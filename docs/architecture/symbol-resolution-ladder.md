@@ -155,7 +155,10 @@ guard against exactly those 63 `net/http` placeholders. With them excluded one l
 is unreachable — across gin, ripgrep, requests and excalidraw, every remaining specifier-shaped
 `qualifiedName` belongs to a `File` node, and a file path is unique within a project by
 construction, so "two or more exact matches" cannot arise for one. GM-367 removed it from that arm.
-`is_module_specifier` itself stays, for rung 5, where shape decides something a score cannot.
+A shape check stays at rung 5, where shape decides something a score cannot: each plugin declares
+the query shapes that are never its symbols (`[plugin.non_symbol_queries]`,
+[ADR 0018](../adr/0018-non-symbol-query-shapes.md)), and rung 5 drops a candidate whose own language
+refuses the query.
 
 The distinction that carries the design: **rungs 3′, 4 and 5 return the same shape** — a page of
 candidates the caller re-queries by id — and differ only in `resolvedBy`. That reuses a contract the

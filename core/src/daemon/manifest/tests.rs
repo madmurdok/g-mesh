@@ -1024,6 +1024,7 @@ fn semantic_pass_capable_languages_returns_only_capable_manifests_sorted() {
         manifest_dir: PathBuf::from("/dev/null"),
         capabilities: Capabilities { semantic_pass: true, ..Capabilities::default() },
         workspace: WorkspaceConfig::default(),
+        non_symbol_queries: Default::default(),
     };
     let not_capable =
         |language: &str| PluginManifest { capabilities: Capabilities::default(), ..capable(language) };
@@ -1038,4 +1039,68 @@ fn semantic_pass_capable_languages_returns_only_capable_manifests_sorted() {
         vec!["rust".to_string(), "typescript".to_string()],
         "go declared no semantic_pass capability and must be excluded; the rest sorted"
     );
+}
+
+fn with_non_symbol_queries(table: &str) -> String {
+    format!("{}\n[plugin.non_symbol_queries]\n{table}\n", well_formed_toml())
+}
+
+/// Control: drop `non_symbol_queries: plugin.non_symbol_queries` from
+/// `read_manifest`'s result (use `Default::default()`) - both fields come
+/// back empty and this fails.
+#[test]
+fn parses_non_symbol_queries() {
+    let (_root, dir) =
+        plugin_dir("python", &with_non_symbol_queries("starts_with = [\"@\", \".\"]\ncontains = [\"/\"]"));
+
+    let manifest = read_manifest(&dir).unwrap();
+
+    assert_eq!(manifest.non_symbol_queries.starts_with, vec!["@".to_string(), ".".to_string()]);
+    assert_eq!(manifest.non_symbol_queries.contains, vec!["/".to_string()]);
+    assert!(manifest.non_symbol_queries.matches("@scope/pkg"));
+    assert!(manifest.non_symbol_queries.matches(".models"));
+    assert!(manifest.non_symbol_queries.matches("a/b"));
+    assert!(!manifest.non_symbol_queries.matches("models"));
+}
+
+/// Control: remove `#[serde(default)]` from `RawPlugin::non_symbol_queries`
+/// - a manifest without the table no longer parses.
+#[test]
+fn a_manifest_with_no_non_symbol_queries_table_refuses_nothing() {
+    let (_root, dir) = plugin_dir("python", &well_formed_toml());
+
+    let manifest = read_manifest(&dir).unwrap();
+
+    assert_eq!(manifest.non_symbol_queries, NonSymbolShapes::default());
+    assert!(!manifest.non_symbol_queries.matches("@scope/pkg"));
+}
+
+/// An empty string is a prefix and an infix of every query.
+///
+/// Control: remove the `validate_non_symbol_queries` call from
+/// `read_manifest` - both manifests load and this fails.
+#[test]
+fn rejects_an_empty_string_in_non_symbol_queries_naming_the_manifest_path_and_key() {
+    for (table, key) in [("starts_with = [\"@\", \"\"]", "starts_with"), ("contains = [\"\"]", "contains")] {
+        let (_root, dir) = plugin_dir("python", &with_non_symbol_queries(table));
+
+        let message = format!("{:#}", read_manifest(&dir).unwrap_err());
+
+        assert!(message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()), "{message}");
+        assert!(message.contains("[plugin.non_symbol_queries]") && message.contains(key), "{message}");
+    }
+}
+
+/// A misspelt key would otherwise be silently ignored and refuse nothing.
+///
+/// Control: remove `#[serde(deny_unknown_fields)]` from `NonSymbolShapes` -
+/// the manifest loads and this fails.
+#[test]
+fn rejects_an_unknown_key_in_non_symbol_queries() {
+    let (_root, dir) = plugin_dir("python", &with_non_symbol_queries("start_with = [\"@\"]"));
+
+    let message = format!("{:#}", read_manifest(&dir).unwrap_err());
+
+    assert!(message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()), "{message}");
+    assert!(message.contains("start_with"), "{message}");
 }

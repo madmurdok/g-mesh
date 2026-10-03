@@ -5,7 +5,7 @@ This directory is the index and home for g-mesh's architecture decisions.
 ## Template
 
 New decisions get their own file: `docs/adr/NNNN-<slug>.md` (four-digit,
-zero-padded, incrementing — the next free number is `0013`). Use this
+zero-padded, incrementing — the next free number is `0019`). Use this
 template:
 
 ```markdown
@@ -88,3 +88,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0015 | [qualifiedName is plugin-segmented; core never parses separators](0015-qualified-name-segments.md) | Accepted |
 | 0016 | [search_code: a cross-encoder reorders the top 30, the verdict stays the embedding's](0016-cross-encoder-rerank.md) | Accepted |
 | 0017 | [The semantic rung embeds off the async workers; plain store reads stay on them](0017-semantic-rung-off-the-worker.md) | Accepted |
+| 0018 | [Plugins declare the query shapes that are never their symbols](0018-non-symbol-query-shapes.md) | Accepted |

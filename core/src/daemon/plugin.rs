@@ -425,6 +425,7 @@ pub fn bundled_manifest() -> PluginManifest {
         // duplicating the real manifest's values.
         capabilities: Capabilities::default(),
         workspace: WorkspaceConfig::default(),
+        non_symbol_queries: Default::default(),
     }
 }
 

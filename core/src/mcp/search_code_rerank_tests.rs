@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rmcp::model::CallToolResult;
 use rusqlite::Connection;
 
+use super::query_shapes::QueryShapes;
 use super::search_code::handle;
 use super::session_hints::SessionHints;
 use super::SearchCodeParams;
@@ -93,7 +94,7 @@ pub(super) fn call(
     cursor: Option<String>,
 ) -> CallToolResult {
     let params = SearchCodeParams { query: query.to_string(), cursor, limit };
-    handle(store, embedding, &SessionHints::default(), params, None).unwrap()
+    handle(store, embedding, QueryShapes::shipped(), &SessionHints::default(), params, None).unwrap()
 }
 
 /// The JSON body of a one-block result.
@@ -537,7 +538,15 @@ fn a_partial_page_is_not_reranked() {
     let partial = |embedding: &EmbeddingPipeline| {
         let params = SearchCodeParams { query: "parseConfig".to_string(), cursor: None, limit: Some(5) };
         serde_json::to_value(
-            handle(&store, embedding, &SessionHints::default(), params, coverage.as_ref()).unwrap(),
+            handle(
+                &store,
+                embedding,
+                QueryShapes::shipped(),
+                &SessionHints::default(),
+                params,
+                coverage.as_ref(),
+            )
+            .unwrap(),
         )
         .unwrap()
     };

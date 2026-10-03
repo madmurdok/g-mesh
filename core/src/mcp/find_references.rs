@@ -18,6 +18,7 @@ use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
 
+use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
 use super::unlinked::{self, UnlinkedUsages};
@@ -171,11 +172,12 @@ fn list_references(
 pub(crate) fn handle(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
+    shapes: &QueryShapes,
     capabilities: &HashMap<String, Capabilities>,
     hints: &SessionHints,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
-    find_definition::resolve_lazily(embedding, |semantic| {
+    find_definition::resolve_lazily(embedding, shapes, |semantic| {
         handle_in(store, semantic, capabilities, hints, params.clone())
     })
 }
@@ -314,6 +316,7 @@ mod tests {
         let result = handle(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             &SessionHints::default(),
             params,
@@ -431,6 +434,7 @@ mod tests {
             &super::super::find_callers_callees::handle_callers(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
@@ -454,6 +458,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
@@ -501,6 +506,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams {
@@ -551,6 +557,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
@@ -591,6 +598,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
@@ -631,6 +639,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams {
@@ -709,6 +718,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
@@ -862,6 +872,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -940,6 +951,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -989,6 +1001,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1028,6 +1041,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
@@ -1038,6 +1052,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams {
@@ -1065,6 +1080,7 @@ mod tests {
         let result = handle(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             &SessionHints::default(),
             params,
@@ -1106,6 +1122,7 @@ mod tests {
             &handle(
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1151,6 +1168,7 @@ mod tests {
             &handle(
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1186,6 +1204,7 @@ mod tests {
             &handle(
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1220,6 +1239,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() },
@@ -1230,6 +1250,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
@@ -1262,6 +1283,7 @@ mod tests {
         let result = handle(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             &SessionHints::default(),
             params,
@@ -1278,6 +1300,7 @@ mod tests {
         let result = handle(
             &Arc::new(IndexStore::new(conn)),
             &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
             &no_capabilities(),
             &SessionHints::default(),
             params,
@@ -1316,6 +1339,7 @@ mod tests {
             &handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1348,6 +1372,7 @@ mod tests {
             &handle(
                 &Arc::new(IndexStore::new(conn)),
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1399,6 +1424,7 @@ mod tests {
             let result = handle(
                 &conn,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &no_capabilities(),
                 &SessionHints::default(),
                 params,
@@ -1440,7 +1466,15 @@ mod tests {
     fn hint_for(store: &Arc<IndexStore>, hints: &SessionHints) -> String {
         let params = SymbolQueryParams { symbol_id: Some("target".to_string()), ..Default::default() };
         let body = json_body(
-            &handle(store, &EmbeddingPipeline::disabled(), &no_capabilities(), hints, params).unwrap(),
+            &handle(
+                store,
+                &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
+                &no_capabilities(),
+                hints,
+                params,
+            )
+            .unwrap(),
         );
         body["hint"].as_str().unwrap_or_default().to_string()
     }

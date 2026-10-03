@@ -256,6 +256,11 @@ ignore = ["node_modules"]    # optional; directory names skipped when
                               # watch_files (triggers a per-language reindex),
                               # exclude_dirs, entry_points. Missing entirely
                               # defaults to all three empty.
+
+[plugin.non_symbol_queries]  # optional; query shapes (starts_with, contains)
+                              # that are never this language's symbols - see
+                              # multi-language-plugins.md. Missing refuses
+                              # nothing.
 ```
 
 `[plugin.capabilities]` and `[plugin.workspace]` shipped with the per-language
@@ -357,6 +362,7 @@ pub struct PluginManifest {
     pub manifest_dir: PathBuf,      // for error messages and fingerprinting
     pub capabilities: Capabilities, // [plugin.capabilities] - see multi-language-plugins.md
     pub workspace: WorkspaceConfig, // [plugin.workspace] - see multi-language-plugins.md
+    pub non_symbol_queries: NonSymbolShapes, // [plugin.non_symbol_queries] - ditto
 }
 
 /// Reads and validates one `plugin.toml`. Hard error on: malformed TOML,

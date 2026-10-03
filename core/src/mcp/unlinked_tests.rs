@@ -1,3 +1,4 @@
+use crate::mcp::query_shapes::QueryShapes;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -79,6 +80,7 @@ impl Fixture {
             &find_callers_callees::handle_callers(
                 &self.store,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &HashMap::<String, Capabilities>::new(),
                 &SessionHints::default(),
                 by_name(symbol),
@@ -92,6 +94,7 @@ impl Fixture {
             &find_references::handle(
                 &self.store,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &HashMap::<String, Capabilities>::new(),
                 &SessionHints::default(),
                 by_name(symbol),

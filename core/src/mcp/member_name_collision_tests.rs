@@ -8,6 +8,7 @@
 //! and lands the edge on the free declaration. Members keep exactly the
 //! usages that address them.
 
+use crate::mcp::query_shapes::QueryShapes;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -85,6 +86,7 @@ impl Walked {
             &find_references::handle(
                 &self.store,
                 &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
                 &HashMap::<String, Capabilities>::new(),
                 &SessionHints::default(),
                 params,

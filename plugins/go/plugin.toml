@@ -101,3 +101,13 @@ watch_files = ["go.mod", "go.work"]
 # cannot be derived, and a test in manifest_test.go pins the two.
 exclude_dirs = ["vendor", "testdata"]
 entry_points = []
+
+[plugin.non_symbol_queries]
+# Query shapes that are never a Go symbol: core sets aside this language's
+# semantic candidates for such a query, and no other language's
+# (docs/architecture/multi-language-plugins.md, "plugin.toml additions").
+# `@` starts a scoped package or a decorator, and `/` is a path or
+# package separator; no Go function, type or member
+# name contains either.
+starts_with = ["@"]
+contains = ["/"]

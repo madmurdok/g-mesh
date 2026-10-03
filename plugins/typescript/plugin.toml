@@ -78,3 +78,13 @@ exclude_dirs = ["node_modules", "dist"]
 # A miss-path lookup treats a directory's `index` file as its container's
 # entry point - the Node/bundler convention this repo already indexes.
 entry_points = ["index"]
+
+[plugin.non_symbol_queries]
+# Query shapes that are never a TypeScript/JavaScript symbol: core sets aside this language's
+# semantic candidates for such a query, and no other language's
+# (docs/architecture/multi-language-plugins.md, "plugin.toml additions").
+# `@` starts a scoped package or a decorator, and `/` is a path or
+# package separator; no TypeScript/JavaScript function, type or member
+# name contains either.
+starts_with = ["@"]
+contains = ["/"]

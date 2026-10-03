@@ -161,3 +161,13 @@ exclude_dirs = ["target"]
 # A miss-path lookup's container-entry-point names: `lib.rs`/`main.rs` are a
 # crate's own root file, `mod.rs` is a directory-module's.
 entry_points = ["lib.rs", "main.rs", "mod.rs"]
+
+[plugin.non_symbol_queries]
+# Query shapes that are never a Rust symbol: core sets aside this language's
+# semantic candidates for such a query, and no other language's
+# (docs/architecture/multi-language-plugins.md, "plugin.toml additions").
+# `@` starts a scoped package or a decorator, and `/` is a path or
+# package separator; no Rust function, type or member
+# name contains either.
+starts_with = ["@"]
+contains = ["/"]

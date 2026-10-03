@@ -53,6 +53,7 @@ use clap::Args;
 use crate::daemon::manifest::{plain_spelling, read_manifest, PluginManifest};
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
+use crate::mcp::query_shapes::QueryShapes;
 use crate::protocol::ndjson::BulkItem;
 use crate::storage::index_store::IndexStore;
 pub use report::{CheckResult, Outcome, Report, Section};
@@ -228,10 +229,13 @@ pub fn check(
         bulk3 = Some(run);
     }
 
-    let mut notes = vec![format!(
-        "timeouts: fileChanged {:?}, per-file semanticPass {:?}, whole-project semanticPass and each bulk run {:?}",
-        timeouts.file_changed, timeouts.semantic_pass_file, whole_project_timeout
-    )];
+    let mut notes = vec![
+        format!(
+            "timeouts: fileChanged {:?}, per-file semanticPass {:?}, whole-project semanticPass and each bulk run {:?}",
+            timeouts.file_changed, timeouts.semantic_pass_file, whole_project_timeout
+        ),
+        format!("non_symbol_queries: {}", manifest.non_symbol_queries.render()),
+    ];
     if let Some(target) = &target {
         notes.push(format!(
             "edited file: {} (whitespace-only edit: one space before the last newline, at the end of line {})",
@@ -356,12 +360,14 @@ fn expectations_section(
     // exactly one plugin, and `mcp::provenance::resolve` looks its anchor's
     // language up in exactly this shape (GM-382).
     let capabilities = HashMap::from([(manifest.language.clone(), manifest.capabilities)]);
+    let shapes = QueryShapes::from_manifests([manifest]);
     let ctx = expectations::EvalContext {
         conn,
         embedding: &embedding,
         project_root: &project_root,
         entry_points: &entry_points,
         capabilities: &capabilities,
+        shapes: &shapes,
     };
 
     let mut results =

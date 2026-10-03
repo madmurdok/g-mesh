@@ -85,14 +85,17 @@
 //! A score that high on an index the query has nothing to do with is proof
 //! that the number describes the query's shape, not the corpus.
 //!
-//! [`find_definition::is_module_specifier`](super::find_definition) makes the
-//! same check and deliberately makes it differently: its input is a symbol
-//! name, so `contains('/')` is enough. This tool's input is free text, where
-//! `"serialize/deserialize the config"` is an ordinary query - hence the
-//! whitespace guard here. Measured across every arm of the sweep,
-//! [`is_specifier_query`] fires on 35 of the 70 junk queries (package
+//! The shapes are each plugin's own declaration
+//! ([`QueryShapes`], `[plugin.non_symbol_queries]`), the same map
+//! `find_definition`'s semantic rung reads, and each row is judged by its own
+//! language's shapes. Core adds only what is not language syntax: this tool's
+//! input is free text, where `"serialize/deserialize the config"` is an
+//! ordinary query, so a prose query is never a specifier ([`refuses_row`]).
+//! Measured across every arm of the sweep with the shipped shapes (`@` prefix,
+//! `/` anywhere), the rule fires on 35 of the 70 junk queries (package
 //! specifiers, paths and invented identifiers) and on **0 of 2,275** name,
-//! short-phrase, sentence and cross-corpus queries.
+//! short-phrase, sentence and cross-corpus queries. Decision:
+//! `docs/adr/0018-non-symbol-query-shapes.md`.
 //!
 //! # A name is told *no*; prose is told *low*
 //!
@@ -204,6 +207,7 @@
 
 use serde::Serialize;
 
+use super::query_shapes::QueryShapes;
 use super::search_code::SearchResult;
 
 /// Why this page is not a match.
@@ -293,19 +297,31 @@ pub(crate) fn floor(language: &str) -> f64 {
     }
 }
 
-/// Whether `query` is a specifier rather than a description of behaviour.
-///
-/// Three conditions, and the whitespace one is the whole difference from
-/// `find_definition::is_module_specifier`: that predicate judges a symbol
-/// name, where a `/` can only be a path separator, while this one judges free
-/// text, where `"serialize/deserialize the config"` is a perfectly ordinary
-/// thing to search for. Measured over the whole sweep this fires on 35 of the
-/// 70 junk queries - every package specifier and path, none of the invented
-/// identifiers, which the floor catches instead - and on 0 of 2,275 real
-/// ones.
-pub(super) fn is_specifier_query(query: &str) -> bool {
+/// Whether `language` refuses `query` as one of its symbols: the trimmed,
+/// non-empty query matches that language's declared shapes and is not prose.
+/// A prose query is never refused, whatever its characters, so
+/// `"serialize/deserialize the config"` is judged by its score alone.
+fn refuses_row(shapes: &QueryShapes, language: &str, query: &str) -> bool {
     let query = query.trim();
-    !query.is_empty() && !is_prose_query(query) && (query.starts_with('@') || query.contains('/'))
+    !query.is_empty() && !is_prose_query(query) && shapes.refuses(language, query)
+}
+
+/// Whether the page's query is a specifier, so its scores are not evidence.
+///
+/// A page with rows: every row's language refuses the query. A page that
+/// mixes refusing and accepting languages is not a specifier page; its
+/// refused rows instead count as below the floor ([`below_floor`]). An empty
+/// page: every discovered language refuses it ([`QueryShapes::refused_by_all`]).
+fn is_specifier_page(shapes: &QueryShapes, query: &str, results: &[SearchResult]) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || is_prose_query(trimmed) {
+        return false;
+    }
+    if results.is_empty() {
+        shapes.refused_by_all(trimmed)
+    } else {
+        results.iter().all(|hit| shapes.refuses(&hit.language, trimmed))
+    }
 }
 
 /// Whether `query` is prose rather than a name: whitespace *inside* it, after
@@ -315,26 +331,29 @@ pub(super) fn is_specifier_query(query: &str) -> bool {
 /// This is exactly the rule the floor eval scores
 /// (`eval/embedding/shipped_floor_rates.py`:
 /// `any(c.isspace() for c in text.strip())`), and it is the whitespace half of
-/// [`is_specifier_query`], so the two cannot drift apart: a specifier is never
+/// [`refuses_row`], so the two cannot drift apart: a specifier is never
 /// prose, which keeps [`verdict`] and [`low_similarity`] disjoint.
 pub(super) fn is_prose_query(query: &str) -> bool {
     query.trim().chars().any(char::is_whitespace)
 }
 
-/// A first page with rows, every one of them below its own language's floor.
+/// A first page with rows, every one of them below its own language's floor
+/// or refused by its own language's shapes (a refused row's score is not
+/// evidence of a match).
 ///
 /// Each row against its own language's floor, not the page's best row
 /// against one of them: in a polyglot repository a page can mix languages,
 /// and a Go hit at 0.58 and a TypeScript hit at 0.58 are not worth the same.
-/// On the single-language repositories this was measured over the two rules
-/// coincide, which is why the distinction is stated by what it guarantees
-/// rather than by a measurement that could not separate them.
-fn below_floor(cursor: Option<&str>, results: &[SearchResult]) -> bool {
-    cursor.is_none() && !results.is_empty() && results.iter().all(|hit| hit.score < floor(&hit.language))
+fn below_floor(shapes: &QueryShapes, query: &str, cursor: Option<&str>, results: &[SearchResult]) -> bool {
+    cursor.is_none()
+        && !results.is_empty()
+        && results
+            .iter()
+            .all(|hit| hit.score < floor(&hit.language) || refuses_row(shapes, &hit.language, query))
 }
 
 /// The verdict for one `search_code` page, or `None` when there is nothing
-/// to say.
+/// to say. One verdict per page; no row is dropped.
 ///
 /// Four ways to get `None`, and each is a deliberate silence:
 ///
@@ -342,31 +361,33 @@ fn below_floor(cursor: Option<&str>, results: &[SearchResult]) -> bool {
 ///   rows are by construction the ones the first page already outranked, so
 ///   "nothing here cleared the floor" would be true of most continuations and
 ///   would say nothing about the query. The caller that paged has already
-///   read the verdict on page one. The rule lives here, with the rest of the
-///   verdict's meaning, rather than as a condition at the call site where it
-///   could not be tested against its own control.
-/// - **The page is empty** and the query is not a specifier. `results: []` is
-///   already a shape that means no, and it means a *different* no (nothing
-///   embedded, or nothing indexed yet), which is the conflation
-///   `super::provenance` spends its own doc comment refusing. Annotating it
-///   would make two causes look like one. A specifier still gets its verdict
-///   here, because that one is a fact about the query rather than about what
-///   the index happened to return.
-/// - **Some row cleared its language's floor.** The healthy case, and the
-///   common one, which is what keeps the field worth reading when it appears.
+///   read the verdict on page one.
+/// - **The page is empty** and not every discovered language refuses the
+///   query. `results: []` is already a shape that means no, and it means a
+///   *different* no (nothing embedded, or nothing indexed yet), which is the
+///   conflation `super::provenance` spends its own doc comment refusing. A
+///   query every language refuses still gets its verdict here, because that
+///   one is a fact about the query rather than about what the index returned.
+/// - **Some row cleared its language's floor** and is not refused by its
+///   language. The healthy case, and the common one.
 /// - **The query is prose.** A below-floor prose page gets
 ///   [`low_similarity`] instead; only a name query is told *no*.
-pub(super) fn verdict(query: &str, cursor: Option<&str>, results: &[SearchResult]) -> Option<NoMatch> {
+pub(super) fn verdict(
+    shapes: &QueryShapes,
+    query: &str,
+    cursor: Option<&str>,
+    results: &[SearchResult],
+) -> Option<NoMatch> {
     if cursor.is_some() {
         return None;
     }
-    if is_specifier_query(query) {
+    if is_specifier_page(shapes, query, results) {
         return Some(NoMatch {
             reason: NoMatchReason::QueryIsAPathOrPackage,
             explanation: SPECIFIER_EXPLANATION,
         });
     }
-    (below_floor(cursor, results) && !is_prose_query(query)).then_some(NoMatch {
+    (below_floor(shapes, query, cursor, results) && !is_prose_query(query)).then_some(NoMatch {
         reason: NoMatchReason::BelowSimilarityFloor,
         explanation: BELOW_FLOOR_EXPLANATION,
     })
@@ -380,27 +401,36 @@ pub(super) fn verdict(query: &str, cursor: Option<&str>, results: &[SearchResult
 /// `None` on a name query, where [`verdict`] speaks instead, and on every
 /// page [`verdict`] would stay silent about for the same reasons.
 pub(super) fn low_similarity(
+    shapes: &QueryShapes,
     query: &str,
     cursor: Option<&str>,
     results: &[SearchResult],
 ) -> Option<&'static str> {
-    (below_floor(cursor, results) && is_prose_query(query)).then_some(LOW_SIMILARITY_EXPLANATION)
+    (below_floor(shapes, query, cursor, results) && is_prose_query(query))
+        .then_some(LOW_SIMILARITY_EXPLANATION)
 }
 
 /// [`verdict`] for a page ranked while the embedding pass is still owed.
 /// "Nothing close" is not known while vectors are missing, so the floor's
 /// verdict is withheld; the one about the query's shape still stands.
 pub(super) fn partial_verdict(
+    shapes: &QueryShapes,
     query: &str,
     cursor: Option<&str>,
     results: &[SearchResult],
 ) -> Option<NoMatch> {
-    verdict(query, cursor, results).filter(|no_match| no_match.reason == NoMatchReason::QueryIsAPathOrPackage)
+    verdict(shapes, query, cursor, results)
+        .filter(|no_match| no_match.reason == NoMatchReason::QueryIsAPathOrPackage)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::manifest::NonSymbolShapes;
+
+    fn shipped() -> &'static QueryShapes {
+        QueryShapes::shipped()
+    }
 
     fn hit(score: f64, language: &str) -> SearchResult {
         SearchResult::for_test(score, language)
@@ -413,8 +443,8 @@ mod tests {
     fn a_page_whose_best_row_clears_its_floor_says_nothing() {
         let page = [hit(0.54, "typescript"), hit(0.30, "typescript")];
         for query in ["parses a config file", "parseConfigFile"] {
-            assert_eq!(verdict(query, None, &page), None, "{query}");
-            assert_eq!(low_similarity(query, None, &page), None, "{query}");
+            assert_eq!(verdict(shipped(), query, None, &page), None, "{query}");
+            assert_eq!(low_similarity(shipped(), query, None, &page), None, "{query}");
         }
     }
 
@@ -422,11 +452,15 @@ mod tests {
     fn a_page_whose_every_row_is_below_its_floor_is_a_no() {
         let page = [hit(0.49, "typescript"), hit(0.30, "typescript")];
 
-        let verdict = verdict("parseConfigFile", None, &page).expect("this page is not a match");
+        let verdict = verdict(shipped(), "parseConfigFile", None, &page).expect("this page is not a match");
 
         assert_eq!(verdict.reason, NoMatchReason::BelowSimilarityFloor);
         assert_eq!(verdict.explanation, BELOW_FLOOR_EXPLANATION, "a name keeps today's wording");
-        assert_eq!(low_similarity("parseConfigFile", None, &page), None, "a name is never told 'low'");
+        assert_eq!(
+            low_similarity(shipped(), "parseConfigFile", None, &page),
+            None,
+            "a name is never told 'low'"
+        );
     }
 
     /// The same below-floor page asked in prose is not a *no*. It
@@ -436,15 +470,18 @@ mod tests {
     fn a_prose_query_below_its_floor_is_low_similarity_not_a_no() {
         let page = [hit(0.49, "typescript"), hit(0.30, "typescript")];
 
-        assert_eq!(verdict("parses a config file", None, &page), None);
-        assert_eq!(low_similarity("parses a config file", None, &page), Some(LOW_SIMILARITY_EXPLANATION));
+        assert_eq!(verdict(shipped(), "parses a config file", None, &page), None);
         assert_eq!(
-            low_similarity("parses a config file", Some("c"), &page),
+            low_similarity(shipped(), "parses a config file", None, &page),
+            Some(LOW_SIMILARITY_EXPLANATION)
+        );
+        assert_eq!(
+            low_similarity(shipped(), "parses a config file", Some("c"), &page),
             None,
             "a continuation is not judged"
         );
         assert_eq!(
-            low_similarity("parses a config file", None, &[]),
+            low_similarity(shipped(), "parses a config file", None, &[]),
             None,
             "an empty page speaks for itself"
         );
@@ -461,9 +498,12 @@ mod tests {
             assert!(is_prose_query(prose), "{prose:?} is prose");
         }
         let page = [hit(0.10, "rust")];
-        assert!(verdict("  readFile  ", None, &page).is_some(), "a padded name keeps the hard verdict");
-        assert_eq!(low_similarity("  readFile  ", None, &page), None);
-        assert!(low_similarity("  read file  ", None, &page).is_some());
+        assert!(
+            verdict(shipped(), "  readFile  ", None, &page).is_some(),
+            "a padded name keeps the hard verdict"
+        );
+        assert_eq!(low_similarity(shipped(), "  readFile  ", None, &page), None);
+        assert!(low_similarity(shipped(), "  read file  ", None, &page).is_some());
     }
 
     /// The sentence may not vouch for the row it cannot vouch for, may not
@@ -482,10 +522,10 @@ mod tests {
     /// Rust's 0.57, Python's 0.59 and Go's 0.57.
     #[test]
     fn one_score_is_a_match_in_one_language_and_not_in_another() {
-        assert_eq!(verdict("readFile", None, &[hit(0.54, "typescript")]), None);
+        assert_eq!(verdict(shipped(), "readFile", None, &[hit(0.54, "typescript")]), None);
         for language in ["rust", "python", "go"] {
             assert!(
-                verdict("readFile", None, &[hit(0.54, language)]).is_some(),
+                verdict(shipped(), "readFile", None, &[hit(0.54, language)]).is_some(),
                 "0.54 must be below {language}'s floor"
             );
         }
@@ -520,8 +560,8 @@ mod tests {
     /// a single global floor taken from either language.
     #[test]
     fn a_mixed_language_page_judges_each_row_by_its_own_floor() {
-        assert_eq!(verdict("readFile", None, &[hit(0.54, "go"), hit(0.54, "typescript")]), None);
-        assert!(verdict("readFile", None, &[hit(0.54, "go"), hit(0.49, "typescript")]).is_some());
+        assert_eq!(verdict(shipped(), "readFile", None, &[hit(0.54, "go"), hit(0.54, "typescript")]), None);
+        assert!(verdict(shipped(), "readFile", None, &[hit(0.54, "go"), hit(0.49, "typescript")]).is_some());
     }
 
     /// The measured case the floor cannot catch: `@excalidraw/element` scores
@@ -533,29 +573,135 @@ mod tests {
     fn a_specifier_is_a_no_at_a_score_no_floor_would_refuse() {
         let page = [hit(0.699, "typescript")];
 
-        let verdict = verdict("@excalidraw/element", None, &page).expect("a specifier is never a match");
+        let verdict =
+            verdict(shipped(), "@excalidraw/element", None, &page).expect("a specifier is never a match");
 
         assert_eq!(verdict.reason, NoMatchReason::QueryIsAPathOrPackage);
     }
 
     /// Free text is this tool's input, so the guard may not fire on a `/`
-    /// that a person wrote inside a sentence. This is the whole reason the
-    /// predicate is not `find_definition::is_module_specifier`.
+    /// that a person wrote inside a sentence, although every shipped language
+    /// declares `/`.
     #[test]
     fn a_slash_inside_a_phrase_is_not_a_specifier() {
-        assert!(!is_specifier_query("serialize/deserialize the config"));
-        assert!(!is_specifier_query("reads a file"));
-        assert!(!is_specifier_query("mutateElement"));
-        assert!(is_specifier_query("@excalidraw/element"));
-        assert!(is_specifier_query("packages/excalidraw/index.tsx"));
-        assert!(is_specifier_query("  src/db/connection.ts  "));
+        let ts = |query: &str| refuses_row(shipped(), "typescript", query);
+        assert!(!ts("serialize/deserialize the config"));
+        assert!(!ts("reads a file"));
+        assert!(!ts("mutateElement"));
+        assert!(!ts("   "));
+        assert!(ts("@excalidraw/element"));
+        assert!(ts("packages/excalidraw/index.tsx"));
+        assert!(ts("  src/db/connection.ts  "));
+        let page = [hit(0.10, "typescript")];
+        assert_eq!(
+            verdict(shipped(), "serialize/deserialize the config", None, &page),
+            None,
+            "a prose query below the floor is told 'low', never 'no'"
+        );
+    }
+
+    fn slash_only() -> NonSymbolShapes {
+        NonSymbolShapes { starts_with: vec![], contains: vec!["/".to_string()] }
+    }
+
+    fn at_only() -> NonSymbolShapes {
+        NonSymbolShapes { starts_with: vec!["@".to_string()], contains: vec![] }
+    }
+
+    /// The shapes are each language's own: a page of rows whose languages all
+    /// refuse the query is a specifier page, at a score above every floor.
+    #[test]
+    fn a_page_every_row_of_which_its_language_refuses_is_a_specifier() {
+        let shapes = QueryShapes::of(&[("typescript", at_only()), ("fake", slash_only())]);
+        let page = [hit(0.90, "typescript"), hit(0.90, "typescript")];
+
+        assert_eq!(
+            verdict(&shapes, "@scope/pkg", None, &page).map(|v| v.reason),
+            Some(NoMatchReason::QueryIsAPathOrPackage)
+        );
+        assert_eq!(verdict(&shapes, "src/lib.ts", None, &page), None, "typescript here declares only `@`");
+    }
+
+    /// A fake language's shapes judge only that language's rows: declaring
+    /// `/` for `fake` neither makes a TypeScript page a specifier page nor
+    /// pushes a TypeScript row below its floor.
+    #[test]
+    fn one_languages_shapes_do_not_change_another_languages_verdict() {
+        let shapes = QueryShapes::of(&[("typescript", NonSymbolShapes::default()), ("fake", slash_only())]);
+        let ts_page = [hit(0.90, "typescript")];
+
+        assert_eq!(verdict(&shapes, "src/lib.ts", None, &ts_page), None);
+        assert_eq!(
+            verdict(&shapes, "src/lib.ts", None, &[hit(0.90, "fake")]).map(|v| v.reason),
+            Some(NoMatchReason::QueryIsAPathOrPackage),
+            "the control: the same score in the refusing language is a specifier"
+        );
+    }
+
+    /// A mixed page, where one row's language refuses the query and the
+    /// other's does not, is not a specifier page; the refused row cannot
+    /// clear the floor, so the page falls to the accepting rows' scores.
+    #[test]
+    fn a_mixed_page_falls_through_to_the_floor_with_refused_rows_below_it() {
+        let shapes = QueryShapes::of(&[("typescript", NonSymbolShapes::default()), ("fake", slash_only())]);
+
+        let low = [hit(0.95, "fake"), hit(0.40, "typescript")];
+        assert_eq!(
+            verdict(&shapes, "src/lib.ts", None, &low).map(|v| v.reason),
+            Some(NoMatchReason::BelowSimilarityFloor),
+            "the refused 0.95 row is not evidence of a match"
+        );
+        let high = [hit(0.95, "fake"), hit(0.60, "typescript")];
+        assert_eq!(verdict(&shapes, "src/lib.ts", None, &high), None, "the accepting row clears its floor");
+    }
+
+    /// The shipped Python manifest refuses a leading `.` (a relative import);
+    /// no other shipped language does. A Python-only page is a specifier page,
+    /// a page with a TypeScript row that clears its floor says nothing, and an
+    /// empty page says nothing because not every language refuses the query.
+    ///
+    /// Control: remove `"."` from `plugins/python/plugin.toml`'s `starts_with`
+    /// - the Python-only page gets no specifier verdict and this fails.
+    #[test]
+    fn with_the_shipped_shapes_a_relative_import_is_refused_by_python_rows_only() {
+        let python = [hit(0.90, "python")];
+        let mixed = [hit(0.90, "python"), hit(0.60, "typescript")];
+
+        for query in [".models", "..pkg.mod"] {
+            assert_eq!(
+                verdict(shipped(), query, None, &python).map(|v| v.reason),
+                Some(NoMatchReason::QueryIsAPathOrPackage),
+                "{query}"
+            );
+            assert_eq!(verdict(shipped(), query, None, &mixed), None, "{query}");
+            assert_eq!(verdict(shipped(), query, None, &[]), None, "{query}");
+        }
+    }
+
+    /// An empty page is a specifier page only when every discovered language
+    /// refuses the query.
+    #[test]
+    fn an_empty_page_is_a_specifier_only_when_every_language_refuses() {
+        let all = QueryShapes::of(&[("typescript", slash_only()), ("fake", slash_only())]);
+        let some = QueryShapes::of(&[("typescript", NonSymbolShapes::default()), ("fake", slash_only())]);
+
+        assert_eq!(
+            verdict(&all, "src/lib.ts", None, &[]).map(|v| v.reason),
+            Some(NoMatchReason::QueryIsAPathOrPackage)
+        );
+        assert_eq!(verdict(&some, "src/lib.ts", None, &[]), None);
+        assert_eq!(
+            verdict(&QueryShapes::default(), "src/lib.ts", None, &[]),
+            None,
+            "no languages refuse nothing"
+        );
     }
 
     /// An empty page is already a shape that means no, and it means a
     /// different one - see [`verdict`]'s doc comment.
     #[test]
     fn an_empty_page_is_left_to_speak_for_itself() {
-        assert_eq!(verdict("reads a file", None, &[]), None);
+        assert_eq!(verdict(shipped(), "reads a file", None, &[]), None);
     }
 
     /// The wire spelling, pinned here rather than only where it is built:
@@ -579,10 +725,13 @@ mod tests {
     #[test]
     fn a_partial_page_withholds_the_floor_verdict_but_not_the_specifier_one() {
         let page = [hit(0.10, "typescript")];
-        assert!(verdict("readFile", None, &page).is_some(), "the control: complete, this page is a no");
-        assert_eq!(partial_verdict("readFile", None, &page), None);
+        assert!(
+            verdict(shipped(), "readFile", None, &page).is_some(),
+            "the control: complete, this page is a no"
+        );
+        assert_eq!(partial_verdict(shipped(), "readFile", None, &page), None);
         assert_eq!(
-            partial_verdict("@excalidraw/element", None, &page).map(|v| v.reason),
+            partial_verdict(shipped(), "@excalidraw/element", None, &page).map(|v| v.reason),
             Some(NoMatchReason::QueryIsAPathOrPackage)
         );
     }
