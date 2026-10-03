@@ -1,335 +1,291 @@
-# GM-475: import-specifier shapes move from core into plugin manifests
+# GM-475: "never a symbol" query shapes move from core into plugin manifests
 
-Status: design (GM-475 slice S3). Not implemented.
+Status: design, revised in S6 after the owner's decisions. Not implemented.
 
-## 1. Problem and decision already taken
+## 1. Decision
 
-`core/src/mcp/find_definition.rs::is_module_specifier` is a spelling rule,
-`name.starts_with('@') || name.contains('/')`, that keeps import-specifier
-shaped queries away from the semantic-neighbour rung. S1 showed that a lookup
-of stored module keys cannot replace it (55 of 401 TS answers and 1 of 335 Go
-answers regressed; `gm-474-qualified-name-segments.md` §3.5). The owner chose
-option (d): keep the rule's behaviour, but have each plugin declare its
-language's specifier shapes in `plugin.toml`, and have core apply the union.
-This follows ADR 0015's principle ("core never parses separators") one step
-further: core holds no language's import syntax either.
+`find_definition::is_module_specifier` and `similarity::is_specifier_query`
+(search_code) both hard-code `starts_with('@') || contains('/')`. S1 showed
+that a lookup of stored module keys cannot replace that rule
+(`gm-474-qualified-name-segments.md` §3.5). The owner decided:
 
-Acceptance criteria are in the task; this note answers how.
+1. Each plugin declares, in `plugin.toml`, the query shapes that are **never
+   its own language's symbols**. Core applies them **per candidate**: a hit
+   of language L is set aside when the query matches L's shapes. A plugin can
+   therefore only affect its own language.
+2. Both call sites move: find_definition and search_code.
+3. Python gets a new leading-`.` shape, in its own slice, with its own
+   measured before/after. Every other slice must show 0 diffs.
+4. TypeScript's `node:` prefix is a separate backlog task.
 
-## 2. What exists today (g-mesh calls behind each claim)
+This extends ADR 0015 ("core never parses separators"): core then holds no
+language's syntax for either tool.
 
-| Question | Answer | Produced by |
-|---|---|---|
-| Callers of `is_module_specifier` | only `by_semantic_neighbours` (the GM-360 `qualifiedName`-arm caller is gone) | `find_callers(is_module_specifier)`, complete |
-| Callers of `by_semantic_neighbours` | only `by_file_name` | `find_callers(by_semantic_neighbours)`, complete |
-| Who reaches the ladder | `resolve_symbol_name` <- `find_definition::by_name` and `mcp::anchor::resolve` (the latter serves find_references, find_callers, find_callees, find_implementations) | `find_callers(resolve_symbol_name)`; `find_references(SemanticRung)` lists the five `handle_in`/`dispatch_in` entry points |
-| How a query gets its rung | every handler runs inside `resolve_lazily` (CLI, tests, plugin-check: 6 callers) or `resolve_lazily_off_worker` (the 5 tool methods in `core/src/mcp/mod.rs`), both of which build the `SemanticRung` | `find_callers(resolve_lazily)`, `find_references(SemanticRung)`, `mcp/mod.rs` read directly |
-| Where `plugin.toml` is parsed | `daemon::manifest::read_manifest` -> `PluginManifest` (raw serde shape `RawPlugin`, no `deny_unknown_fields`); `discover` builds `DiscoveredPlugins` | `find_references(PluginManifest)`: 40 rows in 10 files (daemon/manifest, plugin, lifecycle, bulk_index, workspace_reindex, cli/plugin_check/{mod,session,checks}, two integration tests) |
-| How manifests reach MCP handlers | `PluginRegistry` owns `discovered`; `GMeshMcpServer` holds `Arc<PluginRegistry>`. Precedent: `[plugin.workspace] entry_points` is unioned by `PluginRegistry::entry_points()` and passed into `get_dependencies::handle` | `find_callers(PluginRegistry::entry_points)` -> `GMeshMcpServer::get_dependencies` only |
-| plugin-check's path into `find_definition` | `cli::plugin_check::expectations::call_definition` -> `find_definition::handle`, with `EmbeddingPipeline::disabled()` | `find_callers(find_definition::handle)` (1 non-test caller, 10 tests) |
-| Same syntax elsewhere in core | `mcp::similarity::is_specifier_query` (search_code's verdict) repeats `starts_with('@') || contains('/')` behind a whitespace guard | grep for `'@'` in `core/src/mcp`; `find_callers(is_specifier_query)` -> `similarity::verdict` only |
-
-Lifetime facts (read from `registry.rs` and `daemon/front.rs`):
-
-- `discovered` is read once at daemon start and never changes while the
-  daemon runs (`PluginRegistry::receiver_call_capabilities`' doc says so;
-  installing a plugin already needs a daemon restart for routing).
-- Discovery roots are global, not per project: `~/.g-mesh/plugins/`, then the
-  bundled roots. A multi-project folder is served by a *front* daemon that
-  holds no plugins and answers every index tool with an error; `select_project`
-  re-points the shim at that project's own daemon, which has its own
-  registry. So "per project or global" is: one union per daemon, which in a
-  real install is the same set for every project.
-
-## 3. Field name and format (Q1)
-
-### Option A: literal matchers (recommended)
+## 2. Field
 
 ```toml
-[plugin.import_specifiers]
+[plugin.non_symbol_queries]
+# A query that starts with or contains any of these is never a symbol of
+# this language: core drops this language's candidates for it.
 starts_with = ["@"]
 contains = ["/"]
 ```
 
-A query is specifier-shaped if it starts with any `starts_with` entry or
-contains any `contains` entry of any loaded plugin. Case-sensitive, no
-trimming, plain `str::starts_with` / `str::contains`.
+- Name: **`[plugin.non_symbol_queries]`**. It says what the shapes mean to
+  this plugin ("queries that are not my symbols") rather than why they occur
+  (import syntax). Alternative: `[plugin.not_a_symbol]`.
+- Literal matchers, not regex. `regex` is not a direct core dependency
+  (only transitive, via `tokenizers` and `tree-sitter`). Every shape needed
+  so far is a prefix or an infix. A literal cannot be subtly wrong: as a
+  regex, `.` would match every query. A `matches` key can be added later
+  without changing the meaning of the existing two.
+- Case-sensitive. find_definition matches the raw name. search_code matches
+  the trimmed query, as today.
 
-### Option B: regex
+### Shipped declarations
 
-`regex` is **not** a direct core dependency. It is in `Cargo.lock`
-transitively (`tokenizers` and `tree-sitter` pull 1.13.1, per
-`cargo tree -i regex`), so making it direct adds no new crate or binary
-weight. The `regex` crate is finite-automaton based, so ReDoS by
-backtracking is not possible; the remaining risks are compile size limits
-(handled by `RegexBuilder::size_limit`) and the per-query cost of N
-automata, both small. Compile cost at load time is microseconds per pattern.
+| Plugin | `starts_with` | `contains` | Slice |
+|---|---|---|---|
+| typescript | `@` | `/` | S7 |
+| go | (none) | `/` | S7, see decision D1 |
+| rust | `@` | `/` | S7 |
+| python | `@` | `/` | S7 |
+| python | `.` (added) | | S9 |
 
-### Recommendation: A
+### Can a symbol of each language contain these? (measured)
 
-- Every shape any shipped or foreseeable plugin needs is a prefix or an
-  infix: `@scope/`, `./`, `../`, `github.com/x`, Python's leading `.`,
-  Node's `node:`. Nothing measured needs an anchored alternation.
-- A literal is impossible to get subtly wrong (`.` in a regex is "any
-  character": `contains = ["."]` as a regex would refuse every query).
-- The union is just two concatenated, sorted, deduplicated lists, and
-  `g-mesh plugins list` can print it verbatim.
-- Additive later: a `matches = [...]` regex key can be added beside the two
-  lists without changing their meaning.
+Measured on g-mesh's own index, a mixed Rust/TS/Go/Python corpus: every
+`nodes` row, and separately every embedded row (`vectors` join `nodes`),
+grouped by language and kind.
 
-### TOML each shipped plugin carries
-
-Preserving today's union exactly (`starts_with('@') || contains('/')`):
-
-| Plugin | Declaration | Why |
+| Character | Where it occurs in `name`/`qualifiedName` | Embedded (a semantic candidate)? |
 |---|---|---|
-| typescript | `starts_with = ["@"]`, `contains = ["/"]` | scoped packages (`@excalidraw/math`), relative (`./extract.js`) and subpath (`lodash/fp`) specifiers |
-| go | `contains = ["/"]` | module paths (`github.com/x/y`) and relative imports (`./extract`) |
-| rust | none (no table) | `use` paths are `a::b::C`, which are symbol paths the suffix rung resolves (GM-469). Declaring `::` would refuse legitimate qualified queries |
-| python | none (no table) | see below |
+| `@` | nowhere, in any language or kind | no |
+| `/` | `File` nodes (every language: the path); Go `Module` (package paths, 569 of 851, e.g. `github.com/example/app/cmd`); Rust `Module` (`orphan:core/build.rs`); TS `Module` placeholders (`./version.generated`) | only Rust and Python **File** nodes (222 and 13) |
+| leading `.` | one TS `Module` placeholder (`./version.generated`); no Python row | no |
+| `#` | TS private members (`C#m`) | yes, but no shape uses `#` |
 
-The union over the four is `starts_with = ["@"]`, `contains = ["/"]`, which
-is today's predicate byte for byte. Go's `/` duplicates TypeScript's; the
-union deduplicates it.
+Consequences:
 
-**Python.** Relative imports (`.models`, `..pkg.mod`) start with `.` and
-are *not* refused today. Declaring `starts_with = ["."]` would change
-answers, which "0 diffs" forbids. Absolute imports (`os.path`) are
-indistinguishable from qualified names, so nothing can be declared for them.
+- **Go and `/`.** Package paths contain `/`, but they are `Module` nodes,
+  which are not embedded and are answered at the first structural rung
+  (exact `qualifiedName`) before the semantic rung is reached. S1 recorded
+  the same. Go functions and types (`T.M`) never contain `/`. The filter
+  matches the *query*, never the candidate's name, so a Go symbol cannot be
+  dropped for its own spelling.
+- **File nodes and `/`.** A path query that names an indexed file resolves at
+  the first rung. A path query that names no indexed file is refused today
+  and still is, because Rust and Python refuse `/` too.
+- **TS `#` and decorators.** No shape uses `#`, so private names are
+  unaffected. A decorator is a use, never a declared name, so no symbol
+  starts with `@` in any language.
+- **Python `.`.** No Python name starts with `.`, so S9 can only remove
+  Python candidates for relative-import queries such as `.models`, never a
+  real one.
 
-**Missing shapes, proposed as separate follow-ups (each changes answers and
-needs its own before/after):**
+### D1: Go does not declare `@`
 
-- python: `starts_with = ["."]` (relative imports).
-- typescript: `starts_with = ["node:"]` (Node built-ins such as `node:fs`).
-  Not `#` (subpath imports): `#count` is also a private-member query, and
-  TS's own qualified names use `#` (`C#m`).
-- go: standard-library paths without a slash (`fmt`, `strings`) cannot be
-  told from identifiers by shape; nothing to declare.
+The owner's table gives Go only `/`. In S1's harness (`plugins-root` = TS +
+Go), the Go corpus contains `@Component`, `@property`, `@` and three scoped
+packages. Today all of them are refused at the guard. With Go declaring no
+`@`, Go hits for `@Component` would be offered whenever they clear Go's floor
+(0.57). S1's lookup variant also let these queries through, and none of them
+regressed, so they scored below the floor on that corpus. 0 diffs would then
+hold there only because of the floor. **Recommended: Go also declares
+`starts_with = ["@"]`.** No Go identifier contains `@`, and the four shipped
+plugins would then refuse the same two shapes, so 0 diffs holds by
+construction. Owner decides.
 
-## 4. How the declarations reach the query path (Q2)
+## 3. How the shapes reach both tools
 
-```mermaid
-flowchart LR
-  T[plugin.toml x N] -->|read_manifest| M[PluginManifest.import_specifiers]
-  M -->|discover| D[DiscoveredPlugins]
-  D -->|once, at startup| U["SpecifierShapes::union (Arc)"]
-  U --> S[GMeshMcpServer field]
-  S -->|resolve_lazily_off_worker| R[SemanticRung::Deferred / Embedded]
-  R --> B["by_semantic_neighbours: shapes.matches(name)"]
-```
+- **Manifest.** `NonSymbolShapes { starts_with, contains }` in
+  `daemon::manifest`, as a new `PluginManifest.non_symbol_queries` field.
+  It is parsed from an optional table and is empty when the table is absent.
+- **Map.** `QueryShapes(HashMap<String, NonSymbolShapes>)`, keyed by
+  language, with two methods:
+  - `refuses(language, query)`. A language with no entry refuses nothing.
+  - `refused_by_all(query)`: the map is non-empty and every discovered
+    language refuses the query.
+- **Built once.** It is built in `GMeshMcpServer::new` from the registry's
+  `discovered`, which never changes while a daemon runs, and held as
+  `Arc<QueryShapes>`. Discovery roots are global, and each project in a
+  multi-project folder has its own daemon, so in practice every project gets
+  the same map. The front daemon answers no index tool.
+- **find_definition: carried on `SemanticRung`.** Every path into the
+  semantic rung already carries `SemanticRung`: the five tools through
+  `anchor::resolve` / `resolve_symbol_name`, plus the CLI and plugin-check
+  through `resolve_lazily`. Both variants gain `shapes: &'a QueryShapes`.
+  Handler signatures between the server and the rung stay the same.
+  `SemanticRung::off()` carries the shipped map (`include_str!` of the four
+  manifests), so existing tests keep today's behaviour.
+- **search_code: passed into the verdict.** The handler passes `&QueryShapes`
+  into `similarity::verdict` and `partial_verdict`.
 
-1. **Manifest.** New `SpecifierShapes { starts_with: Vec<String>, contains:
-   Vec<String> }` in `daemon::manifest`, a new `PluginManifest` field
-   `import_specifiers: SpecifierShapes` (default empty), parsed from an
-   optional `RawPlugin.import_specifiers` table.
-2. **Union.** `SpecifierShapes::union<'a>(impl IntoIterator<Item = &'a
-   SpecifierShapes>)`: concatenate, sort, dedup (the `entry_points()`
-   precedent, for the same HashMap-order reason). Exposed as
-   `PluginRegistry::specifier_shapes()`.
-3. **Once per daemon, not per call.** `discovered` never changes while the
-   daemon runs, so `GMeshMcpServer::new` computes the union once into an
-   `Arc<SpecifierShapes>` field. (`entry_points()` recomputes per call; that
-   is fine there, but here the value must cross into a `'static` closure
-   anyway, so an `Arc` clone is the natural shape.)
-4. **Carrier: `SemanticRung`.** The guard is the semantic rung's own input,
-   and `SemanticRung` already reaches `by_semantic_neighbours` through every
-   path (all five tools, anchor resolution, CLI, plugin-check). Both variants
-   gain `shapes: &'a SpecifierShapes`; `resolve_lazily` and
-   `resolve_lazily_off_worker` take the shapes beside the embedding pipeline
-   and put them on both passes. No handler signature between the server and
-   the rung changes (`handle_in`, `anchor::resolve`, `resolve_symbol_name`,
-   `by_file_name` keep theirs).
-   - Rejected: threading a `&SpecifierShapes` parameter through the five
-     `handle_in`s, `anchor::resolve`, `resolve_symbol_name` and
-     `by_file_name`. More signatures, and every one of them already has the
-     rung.
-5. **The predicate.** `is_module_specifier(name)` becomes
-   `SpecifierShapes::matches(&self, name) -> bool` (owned by the type, which
-   lives in `daemon::manifest`), and `by_semantic_neighbours` calls
-   `semantic.shapes().matches(name)`. `find_definition.rs` keeps the
-   *reasoning* (the doc comment) and no syntax.
-6. **Synchronous callers.** `find_definition::handle` and its siblings
-   (`find_callers_callees::handle_callers` etc., the 6 `resolve_lazily`
-   callers) take the shapes as a parameter. plugin-check passes the checked
-   plugin's own `manifest.import_specifiers` (it loads exactly one manifest;
-   its embedding is `disabled()`, so the rung never answers there anyway).
-   Tests use `SemanticRung::off()`, which can carry a `LazyLock` of the
-   shipped union (read from the four committed manifests with
-   `include_str!`), so existing tests keep today's behaviour unedited.
+## 4. Where the filter sits
 
-**Multi-project.** The union is per daemon. Each project's daemon discovers
-the same global roots, so in practice the same union everywhere. The front
-daemon builds no union it would use (no index tool runs there). A user
-plugin in `~/.g-mesh/plugins/` that shadows a bundled one replaces that
-language's declaration too, which is the existing shadowing rule.
+### find_definition: `by_semantic_neighbours`
 
-**Union, not per language.** The query carries no language, so a shape from
-one plugin also refuses queries aimed at another language (`@property` in a
-Python project is refused because TypeScript is loaded). That is today's
-behaviour and is not changed here.
+1. **Short-circuit, before deferring.** If `shapes.refused_by_all(name)`,
+   return `None`, exactly where `is_module_specifier` returns today. Nothing
+   is embedded and the model is not loaded. With the shipped declarations
+   this is today's behaviour, byte for byte.
+2. **Per hit, after the search.** Next to the per-language floor:
+   `.filter(|hit| hit.score >= floor(&hit.language) && !shapes.refuses(&hit.language, name))`.
+3. The search still asks for `SEMANTIC_CANDIDATES` (3) and filters
+   afterwards, so a page can now hold fewer than 3 candidates when one
+   language's hits are dropped. Fetching more before filtering would change
+   pages in the 0-diff slices, so it is not done.
 
-## 5. Defaults (Q3)
+Cost of the per-hit path: when only some languages refuse a query (Python
+`.` after S9, or `@` if D1 stays as the owner's table has it), the query is
+embedded where today it is not. That can be the first model load, and it
+adds latency. The answers are unaffected.
 
-- A plugin without `[plugin.import_specifiers]`, or with an empty table:
-  empty lists, contributes nothing. Same "says nothing means does least"
-  rule as ADR 0005 decision 6; the least here is "refuse nothing on shape".
-- Core with no plugins loaded: empty union, the guard never fires. No core
-  fallback list, which would put syntax back into core. Harmless: with no
-  plugins, nothing is indexed and the rung has nothing to offer.
-- Configurations where TypeScript and Go are both absent (only possible with
-  `G_MESH_PLUGIN_ROOTS_OVERRIDE` or a stripped install) lose the `/` and `@`
-  guard. Those queries then reach the score floor, which still refuses most
-  of them. This is the one behavioural difference the design admits, and no
-  shipped configuration has it.
+### search_code: `similarity::verdict`
 
-## 6. Validation (Q4)
+Today the decision is per query, and the result is one page-level `noMatch`
+annotation. The rows are returned either way. The new rule decides per hit,
+but the output stays page-level:
 
-In `read_manifest`, hard errors naming the manifest path and the offending
-entry (ADR 0005 decision 1):
+- Core keeps the language-neutral parts: trim, non-empty, not prose
+  (`is_prose_query`).
+- **Specifier verdict (`QueryIsAPathOrPackage`).** A non-empty first page
+  gets it when every row's language refuses the query. An empty page gets it
+  when `refused_by_all` holds, which keeps today's "a specifier still gets
+  its verdict on an empty page".
+- **Floor verdict.** In `below_floor`, a row whose language refuses the
+  query counts as below the floor. It cannot be evidence of a match.
+- No rows are dropped. search_code never drops rows today, and dropping them
+  would change pages.
 
-1. An empty string (`contains = [""]` matches every query and would switch
-   the semantic rung off for every language).
-2. An entry containing whitespace (no import specifier contains it, and
-   Rust qualified names such as `<X as Tr>::m` do).
-3. An entry made only of identifier characters (Unicode alphanumerics and
-   `_`), e.g. `starts_with = ["get"]`: it would refuse ordinary symbol names
-   in every language. Every real shape has a punctuation character.
-4. Unknown keys inside the table are an error
-   (`#[serde(deny_unknown_fields)]` on this sub-table only), so a typo like
-   `start_with` fails loudly instead of silently declaring nothing. Trade-off:
-   an older core given a newer plugin that uses a key added later fails to
-   load it. Accepted, the same way an unknown `readiness` value is a hard
-   error today. The SDK's own manifest reader does not look at this table, so
-   it is unaffected.
+With the shipped declarations, a page's languages either all refuse `@`/`/`
+or none of them do, so both verdicts equal today's. For Go and `@`, see D1.
 
-`g-mesh plugins check` calls `read_manifest` (`plugin_check/mod.rs:133`), so
-it inherits rules 1-4 with no code of its own. Additionally:
+## 5. Defaults and validation
 
-- `g-mesh plugins list` prints the declaration next to the capabilities
-  (`import_specifiers: starts_with=@ contains=/`, or `none`), so an author can
-  see what core will apply.
-- plugin-check's report carries the same line as a note. A behavioural
-  plugin-check (asking the rung) is not possible: plugin-check runs with
-  `EmbeddingPipeline::disabled()`, so the semantic rung never answers there.
+- A plugin without the table contributes no entry and refuses nothing for
+  its own candidates. It can never affect another language.
+- With no plugins loaded, the map is empty and `refused_by_all` is false, so
+  nothing is refused. Nothing is indexed either. There is no core fallback
+  list, because that would put syntax back into core.
+- Validation in `read_manifest`. These are hard errors that name the
+  manifest path, which `g-mesh plugins check` inherits because it calls
+  `read_manifest`:
+  1. An empty string. `contains = [""]` would refuse every query for that
+     language.
+  2. An unknown key in the table (`#[serde(deny_unknown_fields)]` on this
+     table only), so that `start_with` fails loudly. Trade-off: an older core
+     refuses a newer plugin that uses a key added later.
+- **The identifier-only rule and the whitespace rule are dropped.** They
+  existed because a global union let one plugin silence every language. Per
+  language, an over-broad declaration only harms the plugin that wrote it.
+- `g-mesh plugins list` and plugin-check's report print the declaration
+  (`non_symbol_queries: starts_with=@ contains=/`, or `none`). plugin-check
+  cannot test this behaviourally, because it runs with
+  `EmbeddingPipeline::disabled()`.
 
-## 7. Docs (Q5)
+Versioning: `plugin.toml` has no schema version, and `protocol_version` is
+for the wire. The change is compatible both ways, because core ignores
+unknown tables and an absent table defaults to empty. No plugin version bump
+is needed: TS 2.4.0 and Go 0.4.0 are already new in 3.19.0, Rust and Python
+follow 3.19.0, and no plugin binary changes. `plugin.toml` is fingerprinted,
+so every index is rebuilt once after the upgrade. 3.19.0 already does that
+(GM-476).
 
-- `docs/architecture/multi-language-plugins.md`, "`plugin.toml` additions":
-  add the table with a comment block (meaning, union across plugins,
-  default, validation), and a short paragraph after the code block.
-- `docs/architecture/plugin-modularity.md`, the manifest sketch around line
-  246: one commented line for `[plugin.import_specifiers]`, pointing at the
-  above, as it does for `[plugin.workspace]`.
-- Plugin SDK: no change. `plugins/sdk/src/manifest.rs` documents only the
-  subset the SDK itself reads (`extensions`, `exclude_dirs`), and nothing in
-  the SDK reads this table.
-- `find_definition.rs`: the `is_module_specifier` doc comment moves onto the
-  call site in `by_semantic_neighbours` (or `SpecifierShapes::matches`),
-  keeping the measurements (0.699 vs 0.566; 42 points of recall; S1's
-  55/401 and 1/335), replacing "starts with `@` or contains `/`" with "matches
-  a shape some loaded plugin declares", and naming the manifest table.
-  `similarity.rs`'s three cross-references to `is_module_specifier` follow
-  the rename.
-- **ADR: yes, a short `docs/adr/0018-import-specifier-shapes-in-manifests.md`.**
-  It is a new boundary decision (which side owns a piece of language syntax),
-  the kind ADR 0015 records, and it adds a manifest field with defaults and
-  validation, the kind ADR 0005 records. It links here for the reasoning.
-  Also fix the README's stale "next free number is `0013`" to `0019`.
+## 6. Slices
 
-## 8. Manifest versioning (Q6)
+| Slice | Content | Model | Gate |
+|---|---|---|---|
+| S7 | Field, validation, `QueryShapes`, `GMeshMcpServer` field, `SemanticRung` carrier, find_definition short-circuit and per-hit filter; TS/Go/Rust/Python manifests at `@`, `/`; `plugins list` line; docs and ADR | opus | 0 diffs (§7 A, C) |
+| S8 | search_code: `verdict`, `partial_verdict` and `below_floor` take `&QueryShapes`; `is_specifier_query`'s syntax removed from core | opus | 0 diffs (§7 B) |
+| S9 | Python `starts_with = ["."]`, plus its measured before/after | opus | diffs listed and explained, Python candidates only (§7 D) |
+| S10 | Verify: fresh agent rebuilds every control in its own worktree and reruns §7 | opus | each control fails or differs |
 
-- `plugin.toml` has no schema version. `protocol_version` versions the wire
-  protocol and a mismatch is a hard error, so bumping it for an optional
-  manifest field would break every third-party plugin for nothing.
-- The change is compatible both ways: core's `RawPlugin` ignores unknown
-  tables (an older core reading the new manifests ignores the field), and an
-  absent table defaults to empty.
-- Plugin versions: no further bump. TypeScript 2.4.0 and Go 0.4.0 were bumped
-  in this unreleased release by GM-476; Rust and Python follow 3.19.0. The
-  plugin binaries do not change at all.
-- Side effect to expect: `plugin.toml` is inside each plugin directory, so it
-  is part of `plugin::fingerprint` and hence of `indexer_version`. Every
-  index built before the change is rebuilt once after the upgrade. A release
-  that changes any plugin file already does this, and 3.19.0 does
-  (GM-476).
+Docs (in S7, extended by S8/S9):
+- `multi-language-plugins.md` ("`plugin.toml` additions"): the table, with
+  its semantics, default and validation.
+- `plugin-modularity.md`: one line in the manifest sketch, pointing there.
+- The doc comments of `is_module_specifier` and `is_specifier_query` move to
+  the new predicates. They keep their measurements (0.699 vs 0.566, 42
+  points of recall, 35/70 vs 0/2,275, S1's 55/401 and 1/335).
+- The plugin SDK needs nothing: it reads only `extensions` and
+  `exclude_dirs`.
 
-## 9. Test plan and before/after method (Q7)
+## 7. Measurement
 
-### Unit and integration tests, each with its control
+Every measurement compares a `before` arm (core at the merge-base) with an
+`after` arm, on the same plugin root, plus a **no-shapes control arm**: the
+`after` binary over copies of the manifests with the table removed (copied
+`plugin.toml`s; symlinked `dist/`, `node_modules/` and plugin binaries). The
+control must differ from `before`. A control that shows 0 diffs means the run
+never reached the filter, for example because the model was missing
+(`G_MESH_MODEL_DIR`). Use a fresh `G_MESH_HOME` per arm, because a manifest
+edit changes `indexer_version` and forces a re-walk.
 
-| Test | Asserts | Control (revert code, not the test) |
-|---|---|---|
-| manifest parses the table | TS-shaped table -> `SpecifierShapes { ["@"], ["/"] }` | drop the field from `RawPlugin` -> empty, test fails |
-| absent table | no table -> empty, no error | default the field to `["@"],["/"]` -> fails |
-| validation x4 | `""`, `"a b"`, `"get"`, `start_with = [...]` each rejected with the path in the message | remove each rule -> its case loads, test fails |
-| union | two manifests -> sorted, deduplicated union; a plugin with none adds nothing | concatenate without dedup / take only the first -> fails |
-| shipped union is today's rule | union of the four committed `plugin.toml`s (`include_str!`) == `starts_with ["@"]`, `contains ["/"]` | delete TS's `starts_with` -> fails |
-| rung guard | `Deferred` pass with the shipped union: `@excalidraw/math`, `./extract.js` leave `reached` empty; with an empty union, `reached` is `Some(name)` | make `matches` return `false` -> the first half fails |
-| existing `is_module_specifier` cases (`tests.rs:886`) | same five assertions, against the shipped union | as above |
-| `plugins list` render | prints `import_specifiers:` line, `none` for an empty table | drop the line -> fails |
+- **A. find_definition on S1's corpora.** `drive.py` and `compare.py` from
+  `scratchpad/gm475/`, on `ts-corpus` (401 queries) and `go-corpus` (335).
+  Expected: 0 diffs; control at least 55 (TS) and at least 1 (Go).
+- **B. search_code on the gm-468 sweep queries.** Extend `drive.py` with a
+  search_code mode that records the full response (rows and `noMatch`). Run
+  it over `eval/embedding/queries/<corpus>.jsonl` and `queries/mechanical/`
+  on g-mesh, plus S1's synthetic specifier queries on both S1 corpora.
+  Expected: 0 diffs. The control must lose `QueryIsAPathOrPackage` on the
+  specifier queries.
+- **C. g-mesh itself as the mixed-language corpus**, for find_definition and
+  search_code. Index a `git archive` snapshot in scratch, never the live
+  checkout. The plugin root needs all four plugins; Rust and Python resolve
+  `${G_MESH_BIN_DIR}`, so run the arm binary from a directory that also holds
+  `g-mesh-plugin-rust` and `g-mesh-plugin-python`. Queries: `drive.py
+  --gen-queries`, plus the S1 synthetic set, plus Python relative-import
+  queries (`.models`, `..pkg.mod`) for D. Expected: 0 diffs for S7 and S8.
+- **D. S9 (Python `.`).** Run C's g-mesh corpus with S8 as `before` and S9 as
+  `after`. Expected diffs: only queries starting with `.`, and in each one
+  only Python candidates removed or a Python-only page turned into a
+  refusal. Every other diff is a finding. Also run a Python-only corpus
+  (py-requests) to measure how often this fires.
 
-### Before/after on S1's corpora (reuse `scratchpad/gm475/`)
+Unit tests, each with a control (revert the code, never the test):
+- Parse, absent table, and both validation rules.
+- `refuses` and `refused_by_all`, including an empty map and an unknown
+  language.
+- The shipped map equals the table in §2, read from the committed manifests.
+- find_definition, rung level. With the shipped map, `@x/y` leaves `reached`
+  empty. With a map where only the hit's language is absent from the
+  refusers, the hit survives. With all refusing, the page is empty.
+- `verdict`: an all-refusing page gets the specifier verdict; a mixed page
+  falls through to the floor; an empty page uses `refused_by_all`.
+- `plugins list` render.
 
-- Arms: `before` = core built at the merge-base of the implementation
-  branch; `after` = core built from it. Same `plugins-root` (symlinks to the
-  worktree's `plugins/go` and `plugins/typescript`, which carry the new
-  tables; the before binary ignores them). The TS ∪ Go union equals the
-  four-plugin union because Rust and Python declare nothing, and the
-  "shipped union" unit test pins that.
-- `drive.py <arm> <binary> corpora/ts-corpus out/ts-corpus` and the same for
-  `go-corpus`, then `compare.py before.json after.json`.
-  **Expected: 0 diffs of 401 (TS) and 0 of 335 (Go).**
-- The model must be present (`G_MESH_MODEL_DIR`), otherwise the rung never
-  answers and 0 diffs measures nothing. The control below proves it was.
-- **Control arm** (`after-noshapes`): the `after` binary with a
-  `plugins-root-control/` whose `plugin.toml`s are copies without the table
-  (TS: symlink `dist/` and `node_modules/`; Go: symlink `g-mesh-plugin-go`).
-  Expected: a non-zero diff count on TS, at least the 55 S1 saw for the
-  lookup variant, and at least 1 on Go. Zero here means the harness did not
-  exercise the guard.
-- A manifest edit changes `indexer_version`, so each arm re-walks its
-  corpus. Use a fresh `G_MESH_HOME` per arm, or accept the re-walk.
-- Fixtures: the full suite once at the end, including the four plugins'
-  conformance runs through `plugin_check`.
+## 8. Risks
 
-## 10. Open decisions for the owner
+- **A vacuous 0-diff run** (no model, or the filter never reached).
+  Mitigated by the control arm in every measurement.
+- **D1.** If Go keeps only `/`, 0 diffs on Go projects holds by score, not by
+  construction, and `@` queries load the model where today they do not.
+- **Shorter candidate pages**, when a refusing language's hits are dropped
+  from the top 3. This only happens once languages differ (S9).
+- **Python `.` changes answers.** It is isolated in S9 and measured there.
+- **An older core refuses a newer manifest** that uses a later key in this
+  table, because of `deny_unknown_fields`.
+- **Signature churn.** It is confined to `resolve_lazily*`, the 6
+  synchronous `handle*` wrappers, the 5 tool methods, and the verdict
+  functions.
+- **A one-time re-index after the upgrade**, through the fingerprint.
 
-1. **`search_code`'s `similarity::is_specifier_query`** holds the same
-   `@`/`/` syntax. The amended criteria name only `find_definition.rs`.
-   Recommended: a follow-up task that feeds the same union into
-   `similarity::verdict`. It needs its own 0-diff run on the search_code
-   sweep (`gm-468`). Alternative: include it in GM-475 (about +1 call site
-   and +1 measurement).
-2. **Validation rule 3** (identifier-only entries rejected). Recommended. It
-   blocks the most damaging third-party mistake, because the union is global.
-3. **Python `.` and TS `node:`**: separate follow-ups, as above.
+## 9. ADR outline: `docs/adr/0018-non-symbol-query-shapes.md`
 
-## 11. Cost and risks (Q8)
-
-Cost: one implement slice (opus) of moderate size. `daemon/manifest.rs`
-(field, raw table, validation, union, tests), `find_definition.rs`
-(`SemanticRung` field, predicate, doc), the two `resolve_lazily*`
-functions, the 5 tool methods in `mcp/mod.rs`, the 6 synchronous `handle*`
-wrappers and their callers (plugin-check's `EvalContext`, about 12 test call
-sites, most absorbed by `SemanticRung::off()`), `cli/plugins.rs` render,
-four manifests, three docs, and one ADR. A verify slice (opus) that
-rebuilds the controls, and a measure run comparable to S1's (two corpora x
-three arms).
-
-Risks:
-
-- **A vacuous 0-diff run** (model missing, or the guard never reached).
-  Mitigated by the no-shapes control arm.
-- **Global union**: one plugin's broad declaration switches the rung off
-  for every language. Mitigated by validation rules 1-3 and by the `plugins
-  list` line. Not eliminated: `starts_with = ["$"]` passes and would refuse
-  `$`-prefixed JS names.
-- **Stripped installs** without the TS and Go plugins lose the guard (§5).
-  No shipped configuration does this.
-- **Hard error on unknown keys** in the table makes an older core refuse a
-  newer plugin that uses a later key (§6, rule 4).
-- **One-time re-index** after upgrade, through the fingerprint (§8).
-- **Signature churn** in the synchronous `handle*` wrappers. Mechanical
-  but spread across several files. Carrying the shapes on `SemanticRung`
-  keeps it out of the handlers between the server and the rung.
+- **Context:** two core predicates hard-coded TS/Go import syntax (`@`, `/`).
+  A lookup cannot replace them (S1). A global union would let one plugin
+  silence every language.
+- **Decision:** each plugin declares `[plugin.non_symbol_queries]`
+  (`starts_with`, `contains`, literals). Core drops a candidate of language L
+  when the query matches L's shapes. It short-circuits before embedding when
+  every discovered language refuses. Both find_definition and search_code
+  apply it. An absent table refuses nothing, and there is no core default.
+  Validation covers empty strings and unknown keys.
+- **Consequences:** no language syntax in core for these tools; a plugin can
+  only affect its own candidates; queries the declarations do not cover cost
+  an embedding; adding a language adds no core code. Follow-ups: TS `node:`
+  (backlog).
+- Also fix `docs/adr/README.md`, which still says the next free number is
+  `0013`. It should be `0019`.
