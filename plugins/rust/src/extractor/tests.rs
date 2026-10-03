@@ -455,6 +455,43 @@ fn a_call_inside_one_file_is_a_direct_resolved_edge() {
     assert_eq!(graph.by_id(&call[0].to_id).qualified_name, "helper");
 }
 
+/// A bare `y()` never names an associated item, so a method or trait item
+/// `y` beside the free `fn y` does not make it ambiguous; the methods keep
+/// their own type-qualified callers.
+///
+/// Control: in `Declarer::declare` (`extractor::decls`), record every
+/// declaration with `model.declare` again, ignoring `block` - `run` and
+/// `Tr::d` lose their edge to `y`.
+#[test]
+fn a_bare_call_lands_on_the_free_fn_beside_same_named_associated_items() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub fn y() {}
+pub struct T;
+impl T {
+    pub fn y(&self) {}
+    pub fn z(&self) { y(); Self::y(self); T::y(self); }
+}
+pub trait Tr {
+    fn y();
+    fn d() { y(); }
+}
+impl Tr for T { fn y() {} }
+pub fn run() { y(); T::y(&T); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["T::y", "y"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "T::z"), vec!["T::y", "y"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "Tr::d"), vec!["y"]);
+    let free = graph.node("y").id.clone();
+    assert!(
+        graph.edges(EdgeKind::Calls).iter().filter(|edge| edge.to_id == free).all(|edge| edge.resolved),
+        "a same-file target is resolved"
+    );
+}
+
 #[test]
 fn a_module_qualified_path_call_is_a_name_placeholder_in_that_module() {
     let krate = Crate::new(&[
