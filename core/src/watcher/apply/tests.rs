@@ -65,6 +65,7 @@ fn canned_node(id: &str) -> WireNode {
         container_parent: None,
         target: None,
         alias_paths: Vec::new(),
+        untyped_calls: Vec::new(),
         qualified_path: None,
     }
 }

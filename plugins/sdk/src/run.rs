@@ -211,7 +211,10 @@ fn bulk_index<E: Extractor>(extractor: &E, spec: &ResolvedSpec, root: &Path) -> 
 }
 
 /// One file's NDJSON: every node, then every edge. Open sites are not written -
-/// they are the semantic tier's, and core has no field for them.
+/// they are the semantic tier's. An extractor that opted in
+/// ([`FileGraphBuilder::record_untyped_receiver_calls`](crate::FileGraphBuilder::record_untyped_receiver_calls))
+/// already folded its untyped receiver calls into their nodes'
+/// `untypedCalls`, so those reach core on the node itself.
 fn write_graph<W: Write>(out: &mut W, graph: &FileGraph) -> io::Result<()> {
     for node in &graph.nodes {
         writeln!(out, "{}", serde_json::to_string(node).expect("a WireNode always serializes"))?;

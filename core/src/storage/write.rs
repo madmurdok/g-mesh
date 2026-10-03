@@ -133,6 +133,12 @@ pub struct NodeRecord {
     /// as `qualified_suffixes` rows, a read leaves this empty, and
     /// [`apply_diff`] replaces the node's rows from it on every upsert.
     pub alias_paths: Vec<QualifiedPath>,
+    /// Bare names of methods this node calls through a receiver of unknown
+    /// type (wire `untypedCalls`, GM-486). **Write-side only**, like
+    /// `alias_paths`: they exist in storage only as `untyped_calls` rows, a
+    /// read leaves this empty, and [`apply_diff`] replaces the node's rows
+    /// from it on every upsert.
+    pub untyped_calls: Vec<String>,
 }
 
 impl NodeRecord {
@@ -172,6 +178,7 @@ impl NodeRecord {
             declarations: Vec::new(),
             qualified_path: None,
             alias_paths: Vec::new(),
+            untyped_calls: Vec::new(),
         }
     }
 }
@@ -332,6 +339,8 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
             .context("failed to delete a node's placeholder target")?;
         tx.execute("DELETE FROM qualified_suffixes WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's qualified suffixes")?;
+        tx.execute("DELETE FROM untyped_calls WHERE nodeId = ?1", params![id])
+            .context("failed to delete a node's untyped calls")?;
         tx.execute("DELETE FROM vectors WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's embedding")?;
         tx.execute("DELETE FROM nodes WHERE id = ?1", params![id]).context("failed to delete node")?;
@@ -432,6 +441,20 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
                 .context("failed to prepare the qualified suffix insert")?
                 .execute(params![suffix, node.id])
                 .context("failed to insert a qualified suffix")?;
+        }
+
+        // Untyped receiver calls are replaced wholesale too: a node re-sent
+        // with an empty list (a plugin that stopped reporting, or a body that
+        // no longer has such calls) loses its rows.
+        tx.prepare_cached("DELETE FROM untyped_calls WHERE nodeId = ?1")
+            .context("failed to prepare the untyped call replacement")?
+            .execute(params![node.id])
+            .context("failed to clear a node's untyped calls")?;
+        for name in &node.untyped_calls {
+            tx.prepare_cached("INSERT OR IGNORE INTO untyped_calls (name, nodeId) VALUES (?1, ?2)")
+                .context("failed to prepare the untyped call insert")?
+                .execute(params![name, node.id])
+                .context("failed to insert an untyped call")?;
         }
 
         // `placeholder_targets` is replaced wholesale too, and for the same

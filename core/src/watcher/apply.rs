@@ -636,6 +636,7 @@ pub(crate) fn to_node_record(node: WireNode, warnings: &mut PathWarnings) -> Nod
             .collect(),
         qualified_path,
         alias_paths,
+        untyped_calls: node.untyped_calls,
     }
 }
 

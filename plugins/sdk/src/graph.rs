@@ -23,6 +23,8 @@
 //! in [`SdkIndex`](crate::SdkIndex) for a [`SemanticEngine`](crate::SemanticEngine)
 //! to read.
 
+use std::collections::HashMap;
+
 use g_mesh_wire::{
     EdgeKind, NodeKind, PlaceholderTarget, Position, QualifiedPath, Range, SourceTier, Visibility,
     WireDeclaration, WireEdge, WireNode,
@@ -50,7 +52,11 @@ pub struct FileGraph {
     /// placeholder node *in this file* instead (see [`PlaceholderKind`]).
     pub edges: Vec<WireEdge>,
     /// Use sites the structural tier could not resolve - receiver calls,
-    /// ambiguous paths. Never sent to core; handed to the semantic engine.
+    /// ambiguous paths. Never sent to core as such; handed to the semantic
+    /// engine. For an extractor that opts in
+    /// ([`FileGraphBuilder::record_untyped_receiver_calls`]), the untyped
+    /// receiver calls among them also reach core as their enclosing node's
+    /// `untypedCalls`.
     pub open_sites: Vec<OpenSite>,
 }
 
@@ -394,6 +400,7 @@ pub struct FileGraphBuilder {
     engine: String,
     file: RelPath,
     graph: FileGraph,
+    record_untyped: bool,
 }
 
 impl FileGraphBuilder {
@@ -406,7 +413,18 @@ impl FileGraphBuilder {
             engine: engine.to_string(),
             file: file.clone(),
             graph: FileGraph::default(),
+            record_untyped: false,
         }
+    }
+
+    /// Opts this file into reporting untyped receiver calls: [`finish`](Self::finish)
+    /// folds every [`OpenSiteKind::ReceiverCall`] site with no
+    /// [`replaces`](OpenSite::replaces) into its enclosing node's
+    /// `untyped_calls`, which core stores so a caller page can say it may be
+    /// missing such calls. Off by default: a plugin that has not opted in
+    /// sends no `untypedCalls`, which core reads as "not reported".
+    pub fn record_untyped_receiver_calls(&mut self) {
+        self.record_untyped = true;
     }
 
     /// Adds the file's own `File` node and returns its id.
@@ -449,6 +467,7 @@ impl FileGraphBuilder {
             target: spec.target,
             qualified_path: spec.qualified_path,
             alias_paths: spec.alias_paths,
+            untyped_calls: Vec::new(),
         });
         id
     }
@@ -552,9 +571,37 @@ impl FileGraphBuilder {
         self.graph.mark_syntax_errors();
     }
 
-    /// The finished graph.
-    pub fn finish(self) -> FileGraph {
+    /// The finished graph. When [`record_untyped_receiver_calls`](Self::record_untyped_receiver_calls)
+    /// was called, every untyped receiver call (a `ReceiverCall` site that
+    /// replaces no edge) lands on its `from_id` node's `untyped_calls`,
+    /// sorted and deduplicated. Only a `File` or `Function` node takes them -
+    /// the kinds core accepts the field on - so a site inside another
+    /// declaration (a `static`'s initializer, say) is not reported.
+    pub fn finish(mut self) -> FileGraph {
+        if self.record_untyped {
+            fold_untyped_calls(&mut self.graph);
+        }
         self.graph
+    }
+}
+
+/// The fold behind [`FileGraphBuilder::finish`]'s opt-in.
+fn fold_untyped_calls(graph: &mut FileGraph) {
+    let mut by_node: HashMap<&str, Vec<String>> = HashMap::new();
+    for site in &graph.open_sites {
+        if site.kind == OpenSiteKind::ReceiverCall && site.replaces.is_none() {
+            by_node.entry(site.from_id.as_str()).or_default().push(site.name.clone());
+        }
+    }
+    for node in &mut graph.nodes {
+        if !matches!(node.kind, NodeKind::File | NodeKind::Function) {
+            continue;
+        }
+        if let Some(mut names) = by_node.remove(node.id.as_str()) {
+            names.sort();
+            names.dedup();
+            node.untyped_calls = names;
+        }
     }
 }
 

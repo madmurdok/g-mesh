@@ -578,6 +578,7 @@ fn the_wire_conversion_carries_container_parent_through_to_the_row() {
         container_parent: Some("github.com/x/app".to_string()),
         target: None,
         alias_paths: Vec::new(),
+        untyped_calls: Vec::new(),
         qualified_path: None,
     };
     let mut conn = setup(false);

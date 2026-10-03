@@ -431,6 +431,13 @@ pub struct WireNode {
     /// on the node, printed or hashed into an id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alias_paths: Vec<QualifiedPath>,
+    /// Bare names of methods this node calls through a receiver whose type
+    /// the structural tier did not know, sorted and deduplicated. Only on a
+    /// `File` or `Function` node, and only from a plugin that opts in; an
+    /// absent key means "not reported", not "none". Write-side only: feeds
+    /// core's `untyped_calls` table, never printed or hashed into an id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untyped_calls: Vec<String>,
 }
 
 impl WireNode {
@@ -715,6 +722,7 @@ mod tests {
             container_parent: None,
             target: None,
             alias_paths: Vec::new(),
+            untyped_calls: Vec::new(),
             qualified_path: None,
         };
 
@@ -819,6 +827,7 @@ mod tests {
                 key_path: None,
             }),
             alias_paths: Vec::new(),
+            untyped_calls: Vec::new(),
             qualified_path: None,
         };
 
@@ -878,6 +887,7 @@ mod tests {
             container_parent: None,
             target: None,
             alias_paths: Vec::new(),
+            untyped_calls: Vec::new(),
             qualified_path: None,
         };
 
@@ -1083,6 +1093,7 @@ mod tests {
                 container_parent: None,
                 target: None,
                 alias_paths: Vec::new(),
+                untyped_calls: Vec::new(),
                 qualified_path: None,
             }],
             delete_node_ids: vec!["n2".to_string()],

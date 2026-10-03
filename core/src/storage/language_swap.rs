@@ -5,14 +5,14 @@
 //! Design: [ADR 0008](../../../docs/adr/0008-workspace-reindex-staging-swap.md).
 //!
 //! Every table keyed by one language's rows appears in both halves: `nodes`,
-//! `declarations`, `placeholder_targets`, `qualified_suffixes`, `edges`,
-//! `containers` and `vectors`. A table missing from either keeps stale rows
+//! `declarations`, `placeholder_targets`, `qualified_suffixes`,
+//! `untyped_calls`, `edges`, `containers` and `vectors`. A table missing from either keeps stale rows
 //! after a swap.
 //!
 //! The unchanged-node rule decides whose edges a node gets. A node is
 //! unchanged when it is in both indexes with every `nodes` column equal and
-//! its `declarations`, `placeholder_targets` and `qualified_suffixes` rows
-//! equal, which is exactly "in both and not in `plan_upsert_nodes`". An unchanged node keeps all of
+//! its `declarations`, `placeholder_targets`, `qualified_suffixes` and
+//! `untyped_calls` rows equal, which is exactly "in both and not in `plan_upsert_nodes`". An unchanged node keeps all of
 //! its live outgoing edges, whatever their `source`, and gets none of
 //! staging's, so the swap neither downgrades what a semantic pass wrote nor
 //! brings back a structural edge the pass retracted. Two exceptions: a live
@@ -54,6 +54,7 @@ const NODE_COLUMNS: &str = "id, kind, name, qualifiedName, filePath, startLine, 
 const DECLARATION_COLUMNS: &str = "nodeId, ordinal, startLine, startCol, endLine, endCol, signature, hasBody";
 const TARGET_COLUMNS: &str = "nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile, keyPath";
 const SUFFIX_COLUMNS: &str = "suffix, nodeId";
+const UNTYPED_COLUMNS: &str = "name, nodeId";
 const EDGE_COLUMNS: &str = "id, fromId, toId, kind, source, engine, resolved, toDeclaration";
 const CONTAINER_COLUMNS: &str = "nodeId, language, key, parentKey, memberCount";
 
@@ -211,6 +212,7 @@ fn plan_attached(
         ("declarations", DECLARATION_COLUMNS),
         ("placeholder_targets", TARGET_COLUMNS),
         ("qualified_suffixes", SUFFIX_COLUMNS),
+        ("untyped_calls", UNTYPED_COLUMNS),
     ] {
         run(
             &format!(
@@ -433,7 +435,7 @@ fn swap_attached(
             OR nodeId IN (SELECT id FROM staging.plan_text_changed)",
         "the stale vectors",
     )?;
-    for table in ["declarations", "placeholder_targets", "qualified_suffixes"] {
+    for table in ["declarations", "placeholder_targets", "qualified_suffixes", "untyped_calls"] {
         run(
             &format!(
                 "DELETE FROM {table} WHERE nodeId IN (SELECT id FROM staging.plan_delete_nodes)
@@ -486,6 +488,14 @@ fn swap_attached(
              WHERE nodeId IN (SELECT id FROM staging.plan_upsert_nodes)"
         ),
         "the qualified suffixes",
+    )?;
+    run(
+        &format!(
+            "INSERT INTO untyped_calls ({UNTYPED_COLUMNS})
+             SELECT {UNTYPED_COLUMNS} FROM staging.untyped_calls
+             WHERE nodeId IN (SELECT id FROM staging.plan_upsert_nodes)"
+        ),
+        "the untyped calls",
     )?;
     run(
         &format!(
@@ -579,6 +589,7 @@ pub(crate) fn delete_placeholders(conn: &mut Connection, language: &str, ids: &[
             "DELETE FROM declarations WHERE nodeId = ?1",
             "DELETE FROM placeholder_targets WHERE nodeId = ?1",
             "DELETE FROM qualified_suffixes WHERE nodeId = ?1",
+            "DELETE FROM untyped_calls WHERE nodeId = ?1",
             "DELETE FROM containers WHERE nodeId = ?1",
         ] {
             tx.execute(sql, params![id]).context("failed to delete a kept placeholder's rows")?;

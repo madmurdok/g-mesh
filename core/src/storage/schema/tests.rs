@@ -40,6 +40,7 @@ fn creates_all_tables_and_indexes() {
             "qualified_suffixes",
             "semantic_pending",
             "semantic_pending_files",
+            "untyped_calls",
             "vectors",
         ]
     );
@@ -60,6 +61,7 @@ fn creates_all_tables_and_indexes() {
         "idx_edges_toId",
         "idx_targets_scope",
         "idx_qualified_suffixes_nodeId",
+        "idx_untyped_calls_nodeId",
     ] {
         assert!(indexes.contains(&expected.to_string()), "missing index {expected}");
     }

@@ -164,6 +164,7 @@ pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
             .as_deref()
             .and_then(crate::storage::qualified_path::decode),
         alias_paths: Vec::new(),
+        untyped_calls: Vec::new(),
     })
 }
 

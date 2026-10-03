@@ -9,7 +9,7 @@ use crate::graph::imports::RESOLVED_MODULE_NATIVE_KIND;
 use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::protocol::jsonrpc::read_message;
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
-use crate::protocol::types::{ControlEnvelope, WireNode};
+use crate::protocol::types::{ControlEnvelope, NodeKind, WireNode};
 
 /// The `nativeKind`s a `WireNode` stands in for something outside its own
 /// file rather than declaring anything (mirrors the plugin's own
@@ -55,6 +55,8 @@ impl ConformanceReport {
 ///    materializes container nodes (Data Model > Logical containers).
 ///  - a `qualifiedPath`, `aliasPaths` entry or `keyPath`, when sent, obeys
 ///    its rules ([`qualified_path_violation`]).
+///  - `untypedCalls`, when sent, sits on a `File` or `Function` node and
+///    names no empty string ([`untyped_calls_violation`]).
 pub fn check_bulk_output(ndjson: &[u8]) -> ConformanceReport {
     let reader = NdjsonReader::new(BufReader::new(Cursor::new(ndjson.to_vec())));
     let mut violations = Vec::new();
@@ -74,6 +76,7 @@ fn node_shape_violations(context: &str, node: &WireNode) -> Vec<Violation> {
         .into_iter()
         .chain(plugin_emitted_container_violation(node))
         .chain(qualified_path_violation(node))
+        .chain(untyped_calls_violation(node))
         .map(|message| Violation { context: context.to_string(), message })
         .collect()
 }
@@ -93,6 +96,25 @@ pub(crate) fn placeholder_target_violation(node: &WireNode) -> Option<String> {
             node.id, node.qualified_name
         )
     })
+}
+
+/// The `untypedCalls` rule (GM-486): only a `File` or `Function` node - the
+/// code a call can sit in - may carry it, and no name in it is empty.
+/// Absent is conformant.
+pub(crate) fn untyped_calls_violation(node: &WireNode) -> Option<String> {
+    if node.untyped_calls.is_empty() {
+        return None;
+    }
+    if !matches!(node.kind, NodeKind::File | NodeKind::Function) {
+        return Some(format!(
+            "node {:?} (kind {:?}) carries `untypedCalls`; only a File or Function node may",
+            node.id, node.kind
+        ));
+    }
+    node.untyped_calls
+        .iter()
+        .any(String::is_empty)
+        .then(|| format!("node {:?} has an empty name in `untypedCalls`", node.id))
 }
 
 /// The path rules: a `qualifiedPath` joins back to `qualifiedName` and ends
