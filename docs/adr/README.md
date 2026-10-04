@@ -5,7 +5,7 @@ This directory is the index and home for g-mesh's architecture decisions.
 ## Template
 
 New decisions get their own file: `docs/adr/NNNN-<slug>.md` (four-digit,
-zero-padded, incrementing — the next free number is `0022`). Use this
+zero-padded, incrementing — the next free number is `0023`). Use this
 template:
 
 ```markdown
@@ -92,3 +92,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0019 | [Plugins declare the prefixes that, stripped, leave one of their symbols](0019-symbol-query-prefixes.md) | Accepted |
 | 0020 | [Plugins declare whether a named re-export shadows a glob](0020-named-reexport-shadows-glob.md) | Accepted |
 | 0021 | [Bulk walk: one language's failure costs only that language, and the index says which](0021-per-language-bulk-outcome.md) | Accepted |
+| 0022 | [Instructions say which languages are covered; per-answer facts move to the answer](0022-instructions-coverage-states.md) | Accepted |
