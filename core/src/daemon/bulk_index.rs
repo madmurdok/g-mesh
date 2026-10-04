@@ -366,7 +366,9 @@ fn walk_one_language_in(
     if let Some(hint) = plugin::missing_plugin_binary_hint(&manifest.command, &manifest.args) {
         // The hint is the innermost cause, so the instructions show it rather
         // than the step (ADR 0022).
-        return Err(anyhow!(hint).context(format!("failed to spawn the {} plugin's bulk index", manifest.language)));
+        return Err(
+            anyhow!(hint).context(format!("failed to spawn the {} plugin's bulk index", manifest.language))
+        );
     }
 
     let mut command = Command::new(&manifest.command);
