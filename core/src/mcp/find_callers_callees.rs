@@ -712,6 +712,7 @@ mod tests {
                 semantic_pass: true,
                 semantic_sweep: false,
                 semantic_prepare: false,
+                files_created: false,
                 receiver_calls: crate::daemon::manifest::ReceiverCallResolution::Resolved,
                 receiver_calls_structural: crate::daemon::manifest::ReceiverCallResolution::Unresolved,
             },

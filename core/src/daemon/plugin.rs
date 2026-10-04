@@ -1452,6 +1452,31 @@ impl PluginProcess {
         Ok(true)
     }
 
+    /// Sends the `filesCreated` notification naming `file_paths` if this
+    /// plugin's manifest declares `files_created`; returns whether it did.
+    /// The caller sends it before the first of those paths' own `fileChanged`,
+    /// so the plugin's project model holds every one of them before it
+    /// extracts any (ADR 0023's presence hook).
+    ///
+    /// Best-effort like [`Self::notify_workspace_changed`]: nothing is
+    /// answered and nothing is replayed. A lost notification leaves the
+    /// per-file `fileChanged`s that follow, which still apply each file's
+    /// presence, and a relaunched process reads the disk in its walk.
+    pub fn notify_files_created(&self, file_paths: &[String]) -> Result<bool> {
+        if !self.manifest.capabilities.files_created {
+            return Ok(false);
+        }
+        let mut state = self.state();
+        let envelope = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: None,
+            message: ControlMessage::FilesCreated { file_paths: file_paths.to_vec() },
+        };
+        write_message(&mut state.io.writer, &envelope)
+            .context("failed to send the filesCreated notification")?;
+        Ok(true)
+    }
+
     /// Shared tail of [`Self::ensure_fresh`]/[`Self::semantic_pass`]: neither
     /// goes through [`Self::apply_file_change`]'s pending-queue replay, but
     /// both still owe the plugin a relaunch once they know for certain it is

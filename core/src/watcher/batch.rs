@@ -9,6 +9,12 @@
 //! per batch only: nothing is held back for a later batch and nothing is
 //! routed twice.
 //!
+//! Invariant: a batch's created paths are announced together, per language,
+//! after its deletions are routed and before the first of them is routed
+//! (`PluginRegistry::announce_created`), so two files created in one batch
+//! are both present in the plugin's model when either is extracted. The
+//! announcement adds no routing: each created path is still routed once.
+//!
 //! See docs/adr/0023-project-model-tracks-file-presence.md (window W1).
 
 use std::path::Path;
@@ -45,11 +51,38 @@ pub fn classify_settled(conn: &IndexStore, absolute: &Path, file_path: &str) -> 
     }
 }
 
+/// A classified batch split into its routing runs, each in the order the
+/// batch had. Routed as `deleted`, then `created`, then `modified`; the split
+/// lets the caller announce `created` between the first two runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingOrder<T> {
+    pub deleted: Vec<T>,
+    pub created: Vec<T>,
+    pub modified: Vec<T>,
+}
+
+impl<T> RoutingOrder<T> {
+    /// Every path in routing order: deletions, creations, modifications.
+    pub fn into_routed(self) -> Vec<T> {
+        let mut routed = self.deleted;
+        routed.extend(self.created);
+        routed.extend(self.modified);
+        routed
+    }
+}
+
 /// Puts a classified batch into routing order: deletions, then creations,
 /// then modifications, stable within each kind.
-pub fn order_for_routing<T>(mut batch: Vec<(SettledKind, T)>) -> Vec<T> {
-    batch.sort_by_key(|(kind, _)| *kind);
-    batch.into_iter().map(|(_, item)| item).collect()
+pub fn order_for_routing<T>(batch: Vec<(SettledKind, T)>) -> RoutingOrder<T> {
+    let mut order = RoutingOrder { deleted: Vec::new(), created: Vec::new(), modified: Vec::new() };
+    for (kind, item) in batch {
+        match kind {
+            SettledKind::Deleted => order.deleted.push(item),
+            SettledKind::Created => order.created.push(item),
+            SettledKind::Modified => order.modified.push(item),
+        }
+    }
+    order
 }
 
 #[cfg(test)]

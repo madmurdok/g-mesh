@@ -94,6 +94,7 @@ fn bridge_semantic(language: &str) -> PresentLanguage {
             semantic_pass: true,
             semantic_sweep: false,
             semantic_prepare: false,
+            files_created: false,
             receiver_calls: ReceiverCallResolution::Resolved,
             receiver_calls_structural: ReceiverCallResolution::Unresolved,
         },
@@ -1074,6 +1075,7 @@ fn resolved_receiver_calls_without_a_semantic_pass_are_never_resolving() {
         semantic_pass: false,
         semantic_sweep: false,
         semantic_prepare: false,
+        files_created: false,
         receiver_calls: ReceiverCallResolution::Resolved,
         receiver_calls_structural: ReceiverCallResolution::Unresolved,
     };
@@ -1092,6 +1094,7 @@ fn a_structurally_resolving_language_is_static_without_the_pass_sentence() {
         semantic_pass: true,
         semantic_sweep: false,
         semantic_prepare: false,
+        files_created: false,
         receiver_calls: ReceiverCallResolution::Resolved,
         receiver_calls_structural: ReceiverCallResolution::Resolved,
     };
@@ -1206,6 +1209,7 @@ fn ladder_step_4_replaces_the_covered_list_and_keeps_absent_and_failed_names() {
         semantic_pass: false,
         semantic_sweep: false,
         semantic_prepare: false,
+        files_created: false,
         receiver_calls: ReceiverCallResolution::Resolved,
         receiver_calls_structural: ReceiverCallResolution::Resolved,
     };

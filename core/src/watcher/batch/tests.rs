@@ -26,7 +26,7 @@ fn a_batch_routes_deletions_then_creations_then_modifications_whatever_its_input
     ];
 
     assert_eq!(
-        order_for_routing(batch),
+        order_for_routing(batch).into_routed(),
         vec!["gone", "other-gone", "new-target", "other-new-target", "importer", "other-importer"],
         "deletions, then creations, then modifications"
     );
@@ -49,7 +49,7 @@ fn paths_of_the_same_kind_keep_the_order_the_batch_had() {
     ];
 
     assert_eq!(
-        order_for_routing(batch),
+        order_for_routing(batch).into_routed(),
         vec!["d3", "d2", "d1", "c3", "c2", "c1", "m3", "m2", "m1"],
         "routing order must be stable within each kind"
     );
@@ -60,7 +60,7 @@ fn ordering_neither_drops_nor_duplicates_a_path() {
     let batch: Vec<(SettledKind, usize)> =
         (0..30).map(|i| ([Modified, Created, Deleted][i % 3], i)).collect();
 
-    let mut routed = order_for_routing(batch);
+    let mut routed = order_for_routing(batch).into_routed();
     assert_eq!(routed.len(), 30, "each path is routed exactly once");
     routed.sort_unstable();
     assert_eq!(routed, (0..30).collect::<Vec<_>>());

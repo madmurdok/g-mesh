@@ -88,7 +88,7 @@
 //! plugins, "is what is in this index still what today's pipeline would
 //! produce?" cannot be answered by looking at one of them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -932,6 +932,47 @@ impl PluginRegistry {
                 continue;
             }
             self.workspace_file_changed(conn, &language, &file_path);
+        }
+    }
+
+    /// Announces one batch's created paths, per language, before any of them
+    /// is routed ([`route_settled_path`](Self::route_settled_path) still routes
+    /// every one of them afterwards). A path counts for the language that would
+    /// receive its `fileChanged`, under the same filters
+    /// [`file_changed`](Self::file_changed) applies: not a workspace file, claimed,
+    /// not under that language's `exclude_dirs`, not a failed language.
+    ///
+    /// Only a language with at least two such paths is told: one created file
+    /// cannot be both the importer and the target the notification exists for.
+    /// Only a running supervisor is asked, so nothing is spawned or woken; a
+    /// plugin that starts later reads the disk after the batch. Whether the
+    /// plugin understands the message is its manifest's `files_created`,
+    /// checked where the message is sent. A failed send is reported and
+    /// dropped: the per-file routing that follows meets the same process.
+    pub fn announce_created(&self, created: &[String]) {
+        let mut by_language: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for file_path in created {
+            if !self.workspace_language_matches(file_path).is_empty() {
+                continue;
+            }
+            let Some(language) = self.discovered.indexing_language(file_path) else { continue };
+            if self.is_failed_language(language) {
+                continue;
+            }
+            by_language.entry(language.to_string()).or_default().push(file_path.clone());
+        }
+        for (language, file_paths) in by_language {
+            if file_paths.len() < 2 {
+                continue;
+            }
+            let running = self.supervisors.lock().unwrap().get(&language).and_then(SupervisorSlot::running);
+            let Some(supervisor) = running else { continue };
+            if let Err(err) = supervisor.files_created(&file_paths) {
+                eprintln!(
+                    "g-mesh daemon: could not tell the {language} plugin about {} created files: {err:#}",
+                    file_paths.len()
+                );
+            }
         }
     }
 

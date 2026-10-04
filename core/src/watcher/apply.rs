@@ -538,6 +538,7 @@ fn method_name(message: &ControlMessage) -> &'static str {
         ControlMessage::SemanticPass { .. } => "semanticPass",
         ControlMessage::WorkspaceChanged { .. } => "workspaceChanged",
         ControlMessage::PrepareSemanticPass => "prepareSemanticPass",
+        ControlMessage::FilesCreated { .. } => "filesCreated",
     }
 }
 
