@@ -6,6 +6,6 @@ use g_mesh::cli;
 fn main() {
     if let Err(err) = cli::run() {
         eprintln!("g-mesh: {err:#}");
-        std::process::exit(1);
+        std::process::exit(cli::exit_code(&err));
     }
 }

@@ -73,7 +73,7 @@ pub fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve the current directory")?;
     let outcome = reindex(&cwd)?;
     print!("{}", render(&outcome, &cwd));
-    Ok(())
+    crate::cli::report_language_outcomes(&outcome.summary.outcomes)
 }
 
 /// Wipes and rebuilds the index for `project_root`, stopping whatever daemon
@@ -197,6 +197,7 @@ mod tests {
                 skipped_lines: 0,
                 linked_imports: 2,
                 linked_symbols: 1,
+                ..BulkIndexSummary::default()
             },
             semantic_pass_ran: true,
             embeddings: backfill::BackfillSummary::default(),
@@ -234,6 +235,7 @@ mod tests {
                 skipped_lines: 3,
                 linked_imports: 0,
                 linked_symbols: 0,
+                ..BulkIndexSummary::default()
             },
             semantic_pass_ran: false,
             embeddings: backfill::BackfillSummary::default(),

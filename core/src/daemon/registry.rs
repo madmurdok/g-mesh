@@ -541,6 +541,11 @@ pub struct PluginRegistry {
     /// error, so it gets one line per extension for the whole daemon run
     /// rather than one per file - see [`unroutable_notice`](Self::unroutable_notice).
     unroutable: Mutex<HashSet<String>>,
+    /// Languages whose bulk walk failed, set once by the walk for the rest of
+    /// this daemon's life. Their files are not routed: a single-file update
+    /// would put part of a language into an index that holds it wholly or not
+    /// at all (ADR 0021).
+    failed_languages: Mutex<HashSet<String>>,
 }
 
 impl PluginRegistry {
@@ -593,7 +598,19 @@ impl PluginRegistry {
             embedding,
             supervisors: Mutex::new(HashMap::new()),
             unroutable: Mutex::new(HashSet::new()),
+            failed_languages: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Records the languages the bulk walk failed, replacing any earlier set.
+    pub(crate) fn set_failed_languages(&self, languages: impl IntoIterator<Item = String>) {
+        let mut failed = self.failed_languages.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *failed = languages.into_iter().collect();
+    }
+
+    /// Whether the bulk walk failed `language`, so its files are not routed.
+    pub(crate) fn is_failed_language(&self, language: &str) -> bool {
+        self.failed_languages.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(language)
     }
 
     /// Which language claims `file_path`, by its extension; `None` if no
@@ -878,6 +895,9 @@ impl PluginRegistry {
             return;
         }
         for language in workspace_languages {
+            if self.is_failed_language(&language) {
+                continue;
+            }
             self.workspace_file_changed(conn, &language, &file_path);
         }
     }
@@ -922,6 +942,9 @@ impl PluginRegistry {
         let Some(language) = self.discovered.indexing_language(&file_path).map(str::to_string) else {
             return;
         };
+        if self.is_failed_language(&language) {
+            return;
+        }
 
         match self.get_or_spawn(&language) {
             Ok(supervisor) => supervisor.file_changed(conn, file_path),
@@ -1209,6 +1232,10 @@ impl PluginRegistry {
         let Some(language) = self.language_for(file_path).map(str::to_string) else {
             return Ok(None);
         };
+        // Not in the index at all, so there is nothing to keep fresh.
+        if self.is_failed_language(&language) {
+            return Ok(None);
+        }
 
         if !conn.with(|conn| staleness::is_stale(conn, &self.project_root, file_path))? {
             return Ok(Some(StalenessOutcome::AlreadyFresh));

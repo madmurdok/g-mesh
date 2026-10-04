@@ -59,6 +59,21 @@ impl CatalogueEntry {
     }
 }
 
+/// What a bulk walk did for one language (ADR 0021). The install command is
+/// not stored: [`CatalogueEntry::install_command`] derives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanguageOutcome {
+    /// A discovered plugin walked it to the end. `files` is its `File`-node
+    /// count; a discovered language with no files is `Indexed { files: 0 }`.
+    Indexed { files: usize },
+    /// A catalogue language with no discovered plugin and at least one file
+    /// in the project. Not an error. `files` is `None` when it was not counted.
+    PluginAbsent { files: Option<usize> },
+    /// A discovered plugin that could not be used; nothing of the language is
+    /// in the index. `error` is the full error chain.
+    Failed { error: String },
+}
+
 /// Every catalogued language, in a fixed order. Adding a language is adding
 /// one entry here.
 pub const CATALOGUE: &[CatalogueEntry] = &[

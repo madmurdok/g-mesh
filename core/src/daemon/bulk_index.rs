@@ -7,10 +7,10 @@
 //! `--bulk-index` mode, one process per language, from the manifest's own
 //! `command`/`args`. Its stdout is the EOF-terminated NDJSON stream
 //! `protocol::ndjson::NdjsonReader` consumes. Why a second process rather
-//! than the control-plane pipe, and why one failed language fails the whole
-//! walk: [ADR 0002](../../../docs/adr/0002-bulk-walk.md).
+//! than the control-plane pipe: [ADR 0002](../../../docs/adr/0002-bulk-walk.md).
+//! What one failed language costs: [ADR 0021](../../../docs/adr/0021-per-language-bulk-outcome.md).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -21,7 +21,9 @@ use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
 use crate::daemon::plugin;
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
+use crate::languages::LanguageOutcome;
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
+use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
 use crate::storage::schema;
 use crate::storage::write::Diff;
@@ -79,6 +81,9 @@ pub struct BulkIndexSummary {
     /// repointed from a pending-symbol placeholder onto the symbol another
     /// file exports (`graph::symbol_links`).
     pub linked_symbols: usize,
+    /// What the walk did for each discovered language, keyed by language.
+    /// The counts above cover only the languages that ended `Indexed`.
+    pub outcomes: BTreeMap<String, LanguageOutcome>,
 }
 
 /// Everything one walk carries from language to language and batch to batch:
@@ -161,14 +166,25 @@ pub fn run_with_progress(
     let walk_clock = std::time::Instant::now();
     let mut ctx =
         WalkContext { embedding, progress, walked_files: Some(BTreeSet::new()), ..WalkContext::new(conn) };
+    let mut failed: BTreeMap<String, String> = BTreeMap::new();
     for manifest in manifests {
         if let Some(progress) = progress {
             progress.mark_language_started(&manifest.language);
         }
-        // One language's failure fails the whole walk, even for a language
-        // the project has no files of: an index that silently skipped a
-        // language would look complete to every tool (ADR 0002).
-        walk_one_language(project_root, manifest, &mut ctx)?;
+        // A language is wholly in the index or not at all, and the walk fails
+        // only when every discovered language failed (ADR 0021, which answers
+        // ADR 0002's partial-index objection). A failed language's rows are
+        // purged here, before `link_all`, so no cross-file edge reaches them.
+        let counts_before = (ctx.summary.nodes, ctx.summary.edges, ctx.summary.skipped_lines);
+        let walked_before = ctx.walked_files.clone();
+        if let Err(err) = walk_one_language(project_root, manifest, &mut ctx) {
+            purge_language(conn, &manifest.language).with_context(|| {
+                format!("failed to remove the partly walked {} rows after: {err:#}", manifest.language)
+            })?;
+            (ctx.summary.nodes, ctx.summary.edges, ctx.summary.skipped_lines) = counts_before;
+            ctx.walked_files = walked_before;
+            failed.insert(manifest.language.clone(), format!("{err:#}"));
+        }
         if let Some(progress) = progress {
             progress.mark_language_done();
         }
@@ -177,6 +193,33 @@ pub fn run_with_progress(
     let walked_files = walked_files.unwrap_or_default();
     if let Some(embedding) = embedding {
         embedding.finish_unit("bulk-walk", &embed_stats, walk_clock.elapsed());
+    }
+
+    let file_counts = conn.with(file_counts_by_language)?;
+    summary.outcomes = discovered
+        .manifests
+        .values()
+        .map(|manifest| {
+            let language = manifest.language.clone();
+            let outcome = match failed.remove(&language) {
+                Some(error) => LanguageOutcome::Failed { error },
+                None => LanguageOutcome::Indexed { files: file_counts.get(&language).copied().unwrap_or(0) },
+            };
+            (language, outcome)
+        })
+        .collect();
+    conn.with(|conn| schema::record_language_outcomes(conn, &summary.outcomes))
+        .context("failed to record the per-language outcomes of the walk")?;
+    let all_failed = !summary.outcomes.is_empty()
+        && summary.outcomes.values().all(|outcome| matches!(outcome, LanguageOutcome::Failed { .. }));
+    if all_failed {
+        let mut message = String::from("every discovered language failed to index:");
+        for (language, outcome) in &summary.outcomes {
+            if let LanguageOutcome::Failed { error } = outcome {
+                message.push_str(&format!("\n  {language}: {error}"));
+            }
+        }
+        bail!(message);
     }
 
     // Once, after every language's stream: an import links only to a file
@@ -216,6 +259,43 @@ pub fn run_with_progress(
 
     hold_the_walk_open_for_tests();
     Ok(summary)
+}
+
+/// Removes every row `language` has in the index, through the watcher's own
+/// path for a deleted file, one file at a time. Containers (`filePath = ''`)
+/// are not files: they go with their last member.
+fn purge_language(conn: &IndexStore, language: &str) -> Result<()> {
+    let paths: Vec<String> = conn.with(|conn| -> Result<Vec<String>> {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT filePath FROM nodes WHERE language = ?1 AND filePath <> '' ORDER BY filePath")
+            .context("failed to prepare the language's file query")?;
+        let rows = stmt
+            .query_map([language], |row| row.get(0))
+            .context("failed to query the language's files")?
+            .collect::<rusqlite::Result<_>>()
+            .context("failed to read the language's files")?;
+        Ok(rows)
+    })?;
+    conn.unit(Unit::BulkWalk, |store| {
+        for path in &paths {
+            let mut diff = Diff::default();
+            store.apply_file_diff_linked(&mut diff, path, FileScope::Gone, "purge a failed language")?;
+        }
+        Ok(())
+    })
+}
+
+/// Each language's `File`-node count.
+fn file_counts_by_language(conn: &rusqlite::Connection) -> Result<BTreeMap<String, usize>> {
+    let mut stmt = conn
+        .prepare("SELECT language, COUNT(*) FROM nodes WHERE kind = ?1 GROUP BY language")
+        .context("failed to prepare the per-language file count")?;
+    let rows = stmt
+        .query_map([FILE_NODE_KIND], |row| {
+            Ok((row.get::<_, String>(0)?, usize::try_from(row.get::<_, i64>(1)?).unwrap_or(0)))
+        })
+        .context("failed to count each language's files")?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to read each language's file count")
 }
 
 /// Spawns `manifest`'s plugin in its one-shot `--bulk-index` mode for
@@ -497,7 +577,14 @@ mod tests {
 
         assert_eq!(
             summary,
-            BulkIndexSummary { nodes: 2, edges: 1, skipped_lines: 0, linked_imports: 0, linked_symbols: 0 }
+            BulkIndexSummary {
+                nodes: 2,
+                edges: 1,
+                skipped_lines: 0,
+                linked_imports: 0,
+                linked_symbols: 0,
+                ..BulkIndexSummary::default()
+            }
         );
         assert_eq!(count(&conn, "nodes"), 2);
         assert_eq!(count(&conn, "edges"), 1);
@@ -520,7 +607,14 @@ mod tests {
 
         assert_eq!(
             summary,
-            BulkIndexSummary { nodes: 2, edges: 0, skipped_lines: 1, linked_imports: 0, linked_symbols: 0 }
+            BulkIndexSummary {
+                nodes: 2,
+                edges: 0,
+                skipped_lines: 1,
+                linked_imports: 0,
+                linked_symbols: 0,
+                ..BulkIndexSummary::default()
+            }
         );
         assert_eq!(count(&conn, "nodes"), 2, "lines after a bad one must still be committed");
     }

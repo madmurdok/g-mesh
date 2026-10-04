@@ -38,12 +38,78 @@ pub mod reindex;
 pub mod status;
 pub mod stop;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::languages::LanguageOutcome;
 use crate::{daemon, shim};
+
+/// The exit code of a command that did its work and printed its result, but
+/// only in part: `g-mesh init`/`reindex` when some, not all, discovered
+/// languages failed to index (ADR 0021). The index is written and usable.
+pub const PARTIAL_FAILURE_EXIT_CODE: i32 = 2;
+
+/// A command's error that carries its own exit code, for an outcome that is
+/// neither success nor the plain failure every other error exits 1 with.
+#[derive(Debug)]
+pub struct ExitStatus {
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExitStatus {}
+
+/// The process exit code for a command's error: an [`ExitStatus`]'s own
+/// code, 1 for every other error.
+pub fn exit_code(err: &anyhow::Error) -> i32 {
+    err.downcast_ref::<ExitStatus>().map_or(1, |status| status.code)
+}
+
+/// One stderr line per language a bulk walk did not index: a `Failed`
+/// language with its error, a `PluginAbsent` one with its file count.
+pub fn language_outcome_lines(outcomes: &BTreeMap<String, LanguageOutcome>) -> Vec<String> {
+    outcomes
+        .iter()
+        .filter_map(|(language, outcome)| match outcome {
+            LanguageOutcome::Indexed { .. } => None,
+            LanguageOutcome::Failed { error } => {
+                Some(format!("g-mesh: {language} failed to index and is not in the index: {error}"))
+            }
+            LanguageOutcome::PluginAbsent { files } => Some(match files {
+                Some(files) => {
+                    format!("g-mesh: {language} has no plugin installed - {files} file(s) not indexed")
+                }
+                None => format!("g-mesh: {language} has no plugin installed - its files are not indexed"),
+            }),
+        })
+        .collect()
+}
+
+/// Prints [`language_outcome_lines`] to stderr, then fails with
+/// [`PARTIAL_FAILURE_EXIT_CODE`] when any language `Failed`. A walk where
+/// every discovered language failed never gets here: it is an error of its own.
+pub(crate) fn report_language_outcomes(outcomes: &BTreeMap<String, LanguageOutcome>) -> Result<()> {
+    for line in language_outcome_lines(outcomes) {
+        eprintln!("{line}");
+    }
+    if outcomes.values().any(|outcome| matches!(outcome, LanguageOutcome::Failed { .. })) {
+        return Err(ExitStatus {
+            code: PARTIAL_FAILURE_EXIT_CODE,
+            message: "some languages failed to index - the index holds every other language".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "g-mesh", version, about = "Local source code indexer for AI agents")]
@@ -215,7 +281,7 @@ pub struct CleanArgs {
 ///
 /// Parse failures never reach here: clap prints its own diagnostic and exits
 /// with its standard status. What this returns is the *command's* outcome,
-/// which `main` turns into a `g-mesh: ...` message and exit code 1.
+/// which `main` turns into a `g-mesh: ...` message and [`exit_code`]'s code.
 pub fn run() -> Result<()> {
     dispatch(Cli::parse().command)
 }
