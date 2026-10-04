@@ -45,10 +45,24 @@ and hides a cache-invalidation rule instead of stating one).
 - A config edit now re-resolves every importer, which today's plugin never
   does, at the cost of a TS reindex per save (~20 s CPU for the Node plugin on
   excalidraw, measured under heavy load).
-- Named residual windows: an importer routed before its new target in one
-  burst stays unresolved until its next edit (a regression against today); a
-  config file whose name the globs miss is read only at reload; `.gitignore`
-  edits are not re-evaluated mid-session.
+- Named residual windows: W1, an importer routed before its new target in one
+  burst stays unresolved until its next edit (a regression against today;
+  closed for modified importers, see below); a config file whose name the
+  globs miss is read only at reload; `.gitignore` edits are not re-evaluated
+  mid-session.
+- W1 closed (GM-505): core routes each drained debounce batch in the order
+  deletions, creations, modifications (`watcher::batch`, applied in
+  `daemon::watch_and_route_once`). A path is classified by its state at drain
+  time, not by event kind (the debouncer coalesces kinds, and FSEvents merges
+  create/modify flags): absent on disk is a deletion, present without an
+  `indexed_files` baseline a creation, otherwise a modification. Deletions go
+  first so a modified importer of a deleted file resolves against a model that
+  has already dropped it instead of linking to a file about to disappear.
+  Ordering is per batch only, with no added latency and no re-extraction.
+  Still open: a *created* importer of another file created in the same batch
+  (both are creations, so their relative order is the batch's), and a target
+  and importer whose last events settle in different batches (a burst longer
+  than the debounce window).
 - GM-324 implements the trait change, the TS model and the manifest change.
   It does not port `ignorePolicy.ts` (the SDK walk owns it) and inherits
   symlinks from GM-349.
