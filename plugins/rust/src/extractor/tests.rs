@@ -920,7 +920,13 @@ pub fn run() { let p = own().unwrap(); p.m(); }
             .collect();
     assert_eq!(untyped.len(), 1, "only `c.m()` is left untyped: {untyped:#?}");
     let b = krate.extract("src/b.rs");
-    assert_eq!(b.targets(EdgeKind::Calls, "b::run"), vec!["b::own"], "a project `Option` is not unwrapped");
+    // `own()` is a typed receiver (GM-488): its `.unwrap()` is the project
+    // `Option`'s own method, a placeholder since this file declares none.
+    assert_eq!(
+        b.targets(EdgeKind::Calls, "b::run"),
+        vec!["b::own", "pending_symbol krate::b::b::Option::unwrap"],
+        "a project `Option` is not unwrapped"
+    );
 }
 
 /// Rust's method lookup prefers an inherent method to a trait method of the

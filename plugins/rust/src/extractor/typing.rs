@@ -14,6 +14,19 @@
 //!   where `x` is itself typed. A chain of such hops stops at [`MAX_HOPS`].
 //! - **An alias**: `let y = x`, `let y = &x`.
 //!
+//! # What types a receiver expression
+//!
+//! Beyond a typed local (GM-488, `docs/architecture/gm-488-l4-fields-and-chains.md`):
+//!
+//! - **A field** of a typed value or of `self` in an `impl`: `self.f.m()`,
+//!   `x.f.m()`, `x.0.m()`, by the field's written type in this file's struct
+//!   declaration. A field mentioning a generic parameter of its struct has
+//!   none.
+//! - **A call** with a written return type, the rule `let` uses without the
+//!   `let`: `a.b().m()`, `T::new().m()`, `a.b()?.m()`.
+//!
+//! Field hops and method-return hops share the one [`MAX_HOPS`] budget.
+//!
 //! # What a written type is reduced to
 //!
 //! `&`, `&mut`, lifetimes and `Box<T>` are stripped. `Option<T>` and
@@ -32,8 +45,9 @@ use tree_sitter::Node;
 
 use crate::extractor::syntax::{flatten_path, text, Seg};
 
-/// How many method-return hops may separate a local from a written type: `let
-/// a = x.m(); let b = a.n();` is two.
+/// How many hops may separate a receiver from a written type. A method-return
+/// hop and a field hop count alike: `let a = x.m(); let b = a.n();` is two,
+/// and so are `self.a.b` and `a.b().c()`.
 pub(crate) const MAX_HOPS: u8 = 2;
 
 /// One segment of a written type's path, owned so it can outlive the walk
@@ -160,6 +174,8 @@ pub(crate) enum Origin {
     FreeFnReturn,
     AssocFnReturn,
     MethodReturn,
+    /// A struct field's written type: `self.f`, `x.f`, `x.0`.
+    Field,
 }
 
 /// A local's type: `name` in `container`, the same address `T::m()` uses.
@@ -168,7 +184,7 @@ pub(crate) struct LocalType {
     pub(crate) container: String,
     pub(crate) name: String,
     pub(crate) wrapper: Wrapper,
-    /// Method-return hops from a written type - see [`MAX_HOPS`].
+    /// Method-return and field hops from a written type - see [`MAX_HOPS`].
     pub(crate) hops: u8,
     pub(crate) origin: Origin,
     /// Whether a `?`/`unwrap()`/`expect()` produced this type.
@@ -191,13 +207,20 @@ pub(crate) fn binding_name<'s>(pattern: Node, source: &'s str) -> Option<&'s str
 }
 
 /// Every generic parameter name in scope at `item`: its own and those of
-/// every enclosing `fn`, `impl` and `trait`.
+/// every enclosing `fn`, `impl`, `trait`, `struct` and `union`.
 pub(crate) fn generic_names(item: Node, source: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut node = Some(item);
     while let Some(current) = node {
-        if matches!(current.kind(), "function_item" | "function_signature_item" | "impl_item" | "trait_item")
-        {
+        if matches!(
+            current.kind(),
+            "function_item"
+                | "function_signature_item"
+                | "impl_item"
+                | "trait_item"
+                | "struct_item"
+                | "union_item"
+        ) {
             if let Some(parameters) = current.child_by_field_name("type_parameters") {
                 let mut cursor = parameters.walk();
                 for parameter in parameters.named_children(&mut cursor) {

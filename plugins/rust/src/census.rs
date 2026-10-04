@@ -64,6 +64,30 @@ pub(crate) enum Reason {
     OpenUnresolvedPath,
 }
 
+/// What a typed receiver is (GM-488): a local (`x.m()`), a field
+/// (`self.f.m()`, `x.0.m()`) or a call (`a.b().m()`, `a.b()?.m()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Shape {
+    Local,
+    Field,
+    Chain,
+}
+
+/// One typed receiver call, as the extractor addressed it.
+#[derive(Debug, Clone)]
+pub(crate) struct TypedSite {
+    pub shape: Shape,
+    pub origin: crate::extractor::Origin,
+    pub unwrapped: bool,
+    /// Whether the edge lands on a same-file declaration rather than a
+    /// placeholder.
+    pub here: bool,
+    /// The calling declaration's node id.
+    pub from: String,
+    /// `container<TAB>T::m`.
+    pub target: String,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Data {
     pub counts: BTreeMap<(Reason, Ctx), u64>,
@@ -88,15 +112,22 @@ pub(crate) struct Data {
     pub unresolved_not_under_glob: u64,
     /// Module keys of the file being extracted that carry a glob `use`.
     globbed_modules: BTreeSet<String>,
-    /// Typed receiver calls, by where the receiver's type came from, whether
-    /// an unwrap produced it, and whether the edge is same-file.
-    pub typed_receivers: BTreeMap<(crate::extractor::Origin, bool, bool), u64>,
+    /// Typed receiver calls, by the receiver's shape, where its type came
+    /// from, whether an unwrap produced it, and whether the edge is same-file.
+    pub typed_receivers: BTreeMap<(Shape, crate::extractor::Origin, bool, bool), u64>,
+    /// Receiver calls left untyped only because typing them took more than
+    /// `MAX_HOPS` hops.
+    pub refused_by_max_hops: u64,
+    /// Every typed site of the file being extracted, until the driver
+    /// writes them out with the file's path and node names.
+    pub file_typed_sites: Vec<TypedSite>,
 }
 
 thread_local! {
     static DATA: RefCell<Data> = RefCell::new(Data::default());
     static CTX: RefCell<Vec<Ctx>> = const { RefCell::new(Vec::new()) };
     static ON: RefCell<bool> = const { RefCell::new(false) };
+    static HOP_REFUSED: RefCell<bool> = const { RefCell::new(false) };
 }
 
 pub(crate) fn enable() {
@@ -161,11 +192,39 @@ pub(crate) fn note_glob(module_key: &str) {
     });
 }
 
-pub(crate) fn typed_receiver(origin: crate::extractor::Origin, unwrapped: bool, here: bool) {
+pub(crate) fn typed_receiver(site: TypedSite) {
     if !ON.with(|on| *on.borrow()) {
         return;
     }
-    DATA.with(|data| *data.borrow_mut().typed_receivers.entry((origin, unwrapped, here)).or_default() += 1);
+    DATA.with(|data| {
+        let mut data = data.borrow_mut();
+        *data.typed_receivers.entry((site.shape, site.origin, site.unwrapped, site.here)).or_default() += 1;
+        data.file_typed_sites.push(site);
+    });
+}
+
+/// Starts typing one receiver: forgets any earlier [`hop_refused`].
+pub(crate) fn begin_receiver() {
+    HOP_REFUSED.with(|refused| *refused.borrow_mut() = false);
+}
+
+/// Typing the current receiver hit `MAX_HOPS`.
+pub(crate) fn hop_refused() {
+    HOP_REFUSED.with(|refused| *refused.borrow_mut() = true);
+}
+
+/// Ends typing one receiver; an untyped one that hit `MAX_HOPS` is counted.
+pub(crate) fn end_receiver(typed: bool) {
+    let refused = HOP_REFUSED.with(|refused| *refused.borrow());
+    if typed || !refused || !ON.with(|on| *on.borrow()) {
+        return;
+    }
+    DATA.with(|data| data.borrow_mut().refused_by_max_hops += 1);
+}
+
+/// Hands the driver the typed sites of the file just extracted.
+pub(crate) fn take_file_typed_sites() -> Vec<TypedSite> {
+    DATA.with(|data| std::mem::take(&mut data.borrow_mut().file_typed_sites))
 }
 
 pub(crate) fn start_file() {
@@ -212,6 +271,8 @@ mod run {
 
         let mut extracted = 0u64;
         let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        // GM-488: file, caller, shape, origin, unwrapped, container, target, here.
+        let mut typed_sites = String::new();
         for path in &files {
             let Ok(source) = std::fs::read_to_string(root.join(path.as_str())) else { continue };
             start_file();
@@ -242,6 +303,22 @@ mod run {
                     declared.insert(node.name.clone());
                 }
             }
+            for site in take_file_typed_sites() {
+                let caller = graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == site.from)
+                    .map_or(site.from.as_str(), |node| node.qualified_name.as_str());
+                typed_sites.push_str(&format!(
+                    "{}\t{caller}\t{:?}\t{:?}\t{}\t{}\t{}\n",
+                    path.as_str(),
+                    site.shape,
+                    site.origin,
+                    site.unwrapped,
+                    site.target,
+                    if site.here { "here" } else { "placeholder" },
+                ));
+            }
             let sites = graph.open_sites.len() as u64;
             end_file(sites, sites - implementations + traits, implementations);
             extracted += 1;
@@ -256,9 +333,12 @@ mod run {
             println!("CENSUS-META\tbridge_questions_asking\t{}", data.questions);
             println!("CENSUS-META\tunresolved_under_glob\t{}", data.unresolved_under_glob);
             println!("CENSUS-META\tunresolved_not_under_glob\t{}", data.unresolved_not_under_glob);
-            for ((origin, unwrapped, here), count) in &data.typed_receivers {
-                println!("CENSUS-TYPED\t{origin:?}\tunwrapped={unwrapped}\tsame_file={here}\t{count}");
+            for ((shape, origin, unwrapped, here), count) in &data.typed_receivers {
+                println!(
+                    "CENSUS-TYPED\t{shape:?}\t{origin:?}\tunwrapped={unwrapped}\tsame_file={here}\t{count}"
+                );
             }
+            println!("CENSUS-META\trefused_by_max_hops\t{}", data.refused_by_max_hops);
             for ((reason, ctx), count) in &data.counts {
                 println!("CENSUS-COUNT\t{reason:?}\t{ctx:?}\t{count}");
             }
@@ -272,6 +352,7 @@ mod run {
                 let total: u64 = map.values().sum();
                 println!("CENSUS-META\t{name}\tdistinct={} occurrences={total}", map.len());
             };
+            std::fs::write(format!("{dir}/rust-typed-receivers.tsv"), &typed_sites).unwrap();
             dump("unknown-type-names", &data.unknown_type_names);
             dump("unknown-value-names", &data.unknown_value_names);
             dump("attr-names", &data.attr_names);
