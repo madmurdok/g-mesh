@@ -82,9 +82,10 @@ pub fn language_outcome_lines(outcomes: &BTreeMap<String, LanguageOutcome>) -> V
         .iter()
         .filter_map(|(language, outcome)| match outcome {
             LanguageOutcome::Indexed { .. } => None,
-            LanguageOutcome::Failed { error } => {
-                Some(format!("g-mesh: {language} failed to index and is not in the index: {error}"))
-            }
+            LanguageOutcome::Failed { error } => Some(format!(
+                "g-mesh: {language} failed to index and is not in the index: {}",
+                crate::languages::error_on_one_line(error)
+            )),
             LanguageOutcome::PluginAbsent { files } => {
                 let what = match files {
                     Some(files) => format!("{files} file(s) not indexed"),
@@ -617,6 +618,35 @@ mod tests {
                 "g-mesh: typescript failed to index and is not in the index: the plugin's entry point x does not exist",
             ]
         );
+    }
+
+    /// A `Failed` language's stored chain (`languages::failed_error`, one
+    /// cause per line) is printed on ONE stderr line, every cause joined by
+    /// ": ", outermost first (GM-330, ADR 0021 section 2).
+    ///
+    /// Control: print the stored error raw in `language_outcome_lines` (no
+    /// `error_on_one_line`) - the line contains "\n" and the exact
+    /// comparison fails.
+    #[test]
+    fn a_failed_languages_whole_chain_is_on_one_stderr_line() {
+        use anyhow::Context;
+
+        let inner: Result<(), std::io::Error> = Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid type: map, expected a string\nat line 3",
+        ));
+        let err = inner.context("reading the manifest").context("loading the rust plugin").unwrap_err();
+        let stored = crate::languages::failed_error(&err);
+        assert_eq!(stored.lines().count(), 3, "the fixture must be a multi-line chain: {stored}");
+
+        let lines = language_outcome_lines(&outcomes(&[("rust", LanguageOutcome::Failed { error: stored })]));
+
+        assert_eq!(
+            lines,
+            ["g-mesh: rust failed to index and is not in the index: loading the rust plugin: \
+              reading the manifest: invalid type: map, expected a string at line 3"]
+        );
+        assert!(!lines[0].contains('\n'));
     }
 
     /// Exit 0 when every discovered language indexed, absent plugins

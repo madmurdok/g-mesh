@@ -67,9 +67,9 @@ semantic_sweep = true
 #
 #   - `receiver_calls = "resolved"` - once Go's whole-project semanticPass
 #     has completed (`language_state.semanticPassAt`), receiver calls are
-#     resolved, so core's generated MCP instructions stop listing the
-#     receiver-call gap for this language (core/src/mcp/instructions.rs's
-#     has_open_receiver_gap);
+#     resolved, so core's generated MCP instructions class this language as
+#     resolved by its semantic pass, not as never resolving
+#     (core/src/mcp/instructions.rs's receiver_class);
 #   - `receiver_calls_structural = "unresolved"` - the go/parser tier alone
 #     still emits nothing for one (it records an open site instead:
 #     plugins/go/open_sites.go), so between the bulk walk and the first

@@ -158,14 +158,12 @@
 //!
 //! One object, on four tools, only in the degraded case:
 //! `,"provenance":{"language":"rust","semanticTier":"absent"}` - 56 bytes at
-//! its widest for a bundled language. It is bounded (a language id plus a
-//! closed enum), unlike a tally, which is why it needs no
-//! `graph::pagination` byte reserve the way `files` and `excludedReferences`
-//! do: `hint` is the precedent - an optional response-level field, larger
-//! than this one, carried without a reserve of its own. `pending` carries a
-//! file list, so a pending response holds back [`PENDING_FILES_RESERVE`]
-//! bytes from its page budget ([`Resolved::page_reserve`]); a response that
-//! is not pending reserves nothing and pages exactly as before.
+//! its widest for a bundled language. The block itself is bounded (a language
+//! id plus a closed enum), unlike a tally. What a degraded response holds back
+//! from its page budget ([`Resolved::page_reserve`]) is the once-per-session
+//! [`session_hints::PROVENANCE`] hint that may ride with it; a pending one
+//! also holds back [`PENDING_FILES_RESERVE`] for its file list. A response
+//! with no `provenance` reserves nothing and pages exactly as before.
 
 use std::collections::HashMap;
 
@@ -174,6 +172,8 @@ use serde::Serialize;
 
 use crate::daemon::manifest::Capabilities;
 use crate::storage::schema;
+
+use super::session_hints;
 
 /// At most this many files in `pendingFiles`; the rest are counted in
 /// `pendingFilesOmitted`.
@@ -314,11 +314,15 @@ pub(super) fn resolve(
 
 impl Resolved {
     /// Bytes the response's page must hold back for this block: only a
-    /// pending block carries a variable-length list.
+    /// pending block carries a variable-length list. Either block may bring
+    /// `session_hints::PROVENANCE` into the page's `hint` (ADR 0022), so that
+    /// sentence, its key and a joining space are held back too.
     pub(super) fn page_reserve(&self) -> usize {
+        let hint = session_hints::PROVENANCE.len() + r#","hint":"""#.len() + 1;
         match self {
-            Resolved::Pending { .. } => PENDING_FILES_RESERVE,
-            Resolved::Silent | Resolved::Absent => 0,
+            Resolved::Pending { .. } => PENDING_FILES_RESERVE + hint,
+            Resolved::Absent => hint,
+            Resolved::Silent => 0,
         }
     }
 

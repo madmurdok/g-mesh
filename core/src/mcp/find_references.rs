@@ -250,6 +250,12 @@ pub(crate) fn handle_in(
         page.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
         hints.once(has_file_row, HintKey::FileRow, session_hints::FILE_ROW),
         hints.once(files.is_some(), HintKey::FilesTally, session_hints::FILES_TALLY),
+        hints.once(
+            !page.all_unresolved && page.results.iter().any(|row| !row.resolved),
+            HintKey::UnresolvedRow,
+            session_hints::UNRESOLVED_ROW,
+        ),
+        hints.once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
     ]);
 
     success(&ReferencePage {

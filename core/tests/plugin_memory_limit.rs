@@ -534,10 +534,10 @@ fn wait_for_rust_suspended(state_dir: &Path, deadline: Instant) {
 /// and `[plugin] memoryLimitMb` low enough that GM-290's fixture reliably
 /// crosses it (the same `LOW_LIMIT_MB` the direct-supervisor tests above
 /// use), the `initialize` response's `instructions` string - what a real MCP
-/// client actually reads, once per session - names the same receiver-call-gap
-/// state the index's own `language_state.semanticPassAt` records for rust,
-/// whichever side of the lock race (this file's module doc) this particular
-/// run landed on. Real production timing throughout: no `G_MESH_PLUGIN_IDLE_MS`
+/// client actually reads, once per session - renders rust's receiver-call
+/// capability the same way whichever side of the lock race (this file's
+/// module doc) this particular run landed on: from the manifest, never from
+/// `language_state.semanticPassAt` (ADR 0022). Real production timing throughout: no `G_MESH_PLUGIN_IDLE_MS`
 /// override, so the supervise loop's tick is the production default (30s,
 /// `IdleTimeouts::tick` at `idleTimeoutMinutes = 60`).
 #[tokio::test]
@@ -592,33 +592,23 @@ async fn the_generated_mcp_instructions_reflect_a_real_suspended_rust() {
 
     assert!(!text.is_empty(), "get_info must carry non-empty instructions once a language is present");
 
-    if semantic_pass_done {
-        // GM-385: a completed pass NARROWS this gap, it does not close it.
-        // rust-analyzer resolves `x.area()` against the receiver's declared
-        // or inferred type - `&dyn Shape`, `<S: Shape>` - so the call lands
-        // on `Shape::area` and the *override's* own caller page still
-        // under-reports. This arm used to assert "One real gap", i.e. the
-        // gap rendered as closed, which was the belief GM-385 measured and
-        // disproved across all four plugins. What a resolved tier changes is
-        // the wording, not the existence of the gap, so the assertion is
-        // still two-sided: the static-receiver form must be there and the
-        // open form must not.
-        assert!(
-            text.contains("binds to the receiver's declared or inferred type"),
-            "rust's semantic pass completed and recorded before suspension caught it (the \
-             common-case race - see this file's module doc), so the real MCP `initialize` \
-             response must render its receiver-call gap in the STATIC-RECEIVER form:\n{text}"
-        );
-        assert!(
-            !text.contains("may produce no edge by design"),
-            "rust's semantic pass completed, so the gap must not still be rendered in its \
-             OPEN form - that wording is for a tier that never ran:\n{text}"
-        );
-    } else {
-        assert!(
-            text.contains("may produce no edge by design"),
-            "rust's semantic pass had not completed when suspension caught it, so the real MCP \
-             `initialize` response must still list its receiver-call gap:\n{text}"
-        );
-    }
+    // ADR 0022: the text is rendered from manifest capabilities only, so it
+    // is the same on both sides of the lock race. Rust resolves receiver
+    // calls only through its semantic pass: the static form plus the
+    // pass-dependent sentence, never the never-resolving form. Whether the
+    // pass has run reaches a caller per answer, through `provenance`.
+    assert!(
+        text.contains("binds to the receiver's declared or inferred type"),
+        "rust resolves receiver calls once its pass has run, so the real MCP `initialize` \
+         response must render the STATIC-RECEIVER form (pass {}):\n{text}",
+        if semantic_pass_done { "SET" } else { "NULL" }
+    );
+    assert!(
+        text.contains("Until a language's semantic pass has run, such a call has no edge at all there"),
+        "rust's receiver calls depend on its semantic pass, so the text must say so:\n{text}"
+    );
+    assert!(
+        !text.contains("may produce no edge"),
+        "rust is not a never-resolving language, whatever its pass state:\n{text}"
+    );
 }

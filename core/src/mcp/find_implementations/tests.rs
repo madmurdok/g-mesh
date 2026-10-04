@@ -216,7 +216,11 @@ fn a_page_with_at_least_one_resolved_implementor_is_not_flagged_all_unresolved()
     );
     assert_eq!(body["results"].as_array().unwrap().len(), 2);
     assert_eq!(body["allUnresolved"], false, "one resolved row must clear the marker");
-    assert!(body.get("hint").is_none(), "no allUnresolved, no sentence: {body}");
+    assert_eq!(
+        body["hint"],
+        session_hints::UNRESOLVED_ROW,
+        "no allUnresolved sentence; the unresolved row gets its own (ADR 0022): {body}"
+    );
 }
 
 /// Task #190: the single-hop response echoes the resolved anchor.
@@ -330,7 +334,7 @@ fn a_resumed_transitive_walk_does_not_repeat_the_anchor() {
     assert!(first.anchor.is_some(), "the first page of a fresh walk still carries the anchor");
     let token = first.resume_token.expect("this wide a fanout must truncate and hand back a token");
 
-    let resumed = json_body(&continued(&conn, &token, &HashMap::new()).unwrap());
+    let resumed = json_body(&continued(&conn, &token, &HashMap::new(), &SessionHints::default()).unwrap());
     assert!(
         resumed.get("anchor").is_none(),
         "a resumed page must not repeat the anchor, not even as null: {resumed}"
@@ -906,7 +910,7 @@ fn a_response_size_cut_is_continued_by_its_token_and_the_chain_covers_every_impl
     let mut calls = 1;
 
     while let Some(t) = token {
-        let body = json_body(&continued(&conn, &t, &HashMap::new()).unwrap());
+        let body = json_body(&continued(&conn, &t, &HashMap::new(), &SessionHints::default()).unwrap());
         calls += 1;
         all.extend(
             body["results"]

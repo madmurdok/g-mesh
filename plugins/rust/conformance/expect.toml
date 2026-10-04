@@ -292,7 +292,7 @@ expect = [
 # not lost, only filed elsewhere: they are on `shapes::Shape::area`'s page
 # directly above, and `[[implementations]] shapes::Shape` below is the edge
 # that gets a reader from this anchor to that one. `core/src/mcp/
-# instructions.rs`'s `P4_STATIC_RECEIVER` is where a session is told so, in
+# instructions.rs`'s `P4_STATIC` is where a session is told so, in
 # one sentence, once - and its doc comment records why this file must never
 # grow an entry asserting a *count* of the calls that are missing here.
 #

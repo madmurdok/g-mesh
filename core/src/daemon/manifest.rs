@@ -148,7 +148,7 @@ pub struct Capabilities {
     pub semantic_prepare: bool,
     /// Whether receiver calls resolve to edges once this plugin's best available
     /// tier has run. `Resolved` means against the receiver's declared or inferred
-    /// type, never its run-time type (`mcp::instructions`' `P4_STATIC_RECEIVER`
+    /// type, never its run-time type (`mcp::instructions`' `P4_STATIC`
     /// discloses this). `Resolved`: the MCP instructions do not list the open
     /// receiver-call gap for this language; `Unresolved` (the default): they do.
     pub receiver_calls: ReceiverCallResolution,

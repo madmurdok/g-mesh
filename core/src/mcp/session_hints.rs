@@ -15,6 +15,8 @@ pub(crate) enum HintKey {
     FilesTally,
     WalkComplete,
     SearchHits,
+    UnresolvedRow,
+    SemanticTier,
 }
 
 /// The once-per-session sentences already sent on one connection. Clones
@@ -37,9 +39,30 @@ pub(crate) fn join(sentences: impl IntoIterator<Item = Option<&'static str>>) ->
     (!present.is_empty()).then(|| present.join(" "))
 }
 
+/// `hint` with `sentence` appended, for a page whose `provenance` is only
+/// known after its `hint` was first assembled.
+pub(crate) fn append(hint: Option<String>, sentence: Option<&'static str>) -> Option<String> {
+    match (hint, sentence) {
+        (Some(hint), Some(sentence)) => Some(format!("{hint} {sentence}")),
+        (hint, sentence) => hint.or_else(|| sentence.map(str::to_string)),
+    }
+}
+
 pub(crate) const ALL_UNRESOLVED: &str =
     "allUnresolved: the linker confirmed none of these rows, so check each in its own file before \
      relying on it; the rest of the project needs no search.";
+
+/// Moved out of the instructions (ADR 0022): it is only needed once a row
+/// says `resolved: false`.
+pub(crate) const UNRESOLVED_ROW: &str =
+    "`resolved: false`: the linker could not confirm this cross-file edge (whether that file exports \
+     the name); every same-file edge is `resolved: true`, never a reason to grep.";
+
+/// Explains `mcp::provenance`'s field, which the instructions no longer
+/// describe per language (ADR 0022, section 2).
+pub(crate) const PROVENANCE: &str =
+    "`provenance`: this language's semantic pass has not finished, so method calls through a variable \
+     receiver may be missing here; ask again later or grep for them.";
 
 pub(crate) const AMBIGUOUS: &str =
     "Several declarations have this name: re-query with the right candidate's `id` as `symbol_id`, \
@@ -168,6 +191,8 @@ mod tests {
         let causes = ["maxDepth", "maxFanout", "explorationBudget", "responseSize"];
         let mut all = vec![
             ALL_UNRESOLVED,
+            UNRESOLVED_ROW,
+            PROVENANCE,
             AMBIGUOUS,
             FILE_ROW,
             FILES_TALLY,

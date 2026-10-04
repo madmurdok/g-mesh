@@ -601,3 +601,68 @@ async fn a_walk_replaces_the_failed_languages_seeded_from_the_index() {
     assert!(python.contains("added_python_symbol"), "the re-walked language is routed again: {python}");
     client.cancel().await.expect("failed to shut the client down");
 }
+
+/// GM-330/S12: the daemon's activation log line for a `Failed` language
+/// (`daemon::activation::ActivationCtx::walk`) is ONE stderr line carrying
+/// the whole stored chain joined by ": " (`languages::error_on_one_line`) -
+/// here the walk step and, innermost, the missing-binary hint naming the
+/// build command. The daemon is started directly with its stderr in a file,
+/// so the line is read as the daemon wrote it (a shim would redirect it to
+/// `daemon.log`).
+///
+/// Control: print the stored error raw in that `eprintln!` (no
+/// `error_on_one_line`) - the line ends after the step, the hint lands on a
+/// line of its own, and the exact comparison fails.
+#[test]
+fn the_daemons_log_line_for_a_failed_language_is_its_whole_chain_on_one_line() {
+    let project = Project::new(&[("tools/gen.py", "def gen():\n    pass\n")]);
+    let (plugins, _binary) = common::rust_and_missing_python_plugin_root();
+    let logs = tempfile::tempdir().expect("failed to create a log directory");
+    let log = logs.path().join("daemon.stderr");
+
+    let mut child = StdCommand::new(BIN)
+        .arg("daemon")
+        .arg("--project-root")
+        .arg(project.root())
+        .current_dir(project.root())
+        .env("G_MESH_PLUGIN_ROOTS_OVERRIDE", plugins.path())
+        .env(g_mesh::embedding::model::MODEL_DIR_ENV, NO_MODEL_DIR)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).expect("failed to create the stderr file"))
+        .spawn()
+        .expect("failed to spawn the daemon");
+    common::wait_for("the daemon to listen", common::startup_timeout(), || {
+        daemon::is_listening(project.root()).unwrap_or(false)
+    });
+    // The log line is written before the phase leaves `indexing`.
+    common::wait_until_phase(project.root(), "ready");
+    common::kill_and_wait(child.id());
+    let _ = child.wait();
+
+    let stored = match project.outcomes().into_iter().find(|(language, _)| language == "python") {
+        Some((_, LanguageOutcome::Failed { error })) => error,
+        other => panic!("python must be recorded as Failed, got {other:?}"),
+    };
+    let causes: Vec<&str> = stored.lines().collect();
+    assert_eq!(
+        causes.first().copied(),
+        Some("failed to spawn the python plugin's bulk index"),
+        "the step is the outer cause: {stored}"
+    );
+    assert!(
+        causes.len() >= 2 && causes.last().is_some_and(|hint| hint.contains("cargo build --workspace")),
+        "the hint is a separate, innermost cause: {stored}"
+    );
+
+    let stderr = std::fs::read_to_string(&log).expect("failed to read the daemon's stderr");
+    let lines = lines_starting(&stderr, "g-mesh daemon: python failed");
+    assert_eq!(
+        lines,
+        [format!(
+            "g-mesh daemon: python failed to index and is left out of the index until `g-mesh reindex`: {}",
+            causes.join(": ")
+        )],
+        "one line with every cause: {stderr}"
+    );
+}

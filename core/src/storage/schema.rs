@@ -713,11 +713,9 @@ fn present_languages(conn: &Connection) -> Result<Vec<String>> {
 }
 
 /// [`present_languages`], each paired with whether that language's
-/// `language_state.semanticPassAt` is set - what `mcp::instructions` reads
-/// (GM-262) to decide, per present language, whether a `receiver_calls`
-/// capability that depends on a completed semantic pass
-/// (`daemon::manifest::Capabilities::receiver_calls`, gated on
-/// `receiver_calls_structural` being unresolved) still names an open gap.
+/// `language_state.semanticPassAt` is set. `mcp::instructions` reads only
+/// the languages: its text is rendered from manifest capabilities, never
+/// from pass state (ADR 0022).
 ///
 /// `pub` rather than folded into a private helper: this is read from
 /// `mcp::mod::GMeshMcpServer::get_info`, a synchronous trait method with a

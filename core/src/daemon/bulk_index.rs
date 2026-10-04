@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
@@ -198,7 +198,7 @@ pub fn run_with_progress(
                 })?;
                 (ctx.summary.nodes, ctx.summary.edges, ctx.summary.skipped_lines) = counts_before;
                 ctx.walked_files = walked_before;
-                failed.insert(manifest.language.clone(), format!("{err:#}"));
+                failed.insert(manifest.language.clone(), languages::failed_error(&err));
             }
             if let Some(progress) = progress {
                 progress.mark_language_done();
@@ -255,7 +255,7 @@ pub fn run_with_progress(
         let mut message = String::from("every discovered language failed to index:");
         for (language, outcome) in &summary.outcomes {
             if let LanguageOutcome::Failed { error } = outcome {
-                message.push_str(&format!("\n  {language}: {error}"));
+                message.push_str(&format!("\n  {language}: {}", languages::error_on_one_line(error)));
             }
         }
         bail!(message);
@@ -364,7 +364,11 @@ fn walk_one_language_in(
     // cargo-workspace plugin binary gets a message naming the build command
     // instead of a bare "No such file or directory".
     if let Some(hint) = plugin::missing_plugin_binary_hint(&manifest.command, &manifest.args) {
-        bail!("failed to spawn the {} plugin's bulk index: {hint}", manifest.language);
+        // The hint is the innermost cause, so the instructions show it rather
+        // than the step (ADR 0022).
+        return Err(
+            anyhow!(hint).context(format!("failed to spawn the {} plugin's bulk index", manifest.language))
+        );
     }
 
     let mut command = Command::new(&manifest.command);
@@ -927,6 +931,53 @@ mod tests {
         assert_eq!(rows.len(), 2, "both failures must be recorded: {rows:?}");
         for (_, outcome) in &rows {
             assert!(matches!(outcome, LanguageOutcome::Failed { .. }), "{rows:?}");
+        }
+    }
+
+    /// The all-failed error names each language on one line of its own,
+    /// with that language's whole stored chain (one cause per line in the
+    /// store) joined by ": " - never the stored newlines (GM-330, ADR 0021
+    /// section 2).
+    ///
+    /// Control: push the stored error raw (no `error_on_one_line`) - the
+    /// message gains a line per extra cause and the line-count and per-line
+    /// assertions fail.
+    #[test]
+    fn the_all_failed_error_shows_each_whole_chain_on_one_line() {
+        let project = tempfile::tempdir().unwrap();
+        let plugins = tempfile::tempdir().unwrap();
+        // A plugin whose spawn command is gone: the OS refuses the spawn, and
+        // the stored error is the context plus the OS cause (a missing
+        // `plugin.js` entry point is caught earlier, as a single cause).
+        for language in ["alpha", "beta"] {
+            let dir = plugins.path().join(language);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("plugin.toml"),
+                format!(
+                    "[plugin]\nlanguage = \"{language}\"\nprotocol_version = {}\n\
+                     plugin_version = \"0.0.0-test\"\n\n[plugin.spawn]\ncommand = \"./g-mesh-plugin-{language}\"\n\n\
+                     [plugin.languages]\nextensions = [\".{language}-src\"]\n",
+                    crate::protocol::types::CURRENT_PROTOCOL_VERSION
+                ),
+            )
+            .unwrap();
+        }
+        let discovered = discover_root(plugins.path());
+        let conn = setup_conn();
+
+        let message = run(project.path(), &conn, None, &discovered)
+            .expect_err("a walk where every discovered language failed is an error")
+            .to_string();
+
+        let rows = recorded_outcomes(&conn);
+        let lines: Vec<&str> = message.lines().collect();
+        assert_eq!(lines.len(), 1 + rows.len(), "a header and one line per language: {message}");
+        for ((language, outcome), line) in rows.iter().zip(&lines[1..]) {
+            let LanguageOutcome::Failed { error } = outcome else { panic!("{rows:?}") };
+            let causes: Vec<&str> = error.lines().collect();
+            assert!(causes.len() >= 2, "the fixture must store a multi-line chain: {error}");
+            assert_eq!(*line, format!("  {language}: {}", causes.join(": ")), "{message}");
         }
     }
 

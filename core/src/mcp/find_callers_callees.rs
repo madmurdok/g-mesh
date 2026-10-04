@@ -329,7 +329,8 @@ struct CalleePage {
     /// from an edge the linker couldn't confirm.
     all_unresolved: bool,
     /// `anchor::file_anchor_hint`, then `session_hints::ALL_UNRESOLVED` when
-    /// `all_unresolved`; absent (not `null`) when neither applies.
+    /// `all_unresolved`, then the once-per-session sentences its rows and
+    /// `provenance` trigger; absent (not `null`) when none applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
     /// See [`ExcludedReferences`] - absent, not zero, when the walk left
@@ -437,6 +438,12 @@ pub(crate) fn handle_callers_in(
         bounded.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
         hints.once(has_file_row, HintKey::FileRow, session_hints::FILE_ROW),
         hints.once(files.is_some(), HintKey::FilesTally, session_hints::FILES_TALLY),
+        hints.once(
+            !bounded.all_unresolved && bounded.results.iter().any(|row| !row.resolved),
+            HintKey::UnresolvedRow,
+            session_hints::UNRESOLVED_ROW,
+        ),
+        hints.once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
     ]);
 
     success(&CallerPage {
@@ -462,8 +469,9 @@ pub(crate) fn handle_callees(
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
+    let hints = SessionHints::default();
     find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        handle_callees_in(store, semantic, capabilities, params.clone())
+        handle_callees_in(store, semantic, capabilities, &hints, params.clone())
     })
 }
 
@@ -472,6 +480,7 @@ pub(crate) fn handle_callees_in(
     store: &Arc<IndexStore>,
     semantic: &find_definition::SemanticRung<'_>,
     capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -525,6 +534,16 @@ pub(crate) fn handle_callees_in(
             excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str())),
         );
     let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
+    let hint = session_hints::join([
+        hint,
+        bounded.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
+        hints.once(
+            !bounded.all_unresolved && bounded.results.iter().any(|row| !row.resolved),
+            HintKey::UnresolvedRow,
+            session_hints::UNRESOLVED_ROW,
+        ),
+        hints.once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+    ]);
 
     success(&CalleePage {
         anchor: anchor_info,
@@ -532,7 +551,7 @@ pub(crate) fn handle_callees_in(
         has_more: bounded.has_more,
         next_cursor: bounded.next_cursor,
         all_unresolved: bounded.all_unresolved,
-        hint: session_hints::join([hint, bounded.all_unresolved.then_some(session_hints::ALL_UNRESOLVED)]),
+        hint,
         excluded_references: excluded,
         provenance,
     })

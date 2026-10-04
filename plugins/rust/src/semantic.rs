@@ -59,8 +59,8 @@
 //!
 //! Incomplete, not complete, is the load-bearing half: it leaves
 //! `language_state.semanticPassAt` unset, which is what keeps Rust's
-//! receiver-call gap listed in the generated MCP instructions
-//! (`core::mcp::instructions::has_open_receiver_gap`). Installing the
+//! answers carrying a `provenance` block that says the semantic tier is
+//! missing (`core::mcp::provenance`). Installing the
 //! component and restarting the daemon then gets the pass; a
 //! completed-but-empty pass would have recorded "done" and never asked again.
 
