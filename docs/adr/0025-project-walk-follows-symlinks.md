@@ -71,7 +71,9 @@ coverage it has today).
   Core learning the link table is a backlog task.
 - An event spelled through a link is remapped to the indexed real spelling by
   the SDK session (GM-349's own code slice), so an aliased file stays indexed
-  once after its first edit.
+  once after its first edit. The remap applies only when the index holds the
+  real spelling and it lies inside the root; a deleted path is handled as
+  spelled.
 - Windows junctions are followed as links (believed from `is_symlink`'s
   definition; checked on CI).
 
