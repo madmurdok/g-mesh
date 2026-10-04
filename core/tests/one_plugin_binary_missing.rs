@@ -389,9 +389,11 @@ fn index_recording_python_as_failed(project: &Project, plugins: &Path) {
 /// (the index is complete), yet a Python file edited while no daemon ran is
 /// not reindexed by a query, while the Rust file edited alongside it is.
 ///
-/// Control: drop the `self.seed_failed_languages()` call at the top of
-/// `daemon::activation::ActivationCtx::activate` - the outline call reindexes
-/// `tools/gen.py` and `added_python_symbol` is written.
+/// Control: drop the `registry.seed_failed_languages(&conn)` call in
+/// `daemon::run` - nothing else fills the set (activation does not walk this
+/// complete index, so `ActivationCtx::walk`'s `set_failed_languages` never
+/// runs), the outline call reindexes `tools/gen.py` and `added_python_symbol`
+/// is written.
 #[tokio::test]
 async fn a_failed_language_recorded_in_the_index_is_not_reindexed_after_a_restart() {
     let project = Project::new(&[("tools/gen.py", "def gen():\n    pass\n")]);
@@ -421,6 +423,144 @@ async fn a_failed_language_recorded_in_the_index_is_not_reindexed_after_a_restar
         0,
         "a language recorded as failed must not be reindexed: {python}"
     );
+    client.cancel().await.expect("failed to shut the client down");
+}
+
+/// `g-mesh daemon` for `project`, started directly rather than through a
+/// shim, so that no tool call - and so no activation - happens until the test
+/// makes one. Returns once the daemon is listening.
+fn start_daemon(project: &Project, plugins: &Path) -> std::process::Child {
+    let child = StdCommand::new(BIN)
+        .arg("daemon")
+        .arg("--project-root")
+        .arg(project.root())
+        .current_dir(project.root())
+        .env("G_MESH_PLUGIN_ROOTS_OVERRIDE", plugins)
+        .env(g_mesh::embedding::model::MODEL_DIR_ENV, NO_MODEL_DIR)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn the daemon");
+    common::wait_for("the daemon to listen", common::startup_timeout(), || {
+        daemon::is_listening(project.root()).unwrap_or(false)
+    });
+    child
+}
+
+/// The rust crate's `src/lib.rs`, declaring `marker` beside the kept symbol.
+fn write_rust_marker(project: &Project, marker: &str) {
+    std::fs::write(
+        project.root().join("src/lib.rs"),
+        format!("pub fn kept_rust_symbol() -> u32 {{\n    1\n}}\npub fn {marker}() {{}}\n"),
+    )
+    .expect("failed to edit the rust file");
+}
+
+fn has_node(project: &Project, name: &str) -> bool {
+    project.count(&format!("SELECT COUNT(*) FROM nodes WHERE name = '{name}'")) > 0
+}
+
+/// Edits the rust file until the watcher writes the edit's marker: proof that
+/// the watcher is registered and its consumer is routing. Retried because the
+/// watcher is registered after the endpoint is bound, so an edit made right
+/// after `start_daemon` may predate it and never be seen.
+fn wait_until_the_watcher_routes(project: &Project) {
+    let deadline = std::time::Instant::now() + common::startup_timeout();
+    for attempt in 0.. {
+        let marker = format!("watcher_primed_{attempt}");
+        write_rust_marker(project, &marker);
+        let retry_at = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < retry_at {
+            if has_node(project, &marker) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(std::time::Instant::now() < deadline, "the watcher never routed a rust edit");
+    }
+}
+
+/// ADR 0021 section 2, across a restart and before any tool call: a daemon
+/// over a complete index whose `language_outcome` records Python as failed
+/// does not route a Python edit its watcher sees, though no tool call has
+/// activated it yet (the watcher's consumer of a walked index starts at
+/// startup). The Python plugin works, so a routed edit would be indexed.
+///
+/// The wait is honest: after the Python edit, two Rust edits in turn are
+/// waited for until the watcher writes them. Events arrive in order and the
+/// consumer routes on one thread, so the Python change was settled, and
+/// routed or skipped, before the second Rust edit was even recorded.
+/// The phase is still `structural` at the end: no activation ran.
+///
+/// Control: drop the `registry.seed_failed_languages(&conn)` call in
+/// `daemon::run` (or move it back into activation) - the watcher routes
+/// `tools/gen.py` and `added_python_symbol` is written.
+#[test]
+fn a_failed_language_is_not_routed_by_the_watcher_before_the_first_tool_call() {
+    let project = Project::new(&[("tools/gen.py", "def gen():\n    pass\n")]);
+    let (plugins, binary) = common::rust_and_missing_python_plugin_root();
+    install_python_binary(&binary);
+    index_recording_python_as_failed(&project, plugins.path());
+
+    let mut daemon_process = start_daemon(&project, plugins.path());
+    wait_until_the_watcher_routes(&project);
+
+    std::fs::write(
+        project.root().join("tools/gen.py"),
+        "def gen():\n    pass\n\ndef added_python_symbol():\n    pass\n",
+    )
+    .expect("failed to edit the python file");
+    for marker in ["after_python_first", "after_python_second"] {
+        write_rust_marker(&project, marker);
+        common::wait_for(&format!("the watcher to index {marker}"), common::startup_timeout(), || {
+            has_node(&project, marker)
+        });
+    }
+
+    assert!(!has_node(&project, "added_python_symbol"), "a language recorded as failed must not be routed");
+    let phase = std::fs::read_to_string(daemon::phase_path_in(
+        &project_dir(project.root()).expect("failed to resolve the state directory"),
+    ))
+    .expect("failed to read the phase file");
+    assert_eq!(phase.trim(), "structural", "no tool call may have activated the daemon");
+    let _ = daemon_process.kill();
+    let _ = daemon_process.wait();
+}
+
+/// ADR 0021 section 2, on the first tool call after a restart: an outline of
+/// a Python file edited while no daemon ran, sent before activation has run
+/// (or finished), does not reindex it through `ensure_fresh`. The Rust file
+/// edited alongside it is reindexed by the next call, so the path works.
+///
+/// Control: drop the `registry.seed_failed_languages(&conn)` call in
+/// `daemon::run` - the outline reindexes `tools/gen.py` and
+/// `added_python_symbol` is written. (Seeding in activation instead races
+/// this call, which is why the seed moved.)
+#[tokio::test]
+async fn a_failed_language_is_not_reindexed_by_the_first_tool_call_after_a_restart() {
+    let project = Project::new(&[("tools/gen.py", "def gen():\n    pass\n")]);
+    let (plugins, binary) = common::rust_and_missing_python_plugin_root();
+    install_python_binary(&binary);
+    index_recording_python_as_failed(&project, plugins.path());
+
+    std::fs::write(
+        project.root().join("tools/gen.py"),
+        "def gen():\n    pass\n\ndef added_python_symbol():\n    pass\n",
+    )
+    .expect("failed to edit the python file");
+    write_rust_marker(&project, "added_rust_symbol");
+
+    let client =
+        ().serve(shim(project.root(), plugins.path())).await.expect("the shim must reach the daemon");
+    let python = outline(&client, "tools/gen.py").await;
+    assert!(
+        !has_node(&project, "added_python_symbol"),
+        "the first call must not reindex a language recorded as failed: {python}"
+    );
+    let rust = outline(&client, "src/lib.rs").await;
+    assert!(rust.contains("added_rust_symbol"), "a routed language is reindexed at query time: {rust}");
+    assert!(!has_node(&project, "added_python_symbol"), "nor may any later step: {python}");
     client.cancel().await.expect("failed to shut the client down");
 }
 

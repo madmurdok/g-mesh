@@ -1019,3 +1019,45 @@ fn setting_the_failed_languages_replaces_the_previous_set() {
 
     assert_eq!(test_plugin::spawns(&dirs[0]).len(), 1);
 }
+
+/// `seed_failed_languages` loads exactly the languages the index records as
+/// `Failed`: an `Indexed` or `PluginAbsent` row seeds nothing, so those
+/// languages keep routing after a restart.
+///
+/// Controls: drop the `set_failed_languages` call in `seed_failed_languages`
+/// (python is not failed); make its filter keep every row (ruby and go are
+/// failed too).
+#[test]
+fn seeding_from_the_index_marks_only_the_languages_recorded_as_failed() {
+    let (_project, _plugins, _dirs, registry) = registry_over(&["python", "ruby", "go"]);
+    let conn = test_plugin::empty_index();
+    let outcomes = std::collections::BTreeMap::from([
+        ("python".to_string(), LanguageOutcome::Failed { error: "the walk failed it".to_string() }),
+        ("ruby".to_string(), LanguageOutcome::Indexed { files: 1 }),
+        ("go".to_string(), LanguageOutcome::PluginAbsent { files: Some(2) }),
+    ]);
+    conn.with(|conn| schema::record_language_outcomes(conn, &outcomes))
+        .expect("failed to record the outcomes");
+
+    registry.seed_failed_languages(&conn);
+
+    assert!(registry.is_failed_language("python"), "a Failed row seeds its language");
+    assert!(!registry.is_failed_language("ruby"), "an Indexed row seeds nothing");
+    assert!(!registry.is_failed_language("go"), "a PluginAbsent row seeds nothing");
+}
+
+/// An index whose outcome table cannot be read seeds an empty set and does
+/// not fail: the daemon keeps serving the rest of the index.
+///
+/// Control: replace the `Err` arm's log with a panic (or propagate it) - the
+/// call panics.
+#[test]
+fn seeding_from_an_unreadable_outcome_table_leaves_the_set_empty() {
+    let (_project, _plugins, _dirs, registry) = registry_over(&["python"]);
+    let conn = test_plugin::empty_index();
+    conn.with(|conn| conn.execute("DROP TABLE language_outcome", [])).expect("failed to drop the table");
+
+    registry.seed_failed_languages(&conn);
+
+    assert!(!registry.is_failed_language("python"));
+}
