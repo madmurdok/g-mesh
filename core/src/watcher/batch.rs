@@ -51,3 +51,6 @@ pub fn order_for_routing<T>(mut batch: Vec<(SettledKind, T)>) -> Vec<T> {
     batch.sort_by_key(|(kind, _)| *kind);
     batch.into_iter().map(|(_, item)| item).collect()
 }
+
+#[cfg(test)]
+mod tests;
