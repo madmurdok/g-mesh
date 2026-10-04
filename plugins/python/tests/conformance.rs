@@ -113,8 +113,10 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 // page an agent gets when it asks who calls an override whose one call site
 // was attributed to the base's annotation. Deliberately NOT semantic: the page
 // is empty with pyright and without it, which is the hazard it records.
-const EXPECTATIONS: usize = 13;
-const SEMANTIC_EXPECTATIONS: usize = 3;
+// 14, and 4 semantic, with `[[callers]] coerce`: one caller of two `@overload`
+// stubs is two bound edges only when pyright's hover picks each stub (ADR 0024).
+const EXPECTATIONS: usize = 14;
+const SEMANTIC_EXPECTATIONS: usize = 4;
 
 /// GM-380: the tripwire above only works if tripping it says what to do.
 ///
