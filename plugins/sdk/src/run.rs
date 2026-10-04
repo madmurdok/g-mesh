@@ -49,6 +49,7 @@
 //! `hasSyntaxErrors` records it (see [`FileGraph::mark_syntax_errors`]) and
 //! the graph is committed like any other.
 
+use std::collections::HashSet;
 use std::io::{self, BufReader, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -414,6 +415,20 @@ impl<E: Extractor> Session<'_, E> {
                 let diff = self.file_changed(&RelPath::new(path));
                 self.respond(out, id, diff)
             }
+            "filesCreated" => {
+                // A notification: every listed file was created in one
+                // watcher batch, and each still gets its own `fileChanged`
+                // after this. Only presence is applied here, nothing is
+                // extracted, so there is no diff to answer with. A non-string
+                // entry costs itself, not the list.
+                let files: Vec<RelPath> = params
+                    .and_then(|params| params.get("filePaths"))
+                    .and_then(|paths| paths.as_array())
+                    .map(|paths| paths.iter().filter_map(|path| path.as_str()).map(RelPath::new).collect())
+                    .unwrap_or_default();
+                self.files_created(&files);
+                self.acknowledge(out, id)
+            }
             "semanticPass" => {
                 // Test-only (GM-397): parks the pass before any engine
                 // starts, blocking this thread as a long pass would.
@@ -521,6 +536,7 @@ impl<E: Extractor> Session<'_, E> {
             if self.project.is_none() {
                 self.load_project();
             }
+            self.presence_changed(&path, true);
             let Some(project) = self.project.as_ref() else { return false };
             if let Some(graph) = extract_caught(self.extractor, project, &path, &source, &self.spec.language)
             {
@@ -539,7 +555,12 @@ impl<E: Extractor> Session<'_, E> {
             return FileChangeDiff::default();
         }
 
-        let Some(source) = read_source(path, &self.root, &self.spec.language) else {
+        // Presence first, and before the unchanged-text short-circuit below,
+        // so the model never extracts against a file set missing this event.
+        // An unreadable file is applied as gone, as the diff treats it.
+        let source = read_source(path, &self.root, &self.spec.language);
+        self.presence_changed(path, source.is_some());
+        let Some(source) = source else {
             // Gone, or unreadable: everything this plugin had for the file is
             // deleted. Forgetting it too means a re-creation is treated as a
             // first sighting rather than diffed against a stale baseline.
@@ -595,10 +616,66 @@ impl<E: Extractor> Session<'_, E> {
     ///
     /// One `canonicalize` per event.
     fn indexed_spelling(&self, path: &RelPath) -> Option<RelPath> {
+        self.real_spelling(path).filter(|real| self.index.entry(real).is_some())
+    }
+
+    /// `path`'s real in-root spelling when it differs from `path`; `None`
+    /// when they are the same, when `path` does not resolve, when it resolves
+    /// outside the root, or when the root itself could not be resolved. The
+    /// one `canonicalize` behind [`Session::indexed_spelling`] and
+    /// [`Session::files_created`].
+    fn real_spelling(&self, path: &RelPath) -> Option<RelPath> {
         let root_real = self.root_real.as_ref()?;
         let real = std::fs::canonicalize(path.to_absolute(&self.root)).ok()?;
         let real = RelPath::relative_to(root_real, &real)?;
-        (real != *path && self.index.entry(&real).is_some()).then_some(real)
+        (real != *path).then_some(real)
+    }
+
+    /// Applies presence for every file of one watcher batch's creations, so
+    /// the `fileChanged`s that follow extract against a model holding all of
+    /// them. Extracts nothing.
+    ///
+    /// Invariants:
+    /// - a link spelling is remapped to its real spelling when the real one
+    ///   is indexed **or listed in this same call**: the real one may be
+    ///   created in this batch and so not indexed yet, and the walk lists only
+    ///   the real spelling (`docs/adr/0025-project-walk-follows-symlinks.md`).
+    ///   Otherwise the path is handled as spelled;
+    /// - `present` is read from the disk now, not taken from the list: a file
+    ///   may be gone again by the time this arrives, and its own
+    ///   `fileChanged` follows and agrees;
+    /// - one bad entry (unclaimed, outside the root, a panicking hook) costs
+    ///   only itself;
+    /// - with no project model, nothing is applied: the next load reads the
+    ///   disk, which already holds every listed file.
+    fn files_created(&mut self, files: &[RelPath]) {
+        if self.project.is_none() {
+            return;
+        }
+        let listed: HashSet<&RelPath> = files.iter().collect();
+        let mut applied: HashSet<RelPath> = HashSet::new();
+        for spelled in files {
+            let path = self
+                .real_spelling(spelled)
+                .filter(|real| listed.contains(real) || self.index.entry(real).is_some())
+                .unwrap_or_else(|| spelled.clone());
+            if !self.claims(&path) || !applied.insert(path.clone()) {
+                continue;
+            }
+            let present = is_readable_source(&path, &self.root);
+            self.presence_changed(&path, present);
+        }
+    }
+
+    /// [`Extractor::file_presence_changed`] for one path, when there is a
+    /// project model to apply it to and the path is inside the root.
+    fn presence_changed(&mut self, path: &RelPath, present: bool) {
+        if !is_within_root(path) {
+            return;
+        }
+        if let Some(project) = self.project.as_mut() {
+            presence_caught(self.extractor, project, path, present, &self.spec.language);
+        }
     }
 
     fn claims(&self, path: &RelPath) -> bool {
@@ -716,6 +793,41 @@ fn read_source(path: &RelPath, root: &Path, language: &str) -> Option<String> {
             eprintln!("[{language}] skipping {path}: {err}");
             None
         }
+    }
+}
+
+/// Whether `path` would be read as a source by [`read_source`] - an existing
+/// file that is valid UTF-8 - without its logging, so presence agrees with
+/// what the file's own `fileChanged` will find.
+fn is_readable_source(path: &RelPath, root: &Path) -> bool {
+    std::fs::read(path.to_absolute(root)).is_ok_and(|bytes| std::str::from_utf8(&bytes).is_ok())
+}
+
+/// Whether `path` is relative and never climbs out with `..`: the
+/// presence hook's contract excludes every other path.
+fn is_within_root(path: &RelPath) -> bool {
+    let path = Path::new(path.as_str());
+    !path.has_root()
+        && path.components().all(|component| {
+            !matches!(component, std::path::Component::ParentDir | std::path::Component::Prefix(_))
+        })
+}
+
+/// [`Extractor::file_presence_changed`], with a panic in it costing this
+/// path's presence rather than the process or the rest of a batch.
+///
+/// `AssertUnwindSafe` although the hook mutates `project`: a panic may leave
+/// the model half-updated for this path, which the hook's contract accepts
+/// (it says not to panic); `workspaceChanged` rebuilds the model whole.
+fn presence_caught<E: Extractor>(
+    extractor: &E,
+    project: &mut E::Project,
+    path: &RelPath,
+    present: bool,
+    language: &str,
+) {
+    if catch_unwind(AssertUnwindSafe(|| extractor.file_presence_changed(project, path, present))).is_err() {
+        eprintln!("[{language}] the presence hook panicked on {path} - its presence is not applied");
     }
 }
 

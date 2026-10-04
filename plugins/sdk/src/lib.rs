@@ -172,4 +172,21 @@ pub trait Extractor: Send + Sync {
     /// spelling core uses - forward slashes, relative to the project root -
     /// and the SDK guarantees it ([`RelPath`]).
     fn extract(&self, project: &Self::Project, path: &RelPath, source: &str) -> FileGraph;
+
+    /// Records that `path` now exists (`present`) or no longer does, so
+    /// `extract` can resolve against the project's current file set without
+    /// reading the disk (`docs/adr/0023-project-model-tracks-file-presence.md`).
+    ///
+    /// The default does nothing, which suits a project model that holds no
+    /// file set. Contract:
+    /// - **idempotent**: one creation may be reported more than once (once
+    ///   for the whole watcher batch it arrived in, again by its own
+    ///   `fileChanged`), and a hydrated file is reported although
+    ///   [`Extractor::load_project`] already saw it;
+    /// - called before any extraction it affects, only for paths whose
+    ///   extension this plugin claims, never from the bulk walk (whose model
+    ///   comes from `load_project`), and never with a path outside the root;
+    /// - a panic is caught and costs that one path's presence. It may leave
+    ///   `project` half-updated, so do not panic here either.
+    fn file_presence_changed(&self, _project: &mut Self::Project, _path: &RelPath, _present: bool) {}
 }
