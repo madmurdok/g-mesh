@@ -250,9 +250,12 @@ sequenceDiagram
     I-->>A: "python: 412 files, no plugin installed.<br/>Run `g-mesh plugins install python`."
 ```
 
-The walk already visits every file to decide what to hand a plugin. Counting the
-ones it *would* have handed to a plugin that is not there is nearly free, and it
-is what turns silence into a sentence.
+Correction (GM-329/S1, from the source): core does not walk the project today -
+each plugin walks in its own `--bulk-index` process - so counting an absent
+language's files is a new, daemon-side walk, not a by-product. It runs only when
+some catalogue language has no plugin, counts only those languages, and is
+measured before it ships; see [ADR 0021](../adr/0021-per-language-bulk-outcome.md)
+sections 3-4.
 
 ## Interfaces
 
@@ -263,8 +266,10 @@ enum LanguageOutcome {
     /// A plugin was discovered and indexed this language.
     Indexed { files: usize },
     /// The catalogue names this language and the project has files for it,
-    /// but no plugin was discovered. NOT an error.
-    PluginAbsent { files: usize, install: String },
+    /// but no plugin was discovered. NOT an error. `None`: files seen, not
+    /// counted (ADR 0021's deadline fallback). The install command is derived
+    /// from the catalogue (`CatalogueEntry::install_command`), not stored.
+    PluginAbsent { files: Option<usize> },
     /// A plugin was discovered and could not be used. An error for this
     /// language, and only for this language.
     Failed { error: String },
@@ -274,7 +279,8 @@ enum LanguageOutcome {
 `bulk_index::run` returns one of these per language instead of aborting on the
 first failure. The whole index fails only when *every* discovered plugin failed,
 which is the case that means something is wrong with the installation rather
-than with one language.
+than with one language. Decided, with the store GM-330 reads
+(`schema::language_outcomes`), in [ADR 0021](../adr/0021-per-language-bulk-outcome.md).
 
 ### Instructions: three states, not two
 

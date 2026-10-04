@@ -1,7 +1,9 @@
 # 0002. Bulk walk: one one-shot process per language, and one failure fails the walk
 
 ## Status
-Accepted
+Accepted. Decision 2 is superseded by [ADR 0021](0021-per-language-bulk-outcome.md)
+(proposed), which answers its partial-index objection rather than
+overruling it; decision 1 stands.
 
 ## Context
 A never-indexed project needs a populated graph before its daemon answers
