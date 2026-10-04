@@ -97,9 +97,13 @@ on: a failed language is not "present", so the `bulkIndexedAt` roll-up and
 the semantic pass ignore it; the instructions never describe a half-walked
 language as present.
 
-For the rest of that daemon's life the registry does not route a failed
-language's files (watcher events, query-time reindex), so single-file updates
-cannot re-populate part of it.
+Until the language is re-walked successfully (`g-mesh reindex` or a plugin
+change), the registry does not route a failed language's files (watcher
+events, query-time reindex), so single-file updates cannot re-populate part of
+it. This holds across daemon restarts: every activation loads the failed set
+from the `language_outcome` table, whether or not it walks, and a walk in that
+activation replaces the set with its own result. A table that cannot be read
+is logged and leaves the set empty; activation does not fail over it.
 
 **Retry**: none automatic. `meta.bulkIndexedAt` is set (the index is complete
 for every language it could index), so the next start does not re-walk. A

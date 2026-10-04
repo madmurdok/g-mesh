@@ -130,6 +130,7 @@ impl ActivationCtx {
     /// order. `Err` only for a failure of the walk (or of what it strictly
     /// needs); the semantic and embedding passes stay best-effort.
     fn activate(&mut self) -> Result<()> {
+        self.seed_failed_languages();
         if self.needs_walk {
             self.walk()?;
         } else if self.needs_semantic_pass_retry {
@@ -202,6 +203,30 @@ impl ActivationCtx {
         }
         self.indexing.set_phase(Phase::Ready);
         Ok(())
+    }
+
+    /// Loads the languages the last walk failed (`language_outcome` rows
+    /// recorded as `Failed`) into the registry, so a failed language stays out
+    /// of single-file updates across daemon restarts, not only in the process
+    /// that walked: see `docs/adr/0021-per-language-bulk-outcome.md`, section 2.
+    /// Runs on every activation, before the watcher's consumer starts; a walk
+    /// in this activation then replaces the set with its own result.
+    ///
+    /// A table that cannot be read leaves the set empty rather than failing
+    /// activation: the structural index is otherwise usable, and refusing to
+    /// serve it over this table would turn a degraded guarantee into an outage.
+    fn seed_failed_languages(&self) {
+        match self.conn.with(schema::language_outcomes) {
+            Ok(outcomes) => {
+                self.registry.set_failed_languages(outcomes.into_iter().filter_map(|(language, outcome)| {
+                    matches!(outcome, LanguageOutcome::Failed { .. }).then_some(language)
+                }))
+            }
+            Err(err) => eprintln!(
+                "g-mesh daemon: could not read the recorded language outcomes - failed languages are not \
+                 excluded from incremental updates until the next walk: {err:#}"
+            ),
+        }
     }
 
     /// The structural walk, its completion marker and the semantic pass that
