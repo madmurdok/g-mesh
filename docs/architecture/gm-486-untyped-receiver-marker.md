@@ -448,3 +448,18 @@ Run: `reindex` took A `real 860 s, user 2114 s, sys 18 s` and B
 Most of the rest was embedding backfill. Load averages at the start were
 174 / 208 / 170, from other work on the machine, and 8 / 27 / 86 at the end.
 So these wall times are not a performance figure.
+
+## Owner decision after the noise measurement
+
+Approved by the owner, verbatim: "Первый вариант".
+
+After a complete semantic pass, 14% of method pages still carried the marker.
+Nearly all of that came from project methods whose names std also uses
+(`expect`, `get`, `push`, `len`, ...). rust-analyzer had answered those calls
+with std targets, which are not indexed, so the bridge recorded nothing and
+the D3 SQL filter, which looks for a semantic edge to a same-named node,
+kept the rows. **D3 is extended:** when the bridge gets an answer for an
+untyped receiver-call site, wherever the answer lands, inside the index or
+outside it, the call's name leaves the caller's `untypedCalls` once every
+untyped site of that name in that caller is answered. The SQL filter stays as
+a second guard.
