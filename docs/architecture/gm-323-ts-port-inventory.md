@@ -121,6 +121,15 @@ not exist - the excalidraw shape); `packages/geom/src/index.ts`
 | E14 | `[[references]] symbol = "target"`, `tier = "semantic"` | `src/nsref/use.ts:keep` (`export const keep = lib.target` via `import * as lib`) | `semanticPass.test.ts` 186 | Stop recording non-call namespace member sites: set empty. |
 | E15 | `[[definition]] symbol = "ambient"`; `[[definition]]` of a function inside `export namespace Outer.Inner` (S2 pins the spelling) | `src/ambient.ts:ambient` (two bodiless `export declare function ambient(...)` signatures, one node) | ambient declarations; `qualifiedPath.test.ts` 129, `extract.test.ts` 448 | Split a bodiless overload set into nodes: two rows. Split a dotted namespace name into nested segments: the definition refuses or changes. |
 
+As landed (S2/S3): E5's first entry is `[[callers]] symbol = "Store#pick"`
+with `expect = []`, because the kit cannot narrow a bare `pick` that shares a
+file with `Store#pick`. It catches a bare call binding the class member, but
+not a bare call binding nothing; that positive half (`pick()` inside a method
+binds the module function) stays a `ts-unit` test the port must carry. E9's
+class-field caller is `Holder#fire`. Under its control E1f yields an empty set
+rather than a refused anchor, and E3 degrades to a `container:` row rather than
+an empty set.
+
 Not expressible in the kit, so not in this list (they stay `ts-unit`): outline
 `exported` flags (`extract` 140, the outline bench questions) - the kit has no
 `[[outline]]`; node kinds and signatures; id stability; specifier folding
