@@ -448,7 +448,6 @@ pub(crate) fn declare_semantic_prepare(plugin_dir: &Path) {
 /// Adds `files_created = true` to any fake plugin's `[plugin.capabilities]`,
 /// adding the table if the manifest has none. Takes effect at the next
 /// `discover`.
-#[expect(dead_code, reason = "the batch-presence daemon tests are its callers")]
 pub(crate) fn declare_files_created(plugin_dir: &Path) {
     let path = plugin_dir.join("plugin.toml");
     let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
