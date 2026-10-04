@@ -21,7 +21,7 @@ use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
 use crate::daemon::plugin;
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
-use crate::languages::LanguageOutcome;
+use crate::languages::{self, LanguageOutcome};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
@@ -59,6 +59,12 @@ const FILE_NODE_KIND: &str = "File";
 /// about to ask for and only then ask, so a "still indexing" answer proves the
 /// indexing flag gates the response rather than an empty table.
 pub const WALK_DELAY_ENV: &str = "G_MESH_BULK_INDEX_DELAY_MS";
+
+/// Test-only: set to any non-empty value to switch off the count of files
+/// belonging to absent plugins ([`languages::count_absent_files`]), so a
+/// measurement can compare the walk with and without it. With it set, no
+/// language gets a `PluginAbsent` outcome. Real installs never set it.
+pub const ABSENT_COUNT_OFF_ENV: &str = "G_MESH_BULK_INDEX_NO_ABSENT_COUNT";
 
 /// Test-only: path whose *deletion* releases the finished walk, so completion
 /// is an event the test causes rather than a duration (unlike
@@ -167,28 +173,50 @@ pub fn run_with_progress(
     let mut ctx =
         WalkContext { embedding, progress, walked_files: Some(BTreeSet::new()), ..WalkContext::new(conn) };
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
-    for manifest in manifests {
-        if let Some(progress) = progress {
-            progress.mark_language_started(&manifest.language);
+    // The absent plugins' file count walks the tree on its own thread, from
+    // before the first plugin is spawned until after the last one finished,
+    // so it costs time only when it outlasts every plugin's walk (ADR 0021).
+    // It touches no database. Nothing to count when every catalogue plugin is
+    // installed.
+    let count_absent = !languages::missing(discovered).is_empty() && !absent_count_switched_off();
+    let absent_files = std::thread::scope(|scope| -> Result<BTreeMap<&'static str, usize>> {
+        let counting =
+            count_absent.then(|| scope.spawn(|| languages::count_absent_files(project_root, discovered)));
+        for manifest in &manifests {
+            if let Some(progress) = progress {
+                progress.mark_language_started(&manifest.language);
+            }
+            // A language is wholly in the index or not at all, and the walk fails
+            // only when every discovered language failed (ADR 0021, which answers
+            // ADR 0002's partial-index objection). A failed language's rows are
+            // purged here, before `link_all`, so no cross-file edge reaches them.
+            let counts_before = (ctx.summary.nodes, ctx.summary.edges, ctx.summary.skipped_lines);
+            let walked_before = ctx.walked_files.clone();
+            if let Err(err) = walk_one_language(project_root, manifest, &mut ctx) {
+                purge_language(conn, &manifest.language).with_context(|| {
+                    format!("failed to remove the partly walked {} rows after: {err:#}", manifest.language)
+                })?;
+                (ctx.summary.nodes, ctx.summary.edges, ctx.summary.skipped_lines) = counts_before;
+                ctx.walked_files = walked_before;
+                failed.insert(manifest.language.clone(), format!("{err:#}"));
+            }
+            if let Some(progress) = progress {
+                progress.mark_language_done();
+            }
         }
-        // A language is wholly in the index or not at all, and the walk fails
-        // only when every discovered language failed (ADR 0021, which answers
-        // ADR 0002's partial-index objection). A failed language's rows are
-        // purged here, before `link_all`, so no cross-file edge reaches them.
-        let counts_before = (ctx.summary.nodes, ctx.summary.edges, ctx.summary.skipped_lines);
-        let walked_before = ctx.walked_files.clone();
-        if let Err(err) = walk_one_language(project_root, manifest, &mut ctx) {
-            purge_language(conn, &manifest.language).with_context(|| {
-                format!("failed to remove the partly walked {} rows after: {err:#}", manifest.language)
-            })?;
-            (ctx.summary.nodes, ctx.summary.edges, ctx.summary.skipped_lines) = counts_before;
-            ctx.walked_files = walked_before;
-            failed.insert(manifest.language.clone(), format!("{err:#}"));
-        }
-        if let Some(progress) = progress {
-            progress.mark_language_done();
-        }
-    }
+        Ok(match counting.map(|handle| handle.join()) {
+            None => BTreeMap::new(),
+            Some(Ok(counts)) => counts,
+            // A count is a courtesy: losing it costs the PluginAbsent lines,
+            // never the walk.
+            Some(Err(_)) => {
+                eprintln!(
+                    "g-mesh: counting the files of languages with no plugin installed panicked - skipped"
+                );
+                BTreeMap::new()
+            }
+        })
+    })?;
     let WalkContext { mut summary, walked_files, embed_stats, .. } = ctx;
     let walked_files = walked_files.unwrap_or_default();
     if let Some(embedding) = embedding {
@@ -208,10 +236,21 @@ pub fn run_with_progress(
             (language, outcome)
         })
         .collect();
+    for (language, files) in absent_files {
+        if files > 0 {
+            summary
+                .outcomes
+                .insert(language.to_string(), LanguageOutcome::PluginAbsent { files: Some(files) });
+        }
+    }
     conn.with(|conn| schema::record_language_outcomes(conn, &summary.outcomes))
         .context("failed to record the per-language outcomes of the walk")?;
-    let all_failed = !summary.outcomes.is_empty()
-        && summary.outcomes.values().all(|outcome| matches!(outcome, LanguageOutcome::Failed { .. }));
+    // Over the discovered languages only: an absent plugin is not a failure.
+    let all_failed = !discovered.manifests.is_empty()
+        && discovered
+            .manifests
+            .keys()
+            .all(|language| matches!(summary.outcomes.get(language), Some(LanguageOutcome::Failed { .. })));
     if all_failed {
         let mut message = String::from("every discovered language failed to index:");
         for (language, outcome) in &summary.outcomes {
@@ -385,6 +424,11 @@ fn walk_one_language_in(
         .with_context(|| format!("failed to record that {} was bulk-indexed", manifest.language))?;
 
     Ok(())
+}
+
+/// Whether [`ABSENT_COUNT_OFF_ENV`] is set to a non-empty value.
+fn absent_count_switched_off() -> bool {
+    std::env::var_os(ABSENT_COUNT_OFF_ENV).is_some_and(|value| !value.is_empty())
 }
 
 /// Honors [`WALK_HOLD_FILE_ENV`] and [`WALK_DELAY_ENV`]. A no-op unless one is

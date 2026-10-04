@@ -10,7 +10,10 @@
 //! # Deliberately thin
 //!
 //! An entry holds a language id, the file extensions that language's plugin
-//! claims, and (derived from the id) the command that installs that plugin.
+//! claims, the directories that plugin's walk skips, and (derived from the id)
+//! the command that installs that plugin. Extensions and skipped directories
+//! together say which files the absent plugin *would* index, so core can count
+//! them ([`count_absent_files`]); neither says what the plugin can do.
 //! Nothing else. In particular it holds **no capability fields**: capabilities
 //! belong to the plugin manifest alone (`daemon::manifest::Capabilities`).
 //! The moment the catalogue holds a capability, someone reads it from here
@@ -30,9 +33,14 @@
 //! One entry in [`CATALOGUE`]; nothing else in core is per-language. Take the
 //! extensions from that plugin's own `plugins/<language>/plugin.toml`
 //! (`[plugin.languages] extensions`), lowercase with a leading dot, exactly as
-//! the manifest spells them.
+//! the manifest spells them, and the excluded directories from its
+//! `[plugin.workspace] exclude_dirs`.
 
-use crate::daemon::manifest::{extension_of, DiscoveredPlugins};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use crate::daemon::manifest::{extension_of, under_excluded_dir, DiscoveredPlugins};
+use crate::project_walk;
 
 /// One catalogued language: what core may say about it while its plugin is
 /// absent. See the module doc for why there is nothing more here.
@@ -44,14 +52,19 @@ pub struct CatalogueEntry {
     /// Lowercase, leading-dot extensions, copied from the plugin's
     /// `plugin.toml` `[plugin.languages] extensions`.
     pub extensions: &'static [&'static str],
+    /// Directory names the plugin's walk skips at any depth, copied from its
+    /// `plugin.toml` `[plugin.workspace] exclude_dirs`. Like `extensions`, it
+    /// says which files the absent plugin would claim; it is not a capability.
+    pub exclude_dirs: &'static [&'static str],
 }
 
 impl CatalogueEntry {
     /// The exact command that installs this language's plugin:
     /// `g-mesh plugins install <language>`.
     ///
-    /// That subcommand does not exist yet (GM-331 adds it, in the same
-    /// release); nothing runs or prints this today. It is derived from the
+    /// `g-mesh init`/`reindex` print it on a `PluginAbsent` language's stderr
+    /// line (`cli::language_outcome_lines`); the subcommand ships in the same
+    /// release. It is derived from the
     /// language id rather than stored, so an entry cannot name one language
     /// and install another.
     pub fn install_command(&self) -> String {
@@ -80,10 +93,23 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
     CatalogueEntry {
         language: "typescript",
         extensions: &[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"],
+        exclude_dirs: &["node_modules", "dist"],
     },
-    CatalogueEntry { language: "python", extensions: &[".py", ".pyi"] },
-    CatalogueEntry { language: "rust", extensions: &[".rs"] },
-    CatalogueEntry { language: "go", extensions: &[".go"] },
+    CatalogueEntry {
+        language: "python",
+        extensions: &[".py", ".pyi"],
+        exclude_dirs: &[
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".tox",
+            ".mypy_cache",
+            "site-packages",
+            "node_modules",
+        ],
+    },
+    CatalogueEntry { language: "rust", extensions: &[".rs"], exclude_dirs: &["target"] },
+    CatalogueEntry { language: "go", extensions: &[".go"], exclude_dirs: &["vendor", "testdata"] },
 ];
 
 /// The catalogue entry for `language`, whether or not its plugin is present.
@@ -118,6 +144,17 @@ pub fn absent_for_path(discovered: &DiscoveredPlugins, file_path: &str) -> Optio
     absent_for_path_in(CATALOGUE, discovered, file_path)
 }
 
+/// How many files under `root` each absent catalogue language would index
+/// (ADR 0021): only languages in [`missing`], and only those with at least one
+/// file. A file counts for the language [`absent_for_path`] names, unless it is
+/// under one of that language's own `exclude_dirs` - never another language's,
+/// which would hide `dist/app.py` from an absent Python. Walks with the same
+/// walker as `g-mesh status`, pruning the baseline plus the directories every
+/// absent language excludes. Empty, without walking, when no plugin is absent.
+pub fn count_absent_files(root: &Path, discovered: &DiscoveredPlugins) -> BTreeMap<&'static str, usize> {
+    count_absent_files_in(CATALOGUE, root, discovered)
+}
+
 // The lookups are written over any table, and the public functions above
 // pass `CATALOGUE`: no lookup may depend on which languages the table holds,
 // so that a new language is one entry and nothing else.
@@ -148,6 +185,39 @@ fn absent_for_path_in<'a>(
         return None;
     }
     Some(entry)
+}
+
+fn count_absent_files_in<'a>(
+    table: &'a [CatalogueEntry],
+    root: &Path,
+    discovered: &DiscoveredPlugins,
+) -> BTreeMap<&'a str, usize> {
+    let mut counts = BTreeMap::new();
+    let absent = missing_in(table, discovered);
+    let Some((first, rest)) = absent.split_first() else {
+        return counts;
+    };
+    // `under_excluded_dir` takes owned names, as the manifests hold them.
+    let exclude_dirs = |entry: &CatalogueEntry| -> Vec<String> {
+        entry.exclude_dirs.iter().map(|dir| (*dir).to_string()).collect()
+    };
+    let mut pruned = exclude_dirs(first);
+    for entry in rest {
+        pruned.retain(|dir| entry.exclude_dirs.contains(&dir.as_str()));
+    }
+    let excluded: BTreeMap<&str, Vec<String>> =
+        absent.iter().map(|entry| (entry.language, exclude_dirs(entry))).collect();
+
+    for walked in project_walk::project_files(root, &pruned) {
+        let Some(entry) = absent_for_path_in(table, discovered, &walked.relative) else {
+            continue;
+        };
+        if excluded.get(entry.language).is_some_and(|dirs| under_excluded_dir(&walked.relative, dirs)) {
+            continue;
+        }
+        *counts.entry(entry.language).or_insert(0) += 1;
+    }
+    counts
 }
 
 #[cfg(test)]

@@ -21,9 +21,9 @@ fn languages(entries: &[&CatalogueEntry]) -> Vec<&'static str> {
     entries.iter().map(|entry| entry.language).collect()
 }
 
-/// language -> sorted extensions, read from every real
+/// language -> (sorted extensions, sorted exclude_dirs), read from every real
 /// `plugins/<dir>/plugin.toml` in the checkout.
-fn real_manifest_extensions() -> BTreeMap<String, Vec<String>> {
+fn real_manifest_extensions() -> BTreeMap<String, (Vec<String>, Vec<String>)> {
     let plugins_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
     let mut found = BTreeMap::new();
     for dir in std::fs::read_dir(&plugins_root).unwrap() {
@@ -41,7 +41,14 @@ fn real_manifest_extensions() -> BTreeMap<String, Vec<String>> {
             .map(|ext| ext.as_str().unwrap().to_string())
             .collect();
         extensions.sort();
-        found.insert(language, extensions);
+        let mut exclude_dirs: Vec<String> = plugin["workspace"]["exclude_dirs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|dir| dir.as_str().unwrap().to_string())
+            .collect();
+        exclude_dirs.sort();
+        found.insert(language, (extensions, exclude_dirs));
     }
     found
 }
@@ -52,18 +59,21 @@ fn the_catalogue_names_exactly_the_four_bundled_languages_in_order() {
     assert_eq!(ids, ["typescript", "python", "rust", "go"]);
 }
 
-/// The catalogue's extensions are copied from the plugins' own manifests; this
-/// reads those manifests rather than a second hand-written list, so a plugin
-/// that gains (or a new plugin that ships with) an extension the catalogue
-/// lacks fails here.
+/// The catalogue's extensions and exclude_dirs are copied from the plugins'
+/// own manifests; this reads those manifests rather than a second hand-written
+/// list, so a plugin that gains (or a new plugin that ships with) an extension
+/// or excluded directory the catalogue lacks fails here.
 #[test]
 fn every_catalogue_entry_matches_its_real_plugin_manifest_extensions() {
-    let catalogue: BTreeMap<String, Vec<String>> = CATALOGUE
+    let catalogue: BTreeMap<String, (Vec<String>, Vec<String>)> = CATALOGUE
         .iter()
         .map(|entry| {
             let mut extensions: Vec<String> = entry.extensions.iter().map(|ext| ext.to_string()).collect();
             extensions.sort();
-            (entry.language.to_string(), extensions)
+            let mut exclude_dirs: Vec<String> =
+                entry.exclude_dirs.iter().map(|dir| dir.to_string()).collect();
+            exclude_dirs.sort();
+            (entry.language.to_string(), (extensions, exclude_dirs))
         })
         .collect();
     assert_eq!(catalogue, real_manifest_extensions());
@@ -90,10 +100,12 @@ fn install_command_is_the_exact_plugins_install_command_for_each_language() {
 /// instead of the manifest's and drift from it, giving core two sources of
 /// truth about a live plugin. If you are adding a field, the catalogue is the
 /// wrong place for it unless it describes an *absent* plugin only.
+/// `exclude_dirs` passes that test: like `extensions`, it says which files the
+/// absent plugin would claim (ADR 0021), not what a plugin can do.
 #[test]
 fn a_catalogue_entry_holds_only_a_language_and_its_extensions() {
     for entry in CATALOGUE {
-        let CatalogueEntry { language, extensions } = *entry;
+        let CatalogueEntry { language, extensions, exclude_dirs: _ } = *entry;
         assert!(!language.is_empty());
         assert!(!extensions.is_empty());
     }
@@ -181,7 +193,7 @@ fn a_fifth_language_works_through_every_lookup_as_one_more_entry() {
     let table: Vec<CatalogueEntry> = CATALOGUE
         .iter()
         .copied()
-        .chain([CatalogueEntry { language: "zig", extensions: &[".zig"] }])
+        .chain([CatalogueEntry { language: "zig", extensions: &[".zig"], exclude_dirs: &[] }])
         .collect();
 
     assert_eq!(entry_in(&table, "zig").map(|e| e.language), Some("zig"));

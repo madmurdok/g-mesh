@@ -75,7 +75,8 @@ pub fn exit_code(err: &anyhow::Error) -> i32 {
 }
 
 /// One stderr line per language a bulk walk did not index: a `Failed`
-/// language with its error, a `PluginAbsent` one with its file count.
+/// language with its error, a `PluginAbsent` one with its file count and the
+/// command that installs its plugin.
 pub fn language_outcome_lines(outcomes: &BTreeMap<String, LanguageOutcome>) -> Vec<String> {
     outcomes
         .iter()
@@ -84,12 +85,21 @@ pub fn language_outcome_lines(outcomes: &BTreeMap<String, LanguageOutcome>) -> V
             LanguageOutcome::Failed { error } => {
                 Some(format!("g-mesh: {language} failed to index and is not in the index: {error}"))
             }
-            LanguageOutcome::PluginAbsent { files } => Some(match files {
-                Some(files) => {
-                    format!("g-mesh: {language} has no plugin installed - {files} file(s) not indexed")
-                }
-                None => format!("g-mesh: {language} has no plugin installed - its files are not indexed"),
-            }),
+            LanguageOutcome::PluginAbsent { files } => {
+                let what = match files {
+                    Some(files) => format!("{files} file(s) not indexed"),
+                    None => "its files are not indexed".to_string(),
+                };
+                // Every PluginAbsent language is a catalogue one; a name the
+                // catalogue lacks still gets its line, just without a command.
+                Some(match crate::languages::entry(language) {
+                    Some(entry) => format!(
+                        "g-mesh: {language} has no plugin installed - {what}; install it with `{}`",
+                        entry.install_command()
+                    ),
+                    None => format!("g-mesh: {language} has no plugin installed - {what}"),
+                })
+            }
         })
         .collect()
 }
