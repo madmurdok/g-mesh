@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
@@ -364,7 +364,9 @@ fn walk_one_language_in(
     // cargo-workspace plugin binary gets a message naming the build command
     // instead of a bare "No such file or directory".
     if let Some(hint) = plugin::missing_plugin_binary_hint(&manifest.command, &manifest.args) {
-        bail!("failed to spawn the {} plugin's bulk index: {hint}", manifest.language);
+        // The hint is the innermost cause, so the instructions show it rather
+        // than the step (ADR 0022).
+        return Err(anyhow!(hint).context(format!("failed to spawn the {} plugin's bulk index", manifest.language)));
     }
 
     let mut command = Command::new(&manifest.command);
