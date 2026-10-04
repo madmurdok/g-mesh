@@ -388,9 +388,23 @@ impl Declarer<'_, '_> {
     /// named [`field_tail`] (`T.f`) within the module.
     /// A tuple struct's `ordered_field_declaration_list` has no names and
     /// declares nothing.
+    ///
+    /// Every field's written type, named or positional (`T.0`, `T.1`), is
+    /// also recorded in the model for typed receivers (`x.f.m()`), see
+    /// [`field_type`](Self::field_type).
     fn fields(&mut self, item: Node, module: &ModuleCtx) {
         let Some(type_name) = item_name(item, self.source) else { return };
         let Some(body) = item.child_by_field_name("body") else { return };
+        let generics = generic_names(item, self.source);
+        if body.kind() == "ordered_field_declaration_list" {
+            let mut cursor = body.walk();
+            let types: Vec<Node> = body.children_by_field_name("type", &mut cursor).collect();
+            for (index, ty) in types.into_iter().enumerate() {
+                let returns = self.field_type(ty, type_name, module, &generics);
+                self.model.set_field_type(&module.key, &field_tail(type_name, &index.to_string()), returns);
+            }
+            return;
+        }
         if body.kind() != "field_declaration_list" {
             return;
         }
@@ -415,7 +429,29 @@ impl Declarer<'_, '_> {
             spec.doc_comment = outer_doc_comment(field, self.source);
             let id = self.emitter.declare(spec, is_public(&own));
             self.model.declare_member(&module.key, &tail, DeclRef { id, kind: NodeKind::Variable });
+            let returns = field
+                .child_by_field_name("type")
+                .and_then(|ty| self.field_type(ty, type_name, module, &generics));
+            self.model.set_field_type(&module.key, &tail, returns);
         }
+    }
+
+    /// A field's written type, when a typed receiver could use it: a path
+    /// type naming none of the struct's generic parameters (nor any of an
+    /// enclosing item's), with `Self` replaced by the struct itself.
+    fn field_type(
+        &self,
+        ty: Node,
+        type_name: &str,
+        module: &ModuleCtx,
+        generics: &[String],
+    ) -> Option<Returns> {
+        let written = WrittenType::parse(ty, self.source)?;
+        let ty = written.substitute_self(Some(type_name))?;
+        if ty.mentions(&|name| generics.iter().any(|generic| generic == name)) {
+            return None;
+        }
+        Some(Returns { module: module.clone(), ty })
     }
 
     /// An item's own visibility, with the one exception Rust spells as an
