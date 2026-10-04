@@ -418,7 +418,8 @@ pub(crate) fn requests(plugin_dir: &Path) -> Vec<String> {
 
 /// Every **notification** (a framed message with no `id`) this plugin
 /// directory's process(es) have ever received, oldest first, across every
-/// spawn, as `"<method> <filePath>"` - see [`NOTIFICATION_LOG`]'s own doc
+/// spawn, as `"<method> <filePath>"` (`filesCreated` as
+/// `"filesCreated <path>,<path>"`) - see [`NOTIFICATION_LOG`]'s own doc
 /// comment for why this is a separate log from [`requests`] rather than the
 /// same one. Empty before the first one, same as [`requests`]/[`spawns`].
 pub(crate) fn notifications(plugin_dir: &Path) -> Vec<String> {
@@ -442,6 +443,21 @@ pub(crate) fn declare_semantic_prepare(plugin_dir: &Path) {
     let prepared =
         manifest.replace("semantic_pass = true\n", "semantic_pass = true\nsemantic_prepare = true\n");
     fs::write(&path, prepared).expect("failed to write the fake plugin's manifest");
+}
+
+/// Adds `files_created = true` to any fake plugin's `[plugin.capabilities]`,
+/// adding the table if the manifest has none. Takes effect at the next
+/// `discover`.
+pub(crate) fn declare_files_created(plugin_dir: &Path) {
+    let path = plugin_dir.join("plugin.toml");
+    let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
+    let table = "[plugin.capabilities]\n";
+    let declared = if manifest.contains(table) {
+        manifest.replace(table, &format!("{table}files_created = true\n"))
+    } else {
+        format!("{manifest}\n{table}files_created = true\n")
+    };
+    fs::write(&path, declared).expect("failed to write the fake plugin's manifest");
 }
 
 /// Just the `fileChanged` requests among [`requests`], as the file path each
@@ -729,7 +745,9 @@ process.stdin.on("data", (chunk) => {{
       // A notification: no id, no response frame - see
       // test_plugin.rs's NOTIFICATION_LOG doc comment for why this is a
       // separate log from REQUEST_LOG above rather than folded into it.
-      const filePath = (request.params && request.params.filePath) || "";
+      // `filesCreated` names its paths comma-joined: "filesCreated a,b".
+      const params = request.params || {{}};
+      const filePath = params.filePath || (Array.isArray(params.filePaths) ? params.filePaths.join(",") : "");
       fs.appendFileSync(path.join(__dirname, "{NOTIFICATION_LOG}"), request.method + " " + filePath + "\n");
     }}
   }}

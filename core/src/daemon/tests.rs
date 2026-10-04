@@ -242,16 +242,26 @@ fn a_record_without_its_terminating_newline_is_not_a_record() {
 /// `registry_over` test fixture, which is private to that module and so
 /// not reusable from here directly.
 fn registry_over(languages: &[&str]) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>, PluginRegistry) {
+    registry_with(|plugins| {
+        languages
+            .iter()
+            .map(|language| {
+                let extension = format!(".{language}-src");
+                test_plugin::install(plugins, language, &[extension.as_str()])
+            })
+            .collect()
+    })
+}
+
+/// [`registry_over`], with the plugin directories written by `install`
+/// (given the plugin root) before discovery.
+fn registry_with(
+    install: impl FnOnce(&Path) -> Vec<PathBuf>,
+) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>, PluginRegistry) {
     let project = tempfile::tempdir().expect("failed to create a project root");
     let plugins = tempfile::tempdir().expect("failed to create a plugin root");
 
-    let dirs = languages
-        .iter()
-        .map(|language| {
-            let extension = format!(".{language}-src");
-            test_plugin::install(plugins.path(), language, &[extension.as_str()])
-        })
-        .collect();
+    let dirs = install(plugins.path());
 
     let discovered =
         manifest::discover(&[plugins.path().to_path_buf()]).expect("the fixtures must discover cleanly");
@@ -522,4 +532,303 @@ fn a_batch_routes_deletions_then_creations_then_modifications_whatever_the_event
         .flat_map(|kind| std::iter::repeat_n(*kind, PATHS_PER_KIND))
         .collect();
     assert_eq!(kinds, expected, "deletions, then creations, then modifications: {requested:?}");
+}
+
+// --- GM-515: a batch's created files are announced before they are routed --
+// Numbers name the behaviours in docs/architecture/gm-515-batch-presence.md.
+
+/// [`registry_over`] for `languages`, each plugin declaring `files_created`.
+fn declaring_registry(
+    languages: &[&str],
+) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>, PluginRegistry) {
+    registry_with(|plugins| {
+        languages
+            .iter()
+            .map(|language| {
+                let extension = format!(".{language}-src");
+                let dir = test_plugin::install(plugins, language, &[extension.as_str()]);
+                test_plugin::declare_files_created(&dir);
+                dir
+            })
+            .collect()
+    })
+}
+
+/// `PATHS_PER_KIND` paths named `<kind><i>.python-src`.
+fn python_paths(kind: &str) -> Vec<String> {
+    (0..PATHS_PER_KIND).map(|i| format!("{kind}{i}.python-src")).collect()
+}
+
+/// The `filesCreated` lines of [`test_plugin::notifications`].
+fn files_created_notifications(plugin_dir: &Path) -> Vec<String> {
+    test_plugin::notifications(plugin_dir)
+        .into_iter()
+        .filter(|line| line.starts_with("filesCreated "))
+        .collect()
+}
+
+/// The paths one `"filesCreated a,b"` notification line names, sorted.
+fn announced_paths(line: &str) -> Vec<String> {
+    let mut paths: Vec<String> =
+        line.trim_start_matches("filesCreated ").split(',').map(str::to_string).collect();
+    paths.sort();
+    paths
+}
+
+/// [`test_plugin::frames`] for `fileChanged`/`filesCreated` only, in send order.
+fn routing_frames(plugins_root: &Path) -> Vec<String> {
+    test_plugin::frames(plugins_root)
+        .into_iter()
+        .filter(|frame| frame.ends_with(" fileChanged") || frame.ends_with(" filesCreated"))
+        .collect()
+}
+
+/// Writes the deleted/created/modified fixture of the batch-order tests:
+/// deleted paths have a baseline and no file, created ones a file and no
+/// baseline, modified ones both. Returns the three lists.
+fn three_kinds(root: &Path, conn: &IndexStore, created: usize) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (deleted, modified) = (python_paths("deleted"), python_paths("modified"));
+    let created: Vec<String> = (0..created).map(|i| format!("created{i}.python-src")).collect();
+    for path in &deleted {
+        record_baseline(conn, path);
+    }
+    for path in &created {
+        fs::write(root.join(path), "").unwrap();
+    }
+    for path in &modified {
+        fs::write(root.join(path), "").unwrap();
+        record_baseline(conn, path);
+    }
+    (deleted, created, modified)
+}
+
+/// 1: a plugin declaring `files_created` is told once, after the batch's
+/// deletions and before its first creation, naming every created path in the
+/// order they are then routed; every path still gets exactly one
+/// `fileChanged`. Fed modified -> created -> deleted.
+///
+/// Control: remove the `registry.announce_created(&order.created)` call in
+/// `watch_and_route_once` (no `filesCreated`), or move it before the deleted
+/// loop (the plugin is not running yet, so nothing is sent; with it running,
+/// the frame lands first).
+#[test]
+fn a_declaring_plugin_is_told_of_a_batchs_creations_between_its_deletions_and_its_creations() {
+    let (project, plugins, dirs, registry) = declaring_registry(&["python"]);
+    let plugin_dir = &dirs[0];
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    let (deleted, created, modified) = three_kinds(&root, &conn, PATHS_PER_KIND);
+
+    let reversed: Vec<String> = modified.iter().chain(&created).chain(&deleted).cloned().collect();
+    route_one_batch(&root, &conn, &registry, &reversed);
+
+    let requested = test_plugin::file_changed_requests(plugin_dir);
+    assert_eq!(requested.len(), 3 * PATHS_PER_KIND, "each path is routed exactly once: {requested:?}");
+    assert!(requested[..PATHS_PER_KIND].iter().all(|path| deleted.contains(path)), "{requested:?}");
+    let routed_created = &requested[PATHS_PER_KIND..2 * PATHS_PER_KIND];
+    assert!(routed_created.iter().all(|path| created.contains(path)), "{requested:?}");
+    assert!(requested[2 * PATHS_PER_KIND..].iter().all(|path| modified.contains(path)), "{requested:?}");
+
+    assert_eq!(
+        files_created_notifications(plugin_dir),
+        vec![format!("filesCreated {}", routed_created.join(","))],
+        "one notification naming every created path, in routing order"
+    );
+    let mut expected = vec!["python fileChanged".to_string(); PATHS_PER_KIND];
+    expected.push("python filesCreated".to_string());
+    expected.extend(vec!["python fileChanged".to_string(); 2 * PATHS_PER_KIND]);
+    assert_eq!(routing_frames(plugins.path()), expected, "deletions, the announcement, then the rest");
+}
+
+/// 2: a plugin that does not declare `files_created` sees only per-file
+/// `fileChanged`, in GM-505's order, for the same batch.
+///
+/// Control: drop the `files_created` capability gate in
+/// `PluginProcess::notify_files_created` -> a `filesCreated` frame appears.
+#[test]
+fn a_plugin_that_does_not_declare_files_created_is_never_sent_it() {
+    let (project, plugins, dirs, registry) = registry_over(&["python"]);
+    let plugin_dir = &dirs[0];
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    let (deleted, created, modified) = three_kinds(&root, &conn, PATHS_PER_KIND);
+
+    let reversed: Vec<String> = modified.iter().chain(&created).chain(&deleted).cloned().collect();
+    route_one_batch(&root, &conn, &registry, &reversed);
+
+    assert_eq!(test_plugin::file_changed_requests(plugin_dir).len(), 3 * PATHS_PER_KIND);
+    assert_eq!(files_created_notifications(plugin_dir), Vec::<String>::new());
+    assert_eq!(
+        routing_frames(plugins.path()),
+        vec!["python fileChanged".to_string(); 3 * PATHS_PER_KIND],
+        "per-file fileChanged only"
+    );
+}
+
+/// 3: one created file is no importer-and-target pair: nothing is announced,
+/// though the plugin is running (spawned by the batch's deletions).
+///
+/// Control: lower the `file_paths.len() < 2` threshold in
+/// `PluginRegistry::announce_created` to `< 1`.
+#[test]
+fn a_single_created_file_is_not_announced() {
+    let (project, _plugins, dirs, registry) = declaring_registry(&["python"]);
+    let plugin_dir = &dirs[0];
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    let (deleted, created, modified) = three_kinds(&root, &conn, 1);
+
+    let batch: Vec<String> = modified.iter().chain(&created).chain(&deleted).cloned().collect();
+    route_one_batch(&root, &conn, &registry, &batch);
+
+    assert!(test_plugin::file_changed_requests(plugin_dir).contains(&created[0]), "the file is still routed");
+    assert_eq!(files_created_notifications(plugin_dir), Vec::<String>::new());
+}
+
+/// 4: a sleeping plugin is neither woken nor told; its queue replays every
+/// created path once, on the wake that reads the disk anyway.
+///
+/// Control: make `PluginSupervisor::files_created` spawn or wake the process
+/// when it has none (or make `announce_created` call `get_or_spawn`) -> a
+/// second spawn before the replay, and a `filesCreated`.
+#[test]
+fn a_sleeping_plugin_is_neither_woken_nor_told_and_replays_each_created_file_once() {
+    let (project, _plugins, dirs, registry) = declaring_registry(&["python"]);
+    let plugin_dir = &dirs[0];
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    let created = python_paths("created");
+    for path in &created {
+        fs::write(root.join(path), "").unwrap();
+    }
+    registry.get_or_spawn("python").unwrap().sleep_now("GM-515 test");
+    assert_eq!(test_plugin::spawns(plugin_dir).len(), 1);
+
+    route_one_batch(&root, &conn, &registry, &created);
+
+    assert_eq!(test_plugin::spawns(plugin_dir).len(), 1, "the batch neither woke nor spawned the plugin");
+    assert_eq!(test_plugin::file_changed_requests(plugin_dir), Vec::<String>::new(), "queued, not sent");
+
+    assert_eq!(registry.replay_pending(&conn), PATHS_PER_KIND);
+    let mut replayed = test_plugin::file_changed_requests(plugin_dir);
+    replayed.sort();
+    let mut expected = created.clone();
+    expected.sort();
+    assert_eq!(replayed, expected, "each created path is replayed exactly once");
+    assert_eq!(files_created_notifications(plugin_dir), Vec::<String>::new(), "and never announced");
+}
+
+/// 4b: a language with no supervisor yet is not spawned to be told: its
+/// first created file spawns it afterwards, and a fresh process reads the
+/// disk the batch already wrote.
+///
+/// Control: replace the supervisor lookup in `announce_created` with
+/// `get_or_spawn` -> a `filesCreated` reaches the new process.
+#[test]
+fn a_language_not_yet_spawned_is_not_spawned_to_be_told() {
+    let (project, _plugins, dirs, registry) = declaring_registry(&["python"]);
+    let plugin_dir = &dirs[0];
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    let created = python_paths("created");
+    for path in &created {
+        fs::write(root.join(path), "").unwrap();
+    }
+
+    route_one_batch(&root, &conn, &registry, &created);
+
+    assert_eq!(test_plugin::spawns(plugin_dir).len(), 1, "spawned once, by routing");
+    assert_eq!(test_plugin::file_changed_requests(plugin_dir).len(), PATHS_PER_KIND);
+    assert_eq!(files_created_notifications(plugin_dir), Vec::<String>::new());
+}
+
+/// 5: a workspace file, a file under the language's `exclude_dirs` and an
+/// unclaimed file are not announced; a language left with one path after
+/// filtering is not told; a failed language is not told.
+///
+/// Control: remove, in turn, `announce_created`'s
+/// `workspace_language_matches` filter (the first line names
+/// `setup.python-src`), its `exclude_dirs` filter by using `language_for`
+/// instead of `indexing_language` (`vendor/c.python-src`), or its
+/// `is_failed_language` filter (a later line appears).
+#[test]
+fn workspace_excluded_and_failed_language_files_are_not_announced() {
+    let (project, _plugins, dirs, registry) = registry_with(|plugins| {
+        let dir = test_plugin::install_with_workspace(
+            plugins,
+            "python",
+            &[".python-src"],
+            &["setup.python-src"],
+            &["vendor"],
+        );
+        test_plugin::declare_files_created(&dir);
+        vec![dir]
+    });
+    let plugin_dir = &dirs[0];
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    fs::write(root.join("barrier.python-src"), "").unwrap();
+    let supervisor = registry.get_or_spawn("python").unwrap();
+    // A round trip after each announcement: the plugin reads its stdin in
+    // order, so the notification is logged by the time the answer arrives.
+    let barrier = || supervisor.file_changed(&conn, "barrier.python-src".to_string());
+    let paths = |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
+
+    registry.announce_created(&paths(&[
+        "a.python-src",
+        "setup.python-src",
+        "vendor/c.python-src",
+        "notes.txt",
+        "b.python-src",
+    ]));
+    barrier();
+    registry.announce_created(&paths(&["a.python-src", "setup.python-src", "vendor/c.python-src"]));
+    barrier();
+    registry.set_failed_languages(["python".to_string()]);
+    registry.announce_created(&paths(&["a.python-src", "b.python-src"]));
+    barrier();
+
+    assert_eq!(files_created_notifications(plugin_dir), vec!["filesCreated a.python-src,b.python-src"]);
+}
+
+/// 6: created files of two languages are announced per language, each with
+/// only its own paths, and each plugin receives its announcement before the
+/// `fileChanged` of its own creations. The order *across* the two plugins is
+/// not asserted: each is a separate process appending to the shared frame log
+/// when it reads a fire-and-forget notification, so that order is the
+/// scheduler's, not core's.
+///
+/// Controls: send the whole created list to every running language in
+/// `announce_created` -> each line names all four paths; announce after
+/// routing the batch's creations -> a plugin's `filesCreated` follows its
+/// `fileChanged` frames.
+#[test]
+fn created_files_of_two_languages_are_announced_per_language() {
+    let (project, plugins, dirs, registry) = declaring_registry(&["python", "rust"]);
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    let created: Vec<String> =
+        ["p1.python-src", "r1.rust-src", "p2.python-src", "r2.rust-src"].map(str::to_string).to_vec();
+    for path in &created {
+        fs::write(root.join(path), "").unwrap();
+    }
+    registry.get_or_spawn("rust").unwrap();
+    registry.get_or_spawn("python").unwrap();
+
+    route_one_batch(&root, &conn, &registry, &created);
+
+    let python = files_created_notifications(&dirs[0]);
+    let rust = files_created_notifications(&dirs[1]);
+    assert_eq!(python.len(), 1, "{python:?}");
+    assert_eq!(rust.len(), 1, "{rust:?}");
+    assert_eq!(announced_paths(&python[0]), vec!["p1.python-src", "p2.python-src"]);
+    assert_eq!(announced_paths(&rust[0]), vec!["r1.rust-src", "r2.rust-src"]);
+    let frames = routing_frames(plugins.path());
+    for language in ["python", "rust"] {
+        let own: Vec<&str> = frames
+            .iter()
+            .filter_map(|frame| frame.strip_prefix(language).and_then(|rest| rest.strip_prefix(' ')))
+            .collect();
+        assert_eq!(own, vec!["filesCreated", "fileChanged", "fileChanged"], "{language}: {frames:?}");
+    }
 }

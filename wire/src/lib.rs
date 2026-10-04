@@ -586,6 +586,19 @@ pub enum ControlMessage {
     /// language's pass really is owed - so it never starts an engine for
     /// structural work, which is the lazy-engine contract's whole point.
     PrepareSemanticPass,
+    /// Tells a plugin that every listed file was created in one watcher batch,
+    /// before any of them is sent as `fileChanged`, so its project model knows
+    /// all of them before it extracts the first. A notification: nothing is
+    /// answered, and each file still gets its own `fileChanged`, which must
+    /// find the hook idempotent (ADR 0023's `file_presence_changed`).
+    ///
+    /// Sent only to a plugin whose manifest declares
+    /// `capabilities.files_created`, and only for a language that received at
+    /// least two created files in the batch.
+    #[serde(rename_all = "camelCase")]
+    FilesCreated {
+        file_paths: Vec<String>,
+    },
 }
 
 /// LSP-style JSON-RPC 2.0 envelope for the control plane. Framing
@@ -1068,6 +1081,26 @@ mod tests {
 
         let json = serde_json::to_string(&envelope).unwrap();
         assert_eq!(json, r#"{"jsonrpc":"2.0","method":"prepareSemanticPass"}"#);
+        let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope, round_tripped);
+    }
+
+    /// The SDK reads `params.filePaths`; a notification, so no `id`.
+    #[test]
+    fn files_created_round_trips_as_a_notification() {
+        let envelope = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: None,
+            message: ControlMessage::FilesCreated {
+                file_paths: vec!["src/a.ts".to_string(), "src/b.ts".to_string()],
+            },
+        };
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(
+            json,
+            r#"{"jsonrpc":"2.0","method":"filesCreated","params":{"filePaths":["src/a.ts","src/b.ts"]}}"#
+        );
         let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(envelope, round_tripped);
     }

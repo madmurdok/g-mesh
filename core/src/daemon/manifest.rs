@@ -146,6 +146,12 @@ pub struct Capabilities {
     /// notification is never sent, so a plugin that does not know it never
     /// sees it.
     pub semantic_prepare: bool,
+    /// Whether core may send this plugin a `filesCreated` notification naming
+    /// a batch's created files before their `fileChanged`s, so its project
+    /// model holds all of them before it extracts the first (ADR 0023's
+    /// presence hook). `false` (the default): never sent; the plugin sees only
+    /// per-file `fileChanged`.
+    pub files_created: bool,
     /// Whether receiver calls resolve to edges once this plugin's best available
     /// tier has run. `Resolved` means against the receiver's declared or inferred
     /// type, never its run-time type (`mcp::instructions`' `P4_STATIC`

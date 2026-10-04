@@ -610,6 +610,7 @@ extensions = [".{language}"]
                     semantic_pass: true,
                     semantic_sweep: false,
                     semantic_prepare: false,
+                    files_created: false,
                     receiver_calls: manifest::ReceiverCallResolution::Resolved,
                     receiver_calls_structural: manifest::ReceiverCallResolution::Unresolved,
                 },

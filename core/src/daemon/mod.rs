@@ -467,6 +467,9 @@ fn spawn_watch_consumer(
 /// One iteration of the watcher loop: waits up to [`DEBOUNCE_WINDOW`] for a
 /// raw change, records it, then routes every settled path to `registry` in
 /// [`order_for_routing`]'s order (deletions, creations, modifications; ADR 0023).
+/// Between the deletions and the creations, the batch's created paths are
+/// announced per language ([`PluginRegistry::announce_created`]), so a plugin
+/// knows all of them before it extracts the first; each is still routed once.
 fn watch_and_route_once(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
@@ -490,9 +493,14 @@ fn watch_and_route_once(
         }
         batch.push((classify_settled(conn, &settled, &file_path), file_path));
     }
-    for file_path in order_for_routing(batch) {
-        // A workspace file (`[plugin.workspace] watch_files`) triggers that
-        // language's reindex; anything else is applied or queued by its supervisor.
+    let order = order_for_routing(batch);
+    // A workspace file (`[plugin.workspace] watch_files`) triggers that
+    // language's reindex; anything else is applied or queued by its supervisor.
+    for file_path in order.deleted {
+        registry.route_settled_path(conn, file_path);
+    }
+    registry.announce_created(&order.created);
+    for file_path in order.created.into_iter().chain(order.modified) {
         registry.route_settled_path(conn, file_path);
     }
 }

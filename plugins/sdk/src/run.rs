@@ -49,6 +49,7 @@
 //! `hasSyntaxErrors` records it (see [`FileGraph::mark_syntax_errors`]) and
 //! the graph is committed like any other.
 
+use std::collections::HashSet;
 use std::io::{self, BufReader, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -414,6 +415,20 @@ impl<E: Extractor> Session<'_, E> {
                 let diff = self.file_changed(&RelPath::new(path));
                 self.respond(out, id, diff)
             }
+            "filesCreated" => {
+                // A notification: every listed file was created in one
+                // watcher batch, and each still gets its own `fileChanged`
+                // after this. Only presence is applied here, nothing is
+                // extracted, so there is no diff to answer with. A non-string
+                // entry costs itself, not the list.
+                let files: Vec<RelPath> = params
+                    .and_then(|params| params.get("filePaths"))
+                    .and_then(|paths| paths.as_array())
+                    .map(|paths| paths.iter().filter_map(|path| path.as_str()).map(RelPath::new).collect())
+                    .unwrap_or_default();
+                self.files_created(&files);
+                self.acknowledge(out, id)
+            }
             "semanticPass" => {
                 // Test-only (GM-397): parks the pass before any engine
                 // starts, blocking this thread as a long pass would.
@@ -521,6 +536,7 @@ impl<E: Extractor> Session<'_, E> {
             if self.project.is_none() {
                 self.load_project();
             }
+            self.presence_changed(&path, true);
             let Some(project) = self.project.as_ref() else { return false };
             if let Some(graph) = extract_caught(self.extractor, project, &path, &source, &self.spec.language)
             {
@@ -539,7 +555,12 @@ impl<E: Extractor> Session<'_, E> {
             return FileChangeDiff::default();
         }
 
-        let Some(source) = read_source(path, &self.root, &self.spec.language) else {
+        // Presence first, and before the unchanged-text short-circuit below,
+        // so the model never extracts against a file set missing this event.
+        // An unreadable file is applied as gone, as the diff treats it.
+        let source = read_source(path, &self.root, &self.spec.language);
+        self.presence_changed(path, source.is_some());
+        let Some(source) = source else {
             // Gone, or unreadable: everything this plugin had for the file is
             // deleted. Forgetting it too means a re-creation is treated as a
             // first sighting rather than diffed against a stale baseline.
@@ -595,10 +616,66 @@ impl<E: Extractor> Session<'_, E> {
     ///
     /// One `canonicalize` per event.
     fn indexed_spelling(&self, path: &RelPath) -> Option<RelPath> {
+        self.real_spelling(path).filter(|real| self.index.entry(real).is_some())
+    }
+
+    /// `path`'s real in-root spelling when it differs from `path`; `None`
+    /// when they are the same, when `path` does not resolve, when it resolves
+    /// outside the root, or when the root itself could not be resolved. The
+    /// one `canonicalize` behind [`Session::indexed_spelling`] and
+    /// [`Session::files_created`].
+    fn real_spelling(&self, path: &RelPath) -> Option<RelPath> {
         let root_real = self.root_real.as_ref()?;
         let real = std::fs::canonicalize(path.to_absolute(&self.root)).ok()?;
         let real = RelPath::relative_to(root_real, &real)?;
-        (real != *path && self.index.entry(&real).is_some()).then_some(real)
+        (real != *path).then_some(real)
+    }
+
+    /// Applies presence for every file of one watcher batch's creations, so
+    /// the `fileChanged`s that follow extract against a model holding all of
+    /// them. Extracts nothing.
+    ///
+    /// Invariants:
+    /// - a link spelling is remapped to its real spelling when the real one
+    ///   is indexed **or listed in this same call**: the real one may be
+    ///   created in this batch and so not indexed yet, and the walk lists only
+    ///   the real spelling (`docs/adr/0025-project-walk-follows-symlinks.md`).
+    ///   Otherwise the path is handled as spelled;
+    /// - `present` is read from the disk now, not taken from the list: a file
+    ///   may be gone again by the time this arrives, and its own
+    ///   `fileChanged` follows and agrees;
+    /// - one bad entry (unclaimed, outside the root, a panicking hook) costs
+    ///   only itself;
+    /// - with no project model, nothing is applied: the next load reads the
+    ///   disk, which already holds every listed file.
+    fn files_created(&mut self, files: &[RelPath]) {
+        if self.project.is_none() {
+            return;
+        }
+        let listed: HashSet<&RelPath> = files.iter().collect();
+        let mut applied: HashSet<RelPath> = HashSet::new();
+        for spelled in files {
+            let path = self
+                .real_spelling(spelled)
+                .filter(|real| listed.contains(real) || self.index.entry(real).is_some())
+                .unwrap_or_else(|| spelled.clone());
+            if !self.claims(&path) || !applied.insert(path.clone()) {
+                continue;
+            }
+            let present = is_readable_source(&path, &self.root);
+            self.presence_changed(&path, present);
+        }
+    }
+
+    /// [`Extractor::file_presence_changed`] for one path, when there is a
+    /// project model to apply it to and the path is inside the root.
+    fn presence_changed(&mut self, path: &RelPath, present: bool) {
+        if !is_within_root(path) {
+            return;
+        }
+        if let Some(project) = self.project.as_mut() {
+            presence_caught(self.extractor, project, path, present, &self.spec.language);
+        }
     }
 
     fn claims(&self, path: &RelPath) -> bool {
@@ -716,6 +793,41 @@ fn read_source(path: &RelPath, root: &Path, language: &str) -> Option<String> {
             eprintln!("[{language}] skipping {path}: {err}");
             None
         }
+    }
+}
+
+/// Whether `path` would be read as a source by [`read_source`] - an existing
+/// file that is valid UTF-8 - without its logging, so presence agrees with
+/// what the file's own `fileChanged` will find.
+fn is_readable_source(path: &RelPath, root: &Path) -> bool {
+    std::fs::read(path.to_absolute(root)).is_ok_and(|bytes| std::str::from_utf8(&bytes).is_ok())
+}
+
+/// Whether `path` is relative and never climbs out with `..`: the
+/// presence hook's contract excludes every other path.
+fn is_within_root(path: &RelPath) -> bool {
+    let path = Path::new(path.as_str());
+    !path.has_root()
+        && path.components().all(|component| {
+            !matches!(component, std::path::Component::ParentDir | std::path::Component::Prefix(_))
+        })
+}
+
+/// [`Extractor::file_presence_changed`], with a panic in it costing this
+/// path's presence rather than the process or the rest of a batch.
+///
+/// `AssertUnwindSafe` although the hook mutates `project`: a panic may leave
+/// the model half-updated for this path, which the hook's contract accepts
+/// (it says not to panic); `workspaceChanged` rebuilds the model whole.
+fn presence_caught<E: Extractor>(
+    extractor: &E,
+    project: &mut E::Project,
+    path: &RelPath,
+    present: bool,
+    language: &str,
+) {
+    if catch_unwind(AssertUnwindSafe(|| extractor.file_presence_changed(project, path, present))).is_err() {
+        eprintln!("[{language}] the presence hook panicked on {path} - its presence is not applied");
     }
 }
 
@@ -1339,5 +1451,430 @@ mod tests {
         let diff = file_changed(&mut session, "alias/a.toy");
         assert!(!diff.delete_node_ids.is_empty(), "a deletion: {diff:#?}");
         assert_eq!(session.index.paths(), vec![RelPath::new("real/a.toy")], "the alias entry went");
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    //! GM-515: `filesCreated` and the presence hook
+    //! ([`crate::Extractor::file_presence_changed`]). Numbers name the
+    //! behaviours in docs/architecture/gm-515-batch-presence.md.
+
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    /// An extractor whose project model is the set of `.toy` files that
+    /// exist: built by `load_project` from the walk, kept by the hook. A
+    /// line `import X` extracts to `X=resolved` in the file's signature when
+    /// `X` is in the set, `X=unresolved` otherwise. Every hook call and
+    /// every extraction is recorded; the hook panics on `panic.toy`, the
+    /// extraction on a source containing `panic-extract`.
+    #[derive(Default)]
+    struct Presence {
+        hooked: Mutex<Vec<(String, bool)>>,
+        extracted: Mutex<Vec<String>>,
+    }
+
+    impl crate::Extractor for Presence {
+        const LANGUAGE: &'static str = "toy";
+        type Project = BTreeSet<String>;
+
+        fn load_project(&self, root: &Path) -> anyhow::Result<BTreeSet<String>> {
+            Ok(crate::walk::walk_project(root, &[".toy".to_string()], &[])
+                .into_iter()
+                .map(|path| path.as_str().to_string())
+                .collect())
+        }
+
+        fn extract(&self, project: &BTreeSet<String>, path: &RelPath, source: &str) -> FileGraph {
+            use crate::graph::{FileGraphBuilder, NodeSpec};
+            use g_mesh_wire::{NodeKind, Position, Range};
+
+            self.extracted.lock().unwrap().push(path.as_str().to_string());
+            assert!(!source.contains("panic-extract"), "the test extractor panics on panic-extract");
+            let imports: Vec<String> = source
+                .lines()
+                .filter_map(|line| line.strip_prefix("import "))
+                .map(|target| {
+                    let state = if project.contains(target.trim()) { "resolved" } else { "unresolved" };
+                    format!("{}={state}", target.trim())
+                })
+                .collect();
+            let mut builder = FileGraphBuilder::new("toy", "toy-parser", path);
+            let range = Range { start: Position { line: 0, col: 0 }, end: Position { line: 1, col: 0 } };
+            builder.file_node(range);
+            let name = path.as_str().trim_end_matches(".toy").to_string();
+            builder.add_node(
+                NodeSpec::new(NodeKind::Function, name.clone(), name, range)
+                    .signature(imports.join(" "))
+                    .public(),
+            );
+            builder.finish()
+        }
+
+        fn file_presence_changed(&self, project: &mut BTreeSet<String>, path: &RelPath, present: bool) {
+            self.hooked.lock().unwrap().push((path.as_str().to_string(), present));
+            assert!(!path.as_str().ends_with("panic.toy"), "the test hook panics on panic.toy");
+            if present {
+                project.insert(path.as_str().to_string());
+            } else {
+                project.remove(path.as_str());
+            }
+        }
+    }
+
+    /// A scratch root, removed on drop.
+    struct Root(PathBuf);
+
+    impl Root {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("g-mesh-presence-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Root(dir)
+        }
+
+        fn write(&self, path: &str, text: &str) {
+            let path = self.0.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn toy_spec() -> ResolvedSpec {
+        ResolvedSpec::resolve_from(&PluginSpec::new("toy", "0.0.0", &[".toy"]), None)
+    }
+
+    /// A session as `control_plane` starts one: project model loaded from
+    /// the disk before the first frame.
+    fn started<'a>(extractor: &'a Presence, spec: &'a ResolvedSpec, root: &Path) -> Session<'a, Presence> {
+        let mut session = Session {
+            extractor,
+            spec,
+            root: root.to_path_buf(),
+            root_real: std::fs::canonicalize(root).ok(),
+            project: None,
+            index: SdkIndex::new(),
+            engine: LazyEngine::new("toy", None),
+            project_hydrated: false,
+        };
+        session.load_project();
+        session
+    }
+
+    /// Hands `session` one frame and returns what it wrote, unframed.
+    fn send(session: &mut Session<'_, Presence>, frame: serde_json::Value) -> Option<serde_json::Value> {
+        let mut out = Vec::new();
+        session.handle(frame.to_string().as_bytes(), &mut out).unwrap();
+        if out.is_empty() {
+            return None;
+        }
+        let written = String::from_utf8(out).unwrap();
+        let (_, body) = written.split_once("\r\n\r\n").expect("one framed response");
+        Some(serde_json::from_str(body).unwrap())
+    }
+
+    /// `filesCreated` for `paths`, as core sends it: a notification.
+    fn files_created(session: &mut Session<'_, Presence>, paths: serde_json::Value) {
+        let written = send(
+            session,
+            serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "method": "filesCreated", "params": { "filePaths": paths } }),
+        );
+        assert_eq!(written, None, "a notification is answered with nothing");
+    }
+
+    /// `fileChanged` for `path`, answered.
+    fn file_changed(session: &mut Session<'_, Presence>, path: &str) -> FileChangeDiff {
+        let response = send(
+            session,
+            serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION, "id": 1, "method": "fileChanged", "params": { "filePath": path }
+            }),
+        )
+        .expect("a request is answered");
+        serde_json::from_value(response["result"].clone()).unwrap()
+    }
+
+    /// The signature of the node named `name` that `diff` upserts.
+    fn signature_of(diff: &FileChangeDiff, name: &str) -> String {
+        let node = diff.upsert_nodes.iter().find(|node| node.name == name).unwrap_or_else(|| {
+            panic!("the diff upserts no node {name}: {diff:#?}");
+        });
+        node.signature.clone().unwrap_or_default()
+    }
+
+    fn hooked(extractor: &Presence) -> Vec<(String, bool)> {
+        extractor.hooked.lock().unwrap().clone()
+    }
+
+    /// 9: a new importer of a new file, created in one batch, resolves in
+    /// that batch: `filesCreated [a, b]` puts both in the model before `a`
+    /// is extracted, and each file is extracted exactly once.
+    ///
+    /// Control: make the `"filesCreated"` arm only `acknowledge` -> `a`'s
+    /// import is unresolved.
+    #[test]
+    fn a_same_batch_new_importer_of_a_new_file_resolves_in_that_batch() {
+        let root = Root::new("same-batch");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("a.toy", "import b.toy\n");
+        root.write("b.toy", "\n");
+
+        files_created(&mut session, serde_json::json!(["a.toy", "b.toy"]));
+        let a = file_changed(&mut session, "a.toy");
+        file_changed(&mut session, "b.toy");
+
+        assert_eq!(signature_of(&a, "a"), "b.toy=resolved", "{a:#?}");
+        assert_eq!(*extractor.extracted.lock().unwrap(), vec!["a.toy", "b.toy"], "each extracted once");
+    }
+
+    /// 10: the degradation 9 is measured against - the same batch with no
+    /// `filesCreated` (a plugin core never announces to) leaves `a`'s import
+    /// unresolved: `b` is not in the model when `a` is extracted.
+    ///
+    /// Control: none in production code; this pins the baseline that makes
+    /// 9's control observable (if `fileChanged` read the disk, both would
+    /// resolve and 9 would prove nothing).
+    #[test]
+    fn without_the_notification_the_same_batch_importer_stays_unresolved() {
+        let root = Root::new("no-announce");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("a.toy", "import b.toy\n");
+        root.write("b.toy", "\n");
+
+        let a = file_changed(&mut session, "a.toy");
+        file_changed(&mut session, "b.toy");
+
+        assert_eq!(signature_of(&a, "a"), "b.toy=unresolved", "{a:#?}");
+    }
+
+    /// 11: `fileChanged` applies presence before extracting, for a creation
+    /// and for a deletion: after `fileChanged b` (created) the importer's
+    /// next extraction resolves; after `fileChanged b` (deleted) it does not.
+    ///
+    /// Control: remove the `self.presence_changed(path, source.is_some())`
+    /// call in `Session::file_changed` -> the importer stays unresolved
+    /// after the creation.
+    #[test]
+    fn file_changed_applies_presence_before_extracting() {
+        let root = Root::new("file-changed");
+        root.write("a.toy", "import b.toy\n");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        assert_eq!(signature_of(&file_changed(&mut session, "a.toy"), "a"), "b.toy=unresolved");
+
+        root.write("b.toy", "\n");
+        file_changed(&mut session, "b.toy");
+        root.write("a.toy", "import b.toy\n# edited\n");
+        let created = file_changed(&mut session, "a.toy");
+        assert_eq!(signature_of(&created, "a"), "b.toy=resolved", "{created:#?}");
+
+        std::fs::remove_file(root.0.join("b.toy")).unwrap();
+        file_changed(&mut session, "b.toy");
+        root.write("a.toy", "import b.toy\n");
+        let deleted = file_changed(&mut session, "a.toy");
+        assert_eq!(signature_of(&deleted, "a"), "b.toy=unresolved", "{deleted:#?}");
+    }
+
+    /// 11a: the hook runs before extracting the *same* file: a new file
+    /// that imports itself, never announced by `filesCreated`, resolves the
+    /// import on its own `fileChanged`.
+    ///
+    /// Control (C4a): move `self.presence_changed(path, source.is_some())` in
+    /// `Session::file_changed` after `extract_caught` -> `c` is not in the
+    /// model while it is extracted, so `c.toy=unresolved`.
+    #[test]
+    fn file_changed_applies_presence_before_extracting_the_same_file() {
+        let root = Root::new("self-import");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("c.toy", "import c.toy\n");
+
+        let c = file_changed(&mut session, "c.toy");
+
+        assert_eq!(signature_of(&c, "c"), "c.toy=resolved", "{c:#?}");
+    }
+
+    /// 11b (design D5, "before the unchanged-text short-circuit"): a
+    /// `fileChanged` whose text matches the reported entry extracts nothing
+    /// but still calls the hook.
+    ///
+    /// Control (C4a, or moving the hook below the short-circuit): the second
+    /// `fileChanged` returns before the hook -> `b` is hooked once.
+    #[test]
+    fn an_unchanged_file_changed_still_applies_presence() {
+        let root = Root::new("short-circuit");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("b.toy", "\n");
+
+        file_changed(&mut session, "b.toy");
+        let unchanged = file_changed(&mut session, "b.toy");
+
+        assert_eq!(unchanged, FileChangeDiff::default(), "unchanged text is short-circuited");
+        assert_eq!(*extractor.extracted.lock().unwrap(), vec!["b.toy"], "extracted once");
+        assert_eq!(hooked(&extractor), vec![("b.toy".to_string(), true), ("b.toy".to_string(), true)]);
+    }
+
+    /// 11c: a file whose extraction fails is still applied as present, so its
+    /// importers resolve although it has no graph yet.
+    ///
+    /// Control (C4a): the failed extraction returns before the hook -> `b`
+    /// is never hooked and `a.toy`'s import stays unresolved.
+    #[test]
+    fn a_file_whose_extraction_fails_is_still_applied_as_present() {
+        let root = Root::new("extract-fails");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("b.toy", "panic-extract\n");
+        root.write("a.toy", "import b.toy\n");
+
+        let b = file_changed(&mut session, "b.toy");
+        let a = file_changed(&mut session, "a.toy");
+
+        assert_eq!(b, FileChangeDiff::default(), "a failed extraction sends nothing");
+        assert_eq!(hooked(&extractor)[0], ("b.toy".to_string(), true));
+        assert_eq!(signature_of(&a, "a"), "b.toy=resolved", "{a:#?}");
+    }
+
+    /// 12: a listed path that is no longer on disk (or is not UTF-8, which
+    /// its own `fileChanged` reads as gone) is applied as absent.
+    ///
+    /// Control: hardcode `present = true` in `Session::files_created` ->
+    /// `b` and `c` are hooked present and `a`'s imports resolve.
+    #[test]
+    fn a_listed_path_gone_from_disk_is_applied_as_absent() {
+        let root = Root::new("gone");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("a.toy", "import b.toy\nimport c.toy\n");
+        std::fs::write(root.0.join("c.toy"), [0xff, 0xfe, 0x00]).unwrap();
+
+        files_created(&mut session, serde_json::json!(["a.toy", "b.toy", "c.toy"]));
+        let a = file_changed(&mut session, "a.toy");
+
+        assert_eq!(
+            hooked(&extractor)[..3],
+            [("a.toy".to_string(), true), ("b.toy".to_string(), false), ("c.toy".to_string(), false)]
+        );
+        assert_eq!(signature_of(&a, "a"), "b.toy=unresolved c.toy=unresolved", "{a:#?}");
+    }
+
+    /// 13: one bad entry costs only itself. A non-string, an unclaimed
+    /// extension and a path whose hook panics come first; the two good paths
+    /// after them are still applied, and the next request is answered.
+    ///
+    /// Control: `return` instead of `continue` on an unclaimed path in
+    /// `Session::files_created`, or call the hook without `presence_caught`'s
+    /// `catch_unwind` -> `b`/`c` are not in the model (or the test panics).
+    #[test]
+    fn one_bad_entry_does_not_cost_the_others() {
+        let root = Root::new("bad-entry");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        for path in ["x.rs", "panic.toy", "b.toy", "c.toy"] {
+            root.write(path, "\n");
+        }
+        root.write("a.toy", "import b.toy\nimport c.toy\n");
+
+        files_created(&mut session, serde_json::json!([5, "x.rs", "panic.toy", "b.toy", "c.toy"]));
+        let a = file_changed(&mut session, "a.toy");
+
+        let hooked: Vec<String> = hooked(&extractor).into_iter().map(|(path, _)| path).collect();
+        assert_eq!(hooked[..3], ["panic.toy", "b.toy", "c.toy"], "the unclaimed path never reaches the hook");
+        assert_eq!(signature_of(&a, "a"), "b.toy=resolved c.toy=resolved", "{a:#?}");
+    }
+
+    /// 14 (D6) and E5: a link spelling whose real spelling is listed in the
+    /// same notification records only the real spelling, once, though the
+    /// real one is not indexed yet (created in this batch).
+    ///
+    /// Control: skip the remap in `Session::files_created` (use `spelled`
+    /// directly) -> the hook also sees `alias/b.toy`; drop the `applied`
+    /// check -> it sees `real/b.toy` twice.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_spelling_listed_with_its_real_spelling_records_only_the_real_one() {
+        let root = Root::new("link-listed");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        std::fs::create_dir_all(root.0.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", root.0.join("alias")).unwrap();
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("real/b.toy", "\n");
+
+        files_created(&mut session, serde_json::json!(["alias/b.toy", "real/b.toy"]));
+
+        assert_eq!(hooked(&extractor), vec![("real/b.toy".to_string(), true)]);
+    }
+
+    /// E7: a link spelling whose real spelling is neither indexed nor listed
+    /// is handled as spelled, the walk's rule for a file reachable only
+    /// through a link.
+    ///
+    /// Control: remap unconditionally (drop the `.filter(..)` on
+    /// `real_spelling` in `Session::files_created`) -> the hook sees
+    /// `real/b.toy`.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_spelling_whose_real_spelling_is_neither_indexed_nor_listed_is_handled_as_spelled() {
+        let root = Root::new("link-unlisted");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        std::fs::create_dir_all(root.0.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", root.0.join("alias")).unwrap();
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("real/b.toy", "\n");
+        root.write("c.toy", "\n");
+
+        files_created(&mut session, serde_json::json!(["alias/b.toy", "c.toy"]));
+
+        assert_eq!(hooked(&extractor), vec![("alias/b.toy".to_string(), true), ("c.toy".to_string(), true)]);
+    }
+
+    /// E4: a path outside the root (absolute, or climbing out with `..`)
+    /// never reaches the hook.
+    ///
+    /// Control: drop the `is_within_root` check in `Session::presence_changed`
+    /// -> the hook sees both.
+    #[test]
+    fn a_path_outside_the_root_never_reaches_the_hook() {
+        let root = Root::new("outside");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("b.toy", "\n");
+
+        files_created(&mut session, serde_json::json!(["../x.toy", "/abs/x.toy", "b.toy"]));
+
+        assert_eq!(hooked(&extractor), vec![("b.toy".to_string(), true)]);
+    }
+
+    /// 15: `filesCreated` with an id is acknowledged; as a notification
+    /// nothing is written (asserted by [`files_created`] in every test above).
+    ///
+    /// Control: remove the `self.acknowledge(out, id)` call in the arm ->
+    /// no response.
+    #[test]
+    fn files_created_with_an_id_is_acknowledged() {
+        let root = Root::new("ack");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+
+        let response = send(
+            &mut session,
+            serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION, "id": 7, "method": "filesCreated", "params": { "filePaths": [] }
+            }),
+        )
+        .expect("a request is answered");
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"], serde_json::json!({ "acknowledged": true }));
     }
 }

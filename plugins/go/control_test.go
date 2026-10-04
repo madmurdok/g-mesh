@@ -619,3 +619,61 @@ func TestADeletedPathIsHandledAsSpelled(t *testing.T) {
 		t.Fatalf("cached %v, want [gen/g.go]", got)
 	}
 }
+
+// GM-515: `filesCreated` names a watcher batch's created files before their
+// own `fileChanged`s. Go has no file-existence model to update, but a request
+// with an id must still be answered (core waits on it), a notification gets
+// nothing, and the stream stays in step: the `fileChanged` after them answers
+// with its own id. Malformed params are acknowledged too, never an error frame.
+func TestFilesCreatedIsAcknowledgedAndTheNextFileChangedAnswersWithItsOwnID(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "a.go", "package a\n")
+
+	var in bytes.Buffer
+	in.Write(frameOf(t, map[string]interface{}{
+		"jsonrpc": "2.0", "id": 7, "method": "filesCreated",
+		"params": map[string]interface{}{"filePaths": []string{"a.go", "b.go"}},
+	}))
+	in.Write(frameOf(t, map[string]interface{}{
+		"jsonrpc": "2.0", "method": "filesCreated",
+		"params": map[string]interface{}{"filePaths": []string{"a.go", "b.go"}},
+	}))
+	in.Write(frameOf(t, map[string]interface{}{
+		"jsonrpc": "2.0", "id": 8, "method": "filesCreated",
+		"params": map[string]interface{}{"filePaths": 5},
+	}))
+	in.Write(frameOf(t, map[string]interface{}{
+		"jsonrpc": "2.0", "id": 9, "method": "fileChanged",
+		"params": map[string]string{"filePath": "a.go"},
+	}))
+
+	var out bytes.Buffer
+	runControlLoop(root, &in, &out, nil)
+
+	frames := readFrames(t, bufio.NewReader(&out))
+	if len(frames) != 4 {
+		t.Fatalf("got %d frames, want 4 (handshake, two acks, the fileChanged diff - nothing for the notification): %+v",
+			len(frames), frames)
+	}
+	for i, id := range []float64{7, 8} {
+		ack := frames[1+i]
+		if ack["id"] != id || ack["error"] != nil {
+			t.Fatalf("frame %d = %+v, want an ack for id %v", 1+i, ack, id)
+		}
+		result, ok := ack["result"].(map[string]interface{})
+		if !ok || result["acknowledged"] != true {
+			t.Fatalf("frame %d result = %+v, want {acknowledged: true}", 1+i, ack["result"])
+		}
+	}
+	diff := frames[3]
+	if diff["id"] != float64(9) {
+		t.Fatalf("the fileChanged answer has id %v, want 9: %+v", diff["id"], diff)
+	}
+	result, ok := diff["result"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("the fileChanged answer has no result: %+v", diff)
+	}
+	if upserts, ok := result["upsertNodes"].([]interface{}); !ok || len(upserts) != 1 {
+		t.Fatalf("upsertNodes = %+v, want a.go's one node", result["upsertNodes"])
+	}
+}
