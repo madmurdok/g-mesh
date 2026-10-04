@@ -258,8 +258,10 @@ fn shim(root: &Path, plugins: &Path) -> TokioChildProcess {
 /// later session's handshake - which reads the finished index to write its
 /// instructions - succeeds with instructions.
 ///
-/// Control: the old abort loop - the first call is a tool error naming the
-/// missing Python binary (GM-316's message), and this fails on `is_error`.
+/// Control: the old abort loop (`docs/adr/0002-bulk-walk.md`, superseded by
+/// `docs/adr/0021-per-language-bulk-outcome.md`) - the first call is a tool
+/// error naming the missing Python binary (`plugin::missing_plugin_binary_hint`'s
+/// message), and this fails on `is_error`.
 #[tokio::test]
 async fn the_daemon_answers_for_the_other_language_when_one_plugin_binary_is_missing() {
     let project = Project::new(&[("tools/gen.py", "def gen():\n    pass\n")]);
@@ -288,4 +290,174 @@ async fn the_daemon_answers_for_the_other_language_when_one_plugin_binary_is_mis
     let instructions = second.peer_info().and_then(|info| info.instructions.clone()).unwrap_or_default();
     assert!(!instructions.is_empty(), "the instructions read path must answer after a partial walk");
     second.cancel().await.expect("failed to shut the second client down");
+}
+
+/// Puts the real, built Python plugin where `common::missing_workspace_binary_plugin_root`'s
+/// manifest expects its binary, so that language can index from then on.
+fn install_python_binary(binary: &Path) {
+    let name = format!("g-mesh-plugin-python{}", std::env::consts::EXE_SUFFIX);
+    let built = Path::new(BIN).with_file_name(&name);
+    let target = PathBuf::from(format!("{}{}", binary.display(), std::env::consts::EXE_SUFFIX));
+    std::fs::create_dir_all(target.parent().unwrap()).expect("failed to create the binary's directory");
+    std::fs::copy(&built, &target).unwrap_or_else(|err| {
+        panic!("failed to copy {} (run `cargo build --workspace`): {err}", built.display())
+    });
+}
+
+/// `get_file_outline` on `file`: an index-needing call whose query-time
+/// reindex (`PluginRegistry::ensure_fresh`) runs for `file` before it answers.
+async fn outline(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>, file: &str) -> String {
+    let result = client
+        .call_tool(CallToolRequestParams::new("get_file_outline").with_arguments(
+            json!({ "file_path": file }).as_object().cloned().expect("arguments literal is an object"),
+        ))
+        .await
+        .expect("the call must come back as a tool result");
+    text(&result)
+}
+
+/// Waits, off the async runtime, until this daemon's activation has finished
+/// (`Phase::Ready`), triggering it first.
+async fn activated(root: &Path) {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || common::wait_until_phase(&root, "ready"))
+        .await
+        .expect("the wait must not panic");
+}
+
+/// ADR 0021 section 2, through the daemon's own walk: Python fails that walk
+/// (binary missing), and once a working binary appears the daemon still does
+/// not route Python's files - a query-time reindex of `tools/gen.py`, which
+/// has no baseline and so is stale, adds no Python rows. Rust's file, edited
+/// after the walk, is reindexed by the same kind of call, so the path itself
+/// works here.
+///
+/// Control: drop the `registry.set_failed_languages(..)` call in
+/// `daemon::activation::ActivationCtx::walk` - the outline call spawns the
+/// now-present Python plugin and `gen` is written (Python rows > 0).
+#[tokio::test]
+async fn a_language_the_daemons_walk_failed_is_not_reindexed_once_its_plugin_works() {
+    let project = Project::new(&[("tools/gen.py", "def gen():\n    pass\n")]);
+    let (plugins, binary) = common::rust_and_missing_python_plugin_root();
+
+    let client =
+        ().serve(shim(project.root(), plugins.path())).await.expect("the shim must reach the daemon");
+    activated(project.root()).await;
+    assert!(
+        matches!(project.outcomes().as_slice(), [(p, LanguageOutcome::Failed { .. }), (r, LanguageOutcome::Indexed { .. })] if p == "python" && r == "rust"),
+        "{:?}",
+        project.outcomes()
+    );
+
+    install_python_binary(&binary);
+    std::fs::write(
+        project.root().join("src/lib.rs"),
+        "pub fn kept_rust_symbol() -> u32 {\n    1\n}\npub fn added_rust_symbol() {}\n",
+    )
+    .expect("failed to edit the rust file");
+
+    let rust = outline(&client, "src/lib.rs").await;
+    assert!(rust.contains("added_rust_symbol"), "a routed language is reindexed at query time: {rust}");
+    outline(&client, "tools/gen.py").await;
+    assert_eq!(
+        project.count("SELECT COUNT(*) FROM nodes WHERE language = 'python'"),
+        0,
+        "a failed language's file must not be reindexed"
+    );
+    client.cancel().await.expect("failed to shut the client down");
+}
+
+/// An `init`-walked index (Python and Rust both indexed) whose recorded
+/// outcome is then made `Failed` for Python, standing in for an earlier walk
+/// that failed it.
+fn index_recording_python_as_failed(project: &Project, plugins: &Path) {
+    let output = project.init(plugins, &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert!(
+        project.count("SELECT COUNT(*) FROM nodes WHERE name = 'gen' AND language = 'python'") > 0,
+        "python was indexed"
+    );
+    let failed = std::collections::BTreeMap::from([
+        ("python".to_string(), LanguageOutcome::Failed { error: "recorded by an earlier walk".to_string() }),
+        ("rust".to_string(), LanguageOutcome::Indexed { files: 1 }),
+    ]);
+    schema::record_language_outcomes(&project.index(), &failed).expect("failed to record the outcomes");
+}
+
+/// ADR 0021 section 2, across a restart: an index whose `language_outcome`
+/// table records Python as failed is served by a daemon that does not walk
+/// (the index is complete), yet a Python file edited while no daemon ran is
+/// not reindexed by a query, while the Rust file edited alongside it is.
+///
+/// Control: drop the `self.seed_failed_languages()` call at the top of
+/// `daemon::activation::ActivationCtx::activate` - the outline call reindexes
+/// `tools/gen.py` and `added_python_symbol` is written.
+#[tokio::test]
+async fn a_failed_language_recorded_in_the_index_is_not_reindexed_after_a_restart() {
+    let project = Project::new(&[("tools/gen.py", "def gen():\n    pass\n")]);
+    let (plugins, binary) = common::rust_and_missing_python_plugin_root();
+    install_python_binary(&binary);
+    index_recording_python_as_failed(&project, plugins.path());
+
+    std::fs::write(
+        project.root().join("tools/gen.py"),
+        "def gen():\n    pass\n\ndef added_python_symbol():\n    pass\n",
+    )
+    .expect("failed to edit the python file");
+    std::fs::write(
+        project.root().join("src/lib.rs"),
+        "pub fn kept_rust_symbol() -> u32 {\n    1\n}\npub fn added_rust_symbol() {}\n",
+    )
+    .expect("failed to edit the rust file");
+
+    let client =
+        ().serve(shim(project.root(), plugins.path())).await.expect("the shim must reach the daemon");
+    activated(project.root()).await;
+    let rust = outline(&client, "src/lib.rs").await;
+    assert!(rust.contains("added_rust_symbol"), "a routed language is reindexed at query time: {rust}");
+    let python = outline(&client, "tools/gen.py").await;
+    assert_eq!(
+        project.count("SELECT COUNT(*) FROM nodes WHERE name = 'added_python_symbol'"),
+        0,
+        "a language recorded as failed must not be reindexed: {python}"
+    );
+    client.cancel().await.expect("failed to shut the client down");
+}
+
+/// The other half of the seeding rule: a walk in the same activation replaces
+/// the set seeded from the index with its own result. The index records
+/// Python as failed but is marked as needing a walk; that walk indexes Python,
+/// so a Python edit made afterwards is reindexed by a query.
+///
+/// Control: drop the `registry.set_failed_languages(..)` call in
+/// `daemon::activation::ActivationCtx::walk` - the seeded `python` stays in
+/// the set and `added_python_symbol` is never written.
+#[tokio::test]
+async fn a_walk_replaces_the_failed_languages_seeded_from_the_index() {
+    let project = Project::new(&[("tools/gen.py", "def gen():\n    pass\n")]);
+    let (plugins, binary) = common::rust_and_missing_python_plugin_root();
+    install_python_binary(&binary);
+    index_recording_python_as_failed(&project, plugins.path());
+    project
+        .index()
+        .execute("UPDATE meta SET bulkIndexedAt = NULL WHERE id = 1", [])
+        .expect("failed to unmark the walk");
+
+    let client =
+        ().serve(shim(project.root(), plugins.path())).await.expect("the shim must reach the daemon");
+    activated(project.root()).await;
+    assert!(
+        matches!(project.outcomes().as_slice(), [(p, LanguageOutcome::Indexed { .. }), _] if p == "python"),
+        "the daemon walked and indexed python: {:?}",
+        project.outcomes()
+    );
+
+    std::fs::write(
+        project.root().join("tools/gen.py"),
+        "def gen():\n    pass\n\ndef added_python_symbol():\n    pass\n",
+    )
+    .expect("failed to edit the python file");
+    let python = outline(&client, "tools/gen.py").await;
+    assert!(python.contains("added_python_symbol"), "the re-walked language is routed again: {python}");
+    client.cancel().await.expect("failed to shut the client down");
 }

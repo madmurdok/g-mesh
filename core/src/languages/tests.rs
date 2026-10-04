@@ -291,18 +291,60 @@ fn an_extension_a_discovered_manifest_claims_is_not_counted_as_absent() {
 }
 
 /// Only absent languages are counted: a discovered language's files come
-/// from the index, never from this walk.
+/// from the index, never from this walk - including a file of an extension
+/// the catalogue gives that language but its manifest no longer claims
+/// (`stub.pyi` here), which discovery does not route and which is still not
+/// an absent language's file.
 ///
-/// Control: count every catalogue entry (`table.iter()` instead of
-/// `missing_in`) - `python` appears with 1.
+/// Control: in `absent_for_path_in`, drop the
+/// `discovered.manifests.contains_key(entry.language)` check - `stub.pyi`
+/// counts for python (`python` appears with 1). Counting every catalogue
+/// entry (`table.iter()` instead of `missing_in`) is not a control: each file
+/// is classified by `absent_for_path_in`, which already returns `None` for a
+/// discovered language, so that change only alters which directories are
+/// pruned (a cost, never a count) and leaves the result unchanged.
 #[test]
 fn a_discovered_languages_files_are_not_counted() {
-    let project = project_with(&["app.py", "lib.rs"]);
-    let discovered = discovered_with_excludes(&[("python", &[".py", ".pyi"], &[])]);
+    let project = project_with(&["app.py", "stub.pyi", "lib.rs"]);
+    let discovered = discovered_with_excludes(&[("python", &[".py"], &[])]);
 
     let counts = count_absent_files(project.path(), &discovered);
 
     assert_eq!(counts, BTreeMap::from([("rust", 1)]));
+}
+
+/// With two absent languages, the walk prunes only the directories *both*
+/// exclude (here `node_modules`): pruning a directory one of them still
+/// counts in would hide that language's files. `dist` is TypeScript's own
+/// exclude but not Python's, so `dist/app.py` counts for Python; `.venv` is
+/// Python's but not TypeScript's, so `.venv/shim.ts` counts for TypeScript.
+///
+/// Control: in `count_absent_files_in`, prune the union of the absent
+/// entries' `exclude_dirs` instead of their intersection (`pruned.extend`
+/// the rest's lists in place of `pruned.retain`) - `dist/` and `.venv/` are
+/// never walked, so both languages drop to 1.
+#[test]
+fn the_walk_prunes_only_directories_every_absent_language_excludes() {
+    let project = project_with(&[
+        "app.py",
+        "dist/app.py",
+        ".venv/lib/x.py",
+        "node_modules/pkg/m.py",
+        "web/index.ts",
+        ".venv/shim.ts",
+        "dist/bundle.ts",
+        "node_modules/pkg/m.ts",
+        "src/lib.rs",
+        "main.go",
+    ]);
+    let discovered =
+        discovered_with_excludes(&[("rust", &[".rs"], &["target"]), ("go", &[".go"], &["vendor"])]);
+    let absent: Vec<&str> = missing(&discovered).iter().map(|entry| entry.language).collect();
+    assert_eq!(absent, ["typescript", "python"], "the fixture needs exactly these two absent");
+
+    let counts = count_absent_files(project.path(), &discovered);
+
+    assert_eq!(counts, BTreeMap::from([("python", 2), ("typescript", 2)]));
 }
 
 /// With every catalogue language discovered there is nothing to count.
