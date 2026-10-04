@@ -205,6 +205,15 @@ fn budgets() -> Budgets {
 /// The two-file index this module's doc describes: `a.toy` declares `add`,
 /// `b.toy` calls it through a receiver it cannot resolve.
 fn fixture(scratch: &Scratch) -> (SdkIndex, String) {
+    let (index, caller, _) = fixture_with_structural_edge(scratch, false);
+    (index, caller)
+}
+
+/// [`fixture`], where `b.toy` may also carry a structural `CALLS` edge for
+/// the site, onto a placeholder addressed differently from the one an answer
+/// produces, and the site names that edge in `replaces`. Returns the edge's
+/// id when there is one.
+fn fixture_with_structural_edge(scratch: &Scratch, structural: bool) -> (SdkIndex, String, Option<String>) {
     scratch.write("src/a.toy", A_TOY);
     scratch.write("src/b.toy", B_TOY);
 
@@ -232,6 +241,20 @@ fn fixture(scratch: &Scratch) -> (SdkIndex, String) {
             .in_container("pkg", None)
             .public(),
     );
+    let replaces = structural.then(|| {
+        let placeholder = builder.add_placeholder(
+            g_mesh_plugin_sdk::PlaceholderKind::PendingSymbol,
+            "add",
+            g_mesh_plugin_sdk::wire::PlaceholderTarget {
+                scope: TargetScope::Container("pkg".to_string()),
+                key: TargetKey::QualifiedName("Receiver::add".to_string()),
+                from_container: Some("pkg".to_string()),
+                key_path: None,
+            },
+            range(1, SITE_CHAR_COL, 1, SITE_CHAR_COL + 3),
+        );
+        builder.placeholder_edge(EdgeKind::Calls, &caller, &placeholder)
+    });
     builder.open_site(OpenSite {
         from_id: caller.clone(),
         position: Position { line: 1, col: SITE_CHAR_COL },
@@ -239,11 +262,11 @@ fn fixture(scratch: &Scratch) -> (SdkIndex, String) {
         kind: OpenSiteKind::ReceiverCall,
         edge_kind: EdgeKind::Calls,
         from_container: Some("pkg".to_string()),
-        replaces: None,
+        replaces: replaces.clone(),
     });
     index.insert(b, B_TOY.to_string(), builder.finish());
 
-    (index, caller)
+    (index, caller, replaces)
 }
 
 fn range(start_line: u32, start_col: u32, end_line: u32, end_col: u32) -> Range {
@@ -333,6 +356,31 @@ fn a_definition_becomes_a_semantic_edge() {
     assert_eq!(target.scope, TargetScope::Container("pkg".to_string()));
     assert_eq!(target.key, TargetKey::QualifiedName("add".to_string()), "exact, never a bare name");
     assert_eq!(target.from_container.as_deref(), Some("pkg"), "who is asking, for the visibility check");
+}
+
+/// A site whose structural edge reaches the answered declaration through a
+/// differently addressed placeholder: the answer's own edge has another id,
+/// so the structural edge is retracted, and the call is left with exactly
+/// one `CALLS` edge rather than one per tier.
+#[test]
+fn an_answer_for_a_site_with_a_structural_edge_leaves_one_edge_for_the_call() {
+    let scratch = Scratch::new("replaces");
+    let (index, caller, replaces) = fixture_with_structural_edge(&scratch, true);
+    let structural = replaces.expect("the fixture wrote a structural edge");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "progress", "beginAfterMs": 0, "endAfterMs": 0 },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete);
+    let edges = semantic_edges(&answer);
+    assert_eq!(edges.len(), 1, "{:#?}", answer.diff);
+    assert_eq!(edges[0].from_id, caller);
+    assert_ne!(edges[0].id, structural);
+    assert_eq!(answer.diff.delete_edge_ids, vec![structural], "the structural edge is retracted");
 }
 
 /// The other half of decision 3: a server that negotiates a *different* unit
@@ -1930,4 +1978,154 @@ fn a_missing_server_found_by_prepare_is_reported_by_the_pass() {
     let answer = pass(&mut bridge, &index);
     assert!(!answer.complete);
     assert!(reason(&answer).contains("could not be started"), "{}", reason(&answer));
+}
+
+// --- GM-486: untyped receiver calls answered outside the index ---------------
+
+/// A file whose one function, `id`, calls each of `sites` - `(name, line)`,
+/// column 4 - through a receiver the structural tier cannot type, so each
+/// name is on its `untypedCalls`.
+fn untyped_caller(
+    scratch: &Scratch,
+    index: &mut SdkIndex,
+    relative: &str,
+    id: &str,
+    sites: &[(&str, u32)],
+) -> String {
+    let mut source = format!("fn {id}() {{\n");
+    for (name, _) in sites {
+        source.push_str(&format!("  x.{name}();\n"));
+    }
+    source.push_str("}\n");
+    scratch.write(relative, &source);
+
+    let path = RelPath::new(relative);
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &path);
+    builder.record_untyped_receiver_calls();
+    let lines = sites.len() as u32 + 2;
+    builder.file_node(range(0, 0, lines, 0));
+    let caller = builder.add_node(
+        NodeSpec::new(NodeKind::Function, id, id, range(0, 0, lines - 1, 1))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    for (name, line) in sites {
+        builder.open_site(OpenSite {
+            from_id: caller.clone(),
+            position: Position { line: *line, col: 4 },
+            name: name.to_string(),
+            kind: OpenSiteKind::ReceiverCall,
+            edge_kind: EdgeKind::Calls,
+            from_container: Some("pkg".to_string()),
+            replaces: None,
+        });
+    }
+    index.insert(path, source, builder.finish());
+    caller
+}
+
+/// A script entry answering the site at `(line, 4)` of `relative` with a std
+/// declaration, a file this index does not hold.
+fn answered_by_std(scratch: &Scratch, relative: &str, line: u32) -> Value {
+    json!({
+        "uri": scratch.uri(relative),
+        "line": line,
+        "character": 4,
+        "definition": { "uri": "file:///rustlib/src/rust/library/alloc/src/vec/mod.rs", "line": 9, "character": 11 },
+    })
+}
+
+/// The `untypedCalls` each re-sent node of `answer` carries, by id.
+fn re_sent(answer: &SemanticAnswer) -> BTreeMap<String, Vec<String>> {
+    answer
+        .diff
+        .upsert_nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Function)
+        .map(|node| (node.id.clone(), node.untyped_calls.clone()))
+        .collect()
+}
+
+/// **GM-486.** Only files the pass both asked about and finished are
+/// trimmed. `c.toy` had its `len` answered by std too, but its `hang`
+/// question never came back, so the pass did not finish that file and its
+/// caller keeps its list - core is not sent it at all.
+///
+/// Control: in `LspBridge::answer`, pass `&asked_about` to
+/// `trim_untyped_calls` instead of `&finished` (`c_caller` is re-sent with
+/// `len` dropped).
+#[test]
+fn a_file_the_pass_did_not_finish_keeps_its_untyped_calls() {
+    let scratch = Scratch::new("untyped-partial");
+    let mut index = SdkIndex::new();
+    let b_caller = untyped_caller(&scratch, &mut index, "src/b.toy", "b_caller", &[("len", 1)]);
+    let c_caller = untyped_caller(&scratch, &mut index, "src/c.toy", "c_caller", &[("len", 1), ("hang", 2)]);
+    let mut silent = answered_by_std(&scratch, "src/c.toy", 2);
+    silent["silent"] = json!(true);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": [answered_by_std(&scratch, "src/b.toy", 1), answered_by_std(&scratch, "src/c.toy", 1), silent],
+    }));
+    let mut budgets = budgets();
+    budgets.request = Duration::from_millis(400);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "the `hang` question was never answered");
+    assert_eq!(
+        re_sent(&answer),
+        BTreeMap::from([(b_caller, Vec::new())]),
+        "b.toy was finished and its one call answered by std; {c_caller} is in an unfinished file"
+    );
+}
+
+/// **GM-486, across passes.** A call std answered leaves its caller's list
+/// on every pass that answers it - each starts from the structural list, so
+/// a structural reparse that re-sent the full list in between is undone -
+/// and comes back on the first pass whose answer stops arriving. After
+/// that, with nothing trimmed, the caller is not re-sent.
+///
+/// The answer "stops" by moving the site to a column the scripted server
+/// has no answer for, the same text and the same name.
+///
+/// Controls, in `trim_untyped_calls`: drop the `else if
+/// previously.contains(..)` branch (pass 3 sends nothing, so `len` never
+/// comes back); or forget `LspBridge::trimmed` between passes - pass a
+/// fresh map instead of `&mut self.trimmed` (likewise).
+#[test]
+fn a_trimmed_name_comes_back_when_its_answer_stops() {
+    let scratch = Scratch::new("untyped-back");
+    let mut index = SdkIndex::new();
+    let caller = untyped_caller(&scratch, &mut index, "src/b.toy", "b_caller", &[("len", 1)]);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": [answered_by_std(&scratch, "src/b.toy", 1)],
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let mut unanswered = SdkIndex::new();
+    for (path, entry) in index.files() {
+        let mut graph = entry.graph.clone();
+        for site in &mut graph.open_sites {
+            site.position.col = 2;
+        }
+        unanswered.insert(path.clone(), entry.source.clone(), graph);
+    }
+
+    let mut passes = Vec::new();
+    for index in [&index, &index, &unanswered, &unanswered] {
+        let answer = pass(&mut bridge, index);
+        assert!(answer.complete, "{:?}", answer.reason);
+        assert!(answer.diff.upsert_edges.is_empty(), "std is never an edge: {:#?}", answer.diff);
+        passes.push(re_sent(&answer));
+    }
+    let sent =
+        |names: &[&str]| BTreeMap::from([(caller.clone(), names.iter().map(|n| n.to_string()).collect())]);
+    assert_eq!(passes[0], sent(&[]), "pass 1: answered by std, `len` drops");
+    assert_eq!(passes[1], sent(&[]), "pass 2: trimmed again from the structural list");
+    assert_eq!(passes[2], sent(&["len"]), "pass 3: no answer, `len` comes back");
+    assert_eq!(passes[3], BTreeMap::new(), "pass 4: nothing trimmed now or before");
 }

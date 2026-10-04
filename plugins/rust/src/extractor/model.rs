@@ -18,19 +18,22 @@
 //! - **by name, within a module** answers "what does the bare name `f` mean
 //!   here". It refuses an ambiguous answer: two declarations of one name in
 //!   one module is either a `cfg` pair this plugin merged already or genuinely
-//!   two things, and picking either would be a guess.
+//!   two things, and picking either would be a guess. Only module-level
+//!   items are in it: a field or an associated item is never named by a bare
+//!   path, so it can neither answer nor make ambiguous a bare `f`.
 //! - **by tail, within a module** answers "is `Point::new` declared here" -
 //!   the exact, unambiguous key a type-qualified path needs, and the reason
 //!   `T::f()` is addressed by `qualifiedName` rather than by name. A module
 //!   holding `impl A { fn new() }` and `impl B { fn new() }` - which is most
-//!   modules - offers two declarations *named* `new`, and only the tail tells
-//!   them apart.
+//!   modules - declares two items *named* `new`, and only the tail tells them
+//!   apart.
 
 use std::collections::{HashMap, HashSet};
 
 use g_mesh_plugin_sdk::wire::NodeKind;
 
-use crate::extractor::keys::ModuleNames;
+use crate::extractor::keys::{ModuleCtx, ModuleNames};
+use crate::extractor::typing::WrittenType;
 
 /// A declaration this file makes, as everything that needs to point at it
 /// sees it.
@@ -41,6 +44,14 @@ pub(crate) struct DeclRef {
     /// Its storage kind, for the same filter core's linker applies: a
     /// `CALLS` edge only ever lands on a `Function`.
     pub(crate) kind: NodeKind,
+}
+
+/// A function's written return type, with the module it was written in, which
+/// is where its names resolve. `Self` is already replaced by the impl's type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Returns {
+    pub(crate) module: ModuleCtx,
+    pub(crate) ty: WrittenType,
 }
 
 /// What one `use` item bound a name to.
@@ -67,6 +78,11 @@ pub(crate) struct FileModel {
     by_tail: HashMap<(String, String), DeclRef>,
     imports: HashMap<(String, String), Import>,
     child_modules: HashSet<(String, String)>,
+    /// Modules with at least one glob `use` (`use a::*;`, any visibility).
+    glob_modules: HashSet<String>,
+    /// Keyed by declaration id. `None` marks an id declared twice (a `cfg`
+    /// pair) with two different return types: neither is the answer.
+    returns: HashMap<String, Option<Returns>>,
 }
 
 impl FileModel {
@@ -84,10 +100,12 @@ impl FileModel {
         }
     }
 
-    /// Records a declaration under its full `tail` only (`T.f` for a struct
-    /// field). A field's bare name is never a path in Rust - it is reached
-    /// only through a value or a type - so a bare identifier written in the
-    /// module must not resolve to it.
+    /// Records a declaration under its full `tail` only: a struct field
+    /// (`T.f`) or an associated item (`T::m`, `<T as Tr>::m`, `Tr::m`).
+    /// Neither's bare name is ever a path in Rust - a field is reached only
+    /// through a value, an associated item only through a type, a trait or
+    /// `self` - so a bare identifier written in the module must not resolve
+    /// to it, nor be made ambiguous by it.
     pub(crate) fn declare_member(&mut self, container: &str, tail: &str, decl: DeclRef) {
         self.by_tail.entry((container.to_string(), tail.to_string())).or_insert(decl);
     }
@@ -115,6 +133,24 @@ impl FileModel {
         self.by_tail.get(&(container.to_string(), tail.to_string()))
     }
 
+    /// Records the written return type of the function `id`.
+    pub(crate) fn set_returns(&mut self, id: &str, returns: Returns) {
+        match self.returns.get(id) {
+            None => {
+                self.returns.insert(id.to_string(), Some(returns));
+            }
+            Some(Some(known)) if *known == returns => {}
+            Some(_) => {
+                self.returns.insert(id.to_string(), None);
+            }
+        }
+    }
+
+    /// The written return type of the function `id`, when it has exactly one.
+    pub(crate) fn returns(&self, id: &str) -> Option<&Returns> {
+        self.returns.get(id)?.as_ref()
+    }
+
     /// Records what a `use` item bound. The first binding of a name in a
     /// module wins, which is also what `rustc` does with the only legal
     /// version of a repeat (two `cfg`-gated `use` items of one name).
@@ -130,6 +166,21 @@ impl FileModel {
     /// Records that `container` declares `mod name` - file-backed or inline.
     pub(crate) fn child_module(&mut self, container: &str, name: &str) {
         self.child_modules.insert((container.to_string(), name.to_string()));
+    }
+
+    /// Records that `container` has a glob `use`.
+    pub(crate) fn glob_module(&mut self, container: &str) {
+        self.glob_modules.insert(container.to_string());
+    }
+
+    /// Whether `container` has any glob `use`.
+    pub(crate) fn has_glob(&self, container: &str) -> bool {
+        self.glob_modules.contains(container)
+    }
+
+    /// Whether `container` declares any `mod` - file-backed or inline.
+    pub(crate) fn has_child_modules(&self, container: &str) -> bool {
+        self.child_modules.iter().any(|(parent, _)| parent == container)
     }
 }
 

@@ -36,8 +36,9 @@ find_callees/find_implementations also carry a response-level \
 the page otherwise looks complete (`hasMore: false`, plausible results), so \
 check this field, not just individual rows. Never set on an empty page.\n\n\
 The one legitimate reason to grep afterward: a method call through a \
-variable receiver (`x.foo()`) produces no edge by design, so caller/reference \
-lists for methods can under-report; bare function calls and this/super/qualified-type \
+variable receiver (`x.foo()`) may produce no edge by design, so caller/reference \
+lists for methods can under-report (a method page that may miss such calls carries \
+`untypedReceiverCalls` where the language reports them); bare function calls and this/super/qualified-type \
 calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
 project's first index, or a re-index after an upgrade, a tool call waits for the walk \
 to finish - slow, not wrong; do not abandon it for grep.\n\n\
@@ -167,7 +168,7 @@ fn ts_only_is_byte_identical_to_the_original_string() {
         "a TypeScript-only project must read exactly what it did before GM-262"
     );
     // The measured length of the current rendering, not a re-derivation.
-    assert_eq!(rendered.len(), 1729, "this module's own current baseline, re-measured");
+    assert_eq!(rendered.len(), 1836, "this module's own current baseline, re-measured");
 }
 
 #[test]
@@ -201,7 +202,7 @@ fn rust_only_before_its_semantic_pass_lists_the_receiver_gap() {
         rendered.contains("The one legitimate reason to grep afterward"),
         "the gap is real until the pass has run"
     );
-    assert!(rendered.contains("produces no edge by design"), "one present language is never named");
+    assert!(rendered.contains("may produce no edge by design"), "one present language is never named");
 }
 
 /// The four assertions every "its semantic tier has landed" arm makes,
@@ -211,7 +212,7 @@ fn rust_only_before_its_semantic_pass_lists_the_receiver_gap() {
 /// The two negative assertions are the discrimination, not decoration.
 /// `"One real gap"` is what this rendering said until GM-385, and it was
 /// measured false in all three languages (see [`P4_STATIC_RECEIVER`]'s
-/// own doc for the queries). `"produces no edge"` is the *pre-pass*
+/// own doc for the queries). `"may produce no edge"` is the *pre-pass*
 /// wording, so its absence is what separates this arm from the
 /// `*_before_its_semantic_pass_*` test beside it - without it both arms
 /// would pass on a `build` that ignored `semantic_pass_done` entirely.
@@ -230,7 +231,7 @@ fn assert_narrowed_receiver_clause(rendered: &str, language: &str) {
         "{language}: a pointer to the missing calls, never a count of them:\n{rendered}"
     );
     assert!(
-        !rendered.contains("produces no edge"),
+        !rendered.contains("may produce no edge"),
         "{language}: that is the pre-pass wording, and this arm is past it:\n{rendered}"
     );
     assert!(
@@ -296,7 +297,7 @@ fn python_only_before_its_semantic_pass_lists_the_receiver_gap() {
         rendered.contains("The one legitimate reason to grep afterward"),
         "the gap is real until the pass has run"
     );
-    assert!(rendered.contains("produces no edge by design"), "one present language is never named");
+    assert!(rendered.contains("may produce no edge by design"), "one present language is never named");
 }
 
 /// And what the same index reads once pyright has answered (GM-299): the
@@ -370,7 +371,7 @@ fn typescript_never_reaches_the_narrowed_rendering_however_its_pass_goes() {
     let rendered = build(&[ts]);
 
     assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "typescript's gap never narrows, because it never resolves");
-    assert!(rendered.contains("produces no edge by design"), "the open-gap wording is the right one here");
+    assert!(rendered.contains("may produce no edge by design"), "the open-gap wording is the right one here");
     assert!(
         !rendered.contains("binds to the receiver's declared"),
         "the narrowed clause must not fire for a language with no receiver-call edges:\n{rendered}"
@@ -394,7 +395,7 @@ fn a_mixed_project_keeps_the_named_open_gap_and_does_not_carry_the_narrowing() {
 
     let rendered = build(&[typescript_present(), go_done]);
 
-    assert!(rendered.contains("produces no edge in typescript"), "{rendered}");
+    assert!(rendered.contains("may produce no edge in typescript"), "{rendered}");
     assert!(
         !rendered.contains("binds to the receiver's declared"),
         "scoped out by budget, deliberately - see P4_STATIC_RECEIVER:\n{rendered}"
@@ -419,14 +420,14 @@ fn go_only_before_its_semantic_pass_still_lists_the_receiver_gap() {
         rendered.contains("The one legitimate reason to grep afterward"),
         "the gap is real until the pass has run"
     );
-    assert!(rendered.contains("produces no edge by design"), "one present language is never named");
+    assert!(rendered.contains("may produce no edge by design"), "one present language is never named");
     assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "a single gapped language reads as it always has");
 }
 
 #[test]
 fn ts_plus_rust_pre_semantic_names_both() {
     let rendered = build(&[typescript_present(), rust_pre_semantic()]);
-    assert!(rendered.contains("produces no edge in rust and typescript"));
+    assert!(rendered.contains("may produce no edge in rust and typescript"));
     println!("ts+rust-pre-semantic bytes: {}", rendered.len());
 }
 
@@ -435,7 +436,7 @@ fn ts_plus_rust_after_rusts_semantic_pass_drops_rust_from_the_list() {
     let mut rust_done = rust_pre_semantic();
     rust_done.semantic_pass_done = true;
     let rendered = build(&[typescript_present(), rust_done]);
-    assert!(rendered.contains("produces no edge in typescript"));
+    assert!(rendered.contains("may produce no edge in typescript"));
     assert!(!rendered.contains("rust"), "rust's own gap is closed once its semantic pass has run");
 }
 
@@ -509,7 +510,7 @@ fn fallback_wording_fits_under_the_ceiling() {
     let rendered = assemble(&p4_fallback());
     println!("fallback bytes: {}", rendered.len());
     assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
-    assert!(rendered.contains("semantic layer finishes"));
+    assert!(rendered.contains("untypedReceiverCalls"));
 }
 
 /// [`build`]'s own fallback branch, proven rather than merely present:
@@ -765,4 +766,29 @@ fn build_front_drops_a_root_too_long_for_the_ceiling() {
     assert!(!rendered.contains("/rrrr"), "the root must not appear: {rendered}");
     assert!(rendered.contains("This folder holds 2+ projects"), "{rendered}");
     assert!(rendered.ends_with("Projects: a, b."), "{rendered}");
+}
+
+/// The eight-language worst case still names every gapped language
+/// and points at `untypedReceiverCalls` when nothing is prefixed, but under a
+/// cold-start line the body is built against the ceiling less the no-path
+/// line and falls back to [`p4_fallback`], whatever the root's length.
+/// Control: build `cold_start`'s body with `build(present)` again (a
+/// 103-byte root renders the named body under the no-path line, over the
+/// ceiling).
+#[test]
+fn the_worst_case_cold_start_falls_back_to_the_generic_receiver_paragraph() {
+    let named = build(&worst_case_present());
+    assert!(named.contains("`untypedReceiverCalls`"), "{named}");
+    assert_ne!(named, assemble(&p4_fallback()));
+    let fallback = assemble(&p4_fallback());
+    println!("named {} bytes, fallback {} bytes", named.len(), fallback.len());
+
+    for walking in [false, true] {
+        for root_len in [10, 103, 600] {
+            let rendered = cold_start(&root_of_byte_len(root_len), walking, &worst_case_present());
+            println!("walking={walking} root={root_len}: {} bytes", rendered.len());
+            assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
+            assert!(rendered.ends_with(&fallback), "walking={walking} root={root_len}: {rendered}");
+        }
+    }
 }

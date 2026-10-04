@@ -133,6 +133,12 @@ pub struct NodeRecord {
     /// as `qualified_suffixes` rows, a read leaves this empty, and
     /// [`apply_diff`] replaces the node's rows from it on every upsert.
     pub alias_paths: Vec<QualifiedPath>,
+    /// Bare names of methods this node calls through a receiver of unknown
+    /// type (wire `untypedCalls`, GM-486). **Write-side only**, like
+    /// `alias_paths`: they exist in storage only as `untyped_calls` rows, a
+    /// read leaves this empty, and [`apply_diff`] replaces the node's rows
+    /// from it on every upsert.
+    pub untyped_calls: Vec<String>,
 }
 
 impl NodeRecord {
@@ -172,6 +178,7 @@ impl NodeRecord {
             declarations: Vec::new(),
             qualified_path: None,
             alias_paths: Vec::new(),
+            untyped_calls: Vec::new(),
         }
     }
 }
@@ -332,6 +339,8 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
             .context("failed to delete a node's placeholder target")?;
         tx.execute("DELETE FROM qualified_suffixes WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's qualified suffixes")?;
+        tx.execute("DELETE FROM untyped_calls WHERE nodeId = ?1", params![id])
+            .context("failed to delete a node's untyped calls")?;
         tx.execute("DELETE FROM vectors WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's embedding")?;
         tx.execute("DELETE FROM nodes WHERE id = ?1", params![id]).context("failed to delete node")?;
@@ -432,6 +441,20 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
                 .context("failed to prepare the qualified suffix insert")?
                 .execute(params![suffix, node.id])
                 .context("failed to insert a qualified suffix")?;
+        }
+
+        // Untyped receiver calls are replaced wholesale too: a node re-sent
+        // with an empty list (a plugin that stopped reporting, or a body that
+        // no longer has such calls) loses its rows.
+        tx.prepare_cached("DELETE FROM untyped_calls WHERE nodeId = ?1")
+            .context("failed to prepare the untyped call replacement")?
+            .execute(params![node.id])
+            .context("failed to clear a node's untyped calls")?;
+        for name in &node.untyped_calls {
+            tx.prepare_cached("INSERT OR IGNORE INTO untyped_calls (name, nodeId) VALUES (?1, ?2)")
+                .context("failed to prepare the untyped call insert")?
+                .execute(params![name, node.id])
+                .context("failed to insert an untyped call")?;
         }
 
         // `placeholder_targets` is replaced wholesale too, and for the same
@@ -1167,5 +1190,76 @@ mod tests {
             .query_row("SELECT keyPath FROM placeholder_targets WHERE nodeId = 'p1'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(stored.as_deref(), Some("a\u{1f}::\u{1f}T\u{1f}.\u{1f}f"));
+    }
+
+    /// `n1`, a function calling `names` through untyped receivers.
+    fn untyped_caller(names: &[&str]) -> NodeRecord {
+        let mut node = NodeRecord::new("n1", "Function", "run", "m::run", "src/m.rs", "rust");
+        node.untyped_calls = names.iter().map(|name| name.to_string()).collect();
+        node
+    }
+
+    fn untyped_of(conn: &Connection, node_id: &str) -> Vec<String> {
+        conn.prepare("SELECT name FROM untyped_calls WHERE nodeId = ?1 ORDER BY name")
+            .unwrap()
+            .query_map(params![node_id], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// A node's untyped calls become `(name, nodeId)` rows, a
+    /// repeated name is one row, and a read leaves the field empty
+    /// (write-side only). Controls: drop the insert loop in `apply_diff` (no
+    /// rows); drop `OR IGNORE` from the insert (the repeated `m` fails the
+    /// primary key).
+    #[test]
+    fn a_nodes_untyped_calls_are_written_as_rows() {
+        let mut conn = setup();
+        apply_diff(
+            &mut conn,
+            &Diff { upsert_nodes: vec![untyped_caller(&["m", "n", "m"])], ..Default::default() },
+        )
+        .unwrap();
+
+        assert_eq!(untyped_of(&conn, "n1"), vec!["m", "n"]);
+        let read_back = crate::graph::queries::get_node(&conn, "n1").unwrap().unwrap();
+        assert!(read_back.untyped_calls.is_empty(), "untyped calls are write-side only");
+    }
+
+    /// Re-upserting a node replaces its rows, and an empty list leaves none.
+    /// Control: drop the `DELETE FROM untyped_calls` before the insert loop
+    /// (`m` survives the second write, and both survive the third).
+    #[test]
+    fn re_upserting_a_node_replaces_its_untyped_call_rows() {
+        let mut conn = setup();
+        for names in [&["m", "n"][..], &["n", "o"]] {
+            apply_diff(&mut conn, &Diff { upsert_nodes: vec![untyped_caller(names)], ..Default::default() })
+                .unwrap();
+        }
+        assert_eq!(untyped_of(&conn, "n1"), vec!["n", "o"]);
+
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![untyped_caller(&[])], ..Default::default() })
+            .unwrap();
+        assert_eq!(count(&conn, "untyped_calls"), 0, "an empty list leaves no rows");
+    }
+
+    /// With foreign keys off, as on the daemon's connection, deleting a node
+    /// deletes its rows. Control: drop the `DELETE FROM untyped_calls` in `apply_diff`'s
+    /// delete loop (two rows remain).
+    #[test]
+    fn deleting_a_node_takes_its_untyped_call_rows_with_it_without_foreign_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+        apply_diff(
+            &mut conn,
+            &Diff { upsert_nodes: vec![untyped_caller(&["m", "n"])], ..Default::default() },
+        )
+        .unwrap();
+
+        apply_diff(&mut conn, &Diff { delete_node_ids: vec!["n1".to_string()], ..Default::default() })
+            .unwrap();
+        assert_eq!(count(&conn, "untyped_calls"), 0);
     }
 }

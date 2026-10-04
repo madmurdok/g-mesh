@@ -260,7 +260,7 @@ fn a_container_named_like_its_member_is_not_a_definition_candidate() {
     let mut member = node_with_span("n1", "app", "app::app", "src/app.rs", (5, 0));
     member.container = Some("app".to_string());
     upsert_node(&mut conn, member).unwrap();
-    let candidates = find_candidates_by_name(&conn, NameColumn::Name, "app", None).unwrap();
+    let candidates = find_candidates_by_name(&conn, NameColumn::Name, &[Lookup::any("app")], None).unwrap();
     assert_eq!(candidates.results.len(), 1, "the container node must not be ranked");
 
     let params = FindDefinitionParams {
@@ -1339,4 +1339,364 @@ fn an_underscore_in_the_query_is_not_a_wildcard() {
     rust_fn(&mut conn, "x", "app", &[("::", "store"), ("::", "readXall")]);
     assert_eq!(answer(&conn, "store::readXall"), ("x".into(), "qualifiedNameSuffix".into()));
     assert!(refused(&conn, "store::read_all"));
+}
+
+// --- the strip-prefix rung (`[plugin.symbol_query_prefixes]`) -------------
+
+fn ts_decl(conn: &mut Connection, id: &str, name: &str, qualified_name: &str, language: &str) {
+    upsert_node(conn, NodeRecord::new(id, "Function", name, qualified_name, format!("{id}.ts"), language))
+        .unwrap();
+}
+
+/// The ladder with no model and `map`'s declarations in place of the
+/// shipped ones.
+fn resolved_with(conn: &Connection, map: &QueryShapes, name: &str) -> CallToolResult {
+    let embedding = EmbeddingPipeline::disabled();
+    by_name(conn, None, &SemanticRung::deferred(&embedding, map), name, None).unwrap()
+}
+
+/// Two languages that both refuse `@` and `/`, with `strip = ["@"]` for
+/// each language in `opting`.
+fn decorator_shapes(opting: &[&str]) -> QueryShapes {
+    let both = QueryShapes::of(&[("typescript", shapes(&["@"], &["/"])), ("python", shapes(&["@"], &["/"]))]);
+    opting.iter().fold(both, |map, language| map.with_strip(language, &["@"]))
+}
+
+fn ids(body: &serde_json::Value) -> Vec<&str> {
+    let mut ids: Vec<&str> =
+        body["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// T7: with the shipped manifests, a decorator's use-site spelling finds the
+/// decorator, labelled with the rung the remainder resolved at and the name
+/// looked up.
+///
+/// Control: delete the `by_stripped_prefix` arm from `resolve_symbol_name` -
+/// `@Component` is refused and this fails.
+#[test]
+fn a_decorator_query_resolves_to_the_decorator() {
+    let mut conn = setup();
+    ts_decl(&mut conn, "deco", "Component", "Component", "typescript");
+
+    let body = json_body(&resolved_by_name(&conn, "@Component").unwrap());
+
+    assert_eq!(body["id"], "deco", "{body}");
+    assert_eq!(body["resolvedBy"], "qualifiedName", "{body}");
+    assert_eq!(body["queriedAs"], "Component", "{body}");
+    let plain = json_body(&resolved_by_name(&conn, "Component").unwrap());
+    assert!(plain.get("queriedAs").is_none(), "only a rewritten answer says what it looked up: {plain}");
+}
+
+/// T8: only TypeScript opts in, so only TypeScript's `Component` is a
+/// candidate for `@Component`; Python's namesake does not make it ambiguous.
+///
+/// Control: make `Lookup::admits` return `true` - both rows are candidates,
+/// the answer is an ambiguous page, and this fails.
+#[test]
+fn a_rewrite_finds_only_the_opting_languages_declarations() {
+    let mut conn = setup();
+    ts_decl(&mut conn, "ts", "Component", "Component", "typescript");
+    ts_decl(&mut conn, "py", "Component", "Component", "python");
+
+    let body = json_body(&resolved_with(&conn, &decorator_shapes(&["typescript"]), "@Component"));
+
+    assert_eq!(body["id"], "ts", "{body}");
+    assert_eq!(body["queriedAs"], "Component", "{body}");
+}
+
+/// T9: both languages opt in, so `@Component` names two decorators and the
+/// answer is the ranked page with both - and with no third language's
+/// namesake, which the page's own SQL leaves out.
+///
+/// Control: collapse the union to one language (take only the first pair of
+/// `QueryShapes::rewrites` in `by_stripped_prefix`) - Python's alone
+/// resolves and this fails. Control for the third row: drop the
+/// `n.language IN (...)` condition in `Lookup::filter` - the Rust row joins
+/// the page and this fails.
+#[test]
+fn when_both_languages_opt_in_the_rewrite_is_an_ambiguous_page_of_both() {
+    let mut conn = setup();
+    ts_decl(&mut conn, "ts", "Component", "Component", "typescript");
+    ts_decl(&mut conn, "py", "Component", "Component", "python");
+    ts_decl(&mut conn, "rs", "Component", "Component", "rust");
+
+    let body = json_body(&resolved_with(&conn, &decorator_shapes(&["typescript", "python"]), "@Component"));
+
+    assert_eq!(body["ambiguous"], true, "{body}");
+    assert_eq!(body["resolvedBy"], "nameAmbiguous", "{body}");
+    assert_eq!(body["queriedAs"], "Component", "{body}");
+    assert_eq!(ids(&body), vec!["py", "ts"], "{body}");
+}
+
+/// The language filter sits inside the page's query, so a full page of the
+/// opting language's rows says `hasMore: false` even while a more-referenced
+/// namesake of another language exists.
+///
+/// Control: filter the page's rows after `paginate_by_score` instead of in
+/// `Lookup::filter` (or drop the `n.language IN (...)` condition) - the Rust
+/// row takes a slot, `hasMore` turns true, and this fails.
+#[test]
+fn a_rewritten_page_counts_only_the_opting_languages_rows() {
+    let mut conn = setup();
+    for i in 0..CANDIDATE_PAGE_SIZE {
+        ts_decl(&mut conn, &format!("ts{i:02}"), "Component", &format!("m{i}.Component"), "typescript");
+    }
+    ts_decl(&mut conn, "rs", "Component", "Component", "rust");
+    called(&mut conn, "rs", 3);
+
+    let body = json_body(&resolved_with(&conn, &decorator_shapes(&["typescript"]), "@Component"));
+
+    assert_eq!(body["results"].as_array().unwrap().len(), CANDIDATE_PAGE_SIZE, "{body}");
+    assert!(!ids(&body).contains(&"rs"), "{body}");
+    assert_eq!(body["hasMore"], false, "{body}");
+}
+
+/// The remainder is retried on the qualifiedName-suffix rung too, as
+/// `@Widget.size` measured on py-deco.
+///
+/// Control: return `Ok(None)` in place of the suffix lookup in
+/// `by_stripped_prefix` - this is refused and fails.
+#[test]
+fn a_rewrite_reaches_the_qualified_name_suffix_rung() {
+    let mut conn = setup();
+    let path = qpath("deco", &[(".", "Widget"), (".", "size")]);
+    let mut node = NodeRecord::new("size", "Function", "size", path.display(), "deco.py", "python");
+    node.qualified_path = Some(path);
+    upsert_node(&mut conn, node).unwrap();
+
+    let body = json_body(&resolved_by_name(&conn, "@Widget.size").unwrap());
+
+    assert_eq!(body["id"], "size", "{body}");
+    assert_eq!(body["resolvedBy"], "qualifiedNameSuffix", "{body}");
+    assert_eq!(body["queriedAs"], "Widget.size", "{body}");
+}
+
+/// T10: a remainder the language refuses is never looked up, so a path can
+/// never resolve to a `File` node by the back door.
+///
+/// Control: drop `&& !shapes.refused.matches(remainder)` from
+/// `QueryShapes::rewrites` - `src/app.ts` resolves to the file and this fails.
+#[test]
+fn a_prefixed_path_is_still_refused() {
+    let mut conn = setup();
+    upsert_node(
+        &mut conn,
+        NodeRecord::new("file", "File", "app.ts", "src/app.ts", "src/app.ts", "typescript"),
+    )
+    .unwrap();
+
+    assert!(refused(&conn, "@src/app.ts"));
+}
+
+/// T11: `@scope/pkg` keeps today's answer, the import note: its remainder
+/// is refused, so no lookup runs, and the later rungs see the original query.
+///
+/// Control: have `by_stripped_prefix` hand its remainder to the rest of the
+/// ladder (`by_file_name(conn, semantic, remainder)`) and drop the shape check
+/// - the answer is then about `scope/pkg` and this fails.
+#[test]
+fn a_scoped_package_keeps_its_import_note() {
+    let mut conn = setup();
+    let mut ph = NodeRecord::new("ph", "Module", "pkg", "@scope/pkg", "src/a.ts", "typescript");
+    ph.native_kind = Some(crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND.to_string());
+    upsert_node(&mut conn, ph).unwrap();
+    ts_decl(&mut conn, "deco", "Component", "Component", "typescript");
+
+    let text = error_text(&resolved_by_name(&conn, "@scope/pkg").unwrap());
+
+    assert!(text.contains("'@scope/pkg' (1)"), "{text}");
+    assert!(text.contains("get_dependencies"), "{text}");
+}
+
+/// T12: a prefixed query nothing declares still stops before the semantic
+/// rung: the rewrite is structural only, and every shipped language refuses
+/// `@`, so nothing is embedded.
+///
+/// Control: run the semantic rung on the remainder when the rewrite misses
+/// (`by_semantic_neighbours(conn, semantic, remainder)`) - `NoSuchThing` is
+/// recorded in `reached` and this fails.
+#[test]
+fn a_prefixed_unknown_name_is_never_embedded() {
+    let mut conn = setup_with_vectors();
+    ts_decl(&mut conn, "deco", "Component", "Component", "typescript");
+    let embedding = unloaded_pipeline();
+
+    let rung = SemanticRung::deferred(&embedding, QueryShapes::shipped());
+    let result = by_name(&conn, None, &rung, "@NoSuchThing", None).unwrap();
+
+    assert_eq!(rung.reached(), None);
+    assert_eq!(error_text(&result), "g-mesh: no symbol named '@NoSuchThing' found");
+}
+
+/// T13: the query as typed goes first, so a declaration whose qualifiedName
+/// is literally the query wins over the rewrite's hit.
+///
+/// Control: call `by_stripped_prefix` at the top of `resolve_symbol_name` -
+/// the answer is the ambiguous `Component` page and this fails.
+#[test]
+fn the_original_query_wins_over_a_rewrite() {
+    let mut conn = setup();
+    ts_decl(&mut conn, "literal", "Component", "@Component", "typescript");
+    ts_decl(&mut conn, "deco", "Component", "Component", "typescript");
+
+    let body = json_body(&resolved_by_name(&conn, "@Component").unwrap());
+
+    assert_eq!(body["id"], "literal", "{body}");
+    assert!(body.get("queriedAs").is_none(), "{body}");
+}
+
+/// A TypeScript declaration stored with `path`, named after its last segment.
+fn ts_path_decl(conn: &mut Connection, id: &str, path: QualifiedPath) {
+    let name = path.last().unwrap().name.clone();
+    let mut node = NodeRecord::new(id, "Function", name, path.display(), format!("{id}.ts"), "typescript");
+    node.qualified_path = Some(path);
+    upsert_node(conn, node).unwrap();
+}
+
+/// The remainder resolves on the rewrite's own exact-qualifiedName rung,
+/// where the declaration's qualifiedName is not its name - a class member
+/// spelled `@Widget.size`.
+///
+/// Control: delete the `exact.len() == 1 && exact[0].0.name != exact[0].1`
+/// early return from `by_stripped_prefix` - `Widget.size` is then no
+/// declaration's name and has no stored suffix, so the query is refused and
+/// this fails.
+#[test]
+fn a_rewrite_resolves_on_the_exact_qualified_name_rung() {
+    let mut conn = setup();
+    ts_decl(&mut conn, "method", "size", "Widget.size", "typescript");
+
+    let body = json_body(&resolved_by_name(&conn, "@Widget.size").unwrap());
+
+    assert_eq!(body["id"], "method", "{body}");
+    assert_eq!(body["resolvedBy"], "qualifiedName", "{body}");
+    assert_eq!(body["queriedAs"], "Widget.size", "{body}");
+}
+
+/// Two declarations carry the remainder as their qualifiedName: the
+/// rewrite's answer is the page over the qualifiedName column, labelled with
+/// the name it looked up.
+///
+/// Controls: drop the `(_, 2..) => Some(NameColumn::QualifiedName)` arm from
+/// `by_stripped_prefix`'s `ambiguous_over` - the query is refused and this
+/// fails; or pass `None` for `page_label` to `CandidatePage::ambiguous` -
+/// `queriedAs` is missing and this fails.
+#[test]
+fn a_rewrite_ambiguous_over_qualified_names_is_a_labelled_page() {
+    let mut conn = setup();
+    ts_decl(&mut conn, "a", "size", "Widget.size", "typescript");
+    ts_decl(&mut conn, "b", "size", "Widget.size", "typescript");
+
+    let body = json_body(&resolved_by_name(&conn, "@Widget.size").unwrap());
+
+    assert_eq!(body["ambiguous"], true, "{body}");
+    assert_eq!(body["resolvedBy"], "nameAmbiguous", "{body}");
+    assert_eq!(body["queriedAs"], "Widget.size", "{body}");
+    assert_eq!(ids(&body), vec!["a", "b"], "{body}");
+}
+
+/// Two declarations store the remainder as a qualifiedName suffix: the
+/// rewrite's answer is the suffix rung's page, labelled with the name it
+/// looked up.
+///
+/// Controls: in `by_stripped_prefix`'s suffix `match`, answer the `_` arm
+/// with `answer(suffixed.remove(0), ResolvedBy::QualifiedNameSuffix)` - one
+/// declaration resolves and this fails; or pass `None` for `page_label` -
+/// `queriedAs` is missing and this fails.
+#[test]
+fn a_rewrite_ambiguous_at_the_suffix_rung_is_a_labelled_page() {
+    let mut conn = setup();
+    ts_path_decl(&mut conn, "a", qpath("a", &[(".", "Widget"), (".", "size")]));
+    ts_path_decl(&mut conn, "b", qpath("b", &[(".", "Widget"), (".", "size")]));
+
+    let body = json_body(&resolved_by_name(&conn, "@Widget.size").unwrap());
+
+    assert_eq!(body["ambiguous"], true, "{body}");
+    assert_eq!(body["resolvedBy"], "nameAmbiguous", "{body}");
+    assert_eq!(body["queriedAs"], "Widget.size", "{body}");
+    assert_eq!(ids(&body), vec!["a", "b"], "{body}");
+}
+
+/// The query as typed wins on the name rung: a declaration literally named
+/// `@Component` resolves even though the rewrite would find `Component`.
+///
+/// Control: call `by_stripped_prefix` before `queries::find_by_name` in
+/// `resolve_symbol_name` (returning its answer when it has one) - `deco`
+/// resolves with `queriedAs` and this fails.
+#[test]
+fn the_original_query_wins_over_a_rewrite_on_the_name_rung() {
+    let mut conn = setup();
+    ts_decl(&mut conn, "literal", "@Component", "deco.@Component", "typescript");
+    ts_decl(&mut conn, "deco", "Component", "Component", "typescript");
+
+    let body = json_body(&resolved_by_name(&conn, "@Component").unwrap());
+
+    assert_eq!(body["id"], "literal", "{body}");
+    assert_eq!(body["resolvedBy"], "name", "{body}");
+    assert!(body.get("queriedAs").is_none(), "{body}");
+}
+
+/// The query as typed wins on the suffix rung: a declaration storing
+/// `@Widget.size` as a suffix resolves even though the rewrite would find
+/// `Widget.size` by its exact qualifiedName.
+///
+/// Control: swap the order of `by_qualified_name_suffix` and
+/// `by_stripped_prefix` in `resolve_symbol_name` - `rewritten` resolves with
+/// `queriedAs` and this fails.
+#[test]
+fn the_original_query_wins_over_a_rewrite_on_the_suffix_rung() {
+    let mut conn = setup();
+    ts_path_decl(&mut conn, "literal", qpath("deco", &[(".", "@Widget"), (".", "size")]));
+    ts_decl(&mut conn, "rewritten", "size", "Widget.size", "typescript");
+
+    let body = json_body(&resolved_by_name(&conn, "@Widget.size").unwrap());
+
+    assert_eq!(body["id"], "literal", "{body}");
+    assert_eq!(body["resolvedBy"], "qualifiedNameSuffix", "{body}");
+    assert!(body.get("queriedAs").is_none(), "{body}");
+}
+
+/// A rewritten ambiguous page continues through its cursor: the second page
+/// holds exactly the remainder and still says what was looked up.
+///
+/// Control: pass `None` in place of `cursor` to `find_candidates_by_name` in
+/// `by_stripped_prefix` - the second call returns the first page again and
+/// this fails.
+#[test]
+fn a_rewritten_page_continues_through_its_cursor() {
+    let mut conn = setup();
+    let total = CANDIDATE_PAGE_SIZE + 1;
+    for i in 0..total {
+        ts_decl(&mut conn, &format!("c{i:02}"), "Component", &format!("m{i}.Component"), "typescript");
+    }
+    let store = Arc::new(IndexStore::new(conn));
+    let page = |cursor: Option<String>| {
+        let params = FindDefinitionParams {
+            symbol_name: Some("@Component".to_string()),
+            file_path: None,
+            position: None,
+            cursor,
+            include_source: None,
+        };
+        json_body(
+            &handle(&store, &no_sources(), &EmbeddingPipeline::disabled(), QueryShapes::shipped(), params)
+                .unwrap(),
+        )
+    };
+
+    let first = page(None);
+    assert_eq!(first["queriedAs"], "Component", "{first}");
+    assert_eq!(first["results"].as_array().unwrap().len(), CANDIDATE_PAGE_SIZE, "{first}");
+    assert_eq!(first["hasMore"], true, "{first}");
+    let second = page(Some(first["nextCursor"].as_str().unwrap().to_string()));
+
+    assert_eq!(second["queriedAs"], "Component", "{second}");
+    assert_eq!(second["results"].as_array().unwrap().len(), 1, "{second}");
+    assert_eq!(second["hasMore"], false, "{second}");
+    let mut all: Vec<&str> = ids(&first).into_iter().chain(ids(&second)).collect();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), total, "every candidate exactly once across both pages");
 }

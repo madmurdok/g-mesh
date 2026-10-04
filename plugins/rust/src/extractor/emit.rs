@@ -47,7 +47,7 @@ use std::collections::{HashMap, HashSet};
 
 use g_mesh_plugin_sdk::ids::{edge_id, node_id};
 use g_mesh_plugin_sdk::wire::{
-    EdgeKind, NodeKind, PlaceholderTarget, Position, Range, TargetKey, TargetScope,
+    EdgeKind, NodeKind, PlaceholderTarget, Position, Range, TargetKey, TargetScope, Visibility,
 };
 use g_mesh_plugin_sdk::{
     render_target, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, PlaceholderKind, RelPath,
@@ -152,6 +152,8 @@ impl<'s> Emitter<'s> {
     ) -> Self {
         let positions = Positions::new(source);
         let mut graph = FileGraphBuilder::new(language, engine, path);
+        // Untyped receiver calls reach core as `untypedCalls` (GM-486).
+        graph.record_untyped_receiver_calls();
         let name = path.as_str().rsplit('/').next().unwrap_or(path.as_str()).to_string();
         let mut spec = NodeSpec::new(NodeKind::File, name, path.as_str(), positions.file_range());
         spec.doc_comment = module_doc;
@@ -228,20 +230,27 @@ impl<'s> Emitter<'s> {
     /// which is what keeps it out of `memberCount`), and a parent is only
     /// ever read from a member's record.
     ///
-    /// The `qualifiedName` names the published name as well as the address,
-    /// where the SDK's own rendering would name only the address. Two
-    /// `pub use` items forwarding one declaration under two names -
-    /// `pub use a::b::C as X;` and `… as Y;` - are two different facts about
-    /// what this module publishes, and an id derived from the address alone
-    /// would make them one node and lose the second name.
+    /// The `qualifiedName` names the publishing module and the published name
+    /// as well as the address, where the SDK's own rendering would name only
+    /// the address. Two `pub use` items forwarding one declaration under two
+    /// names - `pub use a::b::C as X;` and `… as Y;` - are two different facts
+    /// about what this module publishes, and so are two inline modules of one
+    /// file importing the same item: an id derived from the address alone
+    /// would make each pair one node, losing the second name or the second
+    /// module's row.
+    ///
+    /// `visibility` is who may follow the row: [`Visibility::File`] for a
+    /// `pub use` (unchecked by the linker), `container(<module>)` for a
+    /// private `use`, which only that module and its descendants may follow.
     pub(crate) fn reexport(
         &mut self,
         published: &str,
         target: PlaceholderTarget,
         container: &str,
+        visibility: Visibility,
         range: Range,
     ) -> String {
-        let qualified_name = format!("{} as {published}", render_target(&target));
+        let qualified_name = format!("{container}: {} as {published}", render_target(&target));
         let id = node_id(
             self.path.as_str(),
             NodeKind::Module,
@@ -253,6 +262,7 @@ impl<'s> Emitter<'s> {
                 .native_kind(PlaceholderKind::Reexport.native_kind());
             spec.container = Some(container.to_string());
             spec.target = Some(target);
+            spec.visibility = visibility;
             self.graph.add_node(spec);
         }
         id
@@ -269,19 +279,24 @@ impl<'s> Emitter<'s> {
     }
 
     /// An edge onto a declaration of this same file: `resolved: true`, since
-    /// within one file nothing is left for core to confirm.
-    pub(crate) fn resolved_edge(&mut self, kind: EdgeKind, from: &str, to: &str) {
-        if self.edges.insert(edge_id(from, kind, to, None)) {
+    /// within one file nothing is left for core to confirm. Returns the
+    /// edge's id, whether this call or an earlier one added it.
+    pub(crate) fn resolved_edge(&mut self, kind: EdgeKind, from: &str, to: &str) -> String {
+        let id = edge_id(from, kind, to, None);
+        if self.edges.insert(id.clone()) {
             self.graph.resolved_edge(kind, from, to);
         }
+        id
     }
 
     /// An edge onto a placeholder: `resolved: false`, since only core can
-    /// confirm it.
-    pub(crate) fn placeholder_edge(&mut self, kind: EdgeKind, from: &str, to: &str) {
-        if self.edges.insert(edge_id(from, kind, to, None)) {
+    /// confirm it. Returns the edge's id, as [`Self::resolved_edge`] does.
+    pub(crate) fn placeholder_edge(&mut self, kind: EdgeKind, from: &str, to: &str) -> String {
+        let id = edge_id(from, kind, to, None);
+        if self.edges.insert(id.clone()) {
             self.graph.placeholder_edge(kind, from, to);
         }
+        id
     }
 
     /// Records a use site the structural tier could not settle - see

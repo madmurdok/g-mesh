@@ -56,16 +56,132 @@ fn a_plugin_without_the_table_keeps_refused_by_all_false() {
 }
 
 /// The committed manifests declare what the design table says: every shipped
-/// plugin refuses a leading `@` and any `/`, Python also a leading `.` (a
+/// plugin refuses a leading `@` and any `/`, TypeScript also a leading
+/// `node:` (a Node.js built-in specifier), Python also a leading `.` (a
 /// relative import), and nothing else.
 ///
 /// Control: delete the `[plugin.non_symbol_queries]` table from any one
-/// shipped `plugin.toml`, or the `"."` from Python's - its entry comes back
-/// different and this fails.
+/// shipped `plugin.toml`, the `"node:"` from TypeScript's, or the `"."` from
+/// Python's - its entry comes back different and this fails.
 #[test]
 fn the_shipped_manifests_declare_at_and_slash() {
-    for language in ["typescript", "go", "rust"] {
+    for language in ["go", "rust"] {
         assert_eq!(QueryShapes::shipped().get(language), Some(&shapes(&["@"], &["/"])), "{language}");
     }
+    assert_eq!(QueryShapes::shipped().get("typescript"), Some(&shapes(&["@", "node:"], &["/"])));
     assert_eq!(QueryShapes::shipped().get("python"), Some(&shapes(&["@", "."], &["/"])));
+}
+
+/// A Node.js built-in specifier is never a TypeScript symbol, and the prefix
+/// is literal: an identifier that merely starts with `node` is not refused.
+///
+/// Control: remove `"node:"` from `starts_with` in
+/// `plugins/typescript/plugin.toml` - `node:fs` is then accepted and this
+/// fails.
+#[test]
+fn typescript_refuses_node_builtin_specifiers_only() {
+    let shipped = QueryShapes::shipped();
+    for query in ["node:fs", "node:path", "node:child_process", "node:test"] {
+        assert!(shipped.refuses("typescript", query), "{query}");
+        assert!(!shipped.refuses("go", query), "{query}: go declares no `node:`");
+    }
+    for query in ["node", "nodeFs", "NodePath", "nodes"] {
+        assert!(!shipped.refuses("typescript", query), "{query}");
+    }
+}
+
+/// `scripts/bundle-plugin.sh` writes the installed TypeScript manifest by
+/// hand; its `[plugin.non_symbol_queries]` must say what the repo's own
+/// manifest says, or a release install refuses different queries than a
+/// checkout does.
+///
+/// Control: change `starts_with` in the script's heredoc (drop `"node:"`) -
+/// the two tables then differ and this fails.
+#[test]
+fn the_bundled_typescript_manifest_declares_the_same_shapes() {
+    let script = include_str!("../../../../scripts/bundle-plugin.sh");
+    let start =
+        script.find("<<EOF\n# Bundled JS/TS plugin").expect("the bundled manifest heredoc") + "<<EOF\n".len();
+    let len = script[start..].find("\nEOF\n").expect("the heredoc's end");
+    let bundled = crate::daemon::manifest::non_symbol_queries_of(&script[start..start + len])
+        .expect("the bundled manifest parses");
+
+    assert_eq!(Some(&bundled), QueryShapes::shipped().get("typescript"));
+}
+
+/// T5: the pairs to retry. Only a language that strips the prefix gets one;
+/// a remainder that is empty, or that the same language refuses as typed,
+/// gets none - so `@` is stripped at most once and a scoped package or a
+/// path is never looked up.
+///
+/// Control: drop `&& !shapes.refused.matches(remainder)` from `rewrites` -
+/// `@scope/pkg` gives `[("typescript", "scope/pkg")]` and this fails.
+#[test]
+fn rewrites_strip_a_declared_prefix_and_keep_only_a_remainder_the_language_accepts() {
+    let map = QueryShapes::of(&[("typescript", shapes(&["@"], &["/"])), ("go", shapes(&["@"], &["/"]))])
+        .with_strip("typescript", &["@"]);
+
+    assert_eq!(map.rewrites("@Component"), vec![("typescript", "Component")]);
+    for query in ["@", "@@Component", "@scope/pkg", "@src/app.ts", "Component", "x@Component"] {
+        assert_eq!(map.rewrites(query), Vec::<(&str, &str)>::new(), "{query}");
+    }
+    let both = map.with_strip("go", &["@"]);
+    assert_eq!(both.rewrites("@Component"), vec![("go", "Component"), ("typescript", "Component")]);
+    assert_eq!(QueryShapes::default().rewrites("@Component"), Vec::<(&str, &str)>::new());
+}
+
+/// A discovered plugin without the table rewrites nothing for its language.
+///
+/// Control: in `from_manifests`, take `strip` from any manifest that declares
+/// one for every language - `cobol` gets a pair and this fails.
+#[test]
+fn a_plugin_without_the_table_is_never_rewritten_for() {
+    let declared = PluginManifest {
+        language: "typescript".to_string(),
+        non_symbol_queries: shapes(&["@"], &[]),
+        symbol_query_prefixes: crate::daemon::manifest::SymbolQueryPrefixes { strip: vec!["@".to_string()] },
+        ..crate::daemon::plugin::bundled_manifest()
+    };
+    let silent = PluginManifest {
+        language: "cobol".to_string(),
+        non_symbol_queries: shapes(&["@"], &[]),
+        ..crate::daemon::plugin::bundled_manifest()
+    };
+
+    let map = QueryShapes::from_manifests([&declared, &silent]);
+
+    assert_eq!(map.rewrites("@Component"), vec![("typescript", "Component")]);
+}
+
+/// T6: the committed manifests opt in as ADR 0019 says: TypeScript and
+/// Python strip `@`, Rust and Go strip nothing.
+///
+/// Control: none needed beyond the manifests themselves - delete the
+/// `[plugin.symbol_query_prefixes]` table from TypeScript's or Python's
+/// `plugin.toml`, or add one to Go's or Rust's, and this fails.
+#[test]
+fn the_shipped_manifests_strip_at_for_typescript_and_python_only() {
+    let shipped = QueryShapes::shipped();
+    for language in ["typescript", "python"] {
+        assert_eq!(shipped.strip(language), Some(&["@".to_string()][..]), "{language}");
+    }
+    for language in ["go", "rust"] {
+        assert_eq!(shipped.strip(language), Some(&[][..]), "{language}");
+    }
+}
+
+/// The installed TypeScript manifest strips what the repo's own does.
+///
+/// Control: delete the `[plugin.symbol_query_prefixes]` table from the
+/// script's heredoc - the two lists differ and this fails.
+#[test]
+fn the_bundled_typescript_manifest_strips_the_same_prefixes() {
+    let script = include_str!("../../../../scripts/bundle-plugin.sh");
+    let start =
+        script.find("<<EOF\n# Bundled JS/TS plugin").expect("the bundled manifest heredoc") + "<<EOF\n".len();
+    let len = script[start..].find("\nEOF\n").expect("the heredoc's end");
+    let (_, bundled) = crate::daemon::manifest::query_tables_of(&script[start..start + len])
+        .expect("the bundled manifest parses");
+
+    assert_eq!(Some(bundled.strip.as_slice()), QueryShapes::shipped().strip("typescript"));
 }

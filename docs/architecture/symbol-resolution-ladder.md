@@ -74,6 +74,7 @@ Seven rungs, tried in order, each labelled by what it establishes:
 | 3′ | bare name, several matches | **suggestion** — today's ranked candidate page | `nameAmbiguous` |
 | 3.5 | a partial path (`IndexStore::read`) stored as exactly one declaration's qualified suffix | resolution | `qualifiedNameSuffix` |
 | 3.5′ | the same, several declarations | **suggestion** — the ranked candidate page of 3′ | `nameAmbiguous` |
+| 3.9 | rungs 2–3.5′ again on the query minus a language's strip prefix (`@Component` → `Component`), among that language's declarations only ([ADR 0019](../adr/0019-symbol-query-prefixes.md)) | as the rung it lands on, plus `queriedAs` | as the rung it lands on |
 | 4 | the name is a path, or a file's stem | resolution *of the file*, suggestion about the symbol | `fileName` |
 | 5 | semantic neighbours above threshold | **suggestion** | `semanticNeighbours` |
 | 6 | nothing | refusal | — |

@@ -83,8 +83,22 @@ entry_points = ["index"]
 # Query shapes that are never a TypeScript/JavaScript symbol: core sets aside this language's
 # semantic candidates for such a query, and no other language's
 # (docs/architecture/multi-language-plugins.md, "plugin.toml additions").
-# `@` starts a scoped package or a decorator, and `/` is a path or
-# package separator; no TypeScript/JavaScript function, type or member
-# name contains either.
-starts_with = ["@"]
+# `@` starts a scoped package or a decorator, `/` is a path or package
+# separator, and `node:` starts a Node.js built-in module specifier
+# (`node:fs`, `node:path`); no TypeScript/JavaScript function, type or
+# member name contains `@`, `/` or `:`.
+starts_with = ["@", "node:"]
 contains = ["/"]
+
+[plugin.symbol_query_prefixes]
+# A query `@Name` that matches nothing is looked up again as `Name`, among
+# TypeScript/JavaScript declarations only: `@` marks a decorator use, and the
+# decorator is indexed under its own name. Each prefix must also be in
+# `non_symbol_queries.starts_with` above (docs/adr/0019-symbol-query-prefixes.md).
+strip = ["@"]
+
+[plugin.reexports]
+# A local or explicit export (`export { T } from "./a"`) beats `export *`
+# for the same name in ES modules, so core's linker stops at the named row
+# (docs/adr/0020-named-reexport-shadows-glob.md).
+named_shadows_glob = true

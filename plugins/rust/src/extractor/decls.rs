@@ -53,9 +53,15 @@
 //! ```rust,ignore
 //! use a::b::C;          // a `pending_symbol` placeholder in container a::b
 //! use a::b::C as D;     // the same placeholder; `D` is what this module calls it
-//! use a::b::*;          // a container import, and nothing to name
+//! use a::b::*;          // a container import, plus a private `reexport` row
 //! pub use a::b::C;      // a `reexport`: this module publishes `C`
 //! ```
+//!
+//! A private `use` is a `reexport` row too, with `container(<this module>)`
+//! visibility, so that a child module's `use super::*` can reach what the
+//! parent imported and a sibling's glob cannot: a glob always, a named
+//! leaf only in a module that declares a child module (only a descendant
+//! follows it). Design: docs/architecture/gm-479-use-super-private-imports.md.
 //!
 //! Every one of them also emits an `IMPORTS` edge from the file onto the
 //! container `a::b` - not only the glob, which is all the design doc's
@@ -79,11 +85,12 @@ use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::{
     is_public, resolve_module_path, visibility, visibility_modifier, ModuleCtx, PathTarget,
 };
-use crate::extractor::model::{DeclRef, FileModel, Import};
+use crate::extractor::model::{DeclRef, FileModel, Import, Returns};
 use crate::extractor::syntax::{
     collapse_whitespace, flatten_path, inner_doc_comment, item_name, outer_doc_comment, path_tail, signature,
     text, Seg,
 };
+use crate::extractor::typing::{generic_names, WrittenType};
 use crate::project::ProjectContext;
 
 /// Which block a declaration sits in, which is what decides its `nativeKind`
@@ -293,15 +300,27 @@ pub(crate) struct Declarer<'a, 's> {
 
 impl Declarer<'_, '_> {
     /// Records every `mod` item in the file, at every nesting depth, before
-    /// anything else runs.
+    /// anything else runs - and which modules have a glob `use`.
     ///
     /// `use self::helpers::run;` may sit above `mod helpers;`, and Rust does
     /// not care - items in a module are mutually visible whatever their
     /// order. Resolving that `use` needs to know `helpers` is a child module,
-    /// so the child modules are learned first and everything else second.
+    /// so the child modules are learned first and everything else second. The
+    /// globs are learned here for the same reason: an external named `use`
+    /// above a glob needs to know the glob is there (see `use_leaf`).
     pub(crate) fn collect_modules(&mut self, list: Node, module: &ModuleCtx) {
         let mut cursor = list.walk();
         for item in list.named_children(&mut cursor) {
+            if item.kind() == "use_declaration" {
+                if let Some(argument) = item.child_by_field_name("argument") {
+                    let mut leaves = Vec::new();
+                    collect_use_leaves(argument, &[], &mut leaves, self.source);
+                    if leaves.iter().any(|leaf| matches!(leaf.kind, LeafKind::Glob)) {
+                        self.model.glob_module(&module.key);
+                    }
+                }
+                continue;
+            }
             if item.kind() != "mod_item" {
                 continue;
             }
@@ -450,8 +469,40 @@ impl Declarer<'_, '_> {
         spec.signature = signature(item, self.source);
         spec.doc_comment = outer_doc_comment(item, self.source);
         let id = self.emitter.declare(spec, is_public(&own));
-        self.model.declare(&module.key, &name, &tail, DeclRef { id: id.clone(), kind });
+        let decl = DeclRef { id: id.clone(), kind };
+        if let Some(returns) = self.returns(item, module, block) {
+            self.model.set_returns(&id, returns);
+        }
+        if block.is_some() {
+            // An associated item (`T::y`, `<T as Tr>::y`, `Tr::y`) is never
+            // named by a bare path: it is recorded by its tail only, so it
+            // cannot make a bare `y` ambiguous beside a free `fn y`.
+            self.model.declare_member(&module.key, &tail, decl);
+        } else {
+            self.model.declare(&module.key, &name, &tail, decl);
+        }
         Some(id)
+    }
+
+    /// A function's written return type, when a typed receiver could use it:
+    /// a path type naming no generic parameter in scope, with `Self` replaced
+    /// by the impl's own type. A trait's own `Self` is not a type, so a
+    /// trait method returning it has none.
+    fn returns(&self, item: Node, module: &ModuleCtx, block: Option<&BlockCtx>) -> Option<Returns> {
+        if !matches!(item.kind(), "function_item" | "function_signature_item") {
+            return None;
+        }
+        let written = WrittenType::parse(item.child_by_field_name("return_type")?, self.source)?;
+        let self_type = block
+            .filter(|block| block.family != Family::TraitDecl)
+            .map(|block| block.self_type.as_str())
+            .filter(|name| name.chars().all(|c| c.is_alphanumeric() || c == '_'));
+        let ty = written.substitute_self(self_type)?;
+        let generics = generic_names(item, self.source);
+        if ty.mentions(&|name| generics.iter().any(|generic| generic == name)) {
+            return None;
+        }
+        Some(Returns { module: module.clone(), ty })
     }
 
     /// `mod child;` and `mod child { … }`: a member of the module that
@@ -495,8 +546,7 @@ impl Declarer<'_, '_> {
 
     fn use_declaration(&mut self, item: Node, module: &ModuleCtx) {
         let Some(argument) = item.child_by_field_name("argument") else { return };
-        // Any restriction still re-exports: `graph::symbol_links` documents
-        // that a re-export's own visibility is not checked, and the
+        // Any restriction still republishes, as an unchecked `file` row: the
         // declaration at the end of the chain is checked against the original
         // requester anyway.
         let republishes = visibility_modifier(item).is_some();
@@ -527,6 +577,21 @@ impl Declarer<'_, '_> {
                 self.import_edge(target, &krate, range);
                 if let LeafKind::Named { name, alias } = leaf.kind {
                     self.model.import(&module.key, alias.unwrap_or(name), Import::External);
+                    // A private row, as for a project item, where a child
+                    // module's `use super::*` can follow it and this module
+                    // has a glob: an explicit import shadows the module's
+                    // globs (`Resolver::walk`), so without the row a glob's
+                    // same-named item would be linked instead. Without a glob
+                    // there is nothing to shadow and the row is dead weight.
+                    // The target is the crate path, which no project
+                    // container matches, so the walk ends there unresolved.
+                    if !republishes
+                        && self.model.has_child_modules(&module.key)
+                        && self.model.has_glob(&module.key)
+                    {
+                        let path = external_path(&leaf.prefix).unwrap_or(krate);
+                        self.reexport(alias.unwrap_or(name), &path, name, module, false, range);
+                    }
                 }
                 return;
             }
@@ -564,36 +629,46 @@ impl Declarer<'_, '_> {
                 if self.project.has_container(&submodule) {
                     self.import_edge(PathTarget::Container(submodule), name, range);
                 }
-                if republishes {
-                    self.reexport(alias.unwrap_or(name), &container, name, module, range);
+                // A private named `use` is a row only where a descendant can
+                // follow it: this module's own uses of the name are already
+                // addressed at the import's target (`lookup_import`), so in a
+                // module without child modules the row would be dead weight.
+                if republishes || self.model.has_child_modules(&module.key) {
+                    self.reexport(alias.unwrap_or(name), &container, name, module, republishes, range);
                 }
             }
             LeafKind::Glob => {
                 #[cfg(test)]
                 crate::census::note_glob(&module.key);
-                if republishes {
-                    // `*` at both ends: core's own spelling for "this scope
-                    // republishes everything that one does".
-                    self.reexport("*", &container, "*", module, range);
-                }
+                // `*` at both ends: core's own spelling for "this scope
+                // republishes everything that one does". A private glob is a
+                // row too: the module itself is the one that follows it.
+                self.reexport("*", &container, "*", module, republishes, range);
             }
         }
     }
 
-    /// A `pub use`: a `reexport` node carrying what this module *publishes*
-    /// (its `name`) and what that really is (its target).
+    /// A `reexport` node carrying what this module *publishes* (its `name`)
+    /// and what that really is (its target). A `pub use` (any restriction)
+    /// is `file`, which the linker does not check; a private `use` is
+    /// `container(<this module>)`, which only this module and its
+    /// descendants may follow - Rust's own rule for private imports.
     fn reexport(
         &mut self,
         published: &str,
         container: &str,
         name: &str,
         module: &ModuleCtx,
+        republishes: bool,
         range: g_mesh_plugin_sdk::wire::Range,
     ) {
+        let visibility =
+            if republishes { Visibility::File } else { Visibility::Container(module.key.clone()) };
         self.emitter.reexport(
             published,
             container_target(container, TargetKey::Name(name.to_string()), &module.key),
             &module.key,
+            visibility,
             range,
         );
     }
@@ -616,6 +691,19 @@ impl Declarer<'_, '_> {
         };
         self.emitter.placeholder_edge(EdgeKind::Imports, &file, &to);
     }
+}
+
+/// `std::io` for an external `use std::io::Error;`'s prefix: the path as
+/// written, when it is plain names throughout.
+fn external_path(prefix: &[Seg<'_>]) -> Option<String> {
+    let names = prefix
+        .iter()
+        .map(|seg| match seg {
+            Seg::Name(name) => Some(*name),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(names.join("::"))
 }
 
 /// One leaf of a `use` tree, flattened out of however many nested groups

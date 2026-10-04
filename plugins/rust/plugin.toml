@@ -39,7 +39,7 @@ protocol_version = 2
 # (plugins/go, plugins/typescript) tracks its own manifest of record
 # instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
 # rules, not one".
-plugin_version = "3.19.0"
+plugin_version = "3.20.0"
 
 [plugin.spawn]
 command = "${G_MESH_BIN_DIR}/g-mesh-plugin-rust"
@@ -171,3 +171,10 @@ entry_points = ["lib.rs", "main.rs", "mod.rs"]
 # name contains either.
 starts_with = ["@"]
 contains = ["/"]
+
+[plugin.reexports]
+# An explicit `use a::T;` shadows a glob (`use b::*;`) that would also bring
+# `T` into the same module: rustc never considers the glob's `T` at all. So
+# core's linker stops at the named row, even when it leads to another crate
+# (docs/adr/0020-named-reexport-shadows-glob.md).
+named_shadows_glob = true

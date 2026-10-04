@@ -9,7 +9,7 @@
 # resolve an anchor, and what a truncated page does). Each `expect` is a SET
 # of `"filePath:qualifiedName"` strings - order never matters.
 #
-# The project this runs against is ./project - six files, read alongside
+# The project this runs against is ./project - seven files, read alongside
 # this one so each case below can be checked by hand against the real
 # source rather than taken on faith.
 #
@@ -208,6 +208,14 @@ expect = ["src/overload.ts:format"]
 symbol = "Greeter"
 # Unambiguous - no `file` needed to disambiguate.
 expect = ["src/shapes.ts:Greeter"]
+
+[[definition]]
+symbol = "@Component"
+# A decorator's use-site spelling. Nothing is named `@Component`, so it
+# resolves only through plugin.toml's `[plugin.symbol_query_prefixes]`
+# (`strip = ["@"]`): the remainder `Component` is looked up among this
+# language's declarations.
+expect = ["src/decorators.ts:Component"]
 
 # --- importers (get_dependencies, one hop, Incoming) --------------------------
 #     (GM-365; `expectations.rs`'s decision 7 has the contract)

@@ -425,6 +425,19 @@ entry_points = []          # rust: ["lib.rs", "main.rs", "mod.rs"]; typescript: 
 starts_with = ["@"]
 contains = ["/"]
 
+[plugin.symbol_query_prefixes]
+# Literal prefixes that, stripped once from a query nothing matched, can leave a
+# name of this language (`@` before a decorator). The remainder is retried on the
+# structural rungs among this language's declarations only. Each entry must also
+# be in `non_symbol_queries.starts_with`. Absent: nothing is rewritten.
+strip = ["@"]
+
+[plugin.reexports]
+# Whether, in one scope, a named import/re-export of a name hides every glob
+# (`*`) one for it when the linker walks re-export chains. Absent: false, and
+# named and glob rows stay side by side with no winner.
+named_shadows_glob = true  # rust, typescript; python and go declare nothing
+
 # GM-289, read by the SDK's LSP bridge and by nothing in core - see
 # "Implementation notes (GM-289)" for why core deliberately does not parse it.
 # Absent means the plugin has no language server behind its semantic tier.
@@ -472,13 +485,39 @@ declares nothing refuses nothing. Validation, as hard errors naming the
 manifest path: an empty string (it would match every query) and an unknown key
 in the table (so a misspelt `start_with` fails loudly). The four shipped
 plugins declare `starts_with = ["@"]` and `contains = ["/"]`; Python also
-declares a leading `.` (`starts_with = ["@", "."]`), a relative import.
+declares a leading `.` (`starts_with = ["@", "."]`), a relative import, and
+TypeScript declares `node:` (`starts_with = ["@", "node:"]`), a Node built-in.
 `g-mesh plugins list` and `g-mesh plugins check` print the declaration.
 `search_code` reads the same table for its `noMatch` verdict: a first page is
 `queryIsAPathOrPackage` when every row's language refuses the query (an empty
 page: every discovered language), a refused row on a mixed page counts as below
 its floor, and a prose query is never refused. Rows are never dropped.
 Decision: [ADR 0018](../adr/0018-non-symbol-query-shapes.md).
+
+`[plugin.symbol_query_prefixes]` is read by the same resolver
+(`find_definition::resolve_symbol_name`, so all five name-resolving tools).
+When the query as typed misses every structural rung (exact qualifiedName,
+name, qualifiedName suffix), each language whose `strip` has a prefix the
+query starts with retries the remainder on those three rungs, among its own
+declarations only; a remainder that is empty or that the same language's
+`non_symbol_queries` refuses is skipped. One row resolves, labelled with its
+rung's `resolvedBy` plus `queriedAs`; several give the ranked candidate page;
+none lets the ladder go on with the original query (file name, import note,
+semantic rung). `search_code` is not rewritten. Validation, as hard errors: an
+empty prefix, an unknown key, and a prefix missing from the same manifest's
+`non_symbol_queries.starts_with`. TypeScript and Python declare
+`strip = ["@"]`; Rust and Go declare nothing. `g-mesh plugins list` and
+`g-mesh plugins check` print it. Decision:
+[ADR 0019](../adr/0019-symbol-query-prefixes.md).
+
+`[plugin.reexports]` is read by the symbol linker
+(`graph::symbol_links`), through the `LinkRules` the index store is built
+with (`daemon::manifest::link_rules`). With `named_shadows_glob = true`, a
+scope of that language that re-exports a name both by name and through a glob
+follows the named row only; without it, both rows are followed at the same
+depth. Rust and TypeScript declare it; Python (the later import binds) and Go
+do not. Decision:
+[ADR 0020](../adr/0020-named-reexport-shadows-glob.md).
 
 Capabilities are read from the manifest rather than the handshake. Routing and
 instruction assembly need them before any plugin process exists, and the manifest

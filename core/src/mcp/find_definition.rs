@@ -49,6 +49,9 @@ struct DefinitionNode {
     /// file+position lookup, which cannot be anything but exact.
     #[serde(skip_serializing_if = "Option::is_none")]
     resolved_by: Option<ResolvedBy>,
+    /// The name looked up in place of the query - see [`Resolved::queried_as`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queried_as: Option<String>,
     /// The declaration's own text - see [`source`] for why this is worth its
     /// payload and how it is bounded.
     ///
@@ -62,8 +65,8 @@ struct DefinitionNode {
 
 impl DefinitionNode {
     /// The node with the rung that reached it, for the name-addressed path.
-    fn resolved(node: NodeRecord, by: ResolvedBy) -> Self {
-        Self { resolved_by: Some(by), ..Self::from(node) }
+    fn resolved(resolved: Resolved) -> Self {
+        Self { resolved_by: Some(resolved.by), queried_as: resolved.queried_as, ..Self::from(resolved.node) }
     }
 
     /// Attaches the declaration's text, if a root was given and the file can
@@ -96,6 +99,7 @@ impl From<NodeRecord> for DefinitionNode {
             signature: n.signature,
             doc_comment: n.doc_comment,
             resolved_by: None,
+            queried_as: None,
             source: None,
         }
     }
@@ -160,9 +164,27 @@ struct CandidatePage {
     resolved_by: ResolvedBy,
     /// Always `session_hints::AMBIGUOUS`: how to pick from this page.
     explanation: &'static str,
+    /// The name looked up in place of the query - see [`Resolved::queried_as`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queried_as: Option<String>,
     results: Vec<DefinitionCandidate>,
     has_more: bool,
     next_cursor: Option<String>,
+}
+
+impl CandidatePage {
+    /// The ambiguous page over `page`'s ranked candidates.
+    fn ambiguous(page: pagination::Page<DefinitionCandidate>, queried_as: Option<&str>) -> Self {
+        Self {
+            ambiguous: true,
+            resolved_by: ResolvedBy::NameAmbiguous,
+            explanation: super::session_hints::AMBIGUOUS,
+            queried_as: queried_as.map(str::to_string),
+            results: page.results,
+            has_more: page.has_more,
+            next_cursor: page.next_cursor,
+        }
+    }
 }
 
 /// The file-name rung's page. Shares `{ambiguous, resolvedBy, results}` with
@@ -237,26 +259,74 @@ impl NameColumn {
 fn find_candidates_by_name(
     conn: &Connection,
     column: NameColumn,
-    name: &str,
+    lookups: &[Lookup<'_>],
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<DefinitionCandidate>> {
-    rank_candidates(conn, &format!("{} = ?1", column.sql()), &[&name], cursor)
+    let (filter, params) = Lookup::filter(lookups, |key| format!("{} = {key}", column.sql()));
+    rank_candidates(conn, &filter, &params, cursor)
 }
 
 /// The same ranked page over the declarations one of whose stored partial
-/// paths (`qualified_suffixes`) is exactly `suffix` - the set
+/// paths (`qualified_suffixes`) is exactly a lookup's key - the set
 /// [`queries::find_by_qualified_suffix`] returns.
 fn find_candidates_by_qualified_suffix(
     conn: &Connection,
-    suffix: &str,
+    lookups: &[Lookup<'_>],
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<DefinitionCandidate>> {
-    rank_candidates(
-        conn,
-        "n.id IN (SELECT s.nodeId FROM qualified_suffixes s WHERE s.suffix = ?1)",
-        &[&suffix],
-        cursor,
-    )
+    let (filter, params) = Lookup::filter(lookups, |key| {
+        format!("n.id IN (SELECT s.nodeId FROM qualified_suffixes s WHERE s.suffix = {key})")
+    });
+    rank_candidates(conn, &filter, &params, cursor)
+}
+
+/// One spelling a candidate page matches: `key`, among `languages`' declarations
+/// when given, among every language's otherwise.
+struct Lookup<'a> {
+    key: &'a str,
+    languages: Option<Vec<&'a str>>,
+}
+
+impl<'a> Lookup<'a> {
+    /// The query exactly as given, in every language.
+    fn any(key: &'a str) -> Self {
+        Self { key, languages: None }
+    }
+
+    /// The SQL condition matching any of `lookups` (each one `matches(key
+    /// placeholder)`, ANDed with its language filter) and its bound values,
+    /// numbered from `?1`. The language filter sits inside the query, never
+    /// after it, so the page's `hasMore` and cursor count only rows it keeps.
+    fn filter(lookups: &[Lookup<'_>], matches: impl Fn(&str) -> String) -> (String, Vec<String>) {
+        let mut params = Vec::new();
+        let mut placeholder = |value: &str| {
+            params.push(value.to_string());
+            format!("?{}", params.len())
+        };
+        let conditions: Vec<String> = lookups
+            .iter()
+            .map(|lookup| {
+                let key = matches(&placeholder(lookup.key));
+                match &lookup.languages {
+                    None => key,
+                    Some(languages) => {
+                        let list: Vec<String> =
+                            languages.iter().map(|language| placeholder(language)).collect();
+                        format!("({key} AND n.language IN ({}))", list.join(", "))
+                    }
+                }
+            })
+            .collect();
+        let filter = match conditions.as_slice() {
+            [one] => one.clone(),
+            many => format!("({})", many.join(" OR ")),
+        };
+        (filter, params)
+    }
+
+    fn admits(&self, node: &NodeRecord) -> bool {
+        self.languages.as_ref().is_none_or(|languages| languages.contains(&node.language.as_str()))
+    }
 }
 
 /// Declarations satisfying `filter` (a condition on alias `n`, bound by
@@ -264,9 +334,10 @@ fn find_candidates_by_qualified_suffix(
 fn rank_candidates(
     conn: &Connection,
     filter: &str,
-    params: &[&dyn rusqlite::ToSql],
+    params: &[String],
     cursor: Option<&str>,
 ) -> anyhow::Result<pagination::Page<DefinitionCandidate>> {
+    let params: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
     // The `nativeKind` filter is `graph::queries`' own, shared rather than
     // restated (GM-367): the lookups that decide whether a candidate page is
     // needed and the page itself have to agree about what counts as a
@@ -295,7 +366,7 @@ fn rank_candidates(
         Ok((candidate, score, id))
     }
 
-    pagination::paginate_by_score(conn, &base_sql, params, CANDIDATE_PAGE_SIZE, cursor, map_row)
+    pagination::paginate_by_score(conn, &base_sql, &params, CANDIDATE_PAGE_SIZE, cursor, map_row)
 }
 
 /// Resolves `find_definition`'s file+position input - always unambiguous by
@@ -360,6 +431,17 @@ pub(super) enum ResolvedBy {
 pub(super) struct Resolved {
     pub(super) node: NodeRecord,
     pub(super) by: ResolvedBy,
+    /// The name the ladder looked up in place of the query, when the query
+    /// matched nothing and one of its language's strip prefixes was retried
+    /// ([`by_stripped_prefix`]); `None` when the query itself matched. `by`
+    /// stays the rung the remainder resolved at.
+    pub(super) queried_as: Option<String>,
+}
+
+impl Resolved {
+    fn new(node: NodeRecord, by: ResolvedBy) -> Self {
+        Self { node, by, queried_as: None }
+    }
 }
 
 /// How the ladder's last rung, [`by_semantic_neighbours`], gets its query
@@ -536,7 +618,7 @@ pub(super) fn resolve_symbol_name(
     // know any language's path separator - and it is the whole cost of the
     // change on the happy path, one string comparison on a row already read.
     if exact.len() == 1 && exact[0].name != name {
-        return Ok(Ok(Resolved { node: exact.remove(0), by: ResolvedBy::QualifiedName }));
+        return Ok(Ok(Resolved::new(exact.remove(0), ResolvedBy::QualifiedName)));
     }
 
     let matches = queries::find_by_name(conn, name, None)
@@ -555,17 +637,9 @@ pub(super) fn resolve_symbol_name(
         _ => None,
     };
     if let Some(column) = ambiguous_over {
-        let page = find_candidates_by_name(conn, column, name, cursor)
+        let page = find_candidates_by_name(conn, column, &[Lookup::any(name)], cursor)
             .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
-        return success(&CandidatePage {
-            ambiguous: true,
-            resolved_by: ResolvedBy::NameAmbiguous,
-            explanation: super::session_hints::AMBIGUOUS,
-            results: page.results,
-            has_more: page.has_more,
-            next_cursor: page.next_cursor,
-        })
-        .map(Err);
+        return success(&CandidatePage::ambiguous(page, None)).map(Err);
     }
 
     match matches.into_iter().next() {
@@ -575,11 +649,14 @@ pub(super) fn resolve_symbol_name(
         // are bare by construction (TypeScript) answering exactly as it did.
         Some(node) => {
             let by = if exact.len() == 1 { ResolvedBy::QualifiedName } else { ResolvedBy::Name };
-            Ok(Ok(Resolved { node, by }))
+            Ok(Ok(Resolved::new(node, by)))
         }
         None => match by_qualified_name_suffix(conn, name, cursor)? {
             Some(answer) => Ok(answer),
-            None => by_file_name(conn, semantic, name),
+            None => match by_stripped_prefix(conn, semantic.shapes(), name, cursor)? {
+                Some(answer) => Ok(answer),
+                None => by_file_name(conn, semantic, name),
+            },
         },
     }
 }
@@ -602,19 +679,98 @@ fn by_qualified_name_suffix(
         .map_err(|e| internal_error("failed to look up nodes by qualifiedName suffix", e))?;
     match matched.len() {
         0 => Ok(None),
-        1 => Ok(Some(Ok(Resolved { node: matched.remove(0), by: ResolvedBy::QualifiedNameSuffix }))),
+        1 => Ok(Some(Ok(Resolved::new(matched.remove(0), ResolvedBy::QualifiedNameSuffix)))),
         _ => {
-            let page = find_candidates_by_qualified_suffix(conn, name, cursor)
+            let page = find_candidates_by_qualified_suffix(conn, &[Lookup::any(name)], cursor)
                 .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
-            success(&CandidatePage {
-                ambiguous: true,
-                resolved_by: ResolvedBy::NameAmbiguous,
-                explanation: super::session_hints::AMBIGUOUS,
-                results: page.results,
-                has_more: page.has_more,
-                next_cursor: page.next_cursor,
-            })
-            .map(|page| Some(Err(page)))
+            success(&CandidatePage::ambiguous(page, None)).map(|page| Some(Err(page)))
+        }
+    }
+}
+
+/// The strip-prefix rung (`[plugin.symbol_query_prefixes]`, ADR 0019): the
+/// query matched nothing as given, so each `(language, remainder)` pair from
+/// [`QueryShapes::rewrites`] is looked up on the structural rungs above -
+/// exact qualifiedName, name, qualifiedName suffix - among that language's
+/// declarations only, and the rows are unioned over the languages. One row
+/// resolves, labelled with its rung and `queriedAs`; several are the ranked
+/// candidate page; none is `None`, and the ladder goes on with the original
+/// query.
+///
+/// Invariant: reached only after every structural rung missed the original
+/// query, so it never changes an answer they give; and it consults no rung
+/// after them (file name, import note, semantic), which all see the
+/// original query.
+fn by_stripped_prefix(
+    conn: &Connection,
+    shapes: &QueryShapes,
+    name: &str,
+    cursor: Option<&str>,
+) -> Result<Option<Result<Resolved, CallToolResult>>, ErrorData> {
+    let mut lookups: Vec<Lookup<'_>> = Vec::new();
+    for (language, remainder) in shapes.rewrites(name) {
+        match lookups.iter_mut().find(|lookup| lookup.key == remainder) {
+            Some(lookup) => lookup.languages.get_or_insert_with(Vec::new).push(language),
+            None => lookups.push(Lookup { key: remainder, languages: Some(vec![language]) }),
+        }
+    }
+    if lookups.is_empty() {
+        return Ok(None);
+    }
+    // One label for a page only when every language stripped to the same name.
+    let page_label = match lookups.as_slice() {
+        [one] => Some(one.key),
+        _ => None,
+    };
+    let rows =
+        |find: &dyn Fn(&str) -> anyhow::Result<Vec<NodeRecord>>| -> anyhow::Result<Vec<(NodeRecord, &str)>> {
+            let mut rows = Vec::new();
+            for lookup in &lookups {
+                rows.extend(
+                    find(lookup.key)?
+                        .into_iter()
+                        .filter(|node| lookup.admits(node))
+                        .map(|node| (node, lookup.key)),
+                );
+            }
+            Ok(rows)
+        };
+    let answer = |(node, key): (NodeRecord, &str), by| {
+        Ok(Some(Ok(Resolved { node, by, queried_as: Some(key.to_string()) })))
+    };
+
+    let mut exact = rows(&|key| queries::find_by_qualified_name(conn, key, None))
+        .map_err(|e| internal_error("failed to look up node by qualifiedName", e))?;
+    if exact.len() == 1 && exact[0].0.name != exact[0].1 {
+        return answer(exact.remove(0), ResolvedBy::QualifiedName);
+    }
+    let mut matches = rows(&|key| queries::find_by_name(conn, key, None))
+        .map_err(|e| internal_error("failed to look up node by name", e))?;
+    // The same choice of page as `resolve_symbol_name` makes for the query.
+    let ambiguous_over = match (matches.len(), exact.len()) {
+        (2.., _) => Some(NameColumn::Name),
+        (_, 2..) => Some(NameColumn::QualifiedName),
+        _ => None,
+    };
+    if let Some(column) = ambiguous_over {
+        let page = find_candidates_by_name(conn, column, &lookups, cursor)
+            .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
+        return success(&CandidatePage::ambiguous(page, page_label)).map(|page| Some(Err(page)));
+    }
+    if !matches.is_empty() {
+        let by = if exact.len() == 1 { ResolvedBy::QualifiedName } else { ResolvedBy::Name };
+        return answer(matches.remove(0), by);
+    }
+
+    let mut suffixed = rows(&|key| queries::find_by_qualified_suffix(conn, key))
+        .map_err(|e| internal_error("failed to look up nodes by qualifiedName suffix", e))?;
+    match suffixed.len() {
+        0 => Ok(None),
+        1 => answer(suffixed.remove(0), ResolvedBy::QualifiedNameSuffix),
+        _ => {
+            let page = find_candidates_by_qualified_suffix(conn, &lookups, cursor)
+                .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
+            success(&CandidatePage::ambiguous(page, page_label)).map(|page| Some(Err(page)))
         }
     }
 }
@@ -944,9 +1100,7 @@ fn by_name(
     cursor: Option<&str>,
 ) -> Result<CallToolResult, ErrorData> {
     match resolve_symbol_name(conn, semantic, name, cursor)? {
-        Ok(resolved) => {
-            success(&DefinitionNode::resolved(resolved.node, resolved.by).with_source(project_root))
-        }
+        Ok(resolved) => success(&DefinitionNode::resolved(resolved).with_source(project_root)),
         Err(finished) => Ok(finished),
     }
 }

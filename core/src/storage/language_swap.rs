@@ -5,14 +5,14 @@
 //! Design: [ADR 0008](../../../docs/adr/0008-workspace-reindex-staging-swap.md).
 //!
 //! Every table keyed by one language's rows appears in both halves: `nodes`,
-//! `declarations`, `placeholder_targets`, `qualified_suffixes`, `edges`,
-//! `containers` and `vectors`. A table missing from either keeps stale rows
+//! `declarations`, `placeholder_targets`, `qualified_suffixes`,
+//! `untyped_calls`, `edges`, `containers` and `vectors`. A table missing from either keeps stale rows
 //! after a swap.
 //!
 //! The unchanged-node rule decides whose edges a node gets. A node is
 //! unchanged when it is in both indexes with every `nodes` column equal and
-//! its `declarations`, `placeholder_targets` and `qualified_suffixes` rows
-//! equal, which is exactly "in both and not in `plan_upsert_nodes`". An unchanged node keeps all of
+//! its `declarations`, `placeholder_targets`, `qualified_suffixes` and
+//! `untyped_calls` rows equal, which is exactly "in both and not in `plan_upsert_nodes`". An unchanged node keeps all of
 //! its live outgoing edges, whatever their `source`, and gets none of
 //! staging's, so the swap neither downgrades what a semantic pass wrote nor
 //! brings back a structural edge the pass retracted. Two exceptions: a live
@@ -54,6 +54,7 @@ const NODE_COLUMNS: &str = "id, kind, name, qualifiedName, filePath, startLine, 
 const DECLARATION_COLUMNS: &str = "nodeId, ordinal, startLine, startCol, endLine, endCol, signature, hasBody";
 const TARGET_COLUMNS: &str = "nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile, keyPath";
 const SUFFIX_COLUMNS: &str = "suffix, nodeId";
+const UNTYPED_COLUMNS: &str = "name, nodeId";
 const EDGE_COLUMNS: &str = "id, fromId, toId, kind, source, engine, resolved, toDeclaration";
 const CONTAINER_COLUMNS: &str = "nodeId, language, key, parentKey, memberCount";
 
@@ -211,6 +212,7 @@ fn plan_attached(
         ("declarations", DECLARATION_COLUMNS),
         ("placeholder_targets", TARGET_COLUMNS),
         ("qualified_suffixes", SUFFIX_COLUMNS),
+        ("untyped_calls", UNTYPED_COLUMNS),
     ] {
         run(
             &format!(
@@ -433,7 +435,7 @@ fn swap_attached(
             OR nodeId IN (SELECT id FROM staging.plan_text_changed)",
         "the stale vectors",
     )?;
-    for table in ["declarations", "placeholder_targets", "qualified_suffixes"] {
+    for table in ["declarations", "placeholder_targets", "qualified_suffixes", "untyped_calls"] {
         run(
             &format!(
                 "DELETE FROM {table} WHERE nodeId IN (SELECT id FROM staging.plan_delete_nodes)
@@ -486,6 +488,14 @@ fn swap_attached(
              WHERE nodeId IN (SELECT id FROM staging.plan_upsert_nodes)"
         ),
         "the qualified suffixes",
+    )?;
+    run(
+        &format!(
+            "INSERT INTO untyped_calls ({UNTYPED_COLUMNS})
+             SELECT {UNTYPED_COLUMNS} FROM staging.untyped_calls
+             WHERE nodeId IN (SELECT id FROM staging.plan_upsert_nodes)"
+        ),
+        "the untyped calls",
     )?;
     run(
         &format!(
@@ -579,6 +589,7 @@ pub(crate) fn delete_placeholders(conn: &mut Connection, language: &str, ids: &[
             "DELETE FROM declarations WHERE nodeId = ?1",
             "DELETE FROM placeholder_targets WHERE nodeId = ?1",
             "DELETE FROM qualified_suffixes WHERE nodeId = ?1",
+            "DELETE FROM untyped_calls WHERE nodeId = ?1",
             "DELETE FROM containers WHERE nodeId = ?1",
         ] {
             tx.execute(sql, params![id]).context("failed to delete a kept placeholder's rows")?;
@@ -951,5 +962,61 @@ mod tests {
 
         assert_eq!(delete_placeholders(&mut conn, "rust", &["p1".to_string()]).unwrap(), 1);
         assert!(column(&conn, "SELECT suffix FROM qualified_suffixes").is_empty());
+    }
+
+    /// `run`, calling `names` through untyped receivers.
+    fn untyped_caller(names: &[&str]) -> NodeRecord {
+        let mut node = NodeRecord::new("run", "Function", "run", "m::run", "src/a.rs", "rust");
+        node.untyped_calls = names.iter().map(|name| name.to_string()).collect();
+        node
+    }
+
+    /// A node whose only change is its untyped calls is re-swapped, and live
+    /// ends with exactly staging's rows. Controls: drop `untyped_calls` from
+    /// `plan_attached`'s child-table loop (upsert count 0, live keeps `m`);
+    /// from `swap_attached`'s delete loop (the insert of `n` hits the primary
+    /// key, or `m` stays); or its insert (live has no rows).
+    #[test]
+    fn a_swap_carries_an_untyped_calls_only_change() {
+        let (_dir, live, counts) = swap_one(untyped_caller(&["m", "n"]), untyped_caller(&["n", "o"]));
+
+        assert_eq!(counts.upsert_nodes, 1, "the untyped-call change alone marks the node upserted");
+        assert_eq!(column(&live, "SELECT name FROM untyped_calls ORDER BY name"), vec!["n", "o"]);
+    }
+
+    /// Losing every untyped call is a change too, and leaves no rows.
+    /// Control: drop `untyped_calls` from `plan_attached` (upsert count 0,
+    /// both rows stay).
+    #[test]
+    fn a_swap_carries_the_loss_of_every_untyped_call() {
+        let (_dir, live, counts) = swap_one(untyped_caller(&["m", "n"]), untyped_caller(&[]));
+
+        assert_eq!(counts.upsert_nodes, 1);
+        assert!(column(&live, "SELECT name FROM untyped_calls").is_empty());
+    }
+
+    /// An unchanged node with untyped calls is not re-swapped.
+    #[test]
+    fn an_unchanged_node_with_untyped_calls_is_left_alone() {
+        let (_dir, live, counts) = swap_one(untyped_caller(&["m"]), untyped_caller(&["m"]));
+
+        assert_eq!(counts, PlanCounts::default());
+        assert_eq!(column(&live, "SELECT name FROM untyped_calls"), vec!["m"]);
+    }
+
+    /// A swept placeholder takes any untyped-call rows under its id with it.
+    /// Control: drop the `untyped_calls` delete from `delete_placeholders`
+    /// (the row remains).
+    #[test]
+    fn deleting_a_kept_placeholder_takes_its_untyped_call_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_staging(&dir.path().join("index.db")).unwrap();
+        let mut placeholder = NodeRecord::new("p1", "Module", "f", "a.rs#f", "src/b.rs", "rust");
+        placeholder.native_kind = Some(PENDING_SYMBOL_NATIVE_KIND.to_string());
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![placeholder], ..Default::default() }).unwrap();
+        conn.execute("INSERT INTO untyped_calls (name, nodeId) VALUES ('m', 'p1')", []).unwrap();
+
+        assert_eq!(delete_placeholders(&mut conn, "rust", &["p1".to_string()]).unwrap(), 1);
+        assert!(column(&conn, "SELECT name FROM untyped_calls").is_empty());
     }
 }

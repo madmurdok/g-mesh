@@ -57,8 +57,12 @@ fn cold_start_line_fallback(walking: bool) -> &'static str {
 /// `mcp::mod::GMeshMcpServer::instructions` never takes the connection lock,
 /// because the walk or its batch commit may hold it through embedding
 /// inference, and a caller mid-handshake must not wait on it.
+///
+/// The body is built against the ceiling less the no-path line, so that line
+/// always fits on top of it.
 pub fn cold_start(root: &Path, walking: bool, present: &[PresentLanguage]) -> String {
-    let built = build(present);
+    let built =
+        build_within(present, INSTRUCTIONS_BYTE_CEILING - cold_start_line_fallback(walking).len() - 2);
     let with_path = format!("{}\n\n{built}", cold_start_line(root, walking));
     if with_path.len() <= INSTRUCTIONS_BYTE_CEILING {
         with_path
@@ -137,8 +141,9 @@ const P3: &str = "`resolved: false` marks the one thing the indexer could not se
 /// The receiver-call paragraph with no language list: used when nothing is
 /// known yet or exactly one language is present (see [`build`]).
 const P4_GENERIC: &str = "The one legitimate reason to grep afterward: a method call through a \
-     variable receiver (`x.foo()`) produces no edge by design, so caller/reference \
-     lists for methods can under-report; bare function calls and this/super/qualified-type \
+     variable receiver (`x.foo()`) may produce no edge by design, so caller/reference \
+     lists for methods can under-report (a method page that may miss such calls carries \
+     `untypedReceiverCalls` where the language reports them); bare function calls and this/super/qualified-type \
      calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
      project's first index, or a re-index after an upgrade, a tool call waits for the walk \
      to finish - slow, not wrong; do not abandon it for grep.";
@@ -162,8 +167,9 @@ const P4_STATIC_RECEIVER: &str =
 fn p4_named(list: &str) -> String {
     format!(
         "The one legitimate reason to grep afterward: a method call through a \
-         variable receiver (`x.foo()`) produces no edge in {list}, so caller/reference \
-         lists for methods can under-report; bare function calls and this/super/qualified-type \
+         variable receiver (`x.foo()`) may produce no edge in {list}, so caller/reference \
+         lists for methods can under-report (a method page that may miss such calls carries \
+         `untypedReceiverCalls` where the language reports them); bare function calls and this/super/qualified-type \
          calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
          project's first index, or a re-index after an upgrade, a tool call waits for the walk \
          to finish - slow, not wrong; do not abandon it for grep."
@@ -171,13 +177,13 @@ fn p4_named(list: &str) -> String {
 }
 
 /// Used when [`p4_named`] exceeds [`INSTRUCTIONS_BYTE_CEILING`]: a generic
-/// sentence plus "check which", never a list truncated mid-name, and no
-/// pointer to a response field (none carries this fact yet).
+/// sentence plus "check which", never a list truncated mid-name; it points at
+/// the per-page `unlinkedUsages`/`untypedReceiverCalls` fields instead.
 fn p4_fallback() -> String {
     "The one legitimate reason to grep afterward: a method call through a variable \
-     receiver (`x.foo()`) produces no edge in some of this project's languages until \
-     their semantic layer finishes - check which before trusting a method's page as \
-     exhaustive. On a project's first index, or a re-index after an upgrade, a tool \
+     receiver (`x.foo()`) may produce no edge in some of this project's languages - a \
+     method's page says so in `unlinkedUsages`/`untypedReceiverCalls`; check them before \
+     trusting it as exhaustive. On a project's first index, or a re-index after an upgrade, a tool \
      call waits for the walk to finish before answering - slow, not wrong; do not \
      abandon it for grep."
         .to_string()
@@ -205,6 +211,11 @@ fn assemble(p4: &str) -> String {
 ///    naming every gapped language even when that is all of them, falling
 ///    back to [`p4_fallback`] above [`INSTRUCTIONS_BYTE_CEILING`].
 pub fn build(present: &[PresentLanguage]) -> String {
+    build_within(present, INSTRUCTIONS_BYTE_CEILING)
+}
+
+/// [`build`], with [`p4_named`] falling back above `budget` bytes instead.
+fn build_within(present: &[PresentLanguage], budget: usize) -> String {
     if present.is_empty() {
         return assemble(P4_GENERIC);
     }
@@ -219,7 +230,7 @@ pub fn build(present: &[PresentLanguage]) -> String {
 
     let list = format_language_list(&gapped);
     let named = assemble(&p4_named(&list));
-    if named.len() <= INSTRUCTIONS_BYTE_CEILING {
+    if named.len() <= budget {
         named
     } else {
         assemble(&p4_fallback())

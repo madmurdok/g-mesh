@@ -38,6 +38,7 @@ use rusqlite::Connection;
 
 use crate::embedding::pipeline::ComputedEmbedding;
 use crate::embedding::EmbeddingPipeline;
+use crate::graph::symbol_links::LinkRules;
 use crate::graph::{imports, symbol_links};
 use crate::storage::file_rows::{self, FileScope};
 use crate::storage::language_swap::{self, SwapBookkeeping};
@@ -98,14 +99,15 @@ const fn hold(unit: Unit) -> Hold {
 
 /// `apply_diff`, then the imports and symbol links it enables, in one hold.
 /// `label` names the diff in the error.
-fn apply_and_link(conn: &mut Connection, diff: &Diff, label: &str) -> Result<()> {
+fn apply_and_link(conn: &mut Connection, diff: &Diff, label: &str, rules: &LinkRules) -> Result<()> {
     apply_diff(conn, diff).with_context(|| format!("failed to apply the {label} diff"))?;
     // After the commit: linking points edges at `File` nodes, and the ones
     // this diff brought with it have to be in the index first.
     imports::link_diff(conn, diff).context("failed to link the file's resolved imports")?;
     // Symbols second: a usage edge can only be repointed at an export that
     // is already committed, including the ones this diff added.
-    symbol_links::link_diff(conn, diff).context("failed to link the file's cross-file symbol usages")?;
+    symbol_links::link_diff(conn, diff, rules)
+        .context("failed to link the file's cross-file symbol usages")?;
     Ok(())
 }
 
@@ -159,11 +161,30 @@ pub struct IndexStore {
     /// a restart forgets them, and they stay until the language's next swap
     /// keeps them again.
     unclaimed: Mutex<HashMap<String, HashSet<String>>>,
+    /// The discovered plugins' linking rules, fixed for the store's life.
+    /// Empty unless set by [`Self::with_link_rules`]: no language's rule.
+    link_rules: LinkRules,
 }
 
 impl IndexStore {
     pub fn new(conn: Connection) -> Self {
-        Self { conn: Mutex::new(conn), unclaimed: Mutex::new(HashMap::new()) }
+        Self {
+            conn: Mutex::new(conn),
+            unclaimed: Mutex::new(HashMap::new()),
+            link_rules: LinkRules::default(),
+        }
+    }
+
+    /// This store, linking under `rules` - the discovered manifests' own
+    /// (`daemon::manifest::link_rules`).
+    pub fn with_link_rules(mut self, rules: LinkRules) -> Self {
+        self.link_rules = rules;
+        self
+    }
+
+    /// The rules this store links under.
+    pub fn link_rules(&self) -> &LinkRules {
+        &self.link_rules
     }
 
     /// The raw guard, for tests only: no production code outside `storage/`
@@ -273,7 +294,7 @@ impl IndexStore {
         let mut conn = self.acquire();
         let imports =
             imports::link_all(&mut conn).context("failed to link the walk's resolved imports")?.linked_edges;
-        let symbols = symbol_links::link_all(&mut conn)
+        let symbols = symbol_links::link_all(&mut conn, &self.link_rules)
             .context("failed to link the walk's cross-file symbol usages")?
             .linked_edges;
         Ok(LinkCounts { imports, symbols })
@@ -356,7 +377,7 @@ impl Writer<'_> {
     pub fn apply_diff_linked(&mut self, diff: &Diff, label: &str) -> Result<()> {
         let store = self.store;
         self.step(|conn| {
-            apply_and_link(conn, diff, label)?;
+            apply_and_link(conn, diff, label, &store.link_rules)?;
             store.claim(diff);
             Ok(())
         })
@@ -376,7 +397,7 @@ impl Writer<'_> {
         let store = self.store;
         self.step(|conn| {
             file_rows::widen(conn, file_path, scope, diff)?;
-            apply_and_link(conn, diff, label)?;
+            apply_and_link(conn, diff, label, &store.link_rules)?;
             if scope == FileScope::Gone {
                 file_rows::delete_indexed_file(conn, file_path)?;
             }

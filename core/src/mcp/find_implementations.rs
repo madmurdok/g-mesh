@@ -183,9 +183,10 @@ fn handle_in(
     // Destructured here so everything below still reads the node directly,
     // while `resolved.by` stays available for the response's `resolvedBy`.
     let resolved_by = resolved.by;
+    let queried_as = resolved.queried_as;
     let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by);
+    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by, queried_as);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -426,6 +427,7 @@ fn from_root(
     conn: &Connection,
     anchor_node: &NodeRecord,
     resolved_by: find_definition::ResolvedBy,
+    queried_as: Option<String>,
     hint: Option<&'static str>,
     max_depth: Option<u32>,
     capabilities: &HashMap<String, Capabilities>,
@@ -435,7 +437,7 @@ fn from_root(
     // and `transitive: true` is the same query with a deeper walk, not a
     // different kind of answer. Only `continued` legitimately has no rung -
     // a resumed walk carries its anchor rather than resolving one.
-    let anchor_info = anchor::AnchorInfo::with_rung(anchor_node, resolved_by);
+    let anchor_info = anchor::AnchorInfo::with_rung(anchor_node, resolved_by, queried_as);
     let mut options = TraversalOptions::new(anchor_node.id.clone(), Direction::Incoming);
     options.edge_kind = Some(SUPERTYPE_EDGE.to_string());
     if let Some(depth) = max_depth {
@@ -566,9 +568,10 @@ pub(crate) fn dispatch_in(
         Err(finished) => return Ok(finished),
     };
     let resolved_by = resolved.by;
+    let queried_as = resolved.queried_as;
     let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    from_root(&conn, &anchor, resolved_by, hint, max_depth, capabilities)
+    from_root(&conn, &anchor, resolved_by, queried_as, hint, max_depth, capabilities)
 }
 
 #[cfg(test)]

@@ -68,7 +68,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 ///
 /// "10" adds `nodes.qualifiedPath`, `placeholder_targets.keyPath` and the
 /// `qualified_suffixes` table (ADR 0015).
-pub const CURRENT_SCHEMA_VERSION: &str = "10";
+///
+/// "11" adds the `untyped_calls` table (GM-486). Without the bump an existing
+/// index would keep an empty table until each file was reparsed, and caller
+/// pages would silently lack the marker it feeds.
+pub const CURRENT_SCHEMA_VERSION: &str = "11";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -387,6 +391,23 @@ CREATE TABLE IF NOT EXISTS qualified_suffixes (
     PRIMARY KEY (suffix, nodeId)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_qualified_suffixes_nodeId ON qualified_suffixes(nodeId);
+
+-- Bare names of methods a node calls through a receiver whose type the
+-- structural tier did not know (wire `untypedCalls`, GM-486). Lets a caller or
+-- reference page say it may be missing such calls to a method of that name.
+-- Only from a plugin that reports them; no rows means "not reported".
+--
+-- Written only by `storage::write::apply_diff`, which replaces a node's whole
+-- set on every upsert of it, and copied by `storage::language_swap`. Foreign
+-- keys are off on the daemon's connection, so every site that deletes a node
+-- deletes its rows here too; `idx_untyped_calls_nodeId` serves those deletes,
+-- the primary key serves the `name = ?` lookup.
+CREATE TABLE IF NOT EXISTS untyped_calls (
+    name   TEXT NOT NULL,
+    nodeId TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    PRIMARY KEY (name, nodeId)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_untyped_calls_nodeId ON untyped_calls(nodeId);
 
 -- Per-language index state - the roll-up `meta.bulkIndexedAt`/
 -- `semanticPassAt` are built from (design doc: Data Model > Per-language
@@ -1222,7 +1243,7 @@ fn wipe(conn: &Connection) -> Result<()> {
         // just the project-wide roll-up).
         "DROP TABLE IF EXISTS declarations; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS vectors; \
          DROP TABLE IF EXISTS containers; DROP TABLE IF EXISTS placeholder_targets; \
-         DROP TABLE IF EXISTS qualified_suffixes; \
+         DROP TABLE IF EXISTS qualified_suffixes; DROP TABLE IF EXISTS untyped_calls; \
          DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files; \
          DROP TABLE IF EXISTS language_state; DROP TABLE IF EXISTS pending_reindex; \
          DROP TABLE IF EXISTS semantic_pending; DROP TABLE IF EXISTS semantic_pending_files;",

@@ -391,6 +391,169 @@ fn a_pub_use_is_a_reexport_carrying_its_published_name_and_its_container() {
     assert_eq!(graph.target_of(glob), (container("krate::a"), TargetKey::Name("*".into())));
 }
 
+/// Every `reexport` row of `graph`, as `(container, published name, target,
+/// visibility)`, sorted.
+fn reexport_rows(graph: &Graph) -> Vec<(String, String, (TargetScope, TargetKey), Visibility)> {
+    let mut rows: Vec<_> = graph
+        .0
+        .nodes
+        .iter()
+        .filter(|node| node.native_kind.as_deref() == Some("reexport"))
+        .map(|node| {
+            (
+                node.container.clone().unwrap_or_default(),
+                node.name.clone(),
+                graph.target_of(node),
+                node.visibility.clone(),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    rows
+}
+
+/// A private `use` is a `reexport` row that only its own module and that
+/// module's descendants may follow: `container(<module>)`. A glob always is
+/// one; a named leaf only in a module that declares a child module, since
+/// only a descendant can follow it (docs/architecture/gm-479-use-super-private-imports.md).
+///
+/// Controls: emit no row for a private `use` in `Declarer::use_leaf`, and
+/// the `user` and `tests` rows are missing; drop the `has_child_modules`
+/// condition, and `leaf` gains a named row; emit private rows as
+/// `Visibility::File`, and the visibilities differ.
+#[test]
+fn a_private_use_is_a_reexport_row_visible_in_its_own_module_only() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod user;\npub mod leaf;\n"),
+        ("src/a.rs", "pub struct P;\n"),
+        (
+            "src/user.rs",
+            "use crate::a::P;\nuse crate::a::P as Q;\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n}\n",
+        ),
+        ("src/leaf.rs", "use crate::a::P;\nuse crate::a::*;\n"),
+    ]);
+    let private = |module: &str| Visibility::Container(module.to_string());
+
+    let user = krate.extract("src/user.rs");
+    assert_eq!(
+        reexport_rows(&user),
+        vec![
+            (
+                "krate::user".into(),
+                "P".into(),
+                (container("krate::a"), TargetKey::Name("P".into())),
+                private("krate::user")
+            ),
+            (
+                "krate::user".into(),
+                "Q".into(),
+                (container("krate::a"), TargetKey::Name("P".into())),
+                private("krate::user")
+            ),
+            (
+                "krate::user::tests".into(),
+                "*".into(),
+                (container("krate::user"), TargetKey::Name("*".into())),
+                private("krate::user::tests")
+            ),
+        ]
+    );
+
+    let leaf = krate.extract("src/leaf.rs");
+    assert_eq!(
+        reexport_rows(&leaf),
+        vec![(
+            "krate::leaf".into(),
+            "*".into(),
+            (container("krate::a"), TargetKey::Name("*".into())),
+            private("krate::leaf")
+        )],
+        "a module with no child module gets its glob row and no named one"
+    );
+}
+
+/// The named `reexport` rows of `graph` - its globs left out - as
+/// `(container, published name, target container, target name)`.
+fn named_reexport_rows(graph: &Graph) -> Vec<(String, String, TargetScope, String)> {
+    reexport_rows(graph)
+        .into_iter()
+        .filter(|(_, published, ..)| published != "*")
+        .map(|(module, published, (scope, key), visibility)| {
+            assert_eq!(visibility, Visibility::Container(module.clone()), "{module} {published}");
+            let TargetKey::Name(name) = key else { panic!("{module} {published}: {key:?}") };
+            (module, published, scope, name)
+        })
+        .collect()
+}
+
+/// An external named `use` is a private row onto its crate path (`std::io`
+/// for `use std::io::Error;`) only in a module that has a child module *and*
+/// a glob - the one place an explicit import has a glob to shadow for a
+/// descendant. The glob may sit below the `use`, and an inline module's own
+/// `use` lines count for that module, not its parent.
+///
+/// Controls: emit no row for an external named `use` in
+/// `Declarer::use_leaf` - `both` and `inline::inner` lose theirs; drop the
+/// `has_glob` condition - `no_glob` gains one; drop the `has_child_modules`
+/// condition - `no_child` gains one; target `krate` instead of
+/// `external_path(&leaf.prefix)` - the targets read `std`; drop the
+/// `use_declaration` arm of `Declarer::collect_modules` - every row is gone.
+#[test]
+fn an_external_named_use_is_a_row_only_where_a_glob_and_a_child_module_are() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod x;\npub mod both;\npub mod no_glob;\npub mod no_child;\npub mod inline;\n"),
+        ("src/x.rs", "pub struct Error;\n"),
+        (
+            "src/both.rs",
+            "use std::io::Error;\nuse std::fmt::Result as FmtResult;\nuse crate::x::*;\n\n\
+             #[cfg(test)]\nmod tests {\n    use super::*;\n}\n",
+        ),
+        ("src/no_glob.rs", "use std::io::Error;\n\nmod tests {}\n"),
+        ("src/no_child.rs", "use std::io::Error;\nuse crate::x::*;\n"),
+        (
+            "src/inline.rs",
+            "use crate::x::*;\n\nmod inner {\n    use std::io::Error;\n    use crate::x::*;\n\n    mod deep {}\n}\n",
+        ),
+    ]);
+
+    assert_eq!(
+        named_reexport_rows(&krate.extract("src/both.rs")),
+        vec![
+            ("krate::both".into(), "Error".into(), container("std::io"), "Error".into()),
+            ("krate::both".into(), "FmtResult".into(), container("std::fmt"), "Result".into()),
+        ]
+    );
+    assert_eq!(named_reexport_rows(&krate.extract("src/no_glob.rs")), vec![], "no glob to shadow");
+    assert_eq!(named_reexport_rows(&krate.extract("src/no_child.rs")), vec![], "no descendant to follow it");
+    assert_eq!(
+        named_reexport_rows(&krate.extract("src/inline.rs")),
+        vec![("krate::inline::inner".into(), "Error".into(), container("std::io"), "Error".into())]
+    );
+}
+
+/// Two inline modules of one file importing the same item are two rows, one
+/// per module: the row's id names its module.
+///
+/// Control: drop the `{container}: ` prefix from `Emitter::reexport`'s
+/// `qualifiedName` - the second module's row is lost.
+#[test]
+fn two_modules_of_one_file_importing_one_item_get_a_row_each() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod two;\n"),
+        ("src/a.rs", "pub struct P;\n"),
+        (
+            "src/two.rs",
+            "pub mod x {\n    pub use crate::a::P;\n}\npub mod y {\n    pub use crate::a::P;\n}\n",
+        ),
+    ]);
+    let two = krate.extract("src/two.rs");
+    let modules: Vec<_> = reexport_rows(&two).into_iter().map(|(module, name, ..)| (module, name)).collect();
+    assert_eq!(
+        modules,
+        vec![("krate::two::x".to_string(), "P".to_string()), ("krate::two::y".to_string(), "P".to_string())]
+    );
+}
+
 #[test]
 fn a_use_of_a_crate_this_project_does_not_model_is_an_external_module() {
     let krate = Crate::new(&[("src/lib.rs", "use serde::Serialize;\npub fn f() { Serialize::go(); }\n")]);
@@ -455,6 +618,43 @@ fn a_call_inside_one_file_is_a_direct_resolved_edge() {
     assert_eq!(graph.by_id(&call[0].to_id).qualified_name, "helper");
 }
 
+/// A bare `y()` never names an associated item, so a method or trait item
+/// `y` beside the free `fn y` does not make it ambiguous; the methods keep
+/// their own type-qualified callers.
+///
+/// Control: in `Declarer::declare` (`extractor::decls`), record every
+/// declaration with `model.declare` again, ignoring `block` - `run` and
+/// `Tr::d` lose their edge to `y`.
+#[test]
+fn a_bare_call_lands_on_the_free_fn_beside_same_named_associated_items() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub fn y() {}
+pub struct T;
+impl T {
+    pub fn y(&self) {}
+    pub fn z(&self) { y(); Self::y(self); T::y(self); }
+}
+pub trait Tr {
+    fn y();
+    fn d() { y(); }
+}
+impl Tr for T { fn y() {} }
+pub fn run() { y(); T::y(&T); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["T::y", "y"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "T::z"), vec!["T::y", "y"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "Tr::d"), vec!["y"]);
+    let free = graph.node("y").id.clone();
+    assert!(
+        graph.edges(EdgeKind::Calls).iter().filter(|edge| edge.to_id == free).all(|edge| edge.resolved),
+        "a same-file target is resolved"
+    );
+}
+
 #[test]
 fn a_module_qualified_path_call_is_a_name_placeholder_in_that_module() {
     let krate = Crate::new(&[
@@ -504,22 +704,20 @@ fn self_and_self_dot_inside_an_impl_reach_the_impl_types_own_method() {
     assert!(graph.edges(EdgeKind::Calls).iter().all(|edge| edge.resolved));
 }
 
-/// Acceptance: a receiver call produces **no edge**. It is the shape nearly
-/// every Rust method call has, and guessing at it is what the semantic tier
-/// exists to avoid needing.
+/// A receiver call whose receiver's type this file writes out is addressed
+/// as `T::m`, and its open site stays, naming that edge in `replaces` so a
+/// semantic answer that lands elsewhere can retract it.
 #[test]
-fn a_receiver_call_produces_no_edge_and_one_open_site() {
+fn a_typed_receiver_call_produces_an_edge_and_an_open_site_that_replaces_it() {
     let krate = Crate::new(&[(
         "src/lib.rs",
         "pub struct P;\nimpl P { pub fn m(&self) {} }\npub fn run(p: P) { p.m(); }\n",
     )]);
     let graph = krate.extract("src/lib.rs");
     let run = graph.node("run").id.clone();
-    assert!(
-        graph.edges(EdgeKind::Calls).iter().all(|edge| edge.from_id != run),
-        "no edge may be emitted for `p.m()`: {:#?}",
-        graph.edges(EdgeKind::Calls)
-    );
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["P::m"]);
+    let edge = graph.edges(EdgeKind::Calls).into_iter().find(|edge| edge.from_id == run).unwrap().clone();
+    assert!(edge.resolved, "a same-file target is a resolved edge");
     let sites: Vec<_> =
         graph.0.open_sites.iter().filter(|site| site.kind == OpenSiteKind::ReceiverCall).collect();
     assert_eq!(sites.len(), 1, "{sites:#?}");
@@ -527,6 +725,224 @@ fn a_receiver_call_produces_no_edge_and_one_open_site() {
     assert_eq!(sites[0].from_id, run);
     assert_eq!(sites[0].edge_kind, EdgeKind::Calls);
     assert_eq!(sites[0].from_container.as_deref(), Some("krate"));
+    assert_eq!(sites[0].replaces.as_deref(), Some(edge.id.as_str()), "the site names the edge it replaces");
+}
+
+/// A receiver whose type this file does not say - a generic parameter, a
+/// trait object, `impl Trait`, a type from another crate, an untyped closure
+/// parameter - still produces no edge, and its open site replaces nothing.
+#[test]
+fn an_untyped_receiver_call_produces_no_edge_and_an_open_site_that_replaces_nothing() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub trait Tr { fn m(&self); }
+pub struct P;
+impl P { pub fn m(&self) {} }
+pub fn generic<T: Tr>(p: T) { p.m(); }
+pub fn object(p: &dyn Tr) { p.m(); }
+pub fn opaque(p: impl Tr) { p.m(); }
+pub fn foreign(p: String) { p.m(); }
+pub fn closure(ps: Vec<P>) { ps.iter().for_each(|p| p.m()); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for function in ["generic", "object", "opaque", "foreign", "closure"] {
+        assert_eq!(graph.targets(EdgeKind::Calls, function), Vec::<String>::new(), "{function}");
+    }
+    let sites: Vec<_> = graph.0.open_sites.iter().filter(|site| site.name == "m").collect();
+    assert_eq!(sites.len(), 5, "{sites:#?}");
+    assert!(sites.iter().all(|site| site.replaces.is_none()), "{sites:#?}");
+}
+
+/// The Rust extractor opts into reporting untyped receiver calls, so
+/// a call through an untyped closure parameter or a call chain reaches core
+/// as the enclosing fn's `untypedCalls` (closures are not nodes), sorted and
+/// deduplicated, while a typed receiver call, which already has its edge,
+/// is not reported. Control: drop `graph.record_untyped_receiver_calls()`
+/// from `Emitter::new` (`closure` and `chain` carry nothing).
+#[test]
+fn untyped_receiver_calls_reach_the_enclosing_fn_and_typed_ones_do_not() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct P;
+impl P { pub fn m(&self) {} pub fn n(&self) {} }
+pub fn closure(ps: Vec<P>) { ps.iter().for_each(|p| { p.n(); p.m(); p.m(); }); }
+pub fn chain(ps: Vec<P>) { ps.first().unwrap().m(); }
+pub fn typed(p: P) { p.m(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+
+    // `iter`/`for_each` are untyped too: `Vec`'s methods, from another crate.
+    assert_eq!(graph.node("closure").untyped_calls, ["for_each", "iter", "m", "n"]);
+    assert!(graph.node("chain").untyped_calls.contains(&"m".to_string()), "{:?}", graph.node("chain"));
+    assert_eq!(graph.targets(EdgeKind::Calls, "typed"), vec!["P::m"]);
+    assert!(graph.node("typed").untyped_calls.is_empty(), "{:?}", graph.node("typed").untyped_calls);
+    let json = serde_json::to_string(graph.node("typed")).unwrap();
+    assert!(!json.contains("untypedCalls"), "{json}");
+}
+
+/// GM-485's own shape: a local typed by the return type of a method, which
+/// is typed by the parameter it is called on.
+#[test]
+fn a_local_typed_by_a_same_file_method_return_links_its_receiver_calls() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct Q;
+impl Q { pub fn refuses(&self) -> bool { true } }
+pub struct A;
+impl A { pub fn shapes(&self) -> &Q { &Q } }
+pub fn run(a: &A) { let s = a.shapes(); s.refuses(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["A::shapes", "Q::refuses"]);
+    let sites: Vec<_> =
+        graph.0.open_sites.iter().filter(|site| site.kind == OpenSiteKind::ReceiverCall).collect();
+    assert_eq!(sites.len(), 2, "{sites:#?}");
+    assert!(sites.iter().all(|site| site.replaces.is_some()), "{sites:#?}");
+}
+
+/// The same caller in another file: the types are imported, so `a.shapes()`
+/// is a `qualifiedName` placeholder in `A`'s module, and `s` stays untyped
+/// because `A::shapes`'s return type is written in another file.
+#[test]
+fn a_return_type_written_in_another_file_types_nothing() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod m;\npub mod caller;\n"),
+        (
+            "src/m.rs",
+            "pub struct Q;\nimpl Q { pub fn refuses(&self) -> bool { true } }\n\
+             pub struct A;\nimpl A { pub fn shapes(&self) -> &Q { &Q } }\n",
+        ),
+        ("src/caller.rs", "use crate::m::{A, Q};\npub fn run(a: &A) { let s = a.shapes(); s.refuses(); }\n"),
+    ]);
+    let graph = krate.extract("src/caller.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "caller::run"), vec!["pending_symbol krate::m::m::A::shapes"]);
+    let placeholder = graph.placeholder("pending_symbol", "shapes");
+    assert_eq!(
+        graph.target_of(placeholder),
+        (container("krate::m"), TargetKey::QualifiedName("m::A::shapes".into()))
+    );
+    let refuses = graph.0.open_sites.iter().find(|site| site.name == "refuses").unwrap();
+    assert_eq!(refuses.replaces, None);
+}
+
+/// Every way a local is typed from what this file writes: a `let` type, a
+/// struct literal, an alias, a free function's and an associated function's
+/// return type, through `?`, `unwrap()` and `expect()`, and `Box`.
+#[test]
+fn locals_are_typed_by_annotations_literals_aliases_and_same_file_returns() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct P;
+impl P {
+    pub fn new() -> Self { P }
+    pub fn maybe() -> Option<Self> { None }
+    pub fn m(&self) {}
+}
+pub fn make() -> P { P }
+pub fn fallible() -> Result<Box<P>, ()> { Err(()) }
+pub fn annotated() { let p: P = Default::default(); p.m(); }
+pub fn literal() { let p = P {}; p.m(); }
+pub fn alias(q: &P) { let p = &q; p.m(); }
+pub fn free() { let p = make(); p.m(); }
+pub fn assoc() { let p = P::new(); p.m(); }
+pub fn tried() -> Option<()> { let p = P::maybe()?; p.m(); None }
+pub fn unwrapped() { let p = P::maybe().unwrap(); p.m(); }
+pub fn expected() { let p = fallible().expect("p"); p.m(); }
+pub fn boxed(p: Box<P>) { p.m(); }
+pub fn later() { let p = P::maybe(); let q = p.unwrap(); q.m(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for function in
+        ["annotated", "literal", "alias", "free", "assoc", "tried", "unwrapped", "expected", "boxed", "later"]
+    {
+        let targets = graph.targets(EdgeKind::Calls, function);
+        assert!(targets.contains(&"P::m".to_string()), "{function}: {targets:?}");
+    }
+}
+
+/// What does not type a local: an `Option` never unwrapped, `Rc`/`Arc`, a
+/// project type that happens to be called `Option`, a generic return, a
+/// rebinding without a type, and a fourth hop.
+#[test]
+fn wrappers_shadowing_generics_and_long_chains_leave_a_local_untyped() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+        (
+            "src/a.rs",
+            r#"
+use std::rc::Rc;
+pub struct P;
+impl P {
+    pub fn maybe() -> Option<Self> { None }
+    pub fn next(&self) -> P { P }
+    pub fn m(&self) {}
+}
+pub fn any<P>() -> P { todo!() }
+pub fn wrapped() { let p = P::maybe(); p.m(); }
+pub fn counted(p: Rc<P>) { p.m(); }
+pub fn generic() { let p: P = any(); let q = any(); q.m(); let _ = p; }
+pub fn shadowed(p: P) { let p = 3; p.m(); }
+pub fn closure(p: P) { let f = |p| p.m(); let _ = f; }
+pub fn chained(p: P) { let a = p.next(); let b = a.next(); let c = b.next(); a.m(); b.m(); c.m(); }
+"#,
+        ),
+        (
+            "src/b.rs",
+            r#"
+pub struct Option<T>(pub T);
+pub struct P;
+impl P { pub fn m(&self) {} }
+pub fn own() -> Option<P> { Option(P) }
+pub fn run() { let p = own().unwrap(); p.m(); }
+"#,
+        ),
+    ]);
+    let a = krate.extract("src/a.rs");
+    for function in ["a::wrapped", "a::counted", "a::generic", "a::shadowed", "a::closure"] {
+        let targets = a.targets(EdgeKind::Calls, function);
+        assert!(!targets.contains(&"a::P::m".to_string()), "{function}: {targets:?}");
+    }
+    let chained = a.targets(EdgeKind::Calls, "a::chained");
+    assert_eq!(chained, vec!["a::P::m", "a::P::next"], "two hops are typed, the third is not");
+    let chained_id = a.node("a::chained").id.clone();
+    let untyped: Vec<_> =
+        a.0.open_sites
+            .iter()
+            .filter(|site| site.from_id == chained_id && site.name == "m" && site.replaces.is_none())
+            .collect();
+    assert_eq!(untyped.len(), 1, "only `c.m()` is left untyped: {untyped:#?}");
+    let b = krate.extract("src/b.rs");
+    assert_eq!(b.targets(EdgeKind::Calls, "b::run"), vec!["b::own"], "a project `Option` is not unwrapped");
+}
+
+/// Rust's method lookup prefers an inherent method to a trait method of the
+/// same name, and `T::m` is the inherent one. A trait-impl method has no
+/// `T::m` declaration, so it is a placeholder at that address: a miss, never
+/// a link to the wrong method.
+#[test]
+fn a_typed_receiver_finds_the_inherent_method_and_misses_a_trait_impl_method() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub trait Tr { fn m(&self); fn t(&self); }
+pub struct P;
+impl P { pub fn m(&self) {} }
+impl Tr for P { fn m(&self) {} fn t(&self) {} }
+pub fn inherent(p: &P) { p.m(); }
+pub fn traitish(p: &P) { p.t(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "inherent"), vec!["P::m"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "traitish"), vec!["pending_symbol krate::P::t"]);
 }
 
 /// Decision 1, the trap this plugin is most at risk of: a local must never

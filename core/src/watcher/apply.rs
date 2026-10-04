@@ -437,6 +437,17 @@ fn round_trip<R: BufRead + Send, W: Write>(
 
     hold_compute_open_for_tests();
 
+    // A semantic answer carries no new text. Besides its placeholders, it
+    // re-sends structural nodes as they are, only to shorten their
+    // `untypedCalls` (GM-486), and `apply_diff`'s upsert kept their vectors.
+    // Embedding them again would recompute every such caller's unchanged
+    // vector, so only a node that has none yet is embedded. The diff is
+    // committed already, and from here on only its edges are read.
+    if matches!(request.message, ControlMessage::SemanticPass { .. }) {
+        let embedded = store.step(|conn| nodes_with_vectors(conn, &diff));
+        diff.upsert_nodes.retain(|node| !embedded.contains(&node.id));
+    }
+
     // Runs between the unit's steps - see "Lock holds" above.
     let started = std::time::Instant::now();
     let mut stats = EmbedStats::default();
@@ -450,6 +461,25 @@ fn round_trip<R: BufRead + Send, W: Write>(
         incomplete: response.incomplete,
         incomplete_reason: response.incomplete_reason,
         upserted_edges: diff.upsert_edges.iter().map(|edge| edge.id.clone()).collect(),
+    })
+}
+
+/// The upserted nodes of `diff` that already have a vector. A failed lookup
+/// counts as none, which embeds them all, as before GM-486.
+fn nodes_with_vectors(conn: &rusqlite::Connection, diff: &Diff) -> HashSet<String> {
+    let lookup = || -> rusqlite::Result<HashSet<String>> {
+        let mut stmt = conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM vectors WHERE nodeId = ?1)")?;
+        let mut found = HashSet::new();
+        for node in &diff.upsert_nodes {
+            if stmt.query_row([&node.id], |row| row.get::<_, bool>(0))? {
+                found.insert(node.id.clone());
+            }
+        }
+        Ok(found)
+    };
+    lookup().unwrap_or_else(|err| {
+        eprintln!("g-mesh daemon: failed to check a semantic answer's nodes for vectors ({err:#})");
+        HashSet::new()
     })
 }
 
@@ -636,6 +666,7 @@ pub(crate) fn to_node_record(node: WireNode, warnings: &mut PathWarnings) -> Nod
             .collect(),
         qualified_path,
         alias_paths,
+        untyped_calls: node.untyped_calls,
     }
 }
 

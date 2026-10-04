@@ -50,6 +50,12 @@
 //! because silence is visibly silence. So: the tier is named absent, and
 //! what it would have found is left unsaid.
 //!
+//! `untypedReceiverCalls` (`super::untyped`) does not break this refusal: it
+//! is not a project-wide count. It counts only functions that call a method
+//! of the anchor's bare name through an untyped receiver and have no edge to
+//! the anchor yet, and it says those calls *may* reach it. This block stays
+//! as it is.
+//!
 //! # Why the disclosure is conditional, and scoped to four tools
 //!
 //! A disclosure that fires everywhere is noise, and noise is how a real

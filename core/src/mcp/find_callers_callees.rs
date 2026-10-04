@@ -26,6 +26,7 @@ use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
 use super::unlinked::{self, UnlinkedUsages};
+use super::untyped::{self, UntypedReceiverCalls};
 use super::{anchor, find_definition, provenance, SymbolQueryParams};
 
 /// One "other end of a CALLS edge" record, plus whether that edge is
@@ -205,6 +206,11 @@ struct CallerPage {
     /// linker left on a placeholder. Absent when there is no candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
     unlinked_usages: Option<UnlinkedUsages>,
+    /// See [`UntypedReceiverCalls`] - functions calling a method of the
+    /// anchor's name through a receiver whose type was not inferred, with no
+    /// edge to the anchor yet. Absent when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    untyped_receiver_calls: Option<UntypedReceiverCalls>,
     /// See `super::provenance` - present only when the anchor's language
     /// declares a semantic tier that has not completed for this project, so
     /// this answer came from its structural tier alone. Absent (not `null`,
@@ -369,9 +375,10 @@ pub(crate) fn handle_callers_in(
     // Destructured here so everything below still reads the node directly,
     // while `resolved.by` stays available for the response's `resolvedBy`.
     let resolved_by = resolved.by;
+    let queried_as = resolved.queried_as;
     let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by);
+    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by, queried_as);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
@@ -396,11 +403,14 @@ pub(crate) fn handle_callers_in(
         .collect();
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
     let unlinked = unlinked::probe(&conn, &anchor, &["CALLS"], &file_paths);
+    let untyped = untyped::probe(&conn, &anchor, &["CALLS"], &file_paths);
     let bounded = pagination::bound_page_reserving_two_tallies(
         rows,
         page.has_more,
         page.next_cursor,
-        tier.page_reserve() + UnlinkedUsages::wire_len(&unlinked),
+        tier.page_reserve()
+            + UnlinkedUsages::wire_len(&unlinked, "unlinkedUsages")
+            + UntypedReceiverCalls::wire_len(&untyped, untyped::FIELD),
     );
 
     let tally = pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
@@ -410,15 +420,16 @@ pub(crate) fn handle_callers_in(
 
     let excluded = excluded_references(&conn, &anchor.id, Direction::Incoming, &file_paths);
 
-    // Every file this response names: rows, the tally, the excluded and
-    // unlinked tallies.
+    // Every file this response names: rows, the tally, the excluded,
+    // unlinked and untyped tallies.
     let touched = bounded
         .results
         .iter()
         .map(|row| row.file_path.as_str())
         .chain(files.iter().flatten().map(|tally| tally.path.as_str()))
         .chain(excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str())))
-        .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths));
+        .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths))
+        .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
     let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
     let has_file_row = bounded.results.iter().any(|row| row.kind == pagination::FILE_KIND);
     let hint = session_hints::join([
@@ -438,6 +449,7 @@ pub(crate) fn handle_callers_in(
         hint,
         excluded_references: excluded,
         unlinked_usages: unlinked,
+        untyped_receiver_calls: untyped,
         provenance,
     })
 }
@@ -471,9 +483,10 @@ pub(crate) fn handle_callees_in(
     // Destructured here so everything below still reads the node directly,
     // while `resolved.by` stays available for the response's `resolvedBy`.
     let resolved_by = resolved.by;
+    let queried_as = resolved.queried_as;
     let anchor = resolved.node;
     let hint = anchor::file_anchor_hint(&anchor);
-    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by);
+    let anchor_info = anchor::AnchorInfo::with_rung(&anchor, resolved_by, queried_as);
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
