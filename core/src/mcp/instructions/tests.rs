@@ -1643,3 +1643,71 @@ fn the_cap_applies_after_shortening_and_cuts_on_a_char_boundary() {
     assert_eq!(cut, format!("file.rs {}...", "a".repeat(88)));
     assert!(cut.len() <= ERROR_BYTES);
 }
+
+/// GM-330/S12: an unbuilt cargo-workspace plugin binary
+/// (`plugin::missing_workspace_binary_hint`: `command` under
+/// `<root>/target/debug/`, `<root>/Cargo.toml` present, the binary absent),
+/// walked by the real `bulk_index::run`. The stored error keeps the step and
+/// the hint as two causes, the hint innermost, so the rendered failed item
+/// shows the hint - what to build - and not the step.
+///
+/// Control: revert ce33132 (`bail!("failed to spawn the {} plugin's bulk
+/// index: {hint}")` in `walk_one_language_in`) - the stored error is one
+/// line and the two-cause assertion fails; with that assertion removed, the
+/// item reads "rust (failed to spawn the rust plugin's bulk index: the
+/// plugin binary ...)" and the `starts_with`/"failed to spawn" assertions
+/// fail.
+#[test]
+fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
+    use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
+
+    let project = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let plugins = workspace.path().join("plugins");
+    let binary = workspace.path().join("target").join("debug").join("g-mesh-plugin-rust");
+    let rust = plugins.join("rust");
+    std::fs::create_dir_all(&rust).unwrap();
+    std::fs::write(
+        rust.join("plugin.toml"),
+        format!(
+            "[plugin]\nlanguage = \"rust\"\nprotocol_version = {CURRENT_PROTOCOL_VERSION}\n\
+             plugin_version = \"0.0.0-test\"\n\n[plugin.spawn]\ncommand = '{}'\n\n\
+             [plugin.languages]\nextensions = [\".rs\"]\n",
+            binary.display()
+        ),
+    )
+    .unwrap();
+    crate::daemon::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
+    let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
+    let store = IndexStore::new(store_with_files(&[]));
+
+    let summary = crate::daemon::bulk_index::run(project.path(), &store, None, &discovered)
+        .expect("one failed language must not fail the walk");
+
+    let error = match summary.outcomes.get("rust") {
+        Some(LanguageOutcome::Failed { error }) => error.clone(),
+        other => panic!("rust must be Failed, got {other:?}"),
+    };
+    let hint = crate::daemon::plugin::missing_workspace_binary_hint(&binary)
+        .expect("the fixture must be the unbuilt-workspace-binary shape");
+    assert!(hint.contains("cargo build --workspace"), "{hint}");
+    assert_eq!(
+        error.lines().collect::<Vec<_>>(),
+        ["failed to spawn the rust plugin's bulk index", hint.as_str()],
+        "the step and the hint are separate causes, the hint innermost: {error}"
+    );
+
+    let rendered = rendered_with_rust_failed(&error);
+    let item = failed_item(&rendered, "rust");
+
+    assert!(
+        item.starts_with(
+            "rust (the plugin binary g-mesh-plugin-rust does not exist - it has not been built yet."
+        ),
+        "{rendered}"
+    );
+    assert!(item.contains("Run `cargo build"), "the item must name the build command: {rendered}");
+    assert!(!item.contains("failed to spawn"), "{rendered}");
+    assert!(!rendered.contains(&workspace.path().display().to_string()), "{rendered}");
+}
