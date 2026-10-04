@@ -189,6 +189,39 @@ impl ServerReadiness {
     }
 }
 
+/// How a server's `definition` answer for an overloaded call is narrowed to
+/// one declaration, when it names more than one - the manifest's
+/// `overload_disambiguation` key.
+///
+/// See [`super::LspBridge`]'s "Overload binding" section and
+/// `docs/adr/0024-semantic-tier-refines-by-binding-a-declaration.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverloadDisambiguation {
+    /// Only a `definition` answer that already names exactly one bodiless
+    /// declaration binds; several leave the call unbound. The default, and
+    /// what a server that answers with the bound overload needs (tsserver).
+    #[default]
+    None,
+    /// A `definition` answer naming several declarations of one overload set
+    /// is narrowed by comparing `hover` at the call with `hover` at each
+    /// candidate declaration's name. For a server whose `definition` returns
+    /// the whole set whatever the call binds (pyright), whose hover is the
+    /// only channel that carries the binding. Fails closed: no single match,
+    /// no binding.
+    Hover,
+}
+
+impl OverloadDisambiguation {
+    /// The manifest spellings.
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "none" => Some(Self::None),
+            "hover" => Some(Self::Hover),
+            _ => None,
+        }
+    }
+}
+
 /// How to start and address one language server.
 ///
 /// Every field but [`command`](SemanticConfig::command) has a defensible
@@ -256,6 +289,12 @@ pub struct SemanticConfig {
     /// nothing gets exactly the behaviour every manifest had before this key
     /// existed.
     pub readiness: ServerReadiness,
+    /// How an overloaded call's `definition` answer is narrowed to one
+    /// declaration - see [`OverloadDisambiguation`].
+    ///
+    /// [`OverloadDisambiguation::None`] by default: a manifest that says
+    /// nothing never asks a server for `hover`.
+    pub overload_disambiguation: OverloadDisambiguation,
 }
 
 impl SemanticConfig {
@@ -276,6 +315,7 @@ impl SemanticConfig {
             initialization_options: None,
             settings: BTreeMap::new(),
             readiness: ServerReadiness::default(),
+            overload_disambiguation: OverloadDisambiguation::default(),
         }
     }
 
@@ -339,6 +379,18 @@ impl SemanticConfig {
                     path.display()
                 )
             })?;
+        }
+        // Reported rather than defaulted, for the same reason as `readiness`:
+        // this key decides what the bridge accepts as evidence of a binding.
+        if let Some(disambiguation) = &semantic.overload_disambiguation {
+            config.overload_disambiguation =
+                OverloadDisambiguation::parse(disambiguation).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: [plugin.semantic] overload_disambiguation is {disambiguation:?}, which is \
+                     neither \"none\" nor \"hover\"",
+                        path.display()
+                    )
+                })?;
         }
         // A `settings` that is not a table is the manifest saying something
         // this reader cannot act on, and the rule for a present-and-broken
@@ -429,6 +481,8 @@ struct RawSemantic {
     settings: Option<toml::Value>,
     #[serde(default)]
     readiness: Option<String>,
+    #[serde(default)]
+    overload_disambiguation: Option<String>,
 }
 
 #[cfg(test)]
@@ -468,6 +522,7 @@ mod tests {
         assert!(config.args.is_empty());
         assert!(config.env.is_empty());
         assert!(config.implementation_kinds.is_empty());
+        assert_eq!(config.overload_disambiguation, OverloadDisambiguation::None, "no key never asks hover");
         assert_eq!(config.initialization_options, None);
         assert!(config.settings.is_empty(), "no settings is the pre-GM-299 behaviour: answer null");
         assert_eq!(
@@ -512,6 +567,7 @@ mod tests {
                  args = [\"--stdio\"]\n\
                  engine = \"toy-analyzer\"\n\
                  readiness = \"on-demand\"\n\
+                 overload_disambiguation = \"hover\"\n\
                  implementation_kinds = [\"protocol\"]\n\n\
                  [plugin.semantic.env]\nTOY_LOG = \"error\"\n\n\
                  [plugin.semantic.initialization_options]\n\
@@ -532,6 +588,7 @@ mod tests {
         assert_eq!(config.args, vec!["--stdio"]);
         assert_eq!(config.engine, "toy-analyzer");
         assert_eq!(config.readiness, ServerReadiness::OnDemand);
+        assert_eq!(config.overload_disambiguation, OverloadDisambiguation::Hover);
         assert_eq!(config.implementation_kinds, vec!["protocol"]);
         assert_eq!(config.env.get("TOY_LOG").map(String::as_str), Some("error"));
         assert_eq!(

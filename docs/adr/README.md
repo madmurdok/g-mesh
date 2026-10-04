@@ -94,3 +94,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0021 | [Bulk walk: one language's failure costs only that language, and the index says which](0021-per-language-bulk-outcome.md) | Accepted |
 | 0022 | [Instructions say which languages are covered; per-answer facts move to the answer](0022-instructions-coverage-states.md) | Accepted |
 | 0023 | [The project model tracks file presence on `fileChanged`; resolution configs are watch files](0023-project-model-tracks-file-presence.md) | Accepted |
+| 0024 | [A semantic tier refines an edge by binding a declaration, all or nothing per edge](0024-semantic-tier-refines-by-binding-a-declaration.md) | Accepted |
