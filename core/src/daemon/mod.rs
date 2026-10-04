@@ -351,6 +351,10 @@ pub fn run(root: &Path) -> Result<()> {
         project_config.plugin.memory_limit_mb,
         Arc::clone(&embedding),
     ));
+    // Before the tool listener and the watcher's consumer below: both route
+    // files, and neither may reach a language the last walk failed (ADR 0021,
+    // section 2).
+    registry.seed_failed_languages(&conn);
 
     // Starts ticking now, so a daemon nobody connects to still exits.
     let core_activity = CoreActivity::new();

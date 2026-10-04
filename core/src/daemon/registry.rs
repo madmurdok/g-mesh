@@ -101,8 +101,9 @@ use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::manifest::{self, extension_of, under_excluded_dir, DiscoveredPlugins};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
+use crate::languages::LanguageOutcome;
 use crate::storage::index_store::{self, IndexStore};
-use crate::storage::schema::CURRENT_INDEXER_VERSION;
+use crate::storage::schema::{self, CURRENT_INDEXER_VERSION};
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// Where a language's plugin pid is recorded, relative to the project's state
@@ -606,6 +607,31 @@ impl PluginRegistry {
     pub(crate) fn set_failed_languages(&self, languages: impl IntoIterator<Item = String>) {
         let mut failed = self.failed_languages.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *failed = languages.into_iter().collect();
+    }
+
+    /// Loads the languages the last walk failed (`language_outcome` rows
+    /// recorded as `Failed`), so a failed language stays out of single-file
+    /// updates across daemon restarts, not only in the process that walked:
+    /// see `docs/adr/0021-per-language-bulk-outcome.md`, section 2. The daemon
+    /// calls it once at startup, before anything that routes a file (the tool
+    /// listener, the watcher's consumer) exists; a later walk replaces the set
+    /// with its own result.
+    ///
+    /// A table that cannot be read leaves the set empty rather than failing
+    /// startup: the structural index is otherwise usable, and refusing to
+    /// serve it over this table would turn a degraded guarantee into an outage.
+    pub(crate) fn seed_failed_languages(&self, conn: &IndexStore) {
+        match conn.with(schema::language_outcomes) {
+            Ok(outcomes) => {
+                self.set_failed_languages(outcomes.into_iter().filter_map(|(language, outcome)| {
+                    matches!(outcome, LanguageOutcome::Failed { .. }).then_some(language)
+                }))
+            }
+            Err(err) => eprintln!(
+                "g-mesh daemon: could not read the recorded language outcomes - failed languages are not \
+                 excluded from incremental updates until the next walk: {err:#}"
+            ),
+        }
     }
 
     /// Whether the bulk walk failed `language`, so its files are not routed.
