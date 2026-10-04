@@ -63,6 +63,18 @@ a variable receiver" sentence), and `plugin.toml`'s two `receiver_calls*` keys.
 In the Node suite the gap is encoded by `extract.test.ts` 1381/1599 and
 `semanticPass.test.ts` 813 (no question asked for an ordinary call).
 
+### Resolved at review (2026-10-04)
+
+1. CI installs a TypeScript language server (via `scripts/test-deps.sh`, as for
+   pyright and rust-analyzer) rather than running with
+   `--skip-semantic-expectations`; the 8 semantic-result core tests run against
+   it. Owned by GM-325.
+2. If the ported semantic tier resolves receiver calls, `receiver_calls*` flip
+   to `"resolved"` together with the sites listed above. Owned by GM-325.
+3. D-1..D-4 are backlog tasks GM-510..GM-513.
+4. `core/tests/semantic_pass_trigger.rs`'s Node fake plugin is rewritten in
+   Rust. Owned by GM-351.
+
 ### Expectations for S2 (written against today's Node plugin)
 
 New files only under `conformance/project`; none of the seven existing files is
