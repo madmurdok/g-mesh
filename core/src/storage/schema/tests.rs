@@ -59,6 +59,7 @@ fn creates_all_tables_and_indexes() {
         "idx_nodes_pending_name",
         "idx_edges_fromId",
         "idx_edges_toId",
+        "idx_edges_linkedFrom",
         "idx_targets_scope",
         "idx_qualified_suffixes_nodeId",
         "idx_untyped_calls_nodeId",
