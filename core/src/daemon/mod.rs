@@ -36,6 +36,7 @@ use crate::mcp;
 use crate::storage::connection::{self, ensure_project_dir, project_dir};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
+use crate::watcher::batch::{classify_settled, order_for_routing};
 use crate::watcher::debounce::Debouncer;
 use crate::watcher::ProjectWatcher;
 
@@ -464,7 +465,8 @@ fn spawn_watch_consumer(
 }
 
 /// One iteration of the watcher loop: waits up to [`DEBOUNCE_WINDOW`] for a
-/// raw change, records it, then routes every settled path to `registry`.
+/// raw change, records it, then routes every settled path to `registry` in
+/// [`order_for_routing`]'s order (deletions, creations, modifications; ADR 0023).
 fn watch_and_route_once(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
@@ -475,6 +477,7 @@ fn watch_and_route_once(
     if let Some(path) = watcher.next_change(DEBOUNCE_WINDOW) {
         debouncer.record(path);
     }
+    let mut batch = Vec::new();
     for settled in debouncer.drain_ready() {
         let Some(file_path) = relative_wire_path(root, &settled) else {
             // Outside the project root: nothing to route.
@@ -485,6 +488,9 @@ fn watch_and_route_once(
             // a file, and must not enter a sleeping plugin's replay queue.
             continue;
         }
+        batch.push((classify_settled(conn, &settled, &file_path), file_path));
+    }
+    for file_path in order_for_routing(batch) {
         // A workspace file (`[plugin.workspace] watch_files`) triggers that
         // language's reindex; anything else is applied or queued by its supervisor.
         registry.route_settled_path(conn, file_path);

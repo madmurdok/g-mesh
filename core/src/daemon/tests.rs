@@ -405,3 +405,121 @@ fn two_different_files_in_the_same_burst_each_get_their_own_round_trip() {
         "two distinct files in the same burst must each still get their own round trip"
     );
 }
+
+/// Number of paths of each kind the batch-order tests below put in one
+/// batch. The debouncer drains in `HashMap` order, so with one path per kind
+/// an unordered batch would still come out right half the time; with eight
+/// of each, an unordered drain happens to put all of one kind ahead of another
+/// about once in 12870 runs (1 / C(16, 8)).
+const PATHS_PER_KIND: usize = 8;
+
+/// Records `paths` (relative to `root`, in this order) into a debouncer
+/// whose window has already elapsed, then runs `watch_and_route_once` once,
+/// so every path settles into the same batch and is routed by that one call.
+/// The watcher watches an empty directory outside `root`: no filesystem
+/// event can add a path to the batch or reorder it, so the debouncer holds
+/// exactly the events fed here, in the order fed.
+fn route_one_batch(root: &Path, conn: &IndexStore, registry: &PluginRegistry, paths: &[String]) {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let watcher = ProjectWatcher::new(elsewhere.path().canonicalize().unwrap()).unwrap();
+    let mut debouncer = Debouncer::new(Duration::ZERO);
+    for path in paths {
+        debouncer.record(root.join(path));
+    }
+    watch_and_route_once(&watcher, &mut debouncer, root, conn, registry);
+}
+
+fn record_baseline(conn: &IndexStore, file_path: &str) {
+    conn.with(|c| crate::storage::write::upsert_indexed_file(c, file_path, 1, "hash")).unwrap();
+}
+
+/// GM-505 (ADR 0023, W1): a new file and an indexed importer of it settling
+/// in one batch reach the plugin new file first, though the events arrive
+/// importer first - so the importer is extracted against a project model
+/// that already holds its target. Each path is routed exactly once, by the
+/// call that drained it.
+#[test]
+fn a_batch_routes_its_new_files_before_their_modified_importers_whatever_the_event_order() {
+    let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+    let plugin_dir = &dirs[0];
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+
+    let importers: Vec<String> = (0..PATHS_PER_KIND).map(|i| format!("importer{i}.python-src")).collect();
+    let targets: Vec<String> = (0..PATHS_PER_KIND).map(|i| format!("target{i}.python-src")).collect();
+    for (importer, target) in importers.iter().zip(&targets) {
+        fs::write(root.join(importer), format!("import {target}")).unwrap();
+        record_baseline(&conn, importer);
+        fs::write(root.join(target), "").unwrap();
+    }
+
+    let importer_first: Vec<String> = importers.iter().chain(&targets).cloned().collect();
+    route_one_batch(&root, &conn, &registry, &importer_first);
+
+    let requested = test_plugin::file_changed_requests(plugin_dir);
+    let mut expected_set = importer_first.clone();
+    expected_set.sort();
+    let mut requested_set = requested.clone();
+    requested_set.sort();
+    assert_eq!(
+        requested_set, expected_set,
+        "each settled path is routed exactly once, by the call that drained it"
+    );
+    assert!(
+        requested[..PATHS_PER_KIND].iter().all(|path| targets.contains(path)),
+        "every new file must reach the plugin before any modified importer: {requested:?}"
+    );
+}
+
+/// The same batch with deletions in it: every deleted path (gone from disk,
+/// baseline still recorded) is routed first, then creations, then
+/// modifications - fed here in the opposite order.
+#[test]
+fn a_batch_routes_deletions_then_creations_then_modifications_whatever_the_event_order() {
+    let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+    let plugin_dir = &dirs[0];
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+
+    let names = |kind: &str| -> Vec<String> {
+        (0..PATHS_PER_KIND).map(|i| format!("{kind}{i}.python-src")).collect()
+    };
+    let (deleted, created, modified) = (names("deleted"), names("created"), names("modified"));
+    for path in &deleted {
+        record_baseline(&conn, path);
+    }
+    for path in &created {
+        fs::write(root.join(path), "").unwrap();
+    }
+    for path in &modified {
+        fs::write(root.join(path), "").unwrap();
+        record_baseline(&conn, path);
+    }
+
+    let reversed: Vec<String> = modified.iter().chain(&created).chain(&deleted).cloned().collect();
+    route_one_batch(&root, &conn, &registry, &reversed);
+
+    let requested = test_plugin::file_changed_requests(plugin_dir);
+    assert_eq!(
+        requested.len(),
+        3 * PATHS_PER_KIND,
+        "each settled path is routed exactly once: {requested:?}"
+    );
+    let kinds: Vec<&str> = requested
+        .iter()
+        .map(|path| {
+            if deleted.contains(path) {
+                "deleted"
+            } else if created.contains(path) {
+                "created"
+            } else {
+                "modified"
+            }
+        })
+        .collect();
+    let expected: Vec<&str> = ["deleted", "created", "modified"]
+        .iter()
+        .flat_map(|kind| std::iter::repeat_n(*kind, PATHS_PER_KIND))
+        .collect();
+    assert_eq!(kinds, expected, "deletions, then creations, then modifications: {requested:?}");
+}
