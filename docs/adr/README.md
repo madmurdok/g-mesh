@@ -94,3 +94,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0021 | [Bulk walk: one language's failure costs only that language, and the index says which](0021-per-language-bulk-outcome.md) | Accepted |
 | 0022 | [Instructions say which languages are covered; per-answer facts move to the answer](0022-instructions-coverage-states.md) | Accepted |
 | 0023 | [The project model tracks file presence on `fileChanged`; resolution configs are watch files](0023-project-model-tracks-file-presence.md) | Accepted |
+| 0025 | [Project walks follow symlinks; a file's identity is its real spelling when the plain walk reaches it](0025-project-walk-follows-symlinks.md) | Accepted |
