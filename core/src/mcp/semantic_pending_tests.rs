@@ -653,3 +653,100 @@ fn a_page_at_the_budget_edge_keeps_room_for_the_provenance_sentence() {
         "results {results} + hint {hint_field} bytes over {MAX_RESPONSE_BYTES}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GM-330/S14: the session's `SessionHints` is the server's own (`self.hints`),
+// reached through the same handler an MCP `tools/call` uses.
+// ---------------------------------------------------------------------------
+
+/// A server over `store` (no plugins discovered, index ready), so each call
+/// below goes through `GMeshMcpServer`'s tool handler over a real session.
+fn hint_server(dir: &std::path::Path, store: Arc<IndexStore>) -> super::GMeshMcpServer {
+    use crate::daemon::indexing_status::{IndexingStatus, Phase};
+    use crate::daemon::lifecycle::CoreActivity;
+    use crate::daemon::manifest::DiscoveredPlugins;
+    use crate::daemon::registry::PluginRegistry;
+    let root = dir.join("project");
+    let state = dir.join("state");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let indexing = IndexingStatus::structural();
+    indexing.set_phase(Phase::Ready);
+    let registry = Arc::new(PluginRegistry::new(
+        &root,
+        state,
+        DiscoveredPlugins::default(),
+        None,
+        None,
+        Arc::new(EmbeddingPipeline::disabled()),
+    ));
+    super::GMeshMcpServer::new(
+        store,
+        registry,
+        CoreActivity::new(),
+        indexing,
+        Arc::new(EmbeddingPipeline::disabled()),
+    )
+}
+
+/// One MCP call on `client`'s session, as its JSON body.
+async fn served(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    tool: &str,
+    id: &str,
+) -> serde_json::Value {
+    let result =
+        super::search_code_worker_tests::call(client, tool, serde_json::json!({ "symbol_id": id })).await;
+    body(&result).0
+}
+
+/// Through the server, `find_callees` and `find_implementations` each send
+/// the `resolved: false` sentence on the session's first qualifying page
+/// only. Each tool gets its own server (its own session), so the first
+/// call is the one that must carry it. Controls: in `GMeshMcpServer::find_callees`
+/// (resp. `find_implementations`), pass `SessionHints::default()` instead
+/// of `self.hints.clone()` - that tool's second call repeats the sentence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_server_sends_the_row_hint_once_per_session_on_callees_and_implementations() {
+    for (tool, anchor) in [("find_callees", "a1"), ("find_implementations", "iface")] {
+        let dir = tempfile::tempdir().unwrap();
+        let client = super::search_code_worker_tests::connect(hint_server(dir.path(), hint_index())).await;
+
+        let first = served(&client, tool, anchor).await;
+        let rows = first["results"].as_array().unwrap_or_else(|| panic!("{tool}: {first}"));
+        assert!(rows.iter().any(|row| row["resolved"] == false), "{tool}: {first}");
+        assert_eq!(first["allUnresolved"], false, "{tool}: {first}");
+        assert!(hint_of(&first).contains(UNRESOLVED_ROW), "{tool}: the first page sends it: {first}");
+
+        let second = served(&client, tool, anchor).await;
+        assert!(second["results"].as_array().unwrap().iter().any(|row| row["resolved"] == false), "{second}");
+        assert!(!hint_of(&second).contains(UNRESOLVED_ROW), "{tool}: sent once per session: {second}");
+    }
+}
+
+/// Once per session across tools, through the server: after `find_callers`
+/// spent the sentence, `find_callees` and `find_implementations` on the
+/// same session do not repeat it, while a new session's `find_callees`
+/// does. Controls: the `SessionHints::default()` swap above in either
+/// handler (that tool sends it again).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_hint_spent_by_find_callers_is_not_repeated_by_the_other_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = super::search_code_worker_tests::connect(hint_server(dir.path(), hint_index())).await;
+
+    let callers = served(&client, "find_callers", "target").await;
+    assert!(hint_of(&callers).contains(UNRESOLVED_ROW), "{callers}");
+    for (tool, anchor) in [("find_callees", "a1"), ("find_implementations", "iface")] {
+        let page = served(&client, tool, anchor).await;
+        assert!(
+            page["results"].as_array().unwrap().iter().any(|row| row["resolved"] == false),
+            "{tool}: {page}"
+        );
+        assert!(!hint_of(&page).contains(UNRESOLVED_ROW), "{tool}: already sent: {page}");
+    }
+
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = super::search_code_worker_tests::connect(hint_server(other_dir.path(), hint_index())).await;
+    let callees = served(&other, "find_callees", "a1").await;
+    assert!(hint_of(&callees).contains(UNRESOLVED_ROW), "a new session gets it: {callees}");
+}
