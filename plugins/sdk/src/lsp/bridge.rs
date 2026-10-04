@@ -1,7 +1,7 @@
 //! The engine itself: open sites in, a semantic diff out, with a language
 //! server in the middle and a budget around the whole thing.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
@@ -396,6 +396,10 @@ pub struct LspBridge {
     /// The edge ids this bridge has emitted, keyed by the file whose questions
     /// produced them - see this type's doc on retraction.
     emitted: BTreeMap<RelPath, Vec<String>>,
+    /// The nodes this bridge last re-sent with a shortened `untypedCalls`,
+    /// keyed by their file - see [`trim_untyped_calls`]. Only what lets a later
+    /// pass put a name back when its answers stop arriving.
+    trimmed: BTreeMap<RelPath, BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -433,6 +437,7 @@ impl LspBridge {
             start_failure: None,
             opened: BTreeMap::new(),
             emitted: BTreeMap::new(),
+            trimmed: BTreeMap::new(),
         }
     }
 
@@ -811,6 +816,10 @@ struct Answers {
     edges: HashSet<String>,
     by_file: BTreeMap<RelPath, Vec<String>>,
     retract: BTreeSet<String>,
+    /// How many untyped receiver-call sites (`ReceiverCall`, no `replaces`)
+    /// this pass got an answer for, by `(from_id, name)` - see
+    /// [`untyped_call_answered`] and [`trim_untyped_calls`] (GM-486).
+    untyped_answered: HashMap<(String, String), usize>,
 }
 
 /// The node one address gets, and the use site whose `name` and `range` it
@@ -890,6 +899,7 @@ impl Answers {
             edges: HashSet::new(),
             by_file: BTreeMap::new(),
             retract: BTreeSet::new(),
+            untyped_answered: HashMap::new(),
         }
     }
 
@@ -1365,13 +1375,23 @@ fn record_answer(
             // picking one here would be this bridge making the guess the
             // linker declines to make.
             let mut target: Option<(RelPath, &WireNode)> = None;
+            let mut agree = true;
             for location in &found {
                 let Some((path, node)) = node_at(index, roots, encoding, location) else { continue };
                 match &target {
-                    Some((_, chosen)) if chosen.id != node.id => return Vec::new(),
+                    Some((_, chosen)) if chosen.id != node.id => {
+                        agree = false;
+                        break;
+                    }
                     Some(_) => {}
                     None => target = Some((path, node)),
                 }
+            }
+            if untyped_call_answered(index, roots, site, &found, agree && target.is_some()) {
+                *answers.untyped_answered.entry((site.from_id.clone(), site.name.clone())).or_default() += 1;
+            }
+            if !agree {
+                return Vec::new();
             }
             let Some((_, node)) = target else { return Vec::new() };
             // The placeholder is named after the declaration it waits on, not
@@ -1426,6 +1446,96 @@ fn record_answer(
             Vec::new()
         }
     }
+}
+
+/// Whether one answer to `site` counts towards dropping its name from the
+/// caller's `untypedCalls` (GM-486, D3 as extended after the noise
+/// measurement).
+///
+/// Only an untyped receiver call is counted: a `ReceiverCall` site that
+/// replaces no structural edge, which is exactly what
+/// `FileGraphBuilder::finish` folds into `untypedCalls`. Such a call counts
+/// as answered when the server found something and every place it found is
+/// accounted for: either this pass recorded an edge for it (`recorded`), or
+/// every location lies outside the files this index holds - a std or
+/// dependency method, which can never become an edge and is the noise the
+/// marker was measured to carry. An empty answer is not an answer. Neither is
+/// one that lands in an indexed file without becoming an edge (targets that
+/// disagree, or a position no addressable declaration covers): the call may
+/// well be to a project method, and the marker is what says its edge is
+/// missing.
+fn untyped_call_answered(
+    index: &SdkIndex,
+    roots: [&Path; 2],
+    site: &OpenSite,
+    found: &[ServerLocation],
+    recorded: bool,
+) -> bool {
+    if site.kind != OpenSiteKind::ReceiverCall || site.replaces.is_some() || found.is_empty() {
+        return false;
+    }
+    recorded || found.iter().all(|location| file_at(index, roots, location).is_none())
+}
+
+/// The caller nodes whose `untypedCalls` this pass shortens or restores, ready
+/// to upsert (GM-486).
+///
+/// A name leaves a node's list once every untyped receiver-call site of that
+/// name in that node was answered ([`untyped_call_answered`]); a name with one
+/// site left unanswered stays. The list each node starts from is the
+/// structural one the SDK index holds, so a structural reparse that re-sends
+/// the full list is undone by the next pass's answers, the same way edges are.
+///
+/// Only `files` are considered: the files this pass both asked about and
+/// finished. A file the pass did not finish says nothing about its sites, so
+/// its nodes are left as core holds them, as an earlier pass's edges are. In a
+/// finished file a node is re-sent when its list got shorter, or when an
+/// earlier pass shortened it (`trimmed`) and this one no longer does - so a
+/// name whose answers stopped arriving comes back.
+///
+/// The node goes out whole, as the index holds it, with only `untypedCalls`
+/// changed: core's upsert replaces every column and child row from the
+/// record, so anything less would erase what the structural tier sent.
+fn trim_untyped_calls(
+    index: &SdkIndex,
+    files: &BTreeSet<RelPath>,
+    answered: &HashMap<(String, String), usize>,
+    trimmed: &mut BTreeMap<RelPath, BTreeSet<String>>,
+) -> Vec<WireNode> {
+    let mut upserts = Vec::new();
+    for file in files {
+        let previously = trimmed.remove(file).unwrap_or_default();
+        let Some(entry) = index.entry(file) else { continue };
+        let mut sites: HashMap<(&str, &str), usize> = HashMap::new();
+        for site in &entry.graph.open_sites {
+            if site.kind == OpenSiteKind::ReceiverCall && site.replaces.is_none() {
+                *sites.entry((site.from_id.as_str(), site.name.as_str())).or_default() += 1;
+            }
+        }
+        let mut now = BTreeSet::new();
+        for node in entry.graph.nodes.iter().filter(|node| !node.untyped_calls.is_empty()) {
+            let kept: Vec<String> = node
+                .untyped_calls
+                .iter()
+                .filter(|name| {
+                    let total = sites.get(&(node.id.as_str(), name.as_str())).copied().unwrap_or(0);
+                    let done = answered.get(&(node.id.clone(), (*name).clone())).copied().unwrap_or(0);
+                    total == 0 || done < total
+                })
+                .cloned()
+                .collect();
+            if kept.len() < node.untyped_calls.len() {
+                now.insert(node.id.clone());
+                upserts.push(WireNode { untyped_calls: kept, ..node.clone() });
+            } else if previously.contains(&node.id) {
+                upserts.push(node.clone());
+            }
+        }
+        if !now.is_empty() {
+            trimmed.insert(file.clone(), now);
+        }
+    }
+    upserts
 }
 
 /// Records one implementor of `anchor`, if `location` is a declaration this
@@ -1559,7 +1669,10 @@ impl SemanticEngine for LspBridge {
             for file in &covered {
                 self.emitted.insert(file.clone(), Vec::new());
             }
-            let (diff, _) = answers.finish();
+            let (mut diff, _) = answers.finish();
+            // No question means no untyped receiver call in these files, so
+            // this only forgets what an earlier pass trimmed in them.
+            diff.upsert_nodes.extend(trim_untyped_calls(index, &covered, &HashMap::new(), &mut self.trimmed));
             return Ok(SemanticAnswer::complete(diff));
         }
 
@@ -1612,7 +1725,14 @@ impl SemanticEngine for LspBridge {
 
         let produced = answers.by_file.clone();
         retract_stale(&mut answers, &self.emitted, &covered, &produced);
-        let (diff, emitted) = answers.finish();
+        let untyped_answered = std::mem::take(&mut answers.untyped_answered);
+        let (mut diff, emitted) = answers.finish();
+        // Callers whose untyped receiver calls were all answered (GM-486), in
+        // the files this pass asked about and finished. A file reached only
+        // by an implementation sweep's second hop is covered without its own
+        // sites having been asked, so it is not one of them.
+        let finished: BTreeSet<RelPath> = covered.intersection(&asked_about).cloned().collect();
+        diff.upsert_nodes.extend(trim_untyped_calls(index, &finished, &untyped_answered, &mut self.trimmed));
         // A file this pass finished gets a fresh baseline: what it produced is
         // now the whole truth about that file's semantic edges. A file it did
         // *not* finish keeps its old ids as well as the new ones - the old ones
