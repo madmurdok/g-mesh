@@ -135,6 +135,16 @@ engine = "pyright"
 # `ServerReadiness::OnDemand`.
 readiness = "on-demand"
 
+# pyright's `textDocument/definition` at an overloaded call names the whole
+# `@overload` set, implementation included, whatever the call binds (1.1.414,
+# measured in docs/architecture/gm-348-bridge-overload-binding.md section 1);
+# only its `hover` at the call renders the bound stub. "hover" lets the bridge
+# compare that text with each stub's own hover and bind the one that matches -
+# and nothing when none or several do, so a printer change upstream costs the
+# binding, never an edge. See
+# docs/adr/0024-semantic-tier-refines-by-binding-a-declaration.md.
+overload_disambiguation = "hover"
+
 # EMPTY ON PURPOSE, and it is the one key here that would silently break the
 # whole tier if it were filled in with the obvious value. The Rust plugin sets
 # `implementation_kinds = ["trait"]` and the bridge asks

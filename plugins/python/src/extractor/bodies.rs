@@ -54,6 +54,19 @@
 //! The star-import case is the one real loss, and it is named as a structural
 //! gap in the plugin README rather than half-answered here.
 //!
+//! **Plus overloaded calls, which refine an edge rather than stand in for
+//! one.** A call this tier *did* resolve - `f(1)`, `mod.f(1)`, `self.m(1)` -
+//! names the right function and says nothing about which of its `@overload`
+//! stubs the call binds; only a type checker knows. Such a call keeps its
+//! structural `CALLS` edge and also records an [`OpenSiteKind::OverloadCall`]
+//! site whose `replaces` is that edge: always when the target is a node of
+//! this file that is an overload set ([`Emitter::overloaded`]), and for every
+//! call onto a placeholder, whose target this file cannot see (the semantic
+//! engine drops the ones that are not overloaded before asking anything). A
+//! receiver call needs nothing extra: its `ReceiverCall` site already goes
+//! to the engine, which binds an overload when the answer lands on one. See
+//! `docs/adr/0024-semantic-tier-refines-by-binding-a-declaration.md`.
+//!
 //! # Decision 7, continued: `self.method()` is resolved, and `self` is never
 //! trusted
 //!
@@ -387,7 +400,9 @@ impl<'a, 's> Bodies<'a, 's> {
             #[cfg(test)]
             crate::census::pop_ctx();
             match bound {
-                Bound::Here(to, _) => self.emitter.resolved_edge(EdgeKind::SupertypeOf, subtype, &to),
+                Bound::Here(to, _) => {
+                    self.emitter.resolved_edge(EdgeKind::SupertypeOf, subtype, &to);
+                }
                 Bound::There { target, name, .. } => {
                     let range = self.emitter.positions().range(base);
                     let placeholder =
@@ -789,17 +804,42 @@ impl<'a, 's> Bodies<'a, 's> {
                 } else {
                     EdgeKind::References
                 };
-                self.emitter.resolved_edge(edge, from, &to);
+                let written = self.emitter.resolved_edge(edge, from, &to);
+                if edge == EdgeKind::Calls && self.emitter.overloaded(&to) {
+                    self.overload_call(from, written, at);
+                }
             }
             Bound::There { target, name, looks_class } => {
                 let edge = if is_call && !looks_class { EdgeKind::Calls } else { EdgeKind::References };
                 let range = self.emitter.positions().range(at);
                 let placeholder =
                     self.emitter.placeholder(PlaceholderKind::PendingSymbol, &name, target, range);
-                self.emitter.placeholder_edge(edge, from, &placeholder);
+                let written = self.emitter.placeholder_edge(edge, from, &placeholder);
+                // Whether the other file's declaration is an overload set is
+                // not knowable here; the engine filters (Decision 7).
+                if edge == EdgeKind::Calls {
+                    self.overload_call(from, written, at);
+                }
             }
             Bound::Receiver => self.walk_receiver(whole, from, is_call),
             Bound::Nothing => {}
         }
+    }
+
+    /// Records the [`OpenSiteKind::OverloadCall`] site of a call whose
+    /// structural `CALLS` edge `replaces` (from `from`) was just written - see
+    /// Decision 7's overloaded calls. The engine either binds every site of
+    /// that edge to an overload or leaves the edge be.
+    fn overload_call(&mut self, from: &str, replaces: String, at: Node) {
+        let position = self.emitter.positions().at(at.start_position());
+        self.emitter.open_site(OpenSite {
+            from_id: from.to_string(),
+            position,
+            name: text(at, self.source).to_string(),
+            kind: OpenSiteKind::OverloadCall,
+            edge_kind: EdgeKind::Calls,
+            from_container: Some(self.module.key.clone()),
+            replaces: Some(replaces),
+        });
     }
 }
