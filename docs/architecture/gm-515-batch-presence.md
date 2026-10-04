@@ -446,6 +446,14 @@ Go (`plugins/go/control_test.go`):
 4. **ADR: new 0026 plus an 0023 amendment (D8), written in a docs slice after
    the code?** Recommend yes.
 
+### Resolved at review (2026-10-05)
+
+The owner accepted all four recommendations: GM-506 sets
+`files_created = true` in Python's manifest; core announces only when a
+language has two or more created files in the batch; `plugins check`
+coverage of `filesCreated` is a backlog task; ADR 0026 is written after the
+code, from what was actually built.
+
 ## Appendix: g-mesh calls this note relied on
 
 - `find_callers route_settled_path` -> only production caller
