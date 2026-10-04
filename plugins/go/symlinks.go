@@ -1,19 +1,31 @@
 package main
 
-// The symlink policy for this plugin's project walk, mirroring
-// plugins/typescript/src/symlinks.ts's own guard: symlinks are *followed*
-// (a symlinked package - yarn/lerna-style linked packages, vendored shared
-// code linked into a workspace - is an ordinary part of how monorepos are
-// laid out, and skipping them would make a real, imported, in-tree package
-// invisible with nothing saying why), but only under a guard that refuses
-// three shapes: a link onto one of its own ancestors (infinite descent), a
-// second path onto a real location some other path already claimed (the
-// same file indexed twice), and a link resolving outside the project root
-// (a path this index must never hold). A dangling link is skipped, not an
-// error.
+// The symlink guard for this plugin's project walk. Links are followed, under
+// the same policy as the SDK's walk (plugins/sdk/src/walk.rs); why, and why
+// these rules, is docs/adr/0025-project-walk-follows-symlinks.md.
+//
+// Invariants (walk.go's walkDir and walkProjectFiles hold the other half):
+//
+//   - A link is judged only after the hard-excluded names and .gitignore have
+//     let it through: an ignored or excluded link is never followed, and a
+//     gitignored *target* is not a reason to refuse one. Nothing is recorded
+//     for an entry the walk skips.
+//   - A link is followed only when its target resolves, its real path is
+//     inside the root's real path, and no component of that path below the
+//     root is a hard-excluded directory name. Anything else is refused and
+//     contributes nothing; the walk goes on.
+//   - A directory is entered through a link at most once, and never through a
+//     link once it has been entered at all; a directory reached without a
+//     link is always entered. Cycles therefore end: every ancestor of the
+//     current position has been entered.
+//   - An entry's identity is its real path: the followed link above it plus
+//     the suffix below that link, never the spelling it was reached by.
+//   - Every file appears once, keyed by its real path. Its spelling is the one
+//     with no followed link above it when the plain walk reaches it, and the
+//     first in walk order otherwise - sibling names never decide the identity
+//     of a file the plain walk reaches.
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -36,73 +48,80 @@ func canonicalizeProjectRoot(root string) string {
 	return real
 }
 
-// resolvedEntry is one directory entry a traversal was allowed to step
-// onto, with what it turned out to be once followed - see symlinkGuard's
-// own doc comment for `absPath`'s "as-reached, not canonical" rule.
-type resolvedEntry struct {
-	absPath string
-	isDir   bool
-	isFile  bool
-}
-
 // symlinkGuard is stateful: one instance belongs to exactly one traversal
-// and must not outlive it or be shared with another, the same contract
-// symlinks.ts's SymlinkGuard documents.
+// and must not outlive it or be shared with another.
 type symlinkGuard struct {
+	// projectRootReal is both the walk's root and its real path: the walk
+	// starts at the canonicalized root, so a path with no followed link
+	// above it is already real.
 	projectRootReal string
-	claimed         map[string]bool
+	// followed maps each followed link, as reached, to its real path.
+	followed map[string]string
+	// entered holds every directory entered, by real path. It is seeded
+	// with the root, which no entry check would otherwise cover, so a link
+	// back onto the root is refused like any other link onto an entered
+	// directory.
+	entered map[string]bool
 }
 
-// newSymlinkGuard seeds `claimed` with projectRootReal itself - the one
-// location no entry check would otherwise cover, since the root is never
-// some parent directory's os.DirEntry. Without this, a link pointing back
-// at the root (`sub/self -> ../..`) would be followed and the whole
-// project walked a second time underneath it.
 func newSymlinkGuard(projectRootReal string) *symlinkGuard {
 	return &symlinkGuard{
 		projectRootReal: projectRootReal,
-		claimed:         map[string]bool{projectRootReal: true},
+		followed:        map[string]string{},
+		entered:         map[string]bool{projectRootReal: true},
 	}
 }
 
-// resolve answers "may this traversal step onto entry of parentAbsDir?" -
-// the resolved entry, or nil when it must be skipped (a cycle, a second
-// path onto an already-claimed target, an escape from the project root, or
-// a dangling link).
-func (g *symlinkGuard) resolve(parentAbsDir string, entry os.DirEntry) *resolvedEntry {
-	absPath := filepath.Join(parentAbsDir, entry.Name())
-
-	if entry.Type()&os.ModeSymlink == 0 {
-		if g.claimed[absPath] {
-			return nil
-		}
-		g.claimed[absPath] = true
-		info, err := entry.Info()
-		if err != nil {
-			return nil // vanished between ReadDir and Info
-		}
-		return &resolvedEntry{absPath: absPath, isDir: info.IsDir(), isFile: info.Mode().IsRegular()}
+// realOf returns absPath's real path, and whether a followed link is above
+// it (or is it). With no link followed yet it is absPath itself, no lookup.
+func (g *symlinkGuard) realOf(absPath string) (string, bool) {
+	if len(g.followed) == 0 {
+		return absPath, false
 	}
+	for ancestor := absPath; ancestor != g.projectRootReal; {
+		if real, ok := g.followed[ancestor]; ok {
+			return real + absPath[len(ancestor):], true
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			break
+		}
+		ancestor = parent
+	}
+	return absPath, false
+}
 
+// enterDir records a directory reached without being a link itself. It is
+// always entered, even when its real path already was through a link: that
+// is what lets the plain spelling of an aliased file be seen and win.
+func (g *symlinkGuard) enterDir(absPath string) {
+	real, _ := g.realOf(absPath)
+	g.entered[real] = true
+}
+
+// admitLink answers whether the walk may follow the link at absPath, whose
+// followed target is a directory when isDir. It is called only for a link
+// the walk would otherwise step onto (not excluded, not ignored).
+func (g *symlinkGuard) admitLink(absPath string, isDir bool) bool {
 	real, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
-		return nil // dangling symlink
+		return false // dangling, or vanished since the caller's stat
 	}
-
 	rel, err := filepath.Rel(g.projectRootReal, real)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil // escapes the project root
+		return false // outside the project root
 	}
-	if g.claimed[real] {
-		return nil // cycle, or a second path onto an already-claimed target
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if hardExcludedDirs[part] {
+			return false // into a directory the walk never enters by name
+		}
 	}
-
-	// os.Stat follows the link - the "followed" answer, so a caller never
-	// has to know it was looking at one.
-	stat, err := os.Stat(absPath)
-	if err != nil {
-		return nil // vanished between EvalSymlinks and Stat
+	if isDir {
+		if g.entered[real] {
+			return false // an ancestor (a cycle), or a directory already walked
+		}
+		g.entered[real] = true
 	}
-	g.claimed[real] = true
-	return &resolvedEntry{absPath: absPath, isDir: stat.IsDir(), isFile: stat.Mode().IsRegular()}
+	g.followed[absPath] = real
+	return true
 }

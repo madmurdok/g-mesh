@@ -41,14 +41,10 @@ func TestWalkProjectFilesHonorsNestedGitignore(t *testing.T) {
 	}
 }
 
-// A directory reached both directly and through a symlink to it is walked
-// exactly once, under whichever path sibling order (sorted, so this is
-// deterministic) reaches its real location first - see symlinks.go's own
-// doc comment on newSymlinkGuard/resolve. "linked" sorts before "real"
-// alphabetically, so it claims real/'s content and "real" itself is then
-// refused as a second path onto an already-claimed location - the
-// documented trade-off, not a bug: the alternative (indexing the same
-// file twice, under two ids derived from two different paths) is worse.
+// A directory reached both directly and through a symlink to it yields each
+// file once, under its real spelling: the plain walk reaches real/, so its
+// spelling wins even though "linked" sorts first (symlinks.go's invariants,
+// docs/adr/0025-project-walk-follows-symlinks.md).
 func TestWalkProjectFilesFollowsSymlinkedDirectoryOnce(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink creation needs elevated privileges on Windows")
@@ -60,9 +56,9 @@ func TestWalkProjectFilesFollowsSymlinkedDirectoryOnce(t *testing.T) {
 	}
 
 	got := walkProjectFiles(root)
-	want := []string{"linked/pkg.go"}
+	want := []string{"real/pkg.go"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("walkProjectFiles = %v, want %v (linked/ sorts first and claims real/'s content; real/ is then a duplicate)", got, want)
+		t.Fatalf("walkProjectFiles = %v, want %v (the plain walk reaches real/, so its spelling wins over linked/)", got, want)
 	}
 }
 

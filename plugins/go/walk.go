@@ -1,9 +1,9 @@
 package main
 
 // The project walk: which .go files this plugin ever produces a node for.
-// Mirrors plugins/typescript/src/bulkIndex.ts's walkProjectFiles - gitignore
-// layering plus the hard-excluded-dirs set (ignore.go) and the symlink
-// guard (symlinks.go), combined the same way.
+// Gitignore layering plus the hard-excluded-dirs set (ignore.go) and the
+// symlink guard (symlinks.go), with the same link policy as the SDK's walk
+// (plugins/sdk/src/walk.rs).
 
 import (
 	"os"
@@ -27,13 +27,46 @@ func isGoFile(p string) bool {
 func walkProjectFiles(root string) []string {
 	real := canonicalizeProjectRoot(root)
 	guard := newSymlinkGuard(real)
-	var out []string
-	walkDir(real, real, nil, guard, &out)
+	var walked []string
+	walkDir(real, nil, guard, &walked)
+
+	// The winner pass: one spelling per real file. Walk order is
+	// depth-first over sorted entries, so "first" is deterministic; a
+	// spelling with no followed link above it replaces any earlier one.
+	type winner struct {
+		absPath string
+		viaLink bool
+	}
+	winners := map[string]winner{}
+	var order []string
+	for _, absPath := range walked {
+		realPath, viaLink := guard.realOf(absPath)
+		current, seen := winners[realPath]
+		if !seen {
+			order = append(order, realPath)
+		}
+		if !seen || (current.viaLink && !viaLink) {
+			winners[realPath] = winner{absPath: absPath, viaLink: viaLink}
+		}
+	}
+
+	out := make([]string, 0, len(order))
+	for _, realPath := range order {
+		rel, err := filepath.Rel(real, winners[realPath].absPath)
+		if err != nil {
+			continue
+		}
+		out = append(out, filepath.ToSlash(rel))
+	}
 	sort.Strings(out)
 	return out
 }
 
-func walkDir(root, dir string, layers []*gitignoreLayer, guard *symlinkGuard, out *[]string) {
+// walkDir appends to walked the absolute, as-reached path of every .go file
+// under dir the walk may yield, in walk order. A file reached through more
+// than one spelling is appended once per spelling; walkProjectFiles picks
+// the winner.
+func walkDir(dir string, layers []*gitignoreLayer, guard *symlinkGuard, walked *[]string) {
 	if layer := loadGitignoreLayer(dir); layer != nil {
 		// A fresh slice per directory level, never appending onto a
 		// parent's backing array: two sibling subdirectories must not
@@ -45,45 +78,83 @@ func walkDir(root, dir string, layers []*gitignoreLayer, guard *symlinkGuard, ou
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return // vanished/unreadable - nothing to yield, matches bulkIndex.ts
+		return // vanished/unreadable - nothing to yield
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 
 	for _, entry := range entries {
 		// By name, before anything is resolved: a hard-excluded name is
 		// excluded whatever it turns out to be, and settling that first
-		// also saves the guard's realpath call for it.
+		// also saves resolving it.
 		if hardExcludedDirs[entry.Name()] {
 			continue
 		}
 
-		resolved := guard.resolve(dir, entry)
-		if resolved == nil {
-			continue // cycle, duplicate real path, escapes root, or dangling
+		absPath := filepath.Join(dir, entry.Name())
+		isLink := entry.Type()&os.ModeSymlink != 0
+		var info os.FileInfo
+		if isLink {
+			// os.Stat follows the link: what it points at decides whether
+			// it is walked as a directory or read as a file.
+			info, err = os.Stat(absPath)
+		} else {
+			info, err = entry.Info()
 		}
+		if err != nil {
+			continue // a dangling link, or vanished since ReadDir
+		}
+		isDir := info.IsDir()
 
-		if resolved.isDir {
-			if isIgnoredByLayers(layers, resolved.absPath, true) {
-				continue
-			}
-			walkDir(root, resolved.absPath, layers, guard, out)
+		// Before the guard records anything: an ignored entry claims no
+		// real path, so an ignored directory can still be reached through
+		// a link to it whatever the two names sort as.
+		if isIgnoredByLayers(layers, absPath, isDir) {
 			continue
 		}
+		if isLink {
+			if !guard.admitLink(absPath, isDir) {
+				continue // cycle, entered directory, outside the root, excluded target
+			}
+		} else if isDir {
+			guard.enterDir(absPath)
+		}
 
-		if !resolved.isFile {
+		if isDir {
+			walkDir(absPath, layers, guard, walked)
+			continue
+		}
+		if !info.Mode().IsRegular() {
 			continue // neither file nor directory - a socket, device, fifo
 		}
-		if !isGoFile(resolved.absPath) {
+		if !isGoFile(absPath) {
 			continue
 		}
-		if isIgnoredByLayers(layers, resolved.absPath, false) {
-			continue
-		}
-
-		rel, err := filepath.Rel(root, resolved.absPath)
-		if err != nil {
-			continue
-		}
-		*out = append(*out, filepath.ToSlash(rel))
+		*walked = append(*walked, absPath)
 	}
+}
+
+// plainWalkReaches reports whether walkDir, started at rootReal, reaches the
+// .go file at rel (a root-relative path with no link in it) without following
+// a link: no component is a hard-excluded name or gitignored. The real
+// spelling of such a file is the one walkProjectFiles yields.
+func plainWalkReaches(rootReal, rel string) bool {
+	if !isGoFile(rel) {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	var layers []*gitignoreLayer
+	dir := rootReal
+	for i, part := range parts {
+		if layer := loadGitignoreLayer(dir); layer != nil {
+			layers = append(layers, layer)
+		}
+		if hardExcludedDirs[part] {
+			return false
+		}
+		dir = filepath.Join(dir, part)
+		if isIgnoredByLayers(layers, dir, i < len(parts)-1) {
+			return false
+		}
+	}
+	return true
 }
