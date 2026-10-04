@@ -293,6 +293,10 @@ bound too; Python's node row keeps the first `@overload`; the real-server
 containment test against a TypeScript server moves to GM-325, which installs
 that server in CI; ADR 0024 is written in S2.
 
+As built: a receiver call that already carries `replaces` is not bound. Only
+the Rust plugin emits such sites today, and Rust has no overloading, so no
+call that the review meant to bind is affected; ADR 0024 records the limit.
+
 ## Appendix: g-mesh calls behind the cross-file claims
 
 - `find_references(symbol_id = graph::EdgeSpec.to_declaration)`:

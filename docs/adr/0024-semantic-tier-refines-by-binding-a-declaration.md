@@ -63,7 +63,11 @@ both bound and unbound).
   not apply to refinement, since its answer always lands on the structural
   target, and R3 never drops a bound edge.
 - An untyped receiver call whose answer lands on an overload set is bound the
-  same way, and keeps its plain edge when it cannot be bound.
+  same way, and keeps its plain edge when it cannot be bound. A receiver call
+  that already carries a structural guess (`replaces`, emitted today only by
+  the Rust plugin, which has no overloading) is not bound: it keeps that edge.
+  A plugin with overloads that starts guessing receiver targets has to lift
+  this limit.
 - The pyright path depends on prose. A pyright upgrade that changes its printer
   turns bindings into unbound calls, not into wrong ones, and the real-server
   test makes that drift a red test.
