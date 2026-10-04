@@ -177,8 +177,8 @@ fn p4_named(list: &str) -> String {
 }
 
 /// Used when [`p4_named`] exceeds [`INSTRUCTIONS_BYTE_CEILING`]: a generic
-/// sentence plus "check which", never a list truncated mid-name, and no
-/// pointer to a response field (none carries this fact yet).
+/// sentence plus "check which", never a list truncated mid-name; it points at
+/// the per-page `unlinkedUsages`/`untypedReceiverCalls` fields instead.
 fn p4_fallback() -> String {
     "The one legitimate reason to grep afterward: a method call through a variable \
      receiver (`x.foo()`) may produce no edge in some of this project's languages - a \
