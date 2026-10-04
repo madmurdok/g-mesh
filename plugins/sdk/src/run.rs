@@ -250,6 +250,7 @@ fn control_plane<E: Extractor>(
         extractor,
         spec,
         root: root.to_path_buf(),
+        root_real: std::fs::canonicalize(root).ok(),
         project: None,
         index: SdkIndex::new(),
         engine: LazyEngine::new(&spec.language, semantic),
@@ -353,6 +354,11 @@ struct Session<'a, E: Extractor> {
     extractor: &'a E,
     spec: &'a ResolvedSpec,
     root: PathBuf,
+    /// `root` resolved through every link, taken once when the session starts
+    /// (a root moved or relinked under a running plugin is not followed).
+    /// `None` when it could not be resolved, which turns off the event remap
+    /// in [`Session::indexed_spelling`] and nothing else.
+    root_real: Option<PathBuf>,
     /// `None` while the project model could not be built. Unlike the bulk
     /// walk, this is not fatal: a plugin that stops answering `fileChanged`
     /// leaves its language's whole index frozen at whatever it was, which is
@@ -526,6 +532,8 @@ impl<E: Extractor> Session<'_, E> {
 
     /// Reparses one file against what this process last saw of it.
     fn file_changed(&mut self, path: &RelPath) -> FileChangeDiff {
+        let remapped = self.indexed_spelling(path);
+        let path = remapped.as_ref().unwrap_or(path);
         if !self.claims(path) {
             eprintln!("[{}] ignoring {path}: this plugin does not claim its extension", self.spec.language);
             return FileChangeDiff::default();
@@ -567,6 +575,30 @@ impl<E: Extractor> Session<'_, E> {
         let diff = diff_file(self.index.baseline(path), &graph);
         self.index.insert(path.clone(), source, graph);
         diff
+    }
+
+    /// The real spelling `path` is indexed under, when `path` reaches that
+    /// file through an in-root link; `None` means handle `path` as spelled.
+    ///
+    /// The walk indexes a file reachable two ways under its real spelling
+    /// (`docs/adr/0025-project-walk-follows-symlinks.md`), but the OS may
+    /// report an edit under either spelling (inotify shares one watch per
+    /// inode). Handling the link spelling as written would index the file a
+    /// second time beside a baseline that never updates. Invariants:
+    /// - remapped only when the index already holds the real spelling, so a
+    ///   file the walk indexed under a link spelling (reachable only through
+    ///   links) is still handled as that spelling;
+    /// - a path resolving outside the root is never remapped: the walk
+    ///   refuses such links, so nothing under that spelling is indexed;
+    /// - a path that no longer resolves (deleted, dangling) is handled as
+    ///   spelled, so its deletion reaches the entry it names.
+    ///
+    /// One `canonicalize` per event.
+    fn indexed_spelling(&self, path: &RelPath) -> Option<RelPath> {
+        let root_real = self.root_real.as_ref()?;
+        let real = std::fs::canonicalize(path.to_absolute(&self.root)).ok()?;
+        let real = RelPath::relative_to(root_real, &real)?;
+        (real != *path && self.index.entry(&real).is_some()).then_some(real)
     }
 
     fn claims(&self, path: &RelPath) -> bool {
@@ -874,6 +906,7 @@ mod tests {
             extractor: &Nothing,
             spec: &spec,
             root: root.clone(),
+            root_real: None,
             project: None,
             index: SdkIndex::new(),
             engine: LazyEngine::new("toy", Some(factory)),
@@ -950,6 +983,7 @@ mod tests {
             extractor: &Nothing,
             spec: &spec,
             root: PathBuf::from("/projects/toy"),
+            root_real: None,
             project: None,
             index: SdkIndex::new(),
             engine: LazyEngine::new("toy", Some(factory)),
@@ -1084,6 +1118,7 @@ mod tests {
             extractor: &Declares,
             spec,
             root: root.to_path_buf(),
+            root_real: std::fs::canonicalize(root).ok(),
             project: None,
             index: SdkIndex::new(),
             engine: LazyEngine::new("toy", Some(factory)),
@@ -1186,5 +1221,123 @@ mod tests {
         assert!(diff.complete, "a deletion of a hydrated file replaces all core holds for it: {diff:#?}");
         assert!(diff.upsert_nodes.is_empty(), "{diff:#?}");
         assert!(session.index.entry(&RelPath::new("b.toy")).is_none());
+    }
+
+    // `Session::indexed_spelling` remaps a `fileChanged` spelled through an
+    // in-root link onto the real spelling the index holds
+    // (docs/adr/0025-project-walk-follows-symlinks.md). B9 and S7-* name the
+    // behaviours in docs/architecture/gm-349-sdk-walk-symlinks.md.
+
+    /// `fileChanged` for `path`, answered.
+    fn file_changed(session: &mut Session<'_, Declares>, path: &str) -> FileChangeDiff {
+        serde_json::from_value(request(session, "fileChanged", serde_json::json!({ "filePath": path })))
+            .unwrap()
+    }
+
+    /// The distinct `file_path`s of the nodes `diff` upserts, sorted.
+    fn upserted_paths(diff: &FileChangeDiff) -> Vec<String> {
+        let mut paths: Vec<String> = diff.upsert_nodes.iter().map(|node| node.file_path.clone()).collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// A [`Project`] holding `real/a.toy`, with `alias -> real`.
+    #[cfg(unix)]
+    fn aliased_project(tag: &str) -> Project {
+        let project = Project::new(tag, &[]);
+        std::fs::create_dir_all(project.0.join("real")).unwrap();
+        std::fs::write(project.0.join("real/a.toy"), "a v1\n").unwrap();
+        std::os::unix::fs::symlink("real", project.0.join("alias")).unwrap();
+        project
+    }
+
+    /// B9 / S7-a: an edit reported under the link spelling of an indexed
+    /// file updates the real spelling's entry and adds no second one; the
+    /// same text again under the alias is the ordinary unchanged short-cut.
+    ///
+    /// Control: make `indexed_spelling` return `None` -> the diff's nodes
+    /// are under `alias/a.toy`, the index gains that entry, and the resend
+    /// is not empty.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_spelled_event_for_an_indexed_file_updates_its_real_spelling() {
+        let project = aliased_project("remap");
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+        file_changed(&mut session, "real/a.toy");
+        std::fs::write(project.0.join("real/a.toy"), "a v2\n").unwrap();
+
+        let diff = file_changed(&mut session, "alias/a.toy");
+        assert_eq!(upserted_paths(&diff), vec!["real/a.toy"], "the edit is news, under the real spelling");
+        assert_eq!(session.index.paths(), vec![RelPath::new("real/a.toy")], "no second entry");
+
+        let again = file_changed(&mut session, "alias/a.toy");
+        assert!(crate::is_empty_diff(&again), "unchanged text under the alias: {again:#?}");
+    }
+
+    /// S7-b: a file indexed only under a link spelling (its real spelling is
+    /// not in the index) is handled as spelled.
+    ///
+    /// Control: drop the `self.index.entry(&real).is_some()` condition in
+    /// `indexed_spelling` -> the nodes and the entry are under `real/a.toy`.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_spelled_event_for_a_file_not_indexed_by_its_real_spelling_is_handled_as_spelled() {
+        let project = aliased_project("remap-alias-only");
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+
+        let diff = file_changed(&mut session, "alias/a.toy");
+        assert_eq!(upserted_paths(&diff), vec!["alias/a.toy"], "{diff:#?}");
+        assert_eq!(session.index.paths(), vec![RelPath::new("alias/a.toy")]);
+    }
+
+    /// S7-c: a path through a link resolving outside the root is handled as
+    /// spelled.
+    ///
+    /// Control: in `indexed_spelling`, fall back to the absolute real path
+    /// when `RelPath::relative_to(root_real, ..)` fails, and drop the indexed
+    /// check -> the event lands under an absolute spelling, not `ext/a.toy`.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_spelled_event_resolving_outside_the_root_is_handled_as_spelled() {
+        let outside = Project::new("remap-outside-target", &[("a.toy", "a v1\n")]);
+        let project = Project::new("remap-outside", &[]);
+        std::os::unix::fs::symlink(&outside.0, project.0.join("ext")).unwrap();
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+
+        let diff = file_changed(&mut session, "ext/a.toy");
+        assert_eq!(upserted_paths(&diff), vec!["ext/a.toy"], "{diff:#?}");
+        assert_eq!(session.index.paths(), vec![RelPath::new("ext/a.toy")]);
+    }
+
+    /// S7-d: a path that no longer resolves is handled as spelled, so the
+    /// deletion reaches the entry it names - here the link spelling, with the
+    /// real spelling indexed too.
+    ///
+    /// Control: make `indexed_spelling` resolve a missing file through its
+    /// parent (`canonicalize(parent).join(file_name)`) -> the deletion
+    /// removes `real/a.toy` and leaves `alias/a.toy`.
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_path_is_handled_as_spelled() {
+        let project = aliased_project("remap-deleted");
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+        // Alias first: its real spelling is not indexed yet, so both are.
+        file_changed(&mut session, "alias/a.toy");
+        file_changed(&mut session, "real/a.toy");
+        assert_eq!(session.index.paths(), vec![RelPath::new("alias/a.toy"), RelPath::new("real/a.toy")]);
+        std::fs::remove_file(project.0.join("real/a.toy")).unwrap();
+
+        let diff = file_changed(&mut session, "alias/a.toy");
+        assert!(!diff.delete_node_ids.is_empty(), "a deletion: {diff:#?}");
+        assert_eq!(session.index.paths(), vec![RelPath::new("real/a.toy")], "the alias entry went");
     }
 }

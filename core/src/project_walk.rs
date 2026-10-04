@@ -11,7 +11,10 @@
 //! their own processes: each directory's own `.gitignore` and nothing else,
 //! [`BASELINE_EXCLUDED_DIRS`] plus the caller's directory names pruned at any
 //! depth. It diverges only toward doing less (no symlinks followed, unreadable
-//! entries skipped).
+//! entries skipped). The plugins do follow links, but list a file the plain
+//! walk reaches under its direct spelling, so the one difference is files
+//! reachable only through a link, which this walk does not see
+//! ([ADR 0025](../../docs/adr/0025-project-walk-follows-symlinks.md)).
 
 use std::path::{Path, PathBuf};
 
