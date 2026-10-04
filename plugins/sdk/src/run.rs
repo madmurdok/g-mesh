@@ -1468,7 +1468,8 @@ mod presence_tests {
     /// exist: built by `load_project` from the walk, kept by the hook. A
     /// line `import X` extracts to `X=resolved` in the file's signature when
     /// `X` is in the set, `X=unresolved` otherwise. Every hook call and
-    /// every extraction is recorded; the hook panics on `panic.toy`.
+    /// every extraction is recorded; the hook panics on `panic.toy`, the
+    /// extraction on a source containing `panic-extract`.
     #[derive(Default)]
     struct Presence {
         hooked: Mutex<Vec<(String, bool)>>,
@@ -1491,6 +1492,7 @@ mod presence_tests {
             use g_mesh_wire::{NodeKind, Position, Range};
 
             self.extracted.lock().unwrap().push(path.as_str().to_string());
+            assert!(!source.contains("panic-extract"), "the test extractor panics on panic-extract");
             let imports: Vec<String> = source
                 .lines()
                 .filter_map(|line| line.strip_prefix("import "))
@@ -1681,6 +1683,67 @@ mod presence_tests {
         root.write("a.toy", "import b.toy\n");
         let deleted = file_changed(&mut session, "a.toy");
         assert_eq!(signature_of(&deleted, "a"), "b.toy=unresolved", "{deleted:#?}");
+    }
+
+    /// 11a: the hook runs before extracting the *same* file: a new file
+    /// that imports itself, never announced by `filesCreated`, resolves the
+    /// import on its own `fileChanged`.
+    ///
+    /// Control (C4a): move `self.presence_changed(path, source.is_some())` in
+    /// `Session::file_changed` after `extract_caught` -> `c` is not in the
+    /// model while it is extracted, so `c.toy=unresolved`.
+    #[test]
+    fn file_changed_applies_presence_before_extracting_the_same_file() {
+        let root = Root::new("self-import");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("c.toy", "import c.toy\n");
+
+        let c = file_changed(&mut session, "c.toy");
+
+        assert_eq!(signature_of(&c, "c"), "c.toy=resolved", "{c:#?}");
+    }
+
+    /// 11b (design D5, "before the unchanged-text short-circuit"): a
+    /// `fileChanged` whose text matches the reported entry extracts nothing
+    /// but still calls the hook.
+    ///
+    /// Control (C4a, or moving the hook below the short-circuit): the second
+    /// `fileChanged` returns before the hook -> `b` is hooked once.
+    #[test]
+    fn an_unchanged_file_changed_still_applies_presence() {
+        let root = Root::new("short-circuit");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("b.toy", "\n");
+
+        file_changed(&mut session, "b.toy");
+        let unchanged = file_changed(&mut session, "b.toy");
+
+        assert_eq!(unchanged, FileChangeDiff::default(), "unchanged text is short-circuited");
+        assert_eq!(*extractor.extracted.lock().unwrap(), vec!["b.toy"], "extracted once");
+        assert_eq!(hooked(&extractor), vec![("b.toy".to_string(), true), ("b.toy".to_string(), true)]);
+    }
+
+    /// 11c: a file whose extraction fails is still applied as present, so its
+    /// importers resolve although it has no graph yet.
+    ///
+    /// Control (C4a): the failed extraction returns before the hook -> `b`
+    /// is never hooked and `a.toy`'s import stays unresolved.
+    #[test]
+    fn a_file_whose_extraction_fails_is_still_applied_as_present() {
+        let root = Root::new("extract-fails");
+        let (extractor, spec) = (Presence::default(), toy_spec());
+        let mut session = started(&extractor, &spec, &root.0);
+        root.write("b.toy", "panic-extract\n");
+        root.write("a.toy", "import b.toy\n");
+
+        let b = file_changed(&mut session, "b.toy");
+        let a = file_changed(&mut session, "a.toy");
+
+        assert_eq!(b, FileChangeDiff::default(), "a failed extraction sends nothing");
+        assert_eq!(hooked(&extractor)[0], ("b.toy".to_string(), true));
+        assert_eq!(signature_of(&a, "a"), "b.toy=resolved", "{a:#?}");
     }
 
     /// 12: a listed path that is no longer on disk (or is not UTF-8, which

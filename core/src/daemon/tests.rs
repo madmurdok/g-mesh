@@ -792,10 +792,16 @@ fn workspace_excluded_and_failed_language_files_are_not_announced() {
 }
 
 /// 6: created files of two languages are announced per language, each with
-/// only its own paths, languages in sorted order.
+/// only its own paths, and each plugin receives its announcement before the
+/// `fileChanged` of its own creations. The order *across* the two plugins is
+/// not asserted: each is a separate process appending to the shared frame log
+/// when it reads a fire-and-forget notification, so that order is the
+/// scheduler's, not core's.
 ///
-/// Control: send the whole created list to every running language in
-/// `announce_created` -> each line names all four paths.
+/// Controls: send the whole created list to every running language in
+/// `announce_created` -> each line names all four paths; announce after
+/// routing the batch's creations -> a plugin's `filesCreated` follows its
+/// `fileChanged` frames.
 #[test]
 fn created_files_of_two_languages_are_announced_per_language() {
     let (project, plugins, dirs, registry) = declaring_registry(&["python", "rust"]);
@@ -817,7 +823,12 @@ fn created_files_of_two_languages_are_announced_per_language() {
     assert_eq!(rust.len(), 1, "{rust:?}");
     assert_eq!(announced_paths(&python[0]), vec!["p1.python-src", "p2.python-src"]);
     assert_eq!(announced_paths(&rust[0]), vec!["r1.rust-src", "r2.rust-src"]);
-    let announcements: Vec<String> =
-        routing_frames(plugins.path()).into_iter().filter(|frame| frame.ends_with(" filesCreated")).collect();
-    assert_eq!(announcements, vec!["python filesCreated", "rust filesCreated"]);
+    let frames = routing_frames(plugins.path());
+    for language in ["python", "rust"] {
+        let own: Vec<&str> = frames
+            .iter()
+            .filter_map(|frame| frame.strip_prefix(language).and_then(|rest| rest.strip_prefix(' ')))
+            .collect();
+        assert_eq!(own, vec!["filesCreated", "fileChanged", "fileChanged"], "{language}: {frames:?}");
+    }
 }
