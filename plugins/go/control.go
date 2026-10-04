@@ -322,6 +322,19 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 		state.reloadWorkspace()
 		return
 
+	case "filesCreated":
+		// The structural tier never asks the disk whether a file exists
+		// (imports resolve to packages through the module layout), so there
+		// is no model to update. A request still gets its ack - core waits
+		// on it - even when the params are malformed; a notification gets
+		// nothing.
+		var params filePathsParams
+		if err := json.Unmarshal(env.Params, &params); err != nil {
+			logf("malformed filesCreated params: %v", err)
+		} else {
+			logf("files created: %d file(s)", len(params.FilePaths))
+		}
+
 	case "status":
 		logf("status requested")
 
