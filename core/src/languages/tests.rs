@@ -209,3 +209,112 @@ fn a_fifth_language_works_through_every_lookup_as_one_more_entry() {
     assert!(!languages(&missing_in(&table, &found)).contains(&"zig"));
     assert_eq!(absent_for_path_in(&table, &found, "src/main.zig"), None);
 }
+
+// ---------------------------------------------------------------------
+// count_absent_files (ADR 0021, section 3)
+// ---------------------------------------------------------------------
+
+/// Discovery over one manifest per `(language, extensions, exclude_dirs)`.
+fn discovered_with_excludes(plugins: &[(&str, &[&str], &[&str])]) -> DiscoveredPlugins {
+    let bodies: Vec<(String, String)> = plugins
+        .iter()
+        .map(|(language, extensions, exclude_dirs)| {
+            let excludes = exclude_dirs.iter().map(|dir| format!("\"{dir}\"")).collect::<Vec<_>>().join(", ");
+            let body = format!(
+                "{}\n[plugin.workspace]\nexclude_dirs = [{excludes}]\n",
+                manifest_toml(language, "0.0.1", extensions)
+            );
+            (language.to_string(), body)
+        })
+        .collect();
+    let pairs: Vec<(&str, &str)> = bodies.iter().map(|(dir, body)| (dir.as_str(), body.as_str())).collect();
+    let (_guard, root) = discovery_root(&pairs);
+    discover(&[root]).expect("fixture plugins must be discoverable")
+}
+
+fn project_with(files: &[&str]) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    for rel in files {
+        let path = root.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "x").unwrap();
+    }
+    root
+}
+
+/// The absent language's own `exclude_dirs` apply (`.venv/x.py` is not
+/// counted), another language's do not (TypeScript's `dist` does not hide
+/// `dist/app.py` from an absent Python), and `.gitignore` is honoured.
+///
+/// Controls: in `count_absent_files_in`, drop the per-language
+/// `under_excluded_dir` check and prune nothing - `.venv/x.py` and
+/// `__pycache__/c.py` are counted (4 -> 6); prune the union of the
+/// *discovered* manifests' `exclude_dirs` instead of the absent entries' -
+/// both `dist/` files are hidden (-> 2); build the walker with `.git_ignore(false)`
+/// in `project_walk::project_files` - `ignored/y.py` is counted (-> 5).
+#[test]
+fn the_absent_count_honours_the_absent_languages_own_excludes_and_gitignore_only() {
+    let project = project_with(&[
+        "app.py",
+        "pkg/mod.pyi",
+        "dist/app.py",
+        "deep/dist/more.py",
+        ".venv/lib/x.py",
+        "src/__pycache__/c.py",
+        "ignored/y.py",
+        "web/index.ts",
+        "dist/bundle.ts",
+    ]);
+    std::fs::write(project.path().join(".gitignore"), "ignored/\n").unwrap();
+    let discovered = discovered_with_excludes(&[("typescript", &[".ts"], &["dist", "node_modules"])]);
+
+    let counts = count_absent_files(project.path(), &discovered);
+
+    assert_eq!(counts, BTreeMap::from([("python", 4)]));
+}
+
+/// A file whose extension a discovered manifest claims is that plugin's, not
+/// the absent catalogue language's - even when the catalogue says the
+/// extension is Python's.
+///
+/// Control: in `count_absent_files_in`, classify by
+/// `entry_for_path_in` alone (skip `absent_for_path_in`'s discovered-manifest
+/// check) - `snake.py` counts for Python (-> 2).
+#[test]
+fn an_extension_a_discovered_manifest_claims_is_not_counted_as_absent() {
+    let project = project_with(&["snake.py", "stub.pyi", "main.go"]);
+    let discovered = discovered_with_excludes(&[("snake", &[".py"], &[])]);
+
+    let counts = count_absent_files(project.path(), &discovered);
+
+    assert_eq!(counts, BTreeMap::from([("go", 1), ("python", 1)]));
+}
+
+/// Only absent languages are counted: a discovered language's files come
+/// from the index, never from this walk.
+///
+/// Control: count every catalogue entry (`table.iter()` instead of
+/// `missing_in`) - `python` appears with 1.
+#[test]
+fn a_discovered_languages_files_are_not_counted() {
+    let project = project_with(&["app.py", "lib.rs"]);
+    let discovered = discovered_with_excludes(&[("python", &[".py", ".pyi"], &[])]);
+
+    let counts = count_absent_files(project.path(), &discovered);
+
+    assert_eq!(counts, BTreeMap::from([("rust", 1)]));
+}
+
+/// With every catalogue language discovered there is nothing to count.
+#[test]
+fn nothing_is_counted_when_every_catalogue_plugin_is_discovered() {
+    let project = project_with(&["app.py", "lib.rs", "main.go", "index.ts"]);
+    let discovered = discovered_with_excludes(&[
+        ("typescript", &[".ts"], &[]),
+        ("python", &[".py"], &[]),
+        ("rust", &[".rs"], &[]),
+        ("go", &[".go"], &[]),
+    ]);
+
+    assert!(count_absent_files(project.path(), &discovered).is_empty());
+}

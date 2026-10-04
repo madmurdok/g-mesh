@@ -760,4 +760,319 @@ mod tests {
         assert_eq!(summary, BulkIndexSummary::default());
         assert_eq!(count(&conn, "nodes"), 0);
     }
+
+    // -----------------------------------------------------------------
+    // Per-language outcome (ADR 0021): one failed language costs only
+    // itself, and the walk fails only when every discovered one failed.
+    // -----------------------------------------------------------------
+
+    use crate::daemon::test_plugin;
+    use crate::languages::LanguageOutcome;
+
+    /// One NDJSON node line in the fake plugins' wire shape.
+    fn node_of(id: &str, kind: &str, file_path: &str, language: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "kind": kind,
+            "name": id,
+            "qualifiedName": id,
+            "filePath": file_path,
+            "range": { "start": { "line": 0, "col": 0 }, "end": { "line": 1, "col": 0 } },
+            "visibility": "public",
+            "language": language,
+        })
+        .to_string()
+    }
+
+    /// One NDJSON `CALLS` edge line.
+    fn calls_edge(id: &str, from: &str, to: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "fromId": from,
+            "toId": to,
+            "kind": "CALLS",
+            "source": "syntactic",
+            "engine": "tree-sitter",
+            "resolved": true,
+        })
+        .to_string()
+    }
+
+    /// A good language's stream: two files, a function in each, and a call
+    /// from the first file's function to the second's.
+    fn two_file_stream(language: &str, ext: &str) -> Vec<String> {
+        let a = format!("src/a{ext}");
+        let b = format!("src/b{ext}");
+        vec![
+            node_of(&format!("file:{a}"), "File", &a, language),
+            node_of(&format!("{language}-f1"), "Function", &a, language),
+            node_of(&format!("file:{b}"), "File", &b, language),
+            node_of(&format!("{language}-f2"), "Function", &b, language),
+            calls_edge(&format!("{language}-call"), &format!("{language}-f1"), &format!("{language}-f2")),
+        ]
+    }
+
+    /// Writes `rel` under `root` with an mtime an hour back, so the walk's
+    /// staleness baseline (which skips files modified just before the walk)
+    /// records it and `indexed_files` shows which files the walk kept.
+    fn write_old_file(root: &Path, rel: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "x").unwrap();
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(an_hour_ago).unwrap();
+    }
+
+    fn scalar(conn: &IndexStore, sql: &str) -> i64 {
+        conn.lock().unwrap().query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn recorded_outcomes(conn: &IndexStore) -> Vec<(String, LanguageOutcome)> {
+        schema::language_outcomes(&conn.lock().unwrap()).unwrap()
+    }
+
+    /// Removes a fake plugin's entry point: the "binary" of a node-launched
+    /// plugin, so its spawn fails the way a never-built plugin's does.
+    fn remove_entry_point(plugin_dir: &Path) -> std::path::PathBuf {
+        let entry = plugin_dir.join("plugin.js");
+        std::fs::remove_file(&entry).unwrap();
+        entry
+    }
+
+    fn discover_root(plugins: &Path) -> DiscoveredPlugins {
+        crate::daemon::manifest::discover(&[plugins.to_path_buf()])
+            .expect("the fixture plugins must discover")
+    }
+
+    /// The acceptance criterion's core: with one of two plugins' binaries
+    /// gone, the walk is `Ok`, the good language is indexed and queryable,
+    /// and the other is `Failed` with an error naming what is missing.
+    ///
+    /// Control: restore the abort-on-first-failure loop in
+    /// `run_with_progress` (`walk_one_language(..)?` with no purge/record) -
+    /// the walk returns `Err` and the `expect` below fails. Walking `beta`
+    /// before `alpha` is not needed: the old loop aborted on `beta` whichever
+    /// order, and `alpha`'s rows alone could not make it `Ok`.
+    #[test]
+    fn a_missing_plugin_binary_costs_only_its_own_language() {
+        let project = tempfile::tempdir().unwrap();
+        let plugins = tempfile::tempdir().unwrap();
+        test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
+        let beta = test_plugin::install(plugins.path(), "beta", &[".beta-src"]);
+        let missing = remove_entry_point(&beta);
+        test_plugin::set_bulk_stream(project.path(), "alpha", &two_file_stream("alpha", ".alpha-src"), 0);
+        let discovered = discover_root(plugins.path());
+        let conn = setup_conn();
+
+        let summary = run(project.path(), &conn, None, &discovered)
+            .expect("one failed language must not fail the whole walk");
+
+        assert_eq!(summary.outcomes.get("alpha"), Some(&LanguageOutcome::Indexed { files: 2 }));
+        match summary.outcomes.get("beta") {
+            // The manifest's `./plugin.js` is joined onto its directory as
+            // written, so the path is matched as its directory plus file name.
+            Some(LanguageOutcome::Failed { error }) => assert!(
+                error.contains(&beta.display().to_string())
+                    && error.contains("plugin.js")
+                    && error.contains("does not exist"),
+                "beta's error must name the missing entry point {}: {error}",
+                missing.display()
+            ),
+            other => panic!("beta must be Failed, got {other:?}"),
+        }
+        assert_eq!(summary.outcomes.len(), 2, "only discovered languages, no absent catalogue ones");
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM nodes WHERE language = 'alpha' AND kind = 'Function'"),
+            2,
+            "the good language's symbols must be in the index"
+        );
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM edges WHERE id = 'alpha-call'"), 1);
+        assert_eq!(
+            recorded_outcomes(&conn),
+            vec![
+                ("alpha".to_string(), LanguageOutcome::Indexed { files: 2 }),
+                ("beta".to_string(), summary.outcomes["beta"].clone()),
+            ],
+            "the outcome must be persisted for a later session"
+        );
+    }
+
+    /// Every discovered plugin missing: `Err` naming each language, and the
+    /// outcome rows are still written, so a `Phase::Failed` session can say
+    /// why.
+    ///
+    /// Controls: compute `all_failed` as `false` (or drop the bail) - the
+    /// walk returns `Ok` and `expect_err` fails; move the
+    /// `record_language_outcomes` call after the bail - no rows, and the
+    /// row assertion fails.
+    #[test]
+    fn every_discovered_plugin_missing_fails_the_walk_and_still_records_each_failure() {
+        let project = tempfile::tempdir().unwrap();
+        let plugins = tempfile::tempdir().unwrap();
+        let alpha = test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
+        let beta = test_plugin::install(plugins.path(), "beta", &[".beta-src"]);
+        remove_entry_point(&alpha);
+        remove_entry_point(&beta);
+        let discovered = discover_root(plugins.path());
+        let conn = setup_conn();
+
+        let err = run(project.path(), &conn, None, &discovered)
+            .expect_err("a walk where every discovered language failed is an error");
+        let message = format!("{err:#}");
+        for language in ["alpha", "beta"] {
+            assert!(message.contains(language), "the error must name {language}: {message}");
+        }
+
+        let rows = recorded_outcomes(&conn);
+        assert_eq!(rows.len(), 2, "both failures must be recorded: {rows:?}");
+        for (_, outcome) in &rows {
+            assert!(matches!(outcome, LanguageOutcome::Failed { .. }), "{rows:?}");
+        }
+    }
+
+    /// An absent catalogue language never rescues an all-failed walk: the
+    /// all-failed test is over discovered languages only.
+    ///
+    /// Control: compute `all_failed` over every outcome
+    /// (`summary.outcomes.values().all(Failed)`) - python's `PluginAbsent`
+    /// makes it false and the walk returns `Ok`.
+    #[test]
+    fn an_absent_language_with_files_does_not_prevent_the_all_failed_error() {
+        let project = tempfile::tempdir().unwrap();
+        let plugins = tempfile::tempdir().unwrap();
+        let alpha = test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
+        remove_entry_point(&alpha);
+        write_old_file(project.path(), "app.py");
+        let discovered = discover_root(plugins.path());
+        let conn = setup_conn();
+
+        run(project.path(), &conn, None, &discovered)
+            .expect_err("every discovered language failed; python having no plugin changes nothing");
+        let rows = recorded_outcomes(&conn);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            matches!(&rows[0], (language, LanguageOutcome::Failed { .. }) if language == "alpha"),
+            "{rows:?}"
+        );
+        assert_eq!(rows[1], ("python".to_string(), LanguageOutcome::PluginAbsent { files: Some(1) }));
+    }
+
+    /// No plugin discovered at all, `.py` files present: `Ok`, an empty
+    /// graph, and Python's file count as a `PluginAbsent` outcome, persisted.
+    ///
+    /// Control: skip the count (`count_absent = false`) - no outcome, and the
+    /// equality fails.
+    #[test]
+    fn zero_discovered_plugins_with_python_files_is_ok_with_python_absent_and_counted() {
+        let project = tempfile::tempdir().unwrap();
+        write_old_file(project.path(), "app.py");
+        write_old_file(project.path(), "pkg/mod.pyi");
+        let conn = setup_conn();
+
+        let summary = run(project.path(), &conn, None, &DiscoveredPlugins::default())
+            .expect("zero discovered plugins is not an error");
+
+        assert_eq!(count(&conn, "nodes"), 0);
+        let expected =
+            BTreeMap::from([("python".to_string(), LanguageOutcome::PluginAbsent { files: Some(2) })]);
+        assert_eq!(summary.outcomes, expected);
+        assert_eq!(recorded_outcomes(&conn), expected.into_iter().collect::<Vec<_>>());
+    }
+
+    /// No plugin discovered and no file any catalogue language claims: no
+    /// outcome at all - a catalogue language with no files is not
+    /// `PluginAbsent`.
+    ///
+    /// Control: insert `PluginAbsent { files: None }` for every
+    /// `languages::missing` entry rather than only counted ones - four rows
+    /// appear.
+    #[test]
+    fn zero_discovered_plugins_and_no_catalogue_files_records_no_outcome() {
+        let project = tempfile::tempdir().unwrap();
+        write_old_file(project.path(), "README.md");
+        let conn = setup_conn();
+
+        let summary = run(project.path(), &conn, None, &DiscoveredPlugins::default()).unwrap();
+
+        assert!(summary.outcomes.is_empty(), "{:?}", summary.outcomes);
+        assert!(recorded_outcomes(&conn).is_empty());
+    }
+
+    /// A plugin that streams part of its language and then exits non-zero
+    /// leaves nothing of that language behind: no node, no `indexed_files`
+    /// baseline, not counted in the summary; the walk completes, the
+    /// project-wide `bulkIndexedAt` roll-up fires (the failed language is
+    /// not "present"), and the good language's cross-file call is intact.
+    ///
+    /// Controls: drop the `purge_language` call - beta's nodes remain and
+    /// the roll-up stays unset (beta is present without its own
+    /// `bulkIndexedAt`); drop `ctx.walked_files = walked_before` - beta's
+    /// files get `indexed_files` rows; drop the summary-count restore -
+    /// `summary.nodes` includes beta's.
+    #[test]
+    fn a_plugin_that_fails_mid_stream_has_its_committed_rows_purged() {
+        let project = tempfile::tempdir().unwrap();
+        let plugins = tempfile::tempdir().unwrap();
+        test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
+        test_plugin::install(plugins.path(), "beta", &[".beta-src"]);
+        for rel in ["src/a.alpha-src", "src/b.alpha-src", "src/a.beta-src", "src/b.beta-src"] {
+            write_old_file(project.path(), rel);
+        }
+        test_plugin::set_bulk_stream(project.path(), "alpha", &two_file_stream("alpha", ".alpha-src"), 0);
+        // Enough lines for beta to have committed rows before it fails: more
+        // than one batch, so the purge has real rows to remove.
+        let mut beta_stream = two_file_stream("beta", ".beta-src");
+        for n in 0..(BATCH_ITEMS + 10) {
+            beta_stream.push(node_of(&format!("beta-extra-{n}"), "Function", "src/b.beta-src", "beta"));
+        }
+        test_plugin::set_bulk_stream(project.path(), "beta", &beta_stream, 3);
+        let discovered = discover_root(plugins.path());
+        let conn = setup_conn();
+        schema::ensure_current(&conn.lock().unwrap(), "test-generation").unwrap();
+
+        let summary =
+            run(project.path(), &conn, None, &discovered).expect("one failed language is not fatal");
+
+        match summary.outcomes.get("beta") {
+            Some(LanguageOutcome::Failed { error }) => {
+                assert!(error.contains("exited"), "beta's error must say it exited non-zero: {error}")
+            }
+            other => panic!("beta must be Failed, got {other:?}"),
+        }
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM nodes WHERE language = 'beta'"),
+            0,
+            "no beta node may remain"
+        );
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM nodes WHERE filePath LIKE '%.beta-src'"), 0);
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM indexed_files WHERE filePath LIKE '%.beta-src'"), 0);
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM indexed_files WHERE filePath LIKE '%.alpha-src'"),
+            2,
+            "the good language's files keep their baselines (else the check above proves nothing)"
+        );
+        assert_eq!(summary.nodes, 4, "the summary counts only the indexed language's nodes");
+        assert_eq!(summary.edges, 1);
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM edges e JOIN nodes f ON f.id = e.fromId JOIN nodes t ON t.id = e.toId \
+                 WHERE e.id = 'alpha-call' AND f.filePath = 'src/a.alpha-src' AND t.filePath = 'src/b.alpha-src'"
+            ),
+            1,
+            "the good language's cross-file call must survive the purge"
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM edges WHERE fromId NOT IN (SELECT id FROM nodes) OR toId NOT IN (SELECT id FROM nodes)"),
+            0,
+            "no edge may outlive an endpoint"
+        );
+
+        let guard = conn.lock().unwrap();
+        schema::record_bulk_index(&guard).unwrap();
+        assert!(
+            schema::bulk_index_completed(&guard).unwrap(),
+            "the walk is complete for every language it could index, so bulkIndexedAt is set"
+        );
+    }
 }

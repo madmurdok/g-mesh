@@ -581,4 +581,79 @@ mod tests {
             .clone();
         assert!(sub.is_hide_set(), "debug-candidates is for support and M4, not --help");
     }
+
+    // -----------------------------------------------------------------
+    // Per-language outcome lines and exit codes (ADR 0021, resolved at
+    // review 3)
+    // -----------------------------------------------------------------
+
+    fn outcomes(pairs: &[(&str, LanguageOutcome)]) -> BTreeMap<String, LanguageOutcome> {
+        pairs.iter().map(|(language, outcome)| (language.to_string(), outcome.clone())).collect()
+    }
+
+    /// One line per `Failed` (with its error) and per `PluginAbsent` (with
+    /// its file count and the install command); none for `Indexed`.
+    ///
+    /// Controls: drop the error from the `Failed` line, the count or the
+    /// install command from the `PluginAbsent` line, or emit a line for
+    /// `Indexed` - the exact comparison fails.
+    #[test]
+    fn each_language_not_indexed_gets_one_line_naming_what_to_do() {
+        let lines = language_outcome_lines(&outcomes(&[
+            ("go", LanguageOutcome::PluginAbsent { files: None }),
+            ("python", LanguageOutcome::PluginAbsent { files: Some(12) }),
+            ("rust", LanguageOutcome::Indexed { files: 40 }),
+            (
+                "typescript",
+                LanguageOutcome::Failed { error: "the plugin's entry point x does not exist".to_string() },
+            ),
+        ]));
+
+        assert_eq!(
+            lines,
+            [
+                "g-mesh: go has no plugin installed - its files are not indexed; install it with `g-mesh plugins install go`",
+                "g-mesh: python has no plugin installed - 12 file(s) not indexed; install it with `g-mesh plugins install python`",
+                "g-mesh: typescript failed to index and is not in the index: the plugin's entry point x does not exist",
+            ]
+        );
+    }
+
+    /// Exit 0 when every discovered language indexed, absent plugins
+    /// included; 2 when some `Failed`. (1, all failed, is the walk's own
+    /// error and never reaches `report_language_outcomes`.)
+    ///
+    /// Controls: make `report_language_outcomes` fail on `PluginAbsent` too -
+    /// the first `expect` fails; return `Ok` for a `Failed` - `expect_err`
+    /// fails; give `ExitStatus` code 1 - the `assert_eq` on 2 fails.
+    #[test]
+    fn exit_code_is_zero_with_absent_plugins_and_two_with_a_failed_language() {
+        report_language_outcomes(&outcomes(&[
+            ("rust", LanguageOutcome::Indexed { files: 1 }),
+            ("python", LanguageOutcome::PluginAbsent { files: Some(3) }),
+        ]))
+        .expect("absent plugins are a valid install: exit 0");
+        report_language_outcomes(&BTreeMap::new()).expect("no outcomes: exit 0");
+
+        let err = report_language_outcomes(&outcomes(&[
+            ("rust", LanguageOutcome::Indexed { files: 1 }),
+            ("python", LanguageOutcome::Failed { error: "boom".to_string() }),
+        ]))
+        .expect_err("a failed language is a partial failure");
+        assert_eq!(exit_code(&err), PARTIAL_FAILURE_EXIT_CODE);
+        assert_eq!(PARTIAL_FAILURE_EXIT_CODE, 2);
+    }
+
+    /// Every error that is not an `ExitStatus` keeps exit code 1, including
+    /// one with context wrapped around it; an `ExitStatus` keeps its own code
+    /// through context too.
+    ///
+    /// Control: make `exit_code` always return 1 (main's old
+    /// `process::exit(1)`) - the code-2 assertion fails.
+    #[test]
+    fn exit_code_is_one_for_a_plain_error_and_the_status_code_otherwise() {
+        assert_eq!(exit_code(&anyhow::anyhow!("every discovered language failed to index")), 1);
+        let status: anyhow::Error = ExitStatus { code: 2, message: "partial".to_string() }.into();
+        assert_eq!(exit_code(&status.context("while running init")), 2);
+    }
 }
