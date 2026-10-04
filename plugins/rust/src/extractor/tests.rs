@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, TargetKey, TargetScope, Visibility, WireEdge, WireNode};
-use g_mesh_plugin_sdk::{Extractor, FileGraph, OpenSiteKind, RelPath};
+use g_mesh_plugin_sdk::{Extractor, FileGraph, OpenSite, OpenSiteKind, RelPath};
 
 use super::RustExtractor;
 use crate::project::ProjectContext;
@@ -949,6 +949,381 @@ pub fn traitish(p: &P) { p.t(); }
     let graph = krate.extract("src/lib.rs");
     assert_eq!(graph.targets(EdgeKind::Calls, "inherent"), vec!["P::m"]);
     assert_eq!(graph.targets(EdgeKind::Calls, "traitish"), vec!["pending_symbol krate::P::t"]);
+}
+
+/// The receiver-call open sites named `name` out of `from`, in source order.
+fn receiver_sites<'g>(graph: &'g Graph, from: &str, name: &str) -> Vec<&'g OpenSite> {
+    let from = graph.node(from).id.clone();
+    graph
+        .0
+        .open_sites
+        .iter()
+        .filter(|site| site.kind == OpenSiteKind::ReceiverCall && site.from_id == from && site.name == name)
+        .collect()
+}
+
+/// GM-488 F1: a named field of a typed parameter or of `self` types its
+/// receiver by the field's written type, through `Box` and `&`; each site
+/// names the edge it replaces. Controls: drop the `field_expression` arm of
+/// `Bodies::receiver_type` (nothing links); separately, skip
+/// `set_field_type` in `Declarer::fields`'s named-field loop (nothing links).
+#[test]
+fn a_named_field_of_a_typed_value_or_of_self_types_its_receiver() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct Inner;
+impl Inner { pub fn m(&self) {} }
+pub struct Outer<'a> { inner: Inner, boxed: Box<Inner>, r: &'a Inner }
+pub fn run(o: &Outer) { o.inner.m(); o.boxed.m(); o.r.m(); }
+impl<'a> Outer<'a> { pub fn go(&self) { self.inner.m(); } }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    // One edge per (caller, target); the open sites count the calls.
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["Inner::m"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "Outer::go"), vec!["Inner::m"]);
+    assert!(graph.edges(EdgeKind::Calls).iter().all(|edge| edge.resolved));
+    for (from, calls) in [("run", 3), ("Outer::go", 1)] {
+        let sites = receiver_sites(&graph, from, "m");
+        assert_eq!(sites.len(), calls, "{from}: {sites:#?}");
+        assert!(sites.iter().all(|site| site.replaces.is_some()), "{from}: {sites:#?}");
+    }
+}
+
+/// GM-488 F2: a tuple struct's positional field, of `self` or of a typed
+/// parameter. Control: drop the `ordered_field_declaration_list` branch of
+/// `Declarer::fields` (neither links).
+#[test]
+fn a_positional_field_types_its_receiver() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct Inner;
+impl Inner { pub fn m(&self) {} }
+pub struct W(pub Inner);
+impl W { pub fn go(&self) { self.0.m(); } }
+pub fn f(w: W) { w.0.m(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "W::go"), vec!["Inner::m"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "f"), vec!["Inner::m"]);
+}
+
+const CHAINS: &str = r#"
+pub struct A;
+pub struct B;
+impl A {
+    pub fn new() -> A { A }
+    pub fn b(&self) -> B { B }
+    pub fn maybe(&self) -> Option<B> { None }
+}
+impl B { pub fn m(&self) {} }
+pub fn make() -> B { B }
+pub fn run(a: A) -> Option<()> {
+    a.b().m();
+    A::new().b().m();
+    make().m();
+    a.maybe()?.m();
+    a.maybe().unwrap().m();
+    None
+}
+"#;
+
+/// GM-488 F3: a call with a same-file written return type types its receiver
+/// without a `let`: a method, an associated fn, a free fn, through `?` and
+/// `unwrap()`. Control: drop the `call_expression`/`try_expression` arm of
+/// `Bodies::receiver_type` (no `B::m`).
+#[test]
+fn a_call_with_a_written_return_type_types_its_receiver() {
+    let krate = Crate::new(&[("src/lib.rs", CHAINS)]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["A::b", "A::maybe", "A::new", "B::m", "make"]);
+    // One edge per target; each of the five calls is a site that replaces it.
+    let sites = receiver_sites(&graph, "run", "m");
+    assert_eq!(sites.len(), 5, "{sites:#?}");
+    assert!(sites.iter().all(|site| site.replaces.is_some()), "{sites:#?}");
+}
+
+/// GM-488 F4, GM-486's marker: an L4-typed receiver call has its edge, so it
+/// is not reported in the enclosing fn's `untypedCalls`, whether typed by a
+/// call or by a field. Control: the F3 revert (drop the
+/// `call_expression`/`try_expression` arm of `Bodies::receiver_type`) puts
+/// `m` back in `run`'s list; dropping the `field_expression` arm puts it back
+/// in `field`'s.
+#[test]
+fn receiver_calls_typed_by_a_field_or_a_call_leave_untyped_calls() {
+    let source = format!("{CHAINS}pub struct Holder {{ b: B }}\npub fn field(h: Holder) {{ h.b.m(); }}\n");
+    let krate = Crate::new(&[("src/lib.rs", source.as_str())]);
+    let graph = krate.extract("src/lib.rs");
+    for function in ["run", "field"] {
+        let untyped = &graph.node(function).untyped_calls;
+        assert!(!untyped.contains(&"m".to_string()), "{function}: {untyped:?}");
+    }
+    assert!(graph.node("field").untyped_calls.is_empty(), "{:?}", graph.node("field").untyped_calls);
+}
+
+/// GM-488 F5 (D1): field hops and method-return hops share one budget of
+/// `MAX_HOPS` = 2. Two hops link; a third leaves the call untyped, one open
+/// site each that replaces nothing. Control: set `MAX_HOPS = 3` (the 3-hop
+/// calls link to `D::m`).
+#[test]
+fn fields_and_calls_share_the_two_hop_budget() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct D;
+impl D { pub fn m(&self) {} }
+pub struct C { pub h: D }
+impl C { pub fn m(&self) {} pub fn d(&self) -> D { D } }
+pub struct B { pub g: C }
+impl B { pub fn c(&self) -> C { C { h: D } } }
+pub struct A;
+impl A { pub fn b(&self) -> B { todo!() } }
+pub struct F { pub f: B }
+impl F {
+    pub fn two_fields(&self) { self.f.g.m(); }
+    pub fn three_fields(&self) { self.f.g.h.m(); }
+}
+pub fn two_calls(a: A) { a.b().c().m(); }
+pub fn three_calls(a: A) { a.b().c().d().m(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "F::two_fields"), vec!["C::m"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "two_calls"), vec!["A::b", "B::c", "C::m"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "F::three_fields"), Vec::<String>::new());
+    assert_eq!(graph.targets(EdgeKind::Calls, "three_calls"), vec!["A::b", "B::c", "C::d"]);
+    for from in ["F::three_fields", "three_calls"] {
+        let sites = receiver_sites(&graph, from, "m");
+        assert_eq!(sites.len(), 1, "{from}: {sites:#?}");
+        assert_eq!(sites[0].replaces, None, "{from}");
+    }
+}
+
+/// GM-488 F6: a `let` bound to a field (by value or by reference) is typed
+/// like the field. Control: drop the `field_expression` arm of
+/// `Bodies::expression_type` (`y.m()` in `run` stays untyped; `&self.inner`
+/// still links through the `reference_expression` arm).
+#[test]
+fn a_local_bound_to_a_field_is_typed_by_the_field() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct Inner;
+impl Inner { pub fn m(&self) {} }
+pub struct Outer { inner: Inner }
+pub fn run(x: Outer) { let y = x.inner; y.m(); }
+impl Outer { pub fn go(&self) { let z = &self.inner; z.m(); } }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["Inner::m"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "Outer::go"), vec!["Inner::m"]);
+}
+
+/// GM-488 F7: same-named fields of two structs are told apart by their
+/// owner. Control: key `FileModel::field_types` by the bare field name (the
+/// two `inner` entries collide and neither or the wrong one links).
+#[test]
+fn same_named_fields_of_different_structs_keep_their_own_types() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct P;
+impl P { pub fn m(&self) {} }
+pub struct Q;
+impl Q { pub fn m(&self) {} }
+pub struct X { inner: P }
+pub struct Y { inner: Q }
+pub fn run(x: X, y: Y) { x.inner.m(); y.inner.m(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["P::m", "Q::m"]);
+}
+
+/// GM-488 N1: an `Option` field is not unwrapped implicitly, and `Rc`/`Vec`
+/// fields are not looked through; one explicit `unwrap()`/`?` does unwrap.
+/// Control: drop the `Wrapper::Plain` filter on the receiver in
+/// `Bodies::receiver_call` (`o.opt.m()` links to `Inner::m`).
+#[test]
+fn option_rc_and_vec_fields_leave_their_receiver_untyped() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+use std::rc::Rc;
+pub struct Inner;
+impl Inner { pub fn m(&self) {} }
+pub struct O { opt: Option<Inner>, rc: Rc<Inner>, v: Vec<Inner> }
+pub fn wrapped(o: O) { o.opt.m(); o.rc.m(); o.v.m(); }
+pub fn unwrapped(o: O) -> Option<()> { o.opt.unwrap().m(); o.opt?.m(); None }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "wrapped"), Vec::<String>::new());
+    let sites = receiver_sites(&graph, "wrapped", "m");
+    assert_eq!(sites.len(), 3, "{sites:#?}");
+    assert!(sites.iter().all(|site| site.replaces.is_none()), "{sites:#?}");
+    assert_eq!(graph.targets(EdgeKind::Calls, "unwrapped"), vec!["Inner::m"]);
+    let sites = receiver_sites(&graph, "unwrapped", "m");
+    assert_eq!(sites.len(), 2, "{sites:#?}");
+    assert!(sites.iter().all(|site| site.replaces.is_some()), "{sites:#?}");
+}
+
+/// GM-488 N2: a field of a struct declared in another file has no type here,
+/// even though the owner itself is typed through the import. No control:
+/// it pins the same-file rule.
+#[test]
+fn a_field_of_a_struct_declared_in_another_file_types_nothing() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+        (
+            "src/a.rs",
+            "pub struct Inner;\nimpl Inner { pub fn m(&self) {} }\npub struct Outer { pub inner: Inner }\n",
+        ),
+        ("src/b.rs", "use crate::a::Outer;\npub fn run(o: Outer) { o.inner.m(); }\n"),
+    ]);
+    let graph = krate.extract("src/b.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "b::run"), Vec::<String>::new());
+    let sites = receiver_sites(&graph, "b::run", "m");
+    assert_eq!(sites.len(), 1, "{sites:#?}");
+    assert_eq!(sites[0].replaces, None);
+}
+
+/// GM-488 N3 (D3): a field whose type mentions its struct's generic
+/// parameter has no type, though a real `struct T` sits beside it. Control:
+/// drop the generic refusal in `Declarer::field_type` (`g.t.m()` and
+/// `g.o.unwrap().m()` link to `T::m`).
+#[test]
+fn a_field_typed_by_a_struct_generic_types_nothing() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct T;
+impl T { pub fn m(&self) {} }
+pub struct G<T> { t: T, o: Option<T> }
+pub fn run(g: G<u8>) { g.t.m(); g.o.unwrap().m(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    let targets = graph.targets(EdgeKind::Calls, "run");
+    assert!(!targets.contains(&"T::m".to_string()), "{targets:?}");
+    let sites = receiver_sites(&graph, "run", "m");
+    assert_eq!(sites.len(), 2, "{sites:#?}");
+    assert!(sites.iter().all(|site| site.replaces.is_none()), "{sites:#?}");
+}
+
+/// GM-488 N4: `self` in a trait's default body is any implementor, so
+/// `self.f` has no type. The fixture gives the trait a same-named struct
+/// (not valid Rust, but the only way the trait's own name could find a
+/// field). Control: let `Bodies::field_type` accept `Family::TraitDecl`
+/// blocks (`self.f.m()` links to `P::m`).
+#[test]
+fn a_field_of_self_in_a_trait_default_body_types_nothing() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct P;
+impl P { pub fn m(&self) {} }
+pub struct Tr { f: P }
+pub trait Tr { fn d(&self) { self.f.m(); } }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    let d = graph.0.nodes.iter().find(|node| node.name == "d").unwrap().id.clone();
+    assert!(
+        graph.edges(EdgeKind::Calls).iter().all(|edge| edge.from_id != d),
+        "{:#?}",
+        graph.edges(EdgeKind::Calls)
+    );
+    let sites: Vec<_> =
+        graph.0.open_sites.iter().filter(|site| site.from_id == d && site.name == "m").collect();
+    assert_eq!(sites.len(), 1, "{sites:#?}");
+    assert_eq!(sites[0].replaces, None);
+}
+
+/// GM-488 N5: `cfg` alternatives of one struct whose field types disagree
+/// leave the field untyped, and so does an alternative whose field type no
+/// receiver could use (a tuple), in either order; alternatives that agree
+/// keep it. Controls: make `FileModel::set_field_type` keep the first type
+/// (`S`'s and `U`'s calls link); separately, make it ignore a `None` input
+/// (`U`'s and `V`'s calls link).
+#[test]
+fn cfg_alternatives_that_disagree_on_a_field_type_leave_it_untyped() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct P;
+impl P { pub fn m(&self) {} }
+pub struct Q;
+impl Q { pub fn m(&self) {} }
+#[cfg(a)] pub struct S { f: P }
+#[cfg(not(a))] pub struct S { f: Q }
+#[cfg(a)] pub struct U { f: P }
+#[cfg(not(a))] pub struct U { f: (P, P) }
+#[cfg(a)] pub struct V { f: (P, P) }
+#[cfg(not(a))] pub struct V { f: P }
+#[cfg(a)] pub struct K { f: P }
+#[cfg(not(a))] pub struct K { f: P }
+pub fn disagree(s: S) { s.f.m(); }
+pub fn unusable_last(u: U) { u.f.m(); }
+pub fn unusable_first(v: V) { v.f.m(); }
+pub fn agree(k: K) { k.f.m(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for function in ["disagree", "unusable_last", "unusable_first"] {
+        assert_eq!(graph.targets(EdgeKind::Calls, function), Vec::<String>::new(), "{function}");
+        let sites = receiver_sites(&graph, function, "m");
+        assert_eq!(sites.len(), 1, "{function}: {sites:#?}");
+        assert_eq!(sites[0].replaces, None, "{function}");
+    }
+    assert_eq!(graph.targets(EdgeKind::Calls, "agree"), vec!["P::m"]);
+}
+
+/// GM-488 N6: a chain through a method this file does not declare with a
+/// written return type (a derived `clone`) stops there. No control:
+/// `call_type` already requires a same-file `Bound::Here`.
+#[test]
+fn a_chain_through_a_derived_method_leaves_the_call_untyped() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+#[derive(Clone)]
+pub struct Inner;
+impl Inner { pub fn m(&self) {} }
+pub struct Outer { inner: Inner }
+pub fn run(x: Outer) { x.inner.clone().m(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    let targets = graph.targets(EdgeKind::Calls, "run");
+    assert!(!targets.contains(&"Inner::m".to_string()), "{targets:?}");
+    let sites = receiver_sites(&graph, "run", "m");
+    assert_eq!(sites.len(), 1, "{sites:#?}");
+    assert_eq!(sites[0].replaces, None);
+}
+
+/// GM-488 N7: through a field, as through a local, a trait-impl method is a
+/// placeholder at the inherent address `Inner::t`, never a link to
+/// `<Inner as Tr>::t`. Control: as
+/// `a_typed_receiver_finds_the_inherent_method_and_misses_a_trait_impl_method`.
+#[test]
+fn a_trait_impl_method_through_a_field_is_a_placeholder() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub trait Tr { fn t(&self); }
+pub struct Inner;
+impl Tr for Inner { fn t(&self) {} }
+pub struct Outer { inner: Inner }
+pub fn run(o: Outer) { o.inner.t(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["pending_symbol krate::Inner::t"]);
 }
 
 /// Decision 1, the trap this plugin is most at risk of: a local must never
