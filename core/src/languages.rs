@@ -73,14 +73,13 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
 
 /// The catalogue entry for `language`, whether or not its plugin is present.
 pub fn entry(language: &str) -> Option<&'static CatalogueEntry> {
-    CATALOGUE.iter().find(|entry| entry.language == language)
+    entry_in(CATALOGUE, language)
 }
 
 /// The catalogue entry claiming `file_path`'s extension (case-insensitive,
 /// as discovery's routing is), whether or not its plugin is present.
 pub fn entry_for_path(file_path: &str) -> Option<&'static CatalogueEntry> {
-    let extension = extension_of(file_path)?;
-    CATALOGUE.iter().find(|entry| entry.extensions.contains(&extension.as_str()))
+    entry_for_path_in(CATALOGUE, file_path)
 }
 
 /// The precedence rule, for a whole set: every catalogued language with
@@ -88,7 +87,7 @@ pub fn entry_for_path(file_path: &str) -> Option<&'static CatalogueEntry> {
 /// is never returned, whatever its manifest says, because the manifest is the
 /// only source of truth about a present plugin.
 pub fn missing(discovered: &DiscoveredPlugins) -> Vec<&'static CatalogueEntry> {
-    CATALOGUE.iter().filter(|entry| !discovered.manifests.contains_key(entry.language)).collect()
+    missing_in(CATALOGUE, discovered)
 }
 
 /// The precedence rule, for one file: the catalogue entry naming the absent
@@ -101,12 +100,40 @@ pub fn missing(discovered: &DiscoveredPlugins) -> Vec<&'static CatalogueEntry> {
 ///   extension - the manifest wins, so the file is simply not routed);
 /// - no catalogue entry claims the extension, or the path has none.
 pub fn absent_for_path(discovered: &DiscoveredPlugins, file_path: &str) -> Option<&'static CatalogueEntry> {
+    absent_for_path_in(CATALOGUE, discovered, file_path)
+}
+
+// The lookups are written over any table, and the public functions above
+// pass `CATALOGUE`: no lookup may depend on which languages the table holds,
+// so that a new language is one entry and nothing else.
+
+fn entry_in<'a>(table: &'a [CatalogueEntry], language: &str) -> Option<&'a CatalogueEntry> {
+    table.iter().find(|entry| entry.language == language)
+}
+
+fn entry_for_path_in<'a>(table: &'a [CatalogueEntry], file_path: &str) -> Option<&'a CatalogueEntry> {
+    let extension = extension_of(file_path)?;
+    table.iter().find(|entry| entry.extensions.contains(&extension.as_str()))
+}
+
+fn missing_in<'a>(table: &'a [CatalogueEntry], discovered: &DiscoveredPlugins) -> Vec<&'a CatalogueEntry> {
+    table.iter().filter(|entry| !discovered.manifests.contains_key(entry.language)).collect()
+}
+
+fn absent_for_path_in<'a>(
+    table: &'a [CatalogueEntry],
+    discovered: &DiscoveredPlugins,
+    file_path: &str,
+) -> Option<&'a CatalogueEntry> {
     if discovered.language_for(file_path).is_some() {
         return None;
     }
-    let entry = entry_for_path(file_path)?;
+    let entry = entry_for_path_in(table, file_path)?;
     if discovered.manifests.contains_key(entry.language) {
         return None;
     }
     Some(entry)
 }
+
+#[cfg(test)]
+mod tests;
