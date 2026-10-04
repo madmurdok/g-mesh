@@ -266,3 +266,23 @@ evidence".
   unit tests. It stays within the criteria.
 - The doubled-label observation is explained as by-design. Changing it would
   be a separate cosmetic task and is not needed for GM-484.
+
+## Measured after the fix
+
+GM-484/S6: release binaries built from `34d7fe9` (`g-mesh` sha256 `aedf3b3a…`;
+`g-mesh-plugin-rust` and `g-mesh-plugin-python` are unchanged from `cafe6db`,
+same hashes), same corpus and driver as S1/S2, `G_MESH_PLUGIN_IDLE_MS=20000`,
+two fresh bulk builds. The control arm is S2's run on the `cafe6db` binaries at
+the same 20 s idle (`g-mesh` sha256 `448a5e14…`), not repeated because those
+binaries did not change.
+
+| arm | build | rust pending_symbol | nodes | edges | rust `semanticPassAt` | rust `semanticPassError` | real / user / sys (s) | load before → after |
+|---|---|---|---|---|---|---|---|---|
+| unfixed `cafe6db` (S2) | b11 | **5387** | 19938 | 50868 | NULL | not run (plugin asleep) | – | – |
+| fixed `34d7fe9` | b21 | **8324** | 22875 | 55836 | 2026-10-04 04:09:42 | NULL | 223.27 / 0.08 / 0.08 | 38.49 → 3.88 |
+| fixed `34d7fe9` | b22 | **8324** | 22875 | 55836 | 2026-10-04 04:13:35 | NULL | 225.33 / 0.08 / 0.07 | 4.13 → 3.19 |
+
+Both fixed builds match the HIGH (correct) shape of S2's idle-off run exactly
+(pending 9270, rust nodes 19560, nodes 22875, edges 55836). `user`/`sys` are the
+driver's only; the daemon runs detached. The 38.5 load at the start of b21 was
+the release build that had just finished; b21 and b22 agree anyway.
