@@ -37,7 +37,8 @@ the page otherwise looks complete (`hasMore: false`, plausible results), so \
 check this field, not just individual rows. Never set on an empty page.\n\n\
 The one legitimate reason to grep afterward: a method call through a \
 variable receiver (`x.foo()`) may produce no edge by design, so caller/reference \
-lists for methods can under-report; bare function calls and this/super/qualified-type \
+lists for methods can under-report (a method page that may miss such calls carries \
+`untypedReceiverCalls` where the language reports them); bare function calls and this/super/qualified-type \
 calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
 project's first index, or a re-index after an upgrade, a tool call waits for the walk \
 to finish - slow, not wrong; do not abandon it for grep.\n\n\
@@ -167,7 +168,7 @@ fn ts_only_is_byte_identical_to_the_original_string() {
         "a TypeScript-only project must read exactly what it did before GM-262"
     );
     // The measured length of the current rendering, not a re-derivation.
-    assert_eq!(rendered.len(), 1732, "this module's own current baseline, re-measured");
+    assert_eq!(rendered.len(), 1836, "this module's own current baseline, re-measured");
 }
 
 #[test]
@@ -509,7 +510,7 @@ fn fallback_wording_fits_under_the_ceiling() {
     let rendered = assemble(&p4_fallback());
     println!("fallback bytes: {}", rendered.len());
     assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
-    assert!(rendered.contains("semantic layer finishes"));
+    assert!(rendered.contains("untypedReceiverCalls"));
 }
 
 /// [`build`]'s own fallback branch, proven rather than merely present:
@@ -765,4 +766,29 @@ fn build_front_drops_a_root_too_long_for_the_ceiling() {
     assert!(!rendered.contains("/rrrr"), "the root must not appear: {rendered}");
     assert!(rendered.contains("This folder holds 2+ projects"), "{rendered}");
     assert!(rendered.ends_with("Projects: a, b."), "{rendered}");
+}
+
+/// The eight-language worst case still names every gapped language
+/// and points at `untypedReceiverCalls` when nothing is prefixed, but under a
+/// cold-start line the body is built against the ceiling less the no-path
+/// line and falls back to [`p4_fallback`], whatever the root's length.
+/// Control: build `cold_start`'s body with `build(present)` again (a
+/// 103-byte root renders the named body under the no-path line, over the
+/// ceiling).
+#[test]
+fn the_worst_case_cold_start_falls_back_to_the_generic_receiver_paragraph() {
+    let named = build(&worst_case_present());
+    assert!(named.contains("`untypedReceiverCalls`"), "{named}");
+    assert_ne!(named, assemble(&p4_fallback()));
+    let fallback = assemble(&p4_fallback());
+    println!("named {} bytes, fallback {} bytes", named.len(), fallback.len());
+
+    for walking in [false, true] {
+        for root_len in [10, 103, 600] {
+            let rendered = cold_start(&root_of_byte_len(root_len), walking, &worst_case_present());
+            println!("walking={walking} root={root_len}: {} bytes", rendered.len());
+            assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
+            assert!(rendered.ends_with(&fallback), "walking={walking} root={root_len}: {rendered}");
+        }
+    }
 }

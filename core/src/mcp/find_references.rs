@@ -22,6 +22,7 @@ use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
 use super::unlinked::{self, UnlinkedUsages};
+use super::untyped::{self, UntypedReceiverCalls};
 use super::{anchor, find_definition, provenance, SymbolQueryParams};
 
 /// Every edge kind that means "this node uses the anchor somewhere in its own
@@ -106,6 +107,11 @@ struct ReferencePage {
     /// the linker left on a placeholder. Absent when there is no candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
     unlinked_usages: Option<UnlinkedUsages>,
+    /// See [`UntypedReceiverCalls`] - functions calling a method of the
+    /// anchor's name through a receiver whose type was not inferred, with no
+    /// edge to the anchor yet. Absent when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    untyped_receiver_calls: Option<UntypedReceiverCalls>,
     /// See `super::provenance` - present only when the anchor's language
     /// declares a semantic tier that has not completed for this project, so
     /// this answer came from its structural tier alone. Absent (not `null`,
@@ -208,6 +214,7 @@ pub(crate) fn handle_in(
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
     let unlinked = unlinked::probe(&conn, &anchor, USAGE_EDGE_KINDS, &file_paths);
+    let untyped = untyped::probe(&conn, &anchor, USAGE_EDGE_KINDS, &file_paths);
     let page = list_references(
         &conn,
         &anchor.id,
@@ -215,7 +222,9 @@ pub(crate) fn handle_in(
         &file_paths,
         page_size,
         params.cursor.as_deref(),
-        tier.page_reserve() + UnlinkedUsages::wire_len(&unlinked),
+        tier.page_reserve()
+            + UnlinkedUsages::wire_len(&unlinked, "unlinkedUsages")
+            + UntypedReceiverCalls::wire_len(&untyped, untyped::FIELD),
     )
     .map_err(|e| internal_error("failed to find references", e))?;
 
@@ -225,13 +234,15 @@ pub(crate) fn handle_in(
     let files =
         pagination::tally_is_worth_sending(page.results.len(), &tally, page.has_more).then_some(tally);
 
-    // Every file this response names: rows, the tally and the unlinked tally.
+    // Every file this response names: rows, the tally, the unlinked and
+    // untyped tallies.
     let touched = page
         .results
         .iter()
         .map(|row| row.file_path.as_str())
         .chain(files.iter().flatten().map(|tally| tally.path.as_str()))
-        .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths));
+        .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths))
+        .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
     let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
     let has_file_row = page.results.iter().any(|row| row.kind == pagination::FILE_KIND);
     let hint = session_hints::join([
@@ -250,6 +261,7 @@ pub(crate) fn handle_in(
         all_unresolved: page.all_unresolved,
         hint,
         unlinked_usages: unlinked,
+        untyped_receiver_calls: untyped,
         provenance,
     })
 }

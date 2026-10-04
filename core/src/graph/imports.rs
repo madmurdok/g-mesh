@@ -364,6 +364,7 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
             "DELETE FROM placeholder_targets WHERE nodeId = ?1",
             "DELETE FROM declarations WHERE nodeId = ?1",
             "DELETE FROM qualified_suffixes WHERE nodeId = ?1",
+            "DELETE FROM untyped_calls WHERE nodeId = ?1",
             "DELETE FROM vectors WHERE nodeId = ?1",
         ]
         .into_iter()
@@ -877,6 +878,7 @@ mod tests {
             crate::storage::vectors::insert(&conn, id, &[1.0, 0.0], "test-model").unwrap();
             conn.execute("INSERT INTO qualified_suffixes (suffix, nodeId) VALUES ('x::y', ?1)", params![id])
                 .unwrap();
+            conn.execute("INSERT INTO untyped_calls (name, nodeId) VALUES ('m', ?1)", params![id]).unwrap();
         }
 
         let summary = link_all(&mut conn).unwrap();
@@ -890,6 +892,12 @@ mod tests {
             count(&conn, "qualified_suffixes"),
             0,
             "a dropped placeholder's suffix rows must go with it"
+        );
+        // Control: drop the `untyped_calls` delete from `link`.
+        assert_eq!(
+            count(&conn, "untyped_calls"),
+            0,
+            "a dropped placeholder's untyped-call rows must go with it"
         );
     }
 

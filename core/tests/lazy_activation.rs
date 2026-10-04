@@ -321,6 +321,7 @@ async fn a_failed_walk_is_a_tool_error_and_is_retried() {
         container_parent: None,
         target: None,
         alias_paths: Vec::new(),
+        untyped_calls: Vec::new(),
         qualified_path: None,
     };
     let defines = WireEdge {

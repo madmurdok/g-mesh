@@ -1024,6 +1024,7 @@ mod tests {
             container_parent: None,
             target: None,
             alias_paths: Vec::new(),
+            untyped_calls: Vec::new(),
             qualified_path: None,
         }
     }
@@ -1110,7 +1111,7 @@ mod tests {
             .unwrap()
     }
 
-    const GRAPH_TABLES: [&str; 7] = [
+    const GRAPH_TABLES: [&str; 8] = [
         "SELECT * FROM nodes ORDER BY id",
         "SELECT * FROM edges ORDER BY id",
         "SELECT nodeId, hex(embedding), embeddingVersion FROM vectors ORDER BY nodeId",
@@ -1118,6 +1119,7 @@ mod tests {
         "SELECT * FROM declarations ORDER BY nodeId, ordinal",
         "SELECT * FROM placeholder_targets ORDER BY nodeId",
         "SELECT * FROM qualified_suffixes ORDER BY nodeId, suffix",
+        "SELECT * FROM untyped_calls ORDER BY nodeId, name",
     ];
     const FLAG_TABLES: [&str; 2] =
         ["SELECT * FROM language_state ORDER BY language", "SELECT bulkIndexedAt, semanticPassAt FROM meta"];
@@ -1190,6 +1192,7 @@ mod tests {
             }]),
             qualified_name: "pkg::T::alpha-n2".to_string(),
             qualified_path: Some(QualifiedPath::root("pkg").child("::", "T").child("::", "alpha-n2")),
+            untyped_calls: vec!["frobnicate".to_string()],
             ..wire_node("alpha-n2", "src/b.alpha-src")
         };
         let placeholder = WireNode {
@@ -1223,6 +1226,7 @@ mod tests {
                 ("placeholder_targets", "nodeId"),
                 ("vectors", "nodeId"),
                 ("qualified_suffixes", "nodeId"),
+                ("untyped_calls", "nodeId"),
             ] {
                 assert!(
                     count(
@@ -1255,7 +1259,14 @@ mod tests {
             0,
             "no edge may outlive an endpoint"
         );
-        for table in ["declarations", "placeholder_targets", "vectors", "containers", "qualified_suffixes"] {
+        for table in [
+            "declarations",
+            "placeholder_targets",
+            "vectors",
+            "containers",
+            "qualified_suffixes",
+            "untyped_calls",
+        ] {
             assert_eq!(
                 count(
                     &guard,

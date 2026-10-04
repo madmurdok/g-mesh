@@ -545,6 +545,7 @@ fn delete_container(conn: &Connection, node_id: &str) -> Result<()> {
         "DELETE FROM declarations WHERE nodeId = ?1",
         "DELETE FROM placeholder_targets WHERE nodeId = ?1",
         "DELETE FROM qualified_suffixes WHERE nodeId = ?1",
+        "DELETE FROM untyped_calls WHERE nodeId = ?1",
         "DELETE FROM nodes WHERE id = ?1",
     ] {
         conn.prepare_cached(sql)

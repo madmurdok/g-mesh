@@ -152,6 +152,8 @@ impl<'s> Emitter<'s> {
     ) -> Self {
         let positions = Positions::new(source);
         let mut graph = FileGraphBuilder::new(language, engine, path);
+        // Untyped receiver calls reach core as `untypedCalls` (GM-486).
+        graph.record_untyped_receiver_calls();
         let name = path.as_str().rsplit('/').next().unwrap_or(path.as_str()).to_string();
         let mut spec = NodeSpec::new(NodeKind::File, name, path.as_str(), positions.file_range());
         spec.doc_comment = module_doc;

@@ -9,7 +9,7 @@ use crate::graph::imports::RESOLVED_MODULE_NATIVE_KIND;
 use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::protocol::jsonrpc::read_message;
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
-use crate::protocol::types::{ControlEnvelope, WireNode};
+use crate::protocol::types::{ControlEnvelope, NodeKind, WireNode};
 
 /// The `nativeKind`s a `WireNode` stands in for something outside its own
 /// file rather than declaring anything (mirrors the plugin's own
@@ -55,6 +55,8 @@ impl ConformanceReport {
 ///    materializes container nodes (Data Model > Logical containers).
 ///  - a `qualifiedPath`, `aliasPaths` entry or `keyPath`, when sent, obeys
 ///    its rules ([`qualified_path_violation`]).
+///  - `untypedCalls`, when sent, sits on a `File` or `Function` node and
+///    names no empty string ([`untyped_calls_violation`]).
 pub fn check_bulk_output(ndjson: &[u8]) -> ConformanceReport {
     let reader = NdjsonReader::new(BufReader::new(Cursor::new(ndjson.to_vec())));
     let mut violations = Vec::new();
@@ -74,6 +76,7 @@ fn node_shape_violations(context: &str, node: &WireNode) -> Vec<Violation> {
         .into_iter()
         .chain(plugin_emitted_container_violation(node))
         .chain(qualified_path_violation(node))
+        .chain(untyped_calls_violation(node))
         .map(|message| Violation { context: context.to_string(), message })
         .collect()
 }
@@ -93,6 +96,25 @@ pub(crate) fn placeholder_target_violation(node: &WireNode) -> Option<String> {
             node.id, node.qualified_name
         )
     })
+}
+
+/// The `untypedCalls` rule (GM-486): only a `File` or `Function` node - the
+/// code a call can sit in - may carry it, and no name in it is empty.
+/// Absent is conformant.
+pub(crate) fn untyped_calls_violation(node: &WireNode) -> Option<String> {
+    if node.untyped_calls.is_empty() {
+        return None;
+    }
+    if !matches!(node.kind, NodeKind::File | NodeKind::Function) {
+        return Some(format!(
+            "node {:?} (kind {:?}) carries `untypedCalls`; only a File or Function node may",
+            node.id, node.kind
+        ));
+    }
+    node.untyped_calls
+        .iter()
+        .any(String::is_empty)
+        .then(|| format!("node {:?} has an empty name in `untypedCalls`", node.id))
 }
 
 /// The path rules: a `qualifiedPath` joins back to `qualifiedName` and ends
@@ -237,6 +259,32 @@ mod tests {
         let report = check_bulk_output(ndjson);
         assert!(!report.is_conformant());
         assert!(report.violations[0].message.contains("container"), "{:?}", report.violations);
+    }
+
+    const UNTYPED_FUNCTION: &str = "{\"id\":\"n1\",\"kind\":\"Function\",\"name\":\"run\",\"qualifiedName\":\"m::run\",\"filePath\":\"a.rs\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"visibility\":\"file\",\"language\":\"rust\",\"untypedCalls\":[\"m\"]}\n";
+
+    /// `untypedCalls` on a `Function` (or `File`) node is conformant;
+    /// on any other kind, or with an empty name, it is a violation naming the
+    /// node. Controls: return `None` from `untyped_calls_violation` (no
+    /// violation), or drop its chain from `node_shape_violations` (same);
+    /// widen the kind check to every kind (the `Type` line passes).
+    #[test]
+    fn untyped_calls_belong_on_a_file_or_function_node_and_name_something() {
+        let report = check_bulk_output(UNTYPED_FUNCTION.as_bytes());
+        assert!(report.is_conformant(), "{:?}", report.violations);
+        let file = UNTYPED_FUNCTION.replace("\"kind\":\"Function\"", "\"kind\":\"File\"");
+        assert!(check_bulk_output(file.as_bytes()).is_conformant());
+
+        let on_a_type = UNTYPED_FUNCTION.replace("\"kind\":\"Function\"", "\"kind\":\"Type\"");
+        let report = check_bulk_output(on_a_type.as_bytes());
+        assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+        assert!(report.violations[0].message.contains("untypedCalls"), "{:?}", report.violations);
+        assert!(report.violations[0].message.contains("n1"), "{:?}", report.violations);
+
+        let empty_name = UNTYPED_FUNCTION.replace("[\"m\"]", "[\"m\",\"\"]");
+        let report = check_bulk_output(empty_name.as_bytes());
+        assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+        assert!(report.violations[0].message.contains("empty name"), "{:?}", report.violations);
     }
 
     #[test]

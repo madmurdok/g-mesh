@@ -65,6 +65,7 @@ fn canned_node(id: &str) -> WireNode {
         container_parent: None,
         target: None,
         alias_paths: Vec::new(),
+        untyped_calls: Vec::new(),
         qualified_path: None,
     }
 }
@@ -1282,6 +1283,56 @@ fn an_incremental_reparse_rebuilds_suffix_rows() {
     assert_eq!(count(&conn, "qualified_suffixes"), 1, "n2's rows went with it");
 }
 
+/// `canned_node` calling `names` through untyped receivers.
+fn untyped_node(id: &str, names: &[&str]) -> WireNode {
+    WireNode { untyped_calls: names.iter().map(|name| name.to_string()).collect(), ..canned_node(id) }
+}
+
+fn untyped_rows(conn: &IndexStore) -> Vec<(String, String)> {
+    conn.lock()
+        .unwrap()
+        .prepare("SELECT nodeId, name FROM untyped_calls ORDER BY nodeId, name")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// A reparse that re-sends a node replaces its
+/// untyped-call rows, one that re-sends it without the key clears them, and
+/// one that deletes a node removes them - no stale row survives. Control:
+/// drop `untyped_calls: node.untyped_calls` from `to_node_record` (no rows
+/// at all after the first reparse).
+#[test]
+fn an_incremental_reparse_replaces_untyped_call_rows() {
+    let conn = IndexStore::new(setup_conn());
+    let row = |id: &str, name: &str| (id.to_string(), name.to_string());
+
+    reparse(
+        &conn,
+        1,
+        FileChangeDiff {
+            upsert_nodes: vec![untyped_node("n1", &["m", "n"]), untyped_node("n2", &["m"])],
+            ..Default::default()
+        },
+    );
+    assert_eq!(untyped_rows(&conn), vec![row("n1", "m"), row("n1", "n"), row("n2", "m")]);
+
+    reparse(
+        &conn,
+        2,
+        FileChangeDiff {
+            upsert_nodes: vec![untyped_node("n1", &["o"]), untyped_node("n2", &[])],
+            ..Default::default()
+        },
+    );
+    assert_eq!(untyped_rows(&conn), vec![row("n1", "o")], "replaced, and cleared by an absent key");
+
+    reparse(&conn, 3, FileChangeDiff { delete_node_ids: vec!["n1".to_string()], ..Default::default() });
+    assert!(untyped_rows(&conn).is_empty(), "a deleted node's rows go with it");
+}
+
 // --- rows core retires for a file: gone, or answered in full -------------
 
 fn node_in(id: &str, file_path: &str) -> WireNode {
@@ -1387,4 +1438,161 @@ fn a_partial_answer_deletes_only_what_it_names() {
 
     assert_eq!(count(&conn, "nodes"), 4);
     assert_eq!(count(&conn, "edges"), 4);
+}
+
+// --- GM-486: a semantic pass re-sending a caller to shorten its list ----------
+
+/// Every row `table` holds for `node_id`, each rendered as text, in order.
+fn rows_of(conn: &IndexStore, table: &str, node_id: &str) -> Vec<String> {
+    let conn = conn.lock().unwrap();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT * FROM {table} WHERE {} = ?1",
+            if table == "nodes" { "id" } else { "nodeId" }
+        ))
+        .unwrap();
+    let columns = stmt.column_count();
+    let mut rows: Vec<String> = stmt
+        .query_map([node_id], |row| {
+            Ok((0..columns).map(|i| format!("{:?}", row.get_ref(i).unwrap())).collect::<Vec<_>>().join("|"))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    rows.sort();
+    rows
+}
+
+fn vector_of(conn: &IndexStore, node_id: &str) -> Option<Vec<u8>> {
+    conn.lock()
+        .unwrap()
+        .query_row("SELECT embedding FROM vectors WHERE nodeId = ?1", [node_id], |row| row.get(0))
+        .ok()
+}
+
+/// A caller as the structural tier sends it: every column and child row a
+/// node can carry, and two untyped receiver calls.
+fn rich_caller() -> WireNode {
+    use crate::protocol::types::WireDeclaration;
+    WireNode {
+        signature: Some("pub fn caller(ws: Vec<W>)".to_string()),
+        doc_comment: Some("Calls frob on each.".to_string()),
+        container: Some("mod".to_string()),
+        declarations: Some(vec![
+            WireDeclaration {
+                ordinal: 0,
+                start_line: 1,
+                start_col: 0,
+                end_line: 2,
+                end_col: 1,
+                signature: Some("pub fn caller(ws: Vec<W>)".to_string()),
+                has_body: false,
+            },
+            WireDeclaration {
+                ordinal: 1,
+                start_line: 3,
+                start_col: 0,
+                end_line: 5,
+                end_col: 1,
+                signature: None,
+                has_body: true,
+            },
+        ]),
+        target: Some(PlaceholderTarget {
+            scope: TargetScope::Container("mod".to_string()),
+            key: TargetKey::QualifiedName("mod::foo".to_string()),
+            from_container: Some("mod".to_string()),
+            key_path: None,
+        }),
+        untyped_calls: vec!["frob".to_string(), "len".to_string()],
+        ..pathed_node("caller", "Alias")
+    }
+}
+
+/// **GM-486.** The bridge re-sends a caller whole with only `untypedCalls`
+/// shortened. Through a real semantic round trip, that shortens its
+/// `untyped_calls` rows and leaves every other column and child row -
+/// declarations, qualified and alias suffixes, placeholder target - as the
+/// structural tier stored them. And since the caller already has a vector,
+/// the pass does not embed it again, while a genuinely new node in the
+/// same answer still is embedded.
+///
+/// Controls, in `round_trip`: drop the `SemanticPass` `retain` (the caller
+/// is re-embedded: its text reaches the model and its vector changes); keep
+/// only nodes that *have* a vector (`embedded.contains`) or clear
+/// `upsert_nodes` instead (the new node gets no vector); move the `retain`
+/// before `apply_diff_linked` (the caller's rows are never shortened). The
+/// child-row half guards the bridge's `..node.clone()` in
+/// `trim_untyped_calls`, which `a_re_sent_caller_keeps_every_other_column`
+/// pins on the SDK side.
+#[test]
+fn a_semantic_pass_shortens_a_callers_list_keeps_its_other_rows_and_does_not_re_embed_it() {
+    use crate::embedding::pipeline::test_support::{fake_model_dir, fake_pipeline, Counters};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+    let counters = Counters::default();
+    let pipeline = fake_pipeline(&model_dir, None, &counters);
+
+    let mut raw_conn = setup_conn();
+    apply_diff(
+        &mut raw_conn,
+        &Diff {
+            upsert_nodes: vec![to_node_record(rich_caller(), &mut PathWarnings::default())],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let stored_vector = [0.25_f32, 0.5, 0.75];
+    crate::storage::vectors::insert(&raw_conn, "caller", &stored_vector, "earlier-model").unwrap();
+    let conn = IndexStore::new(raw_conn);
+
+    let children = ["declarations", "qualified_suffixes", "placeholder_targets"];
+    let before: Vec<Vec<String>> = children.iter().map(|table| rows_of(&conn, table, "caller")).collect();
+    assert_eq!(
+        before.iter().map(Vec::len).collect::<Vec<_>>(),
+        [2, 1, 1],
+        "the fixture stores every child row"
+    );
+    let node_before = rows_of(&conn, "nodes", "caller");
+    let vector_before = vector_of(&conn, "caller").expect("the caller was embedded by an earlier pass");
+
+    let fresh = WireNode {
+        id: "fresh".to_string(),
+        signature: Some("pub fn fresh()".to_string()),
+        ..canned_node("fresh")
+    };
+    let answer = FileChangeDiff {
+        upsert_nodes: vec![WireNode { untyped_calls: vec!["len".to_string()], ..rich_caller() }, fresh],
+        ..Default::default()
+    };
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+    let plugin = spawn_semantic_stub(plugin_reader, plugin_writer, Vec::new(), answer, false, None);
+    apply_semantic_pass(
+        &mut BufReader::new(core_reader),
+        &mut core_writer,
+        &conn,
+        None,
+        Vec::new(),
+        RequestId::Number(7),
+        &pipeline,
+        TEST_TIMEOUT,
+        &mut on_timeout_must_not_fire,
+    )
+    .unwrap();
+    plugin.join().unwrap();
+
+    assert_eq!(untyped_rows(&conn), vec![("caller".to_string(), "len".to_string())], "`frob` was answered");
+    let after: Vec<Vec<String>> = children.iter().map(|table| rows_of(&conn, table, "caller")).collect();
+    assert_eq!(after, before, "every child row the structural tier stored survives the re-send");
+    assert_eq!(rows_of(&conn, "nodes", "caller"), node_before, "and every column");
+
+    assert_eq!(
+        counters.received(),
+        vec!["pub fn fresh()".to_string()],
+        "only the node with no vector yet reaches the model"
+    );
+    assert_eq!(vector_of(&conn, "caller"), Some(vector_before), "the caller's vector is untouched");
+    assert!(vector_of(&conn, "fresh").is_some(), "a genuinely new node is still embedded");
 }
