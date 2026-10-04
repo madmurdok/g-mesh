@@ -60,8 +60,8 @@ and hides a cache-invalidation rule instead of stating one).
   has already dropped it instead of linking to a file about to disappear.
   Ordering is per batch only, with no added latency and no re-extraction.
   A *created* importer of another file created in the same batch (both are
-  creations, so their relative order is the batch's) is closed by GM-515: core
-  sends a batch's creations together and the plugin applies every presence
+  creations, so their relative order is the batch's) is left to GM-515: core
+  is to send a batch's creations together and the plugin to apply every presence
   change before extracting any of them. Re-routing the creations a second time
   was rejected: a re-sent unchanged file is a no-op in the SDK. Still open: a target
   and importer whose last events settle in different batches (a burst longer
