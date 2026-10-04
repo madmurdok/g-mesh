@@ -379,6 +379,17 @@ Not written in this slice.
    refused, it is the only "reachable only through a link" shape.
    Recommendation: accept, and reword the criterion's pnpm motivation.
 
+### Resolved at review (2026-10-04)
+
+The owner accepted all six recommendations: real-wins (D3), replacing the four
+TS/Go assertions that encoded alias-wins; the `file_changed` remap (2.3) is in
+this task as its own code slice; outside-root links stay refused; core learning
+the link table is a backlog task; the Node TypeScript plugin's two guard bugs
+are left to GM-324, which moves it onto this walk in the same release (so
+B13's TypeScript arm is held by GM-324); the acceptance fixture is a
+gitignored target reached through a link. The ADR proposed in section 8 takes
+number 0025, since GM-348 writes 0024.
+
 ## Appendix: g-mesh calls this note relied on
 
 | Question | Call | Answer |
