@@ -62,6 +62,19 @@ struct ScriptedAnswer {
     /// the ordinary "nothing here".
     #[serde(default)]
     definition: Option<Location>,
+    /// Several locations, answered as an array in this order - what pyright
+    /// answers at a call into an `@overload` set (GM-348). Takes precedence
+    /// over `definition` when non-empty.
+    #[serde(default)]
+    definitions: Vec<Location>,
+    /// What `textDocument/hover` answers there: the markdown `value` of a
+    /// `MarkupContent`, verbatim, so a script spells the fences and
+    /// paragraphs a real server would. Omitted means `null`.
+    #[serde(default)]
+    hover: Option<String>,
+    /// Answer `textDocument/hover` there with this JSON-RPC error instead.
+    #[serde(default)]
+    hover_error: Option<String>,
     /// What `textDocument/implementation` answers there.
     #[serde(default)]
     implementation: Vec<Location>,
@@ -310,6 +323,7 @@ fn main() {
                 let mut capabilities = json!({
                     "definitionProvider": true,
                     "implementationProvider": true,
+                    "hoverProvider": true,
                     "textDocumentSync": 1,
                 });
                 if let Some(encoding) = &script.position_encoding {
@@ -397,6 +411,10 @@ fn main() {
                     Some(_) if changed.load(Ordering::SeqCst) && !revealed.load(Ordering::SeqCst) => {
                         respond(&mut stdout, id, Value::Null)
                     }
+                    Some(answer) if method.ends_with("definition") && !answer.definitions.is_empty() => {
+                        let result: Vec<Value> = answer.definitions.iter().map(Location::to_json).collect();
+                        respond(&mut stdout, id, Value::Array(result))
+                    }
                     Some(answer) if method.ends_with("definition") => {
                         let result = answer.definition.as_ref().map(Location::to_json).unwrap_or(Value::Null);
                         respond(&mut stdout, id, result)
@@ -412,6 +430,33 @@ fn main() {
                     // Not an `exit`: the point is a server that goes away
                     // without saying anything, which is what a crash is.
                     std::process::exit(101);
+                }
+            }
+            // GM-348: a hover is matched on its position like a definition,
+            // and is not counted by `crashAfterRequests`/`silentFrom`, which
+            // were written about definitions and stay about them.
+            "textDocument/hover" => {
+                let key = position_of(&params);
+                let answer = script.answers.iter().find(|answer| {
+                    (answer.uri.as_str(), answer.line, answer.character) == (key.0.as_str(), key.1, key.2)
+                });
+                match answer {
+                    Some(answer) if answer.silent => continue,
+                    Some(answer) if answer.hover_error.is_some() => error_response(
+                        &mut stdout,
+                        id,
+                        -32603,
+                        answer.hover_error.clone().unwrap_or_default(),
+                    ),
+                    Some(answer) => {
+                        let result = answer
+                            .hover
+                            .as_ref()
+                            .map(|value| json!({ "contents": { "kind": "markdown", "value": value } }))
+                            .unwrap_or(Value::Null);
+                        respond(&mut stdout, id, result)
+                    }
+                    None => respond(&mut stdout, id, Value::Null),
                 }
             }
             // The client's answer to *our* `workspace/configuration`: a frame
