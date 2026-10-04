@@ -154,7 +154,7 @@ Rust's trait declaration are this base class, spelled differently.
 `plugins/typescript` is the odd one out and says so: it declares
 `receiver_calls = "unresolved"` for both tiers and emits no edge for `x.m()`
 at all. A session is told the consequence once, by
-`core/src/mcp/instructions.rs`'s `P4_STATIC_RECEIVER`.
+`core/src/mcp/instructions.rs`'s `p4_perm`.
 
 What follows is the part that *is* Python-specific, and it is the larger one.
 

@@ -283,7 +283,7 @@ fn many_implementors(count: usize, name_bytes: usize, file: impl Fn(usize) -> St
 fn the_pending_list_is_capped_and_the_page_keeps_its_budget() {
     let file = |i: usize| format!("src/pending/module_{:02}/implementation.rs", i % 30);
     let files: Vec<String> = (0..30).map(file).collect();
-    let store = pending_index(&many_implementors(60, 440, file), &files);
+    let store = pending_index(&many_implementors(60, 430, file), &files);
 
     let (body, bytes) = implementations(
         &store,

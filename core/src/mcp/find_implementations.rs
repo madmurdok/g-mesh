@@ -36,7 +36,7 @@ use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
 use super::query_shapes::QueryShapes;
-use super::session_hints;
+use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{error, internal_error, success};
 use super::{anchor, find_definition, provenance, FindImplementationsParams, SymbolQueryParams};
 
@@ -88,7 +88,8 @@ struct ImplementationPage {
     /// came from an edge the linker couldn't confirm.
     all_unresolved: bool,
     /// `anchor::file_anchor_hint`, then `session_hints::ALL_UNRESOLVED` when
-    /// `all_unresolved`; absent (not `null`) when neither applies.
+    /// `all_unresolved`, then the once-per-session sentences its rows and
+    /// `provenance` trigger; absent (not `null`) when none applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
     /// See `super::provenance` - present only when the anchor's language
@@ -162,8 +163,9 @@ pub(super) fn handle(
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
+    let hints = SessionHints::default();
     find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        handle_in(store, semantic, capabilities, params.clone())
+        handle_in(store, semantic, capabilities, &hints, params.clone())
     })
 }
 
@@ -172,6 +174,7 @@ fn handle_in(
     store: &Arc<IndexStore>,
     semantic: &find_definition::SemanticRung<'_>,
     capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -203,6 +206,16 @@ fn handle_in(
     .map_err(|e| internal_error("failed to find implementations", e))?;
     let touched = page.results.iter().map(|row| row.file_path.as_str());
     let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
+    let hint = session_hints::join([
+        hint,
+        page.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
+        hints.once(
+            !page.all_unresolved && page.results.iter().any(|row| !row.resolved),
+            HintKey::UnresolvedRow,
+            session_hints::UNRESOLVED_ROW,
+        ),
+        hints.once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+    ]);
 
     success(&ImplementationPage {
         anchor: anchor_info,
@@ -210,7 +223,7 @@ fn handle_in(
         has_more: page.has_more,
         next_cursor: page.next_cursor,
         all_unresolved: page.all_unresolved,
-        hint: session_hints::join([hint, page.all_unresolved.then_some(session_hints::ALL_UNRESOLVED)]),
+        hint,
         provenance,
     })
 }
@@ -285,7 +298,8 @@ struct TransitiveImplementationWalk {
     frontier_nodes: Vec<String>,
     resume_token: Option<String>,
     /// The anchor's `anchor::file_anchor_hint`, then `session_hints::truncated_by`
-    /// for a truncated walk; absent (not `null`) when neither applies.
+    /// for a truncated walk, then `session_hints::PROVENANCE` once per session
+    /// when `provenance` is set; absent (not `null`) when none applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
     /// See `super::provenance`. Present on a fresh walk under exactly the
@@ -428,15 +442,16 @@ fn from_root(
     anchor_node: &NodeRecord,
     resolved_by: find_definition::ResolvedBy,
     queried_as: Option<String>,
-    hint: Option<&'static str>,
     max_depth: Option<u32>,
     capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
 ) -> Result<CallToolResult, ErrorData> {
     // Carries the rung for the same reason the single-hop path does: a caller
     // must be able to tell an exact resolution from one the ladder suggested,
     // and `transitive: true` is the same query with a deeper walk, not a
     // different kind of answer. Only `continued` legitimately has no rung -
     // a resumed walk carries its anchor rather than resolving one.
+    let hint = anchor::file_anchor_hint(anchor_node);
     let anchor_info = anchor::AnchorInfo::with_rung(anchor_node, resolved_by, queried_as);
     let mut options = TraversalOptions::new(anchor_node.id.clone(), Direction::Incoming);
     options.edge_kind = Some(SUPERTYPE_EDGE.to_string());
@@ -452,6 +467,10 @@ fn from_root(
     let mut walk = bound_walk(result, max_depth, max_fanout, framing, Vec::new(), Vec::new());
     let touched = walk.results.iter().map(|row| row.file_path.as_str());
     walk.provenance = tier.disclose(conn, &anchor_node.language, Some(&anchor_node.file_path), touched);
+    walk.hint = session_hints::append(
+        walk.hint,
+        hints.once(walk.provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+    );
     success(&walk)
 }
 
@@ -474,6 +493,7 @@ fn continued(
     conn: &Connection,
     token: &str,
     capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
 ) -> Result<CallToolResult, ErrorData> {
     let state =
         resume_token::decode(token).map_err(|e| internal_error("failed to decode resume token", e))?;
@@ -501,6 +521,10 @@ fn continued(
             .disclose(conn, &language, None, touched)
             .filter(|block| block.semantic_tier == provenance::SemanticTier::Pending);
     }
+    walk.hint = session_hints::append(
+        walk.hint,
+        hints.once(walk.provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+    );
     success(&walk)
 }
 
@@ -519,8 +543,9 @@ pub(crate) fn dispatch(
     capabilities: &HashMap<String, Capabilities>,
     params: FindImplementationsParams,
 ) -> Result<CallToolResult, ErrorData> {
+    let hints = SessionHints::default();
     find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        dispatch_in(store, semantic, capabilities, params.clone())
+        dispatch_in(store, semantic, capabilities, &hints, params.clone())
     })
 }
 
@@ -529,6 +554,7 @@ pub(crate) fn dispatch_in(
     store: &Arc<IndexStore>,
     semantic: &find_definition::SemanticRung<'_>,
     capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
     params: FindImplementationsParams,
 ) -> Result<CallToolResult, ErrorData> {
     let FindImplementationsParams {
@@ -553,13 +579,13 @@ pub(crate) fn dispatch_in(
             );
         }
         let conn = store.read();
-        return continued(&conn, &token, capabilities);
+        return continued(&conn, &token, capabilities, hints);
     }
 
     let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths };
 
     if !transitive.unwrap_or(false) {
-        return handle_in(store, semantic, capabilities, symbol_params);
+        return handle_in(store, semantic, capabilities, hints, symbol_params);
     }
 
     let conn = store.read();
@@ -570,8 +596,7 @@ pub(crate) fn dispatch_in(
     let resolved_by = resolved.by;
     let queried_as = resolved.queried_as;
     let anchor = resolved.node;
-    let hint = anchor::file_anchor_hint(&anchor);
-    from_root(&conn, &anchor, resolved_by, queried_as, hint, max_depth, capabilities)
+    from_root(&conn, &anchor, resolved_by, queried_as, max_depth, capabilities, hints)
 }
 
 #[cfg(test)]

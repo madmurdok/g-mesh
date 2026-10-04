@@ -175,6 +175,8 @@ use serde::Serialize;
 use crate::daemon::manifest::Capabilities;
 use crate::storage::schema;
 
+use super::session_hints;
+
 /// At most this many files in `pendingFiles`; the rest are counted in
 /// `pendingFilesOmitted`.
 pub(super) const MAX_PENDING_FILES: usize = 25;
@@ -314,11 +316,15 @@ pub(super) fn resolve(
 
 impl Resolved {
     /// Bytes the response's page must hold back for this block: only a
-    /// pending block carries a variable-length list.
+    /// pending block carries a variable-length list. Either block may bring
+    /// `session_hints::PROVENANCE` into the page's `hint` (ADR 0022), so that
+    /// sentence, its key and a joining space are held back too.
     pub(super) fn page_reserve(&self) -> usize {
+        let hint = session_hints::PROVENANCE.len() + r#","hint":"""#.len() + 1;
         match self {
-            Resolved::Pending { .. } => PENDING_FILES_RESERVE,
-            Resolved::Silent | Resolved::Absent => 0,
+            Resolved::Pending { .. } => PENDING_FILES_RESERVE + hint,
+            Resolved::Absent => hint,
+            Resolved::Silent => 0,
         }
     }
 

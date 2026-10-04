@@ -149,7 +149,7 @@ tier = "semantic"
 # page for a method reached through a receiver, and the four comments are
 # where the two different reasons are kept apart. Here there is no edge to
 # narrow. There the edge exists and points at the base, which is what
-# `core/src/mcp/instructions.rs`'s `P4_STATIC_RECEIVER` discloses once per
+# `core/src/mcp/instructions.rs`'s `P4_STATIC` discloses once per
 # session for those three languages and never for this one.
 [[callers]]
 symbol = "Greetable#greet"

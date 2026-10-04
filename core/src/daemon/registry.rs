@@ -775,6 +775,13 @@ impl PluginRegistry {
         self.discovered.manifests.iter().map(|(language, m)| (language.clone(), m.capabilities)).collect()
     }
 
+    /// Every catalogued language with no discovered plugin
+    /// (`languages::missing`), in catalogue order. Needs no I/O, so the cold
+    /// start's MCP instructions can name them.
+    pub fn missing_languages(&self) -> Vec<&'static str> {
+        crate::languages::missing(&self.discovered).into_iter().map(|entry| entry.language).collect()
+    }
+
     /// Every discovered language's `[plugin.non_symbol_queries]`, for the
     /// semantic rung. Fixed for the daemon's lifetime, as discovery is.
     pub(crate) fn query_shapes(&self) -> crate::mcp::query_shapes::QueryShapes {

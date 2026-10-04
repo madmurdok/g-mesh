@@ -1,64 +1,46 @@
 use super::*;
 
 /// This module's own baseline rendering, byte for byte - transcribed by
-/// hand rather than derived from `assemble(P4_GENERIC)`, so a
-/// transcription slip in this module's own paragraph constants cannot
-/// accidentally agree with itself. This is the fixture
+/// hand rather than derived from the paragraph constants, so a
+/// transcription slip in one of them cannot accidentally agree with
+/// itself. This is the fixture
 /// [`ts_only_is_byte_identical_to_the_original_string`] checks [`build`]
-/// against.
-///
-/// "Original" names what this constant has meant since GM-262: the text
-/// `get_info` returns for the common, unqualified case (nothing known
-/// yet, or exactly one present language), the one every later addition to
-/// this module had to keep rendering unless it had a specific reason not
-/// to. It stopped being *literally* the text `get_info` returned before
-/// GM-262 at GM-394, which rewrote the second paragraph's closing clause
-/// (see [`P4_GENERIC`]'s own doc comment for why: a tool call issued
-/// while the index is being built now waits instead of erroring, so
-/// telling an agent to grep around a "still building" error was no longer
-/// honest). This constant was re-pinned to match, by the same hand
-/// transcription rule, so it still catches a drift in the five paragraph
-/// constants - just against the current baseline, not the GM-262 one.
+/// against: a TypeScript-only index with nothing absent or failed, the
+/// common case (ADR 0022 re-pinned it).
 const ORIGINAL_INSTRUCTIONS: &str =
     "Structural code-graph queries over this project's index. Prefer these over \
 grepping when you need definitions, references, call edges or imports.\n\n\
+Indexed here: typescript. g-mesh has no answers about files in any other language.\n\n\
 A result anchored by `symbol_id`, or by an unambiguous `symbol_name` \
 (excludes other same-named declarations' call sites, same guarantee either \
 way), is already resolved per call site to that exact declaration - do not \
 re-check it with grep as a routine habit. Only fall back to grep for the one \
 specific gap below, never as a general double-check.\n\n\
-`resolved: false` marks the one thing the indexer could not settle alone: an \
-edge whose target is in *another* file, where whether that file exports the \
-name isn't knowable from the usage alone. Every same-file edge is \
-`resolved: true` - never a reason to grep. find_references/find_callers/\
-find_callees/find_implementations also carry a response-level \
-`allUnresolved: true` when *every* row in a non-empty page is unconfirmed - \
-the page otherwise looks complete (`hasMore: false`, plausible results), so \
-check this field, not just individual rows. Never set on an empty page.\n\n\
-The one legitimate reason to grep afterward: a method call through a \
-variable receiver (`x.foo()`) may produce no edge by design, so caller/reference \
-lists for methods can under-report (a method page that may miss such calls carries \
-`untypedReceiverCalls` where the language reports them); bare function calls and this/super/qualified-type \
-calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive. On a \
-project's first index, or a re-index after an upgrade, a tool call waits for the walk \
-to finish - slow, not wrong; do not abandon it for grep.\n\n\
-Efficient usage: pass `symbol_name` directly to the four tools above instead \
-of calling find_definition first, and raise `limit` for symbols with many \
-results instead of paging.";
+The one legitimate reason to grep afterward: in typescript, a method call through a variable \
+receiver (`x.foo()`) may produce no edge, so a method's caller/reference list there can \
+under-report; bare function calls and this/super/qualified-type calls have no such gap, and \
+for those `hasMore: false` without `unlinkedUsages` is exhaustive.\n\n\
+Efficient usage: pass `symbol_name` directly to \
+find_references/find_callers/find_callees/find_implementations instead of calling find_definition \
+first, and raise `limit` for symbols with many results instead of paging.";
+
+/// A warm session's coverage with `indexed` and nothing absent or failed.
+fn warm(indexed: Vec<PresentLanguage>) -> Coverage {
+    Coverage { covered: Covered::Indexed(indexed), uncovered: Uncovered::Nothing }
+}
+
+/// A cold start's coverage with `installed` and no catalogue language missing.
+fn cold(installed: Vec<PresentLanguage>) -> Coverage {
+    Coverage { covered: Covered::Installed(installed), uncovered: Uncovered::Nothing }
+}
 
 fn ts_only() -> Vec<PresentLanguage> {
-    vec![PresentLanguage {
-        language: "typescript".to_string(),
-        capabilities: Capabilities::default(),
-        semantic_pass_done: false,
-    }]
+    vec![typescript_present()]
 }
 
 /// The bundled Go plugin's own `[plugin.capabilities]`, read off
-/// `plugins/go/plugin.toml` rather than transcribed - so the flip GM-281
-/// made there (`receiver_calls = "resolved"`, structural still
-/// `"unresolved"`) is what these tests actually render from, and a later
-/// edit to that manifest changes what they assert instead of quietly
+/// `plugins/go/plugin.toml` rather than transcribed - so a later edit to
+/// that manifest changes what these tests assert instead of quietly
 /// disagreeing with it.
 fn bundled_go_capabilities() -> Capabilities {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/go");
@@ -67,36 +49,19 @@ fn bundled_go_capabilities() -> Capabilities {
         .capabilities
 }
 
-fn go_present(semantic_pass_done: bool) -> PresentLanguage {
-    PresentLanguage {
-        language: "go".to_string(),
-        capabilities: bundled_go_capabilities(),
-        semantic_pass_done,
-    }
+fn go_present() -> PresentLanguage {
+    PresentLanguage { language: "go".to_string(), capabilities: bundled_go_capabilities() }
 }
 
-/// Rust as it is present in an index whose semantic pass has not landed:
-/// the shipped capabilities, and `semantic_pass_done = false`.
-///
-/// It read a hand-written capability literal until GM-290, because the
-/// manifest it was modelling did not exist yet - it was the *hypothetical*
-/// future Rust, used to exercise the multi-language naming branch before
-/// there was a rust-analyzer tier to produce it. GM-290 shipped exactly
-/// those capabilities, so the literal is gone and this reads the manifest
-/// like its Go counterpart: a test that models a manifest is a test that
-/// can disagree with one.
-fn rust_pre_semantic() -> PresentLanguage {
-    PresentLanguage {
-        language: "rust".to_string(),
-        capabilities: bundled_rust_capabilities(),
-        semantic_pass_done: false,
-    }
+/// Rust with the shipped capabilities, read off its manifest like its Go
+/// counterpart: a test that models a manifest is a test that can disagree
+/// with one.
+fn rust_present() -> PresentLanguage {
+    PresentLanguage { language: "rust".to_string(), capabilities: bundled_rust_capabilities() }
 }
 
 /// The bundled Rust plugin's own `[plugin.capabilities]`, read off
-/// `plugins/rust/plugin.toml` rather than transcribed - so a later edit
-/// to that manifest changes what the two `rust_only_*` tests assert
-/// instead of quietly disagreeing with it.
+/// `plugins/rust/plugin.toml` rather than transcribed.
 fn bundled_rust_capabilities() -> Capabilities {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/rust");
     crate::daemon::manifest::read_manifest(&dir)
@@ -106,13 +71,7 @@ fn bundled_rust_capabilities() -> Capabilities {
 
 /// The bundled Python plugin's own `[plugin.capabilities]`, read off
 /// `plugins/python/plugin.toml` rather than transcribed - the same
-/// `bundled_rust_capabilities`/`bundled_go_capabilities` pattern, so a
-/// later edit to that manifest changes what the two `python_only_*` tests
-/// assert instead of quietly disagreeing with it. That is not
-/// hypothetical: GM-299 landed the pyright tier and flipped
-/// `receiver_calls` to `"resolved"`, and the single test that used to read
-/// this had to become the pair below - which is the failure mode this
-/// helper exists to produce rather than avoid.
+/// `bundled_rust_capabilities`/`bundled_go_capabilities` pattern.
 fn bundled_python_capabilities() -> Capabilities {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/python");
     crate::daemon::manifest::read_manifest(&dir)
@@ -121,19 +80,14 @@ fn bundled_python_capabilities() -> Capabilities {
 }
 
 fn typescript_present() -> PresentLanguage {
-    PresentLanguage {
-        language: "typescript".to_string(),
-        capabilities: Capabilities::default(),
-        semantic_pass_done: false,
-    }
+    PresentLanguage { language: "typescript".to_string(), capabilities: Capabilities::default() }
 }
 
 /// A future language whose semantic tier resolves receiver calls only
 /// through an LSP bridge - the same shape as Rust (design doc's "Paper
 /// stress test" table: Roslyn/clangd/pyright/jdtls/kotlin-lsp all listed
-/// as "semantic" only, never resolved structurally), gapped until its
-/// own semantic pass has run.
-fn bridge_semantic_pre_pass(language: &str) -> PresentLanguage {
+/// as "semantic" only, never resolved structurally): pass-dependent.
+fn bridge_semantic(language: &str) -> PresentLanguage {
     PresentLanguage {
         language: language.to_string(),
         capabilities: Capabilities {
@@ -143,80 +97,37 @@ fn bridge_semantic_pre_pass(language: &str) -> PresentLanguage {
             receiver_calls: ReceiverCallResolution::Resolved,
             receiver_calls_structural: ReceiverCallResolution::Unresolved,
         },
-        semantic_pass_done: false,
     }
 }
 
-/// GM-262's own discrimination requirement, and this module's real
-/// permanent regression guard for it - `ORIGINAL_INSTRUCTIONS` above is
-/// transcribed independently of `P1`/`P2`/`P3`/`P4_GENERIC`/`P5`,
-/// so this assertion fails the moment any of those five drifts from this
-/// module's own current baseline (see `ORIGINAL_INSTRUCTIONS`'s own doc
-/// comment for what "original" means since GM-394), not just on a change
-/// to the receiver-call clause specifically. Proven by mutation, not
-/// merely asserted: changing one byte of `P4_GENERIC` (`"by design"` to
-/// `"by desigm"`) while leaving `ORIGINAL_INSTRUCTIONS` untouched turns
-/// this failing, confirmed by hand while implementing GM-262 and reverted
-/// afterward. This assertion is what stands in for repeating that
-/// procedure on every future run, so the constant's own doc comment does
-/// not.
+/// This module's permanent regression guard for the common rendering:
+/// `ORIGINAL_INSTRUCTIONS` above is transcribed independently of the
+/// paragraph constants, so this assertion fails the moment any of them
+/// drifts.
 #[test]
 fn ts_only_is_byte_identical_to_the_original_string() {
-    let rendered = build(&ts_only());
-    assert_eq!(
-        rendered, ORIGINAL_INSTRUCTIONS,
-        "a TypeScript-only project must read exactly what it did before GM-262"
-    );
+    let rendered = build(&warm(ts_only()));
+    assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "a TypeScript-only project must read exactly the baseline");
     // The measured length of the current rendering, not a re-derivation.
-    assert_eq!(rendered.len(), 1836, "this module's own current baseline, re-measured");
+    assert_eq!(rendered.len(), 1141, "this module's own current baseline, re-measured");
 }
 
+/// Nothing indexed: the coverage paragraph says so, and there is no
+/// receiver paragraph to render (ADR 0022, section 3).
 #[test]
-fn empty_present_falls_back_to_the_original_string() {
-    assert_eq!(build(&[]), ORIGINAL_INSTRUCTIONS, "no index yet must read the same as it always has");
+fn nothing_indexed_says_so_and_leaves_out_the_receiver_paragraph() {
+    let rendered = build(&warm(Vec::new()));
+    assert!(rendered.contains(HEAD_NONE), "{rendered}");
+    assert!(!rendered.contains("The one legitimate reason to grep afterward"), "{rendered}");
 }
 
-/// GM-287's own acceptance criterion, and the half of it GM-290 did not
-/// change: a Rust-only index whose semantic pass has not landed still
-/// lists the receiver-call gap, checked against the shipped manifest
-/// rather than a hand-written capability literal
-/// (`bundled_rust_capabilities`'s own doc).
+/// The four assertions every pass-dependent language makes, so that the
+/// three languages that reach this rendering are checked against one
+/// statement of it rather than three transcriptions.
 ///
-/// Until GM-290 this ran for `semantic_pass_done` of *both* values,
-/// because `plugins/rust/plugin.toml` declared `receiver_calls =
-/// "unresolved"` and a pass that could never resolve one could never
-/// close the gap either. It now declares `"resolved"`, so the two values
-/// have genuinely different answers and each has its own test - the same
-/// pair `go_present`'s two tests have had since GM-281.
-///
-/// This is also the permanent state of a machine with no rust-analyzer:
-/// the plugin answers every `semanticPass` with an empty *incomplete*
-/// diff, `semanticPassAt` is never set, and the gap stays listed. That is
-/// the whole reason the degradation reports incomplete rather than
-/// complete.
-#[test]
-fn rust_only_before_its_semantic_pass_lists_the_receiver_gap() {
-    let rendered = build(&[rust_pre_semantic()]);
-    assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "a single gapped language reads as it always has");
-    assert!(
-        rendered.contains("The one legitimate reason to grep afterward"),
-        "the gap is real until the pass has run"
-    );
-    assert!(rendered.contains("may produce no edge by design"), "one present language is never named");
-}
-
-/// The four assertions every "its semantic tier has landed" arm makes,
-/// so that the three languages that reach this rendering are checked
-/// against one statement of it rather than three transcriptions.
-///
-/// The two negative assertions are the discrimination, not decoration.
-/// `"One real gap"` is what this rendering said until GM-385, and it was
-/// measured false in all three languages (see [`P4_STATIC_RECEIVER`]'s
-/// own doc for the queries). `"may produce no edge"` is the *pre-pass*
-/// wording, so its absence is what separates this arm from the
-/// `*_before_its_semantic_pass_*` test beside it - without it both arms
-/// would pass on a `build` that ignored `semantic_pass_done` entirely.
-fn assert_narrowed_receiver_clause(rendered: &str, language: &str) {
+/// `"may produce no edge"` is the never-resolving wording, so its absence
+/// is what separates this rendering from TypeScript's.
+fn assert_pass_dependent_receiver_clause(rendered: &str, language: &str) {
     assert!(
         rendered.contains("The one legitimate reason to grep afterward"),
         "{language}: the gap narrows, it never closes"
@@ -232,27 +143,20 @@ fn assert_narrowed_receiver_clause(rendered: &str, language: &str) {
     );
     assert!(
         !rendered.contains("may produce no edge"),
-        "{language}: that is the pre-pass wording, and this arm is past it:\n{rendered}"
+        "{language}: that is the never-resolving wording:\n{rendered}"
     );
-    assert!(
-        rendered.contains("a tool call waits for the walk to finish before answering"),
-        "{language}: the wait note survives"
-    );
+    assert!(rendered.contains(S_PASS), "{language}: the pass-dependent sentence:\n{rendered}");
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
         "{language}: {} bytes exceeds the {INSTRUCTIONS_BYTE_CEILING}-byte ceiling",
         rendered.len()
     );
-    println!("{language}-only (pass done) bytes: {}", rendered.len());
+    println!("{language}-only bytes: {}", rendered.len());
 }
 
-/// And what the same index reads once rust-analyzer has answered
-/// (GM-290): the receiver-call gap *narrows* rather than closing.
-///
-/// This is the assertion behind "how long does the gap stay listed" - the
-/// answer being "until this flips", which core sets from
-/// `language_state.semanticPassAt` the moment a *complete* whole-project
-/// pass lands. GM-385 changed what happens when it flips, not when.
+/// Rust resolves receiver calls only through its semantic pass, so it
+/// renders the static form plus [`S_PASS`] whatever its pass state; that
+/// state reaches the caller through `provenance` (ADR 0022, section 2).
 ///
 /// Measured on this plugin's own fixture:
 /// `find_callers("shapes::Shape::area")` is
@@ -262,216 +166,98 @@ fn assert_narrowed_receiver_clause(rendered: &str, language: &str) {
 /// though either of those two call sites reaches it at run time.
 /// `conformance/expect.toml` asserts both as exact sets.
 #[test]
-fn rust_only_after_its_semantic_pass_narrows_the_receiver_gap_instead_of_closing_it() {
-    let mut rust = rust_pre_semantic();
-    rust.semantic_pass_done = true;
-    let rendered = build(&[rust]);
-    assert_narrowed_receiver_clause(&rendered, "rust");
+fn rust_only_renders_the_static_form_with_the_pass_sentence() {
+    let rendered = build(&warm(vec![rust_present()]));
+    assert_pass_dependent_receiver_clause(&rendered, "rust");
 }
 
-/// GM-297's own acceptance criterion 2, and the half GM-299 did not
-/// change: a Python-only index whose semantic pass has not landed still
-/// lists the receiver-call gap, checked against the shipped manifest
-/// rather than a hand-written capability literal
-/// (`bundled_python_capabilities`'s own doc).
-///
-/// Until GM-299 this ran for `semantic_pass_done` of *both* values,
-/// because `plugins/python/plugin.toml` declared `receiver_calls =
-/// "unresolved"` and a pass that could never resolve one could never
-/// close the gap either. It now declares `"resolved"`, so the two values
-/// have genuinely different answers and each has its own test - the same
-/// transition `rust_only_*` records for GM-290.
-///
-/// This is also the permanent state of a machine with no pyright: the
-/// plugin answers every `semanticPass` with an empty *incomplete* diff,
-/// `semanticPassAt` is never set, and the gap stays listed.
-#[test]
-fn python_only_before_its_semantic_pass_lists_the_receiver_gap() {
-    let rendered = build(&[PresentLanguage {
-        language: "python".to_string(),
-        capabilities: bundled_python_capabilities(),
-        semantic_pass_done: false,
-    }]);
-    assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "a single gapped language reads as it always has");
-    assert!(
-        rendered.contains("The one legitimate reason to grep afterward"),
-        "the gap is real until the pass has run"
-    );
-    assert!(rendered.contains("may produce no edge by design"), "one present language is never named");
-}
-
-/// And what the same index reads once pyright has answered (GM-299): the
-/// receiver-call gap narrows rather than dropping out.
-///
-/// Worth reading beside `plugins/python/README.md`, which says at length
-/// that pyright resolves a receiver call only when it can infer the
-/// receiver's type - an unannotated parameter stays unresolved for ever.
-/// That list is still the README's, and still cannot fit here.
-///
-/// What GM-385 moved *into* this rendering is the one part of it that is
-/// not Python-specific at all. GM-299 read the whole thing as "a switch,
-/// and Python's answer is a paragraph", and the paragraph is only
-/// Python's because it enumerates what pyright cannot infer. The
-/// narrowing - that what pyright *does* infer is the receiver's
+/// Python, the same way: pyright resolves a receiver call against its
 /// annotation, so `obj.describe()` for `obj: Base` is attributed to
-/// `Base.describe` however the object was built - is one sentence and is
-/// true of `go/types` and rust-analyzer in exactly the same words.
-/// Measured: `find_callers("Base.describe")` carries
+/// `Base.describe` however the object was built. Measured:
+/// `find_callers("Base.describe")` carries
 /// `pkg/callers.py:through_a_base_annotation`, and
 /// `find_callers("Deep.describe")` does not, though `Deep` overrides
 /// `describe` and `find_implementations("Base")` names it.
 #[test]
-fn python_only_after_its_semantic_pass_narrows_the_receiver_gap_instead_of_closing_it() {
-    let rendered = build(&[PresentLanguage {
+fn python_only_renders_the_static_form_with_the_pass_sentence() {
+    let rendered = build(&warm(vec![PresentLanguage {
         language: "python".to_string(),
         capabilities: bundled_python_capabilities(),
-        semantic_pass_done: true,
-    }]);
-    assert_narrowed_receiver_clause(&rendered, "python");
+    }]));
+    assert_pass_dependent_receiver_clause(&rendered, "python");
 }
 
-/// What a Go-only index reads once Go's whole-project `semanticPass` has
-/// landed - GM-281's own "check what the generated instructions then say"
-/// criterion, asserted against the shipped manifest rather than a
-/// hand-written capability literal.
-///
-/// The `go/types` pass resolved every `x.M()` in the index, and GM-385's
-/// point is what it resolved them *to*. This is the rendering measured
-/// against a real index: on `plugins/go/conformance/project`, with the
-/// pass complete, `find_callers("Conn.Close")` answers `results: []`,
-/// `hasMore: false` in 240 bytes, while `server/conn.go:CloseAll` closes
-/// a `Conn` through a `Closer` value and `find_implementations("Closer")`
-/// names `Conn`. The session that returns that empty page used to also
-/// say "One real gap" and "do not re-check it with grep".
+/// Go, the same way. On `plugins/go/conformance/project`, with the pass
+/// complete, `find_callers("Conn.Close")` answers `results: []` while
+/// `server/conn.go:CloseAll` closes a `Conn` through a `Closer` value and
+/// `find_implementations("Closer")` names `Conn`.
 #[test]
-fn go_only_after_its_semantic_pass_narrows_the_receiver_gap_instead_of_closing_it() {
-    let rendered = build(&[go_present(true)]);
-    assert_narrowed_receiver_clause(&rendered, "go");
+fn go_only_renders_the_static_form_with_the_pass_sentence() {
+    let rendered = build(&warm(vec![go_present()]));
+    assert_pass_dependent_receiver_clause(&rendered, "go");
 }
 
 /// The silence half of the control: TypeScript declares
-/// `receiver_calls = "unresolved"` in *both* tiers, so no amount of
-/// semantic-pass progress can reach the narrowed rendering, and the
-/// sentence about binding to a declared type must never appear for it.
-///
-/// Asserted with `semantic_pass_done: true` deliberately - the flag that
-/// moves the other three languages into the narrowed arm is set here and
-/// changes nothing, which is what makes this a control rather than a
-/// restatement of `ts_only_is_byte_identical_to_the_original_string`.
-/// Measured on a probe fixture carrying three real receiver calls
-/// (`g.greet()` on a parameter typed by the interface, by the base
-/// class, and on a local of a subclass): every one of the three `greet`
-/// declarations answers `find_callers` with an empty set, because this
-/// plugin emits no receiver-call edge for either tier to narrow.
+/// `receiver_calls = "unresolved"` in *both* tiers, so it is named as
+/// never resolving, and the sentence about binding to a declared type
+/// must never appear for it. Measured on a probe fixture carrying three
+/// real receiver calls (`g.greet()` on a parameter typed by the
+/// interface, by the base class, and on a local of a subclass): every one
+/// of the three `greet` declarations answers `find_callers` with an empty
+/// set, because this plugin emits no receiver-call edge.
 #[test]
-fn typescript_never_reaches_the_narrowed_rendering_however_its_pass_goes() {
-    let mut ts = typescript_present();
-    ts.semantic_pass_done = true;
-
-    let rendered = build(&[ts]);
+fn typescript_never_reaches_the_narrowed_rendering() {
+    let rendered = build(&warm(ts_only()));
 
     assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "typescript's gap never narrows, because it never resolves");
-    assert!(rendered.contains("may produce no edge by design"), "the open-gap wording is the right one here");
+    assert!(rendered.contains("in typescript, a method call"), "the never-resolving wording names it");
     assert!(
         !rendered.contains("binds to the receiver's declared"),
         "the narrowed clause must not fire for a language with no receiver-call edges:\n{rendered}"
     );
+    assert!(!rendered.contains(S_PASS), "typescript has no semantic pass to wait for:\n{rendered}");
 }
 
-/// The scope decision [`P4_STATIC_RECEIVER`]'s doc argues for, pinned so
-/// that it is a decision rather than an omission: a mixed project renders
-/// [`p4_named`], which keeps the open-gap clause for the languages that
-/// have it and does *not* carry the narrowing for the ones that do not.
-///
-/// That rendering is unspecific rather than false - it still warns that a
-/// method's caller/reference lists can under-report, and never claims a
-/// method page is exhaustive. The reason it is left alone is the byte
-/// budget measured in that constant's doc: this rendering's worst case is
-/// already 1,857 of 1,900 bytes.
+/// A mixed project names its never-resolving languages and appends
+/// [`S_PASS`] for its pass-dependent ones; it does not carry the static
+/// form's override sentence, which would be false for the named ones.
 #[test]
 fn a_mixed_project_keeps_the_named_open_gap_and_does_not_carry_the_narrowing() {
-    let mut go_done = go_present(true);
-    go_done.semantic_pass_done = true;
+    let rendered = build(&warm(vec![typescript_present(), go_present()]));
 
-    let rendered = build(&[typescript_present(), go_done]);
-
-    assert!(rendered.contains("may produce no edge in typescript"), "{rendered}");
+    assert!(rendered.contains("in typescript, a method call"), "{rendered}");
+    assert!(!rendered.contains("binds to the receiver's declared"), "{rendered}");
+    assert!(rendered.contains(S_PASS), "{rendered}");
     assert!(
-        !rendered.contains("binds to the receiver's declared"),
-        "scoped out by budget, deliberately - see P4_STATIC_RECEIVER:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("caller/reference lists for methods can under-report"),
-        "the warning this rendering does keep is why leaving it alone is not a falsehood:\n{rendered}"
+        rendered.contains("a method's caller/reference list there can under-report"),
+        "the warning this rendering keeps:\n{rendered}"
     );
 }
 
-/// And before that pass - the cold-start window, and the *permanent*
-/// state of a machine with no Go toolchain, where the plugin answers
-/// every `semanticPass` with an empty diff and `semanticPassAt` is never
-/// set. The gap is real then, so it stays listed: `receiver_calls =
-/// "resolved"` is a statement about what the semantic tier *can* do, and
-/// `receiver_calls_structural = "unresolved"` is what stops that from
-/// being read as a promise about the index as it stands.
+/// A pass-dependent language is never named in the gap list, so TypeScript
+/// plus Rust names only TypeScript.
 #[test]
-fn go_only_before_its_semantic_pass_still_lists_the_receiver_gap() {
-    let rendered = build(&[go_present(false)]);
-    assert!(
-        rendered.contains("The one legitimate reason to grep afterward"),
-        "the gap is real until the pass has run"
-    );
-    assert!(rendered.contains("may produce no edge by design"), "one present language is never named");
-    assert_eq!(rendered, ORIGINAL_INSTRUCTIONS, "a single gapped language reads as it always has");
+fn ts_plus_rust_names_only_typescript() {
+    let rendered = build(&warm(vec![typescript_present(), rust_present()]));
+    assert!(rendered.contains("in typescript, a method call"), "{rendered}");
+    assert!(rendered.contains("Indexed here: rust and typescript."), "{rendered}");
+    assert!(rendered.contains(S_PASS), "{rendered}");
+    println!("ts+rust bytes: {}", rendered.len());
 }
 
-#[test]
-fn ts_plus_rust_pre_semantic_names_both() {
-    let rendered = build(&[typescript_present(), rust_pre_semantic()]);
-    assert!(rendered.contains("may produce no edge in rust and typescript"));
-    println!("ts+rust-pre-semantic bytes: {}", rendered.len());
-}
-
-#[test]
-fn ts_plus_rust_after_rusts_semantic_pass_drops_rust_from_the_list() {
-    let mut rust_done = rust_pre_semantic();
-    rust_done.semantic_pass_done = true;
-    let rendered = build(&[typescript_present(), rust_done]);
-    assert!(rendered.contains("may produce no edge in typescript"));
-    assert!(!rendered.contains("rust"), "rust's own gap is closed once its semantic pass has run");
-}
-
-/// GM-262's own worst-case scope note, factored out so
-/// [`worst_case_every_bundled_and_planned_language_gapped_at_once`] and
-/// GM-395 slice 2b's cold-start byte-budget tests below render from the
-/// exact same fixture rather than two copies that could drift apart:
-/// typescript, go and rust plus the five languages the architecture
-/// doc's "Paper stress test" section names (C#, C++, Python, Java,
-/// Kotlin), all present and all still gapped at once - a monorepo where
-/// nothing's semantic pass has finished yet.
+/// The worst-case fixture: typescript and go plus rust and the five
+/// languages the architecture doc's "Paper stress test" section names
+/// (C#, C++, Python, Java, Kotlin), all present at once.
 fn worst_case_present() -> Vec<PresentLanguage> {
     vec![
-        PresentLanguage {
-            language: "typescript".to_string(),
-            capabilities: Capabilities::default(),
-            semantic_pass_done: false,
-        },
-        PresentLanguage {
-            language: "go".to_string(),
-            capabilities: Capabilities {
-                semantic_pass: true,
-                semantic_sweep: false,
-                semantic_prepare: false,
-                receiver_calls: ReceiverCallResolution::Resolved,
-                receiver_calls_structural: ReceiverCallResolution::Unresolved,
-            },
-            semantic_pass_done: false,
-        },
-        bridge_semantic_pre_pass("rust"),
-        bridge_semantic_pre_pass("csharp"),
-        bridge_semantic_pre_pass("cpp"),
-        bridge_semantic_pre_pass("python"),
-        bridge_semantic_pre_pass("java"),
-        bridge_semantic_pre_pass("kotlin"),
+        typescript_present(),
+        bridge_semantic("go"),
+        bridge_semantic("rust"),
+        bridge_semantic("csharp"),
+        bridge_semantic("cpp"),
+        bridge_semantic("python"),
+        bridge_semantic("java"),
+        bridge_semantic("kotlin"),
     ]
 }
 
@@ -479,19 +265,18 @@ fn worst_case_present() -> Vec<PresentLanguage> {
 /// common one or two-language case.
 #[test]
 fn worst_case_every_bundled_and_planned_language_gapped_at_once() {
-    let rendered = build(&worst_case_present());
+    let rendered = build(&warm(worst_case_present()));
     println!("worst-case bytes: {}", rendered.len());
     println!("worst-case text: {rendered}");
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
-        "worst case must stay under the ceiling (or the fallback must have engaged): {} bytes",
+        "worst case must stay under the ceiling (or the ladder must have engaged): {} bytes",
         rendered.len()
     );
 }
 
 /// [`format_language_list`] on its own, independent of [`build`]'s byte
-/// arithmetic - the three arities the receiver-gap clause can actually
-/// need.
+/// arithmetic - the three arities the lists can actually need.
 #[test]
 fn format_language_list_covers_one_two_and_several() {
     assert_eq!(format_language_list(&["go".to_string()]), "go");
@@ -502,82 +287,42 @@ fn format_language_list_covers_one_two_and_several() {
     );
 }
 
-/// The fallback wording itself must (a) exist as a real, shorter
-/// alternative and (b) still fit under the ceiling on its own - a
-/// fallback that itself blew the budget would defeat the point.
+/// The ladder's step 3 wording must still fit under the ceiling on its own,
+/// and makes no claim that a page discloses the gap: TypeScript reports no
+/// per-page field for it (ADR 0022, section 1, row 12).
 #[test]
 fn fallback_wording_fits_under_the_ceiling() {
-    let rendered = assemble(&p4_fallback());
+    let rendered = render(&warm(ts_only()), 3);
     println!("fallback bytes: {}", rendered.len());
     assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
-    assert!(rendered.contains("untypedReceiverCalls"));
+    assert!(rendered.contains(P4_PERM_FALLBACK));
+    assert!(!rendered.contains("untypedReceiverCalls"), "{rendered}");
 }
 
-/// [`build`]'s own fallback branch, proven rather than merely present:
-/// today's eight-language worst case fits under the ceiling on its own
-/// (see [`worst_case_every_bundled_and_planned_language_gapped_at_once`]),
-/// so nothing in this module's other tests actually exercises the `else`
-/// arm of `build`'s ceiling check. This test forces it with a present
-/// list long enough that naming every gapped language would overflow -
-/// more languages than the design doc plans for today, standing in for
-/// "language 9, 10, ..." rather than a real one - and asserts the
-/// rendering that comes back is the fallback, not a truncated name list.
-///
-/// Sixteen languages sufficed before GM-394; its shorter second clause
-/// (see [`P4_GENERIC`]'s own doc comment) freed up enough headroom that
-/// sixteen no longer overflows [`INSTRUCTIONS_BYTE_CEILING`] (measured:
-/// 1,837 bytes, under the 1,900 ceiling) - so the fixture below has
-/// twenty-eight, re-measured to overflow at 1,925 bytes, still standing in
-/// for "more than the design doc plans for" rather than a real count.
+/// [`build`]'s ladder, proven rather than merely present: a list of
+/// never-resolving languages long enough that naming them all overflows
+/// the ceiling renders the generic step-3 paragraph, not a truncated name
+/// list. Sixty synthetic languages stand in for "more than the design doc
+/// plans for" rather than a real count.
 #[test]
 fn a_present_list_too_long_to_name_falls_back_instead_of_exceeding_the_ceiling() {
-    let extra_languages = [
-        "typescript",
-        "go",
-        "rust",
-        "csharp",
-        "cpp",
-        "python",
-        "java",
-        "kotlin",
-        "swift",
-        "ruby",
-        "scala",
-        "haskell",
-        "elixir",
-        "erlang",
-        "dart",
-        "lua",
-        "clojure",
-        "fsharp",
-        "ocaml",
-        "perl",
-        "zig",
-        "nim",
-        "prolog",
-        "fortran",
-        "cobol",
-        "pascal",
-        "delphi",
-        "groovy",
-    ];
-    let present: Vec<PresentLanguage> =
-        extra_languages.iter().map(|language| bridge_semantic_pre_pass(language)).collect();
+    let present: Vec<PresentLanguage> = (0..60)
+        .map(|i| PresentLanguage { language: format!("lang{i:02}"), capabilities: Capabilities::default() })
+        .collect();
+    let coverage = warm(present);
 
-    // Sanity check on the test fixture itself: naming all twenty-eight
-    // really would overflow the ceiling, or this test would silently
-    // exercise the same branch as the worst-case test above instead of
-    // the one it means to.
-    let would_be_named =
-        assemble(&p4_named(&format_language_list(&languages_with_open_receiver_gap(&present))));
+    // Sanity check on the test fixture itself: naming them all really
+    // would overflow the ceiling, or this test would exercise step 1.
+    let would_be_named = render(&coverage, 2);
     assert!(
         would_be_named.len() > INSTRUCTIONS_BYTE_CEILING,
         "test fixture must actually overflow the ceiling to exercise the fallback branch: {} bytes",
         would_be_named.len()
     );
 
-    let rendered = build(&present);
-    assert_eq!(rendered, assemble(&p4_fallback()), "must render the fallback, not a truncated name list");
+    let rendered = build(&coverage);
+    assert_eq!(rendered, render(&coverage, 3), "must render the fallback, not a truncated name list");
+    assert!(rendered.contains(P4_PERM_FALLBACK));
     assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
 }
 
@@ -603,7 +348,7 @@ fn root_of_byte_len(len: usize) -> std::path::PathBuf {
 #[test]
 fn cold_start_unindexed_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() {
     let root = root_of_byte_len(103);
-    let rendered = cold_start(&root, false, &worst_case_present());
+    let rendered = cold_start(&root, false, &cold(worst_case_present()));
     println!("cold-start (unindexed, 103-byte root) bytes: {}", rendered.len());
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
@@ -623,7 +368,7 @@ fn cold_start_unindexed_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling(
 #[test]
 fn cold_start_walking_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() {
     let root = root_of_byte_len(103);
-    let rendered = cold_start(&root, true, &worst_case_present());
+    let rendered = cold_start(&root, true, &cold(worst_case_present()));
     println!("cold-start (walking, 103-byte root) bytes: {}", rendered.len());
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
@@ -642,7 +387,7 @@ fn cold_start_walking_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() 
 #[test]
 fn cold_start_falls_back_to_the_no_path_line_once_the_root_is_too_long() {
     let root = root_of_byte_len(600);
-    let rendered = cold_start(&root, false, &worst_case_present());
+    let rendered = cold_start(&root, false, &cold(worst_case_present()));
     println!("cold-start (unindexed, 600-byte root) bytes: {}", rendered.len());
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
@@ -768,24 +513,39 @@ fn build_front_drops_a_root_too_long_for_the_ceiling() {
     assert!(rendered.ends_with("Projects: a, b."), "{rendered}");
 }
 
-/// The eight-language worst case still names every gapped language
-/// and points at `untypedReceiverCalls` when nothing is prefixed, but under a
-/// cold-start line the body is built against the ceiling less the no-path
-/// line and falls back to [`p4_fallback`], whatever the root's length.
-/// Control: build `cold_start`'s body with `build(present)` again (a
-/// 103-byte root renders the named body under the no-path line, over the
-/// ceiling).
+/// Under a cold-start line the body is built against the ceiling less the
+/// no-path line, whatever the root's length: a coverage whose full text
+/// fits [`build`]'s ceiling but not that smaller budget renders ladder
+/// step 3 under every root. Control: build `cold_start`'s body with
+/// `build(coverage)` again (a 103-byte root renders the step-1 body under
+/// the no-path line, over the ceiling).
 #[test]
 fn the_worst_case_cold_start_falls_back_to_the_generic_receiver_paragraph() {
-    let named = build(&worst_case_present());
-    assert!(named.contains("`untypedReceiverCalls`"), "{named}");
-    assert_ne!(named, assemble(&p4_fallback()));
-    let fallback = assemble(&p4_fallback());
+    let line = cold_start_line_fallback(false).len().min(cold_start_line_fallback(true).len()) + 2;
+    let coverage = (1..200)
+        .map(|n| {
+            cold(
+                (0..n)
+                    .map(|i| PresentLanguage {
+                        language: format!("lang{i:03}"),
+                        capabilities: Capabilities::default(),
+                    })
+                    .collect(),
+            )
+        })
+        .find(|coverage| {
+            let full = render(coverage, 1).len();
+            full <= INSTRUCTIONS_BYTE_CEILING && full > INSTRUCTIONS_BYTE_CEILING - line
+        })
+        .expect("some list length lands between the two budgets");
+    let named = build(&coverage);
+    assert_eq!(named, render(&coverage, 1), "the full text fits the plain ceiling");
+    let fallback = render(&coverage, 3);
     println!("named {} bytes, fallback {} bytes", named.len(), fallback.len());
 
     for walking in [false, true] {
         for root_len in [10, 103, 600] {
-            let rendered = cold_start(&root_of_byte_len(root_len), walking, &worst_case_present());
+            let rendered = cold_start(&root_of_byte_len(root_len), walking, &coverage);
             println!("walking={walking} root={root_len}: {} bytes", rendered.len());
             assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
             assert!(rendered.ends_with(&fallback), "walking={walking} root={root_len}: {rendered}");

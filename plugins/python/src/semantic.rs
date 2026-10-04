@@ -212,8 +212,8 @@
 //!
 //! Incomplete, not complete, is the load-bearing half: it leaves
 //! `language_state.semanticPassAt` unset, which is what keeps Python's
-//! receiver-call gap listed in the generated MCP instructions
-//! (`core::mcp::instructions::has_open_receiver_gap`). Installing pyright and
+//! answers carrying a `provenance` block that says the semantic tier is
+//! missing (`core::mcp::provenance`). Installing pyright and
 //! restarting the daemon then gets the pass; a completed-but-empty pass would
 //! have recorded "done" and never asked again.
 
