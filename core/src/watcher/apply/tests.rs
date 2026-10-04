@@ -1596,3 +1596,112 @@ fn a_semantic_pass_shortens_a_callers_list_keeps_its_other_rows_and_does_not_re_
     assert_eq!(vector_of(&conn, "caller"), Some(vector_before), "the caller's vector is untouched");
     assert!(vector_of(&conn, "fresh").is_some(), "a genuinely new node is still embedded");
 }
+
+// --- GM-489: one caller row for a typed receiver call through an edit ---------
+
+/// `src/lib.rs` holds the caller `f` and its callee `d`. Without
+/// `pre_gm489`, the store is what the GM-489 bridge leaves after a pass that
+/// confirmed the typed call `f -> d`: the structural edge `x` alone. With it,
+/// it is what the bridge used to leave: `x` retracted and a semantic `e-sem`
+/// onto the placeholder `p-sem` in its place.
+fn store_after_a_confirming_pass(pre_gm489: bool) -> IndexStore {
+    let mut raw = setup_conn();
+    raw.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let mut seed = FileChangeDiff {
+        upsert_nodes: vec![node_in("f", "src/lib.rs"), node_in("d", "src/lib.rs")],
+        ..Default::default()
+    };
+    if pre_gm489 {
+        seed.upsert_nodes.push(node_in("p-sem", "src/lib.rs"));
+        seed.upsert_edges.push(semantic_edge("e-sem", "f", "p-sem"));
+    } else {
+        seed.upsert_edges.push(unresolved_edge("x", "f", "d"));
+    }
+    apply_diff(&mut raw, &to_storage_diff(seed, &mut PathWarnings::default())).unwrap();
+    crate::storage::write::upsert_indexed_file(&raw, "src/lib.rs", 1, "hash").unwrap();
+    IndexStore::new(raw)
+}
+
+/// An edit of `src/lib.rs` that keeps the call: the reparse re-sends `f`,
+/// `d` and the structural `x` under its unchanged id, completely. Then the
+/// semantic pass answers `pass`, or - `None` - fails (the stub goes away).
+fn edit_keeping_the_call(conn: &IndexStore, id: i64, pass: Option<FileChangeDiff>) {
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+    let request_id = RequestId::Number(id);
+    let response = FileChangeResponse {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        incomplete: false,
+        incomplete_reason: None,
+        id: request_id.clone(),
+        result: FileChangeDiff {
+            upsert_nodes: vec![node_in("f", "src/lib.rs"), node_in("d", "src/lib.rs")],
+            upsert_edges: vec![unresolved_edge("x", "f", "d")],
+            complete: true,
+            ..Default::default()
+        },
+    };
+    let plugin =
+        spawn_stub_plugin(plugin_reader, plugin_writer, "src/lib.rs", request_id.clone(), response, pass);
+    let root = project_root();
+    apply_file_change(
+        &mut BufReader::new(core_reader),
+        &mut core_writer,
+        conn,
+        root.path(),
+        "src/lib.rs",
+        request_id,
+        &EmbeddingPipeline::disabled(),
+        TEST_TIMEOUT,
+        TEST_TIMEOUT,
+        true,
+        &mut on_timeout_must_not_fire,
+    )
+    .expect("a lost semantic pass never fails the reparse");
+    plugin.join().unwrap();
+}
+
+/// The `CALLS` rows from `f`: what `find_callers(d)` counts for this one
+/// call.
+fn calls_from_f(conn: &IndexStore) -> Vec<String> {
+    ids(conn, "SELECT id FROM edges WHERE fromId = 'f' AND kind = 'CALLS' ORDER BY id")
+}
+
+/// **GM-489, T8.** With the stub answering in the shapes the GM-489 bridge
+/// sends (R1/R2: the structural edge re-sent unchanged and no semantic edge
+/// for a confirmed call), an edit followed by a pass that agrees or answers
+/// empty (both re-send `x`), one that fails, and one that sends nothing for
+/// the file each leaves exactly one `CALLS` row, `x`, still syntactic.
+///
+/// The second half is the arm the first is told apart from: the shape the
+/// bridge sent before GM-489 (`e-sem` in place of a retracted `x`) leaves two
+/// rows once an edit re-sends `x` and the pass then fails - the reported
+/// duplicate. This stands in for the bridge, so it is not the reproduction;
+/// the bridge's own tests (`plugins/sdk/tests/lsp_bridge.rs`, "GM-489") are
+/// what show the bridge sends these shapes.
+#[test]
+fn a_typed_call_keeps_one_caller_row_through_an_edit_whatever_its_pass_does() {
+    let conn = store_after_a_confirming_pass(false);
+    let re_sent =
+        || FileChangeDiff { upsert_edges: vec![unresolved_edge("x", "f", "d")], ..Default::default() };
+    for (id, (what, pass)) in [
+        ("agrees or answers empty", Some(re_sent())),
+        ("fails", None),
+        ("sends nothing for the file", Some(FileChangeDiff::default())),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        edit_keeping_the_call(&conn, id as i64 + 1, pass);
+        assert_eq!(calls_from_f(&conn), vec!["x"], "edit, then a pass that {what}");
+        assert_eq!(edge_source_and_resolved(&conn, "x").0, "syntactic", "edit, then a pass that {what}");
+    }
+
+    let pre_gm489 = store_after_a_confirming_pass(true);
+    edit_keeping_the_call(&pre_gm489, 1, None);
+    assert_eq!(
+        calls_from_f(&pre_gm489),
+        vec!["e-sem", "x"],
+        "the pre-GM-489 shape: the reparse's x beside the surviving semantic edge"
+    );
+}

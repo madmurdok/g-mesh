@@ -41,10 +41,12 @@
 //!    this file spells out the receiver's type `T` ([`super::typing`]), the
 //!    call also gets the edge `T::m(x)` would, and the open site carries that
 //!    edge's id in `replaces`: a semantic answer that lands elsewhere
-//!    retracts it, and one that lands on the same declaration retracts it
-//!    too, because the bridge's own edge onto a placeholder never shares the
-//!    structural edge's id - so the two tiers leave one edge per call, not
-//!    two.
+//!    retracts it, and one that lands on the same declaration keeps it and
+//!    adds no edge of its own - so the two tiers leave one edge per call, not
+//!    two. The bridge's edge onto a placeholder shares the structural edge's
+//!    id only when the structural edge is itself onto a placeholder of the
+//!    same address (a declaration in another file), so agreement is tested
+//!    on the target as well as on the id (`plugins/sdk/src/lsp/bridge.rs`).
 //!  - **`x.f`** - a field read through a receiver whose type this tier does
 //!    not know (anything but `self` inside an `impl`).
 //!  - **A call whose path does not resolve**: a bare name that is neither

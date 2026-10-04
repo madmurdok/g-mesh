@@ -2129,3 +2129,377 @@ fn a_trimmed_name_comes_back_when_its_answer_stops() {
     assert_eq!(passes[2], sent(&["len"]), "pass 3: no answer, `len` comes back");
     assert_eq!(passes[3], BTreeMap::new(), "pass 4: nothing trimmed now or before");
 }
+
+// --- GM-489: one edge per typed receiver call -----------------------------
+
+/// Where a GM-489 fixture's structural edge `X` lands.
+#[derive(Clone, Copy)]
+enum Bound {
+    /// On the declaration itself, in the caller's own file (`X.to_id == D.id`).
+    Here,
+    /// On a placeholder addressed exactly as an answer would address `D` in
+    /// another file, so an agreeing answer would get `X`'s own id.
+    There,
+}
+
+/// `src/d.toy` declares `add` and `sub`, the cross-file targets.
+const D_TOY: &str = "fn add\nfn sub\n";
+/// `src/f.toy` declares its own `add` and `sub` and a `caller` whose
+/// receiver calls sit at column 4 of lines 3 to 7. Which line a site is on
+/// decides what the scripted server answers for it.
+const F_TOY: &str = "fn add\nfn sub\nfn caller\n  x.add()\n  x.add()\n  x.add()\n  x.add()\n  x.add()\n";
+/// Answered with `add`, the structural edge's own target.
+const AGREE: u32 = 3;
+/// Answered with `sub`, somewhere else.
+const CONTRA: u32 = 4;
+/// Never scripted: the server answers `null`.
+const EMPTY: u32 = 5;
+/// Answered with `add`, for an untyped site.
+const UNTYPED: u32 = 6;
+/// Never answered at all, which leaves `f.toy` unfinished.
+const SILENT: u32 = 7;
+
+struct Receiver {
+    index: SdkIndex,
+    caller: String,
+    /// The structural edge every typed site names in `replaces`.
+    x: String,
+}
+
+/// The GM-489 index: `caller` in `f.toy` with one structural `CALLS` edge
+/// `X` onto `add` (where `bound` says), typed sites on `typed` that name `X`
+/// in `replaces`, and untyped sites on `untyped`. `X` is in the graph
+/// whatever the sites are, as it is after any reparse that keeps the call.
+fn receiver_fixture(scratch: &Scratch, bound: Bound, typed: &[u32], untyped: &[u32]) -> Receiver {
+    scratch.write("src/d.toy", D_TOY);
+    scratch.write("src/f.toy", F_TOY);
+    let declare = |builder: &mut FileGraphBuilder| -> [String; 2] {
+        ["add", "sub"].iter().enumerate().fold([String::new(), String::new()], |mut ids, (line, name)| {
+            ids[line] = builder.add_node(
+                NodeSpec::new(NodeKind::Function, *name, *name, range(line as u32, 3, line as u32, 6))
+                    .native_kind("function")
+                    .in_container("pkg", None)
+                    .public(),
+            );
+            ids
+        })
+    };
+
+    let mut index = SdkIndex::new();
+    let d = RelPath::new("src/d.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &d);
+    builder.file_node(range(0, 0, 2, 0));
+    declare(&mut builder);
+    let d_graph = builder.finish();
+    let d_add = d_graph.nodes.iter().find(|node| node.name == "add").unwrap().clone();
+    index.insert(d, D_TOY.to_string(), d_graph);
+
+    let f = RelPath::new("src/f.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &f);
+    builder.record_untyped_receiver_calls();
+    builder.file_node(range(0, 0, 8, 0));
+    let [local_add, _] = declare(&mut builder);
+    let caller = builder.add_node(
+        NodeSpec::new(NodeKind::Function, "caller", "caller", range(2, 0, 7, 9))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    let x = match bound {
+        Bound::Here => builder.resolved_edge(EdgeKind::Calls, &caller, &local_add),
+        Bound::There => {
+            let placeholder = builder.add_placeholder(
+                g_mesh_plugin_sdk::PlaceholderKind::PendingSymbol,
+                "add",
+                g_mesh_plugin_sdk::wire::PlaceholderTarget {
+                    scope: TargetScope::Container("pkg".to_string()),
+                    key: TargetKey::QualifiedName(d_add.qualified_name.clone()),
+                    from_container: Some("pkg".to_string()),
+                    key_path: d_add.qualified_path.clone(),
+                },
+                range(AGREE, 4, AGREE, 7),
+            );
+            builder.placeholder_edge(EdgeKind::Calls, &caller, &placeholder)
+        }
+    };
+    let sites =
+        typed.iter().map(|line| (*line, Some(x.clone()))).chain(untyped.iter().map(|line| (*line, None)));
+    for (line, replaces) in sites {
+        builder.open_site(OpenSite {
+            from_id: caller.clone(),
+            position: Position { line, col: 4 },
+            name: "add".to_string(),
+            kind: OpenSiteKind::ReceiverCall,
+            edge_kind: EdgeKind::Calls,
+            from_container: Some("pkg".to_string()),
+            replaces,
+        });
+    }
+    index.insert(f, F_TOY.to_string(), builder.finish());
+    Receiver { index, caller, x }
+}
+
+/// A bridge whose server answers `f.toy`'s sites by line: `AGREE` and
+/// `UNTYPED` with `add`, `CONTRA` with `sub` - in `f.toy` for [`Bound::Here`]
+/// and in `d.toy` for [`Bound::There`] - `EMPTY` with `null`, and `SILENT`
+/// never.
+fn receiver_bridge(scratch: &Scratch, bound: Bound) -> LspBridge {
+    let target = match bound {
+        Bound::Here => "src/f.toy",
+        Bound::There => "src/d.toy",
+    };
+    let at = |line: u32, declaration: u32| {
+        json!({
+            "uri": scratch.uri("src/f.toy"),
+            "line": line,
+            "character": 4,
+            "definition": { "uri": scratch.uri(target), "line": declaration, "character": 3 },
+        })
+    };
+    let mut silent = at(SILENT, 0);
+    silent["silent"] = json!(true);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": [at(AGREE, 0), at(CONTRA, 1), at(UNTYPED, 0), silent],
+    }));
+    let mut budgets = budgets();
+    budgets.request = Duration::from_millis(400);
+    LspBridge::with_budgets("toy", scratch.path(), config, budgets)
+}
+
+/// Every upsert of edge `id` in `answer`.
+fn upserts<'a>(answer: &'a SemanticAnswer, id: &str) -> Vec<&'a WireEdge> {
+    answer.diff.upsert_edges.iter().filter(|edge| edge.id == id).collect()
+}
+
+/// `X` exactly as the index holds it, the one edge `answer` sends under that
+/// id, and not among the deletes: the call's row stands, still syntactic.
+fn x_re_sent_unchanged(answer: &SemanticAnswer, fixture: &Receiver, pass: &str) {
+    let held = fixture
+        .index
+        .graph(&RelPath::new("src/f.toy"))
+        .and_then(|graph| graph.edges.iter().find(|edge| edge.id == fixture.x))
+        .expect("the fixture holds X");
+    assert_eq!(
+        upserts(answer, &fixture.x),
+        vec![held],
+        "{pass}: X re-sent once, unchanged: {:#?}",
+        answer.diff
+    );
+    assert_eq!(held.source, SourceTier::Syntactic);
+    assert!(
+        !answer.diff.delete_edge_ids.contains(&fixture.x),
+        "{pass}: X is not retracted: {:#?}",
+        answer.diff
+    );
+}
+
+/// **GM-489, T1 (R2, `Bound::Here`).** A typed call whose answer lands on
+/// the structural edge's own target records no semantic edge and retracts
+/// nothing: `X` is re-sent as it is, so the call keeps one row.
+///
+/// Control: in `record_answer`, drop `lands_on_it ||` from the agreement test
+/// (the answer becomes a semantic edge and `X` is retracted).
+#[test]
+fn a_typed_call_its_server_confirms_in_the_same_file_stays_one_structural_edge() {
+    let scratch = Scratch::new("gm489-here-agree");
+    let fixture = receiver_fixture(&scratch, Bound::Here, &[AGREE], &[]);
+    let mut bridge = receiver_bridge(&scratch, Bound::Here);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert!(semantic_edges(&answer).is_empty(), "agreement adds nothing: {:#?}", answer.diff);
+    x_re_sent_unchanged(&answer, &fixture, "the only pass");
+}
+
+/// **GM-489, T2 (R2 `Bound::There`, then R1).** A cross-file typed call the
+/// server confirms, whose answer would get `X`'s own id, adds nothing; a
+/// later pass whose answer is empty (the site moved to a position the server
+/// answers `null` for) neither retracts `X` nor loses it - it re-sends it.
+///
+/// Controls: pass 1 - in `record_answer`, drop `|| &prospective == replaced`
+/// (a semantic edge under `X`'s id is sent and `X` is retracted). Pass 2 -
+/// in `Answers::settle`, skip `self.resend.push(edge.clone())` (`X` is not
+/// re-sent).
+#[test]
+fn a_cross_file_call_the_server_confirms_survives_a_later_empty_pass() {
+    let scratch = Scratch::new("gm489-there-agree-empty");
+    let agree = receiver_fixture(&scratch, Bound::There, &[AGREE], &[]);
+    let empty = receiver_fixture(&scratch, Bound::There, &[EMPTY], &[]);
+    assert_eq!(agree.x, empty.x, "an edit that moves the call keeps X's id");
+    let mut bridge = receiver_bridge(&scratch, Bound::There);
+
+    let first = pass(&mut bridge, &agree.index);
+    assert!(first.complete, "{:?}", first.reason);
+    assert!(semantic_edges(&first).is_empty(), "agreement adds nothing: {:#?}", first.diff);
+    x_re_sent_unchanged(&first, &agree, "pass 1 (agrees)");
+
+    let second = pass(&mut bridge, &empty.index);
+    assert!(second.complete, "{:?}", second.reason);
+    assert!(semantic_edges(&second).is_empty(), "{:#?}", second.diff);
+    x_re_sent_unchanged(&second, &empty, "pass 2 (empty)");
+}
+
+/// **GM-489, T3 (contradiction, then R1).** An answer that lands elsewhere
+/// retracts `X` and emits its own edge `E'`; a later pass whose answer is
+/// empty retracts `E'` and restores `X` in the same diff, so the call has
+/// one row before and after.
+///
+/// Control: in `Answers::settle`, skip `self.resend.push(edge.clone())`
+/// (pass 2 retracts `E'` and sends no `X`: the call has no row).
+#[test]
+fn a_contradicted_call_is_restored_by_a_later_empty_pass() {
+    let scratch = Scratch::new("gm489-contra-empty");
+    let contra = receiver_fixture(&scratch, Bound::Here, &[CONTRA], &[]);
+    let empty = receiver_fixture(&scratch, Bound::Here, &[EMPTY], &[]);
+    let mut bridge = receiver_bridge(&scratch, Bound::Here);
+
+    let first = pass(&mut bridge, &contra.index);
+    assert!(first.complete, "{:?}", first.reason);
+    let emitted = semantic_edges(&first);
+    assert_eq!(emitted.len(), 1, "{:#?}", first.diff);
+    assert_eq!(emitted[0].from_id, contra.caller);
+    let e_prime = emitted[0].id.clone();
+    assert!(upserts(&first, &contra.x).is_empty(), "a contradicted X is not re-sent");
+    assert_eq!(first.diff.delete_edge_ids, vec![contra.x.clone()], "X is retracted");
+
+    let second = pass(&mut bridge, &empty.index);
+    assert!(second.complete, "{:?}", second.reason);
+    assert!(semantic_edges(&second).is_empty(), "{:#?}", second.diff);
+    assert_eq!(second.diff.delete_edge_ids, vec![e_prime], "E' is retracted, X is not");
+    x_re_sent_unchanged(&second, &empty, "pass 2 (empty)");
+}
+
+/// **GM-489, T4 (contradiction, then agreement, file unchanged but for the
+/// answer).** Pass 2 retracts `E'`, re-sends `X`, and emits no semantic edge.
+/// The cross-file shape, so the agreement is by id.
+///
+/// Controls: in `Answers::settle`, skip `self.resend.push(edge.clone())`
+/// (pass 2 sends no `X`); in `record_answer`, drop `|| &prospective ==
+/// replaced` (pass 2 sends a semantic edge under `X`'s id and retracts `X`).
+#[test]
+fn a_contradicted_call_is_restored_by_a_later_agreeing_pass() {
+    let scratch = Scratch::new("gm489-contra-agree");
+    let contra = receiver_fixture(&scratch, Bound::There, &[CONTRA], &[]);
+    let agree = receiver_fixture(&scratch, Bound::There, &[AGREE], &[]);
+    let mut bridge = receiver_bridge(&scratch, Bound::There);
+
+    let first = pass(&mut bridge, &contra.index);
+    assert!(first.complete, "{:?}", first.reason);
+    let emitted = semantic_edges(&first);
+    assert_eq!(emitted.len(), 1, "{:#?}", first.diff);
+    assert_ne!(emitted[0].id, contra.x, "E' lands elsewhere, so its id is its own");
+    let e_prime = emitted[0].id.clone();
+    assert_eq!(first.diff.delete_edge_ids, vec![contra.x.clone()], "X is retracted");
+
+    let second = pass(&mut bridge, &agree.index);
+    assert!(second.complete, "{:?}", second.reason);
+    assert!(semantic_edges(&second).is_empty(), "{:#?}", second.diff);
+    assert_eq!(second.diff.delete_edge_ids, vec![e_prime], "E' is retracted, X is not");
+    x_re_sent_unchanged(&second, &agree, "pass 2 (agrees)");
+}
+
+/// **GM-489, T5 (R3, `Bound::Here`).** A caller with a typed call the server
+/// confirms and an untyped call it answers with the same declaration: the
+/// untyped answer's semantic edge `(caller, CALLS, add)` is covered by `X`,
+/// so the diff holds `X` and no semantic edge or placeholder - and the
+/// untyped call still counts as answered (its name leaves `untypedCalls`).
+///
+/// Control: in `Answers::settle`'s `covered`, drop the `|| lands.get(..)`
+/// arm (an `E_sem(caller, add)` and its placeholder are sent beside `X`).
+#[test]
+fn a_typed_call_covers_an_untyped_call_that_reaches_the_same_declaration() {
+    let scratch = Scratch::new("gm489-mixed-here");
+    let fixture = receiver_fixture(&scratch, Bound::Here, &[AGREE], &[UNTYPED]);
+    let mut bridge = receiver_bridge(&scratch, Bound::Here);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert!(semantic_edges(&answer).is_empty(), "X already says caller calls add: {:#?}", answer.diff);
+    assert!(
+        answer.diff.upsert_nodes.iter().all(|node| node.native_kind.as_deref() != Some("pending_symbol")),
+        "no edge, so no placeholder: {:#?}",
+        answer.diff.upsert_nodes
+    );
+    x_re_sent_unchanged(&answer, &fixture, "the only pass");
+    assert_eq!(
+        re_sent(&answer),
+        BTreeMap::from([(fixture.caller.clone(), Vec::new())]),
+        "the untyped call was answered, so `add` leaves the caller's list"
+    );
+}
+
+/// **GM-489, T5b (R3 by id, `Bound::There`).** The typed site's answer is
+/// empty; the untyped site's answer lands on `add` in `d.toy`, which is
+/// exactly `X`'s address, so the semantic edge it records *is* `X`'s id.
+/// The diff must still carry one edge under that id, the syntactic one.
+///
+/// Control: in `Answers::settle`'s `covered`, drop `ids.contains(..) ||` (a
+/// second, semantic upsert under `X`'s id is sent beside the re-sent `X`).
+#[test]
+fn an_untyped_answer_with_the_structural_edges_id_is_dropped_for_it() {
+    let scratch = Scratch::new("gm489-mixed-there");
+    let fixture = receiver_fixture(&scratch, Bound::There, &[EMPTY], &[UNTYPED]);
+    let mut bridge = receiver_bridge(&scratch, Bound::There);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert!(semantic_edges(&answer).is_empty(), "{:#?}", answer.diff);
+    x_re_sent_unchanged(&answer, &fixture, "the only pass");
+}
+
+/// **GM-489, T6.** Two typed sites name one `X`; one answer agrees and one
+/// lands elsewhere. `X` is not retracted, because not every answer about it
+/// contradicted it - it is re-sent - while the contradicting site keeps its
+/// own edge `E'`.
+///
+/// Control: in `Answers::settle`, drop `&& !self.upheld.contains(replaced)`
+/// (retract on any contradiction: `X` is deleted and not re-sent).
+#[test]
+fn a_structural_edge_one_site_upholds_is_kept_though_another_contradicts_it() {
+    let scratch = Scratch::new("gm489-split");
+    let fixture = receiver_fixture(&scratch, Bound::Here, &[AGREE, CONTRA], &[]);
+    let mut bridge = receiver_bridge(&scratch, Bound::Here);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert_eq!(semantic_edges(&answer).len(), 1, "the contradicting site's own edge: {:#?}", answer.diff);
+    x_re_sent_unchanged(&answer, &fixture, "the only pass");
+}
+
+/// **GM-489, the unfinished file.** `f.toy` has a typed call the server
+/// confirms, an untyped call whose answer has `X`'s own id (`Bound::There`),
+/// and a question that is never answered, so the pass does not finish
+/// `f.toy` and settles nothing there. What this records:
+///
+/// - Pass 1 (unfinished) sends the untyped answer's edge under `X`'s id
+///   with `source = semantic`, and retracts nothing. In core that is an
+///   upsert of `X`'s own row: still one row for the call, but labelled
+///   semantic until the next pass that finishes the file.
+/// - Pass 2 (finished, the silent site gone) sends `X` back unchanged and
+///   syntactic, and does *not* retract it, although pass 1 remembered that
+///   id as emitted for `f.toy`.
+///
+/// Control (pass 2): in `Answers::finish`, drop `&& !resent.contains(id)`
+/// from the delete filter (`X` is both re-sent and retracted).
+#[test]
+fn an_unfinished_file_relabels_the_structural_edge_and_the_next_finished_pass_restores_it() {
+    let scratch = Scratch::new("gm489-unfinished");
+    let unfinished = receiver_fixture(&scratch, Bound::There, &[AGREE], &[UNTYPED, SILENT]);
+    let finished = receiver_fixture(&scratch, Bound::There, &[AGREE], &[UNTYPED]);
+    let mut bridge = receiver_bridge(&scratch, Bound::There);
+
+    let first = pass(&mut bridge, &unfinished.index);
+    assert!(!first.complete, "the SILENT question was never answered");
+    let under_x = upserts(&first, &unfinished.x);
+    assert_eq!(under_x.len(), 1, "one edge under X's id: {:#?}", first.diff);
+    assert_eq!(under_x[0].source, SourceTier::Semantic, "the untyped answer's copy, not X itself");
+    assert_eq!(under_x[0].from_id, unfinished.caller);
+    assert!(first.diff.delete_edge_ids.is_empty(), "nothing is retracted in an unfinished file");
+
+    let second = pass(&mut bridge, &finished.index);
+    assert!(second.complete, "{:?}", second.reason);
+    assert!(semantic_edges(&second).is_empty(), "{:#?}", second.diff);
+    x_re_sent_unchanged(&second, &finished, "pass 2 (finished)");
+}
