@@ -463,3 +463,47 @@ untyped receiver-call site, wherever the answer lands, inside the index or
 outside it, the call's name leaves the caller's `untypedCalls` once every
 untyped site of that name in that caller is answered. The SQL filter stays as
 a second guard.
+
+## Measured noise after the extension
+
+GM-486 S17, by the S13 method. Corpus: `git archive 84a82eb` (273 `.rs`
+files), the same for every run. Release builds of 7c73009 (**before**, S13's
+commit) and 84a82eb (**after**, the extension in 056d5f3), only the Rust plugin
+discovered, a fresh `G_MESH_HOME` per run. Three `reindex` runs: A (after,
+`semantic_pass = false`), B-before and B-after (both `true`, rust-analyzer
+1.97.1). Both B passes completed: `semanticPassAt` set, no
+`semanticPassError`, 273 files, 6,312 semantic edges each. SQL mirror and
+`find_callers` agreed on 5/5 anchors in every run. B-before's
+`untyped_calls` equals A's row for row, so A stands for both arms' structural
+state.
+
+| | A: structural | B-before (7c73009) | B-after (84a82eb) |
+|---|---|---|---|
+| pages with `untypedReceiverCalls` (of 1,389) | 589 (42.4%) | 195 (14.0%) | 51 (3.7%) |
+| `count` p50 / p90 / max | 4 / 48 / 710 | 12 / 218 / 704 | 1 / 3 / 3 |
+| `expect` count | 710 | 704 | 1 |
+| `untyped_calls` rows | 16,172 | 16,172 | 154 |
+| field bytes max / p50 / p90 | 1,525 / 505 / 1,369 | 1,525 / 736 / 1,415 | 502 / 389 / 436 |
+| bridge node upserts in the pass | - | 3,270 | 7,462 (+4,192 re-sent callers) |
+| embeddings computed (backfill + pass) | 8,055 + 0 | 8,055 + 0 | 4,221 + 4,192 = 8,413 |
+| embedding time (backfill + pass) | 468 s | 503 s | 318 s + 339 s = 657 s |
+| `reindex` real / user / sys | 478 / 1,719 / 10 s | 688 / 1,795 / 13 s | 757 / 1,886 / 15 s |
+| load average at start (1/5/15) | 21 / 74 / 60 | 15 / 33 / 44 | 16 / 37 / 42 |
+
+The row counts differ from S13 (16,029, `expect` 708/702) only because the
+corpus is the later commit. The extension removed 16,018 of 16,172 rows on
+4,192 callers. Top names after it: path 3, accept 2, area 2, len 2, raw 2,
+then single calls. The marker is now a short list of real gaps rather than
+std-named noise.
+
+Cost. Every caller the bridge shortens is re-sent, which is 4,192 nodes in this
+pass. In a `reindex` the semantic pass runs before the embedding backfill, so
+none of them has a vector yet, and the "embed only nodes without a vector" rule
+in `watcher::apply` filters nothing. Those nodes are embedded on the pass's
+path instead of in the backfill (339 s). The total of 9,208 vectors is the
+same, but 358 more texts were computed (8,413 against 8,055), because the
+pass-path embedding got no cache hits. `reindex` wall time grew 69 s (+10%) and
+user time 90 s (+5%), at similar load. The bridge's own pass time (171 s
+before, 85 s after) is rust-analyzer variance, not the change. S13 recorded
+`reindex` times under load 174/208/170 and no per-arm embedding split, so those
+numbers are not compared here.
