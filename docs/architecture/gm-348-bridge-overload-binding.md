@@ -285,6 +285,14 @@ unit tests in `plugins/python/src/extractor/tests.rs`.
 5. **Write ADR 0024** (refine vs contradict, hover as evidence) in S2?
    *Recommend: yes, as part of S2.*
 
+### Resolved at review (2026-10-04)
+
+The owner accepted all five recommendations: hover is evidence for pyright,
+gated by the manifest key and failing closed; overloaded receiver calls are
+bound too; Python's node row keeps the first `@overload`; the real-server
+containment test against a TypeScript server moves to GM-325, which installs
+that server in CI; ADR 0024 is written in S2.
+
 ## Appendix: g-mesh calls behind the cross-file claims
 
 - `find_references(symbol_id = graph::EdgeSpec.to_declaration)`:
