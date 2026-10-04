@@ -180,15 +180,15 @@ fn an_ordinary_symbol_in_the_same_walk_costs_no_declaration_rows() {
 }
 
 #[test]
-fn a_freshly_built_index_reads_schema_version_12() {
+fn a_freshly_built_index_reads_schema_version_13() {
     let project = Project::new();
     let conn = project.walk();
 
     let version: String =
         conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
     // Pinned as a literal on purpose, alongside the constant: a schema change
-    // has to update this line by hand. "12" adds `edges.linkedFrom`.
-    assert_eq!(version, "12");
+    // has to update this line by hand. "13" adds the `language_outcome` table.
+    assert_eq!(version, "13");
     assert_eq!(version, schema::CURRENT_SCHEMA_VERSION);
 }
 

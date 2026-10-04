@@ -9,6 +9,7 @@ pub mod languages;
 pub mod mcp;
 pub mod paths;
 pub mod process;
+pub mod project_walk;
 pub mod protocol;
 pub mod shim;
 pub mod storage;

@@ -938,3 +938,126 @@ fn file_changed_does_not_route_a_path_under_its_own_languages_exclude_dirs() {
         "an ordinary file of the same language, outside exclude_dirs, must still route"
     );
 }
+
+// ---------------------------------------------------------------------
+// A language the bulk walk failed is not routed (ADR 0021, section 2)
+// ---------------------------------------------------------------------
+
+/// A failed language's edited file reaches no plugin, so no single-file
+/// update can put part of that language into the index; another language's
+/// file still routes.
+///
+/// Control: drop the `is_failed_language` check in `file_changed` - python's
+/// plugin is spawned and asked.
+#[test]
+fn a_failed_languages_changed_file_is_not_routed() {
+    let (_project, _plugins, dirs, registry) = registry_over(&["python", "ruby"]);
+    let conn = test_plugin::empty_index();
+    registry.set_failed_languages(["python".to_string()]);
+
+    registry.file_changed(&conn, "src/app.python-src".to_string());
+    registry.route_settled_path(&conn, "src/other.python-src".to_string());
+    assert!(test_plugin::spawns(&dirs[0]).is_empty(), "a failed language's file must not be routed");
+
+    registry.file_changed(&conn, "src/app.ruby-src".to_string());
+    assert_eq!(test_plugin::spawns(&dirs[1]).len(), 1, "an indexed language's file still routes");
+}
+
+/// A failed language's watched workspace file triggers no per-language
+/// reindex.
+///
+/// Control: drop the `is_failed_language` check in `route_settled_path` -
+/// the workspace reindex spawns alpha's plugin.
+#[test]
+fn a_failed_languages_workspace_file_triggers_no_reindex() {
+    let (_project, _plugins, dir, registry) =
+        registry_over_workspace("alpha", ".alpha-src", &["go.mod"], &[]);
+    let conn = test_plugin::empty_index();
+    registry.set_failed_languages(["alpha".to_string()]);
+
+    registry.route_settled_path(&conn, "go.mod".to_string());
+
+    assert!(
+        test_plugin::spawns(&dir).is_empty(),
+        "a failed language must not be reindexed by a watched file"
+    );
+}
+
+/// The query-time freshness check skips a failed language: there is
+/// nothing of it in the index to keep fresh, and reindexing the file would
+/// add part of it.
+///
+/// Control: drop the `is_failed_language` check in `ensure_fresh` - the
+/// file on disk with no baseline is stale, so the plugin is spawned and the
+/// answer is `Some(..)`.
+#[test]
+fn ensure_fresh_skips_a_failed_language() {
+    let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+    let conn = test_plugin::empty_index();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::write(project.path().join("src/app.python-src"), "x").unwrap();
+    registry.set_failed_languages(["python".to_string()]);
+
+    let outcome = registry.ensure_fresh(&conn, "src/app.python-src").expect("not an error");
+
+    assert!(outcome.is_none(), "a failed language has nothing to keep fresh: {outcome:?}");
+    assert!(test_plugin::spawns(&dirs[0]).is_empty());
+}
+
+/// `set_failed_languages` replaces the set rather than adding to it.
+///
+/// Control: extend the set instead of replacing it - python stays failed and
+/// is not routed.
+#[test]
+fn setting_the_failed_languages_replaces_the_previous_set() {
+    let (_project, _plugins, dirs, registry) = registry_over(&["python"]);
+    let conn = test_plugin::empty_index();
+    registry.set_failed_languages(["python".to_string()]);
+    registry.set_failed_languages(Vec::<String>::new());
+
+    registry.file_changed(&conn, "src/app.python-src".to_string());
+
+    assert_eq!(test_plugin::spawns(&dirs[0]).len(), 1);
+}
+
+/// `seed_failed_languages` loads exactly the languages the index records as
+/// `Failed`: an `Indexed` or `PluginAbsent` row seeds nothing, so those
+/// languages keep routing after a restart.
+///
+/// Controls: drop the `set_failed_languages` call in `seed_failed_languages`
+/// (python is not failed); make its filter keep every row (ruby and go are
+/// failed too).
+#[test]
+fn seeding_from_the_index_marks_only_the_languages_recorded_as_failed() {
+    let (_project, _plugins, _dirs, registry) = registry_over(&["python", "ruby", "go"]);
+    let conn = test_plugin::empty_index();
+    let outcomes = std::collections::BTreeMap::from([
+        ("python".to_string(), LanguageOutcome::Failed { error: "the walk failed it".to_string() }),
+        ("ruby".to_string(), LanguageOutcome::Indexed { files: 1 }),
+        ("go".to_string(), LanguageOutcome::PluginAbsent { files: Some(2) }),
+    ]);
+    conn.with(|conn| schema::record_language_outcomes(conn, &outcomes))
+        .expect("failed to record the outcomes");
+
+    registry.seed_failed_languages(&conn);
+
+    assert!(registry.is_failed_language("python"), "a Failed row seeds its language");
+    assert!(!registry.is_failed_language("ruby"), "an Indexed row seeds nothing");
+    assert!(!registry.is_failed_language("go"), "a PluginAbsent row seeds nothing");
+}
+
+/// An index whose outcome table cannot be read seeds an empty set and does
+/// not fail: the daemon keeps serving the rest of the index.
+///
+/// Control: replace the `Err` arm's log with a panic (or propagate it) - the
+/// call panics.
+#[test]
+fn seeding_from_an_unreadable_outcome_table_leaves_the_set_empty() {
+    let (_project, _plugins, _dirs, registry) = registry_over(&["python"]);
+    let conn = test_plugin::empty_index();
+    conn.with(|conn| conn.execute("DROP TABLE language_outcome", [])).expect("failed to drop the table");
+
+    registry.seed_failed_languages(&conn);
+
+    assert!(!registry.is_failed_language("python"));
+}

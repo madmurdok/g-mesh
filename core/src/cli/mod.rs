@@ -38,12 +38,88 @@ pub mod reindex;
 pub mod status;
 pub mod stop;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::languages::LanguageOutcome;
 use crate::{daemon, shim};
+
+/// The exit code of a command that did its work and printed its result, but
+/// only in part: `g-mesh init`/`reindex` when some, not all, discovered
+/// languages failed to index (ADR 0021). The index is written and usable.
+pub const PARTIAL_FAILURE_EXIT_CODE: i32 = 2;
+
+/// A command's error that carries its own exit code, for an outcome that is
+/// neither success nor the plain failure every other error exits 1 with.
+#[derive(Debug)]
+pub struct ExitStatus {
+    pub code: i32,
+    pub message: String,
+}
+
+impl std::fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExitStatus {}
+
+/// The process exit code for a command's error: an [`ExitStatus`]'s own
+/// code, 1 for every other error.
+pub fn exit_code(err: &anyhow::Error) -> i32 {
+    err.downcast_ref::<ExitStatus>().map_or(1, |status| status.code)
+}
+
+/// One stderr line per language a bulk walk did not index: a `Failed`
+/// language with its error, a `PluginAbsent` one with its file count and the
+/// command that installs its plugin.
+pub fn language_outcome_lines(outcomes: &BTreeMap<String, LanguageOutcome>) -> Vec<String> {
+    outcomes
+        .iter()
+        .filter_map(|(language, outcome)| match outcome {
+            LanguageOutcome::Indexed { .. } => None,
+            LanguageOutcome::Failed { error } => {
+                Some(format!("g-mesh: {language} failed to index and is not in the index: {error}"))
+            }
+            LanguageOutcome::PluginAbsent { files } => {
+                let what = match files {
+                    Some(files) => format!("{files} file(s) not indexed"),
+                    None => "its files are not indexed".to_string(),
+                };
+                // Every PluginAbsent language is a catalogue one; a name the
+                // catalogue lacks still gets its line, just without a command.
+                Some(match crate::languages::entry(language) {
+                    Some(entry) => format!(
+                        "g-mesh: {language} has no plugin installed - {what}; install it with `{}`",
+                        entry.install_command()
+                    ),
+                    None => format!("g-mesh: {language} has no plugin installed - {what}"),
+                })
+            }
+        })
+        .collect()
+}
+
+/// Prints [`language_outcome_lines`] to stderr, then fails with
+/// [`PARTIAL_FAILURE_EXIT_CODE`] when any language `Failed`. A walk where
+/// every discovered language failed never gets here: it is an error of its own.
+pub(crate) fn report_language_outcomes(outcomes: &BTreeMap<String, LanguageOutcome>) -> Result<()> {
+    for line in language_outcome_lines(outcomes) {
+        eprintln!("{line}");
+    }
+    if outcomes.values().any(|outcome| matches!(outcome, LanguageOutcome::Failed { .. })) {
+        return Err(ExitStatus {
+            code: PARTIAL_FAILURE_EXIT_CODE,
+            message: "some languages failed to index - the index holds every other language".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "g-mesh", version, about = "Local source code indexer for AI agents")]
@@ -215,7 +291,7 @@ pub struct CleanArgs {
 ///
 /// Parse failures never reach here: clap prints its own diagnostic and exits
 /// with its standard status. What this returns is the *command's* outcome,
-/// which `main` turns into a `g-mesh: ...` message and exit code 1.
+/// which `main` turns into a `g-mesh: ...` message and [`exit_code`]'s code.
 pub fn run() -> Result<()> {
     dispatch(Cli::parse().command)
 }
@@ -504,5 +580,80 @@ mod tests {
             .expect("debug-candidates must exist")
             .clone();
         assert!(sub.is_hide_set(), "debug-candidates is for support and M4, not --help");
+    }
+
+    // -----------------------------------------------------------------
+    // Per-language outcome lines and exit codes (ADR 0021, resolved at
+    // review 3)
+    // -----------------------------------------------------------------
+
+    fn outcomes(pairs: &[(&str, LanguageOutcome)]) -> BTreeMap<String, LanguageOutcome> {
+        pairs.iter().map(|(language, outcome)| (language.to_string(), outcome.clone())).collect()
+    }
+
+    /// One line per `Failed` (with its error) and per `PluginAbsent` (with
+    /// its file count and the install command); none for `Indexed`.
+    ///
+    /// Controls: drop the error from the `Failed` line, the count or the
+    /// install command from the `PluginAbsent` line, or emit a line for
+    /// `Indexed` - the exact comparison fails.
+    #[test]
+    fn each_language_not_indexed_gets_one_line_naming_what_to_do() {
+        let lines = language_outcome_lines(&outcomes(&[
+            ("go", LanguageOutcome::PluginAbsent { files: None }),
+            ("python", LanguageOutcome::PluginAbsent { files: Some(12) }),
+            ("rust", LanguageOutcome::Indexed { files: 40 }),
+            (
+                "typescript",
+                LanguageOutcome::Failed { error: "the plugin's entry point x does not exist".to_string() },
+            ),
+        ]));
+
+        assert_eq!(
+            lines,
+            [
+                "g-mesh: go has no plugin installed - its files are not indexed; install it with `g-mesh plugins install go`",
+                "g-mesh: python has no plugin installed - 12 file(s) not indexed; install it with `g-mesh plugins install python`",
+                "g-mesh: typescript failed to index and is not in the index: the plugin's entry point x does not exist",
+            ]
+        );
+    }
+
+    /// Exit 0 when every discovered language indexed, absent plugins
+    /// included; 2 when some `Failed`. (1, all failed, is the walk's own
+    /// error and never reaches `report_language_outcomes`.)
+    ///
+    /// Controls: make `report_language_outcomes` fail on `PluginAbsent` too -
+    /// the first `expect` fails; return `Ok` for a `Failed` - `expect_err`
+    /// fails; give `ExitStatus` code 1 - the `assert_eq` on 2 fails.
+    #[test]
+    fn exit_code_is_zero_with_absent_plugins_and_two_with_a_failed_language() {
+        report_language_outcomes(&outcomes(&[
+            ("rust", LanguageOutcome::Indexed { files: 1 }),
+            ("python", LanguageOutcome::PluginAbsent { files: Some(3) }),
+        ]))
+        .expect("absent plugins are a valid install: exit 0");
+        report_language_outcomes(&BTreeMap::new()).expect("no outcomes: exit 0");
+
+        let err = report_language_outcomes(&outcomes(&[
+            ("rust", LanguageOutcome::Indexed { files: 1 }),
+            ("python", LanguageOutcome::Failed { error: "boom".to_string() }),
+        ]))
+        .expect_err("a failed language is a partial failure");
+        assert_eq!(exit_code(&err), PARTIAL_FAILURE_EXIT_CODE);
+        assert_eq!(PARTIAL_FAILURE_EXIT_CODE, 2);
+    }
+
+    /// Every error that is not an `ExitStatus` keeps exit code 1, including
+    /// one with context wrapped around it; an `ExitStatus` keeps its own code
+    /// through context too.
+    ///
+    /// Control: make `exit_code` always return 1 (main's old
+    /// `process::exit(1)`) - the code-2 assertion fails.
+    #[test]
+    fn exit_code_is_one_for_a_plain_error_and_the_status_code_otherwise() {
+        assert_eq!(exit_code(&anyhow::anyhow!("every discovered language failed to index")), 1);
+        let status: anyhow::Error = ExitStatus { code: 2, message: "partial".to_string() }.into();
+        assert_eq!(exit_code(&status.context("while running init")), 2);
     }
 }

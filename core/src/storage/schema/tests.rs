@@ -32,6 +32,7 @@ fn creates_all_tables_and_indexes() {
             "declarations",
             "edges",
             "indexed_files",
+            "language_outcome",
             "language_state",
             "meta",
             "nodes",
@@ -994,4 +995,122 @@ fn a_reset_empties_the_semantic_pending_tables() {
 
     assert!(semantic_pending(&conn).unwrap().is_empty());
     assert!(semantic_pending_file_rows(&conn).is_empty());
+}
+
+// ---------------------------------------------------------------------
+// language_outcome (ADR 0021, section 5)
+// ---------------------------------------------------------------------
+
+fn outcomes_of(
+    pairs: &[(&str, crate::languages::LanguageOutcome)],
+) -> std::collections::BTreeMap<String, crate::languages::LanguageOutcome> {
+    pairs.iter().map(|(language, outcome)| (language.to_string(), outcome.clone())).collect()
+}
+
+/// Every outcome kind round-trips; an `Indexed` count is read live from the
+/// `File` nodes (a watcher add and delete move it), while a `PluginAbsent`
+/// count stays as the walk recorded it whatever the nodes do.
+///
+/// Controls: in `language_outcomes`, return the `Indexed` count from the
+/// stored `files` column (or a count frozen at record time) - the counts
+/// after the add/delete stay at 2; read `plugin_absent`'s count from the
+/// live File nodes - it becomes 1, not 7.
+#[test]
+fn language_outcomes_read_indexed_counts_live_and_absent_counts_as_recorded() {
+    use crate::languages::LanguageOutcome;
+    let conn = setup();
+    seed_file(&conn, "a.rs", "rust");
+    seed_file(&conn, "b.rs", "rust");
+    record_language_outcomes(
+        &conn,
+        &outcomes_of(&[
+            ("rust", LanguageOutcome::Indexed { files: 2 }),
+            ("python", LanguageOutcome::PluginAbsent { files: Some(7) }),
+            ("go", LanguageOutcome::PluginAbsent { files: None }),
+            ("typescript", LanguageOutcome::Failed { error: "spawn failed: no node".to_string() }),
+        ]),
+    )
+    .unwrap();
+
+    // The watcher adds one Rust file and deletes another; a Python File node
+    // appears too (it never would while python is absent, but the stored
+    // count must not care).
+    seed_file(&conn, "c.rs", "rust");
+    seed_file(&conn, "d.rs", "rust");
+    conn.execute("DELETE FROM nodes WHERE id = 'a.rs'", []).unwrap();
+    seed_file(&conn, "x.py", "python");
+
+    assert_eq!(
+        language_outcomes(&conn).unwrap(),
+        vec![
+            ("go".to_string(), LanguageOutcome::PluginAbsent { files: None }),
+            ("python".to_string(), LanguageOutcome::PluginAbsent { files: Some(7) }),
+            ("rust".to_string(), LanguageOutcome::Indexed { files: 3 }),
+            (
+                "typescript".to_string(),
+                LanguageOutcome::Failed { error: "spawn failed: no node".to_string() }
+            ),
+        ]
+    );
+}
+
+/// A re-walk replaces the recorded set: a language the new walk has no
+/// outcome for is gone, not left from the previous walk.
+///
+/// Control: drop the `DELETE FROM language_outcome` in
+/// `record_language_outcomes` (and insert `OR REPLACE`) - `python` from the
+/// first walk survives.
+#[test]
+fn recording_outcomes_replaces_the_previous_walks_rows() {
+    use crate::languages::LanguageOutcome;
+    let conn = setup();
+    record_language_outcomes(
+        &conn,
+        &outcomes_of(&[
+            ("python", LanguageOutcome::PluginAbsent { files: Some(3) }),
+            ("rust", LanguageOutcome::Failed { error: "first".to_string() }),
+        ]),
+    )
+    .unwrap();
+
+    record_language_outcomes(&conn, &outcomes_of(&[("rust", LanguageOutcome::Indexed { files: 0 })]))
+        .unwrap();
+
+    assert_eq!(
+        language_outcomes(&conn).unwrap(),
+        vec![("rust".to_string(), LanguageOutcome::Indexed { files: 0 })]
+    );
+}
+
+/// Schema "13": an index stamped "12" (before `language_outcome` existed) is
+/// reset, and the reset drops the table's rows with everything else.
+///
+/// Controls: leave `CURRENT_SCHEMA_VERSION` at "12" - `ensure_current`
+/// returns false and the row survives; remove `language_outcome` from
+/// `wipe` - the reset keeps the row.
+#[test]
+fn a_schema_12_index_is_reset_and_the_reset_drops_the_language_outcomes() {
+    use crate::languages::LanguageOutcome;
+    let conn = setup();
+    conn.execute(
+        "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, '12', ?1, CURRENT_TIMESTAMP)",
+        params![GENERATION],
+    )
+    .unwrap();
+    record_language_outcomes(
+        &conn,
+        &outcomes_of(&[("python", LanguageOutcome::PluginAbsent { files: Some(1) })]),
+    )
+    .unwrap();
+
+    assert!(ensure_current(&conn, GENERATION).unwrap(), "schema 12 is not current");
+
+    assert!(language_outcomes(&conn).unwrap().is_empty(), "the reset must drop the outcome rows");
+}
+
+/// An index that has never been walked has no outcomes; reading them is not
+/// an error.
+#[test]
+fn a_fresh_index_has_no_language_outcomes() {
+    assert!(language_outcomes(&setup()).unwrap().is_empty());
 }

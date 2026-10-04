@@ -419,3 +419,26 @@ extensions = [".py"]
 
     (root, binary)
 }
+
+/// Copies the real, checked-in `plugins/rust/plugin.toml` into `root/rust/`,
+/// so discovery finds the bundled Rust plugin (its `${G_MESH_BIN_DIR}`
+/// resolves to this profile's `target/` directory, `daemon_plugin_bin_dir.rs`).
+pub fn add_real_rust_plugin(root: &Path) {
+    let dir = root.join("rust");
+    std::fs::create_dir_all(&dir).expect("failed to create the rust plugin directory");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/rust/plugin.toml"),
+        dir.join("plugin.toml"),
+    )
+    .expect("failed to copy the real Rust manifest");
+}
+
+/// Two discovered plugins, one of them unusable: the real Rust plugin, and
+/// [`missing_workspace_binary_plugin_root`]'s Python plugin whose binary was
+/// never built - "one plugin binary removed" (ADR 0021). Returns the root and
+/// the missing binary's path.
+pub fn rust_and_missing_python_plugin_root() -> (tempfile::TempDir, PathBuf) {
+    let (root, binary) = missing_workspace_binary_plugin_root();
+    add_real_rust_plugin(root.path());
+    (root, binary)
+}
