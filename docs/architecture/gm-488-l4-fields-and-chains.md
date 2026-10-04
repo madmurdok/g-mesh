@@ -349,3 +349,83 @@ reviewer is pulled in.
 - `find_callers(FileModel::set_returns)` → 0 rows (field-receiver call, the
   known gap); grep found `decls.rs:474`. Bridge, SDK fold, census, schema
   and instruction lines were located with grep in known files.
+
+## Measured (S8)
+
+Arms: before = `ee6129e` (release-3.21.0 base), after = `cb66ad9`
+(`5d2ff21` + tests). Corpus: `git archive ee6129e`, 274 `.rs` files, the
+same for every arm. Extractor edges were dumped by a scratch binary linking
+each arm's `g-mesh-plugin-rust` (every `CALLS` edge: file, caller
+qualifiedName, target qualifiedName or rendered placeholder, the open sites
+whose `replaces` names it). Reindexes ran with fresh `G_MESH_HOME`s under
+`/tmp`, rust plugin only; no leaked daemons were found or killed.
+
+### Census (no daemon)
+
+| shape | origin | same_file | before | after | delta |
+|---|---|---|---:|---:|---:|
+| Field | Field | false | 0 | 243 | +243 |
+| Field | Field | true | 0 | 21 | +21 |
+| Chain | FreeFnReturn | false | 0 | 27 | +27 |
+| Chain | FreeFnReturn (unwrapped) | true | 0 | 1 | +1 |
+| Chain | AssocFnReturn | true / false | 0 | 8 / 1 | +9 |
+| Chain | MethodReturn | true / false | 0 | 4 / 3 | +7 |
+| Chain | MethodReturn (unwrapped) | true | 0 | 1 | +1 |
+| Local | Field (`let x = self.f`) | true / false | 0 | 4 / 2 | +6 |
+| Local | all other origins | — | 1467 | 1467 | 0 |
+| **total** | | | **1467** | **1782** | **+315** |
+
+`Here` (same-file) sites 1159 → 1198 (+39); placeholder-addressed 308 → 584
+(+276). Refused by `MAX_HOPS`: 88 (the before build has no counter). Open
+sites (42519) and bridge questions (42528) are unchanged. The design's "+115
+`Here`" was GM-485's count of sites that *link*, not of same-file sites: most
+field types are declared in another file, so L4 lands them on placeholders.
+
+### Extractor `CALLS` diff
+
+Rows 11980 → 12272: **removed 0 edges**, added 295 (35 `Here`, 260
+placeholder; every added edge carries a replacing receiver site). Three rows
+differ in the replacing-site list only — same file, caller, target and
+`resolved`; the edge now has two replacing sites where it had one, because a
+newly typed site calls the same target from the same caller as an
+already-typed one:
+
+- `core/src/shim/router.rs` `only_sub_project_tool_answers_are_stamped` →
+  `Fake::answer`: `session.front.answer(7)` (new, field) joins `a.answer(9)`.
+- same caller → `Fake::reply`: `session.front.reply(..)` joins `a.reply(..)`.
+- `core/tests/incremental_matches_full_reindex.rs` `assert_matches_full_reindex`
+  → `IndexStore::into_inner`: `project.walk().into_inner()` (new, chain)
+  joins `store.into_inner()`.
+
+No edge was removed or retargeted; whether a shared `replaces` id is right
+when both sites answer the same target is the bridge's existing rule (§4).
+
+Oracle: `B_sem`, the before build with a completed semantic pass
+(`semanticPassAt = 2026-10-04 08:31:00`, `semanticPassError` NULL; 274 files,
+6511 edges upserted, 58 retracted). Joined by caller (file + qualifiedName,
+all 295 found) and target bare name, semantic edges only:
+
+| class | Here | placeholder | total |
+|---|---:|---:|---:|
+| agree | 33 | 253 | 286 |
+| contradict | 0 | 0 | **0** |
+| no oracle | 2 | 7 | 9 |
+
+Typed but unlinked (structural-only reindex of the after build): 6 of 260
+added placeholder edges link to nothing — `SessionHints::clone` ×3 and
+`RelPath::clone` (derived `Clone`, no declared method),
+`FileContainers::get` (a type alias of `BTreeMap`), `GMeshMcpServer::serve`
+(a trait method from an external crate). None is a wrong edge.
+
+### `untyped_calls` (structural-only reindexes)
+
+before 16469 rows / 4297 callers → after 16189 / 4274 (−280 rows, −23
+callers).
+
+### Machine
+
+Load was high (a concurrent full test suite): load averages 29.66 / 94.01 /
+102.49 at start, 6.85 / 10.75 / 29.16 at the end. Reindex `time -p`:
+A_struct real 397.3 user 1494.5 sys 10.7; B_struct real 407.4 user 1535.1
+sys 10.4; B_sem real 544.1 user 1498.8 sys 11.5 (semantic pass 146.4s).
+Counts do not depend on load; timings are not comparable to an idle run.
