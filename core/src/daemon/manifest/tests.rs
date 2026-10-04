@@ -194,7 +194,7 @@ fn plugin_dir(dir_name: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
 /// [`plugin_dir`], for `discover()` tests that need more than one
 /// language directory under a root. Returns the root path itself
 /// (unlike `plugin_dir`, which returns a plugin subdirectory).
-fn discovery_root(plugins: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+pub(crate) fn discovery_root(plugins: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
     let root = tempfile::tempdir().unwrap();
     for (dir_name, body) in plugins {
         let plugin_dir = root.path().join(dir_name);
@@ -210,7 +210,7 @@ fn discovery_root(plugins: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
 /// its containing directory name, same as [`well_formed_toml`]),
 /// `plugin_version` (used to tell two same-language manifests apart),
 /// and `extensions` (used to construct routing conflicts).
-fn manifest_toml(language: &str, plugin_version: &str, extensions: &[&str]) -> String {
+pub(crate) fn manifest_toml(language: &str, plugin_version: &str, extensions: &[&str]) -> String {
     let extensions = extensions.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
     format!(
         r#"
