@@ -2503,3 +2503,131 @@ fn an_unfinished_file_relabels_the_structural_edge_and_the_next_finished_pass_re
     assert!(semantic_edges(&second).is_empty(), "{:#?}", second.diff);
     x_re_sent_unchanged(&second, &finished, "pass 2 (finished)");
 }
+
+// --- GM-487: what a per-file pass did not finish is asked again ------------
+
+/// A per-file pass over `files`.
+fn pass_over(bridge: &mut LspBridge, index: &SdkIndex, files: &[&str]) -> SemanticAnswer {
+    let files: Vec<RelPath> = files.iter().map(|file| RelPath::new(*file)).collect();
+    bridge.answer(&files, index).expect("the bridge answers rather than failing")
+}
+
+/// GM-487 Fix 2: the per-file pass for `b.toy` meets a server that is still
+/// indexing and asks nothing. Core will not send `b.toy` again until it is
+/// edited, so the next per-file pass - for `a.toy`, which has no site of its
+/// own - asks `b.toy`'s site too, against the server that is warm by then,
+/// and emits its edge.
+///
+/// Control: drop `scope.extend(self.owed.keys().cloned())` in
+/// `LspBridge::answer`; pass 2 asks only about `a.toy`, sends no
+/// `textDocument/definition`, and `b.toy` gets no edge.
+#[test]
+fn a_file_whose_pass_met_a_cold_server_is_asked_on_the_next_pass() {
+    let scratch = Scratch::new("owed-cold");
+    let (index, caller) = fixture(&scratch);
+    let log = scratch.path().join("asked.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "progress", "beginAfterMs": 0, "endAfterMs": 3000 },
+        "nullWhileIndexing": true,
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "log": log.to_string_lossy(),
+    }));
+    let mut budgets = budgets();
+    // Pass 1 gives up at 1.5s, long before the server finishes indexing at
+    // 3s. The settle clock starts when the bridge *reads* the end of
+    // progress - at the start of pass 2 - so it must fit in pass 2's
+    // readiness budget.
+    budgets.readiness = Duration::from_millis(1_500);
+    budgets.settle = Duration::from_secs(1);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let cold = pass_over(&mut bridge, &index, &["src/b.toy"]);
+    assert!(!cold.complete, "a pass that asked nothing has not finished");
+    assert!(reason(&cold).contains("still indexing"), "{}", reason(&cold));
+    assert_eq!(asked(&log, "textDocument/definition"), 0, "the cold pass asked nothing");
+
+    // Past the end of indexing, so pass 2 reads it at once.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let warm = pass_over(&mut bridge, &index, &["src/a.toy"]);
+    assert!(warm.complete, "{:?}", warm.reason);
+    assert_eq!(asked(&log, "textDocument/definition"), 1, "the owed site in b.toy was asked");
+    let edges = semantic_edges(&warm);
+    assert_eq!(edges.len(), 1, "{:#?}", warm.diff);
+    assert_eq!(edges[0].from_id, caller, "the edge is b.toy's call");
+}
+
+/// GM-487 Fix 2 is bounded: a site the server refuses every time is re-asked
+/// by at most three passes, counting the one it was sent with, and then
+/// left alone until the file changes.
+///
+/// Control: raise `MAX_OWED_ATTEMPTS` (or drop the `attempts >=
+/// MAX_OWED_ATTEMPTS` removal in `settle_owed`); pass 4 still asks the site.
+#[test]
+fn a_file_no_pass_can_finish_is_re_asked_by_three_passes_and_then_dropped() {
+    let scratch = Scratch::new("owed-cap");
+    let (index, _) = fixture(&scratch);
+    let log = scratch.path().join("asked.log");
+    let mut answers = answers_the_site(&scratch);
+    answers[0]["error"] = json!("refused, every time");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+        "log": log.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let first = pass_over(&mut bridge, &index, &["src/b.toy"]);
+    assert!(!first.complete, "a refused question leaves the file unfinished");
+    let mut per_pass = vec![asked(&log, "textDocument/definition")];
+    for _ in 0..3 {
+        // Each later pass is for a.toy, which has no site of its own.
+        pass_over(&mut bridge, &index, &["src/a.toy"]);
+        per_pass.push(asked(&log, "textDocument/definition"));
+    }
+    let deltas: Vec<usize> = per_pass.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    assert!(per_pass[0] > 0, "pass 1 asked b.toy's site: {per_pass:?}");
+    assert!(deltas[0] > 0 && deltas[1] > 0, "passes 2 and 3 re-asked it: {per_pass:?}");
+    assert_eq!(deltas[2], 0, "pass 4 no longer asks it: {per_pass:?}");
+}
+
+/// An incomplete whole-project pass is core's to repeat, and it does not
+/// settle what earlier per-file passes left unfinished: `b.toy`, refused by
+/// its per-file pass and again by the whole-project pass, is still asked by
+/// the next per-file pass - and answered, now that the server has stopped
+/// refusing.
+///
+/// Control: make the whole-project branch at the end of `LspBridge::answer`
+/// clear `owed` whether or not the pass finished; pass 3 asks nothing about
+/// `b.toy` and emits no edge.
+#[test]
+fn an_incomplete_whole_project_pass_keeps_what_is_owed() {
+    let scratch = Scratch::new("owed-whole");
+    let (index, caller) = fixture(&scratch);
+    let log = scratch.path().join("asked.log");
+    let mut answers = answers_the_site(&scratch);
+    answers[0]["error"] = json!("refused, twice");
+    answers[0]["errorTimes"] = json!(2);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+        "log": log.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let per_file = pass_over(&mut bridge, &index, &["src/b.toy"]);
+    assert!(!per_file.complete, "refusal 1");
+    let whole = pass(&mut bridge, &index);
+    assert!(!whole.complete, "refusal 2: the whole-project pass did not finish b.toy");
+    let before = asked(&log, "textDocument/definition");
+
+    let next = pass_over(&mut bridge, &index, &["src/a.toy"]);
+    assert!(asked(&log, "textDocument/definition") > before, "b.toy is still owed and was asked");
+    assert!(next.complete, "{:?}", next.reason);
+    let edges = semantic_edges(&next);
+    assert_eq!(edges.len(), 1, "{:#?}", next.diff);
+    assert_eq!(edges[0].from_id, caller);
+}

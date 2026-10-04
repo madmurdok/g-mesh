@@ -417,7 +417,20 @@ pub struct LspBridge {
     /// keyed by their file - see [`trim_untyped_calls`]. Only what lets a later
     /// pass put a name back when its answers stop arriving.
     trimmed: BTreeMap<RelPath, BTreeSet<String>>,
+    /// Files a per-file pass asked about and did not finish, with the number
+    /// of passes that have tried them (GM-487). Core treats a per-file pass as
+    /// done whatever it reports, and re-sends one only when the file is edited
+    /// again, so a file whose pass met a cold server would otherwise keep its
+    /// sites unanswered until the next daemon start. Each later per-file pass
+    /// asks these too, until one finishes them or [`MAX_OWED_ATTEMPTS`] passes
+    /// have tried.
+    owed: BTreeMap<RelPath, u8>,
 }
+
+/// How many passes may try one file before it stops being re-asked - see
+/// [`LspBridge`]'s `owed`. Bounded so that a site no server ever answers does
+/// not ride along on every pass for the life of the process.
+const MAX_OWED_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct OpenDocument {
@@ -455,6 +468,41 @@ impl LspBridge {
             opened: BTreeMap::new(),
             emitted: BTreeMap::new(),
             trimmed: BTreeMap::new(),
+            owed: BTreeMap::new(),
+        }
+    }
+
+    /// Settles `owed` after a per-file pass: `finished` files and the ones
+    /// with nothing to ask (`settled`) are no longer owed, and every file in
+    /// `unfinished` counts one more attempt - restarting at one for a file
+    /// the pass was sent (`requested`), whose sites an edit may have changed.
+    /// A file that has used up [`MAX_OWED_ATTEMPTS`] is dropped, with a log
+    /// line.
+    fn settle_owed(
+        &mut self,
+        requested: &BTreeSet<RelPath>,
+        settled: &BTreeSet<RelPath>,
+        unfinished: &BTreeSet<RelPath>,
+    ) {
+        for file in settled {
+            self.owed.remove(file);
+        }
+        for file in unfinished {
+            let attempts = if requested.contains(file) {
+                1
+            } else {
+                self.owed.get(file).copied().unwrap_or(0).saturating_add(1)
+            };
+            if attempts >= MAX_OWED_ATTEMPTS {
+                self.owed.remove(file);
+                eprintln!(
+                    "[{}] {file}: {attempts} semantic pass(es) did not finish it - no longer re-asked until it \
+                     changes",
+                    self.language
+                );
+            } else {
+                self.owed.insert(file.clone(), attempts);
+            }
         }
     }
 
@@ -1827,10 +1875,19 @@ impl SemanticEngine for LspBridge {
 
     fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer> {
         let whole_project = files.is_empty();
+        // A file no longer in the index was deleted or failed to extract:
+        // there is nothing left to re-ask about it.
+        self.owed.retain(|file, _| index.entry(file).is_some());
+        let requested: BTreeSet<RelPath> = files.iter().cloned().collect();
         let scope: Vec<RelPath> = if whole_project {
             index.paths()
         } else {
-            files.iter().filter(|path| index.entry(path).is_some()).cloned().collect()
+            // What this pass was sent, plus what earlier per-file passes did
+            // not finish (GM-487).
+            let mut scope: BTreeSet<RelPath> =
+                files.iter().filter(|path| index.entry(path).is_some()).cloned().collect();
+            scope.extend(self.owed.keys().cloned());
+            scope.into_iter().collect()
         };
         if scope.is_empty() {
             return Ok(SemanticAnswer::complete(FileChangeDiff::default()));
@@ -1872,6 +1929,12 @@ impl SemanticEngine for LspBridge {
             // No question means no untyped receiver call in these files, so
             // this only forgets what an earlier pass trimmed in them.
             diff.upsert_nodes.extend(trim_untyped_calls(index, &covered, &HashMap::new(), &mut self.trimmed));
+            // Nothing left to ask is nothing owed.
+            if whole_project {
+                self.owed.clear();
+            } else {
+                self.settle_owed(&requested, &covered, &BTreeSet::new());
+            }
             return Ok(SemanticAnswer::complete(diff));
         }
 
@@ -1918,6 +1981,10 @@ impl SemanticEngine for LspBridge {
                 let reason = reason
                     .or_else(|| self.start_failure.clone())
                     .unwrap_or_else(|| "the language server is not running".to_string());
+                // Not one file was finished: every one asked about is owed.
+                if !whole_project {
+                    self.settle_owed(&requested, &BTreeSet::new(), &asked_about);
+                }
                 return Ok(SemanticAnswer::incomplete_because(FileChangeDiff::default(), reason));
             }
         };
@@ -1971,6 +2038,25 @@ impl SemanticEngine for LspBridge {
         let failure = failure.or_else(|| {
             plan.truncated.then(|| "the open-site ceiling (max_sites) left sites unasked".to_string())
         });
+        if whole_project {
+            // A complete whole-project pass answered everything; an incomplete
+            // one is core's to repeat, so it leaves `owed` as it was, less
+            // what it finished.
+            if failure.is_none() {
+                self.owed.clear();
+            } else {
+                self.owed.retain(|file, _| !finished.contains(file));
+            }
+        } else {
+            // A file in scope with no question is settled too - unless the
+            // ceiling is why it had none.
+            let mut settled = finished.clone();
+            if !plan.truncated {
+                settled.extend(scope.iter().filter(|file| !asked_about.contains(*file)).cloned());
+            }
+            let unfinished: BTreeSet<RelPath> = asked_about.difference(&finished).cloned().collect();
+            self.settle_owed(&requested, &settled, &unfinished);
+        }
         Ok(SemanticAnswer { diff, complete: failure.is_none(), reason: failure })
     }
 }
