@@ -349,6 +349,114 @@ fn the_marker_is_absent_when_every_candidate_already_calls_the_method() {
     assert!(references.get("untypedReceiverCalls").is_none(), "{references}");
 }
 
+/// The `file:` URI of an absolute path, spelled independently of the SDK's
+/// own (see `plugins/sdk/tests/lsp_bridge.rs`' `file_uri` for why).
+fn file_uri(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text).replace('\\', "/");
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                encoded.push(byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
+}
+
+/// The checked-in rust manifest with its semantic tier pointed at the SDK's
+/// scripted `g-mesh-fake-lsp`, which answers every `.frob()` in
+/// [`UNTYPED_CALLER`] with a std location, as rust-analyzer answers a call
+/// it resolves to a std method. The manifest is written under `dir/rust`.
+fn rust_answered_by_std(dir: &std::path::Path, project: &std::path::Path) -> DiscoveredPlugins {
+    let plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+    let checked_in = read_manifest(&plugins.join("rust")).expect("the checked-in rust plugin manifest");
+    let fake = checked_in.command.with_file_name(format!("g-mesh-fake-lsp{}", std::env::consts::EXE_SUFFIX));
+    assert!(fake.exists(), "{} is missing - run `cargo build --workspace`", fake.display());
+
+    let mut answers = Vec::new();
+    for root in [project.to_path_buf(), std::fs::canonicalize(project).unwrap()] {
+        let uri = file_uri(&root.join("src/user/caller.rs"));
+        for (line, text) in UNTYPED_CALLER.lines().enumerate() {
+            let Some(at) = text.find(".frob()") else { continue };
+            answers.push(serde_json::json!({
+                "uri": uri,
+                "line": line,
+                "character": at + 1,
+                "definition": { "uri": "file:///rustlib/src/rust/library/core/src/frob.rs", "line": 3, "character": 11 },
+            }));
+        }
+    }
+    assert_eq!(answers.len(), 4, "two `.frob()` sites, under both spellings of the root");
+    let script = dir.join("script.json");
+    let script_body = serde_json::json!({ "readiness": { "kind": "none" }, "positionEncoding": "utf-16", "answers": answers });
+    std::fs::write(&script, serde_json::to_vec(&script_body).unwrap()).unwrap();
+
+    let text = std::fs::read_to_string(plugins.join("rust/plugin.toml")).unwrap();
+    for needle in ["command = \"rust-analyzer\"", "readiness = \"indexed\""] {
+        assert!(text.contains(needle), "the checked-in manifest no longer says {needle}");
+    }
+    let text = text
+        .replace(
+            "command = \"rust-analyzer\"",
+            &format!("command = '{}'\nargs = ['--script', '{}']", fake.display(), script.display()),
+        )
+        .replace("readiness = \"indexed\"", "readiness = \"on-demand\"");
+    std::fs::create_dir_all(dir.join("rust")).unwrap();
+    std::fs::write(dir.join("rust/plugin.toml"), text).unwrap();
+    DiscoveredPlugins {
+        manifests: HashMap::from([("rust".to_string(), read_manifest(&dir.join("rust")).unwrap())]),
+        routing: HashMap::from([(".rs".to_string(), "rust".to_string())]),
+    }
+}
+
+/// **GM-486, end to end.** Both untyped `frob` calls are answered by the
+/// semantic tier with a std method, outside the index, so no edge is ever
+/// recorded and the SQL filter (a semantic edge to a node named `frob`)
+/// finds nothing to drop. The bridge drops the name from each caller's
+/// `untypedCalls` instead, and after the pass `W::frob`'s page carries no
+/// marker.
+///
+/// Through the real rust plugin, the SDK bridge, a scripted language server
+/// and core's semantic apply. Controls: in `untyped_call_answered`, drop the
+/// "every location outside the index" arm; or skip the
+/// `trim_untyped_calls` extend in `LspBridge::answer` (the marker stays
+/// with count 2). The before-pass assertion is the control that the
+/// fixture had the marker to lose.
+#[test]
+fn a_method_whose_untyped_callers_std_answered_carries_no_marker_after_the_pass() {
+    let fixture = Fixture::with_files(UNTYPED_USER, &[("src/user/caller.rs", UNTYPED_CALLER)]);
+    let scratch = tempfile::tempdir().unwrap();
+    let plugins = rust_answered_by_std(scratch.path(), fixture.dir.path());
+
+    let before = fixture.callers("user::W::frob");
+    assert_eq!(before["untypedReceiverCalls"]["count"], 2, "the structural index marks the page: {before}");
+
+    let root = std::fs::canonicalize(fixture.dir.path()).unwrap();
+    let state = project_dir(fixture.dir.path()).unwrap();
+    let run = crate::daemon::semantic::run_once(
+        &root,
+        &state,
+        &fixture.store,
+        &plugins,
+        &EmbeddingPipeline::disabled(),
+    );
+    assert!(run.failed.is_empty(), "{:?}", run.failed);
+    assert_eq!(run.completed, ["rust"]);
+
+    let after = fixture.callers("user::W::frob");
+    assert!(caller_names(&after).is_empty(), "std answers record no edge to `W::frob`: {after}");
+    assert!(after.get("untypedReceiverCalls").is_none(), "{after}");
+    let references = fixture.references("user::W::frob");
+    assert!(references.get("untypedReceiverCalls").is_none(), "{references}");
+}
+
 fn path(segments: &[&str]) -> QualifiedPath {
     QualifiedPath(
         segments

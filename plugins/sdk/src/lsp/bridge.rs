@@ -2122,4 +2122,277 @@ mod tests {
         assert!(bridge.pass_budget(false, 1) < Duration::from_secs(120));
         assert!(budgets.readiness <= budgets.project_floor);
     }
+
+    // --- GM-486: untyped receiver calls the semantic tier answered ---------
+
+    /// `a.toy` declares `add` and `sub`; `b.toy`'s `caller` calls `len`
+    /// twice and `add` once through untyped receivers, `typed` through a
+    /// receiver with a structural edge (`replaces`), and holds a plain
+    /// reference `bare`. `caller` also carries every column a structural
+    /// node can, so a re-sent copy that lost one is visible.
+    fn untyped_index() -> (SdkIndex, String) {
+        let range = |start: (u32, u32), end: (u32, u32)| Range {
+            start: Position { line: start.0, col: start.1 },
+            end: Position { line: end.0, col: end.1 },
+        };
+
+        let a = RelPath::new("a.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &a);
+        builder.file_node(range((0, 0), (2, 0)));
+        for (line, name) in [(0, "add"), (1, "sub")] {
+            builder.add_node(
+                NodeSpec::new(NodeKind::Function, name, name, range((line, 3), (line, 6)))
+                    .native_kind("method")
+                    .public(),
+            );
+        }
+        let mut index = SdkIndex::new();
+        index.insert(a, "fn add\nfn sub\n".to_string(), builder.finish());
+
+        let b = RelPath::new("b.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &b);
+        builder.record_untyped_receiver_calls();
+        builder.file_node(range((0, 0), (6, 0)));
+        let caller = builder.add_node(
+            NodeSpec::new(NodeKind::Function, "caller", "m::caller", range((0, 0), (5, 1)))
+                .native_kind("function")
+                .in_container("m", None)
+                .public(),
+        );
+        for (line, name, kind, replaces) in [
+            (1, "len", OpenSiteKind::ReceiverCall, None),
+            (2, "len", OpenSiteKind::ReceiverCall, None),
+            (3, "add", OpenSiteKind::ReceiverCall, None),
+            (4, "typed", OpenSiteKind::ReceiverCall, Some("e-typed".to_string())),
+            (4, "bare", OpenSiteKind::Reference, None),
+        ] {
+            builder.open_site(OpenSite {
+                from_id: caller.clone(),
+                position: Position { line, col: 4 },
+                name: name.to_string(),
+                kind,
+                edge_kind: EdgeKind::Calls,
+                from_container: Some("m".to_string()),
+                replaces,
+            });
+        }
+        let mut graph = builder.finish();
+        let node = graph.nodes.iter_mut().find(|node| node.id == caller).unwrap();
+        assert_eq!(node.untyped_calls, ["add", "len"], "the structural list the fixture starts from");
+        node.signature = Some("fn caller()".to_string());
+        node.doc_comment = Some("Calls things.".to_string());
+        node.declarations = Some(vec![g_mesh_wire::WireDeclaration {
+            ordinal: 0,
+            start_line: 0,
+            start_col: 0,
+            end_line: 5,
+            end_col: 1,
+            signature: Some("fn caller()".to_string()),
+            has_body: true,
+        }]);
+        let path = |first: &str| {
+            g_mesh_wire::QualifiedPath(vec![
+                g_mesh_wire::PathSegment { sep: None, name: first.to_string() },
+                g_mesh_wire::PathSegment { sep: Some("::".to_string()), name: "caller".to_string() },
+            ])
+        };
+        node.qualified_path = Some(path("m"));
+        node.alias_paths = vec![path("alias")];
+        node.target = Some(PlaceholderTarget {
+            scope: TargetScope::Container("m".to_string()),
+            key: TargetKey::QualifiedName("m::caller".to_string()),
+            from_container: Some("m".to_string()),
+            key_path: None,
+        });
+        index.insert(
+            b,
+            "fn caller() {\n  x.len();\n  y.len();\n  z.add();\n  t.typed();\n}\n".to_string(),
+            graph,
+        );
+        (index, caller)
+    }
+
+    /// The open site of `caller` called `name` at `line`.
+    fn site_of(index: &SdkIndex, name: &str, line: u32) -> OpenSite {
+        let entry = index.entry(&RelPath::new("b.toy")).unwrap();
+        entry
+            .graph
+            .open_sites
+            .iter()
+            .find(|site| site.name == name && site.position.line == line)
+            .unwrap()
+            .clone()
+    }
+
+    /// How many sites of `(caller, name)` one answer `found` counted as
+    /// answered, and how many edges it recorded.
+    fn answered_by(index: &SdkIndex, caller: &str, site: OpenSite, found: Value) -> (usize, usize) {
+        let question = Question {
+            file: RelPath::new("b.toy"),
+            position: site.position,
+            ask: Ask::Definition(site.clone()),
+        };
+        let mut answers = Answers::new("toy", "toy-lsp");
+        let root = Path::new("/p");
+        let _ = record_answer(&mut answers, index, [root, root], PositionEncoding::Utf16, &question, &found);
+        let counted =
+            answers.untyped_answered.get(&(caller.to_string(), site.name.clone())).copied().unwrap_or(0);
+        let (diff, _) = answers.finish();
+        (counted, diff.upsert_edges.len())
+    }
+
+    /// **GM-486, the counting rule.** An untyped site counts as answered when
+    /// the answer is non-empty and either recorded an edge or lies wholly
+    /// outside the index. An empty or null answer does not count, and neither
+    /// does one that lands in an indexed file without an edge.
+    ///
+    /// Controls, each in `untyped_call_answered` / `record_answer`: drop the
+    /// `found.is_empty()` check (the empty and null cases count); drop the
+    /// `|| found.iter().all(..)` arm (the std case does not count); pass
+    /// `false` for `recorded` (the edge case does not count); pass
+    /// `target.is_some()` instead of `agree && target.is_some()` (the
+    /// disagreeing case counts); test `node_at(..).is_none()` instead of
+    /// `file_at(..).is_none()` (the no-node case counts); drop the
+    /// `site.replaces.is_some()` or `site.kind != ReceiverCall` check (a
+    /// typed call or a reference counts).
+    #[test]
+    fn an_untyped_call_is_answered_only_by_a_non_empty_answer_that_is_an_edge_or_outside_the_index() {
+        let (index, caller) = untyped_index();
+        let len = || site_of(&index, "len", 1);
+        let outside = json!({ "uri": "file:///rustlib/core/src/slice.rs", "range": { "start": { "line": 9, "character": 4 } } });
+        let at_add = json!({ "uri": "file:///p/a.toy", "range": { "start": { "line": 0, "character": 3 } } });
+        let at_sub = json!({ "uri": "file:///p/a.toy", "range": { "start": { "line": 1, "character": 3 } } });
+        // Inside `a.toy`, before `add`: only the file node covers it.
+        let at_no_node =
+            json!({ "uri": "file:///p/a.toy", "range": { "start": { "line": 0, "character": 0 } } });
+
+        assert_eq!(answered_by(&index, &caller, len(), Value::Null), (0, 0), "a null answer is no answer");
+        assert_eq!(answered_by(&index, &caller, len(), json!([])), (0, 0), "an empty answer is no answer");
+        assert_eq!(answered_by(&index, &caller, len(), outside.clone()), (1, 0), "std, outside the index");
+        assert_eq!(
+            answered_by(&index, &caller, len(), json!([outside.clone(), outside.clone()])),
+            (1, 0),
+            "every location outside the index"
+        );
+        assert_eq!(
+            answered_by(&index, &caller, len(), at_add.clone()),
+            (1, 1),
+            "an answer that became an edge"
+        );
+        assert_eq!(
+            answered_by(&index, &caller, len(), at_no_node.clone()),
+            (0, 0),
+            "an indexed file with no node there may be a missed project call"
+        );
+        assert_eq!(
+            answered_by(&index, &caller, len(), json!([at_add.clone(), at_sub])),
+            (0, 0),
+            "targets that disagree record no edge, so the name stays"
+        );
+        assert_eq!(
+            answered_by(&index, &caller, len(), json!([outside.clone(), at_no_node])),
+            (0, 0),
+            "one location in the index without an edge is enough to keep the name"
+        );
+        assert_eq!(
+            answered_by(&index, &caller, site_of(&index, "typed", 4), outside.clone()),
+            (0, 0),
+            "a call with a structural edge is not an untyped call"
+        );
+        assert_eq!(
+            answered_by(&index, &caller, site_of(&index, "bare", 4), outside),
+            (0, 0),
+            "a reference is not a receiver call"
+        );
+    }
+
+    fn answered(counts: &[(&str, &str, usize)]) -> HashMap<(String, String), usize> {
+        counts.iter().map(|(from, name, n)| ((from.to_string(), name.to_string()), *n)).collect()
+    }
+
+    fn b_toy() -> BTreeSet<RelPath> {
+        BTreeSet::from([RelPath::new("b.toy")])
+    }
+
+    /// **GM-486.** A name leaves the list only when every untyped site of it
+    /// in that caller was answered: one of two `len` sites is not enough.
+    /// Only the listed files are considered.
+    ///
+    /// Control: in `trim_untyped_calls`, keep a name only when `done == 0`
+    /// instead of `done < total` (`len` drops after one of its two sites).
+    #[test]
+    fn a_name_drops_only_when_every_one_of_its_sites_in_the_caller_was_answered() {
+        let (index, caller) = untyped_index();
+        let trim = |counts: &[(&str, &str, usize)], files: &BTreeSet<RelPath>| {
+            trim_untyped_calls(&index, files, &answered(counts), &mut BTreeMap::new())
+        };
+
+        let one_len = trim(&[(&caller, "len", 1), (&caller, "add", 1)], &b_toy());
+        assert_eq!(one_len.len(), 1, "{one_len:#?}");
+        assert_eq!(one_len[0].id, caller);
+        assert_eq!(one_len[0].untyped_calls, ["len"], "`add` is answered, one `len` site is still open");
+
+        let both_len = trim(&[(&caller, "len", 2), (&caller, "add", 1)], &b_toy());
+        assert_eq!(both_len[0].untyped_calls, Vec::<String>::new(), "every site answered");
+
+        assert!(trim(&[(&caller, "len", 1)], &b_toy()).is_empty(), "nothing shorter, nothing re-sent");
+        assert!(
+            trim(&[(&caller, "add", 1)], &BTreeSet::from([RelPath::new("a.toy")])).is_empty(),
+            "a file not listed is left as core holds it"
+        );
+    }
+
+    /// **GM-486.** The re-sent caller is the structural node whole, with only
+    /// `untypedCalls` shorter: core's upsert replaces every column and child
+    /// row from the record, so anything less would erase what the structural
+    /// tier sent (declarations, qualified and alias paths, target, doc,
+    /// signature, container).
+    ///
+    /// Control: in `trim_untyped_calls`, build the upsert as
+    /// `WireNode { untyped_calls: kept, declarations: None, alias_paths:
+    /// Vec::new(), ..node.clone() }`.
+    #[test]
+    fn a_re_sent_caller_keeps_every_other_column() {
+        let (index, caller) = untyped_index();
+        let original = index
+            .entry(&RelPath::new("b.toy"))
+            .unwrap()
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id == caller)
+            .unwrap()
+            .clone();
+
+        let upserts =
+            trim_untyped_calls(&index, &b_toy(), &answered(&[(&caller, "add", 1)]), &mut BTreeMap::new());
+        assert_eq!(upserts, vec![WireNode { untyped_calls: vec!["len".to_string()], ..original }]);
+    }
+
+    /// **GM-486.** Every pass starts from the structural list the index
+    /// holds: the same answers trim the same node again on the next pass
+    /// (undoing a structural reparse that re-sent the full list in between),
+    /// a name comes back once its answers stop, and a node that is neither
+    /// trimmed nor was trimmed is not re-sent.
+    ///
+    /// Controls, in `trim_untyped_calls`: drop the `else if
+    /// previously.contains(..)` branch (pass 3 re-sends nothing, so `add`
+    /// never comes back); re-send a shortened node only when
+    /// `!previously.contains(&node.id)` (pass 2 re-sends the full list).
+    #[test]
+    fn each_pass_trims_from_the_structural_list_and_a_name_comes_back_when_its_answers_stop() {
+        let (index, caller) = untyped_index();
+        let mut trimmed = BTreeMap::new();
+        let mut pass = |counts: &[(&str, &str, usize)]| {
+            let upserts = trim_untyped_calls(&index, &b_toy(), &answered(counts), &mut trimmed);
+            upserts.into_iter().map(|node| (node.id, node.untyped_calls)).collect::<Vec<_>>()
+        };
+        let sent =
+            |names: &[&str]| vec![(caller.clone(), names.iter().map(|n| n.to_string()).collect::<Vec<_>>())];
+
+        assert_eq!(pass(&[(&caller, "add", 1)]), sent(&["len"]), "pass 1 trims `add`");
+        assert_eq!(pass(&[(&caller, "add", 1)]), sent(&["len"]), "pass 2 trims it again, from the full list");
+        assert_eq!(pass(&[]), sent(&["add", "len"]), "pass 3: no answer, the full list goes back");
+        assert_eq!(pass(&[]), Vec::new(), "pass 4: nothing trimmed now or before, nothing re-sent");
+    }
 }
