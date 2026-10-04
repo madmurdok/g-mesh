@@ -147,11 +147,12 @@
 //! [`SemanticPassRun`] and every other language is still asked, and neither
 //! entry point is on any command's success path.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 use crate::daemon::indexing_status::IndexingStatus;
+use crate::daemon::lifecycle::AwakeHold;
 use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::{plugin_pid_file_name, PluginRegistry};
@@ -299,11 +300,13 @@ impl SemanticPassRun {
 /// another language its own pass. A supervisor left asleep
 /// (`PluginSupervisor::semantic_pass` returning `Ok(false)`) is deliberately
 /// neither completed nor in [`SemanticPassRun::failed`]: nothing was actually
-/// run, and the language stays owed for whoever asks next - see that method's
-/// own doc comment for why this is expected to be unreachable at this call
-/// site in practice, not a case worth surfacing as an error. It is still
-/// recorded as the language's reason ([`NOT_RUN_REASON`]), so status says why
-/// the language is owed rather than "never completed".
+/// run, and the language stays owed for whoever asks next. It is reachable: a
+/// plugin already asleep when the run starts is not woken for it, and a
+/// memory suspension is not lifted. What the run does prevent is idling a
+/// plugin out mid-run - every language `prepare_owed` told its pass is coming
+/// is held awake ([`AwakeHold`]) until its own pass has been asked. It is
+/// still recorded as the language's reason ([`NOT_RUN_REASON`]), so status
+/// says why the language is owed rather than "never completed".
 pub fn run_with_registry(registry: &PluginRegistry, conn: &IndexStore) -> SemanticPassRun {
     run_with_registry_and_progress(registry, conn, None)
 }
@@ -324,7 +327,9 @@ pub fn run_with_registry_and_progress(
         }
     };
 
-    prepare_owed(registry, &owed);
+    // Each language told its pass is coming stays awake until that pass has
+    // been asked; the rest drop at the end of this function.
+    let mut holds = prepare_owed(registry, &owed);
 
     if let Some(progress) = progress {
         progress.start_semantic_progress(u32::try_from(owed.len()).unwrap_or(u32::MAX));
@@ -338,6 +343,9 @@ pub fn run_with_registry_and_progress(
         let outcome = registry
             .get_or_spawn(&language)
             .and_then(|supervisor| supervisor.semantic_pass(conn, Vec::new(), file_count));
+        // Released once the pass has been asked, whatever its outcome: it
+        // restarts the idle clock, so the plugin now sleeps on its own schedule.
+        drop(holds.remove(&language));
         match outcome {
             Ok(true) => run.record_success(conn, language),
             // The supervisor was asleep or suspended and deliberately left
@@ -365,17 +373,27 @@ pub fn run_with_registry_and_progress(
 ///
 /// Best-effort: a spawn or a write that fails here is logged, and the pass
 /// that follows tries the same spawn again and records its own failure.
-fn prepare_owed(registry: &PluginRegistry, owed: &[String]) {
+fn prepare_owed(registry: &PluginRegistry, owed: &[String]) -> HashMap<String, AwakeHold> {
+    let mut holds = HashMap::new();
     for language in owed.iter().filter(|language| registry.wants_semantic_prepare(language)) {
-        let prepared =
-            registry.get_or_spawn(language).and_then(|supervisor| supervisor.prepare_semantic_pass());
-        if let Err(err) = prepared {
-            eprintln!(
+        // The hold is taken before telling, so no idle tick can slip in
+        // between the two; it is kept only if the plugin was actually told.
+        let prepared = registry.get_or_spawn(language).and_then(|supervisor| {
+            let hold = supervisor.hold_awake();
+            supervisor.prepare_semantic_pass().map(|told| told.then_some(hold))
+        });
+        match prepared {
+            Ok(Some(hold)) => {
+                holds.insert(language.clone(), hold);
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!(
                 "g-mesh daemon: could not tell the {language} plugin its semantic pass is owed ({err:#}) - \
                  it starts its engine when the pass is asked instead"
-            );
+            ),
         }
     }
+    holds
 }
 
 /// Runs the whole-project pass for every currently-owed language for a

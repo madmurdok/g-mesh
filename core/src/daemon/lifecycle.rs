@@ -190,6 +190,27 @@ pub struct PluginSupervisor {
     semantic_suspended: AtomicBool,
     /// Makes the "could not sample" log once per supervisor, not once per tick.
     sampling_unavailable_logged: AtomicBool,
+    /// Live [`AwakeHold`]s: while non-zero, [`sleep_if_idle`](Self::sleep_if_idle)
+    /// leaves the plugin awake. A semantic run holds a language it told a pass
+    /// is coming, so earlier languages' long passes cannot idle it out before
+    /// its own pass is asked. `sleep_now` and `check_memory_limit` ignore it.
+    semantic_holds: AtomicUsize,
+}
+
+/// Keeps a [`PluginSupervisor`] from idling to sleep while it lives
+/// ([`PluginSupervisor::hold_awake`]). Dropping it releases the hold and
+/// restarts the idle clock from that moment, not from the last request
+/// before the hold.
+#[must_use = "the plugin is only held awake while the hold lives"]
+pub struct AwakeHold {
+    supervisor: Arc<PluginSupervisor>,
+}
+
+impl Drop for AwakeHold {
+    fn drop(&mut self) {
+        self.supervisor.semantic_holds.fetch_sub(1, Ordering::SeqCst);
+        self.supervisor.touch();
+    }
 }
 
 impl PluginSupervisor {
@@ -225,6 +246,7 @@ impl PluginSupervisor {
             memory_limit_mb,
             semantic_suspended: AtomicBool::new(false),
             sampling_unavailable_logged: AtomicBool::new(false),
+            semantic_holds: AtomicUsize::new(0),
         }))
     }
 
@@ -420,21 +442,22 @@ impl PluginSupervisor {
         process.ensure_fresh(conn, file_path, &self.embedding, self.is_semantic_suspended())
     }
 
-    /// Puts the plugin to sleep if it has gone [`idle_timeout`] without work.
-    /// Returns whether it actually slept.
+    /// Puts the plugin to sleep if it has gone [`idle_timeout`] without work
+    /// and no [`AwakeHold`] is live. Returns whether it actually slept.
     ///
     /// [`idle_timeout`]: IdleTimeouts::plugin
     pub fn sleep_if_idle(&self) -> bool {
         let Some(timeout) = self.idle_timeout else { return false };
         // Checked outside the lock so a busy plugin's tick never queues behind
         // the reparse keeping it busy...
-        if self.idle_for() < timeout {
+        if self.is_held_awake() || self.idle_for() < timeout {
             return false;
         }
         let mut inner = self.inner();
         // ...and again inside it, because the round trip just waited on is
-        // activity that calls the sleep off.
-        if self.idle_for() < timeout {
+        // activity that calls the sleep off, and a hold may have been taken
+        // meanwhile.
+        if self.is_held_awake() || self.idle_for() < timeout {
             return false;
         }
         let Some(process) = inner.process.take() else { return false };
@@ -572,6 +595,19 @@ impl PluginSupervisor {
 
     fn touch(&self) {
         *self.last_activity.lock().unwrap() = Instant::now();
+    }
+
+    /// Keeps the plugin from idling to sleep until the returned hold drops.
+    /// Only [`sleep_if_idle`](Self::sleep_if_idle) honours it: `sleep_now`
+    /// (core shutdown) and `check_memory_limit` (a deliberate suspension) do
+    /// not. It does not wake a plugin that is already asleep.
+    pub fn hold_awake(self: &Arc<Self>) -> AwakeHold {
+        self.semantic_holds.fetch_add(1, Ordering::SeqCst);
+        AwakeHold { supervisor: Arc::clone(self) }
+    }
+
+    fn is_held_awake(&self) -> bool {
+        self.semantic_holds.load(Ordering::SeqCst) > 0
     }
 
     fn idle_for(&self) -> Duration {
