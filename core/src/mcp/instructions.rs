@@ -231,20 +231,52 @@ const HEAD_INSTALLED_NONE: &str =
 
 const TRAILER: &str = "Until then an empty answer about those files is not evidence of absence.";
 
-/// The longest a failed language's error may be: its first line, cut on a
-/// char boundary. It is the first thing the ceiling cuts.
+/// The longest a failed language's error may be, cut on a char boundary. It
+/// is the first thing the ceiling cuts.
 const ERROR_BYTES: usize = 100;
 
-fn error_first_line(error: &str) -> String {
-    let line = error.lines().next().unwrap_or_default();
-    if line.len() <= ERROR_BYTES {
-        return line.to_string();
+/// What a failed language's item shows of its stored error: the innermost
+/// cause, with filesystem paths shortened to their file name, at most
+/// [`ERROR_BYTES`] bytes. The store keeps the whole anyhow chain as `{:#}`
+/// renders it, outermost first and joined by ": ", so the innermost cause is
+/// what follows the last ": " of the last non-empty line. The outer contexts
+/// name the step and the inner cause names what went wrong; with 100 bytes,
+/// the cause is the part worth keeping. A cause whose own text contains ": "
+/// keeps only its tail.
+fn error_cause(error: &str) -> String {
+    let line = error.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or_default();
+    let cause = line.rsplit(": ").next().unwrap_or_default().trim();
+    let cause = shorten_paths(cause);
+    if cause.len() <= ERROR_BYTES {
+        return cause;
     }
     let mut end = ERROR_BYTES - "...".len();
-    while !line.is_char_boundary(end) {
+    while !cause.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...", &line[..end])
+    format!("{}...", &cause[..end])
+}
+
+/// Replaces each space-separated token that is an absolute (`/...`) or
+/// home-relative (`~/...`) path by its last component, keeping the
+/// punctuation around it: `(/private/tmp/x/plugin.js)` becomes
+/// `(plugin.js)`. Anything else is left as it is.
+fn shorten_paths(text: &str) -> String {
+    const OPEN: &[char] = &['(', '[', '"', '\'', '`'];
+    const CLOSE: &[char] = &[')', ']', '"', '\'', '`', ',', ';', ':', '.'];
+    text.split(' ')
+        .map(|token| {
+            let start = token.len() - token.trim_start_matches(OPEN).len();
+            let end = token.trim_end_matches(CLOSE).len().max(start);
+            let path = &token[start..end];
+            let rooted = path.strip_prefix('/').or_else(|| path.strip_prefix("~/"));
+            match rooted.and_then(|rest| rest.rsplit('/').find(|part| !part.is_empty())) {
+                Some(name) => format!("{}{name}{}", &token[..start], &token[end..]),
+                None => token.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn install_command(language: &str) -> String {
@@ -294,7 +326,7 @@ fn coverage_paragraph(coverage: &Coverage, with_errors: bool, with_list: bool) -
                     .iter()
                     .map(|(language, error)| {
                         if with_errors {
-                            format!("{language} ({})", error_first_line(error))
+                            format!("{language} ({})", error_cause(error))
                         } else {
                             language.clone()
                         }

@@ -777,12 +777,12 @@ fn plugin_absent_cannot_be_mistaken_for_nothing_found() {
     assert!(nothing_found.contains("Indexed here: python and typescript."), "{nothing_found}");
 }
 
-/// Failed: the language is named with the first line of its error and the
-/// `g-mesh reindex` retry, never as indexed, and the trailer follows.
+/// Failed: the language is named with the innermost cause of its error and
+/// the `g-mesh reindex` retry, never as indexed, and the trailer follows.
 /// Controls: drop the failed arm; render the whole chain instead of
-/// `error_first_line`.
+/// `error_cause`.
 #[test]
-fn a_failed_language_names_its_first_error_line_and_the_reindex_command() {
+fn a_failed_language_names_its_error_cause_and_the_reindex_command() {
     let all = ["go", "python", "rust", "typescript"];
     let found = real_plugins(&all);
     let coverage = warm_real(
@@ -801,49 +801,49 @@ fn a_failed_language_names_its_first_error_line_and_the_reindex_command() {
 
     assert!(
         rendered.contains(
-            "Not indexed, plugin failed: rust (rust plugin exited during the handshake) - fix the plugin, \
+            "Not indexed, plugin failed: rust (No such file or directory) - fix the plugin, \
              then run `g-mesh reindex`."
         ),
         "{rendered}"
     );
-    assert!(!rendered.contains("caused by"), "only the first line: {rendered}");
+    assert!(!rendered.contains("handshake"), "only the innermost cause: {rendered}");
     assert!(rendered.contains("Indexed here: go, python and typescript."), "{rendered}");
     assert!(rendered.contains(TRAILER), "{rendered}");
 }
 
-/// [`error_first_line`]: the first line only, at most [`ERROR_BYTES`]
+/// [`error_cause`]: the innermost cause only, at most [`ERROR_BYTES`]
 /// bytes, cut on a char boundary when byte 97 falls inside a multi-byte
 /// char. Controls: cut at `&line[..97]` without the boundary walk (panics on
 /// the multi-byte inputs); drop the length check (the long line comes back
 /// whole).
 #[test]
-fn error_first_line_keeps_the_first_line_within_100_bytes_on_a_char_boundary() {
-    assert_eq!(error_first_line("first\nsecond"), "first");
-    assert_eq!(error_first_line(""), "");
+fn error_cause_keeps_the_innermost_cause_within_100_bytes_on_a_char_boundary() {
+    assert_eq!(error_cause("first\nsecond"), "second");
+    assert_eq!(error_cause(""), "");
 
     let exactly = "e".repeat(ERROR_BYTES);
-    assert_eq!(error_first_line(&exactly), exactly, "100 bytes is kept whole");
+    assert_eq!(error_cause(&exactly), exactly, "100 bytes is kept whole");
 
     let over = "e".repeat(ERROR_BYTES + 1);
-    let cut = error_first_line(&over);
+    let cut = error_cause(&over);
     assert_eq!(cut, format!("{}...", "e".repeat(ERROR_BYTES - 3)));
     assert_eq!(cut.len(), ERROR_BYTES);
 
     // A two-byte char spanning bytes 96-97: byte 97 is inside it.
     let two_byte = format!("{}é{}", "a".repeat(96), "z".repeat(20));
-    let cut = error_first_line(&two_byte);
+    let cut = error_cause(&two_byte);
     assert_eq!(cut, format!("{}...", "a".repeat(96)));
     assert!(cut.len() <= ERROR_BYTES);
 
     // Three-byte chars only: 97 is not a multiple of 3.
     let three_byte = "日".repeat(40);
-    let cut = error_first_line(&three_byte);
+    let cut = error_cause(&three_byte);
     assert_eq!(cut, format!("{}...", "日".repeat(32)));
     assert!(cut.len() <= ERROR_BYTES);
 
-    // The cut applies to the first line, not to the whole chain.
-    let chain = format!("{}\nshort", "日".repeat(40));
-    assert_eq!(error_first_line(&chain), format!("{}...", "日".repeat(32)));
+    // The cut applies to the innermost cause, not to the whole chain.
+    let chain = format!("outer: {}", "日".repeat(40));
+    assert_eq!(error_cause(&chain), format!("{}...", "日".repeat(32)));
 }
 
 /// The trailer is said exactly when something is absent or failed.
@@ -1462,10 +1462,7 @@ fn the_server_renders_a_failed_walk_as_nothing_indexed() {
 
     assert!(rendered.contains(HEAD_NONE), "{rendered}");
     assert!(!rendered.contains(RECEIVER_OPENING), "{rendered}");
-    assert!(
-        rendered.contains("go (exited), python (exited), rust (exited), typescript (exited)"),
-        "{rendered}"
-    );
+    assert!(rendered.contains("go (more), python (more), rust (more), typescript (more)"), "{rendered}");
     assert!(!rendered.contains("Plugins installed"), "{rendered}");
 }
 
