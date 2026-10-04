@@ -47,7 +47,12 @@ win when it sorts first.
   sibling is renamed.
 - **Bounds.** A directory is entered through a link at most once and never
   through a link once entered; a directory reached without a link is always
-  entered. walkdir's ancestor-loop check is a backstop.
+  entered. Nested links can walk one real directory more than once, but each
+  link is entered once, so the walk ends; walkdir's ancestor-loop check is a
+  backstop. A dangling link and a link to an ancestor fail in the directory
+  iterator before `.gitignore` is consulted, so they are reported in the link
+  table even when ignored (never under an excluded directory name, which is
+  not entered).
 - **Core's walk does not follow links.** Under real-wins its file set is the
   plugins' minus the files reachable only through a link.
 - The SDK exposes what became of each link (`walk_project_detailed`:

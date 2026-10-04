@@ -203,7 +203,7 @@ in-tree location (finding 1).
    Output = winners, sorted by component-wise `Path` order (the walk order;
    also what `walk_project`'s "sorted" doc promises).
 
-Bounds: a real directory is walked at most twice (once through the first link
+Bounds (corrected at verify: nested links can walk one real directory more than twice; each link is still entered once): a real directory is walked at most twice (once through the first link
 that reaches it before the plain walk does, once directly); a second link
 onto an entered directory is refused. Files are extracted once - dedupe
 happens before `walk_project` returns.

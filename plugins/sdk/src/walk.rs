@@ -46,8 +46,10 @@
 //!   contributes nothing; the walk goes on.
 //! - A directory is entered through a link at most once, and never through a
 //!   link once it has been entered at all; a directory reached without a
-//!   link is always entered. A real directory is therefore walked at most
-//!   twice, and cycles end (walkdir's own ancestor check is the backstop).
+//!   link is always entered. Nested links can still walk one real directory
+//!   several times (each through a different entered directory), but every
+//!   link is entered once, so the walk ends (walkdir's own ancestor check is
+//!   the backstop) and files are deduplicated by real path.
 //! - Every file appears once, keyed by its real path. Its spelling is the one
 //!   with no followed link above it when the plain walk reaches it, and the
 //!   first in walk order otherwise - sibling names never decide the identity
@@ -107,8 +109,8 @@ pub struct WalkedProject {
     /// exclude skipped, and a file link with an unclaimed extension. Two
     /// kinds are reported before those rules could run, because the
     /// directory iterator fails on them first: a dangling link, and a link to
-    /// one of its own ancestors. Those are left out only when the link sits
-    /// under an excluded directory name.
+    /// one of its own ancestors. A link under an excluded directory name is
+    /// never reported: the walk does not enter excluded directories.
     pub links: Vec<WalkedLink>,
 }
 
@@ -447,13 +449,7 @@ impl LinkGuard {
             _ => None,
         };
         let Some((at, verdict)) = verdict_at else { return };
-        let relative = at.strip_prefix(&self.root).unwrap_or(&at);
-        let under_excluded = relative
-            .components()
-            .any(|part| self.excluded.iter().any(|name| part.as_os_str() == name.as_str()));
-        if !under_excluded {
-            self.lock().judged.push(Judged { at, verdict });
-        }
+        self.lock().judged.push(Judged { at, verdict });
     }
 
     /// The winner pass: one spelling per real file, then every judged link's
@@ -901,10 +897,9 @@ mod tests {
 
     /// B7: dangling directory-shaped and file links are
     /// skipped, the walk continues past them, and both are reported - but
-    /// not one under an excluded directory name.
+    /// not one under an excluded directory name, which is never entered.
     ///
-    /// Controls: make `LinkGuard::note_error` a no-op -> `links` is empty;
-    /// drop its `under_excluded` check -> `vendor/gone` is reported.
+    /// Control: make `LinkGuard::note_error` a no-op -> `links` is empty.
     #[cfg(unix)]
     #[test]
     fn a_dangling_link_is_skipped() {
