@@ -626,6 +626,31 @@ mod tests {
         second_stalling: bool,
         adjust: impl FnOnce(&std::path::Path, &std::path::Path),
     ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf, IndexStore, PluginRegistry) {
+        two_language_registry_idling(
+            first,
+            first_capable,
+            first_stalling,
+            second,
+            second_capable,
+            second_stalling,
+            None,
+            adjust,
+        )
+    }
+
+    /// [`two_language_registry_adjusted`], with `idle_timeout` as every
+    /// plugin's idle timeout.
+    #[allow(clippy::too_many_arguments)]
+    fn two_language_registry_idling(
+        first: &str,
+        first_capable: bool,
+        first_stalling: bool,
+        second: &str,
+        second_capable: bool,
+        second_stalling: bool,
+        idle_timeout: Option<Duration>,
+        adjust: impl FnOnce(&std::path::Path, &std::path::Path),
+    ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf, IndexStore, PluginRegistry) {
         let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
 
@@ -659,7 +684,7 @@ mod tests {
             project.path(),
             state_dir,
             discovered,
-            None,
+            idle_timeout,
             None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
@@ -993,6 +1018,118 @@ mod tests {
             lines.iter().any(|line| line.starts_with("  semantic pass:   alpha pending - ")),
             "{lines:?}"
         );
+    }
+
+    /// The plugin idle timeout of the GM-484 tests below: short, so the tests
+    /// stay quick, and only ever used as a lower bound they wait past.
+    const SHORT_IDLE: Duration = Duration::from_millis(300);
+
+    /// Opens a gated plugin's `semanticPass` gate when dropped, so a failing
+    /// assertion still lets the run waiting on the pass return.
+    struct OpenSemanticPassGateOnDrop<'a>(&'a std::path::Path);
+
+    impl Drop for OpenSemanticPassGateOnDrop<'_> {
+        fn drop(&mut self) {
+            test_plugin::open_semantic_pass_gate(self.0);
+        }
+    }
+
+    /// GM-484, the bug itself: `beta` is told its pass is coming, then
+    /// `alpha`'s pass (sorted first) runs long - held open by a gate - while
+    /// the supervise tick's idle check runs on `beta` past its timeout. `beta`
+    /// must still be awake for its own pass, and that pass must land.
+    ///
+    /// The idle check is `beta`'s own `sleep_if_idle`, not the registry's
+    /// `sleep_if_idle_all`: the latter also visits `alpha`, whose
+    /// `sleep_if_idle` blocks on `alpha`'s lock until the gated pass ends, and
+    /// whether it reached `beta` before or after `beta`'s pass would be a race.
+    ///
+    /// Control: make `prepare_owed` return no holds (or remove the
+    /// `is_held_awake()` checks from `sleep_if_idle`). `beta` is idled out,
+    /// its pass answers `Ok(false)`, it is recorded with `NOT_RUN_REASON` and
+    /// `completed == [alpha]`.
+    #[test]
+    fn a_prepared_language_survives_a_preceding_languages_long_pass() {
+        // Not for the env var itself: another test here sets the project
+        // timeout to 150ms, which would cut alpha's gated pass short.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (_project, _plugins, alpha_dir, _beta_dir, conn, registry) = two_language_registry_idling(
+            "alpha",
+            true,
+            false,
+            "beta",
+            true,
+            false,
+            Some(SHORT_IDLE),
+            |alpha, beta| {
+                test_plugin::gate_semantic_pass(alpha);
+                test_plugin::declare_semantic_prepare(beta);
+            },
+        );
+
+        let (run, beta_slept_while_alpha_ran) = std::thread::scope(|scope| {
+            let idler = scope.spawn(|| {
+                let _open = OpenSemanticPassGateOnDrop(&alpha_dir);
+                // Alpha has been asked, so prepare_owed is done with beta.
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while !test_plugin::requests(&alpha_dir).iter().any(|line| line.starts_with("semanticPass")) {
+                    assert!(std::time::Instant::now() < deadline, "alpha's pass was never asked");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let beta = registry.get_or_spawn("beta").expect("beta was spawned to be told");
+                std::thread::sleep(SHORT_IDLE * 3);
+                beta.sleep_if_idle()
+            });
+            let run = run_with_registry(&registry, &conn);
+            (run, idler.join().expect("the idling thread panicked"))
+        });
+
+        assert!(!beta_slept_while_alpha_ran, "beta was idled out while alpha's pass ran");
+        assert_eq!(run.completed, vec!["alpha".to_string(), "beta".to_string()], "{:?}", run.failed);
+        let guard = conn.lock().unwrap();
+        assert!(semantic_pass_at(&guard, "beta").is_some(), "beta's pass landed");
+        assert!(schema::semantic_pass_failures(&guard).unwrap().is_empty());
+    }
+
+    /// GM-484: the hold on a prepared language is released once its own pass
+    /// is done, so the plugin idles out as usual afterwards. `alpha`, never
+    /// held, sleeping on the same ticks shows the wait was long enough.
+    ///
+    /// Control: leak the holds (`std::mem::forget` the map `prepare_owed`
+    /// returns). `beta` stays awake and the deadline assertion fails.
+    #[test]
+    fn a_prepared_languages_hold_is_released_after_its_pass() {
+        let (_project, _plugins, _alpha_dir, _beta_dir, conn, registry) = two_language_registry_idling(
+            "alpha",
+            true,
+            false,
+            "beta",
+            true,
+            false,
+            Some(SHORT_IDLE),
+            |_, beta| test_plugin::declare_semantic_prepare(beta),
+        );
+
+        let run = run_with_registry(&registry, &conn);
+        assert_eq!(run.completed, vec!["alpha".to_string(), "beta".to_string()], "{:?}", run.failed);
+
+        let alpha = registry.get_or_spawn("alpha").expect("alpha is still registered");
+        let beta = registry.get_or_spawn("beta").expect("beta is still registered");
+        let patience = Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            registry.sleep_if_idle_all();
+            if alpha.pid().is_none() && beta.pid().is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "still awake after {patience:?}: alpha {:?}, beta {:?}",
+                alpha.pid(),
+                beta.pid()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// A pass that ran but whose completion could not be written is recorded

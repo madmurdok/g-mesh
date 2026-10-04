@@ -126,6 +126,14 @@ const INCOMPLETE_MARKER: &str = "incomplete-once.marker";
 /// [`set_semantic_pass_answer`].
 const SEMANTIC_ANSWER: &str = "semantic-pass.json";
 
+/// Makes the plugin in this directory hold every `semanticPass` answer until
+/// [`SEMANTIC_PASS_GATE_OPEN`] exists - see [`gate_semantic_pass`].
+const SEMANTIC_PASS_GATED: &str = "semantic-pass.gated";
+
+/// Lets a [`SEMANTIC_PASS_GATED`] plugin answer its `semanticPass` requests -
+/// see [`open_semantic_pass_gate`].
+const SEMANTIC_PASS_GATE_OPEN: &str = "semantic-pass.allow";
+
 /// Writes a discoverable plugin directory named `language` under `root`,
 /// claiming `extensions`, and returns the directory it created.
 ///
@@ -233,6 +241,28 @@ pub(crate) fn install_gated(root: &Path, language: &str, extensions: &[&str]) ->
 pub(crate) fn open_handshake_gate(plugin_dir: &Path) {
     fs::write(plugin_dir.join(HANDSHAKE_GATE), "go\n")
         .expect("failed to open the fake plugin's handshake gate");
+}
+
+/// Makes the plugin in `plugin_dir` receive (and log) every later
+/// `semanticPass` request but hold its answer until [`open_semantic_pass_gate`]
+/// is called: a pass that is in flight for exactly as long as a test wants,
+/// with no wall-clock race - the same reasoning as [`install_gated`], one step
+/// later. Unlike [`install_stalling`], the answer does arrive once the gate
+/// opens. Read per request, so it takes effect without a respawn.
+///
+/// Every test that gates a pass **must** open the gate on every path,
+/// including a failing assertion: the thread waiting on the pass never
+/// returns otherwise.
+pub(crate) fn gate_semantic_pass(plugin_dir: &Path) {
+    fs::write(plugin_dir.join(SEMANTIC_PASS_GATED), "gated\n")
+        .expect("failed to gate the fake plugin's semantic pass");
+}
+
+/// Lets a plugin gated by [`gate_semantic_pass`] answer its `semanticPass`
+/// requests. Idempotent.
+pub(crate) fn open_semantic_pass_gate(plugin_dir: &Path) {
+    fs::write(plugin_dir.join(SEMANTIC_PASS_GATE_OPEN), "go\n")
+        .expect("failed to open the fake plugin's semantic pass gate");
 }
 
 /// [`install`], but the plugin completes its handshake normally and then
@@ -600,6 +630,25 @@ if (process.argv[2] === "--bulk-index") {{
   process.exit(0);
 }}
 
+// See test_plugin.rs's `gate_semantic_pass`: a gated plugin holds each
+// semanticPass answer until the test opens the gate; everything else is
+// answered at once.
+function afterSemanticPassGate(request, answer) {{
+  const gated =
+    request.method === "semanticPass" && fs.existsSync(path.join(__dirname, "{SEMANTIC_PASS_GATED}"));
+  if (!gated) {{
+    answer();
+    return;
+  }}
+  (function awaitGate() {{
+    if (fs.existsSync(path.join(__dirname, "{SEMANTIC_PASS_GATE_OPEN}"))) {{
+      answer();
+      return;
+    }}
+    setTimeout(awaitGate, 5);
+  }})();
+}}
+
 function writeFrame(message) {{
   const body = Buffer.from(JSON.stringify(message), "utf8");
   process.stdout.write("Content-Length: " + body.length + "\r\n\r\n");
@@ -661,7 +710,8 @@ process.stdin.on("data", (chunk) => {{
       if (shouldStall) {{
         fs.writeFileSync(markerPath, String(process.pid) + "\n");
         // Deliberately never answer this one request.
-      }} else if (incompleteOnce && request.method === "semanticPass" && !fs.existsSync(incompletePath)) {{
+      }} else afterSemanticPassGate(request, () => {{
+      if (incompleteOnce && request.method === "semanticPass" && !fs.existsSync(incompletePath)) {{
         fs.writeFileSync(incompletePath, String(process.pid) + "\n");
         const response = {{ jsonrpc: "2.0", id: request.id, result: {{}}, incomplete: true }};
         if (incompleteReason !== null) {{
@@ -674,6 +724,7 @@ process.stdin.on("data", (chunk) => {{
       }} else {{
         writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
       }}
+      }});
     }} else {{
       // A notification: no id, no response frame - see
       // test_plugin.rs's NOTIFICATION_LOG doc comment for why this is a
