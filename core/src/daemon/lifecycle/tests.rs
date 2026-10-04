@@ -737,3 +737,147 @@ fn a_reading_under_the_limit_costs_a_single_sample() {
 
     supervisor.sleep_now("test cleanup");
 }
+
+/// A supervisor over the plain fixture plugin with `idle_timeout` as its
+/// plugin idle timeout. Returns the temp dirs (dropped early, the pid-file
+/// writes fail) and the plugin directory, for its request log.
+fn supervisor_with_idle_timeout(
+    idle_timeout: Duration,
+) -> (Arc<PluginSupervisor>, tempfile::TempDir, tempfile::TempDir, PathBuf) {
+    let project = tempfile::tempdir().expect("failed to create a project root");
+    let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+    let plugin_dir = test_plugin::install(plugins.path(), "held", &[".held-src"]);
+    let manifest = read_manifest(&plugin_dir).expect("the fixture manifest must parse");
+    let supervisor = PluginSupervisor::start(
+        project.path(),
+        manifest,
+        plugins.path().join("plugin.pid"),
+        Some(idle_timeout),
+        None,
+        Arc::new(EmbeddingPipeline::disabled()),
+    )
+    .expect("the fixture plugin must start");
+    (supervisor, project, plugins, plugin_dir)
+}
+
+/// Waits (polling, generous deadline) until the supervisor has been idle for
+/// longer than `timeout`, so the next `sleep_if_idle` would sleep it but for
+/// a hold. Asserted rather than assumed: a slow machine only makes this wait
+/// longer, never shorter.
+fn wait_until_idle_past(supervisor: &PluginSupervisor, timeout: Duration) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while supervisor.idle_for() <= timeout {
+        assert!(Instant::now() < deadline, "the idle clock never passed {timeout:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// GM-484: a live `AwakeHold` keeps an idle-enough plugin awake - the
+/// supervise tick's `sleep_if_idle` declines - and releasing it lets the
+/// plugin sleep again once idle.
+///
+/// Control: remove the `is_held_awake()` checks from `sleep_if_idle`. The
+/// first `sleep_if_idle` returns `true` and the plugin is asleep.
+#[test]
+fn a_held_supervisor_is_not_idled_out() {
+    let timeout = Duration::from_millis(1);
+    let (supervisor, _project, _plugins, _plugin_dir) = supervisor_with_idle_timeout(timeout);
+    let pid = supervisor.pid().expect("a freshly started plugin is awake");
+
+    let hold = supervisor.hold_awake();
+    wait_until_idle_past(&supervisor, Duration::from_millis(50));
+    assert!(!supervisor.sleep_if_idle(), "a held plugin must not be idled out");
+    assert_eq!(supervisor.pid(), Some(pid), "and must still be the same running process");
+
+    // Positive control: the same supervisor does sleep once released, so the
+    // `false` above was the hold's doing, not a timer that never fired.
+    drop(hold);
+    wait_until_idle_past(&supervisor, Duration::from_millis(50));
+    assert!(supervisor.sleep_if_idle(), "a released, idle plugin sleeps");
+    assert_eq!(supervisor.pid(), None);
+}
+
+/// GM-484: releasing a hold restarts the idle clock, so a plugin held for
+/// longer than its timeout is not put to sleep the instant its pass is done -
+/// it gets a full timeout from the release.
+///
+/// Control: remove the `touch()` from `AwakeHold::drop`. The idle clock still
+/// counts from before the hold, so the first `sleep_if_idle` returns `true`.
+#[test]
+fn releasing_a_hold_restarts_the_idle_clock() {
+    // Far above the few instructions between the release and the first check,
+    // even on a machine at a load of 200.
+    let timeout = Duration::from_secs(2);
+    let (supervisor, _project, _plugins, _plugin_dir) = supervisor_with_idle_timeout(timeout);
+
+    let hold = supervisor.hold_awake();
+    wait_until_idle_past(&supervisor, timeout);
+    assert!(!supervisor.sleep_if_idle(), "held past its timeout, still awake");
+
+    let released = Instant::now();
+    drop(hold);
+    let slept_at_once = supervisor.sleep_if_idle();
+    let checked_after = released.elapsed();
+    assert!(
+        !slept_at_once,
+        "a plugin just released must get a full idle timeout from the release \
+         (checked {checked_after:?} after it, timeout {timeout:?})"
+    );
+    assert!(supervisor.pid().is_some());
+
+    // And the restarted clock does run out.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !supervisor.sleep_if_idle() {
+        assert!(Instant::now() < deadline, "a released plugin never slept");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(released.elapsed() >= timeout, "it slept before a full timeout had passed since the release");
+    assert_eq!(supervisor.pid(), None);
+}
+
+/// GM-484: a hold only defers the idle sleep. Core shutdown (`sleep_now`) and
+/// a memory suspension (`check_memory_limit`) still act on a held plugin.
+///
+/// Control: make `sleep_now` (or `check_memory_limit_sampled_by`) return early
+/// while `is_held_awake()`. The plugin stays awake and the `pid()` assertion
+/// for that arm fails.
+#[test]
+fn a_hold_does_not_stop_a_deliberate_sleep_or_a_memory_suspension() {
+    let (supervisor, _project, _plugins, _plugin_dir) =
+        supervisor_with_idle_timeout(Duration::from_secs(600));
+    let _hold = supervisor.hold_awake();
+    supervisor.sleep_now("test: shutdown while held");
+    assert_eq!(supervisor.pid(), None, "sleep_now ignores a hold");
+
+    let (supervisor, _project, _plugins) = supervisor_with_limit(Some(100));
+    let _hold = supervisor.hold_awake();
+    let (sampler, _calls) = scripted_sampler(vec![Some(500), Some(480)]);
+    supervisor.check_memory_limit_sampled_by(sampler);
+    assert_eq!(supervisor.pid(), None, "a confirmed overage sleeps a held plugin");
+    assert!(supervisor.is_semantic_suspended(), "and suspends its language");
+}
+
+/// GM-484, the design note's item 6: a memory suspension still wins over a
+/// hold. An awake, held, suspended plugin is not asked for its pass.
+///
+/// The suspension flag is set directly rather than through
+/// `check_memory_limit`, because that also puts the plugin to sleep, and a
+/// sleeping plugin answers `Ok(false)` for a reason this test is not about.
+///
+/// Control: make `semantic_pass` skip its `is_semantic_suspended()` check
+/// while `is_held_awake()`. It sends the request and returns `Ok(true)`.
+#[test]
+fn a_memory_suspension_still_wins_over_a_hold() {
+    let (supervisor, _project, _plugins, plugin_dir) = supervisor_with_idle_timeout(Duration::from_secs(600));
+    supervisor.semantic_suspended.store(true, Ordering::SeqCst);
+    let _hold = supervisor.hold_awake();
+    let conn = test_plugin::empty_index();
+
+    let ran = supervisor.semantic_pass(&conn, Vec::new(), 1).expect("a suspended pass is not an error");
+    assert!(!ran, "a suspended language's pass is not run, held or not");
+    assert!(supervisor.pid().is_some(), "the plugin is still awake, so only the suspension declined it");
+    let requests = test_plugin::requests(&plugin_dir);
+    assert!(!requests.iter().any(|line| line.starts_with("semanticPass")), "{requests:?}");
+
+    supervisor.sleep_now("test cleanup");
+}

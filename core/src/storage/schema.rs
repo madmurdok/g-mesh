@@ -72,7 +72,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// "11" adds the `untyped_calls` table (GM-486). Without the bump an existing
 /// index would keep an empty table until each file was reparsed, and caller
 /// pages would silently lack the marker it feeds.
-pub const CURRENT_SCHEMA_VERSION: &str = "11";
+///
+/// "12" adds `edges.linkedFrom` and its partial index (GM-491): the
+/// placeholder a usage edge was linked from, so a woken placeholder can
+/// re-decide - move or unlink - an edge it already linked. An existing index
+/// has no record of where its linked edges came from, so it is rebuilt.
+pub const CURRENT_SCHEMA_VERSION: &str = "12";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -288,11 +293,22 @@ CREATE TABLE IF NOT EXISTS edges (
     source        TEXT NOT NULL CHECK (source IN ('syntactic', 'semantic')),
     engine        TEXT NOT NULL,
     resolved      INTEGER NOT NULL DEFAULT 0,
-    toDeclaration INTEGER
+    toDeclaration INTEGER,
+    linkedFrom    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_edges_fromId ON edges(fromId);
 CREATE INDEX IF NOT EXISTS idx_edges_toId ON edges(toId);
+-- `linkedFrom` (GM-491): the pending-symbol placeholder `graph::symbol_links`
+-- moved this usage edge off, NULL for an edge it never linked (and reset to
+-- NULL whenever a plugin re-sends the edge, which then says what the plugin
+-- says now). Without it a repoint overwrites the only link back, and a
+-- placeholder woken by a new provider could not reopen the edge it already
+-- linked. No foreign key: a placeholder and its usage edges belong to one
+-- importer file and leave together, and a stale value is never looked up -
+-- no pending set can name a deleted placeholder. Partial, because most edges
+-- were never linked.
+CREATE INDEX IF NOT EXISTS idx_edges_linkedFrom ON edges(linkedFrom) WHERE linkedFrom IS NOT NULL;
 
 -- One row per logical container actually present in the index - a Go
 -- package, a Rust module, ... (design doc: Data Model > Logical containers).

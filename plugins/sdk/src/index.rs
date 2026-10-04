@@ -44,9 +44,16 @@ pub struct FileEntry {
     /// the structural pass read (`textDocument/didOpen`), and reading the
     /// file again could pick up an edit that has not been extracted yet.
     pub source: String,
-    /// The last extraction - the diff baseline, and the node set positions
-    /// are resolved against.
+    /// The last extraction - the node set positions are resolved against,
+    /// and, once [`reported`](Self::reported), the diff baseline.
     pub graph: FileGraph,
+    /// Whether core has been told about this extraction. An entry a
+    /// `fileChanged` produced is; one a semantic pass hydrated from disk is
+    /// not (GM-487): core's rows for that file are whatever an earlier process
+    /// sent, so diffing the next `fileChanged` against this graph could answer
+    /// "nothing changed" while core keeps a stale file. An unreported entry is
+    /// therefore no baseline at all - see [`SdkIndex::baseline`].
+    pub reported: bool,
 }
 
 /// The plugin's own view of the project: every file it has extracted.
@@ -61,9 +68,18 @@ impl SdkIndex {
         Self::default()
     }
 
-    /// Records an extraction, replacing whatever was there.
+    /// Records an extraction core has been told about, replacing whatever
+    /// was there.
     pub fn insert(&mut self, path: RelPath, source: String, graph: FileGraph) {
-        self.files.insert(path, FileEntry { source, graph });
+        self.files.insert(path, FileEntry { source, graph, reported: true });
+    }
+
+    /// Records an extraction core has *not* been told about - a file a
+    /// semantic pass read from disk so its answers have somewhere to land.
+    /// It serves positions and open sites like any entry, and is no diff
+    /// baseline until a `fileChanged` reports it.
+    pub fn insert_unreported(&mut self, path: RelPath, source: String, graph: FileGraph) {
+        self.files.insert(path, FileEntry { source, graph, reported: false });
     }
 
     /// Forgets a file - it was deleted, or its extraction panicked and the
@@ -84,9 +100,16 @@ impl SdkIndex {
         self.files.get(path)
     }
 
-    /// The last extraction of `path` - the diff baseline.
+    /// The last extraction of `path`, reported or not.
     pub fn graph(&self, path: &RelPath) -> Option<&FileGraph> {
         self.files.get(path).map(|entry| &entry.graph)
+    }
+
+    /// What core was last told about `path` - the diff baseline. `None` for a
+    /// file never extracted *and* for one only hydrated: a diff against
+    /// nothing is complete, so core replaces whatever it holds for the file.
+    pub fn baseline(&self, path: &RelPath) -> Option<&FileGraph> {
+        self.files.get(path).filter(|entry| entry.reported).map(|entry| &entry.graph)
     }
 
     /// The text `path`'s graph was extracted from.

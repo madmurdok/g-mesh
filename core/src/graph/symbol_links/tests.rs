@@ -2768,12 +2768,11 @@ fn gm490_a_typescript_named_reexport_that_leads_nowhere_still_shadows_the_glob()
 /// depth, both reach an `f`, and the call stays unresolved - in a whole pass
 /// and in incremental passes whichever way round the files arrive. Without
 /// the explicit import the star import alone links `pkg.b.f`, so the walk
-/// does reach the star import's item. Incrementally, `pkg.b.f` is also an
-/// allowed end state (linked before `pkg.a` exists); `pkg.a.f` never is.
-/// Not covered: an order where `pkg.a` and the call are in while `pkg.b` is
-/// not (`__init__`, `a`, `user`, then `b`) links `pkg.a.f`, the only `f` in
-/// the index, and `link_diff` never moves it when `pkg.b` arrives - an answer
-/// that worsens, outside `link_diff`'s contract and independent of the rule.
+/// does reach the star import's item. Incrementally the call ends unresolved
+/// too, whichever way round the files arrive: an order that links the only
+/// `f` in the index before the other arrives (`__init__`, `a`, `user`, then
+/// `b`, and its mirror) unlinks it again when the second `f` wakes the
+/// placeholder (GM-491).
 ///
 /// Control: make `Resolver::hops` tag every row `named_shadows_glob: true`
 /// (or add `"python"` to `bundled_rules`) - the call links `pkg.a.f`.
@@ -2787,25 +2786,16 @@ fn gm490_a_python_explicit_import_never_shadows_a_later_star_import() {
     assert!(!resolved, "linked {target}");
     assert_ne!(target, GM490_PY_A);
 
-    for order in [[0, 1, 2, 3], [0, 1, 3, 2], [3, 2, 1, 0]] {
+    // `diffs` is `[a, b, __init__, user]`; `[2, 0, 3, 1]` is the GM-491
+    // order and `[2, 1, 3, 0]` its mirror.
+    for order in [[0, 1, 2, 3], [0, 1, 3, 2], [3, 2, 1, 0], [2, 0, 3, 1], [2, 1, 3, 0]] {
         let mut incremental = setup();
         for index in order {
             apply_diff(&mut incremental, &diffs[index]).unwrap();
             link_diff(&mut incremental, &diffs[index]).unwrap();
-            let onto_a: i64 = incremental
-                .query_row(
-                    "SELECT COUNT(*) FROM edges WHERE id = ?1 AND toId = ?2",
-                    params![edge, GM490_PY_A],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(onto_a, 0, "file order {order:?}, after file {index}");
         }
-        // `pkg.b` arriving before `pkg.a` links the star import's item, and a
-        // later file never moves an edge that is already linked (the
-        // module doc's `link_diff`): Python's own answer, so also allowed.
         let (target, resolved) = edge_target(&incremental, &edge);
-        assert!(!resolved || target == GM490_PY_B, "file order {order:?} linked {target}");
+        assert!(!resolved, "file order {order:?} linked {target}");
     }
 
     let (diffs, edge) = gm490_python_diffs(false);
@@ -2886,4 +2876,320 @@ fn gm490_an_index_store_links_under_its_own_rules() {
         watched.unit(Unit::WatcherApply, |writer| writer.apply_diff_linked(diff, "test")).unwrap();
     }
     assert_eq!(watched.with(|conn| edge_target(conn, &edge)), (GM490_Y_NEW.to_string(), true));
+}
+
+// --- GM-491: link_diff reopens a link a new provider changes ----------------
+//
+// docs/architecture/gm-491-link-diff-star-provider.md. A linked edge keeps the
+// placeholder it came from in `edges.linkedFrom`, so a woken placeholder is
+// decided again and its edge ends where `link_all` would leave it.
+
+/// Every edge row, every column the linker writes, in id order.
+type FullEdge = (String, String, String, String, String, bool, Option<String>);
+
+fn gm491_edges(conn: &Connection) -> Vec<FullEdge> {
+    conn.prepare("SELECT id, fromId, toId, kind, source, resolved, linkedFrom FROM edges ORDER BY id")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn gm491_linked_from(conn: &Connection, edge_id: &str) -> Option<String> {
+    conn.query_row("SELECT linkedFrom FROM edges WHERE id = ?1", params![edge_id], |row| row.get(0)).unwrap()
+}
+
+/// `link_all` on a fresh store holding `diffs`: the reference end state.
+fn gm491_reference<'a>(diffs: impl IntoIterator<Item = &'a Diff>) -> Vec<FullEdge> {
+    let mut conn = setup();
+    for diff in diffs {
+        apply_diff(&mut conn, diff).unwrap();
+    }
+    link_all(&mut conn).unwrap();
+    gm491_edges(&conn)
+}
+
+fn gm491_apply_and_link_diff(conn: &mut Connection, diff: &Diff) -> LinkSummary {
+    apply_diff(conn, diff).unwrap();
+    link_diff(conn, diff).unwrap()
+}
+
+/// The acceptance criterion: for all 24 arrival orders of the four Python
+/// files (`__init__`, `a`, `user`, `b`), `link_diff` after each file leaves
+/// exactly the edges `link_all` leaves on a fresh store holding the same
+/// files - after every step, not only at the end, and every column.
+///
+/// Control: restore `if edge_kinds.is_empty() { continue; }` semantics for a
+/// linked placeholder in `link` (collect the kinds with `toId = ?1` only, as
+/// before GM-491) - the 12 orders where one `f` is linked before the other
+/// arrives fail (6 end on `pkg.a.f`, 6 on `pkg.b.f`).
+#[test]
+fn gm491_link_diff_agrees_with_link_all_in_every_arrival_order() {
+    let (diffs, _) = gm490_python_diffs(true);
+    let mut orders: Vec<[usize; 4]> = Vec::new();
+    for a in 0..4 {
+        for b in (0..4).filter(|&b| b != a) {
+            for c in (0..4).filter(|&c| c != a && c != b) {
+                orders.push([a, b, c, 6 - a - b - c]);
+            }
+        }
+    }
+    assert_eq!(orders.len(), 24);
+
+    let mut disagreements = Vec::new();
+    for order in orders {
+        let mut incremental = setup();
+        for step in 0..order.len() {
+            gm491_apply_and_link_diff(&mut incremental, &diffs[order[step]]);
+            let reference = gm491_reference(order[..=step].iter().map(|&index| &diffs[index]));
+            let got = gm491_edges(&incremental);
+            if got != reference {
+                disagreements.push(format!("order {order:?} after step {step}: {got:?} != {reference:?}"));
+            }
+        }
+    }
+    assert!(disagreements.is_empty(), "{} disagreements:\n{}", disagreements.len(), disagreements.join("\n"));
+}
+
+/// The reported order (`__init__`, `a`, `user`, `b`): the call links the only
+/// `f` there is when `user` arrives, with its placeholder recorded; when `b`
+/// arrives the two `f`s tie and the edge goes back onto its placeholder,
+/// unresolved, with the provenance cleared.
+///
+/// Control: as for the test above - the edge stays on `pkg.a.f`.
+#[test]
+fn gm491_a_late_star_import_provider_unlinks_the_named_answer() {
+    let (diffs, edge) = gm490_python_diffs(true);
+    let placeholder = diffs[3].upsert_nodes[1].id.clone();
+    assert!(placeholder.starts_with("pending"), "{placeholder}");
+    let [a, b, init, user] = [&diffs[0], &diffs[1], &diffs[2], &diffs[3]];
+
+    let mut conn = setup();
+    gm491_apply_and_link_diff(&mut conn, init);
+    gm491_apply_and_link_diff(&mut conn, a);
+    assert_eq!(gm491_apply_and_link_diff(&mut conn, user), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge), (GM490_PY_A.to_string(), true));
+    assert_eq!(gm491_linked_from(&conn, &edge), Some(placeholder.clone()));
+
+    assert_eq!(gm491_apply_and_link_diff(&mut conn, b), LinkSummary::default());
+    assert_eq!(edge_target(&conn, &edge), (placeholder, false));
+    assert_eq!(gm491_linked_from(&conn, &edge), None);
+}
+
+/// `caller.ts` calls `index.ts`'s `mutate`; `a.ts` and `b.ts` both declare
+/// it; `index.ts` has only `export * from "./b"`. Unlinked; returns the diff
+/// and the call's edge id.
+fn gm491_ts_glob_only() -> (Diff, String) {
+    let placeholder = placeholder_node("caller.ts", "index.ts", "mutate");
+    let edge = usage_edge("Function:caller.ts:run", "CALLS", &placeholder);
+    let id = edge.id.clone();
+    (
+        Diff {
+            upsert_nodes: vec![
+                symbol("caller.ts", "run", "Function", true),
+                symbol("a.ts", "mutate", "Function", true),
+                symbol("b.ts", "mutate", "Function", true),
+                reexport_all("index.ts", "b.ts"),
+                placeholder,
+            ],
+            upsert_edges: vec![edge],
+            ..Default::default()
+        },
+        id,
+    )
+}
+
+/// A move from one single answer to another: the call is linked to `b.ts`'s
+/// `mutate` through `export *`, then `export { mutate } from "./a"` arrives
+/// in the barrel, and under TypeScript's `named_shadows_glob` the call moves
+/// to `a.ts`'s `mutate` - counted as a link - as `link_all` gives.
+///
+/// Control: as for `gm491_link_diff_agrees_with_link_all_in_every_arrival_order`
+/// - the call stays on `b.ts`.
+#[test]
+fn gm491_a_late_named_reexport_moves_a_typescript_link() {
+    let (glob_only, edge) = gm491_ts_glob_only();
+    let named = Diff {
+        upsert_nodes: vec![reexport_node("index.ts", "mutate", "a.ts", "mutate")],
+        ..Default::default()
+    };
+
+    let mut conn = setup();
+    assert_eq!(gm491_apply_and_link_diff(&mut conn, &glob_only), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge), ("Function:b.ts:mutate".to_string(), true));
+
+    assert_eq!(gm491_apply_and_link_diff(&mut conn, &named), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge), ("Function:a.ts:mutate".to_string(), true));
+    assert_eq!(gm491_edges(&conn), gm491_reference([&glob_only, &named]));
+}
+
+/// No answer unlinks too: the Rust call is linked through `user`'s glob to
+/// `x::Error::new`, then `use std::io::Error;` arrives in `user`. The named
+/// row shadows the glob and leads to an external crate, so nothing is found
+/// and the edge goes back onto its placeholder, as `link_all` leaves it.
+///
+/// Control: in `link`, `continue` when `candidates.is_empty()` (before the
+/// per-kind loop) - the edge stays on `x::Error::new`.
+#[test]
+fn gm491_a_late_external_named_use_unlinks_a_rust_glob_answer() {
+    let mut user = gm479_user_diff(false);
+    user.upsert_nodes.push(gm479_user_glob_of_x());
+    let (tests, edge) = gm479_error_caller(gm479_tests(), "user::tests::loads");
+    let diffs =
+        [gm479_error_diff("src/x.rs", "krate::x"), gm479_error_diff("src/y.rs", "krate::y"), user, tests];
+    let named = Diff {
+        upsert_nodes: vec![gm479_private(gm479_user(), "Error", "std::io", "Error")],
+        ..Default::default()
+    };
+
+    let mut conn = setup();
+    for diff in &diffs {
+        gm491_apply_and_link_diff(&mut conn, diff);
+    }
+    assert_eq!(edge_target(&conn, &edge), ("Function:src/x.rs:x::Error::new".to_string(), true));
+
+    gm491_apply_and_link_diff(&mut conn, &named);
+    let (target, resolved) = edge_target(&conn, &edge);
+    assert!(!resolved, "linked {target}");
+    assert_eq!(gm491_linked_from(&conn, &edge), None);
+    assert_eq!(gm491_edges(&conn), gm491_reference(diffs.iter().chain([&named])));
+}
+
+/// An edge the importer re-sends already resolved (a semantic upgrade) is the
+/// plugin's answer, not the linker's: its provenance is cleared, and a later
+/// tie at the placeholder it was once linked from leaves it alone.
+///
+/// Control: remove `linkedFrom = NULL` from `apply_diff`'s edge upsert
+/// `ON CONFLICT` - the tie moves the semantic edge back onto the placeholder.
+#[test]
+fn gm491_a_resent_resolved_edge_is_not_reopened() {
+    let mut conn = setup();
+    let (diff, edge) = gm491_ts_glob_only();
+    gm491_apply_and_link_diff(&mut conn, &diff);
+    assert_eq!(edge_target(&conn, &edge), ("Function:b.ts:mutate".to_string(), true));
+    assert!(gm491_linked_from(&conn, &edge).is_some());
+
+    let upgrade = Diff {
+        upsert_edges: vec![EdgeRecord::new(
+            edge.clone(),
+            "Function:caller.ts:run",
+            "Function:b.ts:mutate",
+            "CALLS",
+            "semantic",
+            true,
+        )],
+        ..Default::default()
+    };
+    gm491_apply_and_link_diff(&mut conn, &upgrade);
+    assert_eq!(gm491_linked_from(&conn, &edge), None);
+
+    // A second `export *` offering `mutate`: two globs at one depth tie.
+    let tie = Diff {
+        upsert_nodes: vec![reexport_all("index.ts", "c.ts"), symbol("c.ts", "mutate", "Function", true)],
+        ..Default::default()
+    };
+    gm491_apply_and_link_diff(&mut conn, &tie);
+    assert_eq!(edge_target(&conn, &edge), ("Function:b.ts:mutate".to_string(), true));
+    assert_eq!(edge_source(&conn, &edge), "semantic");
+    assert_eq!(gm491_linked_from(&conn, &edge), None);
+}
+
+/// A woken placeholder whose answer has not changed writes nothing: `b.ts`
+/// is re-sent unchanged, which wakes the linked call's placeholder through
+/// the barrel's `export *`, and `link_diff` counts nothing and updates no
+/// edge row. (`linking_twice_changes_nothing_the_second_time` is the
+/// `link_all` half.)
+///
+/// Control: drop `AND toId != ?1` from `link`'s repoint - the second pass
+/// counts the edge again and rewrites its row.
+#[test]
+fn gm491_an_unchanged_answer_writes_nothing() {
+    let mut conn = setup();
+    let (diff, edge) = gm491_ts_glob_only();
+    gm491_apply_and_link_diff(&mut conn, &diff);
+    assert_eq!(edge_target(&conn, &edge), ("Function:b.ts:mutate".to_string(), true));
+
+    let resent =
+        Diff { upsert_nodes: vec![symbol("b.ts", "mutate", "Function", true)], ..Default::default() };
+    apply_diff(&mut conn, &resent).unwrap();
+    conn.execute_batch(
+        "CREATE TEMP TABLE edge_updates (id TEXT);
+         CREATE TEMP TRIGGER count_edge_updates AFTER UPDATE ON main.edges
+         BEGIN INSERT INTO edge_updates (id) VALUES (NEW.id); END;",
+    )
+    .unwrap();
+    assert_eq!(link_diff(&mut conn, &resent).unwrap(), LinkSummary::default());
+    assert_eq!(count(&conn, "edge_updates"), 0);
+    assert_eq!(edge_target(&conn, &edge), ("Function:b.ts:mutate".to_string(), true));
+}
+
+/// A language swap carries an edge's provenance into live, even when it is
+/// the only column that differs, and the carried provenance lets a later
+/// tie reopen the edge. Live holds the call already resolved to `b.ts`'s
+/// `mutate` with no provenance; staging links the same call itself.
+///
+/// Control: remove `linkedFrom` from `language_swap::EDGE_COLUMNS` - the plan
+/// sees no change, live keeps `linkedFrom` NULL, and the tie leaves the edge
+/// on `b.ts`.
+#[test]
+fn gm491_a_language_swap_keeps_the_provenance() {
+    use std::collections::HashSet;
+
+    use crate::storage::connection::open_staging;
+    use crate::storage::language_swap::{plan, swap, SwapBookkeeping};
+
+    let dir = tempfile::tempdir().unwrap();
+    let live_path = dir.path().join("index.db");
+    let staging_path = dir.path().join("staging-typescript.db");
+    let (diff, edge) = gm491_ts_glob_only();
+    let placeholder = diff.upsert_edges[0].to_id.clone();
+
+    let mut live = open_staging(&live_path).unwrap();
+    live.execute(
+        "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, 'x', 'x', 'x')",
+        [],
+    )
+    .unwrap();
+    apply_diff(&mut live, &diff).unwrap();
+    let resolved = Diff {
+        upsert_edges: vec![EdgeRecord::new(
+            edge.clone(),
+            "Function:caller.ts:run",
+            "Function:b.ts:mutate",
+            "CALLS",
+            "tree-sitter",
+            true,
+        )],
+        ..Default::default()
+    };
+    apply_diff(&mut live, &resolved).unwrap();
+    assert_eq!(gm491_linked_from(&live, &edge), None);
+
+    let mut staging = open_staging(&staging_path).unwrap();
+    apply_diff(&mut staging, &diff).unwrap();
+    link_all(&mut staging).unwrap();
+    assert_eq!(gm491_linked_from(&staging, &edge), Some(placeholder.clone()));
+    let planned = plan(&mut staging, live_path.to_str().unwrap(), "typescript", "model", true).unwrap();
+    assert_eq!(planned.counts.upsert_edges, 1, "{:?}", planned.counts);
+    drop(staging);
+    let capable = HashSet::new();
+    let bookkeeping = SwapBookkeeping {
+        language: "typescript",
+        plugin_fingerprint: "fp",
+        semantic_pass_languages: &capable,
+    };
+    swap(&mut live, &staging_path, None, &bookkeeping).unwrap();
+
+    assert_eq!(edge_target(&live, &edge), ("Function:b.ts:mutate".to_string(), true));
+    assert_eq!(gm491_linked_from(&live, &edge), Some(placeholder.clone()));
+
+    let tie = Diff {
+        upsert_nodes: vec![reexport_all("index.ts", "c.ts"), symbol("c.ts", "mutate", "Function", true)],
+        ..Default::default()
+    };
+    gm491_apply_and_link_diff(&mut live, &tie);
+    assert_eq!(edge_target(&live, &edge), (placeholder, false));
 }

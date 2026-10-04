@@ -55,7 +55,7 @@ const DECLARATION_COLUMNS: &str = "nodeId, ordinal, startLine, startCol, endLine
 const TARGET_COLUMNS: &str = "nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile, keyPath";
 const SUFFIX_COLUMNS: &str = "suffix, nodeId";
 const UNTYPED_COLUMNS: &str = "name, nodeId";
-const EDGE_COLUMNS: &str = "id, fromId, toId, kind, source, engine, resolved, toDeclaration";
+const EDGE_COLUMNS: &str = "id, fromId, toId, kind, source, engine, resolved, toDeclaration, linkedFrom";
 const CONTAINER_COLUMNS: &str = "nodeId, language, key, parentKey, memberCount";
 
 /// The plan tables, created in the staging file. `plan_text_changed` holds
@@ -503,7 +503,8 @@ fn swap_attached(
              SELECT {EDGE_COLUMNS} FROM staging.edges WHERE id IN (SELECT id FROM staging.plan_upsert_edges)
              ON CONFLICT(id) DO UPDATE SET fromId = excluded.fromId, toId = excluded.toId,
                 kind = excluded.kind, source = excluded.source, engine = excluded.engine,
-                resolved = excluded.resolved, toDeclaration = excluded.toDeclaration"
+                resolved = excluded.resolved, toDeclaration = excluded.toDeclaration,
+                linkedFrom = excluded.linkedFrom"
         ),
         "the edge upserts",
     )?;

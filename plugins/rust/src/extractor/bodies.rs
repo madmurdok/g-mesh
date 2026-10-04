@@ -41,10 +41,12 @@
 //!    this file spells out the receiver's type `T` ([`super::typing`]), the
 //!    call also gets the edge `T::m(x)` would, and the open site carries that
 //!    edge's id in `replaces`: a semantic answer that lands elsewhere
-//!    retracts it, and one that lands on the same declaration retracts it
-//!    too, because the bridge's own edge onto a placeholder never shares the
-//!    structural edge's id - so the two tiers leave one edge per call, not
-//!    two.
+//!    retracts it, and one that lands on the same declaration keeps it and
+//!    adds no edge of its own - so the two tiers leave one edge per call, not
+//!    two. The bridge's edge onto a placeholder shares the structural edge's
+//!    id only when the structural edge is itself onto a placeholder of the
+//!    same address (a declaration in another file), so agreement is tested
+//!    on the target as well as on the id (`plugins/sdk/src/lsp/bridge.rs`).
 //!  - **`x.f`** - a field read through a receiver whose type this tier does
 //!    not know (anything but `self` inside an `impl`).
 //!  - **A call whose path does not resolve**: a bare name that is neither
@@ -70,7 +72,9 @@ use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PlaceholderTarget, QualifiedPa
 use g_mesh_plugin_sdk::{NodeSpec, OpenSite, OpenSiteKind, PlaceholderKind};
 use tree_sitter::Node;
 
-use crate::extractor::decls::{field_tail_path, impl_block, member_tail, trait_block, BlockCtx, Family};
+use crate::extractor::decls::{
+    field_tail, field_tail_path, impl_block, member_tail, trait_block, BlockCtx, Family,
+};
 use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::{
     qualified_in, qualified_path_in, resolve_module_path, visibility, ModuleCtx, PathTarget,
@@ -566,11 +570,23 @@ impl Bodies<'_, '_> {
             }
         }
         self.visit(value, module, block, from);
-        let replaces = match self.receiver_type(value).filter(|ty| ty.wrapper == Wrapper::Plain) {
+        #[cfg(test)]
+        crate::census::begin_receiver();
+        let typed = self.receiver_type(value, module, block).filter(|ty| ty.wrapper == Wrapper::Plain);
+        #[cfg(test)]
+        crate::census::end_receiver(typed.is_some());
+        let replaces = match typed {
             Some(ty) => {
                 let bound = self.member_of(&ty.container, &ty.name, name, module);
                 #[cfg(test)]
-                crate::census::typed_receiver(ty.origin, ty.unwrapped, matches!(bound, Bound::Here(_)));
+                crate::census::typed_receiver(crate::census::TypedSite {
+                    shape: receiver_shape(value),
+                    origin: ty.origin,
+                    unwrapped: ty.unwrapped,
+                    here: matches!(bound, Bound::Here(_)),
+                    from: from.to_string(),
+                    target: format!("{}\t{}::{name}", ty.container, ty.name),
+                });
                 self.edge(bound, EdgeKind::Calls, from, field)
             }
             None => None,
@@ -675,13 +691,17 @@ impl Bodies<'_, '_> {
             || matches!(self.model.lookup_import(container, name), Some(Import::Item { .. }))
     }
 
-    /// The type of a receiver expression: a typed local, through any number
-    /// of `&`/`&mut` and parentheses.
-    fn receiver_type(&self, value: Node) -> Option<LocalType> {
+    /// The type of a receiver expression, through any number of `&`/`&mut`
+    /// and parentheses: a typed local, a field of a typed value or of `self`
+    /// (`x.f`, `self.f`, `x.0`), or a call with a written return type
+    /// (`a.b()`, `T::new()`, `a.b()?`), the rule a `let` initializer uses.
+    fn receiver_type(&self, value: Node, module: &ModuleCtx, block: Option<&BlockCtx>) -> Option<LocalType> {
         match value.kind() {
             "identifier" => self.scopes.type_of(text(value, self.source)).cloned(),
-            "reference_expression" => self.receiver_type(value.child_by_field_name("value")?),
-            "parenthesized_expression" => self.receiver_type(value.named_child(0)?),
+            "reference_expression" => self.receiver_type(value.child_by_field_name("value")?, module, block),
+            "parenthesized_expression" => self.receiver_type(value.named_child(0)?, module, block),
+            "field_expression" => self.field_type(value, module, block),
+            "call_expression" | "try_expression" => self.value_type(value, module, block),
             _ => None,
         }
     }
@@ -731,7 +751,9 @@ impl Bodies<'_, '_> {
         block: Option<&BlockCtx>,
     ) -> Option<LocalType> {
         match value.kind() {
-            "identifier" | "reference_expression" | "parenthesized_expression" => self.receiver_type(value),
+            "identifier" | "reference_expression" | "parenthesized_expression" | "field_expression" => {
+                self.receiver_type(value, module, block)
+            }
             "struct_expression" => {
                 let (container, name) =
                     self.struct_address(value.child_by_field_name("name")?, module, block)?;
@@ -790,9 +812,12 @@ impl Bodies<'_, '_> {
                     let Bound::Here(id) = self.self_member(block?, name, module) else { return None };
                     return self.returned(&id, Origin::MethodReturn, 1);
                 }
-                let receiver = self.receiver_type(value).filter(|ty| ty.wrapper == Wrapper::Plain)?;
+                let receiver =
+                    self.receiver_type(value, module, block).filter(|ty| ty.wrapper == Wrapper::Plain)?;
                 let hops = receiver.hops + 1;
                 if hops > MAX_HOPS {
+                    #[cfg(test)]
+                    crate::census::hop_refused();
                     return None;
                 }
                 let Bound::Here(id) = self.member_of(&receiver.container, &receiver.name, name, module)
@@ -811,6 +836,43 @@ impl Bodies<'_, '_> {
         let returns = self.model.returns(id)?;
         let (container, name, wrapper) = self.resolve_written(&returns.ty, &returns.module, &|_| false)?;
         Some(LocalType { container, name, wrapper, hops, origin, unwrapped: false })
+    }
+
+    /// The type of the field `node` reads (`self.f`, `x.f`, `x.0`): the
+    /// written type of the field in this file's declaration of the owner's
+    /// struct. The owner is the impl's own type for `self`, else a typed
+    /// receiver; a field is one hop more than its owner.
+    fn field_type(&self, node: Node, module: &ModuleCtx, block: Option<&BlockCtx>) -> Option<LocalType> {
+        let value = node.child_by_field_name("value")?;
+        let field = node.child_by_field_name("field")?;
+        let (container, owner, hops) = if value.kind() == "self" {
+            // A trait's own `self` has no type, and an impl of anything but a
+            // plainly named type has no struct to look in.
+            let block = block.filter(|block| block.family != Family::TraitDecl)?;
+            let self_type = block.self_type.as_str();
+            if self_type.is_empty() || !self_type.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return None;
+            }
+            let (container, owner) = self.type_address(self_type, module);
+            (container, owner, 0)
+        } else {
+            let ty = self.receiver_type(value, module, block).filter(|ty| ty.wrapper == Wrapper::Plain)?;
+            (ty.container, ty.name, ty.hops)
+        };
+        let hops = hops + 1;
+        if hops > MAX_HOPS {
+            #[cfg(test)]
+            crate::census::hop_refused();
+            return None;
+        }
+        if !matches!(field.kind(), "field_identifier" | "integer_literal") {
+            return None;
+        }
+        let tail = field_tail(&owner, text(field, self.source));
+        let written = self.model.field_type(&container, &tail)?;
+        // The struct's own generics were refused where it was declared.
+        let (container, name, wrapper) = self.resolve_written(&written.ty, &written.module, &|_| false)?;
+        Some(LocalType { container, name, wrapper, hops, origin: Origin::Field, unwrapped: false })
     }
 
     /// `x.f` read as a value. `self.f` inside an `impl T` is the field `T.f`
@@ -1410,5 +1472,22 @@ impl Bodies<'_, '_> {
         crate::census::pop_ctx();
         let subtype = subtype.to_string();
         self.emit(bound, EdgeKind::SupertypeOf, &subtype, supertype, module, OpenSiteKind::Implementation);
+    }
+}
+
+/// What a typed receiver is, for the census: a local, a field, or a call,
+/// seen through `&` and parentheses.
+#[cfg(test)]
+fn receiver_shape(value: Node) -> crate::census::Shape {
+    match value.kind() {
+        "reference_expression" => {
+            value.child_by_field_name("value").map_or(crate::census::Shape::Local, receiver_shape)
+        }
+        "parenthesized_expression" => {
+            value.named_child(0).map_or(crate::census::Shape::Local, receiver_shape)
+        }
+        "field_expression" => crate::census::Shape::Field,
+        "call_expression" | "try_expression" => crate::census::Shape::Chain,
+        _ => crate::census::Shape::Local,
     }
 }

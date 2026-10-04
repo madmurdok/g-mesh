@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use g_mesh_wire::{
     EdgeKind, FileChangeDiff, NodeKind, PlaceholderTarget, Position, Range, SourceTier, TargetKey,
-    TargetScope, WireNode,
+    TargetScope, WireEdge, WireNode,
 };
 use serde_json::{json, Value};
 
@@ -349,7 +349,24 @@ const MAX_SERVER_STARTS: u32 = 4;
 ///   emit an edge for and guessed wrong about (`plugins/go/semantic.go`'s
 ///   `placeholderCall`, a `CALLS` that turns out to be a conversion), and the
 ///   rule is the Go engine's exactly - retract only when the semantic answer
-///   lands somewhere else, never when it confirms.
+///   lands somewhere else, never when it confirms. Three rules complete it
+///   (`docs/architecture/gm-489-structural-semantic-duplicate.md`, §3):
+///   - **R1, restore unless contradicted.** In a file the pass finished,
+///     every structural edge a site names is re-sent unchanged, `source`
+///     still syntactic, unless every answer about it contradicted it. An
+///     empty, ambiguous or unresolved answer is not a contradiction. A
+///     re-sent edge is never remembered as this bridge's own, so neither its
+///     stale-answer retraction nor core's semantic sweep can delete it.
+///   - **R2, agreement adds nothing.** An answer agrees when it lands on the
+///     structural edge's own target, or would get the structural edge's own
+///     id (a placeholder with the same address). It records no edge. The two
+///     ids differ whenever the structural edge points at a declaration of the
+///     same file, so recording one would leave two rows for one call each
+///     time an edit re-sends the structural edge.
+///   - **R3, coverage.** A semantic edge from the same node, of the same
+///     kind, onto the declaration a re-sent structural edge lands on - or
+///     with that edge's very id - is dropped, and an earlier pass's copy of
+///     it is retracted.
 /// - **It never guesses which edge a site belonged to.** An open site carries
 ///   `from_id` and `edge_kind`, and that pair does not name an edge: one
 ///   function calling two methods of the same name through different
@@ -400,7 +417,20 @@ pub struct LspBridge {
     /// keyed by their file - see [`trim_untyped_calls`]. Only what lets a later
     /// pass put a name back when its answers stop arriving.
     trimmed: BTreeMap<RelPath, BTreeSet<String>>,
+    /// Files a per-file pass asked about and did not finish, with the number
+    /// of passes that have tried them (GM-487). Core treats a per-file pass as
+    /// done whatever it reports, and re-sends one only when the file is edited
+    /// again, so a file whose pass met a cold server would otherwise keep its
+    /// sites unanswered until the next daemon start. Each later per-file pass
+    /// asks these too, until one finishes them or [`MAX_OWED_ATTEMPTS`] passes
+    /// have tried.
+    owed: BTreeMap<RelPath, u8>,
 }
+
+/// How many passes may try one file before it stops being re-asked - see
+/// [`LspBridge`]'s `owed`. Bounded so that a site no server ever answers does
+/// not ride along on every pass for the life of the process.
+const MAX_OWED_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct OpenDocument {
@@ -438,6 +468,41 @@ impl LspBridge {
             opened: BTreeMap::new(),
             emitted: BTreeMap::new(),
             trimmed: BTreeMap::new(),
+            owed: BTreeMap::new(),
+        }
+    }
+
+    /// Settles `owed` after a per-file pass: `finished` files and the ones
+    /// with nothing to ask (`settled`) are no longer owed, and every file in
+    /// `unfinished` counts one more attempt - restarting at one for a file
+    /// the pass was sent (`requested`), whose sites an edit may have changed.
+    /// A file that has used up [`MAX_OWED_ATTEMPTS`] is dropped, with a log
+    /// line.
+    fn settle_owed(
+        &mut self,
+        requested: &BTreeSet<RelPath>,
+        settled: &BTreeSet<RelPath>,
+        unfinished: &BTreeSet<RelPath>,
+    ) {
+        for file in settled {
+            self.owed.remove(file);
+        }
+        for file in unfinished {
+            let attempts = if requested.contains(file) {
+                1
+            } else {
+                self.owed.get(file).copied().unwrap_or(0).saturating_add(1)
+            };
+            if attempts >= MAX_OWED_ATTEMPTS {
+                self.owed.remove(file);
+                eprintln!(
+                    "[{}] {file}: {attempts} semantic pass(es) did not finish it - no longer re-asked until it \
+                     changes",
+                    self.language
+                );
+            } else {
+                self.owed.insert(file.clone(), attempts);
+            }
         }
     }
 
@@ -813,13 +878,63 @@ struct Answers {
     /// row a shared placeholder carries must not depend on which of its sites
     /// was answered first - see [`Placeholder`].
     placeholders: BTreeMap<Address, Placeholder>,
+    /// Every edge id this pass recorded, kept or not - what makes a second
+    /// site with the same edge a no-op.
     edges: HashSet<String>,
+    /// The recorded edges, in the order they were recorded. Held rather than
+    /// added to a builder on the spot, so that [`Answers::settle`] can drop
+    /// the ones a re-sent structural edge already covers (R3) before
+    /// they reach the diff or `by_file`.
+    recorded: Vec<Recorded>,
     by_file: BTreeMap<RelPath, Vec<String>>,
     retract: BTreeSet<String>,
+    /// Structural edges (`OpenSite::replaces`) an answer agreed with, and the
+    /// `(from, kind, declaration)` each agreeing answer landed on (R2).
+    /// An agreeing answer records nothing; this is what R3 uses to know
+    /// which declaration a structural edge onto a placeholder stands for.
+    confirmed: BTreeMap<String, Vec<(String, EdgeKind, String)>>,
+    /// Structural edges at least one answer contradicted - it landed on
+    /// another declaration.
+    contradicted: BTreeSet<String>,
+    /// Structural edges at least one answer did *not* contradict: it agreed,
+    /// or it was empty, ambiguous or outside the index. One such answer is
+    /// enough to keep the edge (R1).
+    upheld: BTreeSet<String>,
+    /// The structural edges this pass re-sends unchanged (R1), set by
+    /// [`Answers::settle`].
+    resend: Vec<WireEdge>,
     /// How many untyped receiver-call sites (`ReceiverCall`, no `replaces`)
     /// this pass got an answer for, by `(from_id, name)` - see
     /// [`untyped_call_answered`] and [`trim_untyped_calls`] (GM-486).
     untyped_answered: HashMap<(String, String), usize>,
+}
+
+/// One semantic edge this pass recorded, waiting for [`Answers::finish`].
+struct Recorded {
+    id: String,
+    /// The file the edge starts in, and so the builder it goes into.
+    in_file: RelPath,
+    from_id: String,
+    kind: EdgeKind,
+    /// The placeholder the edge lands on.
+    to_id: String,
+    /// The declaration the placeholder waits on - what R3 compares a re-sent
+    /// structural edge's target with.
+    declaration: String,
+}
+
+/// The placeholder id and the edge id an answer from `from_id` onto `target`
+/// gets in `in_file`. One formula for [`Answers::record`] and for the
+/// agreement test in [`record_answer`], so the two cannot drift apart.
+fn answer_ids(
+    in_file: &RelPath,
+    from_id: &str,
+    kind: EdgeKind,
+    target: &PlaceholderTarget,
+) -> (String, String) {
+    let placeholder = crate::graph::placeholder_id(in_file, PlaceholderKind::PendingSymbol, target);
+    let edge = crate::ids::edge_id(from_id, kind, &placeholder, None);
+    (placeholder, edge)
 }
 
 /// The node one address gets, and the use site whose `name` and `range` it
@@ -897,8 +1012,13 @@ impl Answers {
             builders: BTreeMap::new(),
             placeholders: BTreeMap::new(),
             edges: HashSet::new(),
+            recorded: Vec::new(),
             by_file: BTreeMap::new(),
             retract: BTreeSet::new(),
+            confirmed: BTreeMap::new(),
+            contradicted: BTreeSet::new(),
+            upheld: BTreeSet::new(),
+            resend: Vec::new(),
             untyped_answered: HashMap::new(),
         }
     }
@@ -923,7 +1043,11 @@ impl Answers {
     /// an address's sites the node ends up showing is [`Placeholder`]'s rule,
     /// not this call's. The node itself is added in [`Answers::finish`], once
     /// every site has had its say - so the id is derived here rather than
-    /// returned by the builder.
+    /// returned by the builder. The edge waits there too, so that
+    /// [`Answers::settle`] can still drop it (R3).
+    ///
+    /// `declaration` is the id of the node the answer landed on, which the
+    /// placeholder addresses.
     #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
@@ -934,6 +1058,7 @@ impl Answers {
         name: &str,
         at: Range,
         target: PlaceholderTarget,
+        declaration: &str,
     ) -> String {
         let key = address_key(in_file, &target);
         let placeholder = match self.placeholders.get_mut(&key) {
@@ -945,7 +1070,7 @@ impl Answers {
                 held.id.clone()
             }
             None => {
-                let id = crate::graph::placeholder_id(in_file, PlaceholderKind::PendingSymbol, &target);
+                let (id, _) = answer_ids(in_file, from_id, kind, &target);
                 self.placeholders
                     .insert(key, Placeholder { id: id.clone(), target, name: name.to_string(), range: at });
                 id
@@ -956,30 +1081,116 @@ impl Answers {
         if !self.edges.insert(id.clone()) {
             return id;
         }
-        let engine = self.engine.clone();
-        self.builder(in_file).add_edge(EdgeSpec {
+        self.recorded.push(Recorded {
+            id: id.clone(),
+            in_file: in_file.clone(),
             from_id: from_id.to_string(),
-            to_id: placeholder,
             kind,
-            // Every edge here lands on a placeholder, so nothing is confirmed
-            // until core links it: `resolved` describes what the edge points
-            // at, never who produced it.
-            resolved: false,
-            to_declaration: None,
-            source: SourceTier::Semantic,
-            engine,
+            to_id: placeholder,
+            declaration: declaration.to_string(),
         });
         self.by_file.entry(for_file.clone()).or_default().push(id.clone());
         id
     }
 
+    /// Settles what this pass says about the structural edges its sites named
+    /// in `replaces`, for the files it finished - see [`LspBridge`]'s doc on
+    /// retraction. Called once, after the last answer and before
+    /// `by_file` is read for retraction.
+    ///
+    /// - **R1, restore unless contradicted.** Every structural edge a site in
+    ///   a finished file names is re-sent unchanged, as the index holds it,
+    ///   unless every answer about it contradicted it. It never enters
+    ///   `by_file`, so neither `retract_stale` nor core's semantic sweep can
+    ///   reach it.
+    /// - **R3, coverage.** A recorded semantic edge whose id is a re-sent
+    ///   edge's, or that goes from the same node, of the same kind, onto the
+    ///   declaration a re-sent edge already lands on, is dropped: from the
+    ///   diff and from `by_file`, so an earlier pass's copy of it is
+    ///   retracted.
+    ///
+    /// A file the pass did not finish is not touched: its sites' answers may
+    /// be missing, and "no answer" is not "the structural edge stands" until
+    /// the question was actually put.
+    fn settle(&mut self, index: &SdkIndex, finished: &BTreeSet<RelPath>) {
+        let mut seen: HashSet<String> = HashSet::new();
+        for file in finished {
+            let Some(graph) = index.graph(file) else { continue };
+            for site in &graph.open_sites {
+                let Some(replaced) = &site.replaces else { continue };
+                if self.contradicted.contains(replaced) && !self.upheld.contains(replaced) {
+                    continue;
+                }
+                if !seen.insert(replaced.clone()) {
+                    continue;
+                }
+                if let Some(edge) = graph.edges.iter().find(|edge| &edge.id == replaced) {
+                    self.resend.push(edge.clone());
+                }
+            }
+        }
+        if self.resend.is_empty() {
+            return;
+        }
+
+        // What the re-sent edges cover: their own ids, and the declarations
+        // they land on - their own target, or whatever an agreeing answer
+        // said a placeholder target stands for.
+        let ids: HashSet<&str> = self.resend.iter().map(|edge| edge.id.as_str()).collect();
+        let mut lands: HashMap<(&str, &str), Vec<EdgeKind>> = HashMap::new();
+        for edge in &self.resend {
+            lands.entry((edge.from_id.as_str(), edge.to_id.as_str())).or_default().push(edge.kind);
+            for (from, kind, declaration) in self.confirmed.get(&edge.id).into_iter().flatten() {
+                lands.entry((from.as_str(), declaration.as_str())).or_default().push(*kind);
+            }
+        }
+        let covered = |edge: &Recorded| {
+            ids.contains(edge.id.as_str())
+                || lands
+                    .get(&(edge.from_id.as_str(), edge.declaration.as_str()))
+                    .is_some_and(|kinds| kinds.contains(&edge.kind))
+        };
+        let dropped: HashSet<String> =
+            self.recorded.iter().filter(|edge| covered(edge)).map(|edge| edge.id.clone()).collect();
+        if dropped.is_empty() {
+            return;
+        }
+        self.recorded.retain(|edge| !dropped.contains(&edge.id));
+        for ids in self.by_file.values_mut() {
+            ids.retain(|id| !dropped.contains(id));
+        }
+    }
+
     fn finish(mut self) -> (FileChangeDiff, BTreeMap<RelPath, Vec<String>>) {
         let mut diff = FileChangeDiff::default();
+        // The edges that survived `settle`, in the order they were recorded,
+        // and only the placeholders one of them still lands on.
+        let recorded = std::mem::take(&mut self.recorded);
+        let used: HashSet<&str> = recorded.iter().map(|edge| edge.to_id.as_str()).collect();
+        let kept: HashSet<String> = recorded.iter().map(|edge| edge.id.clone()).collect();
+        for edge in &recorded {
+            let engine = self.engine.clone();
+            self.builder(&edge.in_file).add_edge(EdgeSpec {
+                from_id: edge.from_id.clone(),
+                to_id: edge.to_id.clone(),
+                kind: edge.kind,
+                // Every edge here lands on a placeholder, so nothing is
+                // confirmed until core links it: `resolved` describes what the
+                // edge points at, never who produced it.
+                resolved: false,
+                to_declaration: None,
+                source: SourceTier::Semantic,
+                engine,
+            });
+        }
         // The nodes, now that every site addressing each one has been seen. In
         // address order, which is the file's own order and not the order the
         // server happened to answer in - the same reason the row itself is
         // chosen rather than taken (see `Placeholder`).
         for ((file, ..), held) in std::mem::take(&mut self.placeholders) {
+            if !used.contains(held.id.as_str()) {
+                continue;
+            }
             let id = self.builder(&file).add_placeholder(
                 PlaceholderKind::PendingSymbol,
                 held.name,
@@ -993,11 +1204,19 @@ impl Answers {
             diff.upsert_nodes.extend(graph.nodes);
             diff.upsert_edges.extend(graph.edges);
         }
+        // The structural edges R1 restores, exactly as the index holds them:
+        // `source` stays syntactic, so core's semantic sweep never reads them
+        // as this tier's.
+        let resent: HashSet<String> = self.resend.iter().map(|edge| edge.id.clone()).collect();
+        diff.upsert_edges.extend(std::mem::take(&mut self.resend));
         // An edge this pass re-emitted is not stale, whatever an earlier pass
         // recorded about it: retracting and upserting one id in one diff is a
         // delete followed by an insert of the same row, which is at best a
         // waste and at worst a foreign-key fault for anything pointing at it.
-        diff.delete_edge_ids = self.retract.into_iter().filter(|id| !self.edges.contains(id)).collect();
+        // The same holds for a structural edge one site contradicted and
+        // another upheld: it is re-sent, so it is not retracted.
+        diff.delete_edge_ids =
+            self.retract.into_iter().filter(|id| !kept.contains(id) && !resent.contains(id)).collect();
         (diff, self.by_file)
     }
 }
@@ -1390,10 +1609,37 @@ fn record_answer(
             if untyped_call_answered(index, roots, site, &found, agree && target.is_some()) {
                 *answers.untyped_answered.entry((site.from_id.clone(), site.name.clone())).or_default() += 1;
             }
-            if !agree {
+            let landed = if agree { target } else { None };
+            let Some((_, node)) = landed else {
+                // Empty, ambiguous, or nothing this index holds: no evidence
+                // against the structural edge, which therefore stands (R1).
+                if let Some(replaced) = &site.replaces {
+                    answers.upheld.insert(replaced.clone());
+                }
                 return Vec::new();
+            };
+            let address = address_of(node, site.from_container.clone());
+            if let Some(replaced) = &site.replaces {
+                // R2, agreement adds nothing: the answer lands on the
+                // structural edge's own target (`Bound::Here`), or would get
+                // the structural edge's own id (`Bound::There`, one address).
+                // Recording it anyway leaves two rows for one call once an
+                // edit re-sends the structural edge - see [`LspBridge`]'s doc.
+                let (_, prospective) = answer_ids(&question.file, &site.from_id, site.edge_kind, &address);
+                let lands_on_it = index
+                    .graph(&question.file)
+                    .and_then(|graph| graph.edges.iter().find(|edge| &edge.id == replaced))
+                    .is_some_and(|edge| edge.to_id == node.id);
+                if lands_on_it || &prospective == replaced {
+                    answers.upheld.insert(replaced.clone());
+                    answers.confirmed.entry(replaced.clone()).or_default().push((
+                        site.from_id.clone(),
+                        site.edge_kind,
+                        node.id.clone(),
+                    ));
+                    return Vec::new();
+                }
             }
-            let Some((_, node)) = target else { return Vec::new() };
             // The placeholder is named after the declaration it waits on, not
             // after the text at this site: `SearchMode::Count` and
             // `SearchMode::CountMatches` are two spellings of one address, and
@@ -1401,22 +1647,22 @@ fn record_answer(
             // name they have in common. The site still supplies the *range* -
             // as wide as what is written there - and which site that is comes
             // from `Placeholder`, not from which answer arrived first.
-            let edge = answers.record(
+            answers.record(
                 &question.file,
                 &question.file,
                 &site.from_id,
                 site.edge_kind,
                 &node.name,
                 site_range(site.position, &site.name),
-                address_of(node, site.from_container.clone()),
+                address,
+                &node.id,
             );
             // The contradiction rule: an answer that lands somewhere else
-            // retracts the structural edge the site said it replaces, and an
-            // answer that confirms it retracts nothing - see [`LspBridge`].
+            // retracts the structural edge the site said it replaces - see
+            // [`LspBridge`].
             if let Some(replaced) = &site.replaces {
-                if replaced != &edge {
-                    answers.retract.insert(replaced.clone());
-                }
+                answers.contradicted.insert(replaced.clone());
+                answers.retract.insert(replaced.clone());
             }
             Vec::new()
         }
@@ -1598,6 +1844,7 @@ fn record_implementor(
         &anchor_node.name,
         site_range(at, &anchor_node.name),
         address_of(&anchor_node, container),
+        &anchor_node.id,
     );
     true
 }
@@ -1628,10 +1875,19 @@ impl SemanticEngine for LspBridge {
 
     fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer> {
         let whole_project = files.is_empty();
+        // A file no longer in the index was deleted or failed to extract:
+        // there is nothing left to re-ask about it.
+        self.owed.retain(|file, _| index.entry(file).is_some());
+        let requested: BTreeSet<RelPath> = files.iter().cloned().collect();
         let scope: Vec<RelPath> = if whole_project {
             index.paths()
         } else {
-            files.iter().filter(|path| index.entry(path).is_some()).cloned().collect()
+            // What this pass was sent, plus what earlier per-file passes did
+            // not finish (GM-487).
+            let mut scope: BTreeSet<RelPath> =
+                files.iter().filter(|path| index.entry(path).is_some()).cloned().collect();
+            scope.extend(self.owed.keys().cloned());
+            scope.into_iter().collect()
         };
         if scope.is_empty() {
             return Ok(SemanticAnswer::complete(FileChangeDiff::default()));
@@ -1673,6 +1929,12 @@ impl SemanticEngine for LspBridge {
             // No question means no untyped receiver call in these files, so
             // this only forgets what an earlier pass trimmed in them.
             diff.upsert_nodes.extend(trim_untyped_calls(index, &covered, &HashMap::new(), &mut self.trimmed));
+            // Nothing left to ask is nothing owed.
+            if whole_project {
+                self.owed.clear();
+            } else {
+                self.settle_owed(&requested, &covered, &BTreeSet::new());
+            }
             return Ok(SemanticAnswer::complete(diff));
         }
 
@@ -1719,19 +1981,28 @@ impl SemanticEngine for LspBridge {
                 let reason = reason
                     .or_else(|| self.start_failure.clone())
                     .unwrap_or_else(|| "the language server is not running".to_string());
+                // Not one file was finished: every one asked about is owed.
+                if !whole_project {
+                    self.settle_owed(&requested, &BTreeSet::new(), &asked_about);
+                }
                 return Ok(SemanticAnswer::incomplete_because(FileChangeDiff::default(), reason));
             }
         };
 
+        // The files this pass asked about and finished. A file reached only by
+        // an implementation sweep's second hop is covered without its own
+        // sites having been asked, so it is not one of them.
+        let finished: BTreeSet<RelPath> = covered.intersection(&asked_about).cloned().collect();
+        // Restores structural edges and drops the semantic edges they cover,
+        // before `by_file` is read: a dropped edge an earlier pass emitted is
+        // then retracted below.
+        answers.settle(index, &finished);
         let produced = answers.by_file.clone();
         retract_stale(&mut answers, &self.emitted, &covered, &produced);
         let untyped_answered = std::mem::take(&mut answers.untyped_answered);
         let (mut diff, emitted) = answers.finish();
         // Callers whose untyped receiver calls were all answered (GM-486), in
-        // the files this pass asked about and finished. A file reached only
-        // by an implementation sweep's second hop is covered without its own
-        // sites having been asked, so it is not one of them.
-        let finished: BTreeSet<RelPath> = covered.intersection(&asked_about).cloned().collect();
+        // the files this pass finished.
         diff.upsert_nodes.extend(trim_untyped_calls(index, &finished, &untyped_answered, &mut self.trimmed));
         // A file this pass finished gets a fresh baseline: what it produced is
         // now the whole truth about that file's semantic edges. A file it did
@@ -1767,6 +2038,25 @@ impl SemanticEngine for LspBridge {
         let failure = failure.or_else(|| {
             plan.truncated.then(|| "the open-site ceiling (max_sites) left sites unasked".to_string())
         });
+        if whole_project {
+            // A complete whole-project pass answered everything; an incomplete
+            // one is core's to repeat, so it leaves `owed` as it was, less
+            // what it finished.
+            if failure.is_none() {
+                self.owed.clear();
+            } else {
+                self.owed.retain(|file, _| !finished.contains(file));
+            }
+        } else {
+            // A file in scope with no question is settled too - unless the
+            // ceiling is why it had none.
+            let mut settled = finished.clone();
+            if !plan.truncated {
+                settled.extend(scope.iter().filter(|file| !asked_about.contains(*file)).cloned());
+            }
+            let unfinished: BTreeSet<RelPath> = asked_about.difference(&finished).cloned().collect();
+            self.settle_owed(&requested, &settled, &unfinished);
+        }
         Ok(SemanticAnswer { diff, complete: failure.is_none(), reason: failure })
     }
 }
@@ -2013,6 +2303,7 @@ mod tests {
                     &declaration.name,
                     site_range(at, written),
                     address_of(&declaration, Some("rg::flags::hiargs".to_string())),
+                    &declaration.id,
                 );
             }
             let (diff, _) = answers.finish();

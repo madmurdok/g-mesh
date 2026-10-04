@@ -46,8 +46,9 @@ pub(crate) struct DeclRef {
     pub(crate) kind: NodeKind,
 }
 
-/// A function's written return type, with the module it was written in, which
-/// is where its names resolve. `Self` is already replaced by the impl's type.
+/// A written type with the module it was written in, which is where its names
+/// resolve: a function's return type, or a struct field's type. `Self` is
+/// already replaced by the impl's (or the struct's) own type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Returns {
     pub(crate) module: ModuleCtx,
@@ -83,6 +84,10 @@ pub(crate) struct FileModel {
     /// Keyed by declaration id. `None` marks an id declared twice (a `cfg`
     /// pair) with two different return types: neither is the answer.
     returns: HashMap<String, Option<Returns>>,
+    /// Written types of this file's struct fields, by `(container, "T.f")` or
+    /// `(container, "T.0")`. `None` when `cfg` alternatives disagree, or when
+    /// one of them writes a type no receiver could use.
+    field_types: HashMap<(String, String), Option<Returns>>,
 }
 
 impl FileModel {
@@ -149,6 +154,28 @@ impl FileModel {
     /// The written return type of the function `id`, when it has exactly one.
     pub(crate) fn returns(&self, id: &str) -> Option<&Returns> {
         self.returns.get(id)?.as_ref()
+    }
+
+    /// Records the written type of the field `tail` (`T.f`, `T.0`) in
+    /// `container`; `None` for a field whose type no receiver could use. Two
+    /// `cfg` alternatives of one struct that disagree leave neither.
+    pub(crate) fn set_field_type(&mut self, container: &str, tail: &str, ty: Option<Returns>) {
+        let key = (container.to_string(), tail.to_string());
+        match self.field_types.get(&key) {
+            None => {
+                self.field_types.insert(key, ty);
+            }
+            Some(known) if *known == ty => {}
+            Some(_) => {
+                self.field_types.insert(key, None);
+            }
+        }
+    }
+
+    /// The written type of the field `tail` in `container`, when it has
+    /// exactly one.
+    pub(crate) fn field_type(&self, container: &str, tail: &str) -> Option<&Returns> {
+        self.field_types.get(&(container.to_string(), tail.to_string()))?.as_ref()
     }
 
     /// Records what a `use` item bound. The first binding of a name in a

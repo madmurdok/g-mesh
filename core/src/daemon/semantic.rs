@@ -147,11 +147,12 @@
 //! [`SemanticPassRun`] and every other language is still asked, and neither
 //! entry point is on any command's success path.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 use crate::daemon::indexing_status::IndexingStatus;
+use crate::daemon::lifecycle::AwakeHold;
 use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::{plugin_pid_file_name, PluginRegistry};
@@ -299,11 +300,13 @@ impl SemanticPassRun {
 /// another language its own pass. A supervisor left asleep
 /// (`PluginSupervisor::semantic_pass` returning `Ok(false)`) is deliberately
 /// neither completed nor in [`SemanticPassRun::failed`]: nothing was actually
-/// run, and the language stays owed for whoever asks next - see that method's
-/// own doc comment for why this is expected to be unreachable at this call
-/// site in practice, not a case worth surfacing as an error. It is still
-/// recorded as the language's reason ([`NOT_RUN_REASON`]), so status says why
-/// the language is owed rather than "never completed".
+/// run, and the language stays owed for whoever asks next. It is reachable: a
+/// plugin already asleep when the run starts is not woken for it, and a
+/// memory suspension is not lifted. What the run does prevent is idling a
+/// plugin out mid-run - every language `prepare_owed` told its pass is coming
+/// is held awake ([`AwakeHold`]) until its own pass has been asked. It is
+/// still recorded as the language's reason ([`NOT_RUN_REASON`]), so status
+/// says why the language is owed rather than "never completed".
 pub fn run_with_registry(registry: &PluginRegistry, conn: &IndexStore) -> SemanticPassRun {
     run_with_registry_and_progress(registry, conn, None)
 }
@@ -324,7 +327,9 @@ pub fn run_with_registry_and_progress(
         }
     };
 
-    prepare_owed(registry, &owed);
+    // Each language told its pass is coming stays awake until that pass has
+    // been asked; the rest drop at the end of this function.
+    let mut holds = prepare_owed(registry, &owed);
 
     if let Some(progress) = progress {
         progress.start_semantic_progress(u32::try_from(owed.len()).unwrap_or(u32::MAX));
@@ -338,6 +343,9 @@ pub fn run_with_registry_and_progress(
         let outcome = registry
             .get_or_spawn(&language)
             .and_then(|supervisor| supervisor.semantic_pass(conn, Vec::new(), file_count));
+        // Released once the pass has been asked, whatever its outcome: it
+        // restarts the idle clock, so the plugin now sleeps on its own schedule.
+        drop(holds.remove(&language));
         match outcome {
             Ok(true) => run.record_success(conn, language),
             // The supervisor was asleep or suspended and deliberately left
@@ -365,17 +373,27 @@ pub fn run_with_registry_and_progress(
 ///
 /// Best-effort: a spawn or a write that fails here is logged, and the pass
 /// that follows tries the same spawn again and records its own failure.
-fn prepare_owed(registry: &PluginRegistry, owed: &[String]) {
+fn prepare_owed(registry: &PluginRegistry, owed: &[String]) -> HashMap<String, AwakeHold> {
+    let mut holds = HashMap::new();
     for language in owed.iter().filter(|language| registry.wants_semantic_prepare(language)) {
-        let prepared =
-            registry.get_or_spawn(language).and_then(|supervisor| supervisor.prepare_semantic_pass());
-        if let Err(err) = prepared {
-            eprintln!(
+        // The hold is taken before telling, so no idle tick can slip in
+        // between the two; it is kept only if the plugin was actually told.
+        let prepared = registry.get_or_spawn(language).and_then(|supervisor| {
+            let hold = supervisor.hold_awake();
+            supervisor.prepare_semantic_pass().map(|told| told.then_some(hold))
+        });
+        match prepared {
+            Ok(Some(hold)) => {
+                holds.insert(language.clone(), hold);
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!(
                 "g-mesh daemon: could not tell the {language} plugin its semantic pass is owed ({err:#}) - \
                  it starts its engine when the pass is asked instead"
-            );
+            ),
         }
     }
+    holds
 }
 
 /// Runs the whole-project pass for every currently-owed language for a
@@ -608,6 +626,31 @@ mod tests {
         second_stalling: bool,
         adjust: impl FnOnce(&std::path::Path, &std::path::Path),
     ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf, IndexStore, PluginRegistry) {
+        two_language_registry_idling(
+            first,
+            first_capable,
+            first_stalling,
+            second,
+            second_capable,
+            second_stalling,
+            None,
+            adjust,
+        )
+    }
+
+    /// [`two_language_registry_adjusted`], with `idle_timeout` as every
+    /// plugin's idle timeout.
+    #[allow(clippy::too_many_arguments)]
+    fn two_language_registry_idling(
+        first: &str,
+        first_capable: bool,
+        first_stalling: bool,
+        second: &str,
+        second_capable: bool,
+        second_stalling: bool,
+        idle_timeout: Option<Duration>,
+        adjust: impl FnOnce(&std::path::Path, &std::path::Path),
+    ) -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf, IndexStore, PluginRegistry) {
         let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
 
@@ -641,7 +684,7 @@ mod tests {
             project.path(),
             state_dir,
             discovered,
-            None,
+            idle_timeout,
             None,
             Arc::new(EmbeddingPipeline::disabled()),
         );
@@ -975,6 +1018,118 @@ mod tests {
             lines.iter().any(|line| line.starts_with("  semantic pass:   alpha pending - ")),
             "{lines:?}"
         );
+    }
+
+    /// The plugin idle timeout of the GM-484 tests below: short, so the tests
+    /// stay quick, and only ever used as a lower bound they wait past.
+    const SHORT_IDLE: Duration = Duration::from_millis(300);
+
+    /// Opens a gated plugin's `semanticPass` gate when dropped, so a failing
+    /// assertion still lets the run waiting on the pass return.
+    struct OpenSemanticPassGateOnDrop<'a>(&'a std::path::Path);
+
+    impl Drop for OpenSemanticPassGateOnDrop<'_> {
+        fn drop(&mut self) {
+            test_plugin::open_semantic_pass_gate(self.0);
+        }
+    }
+
+    /// GM-484, the bug itself: `beta` is told its pass is coming, then
+    /// `alpha`'s pass (sorted first) runs long - held open by a gate - while
+    /// the supervise tick's idle check runs on `beta` past its timeout. `beta`
+    /// must still be awake for its own pass, and that pass must land.
+    ///
+    /// The idle check is `beta`'s own `sleep_if_idle`, not the registry's
+    /// `sleep_if_idle_all`: the latter also visits `alpha`, whose
+    /// `sleep_if_idle` blocks on `alpha`'s lock until the gated pass ends, and
+    /// whether it reached `beta` before or after `beta`'s pass would be a race.
+    ///
+    /// Control: make `prepare_owed` return no holds (or remove the
+    /// `is_held_awake()` checks from `sleep_if_idle`). `beta` is idled out,
+    /// its pass answers `Ok(false)`, it is recorded with `NOT_RUN_REASON` and
+    /// `completed == [alpha]`.
+    #[test]
+    fn a_prepared_language_survives_a_preceding_languages_long_pass() {
+        // Not for the env var itself: another test here sets the project
+        // timeout to 150ms, which would cut alpha's gated pass short.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (_project, _plugins, alpha_dir, _beta_dir, conn, registry) = two_language_registry_idling(
+            "alpha",
+            true,
+            false,
+            "beta",
+            true,
+            false,
+            Some(SHORT_IDLE),
+            |alpha, beta| {
+                test_plugin::gate_semantic_pass(alpha);
+                test_plugin::declare_semantic_prepare(beta);
+            },
+        );
+
+        let (run, beta_slept_while_alpha_ran) = std::thread::scope(|scope| {
+            let idler = scope.spawn(|| {
+                let _open = OpenSemanticPassGateOnDrop(&alpha_dir);
+                // Alpha has been asked, so prepare_owed is done with beta.
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while !test_plugin::requests(&alpha_dir).iter().any(|line| line.starts_with("semanticPass")) {
+                    assert!(std::time::Instant::now() < deadline, "alpha's pass was never asked");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let beta = registry.get_or_spawn("beta").expect("beta was spawned to be told");
+                std::thread::sleep(SHORT_IDLE * 3);
+                beta.sleep_if_idle()
+            });
+            let run = run_with_registry(&registry, &conn);
+            (run, idler.join().expect("the idling thread panicked"))
+        });
+
+        assert!(!beta_slept_while_alpha_ran, "beta was idled out while alpha's pass ran");
+        assert_eq!(run.completed, vec!["alpha".to_string(), "beta".to_string()], "{:?}", run.failed);
+        let guard = conn.lock().unwrap();
+        assert!(semantic_pass_at(&guard, "beta").is_some(), "beta's pass landed");
+        assert!(schema::semantic_pass_failures(&guard).unwrap().is_empty());
+    }
+
+    /// GM-484: the hold on a prepared language is released once its own pass
+    /// is done, so the plugin idles out as usual afterwards. `alpha`, never
+    /// held, sleeping on the same ticks shows the wait was long enough.
+    ///
+    /// Control: leak the holds (`std::mem::forget` the map `prepare_owed`
+    /// returns). `beta` stays awake and the deadline assertion fails.
+    #[test]
+    fn a_prepared_languages_hold_is_released_after_its_pass() {
+        let (_project, _plugins, _alpha_dir, _beta_dir, conn, registry) = two_language_registry_idling(
+            "alpha",
+            true,
+            false,
+            "beta",
+            true,
+            false,
+            Some(SHORT_IDLE),
+            |_, beta| test_plugin::declare_semantic_prepare(beta),
+        );
+
+        let run = run_with_registry(&registry, &conn);
+        assert_eq!(run.completed, vec!["alpha".to_string(), "beta".to_string()], "{:?}", run.failed);
+
+        let alpha = registry.get_or_spawn("alpha").expect("alpha is still registered");
+        let beta = registry.get_or_spawn("beta").expect("beta is still registered");
+        let patience = Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + patience;
+        loop {
+            registry.sleep_if_idle_all();
+            if alpha.pid().is_none() && beta.pid().is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "still awake after {patience:?}: alpha {:?}, beta {:?}",
+                alpha.pid(),
+                beta.pid()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// A pass that ran but whose completion could not be written is recorded

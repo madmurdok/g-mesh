@@ -143,3 +143,81 @@ fn a_plugin_that_does_not_declare_a_semantic_pass_never_starts_its_engine() {
     );
     assert_eq!(outcome.verdict("capabilities.semantic-engine-lazy"), Some(Verdict::Skip));
 }
+
+// --- GM-487: a per-file pass through the real control plane -----------------
+
+/// One `Content-Length` frame off the plugin's stdout.
+fn read_frame(reader: &mut impl std::io::BufRead) -> serde_json::Value {
+    let mut length = None;
+    loop {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0, "the plugin closed its stdout mid-session");
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            length = Some(value.trim().parse::<usize>().unwrap());
+        }
+    }
+    let mut body = vec![0; length.expect("every frame has a Content-Length")];
+    reader.read_exact(&mut body).unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// GM-487 Fix 1 end to end, through the toy plugin's own process: a fresh
+/// plugin's first `semanticPass` is a per-file one for the *calling* file,
+/// and the toy engine - which answers an open site only from the SDK's index -
+/// still finds the declaration in a file it was never sent a `fileChanged`
+/// for. This is the GM-485 cold pass 1 / warm pass 3 difference in miniature.
+///
+/// Control: drop the `self.hydrate(&[])` call in `Session::handle`'s
+/// `"semanticPass"` arm; the index holds `b.toy` alone and the pass answers
+/// no edge.
+#[test]
+fn a_fresh_plugins_per_file_pass_answers_into_a_file_it_was_never_sent() {
+    use std::io::{BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    let root = std::env::temp_dir().join(format!("g-mesh-toy-cold-pass-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.toy"), "fn compute\n").unwrap();
+    std::fs::write(root.join("b.toy"), "fn caller\n?compute\n").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_g-mesh-plugin-toy"))
+        .arg(&root)
+        .env_remove(g_mesh_plugin_sdk::MANIFEST_PATH_ENV)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the toy plugin starts");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let handshake = read_frame(&mut stdout);
+    assert_eq!(handshake["language"], "toy", "{handshake}");
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "semanticPass",
+        "params": { "filePaths": ["b.toy"] },
+    })
+    .to_string();
+    write!(stdin, "Content-Length: {}\r\n\r\n{request}", request.len()).unwrap();
+    stdin.flush().unwrap();
+    let response = read_frame(&mut stdout);
+    drop(stdin);
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+
+    let edges = response["result"]["upsertEdges"].as_array().cloned().unwrap_or_default();
+    assert_eq!(edges.len(), 1, "the open site in b.toy is answered: {response:#}");
+    let placeholder = edges[0]["toId"].as_str().unwrap();
+    let node = response["result"]["upsertNodes"]
+        .as_array()
+        .and_then(|nodes| nodes.iter().find(|node| node["id"] == placeholder))
+        .unwrap_or_else(|| panic!("the edge lands on a placeholder the answer carries: {response:#}"));
+    assert_eq!(node["target"]["scope"], serde_json::json!({ "file": "a.toy" }), "{node:#}");
+}
