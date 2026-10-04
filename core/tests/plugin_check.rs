@@ -1426,6 +1426,24 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
         run.stdout
     );
 
+    // The other `tier = "semantic"` entries, each missing exactly the row
+    // only tsserver binds: a default import under another local name
+    // (`MenuGroup`), the branch an ambiguous `export *` barrel picks
+    // (`mutate` in src/amb/a.ts), and a non-call namespace member read
+    // (`target`).
+    for (id, missing) in [
+        ("expectations.callers[8]", "src/defaults/use.ts:renderGroup"),
+        ("expectations.callers[9]", "src/amb/use.ts:useMutate"),
+        ("expectations.references[2]", "src/nsref/use.ts:keep"),
+    ] {
+        assert_eq!(run.outcome(id), "FAIL", "{id}:\n{}", run.stdout);
+        assert!(
+            run.stdout.contains(&format!("missing (expected, not found): {missing}")),
+            "{id} must fail on {missing}:\n{}",
+            run.stdout
+        );
+    }
+
     // Every other expectation - the structural ones - is unaffected.
     for id in [
         "expectations.callers[0]",
@@ -1449,6 +1467,34 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
         // between the two arms would mean tsserver had started answering
         // receiver calls.
         "expectations.callers[3]",
+        // Structural behaviours the TypeScript plugin must keep: workspace,
+        // `dist/` fallback and `extends`-inherited `paths` resolution
+        // (`pointOf`, the two `packages/` imports/importers entries), `.js`
+        // and directory specifiers, `Owner.member()`, member spelling,
+        // generic heritage, callback/arrow attribution, parameter
+        // shadowing, folded dynamic imports, package.json `imports`, and
+        // one node per merged or overloaded declaration.
+        "expectations.callers[4]",
+        "expectations.callers[5]",
+        "expectations.callers[6]",
+        "expectations.callers[7]",
+        "expectations.callers[11]",
+        "expectations.callers[12]",
+        "expectations.references[1]",
+        "expectations.implementations[1]",
+        "expectations.imports[1]",
+        "expectations.imports[2]",
+        "expectations.imports[3]",
+        "expectations.imports[4]",
+        "expectations.importers[1]",
+        "expectations.definition[3]",
+        "expectations.definition[4]",
+        "expectations.definition[5]",
+        "expectations.definition[6]",
+        // `mutate` in src/amb/b.ts is tagged `semantic` with its pair but is
+        // empty in both arms: the structural pass binds the ambiguous import
+        // to neither branch.
+        "expectations.callers[10]",
     ] {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }

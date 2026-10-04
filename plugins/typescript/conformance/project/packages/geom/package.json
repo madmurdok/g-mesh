@@ -1,0 +1,8 @@
+{
+  "name": "@fx/geom",
+  "main": "./dist/prod/index.js",
+  "exports": {
+    ".": "./dist/prod/index.js",
+    "./*": "./dist/prod/index.js"
+  }
+}
