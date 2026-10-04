@@ -401,6 +401,10 @@ semantic_sweep = true
 # true: core sends prepareSemanticPass before an owed whole-project pass, so a slow
 # engine can start while core walks and asks other languages. Default false.
 semantic_prepare = false
+# true: core sends filesCreated before the fileChanged of a batch's created files
+# (two or more of this language), so the project model knows all of them before it
+# extracts the first. Default false: only per-file fileChanged. See ADR 0026.
+files_created = false
 # "resolved": receiver calls (x.foo()) get edges; the MCP instructions do not list
 # the receiver gap for this language. "unresolved": they are listed.
 receiver_calls = "resolved"
@@ -598,6 +602,12 @@ with one optional field, `complete` (see the next section).
   semantic tier is not suspended. The SDK starts the engine on it; readiness is
   still decided inside the pass. Measurements and the choice of trigger:
   [gm-429-speedup-proposal.md](../results/gm-429-speedup-proposal.md), section 1.
+- **New:** `filesCreated { filePaths }`, a notification. Core sends it once per
+  language for a drained batch's created files, when the language has two or more
+  and its manifest declares `files_created`, before the first of their
+  `fileChanged`s; each file is still routed once. The SDK applies presence for
+  all of them without extracting. Never sent to a sleeping plugin.
+  [ADR 0026](../adr/0026-batch-created-files-notification.md).
 
 ### A `fileChanged` diff from a process with no baseline
 
