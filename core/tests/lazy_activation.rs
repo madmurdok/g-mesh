@@ -81,6 +81,21 @@ impl Project {
         schema::bulk_index_completed(&self.db()).expect("failed to read bulkIndexedAt")
     }
 
+    /// Whether `bulkIndexedAt` lands within a few seconds. `walk()` flips the
+    /// phase to `Structural` before it writes the marker, so a tool call can
+    /// answer before the marker exists: asserting `bulk_indexed()` right
+    /// after the answer races that window (GM-483).
+    async fn bulk_indexed_soon(&self) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !self.bulk_indexed() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
     /// A client over a real shim, which bootstraps the project's daemon.
     /// `env` is passed to the shim, and so inherited by that daemon.
     async fn connect(&self, env: &[(&str, &std::ffi::OsStr)]) -> RunningService<RoleClient, ()> {
@@ -222,7 +237,7 @@ async fn first_structural_call_blocks_and_answers_fully() {
         .collect();
     assert_eq!(names, FULL_OUTLINE, "the first call must answer off the complete index: {outline}");
 
-    assert!(project.bulk_indexed(), "the walk the first call waited for must have been recorded");
+    assert!(project.bulk_indexed_soon().await, "the walk the first call waited for must have been recorded");
     // Also what makes `an_existing_index_is_not_rewalked`'s absent log line
     // mean something: the log channel it reads does carry this line when a
     // walk happens.
@@ -358,7 +373,7 @@ async fn a_failed_walk_is_a_tool_error_and_is_retried() {
     let retried = call(&client, "find_definition", json!({ "symbol_name": "greet" })).await;
     let definition = body(&retried);
     assert_eq!(definition["name"], "greet", "the retried walk must answer: {definition}");
-    assert!(project.bulk_indexed(), "the retried walk must have been recorded");
+    assert!(project.bulk_indexed_soon().await, "the retried walk must have been recorded");
 
     client.cancel().await.expect("failed to shut the client down");
 }
