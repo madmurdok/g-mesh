@@ -1481,3 +1481,165 @@ fn the_server_cold_start_names_installed_and_missing_plugins() {
         assert!(rendered.contains("slow, not wrong"), "{rendered}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// GM-330/S10: the failed item's cause (ADR 0022, section 3 failed row and
+// "Resolved at review" item 2) against errors stored by
+// `languages::failed_error`, one cause per line, outermost first.
+// ---------------------------------------------------------------------------
+
+/// The failed item `{lang} ({cause})` for `language` out of `rendered`.
+fn failed_item<'a>(rendered: &'a str, language: &str) -> &'a str {
+    let start = rendered
+        .find(&format!("plugin failed: {language} ("))
+        .unwrap_or_else(|| panic!("no failed item for {language}: {rendered}"));
+    let item = &rendered[start + "plugin failed: ".len()..];
+    let end = item.find(") - fix the plugin").unwrap_or_else(|| panic!("unterminated item: {rendered}"));
+    &item[..=end]
+}
+
+/// `rendered` for the four bundled languages with `rust` failed with
+/// `error` and the other three indexed.
+fn rendered_with_rust_failed(error: &str) -> String {
+    let found = real_plugins(&["go", "python", "rust", "typescript"]);
+    build(&warm_real(
+        &found,
+        &["go", "python", "typescript"],
+        vec![("go", indexed()), ("python", indexed()), ("rust", failed(error)), ("typescript", indexed())],
+    ))
+}
+
+/// The real failure (GM-330/S4): a plugin laid out as an installed one
+/// (`command = "./g-mesh-plugin-rust"`) whose binary is gone, under a deep
+/// root, walked by the real `bulk_index::run`. The stored error is the whole
+/// chain, the path in an outer cause; the rendered item shows only the OS
+/// cause, read from `std::io::Error` rather than written here, and no path.
+///
+/// Control: make `error_cause` take the first non-empty line instead of the
+/// last (the item becomes the outermost context and the exact-item
+/// assertion fails).
+#[test]
+fn a_real_missing_plugin_binary_renders_the_os_cause_without_the_path() {
+    use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
+
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let plugins =
+        home.path().join("a-plugin-root-deep-enough-that-its-path-alone-fills-the-hundred-byte-budget");
+    let rust = plugins.join("rust");
+    std::fs::create_dir_all(&rust).unwrap();
+    std::fs::write(
+        rust.join("plugin.toml"),
+        format!(
+            "[plugin]\nlanguage = \"rust\"\nprotocol_version = {CURRENT_PROTOCOL_VERSION}\n\
+             plugin_version = \"0.0.0-test\"\n\n[plugin.spawn]\ncommand = \"./g-mesh-plugin-rust\"\n\n\
+             [plugin.languages]\nextensions = [\".rs\"]\n"
+        ),
+    )
+    .unwrap();
+    crate::daemon::test_plugin::install(&plugins, "alpha", &[".alpha-src"]);
+    let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
+    let store = IndexStore::new(store_with_files(&[]));
+
+    let summary = crate::daemon::bulk_index::run(project.path(), &store, None, &discovered)
+        .expect("one failed language must not fail the walk");
+
+    let error = match summary.outcomes.get("rust") {
+        Some(LanguageOutcome::Failed { error }) => error.clone(),
+        other => panic!("rust must be Failed, got {other:?}"),
+    };
+    // ENOENT on Unix and ERROR_FILE_NOT_FOUND on Windows are both 2.
+    let os_message = std::io::Error::from_raw_os_error(2).to_string();
+    assert!(error.lines().count() >= 2, "a chain, one cause per line: {error}");
+    assert!(error.contains(&rust.display().to_string()), "an outer cause names the path: {error}");
+    assert_eq!(error.lines().last(), Some(os_message.as_str()), "the innermost cause is the OS one: {error}");
+
+    let rendered = rendered_with_rust_failed(&error);
+
+    assert_eq!(failed_item(&rendered, "rust"), format!("rust ({os_message})"), "{rendered}");
+    #[cfg(unix)]
+    assert!(rendered.contains("rust (No such file or directory"), "{rendered}");
+    assert!(!rendered.contains(&home.path().display().to_string()), "{rendered}");
+    assert!(!failed_item(&rendered, "rust").contains('/'), "{rendered}");
+}
+
+/// A cause whose own text contains ": " (a serde-like message) is shown
+/// whole: the store's line, not a separator, bounds a cause.
+///
+/// Control: reintroduce a last-": " split in `error_cause`
+/// (`cause.rsplit(": ").next()`) - the item becomes `rust (map, expected a
+/// string at line 3)` and the exact comparison fails.
+#[test]
+fn a_cause_containing_colon_space_survives_whole_in_the_failed_item() {
+    use anyhow::Context;
+
+    let inner: Result<(), std::io::Error> = Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "invalid type: map, expected a string at line 3",
+    ));
+    let err = inner.context("reading the manifest").context("loading the rust plugin").unwrap_err();
+    let stored = languages::failed_error(&err);
+
+    assert_eq!(error_cause(&stored), "invalid type: map, expected a string at line 3");
+    let rendered = rendered_with_rust_failed(&stored);
+    assert_eq!(
+        failed_item(&rendered, "rust"),
+        "rust (invalid type: map, expected a string at line 3)",
+        "{rendered}"
+    );
+}
+
+/// [`shorten_paths`]: an absolute or `~/` path token becomes its last
+/// component, with brackets, quotes and trailing punctuation kept; "/" alone
+/// and relative paths are left as they are. The last assertion goes through
+/// [`error_cause`], so it pins that the cause is shortened at all.
+///
+/// Control: drop the `shorten_paths` call from `error_cause` - the
+/// `error_cause` assertion fails (the direct `shorten_paths` assertions
+/// catch a `shorten_paths` that returns `text` unchanged).
+#[test]
+fn shorten_paths_keeps_only_the_last_component_of_rooted_paths() {
+    assert_eq!(shorten_paths("/usr/local/lib/g-mesh/plugins/rust/plugin.toml"), "plugin.toml");
+    assert_eq!(shorten_paths("~/.g-mesh/plugins/rust/g-mesh-plugin-rust"), "g-mesh-plugin-rust");
+    assert_eq!(shorten_paths("spawn (/private/tmp/x/plugin.js) failed"), "spawn (plugin.js) failed");
+    assert_eq!(shorten_paths("open \"/a/b/c.toml\" failed"), "open \"c.toml\" failed");
+    assert_eq!(shorten_paths("open '/a/b/c.toml'"), "open 'c.toml'");
+    assert_eq!(shorten_paths("[/a/b/c.rs]"), "[c.rs]");
+    assert_eq!(shorten_paths("`~/x/y.js`"), "`y.js`");
+    assert_eq!(shorten_paths("in /a/b/c.rs, then /d/e.rs; and /f/g.rs."), "in c.rs, then e.rs; and g.rs.");
+    assert_eq!(shorten_paths("reading /a/b/c.toml: bad"), "reading c.toml: bad");
+    assert_eq!(shorten_paths("/"), "/");
+    assert_eq!(shorten_paths("a / b"), "a / b");
+    assert_eq!(
+        shorten_paths("src/lib.rs and ./plugin.js and ../x/y"),
+        "src/lib.rs and ./plugin.js and ../x/y"
+    );
+    assert_eq!(shorten_paths("no paths here"), "no paths here");
+
+    assert_eq!(
+        error_cause("spawning the plugin\n/opt/g-mesh/plugins/rust/g-mesh-plugin-rust is missing"),
+        "g-mesh-plugin-rust is missing"
+    );
+}
+
+/// The 100-byte cap applies after shortening: a cause over 100 bytes only
+/// because of its path is kept whole, and one still over 100 bytes after
+/// shortening is cut on a char boundary when byte 97 falls inside a
+/// multi-byte char.
+///
+/// Controls: cut with `&cause[..97]` and no boundary walk (panics on the
+/// second input); cap before shortening (the first input comes back cut).
+#[test]
+fn the_cap_applies_after_shortening_and_cuts_on_a_char_boundary() {
+    let deep = format!("/{}/file.rs", "d".repeat(150));
+    let short = format!("outer context\n{deep} is missing");
+    assert!(short.lines().last().unwrap().len() > ERROR_BYTES);
+    assert_eq!(error_cause(&short), "file.rs is missing", "shortened first, so nothing to cut");
+
+    // Shortened: "file.rs " (8 bytes) + 88 'a' = 96 bytes, then 'é' spans
+    // bytes 96-97, so byte 97 is inside it.
+    let long = format!("outer context\n{deep} {}é{}", "a".repeat(88), "z".repeat(40));
+    let cut = error_cause(&long);
+    assert_eq!(cut, format!("file.rs {}...", "a".repeat(88)));
+    assert!(cut.len() <= ERROR_BYTES);
+}

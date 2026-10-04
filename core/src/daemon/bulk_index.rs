@@ -930,6 +930,53 @@ mod tests {
         }
     }
 
+    /// The all-failed error names each language on one line of its own,
+    /// with that language's whole stored chain (one cause per line in the
+    /// store) joined by ": " - never the stored newlines (GM-330, ADR 0021
+    /// section 2).
+    ///
+    /// Control: push the stored error raw (no `error_on_one_line`) - the
+    /// message gains a line per extra cause and the line-count and per-line
+    /// assertions fail.
+    #[test]
+    fn the_all_failed_error_shows_each_whole_chain_on_one_line() {
+        let project = tempfile::tempdir().unwrap();
+        let plugins = tempfile::tempdir().unwrap();
+        // A plugin whose spawn command is gone: the OS refuses the spawn, and
+        // the stored error is the context plus the OS cause (a missing
+        // `plugin.js` entry point is caught earlier, as a single cause).
+        for language in ["alpha", "beta"] {
+            let dir = plugins.path().join(language);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("plugin.toml"),
+                format!(
+                    "[plugin]\nlanguage = \"{language}\"\nprotocol_version = {}\n\
+                     plugin_version = \"0.0.0-test\"\n\n[plugin.spawn]\ncommand = \"./g-mesh-plugin-{language}\"\n\n\
+                     [plugin.languages]\nextensions = [\".{language}-src\"]\n",
+                    crate::protocol::types::CURRENT_PROTOCOL_VERSION
+                ),
+            )
+            .unwrap();
+        }
+        let discovered = discover_root(plugins.path());
+        let conn = setup_conn();
+
+        let message = run(project.path(), &conn, None, &discovered)
+            .expect_err("a walk where every discovered language failed is an error")
+            .to_string();
+
+        let rows = recorded_outcomes(&conn);
+        let lines: Vec<&str> = message.lines().collect();
+        assert_eq!(lines.len(), 1 + rows.len(), "a header and one line per language: {message}");
+        for ((language, outcome), line) in rows.iter().zip(&lines[1..]) {
+            let LanguageOutcome::Failed { error } = outcome else { panic!("{rows:?}") };
+            let causes: Vec<&str> = error.lines().collect();
+            assert!(causes.len() >= 2, "the fixture must store a multi-line chain: {error}");
+            assert_eq!(*line, format!("  {language}: {}", causes.join(": ")), "{message}");
+        }
+    }
+
     /// An absent catalogue language never rescues an all-failed walk: the
     /// all-failed test is over discovered languages only.
     ///

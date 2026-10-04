@@ -360,3 +360,52 @@ fn nothing_is_counted_when_every_catalogue_plugin_is_discovered() {
 
     assert!(count_absent_files(project.path(), &discovered).is_empty());
 }
+
+/// A real anyhow chain of three `.context()` layers (GM-330, ADR 0021
+/// section 2): [`failed_error`] stores one cause per line, outermost first;
+/// a newline inside a cause (`\n` or `\r\n`) becomes one space, and a cause
+/// whose own text contains ": " stays whole on its line.
+///
+/// Control: store `format!("{err:#}")` instead (the causes come back on one
+/// line joined by ": ", the embedded newline kept), and the exact comparison
+/// fails.
+#[test]
+fn failed_error_stores_a_real_chain_one_cause_per_line_outermost_first() {
+    use anyhow::Context;
+
+    let inner: Result<(), std::io::Error> = Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "invalid type: map, expected a string\nat line 3\r\ncolumn 7",
+    ));
+    let err = inner
+        .context("reading /opt/plugins/rust/plugin.toml")
+        .context("loading the rust plugin:\nits manifest")
+        .unwrap_err();
+
+    assert_eq!(
+        failed_error(&err),
+        "loading the rust plugin: its manifest\n\
+         reading /opt/plugins/rust/plugin.toml\n\
+         invalid type: map, expected a string at line 3 column 7"
+    );
+}
+
+/// With no newline inside any cause, the stored form read back on one line
+/// is exactly anyhow's `{:#}` rendering, and the innermost cause is the last
+/// line whole, ": " included.
+///
+/// Control: join with "\n" in [`error_on_one_line`] (or return the stored
+/// string as it is) - the equality with `{:#}` fails.
+#[test]
+fn a_stored_error_on_one_line_is_the_chain_joined_by_colon_space() {
+    use anyhow::Context;
+
+    let inner: Result<(), std::io::Error> =
+        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid type: map, expected a string"));
+    let err = inner.context("reading the manifest").context("starting the rust plugin").unwrap_err();
+    let stored = failed_error(&err);
+
+    assert_eq!(stored.lines().last(), Some("invalid type: map, expected a string"));
+    assert_eq!(error_on_one_line(&stored), format!("{err:#}"));
+    assert!(!error_on_one_line(&stored).contains('\n'));
+}
