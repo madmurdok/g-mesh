@@ -122,7 +122,7 @@ placeholders.
 | unsupported | covered by the second sentence above, which is said once and generically and names no catalogue | 0 extra |
 | nothing indexed | `Nothing is indexed here: g-mesh has no answers about this project's files.` | 74 |
 | plugin absent | `Not indexed, no plugin installed: {items}.` with item `{lang} ({n} files; `g-mesh plugins install {lang}`)`, or `{lang} (files not counted; `g-mesh plugins install {lang}`)` when `files` is `None` | 42 + 51 or 59 per language |
-| failed | `Not indexed, plugin failed: {items} - fix the plugin, then run `g-mesh reindex`.` with item `{lang} ({error})`, where `error` is the innermost cause of the chain (what follows the last `: ` of the stored `{:#}` text) with absolute and `~/` paths shortened to their file name, cut to 100 bytes on a char boundary | 80 + 16 + error per language |
+| failed | `Not indexed, plugin failed: {items} - fix the plugin, then run `g-mesh reindex`.` with item `{lang} ({error})`, where `error` is the innermost cause of the chain (the last non-empty line of the stored error, which keeps one cause per line) with absolute and `~/` paths shortened to their file name, cut to 100 bytes on a char boundary | 80 + 16 + error per language |
 | trailer (when anything is absent or failed) | `Until then an empty answer about those files is not evidence of absence.` | 72 |
 | receiver, never | `P4_PERM`: "...in {list}, a method call through a variable receiver (`x.foo()`) may produce no edge, so a method's caller/reference list there can under-report; bare function calls and this/super/qualified-type calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive." | 335 |
 | receiver, static | `P4_STATIC` (today's static paragraph without its wait sentence) | 343 |
@@ -205,7 +205,9 @@ accessor.
 2. A failed language shows the innermost cause of its error chain, with
    absolute and `~/` paths shortened to their file name, up to 100 bytes cut
    on a char boundary; it is the first thing the ceiling cuts. The store keeps
-   the whole chain, so `g-mesh status` and stderr still show every context.
+   the whole chain, one cause per line, so the innermost cause is the last
+   line even when its own text contains `: `; `g-mesh status` and stderr
+   still show every context, joined back with `: `.
 3. Cold start uses the conditional wording from `languages::missing()`: no
    count and no I/O at `initialize`. Later sessions read counts from
    `language_outcome`.

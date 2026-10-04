@@ -241,7 +241,8 @@ impl ActivationCtx {
             match outcome {
                 LanguageOutcome::Failed { error } => eprintln!(
                     "g-mesh daemon: {language} failed to index and is left out of the index until \
-                     `g-mesh reindex`: {error}"
+                     `g-mesh reindex`: {}",
+                    crate::languages::error_on_one_line(error)
                 ),
                 LanguageOutcome::PluginAbsent { files } => eprintln!(
                     "g-mesh daemon: {language} has no plugin installed - {} not indexed",

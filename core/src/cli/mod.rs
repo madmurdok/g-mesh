@@ -82,9 +82,10 @@ pub fn language_outcome_lines(outcomes: &BTreeMap<String, LanguageOutcome>) -> V
         .iter()
         .filter_map(|(language, outcome)| match outcome {
             LanguageOutcome::Indexed { .. } => None,
-            LanguageOutcome::Failed { error } => {
-                Some(format!("g-mesh: {language} failed to index and is not in the index: {error}"))
-            }
+            LanguageOutcome::Failed { error } => Some(format!(
+                "g-mesh: {language} failed to index and is not in the index: {}",
+                crate::languages::error_on_one_line(error)
+            )),
             LanguageOutcome::PluginAbsent { files } => {
                 let what = match files {
                     Some(files) => format!("{files} file(s) not indexed"),

@@ -198,7 +198,7 @@ pub fn run_with_progress(
                 })?;
                 (ctx.summary.nodes, ctx.summary.edges, ctx.summary.skipped_lines) = counts_before;
                 ctx.walked_files = walked_before;
-                failed.insert(manifest.language.clone(), format!("{err:#}"));
+                failed.insert(manifest.language.clone(), languages::failed_error(&err));
             }
             if let Some(progress) = progress {
                 progress.mark_language_done();
@@ -255,7 +255,7 @@ pub fn run_with_progress(
         let mut message = String::from("every discovered language failed to index:");
         for (language, outcome) in &summary.outcomes {
             if let LanguageOutcome::Failed { error } = outcome {
-                message.push_str(&format!("\n  {language}: {error}"));
+                message.push_str(&format!("\n  {language}: {}", languages::error_on_one_line(error)));
             }
         }
         bail!(message);

@@ -72,7 +72,10 @@ pub enum LanguageOutcome {
 - `Failed` - a discovered plugin that could not be used: spawn failure
   (including `missing_plugin_binary_hint`), a mid-stream ingest error, a
   non-zero exit, or its `language_state` write failing. `error` is the
-  `{err:#}` chain.
+  whole anyhow chain, one cause per line, outermost first
+  (`languages::failed_error`); a newline inside one cause becomes a space.
+  A one-line reader (CLI stderr, the daemon log, the all-failed message)
+  joins the lines back with `: `.
 
 `run`/`run_with_progress` keep `Result<BulkIndexSummary>`; the summary gains
 `outcomes: BTreeMap<String, LanguageOutcome>`. They return `Err` when the

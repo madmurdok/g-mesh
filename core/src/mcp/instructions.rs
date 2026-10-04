@@ -237,15 +237,13 @@ const ERROR_BYTES: usize = 100;
 
 /// What a failed language's item shows of its stored error: the innermost
 /// cause, with filesystem paths shortened to their file name, at most
-/// [`ERROR_BYTES`] bytes. The store keeps the whole anyhow chain as `{:#}`
-/// renders it, outermost first and joined by ": ", so the innermost cause is
-/// what follows the last ": " of the last non-empty line. The outer contexts
-/// name the step and the inner cause names what went wrong; with 100 bytes,
-/// the cause is the part worth keeping. A cause whose own text contains ": "
-/// keeps only its tail.
+/// [`ERROR_BYTES`] bytes. The store keeps the whole anyhow chain one cause
+/// per line, outermost first (`languages::failed_error`), so the innermost
+/// cause is the last non-empty line, whole even when its own text contains
+/// ": ". The outer contexts name the step and the inner cause names what went
+/// wrong; with 100 bytes, the cause is the part worth keeping.
 fn error_cause(error: &str) -> String {
-    let line = error.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or_default();
-    let cause = line.rsplit(": ").next().unwrap_or_default().trim();
+    let cause = error.lines().rev().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
     let cause = shorten_paths(cause);
     if cause.len() <= ERROR_BYTES {
         return cause;

@@ -791,7 +791,7 @@ fn a_failed_language_names_its_error_cause_and_the_reindex_command() {
         vec![
             ("go", indexed()),
             ("python", indexed()),
-            ("rust", failed("rust plugin exited during the handshake\ncaused by: No such file or directory")),
+            ("rust", failed("rust plugin exited during the handshake\nNo such file or directory")),
             ("typescript", indexed()),
         ],
     );
@@ -842,7 +842,7 @@ fn error_cause_keeps_the_innermost_cause_within_100_bytes_on_a_char_boundary() {
     assert!(cut.len() <= ERROR_BYTES);
 
     // The cut applies to the innermost cause, not to the whole chain.
-    let chain = format!("outer: {}", "日".repeat(40));
+    let chain = format!("outer\n{}", "日".repeat(40));
     assert_eq!(error_cause(&chain), format!("{}...", "日".repeat(32)));
 }
 
