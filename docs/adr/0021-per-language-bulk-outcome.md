@@ -266,3 +266,78 @@ and ADRs.
    backlog task.
 4. **Comments link ADRs, not tickets.** The code comment links ADR 0002 and
    this ADR; GM-316 is named here only.
+
+## Measurement (GM-329/S5)
+
+Run 2026-10-04 at f48f0b9, release build, against the rule in section 4.
+**Verdict: not too slow. The deadline fallback is not needed.** No corpus
+crosses its threshold, and with zero plugins discovered the count costs
+0.04 s on the largest corpus, against a 2 s limit.
+
+**Metric.** Wall time (`/usr/bin/time -p`) of `g-mesh reindex`: wipe, bulk
+walk and link, which is the work the daemon does before `Phase::Structural`.
+Nothing runs after it: every plugin's `semantic_pass`/`semantic_sweep`/
+`semantic_prepare` is switched off in a copied manifest, and
+`G_MESH_MODEL_DIR` points at a missing directory, so there is no semantic or
+embedding pass. Nothing logs the count's own duration, so arm Z is its cost.
+
+**Arms.** Discovery uses `G_MESH_PLUGIN_ROOTS_OVERRIDE` pointed at a private
+plugin root: plugin directories made of symlinks to the checkout plus the
+edited `plugin.toml`. B = rust, go and typescript discovered with python
+absent, count on. C and C2 = the same set with
+`G_MESH_BULK_INDEX_NO_ABSENT_COUNT=1`. C2 is the A/A arm, and the A/A
+spread is |median C − median C2|. Z and Zoff = zero plugins discovered,
+count on or off. A = all four plugins discovered. Each corpus got one
+discarded B warm-up, then A once, then 5 interleaved rounds of B, C and C2,
+then 5 interleaved rounds of Z and Zoff. Corpora ran one at a time.
+`G_MESH_HOME` was private.
+
+**Control, checked on every run** (`language_outcome` read back): every B
+run has a `python=plugin_absent:N` row. No C, C2 or Zoff run has a
+`plugin_absent` row. Every Z run has one per language present. A has
+`python=indexed` and no `plugin_absent` row, so the count did not run.
+0 of 135 runs failed this check. gin, ripgrep and excalidraw contain no
+Python, so one untracked `gm329_marker.py` was added to each scratch clone.
+Without it B and C would have no observable difference.
+
+**Corpora.** Pinned clones: py-requests 6e83187, gin 73726dc, ripgrep
+e89fff8, excalidraw 1acf66e (a clone of the local checkout). The fifth
+corpus is the g-mesh checkout itself. Walked file count comes from
+`git ls-files -co --exclude-standard`, which is what the walker sees because
+it keeps `git_ignore` on: py-requests 129, gin 131, ripgrep 223, g-mesh 641,
+excalidraw 1261. **Headline = excalidraw.** g-mesh's 151k-file `target/` and
+its `node_modules` are gitignored. The walker skips them via `.gitignore`
+before the pruned-name list applies, so they did not stress the count. The
+Z rows for g-mesh confirm this (rust=278 = tracked `.rs` files).
+
+| corpus | B on (s) | C off (s) | B − C | threshold max(5 %·C, 0.5) | A/A spread | Z on | Z off | Z on − off | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| py-requests | 0.21 | 0.20 | +0.01 | 0.50 | 0.03 | 0.04 | 0.04 | +0.00 | ok |
+| gin | 0.98 | 0.93 | +0.05 | 0.50 | 0.01 | 0.04 | 0.04 | +0.00 | ok |
+| ripgrep | 2.85 | 2.69 | +0.16 | 0.50 | 0.27 | 0.06 | 0.06 | +0.00 | ok |
+| **excalidraw** | 19.02 | 21.80 | −2.78 | 1.09 | 1.21 | 0.11 | 0.07 | +0.04 | ok |
+| g-mesh | 15.85 | 15.64 | +0.21 | 0.78 | 0.21 | 0.05 | 0.05 | +0.00 | ok |
+
+All values are medians of 5 runs.
+
+**Machine state.** 8 CPUs, shared with other work. The 1-minute load
+average was 9.7 at the start, peaked at 41.8 during the excalidraw rounds,
+and was 14.8 at the end (5-minute averages 20 to 32). Each corpus's
+before/after `uptime` and the per-run load are in the run's `machine.txt`
+and `runs.csv`. CPU time accounts for most of the wall time in the bulk-walk
+arms: excalidraw user ≈ 18–19 s out of 19–22 s real. So these runs did
+compute and were not stalled waiting. The Z arms show user 0.01–0.04 s,
+which means the count itself is cheap and is not merely hidden behind a
+slow walk. Excalidraw's negative delta is load noise: in round 3, B ran
+while the 1-minute load was at 41.8. That corpus's A/A spread, 1.21 s, is
+of the same order. A negative delta cannot fail the rule.
+
+**Commands** (scripts are in the session's scratchpad and are not part of
+the repo):
+`cargo build --release --workspace`, then `go build` for plugins/go and
+`npm run build` for plugins/typescript. The binaries were copied to a private
+`bin/` so that any leftover process could be identified and killed; none
+was left. Each run was
+`cd <corpus> && G_MESH_HOME=<private> G_MESH_MODEL_DIR=/nonexistent
+G_MESH_PLUGIN_ROOTS_OVERRIDE=<root> [G_MESH_BULK_INDEX_NO_ABSENT_COUNT=1]
+/usr/bin/time -p g-mesh reindex`.
