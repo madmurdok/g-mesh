@@ -212,3 +212,105 @@ accessor.
 5. Paragraph 3 moves to hints as decided; the bench measurement checks the
    prompt change.
 6. Owed items (a)-(d) are separate backlog tasks.
+
+## Measurement (GM-330/S4)
+
+Run 2026-10-04 at 89efca1. **Verdict: the projections hold.** Every rendered
+scenario is at or under the 1900-byte ceiling (`INSTRUCTIONS_BYTE_CEILING`).
+Ten of the eleven projected rows match exactly, and the eleventh is 1.0 %
+under. In a live session, each coverage state renders its line when it
+should and leaves it out when it should not. Part C (a g-mesh-bench
+session) was not run.
+
+### A. Bytes (the module's own tests)
+
+`cargo test -p g-mesh --lib mcp::instructions:: -- --nocapture --test-threads=1`
+ran 47 tests, all passing. `uptime` load 4.69, and `/usr/bin/time -p`
+gave real 20.82, user 9.21, sys 3.98, mostly compiling. The one projected
+row that no test prints (16 never-languages) came from a scratch test in a
+throwaway worktree, which was not committed. It used names `never00` to
+`never15` with `Capabilities::default()`, plus the real TypeScript
+manifest and three absent languages.
+
+| Scenario (section 4) | Projected | Measured | Step | Δ |
+|---|---|---|---|---|
+| TypeScript only | 1141 | 1141 | 1 | 0 |
+| Rust only | 1269 | 1269 | 1 | 0 |
+| TypeScript + Rust | 1280 | 1280 | 1 | 0 |
+| TypeScript + Python absent (214 files) | 1301 | 1301 | 1 | 0 |
+| Four states (Rust failed with a 182-byte error cut to 100; Go and Python absent with 5-digit counts) | 1531 | 1531 | 1 | 0 |
+| Zero plugins, all four absent | 1115 | 1115 | 1 | 0 |
+| Four discovered, three failed with long errors | 1613 | 1613 | 1 | 0 |
+| All four failed | 1379 | 1379 | 1 | 0 |
+| Stress: 16 never + TypeScript + 3 absent (5-digit counts; 214: 1689; not counted: 1713) | 1695 | 1695 | 1 | 0 |
+| Stress: 16 failed + TypeScript + 3 absent | 1617 | 1601 | 2 | −16 (−1.0 %) |
+| Cold start, 103-byte root, TypeScript only, 3 missing, unindexed / walking | 1601 / 1572 | 1601 / 1572 | 1 | 0 |
+
+The tests print other renderings too, none of them over the ceiling:
+
+- Cold start with 0 missing: 1569 / 1540. With 4 missing: 1304 / 1275.
+- Ladder step 3 (40 never + 3 absent + 2 failed): 1843.
+- Ladder step 4 (80 static + 3 absent + 2 failed): 1496.
+- `build_front` with 64 60-byte names under a 103-byte root: 1846. This is
+  the largest rendering measured.
+- The worst-case cold start, named / fallback: 1776 / 1476.
+
+Before and after:
+
+| Worst case | Before | After |
+|---|---|---|
+| Every language named (warm) | 1888 | 1319 |
+| Worst realistic warm (three failed with long errors) | n/a, no such state | 1613 (287 free) |
+| Cold start, walking, 103-byte root | 1885 | 1572 (3 missing) |
+
+### B. Live render
+
+The binary was a release build (`cargo build --release --workspace`:
+real 140.15, user 19.79, sys 2.93, `uptime` load 4.24 at the start). The
+binaries were copied to a private `bin/`. The corpus was a scratch
+directory: 2 `.rs` files with a `Cargo.toml`, 3 `.py` and 2 `.ts`. Each
+arm used its own private `G_MESH_HOME`. Plugin discovery followed the
+GM-329/S5 recipe: `G_MESH_PLUGIN_ROOTS_OVERRIDE` pointed at a private root
+of per-language directories that symlink the checkout's `plugins/<lang>`.
+`G_MESH_MODEL_DIR` pointed at a missing directory.
+
+Each warm arm ran `g-mesh reindex` and then one MCP session. The session
+was a stdio JSON-RPC `initialize` sent to `g-mesh mcp-shim`, run from the
+corpus with `CLAUDE_PROJECT_DIR` unset. That is the same path as
+`core/tests/plugin_memory_limit.rs`. `language_outcome` was read back with
+sqlite3. After each arm, the daemon and its descendants were killed with
+`kill -9`, and no process from the private `bin/` was left. During the run
+the machine was loaded (`uptime` 1-minute average 46.6 at the start and
+34.5 at the end). The whole run took real 24.05, user 7.20, sys 4.24.
+
+The control that tells the arms apart is whether the state line is
+present.
+
+| Arm | Bytes | State line | Check | Verdict |
+|---|---|---|---|---|
+| absent: Python not discovered | 1438 | `Not indexed, no plugin installed: python (3 files; ...)` + trailer | row `python=plugin_absent, files=3` equals the 3 in the text | pass |
+| control: all four discovered | 1288 | none (no "Not indexed") | every present language `indexed` | pass |
+| failed: Rust binary removed from a *copied* `rust/` (manifest `command = "./g-mesh-plugin-rust"`) | 1536 | `Not indexed, plugin failed: rust (failed to spawn the rust plugin's bulk index (/private/tmp/...) - fix the plugin, then run `g-mesh reindex`.` + trailer | row `rust=failed` with the spawn error. `reindex` exit 2 | pass |
+| restored: binary put back, `g-mesh reindex`, new session | 1288 | none. Rust is back in `Indexed here` | row `rust=indexed` | pass |
+| cold: fresh home, first session, Python not discovered | 1706 | `If this project has python files, they are not indexed: no plugin installed (...)` | `Index root:` header (unindexed) | pass |
+
+The cold arm's 1706 bytes is not comparable to the projected 1601. Its
+root is 137 bytes rather than 103, it lists three installed plugins and
+one missing, and it is still 194 bytes under the ceiling.
+
+### Findings
+
+1. **The failed line spends its 100 bytes on the path.** The rust error
+   was `failed to spawn the rust plugin's bulk index (<138-byte plugin
+   path>): No such file or directory (os error 2)`. Cut to 100 bytes, it
+   keeps the path prefix and loses the cause. The language name and the
+   `g-mesh reindex` fix survive, which is what section 3 guarantees. The
+   cause survives only on a short install path such as `~/.g-mesh/plugins`.
+   One option is to put the cause before the path in that error, or to cut
+   the path rather than the tail. That is a separate task if wanted.
+2. **A deep `G_MESH_HOME` cannot host a daemon.** Under the scratchpad,
+   the socket path was 181 bytes, over the macOS limit of 103. The shim
+   says so clearly. The run used a short symlink, `/tmp/g330`, into the
+   scratchpad. This is not a GM-330 issue.
+3. `g-mesh reindex` exits 2 when a language fails. Coverage is still
+   recorded and served.
