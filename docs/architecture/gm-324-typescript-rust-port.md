@@ -751,6 +751,32 @@ tokens, ~7.3k Rust lines of code, ~4k of tests.
    `src/`**, or in `src/` beside the `.ts` files now? Recommend `rust/` now
    (one `git mv` later, no mixed-language `src/` for a release).
 
+### Resolved at review (2026-10-05)
+
+The owner dropped the interim Node semantic tier: **no Node bridge**.
+Instead GM-324, GM-325 and GM-351 are built on one integration branch,
+`feat/GM-324-325-ts-port`, and merged into the release branch once, when all
+three are done, so no release-branch commit loses TypeScript semantics. This
+replaces option A of section 3:
+
+- C5 switches `plugin.toml` to the Rust binary with the semantic tier off
+  (`semantic_pass = false`) until GM-325 adds the LspBridge tier on the same
+  branch. No `rust/semantic.rs` `NodeSemantic`, no SIGKILL-orphan check, no
+  `framing` export for a Node child.
+- The core tests that assert TypeScript semantic results (GM-323 inventory)
+  are red on the integration branch until GM-325; GM-324's verify excludes
+  them by name and says so.
+- Id parity with the Node plugin (T3's comparator, M's excalidraw run) is a
+  **measurement, not a gate**: a difference is reported, and behaviour is held
+  by GM-323's expectations and the crate's tests.
+- Q2-Q5 and Q7 as recommended (javascript grammar for JS; character-column
+  helper lifted into the SDK in C1, python/rust adoption to backlog;
+  `ReceiverCall` sites recorded, `untypedCalls` off the wire until GM-325;
+  `plugin_version` and `package.json` 4.0.0). Q1, Q6, Q8 fall away or follow:
+  `bundled_manifest()` re-pointing is GM-351's, on the same branch; Rust
+  sources stay in `rust/` until GM-325/GM-351 delete the npm package, then
+  one `git mv` to `src/`.
+
 ## Appendix: how the facts were found
 
 g-mesh (project `g-mesh`, index of the main checkout at this commit's parent
