@@ -53,6 +53,11 @@ win when it sorts first.
   iterator before `.gitignore` is consulted, so they are reported in the link
   table even when ignored (never under an excluded directory name, which is
   not entered).
+- **Cost, measured** (release build, median of 20 interleaved walks, load
+  4-6): following links costs 0.5-1.3 ms per walk on link-free corpora
+  (ripgrep 4.8 -> 5.5 ms, py-requests 2.8 -> 4.2, gin 2.4 -> 3.0), 4.5 ms on
+  ripgrep with a link that re-enters `crates/` (same 100 files, deduplicated);
+  `g-mesh init` end to end is within noise (+3% real, user and sys flat).
 - **Core's walk does not follow links.** Under real-wins its file set is the
   plugins' minus the files reachable only through a link.
 - The SDK exposes what became of each link (`walk_project_detailed`:
