@@ -253,6 +253,7 @@ fn control_plane<E: Extractor>(
         project: None,
         index: SdkIndex::new(),
         engine: LazyEngine::new(&spec.language, semantic),
+        project_hydrated: false,
     };
     session.load_project();
 
@@ -361,6 +362,10 @@ struct Session<'a, E: Extractor> {
     project: Option<E::Project>,
     index: SdkIndex,
     engine: LazyEngine,
+    /// Whether this process has hydrated the whole project into `index`
+    /// (GM-487). Done once, by the first `semanticPass` of any scope, and
+    /// undone by `workspaceChanged`, which clears the index.
+    project_hydrated: bool,
 }
 
 impl<E: Extractor> Session<'_, E> {
@@ -412,7 +417,18 @@ impl<E: Extractor> Session<'_, E> {
                     .and_then(|paths| paths.as_array())
                     .map(|paths| paths.iter().filter_map(|path| path.as_str()).map(RelPath::new).collect())
                     .unwrap_or_default();
-                self.hydrate(&files);
+                // A per-file pass needs every file its answers can land in,
+                // not only its own (GM-487): an answer pointing into a file
+                // the index does not hold is dropped as "outside the index".
+                // So the first pass of this process hydrates the whole
+                // project, whatever its scope; after that, a per-file pass
+                // only adds what is new.
+                if files.is_empty() || !self.project_hydrated {
+                    self.project_hydrated = self.hydrate(&[]);
+                }
+                if !files.is_empty() {
+                    self.hydrate(&files);
+                }
                 let root = self.root.clone();
                 let answer = self.engine.answer(&files, &self.index, &root);
                 self.respond_to_pass(out, id, files.is_empty(), answer)
@@ -432,6 +448,7 @@ impl<E: Extractor> Session<'_, E> {
                     self.spec.language
                 );
                 self.index.clear();
+                self.project_hydrated = false;
                 self.load_project();
                 // And a running semantic engine must not trust its server's
                 // earlier readiness for the pass that follows (GM-433).
@@ -458,26 +475,32 @@ impl<E: Extractor> Session<'_, E> {
         }
     }
 
-    /// Makes sure the index holds what the semantic pass is about to be asked
-    /// about.
+    /// Makes sure the index holds `files` - the whole project when `files` is
+    /// empty - before the semantic pass is asked.
     ///
     /// The control-plane process never runs the bulk walk - that is a
     /// separate, one-shot process - so its index holds only the files it has
-    /// been sent a `fileChanged` for. That is enough for a *per-file* pass and
-    /// not nearly enough for the whole-project one core sends after the cold
-    /// walk, where the plugin would otherwise answer about the two files
-    /// someone happened to edit. So the files in scope are extracted here,
-    /// once, before the engine is asked. (The JS/TS plugin solves the same
-    /// problem by having its semantic pass walk the project itself.)
+    /// been sent a `fileChanged` for. That is not enough for any pass: a
+    /// per-file pass's answers point into other files, and an answer landing
+    /// in a file the index does not hold is dropped as "outside the index"
+    /// (GM-487); the whole-project pass core sends after the cold walk would
+    /// otherwise answer about the two files someone happened to edit. So the
+    /// caller hydrates the whole project once per process, and the files in
+    /// scope on every pass. (The JS/TS plugin solves the same problem by
+    /// having its semantic pass walk the project itself.)
     ///
     /// Gated on a semantic tier existing, and reached only from a
     /// `semanticPass`: a plugin with no engine, and a plugin doing structural
-    /// work, never pay for this. The extractions it adds are ordinary cache
-    /// entries - a later `fileChanged` for one of these files diffs against
-    /// it, which is correct and saves that file a re-extraction.
-    fn hydrate(&mut self, files: &[RelPath]) {
+    /// work, never pay for this. The extractions it adds are *unreported*
+    /// entries: core has not been told about them, so they are no diff
+    /// baseline - the next `fileChanged` for one of these files answers a
+    /// complete diff (see [`SdkIndex::baseline`]).
+    ///
+    /// Returns whether every file in scope was considered: `false` when there
+    /// is no engine, or no project model to extract against.
+    fn hydrate(&mut self, files: &[RelPath]) -> bool {
         if !self.engine.configured() {
-            return;
+            return false;
         }
         let scope: Vec<RelPath> = if files.is_empty() {
             walk_project(&self.root, &self.spec.extensions, &self.spec.exclude_dirs)
@@ -492,12 +515,13 @@ impl<E: Extractor> Session<'_, E> {
             if self.project.is_none() {
                 self.load_project();
             }
-            let Some(project) = self.project.as_ref() else { return };
+            let Some(project) = self.project.as_ref() else { return false };
             if let Some(graph) = extract_caught(self.extractor, project, &path, &source, &self.spec.language)
             {
-                self.index.insert(path, source, graph);
+                self.index.insert_unreported(path, source, graph);
             }
         }
+        true
     }
 
     /// Reparses one file against what this process last saw of it.
@@ -511,7 +535,7 @@ impl<E: Extractor> Session<'_, E> {
             // Gone, or unreadable: everything this plugin had for the file is
             // deleted. Forgetting it too means a re-creation is treated as a
             // first sighting rather than diffed against a stale baseline.
-            let diff = diff_file(self.index.graph(path), &FileGraph::default());
+            let diff = diff_file(self.index.baseline(path), &FileGraph::default());
             self.index.remove(path);
             return diff;
         };
@@ -519,8 +543,9 @@ impl<E: Extractor> Session<'_, E> {
         // Editors save unchanged buffers often enough for this to be worth a
         // string comparison: identical text cannot produce a different graph
         // from a pure extractor, so there is nothing to parse and nothing to
-        // say.
-        if self.index.source(path) == Some(source.as_str()) {
+        // say. Only against a reported entry: a hydrated one at the same text
+        // is still news to core (GM-487).
+        if self.index.entry(path).is_some_and(|entry| entry.reported && entry.source == source) {
             return FileChangeDiff::default();
         }
 
@@ -539,7 +564,7 @@ impl<E: Extractor> Session<'_, E> {
             return FileChangeDiff::default();
         };
 
-        let diff = diff_file(self.index.graph(path), &graph);
+        let diff = diff_file(self.index.baseline(path), &graph);
         self.index.insert(path.clone(), source, graph);
         diff
     }
@@ -852,6 +877,7 @@ mod tests {
             project: None,
             index: SdkIndex::new(),
             engine: LazyEngine::new("toy", Some(factory)),
+            project_hydrated: false,
         };
         // Only a started engine has a readiness to forget.
         session.engine.answer(&[], &SdkIndex::new(), &root);
@@ -927,6 +953,7 @@ mod tests {
             project: None,
             index: SdkIndex::new(),
             engine: LazyEngine::new("toy", Some(factory)),
+            project_hydrated: false,
         };
 
         let frame = serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "method": "prepareSemanticPass" });
