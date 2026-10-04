@@ -5,6 +5,7 @@ pub mod embedding;
 pub mod gc;
 pub mod graph;
 pub mod ipc;
+pub mod languages;
 pub mod mcp;
 pub mod paths;
 pub mod process;
