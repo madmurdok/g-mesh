@@ -501,8 +501,13 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
     }
     for edge in &diff.upsert_edges {
         tx.execute(
-            "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved, toDeclaration)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            // `linkedFrom` is NULL on insert and reset to NULL on conflict
+            // (GM-491): a re-sent edge describes what the plugin says now, so
+            // one it re-sends already resolved (a semantic upgrade) must not
+            // be moved by a later reopen of the placeholder it was once
+            // linked from.
+            "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved, toDeclaration, linkedFrom)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
              ON CONFLICT(id) DO UPDATE SET
                 fromId = excluded.fromId,
                 toId = excluded.toId,
@@ -510,7 +515,8 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
                 source = excluded.source,
                 engine = excluded.engine,
                 resolved = excluded.resolved,
-                toDeclaration = excluded.toDeclaration",
+                toDeclaration = excluded.toDeclaration,
+                linkedFrom = NULL",
             params![
                 edge.id,
                 edge.from_id,

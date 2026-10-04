@@ -2768,12 +2768,11 @@ fn gm490_a_typescript_named_reexport_that_leads_nowhere_still_shadows_the_glob()
 /// depth, both reach an `f`, and the call stays unresolved - in a whole pass
 /// and in incremental passes whichever way round the files arrive. Without
 /// the explicit import the star import alone links `pkg.b.f`, so the walk
-/// does reach the star import's item. Incrementally, `pkg.b.f` is also an
-/// allowed end state (linked before `pkg.a` exists); `pkg.a.f` never is.
-/// Not covered: an order where `pkg.a` and the call are in while `pkg.b` is
-/// not (`__init__`, `a`, `user`, then `b`) links `pkg.a.f`, the only `f` in
-/// the index, and `link_diff` never moves it when `pkg.b` arrives - an answer
-/// that worsens, outside `link_diff`'s contract and independent of the rule.
+/// does reach the star import's item. Incrementally the call ends unresolved
+/// too, whichever way round the files arrive: an order that links the only
+/// `f` in the index before the other arrives (`__init__`, `a`, `user`, then
+/// `b`, and its mirror) unlinks it again when the second `f` wakes the
+/// placeholder (GM-491).
 ///
 /// Control: make `Resolver::hops` tag every row `named_shadows_glob: true`
 /// (or add `"python"` to `bundled_rules`) - the call links `pkg.a.f`.
@@ -2787,25 +2786,16 @@ fn gm490_a_python_explicit_import_never_shadows_a_later_star_import() {
     assert!(!resolved, "linked {target}");
     assert_ne!(target, GM490_PY_A);
 
-    for order in [[0, 1, 2, 3], [0, 1, 3, 2], [3, 2, 1, 0]] {
+    // `diffs` is `[a, b, __init__, user]`; `[2, 0, 3, 1]` is the GM-491
+    // order and `[2, 1, 3, 0]` its mirror.
+    for order in [[0, 1, 2, 3], [0, 1, 3, 2], [3, 2, 1, 0], [2, 0, 3, 1], [2, 1, 3, 0]] {
         let mut incremental = setup();
         for index in order {
             apply_diff(&mut incremental, &diffs[index]).unwrap();
             link_diff(&mut incremental, &diffs[index]).unwrap();
-            let onto_a: i64 = incremental
-                .query_row(
-                    "SELECT COUNT(*) FROM edges WHERE id = ?1 AND toId = ?2",
-                    params![edge, GM490_PY_A],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(onto_a, 0, "file order {order:?}, after file {index}");
         }
-        // `pkg.b` arriving before `pkg.a` links the star import's item, and a
-        // later file never moves an edge that is already linked (the
-        // module doc's `link_diff`): Python's own answer, so also allowed.
         let (target, resolved) = edge_target(&incremental, &edge);
-        assert!(!resolved || target == GM490_PY_B, "file order {order:?} linked {target}");
+        assert!(!resolved, "file order {order:?} linked {target}");
     }
 
     let (diffs, edge) = gm490_python_diffs(false);

@@ -15,7 +15,9 @@
 //! `importedSymbol` in plugins/typescript/src/extract.ts). This module is the
 //! other half: it looks for the symbol the placeholder is waiting on among the
 //! nodes actually in the index and, when exactly one fits, repoints the edge
-//! and marks it `resolved`.
+//! and marks it `resolved`. A linked edge keeps the placeholder it came from
+//! in `edges.linkedFrom`, so a woken placeholder is decided again: its edge
+//! moves to a new answer or goes back onto the placeholder (GM-491).
 //!
 //! ## The address is a row, not a string
 //!
@@ -237,7 +239,8 @@
 //! per pass is not one per placeholder), joining each to its target by
 //! `placeholder_targets`' primary key. Everything after that is keyed:
 //!
-//!  - pending edge kinds and the repoint: `idx_edges_toId`;
+//!  - pending edge kinds, the repoint and the unlink: `idx_edges_toId`, and
+//!    `idx_edges_linkedFrom` for the edges a placeholder already linked;
 //!  - file-scope candidates: `idx_nodes_filePath`; container-scope ones by
 //!    name: `idx_nodes_container`; by qualifiedName: `idx_nodes_qualifiedName`
 //!    (the container columns are written `+language`/`+container` so the
@@ -661,17 +664,24 @@ pub fn link_all(conn: &mut Connection, rules: &LinkRules) -> Result<LinkSummary>
 /// placeholder it revisits that turns out not to be answerable is simply left
 /// as it was, so the only way to get one wrong is to *miss* a placeholder.
 ///
-/// Not covered, deliberately, and for the same reason `graph::imports` does
-/// not cover it: a symbol *deleted* from the project, and more generally any
-/// change that makes an already-linked edge's answer worse (a second
+/// A placeholder that is woken is decided again even if its edges were
+/// already linked: a linked edge keeps the placeholder it came from in
+/// `edges.linkedFrom`, so a change that makes its answer different (a second
 /// candidate appearing, a shallower declaration shadowing the linked one, a
-/// visibility narrowing). Linking only ever moves an edge that still hangs on
-/// its placeholder; edges into a deleted node go when something deletes it,
-/// and the importers' edges come back as fresh placeholders the next time
-/// those importers are reindexed. That is also the one sense in which this and
-/// [`link_all`] can disagree: on a sequence of diffs in which an answer only
-/// ever *improves*, the two produce the same edges (asserted by
-/// `link_all_and_link_diff_agree_on_the_same_end_state`).
+/// later provider through a star import) moves it to the new answer or
+/// unlinks it back onto its placeholder, as [`link`] describes (GM-491).
+///
+/// Not covered, deliberately, and for the same reason `graph::imports` does
+/// not cover it: anything that seeds no trigger, so wakes no placeholder.
+/// Two known cases: a symbol *deleted* from the project (edges into a deleted
+/// node go when something deletes it, and the importers' edges come back as
+/// fresh placeholders the next time those importers are reindexed), and a
+/// visibility narrowing, which publishes no scope. Those are the only sense
+/// in which this and [`link_all`] can disagree: whenever every change in a
+/// sequence of diffs seeds a trigger, the two produce the same edges
+/// (asserted by `link_all_and_link_diff_agree_on_the_same_end_state`).
+/// [`link_all`] re-decides every placeholder, linked or not, so its next run
+/// heals both.
 pub fn link_diff(conn: &mut Connection, diff: &Diff, rules: &LinkRules) -> Result<LinkSummary> {
     let mut ids: BTreeSet<String> = diff
         .upsert_nodes
@@ -1174,11 +1184,23 @@ fn requesters_below_new_containers(conn: &Connection, diff: &Diff) -> Result<Vec
 /// the two do not necessarily land on the same node - `export class Foo` and
 /// an overloaded `export function Foo` can coexist in one file.
 ///
-/// Idempotent, which is what makes it safe to run after every write: an edge
-/// that was already repointed no longer points at the placeholder, so a
-/// second pass finds nothing to move, and a reindex that resets one (a
-/// restarted plugin re-sends its full extraction, `resolved: false` and all)
-/// is simply linked again.
+/// Every placeholder it is handed is decided again, including one whose edges
+/// it already linked (GM-491). A linked edge keeps the placeholder it came
+/// from in `edges.linkedFrom`, so when a new provider wakes that placeholder
+/// the edge ends where [`link_all`] would leave it: moved to the new single
+/// answer, or - nothing found, nothing of the right kind, several equally good
+/// candidates - unlinked back onto its placeholder (`resolved = 0`,
+/// `linkedFrom` cleared). Edges still on the placeholder are left alone in
+/// that case. Without the provenance a repoint overwrote the only link back,
+/// and a woken placeholder was skipped as "already linked".
+///
+/// Idempotent, which is what makes it safe to run after every write: the
+/// repoint skips an edge already on the chosen target (`toId != ?target`), so
+/// an unchanged answer writes and counts nothing, and a reindex that resets an
+/// edge (a restarted plugin re-sends its full extraction, `resolved: false`
+/// and all, which also clears `linkedFrom`) is simply linked again.
+/// `linked_edges` counts edges moved onto a target, including moves from one
+/// target to another; unlinks are not counted.
 fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<LinkSummary> {
     let Pending { placeholders, untargeted } = pending;
     let mut summary = LinkSummary::default();
@@ -1190,12 +1212,22 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
     let tx = conn.transaction().context("failed to start the symbol-linking transaction")?;
     let untargeted_reexports;
     {
+        // The kinds still on the placeholder, and the kinds it already linked.
         let mut pending_kinds = tx
-            .prepare("SELECT DISTINCT kind FROM edges WHERE toId = ?1")
+            .prepare(
+                "SELECT kind FROM edges WHERE toId = ?1
+                 UNION SELECT kind FROM edges WHERE linkedFrom = ?1",
+            )
             .context("failed to prepare the pending-edge-kind scan")?;
         let mut repoint = tx
-            .prepare("UPDATE edges SET toId = ?1, resolved = 1 WHERE toId = ?2 AND kind = ?3")
+            .prepare(
+                "UPDATE edges SET toId = ?1, resolved = 1, linkedFrom = ?2
+                 WHERE (toId = ?2 OR linkedFrom = ?2) AND kind = ?3 AND toId != ?1",
+            )
             .context("failed to prepare the edge repoint")?;
+        let mut unlink = tx
+            .prepare("UPDATE edges SET toId = ?1, resolved = 0, linkedFrom = NULL WHERE linkedFrom = ?1 AND kind = ?2")
+            .context("failed to prepare the edge unlink")?;
         let mut resolver = Resolver::new(&tx, rules)?;
 
         for placeholder in placeholders {
@@ -1205,18 +1237,15 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
                 .collect::<rusqlite::Result<_>>()
                 .context("failed to collect a placeholder's edge kinds")?;
             if edge_kinds.is_empty() {
-                continue; // already linked, and nothing new points here
+                continue; // no usages, on the placeholder or linked from it
             }
 
+            // Empty when nothing is visible under that key, here or anywhere
+            // the scope forwards to: the scope is not in the index
+            // (gitignored, excluded, another language), does not offer it to
+            // this requester, or ends its chain somewhere that does not.
+            // Leaving the usage on its placeholder *is* the graceful fallback.
             let candidates = resolver.resolve(&placeholder)?;
-            // Nothing visible under that key, here or anywhere the scope
-            // forwards to: the scope is not in the index (gitignored,
-            // excluded, another language), does not offer it to this
-            // requester, or ends its chain somewhere that does not. Leaving
-            // the placeholder alone *is* the graceful fallback.
-            if candidates.is_empty() {
-                continue;
-            }
 
             for edge_kind in edge_kinds {
                 let Some(required) = required_target_kind(&edge_kind) else {
@@ -1230,20 +1259,28 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
                     })
                     .collect();
                 let target_id = match fitting.as_slice() {
-                    [candidate] => candidate.id.clone(),
-                    // Nothing of the right kind: a missing edge beats a wrong one.
-                    [] => continue,
-                    several => match resolver.sole_non_member(&placeholder.key, several)? {
-                        Some(candidate) => candidate.id.clone(),
-                        // Several equally good candidates: a missing edge
-                        // beats a wrong one.
-                        None => continue,
-                    },
+                    [candidate] => Some(candidate.id.clone()),
+                    // Nothing (of the right kind): a missing edge beats a wrong one.
+                    [] => None,
+                    // Several equally good candidates: a missing edge beats a
+                    // wrong one.
+                    several => resolver
+                        .sole_non_member(&placeholder.key, several)?
+                        .map(|candidate| candidate.id.clone()),
                 };
 
-                summary.linked_edges += repoint
-                    .execute(params![target_id, placeholder.id, edge_kind])
-                    .context("failed to repoint a usage edge")?;
+                match target_id {
+                    Some(target_id) => {
+                        summary.linked_edges += repoint
+                            .execute(params![target_id, placeholder.id, edge_kind])
+                            .context("failed to repoint a usage edge")?;
+                    }
+                    None => {
+                        unlink
+                            .execute(params![placeholder.id, edge_kind])
+                            .context("failed to unlink a usage edge")?;
+                    }
+                }
             }
         }
         untargeted_reexports = resolver.untargeted_reexports.len();
