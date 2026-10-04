@@ -986,4 +986,205 @@ mod tests {
         assert!(lines[2].contains("\"DEFINES\""), "{:?}", lines[2]);
         assert!(lines[3].contains("\"EXPORTS\""), "{:?}", lines[3]);
     }
+
+    // --- GM-487: a per-file pass hydrates the whole project -----------------
+
+    /// Declares one public function named after its file's stem, so every
+    /// extraction has nodes a diff can carry.
+    struct Declares;
+
+    impl crate::Extractor for Declares {
+        const LANGUAGE: &'static str = "toy";
+        type Project = ();
+
+        fn load_project(&self, _root: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn extract(&self, _project: &(), path: &RelPath, source: &str) -> FileGraph {
+            use crate::graph::{FileGraphBuilder, NodeSpec};
+            use g_mesh_wire::{NodeKind, Position, Range};
+
+            let mut builder = FileGraphBuilder::new("toy", "toy-parser", path);
+            let range = Range { start: Position { line: 0, col: 0 }, end: Position { line: 1, col: 0 } };
+            builder.file_node(range);
+            let name = path.as_str().trim_end_matches(".toy").to_string();
+            // The source's text is part of the signature, so two versions of
+            // one file extract to different graphs.
+            builder.add_node(
+                NodeSpec::new(NodeKind::Function, name.clone(), name, range)
+                    .signature(source.trim())
+                    .public(),
+            );
+            builder.finish()
+        }
+    }
+
+    /// An engine that records the paths its index held on each pass.
+    struct Recording {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<RelPath>>>>,
+    }
+
+    impl crate::semantic::SemanticEngine for Recording {
+        fn answer(&mut self, _files: &[RelPath], index: &SdkIndex) -> anyhow::Result<SemanticAnswer> {
+            self.seen.lock().unwrap().push(index.paths());
+            Ok(SemanticAnswer::complete(FileChangeDiff::default()))
+        }
+    }
+
+    /// A scratch project of `files` on disk, removed on drop.
+    struct Project(PathBuf);
+
+    impl Project {
+        fn new(tag: &str, files: &[(&str, &str)]) -> Self {
+            let dir = std::env::temp_dir().join(format!("g-mesh-run-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (path, text) in files {
+                std::fs::write(dir.join(path), text).unwrap();
+            }
+            Project(dir)
+        }
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Sends one request to `session` and returns its `result`.
+    fn request(
+        session: &mut Session<'_, Declares>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let frame =
+            serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "id": 1, "method": method, "params": params });
+        let mut out = Vec::new();
+        session.handle(frame.to_string().as_bytes(), &mut out).unwrap();
+        let written = String::from_utf8(out).unwrap();
+        let (_, body) = written.split_once("\r\n\r\n").expect("one framed response");
+        let response: serde_json::Value = serde_json::from_str(body).unwrap();
+        response["result"].clone()
+    }
+
+    /// A fresh control-plane session over `root`, with a [`Recording`] engine.
+    fn fresh_session<'a>(
+        spec: &'a ResolvedSpec,
+        root: &Path,
+        seen: &std::sync::Arc<std::sync::Mutex<Vec<Vec<RelPath>>>>,
+    ) -> Session<'a, Declares> {
+        let seen = std::sync::Arc::clone(seen);
+        let factory: crate::semantic::SemanticEngineFactory = Box::new(move |_root| {
+            Ok(Box::new(Recording { seen: std::sync::Arc::clone(&seen) })
+                as Box<dyn crate::semantic::SemanticEngine>)
+        });
+        Session {
+            extractor: &Declares,
+            spec,
+            root: root.to_path_buf(),
+            project: None,
+            index: SdkIndex::new(),
+            engine: LazyEngine::new("toy", Some(factory)),
+            project_hydrated: false,
+        }
+    }
+
+    fn toy_spec() -> ResolvedSpec {
+        ResolvedSpec::resolve_from(&PluginSpec::new("toy", "0.0.0", &[".toy"]), None)
+    }
+
+    /// GM-487 Fix 1: the first per-file `semanticPass` of a process hands its
+    /// engine an index holding the whole project, so an answer landing in
+    /// another file has a node to land on.
+    ///
+    /// Control: drop the `self.hydrate(&[])` call in the `"semanticPass"` arm
+    /// and the engine sees `a.toy` alone.
+    #[test]
+    fn a_per_file_pass_hands_its_engine_the_whole_project() {
+        let project = Project::new("hydrate", &[("a.toy", "a v1\n"), ("b.toy", "b v1\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+
+        request(&mut session, "semanticPass", serde_json::json!({ "filePaths": ["a.toy"] }));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one pass, one answer");
+        assert_eq!(
+            seen[0],
+            vec![RelPath::new("a.toy"), RelPath::new("b.toy")],
+            "the per-file pass's index holds every file of the project"
+        );
+    }
+
+    /// GM-487 Fix 1's baseline hazard: a file a semantic pass hydrated from
+    /// disk is news to core, so the `fileChanged` that follows - here at the
+    /// very text that was hydrated - answers a complete diff carrying the
+    /// file's nodes, not "nothing changed".
+    ///
+    /// Control: make `SdkIndex::insert_unreported` record `reported: true`
+    /// (or restore the plain `source ==` short-cut in `file_changed`) and the
+    /// diff is empty.
+    #[test]
+    fn a_file_changed_after_hydration_sends_a_complete_diff() {
+        let project = Project::new("baseline", &[("a.toy", "a v1\n"), ("b.toy", "b v2\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+
+        request(&mut session, "semanticPass", serde_json::json!({ "filePaths": ["a.toy"] }));
+        assert!(session.index.entry(&RelPath::new("b.toy")).is_some(), "the pass hydrated b.toy");
+
+        let diff: FileChangeDiff = serde_json::from_value(request(
+            &mut session,
+            "fileChanged",
+            serde_json::json!({ "filePath": "b.toy" }),
+        ))
+        .unwrap();
+        assert!(diff.complete, "a hydrated entry is no baseline: {diff:#?}");
+        assert!(
+            diff.upsert_nodes.iter().any(|node| node.name == "b" && node.file_path == "b.toy"),
+            "the diff carries b.toy's nodes: {diff:#?}"
+        );
+
+        // Reported now: the same text again is the ordinary short-cut.
+        let again: FileChangeDiff = serde_json::from_value(request(
+            &mut session,
+            "fileChanged",
+            serde_json::json!({ "filePath": "b.toy" }),
+        ))
+        .unwrap();
+        assert!(crate::is_empty_diff(&again), "a reported entry is a baseline again: {again:#?}");
+    }
+
+    /// The same hazard on a deletion: a hydrated file removed from disk
+    /// answers a complete (empty) diff, so core drops whatever it holds for
+    /// the file rather than only the nodes this process hydrated.
+    ///
+    /// Control: diff the deletion against `self.index.graph(path)` instead of
+    /// `self.index.baseline(path)` in `file_changed` and the diff is not
+    /// `complete`.
+    #[test]
+    fn a_hydrated_file_deleted_from_disk_sends_a_complete_diff() {
+        let project = Project::new("deleted", &[("a.toy", "a v1\n"), ("b.toy", "b v1\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut session = fresh_session(&spec, &project.0, &seen);
+
+        request(&mut session, "semanticPass", serde_json::json!({ "filePaths": ["a.toy"] }));
+        assert!(session.index.entry(&RelPath::new("b.toy")).is_some(), "the pass hydrated b.toy");
+        std::fs::remove_file(project.0.join("b.toy")).unwrap();
+
+        let diff: FileChangeDiff = serde_json::from_value(request(
+            &mut session,
+            "fileChanged",
+            serde_json::json!({ "filePath": "b.toy" }),
+        ))
+        .unwrap();
+        assert!(diff.complete, "a deletion of a hydrated file replaces all core holds for it: {diff:#?}");
+        assert!(diff.upsert_nodes.is_empty(), "{diff:#?}");
+        assert!(session.index.entry(&RelPath::new("b.toy")).is_none());
+    }
 }
