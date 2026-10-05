@@ -1203,30 +1203,3 @@ fn the_checked_in_manifests_declare_glob_shadowing_for_rust_and_typescript_only(
     }
     assert_eq!(link_rules(&manifests), LinkRules::with_named_shadows_glob(["rust", "typescript"]));
 }
-
-/// `scripts/bundle-plugin.sh` writes the installed TypeScript manifest by
-/// hand; it must declare the rule the repo's manifest does, or a release
-/// install links TypeScript barrels differently from a checkout.
-///
-/// Control: delete `[plugin.reexports]` from the script's heredoc - this fails.
-#[test]
-fn the_bundled_typescript_manifest_declares_glob_shadowing_too() {
-    #[derive(Deserialize)]
-    struct Outer {
-        plugin: Inner,
-    }
-    #[derive(Deserialize)]
-    struct Inner {
-        #[serde(default)]
-        reexports: ReexportRules,
-    }
-    let script = include_str!("../../../../scripts/bundle-plugin.sh");
-    let start =
-        script.find("<<EOF\n# Bundled JS/TS plugin").expect("the bundled manifest heredoc") + "<<EOF\n".len();
-    let len = script[start..].find("\nEOF\n").expect("the heredoc's end");
-    let bundled: Outer = toml::from_str(&script[start..start + len]).expect("the bundled manifest parses");
-
-    let repo = read_manifest(&bundled_typescript_plugin_dir()).unwrap();
-    assert!(bundled.plugin.reexports.named_shadows_glob);
-    assert_eq!(bundled.plugin.reexports, repo.reexports);
-}

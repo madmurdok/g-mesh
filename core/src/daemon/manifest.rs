@@ -510,12 +510,6 @@ pub(crate) fn query_tables_of(contents: &str) -> Result<(NonSymbolShapes, Symbol
     Ok((outer.plugin.non_symbol_queries, outer.plugin.symbol_query_prefixes))
 }
 
-/// [`query_tables_of`]'s `[plugin.non_symbol_queries]` alone.
-#[cfg(test)]
-pub(crate) fn non_symbol_queries_of(contents: &str) -> Result<NonSymbolShapes> {
-    query_tables_of(contents).map(|(shapes, _)| shapes)
-}
-
 /// Discovery's output: every plugin found, keyed by language, plus the
 /// extension routing table derived from them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
