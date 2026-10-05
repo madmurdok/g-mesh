@@ -255,10 +255,13 @@ fn error_cause(error: &str) -> String {
     format!("{}...", &cause[..end])
 }
 
-/// Replaces each space-separated token that is an absolute (`/...`) or
-/// home-relative (`~/...`) path by its last component, keeping the
-/// punctuation around it: `(/private/tmp/x/plugin.js)` becomes
-/// `(plugin.js)`. Anything else is left as it is.
+/// Replaces each space-separated token that is an absolute (`/...`,
+/// Windows `C:\...` or `C:/...`, UNC `\\server\...`) or home-relative
+/// (`~/...`) path by its last component, keeping the punctuation around it:
+/// `(/private/tmp/x/plugin.js)` becomes `(plugin.js)`. Anything else is left
+/// as it is. Windows forms are recognised on every host, so a stored error
+/// from either OS shortens the same way and the Windows arm is testable
+/// anywhere.
 fn shorten_paths(text: &str) -> String {
     const OPEN: &[char] = &['(', '[', '"', '\'', '`'];
     const CLOSE: &[char] = &[')', ']', '"', '\'', '`', ',', ';', ':', '.'];
@@ -267,14 +270,33 @@ fn shorten_paths(text: &str) -> String {
             let start = token.len() - token.trim_start_matches(OPEN).len();
             let end = token.trim_end_matches(CLOSE).len().max(start);
             let path = &token[start..end];
-            let rooted = path.strip_prefix('/').or_else(|| path.strip_prefix("~/"));
-            match rooted.and_then(|rest| rest.rsplit('/').find(|part| !part.is_empty())) {
+            let name = match windows_rooted(path) {
+                Some(rest) => rest.rsplit(['\\', '/']).find(|part| !part.is_empty()),
+                None => path
+                    .strip_prefix('/')
+                    .or_else(|| path.strip_prefix("~/"))
+                    .and_then(|rest| rest.rsplit('/').find(|part| !part.is_empty())),
+            };
+            match name {
                 Some(name) => format!("{}{name}{}", &token[..start], &token[end..]),
                 None => token.to_string(),
             }
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The part of `path` after a Windows root - a drive (`C:\`, `C:/`) or a
+/// UNC/extended-length prefix (`\\`) - or `None` when `path` has neither.
+fn windows_rooted(path: &str) -> Option<&str> {
+    if let Some(rest) = path.strip_prefix("\\\\") {
+        return Some(rest);
+    }
+    let mut chars = path.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(drive), Some(':'), Some('\\' | '/')) if drive.is_ascii_alphabetic() => Some(&path[3..]),
+        _ => None,
+    }
 }
 
 fn install_command(language: &str) -> String {
