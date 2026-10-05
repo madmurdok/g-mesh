@@ -92,10 +92,9 @@
 //!
 //! `stream-order`, `same-file-rule` and `ownership.diff-stays-in-file` read
 //! the *structural* stream only. A semantic answer is allowed to cross files:
-//! the TS plugin's re-export upgrade re-sends an existing edge with a real
+//! the TS plugin's (former) re-export upgrade re-sends an existing edge with a real
 //! `toId` in another file and sends that target node along
-//! (`plugins/typescript/src/semanticPass.ts`, "Why the first emits a
-//! placeholder and the second a real node id"), and `apply_diff` commits it by
+//! (a placeholder first, then a real node id), and `apply_diff` commits it by
 //! id. The constraint the design states is "edges never leave their file *in
 //! the structural stream*". Shape, ownership of `language`/containers/
 //! `DEFINES`, and `deleteNodeIds` still apply to every diff.

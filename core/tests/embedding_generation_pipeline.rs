@@ -49,7 +49,7 @@ fn only_the_bundled_plugin() -> DiscoveredPlugins {
 /// structural nodes the plugin always emits alongside them (a `File` node
 /// for `src/lib.ts`, notably). The JS/TS plugin fills a `Function` node's
 /// `signature` unconditionally, doc comment or not (see
-/// `plugins/typescript/src/extract.ts`), so *every* function here has embeddable
+/// `plugins/typescript/src/extractor/emit.rs`), so *every* function here has embeddable
 /// text - `bare`'s off its signature alone. The real "nothing to embed" case
 /// in this fixture is the `File` node itself, which carries neither field;
 /// see [`the_file_node_has_no_doc_comment_or_signature_and_is_not_embedded`].

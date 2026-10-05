@@ -146,7 +146,7 @@ func markSemanticEngineStarted() {
 	file, err := os.OpenFile(filepath.Join(dir, semanticEngineMarker), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		// A conformance-run diagnostic only - never worth failing a pass
-		// over, exactly as plugins/typescript/src/semantic.ts treats its own.
+		// over, as the other plugins treat their own.
 		return
 	}
 	defer file.Close()

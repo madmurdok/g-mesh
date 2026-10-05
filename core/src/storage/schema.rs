@@ -276,7 +276,7 @@ CREATE TABLE IF NOT EXISTS declarations (
 -- one, which is every edge the structural pass produces and every edge whose
 -- target has a single declaration - i.e. almost all of them. Set only on
 -- CALLS, only by the semantic pass, and part of the edge's own identity (see
--- `edgeIdFor` in plugins/typescript/src/extract.ts), so one caller calling two
+-- `edge_id` in plugins/sdk/src/ids.rs), so one caller calling two
 -- overloads of the same function stores both bindings instead of one
 -- overwriting the other.
 -- `source` was the two-value pair `'tree-sitter' | 'ts-compiler'` through
@@ -371,7 +371,7 @@ CREATE TABLE IF NOT EXISTS containers (
 -- `PlaceholderTarget` struct at all - `apply_diff` fills it from the
 -- placeholder node's own `filePath`, which is already the requester's file
 -- by the existing convention (a placeholder's `filePath` is the *importing*
--- file - `importedSymbol` in plugins/typescript/src/extract.ts).
+-- file - `imported_symbol` in plugins/typescript/src/extractor/imports.rs).
 CREATE TABLE IF NOT EXISTS placeholder_targets (
     nodeId        TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
     scopeKind     TEXT NOT NULL CHECK (scopeKind IN ('file', 'container')),

@@ -5,7 +5,7 @@
 //!
 //! Scoped in full in `docs/architecture/g-mesh-v1.md` ("Computed import
 //! specifiers") and pinned at the extraction level by
-//! `plugins/typescript/test/extract.test.ts` - this test closes the gap those unit
+//! `plugins/typescript/tests/imports.rs` - this test closes the gap those unit
 //! fixtures leave open: nothing there goes through a real daemon or a real
 //! MCP tool call, so nothing proves the boundary survives contact with the
 //! actual query surface an agent uses. Purely structural, like

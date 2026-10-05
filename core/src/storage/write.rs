@@ -6,8 +6,8 @@ use crate::protocol::types::QualifiedPath;
 use crate::storage::qualified_path;
 
 /// One declaration of a symbol that has several - a row of the `declarations`
-/// table (see `storage::schema`). Mirrors the plugin's `SymbolDeclaration`
-/// (plugins/typescript/src/extract.ts) field for field, which is also the wire
+/// table (see `storage::schema`). Mirrors the wire
+/// `WireDeclaration` (wire/src/lib.rs) field for field, which is also the wire
 /// shape (`protocol::types::WireDeclaration`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclarationRecord {

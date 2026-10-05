@@ -12,7 +12,7 @@
 //!
 //! Instead the plugin emits a placeholder `Module` node marked
 //! [`PENDING_SYMBOL_NATIVE_KIND`] and hangs the usage edge on that (see
-//! `importedSymbol` in plugins/typescript/src/extract.ts). This module is the
+//! `imported_symbol` in plugins/typescript/src/extractor/imports.rs). This module is the
 //! other half: it looks for the symbol the placeholder is waiting on among the
 //! nodes actually in the index and, when exactly one fits, repoints the edge
 //! and marks it `resolved`. A linked edge keeps the placeholder it came from
@@ -196,7 +196,7 @@
 //! "Unresolved" is not always the last word on these. The JS/TS plugin's
 //! semantic pass re-asks the ones whose target file does not declare the name
 //! of the compiler itself and re-sends the edge with `source: "ts-compiler"`
-//! when it gets a single answer (`plugins/typescript/src/semanticPass.ts`).
+//! when it gets a single answer (the TS plugin's former semantic pass).
 //! Two `export *` branches offering one name are ambiguous *here* and settled
 //! in the language, which hands a consumer the first branch to offer it; and
 //! `default` is a name no file ever declares, while `definition` at the

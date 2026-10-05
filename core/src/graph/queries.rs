@@ -343,7 +343,7 @@ pub fn find_by_name(conn: &Connection, name: &str, file_path: Option<&str>) -> R
 /// `kind`. But `kind = 'Module'` refused more than those five - a TypeScript
 /// `namespace` is a real declaration, with a `DEFINES` edge from its file and
 /// members of its own, stored as `kind: "Module", nativeKind: "namespace"`
-/// (plugins/typescript/src/extract.ts). Before this change, asking this rung
+/// (plugins/typescript/src/extractor/decls.rs). Before this change, asking this rung
 /// for a name that only a namespace in some file carried came back empty;
 /// `tests::a_namespace_stored_as_kind_module_is_still_offered` and
 /// `tests::an_import_record_stored_as_a_non_module_kind_is_still_excluded`
@@ -1026,7 +1026,7 @@ mod tests {
 
     /// The control for the test above, and GM-376's other discrimination
     /// case: a real declaration stored as `kind: "Module"` - a TypeScript
-    /// `namespace` is the shape (`plugins/typescript/src/extract.ts`) - used
+    /// `namespace` is the shape (`plugins/typescript/src/extractor/decls.rs`) - used
     /// to be refused here too, by the `kind IS NOT 'Module'` clause this task
     /// removed. It must still be offered once that clause is gone, or the
     /// fold traded one leak for a new exclusion.

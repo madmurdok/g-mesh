@@ -42,10 +42,7 @@ pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// The flush is not optional: both peers block reading the answer to what was
 /// just written, so a message left in a `BufWriter` is a deadlock with a
 /// timeout on it.
-pub(crate) fn write_message<T: serde::Serialize + ?Sized, W: Write>(
-    out: &mut W,
-    message: &T,
-) -> io::Result<()> {
+pub fn write_message<T: serde::Serialize + ?Sized, W: Write>(out: &mut W, message: &T) -> io::Result<()> {
     let body = serde_json::to_vec(message).map_err(io::Error::other)?;
     out.write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())?;
     out.write_all(&body)?;
@@ -57,7 +54,7 @@ pub(crate) fn write_message<T: serde::Serialize + ?Sized, W: Write>(
 /// Headers other than `Content-Length` are ignored rather than rejected: LSP
 /// servers send `Content-Type`, and a header this side does not know is not a
 /// reason to stop reading a stream it can otherwise parse exactly.
-pub(crate) fn read_frame<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
+pub fn read_frame<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
     let mut length: Option<usize> = None;
     let mut started = false;
     loop {

@@ -80,7 +80,7 @@
 
 mod columns;
 mod diff;
-mod framing;
+pub mod framing;
 mod graph;
 mod hold;
 pub mod ids;

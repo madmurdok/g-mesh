@@ -2,7 +2,7 @@
 //!
 //! # The contract, copied deliberately from `plugins/typescript`
 //!
-//! `plugins/typescript/src/incremental.ts` is the behavioural reference, and
+//! The original Node TS plugin's incremental diff was the behavioural reference, and
 //! this is the same algorithm with the same three deliberate choices:
 //!
 //! 1. **Keyed by id, refined by content.** An id present on both sides whose

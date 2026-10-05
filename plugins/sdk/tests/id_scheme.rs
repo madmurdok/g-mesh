@@ -4,8 +4,8 @@
 //! `ids`' module doc specifies the scheme in bytes. That specification is
 //! worth nothing unless the two implementations that exist agree on it, so
 //! every case below pins this crate's answer against the id
-//! `plugins/typescript`'s own `nodeIdFor`/`edgeIdFor`
-//! (`plugins/typescript/src/extract.ts`) produced for the same tuple, on
+//! the original Node TS plugin's own `nodeIdFor`/`edgeIdFor`
+//! produced for the same tuple, on
 //! 2026-09-16, by calling those functions directly on the built plugin:
 //!
 //! ```text
