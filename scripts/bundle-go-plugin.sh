@@ -12,16 +12,15 @@
 # packaging a whole release.
 #
 # ---------------------------------------------------------------------------
-# WHY THIS NEEDS NO NATIVE RUNNER, UNLIKE scripts/bundle-plugin.sh
+# WHY THIS NEEDS NO NATIVE RUNNER
 #
-# The JS/TS plugin embeds the host's own Node runtime (Node SEA), so it can
-# only be built on the platform it targets - that is why build-targets.sh
-# builds each release target on its own runner. The Go plugin carries no
+# Core and the cargo plugins (JS/TS, Rust, Python) compile C for their target
+# (SQLite, tree-sitter grammars), which is why build-targets.sh builds each
+# release target on its own runner. The Go plugin carries no C and no
 # runtime at all: `CGO_ENABLED=0` plus `GOOS`/`GOARCH` produces a static,
 # self-contained binary for any target from any host (see
 # docs/architecture/multi-language-plugins.md's Go plugin "Distribution"
-# line), so this script - unlike bundle-plugin.sh - never refuses a
-# non-host target.
+# line), so this script never refuses a non-host target.
 #
 # ---------------------------------------------------------------------------
 # THE WINDOWS GAP THIS SCRIPT CLOSES (GM-283)
@@ -50,15 +49,15 @@
 # fallback - rather than on a manifest whose `command` names the file that
 # is actually staged beside it - is not a bet worth making for a release
 # archive, so this script generates a manifest whose `command` matches its
-# own target's real binary name, the same way bundle-plugin.sh writes an
-# installed-specific manifest for the TS plugin rather than reusing the
-# checkout's unmodified one.
+# own target's real binary name, the same way the cargo plugins' bundlers
+# write an installed-specific manifest rather than reusing the checkout's
+# unmodified one.
 #
 # The generated manifest is derived from plugins/go/plugin.toml by rewriting
 # only the `[plugin.spawn] command` line, not hand-duplicated field-by-field
-# the way bundle-plugin.sh's TS manifest is: the Go plugin's installed and
-# dev-checkout manifests agree on every other field, so one substitution
-# keeps them from drifting apart instead of restating them twice.
+# (the way the TS plugin's Node-era manifest once was): the Go plugin's
+# installed and dev-checkout manifests agree on every other field, so one
+# substitution keeps them from drifting apart instead of restating them twice.
 #
 # Environment:
 #   GO_BIN  the Go binary to build with (default: `go` on PATH)

@@ -65,8 +65,8 @@ that explanation rather than letting you install 50MB that cannot exec.
 archive, **verifies its SHA-256 before unpacking anything** (a mismatch aborts
 with both hashes printed and installs nothing), runs the downloaded binary once
 to prove it executes and discovers its plugin, and only then installs. It needs
-neither Rust nor Node.js: the archive carries the core binary and a plugin with
-its own embedded runtime.
+neither Rust nor Node.js: the archive carries the core binary and every bundled
+plugin as a native binary.
 
 What lands on disk is a *directory*, not one file — by default `~/.g-mesh/bin`:
 
@@ -330,10 +330,9 @@ Each archive holds a complete install, not just the binary:
 g-mesh-v<version>-<triple>/
   g-mesh                                  the core binary
   plugins/typescript/
-    g-mesh-plugin-typescript              the JS/TS plugin, runtime included
-    node_modules/                         its native tree-sitter grammars
+    g-mesh-plugin-typescript[.exe]        the JS/TS plugin - a plain cargo
+                                           binary, no runtime to embed
     plugin.toml                           how core discovers and spawns it
-    LICENSE-nodejs                        the embedded runtime's notice
   plugins/go/
     g-mesh-plugin-go[.exe]                the Go plugin - one static,
                                            CGO-free binary cross-compiled for
@@ -355,35 +354,32 @@ three — `scripts/bundle-go-plugin.sh` cross-compiles it
 (`CGO_ENABLED=0 GOOS=... GOARCH=...`) into one static binary for any target
 from any host, and writes an installed `plugin.toml` naming that binary.
 
-The Rust plugin (GM-288) needs no bundling step like the JS/TS one's Node
-SEA — `scripts/bundle-rust-plugin.sh` just builds `plugins/rust` for the
-target with `cargo build --target <triple>`, the same way `build-targets.sh`
-already builds core, and writes an installed `plugin.toml` naming the binary
-it staged. The Python plugin (GM-298) ships the same way, via
+The JS/TS, Rust and Python plugins are cargo binaries in core's own
+workspace. `scripts/bundle-plugin.sh` (JS/TS, GM-326),
+`scripts/bundle-rust-plugin.sh` (GM-288) and `scripts/bundle-python-plugin.sh`
+(GM-298) each build their crate for the target with
+`cargo build --target <triple>`, the same way `build-targets.sh` already
+builds core, and write an installed `plugin.toml` naming the binary they
+staged. The Python plugin ships via
 `scripts/bundle-python-plugin.sh` — it is a tree-sitter-based structural
 extractor written in Rust, not a program run by a Python interpreter, so
 **no Python interpreter is required on the machine being indexed** for the
 structural tier it ships today. A future semantic tier over `pyright` would
 need `pyright` installed separately, the same way the TypeScript plugin's
-semantic tier needs the project's own `node_modules/typescript`.
+semantic tier needs `vtsls`.
 
-**No Node.js required.** The plugin is compiled with [Node's single-executable
-application](https://nodejs.org/api/single-executable-applications.html)
-support (`scripts/bundle-plugin.sh`), so it embeds its own JS runtime. Indexing
-— the whole structural graph — works on a machine with no Node installed.
+**No Node.js required for indexing.** The JS/TS plugin is a native binary
+(tree-sitter grammars linked in), so the whole structural graph is built on a
+machine with no Node installed. The archive does *not* carry a TypeScript
+language server: the semantic pass that upgrades unresolved edges drives
+`vtsls`, found on `PATH`, in the indexed project's own `node_modules/.bin`, or
+through `npx --yes --package @vtsls/language-server vtsls` — each of which
+needs Node.js. Without one the semantic pass is skipped and every structural
+edge is still indexed.
 
-The one thing the archive does *not* carry is a TypeScript compiler. The
-semantic pass that upgrades unresolved edges drives `tsserver`, and it
-deliberately prefers **the project's own** `node_modules/typescript` so a
-project is analyzed by the compiler it builds with; the plugin's embedded
-runtime is what executes it, so this too needs no system Node. A project with
-no TypeScript installed at all simply gets no semantic upgrade — every
-structural edge is still indexed. To cover that case, drop a `typescript`
-package into `node_modules/` beside the plugin executable.
-
-Building an archive requires Node 20+ on the build machine, and each archive
-must be built on the platform it targets: a single-executable plugin embeds the
-build machine's own Node runtime and cannot be cross-built.
+Building an archive needs Rust and Go, not Node, and each archive is built on
+the platform it targets, because core and the cargo plugins compile C (SQLite,
+Oniguruma, tree-sitter grammars) for that target.
 
 ### Cutting a release
 

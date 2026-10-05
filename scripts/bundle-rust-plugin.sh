@@ -20,11 +20,8 @@
 # already builds core for a target: `rustup target add`, then `cargo build
 # --target <target>` from the crate's own directory, on whichever runner that
 # target's row in .github/workflows/release.yml runs on. That is a deliberate
-# choice not to invent a second mechanism the way the other two bundlers each
-# had to:
-#   - scripts/bundle-plugin.sh (JS/TS) embeds the *host's own* Node runtime
-#     (Node SEA), so it can only ever be built on the platform it targets -
-#     there is no cross-build option for it at all.
+# choice not to invent a second mechanism (since GM-326 the JS/TS plugin's
+# scripts/bundle-plugin.sh builds the same way, replacing its Node SEA):
 #   - A hypothetical GOOS/GOARCH-style cross-compile (the shape
 #     scripts/bundle-go-plugin.sh uses on the Go plugin, when that plugin
 #     exists in this branch's history) would technically also work here -
@@ -34,9 +31,9 @@
 #     the existing native release matrix. One mechanism, reused, is the
 #     point.
 #
-# This script therefore does not refuse a non-host target the way
-# bundle-plugin.sh does (there is no runtime to embed that would make that
-# refusal correct), but it also does not promise a non-host target will link:
+# This script therefore does not refuse a non-host target (there is no
+# runtime to embed that would make that refusal correct), but it also does
+# not promise a non-host target will link:
 # whether `cargo build --target <target>` succeeds from a given host is
 # exactly the same question it is for core, answered the same way (a native
 # runner per target in CI; the one proven exception - macOS x86_64 ->
@@ -73,9 +70,8 @@
 # derived from that file with only its `command` line rewritten to `./<exe
 # name staged beside it>` - the same one-substitution pattern
 # scripts/bundle-go-plugin.sh uses for the Go plugin's installed manifest and
-# scripts/bundle-plugin.sh hand-writes field-by-field for the TS plugin -
-# chosen over hand-duplicating every other field because the checked-in file
-# is the one place `[plugin.languages]`/`[plugin.capabilities]`/
+# scripts/bundle-plugin.sh for the TS plugin's - chosen over hand-duplicating
+# every other field because the checked-in file is the one place `[plugin.languages]`/`[plugin.capabilities]`/
 # `[plugin.workspace]` are declared, and a second, independently maintained
 # copy of them is exactly the drift this substitution avoids.
 #

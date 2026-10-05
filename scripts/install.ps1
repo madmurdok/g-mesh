@@ -161,7 +161,7 @@ $ErrorActionPreference = 'Stop'
 # is correct. It downloads, verifies the checksum, unpacks, runs the binary
 # once (the same smoke test install.sh does - see Install-GMesh below), and
 # puts it on PATH. None of that depends on what plugins\typescript\ contains
-# internally - whether it is a Node SEA or, later, a native binary - only on
+# internally (a native cargo binary since GM-326, a Node SEA before) - only on
 # the archive's shape, which install.sh already establishes and this script
 # inherits unchanged. Proof that the artifact this script installs actually
 # works end to end on a real Windows machine is GM-333's job (a release
