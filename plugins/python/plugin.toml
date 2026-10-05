@@ -81,6 +81,12 @@ semantic_sweep = true
 # every call site; the gap list is the promise.
 receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
+# The project model answers "is `pkg.mod` one of ours" and decides the `src/`
+# root from the set of files the walk listed, so every created file of one
+# watcher batch must be in it before the first of them is extracted - an
+# importer and the module it imports, created together, then link on the
+# first extraction (docs/adr/0026-batch-created-files-notification.md).
+files_created = true
 
 # How to start pyright. Read by *this plugin*, never by core - core has no use
 # for the fields and validating them would make a typo here take the

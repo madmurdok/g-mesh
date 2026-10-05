@@ -5,8 +5,9 @@
 //! # Scope: this is GM-295, not GM-296
 //!
 //! This module answers "what is the package tree" - a question about the
-//! project as a whole, asked once per [`Extractor::load_project`] and again
-//! on every `workspaceChanged`. It does not answer "what does this file
+//! project as a whole, built once per [`Extractor::load_project`] (again on
+//! every `workspaceChanged`) and kept current between loads by
+//! [`ProjectContext::file_presence_changed`]. It does not answer "what does this file
 //! declare" - that is per-file, asked on every `extract`, and it is
 //! tree-sitter-python's job (GM-296), not this one's. The seam between the
 //! two is [`ProjectContext::container_for`], exactly the seam
@@ -278,16 +279,22 @@
 //! `pkg.sub` is a container key, or a prefix of one, among the files the walk
 //! found.
 //!
-//! The failure direction is the safe one. A container this model never saw -
-//! a module created since the last `load`, a file the walk could not read -
-//! is answered `false`, so the extractor emits an `external_module` node and
-//! the import simply does not link: a missing edge, never a wrong one. The
-//! opposite mistake is impossible, because the set is built from files that
-//! really exist.
+//! The set follows the files: a module created or deleted after `load` is
+//! added or removed by [`ProjectContext::file_presence_changed`], which core
+//! calls for every created file of a watcher batch before the first of them
+//! is extracted (`plugin.toml`'s `files_created`), so an importer created in
+//! the same batch as its module links on its first extraction. What is left
+//! is the safe failure direction. A container this model never saw - a file
+//! the walk could not read, or one `.gitignore` hides - is answered `false`,
+//! so the extractor emits an `external_module` node and the import simply
+//! does not link: a missing edge, never a wrong one. The opposite mistake is
+//! impossible, because the set is built from files that really exist. An
+//! importer extracted *before* its module was created keeps its
+//! `external_module` until it is extracted again.
 
 mod pyproject;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use g_mesh_plugin_sdk::{walk_project, RelPath};
@@ -379,25 +386,38 @@ pub enum ContainerInfo {
 /// expected to consume it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectContext {
+    /// Deepest (most specific) first - see this module's doc, Decision 4.
     roots: Vec<Root>,
+    /// The roots `pyproject.toml` declares, deduplicated, in the order its
+    /// hints named them. Empty when it declares none, and then `roots` is a
+    /// function of `files` (the `src/` heuristic or the fallback root) that
+    /// [`ProjectContext::file_presence_changed`] keeps current. Read only on
+    /// `load`: a `pyproject.toml` edit reaches this model through
+    /// `workspaceChanged`, never through a presence change.
+    declared_roots: Vec<RelPath>,
     files: BTreeMap<RelPath, ContainerInfo>,
     /// Every dotted key this project's files make addressable, each file's
     /// own key together with every ancestor package of it - see this module's
-    /// doc, Decision 8, and [`ProjectContext::has_container`].
+    /// doc, Decision 8, and [`ProjectContext::has_container`] - with the
+    /// number of files that make it so.
     ///
     /// Ancestors are materialized rather than computed by prefix-matching at
     /// lookup time because a prefix match is wrong in one direction that
     /// matters: `pkg.subtle` starts with `pkg.sub` as a *string* and is not
     /// under it as a *package*. Storing `pkg` and `pkg.sub` as their own
-    /// entries makes the question an exact set membership, which cannot get
-    /// that case wrong.
-    containers: BTreeSet<String>,
-    /// Everything this load could not honestly resolve - a `pyproject.toml`
-    /// that would not parse. Never fatal, the same "a project model with
-    /// notes is still a complete, deterministic answer for everything it
-    /// *could* resolve" rule `plugins/rust/src/project::ProjectContext`
-    /// documents for itself.
-    notes: Vec<String>,
+    /// entries makes the question an exact membership, which cannot get
+    /// that case wrong. The count is what lets a deleted file take a key
+    /// away only when it was the last file to provide it (`pkg/mod.py` beside
+    /// `pkg/mod.pyi`, or `pkg` beside any other module of `pkg`).
+    containers: BTreeMap<String, usize>,
+    /// What `pyproject.toml` could not honestly give - one that would not
+    /// parse. Never fatal, the same "a project model with notes is still a
+    /// complete, deterministic answer for everything it *could* resolve"
+    /// rule `plugins/rust/src/project::ProjectContext` documents for itself.
+    config_notes: Vec<String>,
+    /// What one file could not honestly be keyed as (an `__init__` directly
+    /// under a root), by path, so a deleted file takes its note with it.
+    file_notes: BTreeMap<RelPath, Vec<String>>,
 }
 
 impl ProjectContext {
@@ -406,46 +426,111 @@ impl ProjectContext {
     /// hands it). Called once by `--bulk-index`, and again on every
     /// `workspaceChanged` - see `crate::main`'s module doc and the SDK's own
     /// `run::Session::load_project`, which is what actually calls this again
-    /// after a `pyproject.toml` edit; nothing in this module watches the
-    /// filesystem itself.
+    /// after a `pyproject.toml` edit. Between two loads the file set is kept
+    /// current by [`file_presence_changed`](Self::file_presence_changed);
+    /// nothing in this module watches the filesystem itself.
     ///
     /// Never fails. A project with no Python files at all, or no
     /// `pyproject.toml`, still yields a complete (if minimal) model - see
     /// this module's doc, Decision 4, for the fallback root that makes that
     /// true.
     pub fn load(root: &Path) -> anyhow::Result<Self> {
-        let mut notes = Vec::new();
+        let mut config_notes = Vec::new();
         let extensions = vec![PY_EXTENSION.to_string(), PYI_EXTENSION.to_string()];
         let exclude: Vec<String> = EXCLUDE_DIRS.iter().map(|dir| (*dir).to_string()).collect();
         let walked = walk_project(root, &extensions, &exclude);
 
-        let mut root_dirs: Vec<RelPath> = Vec::new();
-        for hint in pyproject::root_hints(root, &mut notes) {
-            push_unique(&mut root_dirs, hint);
+        let mut declared_roots: Vec<RelPath> = Vec::new();
+        for hint in pyproject::root_hints(root, &mut config_notes) {
+            push_unique(&mut declared_roots, hint);
         }
-        if root_dirs.is_empty() && has_src_layout(&walked) {
-            push_unique(&mut root_dirs, RelPath::new("src"));
-        }
-        if root_dirs.is_empty() {
-            root_dirs.push(RelPath::new(""));
-        }
-        // Deepest (most specific) first, so a file under more than one
-        // root's directory resolves to the more specific one - see this
-        // module's doc, Decision 4.
-        root_dirs.sort_by(|a, b| depth(b).cmp(&depth(a)).then_with(|| a.as_str().cmp(b.as_str())));
+        let mut context = Self { declared_roots, config_notes, ..Self::default() };
+        context.rebuild(walked);
+        Ok(context)
+    }
 
-        let mut files = BTreeMap::new();
-        let mut containers = BTreeSet::new();
-        for path in &walked {
-            let info = match owning_root(&root_dirs, path) {
-                Some(root_dir) => container_info_for(path, root_dir, &mut notes),
-                None => ContainerInfo::Orphan { key: orphan_key(path) },
-            };
-            register_container(&mut containers, &info);
-            files.insert(path.clone(), info);
+    /// Records that `path` now exists (`present`) or no longer does, so the
+    /// next `extract` resolves against the current file set with no reload -
+    /// the SDK's [`Extractor::file_presence_changed`](g_mesh_plugin_sdk::Extractor::file_presence_changed),
+    /// and `docs/adr/0023-project-model-tracks-file-presence.md`.
+    ///
+    /// The model afterwards is the one [`load`](Self::load) would build over
+    /// the new file set (with the same `pyproject.toml`): the file's own
+    /// container, every ancestor key [`has_container`](Self::has_container)
+    /// answers, and the roots themselves, because with no `pyproject.toml`
+    /// hint the `src/` layout is decided by whether any file sits under
+    /// `src/` - the first one created there re-roots the project and the
+    /// last one deleted un-roots it, re-keying every file, exactly as a
+    /// reload would. No other file's container moves otherwise: a key is a
+    /// pure function of a path and its root, so a created `__init__.py`
+    /// turns a namespace package into a regular one without touching its
+    /// modules.
+    ///
+    /// Idempotent in both directions, touches no disk, never panics. A path
+    /// the walk would never list - not `.py`/`.pyi`, or under an excluded
+    /// directory - is ignored, as `load` would ignore it. `.gitignore` is the
+    /// one walk rule this cannot see; core's watcher applies it before the
+    /// path gets here.
+    pub fn file_presence_changed(&mut self, path: &RelPath, present: bool) {
+        let claimed = matches!(path.extension().as_deref(), Some(PY_EXTENSION | PYI_EXTENSION));
+        if !claimed || path_is_excluded(path) {
+            return;
         }
+        if present {
+            if self.files.contains_key(path) {
+                return;
+            }
+            self.insert(path.clone());
+        } else if !self.remove(path) {
+            return;
+        }
+        if self.declared_roots.is_empty() {
+            // `src/` sorts contiguously, so the first path at or after it
+            // answers whether any file is under it.
+            let under_src = self.files.range(RelPath::new("src/")..).map(|(path, _)| path).take(1);
+            if resolve_roots(&self.declared_roots, under_src) != self.roots {
+                let paths: Vec<RelPath> = self.files.keys().cloned().collect();
+                self.rebuild(paths);
+            }
+        }
+    }
 
-        Ok(Self { roots: root_dirs.into_iter().map(|dir| Root { dir }).collect(), files, containers, notes })
+    /// Recomputes the roots from `paths` and keys every one of them against
+    /// those roots - the whole of `load` after its walk and `pyproject.toml`
+    /// read, so a presence change that moves the roots ends in the same
+    /// model a reload would.
+    fn rebuild(&mut self, paths: Vec<RelPath>) {
+        self.roots = resolve_roots(&self.declared_roots, paths.iter());
+        self.files.clear();
+        self.containers.clear();
+        self.file_notes.clear();
+        for path in paths {
+            self.insert(path);
+        }
+    }
+
+    /// Keys `path` against the current roots and records it.
+    fn insert(&mut self, path: RelPath) {
+        let mut notes = Vec::new();
+        let info = match owning_root(&self.roots, &path) {
+            Some(root_dir) => container_info_for(&path, root_dir, &mut notes),
+            None => ContainerInfo::Orphan { key: orphan_key(&path) },
+        };
+        register_container(&mut self.containers, &info);
+        if !notes.is_empty() {
+            self.file_notes.insert(path.clone(), notes);
+        }
+        self.files.insert(path, info);
+    }
+
+    /// Forgets `path`; `false` when it was not recorded.
+    fn remove(&mut self, path: &RelPath) -> bool {
+        let Some(info) = self.files.remove(path) else {
+            return false;
+        };
+        unregister_container(&mut self.containers, &info);
+        self.file_notes.remove(path);
+        true
     }
 
     /// Whether `key` names a module or package **of this project** - the
@@ -455,7 +540,8 @@ impl ProjectContext {
     /// third-party distribution or the standard library, which core never
     /// links).
     ///
-    /// Answered from the package tree [`load`](Self::load) already walked -
+    /// Answered from the package tree [`load`](Self::load) walked, as kept
+    /// current by [`file_presence_changed`](Self::file_presence_changed) -
     /// see this module's doc, Decision 8, for why that is the only honest
     /// source and why a `false` answer can only ever cost a missing edge.
     /// A `.pyi` stub contributes its key here even though it contributes no
@@ -464,15 +550,14 @@ impl ProjectContext {
     /// resolves onto an empty container is a truthful "we have this module
     /// and it declares nothing we indexed".
     pub fn has_container(&self, key: &str) -> bool {
-        self.containers.contains(key)
+        self.containers.contains_key(key)
     }
 
-    /// Every root this project model found, in the order [`load`](Self::load)
-    /// resolved them (deepest/most specific first - see this module's doc,
-    /// Decision 4). Named `roots`, not `packages` (compare
-    /// `plugins/rust/src/project::ProjectContext::crates`) because one root
-    /// is a `sys.path` entry that may hold many top-level packages and
-    /// modules, not a single compiled unit the way a Rust crate is.
+    /// Every root this project model found, deepest/most specific first -
+    /// see this module's doc, Decision 4. Named `roots`, not `packages`
+    /// (compare `plugins/rust/src/project::ProjectContext::crates`) because
+    /// one root is a `sys.path` entry that may hold many top-level packages
+    /// and modules, not a single compiled unit the way a Rust crate is.
     pub fn roots(&self) -> &[Root] {
         &self.roots
     }
@@ -480,11 +565,12 @@ impl ProjectContext {
     /// The container `path` belongs to - see [`ContainerInfo`]. Always
     /// answers something: every `.py`/`.pyi` file is a module, a package's
     /// own file, a stub, or an orphan, never neither. A `path` this model
-    /// never saw during [`load`](Self::load) (the extension is claimed but
-    /// the file did not exist, or was created since) is answered exactly as
-    /// if it had been walked - the same "always answers" guarantee
-    /// `plugins/rust/src/project::ProjectContext::container_for` documents
-    /// for itself, and for the same reason: `fileChanged` calls this too.
+    /// does not hold (the extension is claimed but the file does not exist,
+    /// or its creation has not been reported) is answered exactly as if it
+    /// had been walked against the current roots - the same "always answers"
+    /// guarantee `plugins/rust/src/project::ProjectContext::container_for`
+    /// documents for itself, and for the same reason: `fileChanged` calls
+    /// this too.
     ///
     /// A path under [`EXCLUDE_DIRS`] (or the SDK's own
     /// [`g_mesh_plugin_sdk::BASELINE_EXCLUDED_DIRS`]) is answered as an
@@ -502,18 +588,16 @@ impl ProjectContext {
             return ContainerInfo::Orphan { key: orphan_key(path) };
         }
         let mut discard = Vec::new();
-        let mut root_dirs: Vec<RelPath> = self.roots.iter().map(|root| root.dir.clone()).collect();
-        root_dirs.sort_by(|a, b| depth(b).cmp(&depth(a)).then_with(|| a.as_str().cmp(b.as_str())));
-        match owning_root(&root_dirs, path) {
+        match owning_root(&self.roots, path) {
             Some(root_dir) => container_info_for(path, root_dir, &mut discard),
             None => ContainerInfo::Orphan { key: orphan_key(path) },
         }
     }
 
-    /// Everything this load could not honestly resolve - see this struct's
-    /// own field doc.
-    pub fn notes(&self) -> &[String] {
-        &self.notes
+    /// Everything this model could not honestly resolve: what
+    /// `pyproject.toml` could not give, then each file's, in path order.
+    pub fn notes(&self) -> Vec<String> {
+        self.config_notes.iter().chain(self.file_notes.values().flatten()).cloned().collect()
     }
 }
 
@@ -528,18 +612,35 @@ fn push_unique(root_dirs: &mut Vec<RelPath>, dir: RelPath) {
     }
 }
 
-/// Whether the walk found at least one `.py`/`.pyi` file under a top-level
+/// Whether at least one of `paths` is a `.py`/`.pyi` file under a top-level
 /// `src/` directory - see this module's doc, Decision 4, for why an empty or
 /// absent `src/` must not become a root.
-fn has_src_layout(walked: &[RelPath]) -> bool {
-    walked.iter().any(|path| path.as_str().starts_with("src/"))
+fn has_src_layout<'a>(mut paths: impl Iterator<Item = &'a RelPath>) -> bool {
+    paths.any(|path| path.as_str().starts_with("src/"))
+}
+
+/// The roots a project with `declared` `pyproject.toml` roots and the files
+/// `paths` has, deepest (most specific) first so a file under more than one
+/// root's directory resolves to the more specific one - see this module's
+/// doc, Decision 4. `paths` is read only when nothing is declared.
+fn resolve_roots<'a>(declared: &[RelPath], paths: impl Iterator<Item = &'a RelPath>) -> Vec<Root> {
+    let mut root_dirs = declared.to_vec();
+    if root_dirs.is_empty() && has_src_layout(paths) {
+        root_dirs.push(RelPath::new("src"));
+    }
+    if root_dirs.is_empty() {
+        root_dirs.push(RelPath::new(""));
+    }
+    root_dirs.sort_by(|a, b| depth(b).cmp(&depth(a)).then_with(|| a.as_str().cmp(b.as_str())));
+    root_dirs.into_iter().map(|dir| Root { dir }).collect()
 }
 
 /// Whether any directory segment of `path` is one [`walk_project`] would
 /// never descend into - [`EXCLUDE_DIRS`] or the SDK's own
-/// [`g_mesh_plugin_sdk::BASELINE_EXCLUDED_DIRS`]. Only [`ProjectContext::container_for`]'s
-/// fallback for a path [`ProjectContext::load`] never walked needs this -
-/// every path the walk itself produced already satisfies it by construction.
+/// [`g_mesh_plugin_sdk::BASELINE_EXCLUDED_DIRS`]. Only a path that did not
+/// come from the walk needs this - [`ProjectContext::container_for`]'s
+/// fallback and [`ProjectContext::file_presence_changed`] - every path the
+/// walk itself produced already satisfies it by construction.
 fn path_is_excluded(path: &RelPath) -> bool {
     let (dirs, _) = path.as_str().rsplit_once('/').unwrap_or(("", path.as_str()));
     dirs.split('/').any(|segment| {
@@ -549,7 +650,7 @@ fn path_is_excluded(path: &RelPath) -> bool {
 
 /// The number of path segments in `dir` - `0` for `""` (the project root),
 /// `1` for `"src"`, `2` for `"src/pkg"`. Used only to sort roots deepest
-/// first; see [`ProjectContext::load`].
+/// first; see [`resolve_roots`].
 fn depth(dir: &RelPath) -> usize {
     if dir.as_str().is_empty() {
         0
@@ -561,8 +662,8 @@ fn depth(dir: &RelPath) -> usize {
 /// The most specific root in `root_dirs` (already sorted deepest first)
 /// whose directory contains `path`, or `None` if none does - see this
 /// module's doc, Decision 4/5.
-fn owning_root<'a>(root_dirs: &'a [RelPath], path: &RelPath) -> Option<&'a RelPath> {
-    root_dirs.iter().find(|dir| is_under(dir, path))
+fn owning_root<'a>(roots: &'a [Root], path: &RelPath) -> Option<&'a RelPath> {
+    roots.iter().map(|root| &root.dir).find(|dir| is_under(dir, path))
 }
 
 /// Whether `path` sits at or under directory `dir` - `dir == ""` matches
@@ -666,21 +767,44 @@ fn orphan_key(path: &RelPath) -> String {
 /// `orphan:<path>`, which by construction is not a dotted name any `import`
 /// statement can spell, so recording it could only ever make a nonsense
 /// import look like one of ours.
-fn register_container(containers: &mut BTreeSet<String>, info: &ContainerInfo) {
+fn register_container(containers: &mut BTreeMap<String, usize>, info: &ContainerInfo) {
+    for prefix in key_prefixes(info) {
+        *containers.entry(prefix).or_insert(0) += 1;
+    }
+}
+
+/// Undoes one [`register_container`] of `info`: a key leaves the set only
+/// when no other file still provides it.
+fn unregister_container(containers: &mut BTreeMap<String, usize>, info: &ContainerInfo) {
+    for prefix in key_prefixes(info) {
+        if let Some(count) = containers.get_mut(&prefix) {
+            *count -= 1;
+            if *count == 0 {
+                containers.remove(&prefix);
+            }
+        }
+    }
+}
+
+/// `info`'s dotted key and every package above it (`pkg`, `pkg.sub`,
+/// `pkg.sub.mod`), each once; nothing for an orphan.
+fn key_prefixes(info: &ContainerInfo) -> Vec<String> {
     let key = match info {
         ContainerInfo::Module { key, .. }
         | ContainerInfo::Package { key, .. }
         | ContainerInfo::Stub { key } => key.as_str(),
-        ContainerInfo::Orphan { .. } => return,
+        ContainerInfo::Orphan { .. } => return Vec::new(),
     };
+    let mut prefixes = Vec::new();
     let mut prefix = String::new();
     for segment in key.split('.') {
         if !prefix.is_empty() {
             prefix.push('.');
         }
         prefix.push_str(segment);
-        containers.insert(prefix.clone());
+        prefixes.push(prefix.clone());
     }
+    prefixes
 }
 
 #[cfg(test)]
@@ -1078,5 +1202,75 @@ mod tests {
             context.container_for(&RelPath::new("pkg/new_module.py")),
             module("pkg.new_module", Some("pkg"), "new_module")
         );
+    }
+
+    // --- file_presence_changed ------------------------------------------------
+
+    /// Reports `path` created (writing it first) or deleted (removing it
+    /// after), then asserts the model equals a fresh `load` of the tree.
+    fn presence(tree: &Tree, context: &mut ProjectContext, path: &str, present: bool) {
+        if present {
+            tree.write(path, "");
+        } else {
+            std::fs::remove_file(tree.0.join(path)).unwrap();
+        }
+        context.file_presence_changed(&RelPath::new(path), present);
+        assert_eq!(*context, ProjectContext::load(&tree.0).unwrap(), "after {path} present={present}");
+    }
+
+    #[test]
+    fn presence_changes_end_in_the_model_a_fresh_load_builds() {
+        let tree = Tree::new("presence");
+        tree.write("pkg/__init__.py", "");
+        tree.write("app.py", "");
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+        presence(&tree, &mut context, "pkg/new.py", true);
+        assert!(context.has_container("pkg.new"));
+        presence(&tree, &mut context, "pkg/new.pyi", true);
+        presence(&tree, &mut context, "pkg/new.py", false);
+        assert!(context.has_container("pkg.new"), "the stub still provides the key");
+        presence(&tree, &mut context, "pkg/new.pyi", false);
+        assert!(!context.has_container("pkg.new"));
+        presence(&tree, &mut context, "ns/deep/mod.py", true);
+        assert!(context.has_container("ns.deep"));
+        presence(&tree, &mut context, "ns/deep/__init__.py", true);
+        presence(&tree, &mut context, "src/lib/mod.py", true);
+        assert_eq!(context.roots(), &[Root { dir: RelPath::new("src") }]);
+        assert!(context.has_container("lib.mod") && !context.has_container("pkg"));
+        presence(&tree, &mut context, "src/lib/mod.py", false);
+        assert_eq!(context.roots(), &[Root { dir: RelPath::new("") }]);
+        presence(&tree, &mut context, "__init__.py", true);
+        assert_eq!(context.notes().len(), 1);
+        presence(&tree, &mut context, "__init__.py", false);
+    }
+
+    #[test]
+    fn a_repeated_or_unwalkable_presence_change_changes_nothing() {
+        let tree = Tree::new("presence-idem");
+        tree.write("pkg/mod.py", "");
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+        let loaded = context.clone();
+        context.file_presence_changed(&RelPath::new("pkg/mod.py"), true);
+        context.file_presence_changed(&RelPath::new("pkg/gone.py"), false);
+        context.file_presence_changed(&RelPath::new(".venv/lib/x.py"), true);
+        context.file_presence_changed(&RelPath::new("pkg/readme.md"), true);
+        assert_eq!(context, loaded);
+        presence(&tree, &mut context, "pkg/b.py", true);
+        context.file_presence_changed(&RelPath::new("pkg/b.py"), true);
+        presence(&tree, &mut context, "pkg/b.py", false);
+        context.file_presence_changed(&RelPath::new("pkg/b.py"), false);
+        assert_eq!(context, loaded);
+    }
+
+    #[test]
+    fn declared_roots_do_not_move_with_the_files() {
+        let tree = Tree::new("presence-declared");
+        tree.write("pyproject.toml", "[tool.poetry]\npackages = [{ include = \"pkg\", from = \"lib\" }]\n");
+        tree.write("lib/pkg/__init__.py", "");
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+        presence(&tree, &mut context, "src/other.py", true);
+        assert_eq!(context.roots(), &[Root { dir: RelPath::new("lib") }]);
+        presence(&tree, &mut context, "lib/pkg/mod.py", true);
+        assert!(context.has_container("pkg.mod"));
     }
 }
