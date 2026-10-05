@@ -60,29 +60,34 @@ pub fn string_literal_value(node: Node, source: &str) -> Option<String> {
 /// type arguments dropped (`Base<T>` -> `Base`), qualified names kept whole
 /// (`NS.Base`).
 pub fn heritage_names(clause: Node, source: &str) -> Vec<String> {
-    fn collect(node: Node, source: &str, names: &mut Vec<String>) {
+    heritage_name_tokens(clause).into_iter().map(|token| text(token, source).to_string()).collect()
+}
+
+/// The token each of [`heritage_names`] is the text of, in the same order.
+pub fn heritage_name_tokens(clause: Node) -> Vec<Node> {
+    fn collect<'t>(node: Node<'t>, tokens: &mut Vec<Node<'t>>) {
         match node.kind() {
             "extends_clause" | "implements_clause" => {
                 for child in named_children(node) {
-                    collect(child, source, names);
+                    collect(child, tokens);
                 }
             }
             "generic_type" => {
                 if let Some(name) = node.child_by_field_name("name") {
-                    names.push(text(name, source).to_string());
+                    tokens.push(name);
                 }
             }
             "identifier" | "type_identifier" | "nested_type_identifier" | "member_expression" => {
-                names.push(text(node, source).to_string());
+                tokens.push(node);
             }
             _ => {}
         }
     }
-    let mut names = Vec::new();
+    let mut tokens = Vec::new();
     for child in named_children(clause) {
-        collect(child, source, &mut names);
+        collect(child, &mut tokens);
     }
-    names
+    tokens
 }
 
 /// Whether a declaration carries an implementation. A `const` or class-field

@@ -33,7 +33,7 @@ use crate::extractor::model::{FileModel, NodeParams, PendingSupertype};
 use crate::extractor::scope::{block_scope, type_parameter_scope, Scope};
 use crate::extractor::syntax::{
     child_of_kind, children, doc_comment_for, function_signature, has_body, has_child_of_kind,
-    heritage_names, method_native_kind, named_children, string_literal_value, text,
+    heritage_name_tokens, heritage_names, method_native_kind, named_children, string_literal_value, text,
 };
 
 /// Node types a class can be written as.
@@ -296,6 +296,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         let qualified = qualified_in(&scope.prefix, name, MemberSeparator::Dot);
         let body = node.child_by_field_name("body");
         let heritage = child_of_kind(node, "class_heritage");
+        let supertype_tokens = heritage.map(heritage_name_tokens).unwrap_or_default();
         let supertype_names =
             heritage.map(|heritage| heritage_names(heritage, self.source)).unwrap_or_default();
 
@@ -320,7 +321,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         params.doc_comment = doc_comment_for(outer, self.source);
         params.exported = exported;
         let index = self.model.declare_symbol(params);
-        self.record_supertypes(index, &supertype_names, scope);
+        self.record_supertypes(index, &supertype_tokens, scope);
 
         let member_scope = type_parameter_scope(
             node,
@@ -366,9 +367,10 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         let index = self.model.declare_symbol(params);
 
         let extends_clause = child_of_kind(node, "extends_type_clause");
+        let supertype_tokens = extends_clause.map(heritage_name_tokens).unwrap_or_default();
         let supertype_names =
             extends_clause.map(|clause| heritage_names(clause, self.source)).unwrap_or_default();
-        self.record_supertypes(index, &supertype_names, scope);
+        self.record_supertypes(index, &supertype_tokens, scope);
         let member_scope = type_parameter_scope(
             node,
             self.source,
@@ -617,13 +619,14 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
 
     /// Each heritage name of type node `index`, a `SUPERTYPE_OF` edge once
     /// every declaration and import is known.
-    fn record_supertypes(&mut self, index: usize, names: &[String], scope: &Scope) {
+    fn record_supertypes(&mut self, index: usize, tokens: &[Node<'t>], scope: &Scope) {
         let from_id = self.model.node(index).id.clone();
-        for name in names {
+        for token in tokens {
             self.uses.supertypes.push(PendingSupertype {
                 from_id: from_id.clone(),
-                name: name.clone(),
+                name: self.text(*token).to_string(),
                 scope: scope.clone(),
+                at: *token,
             });
         }
     }

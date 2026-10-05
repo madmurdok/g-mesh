@@ -6,6 +6,8 @@
 //!
 //! - [`extractor`]: one file's structural graph, from tree-sitter.
 //! - [`project`]: the project model the extractor reads.
+//! - [`semantic`]: the language-server tier, vtsls on the SDK's LSP bridge.
 
 pub mod extractor;
 pub mod project;
+pub mod semantic;

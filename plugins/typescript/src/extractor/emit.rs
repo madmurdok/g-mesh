@@ -5,8 +5,9 @@
 //! is the bare resolved path) rather than the one
 //! [`FileGraphBuilder::add_placeholder`] would derive from its target. Nodes
 //! and edges are pushed in the draft's insertion order, then the open sites.
-//! Receiver-call sites are never folded into `untypedCalls`: that field would
-//! change what core stores and what the caller pages say.
+//! Receiver-call sites with no `replaces` are folded into their enclosing
+//! node's `untypedCalls`, so a file whose semantic pass has not answered them
+//! says it may be missing those calls.
 
 use g_mesh_plugin_sdk::wire::{QualifiedPath, SourceTier, Visibility};
 use g_mesh_plugin_sdk::{EdgeSpec, FileGraph, FileGraphBuilder, NodeSpec, RelPath};
@@ -23,6 +24,7 @@ pub fn flush(
     syntax_errors: bool,
 ) -> FileGraph {
     let mut builder = FileGraphBuilder::new(language, engine, path);
+    builder.record_untyped_receiver_calls();
     let open_sites = model.take_open_sites();
     let (nodes, edges) = model.into_parts();
     for node in nodes {

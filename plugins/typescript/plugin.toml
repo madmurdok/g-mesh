@@ -10,9 +10,10 @@
 # the directory of the running g-mesh executable, as for plugins/python and
 # plugins/rust.
 #
-# Structural tier only, for now: `semantic_pass = false` below. Semantics come
-# with the language-server tier on the SDK's LSP bridge, which adds
-# `[plugin.semantic]` and turns `semantic_pass` back on.
+# Two tiers: tree-sitter structure, and semantics from vtsls on the SDK's LSP
+# bridge (`[plugin.semantic]` below, src/semantic.rs). Without a usable vtsls
+# the semantic pass is an empty, incomplete diff and the structural tier
+# answers alone.
 
 [plugin]
 language = "typescript"
@@ -29,25 +30,54 @@ command = "${G_MESH_BIN_DIR}/g-mesh-plugin-typescript"
 extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
 
 [plugin.capabilities]
-# Off until the language-server tier lands: core never sends this plugin a
-# semanticPass request, and the structural tier answers alone.
-semantic_pass = false
-# Off: meaningless while `semantic_pass` is off, and kept off until the
-# semantic tier states that a whole-project pass re-sends every edge it stands
-# behind (ADR 0008, section 3).
+# On whether or not a server is installed: the plugin answers every
+# semanticPass, with an empty incomplete diff when vtsls cannot be found.
+semantic_pass = true
+# Off until the semantic tier states that a whole-project pass re-sends every
+# edge it stands behind (ADR 0008, section 3).
 semantic_sweep = false
 # The project model resolves imports against the set of files the walk listed,
 # so every created file of one watcher batch must be in it before the first of
 # them is extracted (docs/adr/0026-batch-created-files-notification.md).
 files_created = true
-# Receiver calls (`x.foo()`) stay unresolved: the structural tier has no type
-# information to know what `x` is, and there is no semantic tier yet. Honest
-# gap, not a missing feature this manifest should overclaim - see
+# Receiver calls (`x.foo()`, and `this.m()` / `super.m()` with no member of
+# that name in this file) are resolved by the semantic tier, which asks the
+# server where each one lands. The structural tier alone has no type for `x`,
+# so its own declaration stays "unresolved", and a file reports such calls in
+# `untypedCalls` until a pass answers them - see
 # docs/architecture/multi-language-plugins.md's `plugin.toml additions`
-# section for what core does with an "unresolved" declaration (lists the gap
-# in the MCP instructions rather than silently under-reporting call sites).
-receiver_calls = "unresolved"
+# section for what core does with each value.
+receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
+
+[plugin.semantic]
+# A bare name: a `PATH` lookup, then the indexed project's own
+# `node_modules/.bin`, then `npx --yes --package @vtsls/language-server vtsls`.
+# Each candidate is proved by `<candidate> --version` under a budget before it
+# runs. Point this at a specific binary and it is used as written, probed and
+# not searched around. The project's own `typescript` is never used: see
+# docs/architecture/gm-325-typescript-lsp-semantics.md, section 2.
+command = "vtsls"
+args = ["--stdio"]
+engine = "vtsls"
+# tsserver loads a project when one of its files is opened; there is no
+# workspace index to wait for before the first question. An empty answer
+# while that load runs is re-asked once the server is quiet (section 3).
+readiness = "on-demand"
+# `overload_disambiguation` stays at its default, "none": vtsls's
+# `definition` already names the bound overload at an overloaded call.
+# No implementation sweep: the server's implementations are transitive, and
+# the structural tier already records the direct ones.
+implementation_kinds = []
+
+# vtsls asks `workspace/configuration` for one section named "" and reads its
+# VS Code settings from that object. `useSyntaxServer = "never"` runs one
+# tsserver: with the default, "auto", a syntax-only server answers while the
+# project loads, and its `definition` of an imported name is the import
+# itself - a non-empty wrong answer the bridge cannot tell from a right one.
+# A single server instead holds the question until the project is loaded.
+[plugin.semantic.settings.""]
+typescript.tsserver.useSyntaxServer = "never"
 
 [plugin.grammars]
 # Which tree-sitter grammar parses which extension. Read by this plugin's tests

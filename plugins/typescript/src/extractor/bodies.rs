@@ -14,8 +14,9 @@
 //!   (innermost namespace outwards), else the `pending_symbol` placeholder of
 //!   an import. `this.m()` binds a member of the enclosing type, `super.m()`
 //!   one of a supertype declared here, `Owner.m()` and `new Owner()` one of a
-//!   type or namespace declared here. Class members are never reached by bare
-//!   name. A `CALLS` edge always targets a `Function` or a `pending_symbol`;
+//!   type or namespace declared here; a `this.m()` / `super.m()` that binds
+//!   nothing here is a receiver-call open site. Class members are never
+//!   reached by bare name. A `CALLS` edge always targets a `Function` or a `pending_symbol`;
 //!   any other target is a `REFERENCES` edge.
 //! - **Heritage.** Each name a class's `extends`/`implements` or an
 //!   interface's `extends` writes is a `SUPERTYPE_OF` edge from the subtype
@@ -45,12 +46,15 @@ use crate::extractor::syntax::named_children;
 /// resolved once it is over, and the call sites resolution produces.
 #[derive(Debug, Default)]
 pub struct UseState<'t> {
-    pub(super) supertypes: Vec<PendingSupertype>,
+    pub(super) supertypes: Vec<PendingSupertype<'t>>,
     calls: Vec<PendingCall<'t>>,
-    references: Vec<PendingReference>,
+    references: Vec<PendingReference<'t>>,
     pub(super) member_accesses: Vec<PendingMemberAccess<'t>>,
     /// Every call that produced a `CALLS` edge, in resolution order.
     pub(super) call_sites: Vec<CallSite>,
+    /// The edges onto a `pending_symbol` placeholder that already have a
+    /// hop site: one question per edge, at its first use.
+    pub(super) hop_edges: HashSet<String>,
 }
 
 impl<'a, 's, 't> Declarer<'a, 's, 't> {
@@ -265,6 +269,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         self.uses.references.push(PendingReference {
             name: self.text(node).to_string(),
             scope: scope.clone(),
+            at: node,
             type_position: node.kind() == "type_identifier",
         });
     }
@@ -289,7 +294,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
             self.resolve_call(&call);
         }
         for reference in std::mem::take(&mut self.uses.references) {
-            self.resolve_reference(&reference.name, &reference.scope, reference.type_position);
+            self.resolve_reference(&reference.name, &reference.scope, reference.type_position, reference.at);
         }
         for access in std::mem::take(&mut self.uses.member_accesses) {
             self.collect_namespace_member_use(&access);
@@ -298,11 +303,17 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
 
     /// `SUPERTYPE_OF` runs from the subtype to the supertype, so a type's
     /// implementations are its inbound edges.
-    fn resolve_supertype(&mut self, supertype: &PendingSupertype) {
+    fn resolve_supertype(&mut self, supertype: &PendingSupertype<'t>) {
         let target = self.lookup_type(&supertype.name, &supertype.scope);
         if let Some(target) = target.or_else(|| self.imported_symbol(&supertype.name)) {
             let target_id = self.model.node(target).id.clone();
             self.model.add_edge(&supertype.from_id, EdgeKind::SupertypeOf, &target_id);
+            self.record_placeholder_use_site(
+                &supertype.from_id,
+                EdgeKind::SupertypeOf,
+                &target_id,
+                supertype.at,
+            );
         }
     }
 
@@ -334,7 +345,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
                 Some(caller) if self.model.node(target).kind == NodeKind::Function => {
                     self.add_call(caller, target, call.at);
                 }
-                _ => self.add_usage(target, &call.scope),
+                _ => self.add_usage(target, &call.scope, call.at),
             }
             return;
         }
@@ -342,16 +353,23 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
             CallReceiver::None => match self.imported_symbol(&call.name) {
                 Some(imported) => match &call.scope.enclosing_caller_id {
                     Some(caller) => self.add_call(caller, imported, call.at),
-                    None => self.add_usage(imported, &call.scope),
+                    None => self.add_usage(imported, &call.scope, call.at),
                 },
-                None => self.resolve_reference(&call.name, &call.scope, false),
+                None => self.resolve_reference(&call.name, &call.scope, false, call.at),
             },
             // Which member of an imported receiver is the semantic tier's
             // question; the receiver itself is a use.
             CallReceiver::Qualified(object) | CallReceiver::New(object) => {
-                self.resolve_reference(object, &call.scope, false)
+                self.resolve_reference(object, &call.scope, false, receiver_token(call))
             }
-            CallReceiver::This | CallReceiver::Super => {}
+            // A member of a type this file does not declare (a base class in
+            // another file, an object literal's method): a question for the
+            // semantic tier. `super(...)` names no member and is not one.
+            CallReceiver::This | CallReceiver::Super => {
+                if call.at.kind() != "super" {
+                    self.record_receiver_call(call.at, &call.scope);
+                }
+            }
         }
     }
 
@@ -384,7 +402,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
 
     /// A use of `name`: the symbol an unqualified name reaches, else an
     /// imported one. A type parameter shadows only in a type position.
-    fn resolve_reference(&mut self, name: &str, scope: &Scope, type_position: bool) {
+    fn resolve_reference(&mut self, name: &str, scope: &Scope, type_position: bool, at: Node<'t>) {
         if is_locally_bound(name, scope.locals.as_ref()) {
             return;
         }
@@ -393,7 +411,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         }
         let target = self.model.lookup_by_name(name, &scope.namespace_prefix, None);
         if let Some(target) = target.or_else(|| self.imported_symbol(name)) {
-            self.add_usage(target, scope);
+            self.add_usage(target, scope, at);
         }
     }
 
@@ -403,17 +421,19 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         let target_id = self.model.node(target).id.clone();
         self.model.add_edge(caller, EdgeKind::Calls, &target_id);
         self.record_call_site(caller, &target_id, at);
+        self.record_placeholder_use_site(caller, EdgeKind::Calls, &target_id, at);
     }
 
     /// A `REFERENCES` edge from the enclosing symbol, unless it is the
-    /// target itself or already calls it.
-    fn add_usage(&mut self, target: usize, scope: &Scope) {
-        let from = &scope.enclosing_symbol_id;
+    /// target itself or already calls it; `at` is the name token of the use.
+    fn add_usage(&mut self, target: usize, scope: &Scope, at: Node<'t>) {
+        let from = scope.enclosing_symbol_id.clone();
         let target_id = self.model.node(target).id.clone();
-        if *from == target_id || self.model.has_edge(from, EdgeKind::Calls, &target_id) {
+        if from == target_id || self.model.has_edge(&from, EdgeKind::Calls, &target_id) {
             return;
         }
-        self.model.add_edge(from, EdgeKind::References, &target_id);
+        self.model.add_edge(&from, EdgeKind::References, &target_id);
+        self.record_placeholder_use_site(&from, EdgeKind::References, &target_id, at);
     }
 
     /// Member `name` of the type `type_qualified_name`, instance or static.
@@ -425,5 +445,16 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
 
     pub(super) fn lookup_type(&self, name: &str, scope: &Scope) -> Option<usize> {
         self.model.lookup_by_name(name, &scope.namespace_prefix, Some(NodeKind::Type))
+    }
+}
+
+/// The receiver's token of `Owner.m()` (`Owner`) and of `new Owner()`
+/// (`Owner`, which is the call's own token).
+fn receiver_token<'t>(call: &PendingCall<'t>) -> Node<'t> {
+    match call.receiver {
+        CallReceiver::Qualified(_) => {
+            call.at.parent().and_then(|member| member.child_by_field_name("object")).unwrap_or(call.at)
+        }
+        _ => call.at,
     }
 }

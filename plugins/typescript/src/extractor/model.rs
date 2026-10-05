@@ -89,12 +89,14 @@ pub struct PendingCall<'t> {
 /// A class's or interface's heritage name, resolved once every declaration
 /// and import of the file is known.
 #[derive(Debug, Clone)]
-pub struct PendingSupertype {
+pub struct PendingSupertype<'t> {
     /// The subtype.
     pub from_id: String,
     pub name: String,
     /// The scope the subtype is declared in.
     pub scope: Scope,
+    /// The heritage name's token: where an open site about it points.
+    pub at: Node<'t>,
 }
 
 /// An `<identifier>.<property>` site, kept until every import is known: it is
@@ -123,9 +125,11 @@ pub struct CallSite {
 /// A name used in the walk, resolved once every declaration of the file is
 /// known.
 #[derive(Debug, Clone)]
-pub struct PendingReference {
+pub struct PendingReference<'t> {
     pub name: String,
     pub scope: Scope,
+    /// The name token: where an open site about this use points.
+    pub at: Node<'t>,
     /// Written where only a type can go, the one place a type parameter can
     /// shadow the name.
     pub type_position: bool,

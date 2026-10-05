@@ -179,12 +179,18 @@ fn a_call_through_an_unknown_receiver_is_a_receiver_call_site() {
 }
 
 #[test]
-fn receiver_calls_never_reach_untyped_calls() {
+fn receiver_calls_are_folded_into_their_callers_untyped_calls() {
     let graph = extract(PATH, "function g(x) { x.m(); }\nunknown.top();\n");
     assert_eq!(graph.sites(ReceiverCall).len(), 2, "{:?}", graph.site_summary(ReceiverCall));
-    for node in &graph.graph.nodes {
-        assert!(node.untyped_calls.is_empty(), "{} has {:?}", node.qualified_name, node.untyped_calls);
-    }
+    let untyped: Vec<(&str, Vec<String>)> = graph
+        .graph
+        .nodes
+        .iter()
+        .filter(|node| !node.untyped_calls.is_empty())
+        .map(|node| (node.name.as_str(), node.untyped_calls.clone()))
+        .collect();
+    let file_name = PATH.rsplit('/').next().unwrap_or(PATH);
+    assert_eq!(untyped, vec![(file_name, vec!["top".to_string()]), ("g", vec!["m".to_string()])]);
 }
 
 // --- NUL -------------------------------------------------------------------------

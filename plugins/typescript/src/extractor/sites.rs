@@ -13,9 +13,18 @@
 //!   project file, unless a local or a declaration of this file shadows `ns`.
 //!   No edge exists for it; `edge_kind` is `CALLS` for a call made inside a
 //!   function, else `REFERENCES`.
-//! - **`ReceiverCall`.** `obj.m()` that reaches no member declared here, and
-//!   any call through a longer receiver (`a.b.m()`, `f().m()`). No edge exists
-//!   for it. These are never folded into `untypedCalls`.
+//! - **`Reference` with `replaces`.** The first use behind each `CALLS`,
+//!   `REFERENCES` or `SUPERTYPE_OF` edge onto a `pending_symbol` placeholder: an imported name,
+//!   which may reach its declaration only through a re-export or as a
+//!   `default`. `replaces` names that edge, and the bridge asks only where
+//!   the linker cannot settle the placeholder itself (design note
+//!   `docs/architecture/gm-325-typescript-lsp-semantics.md`, section 4.3). A
+//!   call may carry both this and an `OverloadCall` site; the bridge keeps
+//!   one question.
+//! - **`ReceiverCall`.** `obj.m()` that reaches no member declared here, any
+//!   call through a longer receiver (`a.b.m()`, `f().m()`), and `this.m()` /
+//!   `super.m()` that binds no member declared here. No edge exists for it.
+//!   The builder folds these into `untypedCalls` ([`crate::extractor::emit`]).
 //!
 //! Every site points at the name token, in wire columns, and has no
 //! `from_container`: this plugin's targets are files, not containers.
@@ -70,6 +79,39 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
                 replaces: Some(replaces),
             });
         }
+    }
+
+    /// A `Reference` site with `replaces` for the use written at `at` that
+    /// produced the edge `from_id -edge_kind-> to_id`, when `to_id` is a
+    /// `pending_symbol` placeholder and the edge has no such site yet.
+    pub(super) fn record_placeholder_use_site(
+        &mut self,
+        from_id: &str,
+        edge_kind: EdgeKind,
+        to_id: &str,
+        at: Node<'t>,
+    ) {
+        if !self.model.has_edge(from_id, edge_kind, to_id) {
+            return;
+        }
+        let Some(target) = self.model.node_by_id(to_id) else { return };
+        if target.native_kind.as_deref() != Some(PENDING_SYMBOL_NATIVE_KIND) {
+            return;
+        }
+        let replaces = edge_id(from_id, edge_kind, to_id, None);
+        if !self.uses.hop_edges.insert(replaces.clone()) {
+            return;
+        }
+        let start = at.start_position();
+        self.model.add_open_site(OpenSite {
+            from_id: from_id.to_string(),
+            position: self.columns.at(start.row, start.column),
+            name: self.text(at).to_string(),
+            kind: OpenSiteKind::Reference,
+            edge_kind,
+            from_container: None,
+            replaces: Some(replaces),
+        });
     }
 
     /// A `ReceiverCall` site for the call of `property`: from the enclosing
