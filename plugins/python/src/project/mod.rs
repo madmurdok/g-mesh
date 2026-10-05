@@ -290,7 +290,11 @@
 //! does not link: a missing edge, never a wrong one. The opposite mistake is
 //! impossible, because the set is built from files that really exist. An
 //! importer extracted *before* its module was created keeps its
-//! `external_module` until it is extracted again.
+//! `external_module` until it is extracted again. Likewise a `src/` layout
+//! flip (the first file created under `src/`, or the last one deleted, with
+//! no `pyproject.toml` hint) re-keys the model at once, but files already
+//! in the graph keep their old keys until they are extracted again or the
+//! next `workspaceChanged` reindexes the language.
 
 mod pyproject;
 
