@@ -348,3 +348,18 @@ New tests and their controls (S4):
 6. **Drop `G_MESH_JS_TS_PLUGIN_PATH` outright, with a release note, and no
    deprecation alias.** Recommend: yes. An alias would need a Node-shaped
    meaning that no longer exists.
+
+## Resolved at review (2026-10-05)
+
+1. **`test_plugin.rs` is ported to Rust in this task**, in its own slice, onto
+   the same `g-mesh-fake-plugin` binary as item 6. This overrides item 1: core's
+   tests stop spawning `node`. The `install_memory_hungry` calibration is
+   re-measured against the Rust fake.
+2. B: the staleness fingerprint covers all discovered plugins.
+3. Lifecycle waits hold, on item 7's interface (GM-325 keeps a static
+   `semantic_pass = true` and the plugin spawns post-walk with no server).
+4. GM-351 edits `scripts/cut-release.sh` and ci.yml's npm steps. Switching
+   `bundle-plugin.sh` off `sea/` belongs to GM-326, whose criteria say so.
+5. The npm deletion and `git mv rust src` are GM-351/S3, after S2 and before
+   GM-325/S3.
+6. `G_MESH_JS_TS_PLUGIN_PATH` is dropped outright, with a release-note line.
