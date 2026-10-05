@@ -3252,3 +3252,353 @@ fn a_deleted_bound_call_is_retracted_by_the_next_pass() {
     assert!(!second.diff.delete_edge_ids.contains(&kept_id));
     retracted(&second, &one.e_f, "f(1) still bound");
 }
+
+// --- the warm-up ------------------------------------------------------------
+//
+// `Budgets::warm_up`: a server's first question may take the warm-up budget
+// instead of `request`, alone in the pipeline, once per server process. The
+// scripted server holds chosen answers (`holdMs`, by arrival) while it goes
+// on reading, and writes a `timeline` of what it was asked and answered, so
+// how many questions were in flight at once is read from the server's side.
+//
+// The margins are wide on purpose: a held first answer sits at three times
+// `request` and a third of the warm-up.
+
+/// The ordinary budget for every question after the first.
+const WARM_REQUEST: Duration = Duration::from_millis(500);
+/// The warm-up budget for the first.
+const WARM_UP: Duration = Duration::from_secs(5);
+/// How long the scripted server holds a cold first answer: past
+/// `WARM_REQUEST`, inside `WARM_UP`.
+const COLD_MS: u64 = 1_500;
+
+fn warm_budgets(request: Duration, warm_up: Option<Duration>) -> Budgets {
+    Budgets { request, warm_up, ..budgets() }
+}
+
+/// The most questions the server had outstanding at once, per interval
+/// between its answers: `[0]` before its first answer, `[1]` between its
+/// first and second, and so on. A question it never answered stays
+/// outstanding.
+fn in_flight_between_answers(timeline: &Path) -> Vec<usize> {
+    let text = std::fs::read_to_string(timeline).unwrap_or_default();
+    let mut outstanding = 0usize;
+    let mut most = 0usize;
+    let mut intervals = Vec::new();
+    for event in text.lines() {
+        if event.starts_with("asked ") {
+            outstanding += 1;
+            most = most.max(outstanding);
+        } else if event.starts_with("answered ") {
+            intervals.push(most);
+            outstanding = outstanding.saturating_sub(1);
+            most = outstanding;
+        }
+    }
+    intervals.push(most);
+    intervals
+}
+
+/// How many definition/implementation questions reached the server.
+fn arrived(timeline: &Path) -> usize {
+    std::fs::read_to_string(timeline)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("asked "))
+        .count()
+}
+
+/// The script every warm-up test runs: no progress, UTF-16, `answers`, the
+/// given holds and refusals, and a timeline.
+fn held_server(
+    scratch: &Scratch,
+    answers: Value,
+    hold_ms: &[u64],
+    refuse: &[u32],
+    extra: Value,
+) -> (SemanticConfig, PathBuf) {
+    let timeline = scratch.path().join("timeline.log");
+    let mut script = json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+        "holdMs": hold_ms,
+        "refuse": refuse,
+        "timeline": timeline.to_string_lossy(),
+    });
+    if let Value::Object(more) = extra {
+        script.as_object_mut().expect("an object").extend(more);
+    }
+    (scratch.server(script), timeline)
+}
+
+/// The fixture with a second site in `b.toy` the script does not answer,
+/// asked after the first.
+fn fixture_with_a_second_site(scratch: &Scratch) -> SdkIndex {
+    let (mut index, caller) = fixture(scratch);
+    let b = RelPath::new("src/b.toy");
+    let (source, mut graph) = {
+        let entry = index.entry(&b).expect("the fixture has it");
+        (entry.source.clone(), entry.graph.clone())
+    };
+    graph.open_sites.push(OpenSite {
+        from_id: caller,
+        position: Position { line: 1, col: 12 },
+        name: "add".to_string(),
+        kind: OpenSiteKind::ReceiverCall,
+        edge_kind: EdgeKind::Calls,
+        from_container: Some("pkg".to_string()),
+        replaces: None,
+    });
+    index.insert(b, source, graph);
+    index
+}
+
+/// A first answer that takes longer than `request` but less than the
+/// warm-up is an answer: the pass is complete and its edge emitted.
+///
+/// Control: use `budgets.request` instead of `request_budget` in `run_pass`'s
+/// expiry filter; the first question times out at `request`.
+#[test]
+fn a_servers_first_question_may_take_its_warm_up_budget() {
+    let scratch = Scratch::new("warm-up-first");
+    let (index, _) = fixture(&scratch);
+    let (config, _) = held_server(&scratch, answers_the_site(&scratch), &[COLD_MS], &[], json!({}));
+    let mut bridge =
+        LspBridge::with_budgets("toy", scratch.path(), config, warm_budgets(WARM_REQUEST, Some(WARM_UP)));
+
+    let answer = pass_over(&mut bridge, &index, &["src/b.toy"]);
+    assert!(answer.complete, "the held first answer arrived inside the warm-up: {:?}", answer.reason);
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+}
+
+/// While the warm-up is owed one question is in flight; once the server has
+/// answered, the pipeline fills to `concurrency`. Counted by the server.
+///
+/// Control: `let width = budgets.concurrency.max(1);` in `run_pass`; four
+/// questions are outstanding before the first answer.
+#[test]
+fn while_the_warm_up_is_owed_one_question_is_in_flight_and_then_the_pipeline_fills() {
+    let scratch = Scratch::new("warm-up-width");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 8);
+    let (config, timeline) =
+        held_server(&scratch, json!([]), &[600, 300, 300, 300, 300, 300, 300, 300], &[], json!({}));
+    let budgets = warm_budgets(Duration::from_secs(2), Some(Duration::from_secs(6)));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    let in_flight = in_flight_between_answers(&timeline);
+    assert_eq!(in_flight[0], 1, "one question while warming: {in_flight:?}");
+    assert!(in_flight[1] > 1, "the pipeline fills once the server has answered: {in_flight:?}");
+}
+
+/// Only the first question gets the warm-up: a later one the server holds
+/// past `request` times out under `request`.
+///
+/// Control: `let request_budget = warm_up.unwrap_or(budgets.request);` in
+/// `run_pass`; the second question is answered and the pass is complete.
+#[test]
+fn questions_after_the_first_get_the_ordinary_request_budget() {
+    let scratch = Scratch::new("warm-up-rest");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 2);
+    let (config, _) = held_server(&scratch, json!([]), &[COLD_MS, COLD_MS], &[], json!({}));
+    let mut bridge =
+        LspBridge::with_budgets("toy", scratch.path(), config, warm_budgets(WARM_REQUEST, Some(WARM_UP)));
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "the second question had only `request`");
+    assert!(
+        reason(&answer).contains("did not answer a question about src/c.toy within 500ms"),
+        "{}",
+        reason(&answer)
+    );
+}
+
+/// The warm-up is spent once per server process: a second pass on the same
+/// running server gives its first question only `request`.
+///
+/// Control: remove `client.mark_warmed_up()` from `run_pass`'s `Answered`
+/// branch; the second pass waits out the warm-up again and is complete.
+#[test]
+fn a_warm_up_is_spent_once_per_server_and_not_once_per_pass() {
+    let scratch = Scratch::new("warm-up-once");
+    let (index, _) = fixture(&scratch);
+    let (config, _) = held_server(&scratch, answers_the_site(&scratch), &[COLD_MS, COLD_MS], &[], json!({}));
+    let mut bridge =
+        LspBridge::with_budgets("toy", scratch.path(), config, warm_budgets(WARM_REQUEST, Some(WARM_UP)));
+
+    let first = pass(&mut bridge, &index);
+    assert!(first.complete, "the first pass had the warm-up: {:?}", first.reason);
+    let second = pass(&mut bridge, &index);
+    assert!(!second.complete, "the same server owes no second warm-up");
+    assert!(reason(&second).contains("within 500ms"), "{}", reason(&second));
+}
+
+/// A restarted server is cold again and owes a new warm-up. The server
+/// crashes after its first answer, so each pass meets a new one.
+///
+/// Control: keep the latch in a process-wide static instead of on
+/// `LspClient`; the second server's first question times out at `request`
+/// and the second pass emits no edge.
+#[test]
+fn a_restarted_server_owes_a_new_warm_up() {
+    let scratch = Scratch::new("warm-up-restart");
+    let index = fixture_with_a_second_site(&scratch);
+    // `request` is long enough for the crashed server's exit to reach the
+    // bridge while its second question waits, so the next pass starts anew.
+    let (config, _) =
+        held_server(&scratch, answers_the_site(&scratch), &[3_000], &[], json!({ "crashAfterRequests": 1 }));
+    let budgets = warm_budgets(Duration::from_secs(1), Some(Duration::from_secs(8)));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let first = pass(&mut bridge, &index);
+    assert_eq!(
+        semantic_edges(&first).len(),
+        1,
+        "the first server answered under its warm-up: {:#?}",
+        first.diff
+    );
+
+    let second = pass(&mut bridge, &index);
+    assert_eq!(
+        semantic_edges(&second).len(),
+        1,
+        "the new server's first question had a warm-up of its own: {:?}",
+        second.reason
+    );
+}
+
+/// A warm-up that times out fails its question as `request` would, and is
+/// spent: the rest go out together under `request`, so all six are asked
+/// well inside a pass budget that six warm-ups in a row would overrun.
+///
+/// Control: remove the `client.mark_warmed_up()` under
+/// `if !expired.is_empty()` in `run_pass`; each question is sent alone under
+/// the warm-up and the pass budget ends before all six are asked.
+#[test]
+fn a_warm_up_that_times_out_fails_its_question_and_is_spent() {
+    let scratch = Scratch::new("warm-up-timeout");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 6);
+    // Never answered within the test.
+    let (config, timeline) = held_server(&scratch, json!([]), &[60_000; 6], &[], json!({}));
+    let mut budgets = warm_budgets(Duration::from_millis(300), Some(Duration::from_secs(1)));
+    budgets.project_floor = Duration::from_secs(4);
+    budgets.per_file = Duration::from_millis(1);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+    // Started under its own budget, so the pass budget is spent on asking.
+    bridge.prepare();
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "an unanswered warm-up is not an answer of 'nothing'");
+    assert!(
+        reason(&answer).contains("did not answer a question about src/c.toy within 1s"),
+        "the warm-up's own timeout is the reason: {}",
+        reason(&answer)
+    );
+    assert!(answer.diff.upsert_edges.is_empty());
+    assert_eq!(arrived(&timeline), 6, "every question was asked after the warm-up was spent");
+}
+
+/// A refusal of the first question spends the warm-up too: the server is
+/// answering, so the pipeline fills right after it.
+///
+/// Control: remove `client.mark_warmed_up()` from `run_pass`'s `Failed`
+/// branch; the second question still goes out alone.
+#[test]
+fn a_refused_first_question_spends_the_warm_up() {
+    let scratch = Scratch::new("warm-up-refused");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 6);
+    let (config, timeline) = held_server(&scratch, json!([]), &[0, 300, 300, 300, 300, 300], &[1], json!({}));
+    let budgets = warm_budgets(Duration::from_secs(2), Some(Duration::from_secs(6)));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "a refused question is not an answer");
+    assert!(reason(&answer).contains("refused by the script"), "{}", reason(&answer));
+    let in_flight = in_flight_between_answers(&timeline);
+    assert_eq!(in_flight[0], 1, "{in_flight:?}");
+    assert!(in_flight[1] > 1, "the pipeline fills right after the refusal: {in_flight:?}");
+}
+
+/// The warm-up is off unless a plugin asks for it: the first question gets
+/// `request` and the pipeline fills to `concurrency` at once.
+///
+/// Control: `warm_up: Some(..)` in `Budgets::default()`; one question goes
+/// out alone and is answered.
+#[test]
+fn without_a_warm_up_the_first_question_gets_the_request_budget_and_the_pipeline_fills_at_once() {
+    assert_eq!(Budgets::default().warm_up, None);
+
+    let scratch = Scratch::new("warm-up-off");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 6);
+    let (config, timeline) =
+        held_server(&scratch, json!([]), &[COLD_MS, 300, 300, 300, 300, 300], &[], json!({}));
+    let defaults = budgets();
+    let budgets = Budgets {
+        request: WARM_REQUEST,
+        concurrency: 4,
+        project_floor: defaults.project_floor,
+        per_file: defaults.per_file,
+        single_file: defaults.single_file,
+        readiness: defaults.readiness,
+        settle: defaults.settle,
+        ..Budgets::default()
+    };
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "the held first answer had only `request`");
+    assert!(reason(&answer).contains("within 500ms"), "{}", reason(&answer));
+    let in_flight = in_flight_between_answers(&timeline);
+    assert!(in_flight[0] > 1, "no question goes out alone: {in_flight:?}");
+}
+
+/// A warm-up shorter than `request` never shortens the first question's
+/// budget.
+///
+/// Control: drop `.max(budgets.request)` from `run_pass`'s `warm_up`; the
+/// first question times out at the warm-up.
+#[test]
+fn a_warm_up_shorter_than_request_never_shortens_the_first_question() {
+    let scratch = Scratch::new("warm-up-short");
+    let (index, _) = fixture(&scratch);
+    let (config, _) = held_server(&scratch, answers_the_site(&scratch), &[1_000], &[], json!({}));
+    let budgets = warm_budgets(Duration::from_secs(3), Some(Duration::from_millis(300)));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "the first question had `request`: {:?}", answer.reason);
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+}
+
+/// The warm-up sits inside the pass budget: a first question still
+/// unanswered when the pass runs out ends the pass then, not at the end of
+/// the warm-up.
+///
+/// Control: `let wake = oldest + request_budget;` in `run_pass` (no
+/// `.min(deadline)`); the pass waits out the warm-up.
+#[test]
+fn the_warm_up_sits_inside_the_pass_budget() {
+    let scratch = Scratch::new("warm-up-deadline");
+    let (index, _) = fixture(&scratch);
+    let (config, _) = held_server(&scratch, answers_the_site(&scratch), &[60_000], &[], json!({}));
+    let mut budgets = warm_budgets(Duration::from_millis(300), Some(Duration::from_secs(8)));
+    budgets.project_floor = Duration::from_millis(2_500);
+    budgets.per_file = Duration::from_millis(1);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+    // Started under its own budget, so the pass budget is spent on asking.
+    bridge.prepare();
+
+    let started = std::time::Instant::now();
+    let answer = pass(&mut bridge, &index);
+    let took = started.elapsed();
+    assert!(!answer.complete);
+    assert!(reason(&answer).contains("ran out of its budget"), "{}", reason(&answer));
+    assert!(took < Duration::from_secs(6), "the pass budget ended the wait, not the warm-up: {took:?}");
+}

@@ -281,4 +281,16 @@ mod tests {
             ]
         );
     }
+
+    /// vtsls's first question gets a two-minute warm-up, and `engine` hands
+    /// it to the bridge. The bridge keeps its budgets private, so the wiring
+    /// is read from this file's own `engine` body.
+    #[test]
+    fn the_engine_gives_vtsls_a_two_minute_warm_up() {
+        assert_eq!(WARM_UP, Duration::from_secs(120));
+        let source = include_str!("semantic.rs");
+        let engine = &source[source.find("pub fn engine(").expect("this file defines `engine`")..];
+        let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
+        assert!(body.contains(".warm_up(WARM_UP)"), "`engine` must pass WARM_UP to the bridge:\n{body}");
+    }
 }
