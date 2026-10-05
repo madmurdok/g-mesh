@@ -16,6 +16,11 @@ changed.
   25-34 s with them. Each timeout makes the whole-project pass `incomplete`, so
   `semanticPassAt` is never recorded and **every daemon start re-runs the whole
   pass and times out again** (run 8). The answered edges are kept.
+- **With the warm-up (S41, `b299235`): 0 timeouts in 6 of 6 cold passes, every
+  pass recorded complete, no re-run at daemon start** (before: 8-32 timeouts,
+  0 of 7 complete, re-run at every start). The first answer waited 13.2-18.9 s
+  without `node_modules`, 29.1-38.0 s with them, all inside the 120 s budget
+  (§5).
 - Per site kind, the semantic tier answers `Reference` and `OverloadCall`
   questions almost entirely into the index (97-100%); `ReceiverCall` is where
   the gaps are: 37% empty without dependencies installed (3% with them), 30%
@@ -254,6 +259,64 @@ The bridge has 8 questions in flight from 0.26 s.
   semantic `CALLS` callers and 2 / 0 untyped calls left.
 - Bulk walk to done: 15.3 s `real`, 10.5 s `user`.
 
+## 5. Cold start with the warm-up (S41)
+
+Measure slice GM-325/S41, run 2026-10-05 against `fc89083` (`b299235`: the
+bridge keeps one question in flight under a warm-up budget until the server's
+first answer, refusal or timeout; the TypeScript plugin sets 120 s). Same
+corpus (`1acf66ed`, fresh `git archive` copies, 655 TS/JS files on disk, 658
+in the pass), same `deps` copy (`yarn install --frozen-lockfile
+--ignore-scripts`), same procedure as §2-3: `g-mesh init` then `g-mesh
+reindex` (one cold vtsls each), `G_MESH_HOME` in scratch, `G_MESH_MODEL_DIR`
+empty, release build of this worktree, vtsls 0.3.0 from
+`scripts/test-deps.sh typescript` behind a transparent stdio proxy that logs
+one compact line per LSP message (method, id, timestamp; no payloads).
+
+**Machine state differs from §2-3.** Other sessions were building on the same
+machine: 1-minute load 8-118 during these runs (§2-3: 3.9-5.0), and the bulk
+walk took 10-29 s instead of 6-9 s. Pass durations are therefore not
+comparable with §2's; timeouts, completion and the first answer's wait are the
+quantities this section answers.
+
+| Run | corpus | command | load avg before (1/5/15) | bulk walk done | warm-up line | first question asked | first answer (wait) | projects loaded (last progress `end`) | pass | real | user | sys | timeouts | answers 2-5 s / 5-10 s | recorded |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| S1 | no deps | init | 21.2 / 46.2 / 40.8 (build ending) | 10.6 s | yes | 0.28 s | 15.03 s (**14.7 s**) | 14.0 s | 81.1 s | 106.1 | 32.5 | 9.2 | **0** | 8 / 0 | complete |
+| S2 | no deps | reindex | **103.0** / 65.1 / 48.6 | 10.0 s | yes | 0.41 s | 19.27 s (**18.9 s**) | 17.5 s | 64.2 s | 91.0 | 30.1 | 8.9 | **0** | 8 / 0 | complete |
+| S3 | no deps | reindex | 34.3 / 52.9 / 45.6 | 29.3 s | yes | 0.34 s | 13.55 s (**13.2 s**) | 12.4 s | 48.0 s | 87.8 | 23.4 | 7.0 | **0** | 0 / 0 | complete |
+| S4 | deps | init | 10.6 / 39.2 / 41.1 | 24.4 s | yes | 0.30 s | 29.39 s (**29.1 s**) | 27.9 s | 80.0 s | 115.4 | 23.5 | 7.7 | **0** | 16 / 0 | complete |
+| S5 | deps | reindex | 8.1 / 29.0 / 36.8 | 23.7 s | yes | 0.39 s | 36.99 s (**36.6 s**) | 35.0 s | 110.2 s | 144.2 | 28.6 | 9.0 | **0** | 23 / 0 | complete |
+| S6 | deps | reindex | 19.2 / 23.9 / 33.4 | 15.9 s | yes | 0.35 s | 38.40 s (**38.0 s**) | 37.1 s | 95.6 s | 121.8 | 30.9 | 9.9 | **0** | 16 / 0 | complete |
+
+Times in the "asked / answer / loaded" columns are from the vtsls process's
+start (proxy clock). "answers 2-5 s" excludes the warm-up question.
+
+- **Every cold pass is recorded complete.** 0 `did not answer` lines in 6 of 6
+  passes (§3: 8-32 in 7 of 7); the pass line carries no `(incomplete)`;
+  `init`/`reindex` print `semantic: pass complete`, and `g-mesh status` shows
+  `semantic pass: complete` for both corpora.
+- **The warm-up line appeared once per pass**, as the bridge's first question
+  went out: `[typescript] the server has not answered yet - its first question
+  may take up to 120s (warm-up), the rest 10s`.
+- **The first answer waited 13.2-18.9 s without `node_modules` and 29.1-38.0 s
+  with them** - the project load, which ends 1.1-2.0 s before it (last
+  `$/progress end`, 11 `Initializing` spans as in §3). The slowest is 32% of the
+  120 s budget, at a load average up to 103. The first question is
+  `.lintstagedrc.js` and its answer is empty, as before; the second is sent
+  within 1 ms of it and answered in 43-202 ms, so the pipeline fills to 8 at
+  once. No answer after the warm-up took 5 s or more.
+- **No re-run at daemon start.** After S3 (no deps) and S6 (deps), a daemon
+  bootstrapped by `g-mesh mcp-shim` and given a `get_file_outline` call
+  (answered in 0.2 s) logged no `semantic pass never completed - retrying`
+  line and spawned no vtsls (0 proxy logs); `g-mesh stop` then stopped it.
+  §3's run 8 re-ran the whole pass and timed out 16 more questions.
+- **Waiting, not computing.** `real` is 2.3-3.8x `user + sys`, the same shape
+  as §2: the wait is on tsserver (a grandchild whose CPU `time -p` does not
+  see) loading projects and answering, here also slowed by the machine's load.
+  The warm-up itself spends 13-38 s of wall time in which the bridge has one
+  question outstanding; before, the same seconds went to 10 s timeouts.
+- Upserted counts are identical across runs of a corpus (no deps: 5 582 nodes
+  / 13 234 edges, deps: 5 790 / 13 329; 4 226 retracted each).
+
 ## README gap entries (for the docs slice)
 
 | Category | Fixture | excalidraw, no deps | excalidraw, deps |
@@ -264,7 +327,7 @@ The bridge has 8 questions in flight from 0.26 s.
 | Receiver typed `any` / untyped JS (empty answer) | 1 (`word.toUpperCase()` in util.js) | 8 577 ReceiverCall (37%) | 655 ReceiverCall (3%) |
 | Ambiguous answer (more than one location) | 0 | 682 (629 / 20 / 33) | 1 365 (1 237 / 45 / 83) |
 | Computed members (`obj[k]()`) | not measured: the extractor records no open site for them, so they never reach the bridge | - | - |
-| **Cold-start timeouts** (10 s budget, pass never recorded complete, retried at every daemon start) | 0 | 8 per cold pass | 16-24 per cold pass (32 under load) |
+| **Cold-start timeouts** (10 s budget, pass never recorded complete, retried at every daemon start) | 0 | 8 per cold pass before the warm-up; **0 with it** (6/6 passes complete, §5) | 16-24 per cold pass (32 under load) before; **0 with it** (first answer 29-38 s of a 120 s warm-up) |
 | False-empty answers (§3) | 0 | 3, ATA cache cold, 0 affecting an edge | 0 |
 
 Two observations for the docs slice beyond §9's list: the semantic tier needs
