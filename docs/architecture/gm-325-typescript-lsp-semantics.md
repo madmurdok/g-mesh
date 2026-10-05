@@ -685,3 +685,9 @@ Trade-offs taken:
   - `replaces` across python and rust;
   - `ts-compiler` / `engine` in core tests;
   - `plugin.toml`, `ci.yml`, `test-deps.sh`, `README.md`.
+
+## Resolved at review (2026-10-05)
+
+The owner approved the note and its slicing ("хорошо, с планом согласен"):
+all ten owner questions as recommended (§13). The native port gets a backlog
+task.
