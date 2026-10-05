@@ -4,15 +4,15 @@
 //! `gen/`, reached only through the link `src/gen -> ../gen`, indexes every
 //! language's file under `src/gen/...` and nothing under `gen/...`.
 //!
-//! Real plugin binaries: Rust and Python (the SDK walk) and Go (its own
-//! walk), discovered through links to their checked-in plugin directories.
-//! Like the rest of the suite's Go tests it needs the Go plugin binary
-//! `core/build.rs` builds, and the Rust and Python plugin binaries built in
-//! this profile (`cargo build --workspace`). TypeScript has no arm here: its
-//! plugin does not run the SDK walk.
+//! Real plugin binaries: Rust, Python and TypeScript (the SDK walk) and Go
+//! (its own walk), discovered through links to their checked-in plugin
+//! directories. Like the rest of the suite's Go tests it needs the Go plugin
+//! binary `core/build.rs` builds, and the Rust, Python and TypeScript plugin
+//! binaries built in this profile (`cargo build --workspace`).
 //!
 //! Controls: `follow_links(false)` in the SDK's `walker`
-//! (`plugins/sdk/src/walk.rs`) -> the Rust and Python rows are missing; in
+//! (`plugins/sdk/src/walk.rs`) -> the Rust, Python and TypeScript rows are
+//! missing; in
 //! the Go plugin's `walkDir`, run the symlink guard before the `.gitignore`
 //! check (or never follow a link) -> the Go row is missing.
 
@@ -32,10 +32,16 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const NO_MODEL_DIR: &str = "/nonexistent-g-mesh-test-model-dir";
 
 /// The generated files, one per language, each declaring one symbol.
-const GENERATED: [(&str, &str, &str, &str); 3] = [
+const GENERATED: [(&str, &str, &str, &str); 4] = [
     ("rust", "gen_rs.rs", "generated_rust_symbol", "pub fn generated_rust_symbol() -> u32 {\n    1\n}\n"),
     ("python", "gen_py.py", "generated_python_symbol", "def generated_python_symbol():\n    pass\n"),
     ("go", "gen_go.go", "GeneratedGoSymbol", "package gen\n\nfunc GeneratedGoSymbol() int { return 1 }\n"),
+    (
+        "typescript",
+        "gen_ts.ts",
+        "generated_typescript_symbol",
+        "export function generated_typescript_symbol(): number {\n  return 1;\n}\n",
+    ),
 ];
 
 struct Project {
@@ -112,10 +118,10 @@ impl Drop for Project {
     }
 }
 
-/// A discovery root holding links to the checked-in `rust`, `python` and
-/// `go` plugin directories, so each manifest's relative and
+/// A discovery root holding links to the checked-in `rust`, `python`, `go`
+/// and `typescript` plugin directories, so each manifest's relative and
 /// `${G_MESH_BIN_DIR}` commands resolve as they do from the checkout.
-fn rust_python_go_plugin_root() -> tempfile::TempDir {
+fn sdk_and_go_plugin_root() -> tempfile::TempDir {
     let root = tempfile::tempdir().expect("failed to create a plugin discovery root");
     let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
     for (language, _, _, _) in GENERATED {
@@ -132,7 +138,7 @@ fn rust_python_go_plugin_root() -> tempfile::TempDir {
 #[test]
 fn init_indexes_a_gitignored_target_reached_through_a_link_under_the_link_spelling() {
     let project = Project::new();
-    let plugins = rust_python_go_plugin_root();
+    let plugins = sdk_and_go_plugin_root();
 
     let output = project.init(plugins.path());
 
