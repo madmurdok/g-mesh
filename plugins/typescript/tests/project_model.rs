@@ -615,6 +615,22 @@ fn an_exports_map_decides_the_entry_for_the_package_root_and_its_subpaths() {
     assert_eq!(resolve(&project, "p/helpers", "app.ts"), some("packages/p/src/helpers.ts"));
 }
 
+/// A wildcard key binds its suffix as well as its prefix: a subpath that
+/// starts right but ends wrong is not that key's, even when the capture it
+/// would give names a real file.
+#[test]
+fn a_wildcard_exports_key_does_not_match_a_subpath_with_the_wrong_suffix() {
+    let fx = Fixture::new(&[
+        ("package.json", r#"{"workspaces":["packages/*"]}"#),
+        ("app.ts", SRC),
+        ("packages/p/package.json", r#"{"name":"p","exports":{"./x/*.js":"./lib/*.ts"}}"#),
+        ("packages/p/lib/a.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "p/x/a.js", "app.ts"), some("packages/p/lib/a.ts"));
+    assert_eq!(resolve(&project, "p/x/a.ts", "app.ts"), None);
+}
+
 #[test]
 fn an_exports_map_with_both_an_import_and_a_require_target_picks_import() {
     let fx = Fixture::new(&[

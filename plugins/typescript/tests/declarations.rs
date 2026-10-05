@@ -464,8 +464,10 @@ fn unknown_extension_yields_the_file_node_alone() {
     assert!(graph.graph.edges.is_empty());
 }
 
+/// A raw NUL inside a regex literal makes the grammar drop the declaration
+/// that follows it; tsc accepts the file, so the declaration must survive.
 #[test]
 fn nul_in_the_source_does_not_end_the_parse() {
-    let graph = extract("src/a.ts", "const a = \"\0\";\nconst b = 2;\n");
-    assert_eq!(graph.symbols(), vec!["a", "b"]);
+    let graph = extract("src/a.ts", "const a = \"\0\";\nconst r = /\0/;\nfunction f() {}\n");
+    assert_eq!(graph.symbols(), vec!["a", "r", "f"]);
 }

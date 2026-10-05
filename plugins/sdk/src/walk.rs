@@ -612,6 +612,19 @@ mod tests {
         assert_eq!(tree.walk(&[]), vec!["a.toy", "src/keep.gen.toy"]);
     }
 
+    /// A `.gitignore` below the root binds only its own subtree: a sibling
+    /// file with the same name is walked.
+    #[test]
+    fn a_nested_gitignore_is_scoped_to_its_own_subtree() {
+        let tree = Tree::new("gitignore-nested");
+        tree.write("pkg/a/.gitignore", "ignored.toy\n");
+        tree.write("pkg/a/kept.toy", "");
+        tree.write("pkg/a/ignored.toy", "");
+        tree.write("pkg/b/ignored.toy", "");
+        tree.write("ignored.toy", "");
+        assert_eq!(tree.walk(&[]), vec!["ignored.toy", "pkg/a/kept.toy", "pkg/b/ignored.toy"]);
+    }
+
     #[test]
     fn is_sorted_and_therefore_reproducible() {
         let tree = Tree::new("order");
