@@ -57,8 +57,18 @@ impl Extractor for TypeScriptExtractor {
     const LANGUAGE: &'static str = LANGUAGE;
     type Project = TsProject;
 
+    /// Builds the project model; each config file it skipped is logged.
     fn load_project(&self, root: &std::path::Path) -> anyhow::Result<TsProject> {
-        TsProject::load(root)
+        let project = TsProject::load(root)?;
+        for note in &project.notes {
+            eprintln!("[{LANGUAGE}] project model: {note}");
+        }
+        Ok(project)
+    }
+
+    /// Keeps the existence set current; touches no disk.
+    fn file_presence_changed(&self, project: &mut TsProject, path: &RelPath, present: bool) {
+        project.file_presence_changed(path, present);
     }
 
     /// Parses `source` with its extension's grammar and declares everything
