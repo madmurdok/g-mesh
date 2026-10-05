@@ -277,6 +277,10 @@ struct Script {
     /// meant to.
     #[serde(default)]
     configuration_out: Option<String>,
+    /// Where to append `<uri> <languageId>` per `didOpen`, so a test can
+    /// assert which language each document was opened as.
+    #[serde(default)]
+    opened_log: Option<String>,
 }
 
 /// The id this server uses for its own `workspace/configuration` request.
@@ -317,6 +321,9 @@ fn main() {
         let id = message.get("id").cloned();
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         log(&script, &method);
+        if method == "textDocument/didOpen" {
+            log_opened(&script, &params);
+        }
 
         match method.as_str() {
             "initialize" => {
@@ -667,6 +674,19 @@ fn close_stdin() {
     // SAFETY: the stdin handle is owned by this process and nothing reads it
     // again.
     drop(unsafe { OwnedHandle::from_raw_handle(std::io::stdin().as_raw_handle()) });
+}
+
+fn log_opened(script: &Script, params: &Value) {
+    let Some(path) = &script.opened_log else { return };
+    let document = &params["textDocument"];
+    let line = format!(
+        "{} {}\n",
+        document["uri"].as_str().unwrap_or(""),
+        document["languageId"].as_str().unwrap_or("")
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 fn log(script: &Script, method: &str) {

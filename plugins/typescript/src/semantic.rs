@@ -126,3 +126,144 @@ fn candidates(command: &Path, root: &Path, script_extensions: &[&str]) -> Vec<Ca
 fn same_binary(command: &Path) -> PathBuf {
     command.to_path_buf()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use g_mesh_plugin_sdk::lsp::{OverloadDisambiguation, ServerReadiness, WINDOWS_SCRIPT_EXTENSIONS};
+
+    const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml");
+
+    fn manifest() -> toml::Value {
+        let text = std::fs::read_to_string(MANIFEST).expect("plugins/typescript/plugin.toml is readable");
+        toml::from_str(&text).expect("plugins/typescript/plugin.toml parses")
+    }
+
+    /// A bare `vtsls` is `PATH`, then the project's `node_modules/.bin`, then
+    /// `npx` with the package named - each spelled bare and then with every
+    /// script extension before the next origin. Every installed candidate is
+    /// probed as itself, and the `npx` probe is the server's own argv.
+    #[test]
+    fn a_bare_vtsls_is_path_then_the_projects_node_modules_then_npx() {
+        let root = Path::new("/projects/thing");
+        let candidates = candidates(Path::new(SERVER_BIN), root, &WINDOWS_SCRIPT_EXTENSIONS);
+        let local = root.join("node_modules/.bin");
+        let spelled: Vec<(&str, PathBuf)> =
+            candidates.iter().map(|candidate| (candidate.origin, candidate.command.clone())).collect();
+        assert_eq!(
+            spelled,
+            vec![
+                ("PATH", PathBuf::from("vtsls")),
+                ("PATH", PathBuf::from("vtsls.cmd")),
+                ("the project's node_modules/.bin", local.join("vtsls")),
+                ("the project's node_modules/.bin", local.join("vtsls.cmd")),
+                ("npx", PathBuf::from("npx")),
+                ("npx", PathBuf::from("npx.cmd")),
+            ],
+            "{candidates:#?}"
+        );
+        let npx_args = vec!["--yes", "--package", "@vtsls/language-server", "vtsls"];
+        for candidate in &candidates {
+            let (probe, probe_args) = &candidate.probe;
+            if candidate.origin == "npx" {
+                assert_eq!(candidate.prefix_args, npx_args, "{candidate:#?}");
+                assert_eq!(probe, &candidate.command, "{candidate:#?}");
+                assert_eq!(probe_args, &npx_args, "the probe runs the server's own bin: {candidate:#?}");
+            } else {
+                assert!(candidate.prefix_args.is_empty(), "{candidate:#?}");
+                assert_eq!(probe, &candidate.command, "vtsls is its own probe: {candidate:#?}");
+                assert!(probe_args.is_empty(), "{candidate:#?}");
+            }
+        }
+    }
+
+    /// A path names one binary and is never searched around.
+    #[test]
+    fn a_command_that_is_a_path_is_the_only_candidate() {
+        let root = Path::new("/projects/thing");
+        for command in ["/opt/ts/vtsls", "servers/vtsls"] {
+            let candidates = candidates(Path::new(command), root, &[]);
+            assert_eq!(candidates.len(), 1, "{candidates:#?}");
+            assert_eq!(candidates[0].command, PathBuf::from(command));
+        }
+    }
+
+    /// Nothing usable says which server is missing, how to install it, and
+    /// where to point the plugin instead.
+    #[test]
+    fn nothing_usable_names_vtsls_and_the_remedy() {
+        let err =
+            resolve(Path::new("/nonexistent/vtsls"), Path::new("/projects/thing"), HOST_SCRIPT_EXTENSIONS)
+                .expect_err("must not resolve");
+        let message = format!("{err:#}");
+        assert!(message.contains("no usable vtsls"), "{message}");
+        assert!(message.contains("npm install -g @vtsls/language-server"), "{message}");
+        assert!(message.contains("plugins/typescript/plugin.toml"), "{message}");
+    }
+
+    /// The shipped manifest's semantic section and capabilities, which this
+    /// module reads at run time and nothing reads at build time.
+    #[test]
+    fn the_shipped_manifest_configures_vtsls() {
+        let config = SemanticConfig::from_manifest_at(Path::new(MANIFEST))
+            .expect("plugins/typescript/plugin.toml parses")
+            .expect("and declares a [plugin.semantic] section");
+        assert_eq!(config.command, PathBuf::from(SERVER_BIN), "a bare name, so PATH is tried first");
+        assert_eq!(config.args, vec!["--stdio"]);
+        assert_eq!(config.engine, "vtsls");
+        assert_eq!(config.readiness, ServerReadiness::OnDemand);
+        assert!(config.implementation_kinds.is_empty(), "{:?}", config.implementation_kinds);
+        assert_eq!(config.overload_disambiguation, OverloadDisambiguation::None);
+        assert_eq!(
+            config.settings.get(""),
+            Some(&serde_json::json!({ "typescript": { "tsserver": { "useSyntaxServer": "never" } } })),
+            "{:?}",
+            config.settings
+        );
+
+        let parsed = manifest();
+        assert!(
+            parsed["plugin"]["semantic"].get("overload_disambiguation").is_none(),
+            "left at its default: vtsls names the bound overload"
+        );
+        let capabilities = &parsed["plugin"]["capabilities"];
+        assert_eq!(capabilities["semantic_pass"].as_bool(), Some(true));
+        assert_eq!(capabilities["semantic_sweep"].as_bool(), Some(false));
+        assert_eq!(capabilities["receiver_calls"].as_str(), Some("resolved"));
+        assert_eq!(capabilities["receiver_calls_structural"].as_str(), Some("unresolved"));
+    }
+
+    #[test]
+    fn the_manifest_version_matches_the_crates() {
+        assert_eq!(manifest()["plugin"]["plugin_version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// Each extension opens under the `languageId` tsserver parses it by;
+    /// `.ts`, `.mts` and `.cts` match no pair and take the bridge's language.
+    #[test]
+    fn each_extension_has_the_language_id_tsserver_parses_it_by() {
+        let id = |file: &str| {
+            LANGUAGE_IDS
+                .iter()
+                .find(|(extension, _)| file.ends_with(extension))
+                .map_or(LANGUAGE, |(_, id)| id)
+        };
+        let ids: Vec<(&str, &str)> = ["a.tsx", "a.jsx", "a.js", "a.mjs", "a.cjs", "a.ts", "a.mts", "a.cts"]
+            .into_iter()
+            .map(|file| (file, id(file)))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("a.tsx", "typescriptreact"),
+                ("a.jsx", "javascriptreact"),
+                ("a.js", "javascript"),
+                ("a.mjs", "javascript"),
+                ("a.cjs", "javascript"),
+                ("a.ts", "typescript"),
+                ("a.mts", "typescript"),
+                ("a.cts", "typescript"),
+            ]
+        );
+    }
+}

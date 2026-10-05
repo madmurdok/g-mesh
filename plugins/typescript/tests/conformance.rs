@@ -61,10 +61,6 @@ const CAPABILITY_CHECKS: [&str; 2] =
 /// tagged `tier = "semantic"`. Hand-written so an entry added without a
 /// decision about its tier fails
 /// [`the_expectation_constants_describe_the_file_they_count`] first.
-///
-/// GM-325: `Greetable#greet` became semantic (vtsls resolves the receiver
-/// call), `mutate` in `src/amb/b.ts` lost its tag (empty in both arms), and
-/// `Base#hello` was added, semantic.
 const EXPECTATIONS: usize = 35;
 const SEMANTIC_EXPECTATIONS: usize = 7;
 
@@ -116,7 +112,10 @@ fn semantic() -> PluginCheck {
 /// No semantic tier: core never asks for one and the structural tier answers
 /// alone.
 fn structural() -> PluginCheck {
-    base().semantic_pass(false).receiver_calls("unresolved", "unresolved").manifest_extra(manifest_extra(None))
+    base()
+        .semantic_pass(false)
+        .receiver_calls("unresolved", "unresolved")
+        .manifest_extra(manifest_extra(None))
 }
 
 /// The shipped configuration on a machine with no vtsls.
@@ -241,7 +240,7 @@ fn the_expectation_constants_describe_the_file_they_count() {
 /// the `[plugin.semantic.settings.""]` table deleted, a cold vtsls answers a
 /// default import's and an ambiguous barrel's hop site with the import
 /// binding itself, the bridge upholds the structural edge, and the
-/// `MenuGroup` and `src/amb/a.ts` `mutate` entries fail (GM-325/S9 item 19).
+/// `MenuGroup` and `src/amb/a.ts` `mutate` entries fail.
 #[test]
 fn the_linked_index_answers_every_expectation_with_vtsls() {
     let outcome = semantic().expect(EXPECT).run().expect("the conformance kit could not be run");
@@ -317,8 +316,8 @@ fn the_semantic_tier_is_what_the_semantic_entries_need() {
         // a receiver call on an interface-typed parameter
         "missing (expected, not found): src/shapes.ts:viaGreetable",
         // an inherited method through `this` and through `super`
-        "missing (expected, not found): src/inherit/derived.ts:Child#viaThis",
-        "missing (expected, not found): src/inherit/derived.ts:Other#viaSuper",
+        "missing (expected, not found): src/inherit/derived.ts:Child#viaThis, \
+         src/inherit/derived.ts:Other#viaSuper",
         // the overloaded `format`: one row either way, two edges only bound
         "the response carries no files tally at all",
     ] {

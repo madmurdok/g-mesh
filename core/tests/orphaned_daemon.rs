@@ -244,7 +244,7 @@ fn daemon_from_a_copy_of_the_binary() -> (tempfile::TempDir, PathBuf) {
     let copied_bin = bin_dir.path().join(Path::new(BIN).file_name().expect("the test binary has a name"));
     std::fs::copy(BIN, &copied_bin).expect("failed to copy the g-mesh binary");
     let built_dir = Path::new(BIN).parent().expect("the test binary has a directory");
-    for plugin in ["g-mesh-plugin-rust", "g-mesh-plugin-python"] {
+    for plugin in ["g-mesh-plugin-rust", "g-mesh-plugin-python", "g-mesh-plugin-typescript"] {
         let name = format!("{plugin}{}", std::env::consts::EXE_SUFFIX);
         std::fs::copy(built_dir.join(&name), bin_dir.path().join(&name))
             .unwrap_or_else(|err| panic!("failed to copy {name} (run `cargo build --workspace`): {err}"));
