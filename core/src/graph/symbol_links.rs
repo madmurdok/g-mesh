@@ -193,10 +193,10 @@
 //!    under a declared name (`export default class Foo {}` is a node called
 //!    `Foo`), which only a semantic layer can tie together.
 //!
-//! "Unresolved" is not always the last word on these. The JS/TS plugin's
-//! semantic pass re-asks the ones whose target file does not declare the name
-//! of the compiler itself and re-sends the edge with `source: "ts-compiler"`
-//! when it gets a single answer (the TS plugin's former semantic pass).
+//! "Unresolved" is not always the last word on these. The TypeScript plugin's
+//! semantic pass re-asks the language server (vtsls) about the ones whose
+//! target file does not declare the name itself, and re-sends the edge with
+//! `source: semantic`, engine `vtsls`, when it gets a single answer.
 //! Two `export *` branches offering one name are ambiguous *here* and settled
 //! in the language, which hands a consumer the first branch to offer it; and
 //! `default` is a name no file ever declares, while `definition` at the
