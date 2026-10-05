@@ -1642,15 +1642,16 @@ fn shorten_paths_keeps_only_the_last_component_of_rooted_paths() {
     // the runner's temp path survives into the item.
     let windows = error_cause(
         "failed to spawn the rust plugin's bulk index\n\
+         Run `cargo build --workspace` in C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpRhPq7a: \
          the plugin binary C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpRhPq7a\\target\\debug\\g-mesh-plugin-rust.exe \
-         has not been built yet. Run `cargo build --workspace` in \
-         C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpRhPq7a",
+         has not been built yet",
     );
     assert!(
-        windows.starts_with("the plugin binary g-mesh-plugin-rust.exe has not been built yet."),
+        windows.starts_with(
+            "Run `cargo build --workspace` in .tmpRhPq7a: the plugin binary g-mesh-plugin-rust.exe has"
+        ),
         "{windows}"
     );
-    assert!(windows.contains("Run `cargo build --workspace`"), "{windows}");
     assert!(!windows.contains("RUNNER~1"), "{windows}");
 }
 
@@ -1740,11 +1741,9 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
     let named = crate::daemon::manifest::exe_suffixed(&binary, std::env::consts::EXE_SUFFIX)
         .unwrap_or_else(|| binary.clone());
     let name = named.file_name().unwrap().to_str().unwrap();
-    assert!(
-        item.starts_with(&format!("rust (the plugin binary {name} has not been built yet.")),
-        "{rendered}"
-    );
-    assert!(item.contains("Run `cargo build"), "the item must name the build command: {rendered}");
+    assert!(item.starts_with("rust (Run `cargo build --workspace` in "), "{rendered}");
+    // The cap may cut the tail after the binary's name, never the command.
+    assert!(item.contains(&format!("the plugin binary {name}")), "{rendered}");
     assert!(!item.contains("failed to spawn"), "{rendered}");
     assert!(!rendered.contains(&workspace.path().display().to_string()), "{rendered}");
 
@@ -1753,6 +1752,76 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
     let windows = crate::daemon::plugin::missing_workspace_binary_hint_with_suffix(&binary, ".exe")
         .expect("the fixture must be the unbuilt-workspace-binary shape");
     let cause = error_cause(&windows);
-    assert!(cause.starts_with("the plugin binary g-mesh-plugin-rust.exe has not been built yet."), "{cause}");
-    assert!(cause.contains("Run `cargo build --workspace`"), "{cause}");
+    assert!(cause.starts_with("Run `cargo build --workspace` in "), "{cause}");
+    assert!(cause.contains("the plugin binary g-mesh-plugin-rust.exe"), "{cause}");
+}
+
+/// GM-351: the 100-byte cap on a failed language's cause never cuts the
+/// build command out of the unbuilt-workspace-binary hint. Worst case on
+/// any host: the longest bundled workspace plugin binary name, read from the
+/// real manifests, in its Windows `.exe` spelling, under both profiles
+/// (`--release` is the longer command) and both hint variants (a workspace
+/// root with `Cargo.toml`, and none: "the repository root"). Every case is
+/// long enough to be cut, so the assertions are about where the cut lands:
+/// after the whole command.
+///
+/// Control: restore the old order in
+/// `plugin::missing_workspace_binary_hint_with_suffix` (binary first, then
+/// "Run `{build}` in ...") - the cut lands inside the command and the
+/// `contains` assertion fails (already for the first case, debug with a
+/// root: 71 bytes of path and wording leave no room for the command).
+#[test]
+fn the_cap_never_cuts_the_build_command_out_of_the_longest_windows_hint() {
+    let found = real_plugins(&["go", "python", "rust", "typescript"]);
+    // The workspace-built plugins: those whose command sits under a cargo
+    // `target/<profile>/` directory, as `${G_MESH_BIN_DIR}` resolves.
+    let (language, name) = found
+        .manifests
+        .values()
+        .filter(|manifest| {
+            let profile = manifest.command.parent().and_then(|dir| dir.file_name());
+            profile.is_some_and(|profile| profile == "debug" || profile == "release")
+        })
+        .map(|manifest| {
+            let name = manifest.command.file_name().unwrap().to_str().unwrap();
+            let name = name.strip_suffix(std::env::consts::EXE_SUFFIX).unwrap_or(name);
+            (manifest.language.clone(), name.to_string())
+        })
+        .max_by_key(|(_, name)| name.len())
+        .expect("at least one bundled plugin is workspace-built");
+    let others: Vec<&str> =
+        ["go", "python", "rust", "typescript"].into_iter().filter(|other| *other != language).collect();
+
+    for with_root in [true, false] {
+        for (profile, cargo_build) in
+            [("debug", "`cargo build --workspace`"), ("release", "`cargo build --workspace --release`")]
+        {
+            let workspace = tempfile::tempdir().unwrap();
+            if with_root {
+                std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+            }
+            let binary = workspace.path().join("target").join(profile).join(&name);
+            let hint = crate::daemon::plugin::missing_workspace_binary_hint_with_suffix(&binary, ".exe")
+                .expect("the fixture must be the unbuilt-workspace-binary shape");
+            let error = format!("failed to spawn the {language} plugin's bulk index\n{hint}");
+
+            let mut outcomes = vec![(language.as_str(), failed(&error))];
+            outcomes.extend(others.iter().map(|other| (*other, indexed())));
+            let rendered = build(&warm_real(&found, &others, outcomes));
+            let item = failed_item(&rendered, &language);
+            let cause = item
+                .strip_prefix(&format!("{language} ("))
+                .and_then(|rest| rest.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("malformed item: {item}"));
+
+            let case = format!("{profile}, with_root={with_root}: {cause}");
+            assert!(cause.ends_with("..."), "the case must reach the cap: {case}");
+            assert!(cause.len() <= ERROR_BYTES, "{case}");
+            assert!(cause.starts_with(&format!("Run {cargo_build} in ")), "{case}");
+            assert!(cause.contains(cargo_build), "the whole command survives the cap: {case}");
+            if !with_root {
+                assert!(cause.starts_with(&format!("Run {cargo_build} in the repository root: ")), "{case}");
+            }
+        }
+    }
 }

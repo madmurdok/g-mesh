@@ -519,6 +519,11 @@ struct PluginState {
 /// g-mesh looks for its plugins, and a plain `cargo build --workspace` would
 /// only fill `target/debug/`, leaving the error exactly where it was.
 ///
+/// Leads with the build command, then the binary's path (GM-351): the MCP
+/// instructions cut a failed language's cause at 100 bytes, and with the
+/// path first a Windows `.exe` name plus `--release` pushed the command
+/// past the cut. Command first, a cut can only land in the path.
+///
 /// # Which spelling the message names
 ///
 /// `command` reaching this function already went through
@@ -565,12 +570,12 @@ pub(crate) fn missing_workspace_binary_hint_with_suffix(command: &Path, suffix: 
 
     Some(match workspace_root {
         Some(root) => format!(
-            "the plugin binary {} has not been built yet. Run `{build}` in {}",
-            named.display(),
-            root.display()
+            "Run `{build}` in {}: the plugin binary {} has not been built yet",
+            root.display(),
+            named.display()
         ),
         None => format!(
-            "the plugin binary {} has not been built yet (run `{build}` in the repository root)",
+            "Run `{build}` in the repository root: the plugin binary {} has not been built yet",
             named.display()
         ),
     })

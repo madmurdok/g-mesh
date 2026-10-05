@@ -124,8 +124,52 @@ fn missing_workspace_binary_hint_names_the_exe_suffixed_spelling_on_windows() {
     let hint = missing_workspace_binary_hint_with_suffix(&binary, ".exe")
         .expect("a missing target/debug binary must get a hint");
 
-    assert!(hint.contains("g-mesh-plugin-python.exe"), "{hint}");
-    assert!(!hint.contains("g-mesh-plugin-python does not exist"), "{hint}");
+    // The binary the hint says is unbuilt is the `.exe` one, never the bare
+    // name `command` holds (control: name `command` instead of the suffixed
+    // spelling - both assertions fail, on any host, via the `_with_suffix`
+    // entry point).
+    let bare = binary.display().to_string();
+    assert!(hint.contains(&format!("the plugin binary {bare}.exe has not been built yet")), "{hint}");
+    assert!(!hint.contains(&format!("{bare} has not been built yet")), "{hint}");
+}
+
+/// GM-351: the hint's exact wording in both variants - the build command
+/// first, so the 100-byte cap on a failed language's cause in the MCP
+/// instructions can only cut into the path; then the workspace root (or
+/// "the repository root" when no `Cargo.toml` marks one), the binary's path
+/// and "has not been built yet", which the bulk-index and plugin-check
+/// callers match on.
+///
+/// Controls: restore the old order (binary first); drop the root or the
+/// binary's path or "has not been built yet" from either arm; swap the arms -
+/// each fails one of the two `assert_eq!`s.
+#[test]
+fn missing_workspace_binary_hint_leads_with_the_build_command_in_both_variants() {
+    let workspace = tempfile::tempdir().unwrap();
+    let binary = workspace.path().join("target").join("release").join("g-mesh-plugin-rust");
+
+    let rootless =
+        missing_workspace_binary_hint_with_suffix(&binary, "").expect("a missing binary gets a hint");
+    assert_eq!(
+        rootless,
+        format!(
+            "Run `cargo build --workspace --release` in the repository root: \
+             the plugin binary {} has not been built yet",
+            binary.display()
+        )
+    );
+
+    std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+    let rooted =
+        missing_workspace_binary_hint_with_suffix(&binary, "").expect("a missing binary gets a hint");
+    assert_eq!(
+        rooted,
+        format!(
+            "Run `cargo build --workspace --release` in {}: the plugin binary {} has not been built yet",
+            workspace.path().display(),
+            binary.display()
+        )
+    );
 }
 
 /// Once the `.exe` file actually exists, `command` itself would already
