@@ -52,7 +52,12 @@
 //! other request with `{"acknowledged": true}`, and walks to one canned `File`
 //! node for `seed.ts`.
 //!
-//! Both exit 0 when core closes stdin.
+//! **Toy** (`--toy <defect>`, `core/tests/plugin_check.rs`): a conformant
+//! plugin for the toy `.fk` language plus one deliberate defect, for
+//! `g-mesh plugins check` to catch - see `toy.rs`. The first positional
+//! argument is the project root it serves.
+//!
+//! All three exit 0 when core closes stdin.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, Write};
@@ -61,6 +66,8 @@ use std::process;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+mod toy;
 
 use g_mesh_plugin_sdk::framing::{read_frame, write_message};
 use g_mesh_plugin_sdk::wire::CURRENT_PROTOCOL_VERSION;
@@ -103,12 +110,19 @@ struct Args {
     plugin_version: String,
     dir: Option<PathBuf>,
     bulk_root: Option<PathBuf>,
+    toy_defect: Option<String>,
+    /// The first positional argument: core appends the project root.
+    root: Option<PathBuf>,
 }
 
 type Out = Arc<Mutex<io::Stdout>>;
 
 fn main() {
     let args = parse_args();
+    if let Some(defect) = &args.toy_defect {
+        toy::run(defect, args.bulk_root.as_deref(), args.root.as_deref());
+        return;
+    }
     match args.dir.clone() {
         Some(dir) => fixture(&args, &dir),
         None => stub(&args),
@@ -120,6 +134,8 @@ fn parse_args() -> Args {
     let mut plugin_version = "0.0.0-test".to_string();
     let mut dir = None;
     let mut bulk_root = None;
+    let mut toy_defect = None;
+    let mut root = None;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         let mut value = |name: &str| argv.next().unwrap_or_else(|| fail(&format!("{name} needs a value")));
@@ -128,11 +144,16 @@ fn parse_args() -> Args {
             "--plugin-version" => plugin_version = value("--plugin-version"),
             "--dir" => dir = Some(PathBuf::from(value("--dir"))),
             "--bulk-index" => bulk_root = Some(PathBuf::from(value("--bulk-index"))),
-            _ => {}
+            "--toy" => toy_defect = Some(value("--toy")),
+            _ => {
+                if root.is_none() {
+                    root = Some(PathBuf::from(arg));
+                }
+            }
         }
     }
     let language = language.unwrap_or_else(|| fail("--language is required"));
-    Args { language, plugin_version, dir, bulk_root }
+    Args { language, plugin_version, dir, bulk_root, toy_defect, root }
 }
 
 fn fail(message: &str) -> ! {
@@ -164,12 +185,16 @@ fn wait_for(path: &Path) {
 }
 
 fn handshake(out: &Out, args: &Args) {
+    handshake_as(out, &args.language, &args.plugin_version);
+}
+
+fn handshake_as(out: &Out, language: &str, plugin_version: &str) {
     write(
         out,
         &json!({
             "protocolVersion": CURRENT_PROTOCOL_VERSION,
-            "language": args.language,
-            "pluginVersion": args.plugin_version,
+            "language": language,
+            "pluginVersion": plugin_version,
         }),
     );
 }
