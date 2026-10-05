@@ -26,10 +26,11 @@ pub fn flush(
     let mut builder = FileGraphBuilder::new(language, engine, path);
     builder.record_untyped_receiver_calls();
     let open_sites = model.take_open_sites();
+    let public = model.public_flags();
     let (nodes, edges) = model.into_parts();
-    for node in nodes {
+    for (node, public) in nodes.into_iter().zip(public) {
         let mut spec = NodeSpec::new(node.kind, node.name, node.qualified_name, node.range);
-        spec.visibility = if node.exported { Visibility::Public } else { Visibility::File };
+        spec.visibility = if public { Visibility::Public } else { Visibility::File };
         spec.native_kind = node.native_kind;
         spec.signature = node.signature;
         spec.doc_comment = node.doc_comment;
