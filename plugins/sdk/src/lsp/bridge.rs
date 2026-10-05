@@ -266,6 +266,18 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// on an overload set goes through steps 1-4 too, and records its edge with
 /// the ordinal when one binds and without it when none does.
 ///
+/// # Re-export hops
+///
+/// A [`OpenSiteKind::Reference`] site with `replaces` names a structural edge
+/// onto a `pending_symbol` placeholder addressed by file and bare name - a use
+/// that hops through a re-export or a default import. It is asked only while
+/// that file is in the index and declares nothing of that name itself, and
+/// not at all when an `OverloadCall` at the same call was kept as an overload
+/// question. Its answer goes through the ordinary `definition` rules: one that
+/// lands elsewhere contradicts the structural edge, an empty or ambiguous one
+/// upholds it (R1). The design is
+/// `docs/architecture/gm-325-typescript-lsp-semantics.md`, section 4.3.
+///
 /// # Readiness (decision 4)
 ///
 /// A cold server answers `definition` with nothing while it indexes, and
@@ -876,6 +888,7 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
         let Some(entry) = index.entry(path) else { continue };
         let mut for_file = Vec::new();
         let mut skipped = 0usize;
+        let mut kept_overloads: HashSet<(String, u32, u32)> = HashSet::new();
         for site in &entry.graph.open_sites {
             let ask = match site.kind {
                 OpenSiteKind::Implementation => {
@@ -894,11 +907,36 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
                     if !overloaded.targets(&entry.graph, replaced) {
                         continue;
                     }
+                    kept_overloads.insert(site_key(site));
                     Ask::Overload(site.clone())
+                }
+                OpenSiteKind::Reference if site.replaces.is_some() => {
+                    // A hop through a re-export or a default import: asked
+                    // only while its placeholder is one the linker cannot
+                    // settle on its own. Like a dropped overload call, a
+                    // site not asked is not unanswerable - its structural
+                    // edge stands as the answer.
+                    let replaced = site.replaces.as_deref().unwrap_or_default();
+                    if !unsettled_hop(index, &entry.graph, replaced) {
+                        continue;
+                    }
+                    Ask::Definition(site.clone())
                 }
                 OpenSiteKind::ReceiverCall | OpenSiteKind::Reference => Ask::Definition(site.clone()),
             };
             for_file.push(Question { file: path.clone(), position: site.position, ask });
+        }
+        // One question per call: a hop site at a call already kept as an
+        // overload question is dropped, because the overload binding is the
+        // stronger answer and two answers for one edge would leave two rows.
+        // After the loop, so the order sites were recorded in does not matter.
+        if !kept_overloads.is_empty() {
+            for_file.retain(|question| match &question.ask {
+                Ask::Definition(site) if site.kind == OpenSiteKind::Reference && site.replaces.is_some() => {
+                    !kept_overloads.contains(&site_key(site))
+                }
+                _ => true,
+            });
         }
         if !config.implementation_kinds.is_empty() {
             for node in &entry.graph.nodes {
@@ -927,6 +965,31 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
         asking.append(&mut for_file);
     }
     Questions { asking, unanswerable, truncated }
+}
+
+/// Where a site is, as [`questions`] matches an overload call with a hop
+/// site at the same call: the enclosing node and the name's position.
+fn site_key(site: &OpenSite) -> (String, u32, u32) {
+    (site.from_id.clone(), site.position.line, site.position.col)
+}
+
+/// Whether structural edge `replaced` of `graph` is a hop the linker cannot
+/// settle, so a [`OpenSiteKind::Reference`] site naming it is worth a
+/// question: the edge lands on a `pending_symbol` placeholder addressed by
+/// file `f` and bare name `n`, `f` is in the index, and `f` itself declares
+/// nothing named `n`. A file that does declare `n` is where the linker lands
+/// the edge already; what is left is `n` re-exported from elsewhere, or
+/// `default`.
+fn unsettled_hop(index: &SdkIndex, graph: &crate::graph::FileGraph, replaced: &str) -> bool {
+    let Some(edge) = graph.edges.iter().find(|edge| edge.id == replaced) else { return false };
+    let Some(placeholder) = graph.nodes.iter().find(|node| node.id == edge.to_id) else { return false };
+    if placeholder.native_kind.as_deref() != Some(PlaceholderKind::PendingSymbol.native_kind()) {
+        return false;
+    }
+    let Some(target) = &placeholder.target else { return false };
+    let (TargetScope::File(file), TargetKey::Name(name)) = (&target.scope, &target.key) else { return false };
+    let Some(declaring) = index.entry(&RelPath::new(file)) else { return false };
+    !declaring.graph.nodes.iter().any(|node| node.name == *name && is_addressable(node))
 }
 
 /// The declarations an [`OpenSiteKind::OverloadCall`] site may be bound to,
