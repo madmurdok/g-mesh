@@ -432,6 +432,10 @@ const MAX_SERVER_STARTS: u32 = 4;
 ///   `replaces` exists instead.
 pub struct LspBridge {
     language: String,
+    /// `(extension, languageId)` pairs for a `didOpen` - see
+    /// [`LspBridge::language_ids`]. A file no pair matches is opened as
+    /// `language`.
+    language_ids: &'static [(&'static str, &'static str)],
     root: PathBuf,
     /// The project root with symlinks resolved. A server reports absolute
     /// paths, and on macOS `$TMPDIR` is `/var/folders/…`, a symlink to
@@ -505,6 +509,18 @@ impl LspBridge {
         Self::with_budgets(language, root, config, Budgets::default())
     }
 
+    /// Opens each file whose name ends with one of the `(extension,
+    /// languageId)` pairs' extensions under that `languageId`, and every other
+    /// file under the bridge's language.
+    ///
+    /// A server may parse a document by its `languageId` rather than by its
+    /// file name: tsserver reads `typescriptreact` as TSX, and a `.tsx` file
+    /// opened as `typescript` is parsed without JSX.
+    pub fn language_ids(mut self, by_extension: &'static [(&'static str, &'static str)]) -> Self {
+        self.language_ids = by_extension;
+        self
+    }
+
     /// [`LspBridge::new`] with budgets a test can make small - see
     /// [`Budgets`].
     pub fn with_budgets(language: &str, root: &Path, config: SemanticConfig, budgets: Budgets) -> Self {
@@ -513,6 +529,7 @@ impl LspBridge {
             .unwrap_or_else(|_| root.to_path_buf());
         Self {
             language: language.to_string(),
+            language_ids: &[],
             root: root.to_path_buf(),
             real_root,
             config,
@@ -648,7 +665,8 @@ impl LspBridge {
         root: &Path,
         index: &SdkIndex,
         scope: &BTreeSet<RelPath>,
-        language_id: &str,
+        language: &str,
+        language_ids: &[(&str, &str)],
     ) {
         for path in scope {
             let Some(entry) = index.entry(path) else { continue };
@@ -680,7 +698,7 @@ impl LspBridge {
                         json!({
                             "textDocument": {
                                 "uri": uri,
-                                "languageId": language_id,
+                                "languageId": language_id(path, language, language_ids),
                                 "version": 1,
                                 "text": entry.source,
                             }
@@ -965,6 +983,15 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
         asking.append(&mut for_file);
     }
     Questions { asking, unanswerable, truncated }
+}
+
+/// The `languageId` `path` is opened under: the first of `language_ids`
+/// whose extension the path ends with, else `language`.
+fn language_id<'a>(path: &RelPath, language: &'a str, language_ids: &[(&str, &'a str)]) -> &'a str {
+    language_ids
+        .iter()
+        .find(|(extension, _)| path.as_str().ends_with(extension))
+        .map_or(language, |(_, id)| id)
 }
 
 /// Where a site is, as [`questions`] matches an overload call with a hop
@@ -2718,6 +2745,7 @@ impl SemanticEngine for LspBridge {
         }
 
         let language = self.language.clone();
+        let language_ids = self.language_ids;
         let engine = self.config.engine.clone();
         let budgets = self.budgets;
         let disambiguation = self.config.overload_disambiguation;
@@ -2733,7 +2761,15 @@ impl SemanticEngine for LspBridge {
                 None => Err(None),
                 Some(client) => {
                     client.drain();
-                    Self::sync_documents(client, &mut opened, &root, index, &asked_about, &language);
+                    Self::sync_documents(
+                        client,
+                        &mut opened,
+                        &root,
+                        index,
+                        &asked_about,
+                        &language,
+                        language_ids,
+                    );
                     match Self::wait_ready(client, &budgets, deadline, &language) {
                         Ok(()) => Ok(run_pass(
                             client,
