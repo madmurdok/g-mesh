@@ -41,10 +41,9 @@
 [[callers]]
 symbol = "add"
 file = "src/math.ts"
-# GM-382. This plugin's semantic tier is the TypeScript compiler itself,
-# resolved from the plugin's own `node_modules` rather than from the user's
-# machine, so it is the least likely of the four to be missing - but the
-# assertion is not "it cannot happen", it is "it did not happen here":
+# GM-382. This plugin's semantic tier is vtsls, found on `PATH`, in the
+# project's `node_modules/.bin` or through `npx` (GM-325), so it can be
+# missing like the other three - the assertion is "it did not happen here":
 # `"silent"` requires the response to carry no `provenance` block, and fails
 # if this plugin ever answers while claiming its semantic tier was absent.
 # Every other entry in this file requires the same thing by saying nothing,
@@ -120,41 +119,27 @@ files = ["src/main.ts:2"]
 # the reason rather than dropping the entry from its list.
 tier = "semantic"
 
-# --- callers: the receiver call this language never resolves (GM-385) --------
+# --- callers: a receiver call, resolved by the semantic tier (GM-385, GM-325) -
 #
-# `src/shapes.ts`'s `viaGreetable(g: Greetable)` calls `g.greet()`. In the
-# other three bundled plugins that call produces an edge onto whatever
-# declaration the receiver's *static* type names - `go/types` files it under
-# the interface method, rust-analyzer under the trait's, pyright under the
-# annotation's class. This plugin files it nowhere: `plugin.toml` declares
-# `receiver_calls = "unresolved"` **and** `receiver_calls_structural =
-# "unresolved"`, so neither tier emits anything and this page is empty.
+# `src/shapes.ts`'s `viaGreetable(g: Greetable)` calls `g.greet()`. The
+# structural tier has no type for `g`, so it records a receiver-call site and
+# no edge (`receiver_calls_structural = "unresolved"`); the semantic tier asks
+# vtsls where the call lands, and tsserver names the declaration the
+# receiver's *static* type declares - the interface method, the same answer
+# `go/types`, rust-analyzer and pyright give for their own fixtures
+# (`receiver_calls = "resolved"`).
 #
-# That pair of manifest fields had no check behind it until this entry
-# existed. The fixture carried no receiver call at all, so a plugin that
-# quietly started resolving them - or a manifest edited to claim it did -
-# changed nothing any expectation could see.
-#
-# **No `tier` key, and this entry must pass in the structural arm too.** That
-# is the assertion rather than a concession: `core/tests/plugin_check.rs`'s
-# `a_namespace_import_caller_needs_the_semantic_pass_to_resolve` runs this
-# same file against a `semantic_pass = false` manifest and lists this entry
-# among the ones a missing tier must not disturb. An entry that differed
-# between those two arms would mean tsserver had started answering receiver
-# calls, which is exactly what the manifest says it does not.
-#
-# Read beside `plugins/go`'s `Conn.Close`, `plugins/rust`'s
-# `shapes::<Circle as Shape>::area` and `plugins/python`'s
-# `Greeter.describe`: all four fixtures now assert an empty `[[callers]]`
-# page for a method reached through a receiver, and the four comments are
-# where the two different reasons are kept apart. Here there is no edge to
-# narrow. There the edge exists and points at the base, which is what
-# `core/src/mcp/instructions.rs`'s `P4_STATIC` discloses once per
-# session for those three languages and never for this one.
+# Until GM-325 this page was empty in both arms, and the entry asserted that
+# emptiness. It is semantic now: the structural arm still answers nothing,
+# so `tests/conformance.rs`'s structural run without the skip flag lists it
+# among the entries a missing tier must fail, as does
+# `core/tests/plugin_check.rs`'s
+# `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`.
 [[callers]]
 symbol = "Greetable#greet"
 file = "src/shapes.ts"
-expect = []
+expect = ["src/shapes.ts:viaGreetable"]
+tier = "semantic"
 
 # --- references (includes SUPERTYPE_OF, which callers/implementations don't share) -
 
@@ -384,10 +369,10 @@ tier = "semantic"
 [[callers]]
 symbol = "mutate"
 file = "src/amb/b.ts"
-# Empty in both arms; tagged with its pair, since it is only evidence of
-# which branch was picked when the semantic pass ran.
+# Empty in both arms, so untagged: the semantic tier binds the import to
+# `./a`, and the structural tier to neither branch. A `tier = "semantic"` tag
+# would require it to fail in the structural arm, where it passes.
 expect = []
-tier = "semantic"
 
 # --- calls inside arrows, callbacks, class fields, and at top level ----------
 
@@ -454,4 +439,19 @@ symbol = "target"
 # `export const keep = lib.target` through `import * as lib from "./lib"`.
 # The structural pass cannot see a member of a namespace import.
 expect = ["src/nsref/use.ts:keep"]
+tier = "semantic"
+
+# --- an inherited method through `this` and `super` (GM-325) -----------------
+
+[[callers]]
+symbol = "Base#hello"
+# `src/inherit/derived.ts`'s `Child#viaThis` calls `this.hello()` and
+# `Other#viaSuper` calls `super.hello()`; neither class declares `hello`, and
+# `Base` is imported from another file. The structural tier binds a
+# `this.m()` / `super.m()` only to a member declared in the calling file, so
+# both are receiver-call sites it leaves open; vtsls lands both on
+# `Base#hello`.
+expect = ["src/inherit/derived.ts:Child#viaThis", "src/inherit/derived.ts:Other#viaSuper"]
+# Decision 12: two rows in one file.
+files = ["src/inherit/derived.ts:2"]
 tier = "semantic"
