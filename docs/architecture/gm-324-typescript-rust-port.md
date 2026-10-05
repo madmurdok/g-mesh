@@ -265,6 +265,13 @@ structural tier (`extract.test.ts` 339). This is what core's
    do not move. Names and specifiers are sliced from the original source, so
    they keep their NULs. `extract.ts:502` did the same swap for a different
    reason (a node-tree-sitter read-buffer bug).
+6. **JSDoc on interface method signatures.** The port attaches a `/** */`
+   block to a method signature inside an interface as its `docComment`; Node
+   sent `null` there. Ids are unchanged; those nodes' embedding text now
+   includes their documentation. Measured on excalidraw: 10 nodes, the only
+   field difference in the whole graph
+   (`docs/results/gm-324-ts-rust-port-measurements.md`). Accepted by the owner
+   (2026-10-05).
 
 ## 2. Project model port
 
