@@ -18,6 +18,9 @@
 //! - Visibility is `public` when the declaration is exported, including by an
 //!   `export { name }`, `export default name` or `export = name` anywhere in
 //!   the file, which also adds the `EXPORTS` edge.
+//! - A member takes its class or interface's visibility, without an
+//!   `EXPORTS` edge of its own; a `private` or `#private` member stays
+//!   `file`.
 //!
 //! Imports, re-exports and computed specifiers are [`crate::extractor::imports`]';
 //! function bodies, calls and references are [`crate::extractor::bodies`]'.
@@ -33,7 +36,8 @@ use crate::extractor::model::{FileModel, NodeParams, PendingSupertype};
 use crate::extractor::scope::{block_scope, type_parameter_scope, Scope};
 use crate::extractor::syntax::{
     child_of_kind, children, doc_comment_for, function_signature, has_body, has_child_of_kind,
-    heritage_name_tokens, heritage_names, method_native_kind, named_children, string_literal_value, text,
+    heritage_name_tokens, heritage_names, is_private_member, method_native_kind, named_children,
+    string_literal_value, text,
 };
 
 /// Node types a class can be written as.
@@ -517,6 +521,8 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         params.native_kind = Some(method_native_kind(node, name, is_static).to_string());
         params.signature = Some(function_signature(name, node, self.source));
         params.doc_comment = doc_comment_for(node, self.source);
+        params.owner_id = Some(scope.enclosing_symbol_id.clone());
+        params.private_member = is_private_member(node, name_node);
         let index = self.model.declare_symbol(params);
         self.visit_function_body(node, scope, index);
     }
@@ -551,6 +557,8 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         params.native_kind = Some(value.kind().to_string());
         params.signature = Some(function_signature(name, value, self.source));
         params.doc_comment = doc_comment_for(node, self.source);
+        params.owner_id = Some(scope.enclosing_symbol_id.clone());
+        params.private_member = is_private_member(node, name_node);
         let index = self.model.declare_symbol(params);
         self.visit_function_body(value, scope, index);
     }

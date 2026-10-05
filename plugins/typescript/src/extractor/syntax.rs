@@ -26,6 +26,14 @@ pub fn has_child_of_kind(node: Node, kind: &str) -> bool {
     children(node).iter().any(|child| child.kind() == kind)
 }
 
+/// Whether a class member is `private`: TypeScript's `private` modifier, or
+/// an ECMAScript `#name`.
+pub fn is_private_member(member: Node, name: Node) -> bool {
+    name.kind() == "private_property_identifier"
+        || child_of_kind(member, "accessibility_modifier")
+            .is_some_and(|modifier| has_child_of_kind(modifier, "private"))
+}
+
 /// The first child (anonymous tokens included) of `kind`.
 pub fn child_of_kind<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
     children(node).into_iter().find(|child| child.kind() == kind)
