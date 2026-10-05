@@ -281,4 +281,30 @@ mod tests {
         assert!(message.contains("rustup component add rust-analyzer"), "{message}");
         assert!(message.contains("/nonexistent/rust-analyzer"), "{message}");
     }
+
+    /// A path's failure carries its origin, in the SDK's shared format.
+    #[test]
+    fn a_path_that_fails_is_reported_with_its_origin() {
+        let err = resolve(Path::new("/nonexistent/rust-analyzer")).expect_err("must not resolve");
+        let message = format!("{err:#}");
+        assert!(
+            message.starts_with(
+                "no usable rust-analyzer: /nonexistent/rust-analyzer (the path the manifest names): "
+            ),
+            "{message}"
+        );
+    }
+
+    /// A path that answers `--version` resolves to itself, with what it
+    /// printed and the path's origin. `echo` exits zero and prints a
+    /// non-empty line for `--version` on every unix.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_answers_resolves_with_its_origin() {
+        let resolved = resolve(Path::new("/bin/echo")).expect("echo answers");
+        assert_eq!(resolved.command, PathBuf::from("/bin/echo"));
+        assert!(resolved.prefix_args.is_empty(), "{:?}", resolved.prefix_args);
+        assert_eq!(resolved.origin, "the path the manifest names");
+        assert_ne!(resolved.version, "no version reported");
+    }
 }
