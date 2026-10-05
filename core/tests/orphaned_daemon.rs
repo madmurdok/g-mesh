@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use g_mesh::daemon;
 use g_mesh::daemon::lifecycle::{CORE_IDLE_ENV, PLUGIN_IDLE_ENV};
+use g_mesh::daemon::manifest;
 use g_mesh::storage::connection::project_dir;
 
 mod common;
@@ -239,15 +240,35 @@ fn a_daemon_whose_project_root_is_deleted_stops_itself() {
 /// to sit. The cargo-workspace plugins' binaries are another matter: their
 /// manifests name `${G_MESH_BIN_DIR}/g-mesh-plugin-*`, the running
 /// executable's own directory (GM-404), so they are copied beside it too.
+///
+/// Which binaries those are is read from the same manifests the daemon will
+/// discover, not listed here: a hard-coded list silently went stale when the
+/// TypeScript plugin moved under `${G_MESH_BIN_DIR}` (GM-351), and the
+/// fixtures' `src/alpha.ts` then waited 60s for a plugin that was never
+/// beside the copy. This process resolves `${G_MESH_BIN_DIR}` to the same
+/// profile directory `BIN` sits in (`deps/` is stepped over), so a manifest
+/// whose resolved `command` lives there is one the copy needs - with the
+/// platform's `.exe` already applied by the resolver.
 fn daemon_from_a_copy_of_the_binary() -> (tempfile::TempDir, PathBuf) {
     let bin_dir = tempfile::tempdir().expect("failed to create a directory for the daemon's binary");
     let copied_bin = bin_dir.path().join(Path::new(BIN).file_name().expect("the test binary has a name"));
     std::fs::copy(BIN, &copied_bin).expect("failed to copy the g-mesh binary");
-    let built_dir = Path::new(BIN).parent().expect("the test binary has a directory");
-    for plugin in ["g-mesh-plugin-rust", "g-mesh-plugin-python"] {
-        let name = format!("{plugin}{}", std::env::consts::EXE_SUFFIX);
-        std::fs::copy(built_dir.join(&name), bin_dir.path().join(&name))
-            .unwrap_or_else(|err| panic!("failed to copy {name} (run `cargo build --workspace`): {err}"));
+    let built_dir =
+        manifest::current_bin_dir().expect("this test can resolve its own executable's directory");
+    let discovered =
+        manifest::discover(&manifest::bundled_roots()).expect("the bundled plugin manifests parse");
+    let beside_the_binary: Vec<&Path> = discovered
+        .manifests
+        .values()
+        .map(|plugin| plugin.command.as_path())
+        .filter(|command| command.parent() == Some(built_dir.as_path()))
+        .collect();
+    assert!(!beside_the_binary.is_empty(), "no bundled manifest names a binary in {}", built_dir.display());
+    for command in beside_the_binary {
+        let name = command.file_name().expect("a resolved plugin command names a file");
+        std::fs::copy(command, bin_dir.path().join(name)).unwrap_or_else(|err| {
+            panic!("failed to copy {} (run `cargo build --workspace`): {err}", command.display())
+        });
     }
     (bin_dir, copied_bin)
 }
