@@ -33,6 +33,7 @@
 //! and restarting the daemon gets the pass.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use g_mesh_plugin_sdk::lsp::{
@@ -55,6 +56,20 @@ const LANGUAGE_IDS: [(&str, &str); 5] = [
     (".mjs", "javascript"),
     (".cjs", "javascript"),
 ];
+
+/// How long vtsls's first question may take - the SDK's `Budgets::warm_up`.
+///
+/// With `useSyntaxServer = "never"` the one tsserver answers nothing until it
+/// has loaded the projects of the files opened before the first question, and
+/// vtsls reports no progress the bridge's readiness could wait on. GM-325
+/// measured that load on excalidraw (docs/results/gm-325-ts-semantic-gaps.md,
+/// section 3): 12.8-24 s without `node_modules`, 24-33 s with them, at a load
+/// average of 4-5; under load 12 the pass timed out four 10 s windows, so the
+/// load ran past 30 s there too. 120 s is about 3.6x the slowest measured
+/// load, which leaves room for a busier machine or a larger project, and is
+/// still small against the whole-project pass's 15-minute floor. It is paid
+/// once per server, and only in full by a server that never answers.
+const WARM_UP: Duration = Duration::from_secs(120);
 
 /// The npm package's language-server bin, the manifest's `command`.
 const SERVER_BIN: &str = "vtsls";
@@ -81,7 +96,7 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
             )
         })?;
     prepare(&mut config, root)?;
-    Ok(Box::new(LspBridge::new(LANGUAGE, root, config).language_ids(&LANGUAGE_IDS)))
+    Ok(Box::new(LspBridge::new(LANGUAGE, root, config).language_ids(&LANGUAGE_IDS).warm_up(WARM_UP)))
 }
 
 /// Turns the manifest's `config` into the one the server for `root` runs

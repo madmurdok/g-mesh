@@ -199,6 +199,7 @@ fn budgets() -> Budgets {
         single_file: Duration::from_secs(30),
         readiness: Duration::from_secs(20),
         settle: Duration::from_millis(150),
+        warm_up: None,
     }
 }
 
@@ -1641,6 +1642,7 @@ fn a_project_larger_than_the_old_ceiling_still_completes_its_pass() {
         single_file: Duration::from_secs(600),
         readiness: Duration::from_secs(60),
         settle: Duration::from_millis(150),
+        warm_up: None,
     };
     let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
 

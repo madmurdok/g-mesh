@@ -186,6 +186,12 @@ pub(crate) struct LspClient {
     /// Set once the server's stdout has closed, so a caller that polls again
     /// after a crash is told the same thing rather than blocking.
     closed: bool,
+    /// Whether this server's first question has been settled - answered,
+    /// refused or timed out - so that [`Budgets::warm_up`](super::Budgets)
+    /// no longer applies to it. A fact about *this* server for the same
+    /// reason as `settled`: a restarted server loads its project from cold
+    /// again, and a flag that dies with the client cannot be left stale.
+    warmed_up: bool,
 }
 
 impl LspClient {
@@ -254,6 +260,7 @@ impl LspClient {
             settled: config.readiness == ServerReadiness::OnDemand,
             on_demand: config.readiness == ServerReadiness::OnDemand,
             closed: false,
+            warmed_up: false,
         };
         client.initialize(config, root, deadline)?;
         Ok(client)
@@ -419,6 +426,18 @@ impl LspClient {
         }
         self.settled = false;
         self.mark_edited();
+    }
+
+    /// Whether this server's warm-up question is behind it - see
+    /// [`Budgets::warm_up`](super::Budgets).
+    pub(crate) fn warmed_up(&self) -> bool {
+        self.warmed_up
+    }
+
+    /// Records that this server's first question has been settled, whichever
+    /// way: the warm-up budget is spent once per server, never re-armed.
+    pub(crate) fn mark_warmed_up(&mut self) {
+        self.warmed_up = true;
     }
 
     /// Whether this server is gone.
