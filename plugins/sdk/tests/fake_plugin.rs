@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,8 @@ const FAKE: &str = env!("CARGO_BIN_EXE_g-mesh-fake-plugin");
 const PATIENCE: Duration = Duration::from_secs(20);
 
 /// How long the fake is given to do something it must not do. A wrong fake
-/// does it in milliseconds; a right one never does.
+/// does it in milliseconds; a right one never does. The window only means
+/// that once the fake is demonstrably running - see [`Fake::assert_quiet`].
 const QUIET: Duration = Duration::from_millis(500);
 
 /// A fresh fixture directory under cargo's per-target scratch space, unique to
@@ -90,6 +91,29 @@ impl Fake {
         self.frames.recv_timeout(PATIENCE).unwrap_or_else(|_| panic!("no frame within {PATIENCE:?}: {what}"))
     }
 
+    /// Blocks until the fixture persona has logged its own pid to
+    /// `spawns.log`, the first thing it does - before its options, before any
+    /// gate. Only from there is [`Self::assert_quiet`]'s window a statement
+    /// about the fake: macOS's first exec of a freshly linked binary can take
+    /// longer than [`QUIET`] on its own, so a window opened at spawn could
+    /// close before an ungated fake had even started (GM-351 verify, F3).
+    fn wait_until_started(&self, dir: &Path) {
+        let pid = self.child.id().to_string();
+        let log = dir.join("spawns.log");
+        let deadline = Instant::now() + PATIENCE;
+        while !fs::read_to_string(&log).is_ok_and(|text| text.lines().any(|line| line == pid)) {
+            assert!(
+                Instant::now() < deadline,
+                "the fake did not log pid {pid} to {} within {PATIENCE:?}",
+                log.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Asserts no frame arrives within [`QUIET`]. The caller must first show
+    /// the process is up - [`Self::wait_until_started`], or a frame it already
+    /// received - or a slow exec alone can make this pass.
     fn assert_quiet(&self, what: &str) {
         if let Ok(frame) = self.frames.recv_timeout(QUIET) {
             panic!("{what}, but the fake wrote {frame}");
@@ -129,6 +153,7 @@ fn a_gated_fixture_withholds_its_handshake_until_the_gate_file_exists() {
     write_options(&dir, json!({ "gated": true }));
     let fake = Fake::fixture("gated", &dir);
 
+    fake.wait_until_started(&dir);
     fake.assert_quiet("the handshake must wait for handshake.allow");
     fs::write(dir.join("handshake.allow"), "").unwrap();
     let handshake = fake.next_frame("the handshake once the gate is open");
@@ -175,7 +200,15 @@ fn a_fixture_told_to_exit_without_a_handshake_says_nothing_and_exits_1() {
 
     let status = fake.wait_for_exit("exitWithoutHandshakeAfterMs");
     assert_eq!(status.code(), Some(1));
-    assert!(fake.frames.recv_timeout(QUIET).is_err(), "nothing may be written, not even a handshake");
+    // The process is gone, so its stdout reaches EOF and the reader hangs up:
+    // waiting for that disconnect drains everything it wrote, with no window.
+    match fake.frames.recv_timeout(PATIENCE) {
+        Err(RecvTimeoutError::Disconnected) => {}
+        Ok(frame) => panic!("nothing may be written, not even a handshake, but the fake wrote {frame}"),
+        Err(RecvTimeoutError::Timeout) => {
+            panic!("the fake's stdout did not close within {PATIENCE:?} of its exit")
+        }
+    }
 }
 
 #[test]
