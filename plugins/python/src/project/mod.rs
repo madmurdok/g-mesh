@@ -1277,4 +1277,71 @@ mod tests {
         presence(&tree, &mut context, "lib/pkg/mod.py", true);
         assert!(context.has_container("pkg.mod"));
     }
+
+    #[test]
+    fn a_namespace_package_stays_a_container_while_any_module_still_provides_it() {
+        let tree = Tree::new("presence-namespace");
+        tree.write("app.py", "");
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+        presence(&tree, &mut context, "ns/a.py", true);
+        presence(&tree, &mut context, "ns/b.py", true);
+        presence(&tree, &mut context, "ns/a.py", false);
+        assert!(context.has_container("ns") && context.has_container("ns.b"), "ns/b.py still provides ns");
+        assert!(!context.has_container("ns.a"));
+        presence(&tree, &mut context, "ns/b.py", false);
+        assert!(!context.has_container("ns"), "the last module of ns took the package with it");
+    }
+
+    #[test]
+    fn a_path_under_any_excluded_directory_is_ignored_however_deep() {
+        let tree = Tree::new("presence-excluded");
+        tree.write("pkg/mod.py", "");
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+        let loaded = context.clone();
+        for path in [
+            "node_modules/pyright/x.pyi",
+            "pkg/__pycache__/mod.py",
+            "pkg/.venv/lib/x.py",
+            "deep/site-packages/dist/x.py",
+            ".git/hooks/x.py",
+            ".claude/x.py",
+            // A source `src/` file under an excluded directory must not
+            // re-root the project either.
+            "src/.tox/x.py",
+        ] {
+            tree.write(path, "");
+            context.file_presence_changed(&RelPath::new(path), true);
+            assert_eq!(context, loaded, "creating {path}");
+            context.file_presence_changed(&RelPath::new(path), false);
+            assert_eq!(context, loaded, "deleting {path}");
+        }
+        assert_eq!(ProjectContext::load(&tree.0).unwrap(), loaded, "load ignores the same paths");
+    }
+
+    #[test]
+    fn only_a_file_under_src_itself_decides_the_src_layout() {
+        let tree = Tree::new("presence-src");
+        tree.write("app.py", "");
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+        // Names that sort right beside `src/` but are not under it.
+        for path in ["src.py", "src-x/a.py", "srcs/a.py"] {
+            presence(&tree, &mut context, path, true);
+            assert_eq!(context.roots(), &[Root { dir: RelPath::new("") }], "after {path}");
+        }
+        // A stub alone is enough to make `src/` a root, and re-keys every file.
+        presence(&tree, &mut context, "src/lib/m.pyi", true);
+        assert_eq!(context.roots(), &[Root { dir: RelPath::new("src") }]);
+        assert!(context.has_container("lib.m"));
+        assert!(matches!(context.container_for(&RelPath::new("app.py")), ContainerInfo::Orphan { .. }));
+        presence(&tree, &mut context, "src/lib/m.py", true);
+        presence(&tree, &mut context, "src/lib/m.pyi", false);
+        assert_eq!(
+            context.roots(),
+            &[Root { dir: RelPath::new("src") }],
+            "src/lib/m.py still holds the root"
+        );
+        presence(&tree, &mut context, "src/lib/m.py", false);
+        assert_eq!(context.roots(), &[Root { dir: RelPath::new("") }]);
+        assert_eq!(context.container_for(&RelPath::new("app.py")), module("app", None, "app"));
+    }
 }
