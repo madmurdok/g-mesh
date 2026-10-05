@@ -17,8 +17,14 @@
 # bundled plugin (go, python, rust, typescript - see that directory's own
 # README for why one file per language, not one file total). A real reindex:
 #   - spawns every bundled plugin's one-shot bulk-index process for real
-#     (core/src/daemon/bulk_index.rs's `run`), and fails the whole walk if any
-#     one of them fails to spawn or exits non-zero;
+#     (core/src/daemon/bulk_index.rs's `run`). Since ADR 0021 a language whose
+#     plugin fails to spawn or exits non-zero is dropped from the index rather
+#     than failing the walk, and `reindex` reports that as exit status 2
+#     ("<language> failed to index and is not in the index"), which this
+#     script treats as a failure like any other non-zero status. The JS/TS
+#     plugin's binary is additionally required up front (GM-326; see the
+#     staged-files check below), so its absence is named before the reindex
+#     and the embedding backfill it runs are paid for;
 #   - has each plugin actually parse its own fixture file and emit nodes and
 #     edges over the same NDJSON protocol a real project's index is built
 #     from;
@@ -85,7 +91,15 @@ case "$target" in
 esac
 
 bin="$stage_dir/$bin_name"
-[ -f "$bin" ] || die "staged binary not found: $bin (did the packaging step run first?)"
+# GM-326: the JS/TS plugin is a cargo binary staged beside its manifest, and
+# is required here with the core binary, on every platform. Without it the
+# reindex below would still fail (exit 2, see this script's header), but only
+# after a full walk and embedding backfill, and with the cause buried in its
+# output.
+ts_plugin_bin="$stage_dir/plugins/typescript/g-mesh-plugin-typescript${bin_name#g-mesh}"
+for staged in "$bin" "$ts_plugin_bin"; do
+	[ -f "$staged" ] || die "staged binary not found: $staged (did the packaging step run first?)"
+done
 [ -d "$FIXTURE_DIR" ] || die "fixture directory not found: $FIXTURE_DIR"
 
 # A scratch copy of the fixture, so this never writes into the tracked

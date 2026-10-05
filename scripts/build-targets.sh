@@ -41,10 +41,15 @@
 # WHAT AN ARCHIVE CONTAINS
 #
 #   g-mesh[.exe]                     the core binary
-#   plugins/typescript/              the JS/TS plugin as a self-contained
-#                                    executable, its native addons, and the
-#                                    plugin.toml core discovers it through
-#                                    (built by scripts/bundle-plugin.sh)
+#   plugins/typescript/              the JS/TS plugin: a cargo binary built
+#                                    in the same workspace as core, for the
+#                                    same target, and the plugin.toml core
+#                                    discovers it through (built by
+#                                    scripts/bundle-plugin.sh; see that
+#                                    script's own header for GM-326). No
+#                                    Node.js is needed to build or run it;
+#                                    its semantic tier uses vtsls when one
+#                                    is installed separately.
 #   plugins/go/                     the Go plugin as one static, CGO-free
 #                                    binary cross-compiled for this target,
 #                                    with the plugin.toml core discovers it
@@ -74,12 +79,11 @@
 # (GOOS/GOARCH, CGO_ENABLED=0 - see scripts/bundle-go-plugin.sh); the other
 # three are built on their target's own runner. Every part of
 # an archive has to be for the *same* platform, which is why each target is
-# built on its own runner (see .github/workflows/release.yml) - the JS/TS
-# plugin embeds the build machine's own Node runtime and cannot be
-# cross-built, and the Rust and Python plugins are built the same way core
-# itself is (`rustup target add` + `cargo build --target`, on that target's
-# own runner) rather than through a second, plugin-specific cross-build path -
-# see scripts/bundle-rust-plugin.sh's own header for why that is deliberate.
+# built on its own runner (see .github/workflows/release.yml) - the JS/TS,
+# Rust and Python plugins are built the same way core itself is (`rustup
+# target add` + `cargo build --target`, on that target's own runner) rather
+# than through a second, plugin-specific cross-build path - see
+# scripts/bundle-rust-plugin.sh's own header for why that is deliberate.
 #
 # `G_MESH_SKIP_PLUGIN_BUNDLE=1` exists for the one case that is still useful
 # without either plugin: exercising the Rust *core* cross-build path (macOS
@@ -285,13 +289,21 @@ build_one() {
 		# path resolution regresses back to a compile-time path. All bundled
 		# plugins are required, not just one - GM-288 added the Rust check
 		# alongside the JS/TS one that was already here, and GM-298 adds the
-		# Python one the same way.
+		# Python one the same way. `plugins list` reads manifests only, so
+		# since GM-326 the JS/TS check also requires the cargo-built plugin
+		# binary the staged manifest spawns: a manifest with no binary beside
+		# it is discovered but cannot index anything. The pattern wants a
+		# loaded manifest (`typescript  <version>  ...`), not an error line.
 		if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" != "1" ]; then
 			log "smoke test: the staged binary discovers the staged plugins"
-			local plugins_output
+			local plugins_output ts_exe="g-mesh-plugin-typescript"
+			case "$target" in
+			*-windows-*) ts_exe="g-mesh-plugin-typescript.exe" ;;
+			esac
 			plugins_output="$("$stage_dir/$bin_name" plugins list)"
-			echo "$plugins_output" | grep -q "typescript" ||
-				die "the staged binary does not discover the typescript plugin staged beside it"
+			{ echo "$plugins_output" | grep -Eq "^typescript +[0-9]" &&
+				[ -f "$stage_dir/plugins/typescript/$ts_exe" ]; } ||
+				die "the staged binary does not discover the typescript plugin staged beside it, or its binary plugins/typescript/$ts_exe is missing"
 			echo "$plugins_output" | grep -q "go" ||
 				die "the staged binary does not discover the go plugin staged beside it"
 			echo "$plugins_output" | grep -q "rust" ||

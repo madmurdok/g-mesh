@@ -21,9 +21,11 @@
 # A release archive is a complete install, not a binary:
 #
 #   g-mesh                       the core binary
-#   plugins/typescript/          the JS/TS plugin (its own embedded Node
-#                                runtime) and the plugin.toml core discovers
-#                                it through
+#   plugins/typescript/          the JS/TS plugin (a plain cargo binary,
+#                                needing no Node.js runtime, GM-326) and the
+#                                plugin.toml core discovers it through
+#   plugins/go/                  the Go plugin (one static binary) and its
+#                                own plugin.toml (GM-283)
 #   plugins/rust/                the Rust plugin (a plain cargo binary,
 #                                needing no runtime of its own) and its own
 #                                plugin.toml (GM-288)

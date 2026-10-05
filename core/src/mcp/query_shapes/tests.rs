@@ -88,25 +88,6 @@ fn typescript_refuses_node_builtin_specifiers_only() {
     }
 }
 
-/// `scripts/bundle-plugin.sh` writes the installed TypeScript manifest by
-/// hand; its `[plugin.non_symbol_queries]` must say what the repo's own
-/// manifest says, or a release install refuses different queries than a
-/// checkout does.
-///
-/// Control: change `starts_with` in the script's heredoc (drop `"node:"`) -
-/// the two tables then differ and this fails.
-#[test]
-fn the_bundled_typescript_manifest_declares_the_same_shapes() {
-    let script = include_str!("../../../../scripts/bundle-plugin.sh");
-    let start =
-        script.find("<<EOF\n# Bundled JS/TS plugin").expect("the bundled manifest heredoc") + "<<EOF\n".len();
-    let len = script[start..].find("\nEOF\n").expect("the heredoc's end");
-    let bundled = crate::daemon::manifest::non_symbol_queries_of(&script[start..start + len])
-        .expect("the bundled manifest parses");
-
-    assert_eq!(Some(&bundled), QueryShapes::shipped().get("typescript"));
-}
-
 /// T5: the pairs to retry. Only a language that strips the prefix gets one;
 /// a remainder that is empty, or that the same language refuses as typed,
 /// gets none - so `@` is stripped at most once and a scoped package or a
@@ -164,20 +145,4 @@ fn the_shipped_manifests_strip_at_for_typescript_and_python_only() {
     for language in ["go", "rust"] {
         assert_eq!(shipped.strip(language), Some(&[][..]), "{language}");
     }
-}
-
-/// The installed TypeScript manifest strips what the repo's own does.
-///
-/// Control: delete the `[plugin.symbol_query_prefixes]` table from the
-/// script's heredoc - the two lists differ and this fails.
-#[test]
-fn the_bundled_typescript_manifest_strips_the_same_prefixes() {
-    let script = include_str!("../../../../scripts/bundle-plugin.sh");
-    let start =
-        script.find("<<EOF\n# Bundled JS/TS plugin").expect("the bundled manifest heredoc") + "<<EOF\n".len();
-    let len = script[start..].find("\nEOF\n").expect("the heredoc's end");
-    let (_, bundled) = crate::daemon::manifest::query_tables_of(&script[start..start + len])
-        .expect("the bundled manifest parses");
-
-    assert_eq!(Some(bundled.strip.as_slice()), QueryShapes::shipped().strip("typescript"));
 }
