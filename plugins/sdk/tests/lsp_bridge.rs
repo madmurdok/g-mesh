@@ -3570,6 +3570,53 @@ fn without_a_warm_up_the_first_question_gets_the_request_budget_and_the_pipeline
     assert!(in_flight[0] >= 4, "the pipeline fills to `concurrency` before any answer: {in_flight:?}");
 }
 
+/// How many questions reached the server before it answered its `nth`
+/// (1-based, by arrival) - the `nth` itself included. A question never
+/// answered counts every arrival.
+fn asked_before_answer(timeline: &Path, nth: usize) -> usize {
+    let answer = format!("answered {nth}");
+    std::fs::read_to_string(timeline)
+        .unwrap_or_default()
+        .lines()
+        .take_while(|line| *line != answer)
+        .filter(|line| line.starts_with("asked "))
+        .count()
+}
+
+/// With no warm-up configured, the first question is not sent alone: while
+/// the server holds its first answer - well inside `request`, so the bridge
+/// is still waiting for it rather than giving up on it - the rest of the
+/// pipeline is already asked. Counted by the server: arrivals before its
+/// first answer is written.
+///
+/// Control: `let warming = !client.warmed_up();` in `run_pass` (the
+/// `warm_up.is_some()` condition dropped); the first question goes out alone
+/// and is answered before any other arrives. The test above misses that
+/// mutant: its held first question times out at `request`, which spends the
+/// warm-up, and the pipeline fills before the server's first answer anyway.
+#[test]
+fn without_a_warm_up_the_first_question_is_not_asked_alone() {
+    let scratch = Scratch::new("warm-up-off-held");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 6);
+    // The first answer is held for 1.5s of a 5s `request`; the rest at once.
+    let (config, timeline) = held_server(&scratch, json!([]), &[COLD_MS], &[], json!({}));
+    let budgets = budgets();
+    assert_eq!(budgets.warm_up, None);
+    assert!(Duration::from_millis(COLD_MS) * 3 <= budgets.request);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "the held first answer came inside `request`: {:?}", answer.reason);
+    let before_first = asked_before_answer(&timeline, 1);
+    assert!(
+        before_first > 1,
+        "more than one question was outstanding while the first was held: {} arrivals before `answered 1`\n{}",
+        before_first,
+        std::fs::read_to_string(&timeline).unwrap_or_default()
+    );
+}
+
 /// A warm-up shorter than `request` never shortens the first question's
 /// budget.
 ///
