@@ -779,6 +779,7 @@ dependencies = [
  "anyhow",
  "g-mesh-plugin-sdk",
  "g-mesh-wire",
+ "toml",
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-typescript",

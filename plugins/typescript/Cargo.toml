@@ -23,3 +23,7 @@ tree-sitter = "0.25"
 # Three grammars, routed per extension (`extractor::grammar`).
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.23"
+
+[dev-dependencies]
+# Reads this crate's own `plugin.toml` in the tests that pin it to the code.
+toml = "0.8"
