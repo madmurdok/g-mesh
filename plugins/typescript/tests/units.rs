@@ -102,6 +102,19 @@ fn plugin_toml_watch_files_equal_watch_files() {
     assert_eq!(listed, WATCH_FILES, "plugin.toml's watch_files must equal project::WATCH_FILES");
 }
 
+/// `plugin.toml`'s `plugin_version` is what core announces for this plugin
+/// (`g-mesh plugins list`, the handshake). The plugin is a workspace crate, so
+/// the number follows the release (plugin-modularity.md, "plugin_version: two
+/// rules, not one"); this keeps the two from drifting, with no built binary.
+#[test]
+fn the_manifest_version_matches_the_crates() {
+    assert_eq!(
+        manifest()["plugin"]["plugin_version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "plugin.toml's plugin_version must track Cargo.toml's version - see that file's comment"
+    );
+}
+
 // --- keys ------------------------------------------------------------------
 
 fn seg(sep: Option<&str>, name: &str) -> PathSegment {

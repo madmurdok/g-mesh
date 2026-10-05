@@ -100,6 +100,26 @@ impl PluginBuild {
         Self { _dir: dir, root, plugin_dir }
     }
 
+    /// Adds a second plugin to the same discovery root: the workspace's fake
+    /// plugin under the language `fake`, claiming an extension no fixture file
+    /// has. Its directory is returned, holding a stand-in build output of its
+    /// own.
+    fn with_a_second_plugin(&self) -> PathBuf {
+        let dir = self.root.join("fake");
+        std::fs::create_dir_all(&dir).expect("failed to create the second plugin's directory");
+        std::fs::write(
+            dir.join("plugin.toml"),
+            "[plugin]\nlanguage = \"fake\"\nprotocol_version = 2\nplugin_version = \"0.1.0\"\n\n\
+             [plugin.spawn]\ncommand = \"${G_MESH_BIN_DIR}/g-mesh-fake-plugin\"\n\
+             args = [\"--language\", \"fake\", \"--plugin-version\", \"0.1.0\"]\n\n\
+             [plugin.languages]\nextensions = [\".fk\"]\n",
+        )
+        .expect("failed to write the second plugin's manifest");
+        std::fs::write(dir.join(REBUILT_FILE), "the first build\n")
+            .expect("failed to write the second plugin's stand-in build output");
+        dir
+    }
+
     /// The one file these tests rebuild, resolved inside the copy.
     fn rebuilt_file(&self) -> PathBuf {
         self.plugin_dir.join(REBUILT_FILE)
@@ -341,4 +361,27 @@ async fn a_plugin_re_emitted_to_the_same_bytes_leaves_the_daemon_and_its_index_a
          doctored graph is what it still has to serve"
     );
     assert_eq!(project.daemon_pid(), incumbent, "a re-emitted identical plugin must not retire anything");
+}
+
+/// The stamp covers every discovered plugin, not only TypeScript's: rebuilding
+/// a plugin that no file of this project is even routed to still retires the
+/// daemon, since it holds that plugin's old build all the same.
+#[tokio::test]
+async fn a_rebuild_of_any_discovered_plugin_retires_the_daemon_not_only_typescripts() {
+    let project = Project::new();
+    let second_plugin = project.plugin.with_a_second_plugin();
+
+    assert_eq!(importers_of(&project, "src/db/connection.ts").await, vec!["src/index.ts".to_string()]);
+    let incumbent = project.daemon_pid();
+
+    let rebuilt = second_plugin.join(REBUILT_FILE);
+    let mut output = std::fs::read_to_string(&rebuilt).expect("failed to read the build output");
+    output.push_str("rebuilt with different extraction logic\n");
+    std::fs::write(&rebuilt, output).expect("failed to rewrite the build output");
+
+    let reported = status(&project);
+    assert!(reported.contains("holding a plugin that has been rebuilt"), "{reported}");
+
+    assert_eq!(importers_of(&project, "src/db/connection.ts").await, vec!["src/index.ts".to_string()]);
+    assert_ne!(project.daemon_pid(), incumbent, "a daemon holding the old build of any plugin is replaced");
 }
