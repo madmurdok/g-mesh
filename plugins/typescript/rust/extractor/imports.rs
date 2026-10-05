@@ -581,3 +581,6 @@ fn posix_join(segments: &[String]) -> String {
     }
     normalized
 }
+
+#[cfg(test)]
+mod tests;
