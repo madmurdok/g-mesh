@@ -19,10 +19,7 @@ language = "typescript"
 protocol_version = 2
 # Must equal this crate's `Cargo.toml` `version`: a plugin in the cargo
 # workspace tracks the release version (docs/architecture/plugin-modularity.md,
-# "plugin_version: two rules, not one"). package.json's `.version` still
-# agrees with it, because `every_declaration_of_the_bundled_plugins_version_agrees`
-# (core/src/daemon/manifest.rs) and scripts/cut-release.sh read it as one of
-# this plugin's version declarations while the npm package remains here.
+# "plugin_version: two rules, not one"); scripts/cut-release.sh checks it.
 plugin_version = "4.0.0"
 
 [plugin.spawn]

@@ -300,25 +300,15 @@ yet; it skips the checksum.
 Skipping this step entirely is a perfectly good choice. Everything else works;
 `search_code` just reports that semantic search is unavailable.
 
-A binary built this way finds the plugin through this checkout: the daemon
-falls back to a path relative to `core`'s own source tree, baked in at *compile
-time* (`core/src/daemon/plugin.rs`):
-
-```
-<repo>/plugins/typescript/dist/src/index.js
-```
-
-That fallback is the last of three steps. In precedence order, the daemon uses:
-
-1. `G_MESH_JS_TS_PLUGIN_PATH`, if set — a plugin build of your own. A `.js`
-   path is run with `node`; anything else is executed directly.
-2. `plugins/typescript/` **next to the `g-mesh` binary**, which is what a
-   release archive unpacks to and needs no Node.js at all (below).
-3. The compile-time checkout path above.
-
-```bash
-export G_MESH_JS_TS_PLUGIN_PATH=/path/to/plugins/typescript/dist/src/index.js
-```
+A binary built this way finds every bundled plugin, TypeScript included, the
+same way: by discovering `plugins/<language>/plugin.toml` (next to the `g-mesh`
+binary in a release archive, or in this checkout for a dev build). A
+cargo-built plugin's manifest names its binary as
+`${G_MESH_BIN_DIR}/g-mesh-plugin-<language>`, the directory the running
+`g-mesh` lives in, so `cargo build --workspace` (with `--release` for a
+release `g-mesh`) is all a checkout needs. To run a plugin build of your own,
+put its `<language>/plugin.toml` under `~/.g-mesh/plugins/`, which takes
+precedence over the bundled one.
 
 ### Release artifacts
 
@@ -1024,7 +1014,7 @@ scripts/check.sh                 # the formatting and lint gates, as CI runs the
 ```
 
 `scripts/test-deps.sh` installs what the suite drives for real and cargo
-cannot fetch: the JS/TS plugin's `npm ci` (`build.rs` builds it),
+cannot fetch: the JS/TS plugin's `npm ci` (for its own `npm test`),
 rust-analyzer (`plugins/rust`'s semantic tier) and pyright
 (`plugins/python`'s: an `npm ci` into its gitignored `node_modules`, at the
 exact version its committed `package.json` and `package-lock.json` pin, the
