@@ -1,8 +1,8 @@
-//! A plugin registry over the real TypeScript plugin and a live index in a
-//! temp project, driven the way the daemon's watcher loop drives it. Shared
-//! by the tests that route settled paths to that plugin.
+//! A plugin registry over one real bundled plugin (TypeScript by default) and
+//! a live index in a temp project, driven the way the daemon's watcher loop
+//! drives it. Shared by the tests that route settled paths to that plugin.
 //!
-//! Needs the TypeScript plugin binary built in this profile
+//! Needs that plugin's binary built in this profile
 //! (`cargo build --workspace`).
 
 #![allow(dead_code)]
@@ -29,17 +29,23 @@ impl Harness {
     /// directory, so its manifest and `${G_MESH_BIN_DIR}` command resolve as
     /// they do from the checkout. Nothing is spawned yet.
     pub fn new() -> Self {
+        Self::with_plugin("typescript")
+    }
+
+    /// The same harness over another checked-in plugin directory
+    /// (`plugins/<language>`).
+    pub fn with_plugin(language: &str) -> Self {
         let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
-        let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript");
+        let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins").join(language);
         std::os::unix::fs::symlink(
-            checkout.canonicalize().expect("the checked-in TypeScript plugin directory"),
-            plugins.path().join("typescript"),
+            checkout.canonicalize().expect("the checked-in plugin directory"),
+            plugins.path().join(language),
         )
-        .expect("failed to link the TypeScript plugin directory");
+        .expect("failed to link the plugin directory");
 
         let discovered =
-            manifest::discover(&[plugins.path().to_path_buf()]).expect("the TypeScript manifest discovers");
+            manifest::discover(&[plugins.path().to_path_buf()]).expect("the plugin manifest discovers");
         let root = project.path().canonicalize().expect("failed to canonicalize the project root");
         let state_dir = project_dir(&root).expect("failed to resolve the state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the state directory");
