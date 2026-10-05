@@ -11,7 +11,7 @@ use g_mesh_plugin_typescript::extractor::keys::{
     is_sendable_path, join_path, qualified_in, qualify, MemberSeparator,
 };
 use g_mesh_plugin_typescript::extractor::model::{FileModel, NodeParams};
-use g_mesh_plugin_typescript::project::EXCLUDE_DIRS;
+use g_mesh_plugin_typescript::project::{EXCLUDE_DIRS, WATCH_FILES};
 
 fn manifest() -> toml::Value {
     toml::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))).unwrap()
@@ -75,6 +75,17 @@ fn every_extension_has_exactly_one_grammar() {
     assert_eq!(routed, claimed, "GRAMMARS routes exactly the extensions the plugin claims");
 }
 
+#[test]
+fn plugin_toml_grammars_equal_grammars() {
+    let manifest = manifest();
+    let table = manifest["plugin"]["grammars"].as_table().expect("[plugin.grammars] is a table");
+    let listed: BTreeSet<(&str, Vec<&str>)> =
+        table.iter().map(|(name, extensions)| (name.as_str(), string_list(extensions))).collect();
+    let routed: BTreeSet<(&str, Vec<&str>)> =
+        GRAMMARS.iter().map(|(grammar, extensions)| (grammar.name(), extensions.to_vec())).collect();
+    assert_eq!(listed, routed, "plugin.toml's [plugin.grammars] must equal grammar::GRAMMARS");
+}
+
 // --- project ---------------------------------------------------------------
 
 #[test]
@@ -82,6 +93,13 @@ fn plugin_toml_exclude_dirs_equal_exclude_dirs() {
     let manifest = manifest();
     let listed = string_list(&manifest["plugin"]["workspace"]["exclude_dirs"]);
     assert_eq!(listed, EXCLUDE_DIRS, "plugin.toml's exclude_dirs must equal project::EXCLUDE_DIRS");
+}
+
+#[test]
+fn plugin_toml_watch_files_equal_watch_files() {
+    let manifest = manifest();
+    let listed = string_list(&manifest["plugin"]["workspace"]["watch_files"]);
+    assert_eq!(listed, WATCH_FILES, "plugin.toml's watch_files must equal project::WATCH_FILES");
 }
 
 // --- keys ------------------------------------------------------------------

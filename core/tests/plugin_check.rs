@@ -794,7 +794,9 @@ fn the_typescript_plugin_passes_on_a_small_typescript_fixture() {
     let run = run_check(&ts_plugin_dir(), &ts_conformance_project(), &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
+        // The shipped manifest declares `semantic_pass = false`, so the lazy
+        // check is the one that does not apply.
+        let expected = if id == "capabilities.semantic-engine-lazy" { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     // GM-275: the TS plugin speaks wire v2 now, so there is nothing left for
@@ -1370,27 +1372,13 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
     let scratch = tempfile::tempdir().expect("failed to create a temp dir for the no-semantic-pass plugin");
     let dir = scratch.path().join("typescript");
     fs::create_dir_all(&dir).unwrap();
-    // `dist`/`node_modules` are symlinked rather than copied: this plugin is
-    // already built by `core/build.rs`, and copying `node_modules` (tens of
-    // MB) on every test run would be pure waste - only `plugin.toml` needs
-    // to differ.
-    for shared in ["dist", "node_modules"] {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(plugin.join(shared), dir.join(shared)).unwrap();
-        #[cfg(windows)]
-        {
-            let target = plugin.join(shared);
-            if target.is_dir() {
-                std::os::windows::fs::symlink_dir(&target, dir.join(shared)).unwrap();
-            } else {
-                std::os::windows::fs::symlink_file(&target, dir.join(shared)).unwrap();
-            }
-        }
-    }
+    // Only `plugin.toml` is copied: its `command` names the plugin binary by
+    // `${G_MESH_BIN_DIR}`, which does not depend on the manifest's directory.
+    // The copy declares `semantic_pass = false` whatever the shipped one says.
     let manifest = fs::read_to_string(plugin.join("plugin.toml")).unwrap();
-    assert!(manifest.contains("semantic_pass = true"), "the real manifest must still declare it: {manifest}");
-    fs::write(dir.join("plugin.toml"), manifest.replace("semantic_pass = true", "semantic_pass = false"))
-        .unwrap();
+    let manifest = manifest.replace("semantic_pass = true", "semantic_pass = false");
+    assert!(manifest.contains("semantic_pass = false"), "the copy must declare it off: {manifest}");
+    fs::write(dir.join("plugin.toml"), manifest).unwrap();
 
     let run = run_check_with_expect(&dir, &ts_conformance_project(), &ts_conformance_expect());
     assert!(!run.success, "{}", run.stdout);

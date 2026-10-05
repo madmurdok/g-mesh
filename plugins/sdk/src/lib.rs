@@ -65,12 +65,16 @@
 //!
 //! # Relationship to the TS plugin
 //!
-//! `plugins/typescript` has its own Node implementation of everything above
-//! and is not being ported onto this crate (the design doc's Open Questions
-//! says why). Where a rule here reads as arbitrary, it is almost always
-//! copied from that plugin deliberately - the id scheme and the incremental
-//! diff especially - because both are cross-plugin contracts and the TS
-//! plugin is the implementation the index in the field was built by.
+//! `plugins/typescript` runs on this crate: its binary is an [`Extractor`]
+//! driven by [`run`], like the Rust and Python plugins. Its project model is
+//! the case the presence hook ([`Extractor::file_presence_changed`]) and the
+//! `filesCreated` notification were built for: it resolves imports against
+//! the set of files the walk listed, which must hear of a created file before
+//! an importer of it is extracted. Where a rule here reads as arbitrary, it
+//! is almost always copied deliberately from the Node implementation that
+//! plugin replaced - the id scheme and the incremental diff especially -
+//! because both are cross-plugin contracts and the indexes in the field were
+//! built by it.
 
 #![deny(missing_docs)]
 

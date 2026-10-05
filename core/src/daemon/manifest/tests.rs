@@ -975,8 +975,17 @@ fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
 
     assert_eq!(manifest.language, "typescript");
     assert_eq!(manifest.protocol_version, CURRENT_PROTOCOL_VERSION);
-    assert_eq!(manifest.command, PathBuf::from("node"));
-    assert_eq!(manifest.args, vec![dir.join("dist/src/index.js").to_string_lossy().into_owned()]);
+    let bin_dir = current_bin_dir().expect("the test binary must know its own directory");
+    assert_eq!(manifest.command.parent(), Some(bin_dir.as_path()), "resolved {}", manifest.command.display());
+    assert!(
+        manifest
+            .command
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("g-mesh-plugin-typescript")),
+        "resolved {}",
+        manifest.command.display()
+    );
+    assert!(manifest.args.is_empty(), "{:?}", manifest.args);
     assert!(manifest.extensions.contains(&".ts".to_string()));
     assert!(manifest.extensions.contains(&".tsx".to_string()));
     assert!(manifest.extensions.contains(&".js".to_string()));
@@ -984,11 +993,10 @@ fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
     // This task's acceptance criterion for the bundled manifest: it
     // carries the capabilities, not just the fields this test already
     // checked before this task.
-    assert!(manifest.capabilities.semantic_pass);
-    // Its checker never reports a pass incomplete, so a sweep could delete
-    // upgraded structural edges a pass stopped short of.
+    // Structural tier only until the language-server tier lands.
+    assert!(!manifest.capabilities.semantic_pass);
     assert!(!manifest.capabilities.semantic_sweep);
-    assert!(!manifest.capabilities.files_created);
+    assert!(manifest.capabilities.files_created);
     assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Unresolved);
     assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
     assert_eq!(manifest.workspace.entry_points, vec!["index".to_string()]);
