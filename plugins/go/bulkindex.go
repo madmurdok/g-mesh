@@ -2,8 +2,8 @@ package main
 
 // The one-shot `--bulk-index <root>` cold-start walk: streams NDJSON nodes
 // (and, once GM-280 exists, edges) to stdout, one file at a time, then lets
-// the process exit. Mirrors plugins/typescript/src/bulkIndex.ts's
-// bulkIndexProject - its own doc comment explains why this is a *separate*
+// the process exit. Mirrors `bulk_index` in plugins/sdk/src/run.rs
+// (shared by the Rust-based plugins) - its own doc comment explains why this is a *separate*
 // process rather than a control-plane method (an open-ended stream has no
 // place in a framed request/response protocol), which is exactly why
 // main.go dispatches `--bulk-index` before ever touching the control loop.

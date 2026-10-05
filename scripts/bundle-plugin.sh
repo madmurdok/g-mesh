@@ -36,7 +36,7 @@
 #
 # Node's SEA has neither problem: `createRequire` anchored at the executable's
 # directory loads the prebuilt `.node` addons off disk (see
-# plugins/typescript/sea/native-require.cjs), and the runtime doing so is the
+# the deleted Node SEA plugin's `native-require.cjs`), and the runtime doing so is the
 # same Node the plugin is developed and measured against, so nothing about the
 # plugin's behavior changes by shipping it this way. Bun's genuine advantage -
 # `--target=bun-linux-x64` cross-compiles from any host - buys nothing here:
@@ -78,7 +78,7 @@ declare -a SUPPORTED_TARGETS=(
 )
 
 # The packages that cannot be bundled because they load a `.node` addon - see
-# plugins/typescript/sea/native-require.cjs.
+# the deleted Node SEA plugin's `native-require.cjs`.
 declare -a NATIVE_PACKAGES=(
 	tree-sitter
 	tree-sitter-javascript

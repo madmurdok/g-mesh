@@ -413,7 +413,7 @@ fn placeholders_and_empty_keys_are_never_members() {
 
 /// The control for the test above: a `Module`-kind node that is not one
 /// of the excluded native kinds - a TypeScript namespace is the real
-/// example (`plugins/typescript/src/extract.ts` emits `kind: "Module",
+/// example (`plugins/typescript/src/extractor/decls.rs` emits `kind: "Module",
 /// nativeKind: "namespace"`) - is still a member, so the exclusion above
 /// is about `nativeKind`, not about `kind == "Module"`.
 #[test]

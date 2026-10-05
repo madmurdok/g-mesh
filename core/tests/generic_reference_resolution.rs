@@ -7,17 +7,17 @@
 //! there is no semantic pass to wait on here: the generics-scope task
 //! (b25d0f4b) found this was a syntax-visibility gap in the tree-sitter
 //! extraction pass itself, not a type-inference problem, and the fix
-//! (`plugins/typescript/src/extract.ts`, `// --- generic types ---`) is purely
+//! (`plugins/typescript/src/extractor/bodies.rs`) is purely
 //! structural. So the new edges are already in the index the moment
 //! `wait_until_indexed` returns, exactly like `reexport_linking.rs`.
 //!
-//! `plugins/typescript/test/extract.test.ts`'s own `// --- generic types ---`
-//! section proves these facts at the extractor's unit level; this file proves
+//! `plugins/typescript/tests/bodies.rs`'s generic-head
+//! tests proves these facts at the extractor's unit level; this file proves
 //! the same facts are visible through the real MCP tool surface, which is the
 //! gap this test closes.
 //!
-//! Requires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs
-//! `npm run build` there whenever this crate is built.
+//! Requires the TypeScript plugin binary, which `cargo build --workspace`
+//! builds.
 
 use std::path::{Path, PathBuf};
 

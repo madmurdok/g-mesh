@@ -4,18 +4,20 @@
 //! daemon itself decides on), this exercises the daemon finding its plugin
 //! gone the hard way - mid request - and recovering from it on its own.
 //!
-//! Exercises `daemon::plugin::PluginProcess` directly (the real Node JS/TS
-//! plugin, same build `plugin_bridge.rs` depends on via `core/build.rs`)
+//! Exercises `daemon::plugin::PluginProcess` directly (the real TypeScript
+//! plugin binary, built by `cargo build --workspace`)
 //! rather than the full daemon binary + filesystem watcher: the acceptance
 //! criterion only cares that "a request that needs [the plugin]" recovers
 //! transparently, and driving `apply_file_change` calls directly is a
 //! deterministic way to control exactly when the crash happens relative to
 //! those requests, without racing a real `notify` filesystem watcher.
 
+mod common;
+
 use std::fs;
 
 use g_mesh::daemon::is_process_alive;
-use g_mesh::daemon::plugin::{bundled_manifest, PluginProcess};
+use g_mesh::daemon::plugin::PluginProcess;
 use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
@@ -63,7 +65,7 @@ fn a_killed_plugin_process_is_transparently_relaunched_and_its_pending_queue_rep
     fs::write(root.join("alpha.ts"), "export function alpha() {}\n").expect("failed to write alpha.ts");
     fs::write(root.join("beta.ts"), "export function beta() {}\n").expect("failed to write beta.ts");
 
-    let plugin = PluginProcess::spawn(root, &bundled_manifest(), root.join("plugin.pid"))
+    let plugin = PluginProcess::spawn(root, &common::typescript_manifest(), root.join("plugin.pid"))
         .expect("failed to spawn the JS/TS plugin");
     let conn = setup_conn();
 

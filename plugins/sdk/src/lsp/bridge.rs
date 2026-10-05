@@ -96,8 +96,33 @@ use crate::semantic::{SemanticAnswer, SemanticEngine};
 /// - **`readiness` (10 minutes) and `settle` (2s).** See [`LspBridge`]'s doc
 ///   on readiness. The readiness wait is *inside* the pass budget too, so a
 ///   server that never loads costs a pass rather than a plugin.
+/// - **`warm_up` (off).** A longer budget for a server's *first* question,
+///   for a server that holds every answer until it has loaded the project the
+///   question's file belongs to and reports no progress while it does - so
+///   readiness cannot see the load, and the first questions meet it instead.
+///   GM-325 measured vtsls with one tsserver (`useSyntaxServer = "never"`):
+///   12.8-33 s of loading on excalidraw, during which every request in flight
+///   timed out at `request`, so every cold pass was incomplete and re-run on
+///   the next daemon start. While it is owed, `run_pass` keeps **one**
+///   question in flight, under this budget instead of `request`; the first
+///   answer, refusal or timeout spends it, and the pipeline fills to
+///   `concurrency` under `request` as usual. One question rather than eight
+///   under the long budget because a server that is loading answers none of
+///   them sooner, and a server that never answers then costs one warm-up
+///   rather than eight. Spent once per *server process*
+///   (`LspClient::warmed_up`): a restarted server is cold again and owes a
+///   new one; a pass on a warm server never pays it. A warm-up that times out
+///   fails its question exactly as `request` would - the pass is incomplete
+///   and the file owed - and is not re-armed, so a server that never answers
+///   costs one long wait, not one per question or per pass. It sits *inside*
+///   the pass deadline like everything else, after `readiness`: a deferred
+///   empty answer still waits for `settle`, and the warm-up question's own
+///   empty answer counts as an answer (the server is responsive). `None` - the
+///   default - is exactly the behaviour before it existed. The one value a
+///   plugin sets ([`LspBridge::warm_up`]), because how long a server takes to
+///   load a project is a fact about that server.
 ///
-/// None of these is configuration. They are this type's fields so a test can
+/// None of these is configuration, `warm_up` aside. They are this type's fields so a test can
 /// drive a real timer with small values instead of faking the clock, which is
 /// the same escape hatch `RoundTripTimeouts` documents for core's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +146,10 @@ pub struct Budgets {
     /// How long to wait for a server to report *any* progress before deciding
     /// it is one that never does.
     pub settle: Duration,
+    /// How long a server's first question may take, if longer than
+    /// `request`; see this type's doc. `None` gives the first question
+    /// `request` like every other.
+    pub warm_up: Option<Duration>,
 }
 
 impl Default for Budgets {
@@ -134,6 +163,7 @@ impl Default for Budgets {
             single_file: Duration::from_secs(90),
             readiness: Duration::from_secs(10 * 60),
             settle: Duration::from_secs(2),
+            warm_up: None,
         }
     }
 }
@@ -265,6 +295,18 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// An untyped receiver call (`ReceiverCall`, no `replaces`) whose answer lands
 /// on an overload set goes through steps 1-4 too, and records its edge with
 /// the ordinal when one binds and without it when none does.
+///
+/// # Re-export hops
+///
+/// A [`OpenSiteKind::Reference`] site with `replaces` names a structural edge
+/// onto a `pending_symbol` placeholder addressed by file and bare name - a use
+/// that hops through a re-export or a default import. It is asked only while
+/// that file is in the index and declares nothing of that name itself, and
+/// not at all when an `OverloadCall` at the same call was kept as an overload
+/// question. Its answer goes through the ordinary `definition` rules: one that
+/// lands elsewhere contradicts the structural edge, an empty or ambiguous one
+/// upholds it (R1). The design is
+/// `docs/architecture/gm-325-typescript-lsp-semantics.md`, section 4.3.
 ///
 /// # Readiness (decision 4)
 ///
@@ -420,6 +462,10 @@ const MAX_SERVER_STARTS: u32 = 4;
 ///   `replaces` exists instead.
 pub struct LspBridge {
     language: String,
+    /// `(extension, languageId)` pairs for a `didOpen` - see
+    /// [`LspBridge::language_ids`]. A file no pair matches is opened as
+    /// `language`.
+    language_ids: &'static [(&'static str, &'static str)],
     root: PathBuf,
     /// The project root with symlinks resolved. A server reports absolute
     /// paths, and on macOS `$TMPDIR` is `/var/folders/…`, a symlink to
@@ -493,6 +539,28 @@ impl LspBridge {
         Self::with_budgets(language, root, config, Budgets::default())
     }
 
+    /// Opens each file whose name ends with one of the `(extension,
+    /// languageId)` pairs' extensions under that `languageId`, and every other
+    /// file under the bridge's language.
+    ///
+    /// A server may parse a document by its `languageId` rather than by its
+    /// file name: tsserver reads `typescriptreact` as TSX, and a `.tsx` file
+    /// opened as `typescript` is parsed without JSX.
+    pub fn language_ids(mut self, by_extension: &'static [(&'static str, &'static str)]) -> Self {
+        self.language_ids = by_extension;
+        self
+    }
+
+    /// Gives each server's first question `budget` instead of
+    /// [`Budgets::request`] - see [`Budgets`]'s `warm_up`. For a server that
+    /// answers nothing while it loads a project and reports no progress for
+    /// the load.
+    #[must_use]
+    pub fn warm_up(mut self, budget: Duration) -> Self {
+        self.budgets.warm_up = Some(budget);
+        self
+    }
+
     /// [`LspBridge::new`] with budgets a test can make small - see
     /// [`Budgets`].
     pub fn with_budgets(language: &str, root: &Path, config: SemanticConfig, budgets: Budgets) -> Self {
@@ -501,6 +569,7 @@ impl LspBridge {
             .unwrap_or_else(|_| root.to_path_buf());
         Self {
             language: language.to_string(),
+            language_ids: &[],
             root: root.to_path_buf(),
             real_root,
             config,
@@ -636,7 +705,8 @@ impl LspBridge {
         root: &Path,
         index: &SdkIndex,
         scope: &BTreeSet<RelPath>,
-        language_id: &str,
+        language: &str,
+        language_ids: &[(&str, &str)],
     ) {
         for path in scope {
             let Some(entry) = index.entry(path) else { continue };
@@ -668,7 +738,7 @@ impl LspBridge {
                         json!({
                             "textDocument": {
                                 "uri": uri,
-                                "languageId": language_id,
+                                "languageId": language_id(path, language, language_ids),
                                 "version": 1,
                                 "text": entry.source,
                             }
@@ -876,6 +946,7 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
         let Some(entry) = index.entry(path) else { continue };
         let mut for_file = Vec::new();
         let mut skipped = 0usize;
+        let mut kept_overloads: HashSet<(String, u32, u32)> = HashSet::new();
         for site in &entry.graph.open_sites {
             let ask = match site.kind {
                 OpenSiteKind::Implementation => {
@@ -894,11 +965,36 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
                     if !overloaded.targets(&entry.graph, replaced) {
                         continue;
                     }
+                    kept_overloads.insert(site_key(site));
                     Ask::Overload(site.clone())
+                }
+                OpenSiteKind::Reference if site.replaces.is_some() => {
+                    // A hop through a re-export or a default import: asked
+                    // only while its placeholder is one the linker cannot
+                    // settle on its own. Like a dropped overload call, a
+                    // site not asked is not unanswerable - its structural
+                    // edge stands as the answer.
+                    let replaced = site.replaces.as_deref().unwrap_or_default();
+                    if !unsettled_hop(index, &entry.graph, replaced) {
+                        continue;
+                    }
+                    Ask::Definition(site.clone())
                 }
                 OpenSiteKind::ReceiverCall | OpenSiteKind::Reference => Ask::Definition(site.clone()),
             };
             for_file.push(Question { file: path.clone(), position: site.position, ask });
+        }
+        // One question per call: a hop site at a call already kept as an
+        // overload question is dropped, because the overload binding is the
+        // stronger answer and two answers for one edge would leave two rows.
+        // After the loop, so the order sites were recorded in does not matter.
+        if !kept_overloads.is_empty() {
+            for_file.retain(|question| match &question.ask {
+                Ask::Definition(site) if site.kind == OpenSiteKind::Reference && site.replaces.is_some() => {
+                    !kept_overloads.contains(&site_key(site))
+                }
+                _ => true,
+            });
         }
         if !config.implementation_kinds.is_empty() {
             for node in &entry.graph.nodes {
@@ -927,6 +1023,40 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
         asking.append(&mut for_file);
     }
     Questions { asking, unanswerable, truncated }
+}
+
+/// The `languageId` `path` is opened under: the first of `language_ids`
+/// whose extension the path ends with, else `language`.
+fn language_id<'a>(path: &RelPath, language: &'a str, language_ids: &[(&str, &'a str)]) -> &'a str {
+    language_ids
+        .iter()
+        .find(|(extension, _)| path.as_str().ends_with(extension))
+        .map_or(language, |(_, id)| id)
+}
+
+/// Where a site is, as [`questions`] matches an overload call with a hop
+/// site at the same call: the enclosing node and the name's position.
+fn site_key(site: &OpenSite) -> (String, u32, u32) {
+    (site.from_id.clone(), site.position.line, site.position.col)
+}
+
+/// Whether structural edge `replaced` of `graph` is a hop the linker cannot
+/// settle, so a [`OpenSiteKind::Reference`] site naming it is worth a
+/// question: the edge lands on a `pending_symbol` placeholder addressed by
+/// file `f` and bare name `n`, `f` is in the index, and `f` itself declares
+/// nothing named `n`. A file that does declare `n` is where the linker lands
+/// the edge already; what is left is `n` re-exported from elsewhere, or
+/// `default`.
+fn unsettled_hop(index: &SdkIndex, graph: &crate::graph::FileGraph, replaced: &str) -> bool {
+    let Some(edge) = graph.edges.iter().find(|edge| edge.id == replaced) else { return false };
+    let Some(placeholder) = graph.nodes.iter().find(|node| node.id == edge.to_id) else { return false };
+    if placeholder.native_kind.as_deref() != Some(PlaceholderKind::PendingSymbol.native_kind()) {
+        return false;
+    }
+    let Some(target) = &placeholder.target else { return false };
+    let (TargetScope::File(file), TargetKey::Name(name)) = (&target.scope, &target.key) else { return false };
+    let Some(declaring) = index.entry(&RelPath::new(file)) else { return false };
+    !declaring.graph.nodes.iter().any(|node| node.name == *name && is_addressable(node))
 }
 
 /// The declarations an [`OpenSiteKind::OverloadCall`] site may be bound to,
@@ -2048,6 +2178,9 @@ fn run_pass(
     let mut fail = |reason: String| {
         failure.get_or_insert(reason);
     };
+    // Never shorter than `request`: a warm-up is a longer budget or none.
+    let warm_up = budgets.warm_up.map(|warm_up| warm_up.max(budgets.request));
+    let mut warm_up_logged = false;
 
     loop {
         // A deferred question goes back on the queue only once the server has
@@ -2059,8 +2192,23 @@ fn run_pass(
         if !deferred.is_empty() && client.quiet_for(budgets.settle) {
             queue.append(&mut deferred);
         }
-        // Fill the pipeline.
-        while in_flight.len() < budgets.concurrency.max(1) {
+        // Fill the pipeline - to one question while the server's warm-up is
+        // owed (see `Budgets::warm_up`), to `concurrency` after.
+        let warming = warm_up.is_some() && !client.warmed_up();
+        let width = if warming { 1 } else { budgets.concurrency.max(1) };
+        let request_budget = match warm_up {
+            Some(warm_up) if warming => warm_up,
+            _ => budgets.request,
+        };
+        if warming && !warm_up_logged && !queue.is_empty() {
+            warm_up_logged = true;
+            eprintln!(
+                "[{language}] the server has not answered yet - its first question may take up to {request_budget:?} \
+                 (warm-up), the rest {:?}",
+                budgets.request
+            );
+        }
+        while in_flight.len() < width {
             let Some(question) = queue.pop() else { break };
             touched_files.insert(question.accounted_to().clone());
             let position = {
@@ -2138,12 +2286,14 @@ fn run_pass(
         // Wake up for whichever comes first: an answer, the oldest request's
         // own timeout, or the end of the pass.
         let oldest = in_flight.values().map(|(_, sent)| *sent).min().unwrap_or(now);
-        let wake = (oldest + budgets.request).min(deadline);
+        let wake = (oldest + request_budget).min(deadline);
         let wait = wake.saturating_duration_since(now).max(Duration::from_millis(1));
 
         match client.poll(wait) {
             Poll::Answered { id, result } => {
                 let Some((question, _)) = in_flight.remove(&id) else { continue };
+                // Any answer, empty or not, is a server that is answering.
+                client.mark_warmed_up();
                 // An empty answer while the server is indexing is not an
                 // answer: re-ask it once, after the indexing ends.
                 let empty = question.is_empty_answer(&result);
@@ -2162,6 +2312,7 @@ fn run_pass(
             }
             Poll::Failed { id, code, message } => {
                 let Some((question, _)) = in_flight.remove(&id) else { continue };
+                client.mark_warmed_up();
                 // `ContentModified` is not a refusal: the server's state moved
                 // under the question (rust-analyzer switching crate graphs,
                 // GM-433), so it is asked again once the server is quiet -
@@ -2212,19 +2363,26 @@ fn run_pass(
                 let now = Instant::now();
                 let expired: Vec<i64> = in_flight
                     .iter()
-                    .filter(|(_, (_, sent))| now.duration_since(*sent) >= budgets.request)
+                    .filter(|(_, (_, sent))| now.duration_since(*sent) >= request_budget)
                     .map(|(id, _)| *id)
                     .collect();
+                if !expired.is_empty() {
+                    // A timed-out warm-up is spent too: it is not re-armed,
+                    // so a server that never answers costs one long wait.
+                    client.mark_warmed_up();
+                }
                 for id in expired {
                     let Some((question, _)) = in_flight.remove(&id) else { continue };
                     client.cancel(id);
                     eprintln!(
-                        "[{language}] the server did not answer a question about {} within {:?}",
-                        question.file, budgets.request
+                        "[{language}] the server did not answer a question about {} within {:?}{}",
+                        question.file,
+                        request_budget,
+                        if warming { " (its warm-up budget)" } else { "" }
                     );
                     fail(format!(
                         "the language server did not answer a question about {} within {:?}",
-                        question.file, budgets.request
+                        question.file, request_budget
                     ));
                     failed_files.insert(question.accounted_to().clone());
                 }
@@ -2655,6 +2813,7 @@ impl SemanticEngine for LspBridge {
         }
 
         let language = self.language.clone();
+        let language_ids = self.language_ids;
         let engine = self.config.engine.clone();
         let budgets = self.budgets;
         let disambiguation = self.config.overload_disambiguation;
@@ -2670,7 +2829,15 @@ impl SemanticEngine for LspBridge {
                 None => Err(None),
                 Some(client) => {
                     client.drain();
-                    Self::sync_documents(client, &mut opened, &root, index, &asked_about, &language);
+                    Self::sync_documents(
+                        client,
+                        &mut opened,
+                        &root,
+                        index,
+                        &asked_about,
+                        &language,
+                        language_ids,
+                    );
                     match Self::wait_ready(client, &budgets, deadline, &language) {
                         Ok(()) => Ok(run_pass(
                             client,
@@ -3404,5 +3571,331 @@ mod tests {
         assert_eq!(pass(&[(&caller, "add", 1)]), sent(&["len"]), "pass 2 trims it again, from the full list");
         assert_eq!(pass(&[]), sent(&["add", "len"]), "pass 3: no answer, the full list goes back");
         assert_eq!(pass(&[]), Vec::new(), "pass 4: nothing trimmed now or before, nothing re-sent");
+    }
+
+    // --- which open sites a pass asks about ---------------------------------
+
+    fn line_range(line: u32) -> Range {
+        Range { start: Position { line, col: 0 }, end: Position { line, col: 9 } }
+    }
+
+    /// What `m.toy`, the file a hop's placeholder names, declares under the
+    /// name `n`.
+    #[derive(Clone, Copy, Debug)]
+    enum Declares {
+        Nothing,
+        Function,
+        Placeholder,
+    }
+
+    fn declaring_file(index: &mut SdkIndex, declares: Declares) {
+        let m = RelPath::new("m.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &m);
+        builder.file_node(line_range(0));
+        match declares {
+            Declares::Nothing => {}
+            Declares::Function => {
+                builder.add_node(
+                    NodeSpec::new(NodeKind::Function, "n", "n", line_range(0))
+                        .native_kind("function")
+                        .public(),
+                );
+            }
+            Declares::Placeholder => {
+                builder.add_placeholder(
+                    PlaceholderKind::PendingSymbol,
+                    "n",
+                    file_name("o.toy", "n"),
+                    line_range(0),
+                );
+            }
+        }
+        index.insert(m, "fn n\n".to_string(), builder.finish());
+    }
+
+    /// `o.toy`, declaring an overload set named `n`: a node with
+    /// `declarations`, which is what makes an `OverloadCall` onto `n` worth
+    /// asking.
+    fn overload_file(index: &mut SdkIndex) {
+        let o = RelPath::new("o.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &o);
+        builder.file_node(line_range(0));
+        let declaration = |ordinal| WireDeclaration {
+            ordinal,
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 9,
+            signature: None,
+            has_body: false,
+        };
+        builder.add_node(
+            NodeSpec::new(NodeKind::Function, "n", "n", line_range(0))
+                .native_kind("function")
+                .public()
+                .declarations(vec![declaration(0), declaration(1)]),
+        );
+        index.insert(o, "fn n\n".to_string(), builder.finish());
+    }
+
+    fn file_name(file: &str, name: &str) -> PlaceholderTarget {
+        PlaceholderTarget {
+            scope: TargetScope::File(file.to_string()),
+            key: TargetKey::Name(name.to_string()),
+            from_container: None,
+            key_path: None,
+        }
+    }
+
+    /// What an open site of `u.toy` names in `replaces`.
+    #[derive(Clone, Copy, Debug)]
+    enum Replaces {
+        TheEdge,
+        AMissingEdge,
+        Nothing,
+    }
+
+    /// `u.toy`: `f` with a `CALLS` edge onto a `kind` placeholder addressed by
+    /// `target`, and one open site per `(kind, replaces, line)`, all at
+    /// column 2 of `line`.
+    fn using_file(
+        index: &mut SdkIndex,
+        kind: PlaceholderKind,
+        target: PlaceholderTarget,
+        sites: &[(OpenSiteKind, Replaces, u32)],
+    ) {
+        let u = RelPath::new("u.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &u);
+        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 4, col: 0 } });
+        let f = builder.add_node(
+            NodeSpec::new(NodeKind::Function, "f", "f", line_range(0)).native_kind("function").public(),
+        );
+        let placeholder = builder.add_placeholder(kind, "n", target, line_range(1));
+        let edge = builder.placeholder_edge(EdgeKind::Calls, &f, &placeholder);
+        for (site_kind, replaces, line) in sites {
+            builder.open_site(OpenSite {
+                from_id: f.clone(),
+                position: Position { line: *line, col: 2 },
+                name: "n".to_string(),
+                kind: *site_kind,
+                edge_kind: EdgeKind::Calls,
+                from_container: None,
+                replaces: match replaces {
+                    Replaces::TheEdge => Some(edge.clone()),
+                    Replaces::AMissingEdge => Some("e-missing".to_string()),
+                    Replaces::Nothing => None,
+                },
+            });
+        }
+        index.insert(u, "fn f\n  n()\n  n()\n  n()\n".to_string(), builder.finish());
+    }
+
+    /// What one pass over `u.toy` asks: each question's kind (`OverloadCall`
+    /// for an overload question) and line, sorted, and the unanswerable count.
+    fn asked_about_u(index: &SdkIndex) -> (Vec<(OpenSiteKind, u32)>, usize) {
+        let questions = questions(
+            index,
+            &[RelPath::new("u.toy")],
+            &SemanticConfig::new("toy-server"),
+            &Budgets::default(),
+        );
+        let mut asked: Vec<(OpenSiteKind, u32)> = questions
+            .asking
+            .iter()
+            .map(|question| match &question.ask {
+                Ask::Definition(site) => (site.kind, site.position.line),
+                Ask::Overload(site) => (OpenSiteKind::OverloadCall, site.position.line),
+                other => panic!("only open sites are asked here: {other:?}"),
+            })
+            .collect();
+        asked.sort_by_key(|(kind, line)| (format!("{kind:?}"), *line));
+        (asked, questions.unanswerable)
+    }
+
+    /// A hop - a `Reference` site whose `replaces` names an edge onto a
+    /// `pending_symbol` placeholder addressed by file and bare name - is asked
+    /// only while that file is indexed and declares nothing addressable of
+    /// that name. Every other hop is left to its structural edge, and none of
+    /// them counts as unanswerable.
+    #[test]
+    fn a_hop_is_asked_only_while_the_linker_cannot_settle_its_placeholder() {
+        use PlaceholderKind::{PendingSymbol, Reexport};
+        let qualified = PlaceholderTarget {
+            scope: TargetScope::File("m.toy".to_string()),
+            key: TargetKey::QualifiedName("n".to_string()),
+            from_container: None,
+            key_path: None,
+        };
+        let container = PlaceholderTarget {
+            scope: TargetScope::Container("m".to_string()),
+            key: TargetKey::Name("n".to_string()),
+            from_container: None,
+            key_path: None,
+        };
+        let cases = [
+            (
+                "m.toy declares no n",
+                Declares::Nothing,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                1,
+            ),
+            (
+                "m.toy's n is only a placeholder",
+                Declares::Placeholder,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                1,
+            ),
+            (
+                "m.toy declares n",
+                Declares::Function,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                0,
+            ),
+            (
+                "the file is not indexed",
+                Declares::Nothing,
+                PendingSymbol,
+                file_name("gone.toy", "n"),
+                Replaces::TheEdge,
+                0,
+            ),
+            ("a container scope", Declares::Nothing, PendingSymbol, container, Replaces::TheEdge, 0),
+            ("a qualified-name key", Declares::Nothing, PendingSymbol, qualified, Replaces::TheEdge, 0),
+            (
+                "a reexport placeholder",
+                Declares::Nothing,
+                Reexport,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                0,
+            ),
+            (
+                "the edge is missing",
+                Declares::Nothing,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::AMissingEdge,
+                0,
+            ),
+        ];
+        for (case, declares, kind, target, replaces, expected) in cases {
+            let mut index = SdkIndex::new();
+            declaring_file(&mut index, declares);
+            using_file(&mut index, kind, target, &[(OpenSiteKind::Reference, replaces, 1)]);
+            let (asked, unanswerable) = asked_about_u(&index);
+            let want: Vec<(OpenSiteKind, u32)> =
+                (0..expected).map(|_| (OpenSiteKind::Reference, 1)).collect();
+            assert_eq!(asked, want, "{case}");
+            assert_eq!(unanswerable, 0, "a hop not asked is not unanswerable: {case}");
+        }
+    }
+
+    /// A `Reference` site with no `replaces` and a `ReceiverCall` are asked
+    /// whatever the placeholder looks like: the hop rule is about `replaces`.
+    #[test]
+    fn a_reference_without_replaces_and_a_receiver_call_are_asked_as_before() {
+        let mut index = SdkIndex::new();
+        declaring_file(&mut index, Declares::Function);
+        using_file(
+            &mut index,
+            PlaceholderKind::PendingSymbol,
+            file_name("m.toy", "n"),
+            &[
+                (OpenSiteKind::Reference, Replaces::Nothing, 1),
+                (OpenSiteKind::ReceiverCall, Replaces::Nothing, 2),
+                (OpenSiteKind::ReceiverCall, Replaces::TheEdge, 3),
+            ],
+        );
+        let (asked, unanswerable) = asked_about_u(&index);
+        assert_eq!(
+            asked,
+            vec![
+                (OpenSiteKind::ReceiverCall, 2),
+                (OpenSiteKind::ReceiverCall, 3),
+                (OpenSiteKind::Reference, 1)
+            ]
+        );
+        assert_eq!(unanswerable, 0);
+    }
+
+    /// A hop at the same call (enclosing node and position) as an overload
+    /// question that was kept is dropped, whichever of the two sites was
+    /// recorded first; a hop elsewhere stays.
+    #[test]
+    fn a_hop_at_a_kept_overload_call_is_dropped_in_either_order() {
+        let hop = (OpenSiteKind::Reference, Replaces::TheEdge, 1);
+        let overload = (OpenSiteKind::OverloadCall, Replaces::TheEdge, 1);
+        let elsewhere = (OpenSiteKind::OverloadCall, Replaces::TheEdge, 2);
+        for sites in [[hop, overload, elsewhere], [overload, hop, elsewhere], [elsewhere, overload, hop]] {
+            let mut index = SdkIndex::new();
+            declaring_file(&mut index, Declares::Nothing);
+            overload_file(&mut index);
+            using_file(&mut index, PlaceholderKind::PendingSymbol, file_name("m.toy", "n"), &sites);
+            let (asked, unanswerable) = asked_about_u(&index);
+            assert_eq!(
+                asked,
+                vec![(OpenSiteKind::OverloadCall, 1), (OpenSiteKind::OverloadCall, 2)],
+                "{sites:?}"
+            );
+            assert_eq!(unanswerable, 0);
+        }
+
+        let mut index = SdkIndex::new();
+        declaring_file(&mut index, Declares::Nothing);
+        overload_file(&mut index);
+        using_file(
+            &mut index,
+            PlaceholderKind::PendingSymbol,
+            file_name("m.toy", "n"),
+            &[(OpenSiteKind::OverloadCall, Replaces::TheEdge, 2), hop],
+        );
+        let (asked, _) = asked_about_u(&index);
+        assert_eq!(
+            asked,
+            vec![(OpenSiteKind::OverloadCall, 2), (OpenSiteKind::Reference, 1)],
+            "a hop at another call"
+        );
+    }
+
+    /// When no overload set answers to the call's name, its `OverloadCall`
+    /// site is filtered out and the hop at the same call is asked instead.
+    #[test]
+    fn a_hop_at_a_filtered_overload_call_is_asked() {
+        for sites in [
+            [
+                (OpenSiteKind::Reference, Replaces::TheEdge, 1),
+                (OpenSiteKind::OverloadCall, Replaces::TheEdge, 1),
+            ],
+            [
+                (OpenSiteKind::OverloadCall, Replaces::TheEdge, 1),
+                (OpenSiteKind::Reference, Replaces::TheEdge, 1),
+            ],
+        ] {
+            let mut index = SdkIndex::new();
+            declaring_file(&mut index, Declares::Nothing);
+            using_file(&mut index, PlaceholderKind::PendingSymbol, file_name("m.toy", "n"), &sites);
+            let (asked, unanswerable) = asked_about_u(&index);
+            assert_eq!(asked, vec![(OpenSiteKind::Reference, 1)], "{sites:?}");
+            assert_eq!(unanswerable, 0);
+        }
+    }
+
+    /// `didOpen`'s `languageId` is the first pair whose extension the path
+    /// ends with, else the bridge's language.
+    #[test]
+    fn a_document_opens_under_the_first_matching_language_id() {
+        let ids = [(".tsx", "typescriptreact"), (".x.tsx", "never-reached"), (".js", "javascript")];
+        let id = |path: &str| language_id(&RelPath::new(path), "typescript", &ids);
+        assert_eq!(id("src/a.tsx"), "typescriptreact");
+        assert_eq!(id("src/a.x.tsx"), "typescriptreact", "the first pair wins");
+        assert_eq!(id("src/a.js"), "javascript");
+        assert_eq!(id("src/a.ts"), "typescript");
+        assert_eq!(language_id(&RelPath::new("src/a.tsx"), "typescript", &[]), "typescript");
     }
 }

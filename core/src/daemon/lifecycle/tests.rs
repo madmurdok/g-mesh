@@ -529,7 +529,7 @@ fn with_no_memory_limit_configured_an_oversized_plugin_is_left_alone() {
 /// too.
 ///
 /// 100MB sits between `install_memory_hungry`'s own documented margins -
-/// a bare Node baseline (~20-40MB) and its 200MB hog - so this is not a
+/// the fake plugin's idle footprint (under 2MB) and its 200MB hog - so this is not a
 /// hair's-breadth threshold a slow CI machine could cross by accident in
 /// either direction.
 #[test]

@@ -73,8 +73,8 @@
 //! # Equivalence with the TS plugin
 //!
 //! `tests/id_scheme.rs` asserts this implementation against ids computed by
-//! `plugins/typescript`'s own `nodeIdFor`/`edgeIdFor`
-//! (`plugins/typescript/src/extract.ts`), recorded as literal expected
+//! the original Node TS plugin's own `nodeIdFor`/`edgeIdFor`,
+//! recorded as literal expected
 //! values. They are recorded rather than recomputed at test time because the
 //! point is to pin *this* crate against what the other implementation
 //! actually produced, not to re-run the other implementation and agree with

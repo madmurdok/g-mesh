@@ -12,9 +12,12 @@
 //! So this module writes a plugin directory that is real in every way
 //! `daemon::manifest`, `daemon::plugin` and `daemon::lifecycle` care about -
 //! a `plugin.toml` that `read_manifest`/`discover` parse like any other, and
-//! a Node entry point that speaks the actual wire protocol (`Content-Length`
-//! framed JSON-RPC: a handshake first, then one `FileChangeResponse` per
-//! request). It answers every request with an *empty* diff, which is the
+//! a process that speaks the actual wire protocol (`Content-Length` framed
+//! JSON-RPC: a handshake first, then one `FileChangeResponse` per request).
+//! That process is `g-mesh-fake-plugin`, a test-only binary of
+//! `plugins/sdk` (`plugins/sdk/fake/main.rs`), which the manifest names as
+//! `${G_MESH_BIN_DIR}/g-mesh-fake-plugin`; it exists only after
+//! `cargo build --workspace`. It answers every request with an *empty* diff, which is the
 //! point: these tests are about which process gets asked, not about what a
 //! parser makes of a file.
 //!
@@ -30,11 +33,9 @@
 //! [`set_bulk_stream`] replaces the whole stream, and can make the walk exit
 //! non-zero after it, for tests that need a different graph per walk.
 //!
-//! Node, rather than a shell script, for the same reason the real plugin uses
-//! it: it is already a hard dependency of this crate's test suite
-//! (`core/build.rs` runs `npm run build` and every plugin-spawning test
-//! shells out to `node`), and framed-message parsing in `sh` would be its own
-//! source of test failures.
+//! Each variant's behaviour is chosen by `fake-plugin.json` in the plugin
+//! directory, read once when the process starts; the binary's module doc
+//! lists every file it reads and writes there.
 //!
 //! # Counting spawns
 //!
@@ -79,6 +80,9 @@ use crate::storage::schema;
 /// The file each fake plugin process appends its pid to on startup.
 const SPAWN_LOG: &str = "spawns.log";
 
+/// The fake plugin's options file - see [`write_options`].
+const OPTIONS_FILE: &str = "fake-plugin.json";
+
 /// The file a *gated* plugin waits for before it announces its handshake -
 /// see [`install_gated`] and [`open_handshake_gate`].
 const HANDSHAKE_GATE: &str = "handshake.allow";
@@ -107,19 +111,6 @@ const NOTIFICATION_LOG: &str = "notifications.log";
 /// test can assert the order in which core sent messages to different
 /// plugins ([`frames`]).
 const FRAME_LOG: &str = "frames.log";
-
-/// Marks that a [`install_stalling`] plugin directory's *very first* framed
-/// request has already been (deliberately) left unanswered - see that
-/// function's doc comment. Written by the process that hits it, and read by
-/// every process spawned against this plugin directory afterward - including
-/// a crash-recovery relaunch, which is a fresh Node process with no memory of
-/// its predecessor's in-memory state, but the same directory on disk.
-const STALL_MARKER: &str = "stalled-once.marker";
-
-/// Marks that an [`install_incomplete_once`] plugin directory has already
-/// answered one `semanticPass` as incomplete - kept on disk for the same
-/// reason as [`STALL_MARKER`].
-const INCOMPLETE_MARKER: &str = "incomplete-once.marker";
 
 /// A plugin directory holding this file answers every complete
 /// `semanticPass` with its contents as the diff, instead of an empty one. See
@@ -216,8 +207,8 @@ pub(crate) fn install_semantic_pass_capable(root: &Path, language: &str, extensi
 /// spawn that is in flight *right now*, and a real one is a process launch
 /// plus whatever the plugin does before it can speak - hundreds of
 /// milliseconds, but a different number on every machine and a wildly
-/// different one under a loaded `cargo test`, where a bare `node` start has
-/// been measured taking over a second. Any test that raced a fixed delay
+/// different one under a loaded `cargo test`, where a bare process start
+/// can take over a second. Any test that raced a fixed delay
 /// would be asserting about this machine's scheduler as much as about the
 /// daemon. A gate removes wall-clock time from the question entirely: the
 /// spawn stays in flight until the test says otherwise, so "while a spawn is
@@ -284,9 +275,9 @@ pub(crate) fn open_semantic_pass_gate(plugin_dir: &Path) {
 /// *whole* recovery cycle - timeout, relaunch, and a subsequent replay that
 /// actually succeeds - rather than an unbounded retry loop that never
 /// converges. The "already stalled once" fact is persisted to
-/// [`STALL_MARKER`] in this plugin's own directory, not held in the process's
+/// `stalled-once.marker` in this plugin's own directory, not held in the process's
 /// memory, specifically so it survives exactly the event this fixture exists
-/// to provoke: a crash-recovery relaunch, which is a brand new Node process
+/// to provoke: a crash-recovery relaunch, which is a brand new process
 /// with no memory of what its predecessor already did.
 ///
 /// The stalled process itself stays alive and keeps its stdin open (unlike a
@@ -294,7 +285,7 @@ pub(crate) fn open_semantic_pass_gate(plugin_dir: &Path) {
 /// fixture is specifically exercising the *timeout* path, not the
 /// pre-existing "process exited" crash-recovery path
 /// `plugin_crash_recovery.rs` already covers. It still exits cleanly if core
-/// closes its stdin (the same `end`-handler exit every fixture here has), and
+/// closes its stdin (as every fixture here does), and
 /// it dies immediately if killed - which is exactly what
 /// `daemon::plugin::PluginProcess`'s `on_timeout` does once a request against
 /// it runs past its budget.
@@ -304,7 +295,7 @@ pub(crate) fn install_stalling(root: &Path, language: &str, extensions: &[&str])
 
 /// [`install_semantic_pass_capable`], but the fake plugin process also
 /// allocates and holds onto a large buffer right after its handshake - task
-/// GM-274's fixture for `[plugin] memoryLimitMb`: a real Node child process
+/// GM-274's fixture for `[plugin] memoryLimitMb`: a real child process
 /// whose resident memory a test can actually put a low configured limit
 /// under, exercised by `daemon::lifecycle::PluginSupervisor::check_memory_limit`'s
 /// own sampling (`daemon::memory::process_tree_rss_mb`), not by a mock.
@@ -316,9 +307,8 @@ pub(crate) fn install_stalling(root: &Path, language: &str, extensions: &[&str])
 /// other capability test in this module already relies on
 /// ([`install_semantic_pass_capable`]'s own doc comment).
 ///
-/// 200MB is comfortably above a bare Node process's baseline RSS
-/// (~20-40MB, measured on this repo's own dev machine) and comfortably below
-/// anything that would make this fixture slow or flaky to allocate - the
+/// 200MB is comfortably above the fake plugin's idle RSS (under 2MB) and
+/// comfortably below anything that would make this fixture slow or flaky to allocate - the
 /// point is a real, measurable spike a low test-only `memoryLimitMb` (well
 /// under 200MB, well over the idle baseline) can reliably catch, not a
 /// pathological one.
@@ -344,12 +334,17 @@ pub(crate) fn install_incomplete_once(
     dir
 }
 
-/// Rewrites an installed plugin directory's entry point so that it answers
-/// the first `semanticPass` as [`install_incomplete_once`] describes, keeping
-/// the manifest it was installed with.
+/// Rewrites the options of `language`'s installed plugin directory so that
+/// its next process answers the first `semanticPass` as
+/// [`install_incomplete_once`] describes (and is neither gated, stalling nor
+/// memory-hungry), keeping the manifest it was installed with.
 pub(crate) fn answer_first_semantic_pass_incomplete(dir: &Path, language: &str, reason: Option<&str>) {
-    fs::write(dir.join("plugin.js"), entry_point(language, false, false, false, true, reason))
-        .expect("failed to write the fake plugin's entry point");
+    assert_eq!(
+        dir.file_name().and_then(|name| name.to_str()),
+        Some(language),
+        "not {language}'s plugin directory"
+    );
+    write_options(dir, &Options { incomplete_once: true, incomplete_reason: reason, ..Options::default() });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -366,8 +361,7 @@ fn install_inner(
 ) -> PathBuf {
     let dir = root.join(language);
     fs::create_dir_all(&dir).expect("failed to create the fake plugin's directory");
-    fs::write(dir.join("plugin.js"), entry_point(language, gated, stalling, memory_hungry, false, None))
-        .expect("failed to write the fake plugin's entry point");
+    write_options(&dir, &Options { gated, stalling, memory_hungry, ..Options::default() });
     fs::write(
         dir.join("plugin.toml"),
         manifest(language, extensions, semantic_pass, watch_files, exclude_dirs),
@@ -535,8 +529,8 @@ protocol_version = {CURRENT_PROTOCOL_VERSION}
 plugin_version = "0.0.0-test"
 
 [plugin.spawn]
-command = "node"
-args = ["./plugin.js"]
+command = "${{G_MESH_BIN_DIR}}/{FAKE_PLUGIN_BIN}"
+args = ["--language", "{language}", "--dir", "./"]
 
 [plugin.languages]
 extensions = [{extensions}]
@@ -544,219 +538,70 @@ extensions = [{extensions}]
     )
 }
 
-/// The fake plugin itself: record the spawn, handshake (once its gate is open,
-/// if a test asked for a `gated` one), then answer every framed request that
-/// carries an id with an empty diff under that same id.
-///
-/// Deliberately minimal about framing - it re-implements just enough of
-/// `protocol::jsonrpc` to be a peer, and would rather hang than guess if core
-/// ever sent something it does not understand, since a test that hangs is
-/// easier to diagnose than one that silently agrees with a bug.
-///
-/// `stalling` (see [`install_stalling`]) still logs every request it parses,
-/// but skips the `writeFrame` that would answer the one request this plugin
-/// directory has never yet stalled on ([`STALL_MARKER`]) - every other
-/// request, including every one after that, is answered normally.
-///
-/// `memory_hungry` (see [`install_memory_hungry`]) allocates a large buffer
-/// right after recording the spawn, held in a module-scope `const` for the
-/// rest of the process's life so V8 cannot garbage-collect it out from under
-/// a test sampling this process's RSS - the wire behaviour (handshake,
-/// answering every framed request) is otherwise unchanged.
-fn entry_point(
-    language: &str,
+/// Breaks the plugin in `plugin_dir` for every later spawn: the process
+/// starts, says nothing for `after_ms` (long enough for other callers to pile
+/// in behind its spawn), then exits 1 without a handshake - the failure
+/// `PluginProcess::spawn` reports.
+pub(crate) fn never_handshake(plugin_dir: &Path, after_ms: u64) {
+    write_options(
+        plugin_dir,
+        &Options { exit_without_handshake_after_ms: Some(after_ms), ..Options::default() },
+    );
+}
+
+/// Points the manifest in `plugin_dir` at a fake binary that was never built,
+/// so its spawn fails the way a never-built workspace plugin's does; returns
+/// the missing path. Takes effect at the next `discover`.
+pub(crate) fn point_at_a_missing_binary(plugin_dir: &Path) -> PathBuf {
+    let path = plugin_dir.join("plugin.toml");
+    let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
+    let command = format!("command = \"${{G_MESH_BIN_DIR}}/{FAKE_PLUGIN_BIN}\"");
+    assert!(manifest.contains(&command), "not a fake plugin manifest: {manifest}");
+    let missing = format!("{FAKE_PLUGIN_BIN}-never-built");
+    fs::write(&path, manifest.replace(&command, &format!("command = \"${{G_MESH_BIN_DIR}}/{missing}\"")))
+        .expect("failed to write the fake plugin's manifest");
+    crate::daemon::manifest::current_bin_dir().expect("the test binary's directory is unknown").join(missing)
+}
+
+/// The file whose bytes stand for the plugin's build in its directory's
+/// fingerprint (`daemon::plugin::fingerprint` hashes the whole directory):
+/// rewriting it with different bytes is a rebuild that changed something.
+pub(crate) fn build_artifact(plugin_dir: &Path) -> PathBuf {
+    plugin_dir.join(OPTIONS_FILE)
+}
+
+/// The binary every manifest written here names - see this module's doc.
+const FAKE_PLUGIN_BIN: &str = "g-mesh-fake-plugin";
+
+/// What one fake plugin process does beyond answering - mirrors the options
+/// file `plugins/sdk/fake/main.rs` reads at start.
+#[derive(Default)]
+struct Options<'a> {
     gated: bool,
     stalling: bool,
     memory_hungry: bool,
     incomplete_once: bool,
-    incomplete_reason: Option<&str>,
-) -> String {
-    let incomplete_reason = serde_json::to_string(&incomplete_reason).expect("a string serializes");
-    let memory_hog = if memory_hungry {
-        "\n// GM-274 fixture (install_memory_hungry): held for this process's whole\n\
-         // lifetime, not just allocated and dropped, so a test's sample actually\n\
-         // sees it.\n\
-         const memoryHog = Buffer.alloc(200 * 1024 * 1024, 1);\n"
-    } else {
-        ""
-    };
-    format!(
-        r#"// Generated by core/src/daemon/test_plugin.rs - not a real plugin.
-const fs = require("fs");
-const path = require("path");
+    incomplete_reason: Option<&'a str>,
+    exit_without_handshake_after_ms: Option<u64>,
+}
 
-fs.appendFileSync(path.join(__dirname, "{SPAWN_LOG}"), process.pid + "\n");
-{memory_hog}
-
-// One-shot bulk-index mode (`daemon::bulk_index::run`'s spawn shape:
-// "<command> <args...> --bulk-index <project_root>"): emit a fixed, small
-// NDJSON stream - two nodes and the edge between them, named after this
-// plugin's own language - and exit, rather than starting the interactive
-// framed-JSON-RPC loop below. Enough for a test to prove two plugins' output
-// both landed and summed, not just the first (or only) one's.
-if (process.argv[2] === "--bulk-index") {{
-  const line = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
-  const optional = (name) => {{
-    try {{
-      return fs.readFileSync(path.join(process.argv[3], name), "utf8");
-    }} catch (_) {{
-      return undefined;
-    }}
-  }};
-  // A test-written stream replaces the fixed one; the exit file sets the
-  // exit status after it (see `set_bulk_stream`).
-  const stream = optional(".{language}-bulk.ndjson");
-  if (stream !== undefined) {{
-    process.stdout.write(stream, () => process.exit(Number(optional(".{language}-bulk.exit") || 0)));
-    return;
-  }}
-  line({{
-    id: "{language}-n1",
-    signature: optional(".{language}-n1.sig"),
-    docComment: optional(".{language}-n1.doc"),
-    kind: "Function",
-    name: "{language}-n1",
-    qualifiedName: "{language}-n1",
-    filePath: "src/{language}-a.src",
-    range: {{ start: {{ line: 0, col: 0 }}, end: {{ line: 1, col: 0 }} }},
-    visibility: "public",
-    language: "{language}",
-  }});
-  line({{
-    id: "{language}-n2",
-    signature: optional(".{language}-n2.sig"),
-    docComment: optional(".{language}-n2.doc"),
-    kind: "Function",
-    name: "{language}-n2",
-    qualifiedName: "{language}-n2",
-    filePath: "src/{language}-b.src",
-    range: {{ start: {{ line: 0, col: 0 }}, end: {{ line: 1, col: 0 }} }},
-    visibility: "public",
-    language: "{language}",
-  }});
-  line({{
-    id: "{language}-e1",
-    fromId: "{language}-n1",
-    toId: "{language}-n2",
-    kind: "CALLS",
-    source: "syntactic",
-    engine: "tree-sitter",
-    resolved: true,
-  }});
-  process.exit(0);
-}}
-
-// See test_plugin.rs's `gate_semantic_pass`: a gated plugin holds each
-// semanticPass answer until the test opens the gate; everything else is
-// answered at once.
-function afterSemanticPassGate(request, answer) {{
-  const gated =
-    request.method === "semanticPass" && fs.existsSync(path.join(__dirname, "{SEMANTIC_PASS_GATED}"));
-  if (!gated) {{
-    answer();
-    return;
-  }}
-  (function awaitGate() {{
-    if (fs.existsSync(path.join(__dirname, "{SEMANTIC_PASS_GATE_OPEN}"))) {{
-      answer();
-      return;
-    }}
-    setTimeout(awaitGate, 5);
-  }})();
-}}
-
-function writeFrame(message) {{
-  const body = Buffer.from(JSON.stringify(message), "utf8");
-  process.stdout.write("Content-Length: " + body.length + "\r\n\r\n");
-  process.stdout.write(body);
-}}
-
-// The handshake core blocks on inside `PluginProcess::spawn`. Sent straight
-// away (the ordinary case), or held until a test opens this plugin's gate
-// file - which is how a test keeps a spawn in flight for as long as it needs
-// to look at something else. See `install_gated`.
-function announce() {{
-  writeFrame({{
-    protocolVersion: {CURRENT_PROTOCOL_VERSION},
-    language: "{language}",
-    pluginVersion: "0.0.0-test",
-  }});
-}}
-if ({gated}) {{
-  const gate = path.join(__dirname, "{HANDSHAKE_GATE}");
-  (function awaitGate() {{
-    if (fs.existsSync(gate)) {{
-      announce();
-      return;
-    }}
-    setTimeout(awaitGate, 5);
-  }})();
-}} else {{
-  announce();
-}}
-
-let buffered = Buffer.alloc(0);
-process.stdin.on("data", (chunk) => {{
-  buffered = Buffer.concat([buffered, chunk]);
-  for (;;) {{
-    const headerEnd = buffered.indexOf("\r\n\r\n");
-    if (headerEnd < 0) return;
-    const header = buffered.slice(0, headerEnd).toString("utf8");
-    const length = /content-length:\s*(\d+)/i.exec(header);
-    if (!length) return;
-    const bodyStart = headerEnd + 4;
-    const bodyEnd = bodyStart + Number(length[1]);
-    if (buffered.length < bodyEnd) return;
-    const request = JSON.parse(buffered.slice(bodyStart, bodyEnd).toString("utf8"));
-    buffered = buffered.slice(bodyEnd);
-    fs.appendFileSync(path.join(__dirname, "..", "{FRAME_LOG}"), "{language} " + request.method + "\n");
-    if (request.id !== undefined && request.id !== null) {{
-      const filePath = (request.params && request.params.filePath) || "";
-      fs.appendFileSync(path.join(__dirname, "{REQUEST_LOG}"), request.method + " " + filePath + "\n");
-      // See test_plugin.rs's `install_stalling`/`STALL_MARKER` doc comments:
-      // this plugin directory stalls on its first-ever framed request, and
-      // answers normally forever after - including from a fresh process a
-      // crash-recovery relaunch spawns, which is why the "already stalled
-      // once" fact has to live in a file rather than a variable.
-      const markerPath = path.join(__dirname, "{STALL_MARKER}");
-      const shouldStall = {stalling} && !fs.existsSync(markerPath);
-      const incompleteOnce = {incomplete_once};
-      const incompleteReason = {incomplete_reason};
-      const incompletePath = path.join(__dirname, "{INCOMPLETE_MARKER}");
-      if (shouldStall) {{
-        fs.writeFileSync(markerPath, String(process.pid) + "\n");
-        // Deliberately never answer this one request.
-      }} else afterSemanticPassGate(request, () => {{
-      if (incompleteOnce && request.method === "semanticPass" && !fs.existsSync(incompletePath)) {{
-        fs.writeFileSync(incompletePath, String(process.pid) + "\n");
-        const response = {{ jsonrpc: "2.0", id: request.id, result: {{}}, incomplete: true }};
-        if (incompleteReason !== null) {{
-          response.incompleteReason = incompleteReason;
-        }}
-        writeFrame(response);
-      }} else if (request.method === "semanticPass" && fs.existsSync(path.join(__dirname, "{SEMANTIC_ANSWER}"))) {{
-        const answer = JSON.parse(fs.readFileSync(path.join(__dirname, "{SEMANTIC_ANSWER}"), "utf8"));
-        writeFrame({{ jsonrpc: "2.0", id: request.id, result: answer }});
-      }} else {{
-        writeFrame({{ jsonrpc: "2.0", id: request.id, result: {{}} }});
-      }}
-      }});
-    }} else {{
-      // A notification: no id, no response frame - see
-      // test_plugin.rs's NOTIFICATION_LOG doc comment for why this is a
-      // separate log from REQUEST_LOG above rather than folded into it.
-      // `filesCreated` names its paths comma-joined: "filesCreated a,b".
-      const params = request.params || {{}};
-      const filePath = params.filePath || (Array.isArray(params.filePaths) ? params.filePaths.join(",") : "");
-      fs.appendFileSync(path.join(__dirname, "{NOTIFICATION_LOG}"), request.method + " " + filePath + "\n");
-    }}
-  }}
-}});
-
-// Same exit condition as the real plugin's (plugins/typescript/src/index.ts): the
-// core closing its end of stdin is what a deliberate sleep looks like from
-// here.
-process.stdin.on("end", () => process.exit(0));
-"#
-    )
+/// Writes `options` where the fake plugin in `dir` reads them, failing with
+/// the build command when the binary itself has not been built.
+fn write_options(dir: &Path, options: &Options<'_>) {
+    let bin_dir = crate::daemon::manifest::current_bin_dir().expect("the test binary's directory is unknown");
+    let binary = bin_dir.join(format!("{FAKE_PLUGIN_BIN}{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        binary.is_file(),
+        "{} does not exist - run `cargo build --workspace` before core's tests",
+        binary.display()
+    );
+    let json = serde_json::json!({
+        "gated": options.gated,
+        "stalling": options.stalling,
+        "memoryHungry": options.memory_hungry,
+        "incompleteOnce": options.incomplete_once,
+        "incompleteReason": options.incomplete_reason,
+        "exitWithoutHandshakeAfterMs": options.exit_without_handshake_after_ms,
+    });
+    fs::write(dir.join(OPTIONS_FILE), json.to_string()).expect("failed to write the fake plugin's options");
 }

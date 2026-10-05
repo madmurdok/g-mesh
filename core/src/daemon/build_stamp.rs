@@ -38,18 +38,17 @@
 //!
 //! # Why the executable is not enough on its own
 //!
-//! Half the pipeline is not in the executable. The JS/TS plugin is a separate
-//! process built by `npm`, and *everything* in the index is computed by it -
-//! so `cd plugins/typescript && npm run build` after an extractor change leaves a
-//! running daemon holding a plugin whose logic no longer exists anywhere on
-//! disk, with an untouched core binary vouching for it. Task 116 measured
-//! exactly that: task 115 changed how same-file edges resolve, and the daemon
-//! went on serving the old resolution with `g-mesh status` reporting "this
-//! build", because that was true and beside the point.
+//! Half the pipeline is not in the executable. Every language plugin is a
+//! separate binary, and *everything* in the index is computed by one of them -
+//! so rebuilding a plugin after an extractor change (`cargo build --workspace`
+//! relinks only the crates that changed) leaves a running daemon holding a
+//! plugin whose logic no longer exists anywhere on disk, with an untouched
+//! core binary vouching for it, and `g-mesh status` reporting "this build"
+//! because that is true and beside the point.
 //!
-//! So the stamp carries a second fact, `daemon::plugin::fingerprint` - a
-//! digest of the plugin's compiled output, derived from the artifact for the
-//! same reason the exe's mtime is. The two are read together by [`vintage`]
+//! So the stamp carries a second fact, `daemon::plugin::discovered_fingerprint` -
+//! a digest over every discovered plugin's directory, derived from the
+//! artifacts for the same reason the exe's mtime is. The two are read together by [`vintage`]
 //! and each catches what the other cannot.
 //!
 //! # Newer wins, never older
@@ -107,8 +106,8 @@ pub struct BuildStamp {
     /// `indexed_files.mtimeMillis` uses, so there is one mtime convention in
     /// this codebase rather than two.
     pub exe_mtime_millis: i64,
-    /// The JS/TS plugin build this process would run, per
-    /// `daemon::plugin::fingerprint` - the half of the pipeline the
+    /// The plugin builds this process would run, per
+    /// `daemon::plugin::discovered_fingerprint` - the half of the pipeline the
     /// executable says nothing about.
     pub plugin: String,
 }
@@ -123,7 +122,7 @@ pub enum Vintage {
     /// The daemon started from an executable built before this one: it
     /// predates whatever was installed since, index invalidation included.
     Outdated,
-    /// Same executable, different JS/TS plugin: the daemon holds a plugin
+    /// Same executable, different plugins: the daemon holds a plugin
     /// build that has since been replaced, so every node and edge it is
     /// serving was computed by extraction logic no longer on disk. Acted on
     /// exactly like `Outdated` - kept apart so nothing tells a human their
@@ -149,12 +148,11 @@ pub fn of_running_process() -> Result<BuildStamp> {
         fs::metadata(&exe).with_context(|| format!("failed to stat the executable at {}", exe.display()))?;
     let exe_mtime_millis =
         mtime_millis(&metadata).with_context(|| format!("failed to read the mtime of {}", exe.display()))?;
-    // Infallible on purpose, unlike the two above: a plugin that cannot be
-    // read at all resolves to `FINGERPRINT_UNAVAILABLE`, which compares equal
-    // to the same answer from anyone else, so an install with no readable
-    // plugin behaves exactly as it did before this field existed instead of
-    // making every process look like a change.
-    let plugin = plugin::bundled_fingerprint().to_string();
+    // Infallible on purpose, unlike the two above: plugins that cannot be
+    // discovered resolve to `FINGERPRINT_UNAVAILABLE`, which compares equal to
+    // the same answer from anyone else, so such an install behaves as if this
+    // field did not exist instead of making every process look like a change.
+    let plugin = plugin::discovered_fingerprint().to_string();
     Ok(BuildStamp { exe, exe_mtime_millis, plugin })
 }
 
@@ -233,7 +231,7 @@ pub fn describe(vintage: Vintage) -> &'static str {
     match vintage {
         Vintage::Current => "started from this build",
         Vintage::Outdated => "started from an older build of g-mesh",
-        Vintage::PluginChanged => "is holding a JS/TS plugin build that has since been rebuilt",
+        Vintage::PluginChanged => "is holding a plugin build that has since been rebuilt",
         Vintage::Unknown => "published no build stamp, so it predates this check",
     }
 }
@@ -345,7 +343,7 @@ mod tests {
         assert_eq!(vintage(None, &stamp("/bin/g-mesh", 2_000)), Vintage::Unknown);
     }
 
-    /// Task 116's headline case: `npm run build` in the plugin, nothing else.
+    /// A plugin rebuilt and nothing else.
     /// The core binary is untouched - which is exactly why nothing noticed
     /// before - so the only evidence there is, is the fingerprint.
     #[test]

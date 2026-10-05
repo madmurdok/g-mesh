@@ -4,9 +4,9 @@ package main
 // ControlEnvelope/FileChangeDiff/Handshake - field names and JSON shapes
 // must match what serde actually produces there (see that file's own
 // `#[serde(rename_all = ...)]` attributes and its test module), not a
-// naive reading of the Rust field names. plugins/typescript/src/protocol.ts
-// and bulkIndex.ts are the TS plugin's own copy of the same mirror; this
-// file is this plugin's independent copy, not a shared one - Go and TS
+// naive reading of the Rust field names. plugins/sdk/src/graph.rs
+// and wire/src/lib.rs are the Rust plugins' own copy of the same mirror; this
+// file is this plugin's independent copy, not a shared one - Go and Rust
 // have no code-sharing mechanism between them, and the two are kept honest
 // against drift by core/src/cli/plugin_check (the conformance kit both
 // plugins are run against), not by shared source.
@@ -248,8 +248,8 @@ type fileChangeDiff struct {
 // empty - never nil. encoding/json marshals a nil slice as `null`, but
 // core's `Vec<...>` fields always serialize as `[]` (there is no
 // `skip_serializing_if` on any of FileChangeDiff's four fields in
-// core/src/protocol/types.rs), and plugins/typescript/src/index.ts's own
-// EMPTY_WIRE_DIFF constant makes the same choice for the same reason.
+// core/src/protocol/types.rs), and plugins/sdk/src/diff.rs's empty diff
+// makes the same choice for the same reason.
 func emptyDiff() fileChangeDiff {
 	return fileChangeDiff{
 		UpsertNodes:   []wireNode{},
@@ -317,7 +317,7 @@ type fileChangeResponse struct {
 
 // ackResponse is the `{ acknowledged: true }` shape this plugin answers a
 // `reindex`/`status` request with, mirroring
-// plugins/typescript/src/index.ts's handleEnvelope default case. Core has
+// plugins/sdk/src/run.rs's `acknowledge`. Core has
 // no named Rust type for this (those two methods are effectively no-ops on
 // the daemon side today - see ControlMessage::Reindex/Status's own doc
 // comments), so there is nothing in core/src/protocol/types.rs for this to

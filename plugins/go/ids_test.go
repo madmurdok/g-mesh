@@ -26,8 +26,9 @@ import "testing"
 //	6be2b51147fd32ef62ebf506f184329a
 //	1deb655be169c9fcfe9e081b775c7117
 //
-// (Node v20.6.1, plugins/typescript/src/extract.ts's `hash`/`nodeIdFor`/
-// `edgeIdFor` copied verbatim into the -e script above.) Asserting against
+// (Node v20.6.1, the original TS plugin's `hash`/`nodeIdFor`/
+// `edgeIdFor` copied verbatim into the -e script above; plugins/sdk/src/ids.rs
+// pins the same scheme.) Asserting against
 // these fixed strings, rather than only against Go-computed values, is
 // the whole point: a bug that made this file's own hash function and its
 // own callers agree with each other while disagreeing with the TS scheme

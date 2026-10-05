@@ -26,7 +26,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use g_mesh::daemon;
 use g_mesh::daemon::lifecycle::PLUGIN_IDLE_ENV;
@@ -49,7 +49,10 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// one the held tool call actually asks about - untouched since the walk, so
 /// its own `ensure_file_fresh` check is a free `AlreadyFresh` and every
 /// progress notification the test sees can only have come from the replay,
-/// not from a second heartbeat of `ensure_file_fresh`'s own (GM-401).
+/// not from a second heartbeat of `ensure_file_fresh`'s own (GM-401). That
+/// holds only if the walk recorded a staleness baseline for it, which it
+/// skips for a file modified within `WALK_BASELINE_MTIME_MARGIN` of the walk's
+/// start - hence [`FIXTURE_AGE`].
 const ALPHA_OLD: &str = "export function alpha(): number {\n  return 1;\n}\n";
 const ALPHA_NEW: &str = "export function alpha(): number {\n  return 1;\n}\n\nexport function alphaAgain(): number {\n  return 2;\n}\n";
 const BETA: &str = "export function beta(): number {\n  return 3;\n}\n";
@@ -72,6 +75,24 @@ const HOLDING_LINE: &str = "holding a reparse's lock-free embedding window open"
 /// is room for about five notifications; the test asks for 3.
 const HELD_FOR: Duration = Duration::from_millis(1_100);
 
+/// How far in the past the initial fixtures are stamped. A file written just
+/// before the daemon starts gets no walk baseline (`staleness::
+/// record_walk_baselines` skips anything modified within 2 s of the walk's
+/// start), so its first query is a real reindex through the plugin - which,
+/// once the replay has let the plugin fall asleep again, respawns it and
+/// heartbeats "bringing src/beta.ts up to date" into the replay's
+/// notifications. Backdating makes the baseline certain instead of
+/// depending on how long the daemon took to start.
+const FIXTURE_AGE: Duration = Duration::from_secs(3_600);
+
+/// What `bulk_index` logs when a walked file got no staleness baseline.
+const NO_BASELINE_LINE: &str = "got no staleness baseline";
+
+/// The prefixes the plugins put on their stderr lines. The plugins share the
+/// daemon log with the daemon, and a daemon `eprintln!` is several `write`s,
+/// so a plugin line can land in the middle of a daemon trace line.
+const PLUGIN_LINE_TAGS: [&str; 4] = ["[typescript] ", "[rust] ", "[python] ", "[g-mesh-go] "];
+
 struct Project {
     dir: tempfile::TempDir,
     /// Outside the project root, so writing to it cannot feed the watcher.
@@ -84,8 +105,15 @@ impl Project {
             dir: tempfile::tempdir().expect("failed to create a temp project root"),
             side: tempfile::tempdir().expect("failed to create a temp side directory"),
         };
-        project.write("src/alpha.ts", ALPHA_OLD);
-        project.write("src/beta.ts", BETA);
+        let stamped = SystemTime::now() - FIXTURE_AGE;
+        for (rel, contents) in [("src/alpha.ts", ALPHA_OLD), ("src/beta.ts", BETA)] {
+            project.write(rel, contents);
+            std::fs::File::options()
+                .write(true)
+                .open(project.root().join(rel))
+                .and_then(|file| file.set_modified(stamped))
+                .expect("failed to backdate a fixture file's mtime");
+        }
         project
     }
 
@@ -173,6 +201,12 @@ impl Project {
         // contend with the calls below.
         let root = self.root().to_path_buf();
         tokio::task::spawn_blocking(move || common::wait_until_phase(&root, "ready")).await.unwrap();
+        let log = self.log_text();
+        assert!(
+            !log.contains(NO_BASELINE_LINE),
+            "precondition: the walk must baseline every backdated fixture, or the first query of an \
+             untouched file reindexes and heartbeats on its own:\n{log}"
+        );
         client
     }
 }
@@ -212,6 +246,37 @@ impl ClientHandler for ProgressRecorder {
     ) {
         self.0.lock().unwrap().push(params);
     }
+}
+
+/// The `replay: tool=get_file_outline` trace lines of `log`, with any plugin
+/// line that landed inside one (see [`PLUGIN_LINE_TAGS`]) cut back out.
+fn replay_trace_lines(log: &str) -> Vec<String> {
+    let mut daemon_only = log.to_string();
+    for tag in PLUGIN_LINE_TAGS {
+        while let Some(start) = daemon_only.find(tag) {
+            let end = daemon_only[start..].find('\n').map_or(daemon_only.len(), |at| start + at + 1);
+            daemon_only.replace_range(start..end, "");
+        }
+    }
+    daemon_only
+        .lines()
+        .filter(|line| line.contains("replay: tool=get_file_outline"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The interleaving seen in a real failing run: the plugin's exit line written
+/// between two `write`s of the daemon's replay trace line.
+#[test]
+fn a_plugin_line_inside_a_replay_trace_line_is_cut_back_out() {
+    let log = "g-mesh daemon: replay: tool=get_file_outline request=1 summary=typescript (1 file) \
+               replayed=1 elapsed_ms=[typescript] core closed the control stream - exiting (semantic \
+               engine started: true)\n1987 progress_sent=9\ng-mesh daemon: prepare: done\n";
+    assert_eq!(
+        replay_trace_lines(log),
+        ["g-mesh daemon: replay: tool=get_file_outline request=1 summary=typescript (1 file) replayed=1 \
+          elapsed_ms=1987 progress_sent=9"]
+    );
 }
 
 fn outline_request(file: &str) -> CallToolRequestParams {
@@ -301,8 +366,7 @@ async fn a_held_replay_with_a_token_gets_a_heartbeat_then_the_full_answer() {
         project.log_text().contains("replay: tool=get_file_outline")
     });
     let log = project.log_text();
-    let replay_lines: Vec<&str> =
-        log.lines().filter(|line| line.contains("replay: tool=get_file_outline")).collect();
+    let replay_lines = replay_trace_lines(&log);
     assert_eq!(replay_lines.len(), 1, "one tool call, one replay:\n{log}");
     assert!(
         replay_lines[0].contains("replayed=1") && replay_lines[0].contains("summary=typescript (1 file)"),

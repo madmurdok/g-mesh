@@ -67,8 +67,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
-use g_mesh_plugin_sdk::lsp::{LspBridge, SemanticConfig};
+use anyhow::{Context, Result};
+use g_mesh_plugin_sdk::lsp::{self, is_bare, Candidate, LspBridge, SemanticConfig, PROBE_BUDGET};
 use g_mesh_plugin_sdk::SemanticEngine;
 
 /// The language id this plugin speaks, for `didOpen` and for log lines.
@@ -87,9 +87,9 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
             )
         })?;
 
-    let (command, version) = resolve(&config.command)?;
-    eprintln!("[{LANGUAGE}] semantic tier: {} ({version})", command.display());
-    config.command = command;
+    let resolved = resolve(&config.command)?;
+    eprintln!("[{LANGUAGE}] semantic tier: {} ({})", resolved.command.display(), resolved.version);
+    config.command = resolved.command;
     Ok(Box::new(LspBridge::new(LANGUAGE, root, config)))
 }
 
@@ -118,18 +118,31 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
 /// because theirs did not work would be the worst possible answer. It is
 /// still probed, so a path that is wrong fails with the same one log line as
 /// a name that is missing rather than as a server that dies at handshake.
-fn resolve(command: &Path) -> Result<(PathBuf, String)> {
-    let mut failures: Vec<String> = Vec::new();
-    for candidate in candidates(command) {
-        match probe(&candidate) {
-            Ok(version) => return Ok((candidate, version)),
-            Err(err) => failures.push(format!("{}: {err:#}", candidate.display())),
-        }
-    }
-    bail!(
-        "no usable rust-analyzer: {}. Install it with `rustup component add rust-analyzer`, or point \
-         [plugin.semantic] command in plugins/rust/plugin.toml at one",
-        failures.join("; ")
+///
+/// Each candidate's `--version` runs under [`PROBE_BUDGET`], like every
+/// plugin's, and is itself the probe: rust-analyzer answers `--version`.
+fn resolve(command: &Path) -> Result<lsp::Resolved> {
+    let bare = is_bare(command);
+    let candidates = candidates(command)
+        .into_iter()
+        .enumerate()
+        .map(|(index, command)| Candidate {
+            probe: (command.clone(), Vec::new()),
+            command,
+            prefix_args: Vec::new(),
+            origin: match (index, bare) {
+                (0, true) => "PATH",
+                (0, false) => "the path the manifest names",
+                _ => "rustup which",
+            },
+        })
+        .collect();
+    lsp::resolve(
+        candidates,
+        PROBE_BUDGET,
+        "rust-analyzer",
+        "Install it with `rustup component add rust-analyzer`, or point [plugin.semantic] command in \
+         plugins/rust/plugin.toml at one",
     )
 }
 
@@ -137,8 +150,7 @@ fn resolve(command: &Path) -> Result<(PathBuf, String)> {
 /// for a bare name - whatever `rustup which` resolves that name to.
 fn candidates(command: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![command.to_path_buf()];
-    let bare = command.components().count() == 1 && !command.is_absolute();
-    if !bare {
+    if !is_bare(command) {
         return candidates;
     }
     let name = command.to_string_lossy().into_owned();
@@ -165,31 +177,10 @@ fn rustup_which(name: &str) -> Option<PathBuf> {
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
-/// Runs `<candidate> --version` and returns what it printed.
-///
-/// This is the whole of the "prove it" half of this module - see the module
-/// doc for the rustup proxy it exists to reject. `--version` is the one
-/// argument every language server that ships as a CLI binary supports, it
-/// starts no workspace, and it exits immediately, so the cost is one spawn
-/// per plugin process rather than per pass.
-fn probe(candidate: &Path) -> Result<String> {
-    let output = Command::new(candidate)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("could not run {}", candidate.display()))?;
-    if !output.status.success() {
-        let said = String::from_utf8_lossy(&output.stderr);
-        let said = said.lines().next().unwrap_or("").trim();
-        bail!("`--version` exited {} ({said})", output.status);
-    }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(if version.is_empty() { "no version reported".to_string() } else { version })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use g_mesh_plugin_sdk::lsp::ServerReadiness;
+    use g_mesh_plugin_sdk::lsp::{probe, ServerReadiness};
 
     /// A path names one binary and is never searched around - see
     /// [`resolve`]'s doc.
@@ -217,9 +208,15 @@ mod tests {
     /// Windows the absent-binary half is the one that runs.
     #[test]
     fn a_binary_that_exits_non_zero_is_not_a_server() {
-        assert!(probe(Path::new("/nonexistent/rust-analyzer")).is_err(), "a binary that is not there");
+        assert!(
+            probe(Path::new("/nonexistent/rust-analyzer"), &[], PROBE_BUDGET).is_err(),
+            "a binary that is not there"
+        );
         #[cfg(unix)]
-        assert!(probe(Path::new("/usr/bin/false")).is_err(), "a binary that runs and refuses");
+        assert!(
+            probe(Path::new("/usr/bin/false"), &[], PROBE_BUDGET).is_err(),
+            "a binary that runs and refuses"
+        );
     }
 
     /// The shipped manifest is read by this module at run time and by nothing
@@ -283,5 +280,31 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("rustup component add rust-analyzer"), "{message}");
         assert!(message.contains("/nonexistent/rust-analyzer"), "{message}");
+    }
+
+    /// A path's failure carries its origin, in the SDK's shared format.
+    #[test]
+    fn a_path_that_fails_is_reported_with_its_origin() {
+        let err = resolve(Path::new("/nonexistent/rust-analyzer")).expect_err("must not resolve");
+        let message = format!("{err:#}");
+        assert!(
+            message.starts_with(
+                "no usable rust-analyzer: /nonexistent/rust-analyzer (the path the manifest names): "
+            ),
+            "{message}"
+        );
+    }
+
+    /// A path that answers `--version` resolves to itself, with what it
+    /// printed and the path's origin. `echo` exits zero and prints a
+    /// non-empty line for `--version` on every unix.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_answers_resolves_with_its_origin() {
+        let resolved = resolve(Path::new("/bin/echo")).expect("echo answers");
+        assert_eq!(resolved.command, PathBuf::from("/bin/echo"));
+        assert!(resolved.prefix_args.is_empty(), "{:?}", resolved.prefix_args);
+        assert_eq!(resolved.origin, "the path the manifest names");
+        assert_ne!(resolved.version, "no version reported");
     }
 }

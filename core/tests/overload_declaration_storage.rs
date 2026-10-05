@@ -17,13 +17,15 @@
 //! no declaration row behind, and that a plugin line for such a node never
 //! mentions the field.
 
+mod common;
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use g_mesh::daemon::bulk_index;
 use g_mesh::daemon::manifest::DiscoveredPlugins;
-use g_mesh::daemon::plugin::{bundled_manifest, BUNDLED_LANGUAGE};
+use g_mesh::daemon::plugin::BUNDLED_LANGUAGE;
 use g_mesh::storage::connection::{open, project_dir};
 use g_mesh::storage::index_store::IndexStore;
 use g_mesh::storage::schema;
@@ -34,14 +36,12 @@ use rusqlite::Connection;
 type DeclarationRow = (i64, i64, i64, i64, i64, Option<String>, bool);
 
 /// The single-language discovery this suite walks with - just the bundled
-/// JS/TS plugin, built by hand from [`bundled_manifest`] rather than through
-/// `daemon::manifest::discover`, so this suite's isolation from whatever else
-/// happens to live under `~/.g-mesh/plugins/` on the machine running it is
-/// unchanged from before task 156 generalized `daemon::bulk_index::run` to
-/// take a discovery result at all.
+/// TypeScript plugin, built by hand from its manifest rather than through
+/// `daemon::manifest::discover`, so whatever else lives under
+/// `~/.g-mesh/plugins/` on the machine running this suite is not walked.
 fn only_the_bundled_plugin() -> DiscoveredPlugins {
     DiscoveredPlugins {
-        manifests: HashMap::from([(BUNDLED_LANGUAGE.to_string(), bundled_manifest())]),
+        manifests: HashMap::from([(BUNDLED_LANGUAGE.to_string(), common::typescript_manifest())]),
         routing: HashMap::new(),
     }
 }
@@ -200,13 +200,12 @@ fn a_freshly_built_index_reads_schema_version_13() {
 #[test]
 fn the_plugins_own_ndjson_mentions_declarations_only_for_the_overloaded_node() {
     let project = Project::new();
-    let entry = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript/dist/src/index.js");
-    let output = Command::new("node")
-        .arg(&entry)
+    let plugin = common::typescript_manifest().command;
+    let output = Command::new(&plugin)
         .arg("--bulk-index")
         .arg(project.root())
         .output()
-        .unwrap_or_else(|e| panic!("failed to run the plugin's bulk index at {}: {e}", entry.display()));
+        .unwrap_or_else(|e| panic!("failed to run the plugin's bulk index at {}: {e}", plugin.display()));
     assert!(output.status.success(), "the plugin's bulk index exited with {}", output.status);
 
     let stdout = String::from_utf8(output.stdout).expect("the plugin's stream must be UTF-8");

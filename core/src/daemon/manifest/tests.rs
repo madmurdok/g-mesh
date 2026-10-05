@@ -8,66 +8,22 @@ use std::sync::Mutex;
 /// `daemon::lifecycle`'s `ENV_LOCK` for its own env-var tests.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// The bundled JS/TS plugin's source directory, reached the same way
+/// The bundled TypeScript plugin's source directory, reached the same way
 /// [`bundled_roots`] reaches it.
 fn bundled_typescript_plugin_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript")
 }
 
-fn json_at(path: &Path) -> serde_json::Value {
-    let contents =
-        fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-    serde_json::from_str(&contents)
-        .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
-}
+// The bundled plugins' `plugin_version` follows the cargo-workspace rule in
+// `docs/architecture/plugin-modularity.md` ("`plugin_version`: two rules, not
+// one"): it equals the plugin crate's version, and each plugin crate's own
+// `the_manifest_version_matches_the_crates` test enforces that.
 
-/// The bundled plugin states its version in three files, and nothing but
-/// this test makes them agree.
+/// The version that actually leaves the plugin at runtime, reported in its
+/// handshake.
 ///
-/// The one that matters at runtime is `plugin.toml`: `read_manifest`
-/// parses it and `g-mesh plugins list` prints it, so it is the number a
-/// user sees when diagnosing. `package.json` is what the npm side uses,
-/// and the lock file records the same version twice more. They have
-/// already drifted once - the 2.1.0 bump left the lock naming 2.0.0, and
-/// nothing failed, because `npm ci` checks dependency sync rather than
-/// the root package's own version field. A wrong number reported to the
-/// only person who ever looks is the cost, so it is worth one test.
-///
-/// Reading the real files rather than a fixture is the point: a fixture
-/// would prove the comparison works, not that these four declarations do.
-#[test]
-fn every_declaration_of_the_bundled_plugins_version_agrees() {
-    let dir = bundled_typescript_plugin_dir();
-    let manifest = read_manifest(&dir).expect("failed to read the bundled plugin's manifest");
-    let package = json_at(&dir.join("package.json"));
-    let lock = json_at(&dir.join("package-lock.json"));
-
-    let declared = [
-        ("plugin.toml [plugin] plugin_version", manifest.plugin_version.clone()),
-        ("package.json .version", string_at(&package, &["version"])),
-        ("package-lock.json .version", string_at(&lock, &["version"])),
-        ("package-lock.json .packages[\"\"].version", string_at(&lock, &["packages", "", "version"])),
-    ];
-
-    let (first_source, first_version) = &declared[0];
-    for (source, version) in &declared[1..] {
-        assert_eq!(
-            version, first_version,
-            "the bundled plugin's version has drifted: {first_source} says {first_version}, \
-             {source} says {version}. Bump package.json and plugin.toml together, and \
-             regenerate the lock with `npm install --package-lock-only`."
-        );
-    }
-}
-
-/// The version that actually leaves the plugin at runtime, reported by
-/// `sendHandshake` in `plugins/typescript/src/index.ts`.
-///
-/// No longer a declaration of its own - `scripts/generate-version.js`
-/// writes it from `package.json` on every build - so this test now asks
-/// the question that survives that: whether the manifest core reads
-/// *without* running a plugin agrees with what the running plugin says.
-/// Those two can still drift, because `plugin.toml` is read by
+/// This asks whether the manifest core reads *without* running a plugin
+/// agrees with what the running plugin says. Those two can drift, because `plugin.toml` is read by
 /// `g-mesh plugins list` on plugins that were never built and so cannot
 /// be derived from anything at runtime.
 ///
@@ -89,11 +45,9 @@ fn the_bundled_plugins_handshake_reports_the_version_its_manifest_declares() {
     let manifest = read_manifest(&dir).expect("failed to read the bundled plugin's manifest");
 
     // Same check `daemon::plugin::PluginState::spawn` makes before
-    // spawning for real - see that function's doc comment. Without it,
-    // an unbuilt `dist/` still lets `node` spawn successfully here and
-    // fails only once its stdout closes with no handshake, which names
-    // nothing about npm.
-    if let Some(hint) = crate::daemon::plugin::missing_node_entry_hint(&manifest.command, &manifest.args) {
+    // spawning for real, so an unbuilt binary fails naming the build
+    // command rather than as a bare spawn error.
+    if let Some(hint) = crate::daemon::plugin::missing_workspace_binary_hint(&manifest.command) {
         panic!("{hint}");
     }
 
@@ -103,7 +57,7 @@ fn the_bundled_plugins_handshake_reports_the_version_its_manifest_declares() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("failed to spawn the bundled plugin - is it built? (`npm run build`)");
+        .expect("failed to spawn the bundled plugin - is it built? (`cargo build --workspace`)");
     let mut stdout = std::io::BufReader::new(plugin.stdout.take().expect("the plugin has no stdout"));
     let handshake = crate::protocol::handshake::perform(&mut stdout);
     drop(plugin.stdin.take());
@@ -114,22 +68,9 @@ fn the_bundled_plugins_handshake_reports_the_version_its_manifest_declares() {
     assert_eq!(
         handshake.plugin_version, manifest.plugin_version,
         "the bundled plugin's handshake reports {}, but its plugin.toml declares {} - \
-         the handshake follows package.json (via scripts/generate-version.js), so either \
-         plugin.toml is stale or the plugin needs rebuilding",
+         either plugin.toml is stale or the plugin needs rebuilding",
         handshake.plugin_version, manifest.plugin_version
     );
-}
-
-/// The string at a path of keys, so a missing or retyped field fails as
-/// "this file no longer declares a version there" rather than as a
-/// comparison against `null`.
-fn string_at(value: &serde_json::Value, keys: &[&str]) -> String {
-    let mut current = value;
-    for key in keys {
-        current =
-            current.get(key).unwrap_or_else(|| panic!("no `{}` in the JSON being checked", keys.join(".")));
-    }
-    current.as_str().unwrap_or_else(|| panic!("`{}` is not a string", keys.join("."))).to_string()
 }
 
 #[test]
@@ -756,7 +697,7 @@ fn exe_suffixed_is_none_for_an_empty_suffix() {
 
 #[test]
 fn exe_suffixed_is_none_for_a_path_that_already_has_an_extension() {
-    assert_eq!(exe_suffixed(Path::new("/plugins/typescript/dist/src/index.js"), ".exe"), None);
+    assert_eq!(exe_suffixed(Path::new("/plugins/example/index.js"), ".exe"), None);
 }
 
 /// The fix under test: a cargo-workspace plugin's binary, present only
@@ -975,8 +916,17 @@ fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
 
     assert_eq!(manifest.language, "typescript");
     assert_eq!(manifest.protocol_version, CURRENT_PROTOCOL_VERSION);
-    assert_eq!(manifest.command, PathBuf::from("node"));
-    assert_eq!(manifest.args, vec![dir.join("dist/src/index.js").to_string_lossy().into_owned()]);
+    let bin_dir = current_bin_dir().expect("the test binary must know its own directory");
+    assert_eq!(manifest.command.parent(), Some(bin_dir.as_path()), "resolved {}", manifest.command.display());
+    assert!(
+        manifest
+            .command
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("g-mesh-plugin-typescript")),
+        "resolved {}",
+        manifest.command.display()
+    );
+    assert!(manifest.args.is_empty(), "{:?}", manifest.args);
     assert!(manifest.extensions.contains(&".ts".to_string()));
     assert!(manifest.extensions.contains(&".tsx".to_string()));
     assert!(manifest.extensions.contains(&".js".to_string()));
@@ -984,12 +934,12 @@ fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
     // This task's acceptance criterion for the bundled manifest: it
     // carries the capabilities, not just the fields this test already
     // checked before this task.
+    // A semantic tier (vtsls) that resolves receiver calls, over a
+    // structural tier that does not.
     assert!(manifest.capabilities.semantic_pass);
-    // Its checker never reports a pass incomplete, so a sweep could delete
-    // upgraded structural edges a pass stopped short of.
     assert!(!manifest.capabilities.semantic_sweep);
-    assert!(!manifest.capabilities.files_created);
-    assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Unresolved);
+    assert!(manifest.capabilities.files_created);
+    assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Resolved);
     assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
     assert_eq!(manifest.workspace.entry_points, vec!["index".to_string()]);
 }

@@ -300,7 +300,7 @@ pub fn indexer_version(discovered: &DiscoveredPlugins) -> String {
 /// exists for, one level up. The language is hashed alongside its fingerprint
 /// (and both are length-delimited by a NUL) so that renaming a plugin, or two
 /// languages swapping builds, cannot leave the concatenation unchanged.
-fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
+pub(crate) fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
     let mut fingerprinted: Vec<(&str, String)> = discovered
         .manifests
         .iter()
@@ -677,7 +677,7 @@ impl PluginRegistry {
     /// `Makefile` for entirely different reasons), and silently routing to
     /// only one of them would drop the other's reindex with no diagnostic at
     /// all. Empty is the overwhelmingly common answer - every language whose
-    /// `watch_files` is empty (the bundled TS plugin among them) can never
+    /// `watch_files` is empty can never
     /// appear here, by construction, which is also GM-272's answer to "must
     /// not break a plugin that does not know `workspaceChanged`": a plugin
     /// with nothing in `watch_files` is simply never a candidate for this

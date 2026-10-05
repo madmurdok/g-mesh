@@ -79,6 +79,11 @@ fn bundled_python_capabilities() -> Capabilities {
         .capabilities
 }
 
+/// TypeScript under a manifest with no semantic tier and receiver calls
+/// unresolved in both tiers: a never-resolving language, which is what the
+/// baseline rendering [`ORIGINAL_INSTRUCTIONS`] describes. The shipped
+/// manifest is pass-dependent instead
+/// ([`the_real_typescript_manifest_is_pass_dependent`]).
 fn typescript_present() -> PresentLanguage {
     PresentLanguage { language: "typescript".to_string(), capabilities: Capabilities::default() }
 }
@@ -198,14 +203,10 @@ fn go_only_renders_the_static_form_with_the_pass_sentence() {
     assert_pass_dependent_receiver_clause(&rendered, "go");
 }
 
-/// The silence half of the control: TypeScript declares
-/// `receiver_calls = "unresolved"` in *both* tiers, so it is named as
-/// never resolving, and the sentence about binding to a declared type
-/// must never appear for it. Measured on a probe fixture carrying three
-/// real receiver calls (`g.greet()` on a parameter typed by the
-/// interface, by the base class, and on a local of a subclass): every one
-/// of the three `greet` declarations answers `find_callers` with an empty
-/// set, because this plugin emits no receiver-call edge.
+/// The silence half of the control: a TypeScript that declares
+/// `receiver_calls = "unresolved"` in *both* tiers ([`typescript_present`])
+/// is named as never resolving, and the sentence about binding to a
+/// declared type must never appear for it.
 #[test]
 fn typescript_never_reaches_the_narrowed_rendering() {
     let rendered = build(&warm(ts_only()));
@@ -674,10 +675,10 @@ fn working_names_every_indexed_language_from_the_real_manifests() {
     assert!(!rendered.contains("Not indexed"), "{rendered}");
     assert!(!rendered.contains(TRAILER), "{rendered}");
     assert!(!rendered.contains("If this project has"), "{rendered}");
-    // TypeScript's real manifest resolves receiver calls in no tier; the
-    // other three resolve them through their semantic pass.
-    assert!(rendered.contains(&p4_perm("typescript")), "{rendered}");
-    assert!(rendered.contains(S_PASS), "{rendered}");
+    // All four real manifests resolve receiver calls through their semantic
+    // pass, so none is named in the gap list.
+    assert!(!rendered.contains(&p4_perm("typescript")), "{rendered}");
+    assert!(rendered.contains(&format!("{P4_STATIC} {S_PASS}")), "{rendered}");
     assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
 }
 
@@ -1032,18 +1033,19 @@ fn a_warm_rendering_never_says_the_cold_start_wait() {
     assert!(!rendered.contains("slow, not wrong"), "{rendered}");
 }
 
-/// TypeScript's real manifest: no tier resolves receiver calls, so it is
-/// named (never), and nothing waits on its pass. Control: classify by
-/// `semantic_pass` alone (TypeScript declares one).
+/// TypeScript's real manifest: its semantic tier (vtsls) resolves receiver
+/// calls and the structural tier does not, so it is pass-dependent - never
+/// named in the gap list; `P4_STATIC` plus `S_PASS`. Control: set the
+/// manifest's `receiver_calls` back to `"unresolved"` (it becomes never and
+/// is named).
 #[test]
-fn the_real_typescript_manifest_is_never_resolving() {
+fn the_real_typescript_manifest_is_pass_dependent() {
     let found = real_plugins(&["typescript"]);
     let present = real_present(&found, &["typescript"]);
-    assert_eq!(receiver_class(&present[0].capabilities), ReceiverClass::Never);
+    assert_eq!(receiver_class(&present[0].capabilities), ReceiverClass::PassDependent);
     let rendered = build(&warm(present));
-    assert!(rendered.contains(&p4_perm("typescript")), "{rendered}");
-    assert!(!rendered.contains(S_PASS), "{rendered}");
-    assert!(!rendered.contains(P4_STATIC), "{rendered}");
+    assert!(!rendered.contains(&p4_perm("typescript")), "{rendered}");
+    assert!(rendered.contains(&format!("{P4_STATIC} {S_PASS}")), "{rendered}");
 }
 
 /// Go, Python and Rust from their real manifests are pass-dependent: never
@@ -1141,16 +1143,17 @@ fn assert_uncovered_named(rendered: &str, absent: &[&str], failed: &[(String, St
     assert!(rendered.contains(TRAILER), "{rendered}");
 }
 
-/// Ladder step 2: sixteen failed languages with long errors, TypeScript and
-/// three absent languages overflow at step 1; dropping the errors fits,
-/// TypeScript still named (step 3 not reached). Control: start the ladder at
-/// step 3 (TypeScript is no longer named) or skip step 2.
+/// Ladder step 2: sixteen failed languages with long errors, a
+/// never-resolving TypeScript and three absent languages overflow at step 1;
+/// dropping the errors fits, TypeScript still named (step 3 not reached).
+/// Control: start the ladder at step 3 (TypeScript is no longer named) or
+/// skip step 2.
 #[test]
 fn ladder_step_2_drops_failed_errors_and_keeps_every_name() {
     let found = real_plugins(&["typescript"]);
     let failed = many_failed(16, 120);
     let coverage = Coverage {
-        covered: Covered::Indexed(real_present(&found, &["typescript"])),
+        covered: Covered::Indexed(ts_only()),
         uncovered: Uncovered::Recorded {
             absent: real_missing(&found).into_iter().map(|language| (language, Some(99_999))).collect(),
             failed: failed.clone(),
@@ -1441,8 +1444,7 @@ fn the_server_text_is_the_same_before_and_after_a_semantic_pass() {
     let after = server.instructions();
 
     assert_eq!(before, after);
-    assert!(before.contains(S_PASS), "{before}");
-    assert!(before.contains(&p4_perm("typescript")), "{before}");
+    assert!(before.contains(&format!("{P4_STATIC} {S_PASS}")), "{before}");
 }
 
 /// `Phase::Failed` with every discovered plugin failed renders the
@@ -1620,10 +1622,37 @@ fn shorten_paths_keeps_only_the_last_component_of_rooted_paths() {
     );
     assert_eq!(shorten_paths("no paths here"), "no paths here");
 
+    // Windows roots, on every host: drive with either separator, UNC and
+    // extended-length; a bare drive or a relative backslash path is kept.
+    assert_eq!(
+        shorten_paths(r"C:\Users\RUNNER~1\target\debug\g-mesh-plugin-rust.exe"),
+        "g-mesh-plugin-rust.exe"
+    );
+    assert_eq!(shorten_paths("d:/a/b/plugin.toml"), "plugin.toml");
+    assert_eq!(shorten_paths(r"spawn (C:\x\plugin.js) failed"), "spawn (plugin.js) failed");
+    assert_eq!(shorten_paths(r"\\srv\share\dir\c.toml"), "c.toml");
+    assert_eq!(shorten_paths(r"\\?\C:\a\b.rs"), "b.rs");
+    assert_eq!(shorten_paths(r"in C:\ and C: and a\b\c"), r"in C:\ and C: and a\b\c");
+
     assert_eq!(
         error_cause("spawning the plugin\n/opt/g-mesh/plugins/rust/g-mesh-plugin-rust is missing"),
         "g-mesh-plugin-rust is missing"
     );
+    // The Windows CI shape of the unbuilt-workspace hint: no directory of
+    // the runner's temp path survives into the item.
+    let windows = error_cause(
+        "failed to spawn the rust plugin's bulk index\n\
+         Run `cargo build --workspace` in C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpRhPq7a: \
+         the plugin binary C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpRhPq7a\\target\\debug\\g-mesh-plugin-rust.exe \
+         has not been built yet",
+    );
+    assert!(
+        windows.starts_with(
+            "Run `cargo build --workspace` in .tmpRhPq7a: the plugin binary g-mesh-plugin-rust.exe has"
+        ),
+        "{windows}"
+    );
+    assert!(!windows.contains("RUNNER~1"), "{windows}");
 }
 
 /// The 100-byte cap applies after shortening: a cause over 100 bytes only
@@ -1660,7 +1689,9 @@ fn the_cap_applies_after_shortening_and_cuts_on_a_char_boundary() {
 /// line and the two-cause assertion fails; with that assertion removed, the
 /// item reads "rust (failed to spawn the rust plugin's bulk index: the
 /// plugin binary ...)" and the `starts_with`/"failed to spawn" assertions
-/// fail.
+/// fail. On Windows the item also needs `shorten_paths` to recognise a
+/// drive-rooted path (pinned host-independently in
+/// [`shorten_paths_keeps_only_the_last_component_of_rooted_paths`]).
 #[test]
 fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
     use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
@@ -1705,13 +1736,92 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
     let rendered = rendered_with_rust_failed(&error);
     let item = failed_item(&rendered, "rust");
 
-    assert!(
-        item.starts_with(
-            "rust (the plugin binary g-mesh-plugin-rust does not exist - it has not been built yet."
-        ),
-        "{rendered}"
-    );
-    assert!(item.contains("Run `cargo build"), "the item must name the build command: {rendered}");
+    // The hint names the spelling cargo builds on this platform
+    // (`g-mesh-plugin-rust.exe` on Windows).
+    let named = crate::daemon::manifest::exe_suffixed(&binary, std::env::consts::EXE_SUFFIX)
+        .unwrap_or_else(|| binary.clone());
+    let name = named.file_name().unwrap().to_str().unwrap();
+    assert!(item.starts_with("rust (Run `cargo build --workspace` in "), "{rendered}");
+    // The cap may cut the tail after the binary's name, never the command.
+    assert!(item.contains(&format!("the plugin binary {name}")), "{rendered}");
     assert!(!item.contains("failed to spawn"), "{rendered}");
     assert!(!rendered.contains(&workspace.path().display().to_string()), "{rendered}");
+
+    // The Windows spelling of the same hint, on any host: the `.exe` name
+    // still leaves the whole build command inside the cause's byte cap.
+    let windows = crate::daemon::plugin::missing_workspace_binary_hint_with_suffix(&binary, ".exe")
+        .expect("the fixture must be the unbuilt-workspace-binary shape");
+    let cause = error_cause(&windows);
+    assert!(cause.starts_with("Run `cargo build --workspace` in "), "{cause}");
+    assert!(cause.contains("the plugin binary g-mesh-plugin-rust.exe"), "{cause}");
+}
+
+/// GM-351: the 100-byte cap on a failed language's cause never cuts the
+/// build command out of the unbuilt-workspace-binary hint. Worst case on
+/// any host: the longest bundled workspace plugin binary name, read from the
+/// real manifests, in its Windows `.exe` spelling, under both profiles
+/// (`--release` is the longer command) and both hint variants (a workspace
+/// root with `Cargo.toml`, and none: "the repository root"). Every case is
+/// long enough to be cut, so the assertions are about where the cut lands:
+/// after the whole command.
+///
+/// Control: restore the old order in
+/// `plugin::missing_workspace_binary_hint_with_suffix` (binary first, then
+/// "Run `{build}` in ...") - the cut lands inside the command and the
+/// `contains` assertion fails (already for the first case, debug with a
+/// root: 71 bytes of path and wording leave no room for the command).
+#[test]
+fn the_cap_never_cuts_the_build_command_out_of_the_longest_windows_hint() {
+    let found = real_plugins(&["go", "python", "rust", "typescript"]);
+    // The workspace-built plugins: those whose command sits under a cargo
+    // `target/<profile>/` directory, as `${G_MESH_BIN_DIR}` resolves.
+    let (language, name) = found
+        .manifests
+        .values()
+        .filter(|manifest| {
+            let profile = manifest.command.parent().and_then(|dir| dir.file_name());
+            profile.is_some_and(|profile| profile == "debug" || profile == "release")
+        })
+        .map(|manifest| {
+            let name = manifest.command.file_name().unwrap().to_str().unwrap();
+            let name = name.strip_suffix(std::env::consts::EXE_SUFFIX).unwrap_or(name);
+            (manifest.language.clone(), name.to_string())
+        })
+        .max_by_key(|(_, name)| name.len())
+        .expect("at least one bundled plugin is workspace-built");
+    let others: Vec<&str> =
+        ["go", "python", "rust", "typescript"].into_iter().filter(|other| *other != language).collect();
+
+    for with_root in [true, false] {
+        for (profile, cargo_build) in
+            [("debug", "`cargo build --workspace`"), ("release", "`cargo build --workspace --release`")]
+        {
+            let workspace = tempfile::tempdir().unwrap();
+            if with_root {
+                std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+            }
+            let binary = workspace.path().join("target").join(profile).join(&name);
+            let hint = crate::daemon::plugin::missing_workspace_binary_hint_with_suffix(&binary, ".exe")
+                .expect("the fixture must be the unbuilt-workspace-binary shape");
+            let error = format!("failed to spawn the {language} plugin's bulk index\n{hint}");
+
+            let mut outcomes = vec![(language.as_str(), failed(&error))];
+            outcomes.extend(others.iter().map(|other| (*other, indexed())));
+            let rendered = build(&warm_real(&found, &others, outcomes));
+            let item = failed_item(&rendered, &language);
+            let cause = item
+                .strip_prefix(&format!("{language} ("))
+                .and_then(|rest| rest.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("malformed item: {item}"));
+
+            let case = format!("{profile}, with_root={with_root}: {cause}");
+            assert!(cause.ends_with("..."), "the case must reach the cap: {case}");
+            assert!(cause.len() <= ERROR_BYTES, "{case}");
+            assert!(cause.starts_with(&format!("Run {cargo_build} in ")), "{case}");
+            assert!(cause.contains(cargo_build), "the whole command survives the cap: {case}");
+            if !with_root {
+                assert!(cause.starts_with(&format!("Run {cargo_build} in the repository root: ")), "{case}");
+            }
+        }
+    }
 }

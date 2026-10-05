@@ -5,11 +5,11 @@
 //! Both are properties of the *daemon's* sequencing, not of any one function,
 //! so this drives the real `g-mesh daemon` binary and watches what actually
 //! arrives on the plugin's stdin. The plugin here is a stub rather than the
-//! bundled JS/TS one (`G_MESH_JS_TS_PLUGIN_PATH` is the same override
-//! `daemon::plugin` documents for exactly this): what is being tested is
-//! which requests core sends and in what order, and a stub can record that
-//! without a tree-sitter parse in the way. `plugin_bridge.rs` covers the
-//! same wire against the real plugin.
+//! real TypeScript one: what is being tested is which requests core sends and
+//! in what order, and a stub can record that without a parse in the way. The
+//! stub is `g-mesh-fake-plugin` (`plugins/sdk/fake/main.rs`), which exists
+//! only after `cargo build --workspace`. `plugin_bridge.rs` covers the same
+//! wire against the real plugin.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,78 +29,16 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// the daemon's child processes, not by core - it is this test's own channel.
 const METHOD_LOG_ENV: &str = "G_MESH_FAKE_PLUGIN_LOG";
 
-/// A stub plugin: it speaks the control plane correctly (handshake, framing,
-/// a diff-shaped answer to anything that expects one) and records every
-/// method it is asked for. Its `--bulk-index` mode emits one canned NDJSON
+/// The stub plugin, beside the daemon under test. In stub mode (no `--dir`)
+/// it handshakes, records every method it is asked for in
+/// [`METHOD_LOG_ENV`], answers `fileChanged`/`semanticPass` with an empty diff
+/// and anything else with an acknowledgement, and walks to one canned `File`
 /// node so the walk has something real to commit.
-const STUB_PLUGIN: &str = r#""use strict";
-const fs = require("fs");
-
-const LOG = process.env.G_MESH_FAKE_PLUGIN_LOG;
-const args = process.argv.slice(2);
-
-function record(entry) {
-  fs.appendFileSync(LOG, entry + "\n");
-}
-
-function writeFrame(obj) {
-  const body = Buffer.from(JSON.stringify(obj), "utf8");
-  process.stdout.write("Content-Length: " + body.length + "\r\n\r\n");
-  process.stdout.write(body);
-}
-
-const EMPTY_DIFF = { upsertNodes: [], deleteNodeIds: [], upsertEdges: [], deleteEdgeIds: [] };
-
-function handle(envelope) {
-  record(envelope.method);
-  if (envelope.id === undefined) return;
-  if (envelope.method === "fileChanged" || envelope.method === "semanticPass") {
-    writeFrame({ jsonrpc: "2.0", id: envelope.id, result: EMPTY_DIFF });
-  } else {
-    writeFrame({ jsonrpc: "2.0", id: envelope.id, result: { acknowledged: true } });
-  }
-}
-
-if (args[0] === "--bulk-index") {
-  record("bulkIndex");
-  process.stdout.write(
-    JSON.stringify({
-      id: "n1",
-      kind: "File",
-      name: "seed.ts",
-      qualifiedName: "seed.ts",
-      filePath: "seed.ts",
-      range: { start: { line: 0, col: 0 }, end: { line: 0, col: 0 } },
-      visibility: "file",
-      language: "typescript",
-    }) + "\n",
-  );
-} else {
-  writeFrame({ protocolVersion: 2, language: "typescript", pluginVersion: "0.1.0" });
-
-  let buffer = Buffer.alloc(0);
-  process.stdin.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    for (;;) {
-      const headerEnd = buffer.indexOf("\r\n\r\n");
-      if (headerEnd === -1) return;
-      const match = /Content-Length:\s*(\d+)/i.exec(buffer.slice(0, headerEnd).toString("utf8"));
-      if (!match) return;
-      const length = Number(match[1]);
-      const start = headerEnd + 4;
-      if (buffer.length < start + length) return;
-      const body = buffer.slice(start, start + length).toString("utf8");
-      buffer = buffer.slice(start + length);
-      handle(JSON.parse(body));
-    }
-  });
-  process.stdin.on("end", () => process.exit(0));
-}
-"#;
+const FAKE_PLUGIN_BIN: &str = "g-mesh-fake-plugin";
 
 /// The project being indexed and the scratch space this test's own machinery
-/// lives in. They are deliberately two directories: the stub and its method
-/// log must sit *outside* the watched root, or writing a log line would look
+/// lives in. They are deliberately two directories: the stub's manifest and
+/// method log must sit *outside* the watched root, or writing a log line would look
 /// like a source edit and feed the watcher its own tail.
 struct Harness {
     project: tempfile::TempDir,
@@ -110,24 +48,16 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         let harness = Self { project: tempfile::tempdir().unwrap(), aux: tempfile::tempdir().unwrap() };
-        fs::write(harness.plugin_path(), STUB_PLUGIN).unwrap();
+        let stub = Path::new(BIN)
+            .parent()
+            .expect("the daemon binary has a directory")
+            .join(format!("{FAKE_PLUGIN_BIN}{}", std::env::consts::EXE_SUFFIX));
+        assert!(stub.is_file(), "{} does not exist - run `cargo build --workspace` first", stub.display());
         fs::write(harness.method_log(), "").unwrap();
         fs::write(harness.root().join("seed.ts"), "export const seed = 1;\n").unwrap();
 
-        // As of task 156, `daemon::bulk_index` no longer resolves the plugin
-        // via `plugin::PLUGIN_PATH_ENV` at all - it walks whatever
-        // `daemon::manifest::discover` found, exactly like the interactive
-        // supervisor a semantic pass runs against always has; and as of task
-        // 163, `registry::indexer_version` fingerprints every *discovered*
-        // manifest rather than the one bundled-plugin view
-        // `plugin::bundled_manifest` resolves from `PLUGIN_PATH_ENV`. Nothing
-        // this test exercises reads that env var any more - only
-        // `daemon::build_stamp` still does, for a question (is this running
-        // daemon's JS/TS build still mine?) this test has no reason to ask -
-        // so it is not set here. A manifest under `G_MESH_PLUGIN_ROOTS_OVERRIDE`
-        // - `daemon::manifest`'s own generalized discovery override - is what
-        // points both the bulk walk and the interactive supervisor at this
-        // stub.
+        // A manifest under `G_MESH_PLUGIN_ROOTS_OVERRIDE` points both the
+        // bulk walk and the interactive supervisor at the stub.
         let plugins_root = harness.aux.path().join("plugins");
         let language_dir = plugins_root.join("typescript");
         fs::create_dir_all(&language_dir).unwrap();
@@ -135,10 +65,10 @@ impl Harness {
             language_dir.join("plugin.toml"),
             format!(
                 "[plugin]\nlanguage = \"typescript\"\nprotocol_version = 2\nplugin_version = \"0.1.0\"\n\n\
-                 [plugin.spawn]\ncommand = \"node\"\nargs = [\"{}\"]\n\n\
+                 [plugin.spawn]\ncommand = \"${{G_MESH_BIN_DIR}}/{FAKE_PLUGIN_BIN}\"\n\
+                 args = [\"--language\", \"typescript\", \"--plugin-version\", \"0.1.0\"]\n\n\
                  [plugin.languages]\nextensions = [\".ts\"]\n\n\
                  [plugin.capabilities]\nsemantic_pass = true\n",
-                harness.plugin_path().to_string_lossy().replace('\\', "\\\\"),
             ),
         )
         .unwrap();
@@ -148,10 +78,6 @@ impl Harness {
 
     fn root(&self) -> &Path {
         self.project.path()
-    }
-
-    fn plugin_path(&self) -> PathBuf {
-        self.aux.path().join("index.js")
     }
 
     fn plugins_root(&self) -> PathBuf {

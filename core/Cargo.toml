@@ -179,9 +179,3 @@ dirs = "5"
 rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }
 tempfile = "3"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
-
-[build-dependencies]
-# `build.rs` digests the JS/TS plugin's build inputs (ts_build_stamp.rs) to
-# skip an unchanged `npm run build`. Same version as the normal
-# dependency, so the lockfile gains no second copy.
-sha2 = "0.10"

@@ -13,7 +13,7 @@ use crate::protocol::types::{ControlEnvelope, NodeKind, WireNode};
 
 /// The `nativeKind`s a `WireNode` stands in for something outside its own
 /// file rather than declaring anything (mirrors the plugin's own
-/// `PLACEHOLDER_NATIVE_KINDS` in plugins/typescript/src/extract.ts, minus
+/// `PLACEHOLDER_NATIVE_KINDS` in plugins/typescript/src/extractor/keys.rs, minus
 /// `external_module` - it names a bare specifier that never links to
 /// anything in this project, so core never materializes a node for one and
 /// it never reaches this check; see this task's own report for why

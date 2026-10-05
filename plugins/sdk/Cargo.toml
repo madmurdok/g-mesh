@@ -40,6 +40,15 @@ path = "toy/main.rs"
 name = "g-mesh-fake-lsp"
 path = "fake-lsp/main.rs"
 
+# The stand-in plugin core's own tests spawn (`core/src/daemon/test_plugin.rs`,
+# `core/tests/semantic_pass_trigger.rs`) through a manifest whose `command` is
+# `${G_MESH_BIN_DIR}/g-mesh-fake-plugin`. Here rather than in core because
+# `cargo install` would ship a core `[[bin]]`; core's tests need the workspace
+# built (`cargo build --workspace`) for it to exist. Not shipped.
+[[bin]]
+name = "g-mesh-fake-plugin"
+path = "fake/main.rs"
+
 [dependencies]
 anyhow = "1"
 # The wire types themselves, shared verbatim with core so the two cannot

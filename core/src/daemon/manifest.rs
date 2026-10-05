@@ -459,6 +459,29 @@ fn validate_symbol_query_prefixes(
     Ok(())
 }
 
+/// A manifest for `language` with every other field at its default and no
+/// command, for tests that only need a struct to spread with `..`. Nothing
+/// is read from a real `plugin.toml`, so no query table or capability leaks
+/// in from one.
+#[cfg(test)]
+pub(crate) fn bare_manifest(language: &str) -> PluginManifest {
+    PluginManifest {
+        language: language.to_string(),
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        plugin_version: String::new(),
+        command: PathBuf::new(),
+        args: Vec::new(),
+        extensions: Vec::new(),
+        fingerprint_ignore: Vec::new(),
+        manifest_dir: PathBuf::new(),
+        capabilities: Capabilities::default(),
+        workspace: WorkspaceConfig::default(),
+        non_symbol_queries: NonSymbolShapes::default(),
+        symbol_query_prefixes: SymbolQueryPrefixes::default(),
+        reexports: ReexportRules::default(),
+    }
+}
+
 /// The `[plugin.non_symbol_queries]` and `[plugin.symbol_query_prefixes]`
 /// tables of a manifest's text, validated as [`read_manifest`] validates
 /// them. For callers that hold a manifest's text but not its directory, such

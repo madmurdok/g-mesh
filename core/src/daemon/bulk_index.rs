@@ -31,7 +31,7 @@ use crate::watcher::apply::{to_edge_record, to_node_record, PathWarnings};
 use crate::watcher::staleness;
 
 /// Puts the plugin in one-shot bulk-index mode; must stay in sync with
-/// `BULK_INDEX_FLAG` in plugins/typescript/src/index.ts.
+/// `BULK_INDEX_FLAG` in plugins/sdk/src/run.rs.
 pub(crate) const BULK_INDEX_FLAG: &str = "--bulk-index";
 
 /// Set to `1` on every bulk spawn, telling the plugin its stdin is a lifeline:
@@ -39,8 +39,7 @@ pub(crate) const BULK_INDEX_FLAG: &str = "--bulk-index";
 /// the walk should stop. Opt-in by the spawner, so a plugin run by an older
 /// core or by hand with `< /dev/null` does not read an immediate EOF as "exit
 /// before walking". Must stay in sync with the plugins' own copies
-/// (`plugins/sdk/src/run.rs`, `plugins/go/main.go`,
-/// `plugins/typescript/src/index.ts`) - see
+/// (`plugins/sdk/src/run.rs`, `plugins/go/main.go`) - see
 /// `docs/architecture/plugin-lifetime.md` §2.
 pub(crate) const BULK_STDIN_LIFELINE_ENV: &str = "G_MESH_BULK_STDIN_LIFELINE";
 
@@ -363,7 +362,7 @@ fn walk_one_language_in(
     // The check `daemon::plugin::PluginState::spawn` makes too: an unbuilt
     // cargo-workspace plugin binary gets a message naming the build command
     // instead of a bare "No such file or directory".
-    if let Some(hint) = plugin::missing_plugin_binary_hint(&manifest.command, &manifest.args) {
+    if let Some(hint) = plugin::missing_plugin_binary_hint(&manifest.command) {
         // The hint is the innermost cause, so the instructions show it rather
         // than the step (ADR 0022).
         return Err(
@@ -835,14 +834,6 @@ mod tests {
         schema::language_outcomes(&conn.lock().unwrap()).unwrap()
     }
 
-    /// Removes a fake plugin's entry point: the "binary" of a node-launched
-    /// plugin, so its spawn fails the way a never-built plugin's does.
-    fn remove_entry_point(plugin_dir: &Path) -> std::path::PathBuf {
-        let entry = plugin_dir.join("plugin.js");
-        std::fs::remove_file(&entry).unwrap();
-        entry
-    }
-
     fn discover_root(plugins: &Path) -> DiscoveredPlugins {
         crate::daemon::manifest::discover(&[plugins.to_path_buf()])
             .expect("the fixture plugins must discover")
@@ -863,7 +854,7 @@ mod tests {
         let plugins = tempfile::tempdir().unwrap();
         test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
         let beta = test_plugin::install(plugins.path(), "beta", &[".beta-src"]);
-        let missing = remove_entry_point(&beta);
+        let missing = test_plugin::point_at_a_missing_binary(&beta);
         test_plugin::set_bulk_stream(project.path(), "alpha", &two_file_stream("alpha", ".alpha-src"), 0);
         let discovered = discover_root(plugins.path());
         let conn = setup_conn();
@@ -873,13 +864,9 @@ mod tests {
 
         assert_eq!(summary.outcomes.get("alpha"), Some(&LanguageOutcome::Indexed { files: 2 }));
         match summary.outcomes.get("beta") {
-            // The manifest's `./plugin.js` is joined onto its directory as
-            // written, so the path is matched as its directory plus file name.
             Some(LanguageOutcome::Failed { error }) => assert!(
-                error.contains(&beta.display().to_string())
-                    && error.contains("plugin.js")
-                    && error.contains("does not exist"),
-                "beta's error must name the missing entry point {}: {error}",
+                error.contains(&missing.display().to_string()) && error.contains("has not been built yet"),
+                "beta's error must name the missing binary {}: {error}",
                 missing.display()
             ),
             other => panic!("beta must be Failed, got {other:?}"),
@@ -915,8 +902,8 @@ mod tests {
         let plugins = tempfile::tempdir().unwrap();
         let alpha = test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
         let beta = test_plugin::install(plugins.path(), "beta", &[".beta-src"]);
-        remove_entry_point(&alpha);
-        remove_entry_point(&beta);
+        test_plugin::point_at_a_missing_binary(&alpha);
+        test_plugin::point_at_a_missing_binary(&beta);
         let discovered = discover_root(plugins.path());
         let conn = setup_conn();
 
@@ -948,7 +935,7 @@ mod tests {
         let plugins = tempfile::tempdir().unwrap();
         // A plugin whose spawn command is gone: the OS refuses the spawn, and
         // the stored error is the context plus the OS cause (a missing
-        // `plugin.js` entry point is caught earlier, as a single cause).
+        // workspace binary is caught earlier, as a single cause).
         for language in ["alpha", "beta"] {
             let dir = plugins.path().join(language);
             std::fs::create_dir_all(&dir).unwrap();
@@ -992,7 +979,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let plugins = tempfile::tempdir().unwrap();
         let alpha = test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
-        remove_entry_point(&alpha);
+        test_plugin::point_at_a_missing_binary(&alpha);
         write_old_file(project.path(), "app.py");
         let discovered = discover_root(plugins.path());
         let conn = setup_conn();
