@@ -27,9 +27,8 @@
 //!   SDK's [`CharColumns`]. They differ from UTF-16 columns only after a
 //!   non-BMP character on the same line.
 //! - **Imports** become placeholders and `IMPORTS` edges ([`imports`]),
-//!   resolved through an injected [`imports::SpecifierResolver`]. Until the
-//!   project model resolves specifiers it is [`imports::no_resolution`], and
-//!   every import is an `external_module`.
+//!   resolved through an injected [`imports::SpecifierResolver`], which is
+//!   the project model's [`TsProject::resolve`].
 //! - **Bodies** are walked with a lexical scope chain, and the calls and
 //!   names they use become `CALLS` and `REFERENCES` edges once the walk is
 //!   over ([`bodies`]). A local never resolves to this file's symbol of the
@@ -54,7 +53,6 @@ pub mod syntax;
 use g_mesh_plugin_sdk::{CharColumns, Extractor, FileGraph, RelPath};
 
 use crate::extractor::decls::Declarer;
-use crate::extractor::imports::no_resolution;
 use crate::extractor::model::FileModel;
 use crate::project::TsProject;
 
@@ -89,7 +87,7 @@ impl Extractor for TypeScriptExtractor {
     /// Parses `source` with its extension's grammar and declares everything
     /// in it. An extension this plugin does not own, or a parse tree-sitter
     /// gives up on, yields the `File` node alone.
-    fn extract(&self, _project: &TsProject, path: &RelPath, source: &str) -> FileGraph {
+    fn extract(&self, project: &TsProject, path: &RelPath, source: &str) -> FileGraph {
         let columns = CharColumns::new(source);
         let tree = grammar::grammar_for(path).and_then(|grammar| grammar::parse(grammar, source));
         let Some(tree) = tree else {
@@ -101,7 +99,8 @@ impl Extractor for TypeScriptExtractor {
         let end = root.end_position();
         let range = columns.range((start.row, start.column), (end.row, end.column));
         let mut model = FileModel::new(path.as_str(), range);
-        Declarer::new(source, &columns, path, &no_resolution, &mut model).run(root);
+        let resolve = |specifier: &str, from: &RelPath| project.resolve(specifier, from);
+        Declarer::new(source, &columns, path, &resolve, &mut model).run(root);
         emit::flush(model, LANGUAGE, ENGINE, path, root.has_error())
     }
 }
