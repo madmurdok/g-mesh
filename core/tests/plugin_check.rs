@@ -1383,6 +1383,13 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
     let run = run_check_with_expect(&dir, &ts_conformance_project(), &ts_conformance_expect());
     assert!(!run.success, "{}", run.stdout);
     assert_eq!(run.outcome("expectations.callers[1]"), "FAIL", "{}", run.stdout);
+    // The entry's structural half: `run` reaches `double` through the named
+    // re-export with no semantic pass, so it is the whole actual set here.
+    assert!(
+        run.stdout.contains("- actual:   {src/main.ts:run}\n"),
+        "callers[1] must still find run through the named re-export:\n{}",
+        run.stdout
+    );
     assert!(
         run.stdout.contains("missing (expected, not found): src/main.ts:useNamespaceImport"),
         "{}",

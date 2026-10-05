@@ -6,13 +6,8 @@
 //! One configuration, the manifest this plugin ships: `semantic_pass = false`,
 //! so core never sends a `semanticPass` and the structural tier answers alone.
 //! The expectations run with `--skip-semantic-expectations`: every entry
-//! tagged `tier = "semantic"` reports `Skip`, and every other entry passes but
-//! one. `[[callers]] symbol = "double"` (the second `[[callers]]` entry) is
-//! semantic without the tag: its namespace-import caller
-//! (`m.double(4)`) has no bare name at the use site, and the entry stays
-//! untagged so a semantic-off run without the skip flag can show it failing
-//! on exactly that row. Here it must fail, and only on that row. The semantic
-//! arm returns with the language-server tier.
+//! tagged `tier = "semantic"` reports `Skip`, and every other entry passes.
+//! The semantic arm returns with the language-server tier.
 //!
 //! `g-mesh` itself is found as the kit finds it: `G_MESH_BIN` if set, else the
 //! binary beside this test's own target directory (`cargo build -p g-mesh`).
@@ -41,11 +36,6 @@ const ALL_CHECKS: [&str; 15] = [
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
 ];
-
-/// The entry that needs the semantic tier without carrying its tag, and the
-/// one row it misses without that tier.
-const UNTAGGED_SEMANTIC: &str = "expectations.callers[1]";
-const UNTAGGED_SEMANTIC_MISSING: &str = "missing (expected, not found): src/main.ts:useNamespaceImport";
 
 /// The capability check that does not apply to a manifest without a semantic
 /// tier, and so must report `Skip`.
@@ -124,17 +114,7 @@ fn the_structural_tier_passes_every_check_and_every_structural_expectation() {
         .skip_semantic_expectations(true)
         .run()
         .expect("the conformance kit could not be run");
-    assert_eq!(
-        outcome.failures(),
-        vec![UNTAGGED_SEMANTIC],
-        "only the untagged semantic entry may fail:\n{}",
-        outcome.stdout
-    );
-    assert!(
-        outcome.stdout.contains(UNTAGGED_SEMANTIC_MISSING),
-        "{UNTAGGED_SEMANTIC} must fail on its namespace-import row alone:\n{}",
-        outcome.stdout
-    );
+    assert!(outcome.failures().is_empty(), "nothing may fail:\n{}", outcome.stdout);
 
     let mut reported: Vec<&str> = outcome.outcomes.keys().map(String::as_str).collect();
     reported.retain(|id| !id.starts_with("expectations."));
@@ -165,8 +145,8 @@ fn the_structural_tier_passes_every_check_and_every_structural_expectation() {
     );
     assert_eq!(
         verdicts_of(&judged, Verdict::Pass),
-        entries - semantic,
-        "the file plus every structural entry but {UNTAGGED_SEMANTIC} passes:\n{}",
+        entries - semantic + 1,
+        "the file plus every structural entry passes:\n{}",
         outcome.stdout
     );
 }
