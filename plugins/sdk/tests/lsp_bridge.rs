@@ -3357,8 +3357,13 @@ fn fixture_with_a_second_site(scratch: &Scratch) -> SdkIndex {
 /// A first answer that takes longer than `request` but less than the
 /// warm-up is an answer: the pass is complete and its edge emitted.
 ///
-/// Control: use `budgets.request` instead of `request_budget` in `run_pass`'s
-/// expiry filter; the first question times out at `request`.
+/// Control: `let request_budget = budgets.request;` in `run_pass`; the first
+/// question times out at `request`. Reverting the expiry filter alone is not
+/// a control here: `run_pass` runs that filter only when a poll comes back
+/// idle, and while the warm-up question is in flight that happens at its
+/// warm-up or at the pass deadline, never in between - a notification is
+/// `Poll::Noise` and goes straight back to the poll. The filter alone is
+/// pinned at the deadline, by `the_warm_up_sits_inside_the_pass_budget`.
 #[test]
 fn a_servers_first_question_may_take_its_warm_up_budget() {
     let scratch = Scratch::new("warm-up-first");
@@ -3529,7 +3534,9 @@ fn a_refused_first_question_spends_the_warm_up() {
 /// `request` and the pipeline fills to `concurrency` at once.
 ///
 /// Control: `warm_up: Some(..)` in `Budgets::default()`; one question goes
-/// out alone and is answered.
+/// out alone and is answered. Control: `let width = if warming ||
+/// warm_up.is_none() { 1 } else { .. };` in `run_pass`; the questions go out
+/// one at a time and at most two are outstanding before the first answer.
 #[test]
 fn without_a_warm_up_the_first_question_gets_the_request_budget_and_the_pipeline_fills_at_once() {
     assert_eq!(Budgets::default().warm_up, None);
@@ -3555,8 +3562,12 @@ fn without_a_warm_up_the_first_question_gets_the_request_budget_and_the_pipeline
     let answer = pass(&mut bridge, &index);
     assert!(!answer.complete, "the held first answer had only `request`");
     assert!(reason(&answer).contains("within 500ms"), "{}", reason(&answer));
+    // Every question asked before the server's first answer: `concurrency`
+    // of them, at once. A bridge that sent one question at a time would have
+    // at most two outstanding here - the held first, which the server goes
+    // on holding after the bridge gives up on it, and the one after it.
     let in_flight = in_flight_between_answers(&timeline);
-    assert!(in_flight[0] > 1, "no question goes out alone: {in_flight:?}");
+    assert!(in_flight[0] >= 4, "the pipeline fills to `concurrency` before any answer: {in_flight:?}");
 }
 
 /// A warm-up shorter than `request` never shortens the first question's
@@ -3582,7 +3593,10 @@ fn a_warm_up_shorter_than_request_never_shortens_the_first_question() {
 /// the warm-up.
 ///
 /// Control: `let wake = oldest + request_budget;` in `run_pass` (no
-/// `.min(deadline)`); the pass waits out the warm-up.
+/// `.min(deadline)`); the pass waits out the warm-up. Control: use
+/// `budgets.request` instead of `request_budget` in `run_pass`'s expiry
+/// filter; the idle poll at the deadline retires the first question at
+/// `request`, and the pass reports that instead of running out of its budget.
 #[test]
 fn the_warm_up_sits_inside_the_pass_budget() {
     let scratch = Scratch::new("warm-up-deadline");
