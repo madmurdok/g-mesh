@@ -1622,10 +1622,36 @@ fn shorten_paths_keeps_only_the_last_component_of_rooted_paths() {
     );
     assert_eq!(shorten_paths("no paths here"), "no paths here");
 
+    // Windows roots, on every host: drive with either separator, UNC and
+    // extended-length; a bare drive or a relative backslash path is kept.
+    assert_eq!(
+        shorten_paths(r"C:\Users\RUNNER~1\target\debug\g-mesh-plugin-rust.exe"),
+        "g-mesh-plugin-rust.exe"
+    );
+    assert_eq!(shorten_paths("d:/a/b/plugin.toml"), "plugin.toml");
+    assert_eq!(shorten_paths(r"spawn (C:\x\plugin.js) failed"), "spawn (plugin.js) failed");
+    assert_eq!(shorten_paths(r"\\srv\share\dir\c.toml"), "c.toml");
+    assert_eq!(shorten_paths(r"\\?\C:\a\b.rs"), "b.rs");
+    assert_eq!(shorten_paths(r"in C:\ and C: and a\b\c"), r"in C:\ and C: and a\b\c");
+
     assert_eq!(
         error_cause("spawning the plugin\n/opt/g-mesh/plugins/rust/g-mesh-plugin-rust is missing"),
         "g-mesh-plugin-rust is missing"
     );
+    // The Windows CI shape of the unbuilt-workspace hint: no directory of
+    // the runner's temp path survives into the item.
+    let windows = error_cause(
+        "failed to spawn the rust plugin's bulk index\n\
+         the plugin binary C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpRhPq7a\\target\\debug\\g-mesh-plugin-rust.exe \
+         has not been built yet. Run `cargo build --workspace` in \
+         C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpRhPq7a",
+    );
+    assert!(
+        windows.starts_with("the plugin binary g-mesh-plugin-rust.exe has not been built yet."),
+        "{windows}"
+    );
+    assert!(windows.contains("Run `cargo build --workspace`"), "{windows}");
+    assert!(!windows.contains("RUNNER~1"), "{windows}");
 }
 
 /// The 100-byte cap applies after shortening: a cause over 100 bytes only
@@ -1662,7 +1688,9 @@ fn the_cap_applies_after_shortening_and_cuts_on_a_char_boundary() {
 /// line and the two-cause assertion fails; with that assertion removed, the
 /// item reads "rust (failed to spawn the rust plugin's bulk index: the
 /// plugin binary ...)" and the `starts_with`/"failed to spawn" assertions
-/// fail.
+/// fail. On Windows the item also needs `shorten_paths` to recognise a
+/// drive-rooted path (pinned host-independently in
+/// [`shorten_paths_keeps_only_the_last_component_of_rooted_paths`]).
 #[test]
 fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
     use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
@@ -1707,13 +1735,24 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
     let rendered = rendered_with_rust_failed(&error);
     let item = failed_item(&rendered, "rust");
 
+    // The hint names the spelling cargo builds on this platform
+    // (`g-mesh-plugin-rust.exe` on Windows).
+    let named = crate::daemon::manifest::exe_suffixed(&binary, std::env::consts::EXE_SUFFIX)
+        .unwrap_or_else(|| binary.clone());
+    let name = named.file_name().unwrap().to_str().unwrap();
     assert!(
-        item.starts_with(
-            "rust (the plugin binary g-mesh-plugin-rust does not exist - it has not been built yet."
-        ),
+        item.starts_with(&format!("rust (the plugin binary {name} has not been built yet.")),
         "{rendered}"
     );
     assert!(item.contains("Run `cargo build"), "the item must name the build command: {rendered}");
     assert!(!item.contains("failed to spawn"), "{rendered}");
     assert!(!rendered.contains(&workspace.path().display().to_string()), "{rendered}");
+
+    // The Windows spelling of the same hint, on any host: the `.exe` name
+    // still leaves the whole build command inside the cause's byte cap.
+    let windows = crate::daemon::plugin::missing_workspace_binary_hint_with_suffix(&binary, ".exe")
+        .expect("the fixture must be the unbuilt-workspace-binary shape");
+    let cause = error_cause(&windows);
+    assert!(cause.starts_with("the plugin binary g-mesh-plugin-rust.exe has not been built yet."), "{cause}");
+    assert!(cause.contains("Run `cargo build --workspace`"), "{cause}");
 }

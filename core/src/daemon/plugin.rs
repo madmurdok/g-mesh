@@ -543,7 +543,7 @@ pub(crate) fn missing_workspace_binary_hint(command: &Path) -> Option<String> {
 /// as a parameter rather than read from [`std::env::consts::EXE_SUFFIX`]
 /// internally, so a test can exercise the Windows arm (`".exe"`) from any
 /// host.
-fn missing_workspace_binary_hint_with_suffix(command: &Path, suffix: &str) -> Option<String> {
+pub(crate) fn missing_workspace_binary_hint_with_suffix(command: &Path, suffix: &str) -> Option<String> {
     if command.is_file() {
         return None;
     }
@@ -565,12 +565,12 @@ fn missing_workspace_binary_hint_with_suffix(command: &Path, suffix: &str) -> Op
 
     Some(match workspace_root {
         Some(root) => format!(
-            "the plugin binary {} does not exist - it has not been built yet. Run `{build}` in {}",
+            "the plugin binary {} has not been built yet. Run `{build}` in {}",
             named.display(),
             root.display()
         ),
         None => format!(
-            "the plugin binary {} does not exist - it has not been built yet (run `{build}` in the repository root)",
+            "the plugin binary {} has not been built yet (run `{build}` in the repository root)",
             named.display()
         ),
     })
