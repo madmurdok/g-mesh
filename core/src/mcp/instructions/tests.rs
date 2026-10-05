@@ -1740,11 +1740,9 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
     let named = crate::daemon::manifest::exe_suffixed(&binary, std::env::consts::EXE_SUFFIX)
         .unwrap_or_else(|| binary.clone());
     let name = named.file_name().unwrap().to_str().unwrap();
-    assert!(
-        item.starts_with(&format!("rust (the plugin binary {name} has not been built yet.")),
-        "{rendered}"
-    );
-    assert!(item.contains("Run `cargo build"), "the item must name the build command: {rendered}");
+    assert!(item.starts_with("rust (Run `cargo build --workspace` in "), "{rendered}");
+    // The cap may cut the tail after the binary's name, never the command.
+    assert!(item.contains(&format!("the plugin binary {name}")), "{rendered}");
     assert!(!item.contains("failed to spawn"), "{rendered}");
     assert!(!rendered.contains(&workspace.path().display().to_string()), "{rendered}");
 
@@ -1753,6 +1751,6 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
     let windows = crate::daemon::plugin::missing_workspace_binary_hint_with_suffix(&binary, ".exe")
         .expect("the fixture must be the unbuilt-workspace-binary shape");
     let cause = error_cause(&windows);
-    assert!(cause.starts_with("the plugin binary g-mesh-plugin-rust.exe has not been built yet."), "{cause}");
-    assert!(cause.contains("Run `cargo build --workspace`"), "{cause}");
+    assert!(cause.starts_with("Run `cargo build --workspace` in "), "{cause}");
+    assert!(cause.contains("the plugin binary g-mesh-plugin-rust.exe"), "{cause}");
 }
