@@ -96,8 +96,33 @@ use crate::semantic::{SemanticAnswer, SemanticEngine};
 /// - **`readiness` (10 minutes) and `settle` (2s).** See [`LspBridge`]'s doc
 ///   on readiness. The readiness wait is *inside* the pass budget too, so a
 ///   server that never loads costs a pass rather than a plugin.
+/// - **`warm_up` (off).** A longer budget for a server's *first* question,
+///   for a server that holds every answer until it has loaded the project the
+///   question's file belongs to and reports no progress while it does - so
+///   readiness cannot see the load, and the first questions meet it instead.
+///   GM-325 measured vtsls with one tsserver (`useSyntaxServer = "never"`):
+///   12.8-33 s of loading on excalidraw, during which every request in flight
+///   timed out at `request`, so every cold pass was incomplete and re-run on
+///   the next daemon start. While it is owed, `run_pass` keeps **one**
+///   question in flight, under this budget instead of `request`; the first
+///   answer, refusal or timeout spends it, and the pipeline fills to
+///   `concurrency` under `request` as usual. One question rather than eight
+///   under the long budget because a server that is loading answers none of
+///   them sooner, and a server that never answers then costs one warm-up
+///   rather than eight. Spent once per *server process*
+///   (`LspClient::warmed_up`): a restarted server is cold again and owes a
+///   new one; a pass on a warm server never pays it. A warm-up that times out
+///   fails its question exactly as `request` would - the pass is incomplete
+///   and the file owed - and is not re-armed, so a server that never answers
+///   costs one long wait, not one per question or per pass. It sits *inside*
+///   the pass deadline like everything else, after `readiness`: a deferred
+///   empty answer still waits for `settle`, and the warm-up question's own
+///   empty answer counts as an answer (the server is responsive). `None` - the
+///   default - is exactly the behaviour before it existed. The one value a
+///   plugin sets ([`LspBridge::warm_up`]), because how long a server takes to
+///   load a project is a fact about that server.
 ///
-/// None of these is configuration. They are this type's fields so a test can
+/// None of these is configuration, `warm_up` aside. They are this type's fields so a test can
 /// drive a real timer with small values instead of faking the clock, which is
 /// the same escape hatch `RoundTripTimeouts` documents for core's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +146,10 @@ pub struct Budgets {
     /// How long to wait for a server to report *any* progress before deciding
     /// it is one that never does.
     pub settle: Duration,
+    /// How long a server's first question may take, if longer than
+    /// `request`; see this type's doc. `None` gives the first question
+    /// `request` like every other.
+    pub warm_up: Option<Duration>,
 }
 
 impl Default for Budgets {
@@ -134,6 +163,7 @@ impl Default for Budgets {
             single_file: Duration::from_secs(90),
             readiness: Duration::from_secs(10 * 60),
             settle: Duration::from_secs(2),
+            warm_up: None,
         }
     }
 }
@@ -518,6 +548,16 @@ impl LspBridge {
     /// opened as `typescript` is parsed without JSX.
     pub fn language_ids(mut self, by_extension: &'static [(&'static str, &'static str)]) -> Self {
         self.language_ids = by_extension;
+        self
+    }
+
+    /// Gives each server's first question `budget` instead of
+    /// [`Budgets::request`] - see [`Budgets`]'s `warm_up`. For a server that
+    /// answers nothing while it loads a project and reports no progress for
+    /// the load.
+    #[must_use]
+    pub fn warm_up(mut self, budget: Duration) -> Self {
+        self.budgets.warm_up = Some(budget);
         self
     }
 
@@ -2138,6 +2178,9 @@ fn run_pass(
     let mut fail = |reason: String| {
         failure.get_or_insert(reason);
     };
+    // Never shorter than `request`: a warm-up is a longer budget or none.
+    let warm_up = budgets.warm_up.map(|warm_up| warm_up.max(budgets.request));
+    let mut warm_up_logged = false;
 
     loop {
         // A deferred question goes back on the queue only once the server has
@@ -2149,8 +2192,23 @@ fn run_pass(
         if !deferred.is_empty() && client.quiet_for(budgets.settle) {
             queue.append(&mut deferred);
         }
-        // Fill the pipeline.
-        while in_flight.len() < budgets.concurrency.max(1) {
+        // Fill the pipeline - to one question while the server's warm-up is
+        // owed (see `Budgets::warm_up`), to `concurrency` after.
+        let warming = warm_up.is_some() && !client.warmed_up();
+        let width = if warming { 1 } else { budgets.concurrency.max(1) };
+        let request_budget = match warm_up {
+            Some(warm_up) if warming => warm_up,
+            _ => budgets.request,
+        };
+        if warming && !warm_up_logged && !queue.is_empty() {
+            warm_up_logged = true;
+            eprintln!(
+                "[{language}] the server has not answered yet - its first question may take up to {request_budget:?} \
+                 (warm-up), the rest {:?}",
+                budgets.request
+            );
+        }
+        while in_flight.len() < width {
             let Some(question) = queue.pop() else { break };
             touched_files.insert(question.accounted_to().clone());
             let position = {
@@ -2228,12 +2286,14 @@ fn run_pass(
         // Wake up for whichever comes first: an answer, the oldest request's
         // own timeout, or the end of the pass.
         let oldest = in_flight.values().map(|(_, sent)| *sent).min().unwrap_or(now);
-        let wake = (oldest + budgets.request).min(deadline);
+        let wake = (oldest + request_budget).min(deadline);
         let wait = wake.saturating_duration_since(now).max(Duration::from_millis(1));
 
         match client.poll(wait) {
             Poll::Answered { id, result } => {
                 let Some((question, _)) = in_flight.remove(&id) else { continue };
+                // Any answer, empty or not, is a server that is answering.
+                client.mark_warmed_up();
                 // An empty answer while the server is indexing is not an
                 // answer: re-ask it once, after the indexing ends.
                 let empty = question.is_empty_answer(&result);
@@ -2252,6 +2312,7 @@ fn run_pass(
             }
             Poll::Failed { id, code, message } => {
                 let Some((question, _)) = in_flight.remove(&id) else { continue };
+                client.mark_warmed_up();
                 // `ContentModified` is not a refusal: the server's state moved
                 // under the question (rust-analyzer switching crate graphs,
                 // GM-433), so it is asked again once the server is quiet -
@@ -2302,19 +2363,26 @@ fn run_pass(
                 let now = Instant::now();
                 let expired: Vec<i64> = in_flight
                     .iter()
-                    .filter(|(_, (_, sent))| now.duration_since(*sent) >= budgets.request)
+                    .filter(|(_, (_, sent))| now.duration_since(*sent) >= request_budget)
                     .map(|(id, _)| *id)
                     .collect();
+                if !expired.is_empty() {
+                    // A timed-out warm-up is spent too: it is not re-armed,
+                    // so a server that never answers costs one long wait.
+                    client.mark_warmed_up();
+                }
                 for id in expired {
                     let Some((question, _)) = in_flight.remove(&id) else { continue };
                     client.cancel(id);
                     eprintln!(
-                        "[{language}] the server did not answer a question about {} within {:?}",
-                        question.file, budgets.request
+                        "[{language}] the server did not answer a question about {} within {:?}{}",
+                        question.file,
+                        request_budget,
+                        if warming { " (its warm-up budget)" } else { "" }
                     );
                     fail(format!(
                         "the language server did not answer a question about {} within {:?}",
-                        question.file, budgets.request
+                        question.file, request_budget
                     ));
                     failed_files.insert(question.accounted_to().clone());
                 }
