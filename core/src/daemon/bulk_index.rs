@@ -865,7 +865,7 @@ mod tests {
         assert_eq!(summary.outcomes.get("alpha"), Some(&LanguageOutcome::Indexed { files: 2 }));
         match summary.outcomes.get("beta") {
             Some(LanguageOutcome::Failed { error }) => assert!(
-                error.contains(&missing.display().to_string()) && error.contains("does not exist"),
+                error.contains(&missing.display().to_string()) && error.contains("has not been built yet"),
                 "beta's error must name the missing binary {}: {error}",
                 missing.display()
             ),
