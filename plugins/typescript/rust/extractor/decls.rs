@@ -29,7 +29,7 @@ use tree_sitter::Node;
 use crate::extractor::bodies::UseState;
 use crate::extractor::imports::{is_whole_module_reexport, ImportState, SpecifierResolver};
 use crate::extractor::keys::{qualified_in, MemberSeparator, Qualified, REEXPORT_ALL_NAME};
-use crate::extractor::model::{FileModel, NodeParams};
+use crate::extractor::model::{FileModel, NodeParams, PendingSupertype};
 use crate::extractor::scope::{block_scope, type_parameter_scope, Scope};
 use crate::extractor::syntax::{
     child_of_kind, children, doc_comment_for, function_signature, has_body, has_child_of_kind,
@@ -56,7 +56,7 @@ pub struct Declarer<'a, 's, 't> {
     /// settled against the file's declarations once the walk is over.
     pending_exports: Vec<String>,
     pub(super) imports: ImportState<'t>,
-    pub(super) uses: UseState,
+    pub(super) uses: UseState<'t>,
 }
 
 impl<'a, 's, 't> Declarer<'a, 's, 't> {
@@ -83,8 +83,9 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
 
     /// Declares everything in the tree under `root`, then imports the
     /// specifiers `require(...)`/`import(...)` fold to, marks the names
-    /// exported after the fact, resolves what the bodies use and settles
-    /// every node's declaration list.
+    /// exported after the fact, resolves heritage and what the bodies use,
+    /// settles every node's declaration list and records the calls that may
+    /// bind an overload.
     ///
     /// Computed specifiers fold first: they read constants declared anywhere
     /// in the file, and their `IMPORTS` edges precede the late `EXPORTS`
@@ -102,6 +103,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         }
         self.resolve_uses();
         self.model.fill_declaration_lists();
+        self.record_overload_call_sites();
     }
 
     // --- helpers ---------------------------------------------------------
@@ -145,6 +147,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
             "export_statement" => self.handle_export(node, scope),
             "call_expression" => self.handle_call(node, scope),
             "new_expression" => self.handle_new(node, scope),
+            "member_expression" => self.handle_member_expression(node, scope),
             "class_declaration"
             | "abstract_class_declaration"
             | "class"
@@ -317,6 +320,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         params.doc_comment = doc_comment_for(outer, self.source);
         params.exported = exported;
         let index = self.model.declare_symbol(params);
+        self.record_supertypes(index, &supertype_names, scope);
 
         let member_scope = type_parameter_scope(
             node,
@@ -364,6 +368,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         let extends_clause = child_of_kind(node, "extends_type_clause");
         let supertype_names =
             extends_clause.map(|clause| heritage_names(clause, self.source)).unwrap_or_default();
+        self.record_supertypes(index, &supertype_names, scope);
         let member_scope = type_parameter_scope(
             node,
             self.source,
@@ -609,6 +614,19 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
     }
 
     // --- heritage ----------------------------------------------------------
+
+    /// Each heritage name of type node `index`, a `SUPERTYPE_OF` edge once
+    /// every declaration and import is known.
+    fn record_supertypes(&mut self, index: usize, names: &[String], scope: &Scope) {
+        let from_id = self.model.node(index).id.clone();
+        for name in names {
+            self.uses.supertypes.push(PendingSupertype {
+                from_id: from_id.clone(),
+                name: name.clone(),
+                scope: scope.clone(),
+            });
+        }
+    }
 
     /// The type arguments of a heritage clause (`extends Box<{ m(): void }>`),
     /// walked in the member scope of the class or interface.

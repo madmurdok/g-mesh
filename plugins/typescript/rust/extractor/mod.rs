@@ -33,7 +33,10 @@
 //! - **Bodies** are walked with a lexical scope chain, and the calls and
 //!   names they use become `CALLS` and `REFERENCES` edges once the walk is
 //!   over ([`bodies`]). A local never resolves to this file's symbol of the
-//!   same name.
+//!   same name. Heritage names become `SUPERTYPE_OF` edges.
+//! - **Open sites** ([`sites`]) carry what only a type checker can answer:
+//!   which overload a call binds, which member of a namespace import a use
+//!   names, and what a receiver call reaches. They never reach the wire.
 //! - **A syntax error is a normal answer**: whatever the error-tolerant parse
 //!   found is emitted, and every node is marked.
 
@@ -45,6 +48,7 @@ pub mod imports;
 pub mod keys;
 pub mod model;
 pub mod scope;
+pub mod sites;
 pub mod syntax;
 
 use g_mesh_plugin_sdk::{CharColumns, Extractor, FileGraph, RelPath};

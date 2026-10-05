@@ -17,8 +17,14 @@
 //!   type or namespace declared here. Class members are never reached by bare
 //!   name. A `CALLS` edge always targets a `Function` or a `pending_symbol`;
 //!   any other target is a `REFERENCES` edge.
-//! - **Order.** Uses resolve after the walk, calls before references: a name
-//!   already called from a symbol is not also referenced by it.
+//! - **Heritage.** Each name a class's `extends`/`implements` or an
+//!   interface's `extends` writes is a `SUPERTYPE_OF` edge from the subtype
+//!   to the type it reaches, else to an import's placeholder. Only the
+//!   clause's type arguments are walked as uses.
+//! - **Order.** Uses resolve after the walk: supertypes, then calls, then
+//!   references (a name already called from a symbol is not also referenced
+//!   by it), then member accesses. The open sites they leave are
+//!   [`crate::extractor::sites`]'.
 
 use std::collections::HashSet;
 
@@ -26,18 +32,25 @@ use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind};
 use tree_sitter::Node;
 
 use crate::extractor::decls::Declarer;
-use crate::extractor::model::{CallReceiver, PendingCall, PendingReference};
+use crate::extractor::model::{
+    CallReceiver, CallSite, PendingCall, PendingMemberAccess, PendingReference, PendingSupertype,
+};
 use crate::extractor::scope::{
     bound_scope, collect_declaration_names, collect_pattern_names, declares_binding, function_scope,
     is_binding_position, is_locally_bound, type_parameter_scope, Scope,
 };
 use crate::extractor::syntax::named_children;
 
-/// The calls and references a walk records, resolved once it is over.
+/// The supertypes, calls, references and member accesses a walk records,
+/// resolved once it is over, and the call sites resolution produces.
 #[derive(Debug, Default)]
-pub struct UseState {
-    calls: Vec<PendingCall>,
+pub struct UseState<'t> {
+    pub(super) supertypes: Vec<PendingSupertype>,
+    calls: Vec<PendingCall<'t>>,
     references: Vec<PendingReference>,
+    pub(super) member_accesses: Vec<PendingMemberAccess<'t>>,
+    /// Every call that produced a `CALLS` edge, in resolution order.
+    pub(super) call_sites: Vec<CallSite>,
 }
 
 impl<'a, 's, 't> Declarer<'a, 's, 't> {
@@ -141,8 +154,12 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
 
     // --- recording uses ------------------------------------------------------
 
-    fn record_call(&mut self, name: &str, receiver: CallReceiver, scope: &Scope) {
-        self.uses.calls.push(PendingCall { name: name.to_string(), receiver, scope: scope.clone() });
+    fn record_call(&mut self, at: Node<'t>, receiver: CallReceiver, scope: &Scope) {
+        self.record_named_call(self.text(at), at, receiver, scope);
+    }
+
+    fn record_named_call(&mut self, name: &str, at: Node<'t>, receiver: CallReceiver, scope: &Scope) {
+        self.uses.calls.push(PendingCall { name: name.to_string(), receiver, scope: scope.clone(), at });
     }
 
     /// A call expression: the call it names, or for `require(...)` and
@@ -151,7 +168,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
     ///
     /// A receiver that is neither `this`, `super` nor a bare identifier
     /// (`a.b.c()`, `f().g()`) needs a type to resolve: the receiver is walked
-    /// and the property records nothing.
+    /// and the call is a receiver-call open site.
     pub(super) fn handle_call(&mut self, node: Node<'t>, scope: &Scope) {
         if let Some(callee) = node.child_by_field_name("function") {
             match callee.kind() {
@@ -160,13 +177,13 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
                     // A `require(...)` that is not read as an import is a call
                     // of the name `require`, which a file may declare itself.
                     if name != "require" || !self.record_call_import(node, scope, Some(callee)) {
-                        self.record_call(name, CallReceiver::None, scope);
+                        self.record_call(callee, CallReceiver::None, scope);
                     }
                 }
                 "import" => {
                     self.record_call_import(node, scope, None);
                 }
-                "super" => self.record_call("constructor", CallReceiver::Super, scope),
+                "super" => self.record_named_call("constructor", callee, CallReceiver::Super, scope),
                 "member_expression" => {
                     let object = callee.child_by_field_name("object");
                     let property = callee.child_by_field_name("property");
@@ -177,13 +194,19 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
                             } else {
                                 CallReceiver::Super
                             };
-                            self.record_call(self.text(property), receiver, scope);
+                            self.record_call(property, receiver, scope);
                         }
                         (Some(object), Some(property)) if object.kind() == "identifier" => {
                             let receiver = CallReceiver::Qualified(self.text(object).to_string());
-                            self.record_call(self.text(property), receiver, scope);
+                            self.record_call(property, receiver, scope);
+                            self.record_member_access(object, property, scope, true);
                         }
-                        (Some(object), _) => self.visit(object, scope),
+                        (Some(object), property) => {
+                            self.visit(object, scope);
+                            if let Some(property) = property {
+                                self.record_receiver_call(property, scope);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -200,8 +223,8 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
     pub(super) fn handle_new(&mut self, node: Node<'t>, scope: &Scope) {
         match node.child_by_field_name("constructor") {
             Some(constructor) if constructor.kind() == "identifier" => {
-                let receiver = CallReceiver::Qualified(self.text(constructor).to_string());
-                self.record_call("constructor", receiver, scope);
+                let receiver = CallReceiver::New(self.text(constructor).to_string());
+                self.record_named_call("constructor", constructor, receiver, scope);
             }
             Some(constructor) => self.visit(constructor, scope),
             None => {}
@@ -210,6 +233,28 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         if let Some(arguments) = node.child_by_field_name("arguments") {
             self.visit_children(arguments, scope);
         }
+    }
+
+    /// `obj.prop` outside a call's callee: walked like any expression, and
+    /// kept as a member access in case `obj` is a namespace import.
+    pub(super) fn handle_member_expression(&mut self, node: Node<'t>, scope: &Scope) {
+        let object = node.child_by_field_name("object");
+        let property = node.child_by_field_name("property");
+        if let (Some(object), Some(property)) = (object, property) {
+            if object.kind() == "identifier" {
+                self.record_member_access(object, property, scope, false);
+            }
+        }
+        self.visit_children(node, scope);
+    }
+
+    fn record_member_access(&mut self, object: Node<'t>, property: Node<'t>, scope: &Scope, is_call: bool) {
+        self.uses.member_accesses.push(PendingMemberAccess {
+            object_name: self.text(object).to_string(),
+            at: property,
+            scope: scope.clone(),
+            is_call,
+        });
     }
 
     /// An identifier outside a binding position is a use of its name.
@@ -228,38 +273,66 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
     /// `require`, after every call the walk recorded.
     pub(super) fn record_require_calls(&mut self, callees: Vec<(Node<'t>, Scope)>) {
         for (callee, scope) in callees {
-            self.record_call(self.text(callee), CallReceiver::None, &scope);
+            self.record_call(callee, CallReceiver::None, &scope);
         }
     }
 
     // --- resolving uses -------------------------------------------------------
 
-    /// Resolves every recorded call, then every recorded reference.
+    /// Resolves every recorded supertype, call, reference and member access,
+    /// in that order.
     pub(super) fn resolve_uses(&mut self) {
+        for supertype in std::mem::take(&mut self.uses.supertypes) {
+            self.resolve_supertype(&supertype);
+        }
         for call in std::mem::take(&mut self.uses.calls) {
             self.resolve_call(&call);
         }
         for reference in std::mem::take(&mut self.uses.references) {
             self.resolve_reference(&reference.name, &reference.scope, reference.type_position);
         }
+        for access in std::mem::take(&mut self.uses.member_accesses) {
+            self.collect_namespace_member_use(&access);
+        }
     }
 
-    fn resolve_call(&mut self, call: &PendingCall) {
+    /// `SUPERTYPE_OF` runs from the subtype to the supertype, so a type's
+    /// implementations are its inbound edges.
+    fn resolve_supertype(&mut self, supertype: &PendingSupertype) {
+        let target = self.lookup_type(&supertype.name, &supertype.scope);
+        if let Some(target) = target.or_else(|| self.imported_symbol(&supertype.name)) {
+            let target_id = self.model.node(target).id.clone();
+            self.model.add_edge(&supertype.from_id, EdgeKind::SupertypeOf, &target_id);
+        }
+    }
+
+    fn resolve_call(&mut self, call: &PendingCall<'t>) {
         // A locally bound name is not a graph symbol. `this.m()`/`super.m()`
         // name a member, which no local shadows.
         let shadowable = match &call.receiver {
             CallReceiver::None => Some(call.name.as_str()),
-            CallReceiver::Qualified(object) => Some(object.as_str()),
-            CallReceiver::This | CallReceiver::Super => None,
+            receiver => receiver.owner(),
         };
-        if shadowable.is_some_and(|name| is_locally_bound(name, call.scope.locals.as_ref())) {
+        let shadowed = shadowable.is_some_and(|name| is_locally_bound(name, call.scope.locals.as_ref()));
+
+        // `obj.m()` that reaches no member declared here is a receiver call,
+        // whatever `obj` is, unless `obj` is a namespace import: that site is
+        // a question of its own.
+        if let CallReceiver::Qualified(object) = &call.receiver {
+            if (shadowed || self.lookup_call_target(call).is_none())
+                && !self.is_namespace_receiver(object, &call.scope)
+            {
+                self.record_receiver_call(call.at, &call.scope);
+            }
+        }
+        if shadowed {
             return;
         }
 
         if let Some(target) = self.lookup_call_target(call) {
             match &call.scope.enclosing_caller_id {
                 Some(caller) if self.model.node(target).kind == NodeKind::Function => {
-                    self.add_call(caller, target);
+                    self.add_call(caller, target, call.at);
                 }
                 _ => self.add_usage(target, &call.scope),
             }
@@ -268,19 +341,21 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         match &call.receiver {
             CallReceiver::None => match self.imported_symbol(&call.name) {
                 Some(imported) => match &call.scope.enclosing_caller_id {
-                    Some(caller) => self.add_call(caller, imported),
+                    Some(caller) => self.add_call(caller, imported, call.at),
                     None => self.add_usage(imported, &call.scope),
                 },
                 None => self.resolve_reference(&call.name, &call.scope, false),
             },
             // Which member of an imported receiver is the semantic tier's
             // question; the receiver itself is a use.
-            CallReceiver::Qualified(object) => self.resolve_reference(object, &call.scope, false),
+            CallReceiver::Qualified(object) | CallReceiver::New(object) => {
+                self.resolve_reference(object, &call.scope, false)
+            }
             CallReceiver::This | CallReceiver::Super => {}
         }
     }
 
-    fn lookup_call_target(&self, call: &PendingCall) -> Option<usize> {
+    fn lookup_call_target(&self, call: &PendingCall<'t>) -> Option<usize> {
         let scope = &call.scope;
         match &call.receiver {
             CallReceiver::None => {
@@ -293,7 +368,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
                 let supertype = self.lookup_type(supertype, scope)?;
                 self.lookup_member(&self.model.node(supertype).qualified_name, &call.name)
             }),
-            CallReceiver::Qualified(object) => {
+            CallReceiver::Qualified(object) | CallReceiver::New(object) => {
                 if let Some(member) = self.model.lookup_qualified(&format!("{object}.{}", call.name)) {
                     return Some(member);
                 }
@@ -322,10 +397,12 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         }
     }
 
-    /// The `CALLS` edge from `caller` to node `target`.
-    fn add_call(&mut self, caller: &str, target: usize) {
+    /// The `CALLS` edge from `caller` to node `target`, and the call site
+    /// written at `at`.
+    fn add_call(&mut self, caller: &str, target: usize, at: Node<'t>) {
         let target_id = self.model.node(target).id.clone();
         self.model.add_edge(caller, EdgeKind::Calls, &target_id);
+        self.record_call_site(caller, &target_id, at);
     }
 
     /// A `REFERENCES` edge from the enclosing symbol, unless it is the
@@ -346,7 +423,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
             .or_else(|| self.model.lookup_qualified(&format!("{type_qualified_name}.{name}")))
     }
 
-    fn lookup_type(&self, name: &str, scope: &Scope) -> Option<usize> {
+    pub(super) fn lookup_type(&self, name: &str, scope: &Scope) -> Option<usize> {
         self.model.lookup_by_name(name, &scope.namespace_prefix, Some(NodeKind::Type))
     }
 }

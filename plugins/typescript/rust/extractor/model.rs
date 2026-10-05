@@ -14,9 +14,11 @@
 use std::collections::{HashMap, HashSet};
 
 use g_mesh_plugin_sdk::ids::{edge_id, node_id};
-use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PathSegment, PlaceholderTarget, Range, WireDeclaration};
+use g_mesh_plugin_sdk::wire::{
+    EdgeKind, NodeKind, PathSegment, PlaceholderTarget, Position, Range, WireDeclaration,
+};
 
-use g_mesh_plugin_sdk::RelPath;
+use g_mesh_plugin_sdk::{OpenSite, RelPath};
 use tree_sitter::Node;
 
 use crate::extractor::keys::{is_placeholder_kind, is_sendable_path, qualify, MemberSeparator};
@@ -54,19 +56,68 @@ pub enum CallReceiver {
     This,
     /// `super.m()`, and `super()` as a call of `constructor`.
     Super,
-    /// `Owner.m()` and `new Owner()` (a call of `constructor`): the receiver is
-    /// a bare identifier, which may name a type or namespace of this file.
+    /// `Owner.m()`: the receiver is a bare identifier, which may name a type
+    /// or namespace of this file, or any other value.
     Qualified(String),
+    /// `new Owner()`, a call of `constructor`; resolved as `Owner.constructor()`
+    /// but never a receiver call.
+    New(String),
+}
+
+impl CallReceiver {
+    /// The identifier `Owner.m()` and `new Owner()` name their owner by.
+    pub fn owner(&self) -> Option<&str> {
+        match self {
+            CallReceiver::Qualified(owner) | CallReceiver::New(owner) => Some(owner),
+            CallReceiver::None | CallReceiver::This | CallReceiver::Super => None,
+        }
+    }
 }
 
 /// A call written in the walk, resolved once every declaration of the file
 /// is known.
 #[derive(Debug, Clone)]
-pub struct PendingCall {
+pub struct PendingCall<'t> {
     /// The callee's name: the function, the member, or `constructor`.
     pub name: String,
     pub receiver: CallReceiver,
     pub scope: Scope,
+    /// The callee's name token: where an open site about this call points.
+    pub at: Node<'t>,
+}
+
+/// A class's or interface's heritage name, resolved once every declaration
+/// and import of the file is known.
+#[derive(Debug, Clone)]
+pub struct PendingSupertype {
+    /// The subtype.
+    pub from_id: String,
+    pub name: String,
+    /// The scope the subtype is declared in.
+    pub scope: Scope,
+}
+
+/// An `<identifier>.<property>` site, kept until every import is known: it is
+/// a question for the semantic tier when the identifier is a namespace import
+/// of a project file.
+#[derive(Debug, Clone)]
+pub struct PendingMemberAccess<'t> {
+    pub object_name: String,
+    /// The property token.
+    pub at: Node<'t>,
+    pub scope: Scope,
+    /// Written as the callee of a call.
+    pub is_call: bool,
+}
+
+/// A call that produced a `CALLS` edge, kept until the declaration lists are
+/// settled: only a call onto an overload set or a placeholder is a question.
+#[derive(Debug, Clone)]
+pub struct CallSite {
+    pub from_id: String,
+    pub to_id: String,
+    pub name: String,
+    pub position: Position,
 }
 
 /// A name used in the walk, resolved once every declaration of the file is
@@ -176,6 +227,8 @@ pub struct FileModel {
     /// Declared symbols only, first declaration wins: placeholders never
     /// shadow a real name.
     by_qualified_name: HashMap<String, usize>,
+    /// The questions left for a semantic tier, in the order they are asked.
+    open_sites: Vec<OpenSite>,
 }
 
 impl FileModel {
@@ -190,6 +243,7 @@ impl FileModel {
             edge_ids: HashSet::new(),
             declarations: HashMap::new(),
             by_qualified_name: HashMap::new(),
+            open_sites: Vec::new(),
         };
         let name = path.rsplit('/').next().unwrap_or(path);
         model.add_node(NodeParams::new(NodeKind::File, name, path, range));
@@ -380,6 +434,16 @@ impl FileModel {
             }
             prefix = prefix.rfind('.').map_or("", |at| &prefix[..at]);
         }
+    }
+
+    /// Records a question for a semantic tier.
+    pub fn add_open_site(&mut self, site: OpenSite) {
+        self.open_sites.push(site);
+    }
+
+    /// The recorded open sites, in the order they were added.
+    pub fn take_open_sites(&mut self) -> Vec<OpenSite> {
+        std::mem::take(&mut self.open_sites)
     }
 
     /// The nodes and edges, in insertion order.

@@ -75,9 +75,26 @@ thread_local! {
     static PARSERS: RefCell<[Option<tree_sitter::Parser>; 3]> = const { RefCell::new([None, None, None]) };
 }
 
+/// The grammars reject a raw NUL even inside a literal, where tsc accepts it
+/// (a common field separator), and the parse around it degrades into errors
+/// that lose the declarations and uses after it. U+0001 stands in for it:
+/// one byte like NUL, so every position stays put; inside a literal the
+/// grammars accept it, and outside one it is an error exactly as NUL is. The
+/// tree is parsed from the stand-in text but every name is read from the real
+/// source, so names keep their NULs.
+const NUL: char = '\0';
+const NUL_STAND_IN: &str = "\u{1}";
+
 /// Parses `source` with `grammar`. `None` only when tree-sitter gives up,
 /// which needs a cancellation flag or a timeout this plugin never sets.
 pub fn parse(grammar: Grammar, source: &str) -> Option<tree_sitter::Tree> {
+    if source.contains(NUL) {
+        return parse_text(grammar, &source.replace(NUL, NUL_STAND_IN));
+    }
+    parse_text(grammar, source)
+}
+
+fn parse_text(grammar: Grammar, source: &str) -> Option<tree_sitter::Tree> {
     PARSERS.with(|parsers| {
         let mut parsers = parsers.borrow_mut();
         let parser = parsers[grammar.index()].get_or_insert_with(|| {
