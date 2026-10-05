@@ -79,6 +79,11 @@ fn bundled_python_capabilities() -> Capabilities {
         .capabilities
 }
 
+/// TypeScript under a manifest with no semantic tier and receiver calls
+/// unresolved in both tiers: a never-resolving language, which is what the
+/// baseline rendering [`ORIGINAL_INSTRUCTIONS`] describes. The shipped
+/// manifest is pass-dependent instead
+/// ([`the_real_typescript_manifest_is_pass_dependent`]).
 fn typescript_present() -> PresentLanguage {
     PresentLanguage { language: "typescript".to_string(), capabilities: Capabilities::default() }
 }
@@ -198,14 +203,10 @@ fn go_only_renders_the_static_form_with_the_pass_sentence() {
     assert_pass_dependent_receiver_clause(&rendered, "go");
 }
 
-/// The silence half of the control: TypeScript declares
-/// `receiver_calls = "unresolved"` in *both* tiers, so it is named as
-/// never resolving, and the sentence about binding to a declared type
-/// must never appear for it. Measured on a probe fixture carrying three
-/// real receiver calls (`g.greet()` on a parameter typed by the
-/// interface, by the base class, and on a local of a subclass): every one
-/// of the three `greet` declarations answers `find_callers` with an empty
-/// set, because this plugin emits no receiver-call edge.
+/// The silence half of the control: a TypeScript that declares
+/// `receiver_calls = "unresolved"` in *both* tiers ([`typescript_present`])
+/// is named as never resolving, and the sentence about binding to a
+/// declared type must never appear for it.
 #[test]
 fn typescript_never_reaches_the_narrowed_rendering() {
     let rendered = build(&warm(ts_only()));
@@ -674,10 +675,10 @@ fn working_names_every_indexed_language_from_the_real_manifests() {
     assert!(!rendered.contains("Not indexed"), "{rendered}");
     assert!(!rendered.contains(TRAILER), "{rendered}");
     assert!(!rendered.contains("If this project has"), "{rendered}");
-    // TypeScript's real manifest resolves receiver calls in no tier; the
-    // other three resolve them through their semantic pass.
-    assert!(rendered.contains(&p4_perm("typescript")), "{rendered}");
-    assert!(rendered.contains(S_PASS), "{rendered}");
+    // All four real manifests resolve receiver calls through their semantic
+    // pass, so none is named in the gap list.
+    assert!(!rendered.contains(&p4_perm("typescript")), "{rendered}");
+    assert!(rendered.contains(&format!("{P4_STATIC} {S_PASS}")), "{rendered}");
     assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
 }
 
@@ -1032,18 +1033,19 @@ fn a_warm_rendering_never_says_the_cold_start_wait() {
     assert!(!rendered.contains("slow, not wrong"), "{rendered}");
 }
 
-/// TypeScript's real manifest: no tier resolves receiver calls, so it is
-/// named (never), and nothing waits on its pass. Control: classify by
-/// `semantic_pass` alone (TypeScript declares one).
+/// TypeScript's real manifest: its semantic tier (vtsls) resolves receiver
+/// calls and the structural tier does not, so it is pass-dependent - never
+/// named in the gap list; `P4_STATIC` plus `S_PASS`. Control: set the
+/// manifest's `receiver_calls` back to `"unresolved"` (it becomes never and
+/// is named).
 #[test]
-fn the_real_typescript_manifest_is_never_resolving() {
+fn the_real_typescript_manifest_is_pass_dependent() {
     let found = real_plugins(&["typescript"]);
     let present = real_present(&found, &["typescript"]);
-    assert_eq!(receiver_class(&present[0].capabilities), ReceiverClass::Never);
+    assert_eq!(receiver_class(&present[0].capabilities), ReceiverClass::PassDependent);
     let rendered = build(&warm(present));
-    assert!(rendered.contains(&p4_perm("typescript")), "{rendered}");
-    assert!(!rendered.contains(S_PASS), "{rendered}");
-    assert!(!rendered.contains(P4_STATIC), "{rendered}");
+    assert!(!rendered.contains(&p4_perm("typescript")), "{rendered}");
+    assert!(rendered.contains(&format!("{P4_STATIC} {S_PASS}")), "{rendered}");
 }
 
 /// Go, Python and Rust from their real manifests are pass-dependent: never
@@ -1141,16 +1143,17 @@ fn assert_uncovered_named(rendered: &str, absent: &[&str], failed: &[(String, St
     assert!(rendered.contains(TRAILER), "{rendered}");
 }
 
-/// Ladder step 2: sixteen failed languages with long errors, TypeScript and
-/// three absent languages overflow at step 1; dropping the errors fits,
-/// TypeScript still named (step 3 not reached). Control: start the ladder at
-/// step 3 (TypeScript is no longer named) or skip step 2.
+/// Ladder step 2: sixteen failed languages with long errors, a
+/// never-resolving TypeScript and three absent languages overflow at step 1;
+/// dropping the errors fits, TypeScript still named (step 3 not reached).
+/// Control: start the ladder at step 3 (TypeScript is no longer named) or
+/// skip step 2.
 #[test]
 fn ladder_step_2_drops_failed_errors_and_keeps_every_name() {
     let found = real_plugins(&["typescript"]);
     let failed = many_failed(16, 120);
     let coverage = Coverage {
-        covered: Covered::Indexed(real_present(&found, &["typescript"])),
+        covered: Covered::Indexed(ts_only()),
         uncovered: Uncovered::Recorded {
             absent: real_missing(&found).into_iter().map(|language| (language, Some(99_999))).collect(),
             failed: failed.clone(),
@@ -1441,8 +1444,7 @@ fn the_server_text_is_the_same_before_and_after_a_semantic_pass() {
     let after = server.instructions();
 
     assert_eq!(before, after);
-    assert!(before.contains(S_PASS), "{before}");
-    assert!(before.contains(&p4_perm("typescript")), "{before}");
+    assert!(before.contains(&format!("{P4_STATIC} {S_PASS}")), "{before}");
 }
 
 /// `Phase::Failed` with every discovered plugin failed renders the

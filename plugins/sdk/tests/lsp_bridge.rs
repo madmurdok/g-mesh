@@ -1465,6 +1465,32 @@ fn the_bridge_carries_no_language_of_its_own() {
     );
 }
 
+/// A document is opened under the `languageId` its extension maps to in
+/// `LspBridge::language_ids`, and under the bridge's language without one -
+/// read from what the server received.
+#[test]
+fn a_document_is_opened_under_the_language_id_its_extension_maps_to() {
+    let scratch = Scratch::new("language-ids");
+    let (index, _) = fixture(&scratch);
+    let opened_as = |by_extension: &'static [(&'static str, &'static str)], tag: &str| {
+        let log = scratch.path().join(format!("opened-{tag}.log"));
+        let config = scratch.server(json!({
+            "readiness": { "kind": "none" },
+            "positionEncoding": "utf-16",
+            "answers": answers_the_site(&scratch),
+            "openedLog": log.to_string_lossy(),
+        }));
+        let mut bridge =
+            LspBridge::with_budgets("toy", scratch.path(), config, budgets()).language_ids(by_extension);
+        let answer = bridge.answer(&[RelPath::new("src/b.toy")], &index).expect("the bridge answers");
+        assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+        std::fs::read_to_string(&log).unwrap_or_default()
+    };
+    let b = scratch.uri("src/b.toy");
+    assert_eq!(opened_as(&[(".other", "other"), ("b.toy", "toy-b")], "mapped"), format!("{b} toy-b\n"));
+    assert_eq!(opened_as(&[(".other", "other")], "unmapped"), format!("{b} toy\n"));
+}
+
 /// The second settings channel (GM-299): a server that *asks* for its
 /// settings gets the ones the config carries, positionally, and `null` for a
 /// section nobody configured.

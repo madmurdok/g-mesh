@@ -471,3 +471,116 @@ fn nul_in_the_source_does_not_end_the_parse() {
     let graph = extract("src/a.ts", "const a = \"\0\";\nconst r = /\0/;\nfunction f() {}\n");
     assert_eq!(graph.symbols(), vec!["a", "r", "f"]);
 }
+
+// --- member visibility -------------------------------------------------------
+
+/// The visibility of each of `qualified_names`, in order.
+fn visibilities(graph: &Graph, qualified_names: &[&str]) -> Vec<(String, Visibility)> {
+    qualified_names.iter().map(|name| (name.to_string(), graph.node(name).visibility.clone())).collect()
+}
+
+fn all_are(names: &[&str], visibility: Visibility) -> Vec<(String, Visibility)> {
+    names.iter().map(|name| (name.to_string(), visibility.clone())).collect()
+}
+
+/// Every member kind of an exported class is `public`, as its class is -
+/// `protected` included, since a subclass in another file reaches it - and
+/// every member of a class that is not exported is `file`.
+#[test]
+fn a_member_takes_its_classs_visibility() {
+    let graph = extract(
+        "src/a.ts",
+        "export class A {\n  constructor() {}\n  m() {}\n  static s() {}\n  get g() { return 1; }\n  \
+         protected q() {}\n  f = () => 1;\n}\nclass X {\n  m() {}\n  f = () => 1;\n}\n\
+         export abstract class K { abstract am(): void; }\n",
+    );
+    let public = ["A#constructor", "A#m", "A.s", "A#q", "A#f", "K#am"];
+    assert_eq!(visibilities(&graph, &public), all_are(&public, Visibility::Public));
+    assert!(graph.all("A#g").iter().all(|getter| getter.visibility == Visibility::Public));
+    let file = ["X#m", "X#f"];
+    assert_eq!(visibilities(&graph, &file), all_are(&file, Visibility::File));
+}
+
+/// A class exported after its declaration - under another name, or as the
+/// default - makes its members `public` too.
+#[test]
+fn a_class_exported_after_the_fact_makes_its_members_public() {
+    let graph = extract(
+        "src/a.ts",
+        "class B { m() {} }\nexport { B as C };\nclass D { m() {} }\nexport default D;\nclass E { m() {} }\n",
+    );
+    let names = ["B#m", "D#m", "E#m"];
+    assert_eq!(
+        visibilities(&graph, &names),
+        vec![
+            ("B#m".to_string(), Visibility::Public),
+            ("D#m".to_string(), Visibility::Public),
+            ("E#m".to_string(), Visibility::File),
+        ]
+    );
+}
+
+/// `private` and `#private` members stay `file` on an exported class.
+#[test]
+fn a_private_member_of_an_exported_class_stays_file() {
+    let graph = extract("src/a.ts", "export class A {\n  private p() {}\n  #h() {}\n  m() {}\n}\n");
+    assert_eq!(
+        visibilities(&graph, &["A#p", "A##h", "A#m"]),
+        vec![
+            ("A#p".to_string(), Visibility::File),
+            ("A##h".to_string(), Visibility::File),
+            ("A#m".to_string(), Visibility::Public),
+        ]
+    );
+}
+
+/// An interface's methods follow the interface, including a method of an
+/// object type written in one of its properties.
+#[test]
+fn an_interface_member_takes_its_interfaces_visibility() {
+    let graph = extract(
+        "src/a.ts",
+        "export interface I {\n  x(): void;\n  y: { z(): void };\n}\ninterface J { x(): void }\n",
+    );
+    assert_eq!(
+        visibilities(&graph, &["I#x", "I#z", "J#x"]),
+        vec![
+            ("I#x".to_string(), Visibility::Public),
+            ("I#z".to_string(), Visibility::Public),
+            ("J#x".to_string(), Visibility::File),
+        ]
+    );
+}
+
+/// The owner is the nearest declaring class, not the namespace around it.
+#[test]
+fn a_member_in_a_namespace_follows_its_own_class() {
+    let graph =
+        extract("src/a.ts", "export namespace N {\n  export class E { m() {} }\n  class F { m() {} }\n}\n");
+    assert_eq!(
+        visibilities(&graph, &["N.E#m", "N.F#m"]),
+        vec![("N.E#m".to_string(), Visibility::Public), ("N.F#m".to_string(), Visibility::File)]
+    );
+}
+
+/// A public member is not exported from the file: `EXPORTS` still runs only
+/// to the file's own top-level and namespace exports.
+#[test]
+fn a_public_member_gets_no_exports_edge() {
+    let graph = extract(
+        "src/a.ts",
+        "export class A { m() {} }\nexport interface I { x(): void }\nexport namespace N { export class E { m() {} } }\n",
+    );
+    let mut exported: Vec<String> = graph
+        .graph
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::Exports)
+        .map(|edge| {
+            graph.graph.nodes.iter().find(|node| node.id == edge.to_id).unwrap().qualified_name.clone()
+        })
+        .collect();
+    exported.sort();
+    assert_eq!(exported, ["A", "I", "N", "N.E"]);
+    assert_eq!(graph.node("A#m").visibility, Visibility::Public);
+}

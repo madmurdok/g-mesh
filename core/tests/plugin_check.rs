@@ -560,9 +560,9 @@ fn the_typescript_plugin_passes_on_a_small_typescript_fixture() {
     let run = run_check(&ts_plugin_dir(), &ts_conformance_project(), &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        // The shipped manifest declares `semantic_pass = false`, so the lazy
-        // check is the one that does not apply.
-        let expected = if id == "capabilities.semantic-engine-lazy" { "SKIP" } else { "PASS" };
+        // The shipped manifest declares `semantic_pass = true`, so the
+        // undeclared-pass check is the one that does not apply.
+        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     // GM-275: the TS plugin speaks wire v2 now, so there is nothing left for
@@ -1187,14 +1187,21 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
         run.stdout
     );
 
-    // The other `tier = "semantic"` entries, each missing exactly the row
-    // only tsserver binds: a default import under another local name
+    // The other `tier = "semantic"` entries, each missing exactly the rows
+    // only tsserver binds: a receiver call on an interface-typed parameter
+    // (`Greetable#greet`), a default import under another local name
     // (`MenuGroup`), the branch an ambiguous `export *` barrel picks
-    // (`mutate` in src/amb/a.ts), and a non-call namespace member read
+    // (`mutate` in src/amb/a.ts), an inherited method reached through `this`
+    // and `super` (`Base#hello`), and a non-call namespace member read
     // (`target`).
     for (id, missing) in [
+        ("expectations.callers[3]", "src/shapes.ts:viaGreetable"),
         ("expectations.callers[8]", "src/defaults/use.ts:renderGroup"),
         ("expectations.callers[9]", "src/amb/use.ts:useMutate"),
+        (
+            "expectations.callers[13]",
+            "src/inherit/derived.ts:Child#viaThis, src/inherit/derived.ts:Other#viaSuper",
+        ),
         ("expectations.references[2]", "src/nsref/use.ts:keep"),
     ] {
         assert_eq!(run.outcome(id), "FAIL", "{id}:\n{}", run.stdout);
@@ -1220,14 +1227,6 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
         // GM-371: a name the index does not carry is refused whether or not
         // tsserver ran, so this one is structural too.
         "expectations.refusal[0]",
-        // GM-385: `[[callers]] Greetable#greet` - the receiver call
-        // `viaGreetable` makes on `g: Greetable`. This plugin declares
-        // `receiver_calls = "unresolved"` for BOTH tiers, so the page is
-        // empty here and empty in the shipped-manifest run above, and its
-        // presence in this list is the assertion: an entry that moved
-        // between the two arms would mean tsserver had started answering
-        // receiver calls.
-        "expectations.callers[3]",
         // Structural behaviours the TypeScript plugin must keep: workspace,
         // `dist/` fallback and `extends`-inherited `paths` resolution
         // (`pointOf`, the two `packages/` imports/importers entries), `.js`
@@ -1252,9 +1251,9 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
         "expectations.definition[4]",
         "expectations.definition[5]",
         "expectations.definition[6]",
-        // `mutate` in src/amb/b.ts is tagged `semantic` with its pair but is
-        // empty in both arms: the structural pass binds the ambiguous import
-        // to neither branch.
+        // `mutate` in src/amb/b.ts is empty in both arms: the semantic tier
+        // binds the ambiguous import to src/amb/a.ts, the structural pass to
+        // neither branch.
         "expectations.callers[10]",
     ] {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);

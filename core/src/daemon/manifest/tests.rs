@@ -934,11 +934,12 @@ fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
     // This task's acceptance criterion for the bundled manifest: it
     // carries the capabilities, not just the fields this test already
     // checked before this task.
-    // Structural tier only until the language-server tier lands.
-    assert!(!manifest.capabilities.semantic_pass);
+    // A semantic tier (vtsls) that resolves receiver calls, over a
+    // structural tier that does not.
+    assert!(manifest.capabilities.semantic_pass);
     assert!(!manifest.capabilities.semantic_sweep);
     assert!(manifest.capabilities.files_created);
-    assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Unresolved);
+    assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Resolved);
     assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
     assert_eq!(manifest.workspace.entry_points, vec!["index".to_string()]);
 }

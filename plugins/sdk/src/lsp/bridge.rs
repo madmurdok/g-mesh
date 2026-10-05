@@ -3504,4 +3504,330 @@ mod tests {
         assert_eq!(pass(&[]), sent(&["add", "len"]), "pass 3: no answer, the full list goes back");
         assert_eq!(pass(&[]), Vec::new(), "pass 4: nothing trimmed now or before, nothing re-sent");
     }
+
+    // --- which open sites a pass asks about ---------------------------------
+
+    fn line_range(line: u32) -> Range {
+        Range { start: Position { line, col: 0 }, end: Position { line, col: 9 } }
+    }
+
+    /// What `m.toy`, the file a hop's placeholder names, declares under the
+    /// name `n`.
+    #[derive(Clone, Copy, Debug)]
+    enum Declares {
+        Nothing,
+        Function,
+        Placeholder,
+    }
+
+    fn declaring_file(index: &mut SdkIndex, declares: Declares) {
+        let m = RelPath::new("m.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &m);
+        builder.file_node(line_range(0));
+        match declares {
+            Declares::Nothing => {}
+            Declares::Function => {
+                builder.add_node(
+                    NodeSpec::new(NodeKind::Function, "n", "n", line_range(0))
+                        .native_kind("function")
+                        .public(),
+                );
+            }
+            Declares::Placeholder => {
+                builder.add_placeholder(
+                    PlaceholderKind::PendingSymbol,
+                    "n",
+                    file_name("o.toy", "n"),
+                    line_range(0),
+                );
+            }
+        }
+        index.insert(m, "fn n\n".to_string(), builder.finish());
+    }
+
+    /// `o.toy`, declaring an overload set named `n`: a node with
+    /// `declarations`, which is what makes an `OverloadCall` onto `n` worth
+    /// asking.
+    fn overload_file(index: &mut SdkIndex) {
+        let o = RelPath::new("o.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &o);
+        builder.file_node(line_range(0));
+        let declaration = |ordinal| WireDeclaration {
+            ordinal,
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 9,
+            signature: None,
+            has_body: false,
+        };
+        builder.add_node(
+            NodeSpec::new(NodeKind::Function, "n", "n", line_range(0))
+                .native_kind("function")
+                .public()
+                .declarations(vec![declaration(0), declaration(1)]),
+        );
+        index.insert(o, "fn n\n".to_string(), builder.finish());
+    }
+
+    fn file_name(file: &str, name: &str) -> PlaceholderTarget {
+        PlaceholderTarget {
+            scope: TargetScope::File(file.to_string()),
+            key: TargetKey::Name(name.to_string()),
+            from_container: None,
+            key_path: None,
+        }
+    }
+
+    /// What an open site of `u.toy` names in `replaces`.
+    #[derive(Clone, Copy, Debug)]
+    enum Replaces {
+        TheEdge,
+        AMissingEdge,
+        Nothing,
+    }
+
+    /// `u.toy`: `f` with a `CALLS` edge onto a `kind` placeholder addressed by
+    /// `target`, and one open site per `(kind, replaces, line)`, all at
+    /// column 2 of `line`.
+    fn using_file(
+        index: &mut SdkIndex,
+        kind: PlaceholderKind,
+        target: PlaceholderTarget,
+        sites: &[(OpenSiteKind, Replaces, u32)],
+    ) {
+        let u = RelPath::new("u.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &u);
+        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 4, col: 0 } });
+        let f = builder.add_node(
+            NodeSpec::new(NodeKind::Function, "f", "f", line_range(0)).native_kind("function").public(),
+        );
+        let placeholder = builder.add_placeholder(kind, "n", target, line_range(1));
+        let edge = builder.placeholder_edge(EdgeKind::Calls, &f, &placeholder);
+        for (site_kind, replaces, line) in sites {
+            builder.open_site(OpenSite {
+                from_id: f.clone(),
+                position: Position { line: *line, col: 2 },
+                name: "n".to_string(),
+                kind: *site_kind,
+                edge_kind: EdgeKind::Calls,
+                from_container: None,
+                replaces: match replaces {
+                    Replaces::TheEdge => Some(edge.clone()),
+                    Replaces::AMissingEdge => Some("e-missing".to_string()),
+                    Replaces::Nothing => None,
+                },
+            });
+        }
+        index.insert(u, "fn f\n  n()\n  n()\n  n()\n".to_string(), builder.finish());
+    }
+
+    /// What one pass over `u.toy` asks: each question's kind (`OverloadCall`
+    /// for an overload question) and line, sorted, and the unanswerable count.
+    fn asked_about_u(index: &SdkIndex) -> (Vec<(OpenSiteKind, u32)>, usize) {
+        let questions = questions(
+            index,
+            &[RelPath::new("u.toy")],
+            &SemanticConfig::new("toy-server"),
+            &Budgets::default(),
+        );
+        let mut asked: Vec<(OpenSiteKind, u32)> = questions
+            .asking
+            .iter()
+            .map(|question| match &question.ask {
+                Ask::Definition(site) => (site.kind, site.position.line),
+                Ask::Overload(site) => (OpenSiteKind::OverloadCall, site.position.line),
+                other => panic!("only open sites are asked here: {other:?}"),
+            })
+            .collect();
+        asked.sort_by_key(|(kind, line)| (format!("{kind:?}"), *line));
+        (asked, questions.unanswerable)
+    }
+
+    /// A hop - a `Reference` site whose `replaces` names an edge onto a
+    /// `pending_symbol` placeholder addressed by file and bare name - is asked
+    /// only while that file is indexed and declares nothing addressable of
+    /// that name. Every other hop is left to its structural edge, and none of
+    /// them counts as unanswerable.
+    #[test]
+    fn a_hop_is_asked_only_while_the_linker_cannot_settle_its_placeholder() {
+        use PlaceholderKind::{PendingSymbol, Reexport};
+        let qualified = PlaceholderTarget {
+            scope: TargetScope::File("m.toy".to_string()),
+            key: TargetKey::QualifiedName("n".to_string()),
+            from_container: None,
+            key_path: None,
+        };
+        let container = PlaceholderTarget {
+            scope: TargetScope::Container("m".to_string()),
+            key: TargetKey::Name("n".to_string()),
+            from_container: None,
+            key_path: None,
+        };
+        let cases = [
+            (
+                "m.toy declares no n",
+                Declares::Nothing,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                1,
+            ),
+            (
+                "m.toy's n is only a placeholder",
+                Declares::Placeholder,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                1,
+            ),
+            (
+                "m.toy declares n",
+                Declares::Function,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                0,
+            ),
+            (
+                "the file is not indexed",
+                Declares::Nothing,
+                PendingSymbol,
+                file_name("gone.toy", "n"),
+                Replaces::TheEdge,
+                0,
+            ),
+            ("a container scope", Declares::Nothing, PendingSymbol, container, Replaces::TheEdge, 0),
+            ("a qualified-name key", Declares::Nothing, PendingSymbol, qualified, Replaces::TheEdge, 0),
+            (
+                "a reexport placeholder",
+                Declares::Nothing,
+                Reexport,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                0,
+            ),
+            (
+                "the edge is missing",
+                Declares::Nothing,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::AMissingEdge,
+                0,
+            ),
+        ];
+        for (case, declares, kind, target, replaces, expected) in cases {
+            let mut index = SdkIndex::new();
+            declaring_file(&mut index, declares);
+            using_file(&mut index, kind, target, &[(OpenSiteKind::Reference, replaces, 1)]);
+            let (asked, unanswerable) = asked_about_u(&index);
+            let want: Vec<(OpenSiteKind, u32)> =
+                (0..expected).map(|_| (OpenSiteKind::Reference, 1)).collect();
+            assert_eq!(asked, want, "{case}");
+            assert_eq!(unanswerable, 0, "a hop not asked is not unanswerable: {case}");
+        }
+    }
+
+    /// A `Reference` site with no `replaces` and a `ReceiverCall` are asked
+    /// whatever the placeholder looks like: the hop rule is about `replaces`.
+    #[test]
+    fn a_reference_without_replaces_and_a_receiver_call_are_asked_as_before() {
+        let mut index = SdkIndex::new();
+        declaring_file(&mut index, Declares::Function);
+        using_file(
+            &mut index,
+            PlaceholderKind::PendingSymbol,
+            file_name("m.toy", "n"),
+            &[
+                (OpenSiteKind::Reference, Replaces::Nothing, 1),
+                (OpenSiteKind::ReceiverCall, Replaces::Nothing, 2),
+                (OpenSiteKind::ReceiverCall, Replaces::TheEdge, 3),
+            ],
+        );
+        let (asked, unanswerable) = asked_about_u(&index);
+        assert_eq!(
+            asked,
+            vec![
+                (OpenSiteKind::ReceiverCall, 2),
+                (OpenSiteKind::ReceiverCall, 3),
+                (OpenSiteKind::Reference, 1)
+            ]
+        );
+        assert_eq!(unanswerable, 0);
+    }
+
+    /// A hop at the same call (enclosing node and position) as an overload
+    /// question that was kept is dropped, whichever of the two sites was
+    /// recorded first; a hop elsewhere stays.
+    #[test]
+    fn a_hop_at_a_kept_overload_call_is_dropped_in_either_order() {
+        let hop = (OpenSiteKind::Reference, Replaces::TheEdge, 1);
+        let overload = (OpenSiteKind::OverloadCall, Replaces::TheEdge, 1);
+        let elsewhere = (OpenSiteKind::OverloadCall, Replaces::TheEdge, 2);
+        for sites in [[hop, overload, elsewhere], [overload, hop, elsewhere], [elsewhere, overload, hop]] {
+            let mut index = SdkIndex::new();
+            declaring_file(&mut index, Declares::Nothing);
+            overload_file(&mut index);
+            using_file(&mut index, PlaceholderKind::PendingSymbol, file_name("m.toy", "n"), &sites);
+            let (asked, unanswerable) = asked_about_u(&index);
+            assert_eq!(
+                asked,
+                vec![(OpenSiteKind::OverloadCall, 1), (OpenSiteKind::OverloadCall, 2)],
+                "{sites:?}"
+            );
+            assert_eq!(unanswerable, 0);
+        }
+
+        let mut index = SdkIndex::new();
+        declaring_file(&mut index, Declares::Nothing);
+        overload_file(&mut index);
+        using_file(
+            &mut index,
+            PlaceholderKind::PendingSymbol,
+            file_name("m.toy", "n"),
+            &[(OpenSiteKind::OverloadCall, Replaces::TheEdge, 2), hop],
+        );
+        let (asked, _) = asked_about_u(&index);
+        assert_eq!(
+            asked,
+            vec![(OpenSiteKind::OverloadCall, 2), (OpenSiteKind::Reference, 1)],
+            "a hop at another call"
+        );
+    }
+
+    /// When no overload set answers to the call's name, its `OverloadCall`
+    /// site is filtered out and the hop at the same call is asked instead.
+    #[test]
+    fn a_hop_at_a_filtered_overload_call_is_asked() {
+        for sites in [
+            [
+                (OpenSiteKind::Reference, Replaces::TheEdge, 1),
+                (OpenSiteKind::OverloadCall, Replaces::TheEdge, 1),
+            ],
+            [
+                (OpenSiteKind::OverloadCall, Replaces::TheEdge, 1),
+                (OpenSiteKind::Reference, Replaces::TheEdge, 1),
+            ],
+        ] {
+            let mut index = SdkIndex::new();
+            declaring_file(&mut index, Declares::Nothing);
+            using_file(&mut index, PlaceholderKind::PendingSymbol, file_name("m.toy", "n"), &sites);
+            let (asked, unanswerable) = asked_about_u(&index);
+            assert_eq!(asked, vec![(OpenSiteKind::Reference, 1)], "{sites:?}");
+            assert_eq!(unanswerable, 0);
+        }
+    }
+
+    /// `didOpen`'s `languageId` is the first pair whose extension the path
+    /// ends with, else the bridge's language.
+    #[test]
+    fn a_document_opens_under_the_first_matching_language_id() {
+        let ids = [(".tsx", "typescriptreact"), (".x.tsx", "never-reached"), (".js", "javascript")];
+        let id = |path: &str| language_id(&RelPath::new(path), "typescript", &ids);
+        assert_eq!(id("src/a.tsx"), "typescriptreact");
+        assert_eq!(id("src/a.x.tsx"), "typescriptreact", "the first pair wins");
+        assert_eq!(id("src/a.js"), "javascript");
+        assert_eq!(id("src/a.ts"), "typescript");
+        assert_eq!(language_id(&RelPath::new("src/a.tsx"), "typescript", &[]), "typescript");
+    }
 }

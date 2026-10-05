@@ -410,3 +410,45 @@ fn lookup_by_name_with_a_kind_skips_other_kinds() {
     assert_eq!(model.lookup_by_name("f", "NS", Some(NodeKind::Variable)), Some(root_f));
     assert_eq!(model.lookup_by_name("f", "NS", Some(NodeKind::Type)), None);
 }
+
+// --- heritage names ----------------------------------------------------------
+
+/// The clause holding a declaration's supertypes, found the way the
+/// declaration pass finds it.
+fn heritage_clause<'t>(
+    tree: &'t tree_sitter::Tree,
+    declaration: &str,
+    clause: &str,
+) -> tree_sitter::Node<'t> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let node = root
+        .named_children(&mut cursor)
+        .find(|node| node.kind() == declaration)
+        .unwrap_or_else(|| panic!("no {declaration} in {}", root.to_sexp()));
+    let mut cursor = node.walk();
+    let found = node.children(&mut cursor).find(|child| child.kind() == clause);
+    found.unwrap_or_else(|| panic!("no {clause} in {}", node.to_sexp()))
+}
+
+/// The token of each supertype name is the name alone: a generic's type
+/// arguments dropped, a qualified name kept whole, in written order, and the
+/// tokens' texts are exactly `heritage_names`.
+#[test]
+fn heritage_name_tokens_are_the_names_heritage_names_reads_in_order() {
+    use g_mesh_plugin_typescript::extractor::grammar::parse;
+    use g_mesh_plugin_typescript::extractor::syntax::{heritage_name_tokens, heritage_names, text};
+
+    let source = "class A extends B<T> implements I, NS.J<U> {}\ninterface K extends L, M.N<T> {}\n";
+    let tree = parse(Grammar::TypeScript, source).expect("the source parses");
+    for (declaration, clause, expected) in [
+        ("class_declaration", "class_heritage", vec!["B", "I", "NS.J"]),
+        ("interface_declaration", "extends_type_clause", vec!["L", "M.N"]),
+    ] {
+        let clause = heritage_clause(&tree, declaration, clause);
+        let tokens: Vec<&str> =
+            heritage_name_tokens(clause).into_iter().map(|token| text(token, source)).collect();
+        assert_eq!(tokens, expected, "{declaration}");
+        assert_eq!(heritage_names(clause, source), expected, "{declaration}");
+    }
+}
