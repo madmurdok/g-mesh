@@ -635,11 +635,10 @@ below) to force a fresh full walk.
 The daemon is two processes with very different costs, and each has its own
 idle timeout:
 
-- The **JS/TS plugin** (the expensive one — tree-sitter parsing in a Node
-  process; `typescript` is a runtime dependency, since `tsserver` ships inside
-  that package, but it is never loaded in this process — the checker runs as a
-  child, spawned only by the first semantic question actually asked and killed
-  with the plugin) exits after an hour with no reparse work.
+- The **JS/TS plugin** (the expensive one — tree-sitter parsing in the
+  plugin's Rust binary; its semantic tier's language server, vtsls, is a Node
+  program that runs as a child, spawned on demand and killed with the plugin)
+  exits after an hour with no reparse work.
   While it is asleep the core keeps watching the project and remembers which
   files changed; the next query wakes it and replays exactly that list, not
   the whole project. `g-mesh status` reports it as `asleep`, which needs no
