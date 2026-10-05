@@ -128,12 +128,16 @@ pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec
 /// A relative entry (`./`, `../`) resolves against the config's directory.
 /// A package-named one (`@tsconfig/node18/tsconfig.json`) resolves under
 /// `node_modules` of the config's directory and each ancestor up to the
-/// root. Candidates outside the project, and absolute entries, are dropped.
+/// root. Candidates outside the project, and absolute entries (a POSIX root
+/// or a drive letter), are dropped. As in tsc, `\\` is a separator on every
+/// host.
 pub fn extends_candidates(config: &str, entry: &str) -> Vec<String> {
     let config_dir = paths::dirname(config);
+    let entry = paths::with_forward_slashes(entry);
+    let entry = entry.as_str();
     let bases: Vec<String> = if entry.starts_with("./") || entry.starts_with("../") {
         vec![paths::join(config_dir, entry)]
-    } else if entry.is_empty() || entry.starts_with('/') || entry.starts_with('.') {
+    } else if entry.is_empty() || paths::is_rooted(entry) || entry.starts_with('.') {
         Vec::new()
     } else {
         paths::ancestors(config_dir)
@@ -169,7 +173,7 @@ pub fn own_resolve_dir(config: &str, base_url: Option<&str>, root: &Path) -> Opt
     let Some(base_url) = base_url else {
         return Some(config_dir.to_string());
     };
-    let base_url = base_url.replace('\\', "/");
+    let base_url = paths::with_forward_slashes(base_url);
     let joined = if paths::is_rooted(&base_url) {
         let relative = with_roots_drive(Path::new(&base_url), root).strip_prefix(root).ok()?.to_path_buf();
         paths::normalize(&relative.to_string_lossy().replace('\\', "/"))

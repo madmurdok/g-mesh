@@ -55,12 +55,14 @@ pub fn escapes(normalized: &str) -> bool {
 /// when that leaves the project, names the directory's root itself, or
 /// `target` is absolute (a POSIX root or a drive letter). Used for every
 /// target a manifest or config declares: a package's entries, an `imports`
-/// key's targets, a tsconfig `paths` target.
+/// key's targets, a tsconfig `paths` target. As in tsc, `\\` in `target`
+/// is a separator on every host.
 pub fn inside(dir: &str, target: &str) -> Option<String> {
-    if target.is_empty() || is_rooted(target) {
+    let target = with_forward_slashes(target);
+    if target.is_empty() || is_rooted(&target) {
         return None;
     }
-    let joined = normalize(&join(dir, target));
+    let joined = normalize(&join(dir, &target));
     (!escapes(&joined)).then_some(joined)
 }
 
@@ -72,6 +74,12 @@ pub fn ancestors(dir: &str) -> impl Iterator<Item = &str> {
         next = if current.is_empty() { None } else { Some(dirname(current)) };
         Some(current)
     })
+}
+
+/// `path` with every `\\` turned into `/`: tsc's `normalizeSlashes`, which
+/// it applies to every path a config declares, on every host.
+pub fn with_forward_slashes(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 /// Whether `target` is absolute on some host: a POSIX root or a drive
