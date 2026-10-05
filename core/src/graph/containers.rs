@@ -216,8 +216,8 @@ type Key = (String, String);
 
 /// The id of the container node for `key` in `language`.
 ///
-/// Same family as every plugin-computed id (`hash` in
-/// plugins/typescript/src/extract.ts): sha256 over a type-marked string,
+/// Same family as every plugin-computed id (`node_id` in
+/// plugins/sdk/src/ids.rs): sha256 over a type-marked string,
 /// lowercase hex, truncated to 32 characters. The preimage is
 /// `"container " + language + "\0" + key`:
 ///

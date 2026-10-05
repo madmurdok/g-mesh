@@ -6,8 +6,8 @@
 //!
 //! A language plugin emits one placeholder `Module` node per import specifier
 //! and hangs the `IMPORTS` edge on it, because a specifier is text, not a
-//! node id it can safely point at (see `recordImport` in
-//! plugins/typescript/src/extract.ts). When the plugin recognises the specifier as
+//! node id it can safely point at (see `record_import` in
+//! plugins/typescript/src/extractor/imports.rs). When the plugin recognises the specifier as
 //! naming something in this project it says so, by setting the placeholder's
 //! `nativeKind` to [`RESOLVED_MODULE_NATIVE_KIND`] and its `target` to a
 //! structured address (`storage::write::PlaceholderTargetRecord`, the

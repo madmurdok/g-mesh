@@ -1,7 +1,7 @@
 package main
 
 // LSP-style Content-Length framing, wire-compatible with core's
-// core/src/protocol/jsonrpc.rs and plugins/typescript/src/jsonrpc.ts - see
+// core/src/protocol/jsonrpc.rs and plugins/sdk/src/framing.rs - see
 // both for the exact contract this mirrors. Header lines are newline
 // terminated (a trailing '\r' is tolerated), a blank line ends the header
 // block, and the body is exactly the announced number of bytes, with no

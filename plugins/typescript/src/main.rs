@@ -1,5 +1,5 @@
 //! `g-mesh-plugin-typescript`: the entry point the SDK's [`run`] loop drives.
-//! Everything else lives in the library half of this crate (`rust/lib.rs`).
+//! Everything else lives in the library half of this crate (`src/lib.rs`).
 
 use g_mesh_plugin_sdk::{run, PluginSpec};
 

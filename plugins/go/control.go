@@ -2,8 +2,8 @@ package main
 
 // The control-plane loop's message handling: fileChanged, semanticPass,
 // workspaceChanged, reindex, status, and anything else core (or the
-// conformance kit) might send. Mirrors plugins/typescript/src/index.ts's
-// handleEnvelope/handleFileChanged/handleSemanticPass - see that file for
+// conformance kit) might send. Mirrors the control loop in plugins/sdk/src/run.rs
+// (`handle`, `file_changed`, `respond_to_pass`) - see that file for
 // the reference behavior this is kept honest against by
 // core/src/cli/plugin_check, the same way the TS plugin is.
 
@@ -37,7 +37,7 @@ type cachedFile struct {
 //
 // A fresh process - every control-plane session, and every one-shot
 // --bulk-index run - starts with none of this, the same "cold" starting
-// point plugins/typescript/src/incremental.ts's own cache has. That is why
+// point plugins/sdk/src/diff.rs's own baseline has. That is why
 // `fileChanged` on a file this process has never reparsed always answers
 // with a full upsert, even when nothing has actually changed since an
 // earlier bulk walk: that walk was a *different* process, with its own
@@ -341,7 +341,7 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 	default:
 		// Never crash, never guess at a response shape for a method this
 		// plugin does not recognize - mirrors
-		// plugins/typescript/src/index.ts's handleFrame, which drops an
+		// plugins/sdk/src/run.rs's `handle`, which drops an
 		// envelope parseControlEnvelope could not recognize the same way
 		// (logged, no response, even if an id was present).
 		logf("unknown method: %q", env.Method)

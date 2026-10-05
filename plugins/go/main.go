@@ -27,7 +27,7 @@ import (
 // bulkIndexFlag selects one-shot bulk-index mode instead of the
 // control-plane loop; must stay in sync with core's
 // daemon::bulk_index::BULK_INDEX_FLAG (core/src/daemon/bulk_index.rs) and
-// plugins/typescript/src/index.ts's own copy of the same constant.
+// plugins/sdk/src/run.rs's own copy of the same constant.
 const bulkIndexFlag = "--bulk-index"
 
 // bulkStdinLifelineEnv is set to "1" by core on every bulk spawn: stdin is
@@ -127,8 +127,8 @@ func sendHandshake(out io.Writer) {
 // framed JSON-RPC request or notification at a time until stdin reaches
 // EOF - core's own signal to exit (daemon::plugin::PluginProcess::shutdown
 // closes the plugin's stdin rather than sending a message), mirrored here
-// exactly the way plugins/typescript/src/index.ts's
-// `process.stdin.on("end", ...)` does. A framing error desynchronizes the
+// exactly the way plugins/sdk/src/run.rs's
+// control-plane loop does when stdin closes. A framing error desynchronizes the
 // stream (jsonrpc.go's readFrame's own doc comment) and ends the loop; a
 // malformed envelope or an unrecognized method does not - see
 // handleEnvelope.

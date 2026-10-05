@@ -337,8 +337,8 @@ impl std::error::Error for PathError {}
 
 /// One declaration of a symbol written as several - an overload signature
 /// beside its implementation, an interface or a namespace merged across
-/// statements. Mirrors the plugin's `SymbolDeclaration`
-/// (plugins/typescript/src/extract.ts) exactly, flat line/col fields and all,
+/// statements. Mirrors the plugin's declaration shape
+/// (see `plugins/sdk/src/graph.rs`) exactly, flat line/col fields and all,
 /// rather than nesting a [`Range`] the way [`WireNode`] does: this shape
 /// crosses the wire as the plugin already builds it in process, and a
 /// transformation on the way out would be one more thing for the two sides to
@@ -393,7 +393,7 @@ pub struct WireNode {
     /// `skip_serializing_if` is load-bearing rather than tidiness: the design
     /// promises an ordinary single-declaration node stays byte-identical on
     /// the wire, and the plugin holds up its half by omitting the key
-    /// entirely (`toWireNode` in plugins/typescript/src/bulkIndex.ts). An empty
+    /// entirely (`plugins/sdk/src/run.rs`'s `write_graph`). An empty
     /// list would be a different, and equally wrong, way to say "one
     /// declaration" - hence `Option`, not `Vec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -511,8 +511,8 @@ pub struct WireEdge {
     /// and omitted rather than sent as `null` for exactly the reason
     /// [`WireNode::declarations`] is.
     ///
-    /// It is part of the edge's identity (`edgeIdFor` in
-    /// plugins/typescript/src/extract.ts), which is what lets one caller that calls
+    /// It is part of the edge's identity (`edge_id` in
+    /// plugins/sdk/src/ids.rs), which is what lets one caller that calls
     /// two overloads of the same function record both bindings instead of one
     /// overwriting the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -851,7 +851,7 @@ mod tests {
         assert_eq!(node, round_tripped);
     }
 
-    /// Exactly what `toWireNode` (plugins/typescript/src/bulkIndex.ts) emits
+    /// Exactly what the plugin's bulk-index stream emits
     /// for an overloaded `parse` - copied from that plugin's own output
     /// rather than hand-written, so this asserts against the real wire bytes
     /// and not against what serde would have produced from the Rust struct.

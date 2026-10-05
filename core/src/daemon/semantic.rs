@@ -4,8 +4,8 @@
 //!
 //! # Why this module exists
 //!
-//! The pass itself lives in each language's own plugin (for JS/TS,
-//! `plugins/typescript/src/semanticPass.ts`) and reaches core through
+//! The pass itself lives in each language's own plugin (for Go,
+//! `plugins/go/semantic.go`) and reaches core through
 //! `watcher::apply::apply_semantic_pass`. What lives here is only *when* it
 //! is asked for over a whole project - which used to be one call site inside
 //! `daemon::run`'s cold-start branch, and that turned out to be a bug rather
