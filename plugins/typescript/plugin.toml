@@ -4,11 +4,11 @@
 # parser/validation rules it must satisfy. `language` must equal this
 # directory's own name ("typescript"), the rule every bundled plugin follows.
 #
-# The plugin is the Rust binary built from this directory's crate (sources in
-# `rust/`) on the SDK in plugins/sdk. It is a member of the cargo workspace, so
+# The plugin is the Rust binary built from this directory's crate on the SDK in
+# plugins/sdk. It is a member of the cargo workspace, so
 # `cargo build` builds it beside g-mesh itself; `${G_MESH_BIN_DIR}` expands to
 # the directory of the running g-mesh executable, as for plugins/python and
-# plugins/rust. The npm package beside it is no longer what core spawns.
+# plugins/rust.
 #
 # Structural tier only, for now: `semantic_pass = false` below. Semantics come
 # with the language-server tier on the SDK's LSP bridge, which adds

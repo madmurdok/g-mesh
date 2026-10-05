@@ -697,7 +697,7 @@ fn exe_suffixed_is_none_for_an_empty_suffix() {
 
 #[test]
 fn exe_suffixed_is_none_for_a_path_that_already_has_an_extension() {
-    assert_eq!(exe_suffixed(Path::new("/plugins/typescript/dist/src/index.js"), ".exe"), None);
+    assert_eq!(exe_suffixed(Path::new("/plugins/example/index.js"), ".exe"), None);
 }
 
 /// The fix under test: a cargo-workspace plugin's binary, present only

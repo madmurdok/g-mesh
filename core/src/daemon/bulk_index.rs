@@ -31,7 +31,7 @@ use crate::watcher::apply::{to_edge_record, to_node_record, PathWarnings};
 use crate::watcher::staleness;
 
 /// Puts the plugin in one-shot bulk-index mode; must stay in sync with
-/// `BULK_INDEX_FLAG` in plugins/typescript/src/index.ts.
+/// `BULK_INDEX_FLAG` in plugins/sdk/src/run.rs.
 pub(crate) const BULK_INDEX_FLAG: &str = "--bulk-index";
 
 /// Set to `1` on every bulk spawn, telling the plugin its stdin is a lifeline:
@@ -39,8 +39,7 @@ pub(crate) const BULK_INDEX_FLAG: &str = "--bulk-index";
 /// the walk should stop. Opt-in by the spawner, so a plugin run by an older
 /// core or by hand with `< /dev/null` does not read an immediate EOF as "exit
 /// before walking". Must stay in sync with the plugins' own copies
-/// (`plugins/sdk/src/run.rs`, `plugins/go/main.go`,
-/// `plugins/typescript/src/index.ts`) - see
+/// (`plugins/sdk/src/run.rs`, `plugins/go/main.go`) - see
 /// `docs/architecture/plugin-lifetime.md` §2.
 pub(crate) const BULK_STDIN_LIFELINE_ENV: &str = "G_MESH_BULK_STDIN_LIFELINE";
 

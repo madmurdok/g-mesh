@@ -5,15 +5,13 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "g-mesh's TypeScript/JavaScript language plugin: tree-sitter structural extraction on the plugin SDK"
 
-# Sources live in `rust/` while `src/` still holds the npm package this crate
-# replaces; they move to `src/` once that package is gone.
 [lib]
 name = "g_mesh_plugin_typescript"
-path = "rust/lib.rs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "g-mesh-plugin-typescript"
-path = "rust/main.rs"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

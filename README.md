@@ -21,12 +21,13 @@ output lands in `target/`.
 - `wire/` — the core ⇆ plugin wire protocol types, and nothing else. Its own
   crate so core and a Rust plugin share one declaration without a plugin
   linking core; core re-exports it as `protocol::types`.
-- `plugins/typescript/` — Node/TypeScript language plugin: tree-sitter parsing,
-  bulk indexing, incremental reparse. Spawned by the daemon as a child
-  process, one instance per project.
+- `plugins/typescript/` — TypeScript/JavaScript language plugin, built on
+  `plugins/sdk`: tree-sitter parsing, bulk indexing, incremental reparse. A
+  cargo workspace member, spawned by the daemon as a child process, one
+  instance per project.
 - `plugins/go/` — Go language plugin: tree-sitter parsing plus a `go/types`
   semantic tier. Its own Go module (`go.mod`), not a cargo workspace member,
-  built as a prebuilt binary the same way `plugins/typescript/` is.
+  built by `core/build.rs` into a prebuilt binary.
 - `plugins/sdk/` — everything a Rust language plugin needs that is not its
   language: protocol loop, walk, incremental diff, ids. See "Writing a
   language plugin".
@@ -38,7 +39,7 @@ output lands in `target/`.
   test` from the repository root cover it.
 
 The daemon and shim are one binary (`target/{debug,release}/g-mesh`);
-the plugin is a separate Node entry point the daemon launches with `node`.
+each plugin is a separate executable the daemon launches.
 
 ## Install
 
@@ -166,14 +167,11 @@ build-from-source path below is the only one that works.
 
 ## Prerequisites
 
-- Rust toolchain (`cargo`, stable) — build the core, the Rust plugin and the
-  Python plugin (both are cargo workspace members).
-- Node.js >= 20 and `node` on `PATH` — build the JS/TS plugin, and required
-  at *runtime* because the daemon spawns it via `node <entry.js>`.
+- Rust toolchain (`cargo`, stable) — build the core and the TypeScript, Rust
+  and Python plugins (all cargo workspace members).
 - Go toolchain (`go` on `PATH`) — `core/build.rs` builds the bundled Go
-  plugin automatically whenever core is built. It is best-effort like the
-  JS/TS build step next to it: a missing toolchain only prints a
-  `cargo:warning`, it does not fail `cargo build`. Without it, the checkout
+  plugin automatically whenever core is built. It is best-effort: a missing
+  toolchain only prints a `cargo:warning`, it does not fail `cargo build`. Without it, the checkout
   simply has no working Go plugin — `g-mesh plugins list` won't show `go`,
   and a dev-checkout daemon (which discovers every bundled plugin
   unconditionally) won't start until it is built some other way.
@@ -188,11 +186,8 @@ cargo build --release -p g-mesh
 # Go toolchain is on PATH (see Prerequisites) -> plugins/go/g-mesh-plugin-go
 
 # 2. JS/TS plugin
-cd plugins/typescript
-npm install
-npm run build
-cd ../..
-# -> plugins/typescript/dist/src/index.js
+cargo build -p g-mesh-plugin-typescript
+# -> target/debug/g-mesh-plugin-typescript
 
 # 3. Rust plugin
 cargo build -p g-mesh-plugin-rust
@@ -205,9 +200,9 @@ cargo build -p g-mesh-plugin-python
 
 Build order doesn't matter, but all four are required — a dev checkout's
 daemon discovers every bundled plugin unconditionally and refuses to start
-(hard failure) if it can't spawn one of them. The Rust and Python plugins are
-looked up next to the running `g-mesh` binary, so a `target/release/g-mesh`
-needs them built with `--release` too (`cargo build --workspace --release`).
+(hard failure) if it can't spawn one of them. The TypeScript, Rust and Python
+plugins are looked up next to the running `g-mesh` binary, so a
+`target/release/g-mesh` needs them built with `--release` too (`cargo build --workspace --release`).
 
 ### 5. Embedding model (optional — only `search_code` needs it)
 
@@ -1007,21 +1002,19 @@ directory that has a `conformance/{project,expect.toml}` pair — see
 
 ```bash
 scripts/test-deps.sh             # once per clone/worktree: the test dependencies CI installs
-cargo test                       # every crate: core, wire, plugins/sdk, plugins/rust, plugins/python
+cargo test                       # every crate: core, wire, plugins/sdk and the typescript, rust and python plugins
 cargo test -p g-mesh             # core alone
-cd plugins/typescript && npm run build && npm test
 scripts/check.sh                 # the formatting and lint gates, as CI runs them
 ```
 
 `scripts/test-deps.sh` installs what the suite drives for real and cargo
-cannot fetch: the JS/TS plugin's `npm ci` (for its own `npm test`),
-rust-analyzer (`plugins/rust`'s semantic tier) and pyright
+cannot fetch: rust-analyzer (`plugins/rust`'s semantic tier) and pyright
 (`plugins/python`'s: an `npm ci` into its gitignored `node_modules`, at the
 exact version its committed `package.json` and `package-lock.json` pin, the
 same step CI's "Install pyright" runs). Without
 it the suite does not skip: `plugins/python`'s tests fail naming the missing
 pyright and the command above. `scripts/test-deps.sh pyright` (or
-`typescript`, `rust-analyzer`) installs just one.
+`rust-analyzer`) installs just one.
 
 `scripts/check.sh` is the one place those two gates are spelled out:
 `.github/workflows/ci.yml` calls it rather than repeating the commands, so a

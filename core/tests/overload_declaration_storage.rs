@@ -20,7 +20,7 @@
 mod common;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use g_mesh::daemon::bulk_index;
@@ -200,13 +200,12 @@ fn a_freshly_built_index_reads_schema_version_13() {
 #[test]
 fn the_plugins_own_ndjson_mentions_declarations_only_for_the_overloaded_node() {
     let project = Project::new();
-    let entry = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript/dist/src/index.js");
-    let output = Command::new("node")
-        .arg(&entry)
+    let plugin = common::typescript_manifest().command;
+    let output = Command::new(&plugin)
         .arg("--bulk-index")
         .arg(project.root())
         .output()
-        .unwrap_or_else(|e| panic!("failed to run the plugin's bulk index at {}: {e}", entry.display()));
+        .unwrap_or_else(|e| panic!("failed to run the plugin's bulk index at {}: {e}", plugin.display()));
     assert!(output.status.success(), "the plugin's bulk index exited with {}", output.status);
 
     let stdout = String::from_utf8(output.stdout).expect("the plugin's stream must be UTF-8");

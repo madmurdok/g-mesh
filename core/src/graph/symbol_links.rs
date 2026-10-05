@@ -274,20 +274,20 @@ use crate::storage::qualified_path;
 use crate::storage::write::Diff;
 
 /// The `nativeKind` a plugin marks a pending cross-file symbol with. Mirrors
-/// `PENDING_SYMBOL_NATIVE_KIND` in plugins/typescript/src/extract.ts - the two are
-/// one wire contract and must be changed together.
+/// `PENDING_SYMBOL_NATIVE_KIND` in plugins/typescript/src/extractor/keys.rs - the
+/// two are one wire contract and must be changed together.
 pub const PENDING_SYMBOL_NATIVE_KIND: &str = "pending_symbol";
 
 /// The `nativeKind` a plugin marks a re-export with: "this scope publishes
 /// `name`, which really is its target". Mirrors `REEXPORT_NATIVE_KIND` in
-/// plugins/typescript/src/extract.ts - the two are one wire contract and must be
+/// plugins/typescript/src/extractor/keys.rs - the two are one wire contract and must be
 /// changed together.
 pub const REEXPORT_NATIVE_KIND: &str = "reexport";
 
 /// The name a whole-module re-export (`export * from "./y"`) is recorded
 /// under, as both its published name and its target key - it republishes
 /// every name the target exports rather than one nameable one. Mirrors
-/// `REEXPORT_ALL_NAME` in plugins/typescript/src/extract.ts.
+/// `REEXPORT_ALL_NAME` in plugins/typescript/src/extractor/keys.rs.
 pub const REEXPORT_ALL_NAME: &str = "*";
 
 /// The name a default export is imported under. A whole-module re-export is
