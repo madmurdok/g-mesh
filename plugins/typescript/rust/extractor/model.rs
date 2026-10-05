@@ -45,6 +45,41 @@ pub struct ConstantInitializer<'t> {
     pub scope: Scope,
 }
 
+/// How a call names its callee.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallReceiver {
+    /// `f()`.
+    None,
+    /// `this.m()`.
+    This,
+    /// `super.m()`, and `super()` as a call of `constructor`.
+    Super,
+    /// `Owner.m()` and `new Owner()` (a call of `constructor`): the receiver is
+    /// a bare identifier, which may name a type or namespace of this file.
+    Qualified(String),
+}
+
+/// A call written in the walk, resolved once every declaration of the file
+/// is known.
+#[derive(Debug, Clone)]
+pub struct PendingCall {
+    /// The callee's name: the function, the member, or `constructor`.
+    pub name: String,
+    pub receiver: CallReceiver,
+    pub scope: Scope,
+}
+
+/// A name used in the walk, resolved once every declaration of the file is
+/// known.
+#[derive(Debug, Clone)]
+pub struct PendingReference {
+    pub name: String,
+    pub scope: Scope,
+    /// Written where only a type can go, the one place a type parameter can
+    /// shadow the name.
+    pub type_position: bool,
+}
+
 /// What a declaration (or placeholder) asks the model to add.
 #[derive(Debug, Clone)]
 pub struct NodeParams {
@@ -304,6 +339,16 @@ impl FileModel {
             kind,
             resolved,
         });
+    }
+
+    /// Whether the edge `from_id -kind-> to_id` is already in the draft.
+    pub fn has_edge(&self, from_id: &str, kind: EdgeKind, to_id: &str) -> bool {
+        self.edge_ids.contains(&edge_id(from_id, kind, to_id, None))
+    }
+
+    /// The declared symbol whose `qualifiedName` is exactly `qualified_name`.
+    pub fn lookup_qualified(&self, qualified_name: &str) -> Option<usize> {
+        self.by_qualified_name.get(qualified_name).copied()
     }
 
     /// Makes node `index` public and adds its `EXPORTS` edge.

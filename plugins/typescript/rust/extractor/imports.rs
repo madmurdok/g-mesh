@@ -296,20 +296,6 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
 
     // --- computed specifiers ------------------------------------------------
 
-    /// Notes a `require(...)` or `import(...)` call for folding.
-    pub(super) fn record_call_import_site(&mut self, node: Node<'t>, scope: &Scope) {
-        let Some(callee) = node.child_by_field_name("function") else { return };
-        match callee.kind() {
-            "identifier" if self.text(callee) == "require" => {
-                self.record_call_import(node, scope, Some(callee));
-            }
-            "import" => {
-                self.record_call_import(node, scope, None);
-            }
-            _ => {}
-        }
-    }
-
     /// Defers the call's first argument for folding when its shape could
     /// fold. Returns whether the call was taken as an import at all; `false`
     /// leaves a `require(...)` an ordinary call of `require`.

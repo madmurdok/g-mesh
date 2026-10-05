@@ -20,16 +20,17 @@
 //!   the file, which also adds the `EXPORTS` edge.
 //!
 //! Imports, re-exports and computed specifiers are [`crate::extractor::imports`]';
-//! everything a body uses is another pass's.
+//! function bodies, calls and references are [`crate::extractor::bodies`]'.
 
 use g_mesh_plugin_sdk::wire::{NodeKind, Range};
 use g_mesh_plugin_sdk::{CharColumns, RelPath};
 use tree_sitter::Node;
 
+use crate::extractor::bodies::UseState;
 use crate::extractor::imports::{is_whole_module_reexport, ImportState, SpecifierResolver};
 use crate::extractor::keys::{qualified_in, MemberSeparator, Qualified, REEXPORT_ALL_NAME};
 use crate::extractor::model::{FileModel, NodeParams};
-use crate::extractor::scope::{type_parameter_scope, Scope};
+use crate::extractor::scope::{block_scope, type_parameter_scope, Scope};
 use crate::extractor::syntax::{
     child_of_kind, children, doc_comment_for, function_signature, has_body, has_child_of_kind,
     heritage_names, method_native_kind, named_children, string_literal_value, text,
@@ -55,6 +56,7 @@ pub struct Declarer<'a, 's, 't> {
     /// settled against the file's declarations once the walk is over.
     pending_exports: Vec<String>,
     pub(super) imports: ImportState<'t>,
+    pub(super) uses: UseState,
 }
 
 impl<'a, 's, 't> Declarer<'a, 's, 't> {
@@ -75,27 +77,30 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
             resolver,
             pending_exports: Vec::new(),
             imports: ImportState::default(),
+            uses: UseState::default(),
         }
     }
 
     /// Declares everything in the tree under `root`, then imports the
     /// specifiers `require(...)`/`import(...)` fold to, marks the names
-    /// exported after the fact and settles every node's declaration list.
+    /// exported after the fact, resolves what the bodies use and settles
+    /// every node's declaration list.
     ///
     /// Computed specifiers fold first: they read constants declared anywhere
     /// in the file, and their `IMPORTS` edges precede the late `EXPORTS`
-    /// edges in insertion order.
+    /// edges in insertion order. Uses resolve last, against every
+    /// declaration and import of the file.
     pub fn run(mut self, root: Node<'t>) {
         let scope = Scope::module(self.model.file_id());
         self.visit_children(root, &scope);
-        // A `require(...)` that does not fold is a call of the name
-        // `require`; these are the call sites, for call resolution.
-        let _require_calls = self.resolve_call_imports();
+        let require_calls = self.resolve_call_imports();
+        self.record_require_calls(require_calls);
         for name in std::mem::take(&mut self.pending_exports) {
             if let Some(index) = self.model.lookup_by_name(&name, "", None) {
                 self.model.mark_exported(index);
             }
         }
+        self.resolve_uses();
         self.model.fill_declaration_lists();
     }
 
@@ -119,35 +124,27 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         params
     }
 
-    fn visit_children(&mut self, node: Node<'t>, scope: &Scope) {
+    pub(super) fn visit_children(&mut self, node: Node<'t>, scope: &Scope) {
         for child in named_children(node) {
             self.visit(child, scope);
         }
     }
 
-    fn visit_field(&mut self, node: Node<'t>, field: &str, scope: &Scope) {
+    pub(super) fn visit_field(&mut self, node: Node<'t>, field: &str, scope: &Scope) {
         if let Some(child) = node.child_by_field_name(field) {
             self.visit(child, scope);
         }
     }
 
-    /// The `from` of a call inside an unnamed function: the nearest enclosing
-    /// declared symbol, never the `File`.
-    fn caller_fallback(&self, scope: &Scope) -> Option<String> {
-        (scope.enclosing_symbol_id != self.model.file_id()).then(|| scope.enclosing_symbol_id.clone())
-    }
-
     // --- dispatch --------------------------------------------------------
 
-    fn visit(&mut self, node: Node<'t>, scope: &Scope) {
+    pub(super) fn visit(&mut self, node: Node<'t>, scope: &Scope) {
         match node.kind() {
             "comment" => {}
             "import_statement" => self.handle_import(node),
             "export_statement" => self.handle_export(node, scope),
-            "call_expression" => {
-                self.record_call_import_site(node, scope);
-                self.visit_children(node, scope);
-            }
+            "call_expression" => self.handle_call(node, scope),
+            "new_expression" => self.handle_new(node, scope),
             "class_declaration"
             | "abstract_class_declaration"
             | "class"
@@ -172,33 +169,20 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
             "arrow_function" | "function_expression" | "generator_function" => {
                 self.visit_function_parts(node, scope)
             }
-            "catch_clause" => {
-                let parameter = node.child_by_field_name("parameter").map(|parameter| parameter.id());
-                for child in named_children(node) {
-                    if Some(child.id()) != parameter {
-                        self.visit(child, scope);
-                    }
-                }
+            "statement_block" | "switch_body" => {
+                let inner = block_scope(node, self.source, scope);
+                self.visit_children(node, &inner);
             }
-            "for_statement" | "for_in_statement" => {
-                let left = node.child_by_field_name("left").map(|left| left.id());
-                let right = node.child_by_field_name("right");
-                if let Some(right) = right {
-                    self.visit(right, scope);
-                }
-                for child in named_children(node) {
-                    if Some(child.id()) == left || Some(child.id()) == right.map(|right| right.id()) {
-                        continue;
-                    }
-                    self.visit(child, scope);
-                }
-            }
+            "catch_clause" => self.visit_catch_clause(node, scope),
+            "for_statement" | "for_in_statement" => self.visit_for_statement(node, scope),
             // Anonymous forms with type parameters of their own.
             "function_type" | "constructor_type" | "call_signature" | "construct_signature" => {
                 let inner = type_parameter_scope(node, self.source, scope.clone());
                 self.visit_children(node, &inner);
             }
-            "identifier" | "type_identifier" | "shorthand_property_identifier" => {}
+            "identifier" | "type_identifier" | "shorthand_property_identifier" => {
+                self.record_reference(node, scope)
+            }
             _ => self.visit_children(node, scope),
         }
     }
@@ -624,53 +608,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         }
     }
 
-    // --- function parts --------------------------------------------------
-
-    /// Walks a declared function's parts with the function as the enclosing
-    /// symbol.
-    fn visit_function_body(&mut self, node: Node<'t>, scope: &Scope, function: usize) {
-        let function = self.model.node(function);
-        let inner = Scope {
-            prefix: function.qualified_path.clone().unwrap_or_default(),
-            enclosing_caller_id: Some(function.id.clone()),
-            enclosing_symbol_id: function.id.clone(),
-            inside_function: true,
-            ..scope.clone()
-        };
-        self.visit_function_parts(node, &inner);
-    }
-
-    /// Walks any function's type parameters, parameters, return type and
-    /// body as the inside of a function.
-    fn visit_function_parts(&mut self, node: Node<'t>, scope: &Scope) {
-        let enclosing_caller_id = scope.enclosing_caller_id.clone().or_else(|| self.caller_fallback(scope));
-        let body_scope = Scope {
-            inside_function: true,
-            enclosing_caller_id,
-            ..type_parameter_scope(node, self.source, scope.clone())
-        };
-        self.visit_field(node, "type_parameters", &body_scope);
-        if let Some(parameters) = node.child_by_field_name("parameters") {
-            self.visit_parameters(parameters, &body_scope);
-        }
-        self.visit_field(node, "return_type", &body_scope);
-        self.visit_field(node, "body", &body_scope);
-    }
-
-    /// A parameter list's types and default values; the binding patterns
-    /// themselves declare nothing.
-    fn visit_parameters(&mut self, node: Node<'t>, scope: &Scope) {
-        for parameter in named_children(node) {
-            match parameter.kind() {
-                "required_parameter" | "optional_parameter" => {
-                    self.visit_field(parameter, "type", scope);
-                    self.visit_field(parameter, "value", scope);
-                }
-                "assignment_pattern" => self.visit_field(parameter, "right", scope),
-                _ => {}
-            }
-        }
-    }
+    // --- heritage ----------------------------------------------------------
 
     /// The type arguments of a heritage clause (`extends Box<{ m(): void }>`),
     /// walked in the member scope of the class or interface.

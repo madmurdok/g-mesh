@@ -30,9 +30,14 @@
 //!   resolved through an injected [`imports::SpecifierResolver`]. Until the
 //!   project model resolves specifiers it is [`imports::no_resolution`], and
 //!   every import is an `external_module`.
+//! - **Bodies** are walked with a lexical scope chain, and the calls and
+//!   names they use become `CALLS` and `REFERENCES` edges once the walk is
+//!   over ([`bodies`]). A local never resolves to this file's symbol of the
+//!   same name.
 //! - **A syntax error is a normal answer**: whatever the error-tolerant parse
 //!   found is emitted, and every node is marked.
 
+pub mod bodies;
 pub mod decls;
 pub mod emit;
 pub mod grammar;
