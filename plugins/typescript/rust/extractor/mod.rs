@@ -26,12 +26,17 @@
 //! - **Columns are characters**, converted from tree-sitter's bytes by the
 //!   SDK's [`CharColumns`]. They differ from UTF-16 columns only after a
 //!   non-BMP character on the same line.
+//! - **Imports** become placeholders and `IMPORTS` edges ([`imports`]),
+//!   resolved through an injected [`imports::SpecifierResolver`]. Until the
+//!   project model resolves specifiers it is [`imports::no_resolution`], and
+//!   every import is an `external_module`.
 //! - **A syntax error is a normal answer**: whatever the error-tolerant parse
 //!   found is emitted, and every node is marked.
 
 pub mod decls;
 pub mod emit;
 pub mod grammar;
+pub mod imports;
 pub mod keys;
 pub mod model;
 pub mod scope;
@@ -40,6 +45,7 @@ pub mod syntax;
 use g_mesh_plugin_sdk::{CharColumns, Extractor, FileGraph, RelPath};
 
 use crate::extractor::decls::Declarer;
+use crate::extractor::imports::no_resolution;
 use crate::extractor::model::FileModel;
 use crate::project::TsProject;
 
@@ -76,7 +82,7 @@ impl Extractor for TypeScriptExtractor {
         let end = root.end_position();
         let range = columns.range((start.row, start.column), (end.row, end.column));
         let mut model = FileModel::new(path.as_str(), range);
-        Declarer::new(source, &columns, &mut model).run(root);
+        Declarer::new(source, &columns, path, &no_resolution, &mut model).run(root);
         emit::flush(model, LANGUAGE, ENGINE, path, root.has_error())
     }
 }

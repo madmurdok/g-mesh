@@ -16,7 +16,34 @@ use std::collections::{HashMap, HashSet};
 use g_mesh_plugin_sdk::ids::{edge_id, node_id};
 use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PathSegment, PlaceholderTarget, Range, WireDeclaration};
 
+use g_mesh_plugin_sdk::RelPath;
+use tree_sitter::Node;
+
 use crate::extractor::keys::{is_placeholder_kind, is_sendable_path, qualify, MemberSeparator};
+use crate::extractor::scope::Scope;
+
+/// One local name an import binds to a file of this project: a name this
+/// file uses and another file declares.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportBinding {
+    /// The project file the specifier resolved to.
+    pub target_path: RelPath,
+    /// The name that file exports: the pre-alias one, or `default`. For a
+    /// namespace import, the local name.
+    pub imported_name: String,
+    /// Where the local name is bound; a placeholder for it spans this.
+    pub at: Range,
+}
+
+/// A file-level `const`'s initializer, kept unfolded: folding it may need
+/// another constant declared anywhere in the file.
+#[derive(Debug, Clone)]
+pub struct ConstantInitializer<'t> {
+    pub value: Node<'t>,
+    /// The scope the initializer is written in, which decides the names it
+    /// reaches.
+    pub scope: Scope,
+}
 
 /// What a declaration (or placeholder) asks the model to add.
 #[derive(Debug, Clone)]

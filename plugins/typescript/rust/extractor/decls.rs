@@ -19,13 +19,15 @@
 //!   `export { name }`, `export default name` or `export = name` anywhere in
 //!   the file, which also adds the `EXPORTS` edge.
 //!
-//! Imports, re-exports and everything a body uses are other passes'.
+//! Imports, re-exports and computed specifiers are [`crate::extractor::imports`]';
+//! everything a body uses is another pass's.
 
 use g_mesh_plugin_sdk::wire::{NodeKind, Range};
-use g_mesh_plugin_sdk::CharColumns;
+use g_mesh_plugin_sdk::{CharColumns, RelPath};
 use tree_sitter::Node;
 
-use crate::extractor::keys::{qualified_in, MemberSeparator, Qualified};
+use crate::extractor::imports::{is_whole_module_reexport, ImportState, SpecifierResolver};
+use crate::extractor::keys::{qualified_in, MemberSeparator, Qualified, REEXPORT_ALL_NAME};
 use crate::extractor::model::{FileModel, NodeParams};
 use crate::extractor::scope::{type_parameter_scope, Scope};
 use crate::extractor::syntax::{
@@ -42,25 +44,53 @@ const CLASS_TYPES: [&str; 3] = ["class_declaration", "abstract_class_declaration
 const FUNCTION_VALUE_TYPES: [&str; 3] = ["arrow_function", "function_expression", "generator_function"];
 
 /// Walks one file's tree, declaring into a [`FileModel`].
-pub struct Declarer<'a, 's> {
-    source: &'s str,
-    columns: &'a CharColumns<'s>,
-    model: &'a mut FileModel,
+pub struct Declarer<'a, 's, 't> {
+    pub(super) source: &'s str,
+    pub(super) columns: &'a CharColumns<'s>,
+    pub(super) model: &'a mut FileModel,
+    /// The file being walked, as the resolver is asked from.
+    pub(super) path: &'a RelPath,
+    pub(super) resolver: &'a SpecifierResolver<'a>,
     /// Names an export statement publishes without declaring them there;
     /// settled against the file's declarations once the walk is over.
     pending_exports: Vec<String>,
+    pub(super) imports: ImportState<'t>,
 }
 
-impl<'a, 's> Declarer<'a, 's> {
-    pub fn new(source: &'s str, columns: &'a CharColumns<'s>, model: &'a mut FileModel) -> Self {
-        Self { source, columns, model, pending_exports: Vec::new() }
+impl<'a, 's, 't> Declarer<'a, 's, 't> {
+    /// `resolver` answers which project file an import specifier written in
+    /// `path` names.
+    pub fn new(
+        source: &'s str,
+        columns: &'a CharColumns<'s>,
+        path: &'a RelPath,
+        resolver: &'a SpecifierResolver<'a>,
+        model: &'a mut FileModel,
+    ) -> Self {
+        Self {
+            source,
+            columns,
+            model,
+            path,
+            resolver,
+            pending_exports: Vec::new(),
+            imports: ImportState::default(),
+        }
     }
 
-    /// Declares everything in the tree under `root`, then marks the names
+    /// Declares everything in the tree under `root`, then imports the
+    /// specifiers `require(...)`/`import(...)` fold to, marks the names
     /// exported after the fact and settles every node's declaration list.
-    pub fn run(mut self, root: Node) {
+    ///
+    /// Computed specifiers fold first: they read constants declared anywhere
+    /// in the file, and their `IMPORTS` edges precede the late `EXPORTS`
+    /// edges in insertion order.
+    pub fn run(mut self, root: Node<'t>) {
         let scope = Scope::module(self.model.file_id());
         self.visit_children(root, &scope);
+        // A `require(...)` that does not fold is a call of the name
+        // `require`; these are the call sites, for call resolution.
+        let _require_calls = self.resolve_call_imports();
         for name in std::mem::take(&mut self.pending_exports) {
             if let Some(index) = self.model.lookup_by_name(&name, "", None) {
                 self.model.mark_exported(index);
@@ -71,31 +101,31 @@ impl<'a, 's> Declarer<'a, 's> {
 
     // --- helpers ---------------------------------------------------------
 
-    fn text(&self, node: Node) -> &'s str {
+    pub(super) fn text(&self, node: Node<'t>) -> &'s str {
         text(node, self.source)
     }
 
-    fn range(&self, node: Node) -> Range {
+    pub(super) fn range(&self, node: Node<'t>) -> Range {
         let start = node.start_position();
         let end = node.end_position();
         self.columns.range((start.row, start.column), (end.row, end.column))
     }
 
     /// The parameters of a declaration spanning `at`, qualified by `qualified`.
-    fn params(&self, kind: NodeKind, name: &str, qualified: Qualified, at: Node) -> NodeParams {
+    fn params(&self, kind: NodeKind, name: &str, qualified: Qualified, at: Node<'t>) -> NodeParams {
         let mut params = NodeParams::new(kind, name, qualified.qualified_name, self.range(at));
         params.qualified_path = Some(qualified.qualified_path);
         params.has_body = has_body(at);
         params
     }
 
-    fn visit_children(&mut self, node: Node, scope: &Scope) {
+    fn visit_children(&mut self, node: Node<'t>, scope: &Scope) {
         for child in named_children(node) {
             self.visit(child, scope);
         }
     }
 
-    fn visit_field(&mut self, node: Node, field: &str, scope: &Scope) {
+    fn visit_field(&mut self, node: Node<'t>, field: &str, scope: &Scope) {
         if let Some(child) = node.child_by_field_name(field) {
             self.visit(child, scope);
         }
@@ -109,10 +139,15 @@ impl<'a, 's> Declarer<'a, 's> {
 
     // --- dispatch --------------------------------------------------------
 
-    fn visit(&mut self, node: Node, scope: &Scope) {
+    fn visit(&mut self, node: Node<'t>, scope: &Scope) {
         match node.kind() {
-            "comment" | "import_statement" => {}
+            "comment" => {}
+            "import_statement" => self.handle_import(node),
             "export_statement" => self.handle_export(node, scope),
+            "call_expression" => {
+                self.record_call_import_site(node, scope);
+                self.visit_children(node, scope);
+            }
             "class_declaration"
             | "abstract_class_declaration"
             | "class"
@@ -168,7 +203,7 @@ impl<'a, 's> Declarer<'a, 's> {
         }
     }
 
-    fn visit_declaration(&mut self, node: Node, scope: &Scope, exported: bool, outer: Node) {
+    fn visit_declaration(&mut self, node: Node<'t>, scope: &Scope, exported: bool, outer: Node<'t>) {
         match node.kind() {
             "class_declaration" | "abstract_class_declaration" | "class" => {
                 self.handle_class(node, scope, exported, outer)
@@ -191,12 +226,14 @@ impl<'a, 's> Declarer<'a, 's> {
 
     // --- exports ---------------------------------------------------------
 
-    /// The declaration half of an export statement: `export <declaration>`,
-    /// `export default <value>`, and the local names `export { a, b }` and
-    /// `export = a` publish. A clause with `from` re-exports another file's
-    /// names and declares nothing here.
-    fn handle_export(&mut self, node: Node, scope: &Scope) {
-        let has_source = node.child_by_field_name("source").is_some();
+    /// An export statement: `export <declaration>`, `export default <value>`,
+    /// and the local names `export { a, b }` and `export = a` publish. With
+    /// `from` it also imports that module, and a clause or `*` records a
+    /// re-export placeholder per published name when the module resolved to a
+    /// project file; nothing is declared here.
+    fn handle_export(&mut self, node: Node<'t>, scope: &Scope) {
+        let source = node.child_by_field_name("source");
+        let target_path = source.and_then(|source| self.record_import(source));
 
         if let Some(declaration) = node.child_by_field_name("declaration") {
             self.visit_declaration(declaration, scope, true, node);
@@ -207,19 +244,26 @@ impl<'a, 's> Declarer<'a, 's> {
             return;
         }
         if let Some(clause) = child_of_kind(node, "export_clause") {
-            if !has_source {
-                for spec in named_children(clause) {
-                    if spec.kind() != "export_specifier" {
-                        continue;
-                    }
-                    if let Some(name) = spec.child_by_field_name("name") {
-                        self.pending_exports.push(self.text(name).to_string());
-                    }
+            for spec in named_children(clause) {
+                if spec.kind() != "export_specifier" {
+                    continue;
+                }
+                let Some(name) = spec.child_by_field_name("name") else { continue };
+                let name_text = self.text(name);
+                if source.is_none() {
+                    self.pending_exports.push(name_text.to_string());
+                } else if let Some(target_path) = &target_path {
+                    let alias = spec.child_by_field_name("alias");
+                    let published = alias.map_or(name_text, |alias| self.text(alias));
+                    self.record_reexport(alias.unwrap_or(name), published, target_path, name_text);
                 }
             }
             return;
         }
-        if has_child_of_kind(node, "*") {
+        if is_whole_module_reexport(node) {
+            if let Some(target_path) = &target_path {
+                self.record_reexport(node, REEXPORT_ALL_NAME, target_path, REEXPORT_ALL_NAME);
+            }
             return;
         }
         // `export = foo`.
@@ -229,7 +273,7 @@ impl<'a, 's> Declarer<'a, 's> {
         }
     }
 
-    fn handle_default_export_value(&mut self, value: Node, scope: &Scope, outer: Node) {
+    fn handle_default_export_value(&mut self, value: Node<'t>, scope: &Scope, outer: Node<'t>) {
         if CLASS_TYPES.contains(&value.kind()) {
             self.handle_class(value, scope, true, outer);
             return;
@@ -259,7 +303,7 @@ impl<'a, 's> Declarer<'a, 's> {
 
     // --- declarations ----------------------------------------------------
 
-    fn handle_class(&mut self, node: Node, scope: &Scope, exported: bool, outer: Node) {
+    fn handle_class(&mut self, node: Node<'t>, scope: &Scope, exported: bool, outer: Node<'t>) {
         // `export default class {}` has no name.
         let name = node.child_by_field_name("name").map_or("default", |name| self.text(name));
         let qualified = qualified_in(&scope.prefix, name, MemberSeparator::Dot);
@@ -311,7 +355,7 @@ impl<'a, 's> Declarer<'a, 's> {
         }
     }
 
-    fn handle_interface(&mut self, node: Node, scope: &Scope, exported: bool, outer: Node) {
+    fn handle_interface(&mut self, node: Node<'t>, scope: &Scope, exported: bool, outer: Node<'t>) {
         let Some(name_node) = node.child_by_field_name("name") else { return };
         let name = self.text(name_node);
         let qualified = qualified_in(&scope.prefix, name, MemberSeparator::Dot);
@@ -357,7 +401,7 @@ impl<'a, 's> Declarer<'a, 's> {
         }
     }
 
-    fn handle_type_alias(&mut self, node: Node, scope: &Scope, exported: bool, outer: Node) {
+    fn handle_type_alias(&mut self, node: Node<'t>, scope: &Scope, exported: bool, outer: Node<'t>) {
         let Some(name_node) = node.child_by_field_name("name") else { return };
         if scope.inside_function {
             let inner = type_parameter_scope(node, self.source, scope.clone());
@@ -380,7 +424,8 @@ impl<'a, 's> Declarer<'a, 's> {
     }
 
     /// Enum members are below symbol granularity: only the enum is a node.
-    fn handle_enum(&mut self, node: Node, scope: &Scope, exported: bool, outer: Node) {
+    /// Its string members are kept for specifier folding.
+    fn handle_enum(&mut self, node: Node<'t>, scope: &Scope, exported: bool, outer: Node<'t>) {
         let Some(name_node) = node.child_by_field_name("name") else { return };
         if scope.inside_function {
             return;
@@ -391,12 +436,14 @@ impl<'a, 's> Declarer<'a, 's> {
         params.native_kind = Some("enum".to_string());
         params.doc_comment = doc_comment_for(outer, self.source);
         params.exported = exported;
-        self.model.declare_symbol(params);
+        let index = self.model.declare_symbol(params);
+        let qualified_name = self.model.node(index).qualified_name.clone();
+        self.record_enum_member_values(node, &qualified_name);
     }
 
     /// `namespace N {}` (`namespace`) and `declare module "x" {}`
     /// (`ambient_module`, named by the string's value).
-    fn handle_namespace(&mut self, node: Node, scope: &Scope, exported: bool, outer: Node) {
+    fn handle_namespace(&mut self, node: Node<'t>, scope: &Scope, exported: bool, outer: Node<'t>) {
         let Some(name_node) = node.child_by_field_name("name") else { return };
         let body = node.child_by_field_name("body");
         let name =
@@ -431,7 +478,13 @@ impl<'a, 's> Declarer<'a, 's> {
         self.visit_children(body, &inner);
     }
 
-    fn handle_function_declaration(&mut self, node: Node, scope: &Scope, exported: bool, outer: Node) {
+    fn handle_function_declaration(
+        &mut self,
+        node: Node<'t>,
+        scope: &Scope,
+        exported: bool,
+        outer: Node<'t>,
+    ) {
         let name_node = node.child_by_field_name("name");
         let Some(name_node) = name_node.filter(|_| !scope.inside_function) else {
             // A nested function declaration is a local.
@@ -456,7 +509,7 @@ impl<'a, 's> Declarer<'a, 's> {
         self.visit_function_body(node, scope, index);
     }
 
-    fn handle_method(&mut self, node: Node, scope: &Scope) {
+    fn handle_method(&mut self, node: Node<'t>, scope: &Scope) {
         let name_node = node.child_by_field_name("name");
         let Some(name_node) =
             name_node.filter(|_| scope.enclosing_type_qname.is_some() && !scope.inside_function)
@@ -479,7 +532,7 @@ impl<'a, 's> Declarer<'a, 's> {
 
     /// Only a function-valued class field (`fire = () => ...`) is a node;
     /// data properties are below symbol granularity.
-    fn handle_field(&mut self, node: Node, scope: &Scope) {
+    fn handle_field(&mut self, node: Node<'t>, scope: &Scope) {
         let name_node = node.child_by_field_name("name");
         let value = node.child_by_field_name("value");
         let member = match (name_node, value) {
@@ -511,7 +564,13 @@ impl<'a, 's> Declarer<'a, 's> {
         self.visit_function_body(value, scope, index);
     }
 
-    fn handle_variable_declaration(&mut self, node: Node, scope: &Scope, exported: bool, outer: Node) {
+    fn handle_variable_declaration(
+        &mut self,
+        node: Node<'t>,
+        scope: &Scope,
+        exported: bool,
+        outer: Node<'t>,
+    ) {
         let keyword = children(node)
             .into_iter()
             .find(|child| matches!(child.kind(), "const" | "let" | "var"))
@@ -553,6 +612,9 @@ impl<'a, 's> Declarer<'a, 's> {
             params.doc_comment = doc_comment_for(outer, self.source);
             params.exported = exported;
             let index = self.model.declare_symbol(params);
+            if let Some(value) = value.filter(|_| keyword == Some("const")) {
+                self.record_constant_initializer(index, name, value, scope);
+            }
             let value_scope =
                 Scope { enclosing_symbol_id: self.model.node(index).id.clone(), ..scope.clone() };
             self.visit_field(declarator, "type", &value_scope);
@@ -566,7 +628,7 @@ impl<'a, 's> Declarer<'a, 's> {
 
     /// Walks a declared function's parts with the function as the enclosing
     /// symbol.
-    fn visit_function_body(&mut self, node: Node, scope: &Scope, function: usize) {
+    fn visit_function_body(&mut self, node: Node<'t>, scope: &Scope, function: usize) {
         let function = self.model.node(function);
         let inner = Scope {
             prefix: function.qualified_path.clone().unwrap_or_default(),
@@ -580,7 +642,7 @@ impl<'a, 's> Declarer<'a, 's> {
 
     /// Walks any function's type parameters, parameters, return type and
     /// body as the inside of a function.
-    fn visit_function_parts(&mut self, node: Node, scope: &Scope) {
+    fn visit_function_parts(&mut self, node: Node<'t>, scope: &Scope) {
         let enclosing_caller_id = scope.enclosing_caller_id.clone().or_else(|| self.caller_fallback(scope));
         let body_scope = Scope {
             inside_function: true,
@@ -597,7 +659,7 @@ impl<'a, 's> Declarer<'a, 's> {
 
     /// A parameter list's types and default values; the binding patterns
     /// themselves declare nothing.
-    fn visit_parameters(&mut self, node: Node, scope: &Scope) {
+    fn visit_parameters(&mut self, node: Node<'t>, scope: &Scope) {
         for parameter in named_children(node) {
             match parameter.kind() {
                 "required_parameter" | "optional_parameter" => {
@@ -612,7 +674,7 @@ impl<'a, 's> Declarer<'a, 's> {
 
     /// The type arguments of a heritage clause (`extends Box<{ m(): void }>`),
     /// walked in the member scope of the class or interface.
-    fn visit_heritage_type_arguments(&mut self, clause: Node, scope: &Scope) {
+    fn visit_heritage_type_arguments(&mut self, clause: Node<'t>, scope: &Scope) {
         for child in named_children(clause) {
             match child.kind() {
                 "extends_clause" | "implements_clause" => self.visit_heritage_type_arguments(child, scope),

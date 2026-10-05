@@ -16,6 +16,18 @@ pub struct LocalBindings {
     pub parent: Option<Rc<LocalBindings>>,
 }
 
+/// Whether `name` is bound anywhere along `bindings`' chain.
+pub fn is_locally_bound(name: &str, bindings: Option<&Rc<LocalBindings>>) -> bool {
+    let mut link = bindings;
+    while let Some(scope) = link {
+        if scope.names.contains(name) {
+            return true;
+        }
+        link = scope.parent.as_ref();
+    }
+    false
+}
+
 /// Where the walk is.
 #[derive(Debug, Clone)]
 pub struct Scope {

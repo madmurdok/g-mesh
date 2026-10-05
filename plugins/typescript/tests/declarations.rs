@@ -4,6 +4,7 @@
 use g_mesh_plugin_sdk::ids::{edge_id, node_id};
 use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PathSegment, Visibility, WireNode};
 use g_mesh_plugin_sdk::{Extractor, FileGraph, RelPath};
+use g_mesh_plugin_typescript::extractor::keys::is_placeholder_kind;
 use g_mesh_plugin_typescript::extractor::TypeScriptExtractor;
 use g_mesh_plugin_typescript::project::TsProject;
 
@@ -48,9 +49,15 @@ impl Graph {
         self.has_edge(self.file_id(), EdgeKind::Exports, &self.node(qualified_name).id)
     }
 
-    /// Every node but the `File` node.
+    /// Every declared node: neither the `File` node nor a placeholder.
     fn symbols(&self) -> Vec<&str> {
-        self.graph.nodes.iter().skip(1).map(|node| node.qualified_name.as_str()).collect()
+        self.graph
+            .nodes
+            .iter()
+            .skip(1)
+            .filter(|node| !is_placeholder_kind(node.native_kind.as_deref()))
+            .map(|node| node.qualified_name.as_str())
+            .collect()
     }
 
     fn assert_parsed_cleanly(&self) {
