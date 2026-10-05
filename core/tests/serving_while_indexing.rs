@@ -47,8 +47,8 @@
 //! machine's connect-and-ask costs right now, the walk stays held open at
 //! least three times that long past it.
 //!
-//! Requires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs
-//! `npm run build` there whenever this crate is built.
+//! Requires the TypeScript plugin binary, which `cargo build --workspace`
+//! builds.
 
 use std::path::Path;
 use std::sync::OnceLock;

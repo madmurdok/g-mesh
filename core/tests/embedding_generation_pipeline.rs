@@ -20,12 +20,14 @@
 //!     g-mesh model fetch      (or core/scripts/fetch-embedding-model.sh)
 //!     cd core && cargo test --test embedding_generation_pipeline -- --ignored
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use g_mesh::daemon::bulk_index;
 use g_mesh::daemon::manifest::DiscoveredPlugins;
-use g_mesh::daemon::plugin::{bundled_manifest, BUNDLED_LANGUAGE};
+use g_mesh::daemon::plugin::BUNDLED_LANGUAGE;
 use g_mesh::embedding::{default_model_dir, CacheSettings, EmbeddingModel, EmbeddingPipeline};
 use g_mesh::storage::connection::{open, project_dir};
 use g_mesh::storage::index_store::IndexStore;
@@ -33,14 +35,12 @@ use g_mesh::storage::schema;
 use rusqlite::Connection;
 
 /// The single-language discovery every test in this file walks with - just
-/// the bundled JS/TS plugin, built by hand from [`bundled_manifest`] rather
-/// than through `daemon::manifest::discover`, so this suite's isolation from
-/// whatever else happens to live under `~/.g-mesh/plugins/` on the machine
-/// running it is unchanged from before task 156 generalized
-/// `daemon::bulk_index::run` to take a discovery result at all.
+/// the bundled TypeScript plugin, built by hand from its manifest rather than
+/// through `daemon::manifest::discover`, so whatever else lives under
+/// `~/.g-mesh/plugins/` on the machine running this suite is not walked.
 fn only_the_bundled_plugin() -> DiscoveredPlugins {
     DiscoveredPlugins {
-        manifests: HashMap::from([(BUNDLED_LANGUAGE.to_string(), bundled_manifest())]),
+        manifests: HashMap::from([(BUNDLED_LANGUAGE.to_string(), common::typescript_manifest())]),
         routing: HashMap::new(),
     }
 }

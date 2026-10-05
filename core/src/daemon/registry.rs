@@ -300,7 +300,7 @@ pub fn indexer_version(discovered: &DiscoveredPlugins) -> String {
 /// exists for, one level up. The language is hashed alongside its fingerprint
 /// (and both are length-delimited by a NUL) so that renaming a plugin, or two
 /// languages swapping builds, cannot leave the concatenation unchanged.
-fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
+pub(crate) fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
     let mut fingerprinted: Vec<(&str, String)> = discovered
         .manifests
         .iter()

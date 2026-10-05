@@ -363,7 +363,7 @@ fn walk_one_language_in(
     // The check `daemon::plugin::PluginState::spawn` makes too: an unbuilt
     // cargo-workspace plugin binary gets a message naming the build command
     // instead of a bare "No such file or directory".
-    if let Some(hint) = plugin::missing_plugin_binary_hint(&manifest.command, &manifest.args) {
+    if let Some(hint) = plugin::missing_plugin_binary_hint(&manifest.command) {
         // The hint is the innermost cause, so the instructions show it rather
         // than the step (ADR 0022).
         return Err(

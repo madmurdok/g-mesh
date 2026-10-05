@@ -29,7 +29,7 @@
 //! # And the real plugin
 //!
 //! `the_typescript_plugin_passes_on_a_small_typescript_fixture` runs the
-//! bundled TS plugin (built by `core/build.rs`) over
+//! bundled TS plugin (built by `cargo build --workspace`) over
 //! `../plugins/typescript/conformance/project/` - a cross-file import, both
 //! re-export forms, a namespace member use (so its semantic pass actually
 //! starts tsserver and the lazy-engine check has a marker to judge), an
@@ -51,9 +51,8 @@
 //! that plugin emits are addresses core's linker actually resolves - plus,
 //! since GM-281, that its `go/types` pass resolves receiver calls through a
 //! variable, an embedded field and an interface value, and finds implicit
-//! interface implementations. Both therefore need a Go toolchain on `PATH`,
-//! the same way the TS pair needs Node: without one `core/build.rs` cannot
-//! build the plugin at all.
+//! interface implementations. Both therefore need a Go toolchain on `PATH`:
+//! without one `core/build.rs` cannot build the plugin at all.
 //!
 //! # `--expect` (GM-277)
 //!

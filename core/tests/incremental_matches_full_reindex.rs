@@ -15,13 +15,15 @@
 //! not compared. Neither is the `indexed_files` row of a file that still
 //! exists: watcher-applied edits leave baselines to query-time staleness.
 
+mod common;
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use g_mesh::daemon::bulk_index;
 use g_mesh::daemon::manifest::{read_manifest, DiscoveredPlugins, PluginManifest};
-use g_mesh::daemon::plugin::{bundled_manifest, PluginProcess, BUNDLED_LANGUAGE};
+use g_mesh::daemon::plugin::{PluginProcess, BUNDLED_LANGUAGE};
 use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::storage::connection::{open, project_dir};
 use g_mesh::storage::index_store::IndexStore;
@@ -44,7 +46,7 @@ impl Language {
     fn manifest(self) -> PluginManifest {
         match self {
             Language::Rust => plugin_manifest("rust"),
-            Language::TypeScript => bundled_manifest(),
+            Language::TypeScript => common::typescript_manifest(),
             Language::Go => plugin_manifest("go"),
         }
     }

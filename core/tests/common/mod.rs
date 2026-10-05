@@ -442,3 +442,15 @@ pub fn rust_and_missing_python_plugin_root() -> (tempfile::TempDir, PathBuf) {
     add_real_rust_plugin(root.path());
     (root, binary)
 }
+
+/// `plugins/typescript/plugin.toml` as discovery reads it, with its
+/// capabilities reset to the defaults so a test does not depend on which
+/// tiers the plugin turns on. `${G_MESH_BIN_DIR}` resolves to this test
+/// binary's `target/<profile>/`, where `cargo build --workspace` puts
+/// `g-mesh-plugin-typescript`.
+pub fn typescript_manifest() -> daemon::manifest::PluginManifest {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript");
+    let manifest = daemon::manifest::read_manifest(&dir)
+        .unwrap_or_else(|err| panic!("plugins/typescript/plugin.toml: {err:#}"));
+    daemon::manifest::PluginManifest { capabilities: Default::default(), ..manifest }
+}

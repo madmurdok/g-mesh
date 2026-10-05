@@ -377,22 +377,12 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
     // fails `Command::spawn` below with a bare `No such file or directory
     // (os error 2)`, which blames the plugin for a build step nothing in
     // this kit's own path runs: `core/build.rs` builds the
-    // typescript and go plugins as a side effect of `cargo build`, but the
-    // two cargo-workspace plugins are ordinary workspace members with no
+    // go plugin as a side effect of `cargo build`, but the
+    // cargo-workspace plugins are ordinary workspace members with no
     // such step, so `cargo build --workspace` is the one command that
     // produces them and this kit deliberately does not run it - see this
     // module's doc comment on why a crash/missing binary is a finding, not
     // something to work around.
-    //
-    // Deliberately `missing_workspace_binary_hint` alone, not the combined
-    // `missing_plugin_binary_hint` the daemon's own spawn sites use: the
-    // latter also matches a missing node entry point, and the typescript
-    // plugin's `Command::spawn` here always succeeds (`node` exists) and
-    // fails informatively on its own - `StderrCapture` already quotes
-    // node's "Cannot find module .../dist/src/index.js" for that case, which
-    // names its own cause and is not this task's gap. Matching that case
-    // here too would replace an unrelated, already-honest failure text
-    // with a different one for no reason this task asked for.
     if let Some(hint) = crate::daemon::plugin::missing_workspace_binary_hint(&manifest.command) {
         return BulkRun { bytes: Vec::new(), lines: Vec::new(), failure: Some(hint) };
     }

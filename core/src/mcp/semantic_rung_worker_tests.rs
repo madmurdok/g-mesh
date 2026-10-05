@@ -302,9 +302,8 @@ async fn the_server_applies_the_discovered_plugins_shapes() {
     let counter = Arc::clone(&embedded);
     let embedding = pipeline(dir.path(), move || Box::new(CountingEmbedder(Arc::clone(&counter))));
     let rust = PluginManifest {
-        language: "rust".to_string(),
         non_symbol_queries: NonSymbolShapes { starts_with: vec!["@".into()], contains: vec!["/".into()] },
-        ..crate::daemon::plugin::bundled_manifest()
+        ..crate::daemon::manifest::bare_manifest("rust")
     };
     let discovered = DiscoveredPlugins {
         manifests: [("rust".to_string(), rust)].into_iter().collect(),

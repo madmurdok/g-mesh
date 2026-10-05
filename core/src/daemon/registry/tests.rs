@@ -252,8 +252,8 @@ fn ensure_current_reindexes_when_any_one_plugins_build_changes() {
 
 /// Against the real bundled plugin rather than a stub: the generation a
 /// daemon on this machine would actually compute names a readable build,
-/// not [`plugin::FINGERPRINT_UNAVAILABLE`] - `core/build.rs` has just
-/// built the plugin discovery finds.
+/// not [`plugin::FINGERPRINT_UNAVAILABLE`] - discovery finds the
+/// checkout's own plugin directories.
 #[test]
 fn the_real_bundled_plugin_root_produces_a_readable_generation() {
     let bundled_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
