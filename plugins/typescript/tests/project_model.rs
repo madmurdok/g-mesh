@@ -591,6 +591,70 @@ fn paths_inside_refuses_absolute_drive_lettered_and_escaping_targets() {
     assert_eq!(inside("", "./a.ts"), some("a.ts"));
 }
 
+/// tsc's `normalizeSlashes`: a config's `\` is a separator on every host, so
+/// `.\x`, `..\x`, `\x` and a UNC `\\server` target read like their `/` forms.
+#[test]
+fn paths_inside_reads_backslashes_as_separators() {
+    assert_eq!(inside("pkg", ".\\src\\index.ts"), some("pkg/src/index.ts"));
+    assert_eq!(inside("pkg", "..\\shared\\a.ts"), some("shared/a.ts"));
+    assert_eq!(inside("pkg", "..\\..\\etc\\x.ts"), None);
+    assert_eq!(inside("pkg", "\\abs\\x.ts"), None);
+    assert_eq!(inside("pkg", "\\\\server\\share\\x.ts"), None);
+}
+
+#[test]
+fn paths_inside_refuses_a_drive_letter_with_either_separator() {
+    for target in ["C:\\x.ts", "C:/x.ts", "d:\\src\\x.ts"] {
+        assert_eq!(inside("pkg", target), None, "{target:?}");
+    }
+}
+
+/// Inputs with no `\` and no drive letter are untouched by the slash
+/// normalisation: the same answers as before it existed.
+#[test]
+fn config_targets_without_backslashes_or_drive_letters_read_as_before() {
+    assert_eq!(inside("pkg", "./src/index.ts"), some("pkg/src/index.ts"));
+    assert_eq!(inside("pkg", "src/index.ts"), some("pkg/src/index.ts"));
+    assert_eq!(inside("pkg", "../shared/a.ts"), some("shared/a.ts"));
+    assert_eq!(inside("pkg", "../../etc/x.ts"), None);
+    assert_eq!(inside("pkg", "/abs/x.ts"), None);
+    assert_eq!(
+        extends_candidates("pkg/tsconfig.json", "./base"),
+        strings(&["pkg/base.json", "pkg/base/tsconfig.json"])
+    );
+    assert_eq!(extends_candidates("a/b/tsconfig.json", "../../base.json"), strings(&["base.json"]));
+    assert_eq!(
+        extends_candidates("pkg/tsconfig.json", "@tsconfig/node18/tsconfig.json"),
+        strings(&[
+            "pkg/node_modules/@tsconfig/node18/tsconfig.json",
+            "node_modules/@tsconfig/node18/tsconfig.json"
+        ])
+    );
+    assert_eq!(extends_candidates("pkg/tsconfig.json", "/abs/base.json"), Vec::<String>::new());
+}
+
+#[test]
+fn backslashed_exports_and_imports_targets_resolve_like_their_slash_forms() {
+    let fx = Fixture::new(&[
+        ("package.json", r#"{"workspaces":["packages/*"]}"#),
+        ("app.ts", SRC),
+        (
+            "packages/p/package.json",
+            r##"{"name":"p","exports":{".":".\\src\\main.ts","./feature":".\\src\\feat\\impl.ts"},"imports":{"#utils":".\\src\\utils.ts"}}"##,
+        ),
+        ("packages/p/src/index.ts", SRC),
+        ("packages/p/src/main.ts", SRC),
+        ("packages/p/src/feat/impl.ts", SRC),
+        ("packages/p/src/feature.ts", SRC),
+        ("packages/p/src/utils.ts", SRC),
+        ("packages/p/src/a.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "p", "app.ts"), some("packages/p/src/main.ts"));
+    assert_eq!(resolve(&project, "p/feature", "app.ts"), some("packages/p/src/feat/impl.ts"));
+    assert_eq!(resolve(&project, "#utils", "packages/p/src/a.ts"), some("packages/p/src/utils.ts"));
+}
+
 #[test]
 fn an_exports_map_decides_the_entry_for_the_package_root_and_its_subpaths() {
     let fx = Fixture::new(&[
@@ -1485,6 +1549,86 @@ fn extends_candidates_follow_tscs_lookup() {
     for entry in ["/etc/base.json", "../outside.json", "", ".hidden"] {
         assert_eq!(extends_candidates("tsconfig.json", entry), Vec::<String>::new(), "{entry:?}");
     }
+}
+
+/// tsc normalises an `extends` entry's slashes before deciding whether it is
+/// relative, so `.\base` is relative and `@tsconfig\node18` is a package path.
+#[test]
+fn extends_candidates_read_backslashes_as_separators() {
+    assert_eq!(
+        extends_candidates("pkg/tsconfig.json", ".\\base"),
+        strings(&["pkg/base.json", "pkg/base/tsconfig.json"])
+    );
+    assert_eq!(extends_candidates("a/b/tsconfig.json", "..\\..\\base.json"), strings(&["base.json"]));
+    assert_eq!(extends_candidates("tsconfig.json", "..\\outside.json"), Vec::<String>::new());
+    assert_eq!(
+        extends_candidates("pkg/tsconfig.json", "@tsconfig\\node18\\tsconfig.json"),
+        strings(&[
+            "pkg/node_modules/@tsconfig/node18/tsconfig.json",
+            "node_modules/@tsconfig/node18/tsconfig.json"
+        ])
+    );
+}
+
+/// A drive-lettered entry is absolute, like `/x`: dropped, never looked up
+/// as a package under `node_modules`.
+#[test]
+fn a_drive_lettered_extends_entry_is_dropped_like_an_absolute_one() {
+    for entry in ["C:/x/tsconfig.json", "C:\\x\\tsconfig.json", "c:/base"] {
+        assert_eq!(extends_candidates("pkg/tsconfig.json", entry), Vec::<String>::new(), "{entry:?}");
+    }
+}
+
+#[test]
+fn a_unc_extends_entry_is_dropped_like_an_absolute_one() {
+    assert_eq!(extends_candidates("pkg/tsconfig.json", "\\\\server\\share\\base.json"), Vec::<String>::new());
+}
+
+#[test]
+fn a_backslashed_extends_entry_is_followed_when_loading() {
+    let fx = Fixture::new(&[
+        ("configs/base.json", r#"{"compilerOptions":{"paths":{"@/*":["../src/*"]}}}"#),
+        ("tsconfig.json", r#"{"extends":".\\configs\\base.json"}"#),
+        ("app.ts", SRC),
+        ("src/a.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@/a", "app.ts"), some("src/a.ts"));
+}
+
+/// The expansion itself, before `RelPath` (which also turns `\\` into `/`)
+/// could hide a target that was never normalised.
+#[test]
+fn expand_paths_candidates_read_backslashed_targets_like_their_slash_forms() {
+    let config = EffectiveConfig {
+        resolve_dir: "apps/web".to_string(),
+        paths: vec![PathsEntry {
+            pattern: "@/*".to_string(),
+            targets: strings(&["src\\*", ".\\gen\\*", "..\\..\\shared\\*", "..\\..\\..\\out\\*", "\\abs\\*"]),
+        }],
+    };
+    assert_eq!(
+        expand_paths_candidates(&config, "@/x"),
+        strings(&["apps/web/src/x", "apps/web/gen/x", "shared/x"])
+    );
+}
+
+/// A `..\\` target is the case `RelPath` cannot rescue: unnormalised, it
+/// stays one literal segment and climbs nowhere.
+#[test]
+fn backslashed_paths_targets_resolve_like_their_slash_forms() {
+    let fx = Fixture::new(&[
+        (
+            "apps/web/tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"@app/*":["src\\*"],"@shared/*":["..\\..\\shared\\*"]}}}"#,
+        ),
+        ("apps/web/app.ts", SRC),
+        ("apps/web/src/util.ts", SRC),
+        ("shared/x/index.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@app/util", "apps/web/app.ts"), some("apps/web/src/util.ts"));
+    assert_eq!(resolve(&project, "@shared/x", "apps/web/app.ts"), some("shared/x/index.ts"));
 }
 
 // --- tsconfig: baseUrl ------------------------------------------------------------
