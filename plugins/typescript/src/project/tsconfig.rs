@@ -8,7 +8,7 @@
 //! config once and records its effective rules per directory.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::project::exports::match_wildcard;
@@ -160,21 +160,36 @@ pub fn extends_candidates(config: &str, entry: &str) -> Vec<String> {
 /// The directory a config's own `paths` resolve against: `baseUrl` when it
 /// declares one, else the config's own directory (tsc's rule for `paths`
 /// without `baseUrl`). `None` when that lies outside the project.
+///
+/// As in tsc, on every host `\\` is a separator and a `baseUrl` starting
+/// with `/` or a drive letter is absolute; a drive-less one takes `root`'s
+/// drive.
 pub fn own_resolve_dir(config: &str, base_url: Option<&str>, root: &Path) -> Option<String> {
     let config_dir = paths::dirname(config);
     let Some(base_url) = base_url else {
         return Some(config_dir.to_string());
     };
-    let joined = if Path::new(base_url).is_absolute() {
-        let relative = Path::new(base_url).strip_prefix(root).ok()?;
+    let base_url = base_url.replace('\\', "/");
+    let joined = if paths::is_rooted(&base_url) {
+        let relative = with_roots_drive(Path::new(&base_url), root).strip_prefix(root).ok()?.to_path_buf();
         paths::normalize(&relative.to_string_lossy().replace('\\', "/"))
     } else {
-        paths::normalize(&paths::join(config_dir, base_url))
+        paths::normalize(&paths::join(config_dir, &base_url))
     };
     match joined.as_str() {
         "." => Some(String::new()),
         _ if paths::escapes(&joined) => None,
         _ => Some(joined),
+    }
+}
+
+/// `path` on `root`'s drive when `path` is rooted but names no drive (only
+/// possible on Windows); otherwise `path` itself.
+fn with_roots_drive(path: &Path, root: &Path) -> PathBuf {
+    let has_prefix = |p: &Path| matches!(p.components().next(), Some(Component::Prefix(_)));
+    match root.components().next() {
+        Some(Component::Prefix(prefix)) if !has_prefix(path) => Path::new(prefix.as_os_str()).join(path),
+        _ => path.to_path_buf(),
     }
 }
 
