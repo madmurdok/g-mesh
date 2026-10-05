@@ -1,0 +1,25 @@
+[package]
+name = "g-mesh-plugin-typescript"
+version = "4.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "g-mesh's TypeScript/JavaScript language plugin: tree-sitter structural extraction on the plugin SDK"
+
+# Sources live in `rust/` while `src/` still holds the npm package this crate
+# replaces; they move to `src/` once that package is gone.
+[lib]
+name = "g_mesh_plugin_typescript"
+path = "rust/lib.rs"
+
+[[bin]]
+name = "g-mesh-plugin-typescript"
+path = "rust/main.rs"
+
+[dependencies]
+anyhow = "1"
+g-mesh-plugin-sdk = { path = "../sdk" }
+g-mesh-wire = { path = "../../wire" }
+tree-sitter = "0.25"
+# Three grammars, routed per extension (`extractor::grammar`).
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"

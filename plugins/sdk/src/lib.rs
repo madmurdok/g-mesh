@@ -74,6 +74,7 @@
 
 #![deny(missing_docs)]
 
+mod columns;
 mod diff;
 mod framing;
 mod graph;
@@ -88,6 +89,7 @@ mod semantic;
 pub mod testing;
 mod walk;
 
+pub use columns::CharColumns;
 pub use diff::{diff_file, is_empty_diff};
 pub use graph::{
     placeholder_id, render_target, EdgeSpec, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, OpenSiteKind,
