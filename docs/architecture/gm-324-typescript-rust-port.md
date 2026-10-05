@@ -257,10 +257,14 @@ structural tier (`extract.test.ts` 339). This is what core's
 4. **Walk semantics from the SDK** (`.gitignore` layering, `exclude_dirs`,
    symlinks per ADR 0025) instead of `ignorePolicy.ts`/`symlinks.ts`. Where the
    two disagree on a symlink alias the SDK wins and the existence set follows.
-5. **No NUL stand-in.** `extract.ts:502` swaps NUL for U+0001 to dodge a
-   node-tree-sitter read-buffer bug; Rust tree-sitter takes a byte slice with a
-   length. The three NUL tests (`extract` 485/499/504) port as they are and
-   must hold without the stand-in.
+5. **NUL is parsed as U+0001; names keep their NUL.** The grammars reject a
+   raw NUL even inside a string or regex literal, where tsc accepts it, and
+   the error recovery then drops what follows (an import's module, the next
+   declaration). `extractor::grammar::parse` therefore hands tree-sitter the
+   source with every NUL replaced by U+0001, one byte like NUL, so positions
+   do not move. Names and specifiers are sliced from the original source, so
+   they keep their NULs. `extract.ts:502` did the same swap for a different
+   reason (a node-tree-sitter read-buffer bug).
 
 ## 2. Project model port
 
