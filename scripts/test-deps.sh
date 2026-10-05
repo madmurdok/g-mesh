@@ -10,7 +10,7 @@
 # `.github/workflows/ci.yml` runs, so a local setup and CI install the same
 # thing - the same arrangement `scripts/check.sh` has for fmt and clippy.
 #
-#   scripts/test-deps.sh               both, in this order
+#   scripts/test-deps.sh               all three, in this order: rust-analyzer, pyright, typescript
 #   scripts/test-deps.sh rust-analyzer the rustup component plugins/rust tests drive
 #   scripts/test-deps.sh pyright       npm ci for plugins/python (pyright, its test dependency)
 #   scripts/test-deps.sh typescript    npm ci for plugins/typescript (vtsls, its test dependency)

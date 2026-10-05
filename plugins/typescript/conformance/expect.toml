@@ -149,11 +149,9 @@ file = "src/shapes.ts"
 # USAGE_EDGE_KINDS) but find_callers does not - proving that inclusion.
 #
 # `viaGreetable` joined this set in GM-385: its parameter annotation
-# `g: Greetable` is an ordinary same-file REFERENCES edge. Worth noticing
-# what that makes this entry say next to the `[[callers]] Greetable#greet`
-# entry above - the *type* is referenced by the very function whose call to
-# its *method* produces nothing. A reader who follows the type finds the
-# call site; a reader who follows the method does not.
+# `g: Greetable` is an ordinary same-file REFERENCES edge. Since GM-325 the
+# `[[callers]] Greetable#greet` entry above also expects `viaGreetable`, so the
+# type and its method now agree: following either one reaches the call site.
 expect = ["src/shapes.ts:Greeter", "src/shapes.ts:viaGreetable"]
 # Decision 12: two rows, one file, so the response carries the tally and this
 # entry has to say so. It was absent - and asserted absent - until the second
