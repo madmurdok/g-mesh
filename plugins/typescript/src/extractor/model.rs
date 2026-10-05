@@ -151,6 +151,10 @@ pub struct NodeParams {
     pub signature: Option<String>,
     pub doc_comment: Option<String>,
     pub exported: bool,
+    /// Members only: the id of the class or interface declaring the member.
+    pub owner_id: Option<String>,
+    /// Members only: a TypeScript `private` or ECMAScript `#private` member.
+    pub private_member: bool,
     /// Placeholders only.
     pub target: Option<PlaceholderTarget>,
 }
@@ -174,6 +178,8 @@ impl NodeParams {
             signature: None,
             doc_comment: None,
             exported: false,
+            owner_id: None,
+            private_member: false,
             target: None,
         }
     }
@@ -189,8 +195,14 @@ pub struct DraftNode {
     /// Present only when [`is_sendable_path`] accepts it.
     pub qualified_path: Option<Vec<PathSegment>>,
     pub range: Range,
-    /// `public` on the wire when set, else `file`.
+    /// Exported from the file: `EXPORTS` from the file, and `public` on the
+    /// wire. A member is never exported; its visibility is its owner's
+    /// ([`FileModel::public_flags`]).
     pub exported: bool,
+    /// Members only: the id of the class or interface declaring the member.
+    pub owner_id: Option<String>,
+    /// Members only: a TypeScript `private` or ECMAScript `#private` member.
+    pub private_member: bool,
     pub native_kind: Option<String>,
     pub signature: Option<String>,
     pub doc_comment: Option<String>,
@@ -292,6 +304,8 @@ impl FileModel {
             qualified_path,
             range: params.range,
             exported: params.exported,
+            owner_id: params.owner_id,
+            private_member: params.private_member,
             native_kind: params.native_kind,
             signature: params.signature,
             doc_comment: params.doc_comment,
@@ -448,6 +462,23 @@ impl FileModel {
     /// The recorded open sites, in the order they were added.
     pub fn take_open_sites(&mut self) -> Vec<OpenSite> {
         std::mem::take(&mut self.open_sites)
+    }
+
+    /// Whether each node, in insertion order, is `public` on the wire rather
+    /// than `file`. A non-member is public when exported. A member takes its
+    /// owner's visibility, read after every late export has landed: public
+    /// when the declaring class or interface is exported, except a `private`
+    /// or `#private` member, which stays `file`. `protected` follows the
+    /// owner: a subclass in another file reaches it.
+    pub fn public_flags(&self) -> Vec<bool> {
+        self.nodes
+            .iter()
+            .map(|node| match &node.owner_id {
+                None => node.exported,
+                Some(_) if node.private_member => false,
+                Some(owner) => self.node_by_id(owner).is_some_and(|owner| owner.exported),
+            })
+            .collect()
     }
 
     /// The nodes and edges, in insertion order.
