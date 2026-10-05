@@ -13,6 +13,7 @@
 #   scripts/test-deps.sh               both, in this order
 #   scripts/test-deps.sh rust-analyzer the rustup component plugins/rust tests drive
 #   scripts/test-deps.sh pyright       npm ci for plugins/python (pyright, its test dependency)
+#   scripts/test-deps.sh typescript    npm ci for plugins/typescript (vtsls, its test dependency)
 #
 # pyright's version is pinned: an exact version in plugins/python/package.json,
 # locked in the committed package-lock.json, installed with `npm ci`. Bumping it is a
@@ -51,15 +52,33 @@ install_pyright() {
     fi
 }
 
+# Same shape as install_pyright: `npm ci` against plugins/typescript's
+# package-lock.json, then `vtsls --version` (which prints the bare version)
+# compared with the pin in package.json, read from there so it has one home.
+install_typescript() {
+    echo "== npm ci (plugins/typescript)"
+    npm ci --prefix plugins/typescript
+    local expected reported
+    expected="$(node -p 'require("./plugins/typescript/package.json").devDependencies["@vtsls/language-server"]')"
+    reported="$(plugins/typescript/node_modules/.bin/vtsls --version)"
+    echo "$reported"
+    if [ "$reported" != "$expected" ]; then
+        echo "expected vtsls ${expected} (plugins/typescript/package.json), got: ${reported}" >&2
+        exit 1
+    fi
+}
+
 case "${1:-all}" in
 rust-analyzer) install_rust_analyzer ;;
 pyright) install_pyright ;;
+typescript) install_typescript ;;
 all)
     install_rust_analyzer
     install_pyright
+    install_typescript
     ;;
 *)
-    echo "usage: $0 [rust-analyzer|pyright|all]" >&2
+    echo "usage: $0 [rust-analyzer|pyright|typescript|all]" >&2
     exit 2
     ;;
 esac

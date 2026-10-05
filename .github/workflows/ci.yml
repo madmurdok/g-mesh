@@ -484,6 +484,22 @@ jobs:
           fi
           echo "$bin_dir" >> "$GITHUB_PATH"
 
+      # vtsls is a *test* dependency of `plugins/typescript`, installed the
+      # way pyright is above (GM-325): `npm ci` against the committed
+      # package.json and lock through `scripts/test-deps.sh`, with the `.bin`
+      # directory put on `PATH` (native spelling on Windows, so the `.cmd`
+      # shim is found by `Command::new`).
+      - name: Install vtsls
+        working-directory: plugins/typescript
+        shell: bash
+        run: |
+          ../../scripts/test-deps.sh typescript
+          bin_dir="$(pwd)/node_modules/.bin"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bin_dir="$(cygpath -w "$bin_dir")"
+          fi
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
       # The Go plugin is a bundled plugin with a real toolchain dependency,
       # a test dependency and not only a packaging one: `build.rs` runs `go build` to produce
       # `plugins/go/g-mesh-plugin-go`, and both the Rust integration tests

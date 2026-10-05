@@ -1,0 +1,7 @@
+{
+  "name": "@g-mesh/plugin-typescript-test-deps",
+  "private": true,
+  "devDependencies": {
+    "@vtsls/language-server": "0.3.0"
+  }
+}
