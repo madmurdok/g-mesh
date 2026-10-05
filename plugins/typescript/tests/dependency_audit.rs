@@ -1,6 +1,12 @@
 //! The plugin has no networking API in its source: its normal dependency
-//! graph, on every target, holds no HTTP or socket crate. Development
-//! dependencies are not shipped and are not checked.
+//! graph holds no HTTP or socket crate. Development dependencies are not
+//! shipped and are not checked.
+//!
+//! The graph read is the host's only: `cargo tree --offline` needs every
+//! package it prints already downloaded, and a build fetches only the host's
+//! target-specific crates, so `--target all` fails on a machine that has never
+//! fetched another platform's (`winapi-util` on Linux and macOS). Each shipped
+//! target is covered by the CI runner that builds on it.
 //!
 //! Control: add `ureq` to `[dependencies]` in this crate's `Cargo.toml` ->
 //! this test names it.
@@ -20,7 +26,7 @@ fn normal_dependency_graph() -> String {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let output = Command::new(cargo)
-        .args(["tree", "--offline", "--locked", "--edges", "normal", "--target", "all", "--prefix", "none"])
+        .args(["tree", "--offline", "--locked", "--edges", "normal", "--prefix", "none"])
         .args(["--format", "{p} {f}", "--manifest-path"])
         .arg(&manifest)
         .output()

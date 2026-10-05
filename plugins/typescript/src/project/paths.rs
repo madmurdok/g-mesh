@@ -57,7 +57,7 @@ pub fn escapes(normalized: &str) -> bool {
 /// target a manifest or config declares: a package's entries, an `imports`
 /// key's targets, a tsconfig `paths` target.
 pub fn inside(dir: &str, target: &str) -> Option<String> {
-    if target.is_empty() || target.starts_with('/') || has_drive_letter(target) {
+    if target.is_empty() || is_rooted(target) {
         return None;
     }
     let joined = normalize(&join(dir, target));
@@ -72,6 +72,13 @@ pub fn ancestors(dir: &str) -> impl Iterator<Item = &str> {
         next = if current.is_empty() { None } else { Some(dirname(current)) };
         Some(current)
     })
+}
+
+/// Whether `target` is absolute on some host: a POSIX root or a drive
+/// letter. Decided by spelling, not by the host's `Path`, so a config reads
+/// the same on every OS.
+pub fn is_rooted(target: &str) -> bool {
+    target.starts_with('/') || has_drive_letter(target)
 }
 
 /// A Windows absolute path's `C:` prefix.

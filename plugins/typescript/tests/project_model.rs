@@ -1502,6 +1502,27 @@ fn own_resolve_dir_is_the_base_url_or_the_configs_directory() {
     assert_eq!(own_resolve_dir("tsconfig.json", Some("/elsewhere/src"), root), None);
 }
 
+/// tsc reads `\` as a separator and `/x` or `C:/x` as rooted on every OS, so
+/// whether a `baseUrl` is absolute must not depend on the host's `Path` (on
+/// Windows a drive-less `/project/root/src` is not `is_absolute()`).
+#[test]
+fn a_base_urls_separators_and_rootedness_do_not_depend_on_the_host() {
+    let root = Path::new("/project/root");
+    assert_eq!(own_resolve_dir("tsconfig.json", Some("\\project\\root\\src"), root), some("src"));
+    assert_eq!(own_resolve_dir("apps/web/tsconfig.json", Some(".\\src"), root), some("apps/web/src"));
+    assert_eq!(own_resolve_dir("apps/web/tsconfig.json", Some("..\\..\\lib"), root), some("lib"));
+    assert_eq!(own_resolve_dir("tsconfig.json", Some("C:/elsewhere/src"), root), None);
+    assert_eq!(own_resolve_dir("tsconfig.json", Some("C:\\elsewhere\\src"), root), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_drive_less_base_url_is_on_the_roots_drive() {
+    let root = Path::new("C:\\project\\root");
+    assert_eq!(own_resolve_dir("tsconfig.json", Some("/project/root/src"), root), some("src"));
+    assert_eq!(own_resolve_dir("tsconfig.json", Some("D:/project/root/src"), root), None);
+}
+
 #[test]
 fn a_base_url_climbing_out_of_the_project_voids_the_configs_own_paths_only() {
     let fx = Fixture::new(&[
