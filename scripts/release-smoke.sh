@@ -53,9 +53,13 @@
 # per-plugin release assets instead of the bundled plugins: a copy of the
 # stage with `plugins/` emptied, then every plugin asset build-targets.sh
 # names for <target> unpacked into it, with discovery pinned to that
-# directory (G_MESH_PLUGIN_ROOTS_OVERRIDE). That leg requires `plugins list` to
-# show every bundled language before reindexing, so a missing or broken asset
-# fails it even where the per-language sqlite3 check is skipped.
+# directory (G_MESH_PLUGIN_ROOTS_OVERRIDE). Only the reindex honors that
+# override - `plugins list` does not, and on a binary built in a checkout it
+# always lists the checkout's own plugins - so discovery is proven by the
+# reindex itself: with every other root replaced by the override, a language
+# whose asset holds no usable manifest is reported as "<language> has no
+# plugin installed" for its fixture file, and both legs fail on that line.
+# That holds even where the per-language sqlite3 check is skipped.
 #
 # Usage: scripts/release-smoke.sh <stage_dir> <target> [<asset_dir>]
 #   stage_dir  the unpacked staging directory build-targets.sh leaves on disk
@@ -145,6 +149,13 @@ smoke_reindex() {
 	echo "$output"
 	[ "$status" -eq 0 ] || die "'$bin_name reindex' exited $status against the fixture - see output above"
 
+	# A language with fixture files but no discovered plugin is reported, not
+	# failed: reindex still exits 0. Every bundled language has a fixture file,
+	# so this line means one of them was not discovered.
+	if printf '%s\n' "$output" | grep -q 'has no plugin installed'; then
+		die "'$bin_name reindex' reports a language with no plugin installed ($leg plugins) - its plugin was not discovered (see output above)"
+	fi
+
 	# g-mesh reindex prints "  index:   N nodes, M edges (X imports linked, Y
 	# symbols linked)" - core/src/cli/reindex.rs's `render`, which has its own
 	# unit tests, so a change to this format is a deliberate diff there, not
@@ -204,7 +215,7 @@ if [ -n "$asset_dir" ]; then
 		asset="${names[$((2 + 2 * i))]}"
 		i=$((i + 1))
 		[ -f "$asset_dir/$asset" ] || die "plugin asset not found: $asset_dir/$asset"
-		log "  unpacking $asset"
+		log "  unpacking $asset ($lang)"
 		tar -xzf "$asset_dir/$asset" -C "$assets_stage/plugins" || die "could not unpack $asset"
 	done
 
@@ -218,14 +229,6 @@ if [ -n "$asset_dir" ]; then
 		roots_override="$(cygpath -w "$roots_override")"
 	fi
 	export G_MESH_PLUGIN_ROOTS_OVERRIDE="$roots_override"
-
-	plugins_output="$("$assets_stage/$bin_name" plugins list 2>&1)" ||
-		die "'$bin_name plugins list' failed with the plugins unpacked from the assets: $plugins_output"
-	echo "$plugins_output"
-	for lang in "${langs[@]}"; do
-		printf '%s\n' "$plugins_output" | grep -Eq "^$lang +[0-9]" ||
-			die "the $lang plugin unpacked from its asset is not discovered (no '$lang <version>' line in plugins list)"
-	done
 
 	smoke_reindex "$assets_stage" plugin-assets
 fi
