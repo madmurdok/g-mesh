@@ -14,13 +14,14 @@
 #   scripts/build-targets.sh x86_64-apple-darwin  # one explicit target
 #   scripts/build-targets.sh --list               # the four supported triples
 #   scripts/build-targets.sh --version            # version the artifacts are named after
+#   scripts/build-targets.sh --plugins            # the bundled plugin languages
 #   scripts/build-targets.sh --asset-names [target...]
 #                                                 # names a full release publishes
 #   scripts/build-targets.sh --stage-dir <target>
 #                                                 # the staging dir build_one()
 #                                                 # left on disk for <target>
 #
-# The four query flags answer questions *without building*, so they need
+# The query flags answer questions *without building*, so they need
 # neither cargo nor rustup and cost nothing to call. `--asset-names` exists for
 # the publishing job in .github/workflows/release.yml: it uploads exactly the
 # names this script says it emits, computed by the same code that emits them,
@@ -72,6 +73,21 @@
 #                                    need one installed separately.
 #   LICENSE, LICENSE-MIT, LICENSE-APACHE, README.md
 #
+# PLUGIN ASSETS
+#
+# Beside each main archive, one asset per language in BUNDLED_PLUGINS:
+#
+#   g-mesh-plugin-<language>-v<version>-<target>.tar.gz   (.tar.gz on every
+#                                                         target, Windows too)
+#   g-mesh-plugin-<language>-v<version>-<target>.tar.gz.sha256
+#
+# Each one is the staged `plugins/<language>/` directory byte for byte, with
+# `<language>/` as its only top-level entry (`plugin.toml` + the plugin
+# binary), so unpacking it into a plugin root reproduces the bundled layout.
+# It is archived from the same stage as the main archive, never rebuilt, and
+# scripts/prepare-release-assets.sh checks that its files are identical to
+# `plugins/<language>/` inside the main archive of the same target.
+#
 # The JS/TS plugin is not optional dressing: core cannot index a TypeScript
 # project without one, so an archive missing it is not a release artifact.
 # The Go, Rust and Python plugins ship for the same reason, one language
@@ -102,6 +118,13 @@ SUPPORTED_TARGETS=(
 	x86_64-unknown-linux-gnu
 	x86_64-pc-windows-msvc
 )
+
+# Every language whose plugin is bundled into the main archive and published
+# as its own plugin asset. Both the bundling step and `--asset-names` iterate
+# this array, so the two cannot list different languages. It must name the
+# same languages as core's `languages::CATALOGUE`, so that every
+# `install_command()` core prints has an asset behind it.
+BUNDLED_PLUGINS=(typescript go rust python)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${DIST_DIR:-$REPO_ROOT/dist}"
@@ -166,6 +189,36 @@ artifact_stem_for() {
 
 archive_name_for() {
 	echo "$(artifact_stem_for "$1" "$2").$(archive_ext_for "$1")"
+}
+
+# $1 = target, $2 = version, $3 = language. Always .tar.gz, whatever the target.
+plugin_asset_name_for() {
+	echo "g-mesh-plugin-$3-v$2-$1.tar.gz"
+}
+
+# The script under scripts/ that stages one language's plugin.
+bundle_script_for() {
+	case "$1" in
+	typescript) echo "bundle-plugin.sh" ;;
+	go) echo "bundle-go-plugin.sh" ;;
+	rust) echo "bundle-rust-plugin.sh" ;;
+	python) echo "bundle-python-plugin.sh" ;;
+	*) die "no bundle script for plugin language '$1'" ;;
+	esac
+}
+
+# Writes the plugin asset $2 for language $3 from $1/plugins/$3 (the stage)
+# into $DIST_DIR, plus its .sha256 in the same format as the main archive's.
+# COPYFILE_DISABLE keeps macOS tar from adding AppleDouble `._*` entries, which
+# would break the asset's "exactly plugin.toml + binary" layout.
+make_plugin_asset() {
+	local stage_dir="$1" asset_name="$2" lang="$3"
+	local plugins_dir="$stage_dir/plugins"
+	[ -f "$plugins_dir/$lang/plugin.toml" ] || die "no staged plugin.toml for $lang in $plugins_dir/$lang"
+	rm -f "$DIST_DIR/$asset_name" "$DIST_DIR/$asset_name.sha256"
+	COPYFILE_DISABLE=1 tar -czf "$DIST_DIR/$asset_name" -C "$plugins_dir" "$lang"
+	[ -f "$DIST_DIR/$asset_name" ] || die "plugin asset was not created: $DIST_DIR/$asset_name"
+	(cd "$DIST_DIR" && sha256_of "$asset_name" >"$asset_name.sha256")
 }
 
 # Creates $2 (an archive) from the directory $1, which must live inside
@@ -248,15 +301,17 @@ build_one() {
 	if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" = "1" ]; then
 		echo "build-targets: WARNING: G_MESH_SKIP_PLUGIN_BUNDLE=1 - packaging $target with no plugins. The resulting archive CANNOT index anything and must not be published." >&2
 	else
-		log "bundling the JS/TS plugin for $target"
-		bash "$REPO_ROOT/scripts/bundle-plugin.sh" "$target" "$stage_dir/plugins"
-
-		log "bundling the Go plugin for $target"
-		bash "$REPO_ROOT/scripts/bundle-go-plugin.sh" "$target" "$stage_dir/plugins"
-		log "bundling the Rust plugin for $target"
-		CARGO_PROFILE="$CARGO_PROFILE" bash "$REPO_ROOT/scripts/bundle-rust-plugin.sh" "$target" "$stage_dir/plugins"
-		log "bundling the Python plugin for $target"
-		CARGO_PROFILE="$CARGO_PROFILE" bash "$REPO_ROOT/scripts/bundle-python-plugin.sh" "$target" "$stage_dir/plugins"
+		local lang
+		for lang in "${BUNDLED_PLUGINS[@]}"; do
+			log "bundling the $lang plugin for $target"
+			CARGO_PROFILE="$CARGO_PROFILE" bash "$REPO_ROOT/scripts/$(bundle_script_for "$lang")" "$target" "$stage_dir/plugins"
+		done
+		# From the stage just bundled and before the main archive, so both
+		# carry the same bytes.
+		for lang in "${BUNDLED_PLUGINS[@]}"; do
+			log "plugin asset: $(plugin_asset_name_for "$target" "$version" "$lang")"
+			make_plugin_asset "$stage_dir" "$(plugin_asset_name_for "$target" "$version" "$lang")" "$lang"
+		done
 	fi
 
 	archive_path="$DIST_DIR/$(archive_name_for "$target" "$version")"
@@ -331,18 +386,28 @@ main() {
 		resolve_version
 		return 0
 		;;
+	--plugins)
+		printf '%s\n' "${BUNDLED_PLUGINS[@]}"
+		return 0
+		;;
 	--asset-names)
 		shift
-		local asset_version asset_targets=("$@") asset_target archive
+		local asset_version asset_targets=("$@") asset_target archive asset_lang plugin_asset
 		asset_version="$(resolve_version)"
 		if [ ${#asset_targets[@]} -eq 0 ]; then
 			asset_targets=("${SUPPORTED_TARGETS[@]}")
 		fi
 		for asset_target in "${asset_targets[@]}"; do
 			archive="$(archive_name_for "$asset_target" "$asset_version")"
-			# Archive first, its checksum second: consumers that want only the
-			# archive can take the odd lines, and the pair stays adjacent.
+			# Per target: the main archive and its checksum on the first two
+			# lines (consumers index them positionally), then one asset/checksum
+			# pair per plugin in BUNDLED_PLUGINS order. Every asset is on an odd
+			# line, its .sha256 on the even line after it.
 			printf '%s\n%s\n' "$archive" "$archive.sha256"
+			for asset_lang in "${BUNDLED_PLUGINS[@]}"; do
+				plugin_asset="$(plugin_asset_name_for "$asset_target" "$asset_version" "$asset_lang")"
+				printf '%s\n%s\n' "$plugin_asset" "$plugin_asset.sha256"
+			done
 		done
 		return 0
 		;;
@@ -359,7 +424,7 @@ main() {
 		return 0
 		;;
 	-*)
-		die "unknown flag: $1 (try --list, --version, --asset-names, --stage-dir)"
+		die "unknown flag: $1 (try --list, --version, --plugins, --asset-names, --stage-dir)"
 		;;
 	esac
 

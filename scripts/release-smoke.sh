@@ -49,14 +49,24 @@
 # .github/workflows/release.yml's header on `ort`/`ring`). Re-test it by hand
 # if the TLS or certificate story changes, not on every release.
 #
-# Usage: scripts/release-smoke.sh <stage_dir> <target>
+# With an asset directory, a second leg runs the same reindex from the
+# per-plugin release assets instead of the bundled plugins: a copy of the
+# stage with `plugins/` emptied, then every plugin asset build-targets.sh
+# names for <target> unpacked into it, with discovery pinned to that
+# directory (G_MESH_PLUGIN_ROOTS_OVERRIDE). That leg requires `plugins list` to
+# show every bundled language before reindexing, so a missing or broken asset
+# fails it even where the per-language sqlite3 check is skipped.
+#
+# Usage: scripts/release-smoke.sh <stage_dir> <target> [<asset_dir>]
 #   stage_dir  the unpacked staging directory build-targets.sh leaves on disk
 #              after packaging, e.g. dist/g-mesh-v2.7.0-x86_64-apple-darwin
 #              (get it with `bash scripts/build-targets.sh --stage-dir
 #              <target>` so the path is computed the one way this repo
 #              computes it, not retyped here)
-#   target     the Rust target triple, only to decide the binary's name
-#              (g-mesh vs g-mesh.exe)
+#   target     the Rust target triple: decides the binary's name (g-mesh vs
+#              g-mesh.exe) and which plugin assets the second leg unpacks
+#   asset_dir  optional: the directory holding the plugin assets (dist/);
+#              when given, the plugin-asset leg runs after the bundled one
 
 set -euo pipefail
 
@@ -72,8 +82,8 @@ log() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURE_DIR="$SCRIPT_DIR/release-smoke-fixture"
 
-if [ $# -ne 2 ]; then
-	die "usage: release-smoke.sh <stage_dir> <target>"
+if [ $# -ne 2 ] && [ $# -ne 3 ]; then
+	die "usage: release-smoke.sh <stage_dir> <target> [<asset_dir>]"
 fi
 
 [ -d "$1" ] || die "staged directory not found: $1 (did the packaging step run first?)"
@@ -84,6 +94,11 @@ fi
 # this against a real local build, where it failed exactly that way.
 stage_dir="$(cd "$1" && pwd)"
 target="$2"
+asset_dir=""
+if [ $# -eq 3 ]; then
+	[ -d "$3" ] || die "asset directory not found: $3"
+	asset_dir="$(cd "$3" && pwd)"
+fi
 
 bin_name="g-mesh"
 case "$target" in
@@ -111,44 +126,108 @@ done
 work="$(mktemp -d "${TMPDIR:-/tmp}/g-mesh-release-smoke.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
-project_dir="$work/project"
-home_dir="$work/home"
-mkdir -p "$project_dir" "$home_dir"
-cp -R "$FIXTURE_DIR"/. "$project_dir"/
-rm -f "$project_dir/README.md" # documentation only, not fixture input
+# Reindexes a fresh copy of the fixture with the binary in stage $1, under a
+# fresh G_MESH_HOME, and requires a non-empty graph (and, where sqlite3 is
+# available, nodes from every language). $2 names the leg in the log and
+# scratch dirs.
+smoke_reindex() {
+	local stage="$1" leg="$2"
+	local bin="$stage/$bin_name"
+	local project_dir home_dir output status counts_line nodes edges db ext count
+	project_dir="$work/$leg/project"
+	home_dir="$work/$leg/home"
+	mkdir -p "$project_dir" "$home_dir"
+	cp -R "$FIXTURE_DIR"/. "$project_dir"/
+	rm -f "$project_dir/README.md" # documentation only, not fixture input
 
-log "reindexing scripts/release-smoke-fixture with the staged $target binary"
-output="$(cd "$project_dir" && G_MESH_HOME="$home_dir" "$bin" reindex 2>&1)" && status=0 || status=$?
-echo "$output"
-[ "$status" -eq 0 ] || die "'$bin_name reindex' exited $status against the fixture - see output above"
+	log "reindexing scripts/release-smoke-fixture with the staged $target binary ($leg plugins)"
+	output="$(cd "$project_dir" && G_MESH_HOME="$home_dir" "$bin" reindex 2>&1)" && status=0 || status=$?
+	echo "$output"
+	[ "$status" -eq 0 ] || die "'$bin_name reindex' exited $status against the fixture - see output above"
 
-# g-mesh reindex prints "  index:   N nodes, M edges (X imports linked, Y
-# symbols linked)" - core/src/cli/reindex.rs's `render`, which has its own
-# unit tests, so a change to this format is a deliberate diff there, not
-# silent drift here.
-counts_line="$(printf '%s\n' "$output" | grep -E '^[[:space:]]*index:' || true)"
-[ -n "$counts_line" ] || die "reindex output has no 'index:' line - cannot verify node/edge counts (see output above)"
+	# g-mesh reindex prints "  index:   N nodes, M edges (X imports linked, Y
+	# symbols linked)" - core/src/cli/reindex.rs's `render`, which has its own
+	# unit tests, so a change to this format is a deliberate diff there, not
+	# silent drift here.
+	counts_line="$(printf '%s\n' "$output" | grep -E '^[[:space:]]*index:' || true)"
+	[ -n "$counts_line" ] || die "reindex output has no 'index:' line - cannot verify node/edge counts (see output above)"
 
-nodes="$(printf '%s\n' "$counts_line" | grep -oE '[0-9]+ nodes' | grep -oE '[0-9]+')"
-edges="$(printf '%s\n' "$counts_line" | grep -oE '[0-9]+ edges' | grep -oE '[0-9]+')"
-[ -n "$nodes" ] && [ -n "$edges" ] || die "could not parse node/edge counts from: $counts_line"
+	nodes="$(printf '%s\n' "$counts_line" | grep -oE '[0-9]+ nodes' | grep -oE '[0-9]+')"
+	edges="$(printf '%s\n' "$counts_line" | grep -oE '[0-9]+ edges' | grep -oE '[0-9]+')"
+	[ -n "$nodes" ] && [ -n "$edges" ] || die "could not parse node/edge counts from: $counts_line"
 
-log "reindex reported $nodes node(s), $edges edge(s)"
-[ "$nodes" -gt 0 ] || die "0 nodes indexed - the staged binary did not extract anything from the fixture"
-[ "$edges" -gt 0 ] || die "0 edges indexed - the staged binary did not link anything in the fixture"
+	log "reindex reported $nodes node(s), $edges edge(s)"
+	[ "$nodes" -gt 0 ] || die "0 nodes indexed - the staged binary did not extract anything from the fixture"
+	[ "$edges" -gt 0 ] || die "0 edges indexed - the staged binary did not link anything in the fixture"
 
-# Best-effort per-language check - see this script's header. Non-fatal to
-# skip; fatal if it runs and finds a language with nothing to show for it.
-db="$(find "$home_dir/projects" -maxdepth 2 -name 'index.db' -print -quit 2>/dev/null || true)"
-if command -v sqlite3 >/dev/null 2>&1 && [ -n "$db" ]; then
-	log "per-language check: querying $db"
-	for ext in go rs py ts; do
-		count="$(sqlite3 "$db" "SELECT COUNT(*) FROM nodes WHERE filePath LIKE '%.$ext';")"
-		log "  .$ext: $count node(s)"
-		[ "$count" -gt 0 ] || die ".$ext contributed 0 nodes - that plugin ran but extracted nothing from its own fixture file (aggregate nodes=$nodes came entirely from the other languages)"
+	# Best-effort per-language check - see this script's header. Non-fatal to
+	# skip; fatal if it runs and finds a language with nothing to show for it.
+	db="$(find "$home_dir/projects" -maxdepth 2 -name 'index.db' -print -quit 2>/dev/null || true)"
+	if command -v sqlite3 >/dev/null 2>&1 && [ -n "$db" ]; then
+		log "per-language check: querying $db"
+		for ext in go rs py ts; do
+			count="$(sqlite3 "$db" "SELECT COUNT(*) FROM nodes WHERE filePath LIKE '%.$ext';")"
+			log "  .$ext: $count node(s)"
+			[ "$count" -gt 0 ] || die ".$ext contributed 0 nodes - that plugin ran but extracted nothing from its own fixture file (aggregate nodes=$nodes came entirely from the other languages)"
+		done
+	else
+		log "per-language check skipped (sqlite3 not on PATH, or no index.db found) - relying on the aggregate nodes/edges check above only"
+	fi
+	log "PASS ($leg): $target spawned its plugins, indexed the fixture, and produced a non-empty graph ($nodes nodes, $edges edges)"
+}
+
+smoke_reindex "$stage_dir" bundled
+
+if [ -n "$asset_dir" ]; then
+	# The per-plugin assets build-targets.sh names for this target: every odd
+	# line after the main archive's pair, paired with --plugins by position.
+	langs=()
+	while IFS= read -r line; do
+		if [ -n "$line" ]; then
+			langs+=("$line")
+		fi
+	done < <(bash "$SCRIPT_DIR/build-targets.sh" --plugins)
+	names=()
+	while IFS= read -r line; do
+		if [ -n "$line" ]; then
+			names+=("$line")
+		fi
+	done < <(bash "$SCRIPT_DIR/build-targets.sh" --asset-names "$target")
+
+	assets_stage="$work/assets-stage"
+	log "plugin-asset leg: copying the stage and replacing plugins/ with the assets in $asset_dir"
+	cp -R "$stage_dir" "$assets_stage"
+	rm -rf "$assets_stage/plugins"
+	mkdir -p "$assets_stage/plugins"
+	i=0
+	for lang in "${langs[@]}"; do
+		asset="${names[$((2 + 2 * i))]}"
+		i=$((i + 1))
+		[ -f "$asset_dir/$asset" ] || die "plugin asset not found: $asset_dir/$asset"
+		log "  unpacking $asset"
+		tar -xzf "$asset_dir/$asset" -C "$assets_stage/plugins" || die "could not unpack $asset"
 	done
-else
-	log "per-language check skipped (sqlite3 not on PATH, or no index.db found) - relying on the aggregate nodes/edges check above only"
+
+	# Discovery is pinned to the unpacked assets: otherwise a language whose
+	# asset is missing would be found in ~/.g-mesh/plugins/ or in the checkout
+	# this binary was built from, and the leg would pass without it.
+	# `plugins/` beside the executable is the layout already exercised by the
+	# bundled leg; this leg proves the assets rebuild that directory.
+	roots_override="$assets_stage/plugins"
+	if command -v cygpath >/dev/null 2>&1; then
+		roots_override="$(cygpath -w "$roots_override")"
+	fi
+	export G_MESH_PLUGIN_ROOTS_OVERRIDE="$roots_override"
+
+	plugins_output="$("$assets_stage/$bin_name" plugins list 2>&1)" ||
+		die "'$bin_name plugins list' failed with the plugins unpacked from the assets: $plugins_output"
+	echo "$plugins_output"
+	for lang in "${langs[@]}"; do
+		printf '%s\n' "$plugins_output" | grep -Eq "^$lang +[0-9]" ||
+			die "the $lang plugin unpacked from its asset is not discovered (no '$lang <version>' line in plugins list)"
+	done
+
+	smoke_reindex "$assets_stage" plugin-assets
 fi
 
-log "PASS: $target's staged artifact spawned its plugins, indexed the fixture, and produced a non-empty graph ($nodes nodes, $edges edges)"
+log "PASS: $target's staged artifact spawned its plugins, indexed the fixture, and produced a non-empty graph"
