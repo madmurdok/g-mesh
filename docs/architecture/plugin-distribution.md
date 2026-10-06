@@ -173,6 +173,88 @@ regression for the most common language in the product's audience, and it is the
 price of the archive dropping by two thirds. It should be taken only with that
 sentence understood.
 
+### Measured (4.0.0, GM-327)
+
+The projection above was checked against real `--release` archives built by the
+release workflow's own script after the port (GM-326), the per-plugin assets
+(GM-353) and `plugins install/remove` (GM-331) had landed, at `release-4.0.0`
+tip `c545645`:
+
+```sh
+DIST_DIR=<scratch> bash scripts/build-targets.sh x86_64-apple-darwin   # host: smoke tests ran
+DIST_DIR=<scratch> bash scripts/build-targets.sh aarch64-apple-darwin  # cross-built on the same Mac
+find <stage> -type f -exec stat -f "%z %N" {} \;   # unpacked, per file
+stat -f "%z %N" <scratch>/*.tar.gz                  # compressed: the exact tar -czf the release uploads
+size -m plugins/<lang>/g-mesh-plugin-<lang>          # Mach-O sections, for the TS-vs-Python gap
+```
+
+`x86_64-apple-darwin` is the triple the 3.5.0 table above was measured on, so
+it is the like-for-like column. Sizes are MiB (2^20 bytes); the 3.5.0 table
+uses the same unit as far as can be told (its 8.4 for `plugins/go` matches the
+4.0.0 Go binary at 8.45 MiB, and Go was not touched).
+
+| component | 3.5.0 x86_64 | projected | 4.0.0 x86_64 | 4.0.0 aarch64 | plugin asset (.tar.gz, x86_64 / aarch64) |
+|---|---:|---:|---:|---:|---:|
+| `g-mesh` (core) | 36 | 36 | **39.4** | 35.6 | - (13.3 / 12.0 gzipped alone) |
+| `plugins/typescript` | 87 | ~5 | **8.0** | 7.8 | 2.08 / 2.00 |
+| `plugins/go` | 8.4 | 8.4 | 8.5 | 7.9 | 4.85 / 4.50 |
+| `plugins/rust` | 5.5 | 5.5 | 6.0 | 5.7 | 1.87 / 1.79 |
+| `plugins/python` | 4.9 | 4.9 | 5.3 | 5.1 | 1.81 / 1.72 |
+| total unpacked | 147 | 60-70 | **67.3** | 62.2 | |
+| main archive, compressed | 50 | ~20 | **24.0** | 22.1 | |
+
+(Licences, README and the four `plugin.toml` files add 0.1 MiB, included in
+the totals.)
+
+**Unpacked: inside the projection, at its top end.** 147 to 67.3 MiB is a 54%
+cut - not the "two thirds" the paragraph above says; that phrase was never
+consistent with its own 60-70 MB figure, which is a 52-59% cut. Three things
+put the result near 70 rather than near 60, and only one of them is the port:
+
+- **The TypeScript binary is 8.0 MiB, not the ~5 the projection borrowed from
+  `plugins/python`.** The difference is grammar tables, not code: the TS
+  plugin's `__TEXT,__const` is 3.45 MB against Python's 0.78 MB, while their
+  `__text` (machine code) is 3.05 against 2.96 MB. TypeScript links three
+  tree-sitter grammars (`typescript`, `tsx`, `javascript` - the `tsx` grammar
+  is a second full TypeScript grammar), Python links one; the
+  `libtree-sitter-typescript.a` static library alone is 2.9 MB against
+  `libtree-sitter-python.a`'s 0.47 MB. TypeScript now sits beside Go (8.5),
+  not beside Python, and will stay there for as long as it parses three
+  dialects.
+- **Core grew from 36 to 39.4 MiB between 3.5.0 and 4.0.0.** None of that is
+  the port (core does not link the plugin); it was not attributed here.
+- **Every other plugin grew 0.4-0.7 MiB** over the same releases.
+
+**Compressed: short of the projection.** 50 to 24.0 MiB is a 52% cut against
+the ~60% that "roughly 20 MB" implied. The projection scaled the 3.5.0
+compression ratio (147:50, 2.9x), but that ratio was flattered by the SEA's
+embedded JavaScript, which compresses far better than machine code; four
+native binaries and core compress 2.8x. Core alone is 13.3 MiB of the 24, so
+no plugin change can bring the main archive near 20 - only core can.
+
+**What a user installs for one language** is now small: a per-plugin asset is
+1.8-2.1 MiB for TypeScript, Rust and Python, 4.9 MiB for Go (Go's semantic
+tier is compiled in).
+
+**The price, measured rather than projected.** The archive no longer contains
+anything that can answer a TypeScript semantic question. The plugin resolves
+`vtsls` at run time (`plugins/typescript/plugin.toml`, `[plugin.semantic]`):
+`vtsls` on `PATH`, then the project's own `node_modules/.bin`, then
+`npx --yes --package @vtsls/language-server vtsls`. So in practice:
+
+- with `vtsls` installed, or Node and network for `npx`, TypeScript keeps a
+  semantic tier - but it is now a program g-mesh does not ship or pin, and the
+  `npx` path fetches it from the npm registry on first use;
+- with **no Node at all** (or `npx` with no network), TypeScript is structural
+  only: receiver calls (`x.foo()`) stay unresolved and are reported in
+  `untypedCalls`, so `find_callers` on a method reached through a variable
+  under-reports, and the instructions say so. In 3.5.0 that same user had full
+  semantics with nothing installed.
+
+That second case is the regression the paragraph above warned about, and the
+numbers say what it bought: 79.7 MiB unpacked and 26 MiB compressed off every
+download, about 54% and 52%.
+
 ### The two decisions that depend on each other
 
 Per-language degradation (below) is **only safe because** the instructions
@@ -214,6 +296,10 @@ graph TD
     core -->|"names a language it has<br/>no plugin for"| cat
     cat -->|"feeds the<br/>absent-plugin state"| instr["mcp::instructions::build"]
 ```
+
+The sizes in the diagram are the design-time projection; the measured 4.0.0
+sizes (67.3 MiB unpacked on x86_64, TypeScript at 8.0 MiB) are in
+"Measured (4.0.0, GM-327)" above.
 
 **The language catalogue is the one genuinely new component.** Core must be able
 to name a language it has *no plugin for* - otherwise the absent-plugin state
