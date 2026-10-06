@@ -5,11 +5,14 @@
 //! from one `GROUP BY` or one `COUNT`, without the rows nobody asked for.
 
 use anyhow::Context;
+use rmcp::model::CallToolResult;
+use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::graph::pagination::{self, Direction, FileTally};
 
+use super::tool_result::success;
 use super::{anchor, Answer};
 
 /// Wire shape of a non-row answer. `D` is the tool's own response-level
@@ -17,25 +20,67 @@ use super::{anchor, Answer};
 /// flattened in so they keep the field names the row answer gives them.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct Summary<D: Serialize> {
-    pub anchor: anchor::AnchorInfo,
+struct Summary<'a, D: Serialize> {
+    anchor: &'a anchor::AnchorInfo,
     /// Exact number of matching rows over the whole set.
-    pub total: usize,
+    total: usize,
     /// How many of `total` the linker could not confirm. `count` only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub unresolved: Option<usize>,
+    unresolved: Option<usize>,
     /// Every file holding a match, with its count. `files` only, and sent
     /// there even when empty: it is the answer.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub files: Option<Vec<FileTally>>,
-    /// Present only when the tally's entry cap left files out, which the
-    /// caller could otherwise see only by summing `refs` against `total`.
+    files: Option<&'a [FileTally]>,
+    /// Present only when the tally's entry cap or the response's byte
+    /// ceiling left files out, which the caller could otherwise see only by
+    /// summing `refs` against `total`.
     #[serde(skip_serializing_if = "is_false")]
-    pub files_truncated: bool,
+    files_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
+    hint: Option<String>,
     #[serde(flatten)]
-    pub disclosures: D,
+    disclosures: D,
+}
+
+/// The [`Summary`] for `counted`, with `files` cut to what fits
+/// `pagination::MAX_RESPONSE_BYTES` beside everything else the response
+/// carries. `tail(files, send)` returns the hint and disclosures for a
+/// response naming `files`; `send` is false while candidates are measured and
+/// true for the one sent, so a once-per-session hint is spent only there.
+pub(super) fn respond<D: Serialize>(
+    anchor: &anchor::AnchorInfo,
+    counted: &Counted,
+    mut tail: impl FnMut(Option<&[FileTally]>, bool) -> (Option<String>, D),
+) -> Result<CallToolResult, ErrorData> {
+    let mut build = |budget: usize, send: bool| {
+        let mut files = counted.files.clone();
+        let cut = files.as_mut().is_some_and(|files| pagination::truncate_to_bytes(files, budget));
+        let (hint, disclosures) = tail(files.as_deref(), send);
+        let bytes = pagination::wire_len(&Summary {
+            anchor,
+            total: counted.total,
+            unresolved: counted.unresolved,
+            files: files.as_deref(),
+            files_truncated: counted.files_truncated || cut,
+            hint: hint.clone(),
+            disclosures: &disclosures,
+        });
+        (files, cut, hint, disclosures, bytes)
+    };
+    let budget = pagination::fit_budget(|budget| {
+        let (files, _, _, _, bytes) = build(budget, false);
+        (files.as_deref().map_or(0, pagination::wire_len), bytes)
+    });
+    let (files, cut, hint, disclosures, _) = build(budget, true);
+    success(&Summary {
+        anchor,
+        total: counted.total,
+        unresolved: counted.unresolved,
+        files: files.as_deref(),
+        files_truncated: counted.files_truncated || cut,
+        hint,
+        disclosures,
+    })
 }
 
 /// The counted part of a [`Summary`], before the tool attaches its anchor,

@@ -24,7 +24,8 @@ pub fn resolve_page_size(limit: Option<u32>) -> usize {
 }
 
 /// Ceiling on a single MCP tool response body, in serialized-JSON bytes of
-/// its `results` array. `MAX_PAGE_SIZE` bounds *row count*, but the thing
+/// the whole response: rows, tallies, hints and every other field.
+/// `MAX_PAGE_SIZE` bounds *row count*, but the thing
 /// that actually gets a call rejected is bytes: a `find_references` call
 /// with `limit: 200` measured at 54,600 characters, and a `get_dependencies`
 /// walk at its old defaults measured at 115,863, both came back rejected
@@ -64,6 +65,7 @@ pub const FILE_KIND: &str = "File";
 /// resolving its other endpoint into a wire-shaped `T`), carrying back the
 /// edge's [`EdgeRank`] so [`bound_page`] can rebuild the exact cursor
 /// `paginate_edges` would have produced had its SQL page ended right there.
+#[derive(Clone)]
 pub struct EdgeRow<T> {
     pub item: T,
     pub rank: EdgeRank,
@@ -126,21 +128,77 @@ pub fn bound_page<T: Serialize>(
     bound_page_within(rows, has_more, next_cursor, MAX_RESPONSE_BYTES)
 }
 
-/// [`bound_page`] leaving `reserve` bytes of [`MAX_RESPONSE_BYTES`] free for
-/// response-level fields the caller attaches after the cut.
-pub fn bound_page_leaving<T: Serialize>(
+/// Serialized JSON length of `value`, the unit every byte budget here is in.
+pub fn wire_len<T: Serialize + ?Sized>(value: &T) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// The largest byte budget for a response's one growable part (its rows, or
+/// a tally that is itself the answer) at which the whole response fits
+/// [`MAX_RESPONSE_BYTES`].
+///
+/// `measure(budget)` builds the response with that part cut to `budget`
+/// bytes and returns `(part bytes, whole response bytes)`. The rest of the
+/// response is measured, never estimated: it may change with the cut (a cut
+/// page gains `total` and a cursor, a dropped row can return a file to a
+/// tally), and each round lowers the budget by the overshoot just measured.
+/// The budget only falls, and a part that stops shrinking is at its floor
+/// (one row, or an empty tally), so the search ends; the response then
+/// exceeds the ceiling only when that floor alone and the response's other
+/// fields do, which their own byte caps rule out for any input but a single
+/// row or anchor that is itself near the ceiling.
+pub fn fit_budget(mut measure: impl FnMut(usize) -> (usize, usize)) -> usize {
+    let mut budget = MAX_RESPONSE_BYTES;
+    let mut last_part = usize::MAX;
+    loop {
+        let (part, whole) = measure(budget);
+        if whole <= MAX_RESPONSE_BYTES || part >= last_part || budget == 0 {
+            return budget;
+        }
+        last_part = part;
+        budget = budget.min(part).saturating_sub(whole - MAX_RESPONSE_BYTES);
+    }
+}
+
+/// [`bound_page`] for a page that is one field of a larger response:
+/// `response_len` serializes the response a candidate page would produce, and
+/// the rows are cut until that whole response fits [`MAX_RESPONSE_BYTES`]
+/// (see [`fit_budget`]). A page whose response already fits is returned
+/// unchanged.
+pub fn bound_page_in_response<T: Serialize + Clone>(
     rows: Vec<EdgeRow<T>>,
     has_more: bool,
     next_cursor: Option<String>,
-    reserve: usize,
+    mut response_len: impl FnMut(&Page<T>) -> usize,
 ) -> Page<T> {
-    bound_page_within(rows, has_more, next_cursor, MAX_RESPONSE_BYTES - reserve)
+    let budget = fit_budget(|budget| {
+        let page = bound_page_within(rows.clone(), has_more, next_cursor.clone(), budget);
+        (wire_len(&page.results), response_len(&page))
+    });
+    bound_page_within(rows, has_more, next_cursor, budget)
 }
 
-/// [`bound_page`] with the byte budget spelled out, so a response that also
-/// carries a `files` tally can hold part of [`MAX_RESPONSE_BYTES`] back for
-/// it (see [`bound_page_reserving_tally`]) instead of the two sections
-/// separately each believing they own the whole ceiling.
+/// A page's `total` as measured for a candidate page: present exactly when
+/// the sent page's is (`has_more`), at the widest value a count can take, so
+/// the page sent is never longer than the one measured.
+pub fn widest_total(has_more: bool) -> Option<usize> {
+    has_more.then_some(usize::MAX)
+}
+
+/// Cuts `items` to the longest prefix whose serialized array fits `max_bytes`,
+/// possibly to nothing. True when anything was cut.
+pub fn truncate_to_bytes<T: Serialize>(items: &mut Vec<T>, max_bytes: usize) -> bool {
+    let Some(mut keep) = longest_prefix_fitting(items, max_bytes) else {
+        return false;
+    };
+    if wire_len(&items[..keep]) > max_bytes {
+        keep = 0;
+    }
+    items.truncate(keep);
+    true
+}
+
+/// [`bound_page`] with the byte budget for the `results` array spelled out.
 fn bound_page_within<T: Serialize>(
     rows: Vec<EdgeRow<T>>,
     has_more: bool,
@@ -304,7 +362,7 @@ pub enum Direction {
 /// on a 50-file tally the longer spelling costs ~600 bytes of pure key text
 /// for no information. The values are unambiguous without it; a tally entry
 /// can only ever be a path and a count.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct FileTally {
     pub path: String,
     pub refs: i64,
@@ -312,16 +370,15 @@ pub struct FileTally {
 
 /// Ceiling on how many entries [`tally_edge_files`] returns. Well above the
 /// widest fan-out the benchmark corpus produces (excalidraw's `pointFrom`,
-/// ~52 referencing files), and at ~40 bytes an entry a full 200 still stays
-/// inside [`FILE_TALLY_RESERVE`].
+/// ~52 referencing files).
 const MAX_FILE_TALLY: usize = 200;
 
-/// Byte budget [`bound_page_reserving_tally`] holds back from
-/// [`MAX_RESPONSE_BYTES`] for a `files` tally, so a response carrying both a
-/// tally and rows never grows past the same total ceiling a rows-only
-/// response already respects. Sized for [`MAX_FILE_TALLY`] entries at typical
-/// path lengths.
-pub const FILE_TALLY_RESERVE: usize = 8_000;
+/// Ceiling on a row page's `files` tally in serialized bytes, applied after
+/// [`MAX_FILE_TALLY`] (see [`tally_edge_files_bounded`]). Together with
+/// [`EXCLUDED_TALLY_MAX_BYTES`] and the other disclosures' caps it keeps a
+/// response's non-row fields well inside [`MAX_RESPONSE_BYTES`], so rows
+/// always have room.
+pub const FILE_TALLY_MAX_BYTES: usize = 8_000;
 
 /// Ceiling on how many files the excluded-references tally on
 /// `find_callers`/`find_callees` names.
@@ -335,10 +392,10 @@ pub const FILE_TALLY_RESERVE: usize = 8_000;
 /// order [`MAX_FILE_TALLY`] leaves over its own worst case.
 pub const MAX_EXCLUDED_FILE_TALLY: usize = 50;
 
-/// Byte budget held back for the excluded-references tally, on the same rule
-/// and at the same ~40-bytes-an-entry sizing as [`FILE_TALLY_RESERVE`], scaled
-/// to [`MAX_EXCLUDED_FILE_TALLY`].
-pub const EXCLUDED_TALLY_RESERVE: usize = 2_000;
+/// Ceiling on the excluded-references tally's `files` in serialized bytes, a
+/// quarter of [`FILE_TALLY_MAX_BYTES`] on the same rule as
+/// [`MAX_EXCLUDED_FILE_TALLY`].
+pub const EXCLUDED_TALLY_MAX_BYTES: usize = 2_000;
 
 /// Every distinct file that holds one of the edges [`paginate_edges`] would
 /// match for the same anchor/direction/kind/scope, with a per-file count -
@@ -363,6 +420,30 @@ pub fn tally_edge_files(
     file_paths: &[&str],
 ) -> Result<Vec<FileTally>> {
     tally_edge_files_limited(conn, anchor_node_id, direction, edge_kinds, file_paths, MAX_FILE_TALLY)
+}
+
+/// [`tally_edge_files`] for a row page's `files` field: capped at
+/// [`MAX_FILE_TALLY`] entries and [`FILE_TALLY_MAX_BYTES`] bytes, with
+/// whether either cap left files out.
+pub fn tally_edge_files_bounded(
+    conn: &Connection,
+    anchor_node_id: &str,
+    direction: Direction,
+    edge_kinds: &[&str],
+    file_paths: &[&str],
+) -> Result<(Vec<FileTally>, bool)> {
+    let mut files = tally_edge_files_limited(
+        conn,
+        anchor_node_id,
+        direction,
+        edge_kinds,
+        file_paths,
+        MAX_FILE_TALLY + 1,
+    )?;
+    let over_count = files.len() > MAX_FILE_TALLY;
+    files.truncate(MAX_FILE_TALLY);
+    let over_bytes = truncate_to_bytes(&mut files, FILE_TALLY_MAX_BYTES);
+    Ok((files, over_count || over_bytes))
 }
 
 /// [`tally_edge_files`] with the entry cap named by the caller instead of
@@ -446,10 +527,6 @@ pub fn count_edges(
     Ok(count_edges_by_resolution(conn, anchor_node_id, direction, edge_kinds, file_paths)?.total)
 }
 
-/// Bytes held back for a `total` field on a truncated page: `,"total":` plus
-/// a count of up to ten digits.
-pub const TOTAL_RESERVE: usize = 20;
-
 /// [`count_edges`]' whole-set count, with how many of those edges the linker
 /// left unresolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,53 +599,6 @@ pub fn count_edges_by_resolution(
 /// row list is already the whole answer.
 pub fn tally_is_worth_sending(row_count: usize, tally: &[FileTally], has_more: bool) -> bool {
     has_more || row_count > tally.len()
-}
-
-/// [`bound_page`], but leaving [`FILE_TALLY_RESERVE`] bytes of the response
-/// budget free for a `files` tally the caller is about to attach. Rows are
-/// still what gets cut - a tally is bounded by [`MAX_FILE_TALLY`] and never
-/// grows without bound, while rows do. `extra_reserve` is held back on top,
-/// for another bounded response-level field.
-pub fn bound_page_reserving_tally<T: Serialize>(
-    rows: Vec<EdgeRow<T>>,
-    has_more: bool,
-    next_cursor: Option<String>,
-    extra_reserve: usize,
-) -> Page<T> {
-    bound_page_leaving(rows, has_more, next_cursor, FILE_TALLY_RESERVE + extra_reserve)
-}
-
-/// [`bound_page_reserving_tally`] for a response that may carry *two* tallies:
-/// the `files` one and the excluded-references one. Both reserves come off the
-/// same [`MAX_RESPONSE_BYTES`] ceiling, so the total a caller page can reach is
-/// unchanged from before the second tally existed - what shrinks is the share
-/// left for rows, which are the part that grows without bound and therefore the
-/// right part to cut. `extra_reserve` as in [`bound_page_reserving_tally`].
-pub fn bound_page_reserving_two_tallies<T: Serialize>(
-    rows: Vec<EdgeRow<T>>,
-    has_more: bool,
-    next_cursor: Option<String>,
-    extra_reserve: usize,
-) -> Page<T> {
-    bound_page_leaving(
-        rows,
-        has_more,
-        next_cursor,
-        FILE_TALLY_RESERVE + EXCLUDED_TALLY_RESERVE + extra_reserve,
-    )
-}
-
-/// [`bound_page`] leaving room for an excluded-references tally alone - the
-/// callee side, which has no `files` tally of its own (see `CallerPage::files`
-/// for why that asymmetry is deliberate). `extra_reserve` as in
-/// [`bound_page_reserving_tally`].
-pub fn bound_page_reserving_excluded_tally<T: Serialize>(
-    rows: Vec<EdgeRow<T>>,
-    has_more: bool,
-    next_cursor: Option<String>,
-    extra_reserve: usize,
-) -> Page<T> {
-    bound_page_leaving(rows, has_more, next_cursor, EXCLUDED_TALLY_RESERVE + extra_reserve)
 }
 
 /// An edge alongside the [`EdgeRank`] [`paginate_edges`] already computed

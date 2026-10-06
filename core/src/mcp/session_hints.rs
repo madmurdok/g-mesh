@@ -31,6 +31,27 @@ impl SessionHints {
     pub(crate) fn once(&self, trigger: bool, key: HintKey, sentence: &'static str) -> Option<&'static str> {
         (trigger && self.0.lock().unwrap_or_else(PoisonError::into_inner).insert(key)).then_some(sentence)
     }
+
+    /// What [`Self::once`] would return now, without recording anything: for
+    /// measuring a candidate response before the one that is sent.
+    pub(crate) fn peek(&self, trigger: bool, key: HintKey, sentence: &'static str) -> Option<&'static str> {
+        (trigger && !self.0.lock().unwrap_or_else(PoisonError::into_inner).contains(&key)).then_some(sentence)
+    }
+
+    /// [`Self::once`] when `send`, otherwise [`Self::peek`].
+    pub(crate) fn offer(
+        &self,
+        send: bool,
+        trigger: bool,
+        key: HintKey,
+        sentence: &'static str,
+    ) -> Option<&'static str> {
+        if send {
+            self.once(trigger, key, sentence)
+        } else {
+            self.peek(trigger, key, sentence)
+        }
+    }
 }
 
 /// The sentences present, in order, as one `hint` value; `None` when none is.

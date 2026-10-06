@@ -1097,7 +1097,11 @@ whole set's per-file tally and `total`) or `count` (no rows and no files;
 `total` and `unresolved`). It answers "which files" and "is it called at all"
 without the evidence. A `rows` page that is truncated (`hasMore`) carries
 `total`, the exact size of the whole set, and omits it when the page is
-complete. `limit: 0` is not an answer mode and keeps its meaning.
+complete. `limit: 0` is not an answer mode and keeps its meaning. Every file
+tally a response carries (`files`, and the `files` of `excludedReferences`,
+`unlinkedUsages` and `untypedReceiverCalls`) is capped by entries and by
+bytes; one a cap cut sets `filesTruncated: true` beside it (absent otherwise),
+on a `rows` page as on the `files` answer, while counts stay exact.
 
 `find_references`/`find_callers`/`find_callees`/`find_implementations` also
 accept an optional `limit` (default 20, capped at 200) to raise the page
@@ -1160,7 +1164,12 @@ close to this size, so the limit is external and not g-mesh's to learn
 exactly - the fix is to stay well under it by construction:
 `pagination::MAX_RESPONSE_BYTES` (20,000 bytes, comfortably under the
 smallest observed real rejection) bounds every list-shaped tool response's
-serialized size, truncating to the longest row prefix that still fits.
+serialized size, truncating to the longest row prefix that still fits. On
+`find_references`/`find_callers`/`find_callees`/`find_implementations` the
+bound is on the whole response, not only its rows: each candidate page's
+complete response is measured and rows are cut until it fits, and the
+non-row fields stay small enough to leave rows room because every list among
+them is byte-capped (the `files` answer instead cuts its tally to fit).
 Continuation for a `responseSize` cut reuses the `explorationBudget` arm's
 own `resumeToken` mechanism exactly (opaque token, cumulative across a resume
 chain) rather than a separate scheme, so a caller does not need to

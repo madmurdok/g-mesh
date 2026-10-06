@@ -160,10 +160,10 @@
 //! `,"provenance":{"language":"rust","semanticTier":"absent"}` - 56 bytes at
 //! its widest for a bundled language. The block itself is bounded (a language
 //! id plus a closed enum), unlike a tally. What a degraded response holds back
-//! from its page budget ([`Resolved::page_reserve`]) is the once-per-session
-//! [`session_hints::PROVENANCE`] hint that may ride with it; a pending one
-//! also holds back [`PENDING_FILES_RESERVE`] for its file list. A response
-//! with no `provenance` reserves nothing and pages exactly as before.
+//! from its page budget is the once-per-session [`session_hints::PROVENANCE`]
+//! hint that may ride with it and, when pending, its file list, which
+//! [`PENDING_FILES_MAX_BYTES`] caps. A response with no `provenance` pages
+//! exactly as before.
 
 use std::collections::HashMap;
 
@@ -171,17 +171,19 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::daemon::manifest::Capabilities;
+use crate::graph::pagination;
 use crate::storage::schema;
 
 use super::session_hints;
 
-/// At most this many files in `pendingFiles`; the rest are counted in
+/// At most this many files in `pendingFiles`, and at most
+/// [`PENDING_FILES_MAX_BYTES`] of them; the rest are counted in
 /// `pendingFilesOmitted`.
 pub(super) const MAX_PENDING_FILES: usize = 25;
 
-/// Bytes a pending response holds back from its page budget for the
-/// `provenance` block: [`MAX_PENDING_FILES`] paths at ~60 bytes each.
-pub(super) const PENDING_FILES_RESERVE: usize = 1_500;
+/// Ceiling on `pendingFiles` in serialized bytes: [`MAX_PENDING_FILES`] paths
+/// at ~60 bytes each.
+pub(super) const PENDING_FILES_MAX_BYTES: usize = 1_500;
 
 /// Which language plugin answered, and what its semantic tier contributed.
 ///
@@ -320,7 +322,7 @@ impl Resolved {
     pub(super) fn page_reserve(&self) -> usize {
         let hint = session_hints::PROVENANCE.len() + r#","hint":"""#.len() + 1;
         match self {
-            Resolved::Pending { .. } => PENDING_FILES_RESERVE + hint,
+            Resolved::Pending { .. } => PENDING_FILES_MAX_BYTES + hint,
             Resolved::Absent => hint,
             Resolved::Silent => 0,
         }
@@ -354,8 +356,10 @@ impl Resolved {
                 pending.insert(0, anchor);
             }
         }
-        let omitted = pending.len().saturating_sub(MAX_PENDING_FILES);
+        let found = pending.len();
         pending.truncate(MAX_PENDING_FILES);
+        pagination::truncate_to_bytes(&mut pending, PENDING_FILES_MAX_BYTES);
+        let omitted = found - pending.len();
         Some(Provenance {
             language: language.to_string(),
             semantic_tier: SemanticTier::Pending,

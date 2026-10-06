@@ -17,6 +17,7 @@ use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
+use crate::storage::write::NodeRecord;
 
 use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
@@ -55,7 +56,7 @@ const USAGE_EDGE_KINDS: &[&str] = &["CALLS", "REFERENCES", "SUPERTYPE_OF"];
 /// JSON entirely via `skip_serializing_if`, never emitted as `null` or `0` -
 /// exactly when `kind` is [`pagination::FILE_KIND`]; see that constant's doc
 /// comment for why both are pure redundancy on a `File`-kind row.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReferenceSite {
     referencing_symbol_id: String,
@@ -79,12 +80,12 @@ struct ReferenceSite {
 /// them agree on an item type.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ReferencePage {
+struct ReferencePage<'a> {
     /// See `anchor::AnchorInfo` - what `symbol_id`/`symbol_name` resolved to,
     /// so a caller asking about usages "elsewhere" doesn't need a separate
     /// `find_definition` call just to learn the anchor's own file/line.
-    anchor: anchor::AnchorInfo,
-    results: Vec<ReferenceSite>,
+    anchor: &'a anchor::AnchorInfo,
+    results: &'a [ReferenceSite],
     /// Every file holding a reference to the anchor, with a per-file count,
     /// computed over the whole edge set rather than this page - see
     /// `pagination::tally_edge_files`. Present only when it says something
@@ -93,13 +94,18 @@ struct ReferencePage {
     /// not sent as an empty array - otherwise, so an exact narrow lookup's
     /// response is byte-for-byte what it was before this field existed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    files: Option<Vec<pagination::FileTally>>,
+    files: Option<&'a [pagination::FileTally]>,
+    /// Present only when `files` leaves files out, cut by its entry or byte
+    /// cap (`pagination::tally_edge_files_bounded`); absent, not `false`,
+    /// otherwise.
+    #[serde(skip_serializing_if = "answer::is_false")]
+    files_truncated: bool,
     /// Exact number of references over the whole set. Present only when
     /// `has_more`: on a complete page it is `results.len()`.
     #[serde(skip_serializing_if = "Option::is_none")]
     total: Option<usize>,
     has_more: bool,
-    next_cursor: Option<String>,
+    next_cursor: Option<&'a str>,
     /// See `Page::all_unresolved` - true when every reference in `results`
     /// came from an edge the linker couldn't confirm.
     all_unresolved: bool,
@@ -110,12 +116,12 @@ struct ReferencePage {
     /// See [`UnlinkedUsages`] - usages that may target the anchor but that
     /// the linker left on a placeholder. Absent when there is no candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
-    unlinked_usages: Option<UnlinkedUsages>,
+    unlinked_usages: Option<&'a UnlinkedUsages>,
     /// See [`UntypedReceiverCalls`] - functions calling a method of the
     /// anchor's name through a receiver whose type was not inferred, with no
     /// edge to the anchor yet. Absent when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    untyped_receiver_calls: Option<UntypedReceiverCalls>,
+    untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
     /// See `super::provenance` - present only when the anchor's language
     /// declares a semantic tier that has not completed for this project, so
     /// this answer came from its structural tier alone. Absent (not `null`,
@@ -129,19 +135,21 @@ struct ReferencePage {
 /// the non-row answers (`answer::Summary`).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ReferenceDisclosures {
+struct ReferenceDisclosures<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    unlinked_usages: Option<UnlinkedUsages>,
+    unlinked_usages: Option<&'a UnlinkedUsages>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    untyped_receiver_calls: Option<UntypedReceiverCalls>,
+    untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
 }
 
 /// Paginates the incoming `USAGE_EDGE_KINDS` edges for `anchor_id` and
-/// resolves each one to its referencing node. Split out from `handle` so
-/// tests can drive it with a small `page_size` without needing a page-size
-/// field on the public tool parameters.
+/// resolves each one to its referencing node, cut so that the response
+/// `response_len` measures for a candidate page fits
+/// `pagination::MAX_RESPONSE_BYTES`. Split out from `handle` so tests can
+/// drive it with a small `page_size` without needing a page-size field on
+/// the public tool parameters.
 fn list_references(
     conn: &Connection,
     anchor_id: &str,
@@ -149,7 +157,7 @@ fn list_references(
     file_paths: &[&str],
     page_size: usize,
     cursor: Option<&str>,
-    extra_reserve: usize,
+    response_len: impl FnMut(&pagination::Page<ReferenceSite>) -> usize,
 ) -> anyhow::Result<pagination::Page<ReferenceSite>> {
     let page = pagination::paginate_edges(
         conn,
@@ -187,7 +195,7 @@ fn list_references(
         });
     }
 
-    Ok(pagination::bound_page_reserving_tally(rows, page.has_more, page.next_cursor, extra_reserve))
+    Ok(pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
 }
 
 pub(crate) fn handle(
@@ -201,6 +209,80 @@ pub(crate) fn handle(
     find_definition::resolve_lazily(embedding, shapes, |semantic| {
         handle_in(store, semantic, capabilities, hints, params.clone())
     })
+}
+
+/// Everything a reference page carries besides its rows, fetched once so that
+/// candidate pages can be measured whole before one is sent.
+struct ReferenceParts<'a> {
+    conn: &'a Connection,
+    anchor: &'a NodeRecord,
+    anchor_info: anchor::AnchorInfo,
+    anchor_hint: Option<&'static str>,
+    tally: Vec<pagination::FileTally>,
+    tally_truncated: bool,
+    unlinked: Option<UnlinkedUsages>,
+    untyped: Option<UntypedReceiverCalls>,
+    tier: provenance::Resolved,
+    hints: &'a SessionHints,
+}
+
+impl ReferenceParts<'_> {
+    /// The response for `page`. `send` spends once-per-session hints; without
+    /// it they are only peeked, for measuring.
+    fn response<'p>(
+        &'p self,
+        page: &'p pagination::Page<ReferenceSite>,
+        total: Option<usize>,
+        send: bool,
+    ) -> ReferencePage<'p> {
+        let files = pagination::tally_is_worth_sending(page.results.len(), &self.tally, page.has_more)
+            .then_some(self.tally.as_slice());
+
+        // Every file this response names: rows, the tally, the unlinked and
+        // untyped tallies.
+        let touched = page
+            .results
+            .iter()
+            .map(|row| row.file_path.as_str())
+            .chain(files.into_iter().flatten().map(|tally| tally.path.as_str()))
+            .chain(self.unlinked.iter().flat_map(UnlinkedUsages::file_paths))
+            .chain(self.untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
+        let provenance = self.tier.clone().disclose(
+            self.conn,
+            &self.anchor.language,
+            Some(&self.anchor.file_path),
+            touched,
+        );
+        let has_file_row = page.results.iter().any(|row| row.kind == pagination::FILE_KIND);
+        let once = |trigger, key, sentence| self.hints.offer(send, trigger, key, sentence);
+        let hint = session_hints::join([
+            self.anchor_hint,
+            page.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
+            once(has_file_row, HintKey::FileRow, session_hints::FILE_ROW),
+            once(files.is_some(), HintKey::FilesTally, session_hints::FILES_TALLY),
+            once(
+                !page.all_unresolved && page.results.iter().any(|row| !row.resolved),
+                HintKey::UnresolvedRow,
+                session_hints::UNRESOLVED_ROW,
+            ),
+            once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+        ]);
+
+        ReferencePage {
+            anchor: &self.anchor_info,
+            results: &page.results,
+            files,
+            files_truncated: files.is_some() && self.tally_truncated,
+            total,
+            has_more: page.has_more,
+            next_cursor: page.next_cursor.as_deref(),
+            all_unresolved: page.all_unresolved,
+            hint,
+            unlinked_usages: self.unlinked.as_ref(),
+            untyped_receiver_calls: self.untyped.as_ref(),
+            provenance,
+        }
+    }
 }
 
 /// One pass of [`handle`] - see [`find_definition::SemanticRung`].
@@ -241,32 +323,47 @@ pub(crate) fn handle_in(
     )
     .map_err(|e| internal_error("failed to count references", e))?;
     if let Some(counted) = counted {
-        let touched = counted
-            .files
-            .iter()
-            .flatten()
-            .map(|tally| tally.path.as_str())
-            .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths))
-            .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
-        let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
-        let hint = session_hints::join([
-            hint,
-            hints.once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
-        ]);
-        return success(&answer::Summary {
-            anchor: anchor_info,
-            total: counted.total,
-            unresolved: counted.unresolved,
-            files: counted.files,
-            files_truncated: counted.files_truncated,
-            hint,
-            disclosures: ReferenceDisclosures {
-                unlinked_usages: unlinked,
-                untyped_receiver_calls: untyped,
+        return answer::respond(&anchor_info, &counted, |files, send| {
+            let touched = files
+                .into_iter()
+                .flatten()
+                .map(|tally| tally.path.as_str())
+                .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths))
+                .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
+            let provenance = tier.clone().disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
+            let hint = session_hints::join([
+                hint,
+                hints.offer(send, provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+            ]);
+            let disclosures = ReferenceDisclosures {
+                unlinked_usages: unlinked.as_ref(),
+                untyped_receiver_calls: untyped.as_ref(),
                 provenance,
-            },
+            };
+            (hint, disclosures)
         });
     }
+
+    let (tally, tally_truncated) = pagination::tally_edge_files_bounded(
+        &conn,
+        &anchor.id,
+        Direction::Incoming,
+        USAGE_EDGE_KINDS,
+        &file_paths,
+    )
+    .map_err(|e| internal_error("failed to tally referencing files", e))?;
+    let parts = ReferenceParts {
+        conn: &conn,
+        anchor: &anchor,
+        anchor_info,
+        anchor_hint: hint,
+        tally,
+        tally_truncated,
+        unlinked,
+        untyped,
+        tier,
+        hints,
+    };
 
     let page = list_references(
         &conn,
@@ -275,10 +372,13 @@ pub(crate) fn handle_in(
         &file_paths,
         page_size,
         params.cursor.as_deref(),
-        tier.page_reserve()
-            + pagination::TOTAL_RESERVE
-            + UnlinkedUsages::wire_len(&unlinked, "unlinkedUsages")
-            + UntypedReceiverCalls::wire_len(&untyped, untyped::FIELD),
+        |candidate| {
+            pagination::wire_len(&parts.response(
+                candidate,
+                pagination::widest_total(candidate.has_more),
+                false,
+            ))
+        },
     )
     .map_err(|e| internal_error("failed to find references", e))?;
     let total = page
@@ -289,49 +389,7 @@ pub(crate) fn handle_in(
         .transpose()
         .map_err(|e| internal_error("failed to count references", e))?;
 
-    let tally =
-        pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, USAGE_EDGE_KINDS, &file_paths)
-            .map_err(|e| internal_error("failed to tally referencing files", e))?;
-    let files =
-        pagination::tally_is_worth_sending(page.results.len(), &tally, page.has_more).then_some(tally);
-
-    // Every file this response names: rows, the tally, the unlinked and
-    // untyped tallies.
-    let touched = page
-        .results
-        .iter()
-        .map(|row| row.file_path.as_str())
-        .chain(files.iter().flatten().map(|tally| tally.path.as_str()))
-        .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths))
-        .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
-    let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
-    let has_file_row = page.results.iter().any(|row| row.kind == pagination::FILE_KIND);
-    let hint = session_hints::join([
-        hint,
-        page.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
-        hints.once(has_file_row, HintKey::FileRow, session_hints::FILE_ROW),
-        hints.once(files.is_some(), HintKey::FilesTally, session_hints::FILES_TALLY),
-        hints.once(
-            !page.all_unresolved && page.results.iter().any(|row| !row.resolved),
-            HintKey::UnresolvedRow,
-            session_hints::UNRESOLVED_ROW,
-        ),
-        hints.once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
-    ]);
-
-    success(&ReferencePage {
-        anchor: anchor_info,
-        results: page.results,
-        files,
-        total,
-        has_more: page.has_more,
-        next_cursor: page.next_cursor,
-        all_unresolved: page.all_unresolved,
-        hint,
-        unlinked_usages: unlinked,
-        untyped_receiver_calls: untyped,
-        provenance,
-    })
+    success(&parts.response(&page, total, true))
 }
 
 #[cfg(test)]
@@ -439,7 +497,8 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = list_references(&conn, "target", "target.rs", &[], 1, cursor.as_deref(), 0).unwrap();
+            let page =
+                list_references(&conn, "target", "target.rs", &[], 1, cursor.as_deref(), |_| 0).unwrap();
             assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one result per page");
             seen.extend(page.results.into_iter().map(|r| r.referencing_symbol_id));
             if !page.has_more {
@@ -751,7 +810,7 @@ mod tests {
         upsert_edge(&mut conn, EdgeRecord::new("e_sub", "sub", "base", "SUPERTYPE_OF", "tree-sitter", true))
             .unwrap();
 
-        let page = list_references(&conn, "base", "base.ts", &[], 10, None, 0).unwrap();
+        let page = list_references(&conn, "base", "base.ts", &[], 10, None, |_| 0).unwrap();
         assert_eq!(page.results.len(), 1);
         assert_eq!(page.results[0].referencing_symbol_id, "sub");
         assert_eq!(page.results[0].reference_kind, "SUPERTYPE_OF");
@@ -866,7 +925,7 @@ mod tests {
         upsert_edge(&mut conn, EdgeRecord::new("e_exp", "file", "target", "EXPORTS", "tree-sitter", true))
             .unwrap();
 
-        let page = list_references(&conn, "target", "tasks.ts", &[], 10, None, 0).unwrap();
+        let page = list_references(&conn, "target", "tasks.ts", &[], 10, None, |_| 0).unwrap();
         assert!(page.results.is_empty(), "a symbol's own declaration site is not a reference to it");
     }
 
@@ -905,7 +964,8 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = list_references(&conn, "target", "target.ts", &[], 1, cursor.as_deref(), 0).unwrap();
+            let page =
+                list_references(&conn, "target", "target.ts", &[], 1, cursor.as_deref(), |_| 0).unwrap();
             assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one result per page");
             seen.extend(page.results.into_iter().map(|r| r.referencing_symbol_id));
             if !page.has_more {
