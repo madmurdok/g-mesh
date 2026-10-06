@@ -131,15 +131,13 @@ fn list_implementations(
     .context("failed to paginate SUPERTYPE_OF edges")?;
 
     let mut rows = Vec::with_capacity(page.results.len());
-    for pagination::ScoredEdge { edge, locality } in page.results {
+    for pagination::ScoredEdge { edge, rank } in page.results {
         let implementing = queries::get_node(conn, &edge.from_id)
             .context("failed to resolve implementing node")?
             .with_context(|| format!("edge {} points at missing node {}", edge.id, edge.from_id))?;
         let is_file = implementing.kind == pagination::FILE_KIND;
         rows.push(pagination::EdgeRow {
-            resolved: edge.resolved,
-            locality,
-            edge_id: edge.id.clone(),
+            rank,
             item: ImplementationSite {
                 implementing_symbol_id: implementing.id,
                 qualified_name: (!is_file).then_some(implementing.qualified_name),

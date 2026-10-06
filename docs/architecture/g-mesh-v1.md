@@ -1073,7 +1073,10 @@ All list-shaped responses are cursor-paginated: `results`, `hasMore`,
 `nextCursor` (opaque token — chosen over `offset` because background
 reindexing can shift/duplicate rows mid-pagination). Structural tool
 results are ordered `resolved: true` before `resolved: false`, then by
-locality; `search_code` is ordered by similarity score. Every edge-derived
+locality (the anchor's own file, then its directory, then elsewhere), then
+symbol rows before `File` rows, then by file path and line, with the edge id
+as the final tiebreak; a cursor from an earlier ordering is refused with an
+error asking to repeat the query. `search_code` is ordered by similarity score. Every edge-derived
 result carries `resolved`/`source` so the agent knows how much to trust a
 given relationship.
 

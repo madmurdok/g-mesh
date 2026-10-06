@@ -38,12 +38,11 @@ use super::{anchor, find_definition, provenance, SymbolQueryParams};
 struct CallSite {
     node: NodeRecord,
     resolved: bool,
-    /// Same rule `paginate_edges`' SQL applies: `0` when this node shares the
-    /// anchor's file, `1` otherwise. Carried through so `handle_callers`/
-    /// `handle_callees` can rebuild a resumable cursor if the enriched page
-    /// needs further truncation to fit `pagination::MAX_RESPONSE_BYTES`.
-    locality: i64,
-    edge_id: String,
+    /// The edge's position in `paginate_edges`' order. Carried through so
+    /// `handle_callers`/`handle_callees` can rebuild a resumable cursor if
+    /// the enriched page needs further truncation to fit
+    /// `pagination::MAX_RESPONSE_BYTES`.
+    rank: pagination::EdgeRank,
 }
 
 /// Paginates the `CALLS` edges incident to `anchor_id` in `direction` and
@@ -74,7 +73,7 @@ fn list_calls(
     .context("failed to paginate CALLS edges")?;
 
     let mut results = Vec::with_capacity(page.results.len());
-    for pagination::ScoredEdge { edge, locality } in page.results {
+    for pagination::ScoredEdge { edge, rank } in page.results {
         // Outgoing: anchor is fromId, the callee sits at toId. Incoming: anchor
         // is toId, the caller sits at fromId.
         let other_id = match direction {
@@ -84,7 +83,7 @@ fn list_calls(
         let node = queries::get_node(conn, other_id)
             .context("failed to resolve call-edge endpoint")?
             .with_context(|| format!("edge {} points at missing node {other_id}", edge.id))?;
-        results.push(CallSite { node, resolved: edge.resolved, locality, edge_id: edge.id });
+        results.push(CallSite { node, resolved: edge.resolved, rank });
     }
 
     // Intermediate page, ahead of the EdgeRow/bound_page step each handle_*
@@ -398,8 +397,8 @@ pub(crate) fn handle_callers_in(
         .results
         .into_iter()
         .map(|site| {
-            let (resolved, locality, edge_id) = (site.resolved, site.locality, site.edge_id.clone());
-            pagination::EdgeRow { item: CallerSite::from(site), resolved, locality, edge_id }
+            let rank = site.rank.clone();
+            pagination::EdgeRow { item: CallerSite::from(site), rank }
         })
         .collect();
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
@@ -514,8 +513,8 @@ pub(crate) fn handle_callees_in(
         .results
         .into_iter()
         .map(|site| {
-            let (resolved, locality, edge_id) = (site.resolved, site.locality, site.edge_id.clone());
-            pagination::EdgeRow { item: CalleeSite::from(site), resolved, locality, edge_id }
+            let rank = site.rank.clone();
+            pagination::EdgeRow { item: CalleeSite::from(site), rank }
         })
         .collect();
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);

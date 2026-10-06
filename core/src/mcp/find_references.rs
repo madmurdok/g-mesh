@@ -1,5 +1,5 @@
 //! Real logic behind the `find_references` MCP tool. The hard part - cursor
-//! pagination with the resolved/locality/id ordering rule - already lives in
+//! pagination with the structural ordering rule (`EdgeRank`) - already lives in
 //! `graph::pagination::paginate_edges`; this module is just the "anchor
 //! lookup -> incoming usage edges -> usage-site JSON" wiring around it.
 
@@ -150,15 +150,13 @@ fn list_references(
     .context("failed to paginate reference edges")?;
 
     let mut rows = Vec::with_capacity(page.results.len());
-    for pagination::ScoredEdge { edge, locality } in page.results {
+    for pagination::ScoredEdge { edge, rank } in page.results {
         let referencing = queries::get_node(conn, &edge.from_id)
             .context("failed to resolve referencing node")?
             .with_context(|| format!("edge {} references missing node {}", edge.id, edge.from_id))?;
         let is_file = referencing.kind == pagination::FILE_KIND;
         rows.push(pagination::EdgeRow {
-            resolved: edge.resolved,
-            locality,
-            edge_id: edge.id.clone(),
+            rank,
             item: ReferenceSite {
                 referencing_symbol_id: referencing.id,
                 qualified_name: (!is_file).then_some(referencing.qualified_name),

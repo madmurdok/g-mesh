@@ -61,15 +61,12 @@ pub const MAX_RESPONSE_BYTES: usize = 20_000;
 pub const FILE_KIND: &str = "File";
 
 /// One row a caller has already enriched from a [`ScoredEdge`] (typically by
-/// resolving its other endpoint into a wire-shaped `T`), carrying back just
-/// enough of the original edge - `resolved`, `locality`, and the edge's own
-/// `id` - for [`bound_page`] to rebuild the exact cursor `paginate_edges`
-/// would have produced had its SQL page ended right there.
+/// resolving its other endpoint into a wire-shaped `T`), carrying back the
+/// edge's [`EdgeRank`] so [`bound_page`] can rebuild the exact cursor
+/// `paginate_edges` would have produced had its SQL page ended right there.
 pub struct EdgeRow<T> {
     pub item: T,
-    pub resolved: bool,
-    pub locality: i64,
-    pub edge_id: String,
+    pub rank: EdgeRank,
 }
 
 /// Longest prefix of `items` whose serialized JSON stays within `budget` bytes,
@@ -156,7 +153,7 @@ fn bound_page_within<T: Serialize>(
 
     let items: Vec<&T> = rows.iter().map(|r| &r.item).collect();
     let Some(cut) = longest_prefix_fitting(&items, budget) else {
-        let all_unresolved = rows.iter().all(|r| !r.resolved);
+        let all_unresolved = rows.iter().all(|r| !r.rank.resolved);
         return Page {
             results: rows.into_iter().map(|r| r.item).collect(),
             has_more,
@@ -171,13 +168,8 @@ fn bound_page_within<T: Serialize>(
     // point can only ever drop trailing unresolved rows, never a resolved
     // one - but the prefix is the honest source of truth if that ordering
     // rule ever changes.
-    let all_unresolved = rows[..cut].iter().all(|r| !r.resolved);
-    let boundary = &rows[cut - 1];
-    let cursor = encode_cursor(&StructuralCursor {
-        resolved: boundary.resolved,
-        locality: boundary.locality,
-        id: boundary.edge_id.clone(),
-    });
+    let all_unresolved = rows[..cut].iter().all(|r| !r.rank.resolved);
+    let cursor = encode_cursor(&rows[cut - 1].rank);
 
     Page {
         results: rows.into_iter().take(cut).map(|r| r.item).collect(),
@@ -219,11 +211,76 @@ fn decode_cursor<T: DeserializeOwned>(raw: &str) -> Result<T> {
     serde_json::from_slice(&bytes).context("invalid pagination cursor payload")
 }
 
-#[derive(Serialize, Deserialize)]
-struct StructuralCursor {
+/// An edge's position in [`paginate_edges`]' order, and the keyset cursor
+/// that resumes right after it. Every key belongs to the edge row or its
+/// far endpoint's node, never to a count over other rows, so a reindex that
+/// adds edges between two page requests cannot move a row already served.
+///
+/// Order, each key breaking ties of the one before:
+/// - `resolved`: confirmed edges first;
+/// - `locality`: the far endpoint is in the anchor's own file (`0`), in the
+///   anchor's directory (`1`), or elsewhere (`2`);
+/// - `file_row`: symbol rows (`0`) before `File`-kind rows (`1`), so an
+///   import line never takes a page slot from a call site at the same
+///   locality;
+/// - `file_path`, `start_line`: rows from one file together, in reading
+///   order;
+/// - `id`: the edge's own id, a stable final tiebreak.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeRank {
+    pub resolved: bool,
+    pub locality: i64,
+    pub file_row: i64,
+    pub file_path: String,
+    pub start_line: i64,
+    pub id: String,
+}
+
+/// The structural cursor's earlier shape, decoded only to refuse it by name.
+#[derive(Deserialize)]
+struct LegacyStructuralCursor {
+    #[allow(dead_code)]
     resolved: bool,
+    #[allow(dead_code)]
     locality: i64,
+    #[allow(dead_code)]
     id: String,
+}
+
+fn decode_edge_cursor(raw: &str) -> Result<EdgeRank> {
+    decode_cursor(raw).or_else(|err| {
+        if decode_cursor::<LegacyStructuralCursor>(raw).is_ok() {
+            anyhow::bail!(
+                "pagination cursor was issued by an older g-mesh version and cannot be continued; \
+                 repeat the query without a cursor"
+            );
+        }
+        Err(err)
+    })
+}
+
+/// `n.filePath`'s locality relative to the anchor's file, as the SQL
+/// expression [`paginate_edges`] orders by: `0` same file, `1` same
+/// directory (a file directly in the anchor's directory, not in a
+/// subdirectory of it), `2` elsewhere. Binds `?1` (the anchor's path), `?8`
+/// (the anchor's directory with a trailing `/`, empty at the root) and `?9`
+/// (that prefix's length in characters). A plain prefix comparison rather
+/// than `LIKE`, which is case-insensitive for ASCII in SQLite and would need
+/// the prefix escaped.
+const LOCALITY_EXPR: &str = "CASE WHEN n.filePath = ?1 THEN 0 \
+     WHEN substr(n.filePath, 1, ?9) = ?8 AND instr(substr(n.filePath, ?9 + 1), '/') = 0 THEN 1 \
+     ELSE 2 END";
+
+/// The anchor's directory as a prefix ending in `/` (empty for a file at the
+/// project root), and its length in characters, which is what SQLite's
+/// `substr` counts.
+fn directory_prefix(anchor_file_path: &str) -> (String, i64) {
+    let prefix = match anchor_file_path.rfind('/') {
+        Some(slash) => anchor_file_path[..=slash].to_string(),
+        None => String::new(),
+    };
+    let len = prefix.chars().count() as i64;
+    (prefix, len)
 }
 
 /// Which way to follow edges out of an anchor node.
@@ -490,15 +547,14 @@ pub fn bound_page_reserving_excluded_tally<T: Serialize>(
     bound_page_leaving(rows, has_more, next_cursor, EXCLUDED_TALLY_RESERVE + extra_reserve)
 }
 
-/// An edge alongside the `locality` [`paginate_edges`] already computed for
-/// its own ordering (`0` when the edge's other endpoint shares the anchor's
-/// file, `1` otherwise) - returned rather than discarded so callers that
+/// An edge alongside the [`EdgeRank`] [`paginate_edges`] already computed
+/// for its own ordering - returned rather than discarded so callers that
 /// need it (to build an [`EdgeRow`] for [`bound_page`], say) don't have to
 /// re-derive the identical rule by hand after separately resolving the other
 /// endpoint's node.
 pub struct ScoredEdge {
     pub edge: EdgeRecord,
-    pub locality: i64,
+    pub rank: EdgeRank,
 }
 
 /// Whether a page's rows are edges or the *other endpoints* those edges
@@ -535,9 +591,9 @@ pub enum Distinctness {
 }
 
 /// Paginates the anchor node's incident edges, ordered per the structural
-/// ordering rule: `resolved: true` before `resolved: false`, then locality
-/// (an edge whose other endpoint shares `anchor_file_path` sorts first),
-/// then `id` as a stable tiebreaker. Backs find_references/find_callers/
+/// ordering rule: `resolved: true` before `resolved: false`, then by the
+/// rest of [`EdgeRank`]'s keys (locality against `anchor_file_path`, symbol
+/// rows before `File` rows, file path and line, edge id). Backs find_references/find_callers/
 /// find_callees/find_implementations, which all differ only in `direction`
 /// and `edge_kinds`.
 ///
@@ -576,27 +632,29 @@ pub fn paginate_edges(
     page_size: usize,
     cursor: Option<&str>,
 ) -> Result<Page<ScoredEdge>> {
-    let decoded: Option<StructuralCursor> = cursor.map(decode_cursor).transpose()?;
+    let decoded: Option<EdgeRank> = cursor.map(decode_edge_cursor).transpose()?;
 
     let (other_endpoint, this_endpoint) = match direction {
         Direction::Outgoing => ("toId", "fromId"),
         Direction::Incoming => ("fromId", "toId"),
     };
 
-    // The seven leading placeholders are fixed regardless of whether a cursor
-    // is present (`?3 = 0` makes the keyset predicate vacuously true); the
-    // kind filter's placeholders continue after them, and the scope filter's
-    // continue after those - both vary in width per call.
+    // The twelve leading placeholders are fixed regardless of whether a
+    // cursor is present (`?3 = 0` makes the keyset predicate vacuously
+    // true); the kind filter's placeholders continue after them, and the
+    // scope filter's continue after those - both vary in width per call.
+    const FIXED_PARAMS: usize = 12;
     let kind_filter = if edge_kinds.is_empty() {
         "1 = 1".to_string()
     } else {
-        let placeholders: Vec<String> = (0..edge_kinds.len()).map(|i| format!("?{}", i + 8)).collect();
+        let placeholders: Vec<String> =
+            (0..edge_kinds.len()).map(|i| format!("?{}", i + FIXED_PARAMS + 1)).collect();
         format!("e.kind IN ({})", placeholders.join(", "))
     };
     let scope_filter = if file_paths.is_empty() {
         "1 = 1".to_string()
     } else {
-        let base = 8 + edge_kinds.len();
+        let base = FIXED_PARAMS + 1 + edge_kinds.len();
         let placeholders: Vec<String> = (0..file_paths.len()).map(|i| format!("?{}", i + base)).collect();
         format!("n.filePath IN ({})", placeholders.join(", "))
     };
@@ -620,7 +678,9 @@ pub fn paginate_edges(
     let sql = format!(
         "SELECT e.id AS id, e.fromId AS fromId, e.toId AS toId, e.kind AS kind, e.source AS source, e.engine AS engine, e.resolved AS resolved, \
          e.toDeclaration AS toDeclaration, \
-         CASE WHEN n.filePath = ?1 THEN 0 ELSE 1 END AS locality \
+         {LOCALITY_EXPR} AS locality, \
+         CASE WHEN n.kind = '{FILE_KIND}' THEN 1 ELSE 0 END AS fileRow, \
+         n.filePath AS filePath, n.startLine AS startLine \
          FROM edges e JOIN nodes n ON n.id = e.{other_endpoint} \
          WHERE e.{this_endpoint} = ?2 \
            AND {kind_filter} \
@@ -628,18 +688,29 @@ pub fn paginate_edges(
            AND {distinct_filter} \
            AND ( \
              ?3 = 0 \
-             OR e.resolved < ?4 \
-             OR (e.resolved = ?4 AND locality > ?5) \
-             OR (e.resolved = ?4 AND locality = ?5 AND e.id > ?6) \
+             OR (1 - e.resolved, locality, fileRow, n.filePath, n.startLine, e.id) \
+                > (1 - ?4, ?5, ?6, ?10, ?11, ?7) \
            ) \
-         ORDER BY e.resolved DESC, locality ASC, e.id ASC \
-         LIMIT ?7"
+         ORDER BY e.resolved DESC, locality ASC, fileRow ASC, n.filePath ASC, n.startLine ASC, e.id ASC \
+         LIMIT ?12"
     );
 
-    let (has_cursor, cursor_resolved, cursor_locality, cursor_id): (i64, i64, i64, String) = match &decoded {
-        Some(c) => (1, c.resolved as i64, c.locality, c.id.clone()),
-        None => (0, 0, 0, String::new()),
+    let (has_cursor, after) = match decoded {
+        Some(c) => (1i64, c),
+        None => (
+            0i64,
+            EdgeRank {
+                resolved: false,
+                locality: 0,
+                file_row: 0,
+                file_path: String::new(),
+                start_line: 0,
+                id: String::new(),
+            },
+        ),
     };
+    let cursor_resolved = after.resolved as i64;
+    let (dir_prefix, dir_prefix_len) = directory_prefix(anchor_file_path);
     let limit = (page_size + 1) as i64;
 
     let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![
@@ -647,30 +718,44 @@ pub fn paginate_edges(
         &anchor_node_id,
         &has_cursor,
         &cursor_resolved,
-        &cursor_locality,
-        &cursor_id,
+        &after.locality,
+        &after.file_row,
+        &after.id,
+        &dir_prefix,
+        &dir_prefix_len,
+        &after.file_path,
+        &after.start_line,
         &limit,
     ];
     sql_params.extend(edge_kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql));
     sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
 
     let mut stmt = conn.prepare(&sql)?;
-    let mut rows: Vec<(EdgeRecord, i64)> = stmt
+    let mut rows: Vec<ScoredEdge> = stmt
         .query_map(sql_params.as_slice(), |row| {
-            let locality: i64 = row.get("locality")?;
-            Ok((
-                EdgeRecord {
-                    id: row.get("id")?,
+            let id: String = row.get("id")?;
+            let resolved: bool = row.get("resolved")?;
+            let rank = EdgeRank {
+                resolved,
+                locality: row.get("locality")?,
+                file_row: row.get("fileRow")?,
+                file_path: row.get("filePath")?,
+                start_line: row.get("startLine")?,
+                id: id.clone(),
+            };
+            Ok(ScoredEdge {
+                edge: EdgeRecord {
+                    id,
                     from_id: row.get("fromId")?,
                     to_id: row.get("toId")?,
                     kind: row.get("kind")?,
                     source: row.get("source")?,
                     engine: row.get("engine")?,
-                    resolved: row.get("resolved")?,
+                    resolved,
                     to_declaration: row.get("toDeclaration")?,
                 },
-                locality,
-            ))
+                rank,
+            })
         })?
         .collect::<rusqlite::Result<_>>()
         .context("failed to paginate edges")?;
@@ -678,13 +763,11 @@ pub fn paginate_edges(
     let has_more = rows.len() > page_size;
     rows.truncate(page_size);
 
-    let next_cursor = has_more.then(|| {
-        let (edge, locality) = rows.last().expect("has_more implies at least one row");
-        encode_cursor(&StructuralCursor { resolved: edge.resolved, locality: *locality, id: edge.id.clone() })
-    });
+    let next_cursor =
+        has_more.then(|| encode_cursor(&rows.last().expect("has_more implies at least one row").rank));
 
     Ok(Page {
-        results: rows.into_iter().map(|(edge, locality)| ScoredEdge { edge, locality }).collect(),
+        results: rows,
         has_more,
         next_cursor,
         // Intermediate page: `bound_page` computes the real marker once
@@ -1372,21 +1455,21 @@ mod tests {
         blob: String,
     }
 
+    fn rank(edge_id: String, resolved: bool) -> EdgeRank {
+        EdgeRank { resolved, locality: 0, file_row: 0, file_path: String::new(), start_line: 0, id: edge_id }
+    }
+
     fn edge_row(id: &str, blob_len: usize) -> EdgeRow<Item> {
         EdgeRow {
             item: Item { id: id.to_string(), blob: "x".repeat(blob_len) },
-            resolved: true,
-            locality: 0,
-            edge_id: format!("e_{id}"),
+            rank: rank(format!("e_{id}"), true),
         }
     }
 
     fn edge_row_resolved(id: &str, resolved: bool) -> EdgeRow<Item> {
         EdgeRow {
             item: Item { id: id.to_string(), blob: String::new() },
-            resolved,
-            locality: 0,
-            edge_id: format!("e_{id}"),
+            rank: rank(format!("e_{id}"), resolved),
         }
     }
 
@@ -1428,7 +1511,7 @@ mod tests {
         // The cursor must resume right after the last row actually returned,
         // not an arbitrary or off-by-one boundary.
         let last_included = page.results.last().unwrap().id.clone();
-        let decoded: StructuralCursor = decode_cursor(&cursor).unwrap();
+        let decoded: EdgeRank = decode_cursor(&cursor).unwrap();
         assert_eq!(decoded.id, format!("e_{last_included}"));
     }
 
@@ -1486,9 +1569,7 @@ mod tests {
         let rows: Vec<EdgeRow<Item>> = (0..5)
             .map(|i| EdgeRow {
                 item: Item { id: format!("n{i}"), blob: "x".repeat(MAX_RESPONSE_BYTES / 3) },
-                resolved: false,
-                locality: 0,
-                edge_id: format!("e_n{i}"),
+                rank: rank(format!("e_n{i}"), false),
             })
             .collect();
         let page = bound_page(rows, false, None);
