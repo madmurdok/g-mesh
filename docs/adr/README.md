@@ -97,3 +97,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0024 | [A semantic tier refines an edge by binding a declaration, all or nothing per edge](0024-semantic-tier-refines-by-binding-a-declaration.md) | Accepted |
 | 0025 | [Project walks follow symlinks; a file's identity is its real spelling when the plain walk reaches it](0025-project-walk-follows-symlinks.md) | Accepted |
 | 0026 | [Created files of one batch reach the plugin as a `filesCreated` notification](0026-batch-created-files-notification.md) | Accepted |
+| 0027 | [Plugin fetch verifies checksums in Rust, a third implementation of the install rule](0027-plugin-fetch-checksums-in-rust.md) | Accepted |

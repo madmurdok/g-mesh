@@ -326,6 +326,26 @@ verifies before unpacking. `remove` deletes `plugins/<language>/` and nothing
 else - there is no config to edit, which is the whole benefit of
 filesystem-based discovery.
 
+#### Per-plugin release assets (GM-353)
+
+Each bundled plugin is also published on its own, so it can be installed
+without re-downloading the main archive (which keeps all four plugins):
+
+- **Naming:** `g-mesh-plugin-<lang>-v<ver>-<target>.tar.gz` plus a sibling
+  `<asset>.sha256` (`<hex>  <basename>`); every asset and its `.sha256` is also
+  listed in `SHA256SUMS`. `.tar.gz` on every platform, Windows included.
+- **Layout:** a single top-level `<lang>/` directory containing `plugin.toml`
+  and the plugin binary, byte for byte what the main archive carries.
+- **Install location:** `<exe dir>/plugins`, so a plugin is version-locked to
+  the core that fetched it and replaced by the next `install.sh`.
+- **Manual install:** download the asset and its `.sha256` from the release;
+  verify with `shasum -a 256 -c <asset>.sha256` before unpacking; then
+  `tar -xzf <asset> -C <exe dir>/plugins`; restart the daemon. Remove with
+  `rm -rf <exe dir>/plugins/<lang>`.
+- **CLI:** `g-mesh plugins install` automates these steps in Rust and is GM-331
+  ([ADR 0027](../adr/0027-plugin-fetch-checksums-in-rust.md)); GM-353 delivers
+  the assets and proves the manual path.
+
 **Both require a daemon restart to take effect**, because `discover()` runs once
 at startup. This should be stated by the command rather than discovered by the
 user; whether the daemon should instead re-discover on change is left open
