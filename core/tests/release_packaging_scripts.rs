@@ -916,24 +916,26 @@ fn prepare_release_assets_refuses_a_plugin_asset_not_identical_to_the_main_archi
     );
 }
 
-/// A stage whose `g-mesh` stand-in passes the bundled leg's checks, and in
-/// `plugins list` prints `<dir>  1.0.0  bundled` for each directory under
-/// `$G_MESH_PLUGIN_ROOTS_OVERRIDE` (nothing when it is unset).
+/// A stage whose `g-mesh` stand-in passes the bundled leg's checks. While
+/// `$G_MESH_PLUGIN_ROOTS_OVERRIDE` is set, its reindex prints the real
+/// binary's "<lang> has no plugin installed" line for each bundled language
+/// with no `<lang>/plugin.toml` under it, and still exits 0.
 fn asset_smoke_stage() -> tempfile::TempDir {
     let stage = tempfile::tempdir().expect("failed to create a scratch stage");
+    let langs = build_targets_query(&["--plugins"]).join(" ");
     write_executable(
         &stage.path().join("g-mesh"),
-        r#"#!/bin/sh
-case "$1" in
-plugins)
-	[ -n "${G_MESH_PLUGIN_ROOTS_OVERRIDE:-}" ] || exit 0
-	for d in "$G_MESH_PLUGIN_ROOTS_OVERRIDE"/*/; do
-		[ -d "$d" ] && printf '%s  1.0.0  bundled\n' "$(basename "$d")"
+        &format!(
+            r#"#!/bin/sh
+if [ -n "${{G_MESH_PLUGIN_ROOTS_OVERRIDE:-}}" ]; then
+	for lang in {langs}; do
+		[ -f "$G_MESH_PLUGIN_ROOTS_OVERRIDE/$lang/plugin.toml" ] ||
+			echo "g-mesh: $lang has no plugin installed - 1 file(s) not indexed; install it with \`g-mesh plugins install $lang\`" >&2
 	done
-	;;
-*) echo 'index: 5 nodes, 3 edges' ;;
-esac
-"#,
+fi
+echo 'index: 5 nodes, 3 edges'
+"#
+        ),
     );
     write_executable(&stage.path().join("plugins/typescript/g-mesh-plugin-typescript"), "#!/bin/sh\n");
     stage
@@ -966,8 +968,8 @@ fn run_release_smoke_with_assets(stage: &Path, assets: &Path) -> Output {
 /// The setup control for the two refusals below: with every asset present
 /// and well-formed, the plugin-asset leg passes.
 ///
-/// Control: drop `export G_MESH_PLUGIN_ROOTS_OVERRIDE` - the stand-in lists no
-/// plugin and this fails.
+/// Control: delete the `tar -xzf` that unpacks each asset - the stand-in
+/// reports every language as having no plugin installed and this fails.
 #[test]
 fn release_smoke_passes_the_plugin_asset_leg_with_every_asset() {
     let stage = asset_smoke_stage();
@@ -1001,11 +1003,24 @@ fn release_smoke_fails_the_plugin_asset_leg_when_one_asset_is_missing() {
     assert!(!stdout_of(&output).contains("PASS (plugin-assets)"), "{}", describe(&output));
 }
 
+fn assert_asset_leg_reports_no_plugin_installed(output: &Output, lang: &str) {
+    assert!(!output.status.success(), "{}", describe(output));
+    assert!(
+        stderr_of(output).contains("reports a language with no plugin installed (plugin-assets plugins)"),
+        "{}",
+        describe(output)
+    );
+    let stdout = stdout_of(output);
+    assert!(stdout.contains(&format!("{lang} has no plugin installed")), "{}", describe(output));
+    assert!(!stdout.contains("PASS (plugin-assets)"), "{}", describe(output));
+}
+
 /// Behaviour 17: an asset that unpacks to some other directory leaves its
-/// language undiscovered, and the leg names it.
+/// language undiscovered, and the leg fails on reindex's "has no plugin
+/// installed" line.
 ///
-/// Control: delete the per-language `plugins list` grep loop - the stand-in
-/// reindex passes and this fails.
+/// Control: delete the `has no plugin installed` grep in `smoke_reindex` -
+/// the stand-in reindex exits 0 and this fails.
 #[test]
 fn release_smoke_fails_the_plugin_asset_leg_when_an_asset_is_not_discovered() {
     let stage = asset_smoke_stage();
@@ -1014,13 +1029,24 @@ fn release_smoke_fails_the_plugin_asset_leg_when_an_asset_is_not_discovered() {
     write_fake_plugin(scratch.path(), "rust-misnamed", HOST);
     tar_gz(&assets.path().join(plugin_asset_name("rust", HOST)), scratch.path(), "rust-misnamed");
     let output = run_release_smoke_with_assets(stage.path(), assets.path());
-    assert!(!output.status.success(), "{}", describe(&output));
-    assert!(
-        stderr_of(&output).contains("the rust plugin unpacked from its asset is not discovered"),
-        "{}",
-        describe(&output)
-    );
-    assert!(!stdout_of(&output).contains("PASS (plugin-assets)"), "{}", describe(&output));
+    assert_asset_leg_reports_no_plugin_installed(&output, "rust");
+}
+
+/// Behaviour 17: an asset that unpacks to its language directory but holds
+/// no manifest leaves that language undiscovered, and the leg fails.
+///
+/// Control: delete the `has no plugin installed` grep in `smoke_reindex` -
+/// the stand-in reindex exits 0 and this fails.
+#[test]
+fn release_smoke_fails_the_plugin_asset_leg_when_an_asset_holds_no_manifest() {
+    let stage = asset_smoke_stage();
+    let assets = host_plugin_assets();
+    let scratch = tempfile::tempdir().unwrap();
+    fs::create_dir_all(scratch.path().join("rust")).unwrap();
+    fs::write(scratch.path().join("rust/README"), "no manifest\n").unwrap();
+    tar_gz(&assets.path().join(plugin_asset_name("rust", HOST)), scratch.path(), "rust");
+    let output = run_release_smoke_with_assets(stage.path(), assets.path());
+    assert_asset_leg_reports_no_plugin_installed(&output, "rust");
 }
 
 // ---------------------------------------------------------------------------

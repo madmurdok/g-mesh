@@ -78,6 +78,14 @@ EOF
 		>"$serve/v$VERSION/$stem.tar.gz.sha256"
 done
 
+# aarch64-apple-darwin's archive is a truncated one: no bundled plugins.
+stem="g-mesh-v$VERSION-aarch64-apple-darwin"
+mkdir -p "$work/src/$stem"
+cp "$work/src/g-mesh-v$VERSION-x86_64-apple-darwin/g-mesh" "$work/src/$stem/g-mesh"
+tar -czf "$serve/v$VERSION/$stem.tar.gz" -C "$work/src" "$stem"
+echo "$(sha256_of "$serve/v$VERSION/$stem.tar.gz")  $stem.tar.gz" \
+	>"$serve/v$VERSION/$stem.tar.gz.sha256"
+
 # --- helpers ---------------------------------------------------------------
 
 # new_home NAME: a fresh, empty HOME for one case.
@@ -239,6 +247,25 @@ if run_install "$home" /bin/zsh x86_64-unknown-linux-gnu G_MESH_NO_MODIFY_PATH=0
 	pass "env-zero: G_MESH_NO_MODIFY_PATH=0 still edits ~/.zshrc"
 else
 	fail "env-zero: install failed"
+fi
+
+# An archive without plugins/typescript/plugin.toml is refused as not a
+# release archive, and nothing is installed.
+home="$(new_home no-bundled-plugins)"
+if run_install "$home" /bin/zsh aarch64-apple-darwin --; then
+	fail "no-bundled-plugins: install succeeded"
+else
+	before="$failures"
+	for want in 'carries no plugins/typescript/plugin.toml' 'not a release archive' 'nothing was installed'; do
+		grep -qF "$want" "$home.out" || fail "no-bundled-plugins: output lacks '$want'"
+	done
+	[[ ! -e "$home/.g-mesh/bin/g-mesh" ]] || fail "no-bundled-plugins: g-mesh was installed"
+	expect_untouched no-bundled-plugins "$home"
+	if [[ "$failures" -eq "$before" ]]; then
+		pass "no-bundled-plugins: refused, nothing installed"
+	else
+		cat "$home.out" >&2
+	fi
 fi
 
 # --- the real HOME ---------------------------------------------------------
