@@ -411,6 +411,16 @@ those too.
   `RegexMatcher`). Benefit: an end-to-end turn figure per language. Risk: a
   cross-repo task first, and new tasks have no variance history.
 
+## Owner decisions (2026-10-06)
+
+- D1: "Близость в 3 уровня + файл/строка (Recommended)" - option A.
+- D2: "Новый параметр answer" - option B: a new `answer: rows|files|count`
+  parameter, not the `limit: 0` overload; `limit: 0` keeps its current
+  meaning. `total` still ships with it.
+- D3: "Строки + symbol_id + исходник ≤3 кандидатов (Recommended)" - option A.
+- D4: "main 3.21.0 против GM-352 (Recommended)" - option A.
+- D5: "Пробник + 4 задачи excalidraw (Recommended)" - option A.
+
 ## Notes on method
 
 - g-mesh MCP was not connected in this session (the server failed to connect
