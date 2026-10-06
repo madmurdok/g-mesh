@@ -1892,6 +1892,101 @@ fn include_source_false_gives_candidates_their_lines_without_source() {
     }
 }
 
+/// The ids of the page's candidates that carry `source`, sorted.
+fn sourced_ids(body: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get("source").is_some())
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Two readable candidates and one whose `endLine` is the file's line count,
+/// one past its last line - the shape a Python `Module` node has (requests'
+/// `__version__`). Its span is refused, so the page carries source for some
+/// candidates only and must not claim "each with its source".
+fn runs_one_past_the_end() -> (Arc<IndexStore>, tempfile::TempDir) {
+    let store = runs(&[("a", "a.rs", 0, 2), ("b", "b.rs", 1, 1), ("m", "m.rs", 0, 2)]);
+    let project = project_files(&[
+        ("a.rs", "fn run() {\n    alpha();\n}\n"),
+        ("b.rs", "// b\nfn run() { beta() }\n"),
+        ("m.rs", "run = 1\nother = 2\n"),
+    ]);
+    (store, project)
+}
+
+#[test]
+fn a_page_where_one_candidates_span_ends_past_the_file_says_only_some_are_sourced() {
+    let (store, project) = runs_one_past_the_end();
+
+    let body = json_body(&define(&store, project.path(), named("run")));
+
+    assert_eq!(body["hasMore"], false, "precondition: {body}");
+    assert_eq!(body["results"].as_array().unwrap().len(), 3, "precondition: {body}");
+    assert_eq!(sourced_ids(&body), vec!["a", "b"], "the past-the-end span is refused, the rest read: {body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_PARTLY_SOURCED, "{body}");
+    assert_ne!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_SOURCED, "{body}");
+}
+
+/// A file deleted since the walk is the other way a candidate loses its
+/// source; the page says "some" for it just the same.
+#[test]
+fn a_page_where_one_candidates_file_is_missing_says_only_some_are_sourced() {
+    let store = runs(&[("a", "a.rs", 0, 2), ("gone", "gone.rs", 0, 0)]);
+    let project = project_files(&[("a.rs", "fn run() {\n    alpha();\n}\n")]);
+
+    let body = json_body(&define(&store, project.path(), named("run")));
+
+    assert_eq!(sourced_ids(&body), vec!["a"], "{body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_PARTLY_SOURCED, "{body}");
+}
+
+/// The partly-sourced explanation sends the reader to the candidates it
+/// could not show, by the field the page uses to mark them.
+#[test]
+fn the_partly_sourced_explanation_names_how_to_reach_the_unsourced_candidates() {
+    let text = crate::mcp::session_hints::AMBIGUOUS_PARTLY_SOURCED;
+
+    assert!(text.contains("`symbol_id`"), "{text}");
+    assert!(text.contains("`source`"), "{text}");
+    assert_ne!(text, crate::mcp::session_hints::AMBIGUOUS_SOURCED);
+    assert_ne!(text, crate::mcp::session_hints::AMBIGUOUS);
+}
+
+/// Opting out of source is "none sourced", not "some": the mixed page with
+/// `include_source: false` reads exactly like any unsourced page.
+#[test]
+fn include_source_false_on_a_mixed_page_is_plainly_ambiguous() {
+    let (store, project) = runs_one_past_the_end();
+
+    let body = json_body(&define(
+        &store,
+        project.path(),
+        FindDefinitionParams { include_source: Some(false), ..named("run") },
+    ));
+
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS, "{body}");
+    assert!(sourced_ids(&body).is_empty(), "{body}");
+}
+
+/// When every candidate's span is refused the page carries no source at
+/// all, and says the plain thing rather than "some".
+#[test]
+fn a_page_where_no_candidates_span_can_be_read_is_plainly_ambiguous() {
+    let store = runs(&[("a", "a.rs", 0, 1), ("b", "b.rs", 5, 9)]);
+    let project = project_files(&[("a.rs", "fn run() {}\n"), ("b.rs", "fn run() {}\n")]);
+
+    let body = json_body(&define(&store, project.path(), named("run")));
+
+    assert_eq!(body["results"].as_array().unwrap().len(), 2, "precondition: {body}");
+    assert!(sourced_ids(&body).is_empty(), "{body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS, "{body}");
+}
+
 #[test]
 fn four_candidates_carry_no_source() {
     let store = runs(&[("a", "a.rs", 0, 0), ("b", "b.rs", 0, 0), ("c", "c.rs", 0, 0), ("d", "d.rs", 0, 0)]);
