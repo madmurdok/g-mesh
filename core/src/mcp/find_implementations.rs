@@ -580,7 +580,7 @@ pub(crate) fn dispatch_in(
         return continued(&conn, &token, capabilities, hints);
     }
 
-    let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths };
+    let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths, answer: None };
 
     if !transitive.unwrap_or(false) {
         return handle_in(store, semantic, capabilities, hints, symbol_params);

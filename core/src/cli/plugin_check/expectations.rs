@@ -928,7 +928,8 @@ impl SymbolTool {
                 params,
             ),
             SymbolTool::Implementations => {
-                let SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths } = params;
+                let SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths, answer: _ } =
+                    params;
                 find_implementations::dispatch(
                     ctx.conn,
                     ctx.embedding,
@@ -1026,6 +1027,7 @@ fn resolve_and_call(
         cursor: None,
         limit,
         file_paths: None,
+        answer: None,
     };
     let value = tool_json(tool.call(ctx, first)).map_err(|e| vec![e])?;
     if !is_candidate_page(&value) {
@@ -1043,6 +1045,7 @@ fn resolve_and_call(
         cursor: None,
         limit,
         file_paths: None,
+        answer: None,
     };
     let retried = tool_json(tool.call(ctx, retry)).map_err(|e| vec![e])?;
     if is_candidate_page(&retried) {
@@ -1443,6 +1446,7 @@ impl RefusedTool {
                 cursor: None,
                 limit: Some(pagination::MAX_PAGE_SIZE as u32),
                 file_paths: None,
+                answer: None,
             },
         )
     }

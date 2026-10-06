@@ -443,6 +443,29 @@ pub fn count_edges(
     edge_kinds: &[&str],
     file_paths: &[&str],
 ) -> Result<usize> {
+    Ok(count_edges_by_resolution(conn, anchor_node_id, direction, edge_kinds, file_paths)?.total)
+}
+
+/// Bytes held back for a `total` field on a truncated page: `,"total":` plus
+/// a count of up to ten digits.
+pub const TOTAL_RESERVE: usize = 20;
+
+/// [`count_edges`]' whole-set count, with how many of those edges the linker
+/// left unresolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeCount {
+    pub total: usize,
+    pub unresolved: usize,
+}
+
+/// [`count_edges`], split by the edges' `resolved` bit in the same query.
+pub fn count_edges_by_resolution(
+    conn: &Connection,
+    anchor_node_id: &str,
+    direction: Direction,
+    edge_kinds: &[&str],
+    file_paths: &[&str],
+) -> Result<EdgeCount> {
     let (other_endpoint, this_endpoint) = match direction {
         Direction::Outgoing => ("toId", "fromId"),
         Direction::Incoming => ("fromId", "toId"),
@@ -465,7 +488,7 @@ pub fn count_edges(
         format!("n.filePath IN ({})", placeholders.join(", "))
     };
     let sql = format!(
-        "SELECT COUNT(*) \
+        "SELECT COUNT(*), COALESCE(SUM(1 - e.resolved), 0) \
          FROM edges e JOIN nodes n ON n.id = e.{other_endpoint} \
          WHERE e.{this_endpoint} = ?1 \
            AND {kind_filter} \
@@ -477,9 +500,10 @@ pub fn count_edges(
     sql_params.extend(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
 
     let mut stmt = conn.prepare(&sql)?;
-    let count: i64 =
-        stmt.query_row(sql_params.as_slice(), |row| row.get(0)).context("failed to count edges")?;
-    Ok(count as usize)
+    let (total, unresolved): (i64, i64) = stmt
+        .query_row(sql_params.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))
+        .context("failed to count edges")?;
+    Ok(EdgeCount { total: total as usize, unresolved: unresolved as usize })
 }
 
 /// Whether a `files` tally is worth sending alongside `results`.

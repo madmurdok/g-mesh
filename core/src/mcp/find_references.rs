@@ -23,7 +23,7 @@ use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
 use super::unlinked::{self, UnlinkedUsages};
 use super::untyped::{self, UntypedReceiverCalls};
-use super::{anchor, find_definition, provenance, SymbolQueryParams};
+use super::{anchor, answer, find_definition, provenance, SymbolQueryParams};
 
 /// Every edge kind that means "this node uses the anchor somewhere in its own
 /// source". The extractor files each usage under exactly one of these and
@@ -94,6 +94,10 @@ struct ReferencePage {
     /// response is byte-for-byte what it was before this field existed.
     #[serde(skip_serializing_if = "Option::is_none")]
     files: Option<Vec<pagination::FileTally>>,
+    /// Exact number of references over the whole set. Present only when
+    /// `has_more`: on a complete page it is `results.len()`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<usize>,
     has_more: bool,
     next_cursor: Option<String>,
     /// See `Page::all_unresolved` - true when every reference in `results`
@@ -117,6 +121,19 @@ struct ReferencePage {
     /// this answer came from its structural tier alone. Absent (not `null`,
     /// not an "everything is fine" object) on every healthy response, which
     /// is nearly all of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<provenance::Provenance>,
+}
+
+/// The response-level disclosures of [`ReferencePage`], carried unchanged by
+/// the non-row answers (`answer::Summary`).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReferenceDisclosures {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unlinked_usages: Option<UnlinkedUsages>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    untyped_receiver_calls: Option<UntypedReceiverCalls>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
 }
@@ -213,6 +230,44 @@ pub(crate) fn handle_in(
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
     let unlinked = unlinked::probe(&conn, &anchor, USAGE_EDGE_KINDS, &file_paths);
     let untyped = untyped::probe(&conn, &anchor, USAGE_EDGE_KINDS, &file_paths);
+
+    let counted = answer::count(
+        &conn,
+        params.answer.unwrap_or_default(),
+        &anchor.id,
+        Direction::Incoming,
+        USAGE_EDGE_KINDS,
+        &file_paths,
+    )
+    .map_err(|e| internal_error("failed to count references", e))?;
+    if let Some(counted) = counted {
+        let touched = counted
+            .files
+            .iter()
+            .flatten()
+            .map(|tally| tally.path.as_str())
+            .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths))
+            .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
+        let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
+        let hint = session_hints::join([
+            hint,
+            hints.once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+        ]);
+        return success(&answer::Summary {
+            anchor: anchor_info,
+            total: counted.total,
+            unresolved: counted.unresolved,
+            files: counted.files,
+            files_truncated: counted.files_truncated,
+            hint,
+            disclosures: ReferenceDisclosures {
+                unlinked_usages: unlinked,
+                untyped_receiver_calls: untyped,
+                provenance,
+            },
+        });
+    }
+
     let page = list_references(
         &conn,
         &anchor.id,
@@ -221,10 +276,18 @@ pub(crate) fn handle_in(
         page_size,
         params.cursor.as_deref(),
         tier.page_reserve()
+            + pagination::TOTAL_RESERVE
             + UnlinkedUsages::wire_len(&unlinked, "unlinkedUsages")
             + UntypedReceiverCalls::wire_len(&untyped, untyped::FIELD),
     )
     .map_err(|e| internal_error("failed to find references", e))?;
+    let total = page
+        .has_more
+        .then(|| {
+            pagination::count_edges(&conn, &anchor.id, Direction::Incoming, USAGE_EDGE_KINDS, &file_paths)
+        })
+        .transpose()
+        .map_err(|e| internal_error("failed to count references", e))?;
 
     let tally =
         pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, USAGE_EDGE_KINDS, &file_paths)
@@ -260,6 +323,7 @@ pub(crate) fn handle_in(
         anchor: anchor_info,
         results: page.results,
         files,
+        total,
         has_more: page.has_more,
         next_cursor: page.next_cursor,
         all_unresolved: page.all_unresolved,
