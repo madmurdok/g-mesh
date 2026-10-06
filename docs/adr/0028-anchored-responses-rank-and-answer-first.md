@@ -41,8 +41,9 @@ complete. The excluded-references tally no longer repeats files the rows or
 **Ambiguity.** `find_definition` accepts `symbol_id` (an exact node, answered
 with its source). Ambiguous candidates carry `startLine` and `endLine`. When
 the whole candidate set is one first page of at most three candidates, each
-candidate also carries its `source`, capped (20 lines, 1,500 characters), and
-the page says no candidate is preferred; `ambiguous: true` and
+candidate whose span can be read also carries its `source`, capped (20 lines,
+1,500 characters); the explanation says whether all or only some carry it, and
+that no candidate is preferred; `ambiguous: true` and
 `resolvedBy: nameAmbiguous` stay. Larger sets get positions only. No candidate
 is ever picked for the caller.
 

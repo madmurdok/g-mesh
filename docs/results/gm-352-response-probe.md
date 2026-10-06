@@ -164,8 +164,9 @@ deserialization error; the real second call there is `file_path` +
    ≤4 the Rust second calls would fall from 171 to ~127. Not measured here
    whether a 4-source page stays under the single-answer cost.
 2. **One sourced page is not fully sourced.** requests `__version__`: 2
-   candidates, the `Module` one has no `source` (its span is the whole file),
-   but the explanation says "each with its source". Counted as 2 calls above.
+   candidates, the `Module` one has no `source` (its `endLine` is one past the
+   file's last line, so the stale-file check refuses the read; fixed
+   wording in a149f32, span in a backlog task), but the explanation said "each with its source". Counted as 2 calls above.
 3. **`limit:200` pages grew ~50%** under the whole-response bound (more rows
    per call, same 20 KB ceiling). Fewer pages per walk, larger single
    responses; the token sweep should watch any task that pages.
