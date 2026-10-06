@@ -118,6 +118,10 @@ $ErrorActionPreference = 'Stop'
 # unpacked. A mismatch aborts with both hashes printed and nothing installed.
 # There is no flag to skip this.
 #
+# The same rule is implemented in scripts/install.sh and in the Rust fetch
+# behind `g-mesh plugins install`; change all three together. Why there are
+# three: docs/adr/0027-plugin-fetch-checksums-in-rust.md.
+#
 # ---------------------------------------------------------------------------
 # VERSIONS, AND THE "NOTHING IS PUBLISHED YET" CASE
 #
@@ -505,7 +509,7 @@ function Install-GMesh {
         }
         $tsPluginToml = Join-Path $stage 'plugins\typescript\plugin.toml'
         if (-not (Test-Path -LiteralPath $tsPluginToml -PathType Leaf)) {
-            Die "unexpected archive layout: $asset carries no plugins\typescript\plugin.toml. Core cannot index a TypeScript project without it, so this archive is not installable."
+            Die "unexpected archive layout: $asset carries no plugins\typescript\plugin.toml. A g-mesh release archive always carries its bundled plugins, so this is not a release archive (wrong or truncated asset) - nothing was installed."
         }
 
         # Run it before installing it, same as install.sh: '--version' proves

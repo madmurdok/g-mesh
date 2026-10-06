@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Checks that a directory holds exactly the assets a complete four-target
-# release consists of, then writes the combined `SHA256SUMS` that gets
+# release consists of - per target the main archive and one plugin asset per
+# bundled language, each with its `.sha256` - then writes the combined `SHA256SUMS` that gets
 # published alongside them.
 #
 #   scripts/prepare-release-assets.sh dist
@@ -36,10 +37,16 @@
 #     prefix in there would break verification for everyone downstream)
 #   - an unexpected archive: a leftover from another version means the
 #     directory is not one clean release
+#   - an archive count other than targets x (1 + bundled plugins), with both
+#     factors taken from build-targets.sh (`--list`, `--plugins`)
+#   - a plugin asset that is not exactly `<language>/plugin.toml` plus the one
+#     binary that manifest's `command` names, whose manifest does not say
+#     `language = "<language>"`, or whose files are not byte-identical to
+#     `plugins/<language>/` inside the main archive of the same target
 #
-# It deliberately does NOT check that a release is complete in any sense
-# beyond names and checksums. Whether the binaries inside work is what the
-# smoke tests in build-targets.sh are for.
+# It deliberately does NOT check that the binaries inside work: that is what
+# the smoke tests in build-targets.sh and scripts/release-smoke.sh are for.
+# Nothing here is executed, so it runs on any host.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -131,6 +138,118 @@ for archive in "${archives[@]}"; do
 		die "checksum mismatch for $archive: file says $declared_sum, bytes hash to $actual_sum"
 
 	log "verified $archive ($actual_sum)"
+done
+
+targets=()
+while IFS= read -r line; do
+	if [ -n "$line" ]; then
+		targets+=("$line")
+	fi
+done < <(bash "$REPO_ROOT/scripts/build-targets.sh" --list)
+plugins=()
+while IFS= read -r line; do
+	if [ -n "$line" ]; then
+		plugins+=("$line")
+	fi
+done < <(bash "$REPO_ROOT/scripts/build-targets.sh" --plugins)
+
+# Asserted separately from the name list, so that dropping a language from
+# BUNDLED_PLUGINS (and with it from the build and the names) still shows up as
+# a different number here.
+expected_archives=$((${#targets[@]} * (1 + ${#plugins[@]})))
+log "${#targets[@]} target(s) x (1 + ${#plugins[@]} plugin(s)) = $expected_archives archives"
+[ "${#archives[@]}" -eq "$expected_archives" ] ||
+	die "found ${#archives[@]} archives, expected $expected_archives (${#targets[@]} targets x (1 main + ${#plugins[@]} plugins))"
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/g-mesh-prepare-release.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+
+# Unpacks archive $1 into the empty directory $2.
+unpack_into() {
+	case "$1" in
+	*.zip)
+		command -v unzip >/dev/null 2>&1 || die "unzip is required to inspect $(basename "$1")"
+		# Status 1 is unzip's "warning" (e.g. backslash separators, which it
+		# converts); the layout checks below catch anything it got wrong.
+		local status=0
+		unzip -q "$1" -d "$2" || status=$?
+		[ "$status" -le 1 ] || die "could not unpack $(basename "$1") (unzip exited $status)"
+		;;
+	*)
+		tar -xzf "$1" -C "$2" || die "could not unpack $(basename "$1")"
+		;;
+	esac
+}
+
+# Prints the regular files under directory $1, relative to it, sorted.
+files_under() {
+	(cd "$1" && find . -type f | sed 's#^\./##' | LC_ALL=C sort)
+}
+
+# Per target: --asset-names lists the main archive first, then one
+# asset/checksum pair per plugin in --plugins order, so the plugin asset for
+# plugins[i] is line 2 + 2i.
+for target in "${targets[@]}"; do
+	names=()
+	while IFS= read -r line; do
+		if [ -n "$line" ]; then
+			names+=("$line")
+		fi
+	done < <(bash "$REPO_ROOT/scripts/build-targets.sh" --asset-names "$target")
+	main_archive="${names[0]}"
+	main_stem="$(basename "$(bash "$REPO_ROOT/scripts/build-targets.sh" --stage-dir "$target")")"
+
+	main_dir="$work/main"
+	rm -rf "$main_dir"
+	mkdir -p "$main_dir"
+	unpack_into "$ASSET_DIR/$main_archive" "$main_dir"
+	[ -d "$main_dir/$main_stem/plugins" ] ||
+		die "$main_archive has no $main_stem/plugins/ directory to compare the plugin assets with"
+
+	i=0
+	for lang in "${plugins[@]}"; do
+		asset="${names[$((2 + 2 * i))]}"
+		i=$((i + 1))
+
+		# Every entry must sit under `<lang>/`; directory entries aside, exactly
+		# two files: the manifest and one binary.
+		asset_files=()
+		while IFS= read -r entry; do
+			case "$entry" in
+			"$lang"/) ;;
+			"$lang"/*/) die "$asset has a subdirectory '$entry'; a plugin asset is $lang/plugin.toml plus one binary" ;;
+			"$lang"/*) asset_files+=("${entry#"$lang"/}") ;;
+			*) die "$asset has an entry outside $lang/: '$entry'" ;;
+			esac
+		done < <(tar -tzf "$ASSET_DIR/$asset" | sed 's#^\./##')
+		[ "${#asset_files[@]}" -eq 2 ] ||
+			die "$asset holds ${#asset_files[@]} file(s) (${asset_files[*]:-none}), expected exactly $lang/plugin.toml and one binary"
+
+		plugin_dir="$work/plugin"
+		rm -rf "$plugin_dir"
+		mkdir -p "$plugin_dir"
+		unpack_into "$ASSET_DIR/$asset" "$plugin_dir"
+		manifest="$plugin_dir/$lang/plugin.toml"
+		[ -f "$manifest" ] || die "$asset carries no $lang/plugin.toml"
+		grep -Eq "^language[[:space:]]*=[[:space:]]*\"$lang\"" "$manifest" ||
+			die "$asset's plugin.toml does not declare language = \"$lang\""
+		exe="$(awk -F'"' '/^command[[:space:]]*=/ { sub(/^\.\//, "", $2); print $2; exit }' "$manifest")"
+		[ -n "$exe" ] && [ -f "$plugin_dir/$lang/$exe" ] ||
+			die "$asset's plugin.toml command names '$exe', which is not the binary beside it"
+
+		bundled_dir="$main_dir/$main_stem/plugins/$lang"
+		[ -d "$bundled_dir" ] || die "$main_archive carries no plugins/$lang/ to compare $asset with"
+		[ "$(files_under "$plugin_dir/$lang")" = "$(files_under "$bundled_dir")" ] ||
+			die "$asset and plugins/$lang/ in $main_archive hold different files"
+		while IFS= read -r rel; do
+			a="$(sha256_of "$plugin_dir/$lang/$rel" | awk '{ print $1 }')"
+			b="$(sha256_of "$bundled_dir/$rel" | awk '{ print $1 }')"
+			[ "$a" = "$b" ] ||
+				die "$asset's $lang/$rel differs from plugins/$lang/$rel in $main_archive ($a vs $b)"
+		done < <(files_under "$bundled_dir")
+
+		log "plugin asset $asset matches plugins/$lang/ in $main_archive"
+	done
 done
 
 # One file a human can run `sha256sum -c SHA256SUMS` against, assembled from

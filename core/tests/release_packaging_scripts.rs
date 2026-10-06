@@ -303,7 +303,8 @@ fn a_repo_manifest_without_the_rewritten_command_line_stops_the_bundle() {
 /// A scratch repo root holding a copy of `build-targets.sh`, stand-in
 /// bundlers, and a stand-in `g-mesh` whose `plugins list` prints
 /// `$FAKE_PLUGINS_LIST`. The TypeScript bundler stages `plugin.toml`, and its
-/// binary only when `$FAKE_STAGE_TS_BINARY` is 1.
+/// binary only when `$FAKE_STAGE_TS_BINARY` is 1; the other bundlers stage
+/// both.
 fn build_targets_root() -> tempfile::TempDir {
     let root = tempfile::tempdir().expect("failed to create a scratch repo root");
     let path = root.path();
@@ -326,7 +327,11 @@ fi
     ] {
         write_executable(
             &path.join("scripts").join(script),
-            &format!("#!/bin/sh\nmkdir -p \"$2/{language}\"\n"),
+            &format!(
+                "#!/bin/sh\nmkdir -p \"$2/{language}\"\n\
+                 printf 'language = \"{language}\"\\ncommand = \"./g-mesh-plugin-{language}\"\\n' >\"$2/{language}/plugin.toml\"\n\
+                 echo {language} >\"$2/{language}/g-mesh-plugin-{language}\"\n"
+            ),
         );
     }
     for file in ["LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "README.md"] {
@@ -500,6 +505,548 @@ fn release_smoke_accepts_a_stage_holding_the_typescript_binary() {
     let output = run_release_smoke(stage.path(), HOST);
     assert!(output.status.success(), "{}", describe(&output));
     assert!(stdout_of(&output).contains("PASS"), "{}", describe(&output));
+}
+
+// ---------------------------------------------------------------------------
+// Per-plugin release assets: names, layout, prepare-release-assets.sh, and the
+// plugin-asset leg of release-smoke.sh
+// ---------------------------------------------------------------------------
+
+/// The version every scratch release below is named after.
+const FAKE_VERSION: &str = "9.9.9";
+
+/// One line per output line of the repo's `build-targets.sh` with `args`, for
+/// version `FAKE_VERSION`. The query flags need no toolchain.
+fn build_targets_query(args: &[&str]) -> Vec<String> {
+    let output = Command::new("bash")
+        .arg(repo_root().join("scripts/build-targets.sh"))
+        .args(args)
+        .env("G_MESH_VERSION", FAKE_VERSION)
+        .output()
+        .expect("failed to run bash");
+    assert!(output.status.success(), "{}", describe(&output));
+    stdout_of(&output).lines().map(str::to_owned).collect()
+}
+
+fn plugin_asset_name(lang: &str, target: &str) -> String {
+    format!("g-mesh-plugin-{lang}-v{FAKE_VERSION}-{target}.tar.gz")
+}
+
+fn main_stem(target: &str) -> String {
+    format!("g-mesh-v{FAKE_VERSION}-{target}")
+}
+
+fn main_archive_name(target: &str) -> String {
+    let ext = if target.contains("-windows-") { "zip" } else { "tar.gz" };
+    format!("{}.{ext}", main_stem(target))
+}
+
+/// Runs `script` under bash with `args` as `$1...`, and requires it to pass.
+fn bash_ok(script: &str, args: &[&Path]) {
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .arg("bash")
+        .args(args)
+        .env("COPYFILE_DISABLE", "1")
+        .output()
+        .expect("failed to run bash");
+    assert!(output.status.success(), "{}", describe(&output));
+}
+
+/// Writes `<dir>/<name>.sha256` as `<hex>  <name>`, the format the release
+/// scripts write and check.
+fn write_sha256(dir: &Path, name: &str) {
+    bash_ok(
+        r#"cd "$1" && n="$(basename "$2")" && { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$n"; else shasum -a 256 "$n"; fi; } >"$n.sha256""#,
+        &[dir, Path::new(name)],
+    );
+}
+
+/// Packs `<base>/<entry>` into the gzipped tarball `archive`, with `entry` as
+/// its one top-level entry.
+fn tar_gz(archive: &Path, base: &Path, entry: &str) {
+    bash_ok(r#"rm -f "$1" && tar -czf "$1" -C "$2" "$3""#, &[archive, base, Path::new(entry)]);
+}
+
+fn untar_gz(archive: &Path, into: &Path) {
+    fs::create_dir_all(into).unwrap();
+    bash_ok(r#"tar -xzf "$1" -C "$2""#, &[archive, into]);
+}
+
+fn tar_entries(archive: &Path) -> Vec<String> {
+    let output = Command::new("tar").arg("-tzf").arg(archive).output().expect("failed to run tar");
+    assert!(output.status.success(), "{}", describe(&output));
+    stdout_of(&output).lines().map(|line| line.trim_start_matches("./").to_owned()).collect()
+}
+
+/// Writes `<dir>/<lang>/plugin.toml` and the binary its `command` names, as a
+/// staged plugin for `target` looks.
+fn write_fake_plugin(dir: &Path, lang: &str, target: &str) {
+    let ext = if target.contains("-windows-") { ".exe" } else { "" };
+    let plugin_dir = dir.join(lang);
+    fs::create_dir_all(&plugin_dir).unwrap();
+    fs::write(
+        plugin_dir.join("plugin.toml"),
+        format!("language = \"{lang}\"\ncommand = \"./g-mesh-plugin-{lang}{ext}\"\n"),
+    )
+    .unwrap();
+    write_executable(
+        &plugin_dir.join(format!("g-mesh-plugin-{lang}{ext}")),
+        &format!("bin {lang} {target}\n"),
+    );
+}
+
+/// A `dist/` holding a complete fake release for `FAKE_VERSION`: for every
+/// `--list` target, the main archive (stand-in binaries, the real layout) and
+/// one asset per `--plugins` language packed from the same stage, each with
+/// its `.sha256`. Needs `zip` for the Windows archive.
+fn fake_release_dist() -> tempfile::TempDir {
+    let dist = tempfile::tempdir().expect("failed to create a scratch dist");
+    let work = tempfile::tempdir().expect("failed to create a scratch stage root");
+    let plugins = build_targets_query(&["--plugins"]);
+    for target in build_targets_query(&["--list"]) {
+        let stem = main_stem(&target);
+        let stage = work.path().join(&stem);
+        let core = if target.contains("-windows-") { "g-mesh.exe" } else { "g-mesh" };
+        write_executable(&stage.join(core), "core\n");
+        for lang in &plugins {
+            write_fake_plugin(&stage.join("plugins"), lang, &target);
+            let asset = plugin_asset_name(lang, &target);
+            tar_gz(&dist.path().join(&asset), &stage.join("plugins"), lang);
+            write_sha256(dist.path(), &asset);
+        }
+        let archive = main_archive_name(&target);
+        if target.contains("-windows-") {
+            bash_ok(
+                r#"cd "$1" && zip -qr "$2" "$3""#,
+                &[work.path(), &dist.path().join(&archive), Path::new(&stem)],
+            );
+        } else {
+            tar_gz(&dist.path().join(&archive), work.path(), &stem);
+        }
+        write_sha256(dist.path(), &archive);
+    }
+    dist
+}
+
+/// Replaces the plugin asset for `lang`/`target` in `dist` with one packed
+/// from its own unpacked `<lang>/` after `edit`, and rewrites its `.sha256`,
+/// so only the content check can tell it apart.
+fn repack_plugin_asset(dist: &Path, lang: &str, target: &str, edit: impl FnOnce(&Path)) {
+    let asset = plugin_asset_name(lang, target);
+    let scratch = tempfile::tempdir().unwrap();
+    untar_gz(&dist.join(&asset), scratch.path());
+    edit(&scratch.path().join(lang));
+    tar_gz(&dist.join(&asset), scratch.path(), lang);
+    write_sha256(dist, &asset);
+}
+
+fn run_prepare(dist: &Path) -> Output {
+    Command::new("bash")
+        .arg(repo_root().join("scripts/prepare-release-assets.sh"))
+        .arg(dist)
+        .env("G_MESH_VERSION", FAKE_VERSION)
+        .env("COPYFILE_DISABLE", "1")
+        .output()
+        .expect("failed to run bash")
+}
+
+fn assert_prepare_refuses(dist: &Path, message: &str) {
+    let output = run_prepare(dist);
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(stderr_of(&output).contains(message), "expected {message:?} in:\n{}", describe(&output));
+    assert!(!stdout_of(&output).contains("are complete"), "{}", describe(&output));
+}
+
+/// Behaviour 10: per target, the main archive and its checksum come first
+/// (consumers index them positionally), then one asset/checksum pair per
+/// plugin in `--plugins` order; the full list is the per-target lists in
+/// `--list` order.
+///
+/// Control: print the plugin pairs before the main pair in `--asset-names` -
+/// this fails.
+#[test]
+fn asset_names_list_the_main_pair_then_one_pair_per_plugin_in_plugins_order() {
+    let plugins = build_targets_query(&["--plugins"]);
+    let mut expected_all = Vec::new();
+    for target in build_targets_query(&["--list"]) {
+        let main = main_archive_name(&target);
+        let mut expected = vec![main.clone(), format!("{main}.sha256")];
+        for lang in &plugins {
+            let asset = plugin_asset_name(lang, &target);
+            expected.push(asset.clone());
+            expected.push(format!("{asset}.sha256"));
+        }
+        assert_eq!(build_targets_query(&["--asset-names", &target]), expected, "--asset-names {target}");
+        expected_all.extend(expected);
+    }
+    assert_eq!(expected_all.len(), 40, "4 targets x (1 + 4 plugins) x 2");
+    assert_eq!(build_targets_query(&["--asset-names"]), expected_all);
+}
+
+/// Behaviour 10, other half: a Windows plugin asset is a `.tar.gz` beside the
+/// `.zip` main archive.
+///
+/// Control: build `plugin_asset_name_for` from `archive_ext_for` - the Windows
+/// asset becomes `.zip` and this fails.
+#[test]
+fn a_windows_plugin_asset_is_a_tar_gz_beside_a_zip_main_archive() {
+    let names = build_targets_query(&["--asset-names", WINDOWS]);
+    assert_eq!(names[0], format!("g-mesh-v{FAKE_VERSION}-{WINDOWS}.zip"));
+    assert_eq!(names[2], format!("g-mesh-plugin-typescript-v{FAKE_VERSION}-{WINDOWS}.tar.gz"));
+}
+
+/// Behaviour 11: every language core catalogues (and prints an install
+/// command for) is bundled and published as an asset, and nothing else is.
+///
+/// Control: drop `python` from `BUNDLED_PLUGINS` - this fails.
+#[test]
+fn bundled_plugins_are_the_catalogue_languages() {
+    let bundled = build_targets_query(&["--plugins"]);
+    let bundled_set: BTreeSet<String> = bundled.iter().cloned().collect();
+    assert_eq!(bundled_set.len(), bundled.len(), "duplicate language in --plugins: {bundled:?}");
+    let catalogue: BTreeSet<String> =
+        g_mesh::languages::CATALOGUE.iter().map(|entry| entry.language.to_owned()).collect();
+    assert_eq!(bundled_set, catalogue);
+}
+
+/// Behaviour 12: `build_one` writes one asset per bundled language whose only
+/// top-level entry is `<lang>/`, holding exactly the staged
+/// `plugins/<lang>/` files byte for byte, with a `.sha256` naming it.
+///
+/// Control: tar `-C "$stage_dir" "plugins/$lang"` in `make_plugin_asset` - the
+/// entries start with `plugins/` and this fails.
+#[test]
+fn build_targets_packs_each_plugin_asset_as_its_staged_language_directory() {
+    let root = build_targets_root();
+    let output = run_build_targets(root.path(), true, ALL_PLUGINS_LISTED);
+    assert!(output.status.success(), "{}", describe(&output));
+    let dist = root.path().join("dist");
+    let stage = dist.join(main_stem(HOST)).join("plugins");
+    for lang in build_targets_query(&["--plugins"]) {
+        let asset = plugin_asset_name(&lang, HOST);
+        let path = dist.join(&asset);
+        let entries = tar_entries(&path);
+        let top: BTreeSet<&str> = entries.iter().map(|entry| entry.split('/').next().unwrap()).collect();
+        assert_eq!(top, BTreeSet::from([lang.as_str()]), "{asset} entries: {entries:?}");
+
+        let unpacked = tempfile::tempdir().unwrap();
+        untar_gz(&path, unpacked.path());
+        let staged = entries_of(&stage.join(&lang));
+        assert!(staged.contains("plugin.toml"), "{lang} stage: {staged:?}");
+        assert_eq!(entries_of(&unpacked.path().join(&lang)), staged, "{asset}");
+        for file in &staged {
+            assert_eq!(
+                fs::read(unpacked.path().join(&lang).join(file)).unwrap(),
+                fs::read(stage.join(&lang).join(file)).unwrap(),
+                "{asset}: {lang}/{file}"
+            );
+        }
+        let sha = fs::read_to_string(dist.join(format!("{asset}.sha256"))).unwrap();
+        assert!(sha.trim_end().ends_with(&format!("  {asset}")), "{asset}.sha256: {sha:?}");
+    }
+}
+
+/// The setup control for every refusal below: the untouched fake release is
+/// blessed, with the archive count logged and every plugin asset in
+/// `SHA256SUMS`.
+///
+/// Control: delete the archive-count assert and its log line - this fails on
+/// the log line.
+#[test]
+fn prepare_release_assets_blesses_a_complete_release_with_plugin_assets() {
+    let dist = fake_release_dist();
+    let output = run_prepare(dist.path());
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(
+        stdout_of(&output).contains("4 target(s) x (1 + 4 plugin(s)) = 20 archives"),
+        "{}",
+        describe(&output)
+    );
+    let sums = fs::read_to_string(dist.path().join("SHA256SUMS")).unwrap();
+    assert_eq!(sums.lines().count(), 20, "{sums}");
+    for target in build_targets_query(&["--list"]) {
+        for lang in build_targets_query(&["--plugins"]) {
+            let asset = plugin_asset_name(&lang, &target);
+            assert!(
+                sums.lines().any(|line| line.ends_with(&format!("  {asset}"))),
+                "{asset} not in:\n{sums}"
+            );
+        }
+    }
+}
+
+/// Behaviour 13: a missing plugin asset is refused by name.
+///
+/// Control: drop the plugin pairs from `--asset-names` - the missing asset is
+/// not expected, the count check refuses with another message, and this fails.
+#[test]
+fn prepare_release_assets_refuses_a_missing_plugin_asset() {
+    let dist = fake_release_dist();
+    let asset = plugin_asset_name("go", HOST);
+    fs::remove_file(dist.path().join(&asset)).unwrap();
+    fs::remove_file(dist.path().join(format!("{asset}.sha256"))).unwrap();
+    assert_prepare_refuses(dist.path(), &format!("missing release asset: {asset}"));
+}
+
+/// Behaviour 13: a plugin asset for a language that is not bundled is not part
+/// of the release.
+///
+/// Control: replace the unexpected-file `die` with `true` - this release is
+/// blessed and this fails.
+#[test]
+fn prepare_release_assets_refuses_an_extra_plugin_asset() {
+    let dist = fake_release_dist();
+    let extra = plugin_asset_name("java", HOST);
+    let stage = tempfile::tempdir().unwrap();
+    write_fake_plugin(stage.path(), "java", HOST);
+    tar_gz(&dist.path().join(&extra), stage.path(), "java");
+    write_sha256(dist.path(), &extra);
+    assert_prepare_refuses(dist.path(), &format!("unexpected file in {}: {extra}", dist.path().display()));
+}
+
+/// Behaviour 14: a plugin asset holding a third file is refused for its
+/// layout, even though the main archive differs from it too.
+///
+/// Control: delete the `-eq 2` check - the identity check refuses with
+/// "hold different files" instead and this fails.
+#[test]
+fn prepare_release_assets_refuses_a_plugin_asset_with_an_extra_file() {
+    let dist = fake_release_dist();
+    repack_plugin_asset(dist.path(), "rust", HOST, |dir| {
+        fs::write(dir.join("notes.txt"), "extra\n").unwrap()
+    });
+    assert_prepare_refuses(dist.path(), &format!("{} holds 3 file(s)", plugin_asset_name("rust", HOST)));
+}
+
+/// Behaviour 14: every entry of a plugin asset sits under `<lang>/`.
+///
+/// Control: delete the `*) die "... has an entry outside ..."` case - the
+/// asset is then refused as holding 0 files and this fails.
+#[test]
+fn prepare_release_assets_refuses_a_plugin_asset_packed_under_plugins() {
+    let dist = fake_release_dist();
+    let asset = plugin_asset_name("go", HOST);
+    let scratch = tempfile::tempdir().unwrap();
+    write_fake_plugin(&scratch.path().join("plugins"), "go", HOST);
+    tar_gz(&dist.path().join(&asset), scratch.path(), "plugins");
+    write_sha256(dist.path(), &asset);
+    assert_prepare_refuses(dist.path(), &format!("{asset} has an entry outside go/"));
+}
+
+/// Behaviour 15: an asset's manifest must declare its own language.
+///
+/// Control: delete the `language = "<lang>"` grep - the identity check
+/// refuses with "differs from" instead and this fails.
+#[test]
+fn prepare_release_assets_refuses_a_plugin_asset_declaring_another_language() {
+    let dist = fake_release_dist();
+    repack_plugin_asset(dist.path(), "python", HOST, |dir| {
+        let manifest = fs::read_to_string(dir.join("plugin.toml")).unwrap();
+        fs::write(dir.join("plugin.toml"), manifest.replace("\"python\"", "\"java\"")).unwrap();
+    });
+    assert_prepare_refuses(
+        dist.path(),
+        &format!(
+            "{}'s plugin.toml does not declare language = \"python\"",
+            plugin_asset_name("python", HOST)
+        ),
+    );
+}
+
+/// Behaviour 15: an asset's manifest `command` must name the binary beside it.
+///
+/// Control: delete the `command` check - the identity check refuses with
+/// "differs from" instead and this fails.
+#[test]
+fn prepare_release_assets_refuses_a_plugin_asset_whose_command_names_no_binary() {
+    let dist = fake_release_dist();
+    repack_plugin_asset(dist.path(), "go", HOST, |dir| {
+        let manifest = fs::read_to_string(dir.join("plugin.toml")).unwrap();
+        fs::write(dir.join("plugin.toml"), manifest.replace("./g-mesh-plugin-go", "./g-mesh-plugin-gone"))
+            .unwrap();
+    });
+    assert_prepare_refuses(
+        dist.path(),
+        &format!("{}'s plugin.toml command names 'g-mesh-plugin-gone'", plugin_asset_name("go", HOST)),
+    );
+}
+
+/// Behaviour 16: a plugin binary whose bytes differ from the main archive's
+/// copy is refused, here for the Windows target, whose main archive is a zip.
+///
+/// Control: skip the per-file sha256 comparison loop - this release is blessed
+/// and this fails.
+#[test]
+fn prepare_release_assets_refuses_a_tampered_plugin_asset_on_windows() {
+    let dist = fake_release_dist();
+    repack_plugin_asset(dist.path(), "typescript", WINDOWS, |dir| {
+        fs::write(dir.join("g-mesh-plugin-typescript.exe"), "tampered\n").unwrap();
+    });
+    assert_prepare_refuses(
+        dist.path(),
+        &format!(
+            "{}'s typescript/g-mesh-plugin-typescript.exe differs from plugins/typescript/g-mesh-plugin-typescript.exe in {}",
+            plugin_asset_name("typescript", WINDOWS),
+            main_archive_name(WINDOWS)
+        ),
+    );
+}
+
+/// Behaviour 16: the asset and the main archive's `plugins/<lang>/` must hold
+/// the same files, here with a file only the main archive carries (the asset
+/// itself is well-formed).
+///
+/// Control: replace the file-set comparison with `true` - the per-file loop
+/// over the main archive's files finds the asset lacks one and refuses with
+/// another message, and this fails.
+#[test]
+fn prepare_release_assets_refuses_a_plugin_asset_not_identical_to_the_main_archives_copy() {
+    let dist = fake_release_dist();
+    let archive = main_archive_name(HOST);
+    let scratch = tempfile::tempdir().unwrap();
+    untar_gz(&dist.path().join(&archive), scratch.path());
+    fs::write(scratch.path().join(main_stem(HOST)).join("plugins/rust/README"), "main only\n").unwrap();
+    tar_gz(&dist.path().join(&archive), scratch.path(), &main_stem(HOST));
+    write_sha256(dist.path(), &archive);
+    assert_prepare_refuses(
+        dist.path(),
+        &format!("{} and plugins/rust/ in {archive} hold different files", plugin_asset_name("rust", HOST)),
+    );
+}
+
+/// A stage whose `g-mesh` stand-in passes the bundled leg's checks. While
+/// `$G_MESH_PLUGIN_ROOTS_OVERRIDE` is set, its reindex prints the real
+/// binary's "<lang> has no plugin installed" line for each bundled language
+/// with no `<lang>/plugin.toml` under it, and still exits 0.
+fn asset_smoke_stage() -> tempfile::TempDir {
+    let stage = tempfile::tempdir().expect("failed to create a scratch stage");
+    let langs = build_targets_query(&["--plugins"]).join(" ");
+    write_executable(
+        &stage.path().join("g-mesh"),
+        &format!(
+            r#"#!/bin/sh
+if [ -n "${{G_MESH_PLUGIN_ROOTS_OVERRIDE:-}}" ]; then
+	for lang in {langs}; do
+		[ -f "$G_MESH_PLUGIN_ROOTS_OVERRIDE/$lang/plugin.toml" ] ||
+			echo "g-mesh: $lang has no plugin installed - 1 file(s) not indexed; install it with \`g-mesh plugins install $lang\`" >&2
+	done
+fi
+echo 'index: 5 nodes, 3 edges'
+"#
+        ),
+    );
+    write_executable(&stage.path().join("plugins/typescript/g-mesh-plugin-typescript"), "#!/bin/sh\n");
+    stage
+}
+
+/// An asset dir holding a well-formed plugin asset for every bundled language
+/// for `HOST`.
+fn host_plugin_assets() -> tempfile::TempDir {
+    let assets = tempfile::tempdir().expect("failed to create a scratch asset dir");
+    let stage = tempfile::tempdir().unwrap();
+    for lang in build_targets_query(&["--plugins"]) {
+        write_fake_plugin(stage.path(), &lang, HOST);
+        tar_gz(&assets.path().join(plugin_asset_name(&lang, HOST)), stage.path(), &lang);
+    }
+    assets
+}
+
+fn run_release_smoke_with_assets(stage: &Path, assets: &Path) -> Output {
+    Command::new("bash")
+        .arg(repo_root().join("scripts/release-smoke.sh"))
+        .arg(stage)
+        .arg(HOST)
+        .arg(assets)
+        .env("G_MESH_VERSION", FAKE_VERSION)
+        .env_remove("G_MESH_PLUGIN_ROOTS_OVERRIDE")
+        .output()
+        .expect("failed to run bash")
+}
+
+/// The setup control for the two refusals below: with every asset present
+/// and well-formed, the plugin-asset leg passes.
+///
+/// Control: delete the `tar -xzf` that unpacks each asset - the stand-in
+/// reports every language as having no plugin installed and this fails.
+#[test]
+fn release_smoke_passes_the_plugin_asset_leg_with_every_asset() {
+    let stage = asset_smoke_stage();
+    let assets = host_plugin_assets();
+    let output = run_release_smoke_with_assets(stage.path(), assets.path());
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(stdout_of(&output).contains("PASS (plugin-assets)"), "{}", describe(&output));
+}
+
+/// Behaviour 17: one missing plugin asset fails the leg by name, before the
+/// asset leg reindexes.
+///
+/// Control: delete the `[ -f "$asset_dir/$asset" ]` check - `tar` fails
+/// instead, with "could not unpack", and this fails.
+#[test]
+fn release_smoke_fails_the_plugin_asset_leg_when_one_asset_is_missing() {
+    let stage = asset_smoke_stage();
+    let assets = host_plugin_assets();
+    let missing = assets.path().join(plugin_asset_name("rust", HOST));
+    fs::remove_file(&missing).unwrap();
+    let output = run_release_smoke_with_assets(stage.path(), assets.path());
+    assert!(!output.status.success(), "{}", describe(&output));
+    let refusal = format!("/{} ", plugin_asset_name("rust", HOST));
+    assert!(
+        stderr_of(&output)
+            .lines()
+            .any(|line| line.contains("plugin asset not found: ") && format!("{line} ").contains(&refusal)),
+        "{}",
+        describe(&output)
+    );
+    assert!(!stdout_of(&output).contains("PASS (plugin-assets)"), "{}", describe(&output));
+}
+
+fn assert_asset_leg_reports_no_plugin_installed(output: &Output, lang: &str) {
+    assert!(!output.status.success(), "{}", describe(output));
+    assert!(
+        stderr_of(output).contains("reports a language with no plugin installed (plugin-assets plugins)"),
+        "{}",
+        describe(output)
+    );
+    let stdout = stdout_of(output);
+    assert!(stdout.contains(&format!("{lang} has no plugin installed")), "{}", describe(output));
+    assert!(!stdout.contains("PASS (plugin-assets)"), "{}", describe(output));
+}
+
+/// Behaviour 17: an asset that unpacks to some other directory leaves its
+/// language undiscovered, and the leg fails on reindex's "has no plugin
+/// installed" line.
+///
+/// Control: delete the `has no plugin installed` grep in `smoke_reindex` -
+/// the stand-in reindex exits 0 and this fails.
+#[test]
+fn release_smoke_fails_the_plugin_asset_leg_when_an_asset_is_not_discovered() {
+    let stage = asset_smoke_stage();
+    let assets = host_plugin_assets();
+    let scratch = tempfile::tempdir().unwrap();
+    write_fake_plugin(scratch.path(), "rust-misnamed", HOST);
+    tar_gz(&assets.path().join(plugin_asset_name("rust", HOST)), scratch.path(), "rust-misnamed");
+    let output = run_release_smoke_with_assets(stage.path(), assets.path());
+    assert_asset_leg_reports_no_plugin_installed(&output, "rust");
+}
+
+/// Behaviour 17: an asset that unpacks to its language directory but holds
+/// no manifest leaves that language undiscovered, and the leg fails.
+///
+/// Control: delete the `has no plugin installed` grep in `smoke_reindex` -
+/// the stand-in reindex exits 0 and this fails.
+#[test]
+fn release_smoke_fails_the_plugin_asset_leg_when_an_asset_holds_no_manifest() {
+    let stage = asset_smoke_stage();
+    let assets = host_plugin_assets();
+    let scratch = tempfile::tempdir().unwrap();
+    fs::create_dir_all(scratch.path().join("rust")).unwrap();
+    fs::write(scratch.path().join("rust/README"), "no manifest\n").unwrap();
+    tar_gz(&assets.path().join(plugin_asset_name("rust", HOST)), scratch.path(), "rust");
+    let output = run_release_smoke_with_assets(stage.path(), assets.path());
+    assert_asset_leg_reports_no_plugin_installed(&output, "rust");
 }
 
 // ---------------------------------------------------------------------------
