@@ -126,7 +126,7 @@ pub(super) fn resolve(
     match (params.symbol_id.as_deref(), params.symbol_name.as_deref()) {
         (Some(symbol_id), None) => by_id(conn, symbol_id),
         (None, Some(name)) => {
-            find_definition::resolve_symbol_name(conn, semantic, name, params.cursor.as_deref())
+            find_definition::resolve_symbol_name(conn, semantic, name, params.cursor.as_deref(), None)
         }
         (Some(_), Some(_)) => error("g-mesh: give either `symbol_id` or `symbol_name`, not both").map(Err),
         (None, None) => {
@@ -151,7 +151,7 @@ pub(super) fn file_anchor_hint(node: &NodeRecord) -> Option<&'static str> {
     )
 }
 
-fn by_id(conn: &Connection, symbol_id: &str) -> Anchor {
+pub(super) fn by_id(conn: &Connection, symbol_id: &str) -> Anchor {
     let anchor =
         queries::get_node(conn, symbol_id).map_err(|e| internal_error("failed to look up anchor node", e))?;
     match anchor {

@@ -881,6 +881,8 @@ impl ServerHandler for GMeshMcpServer {
 pub struct FindDefinitionParams {
     /// Name of the symbol to look up.
     pub symbol_name: Option<String>,
+    /// Or an exact candidate `id`.
+    pub symbol_id: Option<String>,
     /// Project-relative path of the file the cursor is in.
     pub file_path: Option<String>,
     /// Cursor position within `file_path`, used to resolve the symbol under it.

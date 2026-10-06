@@ -68,6 +68,12 @@ pub(crate) const AMBIGUOUS: &str =
     "Several declarations have this name: re-query with the right candidate's `id` as `symbol_id`, \
      not its qualifiedName, and treat that answer as final without grepping to reconfirm it.";
 
+/// `AMBIGUOUS` for a page whose candidates carry their source: every reading
+/// is already answered, so the follow-up is needed only for a cut body.
+pub(crate) const AMBIGUOUS_SOURCED: &str =
+    "Several declarations have this name, each with its source; none is preferred. Pick by reading; \
+     re-query an `id` as `symbol_id` only for a source with `omittedLines`.";
+
 pub(crate) const FILE_ROW: &str =
     "A `kind: File` row is a usage outside any tracked symbol, so the file itself is the answer; \
      don't grep it for the line.";
@@ -194,6 +200,7 @@ mod tests {
             UNRESOLVED_ROW,
             PROVENANCE,
             AMBIGUOUS,
+            AMBIGUOUS_SOURCED,
             FILE_ROW,
             FILES_TALLY,
             WALK_COMPLETE,

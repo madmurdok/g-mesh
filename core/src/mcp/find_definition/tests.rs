@@ -190,6 +190,7 @@ fn ambiguous_bare_name_returns_both_as_ranked_candidates() {
         .unwrap();
 
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("run".to_string()),
         file_path: None,
         position: None,
@@ -230,6 +231,7 @@ fn placeholders_named_after_a_symbol_are_not_definition_candidates() {
     }
 
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("mutate".to_string()),
         file_path: None,
         position: None,
@@ -264,6 +266,7 @@ fn a_container_named_like_its_member_is_not_a_definition_candidate() {
     assert_eq!(candidates.results.len(), 1, "the container node must not be ranked");
 
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("app".to_string()),
         file_path: None,
         position: None,
@@ -292,6 +295,7 @@ fn file_and_position_query_returns_a_single_node_not_a_list() {
     upsert_node(&mut conn, node_with_span("n2", "run", "pkg_b::run", "b/lib.rs", (5, 0))).unwrap();
 
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: None,
         file_path: Some("a/lib.rs".to_string()),
         position: Some(crate::protocol::types::Position { line: 2, col: 0 }),
@@ -322,6 +326,7 @@ fn qualified_name_requery_returns_the_exact_node() {
     upsert_node(&mut conn, node_with_span("n2", "run", "pkg_b::run", "b/lib.rs", (5, 0))).unwrap();
 
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("pkg_b::run".to_string()),
         file_path: None,
         position: None,
@@ -345,6 +350,7 @@ fn qualified_name_requery_returns_the_exact_node() {
 fn no_match_is_a_tool_level_error() {
     let conn = setup();
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("does_not_exist".to_string()),
         file_path: None,
         position: None,
@@ -366,6 +372,7 @@ fn no_match_is_a_tool_level_error() {
 fn neither_name_nor_position_is_a_tool_level_error() {
     let conn = setup();
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: None,
         file_path: None,
         position: None,
@@ -398,6 +405,7 @@ fn ambiguous_candidates_paginate_across_cursor_continuation() {
     let conn = Arc::new(IndexStore::new(conn));
 
     let first_params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("run".to_string()),
         file_path: None,
         position: None,
@@ -414,6 +422,7 @@ fn ambiguous_candidates_paginate_across_cursor_continuation() {
     let cursor = first_body["nextCursor"].as_str().unwrap().to_string();
 
     let second_params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("run".to_string()),
         file_path: None,
         position: None,
@@ -849,6 +858,7 @@ fn include_source_false_leaves_the_response_exactly_as_it_was() {
     let conn = Arc::new(IndexStore::new(conn));
 
     let params = |include| FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("run".to_string()),
         file_path: None,
         position: None,
@@ -1149,8 +1159,11 @@ fn a_semantic_page_is_labelled_as_candidates_and_carries_ids_to_requery() {
             id: "near".to_string(),
             qualified_name: "pkg::near".to_string(),
             file_path: "a.rs".to_string(),
+            start_line: None,
+            end_line: None,
             kind: "Function".to_string(),
             preview: None,
+            source: None,
         }],
     };
 
@@ -1674,6 +1687,7 @@ fn a_rewritten_page_continues_through_its_cursor() {
     let store = Arc::new(IndexStore::new(conn));
     let page = |cursor: Option<String>| {
         let params = FindDefinitionParams {
+            symbol_id: None,
             symbol_name: Some("@Component".to_string()),
             file_path: None,
             position: None,

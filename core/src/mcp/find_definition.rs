@@ -28,6 +28,18 @@ use super::FindDefinitionParams;
 /// constant for this shape of list to reuse.
 const CANDIDATE_PAGE_SIZE: usize = 20;
 
+/// The most candidates an ambiguous page carries source for. Past this the
+/// page is a list to choose from rather than a set of readings to compare,
+/// and every candidate's text would be paid for to answer one of them.
+const SOURCED_CANDIDATES: usize = 3;
+
+/// A sourced candidate's caps: a quarter of a resolved answer's
+/// ([`source::MAX_LINES`], [`source::MAX_CHARS`]), since up to
+/// [`SOURCED_CANDIDATES`] of them share one page. Enough for a signature and
+/// the start of a body, which is what tells two same-named declarations apart.
+const CANDIDATE_SOURCE_LINES: usize = 20;
+const CANDIDATE_SOURCE_CHARS: usize = 1_500;
+
 /// The full node, returned whenever the lookup is unambiguous: a
 /// file+position query, an exact qualifiedName match, or a bare name that
 /// happens to match exactly one node.
@@ -106,8 +118,8 @@ impl From<NodeRecord> for DefinitionNode {
 }
 
 /// One entry in a ranked candidate list for an ambiguous bare name - a
-/// preview, not the full node, since the caller is expected to re-query once
-/// it picks one.
+/// preview, not the full node: the caller re-queries the one it picks, unless
+/// the page is small enough to carry every candidate's source itself.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DefinitionCandidate {
@@ -121,10 +133,21 @@ struct DefinitionCandidate {
     id: String,
     qualified_name: String,
     file_path: String,
+    /// Zero-based, as on a resolved answer, so a caller can go straight to
+    /// `filePath`+`position` without reading the file to find the line.
+    /// Absent on a semantic guess, whose search row carries no span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_line: Option<i64>,
     kind: String,
     /// Signature over docstring when both exist - it's denser and more
     /// identifying in a ranked list than prose.
     preview: Option<String>,
+    /// The candidate's own text, on a small, complete ambiguous page only -
+    /// see [`CandidatePage::ambiguous`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<source::Snippet>,
 }
 
 impl From<super::search_code::SearchResult> for DefinitionCandidate {
@@ -139,8 +162,11 @@ impl From<super::search_code::SearchResult> for DefinitionCandidate {
             id: hit.symbol_id,
             qualified_name: hit.qualified_name,
             file_path: hit.file_path,
+            start_line: None,
+            end_line: None,
             kind: hit.kind,
             preview: None,
+            source: None,
         }
     }
 }
@@ -162,7 +188,8 @@ struct CandidatePage {
     /// a caller reads one field to tell an ambiguity from the other kind of
     /// candidate page (`fileName`), rather than inferring it from `ambiguous`.
     resolved_by: ResolvedBy,
-    /// Always `session_hints::AMBIGUOUS`: how to pick from this page.
+    /// How to pick from this page: `session_hints::AMBIGUOUS`, or
+    /// `AMBIGUOUS_SOURCED` when the candidates carry their source.
     explanation: &'static str,
     /// The name looked up in place of the query - see [`Resolved::queried_as`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,11 +201,44 @@ struct CandidatePage {
 
 impl CandidatePage {
     /// The ambiguous page over `page`'s ranked candidates.
-    fn ambiguous(page: pagination::Page<DefinitionCandidate>, queried_as: Option<&str>) -> Self {
+    ///
+    /// When `source_root` is given and the whole candidate set is this one
+    /// small page (first page, no more, at most [`SOURCED_CANDIDATES`]),
+    /// every candidate carries its own source, so the caller can tell the
+    /// readings apart without a second call. Every candidate or none: the
+    /// page answers each reading equally and still picks none of them, which
+    /// is what keeps it from reading as a confident answer to the first one.
+    fn ambiguous(
+        mut page: pagination::Page<DefinitionCandidate>,
+        queried_as: Option<&str>,
+        cursor: Option<&str>,
+        source_root: Option<&Path>,
+    ) -> Self {
+        let whole_set_here = cursor.is_none() && !page.has_more && page.results.len() <= SOURCED_CANDIDATES;
+        let mut sourced = false;
+        if let (true, Some(root)) = (whole_set_here, source_root) {
+            for candidate in &mut page.results {
+                if let (Some(start), Some(end)) = (candidate.start_line, candidate.end_line) {
+                    candidate.source = source::read_span_within(
+                        root,
+                        &candidate.file_path,
+                        start,
+                        end,
+                        CANDIDATE_SOURCE_LINES,
+                        CANDIDATE_SOURCE_CHARS,
+                    );
+                    sourced |= candidate.source.is_some();
+                }
+            }
+        }
         Self {
             ambiguous: true,
             resolved_by: ResolvedBy::NameAmbiguous,
-            explanation: super::session_hints::AMBIGUOUS,
+            explanation: if sourced {
+                super::session_hints::AMBIGUOUS_SOURCED
+            } else {
+                super::session_hints::AMBIGUOUS
+            },
             queried_as: queried_as.map(str::to_string),
             results: page.results,
             has_more: page.has_more,
@@ -345,7 +405,7 @@ fn rank_candidates(
     // the copy here was three kinds where that one is five.
     let base_sql = format!(
         "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
-         n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
+         n.startLine AS startLine, n.endLine AS endLine, n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
          CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
          FROM nodes n WHERE {filter} AND {}",
         queries::declaration_only("n.")
@@ -358,10 +418,13 @@ fn rank_candidates(
             id: id.clone(),
             qualified_name: row.get("qualifiedName")?,
             file_path: row.get("filePath")?,
+            start_line: Some(row.get("startLine")?),
+            end_line: Some(row.get("endLine")?),
             kind: row.get("kind")?,
             preview: row
                 .get::<_, Option<String>>("signature")?
                 .or(row.get::<_, Option<String>>("docComment")?),
+            source: None,
         };
         Ok((candidate, score, id))
     }
@@ -603,11 +666,17 @@ where
 /// exactly what `find_definition` means by it, down to the error text.
 /// Shaped like `find_callers_callees`' old `resolve_anchor` rather than a
 /// bespoke enum so every call site is the same two-line `match`.
+///
+/// `source_root` is where an ambiguous page reads its candidates' source from
+/// (see [`CandidatePage::ambiguous`]); `None` leaves the candidates without
+/// it. Only `find_definition` passes one: an anchored tool's answer per
+/// candidate is a whole page of edges, not the declaration's text.
 pub(super) fn resolve_symbol_name(
     conn: &Connection,
     semantic: &SemanticRung<'_>,
     name: &str,
     cursor: Option<&str>,
+    source_root: Option<&Path>,
 ) -> Result<Result<Resolved, CallToolResult>, ErrorData> {
     let mut exact = queries::find_by_qualified_name(conn, name, None)
         .map_err(|e| internal_error("failed to look up node by qualifiedName", e))?;
@@ -639,7 +708,7 @@ pub(super) fn resolve_symbol_name(
     if let Some(column) = ambiguous_over {
         let page = find_candidates_by_name(conn, column, &[Lookup::any(name)], cursor)
             .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
-        return success(&CandidatePage::ambiguous(page, None)).map(Err);
+        return success(&CandidatePage::ambiguous(page, None, cursor, source_root)).map(Err);
     }
 
     match matches.into_iter().next() {
@@ -651,9 +720,9 @@ pub(super) fn resolve_symbol_name(
             let by = if exact.len() == 1 { ResolvedBy::QualifiedName } else { ResolvedBy::Name };
             Ok(Ok(Resolved::new(node, by)))
         }
-        None => match by_qualified_name_suffix(conn, name, cursor)? {
+        None => match by_qualified_name_suffix(conn, name, cursor, source_root)? {
             Some(answer) => Ok(answer),
-            None => match by_stripped_prefix(conn, semantic.shapes(), name, cursor)? {
+            None => match by_stripped_prefix(conn, semantic.shapes(), name, cursor, source_root)? {
                 Some(answer) => Ok(answer),
                 None => by_file_name(conn, semantic, name),
             },
@@ -674,6 +743,7 @@ fn by_qualified_name_suffix(
     conn: &Connection,
     name: &str,
     cursor: Option<&str>,
+    source_root: Option<&Path>,
 ) -> Result<Option<Result<Resolved, CallToolResult>>, ErrorData> {
     let mut matched = queries::find_by_qualified_suffix(conn, name)
         .map_err(|e| internal_error("failed to look up nodes by qualifiedName suffix", e))?;
@@ -683,7 +753,7 @@ fn by_qualified_name_suffix(
         _ => {
             let page = find_candidates_by_qualified_suffix(conn, &[Lookup::any(name)], cursor)
                 .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
-            success(&CandidatePage::ambiguous(page, None)).map(|page| Some(Err(page)))
+            success(&CandidatePage::ambiguous(page, None, cursor, source_root)).map(|page| Some(Err(page)))
         }
     }
 }
@@ -706,6 +776,7 @@ fn by_stripped_prefix(
     shapes: &QueryShapes,
     name: &str,
     cursor: Option<&str>,
+    source_root: Option<&Path>,
 ) -> Result<Option<Result<Resolved, CallToolResult>>, ErrorData> {
     let mut lookups: Vec<Lookup<'_>> = Vec::new();
     for (language, remainder) in shapes.rewrites(name) {
@@ -755,7 +826,8 @@ fn by_stripped_prefix(
     if let Some(column) = ambiguous_over {
         let page = find_candidates_by_name(conn, column, &lookups, cursor)
             .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
-        return success(&CandidatePage::ambiguous(page, page_label)).map(|page| Some(Err(page)));
+        return success(&CandidatePage::ambiguous(page, page_label, cursor, source_root))
+            .map(|page| Some(Err(page)));
     }
     if !matches.is_empty() {
         let by = if exact.len() == 1 { ResolvedBy::QualifiedName } else { ResolvedBy::Name };
@@ -770,7 +842,8 @@ fn by_stripped_prefix(
         _ => {
             let page = find_candidates_by_qualified_suffix(conn, &lookups, cursor)
                 .map_err(|e| internal_error("failed to rank ambiguous candidates", e))?;
-            success(&CandidatePage::ambiguous(page, page_label)).map(|page| Some(Err(page)))
+            success(&CandidatePage::ambiguous(page, page_label, cursor, source_root))
+                .map(|page| Some(Err(page)))
         }
     }
 }
@@ -1082,8 +1155,11 @@ fn by_file_name(
                 id: n.id.clone(),
                 qualified_name: n.qualified_name.clone(),
                 file_path: n.file_path.clone(),
+                start_line: Some(n.start_line),
+                end_line: Some(n.end_line),
                 kind: n.kind.clone(),
                 preview: n.signature.clone().or_else(|| n.doc_comment.clone()),
+                source: None,
             })
             .collect(),
     })
@@ -1099,7 +1175,21 @@ fn by_name(
     name: &str,
     cursor: Option<&str>,
 ) -> Result<CallToolResult, ErrorData> {
-    match resolve_symbol_name(conn, semantic, name, cursor)? {
+    match resolve_symbol_name(conn, semantic, name, cursor, project_root)? {
+        Ok(resolved) => success(&DefinitionNode::resolved(resolved).with_source(project_root)),
+        Err(finished) => Ok(finished),
+    }
+}
+
+/// `find_definition` by an exact node id - the follow-up an ambiguous page
+/// asks for. The same lookup the anchored tools make for their `symbol_id`,
+/// so the two refuse an unknown id in the same words.
+fn by_symbol_id(
+    conn: &Connection,
+    project_root: Option<&Path>,
+    symbol_id: &str,
+) -> Result<CallToolResult, ErrorData> {
+    match super::anchor::by_id(conn, symbol_id)? {
         Ok(resolved) => success(&DefinitionNode::resolved(resolved).with_source(project_root)),
         Err(finished) => Ok(finished),
     }
@@ -1128,6 +1218,16 @@ pub(super) fn handle_in(
     // to ask for the thing that saves them a round trip.
     let project_root = params.include_source.unwrap_or(true).then_some(project_root);
 
+    // One addressing mode per call, as the anchored tools require: an id
+    // given beside a name or a position would leave one of them unread, and
+    // which one wins is not something a caller should have to guess.
+    if let Some(symbol_id) = params.symbol_id {
+        return match (params.symbol_name, params.file_path, params.position) {
+            (None, None, None) => by_symbol_id(&conn, project_root, &symbol_id),
+            _ => error("g-mesh: give `symbol_id` alone, without `symbol_name`, `file_path` or `position`"),
+        };
+    }
+
     match (params.file_path, params.position, params.symbol_name) {
         (Some(file_path), Some(position), _) => {
             by_position(&conn, project_root, &file_path, position.line, position.col)
@@ -1137,7 +1237,7 @@ pub(super) fn handle_in(
             error("g-mesh: `cursor` continues a previous ambiguous symbol_name lookup - give the same symbol_name again")
         }
         (None, None, None) => {
-            error("g-mesh: give either `symbol_name`, or both `file_path` and `position`")
+            error("g-mesh: give `symbol_id`, `symbol_name`, or both `file_path` and `position`")
         }
         _ => error("g-mesh: `file_path` and `position` must be given together"),
     }
