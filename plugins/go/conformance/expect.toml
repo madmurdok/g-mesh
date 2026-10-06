@@ -299,15 +299,12 @@ excluded_references = { count = 6, files = [
 # `find_definition` only ever consults it when resolution turns out
 # ambiguous (decision 3) - here it doesn't, and the entry still passes.
 #
-# `helper` was deliberately not used for this: it is declared twice
-# (helper.go and server/conn.go's `helper`), but both share the *same*
-# qualifiedName `helper` - Go's qualifiedName carries no container, unlike a
-# `filePath` - so `file` narrows `find_definition`'s *candidate* list to one
-# but its disambiguated re-call (by qualifiedName; `find_definition` has no
-# `symbol_id`, decision 3) is exactly as ambiguous as the first attempt. Not
-# a fixture gap: no `[[definition]]` entry over two same-qualifiedName Go
-# declarations can ever pass this way, which is worth knowing before
-# reaching for `helper` here again.
+# `helper` is not used for this: it is declared twice (helper.go and
+# server/conn.go's `helper`) under the *same* qualifiedName `helper` - Go's
+# qualifiedName carries no container, unlike a `filePath` - so a name alone
+# cannot tell the two apart. `file` narrows `find_definition`'s candidate list
+# to one, and the retry then anchors on that candidate's `symbol_id`
+# (decision 3), not on the name.
 [[definition]]
 symbol = "Server.Addr"
 file = "server/server.go"

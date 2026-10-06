@@ -5,7 +5,7 @@ This directory is the index and home for g-mesh's architecture decisions.
 ## Template
 
 New decisions get their own file: `docs/adr/NNNN-<slug>.md` (four-digit,
-zero-padded, incrementing — the next free number is `0028`). Use this
+zero-padded, incrementing — the next free number is `0029`). Use this
 template:
 
 ```markdown
@@ -98,3 +98,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0025 | [Project walks follow symlinks; a file's identity is its real spelling when the plain walk reaches it](0025-project-walk-follows-symlinks.md) | Accepted |
 | 0026 | [Created files of one batch reach the plugin as a `filesCreated` notification](0026-batch-created-files-notification.md) | Accepted |
 | 0027 | [Plugin fetch verifies checksums in Rust, a third implementation of the install rule](0027-plugin-fetch-checksums-in-rust.md) | Accepted |
+| 0028 | [Anchored responses rank by structure and answer before evidence](0028-anchored-responses-rank-and-answer-first.md) | Accepted |
