@@ -321,8 +321,8 @@ g-mesh plugins install --from <path>   # new: from a local file
 g-mesh plugins remove <language>    # new: delete the directory
 ```
 
-`install` reuses `install.sh`'s checksum discipline (already 21 lines of it) and
-verifies before unpacking. `remove` deletes `plugins/<language>/` and nothing
+`install` applies `install.sh`'s checksum discipline, reimplemented in Rust on
+top of `cli/model.rs`'s download (ADR 0027), and verifies before unpacking. `remove` deletes `plugins/<language>/` and nothing
 else - there is no config to edit, which is the whole benefit of
 filesystem-based discovery.
 
