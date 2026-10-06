@@ -188,8 +188,9 @@ struct CandidatePage {
     /// a caller reads one field to tell an ambiguity from the other kind of
     /// candidate page (`fileName`), rather than inferring it from `ambiguous`.
     resolved_by: ResolvedBy,
-    /// How to pick from this page: `session_hints::AMBIGUOUS`, or
-    /// `AMBIGUOUS_SOURCED` when the candidates carry their source.
+    /// How to pick from this page: `session_hints::AMBIGUOUS`,
+    /// `AMBIGUOUS_SOURCED` when every candidate carries its source, or
+    /// `AMBIGUOUS_PARTLY_SOURCED` when only some do.
     explanation: &'static str,
     /// The name looked up in place of the query - see [`Resolved::queried_as`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,6 +209,12 @@ impl CandidatePage {
     /// readings apart without a second call. Every candidate or none: the
     /// page answers each reading equally and still picks none of them, which
     /// is what keeps it from reading as a confident answer to the first one.
+    ///
+    /// "Every" is what is attempted, not what is promised: a candidate whose
+    /// span cannot be read (a Python `Module` whose `endLine` is one past the
+    /// file's last line, a file edited since the walk) comes back without
+    /// `source`, and the explanation then says "some", so it never claims a
+    /// source the page does not carry.
     fn ambiguous(
         mut page: pagination::Page<DefinitionCandidate>,
         queried_as: Option<&str>,
@@ -215,7 +222,7 @@ impl CandidatePage {
         source_root: Option<&Path>,
     ) -> Self {
         let whole_set_here = cursor.is_none() && !page.has_more && page.results.len() <= SOURCED_CANDIDATES;
-        let mut sourced = false;
+        let mut sourced = 0;
         if let (true, Some(root)) = (whole_set_here, source_root) {
             for candidate in &mut page.results {
                 if let (Some(start), Some(end)) = (candidate.start_line, candidate.end_line) {
@@ -227,17 +234,17 @@ impl CandidatePage {
                         CANDIDATE_SOURCE_LINES,
                         CANDIDATE_SOURCE_CHARS,
                     );
-                    sourced |= candidate.source.is_some();
+                    sourced += usize::from(candidate.source.is_some());
                 }
             }
         }
         Self {
             ambiguous: true,
             resolved_by: ResolvedBy::NameAmbiguous,
-            explanation: if sourced {
-                super::session_hints::AMBIGUOUS_SOURCED
-            } else {
-                super::session_hints::AMBIGUOUS
+            explanation: match sourced {
+                0 => super::session_hints::AMBIGUOUS,
+                n if n == page.results.len() => super::session_hints::AMBIGUOUS_SOURCED,
+                _ => super::session_hints::AMBIGUOUS_PARTLY_SOURCED,
             },
             queried_as: queried_as.map(str::to_string),
             results: page.results,

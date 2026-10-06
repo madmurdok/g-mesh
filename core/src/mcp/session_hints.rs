@@ -95,6 +95,12 @@ pub(crate) const AMBIGUOUS_SOURCED: &str =
     "Several declarations have this name, each with its source; none is preferred. Pick by reading; \
      re-query an `id` as `symbol_id` only for a source with `omittedLines`.";
 
+/// `AMBIGUOUS_SOURCED` for a page where some candidates could not be given
+/// their source: those, like a cut body, need the follow-up.
+pub(crate) const AMBIGUOUS_PARTLY_SOURCED: &str =
+    "Several declarations have this name, some with their source; none is preferred. Re-query an `id` \
+     as `symbol_id` for one without `source` or with `omittedLines`.";
+
 pub(crate) const FILE_ROW: &str =
     "A `kind: File` row is a usage outside any tracked symbol, so the file itself is the answer; \
      don't grep it for the line.";
@@ -222,6 +228,7 @@ mod tests {
             PROVENANCE,
             AMBIGUOUS,
             AMBIGUOUS_SOURCED,
+            AMBIGUOUS_PARTLY_SOURCED,
             FILE_ROW,
             FILES_TALLY,
             WALK_COMPLETE,
