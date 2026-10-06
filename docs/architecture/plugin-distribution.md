@@ -314,11 +314,11 @@ can - but only once this contract exists.
 ### CLI
 
 ```
-g-mesh plugins list                 # exists
-g-mesh plugins check <dir>          # exists
-g-mesh plugins install <language>   # new: fetch from the GitHub release
-g-mesh plugins install --from <path>   # new: from a local file
-g-mesh plugins remove <language>    # new: delete the directory
+g-mesh plugins list                    # exists
+g-mesh plugins check <dir>             # exists
+g-mesh plugins install <language>      # fetch from this version's GitHub release
+g-mesh plugins install --from <path>   # local .tar.gz or plugin directory, no network
+g-mesh plugins remove <language>       # delete the directory
 ```
 
 `install` applies `install.sh`'s checksum discipline, reimplemented in Rust on

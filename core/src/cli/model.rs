@@ -27,7 +27,9 @@
 //! - Everything below except [`run`] is private, so even a deliberate
 //!   `crate::cli::model::...` from daemon code has nothing to call but the
 //!   whole user-facing command, printing progress to a terminal that isn't
-//!   there.
+//!   there. The two exceptions, [`fetch_to_file`] and [`fetch_text`], are
+//!   `pub(super)`: visible to `cli`'s own `plugins install` and to nothing
+//!   outside `cli`.
 //! - The dependency direction agrees: `cli` already depends on `daemon` and
 //!   `shim` (its `dispatch` hands commands to both), so `daemon` importing
 //!   `cli` would be a cycle in the module graph, not a small edit.
@@ -40,6 +42,17 @@
 //! fails if they ever drift apart. The target directory comes from
 //! [`crate::embedding::resolve_model_dir`], the loader's own resolution, so
 //! "downloaded successfully" and "model not found" cannot both be true.
+//!
+//! # Plugin assets
+//!
+//! `g-mesh plugins install <language>` downloads through [`fetch_to_file`],
+//! which streams and hashes exactly as the model download does but hands the
+//! digest back instead of comparing it to a pinned constant: a plugin's
+//! expected digest comes from the `.sha256` published beside it. The rule the
+//! caller applies - per-asset `.sha256`, compare before unpacking, refuse and
+//! delete on mismatch, print both digests - is also implemented in
+//! `scripts/install.sh` and `scripts/install.ps1`; change all three
+//! ([ADR 0027](../../../docs/adr/0027-plugin-fetch-checksums-in-rust.md)).
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -376,12 +389,7 @@ fn fetch(explicit: Option<&Path>, rerank_dir: Option<&Path>, out: &mut impl Writ
     let dir = prepare_dir(explicit, &model)?;
     writeln!(out, "model directory: {}", dir.display())?;
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(READ_TIMEOUT)
-        .user_agent(concat!("g-mesh/", env!("CARGO_PKG_VERSION")))
-        .build();
-
+    let agent = http_agent();
     let sources = sources();
     fetch_files(&agent, &dir, &FILES, &sources, out)?;
     writeln!(out, "\nmodel ready in {}", dir.display())?;
@@ -604,30 +612,7 @@ fn download_to_partial(
     source: &Source,
 ) -> Result<()> {
     let url = source.url(file);
-    let response = agent.get(&url).call().with_context(|| format!("failed to download {url}"))?;
-
-    let mut source = response.into_reader();
-    let mut sink =
-        File::create(partial).with_context(|| format!("failed to create {}", partial.display()))?;
-    let mut hasher = Sha256::new();
-    // 256 KiB: large enough that syscall overhead is noise against a 154 MiB
-    // transfer, small enough to stay off the stack and out of the way.
-    let mut buffer = vec![0u8; 256 * 1024];
-    let mut written: u64 = 0;
-    let mut progress = Progress::new(file.size);
-
-    loop {
-        let read = source.read(&mut buffer).with_context(|| format!("failed while reading {url}"))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        sink.write_all(&buffer[..read]).with_context(|| format!("failed to write {}", partial.display()))?;
-        written += read as u64;
-        progress.report(written);
-    }
-    sink.flush().with_context(|| format!("failed to flush {}", partial.display()))?;
-    progress.finish(written);
+    let (written, digest) = stream_hashed(agent, &url, partial, Some(file.size))?;
 
     // Size first: a truncated transfer is the common failure and saying so
     // plainly beats reporting a digest mismatch the user cannot act on.
@@ -639,7 +624,6 @@ fn download_to_partial(
             file.size
         );
     }
-    let digest = hex(&hasher.finalize());
     if digest != file.sha256 {
         bail!(
             "{} does not match the pinned revision {}: sha256 {digest}, expected {}. \
@@ -650,6 +634,78 @@ fn download_to_partial(
         );
     }
     Ok(())
+}
+
+/// The client every download in this module uses.
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(READ_TIMEOUT)
+        .user_agent(concat!("g-mesh/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
+/// Streams `url` into `dest`, hashing as it goes, and returns the bytes
+/// written and their SHA-256 as lowercase hex. `expected_size` only drives the
+/// progress line; `None` takes it from the response's `Content-Length`, and an
+/// unknown size draws none.
+fn stream_hashed(
+    agent: &ureq::Agent,
+    url: &str,
+    dest: &Path,
+    expected_size: Option<u64>,
+) -> Result<(u64, String)> {
+    let response = agent.get(url).call().with_context(|| format!("failed to download {url}"))?;
+    let expected_size = expected_size
+        .or_else(|| response.header("Content-Length").and_then(|len| len.parse().ok()))
+        .unwrap_or(0);
+
+    let mut source = response.into_reader();
+    let mut sink = File::create(dest).with_context(|| format!("failed to create {}", dest.display()))?;
+    let mut hasher = Sha256::new();
+    // 256 KiB: large enough that syscall overhead is noise against a 154 MiB
+    // transfer, small enough to stay off the stack and out of the way.
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut written: u64 = 0;
+    let mut progress = Progress::new(expected_size);
+
+    loop {
+        let read = source.read(&mut buffer).with_context(|| format!("failed while reading {url}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        sink.write_all(&buffer[..read]).with_context(|| format!("failed to write {}", dest.display()))?;
+        written += read as u64;
+        progress.report(written);
+    }
+    sink.flush().with_context(|| format!("failed to flush {}", dest.display()))?;
+    progress.finish(written);
+
+    Ok((written, hex(&hasher.finalize())))
+}
+
+/// Downloads `url` into `dest` and returns the SHA-256 of what arrived, as
+/// lowercase hex. Comparing it is the caller's job; on any error `dest` is
+/// deleted rather than left half-written.
+pub(super) fn fetch_to_file(url: &str, dest: &Path) -> Result<String> {
+    stream_hashed(&http_agent(), url, dest, None).map(|(_, digest)| digest).inspect_err(|_| {
+        let _ = fs::remove_file(dest);
+    })
+}
+
+/// Downloads a small text resource (a `.sha256` file) into memory. Capped so a
+/// wrong URL serving something large fails instead of filling memory.
+pub(super) fn fetch_text(url: &str) -> Result<String> {
+    const LIMIT: u64 = 64 * 1024;
+    let response = http_agent().get(url).call().with_context(|| format!("failed to download {url}"))?;
+    let mut text = String::new();
+    response
+        .into_reader()
+        .take(LIMIT)
+        .read_to_string(&mut text)
+        .with_context(|| format!("failed while reading {url}"))?;
+    Ok(text)
 }
 
 /// Lowercase hex, the form both Hugging Face and `shasum -a 256` print, so a
@@ -890,7 +946,7 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "only cli/model.rs may use the HTTP client; found it in {offenders:?}. \
-             g-mesh does not reach the network outside an explicit `g-mesh model fetch`."
+             g-mesh does not reach the network outside an explicit `g-mesh model fetch` or `g-mesh plugins install`."
         );
     }
 
