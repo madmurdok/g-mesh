@@ -33,6 +33,7 @@ pub mod embed_eval;
 pub mod init;
 pub mod model;
 pub mod plugin_check;
+pub mod plugin_install;
 pub mod plugins;
 pub mod reindex;
 pub mod status;
@@ -215,6 +216,15 @@ pub enum PluginsCommand {
     /// Run a plugin against a fixture project through the real index and
     /// linker, and report every conformance check it fails.
     Check(plugin_check::PluginCheckArgs),
+    /// Install a language plugin beside this g-mesh binary: from this
+    /// version's GitHub release, or with `--from` from a local archive or
+    /// directory without touching the network.
+    Install(plugin_install::InstallArgs),
+    /// Delete an installed language plugin's directory.
+    Remove {
+        /// The plugin's language, as `plugins list` names it.
+        language: String,
+    },
 }
 
 /// The embedding model's own commands, grouped under `model` rather than
@@ -222,9 +232,9 @@ pub enum PluginsCommand {
 /// `plugins` is: they act on one thing, and the group is where a later
 /// `model rm` or `model verify` belongs.
 ///
-/// `fetch` is the only command in the whole CLI that opens a network
-/// connection, and it does so *because the user typed it* - see
-/// [`crate::cli::model`] for how that stays true.
+/// `fetch` and `plugins install <language>` are the only commands in the whole
+/// CLI that open a network connection, and they do so *because the user typed
+/// them* - see [`crate::cli::model`] for how that stays true.
 #[derive(Debug, Subcommand)]
 pub enum ModelCommand {
     /// Download the embedding model's weights (~154 MiB) and the search
@@ -308,6 +318,8 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Plugins { command } => match command {
             PluginsCommand::List => plugins::run(),
             PluginsCommand::Check(args) => plugin_check::run(&args),
+            PluginsCommand::Install(args) => plugin_install::install(&args),
+            PluginsCommand::Remove { language } => plugin_install::remove(&language),
         },
         Command::Model { command } => model::run(&command),
         Command::Clean(args) => clean::run(&args),
