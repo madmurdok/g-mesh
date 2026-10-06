@@ -61,7 +61,7 @@
 //! asserts every expectation passes - the acceptance criterion "the TS
 //! fixture passes". The rest of GM-277's own tests
 //! (`a_wrong_expectation_reports_a_readable_diff`,
-//! `an_ambiguous_symbol_fails_with_its_candidates`,
+//! `an_ambiguous_symbol_fails_with_its_candidates_and_file_disambiguates_it`,
 //! `an_unknown_expectation_key_is_a_hard_parse_error`,
 //! `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`) use small,
 //! purpose-built fixtures of their own - the toy `fake` language for the
@@ -948,19 +948,12 @@ fn a_wrong_expectation_reports_a_readable_diff() {
 /// ambiguous - the expectation fails with every candidate's id/
 /// qualifiedName/filePath/kind printed, never a silent pick (decision 3).
 ///
-/// The `[[definition]]` and `[[callers]]` kinds are both exercised here
-/// because they disambiguate differently once `file` narrows the candidate
-/// list to one (`expectations.rs`'s module doc, decision 3): the four
-/// `symbol_id`-accepting tools (`callers` among them) re-call by that exact
-/// id and always land on the one candidate meant. `find_definition` has no
-/// `symbol_id` parameter, so its own disambiguated re-call is by
-/// `qualifiedName` - which stays ambiguous here on purpose (both `shared`
-/// declarations share the bare name `qualifiedName` too, the fake
-/// language's convention), so `[[definition]]`'s `file` case is asserted to
-/// still fail, with its own distinct message, rather than silently claimed
-/// to work when it can't.
+/// Once `file` narrows the candidate list to one, the re-call is by that
+/// candidate's own `symbol_id` and lands on the one meant. Both
+/// `[[definition]]` and `[[callers]]` are exercised, since every tool the
+/// expectations call accepts a `symbol_id`.
 #[test]
-fn an_ambiguous_symbol_fails_with_its_candidates() {
+fn an_ambiguous_symbol_fails_with_its_candidates_and_file_disambiguates_it() {
     let fixture = write_fk_fixture(&[("a.fk", "fn shared\n"), ("b.fk", "fn shared\nfn user\ncall shared\n")]);
     let expect = write_expect_file(
         fixture.path(),
@@ -979,25 +972,14 @@ fn an_ambiguous_symbol_fails_with_its_candidates() {
     assert!(run.stdout.contains("filePath=a.fk"), "{}", run.stdout);
     assert!(run.stdout.contains("filePath=b.fk"), "{}", run.stdout);
 
-    // `find_definition` has no `symbol_id`: narrowing by `file` still leaves
-    // its re-call ambiguous by `qualifiedName` alone, and that failure is
-    // reported rather than silently guessed at.
-    let expect_still_ambiguous = write_expect_file(
+    // `file` narrows to one candidate and the re-call by its `symbol_id`
+    // resolves it.
+    let expect_by_file = write_expect_file(
         fixture.path(),
         "[[definition]]\nsymbol = \"shared\"\nfile = \"a.fk\"\nexpect = [\"a.fk:shared\"]\n",
     );
-    let run_still_ambiguous = run_check_with_expect(&fake.dir, fixture.path(), &expect_still_ambiguous);
-    assert_eq!(
-        run_still_ambiguous.outcome("expectations.definition[0]"),
-        "FAIL",
-        "{}",
-        run_still_ambiguous.stdout
-    );
-    assert!(
-        run_still_ambiguous.stdout.contains("has no symbol_id parameter to disambiguate further"),
-        "{}",
-        run_still_ambiguous.stdout
-    );
+    let run_by_file = run_check_with_expect(&fake.dir, fixture.path(), &expect_by_file);
+    assert_eq!(run_by_file.outcome("expectations.definition[0]"), "PASS", "{}", run_by_file.stdout);
 
     // `[[callers]]` disambiguates cleanly: it re-calls by the winning
     // candidate's own `symbol_id`, so `file` alone is enough.

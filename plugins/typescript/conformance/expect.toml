@@ -383,8 +383,9 @@ expect = [
 ]
 files = ["src/callbacks.ts:3"]
 # The module-level `leaf();` has no enclosing declaration: it is a usage from
-# the file, not a caller, and is disclosed here rather than listed.
-excluded_references = { count = 1, files = ["src/callbacks.ts:1"] }
+# the file, not a caller, and is disclosed here rather than listed. It is
+# counted, but its file is not repeated: `files` above already names it.
+excluded_references = { count = 1, files = [] }
 
 # --- a parameter that shadows a module function ------------------------------
 

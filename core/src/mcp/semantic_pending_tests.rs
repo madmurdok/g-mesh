@@ -52,16 +52,16 @@ fn file_node(file: &str) -> NodeRecord {
     NodeRecord::new(format!("file-{file}"), "File", file, file, file, "rust")
 }
 
-/// One walk of the fixture: `a1`/`c1` call `target` (edges `e1-c`, `e2-a`,
-/// so `c1` pages first), `a_impl`/`c_impl` implement `iface`. `a_signature`
-/// is `a1`'s.
+/// One walk of the fixture: `a1` (in `p.rs`) and `c1` (in `c.rs`) call
+/// `target`, so `c1` pages first by file path; `a_impl`/`c_impl` implement
+/// `iface`. `a_signature` is `a1`'s.
 fn walk(a_signature: &str) -> Diff {
-    let mut upsert_nodes: Vec<NodeRecord> = ["a.rs", "c.rs", "t.rs"].iter().map(|f| file_node(f)).collect();
+    let mut upsert_nodes: Vec<NodeRecord> = ["p.rs", "c.rs", "t.rs"].iter().map(|f| file_node(f)).collect();
     upsert_nodes.extend([
         node("target", "t.rs", "fn target()"),
         node("iface", "t.rs", "trait Iface"),
-        node("a1", "a.rs", a_signature),
-        node("a_impl", "a.rs", "struct AImpl"),
+        node("a1", "p.rs", a_signature),
+        node("a_impl", "p.rs", "struct AImpl"),
         node("c1", "c.rs", "fn c()"),
         node("c_impl", "c.rs", "struct CImpl"),
     ]);
@@ -78,7 +78,7 @@ fn walk(a_signature: &str) -> Diff {
 }
 
 /// A live index after a workspace reindex of `rust` swapped in a walk where
-/// only `a1`'s signature changed, before the semantic pass: `a.rs` pending.
+/// only `a1`'s signature changed, before the semantic pass: `p.rs` pending.
 fn after_a_swap() -> (tempfile::TempDir, Arc<IndexStore>) {
     let dir = tempfile::tempdir().unwrap();
     let live_path = dir.path().join("index.db");
@@ -176,16 +176,16 @@ fn pending_files(body: &serde_json::Value) -> serde_json::Value {
 
 /// Between the swap and the pass, each of the four tools names the pending
 /// file a response touches. Controls: disclose with an empty touched set
-/// (`a.rs` is not named where it is only a row's file); don't write the rows
+/// (`p.rs` is not named where it is only a row's file); don't write the rows
 /// in the swap (`semanticTier` reads `absent`).
 #[test]
 fn during_the_pass_each_tool_names_the_pending_files_it_touches() {
     let (_dir, store) = after_a_swap();
 
-    assert_eq!(pending_files(&callers(&store, by_id("target"))), serde_json::json!(["a.rs"]));
-    assert_eq!(pending_files(&references(&store, "target")), serde_json::json!(["a.rs"]));
-    assert_eq!(pending_files(&implementations_of(&store, "iface")), serde_json::json!(["a.rs"]));
-    assert_eq!(pending_files(&callees(&store, "a1")), serde_json::json!(["a.rs"]), "the anchor's file");
+    assert_eq!(pending_files(&callers(&store, by_id("target"))), serde_json::json!(["p.rs"]));
+    assert_eq!(pending_files(&references(&store, "target")), serde_json::json!(["p.rs"]));
+    assert_eq!(pending_files(&implementations_of(&store, "iface")), serde_json::json!(["p.rs"]));
+    assert_eq!(pending_files(&callees(&store, "a1")), serde_json::json!(["p.rs"]), "the anchor's file");
 }
 
 /// A response touching no pending file still says the language is pending,
@@ -204,7 +204,7 @@ fn a_response_touching_no_pending_file_carries_the_language_level_fact() {
     assert!(!provenance.contains_key("pendingFilesOmitted"), "{body}");
 }
 
-/// `a.rs` only in the `files` tally, not in the one row of the page, is still
+/// `p.rs` only in the `files` tally, not in the one row of the page, is still
 /// named. Control: leave the tally out of the touched set.
 #[test]
 fn a_pending_file_named_only_by_the_tally_is_disclosed() {
@@ -214,10 +214,10 @@ fn a_pending_file_named_only_by_the_tally_is_disclosed() {
 
     assert_eq!(body["results"][0]["filePath"], "c.rs", "{body}");
     assert!(
-        body["files"].as_array().is_some_and(|files| files.iter().any(|f| f["path"] == "a.rs")),
+        body["files"].as_array().is_some_and(|files| files.iter().any(|f| f["path"] == "p.rs")),
         "{body}"
     );
-    assert_eq!(pending_files(&body), serde_json::json!(["a.rs"]));
+    assert_eq!(pending_files(&body), serde_json::json!(["p.rs"]));
 }
 
 /// Once the pass completes, the block is gone entirely.
@@ -277,12 +277,13 @@ fn many_implementors(count: usize, name_bytes: usize, file: impl Fn(usize) -> St
 }
 
 /// Thirty pending files in a page cut at the byte budget: 25 listed, the
-/// other 5 counted, and the whole response inside `MAX_RESPONSE_BYTES`.
-/// Controls: reserve nothing for a pending block (`page_reserve` returns 0)
-/// -> over budget; drop the cap -> 30 listed.
+/// other 5 counted, and the whole response inside `MAX_RESPONSE_BYTES`. One
+/// implementor per file; the pending ones sort first by path, so all thirty
+/// are on the page. Controls: reserve nothing for a pending block
+/// (`page_reserve` returns 0) -> over budget; drop the cap -> 30 listed.
 #[test]
 fn the_pending_list_is_capped_and_the_page_keeps_its_budget() {
-    let file = |i: usize| format!("src/pending/module_{:02}/implementation.rs", i % 30);
+    let file = |i: usize| format!("src/pending/module_{i:02}/implementation.rs");
     let files: Vec<String> = (0..30).map(file).collect();
     let store = pending_index(&many_implementors(60, 430, file), &files);
 
