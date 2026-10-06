@@ -52,6 +52,8 @@ mod instructions;
 mod member_name_collision_tests;
 mod provenance;
 pub(crate) mod query_shapes;
+#[cfg(test)]
+mod response_bound_tests;
 mod search_code;
 #[cfg(test)]
 mod search_code_rerank_tests;

@@ -279,8 +279,9 @@ fn many_implementors(count: usize, name_bytes: usize, file: impl Fn(usize) -> St
 /// Thirty pending files in a page cut at the byte budget: 25 listed, the
 /// other 5 counted, and the whole response inside `MAX_RESPONSE_BYTES`. One
 /// implementor per file; the pending ones sort first by path, so all thirty
-/// are on the page. Controls: reserve nothing for a pending block
-/// (`page_reserve` returns 0) -> over budget; drop the cap -> 30 listed.
+/// are on the page. Controls: measure candidate pages without their
+/// `provenance` block (single-hop `find_implementations::handle_in`) -> over
+/// budget; drop the entry cap -> 30 listed.
 #[test]
 fn the_pending_list_is_capped_and_the_page_keeps_its_budget() {
     let file = |i: usize| format!("src/pending/module_{i:02}/implementation.rs");
@@ -617,19 +618,18 @@ fn transitive_walks_send_the_provenance_sentence_once_per_session() {
     assert!(hint_of(&other_session).contains(PROVENANCE), "a new session gets it: {other_session}");
 }
 
-/// The page budget (`MAX_RESPONSE_BYTES`, on the `results` array) holds
-/// back the provenance sentence's bytes: `results` plus the `hint` field
-/// stays within it. With rows shorter than that field, a cut without the
-/// reserve stops less than one row short of the budget, so adding the
-/// field goes over. With `provenance: absent` there is no pending list to
-/// reserve for. Control: make `page_reserve` return 0 for
-/// `Resolved::Absent`.
+/// Candidate pages are measured with the provenance sentence in their
+/// `hint`: the whole response stays within `MAX_RESPONSE_BYTES`. With rows
+/// shorter than that field, a cut that ignored it would stop less than one
+/// row short of the ceiling, so adding the field would go over. With `provenance: absent` there is no pending
+/// list. Control: measure candidate pages with no `hint` (single-hop
+/// `find_implementations::handle_in`).
 #[test]
 fn a_page_at_the_budget_edge_keeps_room_for_the_provenance_sentence() {
     let store = pending_index(&many_implementors(300, 4, |i| format!("m{i:03}.rs")), &[]);
     store.with(|conn| conn.execute("DELETE FROM semantic_pending", [])).unwrap();
 
-    let (body, _) = implementations(
+    let (body, bytes) = implementations(
         &store,
         FindImplementationsParams {
             symbol_id: Some("iface".to_string()),
@@ -649,11 +649,7 @@ fn a_page_at_the_budget_edge_keeps_room_for_the_provenance_sentence() {
         longest_row < hint_field,
         "fixture: rows ({longest_row} bytes) shorter than the hint ({hint_field})"
     );
-    let results = body["results"].to_string().len();
-    assert!(
-        results + hint_field <= MAX_RESPONSE_BYTES,
-        "results {results} + hint {hint_field} bytes over {MAX_RESPONSE_BYTES}"
-    );
+    assert!(bytes <= MAX_RESPONSE_BYTES, "{bytes} bytes, hint {hint_field}, over {MAX_RESPONSE_BYTES}");
 }
 
 // ---------------------------------------------------------------------------

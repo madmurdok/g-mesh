@@ -400,11 +400,11 @@ fn crowded(with_untyped: bool) -> Arc<IndexStore> {
     Arc::new(IndexStore::new(conn))
 }
 
-/// Both handlers hold the field's bytes back from the row budget: with the
-/// field, a page cut by bytes carries fewer rows, and the whole response
-/// stays inside `MAX_RESPONSE_BYTES`. Control: drop the
-/// `UntypedReceiverCalls::wire_len` term from either handler's reserve (the
-/// row counts match).
+/// Both handlers measure the field with the rest of the response the rows
+/// are cut against: with the field, a page cut by bytes carries fewer rows,
+/// and the whole response stays inside `MAX_RESPONSE_BYTES`. Control: leave
+/// `untypedReceiverCalls` out of the candidate response either handler
+/// measures (`send` false) -> the row counts match and the page is over.
 #[test]
 fn both_handlers_reserve_the_fields_bytes() {
     let plain = crowded(false);
