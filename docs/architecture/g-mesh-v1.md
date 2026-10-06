@@ -1165,11 +1165,15 @@ exactly - the fix is to stay well under it by construction:
 `pagination::MAX_RESPONSE_BYTES` (20,000 bytes, comfortably under the
 smallest observed real rejection) bounds every list-shaped tool response's
 serialized size, truncating to the longest row prefix that still fits. On
-`find_references`/`find_callers`/`find_callees`/`find_implementations` the
-bound is on the whole response, not only its rows: each candidate page's
-complete response is measured and rows are cut until it fits, and the
-non-row fields stay small enough to leave rows room because every list among
-them is byte-capped (the `files` answer instead cuts its tally to fit).
+`find_references`/`find_callers`/`find_callees` and single-hop
+`find_implementations` the bound is on the whole response, not only its rows:
+each candidate page's complete response is measured and rows are cut until it
+fits, and the non-row fields stay small enough to leave rows room because
+every list among them is byte-capped (the `files` answer instead cuts its
+tally to fit). The transitive `find_implementations` walk
+(`transitive: true`) is not under this whole-response bound: its rows are
+cut to the ceiling less a fixed reserve for the rest of the response, and the
+complete response is never measured.
 Continuation for a `responseSize` cut reuses the `explorationBudget` arm's
 own `resumeToken` mechanism exactly (opaque token, cumulative across a resume
 chain) rather than a separate scheme, so a caller does not need to

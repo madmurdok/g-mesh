@@ -304,14 +304,16 @@ fn a_row_wider_than_the_ceiling_is_sent_alone() {
 
 // --- 2. a byte-cut tally says so -------------------------------------------
 
-/// 250 caller files of ~65-byte paths on a 5-row page: the `files` tally is
-/// cut to `FILE_TALLY_MAX_BYTES`, flagged, and names fewer files than the
-/// walk reaches while `total` stays exact. Control: drop the
-/// `truncate_to_bytes` call in `tally_edge_files_bounded`.
+/// 150 caller files of ~65-byte paths on a 5-row page - under the 200-entry
+/// cap, so only the byte cap can cut it: the `files` tally is cut to
+/// `FILE_TALLY_MAX_BYTES`, flagged, and names fewer files than the walk
+/// reaches while `total` stays exact. Controls: drop the `truncate_to_bytes`
+/// call in `tally_edge_files_bounded`, or leave its byte cut out of the
+/// flag it returns.
 #[test]
 fn a_files_tally_cut_by_bytes_is_flagged() {
     for tool in [Tool::Callers, Tool::References] {
-        let shape = Shape { fpad: 60, ..Shape::rows(250) };
+        let shape = Shape { fpad: 60, ..Shape::rows(150) };
         let (body, bytes) = ask(tool, &build(shape, tool), false, 5, None, None);
         assert!(bytes <= MAX_RESPONSE_BYTES, "{tool:?}: {bytes}");
         let files = &body["files"];
@@ -320,8 +322,8 @@ fn a_files_tally_cut_by_bytes_is_flagged() {
         let named = files.as_array().unwrap();
         assert!(!named.is_empty() && named.len() < 200, "{tool:?}: {} files", named.len());
         let tallied: i64 = named.iter().map(|tally| tally["refs"].as_i64().unwrap()).sum();
-        assert_eq!(body["total"], 250, "{tool:?}");
-        assert!((tallied as usize) < 250, "{tool:?}");
+        assert_eq!(body["total"], 150, "{tool:?}");
+        assert!((tallied as usize) < 150, "{tool:?}");
     }
 }
 
@@ -351,17 +353,18 @@ fn a_complete_files_tally_has_no_truncation_key() {
     }
 }
 
-/// 50 excluded files of ~105-byte paths: `excludedReferences.files` is cut to
+/// 30 excluded files of ~105-byte paths - under the 50-entry cap, so only
+/// the byte cap can cut it: `excludedReferences.files` is cut to
 /// `EXCLUDED_TALLY_MAX_BYTES` and flagged, its `count` still exact; a short
-/// one is complete and unflagged. Control: drop the `truncate_to_bytes` call
-/// in `ExcludedReferences::naming_only_new`.
+/// one is complete and unflagged. Controls: drop the `truncate_to_bytes` call
+/// in `ExcludedReferences::naming_only_new`, or leave its cut out of the flag.
 #[test]
 fn an_excluded_tally_cut_by_bytes_is_flagged() {
     for tool in [Tool::Callers, Tool::Callees] {
-        let shape = Shape { ex: 50, ex_pad: 100, ..Shape::rows(3) };
+        let shape = Shape { ex: 30, ex_pad: 100, ..Shape::rows(3) };
         let (body, _) = ask(tool, &build(shape, tool), false, 200, None, None);
         let excluded = &body["excludedReferences"];
-        assert_eq!(excluded["count"], 50, "{tool:?}: {body}");
+        assert_eq!(excluded["count"], 30, "{tool:?}: {body}");
         assert!(json_len(&excluded["files"]) <= EXCLUDED_TALLY_MAX_BYTES, "{tool:?}: {excluded}");
         assert!(!excluded["files"].as_array().unwrap().is_empty(), "{tool:?}");
         assert_eq!(excluded["filesTruncated"], true, "{tool:?}: {excluded}");
@@ -432,6 +435,24 @@ fn a_files_answer_cut_by_the_ceiling_is_flagged() {
         let (body, _) = ask(tool, &build(Shape::rows(40), tool), false, 200, None, Some(Answer::Files));
         assert_eq!(body["files"].as_array().unwrap().len(), 40, "{tool:?}");
         assert!(body.get("filesTruncated").is_none(), "{tool:?}: {body}");
+    }
+}
+
+/// A `files` or `count` answer carrying `provenance` also carries the
+/// once-per-session sentence explaining it, on the first ask of a fresh
+/// session: measuring candidate budgets must not spend it before the answer
+/// that is sent. Control: in `answer::respond`, measure with `build(budget,
+/// true)` -> the sent answer has `provenance` but no sentence.
+#[test]
+fn a_non_row_answer_keeps_the_provenance_sentence() {
+    for tool in [Tool::Callers, Tool::Callees, Tool::References] {
+        for answer in [Answer::Files, Answer::Count] {
+            let shape = Shape { pending: true, ..Shape::rows(3) };
+            let (body, _) = ask(tool, &build(shape, tool), true, 200, None, Some(answer));
+            assert!(body.get("provenance").is_some(), "{tool:?} {answer:?}: {body}");
+            let hint = body["hint"].as_str().unwrap_or_else(|| panic!("{tool:?} {answer:?}: {body}"));
+            assert!(hint.contains(super::session_hints::PROVENANCE), "{tool:?} {answer:?}: {hint}");
+        }
     }
 }
 
