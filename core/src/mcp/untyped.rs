@@ -31,9 +31,6 @@ use crate::storage::write::NodeRecord;
 /// sites.
 pub(crate) type UntypedReceiverCalls = CandidateTally;
 
-/// The response field this module fills, for [`CandidateTally::wire_len`].
-pub(crate) const FIELD: &str = "untypedReceiverCalls";
-
 /// The Rust plugin's `nativeKind`s for a member function: inherent method,
 /// trait declaration and trait-impl method. Needed besides
 /// [`unlinked::is_type_member`] because a trait-impl method's parent path is

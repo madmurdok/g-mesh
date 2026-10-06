@@ -25,9 +25,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// Name plus the parameters a caller must supply - the half of each schema a
 /// follow-up ticket is not allowed to quietly change.
 const EXPECTED_TOOLS: [(&str, &[&str]); 8] = [
-    ("find_callees", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
-    ("find_callers", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
-    ("find_definition", &["symbol_name", "file_path", "position", "cursor", "include_source"]),
+    ("find_callees", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths", "answer"]),
+    ("find_callers", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths", "answer"]),
+    ("find_definition", &["symbol_name", "symbol_id", "file_path", "position", "cursor", "include_source"]),
     (
         "find_implementations",
         &[
@@ -41,7 +41,7 @@ const EXPECTED_TOOLS: [(&str, &[&str]); 8] = [
             "resume_token",
         ],
     ),
-    ("find_references", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths"]),
+    ("find_references", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths", "answer"]),
     ("get_dependencies", &["file_path", "module_id", "direction", "max_depth", "max_fanout", "resume_token"]),
     ("get_file_outline", &["file_path", "cursor", "limit"]),
     ("search_code", &["query", "cursor", "limit"]),

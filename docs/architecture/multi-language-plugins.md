@@ -1959,19 +1959,15 @@ adds a second CI job that runs it with `go` off `PATH`. Two decisions:
    several sites, never called, which is what makes it provable only by this
    handler and not `[[callers]]`), and `[[definition]]` reuses
    `Server.Addr`'s and `Placeholder`'s declarations. One deliberate
-   non-choice: `helper` (declared twice, unexported, in two containers) was
-   *not* used for a "file disambiguates an ambiguous name" `[[definition]]`
-   entry, because it cannot pass one. Go's `qualifiedName` carries no
-   container (unlike TypeScript's, which can differ between two same-named
-   declarations) - see this doc's Data Model, "Logical containers" - so
-   `find_definition`'s `file`-narrowed retry, which re-resolves by
-   `qualifiedName` alone (`expectations.rs`'s decision 3, since
-   `find_definition` has no `symbol_id`), lands on the same ambiguity a
-   second time for *any* two Go declarations that share a bare name. This
-   isn't a fixture gap to work around; it is verified and documented in
-   `expect.toml`'s own comment, matching this repo's own rule that a
-   constant belongs in the record once it is computed, not guessed at again
-   by the next reader.
+   non-choice: `helper` (declared twice, unexported, in two containers) is
+   not used for a "file disambiguates an ambiguous name" `[[definition]]`
+   entry. Go's `qualifiedName` carries no container (unlike TypeScript's,
+   which can differ between two same-named declarations) - see this doc's Data
+   Model, "Logical containers" - so a name alone cannot tell the two
+   declarations apart; the `file`-narrowed retry re-calls `find_definition`
+   with the winning candidate's `symbol_id` (`expectations.rs`'s decision 3),
+   not with the name. The fixture's `[[definition]]` entries use
+   `Server.Addr` and `Placeholder`, whose names are unique.
 2. **A reduced expectation set is read out of the one file, not copied into
    a second one.** `expect.toml` entries take an optional `tier =
    "semantic"` (default `"structural"`); `g-mesh plugins check --expect

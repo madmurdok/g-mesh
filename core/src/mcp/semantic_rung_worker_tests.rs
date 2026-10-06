@@ -224,6 +224,7 @@ async fn the_ladder_answers_as_before_on_exact_suffix_and_semantic_rungs() {
             &call(&client, "find_definition", json!({ "symbol_name": query, "include_source": false })).await,
         );
         let params = FindDefinitionParams {
+            symbol_id: None,
             symbol_name: Some(query.to_string()),
             file_path: None,
             position: None,

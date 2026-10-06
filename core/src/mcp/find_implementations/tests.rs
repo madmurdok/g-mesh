@@ -113,7 +113,7 @@ fn a_file_kind_implementing_row_omits_qualified_name_and_position_but_keeps_them
     )
     .unwrap();
 
-    let page = list_implementations(&conn, "interface", "iface.rs", &[], 10, None, 0).unwrap();
+    let page = list_implementations(&conn, "interface", "iface.rs", &[], 10, None, |_| 0).unwrap();
     assert_eq!(page.results.len(), 2);
 
     let file_row = page.results.iter().find(|r| r.kind == "File").expect("the File-kind row must be present");
@@ -418,7 +418,8 @@ fn implemented_by_three_types_returns_all_three_across_small_pages() {
     let mut seen = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let page = list_implementations(&conn, "target", "target.rs", &[], 1, cursor.as_deref(), 0).unwrap();
+        let page =
+            list_implementations(&conn, "target", "target.rs", &[], 1, cursor.as_deref(), |_| 0).unwrap();
         assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one result per page");
         seen.extend(page.results.into_iter().map(|r| r.implementing_symbol_id));
         if !page.has_more {
@@ -502,7 +503,8 @@ fn a_duplicated_implementor_does_not_reappear_on_the_next_page() {
     let mut seen = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let page = list_implementations(&conn, "target", "target.rs", &[], 1, cursor.as_deref(), 0).unwrap();
+        let page =
+            list_implementations(&conn, "target", "target.rs", &[], 1, cursor.as_deref(), |_| 0).unwrap();
         assert_eq!(page.results.len(), 1, "one row per page at page size 1");
         seen.extend(page.results.into_iter().map(|r| r.implementing_symbol_id));
         if !page.has_more {

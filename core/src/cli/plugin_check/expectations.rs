@@ -132,28 +132,13 @@
 //!    - alongside a top-level `"results"` array; see [`is_candidate_page`]).
 //!
 //!    If the expectation gave an optional `file`, and *exactly one*
-//!    candidate's `filePath` matches it, that candidate is the answer: for
-//!    the four `symbol_id`-accepting tools, the handler is re-called with
-//!    `symbol_id` set to the candidate's `id` - still the same handler code,
-//!    now anchored precisely rather than by a name that turned out
-//!    ambiguous. `find_definition` itself has no `symbol_id` parameter (a
-//!    real limitation of the real tool, not something this module works
-//!    around), so its own disambiguated re-call uses the candidate's exact
-//!    `qualifiedName`, which takes `resolve_symbol_name`'s fast
-//!    exact-match rung.
-//!
-//!    That rung is narrower since GM-360, and it bounds what a
-//!    `[[definition]]` entry can say. A candidate whose `qualifiedName` is
-//!    the bare name several declarations carry - a crate-root Rust type
-//!    against a module-qualified namesake, or a package-level Go func
-//!    against a method - is ambiguous *as a query*, so the re-call returns a
-//!    candidate page a second time and [`resolve_definition`] fails the
-//!    entry saying exactly that. Nor does a `qualifiedName` that two
-//!    declarations share (`shapes::Gauge`, in two crates of
-//!    `plugins/rust/conformance/project`) narrow to one. Both shapes are
-//!    still expressible as `[[references]]`/`[[callers]]`/
-//!    `[[implementations]]`, whose re-call is by `id` - which is why that
-//!    fixture asserts its two-crate case through `[[references]]`.
+//!    candidate's `filePath` matches it, that candidate is the answer: the
+//!    handler is re-called with `symbol_id` set to the candidate's `id` -
+//!    still the same handler code, now anchored precisely rather than by a
+//!    name that turned out ambiguous. All five tools take `symbol_id`, so a
+//!    candidate whose `qualifiedName` is itself shared (a bare Go func name
+//!    against a method, `shapes::Gauge` in two Rust crates) narrows to one
+//!    as surely as any other.
 //! 3. **No `file`, or `file` narrows to zero or more than one candidate**:
 //!    the expectation fails, with every candidate's `id`/`qualifiedName`/
 //!    `filePath`/`kind` printed - never a silent pick, per the task's own
@@ -928,7 +913,8 @@ impl SymbolTool {
                 params,
             ),
             SymbolTool::Implementations => {
-                let SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths } = params;
+                let SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths, answer: _ } =
+                    params;
                 find_implementations::dispatch(
                     ctx.conn,
                     ctx.embedding,
@@ -955,14 +941,20 @@ impl SymbolTool {
 /// and decision 9's [`eval_refusal_expectation`] so both reach the handler
 /// through the same parameters.
 fn call_definition(ctx: &EvalContext, symbol_name: String) -> Result<ToolOutcome, String> {
-    let params = FindDefinitionParams {
-        symbol_name: Some(symbol_name),
+    let params = FindDefinitionParams { symbol_name: Some(symbol_name), ..definition_params() };
+    tool_outcome(find_definition::handle(ctx.conn, ctx.project_root, ctx.embedding, ctx.shapes, params))
+}
+
+/// Every `find_definition` call here addresses one symbol and wants no source.
+fn definition_params() -> FindDefinitionParams {
+    FindDefinitionParams {
+        symbol_id: None,
+        symbol_name: None,
         file_path: None,
         position: None,
         cursor: None,
         include_source: Some(false),
-    };
-    tool_outcome(find_definition::handle(ctx.conn, ctx.project_root, ctx.embedding, ctx.shapes, params))
+    }
 }
 
 fn eval_symbol_expectation(
@@ -1026,6 +1018,7 @@ fn resolve_and_call(
         cursor: None,
         limit,
         file_paths: None,
+        answer: None,
     };
     let value = tool_json(tool.call(ctx, first)).map_err(|e| vec![e])?;
     if !is_candidate_page(&value) {
@@ -1043,6 +1036,7 @@ fn resolve_and_call(
         cursor: None,
         limit,
         file_paths: None,
+        answer: None,
     };
     let retried = tool_json(tool.call(ctx, retry)).map_err(|e| vec![e])?;
     if is_candidate_page(&retried) {
@@ -1383,30 +1377,34 @@ fn eval_definition_expectation(ctx: &EvalContext, index: usize, item: &SymbolExp
     }
 }
 
-/// `find_definition`'s own version of [`resolve_and_call`] - see decision 3
-/// for why the disambiguated re-call is by exact `qualifiedName` rather than
-/// by `symbol_id`: `find_definition` has no such parameter, unlike the other
-/// four tools.
+/// `find_definition`'s own version of [`resolve_and_call`] - decision 3,
+/// with `find_definition`'s parameters in place of `SymbolQueryParams`.
 fn resolve_definition(ctx: &EvalContext, symbol: &str, file: Option<&str>) -> Result<Value, Vec<String>> {
-    let call = |symbol_name: String| tool_json(call_definition(ctx, symbol_name));
-
-    let value = call(symbol.to_string()).map_err(|e| vec![e])?;
+    let value = tool_json(call_definition(ctx, symbol.to_string())).map_err(|e| vec![e])?;
     if !is_candidate_page(&value) {
         return Ok(value);
     }
 
-    let qualified_name = {
+    let candidate_id = {
         let candidate =
             pick_candidate(&value, file).map_err(|reason| candidate_failure(symbol, &value, &reason))?;
-        candidate.get("qualifiedName").and_then(Value::as_str).unwrap_or_default().to_string()
+        candidate.get("id").and_then(Value::as_str).unwrap_or_default().to_string()
     };
-    let retried = call(qualified_name.clone()).map_err(|e| vec![e])?;
+    let retry = FindDefinitionParams { symbol_id: Some(candidate_id), ..definition_params() };
+    let retried = tool_json(tool_outcome(find_definition::handle(
+        ctx.conn,
+        ctx.project_root,
+        ctx.embedding,
+        ctx.shapes,
+        retry,
+    )))
+    .map_err(|e| vec![e])?;
     if is_candidate_page(&retried) {
-        return Err(vec![format!(
-            "candidate qualifiedName '{qualified_name}' is still ambiguous after filtering by file - \
-             find_definition has no symbol_id parameter to disambiguate further (decision 3); refine the \
-             fixture so `file` narrows to a candidate whose qualifiedName is unique"
-        )]);
+        return Err(vec![
+            "re-querying find_definition by the disambiguated candidate's own id still returned a candidate \
+             page - this should not happen for an exact id lookup; the index may be inconsistent"
+                .to_string(),
+        ]);
     }
     Ok(retried)
 }
@@ -1443,6 +1441,7 @@ impl RefusedTool {
                 cursor: None,
                 limit: Some(pagination::MAX_PAGE_SIZE as u32),
                 file_paths: None,
+                answer: None,
             },
         )
     }

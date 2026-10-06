@@ -266,7 +266,7 @@ fn the_candidate_lookup_seeks_the_name_key() {
     assert!(plan[0].contains("u USING PRIMARY KEY (name=?)"), "{plan:?}");
 }
 
-// --- the tally (`CandidateTally::from_files`, `wire_len`) -------------------
+// --- the tally (`CandidateTally::from_files`) ------------------------------
 
 fn tallied(paths: usize) -> Vec<(String, i64)> {
     (0..paths).map(|i| (format!("f{i:02}.rs"), 1)).collect()
@@ -301,17 +301,6 @@ fn files_cap_at_twenty_with_files_truncated() {
     let exact = CandidateTally::from_files(FILE_CAP, tallied(FILE_CAP), "hint").unwrap();
     assert!(!exact.files_truncated);
     assert!(serde_json::to_value(&exact).unwrap().get("filesTruncated").is_none());
-}
-
-/// The bytes held back cover the field as it is sent, key included, and
-/// nothing is held back for an absent field. Control: restore the old fixed
-/// `+ 20` (sized for `,"unlinkedUsages":`) in `wire_len` (short by four).
-#[test]
-fn wire_len_covers_the_field_under_its_own_key() {
-    let found = CandidateTally::from_files(3, tallied(3), UNTYPED_RECEIVER_CALLS_HINT);
-    let sent = format!(",\"{FIELD}\":{}", serde_json::to_string(found.as_ref().unwrap()).unwrap());
-    assert!(UntypedReceiverCalls::wire_len(&found, FIELD) >= sent.len(), "{sent}");
-    assert_eq!(UntypedReceiverCalls::wire_len(&None, FIELD), 0);
 }
 
 // --- the handlers ---------------------------------------------------------
@@ -411,11 +400,11 @@ fn crowded(with_untyped: bool) -> Arc<IndexStore> {
     Arc::new(IndexStore::new(conn))
 }
 
-/// Both handlers hold the field's bytes back from the row budget: with the
-/// field, a page cut by bytes carries fewer rows, and the whole response
-/// stays inside `MAX_RESPONSE_BYTES`. Control: drop the
-/// `UntypedReceiverCalls::wire_len` term from either handler's reserve (the
-/// row counts match).
+/// Both handlers measure the field with the rest of the response the rows
+/// are cut against: with the field, a page cut by bytes carries fewer rows,
+/// and the whole response stays inside `MAX_RESPONSE_BYTES`. Control: leave
+/// `untypedReceiverCalls` out of the candidate response either handler
+/// measures (`send` false) -> the row counts match and the page is over.
 #[test]
 fn both_handlers_reserve_the_fields_bytes() {
     let plain = crowded(false);

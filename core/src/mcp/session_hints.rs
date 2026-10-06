@@ -31,6 +31,27 @@ impl SessionHints {
     pub(crate) fn once(&self, trigger: bool, key: HintKey, sentence: &'static str) -> Option<&'static str> {
         (trigger && self.0.lock().unwrap_or_else(PoisonError::into_inner).insert(key)).then_some(sentence)
     }
+
+    /// What [`Self::once`] would return now, without recording anything: for
+    /// measuring a candidate response before the one that is sent.
+    pub(crate) fn peek(&self, trigger: bool, key: HintKey, sentence: &'static str) -> Option<&'static str> {
+        (trigger && !self.0.lock().unwrap_or_else(PoisonError::into_inner).contains(&key)).then_some(sentence)
+    }
+
+    /// [`Self::once`] when `send`, otherwise [`Self::peek`].
+    pub(crate) fn offer(
+        &self,
+        send: bool,
+        trigger: bool,
+        key: HintKey,
+        sentence: &'static str,
+    ) -> Option<&'static str> {
+        if send {
+            self.once(trigger, key, sentence)
+        } else {
+            self.peek(trigger, key, sentence)
+        }
+    }
 }
 
 /// The sentences present, in order, as one `hint` value; `None` when none is.
@@ -67,6 +88,18 @@ pub(crate) const PROVENANCE: &str =
 pub(crate) const AMBIGUOUS: &str =
     "Several declarations have this name: re-query with the right candidate's `id` as `symbol_id`, \
      not its qualifiedName, and treat that answer as final without grepping to reconfirm it.";
+
+/// `AMBIGUOUS` for a page whose candidates carry their source: every reading
+/// is already answered, so the follow-up is needed only for a cut body.
+pub(crate) const AMBIGUOUS_SOURCED: &str =
+    "Several declarations have this name, each with its source; none is preferred. Pick by reading; \
+     re-query an `id` as `symbol_id` only for a source with `omittedLines`.";
+
+/// `AMBIGUOUS_SOURCED` for a page where some candidates could not be given
+/// their source: those, like a cut body, need the follow-up.
+pub(crate) const AMBIGUOUS_PARTLY_SOURCED: &str =
+    "Several declarations have this name, some with their source; none is preferred. Re-query an `id` \
+     as `symbol_id` for one without `source` or with `omittedLines`.";
 
 pub(crate) const FILE_ROW: &str =
     "A `kind: File` row is a usage outside any tracked symbol, so the file itself is the answer; \
@@ -194,6 +227,8 @@ mod tests {
             UNRESOLVED_ROW,
             PROVENANCE,
             AMBIGUOUS,
+            AMBIGUOUS_SOURCED,
+            AMBIGUOUS_PARTLY_SOURCED,
             FILE_ROW,
             FILES_TALLY,
             WALK_COMPLETE,

@@ -134,11 +134,9 @@ expect = [
 # - one in shapes.rs, one in nested/deep.rs - are REFERENCES edges, so this
 # CALLS walk discloses them rather than dropping them silently. No `files`
 # key: the three rows already sit one per file, so the response carries no
-# tally and its absence is this entry's assertion.
-excluded_references = { count = 2, files = [
-    "crates/alpha/src/nested/deep.rs:1",
-    "crates/alpha/src/shapes.rs:1",
-] }
+# tally and its absence is this entry's assertion. Both usages are counted,
+# but neither file is repeated in the excluded tally: the rows name them.
+excluded_references = { count = 2, files = [] }
 
 # --- callers: a pub use re-export chain, cross-crate --------------------------
 
@@ -160,11 +158,9 @@ expect = ["crates/beta/src/main.rs:main"]
 # usages, and the whole re-export walk this entry exists to prove is written
 # in those two lines. Were this plugin to stop emitting a REFERENCES edge for
 # a `use` path, the caller set above would not move at all and this block
-# would.
-excluded_references = { count = 2, files = [
-    "crates/alpha/src/prelude.rs:1",
-    "crates/beta/src/main.rs:1",
-] }
+# would. The tally names only prelude.rs: main.rs is counted but not
+# repeated, since the row already names it.
+excluded_references = { count = 2, files = ["crates/alpha/src/prelude.rs:1"] }
 
 # --- callers: a type-qualified path call across crates, and a `Self::` call
 #     against the same declaration from inside its own impl -------------------
@@ -190,8 +186,9 @@ symbol = "shapes::describe"
 # `bodies.rs`'s own table, exercised cross-crate rather than same-file the
 # way `internals::published`'s callers already are.
 expect = ["crates/beta/src/main.rs:main"]
-# Decision 13: the `use` line that imports the name sits beside the call.
-excluded_references = { count = 1, files = ["crates/beta/src/main.rs:1"] }
+# Decision 13: the `use` line that imports the name sits beside the call, so
+# it is counted but its file, already named by the row, is not repeated.
+excluded_references = { count = 1, files = [] }
 
 # --- callers: a module-qualified path call, within one crate ------------------
 

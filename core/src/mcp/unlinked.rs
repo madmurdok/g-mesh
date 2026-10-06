@@ -32,6 +32,10 @@ use crate::storage::write::NodeRecord;
 /// Ceiling on how many files the tally names, at ~40 bytes an entry.
 const MAX_UNLINKED_FILE_TALLY: usize = 20;
 
+/// Ceiling on the tally's `files` in serialized bytes, applied after
+/// [`MAX_UNLINKED_FILE_TALLY`]: twenty entries at ~50 bytes.
+const MAX_UNLINKED_FILE_TALLY_BYTES: usize = 1_000;
+
 const UNLINKED_USAGES_HINT: &str =
     "Unresolved usages whose target has this symbol's name (and type, for a `T::f` call) that \
      g-mesh could not link to any declaration - e.g. a call through `use super::*` or through a \
@@ -50,7 +54,8 @@ pub(crate) struct CandidateTally {
     /// `unlinkedUsages`, a calling function for `untypedReceiverCalls`.
     pub(super) count: usize,
     /// Files holding the candidates, highest count first, capped at
-    /// [`MAX_UNLINKED_FILE_TALLY`].
+    /// [`MAX_UNLINKED_FILE_TALLY`] entries and
+    /// [`MAX_UNLINKED_FILE_TALLY_BYTES`] bytes.
     pub(super) files: Vec<FileTally>,
     /// Present only when the cap cut `files`.
     #[serde(skip_serializing_if = "is_false")]
@@ -68,7 +73,8 @@ fn is_false(flag: &bool) -> bool {
 impl CandidateTally {
     /// `count` candidates over `by_file` (`(path, refs)` in any order), or
     /// `None` when `count` is 0. Sorts by refs, then path, and caps the list
-    /// at [`MAX_UNLINKED_FILE_TALLY`].
+    /// at [`MAX_UNLINKED_FILE_TALLY`] entries and
+    /// [`MAX_UNLINKED_FILE_TALLY_BYTES`] bytes.
     pub(super) fn from_files(
         count: usize,
         mut by_file: Vec<(String, i64)>,
@@ -78,25 +84,18 @@ impl CandidateTally {
             return None;
         }
         by_file.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let files_truncated = by_file.len() > MAX_UNLINKED_FILE_TALLY;
+        let over_count = by_file.len() > MAX_UNLINKED_FILE_TALLY;
         by_file.truncate(MAX_UNLINKED_FILE_TALLY);
-        let files = by_file.into_iter().map(|(path, refs)| FileTally { path, refs }).collect();
+        let mut files: Vec<FileTally> =
+            by_file.into_iter().map(|(path, refs)| FileTally { path, refs }).collect();
+        let over_bytes = pagination::truncate_to_bytes(&mut files, MAX_UNLINKED_FILE_TALLY_BYTES);
+        let files_truncated = over_count || over_bytes;
         Some(Self { count, files, files_truncated, hint })
     }
 
     /// The files this disclosure names.
     pub(crate) fn file_paths(&self) -> impl Iterator<Item = &str> {
         self.files.iter().map(|tally| tally.path.as_str())
-    }
-
-    /// Bytes this field, serialized under the camelCase key `field`, adds to
-    /// a response, so the page bound can hold them back. Zero when there is
-    /// nothing to disclose.
-    pub(crate) fn wire_len(disclosure: &Option<Self>, field: &str) -> usize {
-        disclosure.as_ref().map_or(0, |found| {
-            // `,"<field>":` plus the value, with two bytes of slack.
-            serde_json::to_vec(found).map_or(0, |bytes| bytes.len()) + field.len() + 6
-        })
     }
 }
 

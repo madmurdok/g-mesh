@@ -127,12 +127,10 @@ files = ["pkg/consumer.py:1", "pkg/mod.py:2", "pkg/sub/deep.py:1"]
 # the gap GM-258 built this disclosure for - an agent asking "who calls
 # assist" gets four callers and is told, without a second round-trip, which
 # three files name it without calling it. Delete the re-export from
-# `__init__.py` and the count moves while the caller set does not.
-excluded_references = { count = 3, files = [
-    "pkg/__init__.py:1",
-    "pkg/consumer.py:1",
-    "pkg/mod.py:1",
-] }
+# `__init__.py` and the count moves while the caller set does not. The tally
+# names only `pkg/__init__.py`: the other two files already appear in the
+# rows, so they are counted but not repeated.
+excluded_references = { count = 3, files = ["pkg/__init__.py:1"] }
 
 # --- callers: across a PEP 420 namespace package -----------------------------
 
@@ -158,10 +156,9 @@ expect = ["pkg/plugins/loader.py:load", "pkg/mod.py:Greeter.render"]
 # before calling it - two usages that are not calls, disclosed rather than
 # silently dropped. No `files` key: the two rows already sit one per file, so
 # the response carries no tally and its absence is this entry's assertion.
-excluded_references = { count = 2, files = [
-    "pkg/__init__.py:1",
-    "pkg/plugins/loader.py:1",
-] }
+# `loader.py` is counted but not repeated in the excluded tally, since its
+# row already names it.
+excluded_references = { count = 2, files = ["pkg/__init__.py:1"] }
 
 # --- callers: a class-qualified call, plus the receiver calls pyright answers
 #     and the one it does not (GM-299) --------------------------------------
@@ -320,8 +317,9 @@ tier = "semantic"
 expect = ["pkg/overload_callers.py:calls_both_overloads", "pkg/overloads.py:coerce_here"]
 files = ["pkg/overload_callers.py:2", "pkg/overloads.py:1"]
 # Decision 13: the `from pkg.overloads import Codec, coerce` line names it
-# without calling it.
-excluded_references = { count = 1, files = ["pkg/overload_callers.py:1"] }
+# without calling it. Counted, but its file is not repeated: the rows and
+# `files` already name it.
+excluded_references = { count = 1, files = [] }
 
 # --- references: usages [[callers]] cannot reach at all ----------------------
 

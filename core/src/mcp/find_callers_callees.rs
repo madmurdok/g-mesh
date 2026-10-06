@@ -6,7 +6,7 @@
 //! anchor calls). Both are single-hop by design; the transitive walk lives in
 //! `get_dependencies`, not here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -27,7 +27,7 @@ use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
 use super::unlinked::{self, UnlinkedUsages};
 use super::untyped::{self, UntypedReceiverCalls};
-use super::{anchor, find_definition, provenance, SymbolQueryParams};
+use super::{anchor, answer, find_definition, provenance, Answer, SymbolQueryParams};
 
 /// One "other end of a CALLS edge" record, plus whether that edge is
 /// `resolved`. Direction-agnostic on purpose: `list_calls` doesn't know
@@ -38,12 +38,11 @@ use super::{anchor, find_definition, provenance, SymbolQueryParams};
 struct CallSite {
     node: NodeRecord,
     resolved: bool,
-    /// Same rule `paginate_edges`' SQL applies: `0` when this node shares the
-    /// anchor's file, `1` otherwise. Carried through so `handle_callers`/
-    /// `handle_callees` can rebuild a resumable cursor if the enriched page
-    /// needs further truncation to fit `pagination::MAX_RESPONSE_BYTES`.
-    locality: i64,
-    edge_id: String,
+    /// The edge's position in `paginate_edges`' order. Carried through so
+    /// `handle_callers`/`handle_callees` can rebuild a resumable cursor if
+    /// the enriched page needs further truncation to fit
+    /// `pagination::MAX_RESPONSE_BYTES`.
+    rank: pagination::EdgeRank,
 }
 
 /// Paginates the `CALLS` edges incident to `anchor_id` in `direction` and
@@ -74,7 +73,7 @@ fn list_calls(
     .context("failed to paginate CALLS edges")?;
 
     let mut results = Vec::with_capacity(page.results.len());
-    for pagination::ScoredEdge { edge, locality } in page.results {
+    for pagination::ScoredEdge { edge, rank } in page.results {
         // Outgoing: anchor is fromId, the callee sits at toId. Incoming: anchor
         // is toId, the caller sits at fromId.
         let other_id = match direction {
@@ -84,7 +83,7 @@ fn list_calls(
         let node = queries::get_node(conn, other_id)
             .context("failed to resolve call-edge endpoint")?
             .with_context(|| format!("edge {} points at missing node {other_id}", edge.id))?;
-        results.push(CallSite { node, resolved: edge.resolved, locality, edge_id: edge.id });
+        results.push(CallSite { node, resolved: edge.resolved, rank });
     }
 
     // Intermediate page, ahead of the EdgeRow/bound_page step each handle_*
@@ -106,7 +105,7 @@ fn list_calls(
 /// from the wire JSON entirely, never emitted as `null` or `0` - exactly
 /// when `kind` is [`pagination::FILE_KIND`]; see that constant's doc comment
 /// for why both are pure redundancy on a `File`-kind row.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CallerSite {
     caller_symbol_id: String,
@@ -139,7 +138,7 @@ impl From<CallSite> for CallerSite {
 /// Wire shape for `find_callees`: the called function on the other end of
 /// each outbound `CALLS` edge. Same `name`/`qualifiedName`/`startLine`/
 /// `startCol` rules as [`CallerSite`].
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CalleeSite {
     callee_symbol_id: String,
@@ -171,12 +170,12 @@ impl From<CallSite> for CalleeSite {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CallerPage {
+struct CallerPage<'a> {
     /// See `anchor::AnchorInfo` - what `symbol_id`/`symbol_name` resolved to,
     /// so a caller asking about usages "elsewhere" doesn't need a separate
     /// `find_definition` call just to learn the anchor's own file/line.
-    anchor: anchor::AnchorInfo,
-    results: Vec<CallerSite>,
+    anchor: &'a anchor::AnchorInfo,
+    results: &'a [CallerSite],
     /// Every file holding a call to the anchor, with a per-file count, over
     /// the whole edge set rather than this page - see
     /// `pagination::tally_edge_files`, and `find_references`' identically
@@ -188,9 +187,18 @@ struct CallerPage {
     /// change, a removal - all run *inbound*, so a callee-side tally would be
     /// payload on every response for a question the tool never gets.
     #[serde(skip_serializing_if = "Option::is_none")]
-    files: Option<Vec<pagination::FileTally>>,
+    files: Option<&'a [pagination::FileTally]>,
+    /// Present only when `files` leaves files out, cut by its entry or byte
+    /// cap (`pagination::tally_edge_files_bounded`); absent, not `false`,
+    /// otherwise.
+    #[serde(skip_serializing_if = "answer::is_false")]
+    files_truncated: bool,
+    /// Exact number of callers over the whole set. Present only when
+    /// `has_more`: on a complete page it is `results.len()`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<usize>,
     has_more: bool,
-    next_cursor: Option<String>,
+    next_cursor: Option<&'a str>,
     /// See `Page::all_unresolved` - true when every caller in `results` came
     /// from an edge the linker couldn't confirm.
     all_unresolved: bool,
@@ -205,12 +213,12 @@ struct CallerPage {
     /// See [`UnlinkedUsages`] - calls that may target the anchor but that the
     /// linker left on a placeholder. Absent when there is no candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
-    unlinked_usages: Option<UnlinkedUsages>,
+    unlinked_usages: Option<&'a UnlinkedUsages>,
     /// See [`UntypedReceiverCalls`] - functions calling a method of the
     /// anchor's name through a receiver whose type was not inferred, with no
     /// edge to the anchor yet. Absent when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    untyped_receiver_calls: Option<UntypedReceiverCalls>,
+    untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
     /// See `super::provenance` - present only when the anchor's language
     /// declares a semantic tier that has not completed for this project, so
     /// this answer came from its structural tier alone. Absent (not `null`,
@@ -249,7 +257,8 @@ struct CallerPage {
 /// full coverage"* - and the answer it then wrote was a file list.
 ///
 /// So `files` carries the names, at ~40 bytes an entry against a reference
-/// row's ~260, capped by `pagination::MAX_EXCLUDED_FILE_TALLY`. `count` stays
+/// row's ~260, capped by `pagination::MAX_EXCLUDED_FILE_TALLY` entries and
+/// `pagination::EXCLUDED_TALLY_MAX_BYTES` bytes. `count` stays
 /// exact and uncapped even when the tally is cut, since understating the gap
 /// is the one thing this field must never do; `files_truncated` says so
 /// explicitly rather than leaving the caller to notice that the tally sums to
@@ -258,47 +267,60 @@ struct CallerPage {
 /// The field is absent, not zero, when nothing was excluded: the narrow lookup
 /// that is most of the traffic must not grow bytes to announce that nothing
 /// was hidden, the same rule `files` follows.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExcludedReferences {
     count: usize,
-    /// Every file holding one of the excluded usages, highest count first,
-    /// capped at `pagination::MAX_EXCLUDED_FILE_TALLY`.
+    /// The files holding one of the excluded usages that the rest of the
+    /// response does not already name, highest count first, capped at
+    /// `pagination::MAX_EXCLUDED_FILE_TALLY` before that filtering and at
+    /// `pagination::EXCLUDED_TALLY_MAX_BYTES` after it. Every file holding an
+    /// excluded usage is named once somewhere in the response, up to those
+    /// caps. Absent when empty, and always on `answer: "count"`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     files: Vec<pagination::FileTally>,
-    /// Present only when the cap cut the tally - absent, not `false`, in the
+    /// Present only when a cap cut the tally - absent, not `false`, in the
     /// ordinary case, so a disclosure on a small anchor stays small.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "answer::is_false")]
     files_truncated: bool,
     hint: &'static str,
 }
 
-/// `skip_serializing_if` predicate for a `bool` that is only interesting when
-/// true - the same "absent, not false" rule the `Option` fields around it get
-/// from `Option::is_none`.
-fn is_false(flag: &bool) -> bool {
-    !*flag
-}
-
 const EXCLUDED_REFERENCES_HINT: &str =
     "Usages that are not CALLS edges were excluded - a call at file top level or inside an \
-     anonymous callback (e.g. a test's it(...) body) is one of these. `files` here names every \
-     file holding one, so a file-level answer is already complete; call find_references only if \
-     you need the calling symbol or its line.";
+     anonymous callback (e.g. a test's it(...) body) is one of these. This response names every \
+     file holding one (`files` here lists those not named elsewhere), so a file-level answer is \
+     already complete; call find_references only if you need the calling symbol or its line.";
+
+const EXCLUDED_COUNT_HINT: &str =
+    "Usages that are not CALLS edges (a call at file top level or inside an anonymous callback) \
+     are not in `total`; `count` here is how many.";
 
 /// Counts the `REFERENCES`-kind edges this `CALLS` walk excluded, or `None`
-/// when there were none. Errors are swallowed to `None` on purpose: this is a
-/// disclosure attached to an answer that already succeeded, and failing the
-/// whole call because the footnote could not be computed would trade a good
-/// answer for no answer.
+/// when there were none, and names their files (none with `answer` set to
+/// [`Answer::Count`]); [`ExcludedReferences::naming_only_new`] then drops the
+/// files the response already names elsewhere. Errors are swallowed to
+/// `None` on purpose: this is a disclosure attached to an answer that already
+/// succeeded, and failing the whole call because the footnote could not be
+/// computed would trade a good answer for no answer.
 fn excluded_references(
     conn: &Connection,
     anchor_id: &str,
     direction: Direction,
     file_paths: &[&str],
+    answer: Answer,
 ) -> Option<ExcludedReferences> {
     let count = pagination::count_edges(conn, anchor_id, direction, &["REFERENCES"], file_paths).ok()?;
     if count == 0 {
         return None;
+    }
+    if answer == Answer::Count {
+        return Some(ExcludedReferences {
+            count,
+            files: Vec::new(),
+            files_truncated: false,
+            hint: EXCLUDED_COUNT_HINT,
+        });
     }
     // A second query on the same predicate rather than deriving the count from
     // the tally's own sum: the tally is capped and the count must not be, and
@@ -317,14 +339,30 @@ fn excluded_references(
     Some(ExcludedReferences { count, files, files_truncated, hint: EXCLUDED_REFERENCES_HINT })
 }
 
+impl ExcludedReferences {
+    /// This disclosure for a response that already names `named`: those
+    /// files dropped from `files`, and the rest capped at
+    /// `pagination::EXCLUDED_TALLY_MAX_BYTES`.
+    fn naming_only_new(&self, named: &HashSet<&str>) -> ExcludedReferences {
+        let mut files: Vec<pagination::FileTally> =
+            self.files.iter().filter(|tally| !named.contains(tally.path.as_str())).cloned().collect();
+        let cut = pagination::truncate_to_bytes(&mut files, pagination::EXCLUDED_TALLY_MAX_BYTES);
+        ExcludedReferences { files, files_truncated: self.files_truncated || cut, ..self.clone() }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CalleePage {
+struct CalleePage<'a> {
     /// See `anchor::AnchorInfo`, same rationale as `CallerPage`'s own field.
-    anchor: anchor::AnchorInfo,
-    results: Vec<CalleeSite>,
+    anchor: &'a anchor::AnchorInfo,
+    results: &'a [CalleeSite],
+    /// Exact number of callees over the whole set. Present only when
+    /// `has_more`: on a complete page it is `results.len()`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<usize>,
     has_more: bool,
-    next_cursor: Option<String>,
+    next_cursor: Option<&'a str>,
     /// See `Page::all_unresolved` - true when every callee in `results` came
     /// from an edge the linker couldn't confirm.
     all_unresolved: bool,
@@ -346,6 +384,36 @@ struct CalleePage {
     provenance: Option<provenance::Provenance>,
 }
 
+/// The response-level disclosures of [`CallerPage`], carried unchanged by the
+/// non-row answers (`answer::Summary`).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CallerDisclosures<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excluded_references: Option<ExcludedReferences>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unlinked_usages: Option<&'a UnlinkedUsages>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<provenance::Provenance>,
+}
+
+/// The response-level disclosures of [`CalleePage`], as [`CallerDisclosures`].
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CalleeDisclosures {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excluded_references: Option<ExcludedReferences>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<provenance::Provenance>,
+}
+
+/// Every path an excluded-references tally names, for `touched` sets.
+fn excluded_paths(excluded: &Option<ExcludedReferences>) -> impl Iterator<Item = &str> {
+    excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str()))
+}
+
 pub(crate) fn handle_callers(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
@@ -357,6 +425,88 @@ pub(crate) fn handle_callers(
     find_definition::resolve_lazily(embedding, shapes, |semantic| {
         handle_callers_in(store, semantic, capabilities, hints, params.clone())
     })
+}
+
+/// Everything a caller page carries besides its rows, fetched once so that
+/// candidate pages can be measured whole before one is sent.
+struct CallerParts<'a> {
+    conn: &'a Connection,
+    anchor: &'a NodeRecord,
+    anchor_info: anchor::AnchorInfo,
+    anchor_hint: Option<&'static str>,
+    tally: Vec<pagination::FileTally>,
+    tally_truncated: bool,
+    excluded: Option<ExcludedReferences>,
+    unlinked: Option<UnlinkedUsages>,
+    untyped: Option<UntypedReceiverCalls>,
+    tier: provenance::Resolved,
+    hints: &'a SessionHints,
+}
+
+impl CallerParts<'_> {
+    /// The response for `page`. `send` spends once-per-session hints; without
+    /// it they are only peeked, for measuring.
+    fn response<'p>(
+        &'p self,
+        page: &'p pagination::Page<CallerSite>,
+        total: Option<usize>,
+        send: bool,
+    ) -> CallerPage<'p> {
+        let files = pagination::tally_is_worth_sending(page.results.len(), &self.tally, page.has_more)
+            .then_some(self.tally.as_slice());
+        let named: HashSet<&str> = page
+            .results
+            .iter()
+            .map(|row| row.file_path.as_str())
+            .chain(files.into_iter().flatten().map(|tally| tally.path.as_str()))
+            .collect();
+        let excluded = self.excluded.as_ref().map(|excluded| excluded.naming_only_new(&named));
+
+        // Every file this response names: rows, the tally, the excluded,
+        // unlinked and untyped tallies.
+        let touched = named
+            .iter()
+            .copied()
+            .chain(excluded_paths(&excluded))
+            .chain(self.unlinked.iter().flat_map(UnlinkedUsages::file_paths))
+            .chain(self.untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
+        let provenance = self.tier.clone().disclose(
+            self.conn,
+            &self.anchor.language,
+            Some(&self.anchor.file_path),
+            touched,
+        );
+        let has_file_row = page.results.iter().any(|row| row.kind == pagination::FILE_KIND);
+        let once = |trigger, key, sentence| self.hints.offer(send, trigger, key, sentence);
+        let hint = session_hints::join([
+            self.anchor_hint,
+            page.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
+            once(has_file_row, HintKey::FileRow, session_hints::FILE_ROW),
+            once(files.is_some(), HintKey::FilesTally, session_hints::FILES_TALLY),
+            once(
+                !page.all_unresolved && page.results.iter().any(|row| !row.resolved),
+                HintKey::UnresolvedRow,
+                session_hints::UNRESOLVED_ROW,
+            ),
+            once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+        ]);
+
+        CallerPage {
+            anchor: &self.anchor_info,
+            results: &page.results,
+            files,
+            files_truncated: files.is_some() && self.tally_truncated,
+            total,
+            has_more: page.has_more,
+            next_cursor: page.next_cursor.as_deref(),
+            all_unresolved: page.all_unresolved,
+            hint,
+            excluded_references: excluded,
+            unlinked_usages: self.unlinked.as_ref(),
+            untyped_receiver_calls: self.untyped.as_ref(),
+            provenance,
+        }
+    }
 }
 
 /// One pass of [`handle_callers`] - see [`find_definition::SemanticRung`].
@@ -383,6 +533,39 @@ pub(crate) fn handle_callers_in(
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
+    let tier = provenance::resolve(&conn, capabilities, &anchor.language);
+    let unlinked = unlinked::probe(&conn, &anchor, &["CALLS"], &file_paths);
+    let untyped = untyped::probe(&conn, &anchor, &["CALLS"], &file_paths);
+    let answer = params.answer.unwrap_or_default();
+    let excluded = excluded_references(&conn, &anchor.id, Direction::Incoming, &file_paths, answer);
+
+    let counted = answer::count(&conn, answer, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
+        .map_err(|e| internal_error("failed to count callers", e))?;
+    if let Some(counted) = counted {
+        return answer::respond(&anchor_info, &counted, |files, send| {
+            let named: HashSet<&str> = files.into_iter().flatten().map(|tally| tally.path.as_str()).collect();
+            let excluded = excluded.as_ref().map(|excluded| excluded.naming_only_new(&named));
+            let touched = named
+                .iter()
+                .copied()
+                .chain(excluded_paths(&excluded))
+                .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths))
+                .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
+            let provenance = tier.clone().disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
+            let hint = session_hints::join([
+                hint,
+                hints.offer(send, provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+            ]);
+            let disclosures = CallerDisclosures {
+                excluded_references: excluded,
+                unlinked_usages: unlinked.as_ref(),
+                untyped_receiver_calls: untyped.as_ref(),
+                provenance,
+            };
+            (hint, disclosures)
+        });
+    }
+
     let page = list_calls(
         &conn,
         &anchor.id,
@@ -393,72 +576,41 @@ pub(crate) fn handle_callers_in(
         params.cursor.as_deref(),
     )
     .map_err(|e| internal_error("failed to find callers", e))?;
+    let (tally, tally_truncated) =
+        pagination::tally_edge_files_bounded(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
+            .map_err(|e| internal_error("failed to tally calling files", e))?;
+    let parts = CallerParts {
+        conn: &conn,
+        anchor: &anchor,
+        anchor_info,
+        anchor_hint: hint,
+        tally,
+        tally_truncated,
+        excluded,
+        unlinked,
+        untyped,
+        tier,
+        hints,
+    };
 
     let rows = page
         .results
         .into_iter()
         .map(|site| {
-            let (resolved, locality, edge_id) = (site.resolved, site.locality, site.edge_id.clone());
-            pagination::EdgeRow { item: CallerSite::from(site), resolved, locality, edge_id }
+            let rank = site.rank.clone();
+            pagination::EdgeRow { item: CallerSite::from(site), rank }
         })
         .collect();
-    let tier = provenance::resolve(&conn, capabilities, &anchor.language);
-    let unlinked = unlinked::probe(&conn, &anchor, &["CALLS"], &file_paths);
-    let untyped = untyped::probe(&conn, &anchor, &["CALLS"], &file_paths);
-    let bounded = pagination::bound_page_reserving_two_tallies(
-        rows,
-        page.has_more,
-        page.next_cursor,
-        tier.page_reserve()
-            + UnlinkedUsages::wire_len(&unlinked, "unlinkedUsages")
-            + UntypedReceiverCalls::wire_len(&untyped, untyped::FIELD),
-    );
+    let bounded = pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, |candidate| {
+        pagination::wire_len(&parts.response(candidate, pagination::widest_total(candidate.has_more), false))
+    });
+    let total = bounded
+        .has_more
+        .then(|| pagination::count_edges(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths))
+        .transpose()
+        .map_err(|e| internal_error("failed to count callers", e))?;
 
-    let tally = pagination::tally_edge_files(&conn, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
-        .map_err(|e| internal_error("failed to tally calling files", e))?;
-    let files =
-        pagination::tally_is_worth_sending(bounded.results.len(), &tally, bounded.has_more).then_some(tally);
-
-    let excluded = excluded_references(&conn, &anchor.id, Direction::Incoming, &file_paths);
-
-    // Every file this response names: rows, the tally, the excluded,
-    // unlinked and untyped tallies.
-    let touched = bounded
-        .results
-        .iter()
-        .map(|row| row.file_path.as_str())
-        .chain(files.iter().flatten().map(|tally| tally.path.as_str()))
-        .chain(excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str())))
-        .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths))
-        .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
-    let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
-    let has_file_row = bounded.results.iter().any(|row| row.kind == pagination::FILE_KIND);
-    let hint = session_hints::join([
-        hint,
-        bounded.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
-        hints.once(has_file_row, HintKey::FileRow, session_hints::FILE_ROW),
-        hints.once(files.is_some(), HintKey::FilesTally, session_hints::FILES_TALLY),
-        hints.once(
-            !bounded.all_unresolved && bounded.results.iter().any(|row| !row.resolved),
-            HintKey::UnresolvedRow,
-            session_hints::UNRESOLVED_ROW,
-        ),
-        hints.once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
-    ]);
-
-    success(&CallerPage {
-        anchor: anchor_info,
-        results: bounded.results,
-        files,
-        has_more: bounded.has_more,
-        next_cursor: bounded.next_cursor,
-        all_unresolved: bounded.all_unresolved,
-        hint,
-        excluded_references: excluded,
-        unlinked_usages: unlinked,
-        untyped_receiver_calls: untyped,
-        provenance,
-    })
+    success(&parts.response(&bounded, total, true))
 }
 
 #[cfg(test)]
@@ -473,6 +625,62 @@ pub(crate) fn handle_callees(
     find_definition::resolve_lazily(embedding, shapes, |semantic| {
         handle_callees_in(store, semantic, capabilities, &hints, params.clone())
     })
+}
+
+/// Everything a callee page carries besides its rows; see [`CallerParts`].
+struct CalleeParts<'a> {
+    conn: &'a Connection,
+    anchor: &'a NodeRecord,
+    anchor_info: anchor::AnchorInfo,
+    anchor_hint: Option<&'static str>,
+    excluded: Option<ExcludedReferences>,
+    tier: provenance::Resolved,
+    hints: &'a SessionHints,
+}
+
+impl CalleeParts<'_> {
+    /// The response for `page`, as [`CallerParts::response`].
+    fn response<'p>(
+        &'p self,
+        page: &'p pagination::Page<CalleeSite>,
+        total: Option<usize>,
+        send: bool,
+    ) -> CalleePage<'p> {
+        let named: HashSet<&str> = page.results.iter().map(|row| row.file_path.as_str()).collect();
+        let excluded = self.excluded.as_ref().map(|excluded| excluded.naming_only_new(&named));
+
+        // Every file this response names: rows and the excluded tally.
+        let touched = named.iter().copied().chain(excluded_paths(&excluded));
+        let provenance = self.tier.clone().disclose(
+            self.conn,
+            &self.anchor.language,
+            Some(&self.anchor.file_path),
+            touched,
+        );
+        let once = |trigger, key, sentence| self.hints.offer(send, trigger, key, sentence);
+        let hint = session_hints::join([
+            self.anchor_hint,
+            page.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
+            once(
+                !page.all_unresolved && page.results.iter().any(|row| !row.resolved),
+                HintKey::UnresolvedRow,
+                session_hints::UNRESOLVED_ROW,
+            ),
+            once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+        ]);
+
+        CalleePage {
+            anchor: &self.anchor_info,
+            results: &page.results,
+            total,
+            has_more: page.has_more,
+            next_cursor: page.next_cursor.as_deref(),
+            all_unresolved: page.all_unresolved,
+            hint,
+            excluded_references: excluded,
+            provenance,
+        }
+    }
 }
 
 /// One pass of [`handle_callees`] - see [`find_definition::SemanticRung`].
@@ -499,6 +707,26 @@ pub(crate) fn handle_callees_in(
 
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
+    let tier = provenance::resolve(&conn, capabilities, &anchor.language);
+    let answer = params.answer.unwrap_or_default();
+    let excluded = excluded_references(&conn, &anchor.id, Direction::Outgoing, &file_paths, answer);
+
+    let counted = answer::count(&conn, answer, &anchor.id, Direction::Outgoing, &["CALLS"], &file_paths)
+        .map_err(|e| internal_error("failed to count callees", e))?;
+    if let Some(counted) = counted {
+        return answer::respond(&anchor_info, &counted, |files, send| {
+            let named: HashSet<&str> = files.into_iter().flatten().map(|tally| tally.path.as_str()).collect();
+            let excluded = excluded.as_ref().map(|excluded| excluded.naming_only_new(&named));
+            let touched = named.iter().copied().chain(excluded_paths(&excluded));
+            let provenance = tier.clone().disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
+            let hint = session_hints::join([
+                hint,
+                hints.offer(send, provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+            ]);
+            (hint, CalleeDisclosures { excluded_references: excluded, provenance })
+        });
+    }
+
     let page = list_calls(
         &conn,
         &anchor.id,
@@ -509,52 +737,27 @@ pub(crate) fn handle_callees_in(
         params.cursor.as_deref(),
     )
     .map_err(|e| internal_error("failed to find callees", e))?;
+    let parts =
+        CalleeParts { conn: &conn, anchor: &anchor, anchor_info, anchor_hint: hint, excluded, tier, hints };
 
     let rows = page
         .results
         .into_iter()
         .map(|site| {
-            let (resolved, locality, edge_id) = (site.resolved, site.locality, site.edge_id.clone());
-            pagination::EdgeRow { item: CalleeSite::from(site), resolved, locality, edge_id }
+            let rank = site.rank.clone();
+            pagination::EdgeRow { item: CalleeSite::from(site), rank }
         })
         .collect();
-    let tier = provenance::resolve(&conn, capabilities, &anchor.language);
-    let bounded = pagination::bound_page_reserving_excluded_tally(
-        rows,
-        page.has_more,
-        page.next_cursor,
-        tier.page_reserve(),
-    );
+    let bounded = pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, |candidate| {
+        pagination::wire_len(&parts.response(candidate, pagination::widest_total(candidate.has_more), false))
+    });
+    let total = bounded
+        .has_more
+        .then(|| pagination::count_edges(&conn, &anchor.id, Direction::Outgoing, &["CALLS"], &file_paths))
+        .transpose()
+        .map_err(|e| internal_error("failed to count callees", e))?;
 
-    let excluded = excluded_references(&conn, &anchor.id, Direction::Outgoing, &file_paths);
-
-    // Every file this response names: rows and the excluded tally.
-    let touched =
-        bounded.results.iter().map(|row| row.file_path.as_str()).chain(
-            excluded.iter().flat_map(|excluded| excluded.files.iter().map(|tally| tally.path.as_str())),
-        );
-    let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
-    let hint = session_hints::join([
-        hint,
-        bounded.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
-        hints.once(
-            !bounded.all_unresolved && bounded.results.iter().any(|row| !row.resolved),
-            HintKey::UnresolvedRow,
-            session_hints::UNRESOLVED_ROW,
-        ),
-        hints.once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
-    ]);
-
-    success(&CalleePage {
-        anchor: anchor_info,
-        results: bounded.results,
-        has_more: bounded.has_more,
-        next_cursor: bounded.next_cursor,
-        all_unresolved: bounded.all_unresolved,
-        hint,
-        excluded_references: excluded,
-        provenance,
-    })
+    success(&parts.response(&bounded, total, true))
 }
 
 #[cfg(test)]

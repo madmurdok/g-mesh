@@ -35,6 +35,9 @@ use crate::protocol::types::Position;
 use crate::storage::index_store::IndexStore;
 
 mod anchor;
+mod answer;
+#[cfg(test)]
+mod answer_tests;
 // `pub(crate)` so `cli::plugin_check::expectations` calls the same handler
 // functions as the tools below; every other submodule stays private.
 pub(crate) mod find_callers_callees;
@@ -49,6 +52,8 @@ mod instructions;
 mod member_name_collision_tests;
 mod provenance;
 pub(crate) mod query_shapes;
+#[cfg(test)]
+mod response_bound_tests;
 mod search_code;
 #[cfg(test)]
 mod search_code_rerank_tests;
@@ -134,7 +139,7 @@ pub const SEARCH_EMBEDDING_WAIT: Duration = Duration::from_secs(20);
 /// behaviour change that needs a measured token effect, not a quiet edit. The
 /// headroom is kept smaller than the smallest tool's own entry, so a wording
 /// fix fits but a new tool or a batch of new parameters does not.
-pub const TOOLS_LIST_BYTE_CEILING: usize = 11_500;
+pub const TOOLS_LIST_BYTE_CEILING: usize = 11_800;
 
 /// Reads a millisecond-valued env var, falling back to `default` when it is
 /// unset, empty or not a number. Read per call, so a test can change it
@@ -880,6 +885,8 @@ impl ServerHandler for GMeshMcpServer {
 pub struct FindDefinitionParams {
     /// Name of the symbol to look up.
     pub symbol_name: Option<String>,
+    /// Or an exact candidate `id`.
+    pub symbol_id: Option<String>,
     /// Project-relative path of the file the cursor is in.
     pub file_path: Option<String>,
     /// Cursor position within `file_path`, used to resolve the symbol under it.
@@ -909,6 +916,24 @@ pub struct SymbolQueryParams {
     /// Restrict to rows in these files: project-relative, exactly as
     /// `filePath` appears in output (no globs). Omit for the whole project.
     pub file_paths: Option<Vec<String>>,
+    /// No rows: `files` per-file counts, `count` totals.
+    pub answer: Option<Answer>,
+}
+
+// What a symbol query returns. Plain comments rather than doc comments: these
+// would otherwise be published in three tool schemas on every turn, and the
+// field's own one-line doc already says what the two non-default values do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(inline)]
+pub enum Answer {
+    // One row per usage, paged (the default).
+    #[default]
+    Rows,
+    // The whole set's per-file tally, no rows.
+    Files,
+    // The whole set's total and unresolved count, no rows and no files.
+    Count,
 }
 
 // The first five fields must stay identical in name, type and semantics to
