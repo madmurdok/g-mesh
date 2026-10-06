@@ -1600,4 +1600,250 @@ mod tests {
         assert!(page.results.len() < 5, "must actually have truncated for this test to prove anything");
         assert!(page.all_unresolved);
     }
+
+    // --- ranking: EdgeRank's keys, one at a time ---------------------------
+
+    fn make_ranked_node(conn: &Connection, id: &str, kind: &str, file_path: &str, start_line: i64) {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+             VALUES (?1, ?2, ?1, ?1, ?3, ?4, 0, ?4, 0, 'rust')",
+            params![id, kind, file_path, start_line],
+        )
+        .unwrap();
+    }
+
+    /// One edge from `root` to a fresh `Function` node per `(edge id, file,
+    /// line, resolved)`, the anchor itself sitting in `anchor_file`.
+    fn ranked_fixture(anchor_file: &str, targets: &[(&str, &str, i64, bool)]) -> Connection {
+        let conn = setup();
+        make_ranked_node(&conn, "root", "Function", anchor_file, 0);
+        for (edge, file, line, resolved) in targets {
+            let node = format!("n_{edge}");
+            make_ranked_node(&conn, &node, "Function", file, *line);
+            make_edge(&conn, edge, "root", &node, *resolved);
+        }
+        conn
+    }
+
+    fn ranked_page(
+        conn: &Connection,
+        anchor_file: &str,
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> Page<ScoredEdge> {
+        paginate_edges(
+            conn,
+            "root",
+            Direction::Outgoing,
+            &[],
+            &[],
+            anchor_file,
+            Distinctness::Edges,
+            page_size,
+            cursor,
+        )
+        .unwrap()
+    }
+
+    /// `(edge id, locality)` of every row, in served order, from one page.
+    fn ranked(conn: &Connection, anchor_file: &str) -> Vec<(String, i64)> {
+        let page = ranked_page(conn, anchor_file, MAX_PAGE_SIZE, None);
+        assert!(!page.has_more, "precondition: the fixture fits one page");
+        page.results.into_iter().map(|row| (row.edge.id, row.rank.locality)).collect()
+    }
+
+    /// Every edge id served by paging through with `page_size`, in order.
+    fn paged_ids(conn: &Connection, anchor_file: &str, page_size: usize) -> Vec<String> {
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = ranked_page(conn, anchor_file, page_size, cursor.as_deref());
+            seen.extend(page.results.iter().map(|row| row.edge.id.clone()));
+            if !page.has_more {
+                return seen;
+            }
+            cursor = page.next_cursor;
+        }
+    }
+
+    fn owned(rows: &[(&str, i64)]) -> Vec<(String, i64)> {
+        rows.iter().map(|(id, locality)| (id.to_string(), *locality)).collect()
+    }
+
+    #[test]
+    fn a_resolved_row_elsewhere_ranks_before_an_unresolved_row_in_the_anchors_own_file() {
+        let conn = ranked_fixture(
+            "src/a/root.rs",
+            &[("e1", "src/a/root.rs", 1, false), ("e2", "z/far.rs", 1, true)],
+        );
+
+        assert_eq!(ranked(&conn, "src/a/root.rs"), owned(&[("e2", 2), ("e1", 0)]));
+    }
+
+    /// Ids and paths both run against the expected order, so only the
+    /// locality key can produce it.
+    #[test]
+    fn locality_ranks_the_same_file_then_the_same_directory_then_elsewhere() {
+        let conn = ranked_fixture(
+            "src/a/root.rs",
+            &[("e1", "a/far.rs", 1, true), ("e2", "src/a/x.rs", 1, true), ("e3", "src/a/root.rs", 1, true)],
+        );
+
+        assert_eq!(ranked(&conn, "src/a/root.rs"), owned(&[("e3", 0), ("e2", 1), ("e1", 2)]));
+    }
+
+    #[test]
+    fn a_file_in_a_subdirectory_of_the_anchors_directory_is_elsewhere() {
+        let conn = ranked_fixture(
+            "src/a/root.rs",
+            &[("e1", "src/a/sub/z.rs", 1, true), ("e2", "src/a/x.rs", 1, true)],
+        );
+
+        assert_eq!(ranked(&conn, "src/a/root.rs"), owned(&[("e2", 1), ("e1", 2)]));
+    }
+
+    #[test]
+    fn a_sibling_directory_sharing_the_anchors_directory_name_as_a_prefix_is_elsewhere() {
+        let conn =
+            ranked_fixture("src/a/root.rs", &[("e1", "src/ab/y.rs", 1, true), ("e2", "src/a/x.rs", 1, true)]);
+
+        assert_eq!(ranked(&conn, "src/a/root.rs"), owned(&[("e2", 1), ("e1", 2)]));
+    }
+
+    /// `PKG/` sorts before `pkg/`, so a case-insensitive match would put it
+    /// first as well as label it.
+    #[test]
+    fn the_same_directory_match_is_case_sensitive() {
+        let conn = ranked_fixture("pkg/root.py", &[("e1", "PKG/x.py", 1, true), ("e2", "pkg/y.py", 1, true)]);
+
+        assert_eq!(ranked(&conn, "pkg/root.py"), owned(&[("e2", 1), ("e1", 2)]));
+    }
+
+    #[test]
+    fn an_anchor_at_the_project_root_shares_its_directory_with_the_other_root_files_only() {
+        let conn = ranked_fixture("root.rs", &[("e1", "a/b.rs", 1, true), ("e2", "x.rs", 1, true)]);
+
+        assert_eq!(ranked(&conn, "root.rs"), owned(&[("e2", 1), ("e1", 2)]));
+    }
+
+    /// The `File` row's path, line and id all sort before the symbol row's,
+    /// so only the row-kind key puts the call site first.
+    #[test]
+    fn a_symbol_row_ranks_before_a_file_row_at_the_same_locality() {
+        let conn = setup();
+        make_ranked_node(&conn, "root", "Function", "src/root.rs", 0);
+        make_ranked_node(&conn, "importer", FILE_KIND, "lib/a.rs", 0);
+        make_ranked_node(&conn, "caller", "Function", "lib/b.rs", 3);
+        make_edge(&conn, "e1", "root", "importer", true);
+        make_edge(&conn, "e2", "root", "caller", true);
+
+        let page = ranked_page(&conn, "src/root.rs", 10, None);
+        let rows: Vec<(&str, i64)> =
+            page.results.iter().map(|row| (row.edge.id.as_str(), row.rank.file_row)).collect();
+
+        assert_eq!(rows, vec![("e2", 0), ("e1", 1)]);
+    }
+
+    #[test]
+    fn rows_within_one_tier_follow_file_path_then_line_not_edge_id() {
+        let conn = ranked_fixture(
+            "x/root.rs",
+            &[("e1", "y/b.rs", 5, true), ("e2", "y/b.rs", 2, true), ("e3", "y/a.rs", 9, true)],
+        );
+
+        assert_eq!(ranked(&conn, "x/root.rs"), owned(&[("e3", 2), ("e2", 2), ("e1", 2)]));
+    }
+
+    /// Every key varies somewhere in the fixture, and within one file the
+    /// edge ids run against the line order, so a cursor that dropped any key
+    /// would skip or repeat a row.
+    fn mixed_fixture() -> Connection {
+        let conn = ranked_fixture(
+            "src/a/root.rs",
+            &[
+                ("e9", "src/a/x.rs", 2, true),
+                ("e1", "src/a/x.rs", 5, true),
+                ("e8", "src/a/root.rs", 7, true),
+                ("e2", "src/a/root.rs", 3, false),
+                ("e7", "lib/m.rs", 1, true),
+                ("e3", "lib/m.rs", 1, true),
+                ("e6", "src/ab/y.rs", 4, false),
+                ("e4", "src/a/sub/z.rs", 4, true),
+            ],
+        );
+        make_ranked_node(&conn, "importer", FILE_KIND, "src/a/w.rs", 0);
+        make_edge(&conn, "e5", "root", "importer", true);
+        conn
+    }
+
+    #[test]
+    fn paging_one_row_at_a_time_serves_every_row_once_in_the_single_page_order() {
+        let conn = mixed_fixture();
+        let whole: Vec<String> = ranked(&conn, "src/a/root.rs").into_iter().map(|(id, _)| id).collect();
+        assert_eq!(whole.len(), 9, "precondition: every edge is on the single page");
+
+        assert_eq!(paged_ids(&conn, "src/a/root.rs", 1), whole);
+        assert_eq!(paged_ids(&conn, "src/a/root.rs", 2), whole);
+    }
+
+    #[test]
+    fn a_structural_cursor_in_the_earlier_shape_is_refused_by_name() {
+        #[derive(Serialize)]
+        struct EarlierStructuralCursor {
+            resolved: bool,
+            locality: i64,
+            id: String,
+        }
+        let conn = mixed_fixture();
+        let earlier =
+            encode_cursor(&EarlierStructuralCursor { resolved: true, locality: 0, id: "e8".to_string() });
+
+        let err = paginate_edges(
+            &conn,
+            "root",
+            Direction::Outgoing,
+            &[],
+            &[],
+            "src/a/root.rs",
+            Distinctness::Edges,
+            2,
+            Some(&earlier),
+        )
+        .err()
+        .expect("an earlier-shape cursor must be refused");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("older g-mesh version"), "{message}");
+        assert!(message.contains("without a cursor"), "{message}");
+    }
+
+    /// A page cut for bytes rather than rows hands back a cursor built from
+    /// the last kept row's whole rank, so the next SQL page starts exactly
+    /// after it.
+    #[test]
+    fn a_page_cut_for_bytes_resumes_exactly_after_its_last_kept_row() {
+        let conn = mixed_fixture();
+        let page = ranked_page(&conn, "src/a/root.rs", MAX_PAGE_SIZE, None);
+        let whole: Vec<String> = page.results.iter().map(|row| row.edge.id.clone()).collect();
+        let rows: Vec<EdgeRow<Item>> = page
+            .results
+            .into_iter()
+            .map(|row| EdgeRow {
+                item: Item { id: row.edge.id.clone(), blob: "x".repeat(100) },
+                rank: row.rank,
+            })
+            .collect();
+        let budget =
+            serde_json::to_vec(&rows.iter().take(3).map(|row| &row.item).collect::<Vec<_>>()).unwrap().len();
+
+        let cut = bound_page_within(rows, false, None, budget);
+        assert_eq!(cut.results.len(), 3, "precondition: the budget keeps three rows");
+        assert!(cut.has_more);
+
+        let mut served: Vec<String> = cut.results.into_iter().map(|item| item.id).collect();
+        let rest = ranked_page(&conn, "src/a/root.rs", MAX_PAGE_SIZE, cut.next_cursor.as_deref());
+        served.extend(rest.results.into_iter().map(|row| row.edge.id));
+
+        assert_eq!(served, whole);
+    }
 }

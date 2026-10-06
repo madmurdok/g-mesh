@@ -36,6 +36,8 @@ use crate::storage::index_store::IndexStore;
 
 mod anchor;
 mod answer;
+#[cfg(test)]
+mod answer_tests;
 // `pub(crate)` so `cli::plugin_check::expectations` calls the same handler
 // functions as the tools below; every other submodule stays private.
 pub(crate) mod find_callers_callees;
