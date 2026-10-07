@@ -64,6 +64,19 @@
 //! and gets no list. The list is what a semantic engine binds an overloaded
 //! call to by ordinal; see
 //! `docs/adr/0024-semantic-tier-refines-by-binding-a-declaration.md`.
+//!
+//! # Property accessors
+//!
+//! `@property def x`, `@x.setter def x` and `@x.deleter def x` are three
+//! functions of one property, not a redefinition, so they are three nodes:
+//! the same name, `qualifiedName` and container, told apart by `nativeKind`
+//! (`method` for the getter, whose id is unchanged, then `setter` and
+//! `deleter`), each with its own range, signature and docstring. The setter
+//! and deleter are kept out of the name tables (`super::model`'s accessor
+//! table), so a name lookup still finds the getter alone; only an
+//! instance-parameter store (`self.x = v`), `del self.x` or `self.x += v`
+//! is routed to them (`super::bodies`). See
+//! `docs/architecture/gm-511-python-property-accessors.md`.
 
 use std::collections::{HashMap, HashSet};
 

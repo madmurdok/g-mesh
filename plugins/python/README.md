@@ -267,6 +267,11 @@ assertion that it stays a gap forever.
    dispatcher). The decorator is recorded in the signature and as a
    `REFERENCES` edge, and the decorated declaration is indexed as written - but
    a call to it reaches the wrapper at runtime, which the index does not model.
+   A property's `@x.setter` and `@x.deleter` are the exception: each is its
+   own node (`nativeKind` `setter`/`deleter`, beside the getter's `method`),
+   and `self.x = v`, `del self.x` and `self.x += v` reference the accessor they
+   run. A class-qualified `C.x` from another file then names two or three
+   nodes and stays unlinked; `obj.x` on an unknown receiver is not resolved.
 
 Five smaller ones, for completeness:
 
