@@ -95,10 +95,10 @@ impl Extractor for TypeScriptExtractor {
             return emit::flush(model, LANGUAGE, ENGINE, path, false);
         };
         let root = tree.root_node();
-        let start = root.start_position();
-        let end = root.end_position();
-        let range = columns.range((start.row, start.column), (end.row, end.column));
-        let mut model = FileModel::new(path.as_str(), range);
+        // Not the root's own range: tree-sitter ends it at `(lines, 0)` after
+        // a final newline, one past the last line. The `File` node ends where
+        // the content does, as on the unparsed path above (GM-527).
+        let mut model = FileModel::new(path.as_str(), columns.file_range());
         let resolve = |specifier: &str, from: &RelPath| project.resolve(specifier, from);
         Declarer::new(source, &columns, path, &resolve, &mut model).run(root);
         emit::flush(model, LANGUAGE, ENGINE, path, root.has_error())

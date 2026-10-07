@@ -54,18 +54,30 @@ impl<'s> CharColumns<'s> {
         Range { start: self.at(start.0, start.1), end: self.at(end.0, end.1) }
     }
 
-    /// The whole file's range, whose end is `(number of newlines, length of
-    /// the final unterminated line)`: the one formula a space inserted before
-    /// the file's last newline does not move (see
+    /// The whole file's range, ending where its content ends: trailing
+    /// whitespace (`' '`, `\t`, `\r`, `\n`, `\v`, `\f`) is trimmed, and the
+    /// end is `(number of newlines in the rest, length of its last line)`.
+    ///
+    /// So the end line is the file's last real line (`"a\nbc\n"` ends at
+    /// `(1, 2)`, never on the empty line after the final newline), and a
+    /// space inserted before the file's last newline does not move it (see
     /// [`FileGraphBuilder::file_node`](crate::FileGraphBuilder::file_node)).
+    /// An empty or whitespace-only file is `(0, 0)`.
     pub fn file_range(&self) -> Range {
-        let last_start = *self.line_starts.last().unwrap_or(&0);
-        Range {
-            start: Position { line: 0, col: 0 },
-            end: Position {
-                line: (self.line_starts.len() - 1) as u32,
-                col: self.source[last_start..].chars().count() as u32,
-            },
-        }
+        Range { start: Position { line: 0, col: 0 }, end: content_end(self.source) }
     }
+}
+
+/// The trailing whitespace a whole-file range ends before.
+const TRAILING_WHITESPACE: [char; 6] = [' ', '\t', '\r', '\n', '\x0b', '\x0c'];
+
+/// The end of `text` with its trailing whitespace removed, in characters:
+/// `(number of '\n' in the content, characters after the last one)`.
+fn content_end(text: &str) -> Position {
+    let content = text.trim_end_matches(TRAILING_WHITESPACE);
+    let (line, last) = match content.rfind('\n') {
+        Some(at) => (content.matches('\n').count(), &content[at + 1..]),
+        None => (0, content),
+    };
+    Position { line: line as u32, col: last.chars().count() as u32 }
 }

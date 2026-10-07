@@ -31,7 +31,7 @@
 
 use std::collections::BTreeMap;
 
-use g_mesh_wire::{Position, WireNode};
+use g_mesh_wire::{NodeKind, Position, WireNode};
 
 use crate::graph::{FileGraph, OpenSite};
 use crate::path::RelPath;
@@ -150,17 +150,19 @@ impl SdkIndex {
     /// name, which is inside the symbol, which is inside the file's `File`
     /// node. Every one of those contains the position, and only the innermost
     /// is the answer. Ties - two nodes with exactly the same range, an
-    /// overload signature beside its implementation - are broken by id, so
-    /// the answer is at least stable rather than whichever the iteration
-    /// order produced.
+    /// overload signature beside its implementation - go to the node that is
+    /// not the `File` (since GM-527 a file holding one declaration and
+    /// nothing else ends where that declaration does, and the declaration is
+    /// the answer), then by id, so the answer is at least stable rather than
+    /// whichever the iteration order produced.
     pub fn node_at(&self, path: &RelPath, position: Position) -> Option<&WireNode> {
         let entry = self.files.get(path)?;
-        entry
-            .graph
-            .nodes
-            .iter()
-            .filter(|node| contains(node, position))
-            .min_by(|a, b| span(a).cmp(&span(b)).then_with(|| a.id.cmp(&b.id)))
+        entry.graph.nodes.iter().filter(|node| contains(node, position)).min_by(|a, b| {
+            span(a)
+                .cmp(&span(b))
+                .then_with(|| (a.kind == NodeKind::File).cmp(&(b.kind == NodeKind::File)))
+                .then_with(|| a.id.cmp(&b.id))
+        })
     }
 
     /// The node with this id, and the file it is in - what an engine uses to

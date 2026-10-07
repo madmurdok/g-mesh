@@ -669,17 +669,21 @@ pub(crate) fn declaration_edit<'a>(
 /// edit after which no range a plugin reports can *legitimately* move, and
 /// most whitespace edits fail that test:
 ///
-/// - **Appending a newline at EOF** moves the end of the whole-file range: the
-///   TS plugin's `File` node ends at tree-sitter's root end, `(lines, 0)`,
-///   measured on this repo's own fixture as `(8, 0)` for an 8-line file, so a
-///   ninth newline legitimately changes it to `(9, 0)`.
+/// - **Appending a newline at EOF** moves any whole-file end measured on the
+///   raw text, such as tree-sitter's root end `(lines, 0)`. A plugin's `File`
+///   node ends where the content ends instead - trailing whitespace trimmed,
+///   then `(newlines, length of the last line)`, the SDK's
+///   `CharColumns::file_range` - which this edit does not move either; the
+///   check also requires that end line (`checks::whitespace_edit`). The
+///   space below lengthens the raw text too, so a plugin that measures it
+///   still fails.
 /// - **Inserting a blank line** shifts every declaration below it.
 /// - **Trailing space on an arbitrary line** can land inside a multi-line
 ///   doc comment or string, whose text a plugin legitimately reports.
 ///
 /// A space before the *last* newline moves nothing: no content follows it on
 /// its line, every later line (at most the final one, when the file does not
-/// end in a newline) keeps its row and columns, so the root's end is
+/// end in a newline) keeps its row and columns, so the content's end is
 /// unchanged, and a declaration ending on that line ends at its last token,
 /// before the space. The one residue is a line whose end is inside a construct
 /// still open at that point - a template literal or block comment spanning

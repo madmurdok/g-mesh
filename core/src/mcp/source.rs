@@ -76,13 +76,20 @@ pub(super) struct Snippet {
 /// was edited since the last walk. A definition's coordinates are still a
 /// correct, useful answer without its text, so a missing snippet degrades the
 /// response instead of failing the call.
+///
+/// `end_col` is the span's stored end column, `None` when the caller does not
+/// have it. It matters for one span only: a whole-file node in an index built
+/// before GM-527 ends one past the last line, at `(lines, 0)`, after a final
+/// newline. That exact end reads as the end of the last line; every other
+/// span past the end of the file is still refused (see [`read_span_within`]).
 pub(super) fn read_span(
     project_root: &Path,
     file_path: &str,
     start_line: i64,
     end_line: i64,
+    end_col: Option<i64>,
 ) -> Option<Snippet> {
-    read_span_within(project_root, file_path, start_line, end_line, MAX_LINES, MAX_CHARS)
+    read_span_within(project_root, file_path, start_line, end_line, end_col, MAX_LINES, MAX_CHARS)
 }
 
 /// [`read_span`] under caller-chosen caps, for a response that carries
@@ -93,6 +100,7 @@ pub(super) fn read_span_within(
     file_path: &str,
     start_line: i64,
     end_line: i64,
+    end_col: Option<i64>,
     max_lines: usize,
     max_chars: usize,
 ) -> Option<Snippet> {
@@ -104,10 +112,19 @@ pub(super) fn read_span_within(
     let lines: Vec<&str> = contents.lines().collect();
 
     let start = usize::try_from(start_line).ok()?;
-    let end = usize::try_from(end_line).ok()?;
-    // A span past the end of the file means the index is describing a version
-    // of this file that is no longer on disk. Answering with whatever happens
-    // to be at those lines now would be worse than answering with nothing.
+    let mut end = usize::try_from(end_line).ok()?;
+    // An index built before GM-527 ends a whole-file node at `(lines, 0)`
+    // after a final newline: one past the last line `lines()` yields. That
+    // exact end, and only it, is the current file's own end, so it reads as
+    // the end of the last line. For a whole-file node the whole current file
+    // is the right text even if the file changed since the walk.
+    if end == lines.len() && end_col == Some(0) && contents.ends_with('\n') && start < lines.len() {
+        end -= 1;
+    }
+    // Any other span past the end of the file means the index is describing
+    // a version of this file that is no longer on disk. Answering with
+    // whatever happens to be at those lines now would be worse than
+    // answering with nothing.
     if start >= lines.len() || end >= lines.len() {
         return None;
     }
@@ -155,7 +172,7 @@ mod tests {
     fn a_span_is_read_inclusively_and_reported_one_based() {
         let (dir, file) = project("zero\none\ntwo\nthree\n");
 
-        let snippet = read_span(dir.path(), &file, 1, 2).expect("the span is inside the file");
+        let snippet = read_span(dir.path(), &file, 1, 2, None).expect("the span is inside the file");
 
         assert_eq!(snippet.text, "one\ntwo", "0-based and inclusive at both ends");
         assert_eq!(snippet.first_line, 2, "reported as an editor would show it");
@@ -166,7 +183,7 @@ mod tests {
     fn a_single_line_declaration_is_that_line() {
         let (dir, file) = project("zero\none\ntwo\n");
 
-        let snippet = read_span(dir.path(), &file, 0, 0).expect("the span is inside the file");
+        let snippet = read_span(dir.path(), &file, 0, 0, None).expect("the span is inside the file");
 
         assert_eq!(snippet.text, "zero");
         assert_eq!(snippet.first_line, 1);
@@ -180,8 +197,8 @@ mod tests {
         let body: String = (0..MAX_LINES + 30).map(|n| format!("line {n}\n")).collect();
         let (dir, file) = project(&body);
 
-        let snippet =
-            read_span(dir.path(), &file, 0, (MAX_LINES + 29) as i64).expect("the span is inside the file");
+        let snippet = read_span(dir.path(), &file, 0, (MAX_LINES + 29) as i64, None)
+            .expect("the span is inside the file");
 
         assert_eq!(snippet.text.lines().count(), MAX_LINES);
         assert_eq!(snippet.omitted_lines, Some(30));
@@ -192,7 +209,7 @@ mod tests {
         let huge = "x".repeat(MAX_CHARS / 2);
         let (dir, file) = project(&format!("{huge}\n{huge}\n{huge}\n"));
 
-        let snippet = read_span(dir.path(), &file, 0, 2).expect("the span is inside the file");
+        let snippet = read_span(dir.path(), &file, 0, 2, None).expect("the span is inside the file");
 
         assert!(snippet.text.lines().count() < 3, "the char cap must bite before the line cap");
         assert_eq!(snippet.omitted_lines, Some(3 - snippet.text.lines().count()));
@@ -204,7 +221,7 @@ mod tests {
         let huge = "x".repeat(MAX_CHARS * 2);
         let (dir, file) = project(&format!("{huge}\nnext\n"));
 
-        let snippet = read_span(dir.path(), &file, 0, 1).expect("the span is inside the file");
+        let snippet = read_span(dir.path(), &file, 0, 1, None).expect("the span is inside the file");
 
         assert_eq!(snippet.text, huge);
         assert_eq!(snippet.omitted_lines, Some(1));
@@ -217,22 +234,22 @@ mod tests {
     fn a_span_past_the_end_of_the_file_reads_as_absent_rather_than_wrong() {
         let (dir, file) = project("one\ntwo\n");
 
-        assert_eq!(read_span(dir.path(), &file, 0, 9), None, "the file shrank since it was indexed");
-        assert_eq!(read_span(dir.path(), &file, 5, 6), None);
+        assert_eq!(read_span(dir.path(), &file, 0, 9, None), None, "the file shrank since it was indexed");
+        assert_eq!(read_span(dir.path(), &file, 5, 6, None), None);
     }
 
     #[test]
     fn a_missing_file_reads_as_absent() {
         let dir = tempfile::tempdir().expect("failed to create a temp project");
 
-        assert_eq!(read_span(dir.path(), "gone.ts", 0, 1), None);
+        assert_eq!(read_span(dir.path(), "gone.ts", 0, 1, None), None);
     }
 
     #[test]
     fn a_nonsensical_span_reads_as_absent() {
         let (dir, file) = project("one\ntwo\n");
 
-        assert_eq!(read_span(dir.path(), &file, -1, 1), None);
-        assert_eq!(read_span(dir.path(), &file, 1, 0), None, "end before start");
+        assert_eq!(read_span(dir.path(), &file, -1, 1, None), None);
+        assert_eq!(read_span(dir.path(), &file, 1, 0, None), None, "end before start");
     }
 }

@@ -84,23 +84,18 @@ impl<'s> Positions<'s> {
         Range { start: self.at(node.start_position()), end: self.at(node.end_position()) }
     }
 
-    /// The file's own range, whose end is `(number of newlines, length of the
-    /// final unterminated line)`.
+    /// The file's own range, ending where its content ends: trailing
+    /// whitespace is trimmed, and the end is `(number of newlines, length of
+    /// the last line)` of what is left - the file's last real line, never
+    /// the empty line after a final newline.
     ///
     /// Not tree-sitter's root range, and not a byte count: this is the one
     /// formula a space inserted before the file's last newline does not move,
     /// which is what `id-stability.whitespace-edit` asks of every plugin (see
     /// `core::cli::plugin_check::session::whitespace_edit` for why that
-    /// particular edit).
+    /// particular edit), which also requires that end line.
     pub(crate) fn file_range(&self) -> Range {
-        let lines: Vec<&str> = self.source.split('\n').collect();
-        Range {
-            start: Position { line: 0, col: 0 },
-            end: Position {
-                line: (lines.len() - 1) as u32,
-                col: lines.last().map_or(0, |line| line.chars().count()) as u32,
-            },
-        }
+        g_mesh_plugin_sdk::CharColumns::new(self.source).file_range()
     }
 }
 

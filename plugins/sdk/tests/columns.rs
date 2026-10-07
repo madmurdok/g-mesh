@@ -59,8 +59,8 @@ fn columns_file_range_ends_at_newlines_and_last_line_chars() {
 }
 
 #[test]
-fn columns_file_range_of_a_terminated_file_ends_on_the_empty_last_line() {
-    assert_eq!(CharColumns::new("ab\ncd\n").file_range().end, pos(2, 0));
+fn columns_file_range_of_a_terminated_file_ends_on_its_last_real_line() {
+    assert_eq!(CharColumns::new("ab\ncd\n").file_range().end, pos(1, 2));
 }
 
 #[test]
@@ -71,6 +71,6 @@ fn columns_file_range_of_an_empty_file_is_the_origin() {
 #[test]
 fn columns_carriage_return_is_an_ordinary_character() {
     let columns = CharColumns::new("ab\r\ncd\r");
-    assert_eq!(columns.file_range().end, pos(1, 3));
+    assert_eq!(columns.file_range().end, pos(1, 2));
     assert_eq!(columns.at(1, 2), pos(1, 2));
 }

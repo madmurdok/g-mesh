@@ -38,6 +38,8 @@
 //! - `same-file-rule`: same-file `CALLS` edges are `resolved: false`.
 //! - `bulk-repeat`: `a.fk`'s bulk walk adds a node whose id holds the pid.
 //! - `whitespace-moves-range`: the `File` node's end column is the text length.
+//! - `file-end-past-last-line`: the `File` node keeps the old end, `(newline
+//!   count, length after the last newline)` - `(lines, 0)` after a final newline.
 //! - `deletes-unknown`: every non-empty diff deletes `never-emitted-node`.
 //! - `incremental-ids`: declarations are `#func:` ids outside the bulk walk.
 //! - `stale-ranges`: a diff only upserts ids it never sent before.
@@ -158,13 +160,22 @@ fn extract(defect: &str, file_path: &str, text: &str, mode: Mode, present: &BTre
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let lines: Vec<&str> = text.split('\n').collect();
-    let tail = utf16_len(text.rsplit('\n').next().unwrap_or_default());
     let file_id = format!("{file_path}#file");
-    // Conformant: the file range ends at (newline count, length of the final
-    // unterminated line) - which a space before the last newline cannot move.
-    let end_col = if defect == "whitespace-moves-range" { utf16_len(text) } else { tail };
+    // Conformant: the file range ends where its content ends - trailing
+    // whitespace trimmed, then (newline count, length of the last line) - which
+    // is the last real line, and which a space before the last newline cannot
+    // move.
+    let content = text.trim_end_matches([' ', '\t', '\r', '\n', '\x0b', '\x0c']);
+    let content_tail = utf16_len(content.rsplit('\n').next().unwrap_or_default());
+    let [end_line, end_col] = match defect {
+        "whitespace-moves-range" => [content.matches('\n').count(), utf16_len(text)],
+        "file-end-past-last-line" => {
+            [lines.len() - 1, utf16_len(text.rsplit('\n').next().unwrap_or_default())]
+        }
+        _ => [content.matches('\n').count(), content_tail],
+    };
     let base_name = file_path.rsplit('/').next().unwrap_or(file_path);
-    let mut file = node(&file_id, "File", base_name, file_path, file_path, [0, 0, lines.len() - 1, end_col]);
+    let mut file = node(&file_id, "File", base_name, file_path, file_path, [0, 0, end_line, end_col]);
     file.insert("visibility".into(), json!("file"));
     nodes.push(file);
 

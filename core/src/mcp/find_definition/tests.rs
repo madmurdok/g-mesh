@@ -1163,6 +1163,7 @@ fn a_semantic_page_is_labelled_as_candidates_and_carries_ids_to_requery() {
             file_path: "a.rs".to_string(),
             start_line: None,
             end_line: None,
+            end_col: None,
             kind: "Function".to_string(),
             preview: None,
             source: None,
@@ -1905,12 +1906,13 @@ fn sourced_ids(body: &serde_json::Value) -> Vec<String> {
     ids
 }
 
-/// Two readable candidates and one whose `endLine` is the file's line count,
-/// one past its last line - the shape a Python `Module` node has (requests'
-/// `__version__`). Its span is refused, so the page carries source for some
-/// candidates only and must not claim "each with its source".
+/// Two readable candidates and one whose `endLine` is past the end of its
+/// 2-line file - a file shortened since the walk. (`(2, 0)` would not do: that
+/// is an old index's whole-file end, which is read - GM-527.) Its span is
+/// refused, so the page carries source for some candidates only and must not
+/// claim "each with its source".
 fn runs_one_past_the_end() -> (Arc<IndexStore>, tempfile::TempDir) {
-    let store = runs(&[("a", "a.rs", 0, 2), ("b", "b.rs", 1, 1), ("m", "m.rs", 0, 2)]);
+    let store = runs(&[("a", "a.rs", 0, 2), ("b", "b.rs", 1, 1), ("m", "m.rs", 0, 5)]);
     let project = project_files(&[
         ("a.rs", "fn run() {\n    alpha();\n}\n"),
         ("b.rs", "// b\nfn run() { beta() }\n"),
@@ -1977,7 +1979,7 @@ fn include_source_false_on_a_mixed_page_is_plainly_ambiguous() {
 /// all, and says the plain thing rather than "some".
 #[test]
 fn a_page_where_no_candidates_span_can_be_read_is_plainly_ambiguous() {
-    let store = runs(&[("a", "a.rs", 0, 1), ("b", "b.rs", 5, 9)]);
+    let store = runs(&[("a", "a.rs", 0, 2), ("b", "b.rs", 5, 9)]);
     let project = project_files(&[("a.rs", "fn run() {}\n"), ("b.rs", "fn run() {}\n")]);
 
     let body = json_body(&define(&store, project.path(), named("run")));

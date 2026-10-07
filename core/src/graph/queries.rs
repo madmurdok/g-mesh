@@ -701,7 +701,10 @@ pub fn find_containers_by_key(conn: &Connection, key: &str) -> Result<Vec<NodeRe
 /// `find_definition`'s file+position input. Multiple nodes can contain a
 /// position (a `File` spans the whole file, a `Function` inside it spans
 /// just itself) - ordering by span size ascending picks the smallest one
-/// first, which is always the most specific.
+/// first, which is always the most specific. A `File` sorts after any other
+/// node of the same span: since GM-527 a file holding one declaration and
+/// nothing else ends where that declaration does, and the declaration is
+/// the more specific answer.
 pub fn find_by_position(
     conn: &Connection,
     file_path: &str,
@@ -716,7 +719,7 @@ pub fn find_by_position(
                AND {} \
                AND (startLine < ?2 OR (startLine = ?2 AND startCol <= ?3)) \
                AND (endLine > ?2 OR (endLine = ?2 AND endCol >= ?3)) \
-             ORDER BY (endLine - startLine) ASC, (endCol - startCol) ASC \
+             ORDER BY (endLine - startLine) ASC, (endCol - startCol) ASC, (kind = 'File') ASC \
              LIMIT 1",
             declaration_only("")
         ),

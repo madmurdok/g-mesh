@@ -958,22 +958,23 @@ func computeFileNode(relPath string, content []byte) wireNode {
 }
 
 // textEndPosition is the File node's end position, computed from the bytes
-// rather than from the AST - and it must agree with what
-// core/src/cli/plugin_check/session.rs's whitespace_edit actually does for
-// that check to pass: endLine is the number of '\n' bytes in the file,
-// endCol is the byte length of whatever text follows the last one (0 when
-// the file ends in a newline). This is exactly tree-sitter's own root-node
-// end position for the TS plugin - see that doc comment's own measurement,
-// an 8-line file ending at (8, 0) - so a whitespace-only edit before the
-// file's *last* newline (never after it) changes neither the newline count
-// nor what follows the final one, and this function's answer is unchanged by
-// it, which is what lets control.go's handleFileChanged answer that edit
-// with an empty diff.
+// rather than from the AST: where the file's content ends. Trailing
+// whitespace (' ', '\t', '\r', '\n', '\v', '\f') is trimmed first; endLine is
+// then the number of '\n' bytes left, and endCol the byte length of whatever
+// follows the last one. So endLine is the file's last real line, never the
+// empty line after a final newline ("a\nbc\n" ends at (1, 2)), which is what
+// core/src/cli/plugin_check/session.rs's whitespace_edit check requires.
+// That check inserts a space before the file's *last* newline: the space is
+// either trailing whitespace (trimmed away) or on an earlier line than the
+// content's last one, so this function's answer is unchanged by it, which is
+// what lets control.go's handleFileChanged answer that edit with an empty
+// diff. An empty or whitespace-only file ends at (0, 0).
 //
 // Reading it from the bytes rather than from `ast.File.End()` is also what
 // makes it defined for a file that does not parse at all: an empty file and
 // a file whose first token is broken both still have a length.
 func textEndPosition(content []byte) (line, col int) {
+	content = bytes.TrimRight(content, " \t\r\n\v\f")
 	line = bytes.Count(content, []byte{'\n'})
 	lastNewline := bytes.LastIndexByte(content, '\n')
 	col = len(content) - (lastNewline + 1)
