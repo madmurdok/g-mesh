@@ -265,3 +265,95 @@ fn quoted_stderr_survives_bytes_that_are_not_utf8() {
     let quoted = quote_stderr(&[0xff, 0xfe, b'\n', b'o', b'k'], "failed".to_string(), true);
     assert!(quoted.contains("| ok"), "{quoted}");
 }
+
+// -----------------------------------------------------------------
+// GM-516: `capabilities.files-created-resolves`' evidence.
+// -----------------------------------------------------------------
+
+fn files_created_pair(target: &str, importer: &str) -> FilesCreatedPair {
+    FilesCreatedPair {
+        target: target.to_string(),
+        target_text: "fn created\n".to_string(),
+        importer: importer.to_string(),
+        importer_text: format!("import {target}\n"),
+    }
+}
+
+/// Every way a pair cannot be run is a finding naming its field, and a
+/// runnable pair - including one in a subdirectory that does not exist yet -
+/// has none. Control: return no findings from `files_created_pair_findings`
+/// (each of the invalid cases below then reports nothing).
+#[test]
+fn an_unrunnable_files_created_pair_is_named_field_by_field() {
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.fk"), "fn alpha\n").unwrap();
+    let mut manifest = fake_workspace_plugin_manifest(PathBuf::from("true"));
+    manifest.extensions = vec![".fk".to_string()];
+    let findings = |target: &str, importer: &str| {
+        files_created_pair_findings(&manifest, workspace.path(), &files_created_pair(target, importer))
+    };
+
+    assert_eq!(findings("new/c.fk", "d.fk"), Vec::<String>::new());
+
+    let existing = findings("a.fk", "d.fk");
+    assert_eq!(existing.len(), 1, "{existing:?}");
+    assert!(existing[0].starts_with("[files_created] target = \"a.fk\" already exists"), "{existing:?}");
+
+    let unclaimed = findings("c.fk", "d.txt");
+    assert_eq!(unclaimed.len(), 1, "{unclaimed:?}");
+    assert!(unclaimed[0]
+        .starts_with("[files_created] importer = \"d.txt\" has none of the manifest's extensions"));
+
+    let same = findings("c.fk", "c.fk");
+    assert_eq!(same, vec!["[files_created] target and importer are the same path (\"c.fk\")".to_string()]);
+
+    for escaping in ["../c.fk", "./c.fk", "", "/tmp/c.fk"] {
+        let found = findings(escaping, "d.fk");
+        assert!(
+            found.iter().any(|f| f.starts_with("[files_created] target = ") && f.contains("not a plain")),
+            "{escaping:?}: {found:?}"
+        );
+    }
+}
+
+/// `import_rows` reads, for an `IMPORTS` edge onto a core-owned container,
+/// the files of that container's `DEFINES` members, once each - the half of
+/// the amended D2 the fake plugin cannot exercise (it emits no containers).
+/// An edge onto a plain node reports no members, and an edge from another
+/// file is not the importer's. Control: drop the `containers` subquery from
+/// `import_rows` (the container row then reports no member files).
+#[test]
+fn import_rows_report_a_containers_member_files() {
+    let manifest = fake_workspace_plugin_manifest(PathBuf::from("true"));
+    let store = open_index(&manifest).unwrap();
+    store.with(|conn| {
+        conn.execute_batch(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language, nativeKind) VALUES
+               ('imp',  'File',     'importer', 'importer.py', 'importer.py',   0, 0, 1, 0, 'fake', NULL),
+               ('pkg',  'Module',   'target',   'pkg.target',  '',              0, 0, 0, 0, 'fake', 'container'),
+               ('m1',   'Function', 'one',      'one',         'pkg/target.py', 0, 0, 1, 0, 'fake', NULL),
+               ('m2',   'Function', 'two',      'two',         'pkg/target.py', 2, 0, 3, 0, 'fake', NULL),
+               ('tf',   'File',     'target',   'pkg/target.py','pkg/target.py',0, 0, 3, 0, 'fake', NULL),
+               ('other','File',     'other',    'other.py',    'other.py',      0, 0, 1, 0, 'fake', NULL);
+             INSERT INTO containers (nodeId, language, key, parentKey, memberCount) VALUES
+               ('pkg', 'fake', 'pkg.target', NULL, 2);
+             INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved) VALUES
+               ('d1', 'pkg',   'm1',  'DEFINES', 'syntactic', 'core', 1),
+               ('d2', 'pkg',   'm2',  'DEFINES', 'syntactic', 'core', 1),
+               ('i1', 'imp',   'pkg', 'IMPORTS', 'syntactic', 'fake', 1),
+               ('i2', 'imp',   'tf',  'IMPORTS', 'syntactic', 'fake', 1),
+               ('i3', 'other', 'tf',  'IMPORTS', 'syntactic', 'fake', 1);",
+        )
+    })
+    .unwrap();
+
+    let rows = import_rows(&store, "importer.py").unwrap();
+    assert_eq!(rows.len(), 2, "only the importer's own IMPORTS edges: {rows:?}");
+    let container = rows.iter().find(|row| row.to_native_kind.as_deref() == Some("container")).unwrap();
+    assert_eq!(container.to_file, "");
+    assert_eq!(container.container_member_files, vec!["pkg/target.py".to_string()]);
+    assert!(container.resolved);
+    let file = rows.iter().find(|row| row.to_kind == "File").unwrap();
+    assert_eq!(file.to_file, "pkg/target.py");
+    assert!(file.container_member_files.is_empty(), "{file:?}");
+}
