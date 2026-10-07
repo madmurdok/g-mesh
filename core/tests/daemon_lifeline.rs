@@ -27,7 +27,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
 use g_mesh::daemon::lifecycle::{CORE_IDLE_ENV, LIFELINE_PID_ENV, PLUGIN_IDLE_ENV};
@@ -269,9 +269,18 @@ fn a_daemon_whose_lifeline_is_running_or_unreadable_is_left_alone() {
 /// A shim passes its environment to the daemon it detaches, so a daemon a
 /// test reached through `mcp-shim` is tied to the same lifeline - and outlives
 /// the shim itself, which is exactly the daemon nothing else would ever stop.
+///
+/// The bootstrap wait is the one every shim-bootstrapping test here uses:
+/// the pid file, which the daemon writes right after its bind, polled for
+/// [`common::startup_timeout`]. The waits for the daemon to stop each get
+/// their own deadline, started only once the lifeline is gone, so a slow
+/// start never shortens or lengthens them.
 #[test]
 fn a_daemon_detached_by_a_shim_stops_once_the_shims_lifeline_exits() {
     let project = Project::new();
+    let logs = tempfile::tempdir().expect("failed to create a log directory");
+    let shim_log = logs.path().join("shim.log");
+    let daemon_log = logs.path().join("daemon.log");
     let mut helper = Helper::spawn();
 
     let mut shim = Command::new(BIN)
@@ -281,15 +290,27 @@ fn a_daemon_detached_by_a_shim_stops_once_the_shims_lifeline_exits() {
         .env(LIFELINE_PID_ENV, helper.pid().to_string())
         .env(PLUGIN_IDLE_ENV, PLUGIN_IDLE.as_millis().to_string())
         .env(CORE_IDLE_ENV, CORE_IDLE_EFFECTIVELY_NEVER.as_millis().to_string())
+        .env(g_mesh::shim::DAEMON_LOG_ENV, &daemon_log)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(File::create(&shim_log).expect("failed to create the shim's log file"))
         .spawn()
         .expect("failed to spawn the shim");
 
-    common::wait_for("the shim to bootstrap a daemon", common::startup_timeout(), || {
-        daemon::is_listening(&project.root).unwrap_or(false) && project.core_pid_file().exists()
-    });
+    let timeout = common::startup_timeout();
+    let deadline = Instant::now() + timeout;
+    while !project.core_pid_file().exists() {
+        if Instant::now() >= deadline {
+            let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_else(|err| format!("<{err}>"));
+            panic!(
+                "timed out waiting for the shim to bootstrap a daemon within {timeout:?}\n\
+                 shim stderr:\n{}\ndaemon log:\n{}",
+                read(&shim_log),
+                read(&daemon_log)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let daemon_pid = recorded_pid(&project.core_pid_file());
 
     // Closing stdin ends the shim; the daemon it detached stays.
