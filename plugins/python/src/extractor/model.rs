@@ -47,6 +47,8 @@ use std::collections::HashMap;
 
 use g_mesh_plugin_sdk::wire::{NodeKind, Range};
 
+use crate::extractor::syntax::Accessor;
+
 /// A declaration this file makes, as everything that needs to point at it
 /// sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +106,12 @@ pub(crate) struct DunderAll {
 pub(crate) struct FileModel {
     by_scope: HashMap<(String, String), Vec<DeclRef>>,
     by_qualified: HashMap<String, DeclRef>,
+    /// A property's setter and deleter, keyed by the getter's qualified name.
+    /// Kept out of the two tables above on purpose: every name lookup keeps
+    /// seeing only the getter, so a bare `x` in the class body or `C.x` does
+    /// not turn ambiguous; only a use the body pass knows is a store or a
+    /// `del` asks this table.
+    accessors: HashMap<(String, Accessor), DeclRef>,
     imports: HashMap<String, Import>,
     dunder_all: DunderAll,
 }
@@ -135,6 +143,18 @@ impl FileModel {
             // wrong one.
             _ => None,
         }
+    }
+
+    /// Records a property's setter or deleter under the getter's
+    /// `qualified` name. First wins, as in [`FileModel::declare`].
+    pub(crate) fn declare_accessor(&mut self, qualified: &str, accessor: Accessor, decl: DeclRef) {
+        self.accessors.entry((qualified.to_string(), accessor)).or_insert(decl);
+    }
+
+    /// The setter or deleter of the property whose getter's qualified name
+    /// is `qualified`, when this file declares one.
+    pub(crate) fn accessor(&self, qualified: &str, accessor: Accessor) -> Option<&DeclRef> {
+        self.accessors.get(&(qualified.to_string(), accessor))
     }
 
     /// The declaration whose full dotted path within this file is `qualified`.

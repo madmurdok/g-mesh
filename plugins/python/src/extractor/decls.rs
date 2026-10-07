@@ -124,7 +124,7 @@ use crate::extractor::model::{DeclRef, FileModel, Import};
 use crate::extractor::scope::{dotted_path, FrameKind, Scopes};
 use crate::extractor::syntax::{
     assignment_signature, definition_name, docstring, dotted_segments, has_decorator, inner_definition,
-    signature, string_literal, text,
+    property_accessor, signature, string_literal, text, Accessor,
 };
 use crate::project::ProjectContext;
 
@@ -240,8 +240,10 @@ impl Declarer<'_, '_> {
 
     /// `def f` / `async def f`, at any nesting depth.
     fn function(&mut self, outer: Node, inner: Node) {
-        let native_kind = match self.scopes.kind() {
-            FrameKind::Class => "method",
+        let accessor = self.accessor(outer, inner);
+        let native_kind = match (self.scopes.kind(), accessor) {
+            (FrameKind::Class, Some(accessor)) => accessor.native_kind(),
+            (FrameKind::Class, None) => "method",
             _ => "function",
         };
         let Some(id) = self.declare(outer, inner, NodeKind::Function, native_kind) else { return };
@@ -300,9 +302,30 @@ impl Declarer<'_, '_> {
         spec.signature = signature(outer, self.source);
         spec.doc_comment = inner.child_by_field_name("body").and_then(|body| docstring(body, self.source));
         let id = self.emitter.declare(spec, is_public(&own));
-        let scope = self.scopes.path().to_string();
-        self.model.declare(&scope, &name, &qualified, DeclRef { id: id.clone(), kind });
+        let decl = DeclRef { id: id.clone(), kind };
+        // A setter/deleter shares the getter's name and qualified name; it
+        // goes in the accessor table only, so name lookups keep finding the
+        // getter alone (see `FileModel::declare_accessor`).
+        match self.accessor(outer, inner) {
+            Some(accessor) if kind == NodeKind::Function => {
+                self.model.declare_accessor(&qualified, accessor, decl)
+            }
+            _ => {
+                let scope = self.scopes.path().to_string();
+                self.model.declare(&scope, &name, &qualified, decl);
+            }
+        }
         Some(id)
+    }
+
+    /// The property accessor the `def` `inner` (decorated as `outer`)
+    /// declares, when it is one: only in a class body.
+    fn accessor(&self, outer: Node, inner: Node) -> Option<Accessor> {
+        if self.scopes.kind() != FrameKind::Class {
+            return None;
+        }
+        let name = definition_name(inner, self.source)?;
+        property_accessor(outer, name, self.source)
     }
 
     /// A module-level assignment: one `Variable` per name it binds, plus, for
