@@ -50,6 +50,7 @@ mod get_file_outline;
 mod instructions;
 #[cfg(test)]
 mod member_name_collision_tests;
+mod not_indexed;
 mod provenance;
 pub(crate) mod query_shapes;
 #[cfg(test)]
@@ -683,10 +684,13 @@ impl GMeshMcpServer {
         let store = Arc::clone(&self.store);
         let project_root = self.registry.project_root().to_path_buf();
         let params = params.0;
+        let coverage = params.file_path.as_deref().and_then(|path| self.registry.path_coverage(path));
         find_definition::resolve_lazily_off_worker(
             Arc::clone(&self.embedding),
             Arc::clone(&self.shapes),
-            move |semantic| find_definition::handle_in(&store, &project_root, semantic, params.clone()),
+            move |semantic| {
+                find_definition::handle_in(&store, &project_root, semantic, coverage.as_ref(), params.clone())
+            },
         )
         .await
     }
@@ -807,7 +811,8 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         self.ensure_file_fresh(&ctx, "get_file_outline", call_started, &params.0.file_path).await;
-        get_file_outline::handle(&self.store, params.0)
+        let coverage = self.registry.path_coverage(&params.0.file_path);
+        get_file_outline::handle_covered(&self.store, coverage.as_ref(), params.0)
     }
 
     #[tool(
@@ -831,7 +836,8 @@ impl GMeshMcpServer {
         // `graph::queries::entry_point_rank_expr`). Read fresh per call: it
         // never changes while the daemon runs.
         let entry_points = self.registry.entry_points();
-        get_dependencies::handle(&self.store, &entry_points, &self.hints, params.0)
+        let coverage = params.0.file_path.as_deref().and_then(|path| self.registry.path_coverage(path));
+        get_dependencies::handle_covered(&self.store, &entry_points, &self.hints, coverage.as_ref(), params.0)
     }
 
     #[tool(

@@ -14,6 +14,7 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::daemon::registry::PathCoverage;
 use crate::graph::containers::{self, DefiningContainer};
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
@@ -22,6 +23,7 @@ use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResu
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::not_indexed;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{error, internal_error, success};
 use super::GetDependenciesParams;
@@ -787,6 +789,23 @@ pub(crate) fn handle(
     hints: &SessionHints,
     params: GetDependenciesParams,
 ) -> Result<CallToolResult, ErrorData> {
+    handle_covered(store, entry_points, hints, None, params)
+}
+
+/// [`handle`], told whether `params.file_path`'s language is indexed at all
+/// (`PluginRegistry::path_coverage`). A `file_path` in an absent or failed
+/// language that names no indexed file is refused with the reason
+/// ([`not_indexed::miss`]) before the container-key and entry-point
+/// fallbacks: a path with a known language extension is a file path, not a
+/// key, and substituting an entry point for it would answer a different
+/// question.
+pub(crate) fn handle_covered(
+    store: &Arc<IndexStore>,
+    entry_points: &[String],
+    hints: &SessionHints,
+    coverage: Option<&PathCoverage>,
+    params: GetDependenciesParams,
+) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
     let GetDependenciesParams { file_path, module_id, direction, max_depth, max_fanout, resume_token } =
         params;
@@ -800,11 +819,23 @@ pub(crate) fn handle(
         (Some(_), _, _) => {
             error("g-mesh: `resume_token` already carries the walk it continues - call it without `file_path`/`module_id`")
         }
-        (None, Some(file_path), None) => from_file(&conn, entry_points, &file_path, &shape),
+        (None, Some(file_path), None) => match coverage {
+            Some(coverage) if uncovered_miss(&conn, &file_path)? => {
+                not_indexed::miss(&conn, Some(coverage), format!("g-mesh: no file '{file_path}' found in the index"))
+            }
+            _ => from_file(&conn, entry_points, &file_path, &shape),
+        },
         (None, None, Some(module_id)) => from_module(&conn, entry_points, &module_id, &shape),
         (None, Some(_), Some(_)) => error("g-mesh: give either `file_path` or `module_id`, not both"),
         (None, None, None) => error("g-mesh: give either `file_path` or `module_id` to start from"),
     }
+}
+
+/// Whether `file_path` names no indexed file.
+fn uncovered_miss(conn: &Connection, file_path: &str) -> Result<bool, ErrorData> {
+    let node =
+        queries::find_file_node(conn, file_path).map_err(|e| internal_error("failed to look up file", e))?;
+    Ok(node.is_none())
 }
 
 #[cfg(test)]

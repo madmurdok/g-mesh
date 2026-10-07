@@ -17,7 +17,10 @@ use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
-use super::tool_result::{error, internal_error, success};
+use crate::daemon::registry::PathCoverage;
+
+use super::not_indexed;
+use super::tool_result::{internal_error, success};
 use super::GetFileOutlineParams;
 
 /// One symbol the file declares. No `file_path` field - every entry in this
@@ -104,8 +107,21 @@ fn list_outline(
     })
 }
 
+/// [`handle_covered`] for a path whose language is indexed.
+#[cfg(test)]
 pub(super) fn handle(
     store: &Arc<IndexStore>,
+    params: GetFileOutlineParams,
+) -> Result<CallToolResult, ErrorData> {
+    handle_covered(store, None, params)
+}
+
+/// [`handle`], told whether the path's language is indexed at all: a miss on
+/// a path in an absent or failed language is refused with
+/// [`not_indexed::miss`]'s structured reason instead of the bare message.
+pub(super) fn handle_covered(
+    store: &Arc<IndexStore>,
+    coverage: Option<&PathCoverage>,
     params: GetFileOutlineParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -114,7 +130,13 @@ pub(super) fn handle(
         .map_err(|e| internal_error("failed to look up file", e))?;
     let file_node = match file_node {
         Some(node) => node,
-        None => return error(format!("g-mesh: no file '{}' found in the index", params.file_path)),
+        None => {
+            return not_indexed::miss(
+                &conn,
+                coverage,
+                format!("g-mesh: no file '{}' found in the index", params.file_path),
+            )
+        }
     };
 
     let page_size = pagination::resolve_page_size(params.limit);

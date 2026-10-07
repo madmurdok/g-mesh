@@ -11,12 +11,14 @@ use rmcp::ErrorData;
 use rusqlite::{Connection, Row};
 use serde::Serialize;
 
+use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::not_indexed;
 use super::query_shapes::QueryShapes;
 use super::similarity;
 use super::source;
@@ -441,9 +443,13 @@ fn rank_candidates(
 
 /// Resolves `find_definition`'s file+position input - always unambiguous by
 /// construction, so the answer is a single node, never a candidate list.
+///
+/// `coverage` says whether `file_path`'s language is indexed at all; a miss
+/// in an absent or failed language carries the reason ([`not_indexed::miss`]).
 fn by_position(
     conn: &Connection,
     project_root: Option<&Path>,
+    coverage: Option<&PathCoverage>,
     file_path: &str,
     line: u32,
     col: u32,
@@ -453,7 +459,9 @@ fn by_position(
 
     match found {
         Some(node) => success(&DefinitionNode::from(node).with_source(project_root)),
-        None => error(format!("g-mesh: no symbol found at {file_path}:{line}:{col}")),
+        None => {
+            not_indexed::miss(conn, coverage, format!("g-mesh: no symbol found at {file_path}:{line}:{col}"))
+        }
     }
 }
 
@@ -1209,14 +1217,19 @@ pub(crate) fn handle(
     shapes: &QueryShapes,
     params: FindDefinitionParams,
 ) -> Result<CallToolResult, ErrorData> {
-    resolve_lazily(embedding, shapes, |semantic| handle_in(store, project_root, semantic, params.clone()))
+    resolve_lazily(embedding, shapes, |semantic| {
+        handle_in(store, project_root, semantic, None, params.clone())
+    })
 }
 
-/// One pass of [`handle`] - see [`SemanticRung`].
+/// One pass of [`handle`] - see [`SemanticRung`]. `coverage` is
+/// `params.file_path`'s (`PluginRegistry::path_coverage`), read only by the
+/// `file_path` + `position` mode.
 pub(super) fn handle_in(
     store: &Arc<IndexStore>,
     project_root: &Path,
     semantic: &SemanticRung<'_>,
+    coverage: Option<&PathCoverage>,
     params: FindDefinitionParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -1237,7 +1250,7 @@ pub(super) fn handle_in(
 
     match (params.file_path, params.position, params.symbol_name) {
         (Some(file_path), Some(position), _) => {
-            by_position(&conn, project_root, &file_path, position.line, position.col)
+            by_position(&conn, project_root, coverage, &file_path, position.line, position.col)
         }
         (None, None, Some(name)) => by_name(&conn, project_root, semantic, &name, params.cursor.as_deref()),
         (None, None, None) if params.cursor.is_some() => {
