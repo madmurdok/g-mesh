@@ -62,3 +62,18 @@ know which languages have this shadowing.
 - A new language plugin gets no shadowing until it opts in, so the default
   can only leave an edge unmoved, never move it wrongly.
 - `plugin.toml` is fingerprinted, so each index is rebuilt once.
+
+## Addendum (GM-496): the second rule, `later_import_binds`
+
+Python now declares the opposite answer instead of none:
+`[plugin.reexports] later_import_binds = true`. In one module the later of a
+named import and a star import that provides the name binds it, so the
+linker orders one scope's rows by the row node's start position (compared
+within one file only) and keeps the latest row that binds the name: a named
+row always binds, a `*` row binds only when a sub-walk from it finds the
+name. Star-vs-star also resolves to the later provider. Rows from different
+files, or two at one position, keep the base behaviour. A manifest setting
+both keys is refused. Rust and TypeScript are unchanged. The Python plugin
+places a named (`__all__`) re-export node at the import statement that bound
+the name, so its position is that statement's order. Design:
+`docs/architecture/gm-496-python-later-import-binds.md`.

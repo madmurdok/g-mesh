@@ -188,6 +188,13 @@ implementation_kinds = []
 [plugin.semantic.settings.python.analysis]
 typeCheckingMode = "basic"
 
+[plugin.reexports]
+# Each import statement rebinds the name: in one module, the later of a named
+# import and a star import that provides the name binds it, so core's linker
+# follows the later one (docs/architecture/gm-496-python-later-import-binds.md).
+# Not `named_shadows_glob`, which is the opposite (Rust/ES modules) answer.
+later_import_binds = true
+
 [plugin.workspace]
 # Any of these moving can move where this project's roots are (`pyproject.toml`
 # packaging hints) or, for `setup.cfg`/`setup.py`, describe packaging this
