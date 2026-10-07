@@ -395,6 +395,24 @@ fn a_range_moved_by_whitespace_fails_the_whitespace_edit_check() {
     assert!(run.stdout.contains("upserts node \"a.fk#file\""), "{}", run.stdout);
 }
 
+/// GM-527. A plugin whose `File` node keeps the old end, `(lines, 0)` one
+/// past the last line after a final newline, answers the whitespace edit with
+/// an empty diff - that end does not move either - but its end line is not
+/// the line `a.fk`'s content ends on (3, of 4 lines and a final newline), so
+/// `whitespace-edit` fails on that node alone.
+///
+/// Control: remove the `file_end_past_content` finding from
+/// `checks::whitespace_edit`; every check passes and `assert_only_failure`
+/// fails.
+#[test]
+fn a_file_end_past_the_last_line_fails_the_whitespace_edit_check() {
+    let run = assert_only_failure("file-end-past-last-line", true, "id-stability.whitespace-edit", &[]);
+    assert!(run.stdout.contains("\"a.fk#file\""), "{}", run.stdout);
+    assert!(run.stdout.contains("ends at 4:0"), "the old end is named: {}", run.stdout);
+    assert!(run.stdout.contains("ends on line 3"), "the content's end line is named: {}", run.stdout);
+    assert!(!run.stdout.contains("upserts node"), "the diff itself is empty: {}", run.stdout);
+}
+
 #[test]
 fn deleting_an_id_never_emitted_fails_deletes_known() {
     let run = assert_only_failure("deletes-unknown", true, "id-stability.deletes-known", &[]);

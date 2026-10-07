@@ -895,6 +895,52 @@ mod tests {
         assert_eq!(found.id, "fn1", "the nested function must win over the enclosing file");
     }
 
+    /// GM-527: a file holding one declaration and nothing else ends where
+    /// that declaration does, so their spans tie; the declaration is the
+    /// answer. In Python the `Module` always ties with its `File` and wins.
+    /// Both insertion orders and both id orders, so no incidental row order
+    /// can pass for the rule.
+    ///
+    /// Control: drop `(kind = 'File') ASC` from `find_by_position`'s `ORDER
+    /// BY`; at least one arrangement answers with the `File`.
+    #[test]
+    fn find_by_position_a_file_loses_an_equal_span_tie_to_its_declaration() {
+        // (path, declaration kind, the File's id sorts first, the File is inserted first)
+        let arrangements = [
+            ("one.rs", "Function", true, true),
+            ("two.rs", "Function", false, true),
+            ("three.rs", "Function", true, false),
+            ("four.rs", "Function", false, false),
+            ("pkg/mod.py", "Module", true, true),
+            ("pkg/other.py", "Module", true, false),
+        ];
+        let ids = |path: &str, file_id_first: bool| {
+            let (file, decl) = if file_id_first { ("a", "z") } else { ("z", "a") };
+            (format!("{file}:{path}"), format!("{decl}:{path}"))
+        };
+        let mut conn = setup();
+        for (path, kind, file_id_first, file_inserted_first) in arrangements {
+            let (file_id, decl_id) = ids(path, file_id_first);
+            let file = node_with_span(&file_id, "File", path, (0, 0), (2, 1));
+            let decl = node_with_span(&decl_id, kind, path, (0, 0), (2, 1));
+            let (first, second) = if file_inserted_first { (file, decl) } else { (decl, file) };
+            upsert_node(&mut conn, first).unwrap();
+            upsert_node(&mut conn, second).unwrap();
+        }
+
+        for (path, kind, file_id_first, _) in arrangements {
+            let (_, decl_id) = ids(path, file_id_first);
+            for (line, col) in [(0, 0), (1, 3), (2, 1)] {
+                let found = find_by_position(&conn, path, line, col).unwrap().expect("inside both nodes");
+                assert_eq!(
+                    (found.id.as_str(), found.kind.as_str()),
+                    (decl_id.as_str(), kind),
+                    "{path} at ({line}, {col})"
+                );
+            }
+        }
+    }
+
     /// A container node (`graph::containers`) is a real row with no source:
     /// no name, qualifiedName or position lookup may answer with it, even
     /// when its key is exactly the string asked for. Materialized the way the

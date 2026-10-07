@@ -225,6 +225,34 @@ mod tests {
         assert_eq!(index.node_at(&path, at(8, 0)).map(|n| n.name.as_str()), Some("a.toy"));
     }
 
+    /// GM-527: a file holding one declaration and nothing else ends where
+    /// that declaration does, so the two spans tie; the declaration is the
+    /// answer, whichever id sorts first.
+    ///
+    /// Control: drop the `File` tie-break in `node_at` (ties by id only); the
+    /// arrangement where the `File`'s id sorts first answers with the `File`.
+    #[test]
+    fn node_at_a_file_loses_an_equal_span_tie_to_its_declaration() {
+        for (file_id, declaration_id) in [("a", "b"), ("b", "a")] {
+            let path = RelPath::new("one.toy");
+            let whole = range(at(0, 0), at(2, 1));
+            let mut builder = FileGraphBuilder::new("toy", "toy-parser", &path);
+            builder.file_node(whole);
+            builder.add_node(NodeSpec::new(NodeKind::Function, "target", "target", whole));
+            let mut graph = builder.finish();
+            for node in &mut graph.nodes {
+                node.id = if node.kind == NodeKind::File { file_id } else { declaration_id }.to_string();
+            }
+            let mut index = SdkIndex::new();
+            index.insert(path.clone(), "source".to_string(), graph);
+
+            for position in [at(0, 0), at(1, 3), at(2, 1)] {
+                let found = index.node_at(&path, position).expect("the position is in both nodes");
+                assert_eq!(found.kind, NodeKind::Function, "File id {file_id:?}, at {position:?}");
+            }
+        }
+    }
+
     #[test]
     fn node_at_a_position_in_no_node_and_in_no_known_file_is_none() {
         let (index, path) = index();

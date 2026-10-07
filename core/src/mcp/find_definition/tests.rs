@@ -2167,3 +2167,114 @@ fn a_position_hit_carries_no_not_indexed_key_whatever_the_coverage() {
     assert_eq!(body["id"], "n1");
     assert!(body.get("notIndexed").is_none(), "{body}");
 }
+
+// --- a whole-file candidate's source, new and old index (GM-527) ----------
+
+/// requests' `__version__.py`: 14 lines and a final newline. Its name is
+/// both the module's and a variable's in it, so `__version__` is an
+/// ambiguous page with a whole-file candidate on it.
+const VERSION_PY: &str = "# requests\n\n\n\
+    __title__ = \"requests\"\n\
+    __description__ = \"Python HTTP for Humans.\"\n\
+    __url__ = \"https://requests.readthedocs.io\"\n\
+    __version__ = \"2.32.3\"\n\
+    __build__ = 0x023203\n\
+    __author__ = \"Kenneth Reitz\"\n\
+    __author_email__ = \"me@kennethreitz.org\"\n\
+    __license__ = \"Apache-2.0\"\n\
+    __copyright__ = \"Copyright Kenneth Reitz\"\n\
+    \n\
+    __cake__ = \"cake\"\n";
+
+/// The module `requests.__version__` (whole-file span ending at
+/// `module_end`, a `(line, col)`) and its variable `__version__` (line 6),
+/// with `VERSION_PY` on disk.
+fn version_page(module_end: (i64, i64)) -> (Arc<IndexStore>, tempfile::TempDir) {
+    let mut conn = setup();
+    let file = "requests/__version__.py";
+    let mut module =
+        NodeRecord::new("module", "Module", "__version__", "requests.__version__", file, "python");
+    module.end_line = module_end.0;
+    module.end_col = module_end.1;
+    upsert_node(&mut conn, module).unwrap();
+    let mut variable = NodeRecord::new(
+        "variable",
+        "Variable",
+        "__version__",
+        "requests.__version__.__version__",
+        file,
+        "python",
+    );
+    variable.start_line = 6;
+    variable.end_line = 6;
+    variable.end_col = 22;
+    upsert_node(&mut conn, variable).unwrap();
+    (Arc::new(IndexStore::new(conn)), project_files(&[(file, VERSION_PY)]))
+}
+
+/// The page's `source.text` per candidate id.
+fn source_texts(body: &serde_json::Value) -> HashMap<String, String> {
+    body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| Some((c["id"].as_str()?.to_string(), c["source"]["text"].as_str()?.to_string())))
+        .collect()
+}
+
+/// A new index ends the module on its last real line, `(13, 17)`: an
+/// ordinary span, read like any other, so every candidate carries source.
+/// (No control of its own: it pins that the new end needs no clamp; the
+/// old-index test below carries this behaviour's control.)
+#[test]
+fn a_whole_file_candidate_in_a_new_index_carries_its_source() {
+    assert_eq!(VERSION_PY.lines().count(), 14, "precondition: requests' shape");
+    let (store, project) = version_page((13, 17));
+
+    let body = json_body(&define(&store, project.path(), named("__version__")));
+
+    assert_eq!(body["results"].as_array().unwrap().len(), 2, "precondition: {body}");
+    assert_eq!(sourced_ids(&body), vec!["module", "variable"], "{body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_SOURCED, "{body}");
+    let texts = source_texts(&body);
+    assert_eq!(texts["module"], VERSION_PY.trim_end(), "the whole file: {body}");
+    assert_eq!(texts["variable"], "__version__ = \"2.32.3\"", "{body}");
+}
+
+/// An index built before GM-527 holds the module's end as `(14, 0)`, one
+/// past the last line. The page still reads the whole file for it, so it is
+/// "each with its source", not "some". The end column never reaches the
+/// page's JSON.
+///
+/// Control: pass `None` instead of `candidate.end_col` in
+/// `CandidatePage::ambiguous` (or remove the clamp in `read_span_within`);
+/// the module loses its source and the explanation becomes PARTLY_SOURCED.
+#[test]
+fn a_whole_file_candidate_in_an_old_index_still_carries_its_source() {
+    let (store, project) = version_page((14, 0));
+
+    let body = json_body(&define(&store, project.path(), named("__version__")));
+
+    assert_eq!(body["results"].as_array().unwrap().len(), 2, "precondition: {body}");
+    assert_eq!(sourced_ids(&body), vec!["module", "variable"], "{body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_SOURCED, "{body}");
+    assert_eq!(source_texts(&body)["module"], VERSION_PY.trim_end(), "the whole file: {body}");
+    for candidate in body["results"].as_array().unwrap() {
+        assert!(candidate.get("endCol").is_none(), "the page's shape is unchanged: {body}");
+    }
+}
+
+/// A whole-file end past even the old convention - the file was shortened
+/// since the walk - is stale, and the page says only some are sourced.
+///
+/// Control: make the clamp in `read_span_within` unconditional; the module
+/// is read and the explanation becomes AMBIGUOUS_SOURCED.
+#[test]
+fn a_whole_file_candidate_past_the_old_end_is_stale_and_unsourced() {
+    let (store, project) = version_page((20, 0));
+
+    let body = json_body(&define(&store, project.path(), named("__version__")));
+
+    assert_eq!(sourced_ids(&body), vec!["variable"], "{body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_PARTLY_SOURCED, "{body}");
+}

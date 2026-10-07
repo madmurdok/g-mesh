@@ -252,4 +252,41 @@ mod tests {
         assert_eq!(read_span(dir.path(), &file, -1, 1, None), None);
         assert_eq!(read_span(dir.path(), &file, 1, 0, None), None, "end before start");
     }
+
+    /// GM-527: an index built before the fix ends a whole-file node at
+    /// `(lines, 0)` after a final newline, one past the last line. That exact
+    /// end is the current file's own end and reads as the whole file.
+    ///
+    /// Control: remove the clamp in `read_span_within` (the `end -= 1`
+    /// branch); the span is refused and this gets `None`.
+    #[test]
+    fn an_old_index_whole_file_end_reads_as_the_whole_file() {
+        let (dir, file) = project("a\nb\n");
+
+        let snippet = read_span(dir.path(), &file, 0, 2, Some(0)).expect("the old-convention end is read");
+
+        assert_eq!(snippet.text, "a\nb");
+        assert_eq!(snippet.first_line, 1);
+        assert_eq!(snippet.omitted_lines, None);
+    }
+
+    /// The clamp accepts that one span and nothing else past the end: a
+    /// later end line (the file was shortened), a non-zero end column, a
+    /// start past the last line, a file without a final newline, and a
+    /// caller with no end column all stay refused.
+    ///
+    /// Control: make the clamp unconditional (`end = end.min(lines.len() -
+    /// 1)`); every refusal but the start-past-the-end one then reads text
+    /// and fails.
+    #[test]
+    fn every_other_span_past_the_end_is_still_refused() {
+        let (dir, file) = project("a\nb\n");
+        assert_eq!(read_span(dir.path(), &file, 0, 3, Some(0)), None, "the file was shortened");
+        assert_eq!(read_span(dir.path(), &file, 0, 2, Some(1)), None, "a column past the last line");
+        assert_eq!(read_span(dir.path(), &file, 2, 2, Some(0)), None, "starts past the last line");
+        assert_eq!(read_span(dir.path(), &file, 0, 2, None), None, "no end column, no clamp");
+
+        let (dir, file) = project("a\nb");
+        assert_eq!(read_span(dir.path(), &file, 0, 2, Some(0)), None, "no final newline");
+    }
 }

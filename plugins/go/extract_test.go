@@ -14,6 +14,14 @@ func TestTextEndPositionCountsNewlinesAndTrailingBytes(t *testing.T) {
 		{"no trailing newline", "package main", 0, len("package main")},
 		{"multi-line, trailing newline", "a\nb\nc\n", 2, 1},
 		{"multi-line, no trailing newline", "a\nb\nc", 2, 1},
+		// GM-527: the end is where the content ends, never the empty line
+		// after a final newline. Control: drop the TrimRight in
+		// textEndPosition; every row below ending in whitespace fails.
+		{"whitespace only", "\n \n", 0, 0},
+		{"ends in two newlines", "a\nbc\n\n", 1, 2},
+		{"CRLF", "a\r\nbc\r\n", 1, 2},
+		{"trailing spaces", "a\nbc  \n", 1, 2},
+		{"bytes, not chars", "a\nb\u00e9\n", 1, 3},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
