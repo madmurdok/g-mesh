@@ -25,6 +25,8 @@ use g_mesh::storage::connection::project_dir;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// A minimal, otherwise-well-formed `plugin.toml` claiming `.foo` - the
@@ -95,6 +97,7 @@ fn two_plugins_claiming_the_same_extension_fails_daemon_startup_with_a_clear_err
     let plugin_root = conflicting_plugin_root();
 
     let mut daemon = Command::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(project.root())
@@ -168,6 +171,7 @@ fn a_single_discovered_language_with_no_conflict_starts_the_daemon_normally() {
         .expect("failed to write a fixture plugin.toml");
 
     let mut daemon = Command::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(project.root())

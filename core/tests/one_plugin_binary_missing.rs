@@ -27,6 +27,8 @@ use tokio::process::Command;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const NO_MODEL_DIR: &str = "/nonexistent-g-mesh-test-model-dir";
 
@@ -242,6 +244,7 @@ fn shim(root: &Path, plugins: &Path) -> TokioChildProcess {
     let root: PathBuf = root.to_path_buf();
     let plugins = plugins.to_path_buf();
     TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+        cmd.lifeline();
         cmd.kill_on_drop(true)
             .arg("mcp-shim")
             .current_dir(&root)
@@ -431,6 +434,7 @@ async fn a_failed_language_recorded_in_the_index_is_not_reindexed_after_a_restar
 /// makes one. Returns once the daemon is listening.
 fn start_daemon(project: &Project, plugins: &Path) -> std::process::Child {
     let child = StdCommand::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(project.root())
@@ -621,6 +625,7 @@ fn the_daemons_log_line_for_a_failed_language_is_its_whole_chain_on_one_line() {
     let log = logs.path().join("daemon.stderr");
 
     let mut child = StdCommand::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(project.root())

@@ -38,7 +38,9 @@ use g_mesh::daemon::manifest;
 use g_mesh::storage::connection::project_dir;
 
 mod common;
+
 use common::wait_until_indexed;
+use common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
@@ -138,6 +140,7 @@ struct Daemon {
 impl Daemon {
     fn spawn(bin: &Path, root: &Path) -> Self {
         let child = Command::new(bin)
+            .lifeline()
             .arg("daemon")
             .arg("--project-root")
             .arg(root)

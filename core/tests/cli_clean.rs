@@ -26,6 +26,8 @@ use g_mesh::storage::connection::project_dir;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 struct Project {
@@ -60,6 +62,7 @@ impl Project {
     /// this test deletes is one a real daemon really built.
     fn bootstrap_daemon(&self) {
         let mut shim = Command::new(BIN)
+            .lifeline()
             .arg("mcp-shim")
             .current_dir(self.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)

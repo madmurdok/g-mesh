@@ -38,6 +38,8 @@ use g_mesh::paths::HOME_ENV;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// A `G_MESH_HOME` belonging to one test and nothing else, so a sweep inside
@@ -148,6 +150,7 @@ impl<'a> Project<'a> {
     /// reason for driving these as subprocesses.
     fn bootstrap_daemon(&self) {
         let mut shim = Command::new(BIN)
+            .lifeline()
             .arg("mcp-shim")
             .current_dir(self.root())
             .env(HOME_ENV, &self.home.dir)

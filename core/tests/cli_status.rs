@@ -18,7 +18,9 @@ use g_mesh::storage::schema;
 use rusqlite::Connection;
 
 mod common;
+
 use common::wait_until_indexed;
+use common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
@@ -151,6 +153,7 @@ impl Drop for Project {
 
 fn spawn_daemon(root: &Path) -> Child {
     Command::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(root)

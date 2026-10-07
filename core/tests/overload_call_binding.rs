@@ -32,6 +32,8 @@ use rusqlite::Connection;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// Same budget as the ambiguous-barrel test's: this wait pays for a `tsserver`
@@ -92,6 +94,7 @@ impl Drop for Project {
 
 fn spawn_daemon(root: &Path) -> Child {
     Command::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(root)

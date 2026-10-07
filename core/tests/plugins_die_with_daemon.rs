@@ -47,6 +47,8 @@ use rusqlite::Connection;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// The plugins' knob - see the module doc. Must match
@@ -119,6 +121,7 @@ impl Fixture {
     /// and returns the daemon's pid.
     fn bootstrap(&self) -> u32 {
         let mut shim = Command::new(BIN)
+            .lifeline()
             .arg("mcp-shim")
             .current_dir(self.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)

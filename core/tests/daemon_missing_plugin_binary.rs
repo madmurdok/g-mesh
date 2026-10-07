@@ -44,6 +44,8 @@ use tokio::process::Command;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 struct Project {
@@ -88,6 +90,7 @@ async fn a_missing_workspace_built_plugin_binary_is_a_tool_error_naming_the_buil
 
     let root = project.root().to_path_buf();
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+        cmd.lifeline();
         cmd.kill_on_drop(true)
             .arg("mcp-shim")
             .current_dir(&root)

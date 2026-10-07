@@ -57,7 +57,9 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 mod common;
+
 use common::wait_until_indexed;
+use common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
@@ -359,6 +361,7 @@ async fn get_file_outline_answers_from_a_declaration_edited_twice_under_a_runnin
     project.write(OUTLINED, GREET);
 
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+        cmd.lifeline();
         // `kill_on_drop`, because a shim that outlives the test wedges the
         // whole process on Windows (GM-249 - see `common::kill_and_wait`).
         cmd.kill_on_drop(true)

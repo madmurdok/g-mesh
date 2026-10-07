@@ -337,6 +337,29 @@ pub fn kill_and_wait(pid: u32) {
 /// behind, and a daemon that has created the file but not yet written to it
 /// leaves it empty for a window long enough that CI has caught it (GM-242).
 ///
+/// Ties a `g-mesh` this test starts to the test process's own life: sets
+/// [`daemon::lifecycle::LIFELINE_PID_ENV`] to this process's pid, so a daemon
+/// started directly, or detached by a shim (which passes its environment on),
+/// shuts itself down within one tick once the test process is gone, even when
+/// it died without running any teardown (SIGKILL, a nextest timeout, ctrl-c).
+/// Every site that starts a daemon or a shim goes through this; one-shot CLI
+/// commands never start a daemon and do not need it (GM-522).
+pub trait Lifeline {
+    fn lifeline(&mut self) -> &mut Self;
+}
+
+impl Lifeline for std::process::Command {
+    fn lifeline(&mut self) -> &mut Self {
+        self.env(daemon::lifecycle::LIFELINE_PID_ENV, std::process::id().to_string())
+    }
+}
+
+impl Lifeline for tokio::process::Command {
+    fn lifeline(&mut self) -> &mut Self {
+        self.env(daemon::lifecycle::LIFELINE_PID_ENV, std::process::id().to_string())
+    }
+}
+
 /// The point of routing every test's teardown through here rather than
 /// hand-rolling `kill -9`: on Windows the hand-rolled version killed nothing
 /// at all, and a surviving daemon holds an inherited handle to its parent's

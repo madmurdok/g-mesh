@@ -358,7 +358,7 @@ fn a_project_root_and_executable_that_both_exist_are_not_an_orphan() {
     let project = tempfile::tempdir().expect("failed to create a project root");
     let exe = tempfile::NamedTempFile::new().expect("failed to create a stand-in executable");
 
-    assert_eq!(orphan_check(project.path(), Ok(exe.path().to_path_buf())), None);
+    assert_eq!(orphan_check(project.path(), Ok(exe.path().to_path_buf()), None), None);
 }
 
 /// GM-320's first arm, and the one the four hand-cleared daemons were in:
@@ -371,7 +371,7 @@ fn a_deleted_project_root_is_an_orphan() {
     project.close().expect("failed to delete the project root");
 
     assert_eq!(
-        orphan_check(&root, Ok(exe.path().to_path_buf())),
+        orphan_check(&root, Ok(exe.path().to_path_buf()), None),
         Some(Orphaned::ProjectRootGone(root.clone()))
     );
     // The log line has to name the root, or an operator with several
@@ -392,10 +392,10 @@ fn a_deleted_executable_is_an_orphan_even_with_the_project_root_intact() {
     let exe = exe_dir.path().join("g-mesh");
     fs::write(&exe, b"not really a binary").expect("failed to create a stand-in executable");
 
-    assert_eq!(orphan_check(project.path(), Ok(exe.clone())), None, "nothing is missing yet");
+    assert_eq!(orphan_check(project.path(), Ok(exe.clone()), None), None, "nothing is missing yet");
 
     fs::remove_file(&exe).expect("failed to delete the stand-in executable");
-    assert_eq!(orphan_check(project.path(), Ok(exe.clone())), Some(Orphaned::ExecutableGone(exe)));
+    assert_eq!(orphan_check(project.path(), Ok(exe.clone()), None), Some(Orphaned::ExecutableGone(exe)));
 }
 
 /// A `current_exe()` that failed is not evidence that anything is missing,
@@ -407,7 +407,7 @@ fn an_unresolvable_executable_is_never_treated_as_a_missing_one() {
     let project = tempfile::tempdir().expect("failed to create a project root");
 
     let unresolvable = Err(io::Error::new(io::ErrorKind::PermissionDenied, "cannot read /proc/self/exe"));
-    assert_eq!(orphan_check(project.path(), unresolvable), None);
+    assert_eq!(orphan_check(project.path(), unresolvable, None), None);
 }
 
 /// A deleted checkout takes its `target/` with it, so both arms are true
@@ -420,7 +420,7 @@ fn a_root_that_is_gone_is_reported_ahead_of_an_executable_that_is_also_gone() {
     let exe = root.join("target/debug/g-mesh");
     project.close().expect("failed to delete the project root");
 
-    assert_eq!(orphan_check(&root, Ok(exe)), Some(Orphaned::ProjectRootGone(root)));
+    assert_eq!(orphan_check(&root, Ok(exe), None), Some(Orphaned::ProjectRootGone(root)));
 }
 
 /// The discriminating half of [`is_definitely_gone`]: a path whose *parent*
