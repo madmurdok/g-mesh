@@ -89,6 +89,8 @@ use tokio::process::Command;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// One file, one symbol - enough for `find_definition` to have a real,
@@ -219,6 +221,7 @@ impl Drop for Project {
 /// `clippy::zombie_processes` to (rightly) flag.
 fn spawn_daemon_holding_the_lock(project: &mut Project, hold_file: &Path) {
     let daemon = StdCommand::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(project.root())
@@ -248,6 +251,7 @@ fn spawn_daemon_holding_the_lock(project: &mut Project, hold_file: &Path) {
 async fn attach(project: &Project) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
     let root = project.root().to_path_buf();
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+        cmd.lifeline();
         // `kill_on_drop`, because a shim that outlives the test wedges the
         // whole process on Windows (GM-249 - see `common::kill_and_wait`).
         cmd.kill_on_drop(true).arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);

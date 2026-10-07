@@ -19,6 +19,8 @@ use tokio::process::Command;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// The eight index-backed tools every daemon lists.
@@ -86,6 +88,7 @@ impl Folder {
     ) -> RunningService<RoleClient, H> {
         let dir = dir.to_path_buf();
         let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+            cmd.lifeline();
             cmd.kill_on_drop(true)
                 .arg("mcp-shim")
                 .current_dir(&dir)
@@ -551,6 +554,7 @@ async fn the_switch_log_line_names_where_the_project_came_from() {
     let folder = Folder::new();
     let root = folder.root().to_path_buf();
     let (transport, stderr) = TokioChildProcess::builder(Command::new(BIN).configure(|cmd| {
+        cmd.lifeline();
         cmd.kill_on_drop(true)
             .arg("mcp-shim")
             .current_dir(&root)

@@ -38,7 +38,9 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 mod common;
+
 use common::wait_until_indexed;
+use common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
@@ -137,6 +139,7 @@ async fn get_dependencies_resolves_a_foldable_computed_specifier_and_none_for_an
     // longer implies a built index - the walk's own completion marker is what
     // does.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+        cmd.lifeline();
         // `kill_on_drop`, because a shim that outlives the test wedges the
         // whole process on Windows (GM-249 - see `common::kill_and_wait`).
         cmd.kill_on_drop(true).arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);

@@ -58,6 +58,8 @@ use serde_json::{json, Value};
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -136,6 +138,7 @@ fn init_project(root: &Path) {
 /// `std::fs::write` it into existence and start the hold for real.
 fn spawn_daemon_pointing_at_hold_file(project: &mut Project, hold_file: &Path) {
     let daemon = Command::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(project.root())

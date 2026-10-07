@@ -42,6 +42,8 @@ use tokio::process::Command;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// Two independent TS files: `alpha.ts` is the one edited while the plugin
@@ -174,6 +176,7 @@ impl Project {
         let root = self.root().to_path_buf();
         let (log, hold) = (self.log(), self.hold());
         let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+            cmd.lifeline();
             cmd.kill_on_drop(true)
                 .arg("mcp-shim")
                 .current_dir(&root)

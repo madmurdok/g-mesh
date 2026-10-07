@@ -23,6 +23,8 @@ use serde_json::{json, Value};
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -98,6 +100,7 @@ impl Drop for Project {
 
 fn spawn_daemon(root: &Path) -> Child {
     Command::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(root)
@@ -123,6 +126,7 @@ fn spawn_daemon(root: &Path) -> Child {
 /// serve.
 fn spawn_shim(root: &Path) -> Child {
     Command::new(BIN)
+        .lifeline()
         .arg("mcp-shim")
         .current_dir(root)
         .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
@@ -138,6 +142,7 @@ fn spawn_shim(root: &Path) -> Child {
 /// actually treated as the project root.
 fn spawn_shim_with_project_dir_env(cwd: &Path, project_dir_env: &Path) -> Child {
     Command::new(BIN)
+        .lifeline()
         .arg("mcp-shim")
         .current_dir(cwd)
         .env(g_mesh::shim::PROJECT_DIR_ENV, project_dir_env)

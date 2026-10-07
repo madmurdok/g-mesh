@@ -30,6 +30,8 @@ use tokio::process::Command;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const FAKE_PLUGIN_BIN: &str = "g-mesh-fake-plugin";
 /// The fake plugin logs `spam` lines while the file this names exists.
@@ -97,6 +99,7 @@ impl Harness {
         let root = self.root().to_path_buf();
         let (log, plugins, gate) = (self.log(), self.plugins_root(), self.spam_gate());
         let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+            cmd.lifeline();
             cmd.kill_on_drop(true)
                 .arg("mcp-shim")
                 .current_dir(&root)

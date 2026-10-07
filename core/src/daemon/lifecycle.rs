@@ -54,6 +54,15 @@ pub const PLUGIN_IDLE_ENV: &str = "G_MESH_PLUGIN_IDLE_MS";
 /// The core's equivalent of [`PLUGIN_IDLE_ENV`]; `0` means never exit on idleness.
 pub const CORE_IDLE_ENV: &str = "G_MESH_CORE_IDLE_MS";
 
+/// Test-only: the pid of a process this daemon must not outlive. The
+/// integration tests set it to their own pid on every `g-mesh` they start
+/// (a shim passes it on to the daemon it detaches), so a test process that
+/// dies without teardown (SIGKILL, a nextest timeout, ctrl-c) does not leave
+/// its daemon running: [`supervise`] shuts down within one tick once that pid
+/// is gone. Unset in production, where it changes nothing; a value that does
+/// not parse as a pid is ignored.
+pub const LIFELINE_PID_ENV: &str = "G_MESH_LIFELINE_PID";
+
 /// Lower bound on the tick, so a very short timeout never becomes a spin loop.
 const MIN_TICK: Duration = Duration::from_millis(50);
 /// Upper bound on the tick, so shutdown conditions are noticed within 30s.
@@ -684,6 +693,8 @@ pub enum Orphaned {
     /// The executable this process was started from is gone, so no shim can
     /// compare its build (`daemon::build_stamp` reads that file's mtime).
     ExecutableGone(PathBuf),
+    /// The process named by [`LIFELINE_PID_ENV`] (a test run) is gone.
+    LifelineGone(u32),
 }
 
 impl fmt::Display for Orphaned {
@@ -695,6 +706,9 @@ impl fmt::Display for Orphaned {
             Self::ExecutableGone(path) => {
                 write!(f, "the executable this daemon was started from ({}) no longer exists", path.display())
             }
+            Self::LifelineGone(pid) => {
+                write!(f, "the lifeline process {pid} ({LIFELINE_PID_ENV}) is no longer running")
+            }
         }
     }
 }
@@ -703,16 +717,32 @@ impl fmt::Display for Orphaned {
 /// passed in (`std::env::current_exe()` in production) so tests can script
 /// it. The root is judged first: a deleted checkout takes its `target/` with
 /// it, and the project is the fact worth logging. A failed `current_exe()` is
-/// not evidence and never ends the process.
-pub fn orphan_check(project_root: &Path, exe: io::Result<PathBuf>) -> Option<Orphaned> {
+/// not evidence and never ends the process. `lifeline` (the parsed
+/// [`LIFELINE_PID_ENV`], see [`lifeline_pid`]) is judged last; `None` is
+/// never evidence.
+pub fn orphan_check(
+    project_root: &Path,
+    exe: io::Result<PathBuf>,
+    lifeline: Option<u32>,
+) -> Option<Orphaned> {
     if is_definitely_gone(project_root) {
         return Some(Orphaned::ProjectRootGone(project_root.to_path_buf()));
     }
-    let exe = exe.ok()?;
-    if is_definitely_gone(&exe) {
-        return Some(Orphaned::ExecutableGone(exe));
+    if let Ok(exe) = exe {
+        if is_definitely_gone(&exe) {
+            return Some(Orphaned::ExecutableGone(exe));
+        }
     }
-    None
+    match lifeline {
+        Some(pid) if !crate::process::is_alive(pid) => Some(Orphaned::LifelineGone(pid)),
+        _ => None,
+    }
+}
+
+/// [`LIFELINE_PID_ENV`] as a pid: `None` when unset (production) or when the
+/// value does not parse, so a malformed variable never ends the process.
+fn lifeline_pid() -> Option<u32> {
+    std::env::var(LIFELINE_PID_ENV).ok()?.trim().parse().ok()
 }
 
 /// `true` only for a path the filesystem positively reports as absent
@@ -756,6 +786,8 @@ pub fn supervise(
     accept_loop: Receiver<Result<()>>,
 ) -> Result<()> {
     let tick = timeouts.tick();
+    // Read once: the variable is fixed for the process's lifetime.
+    let lifeline = lifeline_pid();
     loop {
         match accept_loop.recv_timeout(tick) {
             // The accept loop only ever ends by failing; its error is the daemon's.
@@ -766,7 +798,7 @@ pub fn supervise(
 
         // First in the tick: an orphan has nothing left to time and no reason to
         // pay for a `sysinfo` scan on its way out.
-        if let Some(orphan) = orphan_check(project_root, std::env::current_exe()) {
+        if let Some(orphan) = orphan_check(project_root, std::env::current_exe(), lifeline) {
             crate::log_line!(
                 "g-mesh daemon: {orphan} - shutting down; nothing can ask this daemon for \
                  anything again, and a fresh one will be started if the project comes back"

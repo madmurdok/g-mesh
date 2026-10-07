@@ -29,6 +29,8 @@ use tokio::process::Command;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 struct Project {
@@ -92,6 +94,7 @@ async fn a_release_daemon_resolves_the_bundled_rust_plugin_in_its_own_release_di
     let project = Project { dir: tempfile::tempdir().unwrap() };
     let root = project.dir.path().to_path_buf();
     let transport = TokioChildProcess::new(Command::new(&exe).configure(|cmd| {
+        cmd.lifeline();
         cmd.kill_on_drop(true)
             .arg("mcp-shim")
             .current_dir(&root)

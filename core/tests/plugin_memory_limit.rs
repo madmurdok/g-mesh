@@ -116,6 +116,8 @@ use rusqlite::Connection;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// GM-290's own conformance fixture - a real two-crate Cargo workspace with
@@ -485,6 +487,7 @@ impl DaemonProject {
         .expect("failed to write the project's config.toml");
 
         let daemon = std::process::Command::new(BIN)
+            .lifeline()
             .arg("daemon")
             .arg("--project-root")
             .arg(dir.path())
@@ -582,6 +585,7 @@ async fn the_generated_mcp_instructions_reflect_a_real_suspended_rust() {
     // daemon above by `--project-root`'s cwd and proxies to it - no second
     // cold start.
     let transport = TokioChildProcess::new(tokio::process::Command::new(BIN).configure(|cmd| {
+        cmd.lifeline();
         cmd.kill_on_drop(true)
             .arg("mcp-shim")
             .current_dir(project.root())

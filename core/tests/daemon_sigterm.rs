@@ -60,6 +60,8 @@ use g_mesh::storage::connection::project_dir;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// How long the daemon gets to honour a `SIGTERM` before this test calls it a
@@ -108,6 +110,7 @@ impl Project {
     /// (see `cli_stop.rs`'s note on the lazy per-language spawn).
     fn bootstrap(&self) -> (u32, u32) {
         let mut shim = Command::new(BIN)
+            .lifeline()
             .arg("mcp-shim")
             .current_dir(self.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
