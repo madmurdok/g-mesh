@@ -890,6 +890,7 @@ built fixture exercising individual defects lives under
 | `ownership.diff-stays-in-file` | upsert and delete only the changed file's nodes in its `fileChanged` diff |
 | `capabilities.semantic-pass-undeclared` | (`semantic_pass = false`) never be sent `semanticPass`, and never start a semantic engine |
 | `capabilities.semantic-engine-lazy` | (`semantic_pass = true`) not start its semantic engine before the first `semanticPass` |
+| `capabilities.files-created-resolves` | (`files_created = true`) after a `filesCreated` notification for a new importer and its new target, routed importer first, link the importer's `IMPORTS` edge to the target (or to a container holding it); needs a `[files_created]` table in `--expect`, otherwise `SKIP` |
 
 `semanticPass` diffs may cross files — a semantic answer legitimately points
 an edge at another file's node — so the stream-order, same-file and
@@ -948,6 +949,12 @@ expect = ["cmd/main.go"]
 [[definition]]
 symbol = "format"
 expect = ["overload.go:format"]
+
+[files_created]                 # one plain table, not an expectation: the
+target = "pkg/gm_check_target.py"      # inputs of capabilities.files-created-resolves
+target_text = "def created() -> int:\n    return 1\n"
+importer = "pkg/gm_check_importer.py"
+importer_text = "from pkg.gm_check_target import created\n\nn = created()\n"
 ```
 
 Once the fixture is fully linked (bulk, every session step, and the
@@ -988,6 +995,16 @@ unknown key in the file (a typo) is a hard parse error, not a silently
 ignored one. See `core/src/cli/plugin_check/expectations.rs`'s own module
 doc for the full contract, including exactly when each edit the session
 makes is safe to have already happened.
+
+`[files_created]` (GM-516) is read only for a plugin whose manifest declares
+`files_created = true`; any other plugin gets `SKIP` and is never sent the
+notification. All four keys are required, both paths are workspace-relative,
+must not exist in the fixture and must carry an extension the manifest claims.
+The kit writes the two files in a short separate session, sends
+`filesCreated` for both, then `fileChanged` for the importer before the
+target, and passes when the importer has an `IMPORTS` edge onto the target
+file or onto a container whose members include it. Without the table the
+check is `SKIP` ("not configured"), not `FAIL`.
 
 CI runs `g-mesh plugins check` with `--expect` for every `plugins/*/`
 directory that has a `conformance/{project,expect.toml}` pair — see

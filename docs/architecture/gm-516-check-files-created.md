@@ -126,17 +126,22 @@ FROM edges e JOIN nodes f ON f.id = e.fromId JOIN nodes t ON t.id = e.toId
 WHERE e.kind = 'IMPORTS' AND f.filePath = ?1
 ```
 
-Pass iff some row's `t.filePath` is the target. On failure the finding lists
+Pass iff some row's `t.filePath` is the target, **or** the row's `t` is a
+container node (`nativeKind = 'container'`, no `filePath` of its own) whose
+members include a node with `filePath = target`. The Python plugin links a module
+import to a core container (e.g. `pkg.gm_check_target`), not to a file node,
+so file-only matching could never pass it; the owner approved the widening.
+On failure the finding lists
 every row (e.g. "lands on `Module` `external_module` `./gmCheckTarget`"),
 which is exactly what a plugin that ignored the notification produces.
 
 - Benefit: language-agnostic, judges what a user's index ends up holding
   (the plugin's address *and* core's link), and has a sharp control: an
   ignored notification yields an `external_module` row.
-- Risk: a container-scoped plugin (Go/Rust style, the edge lands on a
-  container node with no `filePath` of the target) cannot pass it. None
-  declares `files_created` today; widening to "or a container the target is a
-  member of" is a follow-up if one ever does (must-confirm M4).
+- Risk: the container branch is looser than the file branch: an edge onto a
+  container passes if the target file is one of its members, whichever
+  member the plugin meant. Accepted: the importer is new, so no other edge
+  of it can land there by accident (must-confirm M4).
 
 Alternatives:
 
@@ -247,6 +252,9 @@ Alternatives:
   the method yet" with a pointer to this check.
 - `docs/architecture/multi-language-plugins.md` "Conformance kit" (line ~706):
   one paragraph on the check and the `[files_created]` table.
+- `README.md` ("Checking a plugin": the check table row and the
+  `[files_created]` table in the `--expect` section) and
+  `plugins/python/README.md` (the passing-check count).
 - `checks.rs` module doc: the new bullet; `expectations.rs` module doc: the
   table (it is the expect-file format reference).
 
@@ -382,7 +390,8 @@ the kit's timeout path, so run it 5 times.
 - **M3 (D5)**: a separate short session (one extra spawn, structural only) on
   a fresh index, rather than extra steps in the main session.
 - **M4 (D2)**: "resolves" = an `IMPORTS` edge from the importer lands on a
-  node of the target file; container-scoped targets are out of scope until a
-  container-style plugin declares `files_created`.
+  node of the target file, or on a container whose members include the target
+  file (the Python plugin links module imports to a core container such as
+  `pkg.gm_check_target`; owner-approved).
 - **M5**: one new check id, `capabilities.files-created-resolves`, appended
   last; no `files-created-undeclared` companion (AC 2 is pinned by behaviour 3 instead).

@@ -349,7 +349,7 @@ all an npm `.bin` directory is.
 check's verdict by name, so that a check which starts *skipping* fails the
 suite instead of quietly shrinking it:
 
-1. the shipped manifest with a real pyright - 14 checks pass, one skips
+1. the shipped manifest with a real pyright - 15 checks pass, one skips
    (`capabilities.semantic-pass-undeclared`, because `semantic_pass = true`),
    and all ten expectations pass;
 2. the 3.4.0 manifest (`semantic_pass = false`) with
