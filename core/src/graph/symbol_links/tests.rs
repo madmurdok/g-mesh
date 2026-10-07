@@ -3442,8 +3442,11 @@ fn gm496_rows_at_one_position_keep_no_winner() {
 /// moves the call from `pkg.b.f` to `pkg.a.f`, and back on the reverse edit,
 /// matching `link_all` each time.
 ///
-/// Control: remove the `REEXPORT_ALL_NAME` whole-scope branch from
-/// `waiting_placeholders` - the call stays on `pkg.b.f` after the swap.
+/// Control: drop the `later_binding` block in `Resolver::walk_capped` - the
+/// call is left unresolved. (The re-sent `f` row wakes the placeholder by
+/// itself, so this edit does not pin `waiting_placeholders`' whole-scope
+/// branch; `gm496_an_edit_that_only_moves_the_star_import_moves_the_link`
+/// does.)
 #[test]
 fn gm496_an_edit_that_only_swaps_the_imports_moves_the_link() {
     let (diffs, edge) = gm490_python_diffs(true);
@@ -3475,6 +3478,50 @@ fn gm496_an_edit_that_only_swaps_the_imports_moves_the_link() {
     gm491_apply_and_link_diff(&mut conn, &range_only_edit(reexports([0, 1])));
     assert_eq!(edge_target(&conn, &edge), (GM490_PY_B.to_string(), true));
     assert_eq!(gm491_edges(&conn), gm491_reference([a, b, init, user]));
+}
+
+/// An edit that moves only the star import, leaving the explicit import's row
+/// untouched: `pkg/__init__.py` holds `from .a import f` on line 1 and
+/// `from .b import *` on line 0, so the call links `pkg.a.f`; the edit
+/// re-sends just the `*` row (delete plus upsert of the same id) on line 2,
+/// and `link_diff` moves the call to `pkg.b.f`, then back on the reverse
+/// edit, matching `link_all` each time. No row named `f` is in either diff,
+/// so only the `*` address's whole-scope wake can reach the waiting
+/// placeholder.
+///
+/// Control: remove the `REEXPORT_ALL_NAME` whole-scope branch from
+/// `waiting_placeholders` (query `exact` for every key) - the call stays on
+/// `pkg.a.f` after the first edit.
+#[test]
+fn gm496_an_edit_that_only_moves_the_star_import_moves_the_link() {
+    let lines = |named: i64, star: i64| -> Vec<NodeRecord> {
+        let mut rows = gm490_python_diffs(true).0.swap_remove(2).upsert_nodes;
+        rows[0].start_line = named;
+        rows[1].start_line = star;
+        rows
+    };
+    let star_only_edit = |star: i64| {
+        let row = lines(1, star).swap_remove(1);
+        assert_eq!(row.name, REEXPORT_ALL_NAME);
+        Diff { delete_node_ids: vec![row.id.clone()], upsert_nodes: vec![row], ..Default::default() }
+    };
+    let (mut diffs, edge) = gm490_python_diffs(true);
+    diffs[2].upsert_nodes = lines(1, 0);
+    let [a, b, user] = [&diffs[0], &diffs[1], &diffs[3]];
+
+    let mut conn = setup();
+    gm490_apply(&mut conn, &diffs);
+    link_all(&mut conn).unwrap();
+    assert_eq!(edge_target(&conn, &edge), (GM490_PY_A.to_string(), true));
+
+    gm491_apply_and_link_diff(&mut conn, &star_only_edit(2));
+    assert_eq!(edge_target(&conn, &edge), (GM490_PY_B.to_string(), true));
+    let moved = Diff { upsert_nodes: lines(1, 2), ..Default::default() };
+    assert_eq!(gm491_edges(&conn), gm491_reference([a, b, &moved, user]));
+
+    gm491_apply_and_link_diff(&mut conn, &star_only_edit(0));
+    assert_eq!(edge_target(&conn, &edge), (GM490_PY_A.to_string(), true));
+    assert_eq!(gm491_edges(&conn), gm491_reference([a, b, &diffs[2], user]));
 }
 
 /// The GM-490 Rust fixture with `user`'s named `use` and glob placed on
