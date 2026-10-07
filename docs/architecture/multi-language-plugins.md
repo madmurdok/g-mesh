@@ -443,7 +443,7 @@ strip = ["@"]
 named_shadows_glob = true  # rust, typescript
 # Whether the later of a named and a glob import that both provide a name binds
 # it (statement order, as Python executes it). Absent: false. A manifest may
-# set at most one of the two keys.
+# not set both keys to true.
 # later_import_binds = true  # python; go declares neither
 
 # GM-289, read by the SDK's LSP bridge and by nothing in core - see
@@ -527,7 +527,7 @@ depth. Rust and TypeScript declare it. Python declares `later_import_binds =
 true` instead: of the rows that provide a name in one scope, the one whose
 import statement comes last binds it, named or glob, so `from .a import f`
 then `from .b import *` follows `b`. Go declares neither. A manifest setting
-both keys is refused. Decisions:
+both keys to `true` is refused. Decisions:
 [ADR 0020](../adr/0020-named-reexport-shadows-glob.md) and its addendum,
 [the GM-496 note](gm-496-python-later-import-binds.md).
 

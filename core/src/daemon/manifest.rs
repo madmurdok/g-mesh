@@ -268,7 +268,7 @@ pub struct ReexportRules {
     /// Each import statement rebinds the name, so in one module the later of
     /// a named import and a `*` import that provides the name binds it
     /// (Python). The opposite answer to `named_shadows_glob`: a manifest may
-    /// not set both. Decision:
+    /// not set both to `true`. Decision:
     /// `docs/architecture/gm-496-python-later-import-binds.md`.
     #[serde(default)]
     pub later_import_binds: bool,

@@ -73,7 +73,7 @@ within one file only) and keeps the latest row that binds the name: a named
 row always binds, a `*` row binds only when a sub-walk from it finds the
 name. Star-vs-star also resolves to the later provider. Rows from different
 files, or two at one position, keep the base behaviour. A manifest setting
-both keys is refused. Rust and TypeScript are unchanged. The Python plugin
+both keys to `true` is refused. Rust and TypeScript are unchanged. The Python plugin
 places a named (`__all__`) re-export node at the import statement that bound
 the name, so its position is that statement's order. Design:
 `docs/architecture/gm-496-python-later-import-binds.md`.
