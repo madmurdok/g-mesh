@@ -96,8 +96,9 @@ pub(crate) enum Import {
 pub(crate) struct DunderAll {
     /// The names, in source order, exactly as written.
     pub(crate) names: Vec<String>,
-    /// The `__all__` assignment's own range - a re-export node belongs to the
-    /// file that is publishing, so its range is the statement that says so.
+    /// The `__all__` assignment's own range, set once the first `__all__` is
+    /// read. A re-export node does not take it: it carries the range of the
+    /// import that bound its name (see `decls`' `# __all__`).
     pub(crate) range: Option<Range>,
 }
 
@@ -113,6 +114,11 @@ pub(crate) struct FileModel {
     /// `del` asks this table.
     accessors: HashMap<(String, Accessor), DeclRef>,
     imports: HashMap<String, Import>,
+    /// The range of the import statement that bound each name in `imports`:
+    /// where an `__all__` re-export of it is placed, so the re-export node's
+    /// position is its statement's order. Kept beside `imports`, not
+    /// on [`Import`], whose values are compared as bindings.
+    import_ranges: HashMap<String, Range>,
     dunder_all: DunderAll,
 }
 
@@ -166,8 +172,28 @@ impl FileModel {
     /// name wins, which is also what Python does with the only sane version
     /// of a repeat (two branches of an `if` importing one name from two
     /// places).
-    pub(crate) fn import(&mut self, local: &str, import: Import) {
-        self.imports.entry(local.to_string()).or_insert(import);
+    ///
+    /// `range` is the import statement's. A repeat of the *same* binding
+    /// (`from .a import f` written twice) moves it to the later statement,
+    /// which is the one that last bound the name; a repeat with a different
+    /// binding keeps the first binding and its range.
+    pub(crate) fn import(&mut self, local: &str, import: Import, range: Range) {
+        match self.imports.get(local) {
+            None => {
+                self.imports.insert(local.to_string(), import);
+                self.import_ranges.insert(local.to_string(), range);
+            }
+            Some(bound) if *bound == import => {
+                self.import_ranges.insert(local.to_string(), range);
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// The range of the import statement that bound `local`
+    /// ([`FileModel::import`]).
+    pub(crate) fn import_range(&self, local: &str) -> Option<Range> {
+        self.import_ranges.get(local).copied()
     }
 
     /// What a module-level `import` bound `local` to.
@@ -228,8 +254,8 @@ mod tests {
     #[test]
     fn an_external_import_is_known_and_names_no_container_of_ours() {
         let mut model = FileModel::default();
-        model.import("Path", Import::External);
-        model.import("helpers", Import::Item { container: "pkg".into(), name: "helpers".into() });
+        model.import("Path", Import::External, range());
+        model.import("helpers", Import::Item { container: "pkg".into(), name: "helpers".into() }, range());
         assert_eq!(model.lookup_import("Path"), Some(&Import::External));
         assert!(matches!(model.lookup_import("helpers"), Some(Import::Item { .. })));
         assert_eq!(model.lookup_import("missing"), None);

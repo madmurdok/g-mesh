@@ -167,6 +167,14 @@ pub(crate) struct Emitter<'s> {
     /// Every function definition of each node id, in source order - see
     /// "Overload sets" in the module doc.
     definitions: HashMap<String, Vec<Definition>>,
+    /// Re-export nodes, held back until [`Emitter::finish`] so a repeat of
+    /// one (`from .b import *` written twice) can move its range to the
+    /// later statement: core reads a re-export's start position as its
+    /// statement's order. Safe to emit late because a re-export
+    /// node is the source or target of no edge. Indexed by id in
+    /// `reexport_at`.
+    reexports: Vec<NodeSpec>,
+    reexport_at: HashMap<String, usize>,
 }
 
 /// One `def` of a function node, as an overload set's declaration list needs
@@ -218,6 +226,8 @@ impl<'s> Emitter<'s> {
             edges: HashSet::new(),
             placeholders: HashMap::new(),
             definitions: HashMap::new(),
+            reexports: Vec::new(),
+            reexport_at: HashMap::new(),
         }
     }
 
@@ -317,12 +327,17 @@ impl<'s> Emitter<'s> {
             &qualified_name,
             Some(PlaceholderKind::Reexport.native_kind()),
         );
-        if self.nodes.insert(id.clone()) {
+        if let Some(&at) = self.reexport_at.get(&id) {
+            // The same re-export again: the later statement is the one that
+            // last bound the name, so it is the one whose position counts.
+            self.reexports[at].range = range;
+        } else if self.nodes.insert(id.clone()) {
             let mut spec = NodeSpec::new(NodeKind::Module, published, qualified_name, range)
                 .native_kind(PlaceholderKind::Reexport.native_kind());
             spec.container = Some(container.to_string());
             spec.target = Some(target);
-            self.graph.add_node(spec);
+            self.reexport_at.insert(id.clone(), self.reexports.len());
+            self.reexports.push(spec);
         }
         id
     }
@@ -393,6 +408,9 @@ impl<'s> Emitter<'s> {
                 })
                 .collect();
             self.graph.set_declarations(&id, declarations);
+        }
+        for spec in std::mem::take(&mut self.reexports) {
+            self.graph.add_node(spec);
         }
         self.graph.finish()
     }

@@ -265,15 +265,30 @@ pub struct ReexportRules {
     /// import binds the name instead (Python).
     #[serde(default)]
     pub named_shadows_glob: bool,
+    /// Each import statement rebinds the name, so in one module the later of
+    /// a named import and a `*` import that provides the name binds it
+    /// (Python). The opposite answer to `named_shadows_glob`: a manifest may
+    /// not set both to `true`. Decision:
+    /// `docs/architecture/gm-496-python-later-import-binds.md`.
+    #[serde(default)]
+    pub later_import_binds: bool,
 }
 
 /// The linker's rules for every manifest in `manifests`: the languages whose
-/// `[plugin.reexports]` declares `named_shadows_glob`.
+/// `[plugin.reexports]` declares `named_shadows_glob`, and those declaring
+/// `later_import_binds`.
 pub fn link_rules<'a>(manifests: impl IntoIterator<Item = &'a PluginManifest>) -> LinkRules {
+    let manifests: Vec<&PluginManifest> = manifests.into_iter().collect();
     LinkRules::with_named_shadows_glob(
         manifests
-            .into_iter()
+            .iter()
             .filter(|manifest| manifest.reexports.named_shadows_glob)
+            .map(|manifest| manifest.language.clone()),
+    )
+    .with_later_import_binds(
+        manifests
+            .iter()
+            .filter(|manifest| manifest.reexports.later_import_binds)
             .map(|manifest| manifest.language.clone()),
     )
 }
@@ -386,6 +401,14 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+
+    if plugin.reexports.named_shadows_glob && plugin.reexports.later_import_binds {
+        bail!(
+            "plugin manifest at {} sets both `named_shadows_glob` and `later_import_binds` in \
+             [plugin.reexports] - they are opposite answers to which import binds a name; set one",
+            manifest_path.display(),
+        );
+    }
 
     validate_non_symbol_queries(&plugin.non_symbol_queries, &manifest_path)?;
     validate_symbol_query_prefixes(
