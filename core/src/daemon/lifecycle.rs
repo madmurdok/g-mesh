@@ -404,6 +404,20 @@ impl PluginSupervisor {
         process.notify_prepare_semantic_pass()
     }
 
+    /// Tells a running plugin that `file_paths` were created in one batch,
+    /// before their own `fileChanged`s reach it
+    /// (`PluginProcess::notify_files_created`). Returns whether it was told.
+    ///
+    /// Never spawns, wakes or queues: a sleeping plugin's wake, like a fresh
+    /// spawn, builds its model from the disk after the batch, so it already
+    /// sees every created file, and its `DirtyQueue` replays each one per file.
+    pub fn files_created(&self, file_paths: &[String]) -> Result<bool> {
+        let inner = self.inner();
+        let Some(process) = inner.process.as_ref() else { return Ok(false) };
+        self.touch();
+        process.notify_files_created(file_paths)
+    }
+
     /// Runs `f` under this supervisor's serialization lock, the one every plugin
     /// round trip here takes. A workspace reindex must be atomic against a file
     /// change, or a `fileChanged` diff committed between its delete and its

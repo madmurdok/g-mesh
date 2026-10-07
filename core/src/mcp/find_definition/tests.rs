@@ -1,4 +1,6 @@
 use super::*;
+use std::collections::HashMap;
+
 use crate::graph::queries::{upsert_edge, upsert_node};
 use crate::protocol::types::QualifiedPath;
 use crate::storage::index_store::IndexStore;
@@ -190,6 +192,7 @@ fn ambiguous_bare_name_returns_both_as_ranked_candidates() {
         .unwrap();
 
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("run".to_string()),
         file_path: None,
         position: None,
@@ -230,6 +233,7 @@ fn placeholders_named_after_a_symbol_are_not_definition_candidates() {
     }
 
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("mutate".to_string()),
         file_path: None,
         position: None,
@@ -264,6 +268,7 @@ fn a_container_named_like_its_member_is_not_a_definition_candidate() {
     assert_eq!(candidates.results.len(), 1, "the container node must not be ranked");
 
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("app".to_string()),
         file_path: None,
         position: None,
@@ -292,6 +297,7 @@ fn file_and_position_query_returns_a_single_node_not_a_list() {
     upsert_node(&mut conn, node_with_span("n2", "run", "pkg_b::run", "b/lib.rs", (5, 0))).unwrap();
 
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: None,
         file_path: Some("a/lib.rs".to_string()),
         position: Some(crate::protocol::types::Position { line: 2, col: 0 }),
@@ -322,6 +328,7 @@ fn qualified_name_requery_returns_the_exact_node() {
     upsert_node(&mut conn, node_with_span("n2", "run", "pkg_b::run", "b/lib.rs", (5, 0))).unwrap();
 
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("pkg_b::run".to_string()),
         file_path: None,
         position: None,
@@ -345,6 +352,7 @@ fn qualified_name_requery_returns_the_exact_node() {
 fn no_match_is_a_tool_level_error() {
     let conn = setup();
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("does_not_exist".to_string()),
         file_path: None,
         position: None,
@@ -366,6 +374,7 @@ fn no_match_is_a_tool_level_error() {
 fn neither_name_nor_position_is_a_tool_level_error() {
     let conn = setup();
     let params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: None,
         file_path: None,
         position: None,
@@ -398,6 +407,7 @@ fn ambiguous_candidates_paginate_across_cursor_continuation() {
     let conn = Arc::new(IndexStore::new(conn));
 
     let first_params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("run".to_string()),
         file_path: None,
         position: None,
@@ -414,6 +424,7 @@ fn ambiguous_candidates_paginate_across_cursor_continuation() {
     let cursor = first_body["nextCursor"].as_str().unwrap().to_string();
 
     let second_params = FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("run".to_string()),
         file_path: None,
         position: None,
@@ -849,6 +860,7 @@ fn include_source_false_leaves_the_response_exactly_as_it_was() {
     let conn = Arc::new(IndexStore::new(conn));
 
     let params = |include| FindDefinitionParams {
+        symbol_id: None,
         symbol_name: Some("run".to_string()),
         file_path: None,
         position: None,
@@ -1149,8 +1161,11 @@ fn a_semantic_page_is_labelled_as_candidates_and_carries_ids_to_requery() {
             id: "near".to_string(),
             qualified_name: "pkg::near".to_string(),
             file_path: "a.rs".to_string(),
+            start_line: None,
+            end_line: None,
             kind: "Function".to_string(),
             preview: None,
+            source: None,
         }],
     };
 
@@ -1674,6 +1689,7 @@ fn a_rewritten_page_continues_through_its_cursor() {
     let store = Arc::new(IndexStore::new(conn));
     let page = |cursor: Option<String>| {
         let params = FindDefinitionParams {
+            symbol_id: None,
             symbol_name: Some("@Component".to_string()),
             file_path: None,
             position: None,
@@ -1699,4 +1715,362 @@ fn a_rewritten_page_continues_through_its_cursor() {
     all.sort_unstable();
     all.dedup();
     assert_eq!(all.len(), total, "every candidate exactly once across both pages");
+}
+
+// --- candidate lines, symbol_id and sourced candidates -----------------
+
+/// A project holding each `(path, body)` on disk.
+fn project_files(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("failed to create a temp project");
+    for (path, body) in files {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).expect("failed to create the fixture directory");
+        std::fs::write(full, body).expect("failed to write the fixture");
+    }
+    dir
+}
+
+/// One `run` per `(id, file, start, end)`.
+fn runs(spans: &[(&str, &str, i64, i64)]) -> Arc<IndexStore> {
+    let mut conn = setup();
+    for (id, file, start, end) in spans {
+        let mut node = node_with_span(id, "run", &format!("{id}::run"), file, (*end, 0));
+        node.start_line = *start;
+        upsert_node(&mut conn, node).unwrap();
+    }
+    Arc::new(IndexStore::new(conn))
+}
+
+fn definition_params() -> FindDefinitionParams {
+    FindDefinitionParams {
+        symbol_id: None,
+        symbol_name: None,
+        file_path: None,
+        position: None,
+        cursor: None,
+        include_source: None,
+    }
+}
+
+fn define(store: &Arc<IndexStore>, root: &std::path::Path, params: FindDefinitionParams) -> CallToolResult {
+    handle(store, root, &EmbeddingPipeline::disabled(), QueryShapes::shipped(), params).unwrap()
+}
+
+fn named(name: &str) -> FindDefinitionParams {
+    FindDefinitionParams { symbol_name: Some(name.to_string()), ..definition_params() }
+}
+
+fn by_id(id: &str) -> FindDefinitionParams {
+    FindDefinitionParams { symbol_id: Some(id.to_string()), ..definition_params() }
+}
+
+fn candidate_ids(body: &serde_json::Value) -> Vec<String> {
+    body["results"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn ambiguous_candidates_carry_their_start_and_end_lines() {
+    let store = runs(&[("a", "a.rs", 3, 7), ("b", "b.rs", 10, 12)]);
+
+    let body = json_body(&define(&store, &no_sources(), named("run")));
+
+    let lines: Vec<(String, i64, i64)> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["id"].as_str().unwrap().to_string(),
+                c["startLine"].as_i64().unwrap(),
+                c["endLine"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    let mut lines = lines;
+    lines.sort();
+    assert_eq!(lines, vec![("a".to_string(), 3, 7), ("b".to_string(), 10, 12)], "{body}");
+}
+
+/// The page's explanation names `symbol_id` as the field to re-query with,
+/// and following it literally resolves the chosen candidate.
+#[test]
+fn following_the_ambiguous_explanation_resolves_the_chosen_candidate_by_id() {
+    let store = runs(&[("a", "a/lib.rs", 0, 0), ("b", "b/lib.rs", 1, 3)]);
+    let project = project_files(&[("b/lib.rs", "// head\nfn run() {\n    work();\n}\n")]);
+
+    let page = json_body(&define(&store, &no_sources(), named("run")));
+    assert_eq!(page["explanation"], crate::mcp::session_hints::AMBIGUOUS, "{page}");
+    assert!(page["explanation"].as_str().unwrap().contains("`symbol_id`"), "{page}");
+
+    let body = json_body(&define(&store, project.path(), by_id("b")));
+
+    assert_eq!(body["id"], "b", "{body}");
+    assert_eq!(body["resolvedBy"], "id", "{body}");
+    assert_eq!(body["source"]["text"], "fn run() {\n    work();\n}", "{body}");
+}
+
+#[test]
+fn symbol_id_beside_a_name_or_a_position_is_refused() {
+    let store = runs(&[("a", "a.rs", 0, 0)]);
+    let position = crate::protocol::types::Position { line: 0, col: 0 };
+    let mixed = [
+        FindDefinitionParams { symbol_name: Some("run".to_string()), ..by_id("a") },
+        FindDefinitionParams { file_path: Some("a.rs".to_string()), position: Some(position), ..by_id("a") },
+        FindDefinitionParams { file_path: Some("a.rs".to_string()), ..by_id("a") },
+    ];
+
+    for params in mixed {
+        let text = error_text(&define(&store, &no_sources(), params));
+        assert!(text.contains("give `symbol_id` alone"), "{text}");
+    }
+}
+
+#[test]
+fn an_unknown_symbol_id_is_a_tool_level_error() {
+    let store = runs(&[("a", "a.rs", 0, 0)]);
+
+    let text = error_text(&define(&store, &no_sources(), by_id("nope")));
+
+    assert!(text.contains("no symbol with id 'nope'"), "{text}");
+}
+
+/// Three readings of one name, each a different file on disk.
+fn three_runs() -> (Arc<IndexStore>, tempfile::TempDir) {
+    let store = runs(&[("a", "a.rs", 0, 2), ("b", "b.rs", 1, 1), ("c", "c.rs", 0, 0)]);
+    let project = project_files(&[
+        ("a.rs", "fn run() {\n    alpha();\n}\n"),
+        ("b.rs", "// b\nfn run() { beta() }\n"),
+        ("c.rs", "fn run() {}\n"),
+    ]);
+    (store, project)
+}
+
+#[test]
+fn up_to_three_candidates_on_a_complete_first_page_each_carry_their_source() {
+    let (store, project) = three_runs();
+
+    let sourced = json_body(&define(&store, project.path(), named("run")));
+    let bare = json_body(&define(
+        &store,
+        project.path(),
+        FindDefinitionParams { include_source: Some(false), ..named("run") },
+    ));
+
+    assert_eq!(sourced["hasMore"], false, "precondition: {sourced}");
+    assert_eq!(sourced["explanation"], crate::mcp::session_hints::AMBIGUOUS_SOURCED, "{sourced}");
+    let texts: HashMap<String, String> = sourced["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            let text = c["source"]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every candidate is sourced: {sourced}"));
+            (c["id"].as_str().unwrap().to_string(), text.to_string())
+        })
+        .collect();
+    assert_eq!(texts["a"], "fn run() {\n    alpha();\n}");
+    assert_eq!(texts["b"], "fn run() { beta() }");
+    assert_eq!(texts["c"], "fn run() {}");
+    assert_eq!(candidate_ids(&sourced), candidate_ids(&bare), "sourcing does not reorder the candidates");
+}
+
+#[test]
+fn include_source_false_gives_candidates_their_lines_without_source() {
+    let (store, project) = three_runs();
+
+    let body = json_body(&define(
+        &store,
+        project.path(),
+        FindDefinitionParams { include_source: Some(false), ..named("run") },
+    ));
+
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS, "{body}");
+    for candidate in body["results"].as_array().unwrap() {
+        assert!(candidate.get("source").is_none(), "{body}");
+        assert!(candidate["startLine"].is_i64() && candidate["endLine"].is_i64(), "{body}");
+    }
+}
+
+/// The ids of the page's candidates that carry `source`, sorted.
+fn sourced_ids(body: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c.get("source").is_some())
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Two readable candidates and one whose `endLine` is the file's line count,
+/// one past its last line - the shape a Python `Module` node has (requests'
+/// `__version__`). Its span is refused, so the page carries source for some
+/// candidates only and must not claim "each with its source".
+fn runs_one_past_the_end() -> (Arc<IndexStore>, tempfile::TempDir) {
+    let store = runs(&[("a", "a.rs", 0, 2), ("b", "b.rs", 1, 1), ("m", "m.rs", 0, 2)]);
+    let project = project_files(&[
+        ("a.rs", "fn run() {\n    alpha();\n}\n"),
+        ("b.rs", "// b\nfn run() { beta() }\n"),
+        ("m.rs", "run = 1\nother = 2\n"),
+    ]);
+    (store, project)
+}
+
+#[test]
+fn a_page_where_one_candidates_span_ends_past_the_file_says_only_some_are_sourced() {
+    let (store, project) = runs_one_past_the_end();
+
+    let body = json_body(&define(&store, project.path(), named("run")));
+
+    assert_eq!(body["hasMore"], false, "precondition: {body}");
+    assert_eq!(body["results"].as_array().unwrap().len(), 3, "precondition: {body}");
+    assert_eq!(sourced_ids(&body), vec!["a", "b"], "the past-the-end span is refused, the rest read: {body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_PARTLY_SOURCED, "{body}");
+    assert_ne!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_SOURCED, "{body}");
+}
+
+/// A file deleted since the walk is the other way a candidate loses its
+/// source; the page says "some" for it just the same.
+#[test]
+fn a_page_where_one_candidates_file_is_missing_says_only_some_are_sourced() {
+    let store = runs(&[("a", "a.rs", 0, 2), ("gone", "gone.rs", 0, 0)]);
+    let project = project_files(&[("a.rs", "fn run() {\n    alpha();\n}\n")]);
+
+    let body = json_body(&define(&store, project.path(), named("run")));
+
+    assert_eq!(sourced_ids(&body), vec!["a"], "{body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_PARTLY_SOURCED, "{body}");
+}
+
+/// The partly-sourced explanation sends the reader to the candidates it
+/// could not show, by the field the page uses to mark them.
+#[test]
+fn the_partly_sourced_explanation_names_how_to_reach_the_unsourced_candidates() {
+    let text = crate::mcp::session_hints::AMBIGUOUS_PARTLY_SOURCED;
+
+    assert!(text.contains("`symbol_id`"), "{text}");
+    assert!(text.contains("`source`"), "{text}");
+    assert_ne!(text, crate::mcp::session_hints::AMBIGUOUS_SOURCED);
+    assert_ne!(text, crate::mcp::session_hints::AMBIGUOUS);
+}
+
+/// Opting out of source is "none sourced", not "some": the mixed page with
+/// `include_source: false` reads exactly like any unsourced page.
+#[test]
+fn include_source_false_on_a_mixed_page_is_plainly_ambiguous() {
+    let (store, project) = runs_one_past_the_end();
+
+    let body = json_body(&define(
+        &store,
+        project.path(),
+        FindDefinitionParams { include_source: Some(false), ..named("run") },
+    ));
+
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS, "{body}");
+    assert!(sourced_ids(&body).is_empty(), "{body}");
+}
+
+/// When every candidate's span is refused the page carries no source at
+/// all, and says the plain thing rather than "some".
+#[test]
+fn a_page_where_no_candidates_span_can_be_read_is_plainly_ambiguous() {
+    let store = runs(&[("a", "a.rs", 0, 1), ("b", "b.rs", 5, 9)]);
+    let project = project_files(&[("a.rs", "fn run() {}\n"), ("b.rs", "fn run() {}\n")]);
+
+    let body = json_body(&define(&store, project.path(), named("run")));
+
+    assert_eq!(body["results"].as_array().unwrap().len(), 2, "precondition: {body}");
+    assert!(sourced_ids(&body).is_empty(), "{body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS, "{body}");
+}
+
+#[test]
+fn four_candidates_carry_no_source() {
+    let store = runs(&[("a", "a.rs", 0, 0), ("b", "b.rs", 0, 0), ("c", "c.rs", 0, 0), ("d", "d.rs", 0, 0)]);
+    let project = project_files(&[
+        ("a.rs", "fn run() {}\n"),
+        ("b.rs", "fn run() {}\n"),
+        ("c.rs", "fn run() {}\n"),
+        ("d.rs", "fn run() {}\n"),
+    ]);
+
+    let body = json_body(&define(&store, project.path(), named("run")));
+
+    assert_eq!(body["results"].as_array().unwrap().len(), 4, "precondition: {body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS, "{body}");
+    for candidate in body["results"].as_array().unwrap() {
+        assert!(candidate.get("source").is_none(), "{body}");
+    }
+}
+
+/// A later page holds a few candidates, but they are not the whole set, so
+/// they are not sourced either.
+#[test]
+fn a_short_continuation_page_carries_no_source() {
+    let count = CANDIDATE_PAGE_SIZE + 2;
+    let ids: Vec<String> = (0..count).map(|i| format!("r{i:02}")).collect();
+    let files: Vec<String> = ids.iter().map(|id| format!("{id}.rs")).collect();
+    let spans: Vec<(&str, &str, i64, i64)> =
+        ids.iter().zip(&files).map(|(id, file)| (id.as_str(), file.as_str(), 0, 0)).collect();
+    let store = runs(&spans);
+    let bodies: Vec<(&str, &str)> = files.iter().map(|file| (file.as_str(), "fn run() {}\n")).collect();
+    let project = project_files(&bodies);
+
+    let first = json_body(&define(&store, project.path(), named("run")));
+    assert_eq!(first["hasMore"], true, "precondition: {first}");
+    let cursor = first["nextCursor"].as_str().unwrap().to_string();
+
+    let second = json_body(&define(
+        &store,
+        project.path(),
+        FindDefinitionParams { cursor: Some(cursor), ..named("run") },
+    ));
+
+    assert_eq!(second["results"].as_array().unwrap().len(), 2, "precondition: {second}");
+    assert_eq!(second["hasMore"], false, "precondition: {second}");
+    assert_eq!(second["explanation"], crate::mcp::session_hints::AMBIGUOUS, "{second}");
+    for candidate in second["results"].as_array().unwrap() {
+        assert!(candidate.get("source").is_none(), "{second}");
+    }
+}
+
+#[test]
+fn a_candidates_source_is_cut_at_twenty_lines_and_says_so() {
+    let body: String = (0..28).map(|n| format!("    let x{n} = {n};\n")).collect();
+    let store = runs(&[("a", "a.rs", 0, 29), ("b", "b.rs", 0, 0)]);
+    let project = project_files(&[("a.rs", &format!("fn run() {{\n{body}}}\n")), ("b.rs", "fn run() {}\n")]);
+
+    let page = json_body(&define(&store, project.path(), named("run")));
+
+    let long = page["results"].as_array().unwrap().iter().find(|c| c["id"] == "a").expect("candidate a");
+    let text = long["source"]["text"].as_str().unwrap_or_else(|| panic!("a sourced candidate: {page}"));
+    assert_eq!(text.lines().count(), CANDIDATE_SOURCE_LINES, "{page}");
+    assert_eq!(long["source"]["omittedLines"], 30 - CANDIDATE_SOURCE_LINES, "{page}");
+}
+
+/// The anchored tools answer an ambiguous name with the same candidates,
+/// lines included, and never with their source.
+#[test]
+fn an_anchored_tools_ambiguous_page_carries_lines_and_no_source() {
+    let store = runs(&[("a", "a.rs", 3, 7), ("b", "b.rs", 10, 12)]);
+
+    let result = crate::mcp::find_references::handle(
+        &store,
+        &EmbeddingPipeline::disabled(),
+        QueryShapes::shipped(),
+        &HashMap::new(),
+        &crate::mcp::session_hints::SessionHints::default(),
+        crate::mcp::SymbolQueryParams { symbol_name: Some("run".to_string()), ..Default::default() },
+    )
+    .unwrap();
+    let body = json_body(&result);
+
+    assert_eq!(body["ambiguous"], true, "precondition: {body}");
+    for candidate in body["results"].as_array().unwrap() {
+        assert!(candidate["startLine"].is_i64() && candidate["endLine"].is_i64(), "{body}");
+        assert!(candidate.get("source").is_none(), "{body}");
+    }
 }

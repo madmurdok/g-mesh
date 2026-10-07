@@ -1,10 +1,9 @@
 package main
 
 // A hand-rolled subset of .gitignore matching, mirroring
-// plugins/typescript/src/ignorePolicy.ts's shape (per-directory layers,
-// later/deeper layer overrides earlier, negation) rather than its
-// implementation (which delegates the pattern language itself to the npm
-// `ignore` package).
+// the shape plugins/sdk/src/walk.rs gets from the Rust `ignore` crate
+// (per-directory layers, later/deeper layer overrides earlier, negation)
+// rather than its implementation.
 //
 // Decision: hand-rolled rather than a dependency. `go.mod` for this plugin
 // has zero requirements today, which is worth keeping for a scaffold whose

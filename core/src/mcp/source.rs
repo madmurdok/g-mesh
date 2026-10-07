@@ -82,6 +82,20 @@ pub(super) fn read_span(
     start_line: i64,
     end_line: i64,
 ) -> Option<Snippet> {
+    read_span_within(project_root, file_path, start_line, end_line, MAX_LINES, MAX_CHARS)
+}
+
+/// [`read_span`] under caller-chosen caps, for a response that carries
+/// several snippets side by side and so has to keep each one smaller than a
+/// single answer's.
+pub(super) fn read_span_within(
+    project_root: &Path,
+    file_path: &str,
+    start_line: i64,
+    end_line: i64,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<Snippet> {
     if start_line < 0 || end_line < start_line {
         return None;
     }
@@ -99,7 +113,7 @@ pub(super) fn read_span(
     }
 
     let span = &lines[start..=end];
-    let kept = bounded(span);
+    let kept = bounded(span, max_lines, max_chars);
 
     Some(Snippet {
         first_line: start_line + 1,
@@ -111,20 +125,20 @@ pub(super) fn read_span(
 /// How many leading lines of `span` fit inside both caps.
 ///
 /// Always at least one line when the span has one, even if that single line
-/// alone busts [`MAX_CHARS`]: a snippet cut to nothing, marked as truncated,
+/// alone busts `max_chars`: a snippet cut to nothing, marked as truncated,
 /// carries the cost of the field and none of its value. The line-length cap
 /// exists for the generated file where *every* line is enormous, and one such
 /// line is still a bounded amount of text.
-fn bounded(span: &[&str]) -> usize {
+fn bounded(span: &[&str], max_lines: usize, max_chars: usize) -> usize {
     let mut chars = 0;
-    for (n, line) in span.iter().take(MAX_LINES).enumerate() {
+    for (n, line) in span.iter().take(max_lines).enumerate() {
         // +1 for the newline join, which counts toward what the caller pays.
         chars += line.chars().count() + 1;
-        if chars > MAX_CHARS {
+        if chars > max_chars {
             return n.max(1);
         }
     }
-    span.len().min(MAX_LINES)
+    span.len().min(max_lines)
 }
 
 #[cfg(test)]

@@ -143,7 +143,10 @@ pub fn run(agents: &[AgentTarget]) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve the current directory")?;
     let outcome = init(&cwd, agents)?;
     print!("{}", render(&outcome, &cwd));
-    Ok(())
+    match &outcome.summary {
+        Some(summary) => crate::cli::report_language_outcomes(&summary.outcomes),
+        None => Ok(()),
+    }
 }
 
 /// Sets `project_root`'s g-mesh state up: its state directory, a default
@@ -366,6 +369,7 @@ mod tests {
                 skipped_lines: 0,
                 linked_imports: 2,
                 linked_symbols: 1,
+                ..BulkIndexSummary::default()
             }),
             semantic_pass_ran: true,
             agents: Vec::new(),

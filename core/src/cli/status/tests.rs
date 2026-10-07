@@ -902,7 +902,7 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
 fn a_daemon_left_behind_by_an_upgrade_is_called_out_with_what_to_do_about_it() {
     for (state, expected) in [
         (BuildState::Outdated, "older than this g-mesh"),
-        (BuildState::PluginChanged, "JS/TS plugin that has been rebuilt"),
+        (BuildState::PluginChanged, "holding a plugin that has been rebuilt"),
         (BuildState::Unknown, "published no build stamp"),
     ] {
         let described = describe_build(state).expect("a running daemon always reports a build");

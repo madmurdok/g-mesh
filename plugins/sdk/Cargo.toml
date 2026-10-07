@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-plugin-sdk"
-version = "3.21.0"
+version = "4.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Everything a g-mesh language plugin needs that is not its language: protocol loop, project walk, incremental diff, ids"
@@ -39,6 +39,15 @@ path = "toy/main.rs"
 [[bin]]
 name = "g-mesh-fake-lsp"
 path = "fake-lsp/main.rs"
+
+# The stand-in plugin core's own tests spawn (`core/src/daemon/test_plugin.rs`,
+# `core/tests/semantic_pass_trigger.rs`) through a manifest whose `command` is
+# `${G_MESH_BIN_DIR}/g-mesh-fake-plugin`. Here rather than in core because
+# `cargo install` would ship a core `[[bin]]`; core's tests need the workspace
+# built (`cargo build --workspace`) for it to exist. Not shipped.
+[[bin]]
+name = "g-mesh-fake-plugin"
+path = "fake/main.rs"
 
 [dependencies]
 anyhow = "1"

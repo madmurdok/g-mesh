@@ -4,8 +4,8 @@
 //! watched project root - route that change to the plugin and commit its
 //! diff response to the project's SQLite index.
 //!
-//! Requires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs
-//! `npm run build` there automatically whenever this crate is built.
+//! Requires the TypeScript plugin binary, which `cargo build --workspace`
+//! builds.
 
 use std::fs;
 use std::path::Path;

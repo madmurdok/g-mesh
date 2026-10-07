@@ -36,6 +36,7 @@ use crate::mcp;
 use crate::storage::connection::{self, ensure_project_dir, project_dir};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
+use crate::watcher::batch::{classify_settled, order_for_routing};
 use crate::watcher::debounce::Debouncer;
 use crate::watcher::ProjectWatcher;
 
@@ -351,6 +352,10 @@ pub fn run(root: &Path) -> Result<()> {
         project_config.plugin.memory_limit_mb,
         Arc::clone(&embedding),
     ));
+    // Before the tool listener and the watcher's consumer below: both route
+    // files, and neither may reach a language the last walk failed (ADR 0021,
+    // section 2).
+    registry.seed_failed_languages(&conn);
 
     // Starts ticking now, so a daemon nobody connects to still exits.
     let core_activity = CoreActivity::new();
@@ -460,7 +465,11 @@ fn spawn_watch_consumer(
 }
 
 /// One iteration of the watcher loop: waits up to [`DEBOUNCE_WINDOW`] for a
-/// raw change, records it, then routes every settled path to `registry`.
+/// raw change, records it, then routes every settled path to `registry` in
+/// [`order_for_routing`]'s order (deletions, creations, modifications; ADR 0023).
+/// Between the deletions and the creations, the batch's created paths are
+/// announced per language ([`PluginRegistry::announce_created`]), so a plugin
+/// knows all of them before it extracts the first; each is still routed once.
 fn watch_and_route_once(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
@@ -471,6 +480,7 @@ fn watch_and_route_once(
     if let Some(path) = watcher.next_change(DEBOUNCE_WINDOW) {
         debouncer.record(path);
     }
+    let mut batch = Vec::new();
     for settled in debouncer.drain_ready() {
         let Some(file_path) = relative_wire_path(root, &settled) else {
             // Outside the project root: nothing to route.
@@ -481,8 +491,16 @@ fn watch_and_route_once(
             // a file, and must not enter a sleeping plugin's replay queue.
             continue;
         }
-        // A workspace file (`[plugin.workspace] watch_files`) triggers that
-        // language's reindex; anything else is applied or queued by its supervisor.
+        batch.push((classify_settled(conn, &settled, &file_path), file_path));
+    }
+    let order = order_for_routing(batch);
+    // A workspace file (`[plugin.workspace] watch_files`) triggers that
+    // language's reindex; anything else is applied or queued by its supervisor.
+    for file_path in order.deleted {
+        registry.route_settled_path(conn, file_path);
+    }
+    registry.announce_created(&order.created);
+    for file_path in order.created.into_iter().chain(order.modified) {
         registry.route_settled_path(conn, file_path);
     }
 }

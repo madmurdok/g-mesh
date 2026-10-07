@@ -88,3 +88,22 @@ func TestManifestDeclaresTheSemanticTier(t *testing.T) {
 		}
 	}
 }
+
+// GM-515: Go's structural tier has no file-existence model, so it does not
+// ask for core's `filesCreated` notification and keeps the per-file
+// `fileChanged` path. Declaring it would only add a frame per batch.
+func TestManifestDoesNotDeclareFilesCreated(t *testing.T) {
+	content, err := os.ReadFile("plugin.toml")
+	if err != nil {
+		t.Fatalf("read plugin.toml: %v", err)
+	}
+	for _, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if name, _, found := strings.Cut(line, "="); found && strings.TrimSpace(name) == "files_created" {
+			t.Fatalf("plugin.toml declares files_created (%q); the Go plugin must not", line)
+		}
+	}
+}

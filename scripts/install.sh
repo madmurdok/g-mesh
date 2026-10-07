@@ -21,9 +21,11 @@
 # A release archive is a complete install, not a binary:
 #
 #   g-mesh                       the core binary
-#   plugins/typescript/          the JS/TS plugin (its own embedded Node
-#                                runtime) and the plugin.toml core discovers
-#                                it through
+#   plugins/typescript/          the JS/TS plugin (a plain cargo binary,
+#                                needing no Node.js runtime, GM-326) and the
+#                                plugin.toml core discovers it through
+#   plugins/go/                  the Go plugin (one static binary) and its
+#                                own plugin.toml (GM-283)
 #   plugins/rust/                the Rust plugin (a plain cargo binary,
 #                                needing no runtime of its own) and its own
 #                                plugin.toml (GM-288)
@@ -95,6 +97,10 @@
 # chain build-targets.sh uses - sha256sum, else shasum -a 256 - plus openssl
 # as a last resort, and compared before a single byte is unpacked. A mismatch
 # aborts with both hashes printed and nothing installed.
+#
+# The same rule is implemented in scripts/install.ps1 and in the Rust fetch
+# behind `g-mesh plugins install`; change all three together. Why there are
+# three: docs/adr/0027-plugin-fetch-checksums-in-rust.md.
 #
 # ---------------------------------------------------------------------------
 # VERSIONS, AND THE "NOTHING IS PUBLISHED YET" CASE
@@ -678,7 +684,7 @@ this binary."
 	[ -d "$_stage" ] || die "unexpected archive layout: $_asset does not contain a $_stem/ directory"
 	[ -f "$_stage/g-mesh" ] || die "unexpected archive layout: no g-mesh binary inside $_asset"
 	[ -f "$_stage/plugins/typescript/plugin.toml" ] ||
-		die "unexpected archive layout: $_asset carries no plugins/typescript/plugin.toml. Core cannot index a TypeScript project without it, so this archive is not installable."
+		die "unexpected archive layout: $_asset carries no plugins/typescript/plugin.toml. A g-mesh release archive always carries its bundled plugins, so this is not a release archive (wrong or truncated asset) - nothing was installed."
 	chmod +x "$_stage/g-mesh" 2>/dev/null || true
 
 	# Run it before installing it. `--version` proves the binary executes on

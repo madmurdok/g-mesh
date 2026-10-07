@@ -5,7 +5,7 @@ This directory is the index and home for g-mesh's architecture decisions.
 ## Template
 
 New decisions get their own file: `docs/adr/NNNN-<slug>.md` (four-digit,
-zero-padded, incrementing — the next free number is `0019`). Use this
+zero-padded, incrementing — the next free number is `0029`). Use this
 template:
 
 ```markdown
@@ -72,7 +72,7 @@ Each decision made from here on gets its own file, added as a row here.
 | # | Title | Status |
 |---|-------|--------|
 | 0001 | [IndexStore: one owner for the SQLite connection and its lock policy](0001-index-store.md) | Accepted |
-| 0002 | [Bulk walk: one one-shot process per language, and one failure fails the walk](0002-bulk-walk.md) | Accepted |
+| 0002 | [Bulk walk: one one-shot process per language, and one failure fails the walk](0002-bulk-walk.md) | Accepted; decision 2 superseded by 0021 |
 | 0003 | [MCP prompt text: instructions rendered from the index's languages, terse tool schemas](0003-mcp-instructions-rendering.md) | Accepted |
 | 0004 | [Daemon lifecycle: startup order, the singleton lock, two idle timers and the orphan exit](0004-daemon-lifecycle.md) | Accepted |
 | 0005 | [Plugin manifest: read once, fail hard, resolve paths at read time](0005-plugin-manifest.md) | Accepted |
@@ -91,3 +91,11 @@ Each decision made from here on gets its own file, added as a row here.
 | 0018 | [Plugins declare the query shapes that are never their symbols](0018-non-symbol-query-shapes.md) | Accepted |
 | 0019 | [Plugins declare the prefixes that, stripped, leave one of their symbols](0019-symbol-query-prefixes.md) | Accepted |
 | 0020 | [Plugins declare whether a named re-export shadows a glob](0020-named-reexport-shadows-glob.md) | Accepted |
+| 0021 | [Bulk walk: one language's failure costs only that language, and the index says which](0021-per-language-bulk-outcome.md) | Accepted |
+| 0022 | [Instructions say which languages are covered; per-answer facts move to the answer](0022-instructions-coverage-states.md) | Accepted |
+| 0023 | [The project model tracks file presence on `fileChanged`; resolution configs are watch files](0023-project-model-tracks-file-presence.md) | Accepted |
+| 0024 | [A semantic tier refines an edge by binding a declaration, all or nothing per edge](0024-semantic-tier-refines-by-binding-a-declaration.md) | Accepted |
+| 0025 | [Project walks follow symlinks; a file's identity is its real spelling when the plain walk reaches it](0025-project-walk-follows-symlinks.md) | Accepted |
+| 0026 | [Created files of one batch reach the plugin as a `filesCreated` notification](0026-batch-created-files-notification.md) | Accepted |
+| 0027 | [Plugin fetch verifies checksums in Rust, a third implementation of the install rule](0027-plugin-fetch-checksums-in-rust.md) | Accepted |
+| 0028 | [Anchored responses rank by structure and answer before evidence](0028-anchored-responses-rank-and-answer-first.md) | Accepted |

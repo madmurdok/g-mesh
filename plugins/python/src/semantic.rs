@@ -106,7 +106,7 @@
 //! which carried the same naive candidate list this module did - still
 //! reported no usable pyright.
 //!
-//! The fix is [`script_spellings`]: every final candidate path from all three
+//! The fix is [`lsp::script_spellings`]: every final candidate path from all three
 //! branches above, and a path the manifest names explicitly, is tried both as
 //! written and, when it has no extension of its own, with `.cmd` appended.
 //! Only `.cmd` - not `.bat`, which current npm does not write (listing a
@@ -119,9 +119,9 @@
 //! expansion as the manifest path and the two npm-install candidates, which
 //! is what makes this a fix rather than a list of two spellings with a third
 //! exception waiting to be discovered the same way this one was. The
-//! extension list is a parameter, not a fact [`script_spellings`] reads for
-//! itself - [`candidates`] is the one place that picks
-//! [`WINDOWS_SCRIPT_EXTENSIONS`] under `#[cfg(windows)]`, the same shape
+//! extension list is a parameter, not a fact [`lsp::script_spellings`] reads
+//! for itself - [`lsp::HOST_SCRIPT_EXTENSIONS`] is the one place that picks
+//! [`lsp::WINDOWS_SCRIPT_EXTENSIONS`] under `#[cfg(windows)]`, the same shape
 //! `daemon::manifest::resolve_exe_suffix` uses around
 //! `daemon::manifest::exe_suffixed` and its `EXE_SUFFIX` - so the Windows arm
 //! is exercised by this module's own tests from this macOS host, rather than
@@ -130,17 +130,15 @@
 //!
 //! # Decision 2: the probe is bounded, because this one can reach the network
 //!
-//! GM-290's probe is an unbounded `Command::output()`, which is right for
-//! rust-analyzer: `--version` is about twenty milliseconds of local work.
+//! rust-analyzer's `--version` is about twenty milliseconds of local work.
 //! Measured here, the three candidates are not one cost but two -
 //! `node_modules/.bin/pyright --version` is 0.89s (node start-up), and
 //! `npx --yes pyright --version` is 4.94s when it has to populate npm's `_npx`
 //! cache and longer when it has to download. A registry that is unreachable
 //! rather than absent does not fail fast, and the factory runs *inside* the
 //! pass core is timing. So [`PROBE_BUDGET`] bounds it and the child is killed
-//! rather than waited on, which is a correction to the precedent and not a
-//! Python detail: it is the first candidate any language has had that is not
-//! purely local.
+//! rather than waited on. The SDK's probe does this for every plugin, so
+//! rust-analyzer's is bounded too.
 //!
 //! # Decision 3: pyright takes no `initializationOptions`
 //!
@@ -212,18 +210,18 @@
 //!
 //! Incomplete, not complete, is the load-bearing half: it leaves
 //! `language_state.semanticPassAt` unset, which is what keeps Python's
-//! receiver-call gap listed in the generated MCP instructions
-//! (`core::mcp::instructions::has_open_receiver_gap`). Installing pyright and
+//! answers carrying a `provenance` block that says the semantic tier is
+//! missing (`core::mcp::provenance`). Installing pyright and
 //! restarting the daemon then gets the pass; a completed-but-empty pass would
 //! have recorded "done" and never asked again.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use g_mesh_plugin_sdk::lsp::{LspBridge, SemanticConfig};
+use anyhow::{Context, Result};
+use g_mesh_plugin_sdk::lsp::{
+    self, npm_candidates, Candidate, LspBridge, NpmServer, Resolved, SemanticConfig, HOST_SCRIPT_EXTENSIONS,
+    PROBE_BUDGET,
+};
 use g_mesh_plugin_sdk::{walk_scope, SemanticEngine, WalkScope};
 
 /// The language id this plugin speaks, for `didOpen` and for log lines.
@@ -244,40 +242,11 @@ const CLI_BIN: &str = "pyright";
 /// registry for a package called `pyright-langserver` and is answered 404.
 const NPM_PACKAGE: &str = "pyright";
 
-/// Where a project keeps a locally installed pyright.
-const NODE_BIN_DIR: &str = "node_modules/.bin";
-
-/// The npm shim extension worth trying beyond a candidate's bare spelling -
-/// see this module's doc, Decision 1b, for why `.cmd` and not `.bat`/`.ps1`.
-///
-/// Only read by [`HOST_SCRIPT_EXTENSIONS`]'s `#[cfg(windows)]` arm and by this
-/// module's own tests (which exercise it from every host, windows included) -
-/// so a build for any other host sees it as unread, which is what the `allow`
-/// says and nothing more.
-#[cfg_attr(not(windows), allow(dead_code))]
-const WINDOWS_SCRIPT_EXTENSIONS: [&str; 1] = [".cmd"];
-
-/// The script extensions worth trying on the host this process actually runs
-/// on - empty everywhere but Windows, where npm writes a bin as a `.cmd`
-/// shim rather than a `.exe`.
-///
-/// The only `#[cfg(windows)]` in this module, and it does nothing but pick
-/// which list [`candidates`] hands to [`script_spellings`] - a pure function
-/// that takes the list as a parameter rather than reading this constant
-/// itself, so its Windows arm is exercised by this module's own tests from
-/// any host. Same shape as `daemon::manifest::resolve_exe_suffix` picking
-/// `std::env::consts::EXE_SUFFIX` for `daemon::manifest::exe_suffixed`.
-#[cfg(windows)]
-const HOST_SCRIPT_EXTENSIONS: &[&str] = &WINDOWS_SCRIPT_EXTENSIONS;
-#[cfg(not(windows))]
-const HOST_SCRIPT_EXTENSIONS: &[&str] = &[];
-
-/// How long one candidate's `--version` may take before it is killed and
-/// counted as a failure - see this module's doc, Decision 2. Generous against
-/// the 0.89s a local probe measured and the 4.94s an `npx` one did, and still
-/// far inside the pass budget the factory runs within
-/// (`Budgets::project_floor` is fifteen minutes).
-const PROBE_BUDGET: Duration = Duration::from_secs(60);
+/// pyright as an npm package: the server is probed through its CLI twin,
+/// because `pyright-langserver` has no `--version` (this module's doc,
+/// Decision 1).
+const PYRIGHT: NpmServer<'static> =
+    NpmServer { package: NPM_PACKAGE, bin: SERVER_BIN, probe_bin: CLI_BIN, twin: cli_twin };
 
 /// The virtual-environment directory names looked for under the project root,
 /// in order.
@@ -346,145 +315,25 @@ fn add_project_settings(config: &mut SemanticConfig, root: &Path) {
     set_scope(config, &scope);
 }
 
-/// One spelling of "run pyright's language server", and how to prove it is
-/// one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Candidate {
-    /// argv\[0\] for the server.
-    command: PathBuf,
-    /// argv entries that come *before* the manifest's own `args` - the
-    /// package name, for the `npx` candidate, and nothing for the others.
-    prefix_args: Vec<String>,
-    /// The CLI twin to ask `--version`, and the args that precede it.
-    probe: (PathBuf, Vec<String>),
-    /// What to call this branch in the log line and in a failure message.
-    origin: &'static str,
-}
-
-/// A candidate that answered, and what it said.
-#[derive(Debug)]
-struct Resolved {
-    command: PathBuf,
-    prefix_args: Vec<String>,
-    version: String,
-    origin: &'static str,
-}
-
 /// The server to run, the args it needs, and the version its CLI twin
 /// answered with.
 ///
-/// `script_extensions` is [`HOST_SCRIPT_EXTENSIONS`] in production - see this
-/// module's doc, Decision 1b, for why it is a parameter here rather than a
-/// constant this function reads for itself.
+/// `script_extensions` is [`HOST_SCRIPT_EXTENSIONS`] in production; it is a
+/// parameter so tests can exercise the Windows spellings from any host.
 fn resolve(command: &Path, root: &Path, script_extensions: &[&str]) -> Result<Resolved> {
-    let mut failures: Vec<String> = Vec::new();
-    for candidate in candidates(command, root, script_extensions) {
-        let (probe_command, probe_args) = &candidate.probe;
-        match probe(probe_command, probe_args, PROBE_BUDGET) {
-            Ok(version) => {
-                return Ok(Resolved {
-                    command: candidate.command,
-                    prefix_args: candidate.prefix_args,
-                    version,
-                    origin: candidate.origin,
-                })
-            }
-            Err(err) => failures.push(format!("{} ({}): {err:#}", probe_command.display(), candidate.origin)),
-        }
-    }
-    bail!(
-        "no usable pyright: {}. Install it with `npm install pyright` in the project (its \
-         node_modules/.bin is looked in), or `npm install -g pyright`, or point [plugin.semantic] \
-         command in plugins/python/plugin.toml at a pyright-langserver",
-        failures.join("; ")
+    lsp::resolve(
+        candidates(command, root, script_extensions),
+        PROBE_BUDGET,
+        "pyright",
+        "Install it with `npm install pyright` in the project (its node_modules/.bin is looked in), \
+         or `npm install -g pyright`, or point [plugin.semantic] command in plugins/python/plugin.toml \
+         at a pyright-langserver",
     )
 }
 
-/// The spellings worth probing, in order - see this module's doc, Decisions 1
-/// and 1b.
-///
-/// A `command` that is a path names one file and is never searched around; a
-/// bare one is a `PATH` lookup, then the indexed project's own
-/// `node_modules/.bin`, then `npx`. Within each of those, every extension
-/// [`script_spellings`] builds for `script_extensions` is tried, in order,
-/// before moving to the next origin - the origin priority (a global install
-/// over a project-local one over the network) matters more than which
-/// spelling of one origin answers first.
+/// The spellings worth probing, in order - [`npm_candidates`] for pyright.
 fn candidates(command: &Path, root: &Path, script_extensions: &[&str]) -> Vec<Candidate> {
-    let bare = command.components().count() == 1 && !command.is_absolute();
-    if !bare {
-        return script_spellings(command, script_extensions)
-            .into_iter()
-            .map(|command| Candidate {
-                probe: (cli_twin(&command), Vec::new()),
-                command,
-                prefix_args: Vec::new(),
-                origin: "the path the manifest names",
-            })
-            .collect();
-    }
-
-    let name = command.to_string_lossy().into_owned();
-    let local = root.join(NODE_BIN_DIR).join(&name);
-    let mut candidates = Vec::new();
-    for command in script_spellings(command, script_extensions) {
-        candidates.push(Candidate {
-            probe: (cli_twin(&command), Vec::new()),
-            command,
-            prefix_args: Vec::new(),
-            origin: "PATH",
-        });
-    }
-    for command in script_spellings(&local, script_extensions) {
-        candidates.push(Candidate {
-            probe: (cli_twin(&command), Vec::new()),
-            command,
-            prefix_args: Vec::new(),
-            origin: "the project's node_modules/.bin",
-        });
-    }
-    for command in script_spellings(Path::new("npx"), script_extensions) {
-        candidates.push(Candidate {
-            prefix_args: npx_args(&name),
-            probe: (command.clone(), npx_args(CLI_BIN)),
-            command,
-            origin: "npx",
-        });
-    }
-    candidates
-}
-
-/// `path`, and - when it has no extension of its own - `path` with each of
-/// `extensions` appended to its file name, in the order given.
-///
-/// Mirrors `daemon::manifest::exe_suffixed`'s rule for `.exe` (never touch an
-/// explicit spelling) generalised to a list, because a Windows npm install
-/// needs more than one alternate spelling tried - see this module's doc,
-/// Decision 1b. Pure and filesystem-independent, like its precedent: nothing
-/// here checks whether a spelling exists, which is what makes it exercisable
-/// from any host by a plain unit test rather than only against a real
-/// install.
-fn script_spellings(path: &Path, extensions: &[&str]) -> Vec<PathBuf> {
-    let mut spellings = vec![path.to_path_buf()];
-    if path.extension().is_some() {
-        return spellings;
-    }
-    let Some(stem) = path.file_name() else { return spellings };
-    for extension in extensions {
-        let mut name = stem.to_os_string();
-        name.push(extension);
-        spellings.push(path.with_file_name(name));
-    }
-    spellings
-}
-
-/// `npx`'s own argv for running `bin` out of the pyright package.
-///
-/// One function for both the server and its probe, so that the two cannot
-/// drift into proving different things - see this module's doc, Decision 1,
-/// for the 404 that made the difference visible.
-fn npx_args(bin: &str) -> Vec<String> {
-    vec!["--yes".to_string(), "--package".to_string(), NPM_PACKAGE.to_string(), bin.to_string()]
+    npm_candidates(command, root, &PYRIGHT, script_extensions)
 }
 
 /// The CLI entry point beside a language-server one: `…/pyright-langserver`
@@ -512,62 +361,6 @@ fn cli_twin(command: &Path) -> PathBuf {
         Some(parent) => parent.join(twin),
         None => PathBuf::from(twin),
     }
-}
-
-/// Runs `<command> <args…> --version` and returns what it printed, killing it
-/// if it has not finished within `budget`.
-///
-/// The "prove it" half of this module - see the module doc for the `npx` shim
-/// it exists to reject, and Decision 2 for why the budget is here and not in
-/// `plugins/rust`'s equivalent.
-fn probe(command: &Path, args: &[String], budget: Duration) -> Result<String> {
-    let mut child = Command::new(command)
-        .args(args)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("could not run {}", command.display()))?;
-
-    // Both pipes are drained on their own threads: a child that fills one
-    // while this side waits on the other is a deadlock that looks exactly
-    // like a slow probe.
-    let out = reader(child.stdout.take());
-    let err = reader(child.stderr.take());
-
-    let deadline = Instant::now() + budget;
-    let status = loop {
-        match child.try_wait().context("could not wait for the probe")? {
-            Some(status) => break status,
-            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("`--version` did not answer within {budget:?}");
-            }
-        }
-    };
-
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
-    if !status.success() {
-        let said = stderr.lines().next().unwrap_or("").trim();
-        bail!("`--version` exited {status} ({said})");
-    }
-    let version = stdout.trim().to_string();
-    Ok(if version.is_empty() { "no version reported".to_string() } else { version })
-}
-
-/// Reads a child pipe to the end on its own thread.
-fn reader<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_string(&mut text);
-        }
-        text
-    })
 }
 
 /// The project's own interpreter, if it has one: `<root>/.venv/bin/python`, or
@@ -642,7 +435,10 @@ fn as_object(value: &mut serde_json::Value) -> &mut serde_json::Map<String, serd
 #[cfg(test)]
 mod tests {
     use super::*;
-    use g_mesh_plugin_sdk::lsp::ServerReadiness;
+    use g_mesh_plugin_sdk::lsp::{probe, ServerReadiness, WINDOWS_SCRIPT_EXTENSIONS};
+
+    /// Where a project keeps a locally installed pyright.
+    const NODE_BIN_DIR: &str = "node_modules/.bin";
 
     /// A path names one binary and is never searched around - see
     /// [`candidates`]' doc and GM-290's own rule. No extensions on this host
@@ -685,7 +481,7 @@ mod tests {
     /// this module's doc, Decision 1b. Built from `WINDOWS_SCRIPT_EXTENSIONS`
     /// rather than a literal `".cmd"`, so a second extension ever added there
     /// is covered here without editing this test. Run from this macOS host,
-    /// which is the point: [`script_spellings`] takes the extension list as a
+    /// which is the point: [`lsp::script_spellings`] takes the extension list as a
     /// parameter instead of reading [`HOST_SCRIPT_EXTENSIONS`] itself, so its
     /// Windows arm needs no Windows host to execute.
     #[test]
@@ -766,42 +562,6 @@ mod tests {
         }
     }
 
-    /// [`script_spellings`] is the pure building block [`candidates`] uses for
-    /// every origin - see this module's doc, Decision 1b.
-    #[test]
-    fn script_spellings_keeps_the_bare_path_and_appends_every_extension() {
-        assert_eq!(
-            script_spellings(Path::new("pyright-langserver"), &[]),
-            vec![PathBuf::from("pyright-langserver")],
-            "no extensions on this host is a no-op"
-        );
-        assert_eq!(
-            script_spellings(Path::new("pyright-langserver"), &[".cmd"]),
-            vec![PathBuf::from("pyright-langserver"), PathBuf::from("pyright-langserver.cmd")]
-        );
-        assert_eq!(
-            script_spellings(Path::new("/p/node_modules/.bin/pyright-langserver"), &[".cmd", ".ps1"]),
-            vec![
-                PathBuf::from("/p/node_modules/.bin/pyright-langserver"),
-                PathBuf::from("/p/node_modules/.bin/pyright-langserver.cmd"),
-                PathBuf::from("/p/node_modules/.bin/pyright-langserver.ps1"),
-            ],
-            "a directory is kept, and both extensions are offered in the order given"
-        );
-    }
-
-    /// A spelling that already carries an extension is left alone - the same
-    /// rule `daemon::manifest::exe_suffixed` applies to `.exe`: someone who
-    /// wrote `pyright-langserver.cmd` into the manifest by hand meant exactly
-    /// that file, not `pyright-langserver.cmd.cmd`.
-    #[test]
-    fn script_spellings_does_not_touch_an_explicit_extension() {
-        assert_eq!(
-            script_spellings(Path::new("pyright-langserver.cmd"), &[".cmd"]),
-            vec![PathBuf::from("pyright-langserver.cmd")]
-        );
-    }
-
     /// The twin keeps the directory and the extension, and leaves a name that
     /// is not a `-langserver` spelling alone.
     #[test]
@@ -831,29 +591,6 @@ mod tests {
         assert!(probe(Path::new("/nonexistent/pyright"), &[], PROBE_BUDGET).is_err(), "not there at all");
         #[cfg(unix)]
         assert!(probe(Path::new("/usr/bin/false"), &[], PROBE_BUDGET).is_err(), "runs and refuses");
-    }
-
-    /// And it is bounded, which `plugins/rust`'s equivalent is not - see
-    /// Decision 2.
-    ///
-    /// `sh -c "sleep 30"` rather than `sleep 30`, because [`probe`] appends
-    /// `--version` to whatever it is given and `sleep` rejects it as a time
-    /// interval - under `sh -c` a trailing word is `$0` and is ignored, which
-    /// is the smallest unix program that both outlives a short budget and
-    /// tolerates the argument every probe adds.
-    #[cfg(unix)]
-    #[test]
-    fn a_probe_that_never_answers_is_killed_rather_than_waited_on() {
-        let started = Instant::now();
-        let args = ["-c".to_string(), "sleep 30".to_string()];
-        let err = probe(Path::new("/bin/sh"), &args, Duration::from_millis(200))
-            .expect_err("a probe that outlives its budget must fail");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "it must not have waited: {:?}",
-            started.elapsed()
-        );
-        assert!(format!("{err:#}").contains("did not answer"), "{err:#}");
     }
 
     /// The project-local branch against a **real** pyright, not a stand-in.

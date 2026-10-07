@@ -36,15 +36,15 @@
 //!    user actually saw, and the layer where the failure used to be
 //!    swallowed.
 //!
-//! Requires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs
-//! `npm run build` there whenever this crate is built.
+//! Requires the TypeScript plugin binary, which `cargo build --workspace`
+//! builds.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
-use g_mesh::daemon::plugin::{bundled_manifest, PluginProcess};
+use g_mesh::daemon::plugin::PluginProcess;
 use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::storage::connection::{self, project_dir};
 use g_mesh::storage::index_store::IndexStore;
@@ -174,7 +174,7 @@ fn open_production_index(project: &Project) -> IndexStore {
 }
 
 fn spawn_plugin(project: &Project) -> PluginProcess {
-    PluginProcess::spawn(project.root(), &bundled_manifest(), project.root().join("plugin.pid"))
+    PluginProcess::spawn(project.root(), &common::typescript_manifest(), project.root().join("plugin.pid"))
         .expect("failed to spawn the JS/TS plugin")
 }
 

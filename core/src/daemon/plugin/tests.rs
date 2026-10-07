@@ -1,4 +1,6 @@
 use super::*;
+use crate::daemon::manifest::{Capabilities, WorkspaceConfig};
+use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
 use crate::storage::index_store::IndexStore;
 use rusqlite::Connection;
 
@@ -89,8 +91,7 @@ fn missing_workspace_binary_hint_is_none_once_the_binary_exists() {
 
 /// A path that is simply missing, but not under a cargo `target/<profile>`
 /// directory, is not this check's business - the generic spawn-failure
-/// message is left to name it, the same way `missing_node_entry_hint`
-/// declines a non-node command.
+/// message is left to name it.
 #[test]
 fn missing_workspace_binary_hint_ignores_a_missing_path_outside_target() {
     let workspace = tempfile::tempdir().unwrap();
@@ -123,8 +124,52 @@ fn missing_workspace_binary_hint_names_the_exe_suffixed_spelling_on_windows() {
     let hint = missing_workspace_binary_hint_with_suffix(&binary, ".exe")
         .expect("a missing target/debug binary must get a hint");
 
-    assert!(hint.contains("g-mesh-plugin-python.exe"), "{hint}");
-    assert!(!hint.contains("g-mesh-plugin-python does not exist"), "{hint}");
+    // The binary the hint says is unbuilt is the `.exe` one, never the bare
+    // name `command` holds (control: name `command` instead of the suffixed
+    // spelling - both assertions fail, on any host, via the `_with_suffix`
+    // entry point).
+    let bare = binary.display().to_string();
+    assert!(hint.contains(&format!("the plugin binary {bare}.exe has not been built yet")), "{hint}");
+    assert!(!hint.contains(&format!("{bare} has not been built yet")), "{hint}");
+}
+
+/// GM-351: the hint's exact wording in both variants - the build command
+/// first, so the 100-byte cap on a failed language's cause in the MCP
+/// instructions can only cut into the path; then the workspace root (or
+/// "the repository root" when no `Cargo.toml` marks one), the binary's path
+/// and "has not been built yet", which the bulk-index and plugin-check
+/// callers match on.
+///
+/// Controls: restore the old order (binary first); drop the root or the
+/// binary's path or "has not been built yet" from either arm; swap the arms -
+/// each fails one of the two `assert_eq!`s.
+#[test]
+fn missing_workspace_binary_hint_leads_with_the_build_command_in_both_variants() {
+    let workspace = tempfile::tempdir().unwrap();
+    let binary = workspace.path().join("target").join("release").join("g-mesh-plugin-rust");
+
+    let rootless =
+        missing_workspace_binary_hint_with_suffix(&binary, "").expect("a missing binary gets a hint");
+    assert_eq!(
+        rootless,
+        format!(
+            "Run `cargo build --workspace --release` in the repository root: \
+             the plugin binary {} has not been built yet",
+            binary.display()
+        )
+    );
+
+    std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+    let rooted =
+        missing_workspace_binary_hint_with_suffix(&binary, "").expect("a missing binary gets a hint");
+    assert_eq!(
+        rooted,
+        format!(
+            "Run `cargo build --workspace --release` in {}: the plugin binary {} has not been built yet",
+            workspace.path().display(),
+            binary.display()
+        )
+    );
 }
 
 /// Once the `.exe` file actually exists, `command` itself would already
@@ -144,17 +189,15 @@ fn missing_workspace_binary_hint_is_none_when_the_command_already_carries_the_su
     assert_eq!(missing_workspace_binary_hint_with_suffix(&binary, ".exe"), None);
 }
 
-/// [`missing_plugin_binary_hint`] tries the node-entry check first and
-/// falls back to the workspace-binary check - both spawn sites
-/// (`PluginState::spawn`, `daemon::bulk_index::walk_one_language`) call
-/// only this, so it has to actually dispatch to the workspace check for a
-/// non-node manifest, not just the node one every existing caller already
-/// exercised.
+/// Both spawn sites (`PluginState::spawn`,
+/// `daemon::bulk_index::walk_one_language`) call only
+/// [`missing_plugin_binary_hint`], so it has to dispatch to the
+/// workspace-binary check.
 #[test]
-fn missing_plugin_binary_hint_dispatches_to_the_workspace_check_for_a_non_node_command() {
+fn missing_plugin_binary_hint_dispatches_to_the_workspace_check() {
     let workspace = tempfile::tempdir().unwrap();
     let binary = workspace.path().join("target").join("debug").join("g-mesh-plugin-python");
-    let hint = missing_plugin_binary_hint(&binary, &[]).expect("a missing workspace binary must get a hint");
+    let hint = missing_plugin_binary_hint(&binary).expect("a missing workspace binary must get a hint");
     assert!(hint.contains("cargo build --workspace"), "{hint}");
 }
 
@@ -229,7 +272,7 @@ fn changing_one_emitted_file_changes_the_fingerprint() {
     assert_ne!(digest_of_plugin_build(dir.path(), &[]).unwrap(), before);
 }
 
-/// `npm run build` rewrites every file on every invocation. A rebuild
+/// A rebuild can rewrite every file with identical bytes. A rebuild
 /// that changed nothing must not cost a project a full re-walk, which is
 /// why the digest is over content and not over mtimes.
 #[test]
@@ -332,101 +375,39 @@ fn a_change_to_a_non_ignored_file_still_changes_the_fingerprint() {
     assert_ne!(fingerprint(&manifest), before);
 }
 
-/// The bundled plugin's own build is readable from the running test
-/// binary - `core/build.rs` has just built the plugin it points at - so
-/// every build stamp this process publishes names a real fingerprint
-/// rather than degrading to [`FINGERPRINT_UNAVAILABLE`].
-///
-/// (What the *index* is stamped with is no longer this value - see
-/// `daemon::registry::indexer_version` and its own tests.)
+/// The discovered plugins are readable from the running test binary, so
+/// every build stamp this process publishes names a real fingerprint rather
+/// than degrading to [`FINGERPRINT_UNAVAILABLE`].
 #[test]
-fn the_bundled_plugins_build_is_fingerprintable_from_the_test_binary() {
-    // Same unbuilt-plugin check the actual spawn path makes (see
-    // `missing_node_entry_hint`'s doc comment) - without it, this test's
-    // own assertion below fails as "unavailable" != "unavailable"
-    // (`assert_ne!` printing both sides identically, since both are the
-    // same degraded constant), which names nothing about why.
-    let bundled_manifest = bundled_manifest();
-    if let Some(hint) = missing_node_entry_hint(&bundled_manifest.command, &bundled_manifest.args) {
-        panic!("{hint}");
-    }
+fn the_discovered_plugins_are_fingerprintable_from_the_test_binary() {
+    let digest = discovered_fingerprint();
 
-    let bundled = bundled_fingerprint();
-
-    assert_ne!(
-        bundled, FINGERPRINT_UNAVAILABLE,
-        "the test binary's own plugin build must be readable - `cargo test` builds it"
-    );
-    assert_eq!(bundled.len(), FINGERPRINT_HEX_CHARS);
-    assert!(bundled.chars().all(|c| c.is_ascii_hexdigit()), "{bundled} must be hex");
+    assert_ne!(digest, FINGERPRINT_UNAVAILABLE, "the checkout's plugins must be discoverable");
+    assert_eq!(digest.len(), FINGERPRINT_HEX_CHARS);
+    assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{digest} must be hex");
 }
 
-/// A compiled `.js` entry point needs `node` in front of it, and the
-/// argument order has to be exactly what a shell would have written -
-/// this is the shape every existing install and every test that sets
-/// [`PLUGIN_PATH_ENV`] depends on.
-#[test]
-fn a_javascript_entry_point_is_launched_through_node() {
-    let entry = Path::new("/somewhere/plugins/typescript/dist/src/index.js");
-
-    let (command, args) = launch_command_for(entry);
-
-    assert_eq!(command, PathBuf::from("node"), "a script needs an interpreter");
-    assert_eq!(args, vec![entry.to_string_lossy().into_owned()]);
-}
-
-/// The single-executable build (`scripts/bundle-plugin.sh`) carries its own
-/// runtime, so naming an interpreter would both be wrong and reintroduce
-/// the Node.js dependency the whole bundle exists to remove.
-#[test]
-fn a_self_contained_plugin_executable_is_launched_directly() {
-    let entry = Path::new("/opt/g-mesh/plugins/typescript/g-mesh-plugin-typescript");
-
-    let (command, args) = launch_command_for(entry);
-
-    assert_eq!(command, entry, "the executable is its own command");
-    assert!(args.is_empty(), "nothing is prepended to a native executable's argv");
-}
-
-/// Windows names the same artifact with an extension, which must not be
-/// mistaken for a script.
-#[test]
-fn a_windows_plugin_executable_is_launched_directly_too() {
-    let (command, args) =
-        launch_command_for(Path::new(r"C:\g-mesh\plugins\typescript\g-mesh-plugin-typescript.exe"));
-
-    assert!(args.is_empty(), "{command:?} took interpreter arguments it should not have");
-    assert_ne!(command, PathBuf::from("node"));
-}
-
-/// The dev checkout keeps the behavior it has always had: nothing about
-/// bundling a release may change how `cargo test` and a working tree spawn
-/// the plugin. (Test binaries live in the workspace's
-/// `target/<profile>/deps/`, where no `plugins/` directory exists, so
-/// resolution falls through to the compile-time path.)
-#[test]
-fn a_checkout_still_resolves_to_the_compiled_javascript_entry_point() {
-    let manifest = bundled_manifest();
-
-    assert_eq!(manifest.command, PathBuf::from("node"));
-    assert_eq!(manifest.args.len(), 1);
-    assert!(
-        manifest.args[0].ends_with("index.js"),
-        "expected a compiled JS entry point, got {}",
-        manifest.args[0]
-    );
+/// `plugins/typescript/plugin.toml` as discovery reads it, with its
+/// capabilities reset to the defaults so a test does not depend on which
+/// tiers the plugin turns on. `${G_MESH_BIN_DIR}` resolves to the test
+/// binary's `target/<profile>/`.
+fn typescript_manifest() -> PluginManifest {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript");
+    let manifest = crate::daemon::manifest::read_manifest(&dir)
+        .unwrap_or_else(|err| panic!("plugins/typescript/plugin.toml: {err:#}"));
+    PluginManifest { capabilities: Capabilities::default(), ..manifest }
 }
 
 /// The check `docs/architecture/plugin-modularity.md`'s Interfaces
 /// section adds right after `handshake::perform` succeeds: a manifest
 /// whose declared `language` disagrees with what the live plugin's
 /// handshake actually reports is a hard-fail, naming both values - the
-/// bundled JS/TS plugin's handshake reports `"typescript"` (see
+/// TypeScript plugin's handshake reports `"typescript"` (see
 /// `protocol::types`'s handshake test), so declaring anything else in
 /// the manifest must be refused.
 #[test]
 fn spawning_a_manifest_whose_language_disagrees_with_the_live_handshake_hard_fails_naming_both() {
-    let manifest = PluginManifest { language: "python".to_string(), ..bundled_manifest() };
+    let manifest = PluginManifest { language: "python".to_string(), ..typescript_manifest() };
     let project = tempfile::tempdir().unwrap();
 
     let err = match PluginProcess::spawn(project.path(), &manifest, project.path().join("plugin.pid")) {
@@ -490,8 +471,9 @@ fn a_storage_failure_behind_a_live_plugin_is_returned_and_the_relaunch_lets_the_
     fs::write(&file, GREET).unwrap();
     let conn = index_enforcing_foreign_keys();
 
-    let plugin = PluginProcess::spawn(project.path(), &bundled_manifest(), project.path().join("plugin.pid"))
-        .expect("failed to spawn the JS/TS plugin");
+    let plugin =
+        PluginProcess::spawn(project.path(), &typescript_manifest(), project.path().join("plugin.pid"))
+            .expect("failed to spawn the JS/TS plugin");
     let embedding = EmbeddingPipeline::disabled();
     plugin
         .apply_file_change(&conn, "lib.ts", &embedding, true)
@@ -555,8 +537,9 @@ fn a_refused_query_time_reindex_relaunches_the_plugin_so_the_retry_applies_the_e
         (mtime, hash)
     };
 
-    let plugin = PluginProcess::spawn(project.path(), &bundled_manifest(), project.path().join("plugin.pid"))
-        .expect("failed to spawn the JS/TS plugin");
+    let plugin =
+        PluginProcess::spawn(project.path(), &typescript_manifest(), project.path().join("plugin.pid"))
+            .expect("failed to spawn the JS/TS plugin");
     let embedding = EmbeddingPipeline::disabled();
     assert_eq!(
         plugin.ensure_fresh(&conn, "lib.ts", &embedding, true).unwrap(),

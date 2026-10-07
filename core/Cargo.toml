@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "3.21.0"
+version = "4.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -111,6 +111,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sqlite-vec = "0.1.9"
+# Unpacks per-plugin release archives for `g-mesh plugins install`
+# (src/cli/plugin_install.rs), with `flate2` above for the gzip layer. Already
+# in the tree as `ort-sys`'s build dependency, so this is the same version,
+# not a second resolution.
+tar = "0.4"
 # Hugging Face tokenizers, for the BPE `tokenizer.json` that ships with the
 # embedding model. `progressbar`/`esaxx_fast` are training-side extras we never
 # use; `onig` is kept because the model's ByteLevel pre-tokenizer is regex-based.
@@ -119,7 +124,8 @@ sqlite-vec = "0.1.9"
 tokenizers = { version = "=0.23.1", default-features = false, features = ["onig"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 toml = "0.8"
-# The HTTP client behind `g-mesh model fetch` (src/cli/model.rs) - the one and
+# The HTTP client behind `g-mesh model fetch` and `g-mesh plugins install`, both
+# through src/cli/model.rs - the one and
 # only place in this crate that opens a network connection, enforced by a test
 # there. Deliberately not "shell out to curl": the same promise that made ONNX
 # Runtime a static link (see the `ort` pin above - "one binary with no runtime
@@ -179,9 +185,3 @@ dirs = "5"
 rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }
 tempfile = "3"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
-
-[build-dependencies]
-# `build.rs` digests the JS/TS plugin's build inputs (ts_build_stamp.rs) to
-# skip an unchanged `npm run build`. Same version as the normal
-# dependency, so the lockfile gains no second copy.
-sha2 = "0.10"

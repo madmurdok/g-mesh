@@ -15,6 +15,8 @@ pub(crate) enum HintKey {
     FilesTally,
     WalkComplete,
     SearchHits,
+    UnresolvedRow,
+    SemanticTier,
 }
 
 /// The once-per-session sentences already sent on one connection. Clones
@@ -29,6 +31,27 @@ impl SessionHints {
     pub(crate) fn once(&self, trigger: bool, key: HintKey, sentence: &'static str) -> Option<&'static str> {
         (trigger && self.0.lock().unwrap_or_else(PoisonError::into_inner).insert(key)).then_some(sentence)
     }
+
+    /// What [`Self::once`] would return now, without recording anything: for
+    /// measuring a candidate response before the one that is sent.
+    pub(crate) fn peek(&self, trigger: bool, key: HintKey, sentence: &'static str) -> Option<&'static str> {
+        (trigger && !self.0.lock().unwrap_or_else(PoisonError::into_inner).contains(&key)).then_some(sentence)
+    }
+
+    /// [`Self::once`] when `send`, otherwise [`Self::peek`].
+    pub(crate) fn offer(
+        &self,
+        send: bool,
+        trigger: bool,
+        key: HintKey,
+        sentence: &'static str,
+    ) -> Option<&'static str> {
+        if send {
+            self.once(trigger, key, sentence)
+        } else {
+            self.peek(trigger, key, sentence)
+        }
+    }
 }
 
 /// The sentences present, in order, as one `hint` value; `None` when none is.
@@ -37,13 +60,46 @@ pub(crate) fn join(sentences: impl IntoIterator<Item = Option<&'static str>>) ->
     (!present.is_empty()).then(|| present.join(" "))
 }
 
+/// `hint` with `sentence` appended, for a page whose `provenance` is only
+/// known after its `hint` was first assembled.
+pub(crate) fn append(hint: Option<String>, sentence: Option<&'static str>) -> Option<String> {
+    match (hint, sentence) {
+        (Some(hint), Some(sentence)) => Some(format!("{hint} {sentence}")),
+        (hint, sentence) => hint.or_else(|| sentence.map(str::to_string)),
+    }
+}
+
 pub(crate) const ALL_UNRESOLVED: &str =
     "allUnresolved: the linker confirmed none of these rows, so check each in its own file before \
      relying on it; the rest of the project needs no search.";
 
+/// Moved out of the instructions (ADR 0022): it is only needed once a row
+/// says `resolved: false`.
+pub(crate) const UNRESOLVED_ROW: &str =
+    "`resolved: false`: the linker could not confirm this cross-file edge (whether that file exports \
+     the name); every same-file edge is `resolved: true`, never a reason to grep.";
+
+/// Explains `mcp::provenance`'s field, which the instructions no longer
+/// describe per language (ADR 0022, section 2).
+pub(crate) const PROVENANCE: &str =
+    "`provenance`: this language's semantic pass has not finished, so method calls through a variable \
+     receiver may be missing here; ask again later or grep for them.";
+
 pub(crate) const AMBIGUOUS: &str =
     "Several declarations have this name: re-query with the right candidate's `id` as `symbol_id`, \
      not its qualifiedName, and treat that answer as final without grepping to reconfirm it.";
+
+/// `AMBIGUOUS` for a page whose candidates carry their source: every reading
+/// is already answered, so the follow-up is needed only for a cut body.
+pub(crate) const AMBIGUOUS_SOURCED: &str =
+    "Several declarations have this name, each with its source; none is preferred. Pick by reading; \
+     re-query an `id` as `symbol_id` only for a source with `omittedLines`.";
+
+/// `AMBIGUOUS_SOURCED` for a page where some candidates could not be given
+/// their source: those, like a cut body, need the follow-up.
+pub(crate) const AMBIGUOUS_PARTLY_SOURCED: &str =
+    "Several declarations have this name, some with their source; none is preferred. Re-query an `id` \
+     as `symbol_id` for one without `source` or with `omittedLines`.";
 
 pub(crate) const FILE_ROW: &str =
     "A `kind: File` row is a usage outside any tracked symbol, so the file itself is the answer; \
@@ -168,7 +224,11 @@ mod tests {
         let causes = ["maxDepth", "maxFanout", "explorationBudget", "responseSize"];
         let mut all = vec![
             ALL_UNRESOLVED,
+            UNRESOLVED_ROW,
+            PROVENANCE,
             AMBIGUOUS,
+            AMBIGUOUS_SOURCED,
+            AMBIGUOUS_PARTLY_SOURCED,
             FILE_ROW,
             FILES_TALLY,
             WALK_COMPLETE,

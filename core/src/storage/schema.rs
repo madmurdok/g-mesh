@@ -1,7 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::languages::LanguageOutcome;
 
 /// Bumped whenever the DDL below changes in a way that isn't backward
 /// compatible. No migration framework in v1 - a mismatch means a full
@@ -77,7 +79,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// placeholder a usage edge was linked from, so a woken placeholder can
 /// re-decide - move or unlink - an edge it already linked. An existing index
 /// has no record of where its linked edges came from, so it is rebuilt.
-pub const CURRENT_SCHEMA_VERSION: &str = "12";
+///
+/// "13" adds the `language_outcome` table (ADR 0021). An empty table reads as
+/// "every language covered", so an existing index is rebuilt rather than left
+/// claiming that until its next walk.
+pub const CURRENT_SCHEMA_VERSION: &str = "13";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -270,7 +276,7 @@ CREATE TABLE IF NOT EXISTS declarations (
 -- one, which is every edge the structural pass produces and every edge whose
 -- target has a single declaration - i.e. almost all of them. Set only on
 -- CALLS, only by the semantic pass, and part of the edge's own identity (see
--- `edgeIdFor` in plugins/typescript/src/extract.ts), so one caller calling two
+-- `edge_id` in plugins/sdk/src/ids.rs), so one caller calling two
 -- overloads of the same function stores both bindings instead of one
 -- overwriting the other.
 -- `source` was the two-value pair `'tree-sitter' | 'ts-compiler'` through
@@ -365,7 +371,7 @@ CREATE TABLE IF NOT EXISTS containers (
 -- `PlaceholderTarget` struct at all - `apply_diff` fills it from the
 -- placeholder node's own `filePath`, which is already the requester's file
 -- by the existing convention (a placeholder's `filePath` is the *importing*
--- file - `importedSymbol` in plugins/typescript/src/extract.ts).
+-- file - `imported_symbol` in plugins/typescript/src/extractor/imports.rs).
 CREATE TABLE IF NOT EXISTS placeholder_targets (
     nodeId        TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
     scopeKind     TEXT NOT NULL CHECK (scopeKind IN ('file', 'container')),
@@ -458,6 +464,20 @@ CREATE TABLE IF NOT EXISTS language_state (
     semanticPassAt    TEXT,
     pluginFingerprint TEXT,
     semanticPassError TEXT
+);
+
+-- One row per language the last bulk walk had an outcome for (ADR 0021):
+-- every discovered language, plus every catalogue language without a plugin
+-- that has files in the project. Rewritten whole by each walk
+-- (`record_language_outcomes`); incremental updates leave it alone. An
+-- `indexed` row stores no count: `language_outcomes` reads it live from the
+-- `File` nodes.
+CREATE TABLE IF NOT EXISTS language_outcome (
+    language   TEXT PRIMARY KEY,
+    outcome    TEXT NOT NULL CHECK (outcome IN ('indexed', 'plugin_absent', 'failed')),
+    files      INTEGER, -- plugin_absent only; NULL = not counted
+    error      TEXT,    -- failed only
+    recordedAt TEXT NOT NULL
 );
 
 -- bulkIndexedAt is NULL until a full project walk has completed at least
@@ -693,11 +713,9 @@ fn present_languages(conn: &Connection) -> Result<Vec<String>> {
 }
 
 /// [`present_languages`], each paired with whether that language's
-/// `language_state.semanticPassAt` is set - what `mcp::instructions` reads
-/// (GM-262) to decide, per present language, whether a `receiver_calls`
-/// capability that depends on a completed semantic pass
-/// (`daemon::manifest::Capabilities::receiver_calls`, gated on
-/// `receiver_calls_structural` being unresolved) still names an open gap.
+/// `language_state.semanticPassAt` is set. `mcp::instructions` reads only
+/// the languages: its text is rendered from manifest capabilities, never
+/// from pass state (ADR 0022).
 ///
 /// `pub` rather than folded into a private helper: this is read from
 /// `mcp::mod::GMeshMcpServer::get_info`, a synchronous trait method with a
@@ -837,6 +855,73 @@ pub fn record_bulk_index(conn: &Connection) -> Result<()> {
     };
     conn.execute(sql, []).context("failed to record bulkIndexedAt")?;
     Ok(())
+}
+
+/// Replaces every recorded language outcome with `outcomes`, in one
+/// savepoint. An `Indexed` row stores no count ([`language_outcomes`] reads
+/// it live).
+pub fn record_language_outcomes(
+    conn: &Connection,
+    outcomes: &BTreeMap<String, LanguageOutcome>,
+) -> Result<()> {
+    in_savepoint(conn, || {
+        conn.execute("DELETE FROM language_outcome", []).context("failed to clear the language outcomes")?;
+        let mut insert = conn
+            .prepare_cached(
+                "INSERT INTO language_outcome (language, outcome, files, error, recordedAt)
+                 VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)",
+            )
+            .context("failed to prepare the language outcome insert")?;
+        for (language, outcome) in outcomes {
+            let (kind, files, error) = match outcome {
+                LanguageOutcome::Indexed { .. } => ("indexed", None, None),
+                LanguageOutcome::PluginAbsent { files } => {
+                    ("plugin_absent", files.map(|n| i64::try_from(n).unwrap_or(i64::MAX)), None)
+                }
+                LanguageOutcome::Failed { error } => ("failed", None, Some(error.as_str())),
+            };
+            insert
+                .execute(params![language, kind, files, error])
+                .with_context(|| format!("failed to record {language}'s outcome"))?;
+        }
+        Ok(())
+    })
+}
+
+/// Every recorded outcome, sorted by language. `Indexed { files }` is the
+/// live `File`-node count. Empty before any walk has recorded outcomes.
+pub fn language_outcomes(conn: &Connection) -> Result<Vec<(String, LanguageOutcome)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT o.language, o.outcome, o.files, o.error,
+                    (SELECT COUNT(*) FROM nodes n WHERE n.kind = 'File' AND n.language = o.language)
+             FROM language_outcome o ORDER BY o.language",
+        )
+        .context("failed to prepare the language outcome query")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .context("failed to query the language outcomes")?;
+    let mut outcomes = Vec::new();
+    for row in rows {
+        let (language, kind, files, error, live_files) = row.context("failed to read a language outcome")?;
+        let to_usize = |n: i64| usize::try_from(n).unwrap_or(0);
+        let outcome = match kind.as_str() {
+            "indexed" => LanguageOutcome::Indexed { files: to_usize(live_files) },
+            "plugin_absent" => LanguageOutcome::PluginAbsent { files: files.map(to_usize) },
+            "failed" => LanguageOutcome::Failed { error: error.unwrap_or_default() },
+            other => anyhow::bail!("unknown language outcome {other:?} for {language}"),
+        };
+        outcomes.push((language, outcome));
+    }
+    Ok(outcomes)
 }
 
 /// Marks `language`'s workspace reindex as started, replacing an older mark.
@@ -1262,7 +1347,8 @@ fn wipe(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS qualified_suffixes; DROP TABLE IF EXISTS untyped_calls; \
          DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files; \
          DROP TABLE IF EXISTS language_state; DROP TABLE IF EXISTS pending_reindex; \
-         DROP TABLE IF EXISTS semantic_pending; DROP TABLE IF EXISTS semantic_pending_files;",
+         DROP TABLE IF EXISTS semantic_pending; DROP TABLE IF EXISTS semantic_pending_files; \
+         DROP TABLE IF EXISTS language_outcome;",
     )
     .context("failed to wipe schema")
 }

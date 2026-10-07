@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use g_mesh_wire::{
     EdgeKind, FileChangeDiff, NodeKind, PlaceholderTarget, Position, Range, SourceTier, TargetKey,
-    TargetScope, WireEdge, WireNode,
+    TargetScope, WireDeclaration, WireEdge, WireNode,
 };
 use serde_json::{json, Value};
 
 use super::client::{LspClient, Poll, CONTENT_MODIFIED};
-use super::config::SemanticConfig;
+use super::config::{OverloadDisambiguation, SemanticConfig};
 use super::position::{file_uri, line_text, path_from_uri, without_verbatim_prefix, PositionEncoding};
 use crate::graph::{EdgeSpec, FileGraphBuilder, OpenSite, OpenSiteKind, PlaceholderKind};
 use crate::index::SdkIndex;
@@ -96,8 +96,33 @@ use crate::semantic::{SemanticAnswer, SemanticEngine};
 /// - **`readiness` (10 minutes) and `settle` (2s).** See [`LspBridge`]'s doc
 ///   on readiness. The readiness wait is *inside* the pass budget too, so a
 ///   server that never loads costs a pass rather than a plugin.
+/// - **`warm_up` (off).** A longer budget for a server's *first* question,
+///   for a server that holds every answer until it has loaded the project the
+///   question's file belongs to and reports no progress while it does - so
+///   readiness cannot see the load, and the first questions meet it instead.
+///   GM-325 measured vtsls with one tsserver (`useSyntaxServer = "never"`):
+///   12.8-33 s of loading on excalidraw, during which every request in flight
+///   timed out at `request`, so every cold pass was incomplete and re-run on
+///   the next daemon start. While it is owed, `run_pass` keeps **one**
+///   question in flight, under this budget instead of `request`; the first
+///   answer, refusal or timeout spends it, and the pipeline fills to
+///   `concurrency` under `request` as usual. One question rather than eight
+///   under the long budget because a server that is loading answers none of
+///   them sooner, and a server that never answers then costs one warm-up
+///   rather than eight. Spent once per *server process*
+///   (`LspClient::warmed_up`): a restarted server is cold again and owes a
+///   new one; a pass on a warm server never pays it. A warm-up that times out
+///   fails its question exactly as `request` would - the pass is incomplete
+///   and the file owed - and is not re-armed, so a server that never answers
+///   costs one long wait, not one per question or per pass. It sits *inside*
+///   the pass deadline like everything else, after `readiness`: a deferred
+///   empty answer still waits for `settle`, and the warm-up question's own
+///   empty answer counts as an answer (the server is responsive). `None` - the
+///   default - is exactly the behaviour before it existed. The one value a
+///   plugin sets ([`LspBridge::warm_up`]), because how long a server takes to
+///   load a project is a fact about that server.
 ///
-/// None of these is configuration. They are this type's fields so a test can
+/// None of these is configuration, `warm_up` aside. They are this type's fields so a test can
 /// drive a real timer with small values instead of faking the clock, which is
 /// the same escape hatch `RoundTripTimeouts` documents for core's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +146,10 @@ pub struct Budgets {
     /// How long to wait for a server to report *any* progress before deciding
     /// it is one that never does.
     pub settle: Duration,
+    /// How long a server's first question may take, if longer than
+    /// `request`; see this type's doc. `None` gives the first question
+    /// `request` like every other.
+    pub warm_up: Option<Duration>,
 }
 
 impl Default for Budgets {
@@ -134,6 +163,7 @@ impl Default for Budgets {
             single_file: Duration::from_secs(90),
             readiness: Duration::from_secs(10 * 60),
             settle: Duration::from_secs(2),
+            warm_up: None,
         }
     }
 }
@@ -159,7 +189,9 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// # What it asks, and for what
 ///
 /// - **Every open site** except [`OpenSiteKind::Implementation`] gets
-///   `textDocument/definition` at the site's own position. The location that
+///   `textDocument/definition` at the site's own position (an
+///   [`OpenSiteKind::OverloadCall`] only when its target is overloaded, and
+///   perhaps a `hover` hop - see "Overload binding" below). The location that
 ///   comes back is mapped through [`SdkIndex::node_at`] to the node the
 ///   structural tier already emitted for that declaration, and the answer is
 ///   recorded the way every cross-file answer in this design is recorded: a
@@ -221,6 +253,60 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// anyway. The bridge therefore counts these sites and says so rather than
 /// inventing an answer. See `docs/architecture/multi-language-plugins.md`'s
 /// "Implementation notes (GM-290)" for the argument in full.
+///
+/// # Overload binding
+///
+/// An [`OpenSiteKind::OverloadCall`] site **refines** a structural `CALLS`
+/// edge that is right about the function and silent about which of its
+/// overloads the call binds. The answer never moves the call: it either names
+/// one of the target's `declarations` by ordinal, or leaves the structural
+/// edge exactly as it was. The rule and its reasons are
+/// `docs/adr/0024-semantic-tier-refines-by-binding-a-declaration.md`.
+///
+/// - **Filter.** A site is asked only when its `replaces` edge lands on a
+///   node with `declarations`, or on a placeholder whose key names one
+///   anywhere in the index. Every other site's structural edge is already the
+///   whole answer, and is not counted unanswerable.
+/// - **Step 1, containment.** `definition` at the call; every location is
+///   mapped to the tightest declaration range that contains it
+///   ([`declaration_at`]), falling back to [`node_at`]. Locations on two
+///   nodes, or on a node the structural edge does not land on, bind nothing.
+/// - **Step 2.** One ordinal binds (a server that answers with the bound
+///   overload: tsserver).
+/// - **Step 3, hover.** Several ordinals bind only when the manifest sets
+///   `overload_disambiguation = "hover"`: `hover` at the call and at each
+///   bodiless candidate's name (cached per pass), normalised, compared equal
+///   or equal once the candidate's first parameter is dropped (a bound
+///   receiver). Exactly one match binds (pyright, whose `definition` returns
+///   the whole set whatever the call binds). Zero or several bind nothing:
+///   the hover path fails closed.
+/// - **Step 4.** A declaration with a body is never bound in a set that has
+///   bodiless ones.
+///
+/// A bound site records a `CALLS` edge onto the usual placeholder, with
+/// `toDeclaration` set and the ordinal hashed into its id, so two overloads
+/// called from one caller are two edges. The structural edge is settled **all
+/// or nothing**: retracted only when every `OverloadCall` site naming it in a
+/// finished file bound; otherwise re-sent (R1) and every bound edge onto it
+/// dropped. R2 does not apply (the answer always lands on the structural
+/// target), and R3 never drops a bound edge. Bound edges are remembered like
+/// any other, so a deleted call's binding is retracted by the next pass.
+///
+/// An untyped receiver call (`ReceiverCall`, no `replaces`) whose answer lands
+/// on an overload set goes through steps 1-4 too, and records its edge with
+/// the ordinal when one binds and without it when none does.
+///
+/// # Re-export hops
+///
+/// A [`OpenSiteKind::Reference`] site with `replaces` names a structural edge
+/// onto a `pending_symbol` placeholder addressed by file and bare name - a use
+/// that hops through a re-export or a default import. It is asked only while
+/// that file is in the index and declares nothing of that name itself, and
+/// not at all when an `OverloadCall` at the same call was kept as an overload
+/// question. Its answer goes through the ordinary `definition` rules: one that
+/// lands elsewhere contradicts the structural edge, an empty or ambiguous one
+/// upholds it (R1). The design is
+/// `docs/architecture/gm-325-typescript-lsp-semantics.md`, section 4.3.
 ///
 /// # Readiness (decision 4)
 ///
@@ -376,6 +462,10 @@ const MAX_SERVER_STARTS: u32 = 4;
 ///   `replaces` exists instead.
 pub struct LspBridge {
     language: String,
+    /// `(extension, languageId)` pairs for a `didOpen` - see
+    /// [`LspBridge::language_ids`]. A file no pair matches is opened as
+    /// `language`.
+    language_ids: &'static [(&'static str, &'static str)],
     root: PathBuf,
     /// The project root with symlinks resolved. A server reports absolute
     /// paths, and on macOS `$TMPDIR` is `/var/folders/…`, a symlink to
@@ -449,6 +539,28 @@ impl LspBridge {
         Self::with_budgets(language, root, config, Budgets::default())
     }
 
+    /// Opens each file whose name ends with one of the `(extension,
+    /// languageId)` pairs' extensions under that `languageId`, and every other
+    /// file under the bridge's language.
+    ///
+    /// A server may parse a document by its `languageId` rather than by its
+    /// file name: tsserver reads `typescriptreact` as TSX, and a `.tsx` file
+    /// opened as `typescript` is parsed without JSX.
+    pub fn language_ids(mut self, by_extension: &'static [(&'static str, &'static str)]) -> Self {
+        self.language_ids = by_extension;
+        self
+    }
+
+    /// Gives each server's first question `budget` instead of
+    /// [`Budgets::request`] - see [`Budgets`]'s `warm_up`. For a server that
+    /// answers nothing while it loads a project and reports no progress for
+    /// the load.
+    #[must_use]
+    pub fn warm_up(mut self, budget: Duration) -> Self {
+        self.budgets.warm_up = Some(budget);
+        self
+    }
+
     /// [`LspBridge::new`] with budgets a test can make small - see
     /// [`Budgets`].
     pub fn with_budgets(language: &str, root: &Path, config: SemanticConfig, budgets: Budgets) -> Self {
@@ -457,6 +569,7 @@ impl LspBridge {
             .unwrap_or_else(|_| root.to_path_buf());
         Self {
             language: language.to_string(),
+            language_ids: &[],
             root: root.to_path_buf(),
             real_root,
             config,
@@ -592,7 +705,8 @@ impl LspBridge {
         root: &Path,
         index: &SdkIndex,
         scope: &BTreeSet<RelPath>,
-        language_id: &str,
+        language: &str,
+        language_ids: &[(&str, &str)],
     ) {
         for path in scope {
             let Some(entry) = index.entry(path) else { continue };
@@ -624,7 +738,7 @@ impl LspBridge {
                         json!({
                             "textDocument": {
                                 "uri": uri,
-                                "languageId": language_id,
+                                "languageId": language_id(path, language, language_ids),
                                 "version": 1,
                                 "text": entry.source,
                             }
@@ -724,13 +838,58 @@ enum Ask {
     /// pass over the trait re-derives its implementors, and a pass over some
     /// implementor's file has no idea the sweep ever happened.
     Implementor { anchor: String, for_file: RelPath },
+    /// An [`OpenSiteKind::OverloadCall`] site: which declarations of the
+    /// call's overload set does the server say it reaches - see
+    /// [`LspBridge`]'s doc on overload binding.
+    Overload(OpenSite),
+    /// The second hop of an overload answer the server did not narrow to one
+    /// declaration: `hover` at the call, or at one candidate declaration's
+    /// name. `pending` indexes [`Answers::pending`], which joins the hops.
+    ///
+    /// `for_file` is the *call's* file. A candidate's hover is asked in the
+    /// file that declares it, but it is part of the call's answer: it is that
+    /// file whose pass falls short when the hover does, and a declaring file
+    /// is not covered just because a call elsewhere asked about one of its
+    /// names.
+    OverloadHover { pending: usize, at: Hovered, for_file: RelPath },
+}
+
+/// Where an [`Ask::OverloadHover`] is asked.
+#[derive(Debug, Clone)]
+enum Hovered {
+    /// At the call - what the server says the call binds.
+    Call,
+    /// At the name of declaration `ordinal` of `node` - what that overload
+    /// looks like through the same printer.
+    Candidate { node: String, ordinal: u32 },
 }
 
 impl Question {
     fn method(&self) -> &'static str {
         match self.ask {
-            Ask::Definition(_) | Ask::Implementor { .. } => "textDocument/definition",
+            Ask::Definition(_) | Ask::Implementor { .. } | Ask::Overload(_) => "textDocument/definition",
             Ask::Implementation { .. } => "textDocument/implementation",
+            Ask::OverloadHover { .. } => "textDocument/hover",
+        }
+    }
+
+    /// The file this question's outcome is accounted to: the one that is not
+    /// covered when it goes unanswered, and that is covered when it is. Its
+    /// own document, except for a candidate hover - see
+    /// [`Ask::OverloadHover`].
+    fn accounted_to(&self) -> &RelPath {
+        match &self.ask {
+            Ask::OverloadHover { for_file, .. } => for_file,
+            _ => &self.file,
+        }
+    }
+
+    /// Whether `result` says nothing - the answer a busy server gives, which
+    /// `run_pass` re-asks once after the server settles.
+    fn is_empty_answer(&self, result: &Value) -> bool {
+        match self.ask {
+            Ask::OverloadHover { .. } => hover_text(result).is_none(),
+            _ => locations(result).is_empty(),
         }
     }
 }
@@ -781,19 +940,60 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
     let mut asking: Vec<Question> = Vec::new();
     let mut unanswerable = 0usize;
     let mut truncated = false;
+    // Built on the first `OverloadCall` site, once per pass.
+    let mut overloaded: Option<Overloaded> = None;
     for path in scope {
         let Some(entry) = index.entry(path) else { continue };
         let mut for_file = Vec::new();
         let mut skipped = 0usize;
+        let mut kept_overloads: HashSet<(String, u32, u32)> = HashSet::new();
         for site in &entry.graph.open_sites {
-            if site.kind == OpenSiteKind::Implementation {
-                skipped += 1;
-                continue;
-            }
-            for_file.push(Question {
-                file: path.clone(),
-                position: site.position,
-                ask: Ask::Definition(site.clone()),
+            let ask = match site.kind {
+                OpenSiteKind::Implementation => {
+                    skipped += 1;
+                    continue;
+                }
+                OpenSiteKind::OverloadCall => {
+                    // Only a call whose structural target really is an
+                    // overload set is worth a question: a plugin records the
+                    // site for every call it cannot rule out. A dropped site
+                    // is not unanswerable - its structural edge is the whole
+                    // answer - and neither is one without the `replaces` this
+                    // kind requires, which has nothing to refine.
+                    let Some(replaced) = &site.replaces else { continue };
+                    let overloaded = overloaded.get_or_insert_with(|| Overloaded::of(index));
+                    if !overloaded.targets(&entry.graph, replaced) {
+                        continue;
+                    }
+                    kept_overloads.insert(site_key(site));
+                    Ask::Overload(site.clone())
+                }
+                OpenSiteKind::Reference if site.replaces.is_some() => {
+                    // A hop through a re-export or a default import: asked
+                    // only while its placeholder is one the linker cannot
+                    // settle on its own. Like a dropped overload call, a
+                    // site not asked is not unanswerable - its structural
+                    // edge stands as the answer.
+                    let replaced = site.replaces.as_deref().unwrap_or_default();
+                    if !unsettled_hop(index, &entry.graph, replaced) {
+                        continue;
+                    }
+                    Ask::Definition(site.clone())
+                }
+                OpenSiteKind::ReceiverCall | OpenSiteKind::Reference => Ask::Definition(site.clone()),
+            };
+            for_file.push(Question { file: path.clone(), position: site.position, ask });
+        }
+        // One question per call: a hop site at a call already kept as an
+        // overload question is dropped, because the overload binding is the
+        // stronger answer and two answers for one edge would leave two rows.
+        // After the loop, so the order sites were recorded in does not matter.
+        if !kept_overloads.is_empty() {
+            for_file.retain(|question| match &question.ask {
+                Ask::Definition(site) if site.kind == OpenSiteKind::Reference && site.replaces.is_some() => {
+                    !kept_overloads.contains(&site_key(site))
+                }
+                _ => true,
             });
         }
         if !config.implementation_kinds.is_empty() {
@@ -823,6 +1023,83 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
         asking.append(&mut for_file);
     }
     Questions { asking, unanswerable, truncated }
+}
+
+/// The `languageId` `path` is opened under: the first of `language_ids`
+/// whose extension the path ends with, else `language`.
+fn language_id<'a>(path: &RelPath, language: &'a str, language_ids: &[(&str, &'a str)]) -> &'a str {
+    language_ids
+        .iter()
+        .find(|(extension, _)| path.as_str().ends_with(extension))
+        .map_or(language, |(_, id)| id)
+}
+
+/// Where a site is, as [`questions`] matches an overload call with a hop
+/// site at the same call: the enclosing node and the name's position.
+fn site_key(site: &OpenSite) -> (String, u32, u32) {
+    (site.from_id.clone(), site.position.line, site.position.col)
+}
+
+/// Whether structural edge `replaced` of `graph` is a hop the linker cannot
+/// settle, so a [`OpenSiteKind::Reference`] site naming it is worth a
+/// question: the edge lands on a `pending_symbol` placeholder addressed by
+/// file `f` and bare name `n`, `f` is in the index, and `f` itself declares
+/// nothing named `n`. A file that does declare `n` is where the linker lands
+/// the edge already; what is left is `n` re-exported from elsewhere, or
+/// `default`.
+fn unsettled_hop(index: &SdkIndex, graph: &crate::graph::FileGraph, replaced: &str) -> bool {
+    let Some(edge) = graph.edges.iter().find(|edge| edge.id == replaced) else { return false };
+    let Some(placeholder) = graph.nodes.iter().find(|node| node.id == edge.to_id) else { return false };
+    if placeholder.native_kind.as_deref() != Some(PlaceholderKind::PendingSymbol.native_kind()) {
+        return false;
+    }
+    let Some(target) = &placeholder.target else { return false };
+    let (TargetScope::File(file), TargetKey::Name(name)) = (&target.scope, &target.key) else { return false };
+    let Some(declaring) = index.entry(&RelPath::new(file)) else { return false };
+    !declaring.graph.nodes.iter().any(|node| node.name == *name && is_addressable(node))
+}
+
+/// The declarations an [`OpenSiteKind::OverloadCall`] site may be bound to,
+/// as the filter in [`questions`] reads them: every node of the index that
+/// carries `declarations`, by id, and by the two keys a placeholder can wait
+/// on.
+struct Overloaded {
+    ids: HashSet<String>,
+    names: HashSet<String>,
+    qualified: HashSet<String>,
+}
+
+impl Overloaded {
+    fn of(index: &SdkIndex) -> Self {
+        let mut overloaded = Self { ids: HashSet::new(), names: HashSet::new(), qualified: HashSet::new() };
+        for (_, entry) in index.files() {
+            for node in entry.graph.nodes.iter().filter(|node| node.declarations.is_some()) {
+                overloaded.ids.insert(node.id.clone());
+                overloaded.names.insert(node.name.clone());
+                overloaded.qualified.insert(node.qualified_name.clone());
+            }
+        }
+        overloaded
+    }
+
+    /// Whether structural edge `replaced` of `graph` lands on an overload
+    /// set: a node that carries `declarations`, or a placeholder whose key
+    /// names one somewhere in the index.
+    fn targets(&self, graph: &crate::graph::FileGraph, replaced: &str) -> bool {
+        let Some(edge) = graph.edges.iter().find(|edge| edge.id == replaced) else { return false };
+        if self.ids.contains(&edge.to_id) {
+            return true;
+        }
+        graph
+            .nodes
+            .iter()
+            .find(|node| node.id == edge.to_id)
+            .and_then(|node| node.target.as_ref())
+            .is_some_and(|target| match &target.key {
+                TargetKey::Name(name) => self.names.contains(name),
+                TargetKey::QualifiedName(qualified) => self.qualified.contains(qualified),
+            })
+    }
 }
 
 /// Where a declaration's *name* starts, for a request that has to land on an
@@ -858,6 +1135,41 @@ fn name_position(source: &str, node: &WireNode) -> Position {
         }
     }
     node.range.start
+}
+
+/// Where `name` is written inside one of an overload set's declarations, for
+/// a `hover` that has to land on it.
+///
+/// [`name_position`]'s search with one difference: the match must be a whole
+/// identifier. A declaration's range includes its decorators, and a function
+/// called `load` must not be found inside `@overload`. `None` when the name is
+/// not there, which leaves that candidate without a hover and so unmatched.
+fn declaration_name_position(source: &str, name: &str, declaration: &WireDeclaration) -> Option<Position> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    if name.is_empty() {
+        return None;
+    }
+    let width = name.chars().count();
+    for line in declaration.start_line..=declaration.end_line.max(declaration.start_line) {
+        let chars: Vec<char> = line_text(source, line).chars().collect();
+        let from = if line == declaration.start_line { declaration.start_col as usize } else { 0 };
+        let to = if line == declaration.end_line {
+            (declaration.end_col as usize).min(chars.len())
+        } else {
+            chars.len()
+        };
+        let mut col = from;
+        while col + width <= to {
+            let here: String = chars[col..col + width].iter().collect();
+            let before = col.checked_sub(1).map(|at| chars[at]);
+            let after = chars.get(col + width).copied();
+            if here == name && !before.is_some_and(word) && !after.is_some_and(word) {
+                return Some(Position { line, col: col as u32 });
+            }
+            col += 1;
+        }
+    }
+    None
 }
 
 // --- the pass ---------------------------------------------------------------
@@ -907,6 +1219,44 @@ struct Answers {
     /// this pass got an answer for, by `(from_id, name)` - see
     /// [`untyped_call_answered`] and [`trim_untyped_calls`] (GM-486).
     untyped_answered: HashMap<(String, String), usize>,
+    /// How this server's overload answers are narrowed - the manifest's
+    /// `overload_disambiguation`.
+    disambiguation: OverloadDisambiguation,
+    /// Bound [`OpenSiteKind::OverloadCall`] sites, by the structural edge
+    /// they refine: the site's position, and the bound edge it recorded. A
+    /// site of that edge that is missing here was left unbound, or never
+    /// answered - and either keeps the structural edge (all or nothing, see
+    /// [`Answers::settle`]).
+    overload_bound: BTreeMap<String, BTreeMap<(u32, u32), String>>,
+    /// Overload answers waiting on their `hover` hop, by
+    /// [`Ask::OverloadHover::pending`]. `None` once concluded.
+    pending: Vec<Option<PendingOverload>>,
+    /// Each candidate declaration's normalised hover, by `(node, ordinal)`,
+    /// for the pass: a set called from fifty places is hovered once. An empty
+    /// string is a hover that said nothing.
+    hovers: HashMap<(String, u32), String>,
+}
+
+/// An overload answer whose candidates only `hover` can tell apart - the
+/// join of its [`Ask::OverloadHover`] questions.
+struct PendingOverload {
+    landing: Landing,
+    candidates: Vec<u32>,
+    /// The call's normalised hover, once answered.
+    call: Option<String>,
+    /// Hover questions still unanswered.
+    waiting: usize,
+}
+
+/// Where an overload answer landed, and the site it answers: everything
+/// [`Answers::conclude`] needs to record the outcome.
+struct Landing {
+    /// The call's file.
+    file: RelPath,
+    site: OpenSite,
+    node_id: String,
+    node_name: String,
+    address: PlaceholderTarget,
 }
 
 /// One semantic edge this pass recorded, waiting for [`Answers::finish`].
@@ -921,19 +1271,26 @@ struct Recorded {
     /// The declaration the placeholder waits on - what R3 compares a re-sent
     /// structural edge's target with.
     declaration: String,
+    /// The ordinal of the declaration the call binds, for a bound overload
+    /// call - written to `toDeclaration`, and part of the edge's id.
+    to_declaration: Option<u32>,
 }
 
 /// The placeholder id and the edge id an answer from `from_id` onto `target`
 /// gets in `in_file`. One formula for [`Answers::record`] and for the
 /// agreement test in [`record_answer`], so the two cannot drift apart.
+///
+/// `to_declaration` is part of the edge id and not of the placeholder's: two
+/// calls of two overloads from one caller are two edges onto one placeholder.
 fn answer_ids(
     in_file: &RelPath,
     from_id: &str,
     kind: EdgeKind,
     target: &PlaceholderTarget,
+    to_declaration: Option<u32>,
 ) -> (String, String) {
     let placeholder = crate::graph::placeholder_id(in_file, PlaceholderKind::PendingSymbol, target);
-    let edge = crate::ids::edge_id(from_id, kind, &placeholder, None);
+    let edge = crate::ids::edge_id(from_id, kind, &placeholder, to_declaration);
     (placeholder, edge)
 }
 
@@ -1020,6 +1377,10 @@ impl Answers {
             upheld: BTreeSet::new(),
             resend: Vec::new(),
             untyped_answered: HashMap::new(),
+            disambiguation: OverloadDisambiguation::default(),
+            overload_bound: BTreeMap::new(),
+            pending: Vec::new(),
+            hovers: HashMap::new(),
         }
     }
 
@@ -1047,7 +1408,8 @@ impl Answers {
     /// [`Answers::settle`] can still drop it (R3).
     ///
     /// `declaration` is the id of the node the answer landed on, which the
-    /// placeholder addresses.
+    /// placeholder addresses; `to_declaration` the ordinal of the one of its
+    /// declarations a bound overload call binds.
     #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
@@ -1059,6 +1421,7 @@ impl Answers {
         at: Range,
         target: PlaceholderTarget,
         declaration: &str,
+        to_declaration: Option<u32>,
     ) -> String {
         let key = address_key(in_file, &target);
         let placeholder = match self.placeholders.get_mut(&key) {
@@ -1070,14 +1433,14 @@ impl Answers {
                 held.id.clone()
             }
             None => {
-                let (id, _) = answer_ids(in_file, from_id, kind, &target);
+                let (id, _) = answer_ids(in_file, from_id, kind, &target, to_declaration);
                 self.placeholders
                     .insert(key, Placeholder { id: id.clone(), target, name: name.to_string(), range: at });
                 id
             }
         };
 
-        let id = crate::ids::edge_id(from_id, kind, &placeholder, None);
+        let id = crate::ids::edge_id(from_id, kind, &placeholder, to_declaration);
         if !self.edges.insert(id.clone()) {
             return id;
         }
@@ -1088,6 +1451,7 @@ impl Answers {
             kind,
             to_id: placeholder,
             declaration: declaration.to_string(),
+            to_declaration,
         });
         self.by_file.entry(for_file.clone()).or_default().push(id.clone());
         id
@@ -1109,15 +1473,27 @@ impl Answers {
     ///   diff and from `by_file`, so an earlier pass's copy of it is
     ///   retracted.
     ///
+    /// - **Overload binding, all or nothing per edge.** A structural edge
+    ///   that [`OpenSiteKind::OverloadCall`] sites refine is retracted only
+    ///   when *every* such site of it in a finished file bound an ordinal;
+    ///   its bound edges are kept. Otherwise it is re-sent by R1 and every
+    ///   bound edge refining it is dropped, as is every bound edge whose file
+    ///   was not finished. Exempt from R3: an unbound edge never covers a
+    ///   bound one.
+    ///
     /// A file the pass did not finish is not touched: its sites' answers may
     /// be missing, and "no answer" is not "the structural edge stands" until
     /// the question was actually put.
     fn settle(&mut self, index: &SdkIndex, finished: &BTreeSet<RelPath>) {
+        let bound = self.settle_overloads(index, finished);
         let mut seen: HashSet<String> = HashSet::new();
         for file in finished {
             let Some(graph) = index.graph(file) else { continue };
             for site in &graph.open_sites {
                 let Some(replaced) = &site.replaces else { continue };
+                if bound.contains(replaced) {
+                    continue;
+                }
                 if self.contradicted.contains(replaced) && !self.upheld.contains(replaced) {
                     continue;
                 }
@@ -1144,11 +1520,14 @@ impl Answers {
                 lands.entry((from.as_str(), declaration.as_str())).or_default().push(*kind);
             }
         }
+        // A bound overload edge says more than any structural edge onto the
+        // same function: it is never covered.
         let covered = |edge: &Recorded| {
-            ids.contains(edge.id.as_str())
-                || lands
-                    .get(&(edge.from_id.as_str(), edge.declaration.as_str()))
-                    .is_some_and(|kinds| kinds.contains(&edge.kind))
+            edge.to_declaration.is_none()
+                && (ids.contains(edge.id.as_str())
+                    || lands
+                        .get(&(edge.from_id.as_str(), edge.declaration.as_str()))
+                        .is_some_and(|kinds| kinds.contains(&edge.kind)))
         };
         let dropped: HashSet<String> =
             self.recorded.iter().filter(|edge| covered(edge)).map(|edge| edge.id.clone()).collect();
@@ -1159,6 +1538,175 @@ impl Answers {
         for ids in self.by_file.values_mut() {
             ids.retain(|id| !dropped.contains(id));
         }
+    }
+
+    /// The overload half of [`Answers::settle`]: retracts every structural
+    /// edge all of whose [`OpenSiteKind::OverloadCall`] sites in `finished`
+    /// files bound an ordinal, drops every other bound edge, and returns the
+    /// retracted edges - which R1 must then not re-send.
+    fn settle_overloads(&mut self, index: &SdkIndex, finished: &BTreeSet<RelPath>) -> BTreeSet<String> {
+        let mut sites: BTreeMap<&str, Vec<(u32, u32)>> = BTreeMap::new();
+        for file in finished {
+            let Some(graph) = index.graph(file) else { continue };
+            for site in graph.open_sites.iter().filter(|site| site.kind == OpenSiteKind::OverloadCall) {
+                let Some(replaced) = &site.replaces else { continue };
+                sites.entry(replaced.as_str()).or_default().push((site.position.line, site.position.col));
+            }
+        }
+        let bound: BTreeSet<String> = sites
+            .into_iter()
+            .filter(|(replaced, positions)| {
+                self.overload_bound
+                    .get(*replaced)
+                    .is_some_and(|by_site| positions.iter().all(|position| by_site.contains_key(position)))
+            })
+            .map(|(replaced, _)| replaced.to_string())
+            .collect();
+        // One edge id can serve two structural edges (two calls of one
+        // overload from one caller): kept if either is wholly bound.
+        let keep: HashSet<&String> = bound
+            .iter()
+            .filter_map(|replaced| self.overload_bound.get(replaced))
+            .flat_map(|by| by.values())
+            .collect();
+        let dropped: HashSet<String> = self
+            .overload_bound
+            .iter()
+            .filter(|(replaced, _)| !bound.contains(*replaced))
+            .flat_map(|(_, by_site)| by_site.values())
+            .filter(|id| !keep.contains(id))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            self.recorded.retain(|edge| !dropped.contains(&edge.id));
+            for ids in self.by_file.values_mut() {
+                ids.retain(|id| !dropped.contains(id));
+            }
+        }
+        self.retract.extend(bound.iter().cloned());
+        bound
+    }
+
+    /// Records what one overload answer concluded: a bound edge for a bound
+    /// [`OpenSiteKind::OverloadCall`] (booked for [`Answers::settle`]),
+    /// nothing for an unbound one (its structural edge stands), and for a
+    /// receiver call the edge it would have had anyway, with the ordinal when
+    /// there is one.
+    fn conclude(&mut self, landing: Landing, ordinal: Option<u32>) {
+        let site = &landing.site;
+        if site.kind == OpenSiteKind::OverloadCall && ordinal.is_none() {
+            return;
+        }
+        let id = self.record(
+            &landing.file,
+            &landing.file,
+            &site.from_id,
+            site.edge_kind,
+            &landing.node_name,
+            site_range(site.position, &site.name),
+            landing.address.clone(),
+            &landing.node_id,
+            ordinal,
+        );
+        if site.kind == OpenSiteKind::OverloadCall {
+            if let Some(replaced) = &site.replaces {
+                self.overload_bound
+                    .entry(replaced.clone())
+                    .or_default()
+                    .insert((site.position.line, site.position.col), id);
+            }
+        }
+    }
+
+    /// Steps 2-4 of [`LspBridge`]'s overload binding for an answer that
+    /// landed on `node`'s declarations `ordinals`: binds, leaves unbound, or
+    /// returns the `hover` questions that will decide.
+    fn bind_overload(
+        &mut self,
+        index: &SdkIndex,
+        landing: Landing,
+        node: &WireNode,
+        node_file: &RelPath,
+        ordinals: &BTreeSet<u32>,
+    ) -> Vec<Question> {
+        let candidates = match choose_overload(node, ordinals, self.disambiguation) {
+            Choice::Bound(ordinal) => {
+                self.conclude(landing, Some(ordinal));
+                return Vec::new();
+            }
+            Choice::Unbound => {
+                self.conclude(landing, None);
+                return Vec::new();
+            }
+            Choice::Hover(candidates) => candidates,
+        };
+        let pending = self.pending.len();
+        let mut again = vec![Question {
+            file: landing.file.clone(),
+            position: landing.site.position,
+            ask: Ask::OverloadHover { pending, at: Hovered::Call, for_file: landing.file.clone() },
+        }];
+        let source = index.source(node_file).unwrap_or_default();
+        for &ordinal in &candidates {
+            if self.hovers.contains_key(&(node.id.clone(), ordinal)) {
+                continue;
+            }
+            let declaration =
+                node.declarations.iter().flatten().find(|declaration| declaration.ordinal == ordinal);
+            let Some(position) = declaration
+                .and_then(|declaration| declaration_name_position(source, &node.name, declaration))
+            else {
+                // Nowhere to hover: the candidate can never match. Settled now
+                // so it is not asked again for the next call.
+                self.hovers.insert((node.id.clone(), ordinal), String::new());
+                continue;
+            };
+            again.push(Question {
+                file: node_file.clone(),
+                position,
+                ask: Ask::OverloadHover {
+                    pending,
+                    at: Hovered::Candidate { node: node.id.clone(), ordinal },
+                    for_file: landing.file.clone(),
+                },
+            });
+        }
+        self.pending.push(Some(PendingOverload { landing, candidates, call: None, waiting: again.len() }));
+        again
+    }
+
+    /// One `hover` answer of a pending overload; concludes it when it was the
+    /// last one outstanding.
+    fn hovered(&mut self, pending: usize, at: &Hovered, text: Option<String>) {
+        let text = text.unwrap_or_default();
+        let Some(Some(waiting)) = self.pending.get_mut(pending) else { return };
+        match at {
+            Hovered::Call => waiting.call = Some(text),
+            Hovered::Candidate { node, ordinal } => {
+                self.hovers.insert((node.clone(), *ordinal), text);
+            }
+        }
+        waiting.waiting = waiting.waiting.saturating_sub(1);
+        if waiting.waiting > 0 {
+            return;
+        }
+        let Some(done) = self.pending[pending].take() else { return };
+        let call = done.call.unwrap_or_default();
+        let matching: Vec<u32> = done
+            .candidates
+            .iter()
+            .copied()
+            .filter(|ordinal| {
+                self.hovers
+                    .get(&(done.landing.node_id.clone(), *ordinal))
+                    .is_some_and(|declared| hover_matches(declared, &call))
+            })
+            .collect();
+        let ordinal = match matching.as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        };
+        self.conclude(done.landing, ordinal);
     }
 
     fn finish(mut self) -> (FileChangeDiff, BTreeMap<RelPath, Vec<String>>) {
@@ -1178,7 +1726,7 @@ impl Answers {
                 // confirmed until core links it: `resolved` describes what the
                 // edge points at, never who produced it.
                 resolved: false,
-                to_declaration: None,
+                to_declaration: edge.to_declaration,
                 source: SourceTier::Semantic,
                 engine,
             });
@@ -1339,6 +1887,247 @@ fn node_at<'i>(
     is_addressable(node).then_some((path, node))
 }
 
+/// The overload declaration a location points into: the tightest
+/// `declarations` range of any node of its file that contains it, with that
+/// node and the declaration's ordinal.
+///
+/// Not [`node_at`]: a node's own range is not its overload set's extent.
+/// Python's node is the first `@overload` stub, so a server pointing at the
+/// second one lands, by node range, on the enclosing class or file; and
+/// TypeScript's node is the implementation.
+fn declaration_at<'i>(
+    index: &'i SdkIndex,
+    roots: [&Path; 2],
+    encoding: PositionEncoding,
+    location: &ServerLocation,
+) -> Option<(RelPath, &'i WireNode, u32)> {
+    let path = file_at(index, roots, location)?;
+    let at = wire_position(index, &path, encoding, location);
+    let at = (at.line, at.col);
+    let graph = index.graph(&path)?;
+    let mut best: Option<((u32, u32), &WireNode, u32)> = None;
+    for node in graph.nodes.iter().filter(|node| is_addressable(node)) {
+        for declaration in node.declarations.iter().flatten() {
+            let (start, end) = (
+                (declaration.start_line, declaration.start_col),
+                (declaration.end_line, declaration.end_col),
+            );
+            if !(start <= at && at <= end) {
+                continue;
+            }
+            let lines = end.0.saturating_sub(start.0);
+            let span = (lines, if lines == 0 { end.1.saturating_sub(start.1) } else { end.1 });
+            let tighter = best.as_ref().is_none_or(|(held, held_node, held_ordinal)| {
+                (span, &node.id, declaration.ordinal) < (*held, &held_node.id, *held_ordinal)
+            });
+            if tighter {
+                best = Some((span, node, declaration.ordinal));
+            }
+        }
+    }
+    best.map(|(_, node, ordinal)| (path, node, ordinal))
+}
+
+/// Step 1 of overload binding: the one node every location of `found` lands
+/// on, by declaration containment first and node containment otherwise, with
+/// the ordinals of its declarations they land in. `None` when nothing lands
+/// in the index, or two locations land on different nodes (the `agree` rule
+/// of a plain `definition` answer).
+fn overload_landing<'i>(
+    index: &'i SdkIndex,
+    roots: [&Path; 2],
+    encoding: PositionEncoding,
+    found: &[ServerLocation],
+) -> Option<(RelPath, &'i WireNode, BTreeSet<u32>)> {
+    let mut landed: Option<(RelPath, &WireNode, BTreeSet<u32>)> = None;
+    for location in found {
+        let (path, node, ordinal) = match declaration_at(index, roots, encoding, location) {
+            Some((path, node, ordinal)) => (path, node, Some(ordinal)),
+            None => match node_at(index, roots, encoding, location) {
+                Some((path, node)) => (path, node, None),
+                None => continue,
+            },
+        };
+        match &mut landed {
+            Some((_, held, _)) if held.id != node.id => return None,
+            Some((_, _, ordinals)) => ordinals.extend(ordinal),
+            None => landed = Some((path, node, ordinal.into_iter().collect())),
+        }
+    }
+    landed
+}
+
+/// What steps 2-4 of overload binding make of the ordinals an answer landed
+/// in.
+enum Choice {
+    Bound(u32),
+    Unbound,
+    /// Ask `hover` at the call and at each of these.
+    Hover(Vec<u32>),
+}
+
+/// Steps 2-4: exactly one bindable ordinal binds; several go to `hover` when
+/// the manifest allows it and stay unbound otherwise. A declaration with a
+/// body is never bindable in a set that has bodiless ones: no call binds an
+/// implementation, so a server pointing there is answering "the function",
+/// not "the overload".
+fn choose_overload(
+    node: &WireNode,
+    ordinals: &BTreeSet<u32>,
+    disambiguation: OverloadDisambiguation,
+) -> Choice {
+    let Some(declarations) = &node.declarations else { return Choice::Unbound };
+    let stubs = declarations.iter().any(|declaration| !declaration.has_body);
+    let bindable = |ordinal: u32| {
+        declarations
+            .iter()
+            .find(|declaration| declaration.ordinal == ordinal)
+            .is_some_and(|declaration| !(stubs && declaration.has_body))
+    };
+    match ordinals.len() {
+        1 => {
+            let ordinal = *ordinals.iter().next().expect("one ordinal");
+            if bindable(ordinal) {
+                Choice::Bound(ordinal)
+            } else {
+                Choice::Unbound
+            }
+        }
+        0 => Choice::Unbound,
+        _ if disambiguation == OverloadDisambiguation::Hover => {
+            let candidates: Vec<u32> =
+                ordinals.iter().copied().filter(|ordinal| bindable(*ordinal)).collect();
+            if candidates.is_empty() {
+                Choice::Unbound
+            } else {
+                Choice::Hover(candidates)
+            }
+        }
+        _ => Choice::Unbound,
+    }
+}
+
+/// Whether an overload answer agrees with the structural edge its site
+/// refines: the edge lands on `node`, or on a placeholder that waits on it -
+/// one whose id the answer itself would get, or whose key names `node`.
+/// Anything else would move the call to another target, which refining
+/// never does.
+fn refines(index: &SdkIndex, file: &RelPath, site: &OpenSite, replaced: &str, node: &WireNode) -> bool {
+    let Some(graph) = index.graph(file) else { return false };
+    let Some(edge) = graph.edges.iter().find(|edge| edge.id == replaced) else { return false };
+    if edge.to_id == node.id {
+        return true;
+    }
+    let address = address_of(node, site.from_container.clone());
+    let (_, prospective) = answer_ids(file, &site.from_id, site.edge_kind, &address, None);
+    if prospective == replaced {
+        return true;
+    }
+    graph.nodes.iter().find(|held| held.id == edge.to_id).and_then(|held| held.target.as_ref()).is_some_and(
+        |target| match &target.key {
+            TargetKey::Name(name) => name == &node.name,
+            TargetKey::QualifiedName(qualified) => qualified == &node.qualified_name,
+        },
+    )
+}
+
+/// The signature a `hover` result shows, normalised for comparison; `None`
+/// when it shows nothing.
+///
+/// `contents` may be a string, a `MarkupContent`, a `MarkedString` object, or
+/// an array of either. The signature is the first fenced code block when
+/// there is one, and the first paragraph otherwise: what follows is
+/// documentation, which a call and a declaration need not share.
+fn hover_text(result: &Value) -> Option<String> {
+    fn collect(value: &Value, into: &mut Vec<String>) {
+        match value {
+            Value::String(text) => into.push(text.clone()),
+            Value::Array(values) => values.iter().for_each(|value| collect(value, into)),
+            Value::Object(object) => {
+                if let Some(text) = object.get("value").and_then(Value::as_str) {
+                    into.push(text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut parts = Vec::new();
+    collect(result.get("contents")?, &mut parts);
+    let text = parts.join("\n");
+    let signature = match text.find("```") {
+        Some(fence) => {
+            let body = &text[fence + 3..];
+            let body = body.find('\n').map_or("", |newline| &body[newline + 1..]);
+            body.find("```").map_or(body, |end| &body[..end])
+        }
+        None => text.trim().split("\n\n").next().unwrap_or_default(),
+    };
+    let normalised = normalise_hover(signature);
+    (!normalised.is_empty()).then_some(normalised)
+}
+
+/// Whitespace collapsed to single spaces, and none just inside brackets or
+/// before a comma - so a signature a printer wraps over several lines equals
+/// the same signature on one.
+fn normalise_hover(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::with_capacity(collapsed.len());
+    let chars: Vec<char> = collapsed.chars().collect();
+    for (at, &c) in chars.iter().enumerate() {
+        if c == ' ' {
+            let before = out.chars().last();
+            let after = chars.get(at + 1).copied();
+            if matches!(before, Some('(') | Some('[')) || matches!(after, Some(')') | Some(']') | Some(',')) {
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Step 3's match: a candidate declaration's hover equals the call's, or does
+/// once its first parameter is dropped (a method called through a bound
+/// receiver). Two empty hovers never match.
+fn hover_matches(declared: &str, call: &str) -> bool {
+    if declared.is_empty() || call.is_empty() {
+        return false;
+    }
+    declared == call || without_first_parameter(declared).is_some_and(|dropped| dropped == call)
+}
+
+/// `text` with the first parameter of its first parameter list removed - the
+/// first `(` that directly follows an identifier, so a `(method)` prefix is
+/// not taken for one. `None` when there is no list or it is empty.
+fn without_first_parameter(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let open = (1..chars.len())
+        .find(|&at| chars[at] == '(' && (chars[at - 1].is_alphanumeric() || chars[at - 1] == '_'))?;
+    let mut depth = 0usize;
+    let mut comma = None;
+    let mut close = None;
+    for (at, &c) in chars.iter().enumerate().skip(open + 1) {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth > 0 => depth -= 1,
+            ')' => {
+                close = Some(at);
+                break;
+            }
+            ',' if depth == 0 && comma.is_none() => comma = Some(at),
+            _ => {}
+        }
+    }
+    let close = close?;
+    if close == open + 1 {
+        return None;
+    }
+    let rest_from = comma.map_or(close, |comma| comma + 1);
+    let head: String = chars[..=open].iter().collect();
+    let rest: String = chars[rest_from..].iter().collect();
+    Some(format!("{head}{}", rest.trim_start()))
+}
+
 /// How long a server whose pipe broke or whose stdout closed is given to
 /// finish exiting before the pass stops waiting to learn how it ended.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
@@ -1367,8 +2156,10 @@ fn run_pass(
     asking: Vec<Question>,
     budgets: &Budgets,
     deadline: Instant,
+    disambiguation: OverloadDisambiguation,
 ) -> (Answers, BTreeSet<RelPath>, Option<String>) {
     let mut answers = Answers::new(language, engine);
+    answers.disambiguation = disambiguation;
     let mut queue: Vec<Question> = asking.into_iter().rev().collect();
     // Questions whose empty answer arrived while the server was indexing. They
     // are *not* put straight back on the queue: re-asking a busy server
@@ -1377,7 +2168,7 @@ fn run_pass(
     // finished and are asked once more then - see `LspBridge`'s readiness
     // rules. `re_asked` is what keeps "once more" from being "forever".
     let mut deferred: Vec<Question> = Vec::new();
-    let mut re_asked: HashSet<(RelPath, u32, u32)> = HashSet::new();
+    let mut re_asked: HashSet<(RelPath, u32, u32, &'static str)> = HashSet::new();
     let mut in_flight: BTreeMap<i64, (Question, Instant)> = BTreeMap::new();
     let mut failed_files: BTreeSet<RelPath> = BTreeSet::new();
     let mut touched_files: BTreeSet<RelPath> = BTreeSet::new();
@@ -1387,6 +2178,9 @@ fn run_pass(
     let mut fail = |reason: String| {
         failure.get_or_insert(reason);
     };
+    // Never shorter than `request`: a warm-up is a longer budget or none.
+    let warm_up = budgets.warm_up.map(|warm_up| warm_up.max(budgets.request));
+    let mut warm_up_logged = false;
 
     loop {
         // A deferred question goes back on the queue only once the server has
@@ -1398,10 +2192,25 @@ fn run_pass(
         if !deferred.is_empty() && client.quiet_for(budgets.settle) {
             queue.append(&mut deferred);
         }
-        // Fill the pipeline.
-        while in_flight.len() < budgets.concurrency.max(1) {
+        // Fill the pipeline - to one question while the server's warm-up is
+        // owed (see `Budgets::warm_up`), to `concurrency` after.
+        let warming = warm_up.is_some() && !client.warmed_up();
+        let width = if warming { 1 } else { budgets.concurrency.max(1) };
+        let request_budget = match warm_up {
+            Some(warm_up) if warming => warm_up,
+            _ => budgets.request,
+        };
+        if warming && !warm_up_logged && !queue.is_empty() {
+            warm_up_logged = true;
+            eprintln!(
+                "[{language}] the server has not answered yet - its first question may take up to {request_budget:?} \
+                 (warm-up), the rest {:?}",
+                budgets.request
+            );
+        }
+        while in_flight.len() < width {
             let Some(question) = queue.pop() else { break };
-            touched_files.insert(question.file.clone());
+            touched_files.insert(question.accounted_to().clone());
             let position = {
                 let source = index.source(&question.file).unwrap_or_default();
                 let line = line_text(source, question.position.line);
@@ -1416,7 +2225,7 @@ fn run_pass(
                     in_flight.insert(id, (question, Instant::now()));
                 }
                 Err(err) => {
-                    failed_files.insert(question.file.clone());
+                    failed_files.insert(question.accounted_to().clone());
                     // A pipe broken by a server that has died is its death,
                     // not a failure to write.
                     match client.exit_status(EXIT_GRACE) {
@@ -1453,10 +2262,10 @@ fn run_pass(
             ));
             for (id, (question, _)) in std::mem::take(&mut in_flight) {
                 client.cancel(id);
-                failed_files.insert(question.file);
+                failed_files.insert(question.accounted_to().clone());
             }
             for question in queue.drain(..).chain(deferred.drain(..)) {
-                failed_files.insert(question.file);
+                failed_files.insert(question.accounted_to().clone());
             }
             break;
         }
@@ -1466,7 +2275,7 @@ fn run_pass(
             // to do but wait for the server to stop indexing.
             if matches!(client.poll(Duration::from_millis(25)), Poll::Closed) {
                 for question in deferred.drain(..) {
-                    failed_files.insert(question.file);
+                    failed_files.insert(question.accounted_to().clone());
                 }
                 fail(exited(client.exit_status(EXIT_GRACE)));
                 break;
@@ -1477,16 +2286,19 @@ fn run_pass(
         // Wake up for whichever comes first: an answer, the oldest request's
         // own timeout, or the end of the pass.
         let oldest = in_flight.values().map(|(_, sent)| *sent).min().unwrap_or(now);
-        let wake = (oldest + budgets.request).min(deadline);
+        let wake = (oldest + request_budget).min(deadline);
         let wait = wake.saturating_duration_since(now).max(Duration::from_millis(1));
 
         match client.poll(wait) {
             Poll::Answered { id, result } => {
                 let Some((question, _)) = in_flight.remove(&id) else { continue };
+                // Any answer, empty or not, is a server that is answering.
+                client.mark_warmed_up();
                 // An empty answer while the server is indexing is not an
                 // answer: re-ask it once, after the indexing ends.
-                let empty = locations(&result).is_empty();
-                let key = (question.file.clone(), question.position.line, question.position.col);
+                let empty = question.is_empty_answer(&result);
+                let key =
+                    (question.file.clone(), question.position.line, question.position.col, question.method());
                 if empty && !client.quiet_for(budgets.settle) && re_asked.insert(key) {
                     deferred.push(question);
                     continue;
@@ -1500,6 +2312,7 @@ fn run_pass(
             }
             Poll::Failed { id, code, message } => {
                 let Some((question, _)) = in_flight.remove(&id) else { continue };
+                client.mark_warmed_up();
                 // `ContentModified` is not a refusal: the server's state moved
                 // under the question (rust-analyzer switching crate graphs,
                 // GM-433), so it is asked again once the server is quiet -
@@ -1508,7 +2321,12 @@ fn run_pass(
                 // `ContentModified` for the same site falls through to the
                 // refusal below, so "again" cannot become "forever".
                 if code == Some(CONTENT_MODIFIED) {
-                    let key = (question.file.clone(), question.position.line, question.position.col);
+                    let key = (
+                        question.file.clone(),
+                        question.position.line,
+                        question.position.col,
+                        question.method(),
+                    );
                     if re_asked.insert(key) {
                         deferred.push(question);
                         continue;
@@ -1520,7 +2338,7 @@ fn run_pass(
                 // thousand answers.
                 eprintln!("[{language}] the server refused a question about {} ({message})", question.file);
                 fail(format!("the language server refused a question about {} ({message})", question.file));
-                failed_files.insert(question.file);
+                failed_files.insert(question.accounted_to().clone());
             }
             Poll::Closed => {
                 eprintln!(
@@ -1529,10 +2347,10 @@ fn run_pass(
                     answers.edges.len()
                 );
                 for (question, _) in std::mem::take(&mut in_flight).into_values() {
-                    failed_files.insert(question.file);
+                    failed_files.insert(question.accounted_to().clone());
                 }
                 for question in queue.drain(..) {
-                    failed_files.insert(question.file);
+                    failed_files.insert(question.accounted_to().clone());
                 }
                 fail(exited(client.exit_status(EXIT_GRACE)));
                 break;
@@ -1545,21 +2363,28 @@ fn run_pass(
                 let now = Instant::now();
                 let expired: Vec<i64> = in_flight
                     .iter()
-                    .filter(|(_, (_, sent))| now.duration_since(*sent) >= budgets.request)
+                    .filter(|(_, (_, sent))| now.duration_since(*sent) >= request_budget)
                     .map(|(id, _)| *id)
                     .collect();
+                if !expired.is_empty() {
+                    // A timed-out warm-up is spent too: it is not re-armed,
+                    // so a server that never answers costs one long wait.
+                    client.mark_warmed_up();
+                }
                 for id in expired {
                     let Some((question, _)) = in_flight.remove(&id) else { continue };
                     client.cancel(id);
                     eprintln!(
-                        "[{language}] the server did not answer a question about {} within {:?}",
-                        question.file, budgets.request
+                        "[{language}] the server did not answer a question about {} within {:?}{}",
+                        question.file,
+                        request_budget,
+                        if warming { " (its warm-up budget)" } else { "" }
                     );
                     fail(format!(
                         "the language server did not answer a question about {} within {:?}",
-                        question.file, budgets.request
+                        question.file, request_budget
                     ));
-                    failed_files.insert(question.file);
+                    failed_files.insert(question.accounted_to().clone());
                 }
             }
         }
@@ -1572,10 +2397,10 @@ fn run_pass(
 /// Turns one server answer into whatever it is evidence for, and into
 /// whatever it still has to be asked.
 ///
-/// The returned questions are the second hop of an implementation answer and
-/// nothing else - see [`LspBridge`]'s doc. They are always empty for every
-/// other kind, which is what makes the recursion one hop deep by
-/// construction rather than by a counter.
+/// The returned questions are the second hop of an implementation answer, or
+/// the `hover` hop of an overload answer, and nothing else - see
+/// [`LspBridge`]'s doc. Neither second hop returns any, which is what makes
+/// the recursion one hop deep by construction rather than by a counter.
 #[must_use]
 fn record_answer(
     answers: &mut Answers,
@@ -1588,6 +2413,28 @@ fn record_answer(
     let found = locations(result);
     match &question.ask {
         Ask::Definition(site) => {
+            // An untyped receiver call onto an overload set takes the
+            // overload path: the same edge, plus the ordinal when one can be
+            // bound. A call that names a structural edge keeps the rules
+            // below, which an ordinal would not survive (R2 records nothing).
+            if site.kind == OpenSiteKind::ReceiverCall && site.replaces.is_none() {
+                if let Some((path, node, ordinals)) = overload_landing(index, roots, encoding, &found) {
+                    if node.declarations.is_some() {
+                        *answers
+                            .untyped_answered
+                            .entry((site.from_id.clone(), site.name.clone()))
+                            .or_default() += 1;
+                        let landing = Landing {
+                            file: question.file.clone(),
+                            site: site.clone(),
+                            node_id: node.id.clone(),
+                            node_name: node.name.clone(),
+                            address: address_of(node, site.from_container.clone()),
+                        };
+                        return answers.bind_overload(index, landing, node, &path, &ordinals);
+                    }
+                }
+            }
             // Several locations are the normal answer for a `cfg`-gated or
             // overloaded declaration. They are only usable when they agree:
             // core's linker refuses an ambiguous address by design, and
@@ -1625,7 +2472,8 @@ fn record_answer(
                 // the structural edge's own id (`Bound::There`, one address).
                 // Recording it anyway leaves two rows for one call once an
                 // edit re-sends the structural edge - see [`LspBridge`]'s doc.
-                let (_, prospective) = answer_ids(&question.file, &site.from_id, site.edge_kind, &address);
+                let (_, prospective) =
+                    answer_ids(&question.file, &site.from_id, site.edge_kind, &address, None);
                 let lands_on_it = index
                     .graph(&question.file)
                     .and_then(|graph| graph.edges.iter().find(|edge| &edge.id == replaced))
@@ -1656,6 +2504,7 @@ fn record_answer(
                 site_range(site.position, &site.name),
                 address,
                 &node.id,
+                None,
             );
             // The contradiction rule: an answer that lands somewhere else
             // retracts the structural edge the site said it replaces - see
@@ -1689,6 +2538,30 @@ fn record_answer(
             for location in &found {
                 record_implementor(answers, index, roots, encoding, anchor, for_file, location);
             }
+            Vec::new()
+        }
+        Ask::Overload(site) => {
+            let Some(replaced) = &site.replaces else { return Vec::new() };
+            // Nothing landed, the locations disagree, or they land somewhere
+            // the structural edge does not: no binding, and the structural
+            // edge stands. Refining never moves a call.
+            let Some((path, node, ordinals)) = overload_landing(index, roots, encoding, &found) else {
+                return Vec::new();
+            };
+            if !refines(index, &question.file, site, replaced, node) {
+                return Vec::new();
+            }
+            let landing = Landing {
+                file: question.file.clone(),
+                site: site.clone(),
+                node_id: node.id.clone(),
+                node_name: node.name.clone(),
+                address: address_of(node, site.from_container.clone()),
+            };
+            answers.bind_overload(index, landing, node, &path, &ordinals)
+        }
+        Ask::OverloadHover { pending, at, .. } => {
+            answers.hovered(*pending, at, hover_text(result));
             Vec::new()
         }
     }
@@ -1845,6 +2718,7 @@ fn record_implementor(
         site_range(at, &anchor_node.name),
         address_of(&anchor_node, container),
         &anchor_node.id,
+        None,
     );
     true
 }
@@ -1939,8 +2813,10 @@ impl SemanticEngine for LspBridge {
         }
 
         let language = self.language.clone();
+        let language_ids = self.language_ids;
         let engine = self.config.engine.clone();
         let budgets = self.budgets;
+        let disambiguation = self.config.overload_disambiguation;
         let root = self.root.clone();
         let real_root = self.real_root.clone();
         let mut opened = std::mem::take(&mut self.opened);
@@ -1953,7 +2829,15 @@ impl SemanticEngine for LspBridge {
                 None => Err(None),
                 Some(client) => {
                     client.drain();
-                    Self::sync_documents(client, &mut opened, &root, index, &asked_about, &language);
+                    Self::sync_documents(
+                        client,
+                        &mut opened,
+                        &root,
+                        index,
+                        &asked_about,
+                        &language,
+                        language_ids,
+                    );
                     match Self::wait_ready(client, &budgets, deadline, &language) {
                         Ok(()) => Ok(run_pass(
                             client,
@@ -1964,6 +2848,7 @@ impl SemanticEngine for LspBridge {
                             plan.asking,
                             &budgets,
                             deadline,
+                            disambiguation,
                         )),
                         Err(reason) => Err(Some(reason)),
                     }
@@ -2304,6 +3189,7 @@ mod tests {
                     site_range(at, written),
                     address_of(&declaration, Some("rg::flags::hiargs".to_string())),
                     &declaration.id,
+                    None,
                 );
             }
             let (diff, _) = answers.finish();
@@ -2685,5 +3571,331 @@ mod tests {
         assert_eq!(pass(&[(&caller, "add", 1)]), sent(&["len"]), "pass 2 trims it again, from the full list");
         assert_eq!(pass(&[]), sent(&["add", "len"]), "pass 3: no answer, the full list goes back");
         assert_eq!(pass(&[]), Vec::new(), "pass 4: nothing trimmed now or before, nothing re-sent");
+    }
+
+    // --- which open sites a pass asks about ---------------------------------
+
+    fn line_range(line: u32) -> Range {
+        Range { start: Position { line, col: 0 }, end: Position { line, col: 9 } }
+    }
+
+    /// What `m.toy`, the file a hop's placeholder names, declares under the
+    /// name `n`.
+    #[derive(Clone, Copy, Debug)]
+    enum Declares {
+        Nothing,
+        Function,
+        Placeholder,
+    }
+
+    fn declaring_file(index: &mut SdkIndex, declares: Declares) {
+        let m = RelPath::new("m.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &m);
+        builder.file_node(line_range(0));
+        match declares {
+            Declares::Nothing => {}
+            Declares::Function => {
+                builder.add_node(
+                    NodeSpec::new(NodeKind::Function, "n", "n", line_range(0))
+                        .native_kind("function")
+                        .public(),
+                );
+            }
+            Declares::Placeholder => {
+                builder.add_placeholder(
+                    PlaceholderKind::PendingSymbol,
+                    "n",
+                    file_name("o.toy", "n"),
+                    line_range(0),
+                );
+            }
+        }
+        index.insert(m, "fn n\n".to_string(), builder.finish());
+    }
+
+    /// `o.toy`, declaring an overload set named `n`: a node with
+    /// `declarations`, which is what makes an `OverloadCall` onto `n` worth
+    /// asking.
+    fn overload_file(index: &mut SdkIndex) {
+        let o = RelPath::new("o.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &o);
+        builder.file_node(line_range(0));
+        let declaration = |ordinal| WireDeclaration {
+            ordinal,
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 9,
+            signature: None,
+            has_body: false,
+        };
+        builder.add_node(
+            NodeSpec::new(NodeKind::Function, "n", "n", line_range(0))
+                .native_kind("function")
+                .public()
+                .declarations(vec![declaration(0), declaration(1)]),
+        );
+        index.insert(o, "fn n\n".to_string(), builder.finish());
+    }
+
+    fn file_name(file: &str, name: &str) -> PlaceholderTarget {
+        PlaceholderTarget {
+            scope: TargetScope::File(file.to_string()),
+            key: TargetKey::Name(name.to_string()),
+            from_container: None,
+            key_path: None,
+        }
+    }
+
+    /// What an open site of `u.toy` names in `replaces`.
+    #[derive(Clone, Copy, Debug)]
+    enum Replaces {
+        TheEdge,
+        AMissingEdge,
+        Nothing,
+    }
+
+    /// `u.toy`: `f` with a `CALLS` edge onto a `kind` placeholder addressed by
+    /// `target`, and one open site per `(kind, replaces, line)`, all at
+    /// column 2 of `line`.
+    fn using_file(
+        index: &mut SdkIndex,
+        kind: PlaceholderKind,
+        target: PlaceholderTarget,
+        sites: &[(OpenSiteKind, Replaces, u32)],
+    ) {
+        let u = RelPath::new("u.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &u);
+        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 4, col: 0 } });
+        let f = builder.add_node(
+            NodeSpec::new(NodeKind::Function, "f", "f", line_range(0)).native_kind("function").public(),
+        );
+        let placeholder = builder.add_placeholder(kind, "n", target, line_range(1));
+        let edge = builder.placeholder_edge(EdgeKind::Calls, &f, &placeholder);
+        for (site_kind, replaces, line) in sites {
+            builder.open_site(OpenSite {
+                from_id: f.clone(),
+                position: Position { line: *line, col: 2 },
+                name: "n".to_string(),
+                kind: *site_kind,
+                edge_kind: EdgeKind::Calls,
+                from_container: None,
+                replaces: match replaces {
+                    Replaces::TheEdge => Some(edge.clone()),
+                    Replaces::AMissingEdge => Some("e-missing".to_string()),
+                    Replaces::Nothing => None,
+                },
+            });
+        }
+        index.insert(u, "fn f\n  n()\n  n()\n  n()\n".to_string(), builder.finish());
+    }
+
+    /// What one pass over `u.toy` asks: each question's kind (`OverloadCall`
+    /// for an overload question) and line, sorted, and the unanswerable count.
+    fn asked_about_u(index: &SdkIndex) -> (Vec<(OpenSiteKind, u32)>, usize) {
+        let questions = questions(
+            index,
+            &[RelPath::new("u.toy")],
+            &SemanticConfig::new("toy-server"),
+            &Budgets::default(),
+        );
+        let mut asked: Vec<(OpenSiteKind, u32)> = questions
+            .asking
+            .iter()
+            .map(|question| match &question.ask {
+                Ask::Definition(site) => (site.kind, site.position.line),
+                Ask::Overload(site) => (OpenSiteKind::OverloadCall, site.position.line),
+                other => panic!("only open sites are asked here: {other:?}"),
+            })
+            .collect();
+        asked.sort_by_key(|(kind, line)| (format!("{kind:?}"), *line));
+        (asked, questions.unanswerable)
+    }
+
+    /// A hop - a `Reference` site whose `replaces` names an edge onto a
+    /// `pending_symbol` placeholder addressed by file and bare name - is asked
+    /// only while that file is indexed and declares nothing addressable of
+    /// that name. Every other hop is left to its structural edge, and none of
+    /// them counts as unanswerable.
+    #[test]
+    fn a_hop_is_asked_only_while_the_linker_cannot_settle_its_placeholder() {
+        use PlaceholderKind::{PendingSymbol, Reexport};
+        let qualified = PlaceholderTarget {
+            scope: TargetScope::File("m.toy".to_string()),
+            key: TargetKey::QualifiedName("n".to_string()),
+            from_container: None,
+            key_path: None,
+        };
+        let container = PlaceholderTarget {
+            scope: TargetScope::Container("m".to_string()),
+            key: TargetKey::Name("n".to_string()),
+            from_container: None,
+            key_path: None,
+        };
+        let cases = [
+            (
+                "m.toy declares no n",
+                Declares::Nothing,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                1,
+            ),
+            (
+                "m.toy's n is only a placeholder",
+                Declares::Placeholder,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                1,
+            ),
+            (
+                "m.toy declares n",
+                Declares::Function,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                0,
+            ),
+            (
+                "the file is not indexed",
+                Declares::Nothing,
+                PendingSymbol,
+                file_name("gone.toy", "n"),
+                Replaces::TheEdge,
+                0,
+            ),
+            ("a container scope", Declares::Nothing, PendingSymbol, container, Replaces::TheEdge, 0),
+            ("a qualified-name key", Declares::Nothing, PendingSymbol, qualified, Replaces::TheEdge, 0),
+            (
+                "a reexport placeholder",
+                Declares::Nothing,
+                Reexport,
+                file_name("m.toy", "n"),
+                Replaces::TheEdge,
+                0,
+            ),
+            (
+                "the edge is missing",
+                Declares::Nothing,
+                PendingSymbol,
+                file_name("m.toy", "n"),
+                Replaces::AMissingEdge,
+                0,
+            ),
+        ];
+        for (case, declares, kind, target, replaces, expected) in cases {
+            let mut index = SdkIndex::new();
+            declaring_file(&mut index, declares);
+            using_file(&mut index, kind, target, &[(OpenSiteKind::Reference, replaces, 1)]);
+            let (asked, unanswerable) = asked_about_u(&index);
+            let want: Vec<(OpenSiteKind, u32)> =
+                (0..expected).map(|_| (OpenSiteKind::Reference, 1)).collect();
+            assert_eq!(asked, want, "{case}");
+            assert_eq!(unanswerable, 0, "a hop not asked is not unanswerable: {case}");
+        }
+    }
+
+    /// A `Reference` site with no `replaces` and a `ReceiverCall` are asked
+    /// whatever the placeholder looks like: the hop rule is about `replaces`.
+    #[test]
+    fn a_reference_without_replaces_and_a_receiver_call_are_asked_as_before() {
+        let mut index = SdkIndex::new();
+        declaring_file(&mut index, Declares::Function);
+        using_file(
+            &mut index,
+            PlaceholderKind::PendingSymbol,
+            file_name("m.toy", "n"),
+            &[
+                (OpenSiteKind::Reference, Replaces::Nothing, 1),
+                (OpenSiteKind::ReceiverCall, Replaces::Nothing, 2),
+                (OpenSiteKind::ReceiverCall, Replaces::TheEdge, 3),
+            ],
+        );
+        let (asked, unanswerable) = asked_about_u(&index);
+        assert_eq!(
+            asked,
+            vec![
+                (OpenSiteKind::ReceiverCall, 2),
+                (OpenSiteKind::ReceiverCall, 3),
+                (OpenSiteKind::Reference, 1)
+            ]
+        );
+        assert_eq!(unanswerable, 0);
+    }
+
+    /// A hop at the same call (enclosing node and position) as an overload
+    /// question that was kept is dropped, whichever of the two sites was
+    /// recorded first; a hop elsewhere stays.
+    #[test]
+    fn a_hop_at_a_kept_overload_call_is_dropped_in_either_order() {
+        let hop = (OpenSiteKind::Reference, Replaces::TheEdge, 1);
+        let overload = (OpenSiteKind::OverloadCall, Replaces::TheEdge, 1);
+        let elsewhere = (OpenSiteKind::OverloadCall, Replaces::TheEdge, 2);
+        for sites in [[hop, overload, elsewhere], [overload, hop, elsewhere], [elsewhere, overload, hop]] {
+            let mut index = SdkIndex::new();
+            declaring_file(&mut index, Declares::Nothing);
+            overload_file(&mut index);
+            using_file(&mut index, PlaceholderKind::PendingSymbol, file_name("m.toy", "n"), &sites);
+            let (asked, unanswerable) = asked_about_u(&index);
+            assert_eq!(
+                asked,
+                vec![(OpenSiteKind::OverloadCall, 1), (OpenSiteKind::OverloadCall, 2)],
+                "{sites:?}"
+            );
+            assert_eq!(unanswerable, 0);
+        }
+
+        let mut index = SdkIndex::new();
+        declaring_file(&mut index, Declares::Nothing);
+        overload_file(&mut index);
+        using_file(
+            &mut index,
+            PlaceholderKind::PendingSymbol,
+            file_name("m.toy", "n"),
+            &[(OpenSiteKind::OverloadCall, Replaces::TheEdge, 2), hop],
+        );
+        let (asked, _) = asked_about_u(&index);
+        assert_eq!(
+            asked,
+            vec![(OpenSiteKind::OverloadCall, 2), (OpenSiteKind::Reference, 1)],
+            "a hop at another call"
+        );
+    }
+
+    /// When no overload set answers to the call's name, its `OverloadCall`
+    /// site is filtered out and the hop at the same call is asked instead.
+    #[test]
+    fn a_hop_at_a_filtered_overload_call_is_asked() {
+        for sites in [
+            [
+                (OpenSiteKind::Reference, Replaces::TheEdge, 1),
+                (OpenSiteKind::OverloadCall, Replaces::TheEdge, 1),
+            ],
+            [
+                (OpenSiteKind::OverloadCall, Replaces::TheEdge, 1),
+                (OpenSiteKind::Reference, Replaces::TheEdge, 1),
+            ],
+        ] {
+            let mut index = SdkIndex::new();
+            declaring_file(&mut index, Declares::Nothing);
+            using_file(&mut index, PlaceholderKind::PendingSymbol, file_name("m.toy", "n"), &sites);
+            let (asked, unanswerable) = asked_about_u(&index);
+            assert_eq!(asked, vec![(OpenSiteKind::Reference, 1)], "{sites:?}");
+            assert_eq!(unanswerable, 0);
+        }
+    }
+
+    /// `didOpen`'s `languageId` is the first pair whose extension the path
+    /// ends with, else the bridge's language.
+    #[test]
+    fn a_document_opens_under_the_first_matching_language_id() {
+        let ids = [(".tsx", "typescriptreact"), (".x.tsx", "never-reached"), (".js", "javascript")];
+        let id = |path: &str| language_id(&RelPath::new(path), "typescript", &ids);
+        assert_eq!(id("src/a.tsx"), "typescriptreact");
+        assert_eq!(id("src/a.x.tsx"), "typescriptreact", "the first pair wins");
+        assert_eq!(id("src/a.js"), "javascript");
+        assert_eq!(id("src/a.ts"), "typescript");
+        assert_eq!(language_id(&RelPath::new("src/a.tsx"), "typescript", &[]), "typescript");
     }
 }

@@ -35,6 +35,9 @@ use crate::protocol::types::Position;
 use crate::storage::index_store::IndexStore;
 
 mod anchor;
+mod answer;
+#[cfg(test)]
+mod answer_tests;
 // `pub(crate)` so `cli::plugin_check::expectations` calls the same handler
 // functions as the tools below; every other submodule stays private.
 pub(crate) mod find_callers_callees;
@@ -49,6 +52,8 @@ mod instructions;
 mod member_name_collision_tests;
 mod provenance;
 pub(crate) mod query_shapes;
+#[cfg(test)]
+mod response_bound_tests;
 mod search_code;
 #[cfg(test)]
 mod search_code_rerank_tests;
@@ -134,7 +139,7 @@ pub const SEARCH_EMBEDDING_WAIT: Duration = Duration::from_secs(20);
 /// behaviour change that needs a measured token effect, not a quiet edit. The
 /// headroom is kept smaller than the smallest tool's own entry, so a wording
 /// fix fits but a new tool or a batch of new parameters does not.
-pub const TOOLS_LIST_BYTE_CEILING: usize = 11_500;
+pub const TOOLS_LIST_BYTE_CEILING: usize = 11_800;
 
 /// Reads a millisecond-valued env var, falling back to `default` when it is
 /// unset, empty or not a number. Read per call, so a test can change it
@@ -594,39 +599,69 @@ impl GMeshMcpServer {
     }
 
     /// `get_info`'s `with_instructions` string, built per session by
-    /// [`instructions::build`]. Never takes the store while a bulk-index batch
-    /// may hold it (through embedding inference): a blocked `initialize` looks
-    /// like a hung server. So the lock-free [`phase`](IndexingStatus::phase)
-    /// comes first, and [`Phase::Unindexed`]/[`Phase::Walking`] render
-    /// capabilities-only text via [`instructions::cold_start`]; `Phase::Failed`
-    /// queries, since nothing holds the store after a failed walk. If the
-    /// present-languages query fails, every discovered manifest is used with
-    /// `semantic_pass_done: false`: nothing may claim a pass it did not read.
+    /// [`instructions::build`] (ADR 0022). Never takes the store while a
+    /// bulk-index batch may hold it (through embedding inference): a blocked
+    /// `initialize` looks like a hung server. So the lock-free
+    /// [`phase`](IndexingStatus::phase) comes first, and
+    /// [`Phase::Unindexed`]/[`Phase::Walking`] render the installed plugins and
+    /// the missing ones via [`instructions::cold_start`], with no I/O;
+    /// `Phase::Failed` queries, since nothing holds the store after a failed
+    /// walk. The present languages and the recorded outcomes are read under one
+    /// store read. A failed read falls back to the no-I/O cold-start wording
+    /// for the part it could not read.
     fn instructions(&self) -> String {
         let capabilities = self.registry.receiver_call_capabilities();
+        let missing = || self.registry.missing_languages().into_iter().map(str::to_string).collect();
+        let installed = || instructions::present_languages(capabilities.keys().cloned(), &capabilities);
 
         let phase = self.indexing.phase();
         if let Phase::Unindexed | Phase::Walking = phase {
-            let present = capabilities.keys().map(|language| (language.clone(), false)).collect();
-            let present = instructions::present_languages(present, &capabilities);
-            return instructions::cold_start(self.registry.project_root(), phase == Phase::Walking, &present);
+            let coverage = instructions::Coverage {
+                covered: instructions::Covered::Installed(installed()),
+                uncovered: instructions::Uncovered::missing(missing()),
+            };
+            return instructions::cold_start(
+                self.registry.project_root(),
+                phase == Phase::Walking,
+                &coverage,
+            );
         }
 
-        let present = {
+        let (present, outcomes) = {
             let conn = self.store.read();
-            crate::storage::schema::present_languages_with_semantic_state(&conn)
+            (
+                crate::storage::schema::present_languages_with_semantic_state(&conn),
+                crate::storage::schema::language_outcomes(&conn),
+            )
         };
-        let present = match present {
-            Ok(present) => present,
+        let covered = match present {
+            Ok(present) => instructions::Covered::Indexed(instructions::present_languages(
+                present.into_iter().map(|(language, _)| language),
+                &capabilities,
+            )),
             Err(err) => {
                 eprintln!(
                     "g-mesh daemon: failed to read present languages for the MCP instructions, \
-                     falling back to manifest capabilities only: {err:#}"
+                     falling back to the installed plugins: {err:#}"
                 );
-                capabilities.keys().map(|language| (language.clone(), false)).collect()
+                instructions::Covered::Installed(installed())
             }
         };
-        instructions::build(&instructions::present_languages(present, &capabilities))
+        let coverage = match (covered, outcomes) {
+            (instructions::Covered::Indexed(indexed), Ok(outcomes)) => {
+                instructions::Coverage::from_outcomes(indexed, outcomes, missing())
+            }
+            (covered, outcomes) => {
+                if let Err(err) = outcomes {
+                    eprintln!(
+                        "g-mesh daemon: failed to read language outcomes for the MCP instructions, \
+                         falling back to the missing plugins: {err:#}"
+                    );
+                }
+                instructions::Coverage { covered, uncovered: instructions::Uncovered::missing(missing()) }
+            }
+        };
+        instructions::build(&coverage)
     }
 
     #[tool(
@@ -716,12 +751,19 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_callees", Need::Structural).await? {
             return Ok(early);
         }
-        let (store, capabilities, params) = (Arc::clone(&self.store), self.capabilities(), params.0);
+        let (store, capabilities, hints, params) =
+            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
         find_definition::resolve_lazily_off_worker(
             Arc::clone(&self.embedding),
             Arc::clone(&self.shapes),
             move |semantic| {
-                find_callers_callees::handle_callees_in(&store, semantic, &capabilities, params.clone())
+                find_callers_callees::handle_callees_in(
+                    &store,
+                    semantic,
+                    &capabilities,
+                    &hints,
+                    params.clone(),
+                )
             },
         )
         .await
@@ -739,12 +781,13 @@ impl GMeshMcpServer {
         if let Some(early) = self.prepare(&ctx, "find_implementations", Need::Structural).await? {
             return Ok(early);
         }
-        let (store, capabilities, params) = (Arc::clone(&self.store), self.capabilities(), params.0);
+        let (store, capabilities, hints, params) =
+            (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
         find_definition::resolve_lazily_off_worker(
             Arc::clone(&self.embedding),
             Arc::clone(&self.shapes),
             move |semantic| {
-                find_implementations::dispatch_in(&store, semantic, &capabilities, params.clone())
+                find_implementations::dispatch_in(&store, semantic, &capabilities, &hints, params.clone())
             },
         )
         .await
@@ -842,6 +885,8 @@ impl ServerHandler for GMeshMcpServer {
 pub struct FindDefinitionParams {
     /// Name of the symbol to look up.
     pub symbol_name: Option<String>,
+    /// Or an exact candidate `id`.
+    pub symbol_id: Option<String>,
     /// Project-relative path of the file the cursor is in.
     pub file_path: Option<String>,
     /// Cursor position within `file_path`, used to resolve the symbol under it.
@@ -871,6 +916,24 @@ pub struct SymbolQueryParams {
     /// Restrict to rows in these files: project-relative, exactly as
     /// `filePath` appears in output (no globs). Omit for the whole project.
     pub file_paths: Option<Vec<String>>,
+    /// No rows: `files` per-file counts, `count` totals.
+    pub answer: Option<Answer>,
+}
+
+// What a symbol query returns. Plain comments rather than doc comments: these
+// would otherwise be published in three tool schemas on every turn, and the
+// field's own one-line doc already says what the two non-default values do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(inline)]
+pub enum Answer {
+    // One row per usage, paged (the default).
+    #[default]
+    Rows,
+    // The whole set's per-file tally, no rows.
+    Files,
+    // The whole set's total and unresolved count, no rows and no files.
+    Count,
 }
 
 // The first five fields must stay identical in name, type and semantics to

@@ -2,8 +2,8 @@ package main
 
 // The control-plane loop's message handling: fileChanged, semanticPass,
 // workspaceChanged, reindex, status, and anything else core (or the
-// conformance kit) might send. Mirrors plugins/typescript/src/index.ts's
-// handleEnvelope/handleFileChanged/handleSemanticPass - see that file for
+// conformance kit) might send. Mirrors the control loop in plugins/sdk/src/run.rs
+// (`handle`, `file_changed`, `respond_to_pass`) - see that file for
 // the reference behavior this is kept honest against by
 // core/src/cli/plugin_check, the same way the TS plugin is.
 
@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 )
 
 func sortStrings(values []string) { sort.Strings(values) }
@@ -36,15 +37,19 @@ type cachedFile struct {
 //
 // A fresh process - every control-plane session, and every one-shot
 // --bulk-index run - starts with none of this, the same "cold" starting
-// point plugins/typescript/src/incremental.ts's own cache has. That is why
+// point plugins/sdk/src/diff.rs's own baseline has. That is why
 // `fileChanged` on a file this process has never reparsed always answers
 // with a full upsert, even when nothing has actually changed since an
 // earlier bulk walk: that walk was a *different* process, with its own
 // cache.
 type pluginState struct {
 	projectRoot string
-	workspace   *workspace
-	files       map[string]cachedFile
+	// rootReal is projectRoot resolved through every link, taken once when
+	// the process starts (a root relinked under a running plugin is not
+	// followed); indexedSpelling compares real paths against it.
+	rootReal  string
+	workspace *workspace
+	files     map[string]cachedFile
 	// semantic is this process's go/types tier (semantic.go). Constructing
 	// it loads nothing - the engine is inert until the first semanticPass,
 	// which is the laziness `capabilities.semantic-engine-lazy` checks.
@@ -54,6 +59,7 @@ type pluginState struct {
 func newPluginState(projectRoot string) *pluginState {
 	return &pluginState{
 		projectRoot: projectRoot,
+		rootReal:    canonicalizeProjectRoot(projectRoot),
 		workspace:   loadWorkspace(projectRoot),
 		files:       map[string]cachedFile{},
 		semantic:    newSemanticEngine(projectRoot),
@@ -87,6 +93,9 @@ func newPluginState(projectRoot string) *pluginState {
 // `==`: two placeholders with equal targets must compare equal even though
 // their pointers differ.
 func (s *pluginState) handleFileChanged(relPath string) fileChangeDiff {
+	if real := s.indexedSpelling(relPath); real != "" {
+		relPath = real
+	}
 	diff := emptyDiff()
 
 	abs := filepath.Join(s.projectRoot, filepath.FromSlash(relPath))
@@ -156,6 +165,45 @@ func (s *pluginState) handleFileChanged(relPath string) fileChangeDiff {
 
 	s.files[relPath] = next
 	return diff
+}
+
+// indexedSpelling returns the real spelling relPath is indexed under when
+// relPath reaches that file through an in-root link, or "" to handle relPath
+// as spelled.
+//
+// The walk indexes a file reachable two ways under its real spelling
+// (docs/adr/0025-project-walk-follows-symlinks.md), but the OS may report an
+// edit under either spelling. Handling the link spelling as written would
+// index the file a second time beside a baseline that never updates.
+// Invariants:
+//   - remapped only when the real spelling is the indexed one: this process
+//     has sent it already, or the plain walk reaches it (and therefore picked
+//     it). A file the walk indexed under a link spelling (reachable only
+//     through links) is still handled as that spelling;
+//   - a path resolving outside the root is never remapped: the walk refuses
+//     such links, so nothing under that spelling is indexed;
+//   - a path that no longer resolves (deleted, dangling) is handled as
+//     spelled, so its deletion reaches the entry it names.
+//
+// One EvalSymlinks per event; the .gitignore files on the real path are read
+// only for an event spelled through a link.
+func (s *pluginState) indexedSpelling(relPath string) string {
+	real, err := filepath.EvalSymlinks(filepath.Join(s.projectRoot, filepath.FromSlash(relPath)))
+	if err != nil {
+		return ""
+	}
+	rel, err := filepath.Rel(s.rootReal, real)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	realRel := filepath.ToSlash(rel)
+	if realRel == relPath {
+		return ""
+	}
+	if _, sent := s.files[realRel]; sent || plainWalkReaches(s.rootReal, rel) {
+		return realRel
+	}
+	return ""
 }
 
 // reloadWorkspace re-reads the project's module layout and forgets every
@@ -274,13 +322,26 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 		state.reloadWorkspace()
 		return
 
+	case "filesCreated":
+		// The structural tier never asks the disk whether a file exists
+		// (imports resolve to packages through the module layout), so there
+		// is no model to update. A request still gets its ack - core waits
+		// on it - even when the params are malformed; a notification gets
+		// nothing.
+		var params filePathsParams
+		if err := json.Unmarshal(env.Params, &params); err != nil {
+			logf("malformed filesCreated params: %v", err)
+		} else {
+			logf("files created: %d file(s)", len(params.FilePaths))
+		}
+
 	case "status":
 		logf("status requested")
 
 	default:
 		// Never crash, never guess at a response shape for a method this
 		// plugin does not recognize - mirrors
-		// plugins/typescript/src/index.ts's handleFrame, which drops an
+		// plugins/sdk/src/run.rs's `handle`, which drops an
 		// envelope parseControlEnvelope could not recognize the same way
 		// (logged, no response, even if an id was present).
 		logf("unknown method: %q", env.Method)

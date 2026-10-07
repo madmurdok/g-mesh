@@ -35,7 +35,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ignore::WalkBuilder;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::daemon;
@@ -44,9 +43,9 @@ use crate::daemon::indexing_status::{group_thousands, ProgressSnapshot};
 use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
+use crate::project_walk;
 use crate::storage::connection::project_dir;
 use crate::watcher::staleness::mtime_millis;
-use crate::watcher::BASELINE_EXCLUDED_DIRS;
 
 /// Whether a daemon core is serving this project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +80,7 @@ pub enum BuildState {
     /// predates whatever has been installed since, and the index invalidation
     /// that a start on the new build would have performed.
     Outdated,
-    /// The daemon started from this very executable, but is holding a JS/TS
+    /// The daemon started from this very executable, but is holding a
     /// plugin that has been rebuilt since - so the graph it is serving was
     /// computed by extraction logic that is no longer on disk. Reported apart
     /// from `Outdated` because "your core binary is old" would be false here,
@@ -511,66 +510,34 @@ struct SourceFile {
     mtime_millis: i64,
 }
 
-/// Walks `project_root` for files some discovered plugin would index,
-/// honoring `.gitignore`, [`BASELINE_EXCLUDED_DIRS`] and each language's
-/// `[plugin.workspace] exclude_dirs`; the per-file decision is
+/// Walks `project_root` for files some discovered plugin would index, through
+/// the walker [`project_walk::project_files`] shares with the bulk walk's
+/// absent-plugin count: `.gitignore`, the baseline exclusions and each
+/// language's `[plugin.workspace] exclude_dirs`; the per-file decision is
 /// [`DiscoveredPlugins::indexing_language`], the watcher's filter. Each
 /// plugin walks in its own process, so this mirrors their shared manifest
 /// rules rather than reusing a walk. It diverges only toward doing less (no
 /// symlinks followed, unreadable metadata skipped), which cannot make a
 /// broken index look healthy.
 fn discover_source_files(project_root: &Path, plugins: &DiscoveredPlugins) -> Result<Vec<SourceFile>> {
-    // Pruned outright: the baseline, plus any directory *every* discovered
-    // language excludes. A directory only some languages exclude is still
-    // walked (`dist/app.py` is Python's even though TypeScript skips `dist`),
-    // and its files are filtered one by one below.
-    let pruned: Vec<String> = BASELINE_EXCLUDED_DIRS
-        .iter()
-        .map(|dir| (*dir).to_string())
-        .chain(excluded_by_every_language(plugins))
-        .collect();
+    // Pruned outright: the baseline (always, by the walker), plus any
+    // directory *every* discovered language excludes. A directory only some
+    // languages exclude is still walked (`dist/app.py` is Python's even though
+    // TypeScript skips `dist`), and its files are filtered one by one below.
+    let pruned = excluded_by_every_language(plugins);
 
     let mut files = Vec::new();
-    let walk = WalkBuilder::new(project_root)
-        // Matching the plugins' walks, which read each directory's own
-        // .gitignore and nothing else: no dotfile skipping, no rules from
-        // above the project root, no global/`info/exclude` rules, and rules
-        // honored even outside a git repository.
-        .hidden(false)
-        .parents(false)
-        .ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .require_git(false)
-        .follow_links(false)
-        .filter_entry(move |entry| {
-            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-            !is_dir || !entry.file_name().to_str().is_some_and(|name| pruned.iter().any(|dir| dir == name))
-        })
-        .build();
-
-    for entry in walk {
-        let entry = match entry {
-            Ok(entry) => entry,
-            // An unreadable directory costs its subtree, not the report.
-            Err(_) => continue,
-        };
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+    for walked in project_walk::project_files(project_root, &pruned) {
+        if plugins.indexing_language(&walked.relative).is_none() {
             continue;
         }
-        let Some(relative) = relative_wire_path(project_root, entry.path()) else {
-            continue;
-        };
-        if plugins.indexing_language(&relative).is_none() {
-            continue;
-        }
-        let Ok(metadata) = fs::metadata(entry.path()) else {
+        let Ok(metadata) = fs::metadata(&walked.path) else {
             continue;
         };
         let Ok(mtime_millis) = mtime_millis(&metadata) else {
             continue;
         };
-        files.push(SourceFile { relative, mtime_millis });
+        files.push(SourceFile { relative: walked.relative, mtime_millis });
     }
     Ok(files)
 }
@@ -588,15 +555,6 @@ fn excluded_by_every_language(plugins: &DiscoveredPlugins) -> Vec<String> {
         common.retain(|dir| manifest.workspace.exclude_dirs.contains(dir));
     }
     common
-}
-
-fn relative_wire_path(root: &Path, absolute: &Path) -> Option<String> {
-    let relative = absolute.strip_prefix(root).ok()?;
-    let mut parts = Vec::new();
-    for component in relative.components() {
-        parts.push(component.as_os_str().to_str()?.to_string());
-    }
-    Some(parts.join("/"))
 }
 
 /// Every file the index has a `File` node for. The plugin emits exactly one
@@ -911,7 +869,7 @@ fn describe_build(build: BuildState) -> Option<&'static str> {
              would do; run `g-mesh stop`, or let the next MCP call replace it",
         ),
         BuildState::PluginChanged => Some(
-            "this build, but holding a JS/TS plugin that has been rebuilt since - \
+            "this build, but holding a plugin that has been rebuilt since - \
              its graph came from extraction logic no longer on disk; run \
              `g-mesh stop`, or let the next MCP call replace it",
         ),

@@ -14,8 +14,6 @@
 /dist/
 .DS_Store
 .claude/worktrees/
-# Written by plugins/typescript/scripts/generate-version.js on every build.
-/plugins/typescript/src/version.generated.ts
 # The embedding eval's pinned corpus checkouts, snapshots, models and runs
 # (docs/architecture/embedding-eval.md): large, and all reproducible from
 # eval/embedding/corpora.toml and variants.toml.

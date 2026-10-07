@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"reflect"
 	"testing"
 )
 
@@ -477,5 +478,202 @@ func TestRunControlLoopSkipsAMalformedJSONBodyAndContinues(t *testing.T) {
 	frames := readFrames(t, bufio.NewReader(&out))
 	if len(frames) != 2 {
 		t.Fatalf("got %d frames, want 2 (handshake, then the fileChanged response): %+v", len(frames), frames)
+	}
+}
+
+// B9 remap (docs/adr/0025-project-walk-follows-symlinks.md):
+// pluginState.indexedSpelling hands an event spelled through an in-root link
+// to the real spelling the walk indexes. Named after the SDK's run.rs tests
+// where the behaviour is shared.
+
+func cachedPaths(s *pluginState) []string {
+	var paths []string
+	for path := range s.files {
+		paths = append(paths, path)
+	}
+	sortStrings(paths)
+	return paths
+}
+
+func upsertedPaths(diff fileChangeDiff) []string {
+	seen := map[string]bool{}
+	var paths []string
+	for _, node := range diff.UpsertNodes {
+		if !seen[node.FilePath] {
+			seen[node.FilePath] = true
+			paths = append(paths, node.FilePath)
+		}
+	}
+	sortStrings(paths)
+	return paths
+}
+
+// B9 / S7-a: an edit reported under the link spelling of an indexed file
+// updates the real spelling and adds no second entry.
+//
+// Control: make indexedSpelling return "" -> the nodes and the cache key are
+// linked/pkg.go.
+func TestALinkSpelledEventForAnIndexedFileUpdatesItsRealSpelling(t *testing.T) {
+	skipWithoutSymlinks(t)
+	root := t.TempDir()
+	writeFile(t, root, "real/pkg.go", "package p\n\nfunc F() {}\n")
+	linkAt(t, root, "real", "linked")
+	s := newPluginState(root)
+	s.handleFileChanged("real/pkg.go")
+	writeFile(t, root, "real/pkg.go", "package p\n\nfunc F() {}\n\nfunc G() {}\n")
+
+	diff := s.handleFileChanged("linked/pkg.go")
+	if got := upsertedPaths(diff); !reflect.DeepEqual(got, []string{"real/pkg.go"}) {
+		t.Fatalf("upserted under %v, want [real/pkg.go]", got)
+	}
+	if got := cachedPaths(s); !reflect.DeepEqual(got, []string{"real/pkg.go"}) {
+		t.Fatalf("cached %v, want [real/pkg.go]", got)
+	}
+}
+
+// Go-specific: the plain walk reaching the real spelling is enough, before
+// this process has sent it (plainWalkReaches).
+//
+// Control: drop the `|| plainWalkReaches(...)` arm of indexedSpelling -> the
+// cache key is linked/pkg.go.
+func TestALinkSpelledEventForAPlainlyWalkedFileIsRemappedBeforeItWasSent(t *testing.T) {
+	skipWithoutSymlinks(t)
+	root := t.TempDir()
+	writeFile(t, root, "real/pkg.go", "package p\n\nfunc F() {}\n")
+	linkAt(t, root, "real", "linked")
+	s := newPluginState(root)
+
+	s.handleFileChanged("linked/pkg.go")
+	if got := cachedPaths(s); !reflect.DeepEqual(got, []string{"real/pkg.go"}) {
+		t.Fatalf("cached %v, want [real/pkg.go]", got)
+	}
+}
+
+// S7-b: a file the walk reaches only through a link (its real spelling is
+// gitignored and was never sent) is handled as spelled.
+//
+// Control: remap unconditionally (drop the sent/plainWalkReaches condition)
+// -> the cache key is gen/g.go.
+func TestALinkSpelledEventForAFileNotIndexedByItsRealSpellingIsHandledAsSpelled(t *testing.T) {
+	skipWithoutSymlinks(t)
+	root := t.TempDir()
+	writeFile(t, root, ".gitignore", "/gen/\n")
+	writeFile(t, root, "gen/g.go", "package g\n")
+	linkAt(t, root, "../gen", "src/gen")
+	s := newPluginState(root)
+
+	s.handleFileChanged("src/gen/g.go")
+	if got := cachedPaths(s); !reflect.DeepEqual(got, []string{"src/gen/g.go"}) {
+		t.Fatalf("cached %v, want [src/gen/g.go]", got)
+	}
+}
+
+// S7-c: a path through a link resolving outside the root is handled as
+// spelled.
+//
+// Control: drop indexedSpelling's Rel/".." check and its sent condition ->
+// the cache key is a "../..." spelling.
+func TestALinkSpelledEventResolvingOutsideTheRootIsHandledAsSpelled(t *testing.T) {
+	skipWithoutSymlinks(t)
+	outside := t.TempDir()
+	writeFile(t, outside, "a.go", "package a\n")
+	root := t.TempDir()
+	linkAt(t, root, outside, "ext")
+	s := newPluginState(root)
+
+	s.handleFileChanged("ext/a.go")
+	if got := cachedPaths(s); !reflect.DeepEqual(got, []string{"ext/a.go"}) {
+		t.Fatalf("cached %v, want [ext/a.go]", got)
+	}
+}
+
+// S7-d: a path that no longer resolves is handled as spelled, so the
+// deletion reaches the entry it names - the link spelling, with the real
+// spelling cached too.
+//
+// Control: resolve a missing file through its parent in indexedSpelling
+// (EvalSymlinks(dir) joined with the base name) -> the deletion removes
+// gen/g.go and leaves src/gen/g.go.
+func TestADeletedPathIsHandledAsSpelled(t *testing.T) {
+	skipWithoutSymlinks(t)
+	root := t.TempDir()
+	writeFile(t, root, ".gitignore", "/gen/\n")
+	abs := writeFile(t, root, "gen/g.go", "package g\n")
+	linkAt(t, root, "../gen", "src/gen")
+	s := newPluginState(root)
+	// Alias first, while its real spelling is neither sent nor walked.
+	s.handleFileChanged("src/gen/g.go")
+	s.handleFileChanged("gen/g.go")
+	if got := cachedPaths(s); !reflect.DeepEqual(got, []string{"gen/g.go", "src/gen/g.go"}) {
+		t.Fatalf("cached %v, want both spellings", got)
+	}
+	if err := os.Remove(abs); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	diff := s.handleFileChanged("src/gen/g.go")
+	if len(diff.DeleteNodeIds) == 0 {
+		t.Fatalf("expected a deletion, got %+v", diff)
+	}
+	if got := cachedPaths(s); !reflect.DeepEqual(got, []string{"gen/g.go"}) {
+		t.Fatalf("cached %v, want [gen/g.go]", got)
+	}
+}
+
+// GM-515: `filesCreated` names a watcher batch's created files before their
+// own `fileChanged`s. Go has no file-existence model to update, but a request
+// with an id must still be answered (core waits on it), a notification gets
+// nothing, and the stream stays in step: the `fileChanged` after them answers
+// with its own id. Malformed params are acknowledged too, never an error frame.
+func TestFilesCreatedIsAcknowledgedAndTheNextFileChangedAnswersWithItsOwnID(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "a.go", "package a\n")
+
+	var in bytes.Buffer
+	in.Write(frameOf(t, map[string]interface{}{
+		"jsonrpc": "2.0", "id": 7, "method": "filesCreated",
+		"params": map[string]interface{}{"filePaths": []string{"a.go", "b.go"}},
+	}))
+	in.Write(frameOf(t, map[string]interface{}{
+		"jsonrpc": "2.0", "method": "filesCreated",
+		"params": map[string]interface{}{"filePaths": []string{"a.go", "b.go"}},
+	}))
+	in.Write(frameOf(t, map[string]interface{}{
+		"jsonrpc": "2.0", "id": 8, "method": "filesCreated",
+		"params": map[string]interface{}{"filePaths": 5},
+	}))
+	in.Write(frameOf(t, map[string]interface{}{
+		"jsonrpc": "2.0", "id": 9, "method": "fileChanged",
+		"params": map[string]string{"filePath": "a.go"},
+	}))
+
+	var out bytes.Buffer
+	runControlLoop(root, &in, &out, nil)
+
+	frames := readFrames(t, bufio.NewReader(&out))
+	if len(frames) != 4 {
+		t.Fatalf("got %d frames, want 4 (handshake, two acks, the fileChanged diff - nothing for the notification): %+v",
+			len(frames), frames)
+	}
+	for i, id := range []float64{7, 8} {
+		ack := frames[1+i]
+		if ack["id"] != id || ack["error"] != nil {
+			t.Fatalf("frame %d = %+v, want an ack for id %v", 1+i, ack, id)
+		}
+		result, ok := ack["result"].(map[string]interface{})
+		if !ok || result["acknowledged"] != true {
+			t.Fatalf("frame %d result = %+v, want {acknowledged: true}", 1+i, ack["result"])
+		}
+	}
+	diff := frames[3]
+	if diff["id"] != float64(9) {
+		t.Fatalf("the fileChanged answer has id %v, want 9: %+v", diff["id"], diff)
+	}
+	result, ok := diff["result"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("the fileChanged answer has no result: %+v", diff)
+	}
+	if upserts, ok := result["upsertNodes"].([]interface{}); !ok || len(upserts) != 1 {
+		t.Fatalf("upsertNodes = %+v, want a.go's one node", result["upsertNodes"])
 	}
 }

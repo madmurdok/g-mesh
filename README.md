@@ -21,12 +21,13 @@ output lands in `target/`.
 - `wire/` — the core ⇆ plugin wire protocol types, and nothing else. Its own
   crate so core and a Rust plugin share one declaration without a plugin
   linking core; core re-exports it as `protocol::types`.
-- `plugins/typescript/` — Node/TypeScript language plugin: tree-sitter parsing,
-  bulk indexing, incremental reparse. Spawned by the daemon as a child
-  process, one instance per project.
+- `plugins/typescript/` — TypeScript/JavaScript language plugin, built on
+  `plugins/sdk`: tree-sitter parsing, bulk indexing, incremental reparse. A
+  cargo workspace member, spawned by the daemon as a child process, one
+  instance per project.
 - `plugins/go/` — Go language plugin: tree-sitter parsing plus a `go/types`
   semantic tier. Its own Go module (`go.mod`), not a cargo workspace member,
-  built as a prebuilt binary the same way `plugins/typescript/` is.
+  built by `core/build.rs` into a prebuilt binary.
 - `plugins/sdk/` — everything a Rust language plugin needs that is not its
   language: protocol loop, walk, incremental diff, ids. See "Writing a
   language plugin".
@@ -38,7 +39,7 @@ output lands in `target/`.
   test` from the repository root cover it.
 
 The daemon and shim are one binary (`target/{debug,release}/g-mesh`);
-the plugin is a separate Node entry point the daemon launches with `node`.
+each plugin is a separate executable the daemon launches.
 
 ## Install
 
@@ -64,8 +65,8 @@ that explanation rather than letting you install 50MB that cannot exec.
 archive, **verifies its SHA-256 before unpacking anything** (a mismatch aborts
 with both hashes printed and installs nothing), runs the downloaded binary once
 to prove it executes and discovers its plugin, and only then installs. It needs
-neither Rust nor Node.js: the archive carries the core binary and a plugin with
-its own embedded runtime.
+neither Rust nor Node.js: the archive carries the core binary and every bundled
+plugin as a native binary.
 
 What lands on disk is a *directory*, not one file — by default `~/.g-mesh/bin`:
 
@@ -166,14 +167,11 @@ build-from-source path below is the only one that works.
 
 ## Prerequisites
 
-- Rust toolchain (`cargo`, stable) — build the core, the Rust plugin and the
-  Python plugin (both are cargo workspace members).
-- Node.js >= 20 and `node` on `PATH` — build the JS/TS plugin, and required
-  at *runtime* because the daemon spawns it via `node <entry.js>`.
+- Rust toolchain (`cargo`, stable) — build the core and the TypeScript, Rust
+  and Python plugins (all cargo workspace members).
 - Go toolchain (`go` on `PATH`) — `core/build.rs` builds the bundled Go
-  plugin automatically whenever core is built. It is best-effort like the
-  JS/TS build step next to it: a missing toolchain only prints a
-  `cargo:warning`, it does not fail `cargo build`. Without it, the checkout
+  plugin automatically whenever core is built. It is best-effort: a missing
+  toolchain only prints a `cargo:warning`, it does not fail `cargo build`. Without it, the checkout
   simply has no working Go plugin — `g-mesh plugins list` won't show `go`,
   and a dev-checkout daemon (which discovers every bundled plugin
   unconditionally) won't start until it is built some other way.
@@ -188,11 +186,8 @@ cargo build --release -p g-mesh
 # Go toolchain is on PATH (see Prerequisites) -> plugins/go/g-mesh-plugin-go
 
 # 2. JS/TS plugin
-cd plugins/typescript
-npm install
-npm run build
-cd ../..
-# -> plugins/typescript/dist/src/index.js
+cargo build -p g-mesh-plugin-typescript
+# -> target/debug/g-mesh-plugin-typescript
 
 # 3. Rust plugin
 cargo build -p g-mesh-plugin-rust
@@ -205,9 +200,9 @@ cargo build -p g-mesh-plugin-python
 
 Build order doesn't matter, but all four are required — a dev checkout's
 daemon discovers every bundled plugin unconditionally and refuses to start
-(hard failure) if it can't spawn one of them. The Rust and Python plugins are
-looked up next to the running `g-mesh` binary, so a `target/release/g-mesh`
-needs them built with `--release` too (`cargo build --workspace --release`).
+(hard failure) if it can't spawn one of them. The TypeScript, Rust and Python
+plugins are looked up next to the running `g-mesh` binary, so a
+`target/release/g-mesh` needs them built with `--release` too (`cargo build --workspace --release`).
 
 ### 5. Embedding model (optional — only `search_code` needs it)
 
@@ -300,25 +295,15 @@ yet; it skips the checksum.
 Skipping this step entirely is a perfectly good choice. Everything else works;
 `search_code` just reports that semantic search is unavailable.
 
-A binary built this way finds the plugin through this checkout: the daemon
-falls back to a path relative to `core`'s own source tree, baked in at *compile
-time* (`core/src/daemon/plugin.rs`):
-
-```
-<repo>/plugins/typescript/dist/src/index.js
-```
-
-That fallback is the last of three steps. In precedence order, the daemon uses:
-
-1. `G_MESH_JS_TS_PLUGIN_PATH`, if set — a plugin build of your own. A `.js`
-   path is run with `node`; anything else is executed directly.
-2. `plugins/typescript/` **next to the `g-mesh` binary**, which is what a
-   release archive unpacks to and needs no Node.js at all (below).
-3. The compile-time checkout path above.
-
-```bash
-export G_MESH_JS_TS_PLUGIN_PATH=/path/to/plugins/typescript/dist/src/index.js
-```
+A binary built this way finds every bundled plugin, TypeScript included, the
+same way: by discovering `plugins/<language>/plugin.toml` (next to the `g-mesh`
+binary in a release archive, or in this checkout for a dev build). A
+cargo-built plugin's manifest names its binary as
+`${G_MESH_BIN_DIR}/g-mesh-plugin-<language>`, the directory the running
+`g-mesh` lives in, so `cargo build --workspace` (with `--release` for a
+release `g-mesh`) is all a checkout needs. To run a plugin build of your own,
+put its `<language>/plugin.toml` under `~/.g-mesh/plugins/`, which takes
+precedence over the bundled one.
 
 ### Release artifacts
 
@@ -345,10 +330,9 @@ Each archive holds a complete install, not just the binary:
 g-mesh-v<version>-<triple>/
   g-mesh                                  the core binary
   plugins/typescript/
-    g-mesh-plugin-typescript              the JS/TS plugin, runtime included
-    node_modules/                         its native tree-sitter grammars
+    g-mesh-plugin-typescript[.exe]        the JS/TS plugin - a plain cargo
+                                           binary, no runtime to embed
     plugin.toml                           how core discovers and spawns it
-    LICENSE-nodejs                        the embedded runtime's notice
   plugins/go/
     g-mesh-plugin-go[.exe]                the Go plugin - one static,
                                            CGO-free binary cross-compiled for
@@ -370,35 +354,32 @@ three — `scripts/bundle-go-plugin.sh` cross-compiles it
 (`CGO_ENABLED=0 GOOS=... GOARCH=...`) into one static binary for any target
 from any host, and writes an installed `plugin.toml` naming that binary.
 
-The Rust plugin (GM-288) needs no bundling step like the JS/TS one's Node
-SEA — `scripts/bundle-rust-plugin.sh` just builds `plugins/rust` for the
-target with `cargo build --target <triple>`, the same way `build-targets.sh`
-already builds core, and writes an installed `plugin.toml` naming the binary
-it staged. The Python plugin (GM-298) ships the same way, via
+The JS/TS, Rust and Python plugins are cargo binaries in core's own
+workspace. `scripts/bundle-plugin.sh` (JS/TS, GM-326),
+`scripts/bundle-rust-plugin.sh` (GM-288) and `scripts/bundle-python-plugin.sh`
+(GM-298) each build their crate for the target with
+`cargo build --target <triple>`, the same way `build-targets.sh` already
+builds core, and write an installed `plugin.toml` naming the binary they
+staged. The Python plugin ships via
 `scripts/bundle-python-plugin.sh` — it is a tree-sitter-based structural
 extractor written in Rust, not a program run by a Python interpreter, so
 **no Python interpreter is required on the machine being indexed** for the
 structural tier it ships today. A future semantic tier over `pyright` would
 need `pyright` installed separately, the same way the TypeScript plugin's
-semantic tier needs the project's own `node_modules/typescript`.
+semantic tier needs `vtsls`.
 
-**No Node.js required.** The plugin is compiled with [Node's single-executable
-application](https://nodejs.org/api/single-executable-applications.html)
-support (`scripts/bundle-plugin.sh`), so it embeds its own JS runtime. Indexing
-— the whole structural graph — works on a machine with no Node installed.
+**No Node.js required for indexing.** The JS/TS plugin is a native binary
+(tree-sitter grammars linked in), so the whole structural graph is built on a
+machine with no Node installed. The archive does *not* carry a TypeScript
+language server: the semantic pass that upgrades unresolved edges drives
+`vtsls`, found on `PATH`, in the indexed project's own `node_modules/.bin`, or
+through `npx --yes --package @vtsls/language-server vtsls` — each of which
+needs Node.js. Without one the semantic pass is skipped and every structural
+edge is still indexed.
 
-The one thing the archive does *not* carry is a TypeScript compiler. The
-semantic pass that upgrades unresolved edges drives `tsserver`, and it
-deliberately prefers **the project's own** `node_modules/typescript` so a
-project is analyzed by the compiler it builds with; the plugin's embedded
-runtime is what executes it, so this too needs no system Node. A project with
-no TypeScript installed at all simply gets no semantic upgrade — every
-structural edge is still indexed. To cover that case, drop a `typescript`
-package into `node_modules/` beside the plugin executable.
-
-Building an archive requires Node 20+ on the build machine, and each archive
-must be built on the platform it targets: a single-executable plugin embeds the
-build machine's own Node runtime and cannot be cross-built.
+Building an archive needs Rust and Go, not Node, and each archive is built on
+the platform it targets, because core and the cargo plugins compile C (SQLite,
+Oniguruma, tree-sitter grammars) for that target.
 
 ### Cutting a release
 
@@ -654,11 +635,10 @@ below) to force a fresh full walk.
 The daemon is two processes with very different costs, and each has its own
 idle timeout:
 
-- The **JS/TS plugin** (the expensive one — tree-sitter parsing in a Node
-  process; `typescript` is a runtime dependency, since `tsserver` ships inside
-  that package, but it is never loaded in this process — the checker runs as a
-  child, spawned only by the first semantic question actually asked and killed
-  with the plugin) exits after an hour with no reparse work.
+- The **JS/TS plugin** (the expensive one — tree-sitter parsing in the
+  plugin's Rust binary; its semantic tier's language server, vtsls, is a Node
+  program that runs as a child, spawned on demand and killed with the plugin)
+  exits after an hour with no reparse work.
   While it is asleep the core keeps watching the project and remembers which
   files changed; the next query wakes it and replays exactly that list, not
   the whole project. `g-mesh status` reports it as `asleep`, which needs no
@@ -1017,21 +997,19 @@ directory that has a `conformance/{project,expect.toml}` pair — see
 
 ```bash
 scripts/test-deps.sh             # once per clone/worktree: the test dependencies CI installs
-cargo test                       # every crate: core, wire, plugins/sdk, plugins/rust, plugins/python
+cargo test                       # every crate: core, wire, plugins/sdk and the typescript, rust and python plugins
 cargo test -p g-mesh             # core alone
-cd plugins/typescript && npm run build && npm test
 scripts/check.sh                 # the formatting and lint gates, as CI runs them
 ```
 
 `scripts/test-deps.sh` installs what the suite drives for real and cargo
-cannot fetch: the JS/TS plugin's `npm ci` (`build.rs` builds it),
-rust-analyzer (`plugins/rust`'s semantic tier) and pyright
+cannot fetch: rust-analyzer (`plugins/rust`'s semantic tier) and pyright
 (`plugins/python`'s: an `npm ci` into its gitignored `node_modules`, at the
 exact version its committed `package.json` and `package-lock.json` pin, the
 same step CI's "Install pyright" runs). Without
 it the suite does not skip: `plugins/python`'s tests fail naming the missing
 pyright and the command above. `scripts/test-deps.sh pyright` (or
-`typescript`, `rust-analyzer`) installs just one.
+`rust-analyzer`) installs just one.
 
 `scripts/check.sh` is the one place those two gates are spelled out:
 `.github/workflows/ci.yml` calls it rather than repeating the commands, so a

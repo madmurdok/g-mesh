@@ -991,3 +991,186 @@ fn every_declaration_carries_its_lexical_path_as_segments() {
         pairs(&[("", "Base"), (".", "describe")])
     );
 }
+
+// --- overload sets (GM-348) ---------------------------------------------------
+
+/// One module with an `@overload` function set (one stub spelled
+/// `@typing.overload`), a method set whose implementation calls itself
+/// through `self`, a plain function, and a caller that calls into all of it.
+const OVERLOADS: &str = "import typing\n\
+from typing import overload\n\
+from pkg.other import thing, Thing\n\
+\n\
+\n\
+@overload\n\
+def coerce(value: int) -> int: ...\n\
+@typing.overload\n\
+def coerce(value: str) -> str: ...\n\
+def coerce(value):\n\
+\x20   return value\n\
+\n\
+\n\
+def plain():\n\
+\x20   return 1\n\
+\n\
+\n\
+class C:\n\
+\x20   @overload\n\
+\x20   def m(self, x: int) -> int: ...\n\
+\x20   @overload\n\
+\x20   def m(self, x: str) -> str: ...\n\
+\x20   def m(self, x):\n\
+\x20       return self.m(x)\n\
+\n\
+\n\
+def here(o):\n\
+\x20   coerce(1)\n\
+\x20   coerce(\"s\")\n\
+\x20   plain()\n\
+\x20   thing(1)\n\
+\x20   Thing()\n\
+\x20   o.m(1)\n";
+
+fn overloads_tree() -> Tree {
+    tree(&[
+        ("pkg/over.py", OVERLOADS),
+        ("pkg/other.py", "def thing(x):\n    return x\n\n\nclass Thing:\n    pass\n"),
+        (
+            "pkg/cond.py",
+            "import sys\n\nif sys.version_info >= (3, 11):\n    def load():\n        pass\nelse:\n    def load():\n        pass\n",
+        ),
+    ])
+}
+
+/// **GM-348 B9.** An `@overload` set is one node carrying every `def` as
+/// `declarations`: ordinals in source order, each range starting at its
+/// decorator, `hasBody` only on the implementation. `@typing.overload` counts
+/// (last dotted segment). The node row keeps the first stub (first-wins, the
+/// owner's review decision). A method set gets the same list.
+///
+/// Controls: in `Emitter::finish`, set `has_body: true` always (stubs claim
+/// bodies); or `has_body: definition.overload` (inverted); in `decls.rs`,
+/// match only the bare `overload` spelling (`@typing.overload` stub then
+/// reads as a body: two bodies).
+#[test]
+fn an_overload_set_carries_every_def_as_a_declaration() {
+    let tree = overloads_tree();
+    let graph = tree.extract("pkg/over.py");
+
+    let coerce = graph.node("coerce");
+    let declarations = coerce.declarations.as_ref().expect("an @overload set has a declaration list");
+    let shape: Vec<(u32, u32, u32, bool)> = declarations
+        .iter()
+        .map(|declaration| {
+            (declaration.ordinal, declaration.start_line, declaration.end_line, declaration.has_body)
+        })
+        .collect();
+    // Lines are 0-based: `@overload` on 5, `@typing.overload` on 7, the
+    // implementation's `def` on 9 with its body on 10.
+    assert_eq!(shape, vec![(0, 5, 6, false), (1, 7, 8, false), (2, 9, 10, true)]);
+    assert!(declarations.iter().all(|declaration| declaration.start_col == 0));
+    let signatures: Vec<Option<&str>> =
+        declarations.iter().map(|declaration| declaration.signature.as_deref()).collect();
+    assert!(signatures[0].is_some_and(|signature| signature.contains("value: int")), "{signatures:?}");
+    assert!(signatures[1].is_some_and(|signature| signature.contains("value: str")), "{signatures:?}");
+    // First-wins: the row is the first stub's.
+    assert_eq!(coerce.signature, declarations[0].signature);
+    assert!(coerce.range.start.line <= 6 && coerce.range.end.line <= 6, "{:?}", coerce.range);
+
+    let method = graph.node("C.m");
+    let has_body: Vec<bool> = method
+        .declarations
+        .as_ref()
+        .expect("a method overload set has a declaration list too")
+        .iter()
+        .map(|declaration| declaration.has_body)
+        .collect();
+    assert_eq!(has_body, vec![false, false, true]);
+
+    assert_eq!(graph.node("plain").declarations, None, "one def is no list");
+}
+
+/// **GM-348 B9b.** A conditional definition - two `def`s of one id, neither
+/// `@overload` - is a choice between alternatives, not an overload set: no
+/// list.
+///
+/// Control: in `Emitter::finish`, drop the `any(|definition| definition.overload)`
+/// gate (`load` gets a two-entry list).
+#[test]
+fn a_conditional_definition_gets_no_declaration_list() {
+    let tree = overloads_tree();
+    let graph = tree.extract("pkg/cond.py");
+    assert_eq!(graph.node("load").declarations, None);
+}
+
+/// **GM-348, the `OverloadCall` site.** Every call a type checker could bind
+/// to an overload records one, naming the structural `CALLS` edge it refines
+/// in `replaces`, at the callee's name:
+///
+/// - a call onto this file's overload set (two calls, one edge, two sites
+///   with the same `replaces`), and `self.m(x)` onto a method set;
+/// - a call onto a placeholder (`thing(1)`): this file cannot know whether
+///   it is overloaded, so the engine filters;
+/// - not a call onto a same-file function with no set (`plain()`), not a
+///   class-looking name (`Thing()`, a `REFERENCES` edge), and not a receiver
+///   call (`o.m(1)`), which stays a `ReceiverCall` with no `replaces`.
+///
+/// Controls: in `Bodies::emit`, drop the `self.emitter.overloaded(&to)` gate
+/// (`plain()` gets a site); gate the `Bound::There` arm on `false` (`thing`
+/// has none); pass a fresh `edge_id` with another `to` as `replaces` (it
+/// names no edge of the graph).
+#[test]
+fn an_overloadable_call_records_a_site_naming_its_structural_edge() {
+    let tree = overloads_tree();
+    let graph = tree.extract("pkg/over.py");
+
+    let sites: Vec<(&str, OpenSiteKind, u32, u32)> = graph
+        .0
+        .open_sites
+        .iter()
+        .map(|site| (site.name.as_str(), site.kind, site.position.line, site.position.col))
+        .collect();
+    assert_eq!(
+        sites,
+        vec![
+            ("m", OpenSiteKind::OverloadCall, 23, 20),
+            ("coerce", OpenSiteKind::OverloadCall, 27, 4),
+            ("coerce", OpenSiteKind::OverloadCall, 28, 4),
+            ("thing", OpenSiteKind::OverloadCall, 30, 4),
+            ("m", OpenSiteKind::ReceiverCall, 32, 6),
+        ],
+        "{:#?}",
+        graph.0.open_sites
+    );
+
+    let calls = |from: &str| -> Vec<String> {
+        let from = graph.node(from).id.clone();
+        graph
+            .edges(EdgeKind::Calls)
+            .into_iter()
+            .filter(|edge| edge.from_id == from)
+            .map(|edge| edge.id.clone())
+            .collect()
+    };
+    let edge_onto = |from: &str, to_name: &str| -> String {
+        let from_id = graph.node(from).id.clone();
+        graph
+            .edges(EdgeKind::Calls)
+            .into_iter()
+            .find(|edge| edge.from_id == from_id && graph.by_id(&edge.to_id).name == to_name)
+            .unwrap_or_else(|| panic!("a CALLS edge {from} -> {to_name}: {:?}", calls(from)))
+            .id
+            .clone()
+    };
+    let replaces: Vec<Option<&str>> =
+        graph.0.open_sites.iter().map(|site| site.replaces.as_deref()).collect();
+    let (self_m, coerce, thing) =
+        (edge_onto("C.m", "m"), edge_onto("here", "coerce"), edge_onto("here", "thing"));
+    assert_eq!(
+        replaces,
+        vec![Some(self_m.as_str()), Some(coerce.as_str()), Some(coerce.as_str()), Some(thing.as_str()), None]
+    );
+    assert!(graph.0.open_sites.iter().all(|site| site.edge_kind == EdgeKind::Calls));
+    // `plain()` keeps its edge and gets no site.
+    assert_eq!(graph.edge_between("here", "plain"), Some((EdgeKind::Calls, true)));
+}

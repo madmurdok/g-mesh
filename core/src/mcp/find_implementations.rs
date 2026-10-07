@@ -36,7 +36,7 @@ use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
 use super::query_shapes::QueryShapes;
-use super::session_hints;
+use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{error, internal_error, success};
 use super::{anchor, find_definition, provenance, FindImplementationsParams, SymbolQueryParams};
 
@@ -56,7 +56,7 @@ const SUPERTYPE_EDGE: &str = "SUPERTYPE_OF";
 /// from the wire JSON entirely, never emitted as `null` or `0` - exactly
 /// when `kind` is [`pagination::FILE_KIND`]; see that constant's doc comment
 /// for why both are pure redundancy on a `File`-kind row.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImplementationSite {
     implementing_symbol_id: String,
@@ -76,19 +76,20 @@ struct ImplementationSite {
 /// them agree on an item type.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ImplementationPage {
+struct ImplementationPage<'a> {
     /// See `anchor::AnchorInfo` - what `symbol_id`/`symbol_name` resolved to,
     /// so a caller asking about usages "elsewhere" doesn't need a separate
     /// `find_definition` call just to learn the anchor's own file/line.
-    anchor: anchor::AnchorInfo,
-    results: Vec<ImplementationSite>,
+    anchor: &'a anchor::AnchorInfo,
+    results: &'a [ImplementationSite],
     has_more: bool,
-    next_cursor: Option<String>,
+    next_cursor: Option<&'a str>,
     /// See `Page::all_unresolved` - true when every implementor in `results`
     /// came from an edge the linker couldn't confirm.
     all_unresolved: bool,
     /// `anchor::file_anchor_hint`, then `session_hints::ALL_UNRESOLVED` when
-    /// `all_unresolved`; absent (not `null`) when neither applies.
+    /// `all_unresolved`, then the once-per-session sentences its rows and
+    /// `provenance` trigger; absent (not `null`) when none applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
     /// See `super::provenance` - present only when the anchor's language
@@ -101,9 +102,11 @@ struct ImplementationPage {
 }
 
 /// Paginates the incoming `SUPERTYPE_OF` edges for `anchor_id` and resolves
-/// each one to the implementing/extending node. Split out from `handle` so
-/// tests can drive it with a small `page_size` without needing a page-size
-/// field on the public tool parameters.
+/// each one to the implementing/extending node, cut so that the response
+/// `response_len` measures for a candidate page fits
+/// `pagination::MAX_RESPONSE_BYTES`. Split out from `handle` so tests can
+/// drive it with a small `page_size` without needing a page-size field on
+/// the public tool parameters.
 fn list_implementations(
     conn: &Connection,
     anchor_id: &str,
@@ -111,7 +114,7 @@ fn list_implementations(
     file_paths: &[&str],
     page_size: usize,
     cursor: Option<&str>,
-    reserve: usize,
+    response_len: impl FnMut(&pagination::Page<ImplementationSite>) -> usize,
 ) -> anyhow::Result<pagination::Page<ImplementationSite>> {
     let page = pagination::paginate_edges(
         conn,
@@ -130,15 +133,13 @@ fn list_implementations(
     .context("failed to paginate SUPERTYPE_OF edges")?;
 
     let mut rows = Vec::with_capacity(page.results.len());
-    for pagination::ScoredEdge { edge, locality } in page.results {
+    for pagination::ScoredEdge { edge, rank } in page.results {
         let implementing = queries::get_node(conn, &edge.from_id)
             .context("failed to resolve implementing node")?
             .with_context(|| format!("edge {} points at missing node {}", edge.id, edge.from_id))?;
         let is_file = implementing.kind == pagination::FILE_KIND;
         rows.push(pagination::EdgeRow {
-            resolved: edge.resolved,
-            locality,
-            edge_id: edge.id.clone(),
+            rank,
             item: ImplementationSite {
                 implementing_symbol_id: implementing.id,
                 qualified_name: (!is_file).then_some(implementing.qualified_name),
@@ -151,7 +152,7 @@ fn list_implementations(
         });
     }
 
-    Ok(pagination::bound_page_leaving(rows, page.has_more, page.next_cursor, reserve))
+    Ok(pagination::bound_page_in_response(rows, page.has_more, page.next_cursor, response_len))
 }
 
 #[cfg(test)]
@@ -162,8 +163,9 @@ pub(super) fn handle(
     capabilities: &HashMap<String, Capabilities>,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
+    let hints = SessionHints::default();
     find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        handle_in(store, semantic, capabilities, params.clone())
+        handle_in(store, semantic, capabilities, &hints, params.clone())
     })
 }
 
@@ -172,6 +174,7 @@ fn handle_in(
     store: &Arc<IndexStore>,
     semantic: &find_definition::SemanticRung<'_>,
     capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -191,6 +194,24 @@ fn handle_in(
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
+    // A page's `hint` and `provenance`; `send` spends once-per-session hints,
+    // without it they are only peeked, for measuring.
+    let disclosures = |page: &pagination::Page<ImplementationSite>, send: bool| {
+        let touched = page.results.iter().map(|row| row.file_path.as_str());
+        let provenance = tier.clone().disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
+        let hint = session_hints::join([
+            hint,
+            page.all_unresolved.then_some(session_hints::ALL_UNRESOLVED),
+            hints.offer(
+                send,
+                !page.all_unresolved && page.results.iter().any(|row| !row.resolved),
+                HintKey::UnresolvedRow,
+                session_hints::UNRESOLVED_ROW,
+            ),
+            hints.offer(send, provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+        ]);
+        (hint, provenance)
+    };
     let page = list_implementations(
         &conn,
         &anchor.id,
@@ -198,19 +219,29 @@ fn handle_in(
         &file_paths,
         page_size,
         params.cursor.as_deref(),
-        tier.page_reserve(),
+        |candidate| {
+            let (hint, provenance) = disclosures(candidate, false);
+            pagination::wire_len(&ImplementationPage {
+                anchor: &anchor_info,
+                results: &candidate.results,
+                has_more: candidate.has_more,
+                next_cursor: candidate.next_cursor.as_deref(),
+                all_unresolved: candidate.all_unresolved,
+                hint,
+                provenance,
+            })
+        },
     )
     .map_err(|e| internal_error("failed to find implementations", e))?;
-    let touched = page.results.iter().map(|row| row.file_path.as_str());
-    let provenance = tier.disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
+    let (hint, provenance) = disclosures(&page, true);
 
     success(&ImplementationPage {
-        anchor: anchor_info,
-        results: page.results,
+        anchor: &anchor_info,
+        results: &page.results,
         has_more: page.has_more,
-        next_cursor: page.next_cursor,
+        next_cursor: page.next_cursor.as_deref(),
         all_unresolved: page.all_unresolved,
-        hint: session_hints::join([hint, page.all_unresolved.then_some(session_hints::ALL_UNRESOLVED)]),
+        hint,
         provenance,
     })
 }
@@ -285,7 +316,8 @@ struct TransitiveImplementationWalk {
     frontier_nodes: Vec<String>,
     resume_token: Option<String>,
     /// The anchor's `anchor::file_anchor_hint`, then `session_hints::truncated_by`
-    /// for a truncated walk; absent (not `null`) when neither applies.
+    /// for a truncated walk, then `session_hints::PROVENANCE` once per session
+    /// when `provenance` is set; absent (not `null`) when none applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
     /// See `super::provenance`. Present on a fresh walk under exactly the
@@ -428,15 +460,16 @@ fn from_root(
     anchor_node: &NodeRecord,
     resolved_by: find_definition::ResolvedBy,
     queried_as: Option<String>,
-    hint: Option<&'static str>,
     max_depth: Option<u32>,
     capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
 ) -> Result<CallToolResult, ErrorData> {
     // Carries the rung for the same reason the single-hop path does: a caller
     // must be able to tell an exact resolution from one the ladder suggested,
     // and `transitive: true` is the same query with a deeper walk, not a
     // different kind of answer. Only `continued` legitimately has no rung -
     // a resumed walk carries its anchor rather than resolving one.
+    let hint = anchor::file_anchor_hint(anchor_node);
     let anchor_info = anchor::AnchorInfo::with_rung(anchor_node, resolved_by, queried_as);
     let mut options = TraversalOptions::new(anchor_node.id.clone(), Direction::Incoming);
     options.edge_kind = Some(SUPERTYPE_EDGE.to_string());
@@ -452,6 +485,10 @@ fn from_root(
     let mut walk = bound_walk(result, max_depth, max_fanout, framing, Vec::new(), Vec::new());
     let touched = walk.results.iter().map(|row| row.file_path.as_str());
     walk.provenance = tier.disclose(conn, &anchor_node.language, Some(&anchor_node.file_path), touched);
+    walk.hint = session_hints::append(
+        walk.hint,
+        hints.once(walk.provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+    );
     success(&walk)
 }
 
@@ -474,6 +511,7 @@ fn continued(
     conn: &Connection,
     token: &str,
     capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
 ) -> Result<CallToolResult, ErrorData> {
     let state =
         resume_token::decode(token).map_err(|e| internal_error("failed to decode resume token", e))?;
@@ -501,6 +539,10 @@ fn continued(
             .disclose(conn, &language, None, touched)
             .filter(|block| block.semantic_tier == provenance::SemanticTier::Pending);
     }
+    walk.hint = session_hints::append(
+        walk.hint,
+        hints.once(walk.provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+    );
     success(&walk)
 }
 
@@ -519,8 +561,9 @@ pub(crate) fn dispatch(
     capabilities: &HashMap<String, Capabilities>,
     params: FindImplementationsParams,
 ) -> Result<CallToolResult, ErrorData> {
+    let hints = SessionHints::default();
     find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        dispatch_in(store, semantic, capabilities, params.clone())
+        dispatch_in(store, semantic, capabilities, &hints, params.clone())
     })
 }
 
@@ -529,6 +572,7 @@ pub(crate) fn dispatch_in(
     store: &Arc<IndexStore>,
     semantic: &find_definition::SemanticRung<'_>,
     capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
     params: FindImplementationsParams,
 ) -> Result<CallToolResult, ErrorData> {
     let FindImplementationsParams {
@@ -553,13 +597,13 @@ pub(crate) fn dispatch_in(
             );
         }
         let conn = store.read();
-        return continued(&conn, &token, capabilities);
+        return continued(&conn, &token, capabilities, hints);
     }
 
-    let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths };
+    let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths, answer: None };
 
     if !transitive.unwrap_or(false) {
-        return handle_in(store, semantic, capabilities, symbol_params);
+        return handle_in(store, semantic, capabilities, hints, symbol_params);
     }
 
     let conn = store.read();
@@ -570,8 +614,7 @@ pub(crate) fn dispatch_in(
     let resolved_by = resolved.by;
     let queried_as = resolved.queried_as;
     let anchor = resolved.node;
-    let hint = anchor::file_anchor_hint(&anchor);
-    from_root(&conn, &anchor, resolved_by, queried_as, hint, max_depth, capabilities)
+    from_root(&conn, &anchor, resolved_by, queried_as, max_depth, capabilities, hints)
 }
 
 #[cfg(test)]

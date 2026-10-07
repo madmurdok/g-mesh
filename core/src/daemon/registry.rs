@@ -88,7 +88,7 @@
 //! plugins, "is what is in this index still what today's pipeline would
 //! produce?" cannot be answered by looking at one of them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -101,8 +101,9 @@ use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::manifest::{self, extension_of, under_excluded_dir, DiscoveredPlugins};
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
+use crate::languages::LanguageOutcome;
 use crate::storage::index_store::{self, IndexStore};
-use crate::storage::schema::CURRENT_INDEXER_VERSION;
+use crate::storage::schema::{self, CURRENT_INDEXER_VERSION};
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// Where a language's plugin pid is recorded, relative to the project's state
@@ -299,7 +300,7 @@ pub fn indexer_version(discovered: &DiscoveredPlugins) -> String {
 /// exists for, one level up. The language is hashed alongside its fingerprint
 /// (and both are length-delimited by a NUL) so that renaming a plugin, or two
 /// languages swapping builds, cannot leave the concatenation unchanged.
-fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
+pub(crate) fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
     let mut fingerprinted: Vec<(&str, String)> = discovered
         .manifests
         .iter()
@@ -541,6 +542,11 @@ pub struct PluginRegistry {
     /// error, so it gets one line per extension for the whole daemon run
     /// rather than one per file - see [`unroutable_notice`](Self::unroutable_notice).
     unroutable: Mutex<HashSet<String>>,
+    /// Languages whose bulk walk failed, set once by the walk for the rest of
+    /// this daemon's life. Their files are not routed: a single-file update
+    /// would put part of a language into an index that holds it wholly or not
+    /// at all (ADR 0021).
+    failed_languages: Mutex<HashSet<String>>,
 }
 
 impl PluginRegistry {
@@ -593,7 +599,44 @@ impl PluginRegistry {
             embedding,
             supervisors: Mutex::new(HashMap::new()),
             unroutable: Mutex::new(HashSet::new()),
+            failed_languages: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Records the languages the bulk walk failed, replacing any earlier set.
+    pub(crate) fn set_failed_languages(&self, languages: impl IntoIterator<Item = String>) {
+        let mut failed = self.failed_languages.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *failed = languages.into_iter().collect();
+    }
+
+    /// Loads the languages the last walk failed (`language_outcome` rows
+    /// recorded as `Failed`), so a failed language stays out of single-file
+    /// updates across daemon restarts, not only in the process that walked:
+    /// see `docs/adr/0021-per-language-bulk-outcome.md`, section 2. The daemon
+    /// calls it once at startup, before anything that routes a file (the tool
+    /// listener, the watcher's consumer) exists; a later walk replaces the set
+    /// with its own result.
+    ///
+    /// A table that cannot be read leaves the set empty rather than failing
+    /// startup: the structural index is otherwise usable, and refusing to
+    /// serve it over this table would turn a degraded guarantee into an outage.
+    pub(crate) fn seed_failed_languages(&self, conn: &IndexStore) {
+        match conn.with(schema::language_outcomes) {
+            Ok(outcomes) => {
+                self.set_failed_languages(outcomes.into_iter().filter_map(|(language, outcome)| {
+                    matches!(outcome, LanguageOutcome::Failed { .. }).then_some(language)
+                }))
+            }
+            Err(err) => eprintln!(
+                "g-mesh daemon: could not read the recorded language outcomes - failed languages are not \
+                 excluded from incremental updates until the next walk: {err:#}"
+            ),
+        }
+    }
+
+    /// Whether the bulk walk failed `language`, so its files are not routed.
+    pub(crate) fn is_failed_language(&self, language: &str) -> bool {
+        self.failed_languages.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(language)
     }
 
     /// Which language claims `file_path`, by its extension; `None` if no
@@ -634,7 +677,7 @@ impl PluginRegistry {
     /// `Makefile` for entirely different reasons), and silently routing to
     /// only one of them would drop the other's reindex with no diagnostic at
     /// all. Empty is the overwhelmingly common answer - every language whose
-    /// `watch_files` is empty (the bundled TS plugin among them) can never
+    /// `watch_files` is empty can never
     /// appear here, by construction, which is also GM-272's answer to "must
     /// not break a plugin that does not know `workspaceChanged`": a plugin
     /// with nothing in `watch_files` is simply never a candidate for this
@@ -730,6 +773,13 @@ impl PluginRegistry {
     /// index reports present before this map is ever indexed into.
     pub fn receiver_call_capabilities(&self) -> HashMap<String, manifest::Capabilities> {
         self.discovered.manifests.iter().map(|(language, m)| (language.clone(), m.capabilities)).collect()
+    }
+
+    /// Every catalogued language with no discovered plugin
+    /// (`languages::missing`), in catalogue order. Needs no I/O, so the cold
+    /// start's MCP instructions can name them.
+    pub fn missing_languages(&self) -> Vec<&'static str> {
+        crate::languages::missing(&self.discovered).into_iter().map(|entry| entry.language).collect()
     }
 
     /// Every discovered language's `[plugin.non_symbol_queries]`, for the
@@ -878,7 +928,51 @@ impl PluginRegistry {
             return;
         }
         for language in workspace_languages {
+            if self.is_failed_language(&language) {
+                continue;
+            }
             self.workspace_file_changed(conn, &language, &file_path);
+        }
+    }
+
+    /// Announces one batch's created paths, per language, before any of them
+    /// is routed ([`route_settled_path`](Self::route_settled_path) still routes
+    /// every one of them afterwards). A path counts for the language that would
+    /// receive its `fileChanged`, under the same filters
+    /// [`file_changed`](Self::file_changed) applies: not a workspace file, claimed,
+    /// not under that language's `exclude_dirs`, not a failed language.
+    ///
+    /// Only a language with at least two such paths is told: one created file
+    /// cannot be both the importer and the target the notification exists for.
+    /// Only a running supervisor is asked, so nothing is spawned or woken; a
+    /// plugin that starts later reads the disk after the batch. Whether the
+    /// plugin understands the message is its manifest's `files_created`,
+    /// checked where the message is sent. A failed send is reported and
+    /// dropped: the per-file routing that follows meets the same process.
+    pub fn announce_created(&self, created: &[String]) {
+        let mut by_language: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for file_path in created {
+            if !self.workspace_language_matches(file_path).is_empty() {
+                continue;
+            }
+            let Some(language) = self.discovered.indexing_language(file_path) else { continue };
+            if self.is_failed_language(language) {
+                continue;
+            }
+            by_language.entry(language.to_string()).or_default().push(file_path.clone());
+        }
+        for (language, file_paths) in by_language {
+            if file_paths.len() < 2 {
+                continue;
+            }
+            let running = self.supervisors.lock().unwrap().get(&language).and_then(SupervisorSlot::running);
+            let Some(supervisor) = running else { continue };
+            if let Err(err) = supervisor.files_created(&file_paths) {
+                eprintln!(
+                    "g-mesh daemon: could not tell the {language} plugin about {} created files: {err:#}",
+                    file_paths.len()
+                );
+            }
         }
     }
 
@@ -922,6 +1016,9 @@ impl PluginRegistry {
         let Some(language) = self.discovered.indexing_language(&file_path).map(str::to_string) else {
             return;
         };
+        if self.is_failed_language(&language) {
+            return;
+        }
 
         match self.get_or_spawn(&language) {
             Ok(supervisor) => supervisor.file_changed(conn, file_path),
@@ -1209,6 +1306,10 @@ impl PluginRegistry {
         let Some(language) = self.language_for(file_path).map(str::to_string) else {
             return Ok(None);
         };
+        // Not in the index at all, so there is nothing to keep fresh.
+        if self.is_failed_language(&language) {
+            return Ok(None);
+        }
 
         if !conn.with(|conn| staleness::is_stale(conn, &self.project_root, file_path))? {
             return Ok(Some(StalenessOutcome::AlreadyFresh));

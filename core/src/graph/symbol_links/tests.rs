@@ -734,7 +734,7 @@ fn two_reexport_branches_offering_one_name_leave_the_edge_unresolved() {
     assert_eq!(edge_source(&conn, &edge), "syntactic");
 
     // What the semantic pass answers, in the shape it answers it: the edge
-    // re-sent under its own id (`plugins/typescript/src/semanticPass.ts`), which
+    // re-sent under its own id, which
     // is why this needed no storage path of its own - `apply_diff`'s
     // ON CONFLICT rewrites the row in place.
     //

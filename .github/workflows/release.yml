@@ -19,15 +19,17 @@
 # WHAT THESE ARTIFACTS ARE
 #
 # Since task #65 each archive carries a working install: the core binary and
-# the JS/TS plugin compiled to a self-contained executable (Node's SEA - it
-# embeds the runtime, so the machine needs no Node.js) in `plugins/typescript/`.
-# Since GM-283 it also carries the Go plugin, one static `CGO_ENABLED=0`
-# binary cross-compiled for the target in `plugins/go/`, and since GM-288 the
-# Rust plugin, a plain cargo binary built in the same workspace as core for
-# the same target, in `plugins/rust/` - see `scripts/bundle-rust-plugin.sh`
-# for why that needs no extra toolchain setup here (unlike the JS/TS plugin,
-# it is built by the Rust toolchain this file already installs for core).
-# Since GM-298 the same is true of the Python plugin, in `plugins/python/` -
+# the JS/TS plugin in `plugins/typescript/`. Since GM-326 that plugin is a
+# plain cargo binary built in the same workspace as core for the same target
+# (`scripts/bundle-plugin.sh`); it was a Node single-executable application
+# until GM-324/GM-351 ported it to Rust, which is why no job here sets up
+# Node any more. Since GM-283 the archive also carries the Go plugin, one
+# static `CGO_ENABLED=0` binary cross-compiled for the target in
+# `plugins/go/`, and since GM-288 the Rust plugin, a plain cargo binary built
+# in the same workspace as core for the same target, in `plugins/rust/` - see
+# `scripts/bundle-rust-plugin.sh` for why that needs no extra toolchain setup
+# here (it is built by the Rust toolchain this file already installs for
+# core). Since GM-298 the same is true of the Python plugin, in `plugins/python/` -
 # it is a tree-sitter structural extractor written in Rust, not a program run
 # by a Python interpreter, so it needs no Python on this runner and no Python
 # on the machine that later runs it either; see
@@ -46,7 +48,9 @@
 #    against it in the first step of every build job so a mismatch costs a
 #    minute instead of four 90-minute builds. Since GM-288, `wire/Cargo.toml`,
 #    `plugins/sdk/Cargo.toml` and `plugins/rust/Cargo.toml` must say the same
-#    version too, and since GM-298 so must `plugins/python/Cargo.toml` -
+#    version too, since GM-298 so must `plugins/python/Cargo.toml`, and since
+#    GM-351 `plugins/typescript/Cargo.toml` (and its plugin.toml's
+#    `plugin_version`, which the shipped manifest carries unchanged) -
 #    `scripts/cut-release.sh` refuses if any of them disagree (see that
 #    script's own header), which is the easiest way to check this by hand as
 #    well.
@@ -57,7 +61,9 @@
 #    the publish job `needs: build`, and a three-platform Release is worse than
 #    none, because an installer cannot tell "not built yet" from "your platform
 #    is not supported".
-# 4. A DRAFT Release appears with nine assets. Drafts are invisible to the
+# 4. A DRAFT Release appears with 41 assets (per target: the main archive,
+#    one plugin asset per bundled language, and a `.sha256` for each; plus
+#    SHA256SUMS). Drafts are invisible to the
 #    public and fire no `release: published` event, so review it - notes, asset
 #    list, checksums - and press "Publish release" yourself.
 #
@@ -71,7 +77,17 @@
 #
 #   g-mesh-v<version>-<target>.tar.gz          (.zip for the windows target)
 #   g-mesh-v<version>-<target>.tar.gz.sha256   one per archive
-#   SHA256SUMS                                 all four, for `sha256sum -c`
+#   g-mesh-plugin-<language>-v<version>-<target>.tar.gz
+#                                              one per bundled language and
+#                                              target, .tar.gz on every target:
+#                                              the staged plugins/<language>/
+#                                              directory (see build-targets.sh)
+#   g-mesh-plugin-<language>-v<version>-<target>.tar.gz.sha256
+#   SHA256SUMS                                 every archive above (20), for
+#                                              `sha256sum -c`
+#
+# `build-targets.sh --asset-names <target>` lists the main archive and its
+# `.sha256` first; two steps below index those two lines by position.
 #
 # Both checksum forms are published on purpose: the per-asset file is one small
 # extra fetch for an installer that already knows which single archive it
@@ -83,10 +99,8 @@
 # and only the `<version>` and `<target>` parts vary - which is why the names
 # are generated, not typed.
 #
-# This is also why every job needs Node: the TS plugin is built here, and the
-# runtime it embeds is the one `setup-node` installs on that runner. Pinning
-# that version pins what ships. Every job also needs Go, for the second
-# bundled plugin (`plugins/go`, GM-283) - `setup-go` only, no per-target
+# Every job needs Go, for the one bundled plugin that is not a cargo
+# workspace member (`plugins/go`, GM-283) - `setup-go` only, no per-target
 # runner requirement, since that plugin cross-compiles instead of embedding a
 # runtime (see scripts/bundle-go-plugin.sh).
 # ---------------------------------------------------------------------------
@@ -280,15 +294,6 @@ jobs:
           rustup default stable
           rustc -vV
 
-      # Pinned, not `lts/*`: this Node is not just a build tool here, it is the
-      # runtime that gets copied into the shipped plugin executable (see
-      # scripts/bundle-plugin.sh), so an unpinned version would silently change
-      # what users run. 20.x is the floor Node's SEA support and the plugin's
-      # own `engines` field both require.
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "22.x"
-
       # The Go plugin (plugins/go, GM-283) needs no native runner - it
       # cross-compiles a static, CGO-free binary for any target from any
       # host (`GOOS`/`GOARCH`, `CGO_ENABLED=0`; see
@@ -310,13 +315,12 @@ jobs:
         shell: bash
         run: bash scripts/build-targets.sh ${{ matrix.target }}
 
-      # `node-version` above is not a CI detail: it decides which Node runtime
-      # gets copied into the shipped plugin executable, so it is as much a
-      # property of the release as the rustc that compiled the binary. Recorded
-      # per target rather than assumed uniform, because `22.x` resolves to
-      # whatever patch each runner image happens to carry. The publish job
-      # turns these files into a table in the release notes; nothing fails if
-      # one is missing.
+      # The toolchains that produced this target's archive: rustc built core
+      # and the three cargo plugins (JS/TS, Rust, Python), go built the Go
+      # plugin. Recorded per target rather than assumed uniform, because each
+      # runner image carries its own patch versions. The publish job turns
+      # these files into a table in the release notes; nothing fails if one
+      # is missing.
       - name: Record what this artifact carries
         shell: bash
         run: |
@@ -324,7 +328,6 @@ jobs:
           {
             echo "target=${{ matrix.target }}"
             echo "runner=${{ matrix.runner }}"
-            echo "node=$(node --version)"
             echo "go=$(go version)"
             echo "rustc=$(rustc --version)"
           } > "dist/meta/${{ matrix.target }}.txt"
@@ -353,7 +356,7 @@ jobs:
         shell: bash
         run: |
           stage_dir="$(bash scripts/build-targets.sh --stage-dir ${{ matrix.target }})"
-          bash scripts/release-smoke.sh "$stage_dir" ${{ matrix.target }}
+          bash scripts/release-smoke.sh "$stage_dir" ${{ matrix.target }} dist
 
       # GM-333. `scripts/install.ps1` is 616 lines that, until this step, had
       # never been *executed* anywhere - ci.yml's "install.ps1 parses under
@@ -649,38 +652,58 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
 
+          plugin_line=""
           {
             echo "## Downloads"
             echo
-            echo "| target | archive | Node runtime inside | Go compiler used | built with |"
-            echo "| --- | --- | --- | --- | --- |"
+            echo "| target | archive | Go compiler used | built with |"
+            echo "| --- | --- | --- | --- |"
             for target in $(bash scripts/build-targets.sh --list); do
               # First line is the archive, second is its .sha256. Piping to
               # `head -1` would risk a SIGPIPE failure under `pipefail`.
               names="$(G_MESH_VERSION="$version" bash scripts/build-targets.sh --asset-names "$target")"
               archive="${names%%$'\n'*}"
 
-              node="unknown"
               go="unknown"
               rustc="unknown"
               meta="dist/meta/$target.txt"
               if [ -f "$meta" ]; then
-                node="$(awk -F= '$1 == "node" { print $2 }' "$meta")"
                 go="$(awk -F= '$1 == "go" { print $2 }' "$meta")"
                 rustc="$(awk -F= '$1 == "rustc" { print $2 }' "$meta")"
               fi
 
-              echo "| \`$target\` | \`$archive\` | $node | $go | $rustc |"
+              echo "| \`$target\` | \`$archive\` | $go | $rustc |"
+
+              # Every line after the main archive's pair alternates plugin
+              # asset, .sha256.
+              plugin_line="$plugin_line"$'\n'"- \`$target\`:"
+              n=0
+              while IFS= read -r name; do
+                n=$((n + 1))
+                if [ "$n" -gt 2 ] && [ $((n % 2)) -eq 1 ]; then
+                  plugin_line="$plugin_line \`$name\`"
+                fi
+              done <<< "$names"
             done
 
             echo
+            echo "### Plugin assets"
+            echo
+            echo "Each bundled plugin is also published on its own, as the archive's"
+            echo "\`plugins/<language>/\` directory. Unpacking one into \`plugins/\` beside the"
+            echo "\`g-mesh\` executable restores that language (\`tar -xzf <asset> -C <install dir>/plugins\`):"
+            echo "$plugin_line"
+
+            echo
             echo "Every archive unpacks to a directory holding the \`g-mesh\` binary, the"
-            echo "JS/TS plugin as a self-contained executable in \`plugins/typescript/\`, the"
+            echo "JS/TS plugin as a native binary in \`plugins/typescript/\`, the"
             echo "Go plugin as a static binary in \`plugins/go/\`, the Rust plugin in"
             echo "\`plugins/rust/\` and the Python plugin in \`plugins/python/\`. The machine"
-            echo "running it needs no Node.js, no Go and no other toolchain - and, for the"
-            echo "Python plugin's structural tier, no Python interpreter either; a future"
-            echo "semantic tier would need \`pyright\` installed separately."
+            echo "running it needs no Node.js, no Go and no other toolchain for the structural"
+            echo "graph of any of the four languages. The JS/TS semantic tier uses \`vtsls\`"
+            echo "(on \`PATH\`, in the project's \`node_modules/.bin\`, or through \`npx\`),"
+            echo "which needs Node.js; without it the structural tier answers alone. A future"
+            echo "Python semantic tier would need \`pyright\` installed separately."
             echo "\`g-mesh model fetch\` downloads the embedding model \`search_code\` needs."
             echo
             echo "### Verifying a download"
@@ -690,8 +713,8 @@ jobs:
             echo "sha256sum --ignore-missing -c SHA256SUMS   # or: shasum -a 256 --ignore-missing -c SHA256SUMS"
             echo '```'
             echo
-            echo "\`SHA256SUMS\` lists every archive; \`--ignore-missing\` is what keeps it from"
-            echo "reporting the three you did not download as failures. Each archive also has"
+            echo "\`SHA256SUMS\` lists every archive and plugin asset; \`--ignore-missing\` is what"
+            echo "keeps it from reporting the ones you did not download as failures. Each also has"
             echo "its own \`.sha256\` beside it if you would rather check just the one."
           } > notes.md
 

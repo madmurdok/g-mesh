@@ -9,8 +9,8 @@
 # resolve an anchor, and what a truncated page does). Each `expect` is a SET
 # of `"filePath:qualifiedName"` strings - order never matters.
 #
-# The project this runs against is ./project - seven files, read alongside
-# this one so each case below can be checked by hand against the real
+# The project this runs against is ./project, read alongside this one so
+# each case below can be checked by hand against the real
 # source rather than taken on faith.
 #
 # Three fields below are new in GM-386 and read the same way everywhere they
@@ -41,10 +41,9 @@
 [[callers]]
 symbol = "add"
 file = "src/math.ts"
-# GM-382. This plugin's semantic tier is the TypeScript compiler itself,
-# resolved from the plugin's own `node_modules` rather than from the user's
-# machine, so it is the least likely of the four to be missing - but the
-# assertion is not "it cannot happen", it is "it did not happen here":
+# GM-382. This plugin's semantic tier is vtsls, found on `PATH`, in the
+# project's `node_modules/.bin` or through `npx`, so it can be
+# missing like the other three - the assertion is "it did not happen here":
 # `"silent"` requires the response to carry no `provenance` block, and fails
 # if this plugin ever answers while claiming its semantic tier was absent.
 # Every other entry in this file requires the same thing by saying nothing,
@@ -84,6 +83,12 @@ file = "src/math.ts"
 expect = ["src/main.ts:run", "src/main.ts:useNamespaceImport"]
 # Decision 12: both rows are in main.ts, one call each.
 files = ["src/main.ts:2"]
+# Both the namespace row and the tally need the semantic pass, and the set
+# is compared exactly, so no structural spelling of this entry is true in
+# both arms. The structural half - `run` found through the named re-export
+# with the semantic pass off - is asserted by that same core test, which runs
+# this entry without the skip flag and requires `run` in its actual set.
+tier = "semantic"
 
 [[callers]]
 symbol = "format"
@@ -101,9 +106,8 @@ expect = ["src/main.ts:useOverloads"]
 # exempts `[[callers]]` from its duplicate-row check, so this count is the
 # only thing in the whole kit that can see whether both bindings survived.
 files = ["src/main.ts:2"]
-# **`tier = "semantic"` is new in GM-386, and it is this file's first.** The
-# second binding is tsserver's work: without a semantic pass only one CALLS
-# edge exists, the tally is then not worth sending
+# The tally needs the semantic tier: the second binding is tsserver's work.
+# Without a semantic pass only one CALLS edge exists, the tally is then not worth sending
 # (`pagination::tally_is_worth_sending`), and the response carries no `files`
 # at all. Since decision 12 makes an omitted `files` an assertion in its own
 # right, there is no way to write this entry so that it is true in both arms -
@@ -113,48 +117,27 @@ files = ["src/main.ts:2"]
 # `a_namespace_import_caller_needs_the_semantic_pass_to_resolve` was updated
 # to expect it among the failures of its structural arm, naming the tally as
 # the reason rather than dropping the entry from its list.
-#
-# Tagging costs nothing here today: nothing runs this fixture with
-# `--skip-semantic-expectations` (that flag's callers are the Go CI job and
-# the rust/python conformance suites), so the tag changes no run. What it does
-# is say, in the file, that this assertion depends on the compiler tier.
 tier = "semantic"
 
-# --- callers: the receiver call this language never resolves (GM-385) --------
+# --- callers: a receiver call, resolved by the semantic tier ----------------
 #
-# `src/shapes.ts`'s `viaGreetable(g: Greetable)` calls `g.greet()`. In the
-# other three bundled plugins that call produces an edge onto whatever
-# declaration the receiver's *static* type names - `go/types` files it under
-# the interface method, rust-analyzer under the trait's, pyright under the
-# annotation's class. This plugin files it nowhere: `plugin.toml` declares
-# `receiver_calls = "unresolved"` **and** `receiver_calls_structural =
-# "unresolved"`, so neither tier emits anything and this page is empty.
+# `src/shapes.ts`'s `viaGreetable(g: Greetable)` calls `g.greet()`. The
+# structural tier has no type for `g`, so it records a receiver-call site and
+# no edge (`receiver_calls_structural = "unresolved"`); the semantic tier asks
+# vtsls where the call lands, and tsserver names the declaration the
+# receiver's *static* type declares - the interface method, the same answer
+# `go/types`, rust-analyzer and pyright give for their own fixtures
+# (`receiver_calls = "resolved"`).
 #
-# That pair of manifest fields had no check behind it until this entry
-# existed. The fixture carried no receiver call at all, so a plugin that
-# quietly started resolving them - or a manifest edited to claim it did -
-# changed nothing any expectation could see.
-#
-# **No `tier` key, and this entry must pass in the structural arm too.** That
-# is the assertion rather than a concession: `core/tests/plugin_check.rs`'s
-# `a_namespace_import_caller_needs_the_semantic_pass_to_resolve` runs this
-# same file against a `semantic_pass = false` manifest and lists this entry
-# among the ones a missing tier must not disturb. An entry that differed
-# between those two arms would mean tsserver had started answering receiver
-# calls, which is exactly what the manifest says it does not.
-#
-# Read beside `plugins/go`'s `Conn.Close`, `plugins/rust`'s
-# `shapes::<Circle as Shape>::area` and `plugins/python`'s
-# `Greeter.describe`: all four fixtures now assert an empty `[[callers]]`
-# page for a method reached through a receiver, and the four comments are
-# where the two different reasons are kept apart. Here there is no edge to
-# narrow. There the edge exists and points at the base, which is what
-# `core/src/mcp/instructions.rs`'s `P4_STATIC_RECEIVER` discloses once per
-# session for those three languages and never for this one.
+# The structural arm answers nothing, so `tests/conformance.rs`'s structural run without the skip flag lists it
+# among the entries a missing tier must fail, as does
+# `core/tests/plugin_check.rs`'s
+# `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`.
 [[callers]]
 symbol = "Greetable#greet"
 file = "src/shapes.ts"
-expect = []
+expect = ["src/shapes.ts:viaGreetable"]
+tier = "semantic"
 
 # --- references (includes SUPERTYPE_OF, which callers/implementations don't share) -
 
@@ -166,11 +149,9 @@ file = "src/shapes.ts"
 # USAGE_EDGE_KINDS) but find_callers does not - proving that inclusion.
 #
 # `viaGreetable` joined this set in GM-385: its parameter annotation
-# `g: Greetable` is an ordinary same-file REFERENCES edge. Worth noticing
-# what that makes this entry say next to the `[[callers]] Greetable#greet`
-# entry above - the *type* is referenced by the very function whose call to
-# its *method* produces nothing. A reader who follows the type finds the
-# call site; a reader who follows the method does not.
+# `g: Greetable` is an ordinary same-file REFERENCES edge. Since GM-325 the
+# `[[callers]] Greetable#greet` entry above also expects `viaGreetable`, so the
+# type and its method now agree: following either one reaches the call site.
 expect = ["src/shapes.ts:Greeter", "src/shapes.ts:viaGreetable"]
 # Decision 12: two rows, one file, so the response carries the tally and this
 # entry has to say so. It was absent - and asserted absent - until the second
@@ -255,14 +236,14 @@ symbol = "nosuchname"
 contains = ["no symbol named 'nosuchname' found"]
 # Like Rust's entry, this is the terse arm rather than GM-367's import-only
 # one, and for the same reason stated in its own file rather than left
-# implicit: every import in this project is relative and lands on a file the
-# fixture contains. The `[[imports]]` entry above is the direct evidence -
-# all four of its rows are bare file paths, and decision 2 records that a
+# implicit: every import in this project that resolves lands on a file the
+# fixture contains. The `[[imports]]` entries are the direct evidence -
+# all their rows are bare file paths, and decision 2 records that a
 # `container:` row in TypeScript is precisely an import that resolved to
 # nothing. There are none, so there is no import-only name here to refuse.
 #
 # What this entry asserts is that an unknown name is refused rather than
-# answered: with five real declarations in scope and a semantic tier
+# answered: with real declarations in scope and a semantic tier
 # running, "nosuchname" must still come back as nothing. See
 # `plugins/rust/conformance/expect.toml` for why that is deterministic here.
 
@@ -273,3 +254,201 @@ symbol = "Greetable.greet"
 # `#`. The qualifiedName-suffix rung matches by exact spelling, so the same
 # path written with `.` is refused rather than answered.
 contains = ["no symbol named 'Greetable.greet' found"]
+
+# =============================================================================
+# Behaviours the TypeScript plugin must keep however it is implemented. Each
+# group below exercises its own files under ./project, and every symbol they
+# declare is unique in the fixture so the entries above stay unambiguous.
+# =============================================================================
+
+# --- workspaces, a `dist/` entry that was never built, and `extends` paths ---
+#
+# `packages/geom/package.json` names `@fx/geom` with `main` and both `exports`
+# keys pointing at `./dist/prod/index.js`, which does not exist. The root
+# `package.json`'s `workspaces` makes `@fx/geom` resolvable at all; a missing
+# `dist/` target falls back to the package's `src/`. `~geom/*` comes from
+# `packages/tsconfig.base.json`, reached only through
+# `packages/app/tsconfig.json`'s `extends`, and has no `baseUrl`, so its
+# target is relative to the config that declares it.
+
+[[callers]]
+symbol = "pointOf"
+file = "packages/geom/src/point.ts"
+# `pointOf` is `export const pointOf = (...) => ...`: it is anchorable only
+# because a const arrow is extracted as a function. One caller per specifier
+# form: the bare package root, a package subpath, and the `paths` alias.
+expect = [
+    "packages/app/src/alias.ts:viaAlias",
+    "packages/app/src/root.ts:viaRoot",
+    "packages/app/src/subpath.ts:viaSubpath",
+]
+
+[[importers]]
+file = "packages/geom/src/index.ts"
+# The bare `@fx/geom` import lands on the package's source entry, not on its
+# unbuilt `dist/` entry. The subpath import goes to point.ts directly.
+expect = ["packages/app/src/root.ts"]
+
+[[imports]]
+file = "packages/app/src/alias.ts"
+expect = ["packages/geom/src/point.ts"]
+
+# --- ESM specifiers: `./x.js` naming `./x.ts`, and a directory import --------
+
+[[imports]]
+file = "src/esm/use.ts"
+expect = ["src/esm/dir/index.ts", "src/esm/lib.ts"]
+
+[[callers]]
+symbol = "fromLib"
+expect = ["src/esm/use.ts:viaJsSpecifier"]
+
+# --- members: a bare name never binds a class member; `Owner.member()` -------
+#
+# `src/members.ts` declares a module function `pick` and a method
+# `Store#pick` whose body calls the bare `pick()` - which is the module
+# function. The positive side (`[[callers]] symbol = "pick"`) cannot be
+# written: both declarations sit in one file, so `file` cannot narrow the
+# bare name to one anchor. The negative side is asserted instead: the method
+# has no callers, so the bare call inside it did not bind to it.
+
+[[callers]]
+symbol = "Store#pick"
+expect = []
+
+[[callers]]
+symbol = "Store.drop"
+# A static member is joined by `.`, and `Store.drop()` resolves to it.
+expect = ["src/members.ts:clear"]
+
+[[definition]]
+symbol = "Store#pick"
+# An instance member is joined by `#`.
+expect = ["src/members.ts:Store#pick"]
+
+# --- heritage with a generic head --------------------------------------------
+
+[[implementations]]
+symbol = "Container"
+# `Box implements Container<Item>`, cross-file. `SpecialBox extends Box` is
+# not listed: implementations are direct.
+expect = ["src/heritage/box.ts:Box"]
+
+[[references]]
+symbol = "Item"
+# `Item` appears only as the heritage clause's type argument, and that is a
+# reference from `Box`.
+expect = ["src/heritage/box.ts:Box"]
+
+# --- a default export imported under another name ----------------------------
+
+[[callers]]
+symbol = "MenuGroup"
+# `import DropdownMenuGroup from "./menuGroup"`. The structural pass leaves
+# the default import unbound; the semantic pass binds it.
+expect = ["src/defaults/use.ts:renderGroup"]
+tier = "semantic"
+
+# --- an ambiguous `export *` barrel ------------------------------------------
+#
+# `src/amb/index.ts` re-exports both `./a` and `./b`, which each export
+# `mutate`. TypeScript binds the import in `src/amb/use.ts` to the first
+# `export *` (`./a`); the structural pass binds it to neither. Swapping the
+# two lines in index.ts swaps these two sets.
+
+[[callers]]
+symbol = "mutate"
+file = "src/amb/a.ts"
+expect = ["src/amb/use.ts:useMutate"]
+tier = "semantic"
+
+[[callers]]
+symbol = "mutate"
+file = "src/amb/b.ts"
+# Empty in both arms, so untagged: the semantic tier binds the import to
+# `./a`, and the structural tier to neither branch. A `tier = "semantic"` tag
+# would require it to fail in the structural arm, where it passes.
+expect = []
+
+# --- calls inside arrows, callbacks, class fields, and at top level ----------
+
+[[callers]]
+symbol = "leaf"
+# A const arrow's body is attributed to the const, a callback's to the
+# enclosing function, and a class-field arrow's to the field.
+expect = [
+    "src/callbacks.ts:Holder#fire",
+    "src/callbacks.ts:arrowCaller",
+    "src/callbacks.ts:viaCallback",
+]
+files = ["src/callbacks.ts:3"]
+# The module-level `leaf();` has no enclosing declaration: it is a usage from
+# the file, not a caller, and is disclosed here rather than listed. It is
+# counted, but its file is not repeated: `files` above already names it.
+excluded_references = { count = 1, files = [] }
+
+# --- a parameter that shadows a module function ------------------------------
+
+[[callers]]
+symbol = "helper"
+# `outer(helper: () => void)` calls its parameter, not the module function.
+expect = ["src/shadow.ts:inner"]
+
+# --- dynamic imports ---------------------------------------------------------
+
+[[imports]]
+file = "src/dyn/load.ts"
+# ``import(`${DIR}/alpha`)`` folds the same-file `const DIR = "./plugins"`
+# into a path. ``import(`./locales/${code}.json`)`` cannot be folded and
+# records nothing: an import that resolves to no file would appear here as
+# a `container:<specifier>` row, so this exact set also asserts its absence.
+expect = ["src/dyn/plugins/alpha.ts"]
+
+# --- package.json `imports` --------------------------------------------------
+
+[[imports]]
+file = "src/privateUse.ts"
+# `#int/secret` through the root package.json's `"#int/*"` mapping.
+expect = ["src/int/secret.ts"]
+
+# --- declaration merging, ambient overloads, dotted namespaces ---------------
+
+[[definition]]
+symbol = "Settings"
+# Two `interface Settings` statements are one node.
+expect = ["src/merge.ts:Settings"]
+
+[[definition]]
+symbol = "ambient"
+# Two bodiless `export declare function ambient` signatures are one node.
+expect = ["src/ambient.ts:ambient"]
+
+[[definition]]
+symbol = "deepFn"
+# Declared inside `export namespace Outer.Inner`: the dotted name is kept as
+# one path, joined by `.`.
+expect = ["src/ambient.ts:Outer.Inner.deepFn"]
+
+# --- a namespace member read that is not a call ------------------------------
+
+[[references]]
+symbol = "target"
+# `export const keep = lib.target` through `import * as lib from "./lib"`.
+# The structural pass cannot see a member of a namespace import.
+expect = ["src/nsref/use.ts:keep"]
+tier = "semantic"
+
+# --- an inherited method through `this` and `super` -------------------------
+
+[[callers]]
+symbol = "Base#hello"
+# `src/inherit/derived.ts`'s `Child#viaThis` calls `this.hello()` and
+# `Other#viaSuper` calls `super.hello()`; neither class declares `hello`, and
+# `Base` is imported from another file. The structural tier binds a
+# `this.m()` / `super.m()` only to a member declared in the calling file, so
+# both are receiver-call sites it leaves open; vtsls lands both on
+# `Base#hello`.
+expect = ["src/inherit/derived.ts:Child#viaThis", "src/inherit/derived.ts:Other#viaSuper"]
+# Decision 12: two rows in one file.
+files = ["src/inherit/derived.ts:2"]
+tier = "semantic"

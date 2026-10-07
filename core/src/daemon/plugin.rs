@@ -1,26 +1,16 @@
 //! Spawns a language plugin as a child process from its manifest, performs
 //! its handshake, and gives the rest of the daemon a way to route
 //! `FileChanged` requests to it and apply the diff it answers with - the
-//! missing link between the daemon (Rust) and a plugin process (for the
-//! bundled one: `node` plus a compiled script in a checkout, a self-contained
-//! executable that carries its own runtime in a release archive - see
-//! `launch_command_for`; for any other, whatever a discovered manifest's
-//! `command`/`args` name).
+//! missing link between the daemon (Rust) and a plugin process (whatever a
+//! discovered manifest's `command`/`args` name).
 //!
 //! [`PluginProcess`]/[`PluginState`] here are generic over any one plugin;
 //! discovery and per-language routing live in `daemon::manifest`
 //! (`~/.g-mesh/plugins/<language>/plugin.toml` + the bundled root) and
 //! `daemon::registry::PluginRegistry`, which spawns one `PluginProcess` per
-//! discovered language, lazily, the first time anything needs it. This
-//! module keeps a narrower "the bundled JS/TS plugin specifically" surface
-//! too - [`bundled_manifest`], [`plugin_entry_path`], [`PLUGIN_PATH_ENV`],
-//! [`bundled_fingerprint`] - for the handful of callers that genuinely mean
-//! that one plugin rather than whatever the registry has discovered:
-//! `daemon::build_stamp` compares one *running daemon's* JS/TS build against
-//! another's (a question about this install, not about what filled any one
-//! project's index), and a couple of tests want a bare manifest without a
-//! `plugin.toml` fixture. See each item's own doc comment for why it is not
-//! dead code.
+//! discovered language, lazily, the first time anything needs it. Every
+//! plugin, the bundled ones included, is found by that discovery; this module
+//! has no hand-written view of any one plugin.
 //!
 //! # Crash detection and lazy relaunch
 //!
@@ -47,22 +37,14 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::daemon::manifest::{Capabilities, PluginManifest, WorkspaceConfig};
+use crate::daemon::manifest::PluginManifest;
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::handshake;
 use crate::protocol::jsonrpc::{is_timeout, write_message};
-use crate::protocol::types::{
-    ControlEnvelope, ControlMessage, RequestId, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION,
-};
+use crate::protocol::types::{ControlEnvelope, ControlMessage, RequestId, JSONRPC_VERSION};
 use crate::storage::index_store::{self, IndexStore};
 use crate::watcher::apply::{apply_file_change as apply_file_change_diff, apply_semantic_pass};
 use crate::watcher::staleness::{self, StalenessOutcome};
-
-/// Overrides where the plugin's compiled entry point lives. Real installs
-/// never need this - the default already resolves to the bundled plugin -
-/// but it lets the integration test suite point at a build without
-/// depending on the daemon binary's own install location.
-pub const PLUGIN_PATH_ENV: &str = "G_MESH_JS_TS_PLUGIN_PATH";
 
 /// How often [`PluginProcess::shutdown`] checks whether the plugin has taken
 /// the hint and exited.
@@ -302,134 +284,15 @@ pub const FINGERPRINT_UNAVAILABLE: &str = "unavailable";
 const BASELINE_FINGERPRINT_IGNORE: &[&str] =
     &[".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"];
 
-/// File name of the bundled plugin's single-executable build, as
-/// `scripts/bundle-plugin.sh` stages it into a release archive. The two must
-/// agree: this is how a binary that was compiled somewhere else entirely finds
-/// the plugin sitting next to it.
-const BUNDLED_PLUGIN_EXE: &str =
-    if cfg!(windows) { "g-mesh-plugin-typescript.exe" } else { "g-mesh-plugin-typescript" };
-
-/// Where this install's bundled JS/TS plugin is, in precedence order:
+/// The language whose pid file `daemon::plugin_pid_path` resolves: the
+/// bundled TypeScript plugin's manifest `language`, which is also its
+/// directory name under a plugin root.
 ///
-/// 1. [`PLUGIN_PATH_ENV`], for the test suite and anyone pointing a binary at
-///    a plugin build of their own.
-/// 2. The single-executable plugin a release archive unpacks beside the core
-///    binary (`<exe dir>/plugins/typescript/g-mesh-plugin-typescript`). Probed
-///    for existence rather than assumed, because it is exactly what a checkout
-///    does not have.
-/// 3. The compiled entry point in this repo's own tree, baked in at compile
-///    time - `core/` and `plugins/typescript/` are sibling directories here.
-///
-/// The order matters in only one direction: an installed layout has no
-/// `CARGO_MANIFEST_DIR` to resolve, and a checkout has no executable-adjacent
-/// `plugins/`, so on any real machine at most one of (2) and (3) exists. Where
-/// both somehow do, the artifact that shipped with the running binary wins -
-/// see `daemon::manifest::bundled_roots`, which orders its roots the same way
-/// for the same reason.
-pub(crate) fn plugin_entry_path() -> PathBuf {
-    if let Ok(over) = std::env::var(PLUGIN_PATH_ENV) {
-        return PathBuf::from(over);
-    }
-    if let Some(installed) = installed_plugin_executable() {
-        return installed;
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins/typescript/dist/src/index.js")
-}
-
-/// The bundled plugin executable in an installed layout, if this really is
-/// one. `None` in a checkout, which is the case that falls through to the
-/// compile-time path above.
-fn installed_plugin_executable() -> Option<PathBuf> {
-    let candidate =
-        crate::daemon::manifest::installed_bundled_root()?.join(BUNDLED_LANGUAGE).join(BUNDLED_PLUGIN_EXE);
-    candidate.is_file().then_some(candidate)
-}
-
-/// How to launch whatever [`plugin_entry_path`] resolved to, as a
-/// `(command, args)` pair.
-///
-/// A script needs an interpreter and an executable must not have one, and the
-/// difference is decided by the entry's own extension rather than by which
-/// branch above produced it - which is what keeps [`PLUGIN_PATH_ENV`] working
-/// for both. Pointing it at a `dist/src/index.js` (what every test that sets
-/// it does) still spawns `node`; pointing it at a single-executable build
-/// spawns that build directly, with no Node.js needed on the machine at all.
-///
-/// `node` stays a bare command so `std::process::Command` looks it up on
-/// `$PATH` at spawn time, matching how `daemon::manifest` resolves a bare
-/// `command` in a `plugin.toml`.
-fn launch_command_for(entry: &Path) -> (PathBuf, Vec<String>) {
-    let is_script = entry
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "js" | "cjs" | "mjs"));
-
-    if is_script {
-        (PathBuf::from("node"), vec![entry.to_string_lossy().into_owned()])
-    } else {
-        (entry.to_path_buf(), Vec::new())
-    }
-}
-
-/// The bundled plugin's wire identifier - `Handshake.language`
-/// (`plugins/typescript/src/index.ts`), and since task 155 renamed
-/// `plugins/js-ts/` to `plugins/typescript/`, its manifest's `language` and
-/// its directory name too: the bundled plugin is discovered through the
-/// exact same "directory name is the manifest's language" rule as any other
-/// plugin, no special case retained (see
-/// `docs/architecture/plugin-modularity.md`'s Options Considered #1).
-///
-/// A constant rather than a literal at each use site because it names two
-/// genuinely different things that must never drift apart: the language
-/// [`bundled_manifest`] hands out below, and the pid-file name
-/// `daemon::plugin_pid_path` still resolves for the test suite and the few
-/// other callers that predate per-language pid files and only ever meant
-/// "the bundled JS/TS plugin's pid" (see that function's doc comment).
-/// Production code that has to be genuinely multi-language-aware
-/// (`cli::status`, `cli::stop`, `cli::clean`) never references this constant -
-/// it lists every `plugin-<language>.pid` file `PluginRegistry` writes
-/// instead of assuming this one.
+/// Production code that has to be multi-language-aware (`cli::status`,
+/// `cli::stop`, `cli::clean`) never references this constant - it lists every
+/// `plugin-<language>.pid` file `PluginRegistry` writes instead of assuming
+/// this one.
 pub const BUNDLED_LANGUAGE: &str = "typescript";
-
-/// A [`PluginManifest`] describing the bundled JS/TS plugin as this install
-/// would spawn it - [`plugin_entry_path`]'s resolved entry point plus whatever
-/// `launch_command_for` says runs it, honoring the same [`PLUGIN_PATH_ENV`]
-/// override - with nothing read from an actual `plugin.toml`.
-///
-/// Still used after `daemon::run` moved to `daemon::registry::PluginRegistry`
-/// (task 155) and after the index's generation string stopped being keyed off
-/// this one bundled-plugin view (task 163 - see
-/// `daemon::registry::indexer_version`): [`bundled_fingerprint`] below is what
-/// `daemon::build_stamp` compares one *running daemon's* JS/TS plugin against
-/// another's, which is a different question from "what filled this index" and
-/// is deliberately still asked of the bundled plugin alone; and a few tests
-/// (`plugin_crash_recovery.rs`) still want a bare [`PluginManifest`] for the
-/// bundled plugin without going through a `plugin.toml` fixture.
-pub fn bundled_manifest() -> PluginManifest {
-    let entry = plugin_entry_path();
-    let manifest_dir = entry.parent().map(Path::to_path_buf).unwrap_or_default();
-    let (command, args) = launch_command_for(&entry);
-    PluginManifest {
-        language: BUNDLED_LANGUAGE.to_string(),
-        protocol_version: CURRENT_PROTOCOL_VERSION,
-        plugin_version: String::new(),
-        command,
-        args,
-        extensions: Vec::new(),
-        fingerprint_ignore: Vec::new(),
-        manifest_dir,
-        // The bundled plugin's real capabilities/workspace live in
-        // `plugins/typescript/plugin.toml`, not here - this helper predates
-        // both fields and exists only for tests that need a bare manifest,
-        // so the conservative defaults are the right stand-in rather than
-        // duplicating the real manifest's values.
-        capabilities: Capabilities::default(),
-        workspace: WorkspaceConfig::default(),
-        non_symbol_queries: Default::default(),
-        symbol_query_prefixes: Default::default(),
-        reexports: Default::default(),
-    }
-}
 
 /// Identifies the plugin *logic* this process would run, as a short hex
 /// digest of its compiled output.
@@ -457,10 +320,10 @@ pub fn bundled_manifest() -> PluginManifest {
 /// `build_stamp` compares the core executable's mtime because it only needs an
 /// *ordering* ("is that daemon behind me?"). This one has to answer a
 /// different question - "would that build produce a different graph?" - where
-/// mtime is both too eager and unordered: `npm run build` rewrites every file
-/// in `dist/` on every invocation, and a re-emitted but byte-identical bundle
-/// must not cost a project a full re-walk. A digest over the bytes changes
-/// exactly when the logic does.
+/// mtime is both too eager and unordered: a rebuild can rewrite a file with
+/// identical bytes, and a re-emitted but byte-identical build must not cost a
+/// project a full re-walk. A digest over the bytes changes exactly when the
+/// logic does.
 ///
 /// # What it does not cover
 ///
@@ -485,31 +348,33 @@ pub fn fingerprint(manifest: &PluginManifest) -> String {
     })
 }
 
-/// [`fingerprint`] for [`bundled_manifest`], memoized for the process's
-/// lifetime - what `build_stamp::of_running_process` needs, and since task 163
-/// its only caller.
+/// One digest over every plugin `daemon::manifest::discover` finds from
+/// `daemon::manifest::default_roots` - the same value `daemon::registry::indexer_version`
+/// appends to the core pipeline's generation - memoized for the process's
+/// lifetime. It is what `build_stamp::of_running_process` records, so a shim
+/// can tell that a running daemon's plugins were rebuilt under an unchanged
+/// core executable.
 ///
-/// It is deliberately *not* what stamps the index any more: that is
-/// `daemon::registry::indexer_version`, a digest over every *discovered*
-/// plugin's fingerprint, because with N plugins an index is only as current as
-/// the least current of the builds that filled it. The two questions differ in
-/// what they are for. A build stamp compares one running daemon against
-/// another so a shim can decide whether to retire the incumbent, and the
-/// bundled JS/TS plugin is the part of a daemon's build that
-/// [`PLUGIN_PATH_ENV`] can redirect out from under it; the index's generation
-/// is about content that is already stored.
-///
-/// [`fingerprint`] itself does not cache - `daemon::registry` computes one
-/// fingerprint per discovered plugin, and owns that concern for its own set of
-/// manifests rather than leaving a process-wide `OnceLock` to answer for all
-/// of them.
+/// [`FINGERPRINT_UNAVAILABLE`] when discovery itself fails, so two processes
+/// that both cannot discover compare equal instead of looking like a change.
 ///
 /// Computed once per process: the shim asks for it on every call it makes,
 /// and the answer cannot change under a running process in any way that
-/// would matter (the plugin a daemon already spawned is the one it keeps).
-pub fn bundled_fingerprint() -> &'static str {
+/// would matter (the plugins a daemon already spawned are the ones it keeps).
+pub fn discovered_fingerprint() -> &'static str {
     static FINGERPRINT: OnceLock<String> = OnceLock::new();
-    FINGERPRINT.get_or_init(|| fingerprint(&bundled_manifest()))
+    FINGERPRINT.get_or_init(|| {
+        match crate::daemon::manifest::discover(&crate::daemon::manifest::default_roots()) {
+            Ok(discovered) => crate::daemon::registry::plugins_digest(&discovered),
+            Err(err) => {
+                eprintln!(
+                    "g-mesh: could not discover plugins to fingerprint: {err:#} - a rebuilt plugin will \
+                     not be noticed"
+                );
+                FINGERPRINT_UNAVAILABLE.to_string()
+            }
+        }
+    })
 }
 
 /// Digests every regular file under `dir`, skipping any subdirectory whose
@@ -624,77 +489,20 @@ struct PluginState {
     io: PluginIo,
 }
 
-/// Catches a node-launched plugin's missing entry point before it is ever
-/// spawned, instead of letting `Command::spawn` succeed on `node` itself
-/// (genuinely on `$PATH`) only for node to exit before the handshake once it
-/// can't find the script. That latter shape - `spawn()` succeeds,
-/// `handshake::perform` then reports "plugin closed its stdout before
-/// sending a handshake" - is exactly what an unbuilt bundled JS/TS plugin
-/// looks like (`core/build.rs` downgrades a failed `npm run build` to a
-/// warning, so `dist/src/index.js` can genuinely not exist here), and that
-/// message names the symptom, never the missing build. Checked here, not by
-/// making `handshake::perform` itself smarter, because only the caller
-/// knows whether this was even a node script to begin with - a non-node
-/// plugin (the Go binary, a third-party SDK plugin) that fails its
-/// handshake for some other reason must keep getting that other reason.
-///
-/// Not limited to the bundled TypeScript plugin by name: the remedy named
-/// below (`npm ci && npm run build`, run in the entry's own npm package) is
-/// equally correct for any node-based plugin discovered from a
-/// `plugin.toml`, found by walking up from the entry for the nearest
-/// `package.json` rather than assuming `plugins/typescript`'s exact layout.
-///
-/// `pub(crate)` rather than private: `daemon::manifest`'s own
-/// `the_bundled_plugins_handshake_reports_the_version_its_manifest_declares`
-/// test spawns the bundled plugin directly (it has to - it is checking the
-/// handshake against a manifest read from disk, not through this module's
-/// `PluginManifest`) and hits the exact same unbuilt-plugin failure; reusing
-/// this check there keeps both call sites naming the same cause and the
-/// same fix instead of the generic message drifting back in on one side.
-pub(crate) fn missing_node_entry_hint(command: &Path, args: &[String]) -> Option<String> {
-    let is_node = command.file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| stem == "node");
-    let entry = Path::new(args.first()?);
-    if !is_node || entry.is_file() {
-        return None;
-    }
-    let package_dir = entry.ancestors().find(|dir| dir.join("package.json").is_file());
-    Some(match package_dir {
-        Some(dir) => format!(
-            "the plugin's entry point {} does not exist - it has not been built yet. Run `npm ci && npm run \
-             build` in {}",
-            entry.display(),
-            dir.display()
-        ),
-        None => format!(
-            "the plugin's entry point {} does not exist - it has not been built yet (run `npm ci && npm run \
-             build` in its package directory)",
-            entry.display()
-        ),
-    })
-}
-
 /// Catches a cargo-workspace-built plugin's missing binary before it is ever
-/// spawned - the same shape of problem [`missing_node_entry_hint`] catches
-/// for a node-launched one, just on the other side of the check. There the
-/// *launcher* (`node`) genuinely exists and the *entry* named in `args` is
-/// what's missing; here there is no separate launcher - `command` itself is
-/// the plugin binary - so it is `command`, not an argument, that has to be
-/// tested for existence. `Command::spawn` on a missing `command` fails with a
-/// bare `No such file or directory (os error 2)`, naming neither cargo nor
-/// the fact that this is a build output at all, which is exactly the symptom
-/// traced while verifying GM-301: a `cargo test -p g-mesh` run that never
-/// built sibling workspace members failed the daemon's cold-start walk with
-/// that raw OS error, four tests deep before the daemon log (not the test
-/// failure itself) named the real cause.
+/// spawned. `command` itself is the plugin binary, and `Command::spawn` on a
+/// missing one fails with a bare `No such file or directory (os error 2)`,
+/// naming neither cargo nor the fact that this is a build output at all - in
+/// a `cargo test -p g-mesh` run that never built sibling workspace members,
+/// that surfaced as a failed cold-start walk with the real cause only in the
+/// daemon log.
 ///
-/// Triggered by the path shape both bundled cargo-workspace plugins declare
-/// today (`plugins/python/plugin.toml`, `plugins/rust/plugin.toml`:
-/// `${G_MESH_BIN_DIR}/g-mesh-plugin-<language>`, resolved by
+/// Triggered by the path shape the bundled cargo-workspace plugins declare
+/// (`${G_MESH_BIN_DIR}/g-mesh-plugin-<language>`, resolved by
 /// `daemon::manifest::resolve_command` against the running g-mesh
-/// executable's own `target/<profile>/` directory since GM-404) rather than by name, so a future third plugin that joins the
-/// cargo workspace the same way is covered without this function learning
-/// its name - the same "generic over the mechanism, not the specific
-/// plugin" choice `missing_node_entry_hint`'s own doc comment makes for node.
+/// executable's own `target/<profile>/` directory) rather than by name, so a
+/// plugin that joins the cargo workspace the same way is covered without this
+/// function learning its name.
 /// A binary built by some other means that merely happens to live under a
 /// directory named `target/debug` or `target/release` would false-positive
 /// on this check; nothing in this codebase does that today, and the
@@ -710,6 +518,11 @@ pub(crate) fn missing_node_entry_hint(command: &Path, args: &[String]) -> Option
 /// binary is under `target/release/` (GM-404): that is where a release
 /// g-mesh looks for its plugins, and a plain `cargo build --workspace` would
 /// only fill `target/debug/`, leaving the error exactly where it was.
+///
+/// Leads with the build command, then the binary's path (GM-351): the MCP
+/// instructions cut a failed language's cause at 100 bytes, and with the
+/// path first a Windows `.exe` name plus `--release` pushed the command
+/// past the cut. Command first, a cut can only land in the path.
 ///
 /// # Which spelling the message names
 ///
@@ -735,7 +548,7 @@ pub(crate) fn missing_workspace_binary_hint(command: &Path) -> Option<String> {
 /// as a parameter rather than read from [`std::env::consts::EXE_SUFFIX`]
 /// internally, so a test can exercise the Windows arm (`".exe"`) from any
 /// host.
-fn missing_workspace_binary_hint_with_suffix(command: &Path, suffix: &str) -> Option<String> {
+pub(crate) fn missing_workspace_binary_hint_with_suffix(command: &Path, suffix: &str) -> Option<String> {
     if command.is_file() {
         return None;
     }
@@ -757,29 +570,23 @@ fn missing_workspace_binary_hint_with_suffix(command: &Path, suffix: &str) -> Op
 
     Some(match workspace_root {
         Some(root) => format!(
-            "the plugin binary {} does not exist - it has not been built yet. Run `{build}` in {}",
-            named.display(),
-            root.display()
+            "Run `{build}` in {}: the plugin binary {} has not been built yet",
+            root.display(),
+            named.display()
         ),
         None => format!(
-            "the plugin binary {} does not exist - it has not been built yet (run `{build}` in the repository root)",
+            "Run `{build}` in the repository root: the plugin binary {} has not been built yet",
             named.display()
         ),
     })
 }
 
-/// Every "is this plugin's binary simply missing" check this module knows,
-/// tried in turn - the one entry point both spawn sites
-/// ([`PluginState::spawn`] and `daemon::bulk_index::walk_one_language`) call,
-/// so a third such check joins both call sites by joining this function
-/// rather than by becoming a third thing each spawn site has to remember to
-/// call. [`missing_node_entry_hint`] and [`missing_workspace_binary_hint`]
-/// never both match the same manifest - the former requires `command` itself
-/// to be `node` (found on `$PATH`, so never "missing"), the latter requires
-/// `command` itself to be the thing that's missing - so trying both costs
-/// nothing on the manifest that matches neither.
-pub(crate) fn missing_plugin_binary_hint(command: &Path, args: &[String]) -> Option<String> {
-    missing_node_entry_hint(command, args).or_else(|| missing_workspace_binary_hint(command))
+/// Every "is this plugin's binary simply missing" check this module knows -
+/// the one entry point both spawn sites ([`PluginState::spawn`] and
+/// `daemon::bulk_index::walk_one_language`) call, so a further check joins
+/// both call sites by joining this function.
+pub(crate) fn missing_plugin_binary_hint(command: &Path) -> Option<String> {
+    missing_workspace_binary_hint(command)
 }
 
 impl PluginState {
@@ -791,7 +598,7 @@ impl PluginState {
     /// and every crash relaunch (`PluginProcess::relaunch`): both need
     /// exactly the same startup sequence.
     fn spawn(project_root: &Path, manifest: &PluginManifest) -> Result<Self> {
-        if let Some(hint) = missing_plugin_binary_hint(&manifest.command, &manifest.args) {
+        if let Some(hint) = missing_plugin_binary_hint(&manifest.command) {
             bail!(hint);
         }
 
@@ -1449,6 +1256,31 @@ impl PluginProcess {
         };
         write_message(&mut state.io.writer, &envelope)
             .context("failed to send the prepareSemanticPass notification")?;
+        Ok(true)
+    }
+
+    /// Sends the `filesCreated` notification naming `file_paths` if this
+    /// plugin's manifest declares `files_created`; returns whether it did.
+    /// The caller sends it before the first of those paths' own `fileChanged`,
+    /// so the plugin's project model holds every one of them before it
+    /// extracts any (ADR 0023's presence hook).
+    ///
+    /// Best-effort like [`Self::notify_workspace_changed`]: nothing is
+    /// answered and nothing is replayed. A lost notification leaves the
+    /// per-file `fileChanged`s that follow, which still apply each file's
+    /// presence, and a relaunched process reads the disk in its walk.
+    pub fn notify_files_created(&self, file_paths: &[String]) -> Result<bool> {
+        if !self.manifest.capabilities.files_created {
+            return Ok(false);
+        }
+        let mut state = self.state();
+        let envelope = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: None,
+            message: ControlMessage::FilesCreated { file_paths: file_paths.to_vec() },
+        };
+        write_message(&mut state.io.writer, &envelope)
+            .context("failed to send the filesCreated notification")?;
         Ok(true)
     }
 

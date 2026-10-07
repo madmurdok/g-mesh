@@ -245,7 +245,7 @@ ignore = ["node_modules"]    # optional; directory names skipped when
 
 [plugin.capabilities]        # optional; what the plugin's semantic tier can
                               # promise - semantic_pass, semantic_sweep,
-                              # semantic_prepare, receiver_calls,
+                              # semantic_prepare, files_created, receiver_calls,
                               # receiver_calls_structural.
                               # Missing entirely or per-field defaults
                               # conservatively ("says nothing" => "can do
@@ -307,6 +307,12 @@ the mistake to avoid:
   directly, so the drift is caught even under `--skip-tests` and without a Go
   toolchain on `PATH`. A plugin built by its own separate toolchain — not
   added to the cargo workspace — follows this rule instead.
+
+**4.0.0:** `plugins/typescript` became a Rust crate in the cargo workspace
+and moved to the first rule: its `plugin_version` equals its crate version,
+`scripts/cut-release.sh` lists it with rust and python, and the
+`package.json` comparison (script gate and core test) is retired. Only
+`plugins/go` follows the second rule now.
 
 A fifth plugin's author: pick the rule by which category the plugin falls
 into (joins the cargo workspace, or ships its own toolchain), add it to the
@@ -384,8 +390,7 @@ pub fn read_manifest(dir: &Path) -> Result<PluginManifest>;
 /// naming both languages and both manifest paths.
 pub fn discover(roots: &[PathBuf]) -> Result<DiscoveredPlugins>;
 
-/// Generalizes today's test-only `G_MESH_JS_TS_PLUGIN_PATH`. When set,
-/// replaces the entire default roots list (`~/.g-mesh/plugins/` + the
+/// When set, replaces the entire default roots list (`~/.g-mesh/plugins/` + the
 /// bundled root) with this one directory - a test drops whatever
 /// `<language>/plugin.toml` fixtures it needs under it, the same way other
 /// integration tests already build fixture directories, rather than needing
@@ -497,7 +502,9 @@ the daemon has to compute it before it opens the index, `daemon::run`'s
 `manifest::discover()` call moves ahead of `storage::schema::ensure_current`
 (it needs nothing but the singleton lock, already taken). The old
 `daemon::plugin::indexer_version()` goes; `bundled_fingerprint()` stays, as
-`daemon::build_stamp`'s own — and now only — caller.
+`daemon::build_stamp`'s own — and now only — caller. (In 4.0.0 it is replaced
+by `discovered_fingerprint()`, the same per-plugin digest over every
+discovered plugin, since every bundled plugin is now a workspace binary.)
 
 `core/src/cli/plugins.rs::list()` replaces its `include_str!(package.json)`
 read with `daemon::manifest::discover(roots)?.manifests`, one `PluginInfo`
@@ -638,10 +645,9 @@ Data Model and Interfaces above for where each landed):
   architecture decision.
 - **Bundled-root env override**: resolved as `G_MESH_PLUGIN_ROOTS_OVERRIDE`,
   one variable replacing the whole default roots list rather than one
-  variable per language — generalizes today's test-only
-  `G_MESH_JS_TS_PLUGIN_PATH` without reintroducing a per-plugin special
-  case, consistent with this design's "one discovery mechanism, not N
-  hardcoded ones" goal.
+  variable per language, consistent with this design's "one discovery
+  mechanism, not N hardcoded ones" goal. It is the only plugin-location
+  override; 4.0.0 removed the JS/TS-only variable that preceded it.
 
 **Still genuinely open:**
 

@@ -113,7 +113,7 @@ fn a_file_kind_implementing_row_omits_qualified_name_and_position_but_keeps_them
     )
     .unwrap();
 
-    let page = list_implementations(&conn, "interface", "iface.rs", &[], 10, None, 0).unwrap();
+    let page = list_implementations(&conn, "interface", "iface.rs", &[], 10, None, |_| 0).unwrap();
     assert_eq!(page.results.len(), 2);
 
     let file_row = page.results.iter().find(|r| r.kind == "File").expect("the File-kind row must be present");
@@ -216,7 +216,11 @@ fn a_page_with_at_least_one_resolved_implementor_is_not_flagged_all_unresolved()
     );
     assert_eq!(body["results"].as_array().unwrap().len(), 2);
     assert_eq!(body["allUnresolved"], false, "one resolved row must clear the marker");
-    assert!(body.get("hint").is_none(), "no allUnresolved, no sentence: {body}");
+    assert_eq!(
+        body["hint"],
+        session_hints::UNRESOLVED_ROW,
+        "no allUnresolved sentence; the unresolved row gets its own (ADR 0022): {body}"
+    );
 }
 
 /// Task #190: the single-hop response echoes the resolved anchor.
@@ -330,7 +334,7 @@ fn a_resumed_transitive_walk_does_not_repeat_the_anchor() {
     assert!(first.anchor.is_some(), "the first page of a fresh walk still carries the anchor");
     let token = first.resume_token.expect("this wide a fanout must truncate and hand back a token");
 
-    let resumed = json_body(&continued(&conn, &token, &HashMap::new()).unwrap());
+    let resumed = json_body(&continued(&conn, &token, &HashMap::new(), &SessionHints::default()).unwrap());
     assert!(
         resumed.get("anchor").is_none(),
         "a resumed page must not repeat the anchor, not even as null: {resumed}"
@@ -414,7 +418,8 @@ fn implemented_by_three_types_returns_all_three_across_small_pages() {
     let mut seen = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let page = list_implementations(&conn, "target", "target.rs", &[], 1, cursor.as_deref(), 0).unwrap();
+        let page =
+            list_implementations(&conn, "target", "target.rs", &[], 1, cursor.as_deref(), |_| 0).unwrap();
         assert_eq!(page.results.len(), 1, "page size of 1 must return exactly one result per page");
         seen.extend(page.results.into_iter().map(|r| r.implementing_symbol_id));
         if !page.has_more {
@@ -498,7 +503,8 @@ fn a_duplicated_implementor_does_not_reappear_on_the_next_page() {
     let mut seen = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
-        let page = list_implementations(&conn, "target", "target.rs", &[], 1, cursor.as_deref(), 0).unwrap();
+        let page =
+            list_implementations(&conn, "target", "target.rs", &[], 1, cursor.as_deref(), |_| 0).unwrap();
         assert_eq!(page.results.len(), 1, "one row per page at page size 1");
         seen.extend(page.results.into_iter().map(|r| r.implementing_symbol_id));
         if !page.has_more {
@@ -906,7 +912,7 @@ fn a_response_size_cut_is_continued_by_its_token_and_the_chain_covers_every_impl
     let mut calls = 1;
 
     while let Some(t) = token {
-        let body = json_body(&continued(&conn, &t, &HashMap::new()).unwrap());
+        let body = json_body(&continued(&conn, &t, &HashMap::new(), &SessionHints::default()).unwrap());
         calls += 1;
         all.extend(
             body["results"]

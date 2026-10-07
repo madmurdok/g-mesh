@@ -1,0 +1,528 @@
+# Plugin distribution and lifecycle
+
+## Context & Problem
+
+g-mesh ships one archive containing core and every bundled plugin. Measured on
+the 3.5.0 artifact for `x86_64-apple-darwin`:
+
+| component | unpacked | share |
+|---|---:|---:|
+| `plugins/typescript` | **87 MB** | **59%** |
+| `g-mesh` (core) | 36 MB | 24% |
+| `plugins/go` | 8.4 MB | 6% |
+| `plugins/rust` | 5.5 MB | 4% |
+| `plugins/python` | 4.9 MB | 3% |
+| total | **147 MB** (50 MB compressed) | |
+
+Two things follow immediately, and both contradict the intuition that started
+this design.
+
+**The archive is one plugin.** TypeScript is 59% of it, because it is a Node
+SEA: it embeds the Node runtime (the system `node` on the measuring machine is
+94 MB on its own) plus the 23 MB `typescript` package. Go, Rust and Python
+together are 18.8 MB - 13%. Making *plugins in general* optional buys almost
+nothing; making *TypeScript* optional buys nearly everything. Any design that
+treats the four symmetrically for size reasons is solving the wrong problem.
+
+**Core is not the problem either.** 36 MB including bundled SQLite, Oniguruma
+and the ONNX Runtime that `search_code` needs. It is the second-largest single
+item and it is not where the weight is.
+
+The second problem is not about size at all. Today a language whose plugin is
+absent is *invisible*: `mcp::instructions` builds from
+`present_languages_with_semantic_state`, which reads the languages that have
+`File` nodes in the index, and a language nothing indexed has none. So an agent
+asking g-mesh about a Python file in a project with no Python plugin gets an
+empty answer that is indistinguishable from "there is nothing there". That is
+the failure shape this project spends most of its effort eliminating, and it is
+currently built in.
+
+## Goals / Non-goals
+
+**Goals.**
+- Make the default archive small enough that a user who does not write
+  TypeScript is not paying 87 MB for it.
+- Make "this language has no plugin" a state the agent is *told about*, with
+  the command that fixes it, rather than a silent empty result.
+- Let one language's absent or broken plugin cost only that language.
+- Keep install and uninstall symmetric without a config file to edit.
+- Let a user fetch a plugin deliberately, with the checksum discipline
+  `install.sh` already has.
+
+**Non-goals.**
+- Bundling language *servers* (rust-analyzer, pyright, a TS server). Rejected
+  under Options below; rust-analyzer alone is 40 MB on disk and 535-580 MB
+  resident, and each would have to be version-tracked against upstream.
+- Automatic network fetches by the daemon. The daemon is spawned by an agent,
+  not a human; a process that downloads and executes binaries without a person
+  asking is a trust boundary this design will not cross.
+- Changing what the plugins *do*. This is packaging, discovery and reporting.
+
+## Constraints
+
+- **The daemon has no human.** It is spawned by the agent on the first tool
+  call. Nothing in the daemon path may ask a question, and any prompt belongs
+  in the CLI (`g-mesh config` already hosts one).
+- **Discovery is already filesystem-based.** `daemon::manifest::discover()`
+  scans `plugins/*/plugin.toml` under each root in precedence order at daemon
+  start, keyed by language, earlier root winning. Adding a directory adds a
+  plugin; removing it removes one. There is no registry to keep in step - which
+  is why uninstall needs no design of its own, only a note (below).
+- **Instructions are already dynamic.** `mcp::instructions::build` assembles the
+  `initialize` text per session from the languages in the index and their
+  `[plugin.capabilities]`. The mechanism to tell an agent what is and is not
+  covered exists; what it lacks is a way to know about a language that was
+  never indexed.
+- **GM-316 decided that a partial index is dangerous.** One unspawnable plugin
+  fails the whole cold-start index today, deliberately: "a partial index that
+  keeps serving is indistinguishable to an MCP caller from a complete one." That
+  argument is sound and this design must answer it rather than ignore it.
+- **The TS structural tier already uses tree-sitter** - `tree-sitter`,
+  `tree-sitter-javascript`, `tree-sitter-typescript` from npm. It uses the Node
+  *bindings* to the same grammars that `plugins/python` and `plugins/rust` use
+  from Rust. Porting is a binding change, not a strategy change.
+- **Every language already has a semantic tier.** TypeScript is not the only one
+  with semantics; it is the only one that *pays for them in archive size*. Go
+  needs `go` on PATH, Rust needs rust-analyzer, Python needs pyright. TypeScript
+  needs nothing because it carries tsserver.
+
+## Options Considered
+
+### For TypeScript's weight
+
+**A. Keep the SEA (status quo).** 87 MB, and TypeScript's semantic tier is the
+only one that works with no installation at all. Costs the whole archive
+problem, and keeps a class of defect this project has already been bitten by:
+the embedded runtime is not the system Node, and GM-317 was exactly a
+Node-20-vs-22 behavioural difference that only appeared once CI ran.
+
+**B. Un-embed Node, keep the JavaScript plugin.** The plugin becomes roughly the
+`typescript` package plus its own code - order 25 MB - and requires a system
+Node. Cheapest change by far; removes two thirds of the weight. But it swaps a
+known runtime for an unknown one, which is the GM-317 problem made permanent
+rather than removed, and it leaves TypeScript structurally different from the
+other three for no remaining reason.
+
+**C. Port the structural tier to Rust; drive a TS language server through
+`LspBridge`.** TypeScript becomes what Python is: a Rust binary on tree-sitter
+(`plugins/python` is 4.9 MB) plus an external server resolved at run time. Base
+weight falls to about 5 MB. It removes the embedded-runtime class of defect
+entirely and makes all four languages uniform. The cost is real and must be
+stated plainly: **TypeScript loses the only free semantic tier in the product.**
+It is also the largest job here - the TS plugin is the oldest and most-tested
+component (298 tests, and the bench numbers this project's claims rest on).
+
+### For semantic tiers generally
+
+**S1. Bundle every server.** Honest "all-in-one", and the archive grows rather
+than shrinks: rust-analyzer 40 MB, pyright an npm tree, a TS server likewise.
+Each then needs version-tracking against upstream, and rust-analyzer's 535-580
+MB resident is a cost the user pays whether or not they asked. Rejected.
+
+**S2. Bundle none; resolve all externally.** What Go, Rust and Python already
+do, and what the resolve-and-degrade machinery is already built for (GM-290,
+GM-299: probe candidates, log one line, answer an empty incomplete diff, keep
+the gap listed). Uniform and small. TypeScript is the only language that would
+lose something.
+
+**S3. Structural always; a semantic bundle fetched per language from g-mesh's
+own releases.** Considered and dropped once S2 was chosen, because it has no
+content: if no server is ever bundled, there is nothing for g-mesh to host and
+fetch. The only thing a user installs for semantics is the upstream server
+itself, from upstream. S3 would have been a second distribution channel for
+something that is not ours to distribute.
+
+## Chosen Approach
+
+**C + S2.** One format for every language, with no exceptions: a plugin is a
+small structural binary, and **no plugin ever bundles its language server**.
+Every semantic tier resolves an external program at run time and degrades
+honestly when it is absent. TypeScript's structural tier is ported to Rust so it
+stops being the exception; `g-mesh plugins install <language>` installs the
+*plugin*, never a server.
+
+The decision was taken on uniformity rather than on a size threshold, and the
+reason is worth recording because it is not a technical one: **we do not know
+the audience.** A special case for TypeScript is only justified if TypeScript
+users are the majority, and nobody here has that number. Absent it, one format
+that is the same for all four languages beats a format that is better for one of
+them and different for the rest - and it is also the format that makes a fifth
+language cheap, which is the premise `plugins/sdk` exists to defend.
+
+Note that Go already complies: its semantic tier is compiled into the plugin but
+requires the `go` toolchain on PATH, so it too resolves something external and
+degrades without it. After the TypeScript port, all four behave the same way.
+
+Projected base archive: core 36 MB + four structural plugins at roughly 5-8 MB
+each ≈ **60-70 MB unpacked**, against 147 MB today; compressed, roughly 20 MB
+against 50 MB.
+
+Why C over B, given B is far cheaper: B leaves TypeScript depending on a Node it
+does not control, which is the GM-317 defect made permanent. C removes the
+dependency rather than relocating it, and it makes the four plugins one shape
+instead of three-plus-one - which is the whole premise of `plugins/sdk` and the
+reason a fifth language is supposed to be cheap. B remains available as an
+interim if C's schedule is a problem; the two are not mutually exclusive, since
+B is a strictly smaller step along the same path.
+
+**The honest cost, restated so nobody discovers it later:** after C, a user with
+no TypeScript language server gets structural TypeScript only - `find_callers`
+on a method reached through a variable will under-report, and the instructions
+will say so. Today that user gets full semantics for free. This is a real
+regression for the most common language in the product's audience, and it is the
+price of the archive dropping by two thirds. It should be taken only with that
+sentence understood.
+
+### Measured (4.0.0, GM-327)
+
+The projection above was checked against real `--release` archives built by the
+release workflow's own script after the port (GM-326), the per-plugin assets
+(GM-353) and `plugins install/remove` (GM-331) had landed, at `release-4.0.0`
+tip `c545645`:
+
+```sh
+DIST_DIR=<scratch> bash scripts/build-targets.sh x86_64-apple-darwin   # host: smoke tests ran
+DIST_DIR=<scratch> bash scripts/build-targets.sh aarch64-apple-darwin  # cross-built on the same Mac
+find <stage> -type f -exec stat -f "%z %N" {} \;   # unpacked, per file
+stat -f "%z %N" <scratch>/*.tar.gz                  # compressed: the exact tar -czf the release uploads
+size -m plugins/<lang>/g-mesh-plugin-<lang>          # Mach-O sections, for the TS-vs-Python gap
+```
+
+`x86_64-apple-darwin` is the triple the 3.5.0 table above was measured on, so
+it is the like-for-like column. Sizes are MiB (2^20 bytes); the 3.5.0 table
+uses the same unit as far as can be told (its 8.4 for `plugins/go` matches the
+4.0.0 Go binary at 8.45 MiB, and Go was not touched).
+
+| component | 3.5.0 x86_64 | projected | 4.0.0 x86_64 | 4.0.0 aarch64 | plugin asset (.tar.gz, x86_64 / aarch64) |
+|---|---:|---:|---:|---:|---:|
+| `g-mesh` (core) | 36 | 36 | **39.4** | 35.6 | - (13.3 / 12.0 gzipped alone) |
+| `plugins/typescript` | 87 | ~5 | **8.0** | 7.8 | 2.08 / 2.00 |
+| `plugins/go` | 8.4 | 8.4 | 8.5 | 7.9 | 4.85 / 4.50 |
+| `plugins/rust` | 5.5 | 5.5 | 6.0 | 5.7 | 1.87 / 1.79 |
+| `plugins/python` | 4.9 | 4.9 | 5.3 | 5.1 | 1.81 / 1.72 |
+| total unpacked | 147 | 60-70 | **67.3** | 62.2 | |
+| main archive, compressed | 50 | ~20 | **24.0** | 22.1 | |
+
+(Licences, README and the four `plugin.toml` files add 0.1 MiB, included in
+the totals.)
+
+**Unpacked: inside the projection, at its top end.** 147 to 67.3 MiB is a 54%
+cut - not the "two thirds" the paragraph above says; that phrase was never
+consistent with its own 60-70 MB figure, which is a 52-59% cut. Three things
+put the result near 70 rather than near 60, and only one of them is the port:
+
+- **The TypeScript binary is 8.0 MiB, not the ~5 the projection borrowed from
+  `plugins/python`.** The difference is grammar tables, not code: the TS
+  plugin's `__TEXT,__const` is 3.45 MB against Python's 0.78 MB, while their
+  `__text` (machine code) is 3.05 against 2.96 MB. TypeScript links three
+  tree-sitter grammars (`typescript`, `tsx`, `javascript` - the `tsx` grammar
+  is a second full TypeScript grammar), Python links one; the
+  `libtree-sitter-typescript.a` static library alone is 2.9 MB against
+  `libtree-sitter-python.a`'s 0.47 MB. TypeScript now sits beside Go (8.5),
+  not beside Python, and will stay there for as long as it parses three
+  dialects.
+- **Core grew from 36 to 39.4 MiB between 3.5.0 and 4.0.0.** None of that is
+  the port (core does not link the plugin); it was not attributed here.
+- **Every other plugin grew 0.4-0.7 MiB** over the same releases.
+
+**Compressed: short of the projection.** 50 to 24.0 MiB is a 52% cut against
+the ~60% that "roughly 20 MB" implied. The projection scaled the 3.5.0
+compression ratio (147:50, 2.9x), but that ratio was flattered by the SEA's
+embedded JavaScript, which compresses far better than machine code; four
+native binaries and core compress 2.8x. Core alone is 13.3 MiB of the 24, so
+no plugin change can bring the main archive near 20 - only core can.
+
+**What a user installs for one language** is now small: a per-plugin asset is
+1.8-2.1 MiB for TypeScript, Rust and Python, 4.9 MiB for Go (Go's semantic
+tier is compiled in).
+
+**The price, measured rather than projected.** The archive no longer contains
+anything that can answer a TypeScript semantic question. The plugin resolves
+`vtsls` at run time (`plugins/typescript/plugin.toml`, `[plugin.semantic]`):
+`vtsls` on `PATH`, then the project's own `node_modules/.bin`, then
+`npx --yes --package @vtsls/language-server vtsls`. So in practice:
+
+- with `vtsls` installed, or Node and network for `npx`, TypeScript keeps a
+  semantic tier - but it is now a program g-mesh does not ship or pin, and the
+  `npx` path fetches it from the npm registry on first use;
+- with **no Node at all** (or `npx` with no network), TypeScript is structural
+  only: receiver calls (`x.foo()`) stay unresolved and are reported in
+  `untypedCalls`, so `find_callers` on a method reached through a variable
+  under-reports, and the instructions say so. In 3.5.0 that same user had full
+  semantics with nothing installed.
+
+That second case is the regression the paragraph above warned about, and the
+numbers say what it bought: 79.7 MiB unpacked and 26 MiB compressed off every
+download, about 54% and 52%.
+
+### The two decisions that depend on each other
+
+Per-language degradation (below) is **only safe because** the instructions
+declare coverage. GM-316's argument against a partial index - that it is
+indistinguishable from a complete one - is exactly right, and the answer is not
+to reject it but to remove its premise: once the agent is told which languages
+are covered and which are not, a partial index is no longer indistinguishable
+from a complete one. Neither change is safe without the other, and they must
+land together or not at all.
+
+## Components
+
+```mermaid
+graph TD
+    subgraph "base archive (~60-70MB)"
+        core["g-mesh core<br/>36MB"]
+        ts["plugins/typescript<br/>structural, Rust+tree-sitter<br/>~5MB"]
+        go["plugins/go<br/>8.4MB"]
+        rs["plugins/rust<br/>5.5MB"]
+        py["plugins/python<br/>4.9MB"]
+    end
+
+    subgraph "resolved at run time, never bundled"
+        tsserver["a TS language server"]
+        gotool["go on PATH"]
+        ra["rust-analyzer"]
+        pyright["pyright"]
+    end
+
+    subgraph "core's own knowledge"
+        cat["language catalogue<br/>extension -> language id<br/>+ install command"]
+    end
+
+    core -->|"discover() scans<br/>plugins/*/plugin.toml"| ts & go & rs & py
+    ts -.->|LspBridge| tsserver
+    go -.-> gotool
+    rs -.-> ra
+    py -.-> pyright
+    core -->|"names a language it has<br/>no plugin for"| cat
+    cat -->|"feeds the<br/>absent-plugin state"| instr["mcp::instructions::build"]
+```
+
+The sizes in the diagram are the design-time projection; the measured 4.0.0
+sizes (67.3 MiB unpacked on x86_64, TypeScript at 8.0 MiB) are in
+"Measured (4.0.0, GM-327)" above.
+
+**The language catalogue is the one genuinely new component.** Core must be able
+to name a language it has *no plugin for* - otherwise the absent-plugin state
+cannot exist, because the index has no files for it and discovery has no
+manifest. The catalogue maps file extension to language id and carries the
+install command for each. It ships with core, not with plugins.
+
+This is a second place that knows about languages, and that deserves
+justification rather than a shrug: a manifest describes a plugin that is
+*present*, and this describes one that is *absent*. Nothing that ships with a
+plugin can answer a question about the plugin not being there. The catalogue
+must be kept deliberately thin - extension, id, install command - so that it
+cannot drift into a second source of truth about capabilities, which remain the
+manifest's alone.
+
+## Data Flow
+
+```mermaid
+sequenceDiagram
+    participant A as agent
+    participant D as daemon
+    participant W as walk
+    participant I as instructions
+
+    A->>D: first tool call in a project
+    D->>D: discover() -> plugins present on disk
+    D->>W: cold-start index
+    W->>W: for each discovered language: walk and index
+    W->>W: count files matching CATALOGUE extensions<br/>with no discovered plugin
+    W-->>D: per-language outcome: indexed / absent / failed
+    D-->>A: (later) initialize
+    A->>I: get_info
+    I->>I: languages in index + capabilities<br/>+ absent-but-present-on-disk
+    I-->>A: "python: 412 files, no plugin installed.<br/>Run `g-mesh plugins install python`."
+```
+
+Correction (GM-329/S1, from the source): core does not walk the project today -
+each plugin walks in its own `--bulk-index` process - so counting an absent
+language's files is a new, daemon-side walk, not a by-product. It runs only when
+some catalogue language has no plugin, counts only those languages, and is
+measured before it ships; see [ADR 0021](../adr/0021-per-language-bulk-outcome.md)
+sections 3-4.
+
+## Interfaces
+
+### `LanguageOutcome` - the per-language result of a cold-start index
+
+```rust
+enum LanguageOutcome {
+    /// A plugin was discovered and indexed this language.
+    Indexed { files: usize },
+    /// The catalogue names this language and the project has files for it,
+    /// but no plugin was discovered. NOT an error. `None`: files seen, not
+    /// counted (ADR 0021's deadline fallback). The install command is derived
+    /// from the catalogue (`CatalogueEntry::install_command`), not stored.
+    PluginAbsent { files: Option<usize> },
+    /// A plugin was discovered and could not be used. An error for this
+    /// language, and only for this language.
+    Failed { error: String },
+}
+```
+
+`bulk_index::run` returns one of these per language instead of aborting on the
+first failure. The whole index fails only when *every* discovered plugin failed,
+which is the case that means something is wrong with the installation rather
+than with one language. Decided, with the store GM-330 reads
+(`schema::language_outcomes`), in [ADR 0021](../adr/0021-per-language-bulk-outcome.md).
+
+### Instructions: three states, not two
+
+`instructions::build` gains the absent case. The existing input describes
+languages that are present; it must also carry those the catalogue names and the
+project has files for:
+
+```rust
+struct AbsentLanguage {
+    language: String,
+    files: usize,
+    /// The exact command, e.g. "g-mesh plugins install python".
+    install: String,
+}
+```
+
+The rendered contract, per language, is one of:
+- **supported and working** - today's text, including the receiver-call gap
+  sentence when the semantic tier has not run;
+- **supported, plugin absent** - names the language, the file count, and the
+  install command, and says plainly that g-mesh has no answers for this language
+  until then, so the agent does not read an empty result as "nothing found";
+- **not supported** - said once, generically, rather than per language; the
+  catalogue is not a promise of future support.
+
+This is the half of the design that makes a static line in `CLAUDE.md` safe. A
+manifest that tells an agent "g-mesh handles Python" is *actively harmful* while
+the plugin is absent, unless the instructions can correct it at run time. They
+can - but only once this contract exists.
+
+### CLI
+
+```
+g-mesh plugins list                    # exists
+g-mesh plugins check <dir>             # exists
+g-mesh plugins install <language>      # fetch from this version's GitHub release
+g-mesh plugins install --from <path>   # local .tar.gz or plugin directory, no network
+g-mesh plugins remove <language>       # delete the directory
+```
+
+`install` applies `install.sh`'s checksum discipline, reimplemented in Rust on
+top of `cli/model.rs`'s download (ADR 0027), and verifies before unpacking. `remove` deletes `plugins/<language>/` and nothing
+else - there is no config to edit, which is the whole benefit of
+filesystem-based discovery.
+
+#### Per-plugin release assets (GM-353)
+
+Each bundled plugin is also published on its own, so it can be installed
+without re-downloading the main archive (which keeps all four plugins):
+
+- **Naming:** `g-mesh-plugin-<lang>-v<ver>-<target>.tar.gz` plus a sibling
+  `<asset>.sha256` (`<hex>  <basename>`); every asset and its `.sha256` is also
+  listed in `SHA256SUMS`. `.tar.gz` on every platform, Windows included.
+- **Layout:** a single top-level `<lang>/` directory containing `plugin.toml`
+  and the plugin binary, byte for byte what the main archive carries.
+- **Install location:** `<exe dir>/plugins`, so a plugin is version-locked to
+  the core that fetched it and replaced by the next `install.sh`.
+- **Manual install:** download the asset and its `.sha256` from the release;
+  verify with `shasum -a 256 -c <asset>.sha256` before unpacking; then
+  `tar -xzf <asset> -C <exe dir>/plugins`; restart the daemon. Remove with
+  `rm -rf <exe dir>/plugins/<lang>`.
+- **CLI:** `g-mesh plugins install` automates these steps in Rust and is GM-331
+  ([ADR 0027](../adr/0027-plugin-fetch-checksums-in-rust.md)); GM-353 delivers
+  the assets and proves the manual path.
+
+**Both require a daemon restart to take effect**, because `discover()` runs once
+at startup. This should be stated by the command rather than discovered by the
+user; whether the daemon should instead re-discover on change is left open
+below.
+
+## Failure Modes & Edge Cases
+
+- **Zero plugins installed.** A valid state, not an error: the index is empty
+  and the instructions say g-mesh currently covers nothing and name the install
+  command. This is what makes "ship without plugins" possible at all, and it is
+  precisely what today's code cannot express.
+- **A plugin is present but its binary is missing.** `Failed` for that language.
+  GM-316's actionable message already names the cause and the fix; it now
+  reaches the agent as well as the log, and does not take the other three
+  languages with it.
+- **Every discovered plugin fails.** The whole index fails, as today. Something
+  is wrong with the installation rather than with one language.
+- **The catalogue names a language whose plugin exists but is older than the
+  catalogue entry.** The manifest wins on capabilities; the catalogue is only
+  consulted for languages with no manifest at all.
+- **A plugin is removed while the daemon runs.** Discovery is read at startup,
+  so the daemon keeps using what it found. The index is not corrupted - the
+  plugin simply keeps being spawned from a path that no longer exists, which
+  degrades to `Failed` for that language on the next spawn.
+- **Downloaded plugin fails its checksum.** Refuse, delete the partial file, and
+  say which release and which digest were expected. Never unpack on a mismatch.
+
+## Open Questions / Risks
+
+- **Should `LspBridge` live in core rather than in the SDK?** Raised while
+  asking why the Go plugin cannot use it. The barrier is not Go the language
+  but Go the *implementation language of that plugin*: `LspBridge` is a Rust
+  struct in `plugins/sdk`, and a separate Go module cannot import a Rust
+  crate. Moving it into core would sever the link between a plugin's
+  implementation language and whether it can have a semantic tier at all.
+
+  What makes this more plausible than it first sounds is that nearly
+  everything the bridge needs already crosses the plugin/core boundary: open
+  sites are on the wire, `OpenSite::replaces` is on the wire, `native_kind`
+  (which decides what is implementable) is on the wire, `[plugin.semantic]`
+  is in a manifest core already reads, and core holds the full graph with
+  positions plus the file contents the watcher maintains - which is exactly
+  what mapping an LSP `Location` back to a node requires. The bridge sits in
+  the SDK for historical reasons rather than because that is where its inputs
+  are.
+
+  The benefit is not fixing Go. It is removing one implementation of
+  readiness, budgets, retraction and deferral per SDK - rules this project has
+  already corrected four times against real servers (GM-289, GM-290, GM-309,
+  GM-310), and a second copy would inherit none of those corrections, only
+  their absence. It would also shrink a plugin to pure structural extraction,
+  which is the "language N+1 is cheap" premise carried further than it
+  currently goes.
+
+  A separate sidecar process - speaking our plugin protocol on one side and
+  LSP on the other - was considered and is worse: a third process per
+  language, and it would still need the index to map an answer onto a node,
+  which core is better placed to hold than a proxy is.
+
+  **This would not change Go**, and that is worth stating so the two questions
+  are not conflated. Go declines the bridge on merit, not on language: its
+  semantics come from `go/types` through `packages.Load`, a batch API suited
+  to walking a whole project, where `gopls` is built for interactive editing.
+  Moving the bridge would give Go the *option*; taking it would mean trading a
+  fitter tool for a less fit one and adding an external dependency, since a Go
+  developer has `go` by definition and `gopls` is a separate install.
+
+  Deliberately NOT scheduled. It touches the wire contract and the path this
+  project has repaired four times, and doing that in the middle of the
+  TypeScript port would put two large changes on the same code at once. After
+  4.0.0 there is exactly one non-Rust plugin left, so the cost of waiting is
+  low - which is the argument for writing it down now and deciding later.
+
+- ~~Is TypeScript's free semantic tier worth 87 MB?~~ **Decided: no.** Not on a
+  size threshold but on uniformity - we do not know the audience, and a special
+  case is only defensible with a number nobody has. Recorded under Chosen
+  Approach. The consequence stands and is not softened: TypeScript users who
+  install no language server get structural answers only.
+- **Should the daemon re-discover plugins without a restart?** It would make
+  install and remove take effect immediately, at the cost of a filesystem watch
+  on the plugin roots and a re-entrancy question during an in-flight pass. Left
+  out of this design deliberately; `plugins install` printing "restart the
+  daemon" is honest and costs one line.
+- **How much of the TS test suite survives the port?** 298 tests encode
+  behaviour that the bench results depend on. The port is only safe if the
+  conformance fixture and `expect.toml` carry that behaviour across, and that
+  should be established before the port starts, not after.
+- **Where does the catalogue's install command come from for a language g-mesh
+  does not yet support?** Saying "not supported" generically avoids promising
+  anything, but a user with a Kotlin project gets no signal at all. That may be
+  correct; it is not obviously correct.
+- **Windows.** Every size figure here is macOS. The SEA's weight in particular
+  may differ, and nothing in this design has been measured on Windows - where,
+  as of this writing, four tests still fail for unrelated reasons (GM-322).

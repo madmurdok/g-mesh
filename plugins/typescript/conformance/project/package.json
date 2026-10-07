@@ -1,0 +1,8 @@
+{
+  "name": "conformance-fixture",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "imports": {
+    "#int/*": "./src/int/*.ts"
+  }
+}

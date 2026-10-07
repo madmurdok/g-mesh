@@ -1,4 +1,5 @@
 pub mod apply;
+pub mod batch;
 pub mod burst;
 pub mod debounce;
 pub mod staleness;

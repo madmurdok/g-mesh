@@ -6,8 +6,8 @@
 //!
 //! A language plugin emits one placeholder `Module` node per import specifier
 //! and hangs the `IMPORTS` edge on it, because a specifier is text, not a
-//! node id it can safely point at (see `recordImport` in
-//! plugins/typescript/src/extract.ts). When the plugin recognises the specifier as
+//! node id it can safely point at (see `record_import` in
+//! plugins/typescript/src/extractor/imports.rs). When the plugin recognises the specifier as
 //! naming something in this project it says so, by setting the placeholder's
 //! `nativeKind` to [`RESOLVED_MODULE_NATIVE_KIND`] and its `target` to a
 //! structured address (`storage::write::PlaceholderTargetRecord`, the
@@ -92,14 +92,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::storage::write::Diff;
 
 /// The `nativeKind` a plugin marks a resolved import placeholder with.
-/// Mirrors `RESOLVED_MODULE_NATIVE_KIND` in plugins/typescript/src/extract.ts -
-/// the two are one wire contract and must be changed together.
+/// Mirrors `RESOLVED_MODULE_NATIVE_KIND` in plugins/typescript/src/extractor/keys.rs
+/// - the two are one wire contract and must be changed together.
 pub const RESOLVED_MODULE_NATIVE_KIND: &str = "resolved_module";
 
 /// The `nativeKind` a plugin marks an import it could *not* resolve to
 /// anything in this project with - a package, a language builtin, a crate
 /// nothing here walks. Mirrors `EXTERNAL_MODULE_NATIVE_KIND` in
-/// plugins/typescript/src/extract.ts and the same literal in the Python and
+/// plugins/typescript/src/extractor/keys.rs and the same literal in the Python and
 /// Rust plugins' emitters; all of them are one wire contract.
 ///
 /// Unlike [`RESOLVED_MODULE_NATIVE_KIND`] and the two placeholder kinds in

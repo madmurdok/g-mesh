@@ -23,8 +23,8 @@
 //! at the storage layer.
 //!
 //! Structured after `namespace_import_resolution.rs`/`reexport_linking.rs`.
-//! Requires `plugins/typescript/dist/` to be up to date, which `core/build.rs`
-//! keeps so.
+//! Requires the TypeScript plugin binary, which `cargo build --workspace`
+//! builds.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

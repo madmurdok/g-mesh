@@ -1,79 +1,106 @@
-# Bundled JS/TS plugin manifest. See docs/architecture/plugin-modularity.md
-# (Data Model section) for the schema this file follows, and
-# core/src/daemon/manifest.rs (`read_manifest`) for the parser/validation
-# rules it must satisfy.
+# Bundled TypeScript/JavaScript plugin manifest. See
+# docs/architecture/plugin-modularity.md (Data Model section) for the schema
+# this file follows, and core/src/daemon/manifest.rs (`read_manifest`) for the
+# parser/validation rules it must satisfy. `language` must equal this
+# directory's own name ("typescript"), the rule every bundled plugin follows.
 #
-# `language` below is "typescript" - the plugin's actual wire identifier, per
-# its handshake (plugins/typescript/src/index.ts: `language: "typescript"`)
-# and core/src/protocol/types.rs's `handshake_payload_round_trips` test.
-# `read_manifest` requires `language` to equal this manifest's *containing
-# directory* name, which is why this directory (formerly `plugins/js-ts`) is
-# named `typescript` rather than describing the toolchain that builds it -
-# task 155 (the discovery-wiring task) renamed it to close that gap, so the
-# bundled plugin goes through the exact same directory-name-is-the-manifest's-
-# language rule as any other discovered plugin, no special case retained.
+# The plugin is the Rust binary built from this directory's crate on the SDK in
+# plugins/sdk. It is a member of the cargo workspace, so
+# `cargo build` builds it beside g-mesh itself; `${G_MESH_BIN_DIR}` expands to
+# the directory of the running g-mesh executable, as for plugins/python and
+# plugins/rust.
+#
+# Two tiers: tree-sitter structure, and semantics from vtsls on the SDK's LSP
+# bridge (`[plugin.semantic]` below, src/semantic.rs). Without a usable vtsls
+# the semantic pass is an empty, incomplete diff and the structural tier
+# answers alone.
 
 [plugin]
 language = "typescript"
 protocol_version = 2
-# This plugin's OWN semver, not g-mesh's release version - GM-303 wrote down
-# why (docs/architecture/plugin-modularity.md, "plugin_version: two rules,
-# not one"): this directory is a separate npm package, not a member of the
-# cargo workspace the release version is cut from, so it is bumped by hand
-# for its own capability changes - 2.1.0 for becoming a self-contained Node
-# SEA, 2.2.0 for the --run-node entry path (see `git log` on this file and on
-# package.json) - and must equal package.json's `.version`, which the
-# handshake follows via scripts/generate-version.js. Two tests hold that
-# agreement: `every_declaration_of_the_bundled_plugins_version_agrees` and
-# `the_bundled_plugins_handshake_reports_the_version_its_manifest_declares`,
-# both in core/src/daemon/manifest.rs. scripts/cut-release.sh re-checks it
-# directly at release time too, since neither test runs under --skip-tests.
-plugin_version = "2.4.0"
+# Must equal this crate's `Cargo.toml` `version`: a plugin in the cargo
+# workspace tracks the release version (docs/architecture/plugin-modularity.md,
+# "plugin_version: two rules, not one"); scripts/cut-release.sh checks it.
+plugin_version = "4.0.0"
 
 [plugin.spawn]
-command = "node"
-args = ["dist/src/index.js"]
+command = "${G_MESH_BIN_DIR}/g-mesh-plugin-typescript"
 
 [plugin.languages]
 extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
 
 [plugin.capabilities]
-# TypeScript's own checker is this plugin's semantic tier (src/semantic.ts) -
-# core may send it a semanticPass request.
+# On whether or not a server is installed: the plugin answers every
+# semanticPass, with an empty incomplete diff when vtsls cannot be found.
 semantic_pass = true
-# Off: the checker's pass upgrades structural edges in place, under the
-# structural edge's own id, so a sweep after a pass that no longer re-sends an
-# upgrade (the checker now answers with no single declaration) would delete
-# the edge itself rather than fall back to the structural one (ADR 0008,
-# section 3).
+# Off until the semantic tier states that a whole-project pass re-sends every
+# edge it stands behind (ADR 0008, section 3).
 semantic_sweep = false
-# Both tiers leave receiver calls (`x.foo()`) unresolved: the structural pass
-# has no type information to know what `x` is, and the semantic pass
-# (src/semanticPass.ts) resolves imports/overloads/declaration targets but
-# does not yet walk method-call receivers to an edge. Honest gap, not a
-# missing feature this manifest should overclaim - see
+# The project model resolves imports against the set of files the walk listed,
+# so every created file of one watcher batch must be in it before the first of
+# them is extracted (docs/adr/0026-batch-created-files-notification.md).
+files_created = true
+# Receiver calls (`x.foo()`, and `this.m()` / `super.m()` with no member of
+# that name in this file) are resolved by the semantic tier, which asks the
+# server where each one lands. The structural tier alone has no type for `x`,
+# so its own declaration stays "unresolved", and a file reports such calls in
+# `untypedCalls` until a pass answers them - see
 # docs/architecture/multi-language-plugins.md's `plugin.toml additions`
-# section for what core does with an "unresolved" declaration (lists the gap
-# in the MCP instructions rather than silently under-reporting call sites).
-receiver_calls = "unresolved"
+# section for what core does with each value.
+receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
 
+[plugin.semantic]
+# A bare name: a `PATH` lookup, then the indexed project's own
+# `node_modules/.bin`, then `npx --yes --package @vtsls/language-server vtsls`.
+# Each candidate is proved by `<candidate> --version` under a budget before it
+# runs. Point this at a specific binary and it is used as written, probed and
+# not searched around. The project's own `typescript` is never used: see
+# docs/architecture/gm-325-typescript-lsp-semantics.md, section 2.
+command = "vtsls"
+args = ["--stdio"]
+engine = "vtsls"
+# tsserver loads a project when one of its files is opened; there is no
+# workspace index to wait for before the first question. An empty answer
+# while that load runs is re-asked once the server is quiet (section 3).
+readiness = "on-demand"
+# `overload_disambiguation` stays at its default, "none": vtsls's
+# `definition` already names the bound overload at an overloaded call.
+# No implementation sweep: the server's implementations are transitive, and
+# the structural tier already records the direct ones.
+implementation_kinds = []
+
+# vtsls asks `workspace/configuration` for one section named "" and reads its
+# VS Code settings from that object. `useSyntaxServer = "never"` runs one
+# tsserver: with the default, "auto", a syntax-only server answers while the
+# project loads, and its `definition` of an imported name is the import
+# itself - a non-empty wrong answer the bridge cannot tell from a right one.
+# A single server instead holds the question until the project is loaded.
+[plugin.semantic.settings.""]
+typescript.tsserver.useSyntaxServer = "never"
+
+[plugin.grammars]
+# Which tree-sitter grammar parses which extension. Read by this plugin's tests
+# only (core ignores unknown [plugin] tables): the binary can only parse with
+# the grammars it links, so routing stays in code. Must equal
+# `extractor::grammar::GRAMMARS`; a test in tests/units.rs pins the two, and
+# that every extension in [plugin.languages] has exactly one grammar.
+typescript = [".ts", ".mts", ".cts"]
+tsx = [".tsx"]
+javascript = [".js", ".jsx", ".mjs", ".cjs"]
+
 [plugin.workspace]
-# No file here plays the role go.mod/Cargo.toml/*.csproj play for their
-# languages (a workspace-boundary file whose change moves module/crate
-# roots and forces a per-language reindex): tsconfig.json/package.json's
-# path-mapping and package-boundary facts are already read fresh per file
-# by tsconfigPaths.ts/workspace.ts rather than cached at a project-wide
-# model that a stale read could poison, so there is nothing this field
-# needs to name yet.
-watch_files = []
-# Mirrors this plugin's own walk exclusions (ignorePolicy.ts's
-# HARD_EXCLUDED_DIRS), minus `.git`/`.claude`, which are already excluded
-# at the baseline core level and are not specific to this language - the
-# same split the architecture doc's Go example makes (`vendor`/`testdata`,
-# not `.git`). Must equal that set minus those two, order included: core
-# reads this file as data, so it cannot be derived, and a test in
-# test/ignorePolicy.test.ts pins the two.
+# The files the project model is built from: workspace packages
+# (`package.json`, `pnpm-workspace.yaml`), `exports`/`imports` maps
+# (`package.json`) and `paths` (`tsconfig*.json`, `jsconfig*.json`, which also
+# match `extends` targets such as `tsconfig.base.json`). The model reads them
+# once, so a save of one reindexes the language (ADR 0008). Must equal
+# `project::WATCH_FILES`; a test in tests/units.rs pins the two.
+watch_files = ["package.json", "tsconfig*.json", "jsconfig*.json", "pnpm-workspace.yaml"]
+# Directories this plugin's walk never descends into, on top of the SDK's own
+# baseline (`.git` and the like, which are not specific to this language).
+# Must equal `project::EXCLUDE_DIRS`, order included: core reads this file as
+# data, so it cannot be derived, and a test in tests/units.rs pins the two.
 exclude_dirs = ["node_modules", "dist"]
 # A miss-path lookup treats a directory's `index` file as its container's
 # entry point - the Node/bundler convention this repo already indexes.

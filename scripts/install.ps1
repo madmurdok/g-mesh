@@ -118,6 +118,10 @@ $ErrorActionPreference = 'Stop'
 # unpacked. A mismatch aborts with both hashes printed and nothing installed.
 # There is no flag to skip this.
 #
+# The same rule is implemented in scripts/install.sh and in the Rust fetch
+# behind `g-mesh plugins install`; change all three together. Why there are
+# three: docs/adr/0027-plugin-fetch-checksums-in-rust.md.
+#
 # ---------------------------------------------------------------------------
 # VERSIONS, AND THE "NOTHING IS PUBLISHED YET" CASE
 #
@@ -161,7 +165,7 @@ $ErrorActionPreference = 'Stop'
 # is correct. It downloads, verifies the checksum, unpacks, runs the binary
 # once (the same smoke test install.sh does - see Install-GMesh below), and
 # puts it on PATH. None of that depends on what plugins\typescript\ contains
-# internally - whether it is a Node SEA or, later, a native binary - only on
+# internally (a native cargo binary since GM-326, a Node SEA before) - only on
 # the archive's shape, which install.sh already establishes and this script
 # inherits unchanged. Proof that the artifact this script installs actually
 # works end to end on a real Windows machine is GM-333's job (a release
@@ -505,7 +509,7 @@ function Install-GMesh {
         }
         $tsPluginToml = Join-Path $stage 'plugins\typescript\plugin.toml'
         if (-not (Test-Path -LiteralPath $tsPluginToml -PathType Leaf)) {
-            Die "unexpected archive layout: $asset carries no plugins\typescript\plugin.toml. Core cannot index a TypeScript project without it, so this archive is not installable."
+            Die "unexpected archive layout: $asset carries no plugins\typescript\plugin.toml. A g-mesh release archive always carries its bundled plugins, so this is not a release archive (wrong or truncated asset) - nothing was installed."
         }
 
         # Run it before installing it, same as install.sh: '--version' proves

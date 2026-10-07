@@ -38,7 +38,7 @@ protocol_version = 2
 # (plugins/go, plugins/typescript) tracks its own manifest of record
 # instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
 # rules, not one".
-plugin_version = "3.21.0"
+plugin_version = "4.0.0"
 
 [plugin.spawn]
 command = "${G_MESH_BIN_DIR}/g-mesh-plugin-python"
@@ -81,6 +81,12 @@ semantic_sweep = true
 # every call site; the gap list is the promise.
 receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
+# The project model answers "is `pkg.mod` one of ours" and decides the `src/`
+# root from the set of files the walk listed, so every created file of one
+# watcher batch must be in it before the first of them is extracted - an
+# importer and the module it imports, created together, then link on the
+# first extraction (docs/adr/0026-batch-created-files-notification.md).
+files_created = true
 
 # How to start pyright. Read by *this plugin*, never by core - core has no use
 # for the fields and validating them would make a typo here take the
@@ -134,6 +140,16 @@ engine = "pyright"
 # have recorded it too, which is the exact guarantee, stated in
 # `ServerReadiness::OnDemand`.
 readiness = "on-demand"
+
+# pyright's `textDocument/definition` at an overloaded call names the whole
+# `@overload` set, implementation included, whatever the call binds (1.1.414,
+# measured in docs/architecture/gm-348-bridge-overload-binding.md section 1);
+# only its `hover` at the call renders the bound stub. "hover" lets the bridge
+# compare that text with each stub's own hover and bind the one that matches -
+# and nothing when none or several do, so a printer change upstream costs the
+# binding, never an edge. See
+# docs/adr/0024-semantic-tier-refines-by-binding-a-declaration.md.
+overload_disambiguation = "hover"
 
 # EMPTY ON PURPOSE, and it is the one key here that would silently break the
 # whole tier if it were filled in with the obvious value. The Rust plugin sets

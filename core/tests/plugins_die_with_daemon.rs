@@ -50,8 +50,7 @@ mod common;
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// The plugins' knob - see the module doc. Must match
-/// `plugins/sdk/src/hold.rs`, `plugins/go/hold.go` and
-/// `plugins/typescript/src/testHold.ts`.
+/// `plugins/sdk/src/hold.rs` and `plugins/go/hold.go`.
 const HOLD_DIR_ENV: &str = "G_MESH_PLUGIN_HOLD_DIR";
 
 /// How long a plugin may survive its killed daemon. The acceptance criterion

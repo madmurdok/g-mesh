@@ -199,6 +199,7 @@ fn budgets() -> Budgets {
         single_file: Duration::from_secs(30),
         readiness: Duration::from_secs(20),
         settle: Duration::from_millis(150),
+        warm_up: None,
     }
 }
 
@@ -1465,6 +1466,32 @@ fn the_bridge_carries_no_language_of_its_own() {
     );
 }
 
+/// A document is opened under the `languageId` its extension maps to in
+/// `LspBridge::language_ids`, and under the bridge's language without one -
+/// read from what the server received.
+#[test]
+fn a_document_is_opened_under_the_language_id_its_extension_maps_to() {
+    let scratch = Scratch::new("language-ids");
+    let (index, _) = fixture(&scratch);
+    let opened_as = |by_extension: &'static [(&'static str, &'static str)], tag: &str| {
+        let log = scratch.path().join(format!("opened-{tag}.log"));
+        let config = scratch.server(json!({
+            "readiness": { "kind": "none" },
+            "positionEncoding": "utf-16",
+            "answers": answers_the_site(&scratch),
+            "openedLog": log.to_string_lossy(),
+        }));
+        let mut bridge =
+            LspBridge::with_budgets("toy", scratch.path(), config, budgets()).language_ids(by_extension);
+        let answer = bridge.answer(&[RelPath::new("src/b.toy")], &index).expect("the bridge answers");
+        assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+        std::fs::read_to_string(&log).unwrap_or_default()
+    };
+    let b = scratch.uri("src/b.toy");
+    assert_eq!(opened_as(&[(".other", "other"), ("b.toy", "toy-b")], "mapped"), format!("{b} toy-b\n"));
+    assert_eq!(opened_as(&[(".other", "other")], "unmapped"), format!("{b} toy\n"));
+}
+
 /// The second settings channel (GM-299): a server that *asks* for its
 /// settings gets the ones the config carries, positionally, and `null` for a
 /// section nobody configured.
@@ -1615,6 +1642,7 @@ fn a_project_larger_than_the_old_ceiling_still_completes_its_pass() {
         single_file: Duration::from_secs(600),
         readiness: Duration::from_secs(60),
         settle: Duration::from_millis(150),
+        warm_up: None,
     };
     let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
 
@@ -2630,4 +2658,1008 @@ fn an_incomplete_whole_project_pass_keeps_what_is_owed() {
     let edges = semantic_edges(&next);
     assert_eq!(edges.len(), 1, "{:#?}", next.diff);
     assert_eq!(edges[0].from_id, caller);
+}
+
+// --- GM-348: overload binding -----------------------------------------------
+//
+// `src/o.toy` declares two overload sets, each one node carrying three
+// `declarations` (two bodiless stubs, then the implementation, one per line),
+// and a plain `g`:
+//
+// ```text
+// 0  over f int      f, ordinal 0      (the node's own range is this `f`)
+// 1  over f str      f, ordinal 1
+// 2  body f any      f, ordinal 2, has_body
+// 3  fn g            g, no declarations
+// 4  over m int      m, ordinal 0
+// 5  over m str      m, ordinal 1
+// 6  body m any      m, ordinal 2, has_body
+// ```
+//
+// Qualified names are `o::f` and so on, so that a `Name("f")` placeholder
+// and one addressed as an answer addresses `f` are two placeholders.
+//
+// `src/c.toy`'s `caller` calls into it; which sites the index records is
+// each test's choice ([`OSite`]). Every `f` call's structural edge is `E_f`,
+// onto a `Name`-keyed placeholder (`Bound::There`, the plugin cannot know the
+// target is overloaded), so every test here also exercises the filter's
+// placeholder arm (B10b): a site onto `E_f` is asked only because `f`'s key
+// names an overload set elsewhere in the index.
+
+const O_TOY: &str = "over f int\nover f str\nbody f any\nfn g\nover m int\nover m str\nbody m any\n";
+const C_TOY: &str = "fn caller\n  f(1)\n  f(s)\n  g()\n  x.m(s)\n  x.f()\n";
+/// Where every declaration's name is written in `o.toy`.
+const NAME_COL: u32 = 5;
+
+/// The sites [`overload_fixture`] can record in `c.toy`.
+#[derive(Clone, Copy, PartialEq)]
+enum OSite {
+    /// `f(1)`, line 1: `OverloadCall` naming `E_f`.
+    F1,
+    /// `f(s)`, line 2: `OverloadCall` naming `E_f`.
+    Fs,
+    /// `g()`, line 3: `OverloadCall` naming `E_g`, onto a set-less target.
+    G,
+    /// `g()`, line 3: `OverloadCall` with no `replaces`.
+    GBare,
+    /// `x.m(s)`, line 4: an untyped `ReceiverCall`.
+    M,
+    /// `x.f()`, line 5: a typed `ReceiverCall` naming `E_x`, a second
+    /// structural edge from `caller` addressed exactly as an answer
+    /// addresses `f`, so an agreeing answer confirms it.
+    Xf,
+}
+
+impl OSite {
+    fn at(self) -> (u32, u32) {
+        match self {
+            OSite::F1 => (1, 2),
+            OSite::Fs => (2, 2),
+            OSite::G | OSite::GBare => (3, 2),
+            OSite::M => (4, 4),
+            OSite::Xf => (5, 4),
+        }
+    }
+}
+
+struct Overloads {
+    index: SdkIndex,
+    caller: String,
+    e_f: String,
+    e_g: String,
+    e_x: String,
+}
+
+fn stubs(first_line: u32) -> Vec<g_mesh_plugin_sdk::wire::WireDeclaration> {
+    (0..3)
+        .map(|ordinal| g_mesh_plugin_sdk::wire::WireDeclaration {
+            ordinal,
+            start_line: first_line + ordinal,
+            start_col: 0,
+            end_line: first_line + ordinal,
+            end_col: 10,
+            signature: None,
+            has_body: ordinal == 2,
+        })
+        .collect()
+}
+
+fn overload_fixture(scratch: &Scratch, sites: &[OSite]) -> Overloads {
+    scratch.write("src/o.toy", O_TOY);
+    scratch.write("src/c.toy", C_TOY);
+    let mut index = SdkIndex::new();
+
+    let o = RelPath::new("src/o.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &o);
+    builder.file_node(range(0, 0, 7, 0));
+    for (name, line, declarations) in [("f", 0, stubs(0)), ("g", 3, Vec::new()), ("m", 4, stubs(4))] {
+        let col = if name == "g" { 3 } else { NAME_COL };
+        builder.add_node(
+            NodeSpec::new(NodeKind::Function, name, format!("o::{name}"), range(line, col, line, col + 1))
+                .native_kind("function")
+                .in_container("pkg", None)
+                .public()
+                .declarations(declarations),
+        );
+    }
+    let o_graph = builder.finish();
+    let f = o_graph.nodes.iter().find(|node| node.name == "f").unwrap().clone();
+    index.insert(o, O_TOY.to_string(), o_graph);
+
+    let c = RelPath::new("src/c.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &c);
+    builder.file_node(range(0, 0, 6, 0));
+    let caller = builder.add_node(
+        NodeSpec::new(NodeKind::Function, "caller", "caller", range(0, 0, 5, 7))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    let edge_onto = |builder: &mut FileGraphBuilder, name: &str, key: TargetKey, key_path, line: u32| {
+        let placeholder = builder.add_placeholder(
+            g_mesh_plugin_sdk::PlaceholderKind::PendingSymbol,
+            name,
+            g_mesh_plugin_sdk::wire::PlaceholderTarget {
+                scope: TargetScope::Container("pkg".to_string()),
+                key,
+                from_container: Some("pkg".to_string()),
+                key_path,
+            },
+            range(line, 2, line, 3),
+        );
+        builder.placeholder_edge(EdgeKind::Calls, &caller, &placeholder)
+    };
+    let e_f = edge_onto(&mut builder, "f", TargetKey::Name("f".to_string()), None, 1);
+    let e_g = edge_onto(&mut builder, "g", TargetKey::Name("g".to_string()), None, 3);
+    let e_x =
+        edge_onto(&mut builder, "f", TargetKey::QualifiedName(f.qualified_name.clone()), f.qualified_path, 5);
+    for site in sites {
+        let (kind, replaces, name) = match site {
+            OSite::F1 | OSite::Fs => (OpenSiteKind::OverloadCall, Some(e_f.clone()), "f"),
+            OSite::G => (OpenSiteKind::OverloadCall, Some(e_g.clone()), "g"),
+            OSite::GBare => (OpenSiteKind::OverloadCall, None, "g"),
+            OSite::M => (OpenSiteKind::ReceiverCall, None, "m"),
+            OSite::Xf => (OpenSiteKind::ReceiverCall, Some(e_x.clone()), "f"),
+        };
+        let (line, col) = site.at();
+        builder.open_site(OpenSite {
+            from_id: caller.clone(),
+            position: Position { line, col },
+            name: name.to_string(),
+            kind,
+            edge_kind: EdgeKind::Calls,
+            from_container: Some("pkg".to_string()),
+            replaces,
+        });
+    }
+    index.insert(c, C_TOY.to_string(), builder.finish());
+    assert_ne!(e_f, e_x, "a Name key and a QualifiedName key are two placeholders");
+    Overloads { index, caller, e_f, e_g, e_x }
+}
+
+/// A scripted answer at `site`: `definitions` are `o.toy` lines (each at the
+/// declaration's name), `hover` the call's markdown.
+fn at_site(scratch: &Scratch, site: OSite, definitions: &[u32], hover: Option<&str>) -> Value {
+    let (line, character) = site.at();
+    let definitions: Vec<Value> = definitions
+        .iter()
+        .map(|line| json!({ "uri": scratch.uri("src/o.toy"), "line": line, "character": NAME_COL }))
+        .collect();
+    let mut answer = json!({
+        "uri": scratch.uri("src/c.toy"), "line": line, "character": character, "definitions": definitions,
+    });
+    if let Some(hover) = hover {
+        answer["hover"] = json!(hover);
+    }
+    answer
+}
+
+/// The hover a candidate declaration on `o.toy` line `line` answers with.
+fn at_declaration(scratch: &Scratch, line: u32, hover: &str) -> Value {
+    json!({ "uri": scratch.uri("src/o.toy"), "line": line, "character": NAME_COL, "hover": hover })
+}
+
+/// pyright's hover markdown: the signature in a fenced block, then docs.
+fn fenced(signature: &str) -> String {
+    format!("```python\n{signature}\n```\n---\nSome documentation.")
+}
+
+fn overload_bridge(
+    scratch: &Scratch,
+    answers: Vec<Value>,
+    disambiguation: g_mesh_plugin_sdk::lsp::OverloadDisambiguation,
+    concurrency: usize,
+) -> (LspBridge, PathBuf) {
+    let log = scratch.path().join("asked.log");
+    let mut config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+        "log": log.to_string_lossy(),
+    }));
+    config.overload_disambiguation = disambiguation;
+    let mut budgets = budgets();
+    budgets.concurrency = concurrency;
+    (LspBridge::with_budgets("toy", scratch.path(), config, budgets), log)
+}
+
+use g_mesh_plugin_sdk::lsp::OverloadDisambiguation::{Hover as ByHover, None as NoHover};
+
+/// The semantic edges `answer` binds to an ordinal, as `(from, ordinal)`.
+fn bound(answer: &SemanticAnswer) -> Vec<(String, u32)> {
+    let mut bound: Vec<(String, u32)> = semantic_edges(answer)
+        .into_iter()
+        .filter_map(|edge| edge.to_declaration.map(|ordinal| (edge.from_id.clone(), ordinal)))
+        .collect();
+    bound.sort();
+    bound
+}
+
+/// The structural edge `id` is re-sent and not retracted: the call keeps its
+/// one structural row, unrefined.
+fn kept(answer: &SemanticAnswer, id: &str, what: &str) {
+    assert_eq!(upserts(answer, id).len(), 1, "{what}: re-sent: {:#?}", answer.diff);
+    assert!(!answer.diff.delete_edge_ids.iter().any(|deleted| deleted == id), "{what}: not retracted");
+}
+
+/// The structural edge `id` is retracted and not re-sent.
+fn retracted(answer: &SemanticAnswer, id: &str, what: &str) {
+    assert!(answer.diff.delete_edge_ids.iter().any(|deleted| deleted == id), "{what}: {:#?}", answer.diff);
+    assert!(upserts(answer, id).is_empty(), "{what}: not also re-sent");
+}
+
+/// **GM-348 B3.** A server that answers an overloaded call with one location
+/// (tsserver's shape) binds it by containment in the set's `declarations` -
+/// here on the *second* stub, which lies outside the node's own range (the
+/// first stub's name), so node containment alone would land on nothing.
+/// The bound edge replaces the structural one.
+///
+/// Control: in `declaration_at`, test the node's own `range` instead of each
+/// declaration's (or make `overload_landing` use `node_at` only) - no
+/// ordinal, the call stays unbound, `E_f` is re-sent.
+#[test]
+fn a_single_location_binds_the_declaration_that_contains_it() {
+    let scratch = Scratch::new("gm348-b3");
+    let fixture = overload_fixture(&scratch, &[OSite::Fs]);
+    let (mut bridge, _) =
+        overload_bridge(&scratch, vec![at_site(&scratch, OSite::Fs, &[1], None)], NoHover, 4);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert_eq!(bound(&answer), vec![(fixture.caller.clone(), 1)], "{:#?}", answer.diff);
+    retracted(&answer, &fixture.e_f, "every site of E_f bound");
+}
+
+/// **GM-348 B7 (and B5's retraction).** Two calls from one caller binding two
+/// overloads are two edges with distinct ids onto one placeholder, each
+/// carrying its ordinal as `toDeclaration` on the wire; their structural edge
+/// is retracted.
+///
+/// Controls: pass `None` to `edge_id` in `Answers::record` (one edge, not
+/// two); write `to_declaration: None` in `Answers::finish` (the wire field is
+/// absent).
+#[test]
+fn two_overloads_called_from_one_caller_are_two_edges_onto_one_placeholder() {
+    let scratch = Scratch::new("gm348-b7");
+    let fixture = overload_fixture(&scratch, &[OSite::F1, OSite::Fs]);
+    let answers = vec![at_site(&scratch, OSite::F1, &[0], None), at_site(&scratch, OSite::Fs, &[1], None)];
+    let (mut bridge, _) = overload_bridge(&scratch, answers, NoHover, 4);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    let edges = semantic_edges(&answer);
+    assert_eq!(edges.len(), 2, "{:#?}", answer.diff);
+    assert_ne!(edges[0].id, edges[1].id);
+    assert_eq!(edges[0].to_id, edges[1].to_id, "one placeholder");
+    let placeholders = answer.diff.upsert_nodes.iter().filter(|node| node.target.is_some()).count();
+    assert_eq!(placeholders, 1, "{:#?}", answer.diff.upsert_nodes);
+    let mut on_the_wire: Vec<Value> = edges
+        .iter()
+        .map(|edge| serde_json::to_value(edge).expect("an edge serializes")["toDeclaration"].clone())
+        .collect();
+    on_the_wire.sort_by_key(|value| value.as_u64());
+    assert_eq!(on_the_wire, vec![json!(0), json!(1)]);
+    retracted(&answer, &fixture.e_f, "both sites bound");
+}
+
+/// **GM-348 B4.** All or nothing per structural edge: one site of `E_f`
+/// binds, the other gets no answer, so `E_f` is re-sent unchanged and the one
+/// binding is dropped rather than shipped beside it.
+///
+/// Control: in `Answers::settle_overloads`, use `.any(..)` instead of
+/// `.all(..)` over the edge's sites (`E_f` is retracted and one bound edge
+/// sent).
+#[test]
+fn one_unbound_site_keeps_the_structural_edge_and_drops_every_binding() {
+    let scratch = Scratch::new("gm348-b4");
+    let fixture = overload_fixture(&scratch, &[OSite::F1, OSite::Fs]);
+    let (mut bridge, _) =
+        overload_bridge(&scratch, vec![at_site(&scratch, OSite::F1, &[0], None)], NoHover, 4);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert!(semantic_edges(&answer).is_empty(), "{:#?}", answer.diff);
+    kept(&answer, &fixture.e_f, "f(s) did not bind");
+}
+
+/// **GM-348 B5 (R3).** A fully bound edge's bindings survive settle even
+/// though another structural edge from the same caller (`E_x`, confirmed by
+/// an agreeing answer and therefore re-sent) lands on the same declaration:
+/// a bound edge says more than an unbound one and is never covered by it.
+///
+/// Control: in `Answers::settle`'s `covered`, drop the
+/// `edge.to_declaration.is_none() &&` conjunct (both bindings are dropped).
+#[test]
+fn a_binding_survives_a_re_sent_structural_edge_onto_the_same_declaration() {
+    let scratch = Scratch::new("gm348-b5");
+    let fixture = overload_fixture(&scratch, &[OSite::F1, OSite::Fs, OSite::Xf]);
+    let mut xf = at_site(&scratch, OSite::Xf, &[], None);
+    xf["definition"] = json!({ "uri": scratch.uri("src/o.toy"), "line": 0, "character": NAME_COL });
+    let answers =
+        vec![at_site(&scratch, OSite::F1, &[0], None), at_site(&scratch, OSite::Fs, &[1], None), xf];
+    let (mut bridge, _) = overload_bridge(&scratch, answers, NoHover, 4);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    kept(&answer, &fixture.e_x, "x.f() agrees with E_x");
+    assert_eq!(
+        bound(&answer),
+        vec![(fixture.caller.clone(), 0), (fixture.caller.clone(), 1)],
+        "{:#?}",
+        answer.diff
+    );
+    retracted(&answer, &fixture.e_f, "both sites of E_f bound");
+}
+
+/// **GM-348 B6.** A location on the implementation of a set with stubs binds
+/// nothing: no call binds an implementation, so the server is answering "the
+/// function", and the structural edge stands.
+///
+/// Control: make `choose_overload`'s `bindable` true for every existing
+/// ordinal (ordinal 2 is recorded and `E_f` retracted).
+#[test]
+fn a_location_on_the_implementation_binds_nothing() {
+    let scratch = Scratch::new("gm348-b6");
+    let fixture = overload_fixture(&scratch, &[OSite::Fs]);
+    let (mut bridge, _) =
+        overload_bridge(&scratch, vec![at_site(&scratch, OSite::Fs, &[2], None)], NoHover, 4);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert!(semantic_edges(&answer).is_empty(), "{:#?}", answer.diff);
+    kept(&answer, &fixture.e_f, "the implementation is not an overload");
+}
+
+/// **GM-348, refining never moves a call.** An answer for an `f` call that
+/// lands in another overload set (`m`'s first stub) binds nothing and
+/// retracts nothing: refining a call never moves it to another target.
+///
+/// Control: make `refines` return `true` (the call binds `m`'s ordinal 0 and
+/// `E_f` is retracted).
+#[test]
+fn an_answer_on_another_function_leaves_the_structural_edge_alone() {
+    let scratch = Scratch::new("gm348-moves");
+    let fixture = overload_fixture(&scratch, &[OSite::F1]);
+    let mut f1 = at_site(&scratch, OSite::F1, &[], None);
+    f1["definitions"] = json!([{ "uri": scratch.uri("src/o.toy"), "line": 4, "character": NAME_COL }]);
+    let (mut bridge, _) = overload_bridge(&scratch, vec![f1], NoHover, 4);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert!(semantic_edges(&answer).is_empty(), "{:#?}", answer.diff);
+    kept(&answer, &fixture.e_f, "the answer named m, not f");
+}
+
+/// **GM-348 B8 (method), plus the receiver-call path.** An untyped receiver
+/// call onto a method set, answered with the whole set (pyright's shape):
+/// the call's hover is the bound stub with `self` dropped and on one line,
+/// each candidate's hover has `self` and is wrapped over several lines. It
+/// binds ordinal 1 once the first parameter is dropped and whitespace is
+/// normalised; the implementation is never hovered.
+///
+/// Controls: `hover_matches` exact-only (`declared == call`) - unbound, a
+/// plain edge with no ordinal; `normalise_hover` returning `text.to_string()`
+/// - unbound likewise; delete the `ReceiverCall` prelude in `record_answer` -
+///   a three-location answer never agrees, no edge at all.
+#[test]
+fn a_method_call_binds_by_hover_with_its_receiver_dropped() {
+    let scratch = Scratch::new("gm348-b8-method");
+    let fixture = overload_fixture(&scratch, &[OSite::M]);
+    let answers = vec![
+        at_site(&scratch, OSite::M, &[4, 5, 6], Some(&fenced("(method) def m(x: str) -> str"))),
+        at_declaration(&scratch, 4, &fenced("(method) def m(\n    self: Self@C,\n    x: int\n) -> int")),
+        at_declaration(&scratch, 5, &fenced("(method) def m(\n    self: Self@C,\n    x: str\n) -> str")),
+    ];
+    let (mut bridge, log) = overload_bridge(&scratch, answers, ByHover, 4);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert_eq!(bound(&answer), vec![(fixture.caller.clone(), 1)], "{:#?}", answer.diff);
+    assert_eq!(asked(&log, "textDocument/hover"), 3, "the call and two stubs, never the implementation");
+}
+
+/// **GM-348, receiver call unbound.** The same call without hover: three
+/// declarations and nothing to tell them apart, so the receiver call keeps
+/// the plain edge it always had, with no ordinal.
+///
+/// Control: in `Answers::conclude`, return early for every unbound site, not
+/// only an `OverloadCall` (no edge at all).
+#[test]
+fn an_unbound_receiver_call_keeps_its_plain_edge() {
+    let scratch = Scratch::new("gm348-receiver-unbound");
+    let fixture = overload_fixture(&scratch, &[OSite::M]);
+    let (mut bridge, log) =
+        overload_bridge(&scratch, vec![at_site(&scratch, OSite::M, &[4, 5, 6], None)], NoHover, 4);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    let edges = semantic_edges(&answer);
+    assert_eq!(edges.len(), 1, "{:#?}", answer.diff);
+    assert_eq!((edges[0].from_id.as_str(), edges[0].to_declaration), (fixture.caller.as_str(), None));
+    assert_eq!(placeholder(&answer, edges[0]).name, "m");
+    assert_eq!(asked(&log, "textDocument/hover"), 0);
+}
+
+/// **GM-348 B8 (function) and B8d.** Two calls of one set answered with the
+/// whole set, told apart by hover: ordinals 0 and 1, `E_f` retracted. The two
+/// stubs are hovered once each for the pass, not once per call, and the
+/// implementation never: four hovers in all.
+///
+/// Concurrency 1 on purpose. The cache is filled when a candidate's hover
+/// *arrives*, so two definitions in flight at once both miss it and the
+/// stubs are hovered twice (6 hovers) - see the controls file.
+///
+/// Controls: remove the `hovers.contains_key` check in `bind_overload` (6
+/// hovers); make `bindable` ignore `has_body` (the implementation is hovered:
+/// 5).
+#[test]
+fn calls_told_apart_by_hover_bind_and_each_stub_is_hovered_once() {
+    let scratch = Scratch::new("gm348-b8-function");
+    let fixture = overload_fixture(&scratch, &[OSite::F1, OSite::Fs]);
+    let answers = vec![
+        at_site(&scratch, OSite::F1, &[0, 1, 2], Some(&fenced("(function) def f(x: int) -> int"))),
+        at_site(&scratch, OSite::Fs, &[0, 1, 2], Some(&fenced("(function) def f(x: str) -> str"))),
+        at_declaration(&scratch, 0, &fenced("(function) def f(x: int) -> int")),
+        at_declaration(&scratch, 1, &fenced("(function) def f(x: str) -> str")),
+        at_declaration(&scratch, 2, &fenced("(function) def f(x: int | str) -> int | str")),
+    ];
+    let (mut bridge, log) = overload_bridge(&scratch, answers, ByHover, 1);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert_eq!(
+        bound(&answer),
+        vec![(fixture.caller.clone(), 0), (fixture.caller.clone(), 1)],
+        "{:#?}",
+        answer.diff
+    );
+    retracted(&answer, &fixture.e_f, "both calls bound by hover");
+    assert_eq!(asked(&log, "textDocument/hover"), 4, "two calls, two stubs, once each");
+}
+
+/// **GM-348 B8b.** The hover path fails closed: a call hover no stub matches,
+/// and one that two stubs match, both leave `E_f` as it was.
+///
+/// Control: in `Answers::hovered`, bind the first match
+/// (`matching.first().copied()`) - the two-match case binds ordinal 0.
+#[test]
+fn hover_binds_only_on_exactly_one_match() {
+    for (case, stub_1, call) in [
+        ("no match", "(function) def f(x: str) -> str", "(function) def f(x: bytes) -> bytes"),
+        ("two matches", "(function) def f(x: int) -> int", "(function) def f(x: int) -> int"),
+    ] {
+        let scratch = Scratch::new(&format!("gm348-b8b-{}", case.replace(' ', "-")));
+        let fixture = overload_fixture(&scratch, &[OSite::F1]);
+        let answers = vec![
+            at_site(&scratch, OSite::F1, &[0, 1, 2], Some(&fenced(call))),
+            at_declaration(&scratch, 0, &fenced("(function) def f(x: int) -> int")),
+            at_declaration(&scratch, 1, &fenced(stub_1)),
+        ];
+        let (mut bridge, log) = overload_bridge(&scratch, answers, ByHover, 4);
+
+        let answer = pass(&mut bridge, &fixture.index);
+        assert!(answer.complete, "{case}: {:?}", answer.reason);
+        assert_eq!(asked(&log, "textDocument/hover"), 3, "{case}: the hover path ran");
+        assert!(semantic_edges(&answer).is_empty(), "{case}: {:#?}", answer.diff);
+        kept(&answer, &fixture.e_f, case);
+    }
+}
+
+/// **GM-348 B8c.** Hover is opt-in: with the default disambiguation a
+/// whole-set answer binds nothing and `textDocument/hover` is never sent,
+/// though every position has a hover scripted.
+///
+/// Control: drop the `disambiguation == Hover` guard in `choose_overload`
+/// (hovers are sent and both calls bind).
+#[test]
+fn without_the_manifest_key_hover_is_never_asked() {
+    let scratch = Scratch::new("gm348-b8c");
+    let fixture = overload_fixture(&scratch, &[OSite::F1, OSite::Fs]);
+    let answers = vec![
+        at_site(&scratch, OSite::F1, &[0, 1, 2], Some(&fenced("(function) def f(x: int) -> int"))),
+        at_site(&scratch, OSite::Fs, &[0, 1, 2], Some(&fenced("(function) def f(x: str) -> str"))),
+        at_declaration(&scratch, 0, &fenced("(function) def f(x: int) -> int")),
+        at_declaration(&scratch, 1, &fenced("(function) def f(x: str) -> str")),
+    ];
+    let (mut bridge, log) = overload_bridge(&scratch, answers, NoHover, 4);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert_eq!(asked(&log, "textDocument/definition"), 2);
+    assert_eq!(asked(&log, "textDocument/hover"), 0);
+    assert!(semantic_edges(&answer).is_empty(), "{:#?}", answer.diff);
+    kept(&answer, &fixture.e_f, "nothing narrowed the set");
+}
+
+/// **GM-348, hover accounting.** A candidate's hover is asked in `o.toy` but
+/// belongs to the call in `c.toy`: when it is refused, `c.toy` is the file
+/// the pass did not finish, so `E_f` is neither retracted nor re-sent - the
+/// file is simply not judged this pass.
+///
+/// Control: make `Question::accounted_to` return `&self.file` always
+/// (`o.toy` is charged instead, `c.toy` counts as finished and `E_f` is
+/// re-sent by R1).
+#[test]
+fn a_refused_candidate_hover_leaves_the_calls_file_unfinished() {
+    let scratch = Scratch::new("gm348-accounting");
+    let fixture = overload_fixture(&scratch, &[OSite::F1]);
+    let mut refused = at_declaration(&scratch, 0, "unused");
+    refused["hoverError"] = json!("no hover for you");
+    let answers = vec![
+        at_site(&scratch, OSite::F1, &[0, 1, 2], Some(&fenced("(function) def f(x: int) -> int"))),
+        refused,
+        at_declaration(&scratch, 1, &fenced("(function) def f(x: str) -> str")),
+    ];
+    let (mut bridge, _) = overload_bridge(&scratch, answers, ByHover, 4);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(!answer.complete, "a refused hover makes the pass incomplete");
+    assert!(semantic_edges(&answer).is_empty(), "{:#?}", answer.diff);
+    assert!(upserts(&answer, &fixture.e_f).is_empty(), "c.toy unfinished: E_f is not judged");
+    assert!(!answer.diff.delete_edge_ids.contains(&fixture.e_f));
+}
+
+/// **GM-348 B10.** The filter: an `OverloadCall` whose structural edge lands
+/// on a set-less target, and one without the `replaces` the kind requires,
+/// cost the server nothing and leave the pass complete (not unanswerable).
+///
+/// Control: remove the `!overloaded.targets(..)` `continue` in `questions`
+/// (one `definition` is sent).
+#[test]
+fn a_call_onto_a_function_with_no_overloads_asks_nothing() {
+    let scratch = Scratch::new("gm348-b10");
+    let fixture = overload_fixture(&scratch, &[OSite::G, OSite::GBare]);
+    let mut g = at_site(&scratch, OSite::G, &[], None);
+    g["definition"] = json!({ "uri": scratch.uri("src/o.toy"), "line": 3, "character": 3 });
+    let (mut bridge, log) = overload_bridge(&scratch, vec![g], NoHover, 4);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert_eq!(asked(&log, "textDocument/definition"), 0, "nothing was worth asking");
+    assert!(semantic_edges(&answer).is_empty(), "{:#?}", answer.diff);
+    assert!(!answer.diff.delete_edge_ids.contains(&fixture.e_g));
+}
+
+/// **GM-348 B11.** A binding whose call is deleted is retracted by the next
+/// pass over that file, while the binding that is still there is not.
+///
+/// Control: in `Answers::settle_overloads` (or `record`), keep bound edges
+/// out of `by_file` - pass 2 does not retract the `f(s)` binding.
+#[test]
+fn a_deleted_bound_call_is_retracted_by_the_next_pass() {
+    let scratch = Scratch::new("gm348-b11");
+    let both = overload_fixture(&scratch, &[OSite::F1, OSite::Fs]);
+    let one = overload_fixture(&scratch, &[OSite::F1]);
+    assert_eq!(both.e_f, one.e_f);
+    let answers = vec![at_site(&scratch, OSite::F1, &[0], None), at_site(&scratch, OSite::Fs, &[1], None)];
+    let (mut bridge, _) = overload_bridge(&scratch, answers, NoHover, 4);
+
+    let first = pass(&mut bridge, &both.index);
+    assert!(first.complete, "{:?}", first.reason);
+    let id_of = |answer: &SemanticAnswer, ordinal: u32| {
+        semantic_edges(answer)
+            .into_iter()
+            .find(|edge| edge.to_declaration == Some(ordinal))
+            .map(|edge| edge.id.clone())
+            .unwrap_or_else(|| panic!("ordinal {ordinal} bound: {:#?}", answer.diff))
+    };
+    let (kept_id, gone_id) = (id_of(&first, 0), id_of(&first, 1));
+
+    let second = pass(&mut bridge, &one.index);
+    assert!(second.complete, "{:?}", second.reason);
+    assert_eq!(id_of(&second, 0), kept_id);
+    assert!(second.diff.delete_edge_ids.contains(&gone_id), "f(s) is gone: {:#?}", second.diff);
+    assert!(!second.diff.delete_edge_ids.contains(&kept_id));
+    retracted(&second, &one.e_f, "f(1) still bound");
+}
+
+// --- the warm-up ------------------------------------------------------------
+//
+// `Budgets::warm_up`: a server's first question may take the warm-up budget
+// instead of `request`, alone in the pipeline, once per server process. The
+// scripted server holds chosen answers (`holdMs`, by arrival) while it goes
+// on reading, and writes a `timeline` of what it was asked and answered, so
+// how many questions were in flight at once is read from the server's side.
+//
+// The margins are wide on purpose: a held first answer sits at three times
+// `request` and a third of the warm-up.
+
+/// The ordinary budget for every question after the first.
+const WARM_REQUEST: Duration = Duration::from_millis(500);
+/// The warm-up budget for the first.
+const WARM_UP: Duration = Duration::from_secs(5);
+/// How long the scripted server holds a cold first answer: past
+/// `WARM_REQUEST`, inside `WARM_UP`.
+const COLD_MS: u64 = 1_500;
+
+fn warm_budgets(request: Duration, warm_up: Option<Duration>) -> Budgets {
+    Budgets { request, warm_up, ..budgets() }
+}
+
+/// The most questions the server had outstanding at once, per interval
+/// between its answers: `[0]` before its first answer, `[1]` between its
+/// first and second, and so on. A question it never answered stays
+/// outstanding.
+fn in_flight_between_answers(timeline: &Path) -> Vec<usize> {
+    let text = std::fs::read_to_string(timeline).unwrap_or_default();
+    let mut outstanding = 0usize;
+    let mut most = 0usize;
+    let mut intervals = Vec::new();
+    for event in text.lines() {
+        if event.starts_with("asked ") {
+            outstanding += 1;
+            most = most.max(outstanding);
+        } else if event.starts_with("answered ") {
+            intervals.push(most);
+            outstanding = outstanding.saturating_sub(1);
+            most = outstanding;
+        }
+    }
+    intervals.push(most);
+    intervals
+}
+
+/// How many definition/implementation questions reached the server.
+fn arrived(timeline: &Path) -> usize {
+    std::fs::read_to_string(timeline)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("asked "))
+        .count()
+}
+
+/// The script every warm-up test runs: no progress, UTF-16, `answers`, the
+/// given holds and refusals, and a timeline.
+fn held_server(
+    scratch: &Scratch,
+    answers: Value,
+    hold_ms: &[u64],
+    refuse: &[u32],
+    extra: Value,
+) -> (SemanticConfig, PathBuf) {
+    let timeline = scratch.path().join("timeline.log");
+    let mut script = json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+        "holdMs": hold_ms,
+        "refuse": refuse,
+        "timeline": timeline.to_string_lossy(),
+    });
+    if let Value::Object(more) = extra {
+        script.as_object_mut().expect("an object").extend(more);
+    }
+    (scratch.server(script), timeline)
+}
+
+/// The fixture with a second site in `b.toy` the script does not answer,
+/// asked after the first.
+fn fixture_with_a_second_site(scratch: &Scratch) -> SdkIndex {
+    let (mut index, caller) = fixture(scratch);
+    let b = RelPath::new("src/b.toy");
+    let (source, mut graph) = {
+        let entry = index.entry(&b).expect("the fixture has it");
+        (entry.source.clone(), entry.graph.clone())
+    };
+    graph.open_sites.push(OpenSite {
+        from_id: caller,
+        position: Position { line: 1, col: 12 },
+        name: "add".to_string(),
+        kind: OpenSiteKind::ReceiverCall,
+        edge_kind: EdgeKind::Calls,
+        from_container: Some("pkg".to_string()),
+        replaces: None,
+    });
+    index.insert(b, source, graph);
+    index
+}
+
+/// A first answer that takes longer than `request` but less than the
+/// warm-up is an answer: the pass is complete and its edge emitted.
+///
+/// Control: `let request_budget = budgets.request;` in `run_pass`; the first
+/// question times out at `request`. Reverting the expiry filter alone is not
+/// a control here: `run_pass` runs that filter only when a poll comes back
+/// idle, and while the warm-up question is in flight that happens at its
+/// warm-up or at the pass deadline, never in between - a notification is
+/// `Poll::Noise` and goes straight back to the poll. The filter alone is
+/// pinned at the deadline, by `the_warm_up_sits_inside_the_pass_budget`.
+#[test]
+fn a_servers_first_question_may_take_its_warm_up_budget() {
+    let scratch = Scratch::new("warm-up-first");
+    let (index, _) = fixture(&scratch);
+    let (config, _) = held_server(&scratch, answers_the_site(&scratch), &[COLD_MS], &[], json!({}));
+    let mut bridge =
+        LspBridge::with_budgets("toy", scratch.path(), config, warm_budgets(WARM_REQUEST, Some(WARM_UP)));
+
+    let answer = pass_over(&mut bridge, &index, &["src/b.toy"]);
+    assert!(answer.complete, "the held first answer arrived inside the warm-up: {:?}", answer.reason);
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+}
+
+/// While the warm-up is owed one question is in flight; once the server has
+/// answered, the pipeline fills to `concurrency`. Counted by the server.
+///
+/// Control: `let width = budgets.concurrency.max(1);` in `run_pass`; four
+/// questions are outstanding before the first answer.
+#[test]
+fn while_the_warm_up_is_owed_one_question_is_in_flight_and_then_the_pipeline_fills() {
+    let scratch = Scratch::new("warm-up-width");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 8);
+    let (config, timeline) =
+        held_server(&scratch, json!([]), &[600, 300, 300, 300, 300, 300, 300, 300], &[], json!({}));
+    let budgets = warm_budgets(Duration::from_secs(2), Some(Duration::from_secs(6)));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    let in_flight = in_flight_between_answers(&timeline);
+    assert_eq!(in_flight[0], 1, "one question while warming: {in_flight:?}");
+    assert!(in_flight[1] > 1, "the pipeline fills once the server has answered: {in_flight:?}");
+}
+
+/// Only the first question gets the warm-up: a later one the server holds
+/// past `request` times out under `request`.
+///
+/// Control: `let request_budget = warm_up.unwrap_or(budgets.request);` in
+/// `run_pass`; the second question is answered and the pass is complete.
+#[test]
+fn questions_after_the_first_get_the_ordinary_request_budget() {
+    let scratch = Scratch::new("warm-up-rest");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 2);
+    let (config, _) = held_server(&scratch, json!([]), &[COLD_MS, COLD_MS], &[], json!({}));
+    let mut bridge =
+        LspBridge::with_budgets("toy", scratch.path(), config, warm_budgets(WARM_REQUEST, Some(WARM_UP)));
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "the second question had only `request`");
+    assert!(
+        reason(&answer).contains("did not answer a question about src/c.toy within 500ms"),
+        "{}",
+        reason(&answer)
+    );
+}
+
+/// The warm-up is spent once per server process: a second pass on the same
+/// running server gives its first question only `request`.
+///
+/// Control: remove `client.mark_warmed_up()` from `run_pass`'s `Answered`
+/// branch; the second pass waits out the warm-up again and is complete.
+#[test]
+fn a_warm_up_is_spent_once_per_server_and_not_once_per_pass() {
+    let scratch = Scratch::new("warm-up-once");
+    let (index, _) = fixture(&scratch);
+    let (config, _) = held_server(&scratch, answers_the_site(&scratch), &[COLD_MS, COLD_MS], &[], json!({}));
+    let mut bridge =
+        LspBridge::with_budgets("toy", scratch.path(), config, warm_budgets(WARM_REQUEST, Some(WARM_UP)));
+
+    let first = pass(&mut bridge, &index);
+    assert!(first.complete, "the first pass had the warm-up: {:?}", first.reason);
+    let second = pass(&mut bridge, &index);
+    assert!(!second.complete, "the same server owes no second warm-up");
+    assert!(reason(&second).contains("within 500ms"), "{}", reason(&second));
+}
+
+/// A restarted server is cold again and owes a new warm-up. The server
+/// crashes after its first answer, so each pass meets a new one.
+///
+/// Control: keep the latch in a process-wide static instead of on
+/// `LspClient`; the second server's first question times out at `request`
+/// and the second pass emits no edge.
+#[test]
+fn a_restarted_server_owes_a_new_warm_up() {
+    let scratch = Scratch::new("warm-up-restart");
+    let index = fixture_with_a_second_site(&scratch);
+    // `request` is long enough for the crashed server's exit to reach the
+    // bridge while its second question waits, so the next pass starts anew.
+    let (config, _) =
+        held_server(&scratch, answers_the_site(&scratch), &[3_000], &[], json!({ "crashAfterRequests": 1 }));
+    let budgets = warm_budgets(Duration::from_secs(1), Some(Duration::from_secs(8)));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let first = pass(&mut bridge, &index);
+    assert_eq!(
+        semantic_edges(&first).len(),
+        1,
+        "the first server answered under its warm-up: {:#?}",
+        first.diff
+    );
+
+    let second = pass(&mut bridge, &index);
+    assert_eq!(
+        semantic_edges(&second).len(),
+        1,
+        "the new server's first question had a warm-up of its own: {:?}",
+        second.reason
+    );
+}
+
+/// A warm-up that times out fails its question as `request` would, and is
+/// spent: the rest go out together under `request`, so all six are asked
+/// well inside a pass budget that six warm-ups in a row would overrun.
+///
+/// Control: remove the `client.mark_warmed_up()` under
+/// `if !expired.is_empty()` in `run_pass`; each question is sent alone under
+/// the warm-up and the pass budget ends before all six are asked.
+#[test]
+fn a_warm_up_that_times_out_fails_its_question_and_is_spent() {
+    let scratch = Scratch::new("warm-up-timeout");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 6);
+    // Never answered within the test.
+    let (config, timeline) = held_server(&scratch, json!([]), &[60_000; 6], &[], json!({}));
+    let mut budgets = warm_budgets(Duration::from_millis(300), Some(Duration::from_secs(1)));
+    budgets.project_floor = Duration::from_secs(4);
+    budgets.per_file = Duration::from_millis(1);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+    // Started under its own budget, so the pass budget is spent on asking.
+    bridge.prepare();
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "an unanswered warm-up is not an answer of 'nothing'");
+    assert!(
+        reason(&answer).contains("did not answer a question about src/c.toy within 1s"),
+        "the warm-up's own timeout is the reason: {}",
+        reason(&answer)
+    );
+    assert!(answer.diff.upsert_edges.is_empty());
+    assert_eq!(arrived(&timeline), 6, "every question was asked after the warm-up was spent");
+}
+
+/// A refusal of the first question spends the warm-up too: the server is
+/// answering, so the pipeline fills right after it.
+///
+/// Control: remove `client.mark_warmed_up()` from `run_pass`'s `Failed`
+/// branch; the second question still goes out alone.
+#[test]
+fn a_refused_first_question_spends_the_warm_up() {
+    let scratch = Scratch::new("warm-up-refused");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 6);
+    let (config, timeline) = held_server(&scratch, json!([]), &[0, 300, 300, 300, 300, 300], &[1], json!({}));
+    let budgets = warm_budgets(Duration::from_secs(2), Some(Duration::from_secs(6)));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "a refused question is not an answer");
+    assert!(reason(&answer).contains("refused by the script"), "{}", reason(&answer));
+    let in_flight = in_flight_between_answers(&timeline);
+    assert_eq!(in_flight[0], 1, "{in_flight:?}");
+    assert!(in_flight[1] > 1, "the pipeline fills right after the refusal: {in_flight:?}");
+}
+
+/// The warm-up is off unless a plugin asks for it: the first question gets
+/// `request` and the pipeline fills to `concurrency` at once.
+///
+/// Control: `warm_up: Some(..)` in `Budgets::default()`; one question goes
+/// out alone and is answered. Control: `let width = if warming ||
+/// warm_up.is_none() { 1 } else { .. };` in `run_pass`; the questions go out
+/// one at a time and at most two are outstanding before the first answer.
+#[test]
+fn without_a_warm_up_the_first_question_gets_the_request_budget_and_the_pipeline_fills_at_once() {
+    assert_eq!(Budgets::default().warm_up, None);
+
+    let scratch = Scratch::new("warm-up-off");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 6);
+    let (config, timeline) =
+        held_server(&scratch, json!([]), &[COLD_MS, 300, 300, 300, 300, 300], &[], json!({}));
+    let defaults = budgets();
+    let budgets = Budgets {
+        request: WARM_REQUEST,
+        concurrency: 4,
+        project_floor: defaults.project_floor,
+        per_file: defaults.per_file,
+        single_file: defaults.single_file,
+        readiness: defaults.readiness,
+        settle: defaults.settle,
+        ..Budgets::default()
+    };
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "the held first answer had only `request`");
+    assert!(reason(&answer).contains("within 500ms"), "{}", reason(&answer));
+    // Every question asked before the server's first answer: `concurrency`
+    // of them, at once. A bridge that sent one question at a time would have
+    // at most two outstanding here - the held first, which the server goes
+    // on holding after the bridge gives up on it, and the one after it.
+    let in_flight = in_flight_between_answers(&timeline);
+    assert!(in_flight[0] >= 4, "the pipeline fills to `concurrency` before any answer: {in_flight:?}");
+}
+
+/// How many questions reached the server before it answered its `nth`
+/// (1-based, by arrival) - the `nth` itself included. A question never
+/// answered counts every arrival.
+fn asked_before_answer(timeline: &Path, nth: usize) -> usize {
+    let answer = format!("answered {nth}");
+    std::fs::read_to_string(timeline)
+        .unwrap_or_default()
+        .lines()
+        .take_while(|line| *line != answer)
+        .filter(|line| line.starts_with("asked "))
+        .count()
+}
+
+/// With no warm-up configured, the first question is not sent alone: while
+/// the server holds its first answer - well inside `request`, so the bridge
+/// is still waiting for it rather than giving up on it - the rest of the
+/// pipeline is already asked. Counted by the server: arrivals before its
+/// first answer is written.
+///
+/// Control: `let warming = !client.warmed_up();` in `run_pass` (the
+/// `warm_up.is_some()` condition dropped); the first question goes out alone
+/// and is answered before any other arrives. The test above misses that
+/// mutant: its held first question times out at `request`, which spends the
+/// warm-up, and the pipeline fills before the server's first answer anyway.
+#[test]
+fn without_a_warm_up_the_first_question_is_not_asked_alone() {
+    let scratch = Scratch::new("warm-up-off-held");
+    let mut index = SdkIndex::new();
+    crowd_file(&scratch, &mut index, "src/c.toy", 6);
+    // The first answer is held for 1.5s of a 5s `request`; the rest at once.
+    let (config, timeline) = held_server(&scratch, json!([]), &[COLD_MS], &[], json!({}));
+    let budgets = budgets();
+    assert_eq!(budgets.warm_up, None);
+    assert!(Duration::from_millis(COLD_MS) * 3 <= budgets.request);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "the held first answer came inside `request`: {:?}", answer.reason);
+    let before_first = asked_before_answer(&timeline, 1);
+    assert!(
+        before_first > 1,
+        "more than one question was outstanding while the first was held: {} arrivals before `answered 1`\n{}",
+        before_first,
+        std::fs::read_to_string(&timeline).unwrap_or_default()
+    );
+}
+
+/// A warm-up shorter than `request` never shortens the first question's
+/// budget.
+///
+/// Control: drop `.max(budgets.request)` from `run_pass`'s `warm_up`; the
+/// first question times out at the warm-up.
+#[test]
+fn a_warm_up_shorter_than_request_never_shortens_the_first_question() {
+    let scratch = Scratch::new("warm-up-short");
+    let (index, _) = fixture(&scratch);
+    let (config, _) = held_server(&scratch, answers_the_site(&scratch), &[1_000], &[], json!({}));
+    let budgets = warm_budgets(Duration::from_secs(3), Some(Duration::from_millis(300)));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "the first question had `request`: {:?}", answer.reason);
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+}
+
+/// The warm-up sits inside the pass budget: a first question still
+/// unanswered when the pass runs out ends the pass then, not at the end of
+/// the warm-up.
+///
+/// Control: `let wake = oldest + request_budget;` in `run_pass` (no
+/// `.min(deadline)`); the pass waits out the warm-up. Control: use
+/// `budgets.request` instead of `request_budget` in `run_pass`'s expiry
+/// filter; the idle poll at the deadline retires the first question at
+/// `request`, and the pass reports that instead of running out of its budget.
+#[test]
+fn the_warm_up_sits_inside_the_pass_budget() {
+    let scratch = Scratch::new("warm-up-deadline");
+    let (index, _) = fixture(&scratch);
+    let (config, _) = held_server(&scratch, answers_the_site(&scratch), &[60_000], &[], json!({}));
+    let mut budgets = warm_budgets(Duration::from_millis(300), Some(Duration::from_secs(8)));
+    budgets.project_floor = Duration::from_millis(2_500);
+    budgets.per_file = Duration::from_millis(1);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+    // Started under its own budget, so the pass budget is spent on asking.
+    bridge.prepare();
+
+    let started = std::time::Instant::now();
+    let answer = pass(&mut bridge, &index);
+    let took = started.elapsed();
+    assert!(!answer.complete);
+    assert!(reason(&answer).contains("ran out of its budget"), "{}", reason(&answer));
+    assert!(took < Duration::from_secs(6), "the pass budget ended the wait, not the warm-up: {took:?}");
 }

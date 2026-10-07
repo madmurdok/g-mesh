@@ -106,6 +106,24 @@ pub enum OpenSiteKind {
     /// a trait bound, an interface satisfied structurally rather than by
     /// declaration.
     Implementation,
+    /// A call whose structural `CALLS` edge is right about *which function*
+    /// it reaches, and silent about *which of its overloads*: the target may
+    /// carry [`NodeSpec::declarations`], and only a type checker knows which
+    /// one the call binds.
+    ///
+    /// Unlike the other kinds, this one **refines** an edge rather than
+    /// replacing or contradicting one, so [`OpenSite::replaces`] is required
+    /// and names the structural edge, and `edge_kind` is `Calls`. A semantic
+    /// engine either binds every such site of that edge to a declaration
+    /// ordinal (the edge then gives way to bound edges carrying
+    /// `toDeclaration`) or leaves the structural edge exactly as it was. It
+    /// never moves the call to another target. See
+    /// `docs/adr/0024-semantic-tier-refines-by-binding-a-declaration.md`.
+    ///
+    /// A plugin records it for a call bound to a node that has
+    /// `declarations`, and for any call bound to a placeholder (it cannot know
+    /// whether the target is overloaded; the engine filters).
+    OverloadCall,
 }
 
 /// One use site the structural pass left open, with everything a semantic
@@ -470,6 +488,18 @@ impl FileGraphBuilder {
             untyped_calls: Vec::new(),
         });
         id
+    }
+
+    /// Sets the overload/merge declaration list of a node already added, by
+    /// its id. `false` when no node of this file has that id.
+    ///
+    /// For an extractor that only knows a node's full declaration list after
+    /// its last redeclaration, by which time the node has been pushed. Same
+    /// rule as [`NodeSpec::declarations`]: an empty list is no list.
+    pub fn set_declarations(&mut self, id: &str, declarations: Vec<WireDeclaration>) -> bool {
+        let Some(node) = self.graph.nodes.iter_mut().find(|node| node.id == id) else { return false };
+        node.declarations = (!declarations.is_empty()).then_some(declarations);
+        true
     }
 
     /// Adds a placeholder standing in for something outside this file, and

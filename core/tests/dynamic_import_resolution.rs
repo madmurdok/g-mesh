@@ -5,7 +5,7 @@
 //!
 //! Scoped in full in `docs/architecture/g-mesh-v1.md` ("Computed import
 //! specifiers") and pinned at the extraction level by
-//! `plugins/typescript/test/extract.test.ts` - this test closes the gap those unit
+//! `plugins/typescript/tests/imports.rs` - this test closes the gap those unit
 //! fixtures leave open: nothing there goes through a real daemon or a real
 //! MCP tool call, so nothing proves the boundary survives contact with the
 //! actual query surface an agent uses. Purely structural, like
@@ -24,8 +24,8 @@
 //!    permanent hard limit - documented in the architecture doc and in
 //!    `README.md`, not just a code comment.
 //!
-//! Requires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs
-//! `npm run build` there whenever this crate is built.
+//! Requires the TypeScript plugin binary, which `cargo build --workspace`
+//! builds.
 
 use std::path::{Path, PathBuf};
 

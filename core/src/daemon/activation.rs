@@ -48,6 +48,7 @@ use crate::daemon::manifest::DiscoveredPlugins;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
 use crate::embedding::EmbeddingPipeline;
+use crate::languages::LanguageOutcome;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::watcher::ProjectWatcher;
@@ -233,6 +234,23 @@ impl ActivationCtx {
             Some(&self.indexing),
         )
         .context("failed to build the project's initial index")?;
+        self.registry.set_failed_languages(summary.outcomes.iter().filter_map(|(language, outcome)| {
+            matches!(outcome, LanguageOutcome::Failed { .. }).then_some(language.clone())
+        }));
+        for (language, outcome) in &summary.outcomes {
+            match outcome {
+                LanguageOutcome::Failed { error } => eprintln!(
+                    "g-mesh daemon: {language} failed to index and is left out of the index until \
+                     `g-mesh reindex`: {}",
+                    crate::languages::error_on_one_line(error)
+                ),
+                LanguageOutcome::PluginAbsent { files } => eprintln!(
+                    "g-mesh daemon: {language} has no plugin installed - {} not indexed",
+                    files.map_or_else(|| "its files are".to_string(), |n| format!("{n} file(s)"))
+                ),
+                LanguageOutcome::Indexed { .. } => {}
+            }
+        }
 
         // Flipped *before* the completion marker is written. The phase
         // governs what this process answers; `bulkIndexedAt` governs whether

@@ -11,8 +11,8 @@
 //! name in that file and honestly found nothing - and the caller went missing
 //! anyway, because nobody followed the re-export to the file one hop further.
 //!
-//! Requires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs
-//! `npm run build` there whenever this crate is built.
+//! Requires the TypeScript plugin binary, which `cargo build --workspace`
+//! builds.
 
 use std::path::{Path, PathBuf};
 

@@ -50,12 +50,26 @@
 //! which for Python is not an exotic case at all: identifiers may be
 //! non-ASCII, and docstrings routinely are. [`Positions`] converts once,
 //! against a precomputed table of line starts.
+//!
+//! # Overload sets
+//!
+//! A `typing.overload` set is the one same-id redefinition that is not a
+//! choice between alternatives: every `@overload` stub plus the
+//! implementation *is* the function. The node row still follows the
+//! first-wins rule above (range and signature of the first stub, as
+//! TypeScript's "first call signature" rule), and the set as a whole travels
+//! as the node's `declarations` - every `def` of that id, in source order,
+//! ordinal from 0, `hasBody` only on the one not decorated `@overload`. A
+//! set with no `@overload` in it is a conditional definition or a rebinding
+//! and gets no list. The list is what a semantic engine binds an overloaded
+//! call to by ordinal; see
+//! `docs/adr/0024-semantic-tier-refines-by-binding-a-declaration.md`.
 
 use std::collections::{HashMap, HashSet};
 
 use g_mesh_plugin_sdk::ids::{edge_id, node_id};
 use g_mesh_plugin_sdk::wire::{
-    EdgeKind, NodeKind, PlaceholderTarget, Position, Range, TargetKey, TargetScope,
+    EdgeKind, NodeKind, PlaceholderTarget, Position, Range, TargetKey, TargetScope, WireDeclaration,
 };
 use g_mesh_plugin_sdk::{FileGraph, FileGraphBuilder, NodeSpec, OpenSite, PlaceholderKind, RelPath};
 use tree_sitter::Node;
@@ -137,6 +151,21 @@ pub(crate) struct Emitter<'s> {
     nodes: HashSet<String>,
     edges: HashSet<String>,
     placeholders: HashMap<PlaceholderKey, String>,
+    /// Every function definition of each node id, in source order - see
+    /// "Overload sets" in the module doc.
+    definitions: HashMap<String, Vec<Definition>>,
+}
+
+/// One `def` of a function node, as an overload set's declaration list needs
+/// it.
+#[derive(Debug, Clone)]
+pub(crate) struct Definition {
+    /// The whole definition, decorators included.
+    pub(crate) range: Range,
+    pub(crate) signature: Option<String>,
+    /// Decorated `@overload` (or any dotted name ending in `overload`): a
+    /// stub with no body of its own, whatever its `...` says syntactically.
+    pub(crate) overload: bool,
 }
 
 impl<'s> Emitter<'s> {
@@ -175,6 +204,7 @@ impl<'s> Emitter<'s> {
             nodes: HashSet::from([file_id]),
             edges: HashSet::new(),
             placeholders: HashMap::new(),
+            definitions: HashMap::new(),
         }
     }
 
@@ -200,6 +230,19 @@ impl<'s> Emitter<'s> {
             self.graph.defines(&self.file_id.clone(), &id, exported);
         }
         id
+    }
+
+    /// Records one function definition of node `id` - called for every
+    /// `def`, the first and every same-id one after it, in source order.
+    pub(crate) fn definition(&mut self, id: &str, definition: Definition) {
+        self.definitions.entry(id.to_string()).or_default().push(definition);
+    }
+
+    /// Whether node `id` of this file is an overload set: one of its
+    /// definitions so far is `@overload`. Complete once the declaration pass
+    /// is over, which is when the body pass asks.
+    pub(crate) fn overloaded(&self, id: &str) -> bool {
+        self.definitions.get(id).is_some_and(|definitions| definitions.iter().any(|d| d.overload))
     }
 
     /// Adds (or finds) the placeholder waiting on `target`, and returns its
@@ -283,19 +326,24 @@ impl<'s> Emitter<'s> {
     }
 
     /// An edge onto a declaration of this same file: `resolved: true`, since
-    /// within one file nothing is left for core to confirm.
-    pub(crate) fn resolved_edge(&mut self, kind: EdgeKind, from: &str, to: &str) {
-        if self.edges.insert(edge_id(from, kind, to, None)) {
+    /// within one file nothing is left for core to confirm. Returns its id,
+    /// which a repeat shares.
+    pub(crate) fn resolved_edge(&mut self, kind: EdgeKind, from: &str, to: &str) -> String {
+        let id = edge_id(from, kind, to, None);
+        if self.edges.insert(id.clone()) {
             self.graph.resolved_edge(kind, from, to);
         }
+        id
     }
 
     /// An edge onto a placeholder: `resolved: false`, since only core can
-    /// confirm it.
-    pub(crate) fn placeholder_edge(&mut self, kind: EdgeKind, from: &str, to: &str) {
-        if self.edges.insert(edge_id(from, kind, to, None)) {
+    /// confirm it. Returns its id, which a repeat shares.
+    pub(crate) fn placeholder_edge(&mut self, kind: EdgeKind, from: &str, to: &str) -> String {
+        let id = edge_id(from, kind, to, None);
+        if self.edges.insert(id.clone()) {
             self.graph.placeholder_edge(kind, from, to);
         }
+        id
     }
 
     /// Records a use site the structural tier could not settle - see
@@ -310,7 +358,29 @@ impl<'s> Emitter<'s> {
         self.graph.mark_syntax_errors();
     }
 
-    pub(crate) fn finish(self) -> FileGraph {
+    /// The graph, with each overload set's `declarations` attached. Only
+    /// here, because a set's list is complete only after its last `def`, and
+    /// its node was pushed at the first.
+    pub(crate) fn finish(mut self) -> FileGraph {
+        for (id, definitions) in std::mem::take(&mut self.definitions) {
+            if !definitions.iter().any(|definition| definition.overload) {
+                continue;
+            }
+            let declarations = definitions
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, definition)| WireDeclaration {
+                    ordinal: ordinal as u32,
+                    start_line: definition.range.start.line,
+                    start_col: definition.range.start.col,
+                    end_line: definition.range.end.line,
+                    end_col: definition.range.end.col,
+                    signature: definition.signature,
+                    has_body: !definition.overload,
+                })
+                .collect();
+            self.graph.set_declarations(&id, declarations);
+        }
         self.graph.finish()
     }
 }

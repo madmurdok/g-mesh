@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-// hashID mirrors plugins/typescript/src/extract.ts's `hash`: sha256 of the
+// hashID mirrors `node_id`/`edge_id` in plugins/sdk/src/ids.rs: sha256 of the
 // UTF-8 input, hex-encoded, truncated to the first 32 hex characters (the
 // first 16 bytes of the 32-byte digest). See ids_test.go for expected
 // values computed by actually running that TS code (`node -e '...'`, using

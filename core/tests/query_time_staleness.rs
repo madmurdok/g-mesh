@@ -26,8 +26,8 @@
 //! catch this on its own. `get_file_outline` must answer with the *current*
 //! on-disk content, not the one that was current when it was first indexed.
 //!
-//! Requires `plugins/typescript/dist/` to be up to date; `core/build.rs` runs
-//! `npm run build` there whenever this crate is built.
+//! Requires the TypeScript plugin binary, which `cargo build --workspace`
+//! builds.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

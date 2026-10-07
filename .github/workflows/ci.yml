@@ -372,9 +372,8 @@ jobs:
           rustc -vV
 
       # rust-analyzer is a *test* dependency of `plugins/rust`, exactly the way
-      # Node is one of `plugins/typescript` and Go is one of `plugins/go`:
-      # since GM-290 the Rust plugin's semantic tier drives a real
-      # rust-analyzer, and `plugins/rust/tests/conformance.rs` runs the
+      # Go is one of `plugins/go`: since GM-290 the Rust plugin's semantic tier
+      # drives a real rust-analyzer, and `plugins/rust/tests/conformance.rs` runs the
       # conformance kit against it rather than skipping when there is none.
       # `--profile minimal` above deliberately installs nothing beyond
       # rustc/cargo, so this line is what makes that suite runnable at all.
@@ -391,23 +390,12 @@ jobs:
           rustup component add rust-analyzer --toolchain "$RUST_VERSION"
           rust-analyzer --version
 
-      # `build.rs` runs `npm run build` for the JS/TS plugin, and the
-      # integration tests drive that plugin for real - so this is a test
-      # dependency here, not only a packaging one. Pinned to match release.yml
-      # for the same reason it is pinned there.
+      # Node is only here for npm: the "Install pyright" step below runs
+      # `npm ci` in plugins/python. Pinned to match release.yml for the same
+      # reason it is pinned there.
       - uses: actions/setup-node@v6
         with:
           node-version: "22.x"
-
-      # `build.rs` runs `npm run build` for the plugin, and on a fresh checkout
-      # there is nothing to build *with* - so without this it exits 2, build.rs
-      # downgrades that to a warning ("dist/ may be stale"), the run continues,
-      # and the two tests that drive the real plugin fail much later with
-      # "plugin closed its stdout before sending a handshake". Invisible on a
-      # developer machine, where node_modules has been there since day one.
-      - name: Install the plugin's dependencies
-        working-directory: plugins/typescript
-        run: npm ci
 
       # pyright is a *test* dependency of `plugins/python`, the same way
       # rust-analyzer is one of `plugins/rust` (GM-290's step above) - since
@@ -421,8 +409,8 @@ jobs:
       # `npm ci` against plugins/python's committed package.json and
       # package-lock.json, through `scripts/test-deps.sh` so that a local setup
       # and CI install the same pyright - pinned in that package.json exactly
-      # the way plugins/typescript pins its own dependencies (GM-419: before, this
-      # step ran a bare `npm install pyright` and floated on npm's latest).
+      # (GM-419: before, this step ran a bare `npm install pyright` and floated
+      # on npm's latest).
       # plugins/python gitignores only node_modules/, and the install lives
       # there, beside the plugin, rather than inside
       # conformance/project/ - the kit copies the fixture and `copy_tree`
@@ -496,22 +484,24 @@ jobs:
           fi
           echo "$bin_dir" >> "$GITHUB_PATH"
 
-      # The plugin's own suite (protocol.ts/extract.ts/bulkIndex.ts/
-      # incremental.ts/semanticPass.ts unit and e2e tests) was not run in CI
-      # before GM-275 - only `npm ci` was, so build.rs had something to
-      # compile. Nothing here reruns it, so a wire-shape regression in the
-      # plugin surfaced only through the Rust integration tests that happen
-      # to exercise the same path, if any did.
-      #
-      # Runs before the slower Rust steps; `pretest` in package.json builds
-      # the plugin, so this needs only what `npm ci` above installed.
-      - name: JS/TS plugin tests (npm test)
+      # vtsls is a *test* dependency of `plugins/typescript`, installed the
+      # way pyright is above (GM-325): `npm ci` against the committed
+      # package.json and lock through `scripts/test-deps.sh`, with the `.bin`
+      # directory put on `PATH` (native spelling on Windows, so the `.cmd`
+      # shim is found by `Command::new`).
+      - name: Install vtsls
         working-directory: plugins/typescript
-        run: npm test
+        shell: bash
+        run: |
+          ../../scripts/test-deps.sh typescript
+          bin_dir="$(pwd)/node_modules/.bin"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bin_dir="$(cygpath -w "$bin_dir")"
+          fi
+          echo "$bin_dir" >> "$GITHUB_PATH"
 
-      # The Go plugin is a second bundled plugin with a real toolchain
-      # dependency, and the same "test dependency, not only a packaging one"
-      # applies to it as to Node above: `build.rs` runs `go build` to produce
+      # The Go plugin is a bundled plugin with a real toolchain dependency,
+      # a test dependency and not only a packaging one: `build.rs` runs `go build` to produce
       # `plugins/go/g-mesh-plugin-go`, and both the Rust integration tests
       # (`core/tests/plugin_check.rs`'s two `the_go_plugin_*` cases) and the
       # conformance step below spawn that binary for real. Without a Go
@@ -1057,15 +1047,6 @@ jobs:
           rustup component add clippy rustfmt
           cargo clippy --version
           cargo fmt --version
-
-      # build.rs builds the plugin, so clippy needs Node just as the tests do.
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "22.x"
-
-      - name: Install the plugin's dependencies
-        working-directory: plugins/typescript
-        run: npm ci
 
       # Before clippy, because it is the cheaper failure and the one with an
       # obvious fix: `cargo fmt` and push. The style it enforces is recorded in

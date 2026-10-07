@@ -62,6 +62,19 @@ struct ScriptedAnswer {
     /// the ordinary "nothing here".
     #[serde(default)]
     definition: Option<Location>,
+    /// Several locations, answered as an array in this order - what pyright
+    /// answers at a call into an `@overload` set (GM-348). Takes precedence
+    /// over `definition` when non-empty.
+    #[serde(default)]
+    definitions: Vec<Location>,
+    /// What `textDocument/hover` answers there: the markdown `value` of a
+    /// `MarkupContent`, verbatim, so a script spells the fences and
+    /// paragraphs a real server would. Omitted means `null`.
+    #[serde(default)]
+    hover: Option<String>,
+    /// Answer `textDocument/hover` there with this JSON-RPC error instead.
+    #[serde(default)]
+    hover_error: Option<String>,
     /// What `textDocument/implementation` answers there.
     #[serde(default)]
     implementation: Vec<Location>,
@@ -264,6 +277,29 @@ struct Script {
     /// meant to.
     #[serde(default)]
     configuration_out: Option<String>,
+    /// Where to append `<uri> <languageId>` per `didOpen`, so a test can
+    /// assert which language each document was opened as.
+    #[serde(default)]
+    opened_log: Option<String>,
+    /// Hold the nth definition/implementation answer (1-based, counted per
+    /// server process, in the order the requests arrive) for `holdMs[n-1]`
+    /// milliseconds, on its own thread, while this server goes on reading -
+    /// a server that is slow to answer one question without being deaf to
+    /// the next, which is what lets a test see how many questions a client
+    /// keeps in flight. A missing or zero entry is not held.
+    #[serde(default)]
+    hold_ms: Vec<u64>,
+    /// Answer these arrivals (1-based, as `holdMs` counts them) with a
+    /// JSON-RPC error instead - a refusal tied to *when* a question comes
+    /// rather than to where it points.
+    #[serde(default)]
+    refuse: Vec<u32>,
+    /// Where to append `asked <n>` when the nth definition/implementation
+    /// request arrives and `answered <n>` just before its answer is written,
+    /// so a test can count the questions a client had outstanding at once
+    /// from the server's side rather than from a clock.
+    #[serde(default)]
+    timeline: Option<String>,
 }
 
 /// The id this server uses for its own `workspace/configuration` request.
@@ -304,12 +340,16 @@ fn main() {
         let id = message.get("id").cloned();
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         log(&script, &method);
+        if method == "textDocument/didOpen" {
+            log_opened(&script, &params);
+        }
 
         match method.as_str() {
             "initialize" => {
                 let mut capabilities = json!({
                     "definitionProvider": true,
                     "implementationProvider": true,
+                    "hoverProvider": true,
                     "textDocumentSync": 1,
                 });
                 if let Some(encoding) = &script.position_encoding {
@@ -347,6 +387,7 @@ fn main() {
             "exit" => return,
             "textDocument/definition" | "textDocument/implementation" => {
                 asked += 1;
+                mark(&script.timeline, &format!("asked {asked}"));
                 if script.silent_from.is_some_and(|from| asked >= from) {
                     continue;
                 }
@@ -373,45 +414,105 @@ fn main() {
                     let answer = &script.answers[at];
                     answer.error.is_some() && answer.error_times.is_none_or(|times| errors_sent[at] < times)
                 });
+                // The answer is built here and written below, now or after its
+                // hold.
+                let mut frame: Vec<u8> = Vec::new();
+                let refusing = script.refuse.contains(&asked);
                 match answer {
-                    Some(answer) if answer.silent => continue,
+                    Some(answer) if answer.silent && !refusing => continue,
+                    _ if refusing => {
+                        error_response(&mut frame, id, -32603, "refused by the script".to_string())
+                    }
                     Some(answer) if erroring => {
                         if let Some(at) = found {
                             errors_sent[at] += 1;
                         }
                         error_response(
-                            &mut stdout,
+                            &mut frame,
                             id,
                             answer.error_code.unwrap_or(-32603),
                             answer.error.clone().unwrap_or_default(),
                         )
                     }
-                    Some(_) if reloading.load(Ordering::SeqCst) => respond(&mut stdout, id, Value::Null),
+                    Some(_) if reloading.load(Ordering::SeqCst) => respond(&mut frame, id, Value::Null),
                     Some(_) if script.null_while_indexing && indexing.load(Ordering::SeqCst) => {
-                        respond(&mut stdout, id, Value::Null)
+                        respond(&mut frame, id, Value::Null)
                     }
                     // GM-309's window: a `didChange` has started a
                     // `reindexOnChange` cycle and it has not yet ended,
                     // whether or not its progress has even begun - see
                     // [`ReindexOnChange`].
                     Some(_) if changed.load(Ordering::SeqCst) && !revealed.load(Ordering::SeqCst) => {
-                        respond(&mut stdout, id, Value::Null)
+                        respond(&mut frame, id, Value::Null)
+                    }
+                    Some(answer) if method.ends_with("definition") && !answer.definitions.is_empty() => {
+                        let result: Vec<Value> = answer.definitions.iter().map(Location::to_json).collect();
+                        respond(&mut frame, id, Value::Array(result))
                     }
                     Some(answer) if method.ends_with("definition") => {
                         let result = answer.definition.as_ref().map(Location::to_json).unwrap_or(Value::Null);
-                        respond(&mut stdout, id, result)
+                        respond(&mut frame, id, result)
                     }
                     Some(answer) => {
                         let result: Vec<Value> =
                             answer.implementation.iter().map(Location::to_json).collect();
-                        respond(&mut stdout, id, Value::Array(result))
+                        respond(&mut frame, id, Value::Array(result))
                     }
-                    None => respond(&mut stdout, id, Value::Null),
+                    None => respond(&mut frame, id, Value::Null),
+                }
+                let ordinal = asked;
+                let timeline = script.timeline.clone();
+                let deliver = move || {
+                    mark(&timeline, &format!("answered {ordinal}"));
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(&frame);
+                    let _ = out.flush();
+                };
+                let hold = script.hold_ms.get(asked as usize - 1).copied().unwrap_or(0);
+                if hold > 0 {
+                    let held = std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(hold));
+                        deliver();
+                    });
+                    // A crash waits for the held answer, which is part of
+                    // what this server says before it goes.
+                    if crashing {
+                        let _ = held.join();
+                    }
+                } else {
+                    deliver();
                 }
                 if crashing {
                     // Not an `exit`: the point is a server that goes away
                     // without saying anything, which is what a crash is.
                     std::process::exit(101);
+                }
+            }
+            // GM-348: a hover is matched on its position like a definition,
+            // and is not counted by `crashAfterRequests`/`silentFrom`, which
+            // were written about definitions and stay about them.
+            "textDocument/hover" => {
+                let key = position_of(&params);
+                let answer = script.answers.iter().find(|answer| {
+                    (answer.uri.as_str(), answer.line, answer.character) == (key.0.as_str(), key.1, key.2)
+                });
+                match answer {
+                    Some(answer) if answer.silent => continue,
+                    Some(answer) if answer.hover_error.is_some() => error_response(
+                        &mut stdout,
+                        id,
+                        -32603,
+                        answer.hover_error.clone().unwrap_or_default(),
+                    ),
+                    Some(answer) => {
+                        let result = answer
+                            .hover
+                            .as_ref()
+                            .map(|value| json!({ "contents": { "kind": "markdown", "value": value } }))
+                            .unwrap_or(Value::Null);
+                        respond(&mut stdout, id, result)
+                    }
+                    None => respond(&mut stdout, id, Value::Null),
                 }
             }
             // The client's answer to *our* `workspace/configuration`: a frame
@@ -624,6 +725,28 @@ fn close_stdin() {
     drop(unsafe { OwnedHandle::from_raw_handle(std::io::stdin().as_raw_handle()) });
 }
 
+fn log_opened(script: &Script, params: &Value) {
+    let Some(path) = &script.opened_log else { return };
+    let document = &params["textDocument"];
+    let line = format!(
+        "{} {}\n",
+        document["uri"].as_str().unwrap_or(""),
+        document["languageId"].as_str().unwrap_or("")
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// Appends one line to the `timeline` file, if the script names one.
+fn mark(timeline: &Option<String>, event: &str) {
+    let Some(path) = timeline else { return };
+    // One `write` per line, for the reason `log` gives.
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(format!("{event}\n").as_bytes());
+    }
+}
+
 fn log(script: &Script, method: &str) {
     let Some(path) = &script.log else { return };
     // One `write` per line, never `writeln!`: that writes the method and the
@@ -655,8 +778,11 @@ fn notify<W: Write>(out: &mut W, method: &str, params: Value) {
 /// tests cannot catch that implementation being wrong.
 fn write_frame<W: Write>(out: &mut W, message: &Value) {
     let body = serde_json::to_vec(message).expect("a script's message always serializes");
-    let _ = out.write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-    let _ = out.write_all(&body);
+    // One write per frame: `Stdout` locks per call, so a frame written in one
+    // call cannot interleave with one a held answer's thread writes.
+    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    frame.extend_from_slice(&body);
+    let _ = out.write_all(&frame);
     let _ = out.flush();
 }
 

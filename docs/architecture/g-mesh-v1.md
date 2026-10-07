@@ -1060,10 +1060,10 @@ either already the checker's job or has no consumer among the MCP tools.
 
 | Tool | Input | Returns |
 |---|---|---|
-| `find_definition` | symbol name, or `file+position` | node: kind, signature, docstring, location (candidate list if name is ambiguous, ranked by inbound `REFERENCES`/`CALLS` count) |
-| `find_references` | `symbolId` or `symbolName` + `limit`? | usage sites (inbound `REFERENCES`/`CALLS`/`SUPERTYPE_OF` edges - the extractor files each usage under exactly one of these, so references is their union and a superset of `find_callers`/`find_implementations`) |
-| `find_callers` | `symbolId` or `symbolName` + `limit`? | inbound `CALLS` |
-| `find_callees` | `symbolId` or `symbolName` + `limit`? | outbound `CALLS` |
+| `find_definition` | `symbolName`, `symbolId`, or `file+position` | node: kind, signature, docstring, location (candidate list if name is ambiguous, ranked by inbound `REFERENCES`/`CALLS` count; each candidate carries `id`, `startLine`, `endLine`; a first page of at most three candidates also carries the `source` of each one whose span can be read, capped at 20 lines) |
+| `find_references` | `symbolId` or `symbolName` + `limit`? + `answer`? | usage sites (inbound `REFERENCES`/`CALLS`/`SUPERTYPE_OF` edges - the extractor files each usage under exactly one of these, so references is their union and a superset of `find_callers`/`find_implementations`) |
+| `find_callers` | `symbolId` or `symbolName` + `limit`? + `answer`? | inbound `CALLS` |
+| `find_callees` | `symbolId` or `symbolName` + `limit`? + `answer`? | outbound `CALLS` |
 | `find_implementations` | `symbolId` or `symbolName` + `limit`? | inbound `SUPERTYPE_OF` |
 | `search_code` | free-text query | semantic matches via embeddings, ranked by similarity |
 | `get_file_outline` | `filePath` | symbols defined in the file |
@@ -1073,7 +1073,12 @@ All list-shaped responses are cursor-paginated: `results`, `hasMore`,
 `nextCursor` (opaque token — chosen over `offset` because background
 reindexing can shift/duplicate rows mid-pagination). Structural tool
 results are ordered `resolved: true` before `resolved: false`, then by
-locality; `search_code` is ordered by similarity score. Every edge-derived
+locality (the anchor's own file, then its directory, then elsewhere), then
+symbol rows before `File` rows (demoted, never dropped), then by file path
+and `startLine`, with the edge id as the final tiebreak; every key belongs to
+the row itself, so the keyset stays stable across a reindex. A cursor from an
+earlier ordering is refused with an error asking to repeat the query (see
+[ADR 0028](../adr/0028-anchored-responses-rank-and-answer-first.md)). `search_code` is ordered by similarity score. Every edge-derived
 result carries `resolved`/`source` so the agent knows how much to trust a
 given relationship.
 
@@ -1085,6 +1090,18 @@ than an empty `results` page — an empty page with `hasMore: false` is
 indistinguishable from a genuine "nothing found", and an agent that reads it
 as one stops looking. The daemon's own MCP `instructions` say so too, so a
 client learns to retry rather than to fall back to grep.
+
+`find_references`/`find_callers`/`find_callees` also take an optional
+`answer`: `rows` (default; one row per usage, paged), `files` (no rows; the
+whole set's per-file tally and `total`) or `count` (no rows and no files;
+`total` and `unresolved`). It answers "which files" and "is it called at all"
+without the evidence. A `rows` page that is truncated (`hasMore`) carries
+`total`, the exact size of the whole set, and omits it when the page is
+complete. `limit: 0` is not an answer mode and keeps its meaning. Every file
+tally a response carries (`files`, and the `files` of `excludedReferences`,
+`unlinkedUsages` and `untypedReceiverCalls`) is capped by entries and by
+bytes; one a cap cut sets `filesTruncated: true` beside it (absent otherwise),
+on a `rows` page as on the `files` answer, while counts stay exact.
 
 `find_references`/`find_callers`/`find_callees`/`find_implementations` also
 accept an optional `limit` (default 20, capped at 200) to raise the page
@@ -1107,7 +1124,15 @@ separate it from a normal results page, and the caller re-asks with the
 replaces. Candidates carry that `id` precisely because `qualifiedName` is
 not a unique handle either (excalidraw has two distinct
 `getNonDeletedElements` functions sharing one), so a name-based re-ask
-could return the same candidate page forever.
+could return the same candidate page forever. `find_definition` accepts that
+`symbolId` too (an exact node, answered with its source), and its candidates
+carry `startLine`/`endLine` so a caller can fall back to `file+position`.
+When the whole candidate set is one first page of at most three candidates,
+each candidate whose span can be read also carries its `source` (at most 20
+lines and 1,500 characters each, `omittedLines` when cut; the explanation says
+when only some do), so the readings can be told apart
+without a second call; the page still marks `ambiguous: true` and prefers
+none of them.
 
 Traversal responses that hit a limit carry `truncated: true` and
 `truncatedBy: 'maxDepth' | 'maxFanout' | 'explorationBudget' | 'responseSize'`
@@ -1140,7 +1165,16 @@ close to this size, so the limit is external and not g-mesh's to learn
 exactly - the fix is to stay well under it by construction:
 `pagination::MAX_RESPONSE_BYTES` (20,000 bytes, comfortably under the
 smallest observed real rejection) bounds every list-shaped tool response's
-serialized size, truncating to the longest row prefix that still fits.
+serialized size, truncating to the longest row prefix that still fits. On
+`find_references`/`find_callers`/`find_callees` and single-hop
+`find_implementations` the bound is on the whole response, not only its rows:
+each candidate page's complete response is measured and rows are cut until it
+fits, and the non-row fields stay small enough to leave rows room because
+every list among them is byte-capped (the `files` answer instead cuts its
+tally to fit). The transitive `find_implementations` walk
+(`transitive: true`) is not under this whole-response bound: its rows are
+cut to the ceiling less a fixed reserve for the rest of the response, and the
+complete response is never measured.
 Continuation for a `responseSize` cut reuses the `explorationBudget` arm's
 own `resumeToken` mechanism exactly (opaque token, cumulative across a resume
 chain) rather than a separate scheme, so a caller does not need to

@@ -118,18 +118,23 @@ use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, Range, TargetKey};
 use g_mesh_plugin_sdk::{NodeSpec, PlaceholderKind};
 use tree_sitter::Node;
 
-use crate::extractor::emit::{container_target, Emitter};
+use crate::extractor::emit::{container_target, Definition, Emitter};
 use crate::extractor::keys::{is_public, visibility, FileRole, ModuleCtx};
 use crate::extractor::model::{DeclRef, FileModel, Import};
 use crate::extractor::scope::{dotted_path, FrameKind, Scopes};
 use crate::extractor::syntax::{
-    assignment_signature, definition_name, docstring, dotted_segments, inner_definition, signature,
-    string_literal, text,
+    assignment_signature, definition_name, docstring, dotted_segments, has_decorator, inner_definition,
+    signature, string_literal, text,
 };
 use crate::project::ProjectContext;
 
 /// The name whose module-level assignment states what a module republishes.
 const DUNDER_ALL: &str = "__all__";
+
+/// The decorator that makes a `def` one stub of an overload set, matched on
+/// its last dotted segment: `@overload`, `@typing.overload`,
+/// `@typing_extensions.overload`.
+const OVERLOAD: &str = "overload";
 
 /// Walks a file's statements, emitting every declaration and every import.
 pub(crate) struct Declarer<'a, 's> {
@@ -240,7 +245,17 @@ impl Declarer<'_, '_> {
             _ => "function",
         };
         let Some(id) = self.declare(outer, inner, NodeKind::Function, native_kind) else { return };
-        let _ = id;
+        // Every `def` of this id, not only the one the node row came from:
+        // an `@overload` set is one node whose declaration list is all of
+        // them (see `super::emit`'s "Overload sets").
+        self.emitter.definition(
+            &id,
+            Definition {
+                range: self.emitter.positions().range(outer),
+                signature: signature(outer, self.source),
+                overload: has_decorator(outer, self.source, OVERLOAD),
+            },
+        );
         // A nested `def` or `class` is a declaration of this file too, so the
         // body is walked - but as a *function* frame, which is what makes
         // `super::scope`'s class-skipping rule apply to everything inside it.

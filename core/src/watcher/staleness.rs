@@ -285,6 +285,13 @@ struct IndexedFileRecord {
     content_hash: String,
 }
 
+/// Whether the index holds an `indexed_files` baseline for `file_path`
+/// (project-relative), i.e. whether the file has been indexed and not deleted
+/// since.
+pub fn has_indexed_baseline(conn: &Connection, file_path: &str) -> Result<bool> {
+    Ok(lookup_indexed_file(conn, file_path)?.is_some())
+}
+
 fn lookup_indexed_file(conn: &Connection, file_path: &str) -> Result<Option<IndexedFileRecord>> {
     conn.query_row(
         "SELECT mtimeMillis, contentHash FROM indexed_files WHERE filePath = ?1",

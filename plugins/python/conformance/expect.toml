@@ -8,27 +8,28 @@
 # above this section prove the plugin's stream is well formed, and only these
 # prove that the edges it emits actually reach the declarations they name.
 #
-# **`tier = "semantic"`** marks the three entries that need a real pyright
+# **`tier = "semantic"`** marks the four entries that need a real pyright
 # behind the SDK's `LspBridge` - decision 6 of
 # `core/src/cli/plugin_check/expectations.rs`'s own module doc, the same way
 # `plugins/rust/conformance/expect.toml` marks its five.
 # `tests/conformance.rs` runs this file three ways, and the three together are
 # the whole point:
 #
-#   1. with the manifest this plugin ships, where all eleven entries run and pass;
+#   1. with the manifest this plugin ships, where all fourteen entries run and pass;
 #   2. with 3.4.0's own manifest (`semantic_pass = false`, no
 #      `[plugin.semantic]`) and `--skip-semantic-expectations`, where those
-#      three report `Skip` and the other eight - every structural entry here -
+#      four report `Skip` and the other ten - every structural entry here -
 #      keep passing;
-#   3. with 3.4.0's manifest and *without* the skip flag, where those three
+#   3. with 3.4.0's manifest and *without* the skip flag, where those four
 #      must FAIL.
 #
 # Arm 3 is the discrimination, and it is not decoration: measured, it fails
-# exactly three entries, each for the reason it was written -
+# exactly four entries, each for the reason it was written -
 #
 #   callers[2]  missing through_a_base_annotation, module_alias_is_bound
 #   callers[3]  empty, wanted through_a_subclass   (the subclass's override)
-#   callers[4]  missing through_a_variable          (a local, typed by inference)
+#   callers[5]  missing through_a_variable          (a local, typed by inference)
+#   callers[6]  no `files` tally                    (one edge, not one per overload)
 #
 # - which is how this file is known to be measuring the pyright tier rather
 # than describing it.
@@ -39,7 +40,7 @@
 # requires the response to carry neither. An `unresolved:`-prefixed row
 # (decision 11) marks an edge the linker could not confirm; no row in this
 # file carries one, which is this fixture's assertion that every usage it
-# names sits on a confirmed edge - in both arms, including the three entries
+# names sits on a confirmed edge - in both arms, including the four entries
 # pyright answers.
 #
 # Every category `g-mesh plugins check --expect` can assert is exercised at
@@ -126,12 +127,10 @@ files = ["pkg/consumer.py:1", "pkg/mod.py:2", "pkg/sub/deep.py:1"]
 # the gap GM-258 built this disclosure for - an agent asking "who calls
 # assist" gets four callers and is told, without a second round-trip, which
 # three files name it without calling it. Delete the re-export from
-# `__init__.py` and the count moves while the caller set does not.
-excluded_references = { count = 3, files = [
-    "pkg/__init__.py:1",
-    "pkg/consumer.py:1",
-    "pkg/mod.py:1",
-] }
+# `__init__.py` and the count moves while the caller set does not. The tally
+# names only `pkg/__init__.py`: the other two files already appear in the
+# rows, so they are counted but not repeated.
+excluded_references = { count = 3, files = ["pkg/__init__.py:1"] }
 
 # --- callers: across a PEP 420 namespace package -----------------------------
 
@@ -157,10 +156,9 @@ expect = ["pkg/plugins/loader.py:load", "pkg/mod.py:Greeter.render"]
 # before calling it - two usages that are not calls, disclosed rather than
 # silently dropped. No `files` key: the two rows already sit one per file, so
 # the response carries no tally and its absence is this entry's assertion.
-excluded_references = { count = 2, files = [
-    "pkg/__init__.py:1",
-    "pkg/plugins/loader.py:1",
-] }
+# `loader.py` is counted but not repeated in the excluded tally, since its
+# row already names it.
+excluded_references = { count = 2, files = ["pkg/__init__.py:1"] }
 
 # --- callers: a class-qualified call, plus the receiver calls pyright answers
 #     and the one it does not (GM-299) --------------------------------------
@@ -258,7 +256,7 @@ expect = ["pkg/callers.py:through_a_subclass"]
 # Every signal on that response says "complete". It is complete for the
 # question the index can answer - which call sites *name* this declaration -
 # and that is a different question from the one the caller asked. `core/src/
-# mcp/instructions.rs`'s `P4_STATIC_RECEIVER` is where a session is told the
+# mcp/instructions.rs`'s `P4_STATIC` is where a session is told the
 # difference, once, and its doc comment records why neither it nor this file
 # may ever offer a *count* of the calls missing here: the index knows `Base`
 # has two subclasses, it does not know how many of `through_a_base_
@@ -294,6 +292,34 @@ tier = "semantic"
 # from the initializer, which is inference rather than declaration, and is
 # the most ordinary shape in Python code that has no type hints at all.
 expect = ["pkg/mod.py:Greeter.shout", "pkg/callers.py:through_a_variable"]
+
+# --- callers: one caller, two overloads, two rows -------------------------
+
+[[callers]]
+symbol = "coerce"
+tier = "semantic"
+# `pkg/overloads.py`'s `coerce` is an `@overload` set: two stubs and an
+# implementation, one node carrying all three as `declarations`.
+# `pkg/overload_callers.py:calls_both_overloads` calls it twice, `coerce(1)`
+# and `coerce("s")`, each from across a file boundary; `coerce_here` calls it
+# once from its own file.
+#
+# The caller SET is the same in both arms - structurally each call already
+# has its `CALLS` edge onto `coerce`. What the semantic tier changes is how
+# many edges there are: pyright binds `coerce(1)` to ordinal 0 and
+# `coerce("s")` to ordinal 1, and the bridge replaces the one structural edge
+# with two bound ones (ADR 0024, all or nothing per edge). So the assertion
+# is the `files` tally - `pkg/overload_callers.py:2` - which a structural
+# index answers with one edge and therefore no tally at all. That is also
+# what fails this entry when the manifest drops `overload_disambiguation`:
+# pyright's `definition` names the whole set for both calls, and without the
+# hover comparison neither binds.
+expect = ["pkg/overload_callers.py:calls_both_overloads", "pkg/overloads.py:coerce_here"]
+files = ["pkg/overload_callers.py:2", "pkg/overloads.py:1"]
+# Decision 13: the `from pkg.overloads import Codec, coerce` line names it
+# without calling it. Counted, but its file is not repeated: the rows and
+# `files` already name it.
+excluded_references = { count = 1, files = [] }
 
 # --- references: usages [[callers]] cannot reach at all ----------------------
 

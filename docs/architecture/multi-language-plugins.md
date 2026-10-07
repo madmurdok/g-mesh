@@ -401,6 +401,10 @@ semantic_sweep = true
 # true: core sends prepareSemanticPass before an owed whole-project pass, so a slow
 # engine can start while core walks and asks other languages. Default false.
 semantic_prepare = false
+# true: core sends filesCreated before the fileChanged of a batch's created files
+# (two or more of this language), so the project model knows all of them before it
+# extracts the first. Default false: only per-file fileChanged. See ADR 0026.
+files_created = false
 # "resolved": receiver calls (x.foo()) get edges; the MCP instructions do not list
 # the receiver gap for this language. "unresolved": they are listed.
 receiver_calls = "resolved"
@@ -598,6 +602,12 @@ with one optional field, `complete` (see the next section).
   semantic tier is not suspended. The SDK starts the engine on it; readiness is
   still decided inside the pass. Measurements and the choice of trigger:
   [gm-429-speedup-proposal.md](../results/gm-429-speedup-proposal.md), section 1.
+- **New:** `filesCreated { filePaths }`, a notification. Core sends it once per
+  language for a drained batch's created files, when the language has two or more
+  and its manifest declares `files_created`, before the first of their
+  `fileChanged`s; each file is still routed once. The SDK applies presence for
+  all of them without extracting. Never sent to a sleeping plugin.
+  [ADR 0026](../adr/0026-batch-created-files-notification.md).
 
 ### A `fileChanged` diff from a process with no baseline
 
@@ -1949,19 +1959,15 @@ adds a second CI job that runs it with `go` off `PATH`. Two decisions:
    several sites, never called, which is what makes it provable only by this
    handler and not `[[callers]]`), and `[[definition]]` reuses
    `Server.Addr`'s and `Placeholder`'s declarations. One deliberate
-   non-choice: `helper` (declared twice, unexported, in two containers) was
-   *not* used for a "file disambiguates an ambiguous name" `[[definition]]`
-   entry, because it cannot pass one. Go's `qualifiedName` carries no
-   container (unlike TypeScript's, which can differ between two same-named
-   declarations) - see this doc's Data Model, "Logical containers" - so
-   `find_definition`'s `file`-narrowed retry, which re-resolves by
-   `qualifiedName` alone (`expectations.rs`'s decision 3, since
-   `find_definition` has no `symbol_id`), lands on the same ambiguity a
-   second time for *any* two Go declarations that share a bare name. This
-   isn't a fixture gap to work around; it is verified and documented in
-   `expect.toml`'s own comment, matching this repo's own rule that a
-   constant belongs in the record once it is computed, not guessed at again
-   by the next reader.
+   non-choice: `helper` (declared twice, unexported, in two containers) is
+   not used for a "file disambiguates an ambiguous name" `[[definition]]`
+   entry. Go's `qualifiedName` carries no container (unlike TypeScript's,
+   which can differ between two same-named declarations) - see this doc's Data
+   Model, "Logical containers" - so a name alone cannot tell the two
+   declarations apart; the `file`-narrowed retry re-calls `find_definition`
+   with the winning candidate's `symbol_id` (`expectations.rs`'s decision 3),
+   not with the name. The fixture's `[[definition]]` entries use
+   `Server.Addr` and `Placeholder`, whose names are unique.
 2. **A reduced expectation set is read out of the one file, not copied into
    a second one.** `expect.toml` entries take an optional `tier =
    "semantic"` (default `"structural"`); `g-mesh plugins check --expect

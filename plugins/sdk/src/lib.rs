@@ -65,17 +65,22 @@
 //!
 //! # Relationship to the TS plugin
 //!
-//! `plugins/typescript` has its own Node implementation of everything above
-//! and is not being ported onto this crate (the design doc's Open Questions
-//! says why). Where a rule here reads as arbitrary, it is almost always
-//! copied from that plugin deliberately - the id scheme and the incremental
-//! diff especially - because both are cross-plugin contracts and the TS
-//! plugin is the implementation the index in the field was built by.
+//! `plugins/typescript` runs on this crate: its binary is an [`Extractor`]
+//! driven by [`run`], like the Rust and Python plugins. Its project model is
+//! the case the presence hook ([`Extractor::file_presence_changed`]) and the
+//! `filesCreated` notification were built for: it resolves imports against
+//! the set of files the walk listed, which must hear of a created file before
+//! an importer of it is extracted. Where a rule here reads as arbitrary, it
+//! is almost always copied deliberately from the Node implementation that
+//! plugin replaced - the id scheme and the incremental diff especially -
+//! because both are cross-plugin contracts and the indexes in the field were
+//! built by it.
 
 #![deny(missing_docs)]
 
+mod columns;
 mod diff;
-mod framing;
+pub mod framing;
 mod graph;
 mod hold;
 pub mod ids;
@@ -88,6 +93,7 @@ mod semantic;
 pub mod testing;
 mod walk;
 
+pub use columns::CharColumns;
 pub use diff::{diff_file, is_empty_diff};
 pub use graph::{
     placeholder_id, render_target, EdgeSpec, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, OpenSiteKind,
@@ -101,7 +107,10 @@ pub use semantic::{
     write_semantic_engine_marker, SemanticAnswer, SemanticEngine, SemanticEngineFactory, MARKER_DIR_ENV,
     SEMANTIC_ENGINE_MARKER,
 };
-pub use walk::{walk_project, walk_scope, WalkScope, BASELINE_EXCLUDED_DIRS, MAX_SCOPE_ENTRIES};
+pub use walk::{
+    walk_project, walk_project_detailed, walk_scope, LinkOutcome, LinkRefusal, WalkScope, WalkedLink,
+    WalkedProject, BASELINE_EXCLUDED_DIRS, MAX_SCOPE_ENTRIES,
+};
 
 /// The wire protocol, re-exported so a plugin needs one dependency rather
 /// than two and can never end up compiling a second, different copy of these
@@ -169,4 +178,21 @@ pub trait Extractor: Send + Sync {
     /// spelling core uses - forward slashes, relative to the project root -
     /// and the SDK guarantees it ([`RelPath`]).
     fn extract(&self, project: &Self::Project, path: &RelPath, source: &str) -> FileGraph;
+
+    /// Records that `path` now exists (`present`) or no longer does, so
+    /// `extract` can resolve against the project's current file set without
+    /// reading the disk (`docs/adr/0023-project-model-tracks-file-presence.md`).
+    ///
+    /// The default does nothing, which suits a project model that holds no
+    /// file set. Contract:
+    /// - **idempotent**: one creation may be reported more than once (once
+    ///   for the whole watcher batch it arrived in, again by its own
+    ///   `fileChanged`), and a hydrated file is reported although
+    ///   [`Extractor::load_project`] already saw it;
+    /// - called before any extraction it affects, only for paths whose
+    ///   extension this plugin claims, never from the bulk walk (whose model
+    ///   comes from `load_project`), and never with a path outside the root;
+    /// - a panic is caught and costs that one path's presence. It may leave
+    ///   `project` half-updated, so do not panic here either.
+    fn file_presence_changed(&self, _project: &mut Self::Project, _path: &RelPath, _present: bool) {}
 }

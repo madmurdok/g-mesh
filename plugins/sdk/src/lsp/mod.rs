@@ -83,9 +83,14 @@ mod bridge;
 mod client;
 mod config;
 mod position;
+mod resolve;
 
 pub use bridge::{Budgets, LspBridge};
-pub use config::{SemanticConfig, ServerReadiness};
+pub use config::{OverloadDisambiguation, SemanticConfig, ServerReadiness};
+pub use resolve::{
+    is_bare, npm_candidates, probe, resolve, script_spellings, Candidate, NpmServer, Resolved,
+    HOST_SCRIPT_EXTENSIONS, PROBE_BUDGET, WINDOWS_SCRIPT_EXTENSIONS,
+};
 
 /// Public only so an integration test can take the lifeline's path; a
 /// plugin never calls it (`run`'s control-stream reader does).

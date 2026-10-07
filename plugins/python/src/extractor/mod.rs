@@ -171,6 +171,12 @@ impl Extractor for PythonExtractor {
         ProjectContext::load(root)
     }
 
+    /// Keeps the file set, and so every container and root it decides,
+    /// current; touches no disk.
+    fn file_presence_changed(&self, project: &mut ProjectContext, path: &RelPath, present: bool) {
+        project.file_presence_changed(path, present);
+    }
+
     /// One file, in two passes over one parse tree.
     ///
     /// The passes exist because a module's *use sites* do not run in the
