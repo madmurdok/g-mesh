@@ -13,7 +13,8 @@
 //! | `x.m()`, `x` typed in this file | `T::m`, as `T::f()` is - and an open site that replaces it |
 //! | `x.m()`, any other `x` | nothing: an open site for the semantic tier |
 //! | `self.f`, `T { f: .. }`, `T { f, .. }` | a `qualifiedName` key - `…::T.f` - in the container `T` lives in |
-//! | `x.f` | nothing: an open site for the semantic tier |
+//! | `x.f`, `x` typed in this file | `T.f`, as `self.f` is - and an open site that replaces it |
+//! | `x.f`, any other `x` | nothing: an open site for the semantic tier |
 //!
 //! The split between the second and third rows is the naming convention
 //! ([`looks_like_type`](super::syntax::looks_like_type)), and the reason they
@@ -47,8 +48,11 @@
 //!    id only when the structural edge is itself onto a placeholder of the
 //!    same address (a declaration in another file), so agreement is tested
 //!    on the target as well as on the id (`plugins/sdk/src/lsp/bridge.rs`).
-//!  - **`x.f`** - a field read through a receiver whose type this tier does
-//!    not know (anything but `self` inside an `impl`).
+//!  - **`x.f`** - a field read through a receiver (anything but `self`
+//!    inside an `impl`), recorded as [`OpenSiteKind::ReceiverField`]. When
+//!    this file spells out the receiver's type `T`, the read also gets the
+//!    edge `self.f` would get inside `impl T`, and the open site carries its
+//!    id in `replaces`, exactly as a typed `x.m()` does.
 //!  - **A call whose path does not resolve**: a bare name that is neither
 //!    declared here nor imported (it came through a glob import, or the
 //!    prelude), an associated function on a generic parameter (`T::new()`),
@@ -876,8 +880,12 @@ impl Bodies<'_, '_> {
     }
 
     /// `x.f` read as a value. `self.f` inside an `impl T` is the field `T.f`
-    /// of the type `self.m()` addresses; any other receiver's type is unknown here,
-    /// so the field becomes an open site. `x.0` names nothing.
+    /// of the type `self.m()` addresses. Any other receiver becomes a
+    /// [`OpenSiteKind::ReceiverField`] open site; when this file types the
+    /// receiver as a plain `T` ([`Self::receiver_type`]), the read also gets
+    /// the edge onto `T.f` and the site names it in `replaces`, as
+    /// [`Self::receiver_call`] does for `x.m()` - with the same hop budget, since
+    /// the final `.f` resolves no written type. `x.0` names nothing.
     fn field_access(&mut self, node: Node, module: &ModuleCtx, block: Option<&BlockCtx>, from: &str) {
         let Some(value) = node.child_by_field_name("value") else { return };
         let field = node.child_by_field_name("field").filter(|field| field.kind() == "field_identifier");
@@ -895,7 +903,20 @@ impl Bodies<'_, '_> {
             }
         }
         self.visit(value, module, block, from);
-        self.open_site(from, field, name, module, OpenSiteKind::Reference, EdgeKind::References, None);
+        let typed = self.receiver_type(value, module, block).filter(|ty| ty.wrapper == Wrapper::Plain);
+        let replaces = typed.and_then(|ty| {
+            let bound = self.field_of(&ty.container, &ty.name, name, module);
+            self.edge(bound, EdgeKind::References, from, field)
+        });
+        self.open_site(
+            from,
+            field,
+            name,
+            module,
+            OpenSiteKind::ReceiverField,
+            EdgeKind::References,
+            replaces,
+        );
     }
 
     /// Every field named in a struct literal or struct pattern (`list`), as

@@ -1626,15 +1626,17 @@ pub fn drain(ledger: Ledger) -> Option<u8> {
         );
     }
     // The trailing `ledger.all_unresolved` read is a question for the
-    // semantic tier, at the field name.
+    // semantic tier, at the field name; `ledger` is typed by its literal, so
+    // the site replaces the structural edge onto the field.
     let reads: Vec<_> = user
         .0
         .open_sites
         .iter()
-        .filter(|site| site.kind == OpenSiteKind::Reference && site.name == "all_unresolved")
+        .filter(|site| site.kind == OpenSiteKind::ReceiverField && site.name == "all_unresolved")
         .collect();
     assert_eq!(reads.len(), 1, "{:#?}", user.0.open_sites);
     assert_eq!(reads[0].edge_kind, EdgeKind::References);
+    assert!(reads[0].replaces.is_some(), "{:#?}", reads[0]);
     // A destructuring pattern names the field too.
     assert!(
         user.targets(EdgeKind::References, "user::drain")

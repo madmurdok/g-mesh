@@ -191,7 +191,11 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// - **Every open site** except [`OpenSiteKind::Implementation`] gets
 ///   `textDocument/definition` at the site's own position (an
 ///   [`OpenSiteKind::OverloadCall`] only when its target is overloaded, and
-///   perhaps a `hover` hop - see "Overload binding" below). The location that
+///   perhaps a `hover` hop - see "Overload binding" below, and a re-export
+///   hop only while unsettled - see "Re-export hops"). A typed
+///   [`OpenSiteKind::ReceiverField`] site (`x.f` with `replaces`) follows the
+///   same retraction rules as a typed [`OpenSiteKind::ReceiverCall`]. The
+///   location that
 ///   comes back is mapped through [`SdkIndex::node_at`] to the node the
 ///   structural tier already emitted for that declaration, and the answer is
 ///   recorded the way every cross-file answer in this design is recorded: a
@@ -307,6 +311,10 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// lands elsewhere contradicts the structural edge, an empty or ambiguous one
 /// upholds it (R1). The design is
 /// `docs/architecture/gm-325-typescript-lsp-semantics.md`, section 4.3.
+///
+/// A [`OpenSiteKind::ReceiverField`] site with `replaces` is not a hop: it is
+/// always asked, like a typed `ReceiverCall`
+/// (`docs/architecture/gm-497-field-reference-sites.md`).
 ///
 /// # Readiness (decision 4)
 ///
@@ -980,7 +988,9 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
                     }
                     Ask::Definition(site.clone())
                 }
-                OpenSiteKind::ReceiverCall | OpenSiteKind::Reference => Ask::Definition(site.clone()),
+                OpenSiteKind::ReceiverCall | OpenSiteKind::ReceiverField | OpenSiteKind::Reference => {
+                    Ask::Definition(site.clone())
+                }
             };
             for_file.push(Question { file: path.clone(), position: site.position, ask });
         }
