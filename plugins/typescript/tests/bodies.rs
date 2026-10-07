@@ -151,6 +151,63 @@ fn destructuring_and_defaults_bind_only_their_left_hand_side() {
 }
 
 #[test]
+fn a_default_inside_an_object_pattern_parameter_is_a_call_of_the_function() {
+    let graph = extract(PATH, "function d() {}\nfunction k({ y = d() }) {}\n");
+    assert_edge!(graph, Calls, "k", "d");
+
+    // The JavaScript grammar writes the parameter as a bare pattern.
+    let js = extract("src/a.js", "function d() {}\nfunction k({ y = d() }) {}\n");
+    assert_edge!(js, Calls, "k", "d");
+}
+
+#[test]
+fn a_default_inside_an_array_pattern_parameter_is_a_call_of_the_function() {
+    let graph = extract(PATH, "function d() {}\nfunction k([y = d()]) {}\n");
+    assert_edge!(graph, Calls, "k", "d");
+}
+
+#[test]
+fn a_name_default_inside_a_pattern_parameter_is_a_reference() {
+    let source = "function z() {}\nfunction k({ y = z }) {}\n";
+    assert_edge!(extract(PATH, source), References, "k", "z");
+    assert_edge!(extract("src/a.js", source), References, "k", "z");
+}
+
+#[test]
+fn a_default_inside_a_nested_pattern_parameter_is_walked() {
+    let graph = extract(PATH, "function d() {}\nfunction k({ a: { b = d() } }) {}\n");
+    assert_edge!(graph, Calls, "k", "d");
+}
+
+#[test]
+fn a_computed_key_inside_a_pattern_parameter_is_walked() {
+    let graph = extract(PATH, "function f() {}\nfunction k({ [f()]: y }) {}\n");
+    assert_edge!(graph, Calls, "k", "f");
+}
+
+#[test]
+fn the_name_a_defaulted_pattern_binds_is_not_a_use() {
+    let graph = extract(PATH, "function y() {}\nfunction d() {}\nfunction k({ y = d() }) {}\n");
+    assert_edge!(graph, Calls, "k", "d");
+    assert_no_edge!(graph, Calls, "k", "y");
+    assert_no_edge!(graph, References, "k", "y");
+}
+
+#[test]
+fn a_destructured_sibling_shadows_a_default_like_a_plain_parameter() {
+    let graph = extract(
+        PATH,
+        "function a() {}\n\
+         function s({ a, b = a() }) {}\n\
+         function u(a, b = a()) {}\n",
+    );
+    assert_no_edge!(graph, Calls, "s", "a");
+    assert_no_edge!(graph, References, "s", "a");
+    assert_no_edge!(graph, Calls, "u", "a");
+    assert_no_edge!(graph, References, "u", "a");
+}
+
+#[test]
 fn a_named_functions_own_name_is_not_bound_so_recursion_keeps_its_edge() {
     let graph = extract(PATH, "function f() { f(); }\nconst e = function e() { e(); };\n");
     assert_edge!(graph, Calls, "f", "f");
