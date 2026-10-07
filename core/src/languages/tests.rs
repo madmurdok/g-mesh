@@ -184,7 +184,7 @@ fn absent_for_path_is_none_for_a_path_no_catalogue_entry_claims() {
     assert_eq!(absent_for_path(&found, "src/lib.zig"), None);
 }
 
-/// AC4: adding a language is one entry. The lookups are the same
+/// Adding a language is one entry. The lookups are the same
 /// table-driven functions the public API delegates to; a fifth entry appended
 /// to the real catalogue works through every one of them, with nothing else
 /// written for it.
@@ -408,4 +408,31 @@ fn a_stored_error_on_one_line_is_the_chain_joined_by_colon_space() {
     assert_eq!(stored.lines().last(), Some("invalid type: map, expected a string"));
     assert_eq!(error_on_one_line(&stored), format!("{err:#}"));
     assert!(!error_on_one_line(&stored).contains('\n'));
+}
+
+// ---------------------------------------------------------------------
+// absent_for_path honours the absent entry's own exclude_dirs
+// ---------------------------------------------------------------------
+
+/// A path under the absent language's own catalogue
+/// `exclude_dirs` names no install command (installing would not index it
+/// either); whole segments only, at any depth, and only that language's
+/// exclusions count.
+///
+/// Control: drop the `under_excluded_dir` check in `absent_for_path` - the
+/// `venv`, `.venv`, `node_modules` and `vendor` assertions fail.
+#[test]
+fn absent_for_path_is_none_under_the_absent_languages_own_exclude_dirs() {
+    let found = discovered(&[]);
+    let language = |path: &str| absent_for_path(&found, path).map(|entry| entry.language);
+
+    assert_eq!(language("venv/x.py"), None);
+    assert_eq!(language("pkg/.venv/lib/x.py"), None);
+    assert_eq!(language("web/node_modules/a.ts"), None);
+    assert_eq!(language("vendor/github.com/x/y.go"), None);
+    assert_eq!(language("target/debug/build.rs"), None);
+
+    assert_eq!(language("venvx/x.py"), Some("python"), "a prefix of an excluded name is not excluded");
+    assert_eq!(language("target/x.py"), Some("python"), "rust's exclusions do not apply to python");
+    assert_eq!(language("vendor/x.ts"), Some("typescript"), "go's exclusions do not apply to typescript");
 }

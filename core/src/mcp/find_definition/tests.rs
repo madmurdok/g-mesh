@@ -2074,3 +2074,94 @@ fn an_anchored_tools_ambiguous_page_carries_lines_and_no_source() {
         assert!(candidate.get("source").is_none(), "{body}");
     }
 }
+
+// ---------------------------------------------------------------------
+// a position miss on a path whose language is not indexed at all
+// ---------------------------------------------------------------------
+
+use crate::mcp::not_indexed::test_support::*;
+
+fn at_position(file_path: &str) -> FindDefinitionParams {
+    FindDefinitionParams {
+        symbol_id: None,
+        symbol_name: None,
+        file_path: Some(file_path.to_string()),
+        position: Some(crate::protocol::types::Position { line: 0, col: 0 }),
+        cursor: None,
+        include_source: None,
+    }
+}
+
+fn covered_call(
+    conn: Connection,
+    coverage: Option<&PathCoverage>,
+    params: FindDefinitionParams,
+) -> CallToolResult {
+    handle_in(&Arc::new(IndexStore::new(conn)), &no_sources(), &SemanticRung::off(), coverage, params)
+        .unwrap()
+}
+
+/// File + position on an absent language's file is
+/// refused with the install command.
+///
+/// Control: pass `None` instead of `coverage` from `handle_in` to
+/// `by_position` (or call `error(..)` in its `None` arm) - the body is not
+/// JSON.
+#[test]
+fn a_position_in_an_absent_languages_file_is_refused_with_the_install_command() {
+    let result = covered_call(setup(), Some(&python_absent()), at_position("tools/gen.py"));
+    assert_python_absent_refusal(&refusal_body(&result), "g-mesh: no symbol found at tools/gen.py:0:0");
+}
+
+/// A position in a failed language's file names `g-mesh reindex` and the innermost cause.
+///
+/// Control: as above.
+#[test]
+fn a_position_in_a_failed_languages_file_is_refused_with_the_reindex_command() {
+    let conn = setup();
+    record_failed(&conn, "python");
+    let result = covered_call(conn, Some(&python_failed()), at_position("tools/gen.py"));
+    assert_python_failed_refusal(&refusal_body(&result), "g-mesh: no symbol found at tools/gen.py:0:0");
+}
+
+/// A covered language's position miss stays the plain message.
+///
+/// Control: make `not_indexed::miss`'s `None` arm build a refusal.
+#[test]
+fn a_position_miss_in_a_covered_language_stays_the_plain_message() {
+    let result = covered_call(setup(), None, at_position("src/nope.rs"));
+    assert_eq!(plain_error(&result), "g-mesh: no symbol found at src/nope.rs:0:0");
+}
+
+/// The name mode never carries the field, even when the
+/// caller's coverage says the (unused) path is uncovered.
+///
+/// Control: route `coverage` into `by_name`'s miss (`not_indexed::miss`
+/// there) - the answer becomes JSON.
+#[test]
+fn a_name_miss_never_carries_the_not_indexed_reason() {
+    let params = FindDefinitionParams {
+        symbol_id: None,
+        symbol_name: Some("does_not_exist".to_string()),
+        file_path: None,
+        position: None,
+        cursor: None,
+        include_source: None,
+    };
+    let result = covered_call(setup(), Some(&python_absent()), params);
+    assert!(plain_error(&result).contains("does_not_exist"));
+}
+
+/// A hit answers normally whatever the coverage.
+///
+/// Control: refuse whenever `coverage` is `Some` in `by_position`.
+#[test]
+fn a_position_hit_carries_no_not_indexed_key_whatever_the_coverage() {
+    let mut conn = setup();
+    let mut node = node_with_span("n1", "gen", "tools.gen.gen", "tools/gen.py", (5, 0));
+    node.language = "python".to_string();
+    upsert_node(&mut conn, node).unwrap();
+    let body = json_body(&covered_call(conn, Some(&python_absent()), at_position("tools/gen.py")));
+    assert_eq!(body["id"], "n1");
+    assert!(body.get("notIndexed").is_none(), "{body}");
+}

@@ -1029,3 +1029,62 @@ fn a_file_anchor_hint_still_fires_in_transitive_mode() {
     assert_eq!(body["truncated"], false);
     assert!(body["resumeToken"].is_null());
 }
+
+// ---------------------------------------------------------------------
+// `file_paths` entries whose language is not indexed at all
+// ---------------------------------------------------------------------
+
+use crate::mcp::not_indexed::test_support::*;
+
+fn implementations_of_iface(transitive: Option<bool>) -> serde_json::Value {
+    let params = FindImplementationsParams {
+        symbol_id: Some("interface".to_string()),
+        file_paths: Some(vec!["a.rs".to_string(), "x.py".to_string()]),
+        transitive,
+        ..Default::default()
+    };
+    json_body(
+        &dispatch_in_covered(
+            &Arc::new(IndexStore::new(setup_chain())),
+            &find_definition::SemanticRung::off(),
+            &no_capabilities(),
+            &SessionHints::default(),
+            &[("x.py".to_string(), python_absent())],
+            params,
+        )
+        .unwrap(),
+    )
+}
+
+/// Direct `find_implementations` with an uncovered `file_paths` entry: rows unchanged plus
+/// the python entry.
+///
+/// Control: pass `&[]` instead of `uncovered` from `dispatch_in_covered`
+/// to `handle_in`, or drop the field from `ImplementationPage`.
+#[test]
+fn a_direct_answer_names_the_uncovered_file_paths() {
+    let body = implementations_of_iface(None);
+    assert_eq!(
+        body["notIndexed"],
+        serde_json::json!([{
+            "language": "python",
+            "reason": "pluginAbsent",
+            "command": "g-mesh plugins install python",
+            "filePaths": ["x.py"],
+        }]),
+        "{body}"
+    );
+    assert_eq!(body["results"].as_array().unwrap().len(), 1, "{body}");
+}
+
+/// A transitive walk ignores `file_paths`, so it names
+/// nothing about them even when handed uncovered entries. (The tool
+/// wrapper also passes none for `transitive: true`; the end-to-end tests do
+/// not cover that branch.)
+///
+/// Control: make `from_root`'s page carry `not_indexed::group(uncovered)`.
+#[test]
+fn a_transitive_answer_carries_no_not_indexed_field() {
+    let body = implementations_of_iface(Some(true));
+    assert!(body.get("notIndexed").is_none(), "{body}");
+}

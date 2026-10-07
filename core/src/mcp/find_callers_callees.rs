@@ -2069,4 +2069,144 @@ mod tests {
         let resolved = calling(&[("a", "a.rs"), ("b", "b.rs")], true);
         assert_eq!(callee_hint(&resolved), "");
     }
+
+    // -----------------------------------------------------------------
+    // `file_paths` entries whose language is not indexed at all
+    // -----------------------------------------------------------------
+
+    use crate::mcp::not_indexed::test_support::*;
+    use crate::mcp::Answer;
+
+    fn scoped(file_paths: &[&str], answer: Option<Answer>) -> SymbolQueryParams {
+        SymbolQueryParams {
+            symbol_id: Some("b".to_string()),
+            file_paths: Some(file_paths.iter().map(|path| path.to_string()).collect()),
+            answer,
+            ..Default::default()
+        }
+    }
+
+    fn callers_of_b(uncovered: &[(String, PathCoverage)], params: SymbolQueryParams) -> serde_json::Value {
+        json_body(
+            &handle_callers_in_covered(
+                &Arc::new(IndexStore::new(setup_chain())),
+                &find_definition::SemanticRung::off(),
+                &no_capabilities(),
+                &SessionHints::default(),
+                uncovered,
+                params,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn callees_of_b(uncovered: &[(String, PathCoverage)], params: SymbolQueryParams) -> serde_json::Value {
+        json_body(
+            &handle_callees_in_covered(
+                &Arc::new(IndexStore::new(setup_chain())),
+                &find_definition::SemanticRung::off(),
+                &no_capabilities(),
+                &SessionHints::default(),
+                uncovered,
+                params,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn python_entry() -> serde_json::Value {
+        serde_json::json!([{
+            "language": "python",
+            "reason": "pluginAbsent",
+            "command": "g-mesh plugins install python",
+            "filePaths": ["x.py"],
+        }])
+    }
+
+    /// `find_callers` with an uncovered `file_paths` entry: rows unchanged plus the
+    /// python entry; no uncovered entry, no key.
+    ///
+    /// Control: drop the `not_indexed` field from `CallerPage` (or pass
+    /// `&[]` into `CallerParts`) - the first assertion fails.
+    #[test]
+    fn a_callers_rows_answer_names_the_uncovered_file_paths() {
+        let uncovered = [("x.py".to_string(), python_absent())];
+        let body = callers_of_b(&uncovered, scoped(&["a.rs", "x.py"], None));
+        assert_eq!(body["notIndexed"], python_entry(), "{body}");
+        assert_eq!(body["results"].as_array().unwrap().len(), 1, "{body}");
+
+        let body = callers_of_b(&[], scoped(&["a.rs"], None));
+        assert!(body.get("notIndexed").is_none(), "{body}");
+    }
+
+    /// `answer: "files"` and `"count"` carry the field for `find_callers`.
+    ///
+    /// Control: drop the field from `CallerDisclosures`.
+    #[test]
+    fn a_callers_count_and_files_answer_names_the_uncovered_file_paths() {
+        let uncovered = [("x.py".to_string(), python_absent())];
+        for answer in [Answer::Files, Answer::Count] {
+            let body = callers_of_b(&uncovered, scoped(&["a.rs", "x.py"], Some(answer)));
+            assert_eq!(body["notIndexed"], python_entry(), "{answer:?}: {body}");
+        }
+    }
+
+    /// `find_callees` with an uncovered `file_paths` entry; none uncovered, no key.
+    ///
+    /// Control: drop the `not_indexed` field from `CalleePage` (or pass
+    /// `&[]` into `CalleeParts`).
+    #[test]
+    fn a_callees_rows_answer_names_the_uncovered_file_paths() {
+        let uncovered = [("x.py".to_string(), python_absent())];
+        let body = callees_of_b(&uncovered, scoped(&["c.rs", "x.py"], None));
+        assert_eq!(body["notIndexed"], python_entry(), "{body}");
+        assert_eq!(body["results"].as_array().unwrap().len(), 1, "{body}");
+
+        let body = callees_of_b(&[], scoped(&["c.rs"], None));
+        assert!(body.get("notIndexed").is_none(), "{body}");
+    }
+
+    /// `answer: "files"` and `"count"` carry the field for `find_callees`.
+    ///
+    /// Control: drop the field from `CalleeDisclosures`.
+    #[test]
+    fn a_callees_count_and_files_answer_names_the_uncovered_file_paths() {
+        let uncovered = [("x.py".to_string(), python_absent())];
+        for answer in [Answer::Files, Answer::Count] {
+            let body = callees_of_b(&uncovered, scoped(&["c.rs", "x.py"], Some(answer)));
+            assert_eq!(body["notIndexed"], python_entry(), "{answer:?}: {body}");
+        }
+    }
+
+    /// A failed language's entry reads the recorded cause.
+    ///
+    /// Control: in `group`, build every entry with `NotIndexed::failed(..,
+    /// None)` (skip the store read) - `error` is missing.
+    #[test]
+    fn a_failed_languages_entry_carries_the_reindex_command_and_cause() {
+        let conn = setup_chain();
+        record_failed(&conn, "python");
+        let body = json_body(
+            &handle_callers_in_covered(
+                &Arc::new(IndexStore::new(conn)),
+                &find_definition::SemanticRung::off(),
+                &no_capabilities(),
+                &SessionHints::default(),
+                &[("x.py".to_string(), python_failed())],
+                scoped(&["a.rs", "x.py"], None),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            body["notIndexed"],
+            serde_json::json!([{
+                "language": "python",
+                "reason": "pluginFailed",
+                "command": "g-mesh reindex",
+                "error": INNERMOST,
+                "filePaths": ["x.py"],
+            }]),
+            "{body}"
+        );
+    }
 }

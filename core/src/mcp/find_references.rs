@@ -1682,4 +1682,96 @@ mod tests {
         assert!(!hint_for(&repeated_file, &session).contains(session_hints::FILES_TALLY), "once per session");
         assert!(hint_for(&repeated_file, &SessionHints::default()).contains(session_hints::FILES_TALLY));
     }
+
+    // -----------------------------------------------------------------
+    // `file_paths` entries whose language is not indexed at all
+    // -----------------------------------------------------------------
+
+    use crate::mcp::not_indexed::test_support::*;
+    use crate::mcp::Answer;
+
+    /// `target` in target.rs, referenced from a.rs.
+    fn referenced_from_a() -> Arc<IndexStore> {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("user", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e", "user", "target", "REFERENCES", "tree-sitter", true))
+            .unwrap();
+        Arc::new(IndexStore::new(conn))
+    }
+
+    fn scoped(
+        store: &Arc<IndexStore>,
+        uncovered: &[(String, PathCoverage)],
+        symbol_id: &str,
+        answer: Option<Answer>,
+    ) -> CallToolResult {
+        let params = SymbolQueryParams {
+            symbol_id: Some(symbol_id.to_string()),
+            file_paths: Some(vec!["a.rs".to_string(), "x.py".to_string()]),
+            answer,
+            ..Default::default()
+        };
+        handle_in_covered(
+            store,
+            &find_definition::SemanticRung::off(),
+            &no_capabilities(),
+            &SessionHints::default(),
+            uncovered,
+            params,
+        )
+        .unwrap()
+    }
+
+    fn python_entry() -> serde_json::Value {
+        serde_json::json!([{
+            "language": "python",
+            "reason": "pluginAbsent",
+            "command": "g-mesh plugins install python",
+            "filePaths": ["x.py"],
+        }])
+    }
+
+    /// The rows answer as usual and `notIndexed` names the
+    /// uncovered entry; with nothing uncovered there is no key (S6-3).
+    ///
+    /// Controls: drop the `not_indexed` field from `ReferencePage` (or
+    /// pass `&[]` for it in `ReferenceParts`) - the key is missing; drop
+    /// its `skip_serializing_if` - the uncovered-free answer carries `[]`.
+    #[test]
+    fn a_rows_answer_names_the_uncovered_file_paths() {
+        let store = referenced_from_a();
+        let body = json_body(&scoped(&store, &[("x.py".to_string(), python_absent())], "target", None));
+        assert_eq!(body["notIndexed"], python_entry(), "{body}");
+        assert_eq!(body["results"].as_array().unwrap().len(), 1, "the rows are unchanged: {body}");
+
+        let body = json_body(&scoped(&store, &[], "target", None));
+        assert!(body.get("notIndexed").is_none(), "{body}");
+    }
+
+    /// `answer: "files"` and `"count"` carry it too.
+    ///
+    /// Control: drop the `not_indexed` field from `ReferenceDisclosures` -
+    /// both assertions fail.
+    #[test]
+    fn files_and_count_answers_name_the_uncovered_file_paths() {
+        let store = referenced_from_a();
+        for answer in [Answer::Files, Answer::Count] {
+            let body =
+                json_body(&scoped(&store, &[("x.py".to_string(), python_absent())], "target", Some(answer)));
+            assert_eq!(body["notIndexed"], python_entry(), "{answer:?}: {body}");
+        }
+    }
+
+    /// An unknown anchor answers exactly as before.
+    ///
+    /// Control: run `not_indexed::group` before `anchor::resolve` and
+    /// attach it to the anchor error.
+    #[test]
+    fn an_unknown_anchor_carries_no_not_indexed_field() {
+        let store = referenced_from_a();
+        let result = scoped(&store, &[("x.py".to_string(), python_absent())], "nope", None);
+        assert!(!error_text(&result).contains("notIndexed"));
+    }
 }

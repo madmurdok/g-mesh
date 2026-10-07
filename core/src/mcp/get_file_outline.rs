@@ -375,4 +375,70 @@ mod tests {
         );
         assert_eq!(body["hasMore"], true);
     }
+
+    // -----------------------------------------------------------------
+    // a miss on a path whose language is not indexed at all
+    // -----------------------------------------------------------------
+
+    use crate::mcp::not_indexed::test_support::*;
+
+    fn outline_of(conn: Connection, coverage: Option<&PathCoverage>, file_path: &str) -> CallToolResult {
+        let params = GetFileOutlineParams { file_path: file_path.to_string(), ..Default::default() };
+        handle_covered(&Arc::new(IndexStore::new(conn)), coverage, params).unwrap()
+    }
+
+    /// An absent language's file is refused with the
+    /// structured reason and the install command.
+    ///
+    /// Control: in `handle_covered`'s miss arm, call
+    /// `tool_result::error(..)` instead of `not_indexed::miss` - the body is
+    /// not JSON.
+    #[test]
+    fn an_absent_languages_file_is_refused_with_the_install_command() {
+        let result = outline_of(setup(), Some(&python_absent()), "tools/gen.py");
+        assert_python_absent_refusal(
+            &refusal_body(&result),
+            "g-mesh: no file 'tools/gen.py' found in the index",
+        );
+    }
+
+    /// A failed language's file names `g-mesh reindex`
+    /// and the innermost recorded cause.
+    ///
+    /// Control: the same as the absent test; or make
+    /// `PathCoverage::Failed` read as absent in `from_coverage`.
+    #[test]
+    fn a_failed_languages_file_is_refused_with_the_reindex_command() {
+        let conn = setup();
+        record_failed(&conn, "python");
+        let result = outline_of(conn, Some(&python_failed()), "tools/gen.py");
+        assert_python_failed_refusal(
+            &refusal_body(&result),
+            "g-mesh: no file 'tools/gen.py' found in the index",
+        );
+    }
+
+    /// A covered language's miss stays the plain message.
+    ///
+    /// Control: make `not_indexed::miss`'s `None` arm build a refusal.
+    #[test]
+    fn a_covered_languages_miss_stays_the_plain_message() {
+        let result = outline_of(setup(), None, "src/nope.rs");
+        assert_eq!(plain_error(&result), "g-mesh: no file 'src/nope.rs' found in the index");
+    }
+
+    /// An indexed file answers normally even when told
+    /// its language is uncovered - coverage is read only on a miss.
+    ///
+    /// Control: consult `coverage` before the file lookup (refuse whenever
+    /// it is `Some`) - the hit becomes an error.
+    #[test]
+    fn a_hit_carries_no_not_indexed_key_whatever_the_coverage() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "gen.py", "gen.py", "tools/gen.py", "python"))
+            .unwrap();
+        let body = json_body(&outline_of(conn, Some(&python_absent()), "tools/gen.py"));
+        assert!(body.get("notIndexed").is_none(), "{body}");
+        assert!(body.get("results").is_some(), "{body}");
+    }
 }

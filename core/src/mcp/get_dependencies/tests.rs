@@ -1348,3 +1348,127 @@ fn the_import_type_clause_is_only_for_a_typescript_anchor() {
     assert_eq!(rust_hint, session_hints::WALK_COMPLETE);
     assert!(!rust_hint.contains("import type"));
 }
+
+// -----------------------------------------------------------------
+// a file path whose language is not indexed at all
+// -----------------------------------------------------------------
+
+use crate::mcp::not_indexed::test_support::*;
+
+fn covered(
+    conn: Connection,
+    coverage: Option<&PathCoverage>,
+    params: GetDependenciesParams,
+) -> CallToolResult {
+    super::handle_covered(
+        &Arc::new(IndexStore::new(conn)),
+        &ts_entry_points(),
+        &SessionHints::default(),
+        coverage,
+        params,
+    )
+    .unwrap()
+}
+
+/// An absent language's file is refused with the
+/// install command.
+///
+/// Control: drop the `Some(coverage) if uncovered_miss(..)` arm in
+/// `handle_covered` - `from_file`'s plain no-file message comes back.
+#[test]
+fn an_absent_languages_file_is_refused_with_the_install_command() {
+    let result = covered(setup(), Some(&python_absent()), anchored_at("tools/gen.py", Direction::Outgoing));
+    assert_python_absent_refusal(&refusal_body(&result), "g-mesh: no file 'tools/gen.py' found in the index");
+}
+
+/// A failed language's file names `g-mesh reindex` and the innermost cause.
+///
+/// Control: as above.
+#[test]
+fn a_failed_languages_file_is_refused_with_the_reindex_command() {
+    let conn = setup();
+    record_failed(&conn, "python");
+    let result = covered(conn, Some(&python_failed()), anchored_at("tools/gen.py", Direction::Incoming));
+    assert_python_failed_refusal(&refusal_body(&result), "g-mesh: no file 'tools/gen.py' found in the index");
+}
+
+/// The refusal comes before the container-key fallback.
+/// The fixture's container key equals the path, and without a coverage
+/// the same call walks from that container - so the refusal is what
+/// changed the answer.
+///
+/// Control: run `from_file` first and refuse only when it errors (the
+/// refusal after the fallbacks) - the covered call walks the container.
+#[test]
+fn an_uncovered_path_is_refused_before_a_container_key_matches_it() {
+    let fixture = || {
+        let mut conn = setup();
+        materialize_container(&mut conn, "python", "tools/gen.py");
+        conn
+    };
+    let walked = json_body(&covered(fixture(), None, anchored_at("tools/gen.py", Direction::Outgoing)));
+    assert!(walked.get("results").is_some(), "the fixture must match the container key: {walked}");
+
+    let result = covered(fixture(), Some(&python_absent()), anchored_at("tools/gen.py", Direction::Outgoing));
+    assert_python_absent_refusal(&refusal_body(&result), "g-mesh: no file 'tools/gen.py' found in the index");
+}
+
+/// The refusal comes before the entry-point substitution
+/// too. Without a coverage, the fixture substitutes `tools/gen.py/index.ts`
+/// (`resolvedFrom`).
+///
+/// Control: as above - the covered call answers with `resolvedFrom`.
+#[test]
+fn an_uncovered_path_is_refused_before_an_entry_point_is_substituted() {
+    let fixture = || {
+        let mut conn = setup();
+        upsert_node(&mut conn, file("tools/gen.py/index.ts")).unwrap();
+        conn
+    };
+    let substituted = json_body(&covered(fixture(), None, anchored_at("tools/gen.py", Direction::Outgoing)));
+    assert_eq!(substituted["resolvedFrom"]["filePath"], "tools/gen.py/index.ts", "{substituted}");
+
+    let result = covered(fixture(), Some(&python_absent()), anchored_at("tools/gen.py", Direction::Outgoing));
+    let body = refusal_body(&result);
+    assert!(body.get("resolvedFrom").is_none(), "{body}");
+    assert_python_absent_refusal(&body, "g-mesh: no file 'tools/gen.py' found in the index");
+}
+
+/// A covered language's miss stays `from_file`'s plain message.
+///
+/// Control: make `not_indexed::miss`'s `None` arm build a refusal, or
+/// refuse whenever the file is missing regardless of coverage.
+#[test]
+fn a_covered_languages_miss_stays_the_plain_message() {
+    let result = covered(setup(), None, anchored_at("src/nope.rs", Direction::Outgoing));
+    assert!(plain_error(&result).contains("src/nope.rs"));
+}
+
+/// An indexed file walks normally whatever the coverage.
+///
+/// Control: drop the `uncovered_miss` guard (refuse whenever coverage is
+/// `Some`) - the hit becomes an error.
+#[test]
+fn a_hit_walks_normally_whatever_the_coverage() {
+    let body =
+        json_body(&covered(import_chain(), Some(&python_absent()), anchored_at("a.rs", Direction::Outgoing)));
+    assert!(body.get("notIndexed").is_none(), "{body}");
+    assert_eq!(reached(&body).len(), 2, "{body}");
+}
+
+/// `module_id` never carries the field.
+///
+/// Control: refuse in the `module_id` arm when coverage is `Some`.
+#[test]
+fn a_module_id_miss_never_carries_the_not_indexed_reason() {
+    let params = GetDependenciesParams {
+        file_path: None,
+        module_id: Some("tools/gen.py".to_string()),
+        direction: Direction::Outgoing,
+        max_depth: None,
+        max_fanout: None,
+        resume_token: None,
+    };
+    let result = covered(setup(), Some(&python_absent()), params);
+    plain_error(&result);
+}
