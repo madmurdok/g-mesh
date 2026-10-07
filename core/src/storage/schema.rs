@@ -1034,7 +1034,7 @@ fn in_savepoint<T>(conn: &Connection, body: impl FnOnce() -> Result<T>) -> Resul
         }
         Err(err) => {
             if let Err(rollback) = conn.execute_batch("ROLLBACK TO schema_record; RELEASE schema_record") {
-                eprintln!("g-mesh: failed to roll back a savepoint ({rollback:#})");
+                crate::log_line!("g-mesh: failed to roll back a savepoint ({rollback:#})");
             }
             Err(err)
         }

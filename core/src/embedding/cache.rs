@@ -217,7 +217,7 @@ impl EmbeddingCache {
 
     fn recreate_after(path: &Path, cause: &anyhow::Error) -> Result<Self, OpenError> {
         let moved_to = move_aside(path).map_err(OpenError::Failed)?;
-        eprintln!(
+        crate::log_line!(
             "g-mesh: the embedding cache {} is unusable ({cause:#}) - moved it to {} and started an empty one",
             path.display(),
             moved_to.display()

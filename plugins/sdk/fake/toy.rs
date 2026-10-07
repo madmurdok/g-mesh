@@ -314,7 +314,7 @@ fn bulk(defect: &str, root: &Path) -> i32 {
         // even load it: a non-zero exit with nothing on stdout - with a word
         // on stderr, or (the second spelling) without one.
         "bulk-dies" => {
-            eprintln!("fk-extractor: cannot open the toy grammar");
+            g_mesh_plugin_sdk::log_line!("fk-extractor: cannot open the toy grammar");
             return 3;
         }
         "bulk-dies-silently" => return 3,

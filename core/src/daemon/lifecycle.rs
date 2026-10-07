@@ -111,7 +111,7 @@ pub(crate) fn parse_timeout(raw: Option<&str>, default: Duration, name: &str) ->
         Ok(0) => None,
         Ok(millis) => Some(Duration::from_millis(millis)),
         Err(_) => {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: ignoring {name}={raw:?} - not a whole number of milliseconds; \
                  using the default {default:?}"
             );
@@ -310,7 +310,7 @@ impl PluginSupervisor {
                 // mid-write, and it has already been killed and relaunched). Queue it
                 // like a change seen while asleep, so the next `replay_pending` sends it
                 // to the fresh process instead of dropping it.
-                eprintln!(
+                crate::log_line!(
                     "g-mesh daemon: {} plugin timed out applying a file change ({err:#}) - \
                      the plugin was relaunched and {retry_path} is queued for replay",
                     self.manifest.language
@@ -318,7 +318,7 @@ impl PluginSupervisor {
                 inner.dirty.push(retry_path);
                 self.pending.store(true, Ordering::SeqCst);
             } else {
-                eprintln!("g-mesh daemon: failed to apply file change: {err:#}");
+                crate::log_line!("g-mesh daemon: failed to apply file change: {err:#}");
             }
         }
     }
@@ -345,7 +345,7 @@ impl PluginSupervisor {
         let queued = inner.dirty.drain();
         self.pending.store(false, Ordering::SeqCst);
         // Lists the paths, so the log tells a queue replay from a project rescan.
-        eprintln!(
+        crate::log_line!(
             "g-mesh daemon: waking the {} plugin to replay {} queued file change(s): {}",
             self.manifest.language,
             queued.len(),
@@ -361,7 +361,7 @@ impl PluginSupervisor {
                 Ok(()) => replayed += 1,
                 // One unreadable file does not cost the rest of the queue its replay.
                 Err(err) => {
-                    eprintln!("g-mesh daemon: failed to replay queued change to {file_path}: {err:#}")
+                    crate::log_line!("g-mesh daemon: failed to replay queued change to {file_path}: {err:#}")
                 }
             }
         }
@@ -533,7 +533,7 @@ impl PluginSupervisor {
             return;
         };
         if confirmed_mb <= limit_mb {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: the {} plugin's process tree read {measured_mb}MB against a \
                  memoryLimitMb of {limit_mb}MB, but a confirming sample read {confirmed_mb}MB - \
                  treating that as a transient member of the tree rather than a sustained overage, \
@@ -556,7 +556,7 @@ impl PluginSupervisor {
     /// The "no evidence either way" log, emitted once per supervisor.
     fn log_sampling_unavailable_once(&self, pid: u32) {
         if !self.sampling_unavailable_logged.swap(true, Ordering::SeqCst) {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: could not sample the {} plugin's process-tree memory \
                  (pid {pid}) - memoryLimitMb has nothing to enforce against until a later \
                  sample succeeds; logged once",
@@ -581,11 +581,17 @@ impl PluginSupervisor {
         let path = self.suspended_marker_path();
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         if let Err(err) = fs::write(&temporary, format!("{reason}\n")) {
-            eprintln!("g-mesh daemon: failed to write suspension marker {}: {err}", temporary.display());
+            crate::log_line!(
+                "g-mesh daemon: failed to write suspension marker {}: {err}",
+                temporary.display()
+            );
             return;
         }
         if let Err(err) = fs::rename(&temporary, &path) {
-            eprintln!("g-mesh daemon: failed to put suspension marker {} in place: {err}", path.display());
+            crate::log_line!(
+                "g-mesh daemon: failed to put suspension marker {} in place: {err}",
+                path.display()
+            );
             let _ = fs::remove_file(&temporary);
         }
     }
@@ -595,12 +601,12 @@ impl PluginSupervisor {
     fn put_to_sleep(&self, process: PluginProcess, reason: &str) {
         let pid = process.pid();
         if let Err(err) = process.shutdown(PLUGIN_EXIT_GRACE) {
-            eprintln!("g-mesh daemon: the plugin (pid {pid}) did not shut down cleanly: {err:#}");
+            crate::log_line!("g-mesh daemon: the plugin (pid {pid}) did not shut down cleanly: {err:#}");
         }
         // Removed: a pid file naming a deliberately exited process reads as a
         // crashed daemon to `cli::stop` and `cli::status`.
         let _ = fs::remove_file(&self.pid_file);
-        eprintln!(
+        crate::log_line!(
             "g-mesh daemon: {} plugin (pid {pid}) put to sleep - {reason}; file changes will be \
              queued until a request needs it again",
             self.manifest.language
@@ -761,7 +767,7 @@ pub fn supervise(
         // First in the tick: an orphan has nothing left to time and no reason to
         // pay for a `sysinfo` scan on its way out.
         if let Some(orphan) = orphan_check(project_root, std::env::current_exe()) {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: {orphan} - shutting down; nothing can ask this daemon for \
                  anything again, and a fresh one will be started if the project comes back"
             );
@@ -776,7 +782,7 @@ pub fn supervise(
         registry.check_memory_limits_all();
 
         if let Some(idle) = core.idle_beyond(timeouts.core) {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: no MCP requests for {idle:?} - shutting down; the next request \
                  will start a fresh daemon for this project"
             );

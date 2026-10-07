@@ -5,7 +5,7 @@ use g_mesh::cli;
 
 fn main() {
     if let Err(err) = cli::run() {
-        eprintln!("g-mesh: {err:#}");
+        g_mesh::log_line!("g-mesh: {err:#}");
         std::process::exit(cli::exit_code(&err));
     }
 }

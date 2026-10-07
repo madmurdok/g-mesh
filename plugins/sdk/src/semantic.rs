@@ -245,7 +245,7 @@ impl LazyEngine {
         match engine.answer(files, index) {
             Ok(answer) => answer,
             Err(err) => {
-                eprintln!(
+                crate::log_line!(
                     "[{}] the semantic pass failed ({err:#}) - answering with an empty, incomplete diff",
                     self.language
                 );
@@ -274,7 +274,7 @@ impl LazyEngine {
             Err(err) => {
                 self.failed = true;
                 self.start_failure = Some(format!("the semantic engine could not be started: {err:#}"));
-                eprintln!(
+                crate::log_line!(
                     "[{}] the semantic engine could not be started ({err:#}) - answering structurally only \
                      for the rest of this process's life",
                     self.language
@@ -333,7 +333,10 @@ pub fn write_semantic_engine_marker(language: &str) {
     let Some(dir) = std::env::var_os(MARKER_DIR_ENV).filter(|dir| !dir.is_empty()) else { return };
     let path = PathBuf::from(dir).join(SEMANTIC_ENGINE_MARKER);
     if let Err(err) = append_pid(&path) {
-        eprintln!("[{language}] could not write the semantic-engine marker {}: {err:#}", path.display());
+        crate::log_line!(
+            "[{language}] could not write the semantic-engine marker {}: {err:#}",
+            path.display()
+        );
     }
 }
 

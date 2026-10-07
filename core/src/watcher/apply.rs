@@ -161,7 +161,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
         semantic_pass_timeout,
         on_timeout,
     ) {
-        eprintln!(
+        crate::log_line!(
             "g-mesh: the semantic pass over {file_path} failed after its reparse ({err:#}) - \
              its edges keep whatever the structural pass resolved"
         );
@@ -264,7 +264,7 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
             let reason = outcome.incomplete_reason.as_deref().unwrap_or("the plugin gave no reason");
             bail!("the plugin reported an incomplete whole-project semantic pass: {reason}");
         }
-        eprintln!(
+        crate::log_line!(
             "g-mesh: the plugin reported an incomplete per-file semantic pass - its edges keep whatever \
              this pass did resolve"
         );
@@ -273,19 +273,21 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
         // are no longer pending (ADR 0009). Best-effort: a row left behind
         // only over-warns until the whole-project pass clears it.
         if let Err(err) = store.step(|conn| schema::clear_semantic_pending_files(conn, &file_paths)) {
-            eprintln!("g-mesh: failed to clear the semantic-pending files of a per-file pass ({err:#})");
+            crate::log_line!(
+                "g-mesh: failed to clear the semantic-pending files of a per-file pass ({err:#})"
+            );
         }
     } else if let Some(language) = sweep_language {
         let swept = store.step(|conn| sweep_semantic_edges(conn, language, &outcome.upserted_edges))?;
         if swept > 0 {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh: {language}'s whole-project semantic pass no longer stands behind {swept} \
                  semantic edge(s) - deleted"
             );
         }
         let swept = store.sweep_unclaimed_nodes(language)?;
         if swept > 0 {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh: {language}'s whole-project semantic pass did not re-send {swept} placeholder(s) \
                  its last workspace reindex kept - deleted"
             );
@@ -478,7 +480,7 @@ fn nodes_with_vectors(conn: &rusqlite::Connection, diff: &Diff) -> HashSet<Strin
         Ok(found)
     };
     lookup().unwrap_or_else(|err| {
-        eprintln!("g-mesh daemon: failed to check a semantic answer's nodes for vectors ({err:#})");
+        crate::log_line!("g-mesh daemon: failed to check a semantic answer's nodes for vectors ({err:#})");
         HashSet::new()
     })
 }
@@ -509,7 +511,7 @@ fn file_scope(project_root: &Path, file_path: &str, diff: &Diff, complete: bool)
 fn hold_compute_open_for_tests() {
     let Some(path) = std::env::var_os(HOLD_COMPUTE_FILE_ENV).filter(|p| !p.is_empty()) else { return };
     let path = std::path::PathBuf::from(path);
-    eprintln!(
+    crate::log_line!(
         "g-mesh: holding a reparse's lock-free embedding window open until {} is removed \
          ({HOLD_COMPUTE_FILE_ENV})",
         path.display()
@@ -574,7 +576,7 @@ impl PathWarnings {
              dropped it and kept the node (later invalid paths in this file are dropped without a warning)",
             node.language, node.qualified_name, node.file_path
         );
-        eprintln!("{line}");
+        crate::log_line!("{line}");
         self.emitted.push(line);
     }
 }

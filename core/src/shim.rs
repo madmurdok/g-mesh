@@ -1,3 +1,8 @@
+// The shim is its own process; its stderr goes to the MCP client, not the
+// shared daemon log, so `eprintln!` is fine here and in `shim::router`
+// (GM-520, clippy.toml).
+#![allow(clippy::disallowed_macros)]
+
 use std::fs::{self, File};
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
@@ -65,6 +70,9 @@ pub const PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
 /// runs - can share one file without erasing each other; a path that cannot
 /// be opened falls back to `/dev/null` rather than failing the bootstrap,
 /// because a diagnostic aid must never be the reason a daemon does not start.
+/// Sharing is safe because every writer to this file - the daemon
+/// (`g_mesh::log_line!`) and each plugin (`g_mesh_plugin_sdk::log_line!`) -
+/// emits a whole line in one `write`, which `O_APPEND` keeps intact.
 pub const DAEMON_LOG_ENV: &str = "G_MESH_DAEMON_LOG";
 
 /// The file in the project's state directory a shim-bootstrapped daemon's

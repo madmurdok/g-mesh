@@ -39,6 +39,9 @@
 //! mapping rather than of the plumbing: it fails, silently and completely, if
 //! either conversion is dropped.
 
+// Test diagnostics to the harness, not a daemon log line (GM-520).
+#![allow(clippy::disallowed_macros)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

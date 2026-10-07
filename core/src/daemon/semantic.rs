@@ -200,7 +200,7 @@ pub(crate) fn indexed_file_count(conn: &IndexStore, language: &str) -> usize {
     match result {
         Ok(count) => count.max(0) as usize,
         Err(err) => {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: failed to count {language}'s indexed files for the semantic-pass \
                  timeout ({err:#}) - falling back to the flat floor"
             );
@@ -270,10 +270,10 @@ impl SemanticPassRun {
     /// near-identical ones hand-written at each call site.
     pub fn log(&self, context: &str) {
         for language in &self.completed {
-            eprintln!("g-mesh: {language} semantic pass over {context} complete");
+            crate::log_line!("g-mesh: {language} semantic pass over {context} complete");
         }
         for (language, err) in &self.failed {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh: the {language} semantic pass over {context} failed ({err:#}) - \
                  its edges keep whatever the structural pass resolved"
             );
@@ -322,7 +322,9 @@ pub fn run_with_registry_and_progress(
     let owed = match conn.with(|conn| schema::owed_semantic_pass_languages(conn, &capable)) {
         Ok(owed) => owed,
         Err(err) => {
-            eprintln!("g-mesh daemon: failed to determine which languages owe a semantic pass ({err:#})");
+            crate::log_line!(
+                "g-mesh daemon: failed to determine which languages owe a semantic pass ({err:#})"
+            );
             Vec::new()
         }
     };
@@ -387,7 +389,7 @@ fn prepare_owed(registry: &PluginRegistry, owed: &[String]) -> HashMap<String, A
                 holds.insert(language.clone(), hold);
             }
             Ok(None) => {}
-            Err(err) => eprintln!(
+            Err(err) => crate::log_line!(
                 "g-mesh daemon: could not tell the {language} plugin its semantic pass is owed ({err:#}) - \
                  it starts its engine when the pass is asked instead"
             ),
@@ -428,7 +430,7 @@ pub fn run_once(
     let owed = match conn.with(|conn| schema::owed_semantic_pass_languages(conn, &capable)) {
         Ok(owed) => owed,
         Err(err) => {
-            eprintln!("g-mesh: failed to determine which languages owe a semantic pass ({err:#})");
+            crate::log_line!("g-mesh: failed to determine which languages owe a semantic pass ({err:#})");
             Vec::new()
         }
     };
@@ -470,7 +472,7 @@ pub fn run_once(
             Err(err) => run.record_failure(conn, language.clone(), err),
         }
         if let Err(err) = shutdown {
-            eprintln!("g-mesh: the {language} plugin did not shut down cleanly ({err:#})");
+            crate::log_line!("g-mesh: the {language} plugin did not shut down cleanly ({err:#})");
         }
     }
 
@@ -493,7 +495,9 @@ pub(crate) const NOT_RUN_REASON: &str = "not run - its plugin was asleep or memo
 /// Logs and records that `language`'s pass was not run because its plugin was
 /// asleep or memory-suspended. The language stays owed.
 pub(crate) fn record_not_run(conn: &IndexStore, language: &str) {
-    eprintln!("g-mesh daemon: the {language} semantic pass was not run - its plugin is asleep or suspended");
+    crate::log_line!(
+        "g-mesh daemon: the {language} semantic pass was not run - its plugin is asleep or suspended"
+    );
     record_reason(conn, language, NOT_RUN_REASON);
 }
 
@@ -501,7 +505,7 @@ fn record_reason(conn: &IndexStore, language: &str, reason: &str) {
     if let Err(write_err) =
         conn.with(|conn| schema::record_language_semantic_pass_failure(conn, language, reason))
     {
-        eprintln!("g-mesh: failed to record why the {language} semantic pass failed ({write_err:#})");
+        crate::log_line!("g-mesh: failed to record why the {language} semantic pass failed ({write_err:#})");
     }
 }
 
@@ -518,7 +522,7 @@ fn record_reason(conn: &IndexStore, language: &str, reason: &str) {
 /// own doc comment.
 fn reconcile_rollup(conn: &IndexStore, capable: &HashSet<String>) {
     if let Err(err) = conn.with(|conn| schema::reconcile_semantic_pass_rollup(conn, capable)) {
-        eprintln!("g-mesh: failed to update the project-wide semantic-pass roll-up ({err:#})");
+        crate::log_line!("g-mesh: failed to update the project-wide semantic-pass roll-up ({err:#})");
     }
 }
 

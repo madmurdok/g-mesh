@@ -106,7 +106,7 @@ fn prepare(config: &mut SemanticConfig, root: &Path) -> Result<()> {
     let resolved = resolve(&config.command, root, HOST_SCRIPT_EXTENSIONS)?;
     let mut args = resolved.prefix_args;
     args.extend(config.args.iter().cloned());
-    eprintln!(
+    g_mesh_plugin_sdk::log_line!(
         "[{LANGUAGE}] semantic tier: {} ({}, found on {})",
         resolved.command.display(),
         resolved.version,

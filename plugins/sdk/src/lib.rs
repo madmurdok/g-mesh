@@ -85,6 +85,7 @@ mod graph;
 mod hold;
 pub mod ids;
 mod index;
+pub mod log;
 pub mod lsp;
 mod manifest;
 mod path;

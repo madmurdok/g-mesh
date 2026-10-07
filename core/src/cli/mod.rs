@@ -25,6 +25,10 @@
 //! [`crate::cli::model`]). It is also the only command here that opens a
 //! network connection, which that module keeps true structurally.
 
+// CLI output goes to the user's terminal, not the shared daemon log, so
+// `eprintln!` is fine here and in every submodule (GM-520, clippy.toml).
+#![allow(clippy::disallowed_macros)]
+
 pub mod agent_instructions;
 pub mod clean;
 pub mod config_wizard;

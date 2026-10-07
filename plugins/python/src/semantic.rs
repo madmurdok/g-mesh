@@ -280,7 +280,7 @@ fn prepare(config: &mut SemanticConfig, root: &Path) -> Result<()> {
     let resolved = resolve(&config.command, root, HOST_SCRIPT_EXTENSIONS)?;
     let mut args = resolved.prefix_args;
     args.extend(config.args.iter().cloned());
-    eprintln!(
+    g_mesh_plugin_sdk::log_line!(
         "[{LANGUAGE}] semantic tier: {} ({}, found on {})",
         resolved.command.display(),
         resolved.version,
@@ -299,14 +299,14 @@ fn add_project_settings(config: &mut SemanticConfig, root: &Path) {
     // then finds an interpreter itself and says which one it assumed in its
     // own log, which the bridge forwards.
     if let Some(python) = interpreter(root) {
-        eprintln!("[{LANGUAGE}] semantic tier: python.pythonPath = {}", python.display());
+        g_mesh_plugin_sdk::log_line!("[{LANGUAGE}] semantic tier: python.pythonPath = {}", python.display());
         set_python_path(config, &python);
     }
 
     let exclude: Vec<String> = crate::project::EXCLUDE_DIRS.iter().map(|dir| (*dir).to_string()).collect();
     let scope = walk_scope(root, &exclude);
     if scope.dropped > 0 {
-        eprintln!(
+        g_mesh_plugin_sdk::log_line!(
             "[{LANGUAGE}] semantic tier: {} ignored directories left out of python.analysis.exclude \
              (the deepest); pyright may scan them",
             scope.dropped
@@ -409,7 +409,7 @@ fn set_scope(config: &mut SemanticConfig, scope: &WalkScope) {
         as_object(config.settings.entry("python".to_string()).or_insert_with(|| serde_json::json!({})));
     let analysis = as_object(section.entry("analysis").or_insert_with(|| serde_json::json!({})));
     if analysis.contains_key("exclude") {
-        eprintln!(
+        g_mesh_plugin_sdk::log_line!(
             "[{LANGUAGE}] semantic tier: the manifest sets python.analysis.exclude, so the walk's \
              exclude list is not sent"
         );

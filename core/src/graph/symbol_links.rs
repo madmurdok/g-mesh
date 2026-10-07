@@ -1298,7 +1298,7 @@ fn report_untargeted(placeholders: usize, reexports: usize) {
     if placeholders == 0 && reexports == 0 {
         return;
     }
-    eprintln!(
+    crate::log_line!(
         "g-mesh: left {placeholders} pending-symbol placeholder(s) and skipped {reexports} re-export(s) with no \
          placeholder target (an address the plugin sent in a shape core could not read) - unlinked, not guessed"
     );

@@ -119,7 +119,7 @@ fn run(mut ctx: ActivationCtx, triggered: Receiver<()>) {
                 format!("the index build panicked: {what}")
             }
         };
-        eprintln!("g-mesh daemon: {failure} - the next tool call retries");
+        crate::log_line!("g-mesh daemon: {failure} - the next tool call retries");
         ctx.indexing.activation_failed(failure);
     }
 }
@@ -139,7 +139,7 @@ impl ActivationCtx {
             // instead, before the watcher's consumer (below) can start any
             // incremental pass of its own - see the ordering comment in
             // `walk` - and at most once per daemon start.
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: the project was walked but its semantic pass never completed - retrying it"
             );
             semantic::run_with_registry_and_progress(&self.registry, &self.conn, Some(&self.indexing))
@@ -186,7 +186,7 @@ impl ActivationCtx {
             crate::embedding::backfill::run(&self.conn, &self.embedding, &self.indexing)
         }));
         match backfill {
-            Ok(summary) if summary.candidates > 0 => eprintln!(
+            Ok(summary) if summary.candidates > 0 => crate::log_line!(
                 "g-mesh daemon: embedding backfill - {} of {} candidate nodes got a vector, {} from the embedding \
                  cache, {} embedded",
                 summary.cache_hits + summary.embedded,
@@ -195,7 +195,7 @@ impl ActivationCtx {
                 summary.embedded
             ),
             Ok(_) => {}
-            Err(_) => eprintln!(
+            Err(_) => crate::log_line!(
                 "g-mesh daemon: the embedding backfill pass panicked - structural tools are unaffected, \
                  search_code covers only the nodes embedded so far"
             ),
@@ -239,12 +239,12 @@ impl ActivationCtx {
         }));
         for (language, outcome) in &summary.outcomes {
             match outcome {
-                LanguageOutcome::Failed { error } => eprintln!(
+                LanguageOutcome::Failed { error } => crate::log_line!(
                     "g-mesh daemon: {language} failed to index and is left out of the index until \
                      `g-mesh reindex`: {}",
                     crate::languages::error_on_one_line(error)
                 ),
-                LanguageOutcome::PluginAbsent { files } => eprintln!(
+                LanguageOutcome::PluginAbsent { files } => crate::log_line!(
                     "g-mesh daemon: {language} has no plugin installed - {} not indexed",
                     files.map_or_else(|| "its files are".to_string(), |n| format!("{n} file(s)"))
                 ),
@@ -264,12 +264,12 @@ impl ActivationCtx {
         // same reasoning `last_used::touch` applies to a GC scan, applied to
         // the core's own idle timer.
         self.core_activity.request();
-        eprintln!(
+        crate::log_line!(
             "g-mesh daemon: initial index built - {} nodes, {} edges ({} imports linked to their target file)",
             summary.nodes, summary.edges, summary.linked_imports
         );
         if summary.skipped_lines > 0 {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: {} unreadable lines were skipped - the index may be incomplete",
                 summary.skipped_lines
             );

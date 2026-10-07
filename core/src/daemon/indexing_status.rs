@@ -420,7 +420,7 @@ impl IndexingStatus {
         }
         match serde_json::to_string(&self.progress_snapshot()) {
             Ok(json) => super::write_state_file_atomic(&path, &json, "progress file"),
-            Err(err) => eprintln!("g-mesh daemon: failed to serialize indexing progress: {err}"),
+            Err(err) => crate::log_line!("g-mesh daemon: failed to serialize indexing progress: {err}"),
         }
         file.last_write = Some(now);
     }

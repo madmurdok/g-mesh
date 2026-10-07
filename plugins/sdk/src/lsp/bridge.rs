@@ -608,7 +608,7 @@ impl LspBridge {
             };
             if attempts >= MAX_OWED_ATTEMPTS {
                 self.owed.remove(file);
-                eprintln!(
+                crate::log_line!(
                     "[{}] {file}: {attempts} semantic pass(es) did not finish it - no longer re-asked until it \
                      changes",
                     self.language
@@ -632,7 +632,7 @@ impl LspBridge {
     /// be one.
     fn ensure_client(&mut self, deadline: Instant) -> Option<&mut LspClient> {
         if self.client.as_mut().is_some_and(LspClient::gone) {
-            eprintln!("[{}] the language server is gone - starting a new one", self.language);
+            crate::log_line!("[{}] the language server is gone - starting a new one", self.language);
             self.client = None;
         }
         if self.client.is_none() {
@@ -656,7 +656,7 @@ impl LspBridge {
                     ));
                     if missing_binary(&err) {
                         self.unavailable = true;
-                        eprintln!(
+                        crate::log_line!(
                             "[{}] the language server {} could not be started ({err:#}) - this \
                              language's semantic tier is off for the rest of this process's life; \
                              the structural graph is unaffected",
@@ -664,7 +664,7 @@ impl LspBridge {
                             self.config.command.display()
                         );
                     } else {
-                        eprintln!(
+                        crate::log_line!(
                             "[{}] the language server did not come up ({err:#}) - this pass is \
                              incomplete and the next one will try again",
                             self.language
@@ -775,7 +775,7 @@ impl LspBridge {
             let now = Instant::now();
             if now >= until {
                 let waited = now.saturating_duration_since(started);
-                eprintln!(
+                crate::log_line!(
                     "[{language}] the language server was still indexing after {waited:?} - this pass asks \
                      nothing rather than recording its empty answers as real"
                 );
@@ -2202,7 +2202,7 @@ fn run_pass(
         };
         if warming && !warm_up_logged && !queue.is_empty() {
             warm_up_logged = true;
-            eprintln!(
+            crate::log_line!(
                 "[{language}] the server has not answered yet - its first question may take up to {request_budget:?} \
                  (warm-up), the rest {:?}",
                 budgets.request
@@ -2230,11 +2230,13 @@ fn run_pass(
                     // not a failure to write.
                     match client.exit_status(EXIT_GRACE) {
                         Some(status) => {
-                            eprintln!("[{language}] the language server exited during the pass ({status})");
+                            crate::log_line!(
+                                "[{language}] the language server exited during the pass ({status})"
+                            );
                             fail(exited(Some(status)));
                         }
                         None => {
-                            eprintln!("[{language}] could not ask the language server ({err:#})");
+                            crate::log_line!("[{language}] could not ask the language server ({err:#})");
                             fail(format!("could not ask the language server: {err:#}"));
                         }
                     }
@@ -2249,7 +2251,7 @@ fn run_pass(
 
         let now = Instant::now();
         if now >= deadline {
-            eprintln!(
+            crate::log_line!(
                 "[{language}] the semantic pass ran out of its budget with {} question(s) \
                  outstanding and {} unasked",
                 in_flight.len(),
@@ -2336,12 +2338,15 @@ fn run_pass(
                 // the file it was in is not covered - but the pass goes on:
                 // one bad position is not a reason to drop the other nine
                 // thousand answers.
-                eprintln!("[{language}] the server refused a question about {} ({message})", question.file);
+                crate::log_line!(
+                    "[{language}] the server refused a question about {} ({message})",
+                    question.file
+                );
                 fail(format!("the language server refused a question about {} ({message})", question.file));
                 failed_files.insert(question.accounted_to().clone());
             }
             Poll::Closed => {
-                eprintln!(
+                crate::log_line!(
                     "[{language}] the language server exited during the pass - keeping the {} \
                      answer(s) it did give and reporting the pass incomplete",
                     answers.edges.len()
@@ -2374,7 +2379,7 @@ fn run_pass(
                 for id in expired {
                     let Some((question, _)) = in_flight.remove(&id) else { continue };
                     client.cancel(id);
-                    eprintln!(
+                    crate::log_line!(
                         "[{language}] the server did not answer a question about {} within {:?}{}",
                         question.file,
                         request_budget,
@@ -2771,9 +2776,10 @@ impl SemanticEngine for LspBridge {
         let deadline = started + self.pass_budget(whole_project, scope.len());
         let plan = questions(index, &scope, &self.config, &self.budgets);
         if plan.unanswerable > 0 {
-            eprintln!(
+            crate::log_line!(
                 "[{}] {} open site(s) of a kind this bridge does not answer were skipped",
-                self.language, plan.unanswerable
+                self.language,
+                plan.unanswerable
             );
         }
         if plan.asking.is_empty() {
@@ -2909,7 +2915,7 @@ impl SemanticEngine for LspBridge {
             }
         }
 
-        eprintln!(
+        crate::log_line!(
             "[{}] semantic pass: {} file(s), {} node(s)/{} edge(s) upserted, {} edge(s) retracted, \
              in {:?}{}",
             self.language,

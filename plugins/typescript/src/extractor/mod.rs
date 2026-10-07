@@ -74,7 +74,7 @@ impl Extractor for TypeScriptExtractor {
     fn load_project(&self, root: &std::path::Path) -> anyhow::Result<TsProject> {
         let project = TsProject::load(root)?;
         for note in &project.notes {
-            eprintln!("[{LANGUAGE}] project model: {note}");
+            g_mesh_plugin_sdk::log_line!("[{LANGUAGE}] project model: {note}");
         }
         Ok(project)
     }

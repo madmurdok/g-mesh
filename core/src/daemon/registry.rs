@@ -627,7 +627,7 @@ impl PluginRegistry {
                     matches!(outcome, LanguageOutcome::Failed { .. }).then_some(language)
                 }))
             }
-            Err(err) => eprintln!(
+            Err(err) => crate::log_line!(
                 "g-mesh daemon: could not read the recorded language outcomes - failed languages are not \
                  excluded from incremental updates until the next walk: {err:#}"
             ),
@@ -968,7 +968,7 @@ impl PluginRegistry {
             let running = self.supervisors.lock().unwrap().get(&language).and_then(SupervisorSlot::running);
             let Some(supervisor) = running else { continue };
             if let Err(err) = supervisor.files_created(&file_paths) {
-                eprintln!(
+                crate::log_line!(
                     "g-mesh daemon: could not tell the {language} plugin about {} created files: {err:#}",
                     file_paths.len()
                 );
@@ -1006,7 +1006,7 @@ impl PluginRegistry {
     pub fn file_changed(&self, conn: &IndexStore, file_path: String) {
         if self.language_for(&file_path).is_none() {
             if let Some(notice) = self.unroutable_notice(&file_path) {
-                eprintln!("{notice}");
+                crate::log_line!("{notice}");
             }
             return;
         }
@@ -1022,7 +1022,7 @@ impl PluginRegistry {
 
         match self.get_or_spawn(&language) {
             Ok(supervisor) => supervisor.file_changed(conn, file_path),
-            Err(err) => eprintln!(
+            Err(err) => crate::log_line!(
                 "g-mesh daemon: could not start the {language} plugin for {file_path}: {err:#} - \
                  the change was not indexed"
             ),
@@ -1040,14 +1040,14 @@ impl PluginRegistry {
             Ok(supervisor) => {
                 if let Err(err) = crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
                 {
-                    eprintln!(
+                    crate::log_line!(
                         "g-mesh daemon: failed to reindex the {language} workspace after \
                          {changed_file} changed: {err:#} - {language}'s previous graph keeps \
                          serving, and the reindex runs again on the next daemon start"
                     );
                 }
             }
-            Err(err) => eprintln!(
+            Err(err) => crate::log_line!(
                 "g-mesh daemon: could not start the {language} plugin to reindex its workspace \
                  after {changed_file} changed: {err:#}"
             ),
@@ -1271,7 +1271,7 @@ impl PluginRegistry {
         for supervisor in self.active_supervisors() {
             match supervisor.replay_pending(conn) {
                 Ok(count) => replayed += count,
-                Err(err) => eprintln!(
+                Err(err) => crate::log_line!(
                     "g-mesh daemon: could not replay the changes queued while the {} plugin \
                      slept: {err:#}",
                     supervisor.language()

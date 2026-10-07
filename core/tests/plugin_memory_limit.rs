@@ -91,6 +91,9 @@
 //! `core/src/daemon/mod.rs`'s own `#[cfg(test)]` suite and
 //! `core/src/config/mod.rs`'s round-trip tests already cover that wiring.
 
+// Test diagnostics to the harness, not a daemon log line (GM-520).
+#![allow(clippy::disallowed_macros)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Child, Stdio};

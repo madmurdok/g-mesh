@@ -939,6 +939,8 @@ const SEQUENCE_STEPS: usize = 250;
 /// model of the plugin's own view says they should be - on connections
 /// with foreign keys both on and off.
 #[test]
+// Test diagnostic to the harness, not a daemon log line (GM-520).
+#[allow(clippy::disallowed_macros)]
 fn membership_invariants_hold_after_every_diff_of_a_random_sequence() {
     let (mut diffs, mut materialized, mut collected) = (0usize, 0usize, 0usize);
     for seed in seeds(&SEQUENCE_SEEDS) {

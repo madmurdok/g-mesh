@@ -262,7 +262,7 @@ impl RerankSettings {
     fn from_environment() -> Self {
         let enabled = !env_disables_rerank(std::env::var_os(RERANK_ENV).as_deref())
             && crate::config::read_global_config().map(|config| config.rerank.enabled).unwrap_or_else(|err| {
-                eprintln!("g-mesh: failed to read the global config ({err:#}) - the rerank keeps its default (on)");
+                crate::log_line!("g-mesh: failed to read the global config ({err:#}) - the rerank keeps its default (on)");
                 true
             });
         Self { enabled, model_dir: default_rerank_model_dir() }
@@ -295,7 +295,7 @@ impl Reranker {
             settings: Box::new(RerankSettings::from_environment),
             loader: Box::new(|dir| Ok(Box::new(CrossEncoder::load(dir)?) as Box<dyn Scorer>)),
             scorer: OnceLock::new(),
-            log: Box::new(|line| eprintln!("{line}")),
+            log: Box::new(|line| crate::log_line!("{line}")),
         }
     }
 
