@@ -9,7 +9,22 @@
 //! The language: `fn NAME` declares a function, `call NAME` calls one
 //! declared in the same file, and `use FILE NAME` references a name from
 //! another file (a `pending_symbol` placeholder, upgraded to a resolved
-//! cross-file edge by the semantic pass).
+//! cross-file edge by the semantic pass). `import FILE` imports a whole file:
+//! an `IMPORTS` edge from the `File` node onto a `resolved_module`
+//! placeholder addressed at FILE when FILE is in the plugin's file set, or
+//! onto an `external_module` node when it is not - the way the TS and Python
+//! plugins resolve a specifier.
+//!
+//! # The file set, and `filesCreated`
+//!
+//! The control-plane process builds its file set from a walk of the project
+//! *before* its handshake (as an SDK plugin builds its project model), then
+//! keeps it current from what it is told: a `fileChanged` sets its own file's
+//! presence from the disk, and a `filesCreated` - with or without an `id`,
+//! acknowledged only when it has one - adds every listed path. Each
+//! `filesCreated` is also appended, one line of space-separated paths, to
+//! `$G_MESH_PLUGIN_CHECK_MARKER_DIR/notifications`, so a test can see what
+//! the kit sent.
 //!
 //! Lengths and columns are counted in UTF-16 code units, as the Node fake
 //! this replaces counted them.
@@ -36,11 +51,13 @@
 //! - `bulk-hang`: the bulk walk never finishes.
 //! - `bulk-dies` / `bulk-dies-silently`: the bulk walk exits 3 having written
 //!   nothing to stdout - with a line on stderr, or without one.
+//! - `files-created-ignored`: a `filesCreated` is logged (and acknowledged
+//!   when it carries an `id`) but adds nothing to the file set.
 //!
 //! The semantic engine marker is a line with this process's pid appended to
 //! `$G_MESH_PLUGIN_CHECK_MARKER_DIR/semantic-engine-started`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -56,6 +73,7 @@ const LANGUAGE: &str = "fake";
 const PLUGIN_VERSION: &str = "0.0.0-fake";
 const MARKER_DIR_ENV: &str = "G_MESH_PLUGIN_CHECK_MARKER_DIR";
 const ENGINE_MARKER: &str = "semantic-engine-started";
+const NOTIFICATIONS_LOG: &str = "notifications";
 
 /// Which walk an extraction is for: several defects exist in only one.
 #[derive(Clone, Copy, PartialEq)]
@@ -134,7 +152,9 @@ fn declaration(line: &str) -> Option<&str> {
     statement(line, "fn", 1).map(|w| w[0]).filter(|name| is_word(name))
 }
 
-fn extract(defect: &str, file_path: &str, text: &str, mode: Mode) -> Rows {
+/// `extract` stays pure: `present` is the file set an `import` resolves
+/// against, passed in by whichever walk owns it.
+fn extract(defect: &str, file_path: &str, text: &str, mode: Mode, present: &BTreeSet<String>) -> Rows {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let lines: Vec<&str> = text.split('\n').collect();
@@ -196,6 +216,20 @@ fn extract(defect: &str, file_path: &str, text: &str, mode: Mode) -> Rows {
             if defect == "stream-order-cross-file" {
                 edges.push(edge(&current, &format!("{target}#fn:{name}"), "REFERENCES", false));
             }
+        } else if let Some(target) = statement(line, "import", 1).map(|w| w[0]) {
+            let id = format!("{file_path}#import:{target}");
+            let mut placeholder =
+                node(&id, "Module", target, target, file_path, [row, column_of(line, "import"), row, end]);
+            placeholder.insert("visibility".into(), json!("file"));
+            if present.contains(target) {
+                placeholder.insert("nativeKind".into(), json!("resolved_module"));
+                placeholder
+                    .insert("target".into(), json!({ "scope": { "file": target }, "key": { "name": "*" } }));
+            } else {
+                placeholder.insert("nativeKind".into(), json!("external_module"));
+            }
+            nodes.push(placeholder);
+            edges.push(edge(&file_id, &id, "IMPORTS", false));
         }
     }
 
@@ -271,23 +305,42 @@ pub(super) fn run(defect: &str, bulk_root: Option<&Path>, root: Option<&Path>) {
         start_semantic_engine(&mut engine_started);
     }
 
+    // Before the handshake, as an SDK plugin builds its project model: a
+    // file written after this is unknown until a request says otherwise.
+    let mut present: BTreeSet<String> = walk_all(&root).into_iter().collect();
+
     let out: Out = std::sync::Arc::new(std::sync::Mutex::new(io::stdout()));
     handshake_as(&out, LANGUAGE, PLUGIN_VERSION);
     let mut cache: HashMap<String, Rows> = HashMap::new();
     serve(|message| {
-        let id = match message.get("id") {
-            Some(id) if !id.is_null() => id.clone(),
-            _ => return,
-        };
+        let id = message.get("id").filter(|id| !id.is_null()).cloned();
         let method = method_of(&message);
         let params = message.get("params").cloned().unwrap_or(Value::Null);
+        if method == "filesCreated" {
+            let paths: Vec<String> = params
+                .get("filePaths")
+                .and_then(Value::as_array)
+                .map(|paths| paths.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            if let Some(dir) = std::env::var_os(MARKER_DIR_ENV).filter(|dir| !dir.is_empty()) {
+                append(&Path::new(&dir).join(NOTIFICATIONS_LOG), &paths.join(" "));
+            }
+            if defect != "files-created-ignored" {
+                present.extend(paths);
+            }
+            if let Some(id) = id {
+                write(&out, &json!({ "jsonrpc": "2.0", "id": id, "result": { "acknowledged": true } }));
+            }
+            return;
+        }
+        let Some(id) = id else { return };
         let result = match method.as_str() {
             "fileChanged" => {
                 if defect == "hang" {
                     return;
                 }
                 let file_path = params.get("filePath").and_then(Value::as_str).unwrap_or_default();
-                file_changed(defect, &root, &mut cache, file_path)
+                file_changed(defect, &root, &mut cache, &mut present, file_path)
             }
             "semanticPass" => {
                 start_semantic_engine(&mut engine_started);
@@ -296,7 +349,7 @@ pub(super) fn run(defect: &str, bulk_root: Option<&Path>, root: Option<&Path>) {
                     .and_then(Value::as_array)
                     .map(|paths| paths.iter().filter_map(Value::as_str).map(str::to_string).collect())
                     .unwrap_or_default();
-                semantic_pass(defect, &root, paths)
+                semantic_pass(defect, &root, &present, paths)
             }
             _ => json!({ "acknowledged": true }),
         };
@@ -324,8 +377,10 @@ fn bulk(defect: &str, root: &Path) -> i32 {
     let mut out = |value: &Value| {
         let _ = writeln!(stdout, "{value}");
     };
-    for file_path in walk_all(root) {
-        let rows = extract(defect, &file_path, &read(root, &file_path), Mode::Bulk);
+    let files = walk_all(root);
+    let present: BTreeSet<String> = files.iter().cloned().collect();
+    for file_path in files {
+        let rows = extract(defect, &file_path, &read(root, &file_path), Mode::Bulk, &present);
         if defect == "stream-order-late" {
             // The File node, then every edge, then the rest of the nodes.
             out(&rows.nodes[0]);
@@ -344,8 +399,20 @@ fn id_of(item: &Value) -> &str {
     item.get("id").and_then(Value::as_str).unwrap_or_default()
 }
 
-fn file_changed(defect: &str, root: &Path, cache: &mut HashMap<String, Rows>, file_path: &str) -> Value {
-    let next = extract(defect, file_path, &read(root, file_path), Mode::Control);
+fn file_changed(
+    defect: &str,
+    root: &Path,
+    cache: &mut HashMap<String, Rows>,
+    present: &mut BTreeSet<String>,
+    file_path: &str,
+) -> Value {
+    // The file's own presence, from the disk, before it is extracted.
+    if fs::read(root.join(file_path)).is_ok() {
+        present.insert(file_path.to_string());
+    } else {
+        present.remove(file_path);
+    }
+    let next = extract(defect, file_path, &read(root, file_path), Mode::Control, present);
     let previous = cache.remove(file_path).unwrap_or(Rows { nodes: Vec::new(), edges: Vec::new() });
     let mut upserts = [Vec::new(), Vec::new()];
     let mut deletes = [Vec::new(), Vec::new()];
@@ -387,7 +454,7 @@ fn file_changed(defect: &str, root: &Path, cache: &mut HashMap<String, Rows>, fi
         delete_node_ids.push(json!("never-emitted-node"));
     }
     if !empty && defect == "diff-other-file" && file_path != "b.fk" {
-        let other = extract(defect, "b.fk", &read(root, "b.fk"), Mode::Control);
+        let other = extract(defect, "b.fk", &read(root, "b.fk"), Mode::Control, present);
         upsert_nodes.push(other.nodes[0].clone());
     }
     json!({
@@ -405,11 +472,11 @@ fn placeholder_address(to_id: &str) -> Option<(&str, &str)> {
     (!target.is_empty() && is_word(name)).then_some((target, name))
 }
 
-fn semantic_pass(defect: &str, root: &Path, file_paths: Vec<String>) -> Value {
+fn semantic_pass(defect: &str, root: &Path, present: &BTreeSet<String>, file_paths: Vec<String>) -> Value {
     let files = if file_paths.is_empty() { walk_all(root) } else { file_paths };
     let mut upsert_edges = Vec::new();
     for file_path in files {
-        let rows = extract(defect, &file_path, &read(root, &file_path), Mode::Control);
+        let rows = extract(defect, &file_path, &read(root, &file_path), Mode::Control, present);
         for e in &rows.edges {
             let to_id = e.get("toId").and_then(Value::as_str).unwrap_or_default();
             let Some((target, name)) = placeholder_address(to_id) else { continue };

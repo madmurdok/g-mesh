@@ -109,6 +109,7 @@ pub struct PluginCheck {
     entry_points: Vec<String>,
     watch_files: Vec<String>,
     semantic_pass: bool,
+    files_created: bool,
     receiver_calls: &'static str,
     receiver_calls_structural: &'static str,
     expect: Option<PathBuf>,
@@ -141,6 +142,7 @@ impl PluginCheck {
             entry_points: Vec::new(),
             watch_files: Vec::new(),
             semantic_pass: false,
+            files_created: false,
             receiver_calls: "unresolved",
             receiver_calls_structural: "unresolved",
             expect: None,
@@ -181,6 +183,14 @@ impl PluginCheck {
     /// sent one or the marker appears at all.
     pub fn semantic_pass(mut self, semantic_pass: bool) -> Self {
         self.semantic_pass = semantic_pass;
+        self
+    }
+
+    /// `[plugin.capabilities] files_created`. `true` puts the run under
+    /// `capabilities.files-created-resolves`, which needs a `[files_created]`
+    /// pair in the [`PluginCheck::expect`] file to run rather than skip.
+    pub fn files_created(mut self, files_created: bool) -> Self {
+        self.files_created = files_created;
         self
     }
 
@@ -319,6 +329,7 @@ impl PluginCheck {
              extensions = {}\n\n\
              [plugin.capabilities]\n\
              semantic_pass = {}\n\
+             files_created = {}\n\
              receiver_calls = {:?}\n\
              receiver_calls_structural = {:?}\n\n\
              [plugin.workspace]\n\
@@ -331,6 +342,7 @@ impl PluginCheck {
             plugin_binary.display().to_string(),
             list(&self.extensions),
             self.semantic_pass,
+            self.files_created,
             self.receiver_calls,
             self.receiver_calls_structural,
             list(&self.watch_files),

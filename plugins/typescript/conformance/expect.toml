@@ -452,3 +452,22 @@ expect = ["src/inherit/derived.ts:Child#viaThis", "src/inherit/derived.ts:Other#
 # Decision 12: two rows in one file.
 files = ["src/inherit/derived.ts:2"]
 tier = "semantic"
+
+# GM-516: `capabilities.files-created-resolves` (expectations' decision 14).
+# Neither file exists in ./project: the kit writes both mid-session, sends
+# one `filesCreated` listing them, then routes the importer's `fileChanged`
+# before the target's - so the relative import below resolves only if the
+# plugin added the target to its file set when told it was created.
+[files_created]
+target = "src/gmCheckTarget.ts"
+target_text = """
+export function created(): number {
+  return 1;
+}
+"""
+importer = "src/gmCheckImporter.ts"
+importer_text = """
+import { created } from "./gmCheckTarget";
+
+export const n = created();
+"""

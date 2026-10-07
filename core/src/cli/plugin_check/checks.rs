@@ -87,6 +87,18 @@
 //! - **`capabilities.semantic-engine-lazy`** (only for `semantic_pass =
 //!   true`) - the semantic-engine marker (see `session::MARKER_DIR_ENV`) did
 //!   not exist yet when the first `semanticPass` frame was written.
+//! - **`capabilities.files-created-resolves`** (only for `files_created =
+//!   true`, and only with an `--expect` file naming a `[files_created]`
+//!   pair - `expectations`' decision 14) - a target file and a file
+//!   importing it, created in one batch, announced by one id-less
+//!   `filesCreated` and routed importer first on a fresh plugin process and
+//!   a fresh index (`session::run_files_created_session`), end with an
+//!   `IMPORTS` edge from the importer onto a node of the target file, or
+//!   onto a core-owned container the target file is a member of (the
+//!   Python plugin addresses a module import at its container, the dotted
+//!   module key). A plugin that ignores the notification resolves the
+//!   import against a file set without the target, and the edge lands on an
+//!   `external_module` instead (GM-516).
 //!
 //! # Why `semanticPass` diffs are held to fewer rules
 //!
@@ -108,9 +120,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::cli::plugin_check::expectations::FilesCreatedPair;
 use crate::cli::plugin_check::report::{CheckResult, Outcome};
 use crate::cli::plugin_check::session::{
-    BulkLine, BulkRun, EditTarget, Exchange, Method, Session, StoredRange,
+    BulkLine, BulkRun, EditTarget, Exchange, FilesCreatedRun, Method, Session, StoredRange,
 };
 use crate::daemon::manifest::PluginManifest;
 use crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND;
@@ -146,6 +159,35 @@ pub(crate) struct RunData<'a> {
     /// Setup and session failures, in the order they happened.
     pub failures: Vec<String>,
     pub marker_exists_at_end: bool,
+    pub files_created: FilesCreatedEvidence<'a>,
+}
+
+/// Where the `[files_created]` pair came from, as `mod.rs` found it.
+#[derive(Clone, Copy)]
+pub(crate) enum FilesCreatedConfig<'a> {
+    /// No `--expect`, or an expectations file without the table.
+    Absent,
+    /// The expectations file did not read or parse.
+    Unparsed,
+    Pair(&'a FilesCreatedPair),
+}
+
+/// `capabilities.files-created-resolves`' evidence.
+pub(crate) struct FilesCreatedEvidence<'a> {
+    pub config: FilesCreatedConfig<'a>,
+    /// `session::files_created_pair_findings` - empty when the pair is
+    /// runnable (or there is none).
+    pub pair_findings: Vec<String>,
+    /// `None` when the session was not run.
+    pub run: Option<&'a FilesCreatedRun>,
+}
+
+#[cfg(test)]
+impl FilesCreatedEvidence<'_> {
+    /// No pair, nothing run - what every plugin without `--expect` gets.
+    pub(crate) fn absent() -> Self {
+        Self { config: FilesCreatedConfig::Absent, pair_findings: Vec::new(), run: None }
+    }
 }
 
 /// What a node needs to be to be judged: which file it belongs to, and what
@@ -238,6 +280,7 @@ pub(crate) fn evaluate(run: &RunData) -> Vec<CheckResult> {
         diff_stays_in_file(run, &walk),
     ];
     results.extend(capabilities(run));
+    results.push(files_created_resolves(run));
     results
 }
 
@@ -842,6 +885,93 @@ fn capabilities(run: &RunData) -> [CheckResult; 2] {
     [result(UNDECLARED, not_applicable), result(LAZY, lazy)]
 }
 
+/// `capabilities.files-created-resolves` - see the module doc. The outcome
+/// table, in evaluation order: not declared, not configured, the main run
+/// not reached, an invalid pair, the files-created session failed, then the
+/// verdict on the importer's `IMPORTS` rows.
+fn files_created_resolves(run: &RunData) -> CheckResult {
+    const ID: &str = "capabilities.files-created-resolves";
+    if !run.manifest.capabilities.files_created {
+        return result(
+            ID,
+            Outcome::Skip("not applicable: the manifest declares files_created = false".to_string()),
+        );
+    }
+    let evidence = &run.files_created;
+    let pair = match evidence.config {
+        FilesCreatedConfig::Absent => {
+            return result(
+                ID,
+                Outcome::Skip(
+                    "not configured: the manifest declares files_created but no expectations file names a \
+                     [files_created] pair - see `expectations`' decision 14"
+                        .to_string(),
+                ),
+            );
+        }
+        FilesCreatedConfig::Unparsed => {
+            return result(
+                ID,
+                Outcome::Skip(
+                    "not configured: the expectations file did not parse (see `expectations.file`)"
+                        .to_string(),
+                ),
+            );
+        }
+        FilesCreatedConfig::Pair(pair) => pair,
+    };
+    if !run.bulk[0].complete() {
+        return result(ID, Outcome::Skip(BULK_INCOMPLETE.to_string()));
+    }
+    match run.session {
+        None => return result(ID, not_reached("the control-plane session started")),
+        Some(session) if session.failure.is_some() => {
+            return result(ID, not_reached("the files-created session could run"));
+        }
+        Some(_) => {}
+    }
+    if !evidence.pair_findings.is_empty() {
+        return result(ID, Outcome::Fail(evidence.pair_findings.clone()));
+    }
+    let rows = match evidence.run {
+        Some(FilesCreatedRun { session, import_rows: Some(rows) }) if session.failure.is_none() => rows,
+        _ => {
+            return result(
+                ID,
+                Outcome::Skip("not reached: the files-created session failed (see `session`)".to_string()),
+            );
+        }
+    };
+    if rows.iter().any(|row| row.to_file == pair.target || row.container_member_files.contains(&pair.target))
+    {
+        return result(ID, Outcome::Pass);
+    }
+    let mut findings = vec![format!(
+        "{} and {} were created in one batch and announced by filesCreated, importer routed first, but no \
+         IMPORTS edge from {} lands on a node of {} or on a container it is a member of",
+        pair.importer, pair.target, pair.importer, pair.target
+    )];
+    if rows.is_empty() {
+        findings.push(format!("{} has no IMPORTS edge at all", pair.importer));
+    }
+    for row in rows {
+        let members = if row.container_member_files.is_empty() {
+            String::new()
+        } else {
+            format!(", a container of {}", row.container_member_files.join(", "))
+        };
+        findings.push(format!(
+            "IMPORTS lands on {} {:?} in {:?}{}{members} (resolved: {})",
+            row.to_kind,
+            row.to_name,
+            row.to_file,
+            row.to_native_kind.as_deref().map(|k| format!(" nativeKind {k}")).unwrap_or_default(),
+            row.resolved
+        ));
+    }
+    result(ID, Outcome::Fail(findings))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -922,6 +1052,7 @@ mod tests {
             session: None,
             failures: Vec::new(),
             marker_exists_at_end: false,
+            files_created: FilesCreatedEvidence::absent(),
         })
     }
 
@@ -998,6 +1129,7 @@ mod tests {
             session: Some(&session),
             failures: Vec::new(),
             marker_exists_at_end: false,
+            files_created: FilesCreatedEvidence::absent(),
         };
         let results = evaluate(&data);
         assert!(matches!(outcome_of(&results, "capabilities.semantic-pass-undeclared"), Outcome::Fail(_)));
@@ -1017,6 +1149,7 @@ mod tests {
             session: Some(&session),
             failures: Vec::new(),
             marker_exists_at_end,
+            files_created: FilesCreatedEvidence::absent(),
         };
         let lazy = |data: RunData| outcome_of(&evaluate(&data), "capabilities.semantic-engine-lazy");
         assert!(matches!(lazy(data(false)), Outcome::Skip(reason) if reason.starts_with("not instrumented")));
@@ -1105,6 +1238,7 @@ mod tests {
                 session: Some(&session),
                 failures: Vec::new(),
                 marker_exists_at_end: false,
+                files_created: FilesCreatedEvidence::absent(),
             };
             outcome_of(&evaluate(&data), "id-stability.declaration-edit-applies")
         };

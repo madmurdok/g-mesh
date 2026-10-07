@@ -81,7 +81,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// Every check id the kit reports, in report order - asserted in full on
 /// every run, so a check silently dropping out of the report fails a test
 /// rather than passing every "only X fails" assertion vacuously.
-const ALL_CHECKS: [&str; 15] = [
+const ALL_CHECKS: [&str; 16] = [
     "session",
     "shape",
     "stream-order",
@@ -97,7 +97,15 @@ const ALL_CHECKS: [&str; 15] = [
     "ownership.diff-stays-in-file",
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
+    "capabilities.files-created-resolves",
 ];
+
+/// The checks that report `SKIP` on a plugin declaring `semantic_pass =
+/// true` run without an `--expect` pair: the undeclared-pass check does not
+/// apply, and `files-created-resolves` has no `[files_created]` pair to run
+/// (or the manifest does not declare the capability).
+const SKIPPED_WITHOUT_PAIR: [&str; 2] =
+    ["capabilities.semantic-pass-undeclared", "capabilities.files-created-resolves"];
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin_check")
@@ -153,6 +161,13 @@ struct FakePlugin {
 /// `plugin.toml`, since `read_manifest` requires the directory to be named
 /// after the language.
 fn install_fake(defect: &str, semantic_pass: bool) -> FakePlugin {
+    install_fake_with(defect, semantic_pass, false)
+}
+
+/// [`install_fake`] with the manifest's `files_created` capability switched
+/// as given - GM-516's `capabilities.files-created-resolves`.
+#[allow(dead_code)] // GM-516: its tests (the next slice) are the callers.
+fn install_fake_with(defect: &str, semantic_pass: bool, files_created: bool) -> FakePlugin {
     let binary = Path::new(BIN)
         .parent()
         .expect("the g-mesh binary has a directory")
@@ -169,7 +184,7 @@ fn install_fake(defect: &str, semantic_pass: bool) -> FakePlugin {
              [plugin.spawn]\ncommand = \"${{G_MESH_BIN_DIR}}/{FAKE_PLUGIN_BIN}\"\n\
              args = [\"--language\", \"fake\", \"--plugin-version\", \"0.0.0-fake\", \"--toy\", \"{defect}\"]\n\n\
              [plugin.languages]\nextensions = [\".fk\"]\n\n\
-             [plugin.capabilities]\nsemantic_pass = {semantic_pass}\n"
+             [plugin.capabilities]\nsemantic_pass = {semantic_pass}\nfiles_created = {files_created}\n"
         ),
     )
     .unwrap();
@@ -277,7 +292,7 @@ fn the_conformant_fake_passes_every_check() {
     let run = run_check(&fake.dir, &fixture, &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
+        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     assert!(!run.stdout.contains("WARN"), "a v2-speaking plugin gets no legacy warning:\n{}", run.stdout);
@@ -562,7 +577,7 @@ fn the_typescript_plugin_passes_on_a_small_typescript_fixture() {
     for id in ALL_CHECKS {
         // The shipped manifest declares `semantic_pass = true`, so the
         // undeclared-pass check is the one that does not apply.
-        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
+        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     // GM-275: the TS plugin speaks wire v2 now, so there is nothing left for
@@ -588,7 +603,7 @@ fn the_go_plugin_passes_on_its_own_fixture() {
     let run = run_check(&go_plugin_dir(), &go_conformance_project(), &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
+        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     assert!(!run.stdout.contains("WARN"), "{}", run.stdout);

@@ -69,17 +69,18 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use super::checks::is_placeholder;
+use super::expectations::FilesCreatedPair;
 use crate::daemon::bulk_index::{self, WalkContext, BULK_INDEX_FLAG};
 use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
 use crate::paths;
 use crate::protocol::handshake;
-use crate::protocol::jsonrpc::{read_frame, read_message_with_timeout};
+use crate::protocol::jsonrpc::{read_frame, read_message_with_timeout, write_message};
 use crate::protocol::ndjson::BulkItem;
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, Handshake, NodeKind, RequestId,
-    WireNode,
+    WireNode, JSONRPC_VERSION,
 };
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -744,6 +745,227 @@ pub(crate) fn choose_edit_target(
     })
 }
 
+// --- filesCreated -------------------------------------------------------------
+
+/// One `IMPORTS` edge leaving a node of the importer, and where it lands in
+/// the linked index - `capabilities.files-created-resolves`' evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportRow {
+    pub to_file: String,
+    pub to_kind: String,
+    pub to_name: String,
+    pub to_native_kind: Option<String>,
+    pub resolved: bool,
+    /// When the edge lands on a core-owned container (a Python module, a Go
+    /// package), the files of that container's members - empty otherwise.
+    pub container_member_files: Vec<String>,
+}
+
+/// Every `IMPORTS` edge whose `fromId` is a node of `importer`, with its
+/// landing node, as the linked index holds them - and, for a landing node
+/// that is a core-owned container, the files its members live in (the
+/// container's `DEFINES` edges, which core alone writes).
+pub(crate) fn import_rows(store: &IndexStore, importer: &str) -> Result<Vec<ImportRow>> {
+    let conn = store.read();
+    let mut statement = conn.prepare(
+        "SELECT t.filePath, t.kind, t.name, t.nativeKind, e.resolved, \
+                (SELECT group_concat(DISTINCT m.filePath) FROM containers c \
+                   JOIN edges d ON d.fromId = c.nodeId AND d.kind = 'DEFINES' \
+                   JOIN nodes m ON m.id = d.toId \
+                 WHERE c.nodeId = t.id) \
+         FROM edges e JOIN nodes f ON f.id = e.fromId JOIN nodes t ON t.id = e.toId \
+         WHERE e.kind = 'IMPORTS' AND f.filePath = ?1 \
+         ORDER BY t.filePath, t.name",
+    )?;
+    let rows = statement
+        .query_map([importer], |row| {
+            let members: Option<String> = row.get(5)?;
+            Ok(ImportRow {
+                to_file: row.get(0)?,
+                to_kind: row.get(1)?,
+                to_name: row.get(2)?,
+                to_native_kind: row.get(3)?,
+                resolved: row.get::<_, i64>(4)? != 0,
+                container_member_files: members
+                    .map(|members| members.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Why `pair` cannot be run against `workspace`, one finding per violation -
+/// empty when it can. Checked before anything is written: a pair naming an
+/// existing fixture file would overwrite it, and one whose extension the
+/// manifest does not claim would never reach the plugin.
+pub(crate) fn files_created_pair_findings(
+    manifest: &PluginManifest,
+    workspace: &Path,
+    pair: &FilesCreatedPair,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (field, path) in [("target", &pair.target), ("importer", &pair.importer)] {
+        let relative = Path::new(path.as_str());
+        let escapes = path.is_empty()
+            || relative.is_absolute()
+            || relative.components().any(|c| !matches!(c, std::path::Component::Normal(_)));
+        if escapes {
+            findings.push(format!(
+                "[files_created] {field} = {path:?} is not a plain workspace-relative path (no `..`, `.`, or root)"
+            ));
+            continue;
+        }
+        if workspace.join(relative).exists() {
+            findings.push(format!(
+                "[files_created] {field} = {path:?} already exists in the fixture - the pair must name new files"
+            ));
+        }
+        if !claims_extension(manifest, path) {
+            findings.push(format!(
+                "[files_created] {field} = {path:?} has none of the manifest's extensions ({})",
+                manifest.extensions.join(", ")
+            ));
+        }
+    }
+    if pair.target == pair.importer {
+        findings.push(format!("[files_created] target and importer are the same path ({:?})", pair.target));
+    }
+    findings
+}
+
+/// What [`run_files_created_session`] observed. `session.failure` set means
+/// the run did not reach its verdict (spawn, handshake, timeout, apply error,
+/// a write or index read failing); `import_rows` is then `None`.
+pub(crate) struct FilesCreatedRun {
+    pub session: Session,
+    pub import_rows: Option<Vec<ImportRow>>,
+}
+
+/// The pair's files on disk, removed again however the run ends - the
+/// expectations evaluated after it must see the fixture without them.
+struct CreatedFiles {
+    files: Vec<PathBuf>,
+    /// Directories this run created, innermost first.
+    dirs: Vec<PathBuf>,
+}
+
+impl CreatedFiles {
+    fn write(&mut self, path: &Path, contents: &str) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            let mut missing = Vec::new();
+            let mut dir = parent;
+            while !dir.exists() {
+                missing.push(dir.to_path_buf());
+                match dir.parent() {
+                    Some(up) => dir = up,
+                    None => break,
+                }
+            }
+            fs::create_dir_all(parent)?;
+            self.dirs.extend(missing);
+        }
+        self.files.push(path.to_path_buf());
+        fs::write(path, contents)
+    }
+}
+
+impl Drop for CreatedFiles {
+    fn drop(&mut self) {
+        for file in &self.files {
+            let _ = fs::remove_file(file);
+        }
+        for dir in &self.dirs {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
+/// Drives `capabilities.files-created-resolves`' session: a fresh plugin
+/// process and a fresh index, structural gate closed throughout.
+///
+/// 1. Spawn and handshake.
+/// 2. `fileChanged` on `warm_file` - its answer proves the plugin processed a
+///    request after building its project model, so the pair written next is
+///    new to that model (without it an SDK plugin still in `load_project`
+///    would see the files on disk, and the check would pass with the
+///    notification ignored).
+/// 3. Write `pair.target` and `pair.importer`.
+/// 4. `filesCreated { filePaths: [importer, target] }`, with no `id`.
+/// 5. `fileChanged` on the importer, then on the target - importer first,
+///    which is the window the capability exists for.
+/// 6. Read the importer's `IMPORTS` rows ([`import_rows`]), then remove both
+///    files and finish the process.
+pub(crate) fn run_files_created_session(
+    manifest: &PluginManifest,
+    scratch: &Scratch,
+    pair: &FilesCreatedPair,
+    warm_file: &str,
+    timeouts: RoundTripTimeouts,
+) -> FilesCreatedRun {
+    let conn = match open_index(manifest) {
+        Ok(conn) => conn,
+        Err(err) => {
+            return FilesCreatedRun {
+                session: Session { failure: Some(format!("{err:#}")), ..Session::default() },
+                import_rows: None,
+            };
+        }
+    };
+    let mut driver = match Driver::spawn(manifest, scratch, &conn, timeouts) {
+        Ok(driver) => driver,
+        Err(session) => return FilesCreatedRun { session: *session, import_rows: None },
+    };
+    let structural_only = Operation::FileChanged { semantic_pass_capable: false };
+    let workspace = scratch.workspace();
+    let mut created = CreatedFiles { files: Vec::new(), dirs: Vec::new() };
+
+    let finish = |driver: Driver, import_rows| FilesCreatedRun { session: driver.finish(), import_rows };
+
+    if !driver.step(
+        &format!("files-created warm-up: fileChanged ({warm_file} unmodified)"),
+        warm_file,
+        &structural_only,
+    ) {
+        return finish(driver, None);
+    }
+    for (path, text) in [(&pair.target, &pair.target_text), (&pair.importer, &pair.importer_text)] {
+        let on_disk = workspace.join(path);
+        if let Err(err) = created.write(&on_disk, text) {
+            driver.session.failure =
+                Some(format!("files-created: failed to write {}: {err}", on_disk.display()));
+            return finish(driver, None);
+        }
+    }
+    let label = format!("files-created: filesCreated ({}, {})", pair.importer, pair.target);
+    let message =
+        ControlMessage::FilesCreated { file_paths: vec![pair.importer.clone(), pair.target.clone()] };
+    if !driver.notify(&label, message) {
+        return finish(driver, None);
+    }
+    for (role, path) in [("importer", &pair.importer), ("target", &pair.target)] {
+        if !driver.step(
+            &format!("files-created: fileChanged ({path}, the new {role})"),
+            path,
+            &structural_only,
+        ) {
+            return finish(driver, None);
+        }
+    }
+    let rows = match import_rows(&conn, &pair.importer) {
+        Ok(rows) => rows,
+        Err(err) => {
+            driver.session.failure = Some(format!(
+                "files-created: reading {}'s IMPORTS edges back from the index: {err:#}",
+                pair.importer
+            ));
+            return finish(driver, None);
+        }
+    };
+    drop(created);
+    finish(driver, Some(rows))
+}
+
 // --- control plane ------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,6 +1026,10 @@ pub(crate) struct Session {
     /// Whether the semantic-engine marker already existed when the first
     /// `semanticPass` frame was written; `None` if none was ever written.
     pub marker_at_first_semantic_pass: Option<bool>,
+    /// Every id-less `filesCreated` notification the session wrote, as
+    /// (step label, the paths it listed) - only
+    /// [`run_files_created_session`] sends one.
+    pub notifications: Vec<(String, Vec<String>)>,
 }
 
 /// Copies every byte read through it, so the session can recover the raw
@@ -919,62 +1145,10 @@ pub(crate) fn run_session(
     timeouts: RoundTripTimeouts,
     whole_project_timeout: Duration,
 ) -> Session {
-    let mut command = Command::new(&manifest.command);
-    command
-        .args(&manifest.args)
-        .arg(scratch.workspace())
-        // As in `run_bulk` above - see `daemon::manifest::MANIFEST_PATH_ENV`.
-        .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // As in `run_bulk` above - see [`StderrCapture`].
-        .stderr(Stdio::piped());
-    scratch.isolate(&mut command);
-
-    // As in `run_bulk` above - see `daemon::plugin::missing_workspace_binary_hint`'s
-    // doc comment. `missing_workspace_binary_hint` alone, not the
-    // combined `missing_plugin_binary_hint`, for the same reason given there:
-    // the typescript plugin's own spawn failure here is already honest and
-    // must stay untouched.
-    if let Some(hint) = crate::daemon::plugin::missing_workspace_binary_hint(&manifest.command) {
-        return Session { failure: Some(hint), ..Session::default() };
-    }
-
-    let mut child = match crate::process::spawn_serialized(&mut command) {
-        Ok(child) => child,
-        Err(err) => {
-            return Session {
-                failure: Some(format!("failed to spawn `{}`: {err}", manifest.command.display())),
-                ..Session::default()
-            };
-        }
+    let mut driver = match Driver::spawn(manifest, scratch, conn, timeouts) {
+        Ok(driver) => driver,
+        Err(session) => return *session,
     };
-    let stderr = StderrCapture::attach(&mut child);
-    let reader =
-        TeeReader { inner: BufReader::new(child.stdout.take().expect("stdout was piped")), log: Vec::new() };
-    let writer = TeeWriter {
-        inner: child.stdin.take().expect("stdin was piped"),
-        pending: Vec::new(),
-        sent: Vec::new(),
-        marker: scratch.semantic_engine_marker(),
-        marker_at_first_semantic_pass: None,
-    };
-    let mut driver = Driver {
-        child,
-        reader,
-        writer,
-        stderr,
-        conn,
-        workspace: scratch.workspace(),
-        timeouts,
-        next_id: 1,
-        session: Session::default(),
-    };
-
-    if let Err(err) = driver.handshake(manifest) {
-        driver.session.failure = Some(format!("handshake: {err:#}"));
-        return driver.finish();
-    }
 
     let file = target.file_path.as_str();
     let workspace_file = scratch.workspace().join(file);
@@ -1082,7 +1256,78 @@ pub(crate) fn run_session(
     driver.finish()
 }
 
-impl Driver<'_> {
+impl<'a> Driver<'a> {
+    /// Spawns the plugin on the scratch workspace and verifies its
+    /// handshake - the start every session shares. `Err` carries the
+    /// finished [`Session`] (boxed: it is large) whose `failure` says why
+    /// nothing more can run.
+    fn spawn(
+        manifest: &PluginManifest,
+        scratch: &Scratch,
+        conn: &'a IndexStore,
+        timeouts: RoundTripTimeouts,
+    ) -> Result<Driver<'a>, Box<Session>> {
+        let mut command = Command::new(&manifest.command);
+        command
+            .args(&manifest.args)
+            .arg(scratch.workspace())
+            // As in `run_bulk` above - see `daemon::manifest::MANIFEST_PATH_ENV`.
+            .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // As in `run_bulk` above - see [`StderrCapture`].
+            .stderr(Stdio::piped());
+        scratch.isolate(&mut command);
+
+        // As in `run_bulk` above - see `daemon::plugin::missing_workspace_binary_hint`'s
+        // doc comment. `missing_workspace_binary_hint` alone, not the
+        // combined `missing_plugin_binary_hint`, for the same reason given there:
+        // the typescript plugin's own spawn failure here is already honest and
+        // must stay untouched.
+        if let Some(hint) = crate::daemon::plugin::missing_workspace_binary_hint(&manifest.command) {
+            return Err(Box::new(Session { failure: Some(hint), ..Session::default() }));
+        }
+
+        let mut child = match crate::process::spawn_serialized(&mut command) {
+            Ok(child) => child,
+            Err(err) => {
+                return Err(Box::new(Session {
+                    failure: Some(format!("failed to spawn `{}`: {err}", manifest.command.display())),
+                    ..Session::default()
+                }));
+            }
+        };
+        let stderr = StderrCapture::attach(&mut child);
+        let reader = TeeReader {
+            inner: BufReader::new(child.stdout.take().expect("stdout was piped")),
+            log: Vec::new(),
+        };
+        let writer = TeeWriter {
+            inner: child.stdin.take().expect("stdin was piped"),
+            pending: Vec::new(),
+            sent: Vec::new(),
+            marker: scratch.semantic_engine_marker(),
+            marker_at_first_semantic_pass: None,
+        };
+        let mut driver = Driver {
+            child,
+            reader,
+            writer,
+            stderr,
+            conn,
+            workspace: scratch.workspace(),
+            timeouts,
+            next_id: 1,
+            session: Session::default(),
+        };
+
+        if let Err(err) = driver.handshake(manifest) {
+            driver.session.failure = Some(format!("handshake: {err:#}"));
+            return Err(Box::new(driver.finish()));
+        }
+        Ok(driver)
+    }
+
     fn handshake(&mut self, manifest: &PluginManifest) -> Result<()> {
         let Driver { child, reader, timeouts, .. } = self;
         let mut kill = || {
@@ -1146,6 +1391,16 @@ impl Driver<'_> {
         self.record(label, result)
     }
 
+    /// Writes `message` as an id-less notification - the envelope
+    /// `PluginProcess::notify_files_created` builds - and records it. No
+    /// answer is awaited: a notification has none. Returns whether the
+    /// session can continue.
+    fn notify(&mut self, label: &str, message: ControlMessage) -> bool {
+        let envelope = ControlEnvelope { jsonrpc: JSONRPC_VERSION.to_string(), id: None, message };
+        let result = write_message(&mut self.writer, &envelope).context("failed to send the notification");
+        self.record(label, result)
+    }
+
     fn record(&mut self, label: &str, result: Result<()>) -> bool {
         let sent = std::mem::take(&mut self.writer.sent);
         let received = std::mem::take(&mut self.reader.log);
@@ -1170,7 +1425,14 @@ impl Driver<'_> {
 
         let mut unanswered = Vec::new();
         for envelope in sent {
-            let Some(id) = &envelope.id else { continue };
+            let Some(id) = &envelope.id else {
+                // A notification: nothing to pair with an answer, but the
+                // checks still need to see what was sent and when.
+                if let ControlMessage::FilesCreated { file_paths } = envelope.message {
+                    self.session.notifications.push((label.to_string(), file_paths));
+                }
+                continue;
+            };
             let (method, file_paths) = match envelope.message {
                 ControlMessage::FileChanged { file_path } => (Method::FileChanged, vec![file_path]),
                 ControlMessage::SemanticPass { file_paths } => (Method::SemanticPass, file_paths),
