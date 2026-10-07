@@ -47,22 +47,30 @@ pub(super) struct NotIndexed {
 ```
 
 - **Error answers** (the three path-anchored tools; every one of them is a
-  tool error on a miss): the error text gains one sentence after the existing
-  message, from `NotIndexed::sentence()`:
-  - absent: `` - python files are not indexed here: no plugin is installed (`g-mesh plugins install python`), so this is not evidence the file is empty or missing.``
-  - failed: `` - python files are not indexed here: its plugin failed ({error}); fix the plugin, then run `g-mesh reindex`. This is not evidence the file is empty or missing.``
-  The wording reuses ADR 0022 section 3's states, so an agent that did read
-  the instructions sees the same words.
+  tool error on a miss): a tool error (`isError: true`) whose single content
+  block is a JSON object, built by `not_indexed::refusal`:
+  `{"error": "<the tool's miss message> + NotIndexed::sentence()", "notIndexed": {...}}`.
+  `notIndexed` is one `NotIndexed` value without `filePaths`:
+  - absent: `{"language":"python","reason":"pluginAbsent","command":"g-mesh plugins install python"}`
+  - failed: `{"language":"python","reason":"pluginFailed","command":"g-mesh reindex","error":"<innermost cause>"}`
+    (`error` is omitted when no outcome row was recorded for the language).
+  The `error` text keeps the tool's unchanged miss message and appends the
+  human sentence, which reuses ADR 0022 section 3's wording for the two
+  states, so an agent that did read the instructions sees the same words:
+  absent: `` - python files are not indexed here: no plugin is installed (`g-mesh plugins install python`), so this is not evidence the file is empty or missing.``
+  failed: `` - python files are not indexed here: its plugin failed ({error}); fix the plugin, then run `g-mesh reindex`. This is not evidence the file is empty or missing.``
+  A path in a covered language, or an unsupported, extensionless or excluded
+  path, gets the tool's plain text error unchanged.
 - **Success answers** (`file_paths` filter): a response-level field
   `notIndexed: [NotIndexed, ...]`, one entry per language, `filePaths` naming
-  the requested paths it covers; absent when empty. It joins each tool's
+  the requested paths it covers (request order, duplicates dropped; entries
+  ordered by the first requested path of each language); absent when empty.
+  The field is last, after `provenance`. It joins each tool's
   `*Disclosures` struct, so `answer: files|count` carry it too.
 
 Alternatives:
-- *JSON error body* (`{"error": ..., "notIndexed": {...}}` as the error's
-  content block): machine-readable, but every other tool error is plain text,
-  and an agent reads text either way. Rejected unless the owner wants
-  structured errors (decision 1).
+- *Plain text sentence appended to the error*: simplest, but not machine-readable
+  and unlike the success answers' field. Not chosen; the error is a JSON body.
 - *Turn the miss into a success with `results: []` plus `notIndexed`*: makes
   the field literal, but turns "this file is not in the index" into an empty
   outline, which is the false statement this task removes. Rejected.
@@ -163,7 +171,7 @@ Change:
 - `core/src/languages.rs`: `absent_for_path` (160-171) / `absent_for_path_in` (201-214): apply the entry's `exclude_dirs` (or do it in the registry method; decision 5).
 - `core/src/mcp/instructions.rs`: `error_cause` (240-256) to `pub(super)` so the field's `error` matches the instructions.
 - `core/src/mcp/mod.rs`: `get_file_outline` (800-815), `find_definition` (671-696), `get_dependencies` (817-839): compute `Option<NotIndexed>` kind from `self.registry.path_coverage(path)` and pass it in; `find_references` (698-717), `find_callers` (719-744), `find_callees` (746-774), `find_implementations` (776-798): compute it per `file_paths` entry (S3). `mod not_indexed;`.
-- `core/src/mcp/get_file_outline.rs`: `handle` (107-125): on the miss, append `sentence()` (reading the failed error under `conn`).
+- `core/src/mcp/get_file_outline.rs`: `handle` (107-125): on the miss, answer with `not_indexed::miss` (JSON body; reads the failed error under `conn`).
 - `core/src/mcp/find_definition.rs`: `handle_in` (1216-1252) passes it to `by_position` (444-458), appended on the miss only.
 - `core/src/mcp/get_dependencies.rs`: `handle` (784-808) and `from_file` (405-440): when the path is uncovered and `find_file_node` misses, refuse with the `no file` message plus the sentence before the container-key and entry-point fallbacks (a path with a known language extension is a file path, not a key; must-confirm 3).
 - S3: `find_references.rs` `ReferencePage` (81-) / `ReferenceDisclosures` (136-) / `handle_in` (289-); `find_callers_callees.rs` `CallerPage` (171-), `CalleePage` (354-), `CallerDisclosures` (389-), `CalleeDisclosures` (403-), `handle_callers_in` (513-), `handle_callees_in` (687-); `find_implementations.rs` `ImplementationPage` (77-), `handle_in` (173-), `dispatch_in` (571-): add `#[serde(skip_serializing_if = "Vec::is_empty")] not_indexed: Vec<NotIndexed>`.
@@ -179,13 +187,13 @@ Context only: `answer.rs` `Summary` (17-42), `provenance.rs` `Provenance` (198-2
 
 ## Behaviours for the tests slice
 
-1. `get_file_outline` on `x.py` with no Python plugin: tool error whose text names `python`, "no plugin", and `` `g-mesh plugins install python` `` (`get_file_outline::handle`, `NotIndexed::sentence`).
+1. `get_file_outline` on `x.py` with no Python plugin: tool error whose JSON body has `notIndexed` (`pluginAbsent`) and whose `error` names `python`, "no plugin", and `` `g-mesh plugins install python` `` (`get_file_outline::handle`, `NotIndexed::sentence`).
 2. Same for `find_definition` with `file_path: x.py` + `position` (`find_definition::by_position`).
 3. Same for `get_dependencies` with `file_path: x.py`, and no entry-point substitution happens (`get_dependencies::from_file`).
 4. Failed language (discovered, in the failed set): the same three carry "plugin failed", the innermost cause and `` `g-mesh reindex` ``, not the install command.
-5. A file of an indexed language: a hit carries no `notIndexed` key; a miss (`nope.rs`) carries no sentence (AC2).
-6. An unsupported or extensionless path: no sentence.
-7. A path under the catalogue entry's `exclude_dirs` (e.g. `venv/x.py`): no sentence (if decision 5 is accepted).
+5. A file of an indexed language: a hit carries no `notIndexed` key; a miss (`nope.rs`) carries no `notIndexed` and stays plain text (AC2).
+6. An unsupported or extensionless path: plain text error, no `notIndexed`.
+7. A path under the catalogue entry's `exclude_dirs` (e.g. `venv/x.py`): no `notIndexed` (if decision 5 is accepted).
 8. Precedence: a language both recorded `Failed` and with no discovered manifest reads as absent (`PluginRegistry::path_coverage`).
 9. `find_references`/`find_callers`/`find_callees`/`find_implementations` with `file_paths: ["src/lib.rs", "x.py"]`: `notIndexed` has one python entry with `filePaths: ["x.py"]`; with only `.rs` paths, no key; `answer: "count"` and `"files"` carry it too; `transitive: true` does not (S3).
 10. `NotIndexed` serializes exactly (`language`, `reason`, `command`, optional `error`, optional `filePaths`; camelCase; absent fields omitted).
@@ -227,7 +235,7 @@ the `notIndexed` field from one disclosure struct. Each must fail its test.
 
 ## Must confirm (owner)
 
-1. Error answers carry a text sentence, not a JSON body (recommended: text).
+1. Error answers carry a JSON body (`error` text plus `notIndexed`); decided by the owner.
 2. The `file_paths` field on the four find tools is in scope (recommended: yes, as its own slice S3, cuttable).
 3. `get_dependencies` refuses an uncovered-language file path before its container-key and entry-point fallbacks (recommended: yes).
 4. The failed field includes the innermost error cause (recommended: yes, same text as the instructions).
