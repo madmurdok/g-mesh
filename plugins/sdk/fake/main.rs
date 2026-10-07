@@ -50,7 +50,10 @@
 //! received method (and `bulkIndex` for a walk) to `$G_MESH_FAKE_PLUGIN_LOG`
 //! when set, answers `fileChanged`/`semanticPass` with an empty diff and any
 //! other request with `{"acknowledged": true}`, and walks to one canned `File`
-//! node for `seed.ts`.
+//! node for `seed.ts`. With `$G_MESH_FAKE_PLUGIN_STDERR_SPAM` naming a file,
+//! the control-plane process also logs `g-mesh-fake-plugin: spam seq=<n> ...`
+//! lines through `log_line!` in a tight loop for as long as that file exists
+//! (`core/tests/daemon_log_lines.rs`).
 //!
 //! **Toy** (`--toy <defect>`, `core/tests/plugin_check.rs`): a conformant
 //! plugin for the toy `.fk` language plus one deliberate defect, for
@@ -86,6 +89,7 @@ const SEMANTIC_ANSWER: &str = "semantic-pass.json";
 const SEMANTIC_PASS_GATED: &str = "semantic-pass.gated";
 const SEMANTIC_PASS_GATE_OPEN: &str = "semantic-pass.allow";
 const METHOD_LOG_ENV: &str = "G_MESH_FAKE_PLUGIN_LOG";
+const STDERR_SPAM_ENV: &str = "G_MESH_FAKE_PLUGIN_STDERR_SPAM";
 
 /// How often a gate file is checked for.
 const GATE_POLL: Duration = Duration::from_millis(5);
@@ -417,6 +421,10 @@ fn stub(args: &Args) {
 
     let out: Out = Arc::new(Mutex::new(io::stdout()));
     handshake(&out, args);
+    if let Some(gate) = std::env::var_os(STDERR_SPAM_ENV).filter(|v| !v.is_empty()) {
+        let gate = PathBuf::from(gate);
+        thread::spawn(move || spam_stderr(&gate));
+    }
     serve(|message| {
         let method = method_of(&message);
         record(&method);
@@ -429,4 +437,28 @@ fn stub(args: &Args) {
         };
         write(&out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
     });
+}
+
+/// Waits for `gate` to exist, then logs multi-argument lines as fast as it can
+/// until `gate` is removed. Line `n` is
+/// `g-mesh-fake-plugin: spam seq=<n> a=<3n> b=<7n> c=<n%13> end=<n>`.
+fn spam_stderr(gate: &Path) {
+    wait_for(gate);
+    let mut n: u64 = 0;
+    loop {
+        // Checked every 64 lines: a stat per line would throttle the writes
+        // this loop exists to make.
+        if n.is_multiple_of(64) && !gate.exists() {
+            return;
+        }
+        g_mesh_plugin_sdk::log_line!(
+            "g-mesh-fake-plugin: spam seq={} a={} b={} c={} end={}",
+            n,
+            n * 3,
+            n * 7,
+            n % 13,
+            n
+        );
+        n += 1;
+    }
 }

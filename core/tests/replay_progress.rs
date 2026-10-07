@@ -88,11 +88,6 @@ const FIXTURE_AGE: Duration = Duration::from_secs(3_600);
 /// What `bulk_index` logs when a walked file got no staleness baseline.
 const NO_BASELINE_LINE: &str = "got no staleness baseline";
 
-/// The prefixes the plugins put on their stderr lines. The plugins share the
-/// daemon log with the daemon, and a daemon `eprintln!` is several `write`s,
-/// so a plugin line can land in the middle of a daemon trace line.
-const PLUGIN_LINE_TAGS: [&str; 4] = ["[typescript] ", "[rust] ", "[python] ", "[g-mesh-go] "];
-
 struct Project {
     dir: tempfile::TempDir,
     /// Outside the project root, so writing to it cannot feed the watcher.
@@ -248,35 +243,9 @@ impl ClientHandler for ProgressRecorder {
     }
 }
 
-/// The `replay: tool=get_file_outline` trace lines of `log`, with any plugin
-/// line that landed inside one (see [`PLUGIN_LINE_TAGS`]) cut back out.
+/// The `replay: tool=get_file_outline` trace lines of `log`.
 fn replay_trace_lines(log: &str) -> Vec<String> {
-    let mut daemon_only = log.to_string();
-    for tag in PLUGIN_LINE_TAGS {
-        while let Some(start) = daemon_only.find(tag) {
-            let end = daemon_only[start..].find('\n').map_or(daemon_only.len(), |at| start + at + 1);
-            daemon_only.replace_range(start..end, "");
-        }
-    }
-    daemon_only
-        .lines()
-        .filter(|line| line.contains("replay: tool=get_file_outline"))
-        .map(str::to_string)
-        .collect()
-}
-
-/// The interleaving seen in a real failing run: the plugin's exit line written
-/// between two `write`s of the daemon's replay trace line.
-#[test]
-fn a_plugin_line_inside_a_replay_trace_line_is_cut_back_out() {
-    let log = "g-mesh daemon: replay: tool=get_file_outline request=1 summary=typescript (1 file) \
-               replayed=1 elapsed_ms=[typescript] core closed the control stream - exiting (semantic \
-               engine started: true)\n1987 progress_sent=9\ng-mesh daemon: prepare: done\n";
-    assert_eq!(
-        replay_trace_lines(log),
-        ["g-mesh daemon: replay: tool=get_file_outline request=1 summary=typescript (1 file) replayed=1 \
-          elapsed_ms=1987 progress_sent=9"]
-    );
+    log.lines().filter(|line| line.contains("replay: tool=get_file_outline")).map(str::to_string).collect()
 }
 
 fn outline_request(file: &str) -> CallToolRequestParams {
