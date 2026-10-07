@@ -654,6 +654,61 @@ fn dunder_all_in_a_package_init_republishes_what_it_imported() {
     assert!(!names.iter().any(|(qualified, _)| qualified.contains("never_imported")), "{names:#?}");
 }
 
+/// GM-496: core orders one module's re-export rows by their start position,
+/// so an `__all__` re-export sits at the import statement that bound the
+/// name (line 0), not at `__all__` (line 2); the star import's row sits at
+/// its own statement (line 1).
+///
+/// Control: pass `all.range` again in `Declarer::reexport_dunder_all` - the
+/// named row starts on line 2.
+#[test]
+fn a_dunder_all_reexport_sits_at_the_import_that_bound_the_name() {
+    let tree = tree(&[
+        ("pkg/a.py", "def f():\n    pass\n"),
+        ("pkg/b.py", "def f():\n    pass\n"),
+        ("pkg/__init__.py", "from .a import f\nfrom .b import *\n__all__ = [\"f\"]\n"),
+    ]);
+    let graph = tree.extract("pkg/__init__.py");
+    assert_eq!(graph.node("pkg.a::f as f").range.start.line, 0);
+    assert_eq!(graph.node("pkg.b::* as *").range.start.line, 1);
+}
+
+/// The same named import written again after a star import last binds the
+/// name on its later line, so its re-export moves there.
+///
+/// Control: keep the first range in `FileModel::import` (insert into
+/// `import_ranges` only for a new name) - the row starts on line 0.
+#[test]
+fn a_repeated_named_import_places_its_reexport_at_the_later_statement() {
+    let tree = tree(&[
+        ("pkg/a.py", "def f():\n    pass\n"),
+        ("pkg/b.py", "def f():\n    pass\n"),
+        ("pkg/__init__.py", "from .a import f\nfrom .b import *\nfrom .a import f\n__all__ = [\"f\"]\n"),
+    ]);
+    let graph = tree.extract("pkg/__init__.py");
+    assert_eq!(graph.node("pkg.a::f as f").range.start.line, 2);
+}
+
+/// A star import written twice is one re-export node, placed at the later
+/// statement, which is the one that last bound the name.
+///
+/// Control: in `Emitter::reexport`, leave the buffered spec's range alone on a
+/// repeat - the row starts on line 0.
+#[test]
+fn a_repeated_star_import_is_one_reexport_at_the_later_statement() {
+    let tree = tree(&[
+        ("pkg/a.py", "def f():\n    pass\n"),
+        ("pkg/b.py", "def f():\n    pass\n"),
+        ("pkg/__init__.py", "from .b import *\nfrom .a import f\nfrom .b import *\n__all__ = [\"f\"]\n"),
+    ]);
+    let graph = tree.extract("pkg/__init__.py");
+    let stars: Vec<&WireNode> =
+        graph.0.nodes.iter().filter(|node| node.qualified_name == "pkg.b::* as *").collect();
+    assert_eq!(stars.len(), 1, "{:#?}", graph.names());
+    assert_eq!(stars[0].range.start.line, 2);
+    assert_eq!(graph.node("pkg.a::f as f").range.start.line, 1);
+}
+
 /// `__all__` built at runtime is read as *no* names rather than as a guess -
 /// the documented "star-import name sets that depend on runtime" gap.
 #[test]
