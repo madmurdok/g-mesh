@@ -2202,13 +2202,37 @@ struct Receiver {
 /// in `replaces`, and untyped sites on `untyped`. `X` is in the graph
 /// whatever the sites are, as it is after any reparse that keeps the call.
 fn receiver_fixture(scratch: &Scratch, bound: Bound, typed: &[u32], untyped: &[u32]) -> Receiver {
+    typed_site_fixture(scratch, bound, OpenSiteKind::ReceiverCall, typed, untyped)
+}
+
+/// The GM-497 index: [`receiver_fixture`]'s shape for a typed field read.
+/// `add` and `sub` are fields (`Variable`, native `field`), `X` is a
+/// `REFERENCES` edge, and every site is a `ReceiverField` - what
+/// `plugins/rust`'s `Bodies::field_access` emits for `x.add`.
+fn field_fixture(scratch: &Scratch, bound: Bound, typed: &[u32], untyped: &[u32]) -> Receiver {
+    typed_site_fixture(scratch, bound, OpenSiteKind::ReceiverField, typed, untyped)
+}
+
+/// [`receiver_fixture`] and [`field_fixture`]: `site_kind` decides the
+/// declarations' kind, `X`'s edge kind and the sites' kind.
+fn typed_site_fixture(
+    scratch: &Scratch,
+    bound: Bound,
+    site_kind: OpenSiteKind,
+    typed: &[u32],
+    untyped: &[u32],
+) -> Receiver {
+    let (node_kind, native_kind, edge_kind) = match site_kind {
+        OpenSiteKind::ReceiverField => (NodeKind::Variable, "field", EdgeKind::References),
+        _ => (NodeKind::Function, "function", EdgeKind::Calls),
+    };
     scratch.write("src/d.toy", D_TOY);
     scratch.write("src/f.toy", F_TOY);
     let declare = |builder: &mut FileGraphBuilder| -> [String; 2] {
         ["add", "sub"].iter().enumerate().fold([String::new(), String::new()], |mut ids, (line, name)| {
             ids[line] = builder.add_node(
-                NodeSpec::new(NodeKind::Function, *name, *name, range(line as u32, 3, line as u32, 6))
-                    .native_kind("function")
+                NodeSpec::new(node_kind, *name, *name, range(line as u32, 3, line as u32, 6))
+                    .native_kind(native_kind)
                     .in_container("pkg", None)
                     .public(),
             );
@@ -2237,7 +2261,7 @@ fn receiver_fixture(scratch: &Scratch, bound: Bound, typed: &[u32], untyped: &[u
             .public(),
     );
     let x = match bound {
-        Bound::Here => builder.resolved_edge(EdgeKind::Calls, &caller, &local_add),
+        Bound::Here => builder.resolved_edge(edge_kind, &caller, &local_add),
         Bound::There => {
             let placeholder = builder.add_placeholder(
                 g_mesh_plugin_sdk::PlaceholderKind::PendingSymbol,
@@ -2250,7 +2274,7 @@ fn receiver_fixture(scratch: &Scratch, bound: Bound, typed: &[u32], untyped: &[u
                 },
                 range(AGREE, 4, AGREE, 7),
             );
-            builder.placeholder_edge(EdgeKind::Calls, &caller, &placeholder)
+            builder.placeholder_edge(edge_kind, &caller, &placeholder)
         }
     };
     let sites =
@@ -2260,8 +2284,8 @@ fn receiver_fixture(scratch: &Scratch, bound: Bound, typed: &[u32], untyped: &[u
             from_id: caller.clone(),
             position: Position { line, col: 4 },
             name: "add".to_string(),
-            kind: OpenSiteKind::ReceiverCall,
-            edge_kind: EdgeKind::Calls,
+            kind: site_kind,
+            edge_kind,
             from_container: Some("pkg".to_string()),
             replaces,
         });
@@ -2533,6 +2557,147 @@ fn an_unfinished_file_relabels_the_structural_edge_and_the_next_finished_pass_re
     assert!(second.complete, "{:?}", second.reason);
     assert!(semantic_edges(&second).is_empty(), "{:#?}", second.diff);
     x_re_sent_unchanged(&second, &finished, "pass 2 (finished)");
+}
+
+// --- GM-497: typed field reads, asked like typed calls ----------------------
+//
+// The GM-489 fixtures with the sites turned into `ReceiverField` and `X` into
+// a `REFERENCES` edge onto a field. `record_answer` and `Answers::settle` do
+// not look at the site's kind, so these pin that a field read reaches them
+// at all - `questions` asks it - and that the rules then hold for it too.
+// Control for every test here: in `questions`, route `ReceiverField` to
+// `continue` (nothing is asked: `X` is not re-sent, and no edge is emitted).
+
+/// What the semantic `edge` of `answer` lands on: the name of the placeholder
+/// the answer became, which addresses the declaration the server named.
+fn lands_on<'a>(answer: &'a SemanticAnswer, edge: &WireEdge) -> &'a str {
+    let node = answer.diff.upsert_nodes.iter().find(|node| node.id == edge.to_id);
+    &node.unwrap_or_else(|| panic!("the answer sends its target: {:#?}", answer.diff)).name
+}
+
+/// **GM-497, item 12 (R2, `Bound::Here`).** A typed field read whose answer
+/// lands on the structural edge's own target records nothing new: `X` is
+/// re-sent as it is, one row, syntactic.
+#[test]
+fn a_typed_field_read_its_server_confirms_in_the_same_file_stays_one_structural_edge() {
+    let scratch = Scratch::new("gm497-here-agree");
+    let fixture = field_fixture(&scratch, Bound::Here, &[AGREE], &[]);
+    let mut bridge = receiver_bridge(&scratch, Bound::Here);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert!(semantic_edges(&answer).is_empty(), "agreement adds nothing: {:#?}", answer.diff);
+    x_re_sent_unchanged(&answer, &fixture, "the only pass");
+    assert_eq!(upserts(&answer, &fixture.x)[0].kind, EdgeKind::References);
+}
+
+/// **GM-497, item 13 (R2 `Bound::There`, then R1).** A cross-file field read
+/// the server confirms, whose answer would get `X`'s own id, records
+/// nothing; a later empty pass keeps `X`.
+#[test]
+fn a_cross_file_field_read_the_server_confirms_survives_a_later_empty_pass() {
+    let scratch = Scratch::new("gm497-there-agree-empty");
+    let agree = field_fixture(&scratch, Bound::There, &[AGREE], &[]);
+    let empty = field_fixture(&scratch, Bound::There, &[EMPTY], &[]);
+    assert_eq!(agree.x, empty.x, "an edit that moves the read keeps X's id");
+    let mut bridge = receiver_bridge(&scratch, Bound::There);
+
+    let first = pass(&mut bridge, &agree.index);
+    assert!(first.complete, "{:?}", first.reason);
+    assert!(semantic_edges(&first).is_empty(), "agreement adds nothing: {:#?}", first.diff);
+    x_re_sent_unchanged(&first, &agree, "pass 1 (agrees)");
+
+    let second = pass(&mut bridge, &empty.index);
+    assert!(second.complete, "{:?}", second.reason);
+    assert!(semantic_edges(&second).is_empty(), "{:#?}", second.diff);
+    x_re_sent_unchanged(&second, &empty, "pass 2 (empty)");
+}
+
+/// **GM-497, item 14 (contradiction, then R1).** An answer on another field
+/// emits a semantic `REFERENCES` edge onto that field and retracts `X`; a
+/// later empty pass retracts it and restores `X`.
+#[test]
+fn a_contradicted_field_read_is_restored_by_a_later_empty_pass() {
+    let scratch = Scratch::new("gm497-contra-empty");
+    let contra = field_fixture(&scratch, Bound::Here, &[CONTRA], &[]);
+    let empty = field_fixture(&scratch, Bound::Here, &[EMPTY], &[]);
+    let mut bridge = receiver_bridge(&scratch, Bound::Here);
+
+    let first = pass(&mut bridge, &contra.index);
+    assert!(first.complete, "{:?}", first.reason);
+    let emitted = semantic_edges(&first);
+    assert_eq!(emitted.len(), 1, "{:#?}", first.diff);
+    assert_eq!(
+        (emitted[0].from_id.as_str(), emitted[0].kind, lands_on(&first, emitted[0])),
+        (contra.caller.as_str(), EdgeKind::References, "sub"),
+        "the read references the field the server named"
+    );
+    let e_prime = emitted[0].id.clone();
+    assert!(upserts(&first, &contra.x).is_empty(), "a contradicted X is not re-sent");
+    assert_eq!(first.diff.delete_edge_ids, vec![contra.x.clone()], "X is retracted");
+
+    let second = pass(&mut bridge, &empty.index);
+    assert!(second.complete, "{:?}", second.reason);
+    assert!(semantic_edges(&second).is_empty(), "{:#?}", second.diff);
+    assert_eq!(second.diff.delete_edge_ids, vec![e_prime], "E' is retracted, X is not");
+    x_re_sent_unchanged(&second, &empty, "pass 2 (empty)");
+}
+
+/// **GM-497, item 15 (R1).** An empty answer and an ambiguous one (two
+/// fields) both uphold `X`: no semantic edge, nothing retracted, `X`
+/// re-sent. Control, besides the section's: in `Answers::settle`, skip
+/// `self.resend.push(edge.clone())` (`X` is not re-sent).
+#[test]
+fn an_empty_or_ambiguous_answer_upholds_a_typed_field_read() {
+    let scratch = Scratch::new("gm497-uphold");
+    let fixture = field_fixture(&scratch, Bound::Here, &[EMPTY, UNTYPED], &[]);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": [{
+            "uri": scratch.uri("src/f.toy"),
+            "line": UNTYPED,
+            "character": 4,
+            "definitions": [
+                { "uri": scratch.uri("src/f.toy"), "line": 0, "character": 3 },
+                { "uri": scratch.uri("src/f.toy"), "line": 1, "character": 3 },
+            ],
+        }],
+    }));
+    let mut budgets = budgets();
+    budgets.request = Duration::from_millis(400);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert!(semantic_edges(&answer).is_empty(), "{:#?}", answer.diff);
+    x_re_sent_unchanged(&answer, &fixture, "the only pass");
+}
+
+/// **GM-497, items 11 and 17.** An untyped field read (no `replaces`) is
+/// asked, and its answer is an ordinary semantic `REFERENCES` edge; it never
+/// becomes an untyped *call*: the caller's `untypedCalls` is empty and no
+/// caller is re-sent. Controls: route `ReceiverField` to `continue` in
+/// `questions` (no edge); count `ReceiverField` in `fold_untyped_calls`
+/// (the caller lists `add`).
+#[test]
+fn an_untyped_field_read_is_asked_and_is_never_an_untyped_call() {
+    let scratch = Scratch::new("gm497-untyped");
+    let fixture = field_fixture(&scratch, Bound::Here, &[], &[UNTYPED]);
+    let graph = fixture.index.graph(&RelPath::new("src/f.toy")).unwrap();
+    let caller = graph.nodes.iter().find(|node| node.id == fixture.caller).unwrap();
+    assert!(caller.untyped_calls.is_empty(), "a field read is not a call: {:?}", caller.untyped_calls);
+    let mut bridge = receiver_bridge(&scratch, Bound::Here);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    let emitted = semantic_edges(&answer);
+    assert_eq!(emitted.len(), 1, "{:#?}", answer.diff);
+    assert_eq!(
+        (emitted[0].from_id.as_str(), emitted[0].kind, lands_on(&answer, emitted[0])),
+        (fixture.caller.as_str(), EdgeKind::References, "add")
+    );
+    assert!(re_sent(&answer).is_empty(), "no untypedCalls to trim: {:#?}", answer.diff.upsert_nodes);
 }
 
 // --- GM-487: what a per-file pass did not finish is asked again ------------

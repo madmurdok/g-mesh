@@ -108,8 +108,7 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 // Includes the struct-field and `Type::method` entries at the end of the
 // file: four `[[definition]]`s (two of them partial paths the
 // qualifiedName-suffix rung resolves), one `[[refusal]]` and two
-// `[[references]]`, one of which (the field read through a variable receiver)
-// is semantic, plus the getter-named-like-its-field pair: one `[[callers]]` for
+// `[[references]]`, both structural, plus the getter-named-like-its-field pair: one `[[callers]]` for
 // the method and one `[[references]]` for the field.
 const EXPECTATIONS: usize = 31;
 // 6 since GM-386: `[[references]] shapes::Shape` joined the five receiver/
@@ -121,7 +120,10 @@ const EXPECTATIONS: usize = 31;
 // `internals::peek` row is a field read only rust-analyzer resolves.
 // 6 once `[[callers]] shapes::Square::perimeter` became structural: its
 // receiver is a parameter of a written type.
-const SEMANTIC_EXPECTATIONS: usize = 6;
+// 5 once the `internals::peek` row of `[[references]]
+// gaps::Ledger.all_unresolved` became structural for the same reason: the
+// field is read through a parameter of a written type.
+const SEMANTIC_EXPECTATIONS: usize = 5;
 
 /// GM-380: the tripwire above only works if tripping it says what to do.
 ///
@@ -164,7 +166,7 @@ fn the_expectation_constants_describe_the_file_they_count() {
 /// `(entries, entries tagged `tier = "semantic"`)` in [`EXPECT`], by parsing
 /// rather than by grepping. The distinction is not pedantry: `tier =
 /// "semantic"` appears in that file's *comments* too, so counting lines
-/// answers 7 where the file declares 5.
+/// answers more than the file declares.
 fn count_expectations() -> (usize, usize) {
     let text = std::fs::read_to_string(EXPECT).expect("conformance/expect.toml is readable");
     let parsed: toml::Value = toml::from_str(&text).expect("conformance/expect.toml parses");
@@ -421,19 +423,16 @@ fn the_semantic_tier_is_what_closes_the_receiver_call_gap() {
 
     // Named, not only counted - and named by the row each entry is *missing*
     // rather than by the entry's own index, which is what the report prints
-    // and what a later edit to the file would renumber. These two rows are
-    // the task's own acceptance criteria, and each is exactly what the
-    // semantic tier contributes to its entry:
+    // and what a later edit to the file would renumber. Each of these rows is
+    // exactly what the semantic tier contributes to its entry:
     //
     //   - the receiver call on a variable whose method is a trait impl's
     //     (`square.area()` in `total`), which the structural tier addresses
     //     as `Square::area` and so cannot find;
-    //   - the implementation in another crate of the workspace;
-    //   - a struct field read through a variable receiver (`internals::peek`).
+    //   - the implementation in another crate of the workspace.
     for row in [
         "missing (expected, not found): crates/alpha/src/shapes.rs:shapes::total",
         "missing (expected, not found): crates/beta/src/main.rs:Megaphone",
-        "missing (expected, not found): crates/alpha/src/internals.rs:internals::peek",
     ] {
         assert!(outcome.stdout.contains(row), "the report must say `{row}`:\n{}", outcome.stdout);
     }

@@ -98,6 +98,11 @@ pub enum OpenSiteKind {
     /// pass does not know. The case that made open sites necessary: nearly
     /// every method call in Go and Rust has this shape.
     ReceiverCall,
+    /// `x.f` - a named field read through a receiver: the field-read twin of
+    /// [`OpenSiteKind::ReceiverCall`]. [`OpenSite::replaces`] names the
+    /// structural `REFERENCES` edge when the plugin typed the receiver, and
+    /// is `None` when it did not; either way it is asked like `ReceiverCall`.
+    ReceiverField,
     /// A name used as a value or type that the structural pass could not bind
     /// to a declaration, and could not honestly address a placeholder at
     /// either (an ambiguous path, a glob import's member).
@@ -174,7 +179,12 @@ pub struct OpenSite {
     /// The shape that needs it is the one `plugins/go/semantic.go` calls a
     /// `placeholderCall` - a `CALLS` edge the structural tier emitted on a
     /// guess (`T(x)` looks like a call, and turns out to be a conversion)
-    /// which a semantic answer can contradict.
+    /// which a semantic answer can contradict. Typed receiver calls
+    /// ([`OpenSiteKind::ReceiverCall`]) and typed field reads
+    /// ([`OpenSiteKind::ReceiverField`]) carry it the same way: the edge the
+    /// plugin addressed through the receiver's written type. A re-export hop
+    /// (a TypeScript [`OpenSiteKind::Reference`]) carries the placeholder
+    /// edge it guessed.
     ///
     /// It exists because the semantic tier cannot work it out: `from_id` and
     /// [`edge_kind`](OpenSite::edge_kind) do not name an edge - one function
