@@ -82,6 +82,11 @@ semantic_sweep = true
 # the degradation is honest by construction rather than by a second flag.
 receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
+# A method implements the same-named method of an interface its type
+# satisfies, so core derives `find_callers`' `overrides` field from the type
+# edges. Those edges come only from the semantic pass, so before it the field
+# is absent and the page carries `provenance`.
+member_overrides = "by_name"
 
 [plugin.workspace]
 # A go.mod/go.work edit moves the whole project's package/import-path

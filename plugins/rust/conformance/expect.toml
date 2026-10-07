@@ -287,10 +287,10 @@ expect = [
 # What makes the emptiness honest rather than a defect is that the calls are
 # not lost, only filed elsewhere: they are on `shapes::Shape::area`'s page
 # directly above, and `[[implementations]] shapes::Shape` below is the edge
-# that gets a reader from this anchor to that one. `core/src/mcp/
-# instructions.rs`'s `P4_STATIC` is where a session is told so, in
-# one sentence, once - and its doc comment records why this file must never
-# grow an entry asserting a *count* of the calls that are missing here.
+# that gets a reader from this anchor to that one. The page's `overrides`
+# field (`core/src/mcp/overrides.rs`) is where a session is told so, by naming
+# `shapes::Shape::area` - and this file must never grow an entry asserting a
+# *count* of the calls that are missing here.
 #
 # **No `tier` key, and that is the sharpest thing this entry says.** Every
 # other receiver-call entry in this file is `tier = "semantic"` because its

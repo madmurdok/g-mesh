@@ -15,7 +15,7 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::manifest::Capabilities;
+use crate::daemon::manifest::{Capabilities, MemberOverrides};
 use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
@@ -24,6 +24,7 @@ use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
 use super::not_indexed::{self, NotIndexed};
+use super::overrides::{self, OverriddenMember, Overrides};
 use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
@@ -221,6 +222,14 @@ struct CallerPage<'a> {
     /// edge to the anchor yet. Absent when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
+    /// See [`Overrides`] - the base members the anchor overrides or
+    /// implements, whose caller pages hold the calls made through a
+    /// base-typed receiver. Absent (not `[]`) when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overrides: Option<&'a [OverriddenMember]>,
+    /// Present only when `overrides` was cut to its row cap.
+    #[serde(skip_serializing_if = "answer::is_false")]
+    overrides_truncated: bool,
     /// See `super::provenance` - present only when the anchor's language
     /// declares a semantic tier that has not completed for this project, so
     /// this answer came from its structural tier alone. Absent (not `null`,
@@ -408,6 +417,10 @@ struct CallerDisclosures<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    overrides: Option<&'a [OverriddenMember]>,
+    #[serde(skip_serializing_if = "answer::is_false")]
+    overrides_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     not_indexed: &'a [NotIndexed],
@@ -455,6 +468,7 @@ struct CallerParts<'a> {
     excluded: Option<ExcludedReferences>,
     unlinked: Option<UnlinkedUsages>,
     untyped: Option<UntypedReceiverCalls>,
+    overrides: Option<Overrides>,
     tier: provenance::Resolved,
     hints: &'a SessionHints,
     not_indexed: &'a [NotIndexed],
@@ -480,13 +494,14 @@ impl CallerParts<'_> {
         let excluded = self.excluded.as_ref().map(|excluded| excluded.naming_only_new(&named));
 
         // Every file this response names: rows, the tally, the excluded,
-        // unlinked and untyped tallies.
+        // unlinked and untyped tallies, the overridden members.
         let touched = named
             .iter()
             .copied()
             .chain(excluded_paths(&excluded))
             .chain(self.unlinked.iter().flat_map(UnlinkedUsages::file_paths))
-            .chain(self.untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
+            .chain(self.untyped.iter().flat_map(UntypedReceiverCalls::file_paths))
+            .chain(self.overrides.iter().flat_map(Overrides::file_paths));
         let provenance = self.tier.clone().disclose(
             self.conn,
             &self.anchor.language,
@@ -506,6 +521,7 @@ impl CallerParts<'_> {
                 session_hints::UNRESOLVED_ROW,
             ),
             once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+            once(self.overrides.is_some(), HintKey::Overrides, session_hints::OVERRIDES),
         ]);
 
         CallerPage {
@@ -521,6 +537,8 @@ impl CallerParts<'_> {
             excluded_references: excluded,
             unlinked_usages: self.unlinked.as_ref(),
             untyped_receiver_calls: self.untyped.as_ref(),
+            overrides: self.overrides.as_ref().map(|found| found.members.as_slice()),
+            overrides_truncated: self.overrides.as_ref().is_some_and(|found| found.truncated),
             provenance,
             not_indexed: self.not_indexed,
         }
@@ -568,6 +586,10 @@ pub(crate) fn handle_callers_in_covered(
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
     let unlinked = unlinked::probe(&conn, &anchor, &["CALLS"], &file_paths);
     let untyped = untyped::probe(&conn, &anchor, &["CALLS"], &file_paths);
+    let member_overrides = capabilities
+        .get(&anchor.language)
+        .map_or(MemberOverrides::default(), |capabilities| capabilities.member_overrides);
+    let overrides = overrides::probe(&conn, &anchor, member_overrides);
     let answer = params.answer.unwrap_or_default();
     let excluded = excluded_references(&conn, &anchor.id, Direction::Incoming, &file_paths, answer);
     let not_indexed = not_indexed::group(&conn, uncovered)?;
@@ -583,16 +605,20 @@ pub(crate) fn handle_callers_in_covered(
                 .copied()
                 .chain(excluded_paths(&excluded))
                 .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths))
-                .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
+                .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths))
+                .chain(overrides.iter().flat_map(Overrides::file_paths));
             let provenance = tier.clone().disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
             let hint = session_hints::join([
                 hint,
                 hints.offer(send, provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+                hints.offer(send, overrides.is_some(), HintKey::Overrides, session_hints::OVERRIDES),
             ]);
             let disclosures = CallerDisclosures {
                 excluded_references: excluded,
                 unlinked_usages: unlinked.as_ref(),
                 untyped_receiver_calls: untyped.as_ref(),
+                overrides: overrides.as_ref().map(|found| found.members.as_slice()),
+                overrides_truncated: overrides.as_ref().is_some_and(|found| found.truncated),
                 provenance,
                 not_indexed: &not_indexed,
             };
@@ -623,6 +649,7 @@ pub(crate) fn handle_callers_in_covered(
         excluded,
         unlinked,
         untyped,
+        overrides,
         tier,
         hints,
         not_indexed: &not_indexed,
@@ -980,6 +1007,7 @@ mod tests {
                 files_created: false,
                 receiver_calls: crate::daemon::manifest::ReceiverCallResolution::Resolved,
                 receiver_calls_structural: crate::daemon::manifest::ReceiverCallResolution::Unresolved,
+                member_overrides: crate::daemon::manifest::MemberOverrides::None,
             },
         )])
     }

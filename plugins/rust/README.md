@@ -131,8 +131,9 @@ resolution means rather than what one engine does. `plugins/typescript` is
 the odd one out and says so: it declares `receiver_calls = "unresolved"` for
 both tiers and emits no edge for `x.m()` at all — which is also what gap 3
 below describes for *this* plugin's structural tier, before rust-analyzer has
-run. A session is told the consequence once, by
-`core/src/mcp/instructions.rs`'s `P4_STATIC`.
+run. A session is told the consequence on the trait-impl method's caller
+page, whose `overrides` field names the trait member those calls sit on
+(`core/src/mcp/overrides.rs`).
 
 ## What it does not see
 

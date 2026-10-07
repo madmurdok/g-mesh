@@ -73,6 +73,11 @@ semantic_prepare = true
 # landed for this language, and not one moment longer.
 receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
+# A trait-impl method names the trait member it implements with its own
+# `SUPERTYPE_OF` edge (an inherent method implements nothing, so a by-name
+# rule would be wrong here); core reads that edge for `find_callers`'
+# `overrides` field.
+member_overrides = "declared"
 
 # How to start rust-analyzer. Read by *this plugin*, never by core - core has
 # no use for the fields and validating them would make a typo here take the

@@ -255,9 +255,9 @@ expect = ["pkg/callers.py:through_a_subclass"]
 #
 # Every signal on that response says "complete". It is complete for the
 # question the index can answer - which call sites *name* this declaration -
-# and that is a different question from the one the caller asked. `core/src/
-# mcp/instructions.rs`'s `P4_STATIC` is where a session is told the
-# difference, once, and its doc comment records why neither it nor this file
+# and that is a different question from the one the caller asked. The page's
+# `overrides` field (`core/src/mcp/overrides.rs`) is where a session is told
+# the difference, by naming the base member, and neither it nor this file
 # may ever offer a *count* of the calls missing here: the index knows `Base`
 # has two subclasses, it does not know how many of `through_a_base_
 # annotation`'s callers pass a `Greeter`, and a number an agent acts on is

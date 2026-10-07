@@ -116,6 +116,36 @@ impl Default for ReceiverCallResolution {
     }
 }
 
+/// How core learns which base member a method overrides or implements, for
+/// `find_callers`' `overrides` field (`mcp::overrides`). Design:
+/// `docs/architecture/gm-502-override-callers-field.md`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberOverrides {
+    /// Core says nothing for this language, and the MCP instructions keep the
+    /// sentence on override caller pages for it.
+    #[default]
+    None,
+    /// A method overrides or implements the same-named member of a supertype;
+    /// core derives it from the `SUPERTYPE_OF` edges between types.
+    ByName,
+    /// The plugin emits a `SUPERTYPE_OF` edge from a method to the member it
+    /// implements; core only reads that edge.
+    Declared,
+}
+
+impl std::fmt::Display for MemberOverrides {
+    /// The same word the manifest uses, so `cli::plugins` needs no second
+    /// mapping.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MemberOverrides::None => "none",
+            MemberOverrides::ByName => "by_name",
+            MemberOverrides::Declared => "declared",
+        })
+    }
+}
+
 /// What core may ask this plugin to do, and how far each tier's receiver-call
 /// resolution can be trusted. Read from the manifest, not the handshake: it is
 /// needed before any plugin process exists.
@@ -154,14 +184,18 @@ pub struct Capabilities {
     pub files_created: bool,
     /// Whether receiver calls resolve to edges once this plugin's best available
     /// tier has run. `Resolved` means against the receiver's declared or inferred
-    /// type, never its run-time type (`mcp::instructions`' `P4_STATIC`
-    /// discloses this). `Resolved`: the MCP instructions do not list the open
-    /// receiver-call gap for this language; `Unresolved` (the default): they do.
+    /// type, never its run-time type (an override's caller page names the base
+    /// members such calls land on, per `member_overrides`). `Resolved`: the MCP
+    /// instructions do not list the open receiver-call gap for this language;
+    /// `Unresolved` (the default): they do.
     pub receiver_calls: ReceiverCallResolution,
     /// Whether the structural tier alone resolves receiver calls. Separate from
     /// `receiver_calls`: a plugin can be `Unresolved` here and `Resolved` there
     /// (resolved once `semanticPassAt` is set for the language).
     pub receiver_calls_structural: ReceiverCallResolution,
+    /// How an override's caller page learns the base members it overrides.
+    /// `None` (the default): it names none, and the MCP instructions say so.
+    pub member_overrides: MemberOverrides,
 }
 
 /// Which files and directories route to this plugin beyond its extensions, and

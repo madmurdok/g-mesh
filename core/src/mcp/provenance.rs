@@ -386,6 +386,7 @@ mod tests {
                 files_created: false,
                 receiver_calls: ReceiverCallResolution::Resolved,
                 receiver_calls_structural: ReceiverCallResolution::Unresolved,
+                member_overrides: crate::daemon::manifest::MemberOverrides::None,
             },
         )])
     }

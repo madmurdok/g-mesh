@@ -102,6 +102,7 @@ fn bridge_semantic(language: &str) -> PresentLanguage {
             files_created: false,
             receiver_calls: ReceiverCallResolution::Resolved,
             receiver_calls_structural: ReceiverCallResolution::Unresolved,
+            member_overrides: crate::daemon::manifest::MemberOverrides::None,
         },
     }
 }
@@ -1080,6 +1081,7 @@ fn resolved_receiver_calls_without_a_semantic_pass_are_never_resolving() {
         files_created: false,
         receiver_calls: ReceiverCallResolution::Resolved,
         receiver_calls_structural: ReceiverCallResolution::Unresolved,
+        member_overrides: crate::daemon::manifest::MemberOverrides::None,
     };
     assert_eq!(receiver_class(&capabilities), ReceiverClass::Never);
     let rendered = build(&warm(vec![PresentLanguage { language: "zig".to_string(), capabilities }]));
@@ -1099,6 +1101,7 @@ fn a_structurally_resolving_language_is_static_without_the_pass_sentence() {
         files_created: false,
         receiver_calls: ReceiverCallResolution::Resolved,
         receiver_calls_structural: ReceiverCallResolution::Resolved,
+        member_overrides: crate::daemon::manifest::MemberOverrides::None,
     };
     assert_eq!(receiver_class(&capabilities), ReceiverClass::Static);
     let rendered = build(&warm(vec![PresentLanguage { language: "zig".to_string(), capabilities }]));
@@ -1215,6 +1218,7 @@ fn ladder_step_4_replaces_the_covered_list_and_keeps_absent_and_failed_names() {
         files_created: false,
         receiver_calls: ReceiverCallResolution::Resolved,
         receiver_calls_structural: ReceiverCallResolution::Resolved,
+        member_overrides: crate::daemon::manifest::MemberOverrides::None,
     };
     let many: Vec<PresentLanguage> = (0..80)
         .map(|i| PresentLanguage { language: format!("static{i:02}"), capabilities: static_tier })

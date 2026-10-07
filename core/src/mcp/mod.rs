@@ -51,6 +51,7 @@ mod instructions;
 #[cfg(test)]
 mod member_name_collision_tests;
 mod not_indexed;
+mod overrides;
 mod provenance;
 pub(crate) mod query_shapes;
 #[cfg(test)]

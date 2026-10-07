@@ -297,8 +297,9 @@ the plugin records (§1.3, four receiver rows). So:
   - `expect.toml` `[[callers]] Greetable#greet` becomes
     `expect = ["src/shapes.ts:viaGreetable"]` with `tier = "semantic"`. The
     server binds `g.greet()` to the **interface** method, which is the
-    static-type rule that `P4_STATIC` discloses for go, rust and python, and
-    which now applies to TypeScript too.
+    static-type rule that `P4_STATIC` disclosed for go, rust and python, and
+    which now applies to TypeScript too. Since GM-502 the caller page
+    discloses it instead (`overrides`, see `gm-502-override-callers-field.md`).
   - `core/tests/plugin_check.rs` `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`
     (1370-1496): move `Greetable#greet` from the "must pass structurally"
     list to the expected structural failures.
@@ -616,7 +617,7 @@ ones. The measure slice:
 | tsserver false-empty answers beyond 2 s settle on a big project | A missed edge on that pass | Measured in S8 (second-pass diff); `Budgets::settle` is the knob, and the same exposure applies under `indexed` |
 | Every core test that spawns the TS plugin now runs a cold-start pass that starts vtsls (~0.3 s init plus project load) | More load in parallel nextest runs; `replay_progress` is already flaky under load | Verify runs it 5×, once under load; a failure is a finding, not a rerun |
 | Hop questions replace edges core already links (`twice`) | Churn: the edge id changes, the target is the same | Same set the Node pass asked; kit `files` tallies would catch a duplicate row |
-| `receiver_calls = "resolved"` with an interface-typed receiver binds to the interface method | `find_callers Greeter#greet` does not list `viaGreetable` | The same static-type rule `P4_STATIC` discloses for go, rust and python; it is now disclosed for TS too |
+| `receiver_calls = "resolved"` with an interface-typed receiver binds to the interface method | `find_callers Greeter#greet` does not list `viaGreetable` | The same static-type rule `P4_STATIC` disclosed for go, rust and python; it is now disclosed for TS too. Since GM-502 the page names `Greetable#greet` in `overrides` (`gm-502-override-callers-field.md`) |
 | `--version` proves only that vtsls starts, not that tsserver loads | A broken install fails at `initialize` | The bridge's start failure is the one log line plus an incomplete diff; the same as pyright |
 
 Trade-offs taken:
