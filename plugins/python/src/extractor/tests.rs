@@ -1575,3 +1575,52 @@ fn a_bare_name_in_the_class_body_after_the_accessors_is_the_getter() {
     let graph = tree.extract("pkg/mod.py");
     assert_eq!(graph.uses("C"), vec!["References C.x[method]"]);
 }
+
+#[test]
+fn an_accessor_shaped_def_outside_a_class_stays_in_the_name_tables() {
+    // No module-level `x` before the `def`, so the `def` is the only `x`:
+    // its body's call and a later module use both find it by name.
+    let tree = tree(&[(
+        "pkg/mod.py",
+        "def audit():\n\
+         \x20   pass\n\
+         \n\
+         @x.setter\n\
+         def x(v):\n\
+         \x20   audit()\n\
+         \n\
+         def use():\n\
+         \x20   x(1)\n",
+    )]);
+    let graph = tree.extract("pkg/mod.py");
+    assert_eq!(graph.uses_from(graph.accessor("x", "function")), vec!["Calls audit[function]"]);
+    assert_eq!(graph.uses("use"), vec!["Calls x[function]"]);
+}
+
+#[test]
+fn only_the_outermost_attribute_of_a_store_target_is_the_store() {
+    // `self.x.y = v` stores `y` on whatever the getter returns: `self.x`
+    // itself is a read.
+    let source = format!(
+        "{ACCESSORS}\n\
+         \x20   def deep(self, v):\n\
+         \x20       self.x.y = v\n"
+    );
+    let tree = tree(&[("pkg/mod.py", &source)]);
+    let graph = tree.extract("pkg/mod.py");
+    assert_eq!(graph.uses("C.deep"), vec!["References C.x[method]"]);
+}
+
+#[test]
+fn an_annotated_assignment_with_a_value_is_a_store() {
+    // `self.x: int = v` runs the setter, like `self.x = v`; only an
+    // annotation with no value is a read.
+    let source = format!(
+        "{ACCESSORS}\n\
+         \x20   def typed(self, v):\n\
+         \x20       self.x: int = v\n"
+    );
+    let tree = tree(&[("pkg/mod.py", &source)]);
+    let graph = tree.extract("pkg/mod.py");
+    assert_eq!(graph.uses("C.typed"), vec!["References C.x[setter]"]);
+}
