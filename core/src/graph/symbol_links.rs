@@ -328,14 +328,18 @@ const VISIBILITY_PUBLIC: &str = "public";
 const VISIBILITY_FILE: &str = "file";
 const VISIBILITY_CONTAINER: &str = "container";
 
-/// The edge kinds a pending-symbol placeholder can carry, and the node kind
-/// each one demands of the symbol it is linked to. `CALLS` is Function ->
-/// Function by definition and `SUPERTYPE_OF` relates two types; `REFERENCES`
-/// is the catch-all usage edge and accepts whatever the scope offers.
-const LINKABLE_EDGE_KINDS: [(&str, Option<&str>); 3] =
-    [("CALLS", Some("Function")), ("SUPERTYPE_OF", Some("Type")), ("REFERENCES", None)];
+/// The edge kinds a pending-symbol placeholder can carry, and the node kinds
+/// each one accepts for the symbol it is linked to, in order of preference.
+/// `CALLS` is Function -> Function by definition. `SUPERTYPE_OF` relates two
+/// types, and since GM-502 also a trait-impl method to the trait method it
+/// implements (`<Square as Shape>::area -> Shape::area`, D3), so it accepts a
+/// `Function` - but only where no `Type` fits, so every placeholder that
+/// linked to a type before still links to that same type. `REFERENCES` is
+/// the catch-all usage edge and accepts whatever the scope offers.
+const LINKABLE_EDGE_KINDS: [(&str, Option<&[&str]>); 3] =
+    [("CALLS", Some(&["Function"])), ("SUPERTYPE_OF", Some(&["Type", "Function"])), ("REFERENCES", None)];
 
-fn required_target_kind(edge_kind: &str) -> Option<Option<&'static str>> {
+fn required_target_kind(edge_kind: &str) -> Option<Option<&'static [&'static str]>> {
     LINKABLE_EDGE_KINDS.iter().find(|(kind, _)| *kind == edge_kind).map(|(_, required)| *required)
 }
 
@@ -1281,13 +1285,18 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
                 let Some(required) = required_target_kind(&edge_kind) else {
                     continue; // not a usage edge - nothing here linked it, so nothing here moves it
                 };
-                let fitting: Vec<&Candidate> = candidates
-                    .iter()
-                    .filter(|candidate| match required {
-                        Some(required) => candidate.kind == required,
-                        None => true,
-                    })
-                    .collect();
+                // The first accepted kind any candidate has decides; the
+                // others are not considered beside it.
+                let fitting: Vec<&Candidate> = match required {
+                    Some(kinds) => kinds
+                        .iter()
+                        .map(|kind| {
+                            candidates.iter().filter(|candidate| candidate.kind == *kind).collect::<Vec<_>>()
+                        })
+                        .find(|fitting| !fitting.is_empty())
+                        .unwrap_or_default(),
+                    None => candidates.iter().collect(),
+                };
                 let target_id = match fitting.as_slice() {
                     [candidate] => Some(candidate.id.clone()),
                     // Nothing (of the right kind): a missing edge beats a wrong one.

@@ -328,8 +328,23 @@ impl Bodies<'_, '_> {
         if let Some(self_type) = self_type {
             match trait_clause {
                 // `impl Tr for T` is the edge `find_implementations` walks,
-                // subtype -> supertype.
-                Some(clause) => self.supertype_edge(item, self_type, clause, module, Some(&block), from),
+                // subtype -> supertype; and each method of the block is a
+                // subtype of the trait method it implements (GM-502).
+                Some(clause) => {
+                    let resolved = self.resolve_supertype(clause, module, Some(&block));
+                    self.supertype_edge(
+                        item,
+                        self_type,
+                        clause,
+                        resolved.clone(),
+                        module,
+                        Some(&block),
+                        from,
+                    );
+                    if let (Some(body), Some(bound)) = (item.child_by_field_name("body"), resolved) {
+                        self.member_supertypes(body, clause, &bound, module, &block);
+                    }
+                }
                 // An inherent `impl T` is a *use* of `T`, worth a reference
                 // so that `find_references` on a type shows where it is
                 // implemented.
@@ -1396,11 +1411,16 @@ impl Bodies<'_, '_> {
     /// there is `T` - which the semantic tier's trait sweep already
     /// produces. Declaring a block node for them too would be a second row
     /// describing the same impl.
+    ///
+    /// `resolved` is the trait clause as [`Self::resolve_supertype`] read it,
+    /// resolved once by the caller because the block's members need it too.
+    #[allow(clippy::too_many_arguments)]
     fn supertype_edge(
         &mut self,
         item: Node,
         self_type: Node,
         trait_clause: Node,
+        trait_bound: Option<Bound>,
         module: &ModuleCtx,
         block: Option<&BlockCtx>,
         from: &str,
@@ -1413,7 +1433,16 @@ impl Bodies<'_, '_> {
             .and_then(|name| self.model.lookup_name(&module.key, name, Some(NodeKind::Type)))
             .map(|decl| decl.id.clone());
         if let Some(subtype) = subtype {
-            self.supertype_to(&subtype, trait_clause, module, block);
+            if let Some(bound) = trait_bound {
+                self.emit(
+                    bound,
+                    EdgeKind::SupertypeOf,
+                    &subtype,
+                    trait_clause,
+                    module,
+                    OpenSiteKind::Implementation,
+                );
+            }
             return;
         }
 
@@ -1427,7 +1456,16 @@ impl Bodies<'_, '_> {
         };
         if names_nothing {
             if let Some(subtype) = self.declare_impl_block(item, module, block) {
-                self.supertype_to(&subtype, trait_clause, module, block);
+                if let Some(bound) = trait_bound {
+                    self.emit(
+                        bound,
+                        EdgeKind::SupertypeOf,
+                        &subtype,
+                        trait_clause,
+                        module,
+                        OpenSiteKind::Implementation,
+                    );
+                }
                 return;
             }
         }
@@ -1485,14 +1523,66 @@ impl Bodies<'_, '_> {
     }
 
     fn supertype_to(&mut self, subtype: &str, supertype: Node, module: &ModuleCtx, block: Option<&BlockCtx>) {
-        let Some(segments) = flatten_path(supertype, self.source) else { return };
+        let Some(bound) = self.resolve_supertype(supertype, module, block) else { return };
+        let subtype = subtype.to_string();
+        self.emit(bound, EdgeKind::SupertypeOf, &subtype, supertype, module, OpenSiteKind::Implementation);
+    }
+
+    /// What a supertype clause (`Tr`, `m::Tr<X>`) names; `None` for a clause
+    /// that spells no path.
+    fn resolve_supertype(
+        &self,
+        supertype: Node,
+        module: &ModuleCtx,
+        block: Option<&BlockCtx>,
+    ) -> Option<Bound> {
+        let segments = flatten_path(supertype, self.source)?;
         #[cfg(test)]
         crate::census::push_ctx(crate::census::Ctx::Supertype);
         let bound = self.resolve_path(&segments, module, block, Some(NodeKind::Type));
         #[cfg(test)]
         crate::census::pop_ctx();
-        let subtype = subtype.to_string();
-        self.emit(bound, EdgeKind::SupertypeOf, &subtype, supertype, module, OpenSiteKind::Implementation);
+        Some(bound)
+    }
+
+    /// `impl Tr for T { fn m() }` - `SUPERTYPE_OF` from `<T as Tr>::m` to
+    /// `Tr::m`, the method the member implements (GM-502, D3), so a caller
+    /// of the trait method can be found from the impl's.
+    ///
+    /// Only for a trait this project declares: `trait_bound` is the clause's
+    /// own resolution, and a trait from another crate (`Bound::Nothing`)
+    /// has no node to land on. An unresolved clause (`Bound::Open`) gets no
+    /// member edge either: its open site would be answered with the trait
+    /// itself, not the trait's method. The member's address is the clause's
+    /// path plus one `::m` segment, resolved the way a written `Tr::m` path
+    /// is - same-file `Here`, otherwise a `qualifiedName` placeholder.
+    fn member_supertypes(
+        &mut self,
+        body: Node,
+        trait_clause: Node,
+        trait_bound: &Bound,
+        module: &ModuleCtx,
+        block: &BlockCtx,
+    ) {
+        if !matches!(trait_bound, Bound::Here(_) | Bound::There { .. }) {
+            return;
+        }
+        let Some(segments) = flatten_path(trait_clause, self.source) else { return };
+        let mut cursor = body.walk();
+        for member in body.named_children(&mut cursor) {
+            if member.kind() != "function_item" {
+                continue;
+            }
+            let (Some(name_node), Some(id)) =
+                (member.child_by_field_name("name"), self.declaration_id(member, module, Some(block)))
+            else {
+                continue;
+            };
+            let mut path = segments.clone();
+            path.push(Seg::Name(text(name_node, self.source)));
+            let bound = self.resolve_path(&path, module, Some(block), Some(NodeKind::Function));
+            self.edge(bound, EdgeKind::SupertypeOf, &id, name_node);
+        }
     }
 }
 
