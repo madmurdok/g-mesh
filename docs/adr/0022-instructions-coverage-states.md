@@ -62,7 +62,7 @@ What remains owed (recorded here, not built by this task):
 
 - (a) TypeScript reporting `untypedCalls`. With that, statement 6's fixed half can also become a response field.
 - (b) The override field in row 9.
-- (c) A field on an answer about a path in an absent or failed language, for example `get_file_outline` or `find_definition` on a `.py` file with no Python plugin. It would carry the language, the reason and the install command. `languages::absent_for_path` exists for this and has no caller yet.
+- (c) **Delivered (GM-503):** path-anchored answers carry `notIndexed`; see `docs/architecture/gm-503-absent-language-field.md`. Original wording: a field on an answer about a path in an absent or failed language, for example `get_file_outline` or `find_definition` on a `.py` file with no Python plugin. It would carry the language, the reason and the install command. `languages::absent_for_path` exists for this and has no caller yet.
 - (d) `docs/architecture/tool-answer-guarantees.md`, which does not exist yet. It is the consumer-facing home for statements 3-8.
 
 ### 2. The receiver-call gap: capability in the text, state in the answer
@@ -105,9 +105,13 @@ within a session are the coverage statements:
   leaves "not indexed" in the text. That over-reports absence, which is the
   safe direction: the agent may skip a question it could have asked, but it
   never trusts an empty answer.
-- A plugin *removed* mid-session (a daemon restart that the session survives)
-  would leave "indexed" in the text. That is the unsafe direction. It is rare,
-  and owed item (c) is what covers it.
+- A plugin *removed* while a session runs would leave "indexed" in the text.
+  That is the unsafe direction. A daemon's plugin list is fixed for its life,
+  so the removal takes effect at the next daemon start. A single-project
+  session ends with its daemon and never sees the new state; a folder
+  (multi-project) session reselects the project against the new daemon and
+  then gets the path-anchored `notIndexed` answers (owed item (c), delivered
+  by GM-503).
 
 ### 3. The text of each state
 

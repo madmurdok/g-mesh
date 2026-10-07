@@ -26,7 +26,7 @@ use serde::Deserialize;
 use crate::daemon::indexing_status::{IndexingStatus, Need, Phase, WaitOutcome};
 use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::manifest::Capabilities;
-use crate::daemon::registry::PluginRegistry;
+use crate::daemon::registry::{PathCoverage, PluginRegistry};
 use crate::embedding::EmbeddingPipeline;
 use crate::gc::last_used;
 use crate::graph::pagination::Direction;
@@ -50,6 +50,7 @@ mod get_file_outline;
 mod instructions;
 #[cfg(test)]
 mod member_name_collision_tests;
+mod not_indexed;
 mod provenance;
 pub(crate) mod query_shapes;
 #[cfg(test)]
@@ -346,6 +347,18 @@ impl GMeshMcpServer {
     /// (`daemon::manifest::discover`), so a cache would save nothing.
     fn capabilities(&self) -> HashMap<String, Capabilities> {
         self.registry.receiver_call_capabilities()
+    }
+
+    /// The `file_paths` filter entries of a find tool whose language is not
+    /// indexed here (plugin absent or failed), each with that coverage
+    /// (`PluginRegistry::path_coverage`, no I/O). Empty with no filter or a
+    /// fully covered one; the handlers group it into `notIndexed`.
+    fn filter_coverage(&self, file_paths: Option<&[String]>) -> Vec<(String, PathCoverage)> {
+        file_paths
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|path| self.registry.path_coverage(path).map(|coverage| (path.clone(), coverage)))
+            .collect()
     }
 
     /// Query-time staleness check (`watcher::staleness::ensure_fresh`) for the
@@ -683,10 +696,13 @@ impl GMeshMcpServer {
         let store = Arc::clone(&self.store);
         let project_root = self.registry.project_root().to_path_buf();
         let params = params.0;
+        let coverage = params.file_path.as_deref().and_then(|path| self.registry.path_coverage(path));
         find_definition::resolve_lazily_off_worker(
             Arc::clone(&self.embedding),
             Arc::clone(&self.shapes),
-            move |semantic| find_definition::handle_in(&store, &project_root, semantic, params.clone()),
+            move |semantic| {
+                find_definition::handle_in(&store, &project_root, semantic, coverage.as_ref(), params.clone())
+            },
         )
         .await
     }
@@ -705,11 +721,19 @@ impl GMeshMcpServer {
         }
         let (store, capabilities, hints, params) =
             (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
+        let uncovered = self.filter_coverage(params.file_paths.as_deref());
         find_definition::resolve_lazily_off_worker(
             Arc::clone(&self.embedding),
             Arc::clone(&self.shapes),
             move |semantic| {
-                find_references::handle_in(&store, semantic, &capabilities, &hints, params.clone())
+                find_references::handle_in_covered(
+                    &store,
+                    semantic,
+                    &capabilities,
+                    &hints,
+                    &uncovered,
+                    params.clone(),
+                )
             },
         )
         .await
@@ -726,15 +750,17 @@ impl GMeshMcpServer {
         }
         let (store, capabilities, hints, params) =
             (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
+        let uncovered = self.filter_coverage(params.file_paths.as_deref());
         find_definition::resolve_lazily_off_worker(
             Arc::clone(&self.embedding),
             Arc::clone(&self.shapes),
             move |semantic| {
-                find_callers_callees::handle_callers_in(
+                find_callers_callees::handle_callers_in_covered(
                     &store,
                     semantic,
                     &capabilities,
                     &hints,
+                    &uncovered,
                     params.clone(),
                 )
             },
@@ -753,15 +779,17 @@ impl GMeshMcpServer {
         }
         let (store, capabilities, hints, params) =
             (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
+        let uncovered = self.filter_coverage(params.file_paths.as_deref());
         find_definition::resolve_lazily_off_worker(
             Arc::clone(&self.embedding),
             Arc::clone(&self.shapes),
             move |semantic| {
-                find_callers_callees::handle_callees_in(
+                find_callers_callees::handle_callees_in_covered(
                     &store,
                     semantic,
                     &capabilities,
                     &hints,
+                    &uncovered,
                     params.clone(),
                 )
             },
@@ -783,11 +811,24 @@ impl GMeshMcpServer {
         }
         let (store, capabilities, hints, params) =
             (Arc::clone(&self.store), self.capabilities(), self.hints.clone(), params.0);
+        // `transitive` ignores `file_paths`, so it names nothing about them.
+        let uncovered = if params.transitive.unwrap_or(false) {
+            Vec::new()
+        } else {
+            self.filter_coverage(params.file_paths.as_deref())
+        };
         find_definition::resolve_lazily_off_worker(
             Arc::clone(&self.embedding),
             Arc::clone(&self.shapes),
             move |semantic| {
-                find_implementations::dispatch_in(&store, semantic, &capabilities, &hints, params.clone())
+                find_implementations::dispatch_in_covered(
+                    &store,
+                    semantic,
+                    &capabilities,
+                    &hints,
+                    &uncovered,
+                    params.clone(),
+                )
             },
         )
         .await
@@ -807,7 +848,8 @@ impl GMeshMcpServer {
             return Ok(early);
         }
         self.ensure_file_fresh(&ctx, "get_file_outline", call_started, &params.0.file_path).await;
-        get_file_outline::handle(&self.store, params.0)
+        let coverage = self.registry.path_coverage(&params.0.file_path);
+        get_file_outline::handle_covered(&self.store, coverage.as_ref(), params.0)
     }
 
     #[tool(
@@ -831,7 +873,8 @@ impl GMeshMcpServer {
         // `graph::queries::entry_point_rank_expr`). Read fresh per call: it
         // never changes while the daemon runs.
         let entry_points = self.registry.entry_points();
-        get_dependencies::handle(&self.store, &entry_points, &self.hints, params.0)
+        let coverage = params.0.file_path.as_deref().and_then(|path| self.registry.path_coverage(path));
+        get_dependencies::handle_covered(&self.store, &entry_points, &self.hints, coverage.as_ref(), params.0)
     }
 
     #[tool(

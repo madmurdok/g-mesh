@@ -242,7 +242,7 @@ const ERROR_BYTES: usize = 100;
 /// cause is the last non-empty line, whole even when its own text contains
 /// ": ". The outer contexts name the step and the inner cause names what went
 /// wrong; with 100 bytes, the cause is the part worth keeping.
-fn error_cause(error: &str) -> String {
+pub(super) fn error_cause(error: &str) -> String {
     let cause = error.lines().rev().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
     let cause = shorten_paths(cause);
     if cause.len() <= ERROR_BYTES {

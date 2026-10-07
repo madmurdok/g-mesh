@@ -166,9 +166,15 @@ pub fn missing(discovered: &DiscoveredPlugins) -> Vec<&'static CatalogueEntry> {
 /// - the catalogue's language for that extension has a discovered manifest
 ///   (the plugin is present, even if its manifest no longer claims this
 ///   extension - the manifest wins, so the file is simply not routed);
-/// - no catalogue entry claims the extension, or the path has none.
+/// - no catalogue entry claims the extension, or the path has none;
+/// - the path sits under one of that entry's own `exclude_dirs`
+///   (`venv/x.py`): installing the plugin would not index it either, so
+///   naming the install command there would be a false promise.
+///   Only that language's exclusions count, as in [`count_absent_files`].
 pub fn absent_for_path(discovered: &DiscoveredPlugins, file_path: &str) -> Option<&'static CatalogueEntry> {
-    absent_for_path_in(CATALOGUE, discovered, file_path)
+    let entry = absent_for_path_in(CATALOGUE, discovered, file_path)?;
+    let exclude_dirs: Vec<String> = entry.exclude_dirs.iter().map(|dir| (*dir).to_string()).collect();
+    (!under_excluded_dir(file_path, &exclude_dirs)).then_some(entry)
 }
 
 /// How many files under `root` each absent catalogue language would index
