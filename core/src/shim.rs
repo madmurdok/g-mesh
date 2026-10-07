@@ -1,3 +1,8 @@
+// The shim is its own process; its stderr goes to the MCP client, not the
+// shared daemon log, so `eprintln!` is fine here and in `shim::router`
+// (GM-520, clippy.toml).
+#![allow(clippy::disallowed_macros)]
+
 use std::fs::{self, File};
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
