@@ -243,9 +243,42 @@ impl ClientHandler for ProgressRecorder {
     }
 }
 
-/// The `replay: tool=get_file_outline` trace lines of `log`.
+/// How `trace_call` starts the replay line of a `get_file_outline` call.
+const REPLAY_TRACE_PREFIX: &str = "g-mesh daemon: replay: tool=get_file_outline ";
+
+/// The *complete* `get_file_outline` replay trace lines of `log`, without
+/// their newline. The daemon writes each log line, newline included, in one
+/// `write(2)` (`log_line!`), so a line counts only once its newline is there:
+/// a read that lands while a line is still being written must not see a
+/// truncated one, whatever the platform makes of a concurrent read and write.
 fn replay_trace_lines(log: &str) -> Vec<String> {
-    log.lines().filter(|line| line.contains("replay: tool=get_file_outline")).map(str::to_string).collect()
+    log.split_inclusive('\n')
+        .filter_map(|line| line.strip_suffix('\n'))
+        .filter(|line| line.starts_with(REPLAY_TRACE_PREFIX))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The value of `key` in a replay trace line: what follows `key=` up to the
+/// next field, `next` (the line's last field has none). The daemon writes the
+/// fields in a fixed order, and `summary` holds spaces, so a field ends where
+/// the next one's ` next=` begins, not at a space.
+fn trace_field<'a>(line: &'a str, key: &str, next: Option<&str>) -> &'a str {
+    let start = line
+        .find(&format!(" {key}="))
+        .unwrap_or_else(|| panic!("the trace line has no `{key}` field: {line}"))
+        + key.len()
+        + 2;
+    let rest = &line[start..];
+    match next {
+        Some(next) => {
+            let end = rest
+                .find(&format!(" {next}="))
+                .unwrap_or_else(|| panic!("the trace line has no `{next}` field after `{key}`: {line}"));
+            &rest[..end]
+        }
+        None => rest,
+    }
 }
 
 fn outline_request(file: &str) -> CallToolRequestParams {
@@ -331,21 +364,30 @@ async fn a_held_replay_with_a_token_gets_a_heartbeat_then_the_full_answer() {
         assert_eq!(notification.total, None, "no total is sent, matching the other progress tickers");
     }
 
-    project.wait_for("the replay's trace line to appear", || {
-        project.log_text().contains("replay: tool=get_file_outline")
+    // Wait for the whole, newline-terminated line, never for its prefix
+    // alone: parsing a line that is still being written reads a field cut
+    // short (GM-525).
+    project.wait_for("the replay's complete trace line to appear", || {
+        !replay_trace_lines(&project.log_text()).is_empty()
     });
     let log = project.log_text();
     let replay_lines = replay_trace_lines(&log);
     assert_eq!(replay_lines.len(), 1, "one tool call, one replay:\n{log}");
-    assert!(
-        replay_lines[0].contains("replayed=1") && replay_lines[0].contains("summary=typescript (1 file)"),
-        "the trace must record what was replayed and for which language: {}",
-        replay_lines[0]
+    let line = &replay_lines[0];
+    assert_eq!(
+        trace_field(line, "summary", Some("replayed")),
+        "typescript (1 file)",
+        "the trace must record which language's queue was replayed: {line}"
     );
-    assert!(
-        replay_lines[0].contains(&format!("progress_sent={}", seen.len())),
-        "the trace must record how many notifications the replay itself sent: {}",
-        replay_lines[0]
+    assert_eq!(
+        trace_field(line, "replayed", Some("elapsed_ms")),
+        "1",
+        "the trace must record how many files were replayed: {line}"
+    );
+    assert_eq!(
+        trace_field(line, "progress_sent", None),
+        seen.len().to_string(),
+        "the trace must record how many notifications the replay itself sent: {line}"
     );
 
     client.cancel().await.expect("failed to shut the client down");
