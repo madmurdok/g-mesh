@@ -1174,3 +1174,404 @@ fn an_overloadable_call_records_a_site_naming_its_structural_edge() {
     // `plain()` keeps its edge and gets no site.
     assert_eq!(graph.edge_between("here", "plain"), Some((EdgeKind::Calls, true)));
 }
+
+// --- property accessors (GM-511) ----------------------------------------------
+//
+// `docs/architecture/gm-511-python-property-accessors.md` section 5: a
+// property's getter, setter and deleter share `C.x` and are told apart by
+// `nativeKind` (`method`, `setter`, `deleter`).
+
+/// A property with all three accessors, and a method per kind of use.
+const ACCESSORS: &str = "def compute():\n\
+     \x20   pass\n\
+     \n\
+     def audit():\n\
+     \x20   pass\n\
+     \n\
+     def wipe():\n\
+     \x20   pass\n\
+     \n\
+     class C:\n\
+     \x20   @property\n\
+     \x20   def x(self):\n\
+     \x20       return compute()\n\
+     \n\
+     \x20   @x.setter\n\
+     \x20   def x(self, value):\n\
+     \x20       audit()\n\
+     \n\
+     \x20   @x.deleter\n\
+     \x20   def x(self):\n\
+     \x20       wipe()\n\
+     \n\
+     \x20   def load(self):\n\
+     \x20       return self.x\n\
+     \n\
+     \x20   def store(self, v):\n\
+     \x20       self.x = v\n\
+     \n\
+     \x20   def drop(self):\n\
+     \x20       del self.x\n\
+     \n\
+     \x20   def bump(self, v):\n\
+     \x20       self.x += v\n\
+     \n\
+     \x20   def annotate(self):\n\
+     \x20       self.x: int\n\
+     \n\
+     \x20   after = x\n";
+
+impl Graph {
+    /// The one node `qualified_name` with `native_kind`.
+    fn accessor(&self, qualified_name: &str, native_kind: &str) -> &WireNode {
+        let found: Vec<&WireNode> = self
+            .0
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.qualified_name == qualified_name && node.native_kind.as_deref() == Some(native_kind)
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "one {native_kind} {qualified_name:?} in {:#?}", self.names());
+        found[0]
+    }
+
+    /// Every `CALLS`/`REFERENCES` edge out of the node `from`, rendered
+    /// `<kind> <qualifiedName>[<nativeKind>]`, sorted - so a test sees which
+    /// accessor an edge landed on.
+    fn uses_from(&self, from: &WireNode) -> Vec<String> {
+        let mut uses: Vec<String> = self
+            .0
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.from_id == from.id && matches!(edge.kind, EdgeKind::Calls | EdgeKind::References)
+            })
+            .map(|edge| {
+                let to = self.by_id(&edge.to_id);
+                format!("{:?} {}[{}]", edge.kind, to.qualified_name, to.native_kind.as_deref().unwrap_or(""))
+            })
+            .collect();
+        uses.sort();
+        uses
+    }
+
+    fn uses(&self, from: &str) -> Vec<String> {
+        self.uses_from(self.node(from))
+    }
+}
+
+fn accessor_id(path: &str, qualified_name: &str, native_kind: &str) -> String {
+    g_mesh_plugin_sdk::ids::node_id(path, NodeKind::Function, qualified_name, Some(native_kind))
+}
+
+#[test]
+fn a_propertys_getter_setter_and_deleter_are_three_nodes() {
+    let tree = tree(&[("pkg/mod.py", ACCESSORS)]);
+    let graph = tree.extract("pkg/mod.py");
+    let all: Vec<&WireNode> = graph.0.nodes.iter().filter(|node| node.qualified_name == "C.x").collect();
+    let mut kinds: Vec<Option<&str>> = all.iter().map(|node| node.native_kind.as_deref()).collect();
+    kinds.sort();
+    assert_eq!(kinds, vec![Some("deleter"), Some("method"), Some("setter")], "{:#?}", graph.names());
+    let (getter, setter, deleter) =
+        (graph.accessor("C.x", "method"), graph.accessor("C.x", "setter"), graph.accessor("C.x", "deleter"));
+    for node in [getter, setter, deleter] {
+        assert_eq!(node.kind, NodeKind::Function);
+        assert_eq!(node.name, "x");
+    }
+    assert_eq!(setter.id, accessor_id("pkg/mod.py", "C.x", "setter"));
+    assert_eq!(deleter.id, accessor_id("pkg/mod.py", "C.x", "deleter"));
+    assert!(getter.id != setter.id && setter.id != deleter.id && getter.id != deleter.id);
+    // Each its own range: its own decorator through its own body.
+    let lines = |node: &WireNode| (node.range.start.line, node.range.end.line);
+    assert_eq!(lines(getter), (10, 12), "{:?}", getter.range);
+    assert_eq!(lines(setter), (14, 16), "{:?}", setter.range);
+    assert_eq!(lines(deleter), (18, 20), "{:?}", deleter.range);
+    let signature = |node: &WireNode| node.signature.clone().unwrap_or_default();
+    assert!(signature(getter).contains("@property"), "{}", signature(getter));
+    assert!(
+        signature(setter).contains("@x.setter") && signature(setter).contains("value"),
+        "{}",
+        signature(setter)
+    );
+    assert!(signature(deleter).contains("@x.deleter"), "{}", signature(deleter));
+}
+
+#[test]
+fn a_getter_keeps_the_id_a_property_without_accessors_has() {
+    let with = tree(&[("pkg/mod.py", ACCESSORS)]);
+    let with = with.extract("pkg/mod.py");
+    let without = tree(&[("pkg/mod.py", "class C:\n    @property\n    def x(self):\n        return 1\n")]);
+    let without = without.extract("pkg/mod.py");
+    let expected = accessor_id("pkg/mod.py", "C.x", "method");
+    assert_eq!(with.accessor("C.x", "method").id, expected);
+    assert_eq!(without.accessor("C.x", "method").id, expected);
+}
+
+#[test]
+fn a_property_without_accessors_is_still_one_method_node() {
+    let tree = tree(&[(
+        "pkg/mod.py",
+        "class C:\n\
+         \x20   @property\n\
+         \x20   def x(self):\n\
+         \x20       return 1\n\
+         \n\
+         \x20   def load(self):\n\
+         \x20       return self.x\n",
+    )]);
+    let graph = tree.extract("pkg/mod.py");
+    let all: Vec<&WireNode> = graph.0.nodes.iter().filter(|node| node.qualified_name == "C.x").collect();
+    assert_eq!(all.len(), 1, "{:#?}", graph.names());
+    assert_eq!(all[0].native_kind.as_deref(), Some("method"));
+    assert_eq!((all[0].range.start.line, all[0].range.end.line), (1, 3));
+    assert!(
+        graph.0.nodes.iter().all(|node| !matches!(node.native_kind.as_deref(), Some("setter" | "deleter"))),
+        "{:#?}",
+        graph.names()
+    );
+    assert_eq!(graph.uses("C.load"), vec!["References C.x[method]"]);
+    // Extraction stays a pure function of the source with the accessor table
+    // in play.
+    assert_eq!(graph.0, tree.extract("pkg/mod.py").0);
+}
+
+#[test]
+fn each_accessor_body_calls_from_its_own_node() {
+    let tree = tree(&[("pkg/mod.py", ACCESSORS)]);
+    let graph = tree.extract("pkg/mod.py");
+    assert_eq!(graph.uses_from(graph.accessor("C.x", "method")), vec!["Calls compute[function]"]);
+    assert_eq!(graph.uses_from(graph.accessor("C.x", "setter")), vec!["Calls audit[function]"]);
+    assert_eq!(graph.uses_from(graph.accessor("C.x", "deleter")), vec!["Calls wipe[function]"]);
+}
+
+#[test]
+fn an_accessor_decorator_is_no_edge() {
+    // ACCESSORS without the class-body `after = x`, so the class itself
+    // uses nothing but its decorators.
+    let source = ACCESSORS.replace("\n    after = x\n", "\n");
+    let tree = tree(&[("pkg/mod.py", &source)]);
+    let graph = tree.extract("pkg/mod.py");
+    assert_eq!(graph.uses("C"), Vec::<String>::new());
+    assert!(
+        graph.0.edges.iter().all(|edge| edge.kind == EdgeKind::Defines
+            || edge.kind == EdgeKind::Exports
+            || !graph.by_id(&edge.to_id).qualified_name.starts_with("C.x")
+            || ["C.load", "C.store", "C.drop", "C.bump", "C.annotate"]
+                .iter()
+                .any(|from| graph.node(from).id == edge.from_id)),
+        "only the use methods may reach C.x: {:#?}",
+        graph.0.edges
+    );
+}
+
+#[test]
+fn an_instance_use_reaches_the_accessor_it_runs() {
+    let tree = tree(&[("pkg/mod.py", ACCESSORS)]);
+    let graph = tree.extract("pkg/mod.py");
+    assert_eq!(graph.uses("C.load"), vec!["References C.x[method]"]);
+    assert_eq!(graph.uses("C.store"), vec!["References C.x[setter]"]);
+    assert_eq!(graph.uses("C.drop"), vec!["References C.x[deleter]"]);
+    assert_eq!(graph.uses("C.bump"), vec!["References C.x[method]", "References C.x[setter]"]);
+    // An annotation with no value stores nothing: a read of the getter.
+    assert_eq!(graph.uses("C.annotate"), vec!["References C.x[method]"]);
+}
+
+#[test]
+fn every_target_of_one_del_reaches_its_deleter() {
+    let tree = tree(&[(
+        "pkg/mod.py",
+        "class C:\n\
+         \x20   @property\n\
+         \x20   def x(self):\n\
+         \x20       pass\n\
+         \n\
+         \x20   @x.deleter\n\
+         \x20   def x(self):\n\
+         \x20       pass\n\
+         \n\
+         \x20   @property\n\
+         \x20   def y(self):\n\
+         \x20       pass\n\
+         \n\
+         \x20   @y.deleter\n\
+         \x20   def y(self):\n\
+         \x20       pass\n\
+         \n\
+         \x20   def both(self):\n\
+         \x20       del self.x, self.y\n\
+         \n\
+         \x20   def nested(self):\n\
+         \x20       del (self.x, [self.y])\n",
+    )]);
+    let graph = tree.extract("pkg/mod.py");
+    let both = vec!["References C.x[deleter]", "References C.y[deleter]"];
+    assert_eq!(graph.uses("C.both"), both);
+    assert_eq!(graph.uses("C.nested"), both);
+}
+
+#[test]
+fn a_store_to_a_property_with_no_setter_references_the_getter() {
+    let tree = tree(&[(
+        "pkg/mod.py",
+        "class C:\n\
+         \x20   @property\n\
+         \x20   def x(self):\n\
+         \x20       pass\n\
+         \n\
+         \x20   @x.deleter\n\
+         \x20   def x(self):\n\
+         \x20       pass\n\
+         \n\
+         \x20   def store(self, v):\n\
+         \x20       self.x = v\n\
+         \n\
+         \x20   def bump(self, v):\n\
+         \x20       self.x += v\n",
+    )]);
+    let graph = tree.extract("pkg/mod.py");
+    assert_eq!(graph.uses("C.store"), vec!["References C.x[method]"]);
+    assert_eq!(graph.uses("C.bump"), vec!["References C.x[method]"]);
+}
+
+#[test]
+fn a_class_qualified_use_of_a_property_references_the_getter() {
+    let source = format!(
+        "{ACCESSORS}\n\
+         def on_class(v):\n\
+         \x20   C.x = v\n\
+         \n\
+         def read_class():\n\
+         \x20   return C.x\n\
+         \n\
+         def drop_class():\n\
+         \x20   del C.x\n"
+    );
+    let tree = tree(&[("pkg/mod.py", &source)]);
+    let graph = tree.extract("pkg/mod.py");
+    for from in ["on_class", "read_class", "drop_class"] {
+        assert!(
+            graph.uses(from).contains(&"References C.x[method]".to_string())
+                && graph
+                    .uses(from)
+                    .iter()
+                    .all(|used| !used.contains("[setter]") && !used.contains("[deleter]")),
+            "{from}: {:?}",
+            graph.uses(from)
+        );
+    }
+}
+
+#[test]
+fn a_use_through_an_unknown_receiver_is_no_edge_and_no_open_site() {
+    let source = format!(
+        "{ACCESSORS}\n\
+         def through(obj, v):\n\
+         \x20   obj.x\n\
+         \x20   obj.x = v\n\
+         \x20   del obj.x\n"
+    );
+    let tree = tree(&[("pkg/mod.py", &source)]);
+    let graph = tree.extract("pkg/mod.py");
+    assert_eq!(graph.uses("through"), Vec::<String>::new());
+    assert_eq!(graph.open_site_names(), vec![]);
+}
+
+#[test]
+fn a_conditionally_repeated_setter_is_one_node_with_both_bodies() {
+    let tree = tree(&[(
+        "pkg/mod.py",
+        "FLAG = True\n\
+         \n\
+         def audit():\n\
+         \x20   pass\n\
+         \n\
+         def wipe():\n\
+         \x20   pass\n\
+         \n\
+         class C:\n\
+         \x20   @property\n\
+         \x20   def x(self):\n\
+         \x20       pass\n\
+         \n\
+         \x20   if FLAG:\n\
+         \x20       @x.setter\n\
+         \x20       def x(self, v):\n\
+         \x20           audit()\n\
+         \x20   else:\n\
+         \x20       @x.setter\n\
+         \x20       def x(self, v):\n\
+         \x20           wipe()\n",
+    )]);
+    let graph = tree.extract("pkg/mod.py");
+    let setter = graph.accessor("C.x", "setter");
+    assert_eq!((setter.range.start.line, setter.range.end.line), (14, 16), "{:?}", setter.range);
+    assert_eq!(graph.uses_from(setter), vec!["Calls audit[function]", "Calls wipe[function]"]);
+    assert!(graph.uses_from(graph.accessor("C.x", "method")).is_empty());
+}
+
+#[test]
+fn a_getter_replacement_merges_into_the_getter() {
+    let tree = tree(&[(
+        "pkg/mod.py",
+        "def compute():\n\
+         \x20   pass\n\
+         \n\
+         class C:\n\
+         \x20   @property\n\
+         \x20   def x(self):\n\
+         \x20       pass\n\
+         \n\
+         \x20   @x.getter\n\
+         \x20   def x(self):\n\
+         \x20       return compute()\n",
+    )]);
+    let graph = tree.extract("pkg/mod.py");
+    let all: Vec<Option<String>> = graph
+        .0
+        .nodes
+        .iter()
+        .filter(|node| node.qualified_name == "C.x")
+        .map(|node| node.native_kind.clone())
+        .collect();
+    assert_eq!(all, vec![Some("method".to_string())]);
+    assert_eq!(graph.uses_from(graph.accessor("C.x", "method")), vec!["Calls compute[function]"]);
+}
+
+#[test]
+fn an_accessor_shaped_decorator_outside_a_class_is_a_plain_function() {
+    let tree = tree(&[(
+        "pkg/mod.py",
+        "def audit():\n\
+         \x20   pass\n\
+         \n\
+         x = property(audit)\n\
+         \n\
+         @x.setter\n\
+         def x(v):\n\
+         \x20   pass\n",
+    )]);
+    let graph = tree.extract("pkg/mod.py");
+    // `x` is also the module variable `x = property(...)`; the `def` is the
+    // one `Function` of that name, and it is a plain `function`.
+    let defs: Vec<&WireNode> = graph
+        .0
+        .nodes
+        .iter()
+        .filter(|node| node.qualified_name == "x" && node.kind == NodeKind::Function)
+        .collect();
+    assert_eq!(defs.len(), 1, "{:#?}", graph.names());
+    assert_eq!(defs[0].native_kind.as_deref(), Some("function"));
+    assert!(
+        graph.0.nodes.iter().all(|node| !matches!(node.native_kind.as_deref(), Some("setter" | "deleter"))),
+        "{:#?}",
+        graph.names()
+    );
+}
+
+#[test]
+fn a_bare_name_in_the_class_body_after_the_accessors_is_the_getter() {
+    let tree = tree(&[("pkg/mod.py", ACCESSORS)]);
+    let graph = tree.extract("pkg/mod.py");
+    assert_eq!(graph.uses("C"), vec!["References C.x[method]"]);
+}
