@@ -132,7 +132,7 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
         let candidates = match store.step(|conn| count_candidates(conn, version)) {
             Ok(count) => count,
             Err(err) => {
-                eprintln!(
+                crate::log_line!(
                     "g-mesh daemon: failed to count nodes owed an embedding, skipping the backfill pass ({err:#})"
                 );
                 return BackfillSummary::default();
@@ -149,7 +149,7 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
             let page = match store.step(|conn| fetch_candidate_page(conn, version, after_id.as_deref(), PAGE_SIZE)) {
                 Ok(page) => page,
                 Err(err) => {
-                    eprintln!(
+                    crate::log_line!(
                         "g-mesh daemon: failed to read a page of nodes owed an embedding, stopping the \
                          backfill pass early ({err:#})"
                     );
@@ -241,7 +241,7 @@ fn fetch_candidate_page(
 fn hold_before_first_batch_for_tests() {
     let Some(path) = std::env::var_os(HOLD_FILE_ENV).filter(|p| !p.is_empty()) else { return };
     let path = std::path::PathBuf::from(path);
-    eprintln!(
+    crate::log_line!(
         "g-mesh daemon: holding the embedding backfill pass until {} is removed ({HOLD_FILE_ENV})",
         path.display()
     );

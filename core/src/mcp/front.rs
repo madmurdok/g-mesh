@@ -97,7 +97,7 @@ impl Front {
         match tokio::task::spawn_blocking(move || candidates::walk(&root, Limits::default())).await {
             Ok(walk) => walk,
             Err(err) => {
-                eprintln!("g-mesh daemon: the candidate walk panicked: {err}");
+                crate::log_line!("g-mesh daemon: the candidate walk panicked: {err}");
                 candidates::Walk {
                     candidates: Vec::new(),
                     entries_read: 0,

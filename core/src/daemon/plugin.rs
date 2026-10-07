@@ -256,7 +256,7 @@ fn parse_round_trip_timeout(raw: Option<&str>, default: Duration, name: &str) ->
         Ok(0) => default,
         Ok(millis) => Duration::from_millis(millis),
         Err(_) => {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: ignoring {name}={raw:?} - not a whole number of milliseconds; \
                  using the default {default:?}"
             );
@@ -338,7 +338,7 @@ pub const BUNDLED_LANGUAGE: &str = "typescript";
 /// complementary, not redundant.
 pub fn fingerprint(manifest: &PluginManifest) -> String {
     digest_of_plugin_build(&manifest.manifest_dir, &manifest.fingerprint_ignore).unwrap_or_else(|err| {
-        eprintln!(
+        crate::log_line!(
             "g-mesh: could not fingerprint the {} plugin at {}: {err:#} - \
                  a change to its extraction logic will not be noticed",
             manifest.language,
@@ -367,7 +367,7 @@ pub fn discovered_fingerprint() -> &'static str {
         match crate::daemon::manifest::discover(&crate::daemon::manifest::default_roots()) {
             Ok(discovered) => crate::daemon::registry::plugins_digest(&discovered),
             Err(err) => {
-                eprintln!(
+                crate::log_line!(
                     "g-mesh: could not discover plugins to fingerprint: {err:#} - a rebuilt plugin will \
                      not be noticed"
                 );
@@ -955,7 +955,7 @@ impl PluginProcess {
                     "its change to {file_path} could not be applied ({err:#}), so its cached copy of \
                      that file is ahead of the index - a fresh process re-extracts it in full"
                 )) {
-                    eprintln!(
+                    crate::log_line!(
                         "g-mesh daemon: could not relaunch the {} plugin after a failed apply \
                          ({relaunch_err:#}) - {file_path} may stay stale until the plugin restarts",
                         self.manifest.language
@@ -1119,7 +1119,7 @@ impl PluginProcess {
                 "its query-time reindex of {file_path} could not be applied ({err:#}), so its cached \
                  copy of that file is ahead of the index - a fresh process re-extracts it in full"
             )) {
-                eprintln!(
+                crate::log_line!(
                     "g-mesh daemon: could not relaunch the {} plugin after a failed query-time \
                      reindex ({relaunch_err:#}) - {file_path} may stay stale until the plugin restarts",
                     self.manifest.language
@@ -1304,7 +1304,7 @@ impl PluginProcess {
             return;
         }
         if let Err(relaunch_err) = self.relaunch(&format!("the process exited unexpectedly ({err:#})")) {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: failed to relaunch the {} plugin after a control-plane timeout: {relaunch_err:#}",
                 self.manifest.language
             );
@@ -1375,7 +1375,7 @@ impl PluginProcess {
     /// `Mutex`.
     fn kill_on_timeout<'a>(&'a self, child: &'a mut Child) -> impl FnMut() + 'a {
         move || {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: the {} plugin did not answer a control-plane request in time - \
                  killing it so a fresh process can take over",
                 self.manifest.language
@@ -1432,7 +1432,7 @@ impl PluginProcess {
     /// was killed, and what keeps a relaunched *live* plugin from leaving its
     /// tsserver running or its pid a zombie.
     fn relaunch(&self, why: &str) -> Result<()> {
-        eprintln!("g-mesh daemon: relaunching the {} plugin: {why}", self.manifest.language);
+        crate::log_line!("g-mesh daemon: relaunching the {} plugin: {why}", self.manifest.language);
         let fresh = PluginState::spawn(&self.project_root, &self.manifest)?;
         let pid = fresh.child.id();
         let replaced = std::mem::replace(&mut *self.state(), fresh);
@@ -1440,7 +1440,7 @@ impl PluginProcess {
         // Outside the state lock: the fresh process is already serving, and
         // waiting out the old one's grace period must not hold up a request.
         if let Err(err) = replaced.end(RELAUNCH_GRACE) {
-            eprintln!(
+            crate::log_line!(
                 "g-mesh daemon: the replaced {} plugin process did not shut down cleanly: {err:#}",
                 self.manifest.language
             );

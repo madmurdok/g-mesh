@@ -49,9 +49,11 @@ pub(crate) fn hold_point(point: &str, language: &str) {
         return;
     }
     if let Err(err) = write_pid(&dir, &format!("{point}-{language}")) {
-        eprintln!("[{language}] {HOLD_DIR_ENV}: failed to record the pid at hold point {point}: {err}");
+        crate::log_line!(
+            "[{language}] {HOLD_DIR_ENV}: failed to record the pid at hold point {point}: {err}"
+        );
     }
-    eprintln!("[{language}] {HOLD_DIR_ENV}: holding at {point} while {} exists", hold.display());
+    crate::log_line!("[{language}] {HOLD_DIR_ENV}: holding at {point} while {} exists", hold.display());
     let started = Instant::now();
     while hold.exists() && started.elapsed() < MAX_HOLD {
         std::thread::sleep(POLL);

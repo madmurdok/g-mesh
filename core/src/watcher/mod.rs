@@ -119,7 +119,7 @@ impl ProjectWatcher {
                 // inotify watch, so only *this* subtree needs a fallback,
                 // not the whole project.
                 let affected = err.paths.first().cloned().unwrap_or_else(|| root.to_path_buf());
-                eprintln!(
+                crate::log_line!(
                     "g-mesh: inotify watch limit reached at {} - falling back to polling for that subtree",
                     affected.display()
                 );

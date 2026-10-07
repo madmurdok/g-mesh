@@ -209,7 +209,7 @@ pub fn run_with_progress(
             // A count is a courtesy: losing it costs the PluginAbsent lines,
             // never the walk.
             Some(Err(_)) => {
-                eprintln!(
+                crate::log_line!(
                     "g-mesh: counting the files of languages with no plugin installed panicked - skipped"
                 );
                 BTreeMap::new()
@@ -281,7 +281,7 @@ pub fn run_with_progress(
     ) {
         Ok(baselines) => {
             if baselines.skipped > 0 {
-                eprintln!(
+                crate::log_line!(
                     "g-mesh: {} of {} walked files got no staleness baseline (modified during or just \
                      before the walk) - each reindexes on its first query",
                     baselines.skipped,
@@ -289,7 +289,7 @@ pub fn run_with_progress(
                 );
             }
         }
-        Err(err) => eprintln!(
+        Err(err) => crate::log_line!(
             "g-mesh: could not record the walk's staleness baselines - every file reindexes on its first \
              query: {err:#}"
         ),
@@ -441,7 +441,7 @@ fn hold_the_walk_open_for_tests() {
     // action, not blurred by a delay on top.
     if let Some(path) = std::env::var_os(WALK_HOLD_FILE_ENV).filter(|p| !p.is_empty()) {
         let path = std::path::PathBuf::from(path);
-        eprintln!(
+        crate::log_line!(
             "g-mesh daemon: holding the finished bulk walk until {} is removed ({WALK_HOLD_FILE_ENV})",
             path.display()
         );
@@ -457,7 +457,7 @@ fn hold_the_walk_open_for_tests() {
     let Some(millis) = std::env::var(WALK_DELAY_ENV).ok().and_then(|v| v.trim().parse().ok()) else {
         return;
     };
-    eprintln!("g-mesh daemon: holding the finished bulk walk open for {millis}ms ({WALK_DELAY_ENV})");
+    crate::log_line!("g-mesh daemon: holding the finished bulk walk open for {millis}ms ({WALK_DELAY_ENV})");
     std::thread::sleep(std::time::Duration::from_millis(millis));
 }
 
@@ -503,7 +503,7 @@ fn ingest_in<R: BufRead>(reader: R, store: &mut Writer<'_>, ctx: &mut WalkContex
                 if err.downcast_ref::<std::io::Error>().is_some() {
                     return Err(err).context("failed to read the plugin's bulk-index stream");
                 }
-                eprintln!("g-mesh daemon: skipping malformed bulk-index line: {err:#}");
+                crate::log_line!("g-mesh daemon: skipping malformed bulk-index line: {err:#}");
                 ctx.summary.skipped_lines += 1;
                 continue;
             }

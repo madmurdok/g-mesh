@@ -157,7 +157,7 @@ fn parse_args() -> Args {
 }
 
 fn fail(message: &str) -> ! {
-    eprintln!("g-mesh-fake-plugin: {message}");
+    g_mesh_plugin_sdk::log_line!("g-mesh-fake-plugin: {message}");
     process::exit(2);
 }
 
@@ -208,7 +208,7 @@ fn serve(mut handle: impl FnMut(Value)) -> ! {
             Ok(Some(body)) => match serde_json::from_slice(&body) {
                 Ok(message) => handle(message),
                 Err(err) => {
-                    eprintln!("g-mesh-fake-plugin: frame body is not JSON: {err}");
+                    g_mesh_plugin_sdk::log_line!("g-mesh-fake-plugin: frame body is not JSON: {err}");
                     process::exit(1);
                 }
             },
