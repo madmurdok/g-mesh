@@ -423,6 +423,150 @@ fn a_root_that_is_gone_is_reported_ahead_of_an_executable_that_is_also_gone() {
     assert_eq!(orphan_check(&root, Ok(exe), None), Some(Orphaned::ProjectRootGone(root)));
 }
 
+/// The pid of a process that has run, exited and been reaped by this test,
+/// so nothing can still be answering to it (short of pid reuse, which the
+/// kernel does not do this soon). Stands in for a test process that died.
+fn an_exited_and_reaped_pid() -> u32 {
+    #[cfg(unix)]
+    let mut child = std::process::Command::new("true");
+    #[cfg(windows)]
+    let mut child = {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "exit 0"]);
+        cmd
+    };
+    let mut child = child
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn a short-lived helper");
+    let pid = child.id();
+    child.wait().expect("failed to reap the short-lived helper");
+    assert!(!crate::process::is_alive(pid), "a reaped helper must read as gone");
+    pid
+}
+
+/// The name is part of the contract with the test suite's `Lifeline` helper
+/// and with anyone reading a daemon's environment.
+#[test]
+fn the_lifeline_variable_has_its_documented_name() {
+    assert_eq!(LIFELINE_PID_ENV, "G_MESH_LIFELINE_PID");
+}
+
+/// A lifeline that is still running is no reason to stop: this test's own
+/// process is alive by construction.
+#[test]
+fn a_live_lifeline_is_not_an_orphan() {
+    let project = tempfile::tempdir().expect("failed to create a project root");
+    let exe = tempfile::NamedTempFile::new().expect("failed to create a stand-in executable");
+
+    assert_eq!(orphan_check(project.path(), Ok(exe.path().to_path_buf()), Some(std::process::id())), None);
+}
+
+/// The test process that started this daemon is gone, so nothing will
+/// ever tear the daemon down - it has to notice by itself. Root and executable
+/// are intact, so the lifeline is the only thing that can produce a verdict.
+#[test]
+fn an_exited_lifeline_is_an_orphan() {
+    let project = tempfile::tempdir().expect("failed to create a project root");
+    let exe = tempfile::NamedTempFile::new().expect("failed to create a stand-in executable");
+    let gone = an_exited_and_reaped_pid();
+
+    assert_eq!(
+        orphan_check(project.path(), Ok(exe.path().to_path_buf()), Some(gone)),
+        Some(Orphaned::LifelineGone(gone))
+    );
+}
+
+/// The log line has to say which pid it judged and where that pid came from,
+/// or a daemon that stopped for this reason looks like it stopped for none.
+#[test]
+fn a_gone_lifeline_names_its_pid_and_variable() {
+    let reason = Orphaned::LifelineGone(4242).to_string();
+    assert!(reason.contains("4242"), "the reason must name the pid: {reason}");
+    assert!(reason.contains(LIFELINE_PID_ENV), "the reason must name the variable: {reason}");
+}
+
+/// No lifeline (production) is never evidence, whatever else is true: with
+/// root and exe intact, and with an exe that cannot be resolved.
+#[test]
+fn no_lifeline_is_never_evidence() {
+    let project = tempfile::tempdir().expect("failed to create a project root");
+    let exe = tempfile::NamedTempFile::new().expect("failed to create a stand-in executable");
+
+    assert_eq!(orphan_check(project.path(), Ok(exe.path().to_path_buf()), None), None);
+    let unresolvable = Err(io::Error::new(io::ErrorKind::PermissionDenied, "cannot read /proc/self/exe"));
+    assert_eq!(orphan_check(project.path(), unresolvable, None), None);
+}
+
+/// A deleted checkout is still the fact worth logging, even when the test
+/// process that started the daemon is gone too.
+#[test]
+fn a_root_that_is_gone_is_reported_ahead_of_a_lifeline_that_is_also_gone() {
+    let project = tempfile::tempdir().expect("failed to create a project root");
+    let root = project.path().to_path_buf();
+    let exe = tempfile::NamedTempFile::new().expect("failed to create a stand-in executable");
+    project.close().expect("failed to delete the project root");
+    let gone = an_exited_and_reaped_pid();
+
+    assert_eq!(
+        orphan_check(&root, Ok(exe.path().to_path_buf()), Some(gone)),
+        Some(Orphaned::ProjectRootGone(root))
+    );
+}
+
+/// The executable is judged before the lifeline too: the lifeline is judged last.
+#[test]
+fn an_executable_that_is_gone_is_reported_ahead_of_a_lifeline_that_is_also_gone() {
+    let project = tempfile::tempdir().expect("failed to create a project root");
+    let exe_dir = tempfile::tempdir().expect("failed to create an executable directory");
+    let exe = exe_dir.path().join("g-mesh");
+    let gone = an_exited_and_reaped_pid();
+
+    assert_eq!(
+        orphan_check(project.path(), Ok(exe.clone()), Some(gone)),
+        Some(Orphaned::ExecutableGone(exe))
+    );
+}
+
+/// A `current_exe()` that failed says nothing about the executable, and it
+/// must not hide the lifeline either: the lifeline is still judged.
+#[test]
+fn an_unresolvable_executable_does_not_hide_a_gone_lifeline() {
+    let project = tempfile::tempdir().expect("failed to create a project root");
+    let gone = an_exited_and_reaped_pid();
+
+    let unresolvable = Err(io::Error::new(io::ErrorKind::PermissionDenied, "cannot read /proc/self/exe"));
+    assert_eq!(orphan_check(project.path(), unresolvable, Some(gone)), Some(Orphaned::LifelineGone(gone)));
+
+    let unresolvable = Err(io::Error::new(io::ErrorKind::PermissionDenied, "cannot read /proc/self/exe"));
+    assert_eq!(orphan_check(project.path(), unresolvable, Some(std::process::id())), None);
+}
+
+/// Unset is production and reads as no lifeline; a value that does not parse
+/// as a pid is ignored rather than read as a dead one, so a malformed
+/// variable can never end a daemon. A well-formed pid (whitespace trimmed)
+/// is read as itself, which is what makes the `None`s above mean "rejected"
+/// rather than "never read".
+#[test]
+fn only_a_well_formed_pid_in_the_environment_is_a_lifeline() {
+    let _guard = ENV_LOCK.lock().unwrap();
+
+    std::env::remove_var(LIFELINE_PID_ENV);
+    assert_eq!(lifeline_pid(), None, "unset");
+
+    for garbage in ["", "   ", "not-a-pid", "-1", "12abc", "1.5", "99999999999999999999"] {
+        std::env::set_var(LIFELINE_PID_ENV, garbage);
+        assert_eq!(lifeline_pid(), None, "{garbage:?} must not read as a lifeline");
+    }
+
+    std::env::set_var(LIFELINE_PID_ENV, " 4242\n");
+    assert_eq!(lifeline_pid(), Some(4242));
+
+    std::env::remove_var(LIFELINE_PID_ENV);
+}
+
 /// The discriminating half of [`is_definitely_gone`]: a path whose *parent*
 /// does not exist is itself absent, while a path that is merely empty, or
 /// a directory, is present. Only `NotFound` may ever end a daemon.
