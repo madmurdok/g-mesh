@@ -189,6 +189,9 @@ fn a_computed_key_inside_a_pattern_parameter_is_walked() {
 fn the_name_a_defaulted_pattern_binds_is_not_a_use() {
     let graph = extract(PATH, "function y() {}\nfunction d() {}\nfunction k({ y = d() }) {}\n");
     assert_edge!(graph, Calls, "k", "d");
+    // Guard only: no known code revert makes these two fail, because the
+    // visitor never records a use for a shorthand_property_identifier_pattern
+    // node. The k->d half above is the part a control pins.
     assert_no_edge!(graph, Calls, "k", "y");
     assert_no_edge!(graph, References, "k", "y");
 }
