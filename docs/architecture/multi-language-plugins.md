@@ -737,7 +737,15 @@ The kit runs the plugin exactly as the daemon does (spawn, handshake, `--bulk-in
 - **Capabilities:**
   - `semantic_pass = false` plugins are never sent the request;
   - `receiver_calls = "resolved"` is backed by the expectations file actually
-    containing receiver calls.
+    containing receiver calls;
+  - `files_created = true` (GM-516, `capabilities.files-created-resolves`):
+    the kit creates a new target and a new importer, sends `filesCreated`
+    (no `id`), then `fileChanged` importer-first, and requires the importer's
+    `IMPORTS` edge to land on the target (or a container holding it). The two
+    files come from a `[files_created]` table in `expect.toml` (`target`,
+    `target_text`, `importer`, `importer_text`, all required); a declaring
+    plugin without the table is `SKIP`, a non-declaring one is never sent the
+    notification and is `SKIP`. See `docs/architecture/gm-516-check-files-created.md`.
 - **Expectations** (`expect.toml`, per language), checked after linking. Each is
   answered by the same query code the MCP tools use:
 

@@ -87,6 +87,18 @@
 //! - **`capabilities.semantic-engine-lazy`** (only for `semantic_pass =
 //!   true`) - the semantic-engine marker (see `session::MARKER_DIR_ENV`) did
 //!   not exist yet when the first `semanticPass` frame was written.
+//! - **`capabilities.files-created-resolves`** (only for `files_created =
+//!   true`, and only with an `--expect` file naming a `[files_created]`
+//!   pair - `expectations`' decision 14) - a target file and a file
+//!   importing it, created in one batch, announced by one id-less
+//!   `filesCreated` and routed importer first on a fresh plugin process and
+//!   a fresh index (`session::run_files_created_session`), end with an
+//!   `IMPORTS` edge from the importer onto a node of the target file, or
+//!   onto a core-owned container the target file is a member of (the
+//!   Python plugin addresses a module import at its container, the dotted
+//!   module key). A plugin that ignores the notification resolves the
+//!   import against a file set without the target, and the edge lands on an
+//!   `external_module` instead (GM-516).
 //!
 //! # Why `semanticPass` diffs are held to fewer rules
 //!
@@ -108,9 +120,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::cli::plugin_check::expectations::FilesCreatedPair;
 use crate::cli::plugin_check::report::{CheckResult, Outcome};
 use crate::cli::plugin_check::session::{
-    BulkLine, BulkRun, EditTarget, Exchange, Method, Session, StoredRange,
+    BulkLine, BulkRun, EditTarget, Exchange, FilesCreatedRun, Method, Session, StoredRange,
 };
 use crate::daemon::manifest::PluginManifest;
 use crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND;
@@ -146,6 +159,35 @@ pub(crate) struct RunData<'a> {
     /// Setup and session failures, in the order they happened.
     pub failures: Vec<String>,
     pub marker_exists_at_end: bool,
+    pub files_created: FilesCreatedEvidence<'a>,
+}
+
+/// Where the `[files_created]` pair came from, as `mod.rs` found it.
+#[derive(Clone, Copy)]
+pub(crate) enum FilesCreatedConfig<'a> {
+    /// No `--expect`, or an expectations file without the table.
+    Absent,
+    /// The expectations file did not read or parse.
+    Unparsed,
+    Pair(&'a FilesCreatedPair),
+}
+
+/// `capabilities.files-created-resolves`' evidence.
+pub(crate) struct FilesCreatedEvidence<'a> {
+    pub config: FilesCreatedConfig<'a>,
+    /// `session::files_created_pair_findings` - empty when the pair is
+    /// runnable (or there is none).
+    pub pair_findings: Vec<String>,
+    /// `None` when the session was not run.
+    pub run: Option<&'a FilesCreatedRun>,
+}
+
+#[cfg(test)]
+impl FilesCreatedEvidence<'_> {
+    /// No pair, nothing run - what every plugin without `--expect` gets.
+    pub(crate) fn absent() -> Self {
+        Self { config: FilesCreatedConfig::Absent, pair_findings: Vec::new(), run: None }
+    }
 }
 
 /// What a node needs to be to be judged: which file it belongs to, and what
@@ -238,6 +280,7 @@ pub(crate) fn evaluate(run: &RunData) -> Vec<CheckResult> {
         diff_stays_in_file(run, &walk),
     ];
     results.extend(capabilities(run));
+    results.push(files_created_resolves(run));
     results
 }
 
@@ -842,12 +885,99 @@ fn capabilities(run: &RunData) -> [CheckResult; 2] {
     [result(UNDECLARED, not_applicable), result(LAZY, lazy)]
 }
 
+/// `capabilities.files-created-resolves` - see the module doc. The outcome
+/// table, in evaluation order: not declared, not configured, the main run
+/// not reached, an invalid pair, the files-created session failed, then the
+/// verdict on the importer's `IMPORTS` rows.
+fn files_created_resolves(run: &RunData) -> CheckResult {
+    const ID: &str = "capabilities.files-created-resolves";
+    if !run.manifest.capabilities.files_created {
+        return result(
+            ID,
+            Outcome::Skip("not applicable: the manifest declares files_created = false".to_string()),
+        );
+    }
+    let evidence = &run.files_created;
+    let pair = match evidence.config {
+        FilesCreatedConfig::Absent => {
+            return result(
+                ID,
+                Outcome::Skip(
+                    "not configured: the manifest declares files_created but no expectations file names a \
+                     [files_created] pair - see `expectations`' decision 14"
+                        .to_string(),
+                ),
+            );
+        }
+        FilesCreatedConfig::Unparsed => {
+            return result(
+                ID,
+                Outcome::Skip(
+                    "not configured: the expectations file did not parse (see `expectations.file`)"
+                        .to_string(),
+                ),
+            );
+        }
+        FilesCreatedConfig::Pair(pair) => pair,
+    };
+    if !run.bulk[0].complete() {
+        return result(ID, Outcome::Skip(BULK_INCOMPLETE.to_string()));
+    }
+    match run.session {
+        None => return result(ID, not_reached("the control-plane session started")),
+        Some(session) if session.failure.is_some() => {
+            return result(ID, not_reached("the files-created session could run"));
+        }
+        Some(_) => {}
+    }
+    if !evidence.pair_findings.is_empty() {
+        return result(ID, Outcome::Fail(evidence.pair_findings.clone()));
+    }
+    let rows = match evidence.run {
+        Some(FilesCreatedRun { session, import_rows: Some(rows) }) if session.failure.is_none() => rows,
+        _ => {
+            return result(
+                ID,
+                Outcome::Skip("not reached: the files-created session failed (see `session`)".to_string()),
+            );
+        }
+    };
+    if rows.iter().any(|row| row.to_file == pair.target || row.container_member_files.contains(&pair.target))
+    {
+        return result(ID, Outcome::Pass);
+    }
+    let mut findings = vec![format!(
+        "{} and {} were created in one batch and announced by filesCreated, importer routed first, but no \
+         IMPORTS edge from {} lands on a node of {} or on a container it is a member of",
+        pair.importer, pair.target, pair.importer, pair.target
+    )];
+    if rows.is_empty() {
+        findings.push(format!("{} has no IMPORTS edge at all", pair.importer));
+    }
+    for row in rows {
+        let members = if row.container_member_files.is_empty() {
+            String::new()
+        } else {
+            format!(", a container of {}", row.container_member_files.join(", "))
+        };
+        findings.push(format!(
+            "IMPORTS lands on {} {:?} in {:?}{}{members} (resolved: {})",
+            row.to_kind,
+            row.to_name,
+            row.to_file,
+            row.to_native_kind.as_deref().map(|k| format!(" nativeKind {k}")).unwrap_or_default(),
+            row.resolved
+        ));
+    }
+    result(ID, Outcome::Fail(findings))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::cli::plugin_check::session::{parse_bulk_lines, Response};
+    use crate::cli::plugin_check::session::{parse_bulk_lines, ImportRow, Response};
     use crate::daemon::manifest::{Capabilities, WorkspaceConfig};
 
     fn manifest(semantic_pass: bool) -> PluginManifest {
@@ -922,6 +1052,7 @@ mod tests {
             session: None,
             failures: Vec::new(),
             marker_exists_at_end: false,
+            files_created: FilesCreatedEvidence::absent(),
         })
     }
 
@@ -998,6 +1129,7 @@ mod tests {
             session: Some(&session),
             failures: Vec::new(),
             marker_exists_at_end: false,
+            files_created: FilesCreatedEvidence::absent(),
         };
         let results = evaluate(&data);
         assert!(matches!(outcome_of(&results, "capabilities.semantic-pass-undeclared"), Outcome::Fail(_)));
@@ -1017,6 +1149,7 @@ mod tests {
             session: Some(&session),
             failures: Vec::new(),
             marker_exists_at_end,
+            files_created: FilesCreatedEvidence::absent(),
         };
         let lazy = |data: RunData| outcome_of(&evaluate(&data), "capabilities.semantic-engine-lazy");
         assert!(matches!(lazy(data(false)), Outcome::Skip(reason) if reason.starts_with("not instrumented")));
@@ -1105,6 +1238,7 @@ mod tests {
                 session: Some(&session),
                 failures: Vec::new(),
                 marker_exists_at_end: false,
+                files_created: FilesCreatedEvidence::absent(),
             };
             outcome_of(&evaluate(&data), "id-stability.declaration-edit-applies")
         };
@@ -1140,5 +1274,215 @@ mod tests {
             outcome(&target(None), fresh.clone(), fresh),
             Outcome::Skip(reason) if reason.contains("no declaration")
         ));
+    }
+
+    // --- capabilities.files-created-resolves (GM-516) -----------------------
+
+    const FILES_CREATED: &str = "capabilities.files-created-resolves";
+
+    fn pair() -> FilesCreatedPair {
+        FilesCreatedPair {
+            target: "pkg/target.fk".to_string(),
+            target_text: "fn created\n".to_string(),
+            importer: "importer.fk".to_string(),
+            importer_text: "import pkg/target.fk\n".to_string(),
+        }
+    }
+
+    fn import_row(to_file: &str, native_kind: Option<&str>, members: &[&str]) -> ImportRow {
+        ImportRow {
+            to_file: to_file.to_string(),
+            to_kind: "Module".to_string(),
+            to_name: "target".to_string(),
+            to_native_kind: native_kind.map(str::to_string),
+            resolved: native_kind != Some(EXTERNAL_MODULE_NATIVE_KIND),
+            container_member_files: members.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
+    fn files_created_run(failure: Option<&str>, rows: Option<Vec<ImportRow>>) -> FilesCreatedRun {
+        FilesCreatedRun {
+            session: Session { failure: failure.map(str::to_string), ..Session::default() },
+            import_rows: rows,
+        }
+    }
+
+    /// The check's verdict over hand-built evidence: a conformant main run
+    /// (complete bulk run 1, a session without a failure) unless the caller
+    /// says otherwise.
+    fn files_created_outcome(
+        declared: bool,
+        bulk1: &BulkRun,
+        session: Option<&Session>,
+        files_created: FilesCreatedEvidence,
+    ) -> Outcome {
+        let mut manifest = manifest(false);
+        manifest.capabilities.files_created = declared;
+        let data = RunData {
+            manifest: &manifest,
+            bulk: [bulk1, bulk1],
+            target: None,
+            bulk_file_ids: None,
+            bulk_edited_ranges: None,
+            session,
+            failures: Vec::new(),
+            marker_exists_at_end: false,
+            files_created,
+        };
+        outcome_of(&evaluate(&data), FILES_CREATED)
+    }
+
+    fn evidence<'a>(
+        pair: &'a FilesCreatedPair,
+        pair_findings: &[&str],
+        run: Option<&'a FilesCreatedRun>,
+    ) -> FilesCreatedEvidence<'a> {
+        FilesCreatedEvidence {
+            config: FilesCreatedConfig::Pair(pair),
+            pair_findings: pair_findings.iter().map(|f| f.to_string()).collect(),
+            run,
+        }
+    }
+
+    /// D4's first rows: a non-declarer is not applicable whatever it was
+    /// given (control: drop the `files_created` gate at the top of
+    /// `files_created_resolves`), and a declarer with no pair - no file, no
+    /// table, or a file that did not parse - is `Skip`, never `Pass`.
+    #[test]
+    fn files_created_is_skipped_when_undeclared_or_not_configured() {
+        let run = bulk(&conformant_lines());
+        let session = Session::default();
+        let pair = pair();
+        let passing = files_created_run(None, Some(vec![import_row("pkg/target.fk", None, &[])]));
+
+        let undeclared =
+            files_created_outcome(false, &run, Some(&session), evidence(&pair, &[], Some(&passing)));
+        assert!(
+            matches!(&undeclared, Outcome::Skip(reason) if reason.starts_with("not applicable") && reason.contains("files_created = false")),
+            "{undeclared:?}"
+        );
+
+        let absent = files_created_outcome(true, &run, Some(&session), FilesCreatedEvidence::absent());
+        assert!(
+            matches!(&absent, Outcome::Skip(reason) if reason.starts_with("not configured") && reason.contains("[files_created]")),
+            "{absent:?}"
+        );
+
+        let unparsed = FilesCreatedEvidence {
+            config: FilesCreatedConfig::Unparsed,
+            pair_findings: Vec::new(),
+            run: None,
+        };
+        let unparsed = files_created_outcome(true, &run, Some(&session), unparsed);
+        assert!(
+            matches!(&unparsed, Outcome::Skip(reason) if reason.starts_with("not configured") && reason.contains("did not parse")),
+            "{unparsed:?}"
+        );
+    }
+
+    /// A main run that never got far enough, or a files-created session that
+    /// failed, is `Skip` "not reached" - the failure is `session`'s to
+    /// report, not this check's (control: return `Pass`/`Fail` instead of
+    /// the `Skip` on a failed files-created run).
+    #[test]
+    fn files_created_is_not_reached_when_a_session_failed() {
+        let run = bulk(&conformant_lines());
+        let session = Session::default();
+        let pair = pair();
+        let passing = files_created_run(None, Some(vec![import_row("pkg/target.fk", None, &[])]));
+
+        let mut incomplete = bulk(&conformant_lines());
+        incomplete.failure = Some("timed out".to_string());
+        let outcome =
+            files_created_outcome(true, &incomplete, Some(&session), evidence(&pair, &[], Some(&passing)));
+        assert_eq!(outcome, Outcome::Skip(BULK_INCOMPLETE.to_string()));
+
+        let outcome = files_created_outcome(true, &run, None, evidence(&pair, &[], Some(&passing)));
+        assert!(
+            matches!(&outcome, Outcome::Skip(reason) if reason.starts_with("not reached")),
+            "{outcome:?}"
+        );
+
+        let failed_main =
+            Session { failure: Some("fileChanged #1: timeout".to_string()), ..Session::default() };
+        let outcome =
+            files_created_outcome(true, &run, Some(&failed_main), evidence(&pair, &[], Some(&passing)));
+        assert!(
+            matches!(&outcome, Outcome::Skip(reason) if reason.starts_with("not reached")),
+            "{outcome:?}"
+        );
+
+        for failed in [None, Some(files_created_run(Some("files-created: no response within 1s"), None))] {
+            let outcome =
+                files_created_outcome(true, &run, Some(&session), evidence(&pair, &[], failed.as_ref()));
+            assert!(
+                matches!(&outcome, Outcome::Skip(reason) if reason.contains("the files-created session failed")),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    /// An invalid pair fails the check with the validation's own findings,
+    /// whatever a run would have said (control: ignore `pair_findings`).
+    #[test]
+    fn an_invalid_files_created_pair_fails_with_its_findings() {
+        let run = bulk(&conformant_lines());
+        let session = Session::default();
+        let pair = pair();
+        let finding =
+            "[files_created] target = \"a.fk\" already exists in the fixture - the pair must name new files";
+        let outcome = files_created_outcome(true, &run, Some(&session), evidence(&pair, &[finding], None));
+        assert_eq!(outcome, Outcome::Fail(vec![finding.to_string()]));
+    }
+
+    /// The verdict (D2 as amended): `Pass` when an `IMPORTS` edge from the
+    /// importer lands on a node of the target file, or on a container one of
+    /// whose members lives in the target file (the Python plugin's module
+    /// import); `Fail` listing every landing otherwise. Controls: drop
+    /// `container_member_files` from the pass condition (the container row
+    /// then fails), or drop the `to_file` half (the file row fails).
+    #[test]
+    fn files_created_passes_on_a_file_node_or_a_container_of_the_target() {
+        let run = bulk(&conformant_lines());
+        let session = Session::default();
+        let pair = pair();
+        let verdict = |rows: Vec<ImportRow>| {
+            let created = files_created_run(None, Some(rows));
+            files_created_outcome(true, &run, Some(&session), evidence(&pair, &[], Some(&created)))
+        };
+
+        assert_eq!(verdict(vec![import_row("pkg/target.fk", None, &[])]), Outcome::Pass);
+        assert_eq!(
+            verdict(vec![import_row("", Some("container"), &["pkg/other.fk", "pkg/target.fk"])]),
+            Outcome::Pass,
+            "a container the target file is a member of counts"
+        );
+
+        // A container of other files only, and an external module, both fail
+        // - and the finding names each landing.
+        let outcome = verdict(vec![
+            import_row("", Some("container"), &["pkg/other.fk"]),
+            import_row("importer.fk", Some(EXTERNAL_MODULE_NATIVE_KIND), &[]),
+        ]);
+        let Outcome::Fail(findings) = outcome else { panic!("expected a FAIL, got {outcome:?}") };
+        assert!(findings[0].contains("importer.fk") && findings[0].contains("pkg/target.fk"), "{findings:?}");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("nativeKind container") && f.contains("a container of pkg/other.fk")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("nativeKind external_module") && f.contains("resolved: false")),
+            "{findings:?}"
+        );
+
+        let outcome = verdict(Vec::new());
+        assert!(
+            matches!(&outcome, Outcome::Fail(findings) if findings.iter().any(|f| f.contains("has no IMPORTS edge at all"))),
+            "{outcome:?}"
+        );
     }
 }

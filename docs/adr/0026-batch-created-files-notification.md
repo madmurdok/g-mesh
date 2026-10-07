@@ -83,7 +83,8 @@ does not change.
   debounce window).
 - No acknowledgement: core cannot tell a declaring plugin that ignores the
   method. Such a plugin keeps the per-file behaviour. `g-mesh plugins check`
-  does not exercise the method yet.
+  exercises the method through `capabilities.files-created-resolves`
+  (GM-516; `docs/architecture/gm-516-check-files-created.md`).
 - Rust uses the default hook and does not declare the capability. The
   end-to-end case through a shipped plugin arrives when Python declares
   `files_created` together with its hook (GM-506); until then the behaviour is

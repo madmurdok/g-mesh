@@ -576,6 +576,28 @@
 //! conformance fixture is within two orders of magnitude of that cap.
 //! `hint` is a core constant carrying no plugin behaviour, and is not
 //! asserted.
+//!
+//! # Decision 14: the `[files_created]` pair (GM-516)
+//!
+//! Not an expectation over the linked index but the input of the
+//! `capabilities.files-created-resolves` check (`checks`' module doc), kept
+//! here because this file is the per-language, author-written input every
+//! conformance run already passes:
+//!
+//! ```toml
+//! [files_created]
+//! target = "src/gmCheckTarget.ts"
+//! target_text = "export function created(): number { return 1; }\n"
+//! importer = "src/gmCheckImporter.ts"
+//! importer_text = "import { created } from \"./gmCheckTarget\";\n"
+//! ```
+//!
+//! All four keys are required and no other is accepted (decision 5). Both
+//! paths are workspace-relative, must not exist in the fixture, must differ,
+//! and must carry one of the manifest's extensions - a violation fails that
+//! check rather than the parse, so the rest of the file still runs. A
+//! plugin whose manifest declares `files_created` but whose expectations
+//! file has no such table gets that check as `Skip`, not `Fail`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -619,6 +641,30 @@ pub(crate) struct ExpectFile {
     definition: Vec<SymbolExpectation>,
     #[serde(default)]
     refusal: Vec<RefusalExpectation>,
+    /// Decision 14 (GM-516): the pair `capabilities.files-created-resolves`
+    /// writes mid-session. Not an expectation of its own - `evaluate` never
+    /// reads it, `mod.rs` hands it to `session::run_files_created_session`.
+    #[serde(default)]
+    files_created: Option<FilesCreatedPair>,
+}
+
+impl ExpectFile {
+    /// The `[files_created]` table, when the file has one (decision 14).
+    pub(crate) fn files_created(&self) -> Option<&FilesCreatedPair> {
+        self.files_created.as_ref()
+    }
+}
+
+/// Decision 14's `[files_created]` table: a target file and a file importing
+/// it, both new to the fixture, which the kit creates in one batch and routes
+/// importer first. Paths are workspace-relative. Every field is required.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FilesCreatedPair {
+    pub target: String,
+    pub target_text: String,
+    pub importer: String,
+    pub importer_text: String,
 }
 
 /// Which of a plugin's tiers an expectation needs answered before it can

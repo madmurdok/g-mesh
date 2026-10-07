@@ -73,7 +73,7 @@ use g_mesh_plugin_sdk::testing::{CheckOutcome, PluginCheck, Verdict};
 /// asserted as a set so a check dropping out of the report (this crate's own
 /// regression, not a plugin defect) fails loudly rather than shrinking the
 /// loop below silently.
-const ALL_CHECKS: [&str; 15] = [
+const ALL_CHECKS: [&str; 16] = [
     "session",
     "shape",
     "stream-order",
@@ -89,6 +89,7 @@ const ALL_CHECKS: [&str; 15] = [
     "ownership.diff-stays-in-file",
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
+    "capabilities.files-created-resolves",
 ];
 
 /// The two capability checks are each other's alternative: exactly one applies
@@ -100,8 +101,13 @@ const CAPABILITY_CHECKS: [&str; 2] =
     ["capabilities.semantic-pass-undeclared", "capabilities.semantic-engine-lazy"];
 
 /// Every check that must pass whatever the manifest declares.
+/// GM-516's check: `PASS` only for a manifest declaring `files_created`
+/// run with an `--expect` file naming a `[files_created]` pair, `SKIP`
+/// otherwise.
+const FILES_CREATED: &str = "capabilities.files-created-resolves";
+
 fn always_pass() -> Vec<&'static str> {
-    ALL_CHECKS.iter().copied().filter(|id| !CAPABILITY_CHECKS.contains(id)).collect()
+    ALL_CHECKS.iter().copied().filter(|id| !CAPABILITY_CHECKS.contains(id) && *id != FILES_CREATED).collect()
 }
 
 const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.toml");
@@ -213,6 +219,8 @@ fn base() -> PluginCheck {
     .exclude_dirs(&g_mesh_plugin_python::project::EXCLUDE_DIRS)
     .watch_files(&["pyproject.toml", "setup.cfg", "setup.py"])
     .entry_points(&["__init__"])
+    // The shipped manifest declares it (GM-516).
+    .files_created(true)
 }
 
 /// The shipped configuration, with a real pyright.
@@ -350,7 +358,12 @@ fn verdicts_of(judged: &[(&str, Verdict)], want: Verdict) -> usize {
 /// The whole report, for every configuration: the same fifteen checks, with
 /// exactly one capability check skipping, and it must be the one that matches
 /// the manifest.
-fn assert_report_shape(outcome: &CheckOutcome, applicable: &str, not_applicable: &str) {
+fn assert_report_shape(
+    outcome: &CheckOutcome,
+    applicable: &str,
+    not_applicable: &str,
+    files_created: Verdict,
+) {
     let mut reported: Vec<&str> = outcome.outcomes.keys().map(String::as_str).collect();
     reported.retain(|id| !id.starts_with("expectations."));
     reported.sort_unstable();
@@ -373,6 +386,12 @@ fn assert_report_shape(outcome: &CheckOutcome, applicable: &str, not_applicable:
         "{not_applicable} does not apply to this manifest:\n{}",
         outcome.stdout
     );
+    assert_eq!(
+        outcome.verdict(FILES_CREATED),
+        Some(files_created),
+        "{FILES_CREATED} must be {files_created:?} for this configuration:\n{}",
+        outcome.stdout
+    );
 }
 
 #[test]
@@ -383,6 +402,7 @@ fn the_plugin_passes_every_check_that_applies_to_it() {
         &outcome,
         "capabilities.semantic-engine-lazy",
         "capabilities.semantic-pass-undeclared",
+        Verdict::Skip,
     );
 }
 
@@ -426,6 +446,7 @@ fn without_a_semantic_tier_the_structural_expectations_still_hold() {
         &outcome,
         "capabilities.semantic-pass-undeclared",
         "capabilities.semantic-engine-lazy",
+        Verdict::Pass,
     );
 
     let judged = expectation_verdicts(&outcome);

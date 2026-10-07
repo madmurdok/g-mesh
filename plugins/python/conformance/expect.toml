@@ -563,3 +563,21 @@ contains = [
 # because it is the plugin's choice of specifier that makes it true, and a
 # plugin that one day indexed `import os.path` under `path` would still pass
 # every other expectation in this file.
+
+# GM-516: `capabilities.files-created-resolves` (expectations' decision 14).
+# Neither module exists in ./project: the kit writes both mid-session, sends
+# one `filesCreated` listing them, then routes the importer's `fileChanged`
+# before the target's - so the absolute import below resolves only if the
+# plugin added the target to its module set when told it was created.
+[files_created]
+target = "pkg/gm_check_target.py"
+target_text = """
+def created() -> int:
+    return 1
+"""
+importer = "pkg/gm_check_importer.py"
+importer_text = """
+from pkg.gm_check_target import created
+
+n = created()
+"""
