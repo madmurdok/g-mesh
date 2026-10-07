@@ -23,9 +23,8 @@ fn bundled_rules() -> LinkRules {
         .clone()
 }
 
-/// The bundled rules as they were before GM-496: glob shadowing for Rust and
-/// TypeScript, and no rule for Python, whose rows then sit side by side with
-/// no winner.
+/// Glob shadowing for Rust and TypeScript and no rule for Python, whose rows
+/// then sit side by side with no winner.
 fn glob_shadowing_only() -> LinkRules {
     LinkRules::with_named_shadows_glob(["rust", "typescript"])
 }
@@ -2722,7 +2721,7 @@ enum PyRow {
 }
 
 /// `pkg/__init__.py` holding `rows`, each one a statement on the line of its
-/// index (the plugin places a named row at its import statement, GM-496),
+/// index (the plugin places a named row at its import statement),
 /// every module in `providers` declaring `f`, and `user.py` calling `pkg`'s
 /// `f`. One diff per provider in order, then `__init__`, then `user`;
 /// returns the diffs and the call's edge id.
@@ -2820,11 +2819,11 @@ fn gm490_a_typescript_named_reexport_that_leads_nowhere_still_shadows_the_glob()
     assert!(!edge_target(&conn, &edge).1, "{:?}", edge_target(&conn, &edge));
 }
 
-/// GM-496's acceptance criterion: in Python an explicit import followed by a
+/// In Python an explicit import followed by a
 /// star import that provides the same name binds it to the star import's
 /// item, so under the bundled rules (Python's `later_import_binds`) the call
 /// links `pkg.b.f` - in a whole pass and in incremental passes whichever way
-/// round the files arrive. Under the pre-GM-496 rules (no Python rule) the
+/// round the files arrive. Under rules with no Python rule the
 /// two rows sit at one depth and the call stays unresolved, which is what
 /// makes the first assertion the rule's doing. Without the explicit import
 /// the star import alone links `pkg.b.f`, so the walk does reach it.
@@ -2998,7 +2997,7 @@ fn gm491_link_diff_agrees_with_link_all_in_every_arrival_order() {
     }
     assert!(disagreements.is_empty(), "{} disagreements:\n{}", disagreements.len(), disagreements.join("\n"));
 
-    // GM-496: the agreed end state is the later star import's item.
+    // The agreed end state is the later star import's item.
     let mut all = setup();
     gm490_apply(&mut all, &diffs);
     link_all(&mut all).unwrap();
@@ -3303,9 +3302,22 @@ fn gm496_orders(n: usize) -> Vec<Vec<usize>> {
 }
 
 /// `link_all` over `diffs` leaves `edge` on `expected` (`None`: unresolved),
-/// and so does `link_diff` after the last file of every arrival order,
-/// agreeing with `link_all` after every step on the way.
+/// and so does `link_diff` after the last file of every arrival order.
 fn gm496_assert_every_order_links(diffs: &[Diff], edge: &str, expected: Option<&str>) {
+    gm496_assert_links(diffs, edge, expected, &gm496_orders(diffs.len()), false);
+}
+
+/// [`gm496_assert_every_order_links`] for `orders` only, and, when
+/// `per_step`, `link_diff` agreeing with `link_all` after every step on the
+/// way - the costly half (a fresh reference store per step), kept for the
+/// fixtures the design note names "every `link_diff` order" for.
+fn gm496_assert_links(
+    diffs: &[Diff],
+    edge: &str,
+    expected: Option<&str>,
+    orders: &[Vec<usize>],
+    per_step: bool,
+) {
     let ends_right = |conn: &Connection| match expected {
         Some(target) => edge_target(conn, edge) == (target.to_string(), true),
         None => !edge_target(conn, edge).1,
@@ -3316,10 +3328,13 @@ fn gm496_assert_every_order_links(diffs: &[Diff], edge: &str, expected: Option<&
     assert!(ends_right(&all), "link_all left {:?}, expected {expected:?}", edge_target(&all, edge));
 
     let mut failures = Vec::new();
-    for order in gm496_orders(diffs.len()) {
+    for order in orders {
         let mut incremental = setup();
         for step in 0..order.len() {
             gm491_apply_and_link_diff(&mut incremental, &diffs[order[step]]);
+            if !per_step {
+                continue;
+            }
             let reference = gm491_reference(order[..=step].iter().map(|&index| &diffs[index]));
             if gm491_edges(&incremental) != reference {
                 failures.push(format!("order {order:?} disagrees with link_all after step {step}"));
@@ -3342,7 +3357,7 @@ fn gm496_assert_every_order_links(diffs: &[Diff], edge: &str, expected: Option<&
 fn gm496_a_python_explicit_import_after_a_star_import_binds_the_name() {
     let (diffs, edge) =
         gm496_python_diffs(&[PyRow::Star("pkg.b"), PyRow::Named("pkg.a")], &["pkg.a", "pkg.b"]);
-    gm496_assert_every_order_links(&diffs, &edge, Some(GM490_PY_A));
+    gm496_assert_links(&diffs, &edge, Some(GM490_PY_A), &gm496_orders(diffs.len()), true);
 }
 
 /// A later star import whose module does not declare `f` binds nothing, so
@@ -3400,7 +3415,11 @@ fn gm496_a_star_import_providing_through_another_star_import_binds_the_name() {
         upsert_nodes: vec![container_reexport(c, REEXPORT_ALL_NAME, "pkg.b", REEXPORT_ALL_NAME)],
         ..Default::default()
     });
-    gm496_assert_every_order_links(&diffs, &edge, Some(GM490_PY_B));
+    // `[a, b, __init__, user, c]`: `c` (the second hop) last, `b` (the only
+    // `f` the probe reaches) last, and the reverse. All 120 orders add no
+    // case the four-file tests lack.
+    let orders = [vec![0, 1, 2, 3, 4], vec![4, 0, 2, 3, 1], vec![4, 3, 2, 1, 0]];
+    gm496_assert_links(&diffs, &edge, Some(GM490_PY_B), &orders, false);
 }
 
 /// Two rows at one position have no statement order between them, so both
@@ -3536,4 +3555,69 @@ fn gm496_rust_and_typescript_ignore_statement_order() {
         super::link_all(&mut conn, &python_only).unwrap();
         assert!(!edge_target(&conn, &edge).1, "ts {named_line}/{glob_line}: {:?}", edge_target(&conn, &edge));
     }
+}
+
+/// A row the requester may not follow neither binds nor hides: the later
+/// `from .b import *` is visible only inside `pkg.inner`. `user.py` cannot
+/// follow it, so the earlier named import binds `f` for it (`pkg.a.f`);
+/// `pkg/inner.py` can, and the later star import binds it there (`pkg.b.f`).
+///
+/// Control: in `Resolver::walk_capped`, run `later_binding` over all of the
+/// scope's hops before the `restricted_to` filter - the star row wins and is
+/// then dropped for `user.py`, whose call is left unresolved.
+#[test]
+fn gm496_a_row_the_requester_cannot_follow_neither_binds_nor_hides() {
+    let (mut diffs, user_edge) = gm490_python_diffs(true);
+    let star = diffs[2]
+        .upsert_nodes
+        .iter_mut()
+        .find(|node| node.name == REEXPORT_ALL_NAME)
+        .expect("the fixture has a star row");
+    star.visibility = VISIBILITY_CONTAINER.to_string();
+    star.visibility_container = Some("pkg.inner".to_string());
+
+    let inner = At { file: "pkg/inner.py", language: "python", container: "pkg.inner", parent: Some("pkg") };
+    let caller = member(inner, "Function", "pkg.inner.run", Vis::Public);
+    let placeholder = container_placeholder(inner, "pkg", KEY_NAME, "f");
+    let edge = usage_edge(&caller.id, "CALLS", &placeholder);
+    let inner_edge = edge.id.clone();
+    diffs.push(Diff {
+        upsert_nodes: vec![caller, placeholder],
+        upsert_edges: vec![edge],
+        ..Default::default()
+    });
+
+    let mut conn = setup();
+    gm490_apply(&mut conn, &diffs);
+    link_all(&mut conn).unwrap();
+    assert_eq!(edge_target(&conn, &user_edge), (GM490_PY_A.to_string(), true));
+    assert_eq!(edge_target(&conn, &inner_edge), (GM490_PY_B.to_string(), true));
+}
+
+/// Rows of one scope written in different files have no statement order
+/// between them: `pkg/__init__.py`'s `from .a import f` on line 5 and
+/// `pkg/other.py`'s `from .b import *` on line 0, both in the container
+/// `pkg`, are kept side by side and the call is unresolved, as with no rule.
+///
+/// Control: drop the same-file check from `Resolver::later_binding`'s
+/// `ordered` guard - the named row (line 5) wins and the call links
+/// `pkg.a.f`.
+#[test]
+fn gm496_rows_from_different_files_keep_no_winner() {
+    let (mut diffs, edge) = gm490_python_diffs(true);
+    let init = &mut diffs[2].upsert_nodes;
+    let star_at = init.iter().position(|node| node.name == REEXPORT_ALL_NAME).unwrap();
+    init.remove(star_at);
+    init[0].start_line = 5;
+    let other = At { file: "pkg/other.py", language: "python", container: "pkg", parent: None };
+    diffs.push(Diff {
+        upsert_nodes: vec![container_reexport(other, REEXPORT_ALL_NAME, "pkg.b", REEXPORT_ALL_NAME)],
+        ..Default::default()
+    });
+
+    let mut conn = setup();
+    gm490_apply(&mut conn, &diffs);
+    link_all(&mut conn).unwrap();
+    let (target, resolved) = edge_target(&conn, &edge);
+    assert!(!resolved, "linked {target}");
 }

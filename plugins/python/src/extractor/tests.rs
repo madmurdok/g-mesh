@@ -654,7 +654,7 @@ fn dunder_all_in_a_package_init_republishes_what_it_imported() {
     assert!(!names.iter().any(|(qualified, _)| qualified.contains("never_imported")), "{names:#?}");
 }
 
-/// GM-496: core orders one module's re-export rows by their start position,
+/// Core orders one module's re-export rows by their start position,
 /// so an `__all__` re-export sits at the import statement that bound the
 /// name (line 0), not at `__all__` (line 2); the star import's row sits at
 /// its own statement (line 1).

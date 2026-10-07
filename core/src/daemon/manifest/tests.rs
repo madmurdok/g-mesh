@@ -1236,7 +1236,7 @@ fn rejects_a_manifest_setting_both_reexport_rules() {
 }
 
 /// The checked-in manifests declare `named_shadows_glob` for Rust and
-/// TypeScript (ADR 0020) and `later_import_binds` for Python (GM-496), and
+/// TypeScript (ADR 0020) and `later_import_binds` for Python, and
 /// neither for Go, so the rules the daemon builds from them are exactly
 /// those.
 ///
