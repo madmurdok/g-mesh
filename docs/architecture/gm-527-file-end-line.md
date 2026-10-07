@@ -10,6 +10,10 @@ The owner chose:
 - **Q3:** "Строго: только колонка 0 (Recommended)" (strict: column 0 only).
 - **Follow-up:** "(c) + строгий читатель для старых индексов (Recommended)"
   ((c) plus a strict reader for old indexes).
+- **Revised note, Q1:** "(A) Конец содержимого (Recommended)" (content end).
+- **Revised note, Q2:** "В проверке с пробелом, по строке (Recommended)"
+  (enforced inside the whitespace-edit check, line only).
+- **Note:** "Утверждаю (Recommended)".
 
 Amended AC2:
 - In a newly built index, a File or Module `endLine` is at most
