@@ -440,7 +440,11 @@ strip = ["@"]
 # Whether, in one scope, a named import/re-export of a name hides every glob
 # (`*`) one for it when the linker walks re-export chains. Absent: false, and
 # named and glob rows stay side by side with no winner.
-named_shadows_glob = true  # rust, typescript; python and go declare nothing
+named_shadows_glob = true  # rust, typescript
+# Whether the later of a named and a glob import that both provide a name binds
+# it (statement order, as Python executes it). Absent: false. A manifest may
+# set at most one of the two keys.
+# later_import_binds = true  # python; go declares neither
 
 # GM-289, read by the SDK's LSP bridge and by nothing in core - see
 # "Implementation notes (GM-289)" for why core deliberately does not parse it.
@@ -519,9 +523,13 @@ empty prefix, an unknown key, and a prefix missing from the same manifest's
 with (`daemon::manifest::link_rules`). With `named_shadows_glob = true`, a
 scope of that language that re-exports a name both by name and through a glob
 follows the named row only; without it, both rows are followed at the same
-depth. Rust and TypeScript declare it; Python (the later import binds) and Go
-do not. Decision:
-[ADR 0020](../adr/0020-named-reexport-shadows-glob.md).
+depth. Rust and TypeScript declare it. Python declares `later_import_binds =
+true` instead: of the rows that provide a name in one scope, the one whose
+import statement comes last binds it, named or glob, so `from .a import f`
+then `from .b import *` follows `b`. Go declares neither. A manifest setting
+both keys is refused. Decisions:
+[ADR 0020](../adr/0020-named-reexport-shadows-glob.md) and its addendum,
+[the GM-496 note](gm-496-python-later-import-binds.md).
 
 Capabilities are read from the manifest rather than the handshake. Routing and
 instruction assembly need them before any plugin process exists, and the manifest
