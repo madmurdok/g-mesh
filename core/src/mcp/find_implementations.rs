@@ -27,6 +27,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::daemon::manifest::Capabilities;
+use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
@@ -35,6 +36,7 @@ use crate::graph::traversal::{self, ReachedNode, TraversalOptions, TraversalResu
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::not_indexed::{self, NotIndexed};
 use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{error, internal_error, success};
@@ -99,6 +101,11 @@ struct ImplementationPage<'a> {
     /// is nearly all of them.
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
+    /// See `super::not_indexed::group` - the `file_paths` entries in a
+    /// language with no indexed files (plugin absent or failed), one entry
+    /// per language. Absent when the filter is omitted or fully covered.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    not_indexed: &'a [NotIndexed],
 }
 
 /// Paginates the incoming `SUPERTYPE_OF` edges for `anchor_id` and resolves
@@ -165,16 +172,19 @@ pub(super) fn handle(
 ) -> Result<CallToolResult, ErrorData> {
     let hints = SessionHints::default();
     find_definition::resolve_lazily(embedding, shapes, |semantic| {
-        handle_in(store, semantic, capabilities, &hints, params.clone())
+        handle_in(store, semantic, capabilities, &hints, &[], params.clone())
     })
 }
 
 /// The single-hop walk, one pass - see [`find_definition::SemanticRung`].
+/// `uncovered`: the `file_paths` entries whose language is not indexed,
+/// named in the answer's `notIndexed` (`not_indexed::group`).
 fn handle_in(
     store: &Arc<IndexStore>,
     semantic: &find_definition::SemanticRung<'_>,
     capabilities: &HashMap<String, Capabilities>,
     hints: &SessionHints,
+    uncovered: &[(String, PathCoverage)],
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -194,6 +204,7 @@ fn handle_in(
     let page_size = pagination::resolve_page_size(params.limit);
     let file_paths: Vec<&str> = params.file_paths.iter().flatten().map(String::as_str).collect();
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
+    let not_indexed = not_indexed::group(&conn, uncovered)?;
     // A page's `hint` and `provenance`; `send` spends once-per-session hints,
     // without it they are only peeked, for measuring.
     let disclosures = |page: &pagination::Page<ImplementationSite>, send: bool| {
@@ -229,6 +240,7 @@ fn handle_in(
                 all_unresolved: candidate.all_unresolved,
                 hint,
                 provenance,
+                not_indexed: &not_indexed,
             })
         },
     )
@@ -243,6 +255,7 @@ fn handle_in(
         all_unresolved: page.all_unresolved,
         hint,
         provenance,
+        not_indexed: &not_indexed,
     })
 }
 
@@ -575,6 +588,21 @@ pub(crate) fn dispatch_in(
     hints: &SessionHints,
     params: FindImplementationsParams,
 ) -> Result<CallToolResult, ErrorData> {
+    dispatch_in_covered(store, semantic, capabilities, hints, &[], params)
+}
+
+/// [`dispatch_in`], with `uncovered` the `file_paths` entries whose language
+/// is not indexed (`GMeshMcpServer::filter_coverage`). Only the direct walk
+/// names them (`notIndexed`): the transitive walk and a resumed one ignore
+/// `file_paths`, so they ignore `uncovered` too.
+pub(crate) fn dispatch_in_covered(
+    store: &Arc<IndexStore>,
+    semantic: &find_definition::SemanticRung<'_>,
+    capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
+    uncovered: &[(String, PathCoverage)],
+    params: FindImplementationsParams,
+) -> Result<CallToolResult, ErrorData> {
     let FindImplementationsParams {
         symbol_id,
         symbol_name,
@@ -603,7 +631,7 @@ pub(crate) fn dispatch_in(
     let symbol_params = SymbolQueryParams { symbol_id, symbol_name, cursor, limit, file_paths, answer: None };
 
     if !transitive.unwrap_or(false) {
-        return handle_in(store, semantic, capabilities, hints, symbol_params);
+        return handle_in(store, semantic, capabilities, hints, uncovered, symbol_params);
     }
 
     let conn = store.read();

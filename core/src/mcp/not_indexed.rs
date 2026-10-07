@@ -11,6 +11,11 @@
 //! content block is a JSON object carrying the human message and the
 //! structured [`NotIndexed`] value.
 //!
+//! The four find tools with a `file_paths` filter (`find_references`,
+//! `find_callers`, `find_callees`, direct `find_implementations`) answer as
+//! usual and add a `notIndexed` list, [`group`]ed per language, naming the
+//! filter entries in an uncovered language. `search_code` has no path.
+//!
 //! The coverage itself comes from the daemon's registry
 //! (`PluginRegistry::path_coverage`), computed per call with no I/O; the one
 //! store read here is the failed language's recorded error, and only on the
@@ -119,6 +124,38 @@ impl NotIndexed {
             }
         }
     }
+}
+
+/// The `notIndexed` field of a filtered find answer (`find_references`,
+/// `find_callers`, `find_callees`, direct `find_implementations`): one entry
+/// per uncovered language, in the order its first path was requested, with
+/// `filePaths` naming the requested paths it covers (duplicates dropped).
+/// `uncovered` pairs each `file_paths` entry the registry reports as not
+/// covered with that coverage; empty (no filter, or every path covered)
+/// yields an empty list, which the answers omit.
+pub(super) fn group(
+    conn: &Connection,
+    uncovered: &[(String, PathCoverage)],
+) -> Result<Vec<NotIndexed>, ErrorData> {
+    let mut grouped: Vec<NotIndexed> = Vec::new();
+    for (path, coverage) in uncovered {
+        let language = match coverage {
+            PathCoverage::Absent(entry) => entry.language,
+            PathCoverage::Failed(language) => language.as_str(),
+        };
+        let index = match grouped.iter().position(|entry| entry.language == language) {
+            Some(index) => index,
+            None => {
+                grouped.push(NotIndexed::from_coverage(conn, coverage)?);
+                grouped.len() - 1
+            }
+        };
+        let file_paths = &mut grouped[index].file_paths;
+        if !file_paths.contains(path) {
+            file_paths.push(path.clone());
+        }
+    }
+    Ok(grouped)
 }
 
 /// The JSON body of a refusal: `{"error": <message + sentence>, "notIndexed": {...}}`.

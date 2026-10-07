@@ -16,12 +16,14 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::daemon::manifest::Capabilities;
+use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::not_indexed::{self, NotIndexed};
 use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
@@ -226,6 +228,11 @@ struct CallerPage<'a> {
     /// is nearly all of them.
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
+    /// See `super::not_indexed::group` - the `file_paths` entries in a
+    /// language with no indexed files (plugin absent or failed), one entry
+    /// per language. Absent when the filter is omitted or fully covered.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    not_indexed: &'a [NotIndexed],
 }
 
 /// What a `CALLS` walk left behind, disclosed at the response level.
@@ -382,6 +389,11 @@ struct CalleePage<'a> {
     /// is nearly all of them.
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
+    /// See `super::not_indexed::group` - the `file_paths` entries in a
+    /// language with no indexed files (plugin absent or failed), one entry
+    /// per language. Absent when the filter is omitted or fully covered.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    not_indexed: &'a [NotIndexed],
 }
 
 /// The response-level disclosures of [`CallerPage`], carried unchanged by the
@@ -397,16 +409,20 @@ struct CallerDisclosures<'a> {
     untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    not_indexed: &'a [NotIndexed],
 }
 
 /// The response-level disclosures of [`CalleePage`], as [`CallerDisclosures`].
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CalleeDisclosures {
+struct CalleeDisclosures<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     excluded_references: Option<ExcludedReferences>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    not_indexed: &'a [NotIndexed],
 }
 
 /// Every path an excluded-references tally names, for `touched` sets.
@@ -441,6 +457,7 @@ struct CallerParts<'a> {
     untyped: Option<UntypedReceiverCalls>,
     tier: provenance::Resolved,
     hints: &'a SessionHints,
+    not_indexed: &'a [NotIndexed],
 }
 
 impl CallerParts<'_> {
@@ -505,6 +522,7 @@ impl CallerParts<'_> {
             unlinked_usages: self.unlinked.as_ref(),
             untyped_receiver_calls: self.untyped.as_ref(),
             provenance,
+            not_indexed: self.not_indexed,
         }
     }
 }
@@ -515,6 +533,20 @@ pub(crate) fn handle_callers_in(
     semantic: &find_definition::SemanticRung<'_>,
     capabilities: &HashMap<String, Capabilities>,
     hints: &SessionHints,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
+    handle_callers_in_covered(store, semantic, capabilities, hints, &[], params)
+}
+
+/// [`handle_callers_in`], with `uncovered` the `file_paths` entries whose language is
+/// not indexed (`GMeshMcpServer::filter_coverage`): the answer names them in
+/// `notIndexed` (`not_indexed::group`).
+pub(crate) fn handle_callers_in_covered(
+    store: &Arc<IndexStore>,
+    semantic: &find_definition::SemanticRung<'_>,
+    capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
+    uncovered: &[(String, PathCoverage)],
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -538,6 +570,7 @@ pub(crate) fn handle_callers_in(
     let untyped = untyped::probe(&conn, &anchor, &["CALLS"], &file_paths);
     let answer = params.answer.unwrap_or_default();
     let excluded = excluded_references(&conn, &anchor.id, Direction::Incoming, &file_paths, answer);
+    let not_indexed = not_indexed::group(&conn, uncovered)?;
 
     let counted = answer::count(&conn, answer, &anchor.id, Direction::Incoming, &["CALLS"], &file_paths)
         .map_err(|e| internal_error("failed to count callers", e))?;
@@ -561,6 +594,7 @@ pub(crate) fn handle_callers_in(
                 unlinked_usages: unlinked.as_ref(),
                 untyped_receiver_calls: untyped.as_ref(),
                 provenance,
+                not_indexed: &not_indexed,
             };
             (hint, disclosures)
         });
@@ -591,6 +625,7 @@ pub(crate) fn handle_callers_in(
         untyped,
         tier,
         hints,
+        not_indexed: &not_indexed,
     };
 
     let rows = page
@@ -636,6 +671,7 @@ struct CalleeParts<'a> {
     excluded: Option<ExcludedReferences>,
     tier: provenance::Resolved,
     hints: &'a SessionHints,
+    not_indexed: &'a [NotIndexed],
 }
 
 impl CalleeParts<'_> {
@@ -679,16 +715,33 @@ impl CalleeParts<'_> {
             hint,
             excluded_references: excluded,
             provenance,
+            not_indexed: self.not_indexed,
         }
     }
 }
 
 /// One pass of [`handle_callees`] - see [`find_definition::SemanticRung`].
+/// Tests only: the server calls [`handle_callees_in_covered`].
+#[cfg(test)]
 pub(crate) fn handle_callees_in(
     store: &Arc<IndexStore>,
     semantic: &find_definition::SemanticRung<'_>,
     capabilities: &HashMap<String, Capabilities>,
     hints: &SessionHints,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
+    handle_callees_in_covered(store, semantic, capabilities, hints, &[], params)
+}
+
+/// `handle_callees_in`, with `uncovered` the `file_paths` entries whose language is
+/// not indexed (`GMeshMcpServer::filter_coverage`): the answer names them in
+/// `notIndexed` (`not_indexed::group`).
+pub(crate) fn handle_callees_in_covered(
+    store: &Arc<IndexStore>,
+    semantic: &find_definition::SemanticRung<'_>,
+    capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
+    uncovered: &[(String, PathCoverage)],
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -710,6 +763,7 @@ pub(crate) fn handle_callees_in(
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
     let answer = params.answer.unwrap_or_default();
     let excluded = excluded_references(&conn, &anchor.id, Direction::Outgoing, &file_paths, answer);
+    let not_indexed = not_indexed::group(&conn, uncovered)?;
 
     let counted = answer::count(&conn, answer, &anchor.id, Direction::Outgoing, &["CALLS"], &file_paths)
         .map_err(|e| internal_error("failed to count callees", e))?;
@@ -723,7 +777,7 @@ pub(crate) fn handle_callees_in(
                 hint,
                 hints.offer(send, provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
             ]);
-            (hint, CalleeDisclosures { excluded_references: excluded, provenance })
+            (hint, CalleeDisclosures { excluded_references: excluded, provenance, not_indexed: &not_indexed })
         });
     }
 
@@ -737,8 +791,16 @@ pub(crate) fn handle_callees_in(
         params.cursor.as_deref(),
     )
     .map_err(|e| internal_error("failed to find callees", e))?;
-    let parts =
-        CalleeParts { conn: &conn, anchor: &anchor, anchor_info, anchor_hint: hint, excluded, tier, hints };
+    let parts = CalleeParts {
+        conn: &conn,
+        anchor: &anchor,
+        anchor_info,
+        anchor_hint: hint,
+        excluded,
+        tier,
+        hints,
+        not_indexed: &not_indexed,
+    };
 
     let rows = page
         .results

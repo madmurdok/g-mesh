@@ -13,12 +13,14 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::daemon::manifest::Capabilities;
+use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::not_indexed::{self, NotIndexed};
 use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
@@ -129,6 +131,11 @@ struct ReferencePage<'a> {
     /// is nearly all of them.
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
+    /// See `super::not_indexed::group` - the `file_paths` entries in a
+    /// language with no indexed files (plugin absent or failed), one entry
+    /// per language. Absent when the filter is omitted or fully covered.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    not_indexed: &'a [NotIndexed],
 }
 
 /// The response-level disclosures of [`ReferencePage`], carried unchanged by
@@ -142,6 +149,8 @@ struct ReferenceDisclosures<'a> {
     untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    not_indexed: &'a [NotIndexed],
 }
 
 /// Paginates the incoming `USAGE_EDGE_KINDS` edges for `anchor_id` and
@@ -224,6 +233,7 @@ struct ReferenceParts<'a> {
     untyped: Option<UntypedReceiverCalls>,
     tier: provenance::Resolved,
     hints: &'a SessionHints,
+    not_indexed: &'a [NotIndexed],
 }
 
 impl ReferenceParts<'_> {
@@ -281,6 +291,7 @@ impl ReferenceParts<'_> {
             unlinked_usages: self.unlinked.as_ref(),
             untyped_receiver_calls: self.untyped.as_ref(),
             provenance,
+            not_indexed: self.not_indexed,
         }
     }
 }
@@ -291,6 +302,20 @@ pub(crate) fn handle_in(
     semantic: &find_definition::SemanticRung<'_>,
     capabilities: &HashMap<String, Capabilities>,
     hints: &SessionHints,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
+    handle_in_covered(store, semantic, capabilities, hints, &[], params)
+}
+
+/// [`handle_in`], with `uncovered` the `file_paths` entries whose language
+/// is not indexed (`GMeshMcpServer::filter_coverage`): the answer names them
+/// in `notIndexed` (`not_indexed::group`).
+pub(crate) fn handle_in_covered(
+    store: &Arc<IndexStore>,
+    semantic: &find_definition::SemanticRung<'_>,
+    capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
+    uncovered: &[(String, PathCoverage)],
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -312,6 +337,7 @@ pub(crate) fn handle_in(
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
     let unlinked = unlinked::probe(&conn, &anchor, USAGE_EDGE_KINDS, &file_paths);
     let untyped = untyped::probe(&conn, &anchor, USAGE_EDGE_KINDS, &file_paths);
+    let not_indexed = not_indexed::group(&conn, uncovered)?;
 
     let counted = answer::count(
         &conn,
@@ -339,6 +365,7 @@ pub(crate) fn handle_in(
                 unlinked_usages: unlinked.as_ref(),
                 untyped_receiver_calls: untyped.as_ref(),
                 provenance,
+                not_indexed: &not_indexed,
             };
             (hint, disclosures)
         });
@@ -363,6 +390,7 @@ pub(crate) fn handle_in(
         untyped,
         tier,
         hints,
+        not_indexed: &not_indexed,
     };
 
     let page = list_references(
