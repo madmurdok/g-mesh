@@ -267,6 +267,13 @@ Eight controls (B3 has two). No test involves processes, threads or timers.
 
 ## 7. Questions for the owner
 
+Owner's answers (2026-10-08):
+- Q1: "A: плагин Rust сам ставит связь (Recommended)".
+- Q2: "Ближайший объявивший предок (Recommended)".
+- Q3: "Один раз за сессию (Recommended)".
+- Q4: "Не сейчас, задача в бэклог (Recommended)".
+- Note: "Утверждаю (Recommended)".
+
 ### Q1. Rust: how does a Rust trait-impl method get the field?
 
 *Today:* every session reads, in the instructions, "an override's caller page
