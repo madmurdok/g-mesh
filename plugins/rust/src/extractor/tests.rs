@@ -1481,6 +1481,103 @@ fn an_impl_for_an_imported_type_keeps_its_open_site_and_gets_no_block_node() {
     assert_eq!(sites[0].name, "P");
 }
 
+/// A trait-impl method points at the trait method it implements, so core's
+/// `declared` mode can name it on the method's caller page: one edge per
+/// impl, `<Circle as Loud>::speak` to `Loud::speak` only, never to the
+/// same-named `Quiet::speak`. Both ends are this file's, so it is resolved;
+/// the type-level edges are unchanged. Control: drop the
+/// `member_supertypes` call from `impl_item`.
+#[test]
+fn a_trait_impl_method_is_a_supertype_edge_to_the_trait_method() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Loud { fn speak(&self); }\npub trait Quiet { fn speak(&self); }\npub struct Circle;\n\
+         impl Loud for Circle { fn speak(&self) {} }\nimpl Quiet for Circle { fn speak(&self) {} }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::SupertypeOf, "<Circle as Loud>::speak"), vec!["Loud::speak"]);
+    assert_eq!(graph.targets(EdgeKind::SupertypeOf, "<Circle as Quiet>::speak"), vec!["Quiet::speak"]);
+    assert_eq!(graph.targets(EdgeKind::SupertypeOf, "Circle"), vec!["Loud", "Quiet"]);
+    assert!(graph.edges(EdgeKind::SupertypeOf).iter().all(|edge| edge.resolved));
+}
+
+/// The trait one file over: the method's edge is unresolved, onto a
+/// placeholder addressing the trait's method by `qualifiedName` in the
+/// trait's module - the address a written `Shape::area` path gets - for the
+/// linker to land on the declaration.
+#[test]
+fn a_trait_impl_method_of_a_trait_in_another_file_points_at_a_placeholder() {
+    let krate = Crate::new(&[
+        (
+            "src/lib.rs",
+            "pub mod shapes;\nuse crate::shapes::Shape;\npub struct Ci;\nimpl Shape for Ci { fn area(&self) {} }\n",
+        ),
+        ("src/shapes.rs", "pub trait Shape { fn area(&self); }\n"),
+    ]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(
+        graph.targets(EdgeKind::SupertypeOf, "<Ci as Shape>::area"),
+        vec!["pending_symbol krate::shapes::shapes::Shape::area"]
+    );
+    let placeholder = graph.placeholder("pending_symbol", "area");
+    assert_eq!(
+        graph.target_of(placeholder),
+        (container("krate::shapes"), TargetKey::QualifiedName("shapes::Shape::area".into()))
+    );
+}
+
+/// The `SUPERTYPE_OF` edges out of a `Function` node: none of them is what
+/// the declared member edge's absence means.
+fn member_supertype_edges(graph: &Graph) -> Vec<String> {
+    graph
+        .edges(EdgeKind::SupertypeOf)
+        .into_iter()
+        .filter(|edge| graph.by_id(&edge.from_id).kind == NodeKind::Function)
+        .map(|edge| {
+            format!(
+                "{} -> {}",
+                graph.by_id(&edge.from_id).qualified_name,
+                graph.by_id(&edge.to_id).qualified_name
+            )
+        })
+        .collect()
+}
+
+/// An inherent method implements nothing, though its type implements a
+/// trait with a same-named method. Control: call `member_supertypes` for
+/// the inherent arm of `impl_item` too.
+#[test]
+fn an_inherent_method_is_no_supertype_edge() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Shape { fn area(&self); }\npub struct Square;\nimpl Square { fn area(&self) {} }\n\
+         impl Shape for Square { fn area(&self) {} }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert!(graph.targets(EdgeKind::SupertypeOf, "Square::area").is_empty());
+    assert_eq!(member_supertype_edges(&graph), vec!["<Square as Shape>::area -> Shape::area"]);
+}
+
+/// A trait outside the project (`Clone`, `std::fmt::Display`) has no method
+/// node to point at: no member edge and no placeholder for one. Control:
+/// drop the `Here`/`There` gate in `member_supertypes`.
+#[test]
+fn a_method_of_an_external_trait_is_no_supertype_edge() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub struct T;\nimpl Clone for T { fn clone(&self) -> T { T } }\n\
+         impl std::fmt::Display for T { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) } }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert!(member_supertype_edges(&graph).is_empty(), "{:#?}", member_supertype_edges(&graph));
+    assert!(
+        !graph.0.nodes.iter().any(|node| node.native_kind.as_deref() == Some("pending_symbol")
+            && (node.name == "clone" || node.name == "fmt")),
+        "{:#?}",
+        graph.names()
+    );
+}
+
 // --- cfg, errors, purity ---------------------------------------------------------
 
 /// Decision 6: every alternative is indexed, and two alternatives that are

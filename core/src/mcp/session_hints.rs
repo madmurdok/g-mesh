@@ -249,4 +249,12 @@ mod tests {
         }
         assert_eq!(truncated_by("somethingElse"), None);
     }
+
+    /// `OVERRIDES` is two sentences (what the field is, what to do with it),
+    /// with the design's own budget of 226 bytes.
+    #[test]
+    fn the_overrides_sentence_stays_within_its_budget() {
+        assert!(OVERRIDES.len() <= 226, "{} B: {OVERRIDES}", OVERRIDES.len());
+        assert!(OVERRIDES.contains("find_callers") && OVERRIDES.contains("`id`"), "{OVERRIDES}");
+    }
 }

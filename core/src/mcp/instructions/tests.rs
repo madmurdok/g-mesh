@@ -119,40 +119,40 @@ fn ts_only_is_byte_identical_to_the_original_string() {
     assert_eq!(rendered.len(), 1141, "this module's own current baseline, re-measured");
 }
 
-/// Nothing indexed: the coverage paragraph says so, and there is no
-/// receiver paragraph to render (ADR 0022, section 3).
+/// Nothing indexed: the coverage paragraph says so, there is no receiver
+/// paragraph to render (ADR 0022, section 3), and P2 drops [`P2_GAP`],
+/// which would point at it. Control: render `P2_GAP` whatever
+/// `receiver_paragraph` returns.
 #[test]
 fn nothing_indexed_says_so_and_leaves_out_the_receiver_paragraph() {
     let rendered = build(&warm(Vec::new()));
     assert!(rendered.contains(HEAD_NONE), "{rendered}");
     assert!(!rendered.contains("The one legitimate reason to grep afterward"), "{rendered}");
+    assert!(!rendered.contains(P2_GAP), "P2 never points at a missing paragraph:\n{rendered}");
+    assert!(rendered.contains(&format!("{P2}\n\n{P5}")), "{rendered}");
 }
 
-/// The four assertions every pass-dependent language makes, so that the
-/// three languages that reach this rendering are checked against one
-/// statement of it rather than three transcriptions.
+/// What every shipped pass-dependent language renders: no language is
+/// never-resolving and every one reports `overrides`, so the receiver
+/// paragraph is [`S_PASS_ALONE`] - the static sentence about override
+/// caller pages is gone, because the page itself now names the base members
+/// (D7) - and P2 keeps [`P2_GAP`], which points at it. Checked once here
+/// rather than transcribed per language.
 ///
 /// `"may produce no edge"` is the never-resolving wording, so its absence
 /// is what separates this rendering from TypeScript's.
 fn assert_pass_dependent_receiver_clause(rendered: &str, language: &str) {
     assert!(
-        rendered.contains("The one legitimate reason to grep afterward"),
-        "{language}: the gap narrows, it never closes"
+        rendered.contains(&format!("{P2} {P2_GAP}\n\n{S_PASS_ALONE}\n\n{P5}")),
+        "{language}: P2 with its gap sentence, then the pass sentence alone:\n{rendered}"
     );
+    assert!(!rendered.contains(P4_STATIC), "{language}: the page names overrides itself:\n{rendered}");
+    assert!(!rendered.contains(S_PASS), "{language}: nothing precedes the pass sentence:\n{rendered}");
     assert!(!rendered.contains("One real gap"), "{language}: the withdrawn claim must not return");
-    assert!(
-        rendered.contains("binds to the receiver's declared or inferred type"),
-        "{language}: the rendering has to say what the resolution actually binds to:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("find_implementations is the way across"),
-        "{language}: a pointer to the missing calls, never a count of them:\n{rendered}"
-    );
     assert!(
         !rendered.contains("may produce no edge"),
         "{language}: that is the never-resolving wording:\n{rendered}"
     );
-    assert!(rendered.contains(S_PASS), "{language}: the pass-dependent sentence:\n{rendered}");
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
         "{language}: {} bytes exceeds the {INSTRUCTIONS_BYTE_CEILING}-byte ceiling",
@@ -161,11 +161,13 @@ fn assert_pass_dependent_receiver_clause(rendered: &str, language: &str) {
     println!("{language}-only bytes: {}", rendered.len());
 }
 
-/// Rust resolves receiver calls only through its semantic pass, so it
-/// renders the static form plus [`S_PASS`] whatever its pass state; that
-/// state reaches the caller through `provenance` (ADR 0022, section 2).
+/// Rust resolves receiver calls only through its semantic pass and declares
+/// the member a trait-impl method implements, so it renders
+/// [`S_PASS_ALONE`] whatever its pass state; that state reaches the caller
+/// through `provenance` (ADR 0022, section 2).
 ///
-/// Measured on this plugin's own fixture:
+/// The override gap the page now names in `overrides`, measured on this
+/// plugin's own fixture:
 /// `find_callers("shapes::Shape::area")` is
 /// `{shapes::total_dyn, gaps::measure}` - `&dyn Shape` and `<S: Shape>`
 /// both land on the trait's declaration - while
@@ -173,20 +175,20 @@ fn assert_pass_dependent_receiver_clause(rendered: &str, language: &str) {
 /// though either of those two call sites reaches it at run time.
 /// `conformance/expect.toml` asserts both as exact sets.
 #[test]
-fn rust_only_renders_the_static_form_with_the_pass_sentence() {
+fn rust_only_renders_the_pass_sentence_alone() {
     let rendered = build(&warm(vec![rust_present()]));
     assert_pass_dependent_receiver_clause(&rendered, "rust");
 }
 
-/// Python, the same way: pyright resolves a receiver call against its
-/// annotation, so `obj.describe()` for `obj: Base` is attributed to
+/// Python, the same way (`by_name`): pyright resolves a receiver call
+/// against its annotation, so `obj.describe()` for `obj: Base` is attributed to
 /// `Base.describe` however the object was built. Measured:
 /// `find_callers("Base.describe")` carries
 /// `pkg/callers.py:through_a_base_annotation`, and
 /// `find_callers("Deep.describe")` does not, though `Deep` overrides
 /// `describe` and `find_implementations("Base")` names it.
 #[test]
-fn python_only_renders_the_static_form_with_the_pass_sentence() {
+fn python_only_renders_the_pass_sentence_alone() {
     let rendered = build(&warm(vec![PresentLanguage {
         language: "python".to_string(),
         capabilities: bundled_python_capabilities(),
@@ -194,12 +196,12 @@ fn python_only_renders_the_static_form_with_the_pass_sentence() {
     assert_pass_dependent_receiver_clause(&rendered, "python");
 }
 
-/// Go, the same way. On `plugins/go/conformance/project`, with the pass
+/// Go, the same way (`by_name`). On `plugins/go/conformance/project`, with the pass
 /// complete, `find_callers("Conn.Close")` answers `results: []` while
 /// `server/conn.go:CloseAll` closes a `Conn` through a `Closer` value and
 /// `find_implementations("Closer")` names `Conn`.
 #[test]
-fn go_only_renders_the_static_form_with_the_pass_sentence() {
+fn go_only_renders_the_pass_sentence_alone() {
     let rendered = build(&warm(vec![go_present()]));
     assert_pass_dependent_receiver_clause(&rendered, "go");
 }
@@ -677,9 +679,11 @@ fn working_names_every_indexed_language_from_the_real_manifests() {
     assert!(!rendered.contains(TRAILER), "{rendered}");
     assert!(!rendered.contains("If this project has"), "{rendered}");
     // All four real manifests resolve receiver calls through their semantic
-    // pass, so none is named in the gap list.
+    // pass and report `overrides`, so none is named in the gap list and the
+    // pass sentence stands alone.
     assert!(!rendered.contains(&p4_perm("typescript")), "{rendered}");
-    assert!(rendered.contains(&format!("{P4_STATIC} {S_PASS}")), "{rendered}");
+    assert!(!rendered.contains(P4_STATIC), "{rendered}");
+    assert!(rendered.contains(&format!("{P2} {P2_GAP}\n\n{S_PASS_ALONE}")), "{rendered}");
     assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING);
 }
 
@@ -1044,14 +1048,17 @@ fn the_real_typescript_manifest_is_pass_dependent() {
     let found = real_plugins(&["typescript"]);
     let present = real_present(&found, &["typescript"]);
     assert_eq!(receiver_class(&present[0].capabilities), ReceiverClass::PassDependent);
+    assert_eq!(present[0].capabilities.member_overrides, MemberOverrides::ByName);
     let rendered = build(&warm(present));
     assert!(!rendered.contains(&p4_perm("typescript")), "{rendered}");
-    assert!(rendered.contains(&format!("{P4_STATIC} {S_PASS}")), "{rendered}");
+    assert_pass_dependent_receiver_clause(&rendered, "typescript");
 }
 
-/// Go, Python and Rust from their real manifests are pass-dependent: never
-/// named in the gap list; `P4_STATIC` (no never-language) plus `S_PASS`.
-/// Control: drop the `PassDependent` arm (they become never and are named).
+/// Go, Python and Rust from their real manifests are pass-dependent and
+/// report `overrides` (Go and Python by name, Rust declared): never named in
+/// the gap list, and [`S_PASS_ALONE`] instead of `P4_STATIC` plus `S_PASS`.
+/// Controls: drop the `PassDependent` arm (they become never and are named);
+/// restore the `(true, _) => P4_STATIC` arm in `receiver_paragraph`.
 #[test]
 fn the_real_go_python_and_rust_manifests_are_pass_dependent() {
     let three = ["go", "python", "rust"];
@@ -1064,9 +1071,20 @@ fn the_real_go_python_and_rust_manifests_are_pass_dependent() {
             language.language
         );
     }
+    let modes: Vec<(String, MemberOverrides)> = real_present(&found, &three)
+        .into_iter()
+        .map(|present| (present.language, present.capabilities.member_overrides))
+        .collect();
+    assert_eq!(
+        modes,
+        vec![
+            ("go".to_string(), MemberOverrides::ByName),
+            ("python".to_string(), MemberOverrides::ByName),
+            ("rust".to_string(), MemberOverrides::Declared),
+        ]
+    );
     let rendered = build(&warm(real_present(&found, &three)));
-    assert!(rendered.contains(&format!("{P4_STATIC} {S_PASS}")), "{rendered}");
-    assert!(!rendered.contains("may produce no edge"), "{rendered}");
+    assert_pass_dependent_receiver_clause(&rendered, "go, python and rust");
 }
 
 /// A plugin that claims `receiver_calls = resolved` with no semantic tier
@@ -1105,8 +1123,102 @@ fn a_structurally_resolving_language_is_static_without_the_pass_sentence() {
     };
     assert_eq!(receiver_class(&capabilities), ReceiverClass::Static);
     let rendered = build(&warm(vec![PresentLanguage { language: "zig".to_string(), capabilities }]));
-    assert!(rendered.contains(P4_STATIC), "{rendered}");
+    assert!(rendered.contains(&format!("{P2} {P2_GAP}\n\n{P4_STATIC}\n\n{P5}")), "{rendered}");
     assert!(!rendered.contains(S_PASS), "{rendered}");
+}
+
+// --- D7: which receiver paragraph, by `member_overrides` -------------------------
+
+/// A pass-dependent language whose manifest names no overrides (`none`).
+fn silent_pass_dependent(language: &str) -> PresentLanguage {
+    bridge_semantic(language)
+}
+
+/// A language that resolves receiver calls structurally and reports
+/// overrides: no gap at all.
+fn static_reporting(language: &str) -> PresentLanguage {
+    PresentLanguage {
+        language: language.to_string(),
+        capabilities: Capabilities {
+            semantic_pass: false,
+            semantic_sweep: false,
+            semantic_prepare: false,
+            files_created: false,
+            receiver_calls: ReceiverCallResolution::Resolved,
+            receiver_calls_structural: ReceiverCallResolution::Resolved,
+            member_overrides: MemberOverrides::ByName,
+        },
+    }
+}
+
+/// One covered language with `member_overrides = "none"` keeps the static
+/// sentence and `S_PASS` for the whole project, beside languages that report
+/// overrides: its override pages say nothing. Control: drop the
+/// `silent_on_overrides` arm of `receiver_paragraph` (`S_PASS_ALONE`).
+#[test]
+fn a_language_that_reports_no_overrides_keeps_the_static_sentence() {
+    for present in [vec![silent_pass_dependent("zig")], vec![go_present(), silent_pass_dependent("zig")]] {
+        let rendered = build(&warm(present));
+        assert!(rendered.contains(&format!("{P2} {P2_GAP}\n\n{P4_STATIC} {S_PASS}\n\n{P5}")), "{rendered}");
+        assert!(!rendered.contains(S_PASS_ALONE), "{rendered}");
+    }
+}
+
+/// A never-resolving language is named whatever its `member_overrides`, and
+/// `S_PASS` follows the named paragraph for a pass-dependent one beside it.
+/// Control: test `silent_on_overrides` before the `never` arms.
+#[test]
+fn a_never_resolving_language_is_named_even_when_it_reports_overrides() {
+    let never = PresentLanguage {
+        language: "typescript".to_string(),
+        capabilities: Capabilities { member_overrides: MemberOverrides::ByName, ..Capabilities::default() },
+    };
+    assert_eq!(receiver_class(&never.capabilities), ReceiverClass::Never);
+    let rendered = build(&warm(vec![never, rust_present()]));
+    assert!(rendered.contains(&format!("{} {S_PASS}", p4_perm("typescript"))), "{rendered}");
+    assert!(rendered.contains(&format!("{P2} {P2_GAP}")), "{rendered}");
+    assert!(!rendered.contains(S_PASS_ALONE), "{rendered}");
+}
+
+/// Every language static and reporting overrides: no gap to name, so no
+/// receiver paragraph, and P2 without [`P2_GAP`]. Control: render `P2_GAP`
+/// whatever `receiver_paragraph` returns (or return `P4_STATIC` there).
+#[test]
+fn no_gap_to_name_renders_no_receiver_paragraph_and_no_gap_pointer() {
+    let rendered = build(&warm(vec![static_reporting("zig"), static_reporting("odin")]));
+    assert!(!rendered.contains(RECEIVER_OPENING), "{rendered}");
+    assert!(!rendered.contains(P2_GAP), "{rendered}");
+    assert!(rendered.contains(&format!("{P2}\n\n{P5}")), "{rendered}");
+}
+
+/// Every D7 form, at its realistic size, renders within the ceiling; the
+/// byte counts are printed for ADR 0022's table (`-- --nocapture`).
+#[test]
+fn every_receiver_form_renders_within_the_ceiling() {
+    let all = ["go", "python", "rust", "typescript"];
+    let found = real_plugins(&all);
+    let forms = [
+        ("nothing indexed", warm(Vec::new())),
+        ("four real manifests (S_PASS_ALONE)", warm(real_present(&found, &all))),
+        ("four real + one silent (P4_STATIC + S_PASS)", {
+            let mut present = real_present(&found, &all);
+            present.push(silent_pass_dependent("zig"));
+            warm(present)
+        }),
+        ("never + rust (p4_perm + S_PASS)", warm(vec![typescript_present(), rust_present()])),
+        ("all static, reporting (no paragraph)", warm(vec![static_reporting("zig")])),
+        ("worst case", warm(worst_case_present())),
+    ];
+    for (form, coverage) in forms {
+        let rendered = build(&coverage);
+        println!("{form}: {} bytes", rendered.len());
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{form}: {} bytes", rendered.len());
+    }
+    println!(
+        "P4_STATIC + S_PASS: {} bytes, S_PASS_ALONE: {} bytes",
+        P4_STATIC.len() + 1 + S_PASS.len(),
+        S_PASS_ALONE.len()
+    );
 }
 
 /// `from_outcomes` with no recorded outcome at all (an index from before
@@ -1432,8 +1544,8 @@ fn an_outcomes_read_error_falls_back_to_the_missing_wording() {
 }
 
 /// No stale gap: the same index renders byte-identical text before and after
-/// Rust's semantic pass is recorded, and the capability sentence `S_PASS` is
-/// in both. Control: make `instructions` drop pass-done languages' `S_PASS`
+/// Rust's semantic pass is recorded, and the capability sentence
+/// `S_PASS_ALONE` is in both. Control: make `instructions` drop pass-done languages' `S_PASS`
 /// (or reintroduce the pre-pass gap sentence keyed on the pass bool).
 #[test]
 fn the_server_text_is_the_same_before_and_after_a_semantic_pass() {
@@ -1448,7 +1560,8 @@ fn the_server_text_is_the_same_before_and_after_a_semantic_pass() {
     let after = server.instructions();
 
     assert_eq!(before, after);
-    assert!(before.contains(&format!("{P4_STATIC} {S_PASS}")), "{before}");
+    assert!(before.contains(S_PASS_ALONE), "{before}");
+    assert!(!before.contains(P4_STATIC), "{before}");
 }
 
 /// `Phase::Failed` with every discovered plugin failed renders the

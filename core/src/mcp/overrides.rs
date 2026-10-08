@@ -240,3 +240,7 @@ fn declared(conn: &Connection, anchor: &NodeRecord) -> Option<Vec<NodeRecord>> {
     let rows = stmt.query_map([&anchor.id], map_node_row).ok()?;
     rows.collect::<rusqlite::Result<_>>().ok()
 }
+
+#[cfg(test)]
+#[path = "overrides_tests.rs"]
+mod tests;
