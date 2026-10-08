@@ -102,7 +102,7 @@ use tree_sitter::Node;
 
 use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::ModuleCtx;
-use crate::extractor::model::{DeclRef, FileModel, Import};
+use crate::extractor::model::{DeclRef, FileModel, Import, ModuleBinding};
 use crate::extractor::scope::{dotted_path, FrameKind, Scopes};
 use crate::extractor::syntax::{
     decorators, definition_name, dotted_segments, first_parameter_name, has_decorator, inner_definition,
@@ -742,9 +742,33 @@ impl<'a, 's> Bodies<'a, 's> {
     /// Python's own LEGB walk, minus builtins: the nearest enclosing scope
     /// that declares or binds the name wins, and a class scope that is not
     /// the innermost one is skipped ([`super::scope`]).
+    ///
+    /// In the module frame the name means the module's final binding of it
+    /// ([`FileModel::module_binding`]): a declaration an unconditional named
+    /// import written after it displaced is addressed through that import,
+    /// and one a later `*` import may rebind is addressed at this module's
+    /// own container, the address `from pkg import f` uses elsewhere, so the
+    /// linker decides between the star's provider and the declaration.
     fn resolve_bare(&self, name: &str, want: Option<NodeKind>) -> Bound {
         for frame in self.scopes.chain() {
-            if let Some(decl) = self.model.lookup(frame.path(), name, want) {
+            if frame.path().is_empty() {
+                match self.model.module_binding(name, want) {
+                    Some(ModuleBinding::Decl(decl)) => return Bound::Here(decl.id.clone(), decl.kind),
+                    Some(ModuleBinding::DeclBeforeStar(decl)) => {
+                        return Bound::There {
+                            target: container_target(
+                                &self.module.key,
+                                TargetKey::Name(name.to_string()),
+                                &self.module.key,
+                            ),
+                            name: name.to_string(),
+                            looks_class: decl.kind == NodeKind::Type,
+                        };
+                    }
+                    Some(ModuleBinding::Import(_)) => break,
+                    None => {}
+                }
+            } else if let Some(decl) = self.model.lookup(frame.path(), name, want) {
                 return Bound::Here(decl.id.clone(), decl.kind);
             }
             if frame.binds(name) {
@@ -856,9 +880,22 @@ impl<'a, 's> Bodies<'a, 's> {
         qualifier
     }
 
+    /// What the bare `name` heading a dotted name names. In the module frame
+    /// it is the module's final binding of it, as in
+    /// [`Bodies::resolve_bare`], except that a declaration a later `*` import
+    /// may rebind stays the declaration: a `qualifiedName` key never follows
+    /// a re-export row, so there is nothing for the linker to decide.
     fn qualifier_of(&self, name: &str) -> Qualifier {
         for frame in self.scopes.chain() {
-            if self.model.lookup(frame.path(), name, None).is_some() {
+            let declared = if frame.path().is_empty() {
+                match self.model.module_binding(name, None) {
+                    Some(ModuleBinding::Import(_)) => break,
+                    binding => binding.is_some(),
+                }
+            } else {
+                self.model.lookup(frame.path(), name, None).is_some()
+            };
+            if declared {
                 let qualified = if frame.path().is_empty() {
                     name.to_string()
                 } else {

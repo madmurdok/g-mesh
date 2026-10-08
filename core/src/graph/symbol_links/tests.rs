@@ -3896,3 +3896,161 @@ fn gm496_rows_from_different_files_keep_no_winner() {
     let (target, resolved) = edge_target(&conn, &edge);
     assert!(!resolved, "linked {target}");
 }
+
+// --- GM-533: in Python a later binding hop rebinds an earlier declaration ---
+//
+// docs/architecture/gm-533-python-later-binding.md, R1: where the
+// declaration's language binds a name by the later statement, a re-export
+// row written after the declaration in the same file, and providing the
+// name, binds it instead.
+
+const GM533_PY_DEF: &str = "Function:pkg/__init__.py:pkg.f";
+
+/// `pkg/__init__.py` declaring `f` on `def_line` and holding `from .b import
+/// *` on `star_line` - in `pkg/other.py` (also of the container `pkg`)
+/// instead when `star_elsewhere` - every module in `providers` declaring `f`,
+/// and `user.py` calling `pkg`'s `f` ([`gm496_python_diffs`]). Returns the
+/// diffs and the call's edge id.
+fn gm533_python_diffs(
+    def_line: i64,
+    star_line: i64,
+    star_elsewhere: bool,
+    providers: &[&str],
+) -> (Vec<Diff>, String) {
+    let (mut diffs, edge) = gm496_python_diffs(&[PyRow::Star("pkg.b")], providers);
+    let init = gm490_py_at("pkg/__init__.py", "pkg", None);
+    let rows = &mut diffs[providers.len()].upsert_nodes;
+    let mut star = rows.pop().expect("the fixture's one star row");
+    if star_elsewhere {
+        let other = At { file: "pkg/other.py", language: "python", container: "pkg", parent: None };
+        star = container_reexport(other, REEXPORT_ALL_NAME, "pkg.b", REEXPORT_ALL_NAME);
+    }
+    star.start_line = star_line;
+    let mut def = member(init, "Function", "pkg.f", Vis::Public);
+    def.start_line = def_line;
+    rows.push(def);
+    if star_elsewhere {
+        diffs.push(Diff { upsert_nodes: vec![star], ..Default::default() });
+    } else {
+        rows.push(star);
+    }
+    (diffs, edge)
+}
+
+/// T1: `def f` on line 0, then `from .b import *` on line 1 with `pkg.b`
+/// declaring `f`: the star rebinds `f`, so `from pkg import f` links
+/// `pkg.b.f`, in a whole pass and in every arrival order.
+///
+/// Control C1: drop the R1 rebinding check in `Resolver::walk_capped` (never
+/// `continue` past the candidates) - the call links the def.
+#[test]
+fn gm533_a_later_providing_star_import_rebinds_an_earlier_def() {
+    let (diffs, edge) = gm533_python_diffs(0, 1, false, &["pkg.a", "pkg.b"]);
+    gm496_assert_every_order_links(&diffs, &edge, Some(GM490_PY_B));
+}
+
+/// T2: the star on line 0, then `def f` on line 1: the def is the later
+/// binding and wins.
+///
+/// Control C2: in `Resolver::rebinds`, rebind without the position
+/// comparison - the call links `pkg.b.f`.
+#[test]
+fn gm533_a_def_after_a_star_import_wins_again() {
+    let (diffs, edge) = gm533_python_diffs(1, 0, false, &["pkg.a", "pkg.b"]);
+    gm496_assert_every_order_links(&diffs, &edge, Some(GM533_PY_DEF));
+}
+
+/// T3: `def f`, then a star import whose module does not declare `f`: the
+/// star binds nothing, and the def stays.
+///
+/// Control C4: rebind on any later `*` row, skipping `provides` (pass the
+/// step's hops to `Resolver::rebinds` before `later_binding`) - the call is
+/// left unresolved.
+#[test]
+fn gm533_a_later_star_import_that_does_not_provide_the_name_keeps_the_def() {
+    let (diffs, edge) = gm533_python_diffs(0, 1, false, &["pkg.a"]);
+    gm496_assert_every_order_links(&diffs, &edge, Some(GM533_PY_DEF));
+}
+
+/// A star row of the same container written in another file has no
+/// statement order with the def: the def wins, though the row's line is
+/// later.
+///
+/// Control: in `Resolver::rebinds`, drop the same-file filter on the
+/// candidates - the call links `pkg.b.f`.
+#[test]
+fn gm533_a_star_import_of_another_file_keeps_the_def() {
+    let (diffs, edge) = gm533_python_diffs(0, 5, true, &["pkg.a", "pkg.b"]);
+    let mut conn = setup();
+    gm490_apply(&mut conn, &diffs);
+    link_all(&mut conn).unwrap();
+    assert_eq!(edge_target(&conn, &edge), (GM533_PY_DEF.to_string(), true));
+}
+
+/// `src/m.rs` (`mod m`) declaring `f` on line 0 (unless `!declared`) and
+/// holding `pub use crate::n::*;` on line 1, `n` declaring `f`, and `user`
+/// calling `m`'s `f`. Linked under the bundled rules; returns the call's
+/// target.
+fn gm533_rust_call(declared: bool) -> (String, bool) {
+    let m = At { file: "src/m.rs", language: "rust", container: "krate::m", parent: Some("krate") };
+    let n = At { file: "src/n.rs", language: "rust", container: "krate::n", parent: Some("krate") };
+    let user = At { file: "src/user.rs", language: "rust", container: "krate::user", parent: Some("krate") };
+    let mut glob = container_reexport(m, REEXPORT_ALL_NAME, "krate::n", REEXPORT_ALL_NAME);
+    glob.start_line = 1;
+    let mut nodes = vec![glob, member(n, "Function", "krate::n::f", Vis::Public)];
+    if declared {
+        let mut def = member(m, "Function", "krate::m::f", Vis::Public);
+        def.start_line = 0;
+        nodes.push(def);
+    }
+    let mut conn = setup();
+    upsert(&mut conn, nodes);
+    let caller = member(user, "Function", "krate::user::run", Vis::Public);
+    let caller_id = caller.id.clone();
+    let edge = use_through(
+        &mut conn,
+        vec![caller],
+        &caller_id,
+        "CALLS",
+        container_placeholder(user, "krate::m", KEY_NAME, "f"),
+    );
+    link_all(&mut conn).unwrap();
+    edge_target(&conn, &edge)
+}
+
+/// `index.ts` declaring `mutate` on line 0 (unless `!declared`) and holding
+/// `export * from "./b"` on line 1, `b.ts` declaring `mutate`, and a call of
+/// `index.ts`'s `mutate`. Linked under the bundled rules; returns the call's
+/// target.
+fn gm533_ts_call(declared: bool) -> (String, bool) {
+    let mut star = reexport_all("index.ts", "b.ts");
+    star.start_line = 1;
+    let mut nodes =
+        vec![symbol("caller.ts", "run", "Function", true), star, symbol("b.ts", "mutate", "Function", true)];
+    if declared {
+        let mut def = symbol("index.ts", "mutate", "Function", true);
+        def.start_line = 0;
+        nodes.push(def);
+    }
+    let mut conn = setup();
+    upsert(&mut conn, nodes);
+    let edge = seed_usage(&mut conn, "Function:caller.ts:run", "CALLS", "index.ts", "mutate");
+    link_all(&mut conn).unwrap();
+    edge_target(&conn, &edge)
+}
+
+/// T4: Rust and TypeScript keep the declaration over a later glob / `export
+/// *` providing the name - only a `later_import_binds` language rebinds.
+/// Without the declaration the same glob does link the provider, so the
+/// row is one the walk follows.
+///
+/// Control C3: in `Resolver::walk_capped`, rebind without the language gate
+/// (drop the `later_import_binds(&c.language)` check) - both calls link the
+/// glob's provider.
+#[test]
+fn gm533_rust_and_typescript_keep_a_declaration_over_a_later_glob() {
+    assert_eq!(gm533_rust_call(true), ("Function:src/m.rs:krate::m::f".to_string(), true));
+    assert_eq!(gm533_rust_call(false), ("Function:src/n.rs:krate::n::f".to_string(), true));
+    assert_eq!(gm533_ts_call(true), ("Function:index.ts:mutate".to_string(), true));
+    assert_eq!(gm533_ts_call(false), ("Function:b.ts:mutate".to_string(), true));
+}
