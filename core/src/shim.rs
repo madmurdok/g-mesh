@@ -6,7 +6,7 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -467,9 +467,16 @@ fn spawn_detached_daemon(root: &Path) -> Result<()> {
     // stdio (which is the MCP protocol channel) and stops it dying when the
     // client closes it; `process::detach` keeps signals aimed at the client's
     // process group away from it (its own process group on Unix,
-    // `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows). The `Child`
-    // is dropped without waiting, so the daemon outlives the shim - reaped by
-    // init on Unix, and needing no reaper at all on Windows.
+    // `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows).
+    //
+    // The daemon is still the shim's child, and in folder mode the shim lives
+    // the whole session, bootstrapping a daemon per selected project. A
+    // `Child` dropped without waiting would leave every daemon that exits
+    // first an unreaped zombie, which still answers `kill(pid, 0)` and so
+    // makes `g-mesh stop` time out. So a `daemon-reaper` thread waits on it:
+    // it reaps the daemon while the shim lives, and once the shim exits the
+    // daemon is reparented and reaped by init (on Windows the wait only
+    // releases the process handle).
     let mut command = Command::new(&exe);
     command
         .arg("daemon")
@@ -478,20 +485,45 @@ fn spawn_detached_daemon(root: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(daemon_stderr(root));
-    process::detach(&mut command)
+    let child = process::detach(&mut command)
         .spawn()
         .with_context(|| format!("failed to spawn a daemon via {}", exe.display()))?;
+    spawn_daemon_reaper(child);
     Ok(())
+}
+
+/// Stack for the `daemon-reaper` thread: it only blocks in `wait`.
+const DAEMON_REAPER_STACK_BYTES: usize = 64 * 1024;
+
+/// Waits on `child` from a `daemon-reaper` thread so it is reaped when it
+/// exits. The daemon is already running, so failing to start the thread does
+/// not fail the bootstrap: the `Child` is dropped (the daemon may then linger
+/// as a zombie until the shim exits) and the failure is logged.
+fn spawn_daemon_reaper(mut child: Child) {
+    let pid = child.id();
+    let spawned = thread::Builder::new()
+        .name("daemon-reaper".to_owned())
+        .stack_size(DAEMON_REAPER_STACK_BYTES)
+        .spawn(move || {
+            if let Err(err) = child.wait() {
+                eprintln!("g-mesh mcp-shim: failed to reap daemon pid {pid}: {err}");
+            }
+        });
+    if let Err(err) = spawned {
+        eprintln!(
+            "g-mesh mcp-shim: could not start a reaper for daemon pid {pid} ({err}); it is not reaped until the shim exits"
+        );
+    }
 }
 
 /// The file [`DAEMON_LOG_ENV`] names, or else the project's own
 /// [`DAEMON_LOG_FILE`] (rotated first, see [`DAEMON_LOG_ROTATE_BYTES`]);
 /// `/dev/null` only if neither can be opened.
 ///
-/// Never a pipe, whatever the setting: the shim drops the `Child` without
-/// waiting, so nothing would ever drain it, and the first daemon (or plugin)
-/// to fill the pipe buffer would block forever on a write it does not know is
-/// unread. A file and `/dev/null` both absorb writes unconditionally, which is
+/// Never a pipe, whatever the setting: the shim never reads the daemon's
+/// stderr (its reaper only waits for exit), so nothing would drain it, and the
+/// first daemon (or plugin) to fill the pipe buffer would block forever on a
+/// write it does not know is unread. A file and `/dev/null` both absorb writes unconditionally, which is
 /// the property the detached daemon's stderr has to keep.
 fn daemon_stderr(root: &Path) -> Stdio {
     let path = match std::env::var_os(DAEMON_LOG_ENV).filter(|value| !value.is_empty()) {

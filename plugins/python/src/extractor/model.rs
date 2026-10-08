@@ -42,10 +42,27 @@
 //! An ambiguous `name` lookup is refused rather than guessed, for the reason
 //! it is refused everywhere else here: two candidates mean a choice this tier
 //! cannot make, and a missing edge beats a wrong one.
+//!
+//! # The later binding of a module-level name
+//!
+//! Each module-level `def`, `class`, assignment and import statement rebinds
+//! its name, and the last one executed wins. This model keeps the start of
+//! each binding statement, so [`FileModel::module_binding`] can answer which
+//! one a use of the name in this module sees: the latest declaration, an
+//! unconditional named import written after it, or a declaration a later
+//! `*` import may rebind (which only the linker can decide). It answers per
+//! file, not per use site: a use inside a function runs after the module has
+//! loaded and so sees the final binding, and module-level code written
+//! between two bindings is the one case it gets wrong.
+//!
+//! A binding made inside a compound statement (`if`/`try`/`with`/...) never
+//! displaces an earlier one. `try: from ._speedups import f / except
+//! ImportError: from ._pure import f` normally binds the first, and every
+//! branch is indexed with no predicate evaluated (see [`super::decls`]).
 
 use std::collections::HashMap;
 
-use g_mesh_plugin_sdk::wire::{NodeKind, Range};
+use g_mesh_plugin_sdk::wire::{NodeKind, Position, Range};
 
 use crate::extractor::syntax::Accessor;
 
@@ -119,7 +136,37 @@ pub(crate) struct FileModel {
     /// position is its statement's order. Kept beside `imports`, not
     /// on [`Import`], whose values are compared as bindings.
     import_ranges: HashMap<String, Range>,
+    /// The start of the latest unconditional (directly module-level)
+    /// statement that made the binding in `imports`: what decides whether the
+    /// import displaced a module-level declaration.
+    unconditional_imports: HashMap<String, Position>,
+    /// The start of the latest module-level statement declaring each name.
+    /// Kept beside `by_scope`, not on [`DeclRef`], which stays a value.
+    decl_starts: HashMap<String, Position>,
+    /// The start of every non-external `*` import, in source order, branches
+    /// included: the linker orders `*` rows by text alone.
+    stars: Vec<Position>,
     dunder_all: DunderAll,
+}
+
+/// The binding a use of a module-level name sees, when the module declares
+/// that name ([`FileModel::module_binding`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModuleBinding<'m> {
+    /// An unconditional named import written after the latest declaration
+    /// displaced it.
+    Import(&'m Import),
+    /// The declaration: nothing written after it rebinds the name.
+    Decl(&'m DeclRef),
+    /// The declaration, with a `*` import written after it that may or may
+    /// not provide the name. Only the linker knows what the star provides,
+    /// so a use has to be addressed at this module's own container.
+    DeclBeforeStar(&'m DeclRef),
+}
+
+/// A position as a comparable key: source order.
+fn order(position: Position) -> (u32, u32) {
+    (position.line, position.col)
 }
 
 impl FileModel {
@@ -129,7 +176,24 @@ impl FileModel {
     /// A repeated qualified name - a conditional definition, which
     /// [`Emitter`](super::emit::Emitter) has already merged into one node -
     /// keeps the first, so this table says exactly what the graph says.
-    pub(crate) fn declare(&mut self, scope: &str, name: &str, qualified: &str, decl: DeclRef) {
+    ///
+    /// `start` is the declaring statement's start. For a module-level
+    /// declaration (`scope` empty) the latest one is kept, as what a later
+    /// import has to follow to displace it ([`FileModel::module_binding`]).
+    pub(crate) fn declare(
+        &mut self,
+        scope: &str,
+        name: &str,
+        qualified: &str,
+        decl: DeclRef,
+        start: Position,
+    ) {
+        if scope.is_empty() {
+            let latest = self.decl_starts.entry(name.to_string()).or_insert(start);
+            if order(start) > order(*latest) {
+                *latest = start;
+            }
+        }
         self.by_qualified.entry(qualified.to_string()).or_insert_with(|| decl.clone());
         let named = self.by_scope.entry((scope.to_string(), name.to_string())).or_default();
         if !named.contains(&decl) {
@@ -168,26 +232,85 @@ impl FileModel {
         self.by_qualified.get(qualified)
     }
 
-    /// Records what a module-level `import` bound. The first binding of a
-    /// name wins, which is also what Python does with the only sane version
-    /// of a repeat (two branches of an `if` importing one name from two
-    /// places).
+    /// Records what a module-level `import` bound.
+    ///
+    /// `unconditional` says the statement is directly at module level, not
+    /// inside a compound statement. A later unconditional binding of a name
+    /// replaces an earlier different one, and its range with it, because the
+    /// later statement is the one that last bound the name. A conditional one
+    /// never replaces a different binding: of two branches importing one
+    /// name from two places (`try: ... / except ImportError: ...`) Python
+    /// normally runs the first.
     ///
     /// `range` is the import statement's. A repeat of the *same* binding
     /// (`from .a import f` written twice) moves it to the later statement,
-    /// which is the one that last bound the name; a repeat with a different
-    /// binding keeps the first binding and its range.
-    pub(crate) fn import(&mut self, local: &str, import: Import, range: Range) {
-        match self.imports.get(local) {
-            None => {
-                self.imports.insert(local.to_string(), import);
-                self.import_ranges.insert(local.to_string(), range);
-            }
+    /// conditional or not.
+    pub(crate) fn import(&mut self, local: &str, import: Import, range: Range, unconditional: bool) {
+        let replaces = match self.imports.get(local) {
+            None => true,
             Some(bound) if *bound == import => {
                 self.import_ranges.insert(local.to_string(), range);
+                if unconditional {
+                    self.unconditional_imports.insert(local.to_string(), range.start);
+                }
+                return;
             }
-            Some(_) => {}
+            Some(_) => unconditional,
+        };
+        if !replaces {
+            return;
         }
+        self.imports.insert(local.to_string(), import);
+        self.import_ranges.insert(local.to_string(), range);
+        if unconditional {
+            self.unconditional_imports.insert(local.to_string(), range.start);
+        } else {
+            self.unconditional_imports.remove(local);
+        }
+    }
+
+    /// Records a non-external `*` import starting at `start`.
+    pub(crate) fn star(&mut self, start: Position) {
+        self.stars.push(start);
+    }
+
+    /// The binding a use of the module-level `name` sees, when this module
+    /// declares one that fits `want`; `None` when it declares none (or more
+    /// than one), and only an import can bind the name.
+    ///
+    /// - [`ModuleBinding::Import`] when an unconditional named import starts
+    ///   after the latest module-level declaration.
+    /// - [`ModuleBinding::DeclBeforeStar`] when, with no such import, a `*`
+    ///   import starts after it.
+    /// - [`ModuleBinding::Decl`] otherwise: a declaration after the import
+    ///   wins again, and a conditional import never displaces one.
+    pub(crate) fn module_binding(&self, name: &str, want: Option<NodeKind>) -> Option<ModuleBinding<'_>> {
+        let decl = self.lookup("", name, want)?;
+        let Some(declared) = self.decl_starts.get(name).copied().map(order) else {
+            return Some(ModuleBinding::Decl(decl));
+        };
+        if let Some(import) = self.imports.get(name) {
+            if self.unconditional_imports.get(name).is_some_and(|start| order(*start) > declared) {
+                return Some(ModuleBinding::Import(import));
+            }
+        }
+        if self.stars.iter().any(|start| order(*start) > declared) {
+            return Some(ModuleBinding::DeclBeforeStar(decl));
+        }
+        Some(ModuleBinding::Decl(decl))
+    }
+
+    /// Every name a module-level declaration and a later unconditional named
+    /// import both bind, where the import displaced the declaration, sorted.
+    pub(crate) fn displaced(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .unconditional_imports
+            .keys()
+            .map(String::as_str)
+            .filter(|name| matches!(self.module_binding(name, None), Some(ModuleBinding::Import(_))))
+            .collect();
+        names.sort_unstable();
+        names
     }
 
     /// The range of the import statement that bound `local`
@@ -234,7 +357,7 @@ mod tests {
     #[test]
     fn a_method_is_not_visible_under_the_modules_own_scope() {
         let mut model = FileModel::default();
-        model.declare("Greeter", "render", "Greeter.render", decl("m", NodeKind::Function));
+        model.declare("Greeter", "render", "Greeter.render", decl("m", NodeKind::Function), range().start);
         assert_eq!(model.lookup("", "render", None), None);
         assert_eq!(model.lookup("Greeter", "render", None).map(|d| d.id.as_str()), Some("m"));
         // ...and it is exact under its qualified name, which is why a
@@ -245,8 +368,8 @@ mod tests {
     #[test]
     fn a_name_two_declarations_share_is_refused_unless_the_kind_singles_one_out() {
         let mut model = FileModel::default();
-        model.declare("", "load", "load", decl("f", NodeKind::Function));
-        model.declare("", "load", "load", decl("t", NodeKind::Type));
+        model.declare("", "load", "load", decl("f", NodeKind::Function), range().start);
+        model.declare("", "load", "load", decl("t", NodeKind::Type), range().start);
         assert_eq!(model.lookup("", "load", None), None, "no kind to choose by");
         assert_eq!(model.lookup("", "load", Some(NodeKind::Type)).map(|d| d.id.as_str()), Some("t"));
     }
@@ -254,11 +377,67 @@ mod tests {
     #[test]
     fn an_external_import_is_known_and_names_no_container_of_ours() {
         let mut model = FileModel::default();
-        model.import("Path", Import::External, range());
-        model.import("helpers", Import::Item { container: "pkg".into(), name: "helpers".into() }, range());
+        model.import("Path", Import::External, range(), true);
+        model.import(
+            "helpers",
+            Import::Item { container: "pkg".into(), name: "helpers".into() },
+            range(),
+            true,
+        );
         assert_eq!(model.lookup_import("Path"), Some(&Import::External));
         assert!(matches!(model.lookup_import("helpers"), Some(Import::Item { .. })));
         assert_eq!(model.lookup_import("missing"), None);
+    }
+
+    fn at(line: u32) -> Range {
+        Range { start: Position { line, col: 0 }, end: Position { line, col: 1 } }
+    }
+
+    fn item(container: &str) -> Import {
+        Import::Item { container: container.into(), name: "f".into() }
+    }
+
+    /// GM-533 R2: a later unconditional import of a name replaces an earlier
+    /// different binding, and its range; a conditional one never does.
+    #[test]
+    fn a_later_unconditional_import_replaces_and_a_conditional_one_does_not() {
+        let mut model = FileModel::default();
+        model.import("f", item("a"), at(0), true);
+        model.import("f", item("c"), at(1), true);
+        assert_eq!(model.lookup_import("f"), Some(&item("c")));
+        assert_eq!(model.import_range("f").map(|range| range.start.line), Some(1));
+        model.import("f", item("d"), at(2), false);
+        assert_eq!(model.lookup_import("f"), Some(&item("c")));
+        assert_eq!(model.import_range("f").map(|range| range.start.line), Some(1));
+    }
+
+    /// GM-533 R3/R4: the module binding of a declared name, by statement
+    /// order.
+    #[test]
+    fn the_module_binding_is_the_later_statement() {
+        let def = decl("d", NodeKind::Function);
+        let binding = |imports: &[(u32, bool)], stars: &[u32]| {
+            let mut model = FileModel::default();
+            model.declare("", "f", "f", def.clone(), at(1).start);
+            for &(line, unconditional) in imports {
+                model.import("f", item("a"), at(line), unconditional);
+            }
+            for &line in stars {
+                model.star(at(line).start);
+            }
+            match model.module_binding("f", None) {
+                Some(ModuleBinding::Import(_)) => "import",
+                Some(ModuleBinding::Decl(_)) => "decl",
+                Some(ModuleBinding::DeclBeforeStar(_)) => "decl before star",
+                None => "none",
+            }
+        };
+        assert_eq!(binding(&[(2, true)], &[]), "import");
+        assert_eq!(binding(&[(0, true)], &[]), "decl");
+        assert_eq!(binding(&[(2, false)], &[]), "decl");
+        assert_eq!(binding(&[], &[2]), "decl before star");
+        assert_eq!(binding(&[], &[0]), "decl");
+        assert_eq!(binding(&[(2, true)], &[3]), "import");
     }
 
     #[test]

@@ -211,6 +211,52 @@ fn a_destructured_sibling_shadows_a_default_like_a_plain_parameter() {
 }
 
 #[test]
+fn a_default_inside_a_top_level_object_destructuring_references_from_the_file() {
+    let graph = extract(PATH, "function d() {}\nconst o = {};\nconst { y = d() } = o;\n");
+    assert_edge!(graph, References, "<file>", "d");
+}
+
+#[test]
+fn a_default_inside_a_top_level_array_destructuring_references_from_the_file() {
+    let graph = extract(PATH, "function d() {}\nconst [y = d()] = [];\n");
+    assert_edge!(graph, References, "<file>", "d");
+}
+
+#[test]
+fn a_default_inside_a_nested_destructuring_in_a_function_is_a_call_of_the_function() {
+    let graph = extract(PATH, "function d() {}\nfunction f() { const { a: { y = d() } } = {}; }\n");
+    assert_edge!(graph, Calls, "f", "d");
+}
+
+#[test]
+fn a_name_default_inside_a_destructuring_in_a_function_is_a_reference() {
+    let graph = extract(PATH, "function d() {}\nfunction f() { let [z = d] = []; }\n");
+    assert_edge!(graph, References, "f", "d");
+}
+
+#[test]
+fn a_computed_key_inside_a_top_level_destructuring_is_walked() {
+    let graph = extract(PATH, "function d() {}\nconst { [d()]: q } = {};\n");
+    assert_edge!(graph, References, "<file>", "d");
+}
+
+#[test]
+fn the_name_a_defaulted_destructuring_binds_is_not_a_use() {
+    // At top level nothing binds `y` locally, so only skipping the pattern's
+    // left-hand side keeps it from reaching the function `y`.
+    let top = extract(PATH, "function y() {}\nfunction d() {}\nconst [y = d()] = [];\n");
+    assert_edge!(top, References, "<file>", "d");
+    assert_no_edge!(top, References, "<file>", "y");
+
+    let inner = extract(PATH, "function y() {}\nfunction d() {}\nfunction f() { const { y = d() } = {}; }\n");
+    assert_edge!(inner, Calls, "f", "d");
+    // Guard only: inside f the declaration binds `y` locally, which shadows
+    // the function even if the pattern's name were visited.
+    assert_no_edge!(inner, Calls, "f", "y");
+    assert_no_edge!(inner, References, "f", "y");
+}
+
+#[test]
 fn a_named_functions_own_name_is_not_bound_so_recursion_keeps_its_edge() {
     let graph = extract(PATH, "function f() { f(); }\nconst e = function e() { e(); };\n");
     assert_edge!(graph, Calls, "f", "f");

@@ -157,6 +157,7 @@ pub fn ensure_fresh<R: BufRead + Send, W: Write>(
     writer: &mut W,
     store: &IndexStore,
     project_root: &Path,
+    language: &str,
     file_path: &str,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -185,6 +186,7 @@ pub fn ensure_fresh<R: BufRead + Send, W: Write>(
                             writer,
                             store,
                             project_root,
+                            language,
                             file_path,
                             request_id,
                             embedding,
@@ -522,7 +524,7 @@ mod tests {
             let request: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
             let id = request.id.clone().expect("the semantic pass carries an id");
             match request.message {
-                ControlMessage::SemanticPass { file_paths } => {
+                ControlMessage::SemanticPass { file_paths, .. } => {
                     assert_eq!(file_paths, vec![expected_file_path.to_string()])
                 }
                 other => panic!("expected SemanticPass after the reparse, got {other:?}"),
@@ -585,6 +587,7 @@ mod tests {
             &mut core_writer,
             &conn,
             tmp.path(),
+            "rust",
             "src/lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
@@ -642,6 +645,7 @@ mod tests {
             &mut core_writer,
             &conn,
             tmp.path(),
+            "rust",
             "src/lib.rs",
             RequestId::Number(1),
             &EmbeddingPipeline::disabled(),
@@ -690,6 +694,7 @@ mod tests {
             &mut core_writer,
             &conn,
             tmp.path(),
+            "rust",
             "lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
@@ -735,6 +740,7 @@ mod tests {
             &mut core_writer2,
             &conn,
             tmp.path(),
+            "rust",
             "lib.rs",
             request_id2,
             &EmbeddingPipeline::disabled(),
@@ -784,6 +790,7 @@ mod tests {
             &mut core_writer,
             &conn,
             tmp.path(),
+            "rust",
             "lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
@@ -822,6 +829,7 @@ mod tests {
             &mut core_writer2,
             &conn,
             tmp.path(),
+            "rust",
             "lib.rs",
             RequestId::Number(2),
             &EmbeddingPipeline::disabled(),
@@ -873,6 +881,7 @@ mod tests {
             &mut core_writer,
             &conn,
             tmp.path(),
+            "rust",
             "lib.rs",
             request_id,
             &EmbeddingPipeline::disabled(),
@@ -917,6 +926,7 @@ mod tests {
             &mut core_writer2,
             &conn,
             tmp.path(),
+            "rust",
             "lib.rs",
             RequestId::Number(2),
             &EmbeddingPipeline::disabled(),

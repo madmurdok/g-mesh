@@ -834,9 +834,27 @@ mod tests {
         (0..EMBEDDING_DIM).map(|i| (k * 1000 + i as u64) as f32 / 7.0).collect()
     }
 
+    /// Tries a writer call until it is not busy: busy past `BUSY_TIMEOUT` is
+    /// the designed contract (the pipeline drops that batch and goes on), so
+    /// a writer retries it. Panics on any other error, and when the cache
+    /// stays busy for the whole bounded budget, so a stuck lock fails rather
+    /// than hangs.
+    fn retry_while_busy<T>(what: &str, index: u64, mut f: impl FnMut() -> Result<T>) -> T {
+        const TRIES: u32 = 400;
+        for _ in 0..TRIES {
+            match f() {
+                Ok(value) => return value,
+                Err(err) if is_busy(&err) => std::thread::sleep(Duration::from_millis(10)),
+                Err(err) => panic!("writer {index} {what} failed: {err:#}"),
+            }
+        }
+        panic!("writer {index} {what} was busy for the whole budget ({TRIES} tries)");
+    }
+
     /// One writer: waits for the go file, then inserts its overlapping key
-    /// range in small batches, panicking (a non-zero exit) on any error. A
-    /// no-op when not spawned by the test below.
+    /// range in small batches, retrying busy (as the pipeline does) and
+    /// panicking (a non-zero exit) on any other error. A no-op when not
+    /// spawned by the test below.
     #[test]
     fn concurrent_writer_child() {
         let Ok(spec) = std::env::var(WRITER_ENV) else { return };
@@ -861,26 +879,29 @@ mod tests {
             }
         }
         let mut cache = cache.expect("the cache stayed busy for a whole second");
-        let model = cache.model_id(&[9; 32], 100).expect("model_id failed");
+        let model = retry_while_busy("model_id", index, || cache.model_id(&[9; 32], 100));
         let first = index * WRITER_STRIDE;
         let keys: Vec<u64> = (first..first + KEYS_PER_WRITER).collect();
         for batch in keys.chunks(10) {
             let vectors: Vec<(Hash, Vec<f32>)> =
                 batch.iter().map(|k| (writer_key(*k), writer_vector(*k))).collect();
             let entries: Vec<(Hash, &[f32])> = vectors.iter().map(|(key, v)| (*key, v.as_slice())).collect();
-            cache
-                .insert(model, &entries, 100)
-                .unwrap_or_else(|err| panic!("writer {index} insert failed: {err:#}"));
+            retry_while_busy("insert", index, || cache.insert(model, &entries, 100));
             cache.lookup(model, &[writer_key(first)], 100).expect("lookup failed");
         }
     }
 
     /// Four processes writing overlapping keys into one cache at once: none
-    /// errors, every key is present exactly once, with its own bytes.
+    /// errors except busy, which each writer retries (bounded) as the
+    /// pipeline does, and every key is present exactly once, with its own
+    /// bytes.
     ///
-    /// Control: drop `OR IGNORE` in `insert` (overlapping keys then fail
-    /// with a constraint error) and a writer exits non-zero. The busy
-    /// timeout's own controls are the two tests above.
+    /// Controls: (1) revert the retry (unwrap busy) and run with 16 writers
+    /// on a loaded machine: a writer fails with "database is locked".
+    /// (2) Drop `OR IGNORE` in `insert`: the constraint error is not busy,
+    /// is not retried, and a writer exits non-zero. (3) Retry every error
+    /// plus (2): a writer fails on the exhausted budget, not a hang. The
+    /// busy timeout's own controls are the two tests above.
     #[test]
     fn concurrent_writers_share_one_cache() {
         let dir = tempfile::tempdir().unwrap();

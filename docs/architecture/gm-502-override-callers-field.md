@@ -281,6 +281,10 @@ Owner's answers (2026-10-08):
 - Q2: "Ближайший объявивший предок (Recommended)".
 - Q3: "Один раз за сессию (Recommended)".
 - Q4: "Не сейчас, задача в бэклог (Recommended)".
+  Delivered by GM-536: `find_references` runs the same `probe` and carries
+  `overrides`/`overridesTruncated` on its page and `answer` summary; the hint
+  key is shared, so the sentence (reworded to name both tools, 217 bytes) is
+  sent once per session across `find_callers` and `find_references`.
 - Note: "Утверждаю (Recommended)".
 
 ### Q1. Rust: how does a Rust trait-impl method get the field?

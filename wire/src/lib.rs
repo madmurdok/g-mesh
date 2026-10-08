@@ -527,6 +527,15 @@ pub enum RequestId {
     String(String),
 }
 
+/// One structural edge core's linker moved, as `SemanticPass` carries it:
+/// the edge's id and the declaration its `toId` now names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedEdge {
+    pub edge_id: String,
+    pub to_id: String,
+}
+
 /// The control-plane payload shapes: reindex request, file-changed
 /// notification, status query, semantic-pass request, workspace-changed
 /// notification. Which of these is a "request" (expects a response) vs. a
@@ -562,6 +571,15 @@ pub enum ControlMessage {
     #[serde(rename_all = "camelCase")]
     SemanticPass {
         file_paths: Vec<String>,
+        /// Every structural edge of the pass's scope that core's linker
+        /// moved onto a declaration, with the target it moved it to. A
+        /// semantic tier compares its answer with these, so an answer that
+        /// lands where core already linked the edge is agreement, not a
+        /// contradiction - however many re-exports the linker walked to get
+        /// there (`docs/adr/0029-core-ships-its-link-result-to-the-semantic-tier.md`).
+        /// Absent and empty are the same: nothing linked in scope.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        linked_edges: Vec<LinkedEdge>,
     },
     /// Tells a plugin its cached module/crate map is stale - a workspace
     /// file changed (`plugin.toml`'s `workspace.watch_files`, e.g. `go.mod`,
@@ -1026,6 +1044,7 @@ mod tests {
             id: Some(RequestId::Number(7)),
             message: ControlMessage::SemanticPass {
                 file_paths: vec!["src/a.ts".to_string(), "src/b.ts".to_string()],
+                linked_edges: Vec::new(),
             },
         };
 
@@ -1045,13 +1064,50 @@ mod tests {
         let envelope = ControlEnvelope {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: Some(RequestId::Number(1)),
-            message: ControlMessage::SemanticPass { file_paths: Vec::new() },
+            message: ControlMessage::SemanticPass { file_paths: Vec::new(), linked_edges: Vec::new() },
         };
 
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(json.contains("\"filePaths\":[]"), "{json}");
         let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(envelope, round_tripped);
+    }
+
+    /// `linkedEdges` is optional on the wire both ways: a pass with nothing
+    /// linked omits the key (so a plugin that predates the field sees the
+    /// request it always did), and a request without the key reads as empty.
+    #[test]
+    fn semantic_pass_linked_edges_are_omitted_when_empty_and_read_as_empty_when_absent() {
+        let empty = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(RequestId::Number(3)),
+            message: ControlMessage::SemanticPass {
+                file_paths: vec!["src/a.rs".to_string()],
+                linked_edges: Vec::new(),
+            },
+        };
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(!json.contains("linkedEdges"), "an empty list must not be serialized: {json}");
+        let absent: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        match absent.message {
+            ControlMessage::SemanticPass { linked_edges, .. } => {
+                assert!(linked_edges.is_empty(), "an absent field must read as empty: {linked_edges:?}")
+            }
+            other => panic!("expected SemanticPass, got {other:?}"),
+        }
+
+        let linked = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(RequestId::Number(4)),
+            message: ControlMessage::SemanticPass {
+                file_paths: Vec::new(),
+                linked_edges: vec![LinkedEdge { edge_id: "x".to_string(), to_id: "d".to_string() }],
+            },
+        };
+        let json = serde_json::to_string(&linked).unwrap();
+        assert!(json.contains(r#""linkedEdges":[{"edgeId":"x","toId":"d"}]"#), "{json}");
+        let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(linked, round_tripped);
     }
 
     #[test]

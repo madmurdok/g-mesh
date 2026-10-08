@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-plugin-typescript"
-version = "4.1.0"
+version = "4.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "g-mesh's TypeScript/JavaScript language plugin: tree-sitter structural extraction on the plugin SDK"

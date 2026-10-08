@@ -1288,6 +1288,184 @@ fn a_qualified_name_key_disambiguates_two_same_named_methods() {
     assert_eq!(edge_target(&conn, &exact), ("Function:util/server.go:Client.Close".to_string(), true));
 }
 
+/// An accessor `qualified_name` of `at.container` with its `nativeKind`, id
+/// `Function:<file>:<qualifiedName>:<nativeKind>`: a getter and its setter
+/// share a qualifiedName, so [`member`]'s id would merge them.
+fn gm530_accessor(at: At, native_kind: &str, qualified_name: &str) -> NodeRecord {
+    gm530_declaration(at, "Function", native_kind, qualified_name)
+}
+
+fn gm530_declaration(at: At, kind: &str, native_kind: &str, qualified_name: &str) -> NodeRecord {
+    let mut node = member(at, kind, qualified_name, Vis::Public);
+    node.id = format!("{}:{native_kind}", node.id);
+    node.native_kind = Some(native_kind.to_string());
+    node
+}
+
+fn gm530_python(file: &'static str, module: &'static str) -> At<'static> {
+    At { file, language: "python", container: module, parent: None }
+}
+
+fn gm530_typescript(file: &'static str) -> At<'static> {
+    At { file, language: "typescript", container: file, parent: None }
+}
+
+/// `caller` in `from` uses `qualified_name` of the container `scope` through
+/// a `kind` edge keyed by `key_kind`, after `declarations` are indexed;
+/// returns where the edge points once linked.
+fn gm530_link(
+    declarations: Vec<NodeRecord>,
+    from: At,
+    kind: &str,
+    scope: &str,
+    key_kind: &str,
+    key: &str,
+) -> (String, bool) {
+    let mut conn = setup();
+    upsert(&mut conn, declarations);
+    let caller = member(from, "Function", "show", Vis::Public);
+    let caller_id = caller.id.clone();
+    let edge = use_through(
+        &mut conn,
+        vec![caller],
+        &caller_id,
+        kind,
+        container_placeholder(from, scope, key_kind, key),
+    );
+    link_all(&mut conn).unwrap();
+    edge_target(&conn, &edge)
+}
+
+/// GM-530 acceptance 1: `C.x` from another file names the property, and a
+/// property with a setter and a deleter is three nodes of one qualifiedName;
+/// the getter (Python keeps it as `method`) stands for it.
+#[test]
+fn a_qualified_python_property_use_links_to_its_getter() {
+    let shapes = gm530_python("pkg/shapes.py", "pkg.shapes");
+    let target = gm530_link(
+        vec![
+            gm530_accessor(shapes, "method", "C.x"),
+            gm530_accessor(shapes, "setter", "C.x"),
+            gm530_accessor(shapes, "deleter", "C.x"),
+        ],
+        gm530_python("pkg/use.py", "pkg.use"),
+        "REFERENCES",
+        "pkg.shapes",
+        KEY_QUALIFIED_NAME,
+        "C.x",
+    );
+    assert_eq!(target, ("Function:pkg/shapes.py:C.x:method".to_string(), true));
+}
+
+/// GM-530 acceptance 2: a TypeScript `get x()` / `set x(v)` pair, called by
+/// its qualifiedName, links to the `getter`.
+#[test]
+fn a_qualified_typescript_accessor_pair_use_links_to_its_getter() {
+    let c = gm530_typescript("src/c.ts");
+    let target = gm530_link(
+        vec![gm530_accessor(c, "getter", "C.x"), gm530_accessor(c, "setter", "C.x")],
+        gm530_typescript("src/use.ts"),
+        "CALLS",
+        "src/c.ts",
+        KEY_QUALIFIED_NAME,
+        "C.x",
+    );
+    assert_eq!(target, ("Function:src/c.ts:C.x:getter".to_string(), true));
+}
+
+/// GM-530 acceptance 3: a `method` and a `setter` `C.x` from two files of one
+/// container are two declarations, not one property: no tie-break.
+#[test]
+fn a_method_and_a_setter_from_two_files_of_one_container_stay_unlinked() {
+    let target = gm530_link(
+        vec![
+            gm530_accessor(gm530_python("pkg/a.py", "pkg"), "method", "C.x"),
+            gm530_accessor(gm530_python("pkg/b.py", "pkg"), "setter", "C.x"),
+        ],
+        gm530_python("pkg/use.py", "pkg.use"),
+        "REFERENCES",
+        "pkg",
+        KEY_QUALIFIED_NAME,
+        "C.x",
+    );
+    assert!(!target.1, "two files: not one property, got {target:?}");
+}
+
+/// A TypeScript `static x()` beside a `get x()` / `set x(v)` pair: two
+/// getter-like candidates, nothing says which one the use means.
+#[test]
+fn a_static_method_beside_an_accessor_pair_stays_unlinked() {
+    let c = gm530_typescript("src/c.ts");
+    let target = gm530_link(
+        vec![
+            gm530_accessor(c, "method", "C.x"),
+            gm530_accessor(c, "getter", "C.x"),
+            gm530_accessor(c, "setter", "C.x"),
+        ],
+        gm530_typescript("src/use.ts"),
+        "CALLS",
+        "src/c.ts",
+        KEY_QUALIFIED_NAME,
+        "C.x",
+    );
+    assert!(!target.1, "two getter-like candidates, got {target:?}");
+}
+
+/// The tie-break is for a qualifiedName key: under a name key, members alone
+/// stay ambiguous, accessors of one property included.
+#[test]
+fn an_accessor_pair_reached_by_a_name_key_stays_unlinked() {
+    let c = gm530_typescript("src/c.ts");
+    let target = gm530_link(
+        vec![gm530_accessor(c, "getter", "C.x"), gm530_accessor(c, "setter", "C.x")],
+        gm530_typescript("src/use.ts"),
+        "CALLS",
+        "src/c.ts",
+        KEY_NAME,
+        "x",
+    );
+    assert!(!target.1, "a name key gets no accessor tie-break, got {target:?}");
+}
+
+/// No getter to prefer, or a candidate that is no accessor at all (Python's
+/// `x = property(f)` is a `Variable` `C.x`): each stays unlinked.
+#[test]
+fn accessors_without_a_sole_getter_or_beside_a_variable_stay_unlinked() {
+    let shapes = gm530_python("pkg/shapes.py", "pkg.shapes");
+    let cases = [
+        (
+            "setter + deleter",
+            vec![gm530_accessor(shapes, "setter", "C.x"), gm530_accessor(shapes, "deleter", "C.x")],
+        ),
+        (
+            "variable + setter",
+            vec![
+                gm530_declaration(shapes, "Variable", "variable", "C.x"),
+                gm530_accessor(shapes, "setter", "C.x"),
+            ],
+        ),
+        (
+            "variable + getter + setter",
+            vec![
+                gm530_declaration(shapes, "Variable", "variable", "C.x"),
+                gm530_accessor(shapes, "method", "C.x"),
+                gm530_accessor(shapes, "setter", "C.x"),
+            ],
+        ),
+    ];
+    for (case, declarations) in cases {
+        let target = gm530_link(
+            declarations,
+            gm530_python("pkg/use.py", "pkg.use"),
+            "REFERENCES",
+            "pkg.shapes",
+            KEY_QUALIFIED_NAME,
+            "C.x",
+        );
+        assert!(!target.1, "{case}: must stay unlinked, got {target:?}");
+    }
+}
+
 /// Go's unexported: visible to its own package, and only to it - under a
 /// name key, and under a qualifiedName key too, which is what stops a
 /// semantic tier's mistake from linking a private symbol from outside.
@@ -3717,4 +3895,162 @@ fn gm496_rows_from_different_files_keep_no_winner() {
     link_all(&mut conn).unwrap();
     let (target, resolved) = edge_target(&conn, &edge);
     assert!(!resolved, "linked {target}");
+}
+
+// --- GM-533: in Python a later binding hop rebinds an earlier declaration ---
+//
+// docs/architecture/gm-533-python-later-binding.md, R1: where the
+// declaration's language binds a name by the later statement, a re-export
+// row written after the declaration in the same file, and providing the
+// name, binds it instead.
+
+const GM533_PY_DEF: &str = "Function:pkg/__init__.py:pkg.f";
+
+/// `pkg/__init__.py` declaring `f` on `def_line` and holding `from .b import
+/// *` on `star_line` - in `pkg/other.py` (also of the container `pkg`)
+/// instead when `star_elsewhere` - every module in `providers` declaring `f`,
+/// and `user.py` calling `pkg`'s `f` ([`gm496_python_diffs`]). Returns the
+/// diffs and the call's edge id.
+fn gm533_python_diffs(
+    def_line: i64,
+    star_line: i64,
+    star_elsewhere: bool,
+    providers: &[&str],
+) -> (Vec<Diff>, String) {
+    let (mut diffs, edge) = gm496_python_diffs(&[PyRow::Star("pkg.b")], providers);
+    let init = gm490_py_at("pkg/__init__.py", "pkg", None);
+    let rows = &mut diffs[providers.len()].upsert_nodes;
+    let mut star = rows.pop().expect("the fixture's one star row");
+    if star_elsewhere {
+        let other = At { file: "pkg/other.py", language: "python", container: "pkg", parent: None };
+        star = container_reexport(other, REEXPORT_ALL_NAME, "pkg.b", REEXPORT_ALL_NAME);
+    }
+    star.start_line = star_line;
+    let mut def = member(init, "Function", "pkg.f", Vis::Public);
+    def.start_line = def_line;
+    rows.push(def);
+    if star_elsewhere {
+        diffs.push(Diff { upsert_nodes: vec![star], ..Default::default() });
+    } else {
+        rows.push(star);
+    }
+    (diffs, edge)
+}
+
+/// T1: `def f` on line 0, then `from .b import *` on line 1 with `pkg.b`
+/// declaring `f`: the star rebinds `f`, so `from pkg import f` links
+/// `pkg.b.f`, in a whole pass and in every arrival order.
+///
+/// Control C1: drop the R1 rebinding check in `Resolver::walk_capped` (never
+/// `continue` past the candidates) - the call links the def.
+#[test]
+fn gm533_a_later_providing_star_import_rebinds_an_earlier_def() {
+    let (diffs, edge) = gm533_python_diffs(0, 1, false, &["pkg.a", "pkg.b"]);
+    gm496_assert_every_order_links(&diffs, &edge, Some(GM490_PY_B));
+}
+
+/// T2: the star on line 0, then `def f` on line 1: the def is the later
+/// binding and wins.
+///
+/// Control C2: in `Resolver::rebinds`, rebind without the position
+/// comparison - the call links `pkg.b.f`.
+#[test]
+fn gm533_a_def_after_a_star_import_wins_again() {
+    let (diffs, edge) = gm533_python_diffs(1, 0, false, &["pkg.a", "pkg.b"]);
+    gm496_assert_every_order_links(&diffs, &edge, Some(GM533_PY_DEF));
+}
+
+/// T3: `def f`, then a star import whose module does not declare `f`: the
+/// star binds nothing, and the def stays.
+///
+/// Control C4: rebind on any later `*` row, skipping `provides` (pass the
+/// step's hops to `Resolver::rebinds` before `later_binding`) - the call is
+/// left unresolved.
+#[test]
+fn gm533_a_later_star_import_that_does_not_provide_the_name_keeps_the_def() {
+    let (diffs, edge) = gm533_python_diffs(0, 1, false, &["pkg.a"]);
+    gm496_assert_every_order_links(&diffs, &edge, Some(GM533_PY_DEF));
+}
+
+/// A star row of the same container written in another file has no
+/// statement order with the def: the def wins, though the row's line is
+/// later.
+///
+/// Control: in `Resolver::rebinds`, drop the same-file filter on the
+/// candidates - the call links `pkg.b.f`.
+#[test]
+fn gm533_a_star_import_of_another_file_keeps_the_def() {
+    let (diffs, edge) = gm533_python_diffs(0, 5, true, &["pkg.a", "pkg.b"]);
+    let mut conn = setup();
+    gm490_apply(&mut conn, &diffs);
+    link_all(&mut conn).unwrap();
+    assert_eq!(edge_target(&conn, &edge), (GM533_PY_DEF.to_string(), true));
+}
+
+/// `src/m.rs` (`mod m`) declaring `f` on line 0 (unless `!declared`) and
+/// holding `pub use crate::n::*;` on line 1, `n` declaring `f`, and `user`
+/// calling `m`'s `f`. Linked under the bundled rules; returns the call's
+/// target.
+fn gm533_rust_call(declared: bool) -> (String, bool) {
+    let m = At { file: "src/m.rs", language: "rust", container: "krate::m", parent: Some("krate") };
+    let n = At { file: "src/n.rs", language: "rust", container: "krate::n", parent: Some("krate") };
+    let user = At { file: "src/user.rs", language: "rust", container: "krate::user", parent: Some("krate") };
+    let mut glob = container_reexport(m, REEXPORT_ALL_NAME, "krate::n", REEXPORT_ALL_NAME);
+    glob.start_line = 1;
+    let mut nodes = vec![glob, member(n, "Function", "krate::n::f", Vis::Public)];
+    if declared {
+        let mut def = member(m, "Function", "krate::m::f", Vis::Public);
+        def.start_line = 0;
+        nodes.push(def);
+    }
+    let mut conn = setup();
+    upsert(&mut conn, nodes);
+    let caller = member(user, "Function", "krate::user::run", Vis::Public);
+    let caller_id = caller.id.clone();
+    let edge = use_through(
+        &mut conn,
+        vec![caller],
+        &caller_id,
+        "CALLS",
+        container_placeholder(user, "krate::m", KEY_NAME, "f"),
+    );
+    link_all(&mut conn).unwrap();
+    edge_target(&conn, &edge)
+}
+
+/// `index.ts` declaring `mutate` on line 0 (unless `!declared`) and holding
+/// `export * from "./b"` on line 1, `b.ts` declaring `mutate`, and a call of
+/// `index.ts`'s `mutate`. Linked under the bundled rules; returns the call's
+/// target.
+fn gm533_ts_call(declared: bool) -> (String, bool) {
+    let mut star = reexport_all("index.ts", "b.ts");
+    star.start_line = 1;
+    let mut nodes =
+        vec![symbol("caller.ts", "run", "Function", true), star, symbol("b.ts", "mutate", "Function", true)];
+    if declared {
+        let mut def = symbol("index.ts", "mutate", "Function", true);
+        def.start_line = 0;
+        nodes.push(def);
+    }
+    let mut conn = setup();
+    upsert(&mut conn, nodes);
+    let edge = seed_usage(&mut conn, "Function:caller.ts:run", "CALLS", "index.ts", "mutate");
+    link_all(&mut conn).unwrap();
+    edge_target(&conn, &edge)
+}
+
+/// T4: Rust and TypeScript keep the declaration over a later glob / `export
+/// *` providing the name - only a `later_import_binds` language rebinds.
+/// Without the declaration the same glob does link the provider, so the
+/// row is one the walk follows.
+///
+/// Control C3: in `Resolver::walk_capped`, rebind without the language gate
+/// (drop the `later_import_binds(&c.language)` check) - both calls link the
+/// glob's provider.
+#[test]
+fn gm533_rust_and_typescript_keep_a_declaration_over_a_later_glob() {
+    assert_eq!(gm533_rust_call(true), ("Function:src/m.rs:krate::m::f".to_string(), true));
+    assert_eq!(gm533_rust_call(false), ("Function:src/n.rs:krate::n::f".to_string(), true));
+    assert_eq!(gm533_ts_call(true), ("Function:index.ts:mutate".to_string(), true));
+    assert_eq!(gm533_ts_call(false), ("Function:b.ts:mutate".to_string(), true));
 }

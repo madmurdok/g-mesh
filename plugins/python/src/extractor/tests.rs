@@ -1712,3 +1712,150 @@ fn the_file_and_its_module_end_on_the_files_last_real_line() {
         assert_eq!(module.range, file.range, "{what}: the Module takes the File's range");
     }
 }
+
+// --- GM-533: the later top-level binding of a module-level name -------------
+//
+// docs/architecture/gm-533-python-later-binding.md, R2-R4: of two
+// unconditional named imports the later binds, a later unconditional named
+// import displaces an earlier `def`, and an in-file use of a `def` written
+// before a `*` import is left to the linker.
+
+/// `pkg/a.py` and `pkg/c.py` both declaring `g`, and `pkg/__init__.py` as
+/// `init`.
+fn gm533_two_providers(init: &str) -> Tree {
+    tree(&[
+        ("pkg/a.py", "def g():\n    pass\n"),
+        ("pkg/c.py", "def g():\n    pass\n"),
+        ("pkg/__init__.py", init),
+    ])
+}
+
+/// T5: of two top-level named imports of `g`, the later binds it - the
+/// `__all__` row is `c.g`'s, at line 1, and a bare `g()` in a function
+/// addresses `c.g`.
+///
+/// Control C5: `FileModel::import` back to first-wins (a different binding
+/// never replaces the existing one) - the row and the call are `a.g`'s.
+#[test]
+fn gm533_of_two_top_level_named_imports_the_later_binds() {
+    let tree = gm533_two_providers(
+        "from .a import g\nfrom .c import g\n__all__ = [\"g\"]\n\ndef run():\n    return g()\n",
+    );
+    let graph = tree.extract("pkg/__init__.py");
+    assert_eq!(graph.node("pkg.c::g as g").range.start.line, 1);
+    assert!(graph.find("pkg.a::g as g").is_none(), "{:#?}", graph.names());
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["pending_symbol pkg.c::g".to_string()]);
+}
+
+/// T6: a named import inside `try`/`if`/`with`/`for` never replaces an
+/// earlier binding of the name: the `try`/`except ImportError` idiom binds
+/// its first branch, and a top-level import followed by a conditional one
+/// keeps the top-level one. Row and call stay `a.g`'s.
+///
+/// Control C6: drop the `conditional` guard (`Declarer::statement` no longer
+/// counts compound statements) - every case binds `c.g`.
+#[test]
+fn gm533_a_conditional_named_import_never_replaces_an_earlier_one() {
+    let tail = "__all__ = [\"g\"]\n\ndef run():\n    return g()\n";
+    let cases = [
+        "try:\n    from .a import g\nexcept ImportError:\n    from .c import g\n".to_string(),
+        "from .a import g\nif X:\n    from .c import g\n".to_string(),
+        "from .a import g\ntry:\n    from .c import g\nexcept ImportError:\n    pass\n".to_string(),
+        "from .a import g\nwith X:\n    from .c import g\n".to_string(),
+        "from .a import g\nfor _ in X:\n    from .c import g\n".to_string(),
+    ];
+    for head in cases {
+        let tree = gm533_two_providers(&format!("{head}{tail}"));
+        let graph = tree.extract("pkg/__init__.py");
+        assert!(graph.find("pkg.a::g as g").is_some(), "{head:?}: {:#?}", graph.names());
+        assert!(graph.find("pkg.c::g as g").is_none(), "{head:?}: {:#?}", graph.names());
+        assert_eq!(
+            graph.targets(EdgeKind::Calls, "run"),
+            vec!["pending_symbol pkg.a::g".to_string()],
+            "{head:?}"
+        );
+    }
+}
+
+/// `pkg/a.py` and `pkg/b.py` both declaring `f`, and `pkg/__init__.py` as
+/// `init`.
+fn gm533_f_providers(init: &str) -> Tree {
+    tree(&[
+        ("pkg/a.py", "def f():\n    pass\n"),
+        ("pkg/b.py", "def f():\n    pass\n"),
+        ("pkg/__init__.py", init),
+    ])
+}
+
+/// T7: `def f` and then a top-level `from .a import f`: the import displaces
+/// the def, so a bare `f()` addresses `a.f`, and a named row for `f` sits at
+/// the import (line 3) with and without `__all__`. The import before the
+/// def, or a conditional import after it, leaves the def: a direct call and
+/// no row.
+///
+/// Control C7: `FileModel::module_binding` ignores `decl_starts` (the def
+/// always wins) - the call lands on the def and no row is emitted.
+#[test]
+fn gm533_a_later_top_level_named_import_displaces_an_earlier_def() {
+    let displaced = "def f():\n    pass\n\nfrom .a import f\n\ndef run():\n    return f()\n";
+    for all in ["", "__all__ = [\"f\"]\n"] {
+        let tree = gm533_f_providers(&format!("{displaced}{all}"));
+        let graph = tree.extract("pkg/__init__.py");
+        assert_eq!(
+            graph.targets(EdgeKind::Calls, "run"),
+            vec!["pending_symbol pkg.a::f".to_string()],
+            "__all__ {all:?}"
+        );
+        assert_eq!(graph.node("pkg.a::f as f").range.start.line, 3, "__all__ {all:?}");
+    }
+
+    let kept = [
+        "from .a import f\n\ndef f():\n    pass\n\ndef run():\n    return f()\n__all__ = [\"f\"]\n",
+        "def f():\n    pass\n\nif X:\n    from .a import f\n\ndef run():\n    return f()\n__all__ = [\"f\"]\n",
+    ];
+    for init in kept {
+        let tree = gm533_f_providers(init);
+        let graph = tree.extract("pkg/__init__.py");
+        assert_eq!(graph.edge_between("run", "f"), Some((EdgeKind::Calls, true)), "{init:?}");
+        assert!(graph.find("pkg.a::f as f").is_none(), "{init:?}: {:#?}", graph.names());
+    }
+}
+
+/// T8: `def f` and then `from .b import *`: whether the star rebinds `f`
+/// only the linker knows, so a bare `f()` is a placeholder at the module's
+/// own container (`pkg`/`f`, the address `from pkg import f` uses
+/// elsewhere), and no named row is emitted for `f`, even when `__all__`
+/// lists it. The star before the def leaves the def a direct call.
+///
+/// Control C8: `Bodies::resolve_bare` returns `Bound::Here` for
+/// `ModuleBinding::DeclBeforeStar` - the call is a direct edge to the def.
+#[test]
+fn gm533_a_use_of_a_def_before_a_star_import_is_left_to_the_linker() {
+    let before = "def f():\n    pass\n\nfrom .b import *\n\ndef run():\n    return f()\n";
+    for all in ["", "__all__ = [\"f\"]\n"] {
+        let tree = gm533_f_providers(&format!("{before}{all}"));
+        let graph = tree.extract("pkg/__init__.py");
+        assert_eq!(
+            graph.targets(EdgeKind::Calls, "run"),
+            vec!["pending_symbol pkg::f".to_string()],
+            "{all:?}"
+        );
+        assert_eq!(
+            graph.placeholder_target("pkg::f"),
+            ("container:pkg".into(), "name:f".into(), "pkg".into()),
+            "{all:?}"
+        );
+        let rows: Vec<_> = graph
+            .names()
+            .into_iter()
+            .filter(|(qualified, native)| {
+                native.as_deref() == Some("reexport") && qualified.ends_with(" as f")
+            })
+            .collect();
+        assert!(rows.is_empty(), "{all:?}: {rows:#?}");
+    }
+
+    let tree = gm533_f_providers("from .b import *\n\ndef f():\n    pass\n\ndef run():\n    return f()\n");
+    let graph = tree.extract("pkg/__init__.py");
+    assert_eq!(graph.edge_between("run", "f"), Some((EdgeKind::Calls, true)));
+}

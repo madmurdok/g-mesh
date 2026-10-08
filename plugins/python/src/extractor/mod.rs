@@ -216,6 +216,7 @@ impl Extractor for PythonExtractor {
                     emitter: &mut emitter,
                     model: &mut model,
                     scopes: Scopes::new(),
+                    conditional: 0,
                 };
                 declarer.announce(root);
                 declarer.collect(root);

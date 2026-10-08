@@ -1305,6 +1305,7 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
                     // wrong one.
                     several => resolver
                         .sole_non_member(&placeholder.key, several)?
+                        .or_else(|| sole_accessor_getter(&placeholder.key, several))
                         .map(|candidate| candidate.id.clone()),
                 };
 
@@ -1357,6 +1358,8 @@ struct Candidate {
     container: Option<String>,
     /// `nodes.qualifiedPath`, still encoded: only an ambiguity decodes it.
     qualified_path: Option<String>,
+    /// `nodes.nativeKind`: what tells a property's accessors apart.
+    native_kind: Option<String>,
 }
 
 /// A scope and key the walk looks a declaration up at.
@@ -1417,7 +1420,7 @@ struct Resolver<'c> {
 impl<'c> Resolver<'c> {
     fn new(conn: &'c Connection, rules: &'c LinkRules) -> Result<Self> {
         const CANDIDATE: &str = "SELECT id, kind, filePath, language, visibility, visibilityContainer, \
-             qualifiedName, container, qualifiedPath FROM nodes";
+             qualifiedName, container, qualifiedPath, nativeKind FROM nodes";
         const REEXPORT: &str = "SELECT n.id, n.name, n.language, t.scopeKind, t.scope, t.keyKind, t.key, \
              n.visibility, n.visibilityContainer, n.filePath, n.startLine, n.startCol \
              FROM nodes n LEFT JOIN placeholder_targets t ON t.nodeId = n.id";
@@ -1490,7 +1493,11 @@ impl<'c> Resolver<'c> {
     /// `scope` itself).
     ///
     /// Breadth-first, so a name a scope both declares and re-exports resolves
-    /// to the declaration - the language's own rule. Bounded twice over: the
+    /// to the declaration - the language's own rule - except where the
+    /// declaration's language binds a name by the later statement
+    /// ([`LinkRules::later_import_binds`]): there a re-export written after
+    /// the declaration in the same file, and providing the name, binds it
+    /// instead. Bounded twice over: the
     /// visited set makes a re-export cycle terminate, [`MAX_REEXPORT_DEPTH`]
     /// bounds an acyclic chain, and both are needed since one does not imply
     /// the other.
@@ -1514,12 +1521,32 @@ impl<'c> Resolver<'c> {
         for depth in 0..=cap {
             let mut candidates: Vec<Candidate> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
-            for (scope, key) in &frontier {
+            // Binding hops already computed for a frontier step, by index, so
+            // the expansion below does not compute them twice.
+            let mut computed: Vec<Option<Vec<Hop>>> = vec![None; frontier.len()];
+            for (index, (scope, key)) in frontier.iter().enumerate() {
+                let mut found = Vec::new();
                 for candidate in self.declared(scope, key)? {
+                    if self.visible(&candidate, scope, requester)? {
+                        found.push(candidate);
+                    }
+                }
+                if depth < cap {
+                    if let Key::Name(name) = key {
+                        if found.iter().any(|c| self.rules.later_import_binds(&c.language)) {
+                            let hops = self.binding_hops(scope, name, requester, cap - depth - 1)?;
+                            let rebound = self.rebinds(&found, &hops)?;
+                            computed[index] = Some(hops);
+                            if rebound {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                for candidate in found {
                     // The same node can be reached under its file *and* its
                     // container; it is still one candidate, not an ambiguity.
-                    if !seen.contains(&candidate.id) && self.visible(&candidate, scope, requester)? {
-                        seen.insert(candidate.id.clone());
+                    if seen.insert(candidate.id.clone()) {
                         candidates.push(candidate);
                     }
                 }
@@ -1529,39 +1556,16 @@ impl<'c> Resolver<'c> {
             }
 
             let mut next = Vec::new();
-            for (scope, key) in &frontier {
+            for (index, (scope, key)) in frontier.iter().enumerate() {
                 let Key::Name(name) = key else {
                     continue; // a qualifiedName names a declaration, never a pass-through
                 };
-                let mut hops = self.hops(scope, name)?;
-                // Where the language says so, a named row shadows the scope's
-                // `*` rows, even when it leads nowhere (an external crate's
-                // item) and even when this requester may not follow it: in
-                // rustc the shadowed glob item is not in the scope at all, so
-                // a missing edge beats the wrong one a glob would give. A
-                // language declaring neither rule keeps both kinds at this
-                // depth, with no winner.
-                if hops.iter().any(|hop| hop.named && hop.named_shadows_glob) {
-                    hops.retain(|hop| hop.named || !hop.named_shadows_glob);
-                }
-                let mut followed = Vec::new();
-                for hop in hops {
-                    // Checked before `visited`: a row this requester may not
-                    // follow must not hide another row reaching the same step.
-                    // Also before the later-binding rule: a row nobody here
-                    // may follow neither wins nor hides.
-                    if let Some((language, container)) = &hop.restricted_to {
-                        if !self.sees(requester, language, container.as_deref())? {
-                            continue;
-                        }
-                    }
-                    followed.push(hop);
-                }
-                if !followed.is_empty() && followed.iter().all(|hop| hop.later_import_binds) {
+                let hops = match computed[index].take() {
+                    Some(hops) => hops,
                     // `depth < cap` here, so this never underflows.
-                    followed = self.later_binding(followed, requester, cap - depth - 1)?;
-                }
-                for hop in followed {
+                    None => self.binding_hops(scope, name, requester, cap - depth - 1)?,
+                };
+                for hop in hops {
                     if visited.insert(hop.to.clone()) {
                         next.push(hop.to);
                     }
@@ -1574,6 +1578,65 @@ impl<'c> Resolver<'c> {
         }
 
         Ok((Vec::new(), 0))
+    }
+
+    /// The re-export hops a walk follows from `scope` for `name`, with `cap`
+    /// hops left after them: the scope's rows this requester may follow, a
+    /// named row shadowing the `*` rows where the language says so, and of
+    /// rows all of a [`LinkRules::later_import_binds`] language only the one
+    /// that binds the name ([`Resolver::later_binding`]).
+    fn binding_hops(
+        &mut self,
+        scope: &Scope,
+        name: &str,
+        requester: &Requester,
+        cap: usize,
+    ) -> Result<Vec<Hop>> {
+        let mut hops = self.hops(scope, name)?;
+        // Where the language says so, a named row shadows the scope's `*`
+        // rows, even when it leads nowhere (an external crate's item) and
+        // even when this requester may not follow it: in rustc the shadowed
+        // glob item is not in the scope at all, so a missing edge beats the
+        // wrong one a glob would give. A language declaring neither rule
+        // keeps both kinds at this depth, with no winner.
+        if hops.iter().any(|hop| hop.named && hop.named_shadows_glob) {
+            hops.retain(|hop| hop.named || !hop.named_shadows_glob);
+        }
+        let mut followed = Vec::new();
+        for hop in hops {
+            // Checked before the walk's `visited`: a row this requester may
+            // not follow must not hide another row reaching the same step.
+            // Also before the later-binding rule: a row nobody here may
+            // follow neither wins nor hides.
+            if let Some((language, container)) = &hop.restricted_to {
+                if !self.sees(requester, language, container.as_deref())? {
+                    continue;
+                }
+            }
+            followed.push(hop);
+        }
+        if !followed.is_empty() && followed.iter().all(|hop| hop.later_import_binds) {
+            followed = self.later_binding(followed, requester, cap)?;
+        }
+        Ok(followed)
+    }
+
+    /// Whether a step's binding `hops` rebind the name its visible
+    /// `candidates` declare: exactly one hop (an ordered winner of
+    /// [`Resolver::later_binding`]), written after the latest candidate of
+    /// its own file. A candidate of another file has no statement order
+    /// with the row, so with none in the row's file the declaration wins.
+    fn rebinds(&mut self, candidates: &[Candidate], hops: &[Hop]) -> Result<bool> {
+        let [hop] = hops else {
+            return Ok(false);
+        };
+        let (file, line, col) = &hop.position;
+        let mut latest: Option<(i64, i64)> = None;
+        for candidate in candidates.iter().filter(|c| &c.file_path == file) {
+            let position = self.position_of(&candidate.id)?;
+            latest = latest.max(Some(position));
+        }
+        Ok(latest.is_some_and(|start| (*line, *col) > start))
     }
 
     /// Of one scope's followable rows for a name, all of a
@@ -1614,6 +1677,14 @@ impl<'c> Resolver<'c> {
         let found = !candidates.is_empty();
         self.provides.insert(cache_key, found);
         Ok(found)
+    }
+
+    /// A node's `(startLine, startCol)`: its statement's order within its
+    /// file.
+    fn position_of(&self, id: &str) -> Result<(i64, i64)> {
+        let mut statement =
+            self.conn.prepare_cached("SELECT startLine, startCol FROM nodes WHERE id = ?1")?;
+        Ok(statement.query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))?)
     }
 
     /// A `qualifiedName` key's member, reached through its head: the head's
@@ -1665,8 +1736,9 @@ impl<'c> Resolver<'c> {
     /// beside the free declarations, so they share the name lookup, and are
     /// discarded here. Two or more non-members are still ambiguous, and so
     /// are members alone (a field and a getter of one name). A `qualifiedName`
-    /// key names one declaration and gets no tie-break. Design:
-    /// docs/architecture/gm-470-member-free-fn-collision.md.
+    /// key names one declaration and gets no tie-break here; the accessors of
+    /// one property that share it are settled by [`sole_accessor_getter`].
+    /// Design: docs/architecture/gm-470-member-free-fn-collision.md.
     fn sole_non_member<'a>(&mut self, key: &Key, several: &[&'a Candidate]) -> Result<Option<&'a Candidate>> {
         if !matches!(key, Key::Name(_)) {
             return Ok(None);
@@ -1766,6 +1838,7 @@ impl<'c> Resolver<'c> {
                 qualified_name: row.get(6)?,
                 container: row.get(7)?,
                 qualified_path: row.get(8)?,
+                native_kind: row.get(9)?,
             })
         };
         let rows = match (scope, key) {
@@ -1935,6 +2008,48 @@ impl<'c> Resolver<'c> {
         }
         Ok(self.visible_from[&cache_key].contains(visible_in))
     }
+}
+
+/// The `nativeKind`s a property's getter carries: Python keeps its
+/// `@property` def as `method`, TypeScript marks `get x()` as `getter`.
+const GETTER_NATIVE_KINDS: [&str; 2] = ["method", "getter"];
+/// The `nativeKind`s of a property's other accessors, which share the
+/// getter's `qualifiedName`.
+const ACCESSOR_NATIVE_KINDS: [&str; 2] = ["setter", "deleter"];
+
+/// The getter among `several` accessors of one property, when a
+/// `qualifiedName` key found them all.
+///
+/// A property with a setter or deleter is several nodes of one
+/// `qualifiedName` in one file, told apart only by `nativeKind`; a
+/// class-qualified use (`C.x`) names the property, and its getter stands for
+/// it. The rule: every candidate is in one file, exactly one has a getter
+/// `nativeKind`, and every other one has an accessor `nativeKind`. Anything
+/// else stays ambiguous: candidates from two files, two getter-like
+/// candidates (a TypeScript `static x()` beside `get x()`), a candidate of
+/// another `nativeKind` (a variable `C.x`), accessors without a getter, or a
+/// `name` key, where members alone are ambiguous ([`Resolver::sole_non_member`]).
+/// Design: docs/architecture/gm-530-accessor-tie-break.md.
+fn sole_accessor_getter<'a>(key: &Key, several: &[&'a Candidate]) -> Option<&'a Candidate> {
+    if !matches!(key, Key::QualifiedName(_)) {
+        return None;
+    }
+    let (first, rest) = several.split_first()?;
+    if rest.iter().any(|candidate| candidate.file_path != first.file_path) {
+        return None;
+    }
+    let mut getter = None;
+    for candidate in several {
+        let native_kind = candidate.native_kind.as_deref();
+        if native_kind.is_some_and(|kind| GETTER_NATIVE_KINDS.contains(&kind)) {
+            if getter.replace(*candidate).is_some() {
+                return None;
+            }
+        } else if !native_kind.is_some_and(|kind| ACCESSOR_NATIVE_KINDS.contains(&kind)) {
+            return None;
+        }
+    }
+    getter
 }
 
 #[cfg(test)]
