@@ -55,11 +55,17 @@ every turn of every session, including those where nobody searches. A
 `PreToolUse` hook costs one wasted round trip only when it fires. The trade
 is prompt cost per turn against the rate at which the hook fires.
 
-**Known.** A hook cannot turn a grep into a g-mesh call. Hooks run on a tool
-call, not instead of it; the only lever is to refuse with a reason. No firing
-rate exists yet, so the trade cannot be computed. (This is a statement about
-Claude Code hooks, not about this repository's code; it was not re-checked
-here.)
+**Known.** A hook cannot turn a grep into a g-mesh call. Per the Claude Code
+hooks reference (https://code.claude.com/docs/en/hooks.md, PreToolUse), as
+reported by the claude-code-guide agent on 2026-10-08 (the page itself was not
+opened for this note): a `PreToolUse` hook can block a call with exit code 2 or
+`permissionDecision: "deny"` plus `permissionDecisionReason`, which is fed back
+to the model; and it can rewrite the same tool's arguments with `updatedInput`
+(for example the Bash `command`), but it cannot change which tool runs. So the
+levers are refuse-with-a-reason, or rewrite a Bash command that is itself still
+Bash. Rewriting a grep command line into something else that Bash runs is
+possible in principle; routing to an MCP tool is not. No firing rate exists
+yet, so the trade cannot be computed.
 
 **Closing observation.** From the log: the fraction of sessions with at least
 one grep/search-shaped Bash or Grep call on code the index covers (the hook's
@@ -87,12 +93,27 @@ task (move the rule) or a recorded null result (keep the prompt rule).
   with `get_task GM-372` (completion summary). Caveat from that summary: it was
   a side observation made while re-indexing under load, reported and not
   filed, not a controlled benchmark. Per-call local compute is no cheaper.
-- Two uses that fit an embedding model: ordering a page by similarity to the
-  caller's query instead of only by graph centrality (GM-373 ranks rung 4 by
-  inbound edges, a structural proxy), and disclosing a near-miss that GM-381
-  found no floor can separate (`AppState` returns `createAppState` at 0.845).
-  These two figures are carried from the conversation and were not re-checked
-  for this note.
+- Two uses that fit an embedding model:
+  - Ordering a page by similarity to the caller's query instead of only by
+    graph centrality. Verified: GM-373 (`get_task GM-373`) ranks the
+    file-name rung by inbound `REFERENCES`+`CALLS` count, descending, with
+    the old `exported DESC, startLine ASC` as tie-break, in
+    `graph::queries::find_in_file_named`. That is the file-stem rung, which
+    `docs/architecture/symbol-resolution-ladder.md` (table row 4, and
+    "Rung 4 ranks, it does not just page (GM-373)") numbers as rung 4. Its
+    own stated bound: inbound edges measure internal use, so exported API a
+    project barely uses ranks low.
+  - Disclosing a near-miss that no floor can separate. Verified: GM-381
+    (`get_task GM-381`, the task description's calibration, whose source is
+    `g-mesh-bench/docs/results/v0.21.0-semantic-threshold-calibration.md`,
+    not opened here) gives `AppState` returning `createAppState` at 0.845.
+    The same figure, and the statement that "no threshold can separate
+    those, because the wrong answer scores like a right one", are in
+    `core/src/mcp/similarity.rs` (module doc, around line 170) and
+    `core/src/mcp/find_definition.rs` (around line 894, which adds
+    `ExcalidrawImperativeAPI` returning `App#createExcalidrawAPI` at 0.839).
+    GM-381's completion summary says the same: a floor fixes "nothing
+    matched" and cannot fix the near-miss.
 - Rejected: clustering results and labelling the clusters. A label is a
   generated claim from a model that cannot generate.
 
@@ -109,17 +130,24 @@ reduces what is sent. The proven way here is aggregation over pagination.
 Whether that generalises beyond `find_references` is a measurement.
 
 **Known.** The `files` tally exists and is whole-set (see entry 1). The
-specific figures from the conversation, excalidraw `pointFrom` at
-`limit: 200` returning a 51-row page over 46 files with `hasMore: true`, while
-`files` lists 81 files in a quarter of the bytes, were NOT re-verified. Their
-only source is the GM-352 task description (and
-`docs/design/GM-352-rank-and-answer-shaped-responses.md`, which quotes it as
-"the task description's own figures"). The code carries two related but
-different numbers: `core/src/mcp/provenance.rs` says 51 rows at `limit: 200`,
-and `core/src/graph/pagination.rs` (`MAX_FILE_TALLY` doc) says about 52
-referencing files, which does not match 81. No excalidraw index was queried
-for this note. Treat 51 rows, 46 files and 81 files as unverified until
-someone runs the call.
+excalidraw `pointFrom` figures are NOT re-verified, and the sources disagree:
+- GM-352's task description (`get_task GM-352`): at `limit: 200`, 51 rows
+  spanning 46 files, `hasMore: true`; `files` lists all 81 referencing files.
+  `docs/design/GM-352-rank-and-answer-shaped-responses.md` quotes it as "the
+  task description's own figures".
+- Commit ad33932 (`feat: answer file-level impact questions at file
+  granularity`), the commit that introduced the tally, repeats it in its
+  message: rows "top out at 51 of 86 edges over 46 files", `files` lists all
+  81 files.
+- The comment on `MAX_FILE_TALLY` in `core/src/graph/pagination.rs` (added by
+  that same commit) says excalidraw's `pointFrom` is "~52 referencing files".
+  No task is named there and no test or assertion backs it.
+- `core/src/mcp/provenance.rs` (module doc) says only 51 rows at `limit: 200`.
+The code backs neither file count: 51 rows appears in a comment, 52 files
+appears in a comment, and 81 appears nowhere in the code. Both the 52-file
+comment and the 81-file claim come from the same commit, so one of them is
+wrong, and 52 may be a slip for the 51 rows. No excalidraw index was queried.
+Treat the file count as unknown until someone runs the call.
 
 **Closing observation.** From the log, the token size of every g-mesh result
 in a session, split by tool, and for each large result whether the caller used
