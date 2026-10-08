@@ -1490,7 +1490,11 @@ impl<'c> Resolver<'c> {
     /// `scope` itself).
     ///
     /// Breadth-first, so a name a scope both declares and re-exports resolves
-    /// to the declaration - the language's own rule. Bounded twice over: the
+    /// to the declaration - the language's own rule - except where the
+    /// declaration's language binds a name by the later statement
+    /// ([`LinkRules::later_import_binds`]): there a re-export written after
+    /// the declaration in the same file, and providing the name, binds it
+    /// instead. Bounded twice over: the
     /// visited set makes a re-export cycle terminate, [`MAX_REEXPORT_DEPTH`]
     /// bounds an acyclic chain, and both are needed since one does not imply
     /// the other.
@@ -1514,12 +1518,32 @@ impl<'c> Resolver<'c> {
         for depth in 0..=cap {
             let mut candidates: Vec<Candidate> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
-            for (scope, key) in &frontier {
+            // Binding hops already computed for a frontier step, by index, so
+            // the expansion below does not compute them twice.
+            let mut computed: Vec<Option<Vec<Hop>>> = vec![None; frontier.len()];
+            for (index, (scope, key)) in frontier.iter().enumerate() {
+                let mut found = Vec::new();
                 for candidate in self.declared(scope, key)? {
+                    if self.visible(&candidate, scope, requester)? {
+                        found.push(candidate);
+                    }
+                }
+                if depth < cap {
+                    if let Key::Name(name) = key {
+                        if found.iter().any(|c| self.rules.later_import_binds(&c.language)) {
+                            let hops = self.binding_hops(scope, name, requester, cap - depth - 1)?;
+                            let rebound = self.rebinds(&found, &hops)?;
+                            computed[index] = Some(hops);
+                            if rebound {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                for candidate in found {
                     // The same node can be reached under its file *and* its
                     // container; it is still one candidate, not an ambiguity.
-                    if !seen.contains(&candidate.id) && self.visible(&candidate, scope, requester)? {
-                        seen.insert(candidate.id.clone());
+                    if seen.insert(candidate.id.clone()) {
                         candidates.push(candidate);
                     }
                 }
@@ -1529,39 +1553,16 @@ impl<'c> Resolver<'c> {
             }
 
             let mut next = Vec::new();
-            for (scope, key) in &frontier {
+            for (index, (scope, key)) in frontier.iter().enumerate() {
                 let Key::Name(name) = key else {
                     continue; // a qualifiedName names a declaration, never a pass-through
                 };
-                let mut hops = self.hops(scope, name)?;
-                // Where the language says so, a named row shadows the scope's
-                // `*` rows, even when it leads nowhere (an external crate's
-                // item) and even when this requester may not follow it: in
-                // rustc the shadowed glob item is not in the scope at all, so
-                // a missing edge beats the wrong one a glob would give. A
-                // language declaring neither rule keeps both kinds at this
-                // depth, with no winner.
-                if hops.iter().any(|hop| hop.named && hop.named_shadows_glob) {
-                    hops.retain(|hop| hop.named || !hop.named_shadows_glob);
-                }
-                let mut followed = Vec::new();
-                for hop in hops {
-                    // Checked before `visited`: a row this requester may not
-                    // follow must not hide another row reaching the same step.
-                    // Also before the later-binding rule: a row nobody here
-                    // may follow neither wins nor hides.
-                    if let Some((language, container)) = &hop.restricted_to {
-                        if !self.sees(requester, language, container.as_deref())? {
-                            continue;
-                        }
-                    }
-                    followed.push(hop);
-                }
-                if !followed.is_empty() && followed.iter().all(|hop| hop.later_import_binds) {
+                let hops = match computed[index].take() {
+                    Some(hops) => hops,
                     // `depth < cap` here, so this never underflows.
-                    followed = self.later_binding(followed, requester, cap - depth - 1)?;
-                }
-                for hop in followed {
+                    None => self.binding_hops(scope, name, requester, cap - depth - 1)?,
+                };
+                for hop in hops {
                     if visited.insert(hop.to.clone()) {
                         next.push(hop.to);
                     }
@@ -1574,6 +1575,65 @@ impl<'c> Resolver<'c> {
         }
 
         Ok((Vec::new(), 0))
+    }
+
+    /// The re-export hops a walk follows from `scope` for `name`, with `cap`
+    /// hops left after them: the scope's rows this requester may follow, a
+    /// named row shadowing the `*` rows where the language says so, and of
+    /// rows all of a [`LinkRules::later_import_binds`] language only the one
+    /// that binds the name ([`Resolver::later_binding`]).
+    fn binding_hops(
+        &mut self,
+        scope: &Scope,
+        name: &str,
+        requester: &Requester,
+        cap: usize,
+    ) -> Result<Vec<Hop>> {
+        let mut hops = self.hops(scope, name)?;
+        // Where the language says so, a named row shadows the scope's `*`
+        // rows, even when it leads nowhere (an external crate's item) and
+        // even when this requester may not follow it: in rustc the shadowed
+        // glob item is not in the scope at all, so a missing edge beats the
+        // wrong one a glob would give. A language declaring neither rule
+        // keeps both kinds at this depth, with no winner.
+        if hops.iter().any(|hop| hop.named && hop.named_shadows_glob) {
+            hops.retain(|hop| hop.named || !hop.named_shadows_glob);
+        }
+        let mut followed = Vec::new();
+        for hop in hops {
+            // Checked before the walk's `visited`: a row this requester may
+            // not follow must not hide another row reaching the same step.
+            // Also before the later-binding rule: a row nobody here may
+            // follow neither wins nor hides.
+            if let Some((language, container)) = &hop.restricted_to {
+                if !self.sees(requester, language, container.as_deref())? {
+                    continue;
+                }
+            }
+            followed.push(hop);
+        }
+        if !followed.is_empty() && followed.iter().all(|hop| hop.later_import_binds) {
+            followed = self.later_binding(followed, requester, cap)?;
+        }
+        Ok(followed)
+    }
+
+    /// Whether a step's binding `hops` rebind the name its visible
+    /// `candidates` declare: exactly one hop (an ordered winner of
+    /// [`Resolver::later_binding`]), written after the latest candidate of
+    /// its own file. A candidate of another file has no statement order
+    /// with the row, so with none in the row's file the declaration wins.
+    fn rebinds(&mut self, candidates: &[Candidate], hops: &[Hop]) -> Result<bool> {
+        let [hop] = hops else {
+            return Ok(false);
+        };
+        let (file, line, col) = &hop.position;
+        let mut latest: Option<(i64, i64)> = None;
+        for candidate in candidates.iter().filter(|c| &c.file_path == file) {
+            let position = self.position_of(&candidate.id)?;
+            latest = latest.max(Some(position));
+        }
+        Ok(latest.is_some_and(|start| (*line, *col) > start))
     }
 
     /// Of one scope's followable rows for a name, all of a
@@ -1614,6 +1674,14 @@ impl<'c> Resolver<'c> {
         let found = !candidates.is_empty();
         self.provides.insert(cache_key, found);
         Ok(found)
+    }
+
+    /// A node's `(startLine, startCol)`: its statement's order within its
+    /// file.
+    fn position_of(&self, id: &str) -> Result<(i64, i64)> {
+        let mut statement =
+            self.conn.prepare_cached("SELECT startLine, startCol FROM nodes WHERE id = ?1")?;
+        Ok(statement.query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))?)
     }
 
     /// A `qualifiedName` key's member, reached through its head: the head's
