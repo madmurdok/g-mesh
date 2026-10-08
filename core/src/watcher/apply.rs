@@ -26,9 +26,9 @@ use anyhow::{bail, Context, Result};
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
-    ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, PathError, PlaceholderTarget,
-    QualifiedPath, RequestId, SourceTier, TargetKey, TargetScope, Visibility, WireEdge, WireNode,
-    JSONRPC_VERSION,
+    ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, LinkedEdge, PathError,
+    PlaceholderTarget, QualifiedPath, RequestId, SourceTier, TargetKey, TargetScope, Visibility, WireEdge,
+    WireNode, JSONRPC_VERSION,
 };
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
@@ -90,6 +90,7 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
     writer: &mut W,
     store: &IndexStore,
     project_root: &Path,
+    language: &str,
     file_path: impl Into<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -104,6 +105,7 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
             writer,
             store,
             project_root,
+            language,
             file_path,
             request_id,
             embedding,
@@ -122,6 +124,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     writer: &mut W,
     store: &mut Writer<'_>,
     project_root: &Path,
+    language: &str,
     file_path: impl Into<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
@@ -154,6 +157,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
         reader,
         writer,
         store,
+        language,
         None,
         vec![file_path.clone()],
         semantic_pass_id(&request_id),
@@ -175,7 +179,9 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
 /// `file_paths` scopes the pass: one entry after an incremental reparse,
 /// **empty** for the whole project once the cold-start bulk walk is done -
 /// see `ControlMessage::SemanticPass` on why "empty" means everything
-/// rather than nothing.
+/// rather than nothing. `language` is the plugin's: the request carries the
+/// structural edges of that language in scope that linking already moved
+/// (`ControlMessage::SemanticPass::linked_edges`, [`linked_edges`]).
 ///
 /// The answer is an ordinary `FileChangeDiff`, applied through
 /// `apply_diff`, whose edges have `source = 'semantic'`. What it holds
@@ -199,6 +205,7 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     store: &IndexStore,
+    language: &str,
     sweep_language: Option<&str>,
     file_paths: Vec<String>,
     request_id: RequestId,
@@ -211,6 +218,7 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
             reader,
             writer,
             store,
+            language,
             sweep_language,
             file_paths,
             request_id,
@@ -227,6 +235,7 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
     reader: &mut R,
     writer: &mut W,
     store: &mut Writer<'_>,
+    language: &str,
     sweep_language: Option<&str>,
     file_paths: Vec<String>,
     request_id: RequestId,
@@ -235,11 +244,21 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
     on_timeout: &mut dyn FnMut(),
 ) -> Result<()> {
     let whole_project = file_paths.is_empty();
+    // Read inside the same unit that committed the reparse (or after the
+    // whole-project link), so these are the links of exactly the text the
+    // plugin is about to answer for.
+    let linked = store.step(|conn| linked_edges(conn, language, &file_paths))?;
+    if whole_project {
+        crate::log_line!(
+            "g-mesh: {language}'s whole-project semantic pass carries {} linked edge(s)",
+            linked.len()
+        );
+    }
     let outcome = round_trip(
         reader,
         writer,
         store,
-        ControlMessage::SemanticPass { file_paths: file_paths.clone() },
+        ControlMessage::SemanticPass { file_paths: file_paths.clone(), linked_edges: linked },
         None,
         request_id,
         embedding,
@@ -294,6 +313,39 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
         }
     }
     Ok(())
+}
+
+/// The structural edges of `language` that linking moved onto a declaration,
+/// each with the target it moved it to - what a `semanticPass` request
+/// carries as `linkedEdges`. `file_paths` scopes them by the file the edge
+/// starts in; empty means every file, as for the pass itself. A semantic
+/// edge is left out even when linked: the tier compares its answers with
+/// what the structural pass and linking settled, not with its own.
+pub(crate) fn linked_edges(
+    conn: &rusqlite::Connection,
+    language: &str,
+    file_paths: &[String],
+) -> Result<Vec<LinkedEdge>> {
+    let mut sql = String::from(
+        "SELECT e.id, e.toId FROM edges e JOIN nodes f ON f.id = e.fromId
+         WHERE e.linkedFrom IS NOT NULL AND e.source = 'syntactic' AND f.language = ?1",
+    );
+    if !file_paths.is_empty() {
+        let slots: Vec<String> = (0..file_paths.len()).map(|i| format!("?{}", i + 2)).collect();
+        sql.push_str(&format!(" AND f.filePath IN ({})", slots.join(", ")));
+    }
+    sql.push_str(" ORDER BY e.id");
+    let params = std::iter::once(&language as &dyn rusqlite::ToSql)
+        .chain(file_paths.iter().map(|path| path as &dyn rusqlite::ToSql));
+    conn.prepare(&sql)
+        .and_then(|mut statement| {
+            statement
+                .query_map(rusqlite::params_from_iter(params), |row| {
+                    Ok(LinkedEdge { edge_id: row.get(0)?, to_id: row.get(1)? })
+                })?
+                .collect()
+        })
+        .context("failed to read the linked edges of a semantic pass")
 }
 
 /// Deletes every edge with `source = 'semantic'` whose `fromId` is a node of

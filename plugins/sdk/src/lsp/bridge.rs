@@ -453,7 +453,12 @@ const MAX_SERVER_STARTS: u32 = 4;
 ///     stale-answer retraction nor core's semantic sweep can delete it.
 ///   - **R2, agreement adds nothing.** An answer agrees when it lands on the
 ///     structural edge's own target, or would get the structural edge's own
-///     id (a placeholder with the same address). It records no edge. The two
+///     id (a placeholder with the same address), or core's linker moved the
+///     structural edge onto exactly the answered declaration
+///     ([`SdkIndex::linked_target`], from the pass's `linkedEdges`). The last
+///     covers a placeholder addressed at a re-export: its address names the
+///     re-exporting container, never the declaring one, so only core's link
+///     result shows that the two agree. It records no edge. The two
 ///     ids differ whenever the structural edge points at a declaration of the
 ///     same file, so recording one would leave two rows for one call each
 ///     time an edit re-sends the structural edge.
@@ -2484,7 +2489,10 @@ fn record_answer(
             if let Some(replaced) = &site.replaces {
                 // R2, agreement adds nothing: the answer lands on the
                 // structural edge's own target (`Bound::Here`), or would get
-                // the structural edge's own id (`Bound::There`, one address).
+                // the structural edge's own id (`Bound::There`, one address),
+                // or core linked the structural edge onto it (through a
+                // re-export the edge's placeholder address names, which the
+                // answered declaration's own address never matches).
                 // Recording it anyway leaves two rows for one call once an
                 // edit re-sends the structural edge - see [`LspBridge`]'s doc.
                 let (_, prospective) =
@@ -2493,7 +2501,8 @@ fn record_answer(
                     .graph(&question.file)
                     .and_then(|graph| graph.edges.iter().find(|edge| &edge.id == replaced))
                     .is_some_and(|edge| edge.to_id == node.id);
-                if lands_on_it || &prospective == replaced {
+                let linked_on_it = index.linked_target(replaced) == Some(node.id.as_str());
+                if lands_on_it || linked_on_it || &prospective == replaced {
                     answers.upheld.insert(replaced.clone());
                     answers.confirmed.entry(replaced.clone()).or_default().push((
                         site.from_id.clone(),

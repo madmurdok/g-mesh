@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use g_mesh_wire::{FileChangeDiff, Handshake, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION};
+use g_mesh_wire::{FileChangeDiff, Handshake, LinkedEdge, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION};
 
 use crate::diff::diff_file;
 use crate::framing::{read_frame, write_message};
@@ -453,6 +453,23 @@ impl<E: Extractor> Session<'_, E> {
                 if !files.is_empty() {
                     self.hydrate(&files);
                 }
+                // Core's link result for this pass's scope, so an answer that
+                // lands where core already linked an edge is agreement. Always
+                // replaced: a pass without the field has nothing linked, and
+                // an earlier pass's links describe text that may have changed.
+                // An entry that does not parse costs itself, not the list.
+                let linked = params
+                    .and_then(|params| params.get("linkedEdges"))
+                    .and_then(|edges| edges.as_array())
+                    .map(|edges| {
+                        edges
+                            .iter()
+                            .filter_map(|edge| serde_json::from_value::<LinkedEdge>(edge.clone()).ok())
+                            .map(|edge| (edge.edge_id, edge.to_id))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                self.index.set_linked(linked);
                 let root = self.root.clone();
                 let answer = self.engine.answer(&files, &self.index, &root);
                 self.respond_to_pass(out, id, files.is_empty(), answer)

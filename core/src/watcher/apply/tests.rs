@@ -105,7 +105,7 @@ fn spawn_stub_plugin(
         let request: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
         let id = request.id.clone().expect("the semantic pass must be a request, not a notification");
         match request.message {
-            ControlMessage::SemanticPass { file_paths } => {
+            ControlMessage::SemanticPass { file_paths, .. } => {
                 assert_eq!(
                     file_paths,
                     vec![expected_file_path.to_string()],
@@ -329,6 +329,7 @@ fn file_change_diff_is_committed_to_sqlite() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -404,6 +405,7 @@ fn diff_with_deletes_removes_rows() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -450,6 +452,7 @@ fn mismatched_response_id_is_rejected() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -494,6 +497,7 @@ fn empty_diff_response_is_a_safe_no_op() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/unchanged.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -525,7 +529,7 @@ fn spawn_semantic_stub(
         let request: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
         let id = request.id.clone().expect("a semantic pass expects an answer, so it carries an id");
         match request.message {
-            ControlMessage::SemanticPass { file_paths } => {
+            ControlMessage::SemanticPass { file_paths, .. } => {
                 assert_eq!(file_paths, expected_file_paths)
             }
             other => panic!("expected SemanticPass, got {other:?}"),
@@ -589,6 +593,7 @@ fn a_semantic_pass_upgrades_an_edge_in_place_and_leaves_the_others_alone() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "rust",
         None,
         vec!["src/lib.rs".to_string()],
         RequestId::Number(9),
@@ -654,6 +659,7 @@ fn a_settled_reparse_is_followed_by_a_semantic_pass_over_that_file() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -702,6 +708,7 @@ fn a_failing_semantic_pass_does_not_fail_the_reparse() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -759,6 +766,7 @@ fn a_semantic_pass_incapable_plugin_is_never_sent_a_semantic_pass_request() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -789,6 +797,7 @@ fn a_whole_project_semantic_pass_sends_an_empty_file_list() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "rust",
         None,
         Vec::new(),
         RequestId::Number(1),
@@ -827,6 +836,7 @@ fn an_incomplete_whole_project_pass_commits_its_diff_and_is_still_an_error() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "rust",
         None,
         Vec::new(),
         RequestId::Number(1),
@@ -872,6 +882,7 @@ fn an_incomplete_per_file_pass_is_not_an_error() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "rust",
         None,
         vec!["src/lib.rs".to_string()],
         RequestId::Number(1),
@@ -941,6 +952,7 @@ fn pass_resending_only_sem_kept(
         &mut buf_reader,
         &mut core_writer,
         conn,
+        "rust",
         Some("rust"),
         file_paths,
         RequestId::Number(1),
@@ -1040,6 +1052,7 @@ fn per_file_pass_over_a(conn: &IndexStore, incomplete: bool) {
         &mut buf_reader,
         &mut core_writer,
         conn,
+        "rust",
         None,
         vec!["a.rs".to_string()],
         RequestId::Number(1),
@@ -1249,6 +1262,7 @@ fn reparse_in(conn: &IndexStore, root: &std::path::Path, id: i64, diff: FileChan
         &mut core_writer,
         conn,
         root,
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -1573,6 +1587,7 @@ fn a_semantic_pass_shortens_a_callers_list_keeps_its_other_rows_and_does_not_re_
         &mut BufReader::new(core_reader),
         &mut core_writer,
         &conn,
+        "rust",
         None,
         Vec::new(),
         RequestId::Number(7),
@@ -1649,6 +1664,7 @@ fn edit_keeping_the_call(conn: &IndexStore, id: i64, pass: Option<FileChangeDiff
         &mut core_writer,
         conn,
         root.path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
