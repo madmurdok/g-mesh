@@ -117,6 +117,17 @@
 //! import of the same binding moves that range to the later statement
 //! ([`FileModel::import`](super::model::FileModel::import)).
 //!
+//! The later binding also decides between a declaration and an import of one
+//! name ([`FileModel::module_binding`](super::model::FileModel::module_binding)).
+//! An entry naming a declaration of this file gets no node only while the
+//! declaration is the binding; when an unconditional named import written
+//! after it displaced it, the entry gets the import's node like any other.
+//! A displaced name gets that one node even when it is not listed in
+//! `__all__`, or when there is no `__all__` at all: without it, `from pkg
+//! import f` elsewhere would land on the displaced declaration through the
+//! container's own members, while the node, placed after the declaration,
+//! lets core's linker follow the import instead.
+//!
 //! It is applied to any module, not only to an `__init__`, because the shape
 //! is the same wherever it is written; a package's `__init__` is simply the
 //! case it exists for. What it deliberately does **not** do is read `__all__`
@@ -128,7 +139,7 @@ use tree_sitter::Node;
 
 use crate::extractor::emit::{container_target, Definition, Emitter};
 use crate::extractor::keys::{is_public, visibility, FileRole, ModuleCtx};
-use crate::extractor::model::{DeclRef, FileModel, Import};
+use crate::extractor::model::{DeclRef, FileModel, Import, ModuleBinding};
 use crate::extractor::scope::{dotted_path, FrameKind, Scopes};
 use crate::extractor::syntax::{
     assignment_signature, definition_name, docstring, dotted_segments, has_decorator, inner_definition,
@@ -152,6 +163,11 @@ pub(crate) struct Declarer<'a, 's> {
     pub(crate) emitter: &'a mut Emitter<'s>,
     pub(crate) model: &'a mut FileModel,
     pub(crate) scopes: Scopes,
+    /// How many compound statements (`if`/`try`/`with`/`for`/...) enclose the
+    /// statement being walked. A module-level import inside one is
+    /// conditional and never displaces an earlier binding
+    /// ([`FileModel::import`]).
+    pub(crate) conditional: usize,
 }
 
 impl Declarer<'_, '_> {
@@ -241,7 +257,11 @@ impl Declarer<'_, '_> {
             | "while_statement"
             | "match_statement"
             | "case_clause"
-            | "block" => self.collect(statement),
+            | "block" => {
+                self.conditional += 1;
+                self.collect(statement);
+                self.conditional -= 1;
+            }
             _ => {}
         }
     }
@@ -320,7 +340,8 @@ impl Declarer<'_, '_> {
             }
             _ => {
                 let scope = self.scopes.path().to_string();
-                self.model.declare(&scope, &name, &qualified, decl);
+                let start = self.emitter.positions().range(outer).start;
+                self.model.declare(&scope, &name, &qualified, decl, start);
             }
         }
         Some(id)
@@ -360,7 +381,8 @@ impl Declarer<'_, '_> {
             spec.signature = Some(assignment_signature(name, assignment, self.source));
             let id = self.emitter.declare(spec, is_public(&own));
             let scope = self.scopes.path().to_string();
-            self.model.declare(&scope, name, name, DeclRef { id, kind: NodeKind::Variable });
+            let start = self.emitter.positions().range(assignment).start;
+            self.model.declare(&scope, name, name, DeclRef { id, kind: NodeKind::Variable }, start);
         }
     }
 
@@ -409,7 +431,7 @@ impl Declarer<'_, '_> {
                     } else {
                         Import::External
                     };
-                    self.model.import(&top, binding, range);
+                    self.model.import(&top, binding, range, self.conditional == 0);
                 }
                 "aliased_import" => {
                     let Some(name) = leaf.child_by_field_name("name") else { continue };
@@ -422,7 +444,7 @@ impl Declarer<'_, '_> {
                         } else {
                             Import::Module { container: full.clone() }
                         };
-                        self.model.import(text(alias, self.source), binding, range);
+                        self.model.import(text(alias, self.source), binding, range, self.conditional == 0);
                     }
                 }
                 _ => {}
@@ -465,6 +487,7 @@ impl Declarer<'_, '_> {
                     #[cfg(test)]
                     crate::census::note_glob(!external);
                     if !external {
+                        self.model.star(range.start);
                         self.emitter.reexport(
                             "*",
                             container_target(&container, TargetKey::Name("*".to_string()), &self.module.key),
@@ -522,8 +545,9 @@ impl Declarer<'_, '_> {
     /// in `find_references` as a whole-file row, which is the granularity an
     /// import statement genuinely has.
     fn imported_name(&mut self, container: &str, name: &str, local: &str, range: Range, external: bool) {
+        let unconditional = self.conditional == 0;
         if external {
-            self.model.import(local, Import::External, range);
+            self.model.import(local, Import::External, range, unconditional);
             return;
         }
         let placeholder = self.emitter.placeholder(
@@ -538,6 +562,7 @@ impl Declarer<'_, '_> {
             local,
             Import::Item { container: container.to_string(), name: name.to_string() },
             range,
+            unconditional,
         );
 
         // `from a.b import c` where `c` is itself a submodule of `a.b`
@@ -582,21 +607,33 @@ impl Declarer<'_, '_> {
     }
 
     /// Emits a `reexport` node for every `__all__` entry this file imported
-    /// from somewhere else - see this module's doc.
+    /// from somewhere else, and for every name a later import displaced from
+    /// one of this file's declarations - see this module's doc.
     ///
     /// Run after the whole file has been walked, because `__all__` may be
     /// written above the imports it names (and in a package's `__init__` it
     /// routinely is).
     pub(crate) fn reexport_dunder_all(&mut self) {
         let all = self.model.dunder_all().clone();
-        if all.range.is_none() {
-            return;
+        let mut published: Vec<String> = if all.range.is_some() { all.names } else { Vec::new() };
+        for name in self.model.displaced() {
+            if !published.iter().any(|listed| listed == name) {
+                published.push(name.to_string());
+            }
         }
-        for published in &all.names {
-            // A name this file declares itself is already a member of the
-            // container a lookup searches, so a re-export node for it would
-            // be a second, weaker answer to a question already answered.
-            if self.model.lookup("", published, None).is_some() {
+        for published in &published {
+            // A name whose binding is this file's own declaration is already
+            // a member of the container a lookup searches, so a re-export
+            // node for it would be a second, weaker answer to a question
+            // already answered. That holds with a `*` import after the
+            // declaration too: the import a node would carry was either
+            // written before the declaration, which wins over it, or is
+            // conditional, which never displaces it; the star's own node is
+            // what may rebind the name.
+            if matches!(
+                self.model.module_binding(published, None),
+                Some(ModuleBinding::Decl(_) | ModuleBinding::DeclBeforeStar(_))
+            ) {
                 continue;
             }
             let Some(Import::Item { container, name }) = self.model.lookup_import(published) else {
