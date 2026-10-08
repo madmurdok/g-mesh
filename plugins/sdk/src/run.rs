@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use g_mesh_wire::{FileChangeDiff, Handshake, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION};
+use g_mesh_wire::{FileChangeDiff, Handshake, LinkedEdge, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION};
 
 use crate::diff::diff_file;
 use crate::framing::{read_frame, write_message};
@@ -453,6 +453,23 @@ impl<E: Extractor> Session<'_, E> {
                 if !files.is_empty() {
                     self.hydrate(&files);
                 }
+                // Core's link result for this pass's scope, so an answer that
+                // lands where core already linked an edge is agreement. Always
+                // replaced: a pass without the field has nothing linked, and
+                // an earlier pass's links describe text that may have changed.
+                // An entry that does not parse costs itself, not the list.
+                let linked = params
+                    .and_then(|params| params.get("linkedEdges"))
+                    .and_then(|edges| edges.as_array())
+                    .map(|edges| {
+                        edges
+                            .iter()
+                            .filter_map(|edge| serde_json::from_value::<LinkedEdge>(edge.clone()).ok())
+                            .map(|edge| (edge.edge_id, edge.to_id))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                self.index.set_linked(linked);
                 let root = self.root.clone();
                 let answer = self.engine.answer(&files, &self.index, &root);
                 self.respond_to_pass(out, id, files.is_empty(), answer)
@@ -1269,6 +1286,65 @@ mod tests {
             seen[0],
             vec![RelPath::new("a.toy"), RelPath::new("b.toy")],
             "the per-file pass's index holds every file of the project"
+        );
+    }
+
+    /// An engine that records, on each pass, where its index says core
+    /// linked the edges `x` and `y`.
+    struct LinkRecording {
+        seen: LinksSeen,
+    }
+
+    /// Per pass: `linked_target("x")` and `linked_target("y")`.
+    type LinksSeen = std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>>;
+
+    impl crate::semantic::SemanticEngine for LinkRecording {
+        fn answer(&mut self, _files: &[RelPath], index: &SdkIndex) -> anyhow::Result<SemanticAnswer> {
+            let target = |edge: &str| index.linked_target(edge).map(str::to_string);
+            self.seen.lock().unwrap().push((target("x"), target("y")));
+            Ok(SemanticAnswer::complete(FileChangeDiff::default()))
+        }
+    }
+
+    /// A pass's `linkedEdges` reach the engine's index, and the next pass
+    /// replaces them: one without the field leaves nothing linked, so an
+    /// earlier pass's links never decide a later answer.
+    #[test]
+    fn a_passes_linked_edges_reach_the_index_and_a_pass_without_them_clears_it() {
+        let project = Project::new("linked", &[("a.toy", "a v1\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&seen);
+        let factory: crate::semantic::SemanticEngineFactory = Box::new(move |_root| {
+            Ok(Box::new(LinkRecording { seen: std::sync::Arc::clone(&recorded) })
+                as Box<dyn crate::semantic::SemanticEngine>)
+        });
+        let mut session = Session {
+            extractor: &Declares,
+            spec: &spec,
+            root: project.0.clone(),
+            root_real: std::fs::canonicalize(&project.0).ok(),
+            project: None,
+            index: SdkIndex::new(),
+            engine: LazyEngine::new("toy", Some(factory)),
+            project_hydrated: false,
+        };
+
+        request(
+            &mut session,
+            "semanticPass",
+            serde_json::json!({
+                "filePaths": ["a.toy"],
+                "linkedEdges": [{ "edgeId": "x", "toId": "d" }],
+            }),
+        );
+        request(&mut session, "semanticPass", serde_json::json!({ "filePaths": ["a.toy"] }));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![(Some("d".to_string()), None), (None, None)],
+            "pass 1 sees x linked onto d and nothing for y; pass 2 carries no field and sees nothing"
         );
     }
 

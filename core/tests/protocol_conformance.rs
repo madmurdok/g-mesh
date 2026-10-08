@@ -163,6 +163,7 @@ fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
         &mut plugin_answer,
         &mut core_wrote,
         &conn,
+        "typescript",
         None,
         vec!["src/a.ts".to_string()],
         // Matches the id both fixtures carry; a mismatch is refused outright.
@@ -202,6 +203,6 @@ fn a_semantic_pass_diff_upgrades_only_the_edge_it_answers_for() {
     assert_eq!(sent, recorded);
     assert!(matches!(
         sent.message,
-        ControlMessage::SemanticPass { ref file_paths } if file_paths == &["src/a.ts".to_string()]
+        ControlMessage::SemanticPass { ref file_paths, .. } if file_paths == &["src/a.ts".to_string()]
     ));
 }

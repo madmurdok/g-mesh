@@ -222,7 +222,12 @@ The main case is a same-file typed call that rust-analyzer confirms.
 
 These are pre-existing cases outside the reproduction.
 
-1. **Re-exported head.** `use crate::named::T; x: T; x.m()` addresses
+1. **Re-exported head.** *Closed by GM-531*
+   ([ADR 0029](../adr/0029-core-ships-its-link-result-to-the-semantic-tier.md)):
+   core sends its link result with the `semanticPass`, and R2 treats an
+   answer on the declaration core linked the edge to as agreement. The
+   original analysis follows.
+   `use crate::named::T; x: T; x.m()` addresses
    `named::T::m` at `named`. The linker reaches `D` through the head walk
    in `graph::symbol_links`, "Members of a re-exported head". The semantic
    address is `D`'s own, so both tiers link to `D` while neither R2 test

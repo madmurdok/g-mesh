@@ -29,7 +29,7 @@
 //! answer (a position, a location) back to a node id the structural tier
 //! already sent, and that mapping lives nowhere else.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use g_mesh_wire::{NodeKind, Position, WireNode};
 
@@ -60,6 +60,11 @@ pub struct FileEntry {
 #[derive(Debug, Clone, Default)]
 pub struct SdkIndex {
     files: BTreeMap<RelPath, FileEntry>,
+    /// Core's link result for the current semantic pass: a structural edge's
+    /// id to the declaration core's linker moved it onto. Set by every pass
+    /// (`semanticPass`'s `linkedEdges`), so it describes the links of the
+    /// text the pass answers for, never an earlier pass's.
+    linked: HashMap<String, String>,
 }
 
 impl SdkIndex {
@@ -93,6 +98,19 @@ impl SdkIndex {
     /// extraction made against it is suspect.
     pub fn clear(&mut self) {
         self.files.clear();
+        self.linked.clear();
+    }
+
+    /// Replaces core's link result with `edges` - `(edge id, target id)`
+    /// pairs. Always a replacement: a pass that carries none leaves none.
+    pub fn set_linked(&mut self, edges: impl IntoIterator<Item = (String, String)>) {
+        self.linked = edges.into_iter().collect();
+    }
+
+    /// The declaration core's linker moved the structural edge `edge_id`
+    /// onto, if it linked that edge at all.
+    pub fn linked_target(&self, edge_id: &str) -> Option<&str> {
+        self.linked.get(edge_id).map(String::as_str)
     }
 
     /// What the plugin last saw of `path`.

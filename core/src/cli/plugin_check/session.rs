@@ -1119,6 +1119,8 @@ struct Driver<'a> {
     /// The project root the plugin was started on.
     workspace: PathBuf,
     timeouts: RoundTripTimeouts,
+    /// The manifest's language, which scopes a semantic pass's linked edges.
+    language: String,
     next_id: i64,
     session: Session,
 }
@@ -1321,6 +1323,7 @@ impl<'a> Driver<'a> {
             conn,
             workspace: scratch.workspace(),
             timeouts,
+            language: manifest.language.clone(),
             next_id: 1,
             session: Session::default(),
         };
@@ -1359,7 +1362,7 @@ impl<'a> Driver<'a> {
         self.next_id += 1;
         let embedding = EmbeddingPipeline::disabled();
         let result = {
-            let Driver { child, reader, writer, conn, workspace, timeouts, .. } = self;
+            let Driver { child, reader, writer, conn, workspace, timeouts, language, .. } = self;
             let mut kill = || {
                 let _ = child.kill();
             };
@@ -1371,6 +1374,7 @@ impl<'a> Driver<'a> {
                     writer,
                     conn,
                     workspace,
+                    language,
                     file,
                     id,
                     &embedding,
@@ -1383,6 +1387,7 @@ impl<'a> Driver<'a> {
                     reader,
                     writer,
                     conn,
+                    language,
                     sweep_language.as_deref(),
                     Vec::new(),
                     id,
@@ -1439,7 +1444,7 @@ impl<'a> Driver<'a> {
             };
             let (method, file_paths) = match envelope.message {
                 ControlMessage::FileChanged { file_path } => (Method::FileChanged, vec![file_path]),
-                ControlMessage::SemanticPass { file_paths } => (Method::SemanticPass, file_paths),
+                ControlMessage::SemanticPass { file_paths, .. } => (Method::SemanticPass, file_paths),
                 _ => continue,
             };
             let id = serde_json::to_value(id).unwrap_or_default();

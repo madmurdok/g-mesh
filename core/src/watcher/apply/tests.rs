@@ -105,7 +105,7 @@ fn spawn_stub_plugin(
         let request: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
         let id = request.id.clone().expect("the semantic pass must be a request, not a notification");
         match request.message {
-            ControlMessage::SemanticPass { file_paths } => {
+            ControlMessage::SemanticPass { file_paths, .. } => {
                 assert_eq!(
                     file_paths,
                     vec![expected_file_path.to_string()],
@@ -329,6 +329,7 @@ fn file_change_diff_is_committed_to_sqlite() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -404,6 +405,7 @@ fn diff_with_deletes_removes_rows() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -450,6 +452,7 @@ fn mismatched_response_id_is_rejected() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -494,6 +497,7 @@ fn empty_diff_response_is_a_safe_no_op() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/unchanged.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -525,7 +529,7 @@ fn spawn_semantic_stub(
         let request: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
         let id = request.id.clone().expect("a semantic pass expects an answer, so it carries an id");
         match request.message {
-            ControlMessage::SemanticPass { file_paths } => {
+            ControlMessage::SemanticPass { file_paths, .. } => {
                 assert_eq!(file_paths, expected_file_paths)
             }
             other => panic!("expected SemanticPass, got {other:?}"),
@@ -589,6 +593,7 @@ fn a_semantic_pass_upgrades_an_edge_in_place_and_leaves_the_others_alone() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "rust",
         None,
         vec!["src/lib.rs".to_string()],
         RequestId::Number(9),
@@ -654,6 +659,7 @@ fn a_settled_reparse_is_followed_by_a_semantic_pass_over_that_file() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -702,6 +708,7 @@ fn a_failing_semantic_pass_does_not_fail_the_reparse() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -759,6 +766,7 @@ fn a_semantic_pass_incapable_plugin_is_never_sent_a_semantic_pass_request() {
         &mut core_writer,
         &conn,
         project_root().path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -789,6 +797,7 @@ fn a_whole_project_semantic_pass_sends_an_empty_file_list() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "rust",
         None,
         Vec::new(),
         RequestId::Number(1),
@@ -827,6 +836,7 @@ fn an_incomplete_whole_project_pass_commits_its_diff_and_is_still_an_error() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "rust",
         None,
         Vec::new(),
         RequestId::Number(1),
@@ -872,6 +882,7 @@ fn an_incomplete_per_file_pass_is_not_an_error() {
         &mut buf_reader,
         &mut core_writer,
         &conn,
+        "rust",
         None,
         vec!["src/lib.rs".to_string()],
         RequestId::Number(1),
@@ -941,6 +952,7 @@ fn pass_resending_only_sem_kept(
         &mut buf_reader,
         &mut core_writer,
         conn,
+        "rust",
         Some("rust"),
         file_paths,
         RequestId::Number(1),
@@ -1040,6 +1052,7 @@ fn per_file_pass_over_a(conn: &IndexStore, incomplete: bool) {
         &mut buf_reader,
         &mut core_writer,
         conn,
+        "rust",
         None,
         vec!["a.rs".to_string()],
         RequestId::Number(1),
@@ -1249,6 +1262,7 @@ fn reparse_in(conn: &IndexStore, root: &std::path::Path, id: i64, diff: FileChan
         &mut core_writer,
         conn,
         root,
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -1573,6 +1587,7 @@ fn a_semantic_pass_shortens_a_callers_list_keeps_its_other_rows_and_does_not_re_
         &mut BufReader::new(core_reader),
         &mut core_writer,
         &conn,
+        "rust",
         None,
         Vec::new(),
         RequestId::Number(7),
@@ -1649,6 +1664,7 @@ fn edit_keeping_the_call(conn: &IndexStore, id: i64, pass: Option<FileChangeDiff
         &mut core_writer,
         conn,
         root.path(),
+        "rust",
         "src/lib.rs",
         request_id,
         &EmbeddingPipeline::disabled(),
@@ -1704,4 +1720,255 @@ fn a_typed_call_keeps_one_caller_row_through_an_edit_whatever_its_pass_does() {
         vec!["e-sem", "x"],
         "the pre-GM-489 shape: the reparse's x beside the surviving semantic edge"
     );
+}
+
+// --- semanticPass carries core's link result ---------------------------------
+//
+// `src/lib.rs` (crate `mycrate`) holds the caller `f`, a glob re-export
+// `pub use othercrate::*` and placeholders addressed at `mycrate`: `p` for
+// `run` (which only `othercrate` declares, in `other/src/lib.rs`) and `q`
+// for a name nobody declares. `x` is `f`'s structural call through `p`
+// (linked onto `run` through the glob), `u` its call through `q` (left
+// unlinked) and `m` a semantic edge through `p` (linked too). `src/other.rs`
+// (also `mycrate`) holds `g` with its own linked call `y`, and `app.ts` /
+// `mod.ts` hold a TypeScript call `t` linked onto `someExport`.
+
+const RUN: &str = "fn-run";
+const SOME_EXPORT: &str = "ts-some-export";
+
+fn member_in(id: &str, name: &str, file_path: &str, container: &str) -> WireNode {
+    WireNode {
+        name: name.to_string(),
+        qualified_name: format!("{container}::{name}"),
+        container: Some(container.to_string()),
+        ..node_in(id, file_path)
+    }
+}
+
+fn pending(id: &str, file_path: &str, language: &str, scope: TargetScope, name: &str) -> WireNode {
+    WireNode {
+        kind: NodeKind::Module,
+        name: name.to_string(),
+        qualified_name: id.to_string(),
+        language: language.to_string(),
+        native_kind: Some(crate::graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND.to_string()),
+        target: Some(PlaceholderTarget {
+            scope,
+            key: TargetKey::Name(name.to_string()),
+            from_container: Some("mycrate".to_string()),
+            key_path: None,
+        }),
+        ..node_in(id, file_path)
+    }
+}
+
+/// What a reparse of `src/lib.rs` sends: everything of the file, `x` and
+/// `u` re-sent unresolved onto their placeholders, as the structural pass
+/// always does.
+fn lib_rs_reparse() -> FileChangeDiff {
+    let glob = WireNode {
+        kind: NodeKind::Module,
+        name: crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string(),
+        qualified_name: "reexport:othercrate::*".to_string(),
+        container: Some("mycrate".to_string()),
+        native_kind: Some(crate::graph::symbol_links::REEXPORT_NATIVE_KIND.to_string()),
+        target: Some(PlaceholderTarget {
+            scope: TargetScope::Container("othercrate".to_string()),
+            key: TargetKey::Name(crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string()),
+            from_container: Some("mycrate".to_string()),
+            key_path: None,
+        }),
+        ..node_in("glob", "src/lib.rs")
+    };
+    FileChangeDiff {
+        upsert_nodes: vec![
+            member_in("f", "f", "src/lib.rs", "mycrate"),
+            glob,
+            pending("p", "src/lib.rs", "rust", TargetScope::Container("mycrate".to_string()), "run"),
+            pending("q", "src/lib.rs", "rust", TargetScope::Container("mycrate".to_string()), "missing"),
+        ],
+        upsert_edges: vec![unresolved_edge("x", "f", "p"), unresolved_edge("u", "f", "q")],
+        complete: true,
+        ..Default::default()
+    }
+}
+
+fn store_with_linked_edges() -> IndexStore {
+    let mut raw = setup_conn();
+    raw.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    let ts = |id: &str, name: &str, file_path: &str| WireNode {
+        name: name.to_string(),
+        qualified_name: name.to_string(),
+        language: "typescript".to_string(),
+        ..node_in(id, file_path)
+    };
+    let mut seed = lib_rs_reparse();
+    seed.complete = false;
+    seed.upsert_nodes.extend([
+        member_in(RUN, "run", "other/src/lib.rs", "othercrate"),
+        member_in("g", "g", "src/other.rs", "mycrate"),
+        pending("p-other", "src/other.rs", "rust", TargetScope::Container("mycrate".to_string()), "run"),
+        ts("ts-run", "run", "app.ts"),
+        ts(SOME_EXPORT, "someExport", "mod.ts"),
+        pending("p-ts", "app.ts", "typescript", TargetScope::File("mod.ts".to_string()), "someExport"),
+    ]);
+    seed.upsert_edges.extend([
+        semantic_edge("m", "f", "p"),
+        unresolved_edge("y", "g", "p-other"),
+        unresolved_edge("t", "ts-run", "p-ts"),
+    ]);
+    apply_diff(&mut raw, &to_storage_diff(seed, &mut PathWarnings::default())).unwrap();
+    for file in ["src/lib.rs", "src/other.rs", "other/src/lib.rs", "app.ts", "mod.ts"] {
+        crate::storage::write::upsert_indexed_file(&raw, file, 1, "hash").unwrap();
+    }
+    let store = IndexStore::new(raw);
+    store.link_all().unwrap();
+    store
+}
+
+/// `(toId, linkedFrom)` of edge `id`.
+fn link_of(conn: &IndexStore, id: &str) -> (String, Option<String>) {
+    conn.lock()
+        .unwrap()
+        .query_row("SELECT toId, linkedFrom FROM edges WHERE id = ?1", [id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+}
+
+/// The fixture's premise, so a test below that sees an edge left out knows
+/// the edge was linked and the filter, not the linker, left it out.
+fn assert_fixture_linked(conn: &IndexStore) {
+    for (edge, target) in [("x", RUN), ("m", RUN), ("y", RUN), ("t", SOME_EXPORT)] {
+        assert_eq!(
+            link_of(conn, edge),
+            (target.to_string(), Some(edge_placeholder(edge))),
+            "{edge} is linked"
+        );
+    }
+    assert_eq!(link_of(conn, "u"), ("q".to_string(), None), "u is not linked");
+}
+
+fn edge_placeholder(edge: &str) -> String {
+    match edge {
+        "x" | "m" => "p",
+        "y" => "p-other",
+        _ => "p-ts",
+    }
+    .to_string()
+}
+
+fn linked(pairs: &[(&str, &str)]) -> Vec<LinkedEdge> {
+    pairs.iter().map(|(edge, to)| LinkedEdge { edge_id: edge.to_string(), to_id: to.to_string() }).collect()
+}
+
+/// A stub plugin that answers a reparse of `src/lib.rs` with
+/// [`lib_rs_reparse`] (when `reparse` is set), then the semantic pass with
+/// an empty complete diff, and hands back the pass's `linkedEdges`.
+fn spawn_linked_edges_stub(
+    mut reader: std::io::PipeReader,
+    mut writer: std::io::PipeWriter,
+    reparse: Option<RequestId>,
+) -> std::thread::JoinHandle<Vec<LinkedEdge>> {
+    std::thread::spawn(move || {
+        let mut buf_reader = BufReader::new(&mut reader);
+        if let Some(id) = reparse {
+            let request: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
+            assert!(matches!(request.message, ControlMessage::FileChanged { .. }), "{request:?}");
+            let response = FileChangeResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id,
+                result: lib_rs_reparse(),
+                incomplete: false,
+                incomplete_reason: None,
+            };
+            write_message(&mut writer, &response).unwrap();
+        }
+        let request: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
+        let id = request.id.clone().expect("a semantic pass carries an id");
+        let ControlMessage::SemanticPass { linked_edges, .. } = request.message else {
+            panic!("expected SemanticPass, got {:?}", request.message)
+        };
+        let response = FileChangeResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id,
+            result: FileChangeDiff { complete: true, ..Default::default() },
+            incomplete: false,
+            incomplete_reason: None,
+        };
+        write_message(&mut writer, &response).unwrap();
+        linked_edges
+    })
+}
+
+/// A reparse of `src/lib.rs` and the pass after it; returns the pass's
+/// `linkedEdges`.
+fn reparse_lib_rs_for_linked_edges(conn: &IndexStore, id: i64) -> Vec<LinkedEdge> {
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+    let request_id = RequestId::Number(id);
+    let plugin = spawn_linked_edges_stub(plugin_reader, plugin_writer, Some(request_id.clone()));
+    let root = project_root();
+    apply_file_change(
+        &mut BufReader::new(core_reader),
+        &mut core_writer,
+        conn,
+        root.path(),
+        "rust",
+        "src/lib.rs",
+        request_id,
+        &EmbeddingPipeline::disabled(),
+        TEST_TIMEOUT,
+        TEST_TIMEOUT,
+        true,
+        &mut on_timeout_must_not_fire,
+    )
+    .unwrap();
+    plugin.join().unwrap()
+}
+
+/// The pass after a reparse of `src/lib.rs` carries `x` onto the
+/// declaration the cross-crate glob led to, and nothing else: not the
+/// semantic `m` (linked too), not the unlinked `u`, not `y` from another
+/// file of the same language.
+#[test]
+fn the_pass_after_a_reparse_carries_the_files_linked_structural_edges() {
+    let conn = store_with_linked_edges();
+    assert_fixture_linked(&conn);
+
+    let sent = reparse_lib_rs_for_linked_edges(&conn, 1);
+
+    assert_fixture_linked(&conn);
+    assert_eq!(sent, linked(&[("x", RUN)]));
+}
+
+/// A whole-project pass carries every linked structural edge of its own
+/// language and none of another's; a second edit re-sends `x`, which is
+/// linked again in that commit, so the pass after it still carries `x`.
+#[test]
+fn a_whole_project_pass_carries_its_languages_linked_edges_and_a_re_sent_edge_stays_in_them() {
+    let conn = store_with_linked_edges();
+    assert_fixture_linked(&conn);
+
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+    let plugin = spawn_linked_edges_stub(plugin_reader, plugin_writer, None);
+    apply_semantic_pass(
+        &mut BufReader::new(core_reader),
+        &mut core_writer,
+        &conn,
+        "rust",
+        None,
+        Vec::new(),
+        RequestId::Number(1),
+        &EmbeddingPipeline::disabled(),
+        TEST_TIMEOUT,
+        &mut on_timeout_must_not_fire,
+    )
+    .unwrap();
+    assert_eq!(plugin.join().unwrap(), linked(&[("x", RUN), ("y", RUN)]), "rust's, not typescript's t");
+
+    assert_eq!(reparse_lib_rs_for_linked_edges(&conn, 2), linked(&[("x", RUN)]), "first edit");
+    assert_eq!(reparse_lib_rs_for_linked_edges(&conn, 3), linked(&[("x", RUN)]), "second edit");
+    assert_fixture_linked(&conn);
 }
