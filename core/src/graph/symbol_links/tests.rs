@@ -1288,6 +1288,184 @@ fn a_qualified_name_key_disambiguates_two_same_named_methods() {
     assert_eq!(edge_target(&conn, &exact), ("Function:util/server.go:Client.Close".to_string(), true));
 }
 
+/// An accessor `qualified_name` of `at.container` with its `nativeKind`, id
+/// `Function:<file>:<qualifiedName>:<nativeKind>`: a getter and its setter
+/// share a qualifiedName, so [`member`]'s id would merge them.
+fn gm530_accessor(at: At, native_kind: &str, qualified_name: &str) -> NodeRecord {
+    gm530_declaration(at, "Function", native_kind, qualified_name)
+}
+
+fn gm530_declaration(at: At, kind: &str, native_kind: &str, qualified_name: &str) -> NodeRecord {
+    let mut node = member(at, kind, qualified_name, Vis::Public);
+    node.id = format!("{}:{native_kind}", node.id);
+    node.native_kind = Some(native_kind.to_string());
+    node
+}
+
+fn gm530_python(file: &'static str, module: &'static str) -> At<'static> {
+    At { file, language: "python", container: module, parent: None }
+}
+
+fn gm530_typescript(file: &'static str) -> At<'static> {
+    At { file, language: "typescript", container: file, parent: None }
+}
+
+/// `caller` in `from` uses `qualified_name` of the container `scope` through
+/// a `kind` edge keyed by `key_kind`, after `declarations` are indexed;
+/// returns where the edge points once linked.
+fn gm530_link(
+    declarations: Vec<NodeRecord>,
+    from: At,
+    kind: &str,
+    scope: &str,
+    key_kind: &str,
+    key: &str,
+) -> (String, bool) {
+    let mut conn = setup();
+    upsert(&mut conn, declarations);
+    let caller = member(from, "Function", "show", Vis::Public);
+    let caller_id = caller.id.clone();
+    let edge = use_through(
+        &mut conn,
+        vec![caller],
+        &caller_id,
+        kind,
+        container_placeholder(from, scope, key_kind, key),
+    );
+    link_all(&mut conn).unwrap();
+    edge_target(&conn, &edge)
+}
+
+/// GM-530 acceptance 1: `C.x` from another file names the property, and a
+/// property with a setter and a deleter is three nodes of one qualifiedName;
+/// the getter (Python keeps it as `method`) stands for it.
+#[test]
+fn a_qualified_python_property_use_links_to_its_getter() {
+    let shapes = gm530_python("pkg/shapes.py", "pkg.shapes");
+    let target = gm530_link(
+        vec![
+            gm530_accessor(shapes, "method", "C.x"),
+            gm530_accessor(shapes, "setter", "C.x"),
+            gm530_accessor(shapes, "deleter", "C.x"),
+        ],
+        gm530_python("pkg/use.py", "pkg.use"),
+        "REFERENCES",
+        "pkg.shapes",
+        KEY_QUALIFIED_NAME,
+        "C.x",
+    );
+    assert_eq!(target, ("Function:pkg/shapes.py:C.x:method".to_string(), true));
+}
+
+/// GM-530 acceptance 2: a TypeScript `get x()` / `set x(v)` pair, called by
+/// its qualifiedName, links to the `getter`.
+#[test]
+fn a_qualified_typescript_accessor_pair_use_links_to_its_getter() {
+    let c = gm530_typescript("src/c.ts");
+    let target = gm530_link(
+        vec![gm530_accessor(c, "getter", "C.x"), gm530_accessor(c, "setter", "C.x")],
+        gm530_typescript("src/use.ts"),
+        "CALLS",
+        "src/c.ts",
+        KEY_QUALIFIED_NAME,
+        "C.x",
+    );
+    assert_eq!(target, ("Function:src/c.ts:C.x:getter".to_string(), true));
+}
+
+/// GM-530 acceptance 3: a `method` and a `setter` `C.x` from two files of one
+/// container are two declarations, not one property: no tie-break.
+#[test]
+fn a_method_and_a_setter_from_two_files_of_one_container_stay_unlinked() {
+    let target = gm530_link(
+        vec![
+            gm530_accessor(gm530_python("pkg/a.py", "pkg"), "method", "C.x"),
+            gm530_accessor(gm530_python("pkg/b.py", "pkg"), "setter", "C.x"),
+        ],
+        gm530_python("pkg/use.py", "pkg.use"),
+        "REFERENCES",
+        "pkg",
+        KEY_QUALIFIED_NAME,
+        "C.x",
+    );
+    assert!(!target.1, "two files: not one property, got {target:?}");
+}
+
+/// A TypeScript `static x()` beside a `get x()` / `set x(v)` pair: two
+/// getter-like candidates, nothing says which one the use means.
+#[test]
+fn a_static_method_beside_an_accessor_pair_stays_unlinked() {
+    let c = gm530_typescript("src/c.ts");
+    let target = gm530_link(
+        vec![
+            gm530_accessor(c, "method", "C.x"),
+            gm530_accessor(c, "getter", "C.x"),
+            gm530_accessor(c, "setter", "C.x"),
+        ],
+        gm530_typescript("src/use.ts"),
+        "CALLS",
+        "src/c.ts",
+        KEY_QUALIFIED_NAME,
+        "C.x",
+    );
+    assert!(!target.1, "two getter-like candidates, got {target:?}");
+}
+
+/// The tie-break is for a qualifiedName key: under a name key, members alone
+/// stay ambiguous, accessors of one property included.
+#[test]
+fn an_accessor_pair_reached_by_a_name_key_stays_unlinked() {
+    let c = gm530_typescript("src/c.ts");
+    let target = gm530_link(
+        vec![gm530_accessor(c, "getter", "C.x"), gm530_accessor(c, "setter", "C.x")],
+        gm530_typescript("src/use.ts"),
+        "CALLS",
+        "src/c.ts",
+        KEY_NAME,
+        "x",
+    );
+    assert!(!target.1, "a name key gets no accessor tie-break, got {target:?}");
+}
+
+/// No getter to prefer, or a candidate that is no accessor at all (Python's
+/// `x = property(f)` is a `Variable` `C.x`): each stays unlinked.
+#[test]
+fn accessors_without_a_sole_getter_or_beside_a_variable_stay_unlinked() {
+    let shapes = gm530_python("pkg/shapes.py", "pkg.shapes");
+    let cases = [
+        (
+            "setter + deleter",
+            vec![gm530_accessor(shapes, "setter", "C.x"), gm530_accessor(shapes, "deleter", "C.x")],
+        ),
+        (
+            "variable + setter",
+            vec![
+                gm530_declaration(shapes, "Variable", "variable", "C.x"),
+                gm530_accessor(shapes, "setter", "C.x"),
+            ],
+        ),
+        (
+            "variable + getter + setter",
+            vec![
+                gm530_declaration(shapes, "Variable", "variable", "C.x"),
+                gm530_accessor(shapes, "method", "C.x"),
+                gm530_accessor(shapes, "setter", "C.x"),
+            ],
+        ),
+    ];
+    for (case, declarations) in cases {
+        let target = gm530_link(
+            declarations,
+            gm530_python("pkg/use.py", "pkg.use"),
+            "REFERENCES",
+            "pkg.shapes",
+            KEY_QUALIFIED_NAME,
+            "C.x",
+        );
+        assert!(!target.1, "{case}: must stay unlinked, got {target:?}");
+    }
+}
+
 /// Go's unexported: visible to its own package, and only to it - under a
 /// name key, and under a qualifiedName key too, which is what stops a
 /// semantic tier's mistake from linking a private symbol from outside.

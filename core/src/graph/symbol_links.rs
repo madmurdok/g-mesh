@@ -1305,6 +1305,7 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
                     // wrong one.
                     several => resolver
                         .sole_non_member(&placeholder.key, several)?
+                        .or_else(|| sole_accessor_getter(&placeholder.key, several))
                         .map(|candidate| candidate.id.clone()),
                 };
 
@@ -1357,6 +1358,8 @@ struct Candidate {
     container: Option<String>,
     /// `nodes.qualifiedPath`, still encoded: only an ambiguity decodes it.
     qualified_path: Option<String>,
+    /// `nodes.nativeKind`: what tells a property's accessors apart.
+    native_kind: Option<String>,
 }
 
 /// A scope and key the walk looks a declaration up at.
@@ -1417,7 +1420,7 @@ struct Resolver<'c> {
 impl<'c> Resolver<'c> {
     fn new(conn: &'c Connection, rules: &'c LinkRules) -> Result<Self> {
         const CANDIDATE: &str = "SELECT id, kind, filePath, language, visibility, visibilityContainer, \
-             qualifiedName, container, qualifiedPath FROM nodes";
+             qualifiedName, container, qualifiedPath, nativeKind FROM nodes";
         const REEXPORT: &str = "SELECT n.id, n.name, n.language, t.scopeKind, t.scope, t.keyKind, t.key, \
              n.visibility, n.visibilityContainer, n.filePath, n.startLine, n.startCol \
              FROM nodes n LEFT JOIN placeholder_targets t ON t.nodeId = n.id";
@@ -1665,8 +1668,9 @@ impl<'c> Resolver<'c> {
     /// beside the free declarations, so they share the name lookup, and are
     /// discarded here. Two or more non-members are still ambiguous, and so
     /// are members alone (a field and a getter of one name). A `qualifiedName`
-    /// key names one declaration and gets no tie-break. Design:
-    /// docs/architecture/gm-470-member-free-fn-collision.md.
+    /// key names one declaration and gets no tie-break here; the accessors of
+    /// one property that share it are settled by [`sole_accessor_getter`].
+    /// Design: docs/architecture/gm-470-member-free-fn-collision.md.
     fn sole_non_member<'a>(&mut self, key: &Key, several: &[&'a Candidate]) -> Result<Option<&'a Candidate>> {
         if !matches!(key, Key::Name(_)) {
             return Ok(None);
@@ -1766,6 +1770,7 @@ impl<'c> Resolver<'c> {
                 qualified_name: row.get(6)?,
                 container: row.get(7)?,
                 qualified_path: row.get(8)?,
+                native_kind: row.get(9)?,
             })
         };
         let rows = match (scope, key) {
@@ -1935,6 +1940,48 @@ impl<'c> Resolver<'c> {
         }
         Ok(self.visible_from[&cache_key].contains(visible_in))
     }
+}
+
+/// The `nativeKind`s a property's getter carries: Python keeps its
+/// `@property` def as `method`, TypeScript marks `get x()` as `getter`.
+const GETTER_NATIVE_KINDS: [&str; 2] = ["method", "getter"];
+/// The `nativeKind`s of a property's other accessors, which share the
+/// getter's `qualifiedName`.
+const ACCESSOR_NATIVE_KINDS: [&str; 2] = ["setter", "deleter"];
+
+/// The getter among `several` accessors of one property, when a
+/// `qualifiedName` key found them all.
+///
+/// A property with a setter or deleter is several nodes of one
+/// `qualifiedName` in one file, told apart only by `nativeKind`; a
+/// class-qualified use (`C.x`) names the property, and its getter stands for
+/// it. The rule: every candidate is in one file, exactly one has a getter
+/// `nativeKind`, and every other one has an accessor `nativeKind`. Anything
+/// else stays ambiguous: candidates from two files, two getter-like
+/// candidates (a TypeScript `static x()` beside `get x()`), a candidate of
+/// another `nativeKind` (a variable `C.x`), accessors without a getter, or a
+/// `name` key, where members alone are ambiguous ([`Resolver::sole_non_member`]).
+/// Design: docs/architecture/gm-530-accessor-tie-break.md.
+fn sole_accessor_getter<'a>(key: &Key, several: &[&'a Candidate]) -> Option<&'a Candidate> {
+    if !matches!(key, Key::QualifiedName(_)) {
+        return None;
+    }
+    let (first, rest) = several.split_first()?;
+    if rest.iter().any(|candidate| candidate.file_path != first.file_path) {
+        return None;
+    }
+    let mut getter = None;
+    for candidate in several {
+        let native_kind = candidate.native_kind.as_deref();
+        if native_kind.is_some_and(|kind| GETTER_NATIVE_KINDS.contains(&kind)) {
+            if getter.replace(*candidate).is_some() {
+                return None;
+            }
+        } else if !native_kind.is_some_and(|kind| ACCESSOR_NATIVE_KINDS.contains(&kind)) {
+            return None;
+        }
+    }
+    getter
 }
 
 #[cfg(test)]
