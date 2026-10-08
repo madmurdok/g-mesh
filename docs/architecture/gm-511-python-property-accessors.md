@@ -116,7 +116,7 @@ in the class body does not become ambiguous.
 | `self.x.y = v` | getter (receiver walk) | unchanged: only the outermost target attribute is a store; its object is a load |
 | `C.x = v` / `del C.x` (class-qualified) | getter | unchanged: getter. Assigning on the class replaces the descriptor, it does not call the setter |
 | `obj.x` / `obj.x = v` / `del obj.x` (unknown receiver) | nothing | nothing (documented gap, as today) |
-| Cross-file `C.x` (`from .mod import C`, placeholder keyed `QualifiedName("C.x")`) | linked to the getter | **unlinked**: the linker now sees 2-3 candidates with one `qualifiedName`, and a `qualifiedName` key gets no tie-break (`symbol_links.rs` ~1257-1270, `sole_non_member`). Accepted and documented; TypeScript getter/setter pairs behave the same today. Only properties that do have a setter/deleter are affected, and only class-qualified access (`C.x`), which is rare |
+| Cross-file `C.x` (`from .mod import C`, placeholder keyed `QualifiedName("C.x")`) | linked to the getter | **unlinked**: the linker now sees 2-3 candidates with one `qualifiedName`, and a `qualifiedName` key gets no tie-break (`symbol_links.rs` ~1257-1270, `sole_non_member`). Accepted and documented; TypeScript getter/setter pairs behave the same today. Only properties that do have a setter/deleter are affected, and only class-qualified access (`C.x`), which is rare. **Fixed by GM-530**: the linker prefers the getter (`sole_accessor_getter`, [design](gm-530-accessor-tie-break.md)) |
 
 Routing only happens on `Bound::Here` through the instance parameter
 (`resolve_path`'s `self.member` branch); everything else keeps today's target.
@@ -231,7 +231,8 @@ reverted to always `method`; 4 alone fails with `Bodies::function` reverted to
    accessors becomes unlinked (ambiguous `qualifiedName`), like TS
    getter/setter today. The alternative is a core linker tie-break preferring
    `nativeKind = method` for a qualifiedName key - out of scope; would be a
-   follow-up task.
+   follow-up task. **Fixed by GM-530** ([design](gm-530-accessor-tie-break.md)):
+   the linker now links such a `C.x` to the getter.
 4. `deleter` as the new nativeKind spelling (TS has no counterpart).
 5. To verify in the code slice: the tree-sitter-python shape of
    `delete_statement` with several targets (`del a.x, b.y`), and (optional,
