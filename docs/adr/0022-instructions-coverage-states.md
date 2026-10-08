@@ -271,6 +271,48 @@ Before and after:
 | Worst realistic warm (three failed with long errors) | n/a, no such state | 1613 (287 free) |
 | Cold start, walking, 103-byte root | 1885 | 1572 (3 missing) |
 
+#### Re-measured after GM-502 (row 9 delivered)
+
+GM-502 moved the override sentence (`P4_STATIC`) out of the text for every
+language whose manifest reports `overrides` (all four bundled plugins), and
+kept P2's pointer at "the one specific gap below" only when a receiver
+paragraph follows. A pass-dependent session now gets `S_PASS_ALONE` (216
+bytes) instead of `P4_STATIC` + `S_PASS` (473). Same command as above, run
+2026-10-08 on the release base `c1ef86b` and on `a07018e`; the fixtures of
+`adr_0022_byte_table_every_realistic_scenario_fits_at_step_1` are the same
+in both. `uptime` load 110 at the start, 385 at the end (a parallel verify
+build); the base run was `real 344.74, user 223.21` (compiling), the head
+run `real 509.97, user 14.58` (mostly waiting on the shared build lock).
+
+The base column already differs from the 89efca1 table above: TypeScript
+became pass-dependent after it (GM-325), which added `S_PASS` to every
+rendering with TypeScript covered.
+
+| Scenario | 89efca1 | Before (`c1ef86b`) | After (`a07018e`) | Δ |
+|---|---|---|---|---|
+| TypeScript only | 1141 | 1275 | 1018 | −257 |
+| Rust only | 1269 | 1269 | 1012 | −257 |
+| TypeScript + Rust | 1280 | 1284 | 1027 | −257 |
+| All four indexed, real manifests | n/a | 1296 | 1039 | −257 |
+| TypeScript + Python absent (214 files) | 1301 | 1435 | 1178 | −257 |
+| Four states | 1531 | 1665 | 1408 | −257 |
+| Zero plugins, all four absent | 1115 | 1115 | 1027 | −88 |
+| Four discovered, three failed with long errors | 1613 | 1747 | 1490 | −257 |
+| All four failed | 1379 | 1379 | 1291 | −88 |
+| Cold start, 103-byte root, 3 missing, unindexed / walking | 1601 / 1572 | 1735 / 1706 | 1478 / 1449 | −257 |
+| Cold start, 103-byte root, 0 missing, unindexed / walking | 1569 / 1540 | 1573 / 1544 | 1316 / 1287 | −257 |
+| Cold start, 103-byte root, 4 missing, unindexed / walking | 1304 / 1275 | 1304 / 1275 | 1216 / 1187 | −88 |
+
+−257 is `P4_STATIC` + `S_PASS` (473) replaced by `S_PASS_ALONE` (216).
+−88 is P2's gap pointer (87 bytes plus its joining space), dropped because
+nothing indexed or installed leaves no receiver paragraph to point at. The
+renderings built from synthetic never-languages do not change, because a
+`Never` language still gets `p4_perm`: the 16-never stress row (1695, by
+construction; no test prints it), ladder steps 2-4 (1601, 1843, 1496),
+`build_front` (1846), the worst case (1319) and the worst-case cold start
+(1776 / 1476). The largest rendering is still `build_front`'s 1846; the
+largest realistic warm one is now 1490 (410 bytes free).
+
 ### B. Live render
 
 The binary was a release build (`cargo build --release --workspace`:
