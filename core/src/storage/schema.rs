@@ -158,11 +158,6 @@ pub const CURRENT_SCHEMA_VERSION: &str = "13";
 /// different pipeline generations (2.12.0's buggy writer and 3.0.0's fixed
 /// one) the same number in this constant's history, which is exactly the
 /// ambiguity it exists to rule out.
-///
-/// Bumped to "3" by GM-502: the Rust plugin now emits a `SUPERTYPE_OF` edge
-/// from each trait-impl method to the trait method it implements, and the
-/// linker lets `SUPERTYPE_OF` land on a `Function`. An index built before
-/// has neither edge, and nothing else would ever re-extract its files.
 pub const CURRENT_INDEXER_VERSION: &str = "3";
 
 /// DDL per the architecture doc's Data Model erDiagram

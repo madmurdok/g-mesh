@@ -329,7 +329,7 @@ impl Bodies<'_, '_> {
             match trait_clause {
                 // `impl Tr for T` is the edge `find_implementations` walks,
                 // subtype -> supertype; and each method of the block is a
-                // subtype of the trait method it implements (GM-502).
+                // subtype of the trait method it implements.
                 Some(clause) => {
                     let resolved = self.resolve_supertype(clause, module, Some(&block));
                     self.supertype_edge(
@@ -1546,7 +1546,7 @@ impl Bodies<'_, '_> {
     }
 
     /// `impl Tr for T { fn m() }` - `SUPERTYPE_OF` from `<T as Tr>::m` to
-    /// `Tr::m`, the method the member implements (GM-502, D3), so a caller
+    /// `Tr::m`, the method the member implements, so a caller
     /// of the trait method can be found from the impl's.
     ///
     /// Only for a trait this project declares: `trait_bound` is the clause's
