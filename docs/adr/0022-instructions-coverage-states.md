@@ -53,7 +53,7 @@ a consumer go in repo docs.
 | 6 | A method call through a variable receiver may produce no edge in {languages} (P4) | **split**. In a language with no tier that resolves receiver calls (TypeScript today), it is a fixed property of the plugin, so the agent needs it before asking: keep, named. In a language whose semantic pass resolves them, it is temporary state: **move now** to the `provenance` field that already exists (section 2) | split as stated |
 | 7 | A method page that may miss such calls carries `untypedReceiverCalls` where the language reports them (P4) | once an answer exists. The field carries its own `hint` | **move now**: drop it |
 | 8 | Bare/this/super/qualified-type calls have no such gap; `hasMore: false` without `unlinkedUsages` is exhaustive (P4) | the signal is that a field is *missing*, and a response can only say that by putting a positive field on every healthy answer. So this belongs before asking, with the same reasoning as P2 | keep |
-| 9 | Receiver calls bind to the declared/inferred type; an override's caller page under-reports; use find_implementations (P4 static) | once an answer exists (on an override's caller page) | keep; **owed**: a field on `find_callers` when the anchor overrides or implements a base member, pointing at the base. Not in this task |
+| 9 | Receiver calls bind to the declared/inferred type; an override's caller page under-reports; use find_implementations (P4 static) | once an answer exists (on an override's caller page) | **Delivered (GM-502):** `find_callers` carries `overrides`, the base members the anchor overrides or implements, explained by a once-per-session `hint`; `P4_STATIC` renders only while a covered language's manifest says `member_overrides = "none"`, and a pass-dependent session gets `S_PASS_ALONE` instead. See `docs/architecture/gm-502-override-callers-field.md`. Original action: keep; owed a field on `find_callers` pointing at the base |
 | 10 | The first index, or a re-index after an upgrade, waits for the walk: slow, not wrong (P4) | before asking, but only while a walk is owed. A warm `build` never renders while one is: an upgrade wipes the index, and the next session is a cold start | **move now** into `cold_start_line`. Drop it from the warm text |
 | 11 | Pass `symbol_name` directly; raise `limit` (P5) | before asking | keep. Reword "the four tools above" (its referent was P3) to name the four tools |
 | 12 | `p4_fallback`: "a method's page says so in `unlinkedUsages`/`untypedReceiverCalls`" | **false for TypeScript**, which reports neither field (only the Rust plugin sends `untypedCalls`) | replace it (section 4, step 3) |
@@ -61,7 +61,7 @@ a consumer go in repo docs.
 What remains owed (recorded here, not built by this task):
 
 - (a) TypeScript reporting `untypedCalls`. With that, statement 6's fixed half can also become a response field.
-- (b) The override field in row 9.
+- (b) **Delivered (GM-502):** the override field in row 9; see `docs/architecture/gm-502-override-callers-field.md`. Side effect for Rust (D3 in that note): `find_implementations` and `find_references` on a trait method now list the impl methods through a `SUPERTYPE_OF` edge.
 - (c) **Delivered (GM-503):** path-anchored answers carry `notIndexed`; see `docs/architecture/gm-503-absent-language-field.md`. Original wording: a field on an answer about a path in an absent or failed language, for example `get_file_outline` or `find_definition` on a `.py` file with no Python plugin. It would carry the language, the reason and the install command. `languages::absent_for_path` exists for this and has no caller yet.
 - (d) `docs/architecture/tool-answer-guarantees.md`, which does not exist yet. It is the consumer-facing home for statements 3-8.
 
@@ -270,6 +270,48 @@ Before and after:
 | Every language named (warm) | 1888 | 1319 |
 | Worst realistic warm (three failed with long errors) | n/a, no such state | 1613 (287 free) |
 | Cold start, walking, 103-byte root | 1885 | 1572 (3 missing) |
+
+#### Re-measured after GM-502 (row 9 delivered)
+
+GM-502 moved the override sentence (`P4_STATIC`) out of the text for every
+language whose manifest reports `overrides` (all four bundled plugins), and
+kept P2's pointer at "the one specific gap below" only when a receiver
+paragraph follows. A pass-dependent session now gets `S_PASS_ALONE` (216
+bytes) instead of `P4_STATIC` + `S_PASS` (473). Same command as above, run
+2026-10-08 on the release base `c1ef86b` and on `a07018e`; the fixtures of
+`adr_0022_byte_table_every_realistic_scenario_fits_at_step_1` are the same
+in both. `uptime` load 110 at the start, 385 at the end (a parallel verify
+build); the base run was `real 344.74, user 223.21` (compiling), the head
+run `real 509.97, user 14.58` (mostly waiting on the shared build lock).
+
+The base column already differs from the 89efca1 table above: TypeScript
+became pass-dependent after it (GM-325), which added `S_PASS` to every
+rendering with TypeScript covered.
+
+| Scenario | 89efca1 | Before (`c1ef86b`) | After (`a07018e`) | Δ |
+|---|---|---|---|---|
+| TypeScript only | 1141 | 1275 | 1018 | −257 |
+| Rust only | 1269 | 1269 | 1012 | −257 |
+| TypeScript + Rust | 1280 | 1284 | 1027 | −257 |
+| All four indexed, real manifests | n/a | 1296 | 1039 | −257 |
+| TypeScript + Python absent (214 files) | 1301 | 1435 | 1178 | −257 |
+| Four states | 1531 | 1665 | 1408 | −257 |
+| Zero plugins, all four absent | 1115 | 1115 | 1027 | −88 |
+| Four discovered, three failed with long errors | 1613 | 1747 | 1490 | −257 |
+| All four failed | 1379 | 1379 | 1291 | −88 |
+| Cold start, 103-byte root, 3 missing, unindexed / walking | 1601 / 1572 | 1735 / 1706 | 1478 / 1449 | −257 |
+| Cold start, 103-byte root, 0 missing, unindexed / walking | 1569 / 1540 | 1573 / 1544 | 1316 / 1287 | −257 |
+| Cold start, 103-byte root, 4 missing, unindexed / walking | 1304 / 1275 | 1304 / 1275 | 1216 / 1187 | −88 |
+
+−257 is `P4_STATIC` + `S_PASS` (473) replaced by `S_PASS_ALONE` (216).
+−88 is P2's gap pointer (87 bytes plus its joining space), dropped because
+nothing indexed or installed leaves no receiver paragraph to point at. The
+renderings built from synthetic never-languages do not change, because a
+`Never` language still gets `p4_perm`: the 16-never stress row (1695, by
+construction; no test prints it), ladder steps 2-4 (1601, 1843, 1496),
+`build_front` (1846), the worst case (1319) and the worst-case cold start
+(1776 / 1476). The largest rendering is still `build_front`'s 1846; the
+largest realistic warm one is now 1490 (410 bytes free).
 
 ### B. Live render
 

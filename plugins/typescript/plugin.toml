@@ -49,6 +49,9 @@ files_created = true
 # section for what core does with each value.
 receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
+# A method overrides or implements the same-named member of a supertype, so
+# core derives `find_callers`' `overrides` field from the type edges.
+member_overrides = "by_name"
 
 [plugin.semantic]
 # A bare name: a `PATH` lookup, then the indexed project's own

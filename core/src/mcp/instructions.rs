@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::daemon::candidates::Detection;
-use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
+use crate::daemon::manifest::{Capabilities, MemberOverrides, ReceiverCallResolution};
 use crate::languages::LanguageOutcome;
 
 /// Working byte ceiling; one constant because [`build`]'s trim ladder and the
@@ -208,8 +208,12 @@ const P1: &str = "Structural code-graph queries over this project's index. Prefe
 const P2: &str = "A result anchored by `symbol_id`, or by an unambiguous `symbol_name` \
      (excludes other same-named declarations' call sites, same guarantee either \
      way), is already resolved per call site to that exact declaration - do not \
-     re-check it with grep as a routine habit. Only fall back to grep for the one \
-     specific gap below, never as a general double-check.";
+     re-check it with grep as a routine habit.";
+
+/// [`P2`]'s last sentence, rendered only with a receiver paragraph: it points
+/// at that paragraph.
+const P2_GAP: &str =
+    "Only fall back to grep for the one specific gap below, never as a general double-check.";
 
 /// The "unsupported" state is this sentence's second half, said once and
 /// generically: it names no catalogue.
@@ -375,50 +379,62 @@ fn p4_perm(list: &str) -> String {
     )
 }
 
-/// Ladder step 3's [`p4_perm`]: names no language and makes no claim that a
-/// page discloses the gap (TypeScript reports no per-page field for it).
+/// Ladder step 3's [`p4_perm`]: names no language, because at that step the
+/// list of languages is what was cut to fit the budget.
 const P4_PERM_FALLBACK: &str = "The one legitimate reason to grep afterward: in some of this project's \
      languages a method call through a variable receiver (`x.foo()`) may produce no edge, so a \
      method's caller/reference list can under-report; bare function calls and this/super/qualified-type \
      calls have no such gap, and for those `hasMore: false` without `unlinkedUsages` is exhaustive.";
 
-/// No covered language is [`ReceiverClass::Never`]: receiver calls bind to
-/// the declared or inferred type, so an override's caller page
-/// under-reports, and the missing calls sit on the base's page. It must
-/// never pass an implementor count off as missing callers (ADR 0003).
+/// No covered language is [`ReceiverClass::Never`], but one reports no
+/// `overrides` field ([`MemberOverrides::None`]): receiver calls bind to the
+/// declared or inferred type, so an override's caller page under-reports,
+/// and the missing calls sit on the base's page. It must never pass an
+/// implementor count off as missing callers (ADR 0003).
 const P4_STATIC: &str = "The one legitimate reason to grep afterward: a method call through a variable \
      receiver (`x.foo()`) binds to the receiver's declared or inferred type, not the one it holds at run \
      time, so an override's caller page under-reports - calls reaching it through a base or interface \
      sit on that base's page, and find_implementations is the way across.";
 
-/// Appended when any covered language is [`ReceiverClass::PassDependent`].
-/// True at every moment of a session, so it cannot go stale; the live state
-/// is `provenance` on the answer.
+/// Appended to [`p4_perm`], [`P4_PERM_FALLBACK`] or [`P4_STATIC`] when any
+/// covered language is [`ReceiverClass::PassDependent`]; "such a call" is the
+/// receiver call that paragraph names. True at every moment of a session, so
+/// it cannot go stale; the live state is `provenance` on the answer.
 const S_PASS: &str = "Until a language's semantic pass has run, such a call has no edge at all there; \
      a page answered before then carries `provenance`.";
+
+/// [`S_PASS`] standing alone: no language is [`ReceiverClass::Never`] and
+/// every one reports `overrides`, so nothing precedes it.
+const S_PASS_ALONE: &str = "The one legitimate reason to grep afterward: until a language's semantic \
+     pass has run, a method call through a variable receiver (`x.foo()`) has no edge at all there; a \
+     page answered before then carries `provenance`.";
 
 const P5: &str = "Efficient usage: pass `symbol_name` directly to \
      find_references/find_callers/find_callees/find_implementations instead of calling find_definition \
      first, and raise `limit` for symbols with many results instead of paging.";
 
-/// The receiver paragraph for `languages`, or `None` when there are none.
-/// `with_list`: name the [`ReceiverClass::Never`] languages.
+/// The receiver paragraph for `languages`, or `None` when there is no gap to
+/// name: no language, or every one [`ReceiverClass::Static`] and reporting
+/// `overrides`. `with_list`: name the [`ReceiverClass::Never`] languages.
 fn receiver_paragraph(languages: &[PresentLanguage], with_list: bool) -> Option<String> {
-    if languages.is_empty() {
-        return None;
-    }
     let mut never: Vec<String> = languages
         .iter()
         .filter(|p| receiver_class(&p.capabilities) == ReceiverClass::Never)
         .map(|p| p.language.clone())
         .collect();
     never.sort();
+    let pass_dependent =
+        languages.iter().any(|p| receiver_class(&p.capabilities) == ReceiverClass::PassDependent);
+    let silent_on_overrides =
+        languages.iter().any(|p| p.capabilities.member_overrides == MemberOverrides::None);
     let mut paragraph = match (never.is_empty(), with_list) {
-        (true, _) => P4_STATIC.to_string(),
         (false, true) => p4_perm(&format_language_list(&never)),
         (false, false) => P4_PERM_FALLBACK.to_string(),
+        (true, _) if silent_on_overrides => P4_STATIC.to_string(),
+        (true, _) if pass_dependent => return Some(S_PASS_ALONE.to_string()),
+        (true, _) => return None,
     };
-    if languages.iter().any(|p| receiver_class(&p.capabilities) == ReceiverClass::PassDependent) {
+    if pass_dependent {
         paragraph.push(' ');
         paragraph.push_str(S_PASS);
     }
@@ -431,16 +447,21 @@ fn render(coverage: &Coverage, step: u8) -> String {
     let languages = match &coverage.covered {
         Covered::Indexed(languages) | Covered::Installed(languages) => languages,
     };
-    let mut paragraphs =
-        vec![P1.to_string(), coverage_paragraph(coverage, step < 2, step < 4), P2.to_string()];
-    paragraphs.extend(receiver_paragraph(languages, step < 3));
+    let receiver = receiver_paragraph(languages, step < 3);
+    let p2 = match receiver {
+        Some(_) => format!("{P2} {P2_GAP}"),
+        None => P2.to_string(),
+    };
+    let mut paragraphs = vec![P1.to_string(), coverage_paragraph(coverage, step < 2, step < 4), p2];
+    paragraphs.extend(receiver);
     paragraphs.push(P5.to_string());
     paragraphs.join("\n\n")
 }
 
 /// Builds `get_info`'s `with_instructions` string for this session: P1, the
-/// coverage paragraph, P2, the receiver paragraph (left out when no language
-/// is covered), P5.
+/// coverage paragraph, P2 (with [`P2_GAP`] only before a receiver
+/// paragraph), the receiver paragraph (left out when there is no gap to name,
+/// [`receiver_paragraph`]), P5.
 pub fn build(coverage: &Coverage) -> String {
     build_within(coverage, INSTRUCTIONS_BYTE_CEILING)
 }

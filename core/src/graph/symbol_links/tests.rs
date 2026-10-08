@@ -434,6 +434,56 @@ fn each_edge_kind_picks_the_export_that_fits_it() {
     assert_eq!(edge_target(&conn, &references).0, "Type:target.ts:Widget");
 }
 
+/// A `SUPERTYPE_OF` placeholder with only a `Function` candidate links to
+/// it: a trait-impl method's edge to the trait method it implements.
+/// Control: set `SUPERTYPE_OF`'s accepted kinds back to `["Type"]` in
+/// `LINKABLE_EDGE_KINDS` (the edge stays unresolved).
+#[test]
+fn a_supertype_edge_links_to_a_function_when_no_type_fits() {
+    let mut conn = setup();
+    apply_diff(
+        &mut conn,
+        &Diff {
+            upsert_nodes: vec![
+                symbol("impl.rs", "area", "Function", true),
+                symbol("shape.rs", "area", "Function", true),
+            ],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let edge = seed_usage(&mut conn, "Function:impl.rs:area", "SUPERTYPE_OF", "shape.rs", "area");
+
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge), ("Function:shape.rs:area".to_string(), true));
+}
+
+/// With both a `Type` and a `Function` candidate, `SUPERTYPE_OF` still
+/// links to the `Type`, so every placeholder that linked to a type keeps
+/// that link. Control: accept `["Function", "Type"]`, or pool every
+/// accepted kind's candidates instead of taking the first non-empty kind
+/// (ambiguous, unresolved).
+#[test]
+fn a_supertype_edge_prefers_a_type_over_a_same_named_function() {
+    let mut conn = setup();
+    apply_diff(
+        &mut conn,
+        &Diff {
+            upsert_nodes: vec![
+                symbol("impl.rs", "Square", "Type", true),
+                symbol("shape.rs", "Shape", "Type", true),
+                symbol("shape.rs", "Shape", "Function", true),
+            ],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let edge = seed_usage(&mut conn, "Type:impl.rs:Square", "SUPERTYPE_OF", "shape.rs", "Shape");
+
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge), ("Type:shape.rs:Shape".to_string(), true));
+}
+
 /// A `REFERENCES` edge takes any kind of export - which is exactly why it
 /// has to refuse when there are two of them.
 #[test]

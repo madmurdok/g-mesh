@@ -15,7 +15,7 @@ use rmcp::ErrorData;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::daemon::manifest::Capabilities;
+use crate::daemon::manifest::{Capabilities, MemberOverrides};
 use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
@@ -24,6 +24,7 @@ use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
 use super::not_indexed::{self, NotIndexed};
+use super::overrides::{self, OverriddenMember, Overrides};
 use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
@@ -221,6 +222,14 @@ struct CallerPage<'a> {
     /// edge to the anchor yet. Absent when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
+    /// See [`Overrides`] - the base members the anchor overrides or
+    /// implements, whose caller pages hold the calls made through a
+    /// base-typed receiver. Absent (not `[]`) when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overrides: Option<&'a [OverriddenMember]>,
+    /// Present only when `overrides` was cut to its row cap.
+    #[serde(skip_serializing_if = "answer::is_false")]
+    overrides_truncated: bool,
     /// See `super::provenance` - present only when the anchor's language
     /// declares a semantic tier that has not completed for this project, so
     /// this answer came from its structural tier alone. Absent (not `null`,
@@ -408,6 +417,10 @@ struct CallerDisclosures<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    overrides: Option<&'a [OverriddenMember]>,
+    #[serde(skip_serializing_if = "answer::is_false")]
+    overrides_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     not_indexed: &'a [NotIndexed],
@@ -455,6 +468,7 @@ struct CallerParts<'a> {
     excluded: Option<ExcludedReferences>,
     unlinked: Option<UnlinkedUsages>,
     untyped: Option<UntypedReceiverCalls>,
+    overrides: Option<Overrides>,
     tier: provenance::Resolved,
     hints: &'a SessionHints,
     not_indexed: &'a [NotIndexed],
@@ -480,13 +494,14 @@ impl CallerParts<'_> {
         let excluded = self.excluded.as_ref().map(|excluded| excluded.naming_only_new(&named));
 
         // Every file this response names: rows, the tally, the excluded,
-        // unlinked and untyped tallies.
+        // unlinked and untyped tallies, the overridden members.
         let touched = named
             .iter()
             .copied()
             .chain(excluded_paths(&excluded))
             .chain(self.unlinked.iter().flat_map(UnlinkedUsages::file_paths))
-            .chain(self.untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
+            .chain(self.untyped.iter().flat_map(UntypedReceiverCalls::file_paths))
+            .chain(self.overrides.iter().flat_map(Overrides::file_paths));
         let provenance = self.tier.clone().disclose(
             self.conn,
             &self.anchor.language,
@@ -506,6 +521,7 @@ impl CallerParts<'_> {
                 session_hints::UNRESOLVED_ROW,
             ),
             once(provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+            once(self.overrides.is_some(), HintKey::Overrides, session_hints::OVERRIDES),
         ]);
 
         CallerPage {
@@ -521,6 +537,8 @@ impl CallerParts<'_> {
             excluded_references: excluded,
             unlinked_usages: self.unlinked.as_ref(),
             untyped_receiver_calls: self.untyped.as_ref(),
+            overrides: self.overrides.as_ref().map(|found| found.members.as_slice()),
+            overrides_truncated: self.overrides.as_ref().is_some_and(|found| found.truncated),
             provenance,
             not_indexed: self.not_indexed,
         }
@@ -568,6 +586,10 @@ pub(crate) fn handle_callers_in_covered(
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
     let unlinked = unlinked::probe(&conn, &anchor, &["CALLS"], &file_paths);
     let untyped = untyped::probe(&conn, &anchor, &["CALLS"], &file_paths);
+    let member_overrides = capabilities
+        .get(&anchor.language)
+        .map_or(MemberOverrides::default(), |capabilities| capabilities.member_overrides);
+    let overrides = overrides::probe(&conn, &anchor, member_overrides);
     let answer = params.answer.unwrap_or_default();
     let excluded = excluded_references(&conn, &anchor.id, Direction::Incoming, &file_paths, answer);
     let not_indexed = not_indexed::group(&conn, uncovered)?;
@@ -583,16 +605,20 @@ pub(crate) fn handle_callers_in_covered(
                 .copied()
                 .chain(excluded_paths(&excluded))
                 .chain(unlinked.iter().flat_map(UnlinkedUsages::file_paths))
-                .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths));
+                .chain(untyped.iter().flat_map(UntypedReceiverCalls::file_paths))
+                .chain(overrides.iter().flat_map(Overrides::file_paths));
             let provenance = tier.clone().disclose(&conn, &anchor.language, Some(&anchor.file_path), touched);
             let hint = session_hints::join([
                 hint,
                 hints.offer(send, provenance.is_some(), HintKey::SemanticTier, session_hints::PROVENANCE),
+                hints.offer(send, overrides.is_some(), HintKey::Overrides, session_hints::OVERRIDES),
             ]);
             let disclosures = CallerDisclosures {
                 excluded_references: excluded,
                 unlinked_usages: unlinked.as_ref(),
                 untyped_receiver_calls: untyped.as_ref(),
+                overrides: overrides.as_ref().map(|found| found.members.as_slice()),
+                overrides_truncated: overrides.as_ref().is_some_and(|found| found.truncated),
                 provenance,
                 not_indexed: &not_indexed,
             };
@@ -623,6 +649,7 @@ pub(crate) fn handle_callers_in_covered(
         excluded,
         unlinked,
         untyped,
+        overrides,
         tier,
         hints,
         not_indexed: &not_indexed,
@@ -980,6 +1007,7 @@ mod tests {
                 files_created: false,
                 receiver_calls: crate::daemon::manifest::ReceiverCallResolution::Resolved,
                 receiver_calls_structural: crate::daemon::manifest::ReceiverCallResolution::Unresolved,
+                member_overrides: crate::daemon::manifest::MemberOverrides::None,
             },
         )])
     }
@@ -2208,5 +2236,180 @@ mod tests {
             }]),
             "{body}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `overrides`: the capability gate and both wire paths
+    // -----------------------------------------------------------------
+
+    use crate::daemon::manifest::MemberOverrides;
+    use crate::protocol::types::{PathSegment, QualifiedPath};
+
+    /// A `kind` declaration at `segments` (joined by `sep`) in `file` and
+    /// `container`.
+    fn declared_at(
+        conn: &mut Connection,
+        (id, kind, segments): (&str, &str, &[&str]),
+        (language, sep, file, container): (&str, &str, &str, &str),
+    ) {
+        let mut node =
+            NodeRecord::new(id, kind, *segments.last().unwrap(), segments.join(sep), file, language);
+        node.container = Some(container.to_string());
+        node.qualified_path = Some(QualifiedPath(
+            segments
+                .iter()
+                .enumerate()
+                .map(|(i, name)| PathSegment {
+                    sep: (i > 0).then(|| sep.to_string()),
+                    name: name.to_string(),
+                })
+                .collect(),
+        ));
+        upsert_node(conn, node).unwrap();
+    }
+
+    fn language_in(language: &str, mode: MemberOverrides) -> HashMap<String, Capabilities> {
+        HashMap::from([(language.to_string(), Capabilities { member_overrides: mode, ..Default::default() })])
+    }
+
+    fn callers_with(
+        store: &Arc<IndexStore>,
+        capabilities: &HashMap<String, Capabilities>,
+        hints: &SessionHints,
+        id: &str,
+        answer: Option<Answer>,
+    ) -> serde_json::Value {
+        let params = SymbolQueryParams { symbol_id: Some(id.to_string()), answer, ..Default::default() };
+        json_body(
+            &handle_callers(
+                store,
+                &EmbeddingPipeline::disabled(),
+                QueryShapes::shipped(),
+                capabilities,
+                hints,
+                params,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A Rust inherent `Square::area` beside `Square -SUPERTYPE_OF-> Shape`
+    /// and `Shape::area`, called by `run`.
+    fn inherent_rust() -> Arc<IndexStore> {
+        let mut conn = setup();
+        let at = ("rust", "::", "src/shapes.rs", "krate::shapes");
+        declared_at(&mut conn, ("Square", "Type", &["shapes", "Square"]), at);
+        declared_at(&mut conn, ("Shape", "Type", &["shapes", "Shape"]), at);
+        declared_at(&mut conn, ("Shape::area", "Function", &["shapes", "Shape", "area"]), at);
+        declared_at(&mut conn, ("Square::area", "Function", &["shapes", "Square", "area"]), at);
+        declared_at(&mut conn, ("run", "Function", &["shapes", "run"]), at);
+        upsert_edge(
+            &mut conn,
+            EdgeRecord::new("sup", "Square", "Shape", "SUPERTYPE_OF", "tree-sitter", true),
+        )
+        .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("call", "run", "Square::area", "CALLS", "tree-sitter", true))
+            .unwrap();
+        Arc::new(IndexStore::new(conn))
+    }
+
+    /// B5: the mode comes from the anchor language's capabilities. Rust's
+    /// `declared` names nothing for an inherent method; the same graph
+    /// under `by_name` names `Shape::area`; a language with no
+    /// capabilities entry is `none`. Control: pass `MemberOverrides::ByName`
+    /// to `overrides::probe` whatever the map says (the `declared` case
+    /// gains the field).
+    #[test]
+    fn the_anchor_languages_capability_picks_the_overrides_mode() {
+        let store = inherent_rust();
+        let hints = SessionHints::default();
+        let field = |capabilities: &HashMap<String, Capabilities>| {
+            callers_with(&store, capabilities, &hints, "Square::area", None).get("overrides").cloned()
+        };
+        assert_eq!(field(&language_in("rust", MemberOverrides::Declared)), None);
+        assert_eq!(field(&no_capabilities()), None);
+        assert_eq!(field(&language_in("python", MemberOverrides::ByName)), None, "another language's mode");
+        let by_name =
+            field(&language_in("rust", MemberOverrides::ByName)).expect("by_name names Shape::area");
+        assert_eq!(by_name[0]["qualifiedName"], "shapes::Shape::area", "{by_name}");
+    }
+
+    /// Python `pkg.sub.Sub.describe` overriding `pkg.base.Base.describe`,
+    /// called by `run`.
+    fn python_override() -> Arc<IndexStore> {
+        let mut conn = setup();
+        let base = ("python", ".", "pkg/base.py", "pkg.base");
+        let sub = ("python", ".", "pkg/sub.py", "pkg.sub");
+        declared_at(&mut conn, ("Base", "Type", &["pkg", "base", "Base"]), base);
+        declared_at(&mut conn, ("Base.describe", "Function", &["pkg", "base", "Base", "describe"]), base);
+        declared_at(&mut conn, ("Sub", "Type", &["pkg", "sub", "Sub"]), sub);
+        declared_at(&mut conn, ("Sub.describe", "Function", &["pkg", "sub", "Sub", "describe"]), sub);
+        declared_at(&mut conn, ("run", "Function", &["pkg", "sub", "run"]), sub);
+        upsert_edge(&mut conn, EdgeRecord::new("sup", "Sub", "Base", "SUPERTYPE_OF", "tree-sitter", true))
+            .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("call", "run", "Sub.describe", "CALLS", "tree-sitter", true))
+            .unwrap();
+        Arc::new(IndexStore::new(conn))
+    }
+
+    fn base_describe() -> serde_json::Value {
+        serde_json::json!([{
+            "id": "Base.describe",
+            "qualifiedName": "pkg.base.Base.describe",
+            "filePath": "pkg/base.py",
+            "startLine": 0,
+        }])
+    }
+
+    fn says_overrides(body: &serde_json::Value) -> bool {
+        body["hint"].as_str().unwrap_or_default().contains(session_hints::OVERRIDES)
+    }
+
+    /// B7, rows page: the field rides beside the rows, and its sentence is
+    /// sent once per session (the second call keeps the field, not the
+    /// sentence; a new session gets it again). Control: `peek` instead of
+    /// `once` for `HintKey::Overrides` in `CallerParts::response` (the second
+    /// call repeats it).
+    #[test]
+    fn a_rows_page_carries_overrides_and_explains_it_once_per_session() {
+        let store = python_override();
+        let python = language_in("python", MemberOverrides::ByName);
+        let session = SessionHints::default();
+
+        let first = callers_with(&store, &python, &session, "Sub.describe", None);
+        assert_eq!(first["results"].as_array().unwrap().len(), 1, "{first}");
+        assert_eq!(first["overrides"], base_describe(), "{first}");
+        assert!(first.get("overridesTruncated").is_none(), "{first}");
+        assert!(says_overrides(&first), "{first}");
+
+        let second = callers_with(&store, &python, &session, "Sub.describe", None);
+        assert_eq!(second["overrides"], base_describe(), "{second}");
+        assert!(!says_overrides(&second), "once per session: {second}");
+
+        let fresh = callers_with(&store, &python, &SessionHints::default(), "Sub.describe", None);
+        assert!(says_overrides(&fresh), "{fresh}");
+
+        let base = callers_with(&store, &python, &SessionHints::default(), "Base.describe", None);
+        assert!(base.get("overrides").is_none(), "Base overrides nothing: {base}");
+        assert!(!says_overrides(&base), "no field, no sentence: {base}");
+    }
+
+    /// B7, `answer` summaries: `count` and `files` carry the field too, and
+    /// the sentence they send counts for the session. Control: drop
+    /// `overrides` from `CallerDisclosures` (no field on either summary).
+    #[test]
+    fn a_count_or_files_answer_carries_overrides_too() {
+        let store = python_override();
+        let python = language_in("python", MemberOverrides::ByName);
+        for answer in [Answer::Count, Answer::Files] {
+            let session = SessionHints::default();
+            let summary = callers_with(&store, &python, &session, "Sub.describe", Some(answer));
+            assert_eq!(summary["overrides"], base_describe(), "{answer:?}: {summary}");
+            assert!(says_overrides(&summary), "{answer:?}: {summary}");
+
+            let page = callers_with(&store, &python, &session, "Sub.describe", None);
+            assert_eq!(page["overrides"], base_describe(), "{answer:?}: {page}");
+            assert!(!says_overrides(&page), "{answer:?}: already sent this session: {page}");
+        }
     }
 }

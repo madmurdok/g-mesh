@@ -113,7 +113,8 @@ section, saying the same thing in their own syntax, because it is what static
 resolution means rather than what one engine does. `plugins/typescript` is
 the odd one out and says so: it declares `receiver_calls = "unresolved"` for
 both tiers and emits no edge for `x.m()` at all. A session is told the
-consequence once, by `core/src/mcp/instructions.rs`'s `P4_STATIC`.
+consequence on the override's caller page, whose `overrides` field names the
+base member those calls sit on (`core/src/mcp/overrides.rs`).
 
 ## Out of scope, deliberately
 
