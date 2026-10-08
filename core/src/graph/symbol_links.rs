@@ -331,10 +331,10 @@ const VISIBILITY_CONTAINER: &str = "container";
 /// The edge kinds a pending-symbol placeholder can carry, and the node kinds
 /// each one accepts for the symbol it is linked to, in order of preference.
 /// `CALLS` is Function -> Function by definition. `SUPERTYPE_OF` relates two
-/// types, and since GM-502 also a trait-impl method to the trait method it
-/// implements (`<Square as Shape>::area -> Shape::area`, D3), so it accepts a
-/// `Function` - but only where no `Type` fits, so every placeholder that
-/// linked to a type before still links to that same type. `REFERENCES` is
+/// types, and also a trait-impl method to the trait method it implements
+/// (`<Square as Shape>::area -> Shape::area`), so it accepts a `Function` -
+/// but only where no `Type` fits, so a placeholder that can link to a type
+/// still links to that type. `REFERENCES` is
 /// the catch-all usage edge and accepts whatever the scope offers.
 const LINKABLE_EDGE_KINDS: [(&str, Option<&[&str]>); 3] =
     [("CALLS", Some(&["Function"])), ("SUPERTYPE_OF", Some(&["Type", "Function"])), ("REFERENCES", None)];
