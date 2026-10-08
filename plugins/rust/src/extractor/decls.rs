@@ -25,7 +25,7 @@
 //! variant's fields would hang off a variant that is not one. A tuple
 //! struct's positional field is one, named by its index (`0`, `T.0`): no
 //! identifier can start with a digit, so `T.0` collides with no named field,
-//! and the `.` keeps it apart from every `T::m` (GM-528). A field is
+//! and the `.` keeps it apart from every `T::m`. A field is
 //! registered in the file model by its `T.f`/`T.0` tail only, never by its
 //! bare name, so a bare identifier written in the module cannot resolve to a
 //! field, and a method `T::f` of the same name keeps its own key, node and
@@ -182,7 +182,8 @@ fn alias_name(node: Node, source: &str) -> Option<String> {
     }
 }
 
-/// A named field's full name within its module: `T.f`. The `.` keeps it
+/// A field's full name within its module: `T.f`, or `T.0` for a tuple
+/// struct's positional field. The `.` keeps it
 /// apart from `T::f`, the address of an associated item of the same name -
 /// a getter named after its field is common, and the two must never share a
 /// `qualifiedName`, a node id or a file-model key.

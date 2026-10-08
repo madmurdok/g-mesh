@@ -903,7 +903,7 @@ impl Bodies<'_, '_> {
     /// the final `.f` resolves no written type.
     ///
     /// A positional read `x.0` takes the same two paths onto the tuple
-    /// struct's field `T.0` (GM-528) but never opens a site: a site named
+    /// struct's field `T.0` but never opens a site: a site named
     /// `0` would ask the semantic tier about a name every tuple struct
     /// shares, so an untyped `x.0` emits nothing but its value's own uses.
     fn field_access(&mut self, node: Node, module: &ModuleCtx, block: Option<&BlockCtx>, from: &str) {
