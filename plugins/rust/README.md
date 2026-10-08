@@ -138,10 +138,11 @@ page, whose `overrides` field names the trait member those calls sit on
 The edge behind `overrides` also shows up elsewhere: `find_implementations` and
 `find_references` on a trait method (for example `Shape::area`) list the impl
 methods `<Square as Shape>::area`, and the references page marks them
-`referenceKind: SUPERTYPE_OF`. The limit: a method implementing a trait
-declared in another crate of the same workspace gets no `overrides`, even after
-rust-analyzer's pass, because the plugin emits the edge only when it resolves
-the trait itself.
+`referenceKind: SUPERTYPE_OF`. The limit: the plugin emits the edge only when
+it resolves the impl's trait clause itself, so a method implementing a trait
+it cannot resolve - for example one reached through a glob import of another
+crate's re-export (`use alpha::prelude::*;`) - gets no `overrides`, even after
+rust-analyzer's pass.
 
 ## What it does not see
 

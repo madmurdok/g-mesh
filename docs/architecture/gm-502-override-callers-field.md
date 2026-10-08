@@ -137,11 +137,14 @@ Recommended (Q1 option A): the Rust plugin emits, for each member `m` of
 | Rust | `declared` (Q1 A) | trait-impl methods whose trait is in the project | an inherent method, a free function, or a trait outside the project (`Display::fmt`) |
 | any other | `none` | never | the instructions keep the sentence for this language (D7) |
 
-Rust limitation: a method implementing a trait declared in another crate of
-the same workspace gets no `overrides`, even after rust-analyzer's pass. The
-plugin emits the edge only when it resolves the trait itself. This is tracked
-as the backlog task "Rust: overrides for a trait declared in another workspace
-crate".
+Rust limitation: the plugin emits the edge only when the structural tier
+resolves the impl's trait clause, so a method implementing a trait it cannot
+resolve gets no `overrides`, even after rust-analyzer's pass. The case seen in
+verify: a trait reached through a glob import of another crate's re-export
+(`use alpha::prelude::*;` then `impl Loud for Megaphone`), which the
+structural tier resolves to nothing. A trait named by a path into a sibling
+crate does resolve. This is tracked as the backlog task "Rust: overrides for
+a trait the structural tier cannot resolve".
 
 Absent field, in general: "this anchor overrides nothing g-mesh can name in
 this project". It never means "no caller can reach it through a base outside
