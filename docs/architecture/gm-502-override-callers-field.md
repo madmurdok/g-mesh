@@ -137,6 +137,12 @@ Recommended (Q1 option A): the Rust plugin emits, for each member `m` of
 | Rust | `declared` (Q1 A) | trait-impl methods whose trait is in the project | an inherent method, a free function, or a trait outside the project (`Display::fmt`) |
 | any other | `none` | never | the instructions keep the sentence for this language (D7) |
 
+Rust limitation: a method implementing a trait declared in another crate of
+the same workspace gets no `overrides`, even after rust-analyzer's pass. The
+plugin emits the edge only when it resolves the trait itself. This is tracked
+as the backlog task "Rust: overrides for a trait declared in another workspace
+crate".
+
 Absent field, in general: "this anchor overrides nothing g-mesh can name in
 this project". It never means "no caller can reach it through a base outside
 the project".

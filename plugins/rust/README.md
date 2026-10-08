@@ -135,6 +135,14 @@ run. A session is told the consequence on the trait-impl method's caller
 page, whose `overrides` field names the trait member those calls sit on
 (`core/src/mcp/overrides.rs`).
 
+The edge behind `overrides` also shows up elsewhere: `find_implementations` and
+`find_references` on a trait method (for example `Shape::area`) list the impl
+methods `<Square as Shape>::area`, and the references page marks them
+`referenceKind: SUPERTYPE_OF`. The limit: a method implementing a trait
+declared in another crate of the same workspace gets no `overrides`, even after
+rust-analyzer's pass, because the plugin emits the edge only when it resolves
+the trait itself.
+
 ## What it does not see
 
 These are what the *structural* tier does not see. Each is a question only
