@@ -3,10 +3,11 @@
 //! The daemon under test is bootstrapped the way a real one is - by running
 //! `g-mesh mcp-shim` and letting it spawn one - rather than spawned directly
 //! by the test. That is not incidental: a daemon spawned as this process's
-//! own child would linger as an unreaped zombie after being signalled, and a
-//! zombie still answers `kill(pid, 0)`, so the test would be asserting about
-//! a process state that cannot occur in production. Bootstrapping through the
-//! shim reparents the daemon to init, exactly as in real use.
+//! own child would linger as an unreaped zombie after being signalled unless
+//! something waits on it, and a zombie still answers `kill(pid, 0)`. The shim
+//! reaps its daemons with a `daemon-reaper` thread while it lives (a folder
+//! session's shim lives the whole session), and once the shim exits the
+//! daemon is reparented to init - both as in real use.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
