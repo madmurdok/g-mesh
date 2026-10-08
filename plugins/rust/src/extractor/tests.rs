@@ -2223,6 +2223,277 @@ pub fn read_b(b: B) -> u8 { b.f }
     }
 }
 
+// --- GM-528: tuple-struct positional fields -----------------------------------
+
+/// The `REFERENCES` targets out of `from` that are positional fields: any
+/// `….N` whose last segment is all digits, declaration or placeholder.
+fn positional_targets(graph: &Graph, from: &str) -> Vec<String> {
+    graph
+        .targets(EdgeKind::References, from)
+        .into_iter()
+        .filter(|target| {
+            target.rsplit('.').next().is_some_and(|tail| tail.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect()
+}
+
+/// Every open site out of `from` named `name`, of any kind.
+fn sites_named<'g>(graph: &'g Graph, from: &str, name: &str) -> Vec<&'g OpenSite> {
+    let from = graph.node(from).id.clone();
+    graph.0.open_sites.iter().filter(|site| site.from_id == from && site.name == name).collect()
+}
+
+/// GM-528 behaviour 1: `struct P(A, B)` declares one `Variable`/`field` node
+/// per positional field, named by its index, `qualifiedName` `<mod>::P.N`,
+/// in the module like a named field; its id is a function of that name, so
+/// it survives re-extraction and an edit that moves the struct. Control:
+/// put back the old `ordered_field_declaration_list` loop in
+/// `Declarer::fields` (no `store::P.0` node).
+#[test]
+fn a_tuple_structs_positional_fields_are_nodes_named_by_their_index() {
+    let source = "pub struct P(pub u8, u16);\npub struct Named { pub f: u8 }\n";
+    let krate = Crate::new(&[("src/lib.rs", "pub mod store;\n"), ("src/store.rs", source)]);
+    let store = krate.extract("src/store.rs");
+    let named = store.node("store::Named.f");
+    for (index, qualified) in [("0", "store::P.0"), ("1", "store::P.1")] {
+        let field = store.node(qualified);
+        assert_eq!(
+            (field.kind, field.native_kind.as_deref()),
+            (NodeKind::Variable, Some("field")),
+            "{index}"
+        );
+        assert_eq!(field.name, index);
+        assert_eq!(field.container, named.container, "{index}: in the module, like a named field");
+    }
+    assert_ne!(store.node("store::P.0").id, store.node("store::P.1").id);
+    let fields: Vec<_> =
+        store.0.nodes.iter().filter(|node| node.native_kind.as_deref() == Some("field")).collect();
+    assert_eq!(fields.len(), 3, "P.0, P.1 and Named.f: {:#?}", store.names());
+    assert!(store.find("store::P.2").is_none());
+
+    // Stable: the same ids on a second extraction, and after an edit that
+    // moves the struct down a line and a column.
+    assert_eq!(krate.extract("src/store.rs").node("store::P.0").id, store.node("store::P.0").id);
+    let moved = Crate::new(&[
+        ("src/lib.rs", "pub mod store;\n"),
+        ("src/store.rs", &format!("pub fn before() {{}}\n{}", source.replacen("(pub u8", "(  pub u8", 1))),
+    ]);
+    let moved = moved.extract("src/store.rs");
+    for qualified in ["store::P.0", "store::P.1"] {
+        assert_eq!(moved.node(qualified).id, store.node(qualified).id, "{qualified}");
+        assert_ne!(moved.node(qualified).range, store.node(qualified).range, "{qualified} did move");
+    }
+}
+
+/// GM-528 behaviour 2: a positional field's visibility is the modifier
+/// written before its type (`pub`, `pub(crate)`, none), its signature and
+/// range span modifier and type, and its doc is the `///` run before its
+/// attributes. Control: pass `None` to `modifier_visibility` in
+/// `Declarer::positional_fields` (`P.0` is `Container("krate::store")`).
+#[test]
+fn a_positional_fields_visibility_signature_and_doc_are_its_own() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod store;\n"),
+        (
+            "src/store.rs",
+            "pub struct Q;\npub struct P(\n    /// Doc.\n    #[allow(unused)]\n    pub u8,\n    pub(crate) Q,\n    u16,\n);\n",
+        ),
+    ]);
+    let store = krate.extract("src/store.rs");
+    let rows: Vec<_> = ["store::P.0", "store::P.1", "store::P.2"]
+        .into_iter()
+        .map(|qualified| {
+            let field = store.node(qualified);
+            (field.signature.clone(), field.doc_comment.clone(), field.visibility.clone())
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (Some("pub u8".to_string()), Some("Doc.".to_string()), Visibility::Public),
+            (Some("pub(crate) Q".to_string()), None, Visibility::Container("krate".into())),
+            (Some("u16".to_string()), None, Visibility::Container("krate::store".into())),
+        ]
+    );
+    // The range starts at the modifier (line 4, `    pub u8`), not at the
+    // attribute, and ends after the type.
+    let range = &store.node("store::P.0").range;
+    assert_eq!((range.start.line, range.start.col), (4, 4));
+    assert_eq!((range.end.line, range.end.col), (4, 10));
+    let range = &store.node("store::P.2").range;
+    assert_eq!((range.start.line, range.start.col, range.end.col), (6, 4, 7));
+}
+
+/// GM-528 behaviour 3 and the cases left out of scope: a tuple enum variant
+/// declares no field node, and neither a plain tuple's `t.0`, a tuple
+/// variant's binding, nor a literal `P { 0: x }` links a positional field.
+/// Control: call `positional_fields` on an enum variant's
+/// `ordered_field_declaration_list` too (an `E.0`-like field node appears).
+#[test]
+fn tuple_variants_plain_tuples_and_index_literals_declare_and_link_no_positional_field() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct P(pub u8);
+pub enum E { V(u8), W { side: u8 } }
+pub fn plain() -> u8 { let t = (1u8, 2u8); t.0 }
+pub fn variant(e: E) -> u8 { match e { E::V(v) => v, E::W { side } => side } }
+pub fn literal() -> P { P { 0: 1 } }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    let fields: Vec<_> = graph
+        .0
+        .nodes
+        .iter()
+        .filter(|node| node.native_kind.as_deref() == Some("field"))
+        .map(|node| node.qualified_name.clone())
+        .collect();
+    assert_eq!(fields, vec!["P.0"], "only the tuple struct's field: {:#?}", graph.names());
+    for from in ["plain", "variant", "literal"] {
+        assert_eq!(positional_targets(&graph, from), Vec::<String>::new(), "{from}");
+        assert!(sites_named(&graph, from, "0").is_empty(), "{from}: {:#?}", graph.0.open_sites);
+    }
+}
+
+/// GM-528 behaviour 4: `x.0` on a value typed to a same-file tuple struct,
+/// directly or through a typed field (`x.a.0`), is a resolved `REFERENCES`
+/// edge onto `P.0`. Control: drop the `integer_literal` arm of the field
+/// filter in `Bodies::field_access` (no edge onto `P.0`).
+#[test]
+fn a_typed_positional_read_links_the_tuple_structs_field() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct P(pub u8, pub u8);
+pub struct X { pub a: P }
+pub fn first(p: P) -> u8 { p.0 }
+pub fn second(p: P) -> u8 { p.1 }
+pub fn nested(x: X) -> u8 { x.a.0 }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for (from, target) in [("first", "P.0"), ("second", "P.1"), ("nested", "P.0")] {
+        assert_eq!(positional_targets(&graph, from), vec![target], "{from}");
+        let edge = reference_onto(&graph, from, target);
+        assert!(edge.resolved, "{from}: a same-file field is a resolved edge");
+        assert_eq!(edge.to_id, graph.node(target).id, "{from}");
+    }
+    assert!(graph.targets(EdgeKind::References, "nested").contains(&"X.a".to_string()));
+}
+
+/// GM-528 behaviour 4, across files: the edge is onto a `pending_symbol`
+/// placeholder addressed `(Container(P's module), QualifiedName("…P.0"))`,
+/// the same address as `T.f` in GM-497 item 2. Control: as above (no
+/// placeholder named `0`).
+#[test]
+fn a_typed_positional_read_on_a_type_from_another_file_is_a_placeholder_edge() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod store;\npub mod user;\n"),
+        ("src/store.rs", "pub struct P(pub u8);\n"),
+        ("src/user.rs", "use crate::store::P;\npub fn run(p: P) -> u8 { p.0 }\n"),
+    ]);
+    let user = krate.extract("src/user.rs");
+    let placeholder = user.placeholder("pending_symbol", "0");
+    assert_eq!(
+        user.target_of(placeholder),
+        (container("krate::store"), TargetKey::QualifiedName("store::P.0".to_string()))
+    );
+    let edge = reference_onto(&user, "user::run", &placeholder.qualified_name.clone());
+    assert_eq!(edge.to_id, placeholder.id);
+    // The placeholder's address is the declaration's own qualified name.
+    let store = krate.extract("src/store.rs");
+    assert_eq!(store.node("store::P.0").name, "0");
+}
+
+/// GM-528 behaviour 5: `self.0` inside `impl P` links `P.0` and, as
+/// `self.f` does, opens no site. Control: return before the edge in the
+/// `self` branch of `field_access` when the field is positional (`P::get`
+/// has no targets).
+#[test]
+fn a_self_positional_read_links_the_field_and_opens_no_site() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub struct P(u8, u8);\nimpl P { pub fn get(&self) -> u8 { self.1 } }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::References, "P::get"), vec!["P.1"]);
+    let get = graph.node("P::get").id.clone();
+    let sites: Vec<_> = graph.0.open_sites.iter().filter(|site| site.from_id == get).collect();
+    assert!(sites.is_empty(), "{sites:#?}");
+}
+
+/// GM-528 behaviour 6: a positional read on a value this tier cannot type -
+/// an unknown name, a generic, a wrapper (`Option<P>`) - links nothing, not
+/// even a placeholder. Control: drop the `Wrapper::Plain` filter in
+/// `field_access` (`wrapped` links `P.0`).
+#[test]
+fn an_untyped_positional_read_links_nothing() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub trait Tr {}
+pub struct P(pub u8);
+pub fn unknown() { y.0; }
+pub fn generic<G: Tr>(x: G) { x.0; }
+pub fn wrapped(x: Option<P>) { x.0; }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for from in ["unknown", "generic", "wrapped"] {
+        assert_eq!(positional_targets(&graph, from), Vec::<String>::new(), "{from}");
+    }
+    assert!(
+        graph.0.nodes.iter().all(|node| node.name != "0" || node.qualified_name == "P.0"),
+        "{:#?}",
+        graph.names()
+    );
+}
+
+/// GM-528 behaviour 7: no positional read opens a site, typed or not,
+/// while a named read beside it keeps its `ReceiverField` site (GM-497
+/// unchanged). Control: delete `if positional { return; }` in
+/// `field_access` (a `ReceiverField` site named `0` appears).
+#[test]
+fn a_positional_read_opens_no_site_and_a_named_read_still_does() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct P(pub u8);
+pub struct T { pub f: u8 }
+pub fn typed(p: P, t: T) -> u8 { p.0 + t.f }
+pub fn untyped() -> u8 { y.0 + z.f }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for from in ["typed", "untyped"] {
+        assert!(sites_named(&graph, from, "0").is_empty(), "{from}: {:#?}", graph.0.open_sites);
+        assert_eq!(field_sites(&graph, from, "f").len(), 1, "{from}: {:#?}", graph.0.open_sites);
+    }
+    let edge = reference_onto(&graph, "typed", "T.f");
+    assert_eq!(field_sites(&graph, "typed", "f")[0].replaces.as_deref(), Some(edge.id.as_str()));
+    assert_eq!(field_sites(&graph, "untyped", "f")[0].replaces, None);
+    assert_eq!(positional_targets(&graph, "typed"), vec!["P.0"]);
+}
+
+/// GM-528 behaviour 8: a field token the grammar reads as an integer
+/// literal but that is not all digits (`p.0u8`) names no field, and its
+/// value is still visited (`x.a` links). Control: make the
+/// `integer_literal` arm of the field filter `true` (a `0u8` placeholder
+/// edge appears).
+#[test]
+fn a_suffixed_positional_token_names_no_field_and_its_value_is_visited() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub struct P(pub u8);\npub struct X { pub a: P }\npub fn run(x: X) -> u8 { x.a.0u8 }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    let targets = graph.targets(EdgeKind::References, "run");
+    assert!(targets.contains(&"X.a".to_string()), "{targets:?}");
+    assert!(!targets.iter().any(|target| target.contains('0')), "{targets:?}");
+    assert!(sites_named(&graph, "run", "0u8").is_empty(), "{:#?}", graph.0.open_sites);
+}
+
 // --- the whole-file range (GM-527) ----------------------------------------------
 
 /// The `File` node ends where the file's content ends - trailing whitespace
