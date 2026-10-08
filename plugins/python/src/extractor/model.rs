@@ -389,6 +389,57 @@ mod tests {
         assert_eq!(model.lookup_import("missing"), None);
     }
 
+    fn at(line: u32) -> Range {
+        Range { start: Position { line, col: 0 }, end: Position { line, col: 1 } }
+    }
+
+    fn item(container: &str) -> Import {
+        Import::Item { container: container.into(), name: "f".into() }
+    }
+
+    /// GM-533 R2: a later unconditional import of a name replaces an earlier
+    /// different binding, and its range; a conditional one never does.
+    #[test]
+    fn a_later_unconditional_import_replaces_and_a_conditional_one_does_not() {
+        let mut model = FileModel::default();
+        model.import("f", item("a"), at(0), true);
+        model.import("f", item("c"), at(1), true);
+        assert_eq!(model.lookup_import("f"), Some(&item("c")));
+        assert_eq!(model.import_range("f").map(|range| range.start.line), Some(1));
+        model.import("f", item("d"), at(2), false);
+        assert_eq!(model.lookup_import("f"), Some(&item("c")));
+        assert_eq!(model.import_range("f").map(|range| range.start.line), Some(1));
+    }
+
+    /// GM-533 R3/R4: the module binding of a declared name, by statement
+    /// order.
+    #[test]
+    fn the_module_binding_is_the_later_statement() {
+        let def = decl("d", NodeKind::Function);
+        let binding = |imports: &[(u32, bool)], stars: &[u32]| {
+            let mut model = FileModel::default();
+            model.declare("", "f", "f", def.clone(), at(1).start);
+            for &(line, unconditional) in imports {
+                model.import("f", item("a"), at(line), unconditional);
+            }
+            for &line in stars {
+                model.star(at(line).start);
+            }
+            match model.module_binding("f", None) {
+                Some(ModuleBinding::Import(_)) => "import",
+                Some(ModuleBinding::Decl(_)) => "decl",
+                Some(ModuleBinding::DeclBeforeStar(_)) => "decl before star",
+                None => "none",
+            }
+        };
+        assert_eq!(binding(&[(2, true)], &[]), "import");
+        assert_eq!(binding(&[(0, true)], &[]), "decl");
+        assert_eq!(binding(&[(2, false)], &[]), "decl");
+        assert_eq!(binding(&[], &[2]), "decl before star");
+        assert_eq!(binding(&[], &[0]), "decl");
+        assert_eq!(binding(&[(2, true)], &[3]), "import");
+    }
+
     #[test]
     fn the_first_dunder_all_wins_and_carries_its_own_range() {
         let mut model = FileModel::default();
