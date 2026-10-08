@@ -582,13 +582,17 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
             let name_node = declarator.child_by_field_name("name");
             let value = declarator.child_by_field_name("value");
 
-            // Locals and destructuring patterns declare nothing.
+            // Locals and destructuring patterns declare nothing; a pattern's
+            // defaults and computed keys belong to the enclosing scope.
             let Some(name_node) =
                 name_node.filter(|name| !scope.inside_function && name.kind() == "identifier")
             else {
                 self.visit_field(declarator, "type", scope);
                 if let Some(value) = value {
                     self.visit(value, scope);
+                }
+                if let Some(pattern) = name_node {
+                    self.visit_binding_pattern(pattern, scope);
                 }
                 continue;
             };
