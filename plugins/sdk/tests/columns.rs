@@ -59,8 +59,8 @@ fn columns_file_range_ends_at_newlines_and_last_line_chars() {
 }
 
 #[test]
-fn columns_file_range_of_a_terminated_file_ends_on_the_empty_last_line() {
-    assert_eq!(CharColumns::new("ab\ncd\n").file_range().end, pos(2, 0));
+fn columns_file_range_of_a_terminated_file_ends_on_its_last_real_line() {
+    assert_eq!(CharColumns::new("ab\ncd\n").file_range().end, pos(1, 2));
 }
 
 #[test]
@@ -71,6 +71,48 @@ fn columns_file_range_of_an_empty_file_is_the_origin() {
 #[test]
 fn columns_carriage_return_is_an_ordinary_character() {
     let columns = CharColumns::new("ab\r\ncd\r");
-    assert_eq!(columns.file_range().end, pos(1, 3));
+    assert_eq!(columns.file_range().end, pos(1, 2));
     assert_eq!(columns.at(1, 2), pos(1, 2));
+}
+
+/// GM-527 rule (A): a whole-file range ends where the file's content ends -
+/// trailing whitespace trimmed, then `(newlines, chars of the last line)` -
+/// so its end line is always a real line of the file, never the empty one
+/// after a final newline. The design note's table, row for row.
+///
+/// Control: restore the old body of `CharColumns::file_range` (`(line_starts
+/// - 1, chars after the last '\n')`); every row ending in whitespace fails.
+#[test]
+fn columns_file_range_ends_where_the_content_ends() {
+    let cases: &[(&str, &str, Position)] = &[
+        ("empty", "", pos(0, 0)),
+        ("whitespace only", "\n \n", pos(0, 0)),
+        ("no final newline", "a\nbc", pos(1, 2)),
+        ("a final newline", "a\nbc\n", pos(1, 2)),
+        ("ends in two newlines", "a\nbc\n\n", pos(1, 2)),
+        ("CRLF", "a\r\nbc\r\n", pos(1, 2)),
+        ("trailing spaces", "a\nbc  \n", pos(1, 2)),
+        ("trailing tabs and form feeds", "a\nbc\t\x0b\x0c\n", pos(1, 2)),
+        ("chars, not bytes", "a\nbé😀\n", pos(1, 3)),
+    ];
+    for (what, source, end) in cases {
+        let range = CharColumns::new(source).file_range();
+        assert_eq!(range, Range { start: pos(0, 0), end: *end }, "{what}: {source:?}");
+    }
+}
+
+/// The edit `id-stability.whitespace-edit` makes - a space before the last
+/// newline - leaves the end where it was, with or without a final newline.
+///
+/// Control: make `content_end` stop trimming spaces (trim only `'\n'`); the
+/// spaced variant ends one column further and this fails.
+#[test]
+fn columns_file_range_is_unmoved_by_a_space_before_the_last_newline() {
+    for (plain, spaced) in [("a\nbc\n", "a\nbc \n"), ("a\nbc\nd", "a\nbc \nd")] {
+        assert_eq!(
+            CharColumns::new(plain).file_range(),
+            CharColumns::new(spaced).file_range(),
+            "{plain:?} vs {spaced:?}"
+        );
+    }
 }

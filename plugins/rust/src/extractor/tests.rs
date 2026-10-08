@@ -2124,3 +2124,32 @@ pub fn read_b(b: B) -> u8 { b.f }
         assert_eq!(field_sites(&graph, from, "f")[0].replaces.as_deref(), Some(edge.id.as_str()), "{from}");
     }
 }
+
+// --- the whole-file range (GM-527) ----------------------------------------------
+
+/// The `File` node ends where the file's content ends - trailing whitespace
+/// trimmed, then `(newlines, chars of the last line)` - never on the empty
+/// line after a final newline.
+///
+/// Control: restore the old body of `Positions::file_range` (emit.rs:
+/// `(split('\n').count() - 1, chars after the last '\n')`); every row ending
+/// in whitespace fails.
+#[test]
+fn the_file_node_ends_on_the_files_last_real_line() {
+    let cases: &[(&str, &str, (u32, u32))] = &[
+        ("empty", "", (0, 0)),
+        ("no final newline", "fn a() {}\nfn bc() {}", (1, 10)),
+        ("a final newline", "fn a() {}\nfn bc() {}\n", (1, 10)),
+        ("ends in two newlines", "fn a() {}\nfn bc() {}\n\n", (1, 10)),
+        ("trailing spaces", "fn a() {}\nfn bc() {}  \n", (1, 10)),
+        ("chars, not bytes", "fn a() {}\nconst E: &str = \"é😀\";\n", (1, 21)),
+    ];
+    for (what, source, (line, col)) in cases {
+        let krate = Crate::new(&[("src/lib.rs", source)]);
+        let graph = krate.extract("src/lib.rs");
+        let file = graph.node("src/lib.rs");
+        assert_eq!(file.kind, NodeKind::File, "{what}");
+        assert_eq!((file.range.start.line, file.range.start.col), (0, 0), "{what}: {source:?}");
+        assert_eq!((file.range.end.line, file.range.end.col), (*line, *col), "{what}: {source:?}");
+    }
+}

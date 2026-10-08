@@ -584,3 +584,29 @@ fn a_public_member_gets_no_exports_edge() {
     assert_eq!(exported, ["A", "I", "N", "N.E"]);
     assert_eq!(graph.node("A#m").visibility, Visibility::Public);
 }
+
+/// GM-527: the `File` node of a parsed file ends where the content ends, not
+/// at tree-sitter's root end `(lines, 0)` one past the last line. Columns are
+/// characters.
+///
+/// Control: in `TypeScriptExtractor::extract` (src/extractor/mod.rs), build
+/// the parsed file's model from the root node's range again; every row ending
+/// in a newline fails.
+#[test]
+fn a_parsed_files_node_ends_on_its_last_real_line() {
+    let cases: &[(&str, &str, (u32, u32))] = &[
+        ("empty", "", (0, 0)),
+        ("no final newline", "const a = 1;\nconst bc = 2;", (1, 13)),
+        ("a final newline", "const a = 1;\nconst bc = 2;\n", (1, 13)),
+        ("ends in two newlines", "const a = 1;\nconst bc = 2;\n\n", (1, 13)),
+        ("trailing spaces", "const a = 1;\nconst bc = 2;  \n", (1, 13)),
+        ("chars, not bytes", "const a = 1;\nconst é = '😀';\n", (1, 14)),
+    ];
+    for (what, source, (line, col)) in cases {
+        let graph = extract("src/m.ts", source);
+        let file = &graph.graph.nodes[0];
+        assert_eq!(file.kind, NodeKind::File, "{what}");
+        assert_eq!((file.range.start.line, file.range.start.col), (0, 0), "{what}: {source:?}");
+        assert_eq!((file.range.end.line, file.range.end.col), (*line, *col), "{what}: {source:?}");
+    }
+}

@@ -1679,3 +1679,36 @@ fn an_annotated_assignment_with_a_value_is_a_store() {
     let graph = tree.extract("pkg/mod.py");
     assert_eq!(graph.uses("C.typed"), vec!["References C.x[setter]"]);
 }
+
+// --- the whole-file range (GM-527) ----------------------------------------------
+
+/// The `File` node and the module's own `Module` declaration both end where
+/// the file's content ends - trailing whitespace trimmed, then `(newlines,
+/// chars of the last line)` - and so are equal. Never the empty line after a
+/// final newline, which is where a reader of the file runs out of lines.
+///
+/// Control: restore the old body of `Positions::file_range` (emit.rs:
+/// `(split('\n').count() - 1, chars after the last '\n')`); every row ending
+/// in whitespace fails, for the File and the Module alike.
+#[test]
+fn the_file_and_its_module_end_on_the_files_last_real_line() {
+    let cases: &[(&str, &str, (u32, u32))] = &[
+        ("empty", "", (0, 0)),
+        ("no final newline", "x = 1\nyz = 2", (1, 6)),
+        ("a final newline", "x = 1\nyz = 2\n", (1, 6)),
+        ("ends in two newlines", "x = 1\n\n", (0, 5)),
+        ("trailing spaces", "x = 1\nyz = 2  \n", (1, 6)),
+        ("chars, not bytes", "x = 1\ny = 'é😀'\n", (1, 8)),
+    ];
+    for (what, source, (line, col)) in cases {
+        let tree = tree(&[("pkg/mod.py", source)]);
+        let graph = tree.extract("pkg/mod.py");
+        let file = graph.node("pkg/mod.py");
+        let module = graph.node("pkg.mod");
+        assert_eq!(file.kind, NodeKind::File, "{what}");
+        assert_eq!(module.kind, NodeKind::Module, "{what}");
+        assert_eq!((file.range.start.line, file.range.start.col), (0, 0), "{what}: {source:?}");
+        assert_eq!((file.range.end.line, file.range.end.col), (*line, *col), "{what}: {source:?}");
+        assert_eq!(module.range, file.range, "{what}: the Module takes the File's range");
+    }
+}

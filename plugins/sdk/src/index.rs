@@ -31,7 +31,7 @@
 
 use std::collections::BTreeMap;
 
-use g_mesh_wire::{Position, WireNode};
+use g_mesh_wire::{NodeKind, Position, WireNode};
 
 use crate::graph::{FileGraph, OpenSite};
 use crate::path::RelPath;
@@ -150,17 +150,19 @@ impl SdkIndex {
     /// name, which is inside the symbol, which is inside the file's `File`
     /// node. Every one of those contains the position, and only the innermost
     /// is the answer. Ties - two nodes with exactly the same range, an
-    /// overload signature beside its implementation - are broken by id, so
-    /// the answer is at least stable rather than whichever the iteration
-    /// order produced.
+    /// overload signature beside its implementation - go to the node that is
+    /// not the `File` (since GM-527 a file holding one declaration and
+    /// nothing else ends where that declaration does, and the declaration is
+    /// the answer), then by id, so the answer is at least stable rather than
+    /// whichever the iteration order produced.
     pub fn node_at(&self, path: &RelPath, position: Position) -> Option<&WireNode> {
         let entry = self.files.get(path)?;
-        entry
-            .graph
-            .nodes
-            .iter()
-            .filter(|node| contains(node, position))
-            .min_by(|a, b| span(a).cmp(&span(b)).then_with(|| a.id.cmp(&b.id)))
+        entry.graph.nodes.iter().filter(|node| contains(node, position)).min_by(|a, b| {
+            span(a)
+                .cmp(&span(b))
+                .then_with(|| (a.kind == NodeKind::File).cmp(&(b.kind == NodeKind::File)))
+                .then_with(|| a.id.cmp(&b.id))
+        })
     }
 
     /// The node with this id, and the file it is in - what an engine uses to
@@ -221,6 +223,34 @@ mod tests {
         assert_eq!(index.node_at(&path, at(2, 5)).map(|n| n.name.as_str()), Some("inner"));
         assert_eq!(index.node_at(&path, at(4, 0)).map(|n| n.name.as_str()), Some("outer"));
         assert_eq!(index.node_at(&path, at(8, 0)).map(|n| n.name.as_str()), Some("a.toy"));
+    }
+
+    /// GM-527: a file holding one declaration and nothing else ends where
+    /// that declaration does, so the two spans tie; the declaration is the
+    /// answer, whichever id sorts first.
+    ///
+    /// Control: drop the `File` tie-break in `node_at` (ties by id only); the
+    /// arrangement where the `File`'s id sorts first answers with the `File`.
+    #[test]
+    fn node_at_a_file_loses_an_equal_span_tie_to_its_declaration() {
+        for (file_id, declaration_id) in [("a", "b"), ("b", "a")] {
+            let path = RelPath::new("one.toy");
+            let whole = range(at(0, 0), at(2, 1));
+            let mut builder = FileGraphBuilder::new("toy", "toy-parser", &path);
+            builder.file_node(whole);
+            builder.add_node(NodeSpec::new(NodeKind::Function, "target", "target", whole));
+            let mut graph = builder.finish();
+            for node in &mut graph.nodes {
+                node.id = if node.kind == NodeKind::File { file_id } else { declaration_id }.to_string();
+            }
+            let mut index = SdkIndex::new();
+            index.insert(path.clone(), "source".to_string(), graph);
+
+            for position in [at(0, 0), at(1, 3), at(2, 1)] {
+                let found = index.node_at(&path, position).expect("the position is in both nodes");
+                assert_eq!(found.kind, NodeKind::Function, "File id {file_id:?}, at {position:?}");
+            }
+        }
     }
 
     #[test]

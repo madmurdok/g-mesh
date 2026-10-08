@@ -10,10 +10,18 @@ func TestTextEndPositionCountsNewlinesAndTrailingBytes(t *testing.T) {
 		wantCol  int
 	}{
 		{"empty file", "", 0, 0},
-		{"ends with newline", "package main\n", 1, 0},
+		{"ends with newline", "package main\n", 0, len("package main")},
 		{"no trailing newline", "package main", 0, len("package main")},
-		{"multi-line, trailing newline", "a\nb\nc\n", 3, 0},
+		{"multi-line, trailing newline", "a\nb\nc\n", 2, 1},
 		{"multi-line, no trailing newline", "a\nb\nc", 2, 1},
+		// GM-527: the end is where the content ends, never the empty line
+		// after a final newline. Control: drop the TrimRight in
+		// textEndPosition; every row below ending in whitespace fails.
+		{"whitespace only", "\n \n", 0, 0},
+		{"ends in two newlines", "a\nbc\n\n", 1, 2},
+		{"CRLF", "a\r\nbc\r\n", 1, 2},
+		{"trailing spaces", "a\nbc  \n", 1, 2},
+		{"bytes, not chars", "a\nb\u00e9\n", 1, 3},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -27,7 +35,8 @@ func TestTextEndPositionCountsNewlinesAndTrailingBytes(t *testing.T) {
 
 // The design doc's own worked example (docs/architecture/
 // multi-language-plugins.md and core/tests/fixtures/valid_v2.ndjson): a
-// 10-line main.go ends its File node's range at (10, 0).
+// 10-line main.go. Its File node's range ends where its content does, at
+// the end of "// trailer" on line 8: (8, 10), not (10, 0).
 func TestComputeFileNodeMatchesTheDesignDocsWorkedExample(t *testing.T) {
 	content := []byte("package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n\n// trailer\n\n")
 	node := computeFileNode("main.go", content)
@@ -56,9 +65,9 @@ func TestComputeFileNodeMatchesTheDesignDocsWorkedExample(t *testing.T) {
 	if node.Range.Start != (wirePosition{0, 0}) {
 		t.Fatalf("range.start = %+v, want (0, 0)", node.Range.Start)
 	}
-	wantEndLine := 10
-	if node.Range.End.Line != wantEndLine || node.Range.End.Col != 0 {
-		t.Fatalf("range.end = %+v, want (%d, 0)", node.Range.End, wantEndLine)
+	wantEndLine, wantEndCol := 8, len("// trailer")
+	if node.Range.End.Line != wantEndLine || node.Range.End.Col != wantEndCol {
+		t.Fatalf("range.end = %+v, want (%d, %d)", node.Range.End, wantEndLine, wantEndCol)
 	}
 
 	// The design doc's own reference JSON serialization for a Go File

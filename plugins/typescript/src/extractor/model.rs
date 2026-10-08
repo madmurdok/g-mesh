@@ -249,7 +249,7 @@ pub struct FileModel {
 
 impl FileModel {
     /// A model holding only the `File` node: `name` the basename,
-    /// `qualifiedName` the path, `range` the whole parse.
+    /// `qualifiedName` the path, `range` the whole file (`CharColumns::file_range`).
     pub fn new(path: &str, range: Range) -> Self {
         let mut model = Self {
             path: path.to_string(),

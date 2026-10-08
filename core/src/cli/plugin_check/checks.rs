@@ -37,7 +37,11 @@
 //!   same node and edge id sets.
 //! - **`id-stability.whitespace-edit`** - the `fileChanged` answering a
 //!   whitespace-only edit (`session::whitespace_edit` has why that edit) is
-//!   empty in all four lists.
+//!   empty in all four lists, and the edited file's `File` node from bulk
+//!   run 1 ends on the line its content ends on (trailing whitespace
+//!   trimmed; the line only, since core does not know the plugin's column
+//!   unit). That end is the one the edit cannot move, and it is a real line
+//!   of the file rather than the empty one after a final newline.
 //! - **`id-stability.deletes-known`** - every `deleteNodeIds` entry names an id
 //!   the plugin had emitted before that diff (either bulk run, or an earlier
 //!   diff's `upsertNodes`). Judged on every answered diff, but only reported
@@ -685,6 +689,9 @@ fn whitespace_edit(run: &RunData) -> CheckResult {
         target.file_path
     );
     let mut findings = Vec::new();
+    if let Some(finding) = file_end_past_content(run.bulk[0], target) {
+        findings.push(finding);
+    }
     for node in &diff.upsert_nodes {
         let r = &node.range;
         findings.push(format!(
@@ -702,6 +709,39 @@ fn whitespace_edit(run: &RunData) -> CheckResult {
         findings.push(format!("{at}: deletes edge {id:?}"));
     }
     result(ID, verdict(findings))
+}
+
+/// The edited file's `File` node, from bulk run 1, when its end line is not
+/// the line the file's content ends on (`content_end_line`). Only the line is
+/// compared: core does not know the plugin's column unit, and the line is what
+/// makes the end a real line of the file rather than the empty one after a
+/// final newline. `None` too when bulk run 1 has no `File` node for the file.
+fn file_end_past_content(bulk: &BulkRun, target: &EditTarget) -> Option<String> {
+    let file = bulk.lines.iter().find_map(|line| match &line.item {
+        Ok(BulkItem::Node(node)) if node.kind == NodeKind::File && node.file_path == target.file_path => {
+            Some(node)
+        }
+        _ => None,
+    })?;
+    let expected = content_end_line(&target.original);
+    let end = &file.range.end;
+    (end.line as usize != expected).then(|| {
+        format!(
+            "bulk run 1: the File node {:?} of {:?} ends at {}:{}, but the file's content ends on line {expected} \
+             (0-based, trailing whitespace trimmed) - a whole-file range ends on its last real line",
+            file.id, target.file_path, end.line, end.col
+        )
+    })
+}
+
+/// The 0-based line `bytes` ends on once its trailing whitespace (`' '`,
+/// `\t`, `\r`, `\n`, `\v`, `\f`) is trimmed: the end line every plugin's
+/// whole-file range carries (`CharColumns::file_range` in the SDK). 0 for an
+/// empty or whitespace-only file.
+fn content_end_line(bytes: &[u8]) -> usize {
+    let content =
+        bytes.iter().rposition(|byte| !b" \t\r\n\x0b\x0c".contains(byte)).map_or(0, |last| last + 1);
+    bytes[..content].iter().filter(|byte| **byte == b'\n').count()
 }
 
 fn deletes_known(run: &RunData, walk: &DiffWalk) -> CheckResult {
