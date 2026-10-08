@@ -33,6 +33,8 @@ use g_mesh::storage::connection::project_dir;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// Not generous, and that is the point. Once the shim is gone, EOF is either
@@ -64,6 +66,7 @@ fn a_daemon_the_shim_leaves_behind_does_not_hold_the_client_s_pipe() {
     // Piped stdout is what a real MCP client gives it, and is the handle whose
     // fate this test is about.
     let mut shim = Command::new(BIN)
+        .lifeline()
         .arg("mcp-shim")
         .current_dir(project.path())
         .env_remove(g_mesh::shim::PROJECT_DIR_ENV)

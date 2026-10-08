@@ -102,11 +102,11 @@ use tree_sitter::Node;
 
 use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::ModuleCtx;
-use crate::extractor::model::{FileModel, Import};
+use crate::extractor::model::{DeclRef, FileModel, Import};
 use crate::extractor::scope::{dotted_path, FrameKind, Scopes};
 use crate::extractor::syntax::{
     decorators, definition_name, dotted_segments, first_parameter_name, has_decorator, inner_definition,
-    looks_like_class, text,
+    looks_like_class, property_accessor, text, Accessor,
 };
 
 /// The decorator that says a `def` inside a class body has no instance
@@ -123,6 +123,24 @@ struct Instance {
     /// The dotted path of the class that declares the method - `Greeter`, or
     /// `Outer.Inner` for a method of a nested class.
     class_path: String,
+}
+
+/// How an attribute use touches the member it names - which of a property's
+/// accessors it runs. Only an instance-parameter use (`self.x`) of a property
+/// this file declares a setter/deleter for is routed by it; every other use
+/// resolves exactly as a load does. See
+/// `docs/architecture/gm-511-python-property-accessors.md` section 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// A read: `self.x`. The getter.
+    Load,
+    /// The outermost target of an assignment: `self.x = v`. The setter.
+    Store,
+    /// A `del` target: `del self.x`. The deleter.
+    Delete,
+    /// An augmented assignment's target: `self.x += v` reads, then writes.
+    /// The getter and the setter.
+    Augmented,
 }
 
 /// What a use site turned out to name.
@@ -247,8 +265,15 @@ impl<'a, 's> Bodies<'a, 's> {
             "global_statement" | "nonlocal_statement" => {}
             "comment" => {}
             "call" => self.call(node, from),
-            "attribute" => self.attribute(node, from, false),
+            "attribute" => self.attribute(node, from, false, Access::Load),
             "identifier" => self.bare(node, from, false),
+            "delete_statement" => {
+                let mut cursor = node.walk();
+                let targets: Vec<Node> = node.named_children(&mut cursor).collect();
+                for target in targets {
+                    self.delete_target(target, from);
+                }
+            }
             "assignment" | "augmented_assignment" => self.assignment(node, from),
             "named_expression" => {
                 if let Some(value) = node.child_by_field_name("value") {
@@ -277,11 +302,19 @@ impl<'a, 's> Bodies<'a, 's> {
     fn function(&mut self, outer: Node, inner: Node, from: &str) {
         let Some(name) = definition_name(inner, self.source).map(str::to_string) else { return };
         let qualified = self.scopes.child_path(&name);
-        let id = self
-            .model
-            .lookup_qualified(&qualified)
-            .map(|decl| decl.id.clone())
-            .unwrap_or_else(|| from.to_string());
+        // A property's setter/deleter is its own node, found in the accessor
+        // table rather than under the qualified name it shares with the
+        // getter - the same recognition `super::decls` declared it by.
+        let accessor = if self.scopes.kind() == FrameKind::Class {
+            property_accessor(outer, &name, self.source)
+        } else {
+            None
+        };
+        let own = match accessor {
+            Some(accessor) => self.model.accessor(&qualified, accessor),
+            None => self.model.lookup_qualified(&qualified),
+        };
+        let id = own.map(|decl| decl.id.clone()).unwrap_or_else(|| from.to_string());
 
         // Decorators and the signature's own expressions - annotations and
         // default values - are evaluated in the *enclosing* scope, before
@@ -469,22 +502,50 @@ impl<'a, 's> Bodies<'a, 's> {
                 }
             }
         }
+        // An annotation with no value (`self.x: int`) stores nothing.
+        let access = if node.kind() == "augmented_assignment" {
+            Access::Augmented
+        } else if node.child_by_field_name("right").is_some() {
+            Access::Store
+        } else {
+            Access::Load
+        };
         if let Some(left) = node.child_by_field_name("left") {
-            self.visit_target(left, from);
+            self.visit_target(left, from, access);
         }
     }
 
-    fn visit_target(&mut self, target: Node, from: &str) {
+    /// One assignment target. `access` applies to an attribute that *is* the
+    /// target; its object (`self.x` in `self.x.y = v`) is an ordinary load.
+    fn visit_target(&mut self, target: Node, from: &str, access: Access) {
         match target.kind() {
             "identifier" => {}
-            "attribute" | "subscript" => self.visit(target, from),
+            "attribute" => self.attribute(target, from, false, access),
+            "subscript" => self.visit(target, from),
             _ => {
                 let mut cursor = target.walk();
                 let children: Vec<Node> = target.named_children(&mut cursor).collect();
                 for child in children {
-                    self.visit_target(child, from);
+                    self.visit_target(child, from, access);
                 }
             }
+        }
+    }
+
+    /// One `del` target. `del a.x, b.y` is a `delete_statement` over an
+    /// `expression_list`; a parenthesised or bracketed target list nests the
+    /// same way. Anything but an attribute is walked as it always was.
+    fn delete_target(&mut self, target: Node, from: &str) {
+        match target.kind() {
+            "attribute" => self.attribute(target, from, false, Access::Delete),
+            "expression_list" | "tuple" | "list" | "parenthesized_expression" => {
+                let mut cursor = target.walk();
+                let children: Vec<Node> = target.named_children(&mut cursor).collect();
+                for child in children {
+                    self.delete_target(child, from);
+                }
+            }
+            _ => self.visit(target, from),
         }
     }
 
@@ -551,7 +612,7 @@ impl<'a, 's> Bodies<'a, 's> {
         };
         match function.kind() {
             "identifier" => self.bare(function, from, true),
-            "attribute" => self.attribute(function, from, true),
+            "attribute" => self.attribute(function, from, true, Access::Load),
             // Calling something that is not a name at all - `(f)()`,
             // `handlers[key]()`, `factory()()`. The callee is an expression;
             // walking it is the honest answer.
@@ -584,7 +645,11 @@ impl<'a, 's> Bodies<'a, 's> {
 
     /// A dotted name - `mod.helper`, `Cls.method`, `self.render`,
     /// `obj.method`.
-    fn attribute(&mut self, node: Node, from: &str, is_call: bool) {
+    ///
+    /// `access` says whether this use reads, writes or deletes the member; it
+    /// only matters for an instance-parameter use of a property with a
+    /// setter/deleter ([`Bodies::routed_accessor`]).
+    fn attribute(&mut self, node: Node, from: &str, is_call: bool, access: Access) {
         let Some(segments) = dotted_segments(node, self.source) else {
             // Not a chain of plain names: `factory().run`, `rows[0].run`. The
             // object is still real code, and a call on it is a receiver call
@@ -602,7 +667,46 @@ impl<'a, 's> Bodies<'a, 's> {
         let at = node.child_by_field_name("attribute").unwrap_or(node);
         match bound {
             Bound::Receiver => self.walk_receiver(node, from, is_call),
+            Bound::Here(getter, kind) => match (self.routed_accessor(&segments, access), access) {
+                // Read, then write: the getter and the setter.
+                (Some(setter), Access::Augmented) => {
+                    self.emit(Bound::Here(getter, kind), from, node, is_call, at);
+                    self.emit(Bound::Here(setter.id, setter.kind), from, node, is_call, at);
+                }
+                (Some(routed), _) => self.emit(Bound::Here(routed.id, routed.kind), from, node, is_call, at),
+                (None, _) => self.emit(Bound::Here(getter, kind), from, node, is_call, at),
+            },
             other => self.emit(other, from, node, is_call, at),
+        }
+    }
+
+    /// The setter (a store, an augmented assignment) or deleter (a `del`)
+    /// `segments` runs, when it is an instance-parameter use (`self.x`) of a
+    /// property this file declares that accessor for. `None` for a load, for
+    /// any other dotted name - `C.x = v` on the class replaces the
+    /// descriptor rather than calling its setter - and for a property
+    /// without that accessor, whose store keeps referencing the getter.
+    fn routed_accessor(&self, segments: &[&str], access: Access) -> Option<DeclRef> {
+        let accessor = match access {
+            Access::Load => return None,
+            Access::Store | Access::Augmented => Accessor::Setter,
+            Access::Delete => Accessor::Deleter,
+        };
+        let qualified = self.instance_member(segments)?;
+        self.model.accessor(&qualified, accessor).cloned()
+    }
+
+    /// The qualified name `self.member` (whatever the first parameter is
+    /// really called) addresses in the enclosing method's class - see the
+    /// module doc, Decision 7. `None` for anything that is not exactly the
+    /// instance parameter and one member.
+    fn instance_member(&self, segments: &[&str]) -> Option<String> {
+        let instance = self.instance.as_ref()?;
+        match segments {
+            [head, member] if *head == instance.parameter => {
+                Some(format!("{}.{member}", instance.class_path))
+            }
+            _ => None,
         }
     }
 
@@ -682,17 +786,14 @@ impl<'a, 's> Bodies<'a, 's> {
         }
         // `self.member` (whatever the first parameter is really called) -
         // see the module doc, Decision 7.
-        if let Some(instance) = &self.instance {
-            if head.len() == 1 && head[0] == instance.parameter {
-                let qualified = format!("{}.{last}", instance.class_path);
-                return match self.model.lookup_qualified(&qualified) {
-                    Some(decl) => Bound::Here(decl.id.clone(), decl.kind),
-                    // Inherited from a base class, or an attribute rather
-                    // than a method: not something this file declares, so
-                    // not something this tier may name.
-                    None => Bound::Receiver,
-                };
-            }
+        if let Some(qualified) = self.instance_member(segments) {
+            return match self.model.lookup_qualified(&qualified) {
+                Some(decl) => Bound::Here(decl.id.clone(), decl.kind),
+                // Inherited from a base class, or an attribute rather
+                // than a method: not something this file declares, so
+                // not something this tier may name.
+                None => Bound::Receiver,
+            };
         }
         match self.resolve_qualifier(head) {
             Qualifier::Container(container) => {

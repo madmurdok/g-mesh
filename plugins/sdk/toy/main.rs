@@ -50,8 +50,8 @@ use g_mesh_plugin_sdk::wire::{
     TargetScope,
 };
 use g_mesh_plugin_sdk::{
-    run, Extractor, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, OpenSiteKind, PlaceholderKind,
-    PluginSpec, RelPath, SdkIndex, SemanticAnswer, SemanticEngine,
+    run, CharColumns, Extractor, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, OpenSiteKind,
+    PlaceholderKind, PluginSpec, RelPath, SdkIndex, SemanticAnswer, SemanticEngine,
 };
 
 const LANGUAGE: &str = "toy";
@@ -93,15 +93,13 @@ impl Extractor for ToyExtractor {
         let mut graph = FileGraphBuilder::new(LANGUAGE, ENGINE, path);
         let lines: Vec<&str> = source.split('\n').collect();
 
-        // The file's range ends at (number of newlines, length of the final
-        // unterminated line). Getting this wrong is the single easiest way to
-        // fail `id-stability.whitespace-edit`: an end of `(lines, 0)` moves
-        // when a space is inserted before the last newline, and this does not.
-        let file_end = Position {
-            line: (lines.len() - 1) as u32,
-            col: lines.last().map_or(0, |line| line.chars().count()) as u32,
-        };
-        let file = graph.file_node(Range { start: Position { line: 0, col: 0 }, end: file_end });
+        // The file's range ends where its content ends: trailing whitespace
+        // trimmed, then (number of newlines, length of the last line) - the
+        // file's last real line. Getting this wrong is the single easiest way
+        // to fail `id-stability.whitespace-edit`: an end of `(lines, 0)` is
+        // past the last line, and a byte count moves when a space is inserted
+        // before the last newline. `CharColumns::file_range` does neither.
+        let file = graph.file_node(CharColumns::new(source).file_range());
 
         // Collected over the whole file first: a call may name a function
         // declared further down, and a plugin that only knew what it had

@@ -38,7 +38,7 @@ protocol_version = 2
 # (plugins/go, plugins/typescript) tracks its own manifest of record
 # instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
 # rules, not one".
-plugin_version = "4.0.0"
+plugin_version = "4.1.0"
 
 [plugin.spawn]
 command = "${G_MESH_BIN_DIR}/g-mesh-plugin-python"
@@ -81,6 +81,9 @@ semantic_sweep = true
 # every call site; the gap list is the promise.
 receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
+# A method overrides or implements the same-named member of a supertype, so
+# core derives `find_callers`' `overrides` field from the type edges.
+member_overrides = "by_name"
 # The project model answers "is `pkg.mod` one of ours" and decides the `src/`
 # root from the set of files the walk listed, so every created file of one
 # watcher batch must be in it before the first of them is extracted - an
@@ -187,6 +190,13 @@ implementation_kinds = []
 # into this same section at factory time.
 [plugin.semantic.settings.python.analysis]
 typeCheckingMode = "basic"
+
+[plugin.reexports]
+# Each import statement rebinds the name: in one module, the later of a named
+# import and a star import that provides the name binds it, so core's linker
+# follows the later one (docs/architecture/gm-496-python-later-import-binds.md).
+# Not `named_shadows_glob`, which is the opposite (Rust/ES modules) answer.
+later_import_binds = true
 
 [plugin.workspace]
 # Any of these moving can move where this project's roots are (`pyproject.toml`

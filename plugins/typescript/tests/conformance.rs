@@ -34,7 +34,7 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml");
 
 /// Every check `g-mesh plugins check` reports outside `expectations.*`.
-const ALL_CHECKS: [&str; 15] = [
+const ALL_CHECKS: [&str; 16] = [
     "session",
     "shape",
     "stream-order",
@@ -50,6 +50,7 @@ const ALL_CHECKS: [&str; 15] = [
     "ownership.diff-stays-in-file",
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
+    "capabilities.files-created-resolves",
 ];
 
 /// Exactly one of the two applies to a given manifest; the other reports
@@ -64,8 +65,13 @@ const CAPABILITY_CHECKS: [&str; 2] =
 const EXPECTATIONS: usize = 35;
 const SEMANTIC_EXPECTATIONS: usize = 7;
 
+/// GM-516's check: `PASS` only for a manifest declaring `files_created`
+/// run with an `--expect` file naming a `[files_created]` pair, `SKIP`
+/// otherwise.
+const FILES_CREATED: &str = "capabilities.files-created-resolves";
+
 fn always_pass() -> Vec<&'static str> {
-    ALL_CHECKS.iter().copied().filter(|id| !CAPABILITY_CHECKS.contains(id)).collect()
+    ALL_CHECKS.iter().copied().filter(|id| !CAPABILITY_CHECKS.contains(id) && *id != FILES_CREATED).collect()
 }
 
 /// `plugin.toml`'s query tables (`non_symbol_queries`,
@@ -99,6 +105,8 @@ fn base() -> PluginCheck {
     .exclude_dirs(&EXCLUDE_DIRS)
     .watch_files(&WATCH_FILES)
     .entry_points(&["index"])
+    // The shipped manifest declares it (GM-516).
+    .files_created(true)
 }
 
 /// The shipped configuration, with a real vtsls.
@@ -193,7 +201,12 @@ fn verdicts_of(judged: &[(&str, Verdict)], want: Verdict) -> usize {
 
 /// The same fifteen checks for every configuration, with exactly one
 /// capability check skipping: the one that does not match the manifest.
-fn assert_report_shape(outcome: &CheckOutcome, applicable: &str, not_applicable: &str) {
+fn assert_report_shape(
+    outcome: &CheckOutcome,
+    applicable: &str,
+    not_applicable: &str,
+    files_created: Verdict,
+) {
     let mut reported: Vec<&str> = outcome.outcomes.keys().map(String::as_str).collect();
     reported.retain(|id| !id.starts_with("expectations."));
     reported.sort_unstable();
@@ -213,6 +226,12 @@ fn assert_report_shape(outcome: &CheckOutcome, applicable: &str, not_applicable:
         outcome.verdict(not_applicable),
         Some(Verdict::Skip),
         "{not_applicable} does not apply to this manifest:\n{}",
+        outcome.stdout
+    );
+    assert_eq!(
+        outcome.verdict(FILES_CREATED),
+        Some(files_created),
+        "{FILES_CREATED} must be {files_created:?} for this configuration:\n{}",
         outcome.stdout
     );
 }
@@ -249,6 +268,7 @@ fn the_linked_index_answers_every_expectation_with_vtsls() {
         &outcome,
         "capabilities.semantic-engine-lazy",
         "capabilities.semantic-pass-undeclared",
+        Verdict::Pass,
     );
 
     let judged = expectation_verdicts(&outcome);
@@ -270,6 +290,7 @@ fn without_a_semantic_tier_the_structural_expectations_still_hold() {
         &outcome,
         "capabilities.semantic-pass-undeclared",
         "capabilities.semantic-engine-lazy",
+        Verdict::Pass,
     );
 
     let judged = expectation_verdicts(&outcome);

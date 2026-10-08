@@ -20,6 +20,8 @@ use tokio::process::Command;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// Name plus the parameters a caller must supply - the half of each schema a
@@ -105,6 +107,7 @@ async fn a_real_mcp_client_discovers_and_calls_the_tool_surface_through_the_shim
     // Same spawn shape the MCP client of a real editor uses: the project
     // directory as cwd is the shim's entire notion of project identity.
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+        cmd.lifeline();
         // `kill_on_drop`, because a shim that outlives the test wedges the
         // whole process on Windows (GM-249 - see `common::kill_and_wait`).
         cmd.kill_on_drop(true).arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);

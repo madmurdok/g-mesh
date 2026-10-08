@@ -17,6 +17,7 @@ pub(crate) enum HintKey {
     SearchHits,
     UnresolvedRow,
     SemanticTier,
+    Overrides,
 }
 
 /// The once-per-session sentences already sent on one connection. Clones
@@ -84,6 +85,13 @@ pub(crate) const UNRESOLVED_ROW: &str =
 pub(crate) const PROVENANCE: &str =
     "`provenance`: this language's semantic pass has not finished, so method calls through a variable \
      receiver may be missing here; ask again later or grep for them.";
+
+/// Explains `mcp::overrides`' field, which replaces the instructions'
+/// sentence on override caller pages (ADR 0022, statement 9).
+pub(crate) const OVERRIDES: &str =
+    "`overrides` names the base members this method overrides or implements. A call through a \
+     receiver typed as the base binds to the base member, so it is on that member's caller page, \
+     not this one: ask find_callers for each `id`.";
 
 pub(crate) const AMBIGUOUS: &str =
     "Several declarations have this name: re-query with the right candidate's `id` as `symbol_id`, \
@@ -240,5 +248,13 @@ mod tests {
             assert!(sentence.len() <= 200, "{} B: {sentence}", sentence.len());
         }
         assert_eq!(truncated_by("somethingElse"), None);
+    }
+
+    /// `OVERRIDES` is two sentences (what the field is, what to do with it),
+    /// with the design's own budget of 226 bytes.
+    #[test]
+    fn the_overrides_sentence_stays_within_its_budget() {
+        assert!(OVERRIDES.len() <= 226, "{} B: {OVERRIDES}", OVERRIDES.len());
+        assert!(OVERRIDES.contains("find_callers") && OVERRIDES.contains("`id`"), "{OVERRIDES}");
     }
 }

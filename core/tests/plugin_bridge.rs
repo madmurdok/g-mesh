@@ -19,6 +19,8 @@ use rusqlite::Connection;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 struct Project {
@@ -45,6 +47,7 @@ impl Drop for Project {
 
 fn spawn_daemon(root: &Path) -> Child {
     Command::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(root)
@@ -96,6 +99,7 @@ fn an_edit_made_while_the_cold_start_walk_is_finishing_is_not_lost() {
     fs::write(&hold, b"").expect("failed to plant the walk-hold file");
 
     let mut daemon = Command::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(project.root())

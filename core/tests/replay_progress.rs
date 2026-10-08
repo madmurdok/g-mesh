@@ -42,6 +42,8 @@ use tokio::process::Command;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// Two independent TS files: `alpha.ts` is the one edited while the plugin
@@ -87,11 +89,6 @@ const FIXTURE_AGE: Duration = Duration::from_secs(3_600);
 
 /// What `bulk_index` logs when a walked file got no staleness baseline.
 const NO_BASELINE_LINE: &str = "got no staleness baseline";
-
-/// The prefixes the plugins put on their stderr lines. The plugins share the
-/// daemon log with the daemon, and a daemon `eprintln!` is several `write`s,
-/// so a plugin line can land in the middle of a daemon trace line.
-const PLUGIN_LINE_TAGS: [&str; 4] = ["[typescript] ", "[rust] ", "[python] ", "[g-mesh-go] "];
 
 struct Project {
     dir: tempfile::TempDir,
@@ -179,6 +176,7 @@ impl Project {
         let root = self.root().to_path_buf();
         let (log, hold) = (self.log(), self.hold());
         let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+            cmd.lifeline();
             cmd.kill_on_drop(true)
                 .arg("mcp-shim")
                 .current_dir(&root)
@@ -248,35 +246,42 @@ impl ClientHandler for ProgressRecorder {
     }
 }
 
-/// The `replay: tool=get_file_outline` trace lines of `log`, with any plugin
-/// line that landed inside one (see [`PLUGIN_LINE_TAGS`]) cut back out.
+/// How `trace_call` starts the replay line of a `get_file_outline` call.
+const REPLAY_TRACE_PREFIX: &str = "g-mesh daemon: replay: tool=get_file_outline ";
+
+/// The *complete* `get_file_outline` replay trace lines of `log`, without
+/// their newline. The daemon writes each log line, newline included, in one
+/// `write(2)` (`log_line!`), so a line counts only once its newline is there:
+/// a read that lands while a line is still being written must not see a
+/// truncated one, whatever the platform makes of a concurrent read and write.
 fn replay_trace_lines(log: &str) -> Vec<String> {
-    let mut daemon_only = log.to_string();
-    for tag in PLUGIN_LINE_TAGS {
-        while let Some(start) = daemon_only.find(tag) {
-            let end = daemon_only[start..].find('\n').map_or(daemon_only.len(), |at| start + at + 1);
-            daemon_only.replace_range(start..end, "");
-        }
-    }
-    daemon_only
-        .lines()
-        .filter(|line| line.contains("replay: tool=get_file_outline"))
+    log.split_inclusive('\n')
+        .filter_map(|line| line.strip_suffix('\n'))
+        .filter(|line| line.starts_with(REPLAY_TRACE_PREFIX))
         .map(str::to_string)
         .collect()
 }
 
-/// The interleaving seen in a real failing run: the plugin's exit line written
-/// between two `write`s of the daemon's replay trace line.
-#[test]
-fn a_plugin_line_inside_a_replay_trace_line_is_cut_back_out() {
-    let log = "g-mesh daemon: replay: tool=get_file_outline request=1 summary=typescript (1 file) \
-               replayed=1 elapsed_ms=[typescript] core closed the control stream - exiting (semantic \
-               engine started: true)\n1987 progress_sent=9\ng-mesh daemon: prepare: done\n";
-    assert_eq!(
-        replay_trace_lines(log),
-        ["g-mesh daemon: replay: tool=get_file_outline request=1 summary=typescript (1 file) replayed=1 \
-          elapsed_ms=1987 progress_sent=9"]
-    );
+/// The value of `key` in a replay trace line: what follows `key=` up to the
+/// next field, `next` (the line's last field has none). The daemon writes the
+/// fields in a fixed order, and `summary` holds spaces, so a field ends where
+/// the next one's ` next=` begins, not at a space.
+fn trace_field<'a>(line: &'a str, key: &str, next: Option<&str>) -> &'a str {
+    let start = line
+        .find(&format!(" {key}="))
+        .unwrap_or_else(|| panic!("the trace line has no `{key}` field: {line}"))
+        + key.len()
+        + 2;
+    let rest = &line[start..];
+    match next {
+        Some(next) => {
+            let end = rest
+                .find(&format!(" {next}="))
+                .unwrap_or_else(|| panic!("the trace line has no `{next}` field after `{key}`: {line}"));
+            &rest[..end]
+        }
+        None => rest,
+    }
 }
 
 fn outline_request(file: &str) -> CallToolRequestParams {
@@ -362,21 +367,30 @@ async fn a_held_replay_with_a_token_gets_a_heartbeat_then_the_full_answer() {
         assert_eq!(notification.total, None, "no total is sent, matching the other progress tickers");
     }
 
-    project.wait_for("the replay's trace line to appear", || {
-        project.log_text().contains("replay: tool=get_file_outline")
+    // Wait for the whole, newline-terminated line, never for its prefix
+    // alone: parsing a line that is still being written reads a field cut
+    // short (GM-525).
+    project.wait_for("the replay's complete trace line to appear", || {
+        !replay_trace_lines(&project.log_text()).is_empty()
     });
     let log = project.log_text();
     let replay_lines = replay_trace_lines(&log);
     assert_eq!(replay_lines.len(), 1, "one tool call, one replay:\n{log}");
-    assert!(
-        replay_lines[0].contains("replayed=1") && replay_lines[0].contains("summary=typescript (1 file)"),
-        "the trace must record what was replayed and for which language: {}",
-        replay_lines[0]
+    let line = &replay_lines[0];
+    assert_eq!(
+        trace_field(line, "summary", Some("replayed")),
+        "typescript (1 file)",
+        "the trace must record which language's queue was replayed: {line}"
     );
-    assert!(
-        replay_lines[0].contains(&format!("progress_sent={}", seen.len())),
-        "the trace must record how many notifications the replay itself sent: {}",
-        replay_lines[0]
+    assert_eq!(
+        trace_field(line, "replayed", Some("elapsed_ms")),
+        "1",
+        "the trace must record how many files were replayed: {line}"
+    );
+    assert_eq!(
+        trace_field(line, "progress_sent", None),
+        seen.len().to_string(),
+        "the trace must record how many notifications the replay itself sent: {line}"
     );
 
     client.cancel().await.expect("failed to shut the client down");

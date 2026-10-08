@@ -131,12 +131,12 @@ impl ResolvedSpec {
         let manifest = match read_manifest(&path) {
             Ok(manifest) => manifest,
             Err(err) => {
-                eprintln!("[{}] ignoring {}: {err:#}", spec.language, path.display());
+                crate::log_line!("[{}] ignoring {}: {err:#}", spec.language, path.display());
                 return resolved;
             }
         };
         if manifest.plugin.language != spec.language {
-            eprintln!(
+            crate::log_line!(
                 "[{}] ignoring {}: it declares language {:?}, not this plugin's",
                 spec.language,
                 path.display(),

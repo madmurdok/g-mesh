@@ -99,18 +99,52 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         (scope.enclosing_symbol_id != self.model.file_id()).then(|| scope.enclosing_symbol_id.clone())
     }
 
-    /// A parameter list's types and default values; the binding patterns
+    /// A parameter list's types and default values, including the defaults
+    /// and computed keys nested in destructuring patterns; the binding names
     /// themselves are bindings, not uses.
     pub(super) fn visit_parameters(&mut self, node: Node<'t>, scope: &Scope) {
         for parameter in named_children(node) {
             match parameter.kind() {
                 "required_parameter" | "optional_parameter" => {
                     self.visit_field(parameter, "type", scope);
+                    if let Some(pattern) = parameter.child_by_field_name("pattern") {
+                        self.visit_binding_pattern(pattern, scope);
+                    }
                     self.visit_field(parameter, "value", scope);
                 }
-                "assignment_pattern" => self.visit_field(parameter, "right", scope),
-                _ => {}
+                // The JavaScript grammar writes parameters as bare patterns.
+                _ => self.visit_binding_pattern(parameter, scope),
             }
+        }
+    }
+
+    /// The expressions inside a binding pattern: default values
+    /// (`{ y = d() }`, `[y = d()]`, `y = d`) and computed keys
+    /// (`{ [k]: y }`). The names it binds are skipped.
+    fn visit_binding_pattern(&mut self, node: Node<'t>, scope: &Scope) {
+        match node.kind() {
+            "assignment_pattern" | "object_assignment_pattern" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    self.visit_binding_pattern(left, scope);
+                }
+                self.visit_field(node, "right", scope);
+            }
+            "pair_pattern" => {
+                if let Some(key) = node.child_by_field_name("key") {
+                    if key.kind() == "computed_property_name" {
+                        self.visit(key, scope);
+                    }
+                }
+                if let Some(value) = node.child_by_field_name("value") {
+                    self.visit_binding_pattern(value, scope);
+                }
+            }
+            "object_pattern" | "array_pattern" | "rest_pattern" => {
+                for child in named_children(node) {
+                    self.visit_binding_pattern(child, scope);
+                }
+            }
+            _ => {}
         }
     }
 

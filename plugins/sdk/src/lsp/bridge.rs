@@ -191,7 +191,11 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// - **Every open site** except [`OpenSiteKind::Implementation`] gets
 ///   `textDocument/definition` at the site's own position (an
 ///   [`OpenSiteKind::OverloadCall`] only when its target is overloaded, and
-///   perhaps a `hover` hop - see "Overload binding" below). The location that
+///   perhaps a `hover` hop - see "Overload binding" below, and a re-export
+///   hop only while unsettled - see "Re-export hops"). A typed
+///   [`OpenSiteKind::ReceiverField`] site (`x.f` with `replaces`) follows the
+///   same retraction rules as a typed [`OpenSiteKind::ReceiverCall`]. The
+///   location that
 ///   comes back is mapped through [`SdkIndex::node_at`] to the node the
 ///   structural tier already emitted for that declaration, and the answer is
 ///   recorded the way every cross-file answer in this design is recorded: a
@@ -307,6 +311,10 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// lands elsewhere contradicts the structural edge, an empty or ambiguous one
 /// upholds it (R1). The design is
 /// `docs/architecture/gm-325-typescript-lsp-semantics.md`, section 4.3.
+///
+/// A [`OpenSiteKind::ReceiverField`] site with `replaces` is not a hop: it is
+/// always asked, like a typed `ReceiverCall`
+/// (`docs/architecture/gm-497-field-reference-sites.md`).
 ///
 /// # Readiness (decision 4)
 ///
@@ -608,7 +616,7 @@ impl LspBridge {
             };
             if attempts >= MAX_OWED_ATTEMPTS {
                 self.owed.remove(file);
-                eprintln!(
+                crate::log_line!(
                     "[{}] {file}: {attempts} semantic pass(es) did not finish it - no longer re-asked until it \
                      changes",
                     self.language
@@ -632,7 +640,7 @@ impl LspBridge {
     /// be one.
     fn ensure_client(&mut self, deadline: Instant) -> Option<&mut LspClient> {
         if self.client.as_mut().is_some_and(LspClient::gone) {
-            eprintln!("[{}] the language server is gone - starting a new one", self.language);
+            crate::log_line!("[{}] the language server is gone - starting a new one", self.language);
             self.client = None;
         }
         if self.client.is_none() {
@@ -656,7 +664,7 @@ impl LspBridge {
                     ));
                     if missing_binary(&err) {
                         self.unavailable = true;
-                        eprintln!(
+                        crate::log_line!(
                             "[{}] the language server {} could not be started ({err:#}) - this \
                              language's semantic tier is off for the rest of this process's life; \
                              the structural graph is unaffected",
@@ -664,7 +672,7 @@ impl LspBridge {
                             self.config.command.display()
                         );
                     } else {
-                        eprintln!(
+                        crate::log_line!(
                             "[{}] the language server did not come up ({err:#}) - this pass is \
                              incomplete and the next one will try again",
                             self.language
@@ -775,7 +783,7 @@ impl LspBridge {
             let now = Instant::now();
             if now >= until {
                 let waited = now.saturating_duration_since(started);
-                eprintln!(
+                crate::log_line!(
                     "[{language}] the language server was still indexing after {waited:?} - this pass asks \
                      nothing rather than recording its empty answers as real"
                 );
@@ -980,7 +988,9 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
                     }
                     Ask::Definition(site.clone())
                 }
-                OpenSiteKind::ReceiverCall | OpenSiteKind::Reference => Ask::Definition(site.clone()),
+                OpenSiteKind::ReceiverCall | OpenSiteKind::ReceiverField | OpenSiteKind::Reference => {
+                    Ask::Definition(site.clone())
+                }
             };
             for_file.push(Question { file: path.clone(), position: site.position, ask });
         }
@@ -2202,7 +2212,7 @@ fn run_pass(
         };
         if warming && !warm_up_logged && !queue.is_empty() {
             warm_up_logged = true;
-            eprintln!(
+            crate::log_line!(
                 "[{language}] the server has not answered yet - its first question may take up to {request_budget:?} \
                  (warm-up), the rest {:?}",
                 budgets.request
@@ -2230,11 +2240,13 @@ fn run_pass(
                     // not a failure to write.
                     match client.exit_status(EXIT_GRACE) {
                         Some(status) => {
-                            eprintln!("[{language}] the language server exited during the pass ({status})");
+                            crate::log_line!(
+                                "[{language}] the language server exited during the pass ({status})"
+                            );
                             fail(exited(Some(status)));
                         }
                         None => {
-                            eprintln!("[{language}] could not ask the language server ({err:#})");
+                            crate::log_line!("[{language}] could not ask the language server ({err:#})");
                             fail(format!("could not ask the language server: {err:#}"));
                         }
                     }
@@ -2249,7 +2261,7 @@ fn run_pass(
 
         let now = Instant::now();
         if now >= deadline {
-            eprintln!(
+            crate::log_line!(
                 "[{language}] the semantic pass ran out of its budget with {} question(s) \
                  outstanding and {} unasked",
                 in_flight.len(),
@@ -2336,12 +2348,15 @@ fn run_pass(
                 // the file it was in is not covered - but the pass goes on:
                 // one bad position is not a reason to drop the other nine
                 // thousand answers.
-                eprintln!("[{language}] the server refused a question about {} ({message})", question.file);
+                crate::log_line!(
+                    "[{language}] the server refused a question about {} ({message})",
+                    question.file
+                );
                 fail(format!("the language server refused a question about {} ({message})", question.file));
                 failed_files.insert(question.accounted_to().clone());
             }
             Poll::Closed => {
-                eprintln!(
+                crate::log_line!(
                     "[{language}] the language server exited during the pass - keeping the {} \
                      answer(s) it did give and reporting the pass incomplete",
                     answers.edges.len()
@@ -2374,7 +2389,7 @@ fn run_pass(
                 for id in expired {
                     let Some((question, _)) = in_flight.remove(&id) else { continue };
                     client.cancel(id);
-                    eprintln!(
+                    crate::log_line!(
                         "[{language}] the server did not answer a question about {} within {:?}{}",
                         question.file,
                         request_budget,
@@ -2771,9 +2786,10 @@ impl SemanticEngine for LspBridge {
         let deadline = started + self.pass_budget(whole_project, scope.len());
         let plan = questions(index, &scope, &self.config, &self.budgets);
         if plan.unanswerable > 0 {
-            eprintln!(
+            crate::log_line!(
                 "[{}] {} open site(s) of a kind this bridge does not answer were skipped",
-                self.language, plan.unanswerable
+                self.language,
+                plan.unanswerable
             );
         }
         if plan.asking.is_empty() {
@@ -2909,7 +2925,7 @@ impl SemanticEngine for LspBridge {
             }
         }
 
-        eprintln!(
+        crate::log_line!(
             "[{}] semantic pass: {} file(s), {} node(s)/{} edge(s) upserted, {} edge(s) retracted, \
              in {:?}{}",
             self.language,
@@ -3342,19 +3358,27 @@ mod tests {
             (3, "add", OpenSiteKind::ReceiverCall, None),
             (4, "typed", OpenSiteKind::ReceiverCall, Some("e-typed".to_string())),
             (4, "bare", OpenSiteKind::Reference, None),
+            // GM-497: an untyped field read is not a receiver call.
+            (5, "fld", OpenSiteKind::ReceiverField, None),
         ] {
             builder.open_site(OpenSite {
                 from_id: caller.clone(),
                 position: Position { line, col: 4 },
                 name: name.to_string(),
                 kind,
-                edge_kind: EdgeKind::Calls,
+                edge_kind: if kind == OpenSiteKind::ReceiverField {
+                    EdgeKind::References
+                } else {
+                    EdgeKind::Calls
+                },
                 from_container: Some("m".to_string()),
                 replaces,
             });
         }
         let mut graph = builder.finish();
         let node = graph.nodes.iter_mut().find(|node| node.id == caller).unwrap();
+        // `fld` (a `ReceiverField`) is not folded in: control, count
+        // `ReceiverField` in `fold_untyped_calls`.
         assert_eq!(node.untyped_calls, ["add", "len"], "the structural list the fixture starts from");
         node.signature = Some("fn caller()".to_string());
         node.doc_comment = Some("Calls things.".to_string());
@@ -3431,7 +3455,7 @@ mod tests {
     /// disagreeing case counts); test `node_at(..).is_none()` instead of
     /// `file_at(..).is_none()` (the no-node case counts); drop the
     /// `site.replaces.is_some()` or `site.kind != ReceiverCall` check (a
-    /// typed call or a reference counts).
+    /// typed call, a reference or a field read counts).
     #[test]
     fn an_untyped_call_is_answered_only_by_a_non_empty_answer_that_is_an_edge_or_outside_the_index() {
         let (index, caller) = untyped_index();
@@ -3477,9 +3501,14 @@ mod tests {
             "a call with a structural edge is not an untyped call"
         );
         assert_eq!(
-            answered_by(&index, &caller, site_of(&index, "bare", 4), outside),
+            answered_by(&index, &caller, site_of(&index, "bare", 4), outside.clone()),
             (0, 0),
             "a reference is not a receiver call"
+        );
+        assert_eq!(
+            answered_by(&index, &caller, site_of(&index, "fld", 5), outside),
+            (0, 0),
+            "a field read is not a receiver call (GM-497)"
         );
     }
 
@@ -3796,8 +3825,11 @@ mod tests {
         }
     }
 
-    /// A `Reference` site with no `replaces` and a `ReceiverCall` are asked
-    /// whatever the placeholder looks like: the hop rule is about `replaces`.
+    /// A `Reference` site with no `replaces`, a `ReceiverCall` and a
+    /// `ReceiverField` (GM-497) are asked whatever the placeholder looks
+    /// like: the hop rule is about a `Reference`'s `replaces`. Control for
+    /// the `ReceiverField` row: route `ReceiverField` to `continue` in
+    /// `questions`.
     #[test]
     fn a_reference_without_replaces_and_a_receiver_call_are_asked_as_before() {
         let mut index = SdkIndex::new();
@@ -3810,6 +3842,7 @@ mod tests {
                 (OpenSiteKind::Reference, Replaces::Nothing, 1),
                 (OpenSiteKind::ReceiverCall, Replaces::Nothing, 2),
                 (OpenSiteKind::ReceiverCall, Replaces::TheEdge, 3),
+                (OpenSiteKind::ReceiverField, Replaces::TheEdge, 4),
             ],
         );
         let (asked, unanswerable) = asked_about_u(&index);
@@ -3818,9 +3851,44 @@ mod tests {
             vec![
                 (OpenSiteKind::ReceiverCall, 2),
                 (OpenSiteKind::ReceiverCall, 3),
+                (OpenSiteKind::ReceiverField, 4),
                 (OpenSiteKind::Reference, 1)
             ]
         );
+        assert_eq!(unanswerable, 0);
+    }
+
+    /// **GM-497, items 10, 11 and 16.** Onto the placeholder a typed Rust field
+    /// read replaces - a `Container` scope with a `QualifiedName` key - a
+    /// `ReceiverField` site is asked with or without `replaces`, while a
+    /// `Reference` hop with the same `replaces` is still left to its
+    /// structural edge. Controls: route `ReceiverField` to `continue` in
+    /// `questions` (lines 2 and 3 are not asked); give `ReceiverField` the
+    /// hop arm (`ReceiverField if site.replaces.is_some()` beside
+    /// `Reference`: line 2 is not asked); route a `Reference` with `replaces`
+    /// to `Ask::Definition` unconditionally (line 1 is asked).
+    #[test]
+    fn a_receiver_field_is_asked_onto_the_placeholder_a_hop_is_not() {
+        let mut index = SdkIndex::new();
+        declaring_file(&mut index, Declares::Nothing);
+        let field = PlaceholderTarget {
+            scope: TargetScope::Container("m".to_string()),
+            key: TargetKey::QualifiedName("T.n".to_string()),
+            from_container: None,
+            key_path: None,
+        };
+        using_file(
+            &mut index,
+            PlaceholderKind::PendingSymbol,
+            field,
+            &[
+                (OpenSiteKind::Reference, Replaces::TheEdge, 1),
+                (OpenSiteKind::ReceiverField, Replaces::TheEdge, 2),
+                (OpenSiteKind::ReceiverField, Replaces::Nothing, 3),
+            ],
+        );
+        let (asked, unanswerable) = asked_about_u(&index);
+        assert_eq!(asked, vec![(OpenSiteKind::ReceiverField, 2), (OpenSiteKind::ReceiverField, 3)]);
         assert_eq!(unanswerable, 0);
     }
 

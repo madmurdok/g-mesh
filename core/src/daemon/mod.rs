@@ -202,11 +202,11 @@ pub fn write_pid_file(path: &Path, pid: u32) {
 pub(crate) fn write_state_file_atomic(path: &Path, contents: &str, what: &str) {
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     if let Err(err) = fs::write(&temporary, contents) {
-        eprintln!("g-mesh daemon: failed to write {what} {}: {err}", temporary.display());
+        crate::log_line!("g-mesh daemon: failed to write {what} {}: {err}", temporary.display());
         return;
     }
     if let Err(err) = fs::rename(&temporary, path) {
-        eprintln!("g-mesh daemon: failed to put {what} {} in place: {err}", path.display());
+        crate::log_line!("g-mesh daemon: failed to put {what} {} in place: {err}", path.display());
         let _ = fs::remove_file(&temporary);
     }
 }
@@ -245,10 +245,10 @@ pub fn run(root: &Path) -> Result<()> {
     match build_stamp::of_running_process() {
         Ok(stamp) => {
             if let Err(err) = build_stamp::write(&build_stamp_path_in(&dir), &stamp) {
-                eprintln!("g-mesh daemon: could not publish its build stamp: {err:#}");
+                crate::log_line!("g-mesh daemon: could not publish its build stamp: {err:#}");
             }
         }
-        Err(err) => eprintln!("g-mesh daemon: could not describe its own build: {err:#}"),
+        Err(err) => crate::log_line!("g-mesh daemon: could not describe its own build: {err:#}"),
     }
 
     // D10/D11: a folder of projects is served by the front, which needs no
@@ -273,7 +273,7 @@ pub fn run(root: &Path) -> Result<()> {
     if schema::ensure_current(&conn, &registry::indexer_version(&discovered))
         .context("failed to check the index's schema and indexer versions")?
     {
-        eprintln!("g-mesh daemon: index (re)initialized - a full reindex is needed");
+        crate::log_line!("g-mesh daemon: index (re)initialized - a full reindex is needed");
     }
     // Next to the staging cleanup above, once the tables exist: pending rows
     // no pass will clear (a removed plugin, a clear that failed) go.
@@ -442,7 +442,7 @@ fn stand_down(root: &Path) -> Result<()> {
         // `Free`: the incumbent released the lock after the failed attempt; the
         // next bootstrap wins.
         DaemonLock::Free | DaemonLock::Serving | DaemonLock::Starting => {
-            eprintln!("g-mesh daemon: another daemon already serves {} - exiting", root.display());
+            crate::log_line!("g-mesh daemon: another daemon already serves {} - exiting", root.display());
             Ok(())
         }
     }
@@ -545,7 +545,7 @@ fn serve_forever(
                 if let Err(err) =
                     mcp::serve_connection(stream, conn, registry, core_activity, indexing, embedding).await
                 {
-                    eprintln!("g-mesh daemon: connection ended: {err:#}");
+                    crate::log_line!("g-mesh daemon: connection ended: {err:#}");
                 }
             });
         }
@@ -683,7 +683,7 @@ fn clear_serving_owner(state_dir: &Path) {
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => eprintln!("g-mesh daemon: failed to clear {}: {err}", path.display()),
+        Err(err) => crate::log_line!("g-mesh daemon: failed to clear {}: {err}", path.display()),
     }
 }
 

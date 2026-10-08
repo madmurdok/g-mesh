@@ -1056,3 +1056,107 @@ fn seeding_from_an_unreadable_outcome_table_leaves_the_set_empty() {
 
     assert!(!registry.is_failed_language("python"));
 }
+
+// ---------------------------------------------------------------------
+// path_coverage: why a path-anchored answer can be empty
+// ---------------------------------------------------------------------
+
+/// A registry over plugins claiming real catalogue extensions:
+/// `(language, extensions, exclude_dirs)` each.
+fn registry_claiming(
+    plugins: &[(&str, &[&str], &[&str])],
+) -> (tempfile::TempDir, tempfile::TempDir, PluginRegistry) {
+    let project = tempfile::tempdir().expect("failed to create a project root");
+    let root = tempfile::tempdir().expect("failed to create a plugin root");
+    for (language, extensions, exclude_dirs) in plugins {
+        test_plugin::install_with_workspace(root.path(), language, extensions, &[], exclude_dirs);
+    }
+    let discovered = discover(&[root.path().to_path_buf()]).expect("the fixtures must discover cleanly");
+    let state_dir = crate::storage::connection::project_dir(project.path())
+        .expect("failed to resolve the fixture project's state directory");
+    let registry = PluginRegistry::new(
+        project.path(),
+        state_dir,
+        discovered,
+        None,
+        None,
+        Arc::new(EmbeddingPipeline::disabled()),
+    );
+    (project, root, registry)
+}
+
+fn absent_language(coverage: Option<PathCoverage>) -> Option<&'static str> {
+    match coverage {
+        Some(PathCoverage::Absent(entry)) => Some(entry.language),
+        _ => None,
+    }
+}
+
+/// With only Rust discovered, a Python file is absent and a Rust
+/// file is covered.
+///
+/// Control: return `None` from `path_coverage`'s catalogue arm - the
+/// absent assertion fails.
+#[test]
+fn a_file_no_discovered_plugin_claims_is_absent_and_an_indexed_one_is_covered() {
+    let (_project, _plugins, registry) = registry_claiming(&[("rust", &[".rs"], &[])]);
+    assert_eq!(absent_language(registry.path_coverage("tools/gen.py")), Some("python"));
+    assert_eq!(registry.path_coverage("src/lib.rs"), None);
+}
+
+/// A discovered language in the failed set is `Failed`; the
+/// same language not failed is covered.
+///
+/// Control: make the discovered arm return `None` (drop the
+/// `is_failed_language` branch) - the first assertion fails.
+#[test]
+fn a_discovered_language_in_the_failed_set_is_failed() {
+    let (_project, _plugins, registry) =
+        registry_claiming(&[("rust", &[".rs"], &[]), ("python", &[".py", ".pyi"], &[])]);
+    registry.set_failed_languages(["python".to_string()]);
+    assert_eq!(registry.path_coverage("tools/gen.py"), Some(PathCoverage::Failed("python".to_string())));
+    assert_eq!(registry.path_coverage("src/lib.rs"), None, "rust is not failed");
+
+    registry.set_failed_languages(Vec::new());
+    assert_eq!(registry.path_coverage("tools/gen.py"), None, "a working python plugin covers its file");
+}
+
+/// A failed language's path under its own manifest
+/// `exclude_dirs` gets nothing - fixing the plugin would not index it.
+///
+/// Control: use `language_for` instead of `indexing_language` in the
+/// discovered arm - `build/gen.py` reads `Failed`.
+#[test]
+fn a_failed_languages_path_under_its_own_exclude_dirs_has_no_coverage_reason() {
+    let (_project, _plugins, registry) = registry_claiming(&[("python", &[".py"], &["build"])]);
+    registry.set_failed_languages(["python".to_string()]);
+    assert_eq!(registry.path_coverage("build/gen.py"), None);
+    assert_eq!(registry.path_coverage("tools/gen.py"), Some(PathCoverage::Failed("python".to_string())));
+}
+
+/// A language recorded failed whose plugin is no
+/// longer discovered reads as absent - installing is the fix.
+///
+/// Control: check `is_failed_language(entry.language)` before the
+/// catalogue arm (return `Failed`) - the assertion fails.
+#[test]
+fn a_failed_language_with_no_discovered_manifest_reads_as_absent() {
+    let (_project, _plugins, registry) = registry_claiming(&[("rust", &[".rs"], &[])]);
+    registry.set_failed_languages(["python".to_string()]);
+    assert_eq!(absent_language(registry.path_coverage("tools/gen.py")), Some("python"));
+}
+
+/// Unsupported, extensionless and catalogue-excluded
+/// paths have no coverage reason; another language's exclusions do not
+/// apply (`target/` is Rust's, not Python's).
+///
+/// Control: drop the `exclude_dirs` check in `languages::absent_for_path` -
+/// `venv/x.py` reads absent.
+#[test]
+fn unsupported_extensionless_and_excluded_paths_have_no_coverage_reason() {
+    let (_project, _plugins, registry) = registry_claiming(&[("rust", &[".rs"], &[])]);
+    for path in ["Makefile", "README", "src/lib.zig", "venv/x.py", "pkg/.venv/lib/x.py"] {
+        assert_eq!(registry.path_coverage(path), None, "{path}");
+    }
+    assert_eq!(absent_language(registry.path_coverage("target/x.py")), Some("python"));
+}

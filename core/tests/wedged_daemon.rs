@@ -58,6 +58,8 @@ use serde_json::{json, Value};
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -168,6 +170,7 @@ impl Project {
 
     fn spawn_shim(&self) -> std::process::Child {
         Command::new(BIN)
+            .lifeline()
             .arg("mcp-shim")
             .current_dir(self.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
@@ -483,6 +486,7 @@ fn a_daemon_started_over_a_wedged_one_fails_fast_and_names_the_pid() {
     let wedged = project.wedge();
 
     let output = Command::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(project.root())

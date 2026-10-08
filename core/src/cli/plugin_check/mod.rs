@@ -140,6 +140,12 @@ pub fn check(
         bail!("fixture {} is not a directory", fixture.display());
     }
 
+    // Parsed once, up front: the files-created session below needs its
+    // `[files_created]` pair before the expectations section runs, and both
+    // must read the same file. A parse failure is still reported where it
+    // always was, as `expectations.file`.
+    let expect_file = expect.map(expectations::parse);
+
     let scratch = session::Scratch::create()?;
     session::copy_tree(&fixture, &scratch.workspace()).with_context(|| {
         format!("failed to copy the fixture {} to a scratch workspace", fixture.display())
@@ -229,6 +235,35 @@ pub fn check(
         bulk3 = Some(run);
     }
 
+    // `capabilities.files-created-resolves`: a short session of its own, on a
+    // fresh index, so neither the main session's checks nor the expectations
+    // ever see the pair (`session::run_files_created_session`). Run only for
+    // a declaring plugin with a valid pair once the main session succeeded -
+    // a non-declaring plugin is never sent `filesCreated` at all.
+    let files_created_config = match &expect_file {
+        None => checks::FilesCreatedConfig::Absent,
+        Some(Err(_)) => checks::FilesCreatedConfig::Unparsed,
+        Some(Ok(file)) => {
+            file.files_created().map_or(checks::FilesCreatedConfig::Absent, checks::FilesCreatedConfig::Pair)
+        }
+    };
+    let mut pair_findings = Vec::new();
+    let mut files_created_run = None;
+    if let (true, checks::FilesCreatedConfig::Pair(pair)) =
+        (manifest.capabilities.files_created, files_created_config)
+    {
+        pair_findings = session::files_created_pair_findings(&manifest, &scratch.workspace(), pair);
+        let main_session_ok = bulk1.complete() && session.as_ref().is_some_and(|s| s.failure.is_none());
+        if let (true, true, Some(target)) = (main_session_ok, pair_findings.is_empty(), &target) {
+            let run =
+                session::run_files_created_session(&manifest, &scratch, pair, &target.file_path, timeouts);
+            if let Some(failure) = &run.session.failure {
+                failures.push(format!("files-created session: {failure}"));
+            }
+            files_created_run = Some(run);
+        }
+    }
+
     let mut notes = vec![
         format!(
             "timeouts: fileChanged {:?}, per-file semanticPass {:?}, whole-project semanticPass and each bulk run {:?}",
@@ -261,19 +296,15 @@ pub fn check(
         let edges = run.lines.iter().filter(|l| matches!(l.item, Ok(BulkItem::Edge(_)))).count();
         notes.push(format!("bulk run {}: {nodes} node(s), {edges} edge(s)", index + 1));
     }
-    for exchange in session.iter().flat_map(|s| &s.exchanges) {
-        let answer = match exchange.response.as_ref().map(|r| &r.diff) {
-            None => "no answer".to_string(),
-            Some(Err(_)) => "unparseable answer".to_string(),
-            Some(Ok(diff)) => format!(
-                "+{} / -{} node(s), +{} / -{} edge(s)",
-                diff.upsert_nodes.len(),
-                diff.delete_node_ids.len(),
-                diff.upsert_edges.len(),
-                diff.delete_edge_ids.len()
-            ),
-        };
-        notes.push(format!("{} -> {}: {answer}", exchange.step, exchange.method.name()));
+    notes.extend(session.iter().flat_map(|s| &s.exchanges).map(exchange_note));
+    if let checks::FilesCreatedConfig::Pair(pair) = files_created_config {
+        notes.push(format!("files_created: {} -> {}", pair.importer, pair.target));
+    }
+    if let Some(run) = &files_created_run {
+        for (step, paths) in &run.session.notifications {
+            notes.push(format!("{step}: notification listing {}", paths.join(", ")));
+        }
+        notes.extend(run.session.exchanges.iter().map(exchange_note));
     }
 
     let results = checks::evaluate(&checks::RunData {
@@ -285,12 +316,17 @@ pub fn check(
         session: session.as_ref(),
         failures,
         marker_exists_at_end: scratch.semantic_engine_marker().exists(),
+        files_created: checks::FilesCreatedEvidence {
+            config: files_created_config,
+            pair_findings,
+            run: files_created_run.as_ref(),
+        },
     });
 
     let mut sections = vec![Section { title: "checks", results }];
-    if let Some(expect_path) = expect {
+    if let Some(expect_file) = &expect_file {
         sections.push(expectations_section(
-            expect_path,
+            expect_file,
             &manifest,
             &conn,
             &scratch,
@@ -303,17 +339,35 @@ pub fn check(
     Ok(Report { language: manifest.language.clone(), plugin_dir, fixture, notes, sections })
 }
 
+/// One notes line per request a session sent: its step, method, and the
+/// size of the diff it was answered with.
+fn exchange_note(exchange: &session::Exchange) -> String {
+    let answer = match exchange.response.as_ref().map(|r| &r.diff) {
+        None => "no answer".to_string(),
+        Some(Err(_)) => "unparseable answer".to_string(),
+        Some(Ok(diff)) => format!(
+            "+{} / -{} node(s), +{} / -{} edge(s)",
+            diff.upsert_nodes.len(),
+            diff.delete_node_ids.len(),
+            diff.upsert_edges.len(),
+            diff.delete_edge_ids.len()
+        ),
+    };
+    format!("{} -> {}: {answer}", exchange.step, exchange.method.name())
+}
+
 /// Builds the `"expectations"` section for `--expect <expect_path>` -
 /// `expectations`' module doc has the full reasoning (decisions 1-5); this
-/// is just the plumbing: gate on session readiness (decision 1), parse
-/// (decision 5), then hand off to `expectations::evaluate`.
+/// is just the plumbing: gate on session readiness (decision 1), report
+/// the parse `check` already did (decision 5), then hand off to
+/// `expectations::evaluate`.
 ///
 /// One `CheckResult` id, `expectations.file`, always leads the section - a
 /// `Skip` when the session never reached the state expectations need, a
 /// `Fail` when the file could not be read or parsed, or a `Pass` followed by
 /// one result per expectation the file declared.
 fn expectations_section(
-    expect_path: &Path,
+    expect_file: &Result<expectations::ExpectFile>,
     manifest: &PluginManifest,
     conn: &Arc<IndexStore>,
     scratch: &session::Scratch,
@@ -340,7 +394,7 @@ fn expectations_section(
         };
     }
 
-    let expect_file = match expectations::parse(expect_path) {
+    let expect_file = match expect_file {
         Ok(expect_file) => expect_file,
         Err(err) => {
             return Section {
@@ -373,6 +427,6 @@ fn expectations_section(
 
     let mut results =
         vec![CheckResult { id: FILE_CHECK.into(), outcome: Outcome::Pass, warnings: Vec::new() }];
-    results.extend(expectations::evaluate(&ctx, &expect_file, skip_semantic));
+    results.extend(expectations::evaluate(&ctx, expect_file, skip_semantic));
     Section { title: "expectations", results }
 }

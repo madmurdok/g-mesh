@@ -88,7 +88,11 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
         })?;
 
     let resolved = resolve(&config.command)?;
-    eprintln!("[{LANGUAGE}] semantic tier: {} ({})", resolved.command.display(), resolved.version);
+    g_mesh_plugin_sdk::log_line!(
+        "[{LANGUAGE}] semantic tier: {} ({})",
+        resolved.command.display(),
+        resolved.version
+    );
     config.command = resolved.command;
     Ok(Box::new(LspBridge::new(LANGUAGE, root, config)))
 }

@@ -440,7 +440,11 @@ strip = ["@"]
 # Whether, in one scope, a named import/re-export of a name hides every glob
 # (`*`) one for it when the linker walks re-export chains. Absent: false, and
 # named and glob rows stay side by side with no winner.
-named_shadows_glob = true  # rust, typescript; python and go declare nothing
+named_shadows_glob = true  # rust, typescript
+# Whether the later of a named and a glob import that both provide a name binds
+# it (statement order, as Python executes it). Absent: false. A manifest may
+# not set both keys to true.
+# later_import_binds = true  # python; go declares neither
 
 # GM-289, read by the SDK's LSP bridge and by nothing in core - see
 # "Implementation notes (GM-289)" for why core deliberately does not parse it.
@@ -519,9 +523,13 @@ empty prefix, an unknown key, and a prefix missing from the same manifest's
 with (`daemon::manifest::link_rules`). With `named_shadows_glob = true`, a
 scope of that language that re-exports a name both by name and through a glob
 follows the named row only; without it, both rows are followed at the same
-depth. Rust and TypeScript declare it; Python (the later import binds) and Go
-do not. Decision:
-[ADR 0020](../adr/0020-named-reexport-shadows-glob.md).
+depth. Rust and TypeScript declare it. Python declares `later_import_binds =
+true` instead: of the rows that provide a name in one scope, the one whose
+import statement comes last binds it, named or glob, so `from .a import f`
+then `from .b import *` follows `b`. Go declares neither. A manifest setting
+both keys to `true` is refused. Decisions:
+[ADR 0020](../adr/0020-named-reexport-shadows-glob.md) and its addendum,
+[the GM-496 note](gm-496-python-later-import-binds.md).
 
 Capabilities are read from the manifest rather than the handshake. Routing and
 instruction assembly need them before any plugin process exists, and the manifest
@@ -737,7 +745,15 @@ The kit runs the plugin exactly as the daemon does (spawn, handshake, `--bulk-in
 - **Capabilities:**
   - `semantic_pass = false` plugins are never sent the request;
   - `receiver_calls = "resolved"` is backed by the expectations file actually
-    containing receiver calls.
+    containing receiver calls;
+  - `files_created = true` (GM-516, `capabilities.files-created-resolves`):
+    the kit creates a new target and a new importer, sends `filesCreated`
+    (no `id`), then `fileChanged` importer-first, and requires the importer's
+    `IMPORTS` edge to land on the target (or a container holding it). The two
+    files come from a `[files_created]` table in `expect.toml` (`target`,
+    `target_text`, `importer`, `importer_text`, all required); a declaring
+    plugin without the table is `SKIP`, a non-declaring one is never sent the
+    notification and is `SKIP`. See `docs/architecture/gm-516-check-files-created.md`.
 - **Expectations** (`expect.toml`, per language), checked after linking. Each is
   answered by the same query code the MCP tools use:
 

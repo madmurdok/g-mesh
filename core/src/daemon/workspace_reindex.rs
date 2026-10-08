@@ -96,7 +96,10 @@ fn remove_staging(path: &Path) {
     for file in [path, journal.as_path()] {
         if let Err(err) = std::fs::remove_file(file) {
             if err.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("g-mesh daemon: could not remove the staging index {} ({err})", file.display());
+                crate::log_line!(
+                    "g-mesh daemon: could not remove the staging index {} ({err})",
+                    file.display()
+                );
             }
         }
     }
@@ -128,9 +131,11 @@ pub(crate) fn remove_stale_semantic_pending(
     match schema::clear_stale_semantic_pending(conn, &capable) {
         Ok(0) => {}
         Ok(cleared) => {
-            eprintln!("g-mesh daemon: cleared the stale semantic-pending rows of {cleared} language(s)")
+            crate::log_line!(
+                "g-mesh daemon: cleared the stale semantic-pending rows of {cleared} language(s)"
+            )
         }
-        Err(err) => eprintln!("g-mesh daemon: could not clear stale semantic-pending rows ({err:#})"),
+        Err(err) => crate::log_line!("g-mesh daemon: could not clear stale semantic-pending rows ({err:#})"),
     }
 }
 
@@ -141,12 +146,12 @@ pub(crate) fn resume_pending(registry: &PluginRegistry, store: &IndexStore) {
     let pending = match store.with(schema::pending_reindexes) {
         Ok(pending) => pending,
         Err(err) => {
-            eprintln!("g-mesh daemon: could not read the interrupted workspace reindexes ({err:#})");
+            crate::log_line!("g-mesh daemon: could not read the interrupted workspace reindexes ({err:#})");
             return;
         }
     };
     for (language, trigger) in pending {
-        eprintln!(
+        crate::log_line!(
             "g-mesh daemon: the {language} workspace reindex after {trigger} was interrupted - rerunning it"
         );
         registry.workspace_file_changed(store, &language, &trigger);
@@ -195,7 +200,7 @@ pub(crate) fn run_with(
     let embed_stats = supervisor.with_exclusive_access(|process| -> Result<EmbedStats> {
         if let Some(process) = process {
             if let Err(err) = process.notify_workspace_changed(changed_file) {
-                eprintln!(
+                crate::log_line!(
                     "g-mesh daemon: failed to notify the {language} plugin that {changed_file} changed \
                      ({err:#}) - it keeps whatever module/crate map it had cached, but the reindex below \
                      walks the language from scratch regardless"
@@ -206,7 +211,7 @@ pub(crate) fn run_with(
             // language is re-walked.
             if !supervisor.is_semantic_suspended() {
                 if let Err(err) = process.notify_prepare_semantic_pass() {
-                    eprintln!(
+                    crate::log_line!(
                         "g-mesh daemon: could not tell the {language} plugin its semantic pass is owed ({err:#}) \
                          - it starts its engine when the pass is asked instead"
                     );
@@ -235,7 +240,7 @@ pub(crate) fn run_with(
             Ok(true) => {
                 let recorded = store.with(|conn| schema::record_language_semantic_pass(conn, language));
                 if let Err(err) = recorded {
-                    eprintln!(
+                    crate::log_line!(
                         "g-mesh daemon: failed to record {language}'s semantic pass after a workspace \
                          reindex ({err:#})"
                     );
@@ -247,7 +252,7 @@ pub(crate) fn run_with(
             // whoever next asks; status shows why.
             Ok(false) => semantic::record_not_run(store, language),
             Err(err) => {
-                eprintln!(
+                crate::log_line!(
                     "g-mesh daemon: the {language} semantic pass after a workspace reindex failed ({err:#}) - \
                      its edges keep whatever the structural pass resolved"
                 );
@@ -257,7 +262,9 @@ pub(crate) fn run_with(
 
         let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
         if let Err(err) = store.with(|conn| schema::reconcile_semantic_pass_rollup(conn, &capable)) {
-            eprintln!("g-mesh daemon: failed to update the project-wide semantic-pass roll-up ({err:#})");
+            crate::log_line!(
+                "g-mesh daemon: failed to update the project-wide semantic-pass roll-up ({err:#})"
+            );
         }
     }
 
@@ -321,7 +328,7 @@ fn rebuild(
         },
     )?;
     let counts = plan.counts;
-    eprintln!(
+    crate::log_line!(
         "g-mesh daemon: {language} reindex swapped in - nodes -{} +{}, edges -{} +{}, containers -{} +{}, \
          {} texts owed a vector, {} file(s) structural until the semantic pass, {} placeholder(s) kept \
          for it",

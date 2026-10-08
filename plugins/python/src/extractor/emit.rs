@@ -64,6 +64,19 @@
 //! and gets no list. The list is what a semantic engine binds an overloaded
 //! call to by ordinal; see
 //! `docs/adr/0024-semantic-tier-refines-by-binding-a-declaration.md`.
+//!
+//! # Property accessors
+//!
+//! `@property def x`, `@x.setter def x` and `@x.deleter def x` are three
+//! functions of one property, not a redefinition, so they are three nodes:
+//! the same name, `qualifiedName` and container, told apart by `nativeKind`
+//! (`method` for the getter, whose id is unchanged, then `setter` and
+//! `deleter`), each with its own range, signature and docstring. The setter
+//! and deleter are kept out of the name tables (`super::model`'s accessor
+//! table), so a name lookup still finds the getter alone; only an
+//! instance-parameter store (`self.x = v`), `del self.x` or `self.x += v`
+//! is routed to them (`super::bodies`). See
+//! `docs/architecture/gm-511-python-property-accessors.md`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -104,25 +117,21 @@ impl<'s> Positions<'s> {
         Range { start: self.at(node.start_position()), end: self.at(node.end_position()) }
     }
 
-    /// The file's own range, whose end is `(number of newlines, length of the
-    /// final unterminated line)`.
+    /// The file's own range, ending where its content ends: trailing
+    /// whitespace is trimmed, and the end is `(number of newlines, length of
+    /// the last line)` of what is left - the file's last real line, never
+    /// the empty line after a final newline.
     ///
     /// Not tree-sitter's root range, and not a byte count: this is the one
     /// formula a space inserted before the file's last newline does not move,
     /// which is what `id-stability.whitespace-edit` asks of every plugin (see
     /// `core::cli::plugin_check::session::whitespace_edit` for why that
-    /// particular edit). It is also [`FileGraphBuilder::file_node`]'s own
-    /// documented contract, reproduced here because this plugin builds its
-    /// `File` node by hand - see [`Emitter::new`].
+    /// particular edit), which also requires that end line. It is
+    /// [`FileGraphBuilder::file_node`]'s own documented contract, called
+    /// here because this plugin builds its `File` node by hand - see
+    /// [`Emitter::new`]. The `Module` declaration takes the same range.
     pub(crate) fn file_range(&self) -> Range {
-        let lines: Vec<&str> = self.source.split('\n').collect();
-        Range {
-            start: Position { line: 0, col: 0 },
-            end: Position {
-                line: (lines.len() - 1) as u32,
-                col: lines.last().map_or(0, |line| line.chars().count()) as u32,
-            },
-        }
+        g_mesh_plugin_sdk::CharColumns::new(self.source).file_range()
     }
 }
 
@@ -154,6 +163,14 @@ pub(crate) struct Emitter<'s> {
     /// Every function definition of each node id, in source order - see
     /// "Overload sets" in the module doc.
     definitions: HashMap<String, Vec<Definition>>,
+    /// Re-export nodes, held back until [`Emitter::finish`] so a repeat of
+    /// one (`from .b import *` written twice) can move its range to the
+    /// later statement: core reads a re-export's start position as its
+    /// statement's order. Safe to emit late because a re-export
+    /// node is the source or target of no edge. Indexed by id in
+    /// `reexport_at`.
+    reexports: Vec<NodeSpec>,
+    reexport_at: HashMap<String, usize>,
 }
 
 /// One `def` of a function node, as an overload set's declaration list needs
@@ -205,6 +222,8 @@ impl<'s> Emitter<'s> {
             edges: HashSet::new(),
             placeholders: HashMap::new(),
             definitions: HashMap::new(),
+            reexports: Vec::new(),
+            reexport_at: HashMap::new(),
         }
     }
 
@@ -304,12 +323,17 @@ impl<'s> Emitter<'s> {
             &qualified_name,
             Some(PlaceholderKind::Reexport.native_kind()),
         );
-        if self.nodes.insert(id.clone()) {
+        if let Some(&at) = self.reexport_at.get(&id) {
+            // The same re-export again: the later statement is the one that
+            // last bound the name, so it is the one whose position counts.
+            self.reexports[at].range = range;
+        } else if self.nodes.insert(id.clone()) {
             let mut spec = NodeSpec::new(NodeKind::Module, published, qualified_name, range)
                 .native_kind(PlaceholderKind::Reexport.native_kind());
             spec.container = Some(container.to_string());
             spec.target = Some(target);
-            self.graph.add_node(spec);
+            self.reexport_at.insert(id.clone(), self.reexports.len());
+            self.reexports.push(spec);
         }
         id
     }
@@ -380,6 +404,9 @@ impl<'s> Emitter<'s> {
                 })
                 .collect();
             self.graph.set_declarations(&id, declarations);
+        }
+        for spec in std::mem::take(&mut self.reexports) {
+            self.graph.add_node(spec);
         }
         self.graph.finish()
     }

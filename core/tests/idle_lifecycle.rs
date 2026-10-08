@@ -35,7 +35,9 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 
 mod common;
+
 use common::wait_until_indexed;
+use common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -137,6 +139,7 @@ struct Daemon {
 impl Daemon {
     fn spawn(root: &Path, plugin_idle: Duration, core_idle: Duration) -> Self {
         let mut child = Command::new(BIN)
+            .lifeline()
             .arg("daemon")
             .arg("--project-root")
             .arg(root)

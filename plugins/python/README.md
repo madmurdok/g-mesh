@@ -267,6 +267,11 @@ assertion that it stays a gap forever.
    dispatcher). The decorator is recorded in the signature and as a
    `REFERENCES` edge, and the decorated declaration is indexed as written - but
    a call to it reaches the wrapper at runtime, which the index does not model.
+   A property's `@x.setter` and `@x.deleter` are the exception: each is its
+   own node (`nativeKind` `setter`/`deleter`, beside the getter's `method`),
+   and `self.x = v`, `del self.x` and `self.x += v` reference the accessor they
+   run. A class-qualified `C.x` from another file then names two or three
+   nodes and stays unlinked; `obj.x` on an unknown receiver is not resolved.
 
 Five smaller ones, for completeness:
 
@@ -344,7 +349,7 @@ all an npm `.bin` directory is.
 check's verdict by name, so that a check which starts *skipping* fails the
 suite instead of quietly shrinking it:
 
-1. the shipped manifest with a real pyright - 14 checks pass, one skips
+1. the shipped manifest with a real pyright - 15 checks pass, one skips
    (`capabilities.semantic-pass-undeclared`, because `semantic_pass = true`),
    and all ten expectations pass;
 2. the 3.4.0 manifest (`semantic_pass = false`) with

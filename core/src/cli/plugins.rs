@@ -295,14 +295,15 @@ pub fn render(plugins: &[PluginInfo]) -> String {
 /// `semantic_pass` as `yes`/`no` (there is no third state to distinguish
 /// from a boolean, unlike the two receiver-call fields) and the two
 /// receiver-call fields via [`ReceiverCallResolution`]'s own `Display`
-/// impl, so this has no second "resolved"/"unresolved" mapping to keep in
-/// sync with the one on the type itself.
+/// impl and `member_overrides` via [`manifest::MemberOverrides`]'s, so this
+/// has no second mapping to keep in sync with the one on each type.
 fn render_capabilities(capabilities: &Capabilities) -> String {
     format!(
-        "semantic_pass={} receiver_calls={} receiver_calls_structural={}",
+        "semantic_pass={} receiver_calls={} receiver_calls_structural={} member_overrides={}",
         if capabilities.semantic_pass { "yes" } else { "no" },
         capabilities.receiver_calls,
         capabilities.receiver_calls_structural,
+        capabilities.member_overrides,
     )
 }
 
@@ -613,6 +614,7 @@ extensions = [".{language}"]
                     files_created: false,
                     receiver_calls: manifest::ReceiverCallResolution::Resolved,
                     receiver_calls_structural: manifest::ReceiverCallResolution::Unresolved,
+                    member_overrides: crate::daemon::manifest::MemberOverrides::None,
                 },
                 non_symbol_queries: NonSymbolShapes::default(),
                 symbol_query_prefixes: SymbolQueryPrefixes::default(),

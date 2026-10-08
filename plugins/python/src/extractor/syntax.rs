@@ -164,6 +164,50 @@ pub(crate) fn has_decorator(item: Node, source: &str, name: &str) -> bool {
     })
 }
 
+/// Which non-getter accessor of a `property` a `def` is.
+///
+/// `@x.setter def x` and `@x.deleter def x` rebind the class attribute `x` to
+/// a new `property` object, but they are three different functions of one
+/// property, each with its own body. Each gets its own node, told apart from
+/// the getter (`nativeKind = "method"`, unchanged) by its `nativeKind`; see
+/// `docs/architecture/gm-511-python-property-accessors.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Accessor {
+    Setter,
+    Deleter,
+}
+
+impl Accessor {
+    /// The node's `nativeKind`, which is also what keeps its id apart from
+    /// the getter's.
+    pub(crate) fn native_kind(self) -> &'static str {
+        match self {
+            Accessor::Setter => "setter",
+            Accessor::Deleter => "deleter",
+        }
+    }
+}
+
+/// The accessor `item` (a `def`, possibly decorated) declares when it sits in
+/// a class body: a decorator whose expression is exactly the two-segment
+/// dotted name `name.setter` or `name.deleter`, `name` being the def's own
+/// name. The caller checks the frame is a class.
+///
+/// Not recognised, on purpose: `@x.getter` (a getter replacement *is* the
+/// getter, and merges into it), `@Base.x.setter` and a setter whose name
+/// differs from its decorator's head - none of them collides with another
+/// `def` of the same name.
+pub(crate) fn property_accessor(item: Node, name: &str, source: &str) -> Option<Accessor> {
+    decorators(item).into_iter().find_map(|decorator| {
+        let segments = decorator.named_child(0).and_then(|expression| dotted_segments(expression, source))?;
+        match segments.as_slice() {
+            [head, "setter"] if *head == name => Some(Accessor::Setter),
+            [head, "deleter"] if *head == name => Some(Accessor::Deleter),
+            _ => None,
+        }
+    })
+}
+
 /// The text a string literal holds, verbatim - the source between its opening
 /// and closing delimiters. Used for an `__all__` entry, where the name is
 /// wanted exactly as written and no docstring cleanup applies.

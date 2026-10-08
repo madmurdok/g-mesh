@@ -22,6 +22,8 @@ use g_mesh::storage::connection::project_dir;
 
 mod common;
 
+use common::Lifeline;
+
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -90,6 +92,7 @@ impl Harness {
 
     fn spawn_daemon(&self) -> Child {
         Command::new(BIN)
+            .lifeline()
             .arg("daemon")
             .arg("--project-root")
             .arg(self.root())

@@ -26,7 +26,9 @@ use serde_json::{json, Value};
 use tokio::process::Command as TokioCommand;
 
 mod common;
+
 use common::wait_until_indexed;
+use common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
@@ -81,6 +83,7 @@ impl Project {
     /// complete index - to contend with.
     fn bootstrap_daemon(&self) {
         let mut shim = Command::new(BIN)
+            .lifeline()
             .arg("mcp-shim")
             .current_dir(self.root())
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
@@ -189,6 +192,7 @@ fn body(result: &CallToolResult) -> Value {
 /// changed.
 async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     let transport = TokioChildProcess::new(TokioCommand::new(BIN).configure(|cmd| {
+        cmd.lifeline();
         // `kill_on_drop`, because a shim that outlives the test wedges the
         // whole process on Windows (GM-249 - see `common::kill_and_wait`).
         cmd.kill_on_drop(true)

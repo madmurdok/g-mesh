@@ -158,7 +158,7 @@ pub const CURRENT_SCHEMA_VERSION: &str = "13";
 /// different pipeline generations (2.12.0's buggy writer and 3.0.0's fixed
 /// one) the same number in this constant's history, which is exactly the
 /// ambiguity it exists to rule out.
-pub const CURRENT_INDEXER_VERSION: &str = "2";
+pub const CURRENT_INDEXER_VERSION: &str = "3";
 
 /// DDL per the architecture doc's Data Model erDiagram
 /// (docs/architecture/g-mesh-v1.md).
@@ -1034,7 +1034,7 @@ fn in_savepoint<T>(conn: &Connection, body: impl FnOnce() -> Result<T>) -> Resul
         }
         Err(err) => {
             if let Err(rollback) = conn.execute_batch("ROLLBACK TO schema_record; RELEASE schema_record") {
-                eprintln!("g-mesh: failed to roll back a savepoint ({rollback:#})");
+                crate::log_line!("g-mesh: failed to roll back a savepoint ({rollback:#})");
             }
             Err(err)
         }

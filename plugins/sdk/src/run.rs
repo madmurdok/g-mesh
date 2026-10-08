@@ -158,7 +158,7 @@ fn watch_bulk_lifeline(language: &str) {
                 Err(_) => break,
             }
         }
-        eprintln!("[{language}] core closed the bulk stream's lifeline - exiting");
+        crate::log_line!("[{language}] core closed the bulk stream's lifeline - exiting");
         std::process::exit(1);
     });
 }
@@ -173,7 +173,7 @@ fn bulk_index<E: Extractor>(extractor: &E, spec: &ResolvedSpec, root: &Path) -> 
     let project = match extractor.load_project(root) {
         Ok(project) => project,
         Err(err) => {
-            eprintln!("[{}] failed to load the project at {}: {err:#}", spec.language, root.display());
+            crate::log_line!("[{}] failed to load the project at {}: {err:#}", spec.language, root.display());
             return 1;
         }
     };
@@ -195,7 +195,7 @@ fn bulk_index<E: Extractor>(extractor: &E, spec: &ResolvedSpec, root: &Path) -> 
         if let Err(err) = write_graph(&mut out, &graph) {
             // A broken pipe means core stopped reading - it has failed this
             // walk already and nothing is served by finishing it.
-            eprintln!("[{}] failed to write the bulk stream: {err}", spec.language);
+            crate::log_line!("[{}] failed to write the bulk stream: {err}", spec.language);
             return 1;
         }
         files += 1;
@@ -204,10 +204,13 @@ fn bulk_index<E: Extractor>(extractor: &E, spec: &ResolvedSpec, root: &Path) -> 
     }
 
     if let Err(err) = out.flush() {
-        eprintln!("[{}] failed to flush the bulk stream: {err}", spec.language);
+        crate::log_line!("[{}] failed to flush the bulk stream: {err}", spec.language);
         return 1;
     }
-    eprintln!("[{}] bulk index complete: {files} file(s), {nodes} node(s), {edges} edge(s)", spec.language);
+    crate::log_line!(
+        "[{}] bulk index complete: {files} file(s), {nodes} node(s), {edges} edge(s)",
+        spec.language
+    );
     0
 }
 
@@ -243,7 +246,7 @@ fn control_plane<E: Extractor>(
     let stdout = io::stdout();
     let mut out = stdout.lock();
     if let Err(err) = write_message(&mut out, &handshake) {
-        eprintln!("[{}] failed to announce the handshake: {err}", spec.language);
+        crate::log_line!("[{}] failed to announce the handshake: {err}", spec.language);
         return 1;
     }
 
@@ -274,7 +277,7 @@ fn control_plane<E: Extractor>(
             // reports an engine is the failure `capabilities.semantic-engine-lazy`
             // is about, seen from the plugin's own side.
             Ok(None) => {
-                eprintln!(
+                crate::log_line!(
                     "[{}] core closed the control stream - exiting (semantic engine started: {})",
                     spec.language,
                     session.engine.started()
@@ -283,14 +286,14 @@ fn control_plane<E: Extractor>(
             }
             Ok(Some(body)) => {
                 if let Err(err) = session.handle(&body, &mut out) {
-                    eprintln!("[{}] failed to answer a control message: {err:#}", spec.language);
+                    crate::log_line!("[{}] failed to answer a control message: {err:#}", spec.language);
                     return 1;
                 }
             }
             Err(err) => {
                 // Framing errors desynchronize the byte stream - there is no
                 // resuming from one, only guessing.
-                eprintln!("[{}] the control stream is unreadable: {err:#}", spec.language);
+                crate::log_line!("[{}] the control stream is unreadable: {err:#}", spec.language);
                 return 1;
             }
         }
@@ -345,7 +348,7 @@ fn read_control_stream(language: &str) -> Receiver<anyhow::Result<Option<Vec<u8>
         }
         std::thread::sleep(LIFELINE_GRACE);
         crate::lsp::kill_live_servers();
-        eprintln!("[{language}] core closed the control stream mid-request - exiting");
+        crate::log_line!("[{language}] core closed the control stream mid-request - exiting");
         std::process::exit(1);
     });
     inbound
@@ -381,7 +384,7 @@ impl<E: Extractor> Session<'_, E> {
             Ok(project) => self.project = Some(project),
             Err(err) => {
                 self.project = None;
-                eprintln!(
+                crate::log_line!(
                     "[{}] failed to load the project at {}: {err:#} - answering from no project model \
                      until it loads",
                     self.spec.language,
@@ -399,7 +402,7 @@ impl<E: Extractor> Session<'_, E> {
         // wedges core's stream until its timeout. This way an unknown method
         // still gets an acknowledgement.
         let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(body) else {
-            eprintln!("[{}] ignoring a control message that is not JSON", self.spec.language);
+            crate::log_line!("[{}] ignoring a control message that is not JSON", self.spec.language);
             return Ok(());
         };
         let id = envelope.get("id").filter(|id| !id.is_null()).cloned();
@@ -464,7 +467,7 @@ impl<E: Extractor> Session<'_, E> {
                     .and_then(|params| params.get("filePath"))
                     .and_then(|path| path.as_str())
                     .unwrap_or_default();
-                eprintln!(
+                crate::log_line!(
                     "[{}] workspace changed ({file}) - reloading the project model",
                     self.spec.language
                 );
@@ -489,7 +492,7 @@ impl<E: Extractor> Session<'_, E> {
             // separate `--bulk-index` process. `status` is a liveness probe.
             other => {
                 if !other.is_empty() && other != "reindex" && other != "status" {
-                    eprintln!("[{}] ignoring unknown control method {other:?}", self.spec.language);
+                    crate::log_line!("[{}] ignoring unknown control method {other:?}", self.spec.language);
                 }
                 self.acknowledge(out, id)
             }
@@ -551,7 +554,10 @@ impl<E: Extractor> Session<'_, E> {
         let remapped = self.indexed_spelling(path);
         let path = remapped.as_ref().unwrap_or(path);
         if !self.claims(path) {
-            eprintln!("[{}] ignoring {path}: this plugin does not claim its extension", self.spec.language);
+            crate::log_line!(
+                "[{}] ignoring {path}: this plugin does not claim its extension",
+                self.spec.language
+            );
             return FileChangeDiff::default();
         }
 
@@ -711,7 +717,7 @@ impl<E: Extractor> Session<'_, E> {
     ) -> anyhow::Result<()> {
         let Some(id) = id else { return Ok(()) };
         if whole_project && !answer.complete {
-            eprintln!(
+            crate::log_line!(
                 "[{}] the whole-project semantic pass did not finish - reporting it incomplete so the \
                  index does not record a semantic pass it did not get",
                 self.spec.language
@@ -784,13 +790,13 @@ fn read_source(path: &RelPath, root: &Path, language: &str) -> Option<String> {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(source) => Some(source),
             Err(_) => {
-                eprintln!("[{language}] skipping {path}: not valid UTF-8");
+                crate::log_line!("[{language}] skipping {path}: not valid UTF-8");
                 None
             }
         },
         Err(err) if err.kind() == io::ErrorKind::NotFound => None,
         Err(err) => {
-            eprintln!("[{language}] skipping {path}: {err}");
+            crate::log_line!("[{language}] skipping {path}: {err}");
             None
         }
     }
@@ -827,7 +833,7 @@ fn presence_caught<E: Extractor>(
     language: &str,
 ) {
     if catch_unwind(AssertUnwindSafe(|| extractor.file_presence_changed(project, path, present))).is_err() {
-        eprintln!("[{language}] the presence hook panicked on {path} - its presence is not applied");
+        crate::log_line!("[{language}] the presence hook panicked on {path} - its presence is not applied");
     }
 }
 
@@ -852,7 +858,7 @@ fn extract_caught<E: Extractor>(
             // The default hook has already printed the panic and its
             // location; this says which file provoked it, which the panic
             // itself does not.
-            eprintln!("[{language}] the extractor panicked on {path} - skipping this file");
+            crate::log_line!("[{language}] the extractor panicked on {path} - skipping this file");
             None
         }
     }

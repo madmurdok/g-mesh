@@ -488,6 +488,18 @@ impl Drop for SpawnReservation<'_> {
     }
 }
 
+/// Why a path-anchored answer about one file can be empty while the file
+/// exists: [`PluginRegistry::path_coverage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PathCoverage {
+    /// No discovered plugin claims the file; the catalogue entry of the
+    /// plugin that would index it.
+    Absent(&'static crate::languages::CatalogueEntry),
+    /// The discovered plugin for this language failed its bulk walk, so
+    /// nothing of the language is in the index (ADR 0021, section 2).
+    Failed(String),
+}
+
 /// The daemon's plugins: what was discovered, and which of them are running.
 pub struct PluginRegistry {
     /// Canonicalized, exactly as [`PluginSupervisor`] wants it - every
@@ -627,7 +639,7 @@ impl PluginRegistry {
                     matches!(outcome, LanguageOutcome::Failed { .. }).then_some(language)
                 }))
             }
-            Err(err) => eprintln!(
+            Err(err) => crate::log_line!(
                 "g-mesh daemon: could not read the recorded language outcomes - failed languages are not \
                  excluded from incremental updates until the next walk: {err:#}"
             ),
@@ -637,6 +649,25 @@ impl PluginRegistry {
     /// Whether the bulk walk failed `language`, so its files are not routed.
     pub(crate) fn is_failed_language(&self, language: &str) -> bool {
         self.failed_languages.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(language)
+    }
+
+    /// Why the index can hold nothing of `file_path`, read from what this
+    /// daemon already has in memory (no rediscovery, no I/O): see
+    /// `docs/architecture/gm-503-absent-language-field.md`, sections 3 and 5.
+    /// `None` when the file's language is indexed, or when nothing explains
+    /// an empty answer (unsupported or extensionless path, or a path under
+    /// the language's own `exclude_dirs`, which no plugin would index).
+    ///
+    /// Precedence: a discovered manifest that claims the extension makes the
+    /// path failed or covered, never absent; only with no claiming manifest
+    /// is the catalogue asked, so a language recorded `Failed` whose plugin
+    /// has since gone reads as absent - installing is the fix.
+    pub(crate) fn path_coverage(&self, file_path: &str) -> Option<PathCoverage> {
+        if self.discovered.language_for(file_path).is_some() {
+            let language = self.discovered.indexing_language(file_path)?;
+            return self.is_failed_language(language).then(|| PathCoverage::Failed(language.to_string()));
+        }
+        crate::languages::absent_for_path(&self.discovered, file_path).map(PathCoverage::Absent)
     }
 
     /// Which language claims `file_path`, by its extension; `None` if no
@@ -968,7 +999,7 @@ impl PluginRegistry {
             let running = self.supervisors.lock().unwrap().get(&language).and_then(SupervisorSlot::running);
             let Some(supervisor) = running else { continue };
             if let Err(err) = supervisor.files_created(&file_paths) {
-                eprintln!(
+                crate::log_line!(
                     "g-mesh daemon: could not tell the {language} plugin about {} created files: {err:#}",
                     file_paths.len()
                 );
@@ -1006,7 +1037,7 @@ impl PluginRegistry {
     pub fn file_changed(&self, conn: &IndexStore, file_path: String) {
         if self.language_for(&file_path).is_none() {
             if let Some(notice) = self.unroutable_notice(&file_path) {
-                eprintln!("{notice}");
+                crate::log_line!("{notice}");
             }
             return;
         }
@@ -1022,7 +1053,7 @@ impl PluginRegistry {
 
         match self.get_or_spawn(&language) {
             Ok(supervisor) => supervisor.file_changed(conn, file_path),
-            Err(err) => eprintln!(
+            Err(err) => crate::log_line!(
                 "g-mesh daemon: could not start the {language} plugin for {file_path}: {err:#} - \
                  the change was not indexed"
             ),
@@ -1040,14 +1071,14 @@ impl PluginRegistry {
             Ok(supervisor) => {
                 if let Err(err) = crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
                 {
-                    eprintln!(
+                    crate::log_line!(
                         "g-mesh daemon: failed to reindex the {language} workspace after \
                          {changed_file} changed: {err:#} - {language}'s previous graph keeps \
                          serving, and the reindex runs again on the next daemon start"
                     );
                 }
             }
-            Err(err) => eprintln!(
+            Err(err) => crate::log_line!(
                 "g-mesh daemon: could not start the {language} plugin to reindex its workspace \
                  after {changed_file} changed: {err:#}"
             ),
@@ -1271,7 +1302,7 @@ impl PluginRegistry {
         for supervisor in self.active_supervisors() {
             match supervisor.replay_pending(conn) {
                 Ok(count) => replayed += count,
-                Err(err) => eprintln!(
+                Err(err) => crate::log_line!(
                     "g-mesh daemon: could not replay the changes queued while the {} plugin \
                      slept: {err:#}",
                     supervisor.language()

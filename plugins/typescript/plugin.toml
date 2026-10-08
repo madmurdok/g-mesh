@@ -21,7 +21,7 @@ protocol_version = 2
 # Must equal this crate's `Cargo.toml` `version`: a plugin in the cargo
 # workspace tracks the release version (docs/architecture/plugin-modularity.md,
 # "plugin_version: two rules, not one"); scripts/cut-release.sh checks it.
-plugin_version = "4.0.0"
+plugin_version = "4.1.0"
 
 [plugin.spawn]
 command = "${G_MESH_BIN_DIR}/g-mesh-plugin-typescript"
@@ -49,6 +49,9 @@ files_created = true
 # section for what core does with each value.
 receiver_calls = "resolved"
 receiver_calls_structural = "unresolved"
+# A method overrides or implements the same-named member of a supertype, so
+# core derives `find_callers`' `overrides` field from the type edges.
+member_overrides = "by_name"
 
 [plugin.semantic]
 # A bare name: a `PATH` lookup, then the indexed project's own

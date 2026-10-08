@@ -1131,7 +1131,7 @@ fn rejects_a_strip_prefix_missing_from_starts_with() {
 }
 
 // -----------------------------------------------------------------
-// `[plugin.reexports] named_shadows_glob`
+// `[plugin.reexports] named_shadows_glob` and `later_import_binds`
 // -----------------------------------------------------------------
 
 fn with_reexports(table: &str) -> String {
@@ -1184,22 +1184,80 @@ fn rejects_an_unknown_key_in_reexports() {
     assert!(message.contains("named_shadow_glob"), "{message}");
 }
 
-/// The checked-in manifests declare the rule for Rust and TypeScript and not
-/// for Python or Go (ADR 0020), so the rules the daemon builds from them are
-/// exactly those two.
+/// `later_import_binds`: absent or `false` is no rule, `true` parses, and
+/// `link_rules` reports it for exactly the language that declares it, beside
+/// another language's `named_shadows_glob`.
 ///
-/// Control: remove `[plugin.reexports]` from `plugins/rust/plugin.toml` (or
-/// add it to `plugins/python/plugin.toml`) - this fails.
+/// Controls: drop the `.with_later_import_binds(..)` call from `link_rules` -
+/// `python` reads false; drop its `filter` - `rust` (declaring only
+/// `named_shadows_glob`) gets the rule too.
 #[test]
-fn the_checked_in_manifests_declare_glob_shadowing_for_rust_and_typescript_only() {
+fn parses_later_import_binds_and_link_rules_reports_it_for_its_language_only() {
+    let (_absent_root, absent) = plugin_dir("python", &well_formed_toml());
+    assert!(!read_manifest(&absent).unwrap().reexports.later_import_binds);
+
+    let (_false_root, explicit_false) = plugin_dir("python", &with_reexports("later_import_binds = false"));
+    assert!(!read_manifest(&explicit_false).unwrap().reexports.later_import_binds);
+
+    let (_later_root, later) = plugin_dir("python", &with_reexports("later_import_binds = true"));
+    let later = read_manifest(&later).unwrap();
+    assert!(later.reexports.later_import_binds);
+    assert!(!later.reexports.named_shadows_glob);
+
+    let (_shadow_root, shadowing) = plugin_dir("python", &with_reexports("named_shadows_glob = true"));
+    let shadowing = read_manifest(&shadowing).unwrap();
+    let renamed = |language: &str, manifest: &PluginManifest| PluginManifest {
+        language: language.to_string(),
+        ..manifest.clone()
+    };
+    let rules = link_rules([&renamed("rust", &shadowing), &later]);
+    assert_eq!(rules, LinkRules::with_named_shadows_glob(["rust"]).with_later_import_binds(["python"]));
+    assert!(rules.later_import_binds("python"));
+    assert!(!rules.later_import_binds("rust"));
+    assert!(!rules.named_shadows_glob("python"));
+}
+
+/// The two keys are opposite answers to "which import binds a name", so a
+/// manifest setting both is refused, naming the manifest; either one alone
+/// loads.
+///
+/// Control: remove the both-keys `bail!` from `read_manifest` - the manifest
+/// loads and this fails.
+#[test]
+fn rejects_a_manifest_setting_both_reexport_rules() {
+    let (_root, dir) =
+        plugin_dir("python", &with_reexports("named_shadows_glob = true\nlater_import_binds = true"));
+
+    let message = format!("{:#}", read_manifest(&dir).unwrap_err());
+
+    assert!(message.contains(&dir.join(MANIFEST_FILE_NAME).to_string_lossy().into_owned()), "{message}");
+    assert!(message.contains("named_shadows_glob"), "{message}");
+    assert!(message.contains("later_import_binds"), "{message}");
+}
+
+/// The checked-in manifests declare `named_shadows_glob` for Rust and
+/// TypeScript (ADR 0020) and `later_import_binds` for Python, and
+/// neither for Go, so the rules the daemon builds from them are exactly
+/// those.
+///
+/// Control: remove `[plugin.reexports]` from `plugins/rust/plugin.toml` or
+/// from `plugins/python/plugin.toml` (or add `named_shadows_glob = true` to
+/// Python's, which `read_manifest` then refuses) - this fails.
+#[test]
+fn the_checked_in_manifests_declare_each_languages_reexport_rule() {
     let plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
     let manifests: Vec<PluginManifest> = ["rust", "typescript", "python", "go"]
         .iter()
         .map(|language| read_manifest(&plugins.join(language)).unwrap())
         .collect();
     for manifest in &manifests {
-        let expected = matches!(manifest.language.as_str(), "rust" | "typescript");
-        assert_eq!(manifest.reexports.named_shadows_glob, expected, "{}", manifest.language);
+        let language = manifest.language.as_str();
+        let shadows = matches!(language, "rust" | "typescript");
+        assert_eq!(manifest.reexports.named_shadows_glob, shadows, "{language}");
+        assert_eq!(manifest.reexports.later_import_binds, language == "python", "{language}");
     }
-    assert_eq!(link_rules(&manifests), LinkRules::with_named_shadows_glob(["rust", "typescript"]));
+    assert_eq!(
+        link_rules(&manifests),
+        LinkRules::with_named_shadows_glob(["rust", "typescript"]).with_later_import_binds(["python"])
+    );
 }

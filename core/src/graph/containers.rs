@@ -509,7 +509,7 @@ fn apply_parents(conn: &Connection, parents: &[(Key, Option<String>)], created: 
     }
 
     for key in &disagreeing {
-        eprintln!(
+        crate::log_line!(
             "g-mesh: members of the {} container {:?} disagree about its parent (containerParent) - a \
              plugin bug; keeping the one sent last, {:?}",
             key.0,

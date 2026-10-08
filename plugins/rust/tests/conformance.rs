@@ -65,7 +65,7 @@ use g_mesh_plugin_sdk::testing::{CheckOutcome, PluginCheck, Verdict};
 /// asserted as a set so a check dropping out of the report (this crate's
 /// own regression, not a plugin defect) fails loudly rather than shrinking
 /// the loop below silently.
-const ALL_CHECKS: [&str; 15] = [
+const ALL_CHECKS: [&str; 16] = [
     "session",
     "shape",
     "stream-order",
@@ -81,6 +81,7 @@ const ALL_CHECKS: [&str; 15] = [
     "ownership.diff-stays-in-file",
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
+    "capabilities.files-created-resolves",
 ];
 
 /// The two capability checks are each other's alternative: exactly one
@@ -92,8 +93,13 @@ const CAPABILITY_CHECKS: [&str; 2] =
     ["capabilities.semantic-pass-undeclared", "capabilities.semantic-engine-lazy"];
 
 /// Every check that must pass whatever the manifest declares.
+/// GM-516's check: `PASS` only for a manifest declaring `files_created`
+/// run with an `--expect` file naming a `[files_created]` pair, `SKIP`
+/// otherwise.
+const FILES_CREATED: &str = "capabilities.files-created-resolves";
+
 fn always_pass() -> Vec<&'static str> {
-    ALL_CHECKS.iter().copied().filter(|id| !CAPABILITY_CHECKS.contains(id)).collect()
+    ALL_CHECKS.iter().copied().filter(|id| !CAPABILITY_CHECKS.contains(id) && *id != FILES_CREATED).collect()
 }
 
 const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.toml");
@@ -108,8 +114,7 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 // Includes the struct-field and `Type::method` entries at the end of the
 // file: four `[[definition]]`s (two of them partial paths the
 // qualifiedName-suffix rung resolves), one `[[refusal]]` and two
-// `[[references]]`, one of which (the field read through a variable receiver)
-// is semantic, plus the getter-named-like-its-field pair: one `[[callers]]` for
+// `[[references]]`, both structural, plus the getter-named-like-its-field pair: one `[[callers]]` for
 // the method and one `[[references]]` for the field.
 const EXPECTATIONS: usize = 31;
 // 6 since GM-386: `[[references]] shapes::Shape` joined the five receiver/
@@ -121,7 +126,10 @@ const EXPECTATIONS: usize = 31;
 // `internals::peek` row is a field read only rust-analyzer resolves.
 // 6 once `[[callers]] shapes::Square::perimeter` became structural: its
 // receiver is a parameter of a written type.
-const SEMANTIC_EXPECTATIONS: usize = 6;
+// 5 once the `internals::peek` row of `[[references]]
+// gaps::Ledger.all_unresolved` became structural for the same reason: the
+// field is read through a parameter of a written type.
+const SEMANTIC_EXPECTATIONS: usize = 5;
 
 /// GM-380: the tripwire above only works if tripping it says what to do.
 ///
@@ -164,7 +172,7 @@ fn the_expectation_constants_describe_the_file_they_count() {
 /// `(entries, entries tagged `tier = "semantic"`)` in [`EXPECT`], by parsing
 /// rather than by grepping. The distinction is not pedantry: `tier =
 /// "semantic"` appears in that file's *comments* too, so counting lines
-/// answers 7 where the file declares 5.
+/// answers more than the file declares.
 fn count_expectations() -> (usize, usize) {
     let text = std::fs::read_to_string(EXPECT).expect("conformance/expect.toml is readable");
     let parsed: toml::Value = toml::from_str(&text).expect("conformance/expect.toml parses");
@@ -297,7 +305,12 @@ fn verdicts_of(judged: &[(&str, Verdict)], want: Verdict) -> usize {
 /// The whole report, for every configuration: the same fifteen checks, with
 /// exactly one capability check skipping, and it must be the one that matches
 /// the manifest.
-fn assert_report_shape(outcome: &CheckOutcome, applicable: &str, not_applicable: &str) {
+fn assert_report_shape(
+    outcome: &CheckOutcome,
+    applicable: &str,
+    not_applicable: &str,
+    files_created: Verdict,
+) {
     let mut reported: Vec<&str> = outcome.outcomes.keys().map(String::as_str).collect();
     reported.retain(|id| !id.starts_with("expectations."));
     reported.sort_unstable();
@@ -320,6 +333,12 @@ fn assert_report_shape(outcome: &CheckOutcome, applicable: &str, not_applicable:
         "{not_applicable} does not apply to this manifest:\n{}",
         outcome.stdout
     );
+    assert_eq!(
+        outcome.verdict(FILES_CREATED),
+        Some(files_created),
+        "{FILES_CREATED} must be {files_created:?} for this configuration:\n{}",
+        outcome.stdout
+    );
 }
 
 #[test]
@@ -330,6 +349,7 @@ fn the_plugin_passes_every_check_that_applies_to_it() {
         &outcome,
         "capabilities.semantic-engine-lazy",
         "capabilities.semantic-pass-undeclared",
+        Verdict::Skip,
     );
 }
 
@@ -373,6 +393,7 @@ fn without_a_semantic_tier_the_structural_expectations_still_hold() {
         &outcome,
         "capabilities.semantic-pass-undeclared",
         "capabilities.semantic-engine-lazy",
+        Verdict::Skip,
     );
 
     let judged = expectation_verdicts(&outcome);
@@ -421,19 +442,16 @@ fn the_semantic_tier_is_what_closes_the_receiver_call_gap() {
 
     // Named, not only counted - and named by the row each entry is *missing*
     // rather than by the entry's own index, which is what the report prints
-    // and what a later edit to the file would renumber. These two rows are
-    // the task's own acceptance criteria, and each is exactly what the
-    // semantic tier contributes to its entry:
+    // and what a later edit to the file would renumber. Each of these rows is
+    // exactly what the semantic tier contributes to its entry:
     //
     //   - the receiver call on a variable whose method is a trait impl's
     //     (`square.area()` in `total`), which the structural tier addresses
     //     as `Square::area` and so cannot find;
-    //   - the implementation in another crate of the workspace;
-    //   - a struct field read through a variable receiver (`internals::peek`).
+    //   - the implementation in another crate of the workspace.
     for row in [
         "missing (expected, not found): crates/alpha/src/shapes.rs:shapes::total",
         "missing (expected, not found): crates/beta/src/main.rs:Megaphone",
-        "missing (expected, not found): crates/alpha/src/internals.rs:internals::peek",
     ] {
         assert!(outcome.stdout.contains(row), "the report must say `{row}`:\n{}", outcome.stdout);
     }

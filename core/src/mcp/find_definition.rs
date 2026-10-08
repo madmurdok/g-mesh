@@ -11,12 +11,14 @@ use rmcp::ErrorData;
 use rusqlite::{Connection, Row};
 use serde::Serialize;
 
+use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::not_indexed;
 use super::query_shapes::QueryShapes;
 use super::similarity;
 use super::source;
@@ -90,8 +92,9 @@ impl DefinitionNode {
     /// snippet, and giving them two different shapes would make every consumer
     /// handle two cases to learn nothing.
     fn with_source(mut self, project_root: Option<&Path>) -> Self {
-        self.source = project_root
-            .and_then(|root| source::read_span(root, &self.file_path, self.start_line, self.end_line));
+        self.source = project_root.and_then(|root| {
+            source::read_span(root, &self.file_path, self.start_line, self.end_line, Some(self.end_col))
+        });
         self
     }
 }
@@ -140,6 +143,11 @@ struct DefinitionCandidate {
     start_line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     end_line: Option<i64>,
+    /// The span's end column, for reading its source only (an old index's
+    /// whole-file end - see [`source::read_span`]); never serialized, so the
+    /// page's shape is unchanged.
+    #[serde(skip)]
+    end_col: Option<i64>,
     kind: String,
     /// Signature over docstring when both exist - it's denser and more
     /// identifying in a ranked list than prose.
@@ -164,6 +172,7 @@ impl From<super::search_code::SearchResult> for DefinitionCandidate {
             file_path: hit.file_path,
             start_line: None,
             end_line: None,
+            end_col: None,
             kind: hit.kind,
             preview: None,
             source: None,
@@ -211,8 +220,7 @@ impl CandidatePage {
     /// is what keeps it from reading as a confident answer to the first one.
     ///
     /// "Every" is what is attempted, not what is promised: a candidate whose
-    /// span cannot be read (a Python `Module` whose `endLine` is one past the
-    /// file's last line, a file edited since the walk) comes back without
+    /// span cannot be read (a file edited since the walk) comes back without
     /// `source`, and the explanation then says "some", so it never claims a
     /// source the page does not carry.
     fn ambiguous(
@@ -231,6 +239,7 @@ impl CandidatePage {
                         &candidate.file_path,
                         start,
                         end,
+                        candidate.end_col,
                         CANDIDATE_SOURCE_LINES,
                         CANDIDATE_SOURCE_CHARS,
                     );
@@ -412,7 +421,7 @@ fn rank_candidates(
     // the copy here was three kinds where that one is five.
     let base_sql = format!(
         "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
-         n.startLine AS startLine, n.endLine AS endLine, n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
+         n.startLine AS startLine, n.endLine AS endLine, n.endCol AS endCol, n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
          CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
          FROM nodes n WHERE {filter} AND {}",
         queries::declaration_only("n.")
@@ -427,6 +436,7 @@ fn rank_candidates(
             file_path: row.get("filePath")?,
             start_line: Some(row.get("startLine")?),
             end_line: Some(row.get("endLine")?),
+            end_col: Some(row.get("endCol")?),
             kind: row.get("kind")?,
             preview: row
                 .get::<_, Option<String>>("signature")?
@@ -441,9 +451,13 @@ fn rank_candidates(
 
 /// Resolves `find_definition`'s file+position input - always unambiguous by
 /// construction, so the answer is a single node, never a candidate list.
+///
+/// `coverage` says whether `file_path`'s language is indexed at all; a miss
+/// in an absent or failed language carries the reason ([`not_indexed::miss`]).
 fn by_position(
     conn: &Connection,
     project_root: Option<&Path>,
+    coverage: Option<&PathCoverage>,
     file_path: &str,
     line: u32,
     col: u32,
@@ -453,7 +467,9 @@ fn by_position(
 
     match found {
         Some(node) => success(&DefinitionNode::from(node).with_source(project_root)),
-        None => error(format!("g-mesh: no symbol found at {file_path}:{line}:{col}")),
+        None => {
+            not_indexed::miss(conn, coverage, format!("g-mesh: no symbol found at {file_path}:{line}:{col}"))
+        }
     }
 }
 
@@ -1164,6 +1180,7 @@ fn by_file_name(
                 file_path: n.file_path.clone(),
                 start_line: Some(n.start_line),
                 end_line: Some(n.end_line),
+                end_col: Some(n.end_col),
                 kind: n.kind.clone(),
                 preview: n.signature.clone().or_else(|| n.doc_comment.clone()),
                 source: None,
@@ -1209,14 +1226,19 @@ pub(crate) fn handle(
     shapes: &QueryShapes,
     params: FindDefinitionParams,
 ) -> Result<CallToolResult, ErrorData> {
-    resolve_lazily(embedding, shapes, |semantic| handle_in(store, project_root, semantic, params.clone()))
+    resolve_lazily(embedding, shapes, |semantic| {
+        handle_in(store, project_root, semantic, None, params.clone())
+    })
 }
 
-/// One pass of [`handle`] - see [`SemanticRung`].
+/// One pass of [`handle`] - see [`SemanticRung`]. `coverage` is
+/// `params.file_path`'s (`PluginRegistry::path_coverage`), read only by the
+/// `file_path` + `position` mode.
 pub(super) fn handle_in(
     store: &Arc<IndexStore>,
     project_root: &Path,
     semantic: &SemanticRung<'_>,
+    coverage: Option<&PathCoverage>,
     params: FindDefinitionParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -1237,7 +1259,7 @@ pub(super) fn handle_in(
 
     match (params.file_path, params.position, params.symbol_name) {
         (Some(file_path), Some(position), _) => {
-            by_position(&conn, project_root, &file_path, position.line, position.col)
+            by_position(&conn, project_root, coverage, &file_path, position.line, position.col)
         }
         (None, None, Some(name)) => by_name(&conn, project_root, semantic, &name, params.cursor.as_deref()),
         (None, None, None) if params.cursor.is_some() => {

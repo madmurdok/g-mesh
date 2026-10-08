@@ -1481,6 +1481,103 @@ fn an_impl_for_an_imported_type_keeps_its_open_site_and_gets_no_block_node() {
     assert_eq!(sites[0].name, "P");
 }
 
+/// A trait-impl method points at the trait method it implements, so core's
+/// `declared` mode can name it on the method's caller page: one edge per
+/// impl, `<Circle as Loud>::speak` to `Loud::speak` only, never to the
+/// same-named `Quiet::speak`. Both ends are this file's, so it is resolved;
+/// the type-level edges are unchanged. Control: drop the
+/// `member_supertypes` call from `impl_item`.
+#[test]
+fn a_trait_impl_method_is_a_supertype_edge_to_the_trait_method() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Loud { fn speak(&self); }\npub trait Quiet { fn speak(&self); }\npub struct Circle;\n\
+         impl Loud for Circle { fn speak(&self) {} }\nimpl Quiet for Circle { fn speak(&self) {} }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::SupertypeOf, "<Circle as Loud>::speak"), vec!["Loud::speak"]);
+    assert_eq!(graph.targets(EdgeKind::SupertypeOf, "<Circle as Quiet>::speak"), vec!["Quiet::speak"]);
+    assert_eq!(graph.targets(EdgeKind::SupertypeOf, "Circle"), vec!["Loud", "Quiet"]);
+    assert!(graph.edges(EdgeKind::SupertypeOf).iter().all(|edge| edge.resolved));
+}
+
+/// The trait one file over: the method's edge is unresolved, onto a
+/// placeholder addressing the trait's method by `qualifiedName` in the
+/// trait's module - the address a written `Shape::area` path gets - for the
+/// linker to land on the declaration.
+#[test]
+fn a_trait_impl_method_of_a_trait_in_another_file_points_at_a_placeholder() {
+    let krate = Crate::new(&[
+        (
+            "src/lib.rs",
+            "pub mod shapes;\nuse crate::shapes::Shape;\npub struct Ci;\nimpl Shape for Ci { fn area(&self) {} }\n",
+        ),
+        ("src/shapes.rs", "pub trait Shape { fn area(&self); }\n"),
+    ]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(
+        graph.targets(EdgeKind::SupertypeOf, "<Ci as Shape>::area"),
+        vec!["pending_symbol krate::shapes::shapes::Shape::area"]
+    );
+    let placeholder = graph.placeholder("pending_symbol", "area");
+    assert_eq!(
+        graph.target_of(placeholder),
+        (container("krate::shapes"), TargetKey::QualifiedName("shapes::Shape::area".into()))
+    );
+}
+
+/// The `SUPERTYPE_OF` edges out of a `Function` node: none of them is what
+/// the declared member edge's absence means.
+fn member_supertype_edges(graph: &Graph) -> Vec<String> {
+    graph
+        .edges(EdgeKind::SupertypeOf)
+        .into_iter()
+        .filter(|edge| graph.by_id(&edge.from_id).kind == NodeKind::Function)
+        .map(|edge| {
+            format!(
+                "{} -> {}",
+                graph.by_id(&edge.from_id).qualified_name,
+                graph.by_id(&edge.to_id).qualified_name
+            )
+        })
+        .collect()
+}
+
+/// An inherent method implements nothing, though its type implements a
+/// trait with a same-named method. Control: call `member_supertypes` for
+/// the inherent arm of `impl_item` too.
+#[test]
+fn an_inherent_method_is_no_supertype_edge() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Shape { fn area(&self); }\npub struct Square;\nimpl Square { fn area(&self) {} }\n\
+         impl Shape for Square { fn area(&self) {} }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert!(graph.targets(EdgeKind::SupertypeOf, "Square::area").is_empty());
+    assert_eq!(member_supertype_edges(&graph), vec!["<Square as Shape>::area -> Shape::area"]);
+}
+
+/// A trait outside the project (`Clone`, `std::fmt::Display`) has no method
+/// node to point at: no member edge and no placeholder for one. Control:
+/// drop the `Here`/`There` gate in `member_supertypes`.
+#[test]
+fn a_method_of_an_external_trait_is_no_supertype_edge() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub struct T;\nimpl Clone for T { fn clone(&self) -> T { T } }\n\
+         impl std::fmt::Display for T { fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) } }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert!(member_supertype_edges(&graph).is_empty(), "{:#?}", member_supertype_edges(&graph));
+    assert!(
+        !graph.0.nodes.iter().any(|node| node.native_kind.as_deref() == Some("pending_symbol")
+            && (node.name == "clone" || node.name == "fmt")),
+        "{:#?}",
+        graph.names()
+    );
+}
+
 // --- cfg, errors, purity ---------------------------------------------------------
 
 /// Decision 6: every alternative is indexed, and two alternatives that are
@@ -1626,15 +1723,17 @@ pub fn drain(ledger: Ledger) -> Option<u8> {
         );
     }
     // The trailing `ledger.all_unresolved` read is a question for the
-    // semantic tier, at the field name.
+    // semantic tier, at the field name; `ledger` is typed by its literal, so
+    // the site replaces the structural edge onto the field.
     let reads: Vec<_> = user
         .0
         .open_sites
         .iter()
-        .filter(|site| site.kind == OpenSiteKind::Reference && site.name == "all_unresolved")
+        .filter(|site| site.kind == OpenSiteKind::ReceiverField && site.name == "all_unresolved")
         .collect();
     assert_eq!(reads.len(), 1, "{:#?}", user.0.open_sites);
     assert_eq!(reads[0].edge_kind, EdgeKind::References);
+    assert!(reads[0].replaces.is_some(), "{:#?}", reads[0]);
     // A destructuring pattern names the field too.
     assert!(
         user.targets(EdgeKind::References, "user::drain")
@@ -1922,4 +2021,232 @@ pub fn get(holder: &Holder<u8>) -> u8 { Holder::inner(holder) }
         .collect();
     assert!(key_paths.contains(&pairs(&[("", "store"), ("::", "Holder"), (".", "inner")])), "{key_paths:?}");
     assert!(key_paths.contains(&pairs(&[("", "store"), ("::", "Holder"), ("::", "inner")])), "{key_paths:?}");
+}
+
+// --- GM-497: typed field reads as receiver-field open sites -------------------
+
+/// The `ReceiverField` open sites named `name` out of `from`, in source order.
+fn field_sites<'g>(graph: &'g Graph, from: &str, name: &str) -> Vec<&'g OpenSite> {
+    let from = graph.node(from).id.clone();
+    graph
+        .0
+        .open_sites
+        .iter()
+        .filter(|site| site.kind == OpenSiteKind::ReceiverField && site.from_id == from && site.name == name)
+        .collect()
+}
+
+/// The one `REFERENCES` edge out of `from` onto the node `to` (a
+/// declaration's qualified name, or a placeholder's).
+fn reference_onto<'g>(graph: &'g Graph, from: &str, to: &str) -> &'g WireEdge {
+    let from = graph.node(from).id.clone();
+    let found: Vec<_> = graph
+        .edges(EdgeKind::References)
+        .into_iter()
+        .filter(|edge| edge.from_id == from && graph.by_id(&edge.to_id).qualified_name == to)
+        .collect();
+    assert_eq!(found.len(), 1, "one edge {from} -> {to}: {found:#?}");
+    found[0]
+}
+
+/// GM-497 items 1 and 9: `x.f` on a value typed to a same-file struct links
+/// `T.f` with a resolved `REFERENCES` edge, and keeps one `ReceiverField`
+/// site at the field token that names that edge in `replaces`. Control:
+/// make `Bodies::field_access` pass `replaces: None` and emit no edge (no
+/// `T.f` target, `replaces` is `None`).
+#[test]
+fn a_typed_field_read_links_the_field_and_keeps_a_site_that_replaces_the_edge() {
+    let krate = Crate::new(&[("src/lib.rs", "pub struct T { pub f: u8 }\npub fn run(x: T) -> u8 { x.f }\n")]);
+    let graph = krate.extract("src/lib.rs");
+    assert!(graph.targets(EdgeKind::References, "run").contains(&"T.f".to_string()));
+    let edge = reference_onto(&graph, "run", "T.f");
+    assert!(edge.resolved, "a same-file field is a resolved edge");
+    let sites = field_sites(&graph, "run", "f");
+    assert_eq!(sites.len(), 1, "{:#?}", graph.0.open_sites);
+    let site = sites[0];
+    assert_eq!(site.edge_kind, EdgeKind::References);
+    assert_eq!(site.from_container.as_deref(), Some("krate"));
+    assert_eq!(site.replaces.as_deref(), Some(edge.id.as_str()), "the site names the edge it replaces");
+    // The position is the field name's token, not the receiver's.
+    let line = "pub fn run(x: T) -> u8 { x.f }";
+    assert_eq!((site.position.line, site.position.col as usize), (1, line.find("x.f").unwrap() + 2));
+}
+
+/// GM-497 item 2: the struct is declared in another file, so the edge is
+/// onto a `pending_symbol` placeholder addressed `(Container(T's module),
+/// QualifiedName("…T.f"))`, and the site replaces that edge. Control: as
+/// above (no placeholder edge, `replaces` is `None`).
+#[test]
+fn a_field_read_on_a_type_from_another_file_replaces_a_placeholder_edge() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod store;\npub mod user;\n"),
+        ("src/store.rs", "pub struct T { pub f: u8 }\n"),
+        ("src/user.rs", "use crate::store::T;\npub fn run(x: T) -> u8 { x.f }\n"),
+    ]);
+    let user = krate.extract("src/user.rs");
+    let placeholder = user.placeholder("pending_symbol", "f");
+    assert_eq!(
+        user.target_of(placeholder),
+        (container("krate::store"), TargetKey::QualifiedName("store::T.f".to_string()))
+    );
+    let edge = reference_onto(&user, "user::run", &placeholder.qualified_name.clone());
+    assert_eq!(edge.to_id, placeholder.id);
+    let sites = field_sites(&user, "user::run", "f");
+    assert_eq!(sites.len(), 1, "{:#?}", user.0.open_sites);
+    assert_eq!(sites[0].replaces.as_deref(), Some(edge.id.as_str()));
+}
+
+/// GM-497 item 3: a receiver this tier cannot type - an unknown name, a
+/// generic, a trait object, a wrapper (`Option<T>`), a chain past the hop
+/// budget - gets no edge onto a field named `f`, and a `ReceiverField` site
+/// that replaces nothing. `beyond` also pins that a field read has no hop
+/// budget of its own: it reads at the depth where `F::three_fields` in
+/// `fields_and_calls_share_the_two_hop_budget` stops typing its call.
+/// Control: drop the `Wrapper::Plain` filter in `field_access` (`wrapped`
+/// links `T.f`); give `field_access` an extra hop (`beyond` links `D.k`).
+#[test]
+fn an_untyped_field_read_links_nothing_and_keeps_a_site_that_replaces_nothing() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub trait Tr {}
+pub struct T { pub f: u8 }
+pub fn unknown() { y.f; }
+pub fn generic<G: Tr>(x: G) { x.f; }
+pub fn object(x: &dyn Tr) { x.f; }
+pub fn wrapped(x: Option<T>) { x.f; }
+pub struct D { pub k: u8 }
+pub struct C { pub h: D }
+pub struct B { pub g: C }
+pub struct F { pub f: B }
+impl F {
+    pub fn within(&self) { self.f.g.h; }
+    pub fn beyond(&self) { self.f.g.h.k; }
+}
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for (from, name) in
+        [("unknown", "f"), ("generic", "f"), ("object", "f"), ("wrapped", "f"), ("F::beyond", "k")]
+    {
+        let targets = graph.targets(EdgeKind::References, from);
+        assert!(!targets.iter().any(|target| target.ends_with(&format!(".{name}"))), "{from}: {targets:?}");
+        let sites = field_sites(&graph, from, name);
+        assert_eq!(sites.len(), 1, "{from}: {:#?}", graph.0.open_sites);
+        assert_eq!(sites[0].replaces, None, "{from}");
+        assert_eq!(sites[0].edge_kind, EdgeKind::References, "{from}");
+    }
+    // The budget itself is unchanged: the level below still links.
+    assert!(graph.targets(EdgeKind::References, "F::within").contains(&"C.h".to_string()));
+    assert!(field_sites(&graph, "F::within", "h")[0].replaces.is_some());
+}
+
+/// GM-497 item 4: `x.a.f` with both levels typed gets an edge and a site per
+/// level, each site replacing its own edge. Control: `replaces: None` with
+/// no edge in `field_access` (neither `X.a` nor `A.f` links).
+#[test]
+fn each_level_of_a_typed_field_chain_gets_its_own_edge_and_site() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub struct A { pub f: u8 }\npub struct X { pub a: A }\npub fn run(x: X) -> u8 { x.a.f }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for (field, target) in [("a", "X.a"), ("f", "A.f")] {
+        let edge = reference_onto(&graph, "run", target);
+        let sites = field_sites(&graph, "run", field);
+        assert_eq!(sites.len(), 1, "{field}: {:#?}", graph.0.open_sites);
+        assert_eq!(sites[0].replaces.as_deref(), Some(edge.id.as_str()), "{field}");
+    }
+}
+
+/// GM-497 item 5: a positional field `x.0` emits no edge and no site of its
+/// own, and its value is still visited (`x.a` links). Control: drop the
+/// `field_identifier` filter in `field_access` (a site named `0` appears).
+#[test]
+fn a_positional_field_read_emits_nothing_but_its_value_is_visited() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub struct P(pub u8);\npub struct X { pub a: P }\npub fn run(x: X) -> u8 { x.a.0 }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert!(graph.targets(EdgeKind::References, "run").contains(&"X.a".to_string()));
+    assert_eq!(field_sites(&graph, "run", "a").len(), 1);
+    let run = graph.node("run").id.clone();
+    let positional: Vec<_> =
+        graph.0.open_sites.iter().filter(|site| site.from_id == run && site.name == "0").collect();
+    assert!(positional.is_empty(), "{positional:#?}");
+}
+
+/// GM-497 item 6: `self.f` inside `impl T` links `T.f` and opens no site at
+/// all. Control: route the `self` branch of `field_access` through the
+/// typed path (a `ReceiverField` site named `f` appears in `T::get`).
+#[test]
+fn a_self_field_read_links_the_field_and_opens_no_site() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub struct T { pub f: u8 }\nimpl T { pub fn get(&self) -> u8 { self.f } }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::References, "T::get"), vec!["T.f"]);
+    let get = graph.node("T::get").id.clone();
+    let sites: Vec<_> = graph.0.open_sites.iter().filter(|site| site.from_id == get).collect();
+    assert!(sites.is_empty(), "{sites:#?}");
+}
+
+/// GM-497 items 7 and 8: same-named fields of two structs link each to its
+/// own struct, and a field read never lands on a same-named method. Control:
+/// address the field through `type_address` of the wrong type, or through
+/// the method's `T::f` key, in `field_of` (a wrong target appears).
+#[test]
+fn a_field_read_links_its_own_structs_field_and_never_a_same_named_method() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub struct A { pub f: u8 }
+pub struct B { pub f: u8 }
+impl B { pub fn f(&self) -> u8 { 0 } }
+pub fn read_a(a: A) -> u8 { a.f }
+pub fn read_b(b: B) -> u8 { b.f }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    let fields = |from: &str| -> Vec<String> {
+        graph.targets(EdgeKind::References, from).into_iter().filter(|target| target.ends_with("f")).collect()
+    };
+    assert_eq!(fields("read_a"), vec!["A.f"]);
+    assert_eq!(fields("read_b"), vec!["B.f"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "read_b"), Vec::<String>::new(), "a field read is not a call");
+    for (from, target) in [("read_a", "A.f"), ("read_b", "B.f")] {
+        let edge = reference_onto(&graph, from, target);
+        assert_eq!(field_sites(&graph, from, "f")[0].replaces.as_deref(), Some(edge.id.as_str()), "{from}");
+    }
+}
+
+// --- the whole-file range (GM-527) ----------------------------------------------
+
+/// The `File` node ends where the file's content ends - trailing whitespace
+/// trimmed, then `(newlines, chars of the last line)` - never on the empty
+/// line after a final newline.
+///
+/// Control: restore the old body of `Positions::file_range` (emit.rs:
+/// `(split('\n').count() - 1, chars after the last '\n')`); every row ending
+/// in whitespace fails.
+#[test]
+fn the_file_node_ends_on_the_files_last_real_line() {
+    let cases: &[(&str, &str, (u32, u32))] = &[
+        ("empty", "", (0, 0)),
+        ("no final newline", "fn a() {}\nfn bc() {}", (1, 10)),
+        ("a final newline", "fn a() {}\nfn bc() {}\n", (1, 10)),
+        ("ends in two newlines", "fn a() {}\nfn bc() {}\n\n", (1, 10)),
+        ("trailing spaces", "fn a() {}\nfn bc() {}  \n", (1, 10)),
+        ("chars, not bytes", "fn a() {}\nconst E: &str = \"é😀\";\n", (1, 21)),
+    ];
+    for (what, source, (line, col)) in cases {
+        let krate = Crate::new(&[("src/lib.rs", source)]);
+        let graph = krate.extract("src/lib.rs");
+        let file = graph.node("src/lib.rs");
+        assert_eq!(file.kind, NodeKind::File, "{what}");
+        assert_eq!((file.range.start.line, file.range.start.col), (0, 0), "{what}: {source:?}");
+        assert_eq!((file.range.end.line, file.range.end.col), (*line, *col), "{what}: {source:?}");
+    }
 }

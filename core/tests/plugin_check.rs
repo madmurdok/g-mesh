@@ -81,7 +81,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// Every check id the kit reports, in report order - asserted in full on
 /// every run, so a check silently dropping out of the report fails a test
 /// rather than passing every "only X fails" assertion vacuously.
-const ALL_CHECKS: [&str; 15] = [
+const ALL_CHECKS: [&str; 16] = [
     "session",
     "shape",
     "stream-order",
@@ -97,7 +97,15 @@ const ALL_CHECKS: [&str; 15] = [
     "ownership.diff-stays-in-file",
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
+    "capabilities.files-created-resolves",
 ];
+
+/// The checks that report `SKIP` on a plugin declaring `semantic_pass =
+/// true` run without an `--expect` pair: the undeclared-pass check does not
+/// apply, and `files-created-resolves` has no `[files_created]` pair to run
+/// (or the manifest does not declare the capability).
+const SKIPPED_WITHOUT_PAIR: [&str; 2] =
+    ["capabilities.semantic-pass-undeclared", "capabilities.files-created-resolves"];
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plugin_check")
@@ -153,6 +161,12 @@ struct FakePlugin {
 /// `plugin.toml`, since `read_manifest` requires the directory to be named
 /// after the language.
 fn install_fake(defect: &str, semantic_pass: bool) -> FakePlugin {
+    install_fake_with(defect, semantic_pass, false)
+}
+
+/// [`install_fake`] with the manifest's `files_created` capability switched
+/// as given - GM-516's `capabilities.files-created-resolves`.
+fn install_fake_with(defect: &str, semantic_pass: bool, files_created: bool) -> FakePlugin {
     let binary = Path::new(BIN)
         .parent()
         .expect("the g-mesh binary has a directory")
@@ -169,7 +183,7 @@ fn install_fake(defect: &str, semantic_pass: bool) -> FakePlugin {
              [plugin.spawn]\ncommand = \"${{G_MESH_BIN_DIR}}/{FAKE_PLUGIN_BIN}\"\n\
              args = [\"--language\", \"fake\", \"--plugin-version\", \"0.0.0-fake\", \"--toy\", \"{defect}\"]\n\n\
              [plugin.languages]\nextensions = [\".fk\"]\n\n\
-             [plugin.capabilities]\nsemantic_pass = {semantic_pass}\n"
+             [plugin.capabilities]\nsemantic_pass = {semantic_pass}\nfiles_created = {files_created}\n"
         ),
     )
     .unwrap();
@@ -277,7 +291,7 @@ fn the_conformant_fake_passes_every_check() {
     let run = run_check(&fake.dir, &fixture, &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
+        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     assert!(!run.stdout.contains("WARN"), "a v2-speaking plugin gets no legacy warning:\n{}", run.stdout);
@@ -379,6 +393,24 @@ fn ids_that_change_between_bulk_runs_fail_bulk_repeat() {
 fn a_range_moved_by_whitespace_fails_the_whitespace_edit_check() {
     let run = assert_only_failure("whitespace-moves-range", true, "id-stability.whitespace-edit", &[]);
     assert!(run.stdout.contains("upserts node \"a.fk#file\""), "{}", run.stdout);
+}
+
+/// GM-527. A plugin whose `File` node keeps the old end, `(lines, 0)` one
+/// past the last line after a final newline, answers the whitespace edit with
+/// an empty diff - that end does not move either - but its end line is not
+/// the line `a.fk`'s content ends on (3, of 4 lines and a final newline), so
+/// `whitespace-edit` fails on that node alone.
+///
+/// Control: remove the `file_end_past_content` finding from
+/// `checks::whitespace_edit`; every check passes and `assert_only_failure`
+/// fails.
+#[test]
+fn a_file_end_past_the_last_line_fails_the_whitespace_edit_check() {
+    let run = assert_only_failure("file-end-past-last-line", true, "id-stability.whitespace-edit", &[]);
+    assert!(run.stdout.contains("\"a.fk#file\""), "{}", run.stdout);
+    assert!(run.stdout.contains("ends at 4:0"), "the old end is named: {}", run.stdout);
+    assert!(run.stdout.contains("ends on line 3"), "the content's end line is named: {}", run.stdout);
+    assert!(!run.stdout.contains("upserts node"), "the diff itself is empty: {}", run.stdout);
 }
 
 #[test]
@@ -562,7 +594,7 @@ fn the_typescript_plugin_passes_on_a_small_typescript_fixture() {
     for id in ALL_CHECKS {
         // The shipped manifest declares `semantic_pass = true`, so the
         // undeclared-pass check is the one that does not apply.
-        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
+        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     // GM-275: the TS plugin speaks wire v2 now, so there is nothing left for
@@ -588,7 +620,7 @@ fn the_go_plugin_passes_on_its_own_fixture() {
     let run = run_check(&go_plugin_dir(), &go_conformance_project(), &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
+        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     assert!(!run.stdout.contains("WARN"), "{}", run.stdout);
@@ -1240,4 +1272,242 @@ fn a_namespace_import_caller_needs_the_semantic_pass_to_resolve() {
     ] {
         assert_eq!(run.outcome(id), "PASS", "{id}:\n{}", run.stdout);
     }
+}
+
+// --- capabilities.files-created-resolves (GM-516) ---------------------------
+
+const FILES_CREATED: &str = "capabilities.files-created-resolves";
+
+/// The `[files_created]` pair every test below uses unless it says
+/// otherwise: `d.fk` imports `c.fk`, both new to the fake fixture.
+const FK_PAIR: &str = "[files_created]\ntarget = \"c.fk\"\ntarget_text = \"fn created\\n\"\n\
+                       importer = \"d.fk\"\nimporter_text = \"import c.fk\\n\"\n";
+
+/// The fake with `files_created` as given, on `fixture`, with an
+/// expectations file holding `expect` - written outside the fixture, so the
+/// pair's validation sees exactly the fixture's files.
+fn run_files_created(defect: &str, files_created: bool, fixture: &Path, expect: &str) -> Run {
+    let fake = install_fake_with(defect, true, files_created);
+    let expect_dir = tempfile::tempdir().unwrap();
+    let expect = write_expect_file(expect_dir.path(), expect);
+    run_check_with_expect(&fake.dir, fixture, &expect)
+}
+
+/// No step of the files-created session ran: no warm-up, no `filesCreated`
+/// frame, no `fileChanged` of a pair file - so no second plugin process was
+/// spawned for it either (the session's first step after its handshake is
+/// the warm-up, which is always reported).
+fn assert_no_files_created_session(run: &Run) {
+    for needle in ["filesCreated", "files-created warm-up", "files-created: "] {
+        assert!(
+            !run.stdout.contains(needle),
+            "no files-created session may run ({needle:?}):\n{}",
+            run.stdout
+        );
+    }
+}
+
+/// The position of `needle` in the report, panicking with the report.
+fn position(run: &Run, needle: &str) -> usize {
+    run.stdout.find(needle).unwrap_or_else(|| panic!("the report carries no {needle:?}:\n{}", run.stdout))
+}
+
+/// AC 1, behaviours 1, 4 and 5: a conformant declaring plugin resolves the
+/// same-batch new importer, and the session drives it in D5's order - one
+/// id-less `filesCreated` listing both paths (importer first), the warm-up
+/// `fileChanged` before the pair's, the importer's before the target's. The
+/// rest of the report is the baseline, and the fixture is untouched.
+///
+/// Controls: drop `driver.notify` in `run_files_created_session`, or move it
+/// after the pair's `fileChanged`s (the toy then resolves `import c.fk`
+/// against a file set without `c.fk`: `FAIL`); drop the warm-up step (its
+/// line is missing); route the target before the importer (the order
+/// assertion fails); send the notification with an id (`record` no longer
+/// counts it as a notification, so its line is missing).
+#[test]
+fn a_declaring_fake_resolves_an_importer_created_with_its_target() {
+    let fixture = fixtures().join("fake");
+    let before: Vec<(PathBuf, Vec<u8>)> =
+        ["a.fk", "b.fk"].iter().map(|f| (fixture.join(f), fs::read(fixture.join(f)).unwrap())).collect();
+
+    let run = run_files_created("none", true, &fixture, FK_PAIR);
+    assert!(run.success, "{}", run.stdout);
+    for id in ALL_CHECKS {
+        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
+        assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
+    }
+    assert_eq!(run.outcome("expectations.file"), "PASS", "{}", run.stdout);
+
+    assert!(
+        run.stdout.contains("files-created: filesCreated (d.fk, c.fk): notification listing d.fk, c.fk"),
+        "one id-less filesCreated listing both paths, importer first:\n{}",
+        run.stdout
+    );
+    assert_eq!(run.stdout.matches("notification listing").count(), 1, "{}", run.stdout);
+    let warm_up = position(&run, "files-created warm-up: fileChanged (");
+    let importer = position(&run, "files-created: fileChanged (d.fk, the new importer) -> fileChanged");
+    let target = position(&run, "files-created: fileChanged (c.fk, the new target) -> fileChanged");
+    assert!(warm_up < importer && importer < target, "warm-up, importer, then target:\n{}", run.stdout);
+
+    for (path, contents) in before {
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            contents,
+            "the kit must never modify the fixture ({})",
+            path.display()
+        );
+    }
+    assert!(!fixture.join("c.fk").exists() && !fixture.join("d.fk").exists());
+}
+
+/// Behaviour 2: a declaring plugin that ignores the notification fails this
+/// check and only this one, and the finding names where the import landed.
+/// Control: route the target's `fileChanged` before the importer's (the
+/// toy's own `fileChanged` then adds `c.fk` to its file set first, the
+/// import resolves, and the check passes).
+#[test]
+fn a_declaring_fake_that_ignores_files_created_fails_only_that_check() {
+    let run = run_files_created("files-created-ignored", true, &fixtures().join("fake"), FK_PAIR);
+    assert!(!run.success, "a failing check must make the command exit non-zero:\n{}", run.stdout);
+    assert_eq!(run.failing(), vec![FILES_CREATED], "{}", run.stdout);
+    assert!(
+        run.stdout.contains("notification listing d.fk, c.fk"),
+        "the notification was sent:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains(
+            "IMPORTS lands on Module \"c.fk\" in \"d.fk\" nativeKind external_module (resolved: false)"
+        ),
+        "{}",
+        run.stdout
+    );
+}
+
+/// AC 2, behaviour 3: a plugin that does not declare the capability is
+/// sent nothing - no files-created session runs at all - and the check is
+/// `SKIP` "not applicable", even with a pair configured and a defect that
+/// would fail it. Control: remove the `manifest.capabilities.files_created`
+/// gate in `plugin_check::check` (the session runs and its lines appear).
+#[test]
+fn a_non_declaring_fake_is_never_sent_files_created() {
+    for defect in ["none", "files-created-ignored"] {
+        let run = run_files_created(defect, false, &fixtures().join("fake"), FK_PAIR);
+        assert!(run.success, "{defect}:\n{}", run.stdout);
+        assert_eq!(run.outcome(FILES_CREATED), "SKIP", "{defect}:\n{}", run.stdout);
+        assert!(
+            run.stdout.contains("not applicable: the manifest declares files_created = false"),
+            "{defect}:\n{}",
+            run.stdout
+        );
+        assert_no_files_created_session(&run);
+    }
+}
+
+/// Behaviour 6: declared but not configured - no `--expect`, an
+/// expectations file without the table, or one that does not parse - is
+/// `SKIP` "not configured", and no files-created session runs. Control:
+/// return `Pass` for `FilesCreatedConfig::Absent`/`Unparsed`.
+#[test]
+fn a_declaring_fake_without_a_pair_is_skipped_as_not_configured() {
+    let fixture = fixtures().join("fake");
+    let fake = install_fake_with("none", true, true);
+    let run = run_check(&fake.dir, &fixture, &[]);
+    assert!(run.success, "{}", run.stdout);
+    assert_eq!(run.outcome(FILES_CREATED), "SKIP", "{}", run.stdout);
+    assert!(run.stdout.contains("not configured: the manifest declares files_created"), "{}", run.stdout);
+    assert_no_files_created_session(&run);
+
+    let run = run_files_created(
+        "none",
+        true,
+        &fixture,
+        "[[definition]]\nsymbol = \"alpha\"\nexpect = [\"a.fk:alpha\"]\n",
+    );
+    assert_eq!(run.outcome("expectations.file"), "PASS", "{}", run.stdout);
+    assert_eq!(run.outcome(FILES_CREATED), "SKIP", "{}", run.stdout);
+    assert!(run.stdout.contains("not configured: the manifest declares files_created"), "{}", run.stdout);
+    assert_no_files_created_session(&run);
+
+    let run = run_files_created("none", true, &fixture, "this is not = = toml\n");
+    assert_eq!(run.outcome("expectations.file"), "FAIL", "{}", run.stdout);
+    assert_eq!(run.outcome(FILES_CREATED), "SKIP", "{}", run.stdout);
+    assert!(run.stdout.contains("not configured: the expectations file did not parse"), "{}", run.stdout);
+    assert_no_files_created_session(&run);
+}
+
+/// Behaviour 7: a pair that cannot run - a target that already exists in
+/// the fixture, an importer with no extension the manifest claims - fails
+/// the check naming each field, runs no session, and leaves the rest of the
+/// expectations file running. Control: skip
+/// `session::files_created_pair_findings` in `plugin_check::check`.
+#[test]
+fn an_invalid_pair_fails_the_check_and_not_the_parse() {
+    let expect = "[[definition]]\nsymbol = \"alpha\"\nexpect = [\"a.fk:alpha\"]\n\n\
+                  [files_created]\ntarget = \"a.fk\"\ntarget_text = \"fn created\\n\"\n\
+                  importer = \"d.txt\"\nimporter_text = \"import a.fk\\n\"\n";
+    let run = run_files_created("none", true, &fixtures().join("fake"), expect);
+    assert!(!run.success, "{}", run.stdout);
+    assert_eq!(run.failing(), vec![FILES_CREATED], "{}", run.stdout);
+    assert!(
+        run.stdout.contains("[files_created] target = \"a.fk\" already exists in the fixture"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("[files_created] importer = \"d.txt\" has none of the manifest's extensions"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(run.outcome("expectations.file"), "PASS", "{}", run.stdout);
+    assert_eq!(run.outcome("expectations.definition[0]"), "PASS", "{}", run.stdout);
+    assert_no_files_created_session(&run);
+}
+
+/// Behaviour 8: a files-created session that fails - here writing the
+/// target under `a.fk`, which is a file - fails `session` with the reason,
+/// skips this check as not reached, and still runs the expectations.
+/// Control: drop the push of the run's failure into `failures` in
+/// `plugin_check::check` (`session` then passes).
+#[test]
+fn a_failed_files_created_session_fails_session_and_skips_the_check() {
+    let expect = "[[definition]]\nsymbol = \"alpha\"\nexpect = [\"a.fk:alpha\"]\n\n\
+                  [files_created]\ntarget = \"a.fk/c.fk\"\ntarget_text = \"fn created\\n\"\n\
+                  importer = \"d.fk\"\nimporter_text = \"import a.fk/c.fk\\n\"\n";
+    let run = run_files_created("none", true, &fixtures().join("fake"), expect);
+    assert!(!run.success, "{}", run.stdout);
+    assert_eq!(run.failing(), vec!["session"], "{}", run.stdout);
+    assert!(run.stdout.contains("files-created session: files-created: failed to write"), "{}", run.stdout);
+    assert_eq!(run.outcome(FILES_CREATED), "SKIP", "{}", run.stdout);
+    assert!(run.stdout.contains("not reached: the files-created session failed"), "{}", run.stdout);
+    assert_eq!(run.outcome("expectations.definition[0]"), "PASS", "{}", run.stdout);
+}
+
+/// Behaviour 9: the pair never reaches the index the expectations read.
+/// `d.fk` imports the fixture's `a.fk` as well as its target, yet
+/// `[[importers]]` of `a.fk` stays `b.fk` alone. Control: run the
+/// files-created steps on the main index (`conn`) instead of a fresh one.
+#[test]
+fn the_pair_never_reaches_the_expectations_index() {
+    let fixture = write_fk_fixture(&[("a.fk", "fn alpha\n"), ("b.fk", "import a.fk\nfn beta\n")]);
+    let expect = "[[importers]]\nfile = \"a.fk\"\nexpect = [\"b.fk\"]\n\n\
+                  [files_created]\ntarget = \"c.fk\"\ntarget_text = \"fn created\\n\"\n\
+                  importer = \"d.fk\"\nimporter_text = \"import c.fk\\nimport a.fk\\n\"\n";
+    let run = run_files_created("none", true, fixture.path(), expect);
+    assert!(run.success, "{}", run.stdout);
+    assert_eq!(run.outcome(FILES_CREATED), "PASS", "the pair did run:\n{}", run.stdout);
+    assert_eq!(run.outcome("expectations.importers[0]"), "PASS", "{}", run.stdout);
+}
+
+/// Behaviour 10: `[files_created]` accepts no key beyond its four, like
+/// every other table - a parse error, so the check is "did not parse".
+/// Control: drop `deny_unknown_fields` from `FilesCreatedPair`.
+#[test]
+fn an_unknown_files_created_key_is_a_parse_error() {
+    let run =
+        run_files_created("none", true, &fixtures().join("fake"), &format!("{FK_PAIR}bogus_field = 1\n"));
+    assert_eq!(run.outcome("expectations.file"), "FAIL", "{}", run.stdout);
+    assert!(run.stdout.contains("bogus_field") && run.stdout.contains("unknown field"), "{}", run.stdout);
+    assert_eq!(run.outcome(FILES_CREATED), "SKIP", "{}", run.stdout);
+    assert_no_files_created_session(&run);
 }

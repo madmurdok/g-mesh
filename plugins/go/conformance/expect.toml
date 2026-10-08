@@ -188,10 +188,10 @@ expect = ["server/conn.go:CloseAll"]
 # that exists went to `Closer.Close`. So this entry passes in the CI job that
 # runs with no Go toolchain as well as in the one that has it, and the reason
 # it can is the point: the response is byte-identical in both arms, so no
-# field on it could tell a reader which arm produced it. That is why GM-385
-# discloses this once per session (`core/src/mcp/instructions.rs`'s
-# `P4_STATIC`) instead of marking the page - and why neither that
-# sentence nor this file may ever state a *count* of the calls missing here.
+# field on its rows could tell a reader which arm produced it. That is why the
+# page names the base member instead (`find_callers`' `overrides`,
+# `core/src/mcp/overrides.rs`) - and why neither that field nor this file
+# may ever state a *count* of the calls missing here.
 # The index knows `Closer` has three implementors; it does not know how many
 # of `CloseAll`'s iterations reach this one, and a number a caller acts on is
 # worse than silence.

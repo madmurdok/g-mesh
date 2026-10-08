@@ -13,12 +13,14 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::daemon::manifest::Capabilities;
+use crate::daemon::registry::PathCoverage;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::{self, Direction};
 use crate::graph::queries;
 use crate::storage::index_store::IndexStore;
 use crate::storage::write::NodeRecord;
 
+use super::not_indexed::{self, NotIndexed};
 use super::query_shapes::QueryShapes;
 use super::session_hints::{self, HintKey, SessionHints};
 use super::tool_result::{internal_error, success};
@@ -129,6 +131,11 @@ struct ReferencePage<'a> {
     /// is nearly all of them.
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
+    /// See `super::not_indexed::group` - the `file_paths` entries in a
+    /// language with no indexed files (plugin absent or failed), one entry
+    /// per language. Absent when the filter is omitted or fully covered.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    not_indexed: &'a [NotIndexed],
 }
 
 /// The response-level disclosures of [`ReferencePage`], carried unchanged by
@@ -142,6 +149,8 @@ struct ReferenceDisclosures<'a> {
     untyped_receiver_calls: Option<&'a UntypedReceiverCalls>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<provenance::Provenance>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    not_indexed: &'a [NotIndexed],
 }
 
 /// Paginates the incoming `USAGE_EDGE_KINDS` edges for `anchor_id` and
@@ -224,6 +233,7 @@ struct ReferenceParts<'a> {
     untyped: Option<UntypedReceiverCalls>,
     tier: provenance::Resolved,
     hints: &'a SessionHints,
+    not_indexed: &'a [NotIndexed],
 }
 
 impl ReferenceParts<'_> {
@@ -281,6 +291,7 @@ impl ReferenceParts<'_> {
             unlinked_usages: self.unlinked.as_ref(),
             untyped_receiver_calls: self.untyped.as_ref(),
             provenance,
+            not_indexed: self.not_indexed,
         }
     }
 }
@@ -291,6 +302,20 @@ pub(crate) fn handle_in(
     semantic: &find_definition::SemanticRung<'_>,
     capabilities: &HashMap<String, Capabilities>,
     hints: &SessionHints,
+    params: SymbolQueryParams,
+) -> Result<CallToolResult, ErrorData> {
+    handle_in_covered(store, semantic, capabilities, hints, &[], params)
+}
+
+/// [`handle_in`], with `uncovered` the `file_paths` entries whose language
+/// is not indexed (`GMeshMcpServer::filter_coverage`): the answer names them
+/// in `notIndexed` (`not_indexed::group`).
+pub(crate) fn handle_in_covered(
+    store: &Arc<IndexStore>,
+    semantic: &find_definition::SemanticRung<'_>,
+    capabilities: &HashMap<String, Capabilities>,
+    hints: &SessionHints,
+    uncovered: &[(String, PathCoverage)],
     params: SymbolQueryParams,
 ) -> Result<CallToolResult, ErrorData> {
     let conn = store.read();
@@ -312,6 +337,7 @@ pub(crate) fn handle_in(
     let tier = provenance::resolve(&conn, capabilities, &anchor.language);
     let unlinked = unlinked::probe(&conn, &anchor, USAGE_EDGE_KINDS, &file_paths);
     let untyped = untyped::probe(&conn, &anchor, USAGE_EDGE_KINDS, &file_paths);
+    let not_indexed = not_indexed::group(&conn, uncovered)?;
 
     let counted = answer::count(
         &conn,
@@ -339,6 +365,7 @@ pub(crate) fn handle_in(
                 unlinked_usages: unlinked.as_ref(),
                 untyped_receiver_calls: untyped.as_ref(),
                 provenance,
+                not_indexed: &not_indexed,
             };
             (hint, disclosures)
         });
@@ -363,6 +390,7 @@ pub(crate) fn handle_in(
         untyped,
         tier,
         hints,
+        not_indexed: &not_indexed,
     };
 
     let page = list_references(
@@ -1653,5 +1681,97 @@ mod tests {
         assert!(hint_for(&repeated_file, &session).contains(session_hints::FILES_TALLY));
         assert!(!hint_for(&repeated_file, &session).contains(session_hints::FILES_TALLY), "once per session");
         assert!(hint_for(&repeated_file, &SessionHints::default()).contains(session_hints::FILES_TALLY));
+    }
+
+    // -----------------------------------------------------------------
+    // `file_paths` entries whose language is not indexed at all
+    // -----------------------------------------------------------------
+
+    use crate::mcp::not_indexed::test_support::*;
+    use crate::mcp::Answer;
+
+    /// `target` in target.rs, referenced from a.rs.
+    fn referenced_from_a() -> Arc<IndexStore> {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("target", "Function", "run", "pkg::run", "target.rs", "rust"))
+            .unwrap();
+        upsert_node(&mut conn, NodeRecord::new("user", "Function", "a", "pkg::a", "a.rs", "rust")).unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e", "user", "target", "REFERENCES", "tree-sitter", true))
+            .unwrap();
+        Arc::new(IndexStore::new(conn))
+    }
+
+    fn scoped(
+        store: &Arc<IndexStore>,
+        uncovered: &[(String, PathCoverage)],
+        symbol_id: &str,
+        answer: Option<Answer>,
+    ) -> CallToolResult {
+        let params = SymbolQueryParams {
+            symbol_id: Some(symbol_id.to_string()),
+            file_paths: Some(vec!["a.rs".to_string(), "x.py".to_string()]),
+            answer,
+            ..Default::default()
+        };
+        handle_in_covered(
+            store,
+            &find_definition::SemanticRung::off(),
+            &no_capabilities(),
+            &SessionHints::default(),
+            uncovered,
+            params,
+        )
+        .unwrap()
+    }
+
+    fn python_entry() -> serde_json::Value {
+        serde_json::json!([{
+            "language": "python",
+            "reason": "pluginAbsent",
+            "command": "g-mesh plugins install python",
+            "filePaths": ["x.py"],
+        }])
+    }
+
+    /// The rows answer as usual and `notIndexed` names the
+    /// uncovered entry; with nothing uncovered there is no key (S6-3).
+    ///
+    /// Controls: drop the `not_indexed` field from `ReferencePage` (or
+    /// pass `&[]` for it in `ReferenceParts`) - the key is missing; drop
+    /// its `skip_serializing_if` - the uncovered-free answer carries `[]`.
+    #[test]
+    fn a_rows_answer_names_the_uncovered_file_paths() {
+        let store = referenced_from_a();
+        let body = json_body(&scoped(&store, &[("x.py".to_string(), python_absent())], "target", None));
+        assert_eq!(body["notIndexed"], python_entry(), "{body}");
+        assert_eq!(body["results"].as_array().unwrap().len(), 1, "the rows are unchanged: {body}");
+
+        let body = json_body(&scoped(&store, &[], "target", None));
+        assert!(body.get("notIndexed").is_none(), "{body}");
+    }
+
+    /// `answer: "files"` and `"count"` carry it too.
+    ///
+    /// Control: drop the `not_indexed` field from `ReferenceDisclosures` -
+    /// both assertions fail.
+    #[test]
+    fn files_and_count_answers_name_the_uncovered_file_paths() {
+        let store = referenced_from_a();
+        for answer in [Answer::Files, Answer::Count] {
+            let body =
+                json_body(&scoped(&store, &[("x.py".to_string(), python_absent())], "target", Some(answer)));
+            assert_eq!(body["notIndexed"], python_entry(), "{answer:?}: {body}");
+        }
+    }
+
+    /// An unknown anchor answers exactly as before.
+    ///
+    /// Control: run `not_indexed::group` before `anchor::resolve` and
+    /// attach it to the anchor error.
+    #[test]
+    fn an_unknown_anchor_carries_no_not_indexed_field() {
+        let store = referenced_from_a();
+        let result = scoped(&store, &[("x.py".to_string(), python_absent())], "nope", None);
+        assert!(!error_text(&result).contains("notIndexed"));
     }
 }

@@ -85,7 +85,12 @@ fn indexed_timeout() -> Duration {
 /// overriding it for an unusually loaded box - or an unusually fast one that
 /// wants tests to fail faster - takes one env var instead of an edit to
 /// thirteen files.
-const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 60;
+///
+/// 240s rather than 60s: under load averages in the hundreds the OS itself
+/// can stall a fresh process before its first instruction (a shim was seen
+/// sitting in `_dyld_start` for over 80s), so the budget has to cover the
+/// machine, not the daemon. A real hang still fails, only later.
+const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 240;
 
 /// [`DEFAULT_STARTUP_TIMEOUT_SECS`], or `G_MESH_TEST_STARTUP_TIMEOUT_SECS` if
 /// it names a parsable number. Same "unparsable is not fatal" rule as
@@ -327,6 +332,29 @@ pub fn kill_and_wait(pid: u32) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while daemon::is_process_alive(pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Ties a `g-mesh` this test starts to the test process's own life: sets
+/// [`daemon::lifecycle::LIFELINE_PID_ENV`] to this process's pid, so a daemon
+/// started directly, or detached by a shim (which passes its environment on),
+/// shuts itself down within one tick once the test process is gone, even when
+/// it died without running any teardown (SIGKILL, a nextest timeout, ctrl-c).
+/// Every site that starts a daemon or a shim goes through this; one-shot CLI
+/// commands never start a daemon and do not need it.
+pub trait Lifeline {
+    fn lifeline(&mut self) -> &mut Self;
+}
+
+impl Lifeline for std::process::Command {
+    fn lifeline(&mut self) -> &mut Self {
+        self.env(daemon::lifecycle::LIFELINE_PID_ENV, std::process::id().to_string())
+    }
+}
+
+impl Lifeline for tokio::process::Command {
+    fn lifeline(&mut self) -> &mut Self {
+        self.env(daemon::lifecycle::LIFELINE_PID_ENV, std::process::id().to_string())
     }
 }
 

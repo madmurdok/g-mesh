@@ -124,10 +124,19 @@
 //! `use`/`export { x }` beats a glob in Rust and ES modules, even when the
 //! named one leads nowhere - a Rust `use std::io::Error;` beside
 //! `use self::x::*;` is a row to the external crate, so the walk stops there
-//! rather than linking `x::Error`. A language that does not declare it (Python,
-//! where the later import binds the name) keeps named and `*` rows side by
-//! side at one depth, with no winner. Only `name` keys walk; a `qualifiedName` names a
-//! declaration, never a pass-through - except through its head, below.
+//! rather than linking `x::Error`. A language that declares `[plugin.reexports]
+//! later_import_binds` instead (Python, where each import statement rebinds
+//! the name) orders one scope's rows by statement - the row node's start
+//! position, compared within one file only - and the latest row that binds
+//! the name wins: a named row always binds (even when it leads nowhere), a
+//! `*` row binds only when a sub-walk from it finds the name, so a later star
+//! import that does not provide the name never hides an earlier binding.
+//! Rows from different files, or two at one position, keep the old answer:
+//! side by side at one depth, with no winner, which is also what a language
+//! declaring neither rule gets. Decision:
+//! `docs/architecture/gm-496-python-later-import-binds.md`. Only `name` keys
+//! walk; a `qualifiedName` names a declaration, never a pass-through - except
+//! through its head, below.
 //!
 //! ## Members of a re-exported head
 //!
@@ -319,14 +328,18 @@ const VISIBILITY_PUBLIC: &str = "public";
 const VISIBILITY_FILE: &str = "file";
 const VISIBILITY_CONTAINER: &str = "container";
 
-/// The edge kinds a pending-symbol placeholder can carry, and the node kind
-/// each one demands of the symbol it is linked to. `CALLS` is Function ->
-/// Function by definition and `SUPERTYPE_OF` relates two types; `REFERENCES`
-/// is the catch-all usage edge and accepts whatever the scope offers.
-const LINKABLE_EDGE_KINDS: [(&str, Option<&str>); 3] =
-    [("CALLS", Some("Function")), ("SUPERTYPE_OF", Some("Type")), ("REFERENCES", None)];
+/// The edge kinds a pending-symbol placeholder can carry, and the node kinds
+/// each one accepts for the symbol it is linked to, in order of preference.
+/// `CALLS` is Function -> Function by definition. `SUPERTYPE_OF` relates two
+/// types, and also a trait-impl method to the trait method it implements
+/// (`<Square as Shape>::area -> Shape::area`), so it accepts a `Function` -
+/// but only where no `Type` fits, so a placeholder that can link to a type
+/// still links to that type. `REFERENCES` is
+/// the catch-all usage edge and accepts whatever the scope offers.
+const LINKABLE_EDGE_KINDS: [(&str, Option<&[&str]>); 3] =
+    [("CALLS", Some(&["Function"])), ("SUPERTYPE_OF", Some(&["Type", "Function"])), ("REFERENCES", None)];
 
-fn required_target_kind(edge_kind: &str) -> Option<Option<&'static str>> {
+fn required_target_kind(edge_kind: &str) -> Option<Option<&'static [&'static str]>> {
     LINKABLE_EDGE_KINDS.iter().find(|(kind, _)| *kind == edge_kind).map(|(_, required)| *required)
 }
 
@@ -479,7 +492,7 @@ type Address = (Scope, String);
 
 /// Who a placeholder is asking on behalf of - the half of its target the
 /// visibility check reads.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Requester {
     file: String,
     container: Option<String>,
@@ -580,6 +593,10 @@ pub struct LinkRules {
     /// named_shadows_glob = true`: in one scope, a named re-export of a name
     /// hides every `*` re-export for it.
     named_shadows_glob: HashSet<String>,
+    /// Languages whose plugin declares `[plugin.reexports]
+    /// later_import_binds = true`: in one scope, the latest row that binds a
+    /// name wins (a named row, or a `*` row that provides the name).
+    later_import_binds: HashSet<String>,
 }
 
 impl LinkRules {
@@ -590,7 +607,24 @@ impl LinkRules {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Self { named_shadows_glob: languages.into_iter().map(Into::into).collect() }
+        Self { named_shadows_glob: languages.into_iter().map(Into::into).collect(), ..Self::default() }
+    }
+
+    /// These rules, plus exactly `languages` binding a name by the later of
+    /// the scope's import statements.
+    pub fn with_later_import_binds<I, S>(mut self, languages: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.later_import_binds = languages.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Whether, in a scope of `language`, the later of the scope's re-export
+    /// rows that binds a name wins over the earlier ones.
+    pub fn later_import_binds(&self, language: &str) -> bool {
+        self.later_import_binds.contains(language)
     }
 
     /// Whether, in a scope of `language`, a named re-export shadows the
@@ -1251,13 +1285,18 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
                 let Some(required) = required_target_kind(&edge_kind) else {
                     continue; // not a usage edge - nothing here linked it, so nothing here moves it
                 };
-                let fitting: Vec<&Candidate> = candidates
-                    .iter()
-                    .filter(|candidate| match required {
-                        Some(required) => candidate.kind == required,
-                        None => true,
-                    })
-                    .collect();
+                // The first accepted kind any candidate has decides; the
+                // others are not considered beside it.
+                let fitting: Vec<&Candidate> = match required {
+                    Some(kinds) => kinds
+                        .iter()
+                        .map(|kind| {
+                            candidates.iter().filter(|candidate| candidate.kind == *kind).collect::<Vec<_>>()
+                        })
+                        .find(|fitting| !fitting.is_empty())
+                        .unwrap_or_default(),
+                    None => candidates.iter().collect(),
+                };
                 let target_id = match fitting.as_slice() {
                     [candidate] => Some(candidate.id.clone()),
                     // Nothing (of the right kind): a missing edge beats a wrong one.
@@ -1298,7 +1337,7 @@ fn report_untargeted(placeholders: usize, reexports: usize) {
     if placeholders == 0 && reexports == 0 {
         return;
     }
-    eprintln!(
+    crate::log_line!(
         "g-mesh: left {placeholders} pending-symbol placeholder(s) and skipped {reexports} re-export(s) with no \
          placeholder target (an address the plugin sent in a shape core could not read) - unlinked, not guessed"
     );
@@ -1335,6 +1374,12 @@ struct Hop {
     /// explicit import beats a glob in Rust, as an explicit export beats
     /// `export *` in ES modules, while in Python the later import binds.
     named_shadows_glob: bool,
+    /// Whether the row's language binds a name by the later import statement
+    /// ([`LinkRules::later_import_binds`]) - Python.
+    later_import_binds: bool,
+    /// The row node's `(filePath, startLine, startCol)`: its statement's
+    /// order, comparable only between rows of one file.
+    position: (String, i64, i64),
     /// `Some((language, container))` for a row of `container` visibility: only
     /// a requester of that language in that container or below it may follow
     /// it. `None` for every other row, which anyone may follow.
@@ -1364,6 +1409,9 @@ struct Resolver<'c> {
     /// Candidate id -> whether it is a type member ([`Resolver::is_type_member`]).
     type_members: HashMap<String, bool>,
     untargeted_reexports: HashSet<String>,
+    /// `(step, cap, requester)` -> whether a walk from `step` of at most
+    /// `cap` hops finds a visible declaration ([`Resolver::provides`]).
+    provides: HashMap<(Step, usize, Requester), bool>,
 }
 
 impl<'c> Resolver<'c> {
@@ -1371,7 +1419,8 @@ impl<'c> Resolver<'c> {
         const CANDIDATE: &str = "SELECT id, kind, filePath, language, visibility, visibilityContainer, \
              qualifiedName, container, qualifiedPath FROM nodes";
         const REEXPORT: &str = "SELECT n.id, n.name, n.language, t.scopeKind, t.scope, t.keyKind, t.key, \
-             n.visibility, n.visibilityContainer FROM nodes n LEFT JOIN placeholder_targets t ON t.nodeId = n.id";
+             n.visibility, n.visibilityContainer, n.filePath, n.startLine, n.startCol \
+             FROM nodes n LEFT JOIN placeholder_targets t ON t.nodeId = n.id";
         // Unaliased: `CANDIDATE` selects from `nodes` directly.
         let declarations = declaration_only("");
         let prepare = |sql: String| conn.prepare(&sql).context("failed to prepare a symbol-linking lookup");
@@ -1411,6 +1460,7 @@ impl<'c> Resolver<'c> {
             visible_from: HashMap::new(),
             type_members: HashMap::new(),
             untargeted_reexports: HashSet::new(),
+            provides: HashMap::new(),
         })
     }
 
@@ -1445,10 +1495,23 @@ impl<'c> Resolver<'c> {
     /// bounds an acyclic chain, and both are needed since one does not imply
     /// the other.
     fn walk(&mut self, scope: &Scope, key: &Key, requester: &Requester) -> Result<(Vec<Candidate>, usize)> {
+        self.walk_capped(scope, key, requester, MAX_REEXPORT_DEPTH)
+    }
+
+    /// [`Resolver::walk`], following at most `cap` re-export hops: the full
+    /// walk spends [`MAX_REEXPORT_DEPTH`], a [`Resolver::provides`] probe what
+    /// is left of it.
+    fn walk_capped(
+        &mut self,
+        scope: &Scope,
+        key: &Key,
+        requester: &Requester,
+        cap: usize,
+    ) -> Result<(Vec<Candidate>, usize)> {
         let mut frontier: Vec<Step> = vec![(scope.clone(), key.clone())];
         let mut visited: HashSet<Step> = frontier.iter().cloned().collect();
 
-        for depth in 0..=MAX_REEXPORT_DEPTH {
+        for depth in 0..=cap {
             let mut candidates: Vec<Candidate> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
             for (scope, key) in &frontier {
@@ -1461,7 +1524,7 @@ impl<'c> Resolver<'c> {
                     }
                 }
             }
-            if !candidates.is_empty() || depth == MAX_REEXPORT_DEPTH {
+            if !candidates.is_empty() || depth == cap {
                 return Ok((candidates, depth));
             }
 
@@ -1476,8 +1539,8 @@ impl<'c> Resolver<'c> {
                 // item) and even when this requester may not follow it: in
                 // rustc the shadowed glob item is not in the scope at all, so
                 // a missing edge beats the wrong one a glob would give. A
-                // language that does not declare it (Python: the later import
-                // binds) keeps both kinds at this depth, with no winner.
+                // language declaring neither rule keeps both kinds at this
+                // depth, with no winner.
                 if hops.iter().any(|hop| hop.named && hop.named_shadows_glob) {
                     hops.retain(|hop| hop.named || !hop.named_shadows_glob);
                 }
@@ -1485,12 +1548,18 @@ impl<'c> Resolver<'c> {
                 for hop in hops {
                     // Checked before `visited`: a row this requester may not
                     // follow must not hide another row reaching the same step.
+                    // Also before the later-binding rule: a row nobody here
+                    // may follow neither wins nor hides.
                     if let Some((language, container)) = &hop.restricted_to {
                         if !self.sees(requester, language, container.as_deref())? {
                             continue;
                         }
                     }
                     followed.push(hop);
+                }
+                if !followed.is_empty() && followed.iter().all(|hop| hop.later_import_binds) {
+                    // `depth < cap` here, so this never underflows.
+                    followed = self.later_binding(followed, requester, cap - depth - 1)?;
                 }
                 for hop in followed {
                     if visited.insert(hop.to.clone()) {
@@ -1505,6 +1574,46 @@ impl<'c> Resolver<'c> {
         }
 
         Ok((Vec::new(), 0))
+    }
+
+    /// Of one scope's followable rows for a name, all of a
+    /// [`LinkRules::later_import_binds`] language, the one that binds it:
+    /// the latest named row, or a later `*` row that provides the name
+    /// ([`Resolver::provides`], within `cap` more hops). A `*` row that
+    /// provides nothing is skipped, so it hides nothing. Rows of different
+    /// files, or two at one position, have no statement order between them
+    /// and are all kept, as for a language without the rule.
+    fn later_binding(&mut self, mut hops: Vec<Hop>, requester: &Requester, cap: usize) -> Result<Vec<Hop>> {
+        let file = &hops[0].position.0;
+        let mut positions: HashSet<(i64, i64)> = HashSet::new();
+        let ordered = hops
+            .iter()
+            .all(|hop| &hop.position.0 == file && positions.insert((hop.position.1, hop.position.2)));
+        if !ordered {
+            return Ok(hops);
+        }
+        // Latest statement first.
+        hops.sort_by_key(|hop| std::cmp::Reverse((hop.position.1, hop.position.2)));
+        for hop in hops {
+            if hop.named || self.provides(&hop.to, requester, cap)? {
+                return Ok(vec![hop]);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Whether a walk from `step`, following at most `cap` re-export hops,
+    /// finds a declaration `requester` may see. Several count: the outer walk
+    /// reports that ambiguity itself.
+    fn provides(&mut self, step: &Step, requester: &Requester, cap: usize) -> Result<bool> {
+        let cache_key = (step.clone(), cap, requester.clone());
+        if let Some(known) = self.provides.get(&cache_key) {
+            return Ok(*known);
+        }
+        let (candidates, _) = self.walk_capped(&step.0, &step.1, requester, cap)?;
+        let found = !candidates.is_empty();
+        self.provides.insert(cache_key, found);
+        Ok(found)
     }
 
     /// A `qualifiedName` key's member, reached through its head: the head's
@@ -1701,6 +1810,9 @@ impl<'c> Resolver<'c> {
             Option<String>,
             String,
             Option<String>,
+            String,
+            i64,
+            i64,
         );
         let map = |row: &Row| -> rusqlite::Result<ReexportRow> {
             Ok((
@@ -1713,6 +1825,9 @@ impl<'c> Resolver<'c> {
                 row.get(6)?,
                 row.get(7)?,
                 row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
             ))
         };
         let rows: Vec<ReexportRow> = match scope {
@@ -1729,7 +1844,20 @@ impl<'c> Resolver<'c> {
         .context("failed to read a scope's re-exports")?;
 
         let mut hops = Vec::new();
-        for (id, published, language, scope_kind, target_scope, key_kind, key, visibility, visible_in) in rows
+        for (
+            id,
+            published,
+            language,
+            scope_kind,
+            target_scope,
+            key_kind,
+            key,
+            visibility,
+            visible_in,
+            file_path,
+            start_line,
+            start_col,
+        ) in rows
         {
             let (Some(scope_kind), Some(target_scope), Some(key_kind), Some(key)) =
                 (scope_kind, target_scope, key_kind, key)
@@ -1753,11 +1881,14 @@ impl<'c> Resolver<'c> {
                 }
             };
             let named_shadows_glob = self.rules.named_shadows_glob(&language);
+            let later_import_binds = self.rules.later_import_binds(&language);
             let restricted_to = (visibility == VISIBILITY_CONTAINER).then_some((language, visible_in));
             hops.push(Hop {
                 to: (target_scope, hop_key),
                 named: !whole_module,
                 named_shadows_glob,
+                later_import_binds,
+                position: (file_path, start_line, start_col),
                 restricted_to,
             });
         }

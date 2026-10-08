@@ -1163,6 +1163,7 @@ fn a_semantic_page_is_labelled_as_candidates_and_carries_ids_to_requery() {
             file_path: "a.rs".to_string(),
             start_line: None,
             end_line: None,
+            end_col: None,
             kind: "Function".to_string(),
             preview: None,
             source: None,
@@ -1905,12 +1906,13 @@ fn sourced_ids(body: &serde_json::Value) -> Vec<String> {
     ids
 }
 
-/// Two readable candidates and one whose `endLine` is the file's line count,
-/// one past its last line - the shape a Python `Module` node has (requests'
-/// `__version__`). Its span is refused, so the page carries source for some
-/// candidates only and must not claim "each with its source".
+/// Two readable candidates and one whose `endLine` is past the end of its
+/// 2-line file - a file shortened since the walk. (`(2, 0)` would not do: that
+/// is an old index's whole-file end, which is read - GM-527.) Its span is
+/// refused, so the page carries source for some candidates only and must not
+/// claim "each with its source".
 fn runs_one_past_the_end() -> (Arc<IndexStore>, tempfile::TempDir) {
-    let store = runs(&[("a", "a.rs", 0, 2), ("b", "b.rs", 1, 1), ("m", "m.rs", 0, 2)]);
+    let store = runs(&[("a", "a.rs", 0, 2), ("b", "b.rs", 1, 1), ("m", "m.rs", 0, 5)]);
     let project = project_files(&[
         ("a.rs", "fn run() {\n    alpha();\n}\n"),
         ("b.rs", "// b\nfn run() { beta() }\n"),
@@ -1977,7 +1979,7 @@ fn include_source_false_on_a_mixed_page_is_plainly_ambiguous() {
 /// all, and says the plain thing rather than "some".
 #[test]
 fn a_page_where_no_candidates_span_can_be_read_is_plainly_ambiguous() {
-    let store = runs(&[("a", "a.rs", 0, 1), ("b", "b.rs", 5, 9)]);
+    let store = runs(&[("a", "a.rs", 0, 2), ("b", "b.rs", 5, 9)]);
     let project = project_files(&[("a.rs", "fn run() {}\n"), ("b.rs", "fn run() {}\n")]);
 
     let body = json_body(&define(&store, project.path(), named("run")));
@@ -2073,4 +2075,206 @@ fn an_anchored_tools_ambiguous_page_carries_lines_and_no_source() {
         assert!(candidate["startLine"].is_i64() && candidate["endLine"].is_i64(), "{body}");
         assert!(candidate.get("source").is_none(), "{body}");
     }
+}
+
+// ---------------------------------------------------------------------
+// a position miss on a path whose language is not indexed at all
+// ---------------------------------------------------------------------
+
+use crate::mcp::not_indexed::test_support::*;
+
+fn at_position(file_path: &str) -> FindDefinitionParams {
+    FindDefinitionParams {
+        symbol_id: None,
+        symbol_name: None,
+        file_path: Some(file_path.to_string()),
+        position: Some(crate::protocol::types::Position { line: 0, col: 0 }),
+        cursor: None,
+        include_source: None,
+    }
+}
+
+fn covered_call(
+    conn: Connection,
+    coverage: Option<&PathCoverage>,
+    params: FindDefinitionParams,
+) -> CallToolResult {
+    handle_in(&Arc::new(IndexStore::new(conn)), &no_sources(), &SemanticRung::off(), coverage, params)
+        .unwrap()
+}
+
+/// File + position on an absent language's file is
+/// refused with the install command.
+///
+/// Control: pass `None` instead of `coverage` from `handle_in` to
+/// `by_position` (or call `error(..)` in its `None` arm) - the body is not
+/// JSON.
+#[test]
+fn a_position_in_an_absent_languages_file_is_refused_with_the_install_command() {
+    let result = covered_call(setup(), Some(&python_absent()), at_position("tools/gen.py"));
+    assert_python_absent_refusal(&refusal_body(&result), "g-mesh: no symbol found at tools/gen.py:0:0");
+}
+
+/// A position in a failed language's file names `g-mesh reindex` and the innermost cause.
+///
+/// Control: as above.
+#[test]
+fn a_position_in_a_failed_languages_file_is_refused_with_the_reindex_command() {
+    let conn = setup();
+    record_failed(&conn, "python");
+    let result = covered_call(conn, Some(&python_failed()), at_position("tools/gen.py"));
+    assert_python_failed_refusal(&refusal_body(&result), "g-mesh: no symbol found at tools/gen.py:0:0");
+}
+
+/// A covered language's position miss stays the plain message.
+///
+/// Control: make `not_indexed::miss`'s `None` arm build a refusal.
+#[test]
+fn a_position_miss_in_a_covered_language_stays_the_plain_message() {
+    let result = covered_call(setup(), None, at_position("src/nope.rs"));
+    assert_eq!(plain_error(&result), "g-mesh: no symbol found at src/nope.rs:0:0");
+}
+
+/// The name mode never carries the field, even when the
+/// caller's coverage says the (unused) path is uncovered.
+///
+/// Control: route `coverage` into `by_name`'s miss (`not_indexed::miss`
+/// there) - the answer becomes JSON.
+#[test]
+fn a_name_miss_never_carries_the_not_indexed_reason() {
+    let params = FindDefinitionParams {
+        symbol_id: None,
+        symbol_name: Some("does_not_exist".to_string()),
+        file_path: None,
+        position: None,
+        cursor: None,
+        include_source: None,
+    };
+    let result = covered_call(setup(), Some(&python_absent()), params);
+    assert!(plain_error(&result).contains("does_not_exist"));
+}
+
+/// A hit answers normally whatever the coverage.
+///
+/// Control: refuse whenever `coverage` is `Some` in `by_position`.
+#[test]
+fn a_position_hit_carries_no_not_indexed_key_whatever_the_coverage() {
+    let mut conn = setup();
+    let mut node = node_with_span("n1", "gen", "tools.gen.gen", "tools/gen.py", (5, 0));
+    node.language = "python".to_string();
+    upsert_node(&mut conn, node).unwrap();
+    let body = json_body(&covered_call(conn, Some(&python_absent()), at_position("tools/gen.py")));
+    assert_eq!(body["id"], "n1");
+    assert!(body.get("notIndexed").is_none(), "{body}");
+}
+
+// --- a whole-file candidate's source, new and old index (GM-527) ----------
+
+/// requests' `__version__.py`: 14 lines and a final newline. Its name is
+/// both the module's and a variable's in it, so `__version__` is an
+/// ambiguous page with a whole-file candidate on it.
+const VERSION_PY: &str = "# requests\n\n\n\
+    __title__ = \"requests\"\n\
+    __description__ = \"Python HTTP for Humans.\"\n\
+    __url__ = \"https://requests.readthedocs.io\"\n\
+    __version__ = \"2.32.3\"\n\
+    __build__ = 0x023203\n\
+    __author__ = \"Kenneth Reitz\"\n\
+    __author_email__ = \"me@kennethreitz.org\"\n\
+    __license__ = \"Apache-2.0\"\n\
+    __copyright__ = \"Copyright Kenneth Reitz\"\n\
+    \n\
+    __cake__ = \"cake\"\n";
+
+/// The module `requests.__version__` (whole-file span ending at
+/// `module_end`, a `(line, col)`) and its variable `__version__` (line 6),
+/// with `VERSION_PY` on disk.
+fn version_page(module_end: (i64, i64)) -> (Arc<IndexStore>, tempfile::TempDir) {
+    let mut conn = setup();
+    let file = "requests/__version__.py";
+    let mut module =
+        NodeRecord::new("module", "Module", "__version__", "requests.__version__", file, "python");
+    module.end_line = module_end.0;
+    module.end_col = module_end.1;
+    upsert_node(&mut conn, module).unwrap();
+    let mut variable = NodeRecord::new(
+        "variable",
+        "Variable",
+        "__version__",
+        "requests.__version__.__version__",
+        file,
+        "python",
+    );
+    variable.start_line = 6;
+    variable.end_line = 6;
+    variable.end_col = 22;
+    upsert_node(&mut conn, variable).unwrap();
+    (Arc::new(IndexStore::new(conn)), project_files(&[(file, VERSION_PY)]))
+}
+
+/// The page's `source.text` per candidate id.
+fn source_texts(body: &serde_json::Value) -> HashMap<String, String> {
+    body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| Some((c["id"].as_str()?.to_string(), c["source"]["text"].as_str()?.to_string())))
+        .collect()
+}
+
+/// A new index ends the module on its last real line, `(13, 17)`: an
+/// ordinary span, read like any other, so every candidate carries source.
+/// (No control of its own: it pins that the new end needs no clamp; the
+/// old-index test below carries this behaviour's control.)
+#[test]
+fn a_whole_file_candidate_in_a_new_index_carries_its_source() {
+    assert_eq!(VERSION_PY.lines().count(), 14, "precondition: requests' shape");
+    let (store, project) = version_page((13, 17));
+
+    let body = json_body(&define(&store, project.path(), named("__version__")));
+
+    assert_eq!(body["results"].as_array().unwrap().len(), 2, "precondition: {body}");
+    assert_eq!(sourced_ids(&body), vec!["module", "variable"], "{body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_SOURCED, "{body}");
+    let texts = source_texts(&body);
+    assert_eq!(texts["module"], VERSION_PY.trim_end(), "the whole file: {body}");
+    assert_eq!(texts["variable"], "__version__ = \"2.32.3\"", "{body}");
+}
+
+/// An index built before GM-527 holds the module's end as `(14, 0)`, one
+/// past the last line. The page still reads the whole file for it, so it is
+/// "each with its source", not "some". The end column never reaches the
+/// page's JSON.
+///
+/// Control: pass `None` instead of `candidate.end_col` in
+/// `CandidatePage::ambiguous` (or remove the clamp in `read_span_within`);
+/// the module loses its source and the explanation becomes PARTLY_SOURCED.
+#[test]
+fn a_whole_file_candidate_in_an_old_index_still_carries_its_source() {
+    let (store, project) = version_page((14, 0));
+
+    let body = json_body(&define(&store, project.path(), named("__version__")));
+
+    assert_eq!(body["results"].as_array().unwrap().len(), 2, "precondition: {body}");
+    assert_eq!(sourced_ids(&body), vec!["module", "variable"], "{body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_SOURCED, "{body}");
+    assert_eq!(source_texts(&body)["module"], VERSION_PY.trim_end(), "the whole file: {body}");
+    for candidate in body["results"].as_array().unwrap() {
+        assert!(candidate.get("endCol").is_none(), "the page's shape is unchanged: {body}");
+    }
+}
+
+/// A whole-file end past even the old convention - the file was shortened
+/// since the walk - is stale, and the page says only some are sourced.
+///
+/// Control: make the clamp in `read_span_within` unconditional; the module
+/// is read and the explanation becomes AMBIGUOUS_SOURCED.
+#[test]
+fn a_whole_file_candidate_past_the_old_end_is_stale_and_unsourced() {
+    let (store, project) = version_page((20, 0));
+
+    let body = json_body(&define(&store, project.path(), named("__version__")));
+
+    assert_eq!(sourced_ids(&body), vec!["variable"], "{body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_PARTLY_SOURCED, "{body}");
 }

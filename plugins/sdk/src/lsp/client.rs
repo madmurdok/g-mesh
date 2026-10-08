@@ -657,7 +657,7 @@ impl LspClient {
         let mut child = lock(&self.child);
         if child.kill().is_ok() {
             let _ = child.wait();
-            eprintln!("[{}] the language server did not exit when asked - killed it", self.language);
+            crate::log_line!("[{}] the language server did not exit when asked - killed it", self.language);
         }
     }
 
@@ -740,9 +740,9 @@ fn drain_stderr(language: &str, server: &str, stderr: std::process::ChildStderr)
     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
         lines += 1;
         if lines <= STDERR_LINE_BUDGET {
-            eprintln!("[{language}] {server}: {line}");
+            crate::log_line!("[{language}] {server}: {line}");
             if lines == STDERR_LINE_BUDGET {
-                eprintln!(
+                crate::log_line!(
                     "[{language}] {server}: further output is counted rather than printed - \
                      {STDERR_LINE_BUDGET} lines is this log's share of it"
                 );
@@ -752,7 +752,9 @@ fn drain_stderr(language: &str, server: &str, stderr: std::process::ChildStderr)
         }
     }
     if suppressed > 0 {
-        eprintln!("[{language}] {server}: {suppressed} further line(s) of server output were suppressed");
+        crate::log_line!(
+            "[{language}] {server}: {suppressed} further line(s) of server output were suppressed"
+        );
     }
 }
 

@@ -91,6 +91,9 @@
 //! `core/src/daemon/mod.rs`'s own `#[cfg(test)]` suite and
 //! `core/src/config/mod.rs`'s round-trip tests already cover that wiring.
 
+// Test diagnostics to the harness, not a daemon log line (GM-520).
+#![allow(clippy::disallowed_macros)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Child, Stdio};
@@ -112,6 +115,8 @@ use rmcp::ServiceExt;
 use rusqlite::Connection;
 
 mod common;
+
+use common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
@@ -482,6 +487,7 @@ impl DaemonProject {
         .expect("failed to write the project's config.toml");
 
         let daemon = std::process::Command::new(BIN)
+            .lifeline()
             .arg("daemon")
             .arg("--project-root")
             .arg(dir.path())
@@ -579,6 +585,7 @@ async fn the_generated_mcp_instructions_reflect_a_real_suspended_rust() {
     // daemon above by `--project-root`'s cwd and proxies to it - no second
     // cold start.
     let transport = TokioChildProcess::new(tokio::process::Command::new(BIN).configure(|cmd| {
+        cmd.lifeline();
         cmd.kill_on_drop(true)
             .arg("mcp-shim")
             .current_dir(project.root())
@@ -594,18 +601,24 @@ async fn the_generated_mcp_instructions_reflect_a_real_suspended_rust() {
 
     // ADR 0022: the text is rendered from manifest capabilities only, so it
     // is the same on both sides of the lock race. Rust resolves receiver
-    // calls only through its semantic pass: the static form plus the
-    // pass-dependent sentence, never the never-resolving form. Whether the
-    // pass has run reaches a caller per answer, through `provenance`.
+    // calls only through its semantic pass, and declares where an override's
+    // base member is (`member_overrides`), so the text carries the
+    // pass-dependent sentence alone: the override caveat travels on the
+    // answer (`overrides`), not in the instructions. Whether the pass has run
+    // reaches a caller per answer, through `provenance`.
     assert!(
-        text.contains("binds to the receiver's declared or inferred type"),
-        "rust resolves receiver calls once its pass has run, so the real MCP `initialize` \
-         response must render the STATIC-RECEIVER form (pass {}):\n{text}",
+        text.contains(
+            "until a language's semantic pass has run, a method call through a variable \
+                       receiver (`x.foo()`) has no edge at all there"
+        ),
+        "rust's receiver calls depend on its semantic pass, so the real MCP `initialize` \
+         response must say so (pass {}):\n{text}",
         if semantic_pass_done { "SET" } else { "NULL" }
     );
     assert!(
-        text.contains("Until a language's semantic pass has run, such a call has no edge at all there"),
-        "rust's receiver calls depend on its semantic pass, so the text must say so:\n{text}"
+        !text.contains("binds to the receiver's declared or inferred type"),
+        "rust declares member_overrides, so the static override caveat must not be in the \
+         instructions:\n{text}"
     );
     assert!(
         !text.contains("may produce no edge"),

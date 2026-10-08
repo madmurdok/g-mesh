@@ -1,0 +1,9 @@
+# GM-520: `eprintln!`/`eprint!` issue one `write(2)` per format piece, so
+# concurrent writers to the shared daemon log interleave mid-line. Daemon and
+# plugin code logs through `log_line!` (core/src/log.rs, plugins/sdk/src/log.rs)
+# instead. Terminal-facing code (the CLI, the MCP shim) and test diagnostics
+# opt out with `#[allow(clippy::disallowed_macros)]` at module/crate level.
+disallowed-macros = [
+    { path = "std::eprintln", reason = "split stderr writes interleave in the shared daemon log; use log_line! (GM-520)" },
+    { path = "std::eprint", reason = "split stderr writes interleave in the shared daemon log; use log_line! (GM-520)" },
+]

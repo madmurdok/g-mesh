@@ -259,7 +259,11 @@ fn rust_a_module_scoped_name_lands_on_the_free_fn_beside_a_same_named_member() {
     );
     assert_eq!(
         walked.exact_usages("m::S.x"),
-        usages(&[("REFERENCES", "m::S::get_x"), ("REFERENCES", "m::local")])
+        usages(&[
+            ("REFERENCES", "m::S::get_x"),
+            ("REFERENCES", "m::local"),
+            ("REFERENCES", "user::use_field"),
+        ])
     );
     assert_eq!(
         walked.exact_usages("m::T::y"),

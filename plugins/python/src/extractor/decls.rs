@@ -109,6 +109,14 @@
 //! needs none, because it is already a member of the container being looked
 //! in.
 //!
+//! Each such node carries the range of the **import statement that bound the
+//! name**, not the `__all__` assignment's: core orders one module's
+//! re-export rows by their start position, because in Python the later of a
+//! named import and a star import binds the name
+//! (`docs/architecture/gm-496-python-later-import-binds.md`). A repeated
+//! import of the same binding moves that range to the later statement
+//! ([`FileModel::import`](super::model::FileModel::import)).
+//!
 //! It is applied to any module, not only to an `__init__`, because the shape
 //! is the same wherever it is written; a package's `__init__` is simply the
 //! case it exists for. What it deliberately does **not** do is read `__all__`
@@ -124,7 +132,7 @@ use crate::extractor::model::{DeclRef, FileModel, Import};
 use crate::extractor::scope::{dotted_path, FrameKind, Scopes};
 use crate::extractor::syntax::{
     assignment_signature, definition_name, docstring, dotted_segments, has_decorator, inner_definition,
-    signature, string_literal, text,
+    property_accessor, signature, string_literal, text, Accessor,
 };
 use crate::project::ProjectContext;
 
@@ -240,8 +248,10 @@ impl Declarer<'_, '_> {
 
     /// `def f` / `async def f`, at any nesting depth.
     fn function(&mut self, outer: Node, inner: Node) {
-        let native_kind = match self.scopes.kind() {
-            FrameKind::Class => "method",
+        let accessor = self.accessor(outer, inner);
+        let native_kind = match (self.scopes.kind(), accessor) {
+            (FrameKind::Class, Some(accessor)) => accessor.native_kind(),
+            (FrameKind::Class, None) => "method",
             _ => "function",
         };
         let Some(id) = self.declare(outer, inner, NodeKind::Function, native_kind) else { return };
@@ -300,9 +310,30 @@ impl Declarer<'_, '_> {
         spec.signature = signature(outer, self.source);
         spec.doc_comment = inner.child_by_field_name("body").and_then(|body| docstring(body, self.source));
         let id = self.emitter.declare(spec, is_public(&own));
-        let scope = self.scopes.path().to_string();
-        self.model.declare(&scope, &name, &qualified, DeclRef { id: id.clone(), kind });
+        let decl = DeclRef { id: id.clone(), kind };
+        // A setter/deleter shares the getter's name and qualified name; it
+        // goes in the accessor table only, so name lookups keep finding the
+        // getter alone (see `FileModel::declare_accessor`).
+        match self.accessor(outer, inner) {
+            Some(accessor) if kind == NodeKind::Function => {
+                self.model.declare_accessor(&qualified, accessor, decl)
+            }
+            _ => {
+                let scope = self.scopes.path().to_string();
+                self.model.declare(&scope, &name, &qualified, decl);
+            }
+        }
         Some(id)
+    }
+
+    /// The property accessor the `def` `inner` (decorated as `outer`)
+    /// declares, when it is one: only in a class body.
+    fn accessor(&self, outer: Node, inner: Node) -> Option<Accessor> {
+        if self.scopes.kind() != FrameKind::Class {
+            return None;
+        }
+        let name = definition_name(inner, self.source)?;
+        property_accessor(outer, name, self.source)
     }
 
     /// A module-level assignment: one `Variable` per name it binds, plus, for
@@ -378,7 +409,7 @@ impl Declarer<'_, '_> {
                     } else {
                         Import::External
                     };
-                    self.model.import(&top, binding);
+                    self.model.import(&top, binding, range);
                 }
                 "aliased_import" => {
                     let Some(name) = leaf.child_by_field_name("name") else { continue };
@@ -391,7 +422,7 @@ impl Declarer<'_, '_> {
                         } else {
                             Import::Module { container: full.clone() }
                         };
-                        self.model.import(text(alias, self.source), binding);
+                        self.model.import(text(alias, self.source), binding, range);
                     }
                 }
                 _ => {}
@@ -492,7 +523,7 @@ impl Declarer<'_, '_> {
     /// import statement genuinely has.
     fn imported_name(&mut self, container: &str, name: &str, local: &str, range: Range, external: bool) {
         if external {
-            self.model.import(local, Import::External);
+            self.model.import(local, Import::External, range);
             return;
         }
         let placeholder = self.emitter.placeholder(
@@ -503,7 +534,11 @@ impl Declarer<'_, '_> {
         );
         let file = self.emitter.file_id().to_string();
         self.emitter.placeholder_edge(EdgeKind::References, &file, &placeholder);
-        self.model.import(local, Import::Item { container: container.to_string(), name: name.to_string() });
+        self.model.import(
+            local,
+            Import::Item { container: container.to_string(), name: name.to_string() },
+            range,
+        );
 
         // `from a.b import c` where `c` is itself a submodule of `a.b`
         // rather than a symbol declared inside it also loads that submodule
@@ -554,7 +589,9 @@ impl Declarer<'_, '_> {
     /// routinely is).
     pub(crate) fn reexport_dunder_all(&mut self) {
         let all = self.model.dunder_all().clone();
-        let Some(range) = all.range else { return };
+        if all.range.is_none() {
+            return;
+        }
         for published in &all.names {
             // A name this file declares itself is already a member of the
             // container a lookup searches, so a re-export node for it would
@@ -566,6 +603,10 @@ impl Declarer<'_, '_> {
                 continue;
             };
             let (container, name) = (container.clone(), name.clone());
+            // The import statement's range, not `__all__`'s: core orders one
+            // module's re-export rows by position, and the statement that
+            // bound the name is what Python's "the later import binds" reads.
+            let Some(range) = self.model.import_range(published) else { continue };
             self.emitter.reexport(
                 published,
                 container_target(&container, TargetKey::Name(name), &self.module.key),

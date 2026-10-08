@@ -21,7 +21,9 @@ use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
 
 mod common;
+
 use common::wait_until_indexed;
+use common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -74,6 +76,7 @@ impl Drop for Project {
 
 fn spawn_daemon(root: &Path) -> Child {
     Command::new(BIN)
+        .lifeline()
         .arg("daemon")
         .arg("--project-root")
         .arg(root)
