@@ -260,3 +260,151 @@ fn stop_clears_the_state_a_crashed_daemon_left_behind() {
     #[cfg(unix)]
     assert!(!project.socket().exists(), "the stale socket file must be cleared");
 }
+
+/// A folder of two Rust projects, `a` and `b`, served by one folder-mode
+/// shim.
+struct Folder {
+    dir: tempfile::TempDir,
+}
+
+impl Folder {
+    fn new() -> Self {
+        let folder = Self { dir: tempfile::tempdir().expect("failed to create a temp folder") };
+        for name in ["a", "b"] {
+            let sub = folder.sub(name);
+            std::fs::create_dir_all(sub.join("src")).expect("failed to create a project directory");
+            std::fs::create_dir_all(sub.join(".git")).expect("failed to mark a project root");
+            std::fs::write(
+                sub.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+            )
+            .expect("failed to write a Cargo.toml");
+            std::fs::write(sub.join("src/lib.rs"), format!("pub fn {name}() {{}}\n"))
+                .expect("failed to write a source file");
+        }
+        folder
+    }
+
+    fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn sub(&self, name: &str) -> PathBuf {
+        self.root().join(name)
+    }
+}
+
+impl Drop for Folder {
+    fn drop(&mut self) {
+        for dir in [self.root().to_path_buf(), self.sub("a"), self.sub("b")] {
+            let Ok(state) = project_dir(&dir) else { continue };
+            for path in [daemon::pid_path(&dir), daemon::plugin_pid_path(&dir)].into_iter().flatten() {
+                common::kill_pid_file(&path);
+            }
+            for (_, plugin_pid) in daemon::registry::discovered_pid_files(&state) {
+                common::kill_pid_file(&plugin_pid);
+            }
+            if let Ok(endpoint) = daemon::endpoint(&dir) {
+                endpoint.clear_stale();
+            }
+            let _ = std::fs::remove_dir_all(state);
+        }
+    }
+}
+
+/// A folder-mode shim over `dir`, killed when the client drops it.
+fn folder_shim(dir: &Path, plugins: &Path) -> rmcp::transport::TokioChildProcess {
+    use rmcp::transport::ConfigureCommandExt;
+
+    let dir = dir.to_path_buf();
+    let plugins = plugins.to_path_buf();
+    rmcp::transport::TokioChildProcess::new(tokio::process::Command::new(BIN).configure(|cmd| {
+        cmd.lifeline();
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
+            .current_dir(&dir)
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
+            // Inherited by every daemon the shim bootstraps.
+            .env("G_MESH_PLUGIN_ROOTS_OVERRIDE", &plugins)
+            .env(g_mesh::embedding::model::MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir");
+    }))
+    .expect("failed to spawn the shim")
+}
+
+async fn select(client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>, project: &str) {
+    let arguments = serde_json::json!({ "project": project }).as_object().cloned().unwrap();
+    let result = client
+        .call_tool(rmcp::model::CallToolRequestParams::new("select_project").with_arguments(arguments))
+        .await
+        .unwrap_or_else(|err| panic!("select_project {project} must return a result: {err}"));
+    assert_ne!(result.is_error, Some(true), "the switch to {project} must succeed: {result:?}");
+}
+
+/// The pid `root`'s daemon wrote, waiting for it: the daemon writes its pid
+/// file just after binding its endpoint, so a reachable daemon may not have
+/// written it yet.
+fn daemon_pid(root: &Path) -> u32 {
+    let path = daemon::pid_path(root).expect("failed to resolve the pid file path");
+    wait_for("the daemon to write its pid file", || daemon::read_pid_file(&path).is_some());
+    read_pid(&path)
+}
+
+/// `g-mesh stop` in `dir`, asserting it exits 0.
+fn stop_in(dir: &Path) {
+    let output =
+        Command::new(BIN).arg("stop").current_dir(dir).output().expect("failed to run `g-mesh stop`");
+    assert!(
+        output.status.success(),
+        "`g-mesh stop` failed with {}: {}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// GM-534: a folder session's shim lives the whole session and stays the
+/// parent of every daemon it bootstraps, so it must reap them. `a`'s daemon
+/// is stopped while the shim that started it is still serving `b`: `stop`
+/// exits 0 and the pid is gone (not a zombie), the same shim still answers,
+/// and reselecting `a` bootstraps a fresh daemon that can be stopped too.
+/// No order between processes is asserted beyond the test's own sequential
+/// calls and `stop`'s own promise to return only once the pid is gone.
+///
+/// Control: in `shim::spawn_detached_daemon`, drop the `Child` instead of
+/// passing it to `spawn_daemon_reaper` - the stopped daemon stays a zombie
+/// child of the shim and `stop` exits 1 after its grace period.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_reaps_a_daemon_whose_folder_shim_is_still_running() {
+    use rmcp::ServiceExt;
+
+    let folder = Folder::new();
+    let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+    common::add_real_rust_plugin(plugins.path());
+    let a = folder.sub("a");
+
+    let client =
+        ().serve(folder_shim(folder.root(), plugins.path())).await.expect("the shim must reach the front");
+
+    select(&client, "a").await;
+    let first = daemon_pid(&a);
+    assert!(daemon::is_process_alive(first), "a's daemon must be running before it is stopped");
+    select(&client, "b").await;
+
+    let stopper = a.clone();
+    tokio::task::spawn_blocking(move || stop_in(&stopper)).await.expect("the stop task panicked");
+    assert!(!daemon::is_process_alive(first), "a's daemon (pid {first}) must be gone, not a zombie");
+    assert!(!daemon::is_listening(&a).unwrap_or(true), "a's endpoint must be released");
+
+    // The shim that bootstrapped the stopped daemon is still serving, and
+    // bootstraps (and reaps) a fresh one for `a`.
+    select(&client, "a").await;
+    let second = daemon_pid(&a);
+    assert_ne!(second, first, "reselecting a must bootstrap a new daemon");
+    assert!(daemon::is_listening(&a).unwrap_or(false), "a's new daemon must be reachable");
+
+    let stopper = a.clone();
+    tokio::task::spawn_blocking(move || stop_in(&stopper)).await.expect("the stop task panicked");
+    assert!(!daemon::is_process_alive(second), "a's second daemon (pid {second}) must be gone");
+
+    client.cancel().await.expect("failed to shut the client down");
+}
