@@ -318,7 +318,14 @@ pub(crate) fn resolve_module_path(
 /// narrowest reading: it can only refuse a link a correct answer would have
 /// allowed.
 pub(crate) fn visibility(item: Node, module: &ModuleCtx, source: &str) -> Visibility {
-    let Some(modifier) = visibility_modifier(item) else {
+    modifier_visibility(visibility_modifier(item), module, source)
+}
+
+/// [`visibility`] read off a `visibility_modifier` found some other way - a
+/// tuple struct's positional field has no node of its own to look in, so
+/// its modifier is the one written just before its type.
+pub(crate) fn modifier_visibility(modifier: Option<Node>, module: &ModuleCtx, source: &str) -> Visibility {
+    let Some(modifier) = modifier else {
         return Visibility::Container(module.key.clone());
     };
 

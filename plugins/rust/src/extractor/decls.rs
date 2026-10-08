@@ -11,6 +11,7 @@
 //! | `trait Tr` | `Type` | `trait` | `Tr` |
 //! | `const C` / `static S` | `Variable` | `const` / `static` | `C` / `S` |
 //! | named field `f` of `struct`/`union` `T` | `Variable` | `field` | `T.f` |
+//! | positional field `0` of tuple struct `T` | `Variable` | `field` | `T.0` |
 //! | `macro_rules! m` | `Function` | `macro` | `m` |
 //! | `mod m` | `Module` | `module` | `m` |
 //! | `impl T { fn m }` | `Function` | `method` | `T::m` |
@@ -20,12 +21,15 @@
 //!
 //! A `macro_rules!` is a `Function` because that is the kind core's linker
 //! demands of a `CALLS` target, and `m!()` is a call in every sense a caller
-//! cares about. Enum variants and tuple-struct fields are *not* nodes: a
-//! variant's fields would hang off a variant that is not one, and `.0` has
-//! no name a query could carry. A named field is registered in the file
-//! model by its `T.f` tail only, never by its bare name, so a bare
-//! identifier written in the module cannot resolve to a field, and a method
-//! `T::f` of the same name keeps its own key, node and `qualifiedName`.
+//! cares about. Enum variants, and so their fields, are *not* nodes: a
+//! variant's fields would hang off a variant that is not one. A tuple
+//! struct's positional field is one, named by its index (`0`, `T.0`): no
+//! identifier can start with a digit, so `T.0` collides with no named field,
+//! and the `.` keeps it apart from every `T::m` (GM-528). A field is
+//! registered in the file model by its `T.f`/`T.0` tail only, never by its
+//! bare name, so a bare identifier written in the module cannot resolve to a
+//! field, and a method `T::f` of the same name keeps its own key, node and
+//! `qualifiedName`.
 //!
 //! `qualifiedName` prefixes each of those with the module path
 //! ([`keys`](super::keys), Decision 2), and the id is derived from it, so two
@@ -83,7 +87,8 @@ use tree_sitter::Node;
 
 use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::{
-    is_public, resolve_module_path, visibility, visibility_modifier, ModuleCtx, PathTarget,
+    is_public, modifier_visibility, resolve_module_path, visibility, visibility_modifier, ModuleCtx,
+    PathTarget,
 };
 use crate::extractor::model::{DeclRef, FileModel, Import, Returns};
 use crate::extractor::syntax::{
@@ -384,10 +389,10 @@ impl Declarer<'_, '_> {
         }
     }
 
-    /// The named fields of a `struct`/`union`, each a `Variable`/`field` node
-    /// named [`field_tail`] (`T.f`) within the module.
-    /// A tuple struct's `ordered_field_declaration_list` has no names and
-    /// declares nothing.
+    /// The fields of a `struct`/`union`, each a `Variable`/`field` node named
+    /// [`field_tail`] (`T.f`) within the module; a tuple struct's positional
+    /// fields are named by their index (`T.0`, `T.1`), see
+    /// [`positional_fields`](Self::positional_fields).
     ///
     /// Every field's written type, named or positional (`T.0`, `T.1`), is
     /// also recorded in the model for typed receivers (`x.f.m()`), see
@@ -397,12 +402,7 @@ impl Declarer<'_, '_> {
         let Some(body) = item.child_by_field_name("body") else { return };
         let generics = generic_names(item, self.source);
         if body.kind() == "ordered_field_declaration_list" {
-            let mut cursor = body.walk();
-            let types: Vec<Node> = body.children_by_field_name("type", &mut cursor).collect();
-            for (index, ty) in types.into_iter().enumerate() {
-                let returns = self.field_type(ty, type_name, module, &generics);
-                self.model.set_field_type(&module.key, &field_tail(type_name, &index.to_string()), returns);
-            }
+            self.positional_fields(body, type_name, module, &generics);
             return;
         }
         if body.kind() != "field_declaration_list" {
@@ -432,6 +432,65 @@ impl Declarer<'_, '_> {
             let returns = field
                 .child_by_field_name("type")
                 .and_then(|ty| self.field_type(ty, type_name, module, &generics));
+            self.model.set_field_type(&module.key, &tail, returns);
+        }
+    }
+
+    /// A tuple struct's fields, `S(pub A, B)`. The list has no node per
+    /// field: a field is the run of children after a `(` or `,` up to its
+    /// `type` - attributes, then an optional `visibility_modifier`, then the
+    /// type - with any doc comment just before that run. Its range and
+    /// signature span the modifier (when written) and the type, as a named
+    /// field's span `pub f: T`.
+    fn positional_fields(&mut self, body: Node, type_name: &str, module: &ModuleCtx, generics: &[String]) {
+        let mut index = 0usize;
+        let mut first: Option<Node> = None;
+        let mut modifier: Option<Node> = None;
+        let mut cursor = body.walk();
+        let types: Vec<usize> = body.children_by_field_name("type", &mut cursor).map(|ty| ty.id()).collect();
+        let children: Vec<Node> = body.children(&mut cursor).collect();
+        for child in children {
+            match child.kind() {
+                "(" | "," => {
+                    first = None;
+                    modifier = None;
+                    continue;
+                }
+                "line_comment" | "block_comment" => continue,
+                "visibility_modifier" => modifier = Some(child),
+                _ => {}
+            }
+            first.get_or_insert(child);
+            if !types.contains(&child.id()) {
+                continue;
+            }
+            let name = index.to_string();
+            index += 1;
+            let tail = field_tail(type_name, &name);
+            let own = modifier_visibility(modifier, module, self.source);
+            let start = modifier.unwrap_or(child);
+            let range = g_mesh_plugin_sdk::wire::Range {
+                start: self.emitter.positions().at(start.start_position()),
+                end: self.emitter.positions().at(child.end_position()),
+            };
+            let mut spec = NodeSpec::with_path(
+                NodeKind::Variable,
+                name.clone(),
+                module.qualified_path(&field_tail_path(type_name, &name)),
+                range,
+            )
+            .native_kind("field")
+            .visibility(own.clone())
+            .in_container(module.key.clone(), module.parent.clone());
+            spec.signature = self
+                .source
+                .get(start.start_byte()..child.end_byte())
+                .map(collapse_whitespace)
+                .filter(|rendered| !rendered.is_empty());
+            spec.doc_comment = first.and_then(|first| outer_doc_comment(first, self.source));
+            let id = self.emitter.declare(spec, is_public(&own));
+            self.model.declare_member(&module.key, &tail, DeclRef { id, kind: NodeKind::Variable });
+            let returns = self.field_type(child, type_name, module, generics);
             self.model.set_field_type(&module.key, &tail, returns);
         }
     }

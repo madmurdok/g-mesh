@@ -900,14 +900,26 @@ impl Bodies<'_, '_> {
     /// receiver as a plain `T` ([`Self::receiver_type`]), the read also gets
     /// the edge onto `T.f` and the site names it in `replaces`, as
     /// [`Self::receiver_call`] does for `x.m()` - with the same hop budget, since
-    /// the final `.f` resolves no written type. `x.0` names nothing.
+    /// the final `.f` resolves no written type.
+    ///
+    /// A positional read `x.0` takes the same two paths onto the tuple
+    /// struct's field `T.0` (GM-528) but never opens a site: a site named
+    /// `0` would ask the semantic tier about a name every tuple struct
+    /// shares, so an untyped `x.0` emits nothing but its value's own uses.
     fn field_access(&mut self, node: Node, module: &ModuleCtx, block: Option<&BlockCtx>, from: &str) {
         let Some(value) = node.child_by_field_name("value") else { return };
-        let field = node.child_by_field_name("field").filter(|field| field.kind() == "field_identifier");
+        let field = node.child_by_field_name("field").filter(|field| match field.kind() {
+            "field_identifier" => true,
+            // `x.0`, never anything a literal could also spell (`x.0.1`
+            // when the grammar lexes `0.1` as one token).
+            "integer_literal" => text(*field, self.source).bytes().all(|b| b.is_ascii_digit()),
+            _ => false,
+        });
         let Some(field) = field else {
             self.visit(value, module, block, from);
             return;
         };
+        let positional = field.kind() == "integer_literal";
         let name = text(field, self.source);
         if value.kind() == "self" {
             if let Some(block) = block.filter(|block| block.family != Family::TraitDecl) {
@@ -923,6 +935,9 @@ impl Bodies<'_, '_> {
             let bound = self.field_of(&ty.container, &ty.name, name, module);
             self.edge(bound, EdgeKind::References, from, field)
         });
+        if positional {
+            return;
+        }
         self.open_site(
             from,
             field,
@@ -1298,7 +1313,7 @@ impl Bodies<'_, '_> {
         self.tail_in(container, &QualifiedPath::root(type_name).child("::", member), member, module)
     }
 
-    /// The address of the named field `T.field` in `container`, the same way
+    /// The address of the field `T.field` (`T.0` for a positional one) in `container`, the same way
     /// as [`member_of`](Self::member_of) - never a same-named method.
     fn field_of(&self, container: &str, type_name: &str, field: &str, module: &ModuleCtx) -> Bound {
         self.tail_in(container, &field_tail_path(type_name, field), field, module)

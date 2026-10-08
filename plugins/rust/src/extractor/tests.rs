@@ -1640,8 +1640,8 @@ fn an_orphan_file_is_indexed_under_its_synthetic_container() {
 // --- struct fields (docs/architecture/gm-450-rust-fields.md) -------------------
 
 /// A named field is a `Variable`/`field` node named `T.f` within its module,
-/// beside the inherent methods; tuple-struct and enum-variant fields are not
-/// nodes. Its uses are references: `self.f` in the impl and a literal's or
+/// beside the inherent methods; a tuple struct's positional fields are nodes
+/// `T.0`, `T.1` (GM-528), enum-variant fields are not. Its uses are references: `self.f` in the impl and a literal's or
 /// pattern's field names by address, `x.f` on any other receiver as an open
 /// site for the semantic tier.
 #[test]
@@ -1694,7 +1694,7 @@ pub fn drain(ledger: Ledger) -> Option<u8> {
     assert_eq!(store.node("store::Ledger::settle").native_kind.as_deref(), Some("method"));
     let fields: Vec<_> =
         store.0.nodes.iter().filter(|node| node.native_kind.as_deref() == Some("field")).collect();
-    assert_eq!(fields.len(), 3, "only Ledger's named fields: {:#?}", store.names());
+    assert_eq!(fields.len(), 5, "Ledger's named fields and Pair's two: {:#?}", store.names());
 
     // `self.f` inside `impl Ledger` lands on the field, same file.
     assert_eq!(
@@ -2159,8 +2159,9 @@ fn each_level_of_a_typed_field_chain_gets_its_own_edge_and_site() {
     }
 }
 
-/// GM-497 item 5: a positional field `x.0` emits no edge and no site of its
-/// own, and its value is still visited (`x.a` links). Control: drop the
+/// GM-497 item 5: a positional field `x.0` opens no site of its own (since
+/// GM-528 a typed one links `P.0` instead), and its value is still visited
+/// (`x.a` links). Control: drop the
 /// `field_identifier` filter in `field_access` (a site named `0` appears).
 #[test]
 fn a_positional_field_read_emits_nothing_but_its_value_is_visited() {
