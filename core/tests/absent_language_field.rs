@@ -331,15 +331,19 @@ async fn the_field_appears_after_a_plugin_is_removed_mid_session() {
 
     select(&client, "b").await;
     std::fs::remove_dir_all(plugins.path().join("python")).expect("failed to remove the python plugin");
-    // The exit status is not asserted: the daemon a shim bootstrapped stays
-    // a zombie child of that shim until reaped, and `g-mesh stop` reports a
-    // still-present pid as a failure. What the test needs is that a's daemon
-    // no longer serves, which the wait below checks.
-    let _ = std::process::Command::new(BIN)
+    // GM-534: the shim reaps the daemons it bootstraps, so `stop` sees a's
+    // daemon exit and succeeds while this session's shim is still alive.
+    let output = std::process::Command::new(BIN)
         .arg("stop")
         .current_dir(&a)
         .output()
         .expect("failed to run `g-mesh stop`");
+    assert!(
+        output.status.success(),
+        "`g-mesh stop` failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     common::wait_for("a's daemon to stop", common::startup_timeout(), || {
         !daemon::is_listening(&a).unwrap_or(true)
     });

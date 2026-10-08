@@ -207,9 +207,10 @@ pub(crate) fn terminate(pid: u32, grace: Duration) -> Result<Stopped> {
 
     // Neither `SIGKILL` nor `TerminateProcess` can be caught, so reaching this
     // means the process is stuck in the kernel (uninterruptible I/O) or is an
-    // unreaped zombie whose parent is still around - neither of which this
-    // command can fix, and both of which are worth saying out loud rather than
-    // reporting success.
+    // unreaped zombie whose parent is still around (the MCP shim reaps the
+    // daemons it bootstraps, see `shim::spawn_detached_daemon`) - neither of
+    // which this command can fix, and both of which are worth saying out loud
+    // rather than reporting success.
     bail!("pid {pid} is still present after being asked and then made to stop")
 }
 
