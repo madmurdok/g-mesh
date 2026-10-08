@@ -121,7 +121,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
     /// The expressions inside a binding pattern: default values
     /// (`{ y = d() }`, `[y = d()]`, `y = d`) and computed keys
     /// (`{ [k]: y }`). The names it binds are skipped.
-    fn visit_binding_pattern(&mut self, node: Node<'t>, scope: &Scope) {
+    pub(super) fn visit_binding_pattern(&mut self, node: Node<'t>, scope: &Scope) {
         match node.kind() {
             "assignment_pattern" | "object_assignment_pattern" => {
                 if let Some(left) = node.child_by_field_name("left") {
