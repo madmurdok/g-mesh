@@ -87,11 +87,12 @@ pub(crate) const PROVENANCE: &str =
      receiver may be missing here; ask again later or grep for them.";
 
 /// Explains `mcp::overrides`' field, which replaces the instructions'
-/// sentence on override caller pages (ADR 0022, statement 9).
+/// sentence on override caller and reference pages (ADR 0022, statement 9).
+/// One key for both tools: sent once per session across them.
 pub(crate) const OVERRIDES: &str =
     "`overrides` names the base members this method overrides or implements. A call through a \
-     receiver typed as the base binds to the base member, so it is on that member's caller page, \
-     not this one: ask find_callers for each `id`.";
+     base-typed receiver binds to the base member, so it is on that member's page: ask \
+     find_callers or find_references for each `id`.";
 
 pub(crate) const AMBIGUOUS: &str =
     "Several declarations have this name: re-query with the right candidate's `id` as `symbol_id`, \
