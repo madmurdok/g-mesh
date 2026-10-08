@@ -2171,6 +2171,10 @@ enum Bound {
     /// On a placeholder addressed exactly as an answer would address `D` in
     /// another file, so an agreeing answer would get `X`'s own id.
     There,
+    /// On a placeholder addressed at a re-exporting container (`reexp`), as a
+    /// call through a `pub use` re-export is: an answer on `D` gets an id of
+    /// its own, never `X`'s, so only core's link result shows agreement.
+    ReExport,
 }
 
 /// `src/d.toy` declares `add` and `sub`, the cross-file targets.
@@ -2276,6 +2280,20 @@ fn typed_site_fixture(
             );
             builder.placeholder_edge(edge_kind, &caller, &placeholder)
         }
+        Bound::ReExport => {
+            let placeholder = builder.add_placeholder(
+                g_mesh_plugin_sdk::PlaceholderKind::PendingSymbol,
+                "add",
+                g_mesh_plugin_sdk::wire::PlaceholderTarget {
+                    scope: TargetScope::Container("reexp".to_string()),
+                    key: TargetKey::QualifiedName("reexp::add".to_string()),
+                    from_container: Some("pkg".to_string()),
+                    key_path: d_add.qualified_path.clone(),
+                },
+                range(AGREE, 4, AGREE, 7),
+            );
+            builder.placeholder_edge(edge_kind, &caller, &placeholder)
+        }
     };
     let sites =
         typed.iter().map(|line| (*line, Some(x.clone()))).chain(untyped.iter().map(|line| (*line, None)));
@@ -2301,7 +2319,7 @@ fn typed_site_fixture(
 fn receiver_bridge(scratch: &Scratch, bound: Bound) -> LspBridge {
     let target = match bound {
         Bound::Here => "src/f.toy",
-        Bound::There => "src/d.toy",
+        Bound::There | Bound::ReExport => "src/d.toy",
     };
     let at = |line: u32, declaration: u32| {
         json!({
@@ -2698,6 +2716,105 @@ fn an_untyped_field_read_is_asked_and_is_never_an_untyped_call() {
         (fixture.caller.as_str(), EdgeKind::References, "add")
     );
     assert!(re_sent(&answer).is_empty(), "no untypedCalls to trim: {:#?}", answer.diff.upsert_nodes);
+}
+
+// --- Re-exports: core's link result decides agreement -----------------------
+//
+// `X` points at a placeholder addressed at the re-exporting container
+// (`Bound::ReExport`), so neither R2 test that looks at `X` alone matches an
+// answer on `D` in `d.toy`. What core's linker did with `X` comes with the
+// pass (`SdkIndex::set_linked`), and the bridge decides agreement with it.
+
+/// The fixture of `site_kind` with `X` through a re-export, and core's link
+/// result saying it linked `X` onto `d.toy`'s `linked_to`.
+fn reexport_fixture(scratch: &Scratch, site_kind: OpenSiteKind, typed: &[u32], linked_to: &str) -> Receiver {
+    let mut fixture = typed_site_fixture(scratch, Bound::ReExport, site_kind, typed, &[]);
+    let target = fixture
+        .index
+        .graph(&RelPath::new("src/d.toy"))
+        .and_then(|graph| graph.nodes.iter().find(|node| node.name == linked_to))
+        .map(|node| node.id.clone())
+        .expect("d.toy declares the linked target");
+    fixture.index.set_linked([(fixture.x.clone(), target)]);
+    fixture
+}
+
+/// A typed call through a re-export, which core linked onto `D` and the
+/// server answers with `D`: agreement. No semantic edge, `X` not retracted
+/// and re-sent as it is, so the call keeps one row.
+#[test]
+fn a_typed_call_through_a_re_export_core_linked_onto_the_answer_stays_one_structural_edge() {
+    let scratch = Scratch::new("reexport-call-agree");
+    let fixture = reexport_fixture(&scratch, OpenSiteKind::ReceiverCall, &[AGREE], "add");
+    let mut bridge = receiver_bridge(&scratch, Bound::ReExport);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert!(semantic_edges(&answer).is_empty(), "agreement adds nothing: {:#?}", answer.diff);
+    x_re_sent_unchanged(&answer, &fixture, "the only pass");
+}
+
+/// The same for a typed field read (`REFERENCES` onto a field).
+#[test]
+fn a_typed_field_read_through_a_re_export_core_linked_onto_the_answer_stays_one_structural_edge() {
+    let scratch = Scratch::new("reexport-field-agree");
+    let fixture = reexport_fixture(&scratch, OpenSiteKind::ReceiverField, &[AGREE], "add");
+    let mut bridge = receiver_bridge(&scratch, Bound::ReExport);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    assert!(semantic_edges(&answer).is_empty(), "agreement adds nothing: {:#?}", answer.diff);
+    x_re_sent_unchanged(&answer, &fixture, "the only pass");
+    assert_eq!(upserts(&answer, &fixture.x)[0].kind, EdgeKind::References);
+}
+
+/// Core linked `X` onto `sub` and the server answers `add`: a contradiction
+/// as for any other edge. The answer becomes a semantic edge onto `add` and
+/// `X` is retracted - the link result agrees only on the very declaration.
+#[test]
+fn a_call_through_a_re_export_core_linked_elsewhere_is_still_a_contradiction() {
+    let scratch = Scratch::new("reexport-contra");
+    let fixture = reexport_fixture(&scratch, OpenSiteKind::ReceiverCall, &[AGREE], "sub");
+    let mut bridge = receiver_bridge(&scratch, Bound::ReExport);
+
+    let answer = pass(&mut bridge, &fixture.index);
+    assert!(answer.complete, "{:?}", answer.reason);
+    let emitted = semantic_edges(&answer);
+    assert_eq!(emitted.len(), 1, "{:#?}", answer.diff);
+    assert_eq!(
+        (emitted[0].from_id.as_str(), lands_on(&answer, emitted[0])),
+        (fixture.caller.as_str(), "add"),
+        "the call lands where the server said"
+    );
+    assert!(upserts(&answer, &fixture.x).is_empty(), "a contradicted X is not re-sent");
+    assert_eq!(answer.diff.delete_edge_ids, vec![fixture.x.clone()], "X is retracted");
+}
+
+/// After an edit the follow-up pass does not finish (one site is never
+/// answered). Pass 1 agreed through core's link, so there is no semantic
+/// edge to clean up: neither pass records one or retracts `X`, and the call
+/// has one row at every point.
+#[test]
+fn a_failed_pass_after_an_agreeing_re_export_pass_leaves_one_row() {
+    let scratch = Scratch::new("reexport-failed-follow-up");
+    let agree = reexport_fixture(&scratch, OpenSiteKind::ReceiverCall, &[AGREE], "add");
+    let unfinished = reexport_fixture(&scratch, OpenSiteKind::ReceiverCall, &[AGREE, SILENT], "add");
+    assert_eq!(agree.x, unfinished.x, "the edit keeps X's id");
+    let mut bridge = receiver_bridge(&scratch, Bound::ReExport);
+
+    let first = pass(&mut bridge, &agree.index);
+    assert!(first.complete, "{:?}", first.reason);
+    assert!(semantic_edges(&first).is_empty(), "pass 1 agrees: {:#?}", first.diff);
+    x_re_sent_unchanged(&first, &agree, "pass 1 (agrees)");
+
+    let second = pass(&mut bridge, &unfinished.index);
+    assert!(!second.complete, "the SILENT question was never answered");
+    assert!(semantic_edges(&second).is_empty(), "pass 2 records no edge: {:#?}", second.diff);
+    assert!(
+        !second.diff.delete_edge_ids.contains(&unfinished.x),
+        "pass 2 does not retract X: {:#?}",
+        second.diff
+    );
 }
 
 // --- GM-487: what a per-file pass did not finish is asked again ------------

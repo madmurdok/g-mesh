@@ -1289,6 +1289,65 @@ mod tests {
         );
     }
 
+    /// An engine that records, on each pass, where its index says core
+    /// linked the edges `x` and `y`.
+    struct LinkRecording {
+        seen: LinksSeen,
+    }
+
+    /// Per pass: `linked_target("x")` and `linked_target("y")`.
+    type LinksSeen = std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>>;
+
+    impl crate::semantic::SemanticEngine for LinkRecording {
+        fn answer(&mut self, _files: &[RelPath], index: &SdkIndex) -> anyhow::Result<SemanticAnswer> {
+            let target = |edge: &str| index.linked_target(edge).map(str::to_string);
+            self.seen.lock().unwrap().push((target("x"), target("y")));
+            Ok(SemanticAnswer::complete(FileChangeDiff::default()))
+        }
+    }
+
+    /// A pass's `linkedEdges` reach the engine's index, and the next pass
+    /// replaces them: one without the field leaves nothing linked, so an
+    /// earlier pass's links never decide a later answer.
+    #[test]
+    fn a_passes_linked_edges_reach_the_index_and_a_pass_without_them_clears_it() {
+        let project = Project::new("linked", &[("a.toy", "a v1\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&seen);
+        let factory: crate::semantic::SemanticEngineFactory = Box::new(move |_root| {
+            Ok(Box::new(LinkRecording { seen: std::sync::Arc::clone(&recorded) })
+                as Box<dyn crate::semantic::SemanticEngine>)
+        });
+        let mut session = Session {
+            extractor: &Declares,
+            spec: &spec,
+            root: project.0.clone(),
+            root_real: std::fs::canonicalize(&project.0).ok(),
+            project: None,
+            index: SdkIndex::new(),
+            engine: LazyEngine::new("toy", Some(factory)),
+            project_hydrated: false,
+        };
+
+        request(
+            &mut session,
+            "semanticPass",
+            serde_json::json!({
+                "filePaths": ["a.toy"],
+                "linkedEdges": [{ "edgeId": "x", "toId": "d" }],
+            }),
+        );
+        request(&mut session, "semanticPass", serde_json::json!({ "filePaths": ["a.toy"] }));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![(Some("d".to_string()), None), (None, None)],
+            "pass 1 sees x linked onto d and nothing for y; pass 2 carries no field and sees nothing"
+        );
+    }
+
     /// GM-487 Fix 1's baseline hazard: a file a semantic pass hydrated from
     /// disk is news to core, so the `fileChanged` that follows - here at the
     /// very text that was hydrated - answers a complete diff carrying the

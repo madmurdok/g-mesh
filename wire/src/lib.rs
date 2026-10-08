@@ -1073,6 +1073,43 @@ mod tests {
         assert_eq!(envelope, round_tripped);
     }
 
+    /// `linkedEdges` is optional on the wire both ways: a pass with nothing
+    /// linked omits the key (so a plugin that predates the field sees the
+    /// request it always did), and a request without the key reads as empty.
+    #[test]
+    fn semantic_pass_linked_edges_are_omitted_when_empty_and_read_as_empty_when_absent() {
+        let empty = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(RequestId::Number(3)),
+            message: ControlMessage::SemanticPass {
+                file_paths: vec!["src/a.rs".to_string()],
+                linked_edges: Vec::new(),
+            },
+        };
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(!json.contains("linkedEdges"), "an empty list must not be serialized: {json}");
+        let absent: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        match absent.message {
+            ControlMessage::SemanticPass { linked_edges, .. } => {
+                assert!(linked_edges.is_empty(), "an absent field must read as empty: {linked_edges:?}")
+            }
+            other => panic!("expected SemanticPass, got {other:?}"),
+        }
+
+        let linked = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(RequestId::Number(4)),
+            message: ControlMessage::SemanticPass {
+                file_paths: Vec::new(),
+                linked_edges: vec![LinkedEdge { edge_id: "x".to_string(), to_id: "d".to_string() }],
+            },
+        };
+        let json = serde_json::to_string(&linked).unwrap();
+        assert!(json.contains(r#""linkedEdges":[{"edgeId":"x","toId":"d"}]"#), "{json}");
+        let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(linked, round_tripped);
+    }
+
     #[test]
     fn workspace_changed_round_trips_as_a_notification() {
         let envelope = ControlEnvelope {
