@@ -24,7 +24,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind};
+use g_mesh_plugin_sdk::wire::NodeKind;
 use g_mesh_plugin_sdk::RelPath;
 use tree_sitter::Node;
 
@@ -204,7 +204,7 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         let index = self.model.add_node(params);
         let file_id = self.model.file_id().to_string();
         let target_id = self.model.node(index).id.clone();
-        self.model.add_edge(&file_id, EdgeKind::Imports, &target_id);
+        self.model.add_import_edge(&file_id, &target_id, specifier);
         resolved
     }
 

@@ -49,6 +49,7 @@ pub fn flush(
             to_declaration: None,
             source: SourceTier::Syntactic,
             engine: engine.to_string(),
+            specifier: edge.specifier,
         });
         debug_assert_eq!(id, edge.id, "the draft and the SDK derive an edge id the same way");
     }

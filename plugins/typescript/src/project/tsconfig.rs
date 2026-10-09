@@ -299,7 +299,7 @@ impl<'a> TsconfigReader<'a> {
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => {
-                self.notes.push(format!("{config}: unreadable ({err}), skipped"));
+                self.notes.push(format!("{config}{}{err}), skipped", super::UNREADABLE_NOTE));
                 None
             }
         };

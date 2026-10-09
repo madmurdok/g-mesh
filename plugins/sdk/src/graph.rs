@@ -415,6 +415,11 @@ pub struct EdgeSpec {
     /// The engine that produced it, as a free label for diagnostics -
     /// `tree-sitter`, `go-types`, `rust-analyzer`.
     pub engine: String,
+    /// **`IMPORTS` edges only:** the import's raw text as written (a module
+    /// specifier, a crate path, a dotted name), which core matches a
+    /// resolution delta's `Specifier` selectors against. Dropped on any
+    /// other kind of edge. Not part of the edge's id.
+    pub specifier: Option<String>,
 }
 
 /// Accumulates one file's nodes and edges, deriving each id from the item
@@ -565,9 +570,26 @@ impl FileGraphBuilder {
             engine: spec.engine,
             resolved: spec.resolved,
             to_declaration: spec.to_declaration,
-            specifier: None,
+            specifier: if spec.kind == EdgeKind::Imports { spec.specifier } else { None },
         });
         id
+    }
+
+    /// An `IMPORTS` edge onto a placeholder, carrying the import's raw text
+    /// as its `specifier`: `resolved: false`, as for
+    /// [`placeholder_edge`](Self::placeholder_edge).
+    pub fn import_edge(&mut self, from_id: &str, to_id: &str, specifier: impl Into<String>) -> String {
+        let engine = self.engine.clone();
+        self.add_edge(EdgeSpec {
+            from_id: from_id.to_string(),
+            to_id: to_id.to_string(),
+            kind: EdgeKind::Imports,
+            resolved: false,
+            to_declaration: None,
+            source: SourceTier::Syntactic,
+            engine,
+            specifier: Some(specifier.into()),
+        })
     }
 
     /// An edge onto a real declaration **of this same file**: `resolved:
@@ -602,6 +624,7 @@ impl FileGraphBuilder {
             to_declaration: None,
             source: SourceTier::Syntactic,
             engine,
+            specifier: None,
         })
     }
 

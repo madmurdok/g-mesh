@@ -40,6 +40,12 @@ semantic_sweep = false
 # so every created file of one watcher batch must be in it before the first of
 # them is extracted (docs/adr/0026-batch-created-files-notification.md).
 files_created = true
+# A save of a watch file asks the plugin what it changed for resolution
+# (`resolutionChanged`), and core re-extracts only the importers it names
+# instead of the whole language. The bulk walk ends with the facts that
+# answer compares against, and every `IMPORTS` edge carries its specifier
+# (docs/architecture/gm-509-selective-config-reindex.md).
+resolution_delta = true
 # Receiver calls (`x.foo()`, and `this.m()` / `super.m()` with no member of
 # that name in this file) are resolved by the semantic tier, which asks the
 # server where each one lands. The structural tier alone has no type for `x`,
@@ -97,7 +103,8 @@ javascript = [".js", ".jsx", ".mjs", ".cjs"]
 # (`package.json`, `pnpm-workspace.yaml`), `exports`/`imports` maps
 # (`package.json`) and `paths` (`tsconfig*.json`, `jsconfig*.json`, which also
 # match `extends` targets such as `tsconfig.base.json`). The model reads them
-# once, so a save of one reindexes the language (ADR 0008). Must equal
+# once, so a save of one reloads it and re-extracts the files whose imports
+# it can move (`resolution_delta` above). Must equal
 # `project::WATCH_FILES`; a test in tests/units.rs pins the two.
 watch_files = ["package.json", "tsconfig*.json", "jsconfig*.json", "pnpm-workspace.yaml"]
 # Directories this plugin's walk never descends into, on top of the SDK's own

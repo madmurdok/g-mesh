@@ -1696,6 +1696,7 @@ impl Answers {
                 to_declaration: edge.to_declaration,
                 source: SourceTier::Semantic,
                 engine,
+                specifier: None,
             });
         }
         // The nodes, now that every site addressing each one has been seen. In
