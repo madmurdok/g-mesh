@@ -7,7 +7,7 @@
 #
 #   scripts/cut-release.sh <version>              # verify, test, tag locally
 #   scripts/cut-release.sh <version> --push       # ...and push the tag
-#   scripts/cut-release.sh <version> --skip-tests # skip the test runs (all test sections, and cargo test -p g-mesh)
+#   scripts/cut-release.sh <version> --skip-tests # skip the test runs (all test sections, doctests, and cargo test -p g-mesh)
 #
 # This script does NOT bump the version - that already happened as the
 # release branch's first commit. What it does instead is VERIFY that
@@ -217,7 +217,7 @@ usage: scripts/cut-release.sh <version> [--push] [--skip-tests]
 
   <version>      the release version, X.Y.Z, matching core/Cargo.toml
   --push         also push the tag (starts the build/publish workflow)
-  --skip-tests   skip the test runs (all test sections, and cargo test -p g-mesh) before tagging
+  --skip-tests   skip the test runs (all test sections, doctests, and cargo test -p g-mesh) before tagging
 EOF
 }
 
@@ -619,6 +619,12 @@ main() {
 			die "a test section failed - fix the failure before cutting a release"
 		test_end="$(date +%s)"
 		log "every test section passed in $((test_end - test_start))s"
+
+		# nextest does not run doctests, so the sections above never compile
+		# them; this is the run that does.
+		log "running the workspace doctests"
+		(cd "$REPO_ROOT" && cargo test --doc --workspace) ||
+			die "cargo test --doc --workspace failed - fix the doctest before cutting a release"
 
 		# GM-302: the workspace-wide sections above are deliberate (the comment
 		# on them, just above, explains why) and stay - this is IN ADDITION, not a
