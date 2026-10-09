@@ -39,6 +39,8 @@
 //!   the second does not, `semanticPass` answers are held; other frames keep
 //!   being answered meanwhile.
 //! - `semantic-pass.json`: the `result` of every complete `semanticPass`.
+//! - `resolution-changed.json`: the `result` of every `resolutionChanged`;
+//!   without it, `resolutionChanged` answers an `unknown` delta and no facts.
 //!
 //! Every answer's `result` is `{}` unless one of the above says otherwise. The
 //! bulk walk emits two nodes `<L>-n1`/`<L>-n2` and the edge `<L>-e1` between
@@ -86,6 +88,7 @@ const HANDSHAKE_GATE: &str = "handshake.allow";
 const STALL_MARKER: &str = "stalled-once.marker";
 const INCOMPLETE_MARKER: &str = "incomplete-once.marker";
 const SEMANTIC_ANSWER: &str = "semantic-pass.json";
+const RESOLUTION_ANSWER: &str = "resolution-changed.json";
 const SEMANTIC_PASS_GATED: &str = "semantic-pass.gated";
 const SEMANTIC_PASS_GATE_OPEN: &str = "semantic-pass.allow";
 const METHOD_LOG_ENV: &str = "G_MESH_FAKE_PLUGIN_LOG";
@@ -338,6 +341,14 @@ fn fixture_answer(
                 .unwrap_or_else(|err| fail(&format!("bad {SEMANTIC_ANSWER}: {err}")));
             return json!({ "jsonrpc": "2.0", "id": id, "result": result });
         }
+    }
+    if method == "resolutionChanged" {
+        let result = match fs::read_to_string(dir.join(RESOLUTION_ANSWER)) {
+            Ok(text) => serde_json::from_str(&text)
+                .unwrap_or_else(|err| fail(&format!("bad {RESOLUTION_ANSWER}: {err}"))),
+            Err(_) => json!({ "delta": { "kind": "unknown", "reason": "no scripted answer" } }),
+        };
+        return json!({ "jsonrpc": "2.0", "id": id, "result": result });
     }
     json!({ "jsonrpc": "2.0", "id": id, "result": {} })
 }

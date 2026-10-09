@@ -96,7 +96,7 @@ fn spawn_stub_plugin(
         let request: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
         assert_eq!(request.id, Some(expected_id));
         match request.message {
-            ControlMessage::FileChanged { file_path } => assert_eq!(file_path, expected_file_path),
+            ControlMessage::FileChanged { file_path, .. } => assert_eq!(file_path, expected_file_path),
             other => panic!("expected FileChanged, got {other:?}"),
         }
         write_message(&mut writer, &response).unwrap();
@@ -140,6 +140,7 @@ fn unresolved_edge(id: &str, from: &str, to: &str) -> WireEdge {
         engine: "tree-sitter".to_string(),
         resolved: false,
         to_declaration: None,
+        specifier: None,
     }
 }
 
@@ -310,6 +311,7 @@ fn file_change_diff_is_committed_to_sqlite() {
                 engine: "tree-sitter".to_string(),
                 resolved: false,
                 to_declaration: None,
+                specifier: None,
             }],
             delete_edge_ids: vec![],
             complete: false,

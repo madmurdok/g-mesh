@@ -348,7 +348,7 @@ fn shape(run: &RunData, answered: &[(String, &FileChangeDiff)]) -> CheckResult {
                         findings.push(format!("bulk run 1, NDJSON line {}: {message}", line.line_no));
                     }
                 }
-                Ok(BulkItem::Edge(_)) => {}
+                Ok(BulkItem::Edge(_) | BulkItem::ResolutionFacts(_)) => {}
             }
         }
     }
@@ -511,7 +511,7 @@ fn bulk_ids(lines: &[BulkLine]) -> (BTreeSet<&str>, BTreeSet<&str>) {
             Ok(BulkItem::Edge(edge)) => {
                 edges.insert(edge.id.as_str());
             }
-            Err(_) => {}
+            Ok(BulkItem::ResolutionFacts(_)) | Err(_) => {}
         }
     }
     (nodes, edges)

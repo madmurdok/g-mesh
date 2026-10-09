@@ -517,6 +517,14 @@ pub struct WireEdge {
     /// overwriting the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_declaration: Option<u32>,
+    /// **`IMPORTS` edges only:** the import's raw text as written in the
+    /// importing file (a module specifier, a crate path, a dotted name). Core
+    /// stores it beside the edge, and it survives linking, so a
+    /// [`ImportMatch::Specifier`] selector can still find the importer after
+    /// the edge was repointed onto its target. Absent on every other edge,
+    /// and from a plugin that does not declare `resolution_delta`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specifier: Option<String>,
 }
 
 /// JSON-RPC request id - either form is legal per the JSON-RPC 2.0 spec.
@@ -555,6 +563,13 @@ pub enum ControlMessage {
     #[serde(rename_all = "camelCase")]
     FileChanged {
         file_path: String,
+        /// Extract the file even if its text is what the plugin last
+        /// extracted: something the extraction reads besides the text (a
+        /// resolution config) changed. The plugin keeps its baseline, so the
+        /// answer is still a diff against what it last sent. Absent means
+        /// `false`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        reextract: bool,
     },
     Status,
     /// Asks the plugin's semantic layer to re-answer what the structural
@@ -617,6 +632,152 @@ pub enum ControlMessage {
     FilesCreated {
         file_paths: Vec<String>,
     },
+    /// A request: a watch file (`plugin.toml`'s `workspace.watch_files`)
+    /// changed. The plugin reloads its project model and compares the facts
+    /// its resolution reads with `previous_facts`, the opaque blob it handed
+    /// core with the rows the index holds now. It answers with a
+    /// [`ResolutionChangedResult`]: what the edit changed for resolution, and
+    /// the new blob.
+    ///
+    /// Sent only to a plugin whose manifest declares
+    /// `capabilities.resolution_delta`; every other plugin gets
+    /// [`ControlMessage::WorkspaceChanged`] and a whole-language reindex.
+    /// `previous_facts` absent means core holds none, and the plugin answers
+    /// [`ResolutionDelta::Unknown`].
+    #[serde(rename_all = "camelCase")]
+    ResolutionChanged {
+        file_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_facts: Option<String>,
+    },
+}
+
+/// The JSON-RPC 2.0 response to [`ControlMessage::ResolutionChanged`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolutionChangedResponse {
+    pub jsonrpc: String,
+    pub id: RequestId,
+    pub result: ResolutionChangedResult,
+}
+
+/// A plugin's answer to [`ControlMessage::ResolutionChanged`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolutionChangedResult {
+    pub delta: ResolutionDelta,
+    /// The resolution facts of the reloaded model, which core stores in place
+    /// of the previous ones once it has acted on `delta`. Absent: core keeps
+    /// none, and the next edit falls back to a whole-language reindex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<String>,
+}
+
+/// What a watch-file edit changed for resolution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ResolutionDelta {
+    /// Nothing resolution reads changed: no file is re-extracted.
+    Unchanged,
+    /// The plugin cannot say what changed: core reindexes the whole language.
+    Unknown {
+        #[serde(default)]
+        reason: String,
+    },
+    /// Re-extract every indexed file of the language inside one of `files`,
+    /// and every importer one of `imports` selects.
+    Affected {
+        #[serde(default)]
+        files: Vec<PathScope>,
+        #[serde(default)]
+        imports: Vec<ImportSelector>,
+    },
+}
+
+/// A set of project-relative paths: those under `under` and under none of
+/// `not_under`. A directory matches on a `/` boundary; `""` is the whole
+/// project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathScope {
+    pub under: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_under: Vec<String>,
+}
+
+impl PathScope {
+    /// Whether `path` lies in this scope.
+    pub fn contains(&self, path: &str) -> bool {
+        path_is_under(path, &self.under) && !self.not_under.iter().any(|dir| path_is_under(path, dir))
+    }
+}
+
+fn path_is_under(path: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches('/');
+    dir.is_empty() || path == dir || (path.starts_with(dir) && path.as_bytes().get(dir.len()) == Some(&b'/'))
+}
+
+/// The importing files whose `IMPORTS` edges `by` matches, restricted to
+/// those in `importers`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSelector {
+    pub importers: PathScope,
+    pub by: ImportMatch,
+}
+
+/// Which part of a stored import a selector matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportMatch {
+    /// The import's raw text ([`WireEdge::specifier`]).
+    Specifier(Matcher),
+    /// What the import is stored as pointing at: a linked edge's target
+    /// file path or container key, or an unlinked placeholder's scope.
+    #[serde(rename_all = "camelCase")]
+    Target { scope_kind: TargetScopeKind, matcher: Matcher },
+}
+
+/// Which kind of stored target an [`ImportMatch::Target`] compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TargetScopeKind {
+    File,
+    Container,
+}
+
+/// A test on one string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Matcher {
+    Exact(String),
+    /// `s == prefix`, or `s` starts with `prefix` followed by `separator`:
+    /// `pkg.sub` does not match `pkg.subtle`.
+    #[serde(rename_all = "camelCase")]
+    Under {
+        prefix: String,
+        separator: String,
+    },
+    StartsWith(String),
+    /// A TypeScript-style non-relative specifier: one that starts with none
+    /// of `.`, `/` and `#`.
+    NonRelative,
+}
+
+impl Matcher {
+    /// Whether `s` passes this test.
+    pub fn matches(&self, s: &str) -> bool {
+        match self {
+            Matcher::Exact(exact) => s == exact,
+            Matcher::Under { prefix, separator } => {
+                s == prefix
+                    || (!separator.is_empty()
+                        && s.strip_prefix(prefix.as_str())
+                            .is_some_and(|rest| rest.starts_with(separator.as_str())))
+            }
+            Matcher::StartsWith(prefix) => s.starts_with(prefix.as_str()),
+            Matcher::NonRelative => !s.is_empty() && !s.starts_with(['.', '/', '#']),
+        }
+    }
 }
 
 /// LSP-style JSON-RPC 2.0 envelope for the control plane. Framing
@@ -787,6 +948,7 @@ mod tests {
             engine: "ts-compiler".to_string(),
             resolved: true,
             to_declaration: None,
+            specifier: None,
         };
 
         let json = serde_json::to_string(&edge).unwrap();
@@ -957,6 +1119,7 @@ mod tests {
             engine: "tree-sitter".to_string(),
             resolved: false,
             to_declaration: None,
+            specifier: None,
         };
         assert!(!serde_json::to_string(&unbound).unwrap().contains("toDeclaration"));
 
@@ -1039,7 +1202,7 @@ mod tests {
         let envelope = ControlEnvelope {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: None,
-            message: ControlMessage::FileChanged { file_path: "src/main.rs".to_string() },
+            message: ControlMessage::FileChanged { file_path: "src/main.rs".to_string(), reextract: false },
         };
 
         let json = serde_json::to_string(&envelope).unwrap();
@@ -1206,6 +1369,7 @@ mod tests {
                 engine: "tree-sitter".to_string(),
                 resolved: false,
                 to_declaration: None,
+                specifier: None,
             }],
             delete_edge_ids: vec!["e2".to_string()],
             complete: true,

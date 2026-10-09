@@ -207,6 +207,9 @@ pub struct EdgeRecord {
     /// one - every structural-pass edge, and every edge whose target has a
     /// single declaration. See `edges.toDeclaration` in `storage::schema`.
     pub to_declaration: Option<i64>,
+    /// An `IMPORTS` edge's raw import text, `None` on every other edge. Only
+    /// the write side carries it: readers leave it `None`.
+    pub specifier: Option<String>,
 }
 
 impl EdgeRecord {
@@ -239,6 +242,7 @@ impl EdgeRecord {
             engine,
             resolved,
             to_declaration: None,
+            specifier: None,
         }
     }
 }
@@ -573,9 +577,10 @@ fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
             // (GM-491): a re-sent edge describes what the plugin says now, so
             // one it re-sends already resolved (a semantic upgrade) must not
             // be moved by a later reopen of the placeholder it was once
-            // linked from.
-            "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved, toDeclaration, linkedFrom)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+            // linked from. A re-sent edge without a `specifier` keeps the
+            // stored one.
+            "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved, toDeclaration, linkedFrom, specifier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 fromId = excluded.fromId,
                 toId = excluded.toId,
@@ -584,7 +589,8 @@ fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
                 engine = excluded.engine,
                 resolved = excluded.resolved,
                 toDeclaration = excluded.toDeclaration,
-                linkedFrom = NULL",
+                linkedFrom = NULL,
+                specifier = COALESCE(excluded.specifier, edges.specifier)",
             params![
                 edge.id,
                 edge.from_id,
@@ -593,7 +599,8 @@ fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
                 edge.source,
                 edge.engine,
                 edge.resolved,
-                edge.to_declaration
+                edge.to_declaration,
+                edge.specifier
             ],
         )
         .context("failed to upsert edge")?;

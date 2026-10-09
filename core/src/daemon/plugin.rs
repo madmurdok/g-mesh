@@ -40,10 +40,16 @@ use sha2::{Digest, Sha256};
 use crate::daemon::manifest::PluginManifest;
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::handshake;
-use crate::protocol::jsonrpc::{is_timeout, write_message};
-use crate::protocol::types::{ControlEnvelope, ControlMessage, RequestId, JSONRPC_VERSION};
+use crate::protocol::jsonrpc::{is_timeout, read_message_with_timeout, write_message};
+use crate::protocol::types::{
+    ControlEnvelope, ControlMessage, RequestId, ResolutionChangedResponse, ResolutionChangedResult,
+    JSONRPC_VERSION,
+};
 use crate::storage::index_store::{self, IndexStore};
-use crate::watcher::apply::{apply_file_change as apply_file_change_diff, apply_semantic_pass};
+use crate::watcher::apply::{
+    apply_file_change as apply_file_change_diff, apply_scoped_semantic_pass, apply_semantic_pass,
+    reextract_file,
+};
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// How often [`PluginProcess::shutdown`] checks whether the plugin has taken
@@ -907,7 +913,7 @@ impl PluginProcess {
         let file_path = file_path.into();
         self.enqueue_pending(&file_path);
 
-        let (sent_to, sent) = self.send_one(conn, &file_path, embedding, semantic_suspended);
+        let (sent_to, sent) = self.send_one(conn, &file_path, embedding, semantic_suspended, false);
         if let Err(first_err) = sent {
             // A crash shows up here as a failed write or read on the plugin's
             // pipes. Confirm the process is really gone before replacing a
@@ -1019,7 +1025,7 @@ impl PluginProcess {
         loop {
             let next = { self.pending().first().cloned() };
             let Some(file_path) = next else { return Ok(()) };
-            self.send_one(conn, &file_path, embedding, semantic_suspended).1?;
+            self.send_one(conn, &file_path, embedding, semantic_suspended, false).1?;
             self.remove_pending(&file_path);
         }
     }
@@ -1323,12 +1329,16 @@ impl PluginProcess {
     /// that gap would make a live plugin's storage refusal look like a crash
     /// someone else had already recovered from, and replay it into exactly
     /// the empty diff GM-292 hid behind.
+    ///
+    /// `reextract` sends `fileChanged` with its `reextract` flag and no
+    /// semantic pass after it ([`reextract_file`]).
     fn send_one(
         &self,
         conn: &IndexStore,
         file_path: &str,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
+        reextract: bool,
     ) -> (u32, Result<()>) {
         // A per-process atomic counter is all `apply_file_change_diff`'s doc
         // comment asks for - it only needs an id unique enough to catch a
@@ -1346,21 +1356,126 @@ impl PluginProcess {
         let mut on_timeout = self.kill_on_timeout(child);
         // See `Self::ensure_fresh`'s identical comment: `conn` is handed
         // through as the `Mutex` it is (GM-396).
-        let result = apply_file_change_diff(
-            reader,
-            writer,
-            conn,
-            &self.project_root,
-            &self.manifest.language,
-            file_path,
-            id,
-            embedding,
-            self.timeouts.file_changed,
-            self.timeouts.semantic_pass_file,
-            self.manifest.capabilities.semantic_pass && !semantic_suspended,
-            &mut on_timeout,
-        );
+        let result = if reextract {
+            reextract_file(
+                reader,
+                writer,
+                conn,
+                &self.project_root,
+                &self.manifest.language,
+                file_path,
+                id,
+                embedding,
+                self.timeouts.file_changed,
+                &mut on_timeout,
+            )
+        } else {
+            apply_file_change_diff(
+                reader,
+                writer,
+                conn,
+                &self.project_root,
+                &self.manifest.language,
+                file_path,
+                id,
+                embedding,
+                self.timeouts.file_changed,
+                self.timeouts.semantic_pass_file,
+                self.manifest.capabilities.semantic_pass && !semantic_suspended,
+                &mut on_timeout,
+            )
+        };
         (sent_to, result)
+    }
+
+    /// Re-extracts `file_path` whose text has not changed, because something
+    /// its resolution reads did: one structural round trip, no semantic pass
+    /// (`daemon::config_reindex` sends one for the whole selection). Not
+    /// queued for a crash replay: a failure is the caller's to recover from,
+    /// and a timeout relaunches the plugin like any other.
+    pub fn reextract(&self, conn: &IndexStore, file_path: &str, embedding: &EmbeddingPipeline) -> Result<()> {
+        let (_, result) = self.send_one(conn, file_path, embedding, true, true);
+        self.relaunch_after_timeout_if_needed(&result);
+        result
+    }
+
+    /// Asks the plugin, with a `resolutionChanged` request, what the edit of
+    /// the watch file `file_path` changed for resolution, given the facts
+    /// core stored with the language's rows. Bounded by the `fileChanged`
+    /// timeout; a timeout relaunches the plugin.
+    pub fn send_resolution_changed(
+        &self,
+        file_path: &str,
+        previous_facts: Option<String>,
+    ) -> Result<ResolutionChangedResult> {
+        let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
+        let result = {
+            let mut state = self.state();
+            let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
+            let request = ControlEnvelope {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: Some(id.clone()),
+                message: ControlMessage::ResolutionChanged {
+                    file_path: file_path.to_string(),
+                    previous_facts,
+                },
+            };
+            let mut on_timeout = self.kill_on_timeout(child);
+            write_message(writer, &request)
+                .context("failed to write the resolutionChanged request to the plugin")
+                .and_then(|()| {
+                    read_message_with_timeout::<ResolutionChangedResponse, _>(
+                        reader,
+                        self.timeouts.file_changed,
+                        &mut on_timeout,
+                    )
+                    .context("failed to read the plugin's resolutionChanged response")?
+                    .context("the plugin closed its output before answering resolutionChanged")
+                })
+                .and_then(|response| {
+                    if response.id != id {
+                        bail!(
+                            "resolutionChanged response id {:?} does not match request id {:?}",
+                            response.id,
+                            id
+                        );
+                    }
+                    Ok(response.result)
+                })
+        };
+        self.relaunch_after_timeout_if_needed(&result);
+        result
+    }
+
+    /// A per-file `semanticPass` over `file_paths` plus the language's owed
+    /// files, after a re-extract of `file_paths`. `file_paths` must not be
+    /// empty. Gated like [`Self::semantic_pass`] by the caller.
+    pub fn scoped_semantic_pass(
+        &self,
+        conn: &IndexStore,
+        file_paths: Vec<String>,
+        embedding: &EmbeddingPipeline,
+    ) -> Result<()> {
+        let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
+        let timeout = self.timeouts.semantic_pass_project_timeout(file_paths.len());
+        let result = {
+            let mut state = self.state();
+            let PluginState { child, io: PluginIo { reader, writer } } = &mut *state;
+            let mut on_timeout = self.kill_on_timeout(child);
+            apply_scoped_semantic_pass(
+                reader,
+                writer,
+                conn,
+                &self.manifest.language,
+                file_paths,
+                id,
+                embedding,
+                timeout,
+                &mut on_timeout,
+            )
+        };
+        self.relaunch_after_timeout_if_needed(&result);
+        result
     }
 
     /// The `on_timeout` this process gives every round trip: kill the child

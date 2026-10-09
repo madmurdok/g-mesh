@@ -212,7 +212,7 @@ mod tests {
         ControlEnvelope {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: None,
-            message: ControlMessage::FileChanged { file_path: "src/main.rs".to_string() },
+            message: ControlMessage::FileChanged { file_path: "src/main.rs".to_string(), reextract: false },
         }
     }
 

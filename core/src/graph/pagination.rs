@@ -807,6 +807,7 @@ pub fn paginate_edges(
                     engine: row.get("engine")?,
                     resolved,
                     to_declaration: row.get("toDeclaration")?,
+                    specifier: None,
                 },
                 rank,
             })

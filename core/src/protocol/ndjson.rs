@@ -12,6 +12,15 @@ use crate::protocol::types::{WireEdge, WireNode};
 pub enum BulkItem {
     Node(Box<WireNode>),
     Edge(WireEdge),
+    /// `{"resolutionFacts": "<opaque>"}`: the resolution facts the walk was
+    /// built from, written last by a `resolution_delta` plugin.
+    ResolutionFacts(String),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolutionFactsLine {
+    resolution_facts: String,
 }
 
 impl BulkItem {
@@ -22,9 +31,15 @@ impl BulkItem {
         if let Ok(node) = serde_json::from_str::<WireNode>(line) {
             return Ok(BulkItem::Node(Box::new(node)));
         }
-        serde_json::from_str::<WireEdge>(line)
-            .map(BulkItem::Edge)
-            .with_context(|| format!("malformed NDJSON line (neither a valid node nor edge): {line:?}"))
+        match serde_json::from_str::<WireEdge>(line) {
+            Ok(edge) => Ok(BulkItem::Edge(edge)),
+            Err(err) => match serde_json::from_str::<ResolutionFactsLine>(line) {
+                Ok(facts) => Ok(BulkItem::ResolutionFacts(facts.resolution_facts)),
+                Err(_) => Err(err).with_context(|| {
+                    format!("malformed NDJSON line (neither a valid node nor edge): {line:?}")
+                }),
+            },
+        }
     }
 }
 
@@ -112,6 +127,7 @@ mod tests {
             engine: "tree-sitter".to_string(),
             resolved: false,
             to_declaration: None,
+            specifier: None,
         })
         .unwrap()
     }

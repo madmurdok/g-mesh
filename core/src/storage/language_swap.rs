@@ -55,7 +55,8 @@ const DECLARATION_COLUMNS: &str = "nodeId, ordinal, startLine, startCol, endLine
 const TARGET_COLUMNS: &str = "nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile, keyPath";
 const SUFFIX_COLUMNS: &str = "suffix, nodeId";
 const UNTYPED_COLUMNS: &str = "name, nodeId";
-const EDGE_COLUMNS: &str = "id, fromId, toId, kind, source, engine, resolved, toDeclaration, linkedFrom";
+const EDGE_COLUMNS: &str =
+    "id, fromId, toId, kind, source, engine, resolved, toDeclaration, linkedFrom, specifier";
 const CONTAINER_COLUMNS: &str = "nodeId, language, key, parentKey, memberCount";
 
 /// The plan tables, created in the staging file. `plan_text_changed` holds
@@ -399,8 +400,9 @@ pub struct SwapBookkeeping<'a> {
 /// staging, the vectors of deleted nodes and of nodes whose text changed
 /// removed and `vectors` stored, `language_state` of the language written
 /// (walked now, semantic pass owed), both meta roll-ups reconciled, the
-/// language's `pending_reindex` row removed and, for a language with a
-/// semantic pass, its semantic-pending rows written. A failure rolls all of it
+/// language's `pending_reindex` row removed, its resolution facts replaced by
+/// staging's and, for a language with a semantic pass, its semantic-pending
+/// rows written. A failure rolls all of it
 /// back. Returns the ids of the placeholders the plan kept.
 pub fn swap(
     live: &mut Connection,
@@ -504,7 +506,7 @@ fn swap_attached(
              ON CONFLICT(id) DO UPDATE SET fromId = excluded.fromId, toId = excluded.toId,
                 kind = excluded.kind, source = excluded.source, engine = excluded.engine,
                 resolved = excluded.resolved, toDeclaration = excluded.toDeclaration,
-                linkedFrom = excluded.linkedFrom"
+                linkedFrom = excluded.linkedFrom, specifier = excluded.specifier"
         ),
         "the edge upserts",
     )?;
@@ -552,6 +554,16 @@ fn swap_attached(
     // What earlier per-file passes left unfinished described the index this
     // swap replaces; the pass that follows re-asks every file anyway.
     schema::clear_owed_files(&tx, language)?;
+    // The stored resolution facts describe the rows: they are replaced with
+    // the walk's own, or dropped when the walk reported none.
+    tx.execute("DELETE FROM resolution_facts WHERE language = ?1", params![language])
+        .with_context(|| format!("failed to drop {language}'s resolution facts"))?;
+    tx.execute(
+        "INSERT INTO resolution_facts (language, facts)
+         SELECT language, facts FROM staging.resolution_facts WHERE language = ?1",
+        params![language],
+    )
+    .with_context(|| format!("failed to swap in {language}'s resolution facts"))?;
     schema::record_bulk_index(&tx).context("failed to reconcile the bulk-index roll-up")?;
     schema::reconcile_semantic_pass_rollup(&tx, semantic_pass_languages)
         .context("failed to reconcile the semantic-pass roll-up")?;

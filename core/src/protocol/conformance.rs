@@ -65,7 +65,7 @@ pub fn check_bulk_output(ndjson: &[u8]) -> ConformanceReport {
         match result {
             Err(e) => violations.push(Violation { context, message: e.to_string() }),
             Ok(BulkItem::Node(node)) => violations.extend(node_shape_violations(&context, &node)),
-            Ok(BulkItem::Edge(_)) => {}
+            Ok(BulkItem::Edge(_) | BulkItem::ResolutionFacts(_)) => {}
         }
     }
     ConformanceReport { violations }

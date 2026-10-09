@@ -1069,8 +1069,15 @@ impl PluginRegistry {
     pub(crate) fn workspace_file_changed(&self, conn: &IndexStore, language: &str, changed_file: &str) {
         match self.get_or_spawn(language) {
             Ok(supervisor) => {
-                if let Err(err) = crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
-                {
+                // A plugin that can say what the edit changed for resolution
+                // is asked first; every other one gets the whole-language
+                // reindex.
+                let reindexed = if supervisor.manifest().capabilities.resolution_delta {
+                    crate::daemon::config_reindex::run(self, &supervisor, conn, changed_file)
+                } else {
+                    crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
+                };
+                if let Err(err) = reindexed {
                     crate::log_line!(
                         "g-mesh daemon: failed to reindex the {language} workspace after \
                          {changed_file} changed: {err:#} - {language}'s previous graph keeps \

@@ -182,6 +182,15 @@ pub struct Capabilities {
     /// presence hook). `false` (the default): never sent; the plugin sees only
     /// per-file `fileChanged`.
     pub files_created: bool,
+    /// Whether a watch-file save is first offered to this plugin as a
+    /// `resolutionChanged` request, so it can name what the edit changed for
+    /// resolution and core re-extracts only those files
+    /// (`daemon::config_reindex`). A plugin that declares it must answer
+    /// `resolutionChanged`, end its bulk walk with a `resolutionFacts` line,
+    /// and set `specifier` on its `IMPORTS` edges. `false` (the default):
+    /// core notifies `workspaceChanged` and reindexes the whole language, as
+    /// it always has.
+    pub resolution_delta: bool,
     /// Whether receiver calls resolve to edges once this plugin's best available
     /// tier has run. `Resolved` means against the receiver's declared or inferred
     /// type, never its run-time type (an override's caller page names the base

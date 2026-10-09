@@ -1443,7 +1443,7 @@ impl<'a> Driver<'a> {
                 continue;
             };
             let (method, file_paths) = match envelope.message {
-                ControlMessage::FileChanged { file_path } => (Method::FileChanged, vec![file_path]),
+                ControlMessage::FileChanged { file_path, .. } => (Method::FileChanged, vec![file_path]),
                 ControlMessage::SemanticPass { file_paths, .. } => (Method::SemanticPass, file_paths),
                 _ => continue,
             };

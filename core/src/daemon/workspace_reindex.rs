@@ -1050,6 +1050,7 @@ mod tests {
             engine: "tree-sitter".to_string(),
             resolved: true,
             to_declaration: None,
+            specifier: None,
         }
     }
 

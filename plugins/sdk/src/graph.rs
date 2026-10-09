@@ -565,6 +565,7 @@ impl FileGraphBuilder {
             engine: spec.engine,
             resolved: spec.resolved,
             to_declaration: spec.to_declaration,
+            specifier: None,
         });
         id
     }

@@ -112,12 +112,79 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
             file_changed_timeout,
             semantic_pass_timeout,
             semantic_pass_capable,
+            false,
             on_timeout,
         )
     })
 }
 
-/// [`apply_file_change`] for a caller already inside a unit.
+/// One structural `fileChanged` round trip with `reextract` set: the plugin
+/// extracts `file_path` even though its text is what it last extracted,
+/// because something its resolution reads changed. No semantic pass follows;
+/// the caller sends one for every file it re-extracted
+/// (`daemon::config_reindex`).
+#[allow(clippy::too_many_arguments)]
+pub fn reextract_file<R: BufRead + Send, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    store: &IndexStore,
+    project_root: &Path,
+    language: &str,
+    file_path: impl Into<String>,
+    request_id: RequestId,
+    embedding: &EmbeddingPipeline,
+    file_changed_timeout: Duration,
+    on_timeout: &mut dyn FnMut(),
+) -> Result<()> {
+    store.unit(Unit::WatcherApply, |store| {
+        apply_file_change_in(
+            reader,
+            writer,
+            store,
+            project_root,
+            language,
+            file_path,
+            request_id,
+            embedding,
+            file_changed_timeout,
+            file_changed_timeout,
+            false,
+            true,
+            on_timeout,
+        )
+    })
+}
+
+/// A per-file `semanticPass` over `file_paths` plus the language's owed
+/// files, settled like the pass after a reparse. `file_paths` must not be
+/// empty: an empty list asks for the whole project.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_scoped_semantic_pass<R: BufRead + Send, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    store: &IndexStore,
+    language: &str,
+    file_paths: Vec<String>,
+    request_id: RequestId,
+    embedding: &EmbeddingPipeline,
+    timeout: Duration,
+    on_timeout: &mut dyn FnMut(),
+) -> Result<()> {
+    anyhow::ensure!(!file_paths.is_empty(), "a scoped semantic pass needs at least one file");
+    store.unit(Unit::WatcherApply, |store| {
+        let owed = store.step(|conn| schema::owed_files(conn, language)).unwrap_or_else(|err| {
+            crate::log_line!("g-mesh: failed to read {language}'s owed semantic files ({err:#})");
+            Vec::new()
+        });
+        apply_semantic_pass_in(
+            reader, writer, store, language, None, file_paths, owed, request_id, embedding, timeout,
+            on_timeout,
+        )
+    })
+}
+
+/// [`apply_file_change`] for a caller already inside a unit. `reextract` is
+/// sent as `fileChanged`'s own flag.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     reader: &mut R,
@@ -131,6 +198,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     file_changed_timeout: Duration,
     semantic_pass_timeout: Duration,
     semantic_pass_capable: bool,
+    reextract: bool,
     on_timeout: &mut dyn FnMut(),
 ) -> Result<()> {
     let file_path = file_path.into();
@@ -141,7 +209,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
         reader,
         writer,
         store,
-        ControlMessage::FileChanged { file_path: file_path.clone() },
+        ControlMessage::FileChanged { file_path: file_path.clone(), reextract },
         Some(project_root),
         request_id.clone(),
         embedding,
@@ -539,7 +607,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
     let complete = response.result.complete;
     let mut diff = to_storage_diff(response.result, &mut PathWarnings::default());
     match (&request.message, project_root) {
-        (ControlMessage::FileChanged { file_path }, Some(root)) => {
+        (ControlMessage::FileChanged { file_path, .. }, Some(root)) => {
             let scope = file_scope(root, file_path, &diff, complete);
             store.apply_file_diff_linked(&mut diff, file_path, scope, method)?;
         }
@@ -651,6 +719,7 @@ fn method_name(message: &ControlMessage) -> &'static str {
         ControlMessage::WorkspaceChanged { .. } => "workspaceChanged",
         ControlMessage::PrepareSemanticPass => "prepareSemanticPass",
         ControlMessage::FilesCreated { .. } => "filesCreated",
+        ControlMessage::ResolutionChanged { .. } => "resolutionChanged",
     }
 }
 
@@ -847,6 +916,7 @@ pub(crate) fn to_edge_record(edge: WireEdge) -> EdgeRecord {
     // threaded through `new`.
     record.engine = edge.engine;
     record.to_declaration = edge.to_declaration.map(|ordinal| ordinal as i64);
+    record.specifier = edge.specifier;
     record
 }
 
