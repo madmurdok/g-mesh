@@ -444,3 +444,15 @@ renames).
 - C: generate the list from the last full run's JUnit. Benefit: always
   current. Risk: the local selection depends on a file from another run, and
   is not reviewable in git.
+
+## Owner decisions (2026-10-10)
+
+- Q1: "Узить листовые модули" (option B): `core/src/cli/**` selects `core-cli` + `core-it`,
+  `core/src/mcp/**` selects `core-mcp` + `core-it`, anything else under `core/` selects all core.
+- Q2: "Изолировать, починить задачей в батче (Recommended)": the env-writing lib tests stay on
+  nextest in this task; a separate 4.3.0 task converts each writer to injected overrides and
+  empties the list.
+- Q3: "Уменьшенно локально (Recommended)": `G_MESH_CONTAINERS_SEEDS=2` locally, full at batch
+  end and in CI.
+- Q4: "Статический, сверка в конце батча (Recommended)": static list; the batch-end run reports
+  tests that crossed 10 s either way.
