@@ -437,6 +437,13 @@ corpus at 228 symbols and 67.9k bytes in full rows."
   calls per file (about 85 compact rows). Risk: up to 1.5x the bytes
   re-read every turn.
 
+## Owner decisions (2026-10-09)
+
+- Q1: "Короткие, detail:\"full\" по запросу (Recommended)" -> compact rows by default, `detail: "full"` opt-in.
+- Q2: "Заполнять до лимита 8k (Recommended)" -> default `limit` 200, the 8,000 B budget is the real bound.
+- Q3: "Оставить (Recommended)" -> compact rows keep `symbolId`.
+- Q4: "Любой ответ ≤ 8000 байт (Recommended)" -> acceptance criterion 1 restated (task amended).
+
 ## Appendix: size script (no build needed)
 
 Run `python3 -I gm523_measure.py <index.db> <file>...`. The index DB is
