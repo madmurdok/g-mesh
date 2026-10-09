@@ -147,6 +147,9 @@ cmd_run() {
 		section_filter "$name" >/dev/null || die_unknown "$name"
 	done
 	require_nextest
+	# Before any build: only earlier builds' objects exist yet, so nothing
+	# this run links can be pruned.
+	scripts/prune-stale-objects.sh
 
 	local junit_dir="${CARGO_TARGET_DIR:-target}/nextest/$profile"
 	local failed=()
