@@ -273,6 +273,7 @@ fn a_report_renders_every_field_it_was_asked_for() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: 3,
             dirty: 1,
@@ -316,6 +317,7 @@ fn an_interrupted_workspace_reindex_is_named() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: vec![("rust".to_string(), "Cargo.toml".to_string())],
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 1,
             indexed: 1,
             dirty: 0,
@@ -353,6 +355,7 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: 4,
             dirty: 0,
@@ -424,6 +427,7 @@ fn the_generic_advice_stays_for_an_owed_language_with_no_recorded_failure() {
         false,
         &["python".to_string(), "rust".to_string()],
         &[("python".to_string(), "the server exited".to_string())],
+        &[],
         None,
     );
     assert_eq!(
@@ -435,6 +439,102 @@ fn the_generic_advice_stays_for_an_owed_language_with_no_recorded_failure() {
     );
 }
 
+fn leftover(language: &str, residual_files: Option<usize>, never_answered: usize) -> SemanticLeftover {
+    SemanticLeftover { language: language.to_string(), residual_files, never_answered }
+}
+
+/// A residual language is explained by its own line - how many files its
+/// next start asks, or the running daemon while one works - so it carries no
+/// "never completed" advice.
+#[test]
+fn a_residual_language_names_the_files_left_instead_of_the_generic_advice() {
+    let owed = ["python".to_string()];
+    let leftovers = [leftover("python", Some(2), 0)];
+
+    assert_eq!(
+        semantic_pass_lines(false, &owed, &[], &leftovers, None),
+        vec!["  semantic pass:   python incomplete - 2 file(s) left, the next daemon start asks only those"
+            .to_string()]
+    );
+    assert_eq!(
+        semantic_pass_lines(false, &owed, &[], &leftovers, Some("running - python (0/1 languages done)")),
+        vec![
+            "  semantic pass:   running - python (0/1 languages done)".to_string(),
+            "  semantic pass:   python incomplete - 2 file(s) left, the running daemon asks only those"
+                .to_string(),
+        ]
+    );
+}
+
+/// Another owed language with nothing to explain it still gets the advice
+/// beside a residual one.
+#[test]
+fn the_generic_advice_stays_beside_a_residual_language_for_an_unexplained_one() {
+    let lines = semantic_pass_lines(
+        false,
+        &["python".to_string(), "rust".to_string()],
+        &[],
+        &[leftover("python", Some(1), 0)],
+        None,
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "  semantic pass:   never completed - run `g-mesh reindex` to repair it".to_string(),
+            "  semantic pass:   python incomplete - 1 file(s) left, the next daemon start asks only those"
+                .to_string(),
+        ]
+    );
+}
+
+/// Files given up are counted as never answered, also once the pass is
+/// complete.
+#[test]
+fn never_answered_files_are_counted_also_when_the_pass_is_complete() {
+    assert_eq!(
+        semantic_pass_lines(true, &[], &[], &[leftover("rust", None, 3)], None),
+        vec![
+            "  semantic pass:   complete".to_string(),
+            "  semantic pass:   rust: 3 file(s) never answered - asked again when they change".to_string(),
+        ]
+    );
+}
+
+/// `index_status` reads the leftovers from the index, for semantic-pass
+/// capable languages only, and `render` prints them.
+#[test]
+fn the_index_status_reads_and_renders_the_semantic_leftovers() {
+    let fixture = Fixture::new(&[("a.ts", "export const a = 1;")]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "a.ts", false);
+    // The semantic-pass lines are rendered only once a walk has landed.
+    schema::record_language_bulk_indexed(&conn, "typescript", None).unwrap();
+    schema::record_bulk_index(&conn).unwrap();
+    schema::record_language_semantic_residual(&conn, "typescript", &["a.ts".to_string()], "cold").unwrap();
+    conn.execute_batch(
+        "INSERT INTO semantic_gap_files (language, filePath)
+             VALUES ('typescript', 'b.ts'), ('no-such-language', 'x.none');",
+    )
+    .unwrap();
+
+    let status = fixture.status();
+
+    assert_eq!(status.semantic_leftovers, vec![leftover("typescript", Some(1), 1)]);
+    let rendered = render(&report_with(status));
+    assert!(
+        rendered.contains(
+            "  semantic pass:   typescript incomplete - 1 file(s) left, the next daemon start asks only those\n"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "  semantic pass:   typescript: 1 file(s) never answered - asked again when they change\n"
+        ),
+        "{rendered}"
+    );
+}
+
 /// A pass that was not run because its plugin was asleep is still owed, not
 /// failed: status says it is pending and why.
 #[test]
@@ -443,6 +543,7 @@ fn a_pass_deferred_by_a_sleeping_plugin_reads_as_pending_not_failed() {
         false,
         &["python".to_string()],
         &[("python".to_string(), crate::daemon::semantic::NOT_RUN_REASON.to_string())],
+        &[],
         None,
     );
     assert_eq!(
@@ -461,6 +562,7 @@ fn a_deferred_pass_carries_no_reindex_advice_while_a_daemon_works() {
         false,
         &["python".to_string()],
         &[("python".to_string(), crate::daemon::semantic::NOT_RUN_REASON.to_string())],
+        &[],
         Some("running - go (0/2 languages done)"),
     );
     assert_eq!(
@@ -500,6 +602,7 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: 1,
             dirty: 3,
@@ -544,6 +647,7 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: if bulk_indexed { 4 } else { 0 },
             dirty: 4,
@@ -784,6 +888,7 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 2,
             indexed: 0,
             dirty: 2,
@@ -876,6 +981,7 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
@@ -1088,6 +1194,7 @@ fn a_project_with_no_suspension_marker_reports_none() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,

@@ -757,7 +757,7 @@ fn a_plugin_over_its_memory_limit_is_put_to_sleep_and_its_language_suspended() {
     // half) - `daemon::semantic::run_with_registry`/`run_once` and
     // `daemon::workspace_reindex` both go through this same method.
     assert!(
-        !supervisor.semantic_pass(&conn, Vec::new(), 0).expect("must not error, just skip"),
+        supervisor.semantic_pass(&conn, Vec::new(), 0).expect("must not error, just skip").is_none(),
         "a suspended language's whole-project semantic pass must not run either"
     );
 
@@ -1018,7 +1018,7 @@ fn a_memory_suspension_still_wins_over_a_hold() {
     let conn = test_plugin::empty_index();
 
     let ran = supervisor.semantic_pass(&conn, Vec::new(), 1).expect("a suspended pass is not an error");
-    assert!(!ran, "a suspended language's pass is not run, held or not");
+    assert!(ran.is_none(), "a suspended language's pass is not run, held or not");
     assert!(supervisor.pid().is_some(), "the plugin is still awake, so only the suspension declined it");
     let requests = test_plugin::requests(&plugin_dir);
     assert!(!requests.iter().any(|line| line.starts_with("semanticPass")), "{requests:?}");

@@ -549,9 +549,10 @@ fn swap_attached(
         )
         .with_context(|| format!("failed to record {language}'s pending files"))?;
     }
-    // What earlier per-file passes left unfinished described the index this
-    // swap replaces; the pass that follows re-asks every file anyway.
-    schema::clear_owed_files(&tx, language)?;
+    // What earlier passes left unfinished or gave up on (owed, residual and
+    // never-answered rows) described the index this swap replaces; the
+    // whole-project pass that follows re-asks every file anyway.
+    schema::clear_semantic_leftovers(&tx, language)?;
     schema::record_bulk_index(&tx).context("failed to reconcile the bulk-index roll-up")?;
     schema::reconcile_semantic_pass_rollup(&tx, semantic_pass_languages)
         .context("failed to reconcile the semantic-pass roll-up")?;
@@ -812,7 +813,7 @@ mod tests {
     /// A committed swap clears the swapped language's owed files - they named
     /// the index it replaces - and no other language's.
     ///
-    /// Control: drop `clear_owed_files` from `swap_attached`.
+    /// Control: drop `clear_semantic_leftovers` from `swap_attached`.
     #[test]
     fn a_swap_clears_only_its_languages_owed_files() {
         let (_dir, mut live, staging_path, _plan) = planned_reindex();
@@ -824,6 +825,38 @@ mod tests {
 
         swap(&mut live, &staging_path, None, &bookkeeping(&capable)).unwrap();
 
+        assert_eq!(
+            column(&live, "SELECT language || ':' || filePath FROM semantic_owed_files"),
+            vec!["go:a.go"]
+        );
+    }
+
+    /// A committed swap also clears the swapped language's residual and
+    /// never-answered rows (GM-521) - the whole-project pass that follows
+    /// re-asks every file - and no other language's.
+    ///
+    /// Control: call `clear_owed_files` instead of `clear_semantic_leftovers`
+    /// in `swap_attached` - rust's residual and gap rows survive.
+    #[test]
+    fn a_swap_clears_only_its_languages_residual_and_never_answered_files() {
+        let (_dir, mut live, staging_path, _plan) = planned_reindex();
+        for (language, file) in [("rust", "a.rs"), ("go", "a.go")] {
+            schema::record_language_semantic_residual(&live, language, &[file.to_string()], "cold").unwrap();
+            live.execute(
+                "INSERT INTO semantic_gap_files (language, filePath) VALUES (?1, 'given-up')",
+                rusqlite::params![language],
+            )
+            .unwrap();
+        }
+        let capable: HashSet<String> = HashSet::from(["rust".to_string()]);
+
+        swap(&mut live, &staging_path, None, &bookkeeping(&capable)).unwrap();
+
+        assert_eq!(column(&live, "SELECT language FROM semantic_residual"), vec!["go"]);
+        assert_eq!(
+            column(&live, "SELECT language || ':' || filePath FROM semantic_gap_files"),
+            vec!["go:given-up"]
+        );
         assert_eq!(
             column(&live, "SELECT language || ':' || filePath FROM semantic_owed_files"),
             vec!["go:a.go"]

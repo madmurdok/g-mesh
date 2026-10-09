@@ -80,6 +80,7 @@ use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
 use crate::storage::language_swap::{self, SwapBookkeeping};
 use crate::storage::schema;
+use crate::watcher::apply::SemanticPassOutcome;
 
 const STAGING_PREFIX: &str = "staging-";
 const STAGING_SUFFIX: &str = ".db";
@@ -236,9 +237,16 @@ pub(crate) fn run_with(
 
     if manifest.capabilities.semantic_pass {
         let file_count = semantic::indexed_file_count(store, language);
+        // The swap cleared any residual record, so this is always a
+        // whole-project pass.
         match supervisor.semantic_pass(store, Vec::new(), file_count) {
-            Ok(true) => {
-                let recorded = store.with(|conn| schema::record_language_semantic_pass(conn, language));
+            Ok(Some(outcome @ (SemanticPassOutcome::Complete | SemanticPassOutcome::Settled))) => {
+                let recorded = store.with(|conn| match outcome {
+                    SemanticPassOutcome::Settled => {
+                        schema::record_language_semantic_pass_settled(conn, language)
+                    }
+                    _ => schema::record_language_semantic_pass(conn, language),
+                });
                 if let Err(err) = recorded {
                     crate::log_line!(
                         "g-mesh daemon: failed to record {language}'s semantic pass after a workspace \
@@ -250,7 +258,14 @@ pub(crate) fn run_with(
             // The supervisor was asleep and deliberately left that way (see
             // `PluginSupervisor::semantic_pass`). The language stays owed for
             // whoever next asks; status shows why.
-            Ok(false) => semantic::record_not_run(store, language),
+            // Incomplete, with the unfinished files named: already recorded
+            // residual by the pass (`watcher::apply`); the next daemon start
+            // asks only those files.
+            Ok(Some(SemanticPassOutcome::Residual { left })) => crate::log_line!(
+                "g-mesh daemon: the {language} semantic pass after a workspace reindex left {left} file(s) \
+                 unfinished - the next start asks only those"
+            ),
+            Ok(None) => semantic::record_not_run(store, language),
             Err(err) => {
                 crate::log_line!(
                     "g-mesh daemon: the {language} semantic pass after a workspace reindex failed ({err:#}) - \
@@ -1723,7 +1738,10 @@ mod tests {
         let upsert_edges = vec![semantic_edge("alpha-stale", "alpha-n2", "alpha-n3")];
         apply_diff(&mut conn.lock().unwrap(), &Diff { upsert_edges, ..Default::default() }).unwrap();
 
-        assert!(supervisor.semantic_pass(&conn, Vec::new(), 0).expect("the pass succeeds"), "the pass ran");
+        assert!(
+            supervisor.semantic_pass(&conn, Vec::new(), 0).expect("the pass succeeds").is_some(),
+            "the pass ran"
+        );
         let edges = rows(&conn.lock().unwrap(), "SELECT id, source, toId FROM edges ORDER BY id");
         edges
     }

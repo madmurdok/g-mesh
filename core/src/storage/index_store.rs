@@ -405,7 +405,8 @@ impl Writer<'_> {
     /// [`Self::apply_diff_linked`] for one file's `fileChanged` diff, which
     /// is first widened by `scope` to retire the file's stored rows the
     /// plugin did not name (`storage::file_rows`). A gone file also loses its
-    /// `indexed_files` row. All in one step.
+    /// `indexed_files` row and its owed-file and never-answered semantic
+    /// rows. All in one step.
     pub fn apply_file_diff_linked(
         &mut self,
         diff: &mut Diff,
@@ -419,6 +420,7 @@ impl Writer<'_> {
             apply_and_link(conn, diff, label, &store.link_rules)?;
             if scope == FileScope::Gone {
                 file_rows::delete_indexed_file(conn, file_path)?;
+                super::schema::clear_gone_file_semantic_rows(conn, file_path)?;
             }
             store.claim(diff);
             Ok(())
@@ -672,5 +674,116 @@ mod tests {
     fn touching_the_unclaimed_set_without_the_store_fails_a_debug_build() {
         let store = store();
         store.claim(&Diff::default());
+    }
+
+    /// `language:filePath` of every owed-file (`semantic_owed_files`) and
+    /// never-answered (`semantic_gap_files`) row, each list in order.
+    fn semantic_file_rows(conn: &Connection) -> (Vec<String>, Vec<String>) {
+        let column = |sql: &str| -> Vec<String> {
+            conn.prepare(sql).unwrap().query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        (
+            column("SELECT language || ':' || filePath FROM semantic_owed_files ORDER BY 1"),
+            column("SELECT language || ':' || filePath FROM semantic_gap_files ORDER BY 1"),
+        )
+    }
+
+    /// Gives `file_path` an owed row and a never-answered row in `language`.
+    fn owe_and_give_up(conn: &Connection, language: &str, file_path: &str) {
+        conn.execute(
+            "INSERT INTO semantic_owed_files (language, filePath, attempts) VALUES (?1, ?2, 1)",
+            rusqlite::params![language, file_path],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO semantic_gap_files (language, filePath) VALUES (?1, ?2)",
+            rusqlite::params![language, file_path],
+        )
+        .unwrap();
+    }
+
+    fn apply_file_diff(store: &IndexStore, file_path: &str, scope: FileScope) {
+        store
+            .unit(Unit::WatcherApply, |writer| {
+                writer.apply_file_diff_linked(&mut Diff::default(), file_path, scope, "test")
+            })
+            .unwrap();
+    }
+
+    /// A deleted file's owed and never-answered rows go with it, in every
+    /// language, and `g-mesh status` stops counting it as never answered: no
+    /// plugin answer would ever clear them.
+    #[test]
+    fn a_gone_file_loses_its_owed_and_never_answered_rows_and_status_stops_counting_it() {
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let db_path = state.path().join("index.db");
+        let conn = Connection::open(&db_path).unwrap();
+        schema::ensure_current(&conn, &crate::daemon::registry::fixture_indexer_version()).unwrap();
+        owe_and_give_up(&conn, "typescript", "src/gone.ts");
+        owe_and_give_up(&conn, "rust", "src/gone.ts");
+        conn.execute(
+            "INSERT INTO semantic_gap_files (language, filePath) VALUES ('typescript', 'src/kept.ts')",
+            [],
+        )
+        .unwrap();
+        let store = IndexStore::new(conn);
+        let plugins =
+            crate::daemon::manifest::discover(&[
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins")
+            ])
+            .unwrap();
+        let never_answered = || -> Vec<(String, usize)> {
+            crate::cli::status::index_status(project.path(), &db_path, &plugins)
+                .unwrap()
+                .semantic_leftovers
+                .into_iter()
+                .map(|leftover| (leftover.language, leftover.never_answered))
+                .collect()
+        };
+        assert!(never_answered().contains(&("typescript".to_string(), 2)), "{:?}", never_answered());
+
+        apply_file_diff(&store, "src/gone.ts", FileScope::Gone);
+
+        assert_eq!(
+            store.with(semantic_file_rows),
+            (vec![], vec!["typescript:src/kept.ts".to_string()]),
+            "every language's rows for the gone file are deleted"
+        );
+        assert!(never_answered().contains(&("typescript".to_string(), 1)), "{:?}", never_answered());
+    }
+
+    /// A file that changed but is still there keeps its rows: only an answer
+    /// from the plugin settles them.
+    #[test]
+    fn a_partial_or_complete_file_diff_keeps_the_owed_and_never_answered_rows() {
+        for scope in [FileScope::Partial, FileScope::Complete] {
+            let store = store();
+            store.with(|conn| owe_and_give_up(conn, "rust", "src/a.rs"));
+
+            apply_file_diff(&store, "src/a.rs", scope);
+
+            assert_eq!(
+                store.with(semantic_file_rows),
+                (vec!["rust:src/a.rs".to_string()], vec!["rust:src/a.rs".to_string()]),
+                "{scope:?}"
+            );
+        }
+    }
+
+    /// A gone file takes only its own rows.
+    #[test]
+    fn a_gone_file_leaves_other_files_owed_and_never_answered_rows() {
+        let store = store();
+        store.with(|conn| {
+            owe_and_give_up(conn, "rust", "src/a.rs");
+            owe_and_give_up(conn, "rust", "src/b.rs");
+            owe_and_give_up(conn, "rust", "src/a.rs.bak");
+        });
+
+        apply_file_diff(&store, "src/a.rs", FileScope::Gone);
+
+        let left = vec!["rust:src/a.rs.bak".to_string(), "rust:src/b.rs".to_string()];
+        assert_eq!(store.with(semantic_file_rows), (left.clone(), left));
     }
 }

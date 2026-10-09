@@ -416,3 +416,30 @@ out. Core has no idea what a site is; only the plugin does.
   modules that failed to load as `unfinishedFiles` (GM-521/S4).
 - **Q5: "Файлы целиком".** Re-asking is per file, not per call site; GM-521's
   acceptance criterion is amended to match.
+
+### Implementation notes (GM-521/S7)
+
+- **Never-answered count.** Q3's counter is a table, `semantic_gap_files
+  (language, filePath)`: `settle_owed_files` writes a row when it drops a
+  file at `MAX_OWED_ATTEMPTS` and deletes it when a later pass settles or
+  re-owes the file, so an edit clears it. A complete whole-project pass and a
+  workspace reindex swap clear the language's rows;
+  `record_language_semantic_pass_settled` (Q3) keeps them for `g-mesh status`.
+- **A residual pass that fails outright** (timeout, crash) costs each of its
+  files an attempt, so a file whose pass always times out is asked on at most
+  3 starts.
+- **GM-515 presence batches.** Unchanged from Decision 4: owed files, residual
+  ones included, ride along on every per-file pass of a creation batch, so a
+  batch of 3+ creations can spend an owed file's attempts at once. The bound
+  holds; it is reached sooner.
+
+### Owner decision on the residual pass budget (2026-10-09)
+
+**"Core передаёт дедлайн в запросе".** The bridge cannot tell a residual pass
+from a per-file pass: both arrive as `semanticPass { filePaths }`, and a
+per-file pass also carries owed files. So the budget is not inferred from the
+file count. Instead, `semanticPass` gains an optional `budgetMs`, which core
+sets to the timeout it already applies to that pass (`semantic_pass_project_timeout(n)`
+for a residual pass, the per-file timeout otherwise). The bridge's
+`pass_budget` uses it when present, never planning past it, and falls back to
+today's rules when absent. Third-party plugins ignore the field.
