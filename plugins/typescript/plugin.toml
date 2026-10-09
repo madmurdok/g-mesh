@@ -21,7 +21,7 @@ protocol_version = 2
 # Must equal this crate's `Cargo.toml` `version`: a plugin in the cargo
 # workspace tracks the release version (docs/architecture/plugin-modularity.md,
 # "plugin_version: two rules, not one"); scripts/cut-release.sh checks it.
-plugin_version = "4.2.0"
+plugin_version = "4.3.0"
 
 [plugin.spawn]
 command = "${G_MESH_BIN_DIR}/g-mesh-plugin-typescript"
