@@ -499,3 +499,63 @@ Order and parallel work:
 - **Q3: "Да, на секции".** The gate's `cargo test --workspace` becomes
   `test-sections.sh check` + `run all`; the GM-302 `-p g-mesh` run stays.
 - **Q4: "11, мелкие вместе".** The 11 sections in section 2 as listed.
+
+## 11. Results (S9, 2026-10-09)
+
+Measured at c827cfa. Verdict: **the sum of the sections is not worse than one
+run**, in CI on every platform and locally in CPU time.
+
+### CI
+
+Branch run 37948088042 (`workflow_dispatch`, target `all`, green) against main
+run 37859404190 (936c5dd) and release-4.2.0 run 37856293674 (3ea8a7e). On main,
+the single `cargo nextest run` step includes the build. The branch splits it
+into `Build the test binaries` plus 11 section steps, so the comparable number
+is build + sections. "Tests" is the sum of nextest's `Summary [..]` times.
+All values are in seconds.
+
+| platform | main step (build / tests) | 4.2.0 step (build / tests) | branch build + sections (build / tests) | sections steps wall | main job | 4.2.0 job | branch job |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| x86_64-linux | 509 (202 / 287) | 514 (224 / 286) | 482 (222 / 254) | 260 | 590 | 613 | 596 |
+| aarch64-darwin | 587 (211 / 369) | 747 (319 / 415) | 681 (281 / 388) | 400 | 702 | 900 | 828 |
+| x86_64-darwin | 1482 (728 / 727) | 1113 (513 / 583) | 918 (387 / 512) | 531 | 1762 | 1345 | 1079 |
+| windows | 827 (465 / 340) | 833 (478 / 335) | 781 (453 / 310) | 328 | 1001 | 1013 | 979 |
+
+- The overhead of 11 nextest invocations is small. The section steps' wall
+  time minus the sections' summed test time is 6s on linux, 12s on
+  aarch64-darwin, 20s on x86_64-darwin and 18s on windows. Each invocation
+  re-checks freshness in 0.2-0.6s and lists the binaries.
+- The sections' test time is lower than one run's on linux, x86_64-darwin and
+  windows. On aarch64-darwin it is 388s, which lies between main's 369s and
+  4.2.0's 415s. That gap is runner variance, not a section cost: core-it alone
+  is 276s there, and the other ten sections add 112s. The branch's aarch64 job
+  is 126s longer than main's, but 70s of that is the build step (281 vs 211)
+  on a different runner.
+- The branch runs 2979 tests against 2970 on main and 4.2.0; the branch adds
+  tests.
+
+### Local warm-build A/B
+
+The machine was shared, with another agent's full verify suite running.
+Load ranged from 120 to 450 during the runs, so `real` is load-bound and is
+not comparable. `user+sys` is the comparable number. The warm-up was
+`cargo build --workspace` + `nextest --no-run`. GM-538's
+`prune-stale-objects.sh` ran on this target before each arm.
+
+Arm A is `cargo nextest run --workspace --no-fail-fast`, not `-p g-mesh` as
+briefed, because the sections run `--workspace`. `-p g-mesh` would test a
+different set (core only) under a different feature unification, which means
+a rebuild. Arm B is `scripts/test-sections.sh run --keep-going all`. Both arms
+ran 2979 tests, all passing.
+
+| run | user+sys (s) | real (s) | load before / after (1-min) |
+| --- | ---: | ---: | --- |
+| A1 | 988.9 | 1750 | 401 / 129 |
+| B1 | 880.0 | 1713 | 120 / 407 |
+| A2 | 748.5 | 1623 | 404 / 328 |
+| B2 | 729.5 | 2037 | 311 / 148 |
+
+In each A/B pair, B used no more CPU than A: -11% and -3%. The means are A
+868.7s and B 804.7s. B2's longer `real` came mostly from core-it, which took
+1152s against 805s in B1, under the verify suite's load. It is not a cost of
+splitting.
