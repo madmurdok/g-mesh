@@ -600,96 +600,131 @@ jobs:
         shell: bash
         run: echo "G_MESH_HOME=${{ runner.temp }}/g-mesh-test-home" >> "$GITHUB_ENV"
 
-      # A *step* timeout rather than a smaller job one, because the two bound
-      # different things: the job budget has to cover a cold build that
-      # compiles ONNX Runtime, SQLite and Oniguruma from scratch, while the
-      # tests themselves finish in about three minutes on a healthy platform.
-      # Windows spent 37 of its 45 minutes hung and produced nothing, so the
-      # useful budget is the one on the part that hangs (GM-249).
+      # Every section step and the daemon log step below read this path.
+      # `G_MESH_TRACE_CALLS` stays unset: its two lines per tool call crowd the
+      # daemon activity out of the log's last 200 lines.
+      - name: Daemon log path for the test sections
+        shell: bash
+        run: echo "G_MESH_DAEMON_LOG=${{ runner.temp }}/g-mesh-daemon.log" >> "$GITHUB_ENV"
+
+      # The test sections, one step each, on one build. Why steps and not a
+      # matrix, and why `!cancelled()` between them:
+      # docs/adr/0030-test-sections.md.
       #
-      # A backstop now rather than the only bound: nextest terminates an
-      # individual hung test at 210s and *names* it, which is the diagnosis
-      # this timeout could never give - a step killed here is reported as
-      # cancelled and prints nothing. Demonstrated rather than assumed: a test
-      # written to sleep forever comes back as `TIMEOUT [8.066s]
-      # g-mesh::zz_hang_probe a_test_that_never_finishes`.
-      #
-      # 25, not 15, and the number is a measurement rather than a margin.
-      # This budget covers the *build* as well as the run, which is most of
-      # it. On run 35443197107 the x86_64 macOS job was killed at 15:00 with
-      # every one of its 1327 tests passing:
-      #
-      #   step start  12:36:47
-      #   build done  12:46:00   (`Finished test profile ... in 9m 03s`)
-      #   tests start 12:46:05
-      #   Summary     12:51:50   (345s, 1327 passed, 0 failed)
-      #   killed      12:51:51
-      #
-      # 9m03s + 5m45s = 14m53s against 15m - it lost by seconds, on a green
-      # suite, because `macos-15-intel` is the slowest image in the matrix and
-      # a cold debug build of this workspace is nine minutes there. Windows on
-      # the same run: 8m21s total, of which 165s was the tests.
-      #
-      # That job had been passing until GM-335 touched `core/build.rs`, which
-      # invalidates every downstream crate - so the margin had been thin for a
-      # while and nothing had made it visible. 25 leaves roughly 10 minutes of
-      # headroom over the worst observed total while still bounding a genuine
-      # hang, and nextest reports a stuck test as `SLOW`/`TIMEOUT` long before
-      # this fires (see the paragraph above).
-      - name: cargo nextest run
+      # Invariants:
+      # - This step builds every test binary the sections run, and with it
+      #   the `g-mesh`, plugin and SDK binaries the tests spawn; the
+      #   `plugins check` step reuses that `g-mesh` build.
+      # - Each step timeout bounds one part (the build, or one section) and is
+      #   a backstop: nextest itself terminates a hung test at 210s and names
+      #   it (`.config/nextest.toml`), while a step killed by its timeout is
+      #   reported as cancelled and prints nothing.
+      # - `--profile ci` only adds the JUnit file; how tests run is the
+      #   `default` profile's.
+      - name: Build the test binaries
+        id: build
         timeout-minutes: 25
         shell: bash
-        env:
-          G_MESH_DAEMON_LOG: ${{ runner.temp }}/g-mesh-daemon.log
-          # `G_MESH_TRACE_CALLS` is deliberately *not* set here any more. It
-          # did its job - splitting the Windows hang three ways by whether a
-          # call reached `prepare`, got through it, or died on the way back
-          # (GM-246) - and then cost something: two lines per tool call filled
-          # the log's last 200 lines with 183 trace lines, crowding out the
-          # daemon activity the step below exists to show. Turn it back on for
-          # a specific question, not as a standing setting.
-        # `fail-fast = false` and the per-test timeout live in
-        # .config/nextest.toml rather than here, so they hold however the
-        # suite is invoked. That file also carries the measurement that chose
-        # this tool over `cargo test`, and the local one that got it wrong.
-        #
-        # No `--manifest-path` since GM-284: the repository root is the cargo
-        # workspace root now, so this runs core's suite *and* the wire types'
-        # round-trip tests *and* the plugin SDK's - including the SDK's toy
-        # plugin going through the real `g-mesh plugins check`, which is the
-        # only place the SDK's own conformance is proved.
-        # `--profile ci` only adds the JUnit file (GM-344); nothing about how
-        # the tests run changes - see `.config/nextest.toml`.
-        run: cargo nextest run --workspace --profile ci
+        run: cargo nextest run --workspace --profile ci --no-run
 
-      # GM-344. So a platform's state is readable on the run page instead of
-      # by downloading the log and writing a regex - which produced a wrong
-      # count twice in one session, in the same direction both times.
-      #
-      # `always()` because the interesting case is the failing one, and the
-      # step above has already failed the job by the time this runs.
+      # The partition does not depend on the platform, so one row checks it.
+      - name: Test sections cover the whole suite
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        timeout-minutes: 5
+        shell: bash
+        run: scripts/test-sections.sh check
+
+      - name: "tests: core-it"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 20
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci core-it
+
+      - name: "tests: core-mcp"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci core-mcp
+
+      - name: "tests: core-daemon"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci core-daemon
+
+      - name: "tests: core-cli"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci core-cli
+
+      - name: "tests: core-graph"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci core-graph
+
+      - name: "tests: core-rest"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci core-rest
+
+      - name: "tests: sdk"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci sdk
+
+      - name: "tests: plugin-typescript"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci plugin-typescript
+
+      - name: "tests: plugin-rust"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci plugin-rust
+
+      - name: "tests: plugin-python"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci plugin-python
+
+      - name: "tests: wire"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci wire
+
+      # `always()` because the interesting case is the failing one, and a
+      # section step has already failed the job by the time this runs.
       - name: Test results, by binary
         if: always()
         shell: bash
         run: |
           set -uo pipefail
-          junit=target/nextest/ci/junit.xml
-          if [ ! -f "$junit" ]; then
-            echo "No JUnit at \`$junit\` - nextest did not get far enough to write one." >> "$GITHUB_STEP_SUMMARY"
+          shopt -s nullglob
+          junit=(target/nextest/ci/junit-*.xml)
+          if [ ${#junit[@]} -eq 0 ]; then
+            echo "No JUnit under \`target/nextest/ci/\` - nextest did not get far enough to write one." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           # `python3` on the Unix images, `python` on windows-2022.
           py="$(command -v python3 || command -v python)"
-          "$py" scripts/ci-junit-summary.py "$junit" "${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
+          "$py" scripts/ci-junit-summary.py "${junit[@]}" "${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
 
-      # Kept for every run, not only failing ones: GM-345's run-to-run diff
-      # needs both sides, and the green side is the one nobody thinks to keep.
+      # Kept for every run, not only failing ones: a run-to-run diff
+      # (`scripts/ci-diff-runs.sh`) needs both sides.
       - name: Keep the JUnit results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: junit-${{ matrix.target }}
-          path: target/nextest/ci/junit.xml
+          path: target/nextest/ci/junit-*.xml
           if-no-files-found: warn
           retention-days: 30
 
@@ -700,7 +735,7 @@ jobs:
       # OS and not another is caught here instead of only in a bug report.
       #
       # `cargo run`, not a resolved `target/debug/g-mesh(.exe)` path: the
-      # `cargo nextest run` step above already built the `g-mesh` binary
+      # `Build the test binaries` step above already built the `g-mesh` binary
       # (every test that uses `CARGO_BIN_EXE_g-mesh` forces cargo to build
       # it first), and `cargo run` re-uses that same debug-profile artifact
       # after a fast freshness check rather than rebuilding it - which is
