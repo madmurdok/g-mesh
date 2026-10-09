@@ -7,7 +7,7 @@
 #
 #   scripts/cut-release.sh <version>              # verify, test, tag locally
 #   scripts/cut-release.sh <version> --push       # ...and push the tag
-#   scripts/cut-release.sh <version> --skip-tests # skip the cargo test runs (--workspace and -p g-mesh)
+#   scripts/cut-release.sh <version> --skip-tests # skip the test runs (all test sections, doctests, and cargo test -p g-mesh)
 #
 # This script does NOT bump the version - that already happened as the
 # release branch's first commit. What it does instead is VERIFY that
@@ -88,13 +88,13 @@
 # it takes the explicit --push above; without it, the tag is created locally
 # and the exact command to push it is printed instead.
 #
-# `cargo test --workspace` takes 10+ minutes on this machine. Skipping the announcement of
+# The workspace test sections take 10+ minutes on this machine. Skipping the announcement of
 # that fact makes the wait look like a hang, so this script says what it is
 # doing before it goes quiet. --skip-tests exists for re-running this script
 # after a preflight check fails post-test (e.g. to fix --push without paying
 # for the suite twice) - use it deliberately, not as a default habit.
 #
-# GM-302: `cargo test --workspace` above is GM-288's deliberate choice, but a
+# GM-302: the workspace-wide test run is GM-288's deliberate choice, but a
 # workspace is not the configuration that ships. `build-targets.sh` builds
 # core package-scoped, from `core/` (`cd core && cargo build`, no `-p`) -
 # `plugins/rust` and `plugins/python` (and whatever THEY pull in) are not in
@@ -133,7 +133,7 @@
 # `initialize` + `tools/list`, returns a BYTE-IDENTICAL response - every tool
 # schema's property order included - whether the binary was built scoped or
 # workspace-wide. So today, core's shipped JSON key order does not actually
-# diverge from what `cargo test --workspace` exercises; `check_core_feature_
+# diverge from what the workspace-wide test run exercises; `check_core_feature_
 # isolation` below is the standing check that this stays true, since nothing
 # about resolver v2's host/target separation is guaranteed by this script,
 # only observed. `cargo test -p g-mesh` further down is the general backstop
@@ -192,7 +192,8 @@
 #   - core's own normal dependency graph reaching serde_json's
 #     `preserve_order` feature (GM-302) - see that comment above for why this
 #     is checked directly instead of trusted to stay absent
-#   - `cargo test --workspace` failing, OR `cargo test -p g-mesh` failing
+#   - the test sections' coverage check or any test section failing
+#     (`scripts/test-sections.sh`), OR `cargo test -p g-mesh` failing
 #     (GM-302 added the second one; GM-288's comment on the first explains why
 #     both run rather than either replacing the other)
 # ---------------------------------------------------------------------------
@@ -216,7 +217,7 @@ usage: scripts/cut-release.sh <version> [--push] [--skip-tests]
 
   <version>      the release version, X.Y.Z, matching core/Cargo.toml
   --push         also push the tag (starts the build/publish workflow)
-  --skip-tests   skip the cargo test runs (--workspace and -p g-mesh, GM-302) before tagging
+  --skip-tests   skip the test runs (all test sections, doctests, and cargo test -p g-mesh) before tagging
 EOF
 }
 
@@ -377,7 +378,7 @@ check_core_feature_isolation() {
 	local runtime_hits
 	runtime_hits="$(cargo tree -p g-mesh -e normal,features,no-proc-macro 2>/dev/null | grep -c preserve_order || true)"
 	if [ "$runtime_hits" -ne 0 ]; then
-		die "core's own normal dependency graph now reaches serde_json's preserve_order feature ($runtime_hits edge(s) via 'cargo tree -p g-mesh -e normal,features,no-proc-macro') - core's shipped JSON key order would differ from what cargo test --workspace exercises; see this script's GM-302 header comment before proceeding"
+		die "core's own normal dependency graph now reaches serde_json's preserve_order feature ($runtime_hits edge(s) via 'cargo tree -p g-mesh -e normal,features,no-proc-macro') - core's shipped JSON key order would differ from what the workspace test sections exercise; see this script's GM-302 header comment before proceeding"
 	fi
 	log "core's runtime dependency graph does not reach preserve_order (GM-302): cargo tree -p g-mesh -e normal,features,no-proc-macro -> 0"
 
@@ -602,26 +603,31 @@ main() {
 	check_core_feature_isolation
 
 	if [ "$skip_tests" -eq 1 ]; then
-		log "skipping cargo test (--skip-tests)"
+		log "skipping the test runs (--skip-tests)"
 	else
-		log "running cargo test --workspace - this takes 10+ minutes on this machine, not hung, just slow"
+		# Every workspace member's tests run, not core's alone: every one of
+		# them ships inside the release archive. The sections partition the
+		# suite (`check`), so `run all` is the whole suite; it stops at the
+		# first failing section (docs/adr/0030-test-sections.md).
+		log "checking that the test sections cover the whole suite"
+		"$REPO_ROOT/scripts/test-sections.sh" check ||
+			die "scripts/test-sections.sh check failed - a test is in no section or in two; fix the filtersets before cutting a release"
+		log "running every test section - this takes 10+ minutes on this machine, not hung, just slow"
 		local test_start test_end
 		test_start="$(date +%s)"
-		# GM-288: `--workspace` from the repo root, not `cd core && cargo
-		# test` - since GM-284 made the repository a cargo workspace, the
-		# latter tests core alone and would gate a release on green tests
-		# while shipping wire/, plugins/sdk, plugins/rust and plugins/python
-		# untested. Every one of those now ships inside every release archive
-		# (the Rust plugin since GM-288, the Python plugin since GM-298), so a
-		# release gate that does not run their tests is not actually gating on
-		# them.
-		(cd "$REPO_ROOT" && cargo test --workspace) ||
-			die "cargo test --workspace failed - fix the failure before cutting a release"
+		"$REPO_ROOT/scripts/test-sections.sh" run all ||
+			die "a test section failed - fix the failure before cutting a release"
 		test_end="$(date +%s)"
-		log "cargo test --workspace passed in $((test_end - test_start))s"
+		log "every test section passed in $((test_end - test_start))s"
 
-		# GM-302: --workspace above is deliberate (GM-288's comment on it,
-		# just above, explains why) and stays - this is IN ADDITION, not a
+		# nextest does not run doctests, so the sections above never compile
+		# them; this is the run that does.
+		log "running the workspace doctests"
+		(cd "$REPO_ROOT" && cargo test --doc --workspace) ||
+			die "cargo test --doc --workspace failed - fix the doctest before cutting a release"
+
+		# GM-302: the workspace-wide sections above are deliberate (the comment
+		# on them, just above, explains why) and stay - this is IN ADDITION, not a
 		# replacement. `check_core_feature_isolation` already confirmed core's
 		# own linked serde_json is the same in both configurations today, but
 		# that confirmation is a property of this repository's CURRENT
@@ -633,13 +639,13 @@ main() {
 		# build`, no `-p`, which is what `-p g-mesh` from the workspace root
 		# resolves the same way - both exclude plugins/rust and
 		# plugins/python from the graph entirely), so ANY divergence between
-		# what ships and what `--workspace` above just tested - this one, or
+		# what ships and what the sections above just tested - this one, or
 		# a different one neither check above was written for - has to fail
 		# a real test to reach a release.
 		log "running cargo test -p g-mesh - the exact package scope build-targets.sh ships (GM-302)"
 		test_start="$(date +%s)"
 		(cd "$REPO_ROOT" && cargo test -p g-mesh) ||
-			die "cargo test -p g-mesh failed - the shipped configuration itself is broken, even though cargo test --workspace passed; fix it before cutting a release (see GM-302)"
+			die "cargo test -p g-mesh failed - the shipped configuration itself is broken, even though the workspace test sections passed; fix it before cutting a release (see GM-302)"
 		test_end="$(date +%s)"
 		log "cargo test -p g-mesh passed in $((test_end - test_start))s"
 	fi
