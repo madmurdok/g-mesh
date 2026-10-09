@@ -1066,7 +1066,7 @@ either already the checker's job or has no consumer among the MCP tools.
 | `find_callees` | `symbolId` or `symbolName` + `limit`? + `answer`? | outbound `CALLS` |
 | `find_implementations` | `symbolId` or `symbolName` + `limit`? | inbound `SUPERTYPE_OF` |
 | `search_code` | free-text query | semantic matches via embeddings, ranked by similarity |
-| `get_file_outline` | `filePath` + `limit`? + `detail`? | symbols defined in the file, members included, in source order. Compact rows by default (`symbolId`, `name`, `kind`, `startLine`, `endLine`, `exported`); `detail: "full"` adds `qualifiedName`, columns and `signature`. Every response is at most 8,000 bytes (`OUTLINE_MAX_RESPONSE_BYTES`, which `limit` cannot lift); a cut page sets `hasMore`, `nextCursor` and `total` (GM-523) |
+| `get_file_outline` | `filePath` + `limit`? + `detail`? | symbols defined in the file, members included, in source order. Compact rows by default (`symbolId`, `name`, `kind`, `startLine`, `endLine`, `exported`); `detail: "full"` adds `qualifiedName`, columns and `signature`. Every response is at most 8,000 bytes (`OUTLINE_MAX_RESPONSE_BYTES`, which `limit` cannot lift), except a page whose single row alone exceeds it; a cut page sets `hasMore`, `nextCursor` and `total` (GM-523) |
 | `get_dependencies` | `filePath`/`moduleId` + direction | impact analysis before a change: a bounded transitive `IMPORTS` walk over the files linked as described in [Import resolution](#import-resolution) |
 
 All list-shaped responses are cursor-paginated: `results`, `hasMore`,
