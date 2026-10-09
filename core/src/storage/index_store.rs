@@ -405,7 +405,8 @@ impl Writer<'_> {
     /// [`Self::apply_diff_linked`] for one file's `fileChanged` diff, which
     /// is first widened by `scope` to retire the file's stored rows the
     /// plugin did not name (`storage::file_rows`). A gone file also loses its
-    /// `indexed_files` row. All in one step.
+    /// `indexed_files` row and its owed-file and never-answered semantic
+    /// rows. All in one step.
     pub fn apply_file_diff_linked(
         &mut self,
         diff: &mut Diff,
@@ -419,6 +420,7 @@ impl Writer<'_> {
             apply_and_link(conn, diff, label, &store.link_rules)?;
             if scope == FileScope::Gone {
                 file_rows::delete_indexed_file(conn, file_path)?;
+                super::schema::clear_gone_file_semantic_rows(conn, file_path)?;
             }
             store.claim(diff);
             Ok(())

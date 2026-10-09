@@ -1374,6 +1374,19 @@ pub fn clear_owed_files(conn: &Connection, language: &str) -> Result<()> {
     Ok(())
 }
 
+/// Deletes `file_path`'s owed-file and never-answered rows, whatever their
+/// language, for a file that is gone. A per-file pass over a deleted file has
+/// an empty scope and reports nothing unfinished, so without this its rows
+/// would stay until a complete whole-project pass.
+pub fn clear_gone_file_semantic_rows(conn: &Connection, file_path: &str) -> Result<()> {
+    conn.execute("DELETE FROM semantic_owed_files WHERE filePath = ?1", params![file_path])
+        .and_then(|_| conn.execute("DELETE FROM semantic_gap_files WHERE filePath = ?1", params![file_path]))
+        .with_context(|| {
+            format!("failed to clear the gone file {file_path}'s owed and never-answered rows")
+        })?;
+    Ok(())
+}
+
 /// Deletes `language`'s owed-file, residual and never-answered rows: what a
 /// complete whole-project pass answered, or what a workspace reindex swap
 /// made stale (the whole-project pass that follows writes fresh ones).
