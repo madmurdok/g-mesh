@@ -176,7 +176,9 @@ impl ProjectWatcher {
     /// directory (a move can carry a nested `.gitignore` without an event for
     /// the file itself), a symlink, or a link spelling in the current table or
     /// an ancestor of one (a removed link is neither a directory nor a
-    /// symlink any more). The root itself does not count: macOS reports it
+    /// symlink any more) - except a link the table holds unchanged (same real
+    /// target; [`LinkTable::holds`](crate::project_walk::LinkTable::holds)),
+    /// which is what an edit to a file link's target is remapped to. The root itself does not count: macOS reports it
     /// for any write inside. Returns `None` without a reload, else the
     /// changed link spellings ([`Self::reload_ignores`]).
     pub fn reload_ignores_if_changed(&self, settled: &[PathBuf]) -> Option<Vec<String>> {
@@ -185,7 +187,9 @@ impl ProjectWatcher {
             settled.iter().any(|path| {
                 path.file_name() == Some(std::ffi::OsStr::new(GITIGNORE_FILE_NAME))
                     || (path.as_path() != self.root
-                        && (path.is_dir() || path.is_symlink() || current.links().concerns(path)))
+                        && (path.is_dir()
+                            || ((path.is_symlink() || current.links().concerns(path))
+                                && !current.links().holds(path))))
             })
         };
         changed.then(|| self.reload_ignores())
@@ -193,10 +197,28 @@ impl ProjectWatcher {
 
     /// Drops from a settled batch the paths the current layers ignore: an
     /// event that passed [`Self::next_change`] under the old layers but sits
-    /// under what a `.gitignore` in the same batch now ignores.
+    /// under what a `.gitignore` in the same batch now ignores. A file link's
+    /// own path, which [`Self::next_change`] keeps as spelled so it reloads
+    /// the table, is first placed by the reloaded table
+    /// ([`LinkTable::file_link_to_indexed`](crate::project_walk::LinkTable::file_link_to_indexed)):
+    /// a refused one dropped, a duplicate or aliasing one moved to the
+    /// spelling the walk lists (once, if the batch already holds it).
     pub fn retain_unignored(&self, settled: &mut Vec<PathBuf>) {
         let layers = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        settled.retain(|path| !layers.is_ignored(path));
+        let mut seen = std::collections::HashSet::new();
+        let placed: Vec<PathBuf> = std::mem::take(settled)
+            .into_iter()
+            .filter_map(|path| match layers.links().file_link_to_indexed(&path) {
+                Remap::Keep => Some(path),
+                Remap::To(indexed) => Some(indexed),
+                Remap::Drop => None,
+            })
+            .collect();
+        for path in placed {
+            if !layers.is_ignored(&path) && seen.insert(path.clone()) {
+                settled.push(path);
+            }
+        }
     }
 
     /// Returns the next change to a non-ignored path, waiting up to

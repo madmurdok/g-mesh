@@ -80,8 +80,10 @@ pub struct DirWalk {
     /// spellings (nested links) is listed under both, since each spelling is
     /// a place the walk read entries - and `.gitignore` files - from.
     pub dirs: Vec<WalkedEntry>,
-    /// As [`Walk::links`], except that no file link is reported: a directory
-    /// walk keeps no file to decide a file link's winner against.
+    /// As [`Walk::links`] of [`walk`] with the same `root` and `excluded`,
+    /// file links included: the walk still reads every file, keeping only
+    /// those that share a real path with a followed file link, so a file
+    /// link's winner is decided as [`walk`] decides it.
     pub links: Vec<Link>,
 }
 
@@ -106,6 +108,9 @@ pub struct Link {
     /// The target's real (canonical, absolute) path, when it resolves: `None`
     /// only for [`LinkRefusal::Dangling`].
     pub real: Option<PathBuf>,
+    /// Whether the link names a directory: `false` for a file link and for
+    /// a dangling one.
+    pub is_dir: bool,
     /// What the walk did with it.
     pub outcome: LinkOutcome,
 }
@@ -179,12 +184,14 @@ pub fn walk_filtered(root: &Path, excluded: &[String], keep: impl Fn(&str) -> bo
 }
 
 /// Every directory [`walk`] with the same `root` and `excluded` enters, with
-/// the directory links met. The same walker, so the two agree on every
-/// `.gitignore` rule and every link.
+/// every link met (file links too). The same walker, so the two agree on
+/// every `.gitignore` rule and every link.
 pub fn walk_dirs(root: &Path, excluded: &[String]) -> DirWalk {
     let (builder, guard) = walker(root, excluded);
 
     let mut dirs = Vec::new();
+    // Every file, as reached: the candidates for a file link's winner.
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
     for entry in builder.build() {
         let entry = match entry {
             Ok(entry) => entry,
@@ -193,14 +200,20 @@ pub fn walk_dirs(root: &Path, excluded: &[String]) -> DirWalk {
                 continue;
             }
         };
-        if entry.depth() != 0 && !entry.file_type().is_some_and(|file_type| file_type.is_dir()) {
+        let is_dir = entry.file_type().is_some_and(|file_type| file_type.is_dir());
+        if entry.depth() != 0 && !is_dir {
+            if entry.file_type().is_some_and(|file_type| file_type.is_file()) {
+                files.push((entry.into_path(), String::new()));
+            }
             continue;
         }
         let Some(relative) = relative_to(root, entry.path()) else { continue };
         let real_relative = guard.real_relative(entry.path());
         dirs.push(WalkedEntry { path: entry.into_path(), relative, real_relative });
     }
-    let links = guard.links(&[], &HashMap::new());
+    let files = guard.sharing_a_file_link(files);
+    let (winners, _) = guard.winners(&files);
+    let links = guard.links(&files, &winners);
     DirWalk { dirs, links }
 }
 
@@ -288,6 +301,7 @@ struct Entered {
 
 struct Judged {
     at: PathBuf,
+    is_dir: bool,
     verdict: Verdict,
 }
 
@@ -386,7 +400,7 @@ impl LinkGuard {
             }
             Verdict::AlreadyEntered(_) | Verdict::Refused(..) => {}
         }
-        state.judged.push(Judged { at: path.to_path_buf(), verdict });
+        state.judged.push(Judged { at: path.to_path_buf(), is_dir, verdict });
         follow
     }
 
@@ -416,43 +430,30 @@ impl LinkGuard {
     /// Records the two kinds of link the directory iterator fails on before
     /// `filter_entry` sees them: a dangling link and a link to an ancestor.
     fn note_error(&self, err: &ignore::Error) {
-        let verdict_at = match innermost(err) {
-            (_, Some(ignore::Error::Loop { child, .. })) => {
-                fs::canonicalize(child).ok().map(|real| (child.clone(), Verdict::AlreadyEntered(real)))
-            }
-            (Some(path), _) => {
-                let is_link =
-                    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
-                (is_link && fs::metadata(path).is_err())
-                    .then(|| (path.to_path_buf(), Verdict::Refused(LinkRefusal::Dangling, None)))
-            }
-            _ => None,
-        };
-        let Some((at, verdict)) = verdict_at else { return };
-        self.lock().judged.push(Judged { at, verdict });
+        let judged =
+            match innermost(err) {
+                (_, Some(ignore::Error::Loop { child, .. })) => fs::canonicalize(child).ok().map(|real| {
+                    Judged { at: child.clone(), is_dir: true, verdict: Verdict::AlreadyEntered(real) }
+                }),
+                (Some(path), _) => {
+                    let is_link =
+                        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+                    (is_link && fs::metadata(path).is_err()).then(|| Judged {
+                        at: path.to_path_buf(),
+                        is_dir: false,
+                        verdict: Verdict::Refused(LinkRefusal::Dangling, None),
+                    })
+                }
+                _ => None,
+            };
+        let Some(judged) = judged else { return };
+        self.lock().judged.push(judged);
     }
 
     /// The winner pass: one spelling per real file, then every judged link's
     /// outcome.
     fn finish(&self, walked: Vec<(PathBuf, String)>) -> Walk {
-        // Real path -> index in `walked` of its winning spelling.
-        let mut winners: HashMap<PathBuf, (usize, bool)> = HashMap::new();
-        let mut reals = Vec::with_capacity(walked.len());
-        {
-            let state = self.lock();
-            for (index, (path, _)) in walked.iter().enumerate() {
-                let (real, via_link) = self.real_of(&state, path);
-                winners
-                    .entry(real.clone())
-                    .and_modify(|winner| {
-                        if winner.1 && !via_link {
-                            *winner = (index, via_link);
-                        }
-                    })
-                    .or_insert((index, via_link));
-                reals.push((real, via_link));
-            }
-        }
+        let (winners, reals) = self.winners(&walked);
         let mut keep = vec![false; walked.len()];
         for (index, _) in winners.values() {
             keep[*index] = true;
@@ -475,9 +476,54 @@ impl LinkGuard {
         Walk { files, links }
     }
 
+    /// Real path -> index in `walked` of its winning spelling (and whether a
+    /// followed link is above it), plus every walked file's real path, in
+    /// order.
+    #[allow(clippy::type_complexity)]
+    fn winners(
+        &self,
+        walked: &[(PathBuf, String)],
+    ) -> (HashMap<PathBuf, (usize, bool)>, Vec<(PathBuf, bool)>) {
+        let mut winners: HashMap<PathBuf, (usize, bool)> = HashMap::new();
+        let mut reals = Vec::with_capacity(walked.len());
+        let state = self.lock();
+        for (index, (path, _)) in walked.iter().enumerate() {
+            let (real, via_link) = self.real_of(&state, path);
+            winners
+                .entry(real.clone())
+                .and_modify(|winner| {
+                    if winner.1 && !via_link {
+                        *winner = (index, via_link);
+                    }
+                })
+                .or_insert((index, via_link));
+            reals.push((real, via_link));
+        }
+        (winners, reals)
+    }
+
+    /// The files in `walked` whose real path a followed file link names, in
+    /// walk order: all a file link's winner is decided among. Empty, with
+    /// no lookup, when no file link was followed.
+    fn sharing_a_file_link(&self, walked: Vec<(PathBuf, String)>) -> Vec<(PathBuf, String)> {
+        let state = self.lock();
+        let targets: std::collections::HashSet<&PathBuf> = state
+            .judged
+            .iter()
+            .filter_map(|judged| match &judged.verdict {
+                Verdict::FollowedFile(real) => Some(real),
+                _ => None,
+            })
+            .collect();
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        walked.into_iter().filter(|(path, _)| targets.contains(&self.real_of(&state, path).0)).collect()
+    }
+
     /// Every judged link's outcome, given the files walked and the winner
-    /// pass's answer over them (both empty for a directory walk, which then
-    /// reports no file link).
+    /// pass's answer over them (for a directory walk, only the files that
+    /// share a real path with a followed file link).
     fn links(&self, walked: &[(PathBuf, String)], winners: &HashMap<PathBuf, (usize, bool)>) -> Vec<Link> {
         let state = self.lock();
         let relative = |path: &Path| relative_to(&self.root, path).unwrap_or_default();
@@ -504,7 +550,12 @@ impl LinkGuard {
                     }
                 }
             };
-            links.push(Link { at: relative(&judged.at), real: judged.verdict.real().cloned(), outcome });
+            links.push(Link {
+                at: relative(&judged.at),
+                real: judged.verdict.real().cloned(),
+                is_dir: judged.is_dir,
+                outcome,
+            });
         }
         links
     }

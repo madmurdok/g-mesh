@@ -477,7 +477,8 @@ fn spawn_watch_consumer(
 /// knows all of them before it extracts the first; each is still routed once.
 ///
 /// A settled `.gitignore`, directory or link first reloads the watcher's
-/// layers and link table, and the batch is filtered again under them; after
+/// layers and link table; the batch is then filtered again under the current
+/// ones, a file link's own path placed as the walk lists it; after
 /// routing, the batch's `.gitignore` paths and the links whose row the reload
 /// changed go through [`PluginRegistry::gitignore_changed`], which reindexes
 /// each language whose indexed files they changed.
@@ -494,9 +495,11 @@ fn watch_and_route_once(
     let mut settled_paths = debouncer.drain_ready();
     let mut links = Vec::new();
     if let Some(changed_links) = watcher.reload_ignores_if_changed(&settled_paths) {
-        watcher.retain_unignored(&mut settled_paths);
         links = changed_links;
     }
+    // Always, not only after a reload: it also places a file link's own path
+    // (kept by `next_change`) where the walk lists it.
+    watcher.retain_unignored(&mut settled_paths);
     let mut gitignores = Vec::new();
     let mut batch = Vec::new();
     for settled in settled_paths {

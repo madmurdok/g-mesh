@@ -41,9 +41,9 @@ win when it sorts first.
   only after `.gitignore` and the name excludes have let it through.
 - **Real wins.** Files are keyed by real path. A file the plain walk reaches
   keeps that spelling; a file reachable only through links takes the first
-  spelling in walk order. This agrees with core's walk (which does not follow
-  links), with the paths the OS reports to the watcher, and with every
-  language server, which answer in real paths; and it keeps ids stable when a
+  spelling in walk order. This agrees with core's walk (the same crate),
+  with the paths the OS reports to the watcher, and with every language
+  server, which answer in real paths; and it keeps ids stable when a
   sibling is renamed.
 - **Bounds.** A directory is entered through a link at most once and never
   through a link once entered; a directory reached without a link is always
@@ -95,9 +95,14 @@ coverage it has today).
   subtrees, so a link created or removed mid-session reindexes its language
   (same 10,000-file guard). A project with links in reach of a gate subtree
   costs one full walk per gate run, as the pruned walk cannot judge a link.
-- Directory links only: a *file* link to a gitignored file is indexed by the
-  bulk walk, but an edit to its target is still dropped until the next bulk
-  index (the watcher's directories-only walk records no file link).
+- File links are in the table too, matched by whole path rather than as a
+  prefix: an edit, creation or deletion of an alias-only file link's target
+  reaches the link's row; a file link's own path is placed as the walk places
+  it (refused -> dropped, duplicate -> the winner, aliasing -> the plain
+  spelling); a dangling file link's own path is kept, and creating the path
+  it names reaches it. An event on a tabled link that still names the same
+  target does not reload the table, so editing a file link's target costs no
+  walk.
 - An event spelled through a link is remapped to the indexed real spelling by
   the SDK session (GM-349's own code slice), so an aliased file stays indexed
   once after its first edit. The remap applies only when the index holds the

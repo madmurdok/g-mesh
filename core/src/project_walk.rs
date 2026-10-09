@@ -19,13 +19,13 @@
 //! link one language refuses as an excluded target; the per-language check is
 //! the caller's, on both spellings ([`WalkedFile::real_relative`]).
 //!
-//! [`LinkTable`] is what became of every directory link, as the watcher needs
+//! [`LinkTable`] is what became of every link, directory or file, as the watcher needs
 //! it: an event the OS reports under one spelling is turned into the spelling
 //! the index holds ([`LinkTable::to_indexed`]).
 
 use std::path::{Path, PathBuf};
 
-use g_mesh_walk::{Link, LinkOutcome, WalkedEntry};
+use g_mesh_walk::{Link, LinkOutcome, LinkRefusal, WalkedEntry};
 use ignore::WalkBuilder;
 
 use crate::watcher::BASELINE_EXCLUDED_DIRS;
@@ -181,6 +181,28 @@ fn relative_wire_path(root: &Path, absolute: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// The absolute path the dangling link at `link` names, as an event for it
+/// would spell it once it exists: its parent's real path (when that exists)
+/// joined with its name, else the lexical join with `.`/`..` resolved.
+fn dangling_target(link: &Path) -> Option<PathBuf> {
+    let named = link.parent()?.join(std::fs::read_link(link).ok()?);
+    let mut lexical = PathBuf::new();
+    for part in named.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                lexical.pop();
+            }
+            other => lexical.push(other),
+        }
+    }
+    let name = lexical.file_name()?.to_os_string();
+    match lexical.parent().and_then(|parent| std::fs::canonicalize(parent).ok()) {
+        Some(parent) => Some(parent.join(name)),
+        None => Some(lexical),
+    }
+}
+
 /// What [`LinkTable::to_indexed`] makes of a path an event reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Remap {
@@ -193,9 +215,11 @@ pub enum Remap {
     Drop,
 }
 
-/// Every directory link one walk met (`g_mesh_walk::walk_dirs`), as the rules
-/// that turn a reported path into the spelling the walk lists. Paths are
-/// absolute: link spellings under the root the walk was given, targets real.
+/// Every link one walk met (`g_mesh_walk::walk_dirs`), directory and file
+/// links alike, as the rules that turn a reported path into the spelling the
+/// walk lists. Paths are absolute: link spellings under the root the walk was
+/// given, targets real. A directory link's rules cover everything under their
+/// path; a file link's match its path exactly.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LinkTable {
     root: PathBuf,
@@ -205,8 +229,11 @@ pub struct LinkTable {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Rule {
-    /// A path at or under this prefix is the rule's.
+    /// A path at or under this prefix is the rule's (only this path itself
+    /// when `exact`).
     prefix: PathBuf,
+    /// A file link's rule: whole-path match, never a prefix.
+    exact: bool,
     /// The prefix is a link's own spelling: the link itself (created,
     /// removed, retargeted) is reported as spelled.
     is_link: bool,
@@ -220,7 +247,8 @@ impl LinkTable {
         let mut rules = Vec::new();
         for link in &links {
             let spelled = root.join(&link.at);
-            let rule = |prefix: PathBuf, is_link: bool, remap: Remap| Rule { prefix, is_link, remap };
+            let exact = !link.is_dir;
+            let rule = |prefix: PathBuf, is_link: bool, remap: Remap| Rule { prefix, exact, is_link, remap };
             match &link.outcome {
                 // The target is reached only through this link: its real
                 // spelling (reported by FSEvents, and by inotify for the
@@ -237,6 +265,16 @@ impl LinkTable {
                 LinkOutcome::Aliases(plain) => {
                     let plain = if plain.is_empty() { root.to_path_buf() } else { root.join(plain) };
                     rules.push(rule(spelled, true, Remap::To(plain)));
+                }
+                // A dangling file link names no file yet: its own path is
+                // kept (a deletion through it still reaches the index), and
+                // the path it names becomes its spelling, so creating the
+                // target reaches the link (and the reload that follows it).
+                LinkOutcome::Refused(LinkRefusal::Dangling) if exact => {
+                    if let Some(target) = dangling_target(&spelled) {
+                        rules.push(rule(target, false, Remap::To(spelled.clone())));
+                    }
+                    rules.push(rule(spelled, true, Remap::Keep));
                 }
                 LinkOutcome::Refused(_) => rules.push(rule(spelled, true, Remap::Drop)),
             }
@@ -255,10 +293,12 @@ impl LinkTable {
     /// specific rule that covers it: under a followed link's real target ->
     /// the link's spelling; under a duplicate link -> the winning link's;
     /// under an aliasing link -> the plain spelling; under a refused link ->
-    /// dropped. A link's own path is kept as spelled, so its creation or
-    /// removal reaches whoever reloads the table.
+    /// dropped. A file link's rules match only its target or its own path,
+    /// whole. A link's own path is kept as spelled, so its creation or
+    /// removal reaches whoever reloads the table; [`Self::file_link_to_indexed`]
+    /// then places a file link's own path.
     pub fn to_indexed(&self, path: &Path) -> Remap {
-        let Some(rule) = self.rules.iter().find(|rule| path.starts_with(&rule.prefix)) else {
+        let Some(rule) = self.rule_for(path) else {
             return Remap::Keep;
         };
         let Ok(suffix) = path.strip_prefix(&rule.prefix) else { return Remap::Keep };
@@ -277,6 +317,39 @@ impl LinkTable {
                 }
             }
         }
+    }
+
+    /// The spelling the walk lists for `path` when it is a file link's own
+    /// path: a file link *is* the file, so unlike a directory link's path
+    /// (which [`Self::to_indexed`] keeps for the reload) it is placed as the
+    /// walk places it: kept if followed, the winner's spelling if a duplicate,
+    /// the plain spelling if an alias, dropped if refused. `Keep` for any
+    /// other path. Applied to a settled batch, after any reload its own
+    /// paths triggered.
+    pub fn file_link_to_indexed(&self, path: &Path) -> Remap {
+        match self.rules.iter().find(|rule| rule.exact && rule.is_link && rule.prefix == path) {
+            Some(Rule { remap: Remap::To(to), .. }) if to != path => Remap::To(to.clone()),
+            Some(Rule { remap: Remap::Drop, .. }) => Remap::Drop,
+            _ => Remap::Keep,
+        }
+    }
+
+    /// The most specific rule covering `path`.
+    fn rule_for(&self, path: &Path) -> Option<&Rule> {
+        self.rules
+            .iter()
+            .find(|rule| if rule.exact { path == rule.prefix } else { path.starts_with(&rule.prefix) })
+    }
+
+    /// Whether `path` is a link in this table, still naming what the table
+    /// says it names (still a link, to the same real target or still
+    /// dangling): an event on it then changes nothing the table holds. One
+    /// `canonicalize`.
+    pub fn holds(&self, path: &Path) -> bool {
+        let Some(link) = self.links.iter().find(|link| self.root.join(&link.at) == path) else {
+            return false;
+        };
+        path.is_symlink() && link.real == std::fs::canonicalize(path).ok()
     }
 
     /// Whether `path` is a link's spelling in this table or an ancestor of
