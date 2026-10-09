@@ -252,3 +252,9 @@ opens a new session the next day; without this, the graph is stale until the
 first in-session `.gitignore` edit or `g-mesh reindex`. Answers: *include
 (recommended)*: one cheap listing at start, closes the gap; *leave out*:
 smaller task, the gap stays and needs its own task.
+
+## 11. Owner decisions (2026-10-09)
+
+- Q1: "C сейчас, A позже по замеру (Recommended)": option C (gate, then the per-language workspace reindex); a per-file fast path only if a later measurement asks for it.
+- Q2: "Порог 10 000 файлов на язык (Recommended)": above 10,000 added files in one language, no automatic reindex; one log line pointing at `g-mesh reindex`.
+- Q3: "Включить в задачу (Recommended)": at daemon start, any `.gitignore` newer than `bulkIndexedAt` runs the same gate.
