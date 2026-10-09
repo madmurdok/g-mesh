@@ -245,7 +245,13 @@ fn count_absent_files_in<'a>(
         let Some(entry) = absent_for_path_in(table, discovered, &walked.relative) else {
             continue;
         };
-        if excluded.get(entry.language).is_some_and(|dirs| under_excluded_dir(&walked.relative, dirs)) {
+        // Either spelling: a plugin's walk refuses a link whose target is
+        // under one of its excluded names.
+        let excluded_here = |dirs: &Vec<String>| {
+            under_excluded_dir(&walked.relative, dirs)
+                || walked.real_relative.as_deref().is_some_and(|real| under_excluded_dir(real, dirs))
+        };
+        if excluded.get(entry.language).is_some_and(excluded_here) {
             continue;
         }
         *counts.entry(entry.language).or_insert(0) += 1;

@@ -13,6 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use notify::{Config, ErrorKind as NotifyErrorKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::project_walk::Remap;
 use ignore_layers::{IgnoreLayers, GITIGNORE_FILE_NAME};
 
 /// How often the polling fallback (see [`ProjectWatcher::new_inner`]) rescans
@@ -48,8 +49,9 @@ pub struct ProjectWatcher {
     _poll_fallback: Option<PollWatcher>,
     events: Receiver<PathBuf>,
     root: PathBuf,
-    // Swapped whole by `reload_ignores` when a `.gitignore` may have changed;
-    // read for every event.
+    // The layers and the link table, loaded by one walk. Swapped whole by
+    // `reload_ignores` when a `.gitignore` or a link may have changed; read
+    // for every event.
     ignores: RwLock<IgnoreLayers>,
 }
 
@@ -155,28 +157,38 @@ impl ProjectWatcher {
         self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner()).is_ignored(path)
     }
 
-    /// Re-reads every `.gitignore` under the root, so later events (and
-    /// [`Self::retain_unignored`]) are filtered by what the files say now.
-    /// The read happens outside the lock; only the swap holds it.
-    pub fn reload_ignores(&self) {
+    /// Re-reads every `.gitignore` under the root and the link table, so
+    /// later events (and [`Self::retain_unignored`]) are remapped and
+    /// filtered by what the tree says now. Returns the project-relative
+    /// spellings of the links whose row changed (created, removed,
+    /// retargeted, judged differently). The read happens outside the lock;
+    /// only the swap holds it.
+    pub fn reload_ignores(&self) -> Vec<String> {
         let layers = IgnoreLayers::load(&self.root);
-        *self.ignores.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = layers;
+        let mut current = self.ignores.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = current.links().changed_links(layers.links());
+        *current = layers;
+        changed
     }
 
-    /// Reloads the layers when a settled batch may have changed them: a path
-    /// named `.gitignore` (edited, created or deleted), or a directory (a move
-    /// can carry a nested `.gitignore` without an event for the file itself).
-    /// The root itself does not count: macOS reports it for any write inside.
-    /// Returns whether it reloaded.
-    pub fn reload_ignores_if_changed(&self, settled: &[PathBuf]) -> bool {
-        let changed = settled.iter().any(|path| {
-            path.file_name() == Some(std::ffi::OsStr::new(GITIGNORE_FILE_NAME))
-                || (path.as_path() != self.root && path.is_dir())
-        });
-        if changed {
-            self.reload_ignores();
-        }
-        changed
+    /// Reloads the layers and the link table when a settled batch may have
+    /// changed them: a path named `.gitignore` (edited, created or deleted), a
+    /// directory (a move can carry a nested `.gitignore` without an event for
+    /// the file itself), a symlink, or a link spelling in the current table or
+    /// an ancestor of one (a removed link is neither a directory nor a
+    /// symlink any more). The root itself does not count: macOS reports it
+    /// for any write inside. Returns `None` without a reload, else the
+    /// changed link spellings ([`Self::reload_ignores`]).
+    pub fn reload_ignores_if_changed(&self, settled: &[PathBuf]) -> Option<Vec<String>> {
+        let changed = {
+            let current = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+            settled.iter().any(|path| {
+                path.file_name() == Some(std::ffi::OsStr::new(GITIGNORE_FILE_NAME))
+                    || (path.as_path() != self.root
+                        && (path.is_dir() || path.is_symlink() || current.links().concerns(path)))
+            })
+        };
+        changed.then(|| self.reload_ignores())
     }
 
     /// Drops from a settled batch the paths the current layers ignore: an
@@ -188,8 +200,13 @@ impl ProjectWatcher {
     }
 
     /// Returns the next change to a non-ignored path, waiting up to
-    /// `timeout`. `None` means either nothing arrived in time or the
-    /// watcher was dropped.
+    /// `timeout`, spelled as the walk lists it. `None` means either nothing
+    /// arrived in time or the watcher was dropped.
+    ///
+    /// The link table's remap runs before the ignore check: the real spelling
+    /// of a file reached only through a link is gitignored by construction,
+    /// so filtering first would drop every event for it. A path under a
+    /// refused link is dropped.
     pub fn next_change(&self, timeout: Duration) -> Option<PathBuf> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -198,8 +215,17 @@ impl ProjectWatcher {
                 return None;
             }
             match self.events.recv_timeout(remaining) {
-                Ok(path) if self.is_ignored(&path) => continue,
-                Ok(path) => return Some(path),
+                Ok(path) => {
+                    let layers = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let path = match layers.to_indexed(&path) {
+                        Remap::Keep => path,
+                        Remap::To(indexed) => indexed,
+                        Remap::Drop => continue,
+                    };
+                    if !layers.is_ignored(&path) {
+                        return Some(path);
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => return None,
                 Err(RecvTimeoutError::Disconnected) => return None,
             }
@@ -529,21 +555,21 @@ mod tests {
         assert!(!watcher.is_ignored(&built), "not read before a reload");
 
         assert!(
-            !watcher.reload_ignores_if_changed(std::slice::from_ref(&plain)),
+            watcher.reload_ignores_if_changed(std::slice::from_ref(&plain)).is_none(),
             "a plain file reloads nothing"
         );
         assert!(
-            !watcher.reload_ignores_if_changed(std::slice::from_ref(&root)),
+            watcher.reload_ignores_if_changed(std::slice::from_ref(&root)).is_none(),
             "the root alone reloads nothing"
         );
         assert!(!watcher.is_ignored(&built), "still the old layers");
 
-        assert!(watcher.reload_ignores_if_changed(&[plain.clone(), root.join("pkg")]));
+        assert!(watcher.reload_ignores_if_changed(&[plain.clone(), root.join("pkg")]).is_some());
         assert!(watcher.is_ignored(&built), "the moved-in pkg/.gitignore now applies");
 
         // A deleted .gitignore is still named .gitignore.
         fs::remove_file(root.join("pkg/.gitignore")).unwrap();
-        assert!(watcher.reload_ignores_if_changed(&[root.join("pkg/.gitignore")]));
+        assert!(watcher.reload_ignores_if_changed(&[root.join("pkg/.gitignore")]).is_some());
         assert!(!watcher.is_ignored(&built), "the deleted file's rules are gone");
     }
 
@@ -562,7 +588,7 @@ mod tests {
 
         let gitignore = write(&root, ".gitignore", "generated/\n");
         let mut batch = vec![generated.clone(), source.clone(), gitignore.clone()];
-        assert!(watcher.reload_ignores_if_changed(&batch));
+        assert!(watcher.reload_ignores_if_changed(&batch).is_some());
         watcher.retain_unignored(&mut batch);
         assert_eq!(batch, vec![source, gitignore]);
     }

@@ -476,10 +476,11 @@ fn spawn_watch_consumer(
 /// announced per language ([`PluginRegistry::announce_created`]), so a plugin
 /// knows all of them before it extracts the first; each is still routed once.
 ///
-/// A settled `.gitignore` (or directory) first reloads the watcher's layers,
-/// and the batch is filtered again under them (GM-508); after routing, the
-/// batch's `.gitignore` paths go through [`PluginRegistry::gitignore_changed`],
-/// which reindexes each language whose indexed files they changed.
+/// A settled `.gitignore`, directory or link first reloads the watcher's
+/// layers and link table, and the batch is filtered again under them; after
+/// routing, the batch's `.gitignore` paths and the links whose row the reload
+/// changed go through [`PluginRegistry::gitignore_changed`], which reindexes
+/// each language whose indexed files they changed.
 fn watch_and_route_once(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
@@ -491,8 +492,10 @@ fn watch_and_route_once(
         debouncer.record(path);
     }
     let mut settled_paths = debouncer.drain_ready();
-    if watcher.reload_ignores_if_changed(&settled_paths) {
+    let mut links = Vec::new();
+    if let Some(changed_links) = watcher.reload_ignores_if_changed(&settled_paths) {
         watcher.retain_unignored(&mut settled_paths);
+        links = changed_links;
     }
     let mut gitignores = Vec::new();
     let mut batch = Vec::new();
@@ -523,8 +526,8 @@ fn watch_and_route_once(
     }
     // After routing: a file deleted or created in this batch is already in
     // the graph's new state, so the gate compares against it.
-    if !gitignores.is_empty() {
-        registry.gitignore_changed(conn, &gitignores);
+    if !gitignores.is_empty() || !links.is_empty() {
+        registry.gitignore_changed(conn, &gitignores, &links);
     }
 }
 

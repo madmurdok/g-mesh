@@ -58,8 +58,12 @@ win when it sorts first.
   (ripgrep 4.8 -> 5.5 ms, py-requests 2.8 -> 4.2, gin 2.4 -> 3.0), 4.5 ms on
   ripgrep with a link that re-enters `crates/` (same 100 files, deduplicated);
   `g-mesh init` end to end is within noise (+3% real, user and sys flat).
-- **Core's walk does not follow links.** Under real-wins its file set is the
-  plugins' minus the files reachable only through a link.
+- **Core's walk follows links too** (amended by GM-514,
+  [design note](../architecture/gm-514-core-symlink-table.md)): the guard and
+  the winner pass live in one crate, `walk/` (`g-mesh-walk`), which the SDK
+  and core both run. Core's walk prunes only the names every language
+  excludes; a file under a link whose target one language excludes is not
+  that language's (both spellings checked). The boundary stays the root.
 - The SDK exposes what became of each link (`walk_project_detailed`:
   aliases, followed, duplicate, refused) for import resolution in GM-324.
 
@@ -75,10 +79,25 @@ coverage it has today).
 - Four TS/Go assertions that encoded alias-wins change to the real spelling
   (TS tests 467, 493, workspace 291; Go
   `TestWalkProjectFilesFollowsSymlinkedDirectoryOnce`).
-- Files reachable only through a link are invisible to `g-mesh status`, and
-  an edit to one arrives (on macOS) under its real spelling, which core drops
-  when `.gitignore` covers it, so it refreshes only on the next bulk index.
-  Core learning the link table is a backlog task.
+- Files reachable only through a link (a gitignored target) are counted by
+  `g-mesh status` under the link's spelling, with the mtime read through the
+  link, as the plugin's baseline records it.
+- The watcher keeps the link table beside its `.gitignore` layers (one walk
+  loads both) and remaps every event *before* the ignore check: under a
+  followed link's real target -> the link's spelling (so an edit to an
+  alias-only file refreshes it); under a duplicate link -> the winning
+  link's; under an aliasing link -> the plain spelling; under a refused link
+  (outside the root, excluded target, dangling) -> dropped, so inotify's
+  events through an outside-root link no longer index a file the walk
+  refused.
+- The table is reloaded with the layers, also on a settled symlink or a
+  tabled link path; the links whose row changed join the `.gitignore` gate's
+  subtrees, so a link created or removed mid-session reindexes its language
+  (same 10,000-file guard). A project with links in reach of a gate subtree
+  costs one full walk per gate run, as the pruned walk cannot judge a link.
+- Directory links only: a *file* link to a gitignored file is indexed by the
+  bulk walk, but an edit to its target is still dropped until the next bulk
+  index (the watcher's directories-only walk records no file link).
 - An event spelled through a link is remapped to the indexed real spelling by
   the SDK session (GM-349's own code slice), so an aliased file stays indexed
   once after its first edit. The remap applies only when the index holds the

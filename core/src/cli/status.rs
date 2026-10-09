@@ -551,10 +551,13 @@ struct SourceFile {
 /// absent-plugin count: `.gitignore`, the baseline exclusions and each
 /// language's `[plugin.workspace] exclude_dirs`; the per-file decision is
 /// [`DiscoveredPlugins::indexing_language`], the watcher's filter. Each
-/// plugin walks in its own process, so this mirrors their shared manifest
-/// rules rather than reusing a walk. It diverges only toward doing less (no
-/// symlinks followed, unreadable metadata skipped), which cannot make a
-/// broken index look healthy.
+/// plugin walks in its own process with the same walk (`g_mesh_walk`), so
+/// a file reached only through a followed link is discovered under the
+/// link's spelling, as the plugin indexes it, and its mtime is read through
+/// the link, as the plugin's baseline records it. A file under a link whose
+/// target one language excludes is not that language's (both spellings are
+/// checked). Unreadable metadata is skipped, which cannot make a broken
+/// index look healthy.
 fn discover_source_files(project_root: &Path, plugins: &DiscoveredPlugins) -> Result<Vec<SourceFile>> {
     // Pruned outright: the baseline (always, by the walker), plus any
     // directory *every* discovered language excludes. A directory only some
@@ -564,7 +567,7 @@ fn discover_source_files(project_root: &Path, plugins: &DiscoveredPlugins) -> Re
 
     let mut files = Vec::new();
     for walked in project_walk::project_files(project_root, &pruned) {
-        if plugins.indexing_language(&walked.relative).is_none() {
+        if plugins.indexing_language(&walked.relative, walked.real_relative.as_deref()).is_none() {
             continue;
         }
         let Ok(metadata) = fs::metadata(&walked.path) else {

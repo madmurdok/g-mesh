@@ -1204,7 +1204,7 @@ fn a_gitignore_edit_that_changes_no_indexed_file_runs_no_reindex() {
     write_file(project.path(), ".gitignore", "*.log\n");
     let conn = index_with_files(&[("alpha", "src/a.alpha-src")]);
 
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
 
     assert!(test_plugin::spawns(&dirs[0]).is_empty(), "nothing indexed changed, so nothing is reindexed");
 }
@@ -1222,7 +1222,7 @@ fn files_gained_or_lost_by_a_gitignore_edit_reindex_their_language() {
     write_file(project.path(), "src/a.alpha-src", "");
     write_file(project.path(), ".gitignore", "");
     let conn = index_with_files(&[("alpha", "src/a.alpha-src")]);
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
     assert!(!test_plugin::spawns(&dirs[0]).is_empty(), "a file gained by the edit reindexes alpha");
 
     // Newly ignored: generated/x is indexed but now under a rule.
@@ -1231,7 +1231,7 @@ fn files_gained_or_lost_by_a_gitignore_edit_reindex_their_language() {
     write_file(project.path(), "src/a.alpha-src", "");
     write_file(project.path(), ".gitignore", "generated/\n");
     let conn = index_with_files(&[("alpha", "src/a.alpha-src"), ("alpha", "generated/x.alpha-src")]);
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
     assert!(!test_plugin::spawns(&dirs[0]).is_empty(), "a file lost by the edit reindexes alpha");
 }
 
@@ -1249,7 +1249,7 @@ fn only_the_languages_a_gitignore_edit_changed_are_reindexed() {
     write_file(project.path(), ".gitignore", "");
     let conn = index_with_files(&[("alpha", "src/a.alpha-src"), ("beta", "src/b.beta-src")]);
 
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
 
     assert!(!test_plugin::spawns(alpha).is_empty(), "alpha gained generated/x and is reindexed");
     assert!(test_plugin::spawns(beta).is_empty(), "beta's files did not change, so it is not reindexed");
@@ -1274,7 +1274,7 @@ fn a_nested_gitignore_compares_its_subtree_under_its_ancestors_rules() {
     write_file(project.path(), "other/o.alpha-src", "");
     let conn = index_with_files(&[("alpha", "src/a.alpha-src")]);
 
-    registry.gitignore_changed(&conn, &["src/.gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &["src/.gitignore".to_string()], &[]);
 
     assert!(test_plugin::spawns(&dirs[0]).is_empty(), "nothing under src changed under the full rules");
 }
@@ -1290,7 +1290,7 @@ fn a_failed_language_is_not_reindexed_by_a_gitignore_edit() {
     let conn = test_plugin::empty_index();
     registry.set_failed_languages(["alpha".to_string()]);
 
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
 
     assert!(test_plugin::spawns(&dirs[0]).is_empty());
 }
@@ -1314,7 +1314,7 @@ fn a_language_gaining_more_than_the_guard_is_not_reindexed_and_others_still_are(
     write_file(project.path(), ".gitignore", "");
     let conn = test_plugin::empty_index();
 
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
 
     assert!(test_plugin::spawns(alpha).is_empty(), "alpha would gain more than the guard: no reindex");
     assert!(!test_plugin::spawns(beta).is_empty(), "beta, under the guard, is still reindexed");

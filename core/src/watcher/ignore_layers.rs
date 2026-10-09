@@ -6,7 +6,9 @@
 //! nested `.gitignore` ignores was indexed although no walk would list it.
 //!
 //! The layers are re-read by [`IgnoreLayers::load`] whenever a `.gitignore`
-//! may have changed; the watcher swaps the whole value.
+//! or a link may have changed; the watcher swaps the whole value. The same
+//! walk yields the link table ([`LinkTable`]), so layers and table always
+//! describe one state of the tree.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -16,33 +18,34 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::Match;
 
 use super::BASELINE_EXCLUDED_DIRS;
-use crate::project_walk::project_walk_builder;
+use crate::project_walk::{excluded_names, LinkTable, Remap};
 
 /// The file name every layer is read from.
 pub const GITIGNORE_FILE_NAME: &str = ".gitignore";
 
 /// One `.gitignore` matcher per directory that has one, keyed by that
-/// directory's path under the (canonical) project root.
+/// directory's path under the (canonical) project root as the walk spells it
+/// (through a followed link, the link's spelling), and the table of the
+/// links the same walk met.
 pub struct IgnoreLayers {
     root: PathBuf,
     layers: HashMap<PathBuf, Gitignore>,
+    links: LinkTable,
 }
 
 impl IgnoreLayers {
-    /// Reads every `.gitignore` the project walk would read: the walk's own
-    /// options and pruning, so a `.gitignore` inside an ignored or baseline
-    /// directory is not read here either (the walk never enters it). A file
-    /// that fails to parse in part keeps its valid lines, as the walk's
-    /// matcher does; the failure is logged.
+    /// Reads every `.gitignore` the project walk would read, in one walk
+    /// (`g_mesh_walk::walk_dirs`) that also yields the link table: the walk's
+    /// own options and pruning, so a `.gitignore` inside an ignored or
+    /// baseline directory is not read here either (the walk never enters
+    /// it), and one inside a followed link's target is read along the link's
+    /// spelling. A file that fails to parse in part keeps its valid lines, as
+    /// the walk's matcher does; the failure is logged.
     pub fn load(root: &Path) -> Self {
+        let walk = g_mesh_walk::walk_dirs(root, &excluded_names(&[]));
         let mut layers = HashMap::new();
-        for entry in project_walk_builder(root, &[], true).build() {
-            // An unreadable directory costs its subtree, as in the walk.
-            let Ok(entry) = entry else { continue };
-            if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            let dir = entry.into_path();
+        for dir in walk.dirs {
+            let dir = dir.path;
             let file = dir.join(GITIGNORE_FILE_NAME);
             if !file.is_file() {
                 continue;
@@ -59,7 +62,17 @@ impl IgnoreLayers {
                 Err(err) => crate::log_line!("g-mesh: {}: {err}", file.display()),
             }
         }
-        Self { root: root.to_path_buf(), layers }
+        Self { root: root.to_path_buf(), layers, links: LinkTable::new(root, walk.links) }
+    }
+
+    /// The links the loading walk met.
+    pub fn links(&self) -> &LinkTable {
+        &self.links
+    }
+
+    /// The spelling the walk lists for `path`: [`LinkTable::to_indexed`].
+    pub fn to_indexed(&self, path: &Path) -> Remap {
+        self.links.to_indexed(path)
     }
 
     /// Whether the walk would leave `path` out: a [`BASELINE_EXCLUDED_DIRS`]

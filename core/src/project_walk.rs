@@ -1,23 +1,31 @@
 //! Core's own walk of a project tree: the one place that says which tree
 //! "the project" is when core, not a plugin, has to look at it.
 //!
-//! Two callers, each with its own per-file filter: `g-mesh status`'s coverage
-//! walk (files some discovered plugin would index) and the bulk walk's count
-//! of files belonging to absent plugins (`languages::count_absent_files`,
-//! [ADR 0021](../../docs/adr/0021-per-language-bulk-outcome.md)). They share
-//! this walker so they can never disagree about which directories exist.
+//! Its callers: `g-mesh status`'s coverage walk (files some discovered plugin
+//! would index), the bulk walk's count of files belonging to absent plugins
+//! (`languages::count_absent_files`,
+//! [ADR 0021](../../docs/adr/0021-per-language-bulk-outcome.md)), the
+//! `.gitignore` gate's comparison (`PluginRegistry::gitignore_changed`), and
+//! the watcher's layers and link table (`watcher::ignore_layers`).
 //!
-//! It mirrors the plugins' walks (`plugins/sdk/src/walk.rs`), which run in
-//! their own processes: each directory's own `.gitignore` and nothing else,
-//! [`BASELINE_EXCLUDED_DIRS`] plus the caller's directory names pruned at any
-//! depth. It diverges only toward doing less (no symlinks followed, unreadable
-//! entries skipped). The plugins do follow links, but list a file the plain
-//! walk reaches under its direct spelling, so the one difference is files
-//! reachable only through a link, which this walk does not see
-//! ([ADR 0025](../../docs/adr/0025-project-walk-follows-symlinks.md)).
+//! It is the plugins' walk: `g_mesh_walk`, which the SDK runs too, so `.gitignore`
+//! layering, the excluded names and the symlink guard are one implementation
+//! ([ADR 0025](../../docs/adr/0025-project-walk-follows-symlinks.md)). A file
+//! reachable only through a followed link (its target gitignored) is listed
+//! under the link's spelling, as the plugins index it; a file reachable both
+//! ways under its plain spelling. What differs from a plugin's walk is the
+//! excluded names: core prunes [`BASELINE_EXCLUDED_DIRS`] plus the names its
+//! caller passes (the ones *every* language excludes), so it can follow a
+//! link one language refuses as an excluded target; the per-language check is
+//! the caller's, on both spellings ([`WalkedFile::real_relative`]).
+//!
+//! [`LinkTable`] is what became of every directory link, as the watcher needs
+//! it: an event the OS reports under one spelling is turned into the spelling
+//! the index holds ([`LinkTable::to_indexed`]).
 
 use std::path::{Path, PathBuf};
 
+use g_mesh_walk::{Link, LinkOutcome, WalkedEntry};
 use ignore::WalkBuilder;
 
 use crate::watcher::BASELINE_EXCLUDED_DIRS;
@@ -29,62 +37,137 @@ pub struct WalkedFile {
     /// Project-relative, forward-slash separated - the same spelling the
     /// `filePath` columns and the wire protocol use.
     pub relative: String,
+    /// The file's spelling relative to the root's real path, when a followed
+    /// link is above it (so the two differ); `None` when the walk reached it
+    /// without a link.
+    pub real_relative: Option<String>,
 }
 
-/// Every regular file under `root`, honoring each directory's `.gitignore`,
-/// with [`BASELINE_EXCLUDED_DIRS`] and every directory named in `pruned`
-/// skipped outright at any depth. Filtering files one by one is the caller's.
+impl From<WalkedEntry> for WalkedFile {
+    fn from(entry: WalkedEntry) -> Self {
+        WalkedFile { path: entry.path, relative: entry.relative, real_relative: entry.real_relative }
+    }
+}
+
+/// Every regular file under `root`, one per real file, honoring each
+/// directory's `.gitignore`, with [`BASELINE_EXCLUDED_DIRS`] and every
+/// directory named in `pruned` skipped outright at any depth, and links
+/// followed behind the guard. Filtering files one by one is the caller's.
 pub fn project_files(root: &Path, pruned: &[String]) -> impl Iterator<Item = WalkedFile> {
-    walked_files(root, walk_builder(root, pruned, false, None))
+    g_mesh_walk::walk(root, &excluded_names(pruned)).files.into_iter().map(WalkedFile::from)
 }
 
 /// [`project_files`], restricted to the files under `subtrees`
 /// (project-relative directories, forward-slash separated; `""` is the whole
-/// project). The walk still descends from `root` through each subtree's
-/// ancestors, so their `.gitignore` files apply exactly as in the full walk;
-/// it only skips every directory that is neither an ancestor of a subtree
-/// nor inside one, and the files of the ancestors themselves.
+/// project), listed under the spellings [`project_files`] lists them.
+///
+/// Without links in reach this walk descends from `root` through each
+/// subtree's ancestors only, so their `.gitignore` files apply exactly as in
+/// the full walk; it skips every directory that is neither an ancestor of a
+/// subtree nor inside one, and the files of the ancestors themselves. Pruned
+/// that way, the guard could miss the plain spelling of a link's target and
+/// list an aliased file under the link; so when the pruned walk meets any
+/// symlink, the whole project is walked and its files filtered to the
+/// subtrees instead.
 pub fn project_files_under(
     root: &Path,
     pruned: &[String],
     subtrees: &[String],
 ) -> impl Iterator<Item = WalkedFile> {
-    let subtrees: Vec<PathBuf> =
-        subtrees.iter().map(|dir| if dir.is_empty() { root.to_path_buf() } else { root.join(dir) }).collect();
-    walked_files(root, walk_builder(root, pruned, false, Some(subtrees)))
+    let files = match plain_files_under(root, pruned, subtrees) {
+        Some(files) => files,
+        None => project_files(root, pruned).filter(|file| under_any(&file.relative, subtrees)).collect(),
+    };
+    files.into_iter()
 }
 
-fn walked_files(root: &Path, builder: WalkBuilder) -> impl Iterator<Item = WalkedFile> {
-    let walk = builder.build();
-    let root = root.to_path_buf();
-    walk.filter_map(move |entry| {
+/// Whether `relative` lies in one of `subtrees` (`""` is the whole project).
+fn under_any(relative: &str, subtrees: &[String]) -> bool {
+    subtrees.iter().any(|subtree| {
+        subtree.is_empty()
+            || relative
+                .strip_prefix(subtree.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
+}
+
+/// The pruned walk behind [`project_files_under`], following no link; `None`
+/// as soon as it meets a symlink in reach (inside a subtree, or one of a
+/// subtree's ancestors), whose resolution needs the whole tree.
+fn plain_files_under(root: &Path, pruned: &[String], subtrees: &[String]) -> Option<Vec<WalkedFile>> {
+    let excluded = excluded_names(pruned);
+    let subtrees: Vec<PathBuf> =
+        subtrees.iter().map(|dir| if dir.is_empty() { root.to_path_buf() } else { root.join(dir) }).collect();
+    let mut builder = WalkBuilder::new(root);
+    // The policy `g_mesh_walk` documents, minus link following.
+    builder
+        .hidden(false)
+        .parents(false)
+        .ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .follow_links(false)
+        .filter_entry(move |entry| {
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            if is_dir && entry.file_name().to_str().is_some_and(|name| excluded.iter().any(|dir| dir == name))
+            {
+                return false;
+            }
+            // A link may stand for a directory: kept when it is a subtree's
+            // ancestor too, so the walk sees it and gives up.
+            let may_hold = is_dir || entry.path_is_symlink();
+            let path = entry.path();
+            subtrees
+                .iter()
+                .any(|subtree| path.starts_with(subtree) || (may_hold && subtree.starts_with(path)))
+        });
+    let mut files = Vec::new();
+    for entry in builder.build() {
         // An unreadable directory costs its subtree, not the walk.
-        let entry = entry.ok()?;
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+        let Ok(entry) = entry else { continue };
+        if entry.path_is_symlink() {
             return None;
         }
-        let relative = relative_wire_path(&root, entry.path())?;
-        Some(WalkedFile { path: entry.into_path(), relative })
-    })
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let Some(relative) = relative_wire_path(root, entry.path()) else { continue };
+        files.push(WalkedFile { path: entry.into_path(), relative, real_relative: None });
+    }
+    Some(files)
 }
 
 /// Every `.gitignore` the walk would read: one per directory the walk enters
-/// (so none inside an ignored or pruned directory), as a [`WalkedFile`].
+/// (so none inside an ignored or pruned directory, and those under a followed
+/// link spelled through it), as a [`WalkedFile`].
 pub fn gitignore_files(root: &Path, pruned: &[String]) -> impl Iterator<Item = WalkedFile> {
-    let walk = project_walk_builder(root, pruned, true).build();
-    let root = root.to_path_buf();
-    walk.filter_map(move |entry| {
-        let entry = entry.ok()?;
-        if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
-            return None;
-        }
-        let path = entry.path().join(".gitignore");
+    g_mesh_walk::walk_dirs(root, &excluded_names(pruned)).dirs.into_iter().filter_map(|dir| {
+        let path = dir.path.join(GITIGNORE);
         if !path.is_file() {
             return None;
         }
-        let relative = relative_wire_path(&root, &path)?;
-        Some(WalkedFile { path, relative })
+        Some(WalkedFile {
+            path,
+            relative: join_wire(&dir.relative, GITIGNORE),
+            real_relative: dir.real_relative.map(|real| join_wire(&real, GITIGNORE)),
+        })
     })
+}
+
+const GITIGNORE: &str = ".gitignore";
+
+fn join_wire(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// [`BASELINE_EXCLUDED_DIRS`] and `pruned`: the names every walk here skips.
+pub(crate) fn excluded_names(pruned: &[String]) -> Vec<String> {
+    BASELINE_EXCLUDED_DIRS.iter().map(|dir| (*dir).to_string()).chain(pruned.iter().cloned()).collect()
 }
 
 /// `absolute` relative to `root`, forward-slash separated; `None` outside
@@ -98,53 +181,123 @@ fn relative_wire_path(root: &Path, absolute: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// The walker behind [`project_files`], shared with the watcher's
-/// [`IgnoreLayers`](crate::watcher::ignore_layers::IgnoreLayers) so the two can
-/// never disagree about which `.gitignore` files apply or how. With
-/// `directories_only`, files are dropped: the caller wants the directories the
-/// walk would enter, not their files.
-pub(crate) fn project_walk_builder(root: &Path, pruned: &[String], directories_only: bool) -> WalkBuilder {
-    walk_builder(root, pruned, directories_only, None)
+/// What [`LinkTable::to_indexed`] makes of a path an event reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Remap {
+    /// The path is the spelling the walk lists.
+    Keep,
+    /// The walk lists the same file (or directory) under this path.
+    To(PathBuf),
+    /// The path lies under a link the walk refused: the walk lists nothing
+    /// there.
+    Drop,
 }
 
-/// [`project_walk_builder`], optionally kept to `subtrees` (absolute, under
-/// `root`): a directory is entered only when it is an ancestor of a subtree
-/// or inside one, and a file is kept only inside one. One `filter_entry`
-/// holds both rules, as the builder keeps only the last filter it is given.
-fn walk_builder(
-    root: &Path,
-    pruned: &[String],
-    directories_only: bool,
-    subtrees: Option<Vec<PathBuf>>,
-) -> WalkBuilder {
-    let pruned: Vec<String> =
-        BASELINE_EXCLUDED_DIRS.iter().map(|dir| (*dir).to_string()).chain(pruned.iter().cloned()).collect();
-    let mut builder = WalkBuilder::new(root);
-    // Matching the plugins' walks, which read each directory's own
-    // .gitignore and nothing else: no dotfile skipping, no rules from
-    // above the project root, no global/`info/exclude` rules, and rules
-    // honored even outside a git repository.
-    builder
-        .hidden(false)
-        .parents(false)
-        .ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .require_git(false)
-        .follow_links(false)
-        .filter_entry(move |entry| {
-            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-            let in_scope = |path: &Path| match &subtrees {
-                None => true,
-                Some(subtrees) => subtrees
-                    .iter()
-                    .any(|subtree| path.starts_with(subtree) || (is_dir && subtree.starts_with(path))),
-            };
-            if !is_dir {
-                return !directories_only && in_scope(entry.path());
+/// Every directory link one walk met (`g_mesh_walk::walk_dirs`), as the rules
+/// that turn a reported path into the spelling the walk lists. Paths are
+/// absolute: link spellings under the root the walk was given, targets real.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkTable {
+    root: PathBuf,
+    links: Vec<Link>,
+    rules: Vec<Rule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Rule {
+    /// A path at or under this prefix is the rule's.
+    prefix: PathBuf,
+    /// The prefix is a link's own spelling: the link itself (created,
+    /// removed, retargeted) is reported as spelled.
+    is_link: bool,
+    /// `Keep`, `To(base)` (the prefix replaced by `base`) or `Drop`.
+    remap: Remap,
+}
+
+impl LinkTable {
+    /// The table for `links` met by a walk of `root`.
+    pub fn new(root: &Path, links: Vec<Link>) -> Self {
+        let mut rules = Vec::new();
+        for link in &links {
+            let spelled = root.join(&link.at);
+            let rule = |prefix: PathBuf, is_link: bool, remap: Remap| Rule { prefix, is_link, remap };
+            match &link.outcome {
+                // The target is reached only through this link: its real
+                // spelling (reported by FSEvents, and by inotify for the
+                // watch it added last) becomes the link's.
+                LinkOutcome::Followed => {
+                    if let Some(real) = &link.real {
+                        rules.push(rule(real.clone(), false, Remap::To(spelled.clone())));
+                    }
+                    rules.push(rule(spelled, true, Remap::Keep));
+                }
+                LinkOutcome::Duplicate(winner) => {
+                    rules.push(rule(spelled, true, Remap::To(root.join(winner))));
+                }
+                LinkOutcome::Aliases(plain) => {
+                    let plain = if plain.is_empty() { root.to_path_buf() } else { root.join(plain) };
+                    rules.push(rule(spelled, true, Remap::To(plain)));
+                }
+                LinkOutcome::Refused(_) => rules.push(rule(spelled, true, Remap::Drop)),
             }
-            !entry.file_name().to_str().is_some_and(|name| pruned.iter().any(|dir| dir == name))
-                && in_scope(entry.path())
-        });
-    builder
+        }
+        // Longest prefix first, so the first match is the most specific.
+        rules.sort_by_key(|rule| std::cmp::Reverse(rule.prefix.components().count()));
+        LinkTable { root: root.to_path_buf(), links, rules }
+    }
+
+    /// The links the table was built from, in the order the walk met them.
+    pub fn links(&self) -> &[Link] {
+        &self.links
+    }
+
+    /// The spelling the walk lists for `path` (absolute), by the most
+    /// specific rule that covers it: under a followed link's real target ->
+    /// the link's spelling; under a duplicate link -> the winning link's;
+    /// under an aliasing link -> the plain spelling; under a refused link ->
+    /// dropped. A link's own path is kept as spelled, so its creation or
+    /// removal reaches whoever reloads the table.
+    pub fn to_indexed(&self, path: &Path) -> Remap {
+        let Some(rule) = self.rules.iter().find(|rule| path.starts_with(&rule.prefix)) else {
+            return Remap::Keep;
+        };
+        let Ok(suffix) = path.strip_prefix(&rule.prefix) else { return Remap::Keep };
+        if rule.is_link && suffix.as_os_str().is_empty() {
+            return Remap::Keep;
+        }
+        match &rule.remap {
+            Remap::Keep => Remap::Keep,
+            Remap::Drop => Remap::Drop,
+            Remap::To(base) => {
+                let to = if suffix.as_os_str().is_empty() { base.clone() } else { base.join(suffix) };
+                if to == path {
+                    Remap::Keep
+                } else {
+                    Remap::To(to)
+                }
+            }
+        }
+    }
+
+    /// Whether `path` is a link's spelling in this table or an ancestor of
+    /// one (the root excluded): a change there may have changed the table.
+    pub fn concerns(&self, path: &Path) -> bool {
+        path != self.root && self.links.iter().any(|link| self.root.join(&link.at).starts_with(path))
+    }
+
+    /// The spellings (project-relative) of the links whose row differs
+    /// between `self` and `newer`: created, removed, retargeted, or judged
+    /// differently. Sorted, deduplicated.
+    pub fn changed_links(&self, newer: &LinkTable) -> Vec<String> {
+        let mut changed: Vec<String> = self
+            .links
+            .iter()
+            .filter(|link| !newer.links.contains(link))
+            .chain(newer.links.iter().filter(|link| !self.links.contains(link)))
+            .map(|link| link.at.clone())
+            .collect();
+        changed.sort();
+        changed.dedup();
+        changed
+    }
 }

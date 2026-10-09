@@ -322,11 +322,14 @@ pub(crate) fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
 /// [`PluginRegistry::gitignore_changed`] does not reindex it (GM-508, Q2).
 pub(crate) const GITIGNORE_REINDEX_GUARD: usize = 10_000;
 
-/// The directories holding `gitignores` (project-relative, `""` for the
-/// root), deduplicated; just the root when the root's own file is among them.
-fn gitignore_subtrees(gitignores: &[String]) -> Vec<String> {
+/// The directories holding `gitignores` and `links` (project-relative, `""`
+/// for the root), deduplicated; just the root when one of them is in the
+/// root. A link's directory covers the files listed through it and, for a
+/// file link, the link itself.
+fn gitignore_subtrees(gitignores: &[String], links: &[String]) -> Vec<String> {
     let mut dirs: Vec<String> = gitignores
         .iter()
+        .chain(links)
         .map(|path| path.rsplit_once('/').map_or(String::new(), |(dir, _)| dir.to_string()))
         .collect();
     if dirs.iter().any(String::is_empty) {
@@ -708,10 +711,23 @@ impl PluginRegistry {
     /// has since gone reads as absent - installing is the fix.
     pub(crate) fn path_coverage(&self, file_path: &str) -> Option<PathCoverage> {
         if self.discovered.language_for(file_path).is_some() {
-            let language = self.discovered.indexing_language(file_path)?;
+            let language =
+                self.discovered.indexing_language(file_path, self.real_relative(file_path).as_deref())?;
             return self.is_failed_language(language).then(|| PathCoverage::Failed(language.to_string()));
         }
         crate::languages::absent_for_path(&self.discovered, file_path).map(PathCoverage::Absent)
+    }
+
+    /// `file_path`'s spelling relative to the project root's real path, when
+    /// a link on the way makes it differ from `file_path`; `None` otherwise,
+    /// and when the file does not resolve (deleted) or resolves outside the
+    /// root.
+    fn real_relative(&self, file_path: &str) -> Option<String> {
+        let real = std::fs::canonicalize(self.project_root.join(file_path)).ok()?;
+        let relative = real.strip_prefix(&self.project_root).ok()?;
+        let parts: Option<Vec<&str>> = relative.components().map(|part| part.as_os_str().to_str()).collect();
+        let real = parts?.join("/");
+        (real != file_path).then_some(real)
     }
 
     /// Which language claims `file_path`, by its extension; `None` if no
@@ -1030,7 +1046,10 @@ impl PluginRegistry {
             if !self.workspace_language_matches(file_path).is_empty() {
                 continue;
             }
-            let Some(language) = self.discovered.indexing_language(file_path) else { continue };
+            let real = self.real_relative(file_path);
+            let Some(language) = self.discovered.indexing_language(file_path, real.as_deref()) else {
+                continue;
+            };
             if self.is_failed_language(language) {
                 continue;
             }
@@ -1088,7 +1107,10 @@ impl PluginRegistry {
         // Claimed, but under that language's own `exclude_dirs` - the same
         // `DiscoveredPlugins::indexing_language` filter `g-mesh status`'s
         // coverage walk applies, so the two agree on which files exist.
-        let Some(language) = self.discovered.indexing_language(&file_path).map(str::to_string) else {
+        let real = self.real_relative(&file_path);
+        let Some(language) =
+            self.discovered.indexing_language(&file_path, real.as_deref()).map(str::to_string)
+        else {
             return;
         };
         if self.is_failed_language(&language) {
@@ -1130,19 +1152,20 @@ impl PluginRegistry {
     }
 
     /// GM-508's gate: `gitignores` (project-relative paths of settled
-    /// `.gitignore` files, created, edited or deleted) may have changed which
-    /// files are indexed. Walks the directories holding them (with their
-    /// ancestors' rules, `project_walk::project_files_under`), splits the
-    /// files by [`DiscoveredPlugins::indexing_language`] and compares each
+    /// `.gitignore` files, created, edited or deleted) and `links` (spellings
+    /// of links created, removed or judged differently) may have changed
+    /// which files are indexed. Walks the directories holding them (with
+    /// their ancestors' rules, `project_walk::project_files_under`), splits
+    /// the files by [`DiscoveredPlugins::indexing_language`] and compares each
     /// language with its `File` nodes under the same directories. Every
     /// language with a difference is reindexed as after a workspace-file edit
     /// ([`workspace_file_changed`](Self::workspace_file_changed), the first of
-    /// `gitignores` as the trigger), unless it would gain more than
+    /// `gitignores`, else of `links`, as the trigger), unless it would gain more than
     /// [`GITIGNORE_REINDEX_GUARD`] files: then one log line asks for
     /// `g-mesh reindex`. No difference, no reindex.
-    pub(crate) fn gitignore_changed(&self, conn: &IndexStore, gitignores: &[String]) {
-        let Some(trigger) = gitignores.first() else { return };
-        let subtrees = gitignore_subtrees(gitignores);
+    pub(crate) fn gitignore_changed(&self, conn: &IndexStore, gitignores: &[String], links: &[String]) {
+        let Some(trigger) = gitignores.first().or(links.first()) else { return };
+        let subtrees = gitignore_subtrees(gitignores, links);
         let live = match conn.with(|conn| indexed_files_under(conn, &subtrees)) {
             Ok(live) => live,
             Err(err) => {
@@ -1155,7 +1178,9 @@ impl PluginRegistry {
         let mut walked: BTreeMap<String, HashSet<String>> = BTreeMap::new();
         let pruned = self.discovered.excluded_by_every_language();
         for file in crate::project_walk::project_files_under(&self.project_root, &pruned, &subtrees) {
-            if let Some(language) = self.discovered.indexing_language(&file.relative) {
+            if let Some(language) =
+                self.discovered.indexing_language(&file.relative, file.real_relative.as_deref())
+            {
                 walked.entry(language.to_string()).or_default().insert(file.relative);
             }
         }
@@ -1219,7 +1244,7 @@ impl PluginRegistry {
             .map(|file| file.relative)
             .collect();
         if !newer.is_empty() {
-            self.gitignore_changed(conn, &newer);
+            self.gitignore_changed(conn, &newer, &[]);
         }
     }
 
