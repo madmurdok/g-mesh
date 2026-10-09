@@ -1174,9 +1174,10 @@ impl PluginRegistry {
     /// their ancestors' rules, `project_walk::project_files_under`), splits
     /// the files by [`DiscoveredPlugins::indexing_language`] and compares each
     /// language with its `File` nodes under the same directories. Every
-    /// language with a difference is reindexed as after a workspace-file edit
-    /// ([`workspace_file_changed`](Self::workspace_file_changed), the first of
-    /// `gitignores`, else of `links`, as the trigger), unless it would gain more than
+    /// language with a difference is reindexed whole
+    /// ([`reindex_workspace`](Self::reindex_workspace), never asking for a
+    /// resolution delta, since a `.gitignore` changes which files are indexed;
+    /// the first of `gitignores`, else of `links`, as the trigger), unless it would gain more than
     /// [`GITIGNORE_REINDEX_GUARD`] files: then one log line asks for
     /// `g-mesh reindex`. No difference, no reindex.
     pub(crate) fn gitignore_changed(&self, conn: &IndexStore, gitignores: &[String], links: &[String]) {
