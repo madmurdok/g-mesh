@@ -432,3 +432,14 @@ out. Core has no idea what a site is; only the plugin does.
   ones included, ride along on every per-file pass of a creation batch, so a
   batch of 3+ creations can spend an owed file's attempts at once. The bound
   holds; it is reached sooner.
+
+### Owner decision on the residual pass budget (2026-10-09)
+
+**"Core передаёт дедлайн в запросе".** The bridge cannot tell a residual pass
+from a per-file pass: both arrive as `semanticPass { filePaths }`, and a
+per-file pass also carries owed files. So the budget is not inferred from the
+file count. Instead, `semanticPass` gains an optional `budgetMs`, which core
+sets to the timeout it already applies to that pass (`semantic_pass_project_timeout(n)`
+for a residual pass, the per-file timeout otherwise). The bridge's
+`pass_budget` uses it when present, never planning past it, and falls back to
+today's rules when absent. Third-party plugins ignore the field.
