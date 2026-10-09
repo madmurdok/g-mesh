@@ -3302,6 +3302,46 @@ mod tests {
         assert!(budgets.readiness <= budgets.project_floor);
     }
 
+    /// With core's deadline, a pass plans to three quarters of the time left
+    /// until it, whatever its shape: a many-file per-file-shaped pass under
+    /// 120s plans 90s, not 8s a file. A deadline already past plans nothing.
+    ///
+    /// Control: ignore `core_deadline` in `pass_deadline`.
+    #[test]
+    fn with_cores_deadline_a_pass_plans_three_quarters_of_the_time_left() {
+        let mut bridge = LspBridge::new("toy", Path::new("/p"), SemanticConfig::new("toy-server"));
+        let started = Instant::now();
+
+        bridge.set_pass_deadline(Some(started + Duration::from_secs(120)));
+        assert_eq!(bridge.pass_deadline(started, false, 1_000), started + Duration::from_secs(90));
+        assert_eq!(bridge.pass_deadline(started, true, 1_000), started + Duration::from_secs(90));
+
+        bridge.set_pass_deadline(Some(started + Duration::from_secs(20 * 60)));
+        assert_eq!(bridge.pass_deadline(started, true, 10), started + Duration::from_secs(15 * 60));
+
+        let later = started + Duration::from_secs(10);
+        bridge.set_pass_deadline(Some(started));
+        assert_eq!(bridge.pass_deadline(later, true, 10), later, "a past deadline leaves no time to plan");
+    }
+
+    /// Without core's deadline - never sent, or cleared by a pass without
+    /// one - the bridge's own budgets apply.
+    #[test]
+    fn without_cores_deadline_a_pass_plans_its_own_budget() {
+        let mut bridge = LspBridge::new("toy", Path::new("/p"), SemanticConfig::new("toy-server"));
+        let started = Instant::now();
+        for (whole_project, files) in [(false, 1_000), (true, 10), (true, 1_000)] {
+            assert_eq!(
+                bridge.pass_deadline(started, whole_project, files),
+                started + bridge.pass_budget(whole_project, files)
+            );
+        }
+
+        bridge.set_pass_deadline(Some(started + Duration::from_secs(120)));
+        bridge.set_pass_deadline(None);
+        assert_eq!(bridge.pass_deadline(started, true, 1_000), started + Duration::from_secs(8_000));
+    }
+
     // --- GM-486: untyped receiver calls the semantic tier answered ---------
 
     /// `a.toy` declares `add` and `sub`; `b.toy`'s `caller` calls `len`

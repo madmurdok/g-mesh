@@ -1138,6 +1138,40 @@ mod tests {
         assert_eq!(linked, round_tripped);
     }
 
+    /// `budgetMs` is optional both ways: `None` omits the key, so a
+    /// plugin that predates it sees the request it always did; a frame
+    /// without it reads as `None`; a value round-trips under its camelCase name.
+    #[test]
+    fn semantic_pass_budget_ms_round_trips_and_is_omitted_when_none() {
+        let none = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(RequestId::Number(5)),
+            message: ControlMessage::SemanticPass {
+                file_paths: vec!["src/a.rs".to_string()],
+                linked_edges: Vec::new(),
+                budget_ms: None,
+            },
+        };
+        let json = serde_json::to_string(&none).unwrap();
+        assert!(!json.contains("budgetMs"), "None must not be serialized: {json}");
+        let absent: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(none, absent, "an absent budgetMs must read as None");
+
+        let some = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(RequestId::Number(6)),
+            message: ControlMessage::SemanticPass {
+                file_paths: Vec::new(),
+                linked_edges: Vec::new(),
+                budget_ms: Some(120_000),
+            },
+        };
+        let json = serde_json::to_string(&some).unwrap();
+        assert!(json.contains(r#""budgetMs":120000"#), "{json}");
+        let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(some, round_tripped);
+    }
+
     #[test]
     fn workspace_changed_round_trips_as_a_notification() {
         let envelope = ControlEnvelope {

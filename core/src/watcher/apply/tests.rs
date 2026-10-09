@@ -2492,3 +2492,113 @@ fn an_edit_whose_pass_finishes_a_residual_file_removes_its_record() {
 
     assert_eq!(conn.with(|conn| schema::semantic_residual_files(conn, "rust")).unwrap(), Some(Vec::new()));
 }
+
+// ---------------------------------------------------------------------
+// `budgetMs`: core tells the plugin the timeout it holds the pass to.
+// ---------------------------------------------------------------------
+
+/// Which entry point [`budget_sent`] drives.
+enum PassKind {
+    /// An edit of `src/a.rs`: its reparse, then its per-file pass.
+    PerFile,
+    /// A residual pass over two files.
+    Residual,
+    /// A whole-project pass.
+    WholeProject,
+}
+
+/// Runs one pass of `kind` with `timeout` as the semantic pass timeout (and
+/// a different one for the reparse), against a stub that answers every
+/// request complete. Returns the `budgetMs` the `semanticPass` carried.
+fn budget_sent(kind: PassKind, timeout: Duration) -> Option<u64> {
+    let (root, conn) = owed_fixture();
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, mut plugin_writer) = std::io::pipe().unwrap();
+    let plugin = std::thread::spawn(move || {
+        let mut plugin_reader = BufReader::new(plugin_reader);
+        loop {
+            let request: ControlEnvelope = read_message(&mut plugin_reader).unwrap().unwrap();
+            let budget = match request.message {
+                ControlMessage::FileChanged { .. } => None,
+                ControlMessage::SemanticPass { budget_ms, .. } => Some(budget_ms),
+                other => panic!("expected FileChanged or SemanticPass, got {other:?}"),
+            };
+            let response = FileChangeResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id.expect("every request here expects an answer"),
+                result: FileChangeDiff::default(),
+                incomplete: false,
+                incomplete_reason: None,
+                unfinished_files: None,
+            };
+            write_message(&mut plugin_writer, &response).unwrap();
+            if let Some(budget) = budget {
+                return budget;
+            }
+        }
+    });
+
+    let mut reader = BufReader::new(core_reader);
+    let reparse_timeout = timeout + Duration::from_millis(1_111);
+    match kind {
+        PassKind::PerFile => apply_file_change(
+            &mut reader,
+            &mut core_writer,
+            &conn,
+            root.path(),
+            "rust",
+            OWED_A,
+            RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
+            reparse_timeout,
+            timeout,
+            true,
+            &mut on_timeout_must_not_fire,
+        )
+        .map(|_| ()),
+        PassKind::Residual => apply_residual_semantic_pass(
+            &mut reader,
+            &mut core_writer,
+            &conn,
+            "rust",
+            strings(&[OWED_A, OWED_B]),
+            RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
+            timeout,
+            &mut on_timeout_must_not_fire,
+        )
+        .map(|_| ()),
+        PassKind::WholeProject => apply_semantic_pass(
+            &mut reader,
+            &mut core_writer,
+            &conn,
+            "rust",
+            None,
+            Vec::new(),
+            RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
+            timeout,
+            &mut on_timeout_must_not_fire,
+        )
+        .map(|_| ()),
+    }
+    .unwrap();
+    plugin.join().unwrap()
+}
+
+/// A per-file pass is sent the semantic pass timeout it is held to, in
+/// milliseconds - not the reparse's.
+///
+/// Control: send `budget_ms: None` in `apply_semantic_pass_in`.
+#[test]
+fn a_per_file_pass_is_sent_its_own_timeout_as_its_budget() {
+    assert_eq!(budget_sent(PassKind::PerFile, Duration::from_millis(7_250)), Some(7_250));
+}
+
+/// A residual pass, and a whole-project one, are sent the timeout they are
+/// held to.
+#[test]
+fn a_residual_and_a_whole_project_pass_are_sent_their_timeout_as_their_budget() {
+    assert_eq!(budget_sent(PassKind::Residual, Duration::from_millis(6_500)), Some(6_500));
+    assert_eq!(budget_sent(PassKind::WholeProject, Duration::from_millis(8_125)), Some(8_125));
+}
