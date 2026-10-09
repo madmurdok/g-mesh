@@ -1847,7 +1847,7 @@ fn three_runs() -> (Arc<IndexStore>, tempfile::TempDir) {
 }
 
 #[test]
-fn up_to_three_candidates_on_a_complete_first_page_each_carry_their_source() {
+fn three_candidates_on_a_complete_first_page_each_carry_their_source() {
     let (store, project) = three_runs();
 
     let sourced = json_body(&define(&store, project.path(), named("run")));
@@ -1989,23 +1989,55 @@ fn a_page_where_no_candidates_span_can_be_read_is_plainly_ambiguous() {
     assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS, "{body}");
 }
 
+/// The largest set that is sourced (GM-526): four candidates on a complete
+/// first page each carry their own lines.
 #[test]
-fn four_candidates_carry_no_source() {
+fn four_candidates_on_a_complete_first_page_each_carry_their_source() {
     let store = runs(&[("a", "a.rs", 0, 0), ("b", "b.rs", 0, 0), ("c", "c.rs", 0, 0), ("d", "d.rs", 0, 0)]);
     let project = project_files(&[
-        ("a.rs", "fn run() {}\n"),
-        ("b.rs", "fn run() {}\n"),
-        ("c.rs", "fn run() {}\n"),
-        ("d.rs", "fn run() {}\n"),
+        ("a.rs", "fn run() { alpha() }\n"),
+        ("b.rs", "fn run() { beta() }\n"),
+        ("c.rs", "fn run() { gamma() }\n"),
+        ("d.rs", "fn run() { delta() }\n"),
     ]);
 
     let body = json_body(&define(&store, project.path(), named("run")));
 
     assert_eq!(body["results"].as_array().unwrap().len(), 4, "precondition: {body}");
-    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS, "{body}");
-    for candidate in body["results"].as_array().unwrap() {
-        assert!(candidate.get("source").is_none(), "{body}");
+    assert_eq!(body["hasMore"], false, "precondition: {body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS_SOURCED, "{body}");
+    assert_eq!(sourced_ids(&body), vec!["a", "b", "c", "d"], "{body}");
+    for (id, call) in [("a", "alpha"), ("b", "beta"), ("c", "gamma"), ("d", "delta")] {
+        let candidate = body["results"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap();
+        assert_eq!(candidate["source"]["text"], format!("fn run() {{ {call}() }}"), "{body}");
     }
+}
+
+/// One past the largest sourced set: five candidates on a complete first page
+/// carry no source at all.
+#[test]
+fn five_candidates_carry_no_source() {
+    let store = runs(&[
+        ("a", "a.rs", 0, 0),
+        ("b", "b.rs", 0, 0),
+        ("c", "c.rs", 0, 0),
+        ("d", "d.rs", 0, 0),
+        ("e", "e.rs", 0, 0),
+    ]);
+    let project = project_files(&[
+        ("a.rs", "fn run() {}\n"),
+        ("b.rs", "fn run() {}\n"),
+        ("c.rs", "fn run() {}\n"),
+        ("d.rs", "fn run() {}\n"),
+        ("e.rs", "fn run() {}\n"),
+    ]);
+
+    let body = json_body(&define(&store, project.path(), named("run")));
+
+    assert_eq!(body["results"].as_array().unwrap().len(), 5, "precondition: {body}");
+    assert_eq!(body["hasMore"], false, "precondition: {body}");
+    assert_eq!(body["explanation"], crate::mcp::session_hints::AMBIGUOUS, "{body}");
+    assert!(sourced_ids(&body).is_empty(), "{body}");
 }
 
 /// A later page holds a few candidates, but they are not the whole set, so
