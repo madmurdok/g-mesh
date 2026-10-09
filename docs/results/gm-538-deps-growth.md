@@ -242,3 +242,53 @@ binary's debug map references, so `file:line` in backtraces is kept, and the
 test entry point (`scripts/test-sections.sh`, GM-540) runs it before a run.
 A plain `cargo test` outside the script still accumulates objects; the script
 is the remedy, not a guarantee.
+
+## Measurement with the prune (GM-538/S16, 2026-10-09)
+
+Fresh worktree at b53bb4d, cold target dir, macOS default `unpacked`.
+Section `wire` (`package(g-mesh-wire)`; `--workspace` still builds every test
+binary). `exec` = executable files in `deps`. Timings are `/usr/bin/time -p`.
+
+| step | command | total | .o | .d | .rmeta | .rlib | .dylib | exec | du | real / user / sys (s) | load avg (1/5/15) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| a | `cargo build --workspace` | 2,502 | 1,791 | 247 | 217 | 217 | 23 | 7 | 1.5G | 183.5 / 215.3 / 49.5 | 97 / 84 / 75 |
+| b | `test-sections.sh run wire` | 13,128 | 12,035 | 411 | 271 | 271 | 23 | 117 | 6.5G | 424.7 / 1085.6 / 195.3 | 652 / 403 / 222 |
+| c | `scripts/check.sh` | 13,961 | 12,035 | 794 | 650 | 338 | 27 | 117 | 6.7G | 214.1 / 174.6 / 43.8 | 276 / 382 / 258 |
+| d1 | touch `core/src/lib.rs` + `run wire` | 22,499 | 20,573 | 794 | 650 | 338 | 27 | 117 | 6.6G | 130.8 / 262.4 / 116.5 | 340 / 361 / 266 |
+| d2 | same | 22,499 | 20,573 | | | | | | 6.6G | 154.0 / 260.5 / 116.8 | 385 / 354 / 277 |
+| d3 | same | 22,499 | 20,573 | | | | | | 6.6G | 119.3 / 274.8 / 123.6 | 282 / 321 / 274 |
+| e | control: touch + plain `cargo nextest run` (no prune) | 31,457 | 29,531 | | | | | | 6.6G | 151.8 / 279.7 / 126.4 | 385 / 332 / 285 |
+| e' | `scripts/prune-stale-objects.sh` | 13,541 | 11,615 | | | | | | 6.4G | 25.5 / 1.1 / 5.6 | 419 / 346 / 292 |
+
+(Blank cells: unchanged from the row above; only `.o` moved.) A dry run after
+each of d1-d3 reported 11,615 referenced and 8,958 stale objects: the prune
+runs *before* cargo, so the set a run makes stale stays until the next run.
+
+Exec latency, one `plugin_memory_limit` binary, `--list`, 5 runs each:
+
+| deps entries | state | real (s) | median | user / sys | load avg (1 min) |
+|---|---|---|---|---|---|
+| 22,501 | bounded with prune (after d3) | 0.40 / 0.54 / 0.43 / 0.39 / 0.41 | 0.41 | 0.01 / 0.01 | 260 |
+| 31,459 | after control e, before prune | 0.52 / 0.52 / 0.53 / 0.62 / 0.52 | 0.52 | 0.01 / 0.01 | 389 |
+| 13,543 | after e' (one set) | 0.41 / 0.42 / 0.41 / 0.40 / 0.17 | 0.41 | 0.01 / 0.01 | 428 |
+
+Machine: load average 250-650 for the whole run (other work on the machine);
+`real` at `user 0.01` is waiting, not computing, so latency numbers are
+indicative only.
+
+**Conclusion.** With the prune in `test-sections.sh run`, `deps` is bounded:
+three touch cycles stayed at 22,499 entries (one live set plus the one stale
+set the previous run left, ~8,960 `.o`), while the control without the prune
+grew by +8,958 in one cycle, and a manual prune dropped it by 17,916 to
+13,541, matching the post-check baseline. Exec latency was 0.41 s median at
+the bounded count against 0.52 s after one unpruned cycle (+9k entries), under
+heavy load; the 13.5k state did not measure faster than 22.5k here, so the
+latency gain from the prune is within the load noise at these counts and the
+main win is that the count stops growing.
+
+**Recommended `cargo clean` threshold for the slice-task skill (pending owner
+approval):** run `cargo clean` when `target/debug/deps` holds more than
+**25,000 entries**: ~14,000 after a clean build, a workspace test build and
+`scripts/check.sh`, plus the one stale core set (~9,000) the prune leaves
+between runs, plus ~2,000 margin. Above it, objects are accumulating outside
+the script (plain `cargo test`/`nextest`, feature-unification hashes).
