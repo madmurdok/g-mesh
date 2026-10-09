@@ -499,3 +499,56 @@ Order and parallel work:
 - **Q3: "Да, на секции".** The gate's `cargo test --workspace` becomes
   `test-sections.sh check` + `run all`; the GM-302 `-p g-mesh` run stays.
 - **Q4: "11, мелкие вместе".** The 11 sections in section 2 as listed.
+
+## 11. GM-539/S9: CI measurement (2026-10-09)
+
+### Method
+
+Four throwaway branches off `8aa5a54`, each with one comment-only commit,
+pushed as `experiment/GM-539-<kind>` and deleted afterwards. A push to a new
+branch has an all-zero `github.event.before`, which the `select` job turns into
+`full`. So each branch was first pushed at `8aa5a54` itself, then the probe
+commit was pushed on top. The second push's `before` is `8aa5a54`, and its
+run diffed exactly the probe commit. The first push's runs were cancelled by
+the workflow's `cancel-in-progress` concurrency group.
+
+Baseline: `main` run 37859404190 (`936c5dd`), the single `cargo nextest run`
+step before sections. The probe runs overlapped one another and a
+`workflow_dispatch` run on GM-540, so wall times carry runner noise: the wire
+run is a full run, yet its x86_64-darwin job took 36.4m against the baseline's
+29.4m.
+
+### Results
+
+| change (probe path) | run | `select` output | linux | win | arm64-mac | x86-mac | runner min (all jobs) |
+|---|---|---|---|---|---|---|---|
+| baseline, `main` | 37859404190 | (no select job) | 9.8m | 16.7m | 11.7m | 29.4m | 71.8 |
+| plugin (`plugins/go/walk.go`) | 37948206534 | partial: 6 core sections | n/a | n/a | n/a | n/a | 9.5 (failed early) |
+| core (`core/src/lib.rs`) | 37948206213 | partial: 6 core sections | 9.2m | 13.1m | 12.8m | 29.1m | 68.6 |
+| wire (`wire/src/lib.rs`) | 37948205509 | full: 11 sections | 8.4m | 17.9m | 13.3m | 36.4m | 80.0 |
+| docs (`docs/adr/0030-test-sections.md`) | 37948205182 | none: `test` job skipped | 0 | 0 | 0 | 0 | 3.7 |
+
+The platform columns are `tests (<target>)` job wall times.
+
+- **The selection is right in all four cases.** Plugin and core select the 6
+  core sections (`plugins/go/**` has no section of its own, and Q1 puts all
+  core sections on a plugin change). Wire selects `full`. Docs selects `none`,
+  and the `test` job is skipped.
+- **The plugin run measured nothing about time.** The probe comment broke
+  `gofmt` (no blank line before a trailing top-level comment). The Go step
+  failed on every platform before the build. This is the probe's fault, not
+  selection's, and the run was not re-pushed. It selected the same sections
+  as the core run, so the core row stands for its expected time.
+- **The core run's linux failure is unrelated to the change.** `core-it`
+  `plugin_check::a_bulk_index_that_dies_quotes_what_the_plugin_said_about_it`
+  failed because bulk run 2 wrote nothing to stderr, an intermittent
+  stderr-capture result on a comment-only change. Every later section step
+  still ran, so the linux time is complete.
+- **The sections a core change skips cost little.** In the full wire run, the
+  `sdk`, three plugin and `wire` steps took 0.8m on linux, 1.0m on windows,
+  1.1m on arm64-mac and 3.4m on x86-mac, about 6 runner minutes per run. That
+  is what a core or plugin change saves. It is within the run-to-run noise
+  seen here, as section 6 predicted: the build (3.4-14.9m) and `core-it`
+  always run.
+- **A docs-only change is the large win:** 3.7 runner minutes against 71.8,
+  and no wait on x86_64-darwin.
