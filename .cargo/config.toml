@@ -63,3 +63,21 @@
 # reuse the 154 MiB already on disk instead of re-downloading it.
 [env]
 G_MESH_HOME = { value = "/tmp/g-mesh-test-home", force = false }
+
+# STALE OBJECT FILES ON MACOS (GM-538)
+#
+# macOS defaults to `split-debuginfo=unpacked`: the DWARF stays in the
+# `*.rcgu.o` files next to each binary, and rustc names them with a suffix
+# that changes on every compilation. Cargo does not track those files, so
+# every recompile adds a fresh set to `target/debug/deps` and nothing ever
+# removes the old ones. `packed` collects the debug info into a `.dSYM` per
+# binary instead and leaves no `.o` behind; backtraces keep file:line.
+# (`off` also leaves none, but drops file:line from user frames.)
+#
+# KNOW THIS: an exported `RUSTFLAGS` replaces config `rustflags` entirely, so
+# with one set this line is ignored and the growth comes back. Add the flag to
+# your `RUSTFLAGS` if you export one.
+#
+# See docs/results/gm-538-deps-growth.md.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "split-debuginfo=packed"]
