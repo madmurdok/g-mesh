@@ -549,6 +549,9 @@ fn swap_attached(
         )
         .with_context(|| format!("failed to record {language}'s pending files"))?;
     }
+    // What earlier per-file passes left unfinished described the index this
+    // swap replaces; the pass that follows re-asks every file anyway.
+    schema::clear_owed_files(&tx, language)?;
     schema::record_bulk_index(&tx).context("failed to reconcile the bulk-index roll-up")?;
     schema::reconcile_semantic_pass_rollup(&tx, semantic_pass_languages)
         .context("failed to reconcile the semantic-pass roll-up")?;
@@ -803,6 +806,27 @@ mod tests {
                 "SELECT filePath FROM semantic_pending_files WHERE language = 'rust' ORDER BY filePath"
             ),
             vec!["a.rs", "b.rs"]
+        );
+    }
+
+    /// A committed swap clears the swapped language's owed files - they named
+    /// the index it replaces - and no other language's.
+    ///
+    /// Control: drop `clear_owed_files` from `swap_attached`.
+    #[test]
+    fn a_swap_clears_only_its_languages_owed_files() {
+        let (_dir, mut live, staging_path, _plan) = planned_reindex();
+        for (language, file) in [("rust", "a.rs"), ("go", "a.go")] {
+            schema::settle_owed_files(&live, language, &[file.to_string()], &[], &[file.to_string()])
+                .unwrap();
+        }
+        let capable: HashSet<String> = HashSet::from(["rust".to_string()]);
+
+        swap(&mut live, &staging_path, None, &bookkeeping(&capable)).unwrap();
+
+        assert_eq!(
+            column(&live, "SELECT language || ':' || filePath FROM semantic_owed_files"),
+            vec!["go:a.go"]
         );
     }
 

@@ -47,6 +47,7 @@
 //! would otherwise say `SKIP`, and a regression in some later language's
 //! plugin is a failing check rather than a check that never ran.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -104,22 +105,39 @@ pub struct SemanticAnswer {
     /// core beside the `incomplete` flag, which records it per language and
     /// shows it in `g-mesh status`. `None` on a complete pass.
     pub reason: Option<String>,
+    /// The files of this pass's scope it did not finish, sent to
+    /// core as `unfinishedFiles` on per-file and whole-project passes alike.
+    /// Core keeps them and puts them into the scope of its next per-file pass,
+    /// so a file a cold server left unanswered is asked again without an
+    /// edit; every other file core sent is settled. `None` - the default -
+    /// says nothing, and core keeps its behaviour from before the field: a
+    /// complete per-file pass settles the files it sent, an incomplete one
+    /// none. `Some` of an empty set says every file in scope finished.
+    pub unfinished: Option<BTreeSet<RelPath>>,
 }
 
 impl SemanticAnswer {
     /// A pass that covered everything it was asked about.
     pub fn complete(diff: FileChangeDiff) -> Self {
-        Self { diff, complete: true, reason: None }
+        Self { diff, complete: true, reason: None, unfinished: None }
     }
 
     /// A pass that did not - the diff is whatever it did manage.
     pub fn incomplete(diff: FileChangeDiff) -> Self {
-        Self { diff, complete: false, reason: None }
+        Self { diff, complete: false, reason: None, unfinished: None }
     }
 
     /// [`SemanticAnswer::incomplete`], saying why.
     pub fn incomplete_because(diff: FileChangeDiff, reason: impl Into<String>) -> Self {
-        Self { diff, complete: false, reason: Some(reason.into()) }
+        Self { diff, complete: false, reason: Some(reason.into()), unfinished: None }
+    }
+
+    /// This answer, naming the files of its scope it did not finish - see
+    /// [`SemanticAnswer::unfinished`].
+    #[must_use]
+    pub fn with_unfinished(mut self, unfinished: BTreeSet<RelPath>) -> Self {
+        self.unfinished = Some(unfinished);
+        self
     }
 }
 

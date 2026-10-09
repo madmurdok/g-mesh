@@ -1104,6 +1104,20 @@ unspecified.
    completion record to protect and the only thing the flag could do there is
    print a line per keystroke-save, which is the noise the design's "log once"
    rule exists to prevent.
+8. **Which files a pass did not finish travels beside the flag (GM-498).**
+   `FileChangeResponse` gains `unfinishedFiles` (optional, no protocol bump:
+   an old core ignores the key). Absent means unknown, and core keeps rule 7's
+   behaviour: a complete per-file pass settles the files it sent, an
+   incomplete one none. Present - empty when every file in scope finished - it
+   is read on per-file passes whatever `incomplete` says, so the SDK still
+   puts no flag on a per-file pass. Core keeps the named files in
+   `semantic_owed_files`, adds them to the scope of the language's next
+   per-file pass (at most three passes per file, restarting when the file is
+   edited), and settles `sent - unfinishedFiles`: those files are no longer
+   semantic-pending and no longer owed. The SDK's half is
+   `SemanticAnswer::unfinished`, which `LspBridge::answer` fills on every
+   return; the bridge no longer keeps an owed set of its own (GM-487's), so the
+   set survives plugin and daemon restarts.
 
 Two things the sketch above did not say, found while building it:
 

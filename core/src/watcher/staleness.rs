@@ -537,6 +537,7 @@ mod tests {
                     result: FileChangeDiff::default(),
                     incomplete: false,
                     incomplete_reason: None,
+                    unfinished_files: None,
                 },
             )
             .unwrap();
@@ -556,6 +557,7 @@ mod tests {
             },
             incomplete: false,
             incomplete_reason: None,
+            unfinished_files: None,
         }
     }
 
@@ -634,6 +636,7 @@ mod tests {
                     result: FileChangeDiff::default(),
                     incomplete: false,
                     incomplete_reason: None,
+                    unfinished_files: None,
                 };
                 write_message(&mut plugin_writer, &response).unwrap();
             }

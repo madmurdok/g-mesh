@@ -153,6 +153,14 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
         return Ok(());
     }
 
+    // The files earlier per-file passes did not finish ride along:
+    // core, not the plugin, keeps them, so the next pass asks them again
+    // without waiting for an edit, and knows the whole scope it sent.
+    // Best-effort: an unreadable owed set only means they wait one more pass.
+    let owed = store.step(|conn| schema::owed_files(conn, language)).unwrap_or_else(|err| {
+        crate::log_line!("g-mesh: failed to read {language}'s owed semantic files ({err:#})");
+        Vec::new()
+    });
     if let Err(err) = apply_semantic_pass_in(
         reader,
         writer,
@@ -160,6 +168,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
         language,
         None,
         vec![file_path.clone()],
+        owed,
         semantic_pass_id(&request_id),
         embedding,
         semantic_pass_timeout,
@@ -221,6 +230,7 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
             language,
             sweep_language,
             file_paths,
+            Vec::new(),
             request_id,
             embedding,
             timeout,
@@ -230,6 +240,11 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
 }
 
 /// [`apply_semantic_pass`] inside an open unit.
+///
+/// `owed` - for a per-file pass only - is the language's owed files
+/// ([`schema::owed_files`]), sent beside `file_paths`: the pass's scope is
+/// their union, and a `FileChangeResponse::unfinished_files` list settles
+/// exactly that scope less the files it names.
 #[allow(clippy::too_many_arguments)]
 fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
     reader: &mut R,
@@ -238,16 +253,27 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
     language: &str,
     sweep_language: Option<&str>,
     file_paths: Vec<String>,
+    owed: Vec<String>,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
     timeout: Duration,
     on_timeout: &mut dyn FnMut(),
 ) -> Result<()> {
     let whole_project = file_paths.is_empty();
+    // The scope this pass is sent: the requested files, then every owed file
+    // not among them. A whole-project pass is sent no list at all.
+    let mut sent = file_paths.clone();
+    if !whole_project {
+        for path in owed {
+            if !sent.contains(&path) {
+                sent.push(path);
+            }
+        }
+    }
     // Read inside the same unit that committed the reparse (or after the
     // whole-project link), so these are the links of exactly the text the
     // plugin is about to answer for.
-    let linked = store.step(|conn| linked_edges(conn, language, &file_paths))?;
+    let linked = store.step(|conn| linked_edges(conn, language, &sent))?;
     if whole_project {
         crate::log_line!(
             "g-mesh: {language}'s whole-project semantic pass carries {} linked edge(s)",
@@ -258,7 +284,7 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
         reader,
         writer,
         store,
-        ControlMessage::SemanticPass { file_paths: file_paths.clone(), linked_edges: linked },
+        ControlMessage::SemanticPass { file_paths: sent.clone(), linked_edges: linked },
         None,
         request_id,
         embedding,
@@ -278,23 +304,50 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
     // A per-file pass has no completion flag to protect, so an incomplete one
     // is worth a line and nothing more - failing it would only make
     // `apply_file_change` log the same thing twice.
-    if outcome.incomplete {
-        if whole_project {
-            let reason = outcome.incomplete_reason.as_deref().unwrap_or("the plugin gave no reason");
-            bail!("the plugin reported an incomplete whole-project semantic pass: {reason}");
-        }
-        crate::log_line!(
-            "g-mesh: the plugin reported an incomplete per-file semantic pass - its edges keep whatever \
-             this pass did resolve"
-        );
-    } else if !whole_project {
-        // A complete per-file pass has refreshed these files' edges, so they
-        // are no longer pending (ADR 0009). Best-effort: a row left behind
-        // only over-warns until the whole-project pass clears it.
-        if let Err(err) = store.step(|conn| schema::clear_semantic_pending_files(conn, &file_paths)) {
+    if outcome.incomplete && whole_project {
+        let reason = outcome.incomplete_reason.as_deref().unwrap_or("the plugin gave no reason");
+        bail!("the plugin reported an incomplete whole-project semantic pass: {reason}");
+    }
+    if !whole_project {
+        if outcome.incomplete {
             crate::log_line!(
-                "g-mesh: failed to clear the semantic-pending files of a per-file pass ({err:#})"
+                "g-mesh: the plugin reported an incomplete per-file semantic pass - its edges keep whatever \
+                 this pass did resolve"
             );
+        }
+        match outcome.unfinished_files {
+            // The plugin named what it did not finish, so every other file
+            // sent is settled, whatever `incomplete` says: no longer
+            // pending (ADR 0009) and no longer owed. A named file outside the
+            // scope sent is ignored - this pass was not asked about it.
+            Some(unfinished) => {
+                let unfinished: Vec<String> =
+                    sent.iter().filter(|path| unfinished.contains(path)).cloned().collect();
+                let settled: Vec<String> =
+                    sent.iter().filter(|path| !unfinished.contains(path)).cloned().collect();
+                // Best-effort: a pending row left behind only over-warns
+                // until the whole-project pass clears it, and an owed row
+                // left as it was is asked once more.
+                if let Err(err) = store.step(|conn| {
+                    schema::clear_semantic_pending_files(conn, &settled)?;
+                    schema::settle_owed_files(conn, language, &file_paths, &settled, &unfinished)
+                }) {
+                    crate::log_line!(
+                        "g-mesh: failed to settle the semantic-pending and owed files of a per-file pass ({err:#})"
+                    );
+                }
+            }
+            // No list: a complete per-file pass has refreshed the files it
+            // was sent, an incomplete one is not known to have refreshed any.
+            // Best-effort, as above.
+            None if !outcome.incomplete => {
+                if let Err(err) = store.step(|conn| schema::clear_semantic_pending_files(conn, &file_paths)) {
+                    crate::log_line!(
+                        "g-mesh: failed to clear the semantic-pending files of a per-file pass ({err:#})"
+                    );
+                }
+            }
+            None => {}
         }
     } else if let Some(language) = sweep_language {
         let swept = store.step(|conn| sweep_semantic_edges(conn, language, &outcome.upserted_edges))?;
@@ -384,6 +437,10 @@ pub(crate) fn sweep_semantic_edges(
 struct RoundTrip {
     incomplete: bool,
     incomplete_reason: Option<String>,
+    /// [`FileChangeResponse::unfinished_files`]: the files of a
+    /// `semanticPass`'s scope the plugin did not finish, or `None` when it
+    /// did not say.
+    unfinished_files: Option<Vec<String>>,
     /// The ids of every edge the diff upserted.
     upserted_edges: std::collections::HashSet<String>,
 }
@@ -514,6 +571,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
     Ok(RoundTrip {
         incomplete: response.incomplete,
         incomplete_reason: response.incomplete_reason,
+        unfinished_files: response.unfinished_files,
         upserted_edges: diff.upsert_edges.iter().map(|edge| edge.id.clone()).collect(),
     })
 }

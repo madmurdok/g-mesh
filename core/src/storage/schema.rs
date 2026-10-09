@@ -577,6 +577,22 @@ CREATE TABLE IF NOT EXISTS semantic_pending_files (
     filePath TEXT NOT NULL,
     PRIMARY KEY (language, filePath)
 );
+
+-- The files of `language` a per-file semantic pass named in its
+-- `unfinishedFiles`, with how many passes have tried them. Core puts
+-- them into the scope of the language's next per-file pass, so a file a cold
+-- server left unanswered is asked again without waiting for an edit. Written
+-- and settled by `settle_owed_files`; removed by
+-- `record_language_semantic_pass` (a complete whole-project pass answered
+-- everything) and by a workspace reindex swap. Added by
+-- `CREATE TABLE IF NOT EXISTS`, so an existing index gains it without a
+-- schema-version bump.
+CREATE TABLE IF NOT EXISTS semantic_owed_files (
+    language TEXT NOT NULL,
+    filePath TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    PRIMARY KEY (language, filePath)
+);
 "#;
 
 /// Applies the graph schema DDL to a fresh (or already up-to-date) connection.
@@ -988,8 +1004,8 @@ pub fn semantic_pass_completed(conn: &Connection) -> Result<bool> {
 /// below for why that separation is what makes the roll-up rule testable at
 /// all.
 ///
-/// Also removes `language`'s semantic-pending rows, in the same savepoint:
-/// a completed pass has refreshed every file it owed.
+/// Also removes `language`'s semantic-pending and owed-file rows, in the same
+/// savepoint: a completed pass has refreshed every file it owed.
 pub fn record_language_semantic_pass(conn: &Connection, language: &str) -> Result<()> {
     in_savepoint(conn, || {
         conn.execute(
@@ -999,7 +1015,8 @@ pub fn record_language_semantic_pass(conn: &Connection, language: &str) -> Resul
             params![language],
         )
         .with_context(|| format!("failed to record that {language}'s semantic pass completed"))?;
-        clear_semantic_pending(conn, language)
+        clear_semantic_pending(conn, language)?;
+        clear_owed_files(conn, language)
     })
 }
 
@@ -1104,6 +1121,90 @@ pub fn clear_semantic_pending_files(conn: &Connection, file_paths: &[String]) ->
             .with_context(|| format!("failed to clear the pending file {path}"))?;
     }
     Ok(cleared)
+}
+
+/// How many per-file semantic passes may try one owed file before it stops
+/// being re-asked. Bounded so that a site no server
+/// ever answers does not ride along on every per-file pass for good.
+pub const MAX_OWED_ATTEMPTS: i64 = 3;
+
+/// The owed files of `language` (`semantic_owed_files`), in path order: the
+/// files earlier per-file passes did not finish, which core adds to the
+/// scope of the next one.
+pub fn owed_files(conn: &Connection, language: &str) -> Result<Vec<String>> {
+    let mut statement = conn
+        .prepare("SELECT filePath FROM semantic_owed_files WHERE language = ?1 ORDER BY filePath")
+        .context("failed to prepare the owed-files read")?;
+    let rows = statement
+        .query_map(params![language], |row| row.get::<_, String>(0))
+        .with_context(|| format!("failed to read {language}'s owed files"))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read {language}'s owed files"))
+}
+
+/// Settles `language`'s owed files after a per-file pass that reported its
+/// `unfinishedFiles`: the `settled` files are no longer owed, and every file
+/// in `unfinished` counts one more attempt - restarting at one for a file the
+/// pass was sent for (`requested`), whose sites an edit may have changed. A
+/// file that has used up [`MAX_OWED_ATTEMPTS`] is dropped, with a log line,
+/// and is asked again only when it changes.
+pub fn settle_owed_files(
+    conn: &Connection,
+    language: &str,
+    requested: &[String],
+    settled: &[String],
+    unfinished: &[String],
+) -> Result<()> {
+    in_savepoint(conn, || {
+        for path in settled {
+            conn.execute(
+                "DELETE FROM semantic_owed_files WHERE language = ?1 AND filePath = ?2",
+                params![language, path],
+            )
+            .with_context(|| format!("failed to settle the owed file {path}"))?;
+        }
+        for path in unfinished {
+            let attempts = if requested.contains(path) {
+                1
+            } else {
+                let earlier: Option<i64> = conn
+                    .query_row(
+                        "SELECT attempts FROM semantic_owed_files WHERE language = ?1 AND filePath = ?2",
+                        params![language, path],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .with_context(|| format!("failed to read the owed file {path}"))?;
+                earlier.unwrap_or(0).saturating_add(1)
+            };
+            if attempts >= MAX_OWED_ATTEMPTS {
+                conn.execute(
+                    "DELETE FROM semantic_owed_files WHERE language = ?1 AND filePath = ?2",
+                    params![language, path],
+                )
+                .with_context(|| format!("failed to drop the owed file {path}"))?;
+                crate::log_line!(
+                    "g-mesh: [{language}] {path}: {attempts} semantic pass(es) did not finish it - no longer \
+                     re-asked until it changes"
+                );
+            } else {
+                conn.execute(
+                    "INSERT INTO semantic_owed_files (language, filePath, attempts) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(language, filePath) DO UPDATE SET attempts = excluded.attempts",
+                    params![language, path, attempts],
+                )
+                .with_context(|| format!("failed to record the owed file {path}"))?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Deletes `language`'s owed-file rows.
+pub fn clear_owed_files(conn: &Connection, language: &str) -> Result<()> {
+    conn.execute("DELETE FROM semantic_owed_files WHERE language = ?1", params![language])
+        .with_context(|| format!("failed to clear {language}'s owed files"))?;
+    Ok(())
 }
 
 /// Deletes the semantic-pending rows no pass will ever clear: those of a
@@ -1348,7 +1449,7 @@ fn wipe(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files; \
          DROP TABLE IF EXISTS language_state; DROP TABLE IF EXISTS pending_reindex; \
          DROP TABLE IF EXISTS semantic_pending; DROP TABLE IF EXISTS semantic_pending_files; \
-         DROP TABLE IF EXISTS language_outcome;",
+         DROP TABLE IF EXISTS semantic_owed_files; DROP TABLE IF EXISTS language_outcome;",
     )
     .context("failed to wipe schema")
 }

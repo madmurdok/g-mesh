@@ -122,6 +122,7 @@ fn spawn_stub_plugin(
                 result,
                 incomplete: false,
                 incomplete_reason: None,
+                unfinished_files: None,
             },
         )
         .unwrap();
@@ -295,6 +296,7 @@ fn file_change_diff_is_committed_to_sqlite() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff {
             upsert_nodes: vec![canned_node("n1"), canned_node("n2")],
@@ -386,6 +388,7 @@ fn diff_with_deletes_removes_rows() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff { delete_node_ids: vec!["n1".to_string()], ..Default::default() },
     };
@@ -431,6 +434,7 @@ fn mismatched_response_id_is_rejected() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: RequestId::Number(999), // deliberately does not match the request
         result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
     };
@@ -478,6 +482,7 @@ fn empty_diff_response_is_a_safe_no_op() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff::default(),
     };
@@ -542,6 +547,7 @@ fn spawn_semantic_stub(
                 result,
                 incomplete,
                 incomplete_reason: incomplete_reason.map(str::to_string),
+                unfinished_files: None,
             },
         )
         .unwrap();
@@ -632,6 +638,7 @@ fn a_settled_reparse_is_followed_by_a_semantic_pass_over_that_file() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff {
             upsert_nodes: vec![canned_node("n1"), canned_node("n2")],
@@ -693,6 +700,7 @@ fn a_failing_semantic_pass_does_not_fail_the_reparse() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
     };
@@ -749,6 +757,7 @@ fn a_semantic_pass_incapable_plugin_is_never_sent_a_semantic_pass_request() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
     };
@@ -1257,6 +1266,7 @@ fn reparse_embedding(
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: diff,
     };
@@ -1659,6 +1669,7 @@ fn edit_keeping_the_call(conn: &IndexStore, id: i64, pass: Option<FileChangeDiff
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff {
             upsert_nodes: vec![node_in("f", "src/lib.rs"), node_in("d", "src/lib.rs")],
@@ -1892,6 +1903,7 @@ fn spawn_linked_edges_stub(
                 result: lib_rs_reparse(),
                 incomplete: false,
                 incomplete_reason: None,
+                unfinished_files: None,
             };
             write_message(&mut writer, &response).unwrap();
         }
@@ -1906,6 +1918,7 @@ fn spawn_linked_edges_stub(
             result: FileChangeDiff { complete: true, ..Default::default() },
             incomplete: false,
             incomplete_reason: None,
+            unfinished_files: None,
         };
         write_message(&mut writer, &response).unwrap();
         linked_edges
@@ -2257,4 +2270,235 @@ fn a_pass_re_sending_an_unembedded_node_does_not_store_its_text_or_a_vector_of_i
         vector.is_none() || vector == Some(fresh_vector(&foo_as_indexed())),
         "a vector, if any, is one of core's text"
     );
+}
+
+// --- owed files: what a per-file pass did not finish ------------------------
+
+const OWED_A: &str = "src/a.rs";
+const OWED_B: &str = "src/b.rs";
+const OWED_C: &str = "src/c.rs";
+
+/// A project root holding `a.rs`, `b.rs` and `c.rs`, and an index with `rust`
+/// pending and all three files pending, as a workspace reindex swap leaves it.
+fn owed_fixture() -> (tempfile::TempDir, IndexStore) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    for file in [OWED_A, OWED_B, OWED_C] {
+        std::fs::write(root.path().join(file), "").unwrap();
+    }
+    let conn = setup_conn();
+    conn.execute_batch(
+        "INSERT INTO semantic_pending (language, since) VALUES ('rust', '2026-09-26T10:14:03Z');
+         INSERT INTO semantic_pending_files (language, filePath)
+             VALUES ('rust', 'src/a.rs'), ('rust', 'src/b.rs'), ('rust', 'src/c.rs');",
+    )
+    .unwrap();
+    (root, IndexStore::new(conn))
+}
+
+/// Edits `file`: core reparses it (the stub answers an empty diff) and sends
+/// its per-file pass, which the stub answers with `incomplete` and
+/// `unfinished`. Returns the files the pass was sent.
+fn edit_and_pass(
+    conn: &IndexStore,
+    root: &std::path::Path,
+    file: &str,
+    incomplete: bool,
+    unfinished: Option<&[&str]>,
+) -> Vec<String> {
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, mut plugin_writer) = std::io::pipe().unwrap();
+    let unfinished: Option<Vec<String>> =
+        unfinished.map(|files| files.iter().map(|file| file.to_string()).collect());
+    let plugin = std::thread::spawn(move || {
+        let mut plugin_reader = BufReader::new(plugin_reader);
+        let request: ControlEnvelope = read_message(&mut plugin_reader).unwrap().unwrap();
+        assert!(matches!(request.message, ControlMessage::FileChanged { .. }), "{:?}", request.message);
+        let reparse = FileChangeResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: request.id.expect("a reparse expects an answer"),
+            result: FileChangeDiff::default(),
+            incomplete: false,
+            incomplete_reason: None,
+            unfinished_files: None,
+        };
+        write_message(&mut plugin_writer, &reparse).unwrap();
+
+        let request: ControlEnvelope = read_message(&mut plugin_reader).unwrap().unwrap();
+        let ControlMessage::SemanticPass { file_paths, .. } = request.message else {
+            panic!("expected SemanticPass, got {:?}", request.message);
+        };
+        let pass = FileChangeResponse {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: request.id.expect("a semantic pass expects an answer"),
+            result: FileChangeDiff::default(),
+            incomplete,
+            incomplete_reason: None,
+            unfinished_files: unfinished,
+        };
+        write_message(&mut plugin_writer, &pass).unwrap();
+        file_paths
+    });
+
+    apply_file_change(
+        &mut BufReader::new(core_reader),
+        &mut core_writer,
+        conn,
+        root,
+        "rust",
+        file,
+        RequestId::Number(1),
+        &EmbeddingPipeline::disabled(),
+        TEST_TIMEOUT,
+        TEST_TIMEOUT,
+        true,
+        &mut on_timeout_must_not_fire,
+    )
+    .unwrap();
+    plugin.join().unwrap()
+}
+
+/// `rust`'s owed rows, `(filePath, attempts)` in path order.
+fn owed_rows(conn: &IndexStore) -> Vec<(String, i64)> {
+    conn.with(|conn| {
+        conn.prepare(
+            "SELECT filePath, attempts FROM semantic_owed_files WHERE language = 'rust' ORDER BY filePath",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    })
+}
+
+fn strings(files: &[&str]) -> Vec<String> {
+    files.iter().map(|file| file.to_string()).collect()
+}
+
+/// The acceptance case. `a.rs`'s pass leaves it unfinished, so it stays
+/// pending and is owed; the next per-file pass, for `b.rs`, is sent `a.rs`
+/// too, finishes both, and both are then no longer pending or owed.
+///
+/// Control: send no owed files from `apply_file_change_in` - the second pass
+/// is sent `b.rs` alone and `a.rs` stays pending.
+#[test]
+fn an_owed_file_a_later_per_file_pass_finishes_is_no_longer_pending() {
+    let (root, conn) = owed_fixture();
+
+    assert_eq!(edit_and_pass(&conn, root.path(), OWED_A, false, Some(&[OWED_A])), strings(&[OWED_A]));
+    assert_eq!(pending_state(&conn), (1, strings(&[OWED_A, OWED_B, OWED_C])));
+    assert_eq!(owed_rows(&conn), vec![(OWED_A.to_string(), 1)]);
+
+    assert_eq!(edit_and_pass(&conn, root.path(), OWED_B, false, Some(&[])), strings(&[OWED_B, OWED_A]));
+    assert_eq!(pending_state(&conn), (1, strings(&[OWED_C])));
+    assert!(owed_rows(&conn).is_empty());
+}
+
+/// A list settles exactly the files sent less the files it names, whatever
+/// `incomplete` says: a requested file named unfinished stays pending and is
+/// owed although the pass called itself complete, an owed file the pass
+/// finished is settled although the pass called itself incomplete, and a
+/// named file the pass was not sent is ignored.
+///
+/// Controls: clear the requested files instead of `sent - unfinished`
+/// (`a.rs` is cleared by the first pass); keep the named files outside the
+/// scope sent (`c.rs` becomes owed).
+#[test]
+fn a_list_settles_exactly_the_sent_files_it_does_not_name() {
+    let (root, conn) = owed_fixture();
+
+    edit_and_pass(&conn, root.path(), OWED_A, false, Some(&[OWED_A, OWED_C]));
+    assert_eq!(pending_state(&conn), (1, strings(&[OWED_A, OWED_B, OWED_C])), "a.rs is not finished");
+    assert_eq!(owed_rows(&conn), vec![(OWED_A.to_string(), 1)], "c.rs was not sent, so it is not owed");
+
+    assert_eq!(edit_and_pass(&conn, root.path(), OWED_B, true, Some(&[OWED_B])), strings(&[OWED_B, OWED_A]));
+    assert_eq!(pending_state(&conn), (1, strings(&[OWED_B, OWED_C])), "a.rs is finished, b.rs is not");
+    assert_eq!(owed_rows(&conn), vec![(OWED_B.to_string(), 1)]);
+}
+
+/// An owed file is tried by at most `MAX_OWED_ATTEMPTS` passes, counting the
+/// one it was sent with; then it is dropped (still pending) and rides along no
+/// more. An edit makes it a requested file again and restarts its count.
+///
+/// Control: never drop a row at the cap - the row survives with
+/// `MAX_OWED_ATTEMPTS` attempts and is sent again.
+#[test]
+fn an_owed_file_is_dropped_after_its_last_attempt_and_an_edit_restarts_its_count() {
+    let (root, conn) = owed_fixture();
+
+    edit_and_pass(&conn, root.path(), OWED_A, false, Some(&[OWED_A]));
+    assert_eq!(owed_rows(&conn), vec![(OWED_A.to_string(), 1)]);
+    for attempts in 2..schema::MAX_OWED_ATTEMPTS {
+        assert_eq!(
+            edit_and_pass(&conn, root.path(), OWED_B, false, Some(&[OWED_A])),
+            strings(&[OWED_B, OWED_A])
+        );
+        assert_eq!(owed_rows(&conn), vec![(OWED_A.to_string(), attempts)]);
+    }
+    edit_and_pass(&conn, root.path(), OWED_B, false, Some(&[OWED_A]));
+    assert!(owed_rows(&conn).is_empty(), "the last attempt drops the row");
+    assert_eq!(pending_state(&conn), (1, strings(&[OWED_A, OWED_C])), "a dropped file is still pending");
+    assert_eq!(edit_and_pass(&conn, root.path(), OWED_B, false, Some(&[])), strings(&[OWED_B]));
+
+    edit_and_pass(&conn, root.path(), OWED_A, false, Some(&[OWED_A]));
+    edit_and_pass(&conn, root.path(), OWED_B, false, Some(&[OWED_A]));
+    assert_eq!(owed_rows(&conn), vec![(OWED_A.to_string(), 2)]);
+    edit_and_pass(&conn, root.path(), OWED_A, false, Some(&[OWED_A]));
+    assert_eq!(owed_rows(&conn), vec![(OWED_A.to_string(), 1)], "an edit restarts the count");
+}
+
+/// A plugin that does not send the list (one written before it) keeps the
+/// behaviour from before: a complete per-file pass clears only the file it
+/// was requested for - not the owed file sent beside it - and an incomplete
+/// one clears nothing; the owed rows are left as they were.
+///
+/// Control: read an absent list as an empty one - the complete pass clears
+/// `c.rs` and settles its owed row.
+#[test]
+fn a_pass_without_the_list_keeps_the_behaviour_from_before_it() {
+    let (root, conn) = owed_fixture();
+    edit_and_pass(&conn, root.path(), OWED_C, false, Some(&[OWED_C]));
+    assert_eq!(owed_rows(&conn), vec![(OWED_C.to_string(), 1)]);
+
+    assert_eq!(edit_and_pass(&conn, root.path(), OWED_A, false, None), strings(&[OWED_A, OWED_C]));
+    assert_eq!(pending_state(&conn), (1, strings(&[OWED_B, OWED_C])));
+    assert_eq!(owed_rows(&conn), vec![(OWED_C.to_string(), 1)]);
+
+    assert_eq!(edit_and_pass(&conn, root.path(), OWED_B, true, None), strings(&[OWED_B, OWED_C]));
+    assert_eq!(pending_state(&conn), (1, strings(&[OWED_B, OWED_C])));
+    assert_eq!(owed_rows(&conn), vec![(OWED_C.to_string(), 1)]);
+}
+
+/// A whole-project pass asks about every file anyway, so it is sent no list,
+/// owed files or not.
+#[test]
+fn a_whole_project_pass_is_sent_no_owed_files() {
+    let (_root, conn) = owed_fixture();
+    conn.with(|conn| {
+        conn.execute(
+            "INSERT INTO semantic_owed_files (language, filePath, attempts) VALUES ('rust', 'src/a.rs', 1)",
+            [],
+        )
+        .unwrap()
+    });
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+    let plugin =
+        spawn_semantic_stub(plugin_reader, plugin_writer, Vec::new(), FileChangeDiff::default(), false, None);
+
+    apply_semantic_pass(
+        &mut BufReader::new(core_reader),
+        &mut core_writer,
+        &conn,
+        "rust",
+        None,
+        Vec::new(),
+        RequestId::Number(1),
+        &EmbeddingPipeline::disabled(),
+        TEST_TIMEOUT,
+        &mut on_timeout_must_not_fire,
+    )
+    .unwrap();
+    plugin.join().unwrap();
 }

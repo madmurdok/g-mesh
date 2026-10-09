@@ -719,6 +719,17 @@ pub struct FileChangeResponse {
     /// means the plugin gave no reason, and core records a generic one.
     #[serde(rename = "incompleteReason", default, skip_serializing_if = "Option::is_none")]
     pub incomplete_reason: Option<String>,
+    /// **`semanticPass` only:** the files of this pass's scope it did not
+    /// finish. Absent = unknown, and core keeps its behaviour from
+    /// before this field (a complete per-file pass settles the files it sent,
+    /// an incomplete one settles none); present and empty = every file in
+    /// scope finished. Read whatever [`Self::incomplete`] says, so a per-file
+    /// pass can name its unfinished files without core logging it as
+    /// incomplete. Core keeps the named files and puts them into the scope of
+    /// the next per-file pass itself, so `sent - unfinishedFiles` is exactly
+    /// what a pass settled.
+    #[serde(rename = "unfinishedFiles", default, skip_serializing_if = "Option::is_none")]
+    pub unfinished_files: Option<Vec<String>>,
 }
 
 /// `skip_serializing_if` for a `bool` that is absent-means-false on the wire.
@@ -1237,6 +1248,7 @@ mod tests {
             result: FileChangeDiff::default(),
             incomplete: false,
             incomplete_reason: None,
+            unfinished_files: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1268,6 +1280,29 @@ mod tests {
         let parsed: FileChangeResponse = serde_json::from_str(reasoned).unwrap();
         assert_eq!(parsed.incomplete_reason.as_deref(), Some("server exited"));
         assert!(serde_json::to_string(&parsed).unwrap().contains("\"incompleteReason\":\"server exited\""));
+    }
+
+    /// `unfinishedFiles` is optional both ways. Absent reads as
+    /// `None` (a plugin written before the field), `None` is not written, and
+    /// an empty and a non-empty list each survive a round trip as written -
+    /// an empty list ("every file finished") must not collapse into `None`
+    /// ("the plugin did not say").
+    #[test]
+    fn unfinished_files_is_omitted_when_absent_and_round_trips_when_present() {
+        let without = r#"{"jsonrpc":"2.0","id":7,"result":{}}"#;
+        let parsed: FileChangeResponse = serde_json::from_str(without).unwrap();
+        assert_eq!(parsed.unfinished_files, None);
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(!json.contains("unfinishedFiles"), "None is not written: {json}");
+
+        for files in [Vec::new(), vec!["a.rs".to_string()]] {
+            let response = FileChangeResponse { unfinished_files: Some(files.clone()), ..parsed.clone() };
+            let json = serde_json::to_string(&response).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["unfinishedFiles"], serde_json::json!(files), "{json}");
+            let round_tripped: FileChangeResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped.unfinished_files, Some(files));
+        }
     }
 
     #[test]
