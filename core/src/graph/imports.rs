@@ -1061,4 +1061,43 @@ mod tests {
         assert_eq!(edge_target(&conn, &edge_b).0, crate::graph::containers::container_id("go", "pkg/b"));
         assert_ne!(edge_target(&conn, &edge_a).0, edge_target(&conn, &edge_b).0);
     }
+
+    /// Linking repoints an `IMPORTS` edge onto its target and keeps
+    /// the edge's `specifier`, so a specifier selector still finds the
+    /// importer once the edge is linked.
+    #[test]
+    fn linking_an_import_keeps_its_specifier() {
+        let mut conn = setup();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![file_node("src/index.ts"), file_node("packages/math/index.ts")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let placeholder = placeholder_node(
+            "src/index.ts",
+            "packages/math/index.ts",
+            RESOLVED_MODULE_NATIVE_KIND,
+            Some(file_target("packages/math/index.ts")),
+            "typescript",
+        );
+        let mut edge = import_edge("src/index.ts", &placeholder);
+        edge.specifier = Some("@app/math".to_string());
+        let edge_id = edge.id.clone();
+        apply_diff(
+            &mut conn,
+            &Diff { upsert_nodes: vec![placeholder], upsert_edges: vec![edge], ..Default::default() },
+        )
+        .unwrap();
+
+        link_all(&mut conn).unwrap();
+
+        assert_eq!(edge_target(&conn, &edge_id).0, "file:packages/math/index.ts", "the edge was linked");
+        let specifier: Option<String> = conn
+            .query_row("SELECT specifier FROM edges WHERE id = ?1", params![edge_id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(specifier.as_deref(), Some("@app/math"));
+    }
 }

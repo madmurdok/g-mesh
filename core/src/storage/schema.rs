@@ -83,7 +83,11 @@ use crate::languages::LanguageOutcome;
 /// "13" adds the `language_outcome` table (ADR 0021). An empty table reads as
 /// "every language covered", so an existing index is rebuilt rather than left
 /// claiming that until its next walk.
-pub const CURRENT_SCHEMA_VERSION: &str = "13";
+///
+/// "14" adds `edges.specifier` and the `resolution_facts` table. An existing
+/// index holds no specifiers on its linked imports and no facts, so it is
+/// rebuilt.
+pub const CURRENT_SCHEMA_VERSION: &str = "14";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -300,7 +304,8 @@ CREATE TABLE IF NOT EXISTS edges (
     engine        TEXT NOT NULL,
     resolved      INTEGER NOT NULL DEFAULT 0,
     toDeclaration INTEGER,
-    linkedFrom    TEXT
+    linkedFrom    TEXT,
+    specifier     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_edges_fromId ON edges(fromId);
@@ -593,6 +598,16 @@ CREATE TABLE IF NOT EXISTS semantic_owed_files (
     filePath TEXT NOT NULL,
     attempts INTEGER NOT NULL,
     PRIMARY KEY (language, filePath)
+);
+
+-- The opaque resolution facts a `resolution_delta` plugin reported with the
+-- rows this index holds for `language` (daemon::config_reindex): written by
+-- its bulk walk's trailer, swapped in with the language's rows, and replaced
+-- once a `resolutionChanged` answer has been acted on. No row: the next
+-- watch-file edit reindexes the whole language.
+CREATE TABLE IF NOT EXISTS resolution_facts (
+    language TEXT PRIMARY KEY,
+    facts    TEXT NOT NULL
 );
 
 -- One row per language whose last whole-project semantic pass was incomplete
@@ -989,6 +1004,28 @@ pub fn mark_pending_reindex(conn: &Connection, language: &str, trigger: &str) ->
         params![language, trigger],
     )
     .with_context(|| format!("failed to mark {language}'s workspace reindex as pending"))?;
+    Ok(())
+}
+
+/// The resolution facts stored for `language`, `None` when there are none.
+pub fn resolution_facts(conn: &Connection, language: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT facts FROM resolution_facts WHERE language = ?1", params![language], |row| {
+        row.get(0)
+    })
+    .optional()
+    .with_context(|| format!("failed to read {language}'s resolution facts"))
+}
+
+/// Replaces `language`'s resolution facts; `None` deletes them.
+pub fn set_resolution_facts(conn: &Connection, language: &str, facts: Option<&str>) -> Result<()> {
+    match facts {
+        Some(facts) => conn.execute(
+            "INSERT OR REPLACE INTO resolution_facts (language, facts) VALUES (?1, ?2)",
+            params![language, facts],
+        ),
+        None => conn.execute("DELETE FROM resolution_facts WHERE language = ?1", params![language]),
+    }
+    .with_context(|| format!("failed to store {language}'s resolution facts"))?;
     Ok(())
 }
 
@@ -1657,7 +1694,8 @@ fn wipe(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS language_state; DROP TABLE IF EXISTS pending_reindex; \
          DROP TABLE IF EXISTS semantic_pending; DROP TABLE IF EXISTS semantic_pending_files; \
          DROP TABLE IF EXISTS semantic_owed_files; DROP TABLE IF EXISTS semantic_residual; \
-         DROP TABLE IF EXISTS semantic_gap_files; DROP TABLE IF EXISTS language_outcome;",
+         DROP TABLE IF EXISTS semantic_gap_files; DROP TABLE IF EXISTS language_outcome; \
+         DROP TABLE IF EXISTS resolution_facts;",
     )
     .context("failed to wipe schema")
 }

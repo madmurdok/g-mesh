@@ -56,8 +56,10 @@
 //! Sent (`PluginProcess::notify_workspace_changed`) only when this language's
 //! supervisor is awake: nothing is woken just to be told to drop a cache it
 //! does not have. A language reaches this module through a non-empty
-//! `watch_files` or, for any language, through a `.gitignore` change that
-//! altered its indexed files (`PluginRegistry::gitignore_changed`, GM-508).
+//! `watch_files` (directly, or, for a manifest declaring `resolution_delta`
+//! such as the bundled TS plugin, as `daemon::config_reindex`'s fallback) or,
+//! for any language, through a `.gitignore` change that altered its indexed
+//! files (`PluginRegistry::gitignore_changed`, GM-508).
 //!
 //! # Debounce
 //!
@@ -1066,6 +1068,7 @@ mod tests {
             engine: "tree-sitter".to_string(),
             resolved: true,
             to_declaration: None,
+            specifier: None,
         }
     }
 

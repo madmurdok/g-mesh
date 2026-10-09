@@ -65,7 +65,7 @@ use g_mesh_plugin_sdk::testing::{CheckOutcome, PluginCheck, Verdict};
 /// asserted as a set so a check dropping out of the report (this crate's
 /// own regression, not a plugin defect) fails loudly rather than shrinking
 /// the loop below silently.
-const ALL_CHECKS: [&str; 16] = [
+const ALL_CHECKS: [&str; 17] = [
     "session",
     "shape",
     "stream-order",
@@ -82,7 +82,12 @@ const ALL_CHECKS: [&str; 16] = [
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
     "capabilities.files-created-resolves",
+    RESOLUTION_DELTA,
 ];
+
+/// GM-509's check: run only for a manifest declaring `resolution_delta`,
+/// which the kit's generated manifest never does, so it reports `SKIP` here.
+const RESOLUTION_DELTA: &str = "capabilities.resolution-delta-version-bump";
 
 /// The two capability checks are each other's alternative: exactly one
 /// applies to a given manifest, and the other reports `Skip`. Which one runs
@@ -99,7 +104,11 @@ const CAPABILITY_CHECKS: [&str; 2] =
 const FILES_CREATED: &str = "capabilities.files-created-resolves";
 
 fn always_pass() -> Vec<&'static str> {
-    ALL_CHECKS.iter().copied().filter(|id| !CAPABILITY_CHECKS.contains(id) && *id != FILES_CREATED).collect()
+    ALL_CHECKS
+        .iter()
+        .copied()
+        .filter(|id| !CAPABILITY_CHECKS.contains(id) && *id != FILES_CREATED && *id != RESOLUTION_DELTA)
+        .collect()
 }
 
 const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.toml");

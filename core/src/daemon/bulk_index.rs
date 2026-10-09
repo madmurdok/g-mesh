@@ -319,7 +319,7 @@ fn purge_language(conn: &IndexStore, language: &str) -> Result<()> {
             let mut diff = Diff::default();
             store.apply_file_diff_linked(&mut diff, path, FileScope::Gone, "purge a failed language")?;
         }
-        Ok(())
+        store.step(|conn| schema::set_resolution_facts(conn, language, None))
     })
 }
 
@@ -397,13 +397,16 @@ fn walk_one_language_in(
 
     let stdout = child.stdout.take().context("bulk-index plugin process has no stdout")?;
 
-    if let Err(err) = ingest_in(BufReader::new(stdout), store, ctx) {
-        // Nobody will read the rest of this walk: a plugin left writing into
-        // an undrained pipe would otherwise outlive the failure.
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(err);
-    }
+    let facts = match ingest_in(BufReader::new(stdout), store, ctx) {
+        Ok(facts) => facts,
+        Err(err) => {
+            // Nobody will read the rest of this walk: a plugin left writing
+            // into an undrained pipe would otherwise outlive the failure.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
 
     let status = child.wait().context("failed to wait for the bulk-index plugin process")?;
     if !status.success() {
@@ -425,6 +428,11 @@ fn walk_one_language_in(
             )
         })
         .with_context(|| format!("failed to record that {} was bulk-indexed", manifest.language))?;
+    // The facts describe the rows this walk wrote; a walk without a trailer
+    // leaves none, so no stale facts outlive it.
+    store
+        .step(|conn| schema::set_resolution_facts(conn, &manifest.language, facts.as_deref()))
+        .with_context(|| format!("failed to store {}'s resolution facts", manifest.language))?;
 
     Ok(())
 }
@@ -469,13 +477,19 @@ fn hold_the_walk_open_for_tests() {
 /// `linked_symbols` are [`run`]'s, computed once after every language.
 pub(crate) fn ingest<R: BufRead>(reader: R, ctx: &mut WalkContext<'_>) -> Result<()> {
     let store = ctx.store;
-    store.unit(Unit::BulkWalk, |store| ingest_in(reader, store, ctx))
+    store.unit(Unit::BulkWalk, |store| ingest_in(reader, store, ctx).map(|_facts| ()))
 }
 
-fn ingest_in<R: BufRead>(reader: R, store: &mut Writer<'_>, ctx: &mut WalkContext<'_>) -> Result<()> {
+/// Returns the stream's `resolutionFacts`, the last one when it has several.
+fn ingest_in<R: BufRead>(
+    reader: R,
+    store: &mut Writer<'_>,
+    ctx: &mut WalkContext<'_>,
+) -> Result<Option<String>> {
     let mut batch = Diff::default();
     let mut batched = 0usize;
     let mut path_warnings = PathWarnings::default();
+    let mut facts = None;
 
     for item in NdjsonReader::new(reader) {
         match item {
@@ -495,6 +509,10 @@ fn ingest_in<R: BufRead>(reader: R, store: &mut Writer<'_>, ctx: &mut WalkContex
             Ok(BulkItem::Edge(edge)) => {
                 batch.upsert_edges.push(to_edge_record(edge));
                 ctx.summary.edges += 1;
+            }
+            Ok(BulkItem::ResolutionFacts(line)) => {
+                facts = Some(line);
+                continue;
             }
             Err(err) => {
                 // A read failure (a broken pipe, say) repeats on every next
@@ -520,7 +538,7 @@ fn ingest_in<R: BufRead>(reader: R, store: &mut Writer<'_>, ctx: &mut WalkContex
     }
 
     commit(store, &mut batch, ctx)?;
-    Ok(())
+    Ok(facts)
 }
 
 /// Commits one batch and empties it. Embedding inference runs first, outside
@@ -605,6 +623,7 @@ mod tests {
             engine: "tree-sitter".to_string(),
             resolved: false,
             to_declaration: None,
+            specifier: None,
         })
         .unwrap()
     }

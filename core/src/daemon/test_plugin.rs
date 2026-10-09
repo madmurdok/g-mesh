@@ -117,6 +117,11 @@ const FRAME_LOG: &str = "frames.log";
 /// [`set_semantic_pass_answer`].
 const SEMANTIC_ANSWER: &str = "semantic-pass.json";
 
+/// Makes the plugin in this directory answer every `resolutionChanged` with
+/// its contents as the `result` (a `ResolutionChangedResult` as JSON),
+/// instead of an `unknown` delta. See [`set_resolution_changed_answer`].
+const RESOLUTION_ANSWER: &str = "resolution-changed.json";
+
 /// A plugin directory holding this file sets its fields on every
 /// `semanticPass` answer. See [`set_semantic_pass_fields`].
 const SEMANTIC_FIELDS: &str = "semantic-pass-fields.json";
@@ -395,6 +400,37 @@ pub(crate) fn set_semantic_pass_answer(plugin_dir: &Path, diff: Option<&str>) {
     let path = plugin_dir.join(SEMANTIC_ANSWER);
     match diff {
         Some(diff) => fs::write(&path, diff).expect("failed to write the fake plugin's semantic answer"),
+        None => {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Adds `resolution_delta = true` to any fake plugin's
+/// `[plugin.capabilities]`, adding the table if the manifest has none. Takes
+/// effect at the next `discover`.
+pub(crate) fn declare_resolution_delta(plugin_dir: &Path) {
+    let path = plugin_dir.join("plugin.toml");
+    let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
+    let table = "[plugin.capabilities]\n";
+    let declared = if manifest.contains(table) {
+        manifest.replace(table, &format!("{table}resolution_delta = true\n"))
+    } else {
+        format!("{manifest}\n{table}resolution_delta = true\n")
+    };
+    fs::write(&path, declared).expect("failed to write the fake plugin's manifest");
+}
+
+/// Makes every later `resolutionChanged` to the plugin in `plugin_dir` answer
+/// with `result` (a `ResolutionChangedResult` as JSON), or, with `None`, with
+/// an `unknown` delta again. Read per request, so it takes effect without a
+/// respawn.
+pub(crate) fn set_resolution_changed_answer(plugin_dir: &Path, result: Option<&str>) {
+    let path = plugin_dir.join(RESOLUTION_ANSWER);
+    match result {
+        Some(result) => {
+            fs::write(&path, result).expect("failed to write the fake plugin's resolution answer")
+        }
         None => {
             let _ = fs::remove_file(&path);
         }

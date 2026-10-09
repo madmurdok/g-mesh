@@ -895,6 +895,7 @@ built fixture exercising individual defects lives under
 | `capabilities.semantic-pass-undeclared` | (`semantic_pass = false`) never be sent `semanticPass`, and never start a semantic engine |
 | `capabilities.semantic-engine-lazy` | (`semantic_pass = true`) not start its semantic engine before the first `semanticPass` |
 | `capabilities.files-created-resolves` | (`files_created = true`) after a `filesCreated` notification for a new importer and its new target, routed importer first, link the importer's `IMPORTS` edge to the target (or to a container holding it); needs a `[files_created]` table in `--expect`, otherwise `SKIP` |
+| `capabilities.resolution-delta-version-bump` | (`resolution_delta = true`) end bulk run 1 with a `resolutionFacts` line, and answer `unchanged` to `resolutionChanged` for a fixture watch file whose only change is its top-level `version` (the shallowest watch file that parses as a JSON object, e.g. `package.json`); `SKIP` when the fixture has none |
 
 `semanticPass` diffs may cross files — a semantic answer legitimately points
 an edge at another file's node — so the stream-order, same-file and

@@ -103,6 +103,14 @@
 //!   module key). A plugin that ignores the notification resolves the
 //!   import against a file set without the target, and the edge lands on an
 //!   `external_module` instead (GM-516).
+//! - **`capabilities.resolution-delta-version-bump`** (only for
+//!   `resolution_delta = true`) - a fixture watch file whose only change is
+//!   its top-level `version` (`session::choose_version_bump` has the rule),
+//!   sent as one `resolutionChanged` with bulk run 1's `resolutionFacts` on a
+//!   fresh plugin process (`session::run_resolution_delta_session`), answers
+//!   `unchanged`. Anything else re-extracts importers, or the whole
+//!   language, on every release bump (GM-509). Bulk run 1 ending without a
+//!   `resolutionFacts` line fails it too: the capability promises one.
 //!
 //! # Why `semanticPass` diffs are held to fewer rules
 //!
@@ -127,7 +135,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::cli::plugin_check::expectations::FilesCreatedPair;
 use crate::cli::plugin_check::report::{CheckResult, Outcome};
 use crate::cli::plugin_check::session::{
-    BulkLine, BulkRun, EditTarget, Exchange, FilesCreatedRun, Method, Session, StoredRange,
+    BulkLine, BulkRun, EditTarget, Exchange, FilesCreatedRun, Method, ResolutionDeltaRun, Session,
+    StoredRange, VersionBump,
 };
 use crate::daemon::manifest::PluginManifest;
 use crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND;
@@ -136,7 +145,7 @@ use crate::protocol::conformance::{
     untyped_calls_violation, PLACEHOLDER_NATIVE_KINDS,
 };
 use crate::protocol::ndjson::BulkItem;
-use crate::protocol::types::{EdgeKind, FileChangeDiff, NodeKind, WireEdge, WireNode};
+use crate::protocol::types::{EdgeKind, FileChangeDiff, NodeKind, ResolutionDelta, WireEdge, WireNode};
 
 /// An `external_module` node is not one of core's placeholder kinds - core
 /// stores it as an ordinary `Module` row and never links it - but that is
@@ -164,6 +173,22 @@ pub(crate) struct RunData<'a> {
     pub failures: Vec<String>,
     pub marker_exists_at_end: bool,
     pub files_created: FilesCreatedEvidence<'a>,
+    pub resolution_delta: ResolutionDeltaEvidence<'a>,
+}
+
+/// `capabilities.resolution-delta-version-bump`'s evidence, as `mod.rs`
+/// found it.
+pub(crate) enum ResolutionDeltaEvidence<'a> {
+    /// Not declared, or bulk run 1 did not complete.
+    NotRun,
+    /// No fixture watch file a version bump is defined for.
+    NoWatchFile,
+    /// Bulk run 1 wrote no `resolutionFacts` line.
+    NoFacts,
+    Ran {
+        bump: &'a VersionBump,
+        run: &'a ResolutionDeltaRun,
+    },
 }
 
 /// Where the `[files_created]` pair came from, as `mod.rs` found it.
@@ -285,6 +310,7 @@ pub(crate) fn evaluate(run: &RunData) -> Vec<CheckResult> {
     ];
     results.extend(capabilities(run));
     results.push(files_created_resolves(run));
+    results.push(resolution_delta_version_bump(run));
     results
 }
 
@@ -348,7 +374,7 @@ fn shape(run: &RunData, answered: &[(String, &FileChangeDiff)]) -> CheckResult {
                         findings.push(format!("bulk run 1, NDJSON line {}: {message}", line.line_no));
                     }
                 }
-                Ok(BulkItem::Edge(_)) => {}
+                Ok(BulkItem::Edge(_) | BulkItem::ResolutionFacts(_)) => {}
             }
         }
     }
@@ -511,7 +537,7 @@ fn bulk_ids(lines: &[BulkLine]) -> (BTreeSet<&str>, BTreeSet<&str>) {
             Ok(BulkItem::Edge(edge)) => {
                 edges.insert(edge.id.as_str());
             }
-            Err(_) => {}
+            Ok(BulkItem::ResolutionFacts(_)) | Err(_) => {}
         }
     }
     (nodes, edges)
@@ -1012,6 +1038,71 @@ fn files_created_resolves(run: &RunData) -> CheckResult {
     result(ID, Outcome::Fail(findings))
 }
 
+/// `capabilities.resolution-delta-version-bump` - see the module doc. The
+/// outcome table, in evaluation order: not declared, bulk run 1 incomplete,
+/// no qualifying watch file, no facts trailer, the session failed, then the
+/// verdict on the answered delta.
+fn resolution_delta_version_bump(run: &RunData) -> CheckResult {
+    const ID: &str = "capabilities.resolution-delta-version-bump";
+    if !run.manifest.capabilities.resolution_delta {
+        return result(
+            ID,
+            Outcome::Skip("not applicable: the manifest declares resolution_delta = false".to_string()),
+        );
+    }
+    if !run.bulk[0].complete() {
+        return result(ID, Outcome::Skip(BULK_INCOMPLETE.to_string()));
+    }
+    let (bump, delta_run) = match &run.resolution_delta {
+        ResolutionDeltaEvidence::NotRun => {
+            return result(ID, not_reached("the resolution-delta session ran"))
+        }
+        ResolutionDeltaEvidence::NoWatchFile => {
+            return result(
+                ID,
+                Outcome::Skip(
+                    "not configured: the fixture has no watch file (the manifest's watch_files) that parses as a \
+                     JSON object with a string or absent top-level `version` - the one shape a version bump is \
+                     defined for"
+                        .to_string(),
+                ),
+            );
+        }
+        ResolutionDeltaEvidence::NoFacts => {
+            return result(
+                ID,
+                Outcome::Fail(vec![
+                    "bulk run 1 ended without a resolutionFacts line although the manifest declares \
+                     resolution_delta = true"
+                        .to_string(),
+                ]),
+            );
+        }
+        ResolutionDeltaEvidence::Ran { bump, run } => (bump, run),
+    };
+    let Some(answer) = delta_run.result.as_ref().filter(|_| delta_run.session.failure.is_none()) else {
+        return result(
+            ID,
+            Outcome::Skip("not reached: the resolution-delta session failed (see `session`)".to_string()),
+        );
+    };
+    let edit = format!("{}: an edit whose only change is the top-level `version`", bump.file_path);
+    let finding = match &answer.delta {
+        ResolutionDelta::Unchanged => return result(ID, Outcome::Pass),
+        ResolutionDelta::Unknown { reason } => {
+            format!(
+                "{edit} answered unknown ({reason}) instead of unchanged - core reindexes the whole language"
+            )
+        }
+        ResolutionDelta::Affected { files, imports } => format!(
+            "{edit} answered affected ({} file scope(s), {} import selector(s)) instead of unchanged",
+            files.len(),
+            imports.len()
+        ),
+    };
+    result(ID, Outcome::Fail(vec![finding]))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1093,6 +1184,7 @@ mod tests {
             failures: Vec::new(),
             marker_exists_at_end: false,
             files_created: FilesCreatedEvidence::absent(),
+            resolution_delta: ResolutionDeltaEvidence::NotRun,
         })
     }
 
@@ -1170,6 +1262,7 @@ mod tests {
             failures: Vec::new(),
             marker_exists_at_end: false,
             files_created: FilesCreatedEvidence::absent(),
+            resolution_delta: ResolutionDeltaEvidence::NotRun,
         };
         let results = evaluate(&data);
         assert!(matches!(outcome_of(&results, "capabilities.semantic-pass-undeclared"), Outcome::Fail(_)));
@@ -1190,6 +1283,7 @@ mod tests {
             failures: Vec::new(),
             marker_exists_at_end,
             files_created: FilesCreatedEvidence::absent(),
+            resolution_delta: ResolutionDeltaEvidence::NotRun,
         };
         let lazy = |data: RunData| outcome_of(&evaluate(&data), "capabilities.semantic-engine-lazy");
         assert!(matches!(lazy(data(false)), Outcome::Skip(reason) if reason.starts_with("not instrumented")));
@@ -1279,6 +1373,7 @@ mod tests {
                 failures: Vec::new(),
                 marker_exists_at_end: false,
                 files_created: FilesCreatedEvidence::absent(),
+                resolution_delta: ResolutionDeltaEvidence::NotRun,
             };
             outcome_of(&evaluate(&data), "id-stability.declaration-edit-applies")
         };
@@ -1368,6 +1463,7 @@ mod tests {
             failures: Vec::new(),
             marker_exists_at_end: false,
             files_created,
+            resolution_delta: ResolutionDeltaEvidence::NotRun,
         };
         outcome_of(&evaluate(&data), FILES_CREATED)
     }

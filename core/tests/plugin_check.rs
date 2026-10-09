@@ -81,7 +81,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// Every check id the kit reports, in report order - asserted in full on
 /// every run, so a check silently dropping out of the report fails a test
 /// rather than passing every "only X fails" assertion vacuously.
-const ALL_CHECKS: [&str; 16] = [
+const ALL_CHECKS: [&str; 17] = [
     "session",
     "shape",
     "stream-order",
@@ -98,7 +98,12 @@ const ALL_CHECKS: [&str; 16] = [
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
     "capabilities.files-created-resolves",
+    RESOLUTION_DELTA,
 ];
+
+/// Run only for a manifest declaring `resolution_delta` (the TS plugin's
+/// does); every other plugin here reports it `SKIP`.
+const RESOLUTION_DELTA: &str = "capabilities.resolution-delta-version-bump";
 
 /// The checks that report `SKIP` on a plugin declaring `semantic_pass =
 /// true` run without an `--expect` pair: the undeclared-pass check does not
@@ -291,7 +296,8 @@ fn the_conformant_fake_passes_every_check() {
     let run = run_check(&fake.dir, &fixture, &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
+        let skipped = SKIPPED_WITHOUT_PAIR.contains(&id) || id == RESOLUTION_DELTA;
+        let expected = if skipped { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     assert!(!run.stdout.contains("WARN"), "a v2-speaking plugin gets no legacy warning:\n{}", run.stdout);
@@ -620,7 +626,8 @@ fn the_go_plugin_passes_on_its_own_fixture() {
     let run = run_check(&go_plugin_dir(), &go_conformance_project(), &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
+        let skipped = SKIPPED_WITHOUT_PAIR.contains(&id) || id == RESOLUTION_DELTA;
+        let expected = if skipped { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     assert!(!run.stdout.contains("WARN"), "{}", run.stdout);
@@ -1333,7 +1340,8 @@ fn a_declaring_fake_resolves_an_importer_created_with_its_target() {
     let run = run_files_created("none", true, &fixture, FK_PAIR);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
+        let skipped = id == "capabilities.semantic-pass-undeclared" || id == RESOLUTION_DELTA;
+        let expected = if skipped { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     assert_eq!(run.outcome("expectations.file"), "PASS", "{}", run.stdout);
@@ -1510,4 +1518,96 @@ fn an_unknown_files_created_key_is_a_parse_error() {
     assert!(run.stdout.contains("bogus_field") && run.stdout.contains("unknown field"), "{}", run.stdout);
     assert_eq!(run.outcome(FILES_CREATED), "SKIP", "{}", run.stdout);
     assert_no_files_created_session(&run);
+}
+
+/// The TS plugin's manifest as shipped (`resolution_delta = true`) but with
+/// `semantic_pass` off, so no language server is involved, in a directory
+/// named after its language.
+fn ts_plugin_without_semantic_pass() -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("failed to create a temp dir for the plugin");
+    let dir = root.path().join("typescript");
+    fs::create_dir_all(&dir).unwrap();
+    let shipped = fs::read_to_string(ts_plugin_dir().join("plugin.toml")).unwrap();
+    assert!(shipped.contains("resolution_delta = true"), "the shipped manifest declares resolution_delta");
+    assert!(shipped.contains("semantic_pass = true"), "the shipped manifest's capability line moved");
+    fs::write(dir.join("plugin.toml"), shipped.replace("semantic_pass = true", "semantic_pass = false"))
+        .unwrap();
+    root
+}
+
+/// A pnpm workspace whose one member, `packages/geom`, has a package.json
+/// with an entry point and no `version`. The workspace is declared by
+/// `pnpm-workspace.yaml`, not by a root package.json, so the shallowest
+/// watched file a version bump can edit is the member's package.json: the
+/// check bumps a manifest the plugin projects into its facts. (On the
+/// conformance fixture it bumps the root package.json, which is not a
+/// member, and the answer is `unchanged` whatever the projection.)
+fn ts_workspace_member_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("failed to create a temp fixture dir");
+    let files = [
+        ("pnpm-workspace.yaml", "packages:\n  - \"packages/*\"\n"),
+        ("packages/geom/package.json", "{\n  \"name\": \"@fx/geom\",\n  \"main\": \"./src/index.ts\"\n}\n"),
+        ("packages/geom/src/index.ts", "export const origin = 0;\n"),
+        ("src/main.ts", "import { origin } from \"@fx/geom\";\nexport const here = origin;\n"),
+    ];
+    for (name, contents) in files {
+        let path = dir.path().join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    dir
+}
+
+/// The TS plugin answers `unchanged` to a version-only edit of a workspace
+/// member's `package.json`, and the report names the bumped file and the
+/// answer. The fixture itself is never modified.
+///
+/// Control: project the whole manifest in the TS plugin's
+/// `facts::package_facts` (the bump answers `affected`: FAIL).
+#[test]
+fn the_typescript_plugin_answers_unchanged_to_a_version_bump() {
+    let fixture = ts_workspace_member_fixture();
+    let package_json = fixture.path().join("packages/geom/package.json");
+    let before = fs::read(&package_json).unwrap();
+
+    let plugins = ts_plugin_without_semantic_pass();
+    let run = run_check(&plugins.path().join("typescript"), fixture.path(), &[]);
+    assert_eq!(run.outcome(RESOLUTION_DELTA), "PASS", "{}", run.stdout);
+    assert!(
+        run.stdout.contains("resolution-delta: version bump of packages/geom/package.json"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains(r#"resolution-delta: resolutionChanged -> {"kind":"unchanged"}"#),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(fs::read(&package_json).unwrap(), before, "the kit must never modify the fixture");
+}
+
+/// A plugin declaring `resolution_delta` whose bulk walk writes no
+/// `resolutionFacts` trailer fails this check, and only this one.
+///
+/// Control: treat a missing trailer as `NoWatchFile` in `plugin_check::check`
+/// (the check reports SKIP).
+#[test]
+fn a_declaring_plugin_without_a_facts_trailer_fails_only_the_resolution_delta_check() {
+    let fake = install_fake("none", true);
+    let manifest = fake.dir.join("plugin.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    assert!(text.trim_end().ends_with("files_created = false"), "the capabilities table is last:\n{text}");
+    text.push_str("resolution_delta = true\n\n[plugin.workspace]\nwatch_files = [\"package.json\"]\n");
+    fs::write(&manifest, text).unwrap();
+
+    let source = fixtures().join("fake");
+    let fixture = write_fk_fixture(&[
+        ("a.fk", &fs::read_to_string(source.join("a.fk")).unwrap()),
+        ("b.fk", &fs::read_to_string(source.join("b.fk")).unwrap()),
+        ("package.json", r#"{"name":"fk","version":"1.0.0"}"#),
+    ]);
+    let run = run_check(&fake.dir, fixture.path(), &[]);
+    assert!(!run.success, "a failing check must make the command exit non-zero:\n{}", run.stdout);
+    assert_eq!(run.failing(), vec![RESOLUTION_DELTA], "{}", run.stdout);
+    assert!(run.stdout.contains("without a resolutionFacts line"), "{}", run.stdout);
 }

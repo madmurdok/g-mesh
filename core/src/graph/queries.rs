@@ -178,6 +178,7 @@ fn map_edge_row(row: &Row) -> rusqlite::Result<EdgeRecord> {
         engine: row.get("engine")?,
         resolved: row.get("resolved")?,
         to_declaration: row.get("toDeclaration")?,
+        specifier: None,
     })
 }
 

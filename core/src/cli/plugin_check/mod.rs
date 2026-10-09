@@ -264,6 +264,34 @@ pub fn check(
         }
     }
 
+    // `capabilities.resolution-delta-version-bump`: a session of its own, run
+    // only for a declaring plugin once bulk run 1 completed - a
+    // non-declaring plugin is never sent `resolutionChanged`.
+    let facts = bulk1.lines.iter().rev().find_map(|line| match &line.item {
+        Ok(BulkItem::ResolutionFacts(facts)) => Some(facts.clone()),
+        _ => None,
+    });
+    let version_bump = (manifest.capabilities.resolution_delta && bulk1.complete())
+        .then(|| session::choose_version_bump(&manifest, &scratch.workspace()))
+        .flatten();
+    let mut resolution_delta_run = None;
+    if let (Some(bump), Some(facts)) = (&version_bump, &facts) {
+        let run =
+            session::run_resolution_delta_session(&manifest, &scratch, &conn, bump, facts.clone(), timeouts);
+        if let Some(failure) = &run.session.failure {
+            failures.push(format!("resolution-delta session: {failure}"));
+        }
+        resolution_delta_run = Some(run);
+    }
+    let resolution_delta = match (&version_bump, &resolution_delta_run) {
+        _ if !(manifest.capabilities.resolution_delta && bulk1.complete()) => {
+            checks::ResolutionDeltaEvidence::NotRun
+        }
+        (None, _) => checks::ResolutionDeltaEvidence::NoWatchFile,
+        (Some(_), None) => checks::ResolutionDeltaEvidence::NoFacts,
+        (Some(bump), Some(run)) => checks::ResolutionDeltaEvidence::Ran { bump, run },
+    };
+
     let mut notes = vec![
         format!(
             "timeouts: fileChanged {:?}, per-file semanticPass {:?}, whole-project semanticPass and each bulk run {:?}",
@@ -307,6 +335,17 @@ pub fn check(
         notes.extend(run.session.exchanges.iter().map(exchange_note));
     }
 
+    if let Some(bump) = &version_bump {
+        notes.push(format!("resolution-delta: version bump of {}", bump.file_path));
+    }
+    if let Some(run) = &resolution_delta_run {
+        let answer = match run.result.as_ref().map(|r| &r.delta) {
+            None => "no answer".to_string(),
+            Some(delta) => serde_json::to_string(delta).unwrap_or_default(),
+        };
+        notes.push(format!("resolution-delta: resolutionChanged -> {answer}"));
+    }
+
     let results = checks::evaluate(&checks::RunData {
         manifest: &manifest,
         bulk: [&bulk1, &bulk2],
@@ -321,6 +360,7 @@ pub fn check(
             pair_findings,
             run: files_created_run.as_ref(),
         },
+        resolution_delta,
     });
 
     let mut sections = vec![Section { title: "checks", results }];

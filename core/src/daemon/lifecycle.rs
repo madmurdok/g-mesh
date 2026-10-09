@@ -441,6 +441,21 @@ impl PluginSupervisor {
         f(inner.process.as_ref())
     }
 
+    /// [`with_exclusive_access`](Self::with_exclusive_access), waking the
+    /// plugin first if it is asleep: `f` always gets a live process. A plugin
+    /// that fails to start is the error, and `f` does not run.
+    pub fn with_awake_exclusive_access<T>(&self, f: impl FnOnce(&PluginProcess) -> T) -> Result<T> {
+        let mut inner = self.inner();
+        if inner.process.is_none() {
+            let process = PluginProcess::spawn(&self.project_root, &self.manifest, self.pid_file.clone())
+                .with_context(|| format!("failed to wake the {} plugin", self.manifest.language))?;
+            super::write_pid_file(&self.pid_file, process.pid());
+            inner.process = Some(process);
+        }
+        self.touch();
+        Ok(f(inner.process.as_ref().expect("just spawned or already running")))
+    }
+
     /// Synchronously reindexes `file_path` if it changed since it was last
     /// indexed: the safety net for a change the watcher never saw (made while the
     /// daemon was down, or dropped by the backend). The common case resolves off
