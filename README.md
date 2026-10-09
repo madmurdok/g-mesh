@@ -661,6 +661,10 @@ defaults when a project or machine has never run either.
 `find_implementations`, `get_file_outline`, `get_dependencies` — all
 structural, all available with no extra setup.
 
+`get_file_outline` pages are compact (no signatures) and at most about 8k
+bytes each, however high `limit` is: follow `nextCursor` for the rest, and
+pass `detail: "full"` for signatures, qualified names and columns.
+
 Plus `search_code`: free-text semantic search over doc comments and
 signatures, ranked by relevance. It is the one tool with a prerequisite —
 the embedding model above — and the one whose top hit is a ranked guess

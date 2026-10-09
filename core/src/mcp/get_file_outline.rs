@@ -21,23 +21,34 @@ use crate::daemon::registry::PathCoverage;
 
 use super::not_indexed;
 use super::tool_result::{internal_error, success};
-use super::GetFileOutlineParams;
+use super::{GetFileOutlineParams, OutlineDetail};
 
 /// One symbol the file declares. No `file_path` field - every entry in this
 /// list is by definition in the file the caller just named, so repeating it
 /// per row would only be noise.
+///
+/// A compact row (the default) carries only what locates and anchors a
+/// symbol; the `Option` fields are filled by a full render alone
+/// (`detail: "full"`) and skipped otherwise, so a full row is byte-identical
+/// to the row shape before GM-523, `"signature": null` included.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OutlineSymbol {
     symbol_id: String,
     name: String,
-    qualified_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualified_name: Option<String>,
     kind: String,
     start_line: i64,
-    start_col: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_col: Option<i64>,
     end_line: i64,
-    end_col: i64,
-    signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_col: Option<i64>,
+    /// Outer `None`: a compact row, key absent. `Some(None)`: a full row for
+    /// a symbol without a signature, sent as `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<Option<String>>,
     /// Reachable from outside the file this symbol is declared in - **not**
     /// whether the symbol's own line carries a visibility keyword. Those
     /// coincide for a top-level item but diverge for a member whose
@@ -61,50 +72,85 @@ struct OutlineSymbol {
     exported: bool,
 }
 
-impl From<NodeRecord> for OutlineSymbol {
-    fn from(n: NodeRecord) -> Self {
-        Self {
-            symbol_id: n.id,
-            name: n.name,
-            qualified_name: n.qualified_name,
-            kind: n.kind,
-            start_line: n.start_line,
-            start_col: n.start_col,
-            end_line: n.end_line,
-            end_col: n.end_col,
-            signature: n.signature,
-            exported: n.exported,
+/// `n` as the row `detail` asks for.
+fn render(n: NodeRecord, detail: OutlineDetail) -> OutlineSymbol {
+    let full = detail == OutlineDetail::Full;
+    OutlineSymbol {
+        symbol_id: n.id,
+        name: n.name,
+        qualified_name: full.then_some(n.qualified_name),
+        kind: n.kind,
+        start_line: n.start_line,
+        start_col: full.then_some(n.start_col),
+        end_line: n.end_line,
+        end_col: full.then_some(n.end_col),
+        signature: full.then_some(n.signature),
+        exported: n.exported,
+    }
+}
+
+/// The response body, serialized: `Page<T>` itself isn't `Serialize` since
+/// it's shared by every list-shaped tool and none of them agree on an item
+/// type. Borrowed, so the byte cut can measure a candidate page without
+/// copying its rows.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutlinePage<'a> {
+    results: &'a [OutlineSymbol],
+    /// The file's whole row count, present only when `has_more`: what is
+    /// left to page through, as on `find_references`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<usize>,
+    has_more: bool,
+    next_cursor: Option<&'a str>,
+}
+
+/// One outline page, cut to its byte budget, with its `total`.
+struct Outline {
+    page: pagination::Page<OutlineSymbol>,
+    total: Option<usize>,
+}
+
+impl Outline {
+    fn body(&self) -> OutlinePage<'_> {
+        OutlinePage {
+            results: &self.page.results,
+            total: self.total,
+            has_more: self.page.has_more,
+            next_cursor: self.page.next_cursor.as_deref(),
         }
     }
 }
 
-/// The standard cursor-pagination envelope, serialized: `Page<T>` itself
-/// isn't `Serialize` since it's shared by every list-shaped tool and none of
-/// them agree on an item type.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OutlinePage {
-    results: Vec<OutlineSymbol>,
-    has_more: bool,
-    next_cursor: Option<String>,
-}
-
-/// Paginates the `DEFINES` edges out of `file_node_id`, in source order.
-/// Split out from `handle` so tests can drive it with a small `page_size`
-/// without needing a page-size field on the public tool parameters.
+/// Paginates the `DEFINES` edges out of `file_node_id`, in source order, at
+/// most `page_size` rows and at most `max_bytes` of serialized response
+/// (`pagination::bound_defines_page`). Split out from `handle` so tests can
+/// drive it with a small `page_size` or another budget without needing those
+/// fields on the public tool parameters.
 fn list_outline(
     conn: &Connection,
     file_node_id: &str,
     page_size: usize,
     cursor: Option<&str>,
-) -> anyhow::Result<pagination::Page<OutlineSymbol>> {
+    detail: OutlineDetail,
+    max_bytes: usize,
+) -> anyhow::Result<Outline> {
     let page = pagination::paginate_defines(conn, file_node_id, page_size, cursor)?;
-    Ok(pagination::Page {
-        results: page.results.into_iter().map(OutlineSymbol::from).collect(),
-        has_more: page.has_more,
-        next_cursor: page.next_cursor,
-        all_unresolved: page.all_unresolved,
-    })
+    let page = pagination::bound_defines_page(
+        page,
+        |n| render(n, detail),
+        |results, has_more, next_cursor| {
+            pagination::wire_len(&OutlinePage {
+                results,
+                total: pagination::widest_total(has_more),
+                has_more,
+                next_cursor,
+            })
+        },
+        max_bytes,
+    );
+    let total = if page.has_more { Some(pagination::count_defines(conn, file_node_id)?) } else { None };
+    Ok(Outline { page, total })
 }
 
 /// [`handle_covered`] for a path whose language is indexed.
@@ -139,11 +185,21 @@ pub(super) fn handle_covered(
         }
     };
 
-    let page_size = pagination::resolve_page_size(params.limit);
-    let page = list_outline(&conn, &file_node.id, page_size, params.cursor.as_deref())
-        .map_err(|e| internal_error("failed to list file outline", e))?;
+    // Default to the row ceiling: the byte budget, not a row count, is what
+    // bounds a default page (GM-523 Q2).
+    let page_size =
+        params.limit.map_or(pagination::MAX_PAGE_SIZE, |l| pagination::resolve_page_size(Some(l)));
+    let outline = list_outline(
+        &conn,
+        &file_node.id,
+        page_size,
+        params.cursor.as_deref(),
+        params.detail.unwrap_or_default(),
+        pagination::OUTLINE_MAX_RESPONSE_BYTES,
+    )
+    .map_err(|e| internal_error("failed to list file outline", e))?;
 
-    success(&OutlinePage { results: page.results, has_more: page.has_more, next_cursor: page.next_cursor })
+    success(&outline.body())
 }
 
 #[cfg(test)]
@@ -314,11 +370,11 @@ mod tests {
         assert_eq!(body["hasMore"], false);
     }
 
-    /// Omitting `limit` must keep paging at the same default as before this
-    /// field existed - a caller that never touches `limit` must see no
-    /// behavior change.
+    /// Omitting `limit` fills the page up to the byte budget rather than
+    /// stopping at the symbol tools' 20-row default (GM-523 Q2): a small
+    /// file comes back whole in one call.
     #[test]
-    fn omitting_limit_keeps_the_default_page_size() {
+    fn omitting_limit_fills_the_page_to_the_byte_budget() {
         let mut conn = setup();
         upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
         for i in 0..25 {
@@ -335,20 +391,14 @@ mod tests {
         let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
-        assert_eq!(
-            results.len(),
-            pagination::DEFAULT_PAGE_SIZE,
-            "no limit means the first page is exactly the default size"
-        );
-        assert_eq!(
-            body["hasMore"], true,
-            "25 symbols against the default page size must still have a next page"
-        );
+        assert_eq!(results.len(), 25, "no limit means every row that fits the budget");
+        assert_eq!(body["hasMore"], false);
     }
 
     /// A `limit` above the ceiling must be clamped, not honored verbatim or
     /// rejected - same contract `pagination::resolve_page_size` gives the
-    /// symbol-query tools.
+    /// symbol-query tools. Driven through `list_outline` with no byte budget,
+    /// since 205 rows are over the outline's budget and it would cut first.
     #[test]
     fn an_oversized_limit_is_clamped_to_the_ceiling() {
         let mut conn = setup();
@@ -363,17 +413,246 @@ mod tests {
             .unwrap();
         }
 
-        let params =
-            GetFileOutlineParams { file_path: "a.rs".to_string(), limit: Some(10_000), ..Default::default() };
-        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
-        let body = json_body(&result);
-        let results = body["results"].as_array().unwrap();
+        let page_size = pagination::resolve_page_size(Some(10_000));
+        let outline =
+            list_outline(&conn, "file", page_size, None, OutlineDetail::Compact, usize::MAX).unwrap();
         assert_eq!(
-            results.len(),
+            outline.page.results.len(),
             pagination::MAX_PAGE_SIZE,
             "an oversized limit must clamp to the ceiling, not return every row"
         );
+        assert!(outline.page.has_more);
+    }
+
+    // -----------------------------------------------------------------
+    // GM-523: the byte budget, compact/full rows, `total`
+    // -----------------------------------------------------------------
+
+    const BUDGET: usize = pagination::OUTLINE_MAX_RESPONSE_BYTES;
+
+    /// The id of the `i`th row of a [`big_file`], in source order.
+    fn row_id(i: usize) -> String {
+        format!("s{i:04}")
+    }
+
+    /// A file of `n` symbols on lines `0..n`, each with a distinct
+    /// `sig_len`-char signature, so a full row is far wider than a compact one.
+    fn big_file(n: usize, sig_len: usize) -> Arc<IndexStore> {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
+        for i in 0..n {
+            let id = row_id(i);
+            let mut node = symbol_at(&id, &id, i as i64);
+            node.end_line = i as i64;
+            node.signature = Some(format!("{id}{}", "x".repeat(sig_len.saturating_sub(id.len()))));
+            upsert_node(&mut conn, node).unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e{id}"), "file", id, "DEFINES", "tree-sitter", false),
+            )
+            .unwrap();
+        }
+        Arc::new(IndexStore::new(conn))
+    }
+
+    /// One `get_file_outline` call: the response text, as sent, and its JSON.
+    fn outline_call(
+        store: &Arc<IndexStore>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+        detail: Option<OutlineDetail>,
+    ) -> (String, serde_json::Value) {
+        let params = GetFileOutlineParams { file_path: "a.rs".to_string(), cursor, limit, detail };
+        let result = handle(store, params).unwrap();
+        let body = json_body(&result);
+        let text = match &result.content[0] {
+            rmcp::model::ContentBlock::Text(text) => text.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        (text, body)
+    }
+
+    fn ids_of(body: &serde_json::Value) -> Vec<String> {
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["symbolId"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn keys_of(row: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        row.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// B1: no `limit` or `detail` lifts the 8,000-byte budget, and a file
+    /// wider than the budget comes back cut, with `hasMore`. Omitting `limit`
+    /// is the same call as `limit: 200` (GM-523 Q2).
+    #[test]
+    fn every_response_fits_the_byte_budget_whatever_limit_and_detail() {
+        let store = big_file(200, 200);
+        for detail in [None, Some(OutlineDetail::Compact), Some(OutlineDetail::Full)] {
+            for limit in [None, Some(1), Some(50), Some(200), Some(10_000)] {
+                let (text, body) = outline_call(&store, limit, None, detail);
+                assert!(
+                    text.len() <= BUDGET,
+                    "limit {limit:?}, detail {detail:?}: {} bytes over the {BUDGET}-byte budget",
+                    text.len()
+                );
+                assert!(!ids_of(&body).is_empty(), "limit {limit:?}, detail {detail:?}: empty page");
+                assert_eq!(body["hasMore"], true, "limit {limit:?}, detail {detail:?}: 200 rows never fit");
+            }
+            let (no_limit, _) = outline_call(&store, None, None, detail);
+            let (limit_200, _) = outline_call(&store, Some(200), None, detail);
+            assert_eq!(no_limit, limit_200, "detail {detail:?}: no limit must mean limit 200");
+        }
+    }
+
+    /// B2: following `nextCursor` across byte-cut pages, switching `detail`
+    /// between pages, returns every row exactly once, in source order. 250
+    /// rows so the SQL page itself also has a next page to resume from.
+    #[test]
+    fn following_the_cursor_across_byte_cuts_returns_every_row_once() {
+        const N: usize = 250;
+        let store = big_file(N, 200);
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages <= N, "paging never ended after {N} pages");
+            let detail = if pages % 2 == 0 { OutlineDetail::Full } else { OutlineDetail::Compact };
+            let (text, body) = outline_call(&store, Some(200), cursor.clone(), Some(detail));
+            assert!(text.len() <= BUDGET, "page {pages}: {} bytes", text.len());
+            let ids = ids_of(&body);
+            assert!(!ids.is_empty(), "page {pages} is empty");
+            seen.extend(ids);
+            if body["hasMore"] == false {
+                assert!(body.get("total").is_none(), "the last page carries no total");
+                break;
+            }
+            assert_eq!(body["total"], N, "page {pages}: a cut page carries the file's row count");
+            cursor = Some(body["nextCursor"].as_str().expect("hasMore implies a cursor").to_string());
+        }
+        let expected: Vec<String> = (0..N).map(row_id).collect();
+        assert_eq!(seen, expected, "every row exactly once, in source order");
+        assert!(pages > 2, "the fixture must need several byte-cut pages, took {pages}");
+    }
+
+    /// B3: a page cut by bytes reports `hasMore` and a cursor even when
+    /// `limit` covers the whole file (the SQL page says there is no more),
+    /// with `total` placed before `hasMore`.
+    #[test]
+    fn a_byte_cut_sets_has_more_even_when_limit_covers_the_file() {
+        let store = big_file(120, 200);
+        let (text, body) = outline_call(&store, Some(200), None, Some(OutlineDetail::Full));
+        assert!(ids_of(&body).len() < 120, "120 full rows must not fit {BUDGET} bytes");
         assert_eq!(body["hasMore"], true);
+        assert!(body["nextCursor"].is_string(), "a cut page must carry a cursor");
+        assert_eq!(body["total"], 120);
+        assert!(text.contains(r#""total":120,"hasMore":true"#), "total precedes hasMore: {text}");
+    }
+
+    /// B4 and "small files unchanged": a file that fits has no `total` key,
+    /// and with `detail: "full"` its body is byte-for-byte the pre-GM-523
+    /// response, `"signature": null` included.
+    #[test]
+    fn a_small_file_has_no_total_and_its_full_body_is_unchanged() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
+        for i in 0..3i64 {
+            let id = format!("n{i}");
+            let mut node = symbol_at(&id, &id, 10 * i + 3);
+            node.start_col = 4;
+            node.end_line = 10 * i + 5;
+            node.end_col = 6;
+            if i == 1 {
+                node.signature = Some("fn n1()".to_string());
+                node.visibility = "public".to_string();
+                node.exported = true;
+            }
+            upsert_node(&mut conn, node).unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e{i}"), "file", id, "DEFINES", "tree-sitter", false),
+            )
+            .unwrap();
+        }
+        let store = Arc::new(IndexStore::new(conn));
+
+        let (_, compact) = outline_call(&store, None, None, None);
+        assert!(compact.get("total").is_none(), "a complete page has no total key: {compact}");
+        assert_eq!(compact["hasMore"], false);
+
+        let (full, _) = outline_call(&store, None, None, Some(OutlineDetail::Full));
+        assert_eq!(
+            full,
+            concat!(
+                r#"{"results":["#,
+                r#"{"symbolId":"n0","name":"n0","qualifiedName":"pkg::n0","kind":"Function","startLine":3,"startCol":4,"endLine":5,"endCol":6,"signature":null,"exported":false},"#,
+                r#"{"symbolId":"n1","name":"n1","qualifiedName":"pkg::n1","kind":"Function","startLine":13,"startCol":4,"endLine":15,"endCol":6,"signature":"fn n1()","exported":true},"#,
+                r#"{"symbolId":"n2","name":"n2","qualifiedName":"pkg::n2","kind":"Function","startLine":23,"startCol":4,"endLine":25,"endCol":6,"signature":null,"exported":false}"#,
+                r#"],"hasMore":false,"nextCursor":null}"#,
+            )
+        );
+    }
+
+    /// B5: rows are compact by default (exactly six keys, with `symbolId`)
+    /// and full on request (exactly the pre-GM-523 ten keys).
+    #[test]
+    fn rows_are_compact_by_default_and_full_on_request() {
+        let store = big_file(2, 0);
+        let compact_keys: std::collections::BTreeSet<String> =
+            ["symbolId", "name", "kind", "startLine", "endLine", "exported"].map(String::from).into();
+        let mut full_keys = compact_keys.clone();
+        full_keys.extend(["qualifiedName", "startCol", "endCol", "signature"].map(String::from));
+
+        for detail in [None, Some(OutlineDetail::Compact)] {
+            let (_, body) = outline_call(&store, None, None, detail);
+            for row in body["results"].as_array().unwrap() {
+                assert_eq!(keys_of(row), compact_keys, "detail {detail:?}");
+            }
+        }
+        let (_, body) = outline_call(&store, None, None, Some(OutlineDetail::Full));
+        let rows = body["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(keys_of(row), full_keys);
+        }
+    }
+
+    /// B6: a row that alone is over the budget is still sent, alone, with
+    /// `hasMore`, and the next page carries the rest - never an empty page
+    /// that pages forever.
+    #[test]
+    fn a_single_row_over_the_budget_is_sent_alone() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
+        for i in 0..3i64 {
+            let id = format!("n{i}");
+            let mut node = symbol_at(&id, &id, i);
+            if i == 0 {
+                node.signature = Some("x".repeat(9_000));
+            }
+            upsert_node(&mut conn, node).unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e{i}"), "file", id, "DEFINES", "tree-sitter", false),
+            )
+            .unwrap();
+        }
+        let store = Arc::new(IndexStore::new(conn));
+
+        let (text, first) = outline_call(&store, None, None, Some(OutlineDetail::Full));
+        assert_eq!(ids_of(&first), vec!["n0"]);
+        assert!(text.len() > BUDGET, "the fixture row must be over the budget on its own");
+        assert_eq!(first["hasMore"], true);
+        assert_eq!(first["total"], 3);
+
+        let cursor = first["nextCursor"].as_str().map(str::to_string);
+        let (_, second) = outline_call(&store, None, cursor, Some(OutlineDetail::Full));
+        assert_eq!(ids_of(&second), vec!["n1", "n2"]);
+        assert_eq!(second["hasMore"], false);
     }
 
     // -----------------------------------------------------------------
