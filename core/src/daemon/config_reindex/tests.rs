@@ -569,20 +569,64 @@ fn a_sleeping_plugin_is_woken_to_answer() {
     assert_eq!(fixture.facts().as_deref(), Some("facts-2"));
 }
 
-/// A run that died after marking the reindex pending and before storing the
-/// new facts left `pending_reindex`, the old facts and some rows re-extracted
-/// under the new config. The next start reindexes the whole language, even
-/// when the config was reverted meanwhile and the plugin would answer
-/// `unchanged`, and the swap clears the mark.
+/// Every `IMPORTS` row of `alpha` as (importer, target, specifier).
+fn alpha_imports(conn: &IndexStore) -> BTreeSet<(String, String, Option<String>)> {
+    conn.with(|conn| -> rusqlite::Result<BTreeSet<(String, String, Option<String>)>> {
+        conn.prepare(
+            "SELECT e.fromId, e.toId, e.specifier FROM edges e JOIN nodes n ON n.id = e.fromId
+             WHERE e.kind = 'IMPORTS' AND n.language = 'alpha'",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect()
+    })
+    .unwrap()
+}
+
+/// A selective run under config v2 died mid-loop: it had marked the reindex
+/// pending and re-extracted `f2` (its v1 import of `f0` replaced by a v2-only
+/// import of `f3`), and never stored the v2 facts. The config was then
+/// reverted to v1 while the daemon was down, so the plugin would answer
+/// `unchanged` against the stored v1 facts. The next start must still
+/// reindex the whole language, without asking, and the swap clears the mark.
 ///
 /// Control: drop the `pending_reindex` check at the top of `selective` (the
-/// resume asks `resolutionChanged`, gets `unchanged`, and the mark stays).
+/// resume asks `resolutionChanged`, gets `unchanged`, re-extracts nothing,
+/// and the mark stays).
 #[test]
 fn an_interrupted_selective_reindex_is_resumed_as_a_whole_language_reindex() {
     let fixture = fixture(true, false, Some("facts-1"));
+    let v1 = alpha_imports(&fixture.conn);
+    let v1_edge = (format!("file:{}", src(2)), format!("file:{}", src(0)), Some("lib".to_string()));
+    let v2_edge = (format!("file:{}", src(2)), format!("file:{}", src(3)), Some("v2/f3".to_string()));
+    assert!(v1.contains(&v1_edge), "the walk stored f2's v1 import: {v1:?}");
+
+    // The interrupted run: the mark, then f2 re-extracted under v2.
     fixture.conn.with(|conn| schema::mark_pending_reindex(conn, "alpha", "go.mod")).unwrap();
+    {
+        let mut conn = fixture.conn.lock().unwrap();
+        let v1_id: String = conn
+            .query_row(
+                "SELECT id FROM edges WHERE fromId = ?1 AND toId = ?2 AND kind = 'IMPORTS'",
+                [&v1_edge.0, &v1_edge.1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_edges: vec![import(&src(2), &v2_edge.1, "v2/f3")],
+                delete_edge_ids: vec![v1_id],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    let interrupted = alpha_imports(&fixture.conn);
+    assert!(interrupted.contains(&v2_edge) && !interrupted.contains(&v1_edge), "{interrupted:?}");
+
+    // Reverted to v1: the plugin answers unchanged, and a re-walk is v1's.
     fixture.answer(r#"{"delta":{"kind":"unchanged"},"facts":"facts-1"}"#);
-    set_walk(fixture.project.path(), Some("facts-2"));
+    set_walk(fixture.project.path(), Some("facts-1"));
     let requests = test_plugin::requests(&fixture.dir).len();
     let notifications = test_plugin::notifications(&fixture.dir).len();
 
@@ -596,6 +640,7 @@ fn an_interrupted_selective_reindex_is_resumed_as_a_whole_language_reindex() {
             .any(|line| line == "workspaceChanged go.mod"),
         "the language is reindexed whole"
     );
+    // Edge convergence (v2-only edge gone, v1 edge back) is GM-546.
     assert!(fixture.pending().is_empty(), "the swap clears the mark");
-    assert_eq!(fixture.facts().as_deref(), Some("facts-2"), "the re-walk's trailer is stored");
+    assert_eq!(fixture.facts().as_deref(), Some("facts-1"));
 }

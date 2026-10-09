@@ -1535,22 +1535,49 @@ fn ts_plugin_without_semantic_pass() -> tempfile::TempDir {
     root
 }
 
-/// The TS plugin answers `unchanged` to a version-only edit of the fixture's
-/// `package.json`, and the report names the bumped file and the answer. The
-/// fixture itself is never modified.
+/// A pnpm workspace whose one member, `packages/geom`, has a package.json
+/// with an entry point and no `version`. The workspace is declared by
+/// `pnpm-workspace.yaml`, not by a root package.json, so the shallowest
+/// watched file a version bump can edit is the member's package.json: the
+/// check bumps a manifest the plugin projects into its facts. (On the
+/// conformance fixture it bumps the root package.json, which is not a
+/// member, and the answer is `unchanged` whatever the projection.)
+fn ts_workspace_member_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("failed to create a temp fixture dir");
+    let files = [
+        ("pnpm-workspace.yaml", "packages:\n  - \"packages/*\"\n"),
+        ("packages/geom/package.json", "{\n  \"name\": \"@fx/geom\",\n  \"main\": \"./src/index.ts\"\n}\n"),
+        ("packages/geom/src/index.ts", "export const origin = 0;\n"),
+        ("src/main.ts", "import { origin } from \"@fx/geom\";\nexport const here = origin;\n"),
+    ];
+    for (name, contents) in files {
+        let path = dir.path().join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    dir
+}
+
+/// The TS plugin answers `unchanged` to a version-only edit of a workspace
+/// member's `package.json`, and the report names the bumped file and the
+/// answer. The fixture itself is never modified.
 ///
 /// Control: project the whole manifest in the TS plugin's
 /// `facts::package_facts` (the bump answers `affected`: FAIL).
 #[test]
 fn the_typescript_plugin_answers_unchanged_to_a_version_bump() {
-    let fixture = ts_conformance_project();
-    let package_json = fixture.join("package.json");
+    let fixture = ts_workspace_member_fixture();
+    let package_json = fixture.path().join("packages/geom/package.json");
     let before = fs::read(&package_json).unwrap();
 
     let plugins = ts_plugin_without_semantic_pass();
-    let run = run_check(&plugins.path().join("typescript"), &fixture, &[]);
+    let run = run_check(&plugins.path().join("typescript"), fixture.path(), &[]);
     assert_eq!(run.outcome(RESOLUTION_DELTA), "PASS", "{}", run.stdout);
-    assert!(run.stdout.contains("resolution-delta: version bump of package.json"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("resolution-delta: version bump of packages/geom/package.json"),
+        "{}",
+        run.stdout
+    );
     assert!(
         run.stdout.contains(r#"resolution-delta: resolutionChanged -> {"kind":"unchanged"}"#),
         "{}",
