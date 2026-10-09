@@ -28,9 +28,10 @@
 #     answer fails twice;
 #   - callers, a default trait method through a generic (semantic):
 #     `shapes::Shape::label`;
-#   - implementations in another crate of the workspace (semantic):
-#     `shapes::Loud`, which `crates/beta` implements through a glob import
-#     the structural tier cannot follow;
+#   - implementations in another crate of the workspace: `shapes::Loud`,
+#     which `crates/beta` implements through a glob import of a re-export
+#     (structural since GM-537), and `shapes::Loud::speak`, the method-level
+#     edge `overrides` reads;
 #   - references (`shapes::Shape`, which `[[callers]]` cannot reach at all -
 #     a trait bound and a `SUPERTYPE_OF` edge are both usages, never calls);
 #   - implementations (`shapes::Shape`, `impl Trait for T` found by
@@ -408,17 +409,23 @@ expect = ["crates/alpha/src/shapes.rs:shapes::Square", "crates/alpha/src/shapes.
 
 [[implementations]]
 symbol = "shapes::Loud"
-tier = "semantic"
-# The other acceptance criterion, and the one nothing structural can reach.
 # `crates/beta/src/main.rs` implements `alpha`'s `Loud` for its own
-# `Megaphone`, naming the trait through `use alpha::prelude::*` - a glob. The
-# extractor resolves a bare *type* name that is neither declared nor imported
-# by item to `Bound::Nothing`: no edge, and not even an open site (see
-# `crates/alpha/src/prelude.rs`'s comment). So `Megaphone` is here only if
-# `textDocument/implementation` on the trait found it, and `Circle` is here
-# either way - which is what makes this one entry both the cross-crate claim
-# and a guard against a sweep that drops the answers it used to get right.
+# `Megaphone`, naming the trait through `use alpha::prelude::*` - a glob of a
+# module that only re-exports it. Until GM-537 the extractor resolved that
+# clause to `Bound::Nothing` and only rust-analyzer's sweep found the impl;
+# now `Bodies::resolve_supertype` addresses it as a `name` key in beta's root
+# module, which core walks through the glob and the `pub use` (see
+# `crates/alpha/src/prelude.rs`'s comment). Exact on both tiers: the sweep's
+# own `Megaphone -> Loud` edge must land on the same two declarations.
 expect = ["crates/alpha/src/shapes.rs:shapes::Circle", "crates/beta/src/main.rs:Megaphone"]
+
+[[implementations]]
+symbol = "shapes::Loud::speak"
+# GM-537: the method-level edge `find_callers`' `overrides` reads. Circle's
+# trait is imported by item in its own module; Megaphone's arrives only
+# through the glob above, and rust-analyzer's sweep never emits this edge,
+# so `Megaphone`'s row here is the structural glob fallback's alone.
+expect = ["crates/alpha/src/shapes.rs:shapes::<Circle as Loud>::speak", "crates/beta/src/main.rs:<Megaphone as Loud>::speak"]
 
 # --- implementations: blanket impls, and the module that is not one (GM-361) --
 

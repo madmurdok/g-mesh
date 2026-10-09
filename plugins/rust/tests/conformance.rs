@@ -116,7 +116,8 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 // qualifiedName-suffix rung resolves), one `[[refusal]]` and two
 // `[[references]]`, both structural, plus the getter-named-like-its-field pair: one `[[callers]]` for
 // the method and one `[[references]]` for the field.
-const EXPECTATIONS: usize = 31;
+// 32 with GM-537's `[[implementations]] shapes::Loud::speak` (structural).
+const EXPECTATIONS: usize = 32;
 // 6 since GM-386: `[[references]] shapes::Shape` joined the five receiver/
 // implementation entries, not because its rows need rust-analyzer - they do
 // not - but because the `files` tally it now asserts counts edges, and two of
@@ -129,7 +130,10 @@ const EXPECTATIONS: usize = 31;
 // 5 once the `internals::peek` row of `[[references]]
 // gaps::Ledger.all_unresolved` became structural for the same reason: the
 // field is read through a parameter of a written type.
-const SEMANTIC_EXPECTATIONS: usize = 5;
+// 4 once `[[implementations]] shapes::Loud` became structural (GM-537): a
+// trait clause reached through a glob is addressed through the module.
+// GM-537/S6 adds the replacement cross-crate sweep-only witness.
+const SEMANTIC_EXPECTATIONS: usize = 4;
 
 /// GM-380: the tripwire above only works if tripping it says what to do.
 ///
@@ -447,14 +451,12 @@ fn the_semantic_tier_is_what_closes_the_receiver_call_gap() {
     //
     //   - the receiver call on a variable whose method is a trait impl's
     //     (`square.area()` in `total`), which the structural tier addresses
-    //     as `Square::area` and so cannot find;
-    //   - the implementation in another crate of the workspace.
-    for row in [
-        "missing (expected, not found): crates/alpha/src/shapes.rs:shapes::total",
-        "missing (expected, not found): crates/beta/src/main.rs:Megaphone",
-    ] {
-        assert!(outcome.stdout.contains(row), "the report must say `{row}`:\n{}", outcome.stdout);
-    }
+    //     as `Square::area` and so cannot find.
+    //
+    // GM-537/S6 adds the replacement witness: `Megaphone` (the implementation
+    // in another crate) is structural since GM-537.
+    let row = "missing (expected, not found): crates/alpha/src/shapes.rs:shapes::total";
+    assert!(outcome.stdout.contains(row), "the report must say `{row}`:\n{}", outcome.stdout);
 }
 
 /// A missing server degrades to structural and says so **once**, with an

@@ -30,13 +30,14 @@ fn forbidden() -> u8 {
 /// implementing a trait of the other one.
 ///
 /// `Loud` is not imported by item here - it arrives through
-/// `use alpha::prelude::*` at the top of this file - so the structural tier
-/// emits nothing for the `impl` below: not an edge, and not even an open
-/// site (see `crates/alpha/src/prelude.rs`'s own comment for the resolution
-/// path). `find_implementations` on `shapes::Loud` therefore answers
-/// `{Circle}` structurally and `{Circle, Megaphone}` after a semantic pass,
-/// which is what makes `conformance/expect.toml`'s entry for it a real
-/// measurement of the rust-analyzer tier rather than of the parser.
+/// `use alpha::prelude::*` at the top of this file, a glob of a module that
+/// only re-exports it. Since GM-537 the structural tier addresses a trait
+/// clause reached that way as a `name` key in this module, and core walks it
+/// through the glob and the prelude's `pub use` to `alpha::shapes::Loud`
+/// (see `crates/alpha/src/prelude.rs`'s own comment). So both
+/// `Megaphone -> Loud` and `<Megaphone as Loud>::speak -> Loud::speak` exist
+/// without rust-analyzer, and `find_callers` on the impl's `speak` carries
+/// `overrides` from the first index.
 pub struct Megaphone;
 
 impl Loud for Megaphone {
