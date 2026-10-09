@@ -121,6 +121,7 @@ mod syntax;
 
 use std::cell::RefCell;
 
+use g_mesh_plugin_sdk::wire::ResolutionDelta;
 use g_mesh_plugin_sdk::{Extractor, FileGraph, RelPath};
 
 use crate::extractor::bodies::Bodies;
@@ -130,6 +131,7 @@ use crate::extractor::keys::ModuleCtx;
 use crate::extractor::model::FileModel;
 use crate::extractor::scope::Scopes;
 use crate::extractor::syntax::docstring;
+use crate::project::facts::{self, PyFacts};
 use crate::project::ProjectContext;
 
 /// The plugin's wire identifier: the manifest's `language`, this directory's
@@ -175,6 +177,17 @@ impl Extractor for PythonExtractor {
     /// current; touches no disk.
     fn file_presence_changed(&self, project: &mut ProjectContext, path: &RelPath, present: bool) {
         project.file_presence_changed(path, present);
+    }
+
+    /// The roots and the container keys extraction reads.
+    fn resolution_facts(&self, project: &ProjectContext) -> Option<String> {
+        Some(PyFacts::of(project).encode())
+    }
+
+    /// Which files a `pyproject.toml` save re-keyed, and which importers the
+    /// reloaded model may resolve differently.
+    fn resolution_delta(&self, previous: &str, project: &ProjectContext) -> ResolutionDelta {
+        facts::resolution_delta(previous, project)
     }
 
     /// One file, in two passes over one parse tree.
