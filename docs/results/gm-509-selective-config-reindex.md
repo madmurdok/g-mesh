@@ -229,3 +229,9 @@ reader is `daemon::config_reindex::selective`, per g-mesh `find_references`
   `plugins/typescript/src/project/facts.rs::delta` (a package's `exports`
   change selects every specifier under `@excalidraw/math`) were read
   directly, each in one known file.
+
+## Owner decision (2026-10-09)
+
+"Оставить 30% (Recommended)": `FALLBACK_SHARE_PERCENT` stays 30. The semantic
+pass is normally on and costs well over 45 ms per file (GM-425's Rust pass),
+which puts the break-even at or above 30%.
