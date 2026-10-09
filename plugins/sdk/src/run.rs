@@ -54,7 +54,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use g_mesh_wire::{
     FileChangeDiff, Handshake, LinkedEdge, ResolutionChangedResult, ResolutionDelta,
@@ -450,6 +450,15 @@ impl<E: Extractor> Session<'_, E> {
                 self.acknowledge(out, id)
             }
             "semanticPass" => {
+                // Core's timer for this request started when it was sent, so
+                // the deadline is reckoned from its arrival, before the hold
+                // point and the hydration below spend any of it (GM-521). An
+                // absent or unrepresentable budget leaves the engine's own.
+                let received = Instant::now();
+                let deadline = params
+                    .and_then(|params| params.get("budgetMs"))
+                    .and_then(|budget| budget.as_u64())
+                    .and_then(|millis| received.checked_add(Duration::from_millis(millis)));
                 // Test-only (GM-397): parks the pass before any engine
                 // starts, blocking this thread as a long pass would.
                 hold_point("semantic", &self.spec.language);
@@ -488,6 +497,7 @@ impl<E: Extractor> Session<'_, E> {
                     .unwrap_or_default();
                 self.index.set_linked(linked);
                 let root = self.root.clone();
+                self.engine.set_pass_deadline(deadline);
                 let answer = self.engine.answer(&files, &self.index, &root);
                 self.respond_to_pass(out, id, files.is_empty(), answer)
             }
@@ -1495,6 +1505,73 @@ mod tests {
             vec![(Some("d".to_string()), None), (None, None)],
             "pass 1 sees x linked onto d and nothing for y; pass 2 carries no field and sees nothing"
         );
+    }
+
+    /// An engine that records, on each pass, the deadline it was handed
+    /// before `answer`.
+    struct DeadlineRecording {
+        seen: DeadlinesSeen,
+        current: Option<std::time::Instant>,
+    }
+
+    type DeadlinesSeen = std::sync::Arc<std::sync::Mutex<Vec<Option<std::time::Instant>>>>;
+
+    impl crate::semantic::SemanticEngine for DeadlineRecording {
+        fn set_pass_deadline(&mut self, deadline: Option<std::time::Instant>) {
+            self.current = deadline;
+        }
+
+        fn answer(&mut self, _files: &[RelPath], _index: &SdkIndex) -> anyhow::Result<SemanticAnswer> {
+            self.seen.lock().unwrap().push(self.current);
+            Ok(SemanticAnswer::complete(FileChangeDiff::default()))
+        }
+    }
+
+    /// A pass's `budgetMs` reaches the engine as a deadline that far past the
+    /// request's arrival - also on the pass that starts the engine - and a
+    /// pass without it hands the engine no deadline, not the last one.
+    ///
+    /// Control: drop the `self.engine.set_pass_deadline(deadline)` call in
+    /// the `"semanticPass"` arm.
+    #[test]
+    fn a_passes_budget_becomes_the_engines_deadline_and_a_pass_without_one_clears_it() {
+        let project = Project::new("budget", &[("a.toy", "a v1\n")]);
+        let spec = toy_spec();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&seen);
+        let factory: crate::semantic::SemanticEngineFactory = Box::new(move |_root| {
+            Ok(Box::new(DeadlineRecording { seen: std::sync::Arc::clone(&recorded), current: None })
+                as Box<dyn crate::semantic::SemanticEngine>)
+        });
+        let mut session = Session {
+            extractor: &Declares,
+            spec: &spec,
+            root: project.0.clone(),
+            root_real: std::fs::canonicalize(&project.0).ok(),
+            project: None,
+            index: SdkIndex::new(),
+            engine: LazyEngine::new("toy", Some(factory)),
+            project_hydrated: false,
+        };
+
+        let budget = Duration::from_secs(60);
+        let before = std::time::Instant::now();
+        request(
+            &mut session,
+            "semanticPass",
+            serde_json::json!({ "filePaths": ["a.toy"], "budgetMs": 60_000 }),
+        );
+        let after = std::time::Instant::now();
+        request(&mut session, "semanticPass", serde_json::json!({ "filePaths": ["a.toy"] }));
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "two passes, two answers");
+        let deadline = seen[0].expect("a pass with budgetMs hands its engine a deadline");
+        assert!(
+            before + budget <= deadline && deadline <= after + budget,
+            "the deadline is the request's arrival plus budgetMs"
+        );
+        assert_eq!(seen[1], None, "a pass without budgetMs hands no deadline");
     }
 
     /// GM-487 Fix 1's baseline hazard: a file a semantic pass hydrated from

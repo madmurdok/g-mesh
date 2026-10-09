@@ -122,6 +122,14 @@ const SEMANTIC_ANSWER: &str = "semantic-pass.json";
 /// instead of an `unknown` delta. See [`set_resolution_changed_answer`].
 const RESOLUTION_ANSWER: &str = "resolution-changed.json";
 
+/// A plugin directory holding this file sets its fields on every
+/// `semanticPass` answer. See [`set_semantic_pass_fields`].
+const SEMANTIC_FIELDS: &str = "semantic-pass-fields.json";
+
+/// The file each fake plugin process appends every `semanticPass` request's
+/// `filePaths` to, as a JSON array. See [`semantic_passes`].
+const SEMANTIC_PASS_LOG: &str = "semantic-passes.log";
+
 /// Makes the plugin in this directory hold every `semanticPass` answer until
 /// [`SEMANTIC_PASS_GATE_OPEN`] exists - see [`gate_semantic_pass`].
 const SEMANTIC_PASS_GATED: &str = "semantic-pass.gated";
@@ -427,6 +435,29 @@ pub(crate) fn set_resolution_changed_answer(plugin_dir: &Path, result: Option<&s
             let _ = fs::remove_file(&path);
         }
     }
+}
+
+/// Makes every later `semanticPass` answer of the plugin in `plugin_dir`
+/// (bar an [`install_incomplete_once`] one) carry `fields` (a JSON object of
+/// response fields, e.g. `{"incomplete": true, "unfinishedFiles": [...]}`), or,
+/// with `None`, none again. Read per request, so it takes effect without a
+/// respawn.
+pub(crate) fn set_semantic_pass_fields(plugin_dir: &Path, fields: Option<&str>) {
+    let path = plugin_dir.join(SEMANTIC_FIELDS);
+    match fields {
+        Some(fields) => fs::write(&path, fields).expect("failed to write the fake plugin's answer fields"),
+        None => {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// The `filePaths` of every `semanticPass` this plugin directory's
+/// process(es) have ever been sent, oldest first, as JSON arrays (`[]` for a
+/// whole-project pass). Empty before the first one.
+pub(crate) fn semantic_passes(plugin_dir: &Path) -> Vec<String> {
+    let Ok(log) = fs::read_to_string(plugin_dir.join(SEMANTIC_PASS_LOG)) else { return Vec::new() };
+    log.lines().map(str::to_string).collect()
 }
 
 /// Every pid this plugin directory has ever been spawned as, oldest first.

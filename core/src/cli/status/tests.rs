@@ -273,6 +273,7 @@ fn a_report_renders_every_field_it_was_asked_for() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: 3,
             dirty: 1,
@@ -316,6 +317,7 @@ fn an_interrupted_workspace_reindex_is_named() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: vec![("rust".to_string(), "Cargo.toml".to_string())],
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 1,
             indexed: 1,
             dirty: 0,
@@ -353,6 +355,7 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: 4,
             dirty: 0,
@@ -424,6 +427,7 @@ fn the_generic_advice_stays_for_an_owed_language_with_no_recorded_failure() {
         false,
         &["python".to_string(), "rust".to_string()],
         &[("python".to_string(), "the server exited".to_string())],
+        &[],
         None,
     );
     assert_eq!(
@@ -435,6 +439,102 @@ fn the_generic_advice_stays_for_an_owed_language_with_no_recorded_failure() {
     );
 }
 
+fn leftover(language: &str, residual_files: Option<usize>, never_answered: usize) -> SemanticLeftover {
+    SemanticLeftover { language: language.to_string(), residual_files, never_answered }
+}
+
+/// A residual language is explained by its own line - how many files its
+/// next start asks, or the running daemon while one works - so it carries no
+/// "never completed" advice.
+#[test]
+fn a_residual_language_names_the_files_left_instead_of_the_generic_advice() {
+    let owed = ["python".to_string()];
+    let leftovers = [leftover("python", Some(2), 0)];
+
+    assert_eq!(
+        semantic_pass_lines(false, &owed, &[], &leftovers, None),
+        vec!["  semantic pass:   python incomplete - 2 file(s) left, the next daemon start asks only those"
+            .to_string()]
+    );
+    assert_eq!(
+        semantic_pass_lines(false, &owed, &[], &leftovers, Some("running - python (0/1 languages done)")),
+        vec![
+            "  semantic pass:   running - python (0/1 languages done)".to_string(),
+            "  semantic pass:   python incomplete - 2 file(s) left, the running daemon asks only those"
+                .to_string(),
+        ]
+    );
+}
+
+/// Another owed language with nothing to explain it still gets the advice
+/// beside a residual one.
+#[test]
+fn the_generic_advice_stays_beside_a_residual_language_for_an_unexplained_one() {
+    let lines = semantic_pass_lines(
+        false,
+        &["python".to_string(), "rust".to_string()],
+        &[],
+        &[leftover("python", Some(1), 0)],
+        None,
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "  semantic pass:   never completed - run `g-mesh reindex` to repair it".to_string(),
+            "  semantic pass:   python incomplete - 1 file(s) left, the next daemon start asks only those"
+                .to_string(),
+        ]
+    );
+}
+
+/// Files given up are counted as never answered, also once the pass is
+/// complete.
+#[test]
+fn never_answered_files_are_counted_also_when_the_pass_is_complete() {
+    assert_eq!(
+        semantic_pass_lines(true, &[], &[], &[leftover("rust", None, 3)], None),
+        vec![
+            "  semantic pass:   complete".to_string(),
+            "  semantic pass:   rust: 3 file(s) never answered - asked again when they change".to_string(),
+        ]
+    );
+}
+
+/// `index_status` reads the leftovers from the index, for semantic-pass
+/// capable languages only, and `render` prints them.
+#[test]
+fn the_index_status_reads_and_renders_the_semantic_leftovers() {
+    let fixture = Fixture::new(&[("a.ts", "export const a = 1;")]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "a.ts", false);
+    // The semantic-pass lines are rendered only once a walk has landed.
+    schema::record_language_bulk_indexed(&conn, "typescript", None).unwrap();
+    schema::record_bulk_index(&conn).unwrap();
+    schema::record_language_semantic_residual(&conn, "typescript", &["a.ts".to_string()], "cold").unwrap();
+    conn.execute_batch(
+        "INSERT INTO semantic_gap_files (language, filePath)
+             VALUES ('typescript', 'b.ts'), ('no-such-language', 'x.none');",
+    )
+    .unwrap();
+
+    let status = fixture.status();
+
+    assert_eq!(status.semantic_leftovers, vec![leftover("typescript", Some(1), 1)]);
+    let rendered = render(&report_with(status));
+    assert!(
+        rendered.contains(
+            "  semantic pass:   typescript incomplete - 1 file(s) left, the next daemon start asks only those\n"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "  semantic pass:   typescript: 1 file(s) never answered - asked again when they change\n"
+        ),
+        "{rendered}"
+    );
+}
+
 /// A pass that was not run because its plugin was asleep is still owed, not
 /// failed: status says it is pending and why.
 #[test]
@@ -443,6 +543,7 @@ fn a_pass_deferred_by_a_sleeping_plugin_reads_as_pending_not_failed() {
         false,
         &["python".to_string()],
         &[("python".to_string(), crate::daemon::semantic::NOT_RUN_REASON.to_string())],
+        &[],
         None,
     );
     assert_eq!(
@@ -461,6 +562,7 @@ fn a_deferred_pass_carries_no_reindex_advice_while_a_daemon_works() {
         false,
         &["python".to_string()],
         &[("python".to_string(), crate::daemon::semantic::NOT_RUN_REASON.to_string())],
+        &[],
         Some("running - go (0/2 languages done)"),
     );
     assert_eq!(
@@ -500,6 +602,7 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: 1,
             dirty: 3,
@@ -544,6 +647,7 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: if bulk_indexed { 4 } else { 0 },
             dirty: 4,
@@ -784,6 +888,7 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 2,
             indexed: 0,
             dirty: 2,
@@ -876,6 +981,7 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
@@ -1088,6 +1194,7 @@ fn a_project_with_no_suspension_marker_reports_none() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
@@ -1150,4 +1257,99 @@ fn a_pending_semantic_pass_is_named_with_its_file_count_until_it_completes() {
     schema::record_language_semantic_pass(&conn, "typescript").unwrap();
     let rendered = render(&report_with(fixture.status()));
     assert!(!rendered.contains("semantic pending"), "{rendered}");
+}
+
+// ---------------------------------------------------------------------
+// GM-514: files reached through links (docs/architecture/
+// gm-514-core-symlink-table.md, section 5)
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+fn link(fixture: &Fixture, relative: &str, target: &str) {
+    let path = fixture.root().join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(target, path).unwrap();
+}
+
+#[cfg(unix)]
+fn discovered(fixture: &Fixture) -> Vec<String> {
+    let mut found: Vec<String> = discover_source_files(fixture.root(), &bundled_plugins())
+        .unwrap()
+        .into_iter()
+        .map(|file| file.relative)
+        .collect();
+    found.sort();
+    found
+}
+
+/// B4 + M5: a file reached only through `src/api -> ../gen` (`gen/`
+/// gitignored) is discovered under the link's spelling, matches the index
+/// row the plugin writes there, and is not dirty: its mtime is read through
+/// the link, which is the target's, as the plugin's baseline records it.
+///
+/// Control: `.follow_links(false)` in `g_mesh_walk`'s walker
+/// (walk/src/lib.rs) - discovered is 1, short by the alias.
+#[cfg(unix)]
+#[test]
+fn an_alias_only_file_is_discovered_and_indexed_under_the_link_and_not_dirty() {
+    let fixture = Fixture::new(&[
+        (".gitignore", "gen/\n"),
+        ("gen/a.ts", "export const a = 1;"),
+        ("src/main.ts", "export const m = 1;"),
+    ]);
+    link(&fixture, "src/api", "../gen");
+    let real_mtime = fixture.current_mtime("gen/a.ts");
+    assert_eq!(fixture.current_mtime("src/api/a.ts"), real_mtime, "M5: read through the link");
+
+    let conn = fixture.index();
+    for path in ["src/main.ts", "src/api/a.ts"] {
+        fixture.index_file(&conn, path, false);
+    }
+    fixture.record_baseline(&conn, "src/main.ts", fixture.current_mtime("src/main.ts"));
+    // The plugin's baseline: `fs::metadata` through the spelling it indexed.
+    fixture.record_baseline(&conn, "src/api/a.ts", real_mtime);
+    schema::record_language_bulk_indexed(&conn, "typescript", None).unwrap();
+    schema::record_bulk_index(&conn).unwrap();
+
+    assert_eq!(discovered(&fixture), vec!["src/api/a.ts", "src/main.ts"]);
+    let status = fixture.status();
+    assert_eq!(status.discovered, 2);
+    assert_eq!(status.indexed, 2);
+    assert_eq!(status.dirty, 0);
+}
+
+/// B5: a file reachable plainly and through a link (`app -> lib`, `app`
+/// first in walk order) is counted once, under its plain spelling.
+///
+/// Control: skip the winner pass in `g_mesh_walk` (`LinkGuard::finish`
+/// keeps every walked entry) - `app/x.ts` is counted too.
+#[cfg(unix)]
+#[test]
+fn a_file_reachable_through_a_link_and_plainly_is_counted_once_under_its_plain_spelling() {
+    let fixture = Fixture::new(&[("lib/x.ts", "export const x = 1;")]);
+    link(&fixture, "app", "lib");
+
+    assert_eq!(discovered(&fixture), vec!["lib/x.ts"]);
+    assert_eq!(fixture.status().discovered, 1);
+}
+
+/// B10: `src/dep -> ../node_modules/foo` (`node_modules/` gitignored): the
+/// TypeScript file under it is not TypeScript's (its real spelling is under
+/// TypeScript's `exclude_dirs`), while a Rust file there, which Rust does
+/// not exclude, is discovered under the link - so the walk did follow it.
+///
+/// Control: drop the `real_path` arm in
+/// `DiscoveredPlugins::indexing_language` - `src/dep/x.ts` is discovered.
+#[cfg(unix)]
+#[test]
+fn a_file_under_a_link_into_a_languages_excluded_dir_is_not_that_languages() {
+    let fixture = Fixture::new(&[
+        (".gitignore", "node_modules/\n"),
+        ("node_modules/foo/x.ts", "export const x = 1;"),
+        ("node_modules/foo/lib.rs", "pub fn f() {}"),
+        ("src/main.ts", "export const m = 1;"),
+    ]);
+    link(&fixture, "src/dep", "../node_modules/foo");
+
+    assert_eq!(discovered(&fixture), vec!["src/dep/lib.rs", "src/main.ts"]);
 }

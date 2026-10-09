@@ -39,6 +39,7 @@ use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::watcher::batch::{classify_settled, order_for_routing};
 use crate::watcher::debounce::Debouncer;
+use crate::watcher::ignore_layers::GITIGNORE_FILE_NAME;
 use crate::watcher::ProjectWatcher;
 
 /// Unix only: on Windows the endpoint is a pipe name (see `ipc::windows`).
@@ -458,6 +459,10 @@ fn spawn_watch_consumer(
     root: PathBuf,
 ) {
     thread::spawn(move || {
+        // GM-508, Q3: `.gitignore` edits made while no daemon watched. On
+        // this thread, before the first batch, as an in-session edit would
+        // be; events meanwhile queue in the watcher's channel.
+        registry.recheck_gitignores_since_index(&conn);
         let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
         loop {
             watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
@@ -471,6 +476,13 @@ fn spawn_watch_consumer(
 /// Between the deletions and the creations, the batch's created paths are
 /// announced per language ([`PluginRegistry::announce_created`]), so a plugin
 /// knows all of them before it extracts the first; each is still routed once.
+///
+/// A settled `.gitignore`, directory or link first reloads the watcher's
+/// layers and link table; the batch is then filtered again under the current
+/// ones, a file link's own path placed as the walk lists it; after
+/// routing, the batch's `.gitignore` paths and the links whose row the reload
+/// changed go through [`PluginRegistry::gitignore_changed`], which reindexes
+/// each language whose indexed files they changed.
 fn watch_and_route_once(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
@@ -481,8 +493,17 @@ fn watch_and_route_once(
     if let Some(path) = watcher.next_change(DEBOUNCE_WINDOW) {
         debouncer.record(path);
     }
+    let mut settled_paths = debouncer.drain_ready();
+    let mut links = Vec::new();
+    if let Some(changed_links) = watcher.reload_ignores_if_changed(&settled_paths) {
+        links = changed_links;
+    }
+    // Always, not only after a reload: it also places a file link's own path
+    // (kept by `next_change`) where the walk lists it.
+    watcher.retain_unignored(&mut settled_paths);
+    let mut gitignores = Vec::new();
     let mut batch = Vec::new();
-    for settled in debouncer.drain_ready() {
+    for settled in settled_paths {
         let Some(file_path) = relative_wire_path(root, &settled) else {
             // Outside the project root: nothing to route.
             continue;
@@ -491,6 +512,9 @@ fn watch_and_route_once(
             // The project root itself (macOS reports it for a write inside it): not
             // a file, and must not enter a sleeping plugin's replay queue.
             continue;
+        }
+        if settled.file_name() == Some(std::ffi::OsStr::new(GITIGNORE_FILE_NAME)) {
+            gitignores.push(file_path.clone());
         }
         batch.push((classify_settled(conn, &settled, &file_path), file_path));
     }
@@ -503,6 +527,11 @@ fn watch_and_route_once(
     registry.announce_created(&order.created);
     for file_path in order.created.into_iter().chain(order.modified) {
         registry.route_settled_path(conn, file_path);
+    }
+    // After routing: a file deleted or created in this batch is already in
+    // the graph's new state, so the gate compares against it.
+    if !gitignores.is_empty() || !links.is_empty() {
+        registry.gitignore_changed(conn, &gitignores, &links);
     }
 }
 

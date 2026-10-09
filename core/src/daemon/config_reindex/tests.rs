@@ -484,6 +484,35 @@ fn an_unknown_or_unreadable_answer_reindexes_the_whole_language() {
     assert_eq!(fixture.facts().as_deref(), Some("facts-3"));
 }
 
+/// A `.gitignore` change that alters a `resolution_delta` language's indexed
+/// files reindexes the whole language without asking `resolutionChanged`: no
+/// resolution delta says which files the rules added or removed, and an
+/// `unchanged` answer would leave the index holding the ignored files. Here
+/// the walked files are not on disk, so the empty `.gitignore` drops them all.
+///
+/// Control: route `gitignore_changed` through `workspace_file_changed` (the
+/// selective path) - the plugin is asked, answers `unchanged`, and nothing
+/// is re-walked.
+#[test]
+fn a_gitignore_change_reindexes_a_resolution_delta_language_whole() {
+    let fixture = fixture(true, false, Some("facts-1"));
+    fixture.answer(r#"{"delta":{"kind":"unchanged"},"facts":"facts-2"}"#);
+    std::fs::write(fixture.project.path().join(".gitignore"), "").unwrap();
+    let requests = test_plugin::requests(&fixture.dir).len();
+    let notifications = test_plugin::notifications(&fixture.dir).len();
+
+    fixture.registry.gitignore_changed(&fixture.conn, &[".gitignore".to_string()], &[]);
+
+    let asked = test_plugin::requests(&fixture.dir)[requests..].to_vec();
+    assert!(!asked.iter().any(|line| line.starts_with("resolutionChanged")), "{asked:?}");
+    assert!(
+        test_plugin::notifications(&fixture.dir)[notifications..]
+            .iter()
+            .any(|line| line == "workspaceChanged .gitignore"),
+        "the whole language is re-walked"
+    );
+}
+
 /// `affected` selecting 3 of 10 files (30%, not more): exactly those get a
 /// `fileChanged`, nothing is re-walked, the other files keep their rows, the
 /// facts are replaced and no reindex is left pending. The fake answers every

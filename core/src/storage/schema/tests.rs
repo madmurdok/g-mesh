@@ -40,9 +40,11 @@ fn creates_all_tables_and_indexes() {
             "placeholder_targets",
             "qualified_suffixes",
             "resolution_facts",
+            "semantic_gap_files",
             "semantic_owed_files",
             "semantic_pending",
             "semantic_pending_files",
+            "semantic_residual",
             "untyped_calls",
             "vectors",
         ]
@@ -1055,6 +1057,161 @@ fn a_reset_empties_the_owed_files() {
     reset(&conn, GENERATION).unwrap();
 
     assert!(owed_file_rows(&conn).is_empty());
+}
+
+/// `(language, filePath)` of every never-answered (gap) row, sorted.
+fn gap_file_rows(conn: &Connection) -> Vec<(String, String)> {
+    conn.prepare("SELECT language, filePath FROM semantic_gap_files ORDER BY language, filePath")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// `(language, reason)` of every residual row, sorted.
+fn residual_rows(conn: &Connection) -> Vec<(String, String)> {
+    conn.prepare("SELECT language, reason FROM semantic_residual ORDER BY language")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn semantic_pass_at(conn: &Connection, language: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT semanticPassAt FROM language_state WHERE language = ?1",
+        params![language],
+        |row| row.get(0),
+    )
+    .optional()
+    .unwrap()
+    .flatten()
+}
+
+/// A listed incomplete whole-project pass: the files it names are owed one
+/// attempt more (a fresh one at 1), every other owed or given-up file was
+/// answered and is settled, the language is residual with the reason, and
+/// the pending rows go. Run again, a file at its last attempt is given up as
+/// a gap and the count of files left excludes it.
+#[test]
+fn a_residual_record_settles_what_the_pass_answered_and_counts_an_attempt_for_the_rest() {
+    let conn = setup();
+    mark_owed(&conn, "rust", &["a.rs", "b.rs"]);
+    conn.execute("INSERT INTO semantic_gap_files (language, filePath) VALUES ('rust', 'c.rs')", []).unwrap();
+    mark_semantic_pending(&conn, "rust", &["a.rs"]);
+    assert_eq!(semantic_residual_files(&conn, "rust").unwrap(), None, "not residual yet");
+
+    let left =
+        record_language_semantic_residual(&conn, "rust", &["a.rs".to_string(), "d.rs".to_string()], "cold")
+            .unwrap();
+
+    assert_eq!(left, 2);
+    assert_eq!(
+        owed_file_rows(&conn),
+        vec![("rust".to_string(), "a.rs".to_string(), 2), ("rust".to_string(), "d.rs".to_string(), 1)]
+    );
+    assert!(gap_file_rows(&conn).is_empty(), "the pass answered the given-up file");
+    assert_eq!(residual_rows(&conn), vec![("rust".to_string(), "cold".to_string())]);
+    assert!(semantic_pending(&conn).unwrap().is_empty());
+    assert!(semantic_pending_file_rows(&conn).is_empty());
+    assert_eq!(
+        semantic_residual_files(&conn, "rust").unwrap(),
+        Some(vec!["a.rs".to_string(), "d.rs".to_string()])
+    );
+    assert_eq!(semantic_pass_at(&conn, "rust"), None);
+
+    let left = record_language_semantic_residual(&conn, "rust", &["a.rs".to_string()], "cold again").unwrap();
+
+    assert_eq!(left, 0, "a.rs used its last attempt, d.rs was answered");
+    assert!(owed_file_rows(&conn).is_empty());
+    assert_eq!(gap_file_rows(&conn), vec![("rust".to_string(), "a.rs".to_string())]);
+    assert_eq!(semantic_residual_files(&conn, "rust").unwrap(), Some(Vec::new()));
+}
+
+/// A settled residual language is recorded completed (`semanticPassAt`) and
+/// loses its residual, owed and pending rows but keeps its gap rows - what
+/// status counts as never answered. A complete whole-project pass then clears
+/// the gap rows too. Another language's rows stay throughout.
+///
+/// Controls: in `record_language_semantic_pass_settled`, call
+/// `clear_semantic_leftovers` (the gap row goes); in
+/// `record_language_semantic_pass`, call `clear_owed_files` only (the gap and
+/// residual rows stay).
+#[test]
+fn a_settled_pass_keeps_the_never_answered_files_and_a_complete_one_clears_them() {
+    let conn = setup();
+    for language in ["rust", "go"] {
+        conn.execute(
+            "INSERT INTO semantic_gap_files (language, filePath) VALUES (?1, 'gone'), (?1, 'given-up')",
+            params![language],
+        )
+        .unwrap();
+        record_language_semantic_residual(&conn, language, &["left".to_string()], "cold").unwrap();
+        conn.execute(
+            "INSERT INTO semantic_gap_files (language, filePath) VALUES (?1, 'given-up')",
+            params![language],
+        )
+        .unwrap();
+    }
+    mark_semantic_pending(&conn, "rust", &["left"]);
+
+    record_language_semantic_pass_settled(&conn, "rust").unwrap();
+
+    assert!(semantic_pass_at(&conn, "rust").is_some());
+    assert_eq!(residual_rows(&conn), vec![("go".to_string(), "cold".to_string())]);
+    assert_eq!(owed_file_rows(&conn), vec![("go".to_string(), "left".to_string(), 1)]);
+    assert!(semantic_pending_file_rows(&conn).is_empty());
+    assert_eq!(
+        gap_file_rows(&conn),
+        vec![("go".to_string(), "given-up".to_string()), ("rust".to_string(), "given-up".to_string())]
+    );
+
+    record_language_semantic_pass(&conn, "go").unwrap();
+
+    assert!(residual_rows(&conn).is_empty());
+    assert!(owed_file_rows(&conn).is_empty());
+    assert_eq!(gap_file_rows(&conn), vec![("rust".to_string(), "given-up".to_string())]);
+}
+
+/// Status's read: per language with a residual or a gap row, the owed count
+/// when residual and the never-answered count; an index without the tables
+/// reads empty.
+#[test]
+fn semantic_leftovers_count_residual_and_never_answered_files_per_language() {
+    let conn = setup();
+    record_language_semantic_residual(&conn, "rust", &["a.rs".to_string(), "b.rs".to_string()], "cold")
+        .unwrap();
+    conn.execute_batch(
+        "INSERT INTO semantic_gap_files (language, filePath) VALUES ('rust', 'c.rs'), ('go', 'a.go'), ('go', 'b.go');
+         INSERT INTO semantic_owed_files (language, filePath, attempts) VALUES ('python', 'a.py', 1);",
+    )
+    .unwrap();
+
+    assert_eq!(
+        semantic_leftovers(&conn).unwrap(),
+        vec![
+            SemanticLeftover { language: "go".to_string(), residual_files: None, never_answered: 2 },
+            SemanticLeftover { language: "rust".to_string(), residual_files: Some(2), never_answered: 1 },
+        ]
+    );
+    assert!(semantic_leftovers(&Connection::open_in_memory().unwrap()).unwrap().is_empty());
+}
+
+/// `reset` leaves the residual and gap tables empty. Control: leave them out
+/// of `wipe`'s `DROP` list.
+#[test]
+fn a_reset_empties_the_residual_and_never_answered_files() {
+    let conn = setup();
+    record_version(&conn, GENERATION).unwrap();
+    record_language_semantic_residual(&conn, "rust", &["a.rs".to_string()], "cold").unwrap();
+    conn.execute("INSERT INTO semantic_gap_files (language, filePath) VALUES ('rust', 'b.rs')", []).unwrap();
+
+    reset(&conn, GENERATION).unwrap();
+
+    assert!(residual_rows(&conn).is_empty());
+    assert!(gap_file_rows(&conn).is_empty());
 }
 
 // ---------------------------------------------------------------------

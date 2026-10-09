@@ -85,7 +85,7 @@ func TestSemanticPlaceholderKeysCarryAKeyPathThatJoinsBack(t *testing.T) {
 	root := writeProbeProject(t)
 
 	state := newPluginState(root)
-	diff, reason := state.handleSemanticPass(nil)
+	diff, reason, _ := state.handleSemanticPass(nil)
 	if reason != "" {
 		t.Fatalf("pass answered incomplete: %s", reason)
 	}

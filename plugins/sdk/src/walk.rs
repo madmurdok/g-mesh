@@ -11,61 +11,31 @@
 //! the project has, and one that honours `.gitignore` differently from core's
 //! own watcher leaves the two disagreeing about which files exist.
 //!
-//! # The policy, exactly
+//! # The policy
 //!
-//! - **`.gitignore`, layered as git layers it**, from the project root down.
-//!   `require_git` is off, so a fixture directory that is not a git
-//!   repository still honours its own `.gitignore` - which the conformance
-//!   kit needs, since it copies fixtures into a scratch directory with no
-//!   `.git` in it.
-//! - **`.gitignore` above the project root is not read** (`parents(false)`).
-//!   A project is indexed the same way wherever it is checked out; whether
-//!   someone's home directory ignores `*.log` is not a fact about it.
-//! - **The user's global gitignore and `.ignore` files are not read.** Both
-//!   are per machine, and an index that depends on them is an index two
-//!   developers cannot compare.
-//! - **Hidden files are not skipped for being hidden.** `.config/build.ts` is
-//!   source. What is skipped is named explicitly, below.
-//! - **[`BASELINE_EXCLUDED_DIRS`] plus the manifest's `exclude_dirs`**, by
-//!   exact directory name at any depth. The baseline is the two directories
-//!   that are never source in any language; everything else - `node_modules`,
-//!   `vendor`, `target` - belongs to the plugin that knows its ecosystem, and
-//!   is declared in its `plugin.toml` where core's watcher reads the same
-//!   list (`[plugin.workspace] exclude_dirs`).
-//! - **Symlinks are followed, behind a guard.** Why, and why these rules,
-//!   is [ADR 0025](../../../docs/adr/0025-project-walk-follows-symlinks.md).
+//! The walk itself - `.gitignore` layering, name excludes, and the symlink
+//! guard with its invariants - is the `g-mesh-walk` crate (`walk/`), which
+//! core runs too; its crate doc is the policy, exactly. What this module
+//! adds:
 //!
-//! # The guard's invariants
-//!
-//! - A link is judged only after `.gitignore` and the name excludes have
-//!   let it through: an ignored or excluded link is never followed, and a
-//!   gitignored *target* is not a reason to refuse one.
-//! - A link is followed only when its target resolves, its real path is
-//!   inside the root's real path, and no component of that path below the
-//!   root is an excluded directory name. Anything else is refused and
-//!   contributes nothing; the walk goes on.
-//! - A directory is entered through a link at most once, and never through a
-//!   link once it has been entered at all; a directory reached without a
-//!   link is always entered. Nested links can still walk one real directory
-//!   several times (each through a different entered directory), but every
-//!   link is entered once, so the walk ends (walkdir's own ancestor check is
-//!   the backstop) and files are deduplicated by real path.
-//! - Every file appears once, keyed by its real path. Its spelling is the one
-//!   with no followed link above it when the plain walk reaches it, and the
-//!   first in walk order otherwise - sibling names never decide the identity
-//!   of a file the plain walk reaches.
-//! - Paths are relative to the root as given, even when the root itself is
-//!   reached through a link; real paths are only ever compared with real
-//!   paths.
+//! - **Which names are excluded:** [`BASELINE_EXCLUDED_DIRS`] plus the
+//!   manifest's `exclude_dirs`, by exact directory name at any depth. The
+//!   baseline is the two directories that are never source in any language;
+//!   everything else - `node_modules`, `vendor`, `target` - belongs to the
+//!   plugin that knows its ecosystem, and is declared in its `plugin.toml`
+//!   where core's watcher reads the same list (`[plugin.workspace]
+//!   exclude_dirs`).
+//! - **Which files are claimed:** the manifest's extensions, applied before
+//!   the walk picks one spelling per real file.
+//! - **The scope** a language server is told to leave out ([`walk_scope`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
-
-use ignore::WalkBuilder;
 
 use crate::path::RelPath;
+
+pub use g_mesh_walk::LinkRefusal;
 
 /// Directory names no walk ever descends into, whatever the manifest says.
 ///
@@ -92,7 +62,7 @@ pub const BASELINE_EXCLUDED_DIRS: [&str; 2] = [".git", ".claude"];
 /// failure unreproducible. The order is component-wise path order.
 ///
 /// A file reachable both directly and through a followed symlink is listed
-/// once, under its direct spelling (this module's doc).
+/// once, under its direct spelling (`g-mesh-walk`'s crate doc).
 pub fn walk_project(root: &Path, extensions: &[String], exclude_dirs: &[String]) -> Vec<RelPath> {
     walk_project_detailed(root, extensions, exclude_dirs).files
 }
@@ -141,44 +111,29 @@ pub enum LinkOutcome {
     Refused(LinkRefusal),
 }
 
-/// Why a symlink was not followed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkRefusal {
-    /// The target does not exist.
-    Dangling,
-    /// The target's real path is outside the root's.
-    OutsideRoot,
-    /// The target's real path passes through an excluded directory name.
-    ExcludedTarget,
+fn outcome_of(outcome: g_mesh_walk::LinkOutcome) -> LinkOutcome {
+    match outcome {
+        g_mesh_walk::LinkOutcome::Aliases(spelling) => LinkOutcome::Aliases(RelPath::new(spelling)),
+        g_mesh_walk::LinkOutcome::Followed => LinkOutcome::Followed,
+        g_mesh_walk::LinkOutcome::Duplicate(spelling) => LinkOutcome::Duplicate(RelPath::new(spelling)),
+        g_mesh_walk::LinkOutcome::Refused(reason) => LinkOutcome::Refused(reason),
+    }
 }
 
 /// [`walk_project`], with the symlinks it met and what became of each.
 pub fn walk_project_detailed(root: &Path, extensions: &[String], exclude_dirs: &[String]) -> WalkedProject {
     let claimed: Vec<String> = extensions.iter().map(|ext| ext.to_lowercase()).collect();
-    let (builder, guard) = walker(root, exclude_dirs);
-
-    let mut walked: Vec<(PathBuf, RelPath)> = Vec::new();
-    for entry in builder.build() {
-        // An unreadable directory contributes nothing rather than failing the
-        // walk: a project with one permission-denied subdirectory still has an
-        // index worth having, and the alternative is no index at all. The
-        // links the iterator fails on are recorded first.
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                guard.note_error(&err);
-                continue;
-            }
-        };
-        if !entry.file_type().is_some_and(|file_type| file_type.is_file()) {
-            continue;
-        }
-        let Some(path) = RelPath::relative_to(root, entry.path()) else { continue };
-        if path.extension().is_some_and(|extension| claimed.contains(&extension)) {
-            walked.push((entry.into_path(), path));
-        }
+    let walk = g_mesh_walk::walk_filtered(root, &excluded_names(exclude_dirs), |relative| {
+        RelPath::new(relative).extension().is_some_and(|extension| claimed.contains(&extension))
+    });
+    WalkedProject {
+        files: walk.files.into_iter().map(|file| RelPath::new(file.relative)).collect(),
+        links: walk
+            .links
+            .into_iter()
+            .map(|link| WalkedLink { at: RelPath::new(link.at), outcome: outcome_of(link.outcome) })
+            .collect(),
     }
-    guard.finish(walked)
 }
 
 /// The most entries [`walk_scope`] returns, [`WalkScope::pruned`] and
@@ -213,13 +168,8 @@ pub struct WalkScope {
 pub fn walk_scope(root: &Path, exclude_dirs: &[String]) -> WalkScope {
     let excluded = excluded_names(exclude_dirs);
 
-    let entered: HashSet<PathBuf> = walker(root, exclude_dirs)
-        .0
-        .build()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.depth() == 0 || entry.file_type().is_some_and(|file_type| file_type.is_dir()))
-        .map(|entry| entry.into_path())
-        .collect();
+    let entered: HashSet<PathBuf> =
+        g_mesh_walk::walk_dirs(root, &excluded).dirs.into_iter().map(|dir| dir.path).collect();
 
     let mut pruned = Vec::new();
     for dir in &entered {
@@ -263,268 +213,6 @@ fn excluded_names(exclude_dirs: &[String]) -> Vec<String> {
     }
     names
 }
-
-/// The walker both [`walk_project`] and [`walk_scope`] run: the policy in this
-/// module's doc, and nothing else. The guard it returns has seen every entry
-/// the builder's walk let through once that walk has run.
-fn walker(root: &Path, exclude_dirs: &[String]) -> (WalkBuilder, Arc<LinkGuard>) {
-    let excluded = excluded_names(exclude_dirs);
-    let guard = Arc::new(LinkGuard::new(root, excluded.clone()));
-    let mut walker = WalkBuilder::new(root);
-    walker
-        .hidden(false)
-        .parents(false)
-        .ignore(false)
-        .git_ignore(true)
-        .git_global(false)
-        .git_exclude(false)
-        .require_git(false)
-        .follow_links(true)
-        .sort_by_file_name(|a, b| a.cmp(b));
-    let filter_guard = Arc::clone(&guard);
-    // `ignore` runs this after `.gitignore` has let the entry through, and
-    // never for the root.
-    walker.filter_entry(move |entry| {
-        // Directories only: a *file* called `vendor` is a file, and
-        // `exclude_dirs` is a list of directory names. Checked before the
-        // guard, so a link with an excluded name is never resolved.
-        let is_dir = entry.file_type().is_some_and(|file_type| file_type.is_dir());
-        if is_dir && excluded.iter().any(|name| entry.file_name() == name.as_str()) {
-            return false;
-        }
-        if entry.path_is_symlink() {
-            filter_guard.admit_link(entry.path(), is_dir)
-        } else {
-            if is_dir {
-                filter_guard.entered_dir(entry.path());
-            }
-            true
-        }
-    });
-    (walker, guard)
-}
-
-/// The symlink guard's state for one walk. Shared with the walker's
-/// `filter_entry`, which must be `Send + Sync + 'static`; the lock is taken
-/// only for directories and links.
-struct LinkGuard {
-    /// The root as given: every path the walk reports starts with it.
-    root: PathBuf,
-    /// The root's real path, or the root itself if it does not resolve.
-    root_real: PathBuf,
-    excluded: Vec<String>,
-    state: Mutex<GuardState>,
-}
-
-#[derive(Default)]
-struct GuardState {
-    /// Followed links: as-reached path -> real path.
-    followed: HashMap<PathBuf, PathBuf>,
-    /// Every directory entered, by real path.
-    entered: HashMap<PathBuf, Entered>,
-    /// Every link judged, in the order met.
-    judged: Vec<Judged>,
-}
-
-struct Entered {
-    /// The spelling it was first entered by.
-    first: PathBuf,
-    /// The spelling with no followed link above it, once the plain walk has
-    /// entered it.
-    plain: Option<PathBuf>,
-}
-
-struct Judged {
-    at: PathBuf,
-    verdict: Verdict,
-}
-
-enum Verdict {
-    FollowedDir(PathBuf),
-    FollowedFile(PathBuf),
-    /// A directory link whose target was already entered.
-    AlreadyEntered(PathBuf),
-    Refused(LinkRefusal),
-}
-
-impl LinkGuard {
-    fn new(root: &Path, excluded: Vec<String>) -> Self {
-        let root_real = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let mut state = GuardState::default();
-        state.entered.insert(
-            root_real.clone(),
-            Entered { first: root.to_path_buf(), plain: Some(root.to_path_buf()) },
-        );
-        Self { root: root.to_path_buf(), root_real, excluded, state: Mutex::new(state) }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, GuardState> {
-        // A panic while holding the lock leaves plain maps behind, which are
-        // still consistent enough to finish a walk with.
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// `path`'s real path, and whether a followed link is above it (or is
-    /// it). With no link followed yet this is a join, no lookup.
-    fn real_of(&self, state: &GuardState, path: &Path) -> (PathBuf, bool) {
-        if !state.followed.is_empty() {
-            for ancestor in path.ancestors() {
-                if ancestor == self.root {
-                    break;
-                }
-                if let Some(real) = state.followed.get(ancestor) {
-                    let suffix = path.strip_prefix(ancestor).unwrap_or(Path::new(""));
-                    return (real.join(suffix), true);
-                }
-            }
-        }
-        let relative = path.strip_prefix(&self.root).unwrap_or(path);
-        (self.root_real.join(relative), false)
-    }
-
-    /// A directory reached without being a link itself: always entered.
-    fn entered_dir(&self, path: &Path) {
-        let mut state = self.lock();
-        let (real, via_link) = self.real_of(&state, path);
-        let entered =
-            state.entered.entry(real).or_insert_with(|| Entered { first: path.to_path_buf(), plain: None });
-        if !via_link && entered.plain.is_none() {
-            entered.plain = Some(path.to_path_buf());
-        }
-    }
-
-    /// Whether to follow the link at `path`.
-    fn admit_link(&self, path: &Path, is_dir: bool) -> bool {
-        let verdict = self.judge(path, is_dir);
-        let follow = matches!(verdict, Verdict::FollowedDir(_) | Verdict::FollowedFile(_));
-        let mut state = self.lock();
-        match &verdict {
-            Verdict::FollowedDir(real) => {
-                state.followed.insert(path.to_path_buf(), real.clone());
-                state.entered.insert(real.clone(), Entered { first: path.to_path_buf(), plain: None });
-            }
-            Verdict::FollowedFile(real) => {
-                state.followed.insert(path.to_path_buf(), real.clone());
-            }
-            Verdict::AlreadyEntered(_) | Verdict::Refused(_) => {}
-        }
-        state.judged.push(Judged { at: path.to_path_buf(), verdict });
-        follow
-    }
-
-    fn judge(&self, path: &Path, is_dir: bool) -> Verdict {
-        let Ok(real) = fs::canonicalize(path) else { return Verdict::Refused(LinkRefusal::Dangling) };
-        let Ok(below_root) = real.strip_prefix(&self.root_real) else {
-            return Verdict::Refused(LinkRefusal::OutsideRoot);
-        };
-        if below_root
-            .components()
-            .any(|part| self.excluded.iter().any(|name| part.as_os_str() == name.as_str()))
-        {
-            return Verdict::Refused(LinkRefusal::ExcludedTarget);
-        }
-        if !is_dir {
-            return Verdict::FollowedFile(real);
-        }
-        if self.lock().entered.contains_key(&real) {
-            Verdict::AlreadyEntered(real)
-        } else {
-            Verdict::FollowedDir(real)
-        }
-    }
-
-    /// Records the two kinds of link the directory iterator fails on before
-    /// `filter_entry` sees them: a dangling link and a link to an ancestor.
-    fn note_error(&self, err: &ignore::Error) {
-        let verdict_at = match innermost(err) {
-            (_, Some(ignore::Error::Loop { child, .. })) => {
-                fs::canonicalize(child).ok().map(|real| (child.clone(), Verdict::AlreadyEntered(real)))
-            }
-            (Some(path), _) => {
-                let is_link =
-                    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
-                (is_link && fs::metadata(path).is_err())
-                    .then(|| (path.to_path_buf(), Verdict::Refused(LinkRefusal::Dangling)))
-            }
-            _ => None,
-        };
-        let Some((at, verdict)) = verdict_at else { return };
-        self.lock().judged.push(Judged { at, verdict });
-    }
-
-    /// The winner pass: one spelling per real file, then every judged link's
-    /// outcome.
-    fn finish(&self, walked: Vec<(PathBuf, RelPath)>) -> WalkedProject {
-        let state = self.lock();
-
-        // Real path -> index in `walked` of its winning spelling.
-        let mut winners: HashMap<PathBuf, (usize, bool)> = HashMap::new();
-        for (index, (path, _)) in walked.iter().enumerate() {
-            let (real, via_link) = self.real_of(&state, path);
-            winners
-                .entry(real)
-                .and_modify(|winner| {
-                    if winner.1 && !via_link {
-                        *winner = (index, via_link);
-                    }
-                })
-                .or_insert((index, via_link));
-        }
-        let mut keep = vec![false; walked.len()];
-        for (index, _) in winners.values() {
-            keep[*index] = true;
-        }
-
-        let relative =
-            |path: &Path| RelPath::relative_to(&self.root, path).unwrap_or_else(|| RelPath::new(""));
-        let mut links = Vec::new();
-        for judged in &state.judged {
-            let outcome = match &judged.verdict {
-                Verdict::Refused(reason) => LinkOutcome::Refused(*reason),
-                Verdict::FollowedDir(real) | Verdict::AlreadyEntered(real) => match state.entered.get(real) {
-                    Some(Entered { plain: Some(plain), .. }) => LinkOutcome::Aliases(relative(plain)),
-                    Some(Entered { first, .. }) if *first != judged.at => {
-                        LinkOutcome::Duplicate(relative(first))
-                    }
-                    _ => LinkOutcome::Followed,
-                },
-                Verdict::FollowedFile(real) => {
-                    let Some(&(index, via_link)) = winners.get(real) else { continue };
-                    let winner = &walked[index].0;
-                    if *winner == judged.at {
-                        LinkOutcome::Followed
-                    } else if via_link {
-                        LinkOutcome::Duplicate(relative(winner))
-                    } else {
-                        LinkOutcome::Aliases(relative(winner))
-                    }
-                }
-            };
-            links.push(WalkedLink { at: relative(&judged.at), outcome });
-        }
-
-        let files =
-            walked.into_iter().zip(keep).filter_map(|((_, path), kept)| kept.then_some(path)).collect();
-        WalkedProject { files, links }
-    }
-}
-
-/// The path an `ignore` error carries, and the error under its wrappers.
-fn innermost(err: &ignore::Error) -> (Option<&Path>, Option<&ignore::Error>) {
-    let mut path = None;
-    let mut current = err;
-    loop {
-        match current {
-            ignore::Error::WithPath { path: at, err } => {
-                path.get_or_insert(at.as_path());
-                current = err;
-            }
-            ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => current = err,
-            other => return (path, Some(other)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -243,7 +243,9 @@ func nodesEqual(a, b wireNode) bool {
 // stayed put but Go's `language_state.semanticPassAt` got set anyway, and
 // the receiver-call gap dropped out of the MCP instructions despite no
 // semantic tier having actually run.
-func (s *pluginState) handleSemanticPass(filePaths []string) (fileChangeDiff, string) {
+//
+// The third value is the wire's `unfinishedFiles` - see semanticEngine.run.
+func (s *pluginState) handleSemanticPass(filePaths []string) (fileChangeDiff, string, []string) {
 	return s.semantic.run(s.workspace, filePaths)
 }
 
@@ -278,7 +280,7 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 			// A structural reparse has nothing to be incomplete about
 			// (core/src/watcher/apply.rs's own comment on this same
 			// distinction) - always `false`.
-			writeResult(out, env.ID, diff, "")
+			writeResult(out, env.ID, diff, "", nil)
 		}
 		return
 
@@ -296,9 +298,9 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 		} else {
 			logf("semantic pass requested for %d file(s)", len(params.FilePaths))
 		}
-		diff, incompleteReason := state.handleSemanticPass(params.FilePaths)
+		diff, incompleteReason, unfinished := state.handleSemanticPass(params.FilePaths)
 		if hasID {
-			writeResult(out, env.ID, diff, incompleteReason)
+			writeResult(out, env.ID, diff, incompleteReason, unfinished)
 		}
 		return
 
@@ -366,15 +368,20 @@ func workspaceChangedFilePath(params json.RawMessage) string {
 
 // writeResult answers a request with a diff. A non-empty `incompleteReason`
 // marks the answer incomplete and says why; "" is a complete answer, which
-// carries neither field.
-func writeResult(out io.Writer, id json.RawMessage, diff fileChangeDiff, incompleteReason string) {
-	body, err := json.Marshal(fileChangeResponse{
+// carries neither field. A nil `unfinished` omits `unfinishedFiles`; a
+// non-nil one, empty included, is sent as the list.
+func writeResult(out io.Writer, id json.RawMessage, diff fileChangeDiff, incompleteReason string, unfinished []string) {
+	response := fileChangeResponse{
 		JSONRPC:          jsonrpcVersion,
 		ID:               id,
 		Result:           diff,
 		Incomplete:       incompleteReason != "",
 		IncompleteReason: incompleteReason,
-	})
+	}
+	if unfinished != nil {
+		response.UnfinishedFiles = &unfinished
+	}
+	body, err := json.Marshal(response)
 	if err != nil {
 		logf("failed to encode response: %v", err)
 		return

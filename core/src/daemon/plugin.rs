@@ -47,8 +47,8 @@ use crate::protocol::types::{
 };
 use crate::storage::index_store::{self, IndexStore};
 use crate::watcher::apply::{
-    apply_file_change as apply_file_change_diff, apply_scoped_semantic_pass, apply_semantic_pass,
-    reextract_file,
+    apply_file_change as apply_file_change_diff, apply_residual_semantic_pass, apply_scoped_semantic_pass,
+    apply_semantic_pass, reextract_file, SemanticPassOutcome,
 };
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -1166,13 +1166,20 @@ impl PluginProcess {
     /// semantic_pass_project_timeout`] - see that method and
     /// [`RoundTripTimeouts`]'s own doc comment for why a flat timeout here is
     /// wrong for anything past a small project.
+    ///
+    /// `file_paths` empty asks the whole project. Non-empty, it is a residual
+    /// language's owed files (GM-521, `storage::schema::
+    /// semantic_residual_files`) and the pass is
+    /// `watcher::apply::apply_residual_semantic_pass`; `file_count` is then
+    /// their number. The returned [`SemanticPassOutcome`] says what the
+    /// caller records.
     pub fn semantic_pass(
         &self,
         conn: &IndexStore,
         file_paths: Vec<String>,
         file_count: usize,
         embedding: &EmbeddingPipeline,
-    ) -> Result<()> {
+    ) -> Result<SemanticPassOutcome> {
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
         let timeout = self.timeouts.semantic_pass_project_timeout(file_count);
         let result = {
@@ -1181,18 +1188,32 @@ impl PluginProcess {
             let mut on_timeout = self.kill_on_timeout(child);
             // See `Self::ensure_fresh`'s identical comment: `conn` is handed
             // through as the `Mutex` it is (GM-396).
-            apply_semantic_pass(
-                reader,
-                writer,
-                conn,
-                &self.manifest.language,
-                self.manifest.capabilities.semantic_sweep.then_some(self.manifest.language.as_str()),
-                file_paths,
-                id,
-                embedding,
-                timeout,
-                &mut on_timeout,
-            )
+            if file_paths.is_empty() {
+                apply_semantic_pass(
+                    reader,
+                    writer,
+                    conn,
+                    &self.manifest.language,
+                    self.manifest.capabilities.semantic_sweep.then_some(self.manifest.language.as_str()),
+                    file_paths,
+                    id,
+                    embedding,
+                    timeout,
+                    &mut on_timeout,
+                )
+            } else {
+                apply_residual_semantic_pass(
+                    reader,
+                    writer,
+                    conn,
+                    &self.manifest.language,
+                    file_paths,
+                    id,
+                    embedding,
+                    timeout,
+                    &mut on_timeout,
+                )
+            }
         };
         self.relaunch_after_timeout_if_needed(&result);
         result

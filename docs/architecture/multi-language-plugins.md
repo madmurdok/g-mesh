@@ -1118,6 +1118,20 @@ unspecified.
    `SemanticAnswer::unfinished`, which `LspBridge::answer` fills on every
    return; the bridge no longer keeps an owed set of its own (GM-487's), so the
    set survives plugin and daemon restarts.
+9. **Core tells the plugin how long it will wait (GM-521).** `semanticPass`
+   gains `budgetMs` (optional, no protocol bump: a plugin that predates it
+   ignores the key, and Go's `encoding/json` drops unknown fields). Core sets
+   it to the round-trip timeout it applies to that very request:
+   `semantic_pass_project_timeout(n)` for a whole-project pass and for a
+   residual pass of `n` owed files, the per-file timeout for a per-file one.
+   It exists because a plugin cannot tell a residual pass from a per-file one:
+   both send a file list, and a per-file pass carries owed files too, so a
+   budget inferred from the file count would plan a many-file per-file pass
+   far past core's flat per-file timeout. The SDK reckons core's deadline
+   from the request's arrival (`SemanticEngine::set_pass_deadline`), and
+   `LspBridge` plans to three quarters of the time left until it, keeping the
+   last quarter for sending the answer - the same ratio its own budgets keep to
+   core's defaults. Absent, the bridge's own budgets apply as before.
 
 Two things the sketch above did not say, found while building it:
 

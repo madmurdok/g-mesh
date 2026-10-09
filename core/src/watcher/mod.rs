@@ -2,15 +2,19 @@ pub mod apply;
 pub mod batch;
 pub mod burst;
 pub mod debounce;
+pub mod ignore_layers;
 pub mod staleness;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Config, ErrorKind as NotifyErrorKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
+
+use crate::project_walk::Remap;
+use ignore_layers::{IgnoreLayers, GITIGNORE_FILE_NAME};
 
 /// How often the polling fallback (see [`ProjectWatcher::new_inner`]) rescans
 /// its subtree for changes. Polling a large subtree is inherently more
@@ -29,9 +33,10 @@ const POLL_FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
 pub const BASELINE_EXCLUDED_DIRS: [&str; 2] = [".git", ".claude"];
 
 /// Watches a project root for filesystem changes, filtering out anything
-/// `.gitignore` (plus `.git` and `.claude`, which `.gitignore` files don't
-/// normally list - they're special-cased the same way the JS/TS plugin's
-/// bulk-index walk hard-excludes them regardless of `.gitignore` contents).
+/// a `.gitignore` at any level ignores (plus `.git` and `.claude`, which
+/// `.gitignore` files don't normally list - they're special-cased the same
+/// way the JS/TS plugin's bulk-index walk hard-excludes them regardless of
+/// `.gitignore` contents).
 /// `.claude` holds Claude Code's own session/worktree artifacts (e.g. full
 /// project copies under `.claude/worktrees/`), never real project source.
 pub struct ProjectWatcher {
@@ -43,7 +48,11 @@ pub struct ProjectWatcher {
     // it stops the poll loop.
     _poll_fallback: Option<PollWatcher>,
     events: Receiver<PathBuf>,
-    gitignore: Gitignore,
+    root: PathBuf,
+    // The layers and the link table, loaded by one walk. Swapped whole by
+    // `reload_ignores` when a `.gitignore` or a link may have changed; read
+    // for every event.
+    ignores: RwLock<IgnoreLayers>,
 }
 
 impl ProjectWatcher {
@@ -75,20 +84,7 @@ impl ProjectWatcher {
             .with_context(|| format!("failed to canonicalize project root {}", root.as_ref().display()))?;
         let root = root.as_path();
 
-        let mut builder = GitignoreBuilder::new(root);
-        for dir in BASELINE_EXCLUDED_DIRS {
-            builder
-                .add_line(None, &format!("{dir}/"))
-                .with_context(|| format!("failed to add built-in {dir} exclusion"))?;
-        }
-        // A missing .gitignore is the common case (no ignore rules yet),
-        // not an error - only propagate genuine parse failures.
-        if let Some(err) = builder.add(root.join(".gitignore")) {
-            if root.join(".gitignore").exists() {
-                return Err(err).context("failed to parse .gitignore");
-            }
-        }
-        let gitignore = builder.build().context("failed to build gitignore matcher")?;
+        let ignores = RwLock::new(IgnoreLayers::load(root));
 
         let (tx, rx) = channel();
         let mut watcher = {
@@ -146,20 +142,93 @@ impl ProjectWatcher {
             Err(err) => return Err(err).with_context(|| format!("failed to watch {}", root.display())),
         };
 
-        Ok(Self { _watcher: watcher, _poll_fallback: poll_fallback, events: rx, gitignore })
+        Ok(Self {
+            _watcher: watcher,
+            _poll_fallback: poll_fallback,
+            events: rx,
+            root: root.to_path_buf(),
+            ignores,
+        })
     }
 
-    fn is_ignored(&self, path: &Path) -> bool {
-        // `matched` alone only tests the exact path against patterns; a
-        // directory-only pattern like "node_modules/" wouldn't cover a file
-        // beneath it without also checking ancestors, same as real git.
-        let is_dir = path.is_dir();
-        self.gitignore.matched_path_or_any_parents(path, is_dir).is_ignore()
+    /// Whether the project's walks would leave `path` out, by the layers as
+    /// last (re)loaded: see [`IgnoreLayers::is_ignored`].
+    pub fn is_ignored(&self, path: &Path) -> bool {
+        self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner()).is_ignored(path)
+    }
+
+    /// Re-reads every `.gitignore` under the root and the link table, so
+    /// later events (and [`Self::retain_unignored`]) are remapped and
+    /// filtered by what the tree says now. Returns the project-relative
+    /// spellings of the links whose row changed (created, removed,
+    /// retargeted, judged differently). The read happens outside the lock;
+    /// only the swap holds it.
+    pub fn reload_ignores(&self) -> Vec<String> {
+        let layers = IgnoreLayers::load(&self.root);
+        let mut current = self.ignores.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = current.links().changed_links(layers.links());
+        *current = layers;
+        changed
+    }
+
+    /// Reloads the layers and the link table when a settled batch may have
+    /// changed them: a path named `.gitignore` (edited, created or deleted), a
+    /// directory (a move can carry a nested `.gitignore` without an event for
+    /// the file itself), a symlink, or a link spelling in the current table or
+    /// an ancestor of one (a removed link is neither a directory nor a
+    /// symlink any more) - except a link the table holds unchanged (same real
+    /// target; [`LinkTable::holds`](crate::project_walk::LinkTable::holds)),
+    /// which is what an edit to a file link's target is remapped to. The root itself does not count: macOS reports it
+    /// for any write inside. Returns `None` without a reload, else the
+    /// changed link spellings ([`Self::reload_ignores`]).
+    pub fn reload_ignores_if_changed(&self, settled: &[PathBuf]) -> Option<Vec<String>> {
+        let changed = {
+            let current = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+            settled.iter().any(|path| {
+                path.file_name() == Some(std::ffi::OsStr::new(GITIGNORE_FILE_NAME))
+                    || (path.as_path() != self.root
+                        && (path.is_dir()
+                            || ((path.is_symlink() || current.links().concerns(path))
+                                && !current.links().holds(path))))
+            })
+        };
+        changed.then(|| self.reload_ignores())
+    }
+
+    /// Drops from a settled batch the paths the current layers ignore: an
+    /// event that passed [`Self::next_change`] under the old layers but sits
+    /// under what a `.gitignore` in the same batch now ignores. A file link's
+    /// own path, which [`Self::next_change`] keeps as spelled so it reloads
+    /// the table, is first placed by the reloaded table
+    /// ([`LinkTable::file_link_to_indexed`](crate::project_walk::LinkTable::file_link_to_indexed)):
+    /// a refused one dropped, a duplicate or aliasing one moved to the
+    /// spelling the walk lists (once, if the batch already holds it).
+    pub fn retain_unignored(&self, settled: &mut Vec<PathBuf>) {
+        let layers = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut seen = std::collections::HashSet::new();
+        let placed: Vec<PathBuf> = std::mem::take(settled)
+            .into_iter()
+            .filter_map(|path| match layers.links().file_link_to_indexed(&path) {
+                Remap::Keep => Some(path),
+                Remap::To(indexed) => Some(indexed),
+                Remap::Drop => None,
+            })
+            .collect();
+        for path in placed {
+            if !layers.is_ignored(&path) && seen.insert(path.clone()) {
+                settled.push(path);
+            }
+        }
     }
 
     /// Returns the next change to a non-ignored path, waiting up to
-    /// `timeout`. `None` means either nothing arrived in time or the
-    /// watcher was dropped.
+    /// `timeout`, spelled as the walk lists it. `None` means either nothing
+    /// arrived in time or the watcher was dropped.
+    ///
+    /// The link table's remap runs before the ignore check: the real spelling
+    /// of a file reached only through a link is gitignored by construction,
+    /// so filtering first would drop every event for it. A path under a
+    /// refused link is dropped.
     pub fn next_change(&self, timeout: Duration) -> Option<PathBuf> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -168,8 +237,17 @@ impl ProjectWatcher {
                 return None;
             }
             match self.events.recv_timeout(remaining) {
-                Ok(path) if self.is_ignored(&path) => continue,
-                Ok(path) => return Some(path),
+                Ok(path) => {
+                    let layers = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let path = match layers.to_indexed(&path) {
+                        Remap::Keep => path,
+                        Remap::To(indexed) => indexed,
+                        Remap::Drop => continue,
+                    };
+                    if !layers.is_ignored(&path) {
+                        return Some(path);
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => return None,
                 Err(RecvTimeoutError::Disconnected) => return None,
             }
@@ -309,5 +387,539 @@ mod tests {
 
         let result = ProjectWatcher::new_simulating_watch_error(tmp.path(), simulated);
         assert!(result.is_err(), "a non-watch-limit error must not be silently swallowed by the fallback");
+    }
+
+    // -----------------------------------------------------------------
+    // Layered, reloadable .gitignore matching
+    // -----------------------------------------------------------------
+
+    /// Every change [`ProjectWatcher::next_change`] surfaces until `path` does
+    /// (inclusive), or `None` if `path` never surfaced within `timeout`.
+    fn changes_until(watcher: &ProjectWatcher, path: &Path, timeout: Duration) -> Option<Vec<PathBuf>> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut seen = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            if let Some(changed) = watcher.next_change(remaining) {
+                let done = changed == path;
+                seen.push(changed);
+                if done {
+                    return Some(seen);
+                }
+            }
+        }
+    }
+
+    /// Every change surfaced within `window`.
+    fn changes_within(watcher: &ProjectWatcher, window: Duration) -> Vec<PathBuf> {
+        let deadline = std::time::Instant::now() + window;
+        let mut seen = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return seen;
+            }
+            if let Some(changed) = watcher.next_change(remaining) {
+                seen.push(changed);
+            }
+        }
+    }
+
+    fn write(root: &Path, relative: &str, contents: &str) -> PathBuf {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// B0: a save under a directory that only a *nested* `.gitignore`
+    /// ignores surfaces no change; a sibling outside it still does.
+    ///
+    /// Control: read only the root `.gitignore` in `IgnoreLayers::load` -
+    /// `src/gen/a.ts` surfaces.
+    #[test]
+    fn a_save_under_a_directory_a_nested_gitignore_ignores_produces_no_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root, "src/.gitignore", "gen/\n");
+        fs::create_dir_all(root.join("src/gen")).unwrap();
+
+        let watcher = ProjectWatcher::new(&root).unwrap();
+        drain_startup_noise(&watcher);
+
+        let ignored_dir = root.join("src/gen");
+        write(&root, "src/gen/a.ts", "export const a = 1;\n");
+        let tracked = write(&root, "src/b.ts", "export const b = 1;\n");
+
+        let mut seen = changes_until(&watcher, &tracked, EVENT_TIMEOUT)
+            .expect("a save outside the nested-ignored directory must still surface");
+        // No order is guaranteed between the two writes' events: keep
+        // listening after the tracked one.
+        seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
+        assert!(
+            seen.iter().all(|path| !path.starts_with(&ignored_dir)),
+            "nothing under src/gen (ignored by src/.gitignore) may surface: {seen:?}"
+        );
+    }
+
+    /// The deepest layer with an opinion decides: a nested `!` re-includes a
+    /// file the root ignores, a nested pattern ignores what the root allows,
+    /// and an ignored ancestor directory hides its whole subtree.
+    ///
+    /// Control: consult the layers root-first in `IgnoreLayers::matched` -
+    /// `src/keep.gen.ts` reads as ignored.
+    #[test]
+    fn the_deepest_gitignore_with_an_opinion_decides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root, ".gitignore", "*.gen.ts\nbuild/\n");
+        write(&root, "src/.gitignore", "!keep.gen.ts\nlocal.ts\n");
+        let keep = write(&root, "src/keep.gen.ts", "");
+        let other = write(&root, "src/other.gen.ts", "");
+        let local = write(&root, "src/local.ts", "");
+        let plain = write(&root, "src/plain.ts", "");
+        let under_build = write(&root, "build/src/deep.ts", "");
+
+        let watcher = ProjectWatcher::new(&root).unwrap();
+
+        assert!(!watcher.is_ignored(&keep), "src/.gitignore's `!keep.gen.ts` re-includes it");
+        assert!(watcher.is_ignored(&other), "the root's *.gen.ts still applies under src");
+        assert!(watcher.is_ignored(&local), "src/.gitignore ignores what the root allows");
+        assert!(!watcher.is_ignored(&plain));
+        assert!(watcher.is_ignored(&under_build), "an ignored ancestor hides its subtree");
+    }
+
+    /// An edited `.gitignore` (root or nested) governs matching only after
+    /// `reload_ignores`, with no restart; until then the old rules hold.
+    ///
+    /// Control: make `reload_ignores` a no-op - the un-ignored file still
+    /// reads as ignored.
+    #[test]
+    fn reloading_after_a_gitignore_edit_applies_the_new_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root, ".gitignore", "generated/\n");
+        let generated = write(&root, "generated/x.ts", "");
+        let nested = write(&root, "src/gen/y.ts", "");
+
+        let watcher = ProjectWatcher::new(&root).unwrap();
+        assert!(watcher.is_ignored(&generated));
+        assert!(!watcher.is_ignored(&nested));
+
+        write(&root, ".gitignore", "");
+        write(&root, "src/.gitignore", "gen/\n");
+        assert!(watcher.is_ignored(&generated), "without a reload the layers loaded at start stay");
+        assert!(!watcher.is_ignored(&nested), "without a reload a new nested .gitignore is not read");
+
+        watcher.reload_ignores();
+        assert!(!watcher.is_ignored(&generated), "the root .gitignore no longer ignores generated/");
+        assert!(watcher.is_ignored(&nested), "the new src/.gitignore ignores src/gen/");
+
+        // And the events follow: a save in the un-ignored directory surfaces.
+        drain_startup_noise(&watcher);
+        write(&root, "generated/x.ts", "export const x = 1;\n");
+        assert!(
+            changes_until(&watcher, &generated, EVENT_TIMEOUT).is_some(),
+            "a save under generated/ must surface once the reloaded layers allow it"
+        );
+    }
+
+    /// A `.gitignore` that lists itself still surfaces its own edits (or the
+    /// layers could never be reloaded from it); one inside an ignored
+    /// directory does not.
+    ///
+    /// Control: drop the `.gitignore` special case in
+    /// `IgnoreLayers::is_ignored` - the self-listing file reads as ignored and
+    /// its edit never surfaces.
+    #[test]
+    fn a_gitignore_that_ignores_itself_still_delivers_its_own_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let own = write(&root, ".gitignore", ".gitignore\nvendor/\n");
+        let in_ignored_dir = write(&root, "vendor/.gitignore", "*.tmp\n");
+
+        let watcher = ProjectWatcher::new(&root).unwrap();
+        assert!(!watcher.is_ignored(&own), "a .gitignore listing itself is not ignored");
+        assert!(watcher.is_ignored(&in_ignored_dir), "a .gitignore inside an ignored directory is");
+
+        drain_startup_noise(&watcher);
+        write(&root, ".gitignore", ".gitignore\nvendor/\n*.log\n");
+        assert!(
+            changes_until(&watcher, &own, EVENT_TIMEOUT).is_some(),
+            "the self-ignoring .gitignore's edit must surface"
+        );
+    }
+
+    /// `reload_ignores_if_changed` reloads for a settled path named
+    /// `.gitignore` (even one already deleted) or a directory other than the
+    /// root - a moved-in directory can carry a `.gitignore` no event names -
+    /// and not for plain files or the root alone.
+    ///
+    /// Control: drop the `is_dir` arm in `reload_ignores_if_changed` - the
+    /// moved-in directory's rules are never read.
+    #[test]
+    fn a_settled_directory_or_gitignore_reloads_the_layers_and_plain_files_do_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let plain = write(&root, "src/a.ts", "");
+        let watcher = ProjectWatcher::new(&root).unwrap();
+
+        // A directory moved in from outside the project, carrying its own
+        // .gitignore.
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "pkg/.gitignore", "out/\n");
+        write(outside.path(), "pkg/out/built.ts", "");
+        fs::rename(outside.path().join("pkg"), root.join("pkg")).unwrap();
+        let built = root.join("pkg/out/built.ts");
+        assert!(!watcher.is_ignored(&built), "not read before a reload");
+
+        assert!(
+            watcher.reload_ignores_if_changed(std::slice::from_ref(&plain)).is_none(),
+            "a plain file reloads nothing"
+        );
+        assert!(
+            watcher.reload_ignores_if_changed(std::slice::from_ref(&root)).is_none(),
+            "the root alone reloads nothing"
+        );
+        assert!(!watcher.is_ignored(&built), "still the old layers");
+
+        assert!(watcher.reload_ignores_if_changed(&[plain.clone(), root.join("pkg")]).is_some());
+        assert!(watcher.is_ignored(&built), "the moved-in pkg/.gitignore now applies");
+
+        // A deleted .gitignore is still named .gitignore.
+        fs::remove_file(root.join("pkg/.gitignore")).unwrap();
+        assert!(watcher.reload_ignores_if_changed(&[root.join("pkg/.gitignore")]).is_some());
+        assert!(!watcher.is_ignored(&built), "the deleted file's rules are gone");
+    }
+
+    /// A path that passed `next_change` under the old layers is dropped from
+    /// the batch once a reload (from the same batch's `.gitignore` edit)
+    /// ignores it.
+    ///
+    /// Control: make `retain_unignored` keep everything.
+    #[test]
+    fn a_batch_is_refiltered_by_the_reloaded_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let generated = write(&root, "generated/x.ts", "");
+        let source = write(&root, "src/a.ts", "");
+        let watcher = ProjectWatcher::new(&root).unwrap();
+
+        let gitignore = write(&root, ".gitignore", "generated/\n");
+        let mut batch = vec![generated.clone(), source.clone(), gitignore.clone()];
+        assert!(watcher.reload_ignores_if_changed(&batch).is_some());
+        watcher.retain_unignored(&mut batch);
+        assert_eq!(batch, vec![source, gitignore]);
+    }
+
+    /// GM-514 (docs/architecture/gm-514-core-symlink-table.md, section 5):
+    /// events under followed, duplicate, refused and file links surface
+    /// spelled as the walk lists the file. The live tests assert on the
+    /// spelling that surfaces, which is the same whichever spelling the OS
+    /// reported (M2: FSEvents reports the real path; inotify either one).
+    #[cfg(unix)]
+    mod links {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        /// A hang guard, not a timing claim: the machine running these may
+        /// be heavily loaded.
+        const LINK_EVENT_TIMEOUT: Duration = Duration::from_secs(20);
+
+        fn link(root: &Path, relative: &str, target: impl AsRef<Path>) -> PathBuf {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            symlink(target, &path).unwrap();
+            path
+        }
+
+        /// `gen/` gitignored, reached only through `src/api -> ../gen`.
+        fn alias_only(root: &Path) {
+            write(root, ".gitignore", "gen/\n");
+            write(root, "gen/a.ts", "export const a = 1;\n");
+            write(root, "src/main.ts", "");
+            link(root, "src/api", "../gen");
+        }
+
+        fn surfaces(watcher: &ProjectWatcher, path: &Path, what: &str) -> Vec<PathBuf> {
+            changes_until(watcher, path, LINK_EVENT_TIMEOUT)
+                .unwrap_or_else(|| panic!("{what}: {} never surfaced", path.display()))
+        }
+
+        /// B1-B3: an edit, a create and a delete under the gitignored target
+        /// of an alias-only directory link surface under the link's
+        /// spelling, never under the real one.
+        ///
+        /// Control: in `next_change`, skip the remap (use `path` as
+        /// reported) - on macOS the real path is ignored and nothing
+        /// surfaces. (On Linux inotify may report the alias spelling, so the
+        /// OS-independent pin is `project_walk`'s
+        /// `a_path_under_a_followed_links_target_maps_to_the_link`.)
+        #[test]
+        fn edits_creates_and_deletes_under_an_alias_only_target_surface_under_the_link() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            alias_only(&root);
+            let watcher = ProjectWatcher::new(&root).unwrap();
+            drain_startup_noise(&watcher);
+
+            write(&root, "gen/a.ts", "export const a = 2;\n");
+            let mut seen = surfaces(&watcher, &root.join("src/api/a.ts"), "an edit");
+            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
+
+            write(&root, "gen/b.ts", "export const b = 1;\n");
+            seen.extend(surfaces(&watcher, &root.join("src/api/b.ts"), "a create"));
+            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
+
+            fs::remove_file(root.join("gen/a.ts")).unwrap();
+            seen.extend(surfaces(&watcher, &root.join("src/api/a.ts"), "a delete"));
+            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
+
+            assert!(
+                seen.iter().all(|path| !path.starts_with(root.join("gen"))),
+                "nothing surfaces under the real spelling: {seen:?}"
+            );
+        }
+
+        /// B12 (both OSes): with a second link to the same target, an edit
+        /// surfaces under the winning link only - inotify may report the
+        /// duplicate's spelling, FSEvents the real one; both become the
+        /// winner's.
+        #[test]
+        fn an_edit_under_a_duplicated_target_surfaces_under_the_winning_link_only() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            alias_only(&root);
+            link(&root, "src/dup", "../gen");
+            let watcher = ProjectWatcher::new(&root).unwrap();
+            drain_startup_noise(&watcher);
+
+            write(&root, "gen/a.ts", "export const a = 2;\n");
+            let mut seen = surfaces(&watcher, &root.join("src/api/a.ts"), "an edit");
+            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
+            assert!(
+                seen.iter().all(
+                    |path| !path.starts_with(root.join("src/dup")) && !path.starts_with(root.join("gen"))
+                ),
+                "only the winner's spelling surfaces: {seen:?}"
+            );
+        }
+
+        /// B11 / M1, live: on Linux inotify follows `ext -> <outside>` and
+        /// reports an edit there as `<root>/ext/b.ts`; it must not surface
+        /// (the walk refused the link). macOS reports nothing for an
+        /// outside write, so only Linux CI exercises this.
+        ///
+        /// Control: drop the `Refused(_)` -> `Drop` rule in
+        /// `LinkTable::new` - `ext/b.ts` surfaces (Linux only; the
+        /// OS-independent pin is `project_walk`'s
+        /// `a_path_under_a_refused_link_is_dropped`).
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn an_edit_through_an_outside_root_link_does_not_surface() {
+            let tmp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let outside_dir = outside.path().canonicalize().unwrap();
+            fs::write(outside_dir.join("b.ts"), "").unwrap();
+            link(&root, "ext", &outside_dir);
+            let watcher = ProjectWatcher::new(&root).unwrap();
+            drain_startup_noise(&watcher);
+
+            fs::write(outside_dir.join("b.ts"), "export const b = 2;\n").unwrap();
+            // A later in-root write proves the watcher delivered what came
+            // before it.
+            let probe = write(&root, "probe.ts", "");
+            let mut seen = surfaces(&watcher, &probe, "the probe");
+            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
+            assert!(
+                seen.iter().all(|path| !path.starts_with(root.join("ext"))),
+                "nothing under the refused link surfaces: {seen:?}"
+            );
+        }
+
+        /// B13: a `.gitignore` created inside the alias-only target surfaces
+        /// under the link's spelling (its real spelling is ignored), reloads
+        /// the layers, and its rules then apply along the link.
+        ///
+        /// Control: in `next_change`, skip the remap - on macOS the event is
+        /// dropped as ignored and `src/api/.gitignore` never surfaces.
+        #[test]
+        fn a_nested_gitignore_in_an_alias_only_target_surfaces_under_the_link_and_applies() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            alias_only(&root);
+            let watcher = ProjectWatcher::new(&root).unwrap();
+            drain_startup_noise(&watcher);
+            let skipped = root.join("src/api/x.skip.ts");
+            assert!(!watcher.is_ignored(&skipped));
+
+            write(&root, "gen/.gitignore", "*.skip.ts\n");
+            let alias = root.join("src/api/.gitignore");
+            surfaces(&watcher, &alias, "the nested .gitignore");
+
+            assert!(watcher.reload_ignores_if_changed(std::slice::from_ref(&alias)).is_some());
+            assert!(watcher.is_ignored(&skipped), "the target's rules apply along the link");
+            assert!(!watcher.is_ignored(&root.join("src/api/a.ts")));
+        }
+
+        /// B8 (watcher half): a link created or removed reloads the table
+        /// and names the link; a plain file reloads nothing.
+        ///
+        /// Control: drop the `concerns` arm in `reload_ignores_if_changed`:
+        /// the removed link (neither a directory nor a symlink any more)
+        /// reloads nothing.
+        #[test]
+        fn creating_or_removing_a_link_reloads_and_names_it() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            write(&root, ".gitignore", "gen/\n");
+            write(&root, "gen/a.ts", "");
+            let plain = write(&root, "src/main.ts", "");
+            let watcher = ProjectWatcher::new(&root).unwrap();
+
+            let api = link(&root, "src/api", "../gen");
+            assert_eq!(watcher.reload_ignores_if_changed(std::slice::from_ref(&plain)), None);
+            assert_eq!(
+                watcher.reload_ignores_if_changed(std::slice::from_ref(&api)),
+                Some(vec!["src/api".to_string()])
+            );
+
+            fs::remove_file(&api).unwrap();
+            assert_eq!(
+                watcher.reload_ignores_if_changed(std::slice::from_ref(&api)),
+                Some(vec!["src/api".to_string()]),
+                "a removed link is still a spelling in the table"
+            );
+            assert_eq!(
+                watcher.reload_ignores_if_changed(std::slice::from_ref(&api)),
+                None,
+                "nothing left to reload"
+            );
+        }
+
+        /// B9: un-ignoring `gen/` rebuilds the table with the layers: the
+        /// link now aliases a plain directory, and a later edit surfaces
+        /// under `gen/`, not the stale alias.
+        ///
+        /// Control: keep the old link table in `reload_ignores` (swap only
+        /// the layers) - the edit surfaces as `src/api/a.ts`.
+        #[test]
+        fn un_ignoring_the_target_moves_its_events_to_the_plain_spelling() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            alias_only(&root);
+            let watcher = ProjectWatcher::new(&root).unwrap();
+            drain_startup_noise(&watcher);
+
+            let gitignore = write(&root, ".gitignore", "");
+            assert_eq!(
+                watcher.reload_ignores_if_changed(std::slice::from_ref(&gitignore)),
+                Some(vec!["src/api".to_string()]),
+                "the link is judged differently (Followed -> Aliases)"
+            );
+            changes_within(&watcher, NO_EVENT_TIMEOUT);
+
+            write(&root, "gen/a.ts", "export const a = 2;\n");
+            let mut seen = surfaces(&watcher, &root.join("gen/a.ts"), "an edit");
+            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
+            assert!(
+                seen.iter().all(|path| !path.starts_with(root.join("src/api"))),
+                "the old alias spelling no longer surfaces: {seen:?}"
+            );
+        }
+
+        /// B14: an alias-only FILE link (`src/config.ts -> ../cfg/config.ts`,
+        /// `cfg/` gitignored): an edit, a delete and a re-create of its
+        /// target surface as the link. An edit leaves the table alone (the
+        /// link still holds); the delete reloads it and the link's path
+        /// stays in the batch (so routing finds it absent); the re-create
+        /// reaches the now dangling link and reloads again.
+        ///
+        /// Control: drop the `Followed` real-target rule in
+        /// `LinkTable::new` - on macOS nothing surfaces for the edit.
+        #[test]
+        fn edits_deletes_and_creates_of_a_file_links_target_surface_as_the_link() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            write(&root, ".gitignore", "cfg/\n");
+            write(&root, "cfg/config.ts", "export const c = 1;\n");
+            let alias = link(&root, "src/config.ts", "../cfg/config.ts");
+            let watcher = ProjectWatcher::new(&root).unwrap();
+            drain_startup_noise(&watcher);
+
+            write(&root, "cfg/config.ts", "export const c = 2;\n");
+            let mut seen = surfaces(&watcher, &alias, "an edit of the target");
+            assert_eq!(
+                watcher.reload_ignores_if_changed(std::slice::from_ref(&alias)),
+                None,
+                "an edit is not a link change"
+            );
+            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
+
+            fs::remove_file(root.join("cfg/config.ts")).unwrap();
+            seen.extend(surfaces(&watcher, &alias, "a delete of the target"));
+            assert_eq!(
+                watcher.reload_ignores_if_changed(std::slice::from_ref(&alias)),
+                Some(vec!["src/config.ts".to_string()]),
+                "the link now dangles"
+            );
+            let mut batch = vec![alias.clone()];
+            watcher.retain_unignored(&mut batch);
+            assert_eq!(batch, vec![alias.clone()], "the dangling link's path is routed (as absent)");
+            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
+
+            write(&root, "cfg/config.ts", "export const c = 3;\n");
+            seen.extend(surfaces(&watcher, &alias, "a re-create of the target"));
+            assert_eq!(
+                watcher.reload_ignores_if_changed(std::slice::from_ref(&alias)),
+                Some(vec!["src/config.ts".to_string()]),
+                "the link is followed again"
+            );
+            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
+            assert!(
+                seen.iter().all(|path| !path.starts_with(root.join("cfg"))),
+                "nothing surfaces under the real spelling: {seen:?}"
+            );
+        }
+
+        /// B14: a refused file link's own path is dropped from a batch, a
+        /// duplicate file link's is placed at the winner; an edit of the
+        /// shared target surfaces under the winner only.
+        ///
+        /// Control: skip the `file_link_to_indexed` placement in
+        /// `retain_unignored` - `src/b.ts` and `src/out.ts` stay in the
+        /// batch.
+        #[test]
+        fn refused_and_duplicate_file_links_are_placed_as_the_walk_lists_them() {
+            let tmp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let outside_dir = outside.path().canonicalize().unwrap();
+            fs::write(outside_dir.join("out.ts"), "").unwrap();
+            write(&root, ".gitignore", "cfg/\n");
+            write(&root, "cfg/shared.ts", "");
+            let main = write(&root, "src/main.ts", "");
+            let winner = link(&root, "src/a.ts", "../cfg/shared.ts");
+            let duplicate = link(&root, "src/b.ts", "../cfg/shared.ts");
+            let refused = link(&root, "src/out.ts", outside_dir.join("out.ts"));
+            let watcher = ProjectWatcher::new(&root).unwrap();
+            drain_startup_noise(&watcher);
+
+            let mut batch = vec![duplicate.clone(), refused, winner.clone(), main.clone()];
+            watcher.retain_unignored(&mut batch);
+            assert_eq!(batch, vec![winner.clone(), main]);
+
+            write(&root, "cfg/shared.ts", "export const s = 1;\n");
+            let mut seen = surfaces(&watcher, &winner, "an edit of the shared target");
+            seen.extend(changes_within(&watcher, NO_EVENT_TIMEOUT));
+            assert!(
+                seen.iter().all(|path| *path != duplicate && !path.starts_with(root.join("cfg"))),
+                "only the winner's spelling surfaces: {seen:?}"
+            );
+        }
     }
 }

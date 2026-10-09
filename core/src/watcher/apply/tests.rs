@@ -944,7 +944,7 @@ fn pass_resending_only_sem_kept(
     conn: &IndexStore,
     file_paths: Vec<String>,
     incomplete: bool,
-) -> (Result<()>, Vec<String>) {
+) -> (Result<SemanticPassOutcome>, Vec<String>) {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
     let mut resent = unresolved_edge("sem-kept", "n1", "n3");
@@ -2611,4 +2611,390 @@ fn a_scoped_semantic_pass_is_sent_its_files_and_the_owed_ones() {
 
     assert_eq!(sent, strings(&[OWED_A, OWED_B, OWED_C]));
     assert!(owed_rows(&conn).is_empty(), "the pass finished the owed file");
+}
+
+// ---------------------------------------------------------------------
+// GM-521: an incomplete whole-project pass is recorded residual, and the
+// residual pass at the next start asks only its files.
+// ---------------------------------------------------------------------
+
+/// How the stub of [`semantic_round`] answers its one `semanticPass`.
+enum Answer {
+    /// A `FileChangeResponse` with an empty diff, `incomplete` and this
+    /// `unfinishedFiles` list.
+    With { incomplete: bool, unfinished: Option<&'static [&'static str]> },
+    /// No answer: the plugin closes its output, as a crashed one does.
+    HangUp,
+}
+
+/// Asks `rust`'s semantic pass over `file_paths` - the whole project through
+/// [`apply_semantic_pass`] when empty, else a residual pass through
+/// [`apply_residual_semantic_pass`] - and has a stub answer it per `answer`.
+/// Returns the outcome and the `filePaths` the stub was sent.
+fn semantic_round(
+    conn: &IndexStore,
+    file_paths: Vec<String>,
+    answer: Answer,
+) -> (Result<SemanticPassOutcome>, Vec<String>) {
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, mut plugin_writer) = std::io::pipe().unwrap();
+    let plugin = std::thread::spawn(move || {
+        let request: ControlEnvelope = read_message(&mut BufReader::new(plugin_reader)).unwrap().unwrap();
+        let ControlMessage::SemanticPass { file_paths, .. } = request.message else {
+            panic!("expected SemanticPass, got {:?}", request.message);
+        };
+        if let Answer::With { incomplete, unfinished } = answer {
+            let response = FileChangeResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id.expect("a semantic pass expects an answer"),
+                result: FileChangeDiff::default(),
+                incomplete,
+                incomplete_reason: incomplete.then(|| "the server was cold".to_string()),
+                unfinished_files: unfinished.map(strings),
+            };
+            write_message(&mut plugin_writer, &response).unwrap();
+        }
+        file_paths
+    });
+    let mut reader = BufReader::new(core_reader);
+    let outcome = if file_paths.is_empty() {
+        apply_semantic_pass(
+            &mut reader,
+            &mut core_writer,
+            conn,
+            "rust",
+            None,
+            file_paths,
+            RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
+        )
+    } else {
+        apply_residual_semantic_pass(
+            &mut reader,
+            &mut core_writer,
+            conn,
+            "rust",
+            file_paths,
+            RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
+            TEST_TIMEOUT,
+            &mut on_timeout_must_not_fire,
+        )
+    };
+    (outcome, plugin.join().unwrap())
+}
+
+/// The residual pass the next start sends: exactly `rust`'s owed files.
+fn residual_round(conn: &IndexStore, answer: Answer) -> (Result<SemanticPassOutcome>, Vec<String>) {
+    let owed = conn.with(|conn| schema::owed_files(conn, "rust")).unwrap();
+    assert!(!owed.is_empty(), "a residual pass is only sent owed files");
+    semantic_round(conn, owed, answer)
+}
+
+/// `rust`'s never-answered files (`semantic_gap_files`), in path order.
+fn gap_rows(conn: &IndexStore) -> Vec<String> {
+    ids(conn, "SELECT filePath FROM semantic_gap_files WHERE language = 'rust' ORDER BY filePath")
+}
+
+/// `rust`'s `(semanticPassAt, semanticPassError)`.
+fn rust_pass_state(conn: &IndexStore) -> (Option<String>, Option<String>) {
+    conn.with(|conn| {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT semanticPassAt, semanticPassError FROM language_state WHERE language = 'rust'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .unwrap()
+        .unwrap_or((None, None))
+    })
+}
+
+/// The acceptance case, core half: a whole-project pass that names the files
+/// it did not finish is not an error. Those files are owed (one attempt), the
+/// language is recorded residual with the plugin's reason, an earlier failure
+/// is cleared, `semanticPassAt` stays unset and the pending rows go, as after
+/// any whole-project pass.
+///
+/// Control: restore the unconditional `bail!` in `apply_semantic_pass_in`'s
+/// incomplete whole-project branch - the pass is an `Err` and nothing is
+/// recorded.
+#[test]
+fn a_listed_incomplete_whole_project_pass_is_recorded_residual_not_failed() {
+    let (_root, conn) = owed_fixture();
+    conn.with(|conn| schema::record_language_semantic_pass_failure(conn, "rust", "an earlier crash"))
+        .unwrap();
+
+    let (outcome, sent) =
+        semantic_round(&conn, Vec::new(), Answer::With { incomplete: true, unfinished: Some(&[OWED_A]) });
+
+    assert_eq!(outcome.unwrap(), SemanticPassOutcome::Residual { left: 1 });
+    assert!(sent.is_empty(), "a whole-project pass is sent no list");
+    assert_eq!(owed_rows(&conn), vec![(OWED_A.to_string(), 1)]);
+    assert_eq!(
+        ids(&conn, "SELECT language || ':' || reason FROM semantic_residual"),
+        vec!["rust:the server was cold"]
+    );
+    assert_eq!(rust_pass_state(&conn), (None, None), "neither completed nor failed");
+    assert_eq!(pending_state(&conn), (0, Vec::new()));
+}
+
+/// A listed incomplete whole-project pass that names no file left nothing:
+/// it is `Settled`, for the caller to record.
+#[test]
+fn a_listed_incomplete_whole_project_pass_naming_no_file_is_settled() {
+    let (_root, conn) = owed_fixture();
+
+    let (outcome, _) =
+        semantic_round(&conn, Vec::new(), Answer::With { incomplete: true, unfinished: Some(&[]) });
+
+    assert_eq!(outcome.unwrap(), SemanticPassOutcome::Settled);
+    assert!(owed_rows(&conn).is_empty());
+}
+
+/// A plugin that does not name its unfinished files keeps today's
+/// behaviour: an `Err`, and no residual record, so the next start asks the
+/// whole project again.
+///
+/// Control: read an absent list as an empty one - the pass is `Settled`.
+#[test]
+fn an_unlisted_incomplete_whole_project_pass_is_still_an_error_and_records_nothing() {
+    let (_root, conn) = owed_fixture();
+
+    let (outcome, _) = semantic_round(&conn, Vec::new(), Answer::With { incomplete: true, unfinished: None });
+
+    assert!(outcome.is_err());
+    assert_eq!(count(&conn, "semantic_residual"), 0);
+    assert!(owed_rows(&conn).is_empty());
+    assert_eq!(rust_pass_state(&conn).0, None);
+}
+
+/// The residual pass is sent the owed files, never `[]`. A file it leaves
+/// costs one more attempt (counted on, not restarted); a file it finishes
+/// loses its row; when none is left it is `Settled`.
+#[test]
+fn a_residual_pass_is_sent_its_files_and_counts_an_attempt_for_each_it_leaves() {
+    let (_root, conn) = owed_fixture();
+    semantic_round(&conn, Vec::new(), Answer::With { incomplete: true, unfinished: Some(&[OWED_A, OWED_B]) })
+        .0
+        .unwrap();
+
+    let (outcome, sent) =
+        residual_round(&conn, Answer::With { incomplete: true, unfinished: Some(&[OWED_B]) });
+    assert_eq!(sent, strings(&[OWED_A, OWED_B]));
+    assert_eq!(outcome.unwrap(), SemanticPassOutcome::Residual { left: 1 });
+    assert_eq!(owed_rows(&conn), vec![(OWED_B.to_string(), 2)]);
+
+    let (outcome, sent) = residual_round(&conn, Answer::With { incomplete: false, unfinished: Some(&[]) });
+    assert_eq!(sent, strings(&[OWED_B]));
+    assert_eq!(outcome.unwrap(), SemanticPassOutcome::Settled);
+    assert!(owed_rows(&conn).is_empty());
+}
+
+/// A residual answer without the list: incomplete is not known to have
+/// finished any file, so each costs an attempt; complete finished them all.
+#[test]
+fn a_residual_pass_without_a_list_settles_all_when_complete_and_none_when_incomplete() {
+    let (_root, conn) = owed_fixture();
+    semantic_round(&conn, Vec::new(), Answer::With { incomplete: true, unfinished: Some(&[OWED_A, OWED_B]) })
+        .0
+        .unwrap();
+
+    let (outcome, _) = residual_round(&conn, Answer::With { incomplete: true, unfinished: None });
+    assert_eq!(outcome.unwrap(), SemanticPassOutcome::Residual { left: 2 });
+    assert_eq!(owed_rows(&conn), vec![(OWED_A.to_string(), 2), (OWED_B.to_string(), 2)]);
+
+    let (outcome, _) = residual_round(&conn, Answer::With { incomplete: false, unfinished: None });
+    assert_eq!(outcome.unwrap(), SemanticPassOutcome::Settled);
+    assert!(owed_rows(&conn).is_empty());
+}
+
+/// A residual pass that fails outright (here the plugin closes its output)
+/// finished none of its files: each costs an attempt, and the error is the
+/// pass's result.
+///
+/// Control: drop the `settle_owed_files` call in `apply_semantic_pass_in`'s
+/// `round_trip` `Err` arm - the attempts stay at 1.
+#[test]
+fn a_residual_pass_that_fails_counts_an_attempt_for_every_file_it_was_sent() {
+    let (_root, conn) = owed_fixture();
+    semantic_round(&conn, Vec::new(), Answer::With { incomplete: true, unfinished: Some(&[OWED_A, OWED_B]) })
+        .0
+        .unwrap();
+
+    let (outcome, sent) = residual_round(&conn, Answer::HangUp);
+
+    assert_eq!(sent, strings(&[OWED_A, OWED_B]));
+    assert!(outcome.is_err());
+    assert_eq!(owed_rows(&conn), vec![(OWED_A.to_string(), 2), (OWED_B.to_string(), 2)]);
+}
+
+/// Leaves `a.rs` unfinished on `MAX_OWED_ATTEMPTS` passes in a row - the
+/// whole-project one, then residual ones - and asserts each outcome.
+fn give_up_on_a(conn: &IndexStore) {
+    let (outcome, _) =
+        semantic_round(conn, Vec::new(), Answer::With { incomplete: true, unfinished: Some(&[OWED_A]) });
+    assert_eq!(outcome.unwrap(), SemanticPassOutcome::Residual { left: 1 });
+    for attempts in 2..schema::MAX_OWED_ATTEMPTS {
+        let (outcome, _) =
+            residual_round(conn, Answer::With { incomplete: true, unfinished: Some(&[OWED_A]) });
+        assert_eq!(outcome.unwrap(), SemanticPassOutcome::Residual { left: 1 });
+        assert_eq!(owed_rows(conn), vec![(OWED_A.to_string(), attempts)]);
+    }
+    let (outcome, _) = residual_round(conn, Answer::With { incomplete: true, unfinished: Some(&[OWED_A]) });
+    assert_eq!(outcome.unwrap(), SemanticPassOutcome::Settled, "the last attempt gives the file up");
+}
+
+/// A file no pass finishes is asked on at most `MAX_OWED_ATTEMPTS` (3)
+/// passes, then becomes a never-answered (gap) row. A later pass that
+/// finishes it removes the gap row; an edit's pass that leaves it unfinished
+/// re-owes it at one attempt, also removing the gap row.
+#[test]
+fn a_file_no_pass_finishes_is_given_up_as_a_gap_until_a_pass_settles_or_re_owes_it() {
+    assert_eq!(schema::MAX_OWED_ATTEMPTS, 3);
+    let (root, conn) = owed_fixture();
+
+    give_up_on_a(&conn);
+    assert!(owed_rows(&conn).is_empty());
+    assert_eq!(gap_rows(&conn), strings(&[OWED_A]));
+    edit_and_pass(&conn, root.path(), OWED_A, false, Some(&[]));
+    assert!(gap_rows(&conn).is_empty(), "a pass that finishes the file settles its gap row");
+
+    give_up_on_a(&conn);
+    assert_eq!(gap_rows(&conn), strings(&[OWED_A]));
+    edit_and_pass(&conn, root.path(), OWED_A, false, Some(&[OWED_A]));
+    assert_eq!(owed_rows(&conn), vec![(OWED_A.to_string(), 1)], "an edit restarts the count");
+    assert!(gap_rows(&conn).is_empty(), "a file is owed or given up, never both");
+}
+
+/// An edit invalidates a residual file's record: the edit's per-file pass
+/// that finishes it removes its owed row, so the language is residual with
+/// nothing left and the next start asks nothing.
+#[test]
+fn an_edit_whose_pass_finishes_a_residual_file_removes_its_record() {
+    let (root, conn) = owed_fixture();
+    semantic_round(&conn, Vec::new(), Answer::With { incomplete: true, unfinished: Some(&[OWED_A]) })
+        .0
+        .unwrap();
+    assert_eq!(
+        conn.with(|conn| schema::semantic_residual_files(conn, "rust")).unwrap(),
+        Some(strings(&[OWED_A]))
+    );
+
+    edit_and_pass(&conn, root.path(), OWED_A, false, Some(&[]));
+
+    assert_eq!(conn.with(|conn| schema::semantic_residual_files(conn, "rust")).unwrap(), Some(Vec::new()));
+}
+
+// ---------------------------------------------------------------------
+// `budgetMs`: core tells the plugin the timeout it holds the pass to.
+// ---------------------------------------------------------------------
+
+/// Which entry point [`budget_sent`] drives.
+enum PassKind {
+    /// An edit of `src/a.rs`: its reparse, then its per-file pass.
+    PerFile,
+    /// A residual pass over two files.
+    Residual,
+    /// A whole-project pass.
+    WholeProject,
+}
+
+/// Runs one pass of `kind` with `timeout` as the semantic pass timeout (and
+/// a different one for the reparse), against a stub that answers every
+/// request complete. Returns the `budgetMs` the `semanticPass` carried.
+fn budget_sent(kind: PassKind, timeout: Duration) -> Option<u64> {
+    let (root, conn) = owed_fixture();
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, mut plugin_writer) = std::io::pipe().unwrap();
+    let plugin = std::thread::spawn(move || {
+        let mut plugin_reader = BufReader::new(plugin_reader);
+        loop {
+            let request: ControlEnvelope = read_message(&mut plugin_reader).unwrap().unwrap();
+            let budget = match request.message {
+                ControlMessage::FileChanged { .. } => None,
+                ControlMessage::SemanticPass { budget_ms, .. } => Some(budget_ms),
+                other => panic!("expected FileChanged or SemanticPass, got {other:?}"),
+            };
+            let response = FileChangeResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id.expect("every request here expects an answer"),
+                result: FileChangeDiff::default(),
+                incomplete: false,
+                incomplete_reason: None,
+                unfinished_files: None,
+            };
+            write_message(&mut plugin_writer, &response).unwrap();
+            if let Some(budget) = budget {
+                return budget;
+            }
+        }
+    });
+
+    let mut reader = BufReader::new(core_reader);
+    let reparse_timeout = timeout + Duration::from_millis(1_111);
+    match kind {
+        PassKind::PerFile => apply_file_change(
+            &mut reader,
+            &mut core_writer,
+            &conn,
+            root.path(),
+            "rust",
+            OWED_A,
+            RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
+            reparse_timeout,
+            timeout,
+            true,
+            &mut on_timeout_must_not_fire,
+        )
+        .map(|_| ()),
+        PassKind::Residual => apply_residual_semantic_pass(
+            &mut reader,
+            &mut core_writer,
+            &conn,
+            "rust",
+            strings(&[OWED_A, OWED_B]),
+            RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
+            timeout,
+            &mut on_timeout_must_not_fire,
+        )
+        .map(|_| ()),
+        PassKind::WholeProject => apply_semantic_pass(
+            &mut reader,
+            &mut core_writer,
+            &conn,
+            "rust",
+            None,
+            Vec::new(),
+            RequestId::Number(1),
+            &EmbeddingPipeline::disabled(),
+            timeout,
+            &mut on_timeout_must_not_fire,
+        )
+        .map(|_| ()),
+    }
+    .unwrap();
+    plugin.join().unwrap()
+}
+
+/// A per-file pass is sent the semantic pass timeout it is held to, in
+/// milliseconds - not the reparse's.
+///
+/// Control: send `budget_ms: None` in `apply_semantic_pass_in`.
+#[test]
+fn a_per_file_pass_is_sent_its_own_timeout_as_its_budget() {
+    assert_eq!(budget_sent(PassKind::PerFile, Duration::from_millis(7_250)), Some(7_250));
+}
+
+/// A residual pass, and a whole-project one, are sent the timeout they are
+/// held to.
+#[test]
+fn a_residual_and_a_whole_project_pass_are_sent_their_timeout_as_their_budget() {
+    assert_eq!(budget_sent(PassKind::Residual, Duration::from_millis(6_500)), Some(6_500));
+    assert_eq!(budget_sent(PassKind::WholeProject, Duration::from_millis(8_125)), Some(8_125));
 }

@@ -1536,7 +1536,10 @@ impl<'a> Driver<'a> {
                     &embedding,
                     *timeout,
                     &mut kill,
-                ),
+                )
+                // A listed incomplete pass is recorded residual in the scratch
+                // index like any other; the check reads only success or error.
+                .map(|_outcome| ()),
             }
         };
         self.record(label, result)
