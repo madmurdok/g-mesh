@@ -228,3 +228,17 @@ scratchpad `gm538/` directory.
   incremental test build (touch one core file, rebuild tests) more than 10%
   slower than `unpacked`, the fix is not taken as is and the owner is asked
   again (options: `off`, or periodic pruning of stale `.o`).
+
+## Measurement and final decision (2026-10-09)
+
+`packed` failed the +10% gate (GM-538/S8): an incremental test build after
+touching `core/src/lib.rs` relinks 75 test binaries, and `dsymutil` on them
+costs 289 s CPU and writes 4.8 GB of `.dSYM`; median user+sys rose x2.30 and
+real x1.21 under load. The config change is reverted.
+
+**Owner: "Чистить устаревшие .o скриптом".** `unpacked` stays. A script
+removes `*.rcgu.o` files in `target/debug/deps` that no current test or
+binary's debug map references, so `file:line` in backtraces is kept, and the
+test entry point (`scripts/test-sections.sh`, GM-540) runs it before a run.
+A plain `cargo test` outside the script still accumulates objects; the script
+is the remedy, not a guarantee.
