@@ -311,6 +311,20 @@ reindex per link change. *No*: the link is only picked up by `g-mesh reindex`;
 until then its target's edits are remapped to files the index does not hold,
 and plugins index them one by one as they are edited.
 
+## 9. Owner decisions (2026-10-09)
+
+Owner asked first: "Не является ли это регрессией? мы ведь наоборот хотели
+вынести языко-специфичные вещи в плагины?" Answer given: link following is
+filesystem policy, not language logic; (b) moves the guard into a shared crate
+both use (no third copy); per-language `exclude_dirs` stay plugin-declared in
+manifests. Then:
+
+- Q1: "Общий crate обхода (Recommended)" -> (b).
+- Q2: "Корень проекта, W0 (Recommended)" -> boundary unchanged.
+- Q3: "Да, одно правило в ядре (Recommended)" -> core remaps duplicates and
+  drops events under refused links (B11, B12 in scope).
+- Q4: "Да, как .gitignore в GM-508 (Recommended)" -> link changes feed the gate (B8).
+
 ## Appendix: g-mesh calls this note relied on
 
 | Question | Call | Answer |
