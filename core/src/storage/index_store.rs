@@ -42,7 +42,7 @@ use crate::graph::symbol_links::LinkRules;
 use crate::graph::{imports, symbol_links};
 use crate::storage::file_rows::{self, FileScope};
 use crate::storage::language_swap::{self, SwapBookkeeping};
-use crate::storage::write::{apply_diff, upsert_indexed_file, Diff};
+use crate::storage::write::{apply_diff, apply_semantic_diff, upsert_indexed_file, Diff};
 
 thread_local! {
     static HELD: Cell<bool> = const { Cell::new(false) };
@@ -101,6 +101,11 @@ const fn hold(unit: Unit) -> Hold {
 /// `label` names the diff in the error.
 fn apply_and_link(conn: &mut Connection, diff: &Diff, label: &str, rules: &LinkRules) -> Result<()> {
     apply_diff(conn, diff).with_context(|| format!("failed to apply the {label} diff"))?;
+    link_applied(conn, diff, rules)
+}
+
+/// The imports and symbol links a committed `diff` enables.
+fn link_applied(conn: &mut Connection, diff: &Diff, rules: &LinkRules) -> Result<()> {
     // After the commit: linking points edges at `File` nodes, and the ones
     // this diff brought with it have to be in the index first.
     imports::link_diff(conn, diff).context("failed to link the file's resolved imports")?;
@@ -378,6 +383,20 @@ impl Writer<'_> {
         let store = self.store;
         self.step(|conn| {
             apply_and_link(conn, diff, label, &store.link_rules)?;
+            store.claim(diff);
+            Ok(())
+        })
+    }
+
+    /// [`Self::apply_diff_linked`] for a `semanticPass` answer: commits it
+    /// through [`apply_semantic_diff`], so a node already stored keeps its
+    /// text and takes only its `untypedCalls`. Linking and claiming still
+    /// see every node the answer named, kept ones included. In one step.
+    pub fn apply_semantic_diff_linked(&mut self, diff: &mut Diff, label: &str) -> Result<()> {
+        let store = self.store;
+        self.step(|conn| {
+            apply_semantic_diff(conn, diff).with_context(|| format!("failed to apply the {label} diff"))?;
+            link_applied(conn, diff, &store.link_rules)?;
             store.claim(diff);
             Ok(())
         })
