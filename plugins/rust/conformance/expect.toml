@@ -32,6 +32,9 @@
 #     which `crates/beta` implements through a glob import of a re-export
 #     (structural since GM-537), and `shapes::Loud::speak`, the method-level
 #     edge `overrides` reads;
+#   - implementations in another crate that only the semantic tier finds
+#     (`sirens::Wail`): an `impl` written by a `macro_rules!` of `alpha`
+#     invoked in `crates/beta`, which no structural pass expands;
 #   - references (`shapes::Shape`, which `[[callers]]` cannot reach at all -
 #     a trait bound and a `SUPERTYPE_OF` edge are both usages, never calls);
 #   - implementations (`shapes::Shape`, `impl Trait for T` found by
@@ -72,10 +75,10 @@
 # `plugins/go/conformance/expect.toml` marks its four. `tests/conformance.rs`
 # runs this file three ways, and the three together are the whole point:
 #
-#   1. with the manifest this plugin ships, where all 31 entries run and pass;
+#   1. with the manifest this plugin ships, where all 33 entries run and pass;
 #   2. with 3.2.0's own manifest (`semantic_pass = false`, no
 #      `[plugin.semantic]`) and `--skip-semantic-expectations`, where those
-#      five report `Skip` and the other 26 - every structural entry here -
+#      five report `Skip` and the other 28 - every structural entry here -
 #      keep passing;
 #   3. with 3.2.0's manifest and *without* the skip flag, where those five
 #      must FAIL.
@@ -88,8 +91,8 @@
 #   callers[6]  empty, wanted shapes::total                (variable receiver -> the impl's trait method)
 #   callers[7]  empty, wanted total_dyn and gaps::measure  (trait object / generic -> the trait's)
 #   callers[9]  empty, wanted shapes::describe             (a default trait method)
+#   implementations[3]  missing beta's Siren               (an impl a macro of another crate writes)
 #   references[0]       the right six rows, tally 4 not 6  (GM-386; see that entry)
-#   implementations[1]  missing beta's Megaphone           (an impl in another crate)
 #
 # - which is how this file is known to be measuring the rust-analyzer tier
 # rather than describing it. The last line is the odd one and says so in its
@@ -426,6 +429,21 @@ symbol = "shapes::Loud::speak"
 # through the glob above, and rust-analyzer's sweep never emits this edge,
 # so `Megaphone`'s row here is the structural glob fallback's alone.
 expect = ["crates/alpha/src/shapes.rs:shapes::<Circle as Loud>::speak", "crates/beta/src/main.rs:<Megaphone as Loud>::speak"]
+
+# --- implementations: an impl in another crate only the sweep finds ----------
+
+[[implementations]]
+symbol = "sirens::Wail"
+tier = "semantic"
+# The cross-crate impl only the semantic tier finds, now that `Megaphone`
+# above is structural: `crates/beta/src/alarm.rs` implements `alpha`'s `Wail` for `Siren` only
+# through `alpha::wail_for!(Siren)`, a `macro_rules!` of the other crate. The
+# structural tier does not expand macros and finds no implementor at all;
+# rust-analyzer expands it, and its implementation sweep over `Wail` lands on
+# the `Siren` declaration. Measured with rust-analyzer 1.97.1: structural
+# `{}`, semantic `{alarm::Siren}`. Type level only - the sweep emits no
+# method-level edge, so `<Siren as Wail>::wail` has none in either arm.
+expect = ["crates/beta/src/alarm.rs:alarm::Siren"]
 
 # --- implementations: blanket impls, and the module that is not one (GM-361) --
 

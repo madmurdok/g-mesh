@@ -46,6 +46,7 @@ impl Loud for Megaphone {
     }
 }
 
+mod alarm;
 mod shapes;
 
 /// GM-360, face A1: beta's own `Ruler`. It sits at the crate root, so its
