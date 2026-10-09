@@ -231,6 +231,7 @@ EOF
 # release targets.
 OTHER_WORKSPACE_MANIFESTS=(
 	"wire/Cargo.toml"
+	"walk/Cargo.toml"
 	"plugins/sdk/Cargo.toml"
 	"plugins/rust/Cargo.toml"
 	"plugins/python/Cargo.toml"

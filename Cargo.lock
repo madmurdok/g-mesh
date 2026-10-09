@@ -765,8 +765,8 @@ name = "g-mesh-plugin-sdk"
 version = "4.3.0"
 dependencies = [
  "anyhow",
+ "g-mesh-walk",
  "g-mesh-wire",
- "ignore",
  "serde",
  "serde_json",
  "sha2",
@@ -786,6 +786,13 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "g-mesh-walk"
+version = "4.3.0"
+dependencies = [
+ "ignore",
 ]
 
 [[package]]
