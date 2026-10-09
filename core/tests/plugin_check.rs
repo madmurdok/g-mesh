@@ -81,7 +81,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// Every check id the kit reports, in report order - asserted in full on
 /// every run, so a check silently dropping out of the report fails a test
 /// rather than passing every "only X fails" assertion vacuously.
-const ALL_CHECKS: [&str; 16] = [
+const ALL_CHECKS: [&str; 17] = [
     "session",
     "shape",
     "stream-order",
@@ -98,7 +98,12 @@ const ALL_CHECKS: [&str; 16] = [
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
     "capabilities.files-created-resolves",
+    RESOLUTION_DELTA,
 ];
+
+/// Run only for a manifest declaring `resolution_delta` (the TS plugin's
+/// does); every other plugin here reports it `SKIP`.
+const RESOLUTION_DELTA: &str = "capabilities.resolution-delta-version-bump";
 
 /// The checks that report `SKIP` on a plugin declaring `semantic_pass =
 /// true` run without an `--expect` pair: the undeclared-pass check does not
@@ -291,7 +296,8 @@ fn the_conformant_fake_passes_every_check() {
     let run = run_check(&fake.dir, &fixture, &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
+        let skipped = SKIPPED_WITHOUT_PAIR.contains(&id) || id == RESOLUTION_DELTA;
+        let expected = if skipped { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     assert!(!run.stdout.contains("WARN"), "a v2-speaking plugin gets no legacy warning:\n{}", run.stdout);
@@ -620,7 +626,8 @@ fn the_go_plugin_passes_on_its_own_fixture() {
     let run = run_check(&go_plugin_dir(), &go_conformance_project(), &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
+        let skipped = SKIPPED_WITHOUT_PAIR.contains(&id) || id == RESOLUTION_DELTA;
+        let expected = if skipped { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     assert!(!run.stdout.contains("WARN"), "{}", run.stdout);
@@ -1333,7 +1340,8 @@ fn a_declaring_fake_resolves_an_importer_created_with_its_target() {
     let run = run_files_created("none", true, &fixture, FK_PAIR);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let expected = if id == "capabilities.semantic-pass-undeclared" { "SKIP" } else { "PASS" };
+        let skipped = id == "capabilities.semantic-pass-undeclared" || id == RESOLUTION_DELTA;
+        let expected = if skipped { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
     assert_eq!(run.outcome("expectations.file"), "PASS", "{}", run.stdout);

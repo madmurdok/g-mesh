@@ -80,7 +80,7 @@ use crate::protocol::jsonrpc::{read_frame, read_message_with_timeout, write_mess
 use crate::protocol::ndjson::BulkItem;
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, Handshake, NodeKind, RequestId,
-    WireNode, JSONRPC_VERSION,
+    ResolutionChangedResponse, ResolutionChangedResult, WireNode, JSONRPC_VERSION,
 };
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -970,6 +970,148 @@ pub(crate) fn run_files_created_session(
     finish(driver, Some(rows))
 }
 
+// --- resolution delta ----------------------------------------------------------
+
+/// The `version` a [`VersionBump`] writes when the file declares none; one
+/// that does gets this appended to its own.
+const VERSION_BUMP_SUFFIX: &str = "-plugin-check";
+
+/// `capabilities.resolution-delta-version-bump`'s edit: a fixture watch file
+/// whose only change is its top-level `version` - an edit no resolution model
+/// reads, so a plugin declaring `resolution_delta` must answer `unchanged`.
+pub(crate) struct VersionBump {
+    /// Workspace-relative, `/`-separated.
+    pub file_path: String,
+    pub original: Vec<u8>,
+    pub edited: Vec<u8>,
+}
+
+/// The fixture watch file the version bump is made to, and the edit.
+///
+/// The rule, the only language-neutral one a manifest gives enough for: the
+/// shallowest (then path-sorted) file under `workspace`, outside the
+/// manifest's `exclude_dirs`, whose name matches one of its `watch_files` and
+/// whose text parses as a JSON object. Its top-level `version` string gets
+/// [`VERSION_BUMP_SUFFIX`] appended, or one is inserted when it has none;
+/// every other byte stays. `None` when no watch file qualifies (a `go.mod`,
+/// a JSONC config with comments) or its `version` is not a string.
+pub(crate) fn choose_version_bump(manifest: &PluginManifest, workspace: &Path) -> Option<VersionBump> {
+    let matchers: Vec<_> = manifest.workspace.watch_files.iter().map(|glob| glob.compile_matcher()).collect();
+    let mut found = Vec::new();
+    let mut pending = vec![(workspace.to_path_buf(), String::new())];
+    while let Some((dir, relative)) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = if relative.is_empty() { name.clone() } else { format!("{relative}/{name}") };
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => {
+                    if !manifest.workspace.exclude_dirs.contains(&name) {
+                        pending.push((entry.path(), path));
+                    }
+                }
+                Ok(t) if t.is_file() && matchers.iter().any(|m| m.is_match(&name)) => found.push(path),
+                _ => {}
+            }
+        }
+    }
+    found.sort_by(|a, b| a.matches('/').count().cmp(&b.matches('/').count()).then_with(|| a.cmp(b)));
+    found.into_iter().find_map(|file_path| {
+        let original = fs::read(workspace.join(&file_path)).ok()?;
+        let edited = version_bump(std::str::from_utf8(&original).ok()?)?.into_bytes();
+        Some(VersionBump { file_path, original, edited })
+    })
+}
+
+/// `text` with its top-level `version` bumped (see [`choose_version_bump`]),
+/// or `None` when `text` is not a JSON object or no textual edit verifies:
+/// each candidate is re-parsed and must equal the original but for
+/// `version`, so a nested `"version"` key is never the one edited.
+pub(crate) fn version_bump(text: &str) -> Option<String> {
+    let serde_json::Value::Object(original) = serde_json::from_str(text).ok()? else { return None };
+    let (bumped, candidates): (String, Vec<String>) = match original.get("version") {
+        None => {
+            let open = text.find('{')?;
+            let bumped = format!("0.0.0{VERSION_BUMP_SUFFIX}");
+            let separator = if original.is_empty() { "" } else { "," };
+            let edited =
+                format!("{}\"version\": \"{bumped}\"{separator}{}", &text[..=open], &text[open + 1..]);
+            (bumped, vec![edited])
+        }
+        Some(serde_json::Value::String(current)) => {
+            let bumped = format!("{current}{VERSION_BUMP_SUFFIX}");
+            let quoted = serde_json::to_string(current).ok()?;
+            let candidates = text
+                .match_indices("\"version\"")
+                .filter_map(|(at, key)| {
+                    let rest = &text[at + key.len()..];
+                    let after_colon = rest.trim_start().strip_prefix(':')?;
+                    let value_at = text.len() - after_colon.trim_start().len();
+                    text[value_at..].starts_with(&quoted).then(|| {
+                        let replacement = serde_json::to_string(&bumped).unwrap_or_default();
+                        format!("{}{replacement}{}", &text[..value_at], &text[value_at + quoted.len()..])
+                    })
+                })
+                .collect();
+            (bumped, candidates)
+        }
+        Some(_) => return None,
+    };
+    let mut expected = original;
+    expected.insert("version".to_string(), serde_json::Value::String(bumped));
+    candidates.into_iter().find(|edited| {
+        serde_json::from_str::<serde_json::Value>(edited)
+            .is_ok_and(|value| value.as_object().is_some_and(|object| *object == expected))
+    })
+}
+
+/// What [`run_resolution_delta_session`] observed. `session.failure` set
+/// means it did not reach a verdict; `result` is then `None`.
+pub(crate) struct ResolutionDeltaRun {
+    pub session: Session,
+    pub result: Option<ResolutionChangedResult>,
+}
+
+/// Puts the watch file back however the run ends - the expectations
+/// evaluated after it must see the fixture as it was.
+struct Restore<'a> {
+    path: PathBuf,
+    original: &'a [u8],
+}
+
+impl Drop for Restore<'_> {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.path, self.original);
+    }
+}
+
+/// Drives `capabilities.resolution-delta-version-bump`'s session: a fresh
+/// plugin process, the bump written to disk, then one `resolutionChanged`
+/// carrying bulk run 1's `resolutionFacts` - what core would send on that
+/// save - and the file restored.
+pub(crate) fn run_resolution_delta_session(
+    manifest: &PluginManifest,
+    scratch: &Scratch,
+    conn: &IndexStore,
+    bump: &VersionBump,
+    previous_facts: String,
+    timeouts: RoundTripTimeouts,
+) -> ResolutionDeltaRun {
+    let mut driver = match Driver::spawn(manifest, scratch, conn, timeouts) {
+        Ok(driver) => driver,
+        Err(session) => return ResolutionDeltaRun { session: *session, result: None },
+    };
+    let path = scratch.workspace().join(&bump.file_path);
+    let label = format!("resolution-delta: resolutionChanged ({} after a version bump)", bump.file_path);
+    let _restore = Restore { path: path.clone(), original: &bump.original };
+    if let Err(err) = fs::write(&path, &bump.edited) {
+        driver.session.failure = Some(format!("{label}: failed to write {}: {err}", path.display()));
+        return ResolutionDeltaRun { session: driver.finish(), result: None };
+    }
+    let result = driver.resolution_changed(&label, &bump.file_path, Some(previous_facts));
+    ResolutionDeltaRun { session: driver.finish(), result }
+}
+
 // --- control plane ------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1398,6 +1540,59 @@ impl<'a> Driver<'a> {
             }
         };
         self.record(label, result)
+    }
+
+    /// Sends one `resolutionChanged` request - the envelope
+    /// `PluginProcess::send_resolution_changed` builds - and reads its answer
+    /// under the `fileChanged` timeout. `None` when the session cannot
+    /// continue (the failure is recorded).
+    fn resolution_changed(
+        &mut self,
+        label: &str,
+        file: &str,
+        previous_facts: Option<String>,
+    ) -> Option<ResolutionChangedResult> {
+        let id = RequestId::Number(self.next_id);
+        self.next_id += 1;
+        let envelope = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(id.clone()),
+            message: ControlMessage::ResolutionChanged { file_path: file.to_string(), previous_facts },
+        };
+        let answer = {
+            let Driver { child, reader, writer, timeouts, .. } = self;
+            let mut kill = || {
+                let _ = child.kill();
+            };
+            write_message(writer, &envelope)
+                .context("failed to write the resolutionChanged request")
+                .and_then(|()| {
+                    read_message_with_timeout::<ResolutionChangedResponse, _>(
+                        reader,
+                        timeouts.file_changed,
+                        &mut kill,
+                    )
+                    .context("failed to read the plugin's resolutionChanged response")?
+                    .context("the plugin closed its output before answering resolutionChanged")
+                })
+                .and_then(|response| {
+                    if response.id != id {
+                        bail!(
+                            "resolutionChanged response id {:?} does not match request id {:?}",
+                            response.id,
+                            id
+                        );
+                    }
+                    Ok(response.result)
+                })
+        };
+        match answer {
+            Ok(result) => self.record(label, Ok(())).then_some(result),
+            Err(err) => {
+                self.record(label, Err(err));
+                None
+            }
+        }
     }
 
     /// Writes `message` as an id-less notification - the envelope
