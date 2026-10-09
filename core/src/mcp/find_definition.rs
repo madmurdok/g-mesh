@@ -33,11 +33,14 @@ const CANDIDATE_PAGE_SIZE: usize = 20;
 /// The most candidates an ambiguous page carries source for. Past this the
 /// page is a list to choose from rather than a set of readings to compare,
 /// and every candidate's text would be paid for to answer one of them.
-const SOURCED_CANDIDATES: usize = 3;
+/// 4 rather than 3: a 4-source page costs a few hundred bytes more than the
+/// list plus the follow-up call it replaces, and saves that call
+/// (GM-526, docs/results/gm-526-four-candidate-sources.md).
+const SOURCED_CANDIDATES: usize = 4;
 
 /// A sourced candidate's caps: a quarter of a resolved answer's
-/// ([`source::MAX_LINES`], [`source::MAX_CHARS`]), since up to
-/// [`SOURCED_CANDIDATES`] of them share one page. Enough for a signature and
+/// ([`source::MAX_LINES`], [`source::MAX_CHARS`]), so the
+/// [`SOURCED_CANDIDATES`] of a full sourced page add up to one answer. Enough for a signature and
 /// the start of a body, which is what tells two same-named declarations apart.
 const CANDIDATE_SOURCE_LINES: usize = 20;
 const CANDIDATE_SOURCE_CHARS: usize = 1_500;
