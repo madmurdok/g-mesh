@@ -318,6 +318,50 @@ pub(crate) fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
     plugin::truncated_hex(hasher)
 }
 
+/// Above this many files one language would gain from a `.gitignore` change,
+/// [`PluginRegistry::gitignore_changed`] does not reindex it (GM-508, Q2).
+pub(crate) const GITIGNORE_REINDEX_GUARD: usize = 10_000;
+
+/// The directories holding `gitignores` (project-relative, `""` for the
+/// root), deduplicated; just the root when the root's own file is among them.
+fn gitignore_subtrees(gitignores: &[String]) -> Vec<String> {
+    let mut dirs: Vec<String> = gitignores
+        .iter()
+        .map(|path| path.rsplit_once('/').map_or(String::new(), |(dir, _)| dir.to_string()))
+        .collect();
+    if dirs.iter().any(String::is_empty) {
+        return vec![String::new()];
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Each language's `File` nodes under `subtrees` (as [`gitignore_subtrees`]
+/// spells them): the live side of [`PluginRegistry::gitignore_changed`].
+fn indexed_files_under(
+    conn: &rusqlite::Connection,
+    subtrees: &[String],
+) -> Result<BTreeMap<String, HashSet<String>>> {
+    let mut statement = conn
+        .prepare("SELECT language, filePath FROM nodes WHERE kind = 'File'")
+        .context("failed to query indexed files")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .context("failed to read indexed files")?;
+    let mut files: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    for row in rows {
+        let (language, file_path) = row.context("failed to read indexed files")?;
+        let under = subtrees.iter().any(|dir| {
+            dir.is_empty() || file_path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('/'))
+        });
+        if under {
+            files.entry(language).or_default().insert(file_path);
+        }
+    }
+    Ok(files)
+}
+
 /// [`indexer_version`] for a discovery that found nothing - the generation
 /// string a *test* stamps a fixture index with when it needs `meta` to exist
 /// and nothing will ever compare that stamp against a live daemon's.
@@ -1082,6 +1126,100 @@ impl PluginRegistry {
                 "g-mesh daemon: could not start the {language} plugin to reindex its workspace \
                  after {changed_file} changed: {err:#}"
             ),
+        }
+    }
+
+    /// GM-508's gate: `gitignores` (project-relative paths of settled
+    /// `.gitignore` files, created, edited or deleted) may have changed which
+    /// files are indexed. Walks the directories holding them (with their
+    /// ancestors' rules, `project_walk::project_files_under`), splits the
+    /// files by [`DiscoveredPlugins::indexing_language`] and compares each
+    /// language with its `File` nodes under the same directories. Every
+    /// language with a difference is reindexed as after a workspace-file edit
+    /// ([`workspace_file_changed`](Self::workspace_file_changed), the first of
+    /// `gitignores` as the trigger), unless it would gain more than
+    /// [`GITIGNORE_REINDEX_GUARD`] files: then one log line asks for
+    /// `g-mesh reindex`. No difference, no reindex.
+    pub(crate) fn gitignore_changed(&self, conn: &IndexStore, gitignores: &[String]) {
+        let Some(trigger) = gitignores.first() else { return };
+        let subtrees = gitignore_subtrees(gitignores);
+        let live = match conn.with(|conn| indexed_files_under(conn, &subtrees)) {
+            Ok(live) => live,
+            Err(err) => {
+                crate::log_line!(
+                    "g-mesh daemon: could not read the indexed files to compare after {trigger} changed: {err:#}"
+                );
+                return;
+            }
+        };
+        let mut walked: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+        let pruned = self.discovered.excluded_by_every_language();
+        for file in crate::project_walk::project_files_under(&self.project_root, &pruned, &subtrees) {
+            if let Some(language) = self.discovered.indexing_language(&file.relative) {
+                walked.entry(language.to_string()).or_default().insert(file.relative);
+            }
+        }
+        let languages: std::collections::BTreeSet<String> =
+            walked.keys().chain(live.keys()).cloned().collect();
+        let none = HashSet::new();
+        for language in languages {
+            if !self.has_manifest(&language) || self.is_failed_language(&language) {
+                continue;
+            }
+            let now = walked.get(&language).unwrap_or(&none);
+            let indexed = live.get(&language).unwrap_or(&none);
+            let added = now.difference(indexed).count();
+            let removed = indexed.difference(now).count();
+            if added == 0 && removed == 0 {
+                continue;
+            }
+            if added > GITIGNORE_REINDEX_GUARD {
+                crate::log_line!(
+                    "g-mesh daemon: {trigger} changed would add {added} {language} files to the index - \
+                     more than {GITIGNORE_REINDEX_GUARD}, so nothing was reindexed; run `g-mesh reindex` \
+                     to index them"
+                );
+                continue;
+            }
+            crate::log_line!(
+                "g-mesh daemon: {trigger} changed which {language} files are indexed (+{added}, \
+                 -{removed}) - reindexing {language}"
+            );
+            self.workspace_file_changed(conn, &language, trigger);
+        }
+    }
+
+    /// GM-508, owner's Q3: at daemon start on an indexed project, the
+    /// `.gitignore` files edited since the last walk recorded `bulkIndexedAt`
+    /// go through [`gitignore_changed`](Self::gitignore_changed). A
+    /// `.gitignore` deleted while the daemon was down leaves no mtime and is
+    /// not seen here.
+    pub(crate) fn recheck_gitignores_since_index(&self, conn: &IndexStore) {
+        let indexed_at = match conn.with(schema::bulk_indexed_at_unix) {
+            Ok(Some(indexed_at)) => indexed_at,
+            Ok(None) => return,
+            Err(err) => {
+                crate::log_line!("g-mesh daemon: could not read when the project was last walked: {err:#}");
+                return;
+            }
+        };
+        let pruned = self.discovered.excluded_by_every_language();
+        let newer: Vec<String> = crate::project_walk::gitignore_files(&self.project_root, &pruned)
+            .filter(|file| {
+                fs::metadata(&file.path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    // Whole seconds, like `bulkIndexedAt`. Strictly newer:
+                    // a file written in the walk's own last second is taken
+                    // as walked (an edit landing there is missed until the
+                    // next `.gitignore` event).
+                    .is_some_and(|since_epoch| since_epoch.as_secs() as i64 > indexed_at)
+            })
+            .map(|file| file.relative)
+            .collect();
+        if !newer.is_empty() {
+            self.gitignore_changed(conn, &newer);
         }
     }
 

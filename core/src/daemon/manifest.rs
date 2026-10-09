@@ -597,6 +597,21 @@ impl DiscoveredPlugins {
             _ => Some(language),
         }
     }
+
+    /// The directory names in every discovered manifest's `exclude_dirs` - safe to
+    /// prune from a project walk, since no language would index anything under
+    /// them. Empty when nothing was discovered.
+    pub fn excluded_by_every_language(&self) -> Vec<String> {
+        let mut manifests = self.manifests.values();
+        let Some(first) = manifests.next() else {
+            return Vec::new();
+        };
+        let mut common: Vec<String> = first.workspace.exclude_dirs.clone();
+        for manifest in manifests {
+            common.retain(|dir| manifest.workspace.exclude_dirs.contains(dir));
+        }
+        common
+    }
 }
 
 /// `src/App.TSX` -> `".tsx"`: the lowercase, leading-dot form the routing

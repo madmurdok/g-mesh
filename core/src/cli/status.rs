@@ -524,7 +524,7 @@ fn discover_source_files(project_root: &Path, plugins: &DiscoveredPlugins) -> Re
     // directory *every* discovered language excludes. A directory only some
     // languages exclude is still walked (`dist/app.py` is Python's even though
     // TypeScript skips `dist`), and its files are filtered one by one below.
-    let pruned = excluded_by_every_language(plugins);
+    let pruned = plugins.excluded_by_every_language();
 
     let mut files = Vec::new();
     for walked in project_walk::project_files(project_root, &pruned) {
@@ -540,21 +540,6 @@ fn discover_source_files(project_root: &Path, plugins: &DiscoveredPlugins) -> Re
         files.push(SourceFile { relative: walked.relative, mtime_millis });
     }
     Ok(files)
-}
-
-/// The directory names in every discovered manifest's `exclude_dirs` - safe to
-/// prune from the walk, since no language would index anything under them.
-/// Empty when nothing was discovered.
-fn excluded_by_every_language(plugins: &DiscoveredPlugins) -> Vec<String> {
-    let mut manifests = plugins.manifests.values();
-    let Some(first) = manifests.next() else {
-        return Vec::new();
-    };
-    let mut common: Vec<String> = first.workspace.exclude_dirs.clone();
-    for manifest in manifests {
-        common.retain(|dir| manifest.workspace.exclude_dirs.contains(dir));
-    }
-    common
 }
 
 /// Every file the index has a `File` node for. The plugin emits exactly one

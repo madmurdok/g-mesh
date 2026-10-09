@@ -709,6 +709,20 @@ pub fn bulk_index_completed(conn: &Connection) -> Result<bool> {
     Ok(matches!(recorded, Some(Some(_))))
 }
 
+/// `meta.bulkIndexedAt` as Unix seconds (it is stored as SQLite's UTC
+/// `CURRENT_TIMESTAMP`); `None` before a walk has completed.
+pub fn bulk_indexed_at_unix(conn: &Connection) -> Result<Option<i64>> {
+    let recorded: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT CAST(strftime('%s', bulkIndexedAt) AS INTEGER) FROM meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read bulkIndexedAt")?;
+    Ok(recorded.flatten())
+}
+
 /// Every language currently "present" in the index, for the roll-up
 /// [`record_bulk_index`]/[`record_semantic_pass`] compute below - defined as
 /// "has at least one `File` node", not "was discovered" or "has a

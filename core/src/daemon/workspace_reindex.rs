@@ -55,8 +55,9 @@
 //!
 //! Sent (`PluginProcess::notify_workspace_changed`) only when this language's
 //! supervisor is awake: nothing is woken just to be told to drop a cache it
-//! does not have. Only a language with a non-empty `watch_files` reaches this
-//! module, which excludes the bundled TS plugin (`watch_files = []`).
+//! does not have. A language reaches this module through a non-empty
+//! `watch_files` or, for any language, through a `.gitignore` change that
+//! altered its indexed files (`PluginRegistry::gitignore_changed`, GM-508).
 //!
 //! # Debounce
 //!
