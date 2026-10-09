@@ -2109,3 +2109,6 @@ mod presence_tests {
         assert_eq!(response["result"], serde_json::json!({ "acknowledged": true }));
     }
 }
+
+#[cfg(test)]
+mod resolution_tests;

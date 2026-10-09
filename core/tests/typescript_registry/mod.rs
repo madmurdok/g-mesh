@@ -35,7 +35,6 @@ impl Harness {
     /// The same harness over another checked-in plugin directory
     /// (`plugins/<language>`).
     pub fn with_plugin(language: &str) -> Self {
-        let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
         let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins").join(language);
         std::os::unix::fs::symlink(
@@ -43,7 +42,24 @@ impl Harness {
             plugins.path().join(language),
         )
         .expect("failed to link the plugin directory");
+        Self::over(plugins)
+    }
 
+    /// The harness over a copy of the checked-in manifest of `language`,
+    /// rewritten by `edit`. Its `${G_MESH_BIN_DIR}` command still names the
+    /// plugin binary built in this profile.
+    pub fn with_manifest(language: &str, edit: impl FnOnce(String) -> String) -> Self {
+        let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+        let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins").join(language);
+        let text = std::fs::read_to_string(checkout.join("plugin.toml")).expect("the checked-in manifest");
+        let dir = plugins.path().join(language);
+        std::fs::create_dir_all(&dir).expect("failed to create the plugin directory");
+        std::fs::write(dir.join("plugin.toml"), edit(text)).expect("failed to write the manifest");
+        Self::over(plugins)
+    }
+
+    fn over(plugins: tempfile::TempDir) -> Self {
+        let project = tempfile::tempdir().expect("failed to create a project root");
         let discovered =
             manifest::discover(&[plugins.path().to_path_buf()]).expect("the plugin manifest discovers");
         let root = project.path().canonicalize().expect("failed to canonicalize the project root");

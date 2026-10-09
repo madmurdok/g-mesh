@@ -1519,3 +1519,68 @@ fn an_unknown_files_created_key_is_a_parse_error() {
     assert_eq!(run.outcome(FILES_CREATED), "SKIP", "{}", run.stdout);
     assert_no_files_created_session(&run);
 }
+
+/// The TS plugin's manifest as shipped (`resolution_delta = true`) but with
+/// `semantic_pass` off, so no language server is involved, in a directory
+/// named after its language.
+fn ts_plugin_without_semantic_pass() -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("failed to create a temp dir for the plugin");
+    let dir = root.path().join("typescript");
+    fs::create_dir_all(&dir).unwrap();
+    let shipped = fs::read_to_string(ts_plugin_dir().join("plugin.toml")).unwrap();
+    assert!(shipped.contains("resolution_delta = true"), "the shipped manifest declares resolution_delta");
+    assert!(shipped.contains("semantic_pass = true"), "the shipped manifest's capability line moved");
+    fs::write(dir.join("plugin.toml"), shipped.replace("semantic_pass = true", "semantic_pass = false"))
+        .unwrap();
+    root
+}
+
+/// The TS plugin answers `unchanged` to a version-only edit of the fixture's
+/// `package.json`, and the report names the bumped file and the answer. The
+/// fixture itself is never modified.
+///
+/// Control: project the whole manifest in the TS plugin's
+/// `facts::package_facts` (the bump answers `affected`: FAIL).
+#[test]
+fn the_typescript_plugin_answers_unchanged_to_a_version_bump() {
+    let fixture = ts_conformance_project();
+    let package_json = fixture.join("package.json");
+    let before = fs::read(&package_json).unwrap();
+
+    let plugins = ts_plugin_without_semantic_pass();
+    let run = run_check(&plugins.path().join("typescript"), &fixture, &[]);
+    assert_eq!(run.outcome(RESOLUTION_DELTA), "PASS", "{}", run.stdout);
+    assert!(run.stdout.contains("resolution-delta: version bump of package.json"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains(r#"resolution-delta: resolutionChanged -> {"kind":"unchanged"}"#),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(fs::read(&package_json).unwrap(), before, "the kit must never modify the fixture");
+}
+
+/// A plugin declaring `resolution_delta` whose bulk walk writes no
+/// `resolutionFacts` trailer fails this check, and only this one.
+///
+/// Control: treat a missing trailer as `NoWatchFile` in `plugin_check::check`
+/// (the check reports SKIP).
+#[test]
+fn a_declaring_plugin_without_a_facts_trailer_fails_only_the_resolution_delta_check() {
+    let fake = install_fake("none", true);
+    let manifest = fake.dir.join("plugin.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    assert!(text.trim_end().ends_with("files_created = false"), "the capabilities table is last:\n{text}");
+    text.push_str("resolution_delta = true\n\n[plugin.workspace]\nwatch_files = [\"package.json\"]\n");
+    fs::write(&manifest, text).unwrap();
+
+    let source = fixtures().join("fake");
+    let fixture = write_fk_fixture(&[
+        ("a.fk", &fs::read_to_string(source.join("a.fk")).unwrap()),
+        ("b.fk", &fs::read_to_string(source.join("b.fk")).unwrap()),
+        ("package.json", r#"{"name":"fk","version":"1.0.0"}"#),
+    ]);
+    let run = run_check(&fake.dir, fixture.path(), &[]);
+    assert!(!run.success, "a failing check must make the command exit non-zero:\n{}", run.stdout);
+    assert_eq!(run.failing(), vec![RESOLUTION_DELTA], "{}", run.stdout);
+    assert!(run.stdout.contains("without a resolutionFacts line"), "{}", run.stdout);
+}

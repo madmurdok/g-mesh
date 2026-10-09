@@ -973,4 +973,60 @@ mod tests {
         assert!(untyped_of(&graph, &ty).is_empty(), "a Type node takes none: {:?}", untyped_of(&graph, &ty));
         assert_eq!(graph.open_sites.len(), 7, "folding keeps the sites for the semantic engine");
     }
+
+    fn edge(kind: EdgeKind, specifier: Option<&str>) -> EdgeSpec {
+        EdgeSpec {
+            from_id: "from".to_string(),
+            to_id: "to".to_string(),
+            kind,
+            resolved: false,
+            to_declaration: None,
+            source: SourceTier::Syntactic,
+            engine: "toy-parser".to_string(),
+            specifier: specifier.map(str::to_string),
+        }
+    }
+
+    /// An `IMPORTS` edge carries its specifier to the wire, and the
+    /// specifier is not part of the edge's id.
+    ///
+    /// Control: set `specifier: None` for every kind in `add_edge`.
+    #[test]
+    fn an_imports_edge_carries_its_specifier_outside_its_id() {
+        let mut graph = builder();
+        let with = graph.add_edge(edge(EdgeKind::Imports, Some("@app/x")));
+        let graph = graph.finish();
+        assert_eq!(graph.edges[0].specifier.as_deref(), Some("@app/x"));
+
+        let mut bare = builder();
+        let without = bare.add_edge(edge(EdgeKind::Imports, None));
+        assert_eq!(with, without, "the specifier does not move the id");
+        assert_eq!(with, edge_id("from", EdgeKind::Imports, "to", None));
+        assert_eq!(bare.finish().edges[0].specifier, None);
+    }
+
+    /// A specifier on any other kind of edge is dropped.
+    ///
+    /// Control: keep `spec.specifier` for every kind in `add_edge`.
+    #[test]
+    fn a_specifier_on_any_other_edge_is_dropped() {
+        for kind in [EdgeKind::Calls, EdgeKind::References, EdgeKind::Defines, EdgeKind::Exports] {
+            let mut graph = builder();
+            graph.add_edge(edge(kind, Some("@app/x")));
+            assert_eq!(graph.finish().edges[0].specifier, None, "{kind:?}");
+        }
+    }
+
+    /// `import_edge` is an unresolved `IMPORTS` edge carrying the specifier.
+    #[test]
+    fn import_edge_is_an_unresolved_imports_edge_with_its_specifier() {
+        let mut graph = builder();
+        let id = graph.import_edge("from", "to", "./b");
+        let graph = graph.finish();
+        let edge = &graph.edges[0];
+        assert_eq!(edge.id, id);
+        assert_eq!(edge.kind, EdgeKind::Imports);
+        assert!(!edge.resolved);
+        assert_eq!(edge.specifier.as_deref(), Some("./b"));
+    }
 }
