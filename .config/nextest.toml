@@ -20,6 +20,10 @@
 #
 # 714 tests passing on all four, no leaks reported, and faster on three of
 # them. aarch64 pays 23s for what the rest of this file buys.
+#
+# The suite runs as named sections, each a filterset over these profiles:
+# `scripts/test-sections.sh` (docs/adr/0030-test-sections.md). No profile here
+# is per section; every section runs under `default` or `ci` unchanged.
 
 [profile.default]
 # Same reason `--no-fail-fast` is passed today: cargo otherwise stops at the
@@ -83,7 +87,8 @@ test-group = 'daemon-spawning'
 inherits = "default"
 
 [profile.ci.junit]
-# Written to `target/nextest/ci/junit.xml`. One `<testsuite>` per test
+# Written to `target/nextest/ci/junit.xml`, which `scripts/test-sections.sh`
+# renames to `junit-<section>.xml` after each section. One `<testsuite>` per test
 # binary, which is the grouping that matters: 25 failures in one binary is
 # one cause, 25 across twelve is a different situation entirely, and that
 # distinction is what made GM-337 diagnosable at all.
