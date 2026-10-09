@@ -792,6 +792,13 @@ fn pass_response(
     if let (true, Some(reason)) = (incomplete, answer.reason) {
         response["incompleteReason"] = serde_json::Value::String(reason);
     }
+    // Sent on per-file passes too, whatever `incomplete` says: core reads the
+    // list to settle exactly the files a pass finished.
+    if let Some(unfinished) = answer.unfinished {
+        response["unfinishedFiles"] = serde_json::Value::Array(
+            unfinished.iter().map(|file| serde_json::Value::String(file.to_string())).collect(),
+        );
+    }
     response
 }
 

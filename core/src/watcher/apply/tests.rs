@@ -122,6 +122,7 @@ fn spawn_stub_plugin(
                 result,
                 incomplete: false,
                 incomplete_reason: None,
+                unfinished_files: None,
             },
         )
         .unwrap();
@@ -295,6 +296,7 @@ fn file_change_diff_is_committed_to_sqlite() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff {
             upsert_nodes: vec![canned_node("n1"), canned_node("n2")],
@@ -386,6 +388,7 @@ fn diff_with_deletes_removes_rows() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff { delete_node_ids: vec!["n1".to_string()], ..Default::default() },
     };
@@ -431,6 +434,7 @@ fn mismatched_response_id_is_rejected() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: RequestId::Number(999), // deliberately does not match the request
         result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
     };
@@ -478,6 +482,7 @@ fn empty_diff_response_is_a_safe_no_op() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff::default(),
     };
@@ -542,6 +547,7 @@ fn spawn_semantic_stub(
                 result,
                 incomplete,
                 incomplete_reason: incomplete_reason.map(str::to_string),
+                unfinished_files: None,
             },
         )
         .unwrap();
@@ -632,6 +638,7 @@ fn a_settled_reparse_is_followed_by_a_semantic_pass_over_that_file() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff {
             upsert_nodes: vec![canned_node("n1"), canned_node("n2")],
@@ -693,6 +700,7 @@ fn a_failing_semantic_pass_does_not_fail_the_reparse() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
     };
@@ -749,6 +757,7 @@ fn a_semantic_pass_incapable_plugin_is_never_sent_a_semantic_pass_request() {
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
     };
@@ -1246,6 +1255,7 @@ fn reparse_in(conn: &IndexStore, root: &std::path::Path, id: i64, diff: FileChan
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: diff,
     };
@@ -1648,6 +1658,7 @@ fn edit_keeping_the_call(conn: &IndexStore, id: i64, pass: Option<FileChangeDiff
         jsonrpc: JSONRPC_VERSION.to_string(),
         incomplete: false,
         incomplete_reason: None,
+        unfinished_files: None,
         id: request_id.clone(),
         result: FileChangeDiff {
             upsert_nodes: vec![node_in("f", "src/lib.rs"), node_in("d", "src/lib.rs")],
@@ -1881,6 +1892,7 @@ fn spawn_linked_edges_stub(
                 result: lib_rs_reparse(),
                 incomplete: false,
                 incomplete_reason: None,
+                unfinished_files: None,
             };
             write_message(&mut writer, &response).unwrap();
         }
@@ -1895,6 +1907,7 @@ fn spawn_linked_edges_stub(
             result: FileChangeDiff { complete: true, ..Default::default() },
             incomplete: false,
             incomplete_reason: None,
+            unfinished_files: None,
         };
         write_message(&mut writer, &response).unwrap();
         linked_edges

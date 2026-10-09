@@ -549,6 +549,9 @@ fn swap_attached(
         )
         .with_context(|| format!("failed to record {language}'s pending files"))?;
     }
+    // What earlier per-file passes left unfinished described the index this
+    // swap replaces; the pass that follows re-asks every file anyway.
+    schema::clear_owed_files(&tx, language)?;
     schema::record_bulk_index(&tx).context("failed to reconcile the bulk-index roll-up")?;
     schema::reconcile_semantic_pass_rollup(&tx, semantic_pass_languages)
         .context("failed to reconcile the semantic-pass roll-up")?;

@@ -719,6 +719,17 @@ pub struct FileChangeResponse {
     /// means the plugin gave no reason, and core records a generic one.
     #[serde(rename = "incompleteReason", default, skip_serializing_if = "Option::is_none")]
     pub incomplete_reason: Option<String>,
+    /// **`semanticPass` only:** the files of this pass's scope it did not
+    /// finish. Absent = unknown, and core keeps its behaviour from
+    /// before this field (a complete per-file pass settles the files it sent,
+    /// an incomplete one settles none); present and empty = every file in
+    /// scope finished. Read whatever [`Self::incomplete`] says, so a per-file
+    /// pass can name its unfinished files without core logging it as
+    /// incomplete. Core keeps the named files and puts them into the scope of
+    /// the next per-file pass itself, so `sent - unfinishedFiles` is exactly
+    /// what a pass settled.
+    #[serde(rename = "unfinishedFiles", default, skip_serializing_if = "Option::is_none")]
+    pub unfinished_files: Option<Vec<String>>,
 }
 
 /// `skip_serializing_if` for a `bool` that is absent-means-false on the wire.
@@ -1237,6 +1248,7 @@ mod tests {
             result: FileChangeDiff::default(),
             incomplete: false,
             incomplete_reason: None,
+            unfinished_files: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
