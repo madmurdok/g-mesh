@@ -425,6 +425,237 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // GM-523: the byte budget, compact/full rows, `total`
+    // -----------------------------------------------------------------
+
+    const BUDGET: usize = pagination::OUTLINE_MAX_RESPONSE_BYTES;
+
+    /// The id of the `i`th row of a [`big_file`], in source order.
+    fn row_id(i: usize) -> String {
+        format!("s{i:04}")
+    }
+
+    /// A file of `n` symbols on lines `0..n`, each with a distinct
+    /// `sig_len`-char signature, so a full row is far wider than a compact one.
+    fn big_file(n: usize, sig_len: usize) -> Arc<IndexStore> {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
+        for i in 0..n {
+            let id = row_id(i);
+            let mut node = symbol_at(&id, &id, i as i64);
+            node.end_line = i as i64;
+            node.signature = Some(format!("{id}{}", "x".repeat(sig_len.saturating_sub(id.len()))));
+            upsert_node(&mut conn, node).unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e{id}"), "file", id, "DEFINES", "tree-sitter", false),
+            )
+            .unwrap();
+        }
+        Arc::new(IndexStore::new(conn))
+    }
+
+    /// One `get_file_outline` call: the response text, as sent, and its JSON.
+    fn outline_call(
+        store: &Arc<IndexStore>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+        detail: Option<OutlineDetail>,
+    ) -> (String, serde_json::Value) {
+        let params = GetFileOutlineParams { file_path: "a.rs".to_string(), cursor, limit, detail };
+        let result = handle(store, params).unwrap();
+        let body = json_body(&result);
+        let text = match &result.content[0] {
+            rmcp::model::ContentBlock::Text(text) => text.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        (text, body)
+    }
+
+    fn ids_of(body: &serde_json::Value) -> Vec<String> {
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["symbolId"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn keys_of(row: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        row.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// B1: no `limit` or `detail` lifts the 8,000-byte budget, and a file
+    /// wider than the budget comes back cut, with `hasMore`. Omitting `limit`
+    /// is the same call as `limit: 200` (GM-523 Q2).
+    #[test]
+    fn every_response_fits_the_byte_budget_whatever_limit_and_detail() {
+        let store = big_file(200, 200);
+        for detail in [None, Some(OutlineDetail::Compact), Some(OutlineDetail::Full)] {
+            for limit in [None, Some(1), Some(50), Some(200), Some(10_000)] {
+                let (text, body) = outline_call(&store, limit, None, detail);
+                assert!(
+                    text.len() <= BUDGET,
+                    "limit {limit:?}, detail {detail:?}: {} bytes over the {BUDGET}-byte budget",
+                    text.len()
+                );
+                assert!(!ids_of(&body).is_empty(), "limit {limit:?}, detail {detail:?}: empty page");
+                assert_eq!(body["hasMore"], true, "limit {limit:?}, detail {detail:?}: 200 rows never fit");
+            }
+            let (no_limit, _) = outline_call(&store, None, None, detail);
+            let (limit_200, _) = outline_call(&store, Some(200), None, detail);
+            assert_eq!(no_limit, limit_200, "detail {detail:?}: no limit must mean limit 200");
+        }
+    }
+
+    /// B2: following `nextCursor` across byte-cut pages, switching `detail`
+    /// between pages, returns every row exactly once, in source order. 250
+    /// rows so the SQL page itself also has a next page to resume from.
+    #[test]
+    fn following_the_cursor_across_byte_cuts_returns_every_row_once() {
+        const N: usize = 250;
+        let store = big_file(N, 200);
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages <= N, "paging never ended after {N} pages");
+            let detail = if pages % 2 == 0 { OutlineDetail::Full } else { OutlineDetail::Compact };
+            let (text, body) = outline_call(&store, Some(200), cursor.clone(), Some(detail));
+            assert!(text.len() <= BUDGET, "page {pages}: {} bytes", text.len());
+            let ids = ids_of(&body);
+            assert!(!ids.is_empty(), "page {pages} is empty");
+            seen.extend(ids);
+            if body["hasMore"] == false {
+                assert!(body.get("total").is_none(), "the last page carries no total");
+                break;
+            }
+            assert_eq!(body["total"], N, "page {pages}: a cut page carries the file's row count");
+            cursor = Some(body["nextCursor"].as_str().expect("hasMore implies a cursor").to_string());
+        }
+        let expected: Vec<String> = (0..N).map(row_id).collect();
+        assert_eq!(seen, expected, "every row exactly once, in source order");
+        assert!(pages > 2, "the fixture must need several byte-cut pages, took {pages}");
+    }
+
+    /// B3: a page cut by bytes reports `hasMore` and a cursor even when
+    /// `limit` covers the whole file (the SQL page says there is no more),
+    /// with `total` placed before `hasMore`.
+    #[test]
+    fn a_byte_cut_sets_has_more_even_when_limit_covers_the_file() {
+        let store = big_file(120, 200);
+        let (text, body) = outline_call(&store, Some(200), None, Some(OutlineDetail::Full));
+        assert!(ids_of(&body).len() < 120, "120 full rows must not fit {BUDGET} bytes");
+        assert_eq!(body["hasMore"], true);
+        assert!(body["nextCursor"].is_string(), "a cut page must carry a cursor");
+        assert_eq!(body["total"], 120);
+        assert!(text.contains(r#""total":120,"hasMore":true"#), "total precedes hasMore: {text}");
+    }
+
+    /// B4 and "small files unchanged": a file that fits has no `total` key,
+    /// and with `detail: "full"` its body is byte-for-byte the pre-GM-523
+    /// response, `"signature": null` included.
+    #[test]
+    fn a_small_file_has_no_total_and_its_full_body_is_unchanged() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
+        for i in 0..3i64 {
+            let id = format!("n{i}");
+            let mut node = symbol_at(&id, &id, 10 * i + 3);
+            node.start_col = 4;
+            node.end_line = 10 * i + 5;
+            node.end_col = 6;
+            if i == 1 {
+                node.signature = Some("fn n1()".to_string());
+                node.visibility = "public".to_string();
+                node.exported = true;
+            }
+            upsert_node(&mut conn, node).unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e{i}"), "file", id, "DEFINES", "tree-sitter", false),
+            )
+            .unwrap();
+        }
+        let store = Arc::new(IndexStore::new(conn));
+
+        let (_, compact) = outline_call(&store, None, None, None);
+        assert!(compact.get("total").is_none(), "a complete page has no total key: {compact}");
+        assert_eq!(compact["hasMore"], false);
+
+        let (full, _) = outline_call(&store, None, None, Some(OutlineDetail::Full));
+        assert_eq!(
+            full,
+            concat!(
+                r#"{"results":["#,
+                r#"{"symbolId":"n0","name":"n0","qualifiedName":"pkg::n0","kind":"Function","startLine":3,"startCol":4,"endLine":5,"endCol":6,"signature":null,"exported":false},"#,
+                r#"{"symbolId":"n1","name":"n1","qualifiedName":"pkg::n1","kind":"Function","startLine":13,"startCol":4,"endLine":15,"endCol":6,"signature":"fn n1()","exported":true},"#,
+                r#"{"symbolId":"n2","name":"n2","qualifiedName":"pkg::n2","kind":"Function","startLine":23,"startCol":4,"endLine":25,"endCol":6,"signature":null,"exported":false}"#,
+                r#"],"hasMore":false,"nextCursor":null}"#,
+            )
+        );
+    }
+
+    /// B5: rows are compact by default (exactly six keys, with `symbolId`)
+    /// and full on request (exactly the pre-GM-523 ten keys).
+    #[test]
+    fn rows_are_compact_by_default_and_full_on_request() {
+        let store = big_file(2, 0);
+        let compact_keys: std::collections::BTreeSet<String> =
+            ["symbolId", "name", "kind", "startLine", "endLine", "exported"].map(String::from).into();
+        let mut full_keys = compact_keys.clone();
+        full_keys.extend(["qualifiedName", "startCol", "endCol", "signature"].map(String::from));
+
+        for detail in [None, Some(OutlineDetail::Compact)] {
+            let (_, body) = outline_call(&store, None, None, detail);
+            for row in body["results"].as_array().unwrap() {
+                assert_eq!(keys_of(row), compact_keys, "detail {detail:?}");
+            }
+        }
+        let (_, body) = outline_call(&store, None, None, Some(OutlineDetail::Full));
+        let rows = body["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(keys_of(row), full_keys);
+        }
+    }
+
+    /// B6: a row that alone is over the budget is still sent, alone, with
+    /// `hasMore`, and the next page carries the rest - never an empty page
+    /// that pages forever.
+    #[test]
+    fn a_single_row_over_the_budget_is_sent_alone() {
+        let mut conn = setup();
+        upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
+        for i in 0..3i64 {
+            let id = format!("n{i}");
+            let mut node = symbol_at(&id, &id, i);
+            if i == 0 {
+                node.signature = Some("x".repeat(9_000));
+            }
+            upsert_node(&mut conn, node).unwrap();
+            upsert_edge(
+                &mut conn,
+                EdgeRecord::new(format!("e{i}"), "file", id, "DEFINES", "tree-sitter", false),
+            )
+            .unwrap();
+        }
+        let store = Arc::new(IndexStore::new(conn));
+
+        let (text, first) = outline_call(&store, None, None, Some(OutlineDetail::Full));
+        assert_eq!(ids_of(&first), vec!["n0"]);
+        assert!(text.len() > BUDGET, "the fixture row must be over the budget on its own");
+        assert_eq!(first["hasMore"], true);
+        assert_eq!(first["total"], 3);
+
+        let cursor = first["nextCursor"].as_str().map(str::to_string);
+        let (_, second) = outline_call(&store, None, cursor, Some(OutlineDetail::Full));
+        assert_eq!(ids_of(&second), vec!["n1", "n2"]);
+        assert_eq!(second["hasMore"], false);
+    }
+
+    // -----------------------------------------------------------------
     // a miss on a path whose language is not indexed at all
     // -----------------------------------------------------------------
 
