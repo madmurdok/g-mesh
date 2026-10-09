@@ -2504,3 +2504,111 @@ fn a_whole_project_pass_is_sent_no_owed_files() {
     .unwrap();
     plugin.join().unwrap();
 }
+
+/// A re-extract sends `fileChanged` with `reextract: true`, applies the
+/// answer, and sends nothing after it: the caller owes the semantic pass.
+///
+/// Control: pass `reextract = false` from `reextract_file` to
+/// `apply_file_change_in`.
+#[test]
+fn a_re_extract_sets_the_flag_and_sends_no_semantic_pass() {
+    let (plugin_reader, core_writer) = std::io::pipe().unwrap();
+    let (core_reader, mut plugin_writer) = std::io::pipe().unwrap();
+    let conn = IndexStore::new(setup_conn());
+    let plugin = std::thread::spawn(move || {
+        let mut plugin_reader = BufReader::new(plugin_reader);
+        let request: ControlEnvelope = read_message(&mut plugin_reader).unwrap().unwrap();
+        let ControlMessage::FileChanged { file_path, reextract } = request.message else {
+            panic!("expected FileChanged, got {:?}", request.message);
+        };
+        write_message(
+            &mut plugin_writer,
+            &FileChangeResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id.expect("a re-extract expects an answer"),
+                result: FileChangeDiff { upsert_nodes: vec![canned_node("n1")], ..Default::default() },
+                incomplete: false,
+                incomplete_reason: None,
+                unfinished_files: None,
+            },
+        )
+        .unwrap();
+        let next: Option<ControlEnvelope> = read_message(&mut plugin_reader).unwrap();
+        (file_path, reextract, next)
+    });
+
+    let root = project_root();
+    let mut core_writer = core_writer;
+    reextract_file(
+        &mut BufReader::new(core_reader),
+        &mut core_writer,
+        &conn,
+        root.path(),
+        "rust",
+        "src/lib.rs",
+        RequestId::Number(1),
+        &EmbeddingPipeline::disabled(),
+        TEST_TIMEOUT,
+        &mut on_timeout_must_not_fire,
+    )
+    .unwrap();
+    drop(core_writer);
+    let (file_path, reextract, next) = plugin.join().unwrap();
+
+    assert_eq!(file_path, "src/lib.rs");
+    assert!(reextract, "the request carries reextract: true");
+    assert!(next.is_none(), "nothing follows the re-extract: {next:?}");
+    assert_eq!(count(&conn, "nodes"), 1, "the answer was applied");
+}
+
+/// The pass after a selective re-extract is sent the re-extracted files plus
+/// the language's owed files.
+///
+/// Control: pass no owed files from `apply_scoped_semantic_pass`.
+#[test]
+fn a_scoped_semantic_pass_is_sent_its_files_and_the_owed_ones() {
+    let (root, conn) = owed_fixture();
+    edit_and_pass(&conn, root.path(), OWED_A, false, Some(&[OWED_A]));
+    assert_eq!(owed_rows(&conn), vec![(OWED_A.to_string(), 1)]);
+
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, mut plugin_writer) = std::io::pipe().unwrap();
+    let plugin = std::thread::spawn(move || {
+        let mut plugin_reader = BufReader::new(plugin_reader);
+        let request: ControlEnvelope = read_message(&mut plugin_reader).unwrap().unwrap();
+        let ControlMessage::SemanticPass { file_paths, .. } = request.message else {
+            panic!("expected SemanticPass, got {:?}", request.message);
+        };
+        write_message(
+            &mut plugin_writer,
+            &FileChangeResponse {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                id: request.id.expect("a semantic pass expects an answer"),
+                result: FileChangeDiff::default(),
+                incomplete: false,
+                incomplete_reason: None,
+                unfinished_files: Some(Vec::new()),
+            },
+        )
+        .unwrap();
+        file_paths
+    });
+
+    apply_scoped_semantic_pass(
+        &mut BufReader::new(core_reader),
+        &mut core_writer,
+        &conn,
+        "rust",
+        strings(&[OWED_B, OWED_C]),
+        RequestId::Number(2),
+        &EmbeddingPipeline::disabled(),
+        TEST_TIMEOUT,
+        &mut on_timeout_must_not_fire,
+    )
+    .unwrap();
+    let mut sent = plugin.join().unwrap();
+    sent.sort();
+
+    assert_eq!(sent, strings(&[OWED_A, OWED_B, OWED_C]));
+    assert!(owed_rows(&conn).is_empty(), "the pass finished the owed file");
+}

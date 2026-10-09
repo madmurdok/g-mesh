@@ -299,3 +299,6 @@ fn reextract(
         .with_context(|| format!("failed to store {language}'s resolution facts"))?;
     Ok(Outcome::Reextracted(selected.len()))
 }
+
+#[cfg(test)]
+mod tests;

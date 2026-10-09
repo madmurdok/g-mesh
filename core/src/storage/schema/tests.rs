@@ -1174,3 +1174,50 @@ fn a_schema_12_index_is_reset_and_the_reset_drops_the_language_outcomes() {
 fn a_fresh_index_has_no_language_outcomes() {
     assert!(language_outcomes(&setup()).unwrap().is_empty());
 }
+
+/// Resolution facts are stored per language, replaced in place, and deleted
+/// by `None`; another language's are untouched.
+#[test]
+fn resolution_facts_are_stored_replaced_and_deleted_per_language() {
+    let conn = setup();
+    assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None);
+
+    set_resolution_facts(&conn, "typescript", Some("f1")).unwrap();
+    set_resolution_facts(&conn, "rust", Some("r1")).unwrap();
+    set_resolution_facts(&conn, "typescript", Some("f2")).unwrap();
+    assert_eq!(resolution_facts(&conn, "typescript").unwrap().as_deref(), Some("f2"));
+
+    set_resolution_facts(&conn, "typescript", None).unwrap();
+    assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None);
+    assert_eq!(resolution_facts(&conn, "rust").unwrap().as_deref(), Some("r1"));
+}
+
+/// Schema "14": an index stamped "13", whose `edges` has no `specifier`
+/// column, is reset; afterwards the column exists and the stored facts are
+/// gone with everything else.
+///
+/// Controls: leave `CURRENT_SCHEMA_VERSION` at "13" - `ensure_current`
+/// returns false and the column stays missing; remove `resolution_facts`
+/// from `wipe` - the reset keeps the row.
+#[test]
+fn a_schema_13_index_is_reset_and_gains_the_specifier_column() {
+    let conn = setup();
+    conn.execute_batch("ALTER TABLE edges DROP COLUMN specifier").unwrap();
+    conn.execute(
+        "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, '13', ?1, CURRENT_TIMESTAMP)",
+        params![GENERATION],
+    )
+    .unwrap();
+    set_resolution_facts(&conn, "typescript", Some("stale")).unwrap();
+
+    assert!(ensure_current(&conn, GENERATION).unwrap(), "schema 13 is not current");
+
+    let has_specifier: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_table_info('edges') WHERE name = 'specifier'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(has_specifier, 1, "the reset recreates edges with its specifier column");
+    assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None, "the reset drops the facts");
+    assert!(!ensure_current(&conn, GENERATION).unwrap(), "a schema 14 index is current");
+}

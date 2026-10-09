@@ -188,4 +188,19 @@ mod tests {
         assert!(matches!(&items[0], BulkItem::Node(n) if n.id == "n1"));
         assert!(matches!(&items[1], BulkItem::Edge(e) if e.id == "e1"));
     }
+
+    /// The `resolution_delta` trailer reads as its own item, and a line that
+    /// only resembles it (an extra key) is still malformed.
+    #[test]
+    fn a_resolution_facts_trailer_is_its_own_item() {
+        let stream = format!(
+            "{}\n{{\"resolutionFacts\":\"opaque\"}}\n{{\"resolutionFacts\":\"x\",\"y\":1}}\n",
+            node_json("n1")
+        );
+        let items: Vec<_> = NdjsonReader::new(Cursor::new(stream.into_bytes())).collect();
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[0], Ok(BulkItem::Node(n)) if n.id == "n1"));
+        assert!(matches!(&items[1], Ok(BulkItem::ResolutionFacts(facts)) if facts == "opaque"));
+        assert!(items[2].is_err(), "an unknown key is not a trailer");
+    }
 }

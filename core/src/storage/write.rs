@@ -1359,4 +1359,41 @@ mod tests {
             .unwrap();
         assert_eq!(count(&conn, "untyped_calls"), 0);
     }
+
+    fn stored_specifier(conn: &Connection, edge_id: &str) -> Option<String> {
+        conn.query_row("SELECT specifier FROM edges WHERE id = ?1", params![edge_id], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn import_with(specifier: Option<&str>) -> Diff {
+        let mut edge = EdgeRecord::new("imp", "a", "b", "IMPORTS", "tree-sitter", false);
+        edge.specifier = specifier.map(str::to_string);
+        Diff {
+            upsert_nodes: vec![
+                NodeRecord::new("a", "File", "a.ts", "a.ts", "a.ts", "typescript"),
+                NodeRecord::new("b", "File", "b.ts", "b.ts", "b.ts", "typescript"),
+            ],
+            upsert_edges: vec![edge],
+            ..Default::default()
+        }
+    }
+
+    /// An edge's `specifier` is stored; an upsert of the same edge
+    /// without one (a re-sent edge from a tier that does not set it) keeps
+    /// the stored one; an upsert with a different one replaces it.
+    ///
+    /// Control: write `specifier = excluded.specifier` in the upsert (the
+    /// re-send without one clears it).
+    #[test]
+    fn an_edge_specifier_is_stored_and_kept_by_a_re_send_without_one() {
+        let mut conn = setup();
+        apply_diff(&mut conn, &import_with(Some("./b"))).unwrap();
+        assert_eq!(stored_specifier(&conn, "imp").as_deref(), Some("./b"));
+
+        apply_diff(&mut conn, &import_with(None)).unwrap();
+        assert_eq!(stored_specifier(&conn, "imp").as_deref(), Some("./b"), "kept by a re-send without one");
+
+        apply_diff(&mut conn, &import_with(Some("@app/b"))).unwrap();
+        assert_eq!(stored_specifier(&conn, "imp").as_deref(), Some("@app/b"), "replaced by a new one");
+    }
 }

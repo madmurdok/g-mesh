@@ -401,7 +401,6 @@ pub(crate) fn set_semantic_pass_answer(plugin_dir: &Path, diff: Option<&str>) {
 /// Adds `resolution_delta = true` to any fake plugin's
 /// `[plugin.capabilities]`, adding the table if the manifest has none. Takes
 /// effect at the next `discover`.
-#[allow(dead_code)]
 pub(crate) fn declare_resolution_delta(plugin_dir: &Path) {
     let path = plugin_dir.join("plugin.toml");
     let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
@@ -418,7 +417,6 @@ pub(crate) fn declare_resolution_delta(plugin_dir: &Path) {
 /// with `result` (a `ResolutionChangedResult` as JSON), or, with `None`, with
 /// an `unknown` delta again. Read per request, so it takes effect without a
 /// respawn.
-#[allow(dead_code)]
 pub(crate) fn set_resolution_changed_answer(plugin_dir: &Path, result: Option<&str>) {
     let path = plugin_dir.join(RESOLUTION_ANSWER);
     match result {

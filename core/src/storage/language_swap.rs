@@ -1056,4 +1056,95 @@ mod tests {
         assert_eq!(delete_placeholders(&mut conn, "rust", &["p1".to_string()]).unwrap(), 1);
         assert!(column(&conn, "SELECT name FROM untyped_calls").is_empty());
     }
+
+    /// Live holds `rust` and `go` facts and an import `a.rs -> b.rs`
+    /// written `./b`; staging re-walks `rust` with that import now written
+    /// `crate::b`, a changed `b.rs` with a new import `b.rs -> a.rs` written
+    /// `super::a`, and
+    /// `staged_facts`. Swaps and returns live.
+    fn swap_imports_and_facts(staged_facts: Option<&str>) -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let live_path = dir.path().join("index.db");
+        let staging_path = dir.path().join("staging-rust.db");
+        let import = |id: &str, from: &str, to: &str, specifier: &str| {
+            let mut edge = EdgeRecord::new(id, from, to, "IMPORTS", "tree-sitter", true);
+            edge.specifier = Some(specifier.to_string());
+            edge
+        };
+
+        let mut live = open_staging(&live_path).unwrap();
+        live.execute(
+            "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, 'x', 'x', 'x')",
+            [],
+        )
+        .unwrap();
+        apply_diff(
+            &mut live,
+            &Diff {
+                upsert_nodes: vec![file_node("a.rs"), file_node("b.rs")],
+                upsert_edges: vec![import("a->b", "file-a.rs", "file-b.rs", "./b")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        schema::set_resolution_facts(&live, "rust", Some("live facts")).unwrap();
+        schema::set_resolution_facts(&live, "go", Some("go facts")).unwrap();
+
+        let mut staging = open_staging(&staging_path).unwrap();
+        // `b.rs` changed, so the swap takes its new edge.
+        let mut changed_b = file_node("b.rs");
+        changed_b.signature = Some("changed".to_string());
+        apply_diff(
+            &mut staging,
+            &Diff {
+                upsert_nodes: vec![file_node("a.rs"), changed_b],
+                upsert_edges: vec![
+                    import("a->b", "file-a.rs", "file-b.rs", "crate::b"),
+                    import("b->a", "file-b.rs", "file-a.rs", "super::a"),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        schema::set_resolution_facts(&staging, "rust", staged_facts).unwrap();
+        plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+        drop(staging);
+        swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
+        (dir, live)
+    }
+
+    /// The swap carries each edge's `specifier`: a new edge's, and a change
+    /// to the specifier alone.
+    ///
+    /// Control: drop `specifier` from `EDGE_COLUMNS` (both read NULL or the
+    /// old value).
+    #[test]
+    fn a_swap_carries_the_edge_specifiers() {
+        let (_dir, live) = swap_imports_and_facts(Some("staged facts"));
+        assert_eq!(
+            column(&live, "SELECT id || ' ' || coalesce(specifier, 'NULL') FROM edges ORDER BY id"),
+            vec!["a->b crate::b", "b->a super::a"]
+        );
+    }
+
+    /// The swap replaces the language's facts with staging's, and leaves
+    /// another language's alone.
+    #[test]
+    fn a_swap_replaces_the_languages_resolution_facts() {
+        let (_dir, live) = swap_imports_and_facts(Some("staged facts"));
+        assert_eq!(schema::resolution_facts(&live, "rust").unwrap().as_deref(), Some("staged facts"));
+        assert_eq!(schema::resolution_facts(&live, "go").unwrap().as_deref(), Some("go facts"));
+    }
+
+    /// A walk that reported no facts leaves the language with none: the old
+    /// ones described rows the swap replaced.
+    ///
+    /// Control: drop the `DELETE FROM resolution_facts` in `swap_attached`
+    /// (the live facts survive).
+    #[test]
+    fn a_swap_without_staged_facts_drops_the_languages_facts() {
+        let (_dir, live) = swap_imports_and_facts(None);
+        assert_eq!(schema::resolution_facts(&live, "rust").unwrap(), None);
+        assert_eq!(schema::resolution_facts(&live, "go").unwrap().as_deref(), Some("go facts"));
+    }
 }
