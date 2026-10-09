@@ -1,0 +1,15 @@
+[package]
+name = "g-mesh-walk"
+version = "4.3.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The g-mesh project walk: .gitignore layering, excluded directory names, and the symlink guard"
+
+[lib]
+name = "g_mesh_walk"
+path = "src/lib.rs"
+
+[dependencies]
+# `.gitignore` semantics (layered, with negation), sorted walking and
+# `follow_links`. The only dependency: core and every SDK plugin link this.
+ignore = "0.4"

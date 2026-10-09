@@ -587,13 +587,22 @@ impl DiscoveredPlugins {
 
     /// The language whose plugin indexes `file_path`: the one claiming its
     /// extension, unless the file is under one of that same language's
-    /// `exclude_dirs`. Exclusions are per language, never a union. The single
+    /// `exclude_dirs`, by its spelling or by `real_path` (its spelling
+    /// relative to the root's real path, when a link on the way makes the two
+    /// differ): a plugin's walk refuses a link whose target is under an
+    /// excluded name. Exclusions are per language, never a union. The single
     /// answer to "should the index hold this file?", shared by the watcher's
     /// routing and `g-mesh status`'s coverage walk so they cannot disagree.
-    pub fn indexing_language(&self, file_path: &str) -> Option<&str> {
+    pub fn indexing_language(&self, file_path: &str, real_path: Option<&str>) -> Option<&str> {
         let language = self.language_for(file_path)?;
         match self.manifests.get(language) {
-            Some(manifest) if under_excluded_dir(file_path, &manifest.workspace.exclude_dirs) => None,
+            Some(manifest)
+                if under_excluded_dir(file_path, &manifest.workspace.exclude_dirs)
+                    || real_path
+                        .is_some_and(|real| under_excluded_dir(real, &manifest.workspace.exclude_dirs)) =>
+            {
+                None
+            }
             _ => Some(language),
         }
     }

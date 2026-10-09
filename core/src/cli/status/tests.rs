@@ -1258,3 +1258,98 @@ fn a_pending_semantic_pass_is_named_with_its_file_count_until_it_completes() {
     let rendered = render(&report_with(fixture.status()));
     assert!(!rendered.contains("semantic pending"), "{rendered}");
 }
+
+// ---------------------------------------------------------------------
+// GM-514: files reached through links (docs/architecture/
+// gm-514-core-symlink-table.md, section 5)
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+fn link(fixture: &Fixture, relative: &str, target: &str) {
+    let path = fixture.root().join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(target, path).unwrap();
+}
+
+#[cfg(unix)]
+fn discovered(fixture: &Fixture) -> Vec<String> {
+    let mut found: Vec<String> = discover_source_files(fixture.root(), &bundled_plugins())
+        .unwrap()
+        .into_iter()
+        .map(|file| file.relative)
+        .collect();
+    found.sort();
+    found
+}
+
+/// B4 + M5: a file reached only through `src/api -> ../gen` (`gen/`
+/// gitignored) is discovered under the link's spelling, matches the index
+/// row the plugin writes there, and is not dirty: its mtime is read through
+/// the link, which is the target's, as the plugin's baseline records it.
+///
+/// Control: `.follow_links(false)` in `g_mesh_walk`'s walker
+/// (walk/src/lib.rs) - discovered is 1, short by the alias.
+#[cfg(unix)]
+#[test]
+fn an_alias_only_file_is_discovered_and_indexed_under_the_link_and_not_dirty() {
+    let fixture = Fixture::new(&[
+        (".gitignore", "gen/\n"),
+        ("gen/a.ts", "export const a = 1;"),
+        ("src/main.ts", "export const m = 1;"),
+    ]);
+    link(&fixture, "src/api", "../gen");
+    let real_mtime = fixture.current_mtime("gen/a.ts");
+    assert_eq!(fixture.current_mtime("src/api/a.ts"), real_mtime, "M5: read through the link");
+
+    let conn = fixture.index();
+    for path in ["src/main.ts", "src/api/a.ts"] {
+        fixture.index_file(&conn, path, false);
+    }
+    fixture.record_baseline(&conn, "src/main.ts", fixture.current_mtime("src/main.ts"));
+    // The plugin's baseline: `fs::metadata` through the spelling it indexed.
+    fixture.record_baseline(&conn, "src/api/a.ts", real_mtime);
+    schema::record_language_bulk_indexed(&conn, "typescript", None).unwrap();
+    schema::record_bulk_index(&conn).unwrap();
+
+    assert_eq!(discovered(&fixture), vec!["src/api/a.ts", "src/main.ts"]);
+    let status = fixture.status();
+    assert_eq!(status.discovered, 2);
+    assert_eq!(status.indexed, 2);
+    assert_eq!(status.dirty, 0);
+}
+
+/// B5: a file reachable plainly and through a link (`app -> lib`, `app`
+/// first in walk order) is counted once, under its plain spelling.
+///
+/// Control: skip the winner pass in `g_mesh_walk` (`LinkGuard::finish`
+/// keeps every walked entry) - `app/x.ts` is counted too.
+#[cfg(unix)]
+#[test]
+fn a_file_reachable_through_a_link_and_plainly_is_counted_once_under_its_plain_spelling() {
+    let fixture = Fixture::new(&[("lib/x.ts", "export const x = 1;")]);
+    link(&fixture, "app", "lib");
+
+    assert_eq!(discovered(&fixture), vec!["lib/x.ts"]);
+    assert_eq!(fixture.status().discovered, 1);
+}
+
+/// B10: `src/dep -> ../node_modules/foo` (`node_modules/` gitignored): the
+/// TypeScript file under it is not TypeScript's (its real spelling is under
+/// TypeScript's `exclude_dirs`), while a Rust file there, which Rust does
+/// not exclude, is discovered under the link - so the walk did follow it.
+///
+/// Control: drop the `real_path` arm in
+/// `DiscoveredPlugins::indexing_language` - `src/dep/x.ts` is discovered.
+#[cfg(unix)]
+#[test]
+fn a_file_under_a_link_into_a_languages_excluded_dir_is_not_that_languages() {
+    let fixture = Fixture::new(&[
+        (".gitignore", "node_modules/\n"),
+        ("node_modules/foo/x.ts", "export const x = 1;"),
+        ("node_modules/foo/lib.rs", "pub fn f() {}"),
+        ("src/main.ts", "export const m = 1;"),
+    ]);
+    link(&fixture, "src/dep", "../node_modules/foo");
+
+    assert_eq!(discovered(&fixture), vec!["src/dep/lib.rs", "src/main.ts"]);
+}

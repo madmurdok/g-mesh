@@ -1204,7 +1204,7 @@ fn a_gitignore_edit_that_changes_no_indexed_file_runs_no_reindex() {
     write_file(project.path(), ".gitignore", "*.log\n");
     let conn = index_with_files(&[("alpha", "src/a.alpha-src")]);
 
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
 
     assert!(test_plugin::spawns(&dirs[0]).is_empty(), "nothing indexed changed, so nothing is reindexed");
 }
@@ -1222,7 +1222,7 @@ fn files_gained_or_lost_by_a_gitignore_edit_reindex_their_language() {
     write_file(project.path(), "src/a.alpha-src", "");
     write_file(project.path(), ".gitignore", "");
     let conn = index_with_files(&[("alpha", "src/a.alpha-src")]);
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
     assert!(!test_plugin::spawns(&dirs[0]).is_empty(), "a file gained by the edit reindexes alpha");
 
     // Newly ignored: generated/x is indexed but now under a rule.
@@ -1231,7 +1231,7 @@ fn files_gained_or_lost_by_a_gitignore_edit_reindex_their_language() {
     write_file(project.path(), "src/a.alpha-src", "");
     write_file(project.path(), ".gitignore", "generated/\n");
     let conn = index_with_files(&[("alpha", "src/a.alpha-src"), ("alpha", "generated/x.alpha-src")]);
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
     assert!(!test_plugin::spawns(&dirs[0]).is_empty(), "a file lost by the edit reindexes alpha");
 }
 
@@ -1249,7 +1249,7 @@ fn only_the_languages_a_gitignore_edit_changed_are_reindexed() {
     write_file(project.path(), ".gitignore", "");
     let conn = index_with_files(&[("alpha", "src/a.alpha-src"), ("beta", "src/b.beta-src")]);
 
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
 
     assert!(!test_plugin::spawns(alpha).is_empty(), "alpha gained generated/x and is reindexed");
     assert!(test_plugin::spawns(beta).is_empty(), "beta's files did not change, so it is not reindexed");
@@ -1274,7 +1274,7 @@ fn a_nested_gitignore_compares_its_subtree_under_its_ancestors_rules() {
     write_file(project.path(), "other/o.alpha-src", "");
     let conn = index_with_files(&[("alpha", "src/a.alpha-src")]);
 
-    registry.gitignore_changed(&conn, &["src/.gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &["src/.gitignore".to_string()], &[]);
 
     assert!(test_plugin::spawns(&dirs[0]).is_empty(), "nothing under src changed under the full rules");
 }
@@ -1290,7 +1290,7 @@ fn a_failed_language_is_not_reindexed_by_a_gitignore_edit() {
     let conn = test_plugin::empty_index();
     registry.set_failed_languages(["alpha".to_string()]);
 
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
 
     assert!(test_plugin::spawns(&dirs[0]).is_empty());
 }
@@ -1314,7 +1314,7 @@ fn a_language_gaining_more_than_the_guard_is_not_reindexed_and_others_still_are(
     write_file(project.path(), ".gitignore", "");
     let conn = test_plugin::empty_index();
 
-    registry.gitignore_changed(&conn, &[".gitignore".to_string()]);
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
 
     assert!(test_plugin::spawns(alpha).is_empty(), "alpha would gain more than the guard: no reindex");
     assert!(!test_plugin::spawns(beta).is_empty(), "beta, under the guard, is still reindexed");
@@ -1363,4 +1363,178 @@ fn at_start_only_a_gitignore_newer_than_the_last_walk_runs_the_gate() {
             "a .gitignore {offset}s from the last walk: gate ran = {newer} expected"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// GM-514: the gate and routing see files reached through links
+// (docs/architecture/gm-514-core-symlink-table.md, section 5)
+// ---------------------------------------------------------------------
+
+/// A registry over one stub `alpha` plugin (`.alpha-src`, `exclude_dirs`
+/// as given) at the project's canonical root, as the daemon builds it
+/// (`daemon::run` canonicalizes): `real_relative` strips the root from a
+/// canonical path. Returns the project tempdir, its canonical root, the
+/// plugin root's tempdir, the plugin directory and the registry.
+#[cfg(unix)]
+fn canonical_alpha_registry(
+    exclude_dirs: &[&str],
+) -> (tempfile::TempDir, PathBuf, tempfile::TempDir, PathBuf, PluginRegistry) {
+    let project = tempfile::tempdir().expect("failed to create a project root");
+    let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+    let dir =
+        test_plugin::install_with_workspace(plugins.path(), "alpha", &[".alpha-src"], &[], exclude_dirs);
+    let discovered = discover(&[plugins.path().to_path_buf()]).expect("the fixtures must discover cleanly");
+    let root = project.path().canonicalize().unwrap();
+    let state_dir = crate::storage::connection::project_dir(&root).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let registry = PluginRegistry::new(
+        &root,
+        state_dir,
+        discovered,
+        None,
+        None,
+        Arc::new(EmbeddingPipeline::disabled()),
+    );
+    (project, root, plugins, dir, registry)
+}
+
+#[cfg(unix)]
+fn link_at(root: &Path, relative: &str, target: &str) {
+    let path = root.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(target, path).unwrap();
+}
+
+/// `gen/` gitignored (plus `*.log`), reached only through `src/api ->
+/// ../gen`.
+#[cfg(unix)]
+fn alias_only_project(root: &Path) {
+    write_file(root, ".gitignore", "gen/\n*.log\n");
+    write_file(root, "gen/a.alpha-src", "");
+    write_file(root, "src/main.alpha-src", "");
+    link_at(root, "src/api", "../gen");
+}
+
+/// B6: with an alias-only file indexed under its link, a root `.gitignore`
+/// edit unrelated to `gen/` reindexes nothing: the gate's walk lists the
+/// alias too, so it reads nothing as removed.
+///
+/// Control: `.follow_links(false)` in `g_mesh_walk`'s walker
+/// (walk/src/lib.rs) - `src/api/a` reads as removed and alpha is spawned.
+#[cfg(unix)]
+#[test]
+fn a_gitignore_edit_unrelated_to_an_alias_only_target_reindexes_nothing() {
+    let (_project, root, _plugins, dir, registry) = canonical_alpha_registry(&[]);
+    alias_only_project(&root);
+    let conn = index_with_files(&[("alpha", "src/main.alpha-src"), ("alpha", "src/api/a.alpha-src")]);
+
+    registry.gitignore_changed(&conn, &[".gitignore".to_string()], &[]);
+
+    assert!(test_plugin::spawns(&dir).is_empty());
+}
+
+/// B7: a nested `.gitignore` edit whose subtree holds a link to a target
+/// outside it that is not ignored (`src/l -> ../lib`): the file is listed
+/// under its plain spelling, outside the subtree, so nothing changed.
+///
+/// Control: let the pruned walk follow links without the fallback (in
+/// `plain_files_under`, `.follow_links(true)` and no `return None` on a
+/// symlink) - `src/l/x` reads as gained and alpha is spawned.
+#[cfg(unix)]
+#[test]
+fn a_subtree_gate_with_a_link_to_a_plain_target_outside_it_reindexes_nothing() {
+    let (_project, root, _plugins, dir, registry) = canonical_alpha_registry(&[]);
+    write_file(&root, "src/.gitignore", "*.log\n");
+    write_file(&root, "src/a.alpha-src", "");
+    write_file(&root, "lib/x.alpha-src", "");
+    link_at(&root, "src/l", "../lib");
+    let conn = index_with_files(&[("alpha", "src/a.alpha-src"), ("alpha", "lib/x.alpha-src")]);
+
+    registry.gitignore_changed(&conn, &["src/.gitignore".to_string()], &[]);
+
+    assert!(test_plugin::spawns(&dir).is_empty());
+}
+
+/// B13 (gate half): a `.gitignore` inside the alias-only target, spelled
+/// through the link (`src/api/.gitignore`, as the watcher remaps it): the
+/// gate's subtree is the alias directory and lists its files, so an edit
+/// changing nothing reindexes nothing, and one that ignores an indexed file
+/// reindexes.
+///
+/// Control: in `plain_files_under`, `continue` instead of `return None` on a
+/// symlink (no fallback) - the unchanged case reads `src/api/a` as removed
+/// and spawns alpha.
+#[cfg(unix)]
+#[test]
+fn a_gitignore_inside_an_alias_only_target_is_gated_on_the_alias_directory() {
+    let (_project, root, _plugins, dir, registry) = canonical_alpha_registry(&[]);
+    alias_only_project(&root);
+    write_file(&root, "gen/.gitignore", "*.log\n");
+    let conn = index_with_files(&[("alpha", "src/main.alpha-src"), ("alpha", "src/api/a.alpha-src")]);
+    registry.gitignore_changed(&conn, &["src/api/.gitignore".to_string()], &[]);
+    assert!(test_plugin::spawns(&dir).is_empty(), "nothing under the alias changed");
+
+    let (_project, root, _plugins, dir, registry) = canonical_alpha_registry(&[]);
+    alias_only_project(&root);
+    write_file(&root, "gen/.gitignore", "a.alpha-src\n");
+    let conn = index_with_files(&[("alpha", "src/main.alpha-src"), ("alpha", "src/api/a.alpha-src")]);
+    registry.gitignore_changed(&conn, &["src/api/.gitignore".to_string()], &[]);
+    assert!(!test_plugin::spawns(&dir).is_empty(), "src/api/a is now ignored: alpha is reindexed");
+}
+
+/// B8 (gate half): a link created mid-session (its files not indexed yet),
+/// or removed (its files still indexed), reindexes its language through the
+/// gate, given only the link's spelling; an unchanged one does not.
+///
+/// Control: leave `links` out of `gitignore_subtrees` - neither change
+/// spawns alpha.
+#[cfg(unix)]
+#[test]
+fn a_created_or_removed_link_reindexes_its_language() {
+    // Created: on disk, not indexed.
+    let (_project, root, _plugins, dir, registry) = canonical_alpha_registry(&[]);
+    alias_only_project(&root);
+    let conn = index_with_files(&[("alpha", "src/main.alpha-src")]);
+    registry.gitignore_changed(&conn, &[], &["src/api".to_string()]);
+    assert!(!test_plugin::spawns(&dir).is_empty(), "the created link's file is gained");
+
+    // Removed: indexed, gone from disk.
+    let (_project, root, _plugins, dir, registry) = canonical_alpha_registry(&[]);
+    alias_only_project(&root);
+    fs::remove_file(root.join("src/api")).unwrap();
+    let conn = index_with_files(&[("alpha", "src/main.alpha-src"), ("alpha", "src/api/a.alpha-src")]);
+    registry.gitignore_changed(&conn, &[], &["src/api".to_string()]);
+    assert!(!test_plugin::spawns(&dir).is_empty(), "the removed link's file is lost");
+
+    // Unchanged: the index already holds what the walk lists.
+    let (_project, root, _plugins, dir, registry) = canonical_alpha_registry(&[]);
+    alias_only_project(&root);
+    let conn = index_with_files(&[("alpha", "src/main.alpha-src"), ("alpha", "src/api/a.alpha-src")]);
+    registry.gitignore_changed(&conn, &[], &["src/api".to_string()]);
+    assert!(test_plugin::spawns(&dir).is_empty(), "nothing changed");
+}
+
+/// B10 (routing half): `src/dep -> ../node_modules/foo` (gitignored), with
+/// `node_modules` in alpha's `exclude_dirs`: a change spelled under the
+/// link is not alpha's (its real spelling is excluded) and is not routed;
+/// an ordinary file still is.
+///
+/// Control: drop the `real_path` arm in
+/// `DiscoveredPlugins::indexing_language` - alpha is spawned for
+/// `src/dep/x`.
+#[cfg(unix)]
+#[test]
+fn a_change_under_a_link_into_an_excluded_dir_is_not_routed() {
+    let (_project, root, _plugins, dir, registry) = canonical_alpha_registry(&["node_modules"]);
+    write_file(&root, ".gitignore", "node_modules/\n");
+    write_file(&root, "node_modules/foo/x.alpha-src", "");
+    write_file(&root, "src/y.alpha-src", "");
+    link_at(&root, "src/dep", "../node_modules/foo");
+    let conn = test_plugin::empty_index();
+
+    registry.file_changed(&conn, "src/dep/x.alpha-src".to_string());
+    assert!(test_plugin::spawns(&dir).is_empty(), "the real spelling is under alpha's exclude_dirs");
+
+    registry.file_changed(&conn, "src/y.alpha-src".to_string());
+    assert_eq!(test_plugin::spawns(&dir).len(), 1, "an ordinary file still routes");
 }

@@ -476,10 +476,12 @@ fn spawn_watch_consumer(
 /// announced per language ([`PluginRegistry::announce_created`]), so a plugin
 /// knows all of them before it extracts the first; each is still routed once.
 ///
-/// A settled `.gitignore` (or directory) first reloads the watcher's layers,
-/// and the batch is filtered again under them (GM-508); after routing, the
-/// batch's `.gitignore` paths go through [`PluginRegistry::gitignore_changed`],
-/// which reindexes each language whose indexed files they changed.
+/// A settled `.gitignore`, directory or link first reloads the watcher's
+/// layers and link table; the batch is then filtered again under the current
+/// ones, a file link's own path placed as the walk lists it; after
+/// routing, the batch's `.gitignore` paths and the links whose row the reload
+/// changed go through [`PluginRegistry::gitignore_changed`], which reindexes
+/// each language whose indexed files they changed.
 fn watch_and_route_once(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
@@ -491,9 +493,13 @@ fn watch_and_route_once(
         debouncer.record(path);
     }
     let mut settled_paths = debouncer.drain_ready();
-    if watcher.reload_ignores_if_changed(&settled_paths) {
-        watcher.retain_unignored(&mut settled_paths);
+    let mut links = Vec::new();
+    if let Some(changed_links) = watcher.reload_ignores_if_changed(&settled_paths) {
+        links = changed_links;
     }
+    // Always, not only after a reload: it also places a file link's own path
+    // (kept by `next_change`) where the walk lists it.
+    watcher.retain_unignored(&mut settled_paths);
     let mut gitignores = Vec::new();
     let mut batch = Vec::new();
     for settled in settled_paths {
@@ -523,8 +529,8 @@ fn watch_and_route_once(
     }
     // After routing: a file deleted or created in this batch is already in
     // the graph's new state, so the gate compares against it.
-    if !gitignores.is_empty() {
-        registry.gitignore_changed(conn, &gitignores);
+    if !gitignores.is_empty() || !links.is_empty() {
+        registry.gitignore_changed(conn, &gitignores, &links);
     }
 }
 

@@ -56,11 +56,10 @@ anyhow = "1"
 # `json-schema` feature is deliberately left off: a plugin publishes no
 # schemas, so it compiles no schema generator.
 g-mesh-wire = { path = "../../wire" }
-# The project walk. `.gitignore` semantics (layered, with negation) are the
-# thing every plugin's walk has to get right and none of them should be
-# writing twice; this is the crate ripgrep's own walker is, and core already
-# depends on it, so it is one copy in the workspace rather than a new subtree.
-ignore = "0.4"
+# The project walk: `.gitignore` layering, name excludes and the symlink
+# guard, shared with core so the two agree on which files exist and under
+# which spelling. Its only dependency is `ignore`.
+g-mesh-walk = { path = "../../walk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Node and edge ids are sha256 prefixes, and the scheme is a cross-plugin
