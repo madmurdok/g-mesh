@@ -942,7 +942,7 @@ fn pass_resending_only_sem_kept(
     conn: &IndexStore,
     file_paths: Vec<String>,
     incomplete: bool,
-) -> (Result<()>, Vec<String>) {
+) -> (Result<SemanticPassOutcome>, Vec<String>) {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
     let mut resent = unresolved_edge("sem-kept", "n1", "n3");

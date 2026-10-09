@@ -273,6 +273,7 @@ fn a_report_renders_every_field_it_was_asked_for() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: 3,
             dirty: 1,
@@ -316,6 +317,7 @@ fn an_interrupted_workspace_reindex_is_named() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: vec![("rust".to_string(), "Cargo.toml".to_string())],
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 1,
             indexed: 1,
             dirty: 0,
@@ -353,6 +355,7 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: 4,
             dirty: 0,
@@ -424,6 +427,7 @@ fn the_generic_advice_stays_for_an_owed_language_with_no_recorded_failure() {
         false,
         &["python".to_string(), "rust".to_string()],
         &[("python".to_string(), "the server exited".to_string())],
+        &[],
         None,
     );
     assert_eq!(
@@ -443,6 +447,7 @@ fn a_pass_deferred_by_a_sleeping_plugin_reads_as_pending_not_failed() {
         false,
         &["python".to_string()],
         &[("python".to_string(), crate::daemon::semantic::NOT_RUN_REASON.to_string())],
+        &[],
         None,
     );
     assert_eq!(
@@ -461,6 +466,7 @@ fn a_deferred_pass_carries_no_reindex_advice_while_a_daemon_works() {
         false,
         &["python".to_string()],
         &[("python".to_string(), crate::daemon::semantic::NOT_RUN_REASON.to_string())],
+        &[],
         Some("running - go (0/2 languages done)"),
     );
     assert_eq!(
@@ -500,6 +506,7 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: 1,
             dirty: 3,
@@ -544,6 +551,7 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 4,
             indexed: if bulk_indexed { 4 } else { 0 },
             dirty: 4,
@@ -784,6 +792,7 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 2,
             indexed: 0,
             dirty: 2,
@@ -876,6 +885,7 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
@@ -1088,6 +1098,7 @@ fn a_project_with_no_suspension_marker_reports_none() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,

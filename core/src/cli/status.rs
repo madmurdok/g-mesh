@@ -45,6 +45,7 @@ use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
 use crate::project_walk;
 use crate::storage::connection::project_dir;
+use crate::storage::schema::SemanticLeftover;
 use crate::watcher::staleness::mtime_millis;
 
 /// Whether a daemon core is serving this project.
@@ -153,6 +154,10 @@ pub struct IndexStatus {
     /// language whose pass is owed after a workspace reindex swap and not
     /// done (`semantic_pending`, ADR 0009), sorted.
     pub semantic_pending: Vec<(String, String, usize)>,
+    /// Per semantic-pass-capable language: the files its last whole-project
+    /// pass left for the next start (residual, GM-521) and the files no pass
+    /// ever answered, sorted by language.
+    pub semantic_leftovers: Vec<SemanticLeftover>,
     /// Source files found on disk now - the denominator of coverage.
     pub discovered: usize,
     /// How many of those the index has a `File` node for.
@@ -252,6 +257,7 @@ pub fn collect(project_root: &Path) -> Result<Report> {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: 0,
             indexed: 0,
             dirty: 0,
@@ -373,6 +379,7 @@ pub fn index_status(project_root: &Path, db_path: &Path, plugins: &DiscoveredPlu
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_leftovers: Vec::new(),
             discovered: discovered.len(),
             indexed: 0,
             dirty: discovered.len(),
@@ -420,6 +427,11 @@ pub fn index_status(project_root: &Path, db_path: &Path, plugins: &DiscoveredPlu
         pending_reindex: crate::storage::schema::pending_reindexes(&conn)
             .context("failed to read the interrupted workspace reindexes")?,
         semantic_pending: semantic_pending(&conn, &capable)?,
+        semantic_leftovers: crate::storage::schema::semantic_leftovers(&conn)
+            .context("failed to read the semantic residual and never-answered files")?
+            .into_iter()
+            .filter(|leftover| capable.contains(&leftover.language))
+            .collect(),
         discovered: discovered.len(),
         indexed,
         dirty,
@@ -462,23 +474,47 @@ pub(crate) fn semantic_pass_state(
 
 /// The report's semantic-pass lines: one per language whose last pass
 /// failed, with its reason, and the "never completed" advice only while some
-/// owed language has no recorded failure to explain it and no live daemon is
-/// working on the index. `in_progress` is what to say instead while one is.
+/// owed language has no recorded failure or residual to explain it and no
+/// live daemon is working on the index. `in_progress` is what to say instead
+/// while one is. Then, per `leftovers` entry, the files an owed residual
+/// language's next start asks (GM-521) and the files no pass ever answered.
 pub(crate) fn semantic_pass_lines(
     completed: bool,
     owed: &[String],
     failures: &[(String, String)],
+    leftovers: &[SemanticLeftover],
     in_progress: Option<&str>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
+    let residual = |language: &String| {
+        leftovers.iter().any(|leftover| &leftover.language == language && leftover.residual_files.is_some())
+    };
     if completed {
         lines.push("  semantic pass:   complete".to_string());
     } else if let Some(in_progress) = in_progress {
         lines.push(format!("  semantic pass:   {in_progress}"));
     } else {
-        let unexplained = owed.iter().any(|language| !failures.iter().any(|(failed, _)| failed == language));
-        if unexplained || failures.is_empty() {
+        let unexplained = owed
+            .iter()
+            .any(|language| !failures.iter().any(|(failed, _)| failed == language) && !residual(language));
+        if unexplained || (failures.is_empty() && !owed.iter().any(residual)) {
             lines.push("  semantic pass:   never completed - run `g-mesh reindex` to repair it".to_string());
+        }
+    }
+    for leftover in leftovers {
+        let language = &leftover.language;
+        if let Some(files) = leftover.residual_files.filter(|_| owed.contains(language)) {
+            let asks =
+                if in_progress.is_some() { "the running daemon asks" } else { "the next daemon start asks" };
+            lines.push(format!(
+                "  semantic pass:   {language} incomplete - {files} file(s) left, {asks} only those"
+            ));
+        }
+        if leftover.never_answered > 0 {
+            lines.push(format!(
+                "  semantic pass:   {language}: {} file(s) never answered - asked again when they change",
+                leftover.never_answered
+            ));
         }
     }
     for (language, reason) in failures {
@@ -684,6 +720,7 @@ pub fn render(report: &Report) -> String {
             index.semantic_pass_completed,
             &index.semantic_pass_owed,
             &index.semantic_pass_failures,
+            &index.semantic_leftovers,
             in_progress.as_deref(),
         ) {
             let _ = writeln!(out, "{line}");

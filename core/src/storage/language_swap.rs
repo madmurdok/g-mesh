@@ -549,9 +549,10 @@ fn swap_attached(
         )
         .with_context(|| format!("failed to record {language}'s pending files"))?;
     }
-    // What earlier per-file passes left unfinished described the index this
-    // swap replaces; the pass that follows re-asks every file anyway.
-    schema::clear_owed_files(&tx, language)?;
+    // What earlier passes left unfinished or gave up on (owed, residual and
+    // never-answered rows) described the index this swap replaces; the
+    // whole-project pass that follows re-asks every file anyway.
+    schema::clear_semantic_leftovers(&tx, language)?;
     schema::record_bulk_index(&tx).context("failed to reconcile the bulk-index roll-up")?;
     schema::reconcile_semantic_pass_rollup(&tx, semantic_pass_languages)
         .context("failed to reconcile the semantic-pass roll-up")?;
@@ -812,7 +813,7 @@ mod tests {
     /// A committed swap clears the swapped language's owed files - they named
     /// the index it replaces - and no other language's.
     ///
-    /// Control: drop `clear_owed_files` from `swap_attached`.
+    /// Control: drop `clear_semantic_leftovers` from `swap_attached`.
     #[test]
     fn a_swap_clears_only_its_languages_owed_files() {
         let (_dir, mut live, staging_path, _plan) = planned_reindex();
