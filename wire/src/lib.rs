@@ -580,6 +580,16 @@ pub enum ControlMessage {
         /// Absent and empty are the same: nothing linked in scope.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         linked_edges: Vec<LinkedEdge>,
+        /// How long core waits for this pass's answer, in milliseconds: the
+        /// round-trip timeout core applies to this very request (GM-521) -
+        /// `semantic_pass_project_timeout(n)` for a whole-project or residual
+        /// pass, the per-file timeout for a per-file one. A plugin that plans
+        /// its work against a clock plans inside it, since core kills a
+        /// plugin that answers later. Optional, no protocol bump: absent
+        /// means unknown (an older core), and a plugin that ignores it keeps
+        /// its own budgets.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_ms: Option<u64>,
     },
     /// Tells a plugin its cached module/crate map is stale - a workspace
     /// file changed (`plugin.toml`'s `workspace.watch_files`, e.g. `go.mod`,
@@ -1056,6 +1066,7 @@ mod tests {
             message: ControlMessage::SemanticPass {
                 file_paths: vec!["src/a.ts".to_string(), "src/b.ts".to_string()],
                 linked_edges: Vec::new(),
+                budget_ms: None,
             },
         };
 
@@ -1075,7 +1086,11 @@ mod tests {
         let envelope = ControlEnvelope {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: Some(RequestId::Number(1)),
-            message: ControlMessage::SemanticPass { file_paths: Vec::new(), linked_edges: Vec::new() },
+            message: ControlMessage::SemanticPass {
+                file_paths: Vec::new(),
+                linked_edges: Vec::new(),
+                budget_ms: None,
+            },
         };
 
         let json = serde_json::to_string(&envelope).unwrap();
@@ -1095,6 +1110,7 @@ mod tests {
             message: ControlMessage::SemanticPass {
                 file_paths: vec!["src/a.rs".to_string()],
                 linked_edges: Vec::new(),
+                budget_ms: None,
             },
         };
         let json = serde_json::to_string(&empty).unwrap();
@@ -1113,6 +1129,7 @@ mod tests {
             message: ControlMessage::SemanticPass {
                 file_paths: Vec::new(),
                 linked_edges: vec![LinkedEdge { edge_id: "x".to_string(), to_id: "d".to_string() }],
+                budget_ms: None,
             },
         };
         let json = serde_json::to_string(&linked).unwrap();

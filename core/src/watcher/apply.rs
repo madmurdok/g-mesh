@@ -384,7 +384,15 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
         reader,
         writer,
         store,
-        ControlMessage::SemanticPass { file_paths: sent.clone(), linked_edges: linked },
+        ControlMessage::SemanticPass {
+            file_paths: sent.clone(),
+            linked_edges: linked,
+            // The plugin is told the timeout this round trip is held to, so a
+            // residual pass (many files, the project timeout) and a per-file
+            // one (the flat per-file timeout) can be told apart by budget
+            // rather than by file count (GM-521).
+            budget_ms: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+        },
         None,
         request_id,
         embedding,

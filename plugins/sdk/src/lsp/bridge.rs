@@ -93,6 +93,9 @@ use crate::semantic::{SemanticAnswer, SemanticEngine};
 ///   quarters and four fifths of its numbers, so the bridge gives up and
 ///   reports an incomplete pass before core's timer gives up on the bridge.
 /// - **`single_file` (90s)** against core's flat 120s, for the same reason.
+///   These three apply only when core sent no `budgetMs` (a core older than
+///   GM-521); when it did, the pass plans to three quarters of core's own
+///   deadline instead - see [`LspBridge::pass_deadline`].
 /// - **`readiness` (10 minutes) and `settle` (2s).** See [`LspBridge`]'s doc
 ///   on readiness. The readiness wait is *inside* the pass budget too, so a
 ///   server that never loads costs a pass rather than a plugin.
@@ -520,6 +523,9 @@ pub struct LspBridge {
     /// keyed by their file - see [`trim_untyped_calls`]. Only what lets a later
     /// pass put a name back when its answers stop arriving.
     trimmed: BTreeMap<RelPath, BTreeSet<String>>,
+    /// Core's deadline for the pass about to be answered, when core sent one
+    /// (`budgetMs`, GM-521) - see [`LspBridge::pass_deadline`].
+    core_deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -581,10 +587,37 @@ impl LspBridge {
             opened: BTreeMap::new(),
             emitted: BTreeMap::new(),
             trimmed: BTreeMap::new(),
+            core_deadline: None,
         }
     }
 
-    /// The whole budget for one pass - see [`Budgets`].
+    /// When the pass that starts at `started` must be done.
+    ///
+    /// Core sent its own deadline (`budgetMs`, GM-521): the pass plans to
+    /// three quarters of the time left until it, and the last quarter is the
+    /// margin for building, writing and sending the answer. Three quarters is
+    /// the ratio [`Budgets`]' own numbers keep to core's defaults (15 of 20
+    /// minutes, 90 of 120 seconds), so with core's default timeouts a pass
+    /// gets about what it got before - but now also for a residual pass,
+    /// whose many files arrive as a per-file-shaped list that only core's
+    /// budget tells apart from a per-file pass, and under an overridden core
+    /// timeout. Reckoned from `started` rather than from the request, so time
+    /// already spent before the engine was asked (hydration) is not planned
+    /// twice; it can only make the plan shorter, never past core's deadline.
+    ///
+    /// No deadline from core (an older core): [`Self::pass_budget`], today's
+    /// rules.
+    fn pass_deadline(&self, started: Instant, whole_project: bool, files: usize) -> Instant {
+        match self.core_deadline {
+            Some(core) => {
+                let remaining = core.saturating_duration_since(started);
+                started + (remaining - remaining / 4)
+            }
+            None => started + self.pass_budget(whole_project, files),
+        }
+    }
+
+    /// The whole budget for one pass when core sent none - see [`Budgets`].
     fn pass_budget(&self, whole_project: bool, files: usize) -> Duration {
         if !whole_project {
             return self.budgets.single_file;
@@ -2723,6 +2756,10 @@ impl SemanticEngine for LspBridge {
         self.ensure_client(deadline);
     }
 
+    fn set_pass_deadline(&mut self, deadline: Option<Instant>) {
+        self.core_deadline = deadline;
+    }
+
     fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer> {
         let whole_project = files.is_empty();
         // What this pass was sent - core adds the files earlier passes did not
@@ -2741,7 +2778,7 @@ impl SemanticEngine for LspBridge {
         }
 
         let started = Instant::now();
-        let deadline = started + self.pass_budget(whole_project, scope.len());
+        let deadline = self.pass_deadline(started, whole_project, scope.len());
         let plan = questions(index, &scope, &self.config, &self.budgets);
         if plan.unanswerable > 0 {
             crate::log_line!(

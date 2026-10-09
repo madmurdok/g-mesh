@@ -54,7 +54,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use g_mesh_wire::{FileChangeDiff, Handshake, LinkedEdge, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION};
 
@@ -433,6 +433,15 @@ impl<E: Extractor> Session<'_, E> {
                 self.acknowledge(out, id)
             }
             "semanticPass" => {
+                // Core's timer for this request started when it was sent, so
+                // the deadline is reckoned from its arrival, before the hold
+                // point and the hydration below spend any of it (GM-521). An
+                // absent or unrepresentable budget leaves the engine's own.
+                let received = Instant::now();
+                let deadline = params
+                    .and_then(|params| params.get("budgetMs"))
+                    .and_then(|budget| budget.as_u64())
+                    .and_then(|millis| received.checked_add(Duration::from_millis(millis)));
                 // Test-only (GM-397): parks the pass before any engine
                 // starts, blocking this thread as a long pass would.
                 hold_point("semantic", &self.spec.language);
@@ -471,6 +480,7 @@ impl<E: Extractor> Session<'_, E> {
                     .unwrap_or_default();
                 self.index.set_linked(linked);
                 let root = self.root.clone();
+                self.engine.set_pass_deadline(deadline);
                 let answer = self.engine.answer(&files, &self.index, &root);
                 self.respond_to_pass(out, id, files.is_empty(), answer)
             }
