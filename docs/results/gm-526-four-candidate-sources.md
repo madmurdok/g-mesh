@@ -106,3 +106,8 @@ TS stay positive until a turn costs more than ~320-400 B. If a saved turn
 (its re-read of the whole context) is valued above ~400 B, which holds in any
 session past a few thousand tokens, raising is a net win everywhere: 76 second
 calls removed across the four corpora (ripgrep 171 → 127). The owner decides.
+
+## Owner decision (2026-10-09)
+
+"Поднять до 4 (Recommended)": `SOURCED_CANDIDATES` is 4 (6a35f90). ADR-0028 and
+the GM-352 note keep the original 3 as their historical record.

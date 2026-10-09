@@ -1060,7 +1060,7 @@ either already the checker's job or has no consumer among the MCP tools.
 
 | Tool | Input | Returns |
 |---|---|---|
-| `find_definition` | `symbolName`, `symbolId`, or `file+position` | node: kind, signature, docstring, location (candidate list if name is ambiguous, ranked by inbound `REFERENCES`/`CALLS` count; each candidate carries `id`, `startLine`, `endLine`; a first page of at most three candidates also carries the `source` of each one whose span can be read, capped at 20 lines) |
+| `find_definition` | `symbolName`, `symbolId`, or `file+position` | node: kind, signature, docstring, location (candidate list if name is ambiguous, ranked by inbound `REFERENCES`/`CALLS` count; each candidate carries `id`, `startLine`, `endLine`; a first page of at most four candidates also carries the `source` of each one whose span can be read, capped at 20 lines) |
 | `find_references` | `symbolId` or `symbolName` + `limit`? + `answer`? | usage sites (inbound `REFERENCES`/`CALLS`/`SUPERTYPE_OF` edges - the extractor files each usage under exactly one of these, so references is their union and a superset of `find_callers`/`find_implementations`) |
 | `find_callers` | `symbolId` or `symbolName` + `limit`? + `answer`? | inbound `CALLS` |
 | `find_callees` | `symbolId` or `symbolName` + `limit`? + `answer`? | outbound `CALLS` |
@@ -1127,7 +1127,7 @@ not a unique handle either (excalidraw has two distinct
 could return the same candidate page forever. `find_definition` accepts that
 `symbolId` too (an exact node, answered with its source), and its candidates
 carry `startLine`/`endLine` so a caller can fall back to `file+position`.
-When the whole candidate set is one first page of at most three candidates,
+When the whole candidate set is one first page of at most four candidates,
 each candidate whose span can be read also carries its `source` (at most 20
 lines and 1,500 characters each, `omittedLines` when cut; the explanation says
 when only some do), so the readings can be told apart
