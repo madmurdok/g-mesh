@@ -1,5 +1,7 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 
 use crate::graph::containers;
 use crate::protocol::types::QualifiedPath;
@@ -301,7 +303,85 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
     }
 
     let tx = conn.transaction().context("failed to start transaction")?;
-    let membership = containers::detach(&tx, diff).context("failed to detach container members")?;
+    write_diff(&tx, diff)?;
+    tx.commit().context("failed to commit diff transaction")?;
+    Ok(())
+}
+
+/// [`apply_diff`] for a `semanticPass` answer: a node already
+/// stored keeps everything core has for it and takes only what a pass may
+/// change, its `untypedCalls`. Every other upserted node, and every edge and
+/// delete, is written exactly as [`apply_diff`] writes it, in one
+/// transaction.
+///
+/// A pass re-sends a stored node for two reasons, both of them about
+/// something other than its text: to shorten its `untypedCalls` (the SDK's
+/// `trim_untyped_calls`), or because it is the target of an edge the
+/// pass upgraded or bound (the TS plugin's `declarationAt` and
+/// `declarationBindingAt`). Either way the record is the plugin's own parse
+/// of the declaring file, read from disk when the pass had no cached text,
+/// so its signature, docComment, span and the rest may be newer than what
+/// core holds. Writing them would put text on the row that core has not
+/// reparsed and that the row's vector was not computed from
+/// (`watcher::apply::round_trip` keeps a re-sent node's vector). Core's own
+/// reparse of that file is what brings the new text, row and vector together.
+///
+/// A node the index has no row for (a placeholder the pass mints, or a
+/// declaration a pass is the first to name) has nothing to keep and is
+/// inserted whole. So is one this diff also deletes, which has no row left
+/// by the time it is upserted.
+///
+/// `diff.upsert_nodes` is regrouped, not changed: the inserted nodes come
+/// first, the kept ones after, each group in its own order, so every id's
+/// last record is still the one the plugin sent last. The caller links and
+/// embeds from that same list.
+pub fn apply_semantic_diff(conn: &mut Connection, diff: &mut Diff) -> Result<()> {
+    if diff.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction().context("failed to start transaction")?;
+    let stored = stored_node_ids(&tx, diff)?;
+    let (kept, inserted): (Vec<NodeRecord>, Vec<NodeRecord>) =
+        std::mem::take(&mut diff.upsert_nodes).into_iter().partition(|node| stored.contains(&node.id));
+    diff.upsert_nodes = inserted;
+    let written = write_diff_unless_empty(&tx, diff)
+        .and_then(|()| kept.iter().try_for_each(|node| replace_untyped_calls(&tx, node)));
+    diff.upsert_nodes.extend(kept);
+    written?;
+    tx.commit().context("failed to commit diff transaction")?;
+    Ok(())
+}
+
+fn write_diff_unless_empty(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
+    if diff.is_empty() {
+        return Ok(());
+    }
+    write_diff(tx, diff)
+}
+
+/// The ids of `diff`'s upserted nodes that have a row now and that `diff`
+/// does not delete first.
+fn stored_node_ids(tx: &Transaction<'_>, diff: &Diff) -> Result<HashSet<String>> {
+    let deleted: HashSet<&str> = diff.delete_node_ids.iter().map(String::as_str).collect();
+    let mut exists = tx
+        .prepare("SELECT 1 FROM nodes WHERE id = ?1")
+        .context("failed to prepare the stored-node lookup")?;
+    let mut stored = HashSet::new();
+    for node in &diff.upsert_nodes {
+        if deleted.contains(node.id.as_str()) || stored.contains(&node.id) {
+            continue;
+        }
+        if exists.exists(params![node.id]).context("failed to look up a stored node")? {
+            stored.insert(node.id.clone());
+        }
+    }
+    Ok(stored)
+}
+
+/// [`apply_diff`]'s writes, inside a transaction the caller owns and commits.
+fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
+    let membership = containers::detach(tx, diff).context("failed to detach container members")?;
 
     for id in &diff.delete_edge_ids {
         tx.execute("DELETE FROM edges WHERE id = ?1", params![id]).context("failed to delete edge")?;
@@ -443,19 +523,7 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
                 .context("failed to insert a qualified suffix")?;
         }
 
-        // Untyped receiver calls are replaced wholesale too: a node re-sent
-        // with an empty list (a plugin that stopped reporting, or a body that
-        // no longer has such calls) loses its rows.
-        tx.prepare_cached("DELETE FROM untyped_calls WHERE nodeId = ?1")
-            .context("failed to prepare the untyped call replacement")?
-            .execute(params![node.id])
-            .context("failed to clear a node's untyped calls")?;
-        for name in &node.untyped_calls {
-            tx.prepare_cached("INSERT OR IGNORE INTO untyped_calls (name, nodeId) VALUES (?1, ?2)")
-                .context("failed to prepare the untyped call insert")?
-                .execute(params![name, node.id])
-                .context("failed to insert an untyped call")?;
-        }
+        replace_untyped_calls(tx, node)?;
 
         // `placeholder_targets` is replaced wholesale too, and for the same
         // "describes how this node is written *now*" reason: a re-upserted
@@ -531,10 +599,26 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
         .context("failed to upsert edge")?;
     }
     if let Some(membership) = membership {
-        containers::attach(&tx, membership).context("failed to attach container members")?;
+        containers::attach(tx, membership).context("failed to attach container members")?;
     }
+    Ok(())
+}
 
-    tx.commit().context("failed to commit diff transaction")?;
+/// Replaces `node`'s `untyped_calls` rows with the ones it carries now.
+fn replace_untyped_calls(tx: &Transaction<'_>, node: &NodeRecord) -> Result<()> {
+    // Untyped receiver calls are replaced wholesale too: a node re-sent
+    // with an empty list (a plugin that stopped reporting, or a body that
+    // no longer has such calls) loses its rows.
+    tx.prepare_cached("DELETE FROM untyped_calls WHERE nodeId = ?1")
+        .context("failed to prepare the untyped call replacement")?
+        .execute(params![node.id])
+        .context("failed to clear a node's untyped calls")?;
+    for name in &node.untyped_calls {
+        tx.prepare_cached("INSERT OR IGNORE INTO untyped_calls (name, nodeId) VALUES (?1, ?2)")
+            .context("failed to prepare the untyped call insert")?
+            .execute(params![name, node.id])
+            .context("failed to insert an untyped call")?;
+    }
     Ok(())
 }
 

@@ -701,16 +701,16 @@ fn round_trip<R: BufRead + Send, W: Write>(
             let scope = file_scope(root, file_path, &diff, complete);
             store.apply_file_diff_linked(&mut diff, file_path, scope, method)?;
         }
+        (ControlMessage::SemanticPass { .. }, _) => store.apply_semantic_diff_linked(&mut diff, method)?,
         _ => store.apply_diff_linked(&diff, method)?,
     }
 
     hold_compute_open_for_tests();
 
-    // A semantic answer carries no new text. Besides its placeholders, it
-    // re-sends structural nodes as they are, only to shorten their
-    // `untypedCalls` (GM-486), and `apply_diff`'s upsert kept their vectors.
-    // Embedding them again would recompute every such caller's unchanged
-    // vector, so only a node that has none yet is embedded. The diff is
+    // A semantic answer carries no new text: a node it re-sends that was
+    // already stored kept its text and its vector (`apply_semantic_diff`).
+    // Embedding it again would recompute an unchanged vector, so only a node
+    // that has none yet is embedded. The diff is
     // committed already, and from here on only its edges are read.
     if matches!(request.message, ControlMessage::SemanticPass { .. }) {
         let embedded = store.step(|conn| nodes_with_vectors(conn, &diff));
