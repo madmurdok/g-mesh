@@ -21,23 +21,34 @@ use crate::daemon::registry::PathCoverage;
 
 use super::not_indexed;
 use super::tool_result::{internal_error, success};
-use super::GetFileOutlineParams;
+use super::{GetFileOutlineParams, OutlineDetail};
 
 /// One symbol the file declares. No `file_path` field - every entry in this
 /// list is by definition in the file the caller just named, so repeating it
 /// per row would only be noise.
+///
+/// A compact row (the default) carries only what locates and anchors a
+/// symbol; the `Option` fields are filled by a full render alone
+/// (`detail: "full"`) and skipped otherwise, so a full row is byte-identical
+/// to the row shape before GM-523, `"signature": null` included.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OutlineSymbol {
     symbol_id: String,
     name: String,
-    qualified_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qualified_name: Option<String>,
     kind: String,
     start_line: i64,
-    start_col: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_col: Option<i64>,
     end_line: i64,
-    end_col: i64,
-    signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_col: Option<i64>,
+    /// Outer `None`: a compact row, key absent. `Some(None)`: a full row for
+    /// a symbol without a signature, sent as `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<Option<String>>,
     /// Reachable from outside the file this symbol is declared in - **not**
     /// whether the symbol's own line carries a visibility keyword. Those
     /// coincide for a top-level item but diverge for a member whose
@@ -61,50 +72,85 @@ struct OutlineSymbol {
     exported: bool,
 }
 
-impl From<NodeRecord> for OutlineSymbol {
-    fn from(n: NodeRecord) -> Self {
-        Self {
-            symbol_id: n.id,
-            name: n.name,
-            qualified_name: n.qualified_name,
-            kind: n.kind,
-            start_line: n.start_line,
-            start_col: n.start_col,
-            end_line: n.end_line,
-            end_col: n.end_col,
-            signature: n.signature,
-            exported: n.exported,
+/// `n` as the row `detail` asks for.
+fn render(n: NodeRecord, detail: OutlineDetail) -> OutlineSymbol {
+    let full = detail == OutlineDetail::Full;
+    OutlineSymbol {
+        symbol_id: n.id,
+        name: n.name,
+        qualified_name: full.then_some(n.qualified_name),
+        kind: n.kind,
+        start_line: n.start_line,
+        start_col: full.then_some(n.start_col),
+        end_line: n.end_line,
+        end_col: full.then_some(n.end_col),
+        signature: full.then_some(n.signature),
+        exported: n.exported,
+    }
+}
+
+/// The response body, serialized: `Page<T>` itself isn't `Serialize` since
+/// it's shared by every list-shaped tool and none of them agree on an item
+/// type. Borrowed, so the byte cut can measure a candidate page without
+/// copying its rows.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OutlinePage<'a> {
+    results: &'a [OutlineSymbol],
+    /// The file's whole row count, present only when `has_more`: what is
+    /// left to page through, as on `find_references`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<usize>,
+    has_more: bool,
+    next_cursor: Option<&'a str>,
+}
+
+/// One outline page, cut to its byte budget, with its `total`.
+struct Outline {
+    page: pagination::Page<OutlineSymbol>,
+    total: Option<usize>,
+}
+
+impl Outline {
+    fn body(&self) -> OutlinePage<'_> {
+        OutlinePage {
+            results: &self.page.results,
+            total: self.total,
+            has_more: self.page.has_more,
+            next_cursor: self.page.next_cursor.as_deref(),
         }
     }
 }
 
-/// The standard cursor-pagination envelope, serialized: `Page<T>` itself
-/// isn't `Serialize` since it's shared by every list-shaped tool and none of
-/// them agree on an item type.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OutlinePage {
-    results: Vec<OutlineSymbol>,
-    has_more: bool,
-    next_cursor: Option<String>,
-}
-
-/// Paginates the `DEFINES` edges out of `file_node_id`, in source order.
-/// Split out from `handle` so tests can drive it with a small `page_size`
-/// without needing a page-size field on the public tool parameters.
+/// Paginates the `DEFINES` edges out of `file_node_id`, in source order, at
+/// most `page_size` rows and at most `max_bytes` of serialized response
+/// (`pagination::bound_defines_page`). Split out from `handle` so tests can
+/// drive it with a small `page_size` or another budget without needing those
+/// fields on the public tool parameters.
 fn list_outline(
     conn: &Connection,
     file_node_id: &str,
     page_size: usize,
     cursor: Option<&str>,
-) -> anyhow::Result<pagination::Page<OutlineSymbol>> {
+    detail: OutlineDetail,
+    max_bytes: usize,
+) -> anyhow::Result<Outline> {
     let page = pagination::paginate_defines(conn, file_node_id, page_size, cursor)?;
-    Ok(pagination::Page {
-        results: page.results.into_iter().map(OutlineSymbol::from).collect(),
-        has_more: page.has_more,
-        next_cursor: page.next_cursor,
-        all_unresolved: page.all_unresolved,
-    })
+    let page = pagination::bound_defines_page(
+        page,
+        |n| render(n, detail),
+        |results, has_more, next_cursor| {
+            pagination::wire_len(&OutlinePage {
+                results,
+                total: pagination::widest_total(has_more),
+                has_more,
+                next_cursor,
+            })
+        },
+        max_bytes,
+    );
+    let total = if page.has_more { Some(pagination::count_defines(conn, file_node_id)?) } else { None };
+    Ok(Outline { page, total })
 }
 
 /// [`handle_covered`] for a path whose language is indexed.
@@ -139,11 +185,21 @@ pub(super) fn handle_covered(
         }
     };
 
-    let page_size = pagination::resolve_page_size(params.limit);
-    let page = list_outline(&conn, &file_node.id, page_size, params.cursor.as_deref())
-        .map_err(|e| internal_error("failed to list file outline", e))?;
+    // Default to the row ceiling: the byte budget, not a row count, is what
+    // bounds a default page (GM-523 Q2).
+    let page_size =
+        params.limit.map_or(pagination::MAX_PAGE_SIZE, |l| pagination::resolve_page_size(Some(l)));
+    let outline = list_outline(
+        &conn,
+        &file_node.id,
+        page_size,
+        params.cursor.as_deref(),
+        params.detail.unwrap_or_default(),
+        pagination::OUTLINE_MAX_RESPONSE_BYTES,
+    )
+    .map_err(|e| internal_error("failed to list file outline", e))?;
 
-    success(&OutlinePage { results: page.results, has_more: page.has_more, next_cursor: page.next_cursor })
+    success(&outline.body())
 }
 
 #[cfg(test)]
@@ -314,11 +370,11 @@ mod tests {
         assert_eq!(body["hasMore"], false);
     }
 
-    /// Omitting `limit` must keep paging at the same default as before this
-    /// field existed - a caller that never touches `limit` must see no
-    /// behavior change.
+    /// Omitting `limit` fills the page up to the byte budget rather than
+    /// stopping at the symbol tools' 20-row default (GM-523 Q2): a small
+    /// file comes back whole in one call.
     #[test]
-    fn omitting_limit_keeps_the_default_page_size() {
+    fn omitting_limit_fills_the_page_to_the_byte_budget() {
         let mut conn = setup();
         upsert_node(&mut conn, NodeRecord::new("file", "File", "a.rs", "a.rs", "a.rs", "rust")).unwrap();
         for i in 0..25 {
@@ -335,20 +391,14 @@ mod tests {
         let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
         let body = json_body(&result);
         let results = body["results"].as_array().unwrap();
-        assert_eq!(
-            results.len(),
-            pagination::DEFAULT_PAGE_SIZE,
-            "no limit means the first page is exactly the default size"
-        );
-        assert_eq!(
-            body["hasMore"], true,
-            "25 symbols against the default page size must still have a next page"
-        );
+        assert_eq!(results.len(), 25, "no limit means every row that fits the budget");
+        assert_eq!(body["hasMore"], false);
     }
 
     /// A `limit` above the ceiling must be clamped, not honored verbatim or
     /// rejected - same contract `pagination::resolve_page_size` gives the
-    /// symbol-query tools.
+    /// symbol-query tools. Driven through `list_outline` with no byte budget,
+    /// since 205 rows are over the outline's budget and it would cut first.
     #[test]
     fn an_oversized_limit_is_clamped_to_the_ceiling() {
         let mut conn = setup();
@@ -363,17 +413,15 @@ mod tests {
             .unwrap();
         }
 
-        let params =
-            GetFileOutlineParams { file_path: "a.rs".to_string(), limit: Some(10_000), ..Default::default() };
-        let result = handle(&Arc::new(IndexStore::new(conn)), params).unwrap();
-        let body = json_body(&result);
-        let results = body["results"].as_array().unwrap();
+        let page_size = pagination::resolve_page_size(Some(10_000));
+        let outline =
+            list_outline(&conn, "file", page_size, None, OutlineDetail::Compact, usize::MAX).unwrap();
         assert_eq!(
-            results.len(),
+            outline.page.results.len(),
             pagination::MAX_PAGE_SIZE,
             "an oversized limit must clamp to the ceiling, not return every row"
         );
-        assert_eq!(body["hasMore"], true);
+        assert!(outline.page.has_more);
     }
 
     // -----------------------------------------------------------------
