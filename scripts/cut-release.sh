@@ -460,12 +460,15 @@ origin_slug() {
 # run for that exact commit. `ci.yml` has triggered on `release-*` pushes since
 # d508f09, but release-3.8.0 through 3.10.1 were never pushed, so that trigger
 # never saw them - and 3.5.0/3.6.0 were pushed, went red, and shipped anyway.
-# Any successful run on the SHA counts (a push run, or a workflow_dispatch
+# Any successful full run on the SHA counts (a push run, or a workflow_dispatch
 # re-run of the same commit); a red run followed by a green one on the same
 # SHA is a flake someone re-ran, not an untested commit.
 #
 # `merge_rev` defaults to `main`; it is a parameter so this can be checked
 # against an earlier release's merge commit by sourcing this file.
+#
+# The name of ci.yml's `full-suite` job; the two must stay equal.
+CI_FULL_SUITE_JOB="Full test suite ran"
 check_release_branch_ci_passed() {
 	local version="$1" merge_rev="${2:-main}"
 	local branch="release-$version"
@@ -495,12 +498,29 @@ check_release_branch_ci_passed() {
 
 	local green
 	green="$(gh api "repos/$slug/actions/workflows/ci.yml/runs?head_sha=$tip&per_page=100" \
-		--jq '[.workflow_runs[] | select(.conclusion == "success")] | length')" ||
+		--jq '[.workflow_runs[] | select(.conclusion == "success") | .id] | join(" ")')" ||
 		die "could not query ci.yml runs for ${tip:0:7} (is 'gh auth status' logged in?)"
-	[ "$green" -gt 0 ] ||
+	[ -n "$green" ] ||
 		die "no successful ci.yml run for $branch at ${tip:0:7} - fix it on $branch and push, or re-run a flaky job (https://github.com/$slug/actions?query=branch%3A$branch); main has not been verified by CI"
 
-	log "$branch at ${tip:0:7} is on origin and passed ci.yml ($green successful run(s))"
+	# A push to release-* runs only the test sections its paths select, so a
+	# green run is not enough: one of them must be full. ci.yml's job named
+	# "$CI_FULL_SUITE_JOB" succeeds only on a run where every section ran on
+	# every platform and passed.
+	local run_id full_run="" full
+	for run_id in $green; do
+		full="$(gh api "repos/$slug/actions/runs/$run_id/jobs?per_page=100" \
+			--jq "[.jobs[] | select(.name == \"$CI_FULL_SUITE_JOB\" and .conclusion == \"success\")] | length")" ||
+			die "could not query the jobs of ci.yml run $run_id (is 'gh auth status' logged in?)"
+		if [ "$full" -gt 0 ]; then
+			full_run="$run_id"
+			break
+		fi
+	done
+	[ -n "$full_run" ] ||
+		die "ci.yml passed on $branch at ${tip:0:7}, but only as a partial run (test sections selected by changed paths) - run every section: 'gh workflow run ci.yml --ref $branch', wait for it to pass (https://github.com/$slug/actions/workflows/ci.yml?query=branch%3A$branch), then re-run this"
+
+	log "$branch at ${tip:0:7} is on origin and passed a full ci.yml run ($full_run)"
 }
 
 main() {
