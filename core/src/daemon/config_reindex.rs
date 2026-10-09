@@ -5,6 +5,11 @@
 //!
 //! [`run`], inside `PluginSupervisor::with_awake_exclusive_access`:
 //!
+//! 0. A `pending_reindex` row for the language falls back to the
+//!    whole-language reindex: an earlier run was killed with some rows
+//!    re-extracted against facts that were never stored, so no answer
+//!    against the stored facts says which rows are stale (a config reverted
+//!    meanwhile reads as `Unchanged`). The fallback clears the row.
 //! 1. Sends `resolutionChanged` with the facts stored for the language
 //!    (`schema::resolution_facts`). No stored facts, an error, a timeout or
 //!    an [`ResolutionDelta::Unknown`] answer falls back to the whole-language
@@ -19,9 +24,8 @@
 //!    transaction.
 //!
 //! The stored facts are replaced only after the rows they describe: a run
-//! killed before that leaves `pending_reindex` and the old facts, so
-//! `workspace_reindex::resume_pending` asks the same question again at the
-//! next start and gets the same (or a larger) answer.
+//! killed before that leaves `pending_reindex` and the old facts, and
+//! `workspace_reindex::resume_pending` reaches step 0 at the next start.
 //!
 //! The fallback runs after the exclusive section ends, because
 //! `workspace_reindex::run` takes the same lock.
@@ -112,6 +116,10 @@ fn selective(
     changed_file: &str,
     semantic_pass: bool,
 ) -> Result<Outcome> {
+    let pending = store.with(schema::pending_reindexes)?;
+    if pending.iter().any(|(pending_language, _)| pending_language == language) {
+        return Ok(Outcome::Fallback("an earlier reindex of the language was interrupted".to_string()));
+    }
     let Some(previous) = store.with(|conn| schema::resolution_facts(conn, language))? else {
         return Ok(Outcome::Fallback("no resolution facts are stored for the language".to_string()));
     };

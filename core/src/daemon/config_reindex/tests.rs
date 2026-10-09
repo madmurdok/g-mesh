@@ -570,26 +570,32 @@ fn a_sleeping_plugin_is_woken_to_answer() {
 }
 
 /// A run that died after marking the reindex pending and before storing the
-/// new facts left `pending_reindex` and the old facts. The next start asks
-/// again, re-extracts, and clears the mark with the new facts.
+/// new facts left `pending_reindex`, the old facts and some rows re-extracted
+/// under the new config. The next start reindexes the whole language, even
+/// when the config was reverted meanwhile and the plugin would answer
+/// `unchanged`, and the swap clears the mark.
 ///
-/// Control: drop the `DELETE FROM pending_reindex` from `reextract`'s facts
-/// transaction.
+/// Control: drop the `pending_reindex` check at the top of `selective` (the
+/// resume asks `resolutionChanged`, gets `unchanged`, and the mark stays).
 #[test]
-fn an_interrupted_selective_reindex_is_resumed_and_converges() {
+fn an_interrupted_selective_reindex_is_resumed_as_a_whole_language_reindex() {
     let fixture = fixture(true, false, Some("facts-1"));
     fixture.conn.with(|conn| schema::mark_pending_reindex(conn, "alpha", "go.mod")).unwrap();
-    fixture.answer(&affected(&[], IMPORTS_OF_LIB, "facts-2"));
+    fixture.answer(r#"{"delta":{"kind":"unchanged"},"facts":"facts-1"}"#);
+    set_walk(fixture.project.path(), Some("facts-2"));
     let requests = test_plugin::requests(&fixture.dir).len();
+    let notifications = test_plugin::notifications(&fixture.dir).len();
 
     workspace_reindex::resume_pending(&fixture.registry, &fixture.conn);
 
-    let seen: Vec<String> = test_plugin::requests(&fixture.dir)[requests..].to_vec();
-    assert_eq!(seen[0], "resolutionChanged go.mod");
-    assert_eq!(
-        seen[1..].iter().cloned().collect::<BTreeSet<_>>(),
-        [format!("fileChanged {}", src(1)), format!("fileChanged {}", src(2))].into()
+    let asked = test_plugin::requests(&fixture.dir)[requests..].to_vec();
+    assert!(!asked.iter().any(|line| line.starts_with("resolutionChanged")), "nothing is asked: {asked:?}");
+    assert!(
+        test_plugin::notifications(&fixture.dir)[notifications..]
+            .iter()
+            .any(|line| line == "workspaceChanged go.mod"),
+        "the language is reindexed whole"
     );
-    assert!(fixture.pending().is_empty(), "the resumed run clears the mark");
-    assert_eq!(fixture.facts().as_deref(), Some("facts-2"));
+    assert!(fixture.pending().is_empty(), "the swap clears the mark");
+    assert_eq!(fixture.facts().as_deref(), Some("facts-2"), "the re-walk's trailer is stored");
 }

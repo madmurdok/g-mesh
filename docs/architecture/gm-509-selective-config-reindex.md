@@ -324,8 +324,10 @@ A new module, core/src/daemon/config_reindex.rs. It is reached from
       files (GM-498's `owed_files`).
    4. Then, in one transaction, store the new facts and clear `pending_reindex`.
 7. If the daemon dies mid-loop, `pending_reindex` stays. `resume_pending` calls
-   `workspace_file_changed` again with the *old* stored facts, and gets the same
-   (or a larger) delta.
+   `workspace_file_changed` again, and `selective` sees the row and falls back
+   to the whole-language reindex, whose swap clears it. Asking again with the
+   old facts is not enough: a config reverted while the daemon was down reads
+   as `unchanged` and would keep the rows re-extracted under the new config.
 
 ### 3.5 SDK (plugins/sdk)
 

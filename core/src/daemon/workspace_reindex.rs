@@ -56,7 +56,8 @@
 //! Sent (`PluginProcess::notify_workspace_changed`) only when this language's
 //! supervisor is awake: nothing is woken just to be told to drop a cache it
 //! does not have. Only a language with a non-empty `watch_files` reaches this
-//! module, which excludes the bundled TS plugin (`watch_files = []`).
+//! module: directly, or, for a manifest declaring `resolution_delta` (the
+//! bundled TS plugin), as `daemon::config_reindex`'s fallback.
 //!
 //! # Debounce
 //!
