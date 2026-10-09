@@ -248,3 +248,10 @@ adding `mod big;` above a 300-file subtree selects 300 files.
 - **B always per file:** no reindex on a `.rs` save; 300 sequential round
   trips (about 15 ms each, GM-324) inside one exclusive section block queries
   for several seconds.
+
+## 9. Owner decisions (2026-10-09)
+
+- Q1: "Новый хук source_changed (Recommended)" — add `Extractor::source_changed`.
+- Q2: "Да, импортёров родителя (Recommended)" — select the importers of the parent key; behaviour 7 is in scope.
+- Q3: "Порог GM-509: 30% (Recommended)" — reuse GM-509's threshold.
+- Q4 (must-confirm 3): "Записать файлы как owed (Recommended)" — the selected paths are stored as owed before the loop (GM-498's `owed_files` pattern) and resumed after a crash.
