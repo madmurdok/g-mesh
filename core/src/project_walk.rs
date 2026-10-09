@@ -374,3 +374,277 @@ impl LinkTable {
         changed
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    //! GM-514 (docs/architecture/gm-514-core-symlink-table.md, section 5): the
+    //! core walk follows links as the plugins' walk does, and the link table
+    //! turns every spelling an OS may report into the one the walk lists.
+    //! The OS-independent half of B1-B3, B5, B7, B11, B12, B13 and B14; the
+    //! watcher, status and gate tests build on it.
+
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    /// A canonical project root (macOS's `/var` is itself a link) and,
+    /// outside it, a directory for refused targets.
+    struct Tree {
+        _root: tempfile::TempDir,
+        root: PathBuf,
+        _outside: tempfile::TempDir,
+        outside: PathBuf,
+    }
+
+    impl Tree {
+        fn new() -> Self {
+            let root_dir = tempfile::tempdir().unwrap();
+            let outside_dir = tempfile::tempdir().unwrap();
+            let root = root_dir.path().canonicalize().unwrap();
+            let outside = outside_dir.path().canonicalize().unwrap();
+            Self { _root: root_dir, root, _outside: outside_dir, outside }
+        }
+
+        fn write(&self, relative: &str, contents: &str) -> PathBuf {
+            let path = self.root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+            path
+        }
+
+        /// `relative` -> `target`, written as given (relative or absolute).
+        fn link(&self, relative: &str, target: impl AsRef<Path>) {
+            let path = self.root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            symlink(target, path).unwrap();
+        }
+
+        fn at(&self, relative: &str) -> PathBuf {
+            self.root.join(relative)
+        }
+
+        /// The table the watcher builds (`IgnoreLayers::load`'s walk).
+        fn table(&self) -> LinkTable {
+            LinkTable::new(&self.root, g_mesh_walk::walk_dirs(&self.root, &excluded_names(&[])).links)
+        }
+
+        /// `(relative, real_relative)` of every walked `.ts` file, sorted.
+        fn ts_files(&self) -> Vec<(String, Option<String>)> {
+            let mut files: Vec<_> = project_files(&self.root, &[])
+                .filter(|file| file.relative.ends_with(".ts"))
+                .map(|file| (file.relative, file.real_relative))
+                .collect();
+            files.sort();
+            files
+        }
+    }
+
+    /// `gen/` gitignored, reached only through `src/api -> ../gen`.
+    fn alias_only() -> Tree {
+        let tree = Tree::new();
+        tree.write(".gitignore", "gen/\n");
+        tree.write("gen/a.ts", "");
+        tree.write("src/main.ts", "");
+        tree.link("src/api", "../gen");
+        tree
+    }
+
+    /// B4 (walk half): an alias-only file is listed under the link's
+    /// spelling, with its real spelling beside it; nothing under `gen/`.
+    ///
+    /// Control: `.follow_links(false)` in `g_mesh_walk`'s walker
+    /// (walk/src/lib.rs) - `src/api/a.ts` is missing.
+    #[test]
+    fn an_alias_only_file_is_listed_under_the_link_with_its_real_spelling() {
+        let tree = alias_only();
+        assert_eq!(
+            tree.ts_files(),
+            vec![
+                ("src/api/a.ts".to_string(), Some("gen/a.ts".to_string())),
+                ("src/main.ts".to_string(), None),
+            ]
+        );
+    }
+
+    /// B5 (walk half): a file reachable through a link and plainly is
+    /// listed once, under its plain spelling, even when the link comes
+    /// first in walk order (`app` sorts before `lib`).
+    ///
+    /// Control: skip the winner pass in `g_mesh_walk` (`LinkGuard::finish`
+    /// keeps every walked entry) - `app/x.ts` is listed too.
+    #[test]
+    fn a_file_reachable_both_ways_is_listed_once_under_its_plain_spelling() {
+        let tree = Tree::new();
+        tree.write("lib/x.ts", "");
+        tree.link("app", "lib");
+        assert_eq!(tree.ts_files(), vec![("lib/x.ts".to_string(), None)]);
+    }
+
+    /// B1-B3 (guard half): an event spelled under the followed link's real
+    /// target - an existing file (edit, delete) or a new one (create) -
+    /// becomes the link's spelling; the link's own spelling and its path
+    /// are kept as spelled; an unrelated path is untouched.
+    ///
+    /// Control: drop the `Followed` real-target rule in `LinkTable::new` -
+    /// `gen/a.ts` is kept as spelled (and then dropped as ignored).
+    #[test]
+    fn a_path_under_a_followed_links_target_maps_to_the_link() {
+        let tree = alias_only();
+        let table = tree.table();
+
+        assert_eq!(table.to_indexed(&tree.at("gen/a.ts")), Remap::To(tree.at("src/api/a.ts")));
+        assert_eq!(
+            table.to_indexed(&tree.at("gen/new/b.ts")),
+            Remap::To(tree.at("src/api/new/b.ts")),
+            "a file that does not exist yet maps too (a create)"
+        );
+        assert_eq!(table.to_indexed(&tree.at("src/api/a.ts")), Remap::Keep);
+        assert_eq!(table.to_indexed(&tree.at("src/api")), Remap::Keep, "the link itself, for the reload");
+        assert_eq!(table.to_indexed(&tree.at("src/main.ts")), Remap::Keep);
+        assert_eq!(
+            table.to_indexed(&tree.at("generated/a.ts")),
+            Remap::Keep,
+            "a sibling, not a prefix match"
+        );
+    }
+
+    /// B12 (guard half): a second link to an alias-only target is a
+    /// duplicate; its spelling (inotify's, when it added the last watch)
+    /// becomes the winner's, and so does the real spelling.
+    ///
+    /// Control: drop the `Duplicate` rule in `LinkTable::new` -
+    /// `src/dup/a.ts` is kept and indexed as a second row.
+    #[test]
+    fn a_path_under_a_duplicate_link_maps_to_the_winning_link() {
+        let tree = alias_only();
+        tree.link("src/dup", "../gen");
+        let table = tree.table();
+
+        assert_eq!(table.to_indexed(&tree.at("src/dup/a.ts")), Remap::To(tree.at("src/api/a.ts")));
+        assert_eq!(table.to_indexed(&tree.at("gen/a.ts")), Remap::To(tree.at("src/api/a.ts")));
+        assert_eq!(table.to_indexed(&tree.at("src/api/a.ts")), Remap::Keep);
+    }
+
+    /// An aliasing link's spelling maps to the plain one (the remap the SDK
+    /// and Go also do, now in core for every language).
+    #[test]
+    fn a_path_under_an_aliasing_link_maps_to_the_plain_spelling() {
+        let tree = Tree::new();
+        tree.write("lib/x.ts", "");
+        tree.link("app", "lib");
+        let table = tree.table();
+
+        assert_eq!(table.to_indexed(&tree.at("app/x.ts")), Remap::To(tree.at("lib/x.ts")));
+        assert_eq!(table.to_indexed(&tree.at("lib/x.ts")), Remap::Keep);
+    }
+
+    /// B11 / M1 (guard half, every OS): a path spelled through a link the
+    /// walk refused (target outside the root) is dropped - inotify reports
+    /// such paths on Linux, and the walk indexes nothing there.
+    ///
+    /// Control: drop the `Refused(_)` -> `Drop` rule in `LinkTable::new` -
+    /// `ext/b.ts` is kept and reaches the plugin (the ghost row).
+    #[test]
+    fn a_path_under_a_refused_link_is_dropped() {
+        let tree = Tree::new();
+        fs::write(tree.outside.join("b.ts"), "").unwrap();
+        tree.link("ext", &tree.outside);
+        tree.write("src/main.ts", "");
+        let table = tree.table();
+
+        assert_eq!(table.to_indexed(&tree.at("ext/b.ts")), Remap::Drop);
+        assert_eq!(table.to_indexed(&tree.at("ext/nested/c.ts")), Remap::Drop);
+        assert_eq!(table.to_indexed(&tree.at("src/main.ts")), Remap::Keep);
+        assert!(project_files(&tree.root, &[]).all(|file| !file.relative.starts_with("ext/")));
+    }
+
+    /// B14 (guard half): an alias-only FILE link's target maps to the link,
+    /// whole-path only; a dangling file link's named target maps to it too
+    /// (creating it reaches the link); a duplicate file link is placed at
+    /// the winner, a refused one dropped.
+    ///
+    /// Control: make every rule a prefix rule (`exact: false` in
+    /// `LinkTable::new`) - `cfg/config.ts.bak` maps to the link.
+    #[test]
+    fn a_file_links_target_maps_to_the_link_and_its_own_path_is_placed() {
+        let tree = Tree::new();
+        tree.write(".gitignore", "cfg/\n");
+        tree.write("cfg/config.ts", "");
+        tree.write("cfg/shared.ts", "");
+        fs::write(tree.outside.join("out.ts"), "").unwrap();
+        tree.link("src/config.ts", "../cfg/config.ts");
+        tree.link("src/a.ts", "../cfg/shared.ts");
+        tree.link("src/b.ts", "../cfg/shared.ts");
+        tree.link("src/later.ts", "../cfg/later.ts");
+        tree.link("src/out.ts", tree.outside.join("out.ts"));
+        let table = tree.table();
+
+        assert_eq!(table.to_indexed(&tree.at("cfg/config.ts")), Remap::To(tree.at("src/config.ts")));
+        assert_eq!(table.to_indexed(&tree.at("cfg/config.ts.bak")), Remap::Keep, "whole path, not a prefix");
+        assert_eq!(table.to_indexed(&tree.at("cfg/shared.ts")), Remap::To(tree.at("src/a.ts")));
+        assert_eq!(table.to_indexed(&tree.at("cfg/later.ts")), Remap::To(tree.at("src/later.ts")));
+
+        assert_eq!(table.file_link_to_indexed(&tree.at("src/config.ts")), Remap::Keep);
+        assert_eq!(table.file_link_to_indexed(&tree.at("src/b.ts")), Remap::To(tree.at("src/a.ts")));
+        assert_eq!(table.file_link_to_indexed(&tree.at("src/a.ts")), Remap::Keep);
+        assert_eq!(table.file_link_to_indexed(&tree.at("src/out.ts")), Remap::Drop);
+
+        let mut listed: Vec<String> = project_files(&tree.root, &[])
+            .map(|file| file.relative)
+            .filter(|relative| relative.ends_with(".ts"))
+            .collect();
+        listed.sort();
+        assert_eq!(listed, vec!["src/a.ts", "src/config.ts"], "the walk lists what the table maps to");
+    }
+
+    /// B7 (walk half): the pruned walk of a subtree holding a link to a
+    /// non-ignored target outside it lists what the full walk lists there:
+    /// the plain spelling wins, so nothing under the link.
+    #[test]
+    fn a_subtree_walk_lists_an_aliased_file_under_its_plain_spelling_only() {
+        let tree = Tree::new();
+        tree.write("lib/x.ts", "");
+        tree.write("src/a.ts", "");
+        tree.link("src/l", "../lib");
+        let under: Vec<String> =
+            project_files_under(&tree.root, &[], &["src".to_string()]).map(|file| file.relative).collect();
+        assert_eq!(under, vec!["src/a.ts"]);
+    }
+
+    /// B13 (walk half): the subtree walk of an alias directory (a nested
+    /// `.gitignore` edit inside the target is spelled there) lists the
+    /// alias-only files under it.
+    ///
+    /// Control: in `plain_files_under`, `continue` instead of `return None`
+    /// on a symlink (no fallback to the full walk) - the list is empty.
+    #[test]
+    fn a_subtree_walk_through_an_alias_only_link_lists_its_files() {
+        let tree = alias_only();
+        let under: Vec<(String, Option<String>)> =
+            project_files_under(&tree.root, &[], &["src/api".to_string()])
+                .map(|file| (file.relative, file.real_relative))
+                .collect();
+        assert_eq!(under, vec![("src/api/a.ts".to_string(), Some("gen/a.ts".to_string()))]);
+    }
+
+    /// B8 (table half): a link created, removed or judged differently is
+    /// named by `changed_links`; an unchanged table names nothing.
+    #[test]
+    fn changed_links_names_created_removed_and_rejudged_links() {
+        let tree = Tree::new();
+        tree.write(".gitignore", "gen/\n");
+        tree.write("gen/a.ts", "");
+        let empty = tree.table();
+        tree.link("src/api", "../gen");
+        let followed = tree.table();
+        assert_eq!(empty.changed_links(&followed), vec!["src/api"]);
+        assert!(followed.changed_links(&tree.table()).is_empty());
+
+        tree.write(".gitignore", "");
+        let aliasing = tree.table();
+        assert_eq!(followed.changed_links(&aliasing), vec!["src/api"], "Followed -> Aliases");
+
+        fs::remove_file(tree.at("src/api")).unwrap();
+        assert_eq!(aliasing.changed_links(&tree.table()), vec!["src/api"]);
+    }
+}
