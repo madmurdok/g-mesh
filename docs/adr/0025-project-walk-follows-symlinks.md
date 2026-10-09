@@ -86,8 +86,9 @@ coverage it has today).
   loads both) and remaps every event *before* the ignore check: under a
   followed link's real target -> the link's spelling (so an edit to an
   alias-only file refreshes it); under a duplicate link -> the winning
-  link's; under an aliasing link -> the plain spelling; under a refused link
-  (outside the root, excluded target, dangling) -> dropped, so inotify's
+  link's; under an aliasing link -> the plain spelling; under a refused
+  directory link (outside the root, excluded target, dangling) -> dropped
+  (file links: see below), so inotify's
   events through an outside-root link no longer index a file the walk
   refused.
 - The table is reloaded with the layers, also on a settled symlink or a

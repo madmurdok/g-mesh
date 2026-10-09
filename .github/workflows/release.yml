@@ -50,7 +50,8 @@
 #    `plugins/sdk/Cargo.toml` and `plugins/rust/Cargo.toml` must say the same
 #    version too, since GM-298 so must `plugins/python/Cargo.toml`, and since
 #    GM-351 `plugins/typescript/Cargo.toml` (and its plugin.toml's
-#    `plugin_version`, which the shipped manifest carries unchanged) -
+#    `plugin_version`, which the shipped manifest carries unchanged), and
+#    since GM-514 `walk/Cargo.toml` -
 #    `scripts/cut-release.sh` refuses if any of them disagree (see that
 #    script's own header), which is the easiest way to check this by hand as
 #    well.

@@ -21,7 +21,8 @@
 # GM-288: since the repository became a cargo workspace (GM-284), `core/
 # Cargo.toml` is not the only manifest with a hand-pinned `version` -
 # `wire/Cargo.toml`, `plugins/sdk/Cargo.toml`, `plugins/rust/Cargo.toml` and,
-# since GM-298, `plugins/python/Cargo.toml` each carry their own. Nothing
+# since GM-298, `plugins/python/Cargo.toml` (and since GM-514 `walk/Cargo.toml`)
+# each carry their own. Nothing
 # forces them to agree with core's, and a crate
 # whose version silently drifts is the same class of failure #197 already
 # named, just in a manifest this script did not use to look at. Rather than
