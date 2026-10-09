@@ -1239,6 +1239,17 @@ fn reparse(conn: &IndexStore, id: i64, diff: FileChangeDiff) {
 
 /// [`reparse`] of `src/lib.rs` against `root`, which may lack the file.
 fn reparse_in(conn: &IndexStore, root: &std::path::Path, id: i64, diff: FileChangeDiff) {
+    reparse_embedding(conn, root, id, diff, &EmbeddingPipeline::disabled());
+}
+
+/// [`reparse_in`] embedding through `embedding`.
+fn reparse_embedding(
+    conn: &IndexStore,
+    root: &std::path::Path,
+    id: i64,
+    diff: FileChangeDiff,
+    embedding: &EmbeddingPipeline,
+) {
     let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
     let (core_reader, plugin_writer) = std::io::pipe().unwrap();
     let request_id = RequestId::Number(id);
@@ -1265,7 +1276,7 @@ fn reparse_in(conn: &IndexStore, root: &std::path::Path, id: i64, diff: FileChan
         "rust",
         "src/lib.rs",
         request_id,
-        &EmbeddingPipeline::disabled(),
+        embedding,
         TEST_TIMEOUT,
         TEST_TIMEOUT,
         true,
@@ -1971,4 +1982,279 @@ fn a_whole_project_pass_carries_its_languages_linked_edges_and_a_re_sent_edge_st
     assert_eq!(reparse_lib_rs_for_linked_edges(&conn, 2), linked(&[("x", RUN)]), "first edit");
     assert_eq!(reparse_lib_rs_for_linked_edges(&conn, 3), linked(&[("x", RUN)]), "second edit");
     assert_fixture_linked(&conn);
+}
+
+// --- GM-495: a semantic pass does not write text onto a stored node ----------
+
+use crate::embedding::pipeline::test_support::{fake_model_dir, fake_pipeline, Counters};
+
+/// A fake-model pipeline over a model directory under `scratch`.
+fn fake_embedding(scratch: &std::path::Path) -> EmbeddingPipeline {
+    fake_pipeline(&fake_model_dir(&scratch.join("model"), "weights v1"), None, &Counters::default())
+}
+
+/// `node`'s vector in a fresh index that learned it from one `fileChanged`:
+/// what a node holding `node`'s text should carry.
+fn fresh_vector(node: &WireNode) -> Vec<u8> {
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = IndexStore::new(setup_conn());
+    let diff = FileChangeDiff { upsert_nodes: vec![node.clone()], ..Default::default() };
+    reparse_embedding(&conn, project_root().path(), 1, diff, &fake_embedding(scratch.path()));
+    vector_of(&conn, &node.id).expect("a node with text is embedded by a fresh index")
+}
+
+/// `(signature, docComment)` of the stored `node_id`.
+fn text_of(conn: &IndexStore, node_id: &str) -> (Option<String>, Option<String>) {
+    conn.lock()
+        .unwrap()
+        .query_row("SELECT signature, docComment FROM nodes WHERE id = ?1", [node_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+}
+
+/// Answers one whole-project `semanticPass` over `conn` with `answer`.
+fn semantic_pass(conn: &IndexStore, id: i64, answer: FileChangeDiff, embedding: &EmbeddingPipeline) {
+    let (plugin_reader, mut core_writer) = std::io::pipe().unwrap();
+    let (core_reader, plugin_writer) = std::io::pipe().unwrap();
+    let plugin = spawn_semantic_stub(plugin_reader, plugin_writer, Vec::new(), answer, false, None);
+    apply_semantic_pass(
+        &mut BufReader::new(core_reader),
+        &mut core_writer,
+        conn,
+        "typescript",
+        None,
+        Vec::new(),
+        RequestId::Number(id),
+        embedding,
+        TEST_TIMEOUT,
+        &mut on_timeout_must_not_fire,
+    )
+    .unwrap();
+    plugin.join().unwrap();
+}
+
+/// `foo` as core last parsed `decl.ts` (note §2's fixture).
+fn foo_as_indexed() -> WireNode {
+    WireNode {
+        signature: Some("foo(a: number, b: number): number".to_string()),
+        doc_comment: Some("Adds two numbers together and returns the sum.".to_string()),
+        ..canned_node("foo")
+    }
+}
+
+/// `foo` as the plugin parses `decl.ts` from disk after an edit core has not
+/// reparsed yet: newer signature, docComment and span.
+fn foo_from_disk() -> WireNode {
+    WireNode {
+        signature: Some("foo(input: string, strict: boolean): number".to_string()),
+        doc_comment: Some(
+            "Parses an ISO date string into epoch milliseconds, throwing on bad input.".to_string(),
+        ),
+        range: Range { start: Position { line: 1, col: 0 }, end: Position { line: 4, col: 2 } },
+        ..canned_node("foo")
+    }
+}
+
+fn use_it() -> WireNode {
+    WireNode {
+        name: "useIt".to_string(),
+        qualified_name: "mod::useIt".to_string(),
+        signature: Some("useIt()".to_string()),
+        ..canned_node("useIt")
+    }
+}
+
+/// **GM-495, Run A/B at the core level, TS shape.** A pass upgrades the edge
+/// into `foo` and re-sends `foo` as `declarationAt` read it from disk, newer
+/// than what core indexed. `foo`'s row keeps core's text and span, and its
+/// vector is still a fresh index's vector of that text. In the same answer, a
+/// placeholder new to the store is inserted whole and embedded, and a node the
+/// answer deletes and re-sends is written with the text it carries.
+///
+/// Controls: in `round_trip`, route `SemanticPass` through
+/// `apply_diff_linked` again (`foo`'s row takes the disk text, its kept vector
+/// no longer matches it); in `apply_semantic_diff`, put every node in `kept`
+/// (`ph` gets no row); in `stored_node_ids`, drop the `deleted` check (`gone`
+/// keeps its old signature).
+#[test]
+fn a_pass_re_sending_a_declaration_target_keeps_cores_text_and_its_vector() {
+    let scratch = tempfile::tempdir().unwrap();
+    let embedding = fake_embedding(scratch.path());
+    let conn = IndexStore::new(setup_conn());
+    let gone = WireNode { signature: Some("gone()".to_string()), ..canned_node("gone") };
+    reparse_embedding(
+        &conn,
+        project_root().path(),
+        1,
+        FileChangeDiff {
+            upsert_nodes: vec![foo_as_indexed(), use_it(), gone.clone()],
+            upsert_edges: vec![unresolved_edge("e1", "useIt", "foo")],
+            ..Default::default()
+        },
+        &embedding,
+    );
+    assert_eq!(vector_of(&conn, "foo"), Some(fresh_vector(&foo_as_indexed())), "the fixture embeds foo");
+    let foo_row = rows_of(&conn, "nodes", "foo");
+
+    let mut upgraded = unresolved_edge("e1", "useIt", "foo");
+    upgraded.source = SourceTier::Semantic;
+    upgraded.engine = "ts-compiler".to_string();
+    upgraded.resolved = true;
+    let placeholder = WireNode {
+        signature: Some("ph(x: string): void".to_string()),
+        file_path: "src/unchanged.rs".to_string(),
+        ..canned_node("ph")
+    };
+    let gone_again = WireNode { signature: Some("gone(again: true)".to_string()), ..gone };
+    semantic_pass(
+        &conn,
+        2,
+        FileChangeDiff {
+            upsert_nodes: vec![foo_from_disk(), placeholder.clone(), gone_again],
+            delete_node_ids: vec!["gone".to_string()],
+            upsert_edges: vec![upgraded],
+            ..Default::default()
+        },
+        &embedding,
+    );
+
+    assert_eq!(rows_of(&conn, "nodes", "foo"), foo_row, "foo keeps core's text, span and every column");
+    assert_eq!(
+        vector_of(&conn, "foo"),
+        Some(fresh_vector(&foo_as_indexed())),
+        "foo's vector is a fresh index's vector of the text its row holds"
+    );
+    assert_eq!(
+        edge_source_and_resolved(&conn, "e1"),
+        ("semantic".to_string(), "ts-compiler".to_string(), true),
+        "the edge the pass answered is still upgraded"
+    );
+
+    assert_eq!(
+        text_of(&conn, "ph").0.as_deref(),
+        Some("ph(x: string): void"),
+        "a new node is inserted whole"
+    );
+    assert_eq!(vector_of(&conn, "ph"), Some(fresh_vector(&placeholder)), "and embedded from its text");
+    assert_eq!(
+        text_of(&conn, "gone").0.as_deref(),
+        Some("gone(again: true)"),
+        "a node the answer deletes first is written with the text it carries"
+    );
+}
+
+/// **GM-495, SDK-bridge shape.** `trim_untyped_calls` re-sends a caller from
+/// an `SdkIndex` that `hydrate` filled from disk after an edit core has not
+/// reparsed: newer signature and docComment, shorter `untypedCalls`. The list
+/// is applied and the text, child rows and vector stay core's; a later
+/// re-send with an empty list clears the rows.
+///
+/// Controls: in `round_trip`, route `SemanticPass` through
+/// `apply_diff_linked` again (the row takes the disk text); in
+/// `apply_semantic_diff`, drop the `replace_untyped_calls` over `kept` (`frob`
+/// survives the pass).
+#[test]
+fn a_bridge_re_send_after_hydrate_takes_only_its_untyped_calls() {
+    let scratch = tempfile::tempdir().unwrap();
+    let embedding = fake_embedding(scratch.path());
+    let conn = IndexStore::new(setup_conn());
+    reparse_embedding(
+        &conn,
+        project_root().path(),
+        1,
+        FileChangeDiff { upsert_nodes: vec![rich_caller()], ..Default::default() },
+        &embedding,
+    );
+    let children = ["nodes", "declarations", "qualified_suffixes", "placeholder_targets"];
+    let before: Vec<Vec<String>> = children.iter().map(|table| rows_of(&conn, table, "caller")).collect();
+    assert_eq!(
+        before.iter().map(Vec::len).collect::<Vec<_>>(),
+        [1, 2, 1, 1],
+        "the fixture stores every child row"
+    );
+    assert_eq!(
+        vector_of(&conn, "caller"),
+        Some(fresh_vector(&rich_caller())),
+        "the fixture embeds the caller"
+    );
+
+    let hydrated = |untyped: &[&str]| WireNode {
+        signature: Some("pub fn caller(ws: Vec<W>, strict: bool)".to_string()),
+        doc_comment: Some("Calls frob on each, strictly.".to_string()),
+        untyped_calls: untyped.iter().map(|name| name.to_string()).collect(),
+        ..rich_caller()
+    };
+    semantic_pass(
+        &conn,
+        2,
+        FileChangeDiff { upsert_nodes: vec![hydrated(&["len"])], ..Default::default() },
+        &embedding,
+    );
+
+    assert_eq!(untyped_rows(&conn), vec![("caller".to_string(), "len".to_string())], "`frob` was answered");
+    let after: Vec<Vec<String>> = children.iter().map(|table| rows_of(&conn, table, "caller")).collect();
+    assert_eq!(after, before, "the row and its child rows keep core's text");
+    assert_eq!(
+        vector_of(&conn, "caller"),
+        Some(fresh_vector(&rich_caller())),
+        "the vector is a fresh index's vector of the text the row holds"
+    );
+
+    semantic_pass(
+        &conn,
+        3,
+        FileChangeDiff { upsert_nodes: vec![hydrated(&[])], ..Default::default() },
+        &embedding,
+    );
+    assert!(untyped_rows(&conn).is_empty(), "an empty list clears the rows");
+    assert_eq!(rows_of(&conn, "nodes", "caller"), before[0], "and the text is still core's");
+}
+
+/// **GM-495.** `fileChanged` is core's own reparse: it still writes the new
+/// text, and the node is re-embedded from it.
+///
+/// Control: in `round_trip`, send the `FileChanged`-with-root arm through
+/// `apply_semantic_diff_linked` (the row keeps the old text).
+#[test]
+fn a_reparse_still_overwrites_a_nodes_text_and_re_embeds_it() {
+    let scratch = tempfile::tempdir().unwrap();
+    let embedding = fake_embedding(scratch.path());
+    let conn = IndexStore::new(setup_conn());
+    let upsert = |node| FileChangeDiff { upsert_nodes: vec![node], ..Default::default() };
+    reparse_embedding(&conn, project_root().path(), 1, upsert(foo_as_indexed()), &embedding);
+    reparse_embedding(&conn, project_root().path(), 2, upsert(foo_from_disk()), &embedding);
+
+    assert_eq!(text_of(&conn, "foo"), (foo_from_disk().signature, foo_from_disk().doc_comment));
+    assert_eq!(vector_of(&conn, "foo"), Some(fresh_vector(&foo_from_disk())));
+}
+
+/// **GM-495.** A stored node with no vector yet, re-sent by a pass with newer
+/// text: the row keeps core's text, and whatever vector it ends up with is
+/// not one of the pass's text.
+///
+/// Control: in `round_trip`, route `SemanticPass` through
+/// `apply_diff_linked` again (the row takes the disk text, and the pass
+/// embeds and stores it).
+#[test]
+fn a_pass_re_sending_an_unembedded_node_does_not_store_its_text_or_a_vector_of_it() {
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = IndexStore::new(setup_conn());
+    reparse(&conn, 1, FileChangeDiff { upsert_nodes: vec![foo_as_indexed()], ..Default::default() });
+    assert_eq!(vector_of(&conn, "foo"), None, "the fixture leaves foo unembedded");
+    let foo_row = rows_of(&conn, "nodes", "foo");
+
+    semantic_pass(
+        &conn,
+        2,
+        FileChangeDiff { upsert_nodes: vec![foo_from_disk()], ..Default::default() },
+        &fake_embedding(scratch.path()),
+    );
+
+    assert_eq!(rows_of(&conn, "nodes", "foo"), foo_row, "foo keeps core's text");
+    let vector = vector_of(&conn, "foo");
+    assert!(
+        vector.is_none() || vector == Some(fresh_vector(&foo_as_indexed())),
+        "a vector, if any, is one of core's text"
+    );
 }
