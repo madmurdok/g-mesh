@@ -39,6 +39,11 @@
 //!   the second does not, `semanticPass` answers are held; other frames keep
 //!   being answered meanwhile.
 //! - `semantic-pass.json`: the `result` of every complete `semanticPass`.
+//! - `semantic-pass-fields.json`: an object whose fields are set on every
+//!   `semanticPass` answer not taken by `incompleteOnce` (e.g. `incomplete`,
+//!   `unfinishedFiles`); read per request.
+//! - `semantic-passes.log`: each `semanticPass` request's `filePaths`, as a
+//!   JSON array, one line per request, appended before it is answered.
 //!
 //! Every answer's `result` is `{}` unless one of the above says otherwise. The
 //! bulk walk emits two nodes `<L>-n1`/`<L>-n2` and the edge `<L>-e1` between
@@ -86,6 +91,8 @@ const HANDSHAKE_GATE: &str = "handshake.allow";
 const STALL_MARKER: &str = "stalled-once.marker";
 const INCOMPLETE_MARKER: &str = "incomplete-once.marker";
 const SEMANTIC_ANSWER: &str = "semantic-pass.json";
+const SEMANTIC_FIELDS: &str = "semantic-pass-fields.json";
+const SEMANTIC_PASS_LOG: &str = "semantic-passes.log";
 const SEMANTIC_PASS_GATED: &str = "semantic-pass.gated";
 const SEMANTIC_PASS_GATE_OPEN: &str = "semantic-pass.allow";
 const METHOD_LOG_ENV: &str = "G_MESH_FAKE_PLUGIN_LOG";
@@ -289,6 +296,10 @@ fn fixture_frame(out: &Out, language: &str, dir: &Path, options: &Options, messa
 
     let file_path = params.get("filePath").and_then(Value::as_str).unwrap_or_default();
     append(&dir.join(REQUEST_LOG), &format!("{method} {file_path}"));
+    if method == "semanticPass" {
+        let file_paths = params.get("filePaths").cloned().unwrap_or(Value::Array(Vec::new()));
+        append(&dir.join(SEMANTIC_PASS_LOG), &file_paths.to_string());
+    }
 
     let stall_marker = dir.join(STALL_MARKER);
     if options.stalling && !stall_marker.exists() {
@@ -332,14 +343,22 @@ fn fixture_answer(
         }
         return response;
     }
+    let mut response = json!({ "jsonrpc": "2.0", "id": id, "result": {} });
     if method == "semanticPass" {
         if let Ok(text) = fs::read_to_string(dir.join(SEMANTIC_ANSWER)) {
             let result: Value = serde_json::from_str(&text)
                 .unwrap_or_else(|err| fail(&format!("bad {SEMANTIC_ANSWER}: {err}")));
-            return json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            response["result"] = result;
+        }
+        if let Ok(text) = fs::read_to_string(dir.join(SEMANTIC_FIELDS)) {
+            let fields: Map<String, Value> = serde_json::from_str(&text)
+                .unwrap_or_else(|err| fail(&format!("bad {SEMANTIC_FIELDS}: {err}")));
+            for (field, value) in fields {
+                response[field.as_str()] = value;
+            }
         }
     }
-    json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+    response
 }
 
 /// The fixture's walk; returns the exit status.

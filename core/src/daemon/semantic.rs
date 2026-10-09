@@ -785,13 +785,18 @@ mod tests {
     }
 
     /// What `g-mesh status` prints about the semantic pass for this index,
-    /// through the same two functions its report is built with.
+    /// through the same functions its report is built with.
     fn status_lines(conn: &IndexStore, registry: &PluginRegistry) -> Vec<String> {
         let guard = conn.lock().unwrap();
         let capable: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
         let (owed, failures) = crate::cli::status::semantic_pass_state(&guard, &capable).unwrap();
         let completed = schema::semantic_pass_completed(&guard).unwrap();
-        crate::cli::status::semantic_pass_lines(completed, &owed, &failures, &[], None)
+        let leftovers: Vec<_> = schema::semantic_leftovers(&guard)
+            .unwrap()
+            .into_iter()
+            .filter(|leftover| capable.contains(&leftover.language))
+            .collect();
+        crate::cli::status::semantic_pass_lines(completed, &owed, &failures, &leftovers, None)
     }
 
     fn semantic_pass_at(conn: &Connection, language: &str) -> Option<String> {
@@ -1251,5 +1256,157 @@ mod tests {
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert_eq!(failures[0].0, "alpha");
         assert!(failures[0].1.contains("the disk is full"), "{failures:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // GM-521: an incomplete pass that names its unfinished files is
+    // recorded, and the next start asks only those files.
+    // -----------------------------------------------------------------
+
+    /// The file the fixture seeds for `alpha` (`two_language_registry`).
+    const ALPHA_FILE: &str = "src/a.alpha-src";
+
+    /// The answer fields of a pass that did not finish [`ALPHA_FILE`].
+    const ALPHA_UNFINISHED: &str = r#"{"incomplete": true, "incompleteReason": "the server was cold", "unfinishedFiles": ["src/a.alpha-src"]}"#;
+
+    /// The `filePaths` of a residual pass over [`ALPHA_FILE`], as the fake
+    /// plugin logs them.
+    const ALPHA_RESIDUAL: &str = r#"["src/a.alpha-src"]"#;
+
+    fn residual_language_rows(conn: &IndexStore) -> Vec<String> {
+        let guard = conn.lock().unwrap();
+        let mut statement =
+            guard.prepare("SELECT language FROM semantic_residual ORDER BY language").unwrap();
+        let rows =
+            statement.query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        rows
+    }
+
+    /// The acceptance case: start 1's whole-project pass leaves
+    /// [`ALPHA_FILE`] unfinished and names it, which is neither a completion
+    /// nor a failure, and status says what is left; start 2 is sent only that
+    /// file, and its answer completes the language.
+    ///
+    /// Control: make `owed_pass` always return `OwedPass::WholeProject` -
+    /// start 2 is sent `[]` (today's behaviour, asking everything again).
+    #[test]
+    fn the_next_start_asks_only_the_files_an_incomplete_pass_named() {
+        let (_project, _plugins, alpha_dir, _beta_dir, conn, registry) =
+            two_language_registry("alpha", true, false, "beta", false, false);
+        test_plugin::set_semantic_pass_fields(&alpha_dir, Some(ALPHA_UNFINISHED));
+
+        let first = run_with_registry(&registry, &conn);
+        assert!(first.completed.is_empty(), "{:?}", first.completed);
+        assert!(first.failed.is_empty(), "a listed incomplete pass is not a failure: {:?}", first.failed);
+        assert_eq!(first.residual, vec![("alpha".to_string(), 1)]);
+        {
+            let guard = conn.lock().unwrap();
+            assert!(semantic_pass_at(&guard, "alpha").is_none(), "the language stays owed");
+            assert!(schema::semantic_pass_failures(&guard).unwrap().is_empty());
+        }
+        assert_eq!(
+            status_lines(&conn, &registry),
+            vec![
+                "  semantic pass:   alpha incomplete - 1 file(s) left, the next daemon start asks only those"
+                    .to_string()
+            ]
+        );
+
+        test_plugin::set_semantic_pass_fields(&alpha_dir, None);
+        let second = run_with_registry(&registry, &conn);
+
+        assert_eq!(
+            test_plugin::semantic_passes(&alpha_dir),
+            vec!["[]".to_string(), ALPHA_RESIDUAL.to_string()]
+        );
+        assert_eq!(second.completed, vec!["alpha".to_string()], "{:?}", second.failed);
+        assert!(second.residual.is_empty(), "{:?}", second.residual);
+        assert!(semantic_pass_at(&conn.lock().unwrap(), "alpha").is_some());
+        assert!(residual_language_rows(&conn).is_empty());
+        assert_eq!(status_lines(&conn, &registry), vec!["  semantic pass:   complete".to_string()]);
+    }
+
+    /// A file no pass ever finishes is asked on at most `MAX_OWED_ATTEMPTS`
+    /// (3) starts: then the language is recorded completed, status counts the
+    /// file as never answered, and start 4 asks nothing.
+    ///
+    /// Control: remove the `MAX_OWED_ATTEMPTS` drop from
+    /// `schema::settle_owed_files` - start 3 is residual again and start 4
+    /// asks the file a fourth time.
+    #[test]
+    fn a_file_never_finished_is_asked_on_at_most_three_starts_then_counted_as_never_answered() {
+        assert_eq!(schema::MAX_OWED_ATTEMPTS, 3);
+        let (_project, _plugins, alpha_dir, _beta_dir, conn, registry) =
+            two_language_registry("alpha", true, false, "beta", false, false);
+        test_plugin::set_semantic_pass_fields(&alpha_dir, Some(ALPHA_UNFINISHED));
+
+        for start in 1..=2 {
+            let run = run_with_registry(&registry, &conn);
+            assert_eq!(run.residual, vec![("alpha".to_string(), 1)], "start {start}");
+            assert!(run.completed.is_empty() && run.failed.is_empty(), "start {start}: {:?}", run.failed);
+        }
+        let third = run_with_registry(&registry, &conn);
+        assert_eq!(third.completed, vec!["alpha".to_string()], "{:?} {:?}", third.residual, third.failed);
+        assert!(semantic_pass_at(&conn.lock().unwrap(), "alpha").is_some());
+
+        let fourth = run_with_registry(&registry, &conn);
+        assert!(fourth.completed.is_empty() && fourth.residual.is_empty() && fourth.failed.is_empty());
+        assert_eq!(
+            test_plugin::semantic_passes(&alpha_dir),
+            vec!["[]".to_string(), ALPHA_RESIDUAL.to_string(), ALPHA_RESIDUAL.to_string()]
+        );
+        assert_eq!(
+            status_lines(&conn, &registry),
+            vec![
+                "  semantic pass:   complete".to_string(),
+                "  semantic pass:   alpha: 1 file(s) never answered - asked again when they change"
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// An edit invalidates a residual file's record: once the edit's per-file
+    /// pass has finished it (what `watcher::apply`'s own tests pin, recorded
+    /// here directly), the residual language has nothing left, and the next
+    /// start records it without asking the plugin.
+    #[test]
+    fn a_residual_language_whose_files_an_edit_finished_is_recorded_without_a_pass() {
+        let (_project, _plugins, alpha_dir, _beta_dir, conn, registry) =
+            two_language_registry("alpha", true, false, "beta", false, false);
+        test_plugin::set_semantic_pass_fields(&alpha_dir, Some(ALPHA_UNFINISHED));
+        run_with_registry(&registry, &conn);
+        test_plugin::set_semantic_pass_fields(&alpha_dir, None);
+
+        let edited = vec![ALPHA_FILE.to_string()];
+        conn.with(|conn| schema::settle_owed_files(conn, "alpha", &edited, &edited, &[])).unwrap();
+        let second = run_with_registry(&registry, &conn);
+
+        assert_eq!(second.completed, vec!["alpha".to_string()], "{:?}", second.failed);
+        assert_eq!(test_plugin::semantic_passes(&alpha_dir), vec!["[]".to_string()], "start 2 asks nothing");
+        assert!(semantic_pass_at(&conn.lock().unwrap(), "alpha").is_some());
+    }
+
+    /// A pass that does not name its unfinished files keeps today's
+    /// behaviour: a failure, no residual record, and the next start asks the
+    /// whole project again.
+    #[test]
+    fn an_incomplete_pass_without_a_list_is_asked_whole_again() {
+        let (_project, _plugins, alpha_dir, _beta_dir, conn, registry) =
+            two_language_registry("alpha", true, false, "beta", false, false);
+        test_plugin::set_semantic_pass_fields(&alpha_dir, Some(r#"{"incomplete": true}"#));
+
+        let first = run_with_registry(&registry, &conn);
+        assert_eq!(
+            first.failed.iter().map(|(language, _)| language.as_str()).collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+        assert!(first.residual.is_empty(), "{:?}", first.residual);
+        assert!(residual_language_rows(&conn).is_empty());
+
+        test_plugin::set_semantic_pass_fields(&alpha_dir, None);
+        let second = run_with_registry(&registry, &conn);
+
+        assert_eq!(second.completed, vec!["alpha".to_string()], "{:?}", second.failed);
+        assert_eq!(test_plugin::semantic_passes(&alpha_dir), vec!["[]".to_string(), "[]".to_string()]);
     }
 }

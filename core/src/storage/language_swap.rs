@@ -831,6 +831,38 @@ mod tests {
         );
     }
 
+    /// A committed swap also clears the swapped language's residual and
+    /// never-answered rows (GM-521) - the whole-project pass that follows
+    /// re-asks every file - and no other language's.
+    ///
+    /// Control: call `clear_owed_files` instead of `clear_semantic_leftovers`
+    /// in `swap_attached` - rust's residual and gap rows survive.
+    #[test]
+    fn a_swap_clears_only_its_languages_residual_and_never_answered_files() {
+        let (_dir, mut live, staging_path, _plan) = planned_reindex();
+        for (language, file) in [("rust", "a.rs"), ("go", "a.go")] {
+            schema::record_language_semantic_residual(&live, language, &[file.to_string()], "cold").unwrap();
+            live.execute(
+                "INSERT INTO semantic_gap_files (language, filePath) VALUES (?1, 'given-up')",
+                rusqlite::params![language],
+            )
+            .unwrap();
+        }
+        let capable: HashSet<String> = HashSet::from(["rust".to_string()]);
+
+        swap(&mut live, &staging_path, None, &bookkeeping(&capable)).unwrap();
+
+        assert_eq!(column(&live, "SELECT language FROM semantic_residual"), vec!["go"]);
+        assert_eq!(
+            column(&live, "SELECT language || ':' || filePath FROM semantic_gap_files"),
+            vec!["go:given-up"]
+        );
+        assert_eq!(
+            column(&live, "SELECT language || ':' || filePath FROM semantic_owed_files"),
+            vec!["go:a.go"]
+        );
+    }
+
     /// A language with no semantic pass owes nothing: no rows.
     #[test]
     fn a_swap_of_a_language_without_a_semantic_pass_writes_no_pending_rows() {
