@@ -2823,6 +2823,204 @@ fn pass_over(bridge: &mut LspBridge, index: &SdkIndex, files: &[&str]) -> Semant
     bridge.answer(&files, index).expect("the bridge answers rather than failing")
 }
 
+// --- unfinished files: what a pass tells core to ask again -------------------
+
+/// The set of `files`, as [`SemanticAnswer::unfinished`] holds it.
+fn files(files: &[&str]) -> std::collections::BTreeSet<RelPath> {
+    files.iter().map(|file| RelPath::new(*file)).collect()
+}
+
+/// A server that never becomes ready finishes nothing: every file the pass
+/// had a question for is unfinished. `a.toy`, sent too, has no site, so there
+/// is nothing in it to finish and it is not named.
+///
+/// Control: answer this branch with `with_unfinished(scope)` or with no list
+/// at all.
+#[test]
+fn a_server_that_never_becomes_ready_leaves_every_asked_file_unfinished() {
+    let scratch = Scratch::new("unfinished-never-ready");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "never", "beginAfterMs": 0 },
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.readiness = Duration::from_millis(600);
+    budgets.settle = Duration::from_secs(2);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass_over(&mut bridge, &index, &["src/a.toy", "src/b.toy"]);
+    assert!(!answer.complete);
+    assert_eq!(answer.unfinished, Some(files(&["src/b.toy"])));
+}
+
+/// A server that refuses `b.toy`'s one question leaves `b.toy` unfinished
+/// and only it, on a per-file pass and on a whole-project pass alike.
+///
+/// Control: drop `asked_about.difference(&finished)` from the normal return
+/// of `LspBridge::answer` (an empty list, or none).
+#[test]
+fn a_refused_question_leaves_only_its_file_unfinished() {
+    let scratch = Scratch::new("unfinished-refused");
+    let (index, _) = fixture(&scratch);
+    let mut answers = answers_the_site(&scratch);
+    answers[0]["error"] = json!("refused, every time");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let per_file = pass_over(&mut bridge, &index, &["src/a.toy", "src/b.toy"]);
+    assert!(!per_file.complete);
+    assert_eq!(per_file.unfinished, Some(files(&["src/b.toy"])));
+
+    let whole = pass(&mut bridge, &index);
+    assert!(!whole.complete);
+    assert_eq!(whole.unfinished, Some(files(&["src/b.toy"])));
+}
+
+/// A pass that answers everything it asked names an empty list - not `None`,
+/// which would leave core guessing - whether it asked something or had
+/// nothing to ask, and a file no longer in the index is not unfinished.
+#[test]
+fn a_pass_that_finishes_its_scope_names_nothing_unfinished() {
+    let scratch = Scratch::new("unfinished-none");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let answered = pass_over(&mut bridge, &index, &["src/b.toy"]);
+    assert!(answered.complete, "{:?}", answered.reason);
+    assert_eq!(semantic_edges(&answered).len(), 1, "{:#?}", answered.diff);
+    assert_eq!(answered.unfinished, Some(files(&[])));
+
+    let nothing_to_ask = pass_over(&mut bridge, &index, &["src/a.toy"]);
+    assert!(nothing_to_ask.complete);
+    assert_eq!(nothing_to_ask.unfinished, Some(files(&[])));
+
+    let gone = pass_over(&mut bridge, &index, &["src/gone.toy"]);
+    assert!(gone.complete);
+    assert_eq!(gone.unfinished, Some(files(&[])));
+}
+
+/// The bridge keeps nothing between passes: what a per-file pass did not
+/// finish is core's to send again, so the next per-file pass, sent only
+/// `a.toy`, asks nothing about `b.toy` - though the server would answer it
+/// now - and names nothing unfinished.
+///
+/// Control: put `b.toy` back into the second pass's scope (restore the
+/// bridge's own owed set).
+#[test]
+fn a_per_file_pass_asks_only_about_the_files_it_was_sent() {
+    let scratch = Scratch::new("unfinished-not-kept");
+    let (index, _) = fixture(&scratch);
+    let log = scratch.path().join("asked.log");
+    let mut answers = answers_the_site(&scratch);
+    answers[0]["error"] = json!("refused, once");
+    answers[0]["errorTimes"] = json!(1);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+        "log": log.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let refused = pass_over(&mut bridge, &index, &["src/b.toy"]);
+    assert_eq!(refused.unfinished, Some(files(&["src/b.toy"])));
+    let before = asked(&log, "textDocument/definition");
+    assert!(before > 0, "the first pass asked b.toy's site");
+
+    let next = pass_over(&mut bridge, &index, &["src/a.toy"]);
+    assert_eq!(asked(&log, "textDocument/definition"), before, "b.toy was not asked again");
+    assert!(next.complete, "{:?}", next.reason);
+    assert!(semantic_edges(&next).is_empty(), "{:#?}", next.diff);
+    assert_eq!(next.unfinished, Some(files(&[])));
+
+    let resent = pass_over(&mut bridge, &index, &["src/b.toy"]);
+    assert_eq!(semantic_edges(&resent).len(), 1, "sent again, b.toy is answered: {:#?}", resent.diff);
+    assert_eq!(resent.unfinished, Some(files(&[])));
+}
+
+/// A ceiling that admits no site has asked nothing, so every file in scope
+/// is unfinished - the one with no site too, since the ceiling is why
+/// nothing was asked.
+///
+/// Control: answer the `max_sites = 0` branch with no list, or an empty one.
+#[test]
+fn a_ceiling_that_admits_no_site_leaves_the_whole_scope_unfinished() {
+    let scratch = Scratch::new("unfinished-ceiling-zero");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.max_sites = 0;
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass_over(&mut bridge, &index, &["src/a.toy", "src/b.toy"]);
+    assert!(!answer.complete);
+    assert_eq!(answer.unfinished, Some(files(&["src/a.toy", "src/b.toy"])));
+}
+
+/// A ceiling that cuts a pass short leaves a file with no question
+/// unfinished too - it may have had none only because the ceiling was spent -
+/// while a file whose questions were all asked and answered is finished.
+///
+/// Control: drop the `plan.truncated` extension of the unfinished set.
+#[test]
+fn a_ceiling_that_cuts_a_pass_short_leaves_the_files_without_a_question_unfinished() {
+    let scratch = Scratch::new("unfinished-ceiling-cut");
+    let mut index = SdkIndex::new();
+    let decl = RelPath::new("src/decl.toy");
+    let decl_source = "fn target\n";
+    scratch.write("src/decl.toy", decl_source);
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &decl);
+    builder.file_node(range(0, 0, 1, 0));
+    builder.add_node(
+        NodeSpec::new(NodeKind::Function, "target", "target", range(0, 3, 0, 9))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    index.insert(decl, decl_source.to_string(), builder.finish());
+    crowd_file(&scratch, &mut index, "src/x.toy", 2);
+    crowd_file(&scratch, &mut index, "src/y.toy", 2);
+    let mut answers = Vec::new();
+    for file in ["src/x.toy", "src/y.toy"] {
+        for line in 0..2u32 {
+            answers.push(json!({
+                "uri": scratch.uri(file),
+                "line": line,
+                "character": 5,
+                "definition": { "uri": scratch.uri("src/decl.toy"), "line": 0, "character": 4 },
+            }));
+        }
+    }
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+    }));
+    let mut budgets = budgets();
+    budgets.max_sites = 3;
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "the ceiling cut the pass short");
+    let unfinished = answer.unfinished.expect("the bridge always names its unfinished files");
+    assert!(unfinished.contains(&RelPath::new("src/decl.toy")), "{unfinished:?}");
+    assert!(!unfinished.contains(&RelPath::new("src/x.toy")), "x.toy was asked in full: {unfinished:?}");
+}
+
 // --- GM-348: overload binding -----------------------------------------------
 //
 // `src/o.toy` declares two overload sets, each one node carrying three

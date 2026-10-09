@@ -936,6 +936,38 @@ mod tests {
         assert!(pass_response(id, true, complete).get("incompleteReason").is_none());
     }
 
+    /// `unfinishedFiles` is sent whenever the engine named its unfinished
+    /// files, on a per-file pass as on a whole-project one, and whatever the
+    /// pass's own completeness: core settles a per-file pass from the list
+    /// alone. An empty set is sent as an empty list, and an engine that named
+    /// nothing sends no key at all.
+    #[test]
+    fn the_unfinished_files_are_sent_on_every_kind_of_pass() {
+        let id = serde_json::json!(7);
+        let named: std::collections::BTreeSet<RelPath> =
+            [RelPath::new("src/b.toy"), RelPath::new("src/a.toy")].into_iter().collect();
+        let incomplete = SemanticAnswer::incomplete(FileChangeDiff::default()).with_unfinished(named.clone());
+        let complete = SemanticAnswer::complete(FileChangeDiff::default()).with_unfinished(named);
+
+        for whole_project in [false, true] {
+            for answer in [incomplete.clone(), complete.clone()] {
+                assert_eq!(
+                    pass_response(id.clone(), whole_project, answer)["unfinishedFiles"],
+                    serde_json::json!(["src/a.toy", "src/b.toy"]),
+                    "whole_project = {whole_project}"
+                );
+            }
+        }
+
+        let none_left = SemanticAnswer::complete(FileChangeDiff::default())
+            .with_unfinished(std::collections::BTreeSet::new());
+        assert_eq!(pass_response(id.clone(), false, none_left)["unfinishedFiles"], serde_json::json!([]));
+        for whole_project in [false, true] {
+            let silent = SemanticAnswer::incomplete(FileChangeDiff::default());
+            assert!(pass_response(id.clone(), whole_project, silent).get("unfinishedFiles").is_none());
+        }
+    }
+
     /// The diff an incomplete pass did manage travels with it - core commits
     /// it and declines to record the pass, which is the whole point of the
     /// field being beside `result` rather than replacing it.

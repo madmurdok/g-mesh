@@ -1282,6 +1282,29 @@ mod tests {
         assert!(serde_json::to_string(&parsed).unwrap().contains("\"incompleteReason\":\"server exited\""));
     }
 
+    /// `unfinishedFiles` is optional both ways. Absent reads as
+    /// `None` (a plugin written before the field), `None` is not written, and
+    /// an empty and a non-empty list each survive a round trip as written -
+    /// an empty list ("every file finished") must not collapse into `None`
+    /// ("the plugin did not say").
+    #[test]
+    fn unfinished_files_is_omitted_when_absent_and_round_trips_when_present() {
+        let without = r#"{"jsonrpc":"2.0","id":7,"result":{}}"#;
+        let parsed: FileChangeResponse = serde_json::from_str(without).unwrap();
+        assert_eq!(parsed.unfinished_files, None);
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(!json.contains("unfinishedFiles"), "None is not written: {json}");
+
+        for files in [Vec::new(), vec!["a.rs".to_string()]] {
+            let response = FileChangeResponse { unfinished_files: Some(files.clone()), ..parsed.clone() };
+            let json = serde_json::to_string(&response).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["unfinishedFiles"], serde_json::json!(files), "{json}");
+            let round_tripped: FileChangeResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(round_tripped.unfinished_files, Some(files));
+        }
+    }
+
     #[test]
     fn handshake_payload_round_trips() {
         let example = r#"{

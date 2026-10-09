@@ -998,6 +998,64 @@ fn a_reset_empties_the_semantic_pending_tables() {
     assert!(semantic_pending_file_rows(&conn).is_empty());
 }
 
+/// `(language, filePath, attempts)` of every owed-file row, sorted.
+fn owed_file_rows(conn: &Connection) -> Vec<(String, String, i64)> {
+    conn.prepare("SELECT language, filePath, attempts FROM semantic_owed_files ORDER BY language, filePath")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// `files` owed by `language`, each as unfinished by the pass requested for it.
+fn mark_owed(conn: &Connection, language: &str, files: &[&str]) {
+    let files: Vec<String> = files.iter().map(|file| file.to_string()).collect();
+    settle_owed_files(conn, language, &files, &[], &files).unwrap();
+}
+
+/// The owed files are read per language, in path order.
+#[test]
+fn owed_files_are_read_per_language_in_path_order() {
+    let conn = setup();
+    mark_owed(&conn, "rust", &["c.rs", "a.rs", "b.rs"]);
+    mark_owed(&conn, "go", &["a.go"]);
+
+    assert_eq!(owed_files(&conn, "rust").unwrap(), vec!["a.rs", "b.rs", "c.rs"]);
+    assert_eq!(owed_files(&conn, "go").unwrap(), vec!["a.go"]);
+}
+
+/// A completed whole-project pass answered everything, so its language owes
+/// no file any more; another language's rows stay, and a recorded failure
+/// clears nothing.
+///
+/// Control: drop `clear_owed_files` from `record_language_semantic_pass`.
+#[test]
+fn a_completed_pass_clears_only_its_own_languages_owed_files() {
+    let conn = setup();
+    mark_owed(&conn, "rust", &["a.rs"]);
+    mark_owed(&conn, "go", &["a.go"]);
+
+    record_language_semantic_pass_failure(&conn, "rust", "the engine exited").unwrap();
+    assert_eq!(owed_file_rows(&conn).len(), 2, "a failed pass finished nothing");
+
+    record_language_semantic_pass(&conn, "rust").unwrap();
+    assert_eq!(owed_file_rows(&conn), vec![("go".to_string(), "a.go".to_string(), 1)]);
+}
+
+/// `reset` leaves the owed table empty. Control: leave it out of `wipe`'s
+/// `DROP` list.
+#[test]
+fn a_reset_empties_the_owed_files() {
+    let conn = setup();
+    record_version(&conn, GENERATION).unwrap();
+    mark_owed(&conn, "rust", &["a.rs"]);
+
+    reset(&conn, GENERATION).unwrap();
+
+    assert!(owed_file_rows(&conn).is_empty());
+}
+
 // ---------------------------------------------------------------------
 // language_outcome (ADR 0021, section 5)
 // ---------------------------------------------------------------------

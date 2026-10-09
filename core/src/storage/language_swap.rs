@@ -809,6 +809,27 @@ mod tests {
         );
     }
 
+    /// A committed swap clears the swapped language's owed files - they named
+    /// the index it replaces - and no other language's.
+    ///
+    /// Control: drop `clear_owed_files` from `swap_attached`.
+    #[test]
+    fn a_swap_clears_only_its_languages_owed_files() {
+        let (_dir, mut live, staging_path, _plan) = planned_reindex();
+        for (language, file) in [("rust", "a.rs"), ("go", "a.go")] {
+            schema::settle_owed_files(&live, language, &[file.to_string()], &[], &[file.to_string()])
+                .unwrap();
+        }
+        let capable: HashSet<String> = HashSet::from(["rust".to_string()]);
+
+        swap(&mut live, &staging_path, None, &bookkeeping(&capable)).unwrap();
+
+        assert_eq!(
+            column(&live, "SELECT language || ':' || filePath FROM semantic_owed_files"),
+            vec!["go:a.go"]
+        );
+    }
+
     /// A language with no semantic pass owes nothing: no rows.
     #[test]
     fn a_swap_of_a_language_without_a_semantic_pass_writes_no_pending_rows() {
