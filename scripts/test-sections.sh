@@ -5,7 +5,7 @@
 #
 #   scripts/test-sections.sh list                    section names, in run order
 #   scripts/test-sections.sh filter <section>        the section's filterset
-#   scripts/test-sections.sh run [--profile P] [--keep-going] <section>...|all
+#   scripts/test-sections.sh run [--profile P] [--keep-going] <section>...|all|full|none
 #   scripts/test-sections.sh check                   the sections partition the suite
 #
 # Invariants:
@@ -59,7 +59,7 @@ usage() {
 	cat >&2 <<'EOF'
 usage: scripts/test-sections.sh list
        scripts/test-sections.sh filter <section>
-       scripts/test-sections.sh run [--profile P] [--keep-going] <section>...|all
+       scripts/test-sections.sh run [--profile P] [--keep-going] <section>...|all|full|none
        scripts/test-sections.sh check
 EOF
 }
@@ -99,7 +99,7 @@ junit_counts() {
 }
 
 cmd_run() {
-	local profile=default keep_going=0
+	local profile=default keep_going=0 saw_none=0
 	local -a names=()
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -115,8 +115,13 @@ cmd_run() {
 			keep_going=1
 			shift
 			;;
-		all)
+		# `full` and `none` are scripts/test-select.sh's answers.
+		all | full)
 			names+=("${SECTIONS[@]}")
+			shift
+			;;
+		none)
+			saw_none=1
 			shift
 			;;
 		-*)
@@ -129,6 +134,10 @@ cmd_run() {
 			;;
 		esac
 	done
+	if [ ${#names[@]} -eq 0 ] && [ "$saw_none" -eq 1 ]; then
+		echo "== no sections selected"
+		return 0
+	fi
 	[ ${#names[@]} -gt 0 ] || {
 		usage
 		exit 2
