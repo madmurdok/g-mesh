@@ -35,25 +35,7 @@ pub struct WalkedFile {
 /// with [`BASELINE_EXCLUDED_DIRS`] and every directory named in `pruned`
 /// skipped outright at any depth. Filtering files one by one is the caller's.
 pub fn project_files(root: &Path, pruned: &[String]) -> impl Iterator<Item = WalkedFile> {
-    let pruned: Vec<String> =
-        BASELINE_EXCLUDED_DIRS.iter().map(|dir| (*dir).to_string()).chain(pruned.iter().cloned()).collect();
-    let walk = WalkBuilder::new(root)
-        // Matching the plugins' walks, which read each directory's own
-        // .gitignore and nothing else: no dotfile skipping, no rules from
-        // above the project root, no global/`info/exclude` rules, and rules
-        // honored even outside a git repository.
-        .hidden(false)
-        .parents(false)
-        .ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .require_git(false)
-        .follow_links(false)
-        .filter_entry(move |entry| {
-            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-            !is_dir || !entry.file_name().to_str().is_some_and(|name| pruned.iter().any(|dir| dir == name))
-        })
-        .build();
+    let walk = project_walk_builder(root, pruned, false).build();
     let root = root.to_path_buf();
     walk.filter_map(move |entry| {
         // An unreadable directory costs its subtree, not the walk.
@@ -75,4 +57,35 @@ fn relative_wire_path(root: &Path, absolute: &Path) -> Option<String> {
         parts.push(component.as_os_str().to_str()?.to_string());
     }
     Some(parts.join("/"))
+}
+
+/// The walker behind [`project_files`], shared with the watcher's
+/// [`IgnoreLayers`](crate::watcher::ignore_layers::IgnoreLayers) so the two can
+/// never disagree about which `.gitignore` files apply or how. With
+/// `directories_only`, files are dropped: the caller wants the directories the
+/// walk would enter, not their files.
+pub(crate) fn project_walk_builder(root: &Path, pruned: &[String], directories_only: bool) -> WalkBuilder {
+    let pruned: Vec<String> =
+        BASELINE_EXCLUDED_DIRS.iter().map(|dir| (*dir).to_string()).chain(pruned.iter().cloned()).collect();
+    let mut builder = WalkBuilder::new(root);
+    // Matching the plugins' walks, which read each directory's own
+    // .gitignore and nothing else: no dotfile skipping, no rules from
+    // above the project root, no global/`info/exclude` rules, and rules
+    // honored even outside a git repository.
+    builder
+        .hidden(false)
+        .parents(false)
+        .ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .follow_links(false)
+        .filter_entry(move |entry| {
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            if !is_dir {
+                return !directories_only;
+            }
+            !entry.file_name().to_str().is_some_and(|name| pruned.iter().any(|dir| dir == name))
+        });
+    builder
 }

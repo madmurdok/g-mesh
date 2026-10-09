@@ -2,15 +2,18 @@ pub mod apply;
 pub mod batch;
 pub mod burst;
 pub mod debounce;
+pub mod ignore_layers;
 pub mod staleness;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Config, ErrorKind as NotifyErrorKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
+
+use ignore_layers::{IgnoreLayers, GITIGNORE_FILE_NAME};
 
 /// How often the polling fallback (see [`ProjectWatcher::new_inner`]) rescans
 /// its subtree for changes. Polling a large subtree is inherently more
@@ -29,9 +32,10 @@ const POLL_FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
 pub const BASELINE_EXCLUDED_DIRS: [&str; 2] = [".git", ".claude"];
 
 /// Watches a project root for filesystem changes, filtering out anything
-/// `.gitignore` (plus `.git` and `.claude`, which `.gitignore` files don't
-/// normally list - they're special-cased the same way the JS/TS plugin's
-/// bulk-index walk hard-excludes them regardless of `.gitignore` contents).
+/// a `.gitignore` at any level ignores (plus `.git` and `.claude`, which
+/// `.gitignore` files don't normally list - they're special-cased the same
+/// way the JS/TS plugin's bulk-index walk hard-excludes them regardless of
+/// `.gitignore` contents).
 /// `.claude` holds Claude Code's own session/worktree artifacts (e.g. full
 /// project copies under `.claude/worktrees/`), never real project source.
 pub struct ProjectWatcher {
@@ -43,7 +47,10 @@ pub struct ProjectWatcher {
     // it stops the poll loop.
     _poll_fallback: Option<PollWatcher>,
     events: Receiver<PathBuf>,
-    gitignore: Gitignore,
+    root: PathBuf,
+    // Swapped whole by `reload_ignores` when a `.gitignore` may have changed;
+    // read for every event.
+    ignores: RwLock<IgnoreLayers>,
 }
 
 impl ProjectWatcher {
@@ -75,20 +82,7 @@ impl ProjectWatcher {
             .with_context(|| format!("failed to canonicalize project root {}", root.as_ref().display()))?;
         let root = root.as_path();
 
-        let mut builder = GitignoreBuilder::new(root);
-        for dir in BASELINE_EXCLUDED_DIRS {
-            builder
-                .add_line(None, &format!("{dir}/"))
-                .with_context(|| format!("failed to add built-in {dir} exclusion"))?;
-        }
-        // A missing .gitignore is the common case (no ignore rules yet),
-        // not an error - only propagate genuine parse failures.
-        if let Some(err) = builder.add(root.join(".gitignore")) {
-            if root.join(".gitignore").exists() {
-                return Err(err).context("failed to parse .gitignore");
-            }
-        }
-        let gitignore = builder.build().context("failed to build gitignore matcher")?;
+        let ignores = RwLock::new(IgnoreLayers::load(root));
 
         let (tx, rx) = channel();
         let mut watcher = {
@@ -146,15 +140,51 @@ impl ProjectWatcher {
             Err(err) => return Err(err).with_context(|| format!("failed to watch {}", root.display())),
         };
 
-        Ok(Self { _watcher: watcher, _poll_fallback: poll_fallback, events: rx, gitignore })
+        Ok(Self {
+            _watcher: watcher,
+            _poll_fallback: poll_fallback,
+            events: rx,
+            root: root.to_path_buf(),
+            ignores,
+        })
     }
 
-    fn is_ignored(&self, path: &Path) -> bool {
-        // `matched` alone only tests the exact path against patterns; a
-        // directory-only pattern like "node_modules/" wouldn't cover a file
-        // beneath it without also checking ancestors, same as real git.
-        let is_dir = path.is_dir();
-        self.gitignore.matched_path_or_any_parents(path, is_dir).is_ignore()
+    /// Whether the project's walks would leave `path` out, by the layers as
+    /// last (re)loaded: see [`IgnoreLayers::is_ignored`].
+    pub fn is_ignored(&self, path: &Path) -> bool {
+        self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner()).is_ignored(path)
+    }
+
+    /// Re-reads every `.gitignore` under the root, so later events (and
+    /// [`Self::retain_unignored`]) are filtered by what the files say now.
+    /// The read happens outside the lock; only the swap holds it.
+    pub fn reload_ignores(&self) {
+        let layers = IgnoreLayers::load(&self.root);
+        *self.ignores.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = layers;
+    }
+
+    /// Reloads the layers when a settled batch may have changed them: a path
+    /// named `.gitignore` (edited, created or deleted), or a directory (a move
+    /// can carry a nested `.gitignore` without an event for the file itself).
+    /// The root itself does not count: macOS reports it for any write inside.
+    /// Returns whether it reloaded.
+    pub fn reload_ignores_if_changed(&self, settled: &[PathBuf]) -> bool {
+        let changed = settled.iter().any(|path| {
+            path.file_name() == Some(std::ffi::OsStr::new(GITIGNORE_FILE_NAME))
+                || (path.as_path() != self.root && path.is_dir())
+        });
+        if changed {
+            self.reload_ignores();
+        }
+        changed
+    }
+
+    /// Drops from a settled batch the paths the current layers ignore: an
+    /// event that passed [`Self::next_change`] under the old layers but sits
+    /// under what a `.gitignore` in the same batch now ignores.
+    pub fn retain_unignored(&self, settled: &mut Vec<PathBuf>) {
+        let layers = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        settled.retain(|path| !layers.is_ignored(path));
     }
 
     /// Returns the next change to a non-ignored path, waiting up to
