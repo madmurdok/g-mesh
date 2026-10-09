@@ -469,7 +469,14 @@ func (e *semanticEngine) isProjectContainer(path string) bool {
 // When some modules load and others do not, the diff still carries what the
 // loaded ones resolved; the failed modules' files are left out of the
 // answered scope, so this pass neither answers nor retracts anything in them.
-func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff, string) {
+//
+// The third return is wire.go's `fileChangeResponse.UnfinishedFiles`
+// (GM-521): once at least one module loaded, the files in scope this pass
+// did not answer - those of the modules that failed, possibly none - so core
+// settles every other file it sent and owes only these to a later pass. nil
+// (the field omitted) when nothing loaded, `go` is missing or the scope was
+// empty: core then keeps its whole-pass behaviour, retrying the whole scope.
+func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff, string, []string) {
 	started := time.Now()
 	e.ws = ws
 	defer func() { e.ws = nil }()
@@ -477,7 +484,7 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 	if _, err := exec.LookPath("go"); err != nil {
 		e.degrade("semantic pass degraded: no `go` binary on PATH (%v) - answering every "+
 			"semanticPass with an empty diff, incomplete=true; the structural graph is unaffected", err)
-		return emptyDiff(), "the Go semantic pass did not run: no `go` binary on PATH"
+		return emptyDiff(), "the Go semantic pass did not run: no `go` binary on PATH", nil
 	}
 
 	wholeProject := len(filePaths) == 0
@@ -488,17 +495,18 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 		scope = e.claimedFiles(filePaths)
 	}
 	if len(scope) == 0 {
-		return emptyDiff(), ""
+		return emptyDiff(), "", nil
 	}
 
 	resolved := newResolutions()
 	outcome := e.loadFor(ws, resolved, wholeProject, scope)
 	reason := outcome.incompleteReason()
 	if outcome.loaded == 0 {
-		return emptyDiff(), reason
+		return emptyDiff(), reason, nil
 	}
+	unfinished := []string{}
 	if len(outcome.failed) > 0 {
-		scope = e.withoutFailedModules(ws, scope, outcome.failed)
+		scope, unfinished = e.withoutFailedModules(ws, scope, outcome.failed)
 	}
 	structural := e.extractStructural(ws, scope)
 
@@ -515,22 +523,27 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 		len(scope), sites, implementsEdges, len(diff.UpsertNodes), len(diff.UpsertEdges),
 		len(diff.DeleteEdgeIds), time.Since(started).Round(time.Millisecond))
 	if reason != "" {
-		logf("semantic pass incomplete: %s", reason)
+		logf("semantic pass incomplete: %s (%d file(s) unfinished)", reason, len(unfinished))
 	}
-	return diff, reason
+	return diff, reason, unfinished
 }
 
-// withoutFailedModules drops from `scope` every file whose module failed to
-// load. Such a file has no type information this pass could answer from, so
-// answering it would only retract the semantic edges an earlier pass gave it.
-func (e *semanticEngine) withoutFailedModules(ws *workspace, scope []string, failed map[string]error) []string {
-	out := make([]string, 0, len(scope))
+// withoutFailedModules splits `scope` into the files whose module loaded and
+// those whose module failed to. A failed module's file has no type
+// information this pass could answer from, so answering it would only
+// retract the semantic edges an earlier pass gave it; it is unfinished
+// instead.
+func (e *semanticEngine) withoutFailedModules(ws *workspace, scope []string, failed map[string]error) (kept, dropped []string) {
+	kept = make([]string, 0, len(scope))
+	dropped = []string{}
 	for _, relPath := range scope {
-		if _, bad := failed[moduleDirFor(ws, normalizeDir(filepath.ToSlash(filepath.Dir(relPath))))]; !bad {
-			out = append(out, relPath)
+		if _, bad := failed[moduleDirFor(ws, normalizeDir(filepath.ToSlash(filepath.Dir(relPath))))]; bad {
+			dropped = append(dropped, relPath)
+		} else {
+			kept = append(kept, relPath)
 		}
 	}
-	return out
+	return kept, dropped
 }
 
 // claimedFiles narrows a per-file request to the `.go` files this plugin

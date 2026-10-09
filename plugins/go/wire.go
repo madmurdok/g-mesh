@@ -313,6 +313,12 @@ type fileChangeResponse struct {
 	// `incomplete: true` only, why the pass did not cover everything, which
 	// core records per language and shows in `g-mesh status`.
 	IncompleteReason string `json:"incompleteReason,omitempty"`
+	// UnfinishedFiles is the wire's `unfinishedFiles` (GM-498/GM-521):
+	// `semanticPass` only, the files in the pass's scope it did not answer.
+	// A pointer so absent (nil, "this pass names none") and an empty list
+	// ("every file was answered") stay distinct on the wire, as core's
+	// `Option<Vec<String>>` reads them.
+	UnfinishedFiles *[]string `json:"unfinishedFiles,omitempty"`
 }
 
 // ackResponse is the `{ acknowledged: true }` shape this plugin answers a
