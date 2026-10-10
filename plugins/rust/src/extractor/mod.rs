@@ -158,6 +158,18 @@ impl Extractor for RustExtractor {
         facts::resolution_delta(previous, project)
     }
 
+    /// Re-scans the module tree when a save changes a file's `mod` items,
+    /// deletes a module file, or creates a file a `mod` item named before it
+    /// existed; names the files that re-scan re-keyed and their importers.
+    fn source_changed(
+        &self,
+        project: &mut ProjectContext,
+        path: &RelPath,
+        source: Option<&str>,
+    ) -> Option<ResolutionDelta> {
+        project.source_changed(path, source)
+    }
+
     /// One file, in two passes over one parse tree.
     ///
     /// The passes exist because a Rust file's items are mutually visible

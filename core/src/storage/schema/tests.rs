@@ -39,6 +39,7 @@ fn creates_all_tables_and_indexes() {
             "pending_reindex",
             "placeholder_targets",
             "qualified_suffixes",
+            "reextract_owed_files",
             "resolution_facts",
             "semantic_gap_files",
             "semantic_owed_files",

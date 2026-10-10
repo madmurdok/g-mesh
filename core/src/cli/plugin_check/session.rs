@@ -1714,7 +1714,10 @@ impl<'a> Driver<'a> {
                     timeouts.semantic_pass_file,
                     *semantic_pass_capable,
                     &mut kill,
-                ),
+                )
+                // A kit session runs no whole-language reindex; what the
+                // answer's `affected` re-extracted is already committed.
+                .map(|_| ()),
                 Operation::WholeProjectSemanticPass { sweep_language, timeout } => apply_semantic_pass(
                     reader,
                     writer,

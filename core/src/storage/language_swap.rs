@@ -570,6 +570,8 @@ fn swap_attached(
         .context("failed to reconcile the semantic-pass roll-up")?;
     tx.execute("DELETE FROM pending_reindex WHERE language = ?1", params![language])
         .with_context(|| format!("failed to clear {language}'s pending reindex"))?;
+    // The walk re-extracted every file a source edit left owed (GM-507).
+    schema::clear_owed_reextracts(&tx, language)?;
 
     let kept: Vec<String> = tx
         .prepare("SELECT id FROM staging.plan_keep_nodes ORDER BY id")

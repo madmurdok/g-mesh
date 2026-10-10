@@ -673,3 +673,56 @@ fn an_interrupted_selective_reindex_is_resumed_as_a_whole_language_reindex() {
     assert!(fixture.pending().is_empty(), "the swap clears the mark");
     assert_eq!(fixture.facts().as_deref(), Some("facts-1"));
 }
+
+// -------------------------------------------------------------------------
+// GM-507: re-extracts a source edit owed and a killed daemon did not finish
+// -------------------------------------------------------------------------
+
+fn owed(conn: &IndexStore) -> Vec<(String, String, Vec<String>)> {
+    conn.with(schema::owed_reextracts).unwrap()
+}
+
+/// A daemon killed inside a source edit's re-extract loop leaves its rows
+/// (`reextract_owed_files`, written before the loop). The next start, with a
+/// new plugin process, re-extracts exactly those files,
+/// clears the rows and reindexes nothing; rows of a language no plugin
+/// serves are dropped.
+///
+/// Control: return before the loop in `resume_owed_reextracts` when the
+/// language has a manifest (nothing is re-extracted; the rows stay).
+#[test]
+fn owed_re_extracts_left_by_a_killed_daemon_are_finished_at_the_next_start() {
+    let fixture = fixture(true, false, Some("facts-1"));
+    fixture
+        .conn
+        .with(|conn| {
+            schema::owe_reextracts(conn, "alpha", &src(0), &[src(4), src(7)])?;
+            schema::owe_reextracts(conn, "gone-language", "x.gone", &["y.gone".to_string()])
+        })
+        .unwrap();
+    // The old process died with the daemon.
+    fixture.supervisor.sleep_now("the daemon was killed");
+    let requests = test_plugin::requests(&fixture.dir).len();
+    let notifications = test_plugin::notifications(&fixture.dir).len();
+
+    resume_owed_reextracts(&fixture.registry, &fixture.conn);
+
+    let asked = test_plugin::requests(&fixture.dir)[requests..].to_vec();
+    assert_eq!(
+        asked,
+        vec![format!("fileChanged {}", src(4)), format!("fileChanged {}", src(7))],
+        "one fileChanged each, nothing else"
+    );
+    assert!(
+        !test_plugin::notifications(&fixture.dir)[notifications..]
+            .iter()
+            .any(|line| line.starts_with("workspaceChanged")),
+        "no whole reindex"
+    );
+    assert!(owed(&fixture.conn).is_empty(), "every row is settled or dropped");
+    assert_eq!(
+        indexed_files(&fixture.conn).len(),
+        FILES - 2,
+        "the fake's empty answers retired the two re-extracted files"
+    );
+}

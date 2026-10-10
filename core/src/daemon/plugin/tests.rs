@@ -482,7 +482,7 @@ fn a_storage_failure_behind_a_live_plugin_is_returned_and_the_relaunch_lets_the_
 
     fs::write(&file, GREET_GROWN).unwrap();
     let err = match plugin.apply_file_change(&conn, "lib.ts", &embedding, true) {
-        Ok(()) => panic!("a diff the index refused must not be reported as applied"),
+        Ok(_) => panic!("a diff the index refused must not be reported as applied"),
         Err(err) => err,
     };
     let message = format!("{err:#}");
@@ -542,7 +542,7 @@ fn a_refused_query_time_reindex_relaunches_the_plugin_so_the_retry_applies_the_e
             .expect("failed to spawn the JS/TS plugin");
     let embedding = EmbeddingPipeline::disabled();
     assert_eq!(
-        plugin.ensure_fresh(&conn, "lib.ts", &embedding, true).unwrap(),
+        plugin.ensure_fresh(&conn, "lib.ts", &embedding, true).unwrap().0,
         StalenessOutcome::ReindexedNoPriorRecord,
         "a never-indexed file is a cold-cache reparse, which nothing can refuse"
     );
@@ -552,7 +552,7 @@ fn a_refused_query_time_reindex_relaunches_the_plugin_so_the_retry_applies_the_e
     std::thread::sleep(Duration::from_millis(10));
     fs::write(&file, GREET_GROWN).unwrap();
     let err = match plugin.ensure_fresh(&conn, "lib.ts", &embedding, true) {
-        Ok(outcome) => panic!("a reindex the index refused must not be reported as {outcome:?}"),
+        Ok((outcome, _)) => panic!("a reindex the index refused must not be reported as {outcome:?}"),
         Err(err) => format!("{err:#}"),
     };
     assert!(err.contains("FOREIGN KEY"), "the storage error itself must reach the caller: {err}");
@@ -561,7 +561,7 @@ fn a_refused_query_time_reindex_relaunches_the_plugin_so_the_retry_applies_the_e
     // Whatever refused the write stops refusing it.
     conn.lock().unwrap().pragma_update(None, "foreign_keys", "OFF").unwrap();
     assert_eq!(
-        plugin.ensure_fresh(&conn, "lib.ts", &embedding, true).unwrap(),
+        plugin.ensure_fresh(&conn, "lib.ts", &embedding, true).unwrap().0,
         StalenessOutcome::ReindexedViaHashMismatch,
         "the file is still stale, so the next query must reindex it"
     );

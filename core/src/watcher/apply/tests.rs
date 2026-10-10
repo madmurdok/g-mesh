@@ -315,6 +315,7 @@ fn file_change_diff_is_committed_to_sqlite() {
             }],
             delete_edge_ids: vec![],
             complete: false,
+            affected: None,
         },
     };
 
@@ -2998,3 +2999,5 @@ fn a_residual_and_a_whole_project_pass_are_sent_their_timeout_as_their_budget() 
     assert_eq!(budget_sent(PassKind::Residual, Duration::from_millis(6_500)), Some(6_500));
     assert_eq!(budget_sent(PassKind::WholeProject, Duration::from_millis(8_125)), Some(8_125));
 }
+
+mod affected;

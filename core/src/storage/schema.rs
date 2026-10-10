@@ -571,6 +571,21 @@ CREATE TABLE IF NOT EXISTS pending_reindex (
     startedAt TEXT NOT NULL
 );
 
+-- The files of `language` a source edit's `affected` answer selected for a
+-- re-extract (GM-507, `watcher::apply`), written before the first of them is
+-- re-extracted and removed once all of them and their semantic pass are done.
+-- A row outliving its daemon means the loop was interrupted: the next start
+-- re-extracts them again (`daemon::config_reindex::resume_owed_reextracts`).
+-- `trigger` is the edited file. A workspace reindex swap removes the
+-- language's rows. Added by `CREATE TABLE IF NOT EXISTS`, so an existing
+-- index gains it without a schema-version bump.
+CREATE TABLE IF NOT EXISTS reextract_owed_files (
+    language TEXT NOT NULL,
+    filePath TEXT NOT NULL,
+    trigger  TEXT NOT NULL,
+    PRIMARY KEY (language, filePath)
+);
+
 -- One row per language whose whole-project semantic pass is owed after a
 -- workspace reindex swapped it in, and has neither completed nor recorded a
 -- failure since (ADR 0009). Written in the swap's own transaction; removed by
@@ -1058,6 +1073,78 @@ pub fn pending_reindexes(conn: &Connection) -> Result<Vec<(String, String)>> {
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .context("failed to read the pending reindexes")?;
     rows.collect::<rusqlite::Result<_>>().context("failed to read the pending reindexes")
+}
+
+/// Records `file_paths` of `language` as owed a re-extract after `trigger`
+/// changed (`reextract_owed_files`), keeping any row already there.
+pub fn owe_reextracts(conn: &Connection, language: &str, trigger: &str, file_paths: &[String]) -> Result<()> {
+    in_savepoint(conn, || {
+        for path in file_paths {
+            conn.execute(
+                "INSERT OR IGNORE INTO reextract_owed_files (language, filePath, trigger) VALUES (?1, ?2, ?3)",
+                params![language, path, trigger],
+            )
+            .with_context(|| format!("failed to record {path} as owed a re-extract"))?;
+        }
+        Ok(())
+    })
+}
+
+/// Every language's files owed a re-extract, as `(language, trigger, files)`
+/// sorted by language and path; `trigger` is an edited file one of the
+/// language's rows names. Empty for an index that predates the table.
+pub fn owed_reextracts(conn: &Connection) -> Result<Vec<(String, String, Vec<String>)>> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reextract_owed_files')",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to look for the reextract_owed_files table")?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn
+        .prepare("SELECT language, filePath, trigger FROM reextract_owed_files ORDER BY language, filePath")
+        .context("failed to prepare the owed re-extract read")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })
+        .context("failed to read the owed re-extracts")?;
+    let mut owed: Vec<(String, String, Vec<String>)> = Vec::new();
+    for row in rows {
+        let (language, path, trigger) = row.context("failed to read an owed re-extract")?;
+        match owed.last_mut() {
+            Some((last, last_trigger, files)) if *last == language => {
+                *last_trigger = trigger;
+                files.push(path);
+            }
+            _ => owed.push((language, trigger, vec![path])),
+        }
+    }
+    Ok(owed)
+}
+
+/// Deletes the owed re-extracts of `file_paths` in `language`, re-extracted.
+pub fn settle_owed_reextracts(conn: &Connection, language: &str, file_paths: &[String]) -> Result<()> {
+    in_savepoint(conn, || {
+        for path in file_paths {
+            conn.execute(
+                "DELETE FROM reextract_owed_files WHERE language = ?1 AND filePath = ?2",
+                params![language, path],
+            )
+            .with_context(|| format!("failed to settle the owed re-extract of {path}"))?;
+        }
+        Ok(())
+    })
+}
+
+/// Deletes `language`'s owed re-extracts.
+pub fn clear_owed_reextracts(conn: &Connection, language: &str) -> Result<()> {
+    conn.execute("DELETE FROM reextract_owed_files WHERE language = ?1", params![language])
+        .with_context(|| format!("failed to clear {language}'s owed re-extracts"))?;
+    Ok(())
 }
 
 /// Whether the whole-project semantic pass has ever finished for this index -

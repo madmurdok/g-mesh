@@ -1118,11 +1118,32 @@ impl PluginRegistry {
         }
 
         match self.get_or_spawn(&language) {
-            Ok(supervisor) => supervisor.file_changed(conn, file_path),
+            Ok(supervisor) => {
+                supervisor.file_changed(conn, file_path);
+                self.run_owed_reindex(conn, &supervisor);
+            }
             Err(err) => crate::log_line!(
                 "g-mesh daemon: could not start the {language} plugin for {file_path}: {err:#} - \
                  the change was not indexed"
             ),
+        }
+    }
+
+    /// Runs the whole-language reindex a file change of `supervisor`'s
+    /// language asked for (GM-507: its `affected` answer was `unknown`, above
+    /// `config_reindex::FALLBACK_SHARE_PERCENT`, or a re-extract failed), if
+    /// one did. Always the whole reindex, never a `resolutionChanged`: the
+    /// trigger is a source file, not a watch file.
+    fn run_owed_reindex(&self, conn: &IndexStore, supervisor: &Arc<PluginSupervisor>) {
+        let Some((trigger, reason)) = supervisor.take_owed_reindex() else { return };
+        let language = supervisor.language();
+        crate::log_line!("g-mesh daemon: reindexing all of {language} after {trigger} changed: {reason}");
+        if let Err(err) = crate::daemon::workspace_reindex::run(self, supervisor, conn, &trigger) {
+            crate::log_line!(
+                "g-mesh daemon: failed to reindex the {language} workspace after {trigger} changed: \
+                 {err:#} - {language}'s previous graph keeps serving, and the reindex runs again on \
+                 the next daemon start"
+            );
         }
     }
 
@@ -1482,7 +1503,9 @@ impl PluginRegistry {
     pub fn replay_pending(&self, conn: &IndexStore) -> usize {
         let mut replayed = 0;
         for supervisor in self.active_supervisors() {
-            match supervisor.replay_pending(conn) {
+            let replay = supervisor.replay_pending(conn);
+            self.run_owed_reindex(conn, &supervisor);
+            match replay {
                 Ok(count) => replayed += count,
                 Err(err) => crate::log_line!(
                     "g-mesh daemon: could not replay the changes queued while the {} plugin \
@@ -1529,7 +1552,11 @@ impl PluginRegistry {
         }
 
         let supervisor = self.get_or_spawn(&language)?;
-        supervisor.ensure_fresh(conn, file_path).map(Some)
+        let outcome = supervisor.ensure_fresh(conn, file_path);
+        // Rare (see `run_owed_reindex`), and the query waits for it: the
+        // graph it reads is otherwise known to be stale.
+        self.run_owed_reindex(conn, &supervisor);
+        outcome.map(Some)
     }
 }
 

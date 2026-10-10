@@ -170,6 +170,9 @@ impl ActivationCtx {
         // runs again here, with the watcher already draining; until it
         // swaps, the old graph of its language keeps serving.
         crate::daemon::workspace_reindex::resume_pending(&self.registry, &self.conn);
+        // Then the re-extracts a source edit owed and an earlier daemon did
+        // not finish (GM-507); a language just reindexed has none left.
+        crate::daemon::config_reindex::resume_owed_reextracts(&self.registry, &self.conn);
 
         // Runs on every activation, not only after a walk: "the structural
         // graph is complete" says nothing about whether every embeddable node

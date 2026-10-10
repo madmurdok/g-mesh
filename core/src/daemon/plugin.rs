@@ -48,7 +48,7 @@ use crate::protocol::types::{
 use crate::storage::index_store::{self, IndexStore};
 use crate::watcher::apply::{
     apply_file_change as apply_file_change_diff, apply_residual_semantic_pass, apply_scoped_semantic_pass,
-    apply_semantic_pass, reextract_file, SemanticPassOutcome,
+    apply_semantic_pass, reextract_file, FileChangeOutcome, SemanticPassOutcome,
 };
 use crate::watcher::staleness::{self, StalenessOutcome};
 
@@ -909,80 +909,83 @@ impl PluginProcess {
         file_path: impl Into<String>,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
-    ) -> Result<()> {
+    ) -> Result<FileChangeOutcome> {
         let file_path = file_path.into();
         self.enqueue_pending(&file_path);
 
         let (sent_to, sent) = self.send_one(conn, &file_path, embedding, semantic_suspended, false);
-        if let Err(first_err) = sent {
-            // A crash shows up here as a failed write or read on the plugin's
-            // pipes. Confirm the process is really gone before replacing a
-            // merely-slow process's live handle out from under it -
-            // `process_has_exited` is a non-blocking (if briefly polled)
-            // check for exactly that. A timeout has already forced this to be
-            // true (`on_timeout` killed the process before this line runs),
-            // but the check is still correct and still cheap to make
-            // unconditionally.
-            let exited = self.process_has_exited();
+        let outcome = match sent {
+            Ok(outcome) => outcome,
+            Err(first_err) => {
+                // A crash shows up here as a failed write or read on the plugin's
+                // pipes. Confirm the process is really gone before replacing a
+                // merely-slow process's live handle out from under it -
+                // `process_has_exited` is a non-blocking (if briefly polled)
+                // check for exactly that. A timeout has already forced this to be
+                // true (`on_timeout` killed the process before this line runs),
+                // but the check is still correct and still cheap to make
+                // unconditionally.
+                let exited = self.process_has_exited();
 
-            if is_timeout(&first_err) {
-                // See this function's own doc comment: a timeout is not safe
-                // to replay inline. `file_path` (and anything else already
-                // queued) stays in `self.pending` for whenever the next
-                // ordinary call retries it - which is exactly what happens,
-                // since a fresh `apply_file_change` for the same path just
-                // re-enqueues (a no-op, already there) and sends it again.
-                // Unchanged by GM-294: checked before the non-crash branch
-                // below so a timeout can never be mistaken for one.
-                if exited {
-                    self.relaunch(&format!("the process exited unexpectedly ({first_err:#})"))
-                        .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
+                if is_timeout(&first_err) {
+                    // See this function's own doc comment: a timeout is not safe
+                    // to replay inline. `file_path` (and anything else already
+                    // queued) stays in `self.pending` for whenever the next
+                    // ordinary call retries it - which is exactly what happens,
+                    // since a fresh `apply_file_change` for the same path just
+                    // re-enqueues (a no-op, already there) and sends it again.
+                    // Unchanged by GM-294: checked before the non-crash branch
+                    // below so a timeout can never be mistaken for one.
+                    if exited {
+                        self.relaunch(&format!("the process exited unexpectedly ({first_err:#})"))
+                            .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
+                    }
+                    return Err(first_err);
                 }
-                return Err(first_err);
-            }
 
-            // Another thread may already have won the relaunch race by the
-            // time we check - then the current process is alive, but it is
-            // not the one this request died on, and replaying against it is
-            // still the recovery (`replay_pending` always sends against
-            // whatever is current).
-            let relaunched_elsewhere = self.pid() != sent_to;
-            if !exited && !relaunched_elsewhere {
-                // Not a crash, so nothing a replay can fix - see this
-                // method's doc. Dropped from the queue rather than left in
-                // it: a later crash's replay would otherwise stop at this
-                // entry first and fail every recovery behind it.
-                self.remove_pending(&file_path);
-                let err = first_err.context(format!("failed to apply the plugin's diff for {file_path}"));
-                // Relaunched to discard a cache that is now ahead of the
-                // index, not replayed - the error below is still what the
-                // caller gets, whether or not the relaunch works.
-                if let Err(relaunch_err) = self.relaunch(&format!(
-                    "its change to {file_path} could not be applied ({err:#}), so its cached copy of \
+                // Another thread may already have won the relaunch race by the
+                // time we check - then the current process is alive, but it is
+                // not the one this request died on, and replaying against it is
+                // still the recovery (`replay_pending` always sends against
+                // whatever is current).
+                let relaunched_elsewhere = self.pid() != sent_to;
+                if !exited && !relaunched_elsewhere {
+                    // Not a crash, so nothing a replay can fix - see this
+                    // method's doc. Dropped from the queue rather than left in
+                    // it: a later crash's replay would otherwise stop at this
+                    // entry first and fail every recovery behind it.
+                    self.remove_pending(&file_path);
+                    let err = first_err.context(format!("failed to apply the plugin's diff for {file_path}"));
+                    // Relaunched to discard a cache that is now ahead of the
+                    // index, not replayed - the error below is still what the
+                    // caller gets, whether or not the relaunch works.
+                    if let Err(relaunch_err) = self.relaunch(&format!(
+                        "its change to {file_path} could not be applied ({err:#}), so its cached copy of \
                      that file is ahead of the index - a fresh process re-extracts it in full"
-                )) {
-                    crate::log_line!(
-                        "g-mesh daemon: could not relaunch the {} plugin after a failed apply \
+                    )) {
+                        crate::log_line!(
+                            "g-mesh daemon: could not relaunch the {} plugin after a failed apply \
                          ({relaunch_err:#}) - {file_path} may stay stale until the plugin restarts",
-                        self.manifest.language
-                    );
+                            self.manifest.language
+                        );
+                    }
+                    return Err(err);
                 }
-                return Err(err);
-            }
 
-            if exited {
-                self.relaunch(&format!(
-                    "the process exited unexpectedly ({first_err:#}) - replaying pending file changes"
-                ))
-                .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
-            }
+                if exited {
+                    self.relaunch(&format!(
+                        "the process exited unexpectedly ({first_err:#}) - replaying pending file changes"
+                    ))
+                    .context("failed to relaunch the JS/TS plugin after it exited unexpectedly")?;
+                }
 
-            return self.replay_pending(conn, embedding, semantic_suspended).with_context(|| {
+                return self.replay_pending(conn, embedding, semantic_suspended).with_context(|| {
                 format!(
                     "JS/TS plugin process exited unexpectedly and could not be recovered while applying a change to {file_path}"
                 )
             });
-        }
+            }
+        };
 
         // The ordinary, no-crash case: `send_one` above already delivered
         // this file, so it is done, not still pending. `replay_pending`
@@ -990,7 +993,24 @@ impl PluginProcess {
         // leaving it here would grow the queue forever and make every
         // future crash replay the project's entire change history.
         self.remove_pending(&file_path);
-        Ok(())
+        self.relaunch_if_reindex_owed(&outcome);
+        Ok(outcome)
+    }
+
+    /// A re-extract that failed inside a `fileChanged` (GM-507) is reported
+    /// as an owed whole-language reindex, not an error; a timeout among them
+    /// killed the process. Relaunched here, best-effort, so the next request
+    /// finds a live one.
+    fn relaunch_if_reindex_owed(&self, outcome: &FileChangeOutcome) {
+        if !matches!(outcome, FileChangeOutcome::ReindexLanguage { .. }) || !self.process_has_exited() {
+            return;
+        }
+        if let Err(err) = self.relaunch("it exited while re-extracting the files an edit moved") {
+            crate::log_line!(
+                "g-mesh daemon: failed to relaunch the {} plugin after a failed re-extract: {err:#}",
+                self.manifest.language
+            );
+        }
     }
 
     /// Adds `file_path` to the pending queue unless it is already there -
@@ -1016,16 +1036,30 @@ impl PluginProcess {
     /// file that triggered this replay, still queued behind whatever an
     /// earlier crash may have left too) and picks up exactly where it left
     /// off.
+    /// A replayed file whose answer owes the whole-language reindex makes
+    /// the whole replay owe it.
     fn replay_pending(
         &self,
         conn: &IndexStore,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
-    ) -> Result<()> {
+    ) -> Result<FileChangeOutcome> {
+        let mut reextracted = 0;
+        let mut owed = None;
         loop {
             let next = { self.pending().first().cloned() };
-            let Some(file_path) = next else { return Ok(()) };
-            self.send_one(conn, &file_path, embedding, semantic_suspended, false).1?;
+            let Some(file_path) = next else {
+                let outcome = match owed {
+                    Some(reason) => FileChangeOutcome::ReindexLanguage { reason },
+                    None => FileChangeOutcome::Applied { reextracted },
+                };
+                self.relaunch_if_reindex_owed(&outcome);
+                return Ok(outcome);
+            };
+            match self.send_one(conn, &file_path, embedding, semantic_suspended, false).1? {
+                FileChangeOutcome::Applied { reextracted: count } => reextracted += count,
+                FileChangeOutcome::ReindexLanguage { reason } => owed = owed.or(Some(reason)),
+            }
             self.remove_pending(&file_path);
         }
     }
@@ -1085,9 +1119,9 @@ impl PluginProcess {
         file_path: &str,
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
-    ) -> Result<StalenessOutcome> {
+    ) -> Result<(StalenessOutcome, FileChangeOutcome)> {
         if !conn.with(|conn| staleness::is_stale(conn, &self.project_root, file_path))? {
-            return Ok(StalenessOutcome::AlreadyFresh);
+            return Ok((StalenessOutcome::AlreadyFresh, FileChangeOutcome::Applied { reextracted: 0 }));
         }
 
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::SeqCst));
@@ -1115,6 +1149,9 @@ impl PluginProcess {
             (result, asked)
         };
         self.relaunch_after_timeout_if_needed(&result);
+        if let Ok((_, change)) = &result {
+            self.relaunch_if_reindex_owed(change);
+        }
 
         let Err(err) = &result else { return result };
         let refused_by_the_index = err.downcast_ref::<staleness::ReindexFailed>().is_some()
@@ -1360,7 +1397,7 @@ impl PluginProcess {
         embedding: &EmbeddingPipeline,
         semantic_suspended: bool,
         reextract: bool,
-    ) -> (u32, Result<()>) {
+    ) -> (u32, Result<FileChangeOutcome>) {
         // A per-process atomic counter is all `apply_file_change_diff`'s doc
         // comment asks for - it only needs an id unique enough to catch a
         // response answering the wrong request, not a globally unique one.
@@ -1390,6 +1427,7 @@ impl PluginProcess {
                 self.timeouts.file_changed,
                 &mut on_timeout,
             )
+            .map(|()| FileChangeOutcome::Applied { reextracted: 0 })
         } else {
             apply_file_change_diff(
                 reader,
@@ -1417,7 +1455,7 @@ impl PluginProcess {
     pub fn reextract(&self, conn: &IndexStore, file_path: &str, embedding: &EmbeddingPipeline) -> Result<()> {
         let (_, result) = self.send_one(conn, file_path, embedding, true, true);
         self.relaunch_after_timeout_if_needed(&result);
-        result
+        result.map(|_| ())
     }
 
     /// Asks the plugin, with a `resolutionChanged` request, what the edit of

@@ -849,6 +849,17 @@ pub struct FileChangeDiff {
     /// `semanticPass` answer.
     #[serde(default, skip_serializing_if = "is_false")]
     pub complete: bool,
+    /// **`fileChanged` only:** this edit changed the plugin's project model
+    /// (a Rust `mod` item added, removed or moved), and these other files
+    /// may now extract differently. Core selects and re-extracts them as it
+    /// does for a watch-file save's [`ResolutionDelta`]; `Unknown` reindexes
+    /// the language.
+    ///
+    /// Absent means the edit changed no other file's extraction. Ignored on
+    /// a `semanticPass` answer and on a re-extract round trip's answer.
+    /// Design: `docs/architecture/gm-507-rust-module-tree-refresh.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affected: Option<ResolutionDelta>,
 }
 
 /// Minimal JSON-RPC 2.0 response envelope carrying a `FileChangeDiff` -
@@ -1424,6 +1435,7 @@ mod tests {
             }],
             delete_edge_ids: vec!["e2".to_string()],
             complete: true,
+            affected: None,
         };
 
         let json = serde_json::to_string(&diff).unwrap();

@@ -161,7 +161,17 @@ pub enum ContainerInfo {
 /// `crate::extractor`'s module doc for how GM-286 is expected to consume it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectContext {
+    /// The absolute project root the model was loaded from, which a re-scan
+    /// reads again.
+    root: PathBuf,
     crates: Vec<Crate>,
+    /// Each crate's own module tree, index-aligned with `crates`. `files`,
+    /// `container_keys` and `notes` are derived from them by
+    /// [`ProjectContext::rebuild`].
+    trees: Vec<module_tree::CrateTree>,
+    /// The order of `notes`: load-time notes, and where each crate's scan
+    /// notes fall among them.
+    note_layout: Vec<NoteSlot>,
     files: module_tree::FileContainers,
     /// Every container key `files` (and each crate root) actually contains -
     /// the reverse of `files`, kept as its own set rather than recomputed on
@@ -197,7 +207,7 @@ impl ProjectContext {
     /// `--bulk-index` outright - which this module deliberately tries hard
     /// not to need, since "no crates found" is still indexable.
     pub fn load(root: &Path) -> anyhow::Result<Self> {
-        let mut notes = Vec::new();
+        let mut notes = NoteLayout::default();
         let root_manifest_path = root.join("Cargo.toml");
         let root_manifest = match cargo_manifest::read(&root_manifest_path) {
             Ok(manifest) => Some(manifest),
@@ -213,7 +223,8 @@ impl ProjectContext {
         let package_dirs = collect_package_dirs(root, root_manifest.as_ref());
 
         let mut crates = Vec::new();
-        let mut files = module_tree::FileContainers::new();
+        let mut trees: Vec<module_tree::CrateTree> = Vec::new();
+        let mut taken: BTreeSet<RelPath> = BTreeSet::new();
         let mut used_keys: BTreeSet<String> = BTreeSet::new();
 
         for package_dir in &package_dirs {
@@ -246,14 +257,123 @@ impl ProjectContext {
                     ));
                     continue;
                 }
-                module_tree::scan_crate(root, &key, root_file.clone(), &mut files, &mut notes);
+                let tree = module_tree::scan_crate(root, &key, root_file.clone(), &taken);
+                taken.extend(tree.files.keys().cloned());
+                notes.0.push(NoteSlot::Crate(trees.len()));
+                trees.push(tree);
                 crates.push(Crate { key, root: root_file, package_dir: package_rel_dir.clone() });
             }
         }
 
-        let container_keys = files.values().map(|(key, _)| key.clone()).collect();
+        let mut project =
+            Self { root: root.to_path_buf(), crates, trees, note_layout: notes.0, ..Self::default() };
+        project.rebuild();
+        Ok(project)
+    }
 
-        Ok(Self { crates, files, container_keys, notes })
+    /// Derives `files`, `container_keys` and `notes` from `trees` and
+    /// `note_layout`.
+    fn rebuild(&mut self) {
+        self.files = self.trees.iter().flat_map(|tree| tree.files.clone()).collect();
+        self.container_keys = self.files.values().map(|(key, _)| key.clone()).collect();
+        self.notes = self
+            .note_layout
+            .iter()
+            .flat_map(|slot| match slot {
+                NoteSlot::Text(note) => std::slice::from_ref(note),
+                NoteSlot::Crate(index) => self.trees[*index].notes.as_slice(),
+            })
+            .cloned()
+            .collect();
+    }
+
+    /// Updates the module tree for `path`'s new text (`None`: gone or
+    /// unreadable) and answers which other files may now extract
+    /// differently, or `None` when no other file does.
+    ///
+    /// - A file of the tree whose `mod` signature is unchanged: `None`,
+    ///   without reading the disk.
+    /// - A file of the tree with another signature, or gone: its crate is
+    ///   re-scanned.
+    /// - A file outside the tree that a `mod` item named before it existed
+    ///   (a pending candidate): every crate naming it is re-scanned.
+    /// - Anything else: `None`.
+    ///
+    /// A re-scan reads the disk, so afterwards the model equals
+    /// [`ProjectContext::load`]'s for the same module files. The crate list
+    /// is not re-read: a crate root appearing or disappearing is a manifest
+    /// question, answered on the next `Cargo.toml` save. The delta is
+    /// [`facts::delta`] of the model before and after, without `path` itself,
+    /// which the caller extracts anyway.
+    pub fn source_changed(
+        &mut self,
+        path: &RelPath,
+        source: Option<&str>,
+    ) -> Option<g_mesh_plugin_sdk::wire::ResolutionDelta> {
+        use g_mesh_plugin_sdk::wire::ResolutionDelta;
+
+        let owner = self.trees.iter().position(|tree| tree.files.contains_key(path));
+        let forced: BTreeSet<usize> = match (owner, source) {
+            (Some(owner), Some(text)) => {
+                let signature = self.trees[owner].signatures.get(path);
+                if signature == Some(&module_tree::mod_signature(text)) {
+                    return None;
+                }
+                BTreeSet::from([owner])
+            }
+            (Some(owner), None) => BTreeSet::from([owner]),
+            (None, Some(_)) => {
+                (0..self.trees.len()).filter(|&index| self.trees[index].pending.contains(path)).collect()
+            }
+            (None, None) => BTreeSet::new(),
+        };
+        if forced.is_empty() {
+            return None;
+        }
+
+        let before = facts::RustFacts::of(self);
+        self.rescan(&forced);
+        let after = facts::RustFacts::of(self);
+        match facts::delta(&before, &after) {
+            ResolutionDelta::Unchanged => None,
+            ResolutionDelta::Affected { mut files, imports } => {
+                files.retain(|scope| scope.under != path.as_str());
+                if files.is_empty() && imports.is_empty() {
+                    None
+                } else {
+                    Some(ResolutionDelta::Affected { files, imports })
+                }
+            }
+            unknown @ ResolutionDelta::Unknown { .. } => Some(unknown),
+        }
+    }
+
+    /// Re-scans every crate in `forced`, then every later crate whose own
+    /// scan the change can reach: one that claimed, lost or is waiting for a
+    /// file whose claim moved. A crate's scan depends only on the disk and
+    /// on the files earlier crates claimed, so crates before the first
+    /// forced one are kept as they are.
+    fn rescan(&mut self, forced: &BTreeSet<usize>) {
+        let Some(&first) = forced.first() else { return };
+        let mut taken: BTreeSet<RelPath> =
+            self.trees[..first].iter().flat_map(|tree| tree.files.keys().cloned()).collect();
+        let mut moved: BTreeSet<RelPath> = BTreeSet::new();
+        for index in first..self.trees.len() {
+            let old = &self.trees[index];
+            let reached = |path: &RelPath| {
+                old.files.contains_key(path) || old.lost.contains(path) || old.pending.contains(path)
+            };
+            if forced.contains(&index) || moved.iter().any(reached) {
+                let krate = &self.crates[index];
+                let new = module_tree::scan_crate(&self.root, &krate.key, krate.root.clone(), &taken);
+                let old_claims: BTreeSet<&RelPath> = old.files.keys().collect();
+                let new_claims: BTreeSet<&RelPath> = new.files.keys().collect();
+                moved.extend(old_claims.symmetric_difference(&new_claims).map(|path| (*path).clone()));
+                self.trees[index] = new;
+            }
+            taken.extend(self.trees[index].files.keys().cloned());
+        }
+        self.rebuild();
     }
 
     /// Every crate this project model found, in the order their `Cargo.toml`
@@ -301,6 +421,25 @@ impl ProjectContext {
     /// own field doc.
     pub fn notes(&self) -> &[String] {
         &self.notes
+    }
+}
+
+/// One entry of [`ProjectContext`]'s `note_layout`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoteSlot {
+    /// A note of the manifest pass.
+    Text(String),
+    /// The scan notes of the crate at this index.
+    Crate(usize),
+}
+
+/// `load`'s notes as it records them.
+#[derive(Default)]
+struct NoteLayout(Vec<NoteSlot>);
+
+impl NoteLayout {
+    fn push(&mut self, note: String) {
+        self.0.push(NoteSlot::Text(note));
     }
 }
 
@@ -633,5 +772,244 @@ mod tests {
             reloaded.container_for(&RelPath::new("crates/beta/src/main.rs")),
             ContainerInfo::Orphan { .. }
         ));
+    }
+
+    // --- GM-507: a source save re-scans the module tree -------------------
+    //
+    // `ProjectContext::source_changed`. Design:
+    // `docs/architecture/gm-507-rust-module-tree-refresh.md`, section 5.
+
+    use g_mesh_plugin_sdk::wire::ResolutionDelta;
+
+    /// One package `alpha` whose `lib.rs` declares `a`.
+    fn alpha() -> Tree {
+        let tree = Tree::new("source-changed");
+        tree.write("Cargo.toml", "[package]\nname = \"alpha\"\n");
+        tree.write("src/lib.rs", "pub mod a;\n");
+        tree.write("src/a.rs", "pub fn f() {}\n");
+        tree
+    }
+
+    /// Writes `text` to `path` and hands it to the model, as the SDK does on
+    /// that file's `fileChanged`.
+    fn save(context: &mut ProjectContext, tree: &Tree, path: &str, text: &str) -> Option<ResolutionDelta> {
+        tree.write(path, text);
+        context.source_changed(&RelPath::new(path), Some(text))
+    }
+
+    /// Deletes `path` and tells the model, as the SDK does.
+    fn delete(context: &mut ProjectContext, tree: &Tree, path: &str) -> Option<ResolutionDelta> {
+        tree.remove(path);
+        context.source_changed(&RelPath::new(path), None)
+    }
+
+    /// The file scopes of an `Affected` delta.
+    fn scoped(delta: &Option<ResolutionDelta>) -> Vec<String> {
+        match delta {
+            Some(ResolutionDelta::Affected { files, .. }) => {
+                files.iter().map(|scope| scope.under.clone()).collect()
+            }
+            other => panic!("expected an affected delta, got {other:?}"),
+        }
+    }
+
+    fn key_of(context: &ProjectContext, path: &str) -> String {
+        match context.container_for(&RelPath::new(path)) {
+            ContainerInfo::Member { key, .. } | ContainerInfo::Orphan { key } => key,
+        }
+    }
+
+    /// Behaviour 6: the updated model is the one a cold `load` builds.
+    fn assert_equals_load(context: &ProjectContext, tree: &Tree) {
+        assert_eq!(
+            *context,
+            ProjectContext::load(&tree.0).unwrap(),
+            "the updated model differs from a cold load"
+        );
+    }
+
+    /// Behaviour 1: the child file exists first (an orphan); the parent's
+    /// save adding `mod child;` places it and names it in the delta, without
+    /// naming the saved file itself.
+    ///
+    /// Control: answer `None` when the signature differs (the `(Some(owner),
+    /// Some(text))` arm returns before `rescan`).
+    #[test]
+    fn a_child_file_then_its_mod_line_places_the_child() {
+        let tree = alpha();
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+        tree.write("src/child.rs", "pub fn c() {}\n");
+        assert_eq!(context.source_changed(&RelPath::new("src/child.rs"), Some("pub fn c() {}\n")), None);
+        assert_eq!(key_of(&context, "src/child.rs"), "orphan:src/child.rs");
+
+        let delta = save(&mut context, &tree, "src/lib.rs", "pub mod a;\npub mod child;\n");
+
+        assert_eq!(
+            context.container_for(&RelPath::new("src/child.rs")),
+            ContainerInfo::Member { key: "alpha::child".to_string(), parent: Some("alpha".to_string()) }
+        );
+        let files = scoped(&delta);
+        assert!(files.contains(&"src/child.rs".to_string()), "{delta:?}");
+        assert!(!files.contains(&"src/lib.rs".to_string()), "the saved file is not named: {delta:?}");
+        assert_equals_load(&context, &tree);
+    }
+
+    /// Behaviour 2: `mod child;` first (naming nothing yet), the file
+    /// second: the file's own save places it. The delta does not name the
+    /// file itself, which its own round trip extracts.
+    ///
+    /// Control: answer an empty `forced` set in the `(None, Some(_))` arm of
+    /// `source_changed` (the pending candidate is never re-scanned).
+    #[test]
+    fn a_mod_line_then_its_child_file_places_the_child() {
+        let tree = alpha();
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+        save(&mut context, &tree, "src/lib.rs", "pub mod a;\npub mod child;\n");
+        assert_eq!(key_of(&context, "src/child.rs"), "orphan:src/child.rs", "nothing on disk yet");
+
+        let delta = save(&mut context, &tree, "src/child.rs", "pub fn c() {}\n");
+
+        assert_eq!(key_of(&context, "src/child.rs"), "alpha::child");
+        if delta.is_some() {
+            assert!(!scoped(&delta).contains(&"src/child.rs".to_string()), "{delta:?}");
+        }
+        assert_equals_load(&context, &tree);
+    }
+
+    /// Behaviour 3: removing the `mod` item orphans the child and its own
+    /// child, and names both.
+    ///
+    /// Control: as for behaviour 1.
+    #[test]
+    fn removing_the_mod_item_orphans_the_child_subtree() {
+        let tree = alpha();
+        tree.write("src/lib.rs", "pub mod a;\npub mod child;\n");
+        tree.write("src/child.rs", "pub mod grand;\n");
+        tree.write("src/child/grand.rs", "pub fn g() {}\n");
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+        assert_eq!(key_of(&context, "src/child/grand.rs"), "alpha::child::grand");
+
+        let delta = save(&mut context, &tree, "src/lib.rs", "pub mod a;\n");
+
+        assert_eq!(key_of(&context, "src/child.rs"), "orphan:src/child.rs");
+        assert_eq!(key_of(&context, "src/child/grand.rs"), "orphan:src/child/grand.rs");
+        let files = scoped(&delta);
+        for path in ["src/child.rs", "src/child/grand.rs"] {
+            assert!(files.contains(&path.to_string()), "{path}: {delta:?}");
+        }
+        assert_equals_load(&context, &tree);
+    }
+
+    /// Behaviour 4: deleting a module file orphans what it declared, and
+    /// names it.
+    ///
+    /// Control: answer `None` in the `(Some(owner), None)` arm of
+    /// `source_changed`.
+    #[test]
+    fn deleting_a_module_file_orphans_its_children() {
+        let tree = alpha();
+        tree.write("src/lib.rs", "pub mod a;\npub mod child;\n");
+        tree.write("src/child.rs", "pub mod grand;\n");
+        tree.write("src/child/grand.rs", "pub fn g() {}\n");
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+
+        let delta = delete(&mut context, &tree, "src/child.rs");
+
+        assert_eq!(key_of(&context, "src/child/grand.rs"), "orphan:src/child/grand.rs");
+        assert!(scoped(&delta).contains(&"src/child/grand.rs".to_string()), "{delta:?}");
+        assert_equals_load(&context, &tree);
+    }
+
+    /// Behaviour 5: a save keeping every `mod` item answers `None` from the
+    /// text alone. The disk here already holds a new `mod child;` and its
+    /// file; the model does not read it.
+    ///
+    /// Control: drop the signature comparison in the `(Some(owner),
+    /// Some(text))` arm (the disk is re-scanned and `child` placed).
+    #[test]
+    fn a_save_keeping_the_mod_items_changes_nothing_and_reads_no_disk() {
+        let tree = alpha();
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+        let before = context.clone();
+        tree.write("src/lib.rs", "pub mod a;\npub mod child;\n");
+        tree.write("src/child.rs", "");
+
+        let delta = context
+            .source_changed(&RelPath::new("src/lib.rs"), Some("pub mod a;\n// edited\npub fn x() {}\n"));
+
+        assert_eq!(delta, None);
+        assert_eq!(context, before, "the model is untouched");
+    }
+
+    /// Owner decision after S5: a re-scan reaches a later crate sharing a
+    /// file the earlier one claimed. `lib.rs` (`toollib`) and `main.rs`
+    /// (`tool`) both declare `mod util;`; the lib claims it. Removing the
+    /// lib's `mod util;` hands `util.rs` to the bin, and restoring it hands it
+    /// back, each time equal to a cold load.
+    ///
+    /// Control: re-scan only `forced` crates in `ProjectContext::rescan`
+    /// (drop `|| moved.iter().any(reached)`): `util.rs` stays an orphan.
+    #[test]
+    fn a_later_crate_sharing_a_file_is_re_scanned_too() {
+        let tree = Tree::new("shared-file");
+        tree.write("Cargo.toml", "[package]\nname = \"tool\"\n\n[lib]\nname = \"toollib\"\n");
+        tree.write("src/lib.rs", "mod util;\n");
+        tree.write("src/main.rs", "mod util;\n");
+        tree.write("src/util.rs", "pub fn u() {}\n");
+        let mut context = ProjectContext::load(&tree.0).unwrap();
+        let keys: Vec<&str> = context.crates().iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, vec!["toollib", "tool"]);
+        assert_eq!(key_of(&context, "src/util.rs"), "toollib::util");
+
+        let delta = save(&mut context, &tree, "src/lib.rs", "");
+        assert_eq!(key_of(&context, "src/util.rs"), "tool::util");
+        assert!(scoped(&delta).contains(&"src/util.rs".to_string()), "{delta:?}");
+        assert_equals_load(&context, &tree);
+
+        save(&mut context, &tree, "src/lib.rs", "mod util;\n");
+        assert_eq!(key_of(&context, "src/util.rs"), "toollib::util");
+        assert_equals_load(&context, &tree);
+    }
+
+    /// Note section 3.4: the cost of one crate re-scan on g-mesh's own
+    /// `core` crate, against a cold `load` of the whole workspace. Run by
+    /// hand (`--run-ignored only`); prints, asserts only that the probe
+    /// re-scanned.
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_the_core_crate_re_scan() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let lib = RelPath::new("core/src/lib.rs");
+        let text = std::fs::read_to_string(root.join(lib.as_str())).unwrap();
+        let probe = format!("{text}\nmod gm507_probe_never_on_disk;\n");
+        let started = std::time::Instant::now();
+        let mut context = ProjectContext::load(&root).unwrap();
+        let load = started.elapsed();
+        let files = context.files.len();
+        // The re-scan reads the disk, which never holds the probe, so every
+        // probe save differs from the stored signature and re-scans.
+        let mut rescans = Vec::new();
+        for _ in 0..10 {
+            let started = std::time::Instant::now();
+            context.source_changed(&lib, Some(&probe));
+            rescans.push(started.elapsed());
+        }
+        rescans.sort();
+        let started = std::time::Instant::now();
+        assert_eq!(context.source_changed(&lib, Some(&text)), None);
+        let unchanged = started.elapsed();
+        assert!(
+            context.trees.iter().any(|tree| tree.signatures.contains_key(&lib)),
+            "core/src/lib.rs is modeled"
+        );
+        println!(
+            "GM507-MEASURE core re-scan: load {:?} ({files} files, {} crates); re-scan min {:?} median {:?} max {:?}; unchanged save {:?}",
+            load,
+            context.crates.len(),
+            rescans[0],
+            rescans[rescans.len() / 2],
+            rescans[rescans.len() - 1],
+            unchanged
+        );
     }
 }

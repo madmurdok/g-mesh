@@ -29,6 +29,14 @@
 //!
 //! The fallback runs after the exclusive section ends, because
 //! `workspace_reindex::run` takes the same lock.
+//!
+//! A source edit can change resolution too (GM-507: a Rust `mod` line places
+//! a module file). Its plugin answers the `fileChanged` with `affected`, and
+//! `watcher::apply` expands it with [`select`] (the same selection and
+//! threshold) and re-extracts inside that file change's own exclusive
+//! section. Its files are recorded in `reextract_owed_files` before the
+//! loop, not `pending_reindex`; [`resume_owed_reextracts`] finishes them
+//! after a kill.
 
 use std::collections::BTreeSet;
 
@@ -137,17 +145,14 @@ fn selective(
             Ok(Outcome::Fallback(format!("the plugin cannot tell what changed ({reason})")))
         }
         ResolutionDelta::Affected { files, imports } => {
-            let (selected, indexed) = store.with(|conn| select_affected(conn, language, &files, &imports))?;
-            if selected.is_empty() {
-                store.with(|conn| schema::set_resolution_facts(conn, language, facts.as_deref()))?;
-                return Ok(Outcome::Unchanged);
-            }
-            if selected.len() * 100 > indexed * FALLBACK_SHARE_PERCENT {
-                return Ok(Outcome::Fallback(format!(
-                    "the edit affects {} of {indexed} file(s), more than {FALLBACK_SHARE_PERCENT}%",
-                    selected.len()
-                )));
-            }
+            let selected = match store.with(|conn| select(conn, language, &files, &imports, None))? {
+                Selection::Nothing => {
+                    store.with(|conn| schema::set_resolution_facts(conn, language, facts.as_deref()))?;
+                    return Ok(Outcome::Unchanged);
+                }
+                Selection::TooMany(why) => return Ok(Outcome::Fallback(why)),
+                Selection::Files(selected) => selected,
+            };
             reextract(
                 process,
                 store,
@@ -160,6 +165,45 @@ fn selective(
             )
         }
     }
+}
+
+/// What a resolution delta selects for a re-extract.
+#[derive(Debug)]
+pub(crate) enum Selection {
+    /// No indexed file.
+    Nothing,
+    /// More than [`FALLBACK_SHARE_PERCENT`] of the language's indexed files:
+    /// the whole-language reindex is owed, for this reason.
+    TooMany(String),
+    /// These files, few enough to re-extract one by one.
+    Files(BTreeSet<String>),
+}
+
+/// [`select_affected`] with the threshold applied, leaving out `trigger`
+/// (a source edit's own file, extracted by the round trip that answered the
+/// delta). The share counts the trigger out of the selection but not out of
+/// the indexed files.
+pub(crate) fn select(
+    conn: &Connection,
+    language: &str,
+    files: &[PathScope],
+    imports: &[ImportSelector],
+    trigger: Option<&str>,
+) -> Result<Selection> {
+    let (mut selected, indexed) = select_affected(conn, language, files, imports)?;
+    if let Some(trigger) = trigger {
+        selected.remove(trigger);
+    }
+    if selected.is_empty() {
+        return Ok(Selection::Nothing);
+    }
+    if selected.len() * 100 > indexed * FALLBACK_SHARE_PERCENT {
+        return Ok(Selection::TooMany(format!(
+            "the edit affects {} of {indexed} file(s), more than {FALLBACK_SHARE_PERCENT}%",
+            selected.len()
+        )));
+    }
+    Ok(Selection::Files(selected))
 }
 
 /// The indexed files of `language` that `files` or `imports` select, and how
@@ -306,6 +350,77 @@ fn reextract(
         })
         .with_context(|| format!("failed to store {language}'s resolution facts"))?;
     Ok(Outcome::Reextracted(selected.len()))
+}
+
+/// Re-extracts the files a source edit's re-extract loop (GM-507,
+/// `watcher::apply`) recorded as owed and did not finish: a daemon killed
+/// mid-loop leaves their rows, which hold the module placement of before
+/// the edit. Called once at start, after
+/// `workspace_reindex::resume_pending` (whose swap clears a reindexed
+/// language's rows). Per language: each file is re-extracted, one semantic
+/// pass covers them, and the rows are cleared; a failure falls back to the
+/// whole-language reindex, whose swap clears them. Rows of a language no
+/// discovered plugin serves are dropped.
+pub(crate) fn resume_owed_reextracts(registry: &PluginRegistry, store: &IndexStore) {
+    let owed = match store.with(schema::owed_reextracts) {
+        Ok(owed) => owed,
+        Err(err) => {
+            crate::log_line!("g-mesh daemon: could not read the interrupted re-extracts ({err:#})");
+            return;
+        }
+    };
+    for (language, trigger, files) in owed {
+        if !registry.has_manifest(&language) {
+            if let Err(err) = store.with(|conn| schema::clear_owed_reextracts(conn, &language)) {
+                crate::log_line!("g-mesh daemon: could not drop {language}'s owed re-extracts ({err:#})");
+            }
+            continue;
+        }
+        crate::log_line!(
+            "g-mesh daemon: re-extracting {} {language} file(s) an interrupted run owed after {trigger} changed",
+            files.len()
+        );
+        let supervisor = match registry.get_or_spawn(&language) {
+            Ok(supervisor) => supervisor,
+            Err(err) => {
+                crate::log_line!(
+                    "g-mesh daemon: could not start the {language} plugin to finish its owed re-extracts \
+                     ({err:#}) - they are retried at the next start"
+                );
+                continue;
+            }
+        };
+        let semantic_pass =
+            supervisor.manifest().capabilities.semantic_pass && !supervisor.is_semantic_suspended();
+        let embedding = registry.embedding();
+        let finished = supervisor.with_awake_exclusive_access(|process| -> Result<()> {
+            for file_path in &files {
+                process
+                    .reextract(store, file_path, embedding)
+                    .with_context(|| format!("re-extracting {file_path} failed"))?;
+            }
+            if semantic_pass {
+                if let Err(err) = process.scoped_semantic_pass(store, files.clone(), embedding) {
+                    crate::log_line!(
+                        "g-mesh daemon: the semantic pass over {language}'s owed re-extracts failed ({err:#}) - \
+                         their edges keep whatever the structural pass resolved"
+                    );
+                }
+            }
+            store.with(|conn| schema::settle_owed_reextracts(conn, &language, &files))
+        });
+        if let Err(err) = finished.and_then(|finished| finished) {
+            crate::log_line!(
+                "g-mesh daemon: reindexing all of {language}: its owed re-extracts did not finish ({err:#})"
+            );
+            if let Err(err) = workspace_reindex::run(registry, &supervisor, store, &trigger) {
+                crate::log_line!(
+                    "g-mesh daemon: failed to reindex {language} for its owed re-extracts ({err:#}) - \
+                     they are retried at the next start"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
