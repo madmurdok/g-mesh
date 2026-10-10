@@ -718,12 +718,17 @@ mod tests {
             ])
             .unwrap();
         let never_answered = || -> Vec<(String, usize)> {
-            crate::cli::status::index_status(project.path(), &db_path, &plugins)
-                .unwrap()
-                .semantic_leftovers
-                .into_iter()
-                .map(|leftover| (leftover.language, leftover.never_answered))
-                .collect()
+            crate::cli::status::index_status(
+                project.path(),
+                &db_path,
+                &plugins,
+                crate::cli::status::Mode::Light,
+            )
+            .unwrap()
+            .semantic_leftovers
+            .into_iter()
+            .map(|leftover| (leftover.language, leftover.never_answered))
+            .collect()
         };
         assert!(never_answered().contains(&("typescript".to_string(), 2)), "{:?}", never_answered());
 

@@ -160,7 +160,9 @@ impl Extractor for RustExtractor {
 
     /// Re-scans the module tree when a save changes a file's `mod` items,
     /// deletes a module file, or creates a file a `mod` item named before it
-    /// existed; names the files that re-scan re-keyed and their importers.
+    /// existed, and reloads the project when a crate root a manifest names
+    /// is created or deleted; names the files that re-keyed and their
+    /// importers.
     fn source_changed(
         &self,
         project: &mut ProjectContext,

@@ -368,7 +368,8 @@ fn status_names_the_wedged_daemon_instead_of_reporting_nothing_running() {
     let project = Project::new();
     let pid = project.wedge();
 
-    let report = status::collect(project.root()).expect("status must not need a healthy daemon");
+    let report =
+        status::collect(project.root(), status::Mode::Light).expect("status must not need a healthy daemon");
 
     assert_eq!(report.core, CoreState::Wedged { pid });
     let rendered = status::render(&report);
