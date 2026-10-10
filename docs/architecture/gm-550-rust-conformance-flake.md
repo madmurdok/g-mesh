@@ -221,3 +221,9 @@ left files unfinished?**
   3. **Run one residual pass in the kit before judging (option C).** Benefit: judges
      the index a restart reaches. Risk: it acts as a retry and hides that a single
      daemon session serves a partial index.
+
+## Owner decision (2026-10-10)
+
+Q1: "Проваливать сессию (Recommended)": a whole-project semantic pass that leaves files
+unfinished fails the `session` check with its reason; the expectations are skipped.
+Fix = A (measured rust-analyzer warm-up) + B (kit fails the session on a residual pass).
