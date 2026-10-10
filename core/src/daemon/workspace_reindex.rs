@@ -61,13 +61,23 @@
 //! for any language, through a `.gitignore` change that altered its indexed
 //! files (`PluginRegistry::gitignore_changed`, GM-508).
 //!
+//! # Retry of a failed language
+//!
+//! [`retry_failed`] reuses the same staging walk and swap for a language the
+//! last full walk failed, on a daemon start that still owes it a retry
+//! (`daemon::activation`; bound and design:
+//! [ADR 0021](../../../docs/adr/0021-per-language-bulk-outcome.md)). Live
+//! holds none of the language's rows, so the swap adds it whole or not at all.
+//! Unlike a reindex, a retry records its walked files' `indexed_files`
+//! baselines: none of them has one yet.
+//!
 //! # Debounce
 //!
 //! None here: `daemon::watch_and_route_once` runs every settled path through
 //! `watcher::debounce::Debouncer` before it reaches `route_settled_path`, so a
 //! burst of saves to one workspace file is one call into this module.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -76,6 +86,7 @@ use crate::daemon::bulk_index::{self, WalkContext};
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::manifest::{self, PluginManifest};
 use crate::daemon::plugin;
+use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
 use crate::embedding::EmbedStats;
@@ -84,6 +95,7 @@ use crate::storage::index_store::IndexStore;
 use crate::storage::language_swap::{self, SwapBookkeeping};
 use crate::storage::schema;
 use crate::watcher::apply::SemanticPassOutcome;
+use crate::watcher::staleness;
 
 const STAGING_PREFIX: &str = "staging-";
 const STAGING_SUFFIX: &str = ".db";
@@ -210,25 +222,17 @@ pub(crate) fn run_with(
                      walks the language from scratch regardless"
                 );
             }
-            // The whole-project pass after the swap below is owed from here
-            // on; a plugin that asked to be told starts its engine while the
-            // language is re-walked.
-            if !supervisor.is_semantic_suspended() {
-                if let Err(err) = process.notify_prepare_semantic_pass() {
-                    crate::log_line!(
-                        "g-mesh daemon: could not tell the {language} plugin its semantic pass is owed ({err:#}) \
-                         - it starts its engine when the pass is asked instead"
-                    );
-                }
-            }
         }
+        prepare_semantic_pass(supervisor, process, language);
         store
             .with(|conn| schema::mark_pending_reindex(conn, language, changed_file))
             .with_context(|| format!("failed to mark {language}'s reindex as pending"))?;
         remove_staging(&staging);
-        let rebuilt = rebuild(registry, store, &manifest, &staging, at);
+        let rebuilt = rebuild(registry, store, &manifest, &staging, Rebuild::Reindex, at);
         remove_staging(&staging);
-        rebuilt.with_context(|| format!("failed to reindex {language} after {changed_file} changed"))
+        rebuilt
+            .map(|rebuilt| rebuilt.embed_stats)
+            .with_context(|| format!("failed to reindex {language} after {changed_file} changed"))
     })?;
     // Outside the locked phase: it may trim the embedding cache.
     registry.embedding().finish_unit(
@@ -237,7 +241,37 @@ pub(crate) fn run_with(
         started.elapsed(),
     );
     at(Stage::Swapped);
+    semantic_pass_after_swap(registry, supervisor, store, &manifest, "a workspace reindex");
+    Ok(())
+}
 
+/// Tells an awake plugin that the whole-project pass after the swap is owed
+/// from now on, so a plugin that asked to be told starts its engine while
+/// the language is re-walked.
+fn prepare_semantic_pass(supervisor: &PluginSupervisor, process: Option<&PluginProcess>, language: &str) {
+    let Some(process) = process else { return };
+    if supervisor.is_semantic_suspended() {
+        return;
+    }
+    if let Err(err) = process.notify_prepare_semantic_pass() {
+        crate::log_line!(
+            "g-mesh daemon: could not tell the {language} plugin its semantic pass is owed ({err:#}) \
+             - it starts its engine when the pass is asked instead"
+        );
+    }
+}
+
+/// The whole-project semantic pass of `manifest`'s language after its swap
+/// (`after` names what swapped it in, for the log), and the project-wide
+/// semantic-pass roll-up. Best-effort: a failure is recorded and logged.
+fn semantic_pass_after_swap(
+    registry: &PluginRegistry,
+    supervisor: &PluginSupervisor,
+    store: &IndexStore,
+    manifest: &PluginManifest,
+    after: &str,
+) {
+    let language = manifest.language.as_str();
     if manifest.capabilities.semantic_pass {
         let file_count = semantic::indexed_file_count(store, language);
         // The swap cleared any residual record, so this is always a
@@ -252,8 +286,7 @@ pub(crate) fn run_with(
                 });
                 if let Err(err) = recorded {
                     crate::log_line!(
-                        "g-mesh daemon: failed to record {language}'s semantic pass after a workspace \
-                         reindex ({err:#})"
+                        "g-mesh daemon: failed to record {language}'s semantic pass after {after} ({err:#})"
                     );
                     semantic::record_failure(store, language, &err);
                 }
@@ -265,13 +298,13 @@ pub(crate) fn run_with(
             // residual by the pass (`watcher::apply`); the next daemon start
             // asks only those files.
             Ok(Some(SemanticPassOutcome::Residual { left })) => crate::log_line!(
-                "g-mesh daemon: the {language} semantic pass after a workspace reindex left {left} file(s) \
+                "g-mesh daemon: the {language} semantic pass after {after} left {left} file(s) \
                  unfinished - the next start asks only those"
             ),
             Ok(None) => semantic::record_not_run(store, language),
             Err(err) => {
                 crate::log_line!(
-                    "g-mesh daemon: the {language} semantic pass after a workspace reindex failed ({err:#}) - \
+                    "g-mesh daemon: the {language} semantic pass after {after} failed ({err:#}) - \
                      its edges keep whatever the structural pass resolved"
                 );
                 semantic::record_failure(store, language, &err);
@@ -285,8 +318,81 @@ pub(crate) fn run_with(
             );
         }
     }
+}
 
+/// Re-walks `supervisor`'s language, which the last full walk failed, and
+/// swaps it in whole, as [`run`] does except that it sends no
+/// `workspaceChanged`, marks no `pending_reindex` row (a retry killed half
+/// way is the next start's retry, within its bound) and stores no vectors
+/// (the embedding backfill that follows embeds them). The swap records the
+/// language `indexed` and drops its retry count. Then the walked files get
+/// their staleness baselines, the language's files are routed again
+/// (`PluginRegistry::clear_failed_language`) and its semantic pass runs.
+///
+/// `walk_started` must be taken before the language's plugin was spawned
+/// (see `staleness::record_walk_baselines`). `Err` only when nothing was
+/// swapped in: live is then as it was.
+pub(crate) fn retry_failed(
+    registry: &PluginRegistry,
+    supervisor: &PluginSupervisor,
+    store: &IndexStore,
+    walk_started: std::time::SystemTime,
+) -> Result<()> {
+    let manifest = supervisor.manifest().clone();
+    let language = manifest.language.as_str();
+    let staging = staging_path(registry.state_dir(), language);
+
+    let walked_files = supervisor.with_exclusive_access(|process| -> Result<BTreeSet<String>> {
+        prepare_semantic_pass(supervisor, process, language);
+        remove_staging(&staging);
+        let rebuilt = rebuild(registry, store, &manifest, &staging, Rebuild::Retry, &mut |_| {});
+        remove_staging(&staging);
+        rebuilt.map(|rebuilt| rebuilt.walked_files).with_context(|| format!("failed to retry {language}"))
+    })?;
+
+    // Before the language's files are routed again, so no query of an
+    // untouched file pays a synchronous reindex for want of a baseline.
+    match staleness::record_walk_baselines(
+        store,
+        registry.project_root(),
+        walked_files.iter().map(String::as_str),
+        walk_started,
+    ) {
+        Ok(baselines) if baselines.skipped > 0 => crate::log_line!(
+            "g-mesh daemon: {} of {} retried {language} files got no staleness baseline - each reindexes on \
+             its first query",
+            baselines.skipped,
+            walked_files.len()
+        ),
+        Ok(_) => {}
+        Err(err) => crate::log_line!(
+            "g-mesh daemon: could not record the retried {language} files' staleness baselines - each \
+             reindexes on its first query: {err:#}"
+        ),
+    }
+    registry.clear_failed_language(language);
+
+    semantic_pass_after_swap(registry, supervisor, store, &manifest, "a retry");
     Ok(())
+}
+
+/// What [`rebuild`] does besides walking, planning and swapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebuild {
+    /// A workspace reindex: the texts the plan finds changed are embedded
+    /// before the swap.
+    Reindex,
+    /// A daemon start's retry of a failed language: the walked files are
+    /// collected for their baselines, no vector is computed, and the swap
+    /// records the language `indexed`.
+    Retry,
+}
+
+/// What [`rebuild`] returns.
+struct Rebuilt {
+    embed_stats: EmbedStats,
+    /// The files the walk parsed; empty unless [`Rebuild::Retry`].
+    walked_files: BTreeSet<String>,
 }
 
 /// Walks `manifest`'s language into the staging index at `staging`, plans the
@@ -296,8 +402,9 @@ fn rebuild(
     store: &IndexStore,
     manifest: &PluginManifest,
     staging: &Path,
+    kind: Rebuild,
     at: &mut dyn FnMut(Stage),
-) -> Result<EmbedStats> {
+) -> Result<Rebuilt> {
     let language = manifest.language.as_str();
     let live_path = store.file_path().context("a workspace reindex needs a file-backed index")?;
     let live_path = live_path.to_str().context("the index path is not valid UTF-8")?;
@@ -305,12 +412,17 @@ fn rebuild(
     // Links as the live store does: the same discovered plugins' rules.
     let staged =
         IndexStore::new(connection::open_staging(staging)?).with_link_rules(store.link_rules().clone());
-    // No `walked_files`, so no baselines (see the module doc on
-    // `indexed_files`), and no embedding: only the texts the plan finds
-    // changed are embedded.
+    // A reindex collects no `walked_files`, so no baselines (see the module
+    // doc on `indexed_files`); a retry adds a whole language, whose files
+    // have none yet. No embedding during the walk: only the texts the plan
+    // finds changed are embedded.
     let mut ctx = WalkContext::new(&staged);
+    if kind == Rebuild::Retry {
+        ctx.walked_files = Some(BTreeSet::new());
+    }
     bulk_index::walk_one_language(registry.project_root(), manifest, &mut ctx)
         .with_context(|| format!("failed to walk {language} into the staging index"))?;
+    let walked_files = ctx.walked_files.take().unwrap_or_default();
     staged.link_all().context("failed to link the staging index")?;
     at(Stage::Walked);
 
@@ -331,18 +443,26 @@ fn rebuild(
     )?;
     drop(staged);
     let mut stats = EmbedStats::default();
-    let computed = embedding.compute(&plan.to_embed, &mut stats);
+    let computed = match kind {
+        Rebuild::Reindex => embedding.compute(&plan.to_embed, &mut stats),
+        Rebuild::Retry => Vec::new(),
+    };
     at(Stage::Planned);
 
     let semantic_pass_languages: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
     let fingerprint = plugin::fingerprint(manifest);
+    let vectors = match kind {
+        Rebuild::Reindex => Some((embedding.as_ref(), computed.as_slice())),
+        Rebuild::Retry => None,
+    };
     store.swap_language(
         staging,
-        Some((embedding.as_ref(), computed.as_slice())),
+        vectors,
         &SwapBookkeeping {
             language,
             plugin_fingerprint: &fingerprint,
             semantic_pass_languages: &semantic_pass_languages,
+            retried: kind == Rebuild::Retry,
         },
     )?;
     let counts = plan.counts;
@@ -360,7 +480,7 @@ fn rebuild(
         counts.pending_files,
         counts.keep_nodes
     );
-    Ok(stats)
+    Ok(Rebuilt { embed_stats: stats, walked_files })
 }
 
 #[cfg(test)]
@@ -2090,5 +2210,72 @@ mod tests {
         semantic::run_with_registry(&registry, &conn);
 
         assert_eq!(semantic_pending_counts(&conn.lock().unwrap()), (0, 0), "the retry pass cleared it");
+    }
+
+    // -----------------------------------------------------------------
+    // The retry of a language the last full walk failed.
+    // -----------------------------------------------------------------
+
+    /// `alpha` recorded failed by the last walk, its first retry counted and
+    /// the registry not routing it, as a daemon start finds it.
+    fn alpha_failed_and_counted(registry: &PluginRegistry, conn: &IndexStore) {
+        let outcomes = std::collections::BTreeMap::from([(
+            "alpha".to_string(),
+            crate::languages::LanguageOutcome::Failed { error: "the walk failed".to_string() },
+        )]);
+        conn.with(|conn| schema::record_language_outcomes(conn, &outcomes)).unwrap();
+        conn.with(|conn| schema::begin_language_retry(conn, "alpha")).unwrap();
+        registry.set_failed_languages(["alpha".to_string()]);
+    }
+
+    fn alpha_outcome(conn: &IndexStore) -> crate::languages::LanguageOutcome {
+        conn.with(schema::language_outcomes).unwrap().into_iter().find(|(l, _)| l == "alpha").unwrap().1
+    }
+
+    /// A retry swaps the language in or leaves everything as it was: a walk
+    /// that fails changes nothing (outcome `failed`, the retry still counted,
+    /// not routed, no rows); one that succeeds records `indexed`, drops the
+    /// count and routes the language, in the swap. It embeds nothing and
+    /// stores no vector even for texts a reindex would embed: the backfill
+    /// after it does.
+    ///
+    /// Controls: in `rebuild`, compute and pass the vectors for
+    /// `Rebuild::Retry` as for `Rebuild::Reindex` (2 embeds, both vectors
+    /// stored); drop `record_language_retry_succeeded` from
+    /// `language_swap::swap_attached` (the outcome stays `failed`).
+    #[test]
+    fn a_retry_swaps_the_language_in_whole_without_vectors_or_changes_nothing() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, false);
+        give_text(project.path(), "alpha-n1", "Does the first thing.");
+        give_text(project.path(), "alpha-n2", "Does the second thing.");
+        alpha_failed_and_counted(&registry, &conn);
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+
+        test_plugin::set_bulk_stream(
+            project.path(),
+            "alpha",
+            &[json(&wire_node("alpha-n3", "src/a.alpha-src"))],
+            1,
+        );
+        let failed = retry_failed(&registry, &supervisor, &conn, std::time::SystemTime::now());
+
+        assert!(failed.is_err(), "a walk that exits non-zero fails the retry");
+        assert!(matches!(alpha_outcome(&conn), crate::languages::LanguageOutcome::Failed { .. }));
+        assert_eq!(conn.with(schema::language_retries).unwrap().get("alpha"), Some(&1));
+        assert!(registry.is_failed_language("alpha"), "a failed retry leaves the language unrouted");
+        assert_eq!(count(&conn.lock().unwrap(), "SELECT COUNT(*) FROM nodes WHERE language = 'alpha'"), 0);
+
+        // The fake plugin's own stream again: alpha-n1 and alpha-n2, with texts.
+        std::fs::remove_file(project.path().join(".alpha-bulk.ndjson")).unwrap();
+        retry_failed(&registry, &supervisor, &conn, std::time::SystemTime::now())
+            .expect("the retry succeeds");
+
+        assert!(matches!(alpha_outcome(&conn), crate::languages::LanguageOutcome::Indexed { files: _ }));
+        assert!(conn.with(schema::language_retries).unwrap().is_empty(), "the swap drops the count");
+        assert!(!registry.is_failed_language("alpha"), "the swapped-in language is routed");
+        assert_eq!(count(&conn.lock().unwrap(), "SELECT COUNT(*) FROM nodes WHERE language = 'alpha'"), 2);
+        assert_eq!(counters.embeds(), 0, "a retry embeds nothing");
+        assert_eq!((stored_vector(&conn, "alpha-n1"), stored_vector(&conn, "alpha-n2")), (None, None));
     }
 }

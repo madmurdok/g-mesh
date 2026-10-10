@@ -54,7 +54,7 @@ use crate::gc::warning;
 use crate::languages::LanguageOutcome;
 use crate::project_walk;
 use crate::storage::connection::project_dir;
-use crate::storage::schema::SemanticLeftover;
+use crate::storage::schema::{SemanticLeftover, MAX_LANGUAGE_RETRIES};
 use crate::watcher::staleness::mtime_millis;
 
 /// Whether a daemon core is serving this project.
@@ -241,6 +241,9 @@ pub struct LanguagesReport {
     /// `language -> plugin_version` of every discovered plugin, or the
     /// discovery error (a malformed `plugin.toml`) on one line.
     pub installed: std::result::Result<BTreeMap<String, String>, String>,
+    /// Each failed language's automatic retries since the last full walk
+    /// (`storage::schema::language_retries`); a language with none is absent.
+    pub retries: BTreeMap<String, u32>,
 }
 
 /// One row of the languages block: a recorded outcome, or `None` for a
@@ -252,6 +255,8 @@ pub struct LanguageRow<'a> {
     /// The installed plugin's version; `None` when not installed or when
     /// discovery failed.
     pub plugin_version: Option<&'a str>,
+    /// The language's automatic retries since the last full walk.
+    pub retries: u32,
 }
 
 impl LanguagesReport {
@@ -269,12 +274,18 @@ impl LanguagesReport {
                 language,
                 outcome: Some(outcome),
                 plugin_version: version(language),
+                retries: self.retries.get(language).copied().unwrap_or(0),
             })
             .collect();
         if let Some(installed) = installed {
             for (language, plugin_version) in installed {
                 if !outcomes.iter().any(|(recorded, _)| recorded == language) {
-                    rows.push(LanguageRow { language, outcome: None, plugin_version: Some(plugin_version) });
+                    rows.push(LanguageRow {
+                        language,
+                        outcome: None,
+                        plugin_version: Some(plugin_version),
+                        retries: 0,
+                    });
                 }
             }
         }
@@ -399,6 +410,11 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
         let walk_live = matches!(live_phase, Some("walking" | "unindexed"));
         (index_status(project_root, &db_path, &plugins, mode)?, language_section(&db_path, walk_live)?)
     };
+    let retries = if matches!(section, LanguageSection::Recorded(_)) {
+        language_retries(&db_path)
+    } else {
+        BTreeMap::new()
+    };
     Ok(Report {
         mode,
         project_id,
@@ -412,7 +428,7 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
         phase,
         front,
         progress: daemon::read_progress_in(&state_dir),
-        languages: LanguagesReport { section, installed },
+        languages: LanguagesReport { section, installed, retries },
         project_root: project_root.to_path_buf(),
         state_dir,
     })
@@ -452,6 +468,27 @@ pub fn language_section(db_path: &Path, walk_live: bool) -> Result<LanguageSecti
     } else {
         LanguageSection::NoneRecorded
     })
+}
+
+/// Each language's automatic retries (`language_retry`), empty when the index
+/// has no such table yet or cannot be read: the count only adds to a failed
+/// line, so a failure to read it costs that clause, not the report.
+pub fn language_retries(db_path: &Path) -> BTreeMap<String, u32> {
+    let read = || -> Result<BTreeMap<String, u32>> {
+        let conn = open_index(db_path)?;
+        let has_table: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'language_retry')",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed to look for the language retry table")?;
+        if !has_table {
+            return Ok(BTreeMap::new());
+        }
+        crate::storage::schema::language_retries(&conn)
+    };
+    read().unwrap_or_default()
 }
 
 /// Opens an existing index for reading. Read-write without CREATE, for the
@@ -1013,7 +1050,20 @@ fn describe_language_row(row: &LanguageRow<'_>, discovery_failed: bool) -> Strin
             format!("indexed, {files} {unit}{}", version())
         }
         Some(LanguageOutcome::Failed { error }) => {
-            format!("failed{} - not in the index: {}", version(), crate::languages::error_on_one_line(error))
+            // Only an installed plugin is retried: a removed one changes the
+            // indexer version, and the next start re-walks everything.
+            let retry = match (discovery_failed, row.plugin_version) {
+                (false, Some(_)) if row.retries < MAX_LANGUAGE_RETRIES => {
+                    format!("; retry {} of {MAX_LANGUAGE_RETRIES} on the next start", row.retries + 1)
+                }
+                (false, Some(_)) => "; retries used up - run `g-mesh reindex`".to_string(),
+                _ => String::new(),
+            };
+            format!(
+                "failed{} - not in the index: {}{retry}",
+                version(),
+                crate::languages::error_on_one_line(error)
+            )
         }
         Some(LanguageOutcome::PluginAbsent { files }) => {
             if let Some(installed) = row.plugin_version {

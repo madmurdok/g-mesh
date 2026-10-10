@@ -33,6 +33,7 @@ fn creates_all_tables_and_indexes() {
             "edges",
             "indexed_files",
             "language_outcome",
+            "language_retry",
             "language_state",
             "meta",
             "nodes",
@@ -1407,4 +1408,108 @@ fn stored_generation_reads_the_recorded_generation_without_writing() {
         "the generation `ensure_current` recorded"
     );
     assert_eq!(stored_generation(&conn), Some((CURRENT_SCHEMA_VERSION.to_string(), GENERATION.to_string())));
+}
+
+/// Which failed languages a start retries: a `failed` one with fewer than
+/// [`MAX_LANGUAGE_RETRIES`] retries counted, and only if its plugin is
+/// discovered; never an indexed or absent one. Sorted.
+///
+/// Control: `<=` for `<` in `languages_owed_a_retry` (`go`, at the bound,
+/// is owed).
+#[test]
+fn a_start_owes_a_retry_only_to_a_discovered_failed_language_below_the_bound() {
+    use crate::languages::LanguageOutcome;
+    let conn = setup();
+    let failed = || LanguageOutcome::Failed { error: "x".to_string() };
+    record_language_outcomes(
+        &conn,
+        &outcomes_of(&[
+            ("go", failed()),
+            ("java", failed()),
+            ("python", failed()),
+            ("rust", failed()),
+            ("typescript", LanguageOutcome::Indexed { files: 0 }),
+            ("zig", LanguageOutcome::PluginAbsent { files: Some(1) }),
+        ]),
+    )
+    .unwrap();
+    for _ in 0..MAX_LANGUAGE_RETRIES {
+        begin_language_retry(&conn, "go").unwrap();
+    }
+    assert_eq!(begin_language_retry(&conn, "python").unwrap(), 1, "the first retry counts 1");
+
+    let owed = languages_owed_a_retry(&conn, &["go", "python", "rust", "typescript", "zig"]).unwrap();
+
+    assert_eq!(owed, ["python", "rust"], "go is at the bound, java is not discovered");
+    assert_eq!(
+        language_retries(&conn).unwrap(),
+        BTreeMap::from([("go".to_string(), MAX_LANGUAGE_RETRIES), ("python".to_string(), 1)])
+    );
+}
+
+/// An index from before the retry table, at the current schema, gains the
+/// table on `ensure_current` without a reset: the walk and its outcomes are
+/// kept, and the empty table owes the failed language its retries.
+///
+/// Control: drop `language_retry` from the schema DDL's `CREATE TABLE`s
+/// (reading the retries fails).
+#[test]
+fn an_index_without_the_retry_table_gains_it_without_a_reset() {
+    use crate::languages::LanguageOutcome;
+    let conn = setup();
+    assert!(ensure_current(&conn, GENERATION).unwrap(), "a fresh index is initialized");
+    record_bulk_index(&conn).unwrap();
+    record_language_outcomes(
+        &conn,
+        &outcomes_of(&[("python", LanguageOutcome::Failed { error: "x".to_string() })]),
+    )
+    .unwrap();
+    conn.execute("DROP TABLE language_retry", []).unwrap();
+
+    assert!(!ensure_current(&conn, GENERATION).unwrap(), "no reset, so no re-walk");
+
+    assert!(bulk_index_completed(&conn).unwrap(), "the walk is kept");
+    assert_eq!(language_outcomes(&conn).unwrap().len(), 1, "the outcomes are kept");
+    assert!(language_retries(&conn).unwrap().is_empty());
+    assert_eq!(languages_owed_a_retry(&conn, &["python"]).unwrap(), ["python"]);
+}
+
+/// A reset (schema mismatch) drops the retry counts with everything else.
+///
+/// Control: drop `DROP TABLE IF EXISTS language_retry` from `wipe` (the
+/// count survives the reset).
+#[test]
+fn a_reset_drops_the_language_retries() {
+    let conn = setup();
+    conn.execute(
+        "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, '12', ?1, CURRENT_TIMESTAMP)",
+        params![GENERATION],
+    )
+    .unwrap();
+    begin_language_retry(&conn, "python").unwrap();
+
+    assert!(ensure_current(&conn, GENERATION).unwrap(), "schema 12 is not current");
+
+    assert!(language_retries(&conn).unwrap().is_empty(), "the reset must drop the retry counts");
+}
+
+/// A full walk's outcomes clear every retry count, so a language that fails
+/// again gets its retries afresh.
+///
+/// Control: drop the `DELETE FROM language_retry` in
+/// `record_language_outcomes`.
+#[test]
+fn recording_a_walks_outcomes_clears_the_retry_counts() {
+    use crate::languages::LanguageOutcome;
+    let conn = setup();
+    begin_language_retry(&conn, "python").unwrap();
+    begin_language_retry(&conn, "python").unwrap();
+
+    record_language_outcomes(
+        &conn,
+        &outcomes_of(&[("python", LanguageOutcome::Failed { error: "x".to_string() })]),
+    )
+    .unwrap();
+
+    assert!(language_retries(&conn).unwrap().is_empty());
 }

@@ -403,6 +403,10 @@ pub struct SwapBookkeeping<'a> {
     /// The languages whose manifests declare a semantic pass, for the
     /// semantic-pass roll-up.
     pub semantic_pass_languages: &'a std::collections::HashSet<String>,
+    /// The swap is a daemon start's retry of a language the last full walk
+    /// failed: its outcome becomes `indexed` and its retry count goes, in the
+    /// same transaction as its rows.
+    pub retried: bool,
 }
 
 /// Applies the plan in the staging file at `staging_path` to `live`, in one
@@ -411,8 +415,9 @@ pub struct SwapBookkeeping<'a> {
 /// removed and `vectors` stored, `language_state` of the language written
 /// (walked now, semantic pass owed), both meta roll-ups reconciled, the
 /// language's `pending_reindex` row removed, its resolution facts replaced by
-/// staging's and, for a language with a semantic pass, its semantic-pending
-/// rows written. A failure rolls all of it
+/// staging's, for a language with a semantic pass, its semantic-pending
+/// rows written and, for a retry ([`SwapBookkeeping::retried`]), its outcome
+/// recorded `indexed` and its retry count dropped. A failure rolls all of it
 /// back. Returns the ids of the placeholders the plan kept.
 pub fn swap(
     live: &mut Connection,
@@ -535,7 +540,7 @@ fn swap_attached(
         embedding.store(&tx, computed);
     }
 
-    let SwapBookkeeping { language, plugin_fingerprint, semantic_pass_languages } = bookkeeping;
+    let SwapBookkeeping { language, plugin_fingerprint, semantic_pass_languages, retried } = bookkeeping;
     tx.execute(
         "INSERT INTO language_state (language, bulkIndexedAt, pluginFingerprint, semanticPassAt)
          VALUES (?1, CURRENT_TIMESTAMP, ?2, NULL)
@@ -582,6 +587,9 @@ fn swap_attached(
         .with_context(|| format!("failed to clear {language}'s pending reindex"))?;
     // The walk re-extracted every file a source edit left owed (GM-507).
     schema::clear_owed_reextracts(&tx, language)?;
+    if *retried {
+        schema::record_language_retry_succeeded(&tx, language)?;
+    }
 
     let kept: Vec<String> = tx
         .prepare("SELECT id FROM staging.plan_keep_nodes ORDER BY id")
@@ -699,6 +707,7 @@ mod tests {
                 language: "rust",
                 plugin_fingerprint: "fp",
                 semantic_pass_languages: &capable,
+                retried: false,
             },
         )
         .unwrap();
@@ -806,7 +815,12 @@ mod tests {
     }
 
     fn bookkeeping<'a>(capable: &'a HashSet<String>) -> SwapBookkeeping<'a> {
-        SwapBookkeeping { language: "rust", plugin_fingerprint: "fp", semantic_pass_languages: capable }
+        SwapBookkeeping {
+            language: "rust",
+            plugin_fingerprint: "fp",
+            semantic_pass_languages: capable,
+            retried: false,
+        }
     }
 
     /// A committed swap of a semantic-pass language writes its pending row

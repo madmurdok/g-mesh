@@ -1191,7 +1191,11 @@ fn a_project_with_no_suspension_marker_reports_none() {
 /// A report around `index`, with no daemon running.
 /// A languages section with nothing recorded, for fixtures about other lines.
 fn no_languages() -> LanguagesReport {
-    LanguagesReport { section: LanguageSection::NoIndex, installed: Ok(BTreeMap::new()) }
+    LanguagesReport {
+        section: LanguageSection::NoIndex,
+        installed: Ok(BTreeMap::new()),
+        retries: BTreeMap::new(),
+    }
 }
 
 fn report_with(index: IndexStatus) -> Report {
@@ -1354,6 +1358,7 @@ fn languages_report(section: LanguageSection, installed: &[(&str, &str)]) -> Rep
     report.languages = LanguagesReport {
         section,
         installed: Ok(installed.iter().map(|(l, v)| (l.to_string(), v.to_string())).collect()),
+        retries: BTreeMap::new(),
     };
     report
 }
@@ -1604,4 +1609,78 @@ fn language_section_tells_every_index_state_apart() {
         language_section(&fixture.db_path(), false).unwrap(),
         LanguageSection::PredatesOutcomes { schema_version: Some("12".to_string()) }
     );
+}
+
+/// A failed language whose plugin is installed says its retry state: the
+/// retry the next start makes, or that the retries are used up; one whose
+/// plugin is gone says neither (a removed plugin re-walks everything). In
+/// JSON, `retries`/`maxRetries` only beside an installed plugin.
+///
+/// Controls: drop the retry clause in `describe_language_row` (the text
+/// assertions fail); add `retries` regardless of `plugin_version` in
+/// `json::outcome` (go's entry gains the keys).
+#[test]
+fn a_failed_language_says_its_retry_state_only_when_its_plugin_is_installed() {
+    let failed = |error: &str| LanguageOutcome::Failed { error: error.to_string() };
+    let mut report = languages_report(
+        LanguageSection::Recorded(vec![
+            ("go".to_string(), failed("go gone")),
+            ("python".to_string(), failed("spawn failed\n  no such file")),
+            ("rust".to_string(), failed("boom")),
+        ]),
+        &[("python", "0.3.0"), ("rust", "1.2.0")],
+    );
+    report.languages.retries = BTreeMap::from([("python".to_string(), 2), ("rust".to_string(), 1)]);
+
+    let lines = language_lines(&report.languages);
+    let line = |language: &str| {
+        lines
+            .iter()
+            .find(|line| line.trim_start().starts_with(&format!("{language}:")))
+            .unwrap_or_else(|| panic!("no {language} line: {lines:?}"))
+            .clone()
+    };
+    assert!(
+        line("rust")
+            .ends_with("failed (plugin 1.2.0) - not in the index: boom; retry 2 of 2 on the next start"),
+        "{lines:?}"
+    );
+    assert!(
+        line("python").ends_with(
+            "failed (plugin 0.3.0) - not in the index: spawn failed: no such file; retries used up - run \
+             `g-mesh reindex`"
+        ),
+        "{lines:?}"
+    );
+    assert!(
+        line("go").ends_with("failed (plugin no longer installed) - not in the index: go gone"),
+        "{lines:?}"
+    );
+
+    let outcomes = languages_json(&report)["outcomes"].clone();
+    let entry = |language: &str| {
+        outcomes.as_array().unwrap().iter().find(|entry| entry["language"] == language).unwrap().clone()
+    };
+    assert_eq!((entry("rust")["retries"].clone(), entry("rust")["maxRetries"].clone()), (1.into(), 2.into()));
+    assert_eq!(entry("python")["retries"], 2);
+    assert!(entry("go").get("retries").is_none() && entry("go").get("maxRetries").is_none(), "{outcomes}");
+}
+
+/// `language_retries` reads the counts from an index file, and an index
+/// from before the retry table reads as none rather than failing the report.
+#[test]
+fn language_retries_reads_the_counts_and_none_from_an_index_without_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let current = dir.path().join("current.db");
+    let conn = rusqlite::Connection::open(&current).unwrap();
+    schema::apply(&conn).unwrap();
+    schema::begin_language_retry(&conn, "python").unwrap();
+    drop(conn);
+    assert_eq!(language_retries(&current), BTreeMap::from([("python".to_string(), 1)]));
+
+    let older = dir.path().join("older.db");
+    let conn = rusqlite::Connection::open(&older).unwrap();
+    conn.execute("CREATE TABLE language_outcome (language TEXT PRIMARY KEY)", []).unwrap();
+    drop(conn);
+    assert!(language_retries(&older).is_empty());
 }

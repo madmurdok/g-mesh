@@ -355,6 +355,20 @@ pub fn run(root: &Path) -> Result<()> {
     let needs_semantic_pass_retry = !needs_bulk_index
         && !schema::semantic_pass_completed(&conn)
             .context("failed to check whether the project's semantic pass has completed")?;
+    // The languages the last full walk failed that a start still retries
+    // (ADR 0021): only on a walked project, whose walk would otherwise never
+    // revisit them. Unreadable, nothing is retried this start.
+    let retry_languages = if needs_bulk_index {
+        Vec::new()
+    } else {
+        let discovered_languages: Vec<&str> = discovered.manifests.keys().map(String::as_str).collect();
+        schema::languages_owed_a_retry(&conn, &discovered_languages).unwrap_or_else(|err| {
+            crate::log_line!(
+                "g-mesh daemon: could not read which failed languages to retry - none is: {err:#}"
+            );
+            Vec::new()
+        })
+    };
     let conn =
         Arc::new(IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())));
 
@@ -454,13 +468,15 @@ pub fn run(root: &Path) -> Result<()> {
     // The watcher (D8 in `docs/architecture/lazy-indexing.md`): an unindexed
     // project gets it from activation, right before its walk. A walked one gets
     // it now, and its consumer too unless a semantic-pass retry is owed, which
-    // must run before any incremental pass (activation starts it after that).
+    // must run before any incremental pass, or a failed language's retry is,
+    // so that no edit of it routes while it is still failed (activation
+    // starts the consumer after those).
     // A watcher failure here is fatal: this is startup, with no session to lose.
     let pending_watcher = if needs_bulk_index {
         None
     } else {
         let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
-        if needs_semantic_pass_retry {
+        if needs_semantic_pass_retry || !retry_languages.is_empty() {
             Some(watcher)
         } else {
             spawn_watch_consumer(watcher, Arc::clone(&conn), Arc::clone(&registry), canonical_root.clone());
@@ -481,6 +497,7 @@ pub fn run(root: &Path) -> Result<()> {
             core_activity: Arc::clone(&core_activity),
             needs_walk: needs_bulk_index,
             needs_semantic_pass_retry,
+            retry_languages,
             watcher: pending_watcher,
         },
         activation_trigger,
