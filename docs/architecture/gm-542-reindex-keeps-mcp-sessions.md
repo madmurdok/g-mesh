@@ -260,3 +260,12 @@ the other open sessions; they move to the new daemon on their next call. Consequ
 `connect_or_bootstrap` doc's "deliberate trade" disappears. `init` (which also calls `stop`)
 gets no reindex marker in this task, so a session calling during `init`'s rebuild can still race
 it (1.3). Fix it here too, or file a follow-up?
+
+## 7. Owner decisions (2026-10-10)
+
+- M1: "Сразу ответ «reindexing» (Recommended)".
+- M2: "При следующем вызове (Recommended)" - lazy reconnect.
+- M3: "Да, строка в первом ответе (Recommended)" - the first answer after a
+  reconnect carries one restart line.
+- M4: "Защитить init в этой задаче (Recommended)" - `init` takes the same
+  marker as `reindex`.
