@@ -296,3 +296,10 @@ processes).
    `activate`) embeds it. Example: a 1,000-file TypeScript retry appears in
    `find_*` answers minutes earlier; `search_code` covers it once the backfill
    ends. Consequence: faster structural recovery; `search_code` lags briefly.
+
+## 8. Owner decisions (2026-10-10)
+
+1. Bound: "2 повтора (Recommended)".
+2. Mid-session retry: "Только при старте (Recommended)".
+3. Watcher events of other languages: "Да, пусть ждут (Recommended)".
+4. Vectors: "Без эмбеддингов, дозаполнить позже (Recommended)".
