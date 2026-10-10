@@ -351,6 +351,7 @@ async fn a_failed_walk_is_a_tool_error_and_is_retried() {
         engine: "fixture".to_string(),
         resolved: true,
         to_declaration: None,
+        specifier: None,
     };
     let stream = [
         serde_json::to_string(&node("greet.py", NodeKind::File, "greet.py")).unwrap(),

@@ -208,6 +208,9 @@ pub struct GMeshMcpServer {
     embedding: Arc<EmbeddingPipeline>,
     shapes: Arc<query_shapes::QueryShapes>,
     hints: session_hints::SessionHints,
+    /// `search_code`'s embedding wait when a test names one; `None` (always,
+    /// in production) reads [`SEARCH_EMBEDDING_WAIT_ENV`] per call.
+    search_embedding_wait: Option<Duration>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -229,8 +232,18 @@ impl GMeshMcpServer {
             embedding,
             shapes,
             hints: session_hints::SessionHints::default(),
+            search_embedding_wait: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// This server with `search_code`'s embedding wait fixed at `wait`, so a
+    /// test can shorten it without writing [`SEARCH_EMBEDDING_WAIT_ENV`] for
+    /// every other thread in the process.
+    #[cfg(test)]
+    pub(crate) fn with_search_embedding_wait(mut self, wait: Duration) -> Self {
+        self.search_embedding_wait = Some(wait);
+        self
     }
 
     /// Everything every handler owes before it reads the index, in the one
@@ -574,7 +587,9 @@ impl GMeshMcpServer {
         ctx: &RequestContext<RoleServer>,
     ) -> Result<Result<Option<search_code::Coverage>, CallToolResult>, ErrorData> {
         let started = Instant::now();
-        let bound = env_millis(SEARCH_EMBEDDING_WAIT_ENV, SEARCH_EMBEDDING_WAIT);
+        let bound = self
+            .search_embedding_wait
+            .unwrap_or_else(|| env_millis(SEARCH_EMBEDDING_WAIT_ENV, SEARCH_EMBEDDING_WAIT));
         let deadline = started.checked_add(bound);
         let outcome =
             self.wait_until(ctx, "search_code:embeddings", Need::Embeddings, started, deadline).await?;
@@ -837,7 +852,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "get_file_outline",
-        description = "List the top-level symbols a file declares, in source order. Line and column numbers are zero-based - add one to cite a line to a human or to compare against a grep. `exported` means reachable from outside the file, not that the symbol's own line carries a visibility keyword - e.g. in Rust, a trait method or a trait-impl method is exported through the trait/impl even where the language forbids writing `pub` on that line itself."
+        description = "List the symbols a file declares, members included, in source order; pages are capped at about 8k bytes. Line and column numbers are zero-based - add one to cite a line to a human or to compare against a grep. `exported` means reachable from outside the file, not that the symbol's own line carries a visibility keyword - e.g. in Rust, a trait method or a trait-impl method is exported through the trait/impl even where the language forbids writing `pub` on that line itself."
     )]
     async fn get_file_outline(
         &self,
@@ -1021,10 +1036,24 @@ pub struct GetFileOutlineParams {
     pub file_path: String,
     /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
-    /// Maximum symbols (default 20, max 200) - raise it for a big file rather
-    /// than paging via `cursor`: one call costs far less than several, each
-    /// of which re-pays the whole conversation's cached prefix.
+    /// Maximum symbols (default and max 200). Each response is also capped at
+    /// about 8k bytes, so a page may hold fewer: follow `nextCursor`.
     pub limit: Option<u32>,
+    /// `full` adds qualifiedName, columns and signature to each row.
+    pub detail: Option<OutlineDetail>,
+}
+
+// How much each outline row carries. Plain comments, as on `Answer`: the
+// field's doc already says what `full` adds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(inline)]
+pub enum OutlineDetail {
+    // symbolId, name, kind, startLine, endLine, exported (the default).
+    #[default]
+    Compact,
+    // The compact fields plus qualifiedName, startCol, endCol, signature.
+    Full,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

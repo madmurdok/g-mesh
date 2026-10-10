@@ -102,6 +102,7 @@ pub fn diff_file(previous: Option<&FileGraph>, next: &FileGraph) -> FileChangeDi
             .cloned()
             .collect(),
         complete,
+        affected: None,
     }
 }
 
@@ -297,6 +298,7 @@ mod tests {
             to_declaration: Some(1),
             source: SourceTier::Semantic,
             engine: "toy-types".to_string(),
+            specifier: None,
         });
         assert_ne!(unbound, bound);
     }

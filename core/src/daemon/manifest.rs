@@ -56,7 +56,14 @@ pub const PLUGIN_ROOTS_OVERRIDE_ENV: &str = "G_MESH_PLUGIN_ROOTS_OVERRIDE";
 /// (skipped if the home directory cannot be resolved), then [`bundled_roots`].
 /// With [`PLUGIN_ROOTS_OVERRIDE_ENV`] set, that one path replaces them all.
 pub fn default_roots() -> Vec<PathBuf> {
-    if let Ok(over) = std::env::var(PLUGIN_ROOTS_OVERRIDE_ENV) {
+    roots_with_override(std::env::var(PLUGIN_ROOTS_OVERRIDE_ENV).ok())
+}
+
+/// [`default_roots`] with [`PLUGIN_ROOTS_OVERRIDE_ENV`]'s value given rather
+/// than read, so a test can supply it without writing a variable every other
+/// thread in the process reads.
+fn roots_with_override(override_root: Option<String>) -> Vec<PathBuf> {
+    if let Some(over) = override_root {
         return vec![PathBuf::from(over)];
     }
 
@@ -182,6 +189,15 @@ pub struct Capabilities {
     /// presence hook). `false` (the default): never sent; the plugin sees only
     /// per-file `fileChanged`.
     pub files_created: bool,
+    /// Whether a watch-file save is first offered to this plugin as a
+    /// `resolutionChanged` request, so it can name what the edit changed for
+    /// resolution and core re-extracts only those files
+    /// (`daemon::config_reindex`). A plugin that declares it must answer
+    /// `resolutionChanged`, end its bulk walk with a `resolutionFacts` line,
+    /// and set `specifier` on its `IMPORTS` edges. `false` (the default):
+    /// core notifies `workspaceChanged` and reindexes the whole language, as
+    /// it always has.
+    pub resolution_delta: bool,
     /// Whether receiver calls resolve to edges once this plugin's best available
     /// tier has run. `Resolved` means against the receiver's declared or inferred
     /// type, never its run-time type (an override's caller page names the base
@@ -587,15 +603,39 @@ impl DiscoveredPlugins {
 
     /// The language whose plugin indexes `file_path`: the one claiming its
     /// extension, unless the file is under one of that same language's
-    /// `exclude_dirs`. Exclusions are per language, never a union. The single
+    /// `exclude_dirs`, by its spelling or by `real_path` (its spelling
+    /// relative to the root's real path, when a link on the way makes the two
+    /// differ): a plugin's walk refuses a link whose target is under an
+    /// excluded name. Exclusions are per language, never a union. The single
     /// answer to "should the index hold this file?", shared by the watcher's
     /// routing and `g-mesh status`'s coverage walk so they cannot disagree.
-    pub fn indexing_language(&self, file_path: &str) -> Option<&str> {
+    pub fn indexing_language(&self, file_path: &str, real_path: Option<&str>) -> Option<&str> {
         let language = self.language_for(file_path)?;
         match self.manifests.get(language) {
-            Some(manifest) if under_excluded_dir(file_path, &manifest.workspace.exclude_dirs) => None,
+            Some(manifest)
+                if under_excluded_dir(file_path, &manifest.workspace.exclude_dirs)
+                    || real_path
+                        .is_some_and(|real| under_excluded_dir(real, &manifest.workspace.exclude_dirs)) =>
+            {
+                None
+            }
             _ => Some(language),
         }
+    }
+
+    /// The directory names in every discovered manifest's `exclude_dirs` - safe to
+    /// prune from a project walk, since no language would index anything under
+    /// them. Empty when nothing was discovered.
+    pub fn excluded_by_every_language(&self) -> Vec<String> {
+        let mut manifests = self.manifests.values();
+        let Some(first) = manifests.next() else {
+            return Vec::new();
+        };
+        let mut common: Vec<String> = first.workspace.exclude_dirs.clone();
+        for manifest in manifests {
+            common.retain(|dir| manifest.workspace.exclude_dirs.contains(dir));
+        }
+        common
     }
 }
 

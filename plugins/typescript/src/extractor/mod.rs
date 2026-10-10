@@ -50,10 +50,12 @@ pub mod scope;
 pub mod sites;
 pub mod syntax;
 
+use g_mesh_plugin_sdk::wire::ResolutionDelta;
 use g_mesh_plugin_sdk::{CharColumns, Extractor, FileGraph, RelPath};
 
 use crate::extractor::decls::Declarer;
 use crate::extractor::model::FileModel;
+use crate::project::facts::{self, TsFacts};
 use crate::project::TsProject;
 
 /// The plugin's wire identifier: the manifest's `language`, this directory's
@@ -82,6 +84,16 @@ impl Extractor for TypeScriptExtractor {
     /// Keeps the existence set current; touches no disk.
     fn file_presence_changed(&self, project: &mut TsProject, path: &RelPath, present: bool) {
         project.file_presence_changed(path, present);
+    }
+
+    /// The packages, tsconfig `paths` and `imports` maps resolution reads.
+    fn resolution_facts(&self, project: &TsProject) -> Option<String> {
+        Some(TsFacts::of(project).encode())
+    }
+
+    /// Which importers the reloaded model may resolve differently.
+    fn resolution_delta(&self, previous: &str, project: &TsProject) -> ResolutionDelta {
+        facts::resolution_delta(previous, project)
     }
 
     /// Parses `source` with its extension's grammar and declares everything

@@ -296,6 +296,7 @@
 //! in the graph keep their old keys until they are extracted again or the
 //! next `workspaceChanged` reindexes the language.
 
+pub mod facts;
 mod pyproject;
 
 use std::collections::BTreeMap;

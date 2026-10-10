@@ -58,7 +58,7 @@ fn a_supervisor_wakes_the_plugin_its_own_manifest_names() {
 /// plugin never answers blocks `watcher::apply::round_trip`'s read
 /// forever - `file_changed` below would simply never return, and this
 /// test would hang rather than fail. With the fix: the request times out
-/// (a short, test-only `FILE_CHANGED_TIMEOUT_ENV` override - see
+/// (a short, test-only budget given to the supervisor - see
 /// `daemon::plugin::RoundTripTimeouts` - so this test does not wait the
 /// production 30s budget), the plugin is killed and relaunched through
 /// the same crash-recovery path an out-of-band kill already used
@@ -73,9 +73,6 @@ fn a_supervisor_wakes_the_plugin_its_own_manifest_names() {
 #[test]
 fn a_timed_out_file_change_relaunches_the_plugin_and_replays_the_dirty_file_without_blocking_another_language(
 ) {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var(crate::daemon::plugin::FILE_CHANGED_TIMEOUT_ENV, "150");
-
     let project = tempfile::tempdir().expect("failed to create a project root");
     let plugins = tempfile::tempdir().expect("failed to create a plugin root");
 
@@ -93,16 +90,14 @@ fn a_timed_out_file_change_relaunches_the_plugin_and_replays_the_dirty_file_with
         Arc::new(EmbeddingPipeline::disabled()),
     )
     .expect("the stalling fixture plugin must still shake hands and start normally");
-    // Removed *between* the two spawns, not after both (GM-355). The
-    // override is read once, inside `PluginProcess::spawn`, and the
-    // budget it produces then belongs to that supervisor for life - so
-    // setting it across both spawns handed the short stall budget to the
-    // responsive plugin as well, whose round trip below has to *succeed*.
-    // Only the stalling plugin has any business timing out here.
-    //
-    // It also has to come off promptly for the older reason: another test
-    // racing on `ENV_LOCK` right after this one must not see it.
-    std::env::remove_var(crate::daemon::plugin::FILE_CHANGED_TIMEOUT_ENV);
+    // The short budget goes to the stalling plugin alone (GM-355): the
+    // responsive plugin's round trip below has to *succeed*. Given to this
+    // supervisor rather than set through `FILE_CHANGED_TIMEOUT_ENV`, which
+    // every plugin spawned anywhere in the process reads.
+    stalling.set_round_trip_timeouts(crate::daemon::plugin::RoundTripTimeouts {
+        file_changed: Duration::from_millis(150),
+        ..crate::daemon::plugin::RoundTripTimeouts::default()
+    });
 
     let responsive = PluginSupervisor::start(
         project.path(),
@@ -189,7 +184,7 @@ fn a_timed_out_file_change_relaunches_the_plugin_and_replays_the_dirty_file_with
 
     // Everything above is what the short budget was for, and it is spent
     // (GM-355). The relaunched process keeps the budget its
-    // `PluginProcess` captured at construction, so without this the
+    // `PluginProcess` was given above, so without this the
     // replay below - a healthy round trip that has to *succeed* - would
     // go on racing the 150ms the stall was given. Measured, it takes
     // 2.0ms idle and 2.2ms under a 20x CPU oversubscription, then crosses
@@ -224,23 +219,12 @@ fn an_unset_timeout_reads_as_its_documented_default() {
     assert_eq!(parse_timeout(None, DEFAULT_PLUGIN_IDLE, "X"), Some(DEFAULT_PLUGIN_IDLE));
 }
 
-/// Guards every test below that touches [`PLUGIN_IDLE_ENV`] /
-/// [`CORE_IDLE_ENV`]: they are process-wide state, and `cargo test` runs
-/// this module's tests on multiple threads by default, so two of them
-/// setting/clearing the same variable at once would be a genuine race,
-/// not just noise. Held for the lifetime of each test that needs it.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
 /// A project with no config.toml (`ProjectConfig::default()`) must
 /// resolve to exactly the pre-config defaults - task #38's behavior,
 /// unchanged now that config is wired in.
 #[test]
 fn a_default_config_resolves_to_the_documented_defaults() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::remove_var(PLUGIN_IDLE_ENV);
-    std::env::remove_var(CORE_IDLE_ENV);
-
-    let resolved = IdleTimeouts::from_config(&ProjectConfig::default());
+    let resolved = IdleTimeouts::from_config_and_overrides(&ProjectConfig::default(), None, None);
     assert_eq!(resolved, IdleTimeouts::default());
     assert_eq!(resolved.plugin, Some(DEFAULT_PLUGIN_IDLE));
     assert_eq!(resolved.core, Some(DEFAULT_CORE_IDLE));
@@ -251,15 +235,11 @@ fn a_default_config_resolves_to_the_documented_defaults() {
 /// plugin timer, not the hardcoded default.
 #[test]
 fn a_configured_plugin_idle_timeout_overrides_the_default() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::remove_var(PLUGIN_IDLE_ENV);
-    std::env::remove_var(CORE_IDLE_ENV);
-
     let config = ProjectConfig {
         plugin: crate::config::PluginConfig { idle_timeout_minutes: 5, memory_limit_mb: None },
         ..ProjectConfig::default()
     };
-    let resolved = IdleTimeouts::from_config(&config);
+    let resolved = IdleTimeouts::from_config_and_overrides(&config, None, None);
     assert_eq!(resolved.plugin, Some(Duration::from_secs(5 * 60)));
     // The core timeout is untouched by a config that only sets [plugin].
     assert_eq!(resolved.core, Some(DEFAULT_CORE_IDLE));
@@ -268,15 +248,11 @@ fn a_configured_plugin_idle_timeout_overrides_the_default() {
 /// Same claim, for `daemon.coreIdleTimeoutHours`.
 #[test]
 fn a_configured_core_idle_timeout_overrides_the_default() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::remove_var(PLUGIN_IDLE_ENV);
-    std::env::remove_var(CORE_IDLE_ENV);
-
     let config = ProjectConfig {
         daemon: crate::config::DaemonConfig { core_idle_timeout_hours: 2 },
         ..ProjectConfig::default()
     };
-    let resolved = IdleTimeouts::from_config(&config);
+    let resolved = IdleTimeouts::from_config_and_overrides(&config, None, None);
     assert_eq!(resolved.core, Some(Duration::from_secs(2 * 60 * 60)));
     assert_eq!(resolved.plugin, Some(DEFAULT_PLUGIN_IDLE));
 }
@@ -286,17 +262,12 @@ fn a_configured_core_idle_timeout_overrides_the_default() {
 /// against a config that disagrees with it too.
 #[test]
 fn the_env_override_still_wins_over_a_configured_value() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var(PLUGIN_IDLE_ENV, "250");
-
     let config = ProjectConfig {
         plugin: crate::config::PluginConfig { idle_timeout_minutes: 5, memory_limit_mb: None },
         ..ProjectConfig::default()
     };
-    let resolved = IdleTimeouts::from_config(&config);
+    let resolved = IdleTimeouts::from_config_and_overrides(&config, Some("250"), None);
     assert_eq!(resolved.plugin, Some(Duration::from_millis(250)));
-
-    std::env::remove_var(PLUGIN_IDLE_ENV);
 }
 
 #[test]
@@ -551,20 +522,13 @@ fn an_unresolvable_executable_does_not_hide_a_gone_lifeline() {
 /// rather than "never read".
 #[test]
 fn only_a_well_formed_pid_in_the_environment_is_a_lifeline() {
-    let _guard = ENV_LOCK.lock().unwrap();
-
-    std::env::remove_var(LIFELINE_PID_ENV);
-    assert_eq!(lifeline_pid(), None, "unset");
+    assert_eq!(lifeline_pid_from(None), None, "unset");
 
     for garbage in ["", "   ", "not-a-pid", "-1", "12abc", "1.5", "99999999999999999999"] {
-        std::env::set_var(LIFELINE_PID_ENV, garbage);
-        assert_eq!(lifeline_pid(), None, "{garbage:?} must not read as a lifeline");
+        assert_eq!(lifeline_pid_from(Some(garbage)), None, "{garbage:?} must not read as a lifeline");
     }
 
-    std::env::set_var(LIFELINE_PID_ENV, " 4242\n");
-    assert_eq!(lifeline_pid(), Some(4242));
-
-    std::env::remove_var(LIFELINE_PID_ENV);
+    assert_eq!(lifeline_pid_from(Some(" 4242\n")), Some(4242));
 }
 
 /// The discriminating half of [`is_definitely_gone`]: a path whose *parent*
@@ -757,7 +721,7 @@ fn a_plugin_over_its_memory_limit_is_put_to_sleep_and_its_language_suspended() {
     // half) - `daemon::semantic::run_with_registry`/`run_once` and
     // `daemon::workspace_reindex` both go through this same method.
     assert!(
-        !supervisor.semantic_pass(&conn, Vec::new(), 0).expect("must not error, just skip"),
+        supervisor.semantic_pass(&conn, Vec::new(), 0).expect("must not error, just skip").is_none(),
         "a suspended language's whole-project semantic pass must not run either"
     );
 
@@ -1018,7 +982,7 @@ fn a_memory_suspension_still_wins_over_a_hold() {
     let conn = test_plugin::empty_index();
 
     let ran = supervisor.semantic_pass(&conn, Vec::new(), 1).expect("a suspended pass is not an error");
-    assert!(!ran, "a suspended language's pass is not run, held or not");
+    assert!(ran.is_none(), "a suspended language's pass is not run, held or not");
     assert!(supervisor.pid().is_some(), "the plugin is still awake, so only the suspension declined it");
     let requests = test_plugin::requests(&plugin_dir);
     assert!(!requests.iter().any(|line| line.starts_with("semanticPass")), "{requests:?}");

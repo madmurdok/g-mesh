@@ -91,7 +91,7 @@ func TestSemanticPassWithOneFailedModuleIsIncomplete(t *testing.T) {
 	root := writeMultiModuleProject(t, brokenGoMod)
 	state := newPluginState(root)
 
-	diff, reason := state.handleSemanticPass(nil)
+	diff, reason, _ := state.handleSemanticPass(nil)
 	if reason == "" {
 		t.Fatalf("a whole-project pass with one module failing to load answered complete - " +
 			"core would then sweep that module's semantic edges away as stale")
@@ -123,7 +123,7 @@ func TestSemanticPassWithEveryModuleLoadedIsComplete(t *testing.T) {
 	root := writeMultiModuleProject(t, healthyBrokenGoMod)
 	state := newPluginState(root)
 
-	diff, reason := state.handleSemanticPass(nil)
+	diff, reason, _ := state.handleSemanticPass(nil)
 	if reason != "" {
 		t.Fatalf("a whole-project pass where every module loads answered incomplete: %s", reason)
 	}
@@ -149,7 +149,7 @@ func TestSemanticPassDoesNotRetractAFailedModulesEdges(t *testing.T) {
 	root := writeMultiModuleProject(t, healthyBrokenGoMod)
 	state := newPluginState(root)
 
-	before, reason := state.handleSemanticPass(nil)
+	before, reason, _ := state.handleSemanticPass(nil)
 	if reason != "" {
 		t.Fatalf("first pass answered incomplete: %s", reason)
 	}
@@ -165,7 +165,7 @@ func TestSemanticPassDoesNotRetractAFailedModulesEdges(t *testing.T) {
 	}
 
 	writeFixtureFile(t, root, "broken/go.mod", brokenGoMod)
-	after, reason := state.handleSemanticPass(nil)
+	after, reason, _ := state.handleSemanticPass(nil)
 	if !strings.Contains(reason, "broken") {
 		t.Fatalf("second pass reason = %q, want it to name the broken module", reason)
 	}

@@ -1104,6 +1104,34 @@ unspecified.
    completion record to protect and the only thing the flag could do there is
    print a line per keystroke-save, which is the noise the design's "log once"
    rule exists to prevent.
+8. **Which files a pass did not finish travels beside the flag (GM-498).**
+   `FileChangeResponse` gains `unfinishedFiles` (optional, no protocol bump:
+   an old core ignores the key). Absent means unknown, and core keeps rule 7's
+   behaviour: a complete per-file pass settles the files it sent, an
+   incomplete one none. Present - empty when every file in scope finished - it
+   is read on per-file passes whatever `incomplete` says, so the SDK still
+   puts no flag on a per-file pass. Core keeps the named files in
+   `semantic_owed_files`, adds them to the scope of the language's next
+   per-file pass (at most three passes per file, restarting when the file is
+   edited), and settles `sent - unfinishedFiles`: those files are no longer
+   semantic-pending and no longer owed. The SDK's half is
+   `SemanticAnswer::unfinished`, which `LspBridge::answer` fills on every
+   return; the bridge no longer keeps an owed set of its own (GM-487's), so the
+   set survives plugin and daemon restarts.
+9. **Core tells the plugin how long it will wait (GM-521).** `semanticPass`
+   gains `budgetMs` (optional, no protocol bump: a plugin that predates it
+   ignores the key, and Go's `encoding/json` drops unknown fields). Core sets
+   it to the round-trip timeout it applies to that very request:
+   `semantic_pass_project_timeout(n)` for a whole-project pass and for a
+   residual pass of `n` owed files, the per-file timeout for a per-file one.
+   It exists because a plugin cannot tell a residual pass from a per-file one:
+   both send a file list, and a per-file pass carries owed files too, so a
+   budget inferred from the file count would plan a many-file per-file pass
+   far past core's flat per-file timeout. The SDK reckons core's deadline
+   from the request's arrival (`SemanticEngine::set_pass_deadline`), and
+   `LspBridge` plans to three quarters of the time left until it, keeping the
+   last quarter for sending the answer - the same ratio its own budgets keep to
+   core's defaults. Absent, the bridge's own budgets apply as before.
 
 Two things the sketch above did not say, found while building it:
 

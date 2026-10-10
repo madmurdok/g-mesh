@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-plugin-typescript"
-version = "4.2.0"
+version = "4.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "g-mesh's TypeScript/JavaScript language plugin: tree-sitter structural extraction on the plugin SDK"
@@ -18,7 +18,7 @@ anyhow = "1"
 g-mesh-plugin-sdk = { path = "../sdk" }
 g-mesh-wire = { path = "../../wire" }
 # Order-preserving JSON for package.json and tsconfig (`project::jsonc`).
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tree-sitter = "0.25"
 # Three grammars, routed per extension (`extractor::grammar`).

@@ -1,7 +1,9 @@
 //! Assembles `get_info`'s `with_instructions` string from this project's
 //! language coverage (design and measurements:
 //! `docs/adr/0003-mcp-instructions-rendering.md`, amended by
-//! `docs/adr/0022-instructions-coverage-states.md`). Invariants:
+//! `docs/adr/0022-instructions-coverage-states.md`; the per-answer fields it
+//! no longer describes: `docs/architecture/tool-answer-guarantees.md`).
+//! Invariants:
 //! - Every rendering fits [`INSTRUCTIONS_BYTE_CEILING`], a margin under
 //!   Claude Code's 2KB truncation of `with_instructions`.
 //! - Which languages have answers, and which do not and why (no plugin, a

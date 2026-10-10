@@ -55,3 +55,32 @@ question — a full read early gets carried through every later turn.
 See [`docs/adr/README.md`](docs/adr/README.md) for the ADR index —
 existing design decisions (indexed from `docs/architecture/`) and new ones
 going forward.
+
+## Testing
+
+The suite runs as named sections (`scripts/test-sections.sh`,
+[ADR 0030](docs/adr/0030-test-sections.md)). Which command when
+([ADR 0031](docs/adr/0031-local-test-runs.md)):
+
+- **Verify slice:** the sections its change can affect, diffed against the
+  release branch the task branched from. Lib tests run in one process; the
+  heavy tests in `.config/nextest.toml`'s `local` profile are skipped.
+
+  ```
+  scripts/test-local.sh --base <release-branch>
+  ```
+
+- **Batch end:** every section, heavy tests included, per process, plus a
+  report of tests whose time crossed 10s against the heavy list. Its failures
+  and report lines become tasks in the batch.
+
+  ```
+  scripts/test-local.sh --full
+  ```
+
+- **CI** is unchanged: `scripts/test-sections.sh run` per section under
+  `--profile ci`.
+
+`test-select.sh` prints `full`, `none` or section names, and counts
+uncommitted and untracked files too. Any path it has no rule for selects
+`full`. The release gate (`scripts/cut-release.sh`) always runs every section.

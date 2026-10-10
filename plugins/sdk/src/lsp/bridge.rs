@@ -93,6 +93,9 @@ use crate::semantic::{SemanticAnswer, SemanticEngine};
 ///   quarters and four fifths of its numbers, so the bridge gives up and
 ///   reports an incomplete pass before core's timer gives up on the bridge.
 /// - **`single_file` (90s)** against core's flat 120s, for the same reason.
+///   These three apply only when core sent no `budgetMs` (a core older than
+///   GM-521); when it did, the pass plans to three quarters of core's own
+///   deadline instead - see [`LspBridge::pass_deadline`].
 /// - **`readiness` (10 minutes) and `settle` (2s).** See [`LspBridge`]'s doc
 ///   on readiness. The readiness wait is *inside* the pass budget too, so a
 ///   server that never loads costs a pass rather than a plugin.
@@ -113,7 +116,7 @@ use crate::semantic::{SemanticAnswer, SemanticEngine};
 ///   (`LspClient::warmed_up`): a restarted server is cold again and owes a
 ///   new one; a pass on a warm server never pays it. A warm-up that times out
 ///   fails its question exactly as `request` would - the pass is incomplete
-///   and the file owed - and is not re-armed, so a server that never answers
+///   and the file unfinished - and is not re-armed, so a server that never answers
 ///   costs one long wait, not one per question or per pass. It sits *inside*
 ///   the pass deadline like everything else, after `readiness`: a deferred
 ///   empty answer still waits for `settle`, and the warm-up question's own
@@ -395,6 +398,20 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// `an_indexing_server_is_not_believed_early_even_when_the_manifest_says_on_demand`
 /// is that case, and it is the test that fails if any of the above is removed.
 ///
+/// **A server that says when it has finished loading is asked to** (GM-550).
+/// rust-analyzer 1.97 under load paused 2.04s and 2.47s between `Fetching`
+/// and `Building CrateGraph` - longer than the settle - and the bridge called
+/// it ready inside the gap. [`LspBridge::quiescent_signal`] advertises
+/// rust-analyzer's `experimental.serverStatusNotification` capability; the
+/// server then reports `quiescent: false` from its first progress until the
+/// last start-up phase (cache priming included) has ended, and `true` within
+/// milliseconds of that. The client counts `quiescent: false` as work in
+/// flight, so no gap between phases reads as quiet, and the first settle
+/// needs only "quiescent and nothing in flight" - see [`LspClient::settle`]
+/// for the two cases that keep the quiet period (a server that sends no
+/// status, and the settle after a `workspaceChanged`) and for the bound on a
+/// server that never reports `true`.
+///
 /// Readiness is not only a startup condition: a server may begin indexing
 /// again mid-pass (it usually does, after `didChange`). An empty answer that
 /// arrives before the server is quiet again is therefore re-asked once, after
@@ -520,20 +537,13 @@ pub struct LspBridge {
     /// keyed by their file - see [`trim_untyped_calls`]. Only what lets a later
     /// pass put a name back when its answers stop arriving.
     trimmed: BTreeMap<RelPath, BTreeSet<String>>,
-    /// Files a per-file pass asked about and did not finish, with the number
-    /// of passes that have tried them (GM-487). Core treats a per-file pass as
-    /// done whatever it reports, and re-sends one only when the file is edited
-    /// again, so a file whose pass met a cold server would otherwise keep its
-    /// sites unanswered until the next daemon start. Each later per-file pass
-    /// asks these too, until one finishes them or [`MAX_OWED_ATTEMPTS`] passes
-    /// have tried.
-    owed: BTreeMap<RelPath, u8>,
+    /// Core's deadline for the pass about to be answered, when core sent one
+    /// (`budgetMs`, GM-521) - see [`LspBridge::pass_deadline`].
+    core_deadline: Option<Instant>,
+    /// Whether readiness reads the server's `experimental/serverStatus`
+    /// `quiescent` bit - see [`LspBridge::quiescent_signal`].
+    quiescent_signal: bool,
 }
-
-/// How many passes may try one file before it stops being re-asked - see
-/// [`LspBridge`]'s `owed`. Bounded so that a site no server ever answers does
-/// not ride along on every pass for the life of the process.
-const MAX_OWED_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct OpenDocument {
@@ -574,6 +584,18 @@ impl LspBridge {
         self
     }
 
+    /// Asks the server for rust-analyzer's `experimental/serverStatus`
+    /// notification and believes it ready when it reports `quiescent: true`
+    /// with nothing in flight, rather than after [`Budgets::settle`] of
+    /// silence - see this type's doc on readiness (GM-550). For a server whose
+    /// start-up phases can be separated by gaps longer than the settle. A
+    /// server that never sends a status keeps the quiet-period rule.
+    #[must_use]
+    pub fn quiescent_signal(mut self) -> Self {
+        self.quiescent_signal = true;
+        self
+    }
+
     /// [`LspBridge::new`] with budgets a test can make small - see
     /// [`Budgets`].
     pub fn with_budgets(language: &str, root: &Path, config: SemanticConfig, budgets: Budgets) -> Self {
@@ -594,45 +616,38 @@ impl LspBridge {
             opened: BTreeMap::new(),
             emitted: BTreeMap::new(),
             trimmed: BTreeMap::new(),
-            owed: BTreeMap::new(),
+            core_deadline: None,
+            quiescent_signal: false,
         }
     }
 
-    /// Settles `owed` after a per-file pass: `finished` files and the ones
-    /// with nothing to ask (`settled`) are no longer owed, and every file in
-    /// `unfinished` counts one more attempt - restarting at one for a file
-    /// the pass was sent (`requested`), whose sites an edit may have changed.
-    /// A file that has used up [`MAX_OWED_ATTEMPTS`] is dropped, with a log
-    /// line.
-    fn settle_owed(
-        &mut self,
-        requested: &BTreeSet<RelPath>,
-        settled: &BTreeSet<RelPath>,
-        unfinished: &BTreeSet<RelPath>,
-    ) {
-        for file in settled {
-            self.owed.remove(file);
-        }
-        for file in unfinished {
-            let attempts = if requested.contains(file) {
-                1
-            } else {
-                self.owed.get(file).copied().unwrap_or(0).saturating_add(1)
-            };
-            if attempts >= MAX_OWED_ATTEMPTS {
-                self.owed.remove(file);
-                crate::log_line!(
-                    "[{}] {file}: {attempts} semantic pass(es) did not finish it - no longer re-asked until it \
-                     changes",
-                    self.language
-                );
-            } else {
-                self.owed.insert(file.clone(), attempts);
+    /// When the pass that starts at `started` must be done.
+    ///
+    /// Core sent its own deadline (`budgetMs`, GM-521): the pass plans to
+    /// three quarters of the time left until it, and the last quarter is the
+    /// margin for building, writing and sending the answer. Three quarters is
+    /// the ratio [`Budgets`]' own numbers keep to core's defaults (15 of 20
+    /// minutes, 90 of 120 seconds), so with core's default timeouts a pass
+    /// gets about what it got before - but now also for a residual pass,
+    /// whose many files arrive as a per-file-shaped list that only core's
+    /// budget tells apart from a per-file pass, and under an overridden core
+    /// timeout. Reckoned from `started` rather than from the request, so time
+    /// already spent before the engine was asked (hydration) is not planned
+    /// twice; it can only make the plan shorter, never past core's deadline.
+    ///
+    /// No deadline from core (an older core): [`Self::pass_budget`], today's
+    /// rules.
+    fn pass_deadline(&self, started: Instant, whole_project: bool, files: usize) -> Instant {
+        match self.core_deadline {
+            Some(core) => {
+                let remaining = core.saturating_duration_since(started);
+                started + (remaining - remaining / 4)
             }
+            None => started + self.pass_budget(whole_project, files),
         }
     }
 
-    /// The whole budget for one pass - see [`Budgets`].
+    /// The whole budget for one pass when core sent none - see [`Budgets`].
     fn pass_budget(&self, whole_project: bool, files: usize) -> Duration {
         if !whole_project {
             return self.budgets.single_file;
@@ -660,7 +675,8 @@ impl LspBridge {
                 return None;
             }
             self.starts += 1;
-            match LspClient::start(&self.language, &self.config, &self.root, deadline) {
+            match LspClient::start(&self.language, &self.config, &self.root, deadline, self.quiescent_signal)
+            {
                 Ok(client) => self.client = Some(client),
                 Err(err) => {
                     self.start_failure = Some(format!(
@@ -1744,6 +1760,7 @@ impl Answers {
                 to_declaration: edge.to_declaration,
                 source: SourceTier::Semantic,
                 engine,
+                specifier: None,
             });
         }
         // The nodes, now that every site addressing each one has been seen. In
@@ -2771,28 +2788,29 @@ impl SemanticEngine for LspBridge {
         self.ensure_client(deadline);
     }
 
+    fn set_pass_deadline(&mut self, deadline: Option<Instant>) {
+        self.core_deadline = deadline;
+    }
+
     fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer> {
         let whole_project = files.is_empty();
-        // A file no longer in the index was deleted or failed to extract:
-        // there is nothing left to re-ask about it.
-        self.owed.retain(|file, _| index.entry(file).is_some());
-        let requested: BTreeSet<RelPath> = files.iter().cloned().collect();
+        // What this pass was sent - core adds the files earlier passes did not
+        // finish itself. A file no longer in the index was deleted or
+        // failed to extract: there is nothing left to ask about it, so it is
+        // not unfinished either.
         let scope: Vec<RelPath> = if whole_project {
             index.paths()
         } else {
-            // What this pass was sent, plus what earlier per-file passes did
-            // not finish (GM-487).
-            let mut scope: BTreeSet<RelPath> =
+            let scope: BTreeSet<RelPath> =
                 files.iter().filter(|path| index.entry(path).is_some()).cloned().collect();
-            scope.extend(self.owed.keys().cloned());
             scope.into_iter().collect()
         };
         if scope.is_empty() {
-            return Ok(SemanticAnswer::complete(FileChangeDiff::default()));
+            return Ok(SemanticAnswer::complete(FileChangeDiff::default()).with_unfinished(BTreeSet::new()));
         }
 
         let started = Instant::now();
-        let deadline = started + self.pass_budget(whole_project, scope.len());
+        let deadline = self.pass_deadline(started, whole_project, scope.len());
         let plan = questions(index, &scope, &self.config, &self.budgets);
         if plan.unanswerable > 0 {
             crate::log_line!(
@@ -2813,7 +2831,8 @@ impl SemanticEngine for LspBridge {
                 return Ok(SemanticAnswer::incomplete_because(
                     FileChangeDiff::default(),
                     "the open-site ceiling (max_sites) admitted no site",
-                ));
+                )
+                .with_unfinished(scope.into_iter().collect()));
             }
             // Nothing to ask means nothing to start a compiler for. The files
             // in scope are still *covered*, so an earlier pass's answers about
@@ -2828,13 +2847,8 @@ impl SemanticEngine for LspBridge {
             // No question means no untyped receiver call in these files, so
             // this only forgets what an earlier pass trimmed in them.
             diff.upsert_nodes.extend(trim_untyped_calls(index, &covered, &HashMap::new(), &mut self.trimmed));
-            // Nothing left to ask is nothing owed.
-            if whole_project {
-                self.owed.clear();
-            } else {
-                self.settle_owed(&requested, &covered, &BTreeSet::new());
-            }
-            return Ok(SemanticAnswer::complete(diff));
+            // Nothing left to ask is nothing unfinished.
+            return Ok(SemanticAnswer::complete(diff).with_unfinished(BTreeSet::new()));
         }
 
         let language = self.language.clone();
@@ -2891,11 +2905,12 @@ impl SemanticEngine for LspBridge {
                 let reason = reason
                     .or_else(|| self.start_failure.clone())
                     .unwrap_or_else(|| "the language server is not running".to_string());
-                // Not one file was finished: every one asked about is owed.
-                if !whole_project {
-                    self.settle_owed(&requested, &BTreeSet::new(), &asked_about);
-                }
-                return Ok(SemanticAnswer::incomplete_because(FileChangeDiff::default(), reason));
+                // Not one file was finished: every one asked about is
+                // unfinished. A file in scope with no question has nothing to
+                // finish, and the ceiling did not cut any (`plan.truncated`
+                // aside, which this answer is incomplete for anyway).
+                return Ok(SemanticAnswer::incomplete_because(FileChangeDiff::default(), reason)
+                    .with_unfinished(asked_about));
             }
         };
 
@@ -2948,26 +2963,20 @@ impl SemanticEngine for LspBridge {
         let failure = failure.or_else(|| {
             plan.truncated.then(|| "the open-site ceiling (max_sites) left sites unasked".to_string())
         });
-        if whole_project {
-            // A complete whole-project pass answered everything; an incomplete
-            // one is core's to repeat, so it leaves `owed` as it was, less
-            // what it finished.
-            if failure.is_none() {
-                self.owed.clear();
-            } else {
-                self.owed.retain(|file, _| !finished.contains(file));
-            }
-        } else {
-            // A file in scope with no question is settled too - unless the
-            // ceiling is why it had none.
-            let mut settled = finished.clone();
-            if !plan.truncated {
-                settled.extend(scope.iter().filter(|file| !asked_about.contains(*file)).cloned());
-            }
-            let unfinished: BTreeSet<RelPath> = asked_about.difference(&finished).cloned().collect();
-            self.settle_owed(&requested, &settled, &unfinished);
+        // What core is to ask again: every file asked about and not finished,
+        // and - when the ceiling cut the list - every file in scope it left
+        // unasked, since a file with no question is settled only when the
+        // ceiling is not why it had none.
+        let mut unfinished: BTreeSet<RelPath> = asked_about.difference(&finished).cloned().collect();
+        if plan.truncated {
+            unfinished.extend(scope.iter().filter(|file| !asked_about.contains(*file)).cloned());
         }
-        Ok(SemanticAnswer { diff, complete: failure.is_none(), reason: failure })
+        Ok(SemanticAnswer {
+            diff,
+            complete: failure.is_none(),
+            reason: failure,
+            unfinished: Some(unfinished),
+        })
     }
 }
 
@@ -3323,6 +3332,46 @@ mod tests {
         }
         assert!(bridge.pass_budget(false, 1) < Duration::from_secs(120));
         assert!(budgets.readiness <= budgets.project_floor);
+    }
+
+    /// With core's deadline, a pass plans to three quarters of the time left
+    /// until it, whatever its shape: a many-file per-file-shaped pass under
+    /// 120s plans 90s, not 8s a file. A deadline already past plans nothing.
+    ///
+    /// Control: ignore `core_deadline` in `pass_deadline`.
+    #[test]
+    fn with_cores_deadline_a_pass_plans_three_quarters_of_the_time_left() {
+        let mut bridge = LspBridge::new("toy", Path::new("/p"), SemanticConfig::new("toy-server"));
+        let started = Instant::now();
+
+        bridge.set_pass_deadline(Some(started + Duration::from_secs(120)));
+        assert_eq!(bridge.pass_deadline(started, false, 1_000), started + Duration::from_secs(90));
+        assert_eq!(bridge.pass_deadline(started, true, 1_000), started + Duration::from_secs(90));
+
+        bridge.set_pass_deadline(Some(started + Duration::from_secs(20 * 60)));
+        assert_eq!(bridge.pass_deadline(started, true, 10), started + Duration::from_secs(15 * 60));
+
+        let later = started + Duration::from_secs(10);
+        bridge.set_pass_deadline(Some(started));
+        assert_eq!(bridge.pass_deadline(later, true, 10), later, "a past deadline leaves no time to plan");
+    }
+
+    /// Without core's deadline - never sent, or cleared by a pass without
+    /// one - the bridge's own budgets apply.
+    #[test]
+    fn without_cores_deadline_a_pass_plans_its_own_budget() {
+        let mut bridge = LspBridge::new("toy", Path::new("/p"), SemanticConfig::new("toy-server"));
+        let started = Instant::now();
+        for (whole_project, files) in [(false, 1_000), (true, 10), (true, 1_000)] {
+            assert_eq!(
+                bridge.pass_deadline(started, whole_project, files),
+                started + bridge.pass_budget(whole_project, files)
+            );
+        }
+
+        bridge.set_pass_deadline(Some(started + Duration::from_secs(120)));
+        bridge.set_pass_deadline(None);
+        assert_eq!(bridge.pass_deadline(started, true, 1_000), started + Duration::from_secs(8_000));
     }
 
     // --- GM-486: untyped receiver calls the semantic tier answered ---------

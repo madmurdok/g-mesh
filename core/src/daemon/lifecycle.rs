@@ -39,6 +39,7 @@ use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::jsonrpc::is_timeout;
 use crate::storage::index_store::{self, IndexStore};
+use crate::watcher::apply::{FileChangeOutcome, SemanticPassOutcome};
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// `plugin.idleTimeoutMinutes`'s default.
@@ -89,15 +90,27 @@ impl IdleTimeouts {
     /// `config`'s timeouts (`ProjectConfig::default()`'s 60 / 24 equal this module's
     /// defaults), unless the test-only env overrides name something else.
     pub fn from_config(config: &ProjectConfig) -> Self {
+        Self::from_config_and_overrides(
+            config,
+            std::env::var(PLUGIN_IDLE_ENV).ok().as_deref(),
+            std::env::var(CORE_IDLE_ENV).ok().as_deref(),
+        )
+    }
+
+    /// [`from_config`](Self::from_config) with the raw values of
+    /// [`PLUGIN_IDLE_ENV`] and [`CORE_IDLE_ENV`] given rather than read, so a
+    /// test can supply them without writing variables every other thread in
+    /// the process reads.
+    fn from_config_and_overrides(
+        config: &ProjectConfig,
+        plugin_env: Option<&str>,
+        core_env: Option<&str>,
+    ) -> Self {
         let plugin_default = Duration::from_secs(config.plugin.idle_timeout_minutes.saturating_mul(60));
         let core_default = Duration::from_secs(config.daemon.core_idle_timeout_hours.saturating_mul(60 * 60));
         Self {
-            plugin: parse_timeout(
-                std::env::var(PLUGIN_IDLE_ENV).ok().as_deref(),
-                plugin_default,
-                PLUGIN_IDLE_ENV,
-            ),
-            core: parse_timeout(std::env::var(CORE_IDLE_ENV).ok().as_deref(), core_default, CORE_IDLE_ENV),
+            plugin: parse_timeout(plugin_env, plugin_default, PLUGIN_IDLE_ENV),
+            core: parse_timeout(core_env, core_default, CORE_IDLE_ENV),
         }
     }
 
@@ -204,6 +217,11 @@ pub struct PluginSupervisor {
     /// is coming, so earlier languages' long passes cannot idle it out before
     /// its own pass is asked. `sleep_now` and `check_memory_limit` ignore it.
     semantic_holds: AtomicUsize,
+    /// The whole-language reindex a file change asked for (GM-507,
+    /// [`FileChangeOutcome::ReindexLanguage`]), as `(trigger, reason)`: run by
+    /// the registry once this supervisor's lock is released
+    /// ([`take_owed_reindex`](Self::take_owed_reindex)).
+    owed_reindex: Mutex<Option<(String, String)>>,
 }
 
 /// Keeps a [`PluginSupervisor`] from idling to sleep while it lives
@@ -256,6 +274,7 @@ impl PluginSupervisor {
             semantic_suspended: AtomicBool::new(false),
             sampling_unavailable_logged: AtomicBool::new(false),
             semantic_holds: AtomicUsize::new(0),
+            owed_reindex: Mutex::new(None),
         }))
     }
 
@@ -311,9 +330,9 @@ impl PluginSupervisor {
         // measures from its start.
         self.touch();
         let retry_path = file_path.clone();
-        if let Err(err) =
-            process.apply_file_change(conn, file_path, &self.embedding, self.is_semantic_suspended())
-        {
+        let applied =
+            process.apply_file_change(conn, file_path, &self.embedding, self.is_semantic_suspended());
+        if let Err(err) = applied.map(|outcome| self.note(&retry_path, outcome)) {
             if is_timeout(&err) {
                 // A timed-out request is not replayed inline (the plugin may have been
                 // mid-write, and it has already been killed and relaunched). Queue it
@@ -367,7 +386,10 @@ impl PluginSupervisor {
         let mut replayed = 0;
         for file_path in &queued {
             match process.apply_file_change(conn, file_path.clone(), &self.embedding, semantic_suspended) {
-                Ok(()) => replayed += 1,
+                Ok(outcome) => {
+                    self.note(file_path, outcome);
+                    replayed += 1;
+                }
                 // One unreadable file does not cost the rest of the queue its replay.
                 Err(err) => {
                     crate::log_line!("g-mesh daemon: failed to replay queued change to {file_path}: {err:#}")
@@ -377,9 +399,11 @@ impl PluginSupervisor {
         Ok(replayed)
     }
 
-    /// Runs a whole-project semantic pass if the plugin is awake. Returns whether
-    /// it ran; a sleeping plugin is left asleep. A suspended language answers
-    /// `Ok(false)` first: core never sends `semanticPass` to a suspended
+    /// Runs a whole-project semantic pass - or, with `file_paths`, a residual
+    /// language's pass over its owed files (`PluginProcess::semantic_pass`) -
+    /// if the plugin is awake. Returns its outcome, or `None` when it did not
+    /// run; a sleeping plugin is left asleep. A suspended language answers
+    /// `Ok(None)` first: core never sends `semanticPass` to a suspended
     /// language, and both `daemon::semantic` and `daemon::workspace_reindex` go
     /// through this gate. The timeout scales with `file_count`.
     pub fn semantic_pass(
@@ -387,15 +411,14 @@ impl PluginSupervisor {
         conn: &IndexStore,
         file_paths: Vec<String>,
         file_count: usize,
-    ) -> Result<bool> {
+    ) -> Result<Option<SemanticPassOutcome>> {
         if self.is_semantic_suspended() {
-            return Ok(false);
+            return Ok(None);
         }
         let inner = self.inner();
-        let Some(process) = inner.process.as_ref() else { return Ok(false) };
+        let Some(process) = inner.process.as_ref() else { return Ok(None) };
         self.touch();
-        process.semantic_pass(conn, file_paths, file_count, &self.embedding)?;
-        Ok(true)
+        process.semantic_pass(conn, file_paths, file_count, &self.embedding).map(Some)
     }
 
     /// Tells the plugin a whole-project pass is owed, so it can start its
@@ -439,6 +462,21 @@ impl PluginSupervisor {
         f(inner.process.as_ref())
     }
 
+    /// [`with_exclusive_access`](Self::with_exclusive_access), waking the
+    /// plugin first if it is asleep: `f` always gets a live process. A plugin
+    /// that fails to start is the error, and `f` does not run.
+    pub fn with_awake_exclusive_access<T>(&self, f: impl FnOnce(&PluginProcess) -> T) -> Result<T> {
+        let mut inner = self.inner();
+        if inner.process.is_none() {
+            let process = PluginProcess::spawn(&self.project_root, &self.manifest, self.pid_file.clone())
+                .with_context(|| format!("failed to wake the {} plugin", self.manifest.language))?;
+            super::write_pid_file(&self.pid_file, process.pid());
+            inner.process = Some(process);
+        }
+        self.touch();
+        Ok(f(inner.process.as_ref().expect("just spawned or already running")))
+    }
+
     /// Synchronously reindexes `file_path` if it changed since it was last
     /// indexed: the safety net for a change the watcher never saw (made while the
     /// daemon was down, or dropped by the backend). The common case resolves off
@@ -462,7 +500,30 @@ impl PluginSupervisor {
         }
         self.touch();
         let process = inner.process.as_ref().expect("just spawned or already running");
-        process.ensure_fresh(conn, file_path, &self.embedding, self.is_semantic_suspended())
+        let (outcome, change) =
+            process.ensure_fresh(conn, file_path, &self.embedding, self.is_semantic_suspended())?;
+        self.note(file_path, change);
+        Ok(outcome)
+    }
+
+    /// Keeps the whole-language reindex `outcome` asks for, if any, for
+    /// [`take_owed_reindex`](Self::take_owed_reindex); the first one asked
+    /// for wins, since one reindex covers every later edit too.
+    fn note(&self, trigger: &str, outcome: FileChangeOutcome) {
+        if let FileChangeOutcome::ReindexLanguage { reason } = outcome {
+            let mut owed = self.owed_reindex.lock().unwrap();
+            if owed.is_none() {
+                *owed = Some((trigger.to_string(), reason));
+            }
+        }
+    }
+
+    /// The whole-language reindex a file change asked for since the last
+    /// call, as `(trigger, reason)`. The caller runs it
+    /// (`PluginRegistry::run_owed_reindex`): it takes this supervisor's lock,
+    /// so the file change that asked for it could not.
+    pub(crate) fn take_owed_reindex(&self) -> Option<(String, String)> {
+        self.owed_reindex.lock().unwrap().take()
     }
 
     /// Puts the plugin to sleep if it has gone [`idle_timeout`] without work
@@ -742,7 +803,12 @@ pub fn orphan_check(
 /// [`LIFELINE_PID_ENV`] as a pid: `None` when unset (production) or when the
 /// value does not parse, so a malformed variable never ends the process.
 fn lifeline_pid() -> Option<u32> {
-    std::env::var(LIFELINE_PID_ENV).ok()?.trim().parse().ok()
+    lifeline_pid_from(std::env::var(LIFELINE_PID_ENV).ok().as_deref())
+}
+
+/// [`lifeline_pid`] over the variable's raw value, given rather than read.
+fn lifeline_pid_from(raw: Option<&str>) -> Option<u32> {
+    raw?.trim().parse().ok()
 }
 
 /// `true` only for a path the filesystem positively reports as absent

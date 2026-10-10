@@ -318,6 +318,53 @@ pub(crate) fn plugins_digest(discovered: &DiscoveredPlugins) -> String {
     plugin::truncated_hex(hasher)
 }
 
+/// Above this many files one language would gain from a `.gitignore` change,
+/// [`PluginRegistry::gitignore_changed`] does not reindex it (GM-508, Q2).
+pub(crate) const GITIGNORE_REINDEX_GUARD: usize = 10_000;
+
+/// The directories holding `gitignores` and `links` (project-relative, `""`
+/// for the root), deduplicated; just the root when one of them is in the
+/// root. A link's directory covers the files listed through it and, for a
+/// file link, the link itself.
+fn gitignore_subtrees(gitignores: &[String], links: &[String]) -> Vec<String> {
+    let mut dirs: Vec<String> = gitignores
+        .iter()
+        .chain(links)
+        .map(|path| path.rsplit_once('/').map_or(String::new(), |(dir, _)| dir.to_string()))
+        .collect();
+    if dirs.iter().any(String::is_empty) {
+        return vec![String::new()];
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Each language's `File` nodes under `subtrees` (as [`gitignore_subtrees`]
+/// spells them): the live side of [`PluginRegistry::gitignore_changed`].
+fn indexed_files_under(
+    conn: &rusqlite::Connection,
+    subtrees: &[String],
+) -> Result<BTreeMap<String, HashSet<String>>> {
+    let mut statement = conn
+        .prepare("SELECT language, filePath FROM nodes WHERE kind = 'File'")
+        .context("failed to query indexed files")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .context("failed to read indexed files")?;
+    let mut files: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    for row in rows {
+        let (language, file_path) = row.context("failed to read indexed files")?;
+        let under = subtrees.iter().any(|dir| {
+            dir.is_empty() || file_path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('/'))
+        });
+        if under {
+            files.entry(language).or_default().insert(file_path);
+        }
+    }
+    Ok(files)
+}
+
 /// [`indexer_version`] for a discovery that found nothing - the generation
 /// string a *test* stamps a fixture index with when it needs `meta` to exist
 /// and nothing will ever compare that stamp against a live daemon's.
@@ -664,10 +711,23 @@ impl PluginRegistry {
     /// has since gone reads as absent - installing is the fix.
     pub(crate) fn path_coverage(&self, file_path: &str) -> Option<PathCoverage> {
         if self.discovered.language_for(file_path).is_some() {
-            let language = self.discovered.indexing_language(file_path)?;
+            let language =
+                self.discovered.indexing_language(file_path, self.real_relative(file_path).as_deref())?;
             return self.is_failed_language(language).then(|| PathCoverage::Failed(language.to_string()));
         }
         crate::languages::absent_for_path(&self.discovered, file_path).map(PathCoverage::Absent)
+    }
+
+    /// `file_path`'s spelling relative to the project root's real path, when
+    /// a link on the way makes it differ from `file_path`; `None` otherwise,
+    /// and when the file does not resolve (deleted) or resolves outside the
+    /// root.
+    fn real_relative(&self, file_path: &str) -> Option<String> {
+        let real = std::fs::canonicalize(self.project_root.join(file_path)).ok()?;
+        let relative = real.strip_prefix(&self.project_root).ok()?;
+        let parts: Option<Vec<&str>> = relative.components().map(|part| part.as_os_str().to_str()).collect();
+        let real = parts?.join("/");
+        (real != file_path).then_some(real)
     }
 
     /// Which language claims `file_path`, by its extension; `None` if no
@@ -986,7 +1046,10 @@ impl PluginRegistry {
             if !self.workspace_language_matches(file_path).is_empty() {
                 continue;
             }
-            let Some(language) = self.discovered.indexing_language(file_path) else { continue };
+            let real = self.real_relative(file_path);
+            let Some(language) = self.discovered.indexing_language(file_path, real.as_deref()) else {
+                continue;
+            };
             if self.is_failed_language(language) {
                 continue;
             }
@@ -1044,7 +1107,10 @@ impl PluginRegistry {
         // Claimed, but under that language's own `exclude_dirs` - the same
         // `DiscoveredPlugins::indexing_language` filter `g-mesh status`'s
         // coverage walk applies, so the two agree on which files exist.
-        let Some(language) = self.discovered.indexing_language(&file_path).map(str::to_string) else {
+        let real = self.real_relative(&file_path);
+        let Some(language) =
+            self.discovered.indexing_language(&file_path, real.as_deref()).map(str::to_string)
+        else {
             return;
         };
         if self.is_failed_language(&language) {
@@ -1052,11 +1118,32 @@ impl PluginRegistry {
         }
 
         match self.get_or_spawn(&language) {
-            Ok(supervisor) => supervisor.file_changed(conn, file_path),
+            Ok(supervisor) => {
+                supervisor.file_changed(conn, file_path);
+                self.run_owed_reindex(conn, &supervisor);
+            }
             Err(err) => crate::log_line!(
                 "g-mesh daemon: could not start the {language} plugin for {file_path}: {err:#} - \
                  the change was not indexed"
             ),
+        }
+    }
+
+    /// Runs the whole-language reindex a file change of `supervisor`'s
+    /// language asked for (GM-507: its `affected` answer was `unknown`, above
+    /// `config_reindex::FALLBACK_SHARE_PERCENT`, or a re-extract failed), if
+    /// one did. Always the whole reindex, never a `resolutionChanged`: the
+    /// trigger is a source file, not a watch file.
+    fn run_owed_reindex(&self, conn: &IndexStore, supervisor: &Arc<PluginSupervisor>) {
+        let Some((trigger, reason)) = supervisor.take_owed_reindex() else { return };
+        let language = supervisor.language();
+        crate::log_line!("g-mesh daemon: reindexing all of {language} after {trigger} changed: {reason}");
+        if let Err(err) = crate::daemon::workspace_reindex::run(self, supervisor, conn, &trigger) {
+            crate::log_line!(
+                "g-mesh daemon: failed to reindex the {language} workspace after {trigger} changed: \
+                 {err:#} - {language}'s previous graph keeps serving, and the reindex runs again on \
+                 the next daemon start"
+            );
         }
     }
 
@@ -1067,10 +1154,26 @@ impl PluginRegistry {
     /// [`file_changed`](Self::file_changed)'s ordinary `get_or_spawn` call,
     /// with the same "failures are reported and dropped" contract.
     pub(crate) fn workspace_file_changed(&self, conn: &IndexStore, language: &str, changed_file: &str) {
+        self.reindex_workspace(conn, language, changed_file, true);
+    }
+
+    /// [`workspace_file_changed`](Self::workspace_file_changed), with
+    /// `selective` saying whether a `resolution_delta` plugin may be asked
+    /// what the edit changed (`daemon::config_reindex`). A `.gitignore` change
+    /// passes `false`: it changes which files are indexed, which no
+    /// resolution delta describes, so it always reindexes the whole language.
+    fn reindex_workspace(&self, conn: &IndexStore, language: &str, changed_file: &str, selective: bool) {
         match self.get_or_spawn(language) {
             Ok(supervisor) => {
-                if let Err(err) = crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
-                {
+                // A plugin that can say what the edit changed for resolution
+                // is asked first; every other one gets the whole-language
+                // reindex.
+                let reindexed = if selective && supervisor.manifest().capabilities.resolution_delta {
+                    crate::daemon::config_reindex::run(self, &supervisor, conn, changed_file)
+                } else {
+                    crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
+                };
+                if let Err(err) = reindexed {
                     crate::log_line!(
                         "g-mesh daemon: failed to reindex the {language} workspace after \
                          {changed_file} changed: {err:#} - {language}'s previous graph keeps \
@@ -1082,6 +1185,106 @@ impl PluginRegistry {
                 "g-mesh daemon: could not start the {language} plugin to reindex its workspace \
                  after {changed_file} changed: {err:#}"
             ),
+        }
+    }
+
+    /// GM-508's gate: `gitignores` (project-relative paths of settled
+    /// `.gitignore` files, created, edited or deleted) and `links` (spellings
+    /// of links created, removed or judged differently) may have changed
+    /// which files are indexed. Walks the directories holding them (with
+    /// their ancestors' rules, `project_walk::project_files_under`), splits
+    /// the files by [`DiscoveredPlugins::indexing_language`] and compares each
+    /// language with its `File` nodes under the same directories. Every
+    /// language with a difference is reindexed whole
+    /// ([`reindex_workspace`](Self::reindex_workspace), never asking for a
+    /// resolution delta, since a `.gitignore` changes which files are indexed;
+    /// the first of `gitignores`, else of `links`, as the trigger), unless it would gain more than
+    /// [`GITIGNORE_REINDEX_GUARD`] files: then one log line asks for
+    /// `g-mesh reindex`. No difference, no reindex.
+    pub(crate) fn gitignore_changed(&self, conn: &IndexStore, gitignores: &[String], links: &[String]) {
+        let Some(trigger) = gitignores.first().or(links.first()) else { return };
+        let subtrees = gitignore_subtrees(gitignores, links);
+        let live = match conn.with(|conn| indexed_files_under(conn, &subtrees)) {
+            Ok(live) => live,
+            Err(err) => {
+                crate::log_line!(
+                    "g-mesh daemon: could not read the indexed files to compare after {trigger} changed: {err:#}"
+                );
+                return;
+            }
+        };
+        let mut walked: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+        let pruned = self.discovered.excluded_by_every_language();
+        for file in crate::project_walk::project_files_under(&self.project_root, &pruned, &subtrees) {
+            if let Some(language) =
+                self.discovered.indexing_language(&file.relative, file.real_relative.as_deref())
+            {
+                walked.entry(language.to_string()).or_default().insert(file.relative);
+            }
+        }
+        let languages: std::collections::BTreeSet<String> =
+            walked.keys().chain(live.keys()).cloned().collect();
+        let none = HashSet::new();
+        for language in languages {
+            if !self.has_manifest(&language) || self.is_failed_language(&language) {
+                continue;
+            }
+            let now = walked.get(&language).unwrap_or(&none);
+            let indexed = live.get(&language).unwrap_or(&none);
+            let added = now.difference(indexed).count();
+            let removed = indexed.difference(now).count();
+            if added == 0 && removed == 0 {
+                continue;
+            }
+            if added > GITIGNORE_REINDEX_GUARD {
+                crate::log_line!(
+                    "g-mesh daemon: {trigger} changed would add {added} {language} files to the index - \
+                     more than {GITIGNORE_REINDEX_GUARD}, so nothing was reindexed; run `g-mesh reindex` \
+                     to index them"
+                );
+                continue;
+            }
+            crate::log_line!(
+                "g-mesh daemon: {trigger} changed which {language} files are indexed (+{added}, \
+                 -{removed}) - reindexing {language}"
+            );
+            // Whole-language: a resolution delta cannot say which files a
+            // `.gitignore` change added or removed.
+            self.reindex_workspace(conn, &language, trigger, false);
+        }
+    }
+
+    /// GM-508, owner's Q3: at daemon start on an indexed project, the
+    /// `.gitignore` files edited since the last walk recorded `bulkIndexedAt`
+    /// go through [`gitignore_changed`](Self::gitignore_changed). A
+    /// `.gitignore` deleted while the daemon was down leaves no mtime and is
+    /// not seen here.
+    pub(crate) fn recheck_gitignores_since_index(&self, conn: &IndexStore) {
+        let indexed_at = match conn.with(schema::bulk_indexed_at_unix) {
+            Ok(Some(indexed_at)) => indexed_at,
+            Ok(None) => return,
+            Err(err) => {
+                crate::log_line!("g-mesh daemon: could not read when the project was last walked: {err:#}");
+                return;
+            }
+        };
+        let pruned = self.discovered.excluded_by_every_language();
+        let newer: Vec<String> = crate::project_walk::gitignore_files(&self.project_root, &pruned)
+            .filter(|file| {
+                fs::metadata(&file.path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    // Whole seconds, like `bulkIndexedAt`. Strictly newer:
+                    // a file written in the walk's own last second is taken
+                    // as walked (an edit landing there is missed until the
+                    // next `.gitignore` event).
+                    .is_some_and(|since_epoch| since_epoch.as_secs() as i64 > indexed_at)
+            })
+            .map(|file| file.relative)
+            .collect();
+        if !newer.is_empty() {
+            self.gitignore_changed(conn, &newer, &[]);
         }
     }
 
@@ -1300,7 +1503,9 @@ impl PluginRegistry {
     pub fn replay_pending(&self, conn: &IndexStore) -> usize {
         let mut replayed = 0;
         for supervisor in self.active_supervisors() {
-            match supervisor.replay_pending(conn) {
+            let replay = supervisor.replay_pending(conn);
+            self.run_owed_reindex(conn, &supervisor);
+            match replay {
                 Ok(count) => replayed += count,
                 Err(err) => crate::log_line!(
                     "g-mesh daemon: could not replay the changes queued while the {} plugin \
@@ -1347,7 +1552,11 @@ impl PluginRegistry {
         }
 
         let supervisor = self.get_or_spawn(&language)?;
-        supervisor.ensure_fresh(conn, file_path).map(Some)
+        let outcome = supervisor.ensure_fresh(conn, file_path);
+        // Rare (see `run_owed_reindex`), and the query waits for it: the
+        // graph it reads is otherwise known to be stale.
+        self.run_owed_reindex(conn, &supervisor);
+        outcome.map(Some)
     }
 }
 

@@ -100,3 +100,5 @@ Each decision made from here on gets its own file, added as a row here.
 | 0027 | [Plugin fetch verifies checksums in Rust, a third implementation of the install rule](0027-plugin-fetch-checksums-in-rust.md) | Accepted |
 | 0028 | [Anchored responses rank by structure and answer before evidence](0028-anchored-responses-rank-and-answer-first.md) | Accepted |
 | 0029 | [Core ships its link result to the semantic tier, and the tier decides agreement with it](0029-core-ships-its-link-result-to-the-semantic-tier.md) | Accepted |
+| 0030 | [The test suite runs as named sections, defined in one script](0030-test-sections.md) | Accepted |
+| 0031 | [Local test runs: lib tests in one process, heavy tests at batch end](0031-local-test-runs.md) | Accepted |

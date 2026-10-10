@@ -29,7 +29,7 @@
 //!   correctly without having reread others.
 //! - **A cheap, regex-free scan (chosen).** [`mask`] blanks every comment and
 //!   string/char literal - byte-length-preserving, so its output stays
-//!   aligned with the original source - and [`scan_body`] then walks what is
+//!   aligned with the original source - and [`mod_decls`] then walks what is
 //!   left with a single explicit brace-depth stack, matching the literal
 //!   patterns `mod IDENT ;`, `mod IDENT { … }` and a `path = "…"` inside an
 //!   immediately preceding `#[…]`. It is not a parser: it does not know a
@@ -100,7 +100,7 @@
 //!   brace or semicolon) - harmless over-approximation, not a correctness
 //!   bug, since a real one is genuinely a module wherever it is written.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use g_mesh_plugin_sdk::RelPath;
@@ -110,94 +110,198 @@ use g_mesh_plugin_sdk::RelPath;
 /// [`crate::project::ProjectContext::load`] merges across every crate.
 pub(crate) type FileContainers = BTreeMap<RelPath, (String, Option<String>)>;
 
+/// One `mod` item as [`mod_signature`] reads it from a file's text: the
+/// inline modules enclosing it within that file, its name, its `#[path]`
+/// value, and whether it opens an inline body. `#[cfg]` is not part of it
+/// (Decision 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModDecl {
+    inline_segments: Vec<String>,
+    name: String,
+    explicit_path: Option<String>,
+    inline: bool,
+}
+
+/// Every `mod` item of one file, in source order. Two texts with the same
+/// signature place every other file identically, so a save that keeps it
+/// needs no re-scan.
+pub(crate) type ModSignature = Vec<ModDecl>;
+
+/// What [`scan_crate`] found for one crate.
+///
+/// Invariant: `files` holds only paths no earlier crate claimed (the `taken`
+/// set [`scan_crate`] was given), so the crates' `files` maps are disjoint
+/// and their union, in crate order, is what a whole-project scan builds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CrateTree {
+    /// Every file this crate claimed, with its container key and parent.
+    pub files: FileContainers,
+    /// Files this crate reached by `mod` but did not claim, because an
+    /// earlier crate (or an earlier `mod` of this one) already had them.
+    pub lost: BTreeSet<RelPath>,
+    /// The `mod` signature of every claimed file whose text was read.
+    pub signatures: BTreeMap<RelPath, ModSignature>,
+    /// Paths whose appearance would change this crate's tree: the candidate
+    /// files of a `mod` item that named nothing on disk, and the `<name>.rs`
+    /// a `mod name;` resolved past to `<name>/mod.rs`.
+    pub pending: BTreeSet<RelPath>,
+    /// What this scan could not honestly resolve.
+    pub notes: Vec<String>,
+}
+
+/// The `mod` signature of `source`: the same pass the crate scan makes over
+/// one file, without following any `mod` item.
+pub(crate) fn mod_signature(source: &str) -> ModSignature {
+    mod_decls(source)
+}
+
 /// Scans `crate_root_file` and everything it reaches by `mod` (file-based or
-/// inline), recording each reached file's own container key into `files` and
-/// appending a note for anything this scan could not honestly resolve.
+/// inline), recording each reached file's own container key and a note for
+/// anything this scan could not honestly resolve. A file in `taken` belongs
+/// to an earlier crate and is not claimed again.
 ///
 /// `crate_key` is this crate's own root container key (already normalized -
 /// see `crate::project::normalize_crate_name`); the crate root file itself is
 /// recorded under exactly that key, with no parent, which is what closes the
 /// `pub(crate)`/`pub(super)` parent-chain gap the design doc's containers
 /// module doc warns about - see `crate::project`'s module doc, decision 6.
+///
+/// A pure function of the files on disk and `taken`.
 pub(crate) fn scan_crate(
     root: &Path,
     crate_key: &str,
     crate_root_file: RelPath,
-    files: &mut FileContainers,
-    notes: &mut Vec<String>,
-) {
-    scan_file(root, crate_key, &[], crate_root_file, files, notes, true);
+    taken: &BTreeSet<RelPath>,
+) -> CrateTree {
+    let mut scan = Scan { root, crate_key, taken, tree: CrateTree::default() };
+    scan.scan_file(&[], crate_root_file, true);
+    scan.tree
 }
 
-/// Scans one file: records its own container key, then walks its `mod`
-/// items, recursing into an inline module's body in place and into a
-/// file-based module's file by calling this function again.
-///
-/// `key_segments` is this file's module path *within its crate*, empty for
-/// the crate root. `is_dir_owner` is true for the crate root and any
-/// `mod.rs` - a `mod child;` written at this file's own top level then
-/// resolves relative to this file's own directory; false for a "leaf"
-/// `name.rs`, whose children resolve relative to a subdirectory named after
-/// the *module* (`key_segments`' last segment), not after the file's own
-/// name, because `#[path]` can make those differ (Decision 3).
-fn scan_file(
-    root: &Path,
-    crate_key: &str,
-    key_segments: &[String],
-    file: RelPath,
-    files: &mut FileContainers,
-    notes: &mut Vec<String>,
-    is_dir_owner: bool,
-) {
-    if !register_file(crate_key, key_segments, &file, files, notes) {
-        return;
-    }
-
-    let Ok(source) = std::fs::read_to_string(file.to_absolute(root)) else {
-        // A `mod` item can name a file that does not exist - a stale
-        // declaration, or a file mid-save. The container key is already
-        // recorded above (Decision 3's "honest miss" only applies to a
-        // target *outside the project*; a missing file inside it still owns
-        // its key, it just has nothing left to scan).
-        notes.push(format!("{file}: declared as a module but could not be read; module tree stops here"));
-        return;
-    };
-    let cleaned = mask(&source);
-
-    let file_dir = parent_dir(file.as_str());
-    let own_mod_dir = if is_dir_owner {
-        file_dir
-    } else {
-        join(&file_dir, key_segments.last().map(String::as_str).unwrap_or(""))
-    };
-
-    scan_body(root, crate_key, key_segments, &file, &own_mod_dir, &source, &cleaned, files, notes);
+/// One crate's scan in progress.
+struct Scan<'a> {
+    root: &'a Path,
+    crate_key: &'a str,
+    taken: &'a BTreeSet<RelPath>,
+    tree: CrateTree,
 }
 
-/// Records `file`'s own container key, unless the key was already claimed
-/// by an earlier file - see the module doc's Decision 3. Returns whether the
-/// caller should keep scanning `file` for further `mod` items: `false` both
-/// when `file` lost the claim and when it was, impossibly, visited twice by
-/// construction (defensive only - every call site reaches a given `file` at
-/// most once along any single recursion path).
-fn register_file(
-    crate_key: &str,
-    key_segments: &[String],
-    file: &RelPath,
-    files: &mut FileContainers,
-    notes: &mut Vec<String>,
-) -> bool {
-    if files.contains_key(file) {
-        notes.push(format!(
-            "{file}: already indexed under a different module - a second `mod` claimed the same file; \
-             keeping the first"
-        ));
-        return false;
+impl Scan<'_> {
+    /// Scans one file: records its own container key, then walks its `mod`
+    /// items, recursing into a file-based module's file by calling this
+    /// function again.
+    ///
+    /// `key_segments` is this file's module path *within its crate*, empty
+    /// for the crate root. `is_dir_owner` is true for the crate root and any
+    /// `mod.rs` - a `mod child;` written at this file's own top level then
+    /// resolves relative to this file's own directory; false for a "leaf"
+    /// `name.rs`, whose children resolve relative to a subdirectory named
+    /// after the *module* (`key_segments`' last segment), not after the
+    /// file's own name, because `#[path]` can make those differ (Decision 3).
+    fn scan_file(&mut self, key_segments: &[String], file: RelPath, is_dir_owner: bool) {
+        if !self.register_file(key_segments, &file) {
+            return;
+        }
+
+        let Ok(source) = std::fs::read_to_string(file.to_absolute(self.root)) else {
+            // A `mod` item can name a file that does not exist - a stale
+            // declaration, or a file mid-save. The container key is already
+            // recorded above (Decision 3's "honest miss" only applies to a
+            // target *outside the project*; a missing file inside it still
+            // owns its key, it just has nothing left to scan).
+            self.tree
+                .notes
+                .push(format!("{file}: declared as a module but could not be read; module tree stops here"));
+            return;
+        };
+
+        let file_dir = parent_dir(file.as_str());
+        let own_mod_dir = if is_dir_owner {
+            file_dir
+        } else {
+            join(&file_dir, key_segments.last().map(String::as_str).unwrap_or(""))
+        };
+
+        let signature = mod_decls(&source);
+        for decl in signature.iter().filter(|decl| !decl.inline) {
+            // An inline module's body is part of `file` itself, so it needs
+            // no `register_file` call - only its file-based children, which
+            // resolve under its key and directory.
+            let mut segments = key_segments.to_vec();
+            segments.extend(decl.inline_segments.iter().cloned());
+            let mod_dir = decl.inline_segments.iter().fold(own_mod_dir.clone(), |dir, name| join(&dir, name));
+            self.handle_file_mod(&segments, &mod_dir, &file, &decl.name, decl.explicit_path.clone());
+        }
+        self.tree.signatures.insert(file, signature);
     }
-    let key = full_key(crate_key, key_segments);
-    let parent = parent_key(&key);
-    files.insert(file.clone(), (key, parent));
-    true
+
+    /// Records `file`'s own container key, unless the key was already
+    /// claimed by an earlier crate or an earlier file - see the module doc's
+    /// Decision 3. Returns whether the caller should keep scanning `file` for
+    /// further `mod` items.
+    fn register_file(&mut self, key_segments: &[String], file: &RelPath) -> bool {
+        if self.taken.contains(file) || self.tree.files.contains_key(file) {
+            self.tree.notes.push(format!(
+                "{file}: already indexed under a different module - a second `mod` claimed the same file; \
+                 keeping the first"
+            ));
+            self.tree.lost.insert(file.clone());
+            return false;
+        }
+        let key = full_key(self.crate_key, key_segments);
+        let parent = parent_key(&key);
+        self.tree.files.insert(file.clone(), (key, parent));
+        true
+    }
+
+    /// Resolves and recurses into a file-based `mod NAME;` (or `#[path =
+    /// "…"] mod NAME;`) declared at `mod_dir`/`key_segments` inside
+    /// `declaring_file`. A `mod` naming nothing on disk records the files
+    /// whose creation would resolve it as pending.
+    fn handle_file_mod(
+        &mut self,
+        key_segments: &[String],
+        mod_dir: &str,
+        declaring_file: &RelPath,
+        name: &str,
+        explicit_path: Option<String>,
+    ) {
+        let candidates = child_candidates(mod_dir, declaring_file, name, explicit_path.as_deref());
+        let Some((child_file, is_mod_rs)) =
+            resolve_child_file(self.root, mod_dir, declaring_file, name, explicit_path)
+        else {
+            self.tree.notes.push(format!(
+                "{declaring_file}: `mod {name};` has no file on disk under the project root - not indexed"
+            ));
+            self.tree.pending.extend(candidates);
+            return;
+        };
+        // `<name>.rs` wins over `<name>/mod.rs`, so its creation re-places
+        // this module.
+        if is_mod_rs {
+            self.tree.pending.extend(candidates.into_iter().filter(|candidate| *candidate != child_file));
+        }
+        let mut child_segments = key_segments.to_vec();
+        child_segments.push(name.to_string());
+        self.scan_file(&child_segments, child_file, is_mod_rs);
+    }
+}
+
+/// The files [`resolve_child_file`] looks for: the `#[path]` target, or
+/// `<mod_dir>/<name>.rs` and `<mod_dir>/<name>/mod.rs`.
+fn child_candidates(
+    mod_dir: &str,
+    declaring_file: &RelPath,
+    name: &str,
+    explicit_path: Option<&str>,
+) -> Vec<RelPath> {
+    match explicit_path {
+        Some(explicit_path) => vec![RelPath::new(join(&parent_dir(declaring_file.as_str()), explicit_path))],
+        None => vec![
+            RelPath::new(join(mod_dir, &format!("{name}.rs"))),
+            RelPath::new(join(mod_dir, &format!("{name}/mod.rs"))),
+        ],
+    }
 }
 
 /// The container key for `key_segments` within `crate_key` - just `crate_key`
@@ -220,35 +324,24 @@ fn parent_key(key: &str) -> Option<String> {
     key.rsplit_once("::").map(|(parent, _)| parent.to_string())
 }
 
-/// A single explicit forward scan of `cleaned` (the comment/string-masked
-/// text of `file`, byte-aligned with `source`) that finds every `mod` item at
-/// any brace depth, recursing into an inline module's body and into a
-/// file-based module's own file.
+/// A single explicit forward scan of `source`'s comment/string-masked text
+/// that finds every `mod` item at any brace depth, in source order, with the
+/// inline modules enclosing it.
 ///
 /// The only state carried between iterations is a small stack of "was this
 /// brace a module's own body" flags (so `}` knows whether to pop a module
-/// path segment) plus the module path and lookup directory themselves, both
-/// of which grow and shrink with that same stack - see the module doc's
-/// Decision 1 for why a full AST is not built to get this.
-#[allow(clippy::too_many_arguments)]
-fn scan_body(
-    root: &Path,
-    crate_key: &str,
-    base_key_segments: &[String],
-    file: &RelPath,
-    base_mod_dir: &str,
-    source: &str,
-    cleaned: &str,
-    files: &mut FileContainers,
-    notes: &mut Vec<String>,
-) {
+/// path segment) plus the inline module path itself, which grows and shrinks
+/// with that same stack - see the module doc's Decision 1 for why a full AST
+/// is not built to get this.
+fn mod_decls(source: &str) -> Vec<ModDecl> {
+    let cleaned = mask(source);
     let bytes = cleaned.as_bytes();
-    let mut key_segments: Vec<String> = base_key_segments.to_vec();
-    let mut mod_dir = base_mod_dir.to_string();
+    let mut decls = Vec::new();
+    let mut inline_segments: Vec<String> = Vec::new();
     // `true` for a frame opened by an inline `mod NAME {`, `false` for any
     // other brace (a function body, a struct literal, an `impl` block, ...) -
     // both are pushed so `}` always pops something, but only a module frame
-    // changes `key_segments`/`mod_dir` on the way back out.
+    // changes `inline_segments` on the way back out.
     let mut frames: Vec<bool> = Vec::new();
     let mut pending_path: Option<String> = None;
     let mut i = 0usize;
@@ -269,8 +362,7 @@ fn scan_body(
             }
             b'}' => {
                 if frames.pop() == Some(true) {
-                    key_segments.pop();
-                    mod_dir = parent_dir(&mod_dir);
+                    inline_segments.pop();
                 }
                 pending_path = None;
                 i += 1;
@@ -284,32 +376,21 @@ fn scan_body(
                 if word == "mod" && word_boundary_before(bytes, start) {
                     if let Some(outcome) = read_mod_item(bytes, i) {
                         let ModItem { name, after, opens_body } = outcome;
+                        let explicit_path = pending_path.take();
+                        decls.push(ModDecl {
+                            inline_segments: inline_segments.clone(),
+                            name: name.clone(),
+                            explicit_path: if opens_body { None } else { explicit_path },
+                            inline: opens_body,
+                        });
                         if opens_body {
-                            // Inline module: recurse in place. Its own file
-                            // is `file` itself, so it needs no new
-                            // `register_file` call - only its declarations
-                            // (GM-286's job) live under this deeper key.
                             // `after` points AT the opening `{`; it is
                             // consumed here (not by the generic `{` branch
                             // below) so exactly one frame is pushed for it.
-                            key_segments.push(name.clone());
-                            mod_dir = join(&mod_dir, &name);
+                            inline_segments.push(name);
                             frames.push(true);
-                            pending_path = None;
                             i = after + 1;
                         } else {
-                            let explicit_path = pending_path.take();
-                            handle_file_mod(
-                                root,
-                                crate_key,
-                                &key_segments,
-                                &mod_dir,
-                                file,
-                                &name,
-                                explicit_path,
-                                files,
-                                notes,
-                            );
                             i = after; // just past the `;`
                         }
                     } else {
@@ -326,6 +407,7 @@ fn scan_body(
             }
         }
     }
+    decls
 }
 
 /// What [`read_mod_item`] found after `mod IDENT`: the name, the index to
@@ -359,33 +441,6 @@ fn read_mod_item(bytes: &[u8], after_kw: usize) -> Option<ModItem> {
         Some(b'{') => Some(ModItem { name, after: after_name, opens_body: true }),
         _ => None,
     }
-}
-
-/// Resolves and recurses into a file-based `mod NAME;` (or `#[path = "…"]
-/// mod NAME;`) declared at `mod_dir`/`key_segments` inside `declaring_file`.
-#[allow(clippy::too_many_arguments)]
-fn handle_file_mod(
-    root: &Path,
-    crate_key: &str,
-    key_segments: &[String],
-    mod_dir: &str,
-    declaring_file: &RelPath,
-    name: &str,
-    explicit_path: Option<String>,
-    files: &mut FileContainers,
-    notes: &mut Vec<String>,
-) {
-    let Some((child_file, is_mod_rs)) =
-        resolve_child_file(root, mod_dir, declaring_file, name, explicit_path)
-    else {
-        notes.push(format!(
-            "{declaring_file}: `mod {name};` has no file on disk under the project root - not indexed"
-        ));
-        return;
-    };
-    let mut child_segments = key_segments.to_vec();
-    child_segments.push(name.to_string());
-    scan_file(root, crate_key, &child_segments, child_file, files, notes, is_mod_rs);
 }
 
 /// Finds the file a file-based `mod NAME;` resolves to, and whether that file
@@ -655,10 +710,8 @@ mod tests {
     use super::*;
 
     fn scan(root: &Path, crate_key: &str, entry: &str) -> (FileContainers, Vec<String>) {
-        let mut files = FileContainers::new();
-        let mut notes = Vec::new();
-        scan_crate(root, crate_key, RelPath::new(entry), &mut files, &mut notes);
-        (files, notes)
+        let tree = scan_crate(root, crate_key, RelPath::new(entry), &BTreeSet::new());
+        (tree.files, tree.notes)
     }
 
     struct Tree(std::path::PathBuf);

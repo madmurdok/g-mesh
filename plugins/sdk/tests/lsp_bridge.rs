@@ -2817,112 +2817,113 @@ fn a_failed_pass_after_an_agreeing_re_export_pass_leaves_one_row() {
     );
 }
 
-// --- GM-487: what a per-file pass did not finish is asked again ------------
-
 /// A per-file pass over `files`.
 fn pass_over(bridge: &mut LspBridge, index: &SdkIndex, files: &[&str]) -> SemanticAnswer {
     let files: Vec<RelPath> = files.iter().map(|file| RelPath::new(*file)).collect();
     bridge.answer(&files, index).expect("the bridge answers rather than failing")
 }
 
-/// GM-487 Fix 2: the per-file pass for `b.toy` meets a server that is still
-/// indexing and asks nothing. Core will not send `b.toy` again until it is
-/// edited, so the next per-file pass - for `a.toy`, which has no site of its
-/// own - asks `b.toy`'s site too, against the server that is warm by then,
-/// and emits its edge.
-///
-/// Control: drop `scope.extend(self.owed.keys().cloned())` in
-/// `LspBridge::answer`; pass 2 asks only about `a.toy`, sends no
-/// `textDocument/definition`, and `b.toy` gets no edge.
-#[test]
-fn a_file_whose_pass_met_a_cold_server_is_asked_on_the_next_pass() {
-    let scratch = Scratch::new("owed-cold");
-    let (index, caller) = fixture(&scratch);
-    let log = scratch.path().join("asked.log");
-    let config = scratch.server(json!({
-        "readiness": { "kind": "progress", "beginAfterMs": 0, "endAfterMs": 3000 },
-        "nullWhileIndexing": true,
-        "positionEncoding": "utf-16",
-        "answers": answers_the_site(&scratch),
-        "log": log.to_string_lossy(),
-    }));
-    let mut budgets = budgets();
-    // Pass 1 gives up at 1.5s, long before the server finishes indexing at
-    // 3s. The settle clock starts when the bridge *reads* the end of
-    // progress - at the start of pass 2 - so it must fit in pass 2's
-    // readiness budget.
-    budgets.readiness = Duration::from_millis(1_500);
-    budgets.settle = Duration::from_secs(1);
-    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+// --- unfinished files: what a pass tells core to ask again -------------------
 
-    let cold = pass_over(&mut bridge, &index, &["src/b.toy"]);
-    assert!(!cold.complete, "a pass that asked nothing has not finished");
-    assert!(reason(&cold).contains("still indexing"), "{}", reason(&cold));
-    assert_eq!(asked(&log, "textDocument/definition"), 0, "the cold pass asked nothing");
-
-    // Past the end of indexing, so pass 2 reads it at once.
-    std::thread::sleep(Duration::from_secs(2));
-
-    let warm = pass_over(&mut bridge, &index, &["src/a.toy"]);
-    assert!(warm.complete, "{:?}", warm.reason);
-    assert_eq!(asked(&log, "textDocument/definition"), 1, "the owed site in b.toy was asked");
-    let edges = semantic_edges(&warm);
-    assert_eq!(edges.len(), 1, "{:#?}", warm.diff);
-    assert_eq!(edges[0].from_id, caller, "the edge is b.toy's call");
+/// The set of `files`, as [`SemanticAnswer::unfinished`] holds it.
+fn files(files: &[&str]) -> std::collections::BTreeSet<RelPath> {
+    files.iter().map(|file| RelPath::new(*file)).collect()
 }
 
-/// GM-487 Fix 2 is bounded: a site the server refuses every time is re-asked
-/// by at most three passes, counting the one it was sent with, and then
-/// left alone until the file changes.
+/// A server that never becomes ready finishes nothing: every file the pass
+/// had a question for is unfinished. `a.toy`, sent too, has no site, so there
+/// is nothing in it to finish and it is not named.
 ///
-/// Control: raise `MAX_OWED_ATTEMPTS` (or drop the `attempts >=
-/// MAX_OWED_ATTEMPTS` removal in `settle_owed`); pass 4 still asks the site.
+/// Control: answer this branch with `with_unfinished(scope)` or with no list
+/// at all.
 #[test]
-fn a_file_no_pass_can_finish_is_re_asked_by_three_passes_and_then_dropped() {
-    let scratch = Scratch::new("owed-cap");
+fn a_server_that_never_becomes_ready_leaves_every_asked_file_unfinished() {
+    let scratch = Scratch::new("unfinished-never-ready");
     let (index, _) = fixture(&scratch);
-    let log = scratch.path().join("asked.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "never", "beginAfterMs": 0 },
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.readiness = Duration::from_millis(600);
+    budgets.settle = Duration::from_secs(2);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass_over(&mut bridge, &index, &["src/a.toy", "src/b.toy"]);
+    assert!(!answer.complete);
+    assert_eq!(answer.unfinished, Some(files(&["src/b.toy"])));
+}
+
+/// A server that refuses `b.toy`'s one question leaves `b.toy` unfinished
+/// and only it, on a per-file pass and on a whole-project pass alike.
+///
+/// Control: drop `asked_about.difference(&finished)` from the normal return
+/// of `LspBridge::answer` (an empty list, or none).
+#[test]
+fn a_refused_question_leaves_only_its_file_unfinished() {
+    let scratch = Scratch::new("unfinished-refused");
+    let (index, _) = fixture(&scratch);
     let mut answers = answers_the_site(&scratch);
     answers[0]["error"] = json!("refused, every time");
     let config = scratch.server(json!({
         "readiness": { "kind": "none" },
         "positionEncoding": "utf-16",
         "answers": answers,
-        "log": log.to_string_lossy(),
     }));
     let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
 
-    let first = pass_over(&mut bridge, &index, &["src/b.toy"]);
-    assert!(!first.complete, "a refused question leaves the file unfinished");
-    let mut per_pass = vec![asked(&log, "textDocument/definition")];
-    for _ in 0..3 {
-        // Each later pass is for a.toy, which has no site of its own.
-        pass_over(&mut bridge, &index, &["src/a.toy"]);
-        per_pass.push(asked(&log, "textDocument/definition"));
-    }
-    let deltas: Vec<usize> = per_pass.windows(2).map(|pair| pair[1] - pair[0]).collect();
-    assert!(per_pass[0] > 0, "pass 1 asked b.toy's site: {per_pass:?}");
-    assert!(deltas[0] > 0 && deltas[1] > 0, "passes 2 and 3 re-asked it: {per_pass:?}");
-    assert_eq!(deltas[2], 0, "pass 4 no longer asks it: {per_pass:?}");
+    let per_file = pass_over(&mut bridge, &index, &["src/a.toy", "src/b.toy"]);
+    assert!(!per_file.complete);
+    assert_eq!(per_file.unfinished, Some(files(&["src/b.toy"])));
+
+    let whole = pass(&mut bridge, &index);
+    assert!(!whole.complete);
+    assert_eq!(whole.unfinished, Some(files(&["src/b.toy"])));
 }
 
-/// An incomplete whole-project pass is core's to repeat, and it does not
-/// settle what earlier per-file passes left unfinished: `b.toy`, refused by
-/// its per-file pass and again by the whole-project pass, is still asked by
-/// the next per-file pass - and answered, now that the server has stopped
-/// refusing.
-///
-/// Control: make the whole-project branch at the end of `LspBridge::answer`
-/// clear `owed` whether or not the pass finished; pass 3 asks nothing about
-/// `b.toy` and emits no edge.
+/// A pass that answers everything it asked names an empty list - not `None`,
+/// which would leave core guessing - whether it asked something or had
+/// nothing to ask, and a file no longer in the index is not unfinished.
 #[test]
-fn an_incomplete_whole_project_pass_keeps_what_is_owed() {
-    let scratch = Scratch::new("owed-whole");
-    let (index, caller) = fixture(&scratch);
+fn a_pass_that_finishes_its_scope_names_nothing_unfinished() {
+    let scratch = Scratch::new("unfinished-none");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    let answered = pass_over(&mut bridge, &index, &["src/b.toy"]);
+    assert!(answered.complete, "{:?}", answered.reason);
+    assert_eq!(semantic_edges(&answered).len(), 1, "{:#?}", answered.diff);
+    assert_eq!(answered.unfinished, Some(files(&[])));
+
+    let nothing_to_ask = pass_over(&mut bridge, &index, &["src/a.toy"]);
+    assert!(nothing_to_ask.complete);
+    assert_eq!(nothing_to_ask.unfinished, Some(files(&[])));
+
+    let gone = pass_over(&mut bridge, &index, &["src/gone.toy"]);
+    assert!(gone.complete);
+    assert_eq!(gone.unfinished, Some(files(&[])));
+}
+
+/// The bridge keeps nothing between passes: what a per-file pass did not
+/// finish is core's to send again, so the next per-file pass, sent only
+/// `a.toy`, asks nothing about `b.toy` - though the server would answer it
+/// now - and names nothing unfinished.
+///
+/// Control: put `b.toy` back into the second pass's scope (restore the
+/// bridge's own owed set).
+#[test]
+fn a_per_file_pass_asks_only_about_the_files_it_was_sent() {
+    let scratch = Scratch::new("unfinished-not-kept");
+    let (index, _) = fixture(&scratch);
     let log = scratch.path().join("asked.log");
     let mut answers = answers_the_site(&scratch);
-    answers[0]["error"] = json!("refused, twice");
-    answers[0]["errorTimes"] = json!(2);
+    answers[0]["error"] = json!("refused, once");
+    answers[0]["errorTimes"] = json!(1);
     let config = scratch.server(json!({
         "readiness": { "kind": "none" },
         "positionEncoding": "utf-16",
@@ -2931,18 +2932,93 @@ fn an_incomplete_whole_project_pass_keeps_what_is_owed() {
     }));
     let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
 
-    let per_file = pass_over(&mut bridge, &index, &["src/b.toy"]);
-    assert!(!per_file.complete, "refusal 1");
-    let whole = pass(&mut bridge, &index);
-    assert!(!whole.complete, "refusal 2: the whole-project pass did not finish b.toy");
+    let refused = pass_over(&mut bridge, &index, &["src/b.toy"]);
+    assert_eq!(refused.unfinished, Some(files(&["src/b.toy"])));
     let before = asked(&log, "textDocument/definition");
+    assert!(before > 0, "the first pass asked b.toy's site");
 
     let next = pass_over(&mut bridge, &index, &["src/a.toy"]);
-    assert!(asked(&log, "textDocument/definition") > before, "b.toy is still owed and was asked");
+    assert_eq!(asked(&log, "textDocument/definition"), before, "b.toy was not asked again");
     assert!(next.complete, "{:?}", next.reason);
-    let edges = semantic_edges(&next);
-    assert_eq!(edges.len(), 1, "{:#?}", next.diff);
-    assert_eq!(edges[0].from_id, caller);
+    assert!(semantic_edges(&next).is_empty(), "{:#?}", next.diff);
+    assert_eq!(next.unfinished, Some(files(&[])));
+
+    let resent = pass_over(&mut bridge, &index, &["src/b.toy"]);
+    assert_eq!(semantic_edges(&resent).len(), 1, "sent again, b.toy is answered: {:#?}", resent.diff);
+    assert_eq!(resent.unfinished, Some(files(&[])));
+}
+
+/// A ceiling that admits no site has asked nothing, so every file in scope
+/// is unfinished - the one with no site too, since the ceiling is why
+/// nothing was asked.
+///
+/// Control: answer the `max_sites = 0` branch with no list, or an empty one.
+#[test]
+fn a_ceiling_that_admits_no_site_leaves_the_whole_scope_unfinished() {
+    let scratch = Scratch::new("unfinished-ceiling-zero");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.max_sites = 0;
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass_over(&mut bridge, &index, &["src/a.toy", "src/b.toy"]);
+    assert!(!answer.complete);
+    assert_eq!(answer.unfinished, Some(files(&["src/a.toy", "src/b.toy"])));
+}
+
+/// A ceiling that cuts a pass short leaves a file with no question
+/// unfinished too - it may have had none only because the ceiling was spent -
+/// while a file whose questions were all asked and answered is finished.
+///
+/// Control: drop the `plan.truncated` extension of the unfinished set.
+#[test]
+fn a_ceiling_that_cuts_a_pass_short_leaves_the_files_without_a_question_unfinished() {
+    let scratch = Scratch::new("unfinished-ceiling-cut");
+    let mut index = SdkIndex::new();
+    let decl = RelPath::new("src/decl.toy");
+    let decl_source = "fn target\n";
+    scratch.write("src/decl.toy", decl_source);
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &decl);
+    builder.file_node(range(0, 0, 1, 0));
+    builder.add_node(
+        NodeSpec::new(NodeKind::Function, "target", "target", range(0, 3, 0, 9))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    index.insert(decl, decl_source.to_string(), builder.finish());
+    crowd_file(&scratch, &mut index, "src/x.toy", 2);
+    crowd_file(&scratch, &mut index, "src/y.toy", 2);
+    let mut answers = Vec::new();
+    for file in ["src/x.toy", "src/y.toy"] {
+        for line in 0..2u32 {
+            answers.push(json!({
+                "uri": scratch.uri(file),
+                "line": line,
+                "character": 5,
+                "definition": { "uri": scratch.uri("src/decl.toy"), "line": 0, "character": 4 },
+            }));
+        }
+    }
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers,
+    }));
+    let mut budgets = budgets();
+    budgets.max_sites = 3;
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "the ceiling cut the pass short");
+    let unfinished = answer.unfinished.expect("the bridge always names its unfinished files");
+    assert!(unfinished.contains(&RelPath::new("src/decl.toy")), "{unfinished:?}");
+    assert!(!unfinished.contains(&RelPath::new("src/x.toy")), "x.toy was asked in full: {unfinished:?}");
 }
 
 // --- GM-348: overload binding -----------------------------------------------
@@ -3947,4 +4023,245 @@ fn the_warm_up_sits_inside_the_pass_budget() {
     assert!(!answer.complete);
     assert!(reason(&answer).contains("ran out of its budget"), "{}", reason(&answer));
     assert!(took < Duration::from_secs(6), "the pass budget ended the wait, not the warm-up: {took:?}");
+}
+
+// --- GM-550: readiness from rust-analyzer's quiescent status ----------------
+//
+// `LspBridge::quiescent_signal` makes readiness read the server's
+// `experimental/serverStatus` `quiescent` bit (fake-lsp's `serverStatus`
+// table scripts it). Every test here holds the settle long enough that the
+// fake's first `quiescent: false`, written while it handles `initialized`,
+// reaches the client long before a quiet period could pass on its own.
+
+/// A bridge with the GM-550 signal on and `budgets`.
+fn signalled_bridge(scratch: &Scratch, config: SemanticConfig, budgets: Budgets) -> LspBridge {
+    LspBridge::with_budgets("toy", scratch.path(), config, budgets).quiescent_signal()
+}
+
+/// rust-analyzer's capability is asked for only by a bridge with the signal
+/// on; any other server is initialized exactly as before.
+///
+/// Control: drop the `if self.quiescent_signal` guard around the
+/// `experimental` capability in `LspClient::initialize`; the plain arm
+/// advertises it too.
+#[test]
+fn only_a_signalled_bridge_asks_for_the_server_status() {
+    for signalled in [true, false] {
+        let scratch = Scratch::new(if signalled { "status-asked" } else { "status-not-asked" });
+        let (index, _) = fixture(&scratch);
+        let out = scratch.path().join("experimental.json");
+        let config = scratch.server(json!({
+            "readiness": { "kind": "none" },
+            "positionEncoding": "utf-16",
+            "answers": answers_the_site(&scratch),
+            "capabilitiesOut": out.to_string_lossy(),
+        }));
+        let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+        if signalled {
+            bridge = bridge.quiescent_signal();
+        }
+
+        assert!(pass(&mut bridge, &index).complete);
+        let experimental: Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).expect("the server saw an initialize"))
+                .unwrap();
+        if signalled {
+            assert_eq!(experimental, json!({ "serverStatusNotification": true }));
+        } else {
+            assert_eq!(experimental, Value::Null, "a plain bridge asks for no extension");
+        }
+    }
+}
+
+/// The GM-550 flake: rust-analyzer under load paused longer than the settle
+/// between two start-up phases, and the bridge called it ready in the gap.
+/// Here the gap (2.5s) is longer than the settle (2s), as measured, and the
+/// server answers `null` until its last phase ends; a signalled bridge is
+/// still not ready in the gap, because the server is `quiescent: false`
+/// throughout, and asks only after `quiescent: true`.
+///
+/// Control: in `LspClient::track_progress`, start the quiet clock on every
+/// last `end` (drop `&& self.quiescent != Some(false)`); the first phase's
+/// end reads as ready, the bridge asks in the gap and records no edge.
+#[test]
+fn a_gap_between_phases_longer_than_the_settle_is_not_readiness_for_a_signalled_server() {
+    let scratch = Scratch::new("status-gap");
+    let (index, _) = fixture(&scratch);
+    let log = scratch.path().join("asked.log");
+    let config = scratch.server(json!({
+        "readiness": { "phases": [
+            { "token": "fetching", "beginAfterMs": 0, "holdMs": 50 },
+            { "token": "building", "beginAfterMs": 2_500, "holdMs": 50 },
+        ]},
+        "serverStatus": {},
+        "nullWhileIndexing": true,
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "log": log.to_string_lossy(),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_secs(2);
+    let mut bridge = signalled_bridge(&scratch, config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert_eq!(
+        semantic_edges(&answer).len(),
+        1,
+        "the gap between two phases is not the end of loading ({}): {:#?}",
+        uptime(),
+        answer.diff
+    );
+    assert!(answer.complete);
+    assert_eq!(asked(&log, "textDocument/definition"), 1, "asked once, after the server was quiescent");
+}
+
+/// A signalled server's first settle is its `quiescent: true`, not a further
+/// quiet period: with a 10s settle and a start-up of 100ms, the pass is done
+/// long before the settle could have passed.
+///
+/// Control: in `LspClient::settle`, always pass `quiet` to `quiet_for`
+/// (drop the `signalled` zero); the pass waits out the 10s settle.
+#[test]
+fn a_signalled_server_is_ready_at_its_quiescent_status_without_the_settle() {
+    let scratch = Scratch::new("status-ready");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "phases": [{ "token": "fetching", "beginAfterMs": 0, "holdMs": 100 }] },
+        "serverStatus": {},
+        "nullWhileIndexing": true,
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_secs(10);
+    budgets.readiness = Duration::from_secs(30);
+    let mut bridge = signalled_bridge(&scratch, config, budgets);
+
+    let started = std::time::Instant::now();
+    let answer = pass(&mut bridge, &index);
+    let took = started.elapsed();
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+    assert!(answer.complete);
+    assert!(
+        took < Duration::from_secs(7),
+        "ready at quiescent, not after the settle: {took:?} ({})",
+        uptime()
+    );
+}
+
+/// A signalled bridge talking to a server that never sends a status (an
+/// older rust-analyzer, or another server behind the manifest) keeps the
+/// quiet-period rule: it waits out the settle, and does not wait for a
+/// signal that is not coming.
+///
+/// Control: in `LspClient::settle`, drop `self.quiescent.is_some()` from
+/// `signalled`; the bridge believes a server that said nothing at once.
+#[test]
+fn a_signalled_bridge_keeps_the_settle_for_a_server_that_sends_no_status() {
+    let scratch = Scratch::new("status-none");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_millis(900);
+    budgets.readiness = Duration::from_secs(20);
+    let mut bridge = signalled_bridge(&scratch, config, budgets);
+
+    let started = std::time::Instant::now();
+    let answer = pass(&mut bridge, &index);
+    let took = started.elapsed();
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+    assert!(answer.complete);
+    assert!(took >= Duration::from_millis(800), "the settle is still paid: {took:?}");
+    assert!(took < Duration::from_secs(15), "and not the readiness budget: {took:?} ({})", uptime());
+}
+
+/// A server stuck at `quiescent: false` - no progress token at all - is
+/// still loading: nothing is asked, and the pass gives up at the readiness
+/// budget, incomplete, as for a progress that never ends.
+///
+/// Control: in `LspClient::track_status`, do not clear `idle_since` on
+/// `quiescent: false`; the silent server reads as ready and is asked.
+#[test]
+fn a_server_that_stays_not_quiescent_is_never_asked_and_the_pass_is_incomplete() {
+    let scratch = Scratch::new("status-never");
+    let (index, _) = fixture(&scratch);
+    let log = scratch.path().join("asked.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "serverStatus": { "quiescent": "never" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "log": log.to_string_lossy(),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_millis(150);
+    budgets.readiness = Duration::from_millis(1_500);
+    let mut bridge = signalled_bridge(&scratch, config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "a pass that asked nothing has not completed");
+    assert!(reason(&answer).contains("still indexing"), "{}", reason(&answer));
+    assert!(answer.diff.upsert_edges.is_empty());
+    assert_eq!(asked(&log, "textDocument/definition"), 0, "nothing is asked of a loading server");
+}
+
+/// A bridge without the signal ignores a status it never asked for: a
+/// server pushing `quiescent: false` unasked is ready by the quiet-period
+/// rule, exactly as before GM-550.
+///
+/// Control: in `LspClient::handle`, route `experimental/serverStatus` to
+/// `track_status` whatever `quiescent_signal` says; the plain bridge waits
+/// for a `true` that never comes and the pass is incomplete.
+#[test]
+fn a_plain_bridge_ignores_a_server_status_it_did_not_ask_for() {
+    let scratch = Scratch::new("status-unasked");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "serverStatus": { "quiescent": "never", "unasked": true },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_millis(150);
+    budgets.readiness = Duration::from_secs(5);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+    assert!(answer.complete, "{:?}", answer.reason);
+}
+
+/// After a `workspaceChanged`, the last `quiescent: true` may predate the
+/// change, so a signalled server's next settle is the full quiet period on
+/// top of the signal (GM-433's rule kept).
+///
+/// Control: in `LspClient::unsettle`, do not set `reloading`; the stale
+/// `true` makes the server ready at once after the change.
+#[test]
+fn after_a_workspace_change_a_signalled_server_still_pays_the_settle() {
+    let scratch = Scratch::new("status-reload");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "serverStatus": {},
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_millis(900);
+    let mut bridge = signalled_bridge(&scratch, config, budgets);
+
+    assert_eq!(semantic_edges(&pass(&mut bridge, &index)).len(), 1);
+    bridge.workspace_changed();
+    let started = std::time::Instant::now();
+    let answer = pass(&mut bridge, &index);
+    let took = started.elapsed();
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+    assert!(answer.complete);
+    assert!(took >= Duration::from_millis(800), "the change costs a full settle: {took:?} ({})", uptime());
 }

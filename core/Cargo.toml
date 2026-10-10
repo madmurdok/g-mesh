@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "4.2.0"
+version = "4.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -36,6 +36,10 @@ globset = "0.4"
 # this crate. `json-schema` is the `schemars` derive on `Position`, which only
 # core needs (its MCP tool schemas); the SDK leaves it off.
 g-mesh-wire = { path = "../wire", features = ["json-schema"] }
+# The project walk the plugins run, symlink guard included: core's walks
+# (status, the absent-language count, the watcher's layers and link table,
+# the `.gitignore` gate) list the same files under the same spellings.
+g-mesh-walk = { path = "../walk" }
 ignore = "0.4"
 notify = "6"
 # `[plugin] memoryLimitMb` (task GM-274, `daemon::memory`) needs each

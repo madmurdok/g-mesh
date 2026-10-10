@@ -89,6 +89,7 @@ pub mod log;
 pub mod lsp;
 mod manifest;
 mod path;
+mod resolution;
 mod run;
 mod semantic;
 pub mod testing;
@@ -103,6 +104,7 @@ pub use graph::{
 pub use index::{FileEntry, SdkIndex};
 pub use manifest::{PluginSpec, ResolvedSpec, MANIFEST_PATH_ENV};
 pub use path::RelPath;
+pub use resolution::{container_delta, ContainerFacts};
 pub use run::run;
 pub use semantic::{
     write_semantic_engine_marker, SemanticAnswer, SemanticEngine, SemanticEngineFactory, MARKER_DIR_ENV,
@@ -150,7 +152,7 @@ pub trait Extractor: Send + Sync {
 
     /// The extractor's own workspace model: crate roots and a module map for
     /// Rust, a package map for Go, `sys.path` for Python. Rebuilt from
-    /// scratch whenever core sends `workspaceChanged`.
+    /// scratch whenever core sends `workspaceChanged` or `resolutionChanged`.
     ///
     /// An associated type rather than the design sketch's single
     /// `ProjectContext` struct, because there is nothing for such a struct to
@@ -196,4 +198,62 @@ pub trait Extractor: Send + Sync {
     /// - a panic is caught and costs that one path's presence. It may leave
     ///   `project` half-updated, so do not panic here either.
     fn file_presence_changed(&self, _project: &mut Self::Project, _path: &RelPath, _present: bool) {}
+
+    /// Updates `project` for a source file's new text (`None`: the file is
+    /// gone or unreadable), and names the **other** files whose extraction
+    /// that update may change. For a model built from the sources
+    /// themselves, such as Rust's module tree read from `mod` items.
+    ///
+    /// The default does nothing and answers `None`. Contract:
+    /// - called on `fileChanged` after [`file_presence_changed`](Extractor::file_presence_changed)
+    ///   and before [`extract`](Extractor::extract) of the same path, only
+    ///   when the text differs from what this process last reported (or on a
+    ///   re-extract), never from the bulk walk;
+    /// - `None` means no other file extracts differently. `Some` follows
+    ///   [`resolution_delta`](Extractor::resolution_delta)'s contract for
+    ///   `Affected` (a superset of the files that change) and need not name
+    ///   `path` itself, which this same round trip extracts;
+    /// - a panic is caught and costs the delta (`None`). It may leave
+    ///   `project` half-updated, so do not panic here either.
+    fn source_changed(
+        &self,
+        _project: &mut Self::Project,
+        _path: &RelPath,
+        _source: Option<&str>,
+    ) -> Option<wire::ResolutionDelta> {
+        None
+    }
+
+    /// The facts `project`'s resolution reads, as an opaque blob core stores
+    /// beside the index and hands back to
+    /// [`resolution_delta`](Extractor::resolution_delta) after a watch-file
+    /// save. Written as the bulk walk's last line and returned with every
+    /// `resolutionChanged` answer.
+    ///
+    /// The default, `None`, stores nothing, so every watch-file save
+    /// reindexes the language. A plugin returning `Some` must also implement
+    /// `resolution_delta`, set `specifier` on its `IMPORTS` edges
+    /// ([`EdgeSpec::specifier`]) and declare `resolution_delta` in its
+    /// manifest. Must not read the disk: it is a projection of `project`.
+    fn resolution_facts(&self, _project: &Self::Project) -> Option<String> {
+        None
+    }
+
+    /// What a watch-file save changed for resolution: `previous` is the blob
+    /// [`resolution_facts`](Extractor::resolution_facts) returned for the
+    /// model the index was built from, and `project` the reloaded model.
+    ///
+    /// Contract:
+    /// - [`ResolutionDelta::Unchanged`](wire::ResolutionDelta::Unchanged)
+    ///   only when every import of every file resolves exactly as before;
+    /// - [`ResolutionDelta::Affected`](wire::ResolutionDelta::Affected) must
+    ///   select a superset of the files whose extraction differs under
+    ///   `project`: over-selecting costs time, missing a file leaves it stale;
+    /// - [`ResolutionDelta::Unknown`](wire::ResolutionDelta::Unknown) when
+    ///   `previous` cannot be read, which reindexes the language.
+    ///
+    /// The default answers `Unknown`.
+    fn resolution_delta(&self, _previous: &str, _project: &Self::Project) -> wire::ResolutionDelta {
+        wire::ResolutionDelta::Unknown { reason: "this plugin computes no resolution delta".to_string() }
+    }
 }

@@ -606,6 +606,53 @@ fn a_use_of_a_submodule_gains_an_imports_edge_a_plain_symbol_use_does_not() {
     assert_eq!(graph.target_of(graph.placeholder("pending_symbol", "f")).0, container("krate::a"));
 }
 
+/// GM-544: every `IMPORTS` edge carries the path as written as its
+/// `specifier`: the `use` prefix (`crate::a`, `super::a`), the prefix plus
+/// the leaf for a submodule's own edge, the crate name for `extern crate`
+/// and a bare `use`, and an external crate's spelled prefix. Rendered as
+/// `(target, specifier)`, sorted.
+///
+/// Control: pass `""` instead of `specifier` in `Declarer::import_edge`'s
+/// call to `Emitter::import_edge`: every specifier reads `""`.
+#[test]
+fn every_imports_edge_carries_the_path_as_written() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod c;\n"),
+        ("src/a.rs", "pub mod b;\npub fn f() {}\n"),
+        ("src/a/b.rs", "pub fn g() {}\n"),
+        (
+            "src/c.rs",
+            "extern crate alloc;\nuse serde;\nuse std::io::Error;\nuse crate::a::b;\nuse super::a::f;\n",
+        ),
+    ]);
+    let graph = krate.extract("src/c.rs");
+    let from = graph.node("src/c.rs").id.clone();
+    let mut specifiers: Vec<(String, Option<String>)> = graph
+        .edges(EdgeKind::Imports)
+        .into_iter()
+        .filter(|edge| edge.from_id == from)
+        .map(|edge| {
+            let node = graph.by_id(&edge.to_id);
+            (
+                format!("{} {}", node.native_kind.clone().unwrap_or_default(), node.qualified_name),
+                edge.specifier.clone(),
+            )
+        })
+        .collect();
+    specifiers.sort();
+    let expected: Vec<(String, Option<String>)> = [
+        ("external_module alloc", "alloc"),
+        ("external_module serde", "serde"),
+        ("external_module std", "std::io"),
+        ("resolved_module krate::a::*", "crate::a"),
+        ("resolved_module krate::a::b::*", "crate::a::b"),
+    ]
+    .iter()
+    .map(|(target, specifier)| (target.to_string(), Some(specifier.to_string())))
+    .collect();
+    assert_eq!(specifiers, expected, "{:#?}", graph.names());
+}
+
 // --- calls and references -------------------------------------------------------
 
 #[test]
@@ -1576,6 +1623,128 @@ fn a_method_of_an_external_trait_is_no_supertype_edge() {
         "{:#?}",
         graph.names()
     );
+}
+
+/// The addresses of every `SUPERTYPE_OF` edge out of `from`, each the
+/// placeholder's `(scope, key)`: empty when the clause emitted nothing.
+fn supertype_addresses(graph: &Graph, from: &str) -> Vec<(TargetScope, TargetKey)> {
+    let from = graph.node(from).id.clone();
+    graph
+        .edges(EdgeKind::SupertypeOf)
+        .into_iter()
+        .filter(|edge| edge.from_id == from)
+        .map(|edge| graph.target_of(graph.by_id(&edge.to_id)))
+        .collect()
+}
+
+/// A crate whose `src/user.rs` is `user`, beside `a` and `b`, which both
+/// declare a trait `Tr` with a method `m`.
+fn glob_crate(user: &str) -> Crate {
+    Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod b;\npub mod user;\n"),
+        ("src/a.rs", "pub trait Tr { fn m(&self); }\n"),
+        ("src/b.rs", "pub trait Tr { fn m(&self); }\n"),
+        ("src/user.rs", user),
+    ])
+}
+
+/// A trait clause whose trait reaches the module only through a glob is
+/// addressed as a `name` in the module itself - the type's edge to `Tr`, and
+/// the method's to `Tr::m` through the same module - for core to walk
+/// through the glob. Control: in `Bodies::resolve_supertype`, call
+/// `resolve_path` for every clause - neither edge is emitted.
+#[test]
+fn a_trait_reached_only_through_a_glob_is_addressed_in_the_module() {
+    let krate = glob_crate("use crate::a::*;\npub struct M;\nimpl Tr for M { fn m(&self) {} }\n");
+    let graph = krate.extract("src/user.rs");
+    assert_eq!(
+        supertype_addresses(&graph, "user::M"),
+        vec![(container("krate::user"), TargetKey::Name("Tr".into()))]
+    );
+    let member = supertype_addresses(&graph, "user::<M as Tr>::m");
+    assert_eq!(member.len(), 1, "one member edge: {member:?}");
+    assert_eq!(member[0].0, container("krate::user"), "addressed through the module: {member:?}");
+}
+
+/// A named `use` binds the name, so the glob beside it is not consulted:
+/// both edges address `a`, where the import points, and nothing addresses
+/// the module itself. Control: drop the `lookup_import` condition from
+/// `reaches_only_through_glob` - the clause is addressed in `user`.
+#[test]
+fn a_named_import_of_the_trait_wins_over_a_glob() {
+    let krate =
+        glob_crate("use crate::a::Tr;\nuse crate::b::*;\npub struct M;\nimpl Tr for M { fn m(&self) {} }\n");
+    let graph = krate.extract("src/user.rs");
+    assert_eq!(
+        supertype_addresses(&graph, "user::M"),
+        vec![(container("krate::a"), TargetKey::Name("Tr".into()))]
+    );
+    let member = supertype_addresses(&graph, "user::<M as Tr>::m");
+    assert_eq!(member.len(), 1, "one member edge: {member:?}");
+    assert_eq!(member[0].0, container("krate::a"), "{member:?}");
+}
+
+/// Without a glob in the module, a trait nothing here declares or imports
+/// is another crate's (`Display` from the prelude's reach, a derive's
+/// trait): no edge and no placeholder. Control: drop the `has_glob`
+/// condition from `reaches_only_through_glob` - `Display` gets a
+/// placeholder in `user`.
+#[test]
+fn without_a_glob_an_unknown_trait_clause_emits_nothing() {
+    let krate = glob_crate("pub struct M;\nimpl Display for M { fn fmt(&self) {} }\n");
+    let graph = krate.extract("src/user.rs");
+    assert!(graph.edges(EdgeKind::SupertypeOf).is_empty(), "{:#?}", graph.edges(EdgeKind::SupertypeOf));
+    assert!(
+        !graph
+            .0
+            .nodes
+            .iter()
+            .any(|node| node.target.is_some() && (node.name == "Display" || node.name == "fmt")),
+        "no placeholder for an external trait or its method: {:#?}",
+        graph.names()
+    );
+}
+
+/// A clause naming a generic parameter, or `Self`, is never a trait the
+/// glob could have brought in, even when the glob's module declares one of
+/// that name. Control: drop the `scopes.binds` condition (the parameter
+/// `Tr`) or the `name != "Self"` one (`Self`) from
+/// `reaches_only_through_glob` - a placeholder addresses it in `user`.
+#[test]
+fn a_type_parameter_or_self_in_a_trait_clause_is_not_addressed_through_the_glob() {
+    let krate = glob_crate(
+        "use crate::a::*;\npub struct M;\nimpl<Tr> Tr for M {}\npub trait Sub<Tr>: Tr {}\npub trait Own: Self {}\n",
+    );
+    let graph = krate.extract("src/user.rs");
+    let addressed: Vec<_> = graph
+        .0
+        .nodes
+        .iter()
+        .filter_map(|node| node.target.as_ref())
+        .filter(|target| target.scope == container("krate::user"))
+        .map(|target| target.key.clone())
+        .collect();
+    assert!(addressed.is_empty(), "nothing is addressed in `user` itself: {addressed:?}");
+    assert!(supertype_addresses(&graph, "user::M").is_empty());
+    assert!(supertype_addresses(&graph, "user::Sub").is_empty());
+}
+
+/// The census files a glob-reached trait clause under its own reason, not
+/// as the unknown type (`Vec`, `String`) Decision 7 excludes. Counted as a
+/// delta: the census is per thread, and a single-threaded run shares one
+/// thread between tests. Control: drop the `census::record` call in
+/// `resolve_supertype`'s glob arm - nothing is recorded.
+#[test]
+fn the_census_records_a_glob_reached_trait_clause_as_its_own_reason() {
+    use crate::census::{self, Ctx, Reason};
+    let count =
+        |reason| census::with_data(|data| data.counts.get(&(reason, Ctx::Supertype)).copied().unwrap_or(0));
+    census::enable();
+    let krate = glob_crate("use crate::a::*;\npub struct M;\nimpl Tr for M { fn m(&self) {} }\n");
+    let (via_glob, unknown) = (count(Reason::SupertypeViaGlob), count(Reason::BareUnknownType));
+    let _ = krate.extract("src/user.rs");
+    assert_eq!(count(Reason::SupertypeViaGlob) - via_glob, 1);
+    assert_eq!(count(Reason::BareUnknownType) - unknown, 0);
 }
 
 // --- cfg, errors, purity ---------------------------------------------------------

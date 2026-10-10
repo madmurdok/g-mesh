@@ -93,6 +93,7 @@ mod typing;
 
 use std::cell::RefCell;
 
+use g_mesh_plugin_sdk::wire::ResolutionDelta;
 use g_mesh_plugin_sdk::{Extractor, FileGraph, RelPath};
 
 use crate::extractor::bodies::Bodies;
@@ -104,6 +105,7 @@ use crate::extractor::scope::Scopes;
 use crate::extractor::syntax::inner_doc_comment;
 #[cfg(test)]
 pub(crate) use crate::extractor::typing::Origin;
+use crate::project::facts::{self, RustFacts};
 use crate::project::ProjectContext;
 
 /// The plugin's wire identifier: the manifest's `language`, this directory's
@@ -143,6 +145,29 @@ impl Extractor for RustExtractor {
 
     fn load_project(&self, root: &std::path::Path) -> anyhow::Result<ProjectContext> {
         ProjectContext::load(root)
+    }
+
+    /// The crate names and the module tree's container keys extraction reads.
+    fn resolution_facts(&self, project: &ProjectContext) -> Option<String> {
+        Some(RustFacts::of(project).encode())
+    }
+
+    /// Which files a `Cargo.toml` save re-keyed, and which importers the
+    /// reloaded model may resolve differently.
+    fn resolution_delta(&self, previous: &str, project: &ProjectContext) -> ResolutionDelta {
+        facts::resolution_delta(previous, project)
+    }
+
+    /// Re-scans the module tree when a save changes a file's `mod` items,
+    /// deletes a module file, or creates a file a `mod` item named before it
+    /// existed; names the files that re-scan re-keyed and their importers.
+    fn source_changed(
+        &self,
+        project: &mut ProjectContext,
+        path: &RelPath,
+        source: Option<&str>,
+    ) -> Option<ResolutionDelta> {
+        project.source_changed(path, source)
     }
 
     /// One file, in two passes over one parse tree.
