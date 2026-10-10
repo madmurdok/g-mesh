@@ -336,7 +336,7 @@ pub fn check(
     }
 
     if let Some(bump) = &version_bump {
-        notes.push(format!("resolution-delta: version bump of {}", bump.file_path));
+        notes.push(format!("resolution-delta: version bump of {} ({})", bump.file_path, bump.field));
     }
     if let Some(run) = &resolution_delta_run {
         let answer = match run.result.as_ref().map(|r| &r.delta) {

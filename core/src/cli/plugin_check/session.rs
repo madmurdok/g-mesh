@@ -977,13 +977,16 @@ pub(crate) fn run_files_created_session(
 const VERSION_BUMP_SUFFIX: &str = "-plugin-check";
 
 /// `capabilities.resolution-delta-version-bump`'s edit: a fixture watch file
-/// whose only change is its top-level `version` - an edit no resolution model
-/// reads, so a plugin declaring `resolution_delta` must answer `unchanged`.
+/// whose only change is a version - an edit no resolution model reads, so a
+/// plugin declaring `resolution_delta` must answer `unchanged`.
 pub(crate) struct VersionBump {
     /// Workspace-relative, `/`-separated.
     pub file_path: String,
     pub original: Vec<u8>,
     pub edited: Vec<u8>,
+    /// The version that changed, for the report: "the top-level `version`",
+    /// "`[package].version`", "the `require example.com/m` version".
+    pub field: String,
 }
 
 /// The fixture watch file the version bump is made to, and the edit.
@@ -991,10 +994,9 @@ pub(crate) struct VersionBump {
 /// The rule, the only language-neutral one a manifest gives enough for: the
 /// shallowest (then path-sorted) file under `workspace`, outside the
 /// manifest's `exclude_dirs`, whose name matches one of its `watch_files` and
-/// whose text parses as a JSON object. Its top-level `version` string gets
-/// [`VERSION_BUMP_SUFFIX`] appended, or one is inserted when it has none;
-/// every other byte stays. `None` when no watch file qualifies (a `go.mod`,
-/// a JSONC config with comments) or its `version` is not a string.
+/// that [`version_bump_for`] can bump. Every other byte of the file stays.
+/// `None` when no watch file qualifies (a `setup.cfg`, a JSONC config with
+/// comments, a virtual Cargo workspace with no member manifest).
 pub(crate) fn choose_version_bump(manifest: &PluginManifest, workspace: &Path) -> Option<VersionBump> {
     let matchers: Vec<_> = manifest.workspace.watch_files.iter().map(|glob| glob.compile_matcher()).collect();
     let mut found = Vec::new();
@@ -1018,13 +1020,201 @@ pub(crate) fn choose_version_bump(manifest: &PluginManifest, workspace: &Path) -
     found.sort_by(|a, b| a.matches('/').count().cmp(&b.matches('/').count()).then_with(|| a.cmp(b)));
     found.into_iter().find_map(|file_path| {
         let original = fs::read(workspace.join(&file_path)).ok()?;
-        let edited = version_bump(std::str::from_utf8(&original).ok()?)?.into_bytes();
-        Some(VersionBump { file_path, original, edited })
+        let name = file_path.rsplit('/').next().unwrap_or(&file_path);
+        let (edited, field) = version_bump_for(name, std::str::from_utf8(&original).ok()?)?;
+        Some(VersionBump { file_path, original, edited: edited.into_bytes(), field })
     })
 }
 
-/// `text` with its top-level `version` bumped (see [`choose_version_bump`]),
-/// or `None` when `text` is not a JSON object or no textual edit verifies:
+/// The bumped text of a watch file named `name`, and the version it changed,
+/// by the file's format:
+///
+/// - `Cargo.toml`: `[package].version`, else `[workspace.package].version`
+///   ([`toml_version_bump`]);
+/// - `pyproject.toml`: `[project].version`, else `[tool.poetry].version`;
+/// - `go.mod`: the first `require`d module's version, else the `go`
+///   directive ([`go_mod_version_bump`]);
+/// - any other name: the JSON rule ([`version_bump`]).
+///
+/// `None` when the file has no version of that shape to bump.
+pub(crate) fn version_bump_for(name: &str, text: &str) -> Option<(String, String)> {
+    match name {
+        "Cargo.toml" => toml_version_bump(text, &[&["package"], &["workspace", "package"]]),
+        "pyproject.toml" => toml_version_bump(text, &[&["project"], &["tool", "poetry"]]),
+        "go.mod" => go_mod_version_bump(text),
+        _ => version_bump(text).map(|edited| (edited, "the top-level `version`".to_string())),
+    }
+}
+
+/// `text` (TOML) with the `version` string of the first of `tables` that has
+/// one bumped by [`VERSION_BUMP_SUFFIX`], and that version's name. A
+/// targeted textual edit: the suffix goes in before the closing quote of the
+/// `version = "..."` line under the table's own `[header]`, and the result
+/// is re-parsed and must equal the original but for that one string - so a
+/// `version` in another table, a dotted `version.workspace = true` or a
+/// multi-line string is never the one edited. No `version` is inserted where
+/// there is none: `[project]` may list it in `dynamic`, a Cargo package may
+/// inherit it, and either would make an insertion a real change.
+pub(crate) fn toml_version_bump(text: &str, tables: &[&[&str]]) -> Option<(String, String)> {
+    let original: toml::Table = text.parse().ok()?;
+    tables.iter().find_map(|table| {
+        let mut section = &original;
+        for key in *table {
+            section = section.get(*key)?.as_table()?;
+        }
+        let current = section.get("version")?.as_str()?;
+        let bumped = format!("{current}{VERSION_BUMP_SUFFIX}");
+        let mut expected = original.clone();
+        let mut target = &mut expected;
+        for key in *table {
+            target = target.get_mut(*key)?.as_table_mut()?;
+        }
+        target.insert("version".to_string(), toml::Value::String(bumped));
+        let edited = toml_section_lines(text, table).find_map(|(at, line)| {
+            let close = toml_version_value_end(line)?;
+            let insert_at = at + close;
+            Some(format!("{}{VERSION_BUMP_SUFFIX}{}", &text[..insert_at], &text[insert_at..]))
+        })?;
+        let verified = edited.parse::<toml::Table>().is_ok_and(|parsed| parsed == expected);
+        verified.then(|| (edited, format!("`[{}].version`", table.join("."))))
+    })
+}
+
+/// The lines (byte offset, text without the newline) of the TOML section
+/// headed `[table]`, header excluded, up to the next header.
+fn toml_section_lines<'a>(
+    text: &'a str,
+    table: &'a [&'a str],
+) -> impl Iterator<Item = (usize, &'a str)> + 'a {
+    let mut inside = false;
+    let mut at = 0;
+    text.split_inclusive('\n').filter_map(move |raw| {
+        let start = at;
+        at += raw.len();
+        let line = raw.trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            inside = toml_header_keys(trimmed).is_some_and(|keys| keys == table);
+            return None;
+        }
+        inside.then_some((start, line))
+    })
+}
+
+/// The dotted keys of a `[a.b]` header line (`trimmed` starts with `[`);
+/// `None` for an array-of-tables `[[a]]` header.
+fn toml_header_keys(trimmed: &str) -> Option<Vec<&str>> {
+    let inner = trimmed.strip_prefix('[')?;
+    if inner.starts_with('[') {
+        return None;
+    }
+    let inner = &inner[..inner.find(']')?];
+    Some(inner.split('.').map(|key| key.trim().trim_matches(|c| c == '"' || c == '\'')).collect())
+}
+
+/// For a `version = "..."` (or `'...'`) line, the byte offset in `line` of
+/// the value's closing quote; `None` for any other line, a dotted
+/// `version.x` key, or a multi-line string.
+fn toml_version_value_end(line: &str) -> Option<usize> {
+    let rest = line.trim_start().strip_prefix("version")?;
+    let value = rest.trim_start().strip_prefix('=')?.trim_start();
+    let value_at = line.len() - value.len();
+    let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let body = &value[1..];
+    if body.starts_with(quote) {
+        return None; // `""` empty or `"""` multi-line - neither is bumped
+    }
+    let mut escaped = false;
+    for (i, c) in body.char_indices() {
+        match c {
+            '\\' if quote == '"' && !escaped => escaped = true,
+            c if c == quote && !escaped => return Some(value_at + 1 + i),
+            _ => escaped = false,
+        }
+    }
+    None
+}
+
+/// `text` (a `go.mod`) with one version changed, and which. The first
+/// `require`d module's version (single-line or block form) gets
+/// [`VERSION_BUMP_SUFFIX`] appended - still a valid semver pre-release; a
+/// `+incompatible` or other build-metadata version is passed over. With no
+/// usable `require`, the `go` directive is rewritten to the same language
+/// version: `1.22` becomes `1.22.0` and `1.22.3` becomes `1.22`.
+///
+/// Both are edits the Go plugin's workspace model never reads: it takes only
+/// `module` from a `go.mod` and `use` from a `go.work`
+/// (`plugins/go/workspace.go`'s doc), so its resolution facts cannot move.
+pub(crate) fn go_mod_version_bump(text: &str) -> Option<(String, String)> {
+    let mut in_require_block = false;
+    let mut go_directive = None;
+    let mut at = 0;
+    for raw in text.split_inclusive('\n') {
+        let start = at;
+        at += raw.len();
+        let line = raw.split("//").next().unwrap_or_default();
+        let tokens = go_mod_tokens(line);
+        let words: Vec<&str> = tokens.iter().map(|(_, word)| *word).collect();
+        let required = match words.as_slice() {
+            [")"] if in_require_block => {
+                in_require_block = false;
+                None
+            }
+            ["require", "("] => {
+                in_require_block = true;
+                None
+            }
+            [module, version] if in_require_block => Some((*module, *version, tokens[1].0)),
+            ["require", module, version] => Some((*module, *version, tokens[2].0)),
+            ["go", version] if !in_require_block => {
+                go_directive.get_or_insert((start + tokens[1].0, *version));
+                None
+            }
+            _ => None,
+        };
+        if let Some((module, version, offset)) = required {
+            if version.starts_with('v') && !version.contains('+') {
+                let end = start + offset + version.len();
+                let edited = format!("{}{VERSION_BUMP_SUFFIX}{}", &text[..end], &text[end..]);
+                return Some((edited, format!("the `require {module}` version")));
+            }
+        }
+    }
+    let (offset, version) = go_directive?;
+    let parts: Vec<&str> = version.split('.').collect();
+    if !parts.iter().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let rewritten = match parts.as_slice() {
+        [major, minor] => format!("{major}.{minor}.0"),
+        [major, minor, _] => format!("{major}.{minor}"),
+        _ => return None,
+    };
+    let edited = format!("{}{rewritten}{}", &text[..offset], &text[offset + version.len()..]);
+    Some((edited, "the `go` directive".to_string()))
+}
+
+/// `line`'s whitespace-separated words and their byte offsets.
+fn go_mod_tokens(line: &str) -> Vec<(usize, &str)> {
+    let mut tokens = Vec::new();
+    let mut word_start = None;
+    for (i, c) in line.char_indices().chain(std::iter::once((line.len(), ' '))) {
+        match (c.is_whitespace(), word_start) {
+            (true, Some(from)) => {
+                tokens.push((from, &line[from..i]));
+                word_start = None;
+            }
+            (false, None) => word_start = Some(i),
+            _ => {}
+        }
+    }
+    tokens
+}
+
+/// `text` (JSON) with its top-level `version` string bumped: it gets
+/// [`VERSION_BUMP_SUFFIX`] appended, or one is inserted when it has none.
+/// `None` when `text` is not a JSON object, its `version` is not a string,
+/// or no textual edit verifies:
 /// each candidate is re-parsed and must equal the original but for
 /// `version`, so a nested `"version"` key is never the one edited.
 pub(crate) fn version_bump(text: &str) -> Option<String> {

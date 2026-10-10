@@ -90,6 +90,14 @@ member_overrides = "by_name"
 # importer and the module it imports, created together, then link on the
 # first extraction (docs/adr/0026-batch-created-files-notification.md).
 files_created = true
+# A save of a watch file asks the plugin what it changed for resolution
+# (`resolutionChanged`), and core re-extracts only the files whose container
+# key moved and the importers it names instead of the whole language: an
+# edit that leaves the roots where they were re-extracts nothing. The bulk
+# walk ends with the facts that answer compares against, and every `IMPORTS`
+# edge carries its module as written (src/project/facts.rs,
+# docs/architecture/gm-509-selective-config-reindex.md).
+resolution_delta = true
 
 # How to start pyright. Read by *this plugin*, never by core - core has no use
 # for the fields and validating them would make a typo here take the
@@ -203,10 +211,10 @@ later_import_binds = true
 # packaging hints) or, for `setup.cfg`/`setup.py`, describe packaging this
 # plugin does not parse but still cannot rule out having moved something -
 # see `project`'s module doc ("Decision 4: roots") for why only
-# `pyproject.toml`'s own content is actually read. Any of the three still
-# triggers the same per-language reindex `workspaceChanged` drives, because a
-# plugin that goes stale on an unread file is worse than one that reindexes
-# on a no-op edit.
+# `pyproject.toml`'s own content is actually read. A save of any of the three
+# reloads the model and re-extracts what its roots moved (`resolution_delta`
+# above), which for `setup.cfg`/`setup.py` is nothing: the model they reload
+# is the one before.
 watch_files = ["pyproject.toml", "setup.cfg", "setup.py"]
 # A miss-path lookup's container-entry-point name: `__init__` is a package's
 # own file, matched as a bare stem under either extension this plugin claims

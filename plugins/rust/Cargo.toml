@@ -72,6 +72,9 @@ serde = { version = "1", features = ["derive"] }
 # GM-302's completion notes).
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
+# The resolution facts' opaque blob (`project::facts`, GM-544): a derive over
+# sorted maps, so `preserve_order` (above) cannot change its bytes.
+serde_json = "1"
 
 [dev-dependencies]
 # `tests/workspace_changed.rs` drives the plugin's control-plane wire

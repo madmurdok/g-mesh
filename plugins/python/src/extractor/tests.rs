@@ -585,6 +585,67 @@ fn a_from_import_of_a_submodule_gains_an_imports_edge_a_plain_symbol_import_does
     );
 }
 
+/// `(target, specifier)` of every `IMPORTS` edge out of `path`'s file
+/// node, sorted, the target rendered `nativeKind qualifiedName`.
+fn import_specifiers(tree: &Tree, path: &str) -> Vec<(String, String)> {
+    let graph = tree.extract(path);
+    let from = graph.node(path).id.clone();
+    let mut specifiers: Vec<(String, String)> = graph
+        .edges(EdgeKind::Imports)
+        .into_iter()
+        .filter(|edge| edge.from_id == from)
+        .map(|edge| {
+            let node = graph.by_id(&edge.to_id);
+            let target = format!("{} {}", node.native_kind.clone().unwrap_or_default(), node.qualified_name);
+            (target, edge.specifier.clone().unwrap_or_else(|| "<none>".to_string()))
+        })
+        .collect();
+    specifiers.sort();
+    specifiers
+}
+
+/// GM-544: every `IMPORTS` edge carries the import as written as its
+/// `specifier`: an absolute module's dotted name, a relative one's dots and
+/// tail with whitespace dropped, and for a submodule's own edge the written
+/// module plus `.name`, with no second dot after a bare dot run. An external
+/// module carries its dotted name too.
+///
+/// Control: pass `container` instead of `specifier` to
+/// `Emitter::import_edge` in `Declarer::import_edge`: the relative
+/// specifiers read as the resolved container keys.
+#[test]
+fn every_imports_edge_carries_the_import_as_written() {
+    let tree = tree(&[
+        ("pkg/sub/sibling.py", ""),
+        ("pkg/third.py", ""),
+        (
+            "pkg/sub/deep.py",
+            "import os.path\nimport pkg.third as t\nfrom . import sibling\nfrom .. import base\n",
+        ),
+        ("pkg/other.py", "from pkg import base\nfrom . sub import sibling\n"),
+    ]);
+    assert_eq!(
+        import_specifiers(&tree, "pkg/sub/deep.py"),
+        pairs(&[
+            ("external_module os.path", "os.path"),
+            ("resolved_module pkg.base::*", "..base"),
+            ("resolved_module pkg.sub.sibling::*", ".sibling"),
+            ("resolved_module pkg.sub::*", "."),
+            ("resolved_module pkg.third::*", "pkg.third"),
+            ("resolved_module pkg::*", ".."),
+        ])
+    );
+    assert_eq!(
+        import_specifiers(&tree, "pkg/other.py"),
+        pairs(&[
+            ("resolved_module pkg.base::*", "pkg.base"),
+            ("resolved_module pkg.sub.sibling::*", ".sub.sibling"),
+            ("resolved_module pkg.sub::*", ".sub"),
+            ("resolved_module pkg::*", "pkg"),
+        ])
+    );
+}
+
 /// Python's own `ImportError: attempted relative import beyond top-level
 /// package`, answered with nothing rather than with a guess.
 #[test]

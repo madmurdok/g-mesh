@@ -104,6 +104,7 @@
 //! child;` line lives in.
 
 mod cargo_manifest;
+pub mod facts;
 mod module_tree;
 
 use std::collections::BTreeSet;
