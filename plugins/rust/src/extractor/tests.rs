@@ -606,6 +606,53 @@ fn a_use_of_a_submodule_gains_an_imports_edge_a_plain_symbol_use_does_not() {
     assert_eq!(graph.target_of(graph.placeholder("pending_symbol", "f")).0, container("krate::a"));
 }
 
+/// GM-544: every `IMPORTS` edge carries the path as written as its
+/// `specifier`: the `use` prefix (`crate::a`, `super::a`), the prefix plus
+/// the leaf for a submodule's own edge, the crate name for `extern crate`
+/// and a bare `use`, and an external crate's spelled prefix. Rendered as
+/// `(target, specifier)`, sorted.
+///
+/// Control: pass `""` instead of `specifier` in `Declarer::import_edge`'s
+/// call to `Emitter::import_edge`: every specifier reads `""`.
+#[test]
+fn every_imports_edge_carries_the_path_as_written() {
+    let krate = Crate::new(&[
+        ("src/lib.rs", "pub mod a;\npub mod c;\n"),
+        ("src/a.rs", "pub mod b;\npub fn f() {}\n"),
+        ("src/a/b.rs", "pub fn g() {}\n"),
+        (
+            "src/c.rs",
+            "extern crate alloc;\nuse serde;\nuse std::io::Error;\nuse crate::a::b;\nuse super::a::f;\n",
+        ),
+    ]);
+    let graph = krate.extract("src/c.rs");
+    let from = graph.node("src/c.rs").id.clone();
+    let mut specifiers: Vec<(String, Option<String>)> = graph
+        .edges(EdgeKind::Imports)
+        .into_iter()
+        .filter(|edge| edge.from_id == from)
+        .map(|edge| {
+            let node = graph.by_id(&edge.to_id);
+            (
+                format!("{} {}", node.native_kind.clone().unwrap_or_default(), node.qualified_name),
+                edge.specifier.clone(),
+            )
+        })
+        .collect();
+    specifiers.sort();
+    let expected: Vec<(String, Option<String>)> = [
+        ("external_module alloc", "alloc"),
+        ("external_module serde", "serde"),
+        ("external_module std", "std::io"),
+        ("resolved_module krate::a::*", "crate::a"),
+        ("resolved_module krate::a::b::*", "crate::a::b"),
+    ]
+    .iter()
+    .map(|(target, specifier)| (target.to_string(), Some(specifier.to_string())))
+    .collect();
+    assert_eq!(specifiers, expected, "{:#?}", graph.names());
+}
+
 // --- calls and references -------------------------------------------------------
 
 #[test]

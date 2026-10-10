@@ -157,3 +157,177 @@ fn with_import_selectors(
     }
     ResolutionDelta::Affected { files, imports }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch tree, removed on drop. Unique per call: `cargo test` runs
+    /// these concurrently in one process.
+    struct Tree(std::path::PathBuf);
+
+    impl Tree {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("g-mesh-plugin-python-facts-{}-{unique}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+
+        fn write(&self, path: &str, contents: &str) -> &Self {
+            let full = self.0.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, contents).unwrap();
+            self
+        }
+
+        fn load(&self) -> ProjectContext {
+            ProjectContext::load(&self.0).unwrap()
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const ONE_ROOT: &str = "[project]\nname = \"x\"\nversion = \"1.0.0\"\ndependencies = [\"requests\"]\n\n\
+                            [tool.poetry]\npackages = [{ include = \"pkg\", from = \"src\" }]\n";
+    const TWO_ROOTS: &str = "[project]\nname = \"x\"\nversion = \"1.0.0\"\ndependencies = [\"requests\"]\n\n\
+                             [tool.poetry]\npackages = [{ include = \"pkg\", from = \"src\" }, \
+                             { include = \"pkg2\", from = \"other\" }]\n";
+
+    /// `src/pkg` under a declared root, and `other/pkg2`, which only
+    /// [`TWO_ROOTS`] declares.
+    fn project(pyproject: &str) -> Tree {
+        let tree = Tree::new();
+        tree.write("pyproject.toml", pyproject)
+            .write("src/pkg/__init__.py", "")
+            .write("src/pkg/core.py", "")
+            .write("other/pkg2/__init__.py", "")
+            .write("other/pkg2/util.py", "");
+        tree
+    }
+
+    fn file(path: &str) -> PathScope {
+        PathScope { under: path.to_string(), not_under: Vec::new() }
+    }
+
+    fn target(key: &str) -> ImportSelector {
+        ImportSelector {
+            importers: file(""),
+            by: ImportMatch::Target {
+                scope_kind: TargetScopeKind::Container,
+                matcher: Matcher::Exact(key.to_string()),
+            },
+        }
+    }
+
+    fn specifier_under(key: &str) -> ImportSelector {
+        ImportSelector {
+            importers: file(""),
+            by: ImportMatch::Specifier(Matcher::Under {
+                prefix: key.to_string(),
+                separator: ".".to_string(),
+            }),
+        }
+    }
+
+    /// The delta of the save that turned the model `before` into `tree`'s
+    /// current one, through the encoded blob core stores.
+    fn saved(before: &ProjectContext, tree: &Tree) -> ResolutionDelta {
+        resolution_delta(&PyFacts::of(before).encode(), &tree.load())
+    }
+
+    /// A version bump and a dependency edit keep the roots, so every key;
+    /// `setup.cfg` and `setup.py` are never read.
+    ///
+    /// Control: drop the `old.roots == new.roots` early return in [`delta`]
+    /// and compare `roots` inside `container_delta`'s input instead (or make
+    /// it `!=`): the version bump answers something other than `Unchanged`.
+    #[test]
+    fn a_version_or_dependency_edit_and_a_setup_file_save_answer_unchanged() {
+        let tree = project(ONE_ROOT);
+        let before = tree.load();
+        tree.write(
+            "pyproject.toml",
+            &ONE_ROOT.replace("1.0.0", "1.0.1").replace("\"requests\"", "\"requests>=2\", \"attrs\""),
+        );
+        assert_eq!(saved(&before, &tree), ResolutionDelta::Unchanged);
+
+        tree.write("setup.cfg", "[metadata]\nname = x\nversion = 2.0\n")
+            .write("setup.py", "from setuptools import setup\nsetup()\n");
+        assert_eq!(saved(&before, &tree), ResolutionDelta::Unchanged);
+    }
+
+    /// A root added by the packages hint re-keys the files under it and
+    /// selects the importers of every added key, by target and by specifier,
+    /// plus the importers of the added `pkg2.util`'s parent `pkg2`.
+    #[test]
+    fn an_added_root_selects_its_files_and_the_importers_of_its_keys_and_their_parents() {
+        let tree = project(ONE_ROOT);
+        let before = tree.load();
+        tree.write("pyproject.toml", TWO_ROOTS);
+        assert_eq!(
+            saved(&before, &tree),
+            ResolutionDelta::Affected {
+                files: vec![file("other/pkg2/__init__.py"), file("other/pkg2/util.py")],
+                imports: vec![
+                    target("pkg2"),
+                    target("pkg2.util"),
+                    specifier_under("pkg2"),
+                    specifier_under("pkg2.util"),
+                    target("pkg2"),
+                ],
+            }
+        );
+    }
+
+    /// A root removed selects, for every removed key, the importers whose
+    /// specifier is under it: `import pkg2.x` bound `pkg2` as one of ours
+    /// while `pkg2` was a key, with an edge no target selector reaches when
+    /// `pkg2.x` never was one.
+    ///
+    /// Control: drop the removed-key loop in `with_import_selectors`: the
+    /// two `specifier_under` selectors are missing.
+    #[test]
+    fn a_removed_root_selects_the_importers_whose_specifier_is_under_a_removed_key() {
+        let tree = project(TWO_ROOTS);
+        let before = tree.load();
+        tree.write("pyproject.toml", ONE_ROOT);
+        assert_eq!(
+            saved(&before, &tree),
+            ResolutionDelta::Affected {
+                files: vec![file("other/pkg2/__init__.py"), file("other/pkg2/util.py")],
+                imports: vec![
+                    target("pkg2"),
+                    target("pkg2.util"),
+                    specifier_under("pkg2"),
+                    specifier_under("pkg2.util"),
+                ],
+            }
+        );
+    }
+
+    /// A blob that is not this format's facts answers `Unknown`, never a
+    /// guess.
+    #[test]
+    fn unreadable_previous_facts_answer_unknown() {
+        let tree = project(ONE_ROOT);
+        let project = tree.load();
+        let blob = PyFacts::of(&project).encode();
+        let other_format = blob.replacen("\"format\":1", "\"format\":2", 1);
+        assert_ne!(other_format, blob, "the blob spells its format as expected");
+        for previous in ["", "not json", "{}", other_format.as_str()] {
+            assert!(
+                matches!(resolution_delta(previous, &project), ResolutionDelta::Unknown { .. }),
+                "{previous:?} was read as facts"
+            );
+        }
+        assert_eq!(PyFacts::decode(&blob), Some(PyFacts::of(&project)));
+    }
+}
