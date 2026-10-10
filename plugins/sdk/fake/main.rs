@@ -20,6 +20,8 @@
 //! observation is a file in that directory, so it survives a relaunch:
 //!
 //! - `spawns.log`: this process's pid, appended before anything else.
+//! - `bulk-walks.log`: this process's pid, appended when it is a
+//!   `--bulk-index` walk, before the walk's options apply.
 //! - `requests.log`: `"<method> <filePath>"` per id-carrying request, appended
 //!   before it is answered.
 //! - `notifications.log`: `"<method> <filePath>"` per notification
@@ -85,6 +87,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 const SPAWN_LOG: &str = "spawns.log";
+const BULK_WALK_LOG: &str = "bulk-walks.log";
 const REQUEST_LOG: &str = "requests.log";
 const NOTIFICATION_LOG: &str = "notifications.log";
 const FRAME_LOG: &str = "frames.log";
@@ -237,6 +240,9 @@ fn method_of(message: &Value) -> String {
 
 fn fixture(args: &Args, dir: &Path) {
     append(&dir.join(SPAWN_LOG), &process::id().to_string());
+    if args.bulk_root.is_some() {
+        append(&dir.join(BULK_WALK_LOG), &process::id().to_string());
+    }
     let options: Options = match fs::read_to_string(dir.join(OPTIONS_FILE)) {
         Ok(text) => {
             serde_json::from_str(&text).unwrap_or_else(|err| fail(&format!("bad {OPTIONS_FILE}: {err}")))

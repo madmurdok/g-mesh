@@ -33,6 +33,7 @@ fn creates_all_tables_and_indexes() {
             "edges",
             "indexed_files",
             "language_outcome",
+            "language_retry",
             "language_state",
             "meta",
             "nodes",

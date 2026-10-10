@@ -28,7 +28,7 @@ use serde::Serialize;
 
 use crate::daemon::registry::PathCoverage;
 use crate::languages::{CatalogueEntry, LanguageOutcome};
-use crate::storage::schema;
+use crate::storage::schema::{self, MAX_LANGUAGE_RETRIES};
 
 use super::instructions::error_cause;
 use super::tool_result::internal_error;
@@ -61,6 +61,10 @@ pub(super) struct NotIndexed {
     /// language covers. Empty, and so omitted, on a path-anchored refusal.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub file_paths: Vec<String>,
+    /// Failed only: the language's automatic retries so far, `None` when no
+    /// failed outcome is recorded for it. Said by [`Self::sentence`] only.
+    #[serde(skip)]
+    pub retries: Option<u32>,
 }
 
 impl NotIndexed {
@@ -71,6 +75,7 @@ impl NotIndexed {
             command: entry.install_command(),
             error: None,
             file_paths: Vec::new(),
+            retries: None,
         }
     }
 
@@ -83,11 +88,13 @@ impl NotIndexed {
             command: "g-mesh reindex".to_string(),
             error: error.map(error_cause),
             file_paths: Vec::new(),
+            retries: None,
         }
     }
 
     /// Builds the value for `coverage`, reading a failed language's recorded
-    /// error from the store under the read the caller already holds.
+    /// error and retry count from the store under the read the caller already
+    /// holds.
     pub(super) fn from_coverage(conn: &Connection, coverage: &PathCoverage) -> Result<Self, ErrorData> {
         match coverage {
             PathCoverage::Absent(entry) => Ok(Self::absent(entry)),
@@ -98,7 +105,13 @@ impl NotIndexed {
                     LanguageOutcome::Failed { error } if recorded == *language => Some(error),
                     _ => None,
                 });
-                Ok(Self::failed(language, error.as_deref()))
+                let mut value = Self::failed(language, error.as_deref());
+                if error.is_some() {
+                    let retries = schema::language_retries(conn)
+                        .map_err(|e| internal_error("failed to read the language retries", e))?;
+                    value.retries = Some(retries.get(language.as_str()).copied().unwrap_or(0));
+                }
+                Ok(value)
             }
         }
     }
@@ -116,9 +129,18 @@ impl NotIndexed {
             ),
             NotIndexedReason::PluginFailed => {
                 let cause = self.error.as_deref().map(|error| format!(" ({error})")).unwrap_or_default();
+                let retry = match self.retries {
+                    None => String::new(),
+                    Some(n) if n < MAX_LANGUAGE_RETRIES => format!(
+                        "g-mesh retries it on its next start (retry {} of {MAX_LANGUAGE_RETRIES}); if it keeps \
+                         failing, ",
+                        n + 1
+                    ),
+                    Some(n) => format!("retried {n} times without success; "),
+                };
                 format!(
-                    " - {language} files are not indexed here: its plugin failed{cause}; fix the plugin, then \
-                     run `{}`. This is not evidence the file is empty or missing.",
+                    " - {language} files are not indexed here: its plugin failed{cause}; {retry}fix the plugin, \
+                     then run `{}`. This is not evidence the file is empty or missing.",
                     self.command
                 )
             }

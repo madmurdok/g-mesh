@@ -3492,6 +3492,7 @@ fn gm491_a_language_swap_keeps_the_provenance() {
         language: "typescript",
         plugin_fingerprint: "fp",
         semantic_pass_languages: &capable,
+        retried: false,
     };
     swap(&mut live, &staging_path, None, &bookkeeping).unwrap();
 

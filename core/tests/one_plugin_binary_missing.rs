@@ -372,7 +372,8 @@ async fn a_language_the_daemons_walk_failed_is_not_reindexed_once_its_plugin_wor
 
 /// An `init`-walked index (Python and Rust both indexed) whose recorded
 /// outcome is then made `Failed` for Python, standing in for an earlier walk
-/// that failed it.
+/// that failed it, with its automatic retries used up, so no daemon start
+/// re-walks it.
 fn index_recording_python_as_failed(project: &Project, plugins: &Path) {
     let output = project.init(plugins, &[]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
@@ -384,7 +385,11 @@ fn index_recording_python_as_failed(project: &Project, plugins: &Path) {
         ("python".to_string(), LanguageOutcome::Failed { error: "recorded by an earlier walk".to_string() }),
         ("rust".to_string(), LanguageOutcome::Indexed { files: 1 }),
     ]);
-    schema::record_language_outcomes(&project.index(), &failed).expect("failed to record the outcomes");
+    let index = project.index();
+    schema::record_language_outcomes(&index, &failed).expect("failed to record the outcomes");
+    for _ in 0..schema::MAX_LANGUAGE_RETRIES {
+        schema::begin_language_retry(&index, "python").expect("failed to count a retry");
+    }
 }
 
 /// ADR 0021 section 2, across a restart: an index whose `language_outcome`
@@ -665,7 +670,8 @@ fn the_daemons_log_line_for_a_failed_language_is_its_whole_chain_on_one_line() {
     assert_eq!(
         lines,
         [format!(
-            "g-mesh daemon: python failed to index and is left out of the index until `g-mesh reindex`: {}",
+            "g-mesh daemon: python failed to index and is left out of the index - the next 2 daemon starts \
+             retry it, or run `g-mesh reindex`: {}",
             causes.join(": ")
         )],
         "one line with every cause: {stderr}"

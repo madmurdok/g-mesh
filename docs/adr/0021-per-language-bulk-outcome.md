@@ -5,6 +5,9 @@ Accepted 2026-10-04 (GM-329/S1, owner review). Supersedes decision 2 of
 [ADR 0002](0002-bulk-walk.md); decision 1 (one one-shot process per
 language) stands. Ships together with GM-330 (instructions show coverage):
 this ADR is only sound once that one is, see Context.
+Amended 2026-10-10 (GM-499): section 2's "Retry" gains a bounded automatic
+retry on later daemon starts
+([design note](../architecture/gm-499-retry-failed-language.md)).
 
 ## Context
 `daemon::bulk_index::run_with_progress` loops
@@ -108,12 +111,23 @@ from the `language_outcome` table, whether or not it walks, and a walk in that
 activation replaces the set with its own result. A table that cannot be read
 is logged and leaves the set empty; activation does not fail over it.
 
-**Retry**: none automatic. `meta.bulkIndexedAt` is set (the index is complete
-for every language it could index), so the next start does not re-walk. A
-failed language is retried by `g-mesh reindex`, or by anything that changes
+**Retry**: `meta.bulkIndexedAt` is set (the index is complete for every
+language it could index), so the next start does not re-walk the project. A
+failed language is retried by `g-mesh reindex`, by anything that changes
 `indexer_version` (installing, removing or rebuilding a plugin inside its
-manifest dir). The all-failed case keeps today's retry-on-next-tool-call
-(`Phase::Failed`). See Open question 1.
+manifest dir), and, *amended by GM-499*, automatically on each of the next
+`MAX_LANGUAGE_RETRIES` (2) daemon starts: activation re-walks the language
+through the workspace-reindex staging walk and swap (ADR 0008,
+`workspace_reindex::retry_failed`), before the watcher's consumer starts,
+and only at a start, never mid-session. The count lives in a
+`language_retry` table (no row = no retry yet; no schema bump), is taken
+before the walk so a retry that hangs or crashes still uses it, and is reset
+by every full walk (`record_language_outcomes`) and by `wipe`. A successful
+retry's swap records the language `indexed` and drops its count in the same
+transaction; a failed one records its cause as the language's error. The
+retry swap stores no vectors; the embedding backfill that follows embeds
+them. The all-failed case keeps today's retry-on-next-tool-call
+(`Phase::Failed`), whose full walk resets the count.
 
 Rejected: keep partial rows (a half language looks complete - exactly
 ADR 0002's objection, now per language); leave `meta.bulkIndexedAt` unset
@@ -245,8 +259,9 @@ and ADRs.
 ## Consequences
 - One broken plugin costs its language, not the project; zero installed
   plugins is a valid, empty index.
-- A failed language stays out of the index until `g-mesh reindex` or a
-  plugin change. The instructions (GM-330) must say so and name the
+- A failed language stays out of the index until a daemon start's retry
+  succeeds (at most 2 per full walk), `g-mesh reindex` or a plugin change.
+  The instructions (GM-330) say whether a retry is still owed and name the
   command; the CLI `init`/`reindex` print each `Failed`/`PluginAbsent` line.
 - A project with an absent catalogue language pays one extra, metadata-only
   tree walk per cold start, measured in S5, bounded by the section 4
@@ -258,6 +273,8 @@ and ADRs.
 ## Resolved at review (owner, 2026-10-04)
 1. **No automatic retry** of a `Failed` language in this ADR's scope; it is a
    separate backlog task. Until then, section 2's retry paths stand.
+   *Since GM-499 (2026-10-10):* a bounded retry on later daemon starts, see
+   section 2's "Retry".
 2. **`CatalogueEntry` gains `exclude_dirs`.** It says which files the absent
    plugin would claim, like `extensions`, and is not a capability.
 3. **CLI exit code.** `g-mesh init`/`reindex` exit **0** when every discovered

@@ -147,7 +147,9 @@ fn languages(report: &Report) -> Value {
 /// One `outcomes` entry. The keys depend on `outcome`: `files` for
 /// `indexed` and `plugin_absent`, `installCommand` for `plugin_absent`
 /// (`null` once the plugin is installed, or for a language outside the
-/// catalogue), `error` and `causes` for `failed`.
+/// catalogue), `error` and `causes` for `failed`, plus `retries` and
+/// `maxRetries` for a `failed` language whose plugin is installed (the
+/// automatic retries a daemon start makes).
 fn outcome(row: &LanguageRow<'_>) -> Value {
     let mut value = json!({
         "language": row.language,
@@ -174,6 +176,10 @@ fn outcome(row: &LanguageRow<'_>) -> Value {
             value["error"] = json!(crate::languages::error_on_one_line(error));
             value["causes"] =
                 json!(error.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>());
+            if row.plugin_version.is_some() {
+                value["retries"] = json!(row.retries);
+                value["maxRetries"] = json!(crate::storage::schema::MAX_LANGUAGE_RETRIES);
+            }
         }
     }
     value

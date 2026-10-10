@@ -468,6 +468,14 @@ pub(crate) fn spawns(plugin_dir: &Path) -> Vec<u32> {
     log.lines().filter_map(|line| line.trim().parse().ok()).collect()
 }
 
+/// How many `--bulk-index` walks this plugin directory has ever been spawned
+/// for (a subset of [`spawns`]). 0 before the first one.
+#[allow(dead_code)]
+pub(crate) fn bulk_walks(plugin_dir: &Path) -> usize {
+    let Ok(log) = fs::read_to_string(plugin_dir.join("bulk-walks.log")) else { return 0 };
+    log.lines().filter(|line| !line.trim().is_empty()).count()
+}
+
 /// Every id-carrying request this plugin directory's process(es) have ever
 /// answered, oldest first, across every spawn, as `"<method> <filePath>"`
 /// (`filePath` empty for a request with no such field, e.g. `status`).

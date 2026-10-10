@@ -1218,7 +1218,11 @@ fn a_project_with_no_suspension_marker_reports_none() {
 /// A report around `index`, with no daemon running.
 /// A languages section with nothing recorded, for fixtures about other lines.
 fn no_languages() -> LanguagesReport {
-    LanguagesReport { section: LanguageSection::NoIndex, installed: Ok(BTreeMap::new()) }
+    LanguagesReport {
+        section: LanguageSection::NoIndex,
+        installed: Ok(BTreeMap::new()),
+        retries: BTreeMap::new(),
+    }
 }
 
 fn report_with(index: IndexStatus) -> Report {
@@ -1381,6 +1385,7 @@ fn languages_report(section: LanguageSection, installed: &[(&str, &str)]) -> Rep
     report.languages = LanguagesReport {
         section,
         installed: Ok(installed.iter().map(|(l, v)| (l.to_string(), v.to_string())).collect()),
+        retries: BTreeMap::new(),
     };
     report
 }

@@ -646,15 +646,16 @@ fn failed(error: &str) -> LanguageOutcome {
     LanguageOutcome::Failed { error: error.to_string() }
 }
 
-/// A warm coverage exactly as `GMeshMcpServer::instructions` assembles it:
+/// A warm coverage as `GMeshMcpServer::instructions` assembles it:
 /// `indexed` languages paired with `found`'s manifests, the recorded
-/// `outcomes`, and `found`'s missing catalogue languages.
+/// `outcomes` with no retry state (as for `Phase::Failed`), and `found`'s
+/// missing catalogue languages.
 fn warm_real(
     found: &DiscoveredPlugins,
     indexed: &[&str],
     outcomes: Vec<(&str, LanguageOutcome)>,
 ) -> Coverage {
-    Coverage::from_outcomes(real_present(found, indexed), sorted(outcomes), real_missing(found))
+    Coverage::from_outcomes(real_present(found, indexed), sorted(outcomes), None, real_missing(found))
 }
 
 /// The receiver paragraph's opening, said by every one of its forms.
@@ -1279,6 +1280,7 @@ fn ladder_step_2_drops_failed_errors_and_keeps_every_name() {
         uncovered: Uncovered::Recorded {
             absent: real_missing(&found).into_iter().map(|language| (language, Some(99_999))).collect(),
             failed: failed.clone(),
+            retries: None,
         },
     };
     assert!(render(&coverage, 1).len() > INSTRUCTIONS_BYTE_CEILING, "the fixture must overflow step 1");
@@ -1309,6 +1311,7 @@ fn ladder_step_3_keeps_absent_and_failed_names() {
         uncovered: Uncovered::Recorded {
             absent: real_missing(&found).into_iter().map(|language| (language, Some(7))).collect(),
             failed: failed.clone(),
+            retries: None,
         },
     };
     assert!(render(&coverage, 2).len() > INSTRUCTIONS_BYTE_CEILING, "the fixture must overflow step 2");
@@ -1349,6 +1352,7 @@ fn ladder_step_4_replaces_the_covered_list_and_keeps_absent_and_failed_names() {
         uncovered: Uncovered::Recorded {
             absent: real_missing(&found).into_iter().map(|language| (language, None)).collect(),
             failed: failed.clone(),
+            retries: None,
         },
     };
     assert!(render(&coverage, 3).len() > INSTRUCTIONS_BYTE_CEILING, "the fixture must overflow step 3");

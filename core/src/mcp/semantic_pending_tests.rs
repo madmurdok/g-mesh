@@ -103,7 +103,12 @@ fn after_a_swap() -> (tempfile::TempDir, Arc<IndexStore>) {
         &mut live,
         &staging_path,
         None,
-        &SwapBookkeeping { language: "rust", plugin_fingerprint: "fp", semantic_pass_languages: &capable },
+        &SwapBookkeeping {
+            language: "rust",
+            plugin_fingerprint: "fp",
+            semantic_pass_languages: &capable,
+            retried: false,
+        },
     )
     .unwrap();
     (dir, Arc::new(IndexStore::new(live)))
