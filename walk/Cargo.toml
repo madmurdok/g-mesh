@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh-walk"
-version = "4.3.0"
+version = "4.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "The g-mesh project walk: .gitignore layering, excluded directory names, and the symlink guard"
