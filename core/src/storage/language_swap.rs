@@ -23,6 +23,12 @@
 //! Every other node, changed or new, gets exactly staging's outgoing edges;
 //! the semantic pass that runs after the swap refines them.
 //!
+//! A container node is never unchanged, however equal its row: its outgoing
+//! edges are core's `DEFINES` membership edges, which no semantic pass
+//! writes and which staging's own walk computed completely, so it always
+//! gets exactly staging's. Under the unchanged-node rule it would keep the
+//! edge to a member that moved to another container while it survived.
+//!
 //! A live pending-symbol placeholder of the language that staging lacks is
 //! kept, not deleted, when the caller says the language's semantic tier is
 //! swept (`keep_semantic_placeholders`): a semantic pass adds such nodes under
@@ -44,6 +50,7 @@ use rusqlite::{params, Connection};
 use crate::embedding::pipeline::ComputedEmbedding;
 use crate::embedding::text::text_to_embed;
 use crate::embedding::EmbeddingPipeline;
+use crate::graph::containers::CONTAINER_NATIVE_KIND;
 use crate::graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND;
 use crate::storage::schema;
 use crate::storage::write::{Diff, NodeRecord};
@@ -236,10 +243,13 @@ fn plan_attached(
         tx.query_row("SELECT COUNT(*) FROM plan_upsert_nodes", [], |row| row.get::<_, i64>(0))? as usize;
 
     run(
-        "INSERT INTO plan_unchanged_nodes (id)
-         SELECT s.id FROM main.nodes s
-         WHERE s.id IN (SELECT id FROM live.nodes WHERE language = ?1)
-           AND s.id NOT IN (SELECT id FROM plan_upsert_nodes)",
+        &format!(
+            "INSERT INTO plan_unchanged_nodes (id)
+             SELECT s.id FROM main.nodes s
+             WHERE s.id IN (SELECT id FROM live.nodes WHERE language = ?1)
+               AND s.id NOT IN (SELECT id FROM plan_upsert_nodes)
+               AND s.nativeKind IS NOT '{CONTAINER_NATIVE_KIND}'"
+        ),
         "the unchanged nodes",
     )?;
 
