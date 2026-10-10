@@ -692,7 +692,7 @@ fn status_json(project: &Project, plugins: &Path, flags: &[&str]) -> serde_json:
         .unwrap_or_else(|err| panic!("stdout is not one JSON object ({err}): {}", describe(&output)))
 }
 
-/// GM-500 against a real index: after the partial `init` (failed python,
+/// Against a real index: after the partial `init` (failed python,
 /// absent go, indexed rust), `status --json` and `status --full --json`
 /// exit 0 and report the three languages with the installed plugin's
 /// version; only `--full` walks the project for coverage. The light text

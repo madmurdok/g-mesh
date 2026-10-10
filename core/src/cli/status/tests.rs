@@ -1369,7 +1369,7 @@ fn a_file_under_a_link_into_a_languages_excluded_dir_is_not_that_languages() {
 }
 
 // ---------------------------------------------------------------------
-// GM-500: light and full status, the languages block, `--json`
+// Light and full status, the languages block, `--json`
 // (docs/architecture/gm-500-status-language-outcomes.md)
 // ---------------------------------------------------------------------
 

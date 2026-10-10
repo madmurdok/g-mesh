@@ -335,7 +335,7 @@ fn status_warns_about_a_project_idle_past_the_threshold() {
     assert_contains(&status, &project_id);
     assert_contains(&status, "g-mesh clean expired");
 
-    // GM-500: under `--json` the warning goes to stderr and stdout stays one
+    // Under `--json` the warning goes to stderr and stdout stays one
     // JSON object (in this test, not its own: the config lock is per process).
     // Control: `print!` instead of `eprint!` in `run`'s JSON branch -> stdout
     // no longer parses.
@@ -398,7 +398,7 @@ fn status_output(root: &Path, flags: &[&str], envs: &[(&str, &Path)]) -> std::pr
     command.output().expect("failed to run `g-mesh status`")
 }
 
-/// GM-500: an index built before per-language outcomes (schema 12, no
+/// An index built before per-language outcomes (schema 12, no
 /// `language_outcome` table) says so, in text and JSON, and status still
 /// exits 0. Control: remove `language_section`'s `sqlite_master` probe ->
 /// status fails on the missing table.
@@ -427,7 +427,7 @@ fn status_on_an_index_that_predates_language_outcomes_says_so() {
     assert_eq!(report["languages"]["outcomes"], serde_json::json!([]), "{report}");
 }
 
-/// GM-500: a plugin discovery that fails (a malformed `plugin.toml`) is
+/// A plugin discovery that fails (a malformed `plugin.toml`) is
 /// named by the light status, which exits 0, and fails `--full`, whose walk
 /// needs the plugins. Control: `manifest::discover(..)?` in `collect` ->
 /// the light status fails too.
