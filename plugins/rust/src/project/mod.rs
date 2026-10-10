@@ -107,7 +107,7 @@ mod cargo_manifest;
 pub mod facts;
 mod module_tree;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use g_mesh_plugin_sdk::RelPath;
@@ -178,6 +178,11 @@ pub struct ProjectContext {
     /// every query. This is what [`ProjectContext::has_container`] answers
     /// from; see that method's own doc for why the extractor needs it (GM-358).
     container_keys: BTreeSet<String>,
+    /// Every crate-root path a loaded manifest names (an explicit `[lib]`/
+    /// `[[bin]] path`, or the `src/lib.rs`/`src/main.rs` default), mapped to
+    /// whether it was a file at load. A root whose existence flips is what
+    /// [`ProjectContext::source_changed`] answers with a reload.
+    root_files: BTreeMap<RelPath, bool>,
     /// Everything this load could not honestly resolve - a manifest that
     /// would not parse, a crate-key collision, a `mod` naming nothing on
     /// disk, two `mod` items claiming one file. Never fatal (see `load`'s own
@@ -226,6 +231,7 @@ impl ProjectContext {
         let mut trees: Vec<module_tree::CrateTree> = Vec::new();
         let mut taken: BTreeSet<RelPath> = BTreeSet::new();
         let mut used_keys: BTreeSet<String> = BTreeSet::new();
+        let mut root_files: BTreeMap<RelPath, bool> = BTreeMap::new();
 
         for package_dir in &package_dirs {
             let manifest = if package_dir == root {
@@ -249,7 +255,14 @@ impl ProjectContext {
             };
             let package_rel_dir = RelPath::relative_to(root, package_dir).unwrap_or_else(|| RelPath::new(""));
 
-            for (key, root_file) in resolve_targets(root, package_dir, &package.name, &manifest) {
+            for Target { key, root_file, exists } in
+                resolve_targets(root, package_dir, &package.name, &manifest)
+            {
+                let seen = root_files.entry(root_file.clone()).or_insert(false);
+                *seen |= exists;
+                if !exists {
+                    continue;
+                }
                 if !used_keys.insert(key.clone()) {
                     notes.push(format!(
                         "crate key {key:?} ({root_file}, package {package_rel_dir}) collides with an \
@@ -265,8 +278,14 @@ impl ProjectContext {
             }
         }
 
-        let mut project =
-            Self { root: root.to_path_buf(), crates, trees, note_layout: notes.0, ..Self::default() };
+        let mut project = Self {
+            root: root.to_path_buf(),
+            crates,
+            trees,
+            note_layout: notes.0,
+            root_files,
+            ..Self::default()
+        };
         project.rebuild();
         Ok(project)
     }
@@ -291,6 +310,10 @@ impl ProjectContext {
     /// unreadable) and answers which other files may now extract
     /// differently, or `None` when no other file does.
     ///
+    /// - A crate-root path a manifest names that appeared (text given, absent
+    ///   at load) or disappeared (`None`, present at load): the whole model is
+    ///   reloaded, as `cargo` discovers a default root without a manifest
+    ///   edit.
     /// - A file of the tree whose `mod` signature is unchanged: `None`,
     ///   without reading the disk.
     /// - A file of the tree with another signature, or gone: its crate is
@@ -300,9 +323,8 @@ impl ProjectContext {
     /// - Anything else: `None`.
     ///
     /// A re-scan reads the disk, so afterwards the model equals
-    /// [`ProjectContext::load`]'s for the same module files. The crate list
-    /// is not re-read: a crate root appearing or disappearing is a manifest
-    /// question, answered on the next `Cargo.toml` save. The delta is
+    /// [`ProjectContext::load`]'s for the same module files; a reload is
+    /// [`ProjectContext::load`] itself. The delta is
     /// [`facts::delta`] of the model before and after, without `path` itself,
     /// which the caller extracts anyway.
     pub fn source_changed(
@@ -310,7 +332,9 @@ impl ProjectContext {
         path: &RelPath,
         source: Option<&str>,
     ) -> Option<g_mesh_plugin_sdk::wire::ResolutionDelta> {
-        use g_mesh_plugin_sdk::wire::ResolutionDelta;
+        if self.root_files.get(path) == Some(&source.is_none()) {
+            return self.reload_for(path);
+        }
 
         let owner = self.trees.iter().position(|tree| tree.files.contains_key(path));
         let forced: BTreeSet<usize> = match (owner, source) {
@@ -333,8 +357,37 @@ impl ProjectContext {
 
         let before = facts::RustFacts::of(self);
         self.rescan(&forced);
+        self.delta_since(&before, path)
+    }
+
+    /// Replaces the model with a fresh [`ProjectContext::load`] of the same
+    /// root and answers what changed, as [`ProjectContext::source_changed`]
+    /// does. A load that fails keeps the model and answers `Unknown`.
+    fn reload_for(&mut self, path: &RelPath) -> Option<g_mesh_plugin_sdk::wire::ResolutionDelta> {
+        let before = facts::RustFacts::of(self);
+        match Self::load(&self.root) {
+            Ok(fresh) => *self = fresh,
+            Err(err) => {
+                return Some(g_mesh_plugin_sdk::wire::ResolutionDelta::Unknown {
+                    reason: format!("reloading the project after {path} changed failed: {err:#}"),
+                })
+            }
+        }
+        self.delta_since(&before, path)
+    }
+
+    /// [`facts::delta`] from `before` to the current model, without `path`
+    /// itself, which the caller extracts anyway; `None` when nothing else
+    /// changed.
+    fn delta_since(
+        &self,
+        before: &facts::RustFacts,
+        path: &RelPath,
+    ) -> Option<g_mesh_plugin_sdk::wire::ResolutionDelta> {
+        use g_mesh_plugin_sdk::wire::ResolutionDelta;
+
         let after = facts::RustFacts::of(self);
-        match facts::delta(&before, &after) {
+        match facts::delta(before, &after) {
             ResolutionDelta::Unchanged => None,
             ResolutionDelta::Affected { mut files, imports } => {
                 files.retain(|scope| scope.under != path.as_str());
@@ -477,9 +530,10 @@ fn collect_package_dirs(root: &Path, root_manifest: Option<&RawCargoToml>) -> Ve
     package_dirs
 }
 
-/// Every crate `package_dir`'s own package compiles - its `[lib]` target (or
-/// the `src/lib.rs` default) and every `[[bin]]` (or the `src/main.rs`
-/// default when none are declared) that actually exists on disk. See this
+/// Every crate root `package_dir`'s own package names - its `[lib]` target
+/// (or the `src/lib.rs` default) and every `[[bin]]` (or the `src/main.rs`
+/// default when none are declared), each marked with whether it exists on
+/// disk; only an existing one is compiled as a crate. See this
 /// module's doc, "One package, several crates", for why a package can yield
 /// more than one entry here.
 fn resolve_targets(
@@ -487,16 +541,20 @@ fn resolve_targets(
     package_dir: &Path,
     package_name: &str,
     manifest: &RawCargoToml,
-) -> Vec<(String, RelPath)> {
+) -> Vec<Target> {
     let mut targets = Vec::new();
+    let mut push = |name: String, relative: &str| {
+        let absolute = package_dir.join(relative);
+        if let Some(root_file) = RelPath::relative_to(root, &absolute) {
+            targets.push(Target { key: normalize_crate_name(&name), root_file, exists: absolute.is_file() });
+        }
+    };
 
     let lib_path =
         manifest.lib.as_ref().and_then(|lib| lib.path.clone()).unwrap_or_else(|| "src/lib.rs".into());
-    if let Some(root_file) = existing_relpath(root, package_dir, &lib_path) {
-        let name =
-            manifest.lib.as_ref().and_then(|lib| lib.name.clone()).unwrap_or_else(|| package_name.into());
-        targets.push((normalize_crate_name(&name), root_file));
-    }
+    let lib_name =
+        manifest.lib.as_ref().and_then(|lib| lib.name.clone()).unwrap_or_else(|| package_name.into());
+    push(lib_name, &lib_path);
 
     let mut bins = manifest.bins.clone();
     if bins.is_empty() {
@@ -508,18 +566,18 @@ fn resolve_targets(
     }
     for bin in &bins {
         let bin_path = bin.path.clone().unwrap_or_else(|| "src/main.rs".into());
-        if let Some(root_file) = existing_relpath(root, package_dir, &bin_path) {
-            let name = bin.name.clone().unwrap_or_else(|| package_name.into());
-            targets.push((normalize_crate_name(&name), root_file));
-        }
+        push(bin.name.clone().unwrap_or_else(|| package_name.into()), &bin_path);
     }
 
     targets
 }
 
-fn existing_relpath(root: &Path, package_dir: &Path, relative: &str) -> Option<RelPath> {
-    let absolute = package_dir.join(relative);
-    absolute.is_file().then(|| RelPath::relative_to(root, &absolute)).flatten()
+/// One crate root a package's manifest names: its normalized crate key, its
+/// project-relative path, and whether that path is a file now.
+struct Target {
+    key: String,
+    root_file: RelPath,
+    exists: bool,
 }
 
 /// `cargo`'s own crate-identifier rule: a package or target name's `-`
