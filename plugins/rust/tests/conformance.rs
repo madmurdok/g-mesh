@@ -125,7 +125,9 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 // qualifiedName-suffix rung resolves), one `[[refusal]]` and two
 // `[[references]]`, both structural, plus the getter-named-like-its-field pair: one `[[callers]]` for
 // the method and one `[[references]]` for the field.
-const EXPECTATIONS: usize = 31;
+// 32 with GM-537's `[[implementations]] shapes::Loud::speak` (structural).
+// 33 with `[[implementations]] sirens::Wail` (semantic).
+const EXPECTATIONS: usize = 33;
 // 6 since GM-386: `[[references]] shapes::Shape` joined the five receiver/
 // implementation entries, not because its rows need rust-analyzer - they do
 // not - but because the `files` tally it now asserts counts edges, and two of
@@ -138,6 +140,10 @@ const EXPECTATIONS: usize = 31;
 // 5 once the `internals::peek` row of `[[references]]
 // gaps::Ledger.all_unresolved` became structural for the same reason: the
 // field is read through a parameter of a written type.
+// 4 once `[[implementations]] shapes::Loud` became structural (GM-537): a
+// trait clause reached through a glob is addressed through the module.
+// 5 with `[[implementations]] sirens::Wail`: an impl a `macro_rules!` of
+// `alpha` writes in `beta`, which only rust-analyzer's sweep finds.
 const SEMANTIC_EXPECTATIONS: usize = 5;
 
 /// GM-380: the tripwire above only works if tripping it says what to do.
@@ -457,10 +463,11 @@ fn the_semantic_tier_is_what_closes_the_receiver_call_gap() {
     //   - the receiver call on a variable whose method is a trait impl's
     //     (`square.area()` in `total`), which the structural tier addresses
     //     as `Square::area` and so cannot find;
-    //   - the implementation in another crate of the workspace.
+    //   - the implementation in another crate that only the sweep finds
+    //     (`Siren`, whose `impl Wail` a macro of `alpha` writes in `beta`).
     for row in [
         "missing (expected, not found): crates/alpha/src/shapes.rs:shapes::total",
-        "missing (expected, not found): crates/beta/src/main.rs:Megaphone",
+        "missing (expected, not found): crates/beta/src/alarm.rs:alarm::Siren",
     ] {
         assert!(outcome.stdout.contains(row), "the report must say `{row}`:\n{}", outcome.stdout);
     }

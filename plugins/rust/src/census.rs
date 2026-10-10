@@ -58,6 +58,11 @@ pub(crate) enum Reason {
     BareUnknownValue,
     /// A dotted path rooted at a crate this project does not model.
     DottedExternal,
+    /// GM-537: a bare trait in a supertype clause that nothing here declares
+    /// or imports by item, in a module with a glob `use`: addressed as a
+    /// `name` placeholder in the module, which core walks through the glob.
+    /// Not excluded - each one is a new placeholder and edge.
+    SupertypeViaGlob,
     /// Already an open site: an unresolved bare **call**.
     OpenUnresolvedCall,
     /// Already an open site: an unresolved multi-segment path.

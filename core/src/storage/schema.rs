@@ -162,7 +162,15 @@ pub const CURRENT_SCHEMA_VERSION: &str = "14";
 /// different pipeline generations (2.12.0's buggy writer and 3.0.0's fixed
 /// one) the same number in this constant's history, which is exactly the
 /// ambiguity it exists to rule out.
-pub const CURRENT_INDEXER_VERSION: &str = "3";
+///
+/// Bumped to "3" by GM-502: the Rust plugin emits a `SUPERTYPE_OF` edge from
+/// each trait-impl method to the trait method it implements.
+///
+/// Bumped to "4" by GM-537: the Rust plugin now also emits both of those
+/// edges (type and method level) for a trait that reaches the impl's module
+/// only through a glob `use`. An index built before has neither, and nothing
+/// else would ever re-extract its files.
+pub const CURRENT_INDEXER_VERSION: &str = "4";
 
 /// DDL per the architecture doc's Data Model erDiagram
 /// (docs/architecture/g-mesh-v1.md).
