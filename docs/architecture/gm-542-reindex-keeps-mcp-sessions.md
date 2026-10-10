@@ -269,3 +269,6 @@ it (1.3). Fix it here too, or file a follow-up?
   reconnect carries one restart line.
 - M4: "Защитить init в этой задаче (Recommended)" - `init` takes the same
   marker as `reindex`.
+- M5: "Оставить как есть (Recommended)" - a shim started while a rebuild runs
+  fails its first connect with the "being reindexed" error (no daemon can
+  answer `initialize`); the client reconnects it by hand (`/mcp`) afterwards.
