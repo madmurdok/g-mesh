@@ -69,11 +69,11 @@ test-group = 'daemon-spawning'
 filter = 'test(two_languages_spawn_at_the_same_time_rather_than_one_after_the_other)'
 test-group = 'daemon-spawning'
 
-# An ignored test that runs `scripts/test-sections.sh check`: twelve listings
-# of the whole workspace suite, which outlast the 210s above on a loaded
-# machine without hanging.
+# Ignored tests that list the whole workspace suite (twelve times for
+# `scripts/test-sections.sh check`, twice for the `local` profile check),
+# which outlast the 210s above on a loaded machine without hanging.
 [[profile.default.overrides]]
-filter = 'test(=the_real_sections_partition_the_real_suite)'
+filter = 'test(=the_real_sections_partition_the_real_suite) | test(=the_local_profile_skips_exactly_its_heavy_list)'
 slow-timeout = { period = "60s", terminate-after = 20 }
 
 # GM-344. A CI-only profile, so that a run leaves behind something a machine
@@ -100,3 +100,68 @@ inherits = "default"
 # one cause, 25 across twelve is a different situation entirely, and that
 # distinction is what made GM-337 diagnosable at all.
 path = "junit.xml"
+
+# Tests skipped by `scripts/test-local.sh` only, one exact (binary, name) term
+# each. `default` and `ci` must keep running every one of them
+# (docs/adr/0031-local-test-runs.md); `test-local.sh --full` runs them and
+# reports any test whose time crossed 10s either way against this list.
+[profile.local]
+inherits = "default"
+default-filter = """
+not (
+    (binary_id(g-mesh) & test(=mcp::response_bound_tests::every_single_hop_implementation_page_fits_the_ceiling)) |
+    (binary_id(g-mesh) & test(=mcp::response_bound_tests::every_caller_page_fits_the_ceiling)) |
+    (binary_id(g-mesh) & test(=mcp::response_bound_tests::every_reference_page_fits_the_ceiling)) |
+    (binary_id(g-mesh) & test(=mcp::response_bound_tests::every_callee_page_fits_the_ceiling)) |
+    (binary_id(g-mesh) & test(=mcp::response_bound_tests::paging_through_byte_cut_pages_returns_every_row_once)) |
+    (binary_id(g-mesh) & test(=mcp::response_bound_tests::every_files_answer_fits_the_ceiling)) |
+    (binary_id(g-mesh) & test(=graph::symbol_links::tests::link_all_and_link_diff_agree_on_the_same_end_state)) |
+    (binary_id(g-mesh) & test(=daemon::semantic::tests::an_interrupted_pass_for_one_language_is_retried_without_rerunning_the_other)) |
+    (binary_id(g-mesh::serving_while_indexing) & test(=a_walk_that_outlasts_the_bootstrap_timeout_is_waited_out_rather_than_losing_the_client)) |
+    (binary_id(g-mesh::serving_while_indexing) & test(=a_restart_against_an_already_walked_project_never_reports_itself_as_still_indexing)) |
+    (binary_id(g-mesh::serving_while_indexing) & test(=a_first_call_is_answered_normally_when_nothing_holds_the_walk_open)) |
+    (binary_id(g-mesh::daemon_build_staleness) & test(=status_reports_a_daemon_that_an_upgrade_has_left_behind)) |
+    (binary_id(g-mesh::daemon_build_staleness) & test(=shims_racing_to_replace_one_outdated_daemon_produce_exactly_one_replacement)) |
+    (binary_id(g-mesh::daemon_build_staleness) & test(=a_daemon_started_from_an_older_build_is_replaced_before_it_answers_again)) |
+    (binary_id(g-mesh::state_isolation) & test(=a_spawned_g_mesh_resolves_the_same_isolated_state_root)) |
+    (binary_id(g-mesh::cli_clean) & test(=clean_orphaned_without_force_reports_and_deletes_nothing)) |
+    (binary_id(g-mesh::cli_clean) & test(=clean_and_clean_orphaned_handle_a_front_state_dir)) |
+    (binary_id(g-mesh::cli_init) & test(=init_on_a_fresh_project_creates_state_and_a_subsequent_status_shows_it_indexed)) |
+    (binary_id(g-mesh::default_export_linking) & test(=usages_of_a_renamed_default_import_reach_the_class_it_really_names)) |
+    (binary_id(g-mesh::plugin_memory_limit) & test(=the_generated_mcp_instructions_reflect_a_real_suspended_rust)) |
+    (binary_id(g-mesh::plugin_memory_limit) & test(=a_real_rust_analyzer_over_its_memory_limit_is_suspended_and_structural_work_continues)) |
+    (binary_id(g-mesh::plugin_memory_limit) & test(=with_a_memory_limit_far_above_real_usage_a_real_rust_analyzer_is_left_alone)) |
+    (binary_id(g-mesh::cli_status) & test(=status_in_a_front_served_folder_prints_the_front_line_and_no_coverage)) |
+    (binary_id(g-mesh::cli_status) & test(=status_reports_the_daemon_plugin_coverage_and_syntax_errors_of_a_live_project)) |
+    (binary_id(g-mesh::cli_status) & test(=status_reports_a_dead_daemon_and_the_files_its_index_never_saw)) |
+    (binary_id(g-mesh::cli_status) & test(=status_does_not_show_a_dead_daemons_leftover_phase_and_progress_as_live)) |
+    (binary_id(g-mesh::cli_status) & test(=status_warns_about_a_project_idle_past_the_threshold)) |
+    (binary_id(g-mesh::cli_status) & test(=status_on_a_project_that_was_never_indexed_reports_an_empty_state)) |
+    (binary_id(g-mesh::plugin_build_staleness) & test(=a_plugin_rebuilt_under_a_running_daemon_costs_the_project_a_re_walk)) |
+    (binary_id(g-mesh::plugin_build_staleness) & test(=a_rebuild_of_any_discovered_plugin_retires_the_daemon_not_only_typescripts)) |
+    (binary_id(g-mesh::replay_progress) & test(=a_held_replay_with_a_token_gets_a_heartbeat_then_the_full_answer)) |
+    (binary_id(g-mesh::replay_progress) & test(=a_held_replay_without_a_token_gets_no_notifications_and_the_full_answer)) |
+    (binary_id(g-mesh::ambiguous_reexport_linking) & test(=find_callers_resolves_through_an_ambiguous_export_star_barrel)) |
+    (binary_id(g-mesh::release_packaging_scripts) & test(=prepare_release_assets_blesses_a_complete_release_with_plugin_assets)) |
+    (binary_id(g-mesh::release_packaging_scripts) & test(=prepare_release_assets_refuses_a_tampered_plugin_asset_on_windows)) |
+    (binary_id(g-mesh::release_packaging_scripts) & test(=prepare_release_assets_refuses_a_plugin_asset_not_identical_to_the_main_archives_copy)) |
+    (binary_id(g-mesh::release_packaging_scripts) & test(=prepare_release_assets_refuses_a_plugin_asset_packed_under_plugins)) |
+    (binary_id(g-mesh::release_packaging_scripts) & test(=prepare_release_assets_refuses_a_plugin_asset_declaring_another_language)) |
+    (binary_id(g-mesh::release_packaging_scripts) & test(=prepare_release_assets_refuses_a_plugin_asset_with_an_extra_file)) |
+    (binary_id(g-mesh::release_packaging_scripts) & test(=prepare_release_assets_refuses_a_plugin_asset_whose_command_names_no_binary)) |
+    (binary_id(g-mesh::namespace_import_after_init) & test(=a_project_prepared_with_init_answers_find_callers_through_a_namespace_import)) |
+    (binary_id(g-mesh::namespace_import_resolution) & test(=find_callers_reaches_a_caller_that_went_through_a_namespace_import)) |
+    (binary_id(g-mesh::overload_call_resolution) & test(=an_overloaded_function_resolves_correctly_through_the_real_mcp_tools)) |
+    (binary_id(g-mesh::plugin_check) & test(=a_bulk_index_that_never_finishes_fails_session_instead_of_hanging)) |
+    (binary_id(g-mesh::plugin_check) & test(=the_typescript_plugin_satisfies_its_own_expectations_file)) |
+    (binary_id(g-mesh::incremental_embed_outside_lock) & test(=a_tool_call_against_an_unrelated_file_is_not_blocked_by_a_reparses_lock_free_embedding_window)) |
+    (binary_id(g-mesh::idle_lifecycle) & test(=the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed)) |
+    (binary_id(g-mesh::idle_lifecycle) & test(=the_core_exits_on_its_own_longer_timeout_with_nothing_attached)) |
+    (binary_id(g-mesh::plugin_bridge) & test(=an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass)) |
+    (binary_id(g-mesh::orphaned_daemon) & test(=a_daemon_whose_project_root_still_exists_is_left_alone)) |
+    (binary_id(g-mesh::daemon_lifeline) & test(=a_daemon_whose_lifeline_is_running_or_unreadable_is_left_alone)) |
+    (binary_id(g-mesh::go_plugin_fingerprint) & test(=the_go_plugin_fingerprint_ignores_the_checkouts_git_state)) |
+    (binary_id(g-mesh::last_used) & test(=a_daemon_start_and_every_handled_request_advance_last_used_on_disk)) |
+    (binary_id(g-mesh::structural_does_not_wait_for_embeddings) & test(=search_code_waits_for_the_embedding_backfill_pass_but_not_forever))
+)
+"""
