@@ -555,6 +555,7 @@ mod tests {
                 upsert_edges: vec![],
                 delete_edge_ids: vec![],
                 complete: false,
+                affected: None,
             },
             incomplete: false,
             incomplete_reason: None,

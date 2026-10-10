@@ -684,8 +684,9 @@ impl<E: Extractor> Session<'_, E> {
             // Gone, or unreadable: everything this plugin had for the file is
             // deleted. Forgetting it too means a re-creation is treated as a
             // first sighting rather than diffed against a stale baseline.
-            let diff = diff_file(self.index.baseline(path), &FileGraph::default());
+            let mut diff = diff_file(self.index.baseline(path), &FileGraph::default());
             self.index.remove(path);
+            diff.affected = self.source_changed(path, None);
             return diff;
         };
 
@@ -702,6 +703,9 @@ impl<E: Extractor> Session<'_, E> {
         if self.project.is_none() {
             self.load_project();
         }
+        // The model is updated for this text before extracting it, so this
+        // file and every file the delta names extract against the same model.
+        let affected = self.source_changed(path, Some(&source));
         let Some(project) = self.project.as_ref() else {
             return FileChangeDiff::default();
         };
@@ -711,11 +715,13 @@ impl<E: Extractor> Session<'_, E> {
             // thing this plugin actually told core, so diffing the next edit
             // against it is correct. Replacing it with nothing would make the
             // next successful reparse re-send a whole file core already has.
-            return FileChangeDiff::default();
+            // The model update stands, so its delta is still sent.
+            return FileChangeDiff { affected, ..FileChangeDiff::default() };
         };
 
-        let diff = diff_file(self.index.baseline(path), &graph);
+        let mut diff = diff_file(self.index.baseline(path), &graph);
         self.index.insert(path.clone(), source, graph);
+        diff.affected = affected;
         diff
     }
 
@@ -786,6 +792,16 @@ impl<E: Extractor> Session<'_, E> {
             let present = is_readable_source(&path, &self.root);
             self.presence_changed(&path, present);
         }
+    }
+
+    /// [`Extractor::source_changed`] for one path, when there is a project
+    /// model to apply it to and the path is inside the root; `None` otherwise.
+    fn source_changed(&mut self, path: &RelPath, source: Option<&str>) -> Option<ResolutionDelta> {
+        if !is_within_root(path) {
+            return None;
+        }
+        let project = self.project.as_mut()?;
+        source_changed_caught(self.extractor, project, path, source, &self.spec.language)
     }
 
     /// [`Extractor::file_presence_changed`] for one path, when there is a
@@ -957,6 +973,21 @@ fn presence_caught<E: Extractor>(
     if catch_unwind(AssertUnwindSafe(|| extractor.file_presence_changed(project, path, present))).is_err() {
         crate::log_line!("[{language}] the presence hook panicked on {path} - its presence is not applied");
     }
+}
+
+/// [`Extractor::source_changed`], with a panic costing the delta: the model
+/// may be half-updated, and the next `workspaceChanged` reloads it.
+fn source_changed_caught<E: Extractor>(
+    extractor: &E,
+    project: &mut E::Project,
+    path: &RelPath,
+    source: Option<&str>,
+    language: &str,
+) -> Option<ResolutionDelta> {
+    catch_unwind(AssertUnwindSafe(|| extractor.source_changed(project, path, source))).unwrap_or_else(|_| {
+        crate::log_line!("[{language}] the source hook panicked on {path} - its model update is lost");
+        None
+    })
 }
 
 /// [`Extractor::resolution_facts`], with a panic costing the facts (core then

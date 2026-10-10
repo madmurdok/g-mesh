@@ -102,6 +102,7 @@ pub fn diff_file(previous: Option<&FileGraph>, next: &FileGraph) -> FileChangeDi
             .cloned()
             .collect(),
         complete,
+        affected: None,
     }
 }
 

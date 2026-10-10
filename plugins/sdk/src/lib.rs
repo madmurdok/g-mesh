@@ -199,6 +199,31 @@ pub trait Extractor: Send + Sync {
     ///   `project` half-updated, so do not panic here either.
     fn file_presence_changed(&self, _project: &mut Self::Project, _path: &RelPath, _present: bool) {}
 
+    /// Updates `project` for a source file's new text (`None`: the file is
+    /// gone or unreadable), and names the **other** files whose extraction
+    /// that update may change. For a model built from the sources
+    /// themselves, such as Rust's module tree read from `mod` items.
+    ///
+    /// The default does nothing and answers `None`. Contract:
+    /// - called on `fileChanged` after [`file_presence_changed`](Extractor::file_presence_changed)
+    ///   and before [`extract`](Extractor::extract) of the same path, only
+    ///   when the text differs from what this process last reported (or on a
+    ///   re-extract), never from the bulk walk;
+    /// - `None` means no other file extracts differently. `Some` follows
+    ///   [`resolution_delta`](Extractor::resolution_delta)'s contract for
+    ///   `Affected` (a superset of the files that change) and need not name
+    ///   `path` itself, which this same round trip extracts;
+    /// - a panic is caught and costs the delta (`None`). It may leave
+    ///   `project` half-updated, so do not panic here either.
+    fn source_changed(
+        &self,
+        _project: &mut Self::Project,
+        _path: &RelPath,
+        _source: Option<&str>,
+    ) -> Option<wire::ResolutionDelta> {
+        None
+    }
+
     /// The facts `project`'s resolution reads, as an opaque blob core stores
     /// beside the index and hands back to
     /// [`resolution_delta`](Extractor::resolution_delta) after a watch-file

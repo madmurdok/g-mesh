@@ -315,6 +315,7 @@ fn file_change_diff_is_committed_to_sqlite() {
             }],
             delete_edge_ids: vec![],
             complete: false,
+            affected: None,
         },
     };
 
