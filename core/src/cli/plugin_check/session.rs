@@ -290,7 +290,7 @@ impl StderrCapture {
     /// Waits, at most [`STDERR_DRAIN_GRACE`], for the drain thread to reach
     /// EOF. Called once the child is reaped: its exit does not mean the
     /// thread has read the last of the pipe, and a quote taken before then
-    /// can miss exactly the lines the plugin died writing (GM-547).
+    /// can miss exactly the lines the plugin died writing.
     fn wait_drained(&self) {
         if let Some(drained) = &self.drained {
             let _ = drained.recv_timeout(STDERR_DRAIN_GRACE);
