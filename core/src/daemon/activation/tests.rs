@@ -127,7 +127,7 @@ impl Fixture {
     /// earlier daemon's walk or `g-mesh init` leaves them.
     fn full_walk(&self) {
         let store = self.open();
-        bulk_index::run(&self.root, &store, None, &self.discovered).expect("the walk must not fail outright");
+        bulk_index::run(&self.root, &store, &self.discovered).expect("the walk must not fail outright");
         store.with(schema::record_bulk_index).expect("failed to record the walk");
     }
 
