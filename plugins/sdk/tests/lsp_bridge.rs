@@ -4024,3 +4024,244 @@ fn the_warm_up_sits_inside_the_pass_budget() {
     assert!(reason(&answer).contains("ran out of its budget"), "{}", reason(&answer));
     assert!(took < Duration::from_secs(6), "the pass budget ended the wait, not the warm-up: {took:?}");
 }
+
+// --- GM-550: readiness from rust-analyzer's quiescent status ----------------
+//
+// `LspBridge::quiescent_signal` makes readiness read the server's
+// `experimental/serverStatus` `quiescent` bit (fake-lsp's `serverStatus`
+// table scripts it). Every test here holds the settle long enough that the
+// fake's first `quiescent: false`, written while it handles `initialized`,
+// reaches the client long before a quiet period could pass on its own.
+
+/// A bridge with the GM-550 signal on and `budgets`.
+fn signalled_bridge(scratch: &Scratch, config: SemanticConfig, budgets: Budgets) -> LspBridge {
+    LspBridge::with_budgets("toy", scratch.path(), config, budgets).quiescent_signal()
+}
+
+/// rust-analyzer's capability is asked for only by a bridge with the signal
+/// on; any other server is initialized exactly as before.
+///
+/// Control: drop the `if self.quiescent_signal` guard around the
+/// `experimental` capability in `LspClient::initialize`; the plain arm
+/// advertises it too.
+#[test]
+fn only_a_signalled_bridge_asks_for_the_server_status() {
+    for signalled in [true, false] {
+        let scratch = Scratch::new(if signalled { "status-asked" } else { "status-not-asked" });
+        let (index, _) = fixture(&scratch);
+        let out = scratch.path().join("experimental.json");
+        let config = scratch.server(json!({
+            "readiness": { "kind": "none" },
+            "positionEncoding": "utf-16",
+            "answers": answers_the_site(&scratch),
+            "capabilitiesOut": out.to_string_lossy(),
+        }));
+        let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+        if signalled {
+            bridge = bridge.quiescent_signal();
+        }
+
+        assert!(pass(&mut bridge, &index).complete);
+        let experimental: Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).expect("the server saw an initialize"))
+                .unwrap();
+        if signalled {
+            assert_eq!(experimental, json!({ "serverStatusNotification": true }));
+        } else {
+            assert_eq!(experimental, Value::Null, "a plain bridge asks for no extension");
+        }
+    }
+}
+
+/// The GM-550 flake: rust-analyzer under load paused longer than the settle
+/// between two start-up phases, and the bridge called it ready in the gap.
+/// Here the gap (2.5s) is longer than the settle (2s), as measured, and the
+/// server answers `null` until its last phase ends; a signalled bridge is
+/// still not ready in the gap, because the server is `quiescent: false`
+/// throughout, and asks only after `quiescent: true`.
+///
+/// Control: in `LspClient::track_progress`, start the quiet clock on every
+/// last `end` (drop `&& self.quiescent != Some(false)`); the first phase's
+/// end reads as ready, the bridge asks in the gap and records no edge.
+#[test]
+fn a_gap_between_phases_longer_than_the_settle_is_not_readiness_for_a_signalled_server() {
+    let scratch = Scratch::new("status-gap");
+    let (index, _) = fixture(&scratch);
+    let log = scratch.path().join("asked.log");
+    let config = scratch.server(json!({
+        "readiness": { "phases": [
+            { "token": "fetching", "beginAfterMs": 0, "holdMs": 50 },
+            { "token": "building", "beginAfterMs": 2_500, "holdMs": 50 },
+        ]},
+        "serverStatus": {},
+        "nullWhileIndexing": true,
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "log": log.to_string_lossy(),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_secs(2);
+    let mut bridge = signalled_bridge(&scratch, config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert_eq!(
+        semantic_edges(&answer).len(),
+        1,
+        "the gap between two phases is not the end of loading ({}): {:#?}",
+        uptime(),
+        answer.diff
+    );
+    assert!(answer.complete);
+    assert_eq!(asked(&log, "textDocument/definition"), 1, "asked once, after the server was quiescent");
+}
+
+/// A signalled server's first settle is its `quiescent: true`, not a further
+/// quiet period: with a 10s settle and a start-up of 100ms, the pass is done
+/// long before the settle could have passed.
+///
+/// Control: in `LspClient::settle`, always pass `quiet` to `quiet_for`
+/// (drop the `signalled` zero); the pass waits out the 10s settle.
+#[test]
+fn a_signalled_server_is_ready_at_its_quiescent_status_without_the_settle() {
+    let scratch = Scratch::new("status-ready");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "phases": [{ "token": "fetching", "beginAfterMs": 0, "holdMs": 100 }] },
+        "serverStatus": {},
+        "nullWhileIndexing": true,
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_secs(10);
+    budgets.readiness = Duration::from_secs(30);
+    let mut bridge = signalled_bridge(&scratch, config, budgets);
+
+    let started = std::time::Instant::now();
+    let answer = pass(&mut bridge, &index);
+    let took = started.elapsed();
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+    assert!(answer.complete);
+    assert!(
+        took < Duration::from_secs(7),
+        "ready at quiescent, not after the settle: {took:?} ({})",
+        uptime()
+    );
+}
+
+/// A signalled bridge talking to a server that never sends a status (an
+/// older rust-analyzer, or another server behind the manifest) keeps the
+/// quiet-period rule: it waits out the settle, and does not wait for a
+/// signal that is not coming.
+///
+/// Control: in `LspClient::settle`, drop `self.quiescent.is_some()` from
+/// `signalled`; the bridge believes a server that said nothing at once.
+#[test]
+fn a_signalled_bridge_keeps_the_settle_for_a_server_that_sends_no_status() {
+    let scratch = Scratch::new("status-none");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_millis(900);
+    budgets.readiness = Duration::from_secs(20);
+    let mut bridge = signalled_bridge(&scratch, config, budgets);
+
+    let started = std::time::Instant::now();
+    let answer = pass(&mut bridge, &index);
+    let took = started.elapsed();
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+    assert!(answer.complete);
+    assert!(took >= Duration::from_millis(800), "the settle is still paid: {took:?}");
+    assert!(took < Duration::from_secs(15), "and not the readiness budget: {took:?} ({})", uptime());
+}
+
+/// A server stuck at `quiescent: false` - no progress token at all - is
+/// still loading: nothing is asked, and the pass gives up at the readiness
+/// budget, incomplete, as for a progress that never ends.
+///
+/// Control: in `LspClient::track_status`, do not clear `idle_since` on
+/// `quiescent: false`; the silent server reads as ready and is asked.
+#[test]
+fn a_server_that_stays_not_quiescent_is_never_asked_and_the_pass_is_incomplete() {
+    let scratch = Scratch::new("status-never");
+    let (index, _) = fixture(&scratch);
+    let log = scratch.path().join("asked.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "serverStatus": { "quiescent": "never" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "log": log.to_string_lossy(),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_millis(150);
+    budgets.readiness = Duration::from_millis(1_500);
+    let mut bridge = signalled_bridge(&scratch, config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert!(!answer.complete, "a pass that asked nothing has not completed");
+    assert!(reason(&answer).contains("still indexing"), "{}", reason(&answer));
+    assert!(answer.diff.upsert_edges.is_empty());
+    assert_eq!(asked(&log, "textDocument/definition"), 0, "nothing is asked of a loading server");
+}
+
+/// A bridge without the signal ignores a status it never asked for: a
+/// server pushing `quiescent: false` unasked is ready by the quiet-period
+/// rule, exactly as before GM-550.
+///
+/// Control: in `LspClient::handle`, route `experimental/serverStatus` to
+/// `track_status` whatever `quiescent_signal` says; the plain bridge waits
+/// for a `true` that never comes and the pass is incomplete.
+#[test]
+fn a_plain_bridge_ignores_a_server_status_it_did_not_ask_for() {
+    let scratch = Scratch::new("status-unasked");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "serverStatus": { "quiescent": "never", "unasked": true },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_millis(150);
+    budgets.readiness = Duration::from_secs(5);
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets);
+
+    let answer = pass(&mut bridge, &index);
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+    assert!(answer.complete, "{:?}", answer.reason);
+}
+
+/// After a `workspaceChanged`, the last `quiescent: true` may predate the
+/// change, so a signalled server's next settle is the full quiet period on
+/// top of the signal (GM-433's rule kept).
+///
+/// Control: in `LspClient::unsettle`, do not set `reloading`; the stale
+/// `true` makes the server ready at once after the change.
+#[test]
+fn after_a_workspace_change_a_signalled_server_still_pays_the_settle() {
+    let scratch = Scratch::new("status-reload");
+    let (index, _) = fixture(&scratch);
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "serverStatus": {},
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut budgets = budgets();
+    budgets.settle = Duration::from_millis(900);
+    let mut bridge = signalled_bridge(&scratch, config, budgets);
+
+    assert_eq!(semantic_edges(&pass(&mut bridge, &index)).len(), 1);
+    bridge.workspace_changed();
+    let started = std::time::Instant::now();
+    let answer = pass(&mut bridge, &index);
+    let took = started.elapsed();
+    assert_eq!(semantic_edges(&answer).len(), 1, "{:#?}", answer.diff);
+    assert!(answer.complete);
+    assert!(took >= Duration::from_millis(800), "the change costs a full settle: {took:?} ({})", uptime());
+}

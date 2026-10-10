@@ -314,4 +314,21 @@ mod tests {
         assert_eq!(resolved.origin, "the path the manifest names");
         assert_ne!(resolved.version, "no version reported");
     }
+
+    /// rust-analyzer's readiness is its own `quiescent` status (GM-550), and
+    /// `engine` turns that on in the bridge. The bridge keeps the flag
+    /// private, so the wiring is read from this file's own `engine` body, as
+    /// the TypeScript plugin pins its warm-up.
+    ///
+    /// Control: drop `.quiescent_signal()` from `engine`.
+    #[test]
+    fn the_engine_reads_rust_analyzers_quiescent_status() {
+        let source = include_str!("semantic.rs");
+        let engine = &source[source.find("pub fn engine(").expect("this file defines `engine`")..];
+        let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
+        assert!(
+            body.contains("LspBridge::new(LANGUAGE, root, config).quiescent_signal()"),
+            "`engine` must turn on the bridge's quiescent signal:\n{body}"
+        );
+    }
 }
