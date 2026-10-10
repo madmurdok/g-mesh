@@ -198,3 +198,14 @@ Callers/references relied on (g-mesh, project `g-mesh`):
    daemon starts at `Structural`. Change: control (i) forces `Unindexed` at
    startup, control (ii) ignores the cause. Consequence: each test has a
    control that tells the arms apart.
+
+## 8. Owner decisions (2026-10-10)
+
+1. "Строка причины + тесты (Recommended)" - option A, the cause line plus
+   tests; controls (i) and (ii) from section 5 replace the task's control.
+2. "Да, проверять версию (Recommended)" - the front's "(indexed)" also
+   checks `schema_version` and the core half of `indexer_version`.
+3. "Да, добавить (Recommended)" - the `Incomplete` line is in.
+4. "Сократить новые строки (Recommended)" - the `Discarded` and `Incomplete`
+   lines drop "(structural first; semantic search after)", so they stay
+   about as long as today's line.
