@@ -18,7 +18,7 @@ protocol_version = 2
 # cargo workspace member - GM-303 wrote the general rule down
 # (docs/architecture/plugin-modularity.md, "plugin_version: two rules, not
 # one"), of which this is one case and plugins/typescript's is the other.
-plugin_version = "0.4.0"
+plugin_version = "0.5.0"
 
 [plugin.spawn]
 # A prebuilt binary, not `go run ./...`. `go run` recompiles the whole
