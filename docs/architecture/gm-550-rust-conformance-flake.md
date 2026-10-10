@@ -227,3 +227,139 @@ left files unfinished?**
 Q1: "Проваливать сессию (Recommended)": a whole-project semantic pass that leaves files
 unfinished fails the `session` check with its reason; the expectations are skipped.
 Fix = A (measured rust-analyzer warm-up) + B (kit fails the session on a residual pass).
+
+## Warm-up measurement (S4, 2026-10-10)
+
+**Verdict: the control did not pass, so this measurement cannot size the warm-up.**
+At this load, rust-analyzer answers its first question after `PrimeCaches(End)` within
+milliseconds, idle and loaded alike. The 10 s+ first wave from GM-537/S7 did not
+reproduce. The load did reach rust-analyzer: it more than doubled the time to
+`PrimeCaches(End)`. But that time falls inside the readiness budget, not the
+per-question one. A second finding matters for option A (below): in 2 of 18 runs the
+bridge called the server ready during a gap between two startup phases.
+
+### Method
+
+- Throwaway worktree `../g-mesh-wt-gm550-meas` at 99867cf, not committed. One local
+  patch: `plugins/rust/src/semantic.rs:97` gets `.warm_up(Duration::from_secs(600))`.
+  With that patch the first question goes out alone and cannot time out, so its full
+  wait is visible. Without it, the first wave is 8 questions that get cancelled at 10 s.
+  Debug build, the same profile the conformance test uses.
+- `g-mesh plugins check <scratch>/rust --fixture plugins/rust/conformance/project
+  --expect plugins/rust/conformance/expect.toml`, under `/usr/bin/time -p`. The scratch
+  manifest is `plugins/rust/plugin.toml` with two changes: the patched plugin binary,
+  and `[plugin.semantic] command` pointing at a transparent stdio proxy. The proxy logs
+  one line per LSP message (direction, method, id, `$/progress` token and kind, ms since
+  the server started, no payloads), the same technique as GM-325/S41. rust-analyzer
+  1.97.1.
+- The bridge has no per-question latency logging. It logs only timeouts and the
+  warm-up line (`bridge.rs` `run_pass`), so the proxy is the clock.
+- Three arms, alternating, 6 rounds: `idle`, `y16` (16x `yes > /dev/null`) and `y64`
+  (64x). Load was started 3 s before each run and killed by pid after it. Script,
+  proxy, analysis and logs are in `scratchpad/gm550/warm/` (`bin/run.sh`,
+  `bin/ra_proxy.py`, `bin/analyse.py`, `summary.txt`, `runs/<arm>-<n>/`).
+- "First wait" is the time from sending the first `textDocument/*` question to its
+  answer. "Ready" is the last `rustAnalyzer/cachePriming` `end` before that question,
+  in seconds from rust-analyzer's start. "Later" covers every other question of the
+  instance.
+
+### Machine state
+
+8 CPUs. The 1-minute load average was 5.0 just before the series and 32-441 during it.
+Other sessions caused most of that, which is why "idle" is relative. It was 245 at the
+end. `real` was 21-107 s. `user`/`sys` were 9.8-12.2 s and 3.4-4.3 s in the 5 runs where
+the plugin's child exited by itself, and about 1.1-1.4 s and 0.3 s in the 13 runs where
+the plugin killed the proxy at shutdown. A killed child is never reaped, so its CPU
+time is not counted. That is an artefact of the proxy, and it happens after the pass.
+Either way, `real` far above `user + sys` means waiting, mostly on rust-analyzer, whose
+CPU time the kit's rusage does not include.
+
+### Per run
+
+| run | load 1-min before / after | real s | user s | sys s | ready (s) | first question after ready | first wait | later: median / max | later >= 5 s | kit |
+|---|---|---|---|---|---|---|---|---|---|---|
+| idle-1 | 33 / 73 | 22.9 | 10.8 | 4.0 | 15.7 | 2.02 s | 5 ms | 7 ms / 0.70 s | 0 | PASS |
+| y16-1 | 63 / 82 | 28.7 | 1.1 | 0.3 | 21.8 | 2.01 s | 4 ms | 22 ms / 0.85 s | 0 | PASS |
+| y64-1 | 84 / 202 | 39.5 | 1.2 | 0.3 | 25.2 | 2.01 s | 5 ms | 26 ms / 0.99 s | 0 | PASS |
+| idle-2 | 211 / 218 | 27.6 | 1.4 | 0.3 | 19.8 | 2.02 s | 56 ms | 39 ms / 1.94 s | 0 | PASS |
+| y16-2 | 197 / 276 | 55.7 | 1.3 | 0.3 | 43.5 | 2.02 s | 42 ms | 49 ms / 1.27 s | 0 | PASS |
+| y64-2 | 266 / 338 | 47.6 | 1.3 | 0.3 | 28.7 | 2.01 s | 5 ms | 31 ms / 0.97 s | 0 | PASS |
+| idle-3 | 333 / 350 | 34.6 | 1.4 | 0.3 | 25.8 | 2.03 s | 30 ms | 44 ms / 1.36 s | 0 | PASS |
+| y16-3 | 308 / 386 | 52.6 | 1.4 | 0.3 | 41.0 | 2.02 s | 35 ms | 58 ms / 1.03 s | 0 | PASS |
+| y64-3 | 386 / 441 | 91.0 | 1.3 | 0.3 | 68.1 | 2.00 s | 30 ms | 47 ms / 3.28 s | 0 | PASS |
+| idle-4 | 430 / 97 | 106.7 | 11.6 | 4.0 | 90.1 \* | before ready \* | 2602 ms (empty) | 5 ms / 0.92 s | 0 | PASS |
+| y16-4 | 89 / 173 | 34.5 | 1.2 | 0.3 | 26.7 | 2.01 s | 5 ms | 43 ms / 1.36 s | 0 | PASS |
+| y64-4 | 171 / 225 | 72.2 | 1.2 | 0.3 | 56.2 | 2.02 s | 5 ms | 21 ms / 0.94 s | 0 | PASS |
+| idle-5 | 207 / 150 | 21.1 | 9.8 | 3.4 | 15.6 | 2.00 s | 15 ms | 3 ms / 0.75 s | 0 | PASS |
+| y16-5 | 127 / 218 | 49.5 | 1.2 | 0.3 | 37.8 | 2.01 s | 5 ms | 47 ms / 2.59 s | 0 | PASS |
+| y64-5 | 201 / 356 | 52.5 | 1.3 | 0.3 | 34.2 \* | before ready \* | 74 ms (empty) | 9 ms / 1.44 s | 0 | PASS |
+| idle-6 | 327 / 220 | 27.0 | 12.2 | 4.3 | 17.7 | 2.03 s | 7 ms | 4 ms / 1.08 s | 0 | PASS |
+| y16-6 | 195 / 230 | 37.4 | 1.3 | 0.3 | 27.0 | 2.01 s | 6 ms | 15 ms / 1.52 s | 0 | PASS |
+| y64-6 | 247 / 277 | 76.4 | 1.2 | 0.3 | 58.0 | 2.00 s | 5 ms | 12 ms / 0.86 s | 0 | PASS |
+
+Every run logged the warm-up line once and no `did not answer` line. No question went
+unanswered. No answer after the first took 5 s or more (the slowest was 3.28 s).
+
+\* The two runs marked \* called the server ready too early (see below). Their "ready"
+column is the real `PrimeCaches(End)`, reached 46 s (idle-4) and 25 s (y64-5) after the
+first question.
+
+### Distribution
+
+| arm | n | first wait: median / max | ready: median (range) |
+|---|---|---|---|
+| idle | 6 | 22.5 ms / 2602 ms (15 ms / 56 ms without idle-4) | 18.7 s (15.6-90.1) |
+| y16 | 6 | 5.5 ms / 42 ms | 32.4 s (21.8-43.5) |
+| y64 | 6 | 5 ms / 74 ms | 45.2 s (25.2-68.1) |
+| loaded (y16 + y64) | 12 | 5 ms / 74 ms | - |
+
+**Control.** The idle and loaded distributions of the first wait do not differ. Both are
+milliseconds, and the loaded median is in fact the lower one. Under the rule for this
+slice, **the first-answer measurement tells nothing about how large the warm-up has to
+be under S7's load.** The arms did differ on readiness (median 18.7 s, then 32.4 s, then
+45.2 s), so the load reached rust-analyzer. It slowed indexing, which the 10-min
+readiness budget absorbs, and it did not slow the answer to the first question. With
+16x and 64x `yes` at a 1-minute load up to 441, the S7 shape (seven 10 s timeouts right
+after `PrimeCaches(End)`, load 760-830, with the 137-test extractor run starting at the
+same moment) did not reproduce. That run's contention, which comes from parallel
+compile and test processes and their memory and I/O, is not what `yes` produces.
+
+### Readiness called inside a phase gap (2 of 18 runs)
+
+In idle-4 and y64-5, rust-analyzer's first `Fetching` ended, and the next phase
+(`Building CrateGraph`) began 2.47 s and 2.04 s later. Both gaps are longer than the
+bridge's 2 s `settle`. The bridge called the server ready and sent its warm-up question
+2.007 s after `Fetching` ended. That question was answered **empty** in 2.6 s and 74 ms.
+The answer spent the warm-up (`mark_warmed_up`), and 16 questions went out at once
+while rust-analyzer was still fetching, scanning roots and priming, for another 46 s
+and 25 s. Here they were all answered empty within 15 ms, deferred, and asked again
+after the server went quiet (ids 19+ in idle-4 go out 2.0 s after the real
+`PrimeCaches(End)`). The deferral rule absorbed it, and both runs passed.
+
+This matters for option A. If the server answers a question asked mid-indexing slowly
+rather than empty, the warm-up does not protect it: the warm-up has already been spent
+on the premature empty answer, and the wave is 8 wide on 10 s. The GM-310 trace in
+`plugin.toml` measured the largest gap at 182 ms idle. Under load it reached 2.47 s
+here. S7's stderr says the timeouts came "right after `PrimeCaches(End)`", which is the
+case the warm-up does cover. It carries no per-message timestamps, though, so it cannot
+rule out this path. Option B (the kit fails a residual session) covers both paths.
+
+### Proposed `WARM_UP`
+
+**120 s, the same as TypeScript.** The data cannot support a tighter value, and nothing
+in it argues for a larger one.
+
+- Observed: the slowest first answer was 2.6 s (an empty answer during indexing), and
+  74 ms loaded. 120 s / 2.6 s gives a 46x margin over everything measured.
+- The case that failed in S7 needed more than 10 s for 7 of 8 questions. 120 s is 12x
+  that budget. TS's vtsls needed at most 38 s at load 103 (GM-325 §5, 32% of 120 s).
+- Cost: the warm-up keeps one question in flight until the first answer. Here that is
+  4-74 ms of wall time per pass (2.6 s at worst), so the price on a healthy machine is
+  milliseconds. A server that never answers costs one 120 s wait, after which the
+  bridge widens to 8 on 10 s.
+- Against the whole-project floor: 120 s / 900 s = 13% of the 15-min floor, which leaves
+  780 s for the pass itself. The fixture's whole run was 21-107 s here, and S7's pass
+  took 78.5-116 s *with* seven 10 s timeouts.
+
+Not measured: whether 120 s is enough at S7's own load. Reproducing that needs the
+combined extractor and conformance run, which this slice's rules exclude.
