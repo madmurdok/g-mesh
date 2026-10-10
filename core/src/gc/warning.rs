@@ -54,9 +54,19 @@ struct StaleProject {
 /// Never deletes anything. Points at `g-mesh clean expired` for the actual
 /// cleanup, which stays a separate, explicit step.
 pub fn maybe_print_stale_projects_warning() -> Result<()> {
+    if let Some(text) = stale_projects_warning()? {
+        print!("{text}");
+    }
+    Ok(())
+}
+
+/// The text [`maybe_print_stale_projects_warning`] prints, for a caller that
+/// prints it elsewhere (`g-mesh status --json` keeps its stdout pure JSON and
+/// sends this to stderr). `None` when the switch is off or nothing is stale.
+pub fn stale_projects_warning() -> Result<Option<String>> {
     let config = config::read_global_config().context("failed to read the global config")?;
     if !config.cleanup.enabled {
-        return Ok(());
+        return Ok(None);
     }
 
     let root = projects_root().context("failed to resolve ~/.g-mesh/projects")?;
@@ -64,10 +74,7 @@ pub fn maybe_print_stale_projects_warning() -> Result<()> {
     let threshold = Duration::from_secs(threshold_days * 24 * 60 * 60);
 
     let stale = stale_projects(&root, threshold)?;
-    if let Some(text) = render(&stale, threshold_days) {
-        print!("{text}");
-    }
-    Ok(())
+    Ok(render(&stale, threshold_days))
 }
 
 /// Every project directory under `projects_root` whose recorded idle time

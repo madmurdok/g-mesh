@@ -773,8 +773,12 @@ upgrade lands is retired first, whether it is the core binary or only the
 plugin that was rebuilt, so the next MCP call is answered by what is on disk
 now. `g-mesh status` says which build the running daemon came from.
 
-Run `g-mesh status` in a project to see whether its daemon and plugin are up,
-how much of the project the index covers, and which files failed to parse.
+Run `g-mesh status` in a project to see whether its daemon and plugins are up,
+what the last walk did for each language (with the installed plugin's
+version), and which files failed to parse. It does not walk the project's
+files; `g-mesh status --full` also does, to report how much of the project the
+index covers and which files await reindex. `--json` prints either view as one
+JSON object (`formatVersion`, camelCase keys).
 `g-mesh stop` shuts the daemon core and its plugin down; running it when
 nothing is up is a no-op, not an error.
 
