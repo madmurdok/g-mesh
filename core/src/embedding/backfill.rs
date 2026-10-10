@@ -12,13 +12,12 @@
 //! the structural graph a `find_definition`/`find_references`/... caller
 //! actually needs takes about 31s of it.
 //!
-//! `daemon::bulk_index::run` now takes `embedding: None` for the cold-start
-//! walk (see its own doc comment), which makes the walk structural-only, and
-//! this module is the "finish the other half" step that runs once,
-//! afterward: every node the walk (or an earlier interrupted attempt at this
-//! same pass, or an incremental edit whose own embedding step failed) left
-//! without a `vectors` row gets one - or is confirmed to have nothing worth
-//! embedding - see `embedding::pipeline`'s "What gets embedded" section.
+//! `daemon::bulk_index::run` is structural-only, and this module is the
+//! "finish the other half" step that runs once, afterward: every node the
+//! walk (or an earlier interrupted attempt at this same pass, or an
+//! incremental edit whose own embedding step failed) left without a
+//! `vectors` row gets one - or is confirmed to have nothing worth embedding -
+//! see `embedding::pipeline`'s "What gets embedded" section.
 //!
 //! `daemon::indexing_status::IndexingStatus`'s `Embedding` phase covers
 //! exactly the time this pass runs: structural tools do not wait on it

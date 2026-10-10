@@ -532,13 +532,6 @@ mod tests {
         assert_eq!(graph.nodes.len(), 3, "{:?}", graph.nodes);
     }
 
-    #[test]
-    fn a_files_end_is_where_a_trailing_space_cannot_move_it() {
-        let plain = Positions::new("def a():\n    pass\n").file_range();
-        let spaced = Positions::new("def a():\n    pass \n").file_range();
-        assert_eq!(plain, spaced);
-    }
-
     /// tree-sitter counts a column in bytes; everything on the wire counts
     /// characters, and a line with a multi-byte character is where the two
     /// part company. Python allows non-ASCII identifiers, so this is not a

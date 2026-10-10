@@ -1768,9 +1768,10 @@ semantic layer gets built:
   `get_dependencies`) — deliberately not the four symbol-anchored ones
   (`find_references`/`find_callers`/`find_callees`/`find_implementations`),
   which have no single file to check before resolving the query itself.
-  Proven by `core/tests/query_time_staleness.rs`: edit a file while the
-  daemon is down, restart, query immediately — the edit is now visible with
-  no artificial delay.
+  Proven by `core/tests/daemon_core.rs`
+  (`a_restart_against_an_already_indexed_project_does_not_walk_it_again`):
+  edit a file while the daemon is down, restart, query immediately — the
+  edit is now visible with no artificial delay.
 
   A separate, still-open gap surfaced by the same investigation, distinct
   from staleness: `watcher::debounce::Debouncer` and `watcher::burst::

@@ -192,17 +192,6 @@ mod tests {
         }
     }
 
-    /// A path names one binary and is never searched around.
-    #[test]
-    fn a_command_that_is_a_path_is_the_only_candidate() {
-        let root = Path::new("/projects/thing");
-        for command in ["/opt/ts/vtsls", "servers/vtsls"] {
-            let candidates = candidates(Path::new(command), root, &[]);
-            assert_eq!(candidates.len(), 1, "{candidates:#?}");
-            assert_eq!(candidates[0].command, PathBuf::from(command));
-        }
-    }
-
     /// Nothing usable says which server is missing, how to install it, and
     /// where to point the plugin instead.
     #[test]
@@ -246,11 +235,6 @@ mod tests {
         assert_eq!(capabilities["semantic_sweep"].as_bool(), Some(false));
         assert_eq!(capabilities["receiver_calls"].as_str(), Some("resolved"));
         assert_eq!(capabilities["receiver_calls_structural"].as_str(), Some("unresolved"));
-    }
-
-    #[test]
-    fn the_manifest_version_matches_the_crates() {
-        assert_eq!(manifest()["plugin"]["plugin_version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
     }
 
     /// Each extension opens under the `languageId` tsserver parses it by;

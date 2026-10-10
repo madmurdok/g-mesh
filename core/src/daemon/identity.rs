@@ -70,18 +70,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_path_always_hashes_identically() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-
-        assert_eq!(project_hash(root).unwrap(), project_hash(root).unwrap());
-    }
-
-    #[test]
     fn trailing_slash_and_relative_forms_hash_identically_after_canonicalization() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let canonical_hash = project_hash(root).unwrap();
+        assert_eq!(canonical_hash, project_hash(root).unwrap(), "the same path hashes identically");
 
         let with_trailing_slash = root.join("");
         assert_eq!(canonical_hash, project_hash(&with_trailing_slash).unwrap());

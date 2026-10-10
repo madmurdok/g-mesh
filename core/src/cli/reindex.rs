@@ -114,10 +114,10 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let project_config = crate::config::read_project_config(project_root)
         .context("failed to read the project's config.toml")?;
     let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
-    // `embedding: None` - this walk is structural-only, matching
-    // `daemon::run`'s own cold start; the pipeline above is used by the
-    // semantic pass and the backfill pass below instead.
-    let summary = bulk_index::run(&canonical_root, &conn, None, &discovered)
+    // The walk is structural-only, matching `daemon::run`'s own cold
+    // start; the pipeline above is used by the semantic pass and the
+    // backfill pass below.
+    let summary = bulk_index::run(&canonical_root, &conn, &discovered)
         .context("failed to rebuild the project's index")?;
     conn.with(schema::record_bulk_index).context("failed to record that the project was fully reindexed")?;
 

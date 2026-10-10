@@ -145,8 +145,10 @@ listed sites.
     - `TestComputeFileNodeMatchesTheDesignDocsWorkedExample`: `(10,0)`
       becomes `(8,10)`. The last content is `// trailer` on line 8.
 - **Unchanged, and still pinning the whitespace property:**
-  - `a_files_end_is_where_a_trailing_space_cannot_move_it` in
-    `python/.../emit.rs` (509) and `rust/.../emit.rs` (404);
+  - `columns_file_range_is_unmoved_by_a_space_before_the_last_newline` in
+    `sdk/tests/columns.rs` (the plugins' `Positions::file_range` delegates to
+    it; the per-plugin `a_files_end_is_where_a_trailing_space_cannot_move_it`
+    copies in `emit.rs` were later removed as duplicates);
   - `a_trailing_space_before_the_last_newline_changes_nothing` in Python
     `tests.rs:846` and Rust `tests.rs:1525`;
   - `core/tests/plugin_check.rs:393`.

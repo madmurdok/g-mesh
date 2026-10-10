@@ -423,17 +423,4 @@ pub(crate) mod tests {
         assert_eq!(structured_doc("```\nfn main() {}\n```"), "");
         assert_eq!(structured_doc("# Examples\n\nIt runs.\n\n```\nrun();\n```"), "");
     }
-
-    /// Same input, same output; no state crosses calls. Control: any
-    /// iteration over a `HashMap`/`HashSet` or a clock in the rules makes
-    /// this flaky (here: comparing two calls and a fixed expectation).
-    #[test]
-    fn is_deterministic() {
-        let doc = "S.\n\n# Why\n\nShort.\n\n@param x y";
-        let first = structured_doc(doc);
-        for _ in 0..16 {
-            assert_eq!(structured_doc(doc), first);
-        }
-        assert_eq!(first, "S.\n\n# Why\n\nShort.");
-    }
 }

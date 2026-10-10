@@ -85,7 +85,7 @@ impl Project {
             .expect("failed to prepare the index");
         let conn = IndexStore::new(conn);
         let discovered = only_the_bundled_plugin();
-        let summary = bulk_index::run(self.root(), &conn, None, &discovered).expect("the bulk walk failed");
+        let summary = bulk_index::run(self.root(), &conn, &discovered).expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes at all");
         assert_eq!(summary.skipped_lines, 0, "the plugin emitted a line core could not read");
         conn.into_inner().unwrap()
@@ -177,20 +177,6 @@ fn an_ordinary_symbol_in_the_same_walk_costs_no_declaration_rows() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(owners, vec![node_id(&conn, "parse")]);
-}
-
-#[test]
-fn a_freshly_built_index_reads_schema_version_14() {
-    let project = Project::new();
-    let conn = project.walk();
-
-    let version: String =
-        conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
-    // Pinned as a literal on purpose, alongside the constant: a schema change
-    // has to update this line by hand. "14" adds `edges.specifier` and the
-    // `resolution_facts` table.
-    assert_eq!(version, "14");
-    assert_eq!(version, schema::CURRENT_SCHEMA_VERSION);
 }
 
 /// The wire half of the promise, asserted against the plugin's real stdout

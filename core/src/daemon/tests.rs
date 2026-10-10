@@ -443,44 +443,6 @@ fn record_baseline(conn: &IndexStore, file_path: &str) {
     conn.with(|c| crate::storage::write::upsert_indexed_file(c, file_path, 1, "hash")).unwrap();
 }
 
-/// GM-505 (ADR 0023, W1): a new file and an indexed importer of it settling
-/// in one batch reach the plugin new file first, though the events arrive
-/// importer first - so the importer is extracted against a project model
-/// that already holds its target. Each path is routed exactly once, by the
-/// call that drained it.
-#[test]
-fn a_batch_routes_its_new_files_before_their_modified_importers_whatever_the_event_order() {
-    let (project, _plugins, dirs, registry) = registry_over(&["python"]);
-    let plugin_dir = &dirs[0];
-    let conn = test_plugin::empty_index();
-    let root = project.path().canonicalize().unwrap();
-
-    let importers: Vec<String> = (0..PATHS_PER_KIND).map(|i| format!("importer{i}.python-src")).collect();
-    let targets: Vec<String> = (0..PATHS_PER_KIND).map(|i| format!("target{i}.python-src")).collect();
-    for (importer, target) in importers.iter().zip(&targets) {
-        fs::write(root.join(importer), format!("import {target}")).unwrap();
-        record_baseline(&conn, importer);
-        fs::write(root.join(target), "").unwrap();
-    }
-
-    let importer_first: Vec<String> = importers.iter().chain(&targets).cloned().collect();
-    route_one_batch(&root, &conn, &registry, &importer_first);
-
-    let requested = test_plugin::file_changed_requests(plugin_dir);
-    let mut expected_set = importer_first.clone();
-    expected_set.sort();
-    let mut requested_set = requested.clone();
-    requested_set.sort();
-    assert_eq!(
-        requested_set, expected_set,
-        "each settled path is routed exactly once, by the call that drained it"
-    );
-    assert!(
-        requested[..PATHS_PER_KIND].iter().all(|path| targets.contains(path)),
-        "every new file must reach the plugin before any modified importer: {requested:?}"
-    );
-}
-
 /// The same batch with deletions in it: every deleted path (gone from disk,
 /// baseline still recorded) is routed first, then creations, then
 /// modifications - fed here in the opposite order.

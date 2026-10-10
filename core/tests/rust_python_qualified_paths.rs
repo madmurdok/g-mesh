@@ -78,8 +78,7 @@ impl Project {
         schema::ensure_current(&conn, "rust-python-qualified-paths-test")
             .expect("failed to prepare the index");
         let conn = IndexStore::new(conn);
-        let summary =
-            bulk_index::run(self.root(), &conn, None, &rust_and_python()).expect("the bulk walk failed");
+        let summary = bulk_index::run(self.root(), &conn, &rust_and_python()).expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes at all");
         assert_eq!(summary.skipped_lines, 0, "a plugin emitted a line core could not read");
         conn.into_inner().unwrap()

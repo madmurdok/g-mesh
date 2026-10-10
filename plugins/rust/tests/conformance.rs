@@ -359,9 +359,11 @@ fn assert_report_shape(
     );
 }
 
+/// The acceptance criteria, as assertions against the linked index: see
+/// `conformance/expect.toml`, which says what each one proves.
 #[test]
-fn the_plugin_passes_every_check_that_applies_to_it() {
-    let outcome = semantic().run().expect("the conformance kit could not be run");
+fn the_linked_index_answers_the_acceptance_criteria() {
+    let outcome = semantic().expect(EXPECT).run().expect("the conformance kit could not be run");
     outcome.assert_conformant();
     assert_report_shape(
         &outcome,
@@ -369,14 +371,6 @@ fn the_plugin_passes_every_check_that_applies_to_it() {
         "capabilities.semantic-pass-undeclared",
         Verdict::Skip,
     );
-}
-
-/// The acceptance criteria, as assertions against the linked index: see
-/// `conformance/expect.toml`, which says what each one proves.
-#[test]
-fn the_linked_index_answers_the_acceptance_criteria() {
-    let outcome = semantic().expect(EXPECT).run().expect("the conformance kit could not be run");
-    outcome.assert_conformant();
 
     // `assert_conformant` fails on a FAIL and says nothing about a SKIP, and
     // the whole expectations section is skipped when the session did not

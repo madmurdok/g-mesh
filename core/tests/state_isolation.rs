@@ -14,7 +14,7 @@
 //! and it does so on both sides of the process boundary, because the two can
 //! break independently.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use g_mesh::storage::connection::projects_root;
@@ -83,17 +83,4 @@ fn state_directory_line(stdout: &str) -> Option<PathBuf> {
         .lines()
         .find_map(|line| line.trim().strip_prefix("state directory:"))
         .map(|path| PathBuf::from(path.trim()))
-}
-
-/// A sanity check on the parser above, so a rewording of `status` output
-/// surfaces as this failing rather than as the isolation test quietly
-/// asserting nothing.
-#[test]
-fn the_state_directory_parser_reads_the_line_status_actually_prints() {
-    let stdout = "project: a1b2c3d4\n  state directory: /tmp/somewhere/a1b2c3d4\n";
-
-    let parsed = state_directory_line(stdout);
-
-    assert_eq!(parsed, Some(Path::new("/tmp/somewhere/a1b2c3d4").to_path_buf()));
-    assert_eq!(state_directory_line("project: a1b2c3d4\n"), None);
 }

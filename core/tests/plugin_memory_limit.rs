@@ -212,7 +212,7 @@ fn structural_bulk_index(project_root: &Path, conn: &IndexStore, manifest: &Plug
         manifests: HashMap::from([("rust".to_string(), manifest.clone())]),
         routing: HashMap::from([(".rs".to_string(), "rust".to_string())]),
     };
-    let summary = bulk_index::run(project_root, conn, None, &discovered)
+    let summary = bulk_index::run(project_root, conn, &discovered)
         .expect("the real one-shot structural bulk index must succeed");
     assert!(summary.nodes > 0, "the structural walk over a real fixture must find real nodes: {summary:?}");
 }

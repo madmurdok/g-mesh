@@ -149,9 +149,9 @@ BTreeMap<&'static str, usize>`:
   orders of magnitude); a hard-coded "common" list (a second, unpinned copy).
   `exclude_dirs` is not a capability, so the catalogue's "no capability
   fields" rule holds: like `extensions`, it says which files the absent
-  plugin *would* claim. GM-328's test
-  `a_catalogue_entry_holds_only_a_language_and_its_extensions` changes with
-  it (Open question 2).
+  plugin *would* claim. The pinning test,
+  `every_catalogue_entry_matches_its_real_plugin_manifest_extensions`,
+  compares both fields with each plugin's manifest (Open question 2).
 - **Shared walker**: the `WalkBuilder` configuration (`hidden(false)`,
   `parents(false)`, `ignore(false)`, no global/`info/exclude`,
   `require_git(false)`, no symlinks, pruned dir names) moves out of

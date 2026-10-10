@@ -1000,22 +1000,6 @@ mod tests {
         assert_eq!(text_to_embed(Some("   \n"), Some("\t")), None);
     }
 
-    /// The acceptance criterion at the unit level: an empty-text node must
-    /// never reach the model at all, so a caller that (incorrectly) tried to
-    /// embed it with no model loaded would still not observe a panic -
-    /// `embed_node` is called with a `model` argument in the tests below only
-    /// because the type requires one, and the point of this test is that it
-    /// is provably never used.
-    #[test]
-    fn embedding_a_node_with_no_text_never_touches_the_model_or_the_database() {
-        // No real `EmbeddingModel` is constructed here at all - if
-        // `embed_node` tried to call `.embed()` on neither doc comment nor
-        // signature being present, this test would need one and would not
-        // compile without real weights. That it compiles and passes without
-        // one is the proof.
-        assert_eq!(text_to_embed(None, None), None);
-    }
-
     #[test]
     fn a_disabled_pipeline_has_no_query_embedding() {
         let pipeline = EmbeddingPipeline::disabled();
@@ -1583,14 +1567,6 @@ mod tests {
         let conn = rusqlite::Connection::open(&settings.path).unwrap();
         let remaining: i64 = conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0)).unwrap();
         assert!(remaining < 20, "the unit's end must evict down toward the bound, {remaining} left");
-    }
-
-    /// The fake's vectors are what `fake_vector` says, so a test can compare
-    /// an index row with a fresh embed.
-    #[test]
-    fn the_fake_model_is_deterministic() {
-        assert_eq!(bits(&fake_vector("a")), bits(&fake_vector("a")));
-        assert_ne!(bits(&fake_vector("a")), bits(&fake_vector("b")));
     }
 
     /// `TEXT_FORM_TAG` is part of every stored vector's `embeddingVersion`

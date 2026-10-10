@@ -86,7 +86,7 @@ lib (binary g-mesh)
 integration (binary g-mesh::<name>)
   82.4  123.9  serving_while_indexing a_walk_that_outlasts_the_bootstrap_timeout_is_waited_out_rather_than_losing_the_client
   13.6   56.2  serving_while_indexing a_restart_against_an_already_walked_project_never_reports_itself_as_still_indexing
-  10.6   43.4  serving_while_indexing a_first_call_is_answered_normally_when_nothing_holds_the_walk_open
+  10.6   43.4  serving_while_indexing a_first_call_is_answered_normally_when_nothing_holds_the_walk_open   [later removed as a duplicate]
   59.7  102.5  daemon_build_staleness status_reports_a_daemon_that_an_upgrade_has_left_behind
   10.9   26.3  daemon_build_staleness shims_racing_to_replace_one_outdated_daemon_produce_exactly_one_replacement
   10.2   18.4  daemon_build_staleness a_daemon_started_from_an_older_build_is_replaced_before_it_answers_again

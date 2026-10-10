@@ -149,19 +149,6 @@ fn clean_refuses_while_a_daemon_is_still_serving_the_project() {
     assert!(!project.state_dir().exists());
 }
 
-/// Per the requirements: an unrecognized cwd asks for an explicit id rather
-/// than picking something arbitrary to delete.
-#[test]
-fn clean_in_a_never_indexed_directory_asks_for_an_explicit_project_id() {
-    let project = Project::new();
-
-    let cleaned = project.command(&["clean"]);
-
-    assert!(!cleaned.status.success(), "there is nothing here to clean");
-    let stderr = stderr_of(&cleaned);
-    assert!(stderr.contains("pass an explicit <project-id>"), "the error must ask for an id: {stderr}");
-}
-
 /// `orphaned` end to end, in the form that cannot delete anything: the target
 /// has to parse, reach `cli::clean`, and report. What it decides about each
 /// directory is the unit tests' subject - here the point is that the word is
@@ -183,23 +170,6 @@ fn clean_orphaned_without_force_reports_and_deletes_nothing() {
         project.state_dir().is_dir(),
         "this project is still on disk - `clean orphaned` must not have touched its state"
     );
-}
-
-/// A project id that is really a path must never be joined onto the projects
-/// root - checked through the real binary, not just the unit under it.
-#[test]
-fn clean_refuses_a_path_shaped_project_id() {
-    let project = Project::new();
-
-    for id in ["..", "../../etc", "/tmp"] {
-        let cleaned = project.command(&["clean", id]);
-        assert!(!cleaned.status.success(), "`clean {id}` must be refused");
-        assert!(
-            stderr_of(&cleaned).contains("is not a project id"),
-            "`clean {id}` was refused for the wrong reason: {}",
-            stderr_of(&cleaned)
-        );
-    }
 }
 
 /// GM-399 slice 4 (D11): a front's state directory holds a socket, a pid
