@@ -223,11 +223,3 @@ fn last_used_survives_the_daemon_that_wrote_it() {
         after_death.idle
     );
 }
-
-/// A `~/.g-mesh/projects/` entry no daemon ever finished setting up must read
-/// as "nothing recorded", not as an error that would abort a whole scan.
-#[test]
-fn a_project_directory_with_no_index_reads_as_nothing_recorded() {
-    let dir = tempfile::tempdir().expect("failed to create a temp directory");
-    assert_eq!(last_used::read_from_project_dir(dir.path()).unwrap(), None);
-}

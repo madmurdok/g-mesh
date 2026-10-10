@@ -2395,23 +2395,30 @@ fn a_typed_call_its_server_confirms_in_the_same_file_stays_one_structural_edge()
 /// (a semantic edge under `X`'s id is sent and `X` is retracted). Pass 2 -
 /// in `Answers::settle`, skip `self.resend.push(edge.clone())` (`X` is not
 /// re-sent).
+///
+/// A cross-file field read behaves the same way, so the test runs once per
+/// site kind: a receiver call and a receiver field read.
 #[test]
 fn a_cross_file_call_the_server_confirms_survives_a_later_empty_pass() {
-    let scratch = Scratch::new("gm489-there-agree-empty");
-    let agree = receiver_fixture(&scratch, Bound::There, &[AGREE], &[]);
-    let empty = receiver_fixture(&scratch, Bound::There, &[EMPTY], &[]);
-    assert_eq!(agree.x, empty.x, "an edit that moves the call keeps X's id");
-    let mut bridge = receiver_bridge(&scratch, Bound::There);
+    type Fixture = fn(&Scratch, Bound, &[u32], &[u32]) -> Receiver;
+    let kinds: [(&str, Fixture); 2] = [("call", receiver_fixture), ("field-read", field_fixture)];
+    for (kind, fixture) in kinds {
+        let scratch = Scratch::new(&format!("there-agree-empty-{kind}"));
+        let agree = fixture(&scratch, Bound::There, &[AGREE], &[]);
+        let empty = fixture(&scratch, Bound::There, &[EMPTY], &[]);
+        assert_eq!(agree.x, empty.x, "{kind}: an edit that moves the site keeps X's id");
+        let mut bridge = receiver_bridge(&scratch, Bound::There);
 
-    let first = pass(&mut bridge, &agree.index);
-    assert!(first.complete, "{:?}", first.reason);
-    assert!(semantic_edges(&first).is_empty(), "agreement adds nothing: {:#?}", first.diff);
-    x_re_sent_unchanged(&first, &agree, "pass 1 (agrees)");
+        let first = pass(&mut bridge, &agree.index);
+        assert!(first.complete, "{kind}: {:?}", first.reason);
+        assert!(semantic_edges(&first).is_empty(), "{kind}: agreement adds nothing: {:#?}", first.diff);
+        x_re_sent_unchanged(&first, &agree, &format!("{kind}, pass 1 (agrees)"));
 
-    let second = pass(&mut bridge, &empty.index);
-    assert!(second.complete, "{:?}", second.reason);
-    assert!(semantic_edges(&second).is_empty(), "{:#?}", second.diff);
-    x_re_sent_unchanged(&second, &empty, "pass 2 (empty)");
+        let second = pass(&mut bridge, &empty.index);
+        assert!(second.complete, "{kind}: {:?}", second.reason);
+        assert!(semantic_edges(&second).is_empty(), "{kind}: {:#?}", second.diff);
+        x_re_sent_unchanged(&second, &empty, &format!("{kind}, pass 2 (empty)"));
+    }
 }
 
 /// **GM-489, T3 (contradiction, then R1).** An answer that lands elsewhere
@@ -2607,28 +2614,6 @@ fn a_typed_field_read_its_server_confirms_in_the_same_file_stays_one_structural_
     assert!(semantic_edges(&answer).is_empty(), "agreement adds nothing: {:#?}", answer.diff);
     x_re_sent_unchanged(&answer, &fixture, "the only pass");
     assert_eq!(upserts(&answer, &fixture.x)[0].kind, EdgeKind::References);
-}
-
-/// **GM-497, item 13 (R2 `Bound::There`, then R1).** A cross-file field read
-/// the server confirms, whose answer would get `X`'s own id, records
-/// nothing; a later empty pass keeps `X`.
-#[test]
-fn a_cross_file_field_read_the_server_confirms_survives_a_later_empty_pass() {
-    let scratch = Scratch::new("gm497-there-agree-empty");
-    let agree = field_fixture(&scratch, Bound::There, &[AGREE], &[]);
-    let empty = field_fixture(&scratch, Bound::There, &[EMPTY], &[]);
-    assert_eq!(agree.x, empty.x, "an edit that moves the read keeps X's id");
-    let mut bridge = receiver_bridge(&scratch, Bound::There);
-
-    let first = pass(&mut bridge, &agree.index);
-    assert!(first.complete, "{:?}", first.reason);
-    assert!(semantic_edges(&first).is_empty(), "agreement adds nothing: {:#?}", first.diff);
-    x_re_sent_unchanged(&first, &agree, "pass 1 (agrees)");
-
-    let second = pass(&mut bridge, &empty.index);
-    assert!(second.complete, "{:?}", second.reason);
-    assert!(semantic_edges(&second).is_empty(), "{:#?}", second.diff);
-    x_re_sent_unchanged(&second, &empty, "pass 2 (empty)");
 }
 
 /// **GM-497, item 14 (contradiction, then R1).** An answer on another field

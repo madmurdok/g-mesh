@@ -1676,7 +1676,7 @@ fn a_real_missing_plugin_binary_renders_the_os_cause_without_the_path() {
     let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
     let store = IndexStore::new(store_with_files(&[]));
 
-    let summary = crate::daemon::bulk_index::run(project.path(), &store, None, &discovered)
+    let summary = crate::daemon::bulk_index::run(project.path(), &store, &discovered)
         .expect("one failed language must not fail the walk");
 
     let error = match summary.outcomes.get("rust") {
@@ -1846,7 +1846,7 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
     let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
     let store = IndexStore::new(store_with_files(&[]));
 
-    let summary = crate::daemon::bulk_index::run(project.path(), &store, None, &discovered)
+    let summary = crate::daemon::bulk_index::run(project.path(), &store, &discovered)
         .expect("one failed language must not fail the walk");
 
     let error = match summary.outcomes.get("rust") {

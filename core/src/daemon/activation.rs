@@ -291,14 +291,13 @@ impl ActivationCtx {
             self.watcher = Some(ProjectWatcher::new(&self.root).context("failed to start the file watcher")?);
         }
 
-        // `embedding: None` - the walk is structural-only;
-        // embedding is the backfill pass's job (`activate`). A tool call
-        // issued while this runs waits for it (`mcp::GMeshMcpServer::prepare`)
-        // rather than being answered off a half-built graph.
+        // The walk is structural-only; embedding is the backfill pass's
+        // job (`activate`). A tool call issued while this runs waits for it
+        // (`mcp::GMeshMcpServer::prepare`) rather than being answered off a
+        // half-built graph.
         let summary = bulk_index::run_with_progress(
             &self.canonical_root,
             &self.conn,
-            None,
             &self.discovered_for_bulk_index,
             Some(&self.indexing),
         )

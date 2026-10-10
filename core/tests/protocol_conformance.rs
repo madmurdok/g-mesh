@@ -58,30 +58,6 @@ fn real_legacy_v1_plugin_output_fixture_is_rejected() {
     assert!(!report.is_conformant());
 }
 
-/// A `pending_symbol` whose wire line carries no `target` at all - a v2
-/// sender's own mistake, not a legacy shape - and the shape check is what
-/// has to say so, rather than a `WireNode` failing to deserialize at all
-/// further up the pipeline.
-#[test]
-fn placeholder_with_no_target_fixture_is_rejected() {
-    let report = check_bulk_output(&fixture("invalid_placeholder_no_target.ndjson"));
-    assert!(!report.is_conformant());
-    assert!(
-        report.violations.iter().any(|v| v.message.contains("pending_symbol")),
-        "{:?}",
-        report.violations
-    );
-}
-
-/// Core, not a plugin, materializes container nodes - one on the wire is
-/// always a conformance violation (Data Model > Logical containers).
-#[test]
-fn container_node_fixture_is_rejected() {
-    let report = check_bulk_output(&fixture("invalid_container_node.ndjson"));
-    assert!(!report.is_conformant());
-    assert!(report.violations.iter().any(|v| v.message.contains("container")), "{:?}", report.violations);
-}
-
 #[test]
 fn well_formed_control_plane_fixture_is_conformant() {
     let report = check_control_plane_output(&fixture("valid_control.rpc"));

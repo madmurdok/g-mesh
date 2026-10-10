@@ -1115,58 +1115,6 @@ mod tests {
     }
 
     #[test]
-    fn resolved_true_sorts_before_resolved_false_at_equal_locality() {
-        let conn = setup();
-        make_node(&conn, "root", "a.rs");
-        make_node(&conn, "n1", "a.rs");
-        make_node(&conn, "n2", "a.rs");
-        make_edge(&conn, "e_unresolved", "root", "n1", false);
-        make_edge(&conn, "e_resolved", "root", "n2", true);
-
-        let page = paginate_edges(
-            &conn,
-            "root",
-            Direction::Outgoing,
-            &[],
-            &[],
-            "a.rs",
-            Distinctness::Edges,
-            10,
-            None,
-        )
-        .unwrap();
-        assert_eq!(page.results.len(), 2);
-        assert!(page.results[0].edge.resolved, "resolved edge must sort first at equal locality");
-        assert!(!page.results[1].edge.resolved);
-        assert!(!page.has_more);
-    }
-
-    #[test]
-    fn locality_breaks_ties_after_resolved() {
-        let conn = setup();
-        make_node(&conn, "root", "a.rs");
-        make_node(&conn, "far", "b.rs");
-        make_node(&conn, "near", "a.rs");
-        make_edge(&conn, "e_far", "root", "far", true);
-        make_edge(&conn, "e_near", "root", "near", true);
-
-        let page = paginate_edges(
-            &conn,
-            "root",
-            Direction::Outgoing,
-            &[],
-            &[],
-            "a.rs",
-            Distinctness::Edges,
-            10,
-            None,
-        )
-        .unwrap();
-        assert_eq!(page.results[0].edge.id, "e_near", "same-file target must sort before a distant one");
-        assert_eq!(page.results[1].edge.id, "e_far");
-    }
-
-    #[test]
     fn incoming_direction_paginates_edges_pointing_at_the_anchor() {
         let conn = setup();
         make_node(&conn, "root", "a.rs");

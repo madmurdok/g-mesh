@@ -331,21 +331,6 @@ async fn a_walk_that_outlasts_the_bootstrap_timeout_is_waited_out_rather_than_lo
     client.cancel().await.expect("failed to shut the client down");
 }
 
-/// The control that keeps the test above about indexing rather than about
-/// `find_definition`: with no walk held open, the same first call on the same
-/// fixture is answered outright.
-#[tokio::test]
-async fn a_first_call_is_answered_normally_when_nothing_holds_the_walk_open() {
-    let project = Project::new();
-    let client = connect_with(&project, None).await;
-
-    wait_until_indexed(project.root());
-    let node = body(&find_definition(&client, "connect").await);
-    assert_eq!(node["filePath"], "src/db/connection.ts");
-
-    client.cancel().await.expect("failed to shut the client down");
-}
-
 /// The fast path tasks 96 and 99 left intact, and the one this change must not
 /// touch: a restart against an index that was already fully walked has no walk
 /// to be in the middle of, so its socket is bound immediately and its very

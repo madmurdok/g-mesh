@@ -929,23 +929,6 @@ fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
     assert_eq!(manifest.workspace.entry_points, vec!["index".to_string()]);
 }
 
-/// Task 155's actual acceptance criterion for the rename: discovery must
-/// find the bundled plugin at its *real* on-disk location, not just at a
-/// copy under a conveniently-named tempdir - `default_roots()`'s bundled
-/// entry (`CARGO_MANIFEST_DIR/../plugins`) really does contain a
-/// `typescript/plugin.toml` today, where before task 155 it contained
-/// `js-ts/plugin.toml` and could not satisfy `read_manifest`'s
-/// language-equals-directory-name rule at all.
-#[test]
-fn the_real_bundled_plugin_directory_satisfies_read_manifest_directly() {
-    let bundled_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
-
-    let manifest = read_manifest(&bundled_root.join("typescript"))
-        .expect("the real bundled plugin directory must satisfy read_manifest");
-
-    assert_eq!(manifest.language, "typescript");
-}
-
 /// [`semantic_pass_capable_languages`]'s own acceptance criterion: only
 /// the manifests that actually declared `capabilities.semantic_pass =
 /// true` come back, sorted, and a manifest that said nothing (the

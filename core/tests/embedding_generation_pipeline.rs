@@ -1,7 +1,8 @@
 //! The embedding pipeline, end to end: a fixture file walked by the real
 //! plugin through the real cold-start bulk index (`daemon::bulk_index::run`),
-//! with a real `EmbeddingModel` wired in - and the `vectors` rows that come
-//! out the far side.
+//! then embedded by the real backfill pass (`embedding::backfill::run`) with
+//! a real `EmbeddingModel` - and the `vectors` rows that come out the far
+//! side.
 //!
 //! Mirrors `tests/overload_declaration_storage.rs`'s `Project`/`walk` shape:
 //! everything below the plugin process is genuine, and the question here is
@@ -87,27 +88,10 @@ impl Project {
         self.dir.path()
     }
 
-    /// Runs the cold-start walk against this project with `embedding` wired
-    /// in exactly as `daemon::run`/`cli::init`/`cli::reindex` wire it, and
-    /// hands back the index it filled.
-    fn walk(&self, embedding: &EmbeddingPipeline) -> Connection {
-        let conn = open(self.root()).expect("failed to open the project index");
-        schema::ensure_current(&conn, "embedding-generation-pipeline-test")
-            .expect("failed to prepare the index");
-        let conn = IndexStore::new(conn);
-        let discovered = only_the_bundled_plugin();
-        let summary =
-            bulk_index::run(self.root(), &conn, Some(embedding), &discovered).expect("the bulk walk failed");
-        assert!(summary.nodes > 0, "the walk produced no nodes at all");
-        assert_eq!(summary.skipped_lines, 0, "the plugin emitted a line core could not read");
-        conn.into_inner().unwrap()
-    }
-
-    /// GM-395's slice 1 shape: a structural-only walk (`embedding: None`)
-    /// followed by the embedding backfill pass as its own step, mirroring
-    /// what `daemon::run`'s cold start now does instead of [`walk`](Self::walk)'s
-    /// inline embedding. Returns the same kind of filled index [`walk`] does,
-    /// plus the backfill pass's own summary.
+    /// Runs the structural cold-start walk against this project, then the
+    /// embedding backfill pass with `embedding`, as `daemon::run`/
+    /// `cli::init`/`cli::reindex` run them. Returns the index they filled and
+    /// the backfill pass's summary.
     fn walk_then_backfill(
         &self,
         embedding: &EmbeddingPipeline,
@@ -117,8 +101,7 @@ impl Project {
             .expect("failed to prepare the index");
         let conn = IndexStore::new(conn);
         let discovered = only_the_bundled_plugin();
-        let summary =
-            bulk_index::run(self.root(), &conn, None, &discovered).expect("the structural walk failed");
+        let summary = bulk_index::run(self.root(), &conn, &discovered).expect("the structural walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes at all");
         assert_eq!(summary.skipped_lines, 0, "the plugin emitted a line core could not read");
 
@@ -181,35 +164,16 @@ fn load_real_pipeline() -> EmbeddingPipeline {
     pipeline
 }
 
-/// A disabled pipeline (no model loaded, e.g. weights never fetched) must
-/// still let indexing succeed - and must leave the `vectors` table untouched.
-/// This is the one test in this file that needs no weights at all.
-#[test]
-fn a_disabled_pipeline_indexes_the_fixture_without_writing_any_vectors() {
-    let project = Project::new();
-    let conn = project.walk(&EmbeddingPipeline::disabled());
-
-    let documented = node_id(&conn, "readFileAsString");
-    let bare = node_id(&conn, "bare");
-    let file = file_node_id(&conn);
-    assert!(!vector_row_exists(&conn, &documented));
-    assert!(!vector_row_exists(&conn, &bare));
-    assert!(!vector_row_exists(&conn, &file));
-
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM vectors", [], |row| row.get(0)).unwrap();
-    assert_eq!(total, 0, "a disabled pipeline must never write a vector row");
-}
-
 /// The acceptance criterion, at the fixture-file level: indexing a real
-/// project through the real plugin and the real model produces a `vectors`
-/// row for every symbol that has embeddable text - a doc comment, a
-/// signature, or both.
+/// project through the real plugin, then the backfill pass with the real
+/// model, produces a `vectors` row for every symbol that has embeddable
+/// text - a doc comment, a signature, or both.
 #[test]
 #[ignore = "needs the real model weights; see this file's module doc comment"]
 fn indexing_a_fixture_file_embeds_its_documented_symbols() {
     let project = Project::new();
     let pipeline = load_real_pipeline();
-    let conn = project.walk(&pipeline);
+    let (conn, _) = project.walk_then_backfill(&pipeline);
 
     let documented = node_id(&conn, "readFileAsString");
     let bare = node_id(&conn, "bare");
@@ -236,16 +200,11 @@ fn indexing_a_fixture_file_embeds_its_documented_symbols() {
     assert_eq!(version, format!("{}+int8+structured", g_mesh::config::EmbeddingConfig::default().model));
 }
 
-/// GM-395's slice 1 acceptance criterion: a structural-only walk
-/// (`embedding: None`) followed by the embedding backfill pass
-/// (`embedding::backfill::run`) as its own step embeds exactly the same
-/// symbols the old inline walk did in
-/// [`indexing_a_fixture_file_embeds_its_documented_symbols`] above -
-/// splitting embedding out of the walk must not change *what* gets embedded,
-/// only *when*.
+/// The backfill pass's own summary agrees with the rows it wrote: the
+/// fixture's two functions are its only candidates, and both are embedded.
 #[test]
 #[ignore = "needs the real model weights; see this file's module doc comment"]
-fn a_structural_walk_followed_by_backfill_embeds_the_same_symbols_as_the_old_inline_walk() {
+fn the_backfill_pass_counts_and_embeds_exactly_the_embeddable_symbols() {
     let project = Project::new();
     let pipeline = load_real_pipeline();
     let (conn, backfill_summary) = project.walk_then_backfill(&pipeline);
@@ -265,16 +224,15 @@ fn a_structural_walk_followed_by_backfill_embeds_the_same_symbols_as_the_old_inl
     );
 }
 
-/// Task #51's acceptance criterion: after a walk embeds anything at all,
-/// `meta.embedding_model` names the model that actually produced those rows -
-/// not left `NULL` forever the way it was before `EmbeddingPipeline::apply`
-/// started stamping it (see `storage::schema::set_embedding_model`).
+/// After the backfill pass embeds anything at all, `meta.embedding_model`
+/// names the model that actually produced those rows (see
+/// `storage::schema::set_embedding_model`).
 #[test]
 #[ignore = "needs the real model weights; see this file's module doc comment"]
 fn a_walk_that_embeds_anything_records_the_active_model_in_meta() {
     let project = Project::new();
     let pipeline = load_real_pipeline();
-    let conn = project.walk(&pipeline);
+    let (conn, _) = project.walk_then_backfill(&pipeline);
 
     let recorded: Option<String> =
         conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
@@ -291,7 +249,7 @@ fn a_walk_that_embeds_anything_records_the_active_model_in_meta() {
 fn the_file_node_has_no_doc_comment_or_signature_and_is_not_embedded() {
     let project = Project::new();
     let pipeline = load_real_pipeline();
-    let conn = project.walk(&pipeline);
+    let (conn, _) = project.walk_then_backfill(&pipeline);
 
     let file = file_node_id(&conn);
     let (doc_comment, signature): (Option<String>, Option<String>) = conn
@@ -344,7 +302,7 @@ fn embed_query_matches_embedding_the_same_text_directly() {
 fn the_stored_vector_matches_embedding_the_doc_comment_and_signature_directly() {
     let project = Project::new();
     let pipeline = load_real_pipeline();
-    let conn = project.walk(&pipeline);
+    let (conn, _) = project.walk_then_backfill(&pipeline);
     let documented = node_id(&conn, "readFileAsString");
 
     let (doc_comment, signature): (Option<String>, Option<String>) = conn

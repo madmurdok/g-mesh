@@ -265,6 +265,7 @@ fn missing_toolchain() -> PluginCheck {
 /// assert a real pyright resolves, and resolving it through the plugin's own
 /// candidate list would let a bug in that list pass the very test built to
 /// catch it.
+#[cfg(windows)]
 const WINDOWS_SCRIPT_EXTENSIONS: [&str; 1] = [".cmd"];
 #[cfg(windows)]
 const HOST_SCRIPT_EXTENSIONS: &[&str] = &WINDOWS_SCRIPT_EXTENSIONS;
@@ -333,23 +334,6 @@ fn pyright_langserver() -> PathBuf {
     )
 }
 
-/// [`pyright_langserver`]'s extension-expansion, isolated from any real
-/// filesystem - the Windows arm exercised from this host, exactly as
-/// `plugins/python/src/semantic.rs`'s `script_spellings` is by its own tests.
-#[test]
-fn spelled_tries_the_bare_name_then_every_script_extension() {
-    let bare = PathBuf::from("pyright-langserver");
-    let tried: Vec<PathBuf> = std::iter::once("")
-        .chain(WINDOWS_SCRIPT_EXTENSIONS.iter().copied())
-        .map(|extension| spelled(&bare, extension))
-        .collect();
-    assert_eq!(
-        tried,
-        vec![PathBuf::from("pyright-langserver"), PathBuf::from("pyright-langserver.cmd")],
-        "the bare spelling first, then each Windows script extension appended"
-    );
-}
-
 /// Every `expectations.*` verdict the report carries, by check id.
 fn expectation_verdicts(outcome: &CheckOutcome) -> Vec<(&str, Verdict)> {
     outcome
@@ -403,24 +387,18 @@ fn assert_report_shape(
     );
 }
 
-#[test]
-fn the_plugin_passes_every_check_that_applies_to_it() {
-    let outcome = semantic().run().expect("the conformance kit could not be run");
-    outcome.assert_conformant();
-    assert_report_shape(
-        &outcome,
-        "capabilities.semantic-engine-lazy",
-        "capabilities.semantic-pass-undeclared",
-        Verdict::Skip,
-    );
-}
-
 /// The acceptance criteria, as assertions against the *linked* index: see
 /// `conformance/expect.toml`, which says what each one proves.
 #[test]
 fn the_linked_index_answers_the_acceptance_criteria() {
     let outcome = semantic().expect(EXPECT).run().expect("the conformance kit could not be run");
     outcome.assert_conformant();
+    assert_report_shape(
+        &outcome,
+        "capabilities.semantic-engine-lazy",
+        "capabilities.semantic-pass-undeclared",
+        Verdict::Pass,
+    );
 
     // `assert_conformant` fails on a FAIL and says nothing about a SKIP, and
     // the whole expectations section is skipped when the session did not reach

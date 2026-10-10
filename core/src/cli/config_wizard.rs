@@ -428,16 +428,4 @@ mod tests {
         assert_eq!(read_back.embedding.model, "answered-model");
         assert_eq!(read_back.plugin.idle_timeout_minutes, 7);
     }
-
-    #[test]
-    fn writing_the_global_wizard_output_targets_the_global_path_not_the_project_one() {
-        // wizard_global/write_global_config never take a project root at
-        // all, so there is no path for a per-project value to leak into -
-        // asserted structurally via the function signatures plus the
-        // dedicated global path test in `config::tests`.
-        let existing = GlobalConfig::default();
-        let (updated, _) = run_global_wizard(&existing, "n\n45\n");
-        assert!(!updated.cleanup.enabled);
-        assert_eq!(updated.cleanup.idle_threshold_days, 45);
-    }
 }

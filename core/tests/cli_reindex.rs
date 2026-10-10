@@ -13,12 +13,15 @@
 //! signal a *live* daemon safely, and the only way to prove that is to give it
 //! one.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
+use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::ServiceExt;
 use rusqlite::Connection;
@@ -304,4 +307,197 @@ fn reindex_against_an_idle_project_still_rebuilds_from_scratch() {
         project.indexed_file_paths(),
         vec!["src/db/connection.ts".to_string(), "src/index.ts".to_string()],
     );
+}
+
+/// Shortens how long a shim waits for a daemon it bootstrapped, so a shim
+/// that wrongly bootstraps one during a rebuild fails sooner. Only for a shim
+/// that must not bootstrap at all: a real bootstrap under load can take
+/// longer.
+const BOOTSTRAP_TIMEOUT_ENV: &str = "G_MESH_BOOTSTRAP_TIMEOUT_MS";
+
+/// Plays a CLI rebuild of a project the way `g-mesh reindex` holds one: its
+/// daemon lock held and its rebuild marker naming this process. Dropping it
+/// removes the marker, then releases the lock.
+struct HeldForRebuild {
+    marker: PathBuf,
+    _lock: File,
+}
+
+impl HeldForRebuild {
+    fn take(root: &Path) -> Self {
+        let state = g_mesh::storage::connection::ensure_project_dir(root).unwrap();
+        let lock = File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(daemon::daemon_lock_path_in(&state))
+            .unwrap();
+        // The kernel releases a killed daemon's lock shortly after it dies.
+        wait_for("the daemon lock to be free", || lock.try_lock().is_ok());
+        let marker = daemon::rebuild_marker_path_in(&state);
+        let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        std::fs::write(&marker, format!("{}\n{started}\nreindex\n", std::process::id())).unwrap();
+        Self { marker, _lock: lock }
+    }
+}
+
+impl Drop for HeldForRebuild {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.marker);
+    }
+}
+
+/// An MCP session over a shim started in `project`, with `env` on top.
+async fn shim_session(project: &Project, env: &[(&str, &str)]) -> RunningService<RoleClient, ()> {
+    let transport = TokioChildProcess::new(TokioCommand::new(BIN).configure(|cmd| {
+        cmd.lifeline();
+        cmd.kill_on_drop(true)
+            .arg("mcp-shim")
+            .current_dir(project.root())
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+    }))
+    .expect("failed to spawn the shim");
+    ().serve(transport).await.expect("MCP initialization failed")
+}
+
+async fn outline_of_index(client: &RunningService<RoleClient, ()>) -> CallToolResult {
+    client
+        .call_tool(CallToolRequestParams::new("get_file_outline").with_arguments(
+            json!({ "file_path": "src/index.ts" }).as_object().cloned().expect("an object literal"),
+        ))
+        .await
+        .expect("tools/call must return a result, not a protocol failure")
+}
+
+fn texts_of(result: &CallToolResult) -> Vec<&str> {
+    result.content.iter().filter_map(|block| block.as_text()).map(|text| text.text.as_str()).collect()
+}
+
+/// The symbol names of a `get_file_outline` answer, read from its last text
+/// item: the shim may put its own lines before it.
+fn outline_names(result: &CallToolResult) -> Vec<String> {
+    assert_ne!(result.is_error, Some(true), "expected an outline: {:?}", texts_of(result));
+    let outline: Value = serde_json::from_str(texts_of(result).last().expect("no text item"))
+        .unwrap_or_else(|err| panic!("the outline is not JSON ({err}): {:?}", texts_of(result)));
+    outline["results"]
+        .as_array()
+        .expect("results is not an array")
+        .iter()
+        .filter_map(|symbol| symbol["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The line the shim puts first in the first answer after it reconnected.
+const RESTARTED: &str = "restarted since this session's previous answer from it";
+
+fn marks_restart(result: &CallToolResult) -> bool {
+    texts_of(result).iter().any(|text| text.contains(RESTARTED))
+}
+
+/// An MCP session open over the shim survives `g-mesh reindex` of its
+/// project: the call after the rebuild is answered by a new daemon, the
+/// first such answer starts with one restart line, and later answers carry
+/// none.
+///
+/// Control: in `upstream_ended`, send `Event::Done` when the current
+/// upstream ends: the shim exits with its daemon and the call after the
+/// rebuild fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_mcp_session_survives_reindex_and_marks_the_restart_once() {
+    let project = Project::new();
+    let client = shim_session(&project, &[]).await;
+    let first = outline_of_index(&client).await;
+    assert!(!marks_restart(&first), "nothing restarted yet: {:?}", texts_of(&first));
+    wait_until_indexed(project.root());
+    let daemon_pid = project.daemon_pid();
+
+    let output = tokio::task::block_in_place(|| project.reindex());
+    assert!(
+        output.status.success(),
+        "`g-mesh reindex` failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("stopped for the rebuild"));
+    assert!(!daemon::is_process_alive(daemon_pid), "reindex stops the session's daemon");
+    assert_eq!(daemon::rebuild_in_progress(project.root()).unwrap(), None, "reindex released the project");
+
+    let after = outline_of_index(&client).await;
+    let texts = texts_of(&after);
+    assert!(texts[0].starts_with("g-mesh: the daemon serving ") && texts[0].contains(RESTARTED), "{texts:?}");
+    assert!(outline_names(&after).contains(&"start".to_string()), "{texts:?}");
+    let new_pid = project.daemon_pid();
+    assert_ne!(new_pid, daemon_pid, "the call after the rebuild is served by a new daemon");
+    assert!(daemon::is_process_alive(new_pid));
+
+    let later = outline_of_index(&client).await;
+    assert!(!marks_restart(&later), "only the first answer is marked: {:?}", texts_of(&later));
+    assert!(outline_names(&later).contains(&"start".to_string()));
+
+    client.cancel().await.expect("failed to shut the client down");
+}
+
+/// While a rebuild holds the project, a call over an open session is
+/// answered at once with an error naming the rebuild, and no daemon is
+/// bootstrapped; once the rebuild lets go, the next call reconnects.
+///
+/// Control: drop both `rebuilding()` checks in `connect_or_bootstrap`: the
+/// shim bootstraps a daemon, which cannot take the held lock, and the call
+/// gets the bootstrap failure instead (after the default bootstrap timeout).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_while_the_project_is_held_for_a_rebuild_is_answered_at_once() {
+    let project = Project::new();
+    let client = shim_session(&project, &[]).await;
+    outline_of_index(&client).await;
+    wait_until_indexed(project.root());
+    let daemon_pid = project.daemon_pid();
+    tokio::task::block_in_place(|| common::kill_and_wait(daemon_pid));
+    let held = tokio::task::block_in_place(|| HeldForRebuild::take(project.root()));
+
+    let during = outline_of_index(&client).await;
+    let text = texts_of(&during).concat();
+    assert_eq!(during.is_error, Some(true), "{text}");
+    let expected = format!("is being reindexed (g-mesh reindex, pid {}, ", std::process::id());
+    assert!(text.starts_with("g-mesh: ") && text.contains(&expected), "{text}");
+    assert!(!text.contains("could not reach"), "the rebuild is named, not a bootstrap failure: {text}");
+    let running = daemon::read_pid_file(&project.pid_file()).filter(|pid| daemon::is_process_alive(*pid));
+    assert_eq!(running, None, "no daemon may serve a project held for a rebuild");
+
+    drop(held);
+    let after = outline_of_index(&client).await;
+    assert!(marks_restart(&after), "{:?}", texts_of(&after));
+    assert!(outline_names(&after).contains(&"start".to_string()));
+
+    client.cancel().await.expect("failed to shut the client down");
+}
+
+/// A shim started while a rebuild holds its project has no daemon to answer
+/// `initialize`: it exits with the rebuild named, without bootstrapping one.
+///
+/// Control: drop both `rebuilding()` checks in `connect_or_bootstrap`: the
+/// shim bootstraps a daemon and fails on the bootstrap timeout instead.
+#[test]
+fn a_shim_started_while_the_project_is_held_for_a_rebuild_exits_naming_it() {
+    let project = Project::new();
+    let held = HeldForRebuild::take(project.root());
+
+    let output = Command::new(BIN)
+        .lifeline()
+        .arg("mcp-shim")
+        .current_dir(project.root())
+        .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
+        .env(BOOTSTRAP_TIMEOUT_ENV, "2000")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the shim");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    let expected = format!("is being reindexed (g-mesh reindex, pid {}, ", std::process::id());
+    assert!(stderr.contains(&expected), "{stderr}");
+    assert!(!project.pid_file().exists(), "no daemon was bootstrapped");
+    drop(held);
 }

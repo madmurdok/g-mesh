@@ -1571,8 +1571,8 @@ mod tests {
     /// Test 6: with no embedding cache, an unchanged tree embeds nothing and
     /// one edited doc comment embeds exactly one text.
     ///
-    /// Control: embed during the staging walk (`WalkContext { embedding:
-    /// Some(..), .. }` in `rebuild`) -> the unchanged reindex embeds 2.
+    /// Control: in `rebuild`, embed every node the staging walk read instead
+    /// of `plan.to_embed` -> the unchanged reindex embeds 2.
     #[test]
     fn only_changed_text_is_embedded_with_the_cache_off() {
         let counters = Counters::default();
