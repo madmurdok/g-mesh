@@ -215,6 +215,15 @@ impl EmbeddingPipeline {
         Self::build(config, None, slot)
     }
 
+    /// [`load`](Self::load) with the model directory given rather than
+    /// resolved by `default_model_dir`, so a test can name a directory
+    /// without writing `G_MESH_MODEL_DIR` for every other thread in the
+    /// process.
+    #[cfg(test)]
+    pub(crate) fn load_at(config: &EmbeddingConfig, model_dir: &Path) -> Self {
+        Self::build(config, Some(model_dir.to_path_buf()), CacheSlot::Unopened(None))
+    }
+
     fn build(config: &EmbeddingConfig, model_dir: Option<PathBuf>, cache: CacheSlot) -> Self {
         let pinned_weights = config.model == EmbeddingConfig::default().model;
         Self {

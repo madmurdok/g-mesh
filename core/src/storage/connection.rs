@@ -13,14 +13,26 @@ use crate::storage::vectors;
 /// it rather than deriving a single project's path from a root the way
 /// everything else here does.
 pub fn projects_root() -> Result<PathBuf> {
-    Ok(paths::g_mesh_home()?.join("projects"))
+    Ok(projects_root_under(&paths::g_mesh_home()?))
+}
+
+/// [`projects_root`] under the g-mesh home `home`.
+fn projects_root_under(home: &Path) -> PathBuf {
+    home.join("projects")
 }
 
 /// `~/.g-mesh/projects/<hash>/` for the given (canonicalized) project root.
 /// Uses the same hash as the daemon's own socket/pid file location
 /// (`daemon::identity::project_hash`) so the two can never disagree.
 pub fn project_dir(root: &Path) -> Result<PathBuf> {
-    Ok(projects_root()?.join(project_hash(root)?))
+    project_dir_under(&paths::g_mesh_home()?, root)
+}
+
+/// [`project_dir`] under the g-mesh home `home` rather than the one the
+/// environment names, so a test can point it at a temp dir without writing
+/// `G_MESH_HOME`, which every other thread in the process reads.
+pub(crate) fn project_dir_under(home: &Path, root: &Path) -> Result<PathBuf> {
+    Ok(projects_root_under(home).join(project_hash(root)?))
 }
 
 /// The project's state directory, created if absent and recording which
@@ -46,7 +58,13 @@ pub fn project_dir(root: &Path) -> Result<PathBuf> {
 /// here. A bare `create_dir_all` on this path is not a shortcut, it is a
 /// directory that can never be cleaned up.
 pub fn ensure_project_dir(root: &Path) -> Result<PathBuf> {
-    let dir = project_dir(root)?;
+    ensure_project_dir_under(&paths::g_mesh_home()?, root)
+}
+
+/// [`ensure_project_dir`] under the g-mesh home `home` (see
+/// [`project_dir_under`]).
+pub(crate) fn ensure_project_dir_under(home: &Path, root: &Path) -> Result<PathBuf> {
+    let dir = project_dir_under(home, root)?;
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create project directory {}", dir.display()))?;
     identity::record_project_root(&dir, root)?;

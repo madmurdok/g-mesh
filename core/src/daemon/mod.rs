@@ -163,6 +163,12 @@ pub fn lock_path(root: &Path) -> Result<PathBuf> {
     Ok(project_dir(root)?.join(BOOTSTRAP_LOCK_FILE))
 }
 
+/// [`lock_path`] under the g-mesh home `home` rather than the one the
+/// environment names (see `storage::connection::project_dir_under`).
+pub(crate) fn lock_path_under(home: &Path, root: &Path) -> Result<PathBuf> {
+    Ok(crate::storage::connection::project_dir_under(home, root)?.join(BOOTSTRAP_LOCK_FILE))
+}
+
 /// The singleton lock a running daemon holds for its whole lifetime.
 pub fn daemon_lock_path(root: &Path) -> Result<PathBuf> {
     Ok(project_dir(root)?.join(DAEMON_LOCK_FILE))

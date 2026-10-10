@@ -11,7 +11,7 @@ use rmcp::{RoleClient, ServiceExt};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
-use super::{GMeshMcpServer, SEARCH_EMBEDDING_WAIT_ENV};
+use super::GMeshMcpServer;
 use crate::daemon::indexing_status::{IndexingStatus, Phase};
 use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::manifest::DiscoveredPlugins;
@@ -23,9 +23,10 @@ use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::storage::vectors::{insert, register_extension};
 
-/// Every test here sets the same value, so parallel tests never disagree
-/// about it.
-const WAIT_MS: &str = "200";
+/// The embedding wait every server here is built with, given to the server
+/// rather than set through `G_MESH_SEARCH_EMBEDDING_WAIT_MS`, which every
+/// other thread in the process reads.
+const WAIT: Duration = Duration::from_millis(200);
 
 /// Bounds every call: the unbounded wait this module guards against would
 /// otherwise hang the test instead of failing it.
@@ -59,7 +60,6 @@ fn add_embedded_node(conn: &Connection, id: &str, seed: usize) {
 /// A server over `vectors` stored vectors, in [`Phase::Embedding`] with
 /// `embed_progress` at (`embedded`, `total`), and a client connected to it.
 async fn fixture(vectors: usize, embedded: u64, total: u64) -> Fixture {
-    std::env::set_var(SEARCH_EMBEDDING_WAIT_ENV, WAIT_MS);
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("project");
     let state = dir.path().join("state");
@@ -89,7 +89,8 @@ async fn fixture(vectors: usize, embedded: u64, total: u64) -> Fixture {
     ));
     let embedding = Arc::new(fake_pipeline(&dir.path().join("model"), None, &Counters::default()));
     let server =
-        GMeshMcpServer::new(Arc::clone(&store), registry, CoreActivity::new(), indexing.clone(), embedding);
+        GMeshMcpServer::new(Arc::clone(&store), registry, CoreActivity::new(), indexing.clone(), embedding)
+            .with_search_embedding_wait(WAIT);
 
     let (server_io, client_io) = tokio::io::duplex(1 << 20);
     tokio::spawn(async move {
@@ -174,7 +175,7 @@ async fn a_call_during_the_embedding_pass_answers_partially_within_its_bound() {
 /// complete - no note, no `partial` - and carries the floor verdict the
 /// partial page above withheld for the same rows.
 ///
-/// Control: set `G_MESH_SEARCH_EMBEDDING_WAIT_MS` to `0` here (or skip the
+/// Control: set `WAIT` to zero here (or skip the
 /// embedding wait in `GMeshMcpServer::search_code`) - the page comes back
 /// partial.
 #[tokio::test]

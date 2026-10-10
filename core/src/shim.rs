@@ -17,7 +17,7 @@ use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
 use crate::ipc;
 use crate::process;
-use crate::storage::connection::ensure_project_dir;
+use crate::storage::connection::{ensure_project_dir, ensure_project_dir_under};
 
 mod router;
 
@@ -410,7 +410,14 @@ fn lock_state(root: &Path) -> daemon::DaemonLock {
 /// drops it if the holder exits or is killed mid-bootstrap - a dead shim
 /// cannot leave the project locked.
 fn acquire_bootstrap_lock(root: &Path) -> Result<File> {
-    let path = daemon::lock_path(root)?;
+    acquire_bootstrap_lock_under(&crate::paths::g_mesh_home()?, root)
+}
+
+/// [`acquire_bootstrap_lock`] under the g-mesh home `home` rather than the
+/// one the environment names, so a test can use a temp home without writing
+/// `G_MESH_HOME` for every other thread in the process.
+fn acquire_bootstrap_lock_under(home: &Path, root: &Path) -> Result<File> {
+    let path = daemon::lock_path_under(home, root)?;
     // First shim for a project gets here before anything has created the
     // per-project state directory (the daemon is what usually creates it) -
     // and this is the earliest of all the paths that can create it, so it is
@@ -421,7 +428,7 @@ fn acquire_bootstrap_lock(root: &Path) -> Result<File> {
     // `project_hash` is one-way and nothing can recover the root afterwards.
     // Measured on this machine's own test home: 707 of 775 state directories
     // were unsweepable for exactly this reason.
-    ensure_project_dir(root)?;
+    ensure_project_dir_under(home, root)?;
 
     let file = File::options()
         .create(true)
@@ -593,7 +600,7 @@ fn link(stream: ipc::Stream) -> Result<router::Link> {
 mod tests {
     use super::*;
     use crate::daemon::identity::read_project_root;
-    use crate::storage::connection::project_dir;
+    use crate::storage::connection::{project_dir, project_dir_under};
 
     /// A log past its limit moves aside to `.1`, replacing the previous one;
     /// one at or under it is left to be appended to.
@@ -649,16 +656,11 @@ mod tests {
     fn a_bootstrap_lock_alone_is_enough_to_record_the_project_root() {
         let home = tempfile::tempdir().expect("failed to create a temp g-mesh home");
         let root = tempfile::tempdir().expect("failed to create a temp project root");
-        // Scoped rather than global: this process runs tests in parallel, and
-        // `G_MESH_HOME` is read on every path resolution.
-        let previous = std::env::var_os("G_MESH_HOME");
-        // SAFETY: single-threaded within this test's own body; the guard below
-        // restores whatever was there for anything that runs after it.
-        unsafe { std::env::set_var("G_MESH_HOME", home.path()) };
-
+        // The home is passed in, not set through `G_MESH_HOME`: this process
+        // runs tests in parallel, and every path resolution reads that variable.
         let outcome = (|| -> Result<()> {
-            let _lock = acquire_bootstrap_lock(root.path())?;
-            let state = project_dir(root.path())?;
+            let _lock = acquire_bootstrap_lock_under(home.path(), root.path())?;
+            let state = project_dir_under(home.path(), root.path())?;
             let recorded = read_project_root(&state);
             assert_eq!(
                 recorded.as_deref(),
@@ -670,11 +672,6 @@ mod tests {
             Ok(())
         })();
 
-        match previous {
-            // SAFETY: as above.
-            Some(value) => unsafe { std::env::set_var("G_MESH_HOME", value) },
-            None => unsafe { std::env::remove_var("G_MESH_HOME") },
-        }
         outcome.expect("the bootstrap lock must record the project root");
     }
 }

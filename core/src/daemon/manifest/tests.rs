@@ -1,12 +1,4 @@
 use super::*;
-use std::sync::Mutex;
-
-/// Guards every test below that touches [`PLUGIN_ROOTS_OVERRIDE_ENV`]: it
-/// is process-wide state, and `cargo test` runs this module's tests on
-/// multiple threads by default, so two of them setting/clearing the same
-/// variable at once would be a genuine race - same reasoning as
-/// `daemon::lifecycle`'s `ENV_LOCK` for its own env-var tests.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// The bundled TypeScript plugin's source directory, reached the same way
 /// [`bundled_roots`] reaches it.
@@ -75,10 +67,7 @@ fn the_bundled_plugins_handshake_reports_the_version_its_manifest_declares() {
 
 #[test]
 fn default_roots_bundled_entry_resolves_to_the_sibling_plugins_directory() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::remove_var(PLUGIN_ROOTS_OVERRIDE_ENV);
-
-    let roots = default_roots();
+    let roots = roots_with_override(None);
     let bundled = roots.last().expect("default_roots must return at least the bundled root");
 
     assert!(
@@ -107,13 +96,9 @@ fn the_installed_root_sits_beside_the_executable_and_outranks_the_checkout_root(
 
 #[test]
 fn the_override_env_var_replaces_the_entire_default_roots_list() {
-    let _guard = ENV_LOCK.lock().unwrap();
     let override_dir = tempfile::tempdir().unwrap();
-    std::env::set_var(PLUGIN_ROOTS_OVERRIDE_ENV, override_dir.path());
 
-    let roots = default_roots();
-
-    std::env::remove_var(PLUGIN_ROOTS_OVERRIDE_ENV);
+    let roots = roots_with_override(Some(override_dir.path().to_str().unwrap().to_string()));
 
     assert_eq!(roots, vec![override_dir.path().to_path_buf()]);
 }

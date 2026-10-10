@@ -36,10 +36,11 @@ CI must keep running everything exactly as before.
   whose filter is the selected sections minus the lib part, so no test runs
   in both parts or in neither.
 - **Lib tests that write process-wide state stay on nextest** (Q2). The
-  `ISOLATED` filterset in `test-local.sh` names the tests that set env vars
-  other modules read, plus one that asserts on spawn timing. Each is meant to
-  take its override as an argument instead (the `cli::model::sources_from`
-  pattern), after which it leaves the list.
+  `ISOLATED` filterset in `test-local.sh` named the tests that set env vars
+  other modules read, plus one that asserts on spawn timing. GM-549 changed
+  each writer to take its override as an argument (the
+  `cli::model::sources_from` pattern), so the list now holds only the
+  spawn-timing test.
 - **Heavy tests are skipped by a `local` nextest profile only** (Q4). Its
   `default-filter` excludes one exact `(binary_id, name)` term per heavy test.
   `default` and `ci` are untouched, so CI, the release gate and
@@ -75,7 +76,8 @@ run's JUnit (not reviewable, depends on another run's file).
 - One hung lib test stops the whole lib part until the budget kills it, and a
   test that aborts the process hides the rest of the lib's results.
 - A new lib test that writes the process environment races its readers in
-  the one-process run until it is added to `ISOLATED`.
+  the one-process run; it takes its override as an argument instead, or is
+  added to `ISOLATED`.
 - The heavy list drifts between batches; the `--full` report is how it is
   kept current.
 - A `cli`/`mcp` change that breaks another module's lib tests is not caught
