@@ -375,7 +375,7 @@ core's linker cannot settle it when `f` re-exports `n` ambiguously
 
 | Symbol | Callers / references (call) |
 |---|---|
-| python `semantic::candidates` (id `5cb156bc…`) | `resolve`, tests `a_bare_name_is_path_then_the_projects_node_modules_then_npx`, `the_npx_probe_differs_from_the_npx_server_only_in_the_bin_name`, `on_windows_every_origin_is_tried_bare_then_with_each_script_extension`, `every_candidate_is_probed_through_the_cli_twin_and_never_the_server` (`find_callers symbol_id`) |
+| python `semantic::candidates` (id `5cb156bc…`) | `resolve`, tests `a_bare_name_is_path_then_the_projects_node_modules_then_npx`, `the_npx_probe_differs_from_the_npx_server_only_in_the_bin_name`, `on_windows_every_origin_is_tried_bare_then_with_each_script_extension`, `every_candidate_is_probed_through_the_cli_twin_and_never_the_server` (`find_callers symbol_id`). The middle two were later removed: the npx argv is asserted in `every_candidate_is_probed_through_the_cli_twin_and_never_the_server`, and the Windows order by the SDK's `npm_candidates` tests. |
 | python `semantic::script_spellings` | `candidates` only (`find_callers` and `find_references`). **g-mesh missed** the test calls at `semantic.rs:774-800`, which `grep` found (`script_spellings_keeps_the_bare_path_and_appends_every_extension`, `..._does_not_touch_an_explicit_extension`). |
 | python `semantic::probe` (id `13856d55…`) | `resolve`, tests `a_project_local_install_is_found_and_probed_for_real`, `a_probe_that_never_answers_is_killed_rather_than_waited_on`, `installed_bin_dir` (`find_callers symbol_id`) |
 | rust `semantic::candidates` (id `33398653…`) | `resolve`, test `a_bare_name_keeps_its_path_lookup_first` |
@@ -430,12 +430,15 @@ Tests that move to the SDK with the code:
 - `script_spellings_*` (2);
 - `a_probe_that_never_answers_is_killed_rather_than_waited_on`;
 - `on_windows_every_origin_is_tried_bare_then_with_each_script_extension`,
-  rewritten against `npm_candidates` with a fixed `twin`;
+  rewritten against `npm_candidates` with a fixed `twin` (the python copy
+  was later removed; the SDK's `a_bare_name_is_path_then_node_modules_then_npx`
+  covers the order with `.cmd`);
 - a new `a_bare_name_is_path_then_node_modules_then_npx` for the generic
   order.
 
-The pyright-specific tests stay in python: `cli_twin`, the npx bin name, and
-the real local install.
+The pyright-specific tests stay in python: `cli_twin`, the npx bin name (now
+asserted in `every_candidate_is_probed_through_the_cli_twin_and_never_the_server`),
+and the real local install.
 
 ## 6. The 27 red core tests
 

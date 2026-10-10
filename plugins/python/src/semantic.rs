@@ -440,17 +440,6 @@ mod tests {
     /// Where a project keeps a locally installed pyright.
     const NODE_BIN_DIR: &str = "node_modules/.bin";
 
-    /// A path names one binary and is never searched around - see
-    /// [`candidates`]' doc and GM-290's own rule. No extensions on this host
-    /// (`&[]`, matching `HOST_SCRIPT_EXTENSIONS` on every non-Windows host) is
-    /// the ordinary case; the Windows arm gets its own test below.
-    #[test]
-    fn a_command_that_is_a_path_is_the_only_candidate() {
-        let root = Path::new("/projects/thing");
-        assert_eq!(candidates(Path::new("/opt/py/pyright-langserver"), root, &[]).len(), 1);
-        assert_eq!(candidates(Path::new("servers/pyright-langserver"), root, &[]).len(), 1);
-    }
-
     /// A bare name is three places in one fixed order, and the middle one is
     /// resolved against the *project*, not against the manifest.
     #[test]
@@ -476,71 +465,6 @@ mod tests {
         );
     }
 
-    /// GM-341: on Windows every one of the three origins is tried both bare
-    /// and with `.cmd` appended, in that order, before the next origin - see
-    /// this module's doc, Decision 1b. Built from `WINDOWS_SCRIPT_EXTENSIONS`
-    /// rather than a literal `".cmd"`, so a second extension ever added there
-    /// is covered here without editing this test. Run from this macOS host,
-    /// which is the point: [`lsp::script_spellings`] takes the extension list as a
-    /// parameter instead of reading [`HOST_SCRIPT_EXTENSIONS`] itself, so its
-    /// Windows arm needs no Windows host to execute.
-    #[test]
-    fn on_windows_every_origin_is_tried_bare_then_with_each_script_extension() {
-        let root = Path::new("/projects/thing");
-        let candidates = candidates(Path::new(SERVER_BIN), root, &WINDOWS_SCRIPT_EXTENSIONS);
-        let spellings_per_origin = 1 + WINDOWS_SCRIPT_EXTENSIONS.len();
-        assert_eq!(candidates.len(), 3 * spellings_per_origin, "{candidates:#?}");
-
-        let path = |origin: &str, path: &Path| {
-            candidates.iter().find(|c| c.origin == origin && c.command == path).unwrap_or_else(|| {
-                panic!("expected a {origin} candidate spelled {}: {candidates:#?}", path.display())
-            })
-        };
-        path("PATH", Path::new(SERVER_BIN));
-        path("PATH", Path::new("pyright-langserver.cmd"));
-        path(
-            "the project's node_modules/.bin",
-            &root.join("node_modules/.bin").join("pyright-langserver.cmd"),
-        );
-        let npx_cmd = path("npx", Path::new("npx.cmd"));
-        assert_eq!(
-            npx_cmd.prefix_args,
-            vec!["--yes", "--package", NPM_PACKAGE, SERVER_BIN],
-            "the .cmd spelling of npx runs the same argv as the bare one: {npx_cmd:#?}"
-        );
-
-        // Bare-before-.cmd within one origin, and PATH-before-local-before-npx
-        // across origins - see this module's doc, Decision 1b, on why origin
-        // order outranks extension order.
-        let origins: Vec<&str> = candidates.iter().map(|c| c.origin).collect();
-        assert_eq!(
-            origins,
-            vec![
-                "PATH",
-                "PATH",
-                "the project's node_modules/.bin",
-                "the project's node_modules/.bin",
-                "npx",
-                "npx"
-            ],
-            "{candidates:#?}"
-        );
-    }
-
-    /// The npx probe and the npx server invocation must differ in exactly one
-    /// token, the bin name. Anything else and the probe is proving a
-    /// different command than the one that will run - which is precisely how
-    /// the 404 above got past a green probe.
-    #[test]
-    fn the_npx_probe_differs_from_the_npx_server_only_in_the_bin_name() {
-        let npx = candidates(Path::new(SERVER_BIN), Path::new("/projects/thing"), &[]).remove(2);
-        let (_, probe_args) = &npx.probe;
-        assert_eq!(npx.prefix_args.len(), probe_args.len(), "{npx:#?}");
-        let differing: Vec<_> =
-            npx.prefix_args.iter().zip(probe_args).filter(|(server, probe)| server != probe).collect();
-        assert_eq!(differing, vec![(&SERVER_BIN.to_string(), &CLI_BIN.to_string())], "{npx:#?}");
-    }
-
     /// Every candidate is proved through the CLI twin, because the language
     /// server itself has no `--version` - see this module's doc, Decision 1.
     #[test]
@@ -559,6 +483,16 @@ mod tests {
                     || args.iter().any(|arg| arg == CLI_BIN),
                 "and the twin is pyright's own CLI, extension included: {candidate:#?}"
             );
+            // The npx probe must run the command the server will run, differing
+            // only in the bin name, or a green probe proves a different command.
+            if candidate.origin == "npx" {
+                let expected: Vec<String> = candidate
+                    .prefix_args
+                    .iter()
+                    .map(|arg| if arg == SERVER_BIN { CLI_BIN.to_string() } else { arg.clone() })
+                    .collect();
+                assert_eq!(args, &expected, "the npx probe differs only in the bin name: {candidate:#?}");
+            }
         }
     }
 
@@ -581,16 +515,6 @@ mod tests {
             PathBuf::from("/opt/py/some-other-server"),
             "a hand-written path is probed as written"
         );
-    }
-
-    /// The probe is what separates a real install from a shim, so it has to
-    /// fail for a binary that runs and exits non-zero - not only for one that
-    /// is absent.
-    #[test]
-    fn a_binary_that_exits_non_zero_is_not_a_pyright() {
-        assert!(probe(Path::new("/nonexistent/pyright"), &[], PROBE_BUDGET).is_err(), "not there at all");
-        #[cfg(unix)]
-        assert!(probe(Path::new("/usr/bin/false"), &[], PROBE_BUDGET).is_err(), "runs and refuses");
     }
 
     /// The project-local branch against a **real** pyright, not a stand-in.

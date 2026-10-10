@@ -1171,13 +1171,6 @@ mod tests {
     // reconcile once a version no longer matches).
 
     #[test]
-    fn a_v1_shaped_node_exported_instead_of_visibility_is_rejected_with_a_clear_error() {
-        let v1_line = r#"{"id":"n1","kind":"Function","name":"run","qualifiedName":"run","filePath":"caller.ts","range":{"start":{"line":3,"col":7},"end":{"line":5,"col":1}},"signature":"run(): void","exported":true,"docComment":null,"language":"typescript","nativeKind":"function","hasSyntaxErrors":false}"#;
-        let err = serde_json::from_str::<WireNode>(v1_line).unwrap_err();
-        assert!(err.to_string().contains("visibility"), "{err}");
-    }
-
-    #[test]
     fn a_v1_shaped_edge_bare_tree_sitter_source_instead_of_source_plus_engine_is_rejected_with_a_clear_error()
     {
         // `"tree-sitter"` was a valid v1 `source` value; it is not a
@@ -1194,8 +1187,14 @@ mod tests {
     #[test]
     fn a_node_missing_visibility_is_rejected() {
         let json = r#"{"id":"n1","kind":"Function","name":"foo","qualifiedName":"foo","filePath":"a.ts","range":{"start":{"line":0,"col":0},"end":{"line":0,"col":1}},"language":"typescript"}"#;
-        let err = serde_json::from_str::<WireNode>(json).unwrap_err();
-        assert!(err.to_string().contains("visibility"), "{err}");
+        // A wire-v1 node carries `exported` instead of `visibility`. v1 is
+        // rejected, not normalized, so it fails on the missing `visibility`
+        // like any other node without it.
+        let v1_line = r#"{"id":"n1","kind":"Function","name":"run","qualifiedName":"run","filePath":"caller.ts","range":{"start":{"line":3,"col":7},"end":{"line":5,"col":1}},"signature":"run(): void","exported":true,"docComment":null,"language":"typescript","nativeKind":"function","hasSyntaxErrors":false}"#;
+        for line in [json, v1_line] {
+            let err = serde_json::from_str::<WireNode>(line).unwrap_err();
+            assert!(err.to_string().contains("visibility"), "{err}");
+        }
     }
 
     #[test]
