@@ -13,19 +13,23 @@
 //! started against a wiped index - just without waiting for a restart, a
 //! version bump, or anything else to make that happen.
 //!
-//! # Why the daemon is stopped first
+//! # Why the daemon is stopped first, and kept away
 //!
 //! A live daemon holds this project's connection open and keeps writing to
 //! it - both off the file watcher and, mid-cold-start, off its own bulk walk.
 //! Wiping the tables out from under either would race a write this command
-//! knows nothing about. Stopping first, the same way `g-mesh stop` does,
-//! guarantees this command is the only thing touching the database for as
-//! long as the rebuild takes.
+//! knows nothing about. Stopping first, the same way `g-mesh stop` does, and
+//! then holding the project ([`stop_for_rebuild`]) guarantees this command is
+//! the only thing touching the database for as long as the rebuild takes:
+//! the daemon lock keeps a hand-started daemon out, and the rebuild marker
+//! makes a shim answer "being reindexed" instead of bootstrapping one.
 //!
-//! Nothing has to bring a new daemon up afterwards. The next MCP call
-//! bootstraps one exactly as it always does, and that daemon finds an index
-//! that is already current and already fully walked - so it starts `ready`
-//! immediately rather than repeating the walk this command just finished.
+//! Nothing has to bring a new daemon up afterwards. An MCP session that was
+//! connected keeps running: its shim reconnects on the next call,
+//! bootstrapping a daemon exactly as it always does, and that daemon finds an
+//! index that is already current and already fully walked - so it starts
+//! `ready` immediately rather than repeating the walk this command just
+//! finished.
 //!
 //! # Why the rebuild ends with a semantic pass
 //!
@@ -38,12 +42,14 @@
 //! not leave it strictly worse than the one a zero-config cold start builds.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::cli::stop;
+use crate::daemon;
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::{manifest, registry, semantic};
@@ -82,7 +88,7 @@ pub fn run() -> Result<()> {
 /// Split out from [`run`] so it can be exercised against a temporary project
 /// root without taking over the process's real cwd.
 pub fn reindex(project_root: &Path) -> Result<Outcome> {
-    let stop_outcome = stop::stop(project_root)?;
+    let (stop_outcome, _hold) = stop_for_rebuild(project_root, "reindex")?;
 
     // Same discovery `daemon::run`'s own cold start uses - see
     // `daemon::bulk_index::run`'s doc comment for why the walk below takes
@@ -142,6 +148,49 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
         semantic_pass_ran,
         embeddings,
     })
+}
+
+/// A project held for a CLI rebuild of its index: its rebuild marker written
+/// and its daemon lock held. Dropping it removes the marker, then releases the
+/// lock (field order).
+pub(crate) struct RebuildHold {
+    _marker: MarkerFile,
+    _daemon_lock: File,
+}
+
+struct MarkerFile(PathBuf);
+
+impl Drop for MarkerFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Stops whatever daemon serves `project_root` and holds the project until
+/// the returned [`RebuildHold`] drops, on behalf of `g-mesh <command>`.
+///
+/// The marker is written under the shims' bootstrap lock, and that lock is
+/// released only once the daemon lock is held here: a shim queued on it
+/// re-checks the marker once it gets it (`shim::connect_or_bootstrap`), so no
+/// daemon can be bootstrapped between the stop and the rebuild.
+pub(crate) fn stop_for_rebuild(project_root: &Path, command: &str) -> Result<(stop::Outcome, RebuildHold)> {
+    let bootstrap = crate::shim::acquire_bootstrap_lock(project_root)?;
+    let state_dir =
+        connection::project_dir(project_root).context("failed to resolve the project's state directory")?;
+    let marker_path = daemon::rebuild_marker_path_in(&state_dir);
+    daemon::write_rebuild_marker(&marker_path, command)?;
+    let marker = MarkerFile(marker_path);
+
+    let stopped = stop::stop(project_root)?;
+    let Some(daemon_lock) = daemon::acquire_singleton_lock(&state_dir)? else {
+        bail!(
+            "another process still holds the daemon lock for {} after its daemon was stopped; run \
+             `g-mesh stop` there and try again",
+            project_root.display()
+        );
+    };
+    drop(bootstrap);
+    Ok((stopped, RebuildHold { _marker: marker, _daemon_lock: daemon_lock }))
 }
 
 /// Renders an outcome as the text the command prints.
@@ -262,5 +311,50 @@ mod tests {
             rendered.contains("12 of 12 nodes got a vector - 9 from the embedding cache, 3 embedded"),
             "{rendered}"
         );
+    }
+
+    /// A project's state directory, removed when this drops.
+    struct State(PathBuf);
+
+    impl Drop for State {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// While the hold lives, the project reads as rebuilt by this process
+    /// under the command named; dropping it removes the marker.
+    ///
+    /// Control: skip `acquire_singleton_lock` in `stop_for_rebuild`: the
+    /// marker reads as no rebuild.
+    #[test]
+    fn a_held_project_reads_as_rebuilding_until_the_hold_drops() {
+        let project = tempfile::tempdir().unwrap();
+        let state = State(connection::project_dir(project.path()).unwrap());
+        let (stopped, hold) = stop_for_rebuild(project.path(), "reindex").unwrap();
+        assert!(stopped.core.is_none(), "no daemon was running");
+
+        let rebuild = daemon::rebuild_in_progress(project.path()).unwrap().expect("the hold is a rebuild");
+        assert_eq!((rebuild.pid, rebuild.command.as_str()), (std::process::id(), "reindex"));
+
+        drop(hold);
+        assert_eq!(daemon::rebuild_in_progress(project.path()).unwrap(), None);
+        assert!(!daemon::rebuild_marker_path_in(&state.0).exists(), "the marker is removed");
+    }
+
+    /// A rebuild does not start while another process holds the daemon
+    /// lock, and leaves no marker behind.
+    ///
+    /// Control: skip `acquire_singleton_lock` in `stop_for_rebuild`: the
+    /// rebuild goes ahead.
+    #[test]
+    fn a_rebuild_refuses_a_project_whose_daemon_lock_is_held() {
+        let project = tempfile::tempdir().unwrap();
+        let state = State(connection::ensure_project_dir(project.path()).unwrap());
+        let _other = daemon::acquire_singleton_lock(&state.0).unwrap().expect("the fixture's lock is free");
+
+        let refused = stop_for_rebuild(project.path(), "init").err().expect("the rebuild must refuse");
+        assert!(format!("{refused:#}").contains("still holds the daemon lock"), "{refused:#}");
+        assert!(!daemon::rebuild_marker_path_in(&state.0).exists(), "a refused rebuild leaves no marker");
     }
 }

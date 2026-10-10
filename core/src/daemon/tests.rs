@@ -832,3 +832,39 @@ fn created_files_of_two_languages_are_announced_per_language() {
         assert_eq!(own, vec!["filesCreated", "fileChanged", "fileChanged"], "{language}: {frames:?}");
     }
 }
+
+/// A pid that belonged to a process which has since exited.
+fn exited_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().expect("failed to spawn `true`");
+    let pid = child.id();
+    child.wait().expect("failed to reap `true`");
+    pid
+}
+
+/// A rebuild marker counts only while the pid it names is alive and the
+/// daemon lock is held; a missing or unreadable marker is no rebuild.
+///
+/// Control: drop the `is_process_alive`/`daemon_lock_is_held` check in
+/// `rebuild_in_progress_in`: the marker reads as a rebuild after its lock is
+/// released.
+#[test]
+fn a_rebuild_marker_counts_only_while_its_pid_lives_and_the_daemon_lock_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = rebuild_marker_path_in(dir.path());
+    assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "no marker");
+
+    write_rebuild_marker(&marker, "init").unwrap();
+    let lock = held_lock(dir.path());
+    let rebuild = rebuild_in_progress_in(dir.path()).unwrap().expect("a live marker under a held lock");
+    assert_eq!((rebuild.pid, rebuild.command.as_str()), (std::process::id(), "init"));
+
+    drop(lock);
+    assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "the lock was released");
+
+    let _lock = held_lock(dir.path());
+    std::fs::write(&marker, format!("{}\n0\nreindex\n", exited_pid())).unwrap();
+    assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "the pid is dead");
+
+    std::fs::write(&marker, "not a pid\n").unwrap();
+    assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "an unreadable marker");
+}

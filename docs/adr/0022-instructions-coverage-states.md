@@ -107,11 +107,14 @@ within a session are the coverage statements:
   never trusts an empty answer.
 - A plugin *removed* while a session runs would leave "indexed" in the text.
   That is the unsafe direction. A daemon's plugin list is fixed for its life,
-  so the removal takes effect at the next daemon start. A single-project
-  session ends with its daemon and never sees the new state; a folder
-  (multi-project) session reselects the project against the new daemon and
-  then gets the path-anchored `notIndexed` answers (owed item (c), delivered
-  by GM-503).
+  so the removal takes effect at the next daemon start. A session survives
+  that restart (its shim reconnects on the next call), but keeps the
+  instructions of the daemon it first initialized with, since MCP cannot
+  resend them; the first answer after the reconnect says the daemon
+  restarted (ADR 0014). A folder (multi-project) session can also reselect
+  the project against the new daemon to get its current guidance, and then
+  gets the path-anchored `notIndexed` answers (owed item (c), delivered by
+  GM-503).
 
 ### 3. The text of each state
 
