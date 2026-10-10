@@ -324,3 +324,164 @@ fn a_reextract_extracts_unchanged_text_against_the_reloaded_model() {
     assert!(!presence.is_empty() && presence.iter().all(|(path, present)| path == "a.toy" && *present));
     assert!(!started.load(Ordering::SeqCst), "a re-extract starts no semantic engine");
 }
+
+// --- GM-507: the source hook ------------------------------------------------
+//
+// `Extractor::source_changed` on `fileChanged`, as the SDK calls it.
+// Design: `docs/architecture/gm-507-rust-module-tree-refresh.md`, section 5.
+
+/// The `Versioned` model with a source hook that records every call, answers
+/// a delta naming `b.toy` for a text containing `affects` (and for a file
+/// gone), and panics on a text containing `panic`.
+#[derive(Default)]
+struct Hooked {
+    calls: Mutex<Vec<(String, Option<String>)>>,
+}
+
+impl crate::Extractor for Hooked {
+    const LANGUAGE: &'static str = "toy";
+    type Project = Model;
+
+    fn load_project(&self, root: &Path) -> anyhow::Result<Model> {
+        load(root)
+    }
+
+    fn extract(&self, project: &Model, path: &RelPath, _source: &str) -> FileGraph {
+        extract_against(project, path)
+    }
+
+    fn source_changed(
+        &self,
+        _project: &mut Model,
+        path: &RelPath,
+        source: Option<&str>,
+    ) -> Option<ResolutionDelta> {
+        self.calls.lock().unwrap().push((path.as_str().to_string(), source.map(str::to_string)));
+        let text = source.unwrap_or("gone, which affects b");
+        assert!(!text.contains("panic"), "deliberate panic for the test");
+        text.contains("affects").then(hook_delta)
+    }
+}
+
+fn hook_delta() -> ResolutionDelta {
+    ResolutionDelta::Affected {
+        files: vec![PathScope { under: "b.toy".to_string(), not_under: Vec::new() }],
+        imports: Vec::new(),
+    }
+}
+
+fn hook_calls(extractor: &Hooked) -> Vec<(String, Option<String>)> {
+    extractor.calls.lock().unwrap().clone()
+}
+
+/// `fileChanged` for `a.toy`, as the raw `result` object core reads.
+fn file_changed_raw<E: Extractor>(session: &mut Session<'_, E>) -> serde_json::Value {
+    let response = send(session, 1, "fileChanged", serde_json::json!({ "filePath": "a.toy" }))
+        .expect("fileChanged is answered");
+    response["result"].clone()
+}
+
+/// GM-507 behaviour 5 (SDK half): the hook runs once for each new text of a
+/// file, with that text, and once with `None` when the file is gone; a
+/// `fileChanged` whose text is what the plugin last reported does not call
+/// it.
+///
+/// Control: call `self.source_changed(path, Some(&source))` above the
+/// unchanged-text short-circuit in `Session::file_changed` (the unchanged
+/// save is hooked too).
+#[test]
+fn the_source_hook_runs_once_per_new_text_and_never_on_unchanged_text() {
+    let scratch = Scratch::new("hook-once", "1");
+    let (spec, extractor, started) = (spec(), Hooked::default(), Arc::new(AtomicBool::new(false)));
+    let mut session = session(&extractor, &spec, &scratch.0, &started);
+    let a = |text: Option<&str>| ("a.toy".to_string(), text.map(str::to_string));
+
+    file_changed(&mut session, None);
+    assert_eq!(hook_calls(&extractor), vec![a(Some("a\n"))]);
+
+    let unchanged = file_changed(&mut session, None);
+    assert_eq!(unchanged, FileChangeDiff::default(), "unchanged text is short-circuited");
+    assert_eq!(hook_calls(&extractor), vec![a(Some("a\n"))], "the unchanged save is not hooked");
+
+    std::fs::write(scratch.0.join("a.toy"), "a2\n").unwrap();
+    file_changed(&mut session, None);
+    std::fs::remove_file(scratch.0.join("a.toy")).unwrap();
+    file_changed(&mut session, None);
+    assert_eq!(hook_calls(&extractor), vec![a(Some("a\n")), a(Some("a2\n")), a(None)]);
+}
+
+/// S5 deviation: a re-extract of unchanged text is hooked too (the hook then
+/// answers for the text it already has).
+///
+/// Control: return before the hook when `reextract` (the second call is
+/// missing).
+#[test]
+fn a_reextract_of_unchanged_text_is_hooked() {
+    let scratch = Scratch::new("hook-reextract", "1");
+    let (spec, extractor, started) = (spec(), Hooked::default(), Arc::new(AtomicBool::new(false)));
+    let mut session = session(&extractor, &spec, &scratch.0, &started);
+
+    file_changed(&mut session, None);
+    file_changed(&mut session, Some(true));
+
+    assert_eq!(hook_calls(&extractor).len(), 2, "{:?}", hook_calls(&extractor));
+}
+
+/// GM-507 behaviours 1-4 (SDK half): the hook's delta is the answer's
+/// `affected`, for a changed text and for a file gone; a hook answering
+/// `None` leaves the key off the wire.
+///
+/// Control: drop `diff.affected = affected;` in `Session::file_changed` (the
+/// changed text answers no `affected`).
+#[test]
+fn the_hooks_delta_reaches_the_wire_and_none_is_left_off() {
+    let scratch = Scratch::new("hook-wire", "1");
+    let (spec, extractor, started) = (spec(), Hooked::default(), Arc::new(AtomicBool::new(false)));
+    let mut session = session(&extractor, &spec, &scratch.0, &started);
+
+    let plain = file_changed_raw(&mut session);
+    assert!(plain.get("affected").is_none(), "no delta, no key: {plain}");
+    assert!(plain["upsertNodes"].as_array().is_some_and(|nodes| !nodes.is_empty()), "{plain}");
+
+    std::fs::write(scratch.0.join("a.toy"), "affects\n").unwrap();
+    let changed = file_changed_raw(&mut session);
+    let diff: FileChangeDiff = serde_json::from_value(changed.clone()).unwrap();
+    assert_eq!(diff.affected, Some(hook_delta()), "{changed}");
+    assert_eq!(
+        upserted_names(&diff),
+        Vec::<String>::new(),
+        "the same graph: only the File node's text moved"
+    );
+
+    std::fs::remove_file(scratch.0.join("a.toy")).unwrap();
+    let gone = file_changed_raw(&mut session);
+    let diff: FileChangeDiff = serde_json::from_value(gone.clone()).unwrap();
+    assert_eq!(diff.affected, Some(hook_delta()), "a deletion carries the hook's delta: {gone}");
+    assert!(!diff.delete_node_ids.is_empty(), "and still deletes the file's nodes: {gone}");
+}
+
+/// The hook's panic costs its delta only: the file is still extracted and
+/// answered, and the next `fileChanged` is hooked as usual.
+///
+/// Control: call `extractor.source_changed` without `catch_unwind` in
+/// `source_changed_caught` (the panic escapes `Session::handle`).
+#[test]
+fn a_panicking_source_hook_costs_only_its_delta() {
+    let scratch = Scratch::new("hook-panic", "1");
+    let (spec, extractor, started) = (spec(), Hooked::default(), Arc::new(AtomicBool::new(false)));
+    let mut session = session(&extractor, &spec, &scratch.0, &started);
+    std::fs::write(scratch.0.join("a.toy"), "panic\n").unwrap();
+
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let panicked = file_changed(&mut session, None);
+    std::panic::set_hook(previous);
+
+    assert_eq!(panicked.affected, None, "{panicked:?}");
+    assert_eq!(upserted_names(&panicked), vec!["built_against_1"], "the file is still extracted");
+
+    std::fs::write(scratch.0.join("a.toy"), "affects\n").unwrap();
+    let next = file_changed(&mut session, None);
+    assert_eq!(next.affected, Some(hook_delta()), "the session goes on: {next:?}");
+    assert_eq!(hook_calls(&extractor).len(), 2);
+}
