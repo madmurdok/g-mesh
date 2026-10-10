@@ -90,15 +90,27 @@ impl IdleTimeouts {
     /// `config`'s timeouts (`ProjectConfig::default()`'s 60 / 24 equal this module's
     /// defaults), unless the test-only env overrides name something else.
     pub fn from_config(config: &ProjectConfig) -> Self {
+        Self::from_config_and_overrides(
+            config,
+            std::env::var(PLUGIN_IDLE_ENV).ok().as_deref(),
+            std::env::var(CORE_IDLE_ENV).ok().as_deref(),
+        )
+    }
+
+    /// [`from_config`](Self::from_config) with the raw values of
+    /// [`PLUGIN_IDLE_ENV`] and [`CORE_IDLE_ENV`] given rather than read, so a
+    /// test can supply them without writing variables every other thread in
+    /// the process reads.
+    fn from_config_and_overrides(
+        config: &ProjectConfig,
+        plugin_env: Option<&str>,
+        core_env: Option<&str>,
+    ) -> Self {
         let plugin_default = Duration::from_secs(config.plugin.idle_timeout_minutes.saturating_mul(60));
         let core_default = Duration::from_secs(config.daemon.core_idle_timeout_hours.saturating_mul(60 * 60));
         Self {
-            plugin: parse_timeout(
-                std::env::var(PLUGIN_IDLE_ENV).ok().as_deref(),
-                plugin_default,
-                PLUGIN_IDLE_ENV,
-            ),
-            core: parse_timeout(std::env::var(CORE_IDLE_ENV).ok().as_deref(), core_default, CORE_IDLE_ENV),
+            plugin: parse_timeout(plugin_env, plugin_default, PLUGIN_IDLE_ENV),
+            core: parse_timeout(core_env, core_default, CORE_IDLE_ENV),
         }
     }
 
@@ -791,7 +803,12 @@ pub fn orphan_check(
 /// [`LIFELINE_PID_ENV`] as a pid: `None` when unset (production) or when the
 /// value does not parse, so a malformed variable never ends the process.
 fn lifeline_pid() -> Option<u32> {
-    std::env::var(LIFELINE_PID_ENV).ok()?.trim().parse().ok()
+    lifeline_pid_from(std::env::var(LIFELINE_PID_ENV).ok().as_deref())
+}
+
+/// [`lifeline_pid`] over the variable's raw value, given rather than read.
+fn lifeline_pid_from(raw: Option<&str>) -> Option<u32> {
+    raw?.trim().parse().ok()
 }
 
 /// `true` only for a path the filesystem positively reports as absent

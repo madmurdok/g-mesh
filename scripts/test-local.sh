@@ -29,22 +29,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Lib tests that write process-wide state (env vars) or assert on spawn
-# timing. They keep nextest's one process per test until each is changed to
-# take its override as an argument.
-ISOLATED='test(=shim::tests::a_bootstrap_lock_alone_is_enough_to_record_the_project_root)
- | test(=mcp::search_code::tests::handle_reports_a_tool_error_when_the_configured_model_is_unavailable)
- | test(/^mcp::search_code_wait_tests::/)
- | test(=daemon::lifecycle::tests::a_timed_out_file_change_relaunches_the_plugin_and_replays_the_dirty_file_without_blocking_another_language)
- | test(=daemon::lifecycle::tests::a_default_config_resolves_to_the_documented_defaults)
- | test(=daemon::lifecycle::tests::a_configured_plugin_idle_timeout_overrides_the_default)
- | test(=daemon::lifecycle::tests::a_configured_core_idle_timeout_overrides_the_default)
- | test(=daemon::lifecycle::tests::the_env_override_still_wins_over_a_configured_value)
- | test(=daemon::lifecycle::tests::only_a_well_formed_pid_in_the_environment_is_a_lifeline)
- | test(=daemon::semantic::tests::an_interrupted_pass_for_one_language_is_retried_without_rerunning_the_other)
- | test(=daemon::manifest::tests::default_roots_bundled_entry_resolves_to_the_sibling_plugins_directory)
- | test(=daemon::manifest::tests::the_override_env_var_replaces_the_entire_default_roots_list)
- | test(=daemon::registry::tests::two_languages_spawn_at_the_same_time_rather_than_one_after_the_other)'
+# Lib tests kept on nextest's one process per test. No lib test writes
+# process-wide state (env vars, the working directory): one that needs an
+# override takes it as an argument (GM-549). The one left asserts that two
+# plugin processes start while each other's spawn is in flight, within a
+# deadline; the one-process lib run puts every other spawning test beside it,
+# the load that breaks it, so it stays in the `daemon-spawning` group.
+ISOLATED='test(=daemon::registry::tests::two_languages_spawn_at_the_same_time_rather_than_one_after_the_other)'
 
 # The sections whose tests are (partly) the g-mesh lib.
 CORE_LIB_SECTIONS=" core-mcp core-daemon core-cli core-graph core-rest "

@@ -56,7 +56,14 @@ pub const PLUGIN_ROOTS_OVERRIDE_ENV: &str = "G_MESH_PLUGIN_ROOTS_OVERRIDE";
 /// (skipped if the home directory cannot be resolved), then [`bundled_roots`].
 /// With [`PLUGIN_ROOTS_OVERRIDE_ENV`] set, that one path replaces them all.
 pub fn default_roots() -> Vec<PathBuf> {
-    if let Ok(over) = std::env::var(PLUGIN_ROOTS_OVERRIDE_ENV) {
+    roots_with_override(std::env::var(PLUGIN_ROOTS_OVERRIDE_ENV).ok())
+}
+
+/// [`default_roots`] with [`PLUGIN_ROOTS_OVERRIDE_ENV`]'s value given rather
+/// than read, so a test can supply it without writing a variable every other
+/// thread in the process reads.
+fn roots_with_override(override_root: Option<String>) -> Vec<PathBuf> {
+    if let Some(over) = override_root {
         return vec![PathBuf::from(over)];
     }
 

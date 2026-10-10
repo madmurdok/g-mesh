@@ -208,6 +208,9 @@ pub struct GMeshMcpServer {
     embedding: Arc<EmbeddingPipeline>,
     shapes: Arc<query_shapes::QueryShapes>,
     hints: session_hints::SessionHints,
+    /// `search_code`'s embedding wait when a test names one; `None` (always,
+    /// in production) reads [`SEARCH_EMBEDDING_WAIT_ENV`] per call.
+    search_embedding_wait: Option<Duration>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -229,8 +232,18 @@ impl GMeshMcpServer {
             embedding,
             shapes,
             hints: session_hints::SessionHints::default(),
+            search_embedding_wait: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// This server with `search_code`'s embedding wait fixed at `wait`, so a
+    /// test can shorten it without writing [`SEARCH_EMBEDDING_WAIT_ENV`] for
+    /// every other thread in the process.
+    #[cfg(test)]
+    pub(crate) fn with_search_embedding_wait(mut self, wait: Duration) -> Self {
+        self.search_embedding_wait = Some(wait);
+        self
     }
 
     /// Everything every handler owes before it reads the index, in the one
@@ -574,7 +587,9 @@ impl GMeshMcpServer {
         ctx: &RequestContext<RoleServer>,
     ) -> Result<Result<Option<search_code::Coverage>, CallToolResult>, ErrorData> {
         let started = Instant::now();
-        let bound = env_millis(SEARCH_EMBEDDING_WAIT_ENV, SEARCH_EMBEDDING_WAIT);
+        let bound = self
+            .search_embedding_wait
+            .unwrap_or_else(|| env_millis(SEARCH_EMBEDDING_WAIT_ENV, SEARCH_EMBEDDING_WAIT));
         let deadline = started.checked_add(bound);
         let outcome =
             self.wait_until(ctx, "search_code:embeddings", Need::Embeddings, started, deadline).await?;

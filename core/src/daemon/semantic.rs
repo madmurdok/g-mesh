@@ -618,19 +618,13 @@ fn reconcile_rollup(conn: &IndexStore, capable: &HashSet<String>) {
 mod tests {
     use rusqlite::Connection;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
 
     use rusqlite::{params, OptionalExtension};
 
     use super::*;
     use crate::daemon::manifest::discover;
     use crate::daemon::test_plugin;
-
-    /// Guards `SEMANTIC_PASS_PROJECT_TIMEOUT_ENV` the same way
-    /// `daemon::plugin`'s own tests guard their env-var overrides: it is
-    /// process-wide state, and `cargo test` runs this module on multiple
-    /// threads by default.
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
     /// A `File` node for `language` at `file_path`, so `storage::schema::
     /// present_languages` (and therefore "owed") considers it present - the
@@ -939,8 +933,11 @@ mod tests {
     /// then never answers the very first framed request it ever receives
     /// (`test_plugin::install_stalling`'s own doc comment), which for a
     /// language with nothing else asked of it yet is exactly the
-    /// `semanticPass` request this test sends. The
-    /// `SEMANTIC_PASS_PROJECT_TIMEOUT_ENV` override here does not shorten the
+    /// `semanticPass` request this test sends. The short
+    /// `RoundTripTimeouts::semantic_pass_project` given to `alpha`'s
+    /// supervisor here (not set through `SEMANTIC_PASS_PROJECT_TIMEOUT_ENV`,
+    /// which every plugin spawned anywhere in the process reads) does not
+    /// shorten the
     /// wait to its own value - with one `File` node present, `plugin::
     /// RoundTripTimeouts::semantic_pass_project_timeout` clamps to
     /// `max(floor, 1 * SEMANTIC_PASS_PER_FILE_BUDGET)`, and the 10s per-file
@@ -951,23 +948,23 @@ mod tests {
     /// bounded ~10s one, not a fast one.
     #[test]
     fn an_interrupted_pass_for_one_language_is_retried_without_rerunning_the_other() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var(crate::daemon::plugin::SEMANTIC_PASS_PROJECT_TIMEOUT_ENV, "150");
-
         let (_project, _plugins, _alpha_dir, beta_dir, conn, registry) =
             two_language_registry("alpha", true, true, "beta", true, false);
+        // Spawned ahead of the run, which reuses it (`get_or_spawn`), so the
+        // budget can be handed to this one plugin before its pass is asked;
+        // the spawn sends no framed request, so the stall is still ahead.
+        registry
+            .get_or_spawn("alpha")
+            .expect("the stalling fixture plugin must still shake hands and start normally")
+            .set_round_trip_timeouts(crate::daemon::plugin::RoundTripTimeouts {
+                semantic_pass_project: Duration::from_millis(150),
+                ..crate::daemon::plugin::RoundTripTimeouts::default()
+            });
 
         // `owed_semantic_pass_languages` sorts, so "alpha" is always asked
         // before "beta" within one sequential run - see that function's own
         // doc comment.
         let first_run = run_with_registry(&registry, &conn);
-        // The override only has to be visible while `PluginProcess::spawn`
-        // resolves it - every supervisor this registry creates captures its
-        // own `RoundTripTimeouts` by value at spawn time, so removing it now
-        // cannot affect a supervisor already spawned, and leaving it set any
-        // longer than necessary would risk another test racing on this same
-        // lock seeing it.
-        std::env::remove_var(crate::daemon::plugin::SEMANTIC_PASS_PROJECT_TIMEOUT_ENV);
 
         assert_eq!(first_run.completed, vec!["beta".to_string()], "beta must have completed normally");
         assert_eq!(
@@ -1147,9 +1144,6 @@ mod tests {
     /// `completed == [alpha]`.
     #[test]
     fn a_prepared_language_survives_a_preceding_languages_long_pass() {
-        // Not for the env var itself: another test here sets the project
-        // timeout to 150ms, which would cut alpha's gated pass short.
-        let _guard = ENV_LOCK.lock().unwrap();
         let (_project, _plugins, alpha_dir, _beta_dir, conn, registry) = two_language_registry_idling(
             "alpha",
             true,

@@ -601,7 +601,6 @@ fn search_hint(results: &[SearchResult], judged: bool, hints: &SessionHints) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embedding::model::MODEL_DIR_ENV;
     use crate::storage::schema;
     use crate::storage::vectors::{insert, register_extension};
 
@@ -729,23 +728,25 @@ mod tests {
         assert!(error_text(&result).contains("g-mesh model fetch"));
     }
 
-    /// A disabled pipeline (`MODEL_DIR_ENV` pointed at nothing) is the same
-    /// "not available" path a project that never fetched weights hits -
-    /// `EmbeddingPipeline::load` fails its own `Path::exists()` check before
-    /// touching the network or the filesystem further, matching
-    /// `cold_start_grace_wait.rs`'s use of the same override.
+    /// A pipeline whose model directory holds nothing is the same "not
+    /// available" path a project that never fetched weights hits - the load
+    /// fails its own `Path::exists()` check before touching the network or
+    /// the filesystem further. The directory is given to the pipeline rather
+    /// than set through `MODEL_DIR_ENV`, which every other thread in this
+    /// process reads.
     #[test]
     fn handle_reports_a_tool_error_when_the_configured_model_is_unavailable() {
-        std::env::set_var(MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir");
         let conn = Arc::new(IndexStore::new(setup()));
-        let embedding = EmbeddingPipeline::load(&crate::config::EmbeddingConfig::default());
+        let embedding = EmbeddingPipeline::load_at(
+            &crate::config::EmbeddingConfig::default(),
+            Path::new("/nonexistent-g-mesh-test-model-dir"),
+        );
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
         let result =
             handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None)
                 .unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
-        std::env::remove_var(MODEL_DIR_ENV);
     }
 
     /// `search`'s own page-size handling, exercised directly the same way
