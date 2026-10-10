@@ -297,6 +297,7 @@ mod tests {
             to_declaration: Some(1),
             source: SourceTier::Semantic,
             engine: "toy-types".to_string(),
+            specifier: None,
         });
         assert_ne!(unbound, bound);
     }

@@ -193,6 +193,7 @@ pub fn ensure_fresh<R: BufRead + Send, W: Write>(
                             file_changed_timeout,
                             semantic_pass_timeout,
                             semantic_pass_capable,
+                            false,
                             on_timeout,
                         )
                     })
@@ -515,7 +516,7 @@ mod tests {
             let request: ControlEnvelope = read_message(&mut buf_reader).unwrap().unwrap();
             assert_eq!(request.id, Some(expected_id));
             match request.message {
-                ControlMessage::FileChanged { file_path } => assert_eq!(file_path, expected_file_path),
+                ControlMessage::FileChanged { file_path, .. } => assert_eq!(file_path, expected_file_path),
                 other => panic!("expected FileChanged, got {other:?}"),
             }
             invoked_tx.send(()).unwrap();

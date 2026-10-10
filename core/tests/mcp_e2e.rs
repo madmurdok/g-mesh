@@ -45,7 +45,7 @@ const EXPECTED_TOOLS: [(&str, &[&str]); 8] = [
     ),
     ("find_references", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths", "answer"]),
     ("get_dependencies", &["file_path", "module_id", "direction", "max_depth", "max_fanout", "resume_token"]),
-    ("get_file_outline", &["file_path", "cursor", "limit"]),
+    ("get_file_outline", &["file_path", "cursor", "limit", "detail"]),
     ("search_code", &["query", "cursor", "limit"]),
 ];
 

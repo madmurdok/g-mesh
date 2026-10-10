@@ -30,9 +30,12 @@
 //! It cannot, and that is the kit's rule rather than a gap here. A plugin
 //! with no engine reports its whole-project `semanticPass` **incomplete** -
 //! deliberately, since that is what leaves `language_state.semanticPassAt`
-//! unset and Rust's receiver gap listed - and `watcher::apply` turns an
-//! incomplete *whole-project* pass into a session failure, after which the
-//! kit skips the entire expectations section ("expectations need the fully
+//! unset and Rust's receiver gap listed - and the kit fails the session on
+//! an incomplete *whole-project* pass: `watcher::apply` itself when the pass
+//! names no unfinished files, and the kit's own session driver when it names
+//! them and is recorded residual (GM-550; a daemon would ask those files
+//! again on its next start, a kit session has none). Either way the kit then
+//! skips the entire expectations section ("expectations need the fully
 //! linked index a completed session leaves behind"). So the missing-toolchain
 //! arm asserts the log line, the diff and the report; the *structural
 //! results* are asserted by [`structural_3_2_0`], which is a stronger
@@ -65,7 +68,7 @@ use g_mesh_plugin_sdk::testing::{CheckOutcome, PluginCheck, Verdict};
 /// asserted as a set so a check dropping out of the report (this crate's
 /// own regression, not a plugin defect) fails loudly rather than shrinking
 /// the loop below silently.
-const ALL_CHECKS: [&str; 16] = [
+const ALL_CHECKS: [&str; 17] = [
     "session",
     "shape",
     "stream-order",
@@ -82,7 +85,12 @@ const ALL_CHECKS: [&str; 16] = [
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
     "capabilities.files-created-resolves",
+    RESOLUTION_DELTA,
 ];
+
+/// GM-509's check: run only for a manifest declaring `resolution_delta`,
+/// which the kit's generated manifest never does, so it reports `SKIP` here.
+const RESOLUTION_DELTA: &str = "capabilities.resolution-delta-version-bump";
 
 /// The two capability checks are each other's alternative: exactly one
 /// applies to a given manifest, and the other reports `Skip`. Which one runs
@@ -99,7 +107,11 @@ const CAPABILITY_CHECKS: [&str; 2] =
 const FILES_CREATED: &str = "capabilities.files-created-resolves";
 
 fn always_pass() -> Vec<&'static str> {
-    ALL_CHECKS.iter().copied().filter(|id| !CAPABILITY_CHECKS.contains(id) && *id != FILES_CREATED).collect()
+    ALL_CHECKS
+        .iter()
+        .copied()
+        .filter(|id| !CAPABILITY_CHECKS.contains(id) && *id != FILES_CREATED && *id != RESOLUTION_DELTA)
+        .collect()
 }
 
 const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.toml");
@@ -116,7 +128,9 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 // qualifiedName-suffix rung resolves), one `[[refusal]]` and two
 // `[[references]]`, both structural, plus the getter-named-like-its-field pair: one `[[callers]]` for
 // the method and one `[[references]]` for the field.
-const EXPECTATIONS: usize = 31;
+// 32 with GM-537's `[[implementations]] shapes::Loud::speak` (structural).
+// 33 with `[[implementations]] sirens::Wail` (semantic).
+const EXPECTATIONS: usize = 33;
 // 6 since GM-386: `[[references]] shapes::Shape` joined the five receiver/
 // implementation entries, not because its rows need rust-analyzer - they do
 // not - but because the `files` tally it now asserts counts edges, and two of
@@ -129,6 +143,10 @@ const EXPECTATIONS: usize = 31;
 // 5 once the `internals::peek` row of `[[references]]
 // gaps::Ledger.all_unresolved` became structural for the same reason: the
 // field is read through a parameter of a written type.
+// 4 once `[[implementations]] shapes::Loud` became structural (GM-537): a
+// trait clause reached through a glob is addressed through the module.
+// 5 with `[[implementations]] sirens::Wail`: an impl a `macro_rules!` of
+// `alpha` writes in `beta`, which only rust-analyzer's sweep finds.
 const SEMANTIC_EXPECTATIONS: usize = 5;
 
 /// GM-380: the tripwire above only works if tripping it says what to do.
@@ -448,10 +466,11 @@ fn the_semantic_tier_is_what_closes_the_receiver_call_gap() {
     //   - the receiver call on a variable whose method is a trait impl's
     //     (`square.area()` in `total`), which the structural tier addresses
     //     as `Square::area` and so cannot find;
-    //   - the implementation in another crate of the workspace.
+    //   - the implementation in another crate that only the sweep finds
+    //     (`Siren`, whose `impl Wail` a macro of `alpha` writes in `beta`).
     for row in [
         "missing (expected, not found): crates/alpha/src/shapes.rs:shapes::total",
-        "missing (expected, not found): crates/beta/src/main.rs:Megaphone",
+        "missing (expected, not found): crates/beta/src/alarm.rs:alarm::Siren",
     ] {
         assert!(outcome.stdout.contains(row), "the report must say `{row}`:\n{}", outcome.stdout);
     }

@@ -192,6 +192,20 @@ pub(crate) struct LspClient {
     /// reason as `settled`: a restarted server loads its project from cold
     /// again, and a flag that dies with the client cannot be left stale.
     warmed_up: bool,
+    /// Whether this client asked the server for rust-analyzer's
+    /// `experimental/serverStatus` notification and reads its `quiescent`
+    /// bit as readiness (GM-550) - see [`LspClient::settle`].
+    quiescent_signal: bool,
+    /// The `quiescent` bit of the last `experimental/serverStatus` the server
+    /// sent, or `None` while it has sent none. Read only when
+    /// [`quiescent_signal`](LspClient::quiescent_signal) is set.
+    quiescent: Option<bool>,
+    /// Set by [`LspClient::unsettle`] and cleared when the settle latches
+    /// again: after a project-model change the last `quiescent: true` may be
+    /// stale (core's notice can reach this plugin before the server notices
+    /// the change), so that one settle is the full quiet period, as GM-433
+    /// measured it, on top of the signal.
+    reloading: bool,
 }
 
 impl LspClient {
@@ -201,11 +215,16 @@ impl LspClient {
     ///
     /// An `Err` here is the design doc's "semantic engine missing" failure
     /// mode: no binary on `PATH`, or a binary that is not a language server.
+    ///
+    /// `quiescent_signal` asks the server for `experimental/serverStatus`
+    /// and makes its `quiescent` bit part of readiness - see
+    /// [`LspClient::settle`].
     pub(crate) fn start(
         language: &str,
         config: &SemanticConfig,
         root: &Path,
         deadline: Instant,
+        quiescent_signal: bool,
     ) -> Result<Self> {
         let mut command = Command::new(&config.command);
         command
@@ -261,6 +280,9 @@ impl LspClient {
             on_demand: config.readiness == ServerReadiness::OnDemand,
             closed: false,
             warmed_up: false,
+            quiescent_signal,
+            quiescent: None,
+            reloading: false,
         };
         client.initialize(config, root, deadline)?;
         Ok(client)
@@ -294,6 +316,13 @@ impl LspClient {
                 },
             },
         });
+        if self.quiescent_signal {
+            // rust-analyzer's extension: it then sends
+            // `experimental/serverStatus` whenever its status changes, with
+            // `quiescent: false` from the first moment it starts loading the
+            // project until it has loaded it and primed its caches (GM-550).
+            params["capabilities"]["experimental"] = json!({ "serverStatusNotification": true });
+        }
         if let Some(options) = &config.initialization_options {
             params["initializationOptions"] = options.clone();
         }
@@ -381,11 +410,38 @@ impl LspClient {
     /// now", so an on-demand server that happens to be mid-progress when a
     /// pass begins is still waited for, exactly as an indexed one is on its
     /// second pass.
+    ///
+    /// **A server that says when it is done is believed when it says so**
+    /// (GM-550). With [`quiescent_signal`](LspClient::quiescent_signal) set
+    /// and at least one `experimental/serverStatus` received, a
+    /// `quiescent: false` counts as work in flight
+    /// ([`LspClient::track_status`]), so the gaps between rust-analyzer's
+    /// start-up phases - measured at 1.99-2.47s, longer than the 2s settle -
+    /// are no longer quiet at all, and the first settle needs only "quiescent,
+    /// and nothing in flight right now" instead of a further `quiet` of
+    /// silence. Two cases keep the quiet period:
+    ///
+    /// - The server has sent no status at all: it does not implement the
+    ///   extension (an older or a different server behind the same manifest),
+    ///   and this is today's rule unchanged - the fallback costs nothing and
+    ///   never waits for a signal that is not coming.
+    /// - The first settle after [`LspClient::unsettle`]: the last
+    ///   `quiescent: true` may predate the project-model change, so GM-433's
+    ///   full quiet period applies, on top of the signal.
+    ///
+    /// A server that reported `quiescent: false` and never reports `true` is
+    /// waited for no longer than a server whose progress never ends:
+    /// [`Budgets::readiness`](super::bridge::Budgets::readiness) or the pass
+    /// deadline, after which the pass asks nothing and is incomplete.
     pub(crate) fn settle(&mut self, quiet: Duration) -> bool {
         if self.settled {
             return self.quiet_for(Duration::ZERO);
         }
-        self.settled = self.quiet_for(quiet);
+        let signalled = self.quiescent_signal && self.quiescent.is_some() && !self.reloading;
+        self.settled = self.quiet_for(if signalled { Duration::ZERO } else { quiet });
+        if self.settled {
+            self.reloading = false;
+        }
         self.settled
     }
 
@@ -425,6 +481,7 @@ impl LspClient {
             return;
         }
         self.settled = false;
+        self.reloading = true;
         self.mark_edited();
     }
 
@@ -555,6 +612,8 @@ impl LspClient {
             (Some(method), None) => {
                 if method == "$/progress" {
                     self.track_progress(message.get("params"));
+                } else if method == "experimental/serverStatus" && self.quiescent_signal {
+                    self.track_status(message.get("params"));
                 }
                 Poll::Noise
             }
@@ -602,11 +661,32 @@ impl LspClient {
             }
             Some("end") => {
                 self.active_progress.remove(&token);
-                if self.active_progress.is_empty() {
+                if self.active_progress.is_empty() && self.quiescent != Some(false) {
                     self.idle_since = Some(Instant::now());
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Follows rust-analyzer's `experimental/serverStatus` (GM-550): a
+    /// `quiescent: false` is work in flight exactly as a begun progress token
+    /// is, and the `quiescent: true` that ends it starts the quiet clock if no
+    /// token is left in flight - so [`LspClient::quiet_for`], the readiness
+    /// wait and `run_pass`'s deferral of empty answers all read it without a
+    /// rule of their own. A repeated `true` leaves a running quiet clock
+    /// alone. Any other field (`health`, `message`) is information for a
+    /// human, as a progress `report` is.
+    fn track_status(&mut self, params: Option<&Value>) {
+        let Some(quiescent) = params.and_then(|params| params.get("quiescent")).and_then(Value::as_bool)
+        else {
+            return;
+        };
+        self.quiescent = Some(quiescent);
+        if !quiescent {
+            self.idle_since = None;
+        } else if self.idle_since.is_none() && self.active_progress.is_empty() {
+            self.idle_since = Some(Instant::now());
         }
     }
 

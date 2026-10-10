@@ -34,7 +34,7 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml");
 
 /// Every check `g-mesh plugins check` reports outside `expectations.*`.
-const ALL_CHECKS: [&str; 16] = [
+const ALL_CHECKS: [&str; 17] = [
     "session",
     "shape",
     "stream-order",
@@ -51,7 +51,12 @@ const ALL_CHECKS: [&str; 16] = [
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
     "capabilities.files-created-resolves",
+    RESOLUTION_DELTA,
 ];
+
+/// GM-509's check: run only for a manifest declaring `resolution_delta`,
+/// which the kit's generated manifest never does, so it reports `SKIP` here.
+const RESOLUTION_DELTA: &str = "capabilities.resolution-delta-version-bump";
 
 /// Exactly one of the two applies to a given manifest; the other reports
 /// `Skip`.
@@ -71,7 +76,11 @@ const SEMANTIC_EXPECTATIONS: usize = 7;
 const FILES_CREATED: &str = "capabilities.files-created-resolves";
 
 fn always_pass() -> Vec<&'static str> {
-    ALL_CHECKS.iter().copied().filter(|id| !CAPABILITY_CHECKS.contains(id) && *id != FILES_CREATED).collect()
+    ALL_CHECKS
+        .iter()
+        .copied()
+        .filter(|id| !CAPABILITY_CHECKS.contains(id) && *id != FILES_CREATED && *id != RESOLUTION_DELTA)
+        .collect()
 }
 
 /// `plugin.toml`'s query tables (`non_symbol_queries`,

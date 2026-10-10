@@ -288,7 +288,7 @@ fn race_pass_against_memory_check(
     let sup_pass = Arc::clone(supervisor);
     let conn_pass = Arc::clone(conn);
     let pass_handle = thread::spawn(move || {
-        let result = sup_pass.semantic_pass(&conn_pass, Vec::new(), file_count);
+        let result = sup_pass.semantic_pass(&conn_pass, Vec::new(), file_count).map(|ran| ran.is_some());
         let returned_at = start.elapsed();
         // Mirrors `daemon::semantic::run_with_registry`'s own sequencing
         // exactly: record immediately after `Ok(true)`, same thread, no
@@ -381,7 +381,7 @@ fn a_real_rust_analyzer_over_its_memory_limit_is_suspended_and_structural_work_c
     // lifecycle.rs test makes for its synthetic fixture).
     assert!(supervisor.is_semantic_suspended(), "suspension must survive the structural wake");
     assert!(
-        !supervisor.semantic_pass(&conn, Vec::new(), file_count).expect("must not error, just skip"),
+        supervisor.semantic_pass(&conn, Vec::new(), file_count).expect("must not error, just skip").is_none(),
         "a suspended language's whole-project semantic pass must not run, even freshly awake"
     );
 

@@ -370,6 +370,18 @@ impl<'s> Emitter<'s> {
         id
     }
 
+    /// An `IMPORTS` edge onto a placeholder, carrying the import's text as
+    /// written as its `specifier` (GM-544): what core matches a resolution
+    /// delta's `Specifier` selectors against. When two imports draw the same
+    /// edge, the first one's text is kept; the id does not include it.
+    pub(crate) fn import_edge(&mut self, from: &str, to: &str, specifier: &str) -> String {
+        let id = edge_id(from, EdgeKind::Imports, to, None);
+        if self.edges.insert(id.clone()) {
+            self.graph.import_edge(from, to, specifier);
+        }
+        id
+    }
+
     /// Records a use site the structural tier could not settle - see
     /// `super`'s module doc, Decision 7.
     pub(crate) fn open_site(&mut self, site: OpenSite) {

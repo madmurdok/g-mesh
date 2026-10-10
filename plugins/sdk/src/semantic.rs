@@ -49,6 +49,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use g_mesh_wire::FileChangeDiff;
@@ -189,6 +190,19 @@ pub trait SemanticEngine: Send {
     /// The default does nothing. [`crate::lsp::LspBridge`] starts its
     /// language server.
     fn prepare(&mut self) {}
+
+    /// When core stops waiting for the pass about to be asked: the moment
+    /// the SDK received the `semanticPass`, plus the request's `budgetMs`
+    /// (GM-521). Core kills a plugin that answers later, losing whatever the
+    /// pass had resolved, so an engine that plans against a clock should
+    /// finish, and leave room to send its answer, before it. `None` means
+    /// core sent no budget (a core older than the field) and the engine's
+    /// own budgets apply. Called before every [`answer`](Self::answer), so a
+    /// value never outlives the pass it was sent with.
+    ///
+    /// The default does nothing. [`crate::lsp::LspBridge`] plans its pass
+    /// within it.
+    fn set_pass_deadline(&mut self, _deadline: Option<Instant>) {}
 }
 
 /// Builds the semantic engine, called at most once and only on the first
@@ -219,11 +233,28 @@ pub(crate) struct LazyEngine {
     failed: bool,
     /// Why the factory failed, reported as the reason of every pass after it.
     start_failure: Option<String>,
+    /// Core's deadline for the next pass, handed to the engine right before
+    /// it answers - see [`SemanticEngine::set_pass_deadline`]. Kept here
+    /// because the engine may not exist yet when the request is read.
+    pass_deadline: Option<Instant>,
 }
 
 impl LazyEngine {
     pub(crate) fn new(language: &str, factory: Option<SemanticEngineFactory>) -> Self {
-        Self { language: language.to_string(), factory, engine: None, failed: false, start_failure: None }
+        Self {
+            language: language.to_string(),
+            factory,
+            engine: None,
+            failed: false,
+            start_failure: None,
+            pass_deadline: None,
+        }
+    }
+
+    /// Sets core's deadline for the next [`answer`](Self::answer) - see
+    /// [`SemanticEngine::set_pass_deadline`]. Replaced on every pass.
+    pub(crate) fn set_pass_deadline(&mut self, deadline: Option<Instant>) {
+        self.pass_deadline = deadline;
     }
 
     /// Answers a `semanticPass`, starting the engine if this is the first
@@ -260,6 +291,7 @@ impl LazyEngine {
                 .unwrap_or_else(|| "the semantic engine could not be started".to_string());
             return SemanticAnswer::incomplete_because(FileChangeDiff::default(), reason);
         };
+        engine.set_pass_deadline(self.pass_deadline);
         match engine.answer(files, index) {
             Ok(answer) => answer,
             Err(err) => {

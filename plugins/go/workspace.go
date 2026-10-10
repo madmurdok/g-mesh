@@ -52,16 +52,36 @@ type moduleRoot struct {
 }
 
 // workspace is the whole project's module layout, as one immutable value.
-// It is rebuilt from scratch on `workspaceChanged` (control.go) rather than
-// patched, because a go.mod edit can rename a module - which moves every
-// container key under it - and recomputing is cheaper than reasoning about
-// which ones moved.
+// It is rebuilt from scratch on `workspaceChanged` and `resolutionChanged`
+// (control.go) rather than patched; which container keys moved is worked out
+// afterwards by comparing the old and new facts (facts.go).
 type workspace struct {
 	// Longest `dir` first, so importPath's first match is the *innermost*
 	// module containing a directory. A nested module (tools/go.mod inside
 	// the root module's tree) owns its own subtree, exactly as the go
 	// command treats it.
 	modules []moduleRoot
+	// go.work's `use` directories, sorted. Extraction never reads them (a
+	// used module is in `modules` already); they are resolution facts
+	// (facts.go) because a `use` decides whether the semantic tier type-checks
+	// that module's importers against its source in this tree.
+	uses []string
+	// Every `replace` directive of a module's go.mod and of go.work, sorted.
+	// Like `uses`, read only as resolution facts: the semantic tier's
+	// `packages.Load` honours them, the structural tier never does.
+	replaces []replaceRule
+}
+
+// replaceRule is one `replace` directive.
+type replaceRule struct {
+	// The project-relative directory of the go.mod declaring it, or
+	// "go.work" for one in the workspace file.
+	file string
+	// The replaced module path (the left side's first field).
+	from string
+	// The whole directive, whitespace-normalized: `old [v] => new [v]`. A
+	// relative right side means something only together with `file`.
+	rule string
 }
 
 // loadWorkspace reads every go.mod in the project, plus go.work's `use`
@@ -78,7 +98,8 @@ type workspace struct {
 func loadWorkspace(root string) *workspace {
 	byDir := map[string]string{}
 
-	for _, dir := range goWorkUseDirs(root) {
+	uses := goWorkUseDirs(root)
+	for _, dir := range uses {
 		if path, ok := readModulePath(filepath.Join(root, filepath.FromSlash(dir))); ok {
 			byDir[dir] = path
 		}
@@ -127,7 +148,70 @@ func loadWorkspace(root string) *workspace {
 		}
 		return modules[i].dir < modules[j].dir
 	})
-	return &workspace{modules: modules}
+	var replaces []replaceRule
+	for _, module := range modules {
+		replaces = append(replaces, readReplaces(filepath.Join(root, filepath.FromSlash(module.dir), "go.mod"), module.dir)...)
+	}
+	replaces = append(replaces, readReplaces(filepath.Join(root, "go.work"), "go.work")...)
+	sort.Slice(replaces, func(i, j int) bool {
+		if replaces[i].file != replaces[j].file {
+			return replaces[i].file < replaces[j].file
+		}
+		return replaces[i].rule < replaces[j].rule
+	})
+	return &workspace{modules: modules, uses: uses, replaces: replaces}
+}
+
+// readReplaces returns the `replace` directives of one go.mod or go.work,
+// both the one-line and the block form. A missing file has none.
+func readReplaces(file, label string) []replaceRule {
+	content, err := os.ReadFile(file)
+	if err != nil {
+		return nil
+	}
+	var rules []replaceRule
+	for _, args := range directiveEntries(string(content), "replace") {
+		fields := strings.Fields(args)
+		if len(fields) == 0 {
+			continue
+		}
+		rules = append(rules, replaceRule{file: label, from: unquotePath(fields[0]), rule: strings.Join(fields, " ")})
+	}
+	return rules
+}
+
+// directiveEntries returns the arguments of every `keyword` directive in a
+// go.mod/go.work text: the rest of a one-line directive, and each line of a
+// parenthesized block.
+func directiveEntries(content, keyword string) []string {
+	var entries []string
+	inBlock := false
+	for _, raw := range strings.Split(content, "\n") {
+		line := stripLineComment(raw)
+		if line == "" {
+			continue
+		}
+		if inBlock {
+			if line == ")" {
+				inBlock = false
+				continue
+			}
+			entries = append(entries, line)
+			continue
+		}
+		rest, ok := directiveArgs(line, keyword)
+		if !ok {
+			continue
+		}
+		if rest == "(" {
+			inBlock = true
+			continue
+		}
+		if rest != "" {
+			entries = append(entries, rest)
+		}
+	}
+	return entries
 }
 
 // importPath returns the Go import path of a project-relative directory -

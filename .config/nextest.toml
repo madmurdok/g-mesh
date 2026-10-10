@@ -20,6 +20,10 @@
 #
 # 714 tests passing on all four, no leaks reported, and faster on three of
 # them. aarch64 pays 23s for what the rest of this file buys.
+#
+# The suite runs as named sections, each a filterset over these profiles:
+# `scripts/test-sections.sh` (docs/adr/0030-test-sections.md). No profile here
+# is per section; every section runs under `default` or `ci` unchanged.
 
 [profile.default]
 # Same reason `--no-fail-fast` is passed today: cargo otherwise stops at the
@@ -65,6 +69,13 @@ test-group = 'daemon-spawning'
 filter = 'test(two_languages_spawn_at_the_same_time_rather_than_one_after_the_other)'
 test-group = 'daemon-spawning'
 
+# An ignored test that runs `scripts/test-sections.sh check`: twelve listings
+# of the whole workspace suite, which outlast the 210s above on a loaded
+# machine without hanging.
+[[profile.default.overrides]]
+filter = 'test(=the_real_sections_partition_the_real_suite)'
+slow-timeout = { period = "60s", terminate-after = 20 }
+
 # GM-344. A CI-only profile, so that a run leaves behind something a machine
 # can read. Everything about how tests are *run* is inherited unchanged -
 # this adds an output file and nothing else.
@@ -83,7 +94,8 @@ test-group = 'daemon-spawning'
 inherits = "default"
 
 [profile.ci.junit]
-# Written to `target/nextest/ci/junit.xml`. One `<testsuite>` per test
+# Written to `target/nextest/ci/junit.xml`, which `scripts/test-sections.sh`
+# renames to `junit-<section>.xml` after each section. One `<testsuite>` per test
 # binary, which is the grouping that matters: 25 failures in one binary is
 # one cause, 25 across twelve is a different situation entirely, and that
 # distinction is what made GM-337 diagnosable at all.

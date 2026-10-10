@@ -112,12 +112,88 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
             file_changed_timeout,
             semantic_pass_timeout,
             semantic_pass_capable,
+            false,
             on_timeout,
         )
     })
 }
 
-/// [`apply_file_change`] for a caller already inside a unit.
+/// One structural `fileChanged` round trip with `reextract` set: the plugin
+/// extracts `file_path` even though its text is what it last extracted,
+/// because something its resolution reads changed. No semantic pass follows;
+/// the caller sends one for every file it re-extracted
+/// (`daemon::config_reindex`).
+#[allow(clippy::too_many_arguments)]
+pub fn reextract_file<R: BufRead + Send, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    store: &IndexStore,
+    project_root: &Path,
+    language: &str,
+    file_path: impl Into<String>,
+    request_id: RequestId,
+    embedding: &EmbeddingPipeline,
+    file_changed_timeout: Duration,
+    on_timeout: &mut dyn FnMut(),
+) -> Result<()> {
+    store.unit(Unit::WatcherApply, |store| {
+        apply_file_change_in(
+            reader,
+            writer,
+            store,
+            project_root,
+            language,
+            file_path,
+            request_id,
+            embedding,
+            file_changed_timeout,
+            file_changed_timeout,
+            false,
+            true,
+            on_timeout,
+        )
+    })
+}
+
+/// A per-file `semanticPass` over `file_paths` plus the language's owed
+/// files, settled like the pass after a reparse. `file_paths` must not be
+/// empty: an empty list asks for the whole project.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_scoped_semantic_pass<R: BufRead + Send, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    store: &IndexStore,
+    language: &str,
+    file_paths: Vec<String>,
+    request_id: RequestId,
+    embedding: &EmbeddingPipeline,
+    timeout: Duration,
+    on_timeout: &mut dyn FnMut(),
+) -> Result<()> {
+    anyhow::ensure!(!file_paths.is_empty(), "a scoped semantic pass needs at least one file");
+    store.unit(Unit::WatcherApply, |store| {
+        let owed = store.step(|conn| schema::owed_files(conn, language)).unwrap_or_else(|err| {
+            crate::log_line!("g-mesh: failed to read {language}'s owed semantic files ({err:#})");
+            Vec::new()
+        });
+        apply_semantic_pass_in(
+            reader,
+            writer,
+            store,
+            language,
+            None,
+            Scope::Files { requested: file_paths, owed },
+            request_id,
+            embedding,
+            timeout,
+            on_timeout,
+        )
+        .map(|_| ())
+    })
+}
+
+/// [`apply_file_change`] for a caller already inside a unit. `reextract` is
+/// sent as `fileChanged`'s own flag.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     reader: &mut R,
@@ -131,6 +207,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     file_changed_timeout: Duration,
     semantic_pass_timeout: Duration,
     semantic_pass_capable: bool,
+    reextract: bool,
     on_timeout: &mut dyn FnMut(),
 ) -> Result<()> {
     let file_path = file_path.into();
@@ -141,7 +218,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
         reader,
         writer,
         store,
-        ControlMessage::FileChanged { file_path: file_path.clone() },
+        ControlMessage::FileChanged { file_path: file_path.clone(), reextract },
         Some(project_root),
         request_id.clone(),
         embedding,
@@ -157,6 +234,15 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     // core, not the plugin, keeps them, so the next pass asks them again
     // without waiting for an edit, and knows the whole scope it sent.
     // Best-effort: an unreadable owed set only means they wait one more pass.
+    //
+    // The same rows are a residual language's leftovers (GM-521), so an edit
+    // invalidates its file's record here: finished, the row (and any
+    // never-answered mark) goes; unfinished, it restarts at one attempt.
+    // GM-515 presence batches: every created file still gets its own
+    // `fileChanged` and per-file pass, and the owed files ride along on each
+    // one, so a batch of `MAX_OWED_ATTEMPTS` or more creations can use up an
+    // owed file's attempts at once - the same bound, spent sooner; a created
+    // file itself has no owed row.
     let owed = store.step(|conn| schema::owed_files(conn, language)).unwrap_or_else(|err| {
         crate::log_line!("g-mesh: failed to read {language}'s owed semantic files ({err:#})");
         Vec::new()
@@ -167,8 +253,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
         store,
         language,
         None,
-        vec![file_path.clone()],
-        owed,
+        Scope::Files { requested: vec![file_path.clone()], owed },
         semantic_pass_id(&request_id),
         embedding,
         semantic_pass_timeout,
@@ -209,6 +294,13 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
 /// has re-sent since (`IndexStore::sweep_unclaimed_nodes`). `None` (a
 /// plugin whose manifest leaves `capabilities.semantic_sweep` off), an
 /// incomplete pass and a per-file pass sweep nothing.
+///
+/// An incomplete whole-project pass whose answer names its
+/// `unfinishedFiles` is recorded as residual (GM-521,
+/// [`schema::record_language_semantic_residual`]) and returns
+/// [`SemanticPassOutcome::Residual`] or [`SemanticPassOutcome::Settled`];
+/// one that does not name them is still an `Err`, so the next start asks
+/// the whole project again.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     reader: &mut R,
@@ -221,7 +313,12 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     embedding: &EmbeddingPipeline,
     timeout: Duration,
     on_timeout: &mut dyn FnMut(),
-) -> Result<()> {
+) -> Result<SemanticPassOutcome> {
+    let scope = if file_paths.is_empty() {
+        Scope::WholeProject
+    } else {
+        Scope::Files { requested: file_paths, owed: Vec::new() }
+    };
     store.unit(Unit::WatcherApply, |store| {
         apply_semantic_pass_in(
             reader,
@@ -229,8 +326,7 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
             store,
             language,
             sweep_language,
-            file_paths,
-            Vec::new(),
+            scope,
             request_id,
             embedding,
             timeout,
@@ -239,12 +335,89 @@ pub fn apply_semantic_pass<R: BufRead + Send, W: Write>(
     })
 }
 
-/// [`apply_semantic_pass`] inside an open unit.
-///
-/// `owed` - for a per-file pass only - is the language's owed files
-/// ([`schema::owed_files`]), sent beside `file_paths`: the pass's scope is
-/// their union, and a `FileChangeResponse::unfinished_files` list settles
-/// exactly that scope less the files it names.
+/// Asks `language`'s residual files again (GM-521): `file_paths` are the owed
+/// rows an incomplete whole-project pass left
+/// ([`schema::semantic_residual_files`]). Every file the answer does not
+/// finish costs one more attempt, and so does every file of a pass that
+/// fails outright (a timeout, a crash): a file that always times out is asked
+/// on at most [`schema::MAX_OWED_ATTEMPTS`] starts. Returns
+/// [`SemanticPassOutcome::Settled`] once no owed file is left, for the caller
+/// to record the pass (owner decision Q3), and
+/// [`SemanticPassOutcome::Residual`] otherwise. Sweeps nothing: the pass is
+/// not over the whole project.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_residual_semantic_pass<R: BufRead + Send, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    store: &IndexStore,
+    language: &str,
+    file_paths: Vec<String>,
+    request_id: RequestId,
+    embedding: &EmbeddingPipeline,
+    timeout: Duration,
+    on_timeout: &mut dyn FnMut(),
+) -> Result<SemanticPassOutcome> {
+    store.unit(Unit::WatcherApply, |store| {
+        apply_semantic_pass_in(
+            reader,
+            writer,
+            store,
+            language,
+            None,
+            Scope::Residual(file_paths),
+            request_id,
+            embedding,
+            timeout,
+            on_timeout,
+        )
+    })
+}
+
+/// What a semantic pass left for its caller to record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticPassOutcome {
+    /// A complete whole-project pass - the caller records it
+    /// (`schema::record_language_semantic_pass`) - or any per-file pass,
+    /// which has nothing to record.
+    Complete,
+    /// An incomplete whole-project pass, or a residual pass, left `left`
+    /// owed files; the language is recorded residual and stays owed, and the
+    /// next start asks only those files.
+    Residual { left: usize },
+    /// A residual (or a listed incomplete whole-project) pass left no owed
+    /// file: every file is answered or given up. The caller records the pass
+    /// with `schema::record_language_semantic_pass_settled` (owner decision
+    /// Q3), keeping the given-up files for `g-mesh status`.
+    Settled,
+}
+
+impl SemanticPassOutcome {
+    fn left(left: usize) -> Self {
+        if left == 0 {
+            Self::Settled
+        } else {
+            Self::Residual { left }
+        }
+    }
+}
+
+/// Which files a semantic pass is sent, and how its answer settles them.
+enum Scope {
+    /// Every file: sent no list.
+    WholeProject,
+    /// A per-file pass: `requested` (the edited file) and the language's
+    /// `owed` files ([`schema::owed_files`]) riding along. The pass's scope
+    /// is their union, and a `FileChangeResponse::unfinished_files` list
+    /// settles exactly that scope less the files it names; a requested file
+    /// left unfinished restarts at one attempt, its content having changed.
+    Files { requested: Vec<String>, owed: Vec<String> },
+    /// A residual pass at start: these owed files, each costing one attempt
+    /// when not finished.
+    Residual(Vec<String>),
+}
+
+/// [`apply_semantic_pass`] and [`apply_residual_semantic_pass`] inside an
+/// open unit.
 #[allow(clippy::too_many_arguments)]
 fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
     reader: &mut R,
@@ -252,24 +425,28 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
     store: &mut Writer<'_>,
     language: &str,
     sweep_language: Option<&str>,
-    file_paths: Vec<String>,
-    owed: Vec<String>,
+    scope: Scope,
     request_id: RequestId,
     embedding: &EmbeddingPipeline,
     timeout: Duration,
     on_timeout: &mut dyn FnMut(),
-) -> Result<()> {
-    let whole_project = file_paths.is_empty();
+) -> Result<SemanticPassOutcome> {
+    let whole_project = matches!(scope, Scope::WholeProject);
     // The scope this pass is sent: the requested files, then every owed file
     // not among them. A whole-project pass is sent no list at all.
-    let mut sent = file_paths.clone();
-    if !whole_project {
-        for path in owed {
-            if !sent.contains(&path) {
-                sent.push(path);
+    let (sent, file_paths, residual) = match scope {
+        Scope::WholeProject => (Vec::new(), Vec::new(), false),
+        Scope::Files { requested, owed } => {
+            let mut sent = requested.clone();
+            for path in owed {
+                if !sent.contains(&path) {
+                    sent.push(path);
+                }
             }
+            (sent, requested, false)
         }
-    }
+        Scope::Residual(files) => (files, Vec::new(), true),
+    };
     // Read inside the same unit that committed the reparse (or after the
     // whole-project link), so these are the links of exactly the text the
     // plugin is about to answer for.
@@ -280,33 +457,91 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
             linked.len()
         );
     }
-    let outcome = round_trip(
+    let outcome = match round_trip(
         reader,
         writer,
         store,
-        ControlMessage::SemanticPass { file_paths: sent.clone(), linked_edges: linked },
+        ControlMessage::SemanticPass {
+            file_paths: sent.clone(),
+            linked_edges: linked,
+            // The plugin is told the timeout this round trip is held to, so a
+            // residual pass (many files, the project timeout) and a per-file
+            // one (the flat per-file timeout) can be told apart by budget
+            // rather than by file count (GM-521).
+            budget_ms: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+        },
         None,
         request_id,
         embedding,
         timeout,
         on_timeout,
-    )?;
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // A residual pass that failed outright finished none of its
+            // files: each costs an attempt, or a file whose pass always times
+            // out would be asked on every start for good. Best-effort: the
+            // pass's own error is what the caller records.
+            if residual {
+                if let Err(settle) =
+                    store.step(|conn| schema::settle_owed_files(conn, language, &[], &[], &sent))
+                {
+                    crate::log_line!(
+                        "g-mesh: failed to count an attempt for {language}'s residual files ({settle:#})"
+                    );
+                }
+            }
+            return Err(err);
+        }
+    };
 
     // The diff is committed by now, deliberately: an incomplete pass is a
     // *partial* answer, not a failed one, and everything it did resolve is as
     // real as any other semantic edge (`protocol::types::
     // FileChangeResponse::incomplete` says why the plugin does not report this
     // as a JSON-RPC error instead). What is left to do is refuse to call the
-    // pass finished, which for a whole-project pass is exactly what an `Err`
-    // here means to `daemon::semantic`: `language_state.semanticPassAt` stays
-    // unset and the next daemon start asks this language again.
+    // pass finished. For a whole-project pass that does not name its
+    // unfinished files, that is exactly what an `Err` here means to
+    // `daemon::semantic`: `language_state.semanticPassAt` stays unset and the
+    // next daemon start asks the whole project again. One that names them is
+    // recorded residual instead (GM-521): the named files are owed, the next
+    // start asks only those, and nothing is recorded as a failure.
     //
     // A per-file pass has no completion flag to protect, so an incomplete one
     // is worth a line and nothing more - failing it would only make
     // `apply_file_change` log the same thing twice.
     if outcome.incomplete && whole_project {
         let reason = outcome.incomplete_reason.as_deref().unwrap_or("the plugin gave no reason");
-        bail!("the plugin reported an incomplete whole-project semantic pass: {reason}");
+        let Some(unfinished) = outcome.unfinished_files else {
+            bail!("the plugin reported an incomplete whole-project semantic pass: {reason}");
+        };
+        let left = store
+            .step(|conn| schema::record_language_semantic_residual(conn, language, &unfinished, reason))?;
+        crate::log_line!(
+            "g-mesh: {language}'s whole-project semantic pass was incomplete ({reason}) - {left} file(s) left, \
+             the next start asks only those"
+        );
+        return Ok(SemanticPassOutcome::left(left));
+    }
+    if residual {
+        // No list: a complete answer finished every file sent, an incomplete
+        // one is not known to have finished any.
+        let unfinished: Vec<String> = match &outcome.unfinished_files {
+            Some(named) => sent.iter().filter(|path| named.contains(path)).cloned().collect(),
+            None if outcome.incomplete => sent.clone(),
+            None => Vec::new(),
+        };
+        let settled: Vec<String> = sent.iter().filter(|path| !unfinished.contains(path)).cloned().collect();
+        let left = store.step(|conn| {
+            schema::settle_owed_files(conn, language, &[], &settled, &unfinished)?;
+            schema::owed_files(conn, language).map(|owed| owed.len())
+        })?;
+        crate::log_line!(
+            "g-mesh: {language}'s residual semantic pass finished {} of {} file(s) - {left} left",
+            settled.len(),
+            sent.len()
+        );
+        return Ok(SemanticPassOutcome::left(left));
     }
     if !whole_project {
         if outcome.incomplete {
@@ -365,7 +600,7 @@ fn apply_semantic_pass_in<R: BufRead + Send, W: Write>(
             );
         }
     }
-    Ok(())
+    Ok(SemanticPassOutcome::Complete)
 }
 
 /// The structural edges of `language` that linking moved onto a declaration,
@@ -539,7 +774,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
     let complete = response.result.complete;
     let mut diff = to_storage_diff(response.result, &mut PathWarnings::default());
     match (&request.message, project_root) {
-        (ControlMessage::FileChanged { file_path }, Some(root)) => {
+        (ControlMessage::FileChanged { file_path, .. }, Some(root)) => {
             let scope = file_scope(root, file_path, &diff, complete);
             store.apply_file_diff_linked(&mut diff, file_path, scope, method)?;
         }
@@ -651,6 +886,7 @@ fn method_name(message: &ControlMessage) -> &'static str {
         ControlMessage::WorkspaceChanged { .. } => "workspaceChanged",
         ControlMessage::PrepareSemanticPass => "prepareSemanticPass",
         ControlMessage::FilesCreated { .. } => "filesCreated",
+        ControlMessage::ResolutionChanged { .. } => "resolutionChanged",
     }
 }
 
@@ -847,6 +1083,7 @@ pub(crate) fn to_edge_record(edge: WireEdge) -> EdgeRecord {
     // threaded through `new`.
     record.engine = edge.engine;
     record.to_declaration = edge.to_declaration.map(|ordinal| ordinal as i64);
+    record.specifier = edge.specifier;
     record
 }
 

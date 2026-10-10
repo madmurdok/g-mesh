@@ -53,8 +53,12 @@
 //! Because of this, expectations are only evaluated once that state
 //! genuinely exists: bulk run 1 completed and the control-plane session ran
 //! to its end without its own failure (`mod.rs`'s `session_ready` gate). A
-//! session that failed already has the built-in `session` check failing the
-//! whole report; skipping expectations rather than judging a partial index
+//! whole-project `semanticPass` the plugin reports incomplete is such a
+//! failure even when it names its unfinished files (GM-550): a daemon records
+//! that pass residual and asks those files again on its next start, but a
+//! kit session has no next start, so the index it leaves is not fully
+//! linked. A session that failed already has the built-in `session` check
+//! failing the whole report; skipping expectations rather than judging a partial index
 //! keeps a `Skip` about missing evidence, never a false pass or a false
 //! fail (`report::Outcome::Skip`'s own doc comment).
 //!

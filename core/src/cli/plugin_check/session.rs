@@ -80,11 +80,11 @@ use crate::protocol::jsonrpc::{read_frame, read_message_with_timeout, write_mess
 use crate::protocol::ndjson::BulkItem;
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, Handshake, NodeKind, RequestId,
-    WireNode, JSONRPC_VERSION,
+    ResolutionChangedResponse, ResolutionChangedResult, WireNode, JSONRPC_VERSION,
 };
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::watcher::apply::{apply_file_change, apply_semantic_pass};
+use crate::watcher::apply::{apply_file_change, apply_semantic_pass, SemanticPassOutcome};
 
 /// The directory the kit hands every plugin process it spawns, via this
 /// environment variable, for the plugin-side markers the kit defines.
@@ -970,6 +970,338 @@ pub(crate) fn run_files_created_session(
     finish(driver, Some(rows))
 }
 
+// --- resolution delta ----------------------------------------------------------
+
+/// The `version` a [`VersionBump`] writes when the file declares none; one
+/// that does gets this appended to its own.
+const VERSION_BUMP_SUFFIX: &str = "-plugin-check";
+
+/// `capabilities.resolution-delta-version-bump`'s edit: a fixture watch file
+/// whose only change is a version - an edit no resolution model reads, so a
+/// plugin declaring `resolution_delta` must answer `unchanged`.
+pub(crate) struct VersionBump {
+    /// Workspace-relative, `/`-separated.
+    pub file_path: String,
+    pub original: Vec<u8>,
+    pub edited: Vec<u8>,
+    /// The version that changed, for the report: "the top-level `version`",
+    /// "`[package].version`", "the `require example.com/m` version".
+    pub field: String,
+}
+
+/// The fixture watch file the version bump is made to, and the edit.
+///
+/// The rule, the only language-neutral one a manifest gives enough for: the
+/// shallowest (then path-sorted) file under `workspace`, outside the
+/// manifest's `exclude_dirs`, whose name matches one of its `watch_files` and
+/// that [`version_bump_for`] can bump. Every other byte of the file stays.
+/// `None` when no watch file qualifies (a `setup.cfg`, a JSONC config with
+/// comments, a virtual Cargo workspace with no member manifest).
+pub(crate) fn choose_version_bump(manifest: &PluginManifest, workspace: &Path) -> Option<VersionBump> {
+    let matchers: Vec<_> = manifest.workspace.watch_files.iter().map(|glob| glob.compile_matcher()).collect();
+    let mut found = Vec::new();
+    let mut pending = vec![(workspace.to_path_buf(), String::new())];
+    while let Some((dir, relative)) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = if relative.is_empty() { name.clone() } else { format!("{relative}/{name}") };
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => {
+                    if !manifest.workspace.exclude_dirs.contains(&name) {
+                        pending.push((entry.path(), path));
+                    }
+                }
+                Ok(t) if t.is_file() && matchers.iter().any(|m| m.is_match(&name)) => found.push(path),
+                _ => {}
+            }
+        }
+    }
+    found.sort_by(|a, b| a.matches('/').count().cmp(&b.matches('/').count()).then_with(|| a.cmp(b)));
+    found.into_iter().find_map(|file_path| {
+        let original = fs::read(workspace.join(&file_path)).ok()?;
+        let name = file_path.rsplit('/').next().unwrap_or(&file_path);
+        let (edited, field) = version_bump_for(name, std::str::from_utf8(&original).ok()?)?;
+        Some(VersionBump { file_path, original, edited: edited.into_bytes(), field })
+    })
+}
+
+/// The bumped text of a watch file named `name`, and the version it changed,
+/// by the file's format:
+///
+/// - `Cargo.toml`: `[package].version`, else `[workspace.package].version`
+///   ([`toml_version_bump`]);
+/// - `pyproject.toml`: `[project].version`, else `[tool.poetry].version`;
+/// - `go.mod`: the first `require`d module's version, else the `go`
+///   directive ([`go_mod_version_bump`]);
+/// - any other name: the JSON rule ([`version_bump`]).
+///
+/// `None` when the file has no version of that shape to bump.
+pub(crate) fn version_bump_for(name: &str, text: &str) -> Option<(String, String)> {
+    match name {
+        "Cargo.toml" => toml_version_bump(text, &[&["package"], &["workspace", "package"]]),
+        "pyproject.toml" => toml_version_bump(text, &[&["project"], &["tool", "poetry"]]),
+        "go.mod" => go_mod_version_bump(text),
+        _ => version_bump(text).map(|edited| (edited, "the top-level `version`".to_string())),
+    }
+}
+
+/// `text` (TOML) with the `version` string of the first of `tables` that has
+/// one bumped by [`VERSION_BUMP_SUFFIX`], and that version's name. A
+/// targeted textual edit: the suffix goes in before the closing quote of the
+/// `version = "..."` line under the table's own `[header]`, and the result
+/// is re-parsed and must equal the original but for that one string - so a
+/// `version` in another table, a dotted `version.workspace = true` or a
+/// multi-line string is never the one edited. No `version` is inserted where
+/// there is none: `[project]` may list it in `dynamic`, a Cargo package may
+/// inherit it, and either would make an insertion a real change.
+pub(crate) fn toml_version_bump(text: &str, tables: &[&[&str]]) -> Option<(String, String)> {
+    let original: toml::Table = text.parse().ok()?;
+    tables.iter().find_map(|table| {
+        let mut section = &original;
+        for key in *table {
+            section = section.get(*key)?.as_table()?;
+        }
+        let current = section.get("version")?.as_str()?;
+        let bumped = format!("{current}{VERSION_BUMP_SUFFIX}");
+        let mut expected = original.clone();
+        let mut target = &mut expected;
+        for key in *table {
+            target = target.get_mut(*key)?.as_table_mut()?;
+        }
+        target.insert("version".to_string(), toml::Value::String(bumped));
+        let edited = toml_section_lines(text, table).find_map(|(at, line)| {
+            let close = toml_version_value_end(line)?;
+            let insert_at = at + close;
+            Some(format!("{}{VERSION_BUMP_SUFFIX}{}", &text[..insert_at], &text[insert_at..]))
+        })?;
+        let verified = edited.parse::<toml::Table>().is_ok_and(|parsed| parsed == expected);
+        verified.then(|| (edited, format!("`[{}].version`", table.join("."))))
+    })
+}
+
+/// The lines (byte offset, text without the newline) of the TOML section
+/// headed `[table]`, header excluded, up to the next header.
+fn toml_section_lines<'a>(
+    text: &'a str,
+    table: &'a [&'a str],
+) -> impl Iterator<Item = (usize, &'a str)> + 'a {
+    let mut inside = false;
+    let mut at = 0;
+    text.split_inclusive('\n').filter_map(move |raw| {
+        let start = at;
+        at += raw.len();
+        let line = raw.trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            inside = toml_header_keys(trimmed).is_some_and(|keys| keys == table);
+            return None;
+        }
+        inside.then_some((start, line))
+    })
+}
+
+/// The dotted keys of a `[a.b]` header line (`trimmed` starts with `[`);
+/// `None` for an array-of-tables `[[a]]` header.
+fn toml_header_keys(trimmed: &str) -> Option<Vec<&str>> {
+    let inner = trimmed.strip_prefix('[')?;
+    if inner.starts_with('[') {
+        return None;
+    }
+    let inner = &inner[..inner.find(']')?];
+    Some(inner.split('.').map(|key| key.trim().trim_matches(|c| c == '"' || c == '\'')).collect())
+}
+
+/// For a `version = "..."` (or `'...'`) line, the byte offset in `line` of
+/// the value's closing quote; `None` for any other line, a dotted
+/// `version.x` key, or a multi-line string.
+fn toml_version_value_end(line: &str) -> Option<usize> {
+    let rest = line.trim_start().strip_prefix("version")?;
+    let value = rest.trim_start().strip_prefix('=')?.trim_start();
+    let value_at = line.len() - value.len();
+    let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let body = &value[1..];
+    if body.starts_with(quote) {
+        return None; // `""` empty or `"""` multi-line - neither is bumped
+    }
+    let mut escaped = false;
+    for (i, c) in body.char_indices() {
+        match c {
+            '\\' if quote == '"' && !escaped => escaped = true,
+            c if c == quote && !escaped => return Some(value_at + 1 + i),
+            _ => escaped = false,
+        }
+    }
+    None
+}
+
+/// `text` (a `go.mod`) with one version changed, and which. The first
+/// `require`d module's version (single-line or block form) gets
+/// [`VERSION_BUMP_SUFFIX`] appended - still a valid semver pre-release; a
+/// `+incompatible` or other build-metadata version is passed over. With no
+/// usable `require`, the `go` directive is rewritten to the same language
+/// version: `1.22` becomes `1.22.0` and `1.22.3` becomes `1.22`.
+///
+/// Both are edits the Go plugin's workspace model never reads: it takes only
+/// `module` from a `go.mod` and `use` from a `go.work`
+/// (`plugins/go/workspace.go`'s doc), so its resolution facts cannot move.
+pub(crate) fn go_mod_version_bump(text: &str) -> Option<(String, String)> {
+    let mut in_require_block = false;
+    let mut go_directive = None;
+    let mut at = 0;
+    for raw in text.split_inclusive('\n') {
+        let start = at;
+        at += raw.len();
+        let line = raw.split("//").next().unwrap_or_default();
+        let tokens = go_mod_tokens(line);
+        let words: Vec<&str> = tokens.iter().map(|(_, word)| *word).collect();
+        let required = match words.as_slice() {
+            [")"] if in_require_block => {
+                in_require_block = false;
+                None
+            }
+            ["require", "("] => {
+                in_require_block = true;
+                None
+            }
+            [module, version] if in_require_block => Some((*module, *version, tokens[1].0)),
+            ["require", module, version] => Some((*module, *version, tokens[2].0)),
+            ["go", version] if !in_require_block => {
+                go_directive.get_or_insert((start + tokens[1].0, *version));
+                None
+            }
+            _ => None,
+        };
+        if let Some((module, version, offset)) = required {
+            if version.starts_with('v') && !version.contains('+') {
+                let end = start + offset + version.len();
+                let edited = format!("{}{VERSION_BUMP_SUFFIX}{}", &text[..end], &text[end..]);
+                return Some((edited, format!("the `require {module}` version")));
+            }
+        }
+    }
+    let (offset, version) = go_directive?;
+    let parts: Vec<&str> = version.split('.').collect();
+    if !parts.iter().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let rewritten = match parts.as_slice() {
+        [major, minor] => format!("{major}.{minor}.0"),
+        [major, minor, _] => format!("{major}.{minor}"),
+        _ => return None,
+    };
+    let edited = format!("{}{rewritten}{}", &text[..offset], &text[offset + version.len()..]);
+    Some((edited, "the `go` directive".to_string()))
+}
+
+/// `line`'s whitespace-separated words and their byte offsets.
+fn go_mod_tokens(line: &str) -> Vec<(usize, &str)> {
+    let mut tokens = Vec::new();
+    let mut word_start = None;
+    for (i, c) in line.char_indices().chain(std::iter::once((line.len(), ' '))) {
+        match (c.is_whitespace(), word_start) {
+            (true, Some(from)) => {
+                tokens.push((from, &line[from..i]));
+                word_start = None;
+            }
+            (false, None) => word_start = Some(i),
+            _ => {}
+        }
+    }
+    tokens
+}
+
+/// `text` (JSON) with its top-level `version` string bumped: it gets
+/// [`VERSION_BUMP_SUFFIX`] appended, or one is inserted when it has none.
+/// `None` when `text` is not a JSON object, its `version` is not a string,
+/// or no textual edit verifies:
+/// each candidate is re-parsed and must equal the original but for
+/// `version`, so a nested `"version"` key is never the one edited.
+pub(crate) fn version_bump(text: &str) -> Option<String> {
+    let serde_json::Value::Object(original) = serde_json::from_str(text).ok()? else { return None };
+    let (bumped, candidates): (String, Vec<String>) = match original.get("version") {
+        None => {
+            let open = text.find('{')?;
+            let bumped = format!("0.0.0{VERSION_BUMP_SUFFIX}");
+            let separator = if original.is_empty() { "" } else { "," };
+            let edited =
+                format!("{}\"version\": \"{bumped}\"{separator}{}", &text[..=open], &text[open + 1..]);
+            (bumped, vec![edited])
+        }
+        Some(serde_json::Value::String(current)) => {
+            let bumped = format!("{current}{VERSION_BUMP_SUFFIX}");
+            let quoted = serde_json::to_string(current).ok()?;
+            let candidates = text
+                .match_indices("\"version\"")
+                .filter_map(|(at, key)| {
+                    let rest = &text[at + key.len()..];
+                    let after_colon = rest.trim_start().strip_prefix(':')?;
+                    let value_at = text.len() - after_colon.trim_start().len();
+                    text[value_at..].starts_with(&quoted).then(|| {
+                        let replacement = serde_json::to_string(&bumped).unwrap_or_default();
+                        format!("{}{replacement}{}", &text[..value_at], &text[value_at + quoted.len()..])
+                    })
+                })
+                .collect();
+            (bumped, candidates)
+        }
+        Some(_) => return None,
+    };
+    let mut expected = original;
+    expected.insert("version".to_string(), serde_json::Value::String(bumped));
+    candidates.into_iter().find(|edited| {
+        serde_json::from_str::<serde_json::Value>(edited)
+            .is_ok_and(|value| value.as_object().is_some_and(|object| *object == expected))
+    })
+}
+
+/// What [`run_resolution_delta_session`] observed. `session.failure` set
+/// means it did not reach a verdict; `result` is then `None`.
+pub(crate) struct ResolutionDeltaRun {
+    pub session: Session,
+    pub result: Option<ResolutionChangedResult>,
+}
+
+/// Puts the watch file back however the run ends - the expectations
+/// evaluated after it must see the fixture as it was.
+struct Restore<'a> {
+    path: PathBuf,
+    original: &'a [u8],
+}
+
+impl Drop for Restore<'_> {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.path, self.original);
+    }
+}
+
+/// Drives `capabilities.resolution-delta-version-bump`'s session: a fresh
+/// plugin process, the bump written to disk, then one `resolutionChanged`
+/// carrying bulk run 1's `resolutionFacts` - what core would send on that
+/// save - and the file restored.
+pub(crate) fn run_resolution_delta_session(
+    manifest: &PluginManifest,
+    scratch: &Scratch,
+    conn: &IndexStore,
+    bump: &VersionBump,
+    previous_facts: String,
+    timeouts: RoundTripTimeouts,
+) -> ResolutionDeltaRun {
+    let mut driver = match Driver::spawn(manifest, scratch, conn, timeouts) {
+        Ok(driver) => driver,
+        Err(session) => return ResolutionDeltaRun { session: *session, result: None },
+    };
+    let path = scratch.workspace().join(&bump.file_path);
+    let label = format!("resolution-delta: resolutionChanged ({} after a version bump)", bump.file_path);
+    let _restore = Restore { path: path.clone(), original: &bump.original };
+    if let Err(err) = fs::write(&path, &bump.edited) {
+        driver.session.failure = Some(format!("{label}: failed to write {}: {err}", path.display()));
+        return ResolutionDeltaRun { session: driver.finish(), result: None };
+    }
+    let result = driver.resolution_changed(&label, &bump.file_path, Some(previous_facts));
+    ResolutionDeltaRun { session: driver.finish(), result }
+}
+
 // --- control plane ------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1394,10 +1726,79 @@ impl<'a> Driver<'a> {
                     &embedding,
                     *timeout,
                     &mut kill,
-                ),
+                )
+                // A listed incomplete pass is recorded residual in the scratch
+                // index like any other, which a daemon then finishes on its
+                // next start. A kit session has no next start, and its
+                // expectations need the fully linked index a completed session
+                // leaves behind, so a pass that left files owed fails the
+                // session, quoting the plugin's own reason (GM-550).
+                .and_then(|outcome| match outcome {
+                    SemanticPassOutcome::Residual { left } if left > 0 => {
+                        let reason = schema::semantic_residual_reason(&conn.read(), language)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| "the plugin gave no reason".to_string());
+                        bail!("the whole-project semantic pass left {left} file(s) unfinished: {reason}")
+                    }
+                    _ => Ok(()),
+                }),
             }
         };
         self.record(label, result)
+    }
+
+    /// Sends one `resolutionChanged` request - the envelope
+    /// `PluginProcess::send_resolution_changed` builds - and reads its answer
+    /// under the `fileChanged` timeout. `None` when the session cannot
+    /// continue (the failure is recorded).
+    fn resolution_changed(
+        &mut self,
+        label: &str,
+        file: &str,
+        previous_facts: Option<String>,
+    ) -> Option<ResolutionChangedResult> {
+        let id = RequestId::Number(self.next_id);
+        self.next_id += 1;
+        let envelope = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(id.clone()),
+            message: ControlMessage::ResolutionChanged { file_path: file.to_string(), previous_facts },
+        };
+        let answer = {
+            let Driver { child, reader, writer, timeouts, .. } = self;
+            let mut kill = || {
+                let _ = child.kill();
+            };
+            write_message(writer, &envelope)
+                .context("failed to write the resolutionChanged request")
+                .and_then(|()| {
+                    read_message_with_timeout::<ResolutionChangedResponse, _>(
+                        reader,
+                        timeouts.file_changed,
+                        &mut kill,
+                    )
+                    .context("failed to read the plugin's resolutionChanged response")?
+                    .context("the plugin closed its output before answering resolutionChanged")
+                })
+                .and_then(|response| {
+                    if response.id != id {
+                        bail!(
+                            "resolutionChanged response id {:?} does not match request id {:?}",
+                            response.id,
+                            id
+                        );
+                    }
+                    Ok(response.result)
+                })
+        };
+        match answer {
+            Ok(result) => self.record(label, Ok(())).then_some(result),
+            Err(err) => {
+                self.record(label, Err(err));
+                None
+            }
+        }
     }
 
     /// Writes `message` as an id-less notification - the envelope
@@ -1443,7 +1844,7 @@ impl<'a> Driver<'a> {
                 continue;
             };
             let (method, file_paths) = match envelope.message {
-                ControlMessage::FileChanged { file_path } => (Method::FileChanged, vec![file_path]),
+                ControlMessage::FileChanged { file_path, .. } => (Method::FileChanged, vec![file_path]),
                 ControlMessage::SemanticPass { file_paths, .. } => (Method::SemanticPass, file_paths),
                 _ => continue,
             };

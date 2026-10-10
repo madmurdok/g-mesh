@@ -670,7 +670,7 @@ impl Declarer<'_, '_> {
             PathTarget::Container(container) => container.clone(),
             PathTarget::ExternalCrate(krate) => {
                 let krate = krate.clone();
-                self.import_edge(target, &krate, range);
+                self.import_edge(target, &spell(&leaf.prefix), range);
                 if let LeafKind::Named { name, alias } = leaf.kind {
                     self.model.import(&module.key, alias.unwrap_or(name), Import::External);
                     // A private row, as for a project item, where a child
@@ -693,7 +693,7 @@ impl Declarer<'_, '_> {
             }
             PathTarget::Unresolved => return,
         };
-        self.import_edge(PathTarget::Container(container.clone()), "", range);
+        self.import_edge(PathTarget::Container(container.clone()), &spell(&leaf.prefix), range);
 
         match leaf.kind {
             LeafKind::Named { name, alias } => {
@@ -723,7 +723,8 @@ impl Declarer<'_, '_> {
                 // `from a.b import c`.
                 let submodule = format!("{container}::{name}");
                 if self.project.has_container(&submodule) {
-                    self.import_edge(PathTarget::Container(submodule), name, range);
+                    let specifier = format!("{}::{name}", spell(&leaf.prefix));
+                    self.import_edge(PathTarget::Container(submodule), &specifier, range);
                 }
                 // A private named `use` is a row only where a descendant can
                 // follow it: this module's own uses of the name are already
@@ -769,8 +770,9 @@ impl Declarer<'_, '_> {
         );
     }
 
-    /// The `IMPORTS` edge from this file onto whatever a `use` prefix named.
-    fn import_edge(&mut self, target: PathTarget, name: &str, range: g_mesh_plugin_sdk::wire::Range) {
+    /// The `IMPORTS` edge from this file onto whatever a `use` prefix named,
+    /// carrying `specifier`, the path as written ([`spell`]).
+    fn import_edge(&mut self, target: PathTarget, specifier: &str, range: g_mesh_plugin_sdk::wire::Range) {
         let file = self.emitter.file_id().to_string();
         let to = match target {
             PathTarget::Container(container) => self.emitter.placeholder(
@@ -780,13 +782,27 @@ impl Declarer<'_, '_> {
                 range,
             ),
             PathTarget::ExternalCrate(krate) => self.emitter.external_module(&krate, range),
-            PathTarget::Unresolved => {
-                let _ = name;
-                return;
-            }
+            PathTarget::Unresolved => return,
         };
-        self.emitter.placeholder_edge(EdgeKind::Imports, &file, &to);
+        self.emitter.import_edge(&file, &to, specifier);
     }
+}
+
+/// A module path as written, `crate::a::b` or `super::x`: the `specifier` of
+/// the `IMPORTS` edge it draws. Matched by a resolution delta only for a path
+/// rooted at a crate name; an in-crate path (`crate::`, `self::`, `super::`)
+/// is matched by its stored target key instead (GM-509 design, section 3.6).
+fn spell(segments: &[Seg<'_>]) -> String {
+    segments
+        .iter()
+        .map(|seg| match seg {
+            Seg::Crate => "crate",
+            Seg::SelfMod => "self",
+            Seg::Super => "super",
+            Seg::Name(name) => name,
+        })
+        .collect::<Vec<_>>()
+        .join("::")
 }
 
 /// `std::io` for an external `use std::io::Error;`'s prefix: the path as

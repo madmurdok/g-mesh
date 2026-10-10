@@ -93,6 +93,9 @@ use crate::semantic::{SemanticAnswer, SemanticEngine};
 ///   quarters and four fifths of its numbers, so the bridge gives up and
 ///   reports an incomplete pass before core's timer gives up on the bridge.
 /// - **`single_file` (90s)** against core's flat 120s, for the same reason.
+///   These three apply only when core sent no `budgetMs` (a core older than
+///   GM-521); when it did, the pass plans to three quarters of core's own
+///   deadline instead - see [`LspBridge::pass_deadline`].
 /// - **`readiness` (10 minutes) and `settle` (2s).** See [`LspBridge`]'s doc
 ///   on readiness. The readiness wait is *inside* the pass budget too, so a
 ///   server that never loads costs a pass rather than a plugin.
@@ -395,6 +398,20 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// `an_indexing_server_is_not_believed_early_even_when_the_manifest_says_on_demand`
 /// is that case, and it is the test that fails if any of the above is removed.
 ///
+/// **A server that says when it has finished loading is asked to** (GM-550).
+/// rust-analyzer 1.97 under load paused 2.04s and 2.47s between `Fetching`
+/// and `Building CrateGraph` - longer than the settle - and the bridge called
+/// it ready inside the gap. [`LspBridge::quiescent_signal`] advertises
+/// rust-analyzer's `experimental.serverStatusNotification` capability; the
+/// server then reports `quiescent: false` from its first progress until the
+/// last start-up phase (cache priming included) has ended, and `true` within
+/// milliseconds of that. The client counts `quiescent: false` as work in
+/// flight, so no gap between phases reads as quiet, and the first settle
+/// needs only "quiescent and nothing in flight" - see [`LspClient::settle`]
+/// for the two cases that keep the quiet period (a server that sends no
+/// status, and the settle after a `workspaceChanged`) and for the bound on a
+/// server that never reports `true`.
+///
 /// Readiness is not only a startup condition: a server may begin indexing
 /// again mid-pass (it usually does, after `didChange`). An empty answer that
 /// arrives before the server is quiet again is therefore re-asked once, after
@@ -520,6 +537,12 @@ pub struct LspBridge {
     /// keyed by their file - see [`trim_untyped_calls`]. Only what lets a later
     /// pass put a name back when its answers stop arriving.
     trimmed: BTreeMap<RelPath, BTreeSet<String>>,
+    /// Core's deadline for the pass about to be answered, when core sent one
+    /// (`budgetMs`, GM-521) - see [`LspBridge::pass_deadline`].
+    core_deadline: Option<Instant>,
+    /// Whether readiness reads the server's `experimental/serverStatus`
+    /// `quiescent` bit - see [`LspBridge::quiescent_signal`].
+    quiescent_signal: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -561,6 +584,18 @@ impl LspBridge {
         self
     }
 
+    /// Asks the server for rust-analyzer's `experimental/serverStatus`
+    /// notification and believes it ready when it reports `quiescent: true`
+    /// with nothing in flight, rather than after [`Budgets::settle`] of
+    /// silence - see this type's doc on readiness (GM-550). For a server whose
+    /// start-up phases can be separated by gaps longer than the settle. A
+    /// server that never sends a status keeps the quiet-period rule.
+    #[must_use]
+    pub fn quiescent_signal(mut self) -> Self {
+        self.quiescent_signal = true;
+        self
+    }
+
     /// [`LspBridge::new`] with budgets a test can make small - see
     /// [`Budgets`].
     pub fn with_budgets(language: &str, root: &Path, config: SemanticConfig, budgets: Budgets) -> Self {
@@ -581,10 +616,38 @@ impl LspBridge {
             opened: BTreeMap::new(),
             emitted: BTreeMap::new(),
             trimmed: BTreeMap::new(),
+            core_deadline: None,
+            quiescent_signal: false,
         }
     }
 
-    /// The whole budget for one pass - see [`Budgets`].
+    /// When the pass that starts at `started` must be done.
+    ///
+    /// Core sent its own deadline (`budgetMs`, GM-521): the pass plans to
+    /// three quarters of the time left until it, and the last quarter is the
+    /// margin for building, writing and sending the answer. Three quarters is
+    /// the ratio [`Budgets`]' own numbers keep to core's defaults (15 of 20
+    /// minutes, 90 of 120 seconds), so with core's default timeouts a pass
+    /// gets about what it got before - but now also for a residual pass,
+    /// whose many files arrive as a per-file-shaped list that only core's
+    /// budget tells apart from a per-file pass, and under an overridden core
+    /// timeout. Reckoned from `started` rather than from the request, so time
+    /// already spent before the engine was asked (hydration) is not planned
+    /// twice; it can only make the plan shorter, never past core's deadline.
+    ///
+    /// No deadline from core (an older core): [`Self::pass_budget`], today's
+    /// rules.
+    fn pass_deadline(&self, started: Instant, whole_project: bool, files: usize) -> Instant {
+        match self.core_deadline {
+            Some(core) => {
+                let remaining = core.saturating_duration_since(started);
+                started + (remaining - remaining / 4)
+            }
+            None => started + self.pass_budget(whole_project, files),
+        }
+    }
+
+    /// The whole budget for one pass when core sent none - see [`Budgets`].
     fn pass_budget(&self, whole_project: bool, files: usize) -> Duration {
         if !whole_project {
             return self.budgets.single_file;
@@ -612,7 +675,8 @@ impl LspBridge {
                 return None;
             }
             self.starts += 1;
-            match LspClient::start(&self.language, &self.config, &self.root, deadline) {
+            match LspClient::start(&self.language, &self.config, &self.root, deadline, self.quiescent_signal)
+            {
                 Ok(client) => self.client = Some(client),
                 Err(err) => {
                     self.start_failure = Some(format!(
@@ -1696,6 +1760,7 @@ impl Answers {
                 to_declaration: edge.to_declaration,
                 source: SourceTier::Semantic,
                 engine,
+                specifier: None,
             });
         }
         // The nodes, now that every site addressing each one has been seen. In
@@ -2723,6 +2788,10 @@ impl SemanticEngine for LspBridge {
         self.ensure_client(deadline);
     }
 
+    fn set_pass_deadline(&mut self, deadline: Option<Instant>) {
+        self.core_deadline = deadline;
+    }
+
     fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer> {
         let whole_project = files.is_empty();
         // What this pass was sent - core adds the files earlier passes did not
@@ -2741,7 +2810,7 @@ impl SemanticEngine for LspBridge {
         }
 
         let started = Instant::now();
-        let deadline = started + self.pass_budget(whole_project, scope.len());
+        let deadline = self.pass_deadline(started, whole_project, scope.len());
         let plan = questions(index, &scope, &self.config, &self.budgets);
         if plan.unanswerable > 0 {
             crate::log_line!(
@@ -3263,6 +3332,46 @@ mod tests {
         }
         assert!(bridge.pass_budget(false, 1) < Duration::from_secs(120));
         assert!(budgets.readiness <= budgets.project_floor);
+    }
+
+    /// With core's deadline, a pass plans to three quarters of the time left
+    /// until it, whatever its shape: a many-file per-file-shaped pass under
+    /// 120s plans 90s, not 8s a file. A deadline already past plans nothing.
+    ///
+    /// Control: ignore `core_deadline` in `pass_deadline`.
+    #[test]
+    fn with_cores_deadline_a_pass_plans_three_quarters_of_the_time_left() {
+        let mut bridge = LspBridge::new("toy", Path::new("/p"), SemanticConfig::new("toy-server"));
+        let started = Instant::now();
+
+        bridge.set_pass_deadline(Some(started + Duration::from_secs(120)));
+        assert_eq!(bridge.pass_deadline(started, false, 1_000), started + Duration::from_secs(90));
+        assert_eq!(bridge.pass_deadline(started, true, 1_000), started + Duration::from_secs(90));
+
+        bridge.set_pass_deadline(Some(started + Duration::from_secs(20 * 60)));
+        assert_eq!(bridge.pass_deadline(started, true, 10), started + Duration::from_secs(15 * 60));
+
+        let later = started + Duration::from_secs(10);
+        bridge.set_pass_deadline(Some(started));
+        assert_eq!(bridge.pass_deadline(later, true, 10), later, "a past deadline leaves no time to plan");
+    }
+
+    /// Without core's deadline - never sent, or cleared by a pass without
+    /// one - the bridge's own budgets apply.
+    #[test]
+    fn without_cores_deadline_a_pass_plans_its_own_budget() {
+        let mut bridge = LspBridge::new("toy", Path::new("/p"), SemanticConfig::new("toy-server"));
+        let started = Instant::now();
+        for (whole_project, files) in [(false, 1_000), (true, 10), (true, 1_000)] {
+            assert_eq!(
+                bridge.pass_deadline(started, whole_project, files),
+                started + bridge.pass_budget(whole_project, files)
+            );
+        }
+
+        bridge.set_pass_deadline(Some(started + Duration::from_secs(120)));
+        bridge.set_pass_deadline(None);
+        assert_eq!(bridge.pass_deadline(started, true, 1_000), started + Duration::from_secs(8_000));
     }
 
     // --- GM-486: untyped receiver calls the semantic tier answered ---------

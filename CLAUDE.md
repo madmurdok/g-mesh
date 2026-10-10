@@ -55,3 +55,18 @@ question — a full read early gets carried through every later turn.
 See [`docs/adr/README.md`](docs/adr/README.md) for the ADR index —
 existing design decisions (indexed from `docs/architecture/`) and new ones
 going forward.
+
+## Testing
+
+The suite runs as named sections (`scripts/test-sections.sh`,
+[ADR 0030](docs/adr/0030-test-sections.md)). A verify slice runs the sections
+its change can affect, diffed against the release branch the task branched
+from:
+
+```
+scripts/test-sections.sh run $(scripts/test-select.sh --base <release-branch>)
+```
+
+`test-select.sh` prints `full`, `none` or section names, and counts
+uncommitted and untracked files too. Any path it has no rule for selects
+`full`. The release gate (`scripts/cut-release.sh`) always runs every section.

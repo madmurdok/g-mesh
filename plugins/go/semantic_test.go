@@ -194,7 +194,7 @@ func TestSemanticPassResolvesEveryOpenShape(t *testing.T) {
 	root := writeProbeProject(t)
 
 	state := newPluginState(root)
-	diff, reason := state.handleSemanticPass(nil)
+	diff, reason, _ := state.handleSemanticPass(nil)
 	if reason != "" {
 		t.Fatalf("a whole-project pass with a toolchain present answered incomplete: %s", reason)
 	}
@@ -262,7 +262,7 @@ func TestSemanticPassRetractsCallsOntoAType(t *testing.T) {
 	}
 
 	state := newPluginState(root)
-	diff, _ := state.handleSemanticPass(nil)
+	diff, _, _ := state.handleSemanticPass(nil)
 
 	retracted := map[string]bool{}
 	for _, id := range diff.DeleteEdgeIds {
@@ -289,8 +289,8 @@ func TestSemanticPassIsDeterministic(t *testing.T) {
 	requireGoToolchain(t)
 	root := writeProbeProject(t)
 
-	firstDiff, _ := newPluginState(root).handleSemanticPass(nil)
-	secondDiff, _ := newPluginState(root).handleSemanticPass(nil)
+	firstDiff, _, _ := newPluginState(root).handleSemanticPass(nil)
+	secondDiff, _, _ := newPluginState(root).handleSemanticPass(nil)
 	first := renderEdges(t, root, firstDiff)
 	second := renderEdges(t, root, secondDiff)
 	if !equalStrings(first, second) {
@@ -370,7 +370,7 @@ func TestSemanticPassExcludesAnInterfaceFromItsOwnImplementors(t *testing.T) {
 	root := writeSelfImplementsProject(t)
 
 	state := newPluginState(root)
-	diff, _ := state.handleSemanticPass(nil)
+	diff, _, _ := state.handleSemanticPass(nil)
 	got := renderEdges(t, root, diff)
 	want := []string{
 		"talk.go:Loud SUPERTYPE_OF example.com/subprobe#Talker",
@@ -392,7 +392,7 @@ func TestSemanticPassPerFileAnswersOnlyThatFile(t *testing.T) {
 	root := writeProbeProject(t)
 
 	state := newPluginState(root)
-	diff, _ := state.handleSemanticPass([]string{"dotuse.go"})
+	diff, _, _ := state.handleSemanticPass([]string{"dotuse.go"})
 	got := renderEdges(t, root, diff)
 	want := []string{"dotuse.go:dotImported CALLS example.com/probe/dotted#DotFunc"}
 	if !equalStrings(got, want) {
@@ -411,7 +411,7 @@ func TestSemanticPassRetractsWhatAReCheckNoLongerProduces(t *testing.T) {
 	root := writeProbeProject(t)
 
 	state := newPluginState(root)
-	before, _ := state.handleSemanticPass(nil)
+	before, _, _ := state.handleSemanticPass(nil)
 
 	var dotCall string
 	for _, edge := range before.UpsertEdges {
@@ -433,7 +433,7 @@ func TestSemanticPassRetractsWhatAReCheckNoLongerProduces(t *testing.T) {
 		t.Fatalf("rewrite dotuse.go: %v", err)
 	}
 
-	after, _ := state.handleSemanticPass([]string{"dotuse.go"})
+	after, _, _ := state.handleSemanticPass([]string{"dotuse.go"})
 	retracted := false
 	for _, id := range after.DeleteEdgeIds {
 		if id == dotCall {
@@ -470,7 +470,7 @@ func TestSemanticPassWithoutAToolchainAnswersAnEmptyDiff(t *testing.T) {
 	}
 
 	for _, filePaths := range [][]string{nil, {"use.go"}} {
-		diff, reason := state.handleSemanticPass(filePaths)
+		diff, reason, _ := state.handleSemanticPass(filePaths)
 		if len(diff.UpsertNodes) != 0 || len(diff.UpsertEdges) != 0 ||
 			len(diff.DeleteNodeIds) != 0 || len(diff.DeleteEdgeIds) != 0 {
 			t.Fatalf("semanticPass(%v) without a toolchain answered %+v, want an empty diff", filePaths, diff)

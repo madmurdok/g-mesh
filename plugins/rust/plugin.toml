@@ -78,6 +78,14 @@ receiver_calls_structural = "unresolved"
 # rule would be wrong here); core reads that edge for `find_callers`'
 # `overrides` field.
 member_overrides = "declared"
+# A save of a watch file asks the plugin what it changed for resolution
+# (`resolutionChanged`), and core re-extracts only the files whose container
+# key moved and the importers it names instead of the whole language: a
+# dependency or version edit re-extracts nothing, and a changed set of crate
+# names reindexes the language. The bulk walk ends with the facts that answer
+# compares against, and every `IMPORTS` edge carries its path as written
+# (src/project/facts.rs, docs/architecture/gm-509-selective-config-reindex.md).
+resolution_delta = true
 
 # How to start rust-analyzer. Read by *this plugin*, never by core - core has
 # no use for the fields and validating them would make a typo here take the
@@ -95,9 +103,9 @@ engine = "rust-analyzer"
 # The `nativeKind` this extractor gives a `trait_item` (src/extractor/
 # decls.rs). It is the one language-shaped fact the bridge is handed rather
 # than knowing: these are the nodes it asks `textDocument/implementation`
-# about, which is how an `impl` in *another crate* of the workspace becomes a
-# `SUPERTYPE_OF` edge - no `use` in that crate resolves structurally when the
-# trait arrives through a glob import, so nothing but this sweep finds it.
+# about, which is how an `impl` the parser cannot see (one a `macro_rules!`
+# from another crate writes) becomes a `SUPERTYPE_OF` edge. A trait reached
+# through a glob import resolves structurally since GM-537.
 implementation_kinds = ["trait"]
 
 # The default, stated out loud so the trace behind it has somewhere to live.
@@ -153,9 +161,9 @@ checkOnSave = false
 
 [plugin.workspace]
 # A workspace's own Cargo.toml, or a crate's: either can move crate roots or
-# the module tree (members/exclude, [lib]/[[bin]] paths), so either must
-# trigger the per-language reindex this plugin answers with a fresh
-# `load_project` (see `ProjectContext::reload` / `Extractor::load_project`).
+# the module tree (members/exclude, [lib]/[[bin]] paths), so a save of either
+# reloads the model (`Extractor::load_project`) and re-extracts what it moved
+# (`resolution_delta` above).
 watch_files = ["Cargo.toml"]
 # cargo's own build output - never source, and excluded from the walk the
 # same way `node_modules`/`dist` are for TypeScript. This list must equal

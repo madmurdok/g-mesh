@@ -517,6 +517,14 @@ pub struct WireEdge {
     /// overwriting the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_declaration: Option<u32>,
+    /// **`IMPORTS` edges only:** the import's raw text as written in the
+    /// importing file (a module specifier, a crate path, a dotted name). Core
+    /// stores it beside the edge, and it survives linking, so a
+    /// [`ImportMatch::Specifier`] selector can still find the importer after
+    /// the edge was repointed onto its target. Absent on every other edge,
+    /// and from a plugin that does not declare `resolution_delta`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specifier: Option<String>,
 }
 
 /// JSON-RPC request id - either form is legal per the JSON-RPC 2.0 spec.
@@ -555,6 +563,13 @@ pub enum ControlMessage {
     #[serde(rename_all = "camelCase")]
     FileChanged {
         file_path: String,
+        /// Extract the file even if its text is what the plugin last
+        /// extracted: something the extraction reads besides the text (a
+        /// resolution config) changed. The plugin keeps its baseline, so the
+        /// answer is still a diff against what it last sent. Absent means
+        /// `false`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        reextract: bool,
     },
     Status,
     /// Asks the plugin's semantic layer to re-answer what the structural
@@ -580,6 +595,16 @@ pub enum ControlMessage {
         /// Absent and empty are the same: nothing linked in scope.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         linked_edges: Vec<LinkedEdge>,
+        /// How long core waits for this pass's answer, in milliseconds: the
+        /// round-trip timeout core applies to this very request (GM-521) -
+        /// `semantic_pass_project_timeout(n)` for a whole-project or residual
+        /// pass, the per-file timeout for a per-file one. A plugin that plans
+        /// its work against a clock plans inside it, since core kills a
+        /// plugin that answers later. Optional, no protocol bump: absent
+        /// means unknown (an older core), and a plugin that ignores it keeps
+        /// its own budgets.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_ms: Option<u64>,
     },
     /// Tells a plugin its cached module/crate map is stale - a workspace
     /// file changed (`plugin.toml`'s `workspace.watch_files`, e.g. `go.mod`,
@@ -617,6 +642,152 @@ pub enum ControlMessage {
     FilesCreated {
         file_paths: Vec<String>,
     },
+    /// A request: a watch file (`plugin.toml`'s `workspace.watch_files`)
+    /// changed. The plugin reloads its project model and compares the facts
+    /// its resolution reads with `previous_facts`, the opaque blob it handed
+    /// core with the rows the index holds now. It answers with a
+    /// [`ResolutionChangedResult`]: what the edit changed for resolution, and
+    /// the new blob.
+    ///
+    /// Sent only to a plugin whose manifest declares
+    /// `capabilities.resolution_delta`; every other plugin gets
+    /// [`ControlMessage::WorkspaceChanged`] and a whole-language reindex.
+    /// `previous_facts` absent means core holds none, and the plugin answers
+    /// [`ResolutionDelta::Unknown`].
+    #[serde(rename_all = "camelCase")]
+    ResolutionChanged {
+        file_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_facts: Option<String>,
+    },
+}
+
+/// The JSON-RPC 2.0 response to [`ControlMessage::ResolutionChanged`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolutionChangedResponse {
+    pub jsonrpc: String,
+    pub id: RequestId,
+    pub result: ResolutionChangedResult,
+}
+
+/// A plugin's answer to [`ControlMessage::ResolutionChanged`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolutionChangedResult {
+    pub delta: ResolutionDelta,
+    /// The resolution facts of the reloaded model, which core stores in place
+    /// of the previous ones once it has acted on `delta`. Absent: core keeps
+    /// none, and the next edit falls back to a whole-language reindex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<String>,
+}
+
+/// What a watch-file edit changed for resolution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ResolutionDelta {
+    /// Nothing resolution reads changed: no file is re-extracted.
+    Unchanged,
+    /// The plugin cannot say what changed: core reindexes the whole language.
+    Unknown {
+        #[serde(default)]
+        reason: String,
+    },
+    /// Re-extract every indexed file of the language inside one of `files`,
+    /// and every importer one of `imports` selects.
+    Affected {
+        #[serde(default)]
+        files: Vec<PathScope>,
+        #[serde(default)]
+        imports: Vec<ImportSelector>,
+    },
+}
+
+/// A set of project-relative paths: those under `under` and under none of
+/// `not_under`. A directory matches on a `/` boundary; `""` is the whole
+/// project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathScope {
+    pub under: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_under: Vec<String>,
+}
+
+impl PathScope {
+    /// Whether `path` lies in this scope.
+    pub fn contains(&self, path: &str) -> bool {
+        path_is_under(path, &self.under) && !self.not_under.iter().any(|dir| path_is_under(path, dir))
+    }
+}
+
+fn path_is_under(path: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches('/');
+    dir.is_empty() || path == dir || (path.starts_with(dir) && path.as_bytes().get(dir.len()) == Some(&b'/'))
+}
+
+/// The importing files whose `IMPORTS` edges `by` matches, restricted to
+/// those in `importers`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSelector {
+    pub importers: PathScope,
+    pub by: ImportMatch,
+}
+
+/// Which part of a stored import a selector matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImportMatch {
+    /// The import's raw text ([`WireEdge::specifier`]).
+    Specifier(Matcher),
+    /// What the import is stored as pointing at: a linked edge's target
+    /// file path or container key, or an unlinked placeholder's scope.
+    #[serde(rename_all = "camelCase")]
+    Target { scope_kind: TargetScopeKind, matcher: Matcher },
+}
+
+/// Which kind of stored target an [`ImportMatch::Target`] compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TargetScopeKind {
+    File,
+    Container,
+}
+
+/// A test on one string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Matcher {
+    Exact(String),
+    /// `s == prefix`, or `s` starts with `prefix` followed by `separator`:
+    /// `pkg.sub` does not match `pkg.subtle`.
+    #[serde(rename_all = "camelCase")]
+    Under {
+        prefix: String,
+        separator: String,
+    },
+    StartsWith(String),
+    /// A TypeScript-style non-relative specifier: one that starts with none
+    /// of `.`, `/` and `#`.
+    NonRelative,
+}
+
+impl Matcher {
+    /// Whether `s` passes this test.
+    pub fn matches(&self, s: &str) -> bool {
+        match self {
+            Matcher::Exact(exact) => s == exact,
+            Matcher::Under { prefix, separator } => {
+                s == prefix
+                    || (!separator.is_empty()
+                        && s.strip_prefix(prefix.as_str())
+                            .is_some_and(|rest| rest.starts_with(separator.as_str())))
+            }
+            Matcher::StartsWith(prefix) => s.starts_with(prefix.as_str()),
+            Matcher::NonRelative => !s.is_empty() && !s.starts_with(['.', '/', '#']),
+        }
+    }
 }
 
 /// LSP-style JSON-RPC 2.0 envelope for the control plane. Framing
@@ -787,6 +958,7 @@ mod tests {
             engine: "ts-compiler".to_string(),
             resolved: true,
             to_declaration: None,
+            specifier: None,
         };
 
         let json = serde_json::to_string(&edge).unwrap();
@@ -957,6 +1129,7 @@ mod tests {
             engine: "tree-sitter".to_string(),
             resolved: false,
             to_declaration: None,
+            specifier: None,
         };
         assert!(!serde_json::to_string(&unbound).unwrap().contains("toDeclaration"));
 
@@ -1039,7 +1212,7 @@ mod tests {
         let envelope = ControlEnvelope {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: None,
-            message: ControlMessage::FileChanged { file_path: "src/main.rs".to_string() },
+            message: ControlMessage::FileChanged { file_path: "src/main.rs".to_string(), reextract: false },
         };
 
         let json = serde_json::to_string(&envelope).unwrap();
@@ -1056,6 +1229,7 @@ mod tests {
             message: ControlMessage::SemanticPass {
                 file_paths: vec!["src/a.ts".to_string(), "src/b.ts".to_string()],
                 linked_edges: Vec::new(),
+                budget_ms: None,
             },
         };
 
@@ -1075,7 +1249,11 @@ mod tests {
         let envelope = ControlEnvelope {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: Some(RequestId::Number(1)),
-            message: ControlMessage::SemanticPass { file_paths: Vec::new(), linked_edges: Vec::new() },
+            message: ControlMessage::SemanticPass {
+                file_paths: Vec::new(),
+                linked_edges: Vec::new(),
+                budget_ms: None,
+            },
         };
 
         let json = serde_json::to_string(&envelope).unwrap();
@@ -1095,6 +1273,7 @@ mod tests {
             message: ControlMessage::SemanticPass {
                 file_paths: vec!["src/a.rs".to_string()],
                 linked_edges: Vec::new(),
+                budget_ms: None,
             },
         };
         let json = serde_json::to_string(&empty).unwrap();
@@ -1113,12 +1292,47 @@ mod tests {
             message: ControlMessage::SemanticPass {
                 file_paths: Vec::new(),
                 linked_edges: vec![LinkedEdge { edge_id: "x".to_string(), to_id: "d".to_string() }],
+                budget_ms: None,
             },
         };
         let json = serde_json::to_string(&linked).unwrap();
         assert!(json.contains(r#""linkedEdges":[{"edgeId":"x","toId":"d"}]"#), "{json}");
         let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(linked, round_tripped);
+    }
+
+    /// `budgetMs` is optional both ways: `None` omits the key, so a
+    /// plugin that predates it sees the request it always did; a frame
+    /// without it reads as `None`; a value round-trips under its camelCase name.
+    #[test]
+    fn semantic_pass_budget_ms_round_trips_and_is_omitted_when_none() {
+        let none = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(RequestId::Number(5)),
+            message: ControlMessage::SemanticPass {
+                file_paths: vec!["src/a.rs".to_string()],
+                linked_edges: Vec::new(),
+                budget_ms: None,
+            },
+        };
+        let json = serde_json::to_string(&none).unwrap();
+        assert!(!json.contains("budgetMs"), "None must not be serialized: {json}");
+        let absent: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(none, absent, "an absent budgetMs must read as None");
+
+        let some = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(RequestId::Number(6)),
+            message: ControlMessage::SemanticPass {
+                file_paths: Vec::new(),
+                linked_edges: Vec::new(),
+                budget_ms: Some(120_000),
+            },
+        };
+        let json = serde_json::to_string(&some).unwrap();
+        assert!(json.contains(r#""budgetMs":120000"#), "{json}");
+        let round_tripped: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(some, round_tripped);
     }
 
     #[test]
@@ -1206,6 +1420,7 @@ mod tests {
                 engine: "tree-sitter".to_string(),
                 resolved: false,
                 to_declaration: None,
+                specifier: None,
             }],
             delete_edge_ids: vec!["e2".to_string()],
             complete: true,
@@ -1433,5 +1648,225 @@ mod tests {
         let json = serde_json::to_string(&empty).unwrap();
         assert!(!json.contains("untypedCalls"), "{json}");
         assert_eq!(json, OLD_SHAPE_NODE);
+    }
+
+    // ---------------------------------------------------------------
+    // resolutionChanged, the facts trailer's types, reextract and
+    // the edge specifier.
+    // ---------------------------------------------------------------
+
+    fn envelope_json(envelope: &ControlEnvelope) -> serde_json::Value {
+        serde_json::to_value(envelope).unwrap()
+    }
+
+    /// `resolutionChanged` is a request named in camelCase, with
+    /// `previousFacts` only when core holds some.
+    #[test]
+    fn a_resolution_changed_request_round_trips_and_omits_absent_facts() {
+        let with_facts = ControlEnvelope {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(RequestId::Number(3)),
+            message: ControlMessage::ResolutionChanged {
+                file_path: "package.json".to_string(),
+                previous_facts: Some("{\"v\":1}".to_string()),
+            },
+        };
+        let value = envelope_json(&with_facts);
+        assert_eq!(value["method"], "resolutionChanged");
+        assert_eq!(value["params"]["filePath"], "package.json");
+        assert_eq!(value["params"]["previousFacts"], "{\"v\":1}");
+        let back: ControlEnvelope = serde_json::from_value(value).unwrap();
+        assert_eq!(back, with_facts);
+
+        let without = ControlEnvelope {
+            message: ControlMessage::ResolutionChanged {
+                file_path: "package.json".to_string(),
+                previous_facts: None,
+            },
+            ..with_facts
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(!json.contains("previousFacts"), "{json}");
+        let back: ControlEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, without);
+    }
+
+    /// A `fileChanged` without `reextract` reads as
+    /// `false`, and `false` is not written, so the frame is byte-identical
+    /// to the old one; `true` is written as `"reextract":true`.
+    #[test]
+    fn file_changed_reextract_defaults_to_false_and_is_written_only_when_set() {
+        let old = r#"{"jsonrpc":"2.0","id":1,"method":"fileChanged","params":{"filePath":"src/a.ts"}}"#;
+        let envelope: ControlEnvelope = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            envelope.message,
+            ControlMessage::FileChanged { file_path: "src/a.ts".to_string(), reextract: false }
+        );
+        assert_eq!(serde_json::to_string(&envelope).unwrap(), old);
+
+        let reextract = ControlEnvelope {
+            message: ControlMessage::FileChanged { file_path: "src/a.ts".to_string(), reextract: true },
+            ..envelope
+        };
+        let value = envelope_json(&reextract);
+        assert_eq!(value["params"]["reextract"], true);
+        let back: ControlEnvelope = serde_json::from_value(value).unwrap();
+        assert_eq!(back, reextract);
+    }
+
+    /// An edge without a `specifier` reads as `None`;
+    /// `None` is not written; a set one round trips.
+    #[test]
+    fn an_edge_specifier_is_optional_and_round_trips() {
+        let old = r#"{"id":"e","fromId":"a","toId":"b","kind":"IMPORTS","source":"syntactic","engine":"tree-sitter","resolved":false}"#;
+        let edge: WireEdge = serde_json::from_str(old).unwrap();
+        assert_eq!(edge.specifier, None);
+        let json = serde_json::to_string(&edge).unwrap();
+        assert!(!json.contains("specifier"), "{json}");
+
+        let with = WireEdge { specifier: Some("@app/math".to_string()), ..edge };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["specifier"], "@app/math");
+        let back: WireEdge = serde_json::from_value(value).unwrap();
+        assert_eq!(back, with);
+    }
+
+    /// Every delta shape the protocol documents, read from its JSON and
+    /// written back to the same JSON.
+    #[test]
+    fn every_resolution_delta_shape_round_trips_through_its_documented_json() {
+        let cases: Vec<(&str, ResolutionChangedResult)> = vec![
+            (
+                r#"{"delta":{"kind":"unchanged"},"facts":"f2"}"#,
+                ResolutionChangedResult { delta: ResolutionDelta::Unchanged, facts: Some("f2".to_string()) },
+            ),
+            (
+                r#"{"delta":{"kind":"unknown","reason":"no model"}}"#,
+                ResolutionChangedResult {
+                    delta: ResolutionDelta::Unknown { reason: "no model".to_string() },
+                    facts: None,
+                },
+            ),
+            (
+                r#"{"delta":{"kind":"affected","files":[{"under":"a","notUnder":["a/b"]}],"imports":[{"importers":{"under":""},"by":{"specifier":{"exact":"x"}}},{"importers":{"under":"pkg"},"by":{"target":{"scopeKind":"container","matcher":{"under":{"prefix":"app","separator":"."}}}}},{"importers":{"under":""},"by":{"target":{"scopeKind":"file","matcher":{"startsWith":"lib/"}}}},{"importers":{"under":""},"by":{"specifier":"nonRelative"}}]},"facts":"f3"}"#,
+                ResolutionChangedResult {
+                    delta: ResolutionDelta::Affected {
+                        files: vec![PathScope { under: "a".to_string(), not_under: vec!["a/b".to_string()] }],
+                        imports: vec![
+                            ImportSelector {
+                                importers: PathScope { under: String::new(), not_under: vec![] },
+                                by: ImportMatch::Specifier(Matcher::Exact("x".to_string())),
+                            },
+                            ImportSelector {
+                                importers: PathScope { under: "pkg".to_string(), not_under: vec![] },
+                                by: ImportMatch::Target {
+                                    scope_kind: TargetScopeKind::Container,
+                                    matcher: Matcher::Under {
+                                        prefix: "app".to_string(),
+                                        separator: ".".to_string(),
+                                    },
+                                },
+                            },
+                            ImportSelector {
+                                importers: PathScope { under: String::new(), not_under: vec![] },
+                                by: ImportMatch::Target {
+                                    scope_kind: TargetScopeKind::File,
+                                    matcher: Matcher::StartsWith("lib/".to_string()),
+                                },
+                            },
+                            ImportSelector {
+                                importers: PathScope { under: String::new(), not_under: vec![] },
+                                by: ImportMatch::Specifier(Matcher::NonRelative),
+                            },
+                        ],
+                    },
+                    facts: Some("f3".to_string()),
+                },
+            ),
+        ];
+        for (json, expected) in cases {
+            let read: ResolutionChangedResult = serde_json::from_str(json).unwrap();
+            assert_eq!(read, expected, "{json}");
+            assert_eq!(serde_json::to_string(&read).unwrap(), json);
+        }
+
+        // `reason`, `files` and `imports` may be left out.
+        let terse: ResolutionDelta = serde_json::from_str(r#"{"kind":"unknown"}"#).unwrap();
+        assert_eq!(terse, ResolutionDelta::Unknown { reason: String::new() });
+        let terse: ResolutionDelta = serde_json::from_str(r#"{"kind":"affected"}"#).unwrap();
+        assert_eq!(terse, ResolutionDelta::Affected { files: vec![], imports: vec![] });
+    }
+
+    /// The full response frame reads with its id.
+    #[test]
+    fn a_resolution_changed_response_reads_with_its_id() {
+        let json = r#"{"jsonrpc":"2.0","id":9,"result":{"delta":{"kind":"unchanged"}}}"#;
+        let response: ResolutionChangedResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.id, RequestId::Number(9));
+        assert_eq!(
+            response.result,
+            ResolutionChangedResult { delta: ResolutionDelta::Unchanged, facts: None }
+        );
+    }
+
+    /// `Under` matches the prefix itself or the prefix followed by the
+    /// separator, never a longer name sharing the prefix.
+    ///
+    /// Control: drop the separator check from `Matcher::Under`
+    /// (`pkg.subtle` matches).
+    #[test]
+    fn under_matches_on_the_separator_boundary_only() {
+        let under = Matcher::Under { prefix: "pkg.sub".to_string(), separator: ".".to_string() };
+        assert!(under.matches("pkg.sub"));
+        assert!(under.matches("pkg.sub.leaf"));
+        assert!(!under.matches("pkg.subtle"));
+        assert!(!under.matches("pkg"));
+        assert!(!under.matches("other.pkg.sub"));
+
+        let rust = Matcher::Under { prefix: "crate::a".to_string(), separator: "::".to_string() };
+        assert!(rust.matches("crate::a::b"));
+        assert!(!rust.matches("crate::ab"));
+        assert!(!rust.matches("crate::a:b"));
+    }
+
+    #[test]
+    fn exact_starts_with_and_non_relative_match_as_documented() {
+        assert!(Matcher::Exact("x".to_string()).matches("x"));
+        assert!(!Matcher::Exact("x".to_string()).matches("xy"));
+
+        let starts = Matcher::StartsWith("@app/".to_string());
+        assert!(starts.matches("@app/math"));
+        assert!(!starts.matches("@apple/math"));
+
+        for specifier in ["react", "@app/math", "lodash/fp"] {
+            assert!(Matcher::NonRelative.matches(specifier), "{specifier} is non-relative");
+        }
+        for specifier in ["./a", "../b", "/abs", "#internal", ""] {
+            assert!(!Matcher::NonRelative.matches(specifier), "{specifier:?} is not non-relative");
+        }
+    }
+
+    /// A scope is a directory on a `/` boundary minus its `notUnder`
+    /// directories; `""` is the whole project.
+    ///
+    /// Control: ignore `not_under` in `PathScope::contains` (`a/b/x.ts`
+    /// is in).
+    #[test]
+    fn a_path_scope_is_its_directory_minus_the_excluded_ones() {
+        let scope = PathScope { under: "a".to_string(), not_under: vec!["a/b".to_string()] };
+        assert!(scope.contains("a/x.ts"));
+        assert!(scope.contains("a/c/x.ts"));
+        assert!(!scope.contains("a/b/x.ts"));
+        assert!(!scope.contains("a/b"));
+        assert!(!scope.contains("ab/x.ts"), "a directory matches on a / boundary");
+        assert!(scope.contains("a/bc/x.ts"), "a/b excludes a/b/, not a/bc/");
+
+        let whole = PathScope { under: String::new(), not_under: vec![] };
+        assert!(whole.contains("x.ts"));
+        assert!(whole.contains("deep/down/x.ts"));
+
+        let trailing = PathScope { under: "a/".to_string(), not_under: vec![] };
+        assert!(trailing.contains("a/x.ts"));
+        assert!(!trailing.contains("ab/x.ts"));
     }
 }

@@ -612,6 +612,7 @@ extensions = [".{language}"]
                     semantic_sweep: false,
                     semantic_prepare: false,
                     files_created: false,
+                    resolution_delta: false,
                     receiver_calls: manifest::ReceiverCallResolution::Resolved,
                     receiver_calls_structural: manifest::ReceiverCallResolution::Unresolved,
                     member_overrides: crate::daemon::manifest::MemberOverrides::None,

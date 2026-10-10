@@ -415,6 +415,11 @@ pub struct EdgeSpec {
     /// The engine that produced it, as a free label for diagnostics -
     /// `tree-sitter`, `go-types`, `rust-analyzer`.
     pub engine: String,
+    /// **`IMPORTS` edges only:** the import's raw text as written (a module
+    /// specifier, a crate path, a dotted name), which core matches a
+    /// resolution delta's `Specifier` selectors against. Dropped on any
+    /// other kind of edge. Not part of the edge's id.
+    pub specifier: Option<String>,
 }
 
 /// Accumulates one file's nodes and edges, deriving each id from the item
@@ -565,8 +570,26 @@ impl FileGraphBuilder {
             engine: spec.engine,
             resolved: spec.resolved,
             to_declaration: spec.to_declaration,
+            specifier: if spec.kind == EdgeKind::Imports { spec.specifier } else { None },
         });
         id
+    }
+
+    /// An `IMPORTS` edge onto a placeholder, carrying the import's raw text
+    /// as its `specifier`: `resolved: false`, as for
+    /// [`placeholder_edge`](Self::placeholder_edge).
+    pub fn import_edge(&mut self, from_id: &str, to_id: &str, specifier: impl Into<String>) -> String {
+        let engine = self.engine.clone();
+        self.add_edge(EdgeSpec {
+            from_id: from_id.to_string(),
+            to_id: to_id.to_string(),
+            kind: EdgeKind::Imports,
+            resolved: false,
+            to_declaration: None,
+            source: SourceTier::Syntactic,
+            engine,
+            specifier: Some(specifier.into()),
+        })
     }
 
     /// An edge onto a real declaration **of this same file**: `resolved:
@@ -601,6 +624,7 @@ impl FileGraphBuilder {
             to_declaration: None,
             source: SourceTier::Syntactic,
             engine,
+            specifier: None,
         })
     }
 
@@ -948,5 +972,61 @@ mod tests {
         assert_eq!(untyped_of(&graph, &file), ["top"]);
         assert!(untyped_of(&graph, &ty).is_empty(), "a Type node takes none: {:?}", untyped_of(&graph, &ty));
         assert_eq!(graph.open_sites.len(), 7, "folding keeps the sites for the semantic engine");
+    }
+
+    fn edge(kind: EdgeKind, specifier: Option<&str>) -> EdgeSpec {
+        EdgeSpec {
+            from_id: "from".to_string(),
+            to_id: "to".to_string(),
+            kind,
+            resolved: false,
+            to_declaration: None,
+            source: SourceTier::Syntactic,
+            engine: "toy-parser".to_string(),
+            specifier: specifier.map(str::to_string),
+        }
+    }
+
+    /// An `IMPORTS` edge carries its specifier to the wire, and the
+    /// specifier is not part of the edge's id.
+    ///
+    /// Control: set `specifier: None` for every kind in `add_edge`.
+    #[test]
+    fn an_imports_edge_carries_its_specifier_outside_its_id() {
+        let mut graph = builder();
+        let with = graph.add_edge(edge(EdgeKind::Imports, Some("@app/x")));
+        let graph = graph.finish();
+        assert_eq!(graph.edges[0].specifier.as_deref(), Some("@app/x"));
+
+        let mut bare = builder();
+        let without = bare.add_edge(edge(EdgeKind::Imports, None));
+        assert_eq!(with, without, "the specifier does not move the id");
+        assert_eq!(with, edge_id("from", EdgeKind::Imports, "to", None));
+        assert_eq!(bare.finish().edges[0].specifier, None);
+    }
+
+    /// A specifier on any other kind of edge is dropped.
+    ///
+    /// Control: keep `spec.specifier` for every kind in `add_edge`.
+    #[test]
+    fn a_specifier_on_any_other_edge_is_dropped() {
+        for kind in [EdgeKind::Calls, EdgeKind::References, EdgeKind::Defines, EdgeKind::Exports] {
+            let mut graph = builder();
+            graph.add_edge(edge(kind, Some("@app/x")));
+            assert_eq!(graph.finish().edges[0].specifier, None, "{kind:?}");
+        }
+    }
+
+    /// `import_edge` is an unresolved `IMPORTS` edge carrying the specifier.
+    #[test]
+    fn import_edge_is_an_unresolved_imports_edge_with_its_specifier() {
+        let mut graph = builder();
+        let id = graph.import_edge("from", "to", "./b");
+        let graph = graph.finish();
+        let edge = &graph.edges[0];
+        assert_eq!(edge.id, id);
+        assert_eq!(edge.kind, EdgeKind::Imports);
+        assert!(!edge.resolved);
+        assert_eq!(edge.specifier.as_deref(), Some("./b"));
     }
 }

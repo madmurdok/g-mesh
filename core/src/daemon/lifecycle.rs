@@ -39,6 +39,7 @@ use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::jsonrpc::is_timeout;
 use crate::storage::index_store::{self, IndexStore};
+use crate::watcher::apply::SemanticPassOutcome;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// `plugin.idleTimeoutMinutes`'s default.
@@ -377,9 +378,11 @@ impl PluginSupervisor {
         Ok(replayed)
     }
 
-    /// Runs a whole-project semantic pass if the plugin is awake. Returns whether
-    /// it ran; a sleeping plugin is left asleep. A suspended language answers
-    /// `Ok(false)` first: core never sends `semanticPass` to a suspended
+    /// Runs a whole-project semantic pass - or, with `file_paths`, a residual
+    /// language's pass over its owed files (`PluginProcess::semantic_pass`) -
+    /// if the plugin is awake. Returns its outcome, or `None` when it did not
+    /// run; a sleeping plugin is left asleep. A suspended language answers
+    /// `Ok(None)` first: core never sends `semanticPass` to a suspended
     /// language, and both `daemon::semantic` and `daemon::workspace_reindex` go
     /// through this gate. The timeout scales with `file_count`.
     pub fn semantic_pass(
@@ -387,15 +390,14 @@ impl PluginSupervisor {
         conn: &IndexStore,
         file_paths: Vec<String>,
         file_count: usize,
-    ) -> Result<bool> {
+    ) -> Result<Option<SemanticPassOutcome>> {
         if self.is_semantic_suspended() {
-            return Ok(false);
+            return Ok(None);
         }
         let inner = self.inner();
-        let Some(process) = inner.process.as_ref() else { return Ok(false) };
+        let Some(process) = inner.process.as_ref() else { return Ok(None) };
         self.touch();
-        process.semantic_pass(conn, file_paths, file_count, &self.embedding)?;
-        Ok(true)
+        process.semantic_pass(conn, file_paths, file_count, &self.embedding).map(Some)
     }
 
     /// Tells the plugin a whole-project pass is owed, so it can start its
@@ -437,6 +439,21 @@ impl PluginSupervisor {
         let inner = self.inner();
         self.touch();
         f(inner.process.as_ref())
+    }
+
+    /// [`with_exclusive_access`](Self::with_exclusive_access), waking the
+    /// plugin first if it is asleep: `f` always gets a live process. A plugin
+    /// that fails to start is the error, and `f` does not run.
+    pub fn with_awake_exclusive_access<T>(&self, f: impl FnOnce(&PluginProcess) -> T) -> Result<T> {
+        let mut inner = self.inner();
+        if inner.process.is_none() {
+            let process = PluginProcess::spawn(&self.project_root, &self.manifest, self.pid_file.clone())
+                .with_context(|| format!("failed to wake the {} plugin", self.manifest.language))?;
+            super::write_pid_file(&self.pid_file, process.pid());
+            inner.process = Some(process);
+        }
+        self.touch();
+        Ok(f(inner.process.as_ref().expect("just spawned or already running")))
     }
 
     /// Synchronously reindexes `file_path` if it changed since it was last

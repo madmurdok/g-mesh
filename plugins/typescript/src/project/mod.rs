@@ -13,14 +13,15 @@
 //!   when it is in the set.
 //! - **Configs are read once.** Workspace packages, tsconfig `paths` per
 //!   directory and package.json `imports` per directory change only through
-//!   a reload: their files are [`WATCH_FILES`], and core reindexes the
-//!   language when one is saved (ADR 0008).
+//!   a reload: their files are [`WATCH_FILES`], and a save of one reloads
+//!   the model; [`facts`] says which importers that can move.
 //! - **Lookups walk up** the importer's directories against per-directory
 //!   maps, so a directory created after the load needs no model update.
 //! - **A bad config is a note, never an error.** An unreadable or malformed
 //!   file is skipped and recorded in [`TsProject::notes`].
 
 pub mod exports;
+pub mod facts;
 pub mod jsonc;
 pub mod paths;
 pub mod resolve;
@@ -47,6 +48,10 @@ pub const EXCLUDE_DIRS: [&str; 2] = ["node_modules", "dist"];
 /// `[plugin.workspace] watch_files` globs: a save of one reloads the model.
 pub const WATCH_FILES: [&str; 4] =
     ["package.json", "tsconfig*.json", "jsconfig*.json", "pnpm-workspace.yaml"];
+
+/// The phrase a note carries when a config could not be read from disk, as
+/// opposed to read and found malformed.
+pub const UNREADABLE_NOTE: &str = ": unreadable (";
 
 /// What the extractor knows about the project around a file.
 #[derive(Debug, Default, Clone)]
@@ -166,7 +171,7 @@ fn read_text(root: &Path, path: &str, notes: &mut Vec<String>) -> Option<String>
         Ok(text) => Some(text),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => {
-            notes.push(format!("{path}: unreadable ({err}), skipped"));
+            notes.push(format!("{path}{UNREADABLE_NOTE}{err}), skipped"));
             None
         }
     }
