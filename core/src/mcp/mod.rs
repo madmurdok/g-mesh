@@ -652,6 +652,7 @@ impl GMeshMcpServer {
             return instructions::cold_start(
                 self.registry.project_root(),
                 phase == Phase::Walking,
+                self.indexing.cold_cause(),
                 &coverage,
             );
         }

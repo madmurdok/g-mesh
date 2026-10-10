@@ -744,6 +744,28 @@ pub fn ensure_current(conn: &Connection, indexer_version: &str) -> Result<bool> 
     Ok(false)
 }
 
+/// The generation `meta` records, `(schema_version, indexer_version)`, read
+/// without changing anything: `None` when there is no `meta` table or no row
+/// (an index never built here), as for any failure to read it. Read before [`ensure_current`], whose reset
+/// would otherwise hide that a generation existed.
+///
+/// `schema_version` is read first and alone, for the reason [`ensure_current`]
+/// gives; an `indexer_version` an old schema cannot supply reads as `""`.
+pub fn stored_generation(conn: &Connection) -> Option<(String, String)> {
+    let Ok(Some(schema)) = conn
+        .query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get::<_, String>(0))
+        .optional()
+    else {
+        return None;
+    };
+    let indexer = conn
+        .query_row("SELECT indexer_version FROM meta WHERE id = 1", [], |row| row.get::<_, Option<String>>(0))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    Some((schema, indexer))
+}
+
 /// Throws away everything a stale generation left behind and starts the index
 /// over empty. `bulkIndexedAt` going with it is the point, not a side effect:
 /// it is what makes the next daemon start walk the project again instead of
