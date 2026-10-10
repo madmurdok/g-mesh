@@ -246,9 +246,9 @@ mod tests {
     /// A version bump and a dependency edit keep the roots, so every key;
     /// `setup.cfg` and `setup.py` are never read.
     ///
-    /// Control: drop the `old.roots == new.roots` early return in [`delta`]
-    /// and compare `roots` inside `container_delta`'s input instead (or make
-    /// it `!=`): the version bump answers something other than `Unchanged`.
+    /// Control: make the equal-roots branch of [`delta`] fall through to
+    /// `with_import_selectors` over the old facts with an empty `keys` set:
+    /// the bump answers `Affected`.
     #[test]
     fn a_version_or_dependency_edit_and_a_setup_file_save_answer_unchanged() {
         let tree = project(ONE_ROOT);
