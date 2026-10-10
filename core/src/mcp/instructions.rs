@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::daemon::candidates::Detection;
+use crate::daemon::indexing_status::ColdCause;
 use crate::daemon::manifest::{Capabilities, MemberOverrides, ReceiverCallResolution};
 use crate::languages::LanguageOutcome;
 
@@ -33,23 +34,35 @@ const WAIT_IS_NOT_WRONG: &str = " - slow, not wrong; do not abandon it for grep.
 
 /// Prefixed while the project owes its cold start (`Phase::Unindexed` or
 /// `Phase::Walking`): the walk is running now or starts on the first tool
-/// call, and the root tells a caller's g-mesh sessions apart. A root too long
-/// for [`INSTRUCTIONS_BYTE_CEILING`] falls back to [`cold_start_line_fallback`],
-/// so this line is never what breaks the ceiling. A warm rendering never says
-/// the wait: an upgrade wipes the index, so a walk owed after one is a cold
-/// start too (ADR 0022, section 1, row 10).
-fn cold_start_line(root: &Path, walking: bool) -> String {
-    format!("Index root: {}. {}", root.display(), cold_start_line_fallback(walking))
+/// call, and the root tells a caller's g-mesh sessions apart. Before the walk
+/// starts the line names its [`ColdCause`], so an index an upgrade discarded,
+/// or one a walk left half built, does not read as a project never indexed. A
+/// root too long for [`INSTRUCTIONS_BYTE_CEILING`] falls back to
+/// [`cold_start_line_fallback`], so this line is never what breaks the
+/// ceiling. A warm rendering never says the wait: an upgrade wipes the index,
+/// so a walk owed after one is a cold start too (ADR 0022, section 1, row 10).
+fn cold_start_line(root: &Path, walking: bool, cause: ColdCause) -> String {
+    format!("Index root: {}. {}", root.display(), cold_start_line_fallback(walking, cause))
 }
 
 /// [`cold_start_line`] without the root (D12 in
-/// `docs/architecture/lazy-indexing.md`).
-fn cold_start_line_fallback(walking: bool) -> String {
-    let state = if walking {
-        "Being built now - the first tool call waits for it to finish before answering"
-    } else {
-        "Not indexed yet - the first tool call builds it (structural first; semantic search after) and \
-         waits for it"
+/// `docs/architecture/lazy-indexing.md`). The cause is not shown once the walk
+/// runs: by then the wait is the same whatever owed it.
+fn cold_start_line_fallback(walking: bool, cause: ColdCause) -> String {
+    let state = match (walking, cause) {
+        (true, _) => "Being built now - the first tool call waits for it to finish before answering",
+        (false, ColdCause::Fresh) => {
+            "Not indexed yet - the first tool call builds it (structural first; semantic search after) and \
+             waits for it"
+        }
+        (false, ColdCause::Discarded) => {
+            "Index discarded (built by an earlier g-mesh or plugin build) - the first tool call rebuilds it \
+             and waits for it"
+        }
+        (false, ColdCause::Incomplete) => {
+            "Index incomplete (an earlier walk stopped part way) - the first tool call finishes it and waits \
+             for it"
+        }
     };
     format!("{state}{WAIT_IS_NOT_WRONG}")
 }
@@ -62,10 +75,10 @@ fn cold_start_line_fallback(walking: bool) -> String {
 ///
 /// The body is built against the ceiling less the no-path line, so that line
 /// always fits on top of it.
-pub fn cold_start(root: &Path, walking: bool, coverage: &Coverage) -> String {
-    let fallback = cold_start_line_fallback(walking);
+pub fn cold_start(root: &Path, walking: bool, cause: ColdCause, coverage: &Coverage) -> String {
+    let fallback = cold_start_line_fallback(walking, cause);
     let built = build_within(coverage, INSTRUCTIONS_BYTE_CEILING - fallback.len() - 2);
-    let with_path = format!("{}\n\n{built}", cold_start_line(root, walking));
+    let with_path = format!("{}\n\n{built}", cold_start_line(root, walking, cause));
     if with_path.len() <= INSTRUCTIONS_BYTE_CEILING {
         with_path
     } else {

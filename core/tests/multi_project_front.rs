@@ -541,6 +541,45 @@ async fn the_front_names_the_projects_already_indexed() {
     in_b.cancel().await.expect("failed to shut the b session down");
 }
 
+/// `g-mesh init` in `dir`, which builds that project's index without a
+/// daemon.
+fn init_in(dir: &Path) {
+    let init = std::process::Command::new(BIN)
+        .arg("init")
+        .current_dir(dir)
+        .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
+        .env(g_mesh::embedding::model::MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir")
+        .output()
+        .expect("failed to run `g-mesh init`");
+    assert!(init.status.success(), "g-mesh init failed: {}", String::from_utf8_lossy(&init.stderr));
+}
+
+/// A completed index an earlier g-mesh build wrote is not "(indexed)": its
+/// daemon would discard it on start. `a` and `b` are both walked; `b`'s
+/// generation is stale.
+///
+/// Control: in `candidates::has_completed_index`, drop
+/// `&& current_generation(&conn)`: `b` is counted and marked too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_front_does_not_mark_an_index_of_another_generation() {
+    let folder = Folder::new();
+    let (a, b) = (folder.sub("a"), folder.sub("b"));
+    init_in(&a);
+    init_in(&b);
+    assert!(bulk_indexed(&a) && bulk_indexed(&b), "sanity: `g-mesh init` must have walked a and b");
+    rusqlite::Connection::open(project_dir(&b).unwrap().join("index.db"))
+        .and_then(|db| db.execute("UPDATE meta SET indexer_version = 'stale' WHERE id = 1", []))
+        .expect("failed to stamp b's index with a stale generation");
+
+    let client = folder.connect(None).await;
+    let instructions =
+        client.peer_info().and_then(|info| info.instructions.clone()).expect("front instructions");
+    client.cancel().await.expect("failed to shut the client down");
+
+    assert!(instructions.contains("has already indexed 1 of them"), "{instructions}");
+    assert!(instructions.ends_with("Projects: a (indexed), b, c."), "{instructions}");
+}
+
 /// Defect 2 of `docs/results/gm399-multi-project-measurements.md`: the shim's
 /// cold-start line for a selected project says it was selected in the front,
 /// not that it is "the current directory" (the folder is).

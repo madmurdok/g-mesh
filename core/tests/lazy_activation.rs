@@ -79,6 +79,18 @@ impl Project {
         Connection::open(db).expect("failed to open the project's index")
     }
 
+    /// Builds the project's index the way a user does, with `g-mesh init`.
+    fn init(&self) {
+        let init = std::process::Command::new(BIN)
+            .arg("init")
+            .current_dir(self.root())
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
+            .env(g_mesh::embedding::model::MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir")
+            .output()
+            .expect("failed to run `g-mesh init`");
+        assert!(init.status.success(), "g-mesh init failed: {}", String::from_utf8_lossy(&init.stderr));
+    }
+
     fn bulk_indexed(&self) -> bool {
         schema::bulk_index_completed(&self.db()).expect("failed to read bulkIndexedAt")
     }
@@ -256,14 +268,7 @@ async fn first_structural_call_blocks_and_answers_fully() {
 #[tokio::test]
 async fn an_existing_index_is_not_rewalked() {
     let project = Project::new();
-    let init = std::process::Command::new(BIN)
-        .arg("init")
-        .current_dir(project.root())
-        .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
-        .env(g_mesh::embedding::model::MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir")
-        .output()
-        .expect("failed to run `g-mesh init`");
-    assert!(init.status.success(), "g-mesh init failed: {}", String::from_utf8_lossy(&init.stderr));
+    project.init();
 
     let snapshot = |project: &Project| -> (Option<String>, i64) {
         let db = project.db();
@@ -284,6 +289,90 @@ async fn an_existing_index_is_not_rewalked() {
     assert_eq!(snapshot(&project), before, "an already-walked index must not be walked again");
     let log = std::fs::read_to_string(project.log()).unwrap_or_default();
     assert!(!log.contains("initial index built"), "the daemon walked an already-walked index:\n{log}");
+}
+
+/// The session instructions a daemon gives on `initialize`.
+fn instructions_of(client: &RunningService<RoleClient, ()>) -> String {
+    client.peer_info().and_then(|info| info.instructions.clone()).expect("the daemon must send instructions")
+}
+
+/// The start of the warm instructions' first paragraph.
+const WARM_LEAD: &str = "Structural code-graph queries over this project's index.";
+
+/// A daemon started over a current, completed index starts warm, so its
+/// instructions are the warm ones: no cold-start line at all.
+///
+/// Control: in `daemon::run`, always start at `IndexingStatus::unindexed()`:
+/// the instructions open with "Index root:".
+#[tokio::test]
+async fn an_existing_index_renders_the_warm_instructions() {
+    let project = Project::new();
+    project.init();
+
+    let client = project.connect(&[]).await;
+    let instructions = instructions_of(&client);
+    client.cancel().await.expect("failed to shut the client down");
+
+    assert!(instructions.starts_with(WARM_LEAD), "{instructions}");
+    assert!(!instructions.contains("Not indexed yet"), "{instructions}");
+    assert!(!instructions.contains("Index root:"), "{instructions}");
+}
+
+/// An index an earlier g-mesh build wrote is discarded on start, and the
+/// cold-start line says so instead of "Not indexed yet".
+///
+/// Controls: in `daemon::run`, hard-code `ColdCause::Fresh`; or make
+/// `schema::stored_generation` return `None`; or pass `ColdCause::Fresh` from
+/// `GMeshMcpServer::instructions`: each renders "Not indexed yet".
+#[tokio::test]
+async fn a_discarded_index_says_so() {
+    let project = Project::new();
+    project.init();
+    project
+        .db()
+        .execute("UPDATE meta SET indexer_version = 'stale' WHERE id = 1", [])
+        .expect("failed to stamp a stale generation");
+
+    let client = project.connect(&[]).await;
+    let instructions = instructions_of(&client);
+    client.cancel().await.expect("failed to shut the client down");
+
+    assert!(instructions.starts_with("Index root: "), "{instructions}");
+    assert!(
+        instructions.contains(
+            "Index discarded (built by an earlier g-mesh or plugin build) - the first tool call rebuilds it"
+        ),
+        "{instructions}"
+    );
+    assert!(!instructions.contains("Not indexed yet"), "{instructions}");
+}
+
+/// An index of the current generation whose walk never finished is kept,
+/// and the cold-start line says the walk is being finished.
+///
+/// Control: in `daemon::run`, hard-code `ColdCause::Fresh`: the line says
+/// "Not indexed yet".
+#[tokio::test]
+async fn an_incomplete_index_says_so() {
+    let project = Project::new();
+    project.init();
+    project
+        .db()
+        .execute("UPDATE meta SET bulkIndexedAt = NULL WHERE id = 1", [])
+        .expect("failed to clear bulkIndexedAt");
+
+    let client = project.connect(&[]).await;
+    let instructions = instructions_of(&client);
+    client.cancel().await.expect("failed to shut the client down");
+
+    assert!(instructions.starts_with("Index root: "), "{instructions}");
+    assert!(
+        instructions.contains(
+            "Index incomplete (an earlier walk stopped part way) - the first tool call finishes it"
+        ),
+        "{instructions}"
+    );
+    assert!(!instructions.contains("Not indexed yet"), "{instructions}");
 }
 
 /// D2's failure path: a walk that fails - here, a plugin binary that was
