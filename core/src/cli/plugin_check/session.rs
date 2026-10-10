@@ -84,7 +84,7 @@ use crate::protocol::types::{
 };
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
-use crate::watcher::apply::{apply_file_change, apply_semantic_pass};
+use crate::watcher::apply::{apply_file_change, apply_semantic_pass, SemanticPassOutcome};
 
 /// The directory the kit hands every plugin process it spawns, via this
 /// environment variable, for the plugin-side markers the kit defines.
@@ -1728,8 +1728,21 @@ impl<'a> Driver<'a> {
                     &mut kill,
                 )
                 // A listed incomplete pass is recorded residual in the scratch
-                // index like any other; the check reads only success or error.
-                .map(|_outcome| ()),
+                // index like any other, which a daemon then finishes on its
+                // next start. A kit session has no next start, and its
+                // expectations need the fully linked index a completed session
+                // leaves behind, so a pass that left files owed fails the
+                // session, quoting the plugin's own reason (GM-550).
+                .and_then(|outcome| match outcome {
+                    SemanticPassOutcome::Residual { left } if left > 0 => {
+                        let reason = schema::semantic_residual_reason(&conn.read(), language)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| "the plugin gave no reason".to_string());
+                        bail!("the whole-project semantic pass left {left} file(s) unfinished: {reason}")
+                    }
+                    _ => Ok(()),
+                }),
             }
         };
         self.record(label, result)

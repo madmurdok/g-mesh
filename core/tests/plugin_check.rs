@@ -1132,6 +1132,50 @@ fn an_unknown_expectation_key_is_a_hard_parse_error() {
     );
 }
 
+/// GM-550: a whole-project semantic pass that names files it left
+/// unfinished is recorded residual, which a daemon finishes on its next
+/// start - but a kit session has no next start, and its expectations need
+/// the fully linked index. So the `session` check fails, quoting the
+/// plugin's own reason, and expectations are skipped with that case named;
+/// nothing else in the report is collateral damage.
+///
+/// Control: in `Driver::step`, map the whole-project pass's outcome to
+/// `Ok(())` again (drop the `Residual { left > 0 }` arm); the session
+/// passes and the expectations run. Control: revert the skip text in
+/// `expectations_section`; the skip no longer names the unfinished pass.
+#[test]
+fn a_whole_project_pass_that_leaves_files_unfinished_fails_the_session_with_its_reason() {
+    let fixture = write_fk_fixture(&[("a.fk", "fn helper\nfn user\ncall helper\n")]);
+    let expect = write_expect_file(
+        fixture.path(),
+        "[[callers]]\nsymbol = \"helper\"\nfile = \"a.fk\"\nexpect = [\"a.fk:user\"]\n",
+    );
+    let fake = install_fake("residual-pass", true);
+    let run = run_check_with_expect(&fake.dir, fixture.path(), &expect);
+
+    assert!(!run.success, "a residual whole-project pass must not be certifiable:\n{}", run.stdout);
+    assert_eq!(run.failing(), vec!["session"], "only the session fails:\n{}", run.stdout);
+    assert!(
+        run.stdout.contains(
+            "the whole-project semantic pass left 1 file(s) unfinished: \
+             the fake's language server was still loading"
+        ),
+        "the failure quotes the plugin's reason:\n{}",
+        run.stdout
+    );
+    assert_eq!(run.outcome("expectations.file"), "SKIP", "{}", run.stdout);
+    assert!(
+        run.stdout.contains("a whole-project semantic pass that left files unfinished"),
+        "the skip names the unfinished pass:\n{}",
+        run.stdout
+    );
+    assert!(
+        !run.outcomes.keys().any(|id| id.starts_with("expectations.callers[")),
+        "no expectation is evaluated on an index the session did not finish:\n{}",
+        run.stdout
+    );
+}
+
 /// The discrimination case: `[[callers]] symbol = "double"` in the TS
 /// fixture's own `expect.toml` expects a caller reached only through a
 /// namespace import (`import * as m from "./math"; m.double(4)` in

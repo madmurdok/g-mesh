@@ -197,6 +197,29 @@ struct ReindexOnChange {
     hold_ms: u64,
 }
 
+/// rust-analyzer's `experimental/serverStatus` extension (GM-550): what the
+/// server says about whether it has finished loading the project.
+///
+/// Like rust-analyzer, the server sends it only to a client that advertised
+/// `capabilities.experimental.serverStatusNotification` in `initialize`
+/// (unless `unasked`), and its first status - `quiescent: false` - is written
+/// while `initialized` is handled, before any `$/progress` of [`Readiness`]
+/// begins: measured, rust-analyzer sends it 4ms after `initialized`, so a
+/// client never sees a gap between phases without having seen it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerStatus {
+    /// `"afterReadiness"` (the default): `quiescent: true` once the last
+    /// [`Readiness`] progress has ended - at once when the script reports
+    /// none. `"never"`: the server stays `quiescent: false` for good.
+    #[serde(default)]
+    quiescent: Option<String>,
+    /// Send the status even to a client that did not ask for it - a server
+    /// pushing an extension the client never negotiated.
+    #[serde(default)]
+    unasked: bool,
+}
+
 /// The GM-433 shape: a server reloading its project model after a change it
 /// noticed itself - rust-analyzer after `Cargo.toml` changed, which it
 /// watches on its own, so nothing on the client's wire starts it.
@@ -265,6 +288,15 @@ struct Script {
     /// count what was asked.
     #[serde(default)]
     log: Option<String>,
+    /// See [`ServerStatus`]. Absent: the server never sends a status, as a
+    /// server without the extension does not.
+    #[serde(default)]
+    server_status: Option<ServerStatus>,
+    /// Where to write `capabilities.experimental` from the client's
+    /// `initialize`, verbatim (`null` when it sent none), so a test can
+    /// assert which extensions the client asked for.
+    #[serde(default)]
+    capabilities_out: Option<String>,
     /// Sections to ask the *client* for with `workspace/configuration`, right
     /// after `initialized` - which is when pyright asks, and the only channel
     /// it takes settings through at all (GM-299). A server asking its client
@@ -334,6 +366,8 @@ fn main() {
     // How many times each scripted answer has been sent as an error, for
     // `errorTimes`.
     let mut errors_sent: Vec<u32> = vec![0; script.answers.len()];
+    // Whether the client's `initialize` asked for `experimental/serverStatus`.
+    let mut status_asked = false;
 
     while let Some(message) = read_frame(&mut reader) {
         let method = message.get("method").and_then(Value::as_str).unwrap_or("").to_string();
@@ -346,6 +380,12 @@ fn main() {
 
         match method.as_str() {
             "initialize" => {
+                let experimental =
+                    params.pointer("/capabilities/experimental").cloned().unwrap_or(Value::Null);
+                status_asked = experimental.get("serverStatusNotification") == Some(&json!(true));
+                if let Some(path) = &script.capabilities_out {
+                    let _ = std::fs::write(path, experimental.to_string());
+                }
                 let mut capabilities = json!({
                     "definitionProvider": true,
                     "implementationProvider": true,
@@ -358,7 +398,17 @@ fn main() {
                 respond(&mut stdout, id, json!({ "capabilities": capabilities }));
             }
             "initialized" => {
-                start_progress(&script, Arc::clone(&indexing));
+                let status = script.server_status.as_ref().filter(|status| status.unasked || status_asked);
+                if status.is_some() {
+                    notify(
+                        &mut stdout,
+                        "experimental/serverStatus",
+                        json!({ "health": "ok", "quiescent": false }),
+                    );
+                }
+                let then_quiescent =
+                    status.is_some_and(|status| status.quiescent.as_deref() != Some("never"));
+                start_progress(&script, Arc::clone(&indexing), then_quiescent);
                 watch_for_reload(&script, Arc::clone(&reloading));
                 if !script.ask_configuration.is_empty() {
                     let items: Vec<Value> = script
@@ -578,10 +628,23 @@ fn position_of(params: &Value) -> (String, u32, u32) {
 /// thread so that `initialized` returns immediately - which is what a real
 /// server does, and what makes "the client asked before the server was ready"
 /// reachable at all.
-fn start_progress(script: &Script, indexing: Arc<AtomicBool>) {
-    let Some(readiness) = script.readiness.clone() else { return };
+///
+/// `then_quiescent`: send `experimental/serverStatus` `quiescent: true` once
+/// that progress has ended (at once when there is none) - see
+/// [`ServerStatus`].
+fn start_progress(script: &Script, indexing: Arc<AtomicBool>, then_quiescent: bool) {
+    let quiescent = move |stdout: &mut std::io::Stdout| {
+        if then_quiescent {
+            notify(stdout, "experimental/serverStatus", json!({ "health": "ok", "quiescent": true }));
+        }
+    };
+    let Some(readiness) = script.readiness.clone() else {
+        quiescent(&mut std::io::stdout());
+        return;
+    };
     let kind = readiness.kind.clone().unwrap_or_else(|| "progress".to_string());
     if kind == "none" {
+        quiescent(&mut std::io::stdout());
         return;
     }
     indexing.store(true, Ordering::SeqCst);
@@ -605,6 +668,7 @@ fn start_progress(script: &Script, indexing: Arc<AtomicBool>) {
             // Only now: the gaps between phases are not readiness, which is
             // the whole point of this shape.
             indexing.store(false, Ordering::SeqCst);
+            quiescent(&mut stdout);
         });
         return;
     }
@@ -622,6 +686,7 @@ fn start_progress(script: &Script, indexing: Arc<AtomicBool>) {
         std::thread::sleep(Duration::from_millis(readiness.end_after_ms));
         indexing.store(false, Ordering::SeqCst);
         notify(&mut stdout, "$/progress", json!({ "token": "indexing", "value": { "kind": "end" } }));
+        quiescent(&mut stdout);
     });
 }
 
