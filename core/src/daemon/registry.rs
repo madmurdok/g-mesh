@@ -1133,10 +1133,26 @@ impl PluginRegistry {
     /// [`file_changed`](Self::file_changed)'s ordinary `get_or_spawn` call,
     /// with the same "failures are reported and dropped" contract.
     pub(crate) fn workspace_file_changed(&self, conn: &IndexStore, language: &str, changed_file: &str) {
+        self.reindex_workspace(conn, language, changed_file, true);
+    }
+
+    /// [`workspace_file_changed`](Self::workspace_file_changed), with
+    /// `selective` saying whether a `resolution_delta` plugin may be asked
+    /// what the edit changed (`daemon::config_reindex`). A `.gitignore` change
+    /// passes `false`: it changes which files are indexed, which no
+    /// resolution delta describes, so it always reindexes the whole language.
+    fn reindex_workspace(&self, conn: &IndexStore, language: &str, changed_file: &str, selective: bool) {
         match self.get_or_spawn(language) {
             Ok(supervisor) => {
-                if let Err(err) = crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
-                {
+                // A plugin that can say what the edit changed for resolution
+                // is asked first; every other one gets the whole-language
+                // reindex.
+                let reindexed = if selective && supervisor.manifest().capabilities.resolution_delta {
+                    crate::daemon::config_reindex::run(self, &supervisor, conn, changed_file)
+                } else {
+                    crate::daemon::workspace_reindex::run(self, &supervisor, conn, changed_file)
+                };
+                if let Err(err) = reindexed {
                     crate::log_line!(
                         "g-mesh daemon: failed to reindex the {language} workspace after \
                          {changed_file} changed: {err:#} - {language}'s previous graph keeps \
@@ -1158,9 +1174,10 @@ impl PluginRegistry {
     /// their ancestors' rules, `project_walk::project_files_under`), splits
     /// the files by [`DiscoveredPlugins::indexing_language`] and compares each
     /// language with its `File` nodes under the same directories. Every
-    /// language with a difference is reindexed as after a workspace-file edit
-    /// ([`workspace_file_changed`](Self::workspace_file_changed), the first of
-    /// `gitignores`, else of `links`, as the trigger), unless it would gain more than
+    /// language with a difference is reindexed whole
+    /// ([`reindex_workspace`](Self::reindex_workspace), never asking for a
+    /// resolution delta, since a `.gitignore` changes which files are indexed;
+    /// the first of `gitignores`, else of `links`, as the trigger), unless it would gain more than
     /// [`GITIGNORE_REINDEX_GUARD`] files: then one log line asks for
     /// `g-mesh reindex`. No difference, no reindex.
     pub(crate) fn gitignore_changed(&self, conn: &IndexStore, gitignores: &[String], links: &[String]) {
@@ -1210,7 +1227,9 @@ impl PluginRegistry {
                 "g-mesh daemon: {trigger} changed which {language} files are indexed (+{added}, \
                  -{removed}) - reindexing {language}"
             );
-            self.workspace_file_changed(conn, &language, trigger);
+            // Whole-language: a resolution delta cannot say which files a
+            // `.gitignore` change added or removed.
+            self.reindex_workspace(conn, &language, trigger, false);
         }
     }
 

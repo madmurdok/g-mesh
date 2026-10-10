@@ -217,6 +217,7 @@ impl SemanticEngine for ToyEngine {
                     to_declaration: None,
                     source: SourceTier::Semantic,
                     engine: SEMANTIC_ENGINE.to_string(),
+                    specifier: None,
                 });
                 let answer = answer.finish();
                 diff.upsert_nodes.extend(answer.nodes);

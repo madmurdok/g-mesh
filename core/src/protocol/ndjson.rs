@@ -12,6 +12,15 @@ use crate::protocol::types::{WireEdge, WireNode};
 pub enum BulkItem {
     Node(Box<WireNode>),
     Edge(WireEdge),
+    /// `{"resolutionFacts": "<opaque>"}`: the resolution facts the walk was
+    /// built from, written last by a `resolution_delta` plugin.
+    ResolutionFacts(String),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolutionFactsLine {
+    resolution_facts: String,
 }
 
 impl BulkItem {
@@ -22,9 +31,15 @@ impl BulkItem {
         if let Ok(node) = serde_json::from_str::<WireNode>(line) {
             return Ok(BulkItem::Node(Box::new(node)));
         }
-        serde_json::from_str::<WireEdge>(line)
-            .map(BulkItem::Edge)
-            .with_context(|| format!("malformed NDJSON line (neither a valid node nor edge): {line:?}"))
+        match serde_json::from_str::<WireEdge>(line) {
+            Ok(edge) => Ok(BulkItem::Edge(edge)),
+            Err(err) => match serde_json::from_str::<ResolutionFactsLine>(line) {
+                Ok(facts) => Ok(BulkItem::ResolutionFacts(facts.resolution_facts)),
+                Err(_) => Err(err).with_context(|| {
+                    format!("malformed NDJSON line (neither a valid node nor edge): {line:?}")
+                }),
+            },
+        }
     }
 }
 
@@ -112,6 +127,7 @@ mod tests {
             engine: "tree-sitter".to_string(),
             resolved: false,
             to_declaration: None,
+            specifier: None,
         })
         .unwrap()
     }
@@ -171,5 +187,20 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(matches!(&items[0], BulkItem::Node(n) if n.id == "n1"));
         assert!(matches!(&items[1], BulkItem::Edge(e) if e.id == "e1"));
+    }
+
+    /// The `resolution_delta` trailer reads as its own item, and a line that
+    /// only resembles it (an extra key) is still malformed.
+    #[test]
+    fn a_resolution_facts_trailer_is_its_own_item() {
+        let stream = format!(
+            "{}\n{{\"resolutionFacts\":\"opaque\"}}\n{{\"resolutionFacts\":\"x\",\"y\":1}}\n",
+            node_json("n1")
+        );
+        let items: Vec<_> = NdjsonReader::new(Cursor::new(stream.into_bytes())).collect();
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[0], Ok(BulkItem::Node(n)) if n.id == "n1"));
+        assert!(matches!(&items[1], Ok(BulkItem::ResolutionFacts(facts)) if facts == "opaque"));
+        assert!(items[2].is_err(), "an unknown key is not a trailer");
     }
 }

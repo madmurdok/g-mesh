@@ -375,6 +375,7 @@ fn run_walk(
                     engine: row.get("walkedEngine")?,
                     resolved: row.get("walkedResolved")?,
                     to_declaration: row.get("walkedToDeclaration")?,
+                    specifier: None,
                 }),
                 None => None,
             };

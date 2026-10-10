@@ -837,7 +837,7 @@ impl GMeshMcpServer {
 
     #[tool(
         name = "get_file_outline",
-        description = "List the top-level symbols a file declares, in source order. Line and column numbers are zero-based - add one to cite a line to a human or to compare against a grep. `exported` means reachable from outside the file, not that the symbol's own line carries a visibility keyword - e.g. in Rust, a trait method or a trait-impl method is exported through the trait/impl even where the language forbids writing `pub` on that line itself."
+        description = "List the symbols a file declares, members included, in source order; pages are capped at about 8k bytes. Line and column numbers are zero-based - add one to cite a line to a human or to compare against a grep. `exported` means reachable from outside the file, not that the symbol's own line carries a visibility keyword - e.g. in Rust, a trait method or a trait-impl method is exported through the trait/impl even where the language forbids writing `pub` on that line itself."
     )]
     async fn get_file_outline(
         &self,
@@ -1021,10 +1021,24 @@ pub struct GetFileOutlineParams {
     pub file_path: String,
     /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
-    /// Maximum symbols (default 20, max 200) - raise it for a big file rather
-    /// than paging via `cursor`: one call costs far less than several, each
-    /// of which re-pays the whole conversation's cached prefix.
+    /// Maximum symbols (default and max 200). Each response is also capped at
+    /// about 8k bytes, so a page may hold fewer: follow `nextCursor`.
     pub limit: Option<u32>,
+    /// `full` adds qualifiedName, columns and signature to each row.
+    pub detail: Option<OutlineDetail>,
+}
+
+// How much each outline row carries. Plain comments, as on `Answer`: the
+// field's doc already says what `full` adds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(inline)]
+pub enum OutlineDetail {
+    // symbolId, name, kind, startLine, endLine, exported (the default).
+    #[default]
+    Compact,
+    // The compact fields plus qualifiedName, startCol, endCol, signature.
+    Full,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

@@ -45,7 +45,7 @@ use g_mesh_plugin_sdk::testing::{PluginCheck, Verdict};
 /// full so that a check silently dropping out of the report fails this test
 /// rather than passing every "and this one passed" assertion vacuously - the
 /// same guard core's own `tests/plugin_check.rs` keeps.
-const ALL_CHECKS: [&str; 16] = [
+const ALL_CHECKS: [&str; 17] = [
     "session",
     "shape",
     "stream-order",
@@ -62,6 +62,7 @@ const ALL_CHECKS: [&str; 16] = [
     "capabilities.semantic-pass-undeclared",
     "capabilities.semantic-engine-lazy",
     "capabilities.files-created-resolves",
+    "capabilities.resolution-delta-version-bump",
 ];
 
 fn check() -> PluginCheck {
@@ -118,11 +119,16 @@ fn the_toy_plugin_passes_every_conformance_check() {
         outcome.stdout
     );
     // ...and its counterpart does not apply to a plugin that declares the
-    // capability; nor does GM-516's filesCreated check to a manifest that
-    // does not declare `files_created`. Those two are the only skips here.
+    // capability; nor do GM-516's filesCreated check and GM-509's
+    // resolution-delta check to a manifest that declares neither
+    // capability. Those three are the only skips here.
     assert_eq!(
         outcome.skipped(),
-        vec!["capabilities.files-created-resolves", "capabilities.semantic-pass-undeclared"],
+        vec![
+            "capabilities.files-created-resolves",
+            "capabilities.resolution-delta-version-bump",
+            "capabilities.semantic-pass-undeclared"
+        ],
         "nothing else may skip:\n{}",
         outcome.stdout
     );

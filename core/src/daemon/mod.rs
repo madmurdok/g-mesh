@@ -4,6 +4,7 @@ mod activation;
 pub mod build_stamp;
 pub mod bulk_index;
 pub mod candidates;
+pub(crate) mod config_reindex;
 pub mod front;
 pub mod identity;
 pub mod indexing_status;

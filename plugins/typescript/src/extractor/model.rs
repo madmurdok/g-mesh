@@ -23,6 +23,7 @@ use tree_sitter::Node;
 
 use crate::extractor::keys::{is_placeholder_kind, is_sendable_path, qualify, MemberSeparator};
 use crate::extractor::scope::Scope;
+use crate::project::resolve::is_relative_specifier;
 
 /// One local name an import binds to a file of this project: a name this
 /// file uses and another file declares.
@@ -220,6 +221,8 @@ pub struct DraftEdge {
     pub to_id: String,
     pub kind: EdgeKind,
     pub resolved: bool,
+    /// `IMPORTS` only: the specifier as written (see [`FileModel::add_import_edge`]).
+    pub specifier: Option<String>,
 }
 
 /// One declaration of a node, before it is known whether the node has more.
@@ -410,7 +413,26 @@ impl FileModel {
             to_id: to_id.to_string(),
             kind,
             resolved,
+            specifier: None,
         });
+    }
+
+    /// The `IMPORTS` edge `from_id -> to_id`, carrying `specifier`. Several
+    /// specifiers resolving to one file share one placeholder and so one
+    /// edge, which keeps one specifier: the first non-relative one, else the
+    /// first. A config edit changes only how non-relative and `#` specifiers
+    /// resolve, so that is the one a resolution delta must be able to find.
+    pub fn add_import_edge(&mut self, from_id: &str, to_id: &str, specifier: &str) {
+        self.add_edge(from_id, EdgeKind::Imports, to_id);
+        let id = edge_id(from_id, EdgeKind::Imports, to_id, None);
+        let Some(edge) = self.edges.iter_mut().rev().find(|edge| edge.id == id) else { return };
+        let replace = match edge.specifier.as_deref() {
+            None => true,
+            Some(kept) => is_relative_specifier(kept) && !is_relative_specifier(specifier),
+        };
+        if replace {
+            edge.specifier = Some(specifier.to_string());
+        }
     }
 
     /// Whether the edge `from_id -kind-> to_id` is already in the draft.

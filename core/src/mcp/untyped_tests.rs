@@ -313,6 +313,7 @@ fn rust_with_a_semantic_tier() -> HashMap<String, Capabilities> {
             semantic_sweep: false,
             semantic_prepare: false,
             files_created: false,
+            resolution_delta: false,
             receiver_calls: ReceiverCallResolution::Resolved,
             receiver_calls_structural: ReceiverCallResolution::Unresolved,
             member_overrides: crate::daemon::manifest::MemberOverrides::None,

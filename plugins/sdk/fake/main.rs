@@ -39,6 +39,8 @@
 //!   the second does not, `semanticPass` answers are held; other frames keep
 //!   being answered meanwhile.
 //! - `semantic-pass.json`: the `result` of every complete `semanticPass`.
+//! - `resolution-changed.json`: the `result` of every `resolutionChanged`;
+//!   without it, `resolutionChanged` answers an `unknown` delta and no facts.
 //! - `semantic-pass-fields.json`: an object whose fields are set on every
 //!   `semanticPass` answer not taken by `incompleteOnce` (e.g. `incomplete`,
 //!   `unfinishedFiles`); read per request.
@@ -91,6 +93,7 @@ const HANDSHAKE_GATE: &str = "handshake.allow";
 const STALL_MARKER: &str = "stalled-once.marker";
 const INCOMPLETE_MARKER: &str = "incomplete-once.marker";
 const SEMANTIC_ANSWER: &str = "semantic-pass.json";
+const RESOLUTION_ANSWER: &str = "resolution-changed.json";
 const SEMANTIC_FIELDS: &str = "semantic-pass-fields.json";
 const SEMANTIC_PASS_LOG: &str = "semantic-passes.log";
 const SEMANTIC_PASS_GATED: &str = "semantic-pass.gated";
@@ -357,6 +360,14 @@ fn fixture_answer(
                 response[field.as_str()] = value;
             }
         }
+    }
+    if method == "resolutionChanged" {
+        let result = match fs::read_to_string(dir.join(RESOLUTION_ANSWER)) {
+            Ok(text) => serde_json::from_str(&text)
+                .unwrap_or_else(|err| fail(&format!("bad {RESOLUTION_ANSWER}: {err}"))),
+            Err(_) => json!({ "delta": { "kind": "unknown", "reason": "no scripted answer" } }),
+        };
+        return json!({ "jsonrpc": "2.0", "id": id, "result": result });
     }
     response
 }

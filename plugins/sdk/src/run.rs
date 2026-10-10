@@ -56,7 +56,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use g_mesh_wire::{FileChangeDiff, Handshake, LinkedEdge, CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION};
+use g_mesh_wire::{
+    FileChangeDiff, Handshake, LinkedEdge, ResolutionChangedResult, ResolutionDelta,
+    CURRENT_PROTOCOL_VERSION, JSONRPC_VERSION,
+};
 
 use crate::diff::diff_file;
 use crate::framing::{read_frame, write_message};
@@ -201,6 +204,16 @@ fn bulk_index<E: Extractor>(extractor: &E, spec: &ResolvedSpec, root: &Path) -> 
         files += 1;
         nodes += graph.nodes.len();
         edges += graph.edges.len();
+    }
+
+    // The facts the walk was built from, last: core stores them with the
+    // walk's rows, and a stream cut short never delivers them.
+    if let Some(facts) = facts_caught(extractor, &project, &spec.language) {
+        let line = serde_json::json!({ "resolutionFacts": facts });
+        if let Err(err) = writeln!(out, "{line}") {
+            crate::log_line!("[{}] failed to write the bulk stream: {err}", spec.language);
+            return 1;
+        }
     }
 
     if let Err(err) = out.flush() {
@@ -415,7 +428,11 @@ impl<E: Extractor> Session<'_, E> {
                     .and_then(|params| params.get("filePath"))
                     .and_then(|path| path.as_str())
                     .unwrap_or_default();
-                let diff = self.file_changed(&RelPath::new(path));
+                let reextract = params
+                    .and_then(|params| params.get("reextract"))
+                    .and_then(|reextract| reextract.as_bool())
+                    .unwrap_or(false);
+                let diff = self.file_changed(&RelPath::new(path), reextract);
                 self.respond(out, id, diff)
             }
             "filesCreated" => {
@@ -506,6 +523,23 @@ impl<E: Extractor> Session<'_, E> {
                 self.engine.workspace_changed();
                 self.acknowledge(out, id)
             }
+            "resolutionChanged" => {
+                let file = params
+                    .and_then(|params| params.get("filePath"))
+                    .and_then(|path| path.as_str())
+                    .unwrap_or_default();
+                let previous = params
+                    .and_then(|params| params.get("previousFacts"))
+                    .and_then(|facts| facts.as_str())
+                    .map(str::to_string);
+                let result = self.resolution_changed(file, previous.as_deref());
+                let Some(id) = id else { return Ok(()) };
+                write_message(
+                    out,
+                    &serde_json::json!({ "jsonrpc": JSONRPC_VERSION, "id": id, "result": result }),
+                )?;
+                Ok(())
+            }
             "prepareSemanticPass" => {
                 // A notification: a whole-project pass is owed and will
                 // follow, so the engine may start now. Nothing is hydrated
@@ -576,8 +610,61 @@ impl<E: Extractor> Session<'_, E> {
         true
     }
 
-    /// Reparses one file against what this process last saw of it.
-    fn file_changed(&mut self, path: &RelPath) -> FileChangeDiff {
+    /// Reloads the project model after the watch file `file` was saved and
+    /// says what that changed for resolution, given the facts the index was
+    /// built from (`previous`).
+    ///
+    /// Invariants:
+    /// - a model that fails to load answers `Unknown` and the old model stays
+    ///   in use, as on `workspaceChanged`;
+    /// - no `previous`, or a delta that panics, answers `Unknown`;
+    /// - only `Unknown` clears the cached extractions: core follows it with a
+    ///   whole-language reindex. Otherwise every cached extraction outside the
+    ///   delta is still what the new model would produce, and core re-extracts
+    ///   the files inside it with `reextract`;
+    /// - the semantic engine always stops trusting its earlier readiness.
+    fn resolution_changed(&mut self, file: &str, previous: Option<&str>) -> ResolutionChangedResult {
+        crate::log_line!(
+            "[{}] resolution config changed ({file}) - reloading the project model",
+            self.spec.language
+        );
+        let result = match self.extractor.load_project(&self.root) {
+            Err(err) => {
+                crate::log_line!(
+                    "[{}] failed to load the project at {}: {err:#} - keeping the previous model",
+                    self.spec.language,
+                    self.root.display()
+                );
+                ResolutionChangedResult {
+                    delta: ResolutionDelta::Unknown {
+                        reason: format!("the project model failed to load: {err:#}"),
+                    },
+                    facts: None,
+                }
+            }
+            Ok(project) => {
+                let delta = match previous {
+                    None => ResolutionDelta::Unknown { reason: "no previous resolution facts".to_string() },
+                    Some(previous) => delta_caught(self.extractor, previous, &project, &self.spec.language),
+                };
+                let facts = facts_caught(self.extractor, &project, &self.spec.language);
+                self.project = Some(project);
+                ResolutionChangedResult { delta, facts }
+            }
+        };
+        if matches!(result.delta, ResolutionDelta::Unknown { .. }) {
+            self.index.clear();
+            self.project_hydrated = false;
+        }
+        self.engine.workspace_changed();
+        result
+    }
+
+    /// Reparses one file against what this process last saw of it. With
+    /// `reextract`, a file whose text is unchanged is extracted anyway (the
+    /// project model it resolves against changed); the diff is still against
+    /// the last graph core was sent.
+    fn file_changed(&mut self, path: &RelPath, reextract: bool) -> FileChangeDiff {
         let remapped = self.indexed_spelling(path);
         let path = remapped.as_ref().unwrap_or(path);
         if !self.claims(path) {
@@ -607,7 +694,8 @@ impl<E: Extractor> Session<'_, E> {
         // from a pure extractor, so there is nothing to parse and nothing to
         // say. Only against a reported entry: a hydrated one at the same text
         // is still news to core (GM-487).
-        if self.index.entry(path).is_some_and(|entry| entry.reported && entry.source == source) {
+        if !reextract && self.index.entry(path).is_some_and(|entry| entry.reported && entry.source == source)
+        {
             return FileChangeDiff::default();
         }
 
@@ -869,6 +957,28 @@ fn presence_caught<E: Extractor>(
     if catch_unwind(AssertUnwindSafe(|| extractor.file_presence_changed(project, path, present))).is_err() {
         crate::log_line!("[{language}] the presence hook panicked on {path} - its presence is not applied");
     }
+}
+
+/// [`Extractor::resolution_facts`], with a panic costing the facts (core then
+/// stores none, and the next watch-file save reindexes the language).
+fn facts_caught<E: Extractor>(extractor: &E, project: &E::Project, language: &str) -> Option<String> {
+    catch_unwind(AssertUnwindSafe(|| extractor.resolution_facts(project))).unwrap_or_else(|_| {
+        crate::log_line!("[{language}] the extractor panicked computing its resolution facts");
+        None
+    })
+}
+
+/// [`Extractor::resolution_delta`], with a panic answering `Unknown`.
+fn delta_caught<E: Extractor>(
+    extractor: &E,
+    previous: &str,
+    project: &E::Project,
+    language: &str,
+) -> ResolutionDelta {
+    catch_unwind(AssertUnwindSafe(|| extractor.resolution_delta(previous, project))).unwrap_or_else(|_| {
+        crate::log_line!("[{language}] the extractor panicked computing its resolution delta");
+        ResolutionDelta::Unknown { reason: "the resolution delta panicked".to_string() }
+    })
 }
 
 /// [`Extractor::extract`], with a panic in it costing this file rather than
@@ -2076,3 +2186,6 @@ mod presence_tests {
         assert_eq!(response["result"], serde_json::json!({ "acknowledged": true }));
     }
 }
+
+#[cfg(test)]
+mod resolution_tests;

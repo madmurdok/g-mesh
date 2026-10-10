@@ -1554,10 +1554,39 @@ impl Bodies<'_, '_> {
         let segments = flatten_path(supertype, self.source)?;
         #[cfg(test)]
         crate::census::push_ctx(crate::census::Ctx::Supertype);
-        let bound = self.resolve_path(&segments, module, block, Some(NodeKind::Type));
+        let bound = match segments.as_slice() {
+            [Seg::Name(name)] if self.reaches_only_through_glob(name, module) => {
+                #[cfg(test)]
+                crate::census::record(crate::census::Reason::SupertypeViaGlob, name, &module.key);
+                Bound::There {
+                    target: container_target(&module.key, TargetKey::Name((*name).to_string()), &module.key),
+                    name: (*name).to_string(),
+                }
+            }
+            _ => self.resolve_path(&segments, module, block, Some(NodeKind::Type)),
+        };
         #[cfg(test)]
         crate::census::pop_ctx();
         Some(bound)
+    }
+
+    /// GM-537: whether a bare trait name in a supertype clause can only have
+    /// come in through a glob `use` of this module - nothing here binds,
+    /// declares or imports it by item, and the module has a glob.
+    ///
+    /// Such a clause is addressed as a `name` key in the module itself; core
+    /// follows the module's private `*` re-export row to the declaring
+    /// container (through further re-exports), and refuses when two globs
+    /// both offer the name. Only supertype clauses get this: a bare *type*
+    /// elsewhere (`Vec`, `String`) stays unaddressed (Decision 7), while a
+    /// trait clause is rare enough to afford a placeholder that may not link
+    /// (`impl Display for X` under `use super::*`).
+    fn reaches_only_through_glob(&self, name: &str, module: &ModuleCtx) -> bool {
+        name != "Self"
+            && !self.scopes.binds(name)
+            && self.model.has_glob(&module.key)
+            && self.model.lookup_name(&module.key, name, Some(NodeKind::Type)).is_none()
+            && self.model.lookup_import(&module.key, name).is_none()
     }
 
     /// `impl Tr for T { fn m() }` - `SUPERTYPE_OF` from `<T as Tr>::m` to
@@ -1566,7 +1595,10 @@ impl Bodies<'_, '_> {
     ///
     /// Only for a trait this project declares: `trait_bound` is the clause's
     /// own resolution, and a trait from another crate (`Bound::Nothing`)
-    /// has no node to land on. An unresolved clause (`Bound::Open`) gets no
+    /// has no node to land on. A trait that reaches the module only through
+    /// a glob `use` (GM-537) resolves to a `name` placeholder in the module
+    /// itself, so `Tr::m` is addressed through the module too - core walks
+    /// the head `Tr` through the glob to the declaring container. An unresolved clause (`Bound::Open`) gets no
     /// member edge either: its open site would be answered with the trait
     /// itself, not the trait's method. The member's address is the clause's
     /// path plus one `::m` segment, resolved the way a written `Tr::m` path

@@ -44,6 +44,16 @@ pub fn resolve_page_size(limit: Option<u32>) -> usize {
 /// produces, so normal calls never notice this exists.
 pub const MAX_RESPONSE_BYTES: usize = 20_000;
 
+/// Ceiling on one `get_file_outline` response, in the same unit as
+/// [`MAX_RESPONSE_BYTES`] and applied whatever `limit` and `detail` are. An
+/// outline is read whole far less often than it is re-read: every byte of it
+/// is resent on each later turn of the conversation. Measured before this
+/// bound (GM-523), `limit: 200` on `plugins/sdk/src/lsp/bridge.rs` was one
+/// 54,975-byte answer and on excalidraw's `App.tsx` 59,754 bytes. 8,000 is
+/// the size [`FILE_TALLY_MAX_BYTES`] already uses: about 59 compact rows of
+/// `bridge.rs` per page, about 2k tokens at most.
+pub const OUTLINE_MAX_RESPONSE_BYTES: usize = 8_000;
+
 /// The `kind` value a `File` node carries. A `File` node's `qualifiedName`
 /// IS its own project-relative path by construction - see
 /// `plugins/typescript/src/extractor/model.rs`, which sets
@@ -135,7 +145,13 @@ pub fn wire_len<T: Serialize + ?Sized>(value: &T) -> usize {
 
 /// The largest byte budget for a response's one growable part (its rows, or
 /// a tally that is itself the answer) at which the whole response fits
-/// [`MAX_RESPONSE_BYTES`].
+/// [`MAX_RESPONSE_BYTES`]: [`fit_budget_within`] at that ceiling.
+pub fn fit_budget(measure: impl FnMut(usize) -> (usize, usize)) -> usize {
+    fit_budget_within(MAX_RESPONSE_BYTES, measure)
+}
+
+/// The largest byte budget for a response's one growable part at which the
+/// whole response fits `ceiling` bytes.
 ///
 /// `measure(budget)` builds the response with that part cut to `budget`
 /// bytes and returns `(part bytes, whole response bytes)`. The rest of the
@@ -147,16 +163,16 @@ pub fn wire_len<T: Serialize + ?Sized>(value: &T) -> usize {
 /// exceeds the ceiling only when that floor alone and the response's other
 /// fields do, which their own byte caps rule out for any input but a single
 /// row or anchor that is itself near the ceiling.
-pub fn fit_budget(mut measure: impl FnMut(usize) -> (usize, usize)) -> usize {
-    let mut budget = MAX_RESPONSE_BYTES;
+pub fn fit_budget_within(ceiling: usize, mut measure: impl FnMut(usize) -> (usize, usize)) -> usize {
+    let mut budget = ceiling;
     let mut last_part = usize::MAX;
     loop {
         let (part, whole) = measure(budget);
-        if whole <= MAX_RESPONSE_BYTES || part >= last_part || budget == 0 {
+        if whole <= ceiling || part >= last_part || budget == 0 {
             return budget;
         }
         last_part = part;
-        budget = budget.min(part).saturating_sub(whole - MAX_RESPONSE_BYTES);
+        budget = budget.min(part).saturating_sub(whole - ceiling);
     }
 }
 
@@ -807,6 +823,7 @@ pub fn paginate_edges(
                     engine: row.get("engine")?,
                     resolved,
                     to_declaration: row.get("toDeclaration")?,
+                    specifier: None,
                 },
                 rank,
             })
@@ -883,18 +900,72 @@ pub fn paginate_defines(
     let has_more = rows.len() > page_size;
     rows.truncate(page_size);
 
-    let next_cursor = has_more.then(|| {
-        let last = rows.last().expect("has_more implies at least one row");
-        encode_cursor(&SourceOrderCursor {
-            start_line: last.start_line,
-            start_col: last.start_col,
-            id: last.id.clone(),
-        })
-    });
+    let next_cursor =
+        has_more.then(|| source_order_cursor(rows.last().expect("has_more implies at least one row")));
 
     // No per-row resolved concept here - `DEFINES` rows are a file's own
     // declarations, read back in source order, not name-matched edges.
     Ok(Page { results: rows, has_more, next_cursor, all_unresolved: false })
+}
+
+/// The cursor [`paginate_defines`] resumes after `node` with.
+fn source_order_cursor(node: &NodeRecord) -> String {
+    encode_cursor(&SourceOrderCursor {
+        start_line: node.start_line,
+        start_col: node.start_col,
+        id: node.id.clone(),
+    })
+}
+
+/// Cuts a [`paginate_defines`] page so the whole response it is sent in fits
+/// `ceiling` bytes. `render` turns each node into its wire row;
+/// `response_len(rows, has_more, next_cursor)` serializes the response a
+/// candidate page would produce, so the envelope (`total`, the cursor) is
+/// measured with the rows, never estimated ([`fit_budget_within`]).
+///
+/// A page whose response fits is returned with `has_more` and `next_cursor`
+/// as the SQL page gave them. A cut page keeps at least one row, even one
+/// that alone is over `ceiling` (an empty page with `has_more: true` would
+/// never progress), and resumes right after the last row kept: `has_more`
+/// becomes true and the cursor is that row's, so no row is skipped or sent
+/// twice across pages.
+pub fn bound_defines_page<T: Serialize>(
+    page: Page<NodeRecord>,
+    render: impl Fn(NodeRecord) -> T,
+    mut response_len: impl FnMut(&[T], bool, Option<&str>) -> usize,
+    ceiling: usize,
+) -> Page<T> {
+    let Page { results: nodes, has_more, next_cursor, all_unresolved } = page;
+    let cursors: Vec<String> = nodes.iter().map(source_order_cursor).collect();
+    let mut items: Vec<T> = nodes.into_iter().map(render).collect();
+
+    let cut_at = |items: &[T], budget: usize| -> (usize, bool, Option<String>) {
+        match longest_prefix_fitting(items, budget) {
+            None => (items.len(), has_more, next_cursor.clone()),
+            Some(cut) => (cut, true, Some(cursors[cut - 1].clone())),
+        }
+    };
+
+    let budget = fit_budget_within(ceiling, |budget| {
+        let (kept, more, cursor) = cut_at(&items, budget);
+        (wire_len(&items[..kept]), response_len(&items[..kept], more, cursor.as_deref()))
+    });
+    let (kept, more, cursor) = cut_at(&items, budget);
+    items.truncate(kept);
+    Page { results: items, has_more: more, next_cursor: cursor, all_unresolved }
+}
+
+/// How many `DEFINES` edges leave `file_node_id`: the whole outline's row
+/// count, whatever page is being served.
+pub fn count_defines(conn: &Connection, file_node_id: &str) -> Result<usize> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edges WHERE fromId = ?1 AND kind = 'DEFINES'",
+            params![file_node_id],
+            |row| row.get(0),
+        )
+        .context("failed to count DEFINES edges")?;
+    Ok(count as usize)
 }
 
 /// The score travels as its IEEE-754 bits, not as a JSON number: the keyset

@@ -26,6 +26,7 @@ pub mod gaps;
 pub mod internals;
 pub mod prelude;
 pub mod shapes;
+pub mod sirens;
 
 pub fn run() -> &'static str {
     let _ = inline_mod::helper();

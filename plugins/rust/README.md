@@ -138,11 +138,10 @@ page, whose `overrides` field names the trait member those calls sit on
 The edge behind `overrides` also shows up elsewhere: `find_implementations` and
 `find_references` on a trait method (for example `Shape::area`) list the impl
 methods `<Square as Shape>::area`, and the references page marks them
-`referenceKind: SUPERTYPE_OF`. The limit: the plugin emits the edge only when
-it resolves the impl's trait clause itself, so a method implementing a trait
-it cannot resolve - for example one reached through a glob import of another
-crate's re-export (`use alpha::prelude::*;`) - gets no `overrides`, even after
-rust-analyzer's pass.
+`referenceKind: SUPERTYPE_OF`. The plugin emits the edge whenever it can
+address the impl's trait clause, including a trait reached only through a glob
+import (`use alpha::prelude::*;`, GM-537); a trait from outside the project
+(`Display::fmt`) has no member to name.
 
 ## What it does not see
 
@@ -188,12 +187,16 @@ Two smaller ones, for completeness:
   is addressed as `T::m` and keeps its open site, naming the edge in
   `replaces` (`src/extractor/typing.rs` lists the rules). A trait-impl
   method is not found that way: its name is `<T as Tr>::m`, not `T::m`.
-- **An `impl Trait for T` whose trait arrives through a glob import** gets no
-  structural edge and not even an open site - a bare type name that is
-  neither declared nor imported by item resolves to nothing, deliberately, so
-  that `Vec` and `String` do not become questions. The semantic tier finds it
-  from the other end, by asking rust-analyzer which types implement the
-  trait; `conformance/project/crates/beta/src/main.rs` is that case.
+- **A bare type that arrives through a glob import** gets no structural edge
+  and not even an open site - a bare type name that is neither declared nor
+  imported by item resolves to nothing, deliberately, so that `Vec` and
+  `String` do not become questions. Trait clauses are the exception (GM-537):
+  in `impl Trait for T` or `trait Sub: Trait`, a bare trait in a module with a
+  glob `use` becomes a `name` placeholder into that module, which core walks
+  through the glob (and any `pub use` behind it) to the declaring trait, so
+  the impl gets both its type-level and its method-level `SUPERTYPE_OF` edges;
+  `conformance/project/crates/beta/src/main.rs` is that case. Two globs that
+  both offer the name leave it unlinked, never linked to the wrong one.
 
   GM-314 put numbers on both halves of that. The exclusion is worth keeping:
   on tokio-rs/tokio, recording every unresolved bare name adds 5,858 questions
@@ -206,8 +209,9 @@ Two smaller ones, for completeness:
   repository's own tree. The recommendation there is not a wider question list
   but a structural one: the extractor already knows the module has a glob and
   which container it names, so a `name`-keyed placeholder into that container
-  costs the bridge nothing and fails to a missing edge. What blocks it is two
-  globs in scope at once, which would make the placeholder ambiguous.
+  costs the bridge nothing and fails to a missing edge. GM-537 does exactly
+  that for trait clauses, and only for them; two globs in scope at once make
+  the placeholder ambiguous, and core's re-export walk refuses it.
 - **A path call through a `pub use` chain** (`a::b::f()` where `a::b`
   re-exports `f`) does not resolve: a type-qualified path is addressed by
   `qualifiedName`, and core walks re-export chains for `name` keys only. A

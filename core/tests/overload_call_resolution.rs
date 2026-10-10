@@ -199,13 +199,13 @@ async fn an_overloaded_function_resolves_correctly_through_the_real_mcp_tools() 
     // real call signature, never the implementation's `string | number`
     // union - the one signature TypeScript deliberately never shows a
     // caller.
-    let outline = client
-        .call_tool(
-            CallToolRequestParams::new("get_file_outline")
-                .with_arguments(json!({ "file_path": "lib.ts" }).as_object().cloned().unwrap()),
-        )
-        .await
-        .expect("tools/call failed");
+    let outline =
+        client
+            .call_tool(CallToolRequestParams::new("get_file_outline").with_arguments(
+                json!({ "file_path": "lib.ts", "detail": "full" }).as_object().cloned().unwrap(),
+            ))
+            .await
+            .expect("tools/call failed");
     let outline = body(&outline);
     let outline_rows = outline["results"].as_array().expect("results is not an array");
     let parse_rows: Vec<&Value> = outline_rows.iter().filter(|r| r["name"] == "parse").collect();

@@ -95,9 +95,9 @@ engine = "rust-analyzer"
 # The `nativeKind` this extractor gives a `trait_item` (src/extractor/
 # decls.rs). It is the one language-shaped fact the bridge is handed rather
 # than knowing: these are the nodes it asks `textDocument/implementation`
-# about, which is how an `impl` in *another crate* of the workspace becomes a
-# `SUPERTYPE_OF` edge - no `use` in that crate resolves structurally when the
-# trait arrives through a glob import, so nothing but this sweep finds it.
+# about, which is how an `impl` the parser cannot see (one a `macro_rules!`
+# from another crate writes) becomes a `SUPERTYPE_OF` edge. A trait reached
+# through a glob import resolves structurally since GM-537.
 implementation_kinds = ["trait"]
 
 # The default, stated out loud so the trace behind it has somewhere to live.
