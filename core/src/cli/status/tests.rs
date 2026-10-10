@@ -1367,3 +1367,268 @@ fn a_file_under_a_link_into_a_languages_excluded_dir_is_not_that_languages() {
 
     assert_eq!(discovered(&fixture), vec!["src/dep/lib.rs", "src/main.ts"]);
 }
+
+// ---------------------------------------------------------------------
+// GM-500: light and full status, the languages block, `--json`
+// (docs/architecture/gm-500-status-language-outcomes.md)
+// ---------------------------------------------------------------------
+
+/// A report with nothing indexed and `languages` as given.
+fn languages_report(section: LanguageSection, installed: &[(&str, &str)]) -> Report {
+    let mut report = report_with(Fixture::new(&[]).status());
+    report.mode = Mode::Light;
+    report.index.coverage = None;
+    report.languages = LanguagesReport {
+        section,
+        installed: Ok(installed.iter().map(|(l, v)| (l.to_string(), v.to_string())).collect()),
+    };
+    report
+}
+
+fn languages_json(report: &Report) -> serde_json::Value {
+    json::to_json(report)["languages"].clone()
+}
+
+/// Light mode does not walk the project: on the same project and index,
+/// `Full` counts the files on disk and `Light` leaves coverage unknown.
+/// Control: `index_status`'s `Mode::Light` arm walks (`Some(discover_source_files(..)?)`)
+/// -> light coverage is `Some`.
+#[test]
+fn light_mode_leaves_coverage_unchecked_where_full_walks_the_project() {
+    let fixture = Fixture::new(&[("a.ts", "export const a = 1;"), ("b.ts", "export const b = 2;")]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "a.ts", false);
+
+    let full = index_status(fixture.root(), &fixture.db_path(), &bundled_plugins(), Mode::Full).unwrap();
+    assert_eq!(full.coverage, Some(Coverage { discovered: 2, indexed: 1, dirty: 1 }));
+
+    let light = index_status(fixture.root(), &fixture.db_path(), &bundled_plugins(), Mode::Light).unwrap();
+    assert_eq!(light.coverage, None, "light mode must not walk the project");
+    assert_eq!(IndexStatus { coverage: full.coverage, ..light }, full, "everything else is the same read");
+
+    // The same with no index at all: full owes every file, light says nothing.
+    let unindexed = Fixture::new(&[("a.ts", "export const a = 1;")]);
+    let light =
+        index_status(unindexed.root(), &unindexed.db_path(), &bundled_plugins(), Mode::Light).unwrap();
+    assert_eq!(light.coverage, None);
+}
+
+/// Light renders `not checked` in place of the coverage and dirty lines, and
+/// its JSON has `coverage: null` beside `mode: "light"`; full renders both
+/// lines and the counts. Control: delete the `None` arm's `writeln` in
+/// `render` -> no `not checked` line; map `"coverage"` to `Value::Null`
+/// unconditionally in `json::index` -> the full JSON has no counts.
+#[test]
+fn light_and_full_render_and_encode_coverage_differently() {
+    let light = languages_report(LanguageSection::NoIndex, &[]);
+    let rendered = render(&light);
+    assert!(rendered.contains("  index coverage:  not checked - `g-mesh status --full`"), "{rendered}");
+    assert!(!rendered.contains("dirty files:"), "{rendered}");
+    let encoded = json::to_json(&light);
+    assert_eq!(encoded["mode"], "light");
+    assert_eq!(encoded["formatVersion"], json::FORMAT_VERSION);
+    assert!(encoded["index"]["coverage"].is_null(), "{encoded}");
+
+    let mut full = light;
+    full.mode = Mode::Full;
+    full.index.coverage = Some(Coverage { discovered: 4, indexed: 3, dirty: 2 });
+    let rendered = render(&full);
+    assert!(rendered.contains("  index coverage:  75.0% (3/4 source files)"), "{rendered}");
+    assert!(rendered.contains("dirty files:"), "{rendered}");
+    assert!(!rendered.contains("not checked"), "{rendered}");
+    let encoded = json::to_json(&full);
+    assert_eq!(encoded["mode"], "full");
+    assert_eq!(
+        encoded["index"]["coverage"],
+        serde_json::json!({ "discovered": 4, "indexed": 3, "dirty": 2 })
+    );
+}
+
+/// The JSON's top-level and `index` key sets are the contract `formatVersion`
+/// versions. Control: rename any key in `json::to_json` -> this fails.
+#[test]
+fn the_json_report_has_exactly_the_documented_keys() {
+    let encoded = json::to_json(&languages_report(LanguageSection::NoIndex, &[]));
+    let keys = |value: &serde_json::Value| value.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(
+        keys(&encoded),
+        [
+            "daemon",
+            "formatVersion",
+            "front",
+            "index",
+            "languages",
+            "lastUsed",
+            "mode",
+            "plugins",
+            "projectId",
+            "projectRoot",
+            "stateDir",
+            "suspended"
+        ]
+    );
+    assert_eq!(
+        keys(&encoded["index"]),
+        ["bulkIndexed", "coverage", "phase", "progress", "semanticPass", "syntaxErrorFiles"]
+    );
+    assert_eq!(keys(&encoded["languages"]), ["outcomes", "pluginDiscoveryError", "state"]);
+}
+
+/// Every recorded outcome is one row, with the installed plugin's version or
+/// its absence, and a plugin installed since the walk is a row of its own.
+/// Controls: in `LanguagesReport::rows` set `plugin_version: None` -> no
+/// `(plugin 1.2.0)`; delete the loop over `installed` -> no `typescript`
+/// row; delete `describe_language_row`'s `if let Some(installed)` return ->
+/// `go` reads as absent with an install command.
+#[test]
+fn recorded_outcomes_render_with_the_installed_plugin_beside_each() {
+    let report = languages_report(
+        LanguageSection::Recorded(vec![
+            ("go".to_string(), LanguageOutcome::PluginAbsent { files: Some(3) }),
+            ("java".to_string(), LanguageOutcome::PluginAbsent { files: None }),
+            (
+                "python".to_string(),
+                LanguageOutcome::Failed { error: "spawn failed\n  no such file".to_string() },
+            ),
+            ("rust".to_string(), LanguageOutcome::Indexed { files: 1 }),
+            ("zig".to_string(), LanguageOutcome::Indexed { files: 12 }),
+        ]),
+        &[("rust", "1.2.0"), ("typescript", "0.9.0"), ("java", "2.0.0")],
+    );
+
+    assert_eq!(
+        language_lines(&report.languages),
+        [
+            "  languages:       5 recorded by the last walk".to_string(),
+            "    go:            plugin absent - 3 file(s) not indexed; install it with `g-mesh plugins install go`"
+                .to_string(),
+            "    java:          plugin absent at the last walk; 2.0.0 installed since - the next daemon start \
+             re-walks"
+                .to_string(),
+            "    python:        failed (plugin no longer installed) - not in the index: spawn failed: no such file"
+                .to_string(),
+            "    rust:          indexed, 1 file (plugin 1.2.0)".to_string(),
+            "    typescript:    installed 0.9.0 - not in the last walk".to_string(),
+            "    zig:           indexed, 12 files (plugin no longer installed)".to_string(),
+        ]
+    );
+    let rendered = render(&report);
+    let languages = rendered.find("  languages:").expect("a languages block");
+    let syntax = rendered.find("  syntax errors:").expect("a syntax errors line");
+    assert!(languages < syntax, "the languages block precedes syntax errors: {rendered}");
+
+    let encoded = languages_json(&report);
+    assert_eq!(encoded["state"], "recorded");
+    assert!(encoded["pluginDiscoveryError"].is_null());
+    assert_eq!(
+        encoded["outcomes"],
+        serde_json::json!([
+            { "language": "go", "outcome": "plugin_absent", "files": 3, "pluginVersion": null,
+              "installCommand": "g-mesh plugins install go" },
+            { "language": "java", "outcome": "plugin_absent", "files": null, "pluginVersion": "2.0.0",
+              "installCommand": null },
+            { "language": "python", "outcome": "failed", "pluginVersion": null,
+              "error": "spawn failed: no such file", "causes": ["spawn failed", "no such file"] },
+            { "language": "rust", "outcome": "indexed", "files": 1, "pluginVersion": "1.2.0" },
+            { "language": "typescript", "outcome": "not_in_last_walk", "pluginVersion": "0.9.0" },
+            { "language": "zig", "outcome": "indexed", "files": 12, "pluginVersion": null },
+        ])
+    );
+}
+
+/// The states with no rows say which kind of empty they are, in text and in
+/// JSON, and list no rows even with plugins installed. Control: in
+/// `language_lines`, print one header for every empty state -> the headers
+/// no longer differ.
+#[test]
+fn each_state_without_rows_names_itself_in_text_and_json() {
+    let cases = [
+        (LanguageSection::NoIndex, "none recorded - no index yet", "no_index"),
+        (
+            LanguageSection::NoneRecorded,
+            "none recorded - no walk has finished on this index; run `g-mesh reindex`",
+            "none_recorded",
+        ),
+        (
+            LanguageSection::WalkInProgress,
+            "not recorded yet - the walk in progress records them when it finishes",
+            "walk_in_progress",
+        ),
+        (
+            LanguageSection::PredatesOutcomes { schema_version: Some("12".to_string()) },
+            "not recorded - this index predates per-language outcomes (schema 12); the next daemon start \
+             rebuilds it",
+            "predates_outcomes",
+        ),
+    ];
+    for (section, header, state) in cases {
+        let report = languages_report(section, &[("rust", "1.2.0")]);
+        assert_eq!(language_lines(&report.languages), [format!("  languages:       {header}")], "{state}");
+        let encoded = languages_json(&report);
+        assert_eq!(encoded["state"], state);
+        assert_eq!(encoded["outcomes"], serde_json::json!([]), "{state}");
+    }
+    let predates = languages_json(&languages_report(
+        LanguageSection::PredatesOutcomes { schema_version: Some("12".to_string()) },
+        &[],
+    ));
+    assert_eq!(predates["schemaVersion"], "12");
+
+    // A front prints no languages block at all.
+    let front = languages_report(LanguageSection::Front, &[]);
+    assert!(language_lines(&front.languages).is_empty());
+    assert_eq!(languages_json(&front)["state"], "front");
+}
+
+/// A failed plugin discovery drops every version clause (nothing is known
+/// about what is installed) and is named on its own line and in
+/// `pluginDiscoveryError`.
+#[test]
+fn a_failed_plugin_discovery_is_named_and_drops_the_version_clauses() {
+    let mut report = languages_report(
+        LanguageSection::Recorded(vec![("rust".to_string(), LanguageOutcome::Indexed { files: 2 })]),
+        &[],
+    );
+    report.languages.installed = Err("bad plugin.toml".to_string());
+
+    assert_eq!(
+        language_lines(&report.languages),
+        [
+            "  languages:       1 recorded by the last walk".to_string(),
+            "    rust:          indexed, 2 files".to_string(),
+            "  plugins:         discovery failed - bad plugin.toml".to_string(),
+        ]
+    );
+    let encoded = languages_json(&report);
+    assert_eq!(encoded["pluginDiscoveryError"], "bad plugin.toml");
+    assert_eq!(encoded["outcomes"][0]["pluginVersion"], serde_json::Value::Null);
+}
+
+/// `language_section` reads which state the index is in: no file, a table
+/// with rows, an empty table with and without a live walk, and an index from
+/// before the table existed. Controls: always `NoneRecorded` when empty ->
+/// the live-walk case fails; remove the `sqlite_master` probe -> the
+/// pre-13 case errors on the missing table.
+#[test]
+fn language_section_tells_every_index_state_apart() {
+    let fixture = Fixture::new(&[]);
+    assert_eq!(language_section(&fixture.db_path(), false).unwrap(), LanguageSection::NoIndex);
+
+    let conn = fixture.index();
+    assert_eq!(language_section(&fixture.db_path(), false).unwrap(), LanguageSection::NoneRecorded);
+    assert_eq!(language_section(&fixture.db_path(), true).unwrap(), LanguageSection::WalkInProgress);
+
+    let outcomes = BTreeMap::from([("go".to_string(), LanguageOutcome::PluginAbsent { files: Some(1) })]);
+    schema::record_language_outcomes(&conn, &outcomes).unwrap();
+    let recorded =
+        LanguageSection::Recorded(vec![("go".to_string(), LanguageOutcome::PluginAbsent { files: Some(1) })]);
+    assert_eq!(language_section(&fixture.db_path(), false).unwrap(), recorded);
+    assert_eq!(language_section(&fixture.db_path(), true).unwrap(), recorded, "rows win over a live walk");
+
+    conn.execute_batch("DROP TABLE language_outcome; UPDATE meta SET schema_version = '12' WHERE id = 1;")
+        .unwrap();
+    assert_eq!(
+        language_section(&fixture.db_path(), false).unwrap(),
+        LanguageSection::PredatesOutcomes { schema_version: Some("12".to_string()) }
+    );
+}

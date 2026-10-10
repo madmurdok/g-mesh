@@ -334,6 +334,18 @@ fn status_warns_about_a_project_idle_past_the_threshold() {
     assert_contains(&status, "idle for more than 90 days");
     assert_contains(&status, &project_id);
     assert_contains(&status, "g-mesh clean expired");
+
+    // GM-500: under `--json` the warning goes to stderr and stdout stays one
+    // JSON object (in this test, not its own: the config lock is per process).
+    // Control: `print!` instead of `eprint!` in `run`'s JSON branch -> stdout
+    // no longer parses.
+    let output = status_output(project.root(), &["--json"], &[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("stdout is not one JSON object ({err}): {stdout}"));
+    assert_eq!(report["mode"], "light");
+    assert_contains(&String::from_utf8_lossy(&output.stderr), "idle for more than 90 days");
 }
 
 /// The other half of the same criterion: `cleanup.enabled = false` prints
@@ -374,4 +386,71 @@ fn status_in_a_front_served_folder_prints_the_front_line_and_no_coverage() {
     assert!(!status.contains("index coverage"), "a front has no coverage to report:\n{status}");
     assert!(!status.contains("dirty files"), "a front has no dirty files to report:\n{status}");
     assert!(daemon_process.try_wait().unwrap().is_none(), "the front must still be running");
+}
+
+/// `g-mesh status` with `flags` and extra environment, its output unchecked.
+fn status_output(root: &Path, flags: &[&str], envs: &[(&str, &Path)]) -> std::process::Output {
+    let mut command = Command::new(BIN);
+    command.arg("status").args(flags).current_dir(root);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().expect("failed to run `g-mesh status`")
+}
+
+/// GM-500: an index built before per-language outcomes (schema 12, no
+/// `language_outcome` table) says so, in text and JSON, and status still
+/// exits 0. Control: remove `language_section`'s `sqlite_master` probe ->
+/// status fails on the missing table.
+#[test]
+fn status_on_an_index_that_predates_language_outcomes_says_so() {
+    let project = Project::new();
+    project.backdate_last_used(0);
+    let conn = Connection::open(project.state_dir().join("index.db")).expect("failed to open index.db");
+    conn.execute_batch("DROP TABLE language_outcome; UPDATE meta SET schema_version = '12' WHERE id = 1;")
+        .expect("failed to make the index a schema-12 one");
+    drop(conn);
+
+    let status = project.status();
+    assert_contains(
+        &status,
+        "languages:       not recorded - this index predates per-language outcomes (schema 12); the next \
+         daemon start rebuilds it",
+    );
+
+    let output = status_output(project.root(), &["--json"], &[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is one JSON object");
+    assert_eq!(report["languages"]["state"], "predates_outcomes", "{report}");
+    assert_eq!(report["languages"]["schemaVersion"], "12", "{report}");
+    assert_eq!(report["languages"]["outcomes"], serde_json::json!([]), "{report}");
+}
+
+/// GM-500: a plugin discovery that fails (a malformed `plugin.toml`) is
+/// named by the light status, which exits 0, and fails `--full`, whose walk
+/// needs the plugins. Control: `manifest::discover(..)?` in `collect` ->
+/// the light status fails too.
+#[test]
+fn a_failed_plugin_discovery_is_reported_by_light_status_and_fatal_to_full() {
+    let project = Project::new();
+    let plugins = tempfile::tempdir().expect("failed to create a plugin root");
+    let broken = plugins.path().join("broken");
+    std::fs::create_dir_all(&broken).expect("failed to create a plugin directory");
+    std::fs::write(broken.join("plugin.toml"), "this is not toml [").expect("failed to write plugin.toml");
+    let envs = [("G_MESH_PLUGIN_ROOTS_OVERRIDE", plugins.path())];
+
+    let light = status_output(project.root(), &[], &envs);
+    assert!(light.status.success(), "{}", String::from_utf8_lossy(&light.stderr));
+    assert_contains(&String::from_utf8_lossy(&light.stdout), "plugins:         discovery failed - ");
+
+    let light_json = status_output(project.root(), &["--json"], &envs);
+    assert!(light_json.status.success(), "{}", String::from_utf8_lossy(&light_json.stderr));
+    let report: serde_json::Value =
+        serde_json::from_slice(&light_json.stdout).expect("stdout is one JSON object");
+    assert!(report["languages"]["pluginDiscoveryError"].is_string(), "{report}");
+
+    let full = status_output(project.root(), &["--full"], &envs);
+    assert!(!full.status.success(), "the full walk needs the plugins");
+    assert_contains(&String::from_utf8_lossy(&full.stderr), "failed to discover language plugins");
 }
