@@ -1379,3 +1379,28 @@ fn a_schema_13_index_is_reset_and_gains_the_specifier_column() {
     assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None, "the reset drops the facts");
     assert!(!ensure_current(&conn, GENERATION).unwrap(), "a schema 14 index is current");
 }
+
+/// `stored_generation` reports the recorded generation and writes nothing:
+/// an index with no `meta` table stays without one, and a recorded
+/// generation survives being read.
+///
+/// Control: make `stored_generation` always return `None`: the second
+/// assertion fails.
+#[test]
+fn stored_generation_reads_the_recorded_generation_without_writing() {
+    let empty = Connection::open_in_memory().unwrap();
+    assert_eq!(stored_generation(&empty), None);
+    let tables: i64 = empty
+        .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(tables, 0, "reading the generation must not create a table");
+
+    let conn = setup();
+    ensure_current(&conn, GENERATION).unwrap();
+    assert_eq!(
+        stored_generation(&conn),
+        Some((CURRENT_SCHEMA_VERSION.to_string(), GENERATION.to_string())),
+        "the generation `ensure_current` recorded"
+    );
+    assert_eq!(stored_generation(&conn), Some((CURRENT_SCHEMA_VERSION.to_string(), GENERATION.to_string())));
+}

@@ -228,3 +228,136 @@ fn stale_query(harness: &Harness, text: &str) -> std::time::Duration {
     assert!(matches!(outcome, Some(ReindexedViaHashMismatch | ReindexedNoPriorRecord)), "{outcome:?}");
     elapsed
 }
+
+/// Every node as `filePath|kind|name|container`, and every edge as
+/// `from|kind|to|resolved` over those node labels, sorted: the index
+/// content, free of row ids.
+fn index_rows(harness: &Harness) -> (Vec<String>, Vec<String>) {
+    harness.conn.with(|c| {
+        let rows = |sql: &str| -> Vec<String> {
+            let mut statement = c.prepare(sql).unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let label = |n: &str| {
+            ["filePath", "kind", "name", "container"]
+                .map(|column| format!("COALESCE({n}.{column}, '')"))
+                .join(" || '|' || ")
+        };
+        let nodes = rows(&format!("SELECT {} FROM nodes n ORDER BY 1", label("n")));
+        let edges = rows(&format!(
+            "SELECT {} || ' -' || e.kind || '-> ' || {} || ' resolved=' || COALESCE(e.resolved, '') \
+             FROM edges e JOIN nodes f ON f.id = e.fromId JOIN nodes t ON t.id = e.toId ORDER BY 1",
+            label("f"),
+            label("t")
+        ));
+        (nodes, edges)
+    })
+}
+
+/// A fresh harness over `files`, indexed by its first `Cargo.toml` save.
+fn cold(files: &[(&str, &str)]) -> Harness {
+    let harness = harness();
+    for (path, text) in files {
+        harness.write(path, text);
+    }
+    harness.route("Cargo.toml");
+    harness
+}
+
+/// The index equals a cold index of the same files.
+fn assert_equals_cold(harness: &Harness, files: &[(&str, &str)]) {
+    let warm = index_rows(harness);
+    let cold = index_rows(&cold(files));
+    assert!(!warm.0.is_empty(), "the warm index holds nodes");
+    assert_eq!(warm.0, cold.0, "nodes differ from a cold index");
+    assert_eq!(warm.1, cold.1, "edges differ from a cold index");
+}
+
+fn has_function(name: &str, harness: &Harness) -> bool {
+    harness.conn.with(|c| {
+        c.query_row("SELECT COUNT(*) FROM nodes WHERE name = ?1 AND kind = 'Function'", [name], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+            > 0
+    })
+}
+
+const MAIN_ONLY: &[(&str, &str)] = &[
+    ("Cargo.toml", "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n"),
+    ("src/main.rs", "mod cli;\nfn main() {}\n"),
+    ("src/cli.rs", "pub fn cli_fn() {}\n"),
+    ("src/core.rs", "pub fn core_fn() {}\n"),
+];
+
+const LIB_RS: (&str, &str) = ("src/lib.rs", "pub mod core;\npub fn lib_fn() {}\n");
+
+/// Acceptance, `src/lib.rs`: in a package of `src/main.rs` alone, creating
+/// `lib.rs` and routing only it places the lib's module without a
+/// `Cargo.toml` save; the lib takes the package's crate key, so the bin's
+/// module is orphaned. Deleting `lib.rs` restores the bin. Both states equal
+/// a cold index of the same files.
+///
+/// Control: drop the crate-root check at the top of
+/// `ProjectContext::source_changed` (`core.rs` stays an orphan).
+#[test]
+fn creating_and_deleting_src_lib_rs_moves_the_crate_without_a_cargo_toml_save() {
+    let harness = cold(MAIN_ONLY);
+    assert_eq!(container_of("cli_fn", &harness).as_deref(), Some("alpha::cli"));
+    assert_eq!(container_of("core_fn", &harness).as_deref(), Some("orphan:src/core.rs"));
+
+    harness.write(LIB_RS.0, LIB_RS.1);
+    harness.route("src/lib.rs");
+    assert_eq!(container_of("core_fn", &harness).as_deref(), Some("alpha::core"));
+    assert_eq!(container_of("lib_fn", &harness).as_deref(), Some("alpha"));
+    assert_eq!(container_of("cli_fn", &harness).as_deref(), Some("orphan:src/cli.rs"));
+    let with_lib: Vec<(&str, &str)> = MAIN_ONLY.iter().copied().chain([LIB_RS]).collect();
+    assert_equals_cold(&harness, &with_lib);
+
+    std::fs::remove_file(harness.root().join("src/lib.rs")).unwrap();
+    harness.route("src/lib.rs");
+    assert!(!has_function("lib_fn", &harness), "the deleted file's nodes are gone");
+    assert_eq!(container_of("core_fn", &harness).as_deref(), Some("orphan:src/core.rs"));
+    assert_eq!(container_of("cli_fn", &harness).as_deref(), Some("alpha::cli"));
+    assert_equals_cold(&harness, MAIN_ONLY);
+}
+
+const LIB_ONLY: &[(&str, &str)] = &[
+    ("Cargo.toml", "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n\n[lib]\nname = \"alphalib\"\n"),
+    ("src/lib.rs", "pub fn lib_fn() {}\n"),
+    ("src/cli.rs", "pub fn cli_fn() {}\n"),
+];
+
+const MAIN_RS: (&str, &str) = ("src/main.rs", "mod cli;\nfn main() {}\n");
+
+/// Acceptance, `src/main.rs`: a package whose lib is named apart gains the
+/// bin crate `alpha` when `main.rs` is created and routed, and its module
+/// is placed; deleting `main.rs` drops the crate. Both states equal a cold
+/// index of the same files.
+///
+/// Controls: drop the crate-root check at the top of
+/// `ProjectContext::source_changed`; answer `None` from
+/// `ProjectContext::reload_for` after the reload (`cli.rs` is never
+/// re-extracted and stays an orphan).
+#[test]
+fn creating_and_deleting_src_main_rs_adds_and_drops_the_bin_crate() {
+    let harness = cold(LIB_ONLY);
+    assert_eq!(container_of("cli_fn", &harness).as_deref(), Some("orphan:src/cli.rs"));
+
+    harness.write(MAIN_RS.0, MAIN_RS.1);
+    harness.route("src/main.rs");
+    assert_eq!(container_of("cli_fn", &harness).as_deref(), Some("alpha::cli"));
+    assert_eq!(container_of("main", &harness).as_deref(), Some("alpha"));
+    let with_main: Vec<(&str, &str)> = LIB_ONLY.iter().copied().chain([MAIN_RS]).collect();
+    assert_equals_cold(&harness, &with_main);
+
+    std::fs::remove_file(harness.root().join("src/main.rs")).unwrap();
+    harness.route("src/main.rs");
+    assert!(!has_function("main", &harness), "the deleted file's nodes are gone");
+    assert_eq!(container_of("cli_fn", &harness).as_deref(), Some("orphan:src/cli.rs"));
+    assert_equals_cold(&harness, LIB_ONLY);
+}

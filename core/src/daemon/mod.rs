@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
-use crate::daemon::indexing_status::IndexingStatus;
+use crate::daemon::indexing_status::{ColdCause, IndexingStatus};
 use crate::daemon::lifecycle::{CoreActivity, IdleTimeouts};
 use crate::daemon::registry::PluginRegistry;
 use crate::gc::last_used;
@@ -325,13 +325,21 @@ pub fn run(root: &Path) -> Result<()> {
     // file left here belongs to a reindex that died.
     workspace_reindex::remove_stale_staging(&dir);
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
+    // Read before `ensure_current`, whose reset would hide that one existed:
+    // the session instructions say whether a cold start throws an index away.
+    let had_generation = schema::stored_generation(&conn).is_some();
     // The generation names every discovered plugin's build and core's
     // pipeline, so an index built by a since-rebuilt plugin is thrown away.
-    if schema::ensure_current(&conn, &registry::indexer_version(&discovered))
-        .context("failed to check the index's schema and indexer versions")?
-    {
+    let reinitialized = schema::ensure_current(&conn, &registry::indexer_version(&discovered))
+        .context("failed to check the index's schema and indexer versions")?;
+    if reinitialized {
         crate::log_line!("g-mesh daemon: index (re)initialized - a full reindex is needed");
     }
+    let cold_cause = match (had_generation, reinitialized) {
+        (false, _) => ColdCause::Fresh,
+        (true, true) => ColdCause::Discarded,
+        (true, false) => ColdCause::Incomplete,
+    };
     // Next to the staging cleanup above, once the tables exist: pending rows
     // no pass will clear (a removed plugin, a clear that failed) go.
     workspace_reindex::remove_stale_semantic_pending(&conn, &discovered.manifests);
@@ -376,7 +384,11 @@ pub fn run(root: &Path) -> Result<()> {
     // Unwalked: `Unindexed` until the first index-needing tool call; walked:
     // `Structural` (the embedding backfill is still owed). The phase file is
     // published next to the pid file, before its absence could mean anything.
-    let indexing = if needs_bulk_index { IndexingStatus::unindexed() } else { IndexingStatus::structural() };
+    let indexing = if needs_bulk_index {
+        IndexingStatus::unindexed_because(cold_cause)
+    } else {
+        IndexingStatus::structural()
+    };
     indexing.attach_phase_file(phase_path_in(&dir));
     indexing.attach_progress_file(progress_path_in(&dir));
     // Attached before the accept loop can hand `indexing` to any session, so
