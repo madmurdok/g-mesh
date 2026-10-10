@@ -69,11 +69,11 @@ test-group = 'daemon-spawning'
 filter = 'test(two_languages_spawn_at_the_same_time_rather_than_one_after_the_other)'
 test-group = 'daemon-spawning'
 
-# An ignored test that runs `scripts/test-sections.sh check`: twelve listings
-# of the whole workspace suite, which outlast the 210s above on a loaded
-# machine without hanging.
+# Ignored tests that list the whole workspace suite (twelve times for
+# `scripts/test-sections.sh check`, twice for the `local` profile check),
+# which outlast the 210s above on a loaded machine without hanging.
 [[profile.default.overrides]]
-filter = 'test(=the_real_sections_partition_the_real_suite)'
+filter = 'test(=the_real_sections_partition_the_real_suite) | test(=the_local_profile_skips_exactly_its_heavy_list)'
 slow-timeout = { period = "60s", terminate-after = 20 }
 
 # GM-344. A CI-only profile, so that a run leaves behind something a machine

@@ -60,10 +60,17 @@ fn select_script(script_root: &Path, args: &[&str]) -> Output {
 /// Runs the selector on `contents` as a `--paths-from` file and returns its
 /// one output line; any failure panics with the script's output.
 fn select_raw(contents: &str) -> String {
+    select_raw_with(&[], contents)
+}
+
+/// `select_raw` with `flags` (such as `--narrow`) before `--paths-from`.
+fn select_raw_with(flags: &[&str], contents: &str) -> String {
     let dir = tempfile::tempdir().unwrap();
     let list = dir.path().join("paths.txt");
     fs::write(&list, contents).unwrap();
-    let output = select_script(&repo_root(), &["--paths-from", list.to_str().unwrap()]);
+    let mut args = flags.to_vec();
+    args.extend(["--paths-from", list.to_str().unwrap()]);
+    let output = select_script(&repo_root(), &args);
     assert!(output.status.success(), "{}", describe(&output));
     let stdout = stdout_of(&output);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -120,6 +127,42 @@ fn ci_and_the_selection_machinery_run_every_section() {
 #[test]
 fn a_core_change_runs_the_core_sections_only() {
     assert_each(&["core/src/main.rs", "core/tests/foo.rs", "core/Cargo.toml"], &core_plus(&[]));
+}
+
+/// CI's call (no `--narrow`) keeps every core section for a leaf-module
+/// change; only `scripts/test-local.sh`'s `--narrow` call narrows it.
+#[test]
+fn a_cli_or_mcp_change_runs_every_core_section_unless_narrowed() {
+    let leaves =
+        ["core/src/cli/status.rs", "core/src/cli/x/y.rs", "core/src/mcp/mod.rs", "core/src/mcp/x.rs"];
+    assert_each(&leaves, &core_plus(&[]));
+
+    let narrow = |paths: &[&str]| {
+        select_raw_with(&["--narrow"], &paths.iter().map(|p| format!("{p}\n")).collect::<String>())
+    };
+    assert_eq!(narrow(&["core/src/cli/status.rs"]), "core-it core-cli");
+    assert_eq!(narrow(&["core/src/cli/x/y.rs"]), "core-it core-cli");
+    assert_eq!(narrow(&["core/src/mcp/mod.rs"]), "core-it core-mcp");
+    assert_eq!(narrow(&["core/src/cli/a.rs", "core/src/mcp/b.rs"]), "core-it core-mcp core-cli");
+    // Any other core path still selects every core section, narrowed or not.
+    for other in ["core/src/graph/x.rs", "core/src/lib.rs", "core/tests/foo.rs", "core/Cargo.toml"] {
+        assert_eq!(narrow(&[other]), core_plus(&[]), "path {other}");
+        assert_eq!(narrow(&["core/src/cli/a.rs", other]), core_plus(&[]), "path {other} with a cli path");
+    }
+    // The flag's position does not matter.
+    let dir = tempfile::tempdir().unwrap();
+    let list = dir.path().join("paths.txt");
+    fs::write(&list, "core/src/cli/a.rs\n").unwrap();
+    let output = select_script(&repo_root(), &["--paths-from", list.to_str().unwrap(), "--narrow"]);
+    assert_eq!(stdout_of(&output), "core-it core-cli\n", "{}", describe(&output));
+}
+
+#[test]
+fn the_local_run_scripts_run_every_section_narrowed_or_not() {
+    for path in ["scripts/test-local.sh", "scripts/test-heavy-report.py"] {
+        assert_eq!(select(&[path]), "full", "path {path}");
+        assert_eq!(select_raw_with(&["--narrow"], &format!("{path}\n")), "full", "path {path} --narrow");
+    }
 }
 
 #[test]

@@ -660,6 +660,30 @@ fn seeds_from(default: &[u64], seed: Option<&str>, count: Option<&str>) -> Vec<u
     }
 }
 
+#[test]
+fn seeds_from_keeps_every_seed_takes_the_first_n_and_lets_one_seed_win() {
+    let default = [11, 12, 13];
+    assert_eq!(seeds_from(&default, None, None), vec![11, 12, 13]);
+    assert_eq!(seeds_from(&default, None, Some("2")), vec![11, 12]);
+    assert_eq!(seeds_from(&default, None, Some(" 1 ")), vec![11]);
+    // More than the built-in set runs the built-in set, nothing invented.
+    assert_eq!(seeds_from(&default, None, Some("9")), vec![11, 12, 13]);
+    assert_eq!(seeds_from(&default, Some("0x5"), Some("2")), vec![5]);
+    assert_eq!(seeds_from(&default, Some("42"), None), vec![42]);
+}
+
+#[test]
+#[should_panic(expected = "G_MESH_CONTAINERS_SEEDS=0 is not a positive count")]
+fn seeds_from_refuses_a_zero_count() {
+    seeds_from(&[11, 12], None, Some("0"));
+}
+
+#[test]
+#[should_panic(expected = "G_MESH_CONTAINERS_SEEDS=x is not a positive count")]
+fn seeds_from_refuses_a_count_that_is_not_a_number() {
+    seeds_from(&[11, 12], None, Some("x"));
+}
+
 const LANGUAGES: [&str; 2] = ["go", "rust"];
 /// Keys and their true parents. A space in one key, a three-deep chain,
 /// and two roots.

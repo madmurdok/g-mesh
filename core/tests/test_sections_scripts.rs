@@ -308,3 +308,90 @@ fn the_real_sections_partition_the_real_suite() {
         describe(&output)
     );
 }
+
+// ---------------------------------------------------------------------------
+// .config/nextest.toml [profile.local]
+
+/// The `(binary_id(B) & test(=N))` terms of `[profile.local]`, as (B, N).
+fn local_profile_heavy_terms() -> Vec<(String, String)> {
+    let config = fs::read_to_string(repo_root().join(".config/nextest.toml")).unwrap();
+    let start = config.find("[profile.local]").expect("no [profile.local] in .config/nextest.toml");
+    let section = &config[start..];
+    let section = match section[1..].find("\n[") {
+        Some(end) => &section[..end + 1],
+        None => section,
+    };
+    let mut terms = Vec::new();
+    for line in section.lines() {
+        let Some(rest) = line.split_once("binary_id(").map(|(_, r)| r) else { continue };
+        let (binary, rest) = rest.split_once(')').unwrap();
+        let name = rest.split_once("test(=").unwrap().1.split_once(')').unwrap().0;
+        terms.push((binary.trim().to_owned(), name.trim().to_owned()));
+    }
+    terms
+}
+
+/// The tests `cargo nextest list --workspace --profile <profile>` runs, as
+/// (binary id, name).
+fn listed_under(profile: &str) -> std::collections::BTreeSet<(String, String)> {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(repo_root()).args([
+        "nextest",
+        "list",
+        "--workspace",
+        "--message-format",
+        "json",
+        "--profile",
+        profile,
+    ]);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("NEXTEST") {
+            cmd.env_remove(key);
+        }
+    }
+    let output = cmd.output().expect("failed to run cargo");
+    assert!(output.status.success(), "{}", describe(&output));
+    let list: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut tests = std::collections::BTreeSet::new();
+    for suite in list["rust-suites"].as_object().unwrap().values() {
+        let binary = suite["binary-id"].as_str().unwrap();
+        for (name, case) in suite["testcases"].as_object().unwrap() {
+            if case["filter-match"]["status"] == "matches" {
+                tests.insert((binary.to_owned(), name.clone()));
+            }
+        }
+    }
+    tests
+}
+
+/// The real tree: what the `local` profile skips is exactly its heavy list,
+/// each term one existing test, and the two containers random tests (run
+/// locally with fewer seeds) are never skipped. Ignored because it lists the
+/// whole suite twice; run it with `cargo nextest run -p g-mesh --test
+/// test_sections_scripts --run-ignored only`.
+#[test]
+#[ignore = "lists the whole suite twice"]
+fn the_local_profile_skips_exactly_its_heavy_list() {
+    let terms = local_profile_heavy_terms();
+    let unique: std::collections::BTreeSet<_> = terms.iter().cloned().collect();
+    assert_eq!(unique.len(), terms.len(), "a heavy term is listed twice: {terms:#?}");
+    assert!(!terms.is_empty(), "no heavy terms parsed");
+
+    let default = listed_under("default");
+    let local = listed_under("local");
+    assert!(
+        local.is_subset(&default),
+        "local runs a test default does not: {:#?}",
+        local.difference(&default)
+    );
+    let skipped: std::collections::BTreeSet<_> = default.difference(&local).cloned().collect();
+    assert_eq!(skipped, unique, "default minus local is not the heavy list");
+    for name in [
+        "graph::containers::tests::membership_invariants_hold_after_every_diff_of_a_random_sequence",
+        "graph::containers::tests::bulk_batch_boundaries_do_not_change_the_result",
+    ] {
+        let key = ("g-mesh".to_owned(), name.to_owned());
+        assert!(default.contains(&key), "{name} is not in the suite");
+        assert!(local.contains(&key), "{name} is skipped locally; it should run with fewer seeds");
+    }
+}
