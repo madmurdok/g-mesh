@@ -30,9 +30,12 @@
 //! It cannot, and that is the kit's rule rather than a gap here. A plugin
 //! with no engine reports its whole-project `semanticPass` **incomplete** -
 //! deliberately, since that is what leaves `language_state.semanticPassAt`
-//! unset and Rust's receiver gap listed - and `watcher::apply` turns an
-//! incomplete *whole-project* pass into a session failure, after which the
-//! kit skips the entire expectations section ("expectations need the fully
+//! unset and Rust's receiver gap listed - and the kit fails the session on
+//! an incomplete *whole-project* pass: `watcher::apply` itself when the pass
+//! names no unfinished files, and the kit's own session driver when it names
+//! them and is recorded residual (GM-550; a daemon would ask those files
+//! again on its next start, a kit session has none). Either way the kit then
+//! skips the entire expectations section ("expectations need the fully
 //! linked index a completed session leaves behind"). So the missing-toolchain
 //! arm asserts the log line, the diff and the report; the *structural
 //! results* are asserted by [`structural_3_2_0`], which is a stronger
