@@ -95,9 +95,8 @@ impl DefinitionNode {
     /// snippet, and giving them two different shapes would make every consumer
     /// handle two cases to learn nothing.
     fn with_source(mut self, project_root: Option<&Path>) -> Self {
-        self.source = project_root.and_then(|root| {
-            source::read_span(root, &self.file_path, self.start_line, self.end_line, Some(self.end_col))
-        });
+        self.source = project_root
+            .and_then(|root| source::read_span(root, &self.file_path, self.start_line, self.end_line));
         self
     }
 }
@@ -146,11 +145,6 @@ struct DefinitionCandidate {
     start_line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     end_line: Option<i64>,
-    /// The span's end column, for reading its source only (an old index's
-    /// whole-file end - see [`source::read_span`]); never serialized, so the
-    /// page's shape is unchanged.
-    #[serde(skip)]
-    end_col: Option<i64>,
     kind: String,
     /// Signature over docstring when both exist - it's denser and more
     /// identifying in a ranked list than prose.
@@ -175,7 +169,6 @@ impl From<super::search_code::SearchResult> for DefinitionCandidate {
             file_path: hit.file_path,
             start_line: None,
             end_line: None,
-            end_col: None,
             kind: hit.kind,
             preview: None,
             source: None,
@@ -242,7 +235,6 @@ impl CandidatePage {
                         &candidate.file_path,
                         start,
                         end,
-                        candidate.end_col,
                         CANDIDATE_SOURCE_LINES,
                         CANDIDATE_SOURCE_CHARS,
                     );
@@ -424,7 +416,7 @@ fn rank_candidates(
     // the copy here was three kinds where that one is five.
     let base_sql = format!(
         "SELECT n.id AS id, n.qualifiedName AS qualifiedName, n.filePath AS filePath, \
-         n.startLine AS startLine, n.endLine AS endLine, n.endCol AS endCol, n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
+         n.startLine AS startLine, n.endLine AS endLine, n.kind AS kind, n.signature AS signature, n.docComment AS docComment, \
          CAST((SELECT COUNT(*) FROM edges e WHERE e.toId = n.id AND e.kind IN ('REFERENCES', 'CALLS')) AS REAL) AS score \
          FROM nodes n WHERE {filter} AND {}",
         queries::declaration_only("n.")
@@ -439,7 +431,6 @@ fn rank_candidates(
             file_path: row.get("filePath")?,
             start_line: Some(row.get("startLine")?),
             end_line: Some(row.get("endLine")?),
-            end_col: Some(row.get("endCol")?),
             kind: row.get("kind")?,
             preview: row
                 .get::<_, Option<String>>("signature")?
@@ -1183,7 +1174,6 @@ fn by_file_name(
                 file_path: n.file_path.clone(),
                 start_line: Some(n.start_line),
                 end_line: Some(n.end_line),
-                end_col: Some(n.end_col),
                 kind: n.kind.clone(),
                 preview: n.signature.clone().or_else(|| n.doc_comment.clone()),
                 source: None,

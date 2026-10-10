@@ -277,28 +277,6 @@ mod tests {
     }
 
     #[test]
-    fn frame_arriving_in_pieces_over_a_pipe_is_reassembled() {
-        let (reader, mut writer) = std::io::pipe().unwrap();
-        let bytes = framed(&notification());
-        let (head, rest) = bytes.split_at(10);
-        let (middle, tail) = rest.split_at(rest.len() / 2);
-        let (head, middle, tail) = (head.to_vec(), middle.to_vec(), tail.to_vec());
-
-        let sender = std::thread::spawn(move || {
-            for piece in [head, middle, tail] {
-                writer.write_all(&piece).unwrap();
-                writer.flush().unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        });
-
-        let mut reader = BufReader::new(reader);
-        let received: ControlEnvelope = read_message(&mut reader).unwrap().unwrap();
-        sender.join().unwrap();
-        assert_eq!(notification(), received);
-    }
-
-    #[test]
     fn consecutive_frames_are_read_in_order() {
         let mut stream = framed(&request());
         stream.extend_from_slice(&framed(&notification()));

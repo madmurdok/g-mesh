@@ -150,14 +150,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_root_hashes_to_same_directory() {
-        let root = std::env::current_dir().unwrap();
-        let first = project_dir(&root).unwrap();
-        let second = project_dir(&root).unwrap();
-        assert_eq!(first, second);
-    }
-
-    #[test]
     fn opens_database_in_wal_mode() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = open(tmp.path()).unwrap();

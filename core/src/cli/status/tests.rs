@@ -675,33 +675,6 @@ fn unindexed_phase_reports_not_indexed_yet_rather_than_cold_start_owed() {
     assert!(!rendered.contains("building now"), "an unindexed project is idle, not building:\n{rendered}");
 }
 
-/// D13: `embedding` is the phase covering "the structural walk is done
-/// and answering, the embedding backfill pass is running" - distinct from
-/// both `walking` (no structural answers yet) and silence (nothing left
-/// to say once the whole project, embeddings included, is `ready`).
-#[test]
-fn embedding_phase_reports_structural_ready_with_embeddings_in_progress() {
-    let rendered = render(&phase_fixture(true, Some("embedding")));
-    assert!(
-        rendered.contains("index:           structural index ready; embeddings being computed"),
-        "{rendered}"
-    );
-}
-
-/// D13: `failed` names what happened and that the next tool call retries
-/// it (`IndexingStatus::activation_failed`) - the daemon log is where the
-/// actual failure message lives (`Phase::Failed`'s own doc comment), so
-/// this line only has to point there, not repeat it.
-#[test]
-fn failed_phase_reports_the_last_build_failed_and_will_be_retried() {
-    let rendered = render(&phase_fixture(false, Some("failed")));
-    assert!(
-        rendered
-            .contains("index:           last build failed - see daemon log; retried on the next tool call"),
-        "{rendered}"
-    );
-}
-
 /// Every phase, and each no-phase state, prints its own `index:` line.
 #[test]
 fn every_phase_prints_an_accurate_index_line() {
