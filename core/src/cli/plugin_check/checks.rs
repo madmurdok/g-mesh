@@ -105,7 +105,9 @@
 //!   `external_module` instead (GM-516).
 //! - **`capabilities.resolution-delta-version-bump`** (only for
 //!   `resolution_delta = true`) - a fixture watch file whose only change is
-//!   its top-level `version` (`session::choose_version_bump` has the rule),
+//!   a version (a JSON manifest's top-level `version`, `Cargo.toml`'s
+//!   `[package].version`, `pyproject.toml`'s `[project].version`, a `go.mod`
+//!   `require` version; `session::choose_version_bump` has the rule),
 //!   sent as one `resolutionChanged` with bulk run 1's `resolutionFacts` on a
 //!   fresh plugin process (`session::run_resolution_delta_session`), answers
 //!   `unchanged`. Anything else re-extracts importers, or the whole
@@ -1061,9 +1063,10 @@ fn resolution_delta_version_bump(run: &RunData) -> CheckResult {
             return result(
                 ID,
                 Outcome::Skip(
-                    "not configured: the fixture has no watch file (the manifest's watch_files) that parses as a \
-                     JSON object with a string or absent top-level `version` - the one shape a version bump is \
-                     defined for"
+                    "not configured: the fixture has no watch file (the manifest's watch_files) with a version \
+                     a bump is defined for - a JSON object's string or absent top-level `version`, a \
+                     Cargo.toml's `[package]`/`[workspace.package]` version, a pyproject.toml's \
+                     `[project]`/`[tool.poetry]` version, or a go.mod `require` version or `go` directive"
                         .to_string(),
                 ),
             );
@@ -1086,7 +1089,7 @@ fn resolution_delta_version_bump(run: &RunData) -> CheckResult {
             Outcome::Skip("not reached: the resolution-delta session failed (see `session`)".to_string()),
         );
     };
-    let edit = format!("{}: an edit whose only change is the top-level `version`", bump.file_path);
+    let edit = format!("{}: an edit whose only change is {}", bump.file_path, bump.field);
     let finding = match &answer.delta {
         ResolutionDelta::Unchanged => return result(ID, Outcome::Pass),
         ResolutionDelta::Unknown { reason } => {

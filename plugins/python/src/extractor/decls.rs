@@ -421,7 +421,7 @@ impl Declarer<'_, '_> {
                 "dotted_name" => {
                     let Some(segments) = dotted_segments(leaf, self.source) else { continue };
                     let full = segments.join(".");
-                    self.import_edge(&full, range, false);
+                    self.import_edge(&full, &full, range, false);
                     // The *bound* name is the top package, so whether the
                     // binding is one of ours is a question about `a`, not
                     // about the `a.b` the edge was drawn onto.
@@ -437,7 +437,7 @@ impl Declarer<'_, '_> {
                     let Some(name) = leaf.child_by_field_name("name") else { continue };
                     let Some(segments) = dotted_segments(name, self.source) else { continue };
                     let full = segments.join(".");
-                    let external = self.import_edge(&full, range, false);
+                    let external = self.import_edge(&full, &full, range, false);
                     if let Some(alias) = leaf.child_by_field_name("alias") {
                         let binding = if external {
                             Import::External
@@ -472,7 +472,14 @@ impl Declarer<'_, '_> {
             }
         };
 
-        let external = self.import_edge(&container, range, relative);
+        // The module as written: the dotted name, or a relative one's dots
+        // and tail (`..pkg`), whitespace dropped.
+        let written: String = if relative {
+            text(module_name, self.source).chars().filter(|ch| !ch.is_whitespace()).collect()
+        } else {
+            container.clone()
+        };
+        let external = self.import_edge(&container, &written, range, relative);
 
         let mut cursor = item.walk();
         for leaf in item.named_children(&mut cursor) {
@@ -499,7 +506,7 @@ impl Declarer<'_, '_> {
                 "dotted_name" => {
                     let Some(segments) = dotted_segments(leaf, self.source) else { continue };
                     let Some(name) = segments.last() else { continue };
-                    self.imported_name(&container, name, name, range, external);
+                    self.imported_name(&container, &written, name, name, range, external);
                 }
                 "aliased_import" => {
                     let Some(name_node) = leaf.child_by_field_name("name") else { continue };
@@ -509,7 +516,7 @@ impl Declarer<'_, '_> {
                         .child_by_field_name("alias")
                         .map(|alias| text(alias, self.source))
                         .unwrap_or(name);
-                    self.imported_name(&container, name, local, range, external);
+                    self.imported_name(&container, &written, name, local, range, external);
                 }
                 _ => {}
             }
@@ -544,7 +551,18 @@ impl Declarer<'_, '_> {
     /// line belongs to the file rather than to anything in it - so it shows up
     /// in `find_references` as a whole-file row, which is the granularity an
     /// import statement genuinely has.
-    fn imported_name(&mut self, container: &str, name: &str, local: &str, range: Range, external: bool) {
+    ///
+    /// `written` is the module as the statement spells it, which the
+    /// submodule's `IMPORTS` edge extends by `name` for its `specifier`.
+    fn imported_name(
+        &mut self,
+        container: &str,
+        written: &str,
+        name: &str,
+        local: &str,
+        range: Range,
+        external: bool,
+    ) {
         let unconditional = self.conditional == 0;
         if external {
             self.model.import(local, Import::External, range, unconditional);
@@ -578,7 +596,9 @@ impl Declarer<'_, '_> {
         // `from a.b import SomeFunction` case.
         let submodule = format!("{container}.{name}");
         if self.project.has_container(&submodule) {
-            self.import_edge(&submodule, range, false);
+            let specifier =
+                if written.ends_with('.') { format!("{written}{name}") } else { format!("{written}.{name}") };
+            self.import_edge(&submodule, &specifier, range, false);
         }
     }
 
@@ -589,7 +609,11 @@ impl Declarer<'_, '_> {
     /// dots mean, so there is nothing to decide and
     /// `ProjectContext::has_container` is not consulted. An absolute one is
     /// decided by that query - see `crate::project`'s Decision 8.
-    fn import_edge(&mut self, container: &str, range: Range, relative: bool) -> bool {
+    ///
+    /// `specifier` is the import as written (`a.b`, `..pkg`), the edge's
+    /// `specifier` (GM-544). A relative import is matched by a resolution
+    /// delta through its stored target, never through this text.
+    fn import_edge(&mut self, container: &str, specifier: &str, range: Range, relative: bool) -> bool {
         let internal = relative || self.project.has_container(container);
         let to = if internal {
             self.emitter.placeholder(
@@ -602,7 +626,7 @@ impl Declarer<'_, '_> {
             self.emitter.external_module(container, range)
         };
         let file = self.emitter.file_id().to_string();
-        self.emitter.placeholder_edge(EdgeKind::Imports, &file, &to);
+        self.emitter.import_edge(&file, &to, specifier);
         !internal
     }
 
