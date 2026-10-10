@@ -97,6 +97,22 @@ pub enum WaitOutcome {
     TimedOut,
 }
 
+/// Why a daemon started owing its walk, fixed at startup: the session
+/// instructions name it, so an agent that sees a cold start over a project it
+/// knows was indexed learns the wait is expected. Meaningful only while the
+/// phase is [`Phase::Unindexed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdCause {
+    /// The index had no generation recorded: never built here.
+    Fresh,
+    /// A generation was recorded, but an earlier g-mesh or plugin build wrote
+    /// it, so `schema::ensure_current` threw it away.
+    Discarded,
+    /// The index is the current generation, but its walk never finished
+    /// (`bulkIndexedAt` unset).
+    Incomplete,
+}
+
 const UNINDEXED: u8 = 0;
 const WALKING: u8 = 1;
 const STRUCTURAL: u8 = 2;
@@ -147,6 +163,9 @@ struct Inner {
     /// ([`IndexingStatus::attach_phase_file`]); a status with no daemon behind it
     /// writes nothing.
     phase_file: Mutex<Option<PathBuf>>,
+    /// Set once at construction and never written again, so reading it needs
+    /// no lock.
+    cold_cause: ColdCause,
 }
 
 /// The attached progress file and the time of its last write, under one lock
@@ -220,7 +239,7 @@ struct Activation {
 }
 
 impl IndexingStatus {
-    fn starting_at(phase: u8) -> Self {
+    fn starting_at(phase: u8, cold_cause: ColdCause) -> Self {
         Self(Arc::new(Inner {
             phase: AtomicU8::new(phase),
             failure: Mutex::new(None),
@@ -238,6 +257,7 @@ impl IndexingStatus {
             progress_file: Mutex::new(ProgressFile::default()),
             activation: Mutex::new(Activation::default()),
             phase_file: Mutex::new(None),
+            cold_cause,
         }))
     }
 
@@ -245,14 +265,19 @@ impl IndexingStatus {
     /// Every [`Need`] is unsatisfied until a tool call runs
     /// [`request_activation`](Self::request_activation) and the walk finishes.
     pub fn unindexed() -> Self {
-        Self::starting_at(UNINDEXED)
+        Self::unindexed_because(ColdCause::Fresh)
+    }
+
+    /// [`unindexed`](Self::unindexed), recording why the walk is owed.
+    pub fn unindexed_because(cause: ColdCause) -> Self {
+        Self::starting_at(UNINDEXED, cause)
     }
 
     /// A status whose walk is under way; every [`Need`] is unsatisfied until it
     /// reaches [`Phase::Structural`]. Used by tests; the daemon starts at
     /// [`unindexed`](Self::unindexed).
     pub fn walking() -> Self {
-        Self::starting_at(WALKING)
+        Self::starting_at(WALKING, ColdCause::Fresh)
     }
 
     /// A daemon whose walk was complete when it started (every restart of an
@@ -260,7 +285,13 @@ impl IndexingStatus {
     /// [`Need::Embeddings`] waits for the embedding backfill the first tool call
     /// starts.
     pub fn structural() -> Self {
-        Self::starting_at(STRUCTURAL)
+        Self::starting_at(STRUCTURAL, ColdCause::Fresh)
+    }
+
+    /// Why this daemon started owing its walk ([`ColdCause::Fresh`] for a
+    /// status not built by [`unindexed_because`](Self::unindexed_because)).
+    pub fn cold_cause(&self) -> ColdCause {
+        self.0.cold_cause
     }
 
     /// Moves to `phase` and wakes every waiter. Waiters loop, so a phase that

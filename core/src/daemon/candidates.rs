@@ -171,33 +171,59 @@ fn decide(root: &Path, state_dir: Option<&Path>, limits: Limits) -> Detection {
 }
 
 /// Whether `project_root` (canonical) already has a completed index of its
-/// own - rule 2's check, applied to a candidate instead of the root. The
-/// front uses it to say which of its projects are indexed (D12). A state
-/// directory that cannot be resolved counts as "not indexed", as in
-/// [`detect`].
+/// own that a daemon would keep - rule 2's check, applied to a candidate
+/// instead of the root, plus [`current_generation`]. The front uses it to
+/// say which of its projects are indexed (D12): an index the daemon will
+/// discard on start is not. A state directory that cannot be resolved counts
+/// as "not indexed", as in [`detect`].
 pub fn has_completed_index(project_root: &Path) -> bool {
-    project_dir(project_root).is_ok_and(|state_dir| completed_index_in(&state_dir))
+    project_dir(project_root).is_ok_and(|state_dir| {
+        open_existing_index(&state_dir)
+            .is_some_and(|conn| completed_index(&conn) && current_generation(&conn))
+    })
+}
+
+/// Whether the index was written by this build's schema and core pipeline:
+/// `schema_version` equal to [`schema::CURRENT_SCHEMA_VERSION`] and
+/// `indexer_version`'s core half equal to [`schema::CURRENT_INDEXER_VERSION`].
+/// The plugin half is not compared: that needs plugin discovery, which the
+/// front does not do, so a plugin-only rebuild still reads as current here.
+/// Any failure to read it counts as "not current". Rule 2 does not use it: an
+/// index of the whole folder, of any generation, still says someone chose to
+/// treat the folder as one project.
+fn current_generation(conn: &Connection) -> bool {
+    schema::stored_generation(conn).is_some_and(|(schema_version, indexer_version)| {
+        schema_version == schema::CURRENT_SCHEMA_VERSION
+            && indexer_version
+                .strip_prefix(schema::CURRENT_INDEXER_VERSION)
+                .is_some_and(|rest| rest.starts_with('+'))
+    })
 }
 
 /// Rule 2: `<state dir>/index.db` exists and records a finished walk.
+fn completed_index_in(state_dir: &Path) -> bool {
+    open_existing_index(state_dir).is_some_and(|conn| completed_index(&conn))
+}
+
+/// Opens `<state dir>/index.db` if it exists.
 ///
 /// Opened read-write *without* `CREATE`, as `cli::status::index_status` and
 /// `gc::last_used` open it: recovering a WAL an abandoned daemon left behind
 /// needs write access, and a missing database must never be conjured into
 /// existence by a check. Never through `connection::open`, which creates the
-/// file. Any failure to read it (no file, no `meta` table, no row, a corrupt
-/// file) counts as "not completed".
-fn completed_index_in(state_dir: &Path) -> bool {
+/// file.
+fn open_existing_index(state_dir: &Path) -> Option<Connection> {
     let db_path = state_dir.join("index.db");
     if fs::symlink_metadata(&db_path).is_err() {
-        return false;
+        return None;
     }
-    let Ok(conn) =
-        Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI)
-    else {
-        return false;
-    };
-    schema::bulk_index_completed(&conn).unwrap_or(false)
+    Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI).ok()
+}
+
+/// Whether the index records a finished walk. Any failure to read it (no
+/// `meta` table, no row, a corrupt file) counts as "not completed".
+fn completed_index(conn: &Connection) -> bool {
+    schema::bulk_index_completed(conn).unwrap_or(false)
 }
 
 /// The markers `dir` carries, in [`MARKERS`] order, plus whether `.git` is a

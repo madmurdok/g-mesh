@@ -354,7 +354,7 @@ fn root_of_byte_len(len: usize) -> std::path::PathBuf {
 #[test]
 fn cold_start_unindexed_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() {
     let root = root_of_byte_len(103);
-    let rendered = cold_start(&root, false, &cold(worst_case_present()));
+    let rendered = cold_start(&root, false, ColdCause::Fresh, &cold(worst_case_present()));
     println!("cold-start (unindexed, 103-byte root) bytes: {}", rendered.len());
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
@@ -374,7 +374,7 @@ fn cold_start_unindexed_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling(
 #[test]
 fn cold_start_walking_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() {
     let root = root_of_byte_len(103);
-    let rendered = cold_start(&root, true, &cold(worst_case_present()));
+    let rendered = cold_start(&root, true, ColdCause::Fresh, &cold(worst_case_present()));
     println!("cold-start (walking, 103-byte root) bytes: {}", rendered.len());
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
@@ -393,7 +393,7 @@ fn cold_start_walking_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() 
 #[test]
 fn cold_start_falls_back_to_the_no_path_line_once_the_root_is_too_long() {
     let root = root_of_byte_len(600);
-    let rendered = cold_start(&root, false, &cold(worst_case_present()));
+    let rendered = cold_start(&root, false, ColdCause::Fresh, &cold(worst_case_present()));
     println!("cold-start (unindexed, 600-byte root) bytes: {}", rendered.len());
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
@@ -527,7 +527,10 @@ fn build_front_drops_a_root_too_long_for_the_ceiling() {
 /// the no-path line, over the ceiling).
 #[test]
 fn the_worst_case_cold_start_falls_back_to_the_generic_receiver_paragraph() {
-    let line = cold_start_line_fallback(false).len().min(cold_start_line_fallback(true).len()) + 2;
+    let line = cold_start_line_fallback(false, ColdCause::Fresh)
+        .len()
+        .min(cold_start_line_fallback(true, ColdCause::Fresh).len())
+        + 2;
     let coverage = (1..200)
         .map(|n| {
             cold(
@@ -551,7 +554,7 @@ fn the_worst_case_cold_start_falls_back_to_the_generic_receiver_paragraph() {
 
     for walking in [false, true] {
         for root_len in [10, 103, 600] {
-            let rendered = cold_start(&root_of_byte_len(root_len), walking, &coverage);
+            let rendered = cold_start(&root_of_byte_len(root_len), walking, ColdCause::Fresh, &coverage);
             println!("walking={walking} root={root_len}: {} bytes", rendered.len());
             assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
             assert!(rendered.ends_with(&fallback), "walking={walking} root={root_len}: {rendered}");
@@ -914,9 +917,9 @@ fn the_unsupported_sentence_is_said_once_in_every_rendering_with_a_list() {
                 ],
             )),
         ),
-        ("cold, three missing", cold_start(&root_of_byte_len(40), false, &cold_ts)),
-        ("cold walking, three missing", cold_start(&root_of_byte_len(40), true, &cold_ts)),
-        ("cold, none missing", cold_start(&root_of_byte_len(40), false, &cold_all)),
+        ("cold, three missing", cold_start(&root_of_byte_len(40), false, ColdCause::Fresh, &cold_ts)),
+        ("cold walking, three missing", cold_start(&root_of_byte_len(40), true, ColdCause::Fresh, &cold_ts)),
+        ("cold, none missing", cold_start(&root_of_byte_len(40), false, ColdCause::Fresh, &cold_all)),
     ];
     for (name, rendered) in renderings {
         assert_eq!(rendered.matches(UNSUPPORTED).count(), 1, "{name}: {rendered}");
@@ -989,7 +992,7 @@ fn cold_start_names_the_installed_plugins_and_the_missing_ones_conditionally() {
         uncovered: Uncovered::missing(real_missing(&ts)),
     };
     for walking in [false, true] {
-        let rendered = cold_start(&root_of_byte_len(40), walking, &coverage);
+        let rendered = cold_start(&root_of_byte_len(40), walking, ColdCause::Fresh, &coverage);
         assert!(rendered.contains(&format!("Plugins installed: typescript. {UNSUPPORTED}")), "{rendered}");
         assert!(
             rendered.contains(&format!(
@@ -1010,7 +1013,7 @@ fn cold_start_names_the_installed_plugins_and_the_missing_ones_conditionally() {
         covered: Covered::Installed(real_present(&all, &["go", "python", "rust", "typescript"])),
         uncovered: Uncovered::missing(real_missing(&all)),
     };
-    let rendered = cold_start(&root_of_byte_len(40), false, &everything);
+    let rendered = cold_start(&root_of_byte_len(40), false, ColdCause::Fresh, &everything);
     assert!(rendered.contains("Plugins installed: go, python, rust and typescript."), "{rendered}");
     assert!(!rendered.contains("If this project has"), "{rendered}");
 
@@ -1019,7 +1022,7 @@ fn cold_start_names_the_installed_plugins_and_the_missing_ones_conditionally() {
         covered: Covered::Installed(Vec::new()),
         uncovered: Uncovered::missing(real_missing(&none)),
     };
-    let rendered = cold_start(&root_of_byte_len(40), false, &nothing);
+    let rendered = cold_start(&root_of_byte_len(40), false, ColdCause::Fresh, &nothing);
     assert!(rendered.contains(HEAD_INSTALLED_NONE), "{rendered}");
     assert!(rendered.contains("If this project has typescript, python, rust or go files"), "{rendered}");
     assert!(!rendered.contains(RECEIVER_OPENING), "{rendered}");
@@ -1440,7 +1443,7 @@ fn adr_0022_byte_table_every_realistic_scenario_fits_at_step_1() {
             uncovered: Uncovered::missing(real_missing(found)),
         };
         for walking in [false, true] {
-            let rendered = cold_start(&root, walking, &coverage);
+            let rendered = cold_start(&root, walking, ColdCause::Fresh, &coverage);
             println!("Cold start, 103-byte root, {name}, walking={walking}: {} bytes", rendered.len());
             assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
             assert!(rendered.starts_with("Index root: /"), "the root fits: {rendered}");
