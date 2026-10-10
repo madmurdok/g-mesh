@@ -387,48 +387,6 @@ fn index_recording_python_as_failed(project: &Project, plugins: &Path) {
     schema::record_language_outcomes(&project.index(), &failed).expect("failed to record the outcomes");
 }
 
-/// ADR 0021 section 2, across a restart: an index whose `language_outcome`
-/// table records Python as failed is served by a daemon that does not walk
-/// (the index is complete), yet a Python file edited while no daemon ran is
-/// not reindexed by a query, while the Rust file edited alongside it is.
-///
-/// Control: drop the `registry.seed_failed_languages(&conn)` call in
-/// `daemon::run` - nothing else fills the set (activation does not walk this
-/// complete index, so `ActivationCtx::walk`'s `set_failed_languages` never
-/// runs), the outline call reindexes `tools/gen.py` and `added_python_symbol`
-/// is written.
-#[tokio::test]
-async fn a_failed_language_recorded_in_the_index_is_not_reindexed_after_a_restart() {
-    let project = Project::new(&[("tools/gen.py", "def gen():\n    pass\n")]);
-    let (plugins, binary) = common::rust_and_missing_python_plugin_root();
-    install_python_binary(&binary);
-    index_recording_python_as_failed(&project, plugins.path());
-
-    std::fs::write(
-        project.root().join("tools/gen.py"),
-        "def gen():\n    pass\n\ndef added_python_symbol():\n    pass\n",
-    )
-    .expect("failed to edit the python file");
-    std::fs::write(
-        project.root().join("src/lib.rs"),
-        "pub fn kept_rust_symbol() -> u32 {\n    1\n}\npub fn added_rust_symbol() {}\n",
-    )
-    .expect("failed to edit the rust file");
-
-    let client =
-        ().serve(shim(project.root(), plugins.path())).await.expect("the shim must reach the daemon");
-    activated(project.root()).await;
-    let rust = outline(&client, "src/lib.rs").await;
-    assert!(rust.contains("added_rust_symbol"), "a routed language is reindexed at query time: {rust}");
-    let python = outline(&client, "tools/gen.py").await;
-    assert_eq!(
-        project.count("SELECT COUNT(*) FROM nodes WHERE name = 'added_python_symbol'"),
-        0,
-        "a language recorded as failed must not be reindexed: {python}"
-    );
-    client.cancel().await.expect("failed to shut the client down");
-}
-
 /// `g-mesh daemon` for `project`, started directly rather than through a
 /// shim, so that no tool call - and so no activation - happens until the test
 /// makes one. Returns once the daemon is listening.
@@ -565,6 +523,9 @@ async fn a_failed_language_is_not_reindexed_by_the_first_tool_call_after_a_resta
     let rust = outline(&client, "src/lib.rs").await;
     assert!(rust.contains("added_rust_symbol"), "a routed language is reindexed at query time: {rust}");
     assert!(!has_node(&project, "added_python_symbol"), "nor may any later step: {python}");
+    activated(project.root()).await;
+    let python = outline(&client, "tools/gen.py").await;
+    assert!(!has_node(&project, "added_python_symbol"), "nor a call once activation has finished: {python}");
     client.cancel().await.expect("failed to shut the client down");
 }
 

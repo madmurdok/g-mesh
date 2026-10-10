@@ -81,7 +81,7 @@ impl Fixture {
         let discovered = rust_only();
         let rules = crate::daemon::manifest::link_rules(discovered.manifests.values());
         let store = IndexStore::new(conn).with_link_rules(rules);
-        let summary = bulk_index::run(dir.path(), &store, None, &discovered).expect("the bulk walk failed");
+        let summary = bulk_index::run(dir.path(), &store, &discovered).expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes");
         Self { dir, store: Arc::new(store) }
     }

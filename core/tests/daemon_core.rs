@@ -12,7 +12,6 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 use g_mesh::daemon;
 use g_mesh::ipc;
@@ -212,38 +211,6 @@ fn tool_names(response: &Value) -> Vec<String> {
     names
 }
 
-#[test]
-fn daemon_opens_sqlite_watches_files_and_serves_the_mcp_tool_surface() {
-    let project = Project::new();
-    let mut daemon = spawn_daemon(project.root());
-
-    let pid_file = daemon::pid_path(project.root()).unwrap();
-    wait_for("the daemon to start listening", || pid_file.exists());
-
-    let db_path = project_dir(project.root()).unwrap().join("index.db");
-    assert!(db_path.exists(), "the daemon must open (and thus create) the project's SQLite file");
-
-    let endpoint = daemon::endpoint(project.root()).unwrap();
-    let responses = mcp_session(&endpoint, vec![tools_list_request(1)]);
-    assert_eq!(tool_names(&responses[0]), EXPECTED_TOOLS);
-
-    // A file write under the project root must not crash or hang the
-    // daemon - proves the watcher is registered and running, even though
-    // wiring its events into a reindex is a separate ticket.
-    std::fs::write(project.root().join("tracked.txt"), b"hello").unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-
-    let responses = mcp_session(&endpoint, vec![tools_list_request(1)]);
-    assert_eq!(
-        tool_names(&responses[0]),
-        EXPECTED_TOOLS,
-        "daemon must still serve MCP after a watched file write"
-    );
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
-}
-
 /// The cold-start guarantee: a project that already had source files when its
 /// daemon started ends up with them in the graph - no edit, no `touch`,
 /// nothing that could have reached the watcher, so only the bulk walk can
@@ -274,6 +241,9 @@ fn a_pre_existing_project_is_indexed_by_the_cold_start_walk_alone() {
     // daemon is reachable and nothing about whether it can answer yet. There
     // is no sleep here, and there must not be.
     wait_until_indexed(project.root());
+
+    let db_path = project_dir(project.root()).unwrap().join("index.db");
+    assert!(db_path.exists(), "the daemon must open (and thus create) the project's SQLite file");
 
     let endpoint = daemon::endpoint(project.root()).unwrap();
     let responses = mcp_session(&endpoint, vec![outline_request(1, "src/greeter.ts")]);

@@ -20,7 +20,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
 use crate::daemon::plugin;
-use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::languages::{self, LanguageOutcome};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::file_rows::FileScope;
@@ -95,13 +94,6 @@ pub struct BulkIndexSummary {
 /// the store it writes, what it reports to, and what it accumulates.
 pub(crate) struct WalkContext<'a> {
     pub(crate) store: &'a IndexStore,
-    /// `None` for the structural-only cold-start walk (`embedding::backfill`
-    /// fills the vectors afterwards); `Some` for
-    /// `daemon::workspace_reindex`'s per-language re-walk.
-    pub(crate) embedding: Option<&'a EmbeddingPipeline>,
-    /// What `embedding` did across every batch of this walk, for the caller
-    /// to report with `EmbeddingPipeline::finish_unit`.
-    pub(crate) embed_stats: EmbedStats,
     /// The daemon's walk counters; `None` when nobody is waiting on them.
     pub(crate) progress: Option<&'a IndexingStatus>,
     pub(crate) summary: BulkIndexSummary,
@@ -114,14 +106,7 @@ impl<'a> WalkContext<'a> {
     /// A structural walk into `store` that reports nowhere and records no
     /// walked files; set the other fields with struct-update syntax.
     pub(crate) fn new(store: &'a IndexStore) -> Self {
-        Self {
-            store,
-            embedding: None,
-            embed_stats: EmbedStats::default(),
-            progress: None,
-            summary: BulkIndexSummary::default(),
-            walked_files: None,
-        }
+        Self { store, progress: None, summary: BulkIndexSummary::default(), walked_files: None }
     }
 }
 
@@ -142,10 +127,9 @@ impl<'a> WalkContext<'a> {
 pub fn run(
     project_root: &Path,
     conn: &IndexStore,
-    embedding: Option<&EmbeddingPipeline>,
     discovered: &DiscoveredPlugins,
 ) -> Result<BulkIndexSummary> {
-    run_with_progress(project_root, conn, embedding, discovered, None)
+    run_with_progress(project_root, conn, discovered, None)
 }
 
 /// [`run`], also reporting through `progress`'s walk counters: languages done
@@ -153,7 +137,6 @@ pub fn run(
 pub fn run_with_progress(
     project_root: &Path,
     conn: &IndexStore,
-    embedding: Option<&EmbeddingPipeline>,
     discovered: &DiscoveredPlugins,
     progress: Option<&IndexingStatus>,
 ) -> Result<BulkIndexSummary> {
@@ -168,9 +151,7 @@ pub fn run_with_progress(
     // Taken before the first plugin is spawned, so no plugin can have read a
     // file before it - `staleness::record_walk_baselines` relies on that.
     let walk_started = std::time::SystemTime::now();
-    let walk_clock = std::time::Instant::now();
-    let mut ctx =
-        WalkContext { embedding, progress, walked_files: Some(BTreeSet::new()), ..WalkContext::new(conn) };
+    let mut ctx = WalkContext { progress, walked_files: Some(BTreeSet::new()), ..WalkContext::new(conn) };
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
     // The absent plugins' file count walks the tree on its own thread, from
     // before the first plugin is spawned until after the last one finished,
@@ -216,11 +197,8 @@ pub fn run_with_progress(
             }
         })
     })?;
-    let WalkContext { mut summary, walked_files, embed_stats, .. } = ctx;
+    let WalkContext { mut summary, walked_files, .. } = ctx;
     let walked_files = walked_files.unwrap_or_default();
-    if let Some(embedding) = embedding {
-        embedding.finish_unit("bulk-walk", &embed_stats, walk_clock.elapsed());
-    }
 
     let file_counts = conn.with(file_counts_by_language)?;
     summary.outcomes = discovered
@@ -532,26 +510,21 @@ fn ingest_in<R: BufRead>(
         }
         batched += 1;
         if batched >= BATCH_ITEMS {
-            commit(store, &mut batch, ctx)?;
+            commit(store, &mut batch)?;
             batched = 0;
         }
     }
 
-    commit(store, &mut batch, ctx)?;
+    commit(store, &mut batch)?;
     Ok(facts)
 }
 
-/// Commits one batch and empties it. Embedding inference runs first, outside
-/// the store; the commit and the vector store are then one step of the walk's
-/// unit, so nothing inside the hold scales with inference.
-fn commit(store: &mut Writer<'_>, batch: &mut Diff, ctx: &mut WalkContext<'_>) -> Result<()> {
+/// Commits one batch, as one step of the walk's unit, and empties it.
+fn commit(store: &mut Writer<'_>, batch: &mut Diff) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
-    let embedding = ctx.embedding;
-    let computed =
-        embedding.map(|embedding| embedding.compute(batch, &mut ctx.embed_stats)).unwrap_or_default();
-    store.commit_batch(batch, embedding.map(|embedding| (embedding, computed.as_slice())))?;
+    store.commit_batch(batch)?;
     *batch = Diff::default();
     Ok(())
 }
@@ -737,7 +710,7 @@ mod tests {
 
         let conn = setup_conn();
 
-        let summary = run(project.path(), &conn, None, &discovered).expect("the multi-language walk failed");
+        let summary = run(project.path(), &conn, &discovered).expect("the multi-language walk failed");
 
         assert_eq!(summary.nodes, 4, "both languages' nodes must be counted, not just one's");
         assert_eq!(summary.edges, 2, "both languages' edges must be counted, not just one's");
@@ -759,7 +732,7 @@ mod tests {
 
         let conn = setup_conn();
 
-        let summary = run(project.path(), &conn, None, &discovered).expect("the single-language walk failed");
+        let summary = run(project.path(), &conn, &discovered).expect("the single-language walk failed");
 
         assert_eq!(summary.nodes, 2);
         assert_eq!(summary.edges, 1);
@@ -776,8 +749,7 @@ mod tests {
         let conn = setup_conn();
         let discovered = DiscoveredPlugins::default();
 
-        let summary =
-            run(project.path(), &conn, None, &discovered).expect("an empty discovery must not fail");
+        let summary = run(project.path(), &conn, &discovered).expect("an empty discovery must not fail");
 
         assert_eq!(summary, BulkIndexSummary::default());
         assert_eq!(count(&conn, "nodes"), 0);
@@ -878,7 +850,7 @@ mod tests {
         let discovered = discover_root(plugins.path());
         let conn = setup_conn();
 
-        let summary = run(project.path(), &conn, None, &discovered)
+        let summary = run(project.path(), &conn, &discovered)
             .expect("one failed language must not fail the whole walk");
 
         assert_eq!(summary.outcomes.get("alpha"), Some(&LanguageOutcome::Indexed { files: 2 }));
@@ -926,7 +898,7 @@ mod tests {
         let discovered = discover_root(plugins.path());
         let conn = setup_conn();
 
-        let err = run(project.path(), &conn, None, &discovered)
+        let err = run(project.path(), &conn, &discovered)
             .expect_err("a walk where every discovered language failed is an error");
         let message = format!("{err:#}");
         for language in ["alpha", "beta"] {
@@ -972,7 +944,7 @@ mod tests {
         let discovered = discover_root(plugins.path());
         let conn = setup_conn();
 
-        let message = run(project.path(), &conn, None, &discovered)
+        let message = run(project.path(), &conn, &discovered)
             .expect_err("a walk where every discovered language failed is an error")
             .to_string();
 
@@ -1003,7 +975,7 @@ mod tests {
         let discovered = discover_root(plugins.path());
         let conn = setup_conn();
 
-        run(project.path(), &conn, None, &discovered)
+        run(project.path(), &conn, &discovered)
             .expect_err("every discovered language failed; python having no plugin changes nothing");
         let rows = recorded_outcomes(&conn);
         assert_eq!(rows.len(), 2, "{rows:?}");
@@ -1026,7 +998,7 @@ mod tests {
         write_old_file(project.path(), "pkg/mod.pyi");
         let conn = setup_conn();
 
-        let summary = run(project.path(), &conn, None, &DiscoveredPlugins::default())
+        let summary = run(project.path(), &conn, &DiscoveredPlugins::default())
             .expect("zero discovered plugins is not an error");
 
         assert_eq!(count(&conn, "nodes"), 0);
@@ -1049,7 +1021,7 @@ mod tests {
         write_old_file(project.path(), "README.md");
         let conn = setup_conn();
 
-        let summary = run(project.path(), &conn, None, &DiscoveredPlugins::default()).unwrap();
+        let summary = run(project.path(), &conn, &DiscoveredPlugins::default()).unwrap();
 
         assert!(summary.outcomes.is_empty(), "{:?}", summary.outcomes);
         assert!(recorded_outcomes(&conn).is_empty());
@@ -1087,8 +1059,7 @@ mod tests {
         let conn = setup_conn();
         schema::ensure_current(&conn.lock().unwrap(), "test-generation").unwrap();
 
-        let summary =
-            run(project.path(), &conn, None, &discovered).expect("one failed language is not fatal");
+        let summary = run(project.path(), &conn, &discovered).expect("one failed language is not fatal");
 
         match summary.outcomes.get("beta") {
             Some(LanguageOutcome::Failed { error }) => {

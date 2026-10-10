@@ -297,6 +297,10 @@ fn wipes_and_reindexes_on_version_mismatch() {
     let version: String =
         conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    // Pinned as a literal on purpose, alongside the constant: a schema change
+    // has to update this line by hand. "14" adds `edges.specifier` and the
+    // `resolution_facts` table.
+    assert_eq!(version, "14");
 
     let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
     assert_eq!(node_count, 0, "old data must not survive a version mismatch wipe");

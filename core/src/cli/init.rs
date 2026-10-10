@@ -246,11 +246,11 @@ pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
         let embedding_pipeline = EmbeddingPipeline::load(&project_config.embedding);
         // Discovery's result, resolved above, handed straight in - see
         // `daemon::bulk_index::run`'s doc comment for why it takes that
-        // directly rather than a `PluginRegistry`. `embedding: None` -
-        // this walk is structural-only, matching `daemon::run`'s
-        // own cold start; the pipeline above is used by the semantic pass and
-        // the backfill pass below instead.
-        let summary = bulk_index::run(&canonical_root, &conn, None, &discovered)
+        // directly rather than a `PluginRegistry`. The walk is
+        // structural-only, matching `daemon::run`'s own cold start; the
+        // pipeline above is used by the semantic pass and the backfill pass
+        // below.
+        let summary = bulk_index::run(&canonical_root, &conn, &discovered)
             .context("failed to build the project's initial index")?;
         conn.with(schema::record_bulk_index).context("failed to record that the project was indexed")?;
         // The walk is only the structural half of a complete index, and the
