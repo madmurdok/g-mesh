@@ -79,7 +79,10 @@ run's JUnit (not reviewable, depends on another run's file).
   the one-process run; it takes its override as an argument instead, or is
   added to `ISOLATED`.
 - The heavy list drifts between batches; the `--full` report is how it is
-  kept current.
+  kept current. A test joins the list when one batch-end run shows it at 10s
+  or more, and leaves only after two batch-end runs under 10s: one run on a
+  quiet machine understates times that are 2-5x longer under the usual load,
+  so a single light run is not enough to send a test back to every verify.
 - A `cli`/`mcp` change that breaks another module's lib tests is not caught
   by the local verify run; CI (which does not narrow), `--full` at batch end
   and the release gate's full run catch it.
