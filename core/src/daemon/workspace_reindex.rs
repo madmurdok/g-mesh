@@ -2211,4 +2211,71 @@ mod tests {
 
         assert_eq!(semantic_pending_counts(&conn.lock().unwrap()), (0, 0), "the retry pass cleared it");
     }
+
+    // -----------------------------------------------------------------
+    // The retry of a language the last full walk failed.
+    // -----------------------------------------------------------------
+
+    /// `alpha` recorded failed by the last walk, its first retry counted and
+    /// the registry not routing it, as a daemon start finds it.
+    fn alpha_failed_and_counted(registry: &PluginRegistry, conn: &IndexStore) {
+        let outcomes = std::collections::BTreeMap::from([(
+            "alpha".to_string(),
+            crate::languages::LanguageOutcome::Failed { error: "the walk failed".to_string() },
+        )]);
+        conn.with(|conn| schema::record_language_outcomes(conn, &outcomes)).unwrap();
+        conn.with(|conn| schema::begin_language_retry(conn, "alpha")).unwrap();
+        registry.set_failed_languages(["alpha".to_string()]);
+    }
+
+    fn alpha_outcome(conn: &IndexStore) -> crate::languages::LanguageOutcome {
+        conn.with(schema::language_outcomes).unwrap().into_iter().find(|(l, _)| l == "alpha").unwrap().1
+    }
+
+    /// A retry swaps the language in or leaves everything as it was: a walk
+    /// that fails changes nothing (outcome `failed`, the retry still counted,
+    /// not routed, no rows); one that succeeds records `indexed`, drops the
+    /// count and routes the language, in the swap. It embeds nothing and
+    /// stores no vector even for texts a reindex would embed: the backfill
+    /// after it does.
+    ///
+    /// Controls: in `rebuild`, compute and pass the vectors for
+    /// `Rebuild::Retry` as for `Rebuild::Reindex` (2 embeds, both vectors
+    /// stored); drop `record_language_retry_succeeded` from
+    /// `language_swap::swap_attached` (the outcome stays `failed`).
+    #[test]
+    fn a_retry_swaps_the_language_in_whole_without_vectors_or_changes_nothing() {
+        let counters = Counters::default();
+        let (project, _plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, false);
+        give_text(project.path(), "alpha-n1", "Does the first thing.");
+        give_text(project.path(), "alpha-n2", "Does the second thing.");
+        alpha_failed_and_counted(&registry, &conn);
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+
+        test_plugin::set_bulk_stream(
+            project.path(),
+            "alpha",
+            &[json(&wire_node("alpha-n3", "src/a.alpha-src"))],
+            1,
+        );
+        let failed = retry_failed(&registry, &supervisor, &conn, std::time::SystemTime::now());
+
+        assert!(failed.is_err(), "a walk that exits non-zero fails the retry");
+        assert!(matches!(alpha_outcome(&conn), crate::languages::LanguageOutcome::Failed { .. }));
+        assert_eq!(conn.with(schema::language_retries).unwrap().get("alpha"), Some(&1));
+        assert!(registry.is_failed_language("alpha"), "a failed retry leaves the language unrouted");
+        assert_eq!(count(&conn.lock().unwrap(), "SELECT COUNT(*) FROM nodes WHERE language = 'alpha'"), 0);
+
+        // The fake plugin's own stream again: alpha-n1 and alpha-n2, with texts.
+        std::fs::remove_file(project.path().join(".alpha-bulk.ndjson")).unwrap();
+        retry_failed(&registry, &supervisor, &conn, std::time::SystemTime::now())
+            .expect("the retry succeeds");
+
+        assert!(matches!(alpha_outcome(&conn), crate::languages::LanguageOutcome::Indexed { files: _ }));
+        assert!(conn.with(schema::language_retries).unwrap().is_empty(), "the swap drops the count");
+        assert!(!registry.is_failed_language("alpha"), "the swapped-in language is routed");
+        assert_eq!(count(&conn.lock().unwrap(), "SELECT COUNT(*) FROM nodes WHERE language = 'alpha'"), 2);
+        assert_eq!(counters.embeds(), 0, "a retry embeds nothing");
+        assert_eq!((stored_vector(&conn, "alpha-n1"), stored_vector(&conn, "alpha-n2")), (None, None));
+    }
 }

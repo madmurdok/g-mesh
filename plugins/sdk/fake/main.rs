@@ -40,6 +40,9 @@
 //! - `semantic-pass.gated` / `semantic-pass.allow`: while the first exists and
 //!   the second does not, `semanticPass` answers are held; other frames keep
 //!   being answered meanwhile.
+//! - `bulk-walk.gated` / `bulk-walk.allow`: while the first exists and the
+//!   second does not, a `--bulk-index` walk waits, after `bulk-walks.log`,
+//!   before it streams anything.
 //! - `semantic-pass.json`: the `result` of every complete `semanticPass`.
 //! - `resolution-changed.json`: the `result` of every `resolutionChanged`;
 //!   without it, `resolutionChanged` answers an `unknown` delta and no facts.
@@ -101,6 +104,8 @@ const SEMANTIC_FIELDS: &str = "semantic-pass-fields.json";
 const SEMANTIC_PASS_LOG: &str = "semantic-passes.log";
 const SEMANTIC_PASS_GATED: &str = "semantic-pass.gated";
 const SEMANTIC_PASS_GATE_OPEN: &str = "semantic-pass.allow";
+const BULK_WALK_GATED: &str = "bulk-walk.gated";
+const BULK_WALK_GATE_OPEN: &str = "bulk-walk.allow";
 const METHOD_LOG_ENV: &str = "G_MESH_FAKE_PLUGIN_LOG";
 const STDERR_SPAM_ENV: &str = "G_MESH_FAKE_PLUGIN_STDERR_SPAM";
 
@@ -242,6 +247,9 @@ fn fixture(args: &Args, dir: &Path) {
     append(&dir.join(SPAWN_LOG), &process::id().to_string());
     if args.bulk_root.is_some() {
         append(&dir.join(BULK_WALK_LOG), &process::id().to_string());
+        if dir.join(BULK_WALK_GATED).exists() {
+            wait_for(&dir.join(BULK_WALK_GATE_OPEN));
+        }
     }
     let options: Options = match fs::read_to_string(dir.join(OPTIONS_FILE)) {
         Ok(text) => {

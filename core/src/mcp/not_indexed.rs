@@ -457,4 +457,40 @@ mod tests {
         );
         assert!(group(&conn, &[]).unwrap().is_empty());
     }
+
+    /// A failed language's refusal says its retry state, read from the store
+    /// with its error: a retry left names the next one and still the command;
+    /// none left says how many failed. The JSON carries no retry key.
+    ///
+    /// Control: drop the `language_retries` read in `from_coverage` (the
+    /// value has no retry state and the sentence is the old one).
+    #[test]
+    fn a_failed_languages_sentence_says_whether_a_start_retries_it() {
+        let conn = setup();
+        record_failed(&conn, "python");
+
+        let first = NotIndexed::from_coverage(&conn, &python_failed()).unwrap().sentence();
+        assert_eq!(
+            first,
+            format!(
+                " - python files are not indexed here: its plugin failed ({INNERMOST}); g-mesh retries it on its \
+                 next start (retry 1 of 2); if it keeps failing, fix the plugin, then run `g-mesh reindex`. This \
+                 is not evidence the file is empty or missing."
+            )
+        );
+
+        schema::begin_language_retry(&conn, "python").unwrap();
+        schema::begin_language_retry(&conn, "python").unwrap();
+        let value = NotIndexed::from_coverage(&conn, &python_failed()).unwrap();
+        assert_eq!(
+            value.sentence(),
+            format!(
+                " - python files are not indexed here: its plugin failed ({INNERMOST}); retried 2 times without \
+                 success; fix the plugin, then run `g-mesh reindex`. This is not evidence the file is empty or \
+                 missing."
+            )
+        );
+        let json = serde_json::to_value(&value).unwrap();
+        assert!(json.get("retries").is_none(), "{json}");
+    }
 }

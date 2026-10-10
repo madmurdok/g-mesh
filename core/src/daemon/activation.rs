@@ -365,3 +365,6 @@ impl ActivationCtx {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

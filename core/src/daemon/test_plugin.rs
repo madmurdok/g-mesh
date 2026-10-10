@@ -269,6 +269,23 @@ pub(crate) fn open_semantic_pass_gate(plugin_dir: &Path) {
         .expect("failed to open the fake plugin's semantic pass gate");
 }
 
+/// Makes every later `--bulk-index` walk of the plugin in `plugin_dir` wait,
+/// once it has written `bulk-walks.log` ([`bulk_walks`]), until
+/// [`open_bulk_walk_gate`]: a walk in flight is then a state the test holds.
+///
+/// Every test that gates a walk **must** open the gate on every path,
+/// including a failing assertion: the walking thread never returns otherwise.
+pub(crate) fn gate_bulk_walks(plugin_dir: &Path) {
+    fs::write(plugin_dir.join("bulk-walk.gated"), "gated\n")
+        .expect("failed to gate the fake plugin's bulk walk");
+}
+
+/// Lets the walks gated by [`gate_bulk_walks`] stream. Idempotent.
+pub(crate) fn open_bulk_walk_gate(plugin_dir: &Path) {
+    fs::write(plugin_dir.join("bulk-walk.allow"), "go\n")
+        .expect("failed to open the fake plugin's bulk walk gate");
+}
+
 /// [`install`], but the plugin completes its handshake normally and then
 /// never answers the *first* framed request it ever sees for this plugin
 /// directory - it still parses that request and logs it to `requests.log`
@@ -470,7 +487,6 @@ pub(crate) fn spawns(plugin_dir: &Path) -> Vec<u32> {
 
 /// How many `--bulk-index` walks this plugin directory has ever been spawned
 /// for (a subset of [`spawns`]). 0 before the first one.
-#[allow(dead_code)]
 pub(crate) fn bulk_walks(plugin_dir: &Path) -> usize {
     let Ok(log) = fs::read_to_string(plugin_dir.join("bulk-walks.log")) else { return 0 };
     log.lines().filter(|line| !line.trim().is_empty()).count()

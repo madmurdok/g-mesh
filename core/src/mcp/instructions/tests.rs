@@ -2030,3 +2030,249 @@ fn a_walking_cold_start_does_not_name_its_cause() {
         assert!(!rendered.contains(lead), "{cause:?}: {rendered}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The failed sentence by retry state: whether a daemon start still retries
+// the language (ADR 0021), as `GMeshMcpServer::instructions` reads it from
+// `language_retry`.
+// ---------------------------------------------------------------------------
+
+/// [`warm_real`], with `retries` (language -> retries so far; absent = 0) as
+/// a walked project's start reads them.
+fn warm_retrying(
+    found: &DiscoveredPlugins,
+    indexed: &[&str],
+    outcomes: Vec<(&str, LanguageOutcome)>,
+    retries: &[(&str, u32)],
+) -> Coverage {
+    let retries = retries.iter().map(|(language, n)| (language.to_string(), *n)).collect();
+    Coverage::from_outcomes(
+        real_present(found, indexed),
+        sorted(outcomes),
+        Some(retries),
+        real_missing(found),
+    )
+}
+
+/// Each retry state's sentence, exactly: a retry left says which one comes
+/// on the next start and still names the command; none left says how many
+/// failed. Languages in one state share one sentence (plural wording), in
+/// the order of the state's first language; with no retry state the old
+/// sentence is unchanged.
+///
+/// Controls: in `coverage_paragraph`, take every language's state as `None`
+/// (only the old sentence is said); in `failed_advice`, `n` for `n + 1` (the
+/// retry numbers are off by one); drop the grouping and say one sentence per
+/// language (the plural sentence is gone).
+#[test]
+fn a_failed_languages_sentence_says_whether_a_start_retries_it() {
+    let all = ["go", "python", "rust", "typescript"];
+    let found = real_plugins(&all);
+    let cause = |language: &str| failed(&format!("{language} walk failed\n{language} cause"));
+    let one_failed = |retries: &[(&str, u32)]| {
+        build(&warm_retrying(
+            &found,
+            &["go", "python", "typescript"],
+            vec![
+                ("go", indexed()),
+                ("python", indexed()),
+                ("rust", cause("rust")),
+                ("typescript", indexed()),
+            ],
+            retries,
+        ))
+    };
+
+    let first = one_failed(&[]);
+    assert!(
+        first.contains(
+            "Not indexed, plugin failed: rust (rust cause) - g-mesh retries it on its next start (retry 1 of 2); \
+             if it keeps failing, fix the plugin, then run `g-mesh reindex`."
+        ),
+        "{first}"
+    );
+    let second = one_failed(&[("rust", 1)]);
+    assert!(
+        second.contains("rust (rust cause) - g-mesh retries it on its next start (retry 2 of 2);"),
+        "{second}"
+    );
+    let used_up = one_failed(&[("rust", 2)]);
+    assert!(
+        used_up.contains(
+            "Not indexed, plugin failed: rust (rust cause) - retried 2 times without success; fix the plugin, \
+             then run `g-mesh reindex`."
+        ),
+        "{used_up}"
+    );
+
+    let grouped = build(&warm_retrying(
+        &found,
+        &["typescript"],
+        vec![
+            ("go", cause("go")),
+            ("python", cause("python")),
+            ("rust", cause("rust")),
+            ("typescript", indexed()),
+        ],
+        &[("go", 2), ("rust", 2)],
+    ));
+    let used_up_sentence =
+        "Not indexed, plugin failed: go (go cause), rust (rust cause) - retried 2 times without \
+                            success; fix the plugins, then run `g-mesh reindex`.";
+    let retrying_sentence = "Not indexed, plugin failed: python (python cause) - g-mesh retries it on its next \
+                             start (retry 1 of 2); if it keeps failing, fix the plugin, then run `g-mesh reindex`.";
+    assert!(grouped.contains(used_up_sentence), "{grouped}");
+    assert!(grouped.contains(retrying_sentence), "{grouped}");
+    assert!(
+        grouped.find(used_up_sentence) < grouped.find(retrying_sentence),
+        "go's state comes first: {grouped}"
+    );
+
+    let plural = build(&warm_retrying(
+        &found,
+        &["typescript"],
+        vec![
+            ("go", cause("go")),
+            ("python", cause("python")),
+            ("rust", indexed()),
+            ("typescript", indexed()),
+        ],
+        &[],
+    ));
+    assert!(
+        plural.contains(
+            "Not indexed, plugin failed: go (go cause), python (python cause) - g-mesh retries them on its next \
+             start (retry 1 of 2); if they keep failing, fix the plugins, then run `g-mesh reindex`."
+        ),
+        "{plural}"
+    );
+
+    let unsaid = build(&warm_real(
+        &found,
+        &["go", "python", "typescript"],
+        vec![("go", indexed()), ("python", indexed()), ("rust", cause("rust")), ("typescript", indexed())],
+    ));
+    assert!(
+        unsaid.contains(
+            "Not indexed, plugin failed: rust (rust cause) - fix the plugin, then run `g-mesh reindex`."
+        ),
+        "{unsaid}"
+    );
+    assert!(!unsaid.contains("next start") && !unsaid.contains("without success"), "{unsaid}");
+}
+
+/// The ADR 0022 byte table's failed scenarios again, with the retry wording,
+/// which is longer than the old one: three failed languages with long
+/// errors, in each mix of retry states (one sentence per state is the
+/// longest), and the four-state scenario. Each fits the ceiling at ladder
+/// step 1, and says the retry wording, so the measurement is of it. Run with
+/// `--nocapture` for the table.
+///
+/// Control: in `coverage_paragraph`, take every language's state as `None`
+/// (the retry wording is not said).
+#[test]
+fn the_retry_wording_fits_the_ceiling_in_every_realistic_scenario() {
+    let all = ["go", "python", "rust", "typescript"];
+    let every = real_plugins(&all);
+    let long_error = "x".repeat(182);
+    let rust_error = format!("rust plugin failed: {}", "e".repeat(162));
+    let three_failed = || {
+        vec![
+            ("go", failed(&long_error)),
+            ("python", failed(&long_error)),
+            ("rust", failed(&long_error)),
+            ("typescript", indexed()),
+        ]
+    };
+
+    let scenarios: Vec<(&str, Coverage)> = vec![
+        (
+            "Three failed, one per retry state",
+            warm_retrying(&every, &["typescript"], three_failed(), &[("python", 1), ("rust", 2)]),
+        ),
+        ("Three failed, all retried next start", warm_retrying(&every, &["typescript"], three_failed(), &[])),
+        (
+            "Three failed, all retries used up",
+            warm_retrying(&every, &["typescript"], three_failed(), &[("go", 2), ("python", 2), ("rust", 2)]),
+        ),
+        (
+            "Four states, rust retried next start",
+            warm_retrying(
+                &real_plugins(&["rust", "typescript"]),
+                &["typescript"],
+                vec![
+                    ("typescript", indexed()),
+                    ("rust", failed(&rust_error)),
+                    ("go", absent(Some(12_345))),
+                    ("python", absent(Some(54_321))),
+                ],
+                &[],
+            ),
+        ),
+    ];
+    for (name, coverage) in &scenarios {
+        let rendered = build(coverage);
+        println!("{name}: {} bytes", rendered.len());
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{name}: {} bytes", rendered.len());
+        assert_eq!(&rendered, &render(coverage, 1), "{name} must fit at step 1");
+        assert!(
+            rendered.contains("on its next start") || rendered.contains("without success"),
+            "{name} must say the retry wording: {rendered}"
+        );
+    }
+}
+
+/// The server reads the retry count from the store: Rust, failed and retried
+/// once, is said to be retried on the next start (2 of 2).
+///
+/// Control: pass `None` as the retries to `Coverage::from_outcomes` in
+/// `GMeshMcpServer::instructions` (the old wording).
+#[test]
+fn the_server_says_the_retry_state_it_reads_from_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(IndexStore::new(store_with_files(&["typescript"])));
+    record_outcomes(&store, vec![("typescript", indexed()), ("rust", failed("walk failed\nrust cause"))]);
+    store.with(|conn| schema::begin_language_retry(conn, "rust")).unwrap();
+    let server = server_over(&dir, real_plugins(&["rust", "typescript"]), Arc::clone(&store), Phase::Ready);
+
+    let rendered = server.instructions();
+
+    assert!(
+        rendered.contains("rust (rust cause) - g-mesh retries it on its next start (retry 2 of 2);"),
+        "{rendered}"
+    );
+}
+
+/// A walk that failed every language (`Phase::Failed`) is retried whole by
+/// the next tool call, not per language by a start: its failed sentence
+/// keeps the old wording, whatever retries are recorded.
+///
+/// Control: drop the `Phase::Failed` arm that sets the retries to `None` in
+/// `GMeshMcpServer::instructions` (the retry wording appears).
+#[test]
+fn a_failed_walk_keeps_the_failed_sentence_without_a_retry_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(IndexStore::new(store_with_files(&[])));
+    record_outcomes(
+        &store,
+        vec![("rust", failed("walk failed\nrust cause")), ("typescript", failed("t\nts cause"))],
+    );
+    store.with(|conn| schema::begin_language_retry(conn, "rust")).unwrap();
+    let server = server_over(
+        &dir,
+        real_plugins(&["rust", "typescript"]),
+        Arc::clone(&store),
+        Phase::Failed("every plugin failed".into()),
+    );
+
+    let rendered = server.instructions();
+
+    assert!(
+        rendered.contains(
+            "Not indexed, plugin failed: rust (rust cause), typescript (ts cause) - fix the plugin, then run \
+             `g-mesh reindex`."
+        ),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("next start") && !rendered.contains("without success"), "{rendered}");
+}
