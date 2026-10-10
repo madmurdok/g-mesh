@@ -77,9 +77,16 @@ impl Project {
         std::fs::read_to_string(self.root().join(rel)).unwrap_or_else(|e| panic!("failed to read {rel}: {e}"))
     }
 
-    fn status(&self) -> String {
+    /// `g-mesh status --full`: the view that walks the project for index
+    /// coverage and dirty files.
+    fn status_full(&self) -> String {
+        self.status_with(&["--full"])
+    }
+
+    fn status_with(&self, flags: &[&str]) -> String {
         let output = Command::new(BIN)
             .arg("status")
+            .args(flags)
             .current_dir(self.root())
             .output()
             .expect("failed to run `g-mesh status`");
@@ -139,7 +146,7 @@ fn init_on_a_fresh_project_creates_state_and_a_subsequent_status_shows_it_indexe
 
     // A subsequent status call shows indexing has completed - no daemon was
     // ever started, so this is read entirely off what init itself wrote.
-    let status = project.status();
+    let status = project.status_full();
     assert_contains(&status, "daemon core:     not running");
     assert!(!status.contains("never fully walked"), "{status}");
     assert_contains(&status, "index coverage:  100.0% (2/2 source files)");

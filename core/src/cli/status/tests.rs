@@ -74,7 +74,7 @@ impl Fixture {
     }
 
     fn status(&self) -> IndexStatus {
-        index_status(self.root(), &self.db_path(), &bundled_plugins()).unwrap()
+        index_status(self.root(), &self.db_path(), &bundled_plugins(), Mode::Full).unwrap()
     }
 }
 
@@ -84,11 +84,11 @@ fn a_project_with_no_index_owes_work_for_every_file_it_has() {
 
     let status = fixture.status();
 
-    assert_eq!(status.discovered, 2);
-    assert_eq!(status.indexed, 0);
-    assert_eq!(status.dirty, 2);
+    assert_eq!(status.coverage.unwrap().discovered, 2);
+    assert_eq!(status.coverage.unwrap().indexed, 0);
+    assert_eq!(status.coverage.unwrap().dirty, 2);
     assert!(!status.bulk_indexed);
-    assert_eq!(status.coverage(), 0.0);
+    assert_eq!(status.coverage.unwrap().ratio(), 0.0);
 }
 
 #[test]
@@ -106,11 +106,11 @@ fn a_fully_indexed_project_reports_complete_coverage_and_nothing_dirty() {
 
     let status = fixture.status();
 
-    assert_eq!(status.discovered, 2);
-    assert_eq!(status.indexed, 2);
-    assert_eq!(status.dirty, 0, "a bulk-indexed file with no baseline is not stale");
+    assert_eq!(status.coverage.unwrap().discovered, 2);
+    assert_eq!(status.coverage.unwrap().indexed, 2);
+    assert_eq!(status.coverage.unwrap().dirty, 0, "a bulk-indexed file with no baseline is not stale");
     assert!(status.bulk_indexed);
-    assert_eq!(status.coverage(), 1.0);
+    assert_eq!(status.coverage.unwrap().ratio(), 1.0);
 }
 
 /// The acceptance criterion's "known dirty-queue size": one file the
@@ -133,10 +133,10 @@ fn dirty_counts_never_indexed_files_and_files_whose_baseline_went_stale() {
 
     let status = fixture.status();
 
-    assert_eq!(status.discovered, 3);
-    assert_eq!(status.indexed, 2);
-    assert_eq!(status.dirty, 2, "the never-indexed file and the stale one");
-    assert!((status.coverage() - 2.0 / 3.0).abs() < f64::EPSILON);
+    assert_eq!(status.coverage.unwrap().discovered, 3);
+    assert_eq!(status.coverage.unwrap().indexed, 2);
+    assert_eq!(status.coverage.unwrap().dirty, 2, "the never-indexed file and the stale one");
+    assert!((status.coverage.unwrap().ratio() - 2.0 / 3.0).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -205,9 +205,13 @@ fn rust_and_python_files_count_toward_coverage_and_the_dirty_queue() {
 
     let status = fixture.status();
 
-    assert_eq!(status.discovered, 5, "every language's files are discovered, not only JS/TS");
-    assert_eq!(status.indexed, 4);
-    assert_eq!(status.dirty, 2, "the never-indexed .py and the stale .rs");
+    assert_eq!(
+        status.coverage.unwrap().discovered,
+        5,
+        "every language's files are discovered, not only JS/TS"
+    );
+    assert_eq!(status.coverage.unwrap().indexed, 4);
+    assert_eq!(status.coverage.unwrap().dirty, 2, "the never-indexed .py and the stale .rs");
 }
 
 /// Each language's `[plugin.workspace] exclude_dirs` applies to that
@@ -244,14 +248,15 @@ fn a_project_with_no_source_files_is_covered_rather_than_dividing_by_zero() {
 
     let status = fixture.status();
 
-    assert_eq!(status.discovered, 0);
-    assert_eq!(status.coverage(), 1.0);
-    assert_eq!(status.dirty, 0);
+    assert_eq!(status.coverage.unwrap().discovered, 0);
+    assert_eq!(status.coverage.unwrap().ratio(), 1.0);
+    assert_eq!(status.coverage.unwrap().dirty, 0);
 }
 
 #[test]
 fn a_report_renders_every_field_it_was_asked_for() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -274,14 +279,13 @@ fn a_report_renders_every_field_it_was_asked_for() {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 4,
-            indexed: 3,
-            dirty: 1,
+            coverage: Some(Coverage { discovered: 4, indexed: 3, dirty: 1 }),
             syntax_error_files: vec!["src/broken.ts".to_string()],
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -302,6 +306,7 @@ fn a_report_renders_every_field_it_was_asked_for() {
 #[test]
 fn an_interrupted_workspace_reindex_is_named() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -318,14 +323,13 @@ fn an_interrupted_workspace_reindex_is_named() {
             pending_reindex: vec![("rust".to_string(), "Cargo.toml".to_string())],
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 1,
-            indexed: 1,
-            dirty: 0,
+            coverage: Some(Coverage { discovered: 1, indexed: 1, dirty: 0 }),
             syntax_error_files: Vec::new(),
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -340,6 +344,7 @@ fn an_interrupted_workspace_reindex_is_named() {
 #[test]
 fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -356,14 +361,13 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 4,
-            indexed: 4,
-            dirty: 0,
+            coverage: Some(Coverage { discovered: 4, indexed: 4, dirty: 0 }),
             syntax_error_files: Vec::new(),
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -395,6 +399,7 @@ fn a_recorded_semantic_pass_failure_is_shown_with_its_reason_instead_of_the_gene
     let index = fixture.status();
     assert_eq!(index.semantic_pass_owed, vec!["typescript".to_string()]);
     let rendered = render(&Report {
+        mode: Mode::Full,
         project_root: fixture.root().to_path_buf(),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -407,6 +412,7 @@ fn a_recorded_semantic_pass_failure_is_shown_with_its_reason_instead_of_the_gene
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     });
 
     assert!(
@@ -584,6 +590,7 @@ fn a_deferred_pass_carries_no_reindex_advice_while_a_daemon_works() {
 #[test]
 fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_owed() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -603,14 +610,13 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 4,
-            indexed: 1,
-            dirty: 3,
+            coverage: Some(Coverage { discovered: 4, indexed: 1, dirty: 3 }),
             syntax_error_files: Vec::new(),
         },
         phase: Some("walking".to_string()),
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -632,6 +638,7 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
 /// project is incidental to what they check.
 fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
     Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -648,14 +655,13 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 4,
-            indexed: if bulk_indexed { 4 } else { 0 },
-            dirty: 4,
+            coverage: Some(Coverage { discovered: 4, indexed: if bulk_indexed { 4 } else { 0 }, dirty: 4 }),
             syntax_error_files: Vec::new(),
         },
         phase: phase.map(str::to_string),
         front: None,
         progress: None,
+        languages: no_languages(),
     }
 }
 
@@ -870,6 +876,7 @@ fn a_progress_file_left_by_a_dead_daemon_is_not_rendered_as_live() {
 #[test]
 fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -889,14 +896,13 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 2,
-            indexed: 0,
-            dirty: 2,
+            coverage: Some(Coverage { discovered: 2, indexed: 0, dirty: 2 }),
             syntax_error_files: Vec::new(),
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -966,6 +972,7 @@ fn plugin_reports_lists_one_entry_per_live_pid_file_sorted_by_language() {
 #[test]
 fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -982,14 +989,13 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 0,
-            indexed: 0,
-            dirty: 0,
+            coverage: Some(Coverage { discovered: 0, indexed: 0, dirty: 0 }),
             syntax_error_files: Vec::new(),
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -1153,7 +1159,8 @@ fn a_daemon_suspended_language_is_reported_by_a_separate_status_read() {
     supervisor.check_memory_limit_sampled_by(|_pid| Some(230));
     assert!(supervisor.is_semantic_suspended(), "the fixture must actually have suspended");
 
-    let report = collect(project.path()).expect("status must still collect over a suspended project");
+    let report =
+        collect(project.path(), Mode::Light).expect("status must still collect over a suspended project");
     assert_eq!(report.suspended_languages.len(), 1, "{:?}", report.suspended_languages);
     assert_eq!(report.suspended_languages[0].language, "heavy");
     assert!(
@@ -1179,6 +1186,7 @@ fn a_project_with_no_suspension_marker_reports_none() {
     assert_eq!(suspended_language_reports(state.path()), Vec::new());
 
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -1195,22 +1203,27 @@ fn a_project_with_no_suspension_marker_reports_none() {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 0,
-            indexed: 0,
-            dirty: 0,
+            coverage: Some(Coverage { discovered: 0, indexed: 0, dirty: 0 }),
             syntax_error_files: Vec::new(),
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
     let rendered = render(&report);
     assert!(!rendered.contains("semantic ("), "{rendered}");
 }
 
 /// A report around `index`, with no daemon running.
+/// A languages section with nothing recorded, for fixtures about other lines.
+fn no_languages() -> LanguagesReport {
+    LanguagesReport { section: LanguageSection::NoIndex, installed: Ok(BTreeMap::new()) }
+}
+
 fn report_with(index: IndexStatus) -> Report {
     Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -1223,6 +1236,7 @@ fn report_with(index: IndexStatus) -> Report {
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     }
 }
 
@@ -1313,9 +1327,9 @@ fn an_alias_only_file_is_discovered_and_indexed_under_the_link_and_not_dirty() {
 
     assert_eq!(discovered(&fixture), vec!["src/api/a.ts", "src/main.ts"]);
     let status = fixture.status();
-    assert_eq!(status.discovered, 2);
-    assert_eq!(status.indexed, 2);
-    assert_eq!(status.dirty, 0);
+    assert_eq!(status.coverage.unwrap().discovered, 2);
+    assert_eq!(status.coverage.unwrap().indexed, 2);
+    assert_eq!(status.coverage.unwrap().dirty, 0);
 }
 
 /// B5: a file reachable plainly and through a link (`app -> lib`, `app`
@@ -1330,7 +1344,7 @@ fn a_file_reachable_through_a_link_and_plainly_is_counted_once_under_its_plain_s
     link(&fixture, "app", "lib");
 
     assert_eq!(discovered(&fixture), vec!["lib/x.ts"]);
-    assert_eq!(fixture.status().discovered, 1);
+    assert_eq!(fixture.status().coverage.unwrap().discovered, 1);
 }
 
 /// B10: `src/dep -> ../node_modules/foo` (`node_modules/` gitignored): the

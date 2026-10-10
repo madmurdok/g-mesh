@@ -105,8 +105,19 @@ impl Project {
     }
 
     fn status(&self) -> String {
+        self.status_with(&[])
+    }
+
+    /// `g-mesh status --full`: the view that walks the project for index
+    /// coverage and dirty files.
+    fn status_full(&self) -> String {
+        self.status_with(&["--full"])
+    }
+
+    fn status_with(&self, flags: &[&str]) -> String {
         let output = Command::new(BIN)
             .arg("status")
+            .args(flags)
             .current_dir(self.root())
             .output()
             .expect("failed to run `g-mesh status`");
@@ -195,7 +206,7 @@ fn status_reports_the_daemon_plugin_coverage_and_syntax_errors_of_a_live_project
     assert_eq!(core_pid, daemon_process.id(), "the pid file must name the daemon we started");
     assert_ne!(plugin_pid, core_pid, "the plugin runs in a process of its own");
 
-    let status = project.status();
+    let status = project.status_full();
 
     assert_contains(&status, &format!("daemon core:     running (pid {core_pid})"));
     assert_contains(&status, &format!("plugin (typescript):     active (pid {plugin_pid})"));
@@ -237,7 +248,7 @@ fn status_reports_a_dead_daemon_and_the_files_its_index_never_saw() {
     std::fs::write(project.root().join("late.ts"), b"export const late = 1;\n")
         .expect("failed to write late.ts");
 
-    let status = project.status();
+    let status = project.status_full();
 
     assert_contains(&status, "daemon core:     not running");
     // The stale plugin-typescript.pid left behind by the kill names a dead
@@ -265,9 +276,17 @@ fn status_on_a_project_that_was_never_indexed_reports_an_empty_state() {
     assert_contains(&status, "plugins:         none active");
     assert_contains(&status, "last used:       never recorded");
     assert_contains(&status, "never fully walked");
-    assert_contains(&status, "index coverage:  0.0% (0/2 source files)");
-    assert_contains(&status, "dirty files:     2 awaiting reindex");
+    assert_contains(
+        &status,
+        "index coverage:  not checked - `g-mesh status --full` walks the project for coverage and dirty files",
+    );
+    assert!(!status.contains("dirty files:"), "the default view does not walk the project:\n{status}");
+    assert_contains(&status, "languages:       none recorded - no index yet");
     assert_contains(&status, "syntax errors:   none");
+
+    let full = project.status_full();
+    assert_contains(&full, "index coverage:  0.0% (0/2 source files)");
+    assert_contains(&full, "dirty files:     2 awaiting reindex");
 }
 
 /// A daemon killed before it could clean up leaves its pid, phase and
