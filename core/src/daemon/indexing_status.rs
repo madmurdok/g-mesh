@@ -720,6 +720,22 @@ mod tests {
         assert_eq!(status.phase(), Phase::Structural);
     }
 
+    /// The cause a daemon starts cold for is kept, on every clone,
+    /// for the session instructions; a status built without one says `Fresh`.
+    ///
+    /// Control: make `cold_cause()` return `ColdCause::Fresh`: the
+    /// `Discarded` and `Incomplete` rows fail.
+    #[test]
+    fn an_unindexed_status_keeps_its_cold_cause() {
+        for cause in [ColdCause::Fresh, ColdCause::Discarded, ColdCause::Incomplete] {
+            let status = IndexingStatus::unindexed_because(cause);
+            assert_eq!(status.phase(), Phase::Unindexed);
+            assert_eq!(status.cold_cause(), cause);
+            assert_eq!(status.clone().cold_cause(), cause);
+        }
+        assert_eq!(IndexingStatus::unindexed().cold_cause(), ColdCause::Fresh);
+    }
+
     /// Every connection the accept loop serves holds its own clone, so a
     /// transition has to be visible through all of them at once.
     #[test]

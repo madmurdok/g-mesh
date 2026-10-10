@@ -436,6 +436,45 @@ mod tests {
         assert_eq!(detection.mode, Mode::Multi);
     }
 
+    /// The generation check behind the front's "(indexed)": this build's
+    /// schema and core pipeline, whatever the plugin half says; anything
+    /// else, or no generation at all, is not current.
+    #[test]
+    fn only_this_builds_schema_and_core_pipeline_are_the_current_generation() {
+        let state = tempfile::tempdir().unwrap();
+        index_with_bulk_indexed_at(state.path(), true);
+        let conn = open_existing_index(state.path()).unwrap();
+        assert!(current_generation(&conn), "the generation `ensure_current` just wrote");
+
+        let set = |schema_version: &str, indexer_version: &str| {
+            conn.execute(
+                "UPDATE meta SET schema_version = ?1, indexer_version = ?2 WHERE id = 1",
+                [schema_version, indexer_version],
+            )
+            .unwrap();
+        };
+        let core = schema::CURRENT_INDEXER_VERSION;
+        let schema_now = schema::CURRENT_SCHEMA_VERSION;
+
+        set(schema_now, &format!("{core}+another-plugin-digest"));
+        assert!(current_generation(&conn), "the plugin half is not compared");
+
+        for (schema_version, indexer_version) in [
+            (schema_now, "stale".to_string()),
+            (schema_now, format!("{core}0+digest")),
+            (schema_now, core.to_string()),
+            (schema_now, String::new()),
+            ("0", format!("{core}+digest")),
+        ] {
+            set(schema_version, &indexer_version);
+            assert!(!current_generation(&conn), "schema {schema_version:?}, indexer {indexer_version:?}");
+        }
+
+        let empty = tempfile::tempdir().unwrap();
+        Connection::open(empty.path().join("index.db")).unwrap();
+        assert!(!current_generation(&open_existing_index(empty.path()).unwrap()), "no meta table");
+    }
+
     #[test]
     fn the_mode_decision_never_creates_an_index() {
         let root = tempfile::tempdir().unwrap();

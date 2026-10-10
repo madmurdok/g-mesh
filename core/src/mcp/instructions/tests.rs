@@ -1950,3 +1950,79 @@ fn the_cap_never_cuts_the_build_command_out_of_the_longest_windows_hint() {
         }
     }
 }
+
+/// The lead each cause gives a cold start that has not started its
+/// walk, and the one every cause shares once the walk runs.
+const FRESH_LEAD: &str = "Not indexed yet - the first tool call builds it";
+const DISCARDED_LEAD: &str = "Index discarded (built by an earlier g-mesh or plugin build) - \
+the first tool call rebuilds it";
+const INCOMPLETE_LEAD: &str = "Index incomplete (an earlier walk stopped part way) - \
+the first tool call finishes it";
+const WALKING_LEAD: &str = "Being built now";
+/// The parenthetical only the `Fresh` line keeps.
+const STRUCTURAL_FIRST: &str = "(structural first; semantic search after)";
+
+const CAUSES: [(ColdCause, &str); 3] = [
+    (ColdCause::Fresh, FRESH_LEAD),
+    (ColdCause::Discarded, DISCARDED_LEAD),
+    (ColdCause::Incomplete, INCOMPLETE_LEAD),
+];
+
+/// Before the walk starts, each [`ColdCause`] renders its own line,
+/// with the root and, for a root too long for the ceiling, without it - and
+/// every rendering at the worst-case coverage fits
+/// [`INSTRUCTIONS_BYTE_CEILING`].
+///
+/// Control: make `cold_start_line_fallback` give every non-walking cause the
+/// `Fresh` text: the `Discarded` and `Incomplete` rows fail.
+#[test]
+fn cold_start_names_each_cause_within_the_ceiling() {
+    for (cause, lead) in CAUSES {
+        let root = root_of_byte_len(103);
+        let rendered = cold_start(&root, false, cause, &cold(worst_case_present()));
+        println!("cold-start ({cause:?}, 103-byte root) bytes: {}", rendered.len());
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{cause:?}: {} bytes", rendered.len());
+        assert!(
+            rendered.starts_with(&format!("Index root: {}. {lead}", root.display())),
+            "{cause:?}: {rendered}"
+        );
+        for (other, other_lead) in CAUSES {
+            if other != cause {
+                assert!(!rendered.contains(other_lead), "{cause:?} also says {other:?}'s line: {rendered}");
+            }
+        }
+
+        let rendered = cold_start(&root_of_byte_len(600), false, cause, &cold(worst_case_present()));
+        assert!(
+            rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
+            "{cause:?}, 600-byte root: {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.starts_with(lead), "{cause:?}, 600-byte root: {rendered}");
+    }
+}
+
+/// The `Discarded` and `Incomplete` lines leave out "(structural first;
+/// semantic search after)" to stay about as long as the `Fresh` line, which
+/// keeps it.
+#[test]
+fn only_the_fresh_cold_start_line_says_structural_first() {
+    assert!(cold_start_line_fallback(false, ColdCause::Fresh).contains(STRUCTURAL_FIRST));
+    for cause in [ColdCause::Discarded, ColdCause::Incomplete] {
+        let line = cold_start_line_fallback(false, cause);
+        assert!(!line.contains(STRUCTURAL_FIRST), "{cause:?}: {line}");
+        assert!(line.ends_with(WAIT_IS_NOT_WRONG), "{cause:?}: {line}");
+    }
+}
+
+/// Once the walk runs, the cause is not shown: the line is the
+/// walking one whatever owed the walk.
+#[test]
+fn a_walking_cold_start_does_not_name_its_cause() {
+    for (cause, lead) in CAUSES {
+        let rendered = cold_start(&root_of_byte_len(103), true, cause, &cold(worst_case_present()));
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{cause:?}: {} bytes", rendered.len());
+        assert!(rendered.contains(WALKING_LEAD), "{cause:?}: {rendered}");
+        assert!(!rendered.contains(lead), "{cause:?}: {rendered}");
+    }
+}
