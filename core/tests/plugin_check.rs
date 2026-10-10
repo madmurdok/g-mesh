@@ -621,16 +621,39 @@ fn the_typescript_plugin_passes_on_a_small_typescript_fixture() {
 /// it first calls `packages.Load`, which happens only on a `semanticPass`.
 /// Before GM-281 it was a second `SKIP ... not instrumented`, which was the
 /// honest report for a plugin with no engine to start.
+///
+/// The manifest declares `resolution_delta = true`, so
+/// `capabilities.resolution-delta-version-bump` runs: the fixture's go.mod has
+/// no `require`, so the bump rewrites the `go` directive (`1.22` ->
+/// `1.22.0`), which the plugin answers `unchanged`.
+///
+/// Control: `resolution_delta = false` in `plugins/go/plugin.toml` (the
+/// check is a SKIP).
 #[test]
 fn the_go_plugin_passes_on_its_own_fixture() {
+    let before = fs::read(go_conformance_project().join("go.mod")).unwrap();
     let run = run_check(&go_plugin_dir(), &go_conformance_project(), &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let skipped = SKIPPED_WITHOUT_PAIR.contains(&id) || id == RESOLUTION_DELTA;
-        let expected = if skipped { "SKIP" } else { "PASS" };
+        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
+    assert!(
+        run.stdout.contains("resolution-delta: version bump of go.mod (the `go` directive)"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains(r#"resolution-delta: resolutionChanged -> {"kind":"unchanged"}"#),
+        "{}",
+        run.stdout
+    );
     assert!(!run.stdout.contains("WARN"), "{}", run.stdout);
+    assert_eq!(
+        fs::read(go_conformance_project().join("go.mod")).unwrap(),
+        before,
+        "the kit must never modify the fixture"
+    );
 }
 
 // ============================================================================
