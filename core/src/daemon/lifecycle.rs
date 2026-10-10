@@ -39,7 +39,7 @@ use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
 use crate::protocol::jsonrpc::is_timeout;
 use crate::storage::index_store::{self, IndexStore};
-use crate::watcher::apply::SemanticPassOutcome;
+use crate::watcher::apply::{FileChangeOutcome, SemanticPassOutcome};
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// `plugin.idleTimeoutMinutes`'s default.
@@ -205,6 +205,11 @@ pub struct PluginSupervisor {
     /// is coming, so earlier languages' long passes cannot idle it out before
     /// its own pass is asked. `sleep_now` and `check_memory_limit` ignore it.
     semantic_holds: AtomicUsize,
+    /// The whole-language reindex a file change asked for (GM-507,
+    /// [`FileChangeOutcome::ReindexLanguage`]), as `(trigger, reason)`: run by
+    /// the registry once this supervisor's lock is released
+    /// ([`take_owed_reindex`](Self::take_owed_reindex)).
+    owed_reindex: Mutex<Option<(String, String)>>,
 }
 
 /// Keeps a [`PluginSupervisor`] from idling to sleep while it lives
@@ -257,6 +262,7 @@ impl PluginSupervisor {
             semantic_suspended: AtomicBool::new(false),
             sampling_unavailable_logged: AtomicBool::new(false),
             semantic_holds: AtomicUsize::new(0),
+            owed_reindex: Mutex::new(None),
         }))
     }
 
@@ -312,9 +318,9 @@ impl PluginSupervisor {
         // measures from its start.
         self.touch();
         let retry_path = file_path.clone();
-        if let Err(err) =
-            process.apply_file_change(conn, file_path, &self.embedding, self.is_semantic_suspended())
-        {
+        let applied =
+            process.apply_file_change(conn, file_path, &self.embedding, self.is_semantic_suspended());
+        if let Err(err) = applied.map(|outcome| self.note(&retry_path, outcome)) {
             if is_timeout(&err) {
                 // A timed-out request is not replayed inline (the plugin may have been
                 // mid-write, and it has already been killed and relaunched). Queue it
@@ -368,7 +374,10 @@ impl PluginSupervisor {
         let mut replayed = 0;
         for file_path in &queued {
             match process.apply_file_change(conn, file_path.clone(), &self.embedding, semantic_suspended) {
-                Ok(()) => replayed += 1,
+                Ok(outcome) => {
+                    self.note(file_path, outcome);
+                    replayed += 1;
+                }
                 // One unreadable file does not cost the rest of the queue its replay.
                 Err(err) => {
                     crate::log_line!("g-mesh daemon: failed to replay queued change to {file_path}: {err:#}")
@@ -479,7 +488,30 @@ impl PluginSupervisor {
         }
         self.touch();
         let process = inner.process.as_ref().expect("just spawned or already running");
-        process.ensure_fresh(conn, file_path, &self.embedding, self.is_semantic_suspended())
+        let (outcome, change) =
+            process.ensure_fresh(conn, file_path, &self.embedding, self.is_semantic_suspended())?;
+        self.note(file_path, change);
+        Ok(outcome)
+    }
+
+    /// Keeps the whole-language reindex `outcome` asks for, if any, for
+    /// [`take_owed_reindex`](Self::take_owed_reindex); the first one asked
+    /// for wins, since one reindex covers every later edit too.
+    fn note(&self, trigger: &str, outcome: FileChangeOutcome) {
+        if let FileChangeOutcome::ReindexLanguage { reason } = outcome {
+            let mut owed = self.owed_reindex.lock().unwrap();
+            if owed.is_none() {
+                *owed = Some((trigger.to_string(), reason));
+            }
+        }
+    }
+
+    /// The whole-language reindex a file change asked for since the last
+    /// call, as `(trigger, reason)`. The caller runs it
+    /// (`PluginRegistry::run_owed_reindex`): it takes this supervisor's lock,
+    /// so the file change that asked for it could not.
+    pub(crate) fn take_owed_reindex(&self) -> Option<(String, String)> {
+        self.owed_reindex.lock().unwrap().take()
     }
 
     /// Puts the plugin to sleep if it has gone [`idle_timeout`] without work

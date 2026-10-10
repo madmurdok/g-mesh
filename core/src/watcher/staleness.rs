@@ -78,7 +78,7 @@ use crate::embedding::EmbeddingPipeline;
 use crate::protocol::types::RequestId;
 use crate::storage::index_store::{IndexStore, Unit};
 use crate::storage::write::upsert_indexed_file;
-use crate::watcher::apply::apply_file_change_in;
+use crate::watcher::apply::{apply_file_change_in, FileChangeOutcome};
 
 /// What [`ensure_fresh`] did to bring a file's index up to date. All three
 /// non-fresh variants imply `apply_file_change` was actually invoked
@@ -165,21 +165,25 @@ pub fn ensure_fresh<R: BufRead + Send, W: Write>(
     semantic_pass_timeout: Duration,
     semantic_pass_capable: bool,
     on_timeout: &mut dyn FnMut(),
-) -> Result<StalenessOutcome> {
+) -> Result<(StalenessOutcome, FileChangeOutcome)> {
+    let nothing = FileChangeOutcome::Applied { reextracted: 0 };
     store.unit(Unit::QueryTimeReindex, |store| {
         match store.step(|conn| decide(conn, project_root, file_path))? {
-            Decision::AlreadyFresh => Ok(StalenessOutcome::AlreadyFresh),
+            Decision::AlreadyFresh => Ok((StalenessOutcome::AlreadyFresh, nothing)),
             Decision::ContentUnchanged { mtime, hash } => {
                 // Content is unchanged (e.g. a touch, or a byte-identical
                 // rewrite) - just refresh the mtime baseline so the next check
                 // hits the fast path again. No reindex.
                 store.step(|conn| upsert_indexed_file(conn, file_path, mtime, &hash))?;
-                Ok(StalenessOutcome::MtimeMismatchContentUnchanged)
+                Ok((StalenessOutcome::MtimeMismatchContentUnchanged, nothing))
             }
             Decision::NeedsReindex { mtime, hash, had_prior_record } => {
                 // Genuinely stale (or never indexed) - synchronously reindex
-                // before recording the new baseline.
-                store
+                // before recording the new baseline. An edit that moved other
+                // files' resolution re-extracts them here too (GM-507), so a
+                // query can wait for a few more round trips; a whole-language
+                // reindex it asks for is the caller's to run.
+                let change = store
                     .unit(Unit::WatcherApply, |store| {
                         apply_file_change_in(
                             reader,
@@ -206,11 +210,12 @@ pub fn ensure_fresh<R: BufRead + Send, W: Write>(
                 if !gone {
                     store.step(|conn| upsert_indexed_file(conn, file_path, mtime, &hash))?;
                 }
-                Ok(if had_prior_record {
+                let outcome = if had_prior_record {
                     StalenessOutcome::ReindexedViaHashMismatch
                 } else {
                     StalenessOutcome::ReindexedNoPriorRecord
-                })
+                };
+                Ok((outcome, change))
             }
         }
     })
@@ -600,7 +605,8 @@ mod tests {
             true,
             &mut on_timeout_must_not_fire,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         plugin.join().unwrap();
 
         assert_eq!(outcome, StalenessOutcome::ReindexedNoPriorRecord);
@@ -708,7 +714,8 @@ mod tests {
             true,
             &mut on_timeout_must_not_fire,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         plugin.join().unwrap();
         assert_eq!(outcome, StalenessOutcome::ReindexedNoPriorRecord);
         invoked_rx.try_recv().unwrap();
@@ -754,7 +761,8 @@ mod tests {
             true,
             &mut on_timeout_must_not_fire,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         plugin2.join().unwrap();
 
         assert_eq!(outcome2, StalenessOutcome::ReindexedViaHashMismatch);
@@ -843,7 +851,8 @@ mod tests {
             true,
             &mut on_timeout_must_not_fire,
         )
-        .unwrap();
+        .unwrap()
+        .0;
 
         drop(core_writer2); // unblocks the stub thread's read via clean EOF
         plugin2.join().unwrap();
@@ -940,7 +949,8 @@ mod tests {
             true,
             &mut on_timeout_must_not_fire,
         )
-        .unwrap();
+        .unwrap()
+        .0;
 
         drop(core_writer2);
         plugin2.join().unwrap();

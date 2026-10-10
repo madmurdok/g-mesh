@@ -27,8 +27,8 @@ use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::protocol::jsonrpc::{read_message_with_timeout, write_message};
 use crate::protocol::types::{
     ControlEnvelope, ControlMessage, FileChangeDiff, FileChangeResponse, LinkedEdge, PathError,
-    PlaceholderTarget, QualifiedPath, RequestId, SourceTier, TargetKey, TargetScope, Visibility, WireEdge,
-    WireNode, JSONRPC_VERSION,
+    PlaceholderTarget, QualifiedPath, RequestId, ResolutionDelta, SourceTier, TargetKey, TargetScope,
+    Visibility, WireEdge, WireNode, JSONRPC_VERSION,
 };
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
@@ -98,7 +98,7 @@ pub fn apply_file_change<R: BufRead + Send, W: Write>(
     semantic_pass_timeout: Duration,
     semantic_pass_capable: bool,
     on_timeout: &mut dyn FnMut(),
-) -> Result<()> {
+) -> Result<FileChangeOutcome> {
     store.unit(Unit::WatcherApply, |store| {
         apply_file_change_in(
             reader,
@@ -152,6 +152,7 @@ pub fn reextract_file<R: BufRead + Send, W: Write>(
             true,
             on_timeout,
         )
+        .map(|_| ())
     })
 }
 
@@ -192,8 +193,31 @@ pub fn apply_scoped_semantic_pass<R: BufRead + Send, W: Write>(
     })
 }
 
+/// What a `fileChanged` leaves its caller to do (GM-507).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileChangeOutcome {
+    /// Done: the file's diff is committed, and so are the re-extracts of the
+    /// `reextracted` other files its `affected` answer selected.
+    Applied { reextracted: usize },
+    /// The file's diff is committed, but its `affected` answer asks for the
+    /// whole-language reindex, for this reason: the plugin could not say what
+    /// changed, the selection was above GM-509's threshold, or a re-extract
+    /// failed. The caller runs it once the plugin's lock is released
+    /// (`daemon::workspace_reindex::run` takes the same lock). No semantic
+    /// pass was sent: the reindex sends the whole-project one.
+    ReindexLanguage { reason: String },
+}
+
 /// [`apply_file_change`] for a caller already inside a unit. `reextract` is
 /// sent as `fileChanged`'s own flag.
+///
+/// A plugin may answer an edit with `affected` (GM-507): the edit changed
+/// what other files resolve to (a Rust `mod` line placed a module file, or
+/// stopped placing it). Those files are selected and re-extracted here,
+/// inside the caller's exclusive section, by [`reextract_affected`]; the one
+/// semantic pass that follows covers them along with `file_path`. A
+/// re-extract round trip (`reextract`) ignores its own `affected`, so one
+/// edit never starts a second round.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     reader: &mut R,
@@ -209,12 +233,12 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     semantic_pass_capable: bool,
     reextract: bool,
     on_timeout: &mut dyn FnMut(),
-) -> Result<()> {
+) -> Result<FileChangeOutcome> {
     let file_path = file_path.into();
     // A structural reparse has nothing to be incomplete about - the plugin
     // either extracted the file or it did not - so this round trip's report is
     // deliberately dropped here and read only for a `semanticPass`.
-    let _structural = round_trip(
+    let structural = round_trip(
         reader,
         writer,
         store,
@@ -226,8 +250,38 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
         on_timeout,
     )?;
 
+    // Behaviour 9: a re-extract's own answer starts nothing.
+    let affected = if reextract { None } else { structural.affected };
+    let reextracted = match affected {
+        None | Some(ResolutionDelta::Unchanged) => Vec::new(),
+        Some(ResolutionDelta::Unknown { reason }) => {
+            return Ok(FileChangeOutcome::ReindexLanguage {
+                reason: format!("the plugin cannot tell what {file_path} changed for resolution ({reason})"),
+            });
+        }
+        Some(ResolutionDelta::Affected { files, imports }) => match reextract_affected(
+            reader,
+            writer,
+            store,
+            project_root,
+            language,
+            &file_path,
+            &request_id,
+            embedding,
+            file_changed_timeout,
+            &files,
+            &imports,
+            on_timeout,
+        ) {
+            Ok(reextracted) => reextracted,
+            Err(reason) => return Ok(FileChangeOutcome::ReindexLanguage { reason }),
+        },
+    };
+    let outcome = FileChangeOutcome::Applied { reextracted: reextracted.len() };
+
     if !semantic_pass_capable {
-        return Ok(());
+        settle_reextracts(store, language, &reextracted);
+        return Ok(outcome);
     }
 
     // The files earlier per-file passes did not finish ride along:
@@ -247,16 +301,22 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
         crate::log_line!("g-mesh: failed to read {language}'s owed semantic files ({err:#})");
         Vec::new()
     });
+    // The files re-extracted for this edit join its pass (GM-507); its
+    // budget grows by one file's for each.
+    let scale = u32::try_from(reextracted.len().saturating_add(1)).unwrap_or(u32::MAX);
+    let mut requested = Vec::with_capacity(reextracted.len() + 1);
+    requested.push(file_path.clone());
+    requested.extend(reextracted.iter().cloned());
     if let Err(err) = apply_semantic_pass_in(
         reader,
         writer,
         store,
         language,
         None,
-        Scope::Files { requested: vec![file_path.clone()], owed },
+        Scope::Files { requested, owed },
         semantic_pass_id(&request_id),
         embedding,
-        semantic_pass_timeout,
+        semantic_pass_timeout.saturating_mul(scale),
         on_timeout,
     ) {
         crate::log_line!(
@@ -264,7 +324,90 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
              its edges keep whatever the structural pass resolved"
         );
     }
-    Ok(())
+    settle_reextracts(store, language, &reextracted);
+    Ok(outcome)
+}
+
+/// Selects the indexed files of `language` that an edit of `file_path`
+/// answered `affected` for (GM-509's [`config_reindex::select`], the
+/// importers of a moved container key included), records them as owed a
+/// re-extract, and re-extracts each one. Returns the re-extracted paths,
+/// which stay owed until the caller's semantic pass is done
+/// ([`settle_reextracts`]): a daemon killed before that leaves the rows, and
+/// the next start re-extracts them (`config_reindex::resume_owed_reextracts`).
+///
+/// `Err` is the reason the whole-language reindex is owed instead: a
+/// selection above `FALLBACK_SHARE_PERCENT`, a selection or a record that
+/// failed, or a re-extract that failed (the loop stops there; the reindex's
+/// swap clears the rows).
+///
+/// [`config_reindex::select`]: crate::daemon::config_reindex::select
+#[allow(clippy::too_many_arguments)]
+fn reextract_affected<R: BufRead + Send, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    store: &mut Writer<'_>,
+    project_root: &Path,
+    language: &str,
+    file_path: &str,
+    request_id: &RequestId,
+    embedding: &EmbeddingPipeline,
+    file_changed_timeout: Duration,
+    files: &[crate::protocol::types::PathScope],
+    imports: &[crate::protocol::types::ImportSelector],
+    on_timeout: &mut dyn FnMut(),
+) -> std::result::Result<Vec<String>, String> {
+    use crate::daemon::config_reindex::{select, Selection};
+
+    let selected = match store.step(|conn| select(conn, language, files, imports, Some(file_path))) {
+        Ok(Selection::Nothing) => return Ok(Vec::new()),
+        Ok(Selection::Files(selected)) => selected.into_iter().collect::<Vec<_>>(),
+        Ok(Selection::TooMany(why)) => return Err(format!("{file_path} changed resolution: {why}")),
+        Err(err) => return Err(format!("selecting what {file_path} changed failed ({err:#})")),
+    };
+    store
+        .step(|conn| schema::owe_reextracts(conn, language, file_path, &selected))
+        .map_err(|err| format!("recording what {file_path} changed failed ({err:#})"))?;
+    let started = std::time::Instant::now();
+    for (index, path) in selected.iter().enumerate() {
+        if let Err(err) = apply_file_change_in(
+            reader,
+            writer,
+            store,
+            project_root,
+            language,
+            path.clone(),
+            reextract_id(request_id, index),
+            embedding,
+            file_changed_timeout,
+            file_changed_timeout,
+            false,
+            true,
+            on_timeout,
+        ) {
+            return Err(format!("re-extracting {path} after {file_path} changed failed ({err:#})"));
+        }
+    }
+    crate::log_line!(
+        "g-mesh: {file_path} changed {language} resolution - re-extracted {} file(s) ({} ms)",
+        selected.len(),
+        started.elapsed().as_millis()
+    );
+    Ok(selected)
+}
+
+/// Drops the owed-re-extract rows of `file_paths`, done with
+/// ([`reextract_affected`]). Best-effort: a row left behind costs one more
+/// re-extract at the next start.
+fn settle_reextracts(store: &mut Writer<'_>, language: &str, file_paths: &[String]) {
+    if file_paths.is_empty() {
+        return;
+    }
+    if let Err(err) = store.step(|conn| schema::settle_owed_reextracts(conn, language, file_paths)) {
+        crate::log_line!(
+            "g-mesh: failed to settle {language}'s owed re-extracts ({err:#}) - the next start re-extracts them again"
+        );
+    }
 }
 
 /// Asks the plugin's semantic layer what it can now resolve, and commits
@@ -678,6 +821,9 @@ struct RoundTrip {
     unfinished_files: Option<Vec<String>>,
     /// The ids of every edge the diff upserted.
     upserted_edges: std::collections::HashSet<String>,
+    /// [`FileChangeDiff::affected`]: what a `fileChanged`'s edit changed for
+    /// other files' resolution (GM-507). Read only after a `fileChanged`.
+    affected: Option<ResolutionDelta>,
 }
 
 /// The id for the semantic pass that follows a file change, derived from
@@ -700,6 +846,15 @@ fn semantic_pass_id(base: &RequestId) -> RequestId {
     RequestId::String(match base {
         RequestId::Number(n) => format!("semanticPass:num:{n}"),
         RequestId::String(s) => format!("semanticPass:str:{s}"),
+    })
+}
+
+/// The id of the `index`th re-extract an edit's `affected` answer started,
+/// derived from that edit's own id like [`semantic_pass_id`].
+fn reextract_id(base: &RequestId, index: usize) -> RequestId {
+    RequestId::String(match base {
+        RequestId::Number(n) => format!("reextract:num:{n}:{index}"),
+        RequestId::String(s) => format!("reextract:str:{s}:{index}"),
     })
 }
 
@@ -759,7 +914,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
         ControlEnvelope { jsonrpc: JSONRPC_VERSION.to_string(), id: Some(request_id.clone()), message };
     write_message(writer, &request).with_context(|| format!("failed to write {method} request to plugin"))?;
 
-    let response: FileChangeResponse = read_message_with_timeout(reader, timeout, on_timeout)
+    let mut response: FileChangeResponse = read_message_with_timeout(reader, timeout, on_timeout)
         .with_context(|| format!("failed to read plugin's {method} response"))?
         .with_context(|| format!("plugin closed its output before responding to {method}"))?;
 
@@ -772,6 +927,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
     }
 
     let complete = response.result.complete;
+    let affected = response.result.affected.take();
     let mut diff = to_storage_diff(response.result, &mut PathWarnings::default());
     match (&request.message, project_root) {
         (ControlMessage::FileChanged { file_path, .. }, Some(root)) => {
@@ -808,6 +964,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
         incomplete_reason: response.incomplete_reason,
         unfinished_files: response.unfinished_files,
         upserted_edges: diff.upsert_edges.iter().map(|edge| edge.id.clone()).collect(),
+        affected,
     })
 }
 
