@@ -54,11 +54,12 @@ CI must keep running everything exactly as before.
   `graph::containers::tests`; `G_MESH_CONTAINERS_SEED` (one seed, replay)
   still wins. `test-local.sh` sets `n=2`; `--full` and CI leave it unset, so
   they run every seed.
-- **Leaf core modules select narrower sections** (Q1). In
-  `scripts/test-select.sh`, a path under `core/src/cli/` selects `core-cli`
-  and `core-it`, one under `core/src/mcp/` selects `core-mcp` and `core-it`;
-  every other `core/` path still selects all core sections. This amends the
-  `core/**` row of ADR 0030.
+- **Leaf core modules select narrower sections, locally only** (Q1). With
+  `scripts/test-select.sh --narrow`, which only `test-local.sh` passes, a path
+  under `core/src/cli/` selects `core-cli` and `core-it`, one under
+  `core/src/mcp/` selects `core-mcp` and `core-it`; every other `core/` path
+  still selects all core sections. Without the flag (CI's `select` job) the
+  `core/**` row of ADR 0030 is unchanged (owner: "Только локально, CI как был").
 
 Rejected: `#[ignore]` on heavy tests (CI does not pass `--run-ignored`, so it
 would lose coverage); an env gate inside each heavy test (56 edits, and a test
@@ -77,8 +78,6 @@ run's JUnit (not reviewable, depends on another run's file).
   the one-process run until it is added to `ISOLATED`.
 - The heavy list drifts between batches; the `--full` report is how it is
   kept current.
-- Because CI's `select` job also uses `test-select.sh`, the Q1 rows narrow CI
-  runs for a change confined to `core/src/cli/` or `core/src/mcp/` too: such
-  a PR no longer runs the other core lib sections. A `cli`/`mcp` change that
-  breaks another module's lib tests is caught by `--full` at batch end and
-  by the full run the release gate requires.
+- A `cli`/`mcp` change that breaks another module's lib tests is not caught
+  by the local verify run; CI (which does not narrow), `--full` at batch end
+  and the release gate's full run catch it.

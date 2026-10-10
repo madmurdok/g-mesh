@@ -125,7 +125,7 @@ if [ "$full" -eq 1 ]; then
 	exit "$status"
 fi
 
-selection="$(scripts/test-select.sh "${select_args[@]+"${select_args[@]}"}")"
+selection="$(scripts/test-select.sh --narrow "${select_args[@]+"${select_args[@]}"}")"
 echo "== selected: $selection"
 if [ "$selection" = none ]; then
 	echo "== no sections selected"

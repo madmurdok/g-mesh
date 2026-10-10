@@ -3,8 +3,12 @@
 # that the change can affect. The rule and why: docs/adr/0030-test-sections.md
 # (and the rule table in docs/design/GM-540-GM-539-test-sections.md, section 6).
 #
-#   scripts/test-select.sh [--base <ref>]       paths changed since <ref>
-#   scripts/test-select.sh --paths-from <file>  paths listed in <file>, one per line
+#   scripts/test-select.sh [--narrow] [--base <ref>]       paths changed since <ref>
+#   scripts/test-select.sh [--narrow] --paths-from <file>  paths listed in <file>, one per line
+#
+# `--narrow` (scripts/test-local.sh only, never CI) narrows the leaf-module
+# rows below; CI calls without it and keeps every core section for any core
+# change.
 #
 # Prints exactly one line: `full`, `none`, or section names in run order,
 # space-separated. The output is valid arguments for
@@ -18,9 +22,9 @@
 # - A path no rule names selects `full`: an unknown path is never skipped.
 # - A change to anything every crate builds on (wire, the SDK, cargo and
 #   nextest config, CI and this selection machinery) selects `full`.
-# - A change under `core/` selects every core section, except one under
-#   `core/src/cli/` or `core/src/mcp/`, which selects that module's lib section
-#   and `core-it`.
+# - A change under `core/` selects every core section. With `--narrow` only,
+#   one under `core/src/cli/` or `core/src/mcp/` selects that module's lib
+#   section and `core-it`.
 # - A plugin change selects that plugin's section and every core section, never
 #   another plugin's section.
 set -euo pipefail
@@ -29,8 +33,8 @@ cd "$(dirname "$0")/.."
 
 usage() {
 	cat >&2 <<'EOF'
-usage: scripts/test-select.sh [--base <ref>]
-       scripts/test-select.sh --paths-from <file>
+usage: scripts/test-select.sh [--narrow] [--base <ref>]
+       scripts/test-select.sh [--narrow] --paths-from <file>
 EOF
 }
 
@@ -41,8 +45,13 @@ die() {
 
 base=""
 paths_from=""
+narrow=""
 while [ $# -gt 0 ]; do
 	case "$1" in
+	--narrow)
+		narrow=1
+		shift
+		;;
 	--base)
 		[ $# -ge 2 ] || {
 			usage
@@ -127,10 +136,10 @@ classify() {
 	.github/workflows/* | scripts/test-sections.sh | scripts/test-sections-check.py | scripts/test-select.sh) full=1 ;;
 	scripts/test-local.sh | scripts/test-heavy-report.py) full=1 ;;
 	.gitattributes) full=1 ;;
-	# Leaf modules: their lib tests and the integration tests, not the rest of
-	# the lib (docs/adr/0031-local-test-runs.md).
-	core/src/cli/*) add core-cli core-it ;;
-	core/src/mcp/*) add core-mcp core-it ;;
+	# Leaf modules, local runs only: their lib tests and the integration tests,
+	# not the rest of the lib (docs/adr/0031-local-test-runs.md).
+	core/src/cli/*) if [ -n "$narrow" ]; then add core-cli core-it; else add "${CORE[@]}"; fi ;;
+	core/src/mcp/*) if [ -n "$narrow" ]; then add core-mcp core-it; else add "${CORE[@]}"; fi ;;
 	core/*) add "${CORE[@]}" ;;
 	plugins/python/* | plugins/rust/* | plugins/typescript/*)
 		local plugin="${1#plugins/}"
