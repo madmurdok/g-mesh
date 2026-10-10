@@ -213,6 +213,27 @@ func (s *pluginState) reloadWorkspace() {
 	s.files = map[string]cachedFile{}
 }
 
+// handleResolutionChanged reloads the module layout after a go.mod/go.work
+// save and says what that changed for resolution against `previous`, the
+// facts the index was built from (facts.go).
+//
+// Invariants:
+//   - the new layout is always adopted: loading it cannot fail, a go.mod
+//     that stops parsing is a module that is gone;
+//   - only `unknown` drops the cached graphs, as workspaceChanged does: core
+//     follows it with a whole-language reindex. Otherwise every cached graph
+//     outside the delta is what the new layout would extract, and core
+//     re-extracts the files inside it with fileChanged.
+func (s *pluginState) handleResolutionChanged(previous *string) resolutionChangedResult {
+	ws := loadWorkspace(s.projectRoot)
+	delta := resolutionDeltaFor(previous, ws)
+	s.workspace = ws
+	if delta.Kind == "unknown" {
+		s.files = map[string]cachedFile{}
+	}
+	return resolutionChangedResult{Delta: delta, Facts: encodeFacts(ws)}
+}
+
 // openSitesFor returns the unresolved selections this process currently
 // holds for a file - GM-281's input, and nothing core ever sees.
 func (s *pluginState) openSitesFor(relPath string) []openSite {
@@ -274,7 +295,7 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 			logf("malformed fileChanged params: %v", err)
 			return
 		}
-		logf("file changed: %s", params.FilePath)
+		logf("file changed: %s (reextract: %t)", params.FilePath, params.Reextract)
 		diff := state.handleFileChanged(params.FilePath)
 		if hasID {
 			// A structural reparse has nothing to be incomplete about
@@ -322,6 +343,19 @@ func handleEnvelope(state *pluginState, env controlEnvelope, out io.Writer) {
 		// core follows this with does anyway.
 		logf("workspace file changed: %s", workspaceChangedFilePath(env.Params))
 		state.reloadWorkspace()
+		return
+
+	case "resolutionChanged":
+		var params resolutionChangedParams
+		if err := json.Unmarshal(env.Params, &params); err != nil {
+			logf("malformed resolutionChanged params: %v", err)
+		}
+		logf("resolution config changed: %s - reloading the module layout", params.FilePath)
+		result := state.handleResolutionChanged(params.PreviousFacts)
+		logf("resolution delta: %s %s", result.Delta.Kind, result.Delta.Reason)
+		if hasID {
+			writeResolutionChanged(out, env.ID, result)
+		}
 		return
 
 	case "filesCreated":
@@ -388,6 +422,17 @@ func writeResult(out io.Writer, id json.RawMessage, diff fileChangeDiff, incompl
 	}
 	if err := writeFrame(out, body); err != nil {
 		logf("failed to write response: %v", err)
+	}
+}
+
+func writeResolutionChanged(out io.Writer, id json.RawMessage, result resolutionChangedResult) {
+	body, err := json.Marshal(resolutionChangedResponse{JSONRPC: jsonrpcVersion, ID: id, Result: result})
+	if err != nil {
+		logf("failed to encode resolutionChanged answer: %v", err)
+		return
+	}
+	if err := writeFrame(out, body); err != nil {
+		logf("failed to write resolutionChanged answer: %v", err)
 	}
 }
 
