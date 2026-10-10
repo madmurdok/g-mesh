@@ -94,7 +94,10 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
         resolved.version
     );
     config.command = resolved.command;
-    Ok(Box::new(LspBridge::new(LANGUAGE, root, config)))
+    // GM-550: rust-analyzer's start-up phases can be separated by more than
+    // the bridge's 2s settle under load (2.04s and 2.47s measured), so its
+    // readiness is its own `quiescent` status rather than a quiet period.
+    Ok(Box::new(LspBridge::new(LANGUAGE, root, config).quiescent_signal()))
 }
 
 /// The server to run, and the version string it answered with.
@@ -310,5 +313,22 @@ mod tests {
         assert!(resolved.prefix_args.is_empty(), "{:?}", resolved.prefix_args);
         assert_eq!(resolved.origin, "the path the manifest names");
         assert_ne!(resolved.version, "no version reported");
+    }
+
+    /// rust-analyzer's readiness is its own `quiescent` status (GM-550), and
+    /// `engine` turns that on in the bridge. The bridge keeps the flag
+    /// private, so the wiring is read from this file's own `engine` body, as
+    /// the TypeScript plugin pins its warm-up.
+    ///
+    /// Control: drop `.quiescent_signal()` from `engine`.
+    #[test]
+    fn the_engine_reads_rust_analyzers_quiescent_status() {
+        let source = include_str!("semantic.rs");
+        let engine = &source[source.find("pub fn engine(").expect("this file defines `engine`")..];
+        let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
+        assert!(
+            body.contains("LspBridge::new(LANGUAGE, root, config).quiescent_signal()"),
+            "`engine` must turn on the bridge's quiescent signal:\n{body}"
+        );
     }
 }

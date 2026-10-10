@@ -404,6 +404,54 @@ That is a whole-language reindex by design, and the stated Go exception.
 - `setup.cfg` and `setup.py` are not read, so they are always `Unchanged`. This
   is correct, because today's reindex rebuilds the same model.
 
+**GM-544 (Rust and Python, as built).** Exceptions and additions found while
+implementing:
+
+- **Rust: a changed set of crate names answers `Unknown`** (a whole-language
+  reindex), not the selective delta planned above. A path call such as
+  `some_crate::f()` needs no `use`, so a file whose calls resolve differently
+  once `some_crate` becomes (or stops being) a crate of this project has no
+  `IMPORTS` edge a selector can name. A crate rename, an added or removed
+  member with its own name, and a manifest that stops parsing (its crates drop
+  out of the model) all land here. A `[lib] path` or member move that keeps
+  the crate names stays selective.
+- **Python: the resolved roots are the comparison.** A key is a function of
+  path and roots, so equal roots answer `Unchanged` whatever else changed;
+  `declared_roots` is not stored. The file set is not compared: files created
+  since the facts were stored are selected only when the roots moved, as an
+  over-selection.
+- **Both: an added key's parent is a target selector.** `use p::c;` /
+  `from p import c` gains its second `IMPORTS` edge onto `p::c` only once
+  that key exists, so importers targeting `p` are selected.
+- **Python: a removed key is also a specifier selector** (`Under{k, "."}`):
+  `import k.x` binds `k` as one of ours only while `k` is a key, and when
+  `k.x` never was one its edge is an `external_module` no target reaches.
+- Relative Python imports, like in-crate Rust paths, are matched by target,
+  never by text; their `specifier` is still set (`..pkg`, `crate::a`).
+
+**GM-545 (Go, as built).** Exceptions and additions found while implementing
+(plugins/go/facts.go):
+
+- **Every module changed answers `Unknown`**, not a selection the threshold
+  then rejects. A single-module repository's rename moves every container
+  key, and so does its first or last go.mod (a repository with no module
+  keys by directory). The rule: every module dir in the old and new layouts
+  changed.
+- **`replace` and go.work `use` are facts too.** The structural tier reads
+  neither, but the semantic tier's `packages.Load` honours both. A module
+  path whose `replace` directives changed, and the module of a `use` dir
+  added or removed, select their importers by `Specifier(Under{path, "/"})`;
+  core's scoped `semanticPass` then re-answers them. `require`, `go`,
+  `toolchain`, `exclude` and `retract` stay `Unchanged`.
+- **A changed module dir D also selects importers of its enclosing key.**
+  With a nested module added or removed at D, D's files move between `P_D`
+  and `<outer path>/D`, so both prefixes are `Specifier` selectors, not only
+  the old and new module paths.
+- **Importers are matched by text only.** A Go specifier is the import path,
+  which is also the placeholder's container scope, so no `Target` selector is
+  needed. The `fileChanged` `reextract` flag changes nothing: this plugin
+  always extracts a `fileChanged` file and diffs against its cache.
+
 ### 3.7 GM-507 (Rust module orphaned until Cargo.toml is saved)
 
 GM-509 makes a `Cargo.toml` save re-extract exactly the files whose

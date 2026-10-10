@@ -1181,6 +1181,17 @@ pub fn semantic_residual_files(conn: &Connection, language: &str) -> Result<Opti
     }
 }
 
+/// The reason the plugin gave for the incomplete pass that made `language`
+/// residual, or `None` when it is not residual - what `g-mesh plugins check`
+/// quotes when it fails a session on a residual pass (GM-550).
+pub fn semantic_residual_reason(conn: &Connection, language: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT reason FROM semantic_residual WHERE language = ?1", params![language], |row| {
+        row.get(0)
+    })
+    .optional()
+    .with_context(|| format!("failed to read {language}'s semantic residual reason"))
+}
+
 /// What one language has left over from its semantic passes, for
 /// `g-mesh status`.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -621,16 +621,39 @@ fn the_typescript_plugin_passes_on_a_small_typescript_fixture() {
 /// it first calls `packages.Load`, which happens only on a `semanticPass`.
 /// Before GM-281 it was a second `SKIP ... not instrumented`, which was the
 /// honest report for a plugin with no engine to start.
+///
+/// The manifest declares `resolution_delta = true`, so
+/// `capabilities.resolution-delta-version-bump` runs: the fixture's go.mod has
+/// no `require`, so the bump rewrites the `go` directive (`1.22` ->
+/// `1.22.0`), which the plugin answers `unchanged`.
+///
+/// Control: `resolution_delta = false` in `plugins/go/plugin.toml` (the
+/// check is a SKIP).
 #[test]
 fn the_go_plugin_passes_on_its_own_fixture() {
+    let before = fs::read(go_conformance_project().join("go.mod")).unwrap();
     let run = run_check(&go_plugin_dir(), &go_conformance_project(), &[]);
     assert!(run.success, "{}", run.stdout);
     for id in ALL_CHECKS {
-        let skipped = SKIPPED_WITHOUT_PAIR.contains(&id) || id == RESOLUTION_DELTA;
-        let expected = if skipped { "SKIP" } else { "PASS" };
+        let expected = if SKIPPED_WITHOUT_PAIR.contains(&id) { "SKIP" } else { "PASS" };
         assert_eq!(run.outcome(id), expected, "{id}:\n{}", run.stdout);
     }
+    assert!(
+        run.stdout.contains("resolution-delta: version bump of go.mod (the `go` directive)"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains(r#"resolution-delta: resolutionChanged -> {"kind":"unchanged"}"#),
+        "{}",
+        run.stdout
+    );
     assert!(!run.stdout.contains("WARN"), "{}", run.stdout);
+    assert_eq!(
+        fs::read(go_conformance_project().join("go.mod")).unwrap(),
+        before,
+        "the kit must never modify the fixture"
+    );
 }
 
 // ============================================================================
@@ -1132,6 +1155,50 @@ fn an_unknown_expectation_key_is_a_hard_parse_error() {
     );
 }
 
+/// GM-550: a whole-project semantic pass that names files it left
+/// unfinished is recorded residual, which a daemon finishes on its next
+/// start - but a kit session has no next start, and its expectations need
+/// the fully linked index. So the `session` check fails, quoting the
+/// plugin's own reason, and expectations are skipped with that case named;
+/// nothing else in the report is collateral damage.
+///
+/// Control: in `Driver::step`, map the whole-project pass's outcome to
+/// `Ok(())` again (drop the `Residual { left > 0 }` arm); the session
+/// passes and the expectations run. Control: revert the skip text in
+/// `expectations_section`; the skip no longer names the unfinished pass.
+#[test]
+fn a_whole_project_pass_that_leaves_files_unfinished_fails_the_session_with_its_reason() {
+    let fixture = write_fk_fixture(&[("a.fk", "fn helper\nfn user\ncall helper\n")]);
+    let expect = write_expect_file(
+        fixture.path(),
+        "[[callers]]\nsymbol = \"helper\"\nfile = \"a.fk\"\nexpect = [\"a.fk:user\"]\n",
+    );
+    let fake = install_fake("residual-pass", true);
+    let run = run_check_with_expect(&fake.dir, fixture.path(), &expect);
+
+    assert!(!run.success, "a residual whole-project pass must not be certifiable:\n{}", run.stdout);
+    assert_eq!(run.failing(), vec!["session"], "only the session fails:\n{}", run.stdout);
+    assert!(
+        run.stdout.contains(
+            "the whole-project semantic pass left 1 file(s) unfinished: \
+             the fake's language server was still loading"
+        ),
+        "the failure quotes the plugin's reason:\n{}",
+        run.stdout
+    );
+    assert_eq!(run.outcome("expectations.file"), "SKIP", "{}", run.stdout);
+    assert!(
+        run.stdout.contains("a whole-project semantic pass that left files unfinished"),
+        "the skip names the unfinished pass:\n{}",
+        run.stdout
+    );
+    assert!(
+        !run.outcomes.keys().any(|id| id.starts_with("expectations.callers[")),
+        "no expectation is evaluated on an index the session did not finish:\n{}",
+        run.stdout
+    );
+}
+
 /// The discrimination case: `[[callers]] symbol = "double"` in the TS
 /// fixture's own `expect.toml` expects a caller reached only through a
 /// namespace import (`import * as m from "./math"; m.double(4)` in
@@ -1610,4 +1677,102 @@ fn a_declaring_plugin_without_a_facts_trailer_fails_only_the_resolution_delta_ch
     assert!(!run.success, "a failing check must make the command exit non-zero:\n{}", run.stdout);
     assert_eq!(run.failing(), vec![RESOLUTION_DELTA], "{}", run.stdout);
     assert!(run.stdout.contains("without a resolutionFacts line"), "{}", run.stdout);
+}
+
+// ============================================================================
+// GM-544: the version bump reaches Cargo.toml and pyproject.toml, so the Rust
+// and Python plugins' `resolution_delta` is exercised, not skipped.
+// ============================================================================
+
+/// The shipped manifest of the bundled plugin `language` (`plugins/<language>`)
+/// with `semantic_pass` off, in `<tmp>/<language>/`: the version-bump leg
+/// needs no language server, so none is started. The command stays
+/// `${G_MESH_BIN_DIR}/g-mesh-plugin-<language>`, the workspace binary.
+fn bundled_plugin_without_semantic_pass(language: &str) -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("failed to create a temp dir for the plugin");
+    let dir = root.path().join(language);
+    fs::create_dir_all(&dir).unwrap();
+    let shipped_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins").join(language);
+    let shipped = fs::read_to_string(shipped_dir.join("plugin.toml")).unwrap();
+    assert!(
+        shipped.contains("resolution_delta = true"),
+        "the shipped {language} manifest declares resolution_delta"
+    );
+    assert!(
+        shipped.contains("semantic_pass = true"),
+        "the shipped {language} manifest's capability line moved"
+    );
+    fs::write(dir.join("plugin.toml"), shipped.replace("semantic_pass = true", "semantic_pass = false"))
+        .unwrap();
+    root
+}
+
+/// Runs the bundled `language` plugin on its own conformance fixture and
+/// asserts the version-bump leg ran on `bumped` (the fixture-relative file
+/// and the field the report names) and passed with an `unchanged` answer.
+/// The fixture itself is never modified.
+fn assert_the_version_bump_ran_and_passed(language: &str, bumped: &str, field: &str) {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins").join(language).join("conformance/project");
+    let before = fs::read(fixture.join(bumped)).unwrap();
+    let plugins = bundled_plugin_without_semantic_pass(language);
+    let run = run_check(&plugins.path().join(language), &fixture, &[]);
+    assert_eq!(run.outcome(RESOLUTION_DELTA), "PASS", "{}", run.stdout);
+    assert!(
+        run.stdout.contains(&format!("resolution-delta: version bump of {bumped} ({field})")),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains(r#"resolution-delta: resolutionChanged -> {"kind":"unchanged"}"#),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(fs::read(fixture.join(bumped)).unwrap(), before, "the kit must never modify the fixture");
+}
+
+/// The Rust fixture's root Cargo.toml is a virtual workspace with no
+/// version, so the bump passes it for the first member manifest by path,
+/// `crates/alpha/Cargo.toml`.
+///
+/// Control: map `"Cargo.toml"` to the JSON rule in `session::version_bump_for`
+/// (no watch file qualifies: the check is a SKIP).
+#[test]
+fn the_rust_plugin_answers_unchanged_to_a_cargo_toml_version_bump() {
+    assert_the_version_bump_ran_and_passed("rust", "crates/alpha/Cargo.toml", "`[package].version`");
+}
+
+/// Control: map `"pyproject.toml"` to the JSON rule in
+/// `session::version_bump_for` (the check is a SKIP).
+#[test]
+fn the_python_plugin_answers_unchanged_to_a_pyproject_version_bump() {
+    assert_the_version_bump_ran_and_passed("python", "pyproject.toml", "`[project].version`");
+}
+
+/// A declaring plugin whose only watch file is a `setup.cfg` gets a SKIP
+/// that lists every shape a bump is defined for, not a FAIL.
+///
+/// Control: return `Outcome::Fail` from the `NoWatchFile` arm of
+/// `checks::resolution_delta_version_bump` (the SKIP assertion fails).
+#[test]
+fn a_declaring_plugin_with_only_a_setup_cfg_skips_the_version_bump_and_says_why() {
+    let fake = install_fake("none", true);
+    let manifest = fake.dir.join("plugin.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    assert!(text.trim_end().ends_with("files_created = false"), "the capabilities table is last:\n{text}");
+    text.push_str("resolution_delta = true\n\n[plugin.workspace]\nwatch_files = [\"setup.cfg\"]\n");
+    fs::write(&manifest, text).unwrap();
+
+    let source = fixtures().join("fake");
+    let fixture = write_fk_fixture(&[
+        ("a.fk", &fs::read_to_string(source.join("a.fk")).unwrap()),
+        ("b.fk", &fs::read_to_string(source.join("b.fk")).unwrap()),
+        ("setup.cfg", "[metadata]\nname = fk\nversion = 1.0.0\n"),
+    ]);
+    let run = run_check(&fake.dir, fixture.path(), &[]);
+    assert_eq!(run.outcome(RESOLUTION_DELTA), "SKIP", "{}", run.stdout);
+    for shape in ["top-level `version`", "Cargo.toml", "pyproject.toml", "go.mod"] {
+        assert!(run.stdout.contains(shape), "the skip reason names {shape}:\n{}", run.stdout);
+    }
+    assert!(!run.stdout.contains("resolution-delta: version bump of"), "{}", run.stdout);
 }

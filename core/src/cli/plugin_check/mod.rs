@@ -336,7 +336,7 @@ pub fn check(
     }
 
     if let Some(bump) = &version_bump {
-        notes.push(format!("resolution-delta: version bump of {}", bump.file_path));
+        notes.push(format!("resolution-delta: version bump of {} ({})", bump.file_path, bump.field));
     }
     if let Some(run) = &resolution_delta_run {
         let answer = match run.result.as_ref().map(|r| &r.delta) {
@@ -425,7 +425,8 @@ fn expectations_section(
                 id: FILE_CHECK.into(),
                 outcome: Outcome::Skip(
                     "not reached: bulk run 1 did not complete, or the control-plane session failed (see \
-                     `checks`) - expectations need the fully linked index a completed session leaves behind \
+                     `checks`; that includes a whole-project semantic pass that left files unfinished) - \
+                     expectations need the fully linked index a completed session leaves behind \
                      (expectations' module doc, decision 1)"
                         .to_string(),
                 ),

@@ -18,7 +18,7 @@ protocol_version = 2
 # cargo workspace member - GM-303 wrote the general rule down
 # (docs/architecture/plugin-modularity.md, "plugin_version: two rules, not
 # one"), of which this is one case and plugins/typescript's is the other.
-plugin_version = "0.4.0"
+plugin_version = "0.5.0"
 
 [plugin.spawn]
 # A prebuilt binary, not `go run ./...`. `go run` recompiles the whole
@@ -87,13 +87,24 @@ receiver_calls_structural = "unresolved"
 # edges. Those edges come only from the semantic pass, so before it the field
 # is absent and the page carries `provenance`.
 member_overrides = "by_name"
+# A go.mod/go.work save is answered with what it changed for resolution
+# (`resolutionChanged`), and core re-extracts only the files whose container
+# key moved and the importers it names instead of the whole language: a
+# `require` or `go` edit re-extracts nothing, a module path, `replace` or
+# `use` edit selects the importers of the modules it names, and a change to
+# every module of the project reindexes the language. The bulk walk ends with
+# the facts that answer compares against, and every `IMPORTS` edge carries its
+# import path as written (facts.go,
+# docs/architecture/gm-509-selective-config-reindex.md).
+resolution_delta = true
 
 [plugin.workspace]
-# A go.mod/go.work edit moves the whole project's package/import-path
-# layout, so core reindexes this language from scratch when either changes -
-# the same "workspace boundary file" role Cargo.toml/*.csproj play for
-# their languages (docs/architecture/multi-language-plugins.md's
-# "plugin.toml additions" section).
+# A go.mod/go.work edit can move the project's package/import-path layout,
+# so a save of either reloads it and re-extracts what it moved
+# (`resolution_delta` above) - the same "workspace boundary file" role
+# Cargo.toml/*.csproj play for their languages
+# (docs/architecture/multi-language-plugins.md's "plugin.toml additions"
+# section).
 watch_files = ["go.mod", "go.work"]
 # vendor/ holds copied dependency source the project does not own;
 # testdata/ is Go's own convention for fixtures `go build`/`go vet`/`go

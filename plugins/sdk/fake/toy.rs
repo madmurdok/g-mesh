@@ -55,6 +55,9 @@
 //!   nothing to stdout - with a line on stderr, or without one.
 //! - `files-created-ignored`: a `filesCreated` is logged (and acknowledged
 //!   when it carries an `id`) but adds nothing to the file set.
+//! - `residual-pass`: every whole-project `semanticPass` is answered as a
+//!   listed incomplete pass - `incomplete: true`, `unfinishedFiles: ["a.fk"]`
+//!   and [`RESIDUAL_REASON`] - which core records residual (GM-550).
 //!
 //! The semantic engine marker is a line with this process's pid appended to
 //! `$G_MESH_PLUGIN_CHECK_MARKER_DIR/semantic-engine-started`.
@@ -304,6 +307,10 @@ fn start_semantic_engine(started: &mut bool) {
     }
 }
 
+/// The `incompleteReason` of a `residual-pass` whole-project pass, for a test
+/// to find quoted in the kit's report.
+const RESIDUAL_REASON: &str = "the fake's language server was still loading";
+
 /// The toy persona's entry point: `bulk_root` selects the walk, otherwise
 /// `root` is the project the control plane serves.
 pub(super) fn run(defect: &str, bulk_root: Option<&Path>, root: Option<&Path>) {
@@ -360,7 +367,23 @@ pub(super) fn run(defect: &str, bulk_root: Option<&Path>, root: Option<&Path>) {
                     .and_then(Value::as_array)
                     .map(|paths| paths.iter().filter_map(Value::as_str).map(str::to_string).collect())
                     .unwrap_or_default();
-                semantic_pass(defect, &root, &present, paths)
+                let whole_project = paths.is_empty();
+                let result = semantic_pass(defect, &root, &present, paths);
+                if defect == "residual-pass" && whole_project {
+                    write(
+                        &out,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": result,
+                            "incomplete": true,
+                            "incompleteReason": RESIDUAL_REASON,
+                            "unfinishedFiles": ["a.fk"],
+                        }),
+                    );
+                    return;
+                }
+                result
             }
             _ => json!({ "acknowledged": true }),
         };
