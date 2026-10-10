@@ -628,20 +628,35 @@ impl Rng {
 }
 
 /// Replays one seed instead of the built-in set: `G_MESH_CONTAINERS_SEED=
-/// 0x1234 cargo test ... containers::tests::`.
+/// 0x1234 cargo test ... containers::tests::`. Wins over `SEEDS_ENV`.
 const SEED_ENV: &str = "G_MESH_CONTAINERS_SEED";
+/// Runs only the first `n` built-in seeds: `G_MESH_CONTAINERS_SEEDS=2`.
+/// `scripts/test-local.sh` sets it; unset means every seed, which is what CI
+/// and the release gate run (docs/adr/0031-local-test-runs.md).
+const SEEDS_ENV: &str = "G_MESH_CONTAINERS_SEEDS";
 
 fn seeds(default: &[u64]) -> Vec<u64> {
-    match std::env::var(SEED_ENV) {
-        Ok(value) => {
-            let value = value.trim();
-            let parsed = match value.strip_prefix("0x") {
-                Some(hex) => u64::from_str_radix(hex, 16),
-                None => value.parse(),
-            };
-            vec![parsed.unwrap_or_else(|_| panic!("{SEED_ENV}={value} is not a u64"))]
-        }
-        Err(_) => default.to_vec(),
+    seeds_from(default, std::env::var(SEED_ENV).ok().as_deref(), std::env::var(SEEDS_ENV).ok().as_deref())
+}
+
+/// `seeds` with the two variables' values passed in, so a test can check the
+/// rule without writing the process environment.
+fn seeds_from(default: &[u64], seed: Option<&str>, count: Option<&str>) -> Vec<u64> {
+    if let Some(value) = seed {
+        let value = value.trim();
+        let parsed = match value.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16),
+            None => value.parse(),
+        };
+        return vec![parsed.unwrap_or_else(|_| panic!("{SEED_ENV}={value} is not a u64"))];
+    }
+    let Some(value) = count else {
+        return default.to_vec();
+    };
+    let value = value.trim();
+    match value.parse::<usize>() {
+        Ok(n) if n > 0 => default.iter().copied().take(n).collect(),
+        _ => panic!("{SEEDS_ENV}={value} is not a positive count"),
     }
 }
 

@@ -18,6 +18,9 @@
 # - A path no rule names selects `full`: an unknown path is never skipped.
 # - A change to anything every crate builds on (wire, the SDK, cargo and
 #   nextest config, CI and this selection machinery) selects `full`.
+# - A change under `core/` selects every core section, except one under
+#   `core/src/cli/` or `core/src/mcp/`, which selects that module's lib section
+#   and `core-it`.
 # - A plugin change selects that plugin's section and every core section, never
 #   another plugin's section.
 set -euo pipefail
@@ -122,7 +125,12 @@ classify() {
 	wire/* | plugins/sdk/*) full=1 ;;
 	Cargo.toml | Cargo.lock | .cargo/* | .config/nextest.toml | rust-toolchain*) full=1 ;;
 	.github/workflows/* | scripts/test-sections.sh | scripts/test-sections-check.py | scripts/test-select.sh) full=1 ;;
+	scripts/test-local.sh | scripts/test-heavy-report.py) full=1 ;;
 	.gitattributes) full=1 ;;
+	# Leaf modules: their lib tests and the integration tests, not the rest of
+	# the lib (docs/adr/0031-local-test-runs.md).
+	core/src/cli/*) add core-cli core-it ;;
+	core/src/mcp/*) add core-mcp core-it ;;
 	core/*) add "${CORE[@]}" ;;
 	plugins/python/* | plugins/rust/* | plugins/typescript/*)
 		local plugin="${1#plugins/}"
