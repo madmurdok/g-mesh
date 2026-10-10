@@ -363,3 +363,10 @@ in it argues for a larger one.
 
 Not measured: whether 120 s is enough at S7's own load. Reproducing that needs the
 combined extractor and conformance run, which this slice's rules exclude.
+
+## Owner decision after the warm-up measurement (2026-10-10)
+
+"Чинить признак готовности + B (Recommended)": the bridge declares rust-analyzer ready on
+its explicit quiescent signal rather than 2 s of silence (if the running rust-analyzer does
+not offer one, the code slice stops and reports), and the kit fails the session on a
+residual whole-project pass (B). No fixed WARM_UP is added.
