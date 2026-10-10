@@ -63,7 +63,7 @@ What remains owed (recorded here, not built by this task):
 - (a) TypeScript reporting `untypedCalls`. With that, statement 6's fixed half can also become a response field.
 - (b) **Delivered (GM-502):** the override field in row 9; see `docs/architecture/gm-502-override-callers-field.md`. Side effect for Rust (D3 in that note): `find_implementations` and `find_references` on a trait method now list the impl methods through a `SUPERTYPE_OF` edge.
 - (c) **Delivered (GM-503):** path-anchored answers carry `notIndexed`; see `docs/architecture/gm-503-absent-language-field.md`. Original wording: a field on an answer about a path in an absent or failed language, for example `get_file_outline` or `find_definition` on a `.py` file with no Python plugin. It would carry the language, the reason and the install command. `languages::absent_for_path` exists for this and has no caller yet.
-- (d) `docs/architecture/tool-answer-guarantees.md`, which does not exist yet. It is the consumer-facing home for statements 3-8.
+- (d) **Delivered (GM-504):** `docs/architecture/tool-answer-guarantees.md` is the consumer-facing home for statements 3-8: when each per-answer field appears, what it guarantees and what it does not, and its emitting function.
 
 ### 2. The receiver-call gap: capability in the text, state in the answer
 
