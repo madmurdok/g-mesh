@@ -398,6 +398,20 @@ const MAX_SERVER_STARTS: u32 = 4;
 /// `an_indexing_server_is_not_believed_early_even_when_the_manifest_says_on_demand`
 /// is that case, and it is the test that fails if any of the above is removed.
 ///
+/// **A server that says when it has finished loading is asked to** (GM-550).
+/// rust-analyzer 1.97 under load paused 2.04s and 2.47s between `Fetching`
+/// and `Building CrateGraph` - longer than the settle - and the bridge called
+/// it ready inside the gap. [`LspBridge::quiescent_signal`] advertises
+/// rust-analyzer's `experimental.serverStatusNotification` capability; the
+/// server then reports `quiescent: false` from its first progress until the
+/// last start-up phase (cache priming included) has ended, and `true` within
+/// milliseconds of that. The client counts `quiescent: false` as work in
+/// flight, so no gap between phases reads as quiet, and the first settle
+/// needs only "quiescent and nothing in flight" - see [`LspClient::settle`]
+/// for the two cases that keep the quiet period (a server that sends no
+/// status, and the settle after a `workspaceChanged`) and for the bound on a
+/// server that never reports `true`.
+///
 /// Readiness is not only a startup condition: a server may begin indexing
 /// again mid-pass (it usually does, after `didChange`). An empty answer that
 /// arrives before the server is quiet again is therefore re-asked once, after
@@ -526,6 +540,9 @@ pub struct LspBridge {
     /// Core's deadline for the pass about to be answered, when core sent one
     /// (`budgetMs`, GM-521) - see [`LspBridge::pass_deadline`].
     core_deadline: Option<Instant>,
+    /// Whether readiness reads the server's `experimental/serverStatus`
+    /// `quiescent` bit - see [`LspBridge::quiescent_signal`].
+    quiescent_signal: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -567,6 +584,18 @@ impl LspBridge {
         self
     }
 
+    /// Asks the server for rust-analyzer's `experimental/serverStatus`
+    /// notification and believes it ready when it reports `quiescent: true`
+    /// with nothing in flight, rather than after [`Budgets::settle`] of
+    /// silence - see this type's doc on readiness (GM-550). For a server whose
+    /// start-up phases can be separated by gaps longer than the settle. A
+    /// server that never sends a status keeps the quiet-period rule.
+    #[must_use]
+    pub fn quiescent_signal(mut self) -> Self {
+        self.quiescent_signal = true;
+        self
+    }
+
     /// [`LspBridge::new`] with budgets a test can make small - see
     /// [`Budgets`].
     pub fn with_budgets(language: &str, root: &Path, config: SemanticConfig, budgets: Budgets) -> Self {
@@ -588,6 +617,7 @@ impl LspBridge {
             emitted: BTreeMap::new(),
             trimmed: BTreeMap::new(),
             core_deadline: None,
+            quiescent_signal: false,
         }
     }
 
@@ -645,7 +675,8 @@ impl LspBridge {
                 return None;
             }
             self.starts += 1;
-            match LspClient::start(&self.language, &self.config, &self.root, deadline) {
+            match LspClient::start(&self.language, &self.config, &self.root, deadline, self.quiescent_signal)
+            {
                 Ok(client) => self.client = Some(client),
                 Err(err) => {
                     self.start_failure = Some(format!(

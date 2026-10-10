@@ -94,7 +94,10 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
         resolved.version
     );
     config.command = resolved.command;
-    Ok(Box::new(LspBridge::new(LANGUAGE, root, config)))
+    // GM-550: rust-analyzer's start-up phases can be separated by more than
+    // the bridge's 2s settle under load (2.04s and 2.47s measured), so its
+    // readiness is its own `quiescent` status rather than a quiet period.
+    Ok(Box::new(LspBridge::new(LANGUAGE, root, config).quiescent_signal()))
 }
 
 /// The server to run, and the version string it answered with.
