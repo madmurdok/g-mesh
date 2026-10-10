@@ -87,5 +87,11 @@ func runBulkIndex(root string, out io.Writer) (bulkIndexSummary, error) {
 		summary.filesProcessed++
 	}
 
+	// The facts the walk was built from, last: core stores them with the
+	// walk's rows, and a stream cut short never delivers them.
+	if err := write(bulkFactsLine{ResolutionFacts: encodeFacts(ws)}); err != nil {
+		return summary, err
+	}
+
 	return summary, w.Flush()
 }

@@ -31,7 +31,7 @@ const (
 	// golang.org/x/tools/go/packages) and its manifest's declared
 	// capabilities changed with it, which is exactly what a plugin version
 	// exists to say.
-	pluginVersion = "0.4.0"
+	pluginVersion = "0.5.0"
 	languageName  = "go"
 )
 
@@ -228,6 +228,10 @@ type wireEdge struct {
 	Source   string `json:"source"`
 	Engine   string `json:"engine"`
 	Resolved bool   `json:"resolved"`
+	// IMPORTS edges only: the import path as written, which core keeps
+	// beside the edge after linking so a resolutionChanged selector can
+	// still find the importer. Not part of the edge's id.
+	Specifier string `json:"specifier,omitempty"`
 }
 
 // fileChangeDiff mirrors core's FileChangeDiff: what a `fileChanged` or
@@ -285,6 +289,37 @@ type controlEnvelope struct {
 // singular `params: { filePath }`.
 type filePathParams struct {
 	FilePath string `json:"filePath"`
+	// fileChanged only: extract even when the text is what this process last
+	// extracted. This plugin always extracts a fileChanged file, so the flag
+	// changes nothing here; the answer is still a diff against the cached
+	// graph.
+	Reextract bool `json:"reextract,omitempty"`
+}
+
+// resolutionChangedParams mirrors ControlMessage::ResolutionChanged.
+type resolutionChangedParams struct {
+	FilePath      string  `json:"filePath"`
+	PreviousFacts *string `json:"previousFacts,omitempty"`
+}
+
+// resolutionChangedResponse mirrors ResolutionChangedResponse.
+type resolutionChangedResponse struct {
+	JSONRPC string                  `json:"jsonrpc"`
+	ID      json.RawMessage         `json:"id"`
+	Result  resolutionChangedResult `json:"result"`
+}
+
+type resolutionChangedResult struct {
+	Delta resolutionDelta `json:"delta"`
+	// The reloaded workspace's facts, which core stores once it has acted on
+	// Delta.
+	Facts string `json:"facts,omitempty"`
+}
+
+// bulkFactsLine is the bulk stream's last line: the facts the walk was built
+// from.
+type bulkFactsLine struct {
+	ResolutionFacts string `json:"resolutionFacts"`
 }
 
 // filePathsParams mirrors ControlMessage::SemanticPass's plural

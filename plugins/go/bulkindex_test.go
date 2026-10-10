@@ -33,6 +33,9 @@ func TestRunBulkIndexEmitsEveryGoFilesGraph(t *testing.T) {
 		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
 			t.Fatalf("emitted line did not parse as JSON: %v\nline: %s", err, scanner.Text())
 		}
+		if _, isFacts := record["resolutionFacts"]; isFacts {
+			continue
+		}
 		if _, isEdge := record["fromId"]; isEdge {
 			var edge wireEdge
 			if err := json.Unmarshal(scanner.Bytes(), &edge); err != nil {
@@ -82,10 +85,14 @@ func TestRunBulkIndexIsIDStableAcrossRepeatedRuns(t *testing.T) {
 			// have to be stable, since core keys upserts and deletes on
 			// them either way.
 			var record struct {
-				ID string `json:"id"`
+				ID              string  `json:"id"`
+				ResolutionFacts *string `json:"resolutionFacts"`
 			}
 			if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
 				t.Fatalf("bad line: %v", err)
+			}
+			if record.ResolutionFacts != nil {
+				continue
 			}
 			ids = append(ids, record.ID)
 		}
@@ -106,15 +113,16 @@ func TestRunBulkIndexIsIDStableAcrossRepeatedRuns(t *testing.T) {
 	}
 }
 
-// An empty project must not error and must emit nothing.
-func TestRunBulkIndexOverAnEmptyProjectEmitsNothing(t *testing.T) {
+// An empty project must not error and must emit only the facts trailer.
+func TestRunBulkIndexOverAnEmptyProjectEmitsOnlyTheFacts(t *testing.T) {
 	root := t.TempDir()
 	var out bytes.Buffer
 	summary, err := runBulkIndex(root, &out)
 	if err != nil {
 		t.Fatalf("runBulkIndex failed: %v", err)
 	}
-	if summary.filesProcessed != 0 || out.Len() != 0 {
-		t.Fatalf("summary = %+v, out.Len() = %d, want an empty walk", summary, out.Len())
+	want := `{"resolutionFacts":"{\"format\":1,\"modules\":[],\"uses\":[],\"replaces\":[]}"}` + "\n"
+	if summary.filesProcessed != 0 || out.String() != want {
+		t.Fatalf("summary = %+v, out = %q, want an empty walk and %q", summary, out.String(), want)
 	}
 }

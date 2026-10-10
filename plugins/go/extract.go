@@ -337,6 +337,15 @@ func (e *extractor) addNode(node wireNode) string {
 // same rule the TS plugin's addEdge states, and it is what the conformance
 // kit's `same-file-rule` check enforces on both plugins.
 func (e *extractor) addEdge(fromID, kind, toID string) {
+	e.addEdgeWithSpecifier(fromID, kind, toID, "")
+}
+
+// addImportEdge records an IMPORTS edge carrying its import path as written.
+func (e *extractor) addImportEdge(fromID, toID, importPath string) {
+	e.addEdgeWithSpecifier(fromID, edgeKindImports, toID, importPath)
+}
+
+func (e *extractor) addEdgeWithSpecifier(fromID, kind, toID, specifier string) {
 	if fromID == "" || toID == "" || !e.nodeSeen[fromID] || !e.nodeSeen[toID] {
 		return
 	}
@@ -346,13 +355,14 @@ func (e *extractor) addEdge(fromID, kind, toID string) {
 	}
 	e.edgeSeen[id] = true
 	e.edges = append(e.edges, wireEdge{
-		ID:       id,
-		FromID:   fromID,
-		ToID:     toID,
-		Kind:     kind,
-		Source:   sourceTierSyntactic,
-		Engine:   engineName,
-		Resolved: !e.placeholder[toID],
+		ID:        id,
+		FromID:    fromID,
+		ToID:      toID,
+		Kind:      kind,
+		Source:    sourceTierSyntactic,
+		Engine:    engineName,
+		Resolved:  !e.placeholder[toID],
+		Specifier: specifier,
 	})
 }
 
@@ -493,7 +503,7 @@ func (e *extractor) collectImports(file *ast.File) {
 			NativeKind:    nativeKind,
 			Target:        target,
 		})
-		e.addEdge(e.fileNodeID, edgeKindImports, id)
+		e.addImportEdge(e.fileNodeID, id, importPath)
 
 		switch {
 		case spec.Name == nil:

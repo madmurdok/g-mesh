@@ -429,6 +429,29 @@ implementing:
 - Relative Python imports, like in-crate Rust paths, are matched by target,
   never by text; their `specifier` is still set (`..pkg`, `crate::a`).
 
+**GM-545 (Go, as built).** Exceptions and additions found while implementing
+(plugins/go/facts.go):
+
+- **Every module changed answers `Unknown`**, not a selection the threshold
+  then rejects. A single-module repository's rename moves every container
+  key, and so does its first or last go.mod (a repository with no module
+  keys by directory). The rule: every module dir in the old and new layouts
+  changed.
+- **`replace` and go.work `use` are facts too.** The structural tier reads
+  neither, but the semantic tier's `packages.Load` honours both. A module
+  path whose `replace` directives changed, and the module of a `use` dir
+  added or removed, select their importers by `Specifier(Under{path, "/"})`;
+  core's scoped `semanticPass` then re-answers them. `require`, `go`,
+  `toolchain`, `exclude` and `retract` stay `Unchanged`.
+- **A changed module dir D also selects importers of its enclosing key.**
+  With a nested module added or removed at D, D's files move between `P_D`
+  and `<outer path>/D`, so both prefixes are `Specifier` selectors, not only
+  the old and new module paths.
+- **Importers are matched by text only.** A Go specifier is the import path,
+  which is also the placeholder's container scope, so no `Target` selector is
+  needed. The `fileChanged` `reextract` flag changes nothing: this plugin
+  always extracts a `fileChanged` file and diffs against its cache.
+
 ### 3.7 GM-507 (Rust module orphaned until Cargo.toml is saved)
 
 GM-509 makes a `Cargo.toml` save re-extract exactly the files whose
