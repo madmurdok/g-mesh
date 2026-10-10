@@ -1129,8 +1129,24 @@ mod tests {
         front: Fake,
         /// Every daemon the connector connected to, in order.
         daemons: mpsc::Receiver<Fake>,
+        /// The root a rebuild currently holds, if any: the connector refuses
+        /// it with [`Rebuilding`] and the probe reports it.
+        rebuild: Arc<Mutex<Option<PathBuf>>>,
         session: thread::JoinHandle<Result<()>>,
         _dir: tempfile::TempDir,
+    }
+
+    /// The pid every scripted rebuild reports.
+    const REBUILD_PID: u32 = 4242;
+
+    fn rebuild_of(held: &Mutex<Option<PathBuf>>, path: &Path) -> Option<Rebuilding> {
+        let held = held.lock().unwrap();
+        (held.as_deref() == Some(path)).then(|| Rebuilding {
+            root: path.to_path_buf(),
+            command: "reindex".into(),
+            pid: REBUILD_PID,
+            running: Duration::from_secs(3),
+        })
     }
 
     impl Session {
@@ -1149,13 +1165,18 @@ mod tests {
             let (front_link, front) = Fake::spawn(root.clone());
             let (daemon_tx, daemons) = mpsc::channel();
             let daemon_tx = Mutex::new(daemon_tx);
+            let rebuild = Arc::new(Mutex::new(None));
+            let (refused, probed) = (Arc::clone(&rebuild), Arc::clone(&rebuild));
             let reach = Daemons {
                 connect: Box::new(move |path| {
+                    if let Some(rebuilding) = rebuild_of(&refused, path) {
+                        return Err(rebuilding.into());
+                    }
                     let (link, fake) = Fake::spawn(path.to_path_buf());
                     daemon_tx.lock().unwrap().send(fake).unwrap();
                     Ok(link)
                 }),
-                rebuilding: Box::new(|_| None),
+                rebuilding: Box::new(move |path| rebuild_of(&probed, path)),
             };
             let (client_r, client) = io::pipe().unwrap();
             let (out_r, out_w) = io::pipe().unwrap();
@@ -1171,7 +1192,7 @@ mod tests {
                     }
                 }
             });
-            Self { root, client, out, front, daemons, session, _dir: dir }
+            Self { root, client, out, front, daemons, rebuild, session, _dir: dir }
         }
 
         fn initialize(&mut self) {
@@ -1213,6 +1234,41 @@ mod tests {
 
         fn daemon(&self) -> Fake {
             self.daemons.recv_timeout(WAIT).expect("the shim did not connect")
+        }
+
+        fn list_tools(&mut self, id: u64) {
+            self.send(json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list" }));
+        }
+
+        fn hold_for_rebuild(&self, root: Option<PathBuf>) {
+            *self.rebuild.lock().unwrap() = root;
+        }
+
+        /// Sends call `id`, lets `daemon` (the front when `None`) receive it
+        /// and hang up, and returns the shim's error answer to it. The shim
+        /// sends that answer under the lock that marks the connection lost,
+        /// so every frame sent after it sees the loss.
+        fn lose(&mut self, daemon: Option<&Fake>, id: u64) -> Value {
+            self.call(id);
+            let daemon = daemon.unwrap_or(&self.front);
+            assert_eq!(daemon.expect("tools/call")["id"], id);
+            daemon.hang_up();
+            let answer = self.recv();
+            assert_eq!(answer["id"], id, "{answer}");
+            assert_eq!(answer["result"]["isError"], true, "{answer}");
+            answer
+        }
+
+        /// The line a call's answer starts with after its daemon at `root`
+        /// was reconnected, up to where the reason starts.
+        fn restart_line(&self, root: &Path) -> String {
+            let name = match root.strip_prefix(&self.root) {
+                Ok(relative) if !relative.as_os_str().is_empty() => relative.display().to_string(),
+                _ => root.display().to_string(),
+            };
+            format!(
+                "g-mesh: the daemon serving {name} restarted since this session's previous answer from it"
+            )
         }
     }
 
@@ -1521,5 +1577,197 @@ mod tests {
         session.front.reply(json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }));
         let listed = session.recv();
         assert_eq!((&listed["id"], &listed["result"]["tools"]), (&json!(1), &json!([])), "{listed}");
+    }
+
+    /// The text items of a tool result, in order.
+    fn texts(answer: &Value) -> Vec<&str> {
+        answer["result"]["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no content: {answer}"))
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .collect()
+    }
+
+    /// The daemon going away leaves the session up; the next call reconnects
+    /// to the same root, replays `initialize` and `initialized` before
+    /// forwarding the call, and its answer starts with one restart line.
+    /// The answer after that carries none.
+    ///
+    /// Controls: in `reach`, return `None` for a lost slot: id 8 never
+    /// connects. Drop `router.restarted.insert(id)` in `reconnect`: id 8's
+    /// first text item is the daemon's own answer.
+    #[test]
+    fn a_lost_daemon_is_reconnected_on_the_next_call() {
+        let mut session = Session::start();
+        session.lose(None, 7);
+        assert!(!session.session.is_finished(), "the session outlives its daemon");
+
+        session.call(8);
+        let daemon = session.daemon();
+        assert_eq!(daemon.root, session.root, "the reconnect goes to the same root");
+        // The fake ends a connection whose first frame is not `initialize`,
+        // so receiving these at all proves `initialize` went first.
+        daemon.expect("notifications/initialized");
+        assert_eq!(daemon.expect("tools/call")["id"], 8);
+        daemon.answer(8);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 8, "{answer}");
+        let own = format!("answer from {}", session.root.display());
+        let items = texts(&answer);
+        assert_eq!(items.len(), 2, "{answer}");
+        assert!(items[0].starts_with(&session.restart_line(&session.root)), "{answer}");
+        assert_eq!(items[1], own, "{answer}");
+
+        session.call(9);
+        assert_eq!(daemon.expect("tools/call")["id"], 9);
+        daemon.answer(9);
+        let answer = session.recv();
+        assert_eq!(texts(&answer), vec![own.as_str()], "only the first answer is marked: {answer}");
+        assert!(session.daemons.try_recv().is_err(), "a live connection is never reconnected");
+    }
+
+    /// A selected sub-project's daemon going away keeps the selection: the
+    /// next call reconnects to that sub-project, never to the front, and its
+    /// answer names the project, then the restart.
+    ///
+    /// Control: make `Router::slot(Which::Current)` return the front when
+    /// the sub-project is lost: id 8 reaches the front and nothing connects.
+    #[test]
+    fn a_lost_sub_project_reconnects_to_the_selection() {
+        let mut session = Session::start();
+        session.select(1, "a");
+        let a = session.daemon();
+        session.lose(Some(&a), 7);
+
+        session.call(8);
+        let again = session.daemon();
+        assert_eq!(again.root, a.root, "the selection survives the loss");
+        assert_eq!(again.expect("tools/call")["id"], 8);
+        again.answer(8);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 8, "{answer}");
+        let items = texts(&answer);
+        assert_eq!(items.len(), 3, "{answer}");
+        assert_eq!(items[0], "g-mesh: answered from project a.", "{answer}");
+        assert!(items[1].starts_with(&session.restart_line(&a.root)), "{answer}");
+        assert_eq!(items[2], format!("answer from {}", a.root.display()), "{answer}");
+        let on_front: Vec<Value> =
+            session.front.got.try_iter().filter(|message| message["method"] == "tools/call").collect();
+        assert!(on_front.is_empty(), "the front got a call meant for a: {on_front:?}");
+    }
+
+    /// While a rebuild holds the root, a call owed by the stopped daemon is
+    /// answered naming the rebuild, and the next call is answered at once
+    /// with the rebuild's own text, without connecting. Once the rebuild
+    /// ends, the call after it reconnects.
+    ///
+    /// Controls: in `unreachable_text`, ignore the `Rebuilding` downcast: id
+    /// 8's text starts "could not reach". In `upstream_ended`, always use the
+    /// `(None, None)` reason: id 7's text does not name the rebuild.
+    #[test]
+    fn a_call_during_a_rebuild_is_answered_at_once() {
+        let mut session = Session::start();
+        session.hold_for_rebuild(Some(session.root.clone()));
+        let lost = session.lose(None, 7);
+        let text = first_text(&lost);
+        assert!(
+            text.contains(&format!(
+                "(it was stopped for g-mesh reindex, pid {REBUILD_PID}, which is rebuilding its index)"
+            )),
+            "{text}"
+        );
+
+        session.call(8);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 8, "{answer}");
+        assert_eq!(answer["result"]["isError"], true, "{answer}");
+        let rebuilding = format!(
+            "g-mesh: {} is being reindexed (g-mesh reindex, pid {REBUILD_PID}, ",
+            session.root.display()
+        );
+        assert!(first_text(&answer).starts_with(&rebuilding), "{answer}");
+        assert!(session.daemons.try_recv().is_err(), "nothing connects while a rebuild holds the root");
+
+        session.hold_for_rebuild(None);
+        session.call(9);
+        let daemon = session.daemon();
+        assert_eq!(daemon.expect("tools/call")["id"], 9);
+        daemon.answer(9);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 9, "id 8 was answered once and is owed nothing more: {answer}");
+        assert!(first_text(&answer).starts_with(&session.restart_line(&session.root)), "{answer}");
+    }
+
+    /// The front going away does not cost the session its ability to switch:
+    /// `select_project` reconnects the front, which then switches as usual.
+    ///
+    /// Control: answer `select_project` with an error when the front is
+    /// lost instead of reconnecting it: the select answer is an error.
+    #[test]
+    fn select_project_reconnects_a_lost_front() {
+        let mut session = Session::start();
+        session.list_tools(3);
+        assert_eq!(session.front.expect("tools/list")["id"], 3);
+        session.front.hang_up();
+        let refused = session.recv();
+        assert_eq!(refused["id"], 3, "{refused}");
+        assert!(refused["error"]["message"].as_str().is_some(), "{refused}");
+
+        let selected = session.select(4, "a");
+        assert!(selected.contains("this session now serves"), "{selected}");
+        let front = session.daemon();
+        assert_eq!(front.root, session.root, "the front reconnects first");
+        let a = session.daemon();
+        assert_eq!(a.root, session.root.join("a"));
+    }
+
+    /// `tools/list` goes to the front, reconnecting it when it is lost; when
+    /// the front cannot reconnect, the selected sub-project's daemon answers
+    /// it instead.
+    ///
+    /// Control: route `tools/list` to the current slot: id 2 reaches `a`,
+    /// not the front.
+    #[test]
+    fn tools_list_reconnects_the_front_or_falls_back_to_the_selection() {
+        let mut session = Session::start();
+        session.select(1, "a");
+        let a = session.daemon();
+        session.list_tools(2);
+        assert_eq!(session.front.expect("tools/list")["id"], 2);
+        session.front.hang_up();
+        assert_eq!(session.recv()["id"], 2);
+
+        session.hold_for_rebuild(Some(session.root.clone()));
+        session.list_tools(3);
+        assert_eq!(a.expect("tools/list")["id"], 3, "the front cannot reconnect, so a lists its tools");
+        let listed = json!({ "jsonrpc": "2.0", "id": 3, "result": { "tools": [] } });
+        a.reply(listed.clone());
+        assert_eq!(session.recv(), listed);
+
+        session.hold_for_rebuild(None);
+        session.list_tools(4);
+        let front = session.daemon();
+        assert_eq!(front.root, session.root);
+        assert_eq!(front.expect("tools/list")["id"], 4, "a reachable front lists the tools again");
+    }
+
+    /// With its daemon lost, the session still ends when the client's input
+    /// does.
+    ///
+    /// Control: in `client_loop`, never send `Event::Done`: the session
+    /// thread does not finish.
+    #[test]
+    fn the_session_ends_on_client_eof_after_its_daemon_is_lost() {
+        let mut session = Session::start();
+        session.lose(None, 7);
+        let Session { client, session: handle, .. } = session;
+        drop(client);
+        let deadline = Instant::now() + WAIT;
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline, "the session did not end within 2 s of its client's EOF");
+            thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().unwrap().expect("the session must end cleanly");
     }
 }

@@ -312,4 +312,49 @@ mod tests {
             "{rendered}"
         );
     }
+
+    /// A project's state directory, removed when this drops.
+    struct State(PathBuf);
+
+    impl Drop for State {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// While the hold lives, the project reads as rebuilt by this process
+    /// under the command named; dropping it removes the marker.
+    ///
+    /// Control: skip `acquire_singleton_lock` in `stop_for_rebuild`: the
+    /// marker reads as no rebuild.
+    #[test]
+    fn a_held_project_reads_as_rebuilding_until_the_hold_drops() {
+        let project = tempfile::tempdir().unwrap();
+        let state = State(connection::project_dir(project.path()).unwrap());
+        let (stopped, hold) = stop_for_rebuild(project.path(), "reindex").unwrap();
+        assert!(stopped.core.is_none(), "no daemon was running");
+
+        let rebuild = daemon::rebuild_in_progress(project.path()).unwrap().expect("the hold is a rebuild");
+        assert_eq!((rebuild.pid, rebuild.command.as_str()), (std::process::id(), "reindex"));
+
+        drop(hold);
+        assert_eq!(daemon::rebuild_in_progress(project.path()).unwrap(), None);
+        assert!(!daemon::rebuild_marker_path_in(&state.0).exists(), "the marker is removed");
+    }
+
+    /// A rebuild does not start while another process holds the daemon
+    /// lock, and leaves no marker behind.
+    ///
+    /// Control: skip `acquire_singleton_lock` in `stop_for_rebuild`: the
+    /// rebuild goes ahead.
+    #[test]
+    fn a_rebuild_refuses_a_project_whose_daemon_lock_is_held() {
+        let project = tempfile::tempdir().unwrap();
+        let state = State(connection::ensure_project_dir(project.path()).unwrap());
+        let _other = daemon::acquire_singleton_lock(&state.0).unwrap().expect("the fixture's lock is free");
+
+        let refused = stop_for_rebuild(project.path(), "init").err().expect("the rebuild must refuse");
+        assert!(format!("{refused:#}").contains("still holds the daemon lock"), "{refused:#}");
+        assert!(!daemon::rebuild_marker_path_in(&state.0).exists(), "a refused rebuild leaves no marker");
+    }
 }

@@ -227,3 +227,30 @@ fn init_without_agent_writes_no_agent_instruction_files() {
     assert!(!project.root().join("CLAUDE.md").exists());
     assert!(!project.root().join("GEMINI.md").exists());
 }
+
+/// `init` rebuilds under the same hold as `reindex`: while another process
+/// holds the project's daemon lock it refuses to touch the index, and it
+/// leaves no rebuild marker behind.
+///
+/// Control: call `stop::stop` directly in `init` instead of
+/// `reindex::stop_for_rebuild`: init succeeds.
+#[test]
+fn init_refuses_a_project_whose_daemon_lock_is_held() {
+    let project = Project::new();
+    let state = g_mesh::storage::connection::ensure_project_dir(project.root()).unwrap();
+    let lock = std::fs::File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(daemon::daemon_lock_path_in(&state))
+        .unwrap();
+    lock.try_lock().expect("nothing else holds this fixture's daemon lock");
+
+    let output = project.init();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "init must refuse a held project; stderr:\n{stderr}");
+    assert_contains(&stderr, "still holds the daemon lock");
+    assert!(!daemon::rebuild_marker_path_in(&state).exists(), "a refused init leaves no marker");
+    assert!(!project.index_path().exists(), "a refused init writes no index");
+}

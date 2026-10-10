@@ -589,3 +589,57 @@ async fn the_switch_log_line_names_where_the_project_came_from() {
 
     client.cancel().await.expect("failed to shut the client down");
 }
+
+/// Reindexing the selected project restarts only that project's daemon: the
+/// front and another project's daemon keep running, the session keeps its
+/// selection, and only its next answer from that project marks the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reindexing_one_project_leaves_the_front_and_other_projects_alone() {
+    let folder = Folder::new();
+    let client = folder.connect(None).await;
+    guidance_of(&select(&client, "a").await, &folder.sub("a"));
+    let before = call(&client, "get_file_outline", json!({ "file_path": "a.ts" })).await;
+    assert_eq!(outline_names(&before), Some(vec!["a".to_string()]), "{}", text_of(&before));
+    let other = folder.connect(None).await;
+    guidance_of(&select(&other, "b").await, &folder.sub("b"));
+    let b_before = call(&other, "get_file_outline", json!({ "file_path": "b.ts" })).await;
+    assert_eq!(outline_names(&b_before), Some(vec!["b".to_string()]), "{}", text_of(&b_before));
+
+    let pid_of = |dir: &Path| {
+        daemon::read_pid_file(&daemon::pid_path(dir).unwrap())
+            .unwrap_or_else(|| panic!("{} has no daemon pid", dir.display()))
+    };
+    let (front, a, b) = (pid_of(folder.root()), pid_of(&folder.sub("a")), pid_of(&folder.sub("b")));
+
+    let output = tokio::task::block_in_place(|| {
+        std::process::Command::new(BIN)
+            .arg("reindex")
+            .current_dir(folder.sub("a"))
+            .env(g_mesh::embedding::model::MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir")
+            .output()
+            .expect("failed to run `g-mesh reindex`")
+    });
+    assert!(output.status.success(), "`g-mesh reindex` failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(!daemon::is_process_alive(a), "reindex stops a's daemon");
+    for (what, dir, pid) in
+        [("the front", folder.root().to_path_buf(), front), ("b's daemon", folder.sub("b"), b)]
+    {
+        assert!(daemon::is_process_alive(pid), "{what} must outlive a's reindex");
+        assert_eq!(pid_of(&dir), pid, "{what} must not be replaced");
+    }
+
+    let after = call(&client, "get_file_outline", json!({ "file_path": "a.ts" })).await;
+    let texts = texts_of(&after);
+    assert_eq!(texts.first(), Some(&"g-mesh: answered from project a."), "{texts:?}");
+    assert!(
+        texts.get(1).is_some_and(|line| line.starts_with("g-mesh: the daemon serving a restarted since")),
+        "{texts:?}"
+    );
+    assert_eq!(outline_names(&after), Some(vec!["a".to_string()]), "{texts:?}");
+
+    let b_after = call(&other, "get_file_outline", json!({ "file_path": "b.ts" })).await;
+    assert_eq!(texts_of(&b_after).len(), 2, "b did not restart: {:?}", texts_of(&b_after));
+
+    client.cancel().await.expect("failed to shut the client down");
+    other.cancel().await.expect("failed to shut the client down");
+}
