@@ -232,3 +232,12 @@ form). Grep for CLI wiring, test/doc line expectations, SQL.
    `g-mesh plugins install go` after the walk, in a project with no `.go`
    files. Consequence: one more row kind; the alternative (rows only) hides
    an installed plugin until the next walk.
+
+## Owner decisions (2026-10-10)
+
+- Two modes: "Лёгкий, полный по --full (Recommended)"; scope widened in
+  this task: "Расширить в этой задаче (Recommended)". Owner's words: "а можем
+  сделать 2 режима: просто статус того что можно получить легко + языки(
+  версии плагинов в том числе ) и полный статус - с "тяжелыми операциями"."
+- Dirty files: "Перенести в --full (Recommended)".
+- Plugins installed after the last walk: "Да, показывать (Recommended)".
