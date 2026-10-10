@@ -36,6 +36,21 @@ flight across a switch names the project that really served it.
   ended connection still owed (their text already names the daemon's root).
 - A session that never switches has no sub-project upstream, so its frames
   still cross byte-for-byte.
+- **The restart line.** A session outlives its daemons: when one goes away
+  (`g-mesh reindex`, `init` or `stop`, a newer build, a crash), the shim
+  reconnects on the next call routed to it. The first `tools/call` result
+  that the new daemon answers carries one more text item, after the stamp
+  when there is one (so the stamp stays the first item):
+
+      g-mesh: the daemon serving <name> restarted since this session's previous answer from it (...); results from before the restart may differ from this one.
+
+  `<name>` is named as in the stamp, or the shim's root when the front
+  restarted. It is added in a single-project session too, which is the one
+  time such a session's frames do not cross byte-for-byte. The client keeps
+  the first daemon's `instructions` (MCP cannot resend them); this line is
+  how the agent learns the index may have changed. The shim's own
+  "being reindexed" answer, given while the CLI rebuilds the index, is a
+  shim answer and carries neither line.
 - The `select_project` result after a switch tells the agent that agents on
   one connection share the choice, quotes the stamp's shape, and says to call
   `select_project` again when it names a project other than the one it

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -54,6 +54,9 @@ const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
 /// project's socket. Not the bootstrap lock: the shim holds that one while
 /// spawning the daemon, so sharing it would deadlock.
 const DAEMON_LOCK_FILE: &str = "daemon.lock";
+/// Written by `g-mesh reindex` and `g-mesh init` for as long as they rebuild
+/// the project's index: their pid, start time and command, one per line.
+const REBUILD_MARKER_FILE: &str = "reindex.pid";
 
 /// Where the lock's holder records that it has begun serving. Beside the lock,
 /// not inside it: on Windows a second handle cannot read a locked file. Only
@@ -180,6 +183,52 @@ pub fn daemon_lock_path_in(state_dir: &Path) -> PathBuf {
 
 fn serving_owner_path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(DAEMON_SERVING_FILE)
+}
+
+pub fn rebuild_marker_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(REBUILD_MARKER_FILE)
+}
+
+/// A CLI rebuild of a project's index in progress, as its marker records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebuild {
+    pub pid: u32,
+    pub started: SystemTime,
+    /// The `g-mesh` subcommand running it: `reindex` or `init`.
+    pub command: String,
+}
+
+/// Records that this process is rebuilding the index whose state directory
+/// holds `path`, on behalf of `g-mesh <command>`.
+pub(crate) fn write_rebuild_marker(path: &Path, command: &str) -> Result<()> {
+    let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    fs::write(path, format!("{}\n{started}\n{command}\n", std::process::id()))
+        .with_context(|| format!("failed to write the rebuild marker {}", path.display()))
+}
+
+/// The rebuild holding `root`'s index, if one is running. A marker counts only
+/// while its pid is alive and the daemon lock is held: a rebuild that crashed
+/// leaves a marker naming a dead (or reused) pid, and the kernel has already
+/// released its lock, so the project reads as free.
+pub fn rebuild_in_progress(root: &Path) -> Result<Option<Rebuild>> {
+    rebuild_in_progress_in(&project_dir(root)?)
+}
+
+fn rebuild_in_progress_in(state_dir: &Path) -> Result<Option<Rebuild>> {
+    let Ok(contents) = fs::read_to_string(rebuild_marker_path_in(state_dir)) else {
+        return Ok(None);
+    };
+    let mut lines = contents.lines();
+    let (Some(Ok(pid)), Some(Ok(started))) =
+        (lines.next().map(str::parse::<u32>), lines.next().map(str::parse::<u64>))
+    else {
+        return Ok(None);
+    };
+    let command = lines.next().unwrap_or("reindex").to_string();
+    if !is_process_alive(pid) || !daemon_lock_is_held(state_dir)? {
+        return Ok(None);
+    }
+    Ok(Some(Rebuild { pid, started: UNIX_EPOCH + Duration::from_secs(started), command }))
 }
 
 /// Reads a pid from one of the files above; `None` for "nothing recorded". See
@@ -611,7 +660,7 @@ const SINGLETON_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// returned `File` must live as long as the daemon: the lock is tied to the
 /// open file, so exit or death releases it. A contended lock is retried because
 /// the kernel releases a `kill -9`'d holder's `flock` slightly after it dies.
-fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
+pub(crate) fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
     let path = dir.join(DAEMON_LOCK_FILE);
     let file = File::options()
         .create(true)

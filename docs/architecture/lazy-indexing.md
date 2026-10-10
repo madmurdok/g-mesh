@@ -663,10 +663,11 @@ Options considered:
    - All frames to stdout go through **one writer thread fed by a channel**,
      not a mutex around stdout: interleaving two readers' frames then becomes
      impossible by construction rather than by discipline.
-   - If the front's connection ends after a switch (for example, it was
-     retired as outdated), `tools/list` falls back to the current upstream
-     and `select_project` calls get an error saying the front is gone. The
-     session itself continues on `C`.
+   - If the front's or `C`'s connection ends (a reindex, `g-mesh stop`, a
+     retirement as outdated), the session continues: the next request routed
+     there reconnects, bootstrapping a daemon if needed, and replays
+     `initialize`. A lost `C` never falls back to the front. `tools/list`
+     falls back to `C` only when the front cannot be reconnected.
    - A **single-project** session never sees a `switchProject` directive, so
      for it the shim forwards every frame byte-for-byte as today (a frame that
      fails to parse is forwarded raw).

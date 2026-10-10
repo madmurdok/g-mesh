@@ -55,7 +55,8 @@
 //! index directly and writes to it outside of any daemon's supervision. A
 //! live daemon holds that same file open and may be mid-write off its own
 //! file watcher, so it is stopped first via `cli::stop`, the same safe,
-//! wait-for-genuinely-gone shutdown `reindex` relies on. A project someone is
+//! wait-for-genuinely-gone shutdown `reindex` relies on, and kept away until
+//! `init` returns (`cli::reindex::stop_for_rebuild`). A project someone is
 //! running `init` against for the first time will not normally have one, but
 //! `init` is also safe to run again later - see below - and by then one may
 //! well exist.
@@ -99,7 +100,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::cli::agent_instructions::{self, AgentsMdWrite};
-use crate::cli::{stop, AgentTarget};
+use crate::cli::{reindex, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::indexing_status::IndexingStatus;
@@ -157,7 +158,7 @@ pub fn run(agents: &[AgentTarget]) -> Result<()> {
 /// Split out from [`run`] so it can be exercised against a temporary project
 /// root without taking over the process's real cwd.
 pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
-    let stop_outcome = stop::stop(project_root)?;
+    let (stop_outcome, _hold) = reindex::stop_for_rebuild(project_root, "init")?;
 
     let state_dir =
         connection::project_dir(project_root).context("failed to resolve the project's state directory")?;
