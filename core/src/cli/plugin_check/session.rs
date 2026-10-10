@@ -229,6 +229,12 @@ pub(crate) fn count_claimed_files(manifest: &PluginManifest, dir: &Path) -> usiz
 /// plugin that logs steadily cannot bury the finding it is attached to.
 const STDERR_LINES_QUOTED: usize = 20;
 
+/// Once a plugin has exited, how long to wait for its stderr drain thread to
+/// reach EOF before quoting what it has so far. The same bound, for the same
+/// reason, as [`KILL_DRAIN_GRACE`]: only exceeded when the plugin handed its
+/// stderr to a grandchild that outlives it.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 /// A spawned plugin's stderr, drained on a thread and kept for whatever
 /// failure message the kit ends up writing about that process.
 ///
@@ -240,7 +246,11 @@ const STDERR_LINES_QUOTED: usize = 20;
 /// Twenty-five Windows failures were diagnosable only by reasoning about
 /// paths, because the one process that knew the answer had been told to say
 /// it somewhere nobody was listening.
-struct StderrCapture(Arc<Mutex<Vec<u8>>>);
+struct StderrCapture {
+    captured: Arc<Mutex<Vec<u8>>>,
+    /// Disconnected when the drain thread ends: its sender is dropped with it.
+    drained: Option<std::sync::mpsc::Receiver<()>>,
+}
 
 impl StderrCapture {
     /// Takes `child`'s piped stderr and starts draining it. Every byte is
@@ -255,10 +265,12 @@ impl StderrCapture {
     fn attach(child: &mut Child) -> Self {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let Some(mut stderr) = child.stderr.take() else {
-            return Self(captured);
+            return Self { captured, drained: None };
         };
         let sink = Arc::clone(&captured);
+        let (drained_tx, drained) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
+            let _drained_tx = drained_tx;
             let mut chunk = [0u8; 8 * 1024];
             loop {
                 match stderr.read(&mut chunk) {
@@ -272,7 +284,17 @@ impl StderrCapture {
                 }
             }
         });
-        Self(captured)
+        Self { captured, drained: Some(drained) }
+    }
+
+    /// Waits, at most [`STDERR_DRAIN_GRACE`], for the drain thread to reach
+    /// EOF. Called once the child is reaped: its exit does not mean the
+    /// thread has read the last of the pipe, and a quote taken before then
+    /// can miss exactly the lines the plugin died writing.
+    fn wait_drained(&self) {
+        if let Some(drained) = &self.drained {
+            let _ = drained.recv_timeout(STDERR_DRAIN_GRACE);
+        }
     }
 
     /// `failure` with what the plugin wrote to stderr quoted under it, or
@@ -280,7 +302,7 @@ impl StderrCapture {
     /// is finally assembled, which for a process still running is a
     /// best-effort snapshot - the drain thread may be mid-chunk.
     fn explain(&self, failure: String) -> String {
-        quote_stderr(&self.0.lock().unwrap(), failure, false)
+        quote_stderr(&self.captured.lock().unwrap(), failure, false)
     }
 
     /// As [`Self::explain`], for a failure that *is* the child's own fate -
@@ -290,7 +312,7 @@ impl StderrCapture {
     /// exactly like one that never looked, which is the report this kit used
     /// to print.
     fn explain_end(&self, failure: String) -> String {
-        quote_stderr(&self.0.lock().unwrap(), failure, true)
+        quote_stderr(&self.captured.lock().unwrap(), failure, true)
     }
 }
 
@@ -452,6 +474,9 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
 
     // Only now, with the child reaped: whatever it wrote to stderr is the
     // only account of a walk that produced nothing and exited non-zero.
+    if failure.is_some() {
+        stderr.wait_drained();
+    }
     let failure = failure.map(|failure| stderr.explain_end(failure));
     let bytes = std::mem::take(&mut *captured.lock().unwrap());
     BulkRun { lines: parse_bulk_lines(&bytes), bytes, failure }
@@ -1900,6 +1925,9 @@ impl<'a> Driver<'a> {
         }
         // After the child is gone, so a plugin that explained itself on the
         // way out is quoted having said all of it.
+        if session.failure.is_some() {
+            stderr.wait_drained();
+        }
         session.failure = session.failure.take().map(|failure| stderr.explain(failure));
         session
     }
