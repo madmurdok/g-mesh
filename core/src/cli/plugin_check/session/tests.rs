@@ -357,3 +357,222 @@ fn import_rows_report_a_containers_member_files() {
     assert_eq!(file.to_file, "pkg/target.py");
     assert!(file.container_member_files.is_empty(), "{file:?}");
 }
+
+// -----------------------------------------------------------------
+// GM-544: the resolution-delta version bump per watch-file format.
+// Every case states the whole expected text, so "only the version
+// changed, every other byte kept" is the assertion itself.
+// -----------------------------------------------------------------
+
+fn bump(name: &str, text: &str) -> Option<(String, String)> {
+    version_bump_for(name, text)
+}
+
+fn bumped(text: &str, field: &str) -> Option<(String, String)> {
+    Some((text.to_string(), field.to_string()))
+}
+
+#[test]
+fn a_cargo_package_version_gets_the_suffix_and_nothing_else_moves() {
+    let text = "# top comment\n[package]\nname = \"alpha\"\nversion   =  \"0.1.0\"  # keep me\nedition = \"2021\"\n\n\
+                [dependencies]\nserde = { version = \"1.0\" }\n";
+    let expected =
+        "# top comment\n[package]\nname = \"alpha\"\nversion   =  \"0.1.0-plugin-check\"  # keep me\n\
+                    edition = \"2021\"\n\n[dependencies]\nserde = { version = \"1.0\" }\n";
+    assert_eq!(bump("Cargo.toml", text), bumped(expected, "`[package].version`"));
+}
+
+#[test]
+fn a_cargo_version_in_another_table_before_the_package_is_never_the_one_edited() {
+    // A `[dependencies.foo]` table has its own `version = "..."` line, and
+    // it comes first; the edit still lands under `[package]`.
+    let text = "[dependencies.foo]\nversion = \"9.9\"\n\n[package]\nname = \"a\"\nversion = \"0.1.0\"\n";
+    let expected = "[dependencies.foo]\nversion = \"9.9\"\n\n[package]\nname = \"a\"\nversion = \"0.1.0-plugin-check\"\n";
+    assert_eq!(bump("Cargo.toml", text), bumped(expected, "`[package].version`"));
+}
+
+#[test]
+fn a_virtual_cargo_workspace_bumps_its_workspace_package_version() {
+    let text = "[workspace]\nmembers = [\"crates/a\"]\n\n[workspace.package]\nversion = \"2.0.0\"\n";
+    let expected =
+        "[workspace]\nmembers = [\"crates/a\"]\n\n[workspace.package]\nversion = \"2.0.0-plugin-check\"\n";
+    assert_eq!(bump("Cargo.toml", text), bumped(expected, "`[workspace.package].version`"));
+}
+
+#[test]
+fn a_cargo_package_version_wins_over_the_workspace_package_version() {
+    let text = "[workspace.package]\nversion = \"2.0.0\"\n\n[package]\nname = \"a\"\nversion = \"0.1.0\"\n";
+    let expected = "[workspace.package]\nversion = \"2.0.0\"\n\n[package]\nname = \"a\"\nversion = \"0.1.0-plugin-check\"\n";
+    assert_eq!(bump("Cargo.toml", text), bumped(expected, "`[package].version`"));
+}
+
+#[test]
+fn a_cargo_toml_without_its_own_version_string_is_not_bumped_and_none_is_inserted() {
+    for text in [
+        // A virtual workspace root.
+        "[workspace]\nmembers = [\"crates/a\"]\nresolver = \"2\"\n",
+        // An inherited version: a dotted key, not a string.
+        "[package]\nname = \"a\"\nversion.workspace = true\n",
+        // No version at all (Cargo defaults it; inserting one is a real change).
+        "[package]\nname = \"a\"\n",
+        // An empty and a multi-line string are never edited.
+        "[package]\nname = \"a\"\nversion = \"\"\n",
+        "[package]\nname = \"a\"\nversion = \"\"\"0.1.0\"\"\"\n",
+        // Not TOML.
+        "[package\nversion = \"0.1.0\"\n",
+    ] {
+        assert_eq!(bump("Cargo.toml", text), None, "{text}");
+    }
+}
+
+#[test]
+fn a_literal_string_version_and_crlf_line_ends_are_kept() {
+    let text = "[package]\r\nname = 'a'\r\nversion = '0.1.0' # c\r\n";
+    let expected = "[package]\r\nname = 'a'\r\nversion = '0.1.0-plugin-check' # c\r\n";
+    assert_eq!(bump("Cargo.toml", text), bumped(expected, "`[package].version`"));
+}
+
+#[test]
+fn a_pyproject_project_version_gets_the_suffix() {
+    let text =
+        "[build-system]\nrequires = [\"hatchling\"]\n\n[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\
+                dependencies = [\"requests>=2\"]\n\n[tool.poetry]\nversion = \"7.0.0\"\n";
+    let expected = "[build-system]\nrequires = [\"hatchling\"]\n\n[project]\nname = \"demo\"\n\
+                    version = \"0.1.0-plugin-check\"\ndependencies = [\"requests>=2\"]\n\n[tool.poetry]\n\
+                    version = \"7.0.0\"\n";
+    assert_eq!(bump("pyproject.toml", text), bumped(expected, "`[project].version`"));
+}
+
+#[test]
+fn a_poetry_pyproject_bumps_the_tool_poetry_version() {
+    let text = "[tool.poetry]\nname = \"demo\"\nversion = \"1.2.3\"\n\n[tool.poetry.dependencies]\npython = \"^3.11\"\n";
+    let expected = "[tool.poetry]\nname = \"demo\"\nversion = \"1.2.3-plugin-check\"\n\n\
+                    [tool.poetry.dependencies]\npython = \"^3.11\"\n";
+    assert_eq!(bump("pyproject.toml", text), bumped(expected, "`[tool.poetry].version`"));
+    // A `[project]` table without a version falls through to poetry's.
+    let text = "[project]\nname = \"demo\"\ndynamic = [\"version\"]\n\n[tool.poetry]\nversion = \"1.2.3\"\n";
+    let expected = "[project]\nname = \"demo\"\ndynamic = [\"version\"]\n\n[tool.poetry]\nversion = \"1.2.3-plugin-check\"\n";
+    assert_eq!(bump("pyproject.toml", text), bumped(expected, "`[tool.poetry].version`"));
+}
+
+#[test]
+fn a_pyproject_without_a_static_version_is_not_bumped_and_none_is_inserted() {
+    for text in [
+        "[project]\nname = \"demo\"\ndynamic = [\"version\"]\n",
+        "[project]\nname = \"demo\"\n",
+        "[tool.black]\nline-length = 100\n",
+        // A Cargo-shaped table is not a pyproject version.
+        "[package]\nversion = \"0.1.0\"\n",
+    ] {
+        assert_eq!(bump("pyproject.toml", text), None, "{text}");
+    }
+}
+
+#[test]
+fn a_go_mod_single_line_require_version_gets_the_suffix() {
+    let text = "module example.com/m\n\ngo 1.22\n\nrequire golang.org/x/text v0.14.0 // indirect\n";
+    let expected =
+        "module example.com/m\n\ngo 1.22\n\nrequire golang.org/x/text v0.14.0-plugin-check // indirect\n";
+    assert_eq!(bump("go.mod", text), bumped(expected, "the `require golang.org/x/text` version"));
+}
+
+#[test]
+fn a_go_mod_require_block_skips_comments_and_incompatible_versions() {
+    let text = "module example.com/m\n\ngo 1.22\n\nrequire (\n\t// require example.com/c v1.0.0\n\
+                \texample.com/old v2.0.0+incompatible\n\texample.com/new v1.4.0\n)\n";
+    let expected = "module example.com/m\n\ngo 1.22\n\nrequire (\n\t// require example.com/c v1.0.0\n\
+                    \texample.com/old v2.0.0+incompatible\n\texample.com/new v1.4.0-plugin-check\n)\n";
+    assert_eq!(bump("go.mod", text), bumped(expected, "the `require example.com/new` version"));
+}
+
+#[test]
+fn a_go_mod_without_a_usable_require_rewrites_the_go_directive() {
+    let text = "module example.com/m\n\ngo 1.22\n";
+    assert_eq!(bump("go.mod", text), bumped("module example.com/m\n\ngo 1.22.0\n", "the `go` directive"));
+    let text = "module example.com/m\r\n\r\ngo 1.22.3\r\n\r\nrequire example.com/old v2.0.0+incompatible\r\n";
+    let expected =
+        "module example.com/m\r\n\r\ngo 1.22\r\n\r\nrequire example.com/old v2.0.0+incompatible\r\n";
+    assert_eq!(bump("go.mod", text), bumped(expected, "the `go` directive"));
+}
+
+#[test]
+fn a_go_mod_with_neither_a_require_nor_a_plain_go_directive_is_not_bumped() {
+    for text in
+        ["module example.com/m\n", "module example.com/m\n\ngo 1\n", "module example.com/m\n\ngo 1.22rc1\n"]
+    {
+        assert_eq!(bump("go.mod", text), None, "{text}");
+    }
+}
+
+#[test]
+fn the_format_follows_the_file_name_and_any_other_name_takes_the_json_rule() {
+    let cargo = "[package]\nname = \"a\"\nversion = \"0.1.0\"\n";
+    assert!(bump("Cargo.toml", cargo).is_some());
+    assert_eq!(bump("pyproject.toml", cargo), None);
+    // A TOML file under any other name is read as JSON, which it is not.
+    assert_eq!(bump("Pipfile", cargo), None);
+    for (name, text) in
+        [("setup.cfg", "[metadata]\nversion = 0.1.0\n"), ("setup.py", "setup(version=\"0.1.0\")\n")]
+    {
+        assert_eq!(bump(name, text), None, "{name}");
+    }
+    assert_eq!(
+        bump("composer.json", "{\"name\": \"x\", \"version\": \"1.0.0\"}"),
+        bumped("{\"name\": \"x\", \"version\": \"1.0.0-plugin-check\"}", "the top-level `version`")
+    );
+}
+
+#[test]
+fn the_json_rule_appends_to_a_top_level_version_or_inserts_one() {
+    let text = "{\n  \"name\": \"x\",\n  \"dependencies\": { \"version\": \"1.0.0\" },\n  \"version\": \"1.0.0\"\n}\n";
+    let expected =
+        "{\n  \"name\": \"x\",\n  \"dependencies\": { \"version\": \"1.0.0\" },\n  \"version\": \"1.0.0-plugin-check\"\n}\n";
+    assert_eq!(version_bump(text).as_deref(), Some(expected));
+    assert_eq!(
+        version_bump("{\"name\": \"x\"}").as_deref(),
+        Some("{\"version\": \"0.0.0-plugin-check\",\"name\": \"x\"}")
+    );
+    assert_eq!(version_bump("{}").as_deref(), Some("{\"version\": \"0.0.0-plugin-check\"}"));
+    assert_eq!(version_bump("{\"version\": 3}"), None);
+    assert_eq!(version_bump("[1, 2]"), None);
+    assert_eq!(version_bump("{\"version\": \"1\" // c\n}"), None);
+}
+
+fn watching(globs: &[&str]) -> PluginManifest {
+    let mut manifest = fake_workspace_plugin_manifest(PathBuf::from("/dev/null"));
+    manifest.workspace.watch_files = globs.iter().map(|g| globset::Glob::new(g).unwrap()).collect();
+    manifest.workspace.exclude_dirs = vec!["target".to_string()];
+    manifest
+}
+
+fn write_tree(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, contents) in files {
+        let path = dir.path().join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn the_chooser_passes_a_virtual_workspace_root_for_the_shallowest_bumpable_member() {
+    let dir = write_tree(&[
+        ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+        ("crates/beta/Cargo.toml", "[package]\nname = \"beta\"\nversion = \"0.2.0\"\n"),
+        ("crates/alpha/Cargo.toml", "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n"),
+        ("target/x/Cargo.toml", "[package]\nversion = \"9.0.0\"\n"),
+    ]);
+    let chosen = choose_version_bump(&watching(&["Cargo.toml"]), dir.path()).expect("a member is bumpable");
+    assert_eq!(chosen.file_path, "crates/alpha/Cargo.toml");
+    assert_eq!(chosen.field, "`[package].version`");
+    assert_eq!(chosen.original, b"[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n");
+    assert_eq!(chosen.edited, b"[package]\nname = \"alpha\"\nversion = \"0.1.0-plugin-check\"\n");
+}
+
+#[test]
+fn the_chooser_finds_nothing_when_only_unsupported_watch_files_exist() {
+    let dir = write_tree(&[("setup.cfg", "[metadata]\nversion = 0.1.0\n"), ("setup.py", "setup()\n")]);
+    let manifest = watching(&["pyproject.toml", "setup.cfg", "setup.py"]);
+    assert!(choose_version_bump(&manifest, dir.path()).is_none());
+}
