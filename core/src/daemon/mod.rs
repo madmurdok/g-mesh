@@ -794,8 +794,6 @@ fn record_serving_owner(state_dir: &Path) {
     write_pid_file(&serving_owner_path_in(state_dir), std::process::id());
 }
 
-/// Removes the record, so a fresh holder does not inherit its predecessor's
-/// claim. Called under the lock, which keeps "only the holder writes this" true.
 /// Removes the rebuild marker a crashed `g-mesh reindex`/`init` left behind.
 /// Only a normal daemon calls this, after taking the singleton lock; never
 /// `acquire_singleton_lock` itself, which the rebuild also goes through.
@@ -808,6 +806,8 @@ fn clear_stale_rebuild_marker(state_dir: &Path) {
     }
 }
 
+/// Removes the record, so a fresh holder does not inherit its predecessor's
+/// claim. Called under the lock, which keeps "only the holder writes this" true.
 fn clear_serving_owner(state_dir: &Path) {
     let path = serving_owner_path_in(state_dir);
     match fs::remove_file(&path) {
