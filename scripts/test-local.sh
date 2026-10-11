@@ -3,20 +3,23 @@
 # them. Why and what it trades: docs/adr/0031-local-test-runs.md.
 #
 #   scripts/test-local.sh [--base <ref> | --paths-from <file>] [--per-process] [--keep-going] [--dry-run]
-#   scripts/test-local.sh --full
+#   scripts/test-local.sh --full [--dry-run]
 #
-# Without --full, in two parts:
-#   1. lib: the selected core lib tests, in one libtest process
-#      (`cargo test --workspace --lib -- --exact <names>`), names from
-#      `cargo nextest list --profile local`. Skipped with --per-process.
-#   2. nextest: every other selected test, one `cargo nextest run --profile
-#      local` (integration tests, binaries, ISOLATED, plugin/sdk/wire sections).
-# Both parts set G_MESH_CONTAINERS_SEEDS=2. --dry-run lists what each part
-# would run and runs no test.
+# In two parts:
+#   1. lib: the selected lib tests, one libtest process per crate
+#      (`cargo test -p <crate> --lib -- --exact <names>`), names from
+#      `cargo nextest list`. Skipped with --per-process.
+#   2. nextest: every other selected test, one `cargo nextest run`
+#      (integration tests, binaries, ISOLATED).
+# Without --full: the sections scripts/test-select.sh picks, profile `local`
+# (its heavy tests skipped), G_MESH_CONTAINERS_SEEDS=2. --dry-run lists what
+# each part would run and runs no test.
 #
-# --full is the batch-end run: `scripts/test-sections.sh run --profile ci
-# --keep-going all` (every section, heavy tests included, every seed), then
-# scripts/test-heavy-report.py against the `local` profile's heavy list.
+# --full is the batch-end run: every section under profile `ci` (heavy tests
+# included, every seed), --keep-going forced. The heavy lib tests stay in
+# part 2, so that its JUnit times every heavy test; then
+# scripts/test-heavy-report.py checks that JUnit against the `local`
+# profile's heavy list. Lib tests in part 1 have no per-test time.
 #
 # Invariants:
 # - Sections and their filtersets come from scripts/test-sections.sh, the
@@ -37,8 +40,9 @@ cd "$(dirname "$0")/.."
 # the load that breaks it, so it stays in the `daemon-spawning` group.
 ISOLATED='test(=daemon::registry::tests::two_languages_spawn_at_the_same_time_rather_than_one_after_the_other)'
 
-# The sections whose tests are (partly) the g-mesh lib.
-CORE_LIB_SECTIONS=" core-mcp core-daemon core-cli core-graph core-rest "
+# The sections whose tests are (partly) a lib: the g-mesh lib, and the
+# plugin, sdk and wire crates' libs.
+LIB_SECTIONS=" core-mcp core-daemon core-cli core-graph core-rest sdk plugin-typescript plugin-rust plugin-python wire "
 
 # Seconds the one-process lib run may take before it is killed: libtest has
 # no per-test timeout.
@@ -47,7 +51,7 @@ LIB_BUDGET_SECS="${G_MESH_LIB_BUDGET_SECS:-600}"
 usage() {
 	cat >&2 <<'EOF'
 usage: scripts/test-local.sh [--base <ref> | --paths-from <file>] [--per-process] [--keep-going] [--dry-run]
-       scripts/test-local.sh --full
+       scripts/test-local.sh --full [--dry-run]
 EOF
 }
 
@@ -98,25 +102,17 @@ done
 target_dir="${CARGO_TARGET_DIR:-target}"
 
 if [ "$full" -eq 1 ]; then
-	[ ${#select_args[@]} -eq 0 ] && [ "$per_process" -eq 0 ] && [ "$dry_run" -eq 0 ] ||
-		die "--full takes no other option"
-	junit_dir="$target_dir/nextest/ci"
-	rm -f "$junit_dir"/junit-*.xml
-	status=0
-	env -u G_MESH_CONTAINERS_SEEDS scripts/test-sections.sh run --profile ci --keep-going all || status=$?
-	shopt -s nullglob
-	junits=("$junit_dir"/junit-*.xml)
-	shopt -u nullglob
-	if [ ${#junits[@]} -gt 0 ]; then
-		"$(python_cmd)" scripts/test-heavy-report.py .config/nextest.toml "${junits[@]}" ||
-			echo "test-local: the heavy-list report failed" >&2
-	else
-		echo "test-local: no JUnit files in $junit_dir; no heavy-list report" >&2
-	fi
-	exit "$status"
+	[ ${#select_args[@]} -eq 0 ] && [ "$per_process" -eq 0 ] ||
+		die "--full takes no option but --dry-run"
+	profile=ci
+	keep_going=1
+	selection=full
+	unset G_MESH_CONTAINERS_SEEDS
+else
+	profile=local
+	selection="$(scripts/test-select.sh --narrow "${select_args[@]+"${select_args[@]}"}")"
+	export G_MESH_CONTAINERS_SEEDS=2
 fi
-
-selection="$(scripts/test-select.sh --narrow "${select_args[@]+"${select_args[@]}"}")"
 echo "== selected: $selection"
 if [ "$selection" = none ]; then
 	echo "== no sections selected"
@@ -129,6 +125,20 @@ else
 	sections=($selection)
 fi
 
+# The `local` profile's default-filter, on one line: `not (<heavy terms>)`.
+local_default_filter() {
+	local f
+	f="$(awk '
+		/^\[profile\.local\]/ { p = 1; next }
+		/^\[/ { p = 0 }
+		p && /^default-filter = """/ { d = 1; next }
+		d && /^"""/ { exit }
+		d
+	' .config/nextest.toml | tr -s ' \n' ' ')"
+	[ -n "$f" ] || die "no default-filter in [profile.local] of .config/nextest.toml"
+	echo "$f"
+}
+
 # Joins the filtersets of the given sections with `|`.
 union_of() {
 	local s out=""
@@ -140,39 +150,38 @@ union_of() {
 
 lib_sections=()
 for s in "${sections[@]}"; do
-	case "$CORE_LIB_SECTIONS" in *" $s "*) lib_sections+=("$s") ;; esac
+	case "$LIB_SECTIONS" in *" $s "*) lib_sections+=("$s") ;; esac
 done
 
 all_filter="$(union_of "${sections[@]}")"
 lib_filter=""
 if [ ${#lib_sections[@]} -gt 0 ] && [ "$per_process" -eq 0 ]; then
-	lib_filter="package(g-mesh) & kind(lib) & ($(union_of "${lib_sections[@]}")) & not ($ISOLATED)"
+	lib_filter="kind(lib) & ($(union_of "${lib_sections[@]}")) & not ($ISOLATED)"
+	# `ci` has no default-filter: --full keeps the heavy lib tests out of part
+	# 1 by the `local` one, so part 2 runs and times them. Without --full the
+	# `local` profile skips them in both parts already.
+	[ "$full" -eq 0 ] || lib_filter="$lib_filter & ($(local_default_filter))"
 	rest_filter="($all_filter) & not ($lib_filter)"
 else
 	rest_filter="$all_filter"
 fi
-
-export G_MESH_CONTAINERS_SEEDS=2
 
 if [ "$dry_run" -eq 0 ]; then
 	scripts/prune-stale-objects.sh
 	cargo nextest run --workspace --no-run
 fi
 
-# The tests matching $2 under the `local` profile, one `<binary id> <name>`
-# per line; with $1 set, only those of binary $1, name only.
+# The tests matching $1 under $profile, one `<package> <binary id> <name>`
+# per line, grouped by binary.
 listed() {
-	cargo nextest list --workspace --profile local --message-format json -E "$2" |
+	cargo nextest list --workspace --profile "$profile" --message-format json -E "$1" |
 		"$(python_cmd)" -c '
 import json, sys
-only = sys.argv[1]
 for suite in json.load(sys.stdin)["rust-suites"].values():
-    if only and suite["binary-id"] != only:
-        continue
     for name, case in suite["testcases"].items():
         if case["filter-match"]["status"] == "matches":
-            print(name if only else suite["binary-id"] + " " + name)
-' "$1"
+            print(suite["package-name"], suite["binary-id"], name)
+'
 }
 
 # Runs "$@" in its own process group, killed whole after $1 seconds.
@@ -209,23 +218,55 @@ summary=()
 if [ -n "$lib_filter" ]; then
 	# A substitution, not `< <(...)`: a failing listing must stop the script,
 	# never read as "no tests".
-	names_text="$(listed g-mesh "$lib_filter")"
-	names=()
-	while IFS= read -r name; do
-		[ -z "$name" ] || names+=("$name")
-	done <<<"$names_text"
+	listing="$(listed "$lib_filter")"
+	# One argument list for every crate: `--crate=<package>` then its names.
+	# The names are passed per crate because a name is unique only within its
+	# binary: another crate's test of the same name is not selected.
+	crate_args=() ntests=0 crates=() crate=""
+	while read -r pkg bin name; do
+		# A lib's binary id is its package name; any other binary is not libtest's.
+		[ -n "$name" ] && [ "$bin" = "$pkg" ] || continue
+		if [ "$pkg" != "$crate" ]; then
+			crate="$pkg"
+			crates+=("$pkg")
+			crate_args+=("--crate=$pkg")
+		fi
+		crate_args+=("$name")
+		ntests=$((ntests + 1))
+	done <<<"$listing"
 	if [ "$dry_run" -eq 1 ]; then
-		echo "== lib (one process): ${#names[@]} tests: -E $lib_filter"
-	elif [ ${#names[@]} -eq 0 ]; then
-		summary+=("== lib (one process): no tests")
+		echo "== lib (one process per crate): $ntests tests in ${crates[*]-no crate}: -E $lib_filter"
+		for crate in "${crates[@]+"${crates[@]}"}"; do
+			echo "   $crate: $(grep -c "^$crate $crate " <<<"$listing")"
+		done
+	elif [ "$ntests" -eq 0 ]; then
+		summary+=("== lib (one process per crate): no tests")
 	else
-		echo "== lib (one process): ${#names[@]} tests"
+		echo "== lib (one process per crate): $ntests tests in ${crates[*]}"
 		start=$SECONDS
 		status=0
+		# Every crate runs even after one fails; the status is the last failing
+		# crate's (libtest: 101).
 		# shellcheck disable=SC2016 # expanded by the inner bash
-		run_with_budget "$LIB_BUDGET_SECS" bash -c \
-			'log="$1"; shift; cargo test --workspace --lib -- --exact "$@" 2>&1 | tee "$log"; exit "${PIPESTATUS[0]}"' \
-			_ "$log_dir/lib.log" "${names[@]}" || status=$?
+		run_with_budget "$LIB_BUDGET_SECS" bash -c '
+			log="$1"
+			shift
+			: >"$log"
+			status=0
+			while [ $# -gt 0 ]; do
+				crate="${1#--crate=}"
+				shift
+				names=()
+				while [ $# -gt 0 ] && [ "${1#--crate=}" = "$1" ]; do
+					names+=("$1")
+					shift
+				done
+				cargo test -p "$crate" --lib -- --exact "${names[@]}" 2>&1 | tee -a "$log"
+				s="${PIPESTATUS[0]}"
+				[ "$s" -eq 0 ] || status="$s"
+			done
+			exit "$status"' \
+			_ "$log_dir/lib.log" "${crate_args[@]}" || status=$?
 		passed="$(sed -n 's/^test result: .* \([0-9]*\) passed; \([0-9]*\) failed.*/\1/p' "$log_dir/lib.log" | awk '{s+=$1} END {print s+0}')"
 		nfailed="$(sed -n 's/^test result: .* \([0-9]*\) passed; \([0-9]*\) failed.*/\2/p' "$log_dir/lib.log" | awk '{s+=$1} END {print s+0}')"
 		result=PASS
@@ -233,19 +274,21 @@ if [ -n "$lib_filter" ]; then
 			result=FAIL
 			failed=1
 		}
-		summary+=("== lib (one process): $result, $passed passed, $nfailed failed, $((SECONDS - start))s (log: $log_dir/lib.log)")
+		summary+=("== lib (one process per crate): $result, $passed passed, $nfailed failed, $((SECONDS - start))s (log: $log_dir/lib.log)")
 	fi
 fi
 
+junit="$target_dir/nextest/ci/junit.xml"
 if [ "$dry_run" -eq 1 ]; then
-	rest_text="$(listed "" "$rest_filter")"
+	rest_text="$(listed "$rest_filter")"
 	echo "== nextest: $(grep -c . <<<"$rest_text" || true) tests: -E $rest_filter"
 elif [ "$failed" -eq 1 ] && [ "$keep_going" -eq 0 ]; then
 	summary+=("== nextest: not run, the lib part failed (--keep-going runs it)")
 else
 	start=$SECONDS
 	status=0
-	cargo nextest run --workspace --profile local --no-tests=pass -E "$rest_filter" 2>&1 |
+	[ "$full" -eq 0 ] || rm -f "$junit"
+	cargo nextest run --workspace --profile "$profile" --no-tests=pass -E "$rest_filter" 2>&1 |
 		tee "$log_dir/nextest.log" || status=$?
 	result=PASS
 	[ "$status" -eq 0 ] || {
@@ -254,9 +297,19 @@ else
 	}
 	line="$(grep -E '^ *Summary \[' "$log_dir/nextest.log" | tail -n 1 | sed 's/^ *//' || true)"
 	summary+=("== nextest: $result, $((SECONDS - start))s: ${line:-no summary line} (log: $log_dir/nextest.log)")
+	if [ "$full" -eq 1 ]; then
+		if [ -f "$junit" ]; then
+			"$(python_cmd)" scripts/test-heavy-report.py .config/nextest.toml "$junit" ||
+				echo "test-local: the heavy-list report failed" >&2
+		else
+			echo "test-local: no $junit; no heavy-list report" >&2
+		fi
+	fi
 fi
 
-heavy="$(awk '/^\[profile\.local\]/ {p = 1; next} /^\[/ {p = 0} p' .config/nextest.toml | grep -c 'binary_id(' || true)"
-summary+=("== skipped locally: $heavy heavy tests (run: scripts/test-local.sh --full)")
-printf '%s\n' "${summary[@]}"
+if [ "$full" -eq 0 ]; then
+	heavy="$(awk '/^\[profile\.local\]/ {p = 1; next} /^\[/ {p = 0} p' .config/nextest.toml | grep -c 'binary_id(' || true)"
+	summary+=("== skipped locally: $heavy heavy tests (run: scripts/test-local.sh --full)")
+fi
+printf '%s\n' "${summary[@]+"${summary[@]}"}"
 exit "$failed"
