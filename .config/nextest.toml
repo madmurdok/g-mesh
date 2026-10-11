@@ -137,6 +137,9 @@ not (
     (binary_id(g-mesh::cli_status) & test(=status_does_not_show_a_dead_daemons_leftover_phase_and_progress_as_live)) |
     (binary_id(g-mesh::cli_status) & test(=status_warns_about_a_project_idle_past_the_threshold)) |
     (binary_id(g-mesh::cli_status) & test(=status_on_a_project_that_was_never_indexed_reports_an_empty_state)) |
+    (binary_id(g-mesh::cli_status) & test(=a_failed_plugin_discovery_is_reported_by_light_status_and_fatal_to_full)) |
+    (binary_id(g-mesh::cli_status) & test(=status_on_an_index_that_predates_language_outcomes_says_so)) |
+    (binary_id(g-mesh::one_plugin_binary_missing) & test(=status_reports_each_languages_outcome_in_light_and_full_json)) |
     (binary_id(g-mesh::plugin_build_staleness) & test(=a_plugin_rebuilt_under_a_running_daemon_costs_the_project_a_re_walk)) |
     (binary_id(g-mesh::plugin_build_staleness) & test(=a_rebuild_of_any_discovered_plugin_retires_the_daemon_not_only_typescripts)) |
     (binary_id(g-mesh::replay_progress) & test(=a_held_replay_with_a_token_gets_a_heartbeat_then_the_full_answer)) |
