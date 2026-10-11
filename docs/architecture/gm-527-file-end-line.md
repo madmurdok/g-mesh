@@ -3,6 +3,15 @@
 Status: design, revision 2 (GM-527/S5). It replaces revision 1, which
 recommended a reader-only fix. No production code is changed by this note.
 
+> **Superseded in part by GM-553.** The strict old-index clamp in
+> `read_span_within` described below was removed. `read_span_within` now
+> refuses any span with `start >= lines.len()` or `end >= lines.len()`, with
+> no `end_col` and no special case for `end_line == lines.len()`. Indexes from
+> older schemas are wiped and rebuilt (current schema version "14", see
+> `CURRENT_SCHEMA_VERSION` in `core/src/storage/schema.rs`), so the old-convention
+> rows the clamp guarded no longer arise. The sections on the clamp are kept as
+> design history.
+
 ## Decisions taken
 
 The owner chose:
@@ -170,7 +179,7 @@ listed sites.
   - `plugin_check/session.rs:672-676`, the "(lines, 0) … (8, 0)" bullet,
     which is already wrong for TS today.
 
-## The strict old-index reader in core
+## The strict old-index reader in core (removed by GM-553)
 
 `read_span_within` gains `end_col`. It accepts `end_line == lines.len()` only
 when all three hold:

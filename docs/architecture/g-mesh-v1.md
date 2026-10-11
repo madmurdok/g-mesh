@@ -1768,10 +1768,15 @@ semantic layer gets built:
   `get_dependencies`) — deliberately not the four symbol-anchored ones
   (`find_references`/`find_callers`/`find_callees`/`find_implementations`),
   which have no single file to check before resolving the query itself.
-  Proven by `core/tests/daemon_core.rs`
-  (`a_restart_against_an_already_indexed_project_does_not_walk_it_again`):
-  edit a file while the daemon is down, restart, query immediately — the
-  edit is now visible with no artificial delay.
+  Pinned by `core/tests/daemon_core.rs`
+  (`a_restart_against_an_already_indexed_project_does_not_walk_it_again`)
+  for the *added* file: add a file while the daemon is down, restart, query
+  it immediately — it is visible with no artificial delay, and an unqueried
+  sibling stays unindexed (no re-walk). The *edited-while-down* case is not
+  pinned by any restart test; its pieces are covered separately by
+  `core/tests/first_query_after_walk.rs`
+  (`a_file_edited_after_the_walk_is_still_reindexed`, daemon running) and
+  the `watcher/staleness.rs` unit tests (a stale hash is detected).
 
   A separate, still-open gap surfaced by the same investigation, distinct
   from staleness: `watcher::debounce::Debouncer` and `watcher::burst::
