@@ -117,3 +117,57 @@ fn a_package_json_version_bump_re_extracts_nothing() {
     assert_eq!(marked("mark_v2", &harness), Vec::<String>::new(), "no file was re-extracted");
     assert_eq!(marked("mark_v1", &harness).len(), FILES.len());
 }
+
+/// GM-546: the paths swap routed through a whole-language reindex instead of
+/// a re-extract. Only three files, all written once and never edited, so the
+/// importer's `File` node is unchanged across the two walks; its import edge
+/// still moves onto the new target, which existed already. Without
+/// `resolution_delta`, and with it but the answer above the threshold
+/// (`src/a.ts` is 1 of 3 files, more than 30%).
+///
+/// A whole reindex is told apart from a re-extract by `src/app/x.ts`,
+/// rewritten to `mark_v2` without being routed: only a walk reads it.
+///
+/// Control: revert `language_swap::plan_attached` to the pre-GM-546
+/// predicates (both `dropped` uses back to the target-only rule) ->
+/// `src/a.ts` still imports `src/app/x.ts`.
+#[test]
+fn a_whole_language_paths_reindex_moves_an_unchanged_importers_edge() {
+    // Each arm's imports, compared once both ran, so a control fails both.
+    let mut arms = Vec::new();
+    for resolution_delta in [false, true] {
+        let harness = Harness::with_manifest("typescript", |text| {
+            assert!(text.contains("resolution_delta = true"), "the shipped manifest's capability line moved");
+            let text = text.replace("semantic_pass = true", "semantic_pass = false");
+            if resolution_delta {
+                text
+            } else {
+                text.replace("resolution_delta = true", "resolution_delta = false")
+            }
+        });
+        harness.write("tsconfig.json", TSCONFIG);
+        harness.write("package.json", PACKAGE_JSON);
+        for (path, import) in &FILES[..3] {
+            harness.write(path, &source(import, "mark_v1"));
+        }
+        harness.route("tsconfig.json");
+        assert_eq!(harness.imports("src/a.ts").0, vec!["src/app/x.ts:x.ts".to_string()]);
+
+        harness.write("src/app/x.ts", &source("", "mark_v2"));
+        harness.write("tsconfig.json", &TSCONFIG.replace("src/app/*", "src/app2/*"));
+        harness.route("tsconfig.json");
+
+        assert_eq!(
+            marked("mark_v2", &harness),
+            vec!["src/app/x.ts".to_string()],
+            "resolution_delta {resolution_delta}: the language was reindexed whole"
+        );
+        arms.push((resolution_delta, harness.imports("src/a.ts")));
+    }
+    let moved = (vec!["src/app2/x.ts:x.ts".to_string()], Vec::new());
+    assert_eq!(
+        arms,
+        vec![(false, moved.clone()), (true, moved)],
+        "the unchanged importer resolves through the edited alias"
+    );
+}

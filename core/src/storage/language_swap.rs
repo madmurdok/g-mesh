@@ -17,9 +17,13 @@
 //! staging's, so the swap neither downgrades what a semantic pass wrote nor
 //! brings back a structural edge the pass retracted. Two exceptions: a live
 //! syntactic edge whose staged edge of the same id differs is replaced by
-//! it; and a live edge whose target does not exist after the swap is
-//! deleted, and the staged edges from that node of the same kind, which
-//! live lacks or holds only with a vanished target, are taken in its place.
+//! it; and a live edge that is dropped is deleted, and the staged edges
+//! from that node of the same kind, which live lacks or holds only with a
+//! vanished target, are taken in its place. A live edge is dropped when its
+//! target does not exist after the swap, or when it is syntactic and staging
+//! lacks its id: edge ids include the target, so the walk moved it to
+//! another, still existing target (GM-546). Any other edge staging lacks
+//! is kept by the target-only rule.
 //! Every other node, changed or new, gets exactly staging's outgoing edges;
 //! the semantic pass that runs after the swap refines them.
 //!
@@ -69,7 +73,8 @@ const CONTAINER_COLUMNS: &str = "nodeId, language, key, parentKey, memberCount";
 /// The plan tables, created in the staging file. `plan_text_changed` holds
 /// the upserted nodes whose embedded text differs from live's, whose live
 /// vector is therefore stale; `plan_unchanged_nodes` the nodes the
-/// unchanged-node rule (module doc) keeps live's outgoing edges for;
+/// unchanged-node rule (module doc) keeps live's outgoing edges for, except
+/// the dropped ones (a vanished target, or a syntactic edge staging lacks);
 /// `plan_pending_files` the files whose edges the swap leaves structural until
 /// the language's semantic pass refreshes them (ADR 0009); `plan_keep_nodes`
 /// the live placeholders staging lacks that the swap keeps (module doc).
@@ -263,9 +268,24 @@ fn plan_attached(
         )
     };
 
+    // Whether live edge `x` is dropped from an unchanged or a kept node: its
+    // target does not survive, or it is a syntactic edge of an unchanged node
+    // whose id staging lacks, so the walk retargeted it (ids include the
+    // target, GM-546). Staging has no rows for a kept placeholder, so it keeps
+    // the target-only rule; the two node sets are disjoint.
+    let dropped = |x: &str| {
+        format!(
+            "(NOT {target_survives}
+              OR ({x}.source = 'syntactic'
+                  AND {x}.fromId IN (SELECT id FROM plan_unchanged_nodes)
+                  AND {x}.id NOT IN (SELECT id FROM main.edges)))",
+            target_survives = survives(&format!("{x}.toId")),
+        )
+    };
+
     // Live edges of the language: either endpoint is one of its live nodes.
-    // One from an unchanged or a kept node goes only when its target does;
-    // any other goes when staging lacks its id.
+    // One from an unchanged or a kept node goes only when it is dropped; any
+    // other goes when staging lacks its id.
     let delete_edges = run(
         &format!(
             "INSERT INTO plan_delete_edges (id)
@@ -274,16 +294,16 @@ fn plan_attached(
                     OR e.toId IN (SELECT id FROM live.nodes WHERE language = ?1))
                AND CASE WHEN e.fromId IN (SELECT id FROM plan_unchanged_nodes)
                              OR e.fromId IN (SELECT id FROM plan_keep_nodes)
-                        THEN NOT {target_survives}
+                        THEN {e_dropped}
                         ELSE e.id NOT IN (SELECT id FROM main.edges) END",
-            target_survives = survives("e.toId"),
+            e_dropped = dropped("e"),
         ),
         "the edges to delete",
     )?;
     // Staged edges that differ from live. One from an unchanged node is taken
-    // over a live syntactic edge of its own id, or in place of a live edge of
-    // the same kind whose target went away, and never over any other live
-    // edge of its own id that is kept.
+    // over a live syntactic edge of its own id, or in place of a dropped live
+    // edge of the same kind, and never over any other live edge of its own id
+    // that is kept.
     let upsert_edges = run(
         &format!(
             "INSERT INTO plan_upsert_edges (id) SELECT s.id FROM (
@@ -292,10 +312,10 @@ fn plan_attached(
              WHERE s.fromId NOT IN (SELECT id FROM plan_unchanged_nodes)
                 OR EXISTS (SELECT 1 FROM live.edges t WHERE t.id = s.id AND t.source = 'syntactic')
                 OR (EXISTS (SELECT 1 FROM live.edges d
-                            WHERE d.fromId = s.fromId AND d.kind = s.kind AND NOT {dropped_survives})
+                            WHERE d.fromId = s.fromId AND d.kind = s.kind AND {d_dropped})
                     AND NOT EXISTS (SELECT 1 FROM live.edges l
                                     WHERE l.id = s.id AND {kept_survives}))",
-            dropped_survives = survives("d.toId"),
+            d_dropped = dropped("d"),
             kept_survives = survives("l.toId"),
         ),
         "the edges to upsert",
@@ -1205,5 +1225,74 @@ mod tests {
         let (_dir, live) = swap_imports_and_facts(None);
         assert_eq!(schema::resolution_facts(&live, "rust").unwrap(), None);
         assert_eq!(schema::resolution_facts(&live, "go").unwrap().as_deref(), Some("go facts"));
+    }
+
+    /// GM-546: live holds `a.rs -> app.rs`; staging re-walks `rust` with the
+    /// same three `File` nodes, unchanged, and that import moved to
+    /// `app2.rs`, which existed already (a resolution config change). Edge
+    /// ids include the target, so the two edges have different ids and
+    /// `app.rs` survives. Swaps and returns live.
+    fn swap_a_retargeted_import() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let live_path = dir.path().join("index.db");
+        let staging_path = dir.path().join("staging-rust.db");
+        let import =
+            |id: &str, to: &str| EdgeRecord::new(id, "file-a.rs", to, "IMPORTS", "tree-sitter", true);
+        let nodes = || vec![file_node("a.rs"), file_node("app.rs"), file_node("app2.rs")];
+
+        let mut live = open_staging(&live_path).unwrap();
+        live.execute(
+            "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, 'x', 'x', 'x')",
+            [],
+        )
+        .unwrap();
+        apply_diff(
+            &mut live,
+            &Diff {
+                upsert_nodes: nodes(),
+                upsert_edges: vec![import("a->app", "file-app.rs")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut staging = open_staging(&staging_path).unwrap();
+        apply_diff(
+            &mut staging,
+            &Diff {
+                upsert_nodes: nodes(),
+                upsert_edges: vec![import("a->app2", "file-app2.rs")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+        drop(staging);
+        swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
+        (dir, live)
+    }
+
+    /// An unchanged node's syntactic edge the walk moved to another, still
+    /// existing target is deleted: its id is not in staging.
+    ///
+    /// Control: in `plan_delete_edges` use `NOT {target_survives}` again
+    /// instead of the `dropped` closure (the old edge stays).
+    #[test]
+    fn a_retargeted_syntactic_edge_of_an_unchanged_node_is_deleted() {
+        let (_dir, live) = swap_a_retargeted_import();
+        assert_eq!(column(&live, "SELECT id FROM edges WHERE toId = 'file-app.rs'"), Vec::<String>::new());
+    }
+
+    /// The staged edge that took its place is taken.
+    ///
+    /// Control: revert the `d` predicate of `plan_upsert_edges` to
+    /// `NOT {dropped_survives}` (`a.rs` has no import left).
+    #[test]
+    fn the_retargeted_edge_of_an_unchanged_node_is_taken_from_staging() {
+        let (_dir, live) = swap_a_retargeted_import();
+        assert_eq!(
+            column(&live, "SELECT id || ' ' || source FROM edges WHERE toId = 'file-app2.rs'"),
+            vec!["a->app2 syntactic"]
+        );
     }
 }

@@ -501,3 +501,56 @@ fn a_shim_started_while_the_project_is_held_for_a_rebuild_exits_naming_it() {
     assert!(!project.pid_file().exists(), "no daemon was bootstrapped");
     drop(held);
 }
+
+/// GM-554: a rebuild killed with `kill -9` leaves its marker behind. Once a
+/// normal daemon holds the project and the marker's pid belongs to some
+/// unrelated live process (here, this test process), the marker must not
+/// read as a rebuild, or every shim is turned away as "being reindexed".
+///
+/// Control: remove the `clear_stale_rebuild_marker(&dir)` call from
+/// `daemon::run`: the marker survives and reads as a rebuild, and the shim
+/// exits naming it.
+#[test]
+fn a_crashed_rebuilds_marker_naming_a_live_pid_does_not_turn_shims_away_once_a_daemon_serves() {
+    let project = Project::new();
+    let state = g_mesh::storage::connection::ensure_project_dir(project.root()).unwrap();
+    let marker = daemon::rebuild_marker_path_in(&state);
+    let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    std::fs::write(&marker, format!("{}\n{started}\nreindex\n", std::process::id())).unwrap();
+
+    let mut daemon_process = Command::new(BIN)
+        .lifeline()
+        .arg("daemon")
+        .arg("--project-root")
+        .arg(project.root())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the daemon");
+    // Serving is published after the daemon took the lock and cleared the marker.
+    wait_for("the daemon to serve", || {
+        daemon::inspect_daemon_lock(project.root()).unwrap() == daemon::DaemonLock::Serving
+    });
+
+    assert_eq!(daemon::rebuild_in_progress(project.root()).unwrap(), None);
+    assert!(!marker.exists(), "the crashed rebuild's marker is removed");
+
+    let shim = Command::new(BIN)
+        .lifeline()
+        .arg("mcp-shim")
+        .current_dir(project.root())
+        .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
+        .env(BOOTSTRAP_TIMEOUT_ENV, "2000")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the shim");
+    let stderr = String::from_utf8_lossy(&shim.stderr);
+    assert!(!stderr.contains("is being reindexed"), "{stderr}");
+    // Still the same daemon: the lock was held throughout the checks above.
+    assert_eq!(daemon::inspect_daemon_lock(project.root()).unwrap(), daemon::DaemonLock::Serving);
+
+    drop(project);
+    let _ = daemon_process.kill();
+    let _ = daemon_process.wait();
+}
