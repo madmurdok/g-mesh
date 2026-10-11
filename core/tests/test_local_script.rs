@@ -1,6 +1,7 @@
-//! `scripts/test-local.sh` runs the selected sections in two parts (core lib
-//! tests in one libtest process, the rest under nextest's `local` profile),
-//! and `--full` runs every section under the `ci` profile, then
+//! `scripts/test-local.sh` runs the selected sections in two parts (lib tests
+//! in one libtest process per crate, the rest under nextest's `local`
+//! profile), and `--full` runs every section the same way under the `ci`
+//! profile, heavy tests in the nextest part, then
 //! `scripts/test-heavy-report.py`. Why: docs/adr/0031-local-test-runs.md.
 //!
 //! The script runs for real with a stand-in `cargo` on `PATH` that records
@@ -41,7 +42,8 @@ fn stdout_of(output: &Output) -> String {
 
 /// The stand-in `cargo`. Appends one JSON line per call to `$FAKE_CARGO_LOG`.
 /// `nextest list` prints a listing with two matching lib tests, one lib test
-/// the profile filtered out, and one integration test. `test` exits
+/// the profile filtered out, and one integration test; with
+/// `$FAKE_LIST_SDK` set, also an sdk lib test named like a g-mesh one. `test` exits
 /// `$FAKE_CARGO_TEST_EXIT` (default 0). A `nextest run --profile ci` leaves a
 /// JUnit file where nextest would.
 const FAKE_CARGO: &str = r#"#!/usr/bin/env python3
@@ -51,16 +53,25 @@ with open(os.environ["FAKE_CARGO_LOG"], "a") as log:
     log.write(json.dumps({"args": args, "seeds": os.environ.get("G_MESH_CONTAINERS_SEEDS")}) + "\n")
 if args[:2] == ["nextest", "list"]:
     matches = {"filter-match": {"status": "matches"}}
-    print(json.dumps({"rust-suites": {
-        "g-mesh": {"binary-id": "g-mesh", "testcases": {
+    suites = {
+        "g-mesh": {"package-name": "g-mesh", "binary-id": "g-mesh", "testcases": {
             "cli::a": matches,
             "cli::b": matches,
             "cli::heavy": {"filter-match": {"status": "mismatch", "reason": "default-filter"}},
         }},
-        "g-mesh::cli_init": {"binary-id": "g-mesh::cli_init", "testcases": {"c": matches}},
-    }}))
+        "g-mesh::cli_init": {"package-name": "g-mesh", "binary-id": "g-mesh::cli_init",
+                             "testcases": {"c": matches}},
+    }
+    if os.environ.get("FAKE_LIST_SDK"):
+        suites["g-mesh-plugin-sdk"] = {"package-name": "g-mesh-plugin-sdk",
+                                       "binary-id": "g-mesh-plugin-sdk",
+                                       "testcases": {"cli::a": matches}}
+    print(json.dumps({"rust-suites": suites}))
 elif args[:1] == ["test"]:
     code = int(os.environ.get("FAKE_CARGO_TEST_EXIT", "0"))
+    if os.environ.get("FAKE_CARGO_TEST_FAIL_CRATE"):
+        crate = args[args.index("-p") + 1]
+        code = 101 if crate == os.environ["FAKE_CARGO_TEST_FAIL_CRATE"] else 0
     if code == 0:
         print("test result: ok. 2 passed; 0 failed; 0 ignored")
     else:
@@ -117,6 +128,8 @@ fn run_local(args: &[&str], extra_env: &[(&str, &str)]) -> (Output, Vec<Call>) {
         .env("FAKE_CARGO_LOG", &log)
         .env_remove("G_MESH_CONTAINERS_SEEDS")
         .env_remove("FAKE_CARGO_TEST_EXIT")
+        .env_remove("FAKE_CARGO_TEST_FAIL_CRATE")
+        .env_remove("FAKE_LIST_SDK")
         .env_remove("GITHUB_STEP_SUMMARY");
     for (key, value) in extra_env {
         cmd.env(key, value);
@@ -209,16 +222,13 @@ fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest()
     let lib_filter = lists[0].value_of("-E");
     let tests = calls_of(&calls, &["test"]);
     assert_eq!(tests.len(), 1);
-    assert_eq!(tests[0].args, ["test", "--workspace", "--lib", "--", "--exact", "cli::a", "cli::b"]);
+    assert_eq!(tests[0].args, ["test", "-p", "g-mesh", "--lib", "--", "--exact", "cli::a", "cli::b"]);
     assert_eq!(tests[0].seeds.as_deref(), Some("2"));
 
     // The lib filter is the core-cli section's lib tests; nextest runs the
     // union of the selected sections minus exactly that filter.
     assert!(
-        lib_filter.starts_with(&format!(
-            "package(g-mesh) & kind(lib) & (({})) & not (",
-            section_filter("core-cli")
-        )),
+        lib_filter.starts_with(&format!("kind(lib) & (({})) & not (", section_filter("core-cli"))),
         "{lib_filter}"
     );
     let union = format!("({}) | ({})", section_filter("core-it"), section_filter("core-cli"));
@@ -229,8 +239,29 @@ fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest()
     assert_eq!(runs[0].seeds.as_deref(), Some("2"));
 
     let stdout = stdout_of(&output);
-    assert!(stdout.contains("== lib (one process): PASS, 2 passed, 0 failed"), "{}", describe(&output));
+    assert!(
+        stdout.contains("== lib (one process per crate): PASS, 2 passed, 0 failed"),
+        "{}",
+        describe(&output)
+    );
     assert!(stdout.contains("== nextest: PASS"), "{}", describe(&output));
+}
+
+/// A name is unique only within its binary: each crate's lib runs in its own
+/// `cargo test -p`, with only that crate's names.
+#[test]
+fn each_crate_runs_its_own_names_in_its_own_process() {
+    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let (output, calls) = run_local(&["--paths-from", &file], &[("FAKE_LIST_SDK", "1")]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let tests: Vec<_> = calls_of(&calls, &["test"]).into_iter().map(|c| c.args.clone()).collect();
+    assert_eq!(
+        tests,
+        [
+            vec!["test", "-p", "g-mesh", "--lib", "--", "--exact", "cli::a", "cli::b"],
+            vec!["test", "-p", "g-mesh-plugin-sdk", "--lib", "--", "--exact", "cli::a"],
+        ]
+    );
 }
 
 #[test]
@@ -261,31 +292,71 @@ fn a_failing_lib_part_fails_the_run_and_skips_nextest_unless_keep_going() {
     assert_ne!(output.status.code(), Some(0), "{}", describe(&output));
     assert_eq!(calls_of(&calls, &["test"]).len(), 1);
     assert!(test_runs(&calls).is_empty(), "nextest ran after a failed lib part");
-    assert!(stdout_of(&output).contains("== lib (one process): FAIL"), "{}", describe(&output));
+    assert!(stdout_of(&output).contains("== lib (one process per crate): FAIL"), "{}", describe(&output));
 
     let (output, calls) = run_local(&["--keep-going", "--paths-from", &file], &failing);
     assert_ne!(output.status.code(), Some(0), "{}", describe(&output));
     assert_eq!(test_runs(&calls).len(), 1, "--keep-going did not run nextest");
 }
 
+/// A failing crate does not stop part 1: the next crate's lib tests still
+/// run, with or without `--keep-going`, and the run exits 1.
 #[test]
-fn full_runs_every_section_under_the_ci_profile_with_every_seed_then_the_report() {
+fn a_failing_crate_does_not_stop_the_next_crates_lib_tests() {
+    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let env = [("FAKE_LIST_SDK", "1"), ("FAKE_CARGO_TEST_FAIL_CRATE", "g-mesh")];
+    for mode in [&["--paths-from", file.as_str()][..], &["--keep-going", "--paths-from", file.as_str()][..]] {
+        let (output, calls) = run_local(mode, &env);
+        assert_eq!(output.status.code(), Some(1), "{mode:?}: {}", describe(&output));
+        let crates: Vec<_> = calls_of(&calls, &["test"]).into_iter().map(|c| c.value_of("-p")).collect();
+        assert_eq!(crates, ["g-mesh", "g-mesh-plugin-sdk"], "{mode:?}: {}", describe(&output));
+        assert!(
+            stdout_of(&output).contains("== lib (one process per crate): FAIL"),
+            "{mode:?}: {}",
+            describe(&output)
+        );
+    }
+}
+
+/// `--full`: both parts under `ci`, every seed; the lib part leaves out
+/// ISOLATED and the `local` profile's heavy terms, so the one nextest run
+/// times the heavy lib tests in the JUnit the report reads.
+#[test]
+fn full_runs_every_section_in_two_parts_under_the_ci_profile_with_every_seed_then_the_report() {
     let (output, calls) = run_local(&["--full"], &[("G_MESH_CONTAINERS_SEEDS", "2")]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let lists = calls_of(&calls, &["nextest", "list"]);
+    assert_eq!(lists.len(), 1, "{:?}", calls.iter().map(|c| &c.args).collect::<Vec<_>>());
+    assert_eq!(lists[0].value_of("--profile"), "ci");
+    let lib_filter = lists[0].value_of("-E");
+    assert!(lib_filter.contains("two_languages_spawn_at_the_same_time"), "{lib_filter}");
+    assert!(
+        lib_filter.contains("& (not ( (binary_id(g-mesh) & test(=mcp::response_bound_tests::"),
+        "{lib_filter}"
+    );
+    let tests = calls_of(&calls, &["test"]);
+    assert_eq!(tests.len(), 1);
+    assert_eq!(tests[0].seeds, None, "G_MESH_CONTAINERS_SEEDS reached the lib part");
     let runs = test_runs(&calls);
-    assert_eq!(runs.len(), 11, "{:?}", calls.iter().map(|c| &c.args).collect::<Vec<_>>());
-    for run in &runs {
-        assert_eq!(run.value_of("--profile"), "ci", "{:?}", run.args);
-        assert_eq!(run.seeds, None, "G_MESH_CONTAINERS_SEEDS reached a full run: {:?}", run.args);
-    }
-    assert!(calls_of(&calls, &["test"]).is_empty());
+    assert_eq!(runs.len(), 1, "{:?}", calls.iter().map(|c| &c.args).collect::<Vec<_>>());
+    assert_eq!(runs[0].value_of("--profile"), "ci", "{:?}", runs[0].args);
+    assert_eq!(runs[0].seeds, None, "G_MESH_CONTAINERS_SEEDS reached a full run: {:?}", runs[0].args);
+    assert!(runs[0].value_of("-E").ends_with(&format!(" & not ({lib_filter})")), "{:?}", runs[0].args);
     assert!(stdout_of(&output).contains("== heavy list: "), "{}", describe(&output));
+}
+
+/// A failing lib part does not stop `--full`: it always runs part 2.
+#[test]
+fn full_runs_nextest_after_a_failing_lib_part() {
+    let (output, calls) = run_local(&["--full"], &[("FAKE_CARGO_TEST_EXIT", "101")]);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert_eq!(test_runs(&calls).len(), 1, "{}", describe(&output));
 }
 
 #[test]
 fn full_takes_no_other_option() {
     let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
-    for extra in [vec!["--per-process"], vec!["--dry-run"], vec!["--paths-from", file.as_str()]] {
+    for extra in [vec!["--per-process"], vec!["--paths-from", file.as_str()]] {
         let mut args = vec!["--full"];
         args.extend(&extra);
         let (output, calls) = run_local(&args, &[]);

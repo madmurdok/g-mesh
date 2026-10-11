@@ -25,11 +25,12 @@ CI must keep running everything exactly as before.
 - **One local entry point, `scripts/test-local.sh`.** A verify slice runs
   `scripts/test-local.sh --base <release-branch>`; the batch-end slice runs
   `scripts/test-local.sh --full`. CI does not call it.
-- **The selected g-mesh lib tests run in one libtest process**
-  (`cargo test --workspace --lib -- --exact <names>`). The names come from
-  `cargo nextest list --profile local`, so section membership, the heavy
-  exclusion and the isolation list each have one definition. `--workspace`
-  reuses the `cargo nextest run --workspace --no-run` build. The run has a
+- **The selected lib tests run in one libtest process per crate**
+  (`cargo test -p <crate> --lib -- --exact <names>`; g-mesh, the plugin, sdk
+  and wire crates, GM-556). The names come from `cargo nextest list`, so
+  section membership, the heavy exclusion and the isolation list each have
+  one definition. They are passed per crate because a test name is unique
+  only within its binary (plugin-python and plugin-rust share 14). The run has a
   total budget (600s, `G_MESH_LIB_BUDGET_SECS`), because libtest has no
   per-test timeout; `--per-process` sends the lib back to nextest to find a
   hung test. Everything else runs in one `cargo nextest run --profile local`
@@ -45,9 +46,13 @@ CI must keep running everything exactly as before.
   `default-filter` excludes one exact `(binary_id, name)` term per heavy test.
   `default` and `ci` are untouched, so CI, the release gate and
   `test-sections.sh check` run and count them as before. The list is static
-  and reviewable in git. `--full` runs `test-sections.sh run --profile ci
-  --keep-going all` (every section, every heavy test, JUnit written) and then
-  `scripts/test-heavy-report.py`, which reports listed tests now under 10s,
+  and reviewable in git. `--full` runs the same two parts over every section
+  under `ci` with `--keep-going` (GM-556; before, `test-sections.sh run
+  --profile ci --keep-going all`): the lib part leaves out the `local`
+  heavy terms, so the one nextest run executes every heavy test and writes
+  the JUnit, and then `scripts/test-heavy-report.py` reads it. Lib tests run
+  in libtest have no per-test time, so a non-heavy lib test crossing 10s goes
+  unreported. The report names listed tests now under 10s,
   unlisted tests at 10s or more, and listed tests the run did not contain
   (renamed or deleted). The report is a finding for the batch, not a failure.
 - **The two random-sequence tests run reduced locally, not skipped** (Q3).

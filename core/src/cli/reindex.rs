@@ -326,7 +326,9 @@ mod tests {
     /// under the command named; dropping it removes the marker.
     ///
     /// Control: skip `acquire_singleton_lock` in `stop_for_rebuild`: the
-    /// marker reads as no rebuild.
+    /// marker reads as no rebuild. GM-554 control: move the daemon's
+    /// `clear_stale_rebuild_marker` call into `acquire_singleton_lock`: the
+    /// rebuild's own marker is removed and the hold reads as no rebuild.
     #[test]
     fn a_held_project_reads_as_rebuilding_until_the_hold_drops() {
         let project = tempfile::tempdir().unwrap();

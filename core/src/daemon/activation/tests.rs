@@ -258,7 +258,7 @@ fn a_language_that_failed_the_walk_is_retried_and_indexed_on_the_next_start() {
 /// Controls: in `schema::languages_owed_a_retry` drop the `< MAX_LANGUAGE_RETRIES`
 /// filter (beta is walked on every start: 5); drop the
 /// `record_language_retry_failed` call in `retry_failed_languages` (the
-/// error still names exit status 1).
+/// error still names exit 1).
 #[test]
 fn a_language_that_always_fails_is_walked_at_most_three_times() {
     let fixture = Fixture::new();
@@ -283,10 +283,29 @@ fn a_language_that_always_fails_is_walked_at_most_three_times() {
     assert_eq!(retries(&conn), BTreeMap::from([("beta".to_string(), schema::MAX_LANGUAGE_RETRIES)]));
     match outcome(&conn, "beta") {
         Some(LanguageOutcome::Failed { error }) => {
-            assert!(error.contains("exit status: 2"), "the latest retry's cause: {error}")
+            assert!(error.contains(&exit_status_wording(2)), "the latest retry's cause: {error}")
         }
         other => panic!("beta must still be failed: {other:?}"),
     }
+}
+
+/// How this platform's `ExitStatus` displays a process that exited with
+/// `code` ("exit status: 2" on Unix, "exit code: 2" on Windows), built from a
+/// real `ExitStatus` so an assertion on it holds on every platform.
+fn exit_status_wording(code: i32) -> String {
+    #[cfg(unix)]
+    let status = {
+        use std::os::unix::process::ExitStatusExt;
+        // A wait status carries a normal exit's code in its second byte.
+        std::process::ExitStatus::from_raw(code << 8)
+    };
+    #[cfg(windows)]
+    let status = {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code as u32)
+    };
+    assert_eq!(status.code(), Some(code), "the built status must carry the code");
+    status.to_string()
 }
 
 /// A retry is counted before its walk: while the retry's walk is in flight
