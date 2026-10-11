@@ -301,22 +301,43 @@ fn drain_startup_noise(
     }
 }
 
-/// Pumps `watch_and_route_once` for a bounded window comfortably longer
-/// than [`DEBOUNCE_WINDOW`] - long enough to both drain whatever raw
-/// events a preceding burst queued and let their debounce window elapse
-/// and fire, without looping forever the way `run`'s real watcher thread
-/// does.
-fn pump_until_settled(
+/// How long [`pump_until_round_trips`] waits for the expected round trips
+/// before giving up. Far beyond what an idle machine needs (one watcher
+/// event, one [`DEBOUNCE_WINDOW`], one plugin spawn and call): it only
+/// bounds a failing run, and a passing one returns as soon as the trips are
+/// seen. Under heavy load (GM-555: load 360-745) the old fixed three-window
+/// pump ended before the plugin had answered.
+const ROUND_TRIP_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Pumps `watch_and_route_once` until the plugin has logged at least
+/// `expected` `fileChanged` round trips or [`ROUND_TRIP_DEADLINE`] passes,
+/// then keeps pumping for a settle period of `DEBOUNCE_WINDOW * 3`, and
+/// returns every round trip logged by then.
+///
+/// The settle period is what lets a caller assert *exactly* `expected`:
+/// any path still in the debouncer when the last expected trip was seen
+/// becomes ready within one [`DEBOUNCE_WINDOW`], so an extra trip that
+/// coalescing should have absorbed fires, and is logged, inside it.
+fn pump_until_round_trips(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
     root: &Path,
     conn: &IndexStore,
     registry: &PluginRegistry,
-) {
-    let deadline = std::time::Instant::now() + DEBOUNCE_WINDOW * 3;
-    while std::time::Instant::now() < deadline {
+    plugin_dir: &Path,
+    expected: usize,
+) -> Vec<String> {
+    let deadline = std::time::Instant::now() + ROUND_TRIP_DEADLINE;
+    while test_plugin::file_changed_requests(plugin_dir).len() < expected
+        && std::time::Instant::now() < deadline
+    {
         watch_and_route_once(watcher, debouncer, root, conn, registry);
     }
+    let settled = std::time::Instant::now() + DEBOUNCE_WINDOW * 3;
+    while std::time::Instant::now() < settled {
+        watch_and_route_once(watcher, debouncer, root, conn, registry);
+    }
+    test_plugin::file_changed_requests(plugin_dir)
 }
 
 /// The concrete acceptance bar for task 129: a burst of rapid saves to
@@ -355,10 +376,10 @@ fn a_burst_of_rapid_saves_to_the_same_file_costs_one_plugin_round_trip_not_one_p
         "a burst still in progress must not have reached the plugin yet"
     );
 
-    pump_until_settled(&watcher, &mut debouncer, &root, &conn, &registry);
+    let requested = pump_until_round_trips(&watcher, &mut debouncer, &root, &conn, &registry, plugin_dir, 1);
 
     assert_eq!(
-        test_plugin::file_changed_requests(plugin_dir).len(),
+        requested.len(),
         1,
         "a burst of 5 rapid saves to the same file must cost exactly one plugin round trip, not one per save"
     );
@@ -378,13 +399,9 @@ fn an_isolated_save_still_reaches_the_plugin_exactly_once() {
     drain_startup_noise(&watcher, &mut debouncer, &root, &conn, &registry);
 
     fs::write(root.join("a.python-src"), "v0").unwrap();
-    pump_until_settled(&watcher, &mut debouncer, &root, &conn, &registry);
+    let requested = pump_until_round_trips(&watcher, &mut debouncer, &root, &conn, &registry, plugin_dir, 1);
 
-    assert_eq!(
-        test_plugin::file_changed_requests(plugin_dir).len(),
-        1,
-        "a single isolated save must still reach the plugin, exactly once"
-    );
+    assert_eq!(requested.len(), 1, "a single isolated save must still reach the plugin, exactly once");
 }
 
 /// Debouncing coalesces repeats of the *same* path; it must not
@@ -405,9 +422,8 @@ fn two_different_files_in_the_same_burst_each_get_their_own_round_trip() {
     thread::sleep(Duration::from_millis(20));
     watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
     fs::write(root.join("b.python-src"), "b").unwrap();
-    pump_until_settled(&watcher, &mut debouncer, &root, &conn, &registry);
-
-    let mut requested = test_plugin::file_changed_requests(plugin_dir);
+    let mut requested =
+        pump_until_round_trips(&watcher, &mut debouncer, &root, &conn, &registry, plugin_dir, 2);
     requested.sort();
     assert_eq!(
         requested,
