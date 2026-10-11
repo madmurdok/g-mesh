@@ -296,6 +296,10 @@ pub fn run(root: &Path) -> Result<()> {
         Some(lock) => lock,
         None => return stand_down(root),
     };
+    // A daemon holding the lock means no rebuild holds it (a rebuild takes
+    // the same lock), so any marker left here is a crashed rebuild's: once
+    // its pid is reused it would read as live and turn every shim away.
+    clear_stale_rebuild_marker(&dir);
 
     // After the singleton lock, before the bind (never transiently missing).
     // Not fatal: a daemon that reads as outdated gets replaced.
@@ -792,6 +796,18 @@ fn record_serving_owner(state_dir: &Path) {
 
 /// Removes the record, so a fresh holder does not inherit its predecessor's
 /// claim. Called under the lock, which keeps "only the holder writes this" true.
+/// Removes the rebuild marker a crashed `g-mesh reindex`/`init` left behind.
+/// Only a normal daemon calls this, after taking the singleton lock; never
+/// `acquire_singleton_lock` itself, which the rebuild also goes through.
+fn clear_stale_rebuild_marker(state_dir: &Path) {
+    let path = rebuild_marker_path_in(state_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => crate::log_line!("g-mesh daemon: removed a stale rebuild marker {}", path.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => crate::log_line!("g-mesh daemon: failed to remove {}: {err}", path.display()),
+    }
+}
+
 fn clear_serving_owner(state_dir: &Path) {
     let path = serving_owner_path_in(state_dir);
     match fs::remove_file(&path) {
