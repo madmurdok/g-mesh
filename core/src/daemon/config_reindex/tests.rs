@@ -280,9 +280,29 @@ fn wire_import(from: usize, to: usize, specifier: &str) -> WireEdge {
 /// The walk: [`FILES`] files, none of them on disk; `f1` and `f2` import
 /// `f0` as `lib`, `f3` imports it as `./f0`; then the trailer, when `facts`.
 fn set_walk(project: &Path, facts: Option<&str>) {
+    set_walk_of(
+        project,
+        facts,
+        [wire_import(1, 0, "lib"), wire_import(2, 0, "lib"), wire_import(3, 0, "./f0")],
+    );
+}
+
+/// The walk of [`set_walk`] after a resolution config change moved `f2`'s
+/// `lib` import onto `f3`, a file that existed already, as a `paths` swap
+/// does: every file row is unchanged, and the edge's id, which includes the
+/// target, is new.
+fn set_moved_walk(project: &Path, facts: Option<&str>) {
+    set_walk_of(
+        project,
+        facts,
+        [wire_import(1, 0, "lib"), wire_import(2, 3, "lib"), wire_import(3, 0, "./f0")],
+    );
+}
+
+fn set_walk_of(project: &Path, facts: Option<&str>, imports: [WireEdge; 3]) {
     let mut lines: Vec<String> =
         (0..FILES).map(|i| serde_json::to_string(&wire_file(&src(i))).unwrap()).collect();
-    for edge in [wire_import(1, 0, "lib"), wire_import(2, 0, "lib"), wire_import(3, 0, "./f0")] {
+    for edge in imports {
         lines.push(serde_json::to_string(&edge).unwrap());
     }
     if let Some(facts) = facts {
@@ -555,6 +575,48 @@ fn an_affected_answer_above_the_threshold_reindexes_the_whole_language() {
     assert_eq!(fixture.facts().as_deref(), Some("facts-3"), "the walk's facts, not the answer's");
 }
 
+/// `f2`'s import as (importer, target, specifier), at v1 (onto `f0`) and
+/// after [`set_moved_walk`] (onto `f3`).
+fn f2_imports() -> [(String, String, Option<String>); 2] {
+    let edge = |to: usize| (format!("file:{}", src(2)), format!("file:{}", src(to)), Some("lib".to_string()));
+    [edge(0), edge(3)]
+}
+
+/// GM-546: a whole-language reindex after a resolution change moves an
+/// unchanged importer's edge onto its new, already existing target: `f2`'s
+/// file row is the same in both walks, so the swap keeps its live edges
+/// except the ones it drops. Without the capability, and with it but the
+/// answer above the threshold.
+///
+/// Control: revert `plan_attached` to the pre-GM-546 predicates (both
+/// `dropped` uses back to the target-only rule) -> `f2` still imports `f0`.
+#[test]
+fn a_whole_language_reindex_moves_an_unchanged_importers_edge() {
+    // Each arm's imports, compared once both ran, so a control fails both.
+    let mut arms = Vec::new();
+    let mut expected = Vec::new();
+    for capability in [false, true] {
+        let fixture = fixture(capability, false, Some("facts-1"));
+        let [v1_edge, moved_edge] = f2_imports();
+        let mut moved = alpha_imports(&fixture.conn);
+        assert!(moved.remove(&v1_edge), "the walk stored f2's v1 import: {moved:?}");
+        moved.insert(moved_edge);
+        expected.push((capability, moved));
+        set_moved_walk(fixture.project.path(), Some("facts-2"));
+        if capability {
+            // f1, f2, f8, f9: 4 of 10, above the threshold.
+            fixture.answer(&affected(&[&src(8), &src(9)], IMPORTS_OF_LIB, "facts-2"));
+        }
+
+        let seen = fixture.save_go_mod();
+
+        assert!(seen.whole_reindex, "capability {capability}: the language is reindexed whole");
+        assert!(re_extracted(&seen).is_empty(), "capability {capability}: {:?}", seen.requests);
+        arms.push((capability, alpha_imports(&fixture.conn)));
+    }
+    assert_eq!(arms, expected, "f2 imports f3 instead of f0, the other imports as they were");
+}
+
 /// For a semantic-pass plugin, the re-extracts are followed by exactly one
 /// `semanticPass`, after the last of them.
 ///
@@ -621,6 +683,8 @@ fn alpha_imports(conn: &IndexStore) -> BTreeSet<(String, String, Option<String>)
 /// Control: drop the `pending_reindex` check at the top of `selective` (the
 /// resume asks `resolutionChanged`, gets `unchanged`, re-extracts nothing,
 /// and the mark stays).
+/// Control (GM-546): revert `plan_attached` to the pre-GM-546 predicates
+/// (the v2 edge stays, the v1 edge is not taken).
 #[test]
 fn an_interrupted_selective_reindex_is_resumed_as_a_whole_language_reindex() {
     let fixture = fixture(true, false, Some("facts-1"));
@@ -669,8 +733,10 @@ fn an_interrupted_selective_reindex_is_resumed_as_a_whole_language_reindex() {
             .any(|line| line == "workspaceChanged go.mod"),
         "the language is reindexed whole"
     );
-    // Edge convergence (v2-only edge gone, v1 edge back) is GM-546.
     assert!(fixture.pending().is_empty(), "the swap clears the mark");
+    // GM-546: f2's file row is unchanged, yet its v2-only edge goes and its
+    // v1 edge is back: the edges are exactly the v1 walk's.
+    assert_eq!(alpha_imports(&fixture.conn), v1, "no v2-only edge remains and the v1 edges are restored");
     assert_eq!(fixture.facts().as_deref(), Some("facts-1"));
 }
 
