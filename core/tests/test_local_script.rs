@@ -69,6 +69,9 @@ if args[:2] == ["nextest", "list"]:
     print(json.dumps({"rust-suites": suites}))
 elif args[:1] == ["test"]:
     code = int(os.environ.get("FAKE_CARGO_TEST_EXIT", "0"))
+    if os.environ.get("FAKE_CARGO_TEST_FAIL_CRATE"):
+        crate = args[args.index("-p") + 1]
+        code = 101 if crate == os.environ["FAKE_CARGO_TEST_FAIL_CRATE"] else 0
     if code == 0:
         print("test result: ok. 2 passed; 0 failed; 0 ignored")
     else:
@@ -125,6 +128,7 @@ fn run_local(args: &[&str], extra_env: &[(&str, &str)]) -> (Output, Vec<Call>) {
         .env("FAKE_CARGO_LOG", &log)
         .env_remove("G_MESH_CONTAINERS_SEEDS")
         .env_remove("FAKE_CARGO_TEST_EXIT")
+        .env_remove("FAKE_CARGO_TEST_FAIL_CRATE")
         .env_remove("FAKE_LIST_SDK")
         .env_remove("GITHUB_STEP_SUMMARY");
     for (key, value) in extra_env {
@@ -224,10 +228,7 @@ fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest()
     // The lib filter is the core-cli section's lib tests; nextest runs the
     // union of the selected sections minus exactly that filter.
     assert!(
-        lib_filter.starts_with(&format!(
-            "kind(lib) & (({})) & not (",
-            section_filter("core-cli")
-        )),
+        lib_filter.starts_with(&format!("kind(lib) & (({})) & not (", section_filter("core-cli"))),
         "{lib_filter}"
     );
     let union = format!("({}) | ({})", section_filter("core-it"), section_filter("core-cli"));
@@ -238,7 +239,11 @@ fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest()
     assert_eq!(runs[0].seeds.as_deref(), Some("2"));
 
     let stdout = stdout_of(&output);
-    assert!(stdout.contains("== lib (one process per crate): PASS, 2 passed, 0 failed"), "{}", describe(&output));
+    assert!(
+        stdout.contains("== lib (one process per crate): PASS, 2 passed, 0 failed"),
+        "{}",
+        describe(&output)
+    );
     assert!(stdout.contains("== nextest: PASS"), "{}", describe(&output));
 }
 
@@ -292,6 +297,25 @@ fn a_failing_lib_part_fails_the_run_and_skips_nextest_unless_keep_going() {
     let (output, calls) = run_local(&["--keep-going", "--paths-from", &file], &failing);
     assert_ne!(output.status.code(), Some(0), "{}", describe(&output));
     assert_eq!(test_runs(&calls).len(), 1, "--keep-going did not run nextest");
+}
+
+/// A failing crate does not stop part 1: the next crate's lib tests still
+/// run, with or without `--keep-going`, and the run exits 1.
+#[test]
+fn a_failing_crate_does_not_stop_the_next_crates_lib_tests() {
+    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let env = [("FAKE_LIST_SDK", "1"), ("FAKE_CARGO_TEST_FAIL_CRATE", "g-mesh")];
+    for mode in [&["--paths-from", file.as_str()][..], &["--keep-going", "--paths-from", file.as_str()][..]] {
+        let (output, calls) = run_local(mode, &env);
+        assert_eq!(output.status.code(), Some(1), "{mode:?}: {}", describe(&output));
+        let crates: Vec<_> = calls_of(&calls, &["test"]).into_iter().map(|c| c.value_of("-p")).collect();
+        assert_eq!(crates, ["g-mesh", "g-mesh-plugin-sdk"], "{mode:?}: {}", describe(&output));
+        assert!(
+            stdout_of(&output).contains("== lib (one process per crate): FAIL"),
+            "{mode:?}: {}",
+            describe(&output)
+        );
+    }
 }
 
 /// `--full`: both parts under `ci`, every seed; the lib part leaves out
