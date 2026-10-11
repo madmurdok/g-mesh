@@ -117,3 +117,28 @@ Q4. Pid-keyed temp dirs: convert to `tempfile::tempdir()` now, or leave?
 Today 11 helpers name dirs `<prefix>-<pid>[-<tag>]` (8 tagged, 3 single-use); none collide.
 Change: in one process a future duplicate tag collides where nextest hid it. Fix is
 mechanical (11 helpers) but touches tests outside this task's scope.
+
+## Measurement (GM-556/S10): the lib share of `--full`, before and after
+
+Machine: macOS, otherwise idle except for an endpoint scanner; 2 runs per arm, alternated B, A, B, A,
+each under `/usr/bin/time -p`. Every run waited (up to 10 min) for the 1-min load to fall below 20
+first. Both trees were built and warm beforehand (main: `cargo clean`, deps 36,865 -> 15,354).
+
+- **B** (release-4.5.0 `d969781`): `cargo nextest run --workspace --profile ci -E 'kind(lib)'`, the
+  lib tests of the lib sections, 2431 tests.
+- **A1** (`134a60a`): part 1 of `test-local.sh --full`, stopped after part 1 (in-memory patch, as in
+  S9): prune, `nextest --no-run`, list, then one `cargo test --lib` per crate, 2422 tests.
+- **A9**: the 8 heavy lib tests and ISOLATED on nextest (`ci`), which `--full` runs in part 2.
+
+| arm | run | real s | user s | sys s | load 1/5/15 before | passed |
+|---|---|---:|---:|---:|---|---:|
+| B | 1 | 426.09 | 203.16 | 62.32 | 18.04 185.42 231.93 | 2431 |
+| B | 2 | 438.19 | 191.60 | 59.60 | 17.56 55.87 110.80 | 2431 |
+| A1 | 1 | 165.46 | 99.11 | 67.56 | 19.10 73.71 153.91 | 2422 (lib 94 s) |
+| A1 | 2 | 132.70 | 88.51 | 78.03 | 17.19 46.36 82.96 | 2422 (lib 61 s) |
+| A9 | 1 | 44.49 | 79.07 | 2.66 | 19.13 65.80 128.62 | 9 |
+| A9 | 2 | 28.29 | 73.20 | 2.27 | 18.57 39.30 73.56 | 9 |
+
+Median real: B 432 s; A1 149 s (2.9x less); A1 + A9 186 s (2.3x less), for the same 2431
+tests. B's real is about 170 s above user + sys: nextest's 2431 process starts wait, not
+compute. About 70 s of A1 is the prune, `--no-run` and list steps, not the tests.
