@@ -1848,6 +1848,41 @@ mod tests {
         );
     }
 
+    /// Test 12b (GM-546): an unchanged node's syntactic edge the walk moved
+    /// to another, still existing node, under a new id (ids include the
+    /// target), is replaced by the walk's, while the node's semantic edges of
+    /// the same kind, the one a pass upgraded in place included, stay as
+    /// live has them. No edge of the node was retracted: whether a retracted
+    /// one comes back in this case is not pinned (design note, 5.2).
+    ///
+    /// Control: drop `{x}.source = 'syntactic'` from the `dropped` closure in
+    /// `language_swap::plan_attached` -> `alpha-sem` is deleted.
+    #[test]
+    fn a_moved_syntactic_edge_is_replaced_and_its_semantic_siblings_stay() {
+        let mut first = three_nodes();
+        first.push(json(&wire_edge("alpha-old", "alpha-n1", "alpha-n2")));
+        let mut second = three_nodes();
+        second.push(json(&wire_edge("alpha-new", "alpha-n1", "alpha-n3")));
+        let (_project, _plugins, _scratch, registry, conn, supervisor) = after_a_pass(
+            &first,
+            vec![
+                semantic_edge("alpha-e1", "alpha-n1", "alpha-n3"),
+                semantic_edge("alpha-sem", "alpha-n1", "alpha-n2"),
+            ],
+            &[],
+            &second,
+        );
+
+        assert_eq!(
+            edges_at_swap(&registry, &supervisor, &conn),
+            vec![
+                edge_row("alpha-e1", "semantic", "alpha-n3"),
+                edge_row("alpha-new", "syntactic", "alpha-n3"),
+                edge_row("alpha-sem", "semantic", "alpha-n2"),
+            ]
+        );
+    }
+
     /// Indexes `three_nodes` for `alpha`, whose manifest declares
     /// `semantic_sweep` or not, adds a semantic edge no pass will re-send,
     /// then runs a complete whole-project pass (the fake plugin answers with

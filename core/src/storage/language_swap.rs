@@ -1226,4 +1226,73 @@ mod tests {
         assert_eq!(schema::resolution_facts(&live, "rust").unwrap(), None);
         assert_eq!(schema::resolution_facts(&live, "go").unwrap().as_deref(), Some("go facts"));
     }
+
+    /// GM-546: live holds `a.rs -> app.rs`; staging re-walks `rust` with the
+    /// same three `File` nodes, unchanged, and that import moved to
+    /// `app2.rs`, which existed already (a resolution config change). Edge
+    /// ids include the target, so the two edges have different ids and
+    /// `app.rs` survives. Swaps and returns live.
+    fn swap_a_retargeted_import() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let live_path = dir.path().join("index.db");
+        let staging_path = dir.path().join("staging-rust.db");
+        let import =
+            |id: &str, to: &str| EdgeRecord::new(id, "file-a.rs", to, "IMPORTS", "tree-sitter", true);
+        let nodes = || vec![file_node("a.rs"), file_node("app.rs"), file_node("app2.rs")];
+
+        let mut live = open_staging(&live_path).unwrap();
+        live.execute(
+            "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, 'x', 'x', 'x')",
+            [],
+        )
+        .unwrap();
+        apply_diff(
+            &mut live,
+            &Diff {
+                upsert_nodes: nodes(),
+                upsert_edges: vec![import("a->app", "file-app.rs")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut staging = open_staging(&staging_path).unwrap();
+        apply_diff(
+            &mut staging,
+            &Diff {
+                upsert_nodes: nodes(),
+                upsert_edges: vec![import("a->app2", "file-app2.rs")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
+        drop(staging);
+        swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
+        (dir, live)
+    }
+
+    /// An unchanged node's syntactic edge the walk moved to another, still
+    /// existing target is deleted: its id is not in staging.
+    ///
+    /// Control: in `plan_delete_edges` use `NOT {target_survives}` again
+    /// instead of the `dropped` closure (the old edge stays).
+    #[test]
+    fn a_retargeted_syntactic_edge_of_an_unchanged_node_is_deleted() {
+        let (_dir, live) = swap_a_retargeted_import();
+        assert_eq!(column(&live, "SELECT id FROM edges WHERE toId = 'file-app.rs'"), Vec::<String>::new());
+    }
+
+    /// The staged edge that took its place is taken.
+    ///
+    /// Control: revert the `d` predicate of `plan_upsert_edges` to
+    /// `NOT {dropped_survives}` (`a.rs` has no import left).
+    #[test]
+    fn the_retargeted_edge_of_an_unchanged_node_is_taken_from_staging() {
+        let (_dir, live) = swap_a_retargeted_import();
+        assert_eq!(
+            column(&live, "SELECT id || ' ' || source FROM edges WHERE toId = 'file-app2.rs'"),
+            vec!["a->app2 syntactic"]
+        );
+    }
 }
