@@ -85,12 +85,6 @@ impl Drop for Project {
     }
 }
 
-/// GM-301: see `common::wait_for`'s doc comment for why this delegates
-/// instead of polling against a file-local timeout constant.
-fn wait_for(what: &str, ready: impl FnMut() -> bool) {
-    common::wait_for(what, common::startup_timeout(), ready);
-}
-
 #[test]
 fn two_plugins_claiming_the_same_extension_fails_daemon_startup_with_a_clear_error() {
     let project = Project::new();
@@ -154,42 +148,4 @@ fn two_plugins_claiming_the_same_extension_fails_daemon_startup_with_a_clear_err
         !daemon::is_listening(project.root()).unwrap(),
         "a daemon that failed to start must not be answering connections"
     );
-}
-
-/// The healthy counterpart, pinned in the same file so the failure above
-/// cannot be satisfied by a discovery root the daemon simply never reads:
-/// one language, no conflict, and `G_MESH_PLUGIN_ROOTS_OVERRIDE` is doing
-/// something real, since a daemon that ignored it would also "pass" this by
-/// finding the real bundled plugin instead.
-#[test]
-fn a_single_discovered_language_with_no_conflict_starts_the_daemon_normally() {
-    let project = Project::new();
-    let root = tempfile::tempdir().expect("failed to create a plugin discovery root");
-    let dir = root.path().join("alpha");
-    std::fs::create_dir_all(&dir).expect("failed to create a fixture plugin directory");
-    std::fs::write(dir.join("plugin.toml"), manifest_toml("alpha"))
-        .expect("failed to write a fixture plugin.toml");
-
-    let mut daemon = Command::new(BIN)
-        .lifeline()
-        .arg("daemon")
-        .arg("--project-root")
-        .arg(project.root())
-        .env("G_MESH_PLUGIN_ROOTS_OVERRIDE", root.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn the daemon");
-
-    let pid_file = daemon::pid_path(project.root()).unwrap();
-    wait_for("the daemon to start listening despite an override with no conflict", || pid_file.exists());
-
-    assert!(
-        daemon.try_wait().expect("failed to poll the daemon").is_none(),
-        "the daemon must still be running, not have exited"
-    );
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
 }

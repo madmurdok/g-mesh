@@ -121,8 +121,24 @@ pub fn run() -> Result<()> {
         io::stdout().lock(),
         link(stream)?,
         canonical,
-        Box::new(move |root: &Path| link(connect_or_bootstrap(root, &origin)?)),
+        router::Daemons {
+            connect: Box::new(move |root: &Path| link(connect_or_bootstrap(root, &origin)?)),
+            rebuilding: Box::new(rebuilding),
+        },
     )
+}
+
+/// The CLI rebuild holding `root`'s index, if one is running (see
+/// `daemon::rebuild_in_progress`). A marker that cannot be read reads as
+/// none: the bootstrap that follows then behaves as it would without one.
+fn rebuilding(root: &Path) -> Option<router::Rebuilding> {
+    let rebuild = daemon::rebuild_in_progress(root).ok().flatten()?;
+    Some(router::Rebuilding {
+        root: root.to_path_buf(),
+        command: rebuild.command,
+        pid: rebuild.pid,
+        running: rebuild.started.elapsed().unwrap_or_default(),
+    })
 }
 
 /// Where the session's first root came from, for the cold-start line in
@@ -178,12 +194,19 @@ enum Incumbent {
 /// The client's whole cost here is that the first connection took a moment
 /// longer.
 ///
-/// The other party's session is not so lucky: a *different* client already
-/// connected to the retired daemon loses its connection and its shim exits,
-/// which its MCP client sees as the server going away. That is the deliberate
-/// trade - it happens once, at the moment a build changes, and the
-/// alternative is every session on the machine going on being answered by a
-/// build that has been replaced.
+/// A *different* client already connected to the retired daemon loses that
+/// connection, not its session: its shim answers whatever that daemon still
+/// owed with an error and reconnects on the client's next call (see
+/// `router`), which lands it on the current build.
+///
+/// # A rebuild in progress
+///
+/// While `g-mesh reindex` or `g-mesh init` rebuilds the project's index, this
+/// returns a [`router::Rebuilding`] error instead of connecting or
+/// bootstrapping: a daemon started now would walk the index the CLI is
+/// writing. The rebuild takes the bootstrap lock before writing its marker
+/// and releases it only once it holds the daemon lock, so the check under the
+/// lock below sees every rebuild that the first check missed.
 ///
 /// `origin` says where `root` came from (see [`launch_origin`] and
 /// [`selected_origin`]); it only colors the cold-start line.
@@ -198,6 +221,10 @@ fn connect_or_bootstrap(root: &Path, origin: &str) -> Result<ipc::Stream> {
     // reports a timeout rather than the reason.
     if let Err(message) = endpoint.check_length() {
         bail!("{message}");
+    }
+
+    if let Some(rebuild) = rebuilding(root) {
+        return Err(rebuild.into());
     }
 
     // A missing endpoint, a refused connection and (on Unix) a socket left
@@ -218,6 +245,9 @@ fn connect_or_bootstrap(root: &Path, origin: &str) -> Result<ipc::Stream> {
     // incumbent would have the second one kill the *replacement* the first
     // had just started.
     let lock = acquire_bootstrap_lock(root)?;
+    if let Some(rebuild) = rebuilding(root) {
+        return Err(rebuild.into());
+    }
 
     // The re-check under the lock is what makes the lock worth taking: a
     // shim that queued behind another one finds the socket connectable here
@@ -409,7 +439,7 @@ fn lock_state(root: &Path) -> daemon::DaemonLock {
 /// The lock is an advisory `flock()` tied to the open file, so the kernel
 /// drops it if the holder exits or is killed mid-bootstrap - a dead shim
 /// cannot leave the project locked.
-fn acquire_bootstrap_lock(root: &Path) -> Result<File> {
+pub(crate) fn acquire_bootstrap_lock(root: &Path) -> Result<File> {
     acquire_bootstrap_lock_under(&crate::paths::g_mesh_home()?, root)
 }
 

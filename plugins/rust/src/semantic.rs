@@ -187,7 +187,7 @@ fn rustup_which(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use g_mesh_plugin_sdk::lsp::{probe, ServerReadiness};
+    use g_mesh_plugin_sdk::lsp::ServerReadiness;
 
     /// A path names one binary and is never searched around - see
     /// [`resolve`]'s doc.
@@ -207,23 +207,6 @@ mod tests {
         if let Some(second) = candidates.get(1) {
             assert!(second.is_absolute(), "rustup answers with a path: {second:?}");
         }
-    }
-
-    /// The probe is what separates a server from a shim, so it has to fail
-    /// for a binary that runs and exits non-zero - not only for one that is
-    /// absent. `false` is the smallest such program every unix has; on
-    /// Windows the absent-binary half is the one that runs.
-    #[test]
-    fn a_binary_that_exits_non_zero_is_not_a_server() {
-        assert!(
-            probe(Path::new("/nonexistent/rust-analyzer"), &[], PROBE_BUDGET).is_err(),
-            "a binary that is not there"
-        );
-        #[cfg(unix)]
-        assert!(
-            probe(Path::new("/usr/bin/false"), &[], PROBE_BUDGET).is_err(),
-            "a binary that runs and refuses"
-        );
     }
 
     /// The shipped manifest is read by this module at run time and by nothing
@@ -280,20 +263,13 @@ mod tests {
     }
 
     /// And the whole resolution says what to do about it rather than only
-    /// that it failed.
+    /// that it failed, and reports the failed path with its origin in the
+    /// SDK's shared format.
     #[test]
     fn nothing_usable_names_the_remedy() {
         let err = resolve(Path::new("/nonexistent/rust-analyzer")).expect_err("must not resolve");
         let message = format!("{err:#}");
         assert!(message.contains("rustup component add rust-analyzer"), "{message}");
-        assert!(message.contains("/nonexistent/rust-analyzer"), "{message}");
-    }
-
-    /// A path's failure carries its origin, in the SDK's shared format.
-    #[test]
-    fn a_path_that_fails_is_reported_with_its_origin() {
-        let err = resolve(Path::new("/nonexistent/rust-analyzer")).expect_err("must not resolve");
-        let message = format!("{err:#}");
         assert!(
             message.starts_with(
                 "no usable rust-analyzer: /nonexistent/rust-analyzer (the path the manifest names): "

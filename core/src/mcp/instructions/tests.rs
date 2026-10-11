@@ -354,7 +354,7 @@ fn root_of_byte_len(len: usize) -> std::path::PathBuf {
 #[test]
 fn cold_start_unindexed_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() {
     let root = root_of_byte_len(103);
-    let rendered = cold_start(&root, false, &cold(worst_case_present()));
+    let rendered = cold_start(&root, false, ColdCause::Fresh, &cold(worst_case_present()));
     println!("cold-start (unindexed, 103-byte root) bytes: {}", rendered.len());
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
@@ -374,7 +374,7 @@ fn cold_start_unindexed_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling(
 #[test]
 fn cold_start_walking_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() {
     let root = root_of_byte_len(103);
-    let rendered = cold_start(&root, true, &cold(worst_case_present()));
+    let rendered = cold_start(&root, true, ColdCause::Fresh, &cold(worst_case_present()));
     println!("cold-start (walking, 103-byte root) bytes: {}", rendered.len());
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
@@ -393,7 +393,7 @@ fn cold_start_walking_at_the_worst_case_with_a_103_byte_root_fits_the_ceiling() 
 #[test]
 fn cold_start_falls_back_to_the_no_path_line_once_the_root_is_too_long() {
     let root = root_of_byte_len(600);
-    let rendered = cold_start(&root, false, &cold(worst_case_present()));
+    let rendered = cold_start(&root, false, ColdCause::Fresh, &cold(worst_case_present()));
     println!("cold-start (unindexed, 600-byte root) bytes: {}", rendered.len());
     assert!(
         rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
@@ -527,7 +527,10 @@ fn build_front_drops_a_root_too_long_for_the_ceiling() {
 /// the no-path line, over the ceiling).
 #[test]
 fn the_worst_case_cold_start_falls_back_to_the_generic_receiver_paragraph() {
-    let line = cold_start_line_fallback(false).len().min(cold_start_line_fallback(true).len()) + 2;
+    let line = cold_start_line_fallback(false, ColdCause::Fresh)
+        .len()
+        .min(cold_start_line_fallback(true, ColdCause::Fresh).len())
+        + 2;
     let coverage = (1..200)
         .map(|n| {
             cold(
@@ -551,7 +554,7 @@ fn the_worst_case_cold_start_falls_back_to_the_generic_receiver_paragraph() {
 
     for walking in [false, true] {
         for root_len in [10, 103, 600] {
-            let rendered = cold_start(&root_of_byte_len(root_len), walking, &coverage);
+            let rendered = cold_start(&root_of_byte_len(root_len), walking, ColdCause::Fresh, &coverage);
             println!("walking={walking} root={root_len}: {} bytes", rendered.len());
             assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
             assert!(rendered.ends_with(&fallback), "walking={walking} root={root_len}: {rendered}");
@@ -643,15 +646,16 @@ fn failed(error: &str) -> LanguageOutcome {
     LanguageOutcome::Failed { error: error.to_string() }
 }
 
-/// A warm coverage exactly as `GMeshMcpServer::instructions` assembles it:
+/// A warm coverage as `GMeshMcpServer::instructions` assembles it:
 /// `indexed` languages paired with `found`'s manifests, the recorded
-/// `outcomes`, and `found`'s missing catalogue languages.
+/// `outcomes` with no retry state (as for `Phase::Failed`), and `found`'s
+/// missing catalogue languages.
 fn warm_real(
     found: &DiscoveredPlugins,
     indexed: &[&str],
     outcomes: Vec<(&str, LanguageOutcome)>,
 ) -> Coverage {
-    Coverage::from_outcomes(real_present(found, indexed), sorted(outcomes), real_missing(found))
+    Coverage::from_outcomes(real_present(found, indexed), sorted(outcomes), None, real_missing(found))
 }
 
 /// The receiver paragraph's opening, said by every one of its forms.
@@ -914,9 +918,9 @@ fn the_unsupported_sentence_is_said_once_in_every_rendering_with_a_list() {
                 ],
             )),
         ),
-        ("cold, three missing", cold_start(&root_of_byte_len(40), false, &cold_ts)),
-        ("cold walking, three missing", cold_start(&root_of_byte_len(40), true, &cold_ts)),
-        ("cold, none missing", cold_start(&root_of_byte_len(40), false, &cold_all)),
+        ("cold, three missing", cold_start(&root_of_byte_len(40), false, ColdCause::Fresh, &cold_ts)),
+        ("cold walking, three missing", cold_start(&root_of_byte_len(40), true, ColdCause::Fresh, &cold_ts)),
+        ("cold, none missing", cold_start(&root_of_byte_len(40), false, ColdCause::Fresh, &cold_all)),
     ];
     for (name, rendered) in renderings {
         assert_eq!(rendered.matches(UNSUPPORTED).count(), 1, "{name}: {rendered}");
@@ -989,7 +993,7 @@ fn cold_start_names_the_installed_plugins_and_the_missing_ones_conditionally() {
         uncovered: Uncovered::missing(real_missing(&ts)),
     };
     for walking in [false, true] {
-        let rendered = cold_start(&root_of_byte_len(40), walking, &coverage);
+        let rendered = cold_start(&root_of_byte_len(40), walking, ColdCause::Fresh, &coverage);
         assert!(rendered.contains(&format!("Plugins installed: typescript. {UNSUPPORTED}")), "{rendered}");
         assert!(
             rendered.contains(&format!(
@@ -1010,7 +1014,7 @@ fn cold_start_names_the_installed_plugins_and_the_missing_ones_conditionally() {
         covered: Covered::Installed(real_present(&all, &["go", "python", "rust", "typescript"])),
         uncovered: Uncovered::missing(real_missing(&all)),
     };
-    let rendered = cold_start(&root_of_byte_len(40), false, &everything);
+    let rendered = cold_start(&root_of_byte_len(40), false, ColdCause::Fresh, &everything);
     assert!(rendered.contains("Plugins installed: go, python, rust and typescript."), "{rendered}");
     assert!(!rendered.contains("If this project has"), "{rendered}");
 
@@ -1019,7 +1023,7 @@ fn cold_start_names_the_installed_plugins_and_the_missing_ones_conditionally() {
         covered: Covered::Installed(Vec::new()),
         uncovered: Uncovered::missing(real_missing(&none)),
     };
-    let rendered = cold_start(&root_of_byte_len(40), false, &nothing);
+    let rendered = cold_start(&root_of_byte_len(40), false, ColdCause::Fresh, &nothing);
     assert!(rendered.contains(HEAD_INSTALLED_NONE), "{rendered}");
     assert!(rendered.contains("If this project has typescript, python, rust or go files"), "{rendered}");
     assert!(!rendered.contains(RECEIVER_OPENING), "{rendered}");
@@ -1276,6 +1280,7 @@ fn ladder_step_2_drops_failed_errors_and_keeps_every_name() {
         uncovered: Uncovered::Recorded {
             absent: real_missing(&found).into_iter().map(|language| (language, Some(99_999))).collect(),
             failed: failed.clone(),
+            retries: None,
         },
     };
     assert!(render(&coverage, 1).len() > INSTRUCTIONS_BYTE_CEILING, "the fixture must overflow step 1");
@@ -1306,6 +1311,7 @@ fn ladder_step_3_keeps_absent_and_failed_names() {
         uncovered: Uncovered::Recorded {
             absent: real_missing(&found).into_iter().map(|language| (language, Some(7))).collect(),
             failed: failed.clone(),
+            retries: None,
         },
     };
     assert!(render(&coverage, 2).len() > INSTRUCTIONS_BYTE_CEILING, "the fixture must overflow step 2");
@@ -1346,6 +1352,7 @@ fn ladder_step_4_replaces_the_covered_list_and_keeps_absent_and_failed_names() {
         uncovered: Uncovered::Recorded {
             absent: real_missing(&found).into_iter().map(|language| (language, None)).collect(),
             failed: failed.clone(),
+            retries: None,
         },
     };
     assert!(render(&coverage, 3).len() > INSTRUCTIONS_BYTE_CEILING, "the fixture must overflow step 3");
@@ -1440,7 +1447,7 @@ fn adr_0022_byte_table_every_realistic_scenario_fits_at_step_1() {
             uncovered: Uncovered::missing(real_missing(found)),
         };
         for walking in [false, true] {
-            let rendered = cold_start(&root, walking, &coverage);
+            let rendered = cold_start(&root, walking, ColdCause::Fresh, &coverage);
             println!("Cold start, 103-byte root, {name}, walking={walking}: {} bytes", rendered.len());
             assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
             assert!(rendered.starts_with("Index root: /"), "the root fits: {rendered}");
@@ -1669,7 +1676,7 @@ fn a_real_missing_plugin_binary_renders_the_os_cause_without_the_path() {
     let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
     let store = IndexStore::new(store_with_files(&[]));
 
-    let summary = crate::daemon::bulk_index::run(project.path(), &store, None, &discovered)
+    let summary = crate::daemon::bulk_index::run(project.path(), &store, &discovered)
         .expect("one failed language must not fail the walk");
 
     let error = match summary.outcomes.get("rust") {
@@ -1839,7 +1846,7 @@ fn an_unbuilt_workspace_plugin_binary_renders_the_build_hint_not_the_step() {
     let discovered = discover(std::slice::from_ref(&plugins)).expect("the fixture plugins must discover");
     let store = IndexStore::new(store_with_files(&[]));
 
-    let summary = crate::daemon::bulk_index::run(project.path(), &store, None, &discovered)
+    let summary = crate::daemon::bulk_index::run(project.path(), &store, &discovered)
         .expect("one failed language must not fail the walk");
 
     let error = match summary.outcomes.get("rust") {
@@ -1946,4 +1953,326 @@ fn the_cap_never_cuts_the_build_command_out_of_the_longest_windows_hint() {
             }
         }
     }
+}
+
+/// The lead each cause gives a cold start that has not started its
+/// walk, and the one every cause shares once the walk runs.
+const FRESH_LEAD: &str = "Not indexed yet - the first tool call builds it";
+const DISCARDED_LEAD: &str = "Index discarded (built by an earlier g-mesh or plugin build) - \
+the first tool call rebuilds it";
+const INCOMPLETE_LEAD: &str = "Index incomplete (an earlier walk stopped part way) - \
+the first tool call finishes it";
+const WALKING_LEAD: &str = "Being built now";
+/// The parenthetical only the `Fresh` line keeps.
+const STRUCTURAL_FIRST: &str = "(structural first; semantic search after)";
+
+const CAUSES: [(ColdCause, &str); 3] = [
+    (ColdCause::Fresh, FRESH_LEAD),
+    (ColdCause::Discarded, DISCARDED_LEAD),
+    (ColdCause::Incomplete, INCOMPLETE_LEAD),
+];
+
+/// Before the walk starts, each [`ColdCause`] renders its own line,
+/// with the root and, for a root too long for the ceiling, without it - and
+/// every rendering at the worst-case coverage fits
+/// [`INSTRUCTIONS_BYTE_CEILING`].
+///
+/// Control: make `cold_start_line_fallback` give every non-walking cause the
+/// `Fresh` text: the `Discarded` and `Incomplete` rows fail.
+#[test]
+fn cold_start_names_each_cause_within_the_ceiling() {
+    for (cause, lead) in CAUSES {
+        let root = root_of_byte_len(103);
+        let rendered = cold_start(&root, false, cause, &cold(worst_case_present()));
+        println!("cold-start ({cause:?}, 103-byte root) bytes: {}", rendered.len());
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{cause:?}: {} bytes", rendered.len());
+        assert!(
+            rendered.starts_with(&format!("Index root: {}. {lead}", root.display())),
+            "{cause:?}: {rendered}"
+        );
+        for (other, other_lead) in CAUSES {
+            if other != cause {
+                assert!(!rendered.contains(other_lead), "{cause:?} also says {other:?}'s line: {rendered}");
+            }
+        }
+
+        let rendered = cold_start(&root_of_byte_len(600), false, cause, &cold(worst_case_present()));
+        assert!(
+            rendered.len() <= INSTRUCTIONS_BYTE_CEILING,
+            "{cause:?}, 600-byte root: {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.starts_with(lead), "{cause:?}, 600-byte root: {rendered}");
+    }
+}
+
+/// The `Discarded` and `Incomplete` lines leave out "(structural first;
+/// semantic search after)" to stay about as long as the `Fresh` line, which
+/// keeps it.
+#[test]
+fn only_the_fresh_cold_start_line_says_structural_first() {
+    assert!(cold_start_line_fallback(false, ColdCause::Fresh).contains(STRUCTURAL_FIRST));
+    for cause in [ColdCause::Discarded, ColdCause::Incomplete] {
+        let line = cold_start_line_fallback(false, cause);
+        assert!(!line.contains(STRUCTURAL_FIRST), "{cause:?}: {line}");
+        assert!(line.ends_with(WAIT_IS_NOT_WRONG), "{cause:?}: {line}");
+    }
+}
+
+/// Once the walk runs, the cause is not shown: the line is the
+/// walking one whatever owed the walk.
+#[test]
+fn a_walking_cold_start_does_not_name_its_cause() {
+    for (cause, lead) in CAUSES {
+        let rendered = cold_start(&root_of_byte_len(103), true, cause, &cold(worst_case_present()));
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{cause:?}: {} bytes", rendered.len());
+        assert!(rendered.contains(WALKING_LEAD), "{cause:?}: {rendered}");
+        assert!(!rendered.contains(lead), "{cause:?}: {rendered}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The failed sentence by retry state: whether a daemon start still retries
+// the language (ADR 0021), as `GMeshMcpServer::instructions` reads it from
+// `language_retry`.
+// ---------------------------------------------------------------------------
+
+/// [`warm_real`], with `retries` (language -> retries so far; absent = 0) as
+/// a walked project's start reads them.
+fn warm_retrying(
+    found: &DiscoveredPlugins,
+    indexed: &[&str],
+    outcomes: Vec<(&str, LanguageOutcome)>,
+    retries: &[(&str, u32)],
+) -> Coverage {
+    let retries = retries.iter().map(|(language, n)| (language.to_string(), *n)).collect();
+    Coverage::from_outcomes(
+        real_present(found, indexed),
+        sorted(outcomes),
+        Some(retries),
+        real_missing(found),
+    )
+}
+
+/// Each retry state's sentence, exactly: a retry left says which one comes
+/// on the next start and still names the command; none left says how many
+/// failed. Languages in one state share one sentence (plural wording), in
+/// the order of the state's first language; with no retry state the old
+/// sentence is unchanged.
+///
+/// Controls: in `coverage_paragraph`, take every language's state as `None`
+/// (only the old sentence is said); in `failed_advice`, `n` for `n + 1` (the
+/// retry numbers are off by one); drop the grouping and say one sentence per
+/// language (the plural sentence is gone).
+#[test]
+fn a_failed_languages_sentence_says_whether_a_start_retries_it() {
+    let all = ["go", "python", "rust", "typescript"];
+    let found = real_plugins(&all);
+    let cause = |language: &str| failed(&format!("{language} walk failed\n{language} cause"));
+    let one_failed = |retries: &[(&str, u32)]| {
+        build(&warm_retrying(
+            &found,
+            &["go", "python", "typescript"],
+            vec![
+                ("go", indexed()),
+                ("python", indexed()),
+                ("rust", cause("rust")),
+                ("typescript", indexed()),
+            ],
+            retries,
+        ))
+    };
+
+    let first = one_failed(&[]);
+    assert!(
+        first.contains(
+            "Not indexed, plugin failed: rust (rust cause) - g-mesh retries it on its next start (retry 1 of 2); \
+             if it keeps failing, fix the plugin, then run `g-mesh reindex`."
+        ),
+        "{first}"
+    );
+    let second = one_failed(&[("rust", 1)]);
+    assert!(
+        second.contains("rust (rust cause) - g-mesh retries it on its next start (retry 2 of 2);"),
+        "{second}"
+    );
+    let used_up = one_failed(&[("rust", 2)]);
+    assert!(
+        used_up.contains(
+            "Not indexed, plugin failed: rust (rust cause) - retried 2 times without success; fix the plugin, \
+             then run `g-mesh reindex`."
+        ),
+        "{used_up}"
+    );
+
+    let grouped = build(&warm_retrying(
+        &found,
+        &["typescript"],
+        vec![
+            ("go", cause("go")),
+            ("python", cause("python")),
+            ("rust", cause("rust")),
+            ("typescript", indexed()),
+        ],
+        &[("go", 2), ("rust", 2)],
+    ));
+    let used_up_sentence =
+        "Not indexed, plugin failed: go (go cause), rust (rust cause) - retried 2 times without \
+                            success; fix the plugins, then run `g-mesh reindex`.";
+    let retrying_sentence = "Not indexed, plugin failed: python (python cause) - g-mesh retries it on its next \
+                             start (retry 1 of 2); if it keeps failing, fix the plugin, then run `g-mesh reindex`.";
+    assert!(grouped.contains(used_up_sentence), "{grouped}");
+    assert!(grouped.contains(retrying_sentence), "{grouped}");
+    assert!(
+        grouped.find(used_up_sentence) < grouped.find(retrying_sentence),
+        "go's state comes first: {grouped}"
+    );
+
+    let plural = build(&warm_retrying(
+        &found,
+        &["typescript"],
+        vec![
+            ("go", cause("go")),
+            ("python", cause("python")),
+            ("rust", indexed()),
+            ("typescript", indexed()),
+        ],
+        &[],
+    ));
+    assert!(
+        plural.contains(
+            "Not indexed, plugin failed: go (go cause), python (python cause) - g-mesh retries them on its next \
+             start (retry 1 of 2); if they keep failing, fix the plugins, then run `g-mesh reindex`."
+        ),
+        "{plural}"
+    );
+
+    let unsaid = build(&warm_real(
+        &found,
+        &["go", "python", "typescript"],
+        vec![("go", indexed()), ("python", indexed()), ("rust", cause("rust")), ("typescript", indexed())],
+    ));
+    assert!(
+        unsaid.contains(
+            "Not indexed, plugin failed: rust (rust cause) - fix the plugin, then run `g-mesh reindex`."
+        ),
+        "{unsaid}"
+    );
+    assert!(!unsaid.contains("next start") && !unsaid.contains("without success"), "{unsaid}");
+}
+
+/// The ADR 0022 byte table's failed scenarios again, with the retry wording,
+/// which is longer than the old one: three failed languages with long
+/// errors, in each mix of retry states (one sentence per state is the
+/// longest), and the four-state scenario. Each fits the ceiling at ladder
+/// step 1, and says the retry wording, so the measurement is of it. Run with
+/// `--nocapture` for the table.
+///
+/// Control: in `coverage_paragraph`, take every language's state as `None`
+/// (the retry wording is not said).
+#[test]
+fn the_retry_wording_fits_the_ceiling_in_every_realistic_scenario() {
+    let all = ["go", "python", "rust", "typescript"];
+    let every = real_plugins(&all);
+    let long_error = "x".repeat(182);
+    let rust_error = format!("rust plugin failed: {}", "e".repeat(162));
+    let three_failed = || {
+        vec![
+            ("go", failed(&long_error)),
+            ("python", failed(&long_error)),
+            ("rust", failed(&long_error)),
+            ("typescript", indexed()),
+        ]
+    };
+
+    let scenarios: Vec<(&str, Coverage)> = vec![
+        (
+            "Three failed, one per retry state",
+            warm_retrying(&every, &["typescript"], three_failed(), &[("python", 1), ("rust", 2)]),
+        ),
+        ("Three failed, all retried next start", warm_retrying(&every, &["typescript"], three_failed(), &[])),
+        (
+            "Three failed, all retries used up",
+            warm_retrying(&every, &["typescript"], three_failed(), &[("go", 2), ("python", 2), ("rust", 2)]),
+        ),
+        (
+            "Four states, rust retried next start",
+            warm_retrying(
+                &real_plugins(&["rust", "typescript"]),
+                &["typescript"],
+                vec![
+                    ("typescript", indexed()),
+                    ("rust", failed(&rust_error)),
+                    ("go", absent(Some(12_345))),
+                    ("python", absent(Some(54_321))),
+                ],
+                &[],
+            ),
+        ),
+    ];
+    for (name, coverage) in &scenarios {
+        let rendered = build(coverage);
+        println!("{name}: {} bytes", rendered.len());
+        assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{name}: {} bytes", rendered.len());
+        assert_eq!(&rendered, &render(coverage, 1), "{name} must fit at step 1");
+        assert!(
+            rendered.contains("on its next start") || rendered.contains("without success"),
+            "{name} must say the retry wording: {rendered}"
+        );
+    }
+}
+
+/// The server reads the retry count from the store: Rust, failed and retried
+/// once, is said to be retried on the next start (2 of 2).
+///
+/// Control: pass `None` as the retries to `Coverage::from_outcomes` in
+/// `GMeshMcpServer::instructions` (the old wording).
+#[test]
+fn the_server_says_the_retry_state_it_reads_from_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(IndexStore::new(store_with_files(&["typescript"])));
+    record_outcomes(&store, vec![("typescript", indexed()), ("rust", failed("walk failed\nrust cause"))]);
+    store.with(|conn| schema::begin_language_retry(conn, "rust")).unwrap();
+    let server = server_over(&dir, real_plugins(&["rust", "typescript"]), Arc::clone(&store), Phase::Ready);
+
+    let rendered = server.instructions();
+
+    assert!(
+        rendered.contains("rust (rust cause) - g-mesh retries it on its next start (retry 2 of 2);"),
+        "{rendered}"
+    );
+}
+
+/// A walk that failed every language (`Phase::Failed`) is retried whole by
+/// the next tool call, not per language by a start: its failed sentence
+/// keeps the old wording, whatever retries are recorded.
+///
+/// Control: drop the `Phase::Failed` arm that sets the retries to `None` in
+/// `GMeshMcpServer::instructions` (the retry wording appears).
+#[test]
+fn a_failed_walk_keeps_the_failed_sentence_without_a_retry_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(IndexStore::new(store_with_files(&[])));
+    record_outcomes(
+        &store,
+        vec![("rust", failed("walk failed\nrust cause")), ("typescript", failed("t\nts cause"))],
+    );
+    store.with(|conn| schema::begin_language_retry(conn, "rust")).unwrap();
+    let server = server_over(
+        &dir,
+        real_plugins(&["rust", "typescript"]),
+        Arc::clone(&store),
+        Phase::Failed("every plugin failed".into()),
+    );
+
+    let rendered = server.instructions();
+
+    assert!(
+        rendered.contains(
+            "Not indexed, plugin failed: rust (rust cause), typescript (ts cause) - fix the plugin, then run \
+             `g-mesh reindex`."
+        ),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("next start") && !rendered.contains("without success"), "{rendered}");
 }

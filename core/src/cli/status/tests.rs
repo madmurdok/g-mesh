@@ -74,7 +74,7 @@ impl Fixture {
     }
 
     fn status(&self) -> IndexStatus {
-        index_status(self.root(), &self.db_path(), &bundled_plugins()).unwrap()
+        index_status(self.root(), &self.db_path(), &bundled_plugins(), Mode::Full).unwrap()
     }
 }
 
@@ -84,11 +84,11 @@ fn a_project_with_no_index_owes_work_for_every_file_it_has() {
 
     let status = fixture.status();
 
-    assert_eq!(status.discovered, 2);
-    assert_eq!(status.indexed, 0);
-    assert_eq!(status.dirty, 2);
+    assert_eq!(status.coverage.unwrap().discovered, 2);
+    assert_eq!(status.coverage.unwrap().indexed, 0);
+    assert_eq!(status.coverage.unwrap().dirty, 2);
     assert!(!status.bulk_indexed);
-    assert_eq!(status.coverage(), 0.0);
+    assert_eq!(status.coverage.unwrap().ratio(), 0.0);
 }
 
 #[test]
@@ -106,11 +106,11 @@ fn a_fully_indexed_project_reports_complete_coverage_and_nothing_dirty() {
 
     let status = fixture.status();
 
-    assert_eq!(status.discovered, 2);
-    assert_eq!(status.indexed, 2);
-    assert_eq!(status.dirty, 0, "a bulk-indexed file with no baseline is not stale");
+    assert_eq!(status.coverage.unwrap().discovered, 2);
+    assert_eq!(status.coverage.unwrap().indexed, 2);
+    assert_eq!(status.coverage.unwrap().dirty, 0, "a bulk-indexed file with no baseline is not stale");
     assert!(status.bulk_indexed);
-    assert_eq!(status.coverage(), 1.0);
+    assert_eq!(status.coverage.unwrap().ratio(), 1.0);
 }
 
 /// The acceptance criterion's "known dirty-queue size": one file the
@@ -133,10 +133,10 @@ fn dirty_counts_never_indexed_files_and_files_whose_baseline_went_stale() {
 
     let status = fixture.status();
 
-    assert_eq!(status.discovered, 3);
-    assert_eq!(status.indexed, 2);
-    assert_eq!(status.dirty, 2, "the never-indexed file and the stale one");
-    assert!((status.coverage() - 2.0 / 3.0).abs() < f64::EPSILON);
+    assert_eq!(status.coverage.unwrap().discovered, 3);
+    assert_eq!(status.coverage.unwrap().indexed, 2);
+    assert_eq!(status.coverage.unwrap().dirty, 2, "the never-indexed file and the stale one");
+    assert!((status.coverage.unwrap().ratio() - 2.0 / 3.0).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -205,9 +205,13 @@ fn rust_and_python_files_count_toward_coverage_and_the_dirty_queue() {
 
     let status = fixture.status();
 
-    assert_eq!(status.discovered, 5, "every language's files are discovered, not only JS/TS");
-    assert_eq!(status.indexed, 4);
-    assert_eq!(status.dirty, 2, "the never-indexed .py and the stale .rs");
+    assert_eq!(
+        status.coverage.unwrap().discovered,
+        5,
+        "every language's files are discovered, not only JS/TS"
+    );
+    assert_eq!(status.coverage.unwrap().indexed, 4);
+    assert_eq!(status.coverage.unwrap().dirty, 2, "the never-indexed .py and the stale .rs");
 }
 
 /// Each language's `[plugin.workspace] exclude_dirs` applies to that
@@ -244,14 +248,15 @@ fn a_project_with_no_source_files_is_covered_rather_than_dividing_by_zero() {
 
     let status = fixture.status();
 
-    assert_eq!(status.discovered, 0);
-    assert_eq!(status.coverage(), 1.0);
-    assert_eq!(status.dirty, 0);
+    assert_eq!(status.coverage.unwrap().discovered, 0);
+    assert_eq!(status.coverage.unwrap().ratio(), 1.0);
+    assert_eq!(status.coverage.unwrap().dirty, 0);
 }
 
 #[test]
 fn a_report_renders_every_field_it_was_asked_for() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -274,14 +279,13 @@ fn a_report_renders_every_field_it_was_asked_for() {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 4,
-            indexed: 3,
-            dirty: 1,
+            coverage: Some(Coverage { discovered: 4, indexed: 3, dirty: 1 }),
             syntax_error_files: vec!["src/broken.ts".to_string()],
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -302,6 +306,7 @@ fn a_report_renders_every_field_it_was_asked_for() {
 #[test]
 fn an_interrupted_workspace_reindex_is_named() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -318,14 +323,13 @@ fn an_interrupted_workspace_reindex_is_named() {
             pending_reindex: vec![("rust".to_string(), "Cargo.toml".to_string())],
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 1,
-            indexed: 1,
-            dirty: 0,
+            coverage: Some(Coverage { discovered: 1, indexed: 1, dirty: 0 }),
             syntax_error_files: Vec::new(),
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -340,6 +344,7 @@ fn an_interrupted_workspace_reindex_is_named() {
 #[test]
 fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -356,14 +361,13 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 4,
-            indexed: 4,
-            dirty: 0,
+            coverage: Some(Coverage { discovered: 4, indexed: 4, dirty: 0 }),
             syntax_error_files: Vec::new(),
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -395,6 +399,7 @@ fn a_recorded_semantic_pass_failure_is_shown_with_its_reason_instead_of_the_gene
     let index = fixture.status();
     assert_eq!(index.semantic_pass_owed, vec!["typescript".to_string()]);
     let rendered = render(&Report {
+        mode: Mode::Full,
         project_root: fixture.root().to_path_buf(),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -407,6 +412,7 @@ fn a_recorded_semantic_pass_failure_is_shown_with_its_reason_instead_of_the_gene
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     });
 
     assert!(
@@ -584,6 +590,7 @@ fn a_deferred_pass_carries_no_reindex_advice_while_a_daemon_works() {
 #[test]
 fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_owed() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -603,14 +610,13 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 4,
-            indexed: 1,
-            dirty: 3,
+            coverage: Some(Coverage { discovered: 4, indexed: 1, dirty: 3 }),
             syntax_error_files: Vec::new(),
         },
         phase: Some("walking".to_string()),
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -632,6 +638,7 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
 /// project is incidental to what they check.
 fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
     Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -648,14 +655,13 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 4,
-            indexed: if bulk_indexed { 4 } else { 0 },
-            dirty: 4,
+            coverage: Some(Coverage { discovered: 4, indexed: if bulk_indexed { 4 } else { 0 }, dirty: 4 }),
             syntax_error_files: Vec::new(),
         },
         phase: phase.map(str::to_string),
         front: None,
         progress: None,
+        languages: no_languages(),
     }
 }
 
@@ -673,33 +679,6 @@ fn unindexed_phase_reports_not_indexed_yet_rather_than_cold_start_owed() {
     );
     assert!(!rendered.contains("cold start is still owed"), "{rendered}");
     assert!(!rendered.contains("building now"), "an unindexed project is idle, not building:\n{rendered}");
-}
-
-/// D13: `embedding` is the phase covering "the structural walk is done
-/// and answering, the embedding backfill pass is running" - distinct from
-/// both `walking` (no structural answers yet) and silence (nothing left
-/// to say once the whole project, embeddings included, is `ready`).
-#[test]
-fn embedding_phase_reports_structural_ready_with_embeddings_in_progress() {
-    let rendered = render(&phase_fixture(true, Some("embedding")));
-    assert!(
-        rendered.contains("index:           structural index ready; embeddings being computed"),
-        "{rendered}"
-    );
-}
-
-/// D13: `failed` names what happened and that the next tool call retries
-/// it (`IndexingStatus::activation_failed`) - the daemon log is where the
-/// actual failure message lives (`Phase::Failed`'s own doc comment), so
-/// this line only has to point there, not repeat it.
-#[test]
-fn failed_phase_reports_the_last_build_failed_and_will_be_retried() {
-    let rendered = render(&phase_fixture(false, Some("failed")));
-    assert!(
-        rendered
-            .contains("index:           last build failed - see daemon log; retried on the next tool call"),
-        "{rendered}"
-    );
 }
 
 /// Every phase, and each no-phase state, prints its own `index:` line.
@@ -870,6 +849,7 @@ fn a_progress_file_left_by_a_dead_daemon_is_not_rendered_as_live() {
 #[test]
 fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -889,14 +869,13 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 2,
-            indexed: 0,
-            dirty: 2,
+            coverage: Some(Coverage { discovered: 2, indexed: 0, dirty: 2 }),
             syntax_error_files: Vec::new(),
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -966,6 +945,7 @@ fn plugin_reports_lists_one_entry_per_live_pid_file_sorted_by_language() {
 #[test]
 fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -982,14 +962,13 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 0,
-            indexed: 0,
-            dirty: 0,
+            coverage: Some(Coverage { discovered: 0, indexed: 0, dirty: 0 }),
             syntax_error_files: Vec::new(),
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
 
     let rendered = render(&report);
@@ -1153,7 +1132,8 @@ fn a_daemon_suspended_language_is_reported_by_a_separate_status_read() {
     supervisor.check_memory_limit_sampled_by(|_pid| Some(230));
     assert!(supervisor.is_semantic_suspended(), "the fixture must actually have suspended");
 
-    let report = collect(project.path()).expect("status must still collect over a suspended project");
+    let report =
+        collect(project.path(), Mode::Light).expect("status must still collect over a suspended project");
     assert_eq!(report.suspended_languages.len(), 1, "{:?}", report.suspended_languages);
     assert_eq!(report.suspended_languages[0].language, "heavy");
     assert!(
@@ -1179,6 +1159,7 @@ fn a_project_with_no_suspension_marker_reports_none() {
     assert_eq!(suspended_language_reports(state.path()), Vec::new());
 
     let report = Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -1195,22 +1176,31 @@ fn a_project_with_no_suspension_marker_reports_none() {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 0,
-            indexed: 0,
-            dirty: 0,
+            coverage: Some(Coverage { discovered: 0, indexed: 0, dirty: 0 }),
             syntax_error_files: Vec::new(),
         },
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     };
     let rendered = render(&report);
     assert!(!rendered.contains("semantic ("), "{rendered}");
 }
 
 /// A report around `index`, with no daemon running.
+/// A languages section with nothing recorded, for fixtures about other lines.
+fn no_languages() -> LanguagesReport {
+    LanguagesReport {
+        section: LanguageSection::NoIndex,
+        installed: Ok(BTreeMap::new()),
+        retries: BTreeMap::new(),
+    }
+}
+
 fn report_with(index: IndexStatus) -> Report {
     Report {
+        mode: Mode::Full,
         project_root: PathBuf::from("/tmp/project"),
         project_id: "a1b2c3d4e5f6a7b8".to_string(),
         state_dir: PathBuf::from("/home/u/.g-mesh/projects/a1b2c3d4e5f6a7b8"),
@@ -1223,6 +1213,7 @@ fn report_with(index: IndexStatus) -> Report {
         phase: None,
         front: None,
         progress: None,
+        languages: no_languages(),
     }
 }
 
@@ -1313,9 +1304,9 @@ fn an_alias_only_file_is_discovered_and_indexed_under_the_link_and_not_dirty() {
 
     assert_eq!(discovered(&fixture), vec!["src/api/a.ts", "src/main.ts"]);
     let status = fixture.status();
-    assert_eq!(status.discovered, 2);
-    assert_eq!(status.indexed, 2);
-    assert_eq!(status.dirty, 0);
+    assert_eq!(status.coverage.unwrap().discovered, 2);
+    assert_eq!(status.coverage.unwrap().indexed, 2);
+    assert_eq!(status.coverage.unwrap().dirty, 0);
 }
 
 /// B5: a file reachable plainly and through a link (`app -> lib`, `app`
@@ -1330,7 +1321,7 @@ fn a_file_reachable_through_a_link_and_plainly_is_counted_once_under_its_plain_s
     link(&fixture, "app", "lib");
 
     assert_eq!(discovered(&fixture), vec!["lib/x.ts"]);
-    assert_eq!(fixture.status().discovered, 1);
+    assert_eq!(fixture.status().coverage.unwrap().discovered, 1);
 }
 
 /// B10: `src/dep -> ../node_modules/foo` (`node_modules/` gitignored): the
@@ -1352,4 +1343,344 @@ fn a_file_under_a_link_into_a_languages_excluded_dir_is_not_that_languages() {
     link(&fixture, "src/dep", "../node_modules/foo");
 
     assert_eq!(discovered(&fixture), vec!["src/dep/lib.rs", "src/main.ts"]);
+}
+
+// ---------------------------------------------------------------------
+// Light and full status, the languages block, `--json`
+// (docs/architecture/gm-500-status-language-outcomes.md)
+// ---------------------------------------------------------------------
+
+/// A report with nothing indexed and `languages` as given.
+fn languages_report(section: LanguageSection, installed: &[(&str, &str)]) -> Report {
+    let mut report = report_with(Fixture::new(&[]).status());
+    report.mode = Mode::Light;
+    report.index.coverage = None;
+    report.languages = LanguagesReport {
+        section,
+        installed: Ok(installed.iter().map(|(l, v)| (l.to_string(), v.to_string())).collect()),
+        retries: BTreeMap::new(),
+    };
+    report
+}
+
+fn languages_json(report: &Report) -> serde_json::Value {
+    json::to_json(report)["languages"].clone()
+}
+
+/// Light mode does not walk the project: on the same project and index,
+/// `Full` counts the files on disk and `Light` leaves coverage unknown.
+/// Control: `index_status`'s `Mode::Light` arm walks (`Some(discover_source_files(..)?)`)
+/// -> light coverage is `Some`.
+#[test]
+fn light_mode_leaves_coverage_unchecked_where_full_walks_the_project() {
+    let fixture = Fixture::new(&[("a.ts", "export const a = 1;"), ("b.ts", "export const b = 2;")]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "a.ts", false);
+
+    let full = index_status(fixture.root(), &fixture.db_path(), &bundled_plugins(), Mode::Full).unwrap();
+    assert_eq!(full.coverage, Some(Coverage { discovered: 2, indexed: 1, dirty: 1 }));
+
+    let light = index_status(fixture.root(), &fixture.db_path(), &bundled_plugins(), Mode::Light).unwrap();
+    assert_eq!(light.coverage, None, "light mode must not walk the project");
+    assert_eq!(IndexStatus { coverage: full.coverage, ..light }, full, "everything else is the same read");
+
+    // The same with no index at all: full owes every file, light says nothing.
+    let unindexed = Fixture::new(&[("a.ts", "export const a = 1;")]);
+    let light =
+        index_status(unindexed.root(), &unindexed.db_path(), &bundled_plugins(), Mode::Light).unwrap();
+    assert_eq!(light.coverage, None);
+}
+
+/// Light renders `not checked` in place of the coverage and dirty lines, and
+/// its JSON has `coverage: null` beside `mode: "light"`; full renders both
+/// lines and the counts. Control: delete the `None` arm's `writeln` in
+/// `render` -> no `not checked` line; map `"coverage"` to `Value::Null`
+/// unconditionally in `json::index` -> the full JSON has no counts.
+#[test]
+fn light_and_full_render_and_encode_coverage_differently() {
+    let light = languages_report(LanguageSection::NoIndex, &[]);
+    let rendered = render(&light);
+    assert!(rendered.contains("  index coverage:  not checked - `g-mesh status --full`"), "{rendered}");
+    assert!(!rendered.contains("dirty files:"), "{rendered}");
+    let encoded = json::to_json(&light);
+    assert_eq!(encoded["mode"], "light");
+    assert_eq!(encoded["formatVersion"], json::FORMAT_VERSION);
+    assert!(encoded["index"]["coverage"].is_null(), "{encoded}");
+
+    let mut full = light;
+    full.mode = Mode::Full;
+    full.index.coverage = Some(Coverage { discovered: 4, indexed: 3, dirty: 2 });
+    let rendered = render(&full);
+    assert!(rendered.contains("  index coverage:  75.0% (3/4 source files)"), "{rendered}");
+    assert!(rendered.contains("dirty files:"), "{rendered}");
+    assert!(!rendered.contains("not checked"), "{rendered}");
+    let encoded = json::to_json(&full);
+    assert_eq!(encoded["mode"], "full");
+    assert_eq!(
+        encoded["index"]["coverage"],
+        serde_json::json!({ "discovered": 4, "indexed": 3, "dirty": 2 })
+    );
+}
+
+/// The JSON's top-level and `index` key sets are the contract `formatVersion`
+/// versions. Control: rename any key in `json::to_json` -> this fails.
+#[test]
+fn the_json_report_has_exactly_the_documented_keys() {
+    let encoded = json::to_json(&languages_report(LanguageSection::NoIndex, &[]));
+    let keys = |value: &serde_json::Value| value.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(
+        keys(&encoded),
+        [
+            "daemon",
+            "formatVersion",
+            "front",
+            "index",
+            "languages",
+            "lastUsed",
+            "mode",
+            "plugins",
+            "projectId",
+            "projectRoot",
+            "stateDir",
+            "suspended"
+        ]
+    );
+    assert_eq!(
+        keys(&encoded["index"]),
+        ["bulkIndexed", "coverage", "phase", "progress", "semanticPass", "syntaxErrorFiles"]
+    );
+    assert_eq!(keys(&encoded["languages"]), ["outcomes", "pluginDiscoveryError", "state"]);
+}
+
+/// Every recorded outcome is one row, with the installed plugin's version or
+/// its absence, and a plugin installed since the walk is a row of its own.
+/// Controls: in `LanguagesReport::rows` set `plugin_version: None` -> no
+/// `(plugin 1.2.0)`; delete the loop over `installed` -> no `typescript`
+/// row; delete `describe_language_row`'s `if let Some(installed)` return ->
+/// `go` reads as absent with an install command.
+#[test]
+fn recorded_outcomes_render_with_the_installed_plugin_beside_each() {
+    let report = languages_report(
+        LanguageSection::Recorded(vec![
+            ("go".to_string(), LanguageOutcome::PluginAbsent { files: Some(3) }),
+            ("java".to_string(), LanguageOutcome::PluginAbsent { files: None }),
+            (
+                "python".to_string(),
+                LanguageOutcome::Failed { error: "spawn failed\n  no such file".to_string() },
+            ),
+            ("rust".to_string(), LanguageOutcome::Indexed { files: 1 }),
+            ("zig".to_string(), LanguageOutcome::Indexed { files: 12 }),
+        ]),
+        &[("rust", "1.2.0"), ("typescript", "0.9.0"), ("java", "2.0.0")],
+    );
+
+    assert_eq!(
+        language_lines(&report.languages),
+        [
+            "  languages:       5 recorded by the last walk".to_string(),
+            "    go:            plugin absent - 3 file(s) not indexed; install it with `g-mesh plugins install go`"
+                .to_string(),
+            "    java:          plugin absent at the last walk; 2.0.0 installed since - the next daemon start \
+             re-walks"
+                .to_string(),
+            "    python:        failed (plugin no longer installed) - not in the index: spawn failed: no such file"
+                .to_string(),
+            "    rust:          indexed, 1 file (plugin 1.2.0)".to_string(),
+            "    typescript:    installed 0.9.0 - not in the last walk".to_string(),
+            "    zig:           indexed, 12 files (plugin no longer installed)".to_string(),
+        ]
+    );
+    let rendered = render(&report);
+    let languages = rendered.find("  languages:").expect("a languages block");
+    let syntax = rendered.find("  syntax errors:").expect("a syntax errors line");
+    assert!(languages < syntax, "the languages block precedes syntax errors: {rendered}");
+
+    let encoded = languages_json(&report);
+    assert_eq!(encoded["state"], "recorded");
+    assert!(encoded["pluginDiscoveryError"].is_null());
+    assert_eq!(
+        encoded["outcomes"],
+        serde_json::json!([
+            { "language": "go", "outcome": "plugin_absent", "files": 3, "pluginVersion": null,
+              "installCommand": "g-mesh plugins install go" },
+            { "language": "java", "outcome": "plugin_absent", "files": null, "pluginVersion": "2.0.0",
+              "installCommand": null },
+            { "language": "python", "outcome": "failed", "pluginVersion": null,
+              "error": "spawn failed: no such file", "causes": ["spawn failed", "no such file"] },
+            { "language": "rust", "outcome": "indexed", "files": 1, "pluginVersion": "1.2.0" },
+            { "language": "typescript", "outcome": "not_in_last_walk", "pluginVersion": "0.9.0" },
+            { "language": "zig", "outcome": "indexed", "files": 12, "pluginVersion": null },
+        ])
+    );
+}
+
+/// The states with no rows say which kind of empty they are, in text and in
+/// JSON, and list no rows even with plugins installed. Control: in
+/// `language_lines`, print one header for every empty state -> the headers
+/// no longer differ.
+#[test]
+fn each_state_without_rows_names_itself_in_text_and_json() {
+    let cases = [
+        (LanguageSection::NoIndex, "none recorded - no index yet", "no_index"),
+        (
+            LanguageSection::NoneRecorded,
+            "none recorded - no walk has finished on this index; run `g-mesh reindex`",
+            "none_recorded",
+        ),
+        (
+            LanguageSection::WalkInProgress,
+            "not recorded yet - the walk in progress records them when it finishes",
+            "walk_in_progress",
+        ),
+        (
+            LanguageSection::PredatesOutcomes { schema_version: Some("12".to_string()) },
+            "not recorded - this index predates per-language outcomes (schema 12); the next daemon start \
+             rebuilds it",
+            "predates_outcomes",
+        ),
+    ];
+    for (section, header, state) in cases {
+        let report = languages_report(section, &[("rust", "1.2.0")]);
+        assert_eq!(language_lines(&report.languages), [format!("  languages:       {header}")], "{state}");
+        let encoded = languages_json(&report);
+        assert_eq!(encoded["state"], state);
+        assert_eq!(encoded["outcomes"], serde_json::json!([]), "{state}");
+    }
+    let predates = languages_json(&languages_report(
+        LanguageSection::PredatesOutcomes { schema_version: Some("12".to_string()) },
+        &[],
+    ));
+    assert_eq!(predates["schemaVersion"], "12");
+
+    // A front prints no languages block at all.
+    let front = languages_report(LanguageSection::Front, &[]);
+    assert!(language_lines(&front.languages).is_empty());
+    assert_eq!(languages_json(&front)["state"], "front");
+}
+
+/// A failed plugin discovery drops every version clause (nothing is known
+/// about what is installed) and is named on its own line and in
+/// `pluginDiscoveryError`.
+#[test]
+fn a_failed_plugin_discovery_is_named_and_drops_the_version_clauses() {
+    let mut report = languages_report(
+        LanguageSection::Recorded(vec![("rust".to_string(), LanguageOutcome::Indexed { files: 2 })]),
+        &[],
+    );
+    report.languages.installed = Err("bad plugin.toml".to_string());
+
+    assert_eq!(
+        language_lines(&report.languages),
+        [
+            "  languages:       1 recorded by the last walk".to_string(),
+            "    rust:          indexed, 2 files".to_string(),
+            "  plugins:         discovery failed - bad plugin.toml".to_string(),
+        ]
+    );
+    let encoded = languages_json(&report);
+    assert_eq!(encoded["pluginDiscoveryError"], "bad plugin.toml");
+    assert_eq!(encoded["outcomes"][0]["pluginVersion"], serde_json::Value::Null);
+}
+
+/// `language_section` reads which state the index is in: no file, a table
+/// with rows, an empty table with and without a live walk, and an index from
+/// before the table existed. Controls: always `NoneRecorded` when empty ->
+/// the live-walk case fails; remove the `sqlite_master` probe -> the
+/// pre-13 case errors on the missing table.
+#[test]
+fn language_section_tells_every_index_state_apart() {
+    let fixture = Fixture::new(&[]);
+    assert_eq!(language_section(&fixture.db_path(), false).unwrap(), LanguageSection::NoIndex);
+
+    let conn = fixture.index();
+    assert_eq!(language_section(&fixture.db_path(), false).unwrap(), LanguageSection::NoneRecorded);
+    assert_eq!(language_section(&fixture.db_path(), true).unwrap(), LanguageSection::WalkInProgress);
+
+    let outcomes = BTreeMap::from([("go".to_string(), LanguageOutcome::PluginAbsent { files: Some(1) })]);
+    schema::record_language_outcomes(&conn, &outcomes).unwrap();
+    let recorded =
+        LanguageSection::Recorded(vec![("go".to_string(), LanguageOutcome::PluginAbsent { files: Some(1) })]);
+    assert_eq!(language_section(&fixture.db_path(), false).unwrap(), recorded);
+    assert_eq!(language_section(&fixture.db_path(), true).unwrap(), recorded, "rows win over a live walk");
+
+    conn.execute_batch("DROP TABLE language_outcome; UPDATE meta SET schema_version = '12' WHERE id = 1;")
+        .unwrap();
+    assert_eq!(
+        language_section(&fixture.db_path(), false).unwrap(),
+        LanguageSection::PredatesOutcomes { schema_version: Some("12".to_string()) }
+    );
+}
+
+/// A failed language whose plugin is installed says its retry state: the
+/// retry the next start makes, or that the retries are used up; one whose
+/// plugin is gone says neither (a removed plugin re-walks everything). In
+/// JSON, `retries`/`maxRetries` only beside an installed plugin.
+///
+/// Controls: drop the retry clause in `describe_language_row` (the text
+/// assertions fail); add `retries` regardless of `plugin_version` in
+/// `json::outcome` (go's entry gains the keys).
+#[test]
+fn a_failed_language_says_its_retry_state_only_when_its_plugin_is_installed() {
+    let failed = |error: &str| LanguageOutcome::Failed { error: error.to_string() };
+    let mut report = languages_report(
+        LanguageSection::Recorded(vec![
+            ("go".to_string(), failed("go gone")),
+            ("python".to_string(), failed("spawn failed\n  no such file")),
+            ("rust".to_string(), failed("boom")),
+        ]),
+        &[("python", "0.3.0"), ("rust", "1.2.0")],
+    );
+    report.languages.retries = BTreeMap::from([("python".to_string(), 2), ("rust".to_string(), 1)]);
+
+    let lines = language_lines(&report.languages);
+    let line = |language: &str| {
+        lines
+            .iter()
+            .find(|line| line.trim_start().starts_with(&format!("{language}:")))
+            .unwrap_or_else(|| panic!("no {language} line: {lines:?}"))
+            .clone()
+    };
+    assert!(
+        line("rust")
+            .ends_with("failed (plugin 1.2.0) - not in the index: boom; retry 2 of 2 on the next start"),
+        "{lines:?}"
+    );
+    assert!(
+        line("python").ends_with(
+            "failed (plugin 0.3.0) - not in the index: spawn failed: no such file; retries used up - run \
+             `g-mesh reindex`"
+        ),
+        "{lines:?}"
+    );
+    assert!(
+        line("go").ends_with("failed (plugin no longer installed) - not in the index: go gone"),
+        "{lines:?}"
+    );
+
+    let outcomes = languages_json(&report)["outcomes"].clone();
+    let entry = |language: &str| {
+        outcomes.as_array().unwrap().iter().find(|entry| entry["language"] == language).unwrap().clone()
+    };
+    assert_eq!((entry("rust")["retries"].clone(), entry("rust")["maxRetries"].clone()), (1.into(), 2.into()));
+    assert_eq!(entry("python")["retries"], 2);
+    assert!(entry("go").get("retries").is_none() && entry("go").get("maxRetries").is_none(), "{outcomes}");
+}
+
+/// `language_retries` reads the counts from an index file, and an index
+/// from before the retry table reads as none rather than failing the report.
+#[test]
+fn language_retries_reads_the_counts_and_none_from_an_index_without_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let current = dir.path().join("current.db");
+    let conn = rusqlite::Connection::open(&current).unwrap();
+    schema::apply(&conn).unwrap();
+    schema::begin_language_retry(&conn, "python").unwrap();
+    drop(conn);
+    assert_eq!(language_retries(&current), BTreeMap::from([("python".to_string(), 1)]));
+
+    let older = dir.path().join("older.db");
+    let conn = rusqlite::Connection::open(&older).unwrap();
+    conn.execute("CREATE TABLE language_outcome (language TEXT PRIMARY KEY)", []).unwrap();
+    drop(conn);
+    assert!(language_retries(&older).is_empty());
 }

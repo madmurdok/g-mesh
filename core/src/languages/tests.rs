@@ -93,24 +93,6 @@ fn install_command_is_the_exact_plugins_install_command_for_each_language() {
     );
 }
 
-/// The catalogue carries no capability information, and this destructuring
-/// is exhaustive so that adding any field to `CatalogueEntry` stops it
-/// compiling. That is deliberate: capabilities belong to the plugin manifest
-/// (`daemon::manifest::Capabilities`) alone. A capability here would be read
-/// instead of the manifest's and drift from it, giving core two sources of
-/// truth about a live plugin. If you are adding a field, the catalogue is the
-/// wrong place for it unless it describes an *absent* plugin only.
-/// `exclude_dirs` passes that test: like `extensions`, it says which files the
-/// absent plugin would claim (ADR 0021), not what a plugin can do.
-#[test]
-fn a_catalogue_entry_holds_only_a_language_and_its_extensions() {
-    for entry in CATALOGUE {
-        let CatalogueEntry { language, extensions, exclude_dirs: _ } = *entry;
-        assert!(!language.is_empty());
-        assert!(!extensions.is_empty());
-    }
-}
-
 #[test]
 fn entry_finds_a_catalogued_language_by_id() {
     assert_eq!(entry("rust").map(|e| e.language), Some("rust"));

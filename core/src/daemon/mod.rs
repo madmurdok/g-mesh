@@ -24,11 +24,11 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
-use crate::daemon::indexing_status::IndexingStatus;
+use crate::daemon::indexing_status::{ColdCause, IndexingStatus};
 use crate::daemon::lifecycle::{CoreActivity, IdleTimeouts};
 use crate::daemon::registry::PluginRegistry;
 use crate::gc::last_used;
@@ -54,6 +54,9 @@ const BOOTSTRAP_LOCK_FILE: &str = "bootstrap.lock";
 /// project's socket. Not the bootstrap lock: the shim holds that one while
 /// spawning the daemon, so sharing it would deadlock.
 const DAEMON_LOCK_FILE: &str = "daemon.lock";
+/// Written by `g-mesh reindex` and `g-mesh init` for as long as they rebuild
+/// the project's index: their pid, start time and command, one per line.
+const REBUILD_MARKER_FILE: &str = "reindex.pid";
 
 /// Where the lock's holder records that it has begun serving. Beside the lock,
 /// not inside it: on Windows a second handle cannot read a locked file. Only
@@ -182,6 +185,52 @@ fn serving_owner_path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(DAEMON_SERVING_FILE)
 }
 
+pub fn rebuild_marker_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(REBUILD_MARKER_FILE)
+}
+
+/// A CLI rebuild of a project's index in progress, as its marker records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebuild {
+    pub pid: u32,
+    pub started: SystemTime,
+    /// The `g-mesh` subcommand running it: `reindex` or `init`.
+    pub command: String,
+}
+
+/// Records that this process is rebuilding the index whose state directory
+/// holds `path`, on behalf of `g-mesh <command>`.
+pub(crate) fn write_rebuild_marker(path: &Path, command: &str) -> Result<()> {
+    let started = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    fs::write(path, format!("{}\n{started}\n{command}\n", std::process::id()))
+        .with_context(|| format!("failed to write the rebuild marker {}", path.display()))
+}
+
+/// The rebuild holding `root`'s index, if one is running. A marker counts only
+/// while its pid is alive and the daemon lock is held: a rebuild that crashed
+/// leaves a marker naming a dead (or reused) pid, and the kernel has already
+/// released its lock, so the project reads as free.
+pub fn rebuild_in_progress(root: &Path) -> Result<Option<Rebuild>> {
+    rebuild_in_progress_in(&project_dir(root)?)
+}
+
+fn rebuild_in_progress_in(state_dir: &Path) -> Result<Option<Rebuild>> {
+    let Ok(contents) = fs::read_to_string(rebuild_marker_path_in(state_dir)) else {
+        return Ok(None);
+    };
+    let mut lines = contents.lines();
+    let (Some(Ok(pid)), Some(Ok(started))) =
+        (lines.next().map(str::parse::<u32>), lines.next().map(str::parse::<u64>))
+    else {
+        return Ok(None);
+    };
+    let command = lines.next().unwrap_or("reindex").to_string();
+    if !is_process_alive(pid) || !daemon_lock_is_held(state_dir)? {
+        return Ok(None);
+    }
+    Ok(Some(Rebuild { pid, started: UNIX_EPOCH + Duration::from_secs(started), command }))
+}
+
 /// Reads a pid from one of the files above; `None` for "nothing recorded". See
 /// [`read_pid_file_result`] where "could not tell" must differ from that.
 pub fn read_pid_file(path: &Path) -> Option<u32> {
@@ -276,13 +325,21 @@ pub fn run(root: &Path) -> Result<()> {
     // file left here belongs to a reindex that died.
     workspace_reindex::remove_stale_staging(&dir);
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
+    // Read before `ensure_current`, whose reset would hide that one existed:
+    // the session instructions say whether a cold start throws an index away.
+    let had_generation = schema::stored_generation(&conn).is_some();
     // The generation names every discovered plugin's build and core's
     // pipeline, so an index built by a since-rebuilt plugin is thrown away.
-    if schema::ensure_current(&conn, &registry::indexer_version(&discovered))
-        .context("failed to check the index's schema and indexer versions")?
-    {
+    let reinitialized = schema::ensure_current(&conn, &registry::indexer_version(&discovered))
+        .context("failed to check the index's schema and indexer versions")?;
+    if reinitialized {
         crate::log_line!("g-mesh daemon: index (re)initialized - a full reindex is needed");
     }
+    let cold_cause = match (had_generation, reinitialized) {
+        (false, _) => ColdCause::Fresh,
+        (true, true) => ColdCause::Discarded,
+        (true, false) => ColdCause::Incomplete,
+    };
     // Next to the staging cleanup above, once the tables exist: pending rows
     // no pass will clear (a removed plugin, a clear that failed) go.
     workspace_reindex::remove_stale_semantic_pending(&conn, &discovered.manifests);
@@ -298,6 +355,20 @@ pub fn run(root: &Path) -> Result<()> {
     let needs_semantic_pass_retry = !needs_bulk_index
         && !schema::semantic_pass_completed(&conn)
             .context("failed to check whether the project's semantic pass has completed")?;
+    // The languages the last full walk failed that a start still retries
+    // (ADR 0021): only on a walked project, whose walk would otherwise never
+    // revisit them. Unreadable, nothing is retried this start.
+    let retry_languages = if needs_bulk_index {
+        Vec::new()
+    } else {
+        let discovered_languages: Vec<&str> = discovered.manifests.keys().map(String::as_str).collect();
+        schema::languages_owed_a_retry(&conn, &discovered_languages).unwrap_or_else(|err| {
+            crate::log_line!(
+                "g-mesh daemon: could not read which failed languages to retry - none is: {err:#}"
+            );
+            Vec::new()
+        })
+    };
     let conn =
         Arc::new(IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())));
 
@@ -327,7 +398,11 @@ pub fn run(root: &Path) -> Result<()> {
     // Unwalked: `Unindexed` until the first index-needing tool call; walked:
     // `Structural` (the embedding backfill is still owed). The phase file is
     // published next to the pid file, before its absence could mean anything.
-    let indexing = if needs_bulk_index { IndexingStatus::unindexed() } else { IndexingStatus::structural() };
+    let indexing = if needs_bulk_index {
+        IndexingStatus::unindexed_because(cold_cause)
+    } else {
+        IndexingStatus::structural()
+    };
     indexing.attach_phase_file(phase_path_in(&dir));
     indexing.attach_progress_file(progress_path_in(&dir));
     // Attached before the accept loop can hand `indexing` to any session, so
@@ -393,13 +468,15 @@ pub fn run(root: &Path) -> Result<()> {
     // The watcher (D8 in `docs/architecture/lazy-indexing.md`): an unindexed
     // project gets it from activation, right before its walk. A walked one gets
     // it now, and its consumer too unless a semantic-pass retry is owed, which
-    // must run before any incremental pass (activation starts it after that).
+    // must run before any incremental pass, or a failed language's retry is,
+    // so that no edit of it routes while it is still failed (activation
+    // starts the consumer after those).
     // A watcher failure here is fatal: this is startup, with no session to lose.
     let pending_watcher = if needs_bulk_index {
         None
     } else {
         let watcher = ProjectWatcher::new(root).context("failed to start the file watcher")?;
-        if needs_semantic_pass_retry {
+        if needs_semantic_pass_retry || !retry_languages.is_empty() {
             Some(watcher)
         } else {
             spawn_watch_consumer(watcher, Arc::clone(&conn), Arc::clone(&registry), canonical_root.clone());
@@ -420,6 +497,7 @@ pub fn run(root: &Path) -> Result<()> {
             core_activity: Arc::clone(&core_activity),
             needs_walk: needs_bulk_index,
             needs_semantic_pass_retry,
+            retry_languages,
             watcher: pending_watcher,
         },
         activation_trigger,
@@ -611,7 +689,7 @@ const SINGLETON_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 /// returned `File` must live as long as the daemon: the lock is tied to the
 /// open file, so exit or death releases it. A contended lock is retried because
 /// the kernel releases a `kill -9`'d holder's `flock` slightly after it dies.
-fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
+pub(crate) fn acquire_singleton_lock(dir: &Path) -> Result<Option<File>> {
     let path = dir.join(DAEMON_LOCK_FILE);
     let file = File::options()
         .create(true)

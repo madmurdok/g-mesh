@@ -140,7 +140,7 @@ impl Project {
         let conn = open(self.root()).unwrap();
         schema::ensure_current(&conn, "test").unwrap();
         let store = IndexStore::new(conn);
-        bulk_index::run(self.root(), &store, None, &self.language.discovered()).expect("bulk walk");
+        bulk_index::run(self.root(), &store, &self.language.discovered()).expect("bulk walk");
         if self.language.semantic() {
             let plugin = self.spawn();
             plugin

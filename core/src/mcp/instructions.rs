@@ -17,12 +17,14 @@
 //! - A language is rendered by its manifest `language` id; core holds no
 //!   display-name table and no per-language syntax.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::daemon::candidates::Detection;
+use crate::daemon::indexing_status::ColdCause;
 use crate::daemon::manifest::{Capabilities, MemberOverrides, ReceiverCallResolution};
 use crate::languages::LanguageOutcome;
+use crate::storage::schema::MAX_LANGUAGE_RETRIES;
 
 /// Working byte ceiling; one constant because [`build`]'s trim ladder and the
 /// worst-case tests must agree on the same figure.
@@ -33,23 +35,35 @@ const WAIT_IS_NOT_WRONG: &str = " - slow, not wrong; do not abandon it for grep.
 
 /// Prefixed while the project owes its cold start (`Phase::Unindexed` or
 /// `Phase::Walking`): the walk is running now or starts on the first tool
-/// call, and the root tells a caller's g-mesh sessions apart. A root too long
-/// for [`INSTRUCTIONS_BYTE_CEILING`] falls back to [`cold_start_line_fallback`],
-/// so this line is never what breaks the ceiling. A warm rendering never says
-/// the wait: an upgrade wipes the index, so a walk owed after one is a cold
-/// start too (ADR 0022, section 1, row 10).
-fn cold_start_line(root: &Path, walking: bool) -> String {
-    format!("Index root: {}. {}", root.display(), cold_start_line_fallback(walking))
+/// call, and the root tells a caller's g-mesh sessions apart. Before the walk
+/// starts the line names its [`ColdCause`], so an index an upgrade discarded,
+/// or one a walk left half built, does not read as a project never indexed. A
+/// root too long for [`INSTRUCTIONS_BYTE_CEILING`] falls back to
+/// [`cold_start_line_fallback`], so this line is never what breaks the
+/// ceiling. A warm rendering never says the wait: an upgrade wipes the index,
+/// so a walk owed after one is a cold start too (ADR 0022, section 1, row 10).
+fn cold_start_line(root: &Path, walking: bool, cause: ColdCause) -> String {
+    format!("Index root: {}. {}", root.display(), cold_start_line_fallback(walking, cause))
 }
 
 /// [`cold_start_line`] without the root (D12 in
-/// `docs/architecture/lazy-indexing.md`).
-fn cold_start_line_fallback(walking: bool) -> String {
-    let state = if walking {
-        "Being built now - the first tool call waits for it to finish before answering"
-    } else {
-        "Not indexed yet - the first tool call builds it (structural first; semantic search after) and \
-         waits for it"
+/// `docs/architecture/lazy-indexing.md`). The cause is not shown once the walk
+/// runs: by then the wait is the same whatever owed it.
+fn cold_start_line_fallback(walking: bool, cause: ColdCause) -> String {
+    let state = match (walking, cause) {
+        (true, _) => "Being built now - the first tool call waits for it to finish before answering",
+        (false, ColdCause::Fresh) => {
+            "Not indexed yet - the first tool call builds it (structural first; semantic search after) and \
+             waits for it"
+        }
+        (false, ColdCause::Discarded) => {
+            "Index discarded (built by an earlier g-mesh or plugin build) - the first tool call rebuilds it \
+             and waits for it"
+        }
+        (false, ColdCause::Incomplete) => {
+            "Index incomplete (an earlier walk stopped part way) - the first tool call finishes it and waits \
+             for it"
+        }
     };
     format!("{state}{WAIT_IS_NOT_WRONG}")
 }
@@ -62,10 +76,10 @@ fn cold_start_line_fallback(walking: bool) -> String {
 ///
 /// The body is built against the ceiling less the no-path line, so that line
 /// always fits on top of it.
-pub fn cold_start(root: &Path, walking: bool, coverage: &Coverage) -> String {
-    let fallback = cold_start_line_fallback(walking);
+pub fn cold_start(root: &Path, walking: bool, cause: ColdCause, coverage: &Coverage) -> String {
+    let fallback = cold_start_line_fallback(walking, cause);
     let built = build_within(coverage, INSTRUCTIONS_BYTE_CEILING - fallback.len() - 2);
-    let with_path = format!("{}\n\n{built}", cold_start_line(root, walking));
+    let with_path = format!("{}\n\n{built}", cold_start_line(root, walking, cause));
     if with_path.len() <= INSTRUCTIONS_BYTE_CEILING {
         with_path
     } else {
@@ -103,6 +117,10 @@ pub enum Uncovered {
         absent: Vec<(String, Option<usize>)>,
         /// `Failed` languages, with their full error chain.
         failed: Vec<(String, String)>,
+        /// Each failed language's automatic retries so far (absent = 0), or
+        /// `None` when no daemon start retries them (a walk that failed
+        /// every language is retried whole on the next tool call instead).
+        retries: Option<BTreeMap<String, u32>>,
     },
     /// Catalogue languages with no plugin, said conditionally ("if this
     /// project has ... files"): no outcome says which have files, and reading
@@ -125,10 +143,12 @@ impl Coverage {
     /// A warm session's coverage: `indexed` from the index, absent and failed
     /// languages from the recorded `outcomes`, never re-derived. With no
     /// recorded outcome at all (an index from before outcomes were recorded),
-    /// falls back to the conditional `missing` wording.
+    /// falls back to the conditional `missing` wording. `retries`: see
+    /// [`Uncovered::Recorded`].
     pub fn from_outcomes(
         indexed: Vec<PresentLanguage>,
         outcomes: Vec<(String, LanguageOutcome)>,
+        retries: Option<BTreeMap<String, u32>>,
         missing: Vec<String>,
     ) -> Self {
         if outcomes.is_empty() {
@@ -146,7 +166,7 @@ impl Coverage {
         let uncovered = if absent.is_empty() && failed.is_empty() {
             Uncovered::Nothing
         } else {
-            Uncovered::Recorded { absent, failed }
+            Uncovered::Recorded { absent, failed, retries }
         };
         Self { covered: Covered::Indexed(indexed), uncovered }
     }
@@ -309,6 +329,23 @@ fn install_command(language: &str) -> String {
     format!("`g-mesh plugins install {language}`")
 }
 
+/// What a failed language's sentence advises after its names: whether a
+/// daemon start still retries it (`retries` so far; `None` when no start
+/// does), and the reindex command.
+fn failed_advice(retries: Option<u32>, plural: bool) -> String {
+    let (it, plugin) = if plural { ("them", "plugins") } else { ("it", "plugin") };
+    let they = if plural { "they keep" } else { "it keeps" };
+    match retries {
+        None => "fix the plugin, then run `g-mesh reindex`.".to_string(),
+        Some(n) if n < MAX_LANGUAGE_RETRIES => format!(
+            "g-mesh retries {it} on its next start (retry {} of {MAX_LANGUAGE_RETRIES}); if {they} failing, \
+             fix the {plugin}, then run `g-mesh reindex`.",
+            n + 1
+        ),
+        Some(n) => format!("retried {n} times without success; fix the {plugin}, then run `g-mesh reindex`."),
+    }
+}
+
 /// The coverage paragraph (ADR 0022, section 3). `with_errors`: ladder
 /// step 1 names each failed language's error. `with_list`: ladder steps
 /// 1-3 name the covered languages.
@@ -336,7 +373,7 @@ fn coverage_paragraph(coverage: &Coverage, with_errors: bool, with_list: bool) -
                 commands.join(", ")
             ));
         }
-        Uncovered::Recorded { absent, failed } => {
+        Uncovered::Recorded { absent, failed, retries } => {
             if !absent.is_empty() {
                 let items: Vec<String> = absent
                     .iter()
@@ -347,20 +384,26 @@ fn coverage_paragraph(coverage: &Coverage, with_errors: bool, with_list: bool) -
                     .collect();
                 sentences.push(format!("Not indexed, no plugin installed: {}.", items.join(", ")));
             }
-            if !failed.is_empty() {
-                let items: Vec<String> = failed
-                    .iter()
-                    .map(|(language, error)| {
-                        if with_errors {
-                            format!("{language} ({})", error_cause(error))
-                        } else {
-                            language.clone()
-                        }
-                    })
-                    .collect();
+            // One sentence per retry state, in the order of the state's
+            // first language.
+            let mut groups: Vec<(Option<u32>, Vec<String>)> = Vec::new();
+            for (language, error) in failed {
+                let item = if with_errors {
+                    format!("{language} ({})", error_cause(error))
+                } else {
+                    language.clone()
+                };
+                let state = retries.as_ref().map(|retries| retries.get(language).copied().unwrap_or(0));
+                match groups.iter_mut().find(|(group, _)| *group == state) {
+                    Some((_, items)) => items.push(item),
+                    None => groups.push((state, vec![item])),
+                }
+            }
+            for (state, items) in groups {
                 sentences.push(format!(
-                    "Not indexed, plugin failed: {} - fix the plugin, then run `g-mesh reindex`.",
-                    items.join(", ")
+                    "Not indexed, plugin failed: {} - {}",
+                    items.join(", "),
+                    failed_advice(state, items.len() > 1)
                 ));
             }
             sentences.push(TRAILER.to_string());

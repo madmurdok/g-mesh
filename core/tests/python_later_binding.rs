@@ -88,7 +88,7 @@ impl Project {
         // daemon link: without them Python has no `later_import_binds`.
         let plugins = python();
         let conn = IndexStore::new(conn).with_link_rules(link_rules(plugins.manifests.values()));
-        let summary = bulk_index::run(self.root(), &conn, None, &plugins).expect("the bulk walk failed");
+        let summary = bulk_index::run(self.root(), &conn, &plugins).expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes at all");
         assert_eq!(summary.skipped_lines, 0, "the plugin emitted a line core could not read");
         conn.into_inner().unwrap()

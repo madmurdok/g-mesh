@@ -652,16 +652,31 @@ impl GMeshMcpServer {
             return instructions::cold_start(
                 self.registry.project_root(),
                 phase == Phase::Walking,
+                self.indexing.cold_cause(),
                 &coverage,
             );
         }
 
-        let (present, outcomes) = {
+        let (present, outcomes, retries) = {
             let conn = self.store.read();
             (
                 crate::storage::schema::present_languages_with_semantic_state(&conn),
                 crate::storage::schema::language_outcomes(&conn),
+                crate::storage::schema::language_retries(&conn),
             )
+        };
+        // A walk that failed every language is retried whole on the next
+        // tool call, not by a daemon start's per-language retry.
+        let retries = match retries {
+            _ if matches!(phase, Phase::Failed(_)) => None,
+            Ok(retries) => Some(retries),
+            Err(err) => {
+                crate::log_line!(
+                    "g-mesh daemon: failed to read language retries for the MCP instructions, \
+                     leaving the retry state unsaid: {err:#}"
+                );
+                None
+            }
         };
         let covered = match present {
             Ok(present) => instructions::Covered::Indexed(instructions::present_languages(
@@ -678,7 +693,7 @@ impl GMeshMcpServer {
         };
         let coverage = match (covered, outcomes) {
             (instructions::Covered::Indexed(indexed), Ok(outcomes)) => {
-                instructions::Coverage::from_outcomes(indexed, outcomes, missing())
+                instructions::Coverage::from_outcomes(indexed, outcomes, retries, missing())
             }
             (covered, outcomes) => {
                 if let Err(err) = outcomes {

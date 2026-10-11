@@ -372,7 +372,8 @@ async fn a_language_the_daemons_walk_failed_is_not_reindexed_once_its_plugin_wor
 
 /// An `init`-walked index (Python and Rust both indexed) whose recorded
 /// outcome is then made `Failed` for Python, standing in for an earlier walk
-/// that failed it.
+/// that failed it, with its automatic retries used up, so no daemon start
+/// re-walks it.
 fn index_recording_python_as_failed(project: &Project, plugins: &Path) {
     let output = project.init(plugins, &[]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
@@ -384,49 +385,11 @@ fn index_recording_python_as_failed(project: &Project, plugins: &Path) {
         ("python".to_string(), LanguageOutcome::Failed { error: "recorded by an earlier walk".to_string() }),
         ("rust".to_string(), LanguageOutcome::Indexed { files: 1 }),
     ]);
-    schema::record_language_outcomes(&project.index(), &failed).expect("failed to record the outcomes");
-}
-
-/// ADR 0021 section 2, across a restart: an index whose `language_outcome`
-/// table records Python as failed is served by a daemon that does not walk
-/// (the index is complete), yet a Python file edited while no daemon ran is
-/// not reindexed by a query, while the Rust file edited alongside it is.
-///
-/// Control: drop the `registry.seed_failed_languages(&conn)` call in
-/// `daemon::run` - nothing else fills the set (activation does not walk this
-/// complete index, so `ActivationCtx::walk`'s `set_failed_languages` never
-/// runs), the outline call reindexes `tools/gen.py` and `added_python_symbol`
-/// is written.
-#[tokio::test]
-async fn a_failed_language_recorded_in_the_index_is_not_reindexed_after_a_restart() {
-    let project = Project::new(&[("tools/gen.py", "def gen():\n    pass\n")]);
-    let (plugins, binary) = common::rust_and_missing_python_plugin_root();
-    install_python_binary(&binary);
-    index_recording_python_as_failed(&project, plugins.path());
-
-    std::fs::write(
-        project.root().join("tools/gen.py"),
-        "def gen():\n    pass\n\ndef added_python_symbol():\n    pass\n",
-    )
-    .expect("failed to edit the python file");
-    std::fs::write(
-        project.root().join("src/lib.rs"),
-        "pub fn kept_rust_symbol() -> u32 {\n    1\n}\npub fn added_rust_symbol() {}\n",
-    )
-    .expect("failed to edit the rust file");
-
-    let client =
-        ().serve(shim(project.root(), plugins.path())).await.expect("the shim must reach the daemon");
-    activated(project.root()).await;
-    let rust = outline(&client, "src/lib.rs").await;
-    assert!(rust.contains("added_rust_symbol"), "a routed language is reindexed at query time: {rust}");
-    let python = outline(&client, "tools/gen.py").await;
-    assert_eq!(
-        project.count("SELECT COUNT(*) FROM nodes WHERE name = 'added_python_symbol'"),
-        0,
-        "a language recorded as failed must not be reindexed: {python}"
-    );
-    client.cancel().await.expect("failed to shut the client down");
+    let index = project.index();
+    schema::record_language_outcomes(&index, &failed).expect("failed to record the outcomes");
+    for _ in 0..schema::MAX_LANGUAGE_RETRIES {
+        schema::begin_language_retry(&index, "python").expect("failed to count a retry");
+    }
 }
 
 /// `g-mesh daemon` for `project`, started directly rather than through a
@@ -565,6 +528,9 @@ async fn a_failed_language_is_not_reindexed_by_the_first_tool_call_after_a_resta
     let rust = outline(&client, "src/lib.rs").await;
     assert!(rust.contains("added_rust_symbol"), "a routed language is reindexed at query time: {rust}");
     assert!(!has_node(&project, "added_python_symbol"), "nor may any later step: {python}");
+    activated(project.root()).await;
+    let python = outline(&client, "tools/gen.py").await;
+    assert!(!has_node(&project, "added_python_symbol"), "nor a call once activation has finished: {python}");
     client.cancel().await.expect("failed to shut the client down");
 }
 
@@ -665,9 +631,101 @@ fn the_daemons_log_line_for_a_failed_language_is_its_whole_chain_on_one_line() {
     assert_eq!(
         lines,
         [format!(
-            "g-mesh daemon: python failed to index and is left out of the index until `g-mesh reindex`: {}",
+            "g-mesh daemon: python failed to index and is left out of the index - the next 2 daemon starts \
+             retry it, or run `g-mesh reindex`: {}",
             causes.join(": ")
         )],
         "one line with every cause: {stderr}"
     );
+}
+
+/// `g-mesh status` in the project's directory with `flags`, against the same
+/// plugin root `init` used.
+fn status(project: &Project, plugins: &Path, flags: &[&str]) -> Output {
+    StdCommand::new(BIN)
+        .arg("status")
+        .args(flags)
+        .current_dir(project.root())
+        .env("G_MESH_PLUGIN_ROOTS_OVERRIDE", plugins)
+        .output()
+        .expect("failed to run `g-mesh status`")
+}
+
+/// `status`'s stdout as the one JSON object it must be.
+fn status_json(project: &Project, plugins: &Path, flags: &[&str]) -> serde_json::Value {
+    let output = status(project, plugins, flags);
+    assert_eq!(output.status.code(), Some(0), "status exits 0 whatever the outcomes: {}", describe(&output));
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("stdout is not one JSON object ({err}): {}", describe(&output)))
+}
+
+/// Against a real index: after the partial `init` (failed python,
+/// absent go, indexed rust), `status --json` and `status --full --json`
+/// exit 0 and report the three languages with the installed plugin's
+/// version; only `--full` walks the project for coverage. The light text
+/// view names the same three rows and `not checked`.
+///
+/// Controls: in `run`, always `Mode::Light` -> the full JSON's coverage is
+/// null; in `LanguagesReport::rows`, `plugin_version: None` -> no versions.
+#[test]
+fn status_reports_each_languages_outcome_in_light_and_full_json() {
+    let project =
+        Project::new(&[("tools/gen.py", "def gen():\n    pass\n"), ("cmd/main.go", "package main\n")]);
+    let (plugins, binary) = common::rust_and_missing_python_plugin_root();
+    let init = project.init(plugins.path(), &[]);
+    assert_eq!(init.status.code(), Some(2), "{}", describe(&init));
+    let discovered = daemon::manifest::discover(&[plugins.path().to_path_buf()]).expect("discovery");
+    let version = |language: &str| discovered.manifests[language].plugin_version.clone();
+
+    let light = status_json(&project, plugins.path(), &["--json"]);
+    let full = status_json(&project, plugins.path(), &["--full", "--json"]);
+
+    assert_eq!(light["mode"], "light");
+    assert_eq!(full["mode"], "full");
+    assert!(light["index"]["coverage"].is_null(), "light does not walk: {light}");
+    let coverage = &full["index"]["coverage"];
+    assert_eq!(coverage["indexed"], 1, "src/lib.rs: {coverage}");
+    assert_eq!(coverage["discovered"], 2, "src/lib.rs and tools/gen.py (go has no plugin): {coverage}");
+
+    for report in [&light, &full] {
+        assert_eq!(report["formatVersion"], 1);
+        let languages = &report["languages"];
+        assert_eq!(languages["state"], "recorded", "{languages}");
+        assert!(languages["pluginDiscoveryError"].is_null(), "{languages}");
+        let outcomes = languages["outcomes"].as_array().expect("an outcomes array");
+        assert_eq!(outcomes.len(), 3, "{languages}");
+        assert_eq!(
+            outcomes[0],
+            json!({ "language": "go", "outcome": "plugin_absent", "files": 1, "pluginVersion": null,
+                    "installCommand": "g-mesh plugins install go" })
+        );
+        let python = &outcomes[1];
+        assert_eq!(python["language"], "python");
+        assert_eq!(python["outcome"], "failed");
+        assert_eq!(python["pluginVersion"], version("python").as_str(), "python's plugin is installed");
+        let error = python["error"].as_str().expect("a failed outcome carries its error");
+        assert!(error.contains(&binary.display().to_string()), "the error names the binary: {error}");
+        let causes = python["causes"].as_array().expect("and its causes");
+        assert!(!causes.is_empty() && causes.iter().all(|cause| cause.is_string()), "{python}");
+        assert!(python.get("files").is_none() && python.get("installCommand").is_none(), "{python}");
+        assert_eq!(
+            outcomes[2],
+            json!({ "language": "rust", "outcome": "indexed", "files": 1, "pluginVersion": version("rust") })
+        );
+    }
+
+    let text = status(&project, plugins.path(), &[]);
+    assert_eq!(text.status.code(), Some(0), "{}", describe(&text));
+    let text = String::from_utf8_lossy(&text.stdout).into_owned();
+    for expected in [
+        "  index coverage:  not checked".to_string(),
+        "  languages:       3 recorded by the last walk".to_string(),
+        "    go:            plugin absent - 1 file(s) not indexed; install it with `g-mesh plugins install go`"
+            .to_string(),
+        format!("    python:        failed (plugin {}) - not in the index:", version("python")),
+        format!("    rust:          indexed, 1 file (plugin {})", version("rust")),
+    ] {
+        assert!(text.contains(&expected), "missing {expected:?} in:\n{text}");
+    }
+    assert!(!text.contains("dirty files:"), "{text}");
 }

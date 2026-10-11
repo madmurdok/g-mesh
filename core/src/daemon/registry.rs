@@ -601,10 +601,11 @@ pub struct PluginRegistry {
     /// error, so it gets one line per extension for the whole daemon run
     /// rather than one per file - see [`unroutable_notice`](Self::unroutable_notice).
     unroutable: Mutex<HashSet<String>>,
-    /// Languages whose bulk walk failed, set once by the walk for the rest of
-    /// this daemon's life. Their files are not routed: a single-file update
-    /// would put part of a language into an index that holds it wholly or not
-    /// at all (ADR 0021).
+    /// Languages whose bulk walk failed, set by the walk (or seeded from its
+    /// recorded outcomes at startup); a language leaves it only when a start's
+    /// retry has swapped it in. Their files are not routed: a single-file
+    /// update would put part of a language into an index that holds it wholly
+    /// or not at all (ADR 0021).
     failed_languages: Mutex<HashSet<String>>,
 }
 
@@ -691,6 +692,13 @@ impl PluginRegistry {
                  excluded from incremental updates until the next walk: {err:#}"
             ),
         }
+    }
+
+    /// Removes `language` from the failed set, so its files are routed again.
+    /// Called once a retry has swapped the whole language in and recorded its
+    /// staleness baselines.
+    pub(crate) fn clear_failed_language(&self, language: &str) {
+        self.failed_languages.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(language);
     }
 
     /// Whether the bulk walk failed `language`, so its files are not routed.

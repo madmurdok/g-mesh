@@ -25,10 +25,18 @@
 //! - **Index progress**: `index.progress` counters, shown only while their
 //!   pid is the live daemon's ([`live_progress`]).
 //! - **Dirty files / index coverage**: a gitignore-aware walk cross-referenced
-//!   against `File` nodes and `indexed_files` baselines (see [`IndexStatus`]).
+//!   against `File` nodes and `indexed_files` baselines (see [`Coverage`]).
+//!   The only part that costs one `stat` per project file, so it runs only
+//!   under `--full` ([`Mode::Full`]); the default view says it was not checked.
+//! - **Languages**: what the last walk recorded per language
+//!   (`language_outcome`, ADR 0021) beside the version of each installed
+//!   plugin, plus installed plugins the last walk did not see
+//!   ([`LanguageSection`]).
 //! - **Files with syntax errors**: the plugin's `hasSyntaxErrors` flag.
+//!
+//! `--json` prints the same report as one object ([`to_json`]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -43,9 +51,10 @@ use crate::daemon::indexing_status::{group_thousands, ProgressSnapshot};
 use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
+use crate::languages::LanguageOutcome;
 use crate::project_walk;
 use crate::storage::connection::project_dir;
-use crate::storage::schema::SemanticLeftover;
+use crate::storage::schema::{SemanticLeftover, MAX_LANGUAGE_RETRIES};
 use crate::watcher::staleness::mtime_millis;
 
 /// Whether a daemon core is serving this project.
@@ -158,6 +167,25 @@ pub struct IndexStatus {
     /// pass left for the next start (residual, GM-521) and the files no pass
     /// ever answered, sorted by language.
     pub semantic_leftovers: Vec<SemanticLeftover>,
+    /// What the project walk found against the index; `None` in
+    /// [`Mode::Light`], which does not walk the project.
+    pub coverage: Option<Coverage>,
+    /// Project-relative paths of files the plugin flagged as only partially
+    /// parseable, sorted.
+    pub syntax_error_files: Vec<String>,
+}
+
+/// Which `status` view to build: [`Mode::Light`] reads only state files and
+/// the index; [`Mode::Full`] also walks the project for [`Coverage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Light,
+    Full,
+}
+
+/// The index against the project on disk, from one gitignore-aware walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Coverage {
     /// Source files found on disk now - the denominator of coverage.
     pub discovered: usize,
     /// How many of those the index has a `File` node for.
@@ -171,15 +199,12 @@ pub struct IndexStatus {
     /// none at all, so a missing baseline means "not checked since", not
     /// "stale".
     pub dirty: usize,
-    /// Project-relative paths of files the plugin flagged as only partially
-    /// parseable, sorted.
-    pub syntax_error_files: Vec<String>,
 }
 
-impl IndexStatus {
+impl Coverage {
     /// Indexed files over discovered files. A project with no source files at
     /// all is fully covered rather than a division by zero.
-    pub fn coverage(&self) -> f64 {
+    pub fn ratio(&self) -> f64 {
         if self.discovered == 0 {
             return 1.0;
         }
@@ -187,9 +212,92 @@ impl IndexStatus {
     }
 }
 
+/// What the index records per language, as far as this index can say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanguageSection {
+    /// No `index.db` yet.
+    NoIndex,
+    /// The directory is a front (D11): there is no index to read.
+    Front,
+    /// The index has no `language_outcome` table: it was built by a schema
+    /// before per-language outcomes, and the next daemon start rebuilds it.
+    /// `schema_version` is `meta.schema_version` when readable.
+    PredatesOutcomes { schema_version: Option<String> },
+    /// No outcome recorded, and a live daemon is walking (or about to walk)
+    /// the project: the walk records them when it finishes.
+    WalkInProgress,
+    /// No outcome recorded and no walk under way.
+    NoneRecorded,
+    /// The last walk's outcomes, sorted by language
+    /// (`storage::schema::language_outcomes`).
+    Recorded(Vec<(String, LanguageOutcome)>),
+}
+
+/// The languages part of the report: the index's outcomes and the plugins
+/// installed now (`manifest::discover`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguagesReport {
+    pub section: LanguageSection,
+    /// `language -> plugin_version` of every discovered plugin, or the
+    /// discovery error (a malformed `plugin.toml`) on one line.
+    pub installed: std::result::Result<BTreeMap<String, String>, String>,
+    /// Each failed language's automatic retries since the last full walk
+    /// (`storage::schema::language_retries`); a language with none is absent.
+    pub retries: BTreeMap<String, u32>,
+}
+
+/// One row of the languages block: a recorded outcome, or `None` for a
+/// plugin installed now that the last walk did not see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageRow<'a> {
+    pub language: &'a str,
+    pub outcome: Option<&'a LanguageOutcome>,
+    /// The installed plugin's version; `None` when not installed or when
+    /// discovery failed.
+    pub plugin_version: Option<&'a str>,
+    /// The language's automatic retries since the last full walk.
+    pub retries: u32,
+}
+
+impl LanguagesReport {
+    /// Every row, sorted by language: the recorded outcomes, plus each
+    /// installed plugin without one. Empty unless outcomes are recorded.
+    pub fn rows(&self) -> Vec<LanguageRow<'_>> {
+        let LanguageSection::Recorded(outcomes) = &self.section else {
+            return Vec::new();
+        };
+        let installed = self.installed.as_ref().ok();
+        let version = |language: &str| installed.and_then(|map| map.get(language)).map(String::as_str);
+        let mut rows: Vec<LanguageRow<'_>> = outcomes
+            .iter()
+            .map(|(language, outcome)| LanguageRow {
+                language,
+                outcome: Some(outcome),
+                plugin_version: version(language),
+                retries: self.retries.get(language).copied().unwrap_or(0),
+            })
+            .collect();
+        if let Some(installed) = installed {
+            for (language, plugin_version) in installed {
+                if !outcomes.iter().any(|(recorded, _)| recorded == language) {
+                    rows.push(LanguageRow {
+                        language,
+                        outcome: None,
+                        plugin_version: Some(plugin_version),
+                        retries: 0,
+                    });
+                }
+            }
+        }
+        rows.sort_by(|a, b| a.language.cmp(b.language));
+        rows
+    }
+}
+
 /// Everything `g-mesh status` prints, as data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Report {
+    pub mode: Mode,
     pub project_root: PathBuf,
     pub project_id: String,
     pub state_dir: PathBuf,
@@ -216,6 +324,7 @@ pub struct Report {
     /// daemon wrote them - [`render`] shows them only while their `pid` is
     /// the live daemon's (see [`live_progress`]).
     pub progress: Option<ProgressSnapshot>,
+    pub languages: LanguagesReport,
 }
 
 /// What `g-mesh status` says about a front: how many projects, and whether
@@ -229,16 +338,28 @@ pub struct FrontSummary {
 /// Reports on the project the current directory belongs to, then prints the
 /// GC idle-project warning (`gc::warning`) when it applies. That warning is
 /// printed for this human-facing command only, never for `mcp-shim` or
-/// `daemon`, whose stdout is protocol traffic.
-pub fn run() -> Result<()> {
+/// `daemon`, whose stdout is protocol traffic; under `--json` it goes to
+/// stderr so stdout stays one JSON object. Exits 0 whatever the report says.
+pub fn run(full: bool, json: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to resolve the current directory")?;
-    print!("{}", render(&collect(&cwd)?));
-    warning::maybe_print_stale_projects_warning()?;
+    let mode = if full { Mode::Full } else { Mode::Light };
+    let report = collect(&cwd, mode)?;
+    if json {
+        let text = serde_json::to_string_pretty(&to_json(&report)).context("failed to encode the status")?;
+        println!("{text}");
+        if let Some(text) = warning::stale_projects_warning()? {
+            eprint!("{text}");
+        }
+    } else {
+        print!("{}", render(&report));
+        warning::maybe_print_stale_projects_warning()?;
+    }
     Ok(())
 }
 
-/// Gathers every field of the report for `project_root`.
-pub fn collect(project_root: &Path) -> Result<Report> {
+/// Gathers every field of the report for `project_root`. Only
+/// [`Mode::Full`] walks the project's files.
+pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
     let state_dir = project_dir(project_root).context("failed to resolve the project's state directory")?;
     let project_id =
         state_dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
@@ -249,8 +370,29 @@ pub fn collect(project_root: &Path) -> Result<Report> {
         let walk = daemon::candidates::walk(project_root, daemon::candidates::Limits::default());
         FrontSummary { projects: walk.candidates.len(), truncated: walk.truncated }
     });
-    let index = if front.is_some() {
-        IndexStatus {
+    // The same discovery the daemon runs at startup, so the files counted
+    // here are the files the discovered plugins index, in every language.
+    // A failure is reported rather than fatal, except where the walk needs
+    // the plugins to know which files count.
+    let discovered = manifest::discover(&manifest::default_roots());
+    if mode == Mode::Full && front.is_none() {
+        if let Err(err) = &discovered {
+            anyhow::bail!("failed to discover language plugins: {err:#}");
+        }
+    }
+    let installed = match &discovered {
+        Ok(plugins) => Ok(plugins
+            .manifests
+            .iter()
+            .map(|(language, manifest)| (language.clone(), manifest.plugin_version.clone()))
+            .collect()),
+        Err(err) => Err(format!("{err:#}")),
+    };
+    let plugins = discovered.unwrap_or_default();
+
+    let db_path = state_dir.join("index.db");
+    let (index, section) = if front.is_some() {
+        let index = IndexStatus {
             bulk_indexed: false,
             semantic_pass_completed: false,
             semantic_pass_owed: Vec::new(),
@@ -258,19 +400,23 @@ pub fn collect(project_root: &Path) -> Result<Report> {
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: 0,
-            indexed: 0,
-            dirty: 0,
+            coverage: None,
             syntax_error_files: Vec::new(),
-        }
+        };
+        (index, LanguageSection::Front)
     } else {
-        // The same discovery the daemon runs at startup, so the files counted
-        // here are the files the discovered plugins index, in every language.
-        let plugins =
-            manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
-        index_status(project_root, &state_dir.join("index.db"), &plugins)?
+        // A phase word left by a dead daemon says nothing about a walk now.
+        let live_phase = if matches!(core, CoreState::NotRunning) { None } else { phase.as_deref() };
+        let walk_live = matches!(live_phase, Some("walking" | "unindexed"));
+        (index_status(project_root, &db_path, &plugins, mode)?, language_section(&db_path, walk_live)?)
+    };
+    let retries = if matches!(section, LanguageSection::Recorded(_)) {
+        language_retries(&db_path)
+    } else {
+        BTreeMap::new()
     };
     Ok(Report {
+        mode,
         project_id,
         core,
         build: build_state(core, &state_dir),
@@ -282,9 +428,77 @@ pub fn collect(project_root: &Path) -> Result<Report> {
         phase,
         front,
         progress: daemon::read_progress_in(&state_dir),
+        languages: LanguagesReport { section, installed, retries },
         project_root: project_root.to_path_buf(),
         state_dir,
     })
+}
+
+/// What the index at `db_path` records per language. `walk_live` is whether
+/// a live daemon's phase is `walking` or `unindexed`, which tells "not
+/// recorded yet" from "none recorded" on an index with no outcome rows.
+/// Probes for the table first: an index from before per-language outcomes
+/// has none, and says so rather than looking like an empty list.
+pub fn language_section(db_path: &Path, walk_live: bool) -> Result<LanguageSection> {
+    if !db_path.exists() {
+        return Ok(LanguageSection::NoIndex);
+    }
+    let conn = open_index(db_path)?;
+    let has_table: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'language_outcome')",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to look for the language outcome table")?;
+    if !has_table {
+        use rusqlite::OptionalExtension as _;
+        let schema_version = conn
+            .query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get::<_, String>(0))
+            .optional()
+            .ok()
+            .flatten();
+        return Ok(LanguageSection::PredatesOutcomes { schema_version });
+    }
+    let outcomes = crate::storage::schema::language_outcomes(&conn)?;
+    Ok(if !outcomes.is_empty() {
+        LanguageSection::Recorded(outcomes)
+    } else if walk_live {
+        LanguageSection::WalkInProgress
+    } else {
+        LanguageSection::NoneRecorded
+    })
+}
+
+/// Each language's automatic retries (`language_retry`), empty when the index
+/// has no such table yet or cannot be read: the count only adds to a failed
+/// line, so a failure to read it costs that clause, not the report.
+pub fn language_retries(db_path: &Path) -> BTreeMap<String, u32> {
+    let read = || -> Result<BTreeMap<String, u32>> {
+        let conn = open_index(db_path)?;
+        let has_table: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'language_retry')",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed to look for the language retry table")?;
+        if !has_table {
+            return Ok(BTreeMap::new());
+        }
+        crate::storage::schema::language_retries(&conn)
+    };
+    read().unwrap_or_default()
+}
+
+/// Opens an existing index for reading. Read-write without CREATE, for the
+/// same reason `gc::last_used` uses it: recovering a WAL an abandoned daemon
+/// left behind needs write access, and a missing database must never be
+/// conjured into existence by a command that only reports. Nothing here
+/// writes.
+fn open_index(db_path: &Path) -> Result<Connection> {
+    Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI)
+        .with_context(|| format!("failed to open the project index at {}", db_path.display()))
 }
 
 fn core_state(project_root: &Path) -> Result<CoreState> {
@@ -363,11 +577,19 @@ fn classify_plugin(pid: u32, core: CoreState) -> PluginState {
     }
 }
 
-/// Cross-references what is on disk against what the index knows about it.
-/// Takes the database path explicitly so it can be tested against a
+/// What the index knows, and in [`Mode::Full`] how it compares with what is
+/// on disk. Takes the database path explicitly so it can be tested against a
 /// hand-built index.
-pub fn index_status(project_root: &Path, db_path: &Path, plugins: &DiscoveredPlugins) -> Result<IndexStatus> {
-    let discovered = discover_source_files(project_root, plugins)?;
+pub fn index_status(
+    project_root: &Path,
+    db_path: &Path,
+    plugins: &DiscoveredPlugins,
+    mode: Mode,
+) -> Result<IndexStatus> {
+    let discovered = match mode {
+        Mode::Full => Some(discover_source_files(project_root, plugins)?),
+        Mode::Light => None,
+    };
 
     // No index yet (never bootstrapped, or deleted by hand): everything on
     // disk is owed work, and none of it is covered.
@@ -380,39 +602,20 @@ pub fn index_status(project_root: &Path, db_path: &Path, plugins: &DiscoveredPlu
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
             semantic_leftovers: Vec::new(),
-            discovered: discovered.len(),
-            indexed: 0,
-            dirty: discovered.len(),
+            coverage: discovered.map(|files| Coverage {
+                discovered: files.len(),
+                indexed: 0,
+                dirty: files.len(),
+            }),
             syntax_error_files: Vec::new(),
         });
     }
 
-    // Read-write without CREATE, for the same reason `gc::last_used` uses it:
-    // recovering a WAL an abandoned daemon left behind needs write access,
-    // and a missing database must never be conjured into existence by a
-    // command that only reports. Nothing here writes.
-    let conn =
-        Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI)
-            .with_context(|| format!("failed to open the project index at {}", db_path.display()))?;
-
-    let indexed_files = indexed_file_paths(&conn)?;
-    let baselines = recorded_baselines(&conn)?;
-
-    let mut indexed = 0;
-    let mut dirty = 0;
-    for file in &discovered {
-        if !indexed_files.contains(&file.relative) {
-            // Never indexed - the one case that is both uncovered and dirty.
-            dirty += 1;
-            continue;
-        }
-        indexed += 1;
-        if let Some(&recorded_mtime) = baselines.get(&file.relative) {
-            if recorded_mtime != file.mtime_millis {
-                dirty += 1;
-            }
-        }
-    }
+    let conn = open_index(db_path)?;
+    let coverage = match discovered {
+        Some(files) => Some(coverage(&conn, &files)?),
+        None => None,
+    };
 
     let capable: HashSet<String> =
         manifest::semantic_pass_capable_languages(&plugins.manifests).into_iter().collect();
@@ -432,11 +635,33 @@ pub fn index_status(project_root: &Path, db_path: &Path, plugins: &DiscoveredPlu
             .into_iter()
             .filter(|leftover| capable.contains(&leftover.language))
             .collect(),
-        discovered: discovered.len(),
-        indexed,
-        dirty,
+        coverage,
         syntax_error_files: syntax_error_files(&conn)?,
     })
+}
+
+/// Cross-references the files a project walk found against the index's
+/// `File` nodes and `indexed_files` baselines.
+fn coverage(conn: &Connection, discovered: &[SourceFile]) -> Result<Coverage> {
+    let indexed_files = indexed_file_paths(conn)?;
+    let baselines = recorded_baselines(conn)?;
+
+    let mut indexed = 0;
+    let mut dirty = 0;
+    for file in discovered {
+        if !indexed_files.contains(&file.relative) {
+            // Never indexed - the one case that is both uncovered and dirty.
+            dirty += 1;
+            continue;
+        }
+        indexed += 1;
+        if let Some(&recorded_mtime) = baselines.get(&file.relative) {
+            if recorded_mtime != file.mtime_millis {
+                dirty += 1;
+            }
+        }
+    }
+    Ok(Coverage { discovered: discovered.len(), indexed, dirty })
 }
 
 /// The semantic-pending languages a reader should believe: capable, and whose
@@ -680,17 +905,32 @@ pub fn render(report: &Report) -> String {
             "  overall:         ~{estimate:.0}% (estimate: walk 40%, semantic pass 20%, embeddings 40% of the work)"
         );
     }
-    let _ = writeln!(
-        out,
-        "  index coverage:  {:.1}% ({}/{} source files)",
-        index.coverage() * 100.0,
-        index.indexed,
-        index.discovered
-    );
-    if !index.bulk_indexed && phase == Some("walking") {
-        let _ = writeln!(out, "  dirty files:     {} awaiting the walk already in progress", index.dirty);
-    } else {
-        let _ = writeln!(out, "  dirty files:     {} awaiting reindex", index.dirty);
+    match &index.coverage {
+        Some(coverage) => {
+            let _ = writeln!(
+                out,
+                "  index coverage:  {:.1}% ({}/{} source files)",
+                coverage.ratio() * 100.0,
+                coverage.indexed,
+                coverage.discovered
+            );
+            if !index.bulk_indexed && phase == Some("walking") {
+                let _ = writeln!(
+                    out,
+                    "  dirty files:     {} awaiting the walk already in progress",
+                    coverage.dirty
+                );
+            } else {
+                let _ = writeln!(out, "  dirty files:     {} awaiting reindex", coverage.dirty);
+            }
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "  index coverage:  not checked - `g-mesh status --full` walks the project for coverage and \
+                 dirty files"
+            );
+        }
     }
 
     // Only once a walk has landed: before that `index:` already says what is
@@ -735,6 +975,10 @@ pub fn render(report: &Report) -> String {
         );
     }
 
+    for line in language_lines(&report.languages) {
+        let _ = writeln!(out, "{line}");
+    }
+
     if index.syntax_error_files.is_empty() {
         let _ = writeln!(out, "  syntax errors:   none");
     } else {
@@ -754,6 +998,90 @@ pub(crate) fn live_progress(report: &Report) -> Option<&ProgressSnapshot> {
     match report.core {
         CoreState::Running { pid } => report.progress.as_ref().filter(|progress| progress.pid == pid),
         _ => None,
+    }
+}
+
+/// The `languages:` block: a header line, then one row per language.
+pub(crate) fn language_lines(languages: &LanguagesReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    let header = match &languages.section {
+        LanguageSection::Front => return lines,
+        LanguageSection::NoIndex => "none recorded - no index yet".to_string(),
+        LanguageSection::PredatesOutcomes { schema_version } => format!(
+            "not recorded - this index predates per-language outcomes (schema {}); the next daemon \
+             start rebuilds it",
+            schema_version.as_deref().unwrap_or("unknown")
+        ),
+        LanguageSection::WalkInProgress => {
+            "not recorded yet - the walk in progress records them when it finishes".to_string()
+        }
+        LanguageSection::NoneRecorded => {
+            "none recorded - no walk has finished on this index; run `g-mesh reindex`".to_string()
+        }
+        LanguageSection::Recorded(outcomes) => format!("{} recorded by the last walk", outcomes.len()),
+    };
+    lines.push(format!("  languages:       {header}"));
+    let discovery_failed = languages.installed.is_err();
+    for row in languages.rows() {
+        lines.push(format!(
+            "    {:<15}{}",
+            format!("{}:", row.language),
+            describe_language_row(&row, discovery_failed)
+        ));
+    }
+    if let Err(err) = &languages.installed {
+        lines.push(format!("  plugins:         discovery failed - {err}"));
+    }
+    lines
+}
+
+/// One language row's text, after its name. `discovery_failed` drops every
+/// version clause: nothing is known about what is installed.
+fn describe_language_row(row: &LanguageRow<'_>, discovery_failed: bool) -> String {
+    let version = || match (discovery_failed, row.plugin_version) {
+        (true, _) => String::new(),
+        (false, Some(version)) => format!(" (plugin {version})"),
+        (false, None) => " (plugin no longer installed)".to_string(),
+    };
+    match row.outcome {
+        None => format!("installed {} - not in the last walk", row.plugin_version.unwrap_or("?")),
+        Some(LanguageOutcome::Indexed { files }) => {
+            let unit = if *files == 1 { "file" } else { "files" };
+            format!("indexed, {files} {unit}{}", version())
+        }
+        Some(LanguageOutcome::Failed { error }) => {
+            // Only an installed plugin is retried: a removed one changes the
+            // indexer version, and the next start re-walks everything.
+            let retry = match (discovery_failed, row.plugin_version) {
+                (false, Some(_)) if row.retries < MAX_LANGUAGE_RETRIES => {
+                    format!("; retry {} of {MAX_LANGUAGE_RETRIES} on the next start", row.retries + 1)
+                }
+                (false, Some(_)) => "; retries used up - run `g-mesh reindex`".to_string(),
+                _ => String::new(),
+            };
+            format!(
+                "failed{} - not in the index: {}{retry}",
+                version(),
+                crate::languages::error_on_one_line(error)
+            )
+        }
+        Some(LanguageOutcome::PluginAbsent { files }) => {
+            if let Some(installed) = row.plugin_version {
+                return format!(
+                    "plugin absent at the last walk; {installed} installed since - the next daemon start re-walks"
+                );
+            }
+            let what = match files {
+                Some(files) => format!("{files} file(s) not indexed"),
+                None => "its files are not indexed (not counted)".to_string(),
+            };
+            match crate::languages::entry(row.language) {
+                Some(entry) => {
+                    format!("plugin absent - {what}; install it with `{}`", entry.install_command())
+                }
+                None => format!("plugin absent - {what}"),
+            }
+        }
     }
 }
 
@@ -939,6 +1267,9 @@ fn plural(count: u64, unit: &str) -> String {
     let suffix = if count == 1 { "" } else { "s" };
     format!("{count} {unit}{suffix} ago")
 }
+
+mod json;
+pub use json::to_json;
 
 #[cfg(test)]
 mod tests;

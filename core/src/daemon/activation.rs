@@ -47,6 +47,7 @@ use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::manifest::DiscoveredPlugins;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
+use crate::daemon::workspace_reindex;
 use crate::embedding::EmbeddingPipeline;
 use crate::languages::LanguageOutcome;
 use crate::storage::index_store::IndexStore;
@@ -76,12 +77,18 @@ pub(super) struct ActivationCtx {
     /// `daemon::semantic`'s module doc. Never set together with `needs_walk`:
     /// a walk runs the pass itself.
     pub needs_semantic_pass_retry: bool,
+    /// The languages the last full walk failed that a daemon start still owes
+    /// a retry (`schema::languages_owed_a_retry`), each retried once by this
+    /// activation. Empty whenever `needs_walk` is set: a walk records every
+    /// language's outcome afresh.
+    pub retry_languages: Vec<String>,
     /// A watcher whose consumer this activation still owes (D8). `Some` for
-    /// an already-walked project whose semantic retry is owed: `daemon::run`
-    /// registered it at startup but left it undrained until the retry is
-    /// done. `None` both for a project whose consumer already runs and for
-    /// an unindexed project - `needs_walk` tells those apart, and for the
-    /// latter this activation registers the watcher itself, before its walk.
+    /// an already-walked project whose semantic retry or language retry is
+    /// owed: `daemon::run` registered it at startup but left it undrained
+    /// until the retries are done. `None` both for a project whose consumer
+    /// already runs and for an unindexed project - `needs_walk` tells those
+    /// apart, and for the latter this activation registers the watcher
+    /// itself, before its walk.
     pub watcher: Option<ProjectWatcher>,
 }
 
@@ -146,6 +153,11 @@ impl ActivationCtx {
                 .log("the previously-interrupted index");
             self.needs_semantic_pass_retry = false;
         }
+        // Before the watcher's consumer too: an edit queued meanwhile routes
+        // after the retry, to a language no longer failed, so none is lost.
+        if !self.retry_languages.is_empty() {
+            self.retry_failed_languages();
+        }
 
         // After the structural walk and its semantic pass, never before: a
         // bulk walk racing incremental updates could commit its own (older)
@@ -207,6 +219,60 @@ impl ActivationCtx {
         Ok(())
     }
 
+    /// Retries each of `retry_languages` once, in order: counts the retry
+    /// (before the walk, so a retry that hangs or takes the daemon down still
+    /// uses it), spawns the language's plugin and re-walks and swaps the
+    /// language in (`workspace_reindex::retry_failed`). A failed retry
+    /// records its cause as the language's error and leaves the language
+    /// failed. Best-effort: nothing here fails the activation.
+    fn retry_failed_languages(&mut self) {
+        for language in std::mem::take(&mut self.retry_languages) {
+            let retry = match self.conn.with(|conn| schema::begin_language_retry(conn, &language)) {
+                Ok(retry) => retry,
+                Err(err) => {
+                    crate::log_line!(
+                        "g-mesh daemon: could not count a retry of {language} - not retried: {err:#}"
+                    );
+                    continue;
+                }
+            };
+            let of = schema::MAX_LANGUAGE_RETRIES;
+            crate::log_line!(
+                "g-mesh daemon: retrying {language}, which failed the last walk - retry {retry} of {of}"
+            );
+            // Before the plugin is spawned: the baselines rest on it.
+            let walk_started = std::time::SystemTime::now();
+            let attempt = panic::catch_unwind(AssertUnwindSafe(|| {
+                let supervisor = self.registry.get_or_spawn(&language)?;
+                workspace_reindex::retry_failed(&self.registry, &supervisor, &self.conn, walk_started)
+            }));
+            let err = match attempt {
+                Ok(Ok(())) => {
+                    crate::log_line!(
+                        "g-mesh daemon: {language} retry {retry} of {of} succeeded - it is indexed"
+                    );
+                    continue;
+                }
+                Ok(Err(err)) => err,
+                Err(_) => anyhow::anyhow!("the retry of {language} panicked"),
+            };
+            let error = crate::languages::failed_error(&err);
+            if let Err(record) =
+                self.conn.with(|conn| schema::record_language_retry_failed(conn, &language, &error))
+            {
+                crate::log_line!(
+                    "g-mesh daemon: could not record the failed retry of {language}: {record:#}"
+                );
+            }
+            let next = if retry < of {
+                "the next start retries it"
+            } else {
+                "no retry left - fix the plugin, then run `g-mesh reindex`"
+            };
+            crate::log_line!("g-mesh daemon: {language} retry {retry} of {of} failed ({err:#}) - {next}");
+        }
+    }
+
     /// The structural walk, its completion marker and the semantic pass that
     /// follows it.
     fn walk(&mut self) -> Result<()> {
@@ -225,14 +291,13 @@ impl ActivationCtx {
             self.watcher = Some(ProjectWatcher::new(&self.root).context("failed to start the file watcher")?);
         }
 
-        // `embedding: None` - the walk is structural-only;
-        // embedding is the backfill pass's job (`activate`). A tool call
-        // issued while this runs waits for it (`mcp::GMeshMcpServer::prepare`)
-        // rather than being answered off a half-built graph.
+        // The walk is structural-only; embedding is the backfill pass's
+        // job (`activate`). A tool call issued while this runs waits for it
+        // (`mcp::GMeshMcpServer::prepare`) rather than being answered off a
+        // half-built graph.
         let summary = bulk_index::run_with_progress(
             &self.canonical_root,
             &self.conn,
-            None,
             &self.discovered_for_bulk_index,
             Some(&self.indexing),
         )
@@ -243,8 +308,9 @@ impl ActivationCtx {
         for (language, outcome) in &summary.outcomes {
             match outcome {
                 LanguageOutcome::Failed { error } => crate::log_line!(
-                    "g-mesh daemon: {language} failed to index and is left out of the index until \
-                     `g-mesh reindex`: {}",
+                    "g-mesh daemon: {language} failed to index and is left out of the index - the next \
+                     {} daemon starts retry it, or run `g-mesh reindex`: {}",
+                    schema::MAX_LANGUAGE_RETRIES,
                     crate::languages::error_on_one_line(error)
                 ),
                 LanguageOutcome::PluginAbsent { files } => crate::log_line!(
@@ -298,3 +364,6 @@ impl ActivationCtx {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

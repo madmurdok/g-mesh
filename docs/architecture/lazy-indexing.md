@@ -663,10 +663,11 @@ Options considered:
    - All frames to stdout go through **one writer thread fed by a channel**,
      not a mutex around stdout: interleaving two readers' frames then becomes
      impossible by construction rather than by discipline.
-   - If the front's connection ends after a switch (for example, it was
-     retired as outdated), `tools/list` falls back to the current upstream
-     and `select_project` calls get an error saying the front is gone. The
-     session itself continues on `C`.
+   - If the front's or `C`'s connection ends (a reindex, `g-mesh stop`, a
+     retirement as outdated), the session continues: the next request routed
+     there reconnects, bootstrapping a daemon if needed, and replays
+     `initialize`. A lost `C` never falls back to the front. `tools/list`
+     falls back to `C` only when the front cannot be reconnected.
    - A **single-project** session never sees a `switchProject` directive, so
      for it the shim forwards every frame byte-for-byte as today (a frame that
      fails to parse is forwarded raw).
@@ -727,6 +728,21 @@ Options considered:
   uses it for `Phase::Unindexed | Phase::Walking` and `build` for every other
   phase. The ceiling tests exist (`mcp/instructions.rs:1242-1295`). GM-399
   adds nothing here; D11 step 5 reuses this rendering as `C`'s guidance.
+- **The cold line names why the walk is owed (GM-543).** While `Unindexed`,
+  the line depends on the `ColdCause` `daemon::run` fixes at startup (read
+  lock-free through `IndexingStatus::cold_cause`, no I/O at `initialize`):
+  `Fresh` (no `meta` row) keeps `"Not indexed yet - the first tool call
+  builds it (structural first; semantic search after) and waits for it"`;
+  `Discarded` (a `meta` row `schema::ensure_current` reset) says `"Index
+  discarded (built by an earlier g-mesh or plugin build) - the first tool
+  call rebuilds it and waits for it"`; `Incomplete` (current generation,
+  `bulkIndexedAt` unset) says `"Index incomplete (an earlier walk stopped part
+  way) - the first tool call finishes it and waits for it"`. Each ends with
+  `" - slow, not wrong; do not abandon it for grep."`. `Walking` keeps `"Being
+  built now - ..."` whatever the cause. The front's "(indexed)" mark
+  (`candidates::has_completed_index`) also requires the current
+  `schema_version` and the core half of `indexer_version`, so an index the
+  daemon will discard is not listed as indexed.
 - **The `P4_*` wait clause** stays true and needs no edit.
 - **Front mode:** new `pub fn build_front(root: &Path, detection:
   &Detection, indexed: &HashSet<&str>) -> String` in `mcp/instructions.rs`.

@@ -116,17 +116,9 @@ fn link_applied(conn: &mut Connection, diff: &Diff, rules: &LinkRules) -> Result
     Ok(())
 }
 
-fn commit_batch_on(
-    conn: &mut Connection,
-    diff: &Diff,
-    vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
-) -> Result<()> {
+fn commit_batch_on(conn: &mut Connection, diff: &Diff) -> Result<()> {
     apply_diff(conn, diff).context("failed to commit a bulk-index batch")?;
     hold_the_lock_open_for_tests();
-    // Best-effort: a failed vector store must not undo a durable batch.
-    if let Some((embedding, computed)) = vectors {
-        embedding.store(conn, computed);
-    }
     Ok(())
 }
 
@@ -245,14 +237,10 @@ impl IndexStore {
         f(&mut Writer { store: self, held })
     }
 
-    /// Commits one bulk batch and stores its precomputed vectors in one hold.
-    pub fn commit_batch(
-        &self,
-        diff: &Diff,
-        vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
-    ) -> Result<()> {
+    /// Commits one bulk batch in one hold.
+    pub fn commit_batch(&self, diff: &Diff) -> Result<()> {
         let mut conn = self.acquire();
-        commit_batch_on(&mut conn, diff, vectors)?;
+        commit_batch_on(&mut conn, diff)?;
         self.claim(diff);
         Ok(())
     }
@@ -449,14 +437,10 @@ impl Writer<'_> {
     }
 
     /// [`IndexStore::commit_batch`] as one step of this unit.
-    pub fn commit_batch(
-        &mut self,
-        diff: &Diff,
-        vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
-    ) -> Result<()> {
+    pub fn commit_batch(&mut self, diff: &Diff) -> Result<()> {
         let store = self.store;
         self.step(|conn| {
-            commit_batch_on(conn, diff, vectors)?;
+            commit_batch_on(conn, diff)?;
             store.claim(diff);
             Ok(())
         })
@@ -624,7 +608,7 @@ mod tests {
             upsert_nodes: vec![NodeRecord::new("a", "Function", "a", "a", "src/a.rs", "rust")],
             ..Default::default()
         };
-        store.commit_batch(&diff, None).unwrap();
+        store.commit_batch(&diff).unwrap();
         assert_eq!(store.with(node_count), 1);
     }
 
@@ -657,9 +641,9 @@ mod tests {
         };
         store.unit(Unit::WatcherApply, |writer| {
             writer.apply_diff_linked(&diff("a"), "test").unwrap();
-            writer.commit_batch(&diff("b"), None).unwrap();
+            writer.commit_batch(&diff("b")).unwrap();
         });
-        store.commit_batch(&diff("x"), None).unwrap();
+        store.commit_batch(&diff("x")).unwrap();
         assert_eq!(store.unclaimed_nodes("rust"), vec!["c".to_string()], "a and b claimed");
         let swept = store.unit(Unit::WatcherApply, |writer| writer.sweep_unclaimed_nodes("rust")).unwrap();
         assert_eq!(swept, 0, "c is no node in the index, so nothing to delete");
@@ -734,12 +718,17 @@ mod tests {
             ])
             .unwrap();
         let never_answered = || -> Vec<(String, usize)> {
-            crate::cli::status::index_status(project.path(), &db_path, &plugins)
-                .unwrap()
-                .semantic_leftovers
-                .into_iter()
-                .map(|leftover| (leftover.language, leftover.never_answered))
-                .collect()
+            crate::cli::status::index_status(
+                project.path(),
+                &db_path,
+                &plugins,
+                crate::cli::status::Mode::Light,
+            )
+            .unwrap()
+            .semantic_leftovers
+            .into_iter()
+            .map(|leftover| (leftover.language, leftover.never_answered))
+            .collect()
         };
         assert!(never_answered().contains(&("typescript".to_string(), 2)), "{:?}", never_answered());
 

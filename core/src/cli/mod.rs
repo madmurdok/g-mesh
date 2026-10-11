@@ -153,8 +153,17 @@ pub enum Command {
         #[arg(long)]
         global: bool,
     },
-    /// Report the current project's daemon, plugin and index state.
-    Status,
+    /// Report the current project's daemon, plugin, index and per-language
+    /// state. Cheap by default: it does not walk the project's files.
+    Status {
+        /// Also walk the project for index coverage and files awaiting
+        /// reindex (one `stat` per source file).
+        #[arg(long)]
+        full: bool,
+        /// Print the whole report as one JSON object instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Wipe and rebuild the current project's index from scratch.
     Reindex,
     /// Inspect the installed language plugins, or check one against the
@@ -317,7 +326,7 @@ fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Init { agent } => init::run(&agent),
         Command::Config { global } => config_wizard::run(global),
-        Command::Status => status::run(),
+        Command::Status { full, json } => status::run(full, json),
         Command::Reindex => reindex::run(),
         Command::Plugins { command } => match command {
             PluginsCommand::List => plugins::run(),

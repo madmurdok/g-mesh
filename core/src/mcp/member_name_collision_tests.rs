@@ -52,7 +52,7 @@ impl Walked {
         schema::ensure_current(&conn, "member-name-collision-test").expect("failed to prepare the index");
         let store = IndexStore::new(conn);
         let summary =
-            bulk_index::run(dir.path(), &store, None, &plugins(language, ext)).expect("the bulk walk failed");
+            bulk_index::run(dir.path(), &store, &plugins(language, ext)).expect("the bulk walk failed");
         assert!(summary.nodes > 0, "the walk produced no nodes");
         Self { dir, store: Arc::new(store) }
     }

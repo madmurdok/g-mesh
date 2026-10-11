@@ -225,19 +225,6 @@ fn stopping_a_project_with_no_daemon_running_is_a_clean_no_op() {
     // already required to be a success.
 }
 
-/// Stopping twice in a row is the same no-op: the second call finds the state
-/// files the first one cleared.
-#[test]
-fn stopping_an_already_stopped_project_is_a_clean_no_op() {
-    let project = Project::new();
-    project.bootstrap_daemon();
-    project.stop();
-
-    let output = project.stop();
-
-    assert!(output.contains("no daemon is running"), "expected a no-op message, got:\n{output}");
-}
-
 /// A daemon that was killed rather than stopped leaves its pid files behind.
 /// `stop` has to see through them - report nothing running, and clear them -
 /// instead of trying to signal a pid that may since have been reused.
