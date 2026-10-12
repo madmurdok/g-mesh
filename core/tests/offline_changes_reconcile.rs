@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
+use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
@@ -94,6 +95,21 @@ impl Harness {
     /// Starts a daemon through a shim, logging to a file of this start's own,
     /// and waits until the index is complete and answering.
     async fn start(&mut self) -> RunningService<RoleClient, ()> {
+        let client = self.connect().await;
+        let root = self.root().to_path_buf();
+        tokio::task::spawn_blocking(move || common::wait_until_indexed(&root)).await.unwrap();
+        // A start whose predecessor stopped before its semantic pass finished
+        // retries that pass before the reconcile runs; every start here waits
+        // for it, so the next start owes nothing but the reconcile.
+        self.await_index("the semantic pass to complete", Index::semantic_pass_completed).await;
+        client
+    }
+
+    /// Starts a daemon through a shim, logging to a file of this start's own,
+    /// and returns once the session is up - with no tool call, and without
+    /// `common::wait_until_indexed`, which sends one whenever its first read
+    /// of the walk marker fails.
+    async fn connect(&mut self) -> RunningService<RoleClient, ()> {
         self.starts += 1;
         let root = self.root().to_path_buf();
         let log = self.log(self.starts);
@@ -109,14 +125,22 @@ impl Harness {
                 .env(g_mesh::embedding::model::MODEL_DIR_ENV, "/nonexistent-g-mesh-test-model-dir");
         }))
         .expect("failed to spawn the shim");
-        let client = ().serve(transport).await.expect("the shim must reach the daemon");
-        let root = self.root().to_path_buf();
-        tokio::task::spawn_blocking(move || common::wait_until_indexed(&root)).await.unwrap();
-        // A start whose predecessor stopped before its semantic pass finished
-        // retries that pass before the reconcile runs; every start here waits
-        // for it, so the next start owes nothing but the reconcile.
-        self.await_index("the semantic pass to complete", Index::semantic_pass_completed).await;
-        client
+        ().serve(transport).await.expect("the shim must reach the daemon")
+    }
+
+    /// Clears `meta.semanticPassAt` with no daemon running: the state a daemon
+    /// stopped after its walk but before its semantic pass completed leaves
+    /// behind (`bulkIndexedAt` set, `semanticPassAt` unset).
+    fn forget_semantic_pass(&self) {
+        let path = project_dir(self.root()).unwrap().join("index.db");
+        let conn = Connection::open(path).unwrap();
+        conn.execute("UPDATE meta SET semanticPassAt = NULL WHERE id = 1", []).unwrap();
+        assert!(!g_mesh::storage::schema::semantic_pass_completed(&conn).unwrap());
+    }
+
+    /// This start's daemon log so far.
+    fn log_text(&self) -> String {
+        fs::read_to_string(self.log(self.starts)).unwrap_or_default()
     }
 
     /// Ends the session, then the daemon and its plugins, the way a user
@@ -324,5 +348,87 @@ async fn an_unchanged_start_reindexes_nothing() {
 
     let client = harness.start().await;
     assert_eq!(harness.reconciled().await, Reconciled { deleted: 0, created: 0, reindexed: 0 });
+    harness.stop(client).await;
+}
+
+/// A walked project whose daemon stopped before its semantic pass completed
+/// stays lazy at the next start (a session that never calls g-mesh
+/// spends no CPU) - no retry, no watcher consumer, no reconcile - until the
+/// first tool call that needs the index. That call's activation then retries
+/// the pass, starts the consumer and, with it, reconciles what changed while
+/// no daemon ran; edits made after it reach the index through the watcher.
+///
+/// The owed pass is produced by clearing `meta.semanticPassAt` while no
+/// daemon runs, not by stopping a daemon mid-pass: that is the exact state an
+/// interrupted pass leaves (`daemon::run`'s `needs_semantic_pass_retry`), and
+/// a stop timed against a sub-second pass would race it.
+///
+/// The lazy half holds by construction, not by timing: the consumer is handed
+/// to the activation thread (`pending_watcher`), which blocks on its trigger
+/// channel, and the only sender is `IndexingStatus::request_activation`, whose
+/// only production caller is `GMeshMcpServer::prepare`. A window with no tool
+/// call can therefore only be too short to catch an eager regression, never
+/// fail spuriously.
+///
+/// Control: in `ActivationCtx::activate` (daemon/activation.rs), call
+/// `spawn_watch_consumer` with `reconcile` = `false` instead of `reconcile`:
+/// no "reconciled" line after the call, the offline edit is never seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_that_owes_its_semantic_pass_reconciles_at_the_first_tool_call() {
+    let mut harness = Harness::new();
+    harness.write("src/stable.ts", &function("stable"));
+    harness.write("src/edited.ts", &function("oldName"));
+    harness.write("src/deleted.ts", &function("goner"));
+    let client = harness.start().await;
+    harness
+        .await_index("the first walk's graph", |index| {
+            index.defined_in("oldName") == ["src/edited.ts"]
+                && index.defined_in("goner") == ["src/deleted.ts"]
+        })
+        .await;
+    harness.stop(client).await;
+
+    harness.forget_semantic_pass();
+    harness.write("src/edited.ts", &function("newName"));
+    fs::remove_file(harness.root().join("src/deleted.ts")).unwrap();
+    harness.write("src/created.ts", &function("createdThing"));
+
+    let client = harness.connect().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let log = harness.log_text();
+    assert!(!log.contains("files with the disk in"), "reconciled before any tool call; daemon log:\n{log}");
+    let index = Index::open(harness.root()).unwrap();
+    assert!(!index.semantic_pass_completed(), "the owed pass ran before any tool call");
+    assert_eq!(index.defined_in("oldName"), ["src/edited.ts"], "the index changed before any tool call");
+    drop(index);
+
+    // On a file no offline change touched, so only the reconcile can bring
+    // the others up to date.
+    let call =
+        client.call_tool(CallToolRequestParams::new("get_file_outline").with_arguments(
+            serde_json::json!({ "file_path": "src/stable.ts" }).as_object().cloned().unwrap(),
+        ));
+    tokio::time::timeout(RECONCILE_DEADLINE, call)
+        .await
+        .unwrap_or_else(|_| panic!("the first tool call hung; daemon log:\n{}", harness.log_text()))
+        .expect("tools/call must return a result");
+
+    assert_eq!(harness.reconciled().await, Reconciled { deleted: 1, created: 1, reindexed: 2 });
+    harness
+        .await_index("the offline changes in the graph", |index| {
+            index.defined_in("newName") == ["src/edited.ts"]
+                && index.defined_in("oldName").is_empty()
+                && index.defined_in("goner").is_empty()
+                && index.defined_in("createdThing") == ["src/created.ts"]
+        })
+        .await;
+    harness.await_index("the owed semantic pass to complete", Index::semantic_pass_completed).await;
+
+    harness.write("src/live.ts", &function("liveThing"));
+    harness
+        .await_index("a file created after the first call (the watcher consumer)", |index| {
+            index.defined_in("liveThing") == ["src/live.ts"]
+        })
+        .await;
     harness.stop(client).await;
 }
