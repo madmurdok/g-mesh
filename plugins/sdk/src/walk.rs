@@ -243,12 +243,6 @@ mod tests {
         }
     }
 
-    impl Drop for Tree {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
     #[test]
     fn claims_only_its_own_extensions_case_insensitively() {
         let tree = Tree::new("extensions");

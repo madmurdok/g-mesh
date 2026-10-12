@@ -303,13 +303,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// A probe that runs `script` under `/bin/sh -c`. [`probe`] appends
     /// `--version`, which `sh -c` takes as `$0` and ignores.
     #[cfg(unix)]
