@@ -278,6 +278,7 @@ fn a_report_renders_every_field_it_was_asked_for() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_stale: Vec::new(),
             semantic_leftovers: Vec::new(),
             coverage: Some(Coverage { discovered: 4, indexed: 3, dirty: 1 }),
             syntax_error_files: vec!["src/broken.ts".to_string()],
@@ -322,6 +323,7 @@ fn an_interrupted_workspace_reindex_is_named() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: vec![("rust".to_string(), "Cargo.toml".to_string())],
             semantic_pending: Vec::new(),
+            semantic_stale: Vec::new(),
             semantic_leftovers: Vec::new(),
             coverage: Some(Coverage { discovered: 1, indexed: 1, dirty: 0 }),
             syntax_error_files: Vec::new(),
@@ -360,6 +362,7 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_stale: Vec::new(),
             semantic_leftovers: Vec::new(),
             coverage: Some(Coverage { discovered: 4, indexed: 4, dirty: 0 }),
             syntax_error_files: Vec::new(),
@@ -609,6 +612,7 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_stale: Vec::new(),
             semantic_leftovers: Vec::new(),
             coverage: Some(Coverage { discovered: 4, indexed: 1, dirty: 3 }),
             syntax_error_files: Vec::new(),
@@ -654,6 +658,7 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_stale: Vec::new(),
             semantic_leftovers: Vec::new(),
             coverage: Some(Coverage { discovered: 4, indexed: if bulk_indexed { 4 } else { 0 }, dirty: 4 }),
             syntax_error_files: Vec::new(),
@@ -868,6 +873,7 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_stale: Vec::new(),
             semantic_leftovers: Vec::new(),
             coverage: Some(Coverage { discovered: 2, indexed: 0, dirty: 2 }),
             syntax_error_files: Vec::new(),
@@ -961,6 +967,7 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_stale: Vec::new(),
             semantic_leftovers: Vec::new(),
             coverage: Some(Coverage { discovered: 0, indexed: 0, dirty: 0 }),
             syntax_error_files: Vec::new(),
@@ -1175,6 +1182,7 @@ fn a_project_with_no_suspension_marker_reports_none() {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_stale: Vec::new(),
             semantic_leftovers: Vec::new(),
             coverage: Some(Coverage { discovered: 0, indexed: 0, dirty: 0 }),
             syntax_error_files: Vec::new(),
@@ -1248,6 +1256,37 @@ fn a_pending_semantic_pass_is_named_with_its_file_count_until_it_completes() {
     schema::record_language_semantic_pass(&conn, "typescript").unwrap();
     let rendered = render(&report_with(fixture.status()));
     assert!(!rendered.contains("semantic pending"), "{rendered}");
+}
+
+/// A language whose pass after a workspace reindex failed or did not run is
+/// no longer pending, but its changed files are named as stale, one line per
+/// language, until a pass completes. Control: drop the `semantic stale:`
+/// loop from `render` -> not named.
+#[test]
+fn files_no_pass_rechecked_after_a_reindex_are_named_stale_until_a_pass_completes() {
+    let fixture = Fixture::new(&[("a.ts", "export const a = 1;")]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "a.ts", false);
+    conn.execute_batch(
+        "INSERT INTO semantic_pending (language, since) VALUES ('typescript', '2026-09-26T10:14:03Z');
+         INSERT INTO semantic_pending_files (language, filePath) VALUES ('typescript', 'a.ts'), ('typescript', 'b.ts');",
+    )
+    .unwrap();
+    schema::record_language_semantic_pass_failure(&conn, "typescript", "not run").unwrap();
+
+    let status = fixture.status();
+    assert!(status.semantic_pending.is_empty(), "{:?}", status.semantic_pending);
+    assert_eq!(status.semantic_stale, vec![("typescript".to_string(), 2)]);
+    let rendered = render(&report_with(status));
+    assert!(!rendered.contains("semantic pending"), "{rendered}");
+    assert_eq!(rendered.matches("stale since the last reindex").count(), 1, "{rendered}");
+    assert!(rendered.contains("typescript: 2 file(s) stale since the last reindex"), "{rendered}");
+
+    schema::record_language_semantic_pass(&conn, "typescript").unwrap();
+    let status = fixture.status();
+    assert!(status.semantic_stale.is_empty(), "{:?}", status.semantic_stale);
+    let rendered = render(&report_with(status));
+    assert!(!rendered.contains("stale since the last reindex"), "{rendered}");
 }
 
 // ---------------------------------------------------------------------

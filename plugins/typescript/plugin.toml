@@ -21,7 +21,7 @@ protocol_version = 2
 # Must equal this crate's `Cargo.toml` `version`: a plugin in the cargo
 # workspace tracks the release version (docs/architecture/plugin-modularity.md,
 # "plugin_version: two rules, not one"); scripts/cut-release.sh checks it.
-plugin_version = "4.5.0"
+plugin_version = "4.6.0"
 
 [plugin.spawn]
 command = "${G_MESH_BIN_DIR}/g-mesh-plugin-typescript"
@@ -33,9 +33,12 @@ extensions = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
 # On whether or not a server is installed: the plugin answers every
 # semanticPass, with an empty incomplete diff when vtsls cannot be found.
 semantic_pass = true
-# Off until the semantic tier states that a whole-project pass re-sends every
-# edge it stands behind (ADR 0008, section 3).
-semantic_sweep = false
+# Every complete whole-project pass re-sends each semantic edge it stands
+# behind, and each pending-symbol placeholder node one of them lands on
+# (the SDK LSP bridge's `Answers::finish`), so core may delete this language's semantic
+# edges, and the placeholders its last workspace reindex kept, that one did
+# not re-send (docs/adr/0008-workspace-reindex-staging-swap.md, section 3).
+semantic_sweep = true
 # The project model resolves imports against the set of files the walk listed,
 # so every created file of one watcher batch must be in it before the first of
 # them is extracted (docs/adr/0026-batch-created-files-notification.md).

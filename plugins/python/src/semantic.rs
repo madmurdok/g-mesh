@@ -536,9 +536,9 @@ mod tests {
     #[test]
     fn a_project_local_install_is_found_and_probed_for_real() {
         let installed = installed_bin_dir();
-        let root = std::env::temp_dir().join(format!("g-mesh-py-local-{}", std::process::id()));
+        let guard = tempfile::Builder::new().prefix("g-mesh-py-local-").tempdir().unwrap();
+        let root = guard.path().to_path_buf();
         let bin = root.join(NODE_BIN_DIR);
-        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&bin).unwrap();
         for name in [SERVER_BIN, CLI_BIN] {
             std::os::unix::fs::symlink(installed.join(name), bin.join(name)).unwrap();
@@ -556,7 +556,6 @@ mod tests {
             assert_eq!(resolved.command, bin.join(SERVER_BIN), "and it is the server, not the CLI");
             assert!(resolved.prefix_args.is_empty(), "no npx wrapping: {resolved:?}");
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Where `scripts/test-deps.sh pyright` (an `npm ci` in `plugins/python`,
@@ -582,8 +581,8 @@ mod tests {
     /// The venv lookup reads the project, and only the project.
     #[test]
     fn an_interpreter_is_found_under_the_root_and_nowhere_else() {
-        let dir = std::env::temp_dir().join(format!("g-mesh-py-venv-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let guard = tempfile::Builder::new().prefix("g-mesh-py-venv-").tempdir().unwrap();
+        let dir = guard.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".venv/bin")).unwrap();
         assert_eq!(interpreter(&dir), None, "an empty .venv is not an interpreter");
 
@@ -593,7 +592,6 @@ mod tests {
         let empty = dir.join("no-venv-here");
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(interpreter(&empty), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `pythonPath` joins the manifest's own settings rather than replacing
@@ -657,9 +655,9 @@ mod tests {
 
     /// A scratch Python project: `app/main.py` imports from the gitignored
     /// `genpkg/`, and the gitignored `junk/` holds a module nothing imports.
-    fn scoped_project(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("g-mesh-py-scope-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn scoped_project(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::Builder::new().prefix(&format!("g-mesh-py-scope-{name}-")).tempdir().unwrap();
+        let root = guard.path().to_path_buf();
         for (path, contents) in [
             (".gitignore", "junk/\ngenpkg/\n"),
             ("app/main.py", "from genpkg.gen import gen_fn\n\ngen_fn()\n"),
@@ -671,7 +669,8 @@ mod tests {
             std::fs::create_dir_all(full.parent().unwrap()).unwrap();
             std::fs::write(full, contents).unwrap();
         }
-        root.canonicalize().unwrap()
+        let root = root.canonicalize().unwrap();
+        (guard, root)
     }
 
     fn shipped_config() -> SemanticConfig {
@@ -683,7 +682,7 @@ mod tests {
     /// no `include`.
     #[test]
     fn the_engine_config_carries_the_walks_exclude_list() {
-        let root = scoped_project("config");
+        let (_guard, root) = scoped_project("config");
         let mut config = shipped_config();
         add_project_settings(&mut config, &root);
         let analysis = &config.settings["python"]["analysis"];
@@ -697,7 +696,6 @@ mod tests {
         assert!(exclude.contains(&"**/.venv") && exclude.contains(&"**/.git"), "{exclude:?}");
         assert!(!exclude.iter().any(|entry| entry.starts_with("app")), "{exclude:?}");
         assert!(analysis.get("include").is_none(), "include is never sent: {analysis}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A real pyright, handed the config [`prepare`] builds, does not track
@@ -707,7 +705,7 @@ mod tests {
     #[test]
     #[ignore = "needs pyright, locally installed or through npx"]
     fn real_pyright_skips_a_pruned_tree_and_still_resolves_imports_into_one() {
-        let root = scoped_project("pyright");
+        let (_guard, root) = scoped_project("pyright");
         let mut config = shipped_config();
         prepare(&mut config, &root).expect("a pyright to run");
         let mut session = lsp::Session::start(&root, &config);
@@ -738,7 +736,6 @@ mod tests {
         assert!(found.is_empty(), "the pruned junk/ is not tracked: {symbols}");
 
         drop(session);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Just enough of an LSP client over stdio for the real-pyright test.

@@ -94,27 +94,21 @@ impl crate::Extractor for Defaults {
     }
 }
 
-/// A scratch project, removed on drop.
-struct Scratch(PathBuf);
+/// A scratch project, removed when the guard drops.
+struct Scratch(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
 impl Scratch {
     fn new(tag: &str, model: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("g-mesh-run-resolution-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard =
+            tempfile::Builder::new().prefix(&format!("g-mesh-run-resolution-{tag}-")).tempdir().unwrap();
+        let dir = guard.path().to_path_buf();
         std::fs::write(dir.join(MODEL), model).unwrap();
         std::fs::write(dir.join("a.toy"), "a\n").unwrap();
-        Scratch(dir)
+        Scratch(dir, guard)
     }
 
     fn set_model(&self, model: &str) {
         std::fs::write(self.0.join(MODEL), model).unwrap();
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

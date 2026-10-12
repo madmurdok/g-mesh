@@ -163,6 +163,12 @@ pub struct IndexStatus {
     /// language whose pass is owed after a workspace reindex swap and not
     /// done (`semantic_pending`, ADR 0009), sorted.
     pub semantic_pending: Vec<(String, String, usize)>,
+    /// `(language, file count)` for every semantic-pass-capable language not
+    /// done whose files a workspace reindex changed and whose pass then
+    /// failed, finished residual or did not run: no pass has re-checked those
+    /// files' semantic edges (`semantic_pending_files` without a
+    /// `semantic_pending` row, ADR 0009), sorted.
+    pub semantic_stale: Vec<(String, usize)>,
     /// Per semantic-pass-capable language: the files its last whole-project
     /// pass left for the next start (residual, GM-521) and the files no pass
     /// ever answered, sorted by language.
@@ -399,6 +405,7 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_stale: Vec::new(),
             semantic_leftovers: Vec::new(),
             coverage: None,
             syntax_error_files: Vec::new(),
@@ -601,6 +608,7 @@ pub fn index_status(
             semantic_pass_failures: Vec::new(),
             pending_reindex: Vec::new(),
             semantic_pending: Vec::new(),
+            semantic_stale: Vec::new(),
             semantic_leftovers: Vec::new(),
             coverage: discovered.map(|files| Coverage {
                 discovered: files.len(),
@@ -630,6 +638,7 @@ pub fn index_status(
         pending_reindex: crate::storage::schema::pending_reindexes(&conn)
             .context("failed to read the interrupted workspace reindexes")?,
         semantic_pending: semantic_pending(&conn, &capable)?,
+        semantic_stale: semantic_stale(&conn, &capable)?,
         semantic_leftovers: crate::storage::schema::semantic_leftovers(&conn)
             .context("failed to read the semantic residual and never-answered files")?
             .into_iter()
@@ -676,6 +685,23 @@ fn semantic_pending(conn: &Connection, capable: &HashSet<String>) -> Result<Vec<
                 .context("failed to read whether a pending semantic pass completed")?
         {
             believed.push((language, since, files));
+        }
+    }
+    Ok(believed)
+}
+
+/// The stale-file counts a reader should believe: capable languages whose
+/// pass is not recorded done, as [`semantic_pending`] filters.
+fn semantic_stale(conn: &Connection, capable: &HashSet<String>) -> Result<Vec<(String, usize)>> {
+    let stale = crate::storage::schema::semantic_stale_files(conn)
+        .context("failed to read the stale semantic files")?;
+    let mut believed = Vec::new();
+    for (language, files) in stale {
+        if capable.contains(&language)
+            && !crate::storage::schema::language_semantic_pass_done(conn, &language)
+                .context("failed to read whether a semantic pass completed")?
+        {
+            believed.push((language, files));
         }
     }
     Ok(believed)
@@ -964,6 +990,14 @@ pub fn render(report: &Report) -> String {
         let _ = writeln!(
             out,
             "  semantic pending: {language} since {since} - {files} file(s) changed by the reindex {tail}"
+        );
+    }
+
+    for (language, files) in &index.semantic_stale {
+        let _ = writeln!(
+            out,
+            "  semantic stale:  {language}: {files} file(s) stale since the last reindex - their semantic \
+             edges may point where the previous configuration resolved them until a pass re-checks them"
         );
     }
 

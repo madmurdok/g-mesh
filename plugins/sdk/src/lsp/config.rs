@@ -492,16 +492,13 @@ mod tests {
     /// Writes `contents` to a scratch `plugin.toml` and reads it back. `None`
     /// reads a path that does not exist.
     fn read(tag: &str, contents: Option<&str>) -> Result<Option<SemanticConfig>> {
-        let dir = std::env::temp_dir().join(format!("g-mesh-sdk-semantic-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("plugin.toml");
+        let guard =
+            tempfile::Builder::new().prefix(&format!("g-mesh-sdk-semantic-{tag}-")).tempdir().unwrap();
+        let path = guard.path().join("plugin.toml");
         if let Some(contents) = contents {
             std::fs::write(&path, contents).unwrap();
         }
-        let read = SemanticConfig::from_manifest_at(&path);
-        let _ = std::fs::remove_dir_all(&dir);
-        read
+        SemanticConfig::from_manifest_at(&path)
     }
 
     #[test]

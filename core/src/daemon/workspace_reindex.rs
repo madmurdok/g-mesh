@@ -1212,6 +1212,20 @@ mod tests {
         semantic_pass: bool,
         semantic_sweep: bool,
     ) -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, PluginRegistry, IndexStore) {
+        alpha_staging_registry_shaped(counters, semantic_pass, &|dir: &Path| {
+            if semantic_sweep {
+                test_plugin::declare_semantic_sweep(dir);
+            }
+        })
+    }
+
+    /// [`alpha_staging_registry`], with `shape` run on the semantic pass's
+    /// plugin directory before discovery (not called without one).
+    fn alpha_staging_registry_shaped(
+        counters: &Counters,
+        semantic_pass: bool,
+        shape: &dyn Fn(&Path),
+    ) -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir, PluginRegistry, IndexStore) {
         let project = tempfile::tempdir().expect("failed to create a project root");
         let plugins = tempfile::tempdir().expect("failed to create a plugin root");
         let scratch = tempfile::tempdir().expect("failed to create a model root");
@@ -1223,9 +1237,7 @@ mod tests {
                 &["go.mod"],
                 &[],
             );
-            if semantic_sweep {
-                test_plugin::declare_semantic_sweep(&dir);
-            }
+            shape(&dir);
         } else {
             test_plugin::install_with_workspace(plugins.path(), "alpha", &[".alpha-src"], &["go.mod"], &[]);
         }
@@ -1883,6 +1895,57 @@ mod tests {
         );
     }
 
+    /// Test 12b's swap, but the reindex's own pass does not run (the plugin
+    /// asleep). After the whole
+    /// reindex the unchanged node's semantic edge still points at the old,
+    /// still existing target - no pass re-checked it - and the file the walk
+    /// changed stays listed as stale rather than vanishing with the language
+    /// row.
+    ///
+    /// Control: drop `{x}.source = 'syntactic' AND` from the `dropped`
+    /// closure in `language_swap::plan_attached` -> `alpha-sem` is deleted.
+    #[test]
+    fn a_kept_semantic_edge_outlives_a_pass_not_run_and_its_file_stays_stale() {
+        let mut first = three_nodes();
+        first.push(json(&wire_edge("alpha-old", "alpha-n1", "alpha-n2")));
+        let mut second = three_nodes();
+        second.push(json(&wire_edge("alpha-new", "alpha-n1", "alpha-n3")));
+        let (_project, _plugins, _scratch, registry, conn, supervisor) = after_a_pass(
+            &first,
+            vec![
+                semantic_edge("alpha-e1", "alpha-n1", "alpha-n3"),
+                semantic_edge("alpha-sem", "alpha-n1", "alpha-n2"),
+            ],
+            &[],
+            &second,
+        );
+        supervisor.sleep_now("the test put it to sleep");
+
+        run(&registry, &supervisor, &conn, "go.mod").expect("the reindex itself succeeds");
+
+        let guard = conn.lock().unwrap();
+        assert_eq!(
+            rows(&guard, "SELECT id, source, toId FROM edges ORDER BY id"),
+            vec![
+                edge_row("alpha-e1", "semantic", "alpha-n3"),
+                edge_row("alpha-new", "syntactic", "alpha-n3"),
+                edge_row("alpha-sem", "semantic", "alpha-n2"),
+            ],
+            "no pass ran, so the semantic edge to the old target is still there"
+        );
+        assert_eq!(
+            schema::semantic_pass_failures(&guard).unwrap(),
+            vec![("alpha".to_string(), semantic::NOT_RUN_REASON.to_string())],
+            "the pass was recorded as not run"
+        );
+        assert_eq!(schema::semantic_pending(&guard).unwrap(), Vec::new(), "the language row went");
+        assert_eq!(
+            schema::semantic_stale_files(&guard).unwrap(),
+            vec![("alpha".to_string(), 1)],
+            "the changed file stays stale"
+        );
+    }
+
     /// Indexes `three_nodes` for `alpha`, whose manifest declares
     /// `semantic_sweep` or not, adds a semantic edge no pass will re-send,
     /// then runs a complete whole-project pass (the fake plugin answers with
@@ -1916,8 +1979,8 @@ mod tests {
         assert_eq!(edges_after_a_complete_pass(true), vec![edge_row("alpha-e1", "syntactic", "alpha-n2")]);
     }
 
-    /// Test 13, the other arm: a language whose manifest leaves `semantic_sweep` off (as
-    /// TypeScript's does) keeps it.
+    /// Test 13, the other arm: a language whose manifest leaves `semantic_sweep` off
+    /// keeps it.
     ///
     /// Control: pass `Some(&self.manifest.language)` unconditionally to
     /// `apply_semantic_pass` in `PluginProcess::semantic_pass` ->
@@ -1931,6 +1994,104 @@ mod tests {
                 edge_row("alpha-stale", "semantic", "alpha-n3")
             ]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The bundled TypeScript plugin's capabilities, over the fake plugin.
+    // -----------------------------------------------------------------
+
+    /// The `[plugin.capabilities]` table of the bundled TypeScript manifest,
+    /// header included, up to the next table.
+    fn typescript_capabilities() -> String {
+        const TYPESCRIPT_MANIFEST: &str = include_str!("../../../plugins/typescript/plugin.toml");
+        let mut lines = TYPESCRIPT_MANIFEST.lines().skip_while(|line| *line != "[plugin.capabilities]");
+        let header = lines.next().expect("the TypeScript manifest has a [plugin.capabilities] table");
+        let body: Vec<&str> = lines.take_while(|line| !line.starts_with('[')).collect();
+        format!("{header}\n{}\n", body.join("\n"))
+    }
+
+    /// Indexes `three_nodes` for `alpha` carrying the bundled TypeScript
+    /// manifest's capabilities, adds `alpha-old`, a semantic edge
+    /// `alpha-n1 -> alpha-n2` no process of this test emitted (an earlier
+    /// plugin process's), then runs a whole-project pass in this test's
+    /// process whose diff upserts only `alpha-new` (`alpha-n1 -> alpha-n3`)
+    /// and deletes nothing, answering with `fields` besides. Returns the
+    /// pass's result and every edge as `id|source|toId`.
+    fn edges_after_a_typescript_pass(
+        fields: Option<&str>,
+    ) -> (Result<Option<SemanticPassOutcome>>, Vec<String>) {
+        let counters = Counters::default();
+        let (project, plugins, _scratch, registry, conn) =
+            alpha_staging_registry_shaped(&counters, true, &|dir: &Path| {
+                test_plugin::replace_capabilities(dir, &typescript_capabilities())
+            });
+        let plugin_dir = plugins.path().join("alpha");
+        test_plugin::set_bulk_stream(project.path(), "alpha", &three_nodes(), 0);
+        let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
+        run(&registry, &supervisor, &conn, "go.mod").expect("the first reindex succeeds");
+        let upsert_edges = vec![semantic_edge("alpha-old", "alpha-n1", "alpha-n2")];
+        apply_diff(&mut conn.lock().unwrap(), &Diff { upsert_edges, ..Default::default() }).unwrap();
+
+        let new = WireEdge {
+            source: SourceTier::Semantic,
+            engine: "fake-lsp".to_string(),
+            ..wire_edge("alpha-new", "alpha-n1", "alpha-n3")
+        };
+        test_plugin::set_semantic_pass_answer(
+            &plugin_dir,
+            Some(&format!(r#"{{"upsertEdges":[{}]}}"#, json(&new))),
+        );
+        test_plugin::set_semantic_pass_fields(&plugin_dir, fields);
+        let outcome = supervisor.semantic_pass(&conn, Vec::new(), 0);
+        let edges = rows(&conn.lock().unwrap(), "SELECT id, source, toId FROM edges ORDER BY id");
+        (outcome, edges)
+    }
+
+    /// A complete whole-project pass of a language with TypeScript's
+    /// capabilities deletes the semantic edge an earlier process emitted and
+    /// this pass did not re-send: what the pass sent and the syntactic edge
+    /// stay. The plugin never retracts across processes
+    /// (`a_new_bridge_does_not_retract_what_an_earlier_process_emitted` in
+    /// `plugins/sdk/tests/lsp_bridge.rs`), so core's sweep is what removes it.
+    ///
+    /// Control: `semantic_sweep = false` in `plugins/typescript/plugin.toml`
+    /// -> `alpha-old` survives.
+    #[test]
+    fn a_complete_typescript_pass_sweeps_the_edge_an_earlier_process_emitted() {
+        let (outcome, edges) = edges_after_a_typescript_pass(None);
+        assert!(outcome.expect("the pass succeeds").is_some(), "the pass ran");
+        assert_eq!(
+            edges,
+            vec![
+                edge_row("alpha-e1", "syntactic", "alpha-n2"),
+                edge_row("alpha-new", "semantic", "alpha-n3")
+            ]
+        );
+    }
+
+    /// An incomplete whole-project pass of a language with TypeScript's
+    /// capabilities sweeps nothing, whether it names its unfinished files
+    /// (recorded residual) or not (an error): what it did send is applied,
+    /// and `alpha-old` may be what it never got to.
+    ///
+    /// Control: sweep before the `outcome.incomplete && whole_project` check
+    /// in `watcher::apply::apply_semantic_pass_in` -> `alpha-old` is gone.
+    #[test]
+    fn an_incomplete_typescript_pass_sweeps_nothing() {
+        let kept = vec![
+            edge_row("alpha-e1", "syntactic", "alpha-n2"),
+            edge_row("alpha-new", "semantic", "alpha-n3"),
+            edge_row("alpha-old", "semantic", "alpha-n2"),
+        ];
+        let (outcome, edges) = edges_after_a_typescript_pass(Some(r#"{"incomplete": true}"#));
+        outcome.expect_err("an incomplete whole-project pass naming no files is an error");
+        assert_eq!(edges, kept, "unnamed");
+
+        let (outcome, edges) = edges_after_a_typescript_pass(Some(
+            r#"{"incomplete": true, "unfinishedFiles": ["src/a.alpha-src"]}"#,
+        ));
+        assert!(outcome.expect("a residual pass succeeds").is_some(), "the pass ran");
+        assert_eq!(edges, kept, "named");
     }
 
     // -----------------------------------------------------------------
@@ -2165,11 +2326,15 @@ mod tests {
         assert_eq!(after, (0, 0), "the completed pass cleared it");
     }
 
-    /// A pass not run (its plugin asleep) clears the rows the swap wrote: no
-    /// pass is working on them. Control: remove the clear from
-    /// `schema::record_language_semantic_pass_failure` -> rows remain.
+    /// A pass not run (its plugin asleep) clears the language row the swap
+    /// wrote, since no pass is working on it. This fixture's swap writes no
+    /// file rows; that they stay as stale is pinned by
+    /// `a_kept_semantic_edge_outlives_a_pass_not_run_and_its_file_stays_stale`.
+    /// Control: remove the clear from
+    /// `schema::record_language_semantic_pass_failure` -> the language row
+    /// remains.
     #[test]
-    fn a_pass_not_run_after_the_swap_clears_the_pending_rows() {
+    fn a_pass_not_run_after_the_swap_clears_the_pending_row_and_keeps_its_files() {
         let (_project, _plugins, registry, conn) = alpha_registry();
         let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
         supervisor.sleep_now("the test put it to sleep");
@@ -2177,13 +2342,13 @@ mod tests {
         let (at_swap, after) = semantic_pending_around_the_pass(&registry, &supervisor, &conn);
 
         assert_eq!(at_swap.0, 1, "the swap wrote the language row");
-        assert_eq!(after, (0, 0));
+        assert_eq!(after, (0, at_swap.1), "the language row goes, the file rows stay");
     }
 
-    /// An incomplete pass is recorded as a failure and clears the rows the
-    /// same way. Control: as above.
+    /// An incomplete pass is recorded as a failure and clears the language
+    /// row the same way, keeping the file row. Control: as above.
     #[test]
-    fn an_incomplete_pass_after_the_swap_clears_the_pending_rows() {
+    fn an_incomplete_pass_after_the_swap_clears_the_pending_row_and_keeps_its_files() {
         let counters = Counters::default();
         let (project, plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, true);
         test_plugin::answer_first_semantic_pass_incomplete(
@@ -2197,7 +2362,7 @@ mod tests {
         let (at_swap, after) = semantic_pending_around_the_pass(&registry, &supervisor, &conn);
 
         assert_eq!(at_swap, (1, 1), "the new file is pending at the swap");
-        assert_eq!(after, (0, 0));
+        assert_eq!(after, (0, 1), "the file stays as a stale file");
         assert_eq!(schema::semantic_pass_failures(&conn.lock().unwrap()).unwrap().len(), 1);
     }
 
