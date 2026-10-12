@@ -541,12 +541,10 @@ fn an_answered_refusal_names_what_it_resolved_to_on_either_shape() {
 
 #[test]
 fn an_unparsable_expect_file_reports_a_readable_parse_error() {
-    let dir = std::env::temp_dir().join(format!("g-mesh-expectations-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("expect.toml");
+    let dir = tempfile::Builder::new().prefix("g-mesh-expectations-test-").tempdir().unwrap();
+    let path = dir.path().join("expect.toml");
     std::fs::write(&path, "[[callers]]\nsymbol = \"f\"\nexpect = [\"a.ts:f\"]\nbogus_key = true\n").unwrap();
     let err = parse(&path).unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("bogus_key") || text.contains("unknown field"), "{text}");
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -290,24 +290,16 @@ mod tests {
         assert!(format!("{err:#}").contains("did not answer"), "{err:#}");
     }
 
-    /// A scratch directory, removed on drop.
+    /// A scratch directory, removed when the guard drops.
     #[cfg(unix)]
-    struct Scratch(PathBuf);
+    struct Scratch(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     #[cfg(unix)]
     impl Scratch {
         fn new(tag: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("g-mesh-sdk-resolve-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let guard =
+                tempfile::Builder::new().prefix(&format!("g-mesh-sdk-resolve-{tag}-")).tempdir().unwrap();
+            Self(guard.path().to_path_buf(), guard)
         }
     }
 

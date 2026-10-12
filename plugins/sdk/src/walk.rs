@@ -217,16 +217,14 @@ fn excluded_names(exclude_dirs: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// A scratch tree, removed on drop. `tempfile` is not a dependency of
-    /// this crate for the reason `testing`'s own `Scratch` gives.
-    struct Tree(std::path::PathBuf);
+    /// A scratch tree, removed when the guard drops.
+    struct Tree(std::path::PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     impl Tree {
         fn new(name: &str) -> Self {
-            let root = std::env::temp_dir().join(format!("g-mesh-sdk-walk-{}-{name}", std::process::id()));
-            let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).unwrap();
-            Self(root)
+            let guard =
+                tempfile::Builder::new().prefix(&format!("g-mesh-sdk-walk-{name}-")).tempdir().unwrap();
+            Self(guard.path().to_path_buf(), guard)
         }
 
         fn write(&self, path: &str, contents: &str) {
@@ -242,12 +240,6 @@ mod tests {
                 .into_iter()
                 .map(|path| path.as_str().to_string())
                 .collect()
-        }
-    }
-
-    impl Drop for Tree {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
         }
     }
 

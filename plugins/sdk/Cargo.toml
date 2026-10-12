@@ -71,3 +71,6 @@ sha2 = "0.10"
 # and the extensions it claims - see `manifest`' module doc for why the
 # plugin re-reads the file core also reads rather than being told.
 toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

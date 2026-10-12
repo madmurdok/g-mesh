@@ -58,3 +58,6 @@ serde_json = "1"
 # not have to find the other one to learn it.
 tree-sitter = "0.25"
 tree-sitter-python = "0.25"
+
+[dev-dependencies]
+tempfile = "3"
