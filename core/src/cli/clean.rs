@@ -1265,4 +1265,102 @@ mod tests {
         assert!(rendered.contains("deleted project a1b2c3d4"), "{rendered}");
         assert!(rendered.contains("/home/u/.g-mesh/projects/a1b2c3d4"), "{rendered}");
     }
+
+    // -----------------------------------------------------------------
+    // The shim's startup sweep
+    // -----------------------------------------------------------------
+
+    /// The sweep deletes exactly what `clean orphaned --force` would: only
+    /// the deleted project's state, never a live, unreachable, unrecorded or
+    /// still-served one.
+    ///
+    /// Control: make `purge_orphaned_state_dir` skip the
+    /// `daemon_is_running` check: eeee5555 (served by a live pid) is deleted.
+    #[test]
+    fn the_sweep_deletes_only_state_whose_project_directory_was_deleted() {
+        let fixture = orphan_fixture();
+
+        assert_eq!(sweep_orphaned(fixture.projects.root()).unwrap(), 1);
+
+        assert!(!fixture.projects.exists("bbbb2222"), "the deleted project's state survived");
+        for survivor in ["aaaa1111", "cccc3333", "dddd4444", "eeee5555"] {
+            assert!(fixture.projects.exists(survivor), "{survivor} must not have been deleted");
+        }
+    }
+
+    /// A daemon whose pid file is already gone still holds its singleton
+    /// lock while it runs; the sweep keeps its state.
+    #[test]
+    fn the_sweep_keeps_state_whose_daemon_lock_is_held() {
+        let fixture = orphan_fixture();
+        let state = fixture.projects.root().join("bbbb2222");
+        let lock = fs::File::create(daemon::daemon_lock_path_in(&state)).unwrap();
+        lock.lock().unwrap();
+
+        assert_eq!(sweep_orphaned(fixture.projects.root()).unwrap(), 0);
+        assert!(fixture.projects.exists("bbbb2222"), "a locked daemon's state must stay");
+
+        drop(lock);
+        assert_eq!(sweep_orphaned(fixture.projects.root()).unwrap(), 1, "and goes once the lock is free");
+    }
+
+    /// A home holding one orphaned project's state, as the sweep sees it:
+    /// `<home>/projects/<id>/` with a recorded root that was deleted.
+    struct SweepHome {
+        home: tempfile::TempDir,
+        parent: tempfile::TempDir,
+    }
+
+    impl SweepHome {
+        fn new() -> Self {
+            Self { home: tempfile::tempdir().unwrap(), parent: tempfile::tempdir().unwrap() }
+        }
+
+        fn add_orphan(&self, id: &str) -> PathBuf {
+            let state = crate::storage::connection::projects_root_under(self.home.path()).join(id);
+            fs::create_dir_all(&state).unwrap();
+            let root = self.parent.path().join(id);
+            fs::create_dir(&root).unwrap();
+            crate::daemon::identity::record_project_root(&state, &root).unwrap();
+            fs::remove_dir(&root).unwrap();
+            state
+        }
+    }
+
+    /// At most one sweep per interval: a second call within it does nothing,
+    /// and leaves an orphan made in between for a later sweep.
+    ///
+    /// Control: make `sweep_orphaned_if_due` treat every call as due: the
+    /// second call sweeps.
+    #[test]
+    fn the_sweep_runs_at_most_once_per_interval() {
+        let fixture = SweepHome::new();
+        let first = fixture.add_orphan("aaaa1111");
+
+        assert_eq!(
+            sweep_orphaned_if_due(fixture.home.path(), ORPHAN_SWEEP_INTERVAL).unwrap(),
+            Sweep::Swept(1)
+        );
+        assert!(!first.exists());
+
+        let second = fixture.add_orphan("bbbb2222");
+        assert_eq!(sweep_orphaned_if_due(fixture.home.path(), ORPHAN_SWEEP_INTERVAL).unwrap(), Sweep::NotDue);
+        assert!(second.exists(), "a sweep that is not due deletes nothing");
+
+        assert_eq!(sweep_orphaned_if_due(fixture.home.path(), Duration::ZERO).unwrap(), Sweep::Swept(1));
+        assert!(!second.exists(), "once due again, it sweeps");
+    }
+
+    /// Another process sweeping (holding the marker's lock) makes this one
+    /// step aside rather than sweep beside it.
+    #[test]
+    fn the_sweep_steps_aside_while_another_one_runs() {
+        let fixture = SweepHome::new();
+        let orphan = fixture.add_orphan("aaaa1111");
+        let marker = fs::File::create(fixture.home.path().join(ORPHAN_SWEEP_MARKER)).unwrap();
+        marker.lock().unwrap();
+
+        assert_eq!(sweep_orphaned_if_due(fixture.home.path(), Duration::ZERO).unwrap(), Sweep::Busy);
+        assert!(orphan.exists());
+    }
 }
