@@ -433,6 +433,7 @@ impl<'a, 's> Bodies<'a, 's> {
 
         self.scopes.push(FrameKind::Class, qualified);
         if let Some(body) = inner.child_by_field_name("body") {
+            self.scopes.note_class_names(body, self.source);
             self.visit_children(body, &id);
         }
         self.scopes.pop();
@@ -819,11 +820,14 @@ impl<'a, 's> Bodies<'a, 's> {
                 }
                 break;
             }
-            if self.model.declares_name(frame.path(), name) {
+            if self.model.declares_name(frame.path(), name) || frame.class_binds(name) {
                 return false;
             }
+            // A function-local import of `importlib` is the standard library
+            // only when the project has no `importlib` of its own - the same
+            // rule the module branch below gets from `Import::External`.
             if frame.binds(name) {
-                return frame.importlib(name) == Some(want);
+                return frame.importlib(name) == Some(want) && !self.project.has_container("importlib");
             }
         }
         if !matches!(self.model.module_binding(name, None), None | Some(ModuleBinding::Import(_))) {
@@ -858,7 +862,10 @@ impl<'a, 's> Bodies<'a, 's> {
                     if frame.kind() == FrameKind::Module {
                         break;
                     }
-                    if frame.binds(name) || self.model.declares_name(frame.path(), name) {
+                    if frame.binds(name)
+                        || frame.class_binds(name)
+                        || self.model.declares_name(frame.path(), name)
+                    {
                         return None;
                     }
                 }

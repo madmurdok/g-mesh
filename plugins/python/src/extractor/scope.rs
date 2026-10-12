@@ -114,11 +114,17 @@ pub(crate) struct Frame {
     /// that function, one consistent `importlib` spelling (GM-510, D7b).
     /// Filled by [`Scopes::bind_function_locals`]; a subset of `locals`.
     importlib: HashMap<String, ImportlibName>,
+    /// Every name a class body binds, in any form and with no source order
+    /// (GM-510): filled by [`Scopes::note_class_names`] for a class frame
+    /// only, and kept apart from `locals` so that general name resolution in
+    /// a class body is unchanged. What keeps a class-level `NAME` from
+    /// folding to the module constant of the same name.
+    class_names: HashSet<String>,
 }
 
 impl Frame {
     fn new(kind: FrameKind, path: String) -> Self {
-        Self { kind, path, locals: HashSet::new(), importlib: HashMap::new() }
+        Self { kind, path, locals: HashSet::new(), importlib: HashMap::new(), class_names: HashSet::new() }
     }
 
     pub(crate) fn path(&self) -> &str {
@@ -139,6 +145,15 @@ impl Frame {
     /// - a parameter, an assignment target, a `with … as`, a local import.
     pub(crate) fn binds(&self, name: &str) -> bool {
         self.locals.contains(name)
+    }
+
+    /// Whether this is a class frame whose body binds `name` anywhere -
+    /// an assignment, a loop or `with` target, an import. A class body reads
+    /// its own `NAME` before the module's, so such a name is never the
+    /// module-level one; a method does not see it, and
+    /// [`Scopes::chain`] already skips the class frame there.
+    pub(crate) fn class_binds(&self, name: &str) -> bool {
+        self.class_names.contains(name)
     }
 }
 
@@ -302,6 +317,27 @@ impl Scopes {
         if let Some(frame) = self.frames.last_mut() {
             frame.importlib =
                 prescan.into_iter().filter_map(|(name, importlib)| Some((name, importlib?))).collect();
+        }
+    }
+
+    /// Records in the innermost (class) frame every name its `body` binds
+    /// ([`Frame::class_binds`]), by the same sweep as
+    /// [`Scopes::bind_function_locals`] but leaving `locals` as it was. The
+    /// sweep has no source order, so a use above the assignment is treated
+    /// as the class's own name too: a missing edge, never a wrong one.
+    pub(crate) fn note_class_names(&mut self, body: Node, source: &str) {
+        let mut declared_elsewhere = HashSet::new();
+        collect_outer_declarations(body, source, &mut declared_elsewhere);
+        let locals = self.frames.last().map(|frame| frame.locals.clone()).unwrap_or_default();
+        self.prescan = Some(HashMap::new());
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            self.bind_locals_in(child, source, &declared_elsewhere);
+        }
+        let prescan = self.prescan.take().unwrap_or_default();
+        if let Some(frame) = self.frames.last_mut() {
+            frame.locals = locals;
+            frame.class_names = prescan.into_keys().collect();
         }
     }
 
