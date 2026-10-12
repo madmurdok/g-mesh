@@ -131,9 +131,6 @@ pub fn run() -> Result<()> {
     )
 }
 
-/// The CLI rebuild holding `root`'s index, if one is running (see
-/// `daemon::rebuild_in_progress`). A marker that cannot be read reads as
-/// none: the bootstrap that follows then behaves as it would without one.
 /// Starts the sweep of orphaned state directories (GM-524 D1, option (c)) on
 /// a background thread: `cli::clean::sweep_orphaned_if_due`, at most once per
 /// `cli::clean::ORPHAN_SWEEP_INTERVAL` across every shim on the machine. It
@@ -158,6 +155,9 @@ fn spawn_orphan_sweep() {
     });
 }
 
+/// The CLI rebuild holding `root`'s index, if one is running (see
+/// `daemon::rebuild_in_progress`). A marker that cannot be read reads as
+/// none: the bootstrap that follows then behaves as it would without one.
 fn rebuilding(root: &Path) -> Option<router::Rebuilding> {
     let rebuild = daemon::rebuild_in_progress(root).ok().flatten()?;
     Some(router::Rebuilding {
