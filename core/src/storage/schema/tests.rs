@@ -926,10 +926,12 @@ fn a_completed_pass_clears_only_its_own_languages_pending_rows() {
 }
 
 /// A recorded failure (incomplete or not run alike) clears the language's
-/// pending rows: no pass is working on them. Control: remove the clear from
-/// `record_language_semantic_pass_failure` (rows remain).
+/// pending row, since no pass is working on it, and keeps its file rows as
+/// stale files. Controls: remove the clear from
+/// `record_language_semantic_pass_failure` (the language row remains);
+/// restore the full clear there (the file rows go).
 #[test]
-fn a_recorded_failure_clears_the_languages_pending_rows() {
+fn a_recorded_failure_clears_the_languages_pending_row_and_keeps_its_files() {
     let conn = setup();
     mark_semantic_pending(&conn, "rust", &["a.rs", "b.rs"]);
     mark_semantic_pending(&conn, "go", &["a.go"]);
@@ -937,7 +939,23 @@ fn a_recorded_failure_clears_the_languages_pending_rows() {
     record_language_semantic_pass_failure(&conn, "rust", "the engine exited").unwrap();
 
     assert_eq!(semantic_pending_since(&conn, "rust").unwrap(), None);
+    assert_eq!(
+        semantic_pending_file_rows(&conn),
+        vec![
+            ("go".to_string(), "a.go".to_string()),
+            ("rust".to_string(), "a.rs".to_string()),
+            ("rust".to_string(), "b.rs".to_string())
+        ]
+    );
+    assert_eq!(semantic_stale_files(&conn).unwrap(), vec![("rust".to_string(), 2)]);
+
+    // A later complete pass clears the stale rows, and
+    // only its own language's. Control: make `record_language_semantic_pass`
+    // call `clear_semantic_pending_language` instead of
+    // `clear_semantic_pending` -> the rust file rows stay.
+    record_language_semantic_pass(&conn, "rust").unwrap();
     assert_eq!(semantic_pending_file_rows(&conn), vec![("go".to_string(), "a.go".to_string())]);
+    assert!(semantic_stale_files(&conn).unwrap().is_empty());
 }
 
 /// The clear and the `language_state` write commit together, inside a
@@ -1099,7 +1117,7 @@ fn semantic_pass_at(conn: &Connection, language: &str) -> Option<String> {
 /// A listed incomplete whole-project pass: the files it names are owed one
 /// attempt more (a fresh one at 1), every other owed or given-up file was
 /// answered and is settled, the language is residual with the reason, and
-/// the pending rows go. Run again, a file at its last attempt is given up as
+/// the pending row goes while its file rows stay stale. Run again, a file at its last attempt is given up as
 /// a gap and the count of files left excludes it.
 #[test]
 fn a_residual_record_settles_what_the_pass_answered_and_counts_an_attempt_for_the_rest() {
@@ -1121,7 +1139,7 @@ fn a_residual_record_settles_what_the_pass_answered_and_counts_an_attempt_for_th
     assert!(gap_file_rows(&conn).is_empty(), "the pass answered the given-up file");
     assert_eq!(residual_rows(&conn), vec![("rust".to_string(), "cold".to_string())]);
     assert!(semantic_pending(&conn).unwrap().is_empty());
-    assert!(semantic_pending_file_rows(&conn).is_empty());
+    assert_eq!(semantic_pending_file_rows(&conn), vec![("rust".to_string(), "a.rs".to_string())]);
     assert_eq!(
         semantic_residual_files(&conn, "rust").unwrap(),
         Some(vec!["a.rs".to_string(), "d.rs".to_string()])

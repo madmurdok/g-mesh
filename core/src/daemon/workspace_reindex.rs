@@ -1883,6 +1883,57 @@ mod tests {
         );
     }
 
+    /// Test 12b's swap, but the reindex's own pass does not run (the plugin
+    /// asleep). After the whole
+    /// reindex the unchanged node's semantic edge still points at the old,
+    /// still existing target - no pass re-checked it - and the file the walk
+    /// changed stays listed as stale rather than vanishing with the language
+    /// row.
+    ///
+    /// Control: drop `{x}.source = 'syntactic' AND` from the `dropped`
+    /// closure in `language_swap::plan_attached` -> `alpha-sem` is deleted.
+    #[test]
+    fn a_kept_semantic_edge_outlives_a_pass_not_run_and_its_file_stays_stale() {
+        let mut first = three_nodes();
+        first.push(json(&wire_edge("alpha-old", "alpha-n1", "alpha-n2")));
+        let mut second = three_nodes();
+        second.push(json(&wire_edge("alpha-new", "alpha-n1", "alpha-n3")));
+        let (_project, _plugins, _scratch, registry, conn, supervisor) = after_a_pass(
+            &first,
+            vec![
+                semantic_edge("alpha-e1", "alpha-n1", "alpha-n3"),
+                semantic_edge("alpha-sem", "alpha-n1", "alpha-n2"),
+            ],
+            &[],
+            &second,
+        );
+        supervisor.sleep_now("the test put it to sleep");
+
+        run(&registry, &supervisor, &conn, "go.mod").expect("the reindex itself succeeds");
+
+        let guard = conn.lock().unwrap();
+        assert_eq!(
+            rows(&guard, "SELECT id, source, toId FROM edges ORDER BY id"),
+            vec![
+                edge_row("alpha-e1", "semantic", "alpha-n3"),
+                edge_row("alpha-new", "syntactic", "alpha-n3"),
+                edge_row("alpha-sem", "semantic", "alpha-n2"),
+            ],
+            "no pass ran, so the semantic edge to the old target is still there"
+        );
+        assert_eq!(
+            schema::semantic_pass_failures(&guard).unwrap(),
+            vec![("alpha".to_string(), semantic::NOT_RUN_REASON.to_string())],
+            "the pass was recorded as not run"
+        );
+        assert_eq!(schema::semantic_pending(&guard).unwrap(), Vec::new(), "the language row went");
+        assert_eq!(
+            schema::semantic_stale_files(&guard).unwrap(),
+            vec![("alpha".to_string(), 1)],
+            "the changed file stays stale"
+        );
+    }
+
     /// Indexes `three_nodes` for `alpha`, whose manifest declares
     /// `semantic_sweep` or not, adds a semantic edge no pass will re-send,
     /// then runs a complete whole-project pass (the fake plugin answers with
@@ -2165,11 +2216,15 @@ mod tests {
         assert_eq!(after, (0, 0), "the completed pass cleared it");
     }
 
-    /// A pass not run (its plugin asleep) clears the rows the swap wrote: no
-    /// pass is working on them. Control: remove the clear from
-    /// `schema::record_language_semantic_pass_failure` -> rows remain.
+    /// A pass not run (its plugin asleep) clears the language row the swap
+    /// wrote, since no pass is working on it. This fixture's swap writes no
+    /// file rows; that they stay as stale is pinned by
+    /// `a_kept_semantic_edge_outlives_a_pass_not_run_and_its_file_stays_stale`.
+    /// Control: remove the clear from
+    /// `schema::record_language_semantic_pass_failure` -> the language row
+    /// remains.
     #[test]
-    fn a_pass_not_run_after_the_swap_clears_the_pending_rows() {
+    fn a_pass_not_run_after_the_swap_clears_the_pending_row_and_keeps_its_files() {
         let (_project, _plugins, registry, conn) = alpha_registry();
         let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
         supervisor.sleep_now("the test put it to sleep");
@@ -2177,13 +2232,13 @@ mod tests {
         let (at_swap, after) = semantic_pending_around_the_pass(&registry, &supervisor, &conn);
 
         assert_eq!(at_swap.0, 1, "the swap wrote the language row");
-        assert_eq!(after, (0, 0));
+        assert_eq!(after, (0, at_swap.1), "the language row goes, the file rows stay");
     }
 
-    /// An incomplete pass is recorded as a failure and clears the rows the
-    /// same way. Control: as above.
+    /// An incomplete pass is recorded as a failure and clears the language
+    /// row the same way, keeping the file row. Control: as above.
     #[test]
-    fn an_incomplete_pass_after_the_swap_clears_the_pending_rows() {
+    fn an_incomplete_pass_after_the_swap_clears_the_pending_row_and_keeps_its_files() {
         let counters = Counters::default();
         let (project, plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, true);
         test_plugin::answer_first_semantic_pass_incomplete(
@@ -2197,7 +2252,7 @@ mod tests {
         let (at_swap, after) = semantic_pending_around_the_pass(&registry, &supervisor, &conn);
 
         assert_eq!(at_swap, (1, 1), "the new file is pending at the swap");
-        assert_eq!(after, (0, 0));
+        assert_eq!(after, (0, 1), "the file stays as a stale file");
         assert_eq!(schema::semantic_pass_failures(&conn.lock().unwrap()).unwrap().len(), 1);
     }
 
