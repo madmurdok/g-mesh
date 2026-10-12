@@ -597,6 +597,89 @@ mod tests {
         assert_eq!(provenance.pending_files_omitted, Some(30 - MAX_PENDING_FILES));
     }
 
+    /// `language`'s file rows left stale: written by a swap, then the
+    /// language row cleared by a recorded failure, as a pass that did not run
+    /// or failed leaves them.
+    fn mark_stale(conn: &Connection, language: &str, files: &[&str]) {
+        mark_pending(conn, language, "2026-09-26T10:14:03Z", files);
+        schema::record_language_semantic_pass_failure(conn, language, "not run").unwrap();
+    }
+
+    /// An `absent` answer naming stale files lists exactly those, the
+    /// anchor's file first and the rest sorted, and no pending fields; a
+    /// stale file the response does not name is not listed.
+    ///
+    /// Control: make `disclose`'s `Absent` arm return
+    /// `Provenance::absent(language)` without reading the rows -> no
+    /// `staleFiles`.
+    #[test]
+    fn an_absent_block_names_only_the_responses_stale_files_anchor_first() {
+        let conn = db();
+        mark_stale(&conn, "rust", &["z.rs", "a.rs", "m.rs", "elsewhere.rs"]);
+
+        let provenance = disclosed(
+            &conn,
+            &with_semantic_tier("rust"),
+            "rust",
+            Some("z.rs"),
+            &["m.rs", "c.rs", "a.rs", "m.rs"],
+        )
+        .unwrap();
+
+        assert_eq!(provenance.semantic_tier, SemanticTier::Absent);
+        assert_eq!(provenance.since, None);
+        assert_eq!(provenance.stale_files, vec!["z.rs", "a.rs", "m.rs"]);
+        assert_eq!(provenance.stale_files_omitted, None);
+        assert!(provenance.pending_files.is_empty());
+        assert_eq!(provenance.pending_files_omitted, None);
+        assert_eq!(
+            serde_json::to_string(&provenance).unwrap(),
+            r#"{"language":"rust","semanticTier":"absent","staleFiles":["z.rs","a.rs","m.rs"]}"#
+        );
+    }
+
+    /// More stale files than the cap: [`MAX_PENDING_FILES`] listed, the rest
+    /// counted exactly, as `pendingFiles` is.
+    #[test]
+    fn the_stale_file_list_is_capped_and_the_rest_counted() {
+        let conn = db();
+        let files: Vec<String> = (0..30).map(|i| format!("src/f{i:02}.rs")).collect();
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+        mark_stale(&conn, "rust", &files);
+
+        let provenance = disclosed(&conn, &with_semantic_tier("rust"), "rust", None, &files).unwrap();
+
+        assert_eq!(provenance.semantic_tier, SemanticTier::Absent);
+        assert_eq!(provenance.stale_files.len(), MAX_PENDING_FILES);
+        assert_eq!(provenance.stale_files_omitted, Some(30 - MAX_PENDING_FILES));
+    }
+
+    /// An `absent` answer naming no stale file is plain `absent`: the field
+    /// is not serialized, not `[]`.
+    #[test]
+    fn an_absent_block_naming_no_stale_file_is_plain_absent() {
+        let conn = db();
+        mark_stale(&conn, "rust", &["elsewhere.rs"]);
+
+        let provenance = disclosed(&conn, &with_semantic_tier("rust"), "rust", Some("a.rs"), &["b.rs"]);
+
+        assert_eq!(provenance, Some(Provenance::absent("rust")));
+        assert_eq!(
+            serde_json::to_string(&provenance.unwrap()).unwrap(),
+            r#"{"language":"rust","semanticTier":"absent"}"#
+        );
+    }
+
+    /// An `absent` block may carry a file list, so the page holds back as
+    /// much for it as for a `pending` one.
+    #[test]
+    fn an_absent_block_reserves_room_for_its_stale_files() {
+        let pending = Resolved::Pending { since: "2026-09-26T10:14:03Z".to_string() };
+
+        assert!(Resolved::Absent.page_reserve() >= PENDING_FILES_MAX_BYTES);
+        assert_eq!(Resolved::Absent.page_reserve(), pending.page_reserve());
+    }
+
     /// The wire spelling, pinned here rather than only in the conformance
     /// fixtures: `camelCase` keys, lower-case enum values, `since` and the
     /// file fields only with `pending`, no empty list, and nothing resembling

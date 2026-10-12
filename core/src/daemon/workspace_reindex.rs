@@ -1883,6 +1883,57 @@ mod tests {
         );
     }
 
+    /// Test 12b's swap, but the reindex's own pass does not run (the plugin
+    /// asleep). After the whole
+    /// reindex the unchanged node's semantic edge still points at the old,
+    /// still existing target - no pass re-checked it - and the file the walk
+    /// changed stays listed as stale rather than vanishing with the language
+    /// row.
+    ///
+    /// Control: drop `{x}.source = 'syntactic' AND` from the `dropped`
+    /// closure in `language_swap::plan_attached` -> `alpha-sem` is deleted.
+    #[test]
+    fn a_kept_semantic_edge_outlives_a_pass_not_run_and_its_file_stays_stale() {
+        let mut first = three_nodes();
+        first.push(json(&wire_edge("alpha-old", "alpha-n1", "alpha-n2")));
+        let mut second = three_nodes();
+        second.push(json(&wire_edge("alpha-new", "alpha-n1", "alpha-n3")));
+        let (_project, _plugins, _scratch, registry, conn, supervisor) = after_a_pass(
+            &first,
+            vec![
+                semantic_edge("alpha-e1", "alpha-n1", "alpha-n3"),
+                semantic_edge("alpha-sem", "alpha-n1", "alpha-n2"),
+            ],
+            &[],
+            &second,
+        );
+        supervisor.sleep_now("the test put it to sleep");
+
+        run(&registry, &supervisor, &conn, "go.mod").expect("the reindex itself succeeds");
+
+        let guard = conn.lock().unwrap();
+        assert_eq!(
+            rows(&guard, "SELECT id, source, toId FROM edges ORDER BY id"),
+            vec![
+                edge_row("alpha-e1", "semantic", "alpha-n3"),
+                edge_row("alpha-new", "syntactic", "alpha-n3"),
+                edge_row("alpha-sem", "semantic", "alpha-n2"),
+            ],
+            "no pass ran, so the semantic edge to the old target is still there"
+        );
+        assert_eq!(
+            schema::semantic_pass_failures(&guard).unwrap(),
+            vec![("alpha".to_string(), semantic::NOT_RUN_REASON.to_string())],
+            "the pass was recorded as not run"
+        );
+        assert_eq!(schema::semantic_pending(&guard).unwrap(), Vec::new(), "the language row went");
+        assert_eq!(
+            schema::semantic_stale_files(&guard).unwrap(),
+            vec![("alpha".to_string(), 1)],
+            "the changed file stays stale"
+        );
+    }
+
     /// Indexes `three_nodes` for `alpha`, whose manifest declares
     /// `semantic_sweep` or not, adds a semantic edge no pass will re-send,
     /// then runs a complete whole-project pass (the fake plugin answers with

@@ -1258,6 +1258,37 @@ fn a_pending_semantic_pass_is_named_with_its_file_count_until_it_completes() {
     assert!(!rendered.contains("semantic pending"), "{rendered}");
 }
 
+/// A language whose pass after a workspace reindex failed or did not run is
+/// no longer pending, but its changed files are named as stale, one line per
+/// language, until a pass completes. Control: drop the `semantic stale:`
+/// loop from `render` -> not named.
+#[test]
+fn files_no_pass_rechecked_after_a_reindex_are_named_stale_until_a_pass_completes() {
+    let fixture = Fixture::new(&[("a.ts", "export const a = 1;")]);
+    let conn = fixture.index();
+    fixture.index_file(&conn, "a.ts", false);
+    conn.execute_batch(
+        "INSERT INTO semantic_pending (language, since) VALUES ('typescript', '2026-09-26T10:14:03Z');
+         INSERT INTO semantic_pending_files (language, filePath) VALUES ('typescript', 'a.ts'), ('typescript', 'b.ts');",
+    )
+    .unwrap();
+    schema::record_language_semantic_pass_failure(&conn, "typescript", "not run").unwrap();
+
+    let status = fixture.status();
+    assert!(status.semantic_pending.is_empty(), "{:?}", status.semantic_pending);
+    assert_eq!(status.semantic_stale, vec![("typescript".to_string(), 2)]);
+    let rendered = render(&report_with(status));
+    assert!(!rendered.contains("semantic pending"), "{rendered}");
+    assert_eq!(rendered.matches("stale since the last reindex").count(), 1, "{rendered}");
+    assert!(rendered.contains("typescript: 2 file(s) stale since the last reindex"), "{rendered}");
+
+    schema::record_language_semantic_pass(&conn, "typescript").unwrap();
+    let status = fixture.status();
+    assert!(status.semantic_stale.is_empty(), "{:?}", status.semantic_stale);
+    let rendered = render(&report_with(status));
+    assert!(!rendered.contains("stale since the last reindex"), "{rendered}");
+}
+
 // ---------------------------------------------------------------------
 // GM-514: files reached through links (docs/architecture/
 // gm-514-core-symlink-table.md, section 5)

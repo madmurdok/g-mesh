@@ -948,6 +948,14 @@ fn a_recorded_failure_clears_the_languages_pending_row_and_keeps_its_files() {
         ]
     );
     assert_eq!(semantic_stale_files(&conn).unwrap(), vec![("rust".to_string(), 2)]);
+
+    // A later complete pass clears the stale rows, and
+    // only its own language's. Control: make `record_language_semantic_pass`
+    // call `clear_semantic_pending_language` instead of
+    // `clear_semantic_pending` -> the rust file rows stay.
+    record_language_semantic_pass(&conn, "rust").unwrap();
+    assert_eq!(semantic_pending_file_rows(&conn), vec![("go".to_string(), "a.go".to_string())]);
+    assert!(semantic_stale_files(&conn).unwrap().is_empty());
 }
 
 /// The clear and the `language_state` write commit together, inside a
