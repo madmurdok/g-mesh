@@ -500,15 +500,7 @@ pub fn run(root: &Path) -> Result<()> {
         }
     };
 
-    // A walked project whose consumer waits on an owed retry (above) is
-    // activated now, not on the first tool call: until then neither the
-    // watcher's consumer nor the startup reconcile would run, so a session
-    // that only connects would see no edit at all (GM-524, F1). Taken before
-    // `indexing` moves, so the trigger is queued for the thread below.
-    let activate_now = pending_watcher.is_some();
-    let eager_activation = indexing.clone();
-
-    // Otherwise parked until the first tool call - see `daemon::activation`.
+    // Parked until the first tool call - see `daemon::activation`.
     activation::spawn(
         activation::ActivationCtx {
             conn: Arc::clone(&conn),
@@ -526,9 +518,6 @@ pub fn run(root: &Path) -> Result<()> {
         },
         activation_trigger,
     )?;
-    if activate_now {
-        eager_activation.request_activation();
-    }
 
     // `canonical_root`: the orphan check must stat the same spelling
     // everything else resolved against.
