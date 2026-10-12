@@ -217,16 +217,13 @@ mod tests {
     /// Writes `contents` to a uniquely named file and resolves against it.
     /// `None` resolves against a path that does not exist.
     fn resolve_against(tag: &str, contents: Option<&str>) -> ResolvedSpec {
-        let dir = std::env::temp_dir().join(format!("g-mesh-sdk-manifest-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("plugin.toml");
+        let guard =
+            tempfile::Builder::new().prefix(&format!("g-mesh-sdk-manifest-{tag}-")).tempdir().unwrap();
+        let path = guard.path().join("plugin.toml");
         if let Some(contents) = contents {
             std::fs::write(&path, contents).unwrap();
         }
-        let resolved = ResolvedSpec::resolve_from(&SPEC, Some(path));
-        let _ = std::fs::remove_dir_all(&dir);
-        resolved
+        ResolvedSpec::resolve_from(&SPEC, Some(path))
     }
 
     #[test]

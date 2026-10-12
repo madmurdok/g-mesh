@@ -742,6 +742,7 @@ dependencies = [
  "g-mesh-wire",
  "serde",
  "serde_json",
+ "tempfile",
  "toml",
  "tree-sitter",
  "tree-sitter-python",
@@ -771,6 +772,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "toml",
 ]
 

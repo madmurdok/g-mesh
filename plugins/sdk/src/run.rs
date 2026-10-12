@@ -1391,24 +1391,17 @@ mod tests {
         }
     }
 
-    /// A scratch project of `files` on disk, removed on drop.
-    struct Project(PathBuf);
+    /// A scratch project of `files` on disk, removed when the guard drops.
+    struct Project(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     impl Project {
         fn new(tag: &str, files: &[(&str, &str)]) -> Self {
-            let dir = std::env::temp_dir().join(format!("g-mesh-run-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = tempfile::Builder::new().prefix(&format!("g-mesh-run-{tag}-")).tempdir().unwrap();
+            let dir = guard.path().to_path_buf();
             for (path, text) in files {
                 std::fs::write(dir.join(path), text).unwrap();
             }
-            Project(dir)
-        }
-    }
-
-    impl Drop for Project {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            Project(dir, guard)
         }
     }
 
@@ -1863,27 +1856,20 @@ mod presence_tests {
         }
     }
 
-    /// A scratch root, removed on drop.
-    struct Root(PathBuf);
+    /// A scratch root, removed when the guard drops.
+    struct Root(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     impl Root {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("g-mesh-presence-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Root(dir)
+            let guard =
+                tempfile::Builder::new().prefix(&format!("g-mesh-presence-{tag}-")).tempdir().unwrap();
+            Root(guard.path().to_path_buf(), guard)
         }
 
         fn write(&self, path: &str, text: &str) {
             let path = self.0.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
-        }
-    }
-
-    impl Drop for Root {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
