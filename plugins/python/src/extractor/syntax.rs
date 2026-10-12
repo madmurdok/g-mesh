@@ -215,6 +215,41 @@ pub(crate) fn string_literal<'s>(literal: Node, source: &'s str) -> Option<&'s s
     (literal.kind() == "string").then(|| string_content(literal, source)).flatten()
 }
 
+/// The text of a string literal whose value *is* its source text, or `None`.
+///
+/// Stricter than [`string_literal`] on purpose (GM-510, D2): a dynamic
+/// import's module name folds from this, and folding `f"pkg.{x}"` to
+/// `pkg.{x}` would be a wrong edge. Accepted: a single `string` whose prefix
+/// is only `r`/`u` (any case) and that has no `interpolation` and no
+/// `escape_sequence` (which the grammar nests inside `string_content`).
+/// Refused: f-, t- and byte strings, escapes, and implicit concatenation
+/// (`concatenated_string`, a different node kind).
+pub(crate) fn plain_string<'s>(literal: Node, source: &'s str) -> Option<&'s str> {
+    if literal.kind() != "string" {
+        return None;
+    }
+    let mut cursor = literal.walk();
+    for child in literal.children(&mut cursor) {
+        match child.kind() {
+            "string_start" => {
+                let prefix = text(child, source).trim_end_matches(['\'', '"']);
+                if !prefix.chars().all(|ch| matches!(ch, 'r' | 'R' | 'u' | 'U')) {
+                    return None;
+                }
+            }
+            "interpolation" | "escape_sequence" => return None,
+            "string_content" => {
+                let mut inner = child.walk();
+                if child.children(&mut inner).any(|part| part.kind() != "string_content") {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    string_content(literal, source)
+}
+
 /// The docstring of a body - the first statement of a `module` or `block`,
 /// when that statement is a string literal.
 ///

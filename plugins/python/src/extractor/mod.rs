@@ -13,7 +13,9 @@
 //! `for`/`with`/`except` targets, comprehension variables, the walrus
 //! operator, function-local imports - on a stack pushed and popped with the
 //! syntax. A name that is bound is not a name this file can address
-//! elsewhere, so no edge is emitted for it.
+//! elsewhere, so no edge is emitted for it. A function-local import still
+//! draws its `IMPORTS` edges from the file node (section 4); only the names
+//! it binds stay locals.
 //!
 //! Two things there are *not* copied from the Rust plugin, because Python's
 //! rules differ: a function's locals are bound by a **pre-scan** of its whole
@@ -50,6 +52,21 @@
 //! ([`ModuleCtx::relative`]), which for an `__init__.py` is the package
 //! itself. [`decls`] is what each shape emits; [`keys`] is the resolution
 //! rule.
+//!
+//! The same statement inside a `def` or a class body (GM-510) emits the same
+//! `IMPORTS` edges, from the file node, through the same
+//! `decls::import_edges` - drawn by [`bodies`], since [`decls`] reads module
+//! level only. It emits nothing else: no `pending_symbol`, no re-export, no
+//! module binding. A **dynamic** import - `importlib.import_module(name,
+//! package)` or the builtin `__import__(name)` - emits what the static
+//! `import <name>` would, when its callee is statically importlib's (however
+//! aliased, at module level or in an enclosing function) and `name` folds to
+//! a string from this file alone: a plain literal, or a module-level constant
+//! assigned exactly once ([`model::FileModel::constant`]). A leading-dot name
+//! resolves against `package` the way CPython's `_resolve_name` does.
+//! Anything that does not fold - an f-string, a concatenation, a parameter,
+//! a reassigned name - emits nothing. Edges from function-local and dynamic
+//! imports carry no flag: in the graph a lazy import looks like an eager one.
 //!
 //! # 5. `__all__`
 //!
@@ -232,12 +249,13 @@ impl Extractor for PythonExtractor {
                     conditional: 0,
                 };
                 declarer.announce(root);
+                declarer.poison_rebindings(root);
                 declarer.collect(root);
                 declarer.reexport_dunder_all();
             }
             {
                 let file = emitter.file_id().to_string();
-                let mut bodies = Bodies::new(&module, source, &model, &mut emitter);
+                let mut bodies = Bodies::new(project, &module, source, &model, &mut emitter);
                 bodies.visit_children(root, &file);
             }
         }
