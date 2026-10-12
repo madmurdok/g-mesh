@@ -1916,8 +1916,8 @@ mod tests {
         assert_eq!(edges_after_a_complete_pass(true), vec![edge_row("alpha-e1", "syntactic", "alpha-n2")]);
     }
 
-    /// Test 13, the other arm: a language whose manifest leaves `semantic_sweep` off (as
-    /// TypeScript's does) keeps it.
+    /// Test 13, the other arm: a language whose manifest leaves `semantic_sweep` off
+    /// keeps it.
     ///
     /// Control: pass `Some(&self.manifest.language)` unconditionally to
     /// `apply_semantic_pass` in `PluginProcess::semantic_pass` ->
