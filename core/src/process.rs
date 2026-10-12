@@ -1,6 +1,7 @@
-//! The three things this project does to processes that POSIX spells with
+//! The things this project does to processes that POSIX spells with
 //! signals, named once and implemented per platform: is it alive, ask it to
-//! stop, make it stop, and start one detached.
+//! stop, make it stop, start one detached, and (Unix only) the same for a
+//! detached daemon's whole process group.
 //!
 //! # Why Windows stops a daemon with `TerminateProcess` rather than a
 //! shutdown request
@@ -97,6 +98,60 @@ pub fn keep_our_stdio_from_children() {
     imp::keep_our_stdio_from_children()
 }
 
+/// The process group to signal in place of `pid`, when `pid` leads a group of
+/// its own: `Some(pid)` for a daemon `detach` started (it is its group's
+/// leader, and its plugins, their language servers and those servers'
+/// `cargo`/`rustc` all inherit that group). `None` when `pid` is not a group
+/// leader - a daemon run by hand in a shell job, or by a test harness without
+/// `detach` - or when its group is the caller's own, so signalling the group
+/// could never reach a process the caller did not mean (GM-524 D2). Always
+/// `None` on Windows, which has no process groups in this sense.
+pub fn own_group_of(pid: u32) -> Option<u32> {
+    imp::own_group_of(pid)
+}
+
+/// [`request_stop`] for every member of process group `pgid`.
+pub fn request_stop_group(pgid: u32) -> Result<()> {
+    imp::signal_group(pgid, imp::TERMINATE)
+}
+
+/// [`force_stop`] for every member of process group `pgid`.
+pub fn force_stop_group(pgid: u32) -> Result<()> {
+    imp::signal_group(pgid, imp::KILL)
+}
+
+/// Whether process group `pgid` still has any member.
+pub fn group_is_alive(pgid: u32) -> bool {
+    imp::group_is_alive(pgid)
+}
+
+/// What [`kill_own_group`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupSweep {
+    /// This process does not lead its own group, so the group belongs to
+    /// whatever started it (a shell job, a test harness) and was left alone.
+    /// Always the answer on Windows.
+    NotLeader,
+    /// `terminated` members were sent `SIGTERM`; `killed` of them were still
+    /// there after the grace and were sent `SIGKILL`.
+    Swept { terminated: usize, killed: usize },
+}
+
+/// Ends every other process in this process's group: `SIGTERM`, up to
+/// `grace` for them to go, then `SIGKILL` to whatever is left. This process
+/// itself is never signalled - it has no `SIGTERM` handler, so `killpg` would
+/// end it before it finished its own teardown. Members are found by listing
+/// the processes (`sysinfo`) and keeping those whose `getpgid` is ours, so a
+/// member forked after the `SIGTERM` is still caught by the `SIGKILL` round's
+/// fresh listing.
+///
+/// A no-op unless this process leads its group (see [`GroupSweep::NotLeader`]):
+/// a daemon is a group leader only when `detach` started it, which is the one
+/// case where the whole group is its own.
+pub fn kill_own_group(grace: std::time::Duration) -> GroupSweep {
+    imp::kill_own_group(grace)
+}
+
 /// The one lock every plugin spawn is taken under - see [`spawn_serialized`].
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -128,6 +183,7 @@ mod imp {
     use anyhow::{Context, Result};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
+    use std::time::{Duration, Instant};
 
     pub fn is_alive(pid: u32) -> bool {
         // `kill(pid, 0)` performs the usual permission and existence checks
@@ -176,6 +232,104 @@ mod imp {
     /// Nothing to do: Rust opens its file descriptors `CLOEXEC`, so a child
     /// gets what `Command`'s stdio names and nothing else.
     pub fn keep_our_stdio_from_children() {}
+
+    pub const TERMINATE: libc::c_int = libc::SIGTERM;
+    pub const KILL: libc::c_int = libc::SIGKILL;
+
+    /// How often [`kill_own_group`] re-lists the group while it waits.
+    const GROUP_POLL: Duration = Duration::from_millis(50);
+
+    fn pgid_of(pid: u32) -> Option<u32> {
+        // SAFETY: `getpgid` takes no pointers and only reads.
+        let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+        (pgid > 0).then_some(pgid as u32)
+    }
+
+    fn own_pgid() -> u32 {
+        // SAFETY: `getpgrp` takes no arguments and cannot fail.
+        unsafe { libc::getpgrp() as u32 }
+    }
+
+    pub fn own_group_of(pid: u32) -> Option<u32> {
+        (pgid_of(pid) == Some(pid) && pid != own_pgid()).then_some(pid)
+    }
+
+    pub fn signal_group(pgid: u32, signal: libc::c_int) -> Result<()> {
+        // Never a group this process is in, whatever the caller passed:
+        // `killpg` on it would end the caller too.
+        if pgid <= 1 || pgid == own_pgid() {
+            anyhow::bail!("refusing to signal process group {pgid}: it is not a separate group");
+        }
+        // SAFETY: `killpg` takes no pointers; it affects only group `pgid`.
+        if unsafe { libc::killpg(pgid as libc::pid_t, signal) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            // The group has no members left: what the signal was for.
+            Some(libc::ESRCH) => Ok(()),
+            _ => Err(err).with_context(|| format!("failed to signal process group {pgid}")),
+        }
+    }
+
+    pub fn group_is_alive(pgid: u32) -> bool {
+        if pgid <= 1 {
+            return false;
+        }
+        // SAFETY: signal 0 only inspects; no pointers.
+        if unsafe { libc::killpg(pgid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    /// Every live process in group `pgid` except `me`. Zombies are left out:
+    /// one cannot be signalled away, and waiting on it would only spend the
+    /// whole grace.
+    fn group_members(pgid: u32, me: u32) -> Vec<u32> {
+        use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+        let mut system = System::new();
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+        system
+            .processes()
+            .iter()
+            .filter(|(_, process)| process.status() != ProcessStatus::Zombie)
+            .map(|(pid, _)| pid.as_u32())
+            .filter(|&pid| pid != me && pgid_of(pid) == Some(pgid))
+            .collect()
+    }
+
+    /// Signals each of `pids` that is still in group `pgid` - re-checked
+    /// right before the signal, so a member that exited since the listing and
+    /// whose pid was reused is not hit.
+    fn signal_members(pids: &[u32], pgid: u32, signal: libc::c_int) {
+        for &pid in pids {
+            if pgid_of(pid) == Some(pgid) {
+                let _ = send_signal(pid, signal);
+            }
+        }
+    }
+
+    pub fn kill_own_group(grace: Duration) -> super::GroupSweep {
+        let me = std::process::id();
+        let pgid = own_pgid();
+        if pgid != me {
+            return super::GroupSweep::NotLeader;
+        }
+        let members = group_members(pgid, me);
+        if members.is_empty() {
+            return super::GroupSweep::Swept { terminated: 0, killed: 0 };
+        }
+        signal_members(&members, pgid, libc::SIGTERM);
+        let deadline = Instant::now() + grace;
+        let mut left = group_members(pgid, me);
+        while !left.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(GROUP_POLL);
+            left = group_members(pgid, me);
+        }
+        signal_members(&left, pgid, libc::SIGKILL);
+        super::GroupSweep::Swept { terminated: members.len(), killed: left.len() }
+    }
 }
 
 #[cfg(windows)]
@@ -275,6 +429,30 @@ mod imp {
             // ownership changes hands.
             unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
         }
+    }
+
+    // Process groups: Unix-only (GM-524 D2). `CREATE_NEW_PROCESS_GROUP` is a
+    // console-signal group, not something `TerminateProcess` can address, and
+    // the equivalent (a job object the daemon puts itself and its children in)
+    // is out of this task's scope. `own_group_of` answering `None` keeps every
+    // caller on the per-pid path, so the two below are never reached.
+    pub const TERMINATE: i32 = 0;
+    pub const KILL: i32 = 0;
+
+    pub fn own_group_of(_pid: u32) -> Option<u32> {
+        None
+    }
+
+    pub fn signal_group(pgid: u32, _signal: i32) -> Result<()> {
+        anyhow::bail!("process group {pgid} cannot be signalled on Windows")
+    }
+
+    pub fn group_is_alive(_pgid: u32) -> bool {
+        false
+    }
+
+    pub fn kill_own_group(_grace: std::time::Duration) -> super::GroupSweep {
+        super::GroupSweep::NotLeader
     }
 
     fn open(pid: u32, rights: PROCESS_ACCESS_RIGHTS) -> Option<OwnedHandle> {

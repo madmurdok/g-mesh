@@ -884,19 +884,35 @@ fn restarted(root: &Path, served: &Path) -> String {
     };
     format!(
         "g-mesh: the daemon serving {name} restarted since this session's previous answer from it (g-mesh \
-         reindex, init or stop, or a newer build); results from before the restart may differ from this one."
+         reindex, init or stop, a newer build, or the daemon exited); results from before the restart may differ \
+         from this one."
     )
 }
 
-/// The shim's answer to a request whose slot could not reconnect.
+/// The shim's answer to a request whose slot could not reconnect. A root the
+/// filesystem reports as gone (a removed git worktree, a deleted folder) gets
+/// its own text: retrying cannot help, and nothing here recreates it.
 fn unreachable_text(root: &Path, err: &anyhow::Error) -> String {
     match err.chain().find_map(|cause| cause.downcast_ref::<Rebuilding>()) {
         Some(rebuilding) => format!("g-mesh: {rebuilding}"),
+        None if root_is_gone(root) => format!(
+            "g-mesh: the project directory {} no longer exists, so no daemon can serve it. The session \
+             stays up; call select_project to choose another project, or restart the session in an \
+             existing directory.",
+            root.display()
+        ),
         None => format!(
             "g-mesh: could not reach the daemon serving {}: {err:#}. The session stays up; call again to retry.",
             root.display()
         ),
     }
+}
+
+/// `true` only when the filesystem positively reports `root` as absent
+/// (`NotFound`), the rule the daemon's own orphan check uses: a permission or
+/// I/O error is not evidence that a project is gone.
+fn root_is_gone(root: &Path) -> bool {
+    std::fs::metadata(root).is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// `frame` with `lines` as the first text items of its tool result. A frame

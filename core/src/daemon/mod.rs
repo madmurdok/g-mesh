@@ -166,6 +166,12 @@ pub fn lock_path(root: &Path) -> Result<PathBuf> {
     Ok(project_dir(root)?.join(BOOTSTRAP_LOCK_FILE))
 }
 
+/// [`lock_path`] inside an already-known state directory, for a caller whose
+/// project root may be gone (`project_hash` cannot be computed for it then).
+pub(crate) fn bootstrap_lock_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(BOOTSTRAP_LOCK_FILE)
+}
+
 /// [`lock_path`] under the g-mesh home `home` rather than the one the
 /// environment names (see `storage::connection::project_dir_under`).
 pub(crate) fn lock_path_under(home: &Path, root: &Path) -> Result<PathBuf> {
@@ -515,7 +521,11 @@ pub fn run(root: &Path) -> Result<()> {
     // Released explicitly: the lock is now the only claim on this project, and
     // a slow teardown while holding it would wedge the project.
     drop(singleton);
-    outcome
+    let exit = outcome?;
+    // After the lock, so the purge judges the directory as `clean` would; the
+    // index this process still has open is no obstacle (see the function).
+    lifecycle::purge_state_dir(&dir, &exit);
+    Ok(())
 }
 
 /// What a daemon that lost the singleton race does: quiet success against a

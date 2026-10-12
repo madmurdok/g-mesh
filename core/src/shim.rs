@@ -112,6 +112,9 @@ pub fn run() -> Result<()> {
 
     let root = resolve_project_root()?;
     let stream = connect_or_bootstrap(&root, &launch_origin())?;
+    // After the connect, so it never competes with this session's own
+    // bootstrap; on a thread, so no request ever waits on it.
+    spawn_orphan_sweep();
     // The router compares switch targets against it (D11 step 3), and a
     // front names its projects by canonical path.
     let canonical = root.canonicalize().unwrap_or(root);
@@ -131,6 +134,30 @@ pub fn run() -> Result<()> {
 /// The CLI rebuild holding `root`'s index, if one is running (see
 /// `daemon::rebuild_in_progress`). A marker that cannot be read reads as
 /// none: the bootstrap that follows then behaves as it would without one.
+/// Starts the sweep of orphaned state directories (GM-524 D1, option (c)) on
+/// a background thread: `cli::clean::sweep_orphaned_if_due`, at most once per
+/// `cli::clean::ORPHAN_SWEEP_INTERVAL` across every shim on the machine. It
+/// cleans up after the daemons that could not purge their own state - one
+/// killed with `-9`, or any on Windows. The process may exit mid-sweep; the
+/// sweep deletes each directory's root record last so a cut-short delete is
+/// finished by the next one.
+fn spawn_orphan_sweep() {
+    let Ok(home) = crate::paths::g_mesh_home() else {
+        return;
+    };
+    let _ = thread::Builder::new().name("orphan-sweep".into()).spawn(move || {
+        use crate::cli::clean::{sweep_orphaned_if_due, Sweep, ORPHAN_SWEEP_INTERVAL};
+        match sweep_orphaned_if_due(&home, ORPHAN_SWEEP_INTERVAL) {
+            Ok(Sweep::Swept(deleted)) if deleted > 0 => eprintln!(
+                "g-mesh mcp-shim: deleted the index and state of {deleted} project(s) whose directory no \
+                 longer exists"
+            ),
+            Ok(_) => {}
+            Err(err) => eprintln!("g-mesh mcp-shim: the orphaned-state sweep failed: {err:#}"),
+        }
+    });
+}
+
 fn rebuilding(root: &Path) -> Option<router::Rebuilding> {
     let rebuild = daemon::rebuild_in_progress(root).ok().flatten()?;
     Some(router::Rebuilding {
@@ -420,7 +447,9 @@ fn evict_wedged_daemon(root: &Path) {
          clearing it so this project can be served again",
         root.display()
     );
-    if let Err(err) = stop::terminate(pid, stop::TERMINATION_TIMEOUT) {
+    // The whole process group when the daemon leads one, so its plugins and
+    // their children go with it (GM-524 D2).
+    if let Err(err) = stop::terminate_daemon(pid, stop::TERMINATION_TIMEOUT) {
         eprintln!("g-mesh mcp-shim: could not clear the wedged daemon (pid {pid}): {err:#}");
     }
 }
