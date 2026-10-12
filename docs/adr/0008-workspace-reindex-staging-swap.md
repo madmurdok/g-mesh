@@ -204,7 +204,7 @@ unlinked placeholders are ordinary rows and go through the same diff.
   incomplete). The Go tier reports incomplete only when every module
   fails to load.
 - **Semantic-owned placeholders.** A semantic tier (the SDK's LSP bridge
-  for Rust and Python, the Go tier) records a cross-file answer as a
+  for Rust, Python and TypeScript, the Go tier) records a cross-file answer as a
   pending-symbol placeholder (`kind = 'Module'`, `nativeKind =
   'pending_symbol'`) under an id no walk emits, plus its semantic edge onto
   it. The walk never emits these, so staging lacking one says nothing about
@@ -231,10 +231,10 @@ unlinked placeholders are ordinary rows and go through the same diff.
   *The node contract.* This rests on `capabilities.semantic_sweep`
   promising nodes as well as edges: a complete whole-project pass re-sends
   every placeholder node one of its semantic edges lands on
-  (`daemon::manifest::Capabilities::semantic_sweep`). The three swept tiers
+  (`daemon::manifest::Capabilities::semantic_sweep`). The swept tiers
   keep it by construction, because they build every answer as a placeholder
   plus an edge onto it and emit every placeholder of the pass in the same
-  diff: the SDK LSP bridge (Rust, Python) adds a placeholder only in
+  diff: the SDK LSP bridge (Rust, Python, TypeScript) adds a placeholder only in
   `Answers::record`, next to the edge, and `Answers::finish` writes all of
   them to `upsert_nodes`; the Go tier adds one only in
   `semanticDiff.placeholder`, whose id is the edge's target in
@@ -370,7 +370,7 @@ and `:963`; the pause is `G_MESH_BULK_INDEX_HOLD_FILE`
    target stays; drop the plan's `EXCEPT` -> test 7 counts one more change.
 13. *Sweep is opt-in*: after a complete pass, a language declaring
    `semantic_sweep` loses a semantic edge the pass did not re-send; one
-   that does not (as TypeScript) keeps it. Controls: never pass the
+   that does not keeps it. Controls: never pass the
    language to the sweep -> the first keeps it; always pass it -> the
    second loses it.
 `delete_language_rows`' own tests (`:380`, `:472`) go with it if nothing
