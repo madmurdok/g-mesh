@@ -137,6 +137,8 @@ impl ActivationCtx {
     /// order. `Err` only for a failure of the walk (or of what it strictly
     /// needs); the semantic and embedding passes stay best-effort.
     fn activate(&mut self) -> Result<()> {
+        // A walk this attempt makes is itself the reconcile with the disk.
+        let reconcile = !self.needs_walk;
         if self.needs_walk {
             self.walk()?;
         } else if self.needs_semantic_pass_retry {
@@ -175,6 +177,7 @@ impl ActivationCtx {
                 Arc::clone(&self.conn),
                 Arc::clone(&self.registry),
                 self.canonical_root.clone(),
+                reconcile,
             );
         }
 

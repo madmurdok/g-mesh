@@ -17,7 +17,7 @@ pub fn projects_root() -> Result<PathBuf> {
 }
 
 /// [`projects_root`] under the g-mesh home `home`.
-fn projects_root_under(home: &Path) -> PathBuf {
+pub(crate) fn projects_root_under(home: &Path) -> PathBuf {
     home.join("projects")
 }
 

@@ -89,6 +89,19 @@ impl Project {
         project
     }
 
+    /// A project at `<temp>/parent/root`, so that [`Project::delete`] takes
+    /// the root's parent with it - the shape an unmounted volume or a moved
+    /// tree leaves.
+    fn with_parent_to_delete() -> Self {
+        let dir = tempfile::tempdir().expect("failed to create a temp directory");
+        let root = dir.path().join("parent").join("root");
+        std::fs::create_dir_all(&root).expect("failed to create the nested project root");
+        let state_dir = project_dir(&root).expect("failed to resolve the state directory");
+        let project = Self { dir: Some(dir), state_dir, root };
+        project.write("src/alpha.ts", "export function alpha(): number {\n  return 1;\n}\n");
+        project
+    }
+
     fn root(&self) -> &Path {
         &self.root
     }
@@ -230,6 +243,36 @@ fn a_daemon_whose_project_root_is_deleted_stops_itself() {
 
     common::wait_for("the orphaned daemon to stop itself", orphan_budget(), || !daemon_process.is_running());
     assert_released_everything(&project, &mut daemon_process, plugin_pid);
+    // The purge runs before the process exits, and the exit was reaped above.
+    assert!(
+        !project.state_dir.exists(),
+        "the state of a project whose directory was deleted (its parent still there) must go with its \
+         daemon: {} is still there",
+        project.state_dir.display()
+    );
+}
+
+/// A root whose parent is gone too is not judged deleted (it may be an
+/// unmounted volume): the daemon still stops, but keeps the project's state.
+///
+/// Control: make `cli::clean::root_state` return `Orphaned` for a missing
+/// parent too: the state directory is deleted.
+#[test]
+fn a_daemon_whose_root_and_its_parent_are_gone_keeps_its_state() {
+    let mut project = Project::with_parent_to_delete();
+    let mut daemon_process = Daemon::spawn(Path::new(BIN), project.root());
+    let plugin_pid = wait_until_fully_up(&project);
+
+    project.delete();
+    assert!(!project.root.parent().unwrap().exists(), "the root's parent must be gone too");
+
+    common::wait_for("the orphaned daemon to stop itself", orphan_budget(), || !daemon_process.is_running());
+    assert_released_everything(&project, &mut daemon_process, plugin_pid);
+    assert!(
+        project.state_dir.join("index.db").exists(),
+        "a project whose root's parent is gone too keeps its index: {}",
+        project.state_dir.display()
+    );
 }
 
 /// Copies the g-mesh binary into a directory of its own and returns both, so

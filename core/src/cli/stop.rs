@@ -152,7 +152,7 @@ pub fn stop(project_root: &Path) -> Result<Outcome> {
 
     if let Some(pid) = core_pid {
         outcome.core = Some(
-            terminate(pid, TERMINATION_TIMEOUT)
+            terminate_daemon(pid, TERMINATION_TIMEOUT)
                 .with_context(|| format!("failed to stop the daemon core (pid {pid})"))?,
         );
     }
@@ -183,18 +183,14 @@ fn live_pid(path: &Path) -> Option<u32> {
 /// Ask, then insist, waiting for the process to go after each
 /// (`process::request_stop`, then `process::force_stop`).
 ///
-/// `pub(crate)` for `shim::evict_wedged_daemon`, which has to clear exactly
-/// this kind of process out of the way before it can bootstrap a replacement,
-/// and must escalate the same way rather than grow a second implementation of
-/// it - the same argument `shim::retire_outdated_daemon` already makes for
-/// reusing [`stop`] itself.
+/// Used for plugins, and for a core through [`terminate_daemon`].
 ///
 /// On Windows both rungs are `TerminateProcess`, which cannot be ignored, so
 /// the second one is dead weight there rather than a second chance -
 /// [`Stopped::Killed`] is a verdict only Unix can reach. Kept as one shape on
 /// both platforms because everything downstream of it (the escalation's
 /// waiting, `Outcome`, what `stop` reports) is genuinely the same.
-pub(crate) fn terminate(pid: u32, grace: Duration) -> Result<Stopped> {
+fn terminate(pid: u32, grace: Duration) -> Result<Stopped> {
     process::request_stop(pid)?;
     if wait_until_gone(pid, grace) {
         return Ok(Stopped::Terminated { pid });
@@ -212,6 +208,56 @@ pub(crate) fn terminate(pid: u32, grace: Duration) -> Result<Stopped> {
     // which this command can fix, and both of which are worth saying out loud
     // rather than reporting success.
     bail!("pid {pid} is still present after being asked and then made to stop")
+}
+
+/// [`terminate`] for a daemon core, aimed at its whole process group when it
+/// leads one (`process::own_group_of`): a daemon `detach` started shares its
+/// group with its plugins, their language servers and whatever those run
+/// (rust-analyzer's `cargo`/`rustc`), and a `SIGTERM` to the core alone left
+/// those writing into the project after it was gone (GM-524 D2). Once the core
+/// is gone, members still in the group after `grace` are sent `SIGKILL`. A
+/// core that does not lead its own group (run by hand, or by a test harness)
+/// is signalled by pid alone, as before.
+///
+/// `pub(crate)` for `shim::evict_wedged_daemon`, which has to clear exactly
+/// this kind of process out of the way before it can bootstrap a replacement,
+/// and must escalate the same way rather than grow a second implementation of
+/// it - the same argument `shim::retire_outdated_daemon` already makes for
+/// reusing [`stop`] itself.
+pub(crate) fn terminate_daemon(pid: u32, grace: Duration) -> Result<Stopped> {
+    let Some(pgid) = process::own_group_of(pid) else {
+        return terminate(pid, grace);
+    };
+    process::request_stop_group(pgid)?;
+    let stopped = if wait_until_gone(pid, grace) {
+        Stopped::Terminated { pid }
+    } else {
+        process::force_stop_group(pgid)?;
+        if !wait_until_gone(pid, grace) {
+            bail!("pid {pid} is still present after its process group was asked and then made to stop");
+        }
+        Stopped::Killed { pid }
+    };
+    // The group outlives its leader while any member does, and its id cannot
+    // be reused until then, so signalling it after the core is gone still
+    // reaches only what the core started.
+    if !wait_until_group_gone(pgid, grace) {
+        process::force_stop_group(pgid)?;
+    }
+    Ok(stopped)
+}
+
+fn wait_until_group_gone(pgid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process::group_is_alive(pgid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
 }
 
 fn wait_until_gone(pid: u32, timeout: Duration) -> bool {
