@@ -1340,10 +1340,10 @@ pub fn record_language_semantic_pass_settled(conn: &Connection, language: &str) 
 /// attempt more than before; every other owed or given-up file was answered
 /// by this pass and is settled; and the language is marked residual, so the
 /// next start asks only the owed files. `semanticPassAt` stays unset and
-/// `semanticPassError` is cleared: the pass did not fail. Like every
-/// whole-project outcome, it also clears the language's semantic-pending rows
-/// (ADR 0009). Returns how many owed files are left (a file at its last
-/// attempt is dropped as a gap instead).
+/// `semanticPassError` is cleared: the pass did not fail. Like a failure, it
+/// clears the language's semantic-pending row and keeps its pending-file rows
+/// as stale (ADR 0009). Returns how many owed files are left (a file at its
+/// last attempt is dropped as a gap instead).
 pub fn record_language_semantic_residual(
     conn: &Connection,
     language: &str,
@@ -1368,7 +1368,7 @@ pub fn record_language_semantic_residual(
             params![language],
         )
         .with_context(|| format!("failed to clear {language}'s semantic-pass error"))?;
-        clear_semantic_pending(conn, language)?;
+        clear_semantic_pending_language(conn, language)?;
         Ok(owed_files(conn, language)?.len())
     })
 }
@@ -1453,9 +1453,10 @@ pub fn semantic_leftovers(conn: &Connection) -> Result<Vec<SemanticLeftover>> {
 /// its pass stays owed, and the next [`record_language_semantic_pass`] clears
 /// the reason.
 ///
-/// Also removes `language`'s semantic-pending rows, in the same savepoint:
-/// no pass is working on those files any more, so the language reads as
-/// `absent` rather than `pending` (ADR 0009).
+/// Also removes `language`'s semantic-pending row, in the same savepoint: no
+/// pass is working on its files any more, so the language reads as `absent`
+/// rather than `pending`. Its pending-file rows stay: no pass has re-checked
+/// those files' edges, so `absent` lists them as stale (ADR 0009).
 pub fn record_language_semantic_pass_failure(conn: &Connection, language: &str, reason: &str) -> Result<()> {
     in_savepoint(conn, || {
         conn.execute(
@@ -1464,7 +1465,7 @@ pub fn record_language_semantic_pass_failure(conn: &Connection, language: &str, 
             params![language, reason],
         )
         .with_context(|| format!("failed to record that {language}'s semantic pass failed"))?;
-        clear_semantic_pending(conn, language)
+        clear_semantic_pending_language(conn, language)
     })
 }
 
@@ -1488,11 +1489,17 @@ fn in_savepoint<T>(conn: &Connection, body: impl FnOnce() -> Result<T>) -> Resul
 
 /// Deletes `language`'s rows from both semantic-pending tables.
 fn clear_semantic_pending(conn: &Connection, language: &str) -> Result<()> {
+    clear_semantic_pending_language(conn, language)?;
+    conn.execute("DELETE FROM semantic_pending_files WHERE language = ?1", params![language])
+        .with_context(|| format!("failed to clear {language}'s semantic-pending files"))?;
+    Ok(())
+}
+
+/// Deletes `language`'s `semantic_pending` row only, so the language is no
+/// longer `pending`; its `semantic_pending_files` rows stay as stale files.
+fn clear_semantic_pending_language(conn: &Connection, language: &str) -> Result<()> {
     conn.execute("DELETE FROM semantic_pending WHERE language = ?1", params![language])
-        .and_then(|_| {
-            conn.execute("DELETE FROM semantic_pending_files WHERE language = ?1", params![language])
-        })
-        .with_context(|| format!("failed to clear {language}'s semantic-pending rows"))?;
+        .with_context(|| format!("failed to clear {language}'s semantic-pending row"))?;
     Ok(())
 }
 
@@ -1724,6 +1731,35 @@ pub fn semantic_pending(conn: &Connection) -> Result<Vec<(String, String, usize)
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? as usize)))
         .context("failed to read the semantic-pending languages")?;
     rows.collect::<rusqlite::Result<_>>().context("failed to read the semantic-pending languages")
+}
+
+/// Every `(language, stale file count)` with `semantic_pending_files` rows and
+/// no `semantic_pending` row, sorted by language: files a reindex changed that
+/// no semantic pass has re-checked since its pass failed, finished residual
+/// or did not run. Empty for an index that predates the tables. Includes rows
+/// of languages no longer capable or since done; a reader filters them.
+pub fn semantic_stale_files(conn: &Connection) -> Result<Vec<(String, usize)>> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'semantic_pending_files')",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to look for the semantic_pending_files table")?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT f.language, COUNT(*) FROM semantic_pending_files f
+             WHERE NOT EXISTS (SELECT 1 FROM semantic_pending p WHERE p.language = f.language)
+             GROUP BY f.language ORDER BY f.language",
+        )
+        .context("failed to prepare the stale semantic files read")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as usize)))
+        .context("failed to read the stale semantic files")?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to read the stale semantic files")
 }
 
 /// Every language whose last whole-project semantic pass failed, with the

@@ -84,7 +84,7 @@ pub(crate) const UNRESOLVED_ROW: &str =
 /// describe per language (ADR 0022, section 2).
 pub(crate) const PROVENANCE: &str =
     "`provenance`: this language's semantic pass has not finished, so method calls through a variable \
-     receiver may be missing here; ask again later or grep for them.";
+     receiver may be missing; in `staleFiles`, edges may point at old targets. Ask again later or grep.";
 
 /// Explains `mcp::overrides`' field, which replaces the instructions'
 /// sentence on override caller and reference pages (ADR 0022, statement 9).

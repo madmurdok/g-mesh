@@ -2165,11 +2165,13 @@ mod tests {
         assert_eq!(after, (0, 0), "the completed pass cleared it");
     }
 
-    /// A pass not run (its plugin asleep) clears the rows the swap wrote: no
-    /// pass is working on them. Control: remove the clear from
-    /// `schema::record_language_semantic_pass_failure` -> rows remain.
+    /// A pass not run (its plugin asleep) clears the language row the swap
+    /// wrote, since no pass is working on it, and keeps its file rows as
+    /// stale. Control: remove the clear from
+    /// `schema::record_language_semantic_pass_failure` -> the language row
+    /// remains.
     #[test]
-    fn a_pass_not_run_after_the_swap_clears_the_pending_rows() {
+    fn a_pass_not_run_after_the_swap_clears_the_pending_row_and_keeps_its_files() {
         let (_project, _plugins, registry, conn) = alpha_registry();
         let supervisor = registry.get_or_spawn("alpha").expect("the fixture plugin spawns");
         supervisor.sleep_now("the test put it to sleep");
@@ -2177,13 +2179,13 @@ mod tests {
         let (at_swap, after) = semantic_pending_around_the_pass(&registry, &supervisor, &conn);
 
         assert_eq!(at_swap.0, 1, "the swap wrote the language row");
-        assert_eq!(after, (0, 0));
+        assert_eq!(after, (0, at_swap.1), "the language row goes, the file rows stay");
     }
 
-    /// An incomplete pass is recorded as a failure and clears the rows the
-    /// same way. Control: as above.
+    /// An incomplete pass is recorded as a failure and clears the language
+    /// row the same way, keeping the file row. Control: as above.
     #[test]
-    fn an_incomplete_pass_after_the_swap_clears_the_pending_rows() {
+    fn an_incomplete_pass_after_the_swap_clears_the_pending_row_and_keeps_its_files() {
         let counters = Counters::default();
         let (project, plugins, _scratch, registry, conn) = alpha_staging_registry(&counters, true);
         test_plugin::answer_first_semantic_pass_incomplete(
@@ -2197,7 +2199,7 @@ mod tests {
         let (at_swap, after) = semantic_pending_around_the_pass(&registry, &supervisor, &conn);
 
         assert_eq!(at_swap, (1, 1), "the new file is pending at the swap");
-        assert_eq!(after, (0, 0));
+        assert_eq!(after, (0, 1), "the file stays as a stale file");
         assert_eq!(schema::semantic_pass_failures(&conn.lock().unwrap()).unwrap().len(), 1);
     }
 

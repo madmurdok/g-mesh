@@ -8,6 +8,17 @@ not-run pass deletes the pending rows and the language falls back to
 pending block, and only that block, when its rows' language is pending;
 MCP instructions do not change.
 
+Amended 2026-10-12 (owner decision in GM-560, option D "mark stale",
+docs/architecture/gm-560-stale-semantic-edges.md). The first accepted point
+changes: a failed, incomplete or not-run pass deletes only the
+`semantic_pending` row, so the language still falls back to `absent`, but
+its `semantic_pending_files` rows are kept. An `absent` block then lists the
+response's files among them as `staleFiles` (`staleFilesOmitted` past the
+cap, bounded as `pendingFiles`): a reindex changed those files' edges and no
+semantic pass has re-checked them, so a kept semantic edge there may point
+where the old configuration resolved it. `g-mesh status` shows one line per
+language with stale files. "Who clears" below reflects the amendment.
+
 ## Context
 After a workspace reindex swaps a language `L` in (ADR 0008), `L`'s
 semantic pass runs against live (`daemon/workspace_reindex.rs` `run_with`,
@@ -94,20 +105,29 @@ Atomic with the swap: a swap that rolls back leaves no rows; a committed
 swap always has them. `INSERT OR IGNORE` keeps files a previous swap left
 pending (possible only if its pass never finished; section 2 says when).
 
-**Who clears, and when.** Invariant: a row for `L` exists only while `L`'s
-whole-project pass is owed and has neither completed nor recorded a
-failure.
+**Who clears, and when.** Invariant: a `semantic_pending` row for `L`
+exists only while `L`'s whole-project pass is owed and has neither completed
+nor recorded a failure or residual outcome. A `semantic_pending_files` row
+exists while its file's edges, changed by a swap, have not been re-checked
+by a complete pass (whole-project, or per-file over that file); without a
+language row it reads as stale (amended 2026-10-12, GM-560).
 - *Whole-project pass completes*: `schema::record_language_semantic_pass`
   deletes `L`'s rows from both tables in the same transaction as setting
   `semanticPassAt`. Every completion path (`SemanticPassRun::record_success`
   for the activation retry and `cli::init`, `workspace_reindex::run_with`)
   already goes through it, so none can forget.
-- *Whole-project pass fails, is incomplete, or is not run* (plugin asleep):
-  `schema::record_language_semantic_pass_failure` deletes the same rows.
-  Every failure path (`semantic::record_failure`, `record_not_run`,
-  `SemanticPassRun::record_failure`) goes through it. The language then
-  falls back to today's `semanticTier: "absent"` (section 3), which is the
-  true state: no pass is working on it.
+- *Whole-project pass fails, is incomplete, or is not run* (plugin asleep
+  or memory-suspended): `schema::record_language_semantic_pass_failure`
+  (every failure path: `semantic::record_failure`, `record_not_run`,
+  `SemanticPassRun::record_failure`) and
+  `schema::record_language_semantic_residual` (an incomplete pass that names
+  its unfinished files) delete only `L`'s `semantic_pending` row. The
+  language then falls back to `semanticTier: "absent"` (section 3), which is
+  the true state: no pass is working on it. Its `semantic_pending_files`
+  rows stay, and `absent` lists the response's files among them as
+  `staleFiles`. A settled residual pass
+  (`record_language_semantic_pass_settled`) clears both tables, as a
+  completed one does.
 - *Per-file pass completes* (not `incomplete`): `apply_semantic_pass_in`
   deletes `semantic_pending_files` rows whose `filePath` is in its
   `file_paths`, in its own `store.step` after the diff is committed. By

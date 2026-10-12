@@ -2717,8 +2717,8 @@ fn rust_pass_state(conn: &IndexStore) -> (Option<String>, Option<String>) {
 /// The acceptance case, core half: a whole-project pass that names the files
 /// it did not finish is not an error. Those files are owed (one attempt), the
 /// language is recorded residual with the plugin's reason, an earlier failure
-/// is cleared, `semanticPassAt` stays unset and the pending rows go, as after
-/// any whole-project pass.
+/// is cleared, `semanticPassAt` stays unset, and the pending language row
+/// goes while the pending files stay as stale files.
 ///
 /// Control: restore the unconditional `bail!` in `apply_semantic_pass_in`'s
 /// incomplete whole-project branch - the pass is an `Err` and nothing is
@@ -2740,7 +2740,7 @@ fn a_listed_incomplete_whole_project_pass_is_recorded_residual_not_failed() {
         vec!["rust:the server was cold"]
     );
     assert_eq!(rust_pass_state(&conn), (None, None), "neither completed nor failed");
-    assert_eq!(pending_state(&conn), (0, Vec::new()));
+    assert_eq!(pending_state(&conn), (0, vec![OWED_A.to_string(), OWED_B.to_string(), OWED_C.to_string()]));
 }
 
 /// A listed incomplete whole-project pass that names no file left nothing:
