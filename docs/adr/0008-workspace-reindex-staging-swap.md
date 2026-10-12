@@ -198,14 +198,13 @@ unlinked placeholders are ordinary rows and go through the same diff.
   placeholder is kept"); `graph::queries` already hides them.
   The sweep trusts "complete", so it is opt-in and absent means off
   (ADR 0005's conservative default): a third-party plugin that never says
-  `incomplete` is not swept until it declares it can be. Rust, Go and
-  Python declare it. TypeScript declares `false`: its pass upgrades
-  structural edges in place and never reports incomplete, so a checker
-  failure part-way would sweep upgraded structural edges it did not
-  repeat (gone, not downgraded, until the file is reparsed). The Go tier
-  reports incomplete only when every module fails to load.
+  `incomplete` is not swept until it declares it can be. Rust, Go,
+  Python and TypeScript declare it (TypeScript since GM-563: its tier is
+  the SDK LSP bridge, which never upgrades in place and reports
+  incomplete). The Go tier reports incomplete only when every module
+  fails to load.
 - **Semantic-owned placeholders.** A semantic tier (the SDK's LSP bridge
-  for Rust and Python, the Go tier) records a cross-file answer as a
+  for Rust, Python and TypeScript, the Go tier) records a cross-file answer as a
   pending-symbol placeholder (`kind = 'Module'`, `nativeKind =
   'pending_symbol'`) under an id no walk emits, plus its semantic edge onto
   it. The walk never emits these, so staging lacking one says nothing about
@@ -232,10 +231,10 @@ unlinked placeholders are ordinary rows and go through the same diff.
   *The node contract.* This rests on `capabilities.semantic_sweep`
   promising nodes as well as edges: a complete whole-project pass re-sends
   every placeholder node one of its semantic edges lands on
-  (`daemon::manifest::Capabilities::semantic_sweep`). The three swept tiers
+  (`daemon::manifest::Capabilities::semantic_sweep`). The swept tiers
   keep it by construction, because they build every answer as a placeholder
   plus an edge onto it and emit every placeholder of the pass in the same
-  diff: the SDK LSP bridge (Rust, Python) adds a placeholder only in
+  diff: the SDK LSP bridge (Rust, Python, TypeScript) adds a placeholder only in
   `Answers::record`, next to the edge, and `Answers::finish` writes all of
   them to `upsert_nodes`; the Go tier adds one only in
   `semanticDiff.placeholder`, whose id is the edge's target in
@@ -371,7 +370,7 @@ and `:963`; the pause is `G_MESH_BULK_INDEX_HOLD_FILE`
    target stays; drop the plan's `EXCEPT` -> test 7 counts one more change.
 13. *Sweep is opt-in*: after a complete pass, a language declaring
    `semantic_sweep` loses a semantic edge the pass did not re-send; one
-   that does not (as TypeScript) keeps it. Controls: never pass the
+   that does not keeps it. Controls: never pass the
    language to the sweep -> the first keeps it; always pass it -> the
    second loses it.
 `delete_language_rows`' own tests (`:380`, `:472`) go with it if nothing
@@ -401,8 +400,8 @@ start completes it. Control for the probe: the before build must show the
 - Stale semantic edges from an earlier process last until the next complete
   whole-project pass of their language, not forever; a pass's retracted
   structural edges no longer come back at a swap.
-- TypeScript is not swept (section 3, Sweep): its stale semantic edges
-  from an earlier process last until their files are reparsed.
+- Every bundled language is swept (section 3, Sweep), TypeScript included
+  since GM-563.
 - Which files a post-swap semantic pass has not reached yet is disclosed per
   response as `semanticTier: "pending"`: [ADR 0009](0009-semantic-pending.md).
 
@@ -426,6 +425,11 @@ start completes it. Control for the probe: the before build must show the
    `semantic_sweep`, off unless declared; TypeScript stays off until its
    pass can report incomplete (GM-430). An unchanged node's live syntactic
    edge whose staged twin differs is taken from staging.
+7. (2026-10-12, GM-563) TypeScript declares `semantic_sweep = true`. The
+   reasons it stayed off (in-place upgrades, no incomplete report) belonged
+   to the Node checker tier that GM-324/325 replaced with the SDK LSP
+   bridge; without the sweep, a pass in a new plugin process kept the
+   previous process's stale edges (docs/architecture/gm-563-ts-stale-semantic-edges.md).
 
 Follow-ups filed separately: telling callers which files' semantic edges
 are still pending after a swap, and measuring where a semantic pass's time

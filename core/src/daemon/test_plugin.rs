@@ -410,6 +410,19 @@ pub(crate) fn declare_semantic_sweep(plugin_dir: &Path) {
     fs::write(&path, swept).expect("failed to write the fake plugin's manifest");
 }
 
+/// Replaces a semantic-pass-capable plugin's `[plugin.capabilities]` table
+/// with `table`, a whole table, header included (a bundled plugin's, read
+/// from its `plugin.toml`). Takes effect at the next `discover`.
+pub(crate) fn replace_capabilities(plugin_dir: &Path, table: &str) {
+    let path = plugin_dir.join("plugin.toml");
+    let manifest = fs::read_to_string(&path).expect("failed to read the fake plugin's manifest");
+    let own = "\n[plugin.capabilities]\nsemantic_pass = true\n";
+    assert!(manifest.contains(own), "only a semantic-pass-capable manifest's table is replaced");
+    assert!(table.starts_with("[plugin.capabilities]\n"), "a whole table, header included: {table}");
+    let replaced = manifest.replace(own, &format!("\n{table}"));
+    fs::write(&path, replaced).expect("failed to write the fake plugin's manifest");
+}
+
 /// Makes every later complete `semanticPass` to the plugin in `plugin_dir`
 /// answer with `diff` (a `FileChangeDiff` as JSON), or, with `None`, with an
 /// empty diff again. Read per request, so it takes effect without a respawn.

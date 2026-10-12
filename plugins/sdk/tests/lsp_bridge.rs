@@ -4250,3 +4250,67 @@ fn after_a_workspace_change_a_signalled_server_still_pays_the_settle() {
     assert!(answer.complete);
     assert!(took >= Duration::from_millis(800), "the change costs a full settle: {took:?} ({})", uptime());
 }
+
+/// Retraction is per process: a bridge that never emitted an edge cannot
+/// withdraw it. After a plugin restart, a complete pass that now lands the
+/// same site elsewhere sends the new edge, neither re-sends nor deletes the
+/// old one, and so leaves it to core. Core's sweep after a complete
+/// whole-project pass, for a language whose manifest declares
+/// `semantic_sweep` (TypeScript's does), is what removes it (core's
+/// `a_complete_typescript_pass_sweeps_the_edge_an_earlier_process_emitted`).
+#[test]
+fn a_new_bridge_does_not_retract_what_an_earlier_process_emitted() {
+    let scratch = Scratch::new("restart");
+    let (mut index, _) = fixture(&scratch);
+    // A second `add`, in another container: the site's new answer.
+    scratch.write("src/c.toy", A_TOY);
+    let c = RelPath::new("src/c.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &c);
+    builder.file_node(range(0, 0, 1, 0));
+    builder.add_node(
+        NodeSpec::new(NodeKind::Function, "add", "add", range(0, DECL_CHAR_COL, 0, DECL_CHAR_COL + 3))
+            .native_kind("function")
+            .in_container("pkg2", None)
+            .public(),
+    );
+    index.insert(c, A_TOY.to_string(), builder.finish());
+
+    // Process 1: the site lands on `pkg`'s `add`.
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+    }));
+    let mut first_process = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+    let first = pass(&mut first_process, &index);
+    assert!(first.complete);
+    let old = semantic_edges(&first).first().map(|edge| edge.id.clone()).expect("one edge");
+    drop(first_process);
+
+    // Process 2 (a restart or a memory suspension): the same site now lands on
+    // `pkg2`'s `add`.
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": [{
+            "uri": scratch.uri("src/b.toy"),
+            "line": 1,
+            "character": SITE_UTF16_COL,
+            "definition": { "uri": scratch.uri("src/c.toy"), "line": 0, "character": DECL_UTF16_COL },
+        }],
+    }));
+    let mut second_process = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+    let second = pass(&mut second_process, &index);
+    assert!(second.complete, "a complete whole-project pass");
+    let new = semantic_edges(&second).first().map(|edge| edge.id.clone()).expect("one edge");
+    assert_ne!(new, old, "the site's answer moved, so its edge id moved");
+    assert!(
+        !semantic_edges(&second).iter().any(|edge| edge.id == old),
+        "the old edge is not re-sent, so core's sweep can tell it is stale"
+    );
+    assert!(
+        !second.diff.delete_edge_ids.contains(&old),
+        "a new process retracts nothing it did not emit: {:#?}",
+        second.diff.delete_edge_ids
+    );
+}

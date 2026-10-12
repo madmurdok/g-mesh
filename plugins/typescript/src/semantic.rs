@@ -232,7 +232,7 @@ mod tests {
         );
         let capabilities = &parsed["plugin"]["capabilities"];
         assert_eq!(capabilities["semantic_pass"].as_bool(), Some(true));
-        assert_eq!(capabilities["semantic_sweep"].as_bool(), Some(false));
+        assert_eq!(capabilities["semantic_sweep"].as_bool(), Some(true));
         assert_eq!(capabilities["receiver_calls"].as_str(), Some("resolved"));
         assert_eq!(capabilities["receiver_calls_structural"].as_str(), Some("unresolved"));
     }

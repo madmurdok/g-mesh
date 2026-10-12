@@ -922,7 +922,7 @@ fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
     // A semantic tier (vtsls) that resolves receiver calls, over a
     // structural tier that does not.
     assert!(manifest.capabilities.semantic_pass);
-    assert!(!manifest.capabilities.semantic_sweep);
+    assert!(manifest.capabilities.semantic_sweep);
     assert!(manifest.capabilities.files_created);
     assert_eq!(manifest.capabilities.receiver_calls, ReceiverCallResolution::Resolved);
     assert_eq!(manifest.capabilities.receiver_calls_structural, ReceiverCallResolution::Unresolved);
