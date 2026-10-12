@@ -2333,3 +2333,66 @@ fn an_import_module_that_is_not_importlibs_gives_no_edge() {
         pairs(&[IMPORTLIB, ("external_module mylib", "mylib")])
     );
 }
+
+/// The dynamic-import targets (`pkg.*`) among `edges`.
+fn pkg_targets(edges: &[(String, String)]) -> Vec<&str> {
+    edges.iter().map(|(_, t)| t.as_str()).filter(|t| t.starts_with("pkg.")).collect()
+}
+
+/// F1: a class body sees its own class-level names first, so a call there
+/// whose argument name is rebound by the class folds to nothing (not the
+/// module constant, not the class value). A method does not see class-level
+/// names, so it still folds to the module constant.
+///
+/// Control: remove `|| frame.class_binds(name)` in `Bodies::fold`.
+#[test]
+fn a_class_level_name_shadows_the_module_constant_in_the_class_body_only() {
+    let class_body = dynamic_imports_of(&py(&[
+        "import importlib",
+        "NAME = \"pkg.mod\"",
+        "",
+        "class C:",
+        "    NAME = \"pkg.helpers\"",
+        "    importlib.import_module(NAME)",
+    ]));
+    assert_eq!(pkg_targets(&class_body), Vec::<&str>::new(), "{class_body:?}");
+
+    let method = dynamic_imports_of(&py(&[
+        "import importlib",
+        "NAME = \"pkg.mod\"",
+        "",
+        "class C:",
+        "    NAME = \"pkg.helpers\"",
+        "",
+        "    def load(self):",
+        "        return importlib.import_module(NAME)",
+    ]));
+    assert_eq!(pkg_targets(&method), vec!["pkg.mod"], "{method:?}");
+}
+
+/// F2: when the project has its own `importlib` package, `importlib` and
+/// `import_module` inside a function are not the standard library's, so no
+/// dynamic edge is emitted.
+///
+/// Control: remove the `!self.project.has_container("importlib")` clause in
+/// the frame branch of `Bodies::binding_is_importlib`.
+#[test]
+fn a_project_own_importlib_gives_no_dynamic_edge_inside_a_function() {
+    let source = py(&[
+        "def a():",
+        "    import importlib",
+        "    return importlib.import_module(\"pkg.mod\")",
+        "",
+        "def b():",
+        "    from importlib import import_module",
+        "    return import_module(\"pkg.helpers\")",
+    ]);
+    let tree = tree(&[
+        ("importlib/__init__.py", "def import_module(name):\n    pass\n"),
+        ("pkg/mod.py", ""),
+        ("pkg/helpers.py", ""),
+        ("pkg/x.py", &source),
+    ]);
+    let edges = import_specifiers(&tree, "pkg/x.py");
+    assert_eq!(pkg_targets(&edges), Vec::<&str>::new(), "{edges:?}");
+}
