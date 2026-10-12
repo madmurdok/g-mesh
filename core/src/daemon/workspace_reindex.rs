@@ -2217,8 +2217,10 @@ mod tests {
     }
 
     /// A pass not run (its plugin asleep) clears the language row the swap
-    /// wrote, since no pass is working on it, and keeps its file rows as
-    /// stale. Control: remove the clear from
+    /// wrote, since no pass is working on it. This fixture's swap writes no
+    /// file rows; that they stay as stale is pinned by
+    /// `a_kept_semantic_edge_outlives_a_pass_not_run_and_its_file_stays_stale`.
+    /// Control: remove the clear from
     /// `schema::record_language_semantic_pass_failure` -> the language row
     /// remains.
     #[test]
