@@ -365,6 +365,17 @@ fn indexed_files_under(
     Ok(files)
 }
 
+/// Every file the index holds anything for: an `indexed_files` baseline or a
+/// `File` node. The live side of [`PluginRegistry::reconcile_since_index`].
+fn live_file_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>> {
+    let mut statement = conn
+        .prepare("SELECT filePath FROM indexed_files UNION SELECT filePath FROM nodes WHERE kind = 'File'")
+        .context("failed to query indexed files")?;
+    let rows =
+        statement.query_map([], |row| row.get::<_, String>(0)).context("failed to read indexed files")?;
+    rows.collect::<rusqlite::Result<HashSet<String>>>().context("failed to read indexed files")
+}
+
 /// [`indexer_version`] for a discovery that found nothing - the generation
 /// string a *test* stamps a fixture index with when it needs `meta` to exist
 /// and nothing will ever compare that stamp against a live daemon's.
@@ -1294,6 +1305,92 @@ impl PluginRegistry {
         if !newer.is_empty() {
             self.gitignore_changed(conn, &newer, &[]);
         }
+    }
+
+    /// At daemon start on an indexed project, brings every file
+    /// changed while no daemon watched back in line with the disk, so the
+    /// symbol-anchored tools stop answering from the old graph. Runs on the
+    /// watcher's consumer thread before its first batch, so it inherits that
+    /// thread's ordering: after the walk, an owed semantic-pass retry and a
+    /// failed language's retry (`daemon::run`, `daemon::activation`).
+    ///
+    /// The walk is the bulk walk's ([`project_files`] with the directories
+    /// every language excludes pruned, `.gitignore` honoured), and a file
+    /// counts only where [`indexing_language`] gives it a language, so a
+    /// language's own `exclude_dirs` is never statted beyond the walk and
+    /// never hashed. The live side is every `indexed_files` baseline and
+    /// `File` node. Routed in the watcher's batch order (ADR 0023):
+    /// - live, absent on disk: a deletion, through
+    ///   [`route_settled_path`](Self::route_settled_path).
+    /// - walked, not live: a creation, announced with the others
+    ///   ([`announce_created`](Self::announce_created)), then reindexed.
+    /// - walked and live: [`ensure_fresh`](Self::ensure_fresh), whose stat
+    ///   fast path leaves an untouched file unread, whose hash refreshes only
+    ///   the mtime of a touched one, and which records the new baseline after
+    ///   a reindex, so the next start finds it fresh.
+    ///
+    /// Creations go through `ensure_fresh` too, for that baseline. A file
+    /// still on disk but no longer walked (a `.gitignore` edit) is left to
+    /// [`recheck_gitignores_since_index`](Self::recheck_gitignores_since_index).
+    /// Errors are logged per file; nothing here propagates.
+    ///
+    /// [`project_files`]: crate::project_walk::project_files
+    /// [`indexing_language`]: DiscoveredPlugins::indexing_language
+    pub(crate) fn reconcile_since_index(&self, conn: &IndexStore) {
+        match conn.with(schema::bulk_indexed_at_unix) {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(err) => {
+                crate::log_line!("g-mesh daemon: could not read when the project was last walked: {err:#}");
+                return;
+            }
+        }
+        let started = std::time::Instant::now();
+        let live = match conn.with(live_file_paths) {
+            Ok(live) => live,
+            Err(err) => {
+                crate::log_line!(
+                    "g-mesh daemon: could not read the indexed files - changes made while no daemon \
+                     ran are not reconciled: {err:#}"
+                );
+                return;
+            }
+        };
+        let pruned = self.discovered.excluded_by_every_language();
+        let walked: Vec<String> = crate::project_walk::project_files(&self.project_root, &pruned)
+            .filter(|file| {
+                self.discovered.indexing_language(&file.relative, file.real_relative.as_deref()).is_some()
+            })
+            .map(|file| file.relative)
+            .collect();
+        let deleted: Vec<String> =
+            live.iter().filter(|file_path| !self.project_root.join(file_path).exists()).cloned().collect();
+        let (known, created): (Vec<String>, Vec<String>) =
+            walked.into_iter().partition(|file_path| live.contains(file_path));
+
+        for file_path in &deleted {
+            self.route_settled_path(conn, file_path.clone());
+        }
+        self.announce_created(&created);
+        let mut reindexed = 0usize;
+        for file_path in created.iter().chain(&known) {
+            match self.ensure_fresh(conn, file_path) {
+                Ok(Some(outcome)) if outcome.reindexed() => reindexed += 1,
+                Ok(_) => {}
+                Err(err) => crate::log_line!(
+                    "g-mesh daemon: could not reconcile {file_path} with the disk: {err:#} - the next \
+                     query of it retries"
+                ),
+            }
+        }
+        crate::log_line!(
+            "g-mesh daemon: reconciled {} files with the disk in {} ms: {} deleted, {} created, {} reindexed",
+            known.len() + created.len() + deleted.len(),
+            started.elapsed().as_millis(),
+            deleted.len(),
+            created.len(),
+            reindexed
+        );
     }
 
     /// The message to log for a file no plugin claims, or `None` if this
