@@ -60,7 +60,7 @@
 //! ImportError: from ._pure import f` normally binds the first, and every
 //! branch is indexed with no predicate evaluated (see [`super::decls`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use g_mesh_plugin_sdk::wire::{NodeKind, Position, Range};
 
@@ -108,6 +108,30 @@ pub(crate) enum Import {
     External,
 }
 
+/// Which of `importlib`'s two spellings a local name stands for (GM-510):
+/// the module itself, or its `import_module` function. Kept beside
+/// [`Import`] rather than on it, because `Import`'s values are compared as
+/// bindings and an `External` carries no module name on purpose (see
+/// [`FileModel::import`]). Shared by the module-level table here and the
+/// per-frame one in [`super::scope`], so both levels speak one vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportlibName {
+    /// `import importlib`, `import importlib.util` (both bind `importlib`),
+    /// `import importlib as il`.
+    Module,
+    /// `from importlib import import_module [as im]`.
+    ImportModule,
+}
+
+/// The value a module-level constant was assigned, as far as this tier folds
+/// it (GM-510, D2/D3): a plain string literal, or another name of this
+/// module, folded in turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConstValue {
+    Literal(String),
+    Name(String),
+}
+
 /// What `__all__` republishes, and where it is written.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DunderAll {
@@ -147,6 +171,20 @@ pub(crate) struct FileModel {
     /// included: the linker orders `*` rows by text alone.
     stars: Vec<Position>,
     dunder_all: DunderAll,
+    /// The module-level names an `importlib` import bound, and as which
+    /// spelling. Read together with `imports`: a use counts only while
+    /// [`FileModel::lookup_import`] still says `External` (GM-510, D1a).
+    importlib: HashMap<String, ImportlibName>,
+    /// The value of each module-level variable, keyed by its node id, or
+    /// `None` once a second assignment of it (or one this tier does not fold)
+    /// was seen. Two assignments of one name share one id, which is what
+    /// makes the second find the first.
+    constants: HashMap<String, Option<ConstValue>>,
+    /// Module-level names bound by anything other than a plain assignment -
+    /// `+=`, `for`, `with ... as`, a walrus, an import, a `def`/`class`,
+    /// `del` - or named by a `global` statement anywhere. None of them is a
+    /// constant (GM-510, D3 and M3).
+    poisoned_names: HashSet<String>,
 }
 
 /// The binding a use of a module-level name sees, when the module declares
@@ -322,6 +360,69 @@ impl FileModel {
     /// What a module-level `import` bound `local` to.
     pub(crate) fn lookup_import(&self, local: &str) -> Option<&Import> {
         self.imports.get(local)
+    }
+
+    /// Records which `importlib` spelling a module-level import bound
+    /// `local` to. `None` (an import of anything else) removes an earlier
+    /// entry only when the statement is unconditional - the same rule
+    /// [`FileModel::import`] applies to the binding itself, so the two tables
+    /// stay in step.
+    pub(crate) fn note_importlib(&mut self, local: &str, name: Option<ImportlibName>, unconditional: bool) {
+        match name {
+            Some(name) => {
+                self.importlib.insert(local.to_string(), name);
+            }
+            None if unconditional => {
+                self.importlib.remove(local);
+            }
+            None => {}
+        }
+    }
+
+    /// The `importlib` spelling the module-level `local` was bound to, if
+    /// any. Only meaningful while `lookup_import(local)` is `External`.
+    pub(crate) fn importlib(&self, local: &str) -> Option<ImportlibName> {
+        self.importlib.get(local).copied()
+    }
+
+    /// Records one module-level assignment of the variable whose node id is
+    /// `id`. The first assignment stores its value; any later one makes the
+    /// variable no constant at all, because which value a call site sees is
+    /// then a runtime question.
+    pub(crate) fn note_constant(&mut self, id: &str, value: Option<ConstValue>) {
+        match self.constants.get_mut(id) {
+            None => {
+                self.constants.insert(id.to_string(), value);
+            }
+            Some(stored) => *stored = None,
+        }
+    }
+
+    /// Whether the frame whose path is `scope` declares `name` at all - one
+    /// declaration or several. [`FileModel::lookup`] answers `None` for
+    /// several, which is the wrong answer to "is this name taken here?".
+    pub(crate) fn declares_name(&self, scope: &str, name: &str) -> bool {
+        self.by_scope.get(&(scope.to_string(), name.to_string())).is_some_and(|decls| !decls.is_empty())
+    }
+
+    /// Whether something other than a plain assignment binds the
+    /// module-level `name` ([`FileModel::poison_name`]).
+    pub(crate) fn rebound(&self, name: &str) -> bool {
+        self.poisoned_names.contains(name)
+    }
+
+    /// Marks the module-level `name` as never a constant.
+    pub(crate) fn poison_name(&mut self, name: &str) {
+        self.poisoned_names.insert(name.to_string());
+    }
+
+    /// The folded value of the module-level variable `name` (node id `id`),
+    /// when it is a constant.
+    pub(crate) fn constant(&self, id: &str, name: &str) -> Option<&ConstValue> {
+        if self.poisoned_names.contains(name) {
+            return None;
+        }
+        self.constants.get(id)?.as_ref()
     }
 
     /// Records this file's `__all__`. The first one wins, for the same reason

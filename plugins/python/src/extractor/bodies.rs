@@ -100,14 +100,16 @@ use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PlaceholderTarget, TargetKey};
 use g_mesh_plugin_sdk::{OpenSite, OpenSiteKind, PlaceholderKind};
 use tree_sitter::Node;
 
+use crate::extractor::decls::{emit_import_edge, import_edges};
 use crate::extractor::emit::{container_target, Emitter};
-use crate::extractor::keys::ModuleCtx;
-use crate::extractor::model::{DeclRef, FileModel, Import, ModuleBinding};
+use crate::extractor::keys::{FileRole, ModuleCtx};
+use crate::extractor::model::{ConstValue, DeclRef, FileModel, Import, ImportlibName, ModuleBinding};
 use crate::extractor::scope::{dotted_path, FrameKind, Scopes};
 use crate::extractor::syntax::{
     decorators, definition_name, dotted_segments, first_parameter_name, has_decorator, inner_definition,
-    looks_like_class, property_accessor, text, Accessor,
+    looks_like_class, plain_string, property_accessor, text, Accessor,
 };
+use crate::project::ProjectContext;
 
 /// The decorator that says a `def` inside a class body has no instance
 /// parameter. Matched on the decorator's own name, so `@staticmethod` counts
@@ -208,16 +210,53 @@ impl Qualifier {
     }
 }
 
+/// Which dynamic-import function a call's callee statically is (GM-510).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicCallee {
+    /// `importlib.import_module`, however `importlib` or it was bound.
+    ImportModule,
+    /// The builtin `__import__`, unshadowed.
+    DunderImport,
+}
+
+/// The segments of a dotted module name, when every one is an identifier;
+/// `None` for anything a real import could not name (`pkg..mod`, `a b`).
+fn module_segments(name: &str) -> Option<Vec<&str>> {
+    let segments: Vec<&str> = name.split('.').collect();
+    let valid = |segment: &&str| {
+        segment.chars().next().is_some_and(|first| first == '_' || first.is_alphabetic())
+            && segment.chars().all(|ch| ch == '_' || ch.is_alphanumeric())
+    };
+    segments.iter().all(valid).then_some(segments)
+}
+
+/// CPython's `importlib._bootstrap._resolve_name`: `level` leading dots and
+/// the `tail` after them, against `package`. `None` where CPython raises
+/// (`attempted relative import beyond top-level package`): `package` has
+/// fewer than `level` segments.
+fn resolve_name(tail: &[&str], package: &str, level: usize) -> Option<String> {
+    let bits: Vec<&str> = package.rsplitn(level, '.').collect();
+    if bits.len() < level {
+        return None;
+    }
+    let base = bits.last()?;
+    let mut segments = vec![*base];
+    segments.extend(tail.iter().copied());
+    Some(segments.join("."))
+}
+
 /// Walks a file's bodies against what [`Declarer`](super::decls::Declarer)
 /// found.
 ///
-/// It deliberately holds no [`ProjectContext`](crate::project::ProjectContext):
-/// the project model answers questions about *other* files (which dotted
-/// names exist, where a root is), and every question this pass asks is about
-/// names the file itself established - its own declarations, and what its own
-/// import statements bound. `super::decls` is where the project model is
-/// consulted, once per import.
+/// Every question this pass asks about a *name* is about what the file
+/// itself established - its own declarations, and what its own import
+/// statements bound. The [`ProjectContext`] it holds is consulted for one
+/// thing only: whether an import this pass emits (a function-local or
+/// class-body one, or a dynamic one - GM-510) names a container of this
+/// project, the same question `super::decls` asks of a module-level import,
+/// through the same [`emit_import_edge`].
 pub(crate) struct Bodies<'a, 's> {
+    pub(crate) project: &'a ProjectContext,
     pub(crate) module: &'a ModuleCtx,
     pub(crate) source: &'s str,
     pub(crate) model: &'a FileModel,
@@ -228,12 +267,13 @@ pub(crate) struct Bodies<'a, 's> {
 
 impl<'a, 's> Bodies<'a, 's> {
     pub(crate) fn new(
+        project: &'a ProjectContext,
         module: &'a ModuleCtx,
         source: &'s str,
         model: &'a FileModel,
         emitter: &'a mut Emitter<'s>,
     ) -> Self {
-        Self { module, source, model, emitter, scopes: Scopes::new(), instance: None }
+        Self { project, module, source, model, emitter, scopes: Scopes::new(), instance: None }
     }
 
     pub(crate) fn visit_children(&mut self, node: Node, from: &str) {
@@ -258,9 +298,27 @@ impl<'a, 's> Bodies<'a, 's> {
             }
             "function_definition" => self.function(node, node, from),
             "class_definition" => self.class(node, node, from),
-            // Pass 1 read these; walking them again would emit a second,
-            // duplicate reference for every imported name.
-            "import_statement" | "import_from_statement" => {}
+            // At module level pass 1 read these; walking them again would
+            // emit a second, duplicate reference for every imported name.
+            // Below a `def` or `class` pass 1 does not look, so the
+            // statement's `IMPORTS` edges are drawn here, from the file node
+            // (GM-510, D7a). What it binds stays a plain local
+            // (`super::scope`), so nothing else is emitted.
+            "import_statement" | "import_from_statement" => {
+                if self.scopes.kind() != FrameKind::Module {
+                    let range = self.emitter.positions().range(node);
+                    for edge in import_edges(node, self.source, self.project, self.module) {
+                        emit_import_edge(
+                            self.project,
+                            self.emitter,
+                            &edge.container,
+                            &edge.specifier,
+                            range,
+                            edge.relative,
+                        );
+                    }
+                }
+            }
             // `global x` / `nonlocal x` name a binding, not a use of one.
             "global_statement" | "nonlocal_statement" => {}
             "comment" => {}
@@ -375,6 +433,7 @@ impl<'a, 's> Bodies<'a, 's> {
 
         self.scopes.push(FrameKind::Class, qualified);
         if let Some(body) = inner.child_by_field_name("body") {
+            self.scopes.note_class_names(body, self.source);
             self.visit_children(body, &id);
         }
         self.scopes.pop();
@@ -628,6 +687,230 @@ impl<'a, 's> Bodies<'a, 's> {
             #[cfg(test)]
             crate::census::pop_ctx();
         }
+        self.dynamic_import(node);
+    }
+
+    // --- dynamic imports (GM-510) ---------------------------------------------
+
+    /// `importlib.import_module(name, package)` or `__import__(name, ...)`
+    /// whose module name folds to a string from this file alone: the same
+    /// `IMPORTS` edge the static `import <name>` draws, from the file node,
+    /// with the module-name argument's range. Anything that does not fold
+    /// draws nothing - a missing edge, never a wrong one.
+    fn dynamic_import(&mut self, call: Node) {
+        let Some(function) = call.child_by_field_name("function") else { return };
+        let Some(callee) = self.dynamic_import_callee(function) else { return };
+        let Some(arguments) = call.child_by_field_name("arguments") else { return };
+        if arguments.kind() != "argument_list" {
+            return;
+        }
+        let mut positional = Vec::new();
+        let mut keywords = Vec::new();
+        let mut cursor = arguments.walk();
+        for argument in arguments.named_children(&mut cursor) {
+            match argument.kind() {
+                "keyword_argument" => {
+                    let name = argument.child_by_field_name("name");
+                    let value = argument.child_by_field_name("value");
+                    if let (Some(name), Some(value)) = (name, value) {
+                        keywords.push((text(name, self.source), value));
+                    }
+                }
+                // `f(*args)` / `f(**kwargs)`: which argument is which is a
+                // runtime question.
+                "list_splat" | "dictionary_splat" => return,
+                "comment" => {}
+                _ => positional.push(argument),
+            }
+        }
+        let argument = |index: usize, keyword: &str| {
+            positional
+                .get(index)
+                .copied()
+                .or_else(|| keywords.iter().find(|(name, _)| *name == keyword).map(|(_, value)| *value))
+        };
+        let Some(name_node) = argument(0, "name") else { return };
+        let Some(name) = self.fold(name_node) else { return };
+        let range = self.emitter.positions().range(name_node);
+        let level = name.chars().take_while(|ch| *ch == '.').count();
+        if callee == DynamicCallee::DunderImport {
+            // D4: Python 3's default `level` is 0 (absolute); a relative
+            // `__import__` is not folded. The edge goes onto the whole dotted
+            // name, as the static `import a.b` draws it.
+            if let Some(level) = argument(4, "level") {
+                if level.kind() != "integer" || text(level, self.source) != "0" {
+                    return;
+                }
+            }
+            if level > 0 {
+                return;
+            }
+        }
+        if level == 0 {
+            if module_segments(&name).is_some() {
+                emit_import_edge(self.project, self.emitter, &name, &name, range, false);
+            }
+            return;
+        }
+        // D5: a leading-dot name resolves against `package`, CPython's own
+        // `_resolve_name`.
+        let tail_text = &name[level..];
+        let tail = if tail_text.is_empty() {
+            Vec::new()
+        } else {
+            match module_segments(tail_text) {
+                Some(tail) => tail,
+                None => return,
+            }
+        };
+        let Some(package_node) = argument(1, "package") else { return };
+        let Some((package, own)) = self.fold_package(package_node) else { return };
+        if module_segments(&package).is_none() {
+            return;
+        }
+        let Some(resolved) = resolve_name(&tail, &package, level) else { return };
+        if own {
+            // `__package__` / `__name__`: this file's own package, so the
+            // static relative rule applies - always one of ours, the name as
+            // written for the specifier (D5a).
+            emit_import_edge(self.project, self.emitter, &resolved, &name, range, true);
+        } else {
+            // A literal or constant package: an absolute import of the
+            // resolved name, which `has_container` decides (D5a).
+            emit_import_edge(self.project, self.emitter, &resolved, &resolved, range, false);
+        }
+    }
+
+    /// Which dynamic-import function `function` (a call's callee) statically
+    /// is, if either (D1).
+    fn dynamic_import_callee(&self, function: Node) -> Option<DynamicCallee> {
+        match function.kind() {
+            "identifier" => {
+                let name = text(function, self.source);
+                if self.binding_is_importlib(name, ImportlibName::ImportModule) {
+                    Some(DynamicCallee::ImportModule)
+                } else {
+                    (name == "__import__" && self.unbound(name)).then_some(DynamicCallee::DunderImport)
+                }
+            }
+            "attribute" => match dotted_segments(function, self.source)?.as_slice() {
+                [head, "import_module"] => self
+                    .binding_is_importlib(head, ImportlibName::Module)
+                    .then_some(DynamicCallee::ImportModule),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether `name`, used here, is bound to the `importlib` spelling
+    /// `want` (D1, D7b).
+    ///
+    /// The first enclosing function frame that declares or binds the name
+    /// decides: a nested `def` of it means no, and a local means yes only when
+    /// the pre-scan found every binding of it to be that one import. With no
+    /// such frame, the module's own binding decides: its final binding must
+    /// be an import (no declaration after it), still `External`, and recorded
+    /// as that spelling.
+    fn binding_is_importlib(&self, name: &str, want: ImportlibName) -> bool {
+        for frame in self.scopes.chain() {
+            if frame.kind() == FrameKind::Module {
+                if frame.binds(name) {
+                    return false;
+                }
+                break;
+            }
+            if self.model.declares_name(frame.path(), name) || frame.class_binds(name) {
+                return false;
+            }
+            // A function-local import of `importlib` is the standard library
+            // only when the project has no `importlib` of its own - the same
+            // rule the module branch below gets from `Import::External`.
+            if frame.binds(name) {
+                return frame.importlib(name) == Some(want) && !self.project.has_container("importlib");
+            }
+        }
+        if !matches!(self.model.module_binding(name, None), None | Some(ModuleBinding::Import(_))) {
+            return false;
+        }
+        self.model.lookup_import(name) == Some(&Import::External) && self.model.importlib(name) == Some(want)
+    }
+
+    /// Whether nothing in this file binds `name`: no frame binds or declares
+    /// it, the module does not import it, and no module-level binding of any
+    /// form ([`FileModel::rebound`]) takes it. What makes a bare
+    /// `__import__`/`__package__`/`__name__` the builtin.
+    fn unbound(&self, name: &str) -> bool {
+        for frame in self.scopes.chain() {
+            if frame.binds(name) || self.model.declares_name(frame.path(), name) {
+                return false;
+            }
+        }
+        self.model.lookup_import(name).is_none() && !self.model.rebound(name)
+    }
+
+    /// The string `node` statically is, from this file alone (D2): a plain
+    /// string literal, or a name that resolves to a module-level constant of
+    /// this file (D3). A name some enclosing function or class binds or
+    /// declares is that local, not the constant.
+    fn fold(&self, node: Node) -> Option<String> {
+        match node.kind() {
+            "string" => plain_string(node, self.source).map(str::to_string),
+            "identifier" => {
+                let name = text(node, self.source);
+                for frame in self.scopes.chain() {
+                    if frame.kind() == FrameKind::Module {
+                        break;
+                    }
+                    if frame.binds(name)
+                        || frame.class_binds(name)
+                        || self.model.declares_name(frame.path(), name)
+                    {
+                        return None;
+                    }
+                }
+                self.fold_constant(name, &mut Vec::new())
+            }
+            _ => None,
+        }
+    }
+
+    /// The value of the module-level constant `name`, following `A = B`
+    /// chains; `seen` breaks an `A = B`, `B = A` cycle.
+    fn fold_constant(&self, name: &str, seen: &mut Vec<String>) -> Option<String> {
+        if seen.iter().any(|earlier| earlier == name) {
+            return None;
+        }
+        seen.push(name.to_string());
+        let Some(ModuleBinding::Decl(decl)) = self.model.module_binding(name, None) else { return None };
+        if decl.kind != NodeKind::Variable {
+            return None;
+        }
+        match self.model.constant(&decl.id, name)? {
+            ConstValue::Literal(value) => Some(value.clone()),
+            ConstValue::Name(next) => self.fold_constant(next, seen),
+        }
+    }
+
+    /// The `package` argument of `import_module`, and whether it is this
+    /// file's own package (D5): `__package__` is the package a relative
+    /// import here resolves against, `__name__` this module's own key (an
+    /// orphan has neither). Anything else folds as a string ([`Bodies::fold`]).
+    fn fold_package(&self, node: Node) -> Option<(String, bool)> {
+        if node.kind() == "identifier" {
+            let name = text(node, self.source);
+            if matches!(name, "__package__" | "__name__") && self.unbound(name) {
+                if self.module.role == FileRole::Orphan {
+                    return None;
+                }
+                return if name == "__package__" {
+                    self.module.package.clone().map(|package| (package, true))
+                } else {
+                    Some((self.module.key.clone(), true))
+                };
+            }
+        }
+        self.fold(node).map(|value| (value, false))
     }
 
     // --- name resolution ------------------------------------------------------

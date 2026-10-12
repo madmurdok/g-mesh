@@ -79,11 +79,13 @@
 //! missing edge. That is the standing rule (`graph::symbol_links`: "a missing
 //! edge beats a wrong one").
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use g_mesh_plugin_sdk::wire::QualifiedPath;
 use tree_sitter::Node;
 
+use crate::extractor::decls::importlib_name;
+use crate::extractor::model::ImportlibName;
 use crate::extractor::syntax::text;
 
 /// What kind of lexical scope a frame is - see this module's doc for why the
@@ -108,17 +110,50 @@ pub(crate) struct Frame {
     /// `"Greeter.render"` inside its method. See `super::keys`, Decision 2.
     path: String,
     locals: HashSet<String>,
+    /// The locals of a function frame that are, at every binding of them in
+    /// that function, one consistent `importlib` spelling (GM-510, D7b).
+    /// Filled by [`Scopes::bind_function_locals`]; a subset of `locals`.
+    importlib: HashMap<String, ImportlibName>,
+    /// Every name a class body binds, in any form and with no source order
+    /// (GM-510): filled by [`Scopes::note_class_names`] for a class frame
+    /// only, and kept apart from `locals` so that general name resolution in
+    /// a class body is unchanged. What keeps a class-level `NAME` from
+    /// folding to the module constant of the same name.
+    class_names: HashSet<String>,
 }
 
 impl Frame {
+    fn new(kind: FrameKind, path: String) -> Self {
+        Self { kind, path, locals: HashSet::new(), importlib: HashMap::new(), class_names: HashSet::new() }
+    }
+
     pub(crate) fn path(&self) -> &str {
         &self.path
+    }
+
+    pub(crate) fn kind(&self) -> FrameKind {
+        self.kind
+    }
+
+    /// The `importlib` spelling this frame's local `name` stands for, when
+    /// every binding of it in the function is that one import.
+    pub(crate) fn importlib(&self, name: &str) -> Option<ImportlibName> {
+        self.importlib.get(name).copied()
     }
 
     /// Whether this frame binds `name` as something other than a declaration
     /// - a parameter, an assignment target, a `with … as`, a local import.
     pub(crate) fn binds(&self, name: &str) -> bool {
         self.locals.contains(name)
+    }
+
+    /// Whether this is a class frame whose body binds `name` anywhere -
+    /// an assignment, a loop or `with` target, an import. A class body reads
+    /// its own `NAME` before the module's, so such a name is never the
+    /// module-level one; a method does not see it, and
+    /// [`Scopes::chain`] already skips the class frame there.
+    pub(crate) fn class_binds(&self, name: &str) -> bool {
+        self.class_names.contains(name)
     }
 }
 
@@ -138,13 +173,18 @@ pub(crate) fn dotted_path(text: &str) -> Option<QualifiedPath> {
 #[derive(Debug)]
 pub(crate) struct Scopes {
     frames: Vec<Frame>,
+    /// While [`Scopes::bind_function_locals`] runs: every name it binds, and
+    /// the `importlib` spelling of it when every binding so far was that one
+    /// import (`None` once anything else bound it). `None` outside the
+    /// pre-scan, so a binding made by the body walk records nothing.
+    prescan: Option<HashMap<String, Option<ImportlibName>>>,
 }
 
 impl Scopes {
     /// A stack holding only the module frame, which is where every file's
     /// walk starts and which is never popped.
     pub(crate) fn new() -> Self {
-        Self { frames: vec![Frame { kind: FrameKind::Module, path: String::new(), locals: HashSet::new() }] }
+        Self { frames: vec![Frame::new(FrameKind::Module, String::new())], prescan: None }
     }
 
     /// Enters a scope whose declarations are prefixed with `path`. Every
@@ -152,7 +192,7 @@ impl Scopes {
     /// because the walk is recursive and a guard would have to borrow the
     /// stack for the whole of each recursive call.
     pub(crate) fn push(&mut self, kind: FrameKind, path: String) {
-        self.frames.push(Frame { kind, path, locals: HashSet::new() });
+        self.frames.push(Frame::new(kind, path));
     }
 
     /// Leaves the innermost scope. The module frame is never popped: a walk
@@ -255,13 +295,64 @@ impl Scopes {
     /// handled where they are met - a `global` may be written below the
     /// assignment it governs, and Python still applies it to the whole
     /// function.
+    ///
+    /// The same sweep decides which locals are `importlib` bindings (GM-510,
+    /// D7b): a name is one only when every binding of it in the function is
+    /// an import of one consistent [`ImportlibName`]. A parameter (already
+    /// bound when this runs), an assignment, a `for`/`with`/`except` target,
+    /// a walrus, or an import of anything else poisons it. The sweep has no
+    /// source order, so `try: from importlib import import_module / except
+    /// ImportError: from compat import import_module` is poisoned too: a
+    /// missing edge, never a wrong one.
     pub(crate) fn bind_function_locals(&mut self, body: Node, source: &str) {
         let mut declared_elsewhere = HashSet::new();
         collect_outer_declarations(body, source, &mut declared_elsewhere);
+        let parameters = self.frames.last().map(|frame| frame.locals.clone()).unwrap_or_default();
+        self.prescan = Some(parameters.into_iter().map(|name| (name, None)).collect());
         let mut cursor = body.walk();
         for child in body.named_children(&mut cursor) {
             self.bind_locals_in(child, source, &declared_elsewhere);
         }
+        let prescan = self.prescan.take().unwrap_or_default();
+        if let Some(frame) = self.frames.last_mut() {
+            frame.importlib =
+                prescan.into_iter().filter_map(|(name, importlib)| Some((name, importlib?))).collect();
+        }
+    }
+
+    /// Records in the innermost (class) frame every name its `body` binds
+    /// ([`Frame::class_binds`]), by the same sweep as
+    /// [`Scopes::bind_function_locals`] but leaving `locals` as it was. The
+    /// sweep has no source order, so a use above the assignment is treated
+    /// as the class's own name too: a missing edge, never a wrong one.
+    pub(crate) fn note_class_names(&mut self, body: Node, source: &str) {
+        let mut declared_elsewhere = HashSet::new();
+        collect_outer_declarations(body, source, &mut declared_elsewhere);
+        let locals = self.frames.last().map(|frame| frame.locals.clone()).unwrap_or_default();
+        self.prescan = Some(HashMap::new());
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            self.bind_locals_in(child, source, &declared_elsewhere);
+        }
+        let prescan = self.prescan.take().unwrap_or_default();
+        if let Some(frame) = self.frames.last_mut() {
+            frame.locals = locals;
+            frame.class_names = prescan.into_keys().collect();
+        }
+    }
+
+    /// Records one pre-scan binding of `name`: `importlib` is the spelling an
+    /// import bound it to, `None` for any other binding.
+    fn note_prescan(&mut self, name: &str, importlib: Option<ImportlibName>) {
+        let Some(prescan) = self.prescan.as_mut() else { return };
+        prescan
+            .entry(name.to_string())
+            .and_modify(|seen| {
+                if *seen != importlib {
+                    *seen = None;
+                }
+            })
+            .or_insert(importlib);
     }
 
     fn bind_locals_in(&mut self, node: Node, source: &str, skip: &HashSet<String>) {
@@ -300,28 +391,30 @@ impl Scopes {
 
     /// The names an `import` inside a function body binds. They are locals
     /// here, not module members: a function-local import is visible only in
-    /// that function, and this plugin records imports at module level only
-    /// (see [`super::decls`]).
+    /// that function. Its `IMPORTS` edges are drawn by `super::bodies`
+    /// (GM-510, D7a), but what it binds stays a plain local - only whether
+    /// that local is `importlib` is recorded ([`Frame::importlib`]).
     fn bind_import(&mut self, node: Node, source: &str, skip: &HashSet<String>) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            match child.kind() {
+            let local = match child.kind() {
                 // `import a.b` binds `a`; `from a import b` binds `b`.
                 "dotted_name" => {
                     if Some(child) == node.child_by_field_name("module_name") {
                         continue;
                     }
-                    if let Some(first) = child.named_child(0) {
-                        self.bind_unless(first, source, skip);
-                    }
+                    child.named_child(0)
                 }
-                "aliased_import" => {
-                    if let Some(alias) = child.child_by_field_name("alias") {
-                        self.bind_unless(alias, source, skip);
-                    }
-                }
-                _ => {}
+                "aliased_import" => child.child_by_field_name("alias"),
+                _ => None,
+            };
+            let Some(local) = local else { continue };
+            let name = text(local, source);
+            if local.kind() != "identifier" || skip.contains(name) {
+                continue;
             }
+            self.bind(name);
+            self.note_prescan(name, importlib_name(node, child, source));
         }
     }
 
@@ -344,6 +437,7 @@ impl Scopes {
                 let name = text(target, source);
                 if !skip.contains(name) {
                     self.bind(name);
+                    self.note_prescan(name, None);
                 }
             }
             "attribute" | "subscript" => {}

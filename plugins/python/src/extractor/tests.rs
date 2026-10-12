@@ -1920,3 +1920,479 @@ fn gm533_a_use_of_a_def_before_a_star_import_is_left_to_the_linker() {
     let graph = tree.extract("pkg/__init__.py");
     assert_eq!(graph.edge_between("run", "f"), Some((EdgeKind::Calls, true)));
 }
+
+// --- GM-510: function-local and dynamic imports ---------------------------------
+
+/// A Python source from its lines, so a test's fixture reads as Python.
+fn py(lines: &[&str]) -> String {
+    let mut source = lines.join("\n");
+    source.push('\n');
+    source
+}
+
+/// `import_specifiers` of `pkg/x.py` holding `source`, in a project that also
+/// has `pkg/mod.py`, `pkg/helpers.py`, `pkg/sub/leaf.py` and a `pkg/other.py`
+/// that declares a constant `OTHER`.
+fn dynamic_imports_of(source: &str) -> Vec<(String, String)> {
+    let tree = tree(&[
+        ("pkg/mod.py", ""),
+        ("pkg/helpers.py", "def assist():\n    pass\n"),
+        ("pkg/sub/leaf.py", ""),
+        ("pkg/other.py", "OTHER = \"pkg.mod\"\n"),
+        ("pkg/x.py", source),
+    ]);
+    import_specifiers(&tree, "pkg/x.py")
+}
+
+/// The one edge every fixture with a plain `import importlib` has.
+const IMPORTLIB: (&str, &str) = ("external_module importlib", "importlib");
+
+/// L1 (D7a): an import below a `def` or `class` body emits the `IMPORTS`
+/// edges the same statement emits at module level - plain, relative, a
+/// submodule's own edge, one inside `try/except` in a nested `def`, one in a
+/// class body - and nothing else: no `pending_symbol` for the names it binds.
+/// A local import of a module the file already imports at module level adds no
+/// second edge; the module-level specifier stays.
+///
+/// Control: make the `import_statement | import_from_statement` arm of
+/// `Bodies::visit` (bodies.rs) a no-op `{}`.
+#[test]
+fn a_function_local_import_emits_the_file_level_imports_edge_and_nothing_else() {
+    let source = py(&[
+        "import pkg.helpers",
+        "",
+        "def handler():",
+        "    from pkg.models import User",
+        "    from ..helpers import assist",
+        "    return User(), assist()",
+        "",
+        "class Service:",
+        "    from pkg import sub",
+        "",
+        "    def method(self):",
+        "        from ..base import Base",
+        "        return Base",
+        "",
+        "def outer():",
+        "    def inner():",
+        "        try:",
+        "            import fastjson",
+        "        except ImportError:",
+        "            import json",
+        "    return inner",
+    ]);
+    let tree = tree(&[
+        ("pkg/helpers.py", "def assist():\n    pass\n"),
+        ("pkg/models.py", "class User:\n    pass\n"),
+        ("pkg/sub/service.py", &source),
+    ]);
+    assert_eq!(
+        import_specifiers(&tree, "pkg/sub/service.py"),
+        pairs(&[
+            ("external_module fastjson", "fastjson"),
+            ("external_module json", "json"),
+            ("resolved_module pkg.base::*", "..base"),
+            ("resolved_module pkg.helpers::*", "pkg.helpers"),
+            ("resolved_module pkg.models::*", "pkg.models"),
+            ("resolved_module pkg.sub::*", "pkg.sub"),
+            ("resolved_module pkg::*", "pkg"),
+        ])
+    );
+    let graph = tree.extract("pkg/sub/service.py");
+    let pending: Vec<String> = graph
+        .0
+        .nodes
+        .iter()
+        .filter(|node| node.native_kind.as_deref() == Some("pending_symbol"))
+        .map(|node| node.qualified_name.clone())
+        .collect();
+    assert!(pending.is_empty(), "a function-local from-import binds a plain local: {pending:?}");
+}
+
+/// B1 (D4): `importlib.import_module` with a literal name gives the edge the
+/// static `import` gives, internal or external, also through the `name=`
+/// keyword. `__import__("a.b")` lands on the whole dotted name, not on `a`;
+/// an explicit `level` of `0` still folds, any other `level` gives nothing,
+/// and so does an `__import__` this file shadows.
+///
+/// Control: in `Bodies::dynamic_import`, for `DynamicCallee::DunderImport`
+/// emit `name.split('.').next()` instead of `name`.
+#[test]
+fn a_literal_dynamic_import_is_an_imports_edge_onto_the_whole_dotted_name() {
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "import importlib",
+            "",
+            "def load():",
+            "    importlib.import_module(\"pkg.helpers\")",
+            "    importlib.import_module(\"json.decoder\")",
+            "    return importlib.import_module(name=\"pkg.mod\")",
+        ])),
+        pairs(&[
+            IMPORTLIB,
+            ("external_module json.decoder", "json.decoder"),
+            ("resolved_module pkg.helpers::*", "pkg.helpers"),
+            ("resolved_module pkg.mod::*", "pkg.mod"),
+        ])
+    );
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "def load(g, l):",
+            "    __import__(\"pkg.sub.leaf\")",
+            "    __import__(\"pkg.helpers\", g, l, [], 0)",
+            "    __import__(\"pkg.mod\", g, l, [], 1)",
+            "    return __import__(\"pkg.mod\", level=2)",
+        ])),
+        pairs(&[
+            ("resolved_module pkg.helpers::*", "pkg.helpers"),
+            ("resolved_module pkg.sub.leaf::*", "pkg.sub.leaf"),
+        ])
+    );
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "def __import__(name):",
+            "    return name",
+            "",
+            "def load():",
+            "    return __import__(\"pkg.mod\")",
+        ])),
+        Vec::<(String, String)>::new(),
+        "a module-level `def __import__` is not the builtin"
+    );
+}
+
+/// B2 (D1): every module-level spelling of `importlib` counts as the callee:
+/// `import importlib as il`, `from importlib import import_module as im`,
+/// `import importlib.util` (which binds `importlib`), and the unaliased
+/// `from importlib import import_module`. `import importlib.util as u` binds
+/// `util`, so `u.import_module` is not the callee.
+///
+/// Control: in `decls::importlib_name`'s `aliased_import` branch return
+/// `Module` only when the alias text is `importlib`.
+#[test]
+fn a_module_level_importlib_alias_is_the_dynamic_import_callee() {
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "import importlib as il",
+            "from importlib import import_module as im",
+            "",
+            "def load():",
+            "    il.import_module(\"pkg.mod\")",
+            "    return im(\"pkg.helpers\")",
+        ])),
+        pairs(&[
+            IMPORTLIB,
+            ("resolved_module pkg.helpers::*", "pkg.helpers"),
+            ("resolved_module pkg.mod::*", "pkg.mod"),
+        ])
+    );
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "import importlib.util",
+            "from importlib import import_module",
+            "",
+            "def load():",
+            "    importlib.import_module(\"pkg.mod\")",
+            "    return import_module(\"pkg.helpers\")",
+        ])),
+        pairs(&[
+            IMPORTLIB,
+            ("external_module importlib.util", "importlib.util"),
+            ("resolved_module pkg.helpers::*", "pkg.helpers"),
+            ("resolved_module pkg.mod::*", "pkg.mod"),
+        ])
+    );
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "import importlib.util as u",
+            "",
+            "def load():",
+            "    return u.import_module(\"pkg.mod\")",
+        ])),
+        pairs(&[("external_module importlib.util", "importlib.util")])
+    );
+}
+
+/// L2 (D7b): an importlib binding inside a function folds there and in a
+/// nested `def`, not in a sibling function, and not where the function binds
+/// the name two ways (`try: from importlib ... / except: from compat ...`).
+///
+/// Control: make `Scopes::note_prescan` keep the first spelling it saw instead
+/// of poisoning a name whose bindings disagree.
+#[test]
+fn a_function_local_importlib_binding_folds_only_where_it_is_the_only_binding() {
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "def load():",
+            "    import importlib as il",
+            "    il.import_module(\"pkg.mod\")",
+            "    def nested():",
+            "        return il.import_module(\"pkg.helpers\")",
+            "    return nested",
+            "",
+            "def sibling():",
+            "    return il.import_module(\"pkg.sub.leaf\")",
+        ])),
+        pairs(&[
+            IMPORTLIB,
+            ("resolved_module pkg.helpers::*", "pkg.helpers"),
+            ("resolved_module pkg.mod::*", "pkg.mod"),
+        ])
+    );
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "def load():",
+            "    try:",
+            "        from importlib import import_module",
+            "    except ImportError:",
+            "        from compat import import_module",
+            "    return import_module(\"pkg.mod\")",
+        ])),
+        pairs(&[("external_module compat", "compat"), IMPORTLIB]),
+        "a name bound two ways is not statically importlib's"
+    );
+}
+
+/// B4 (D5, D5a): a leading-dot name resolves against `package` the way
+/// CPython's `_resolve_name` does. A literal `package` gives an absolute
+/// import of the resolved name (internal or external by the project);
+/// `__package__`/`__name__` give a relative import with the name as written.
+/// No `package`, or more dots than `package` has segments, gives nothing.
+///
+/// Control: in `bodies::resolve_name` skip the `level - 1` segment stripping
+/// (`rsplitn(1, ..)`): `("..mod", "pkg.sub")` then lands on `pkg.sub.mod`.
+#[test]
+fn a_relative_dynamic_import_resolves_against_its_package_argument() {
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "import importlib",
+            "",
+            "def load():",
+            "    importlib.import_module(\".leaf\", package=\"pkg.sub\")",
+            "    importlib.import_module(\"..mod\", \"pkg.sub\")",
+            "    importlib.import_module(\".compat\", package=\"requests\")",
+            "    importlib.import_module(\".helpers\", package=__package__)",
+            "    importlib.import_module(\".inner\", __name__)",
+            "    importlib.import_module(\".base\")",
+            "    return importlib.import_module(\"...deep\", \"pkg.sub\")",
+        ])),
+        pairs(&[
+            IMPORTLIB,
+            ("external_module requests.compat", "requests.compat"),
+            ("resolved_module pkg.helpers::*", ".helpers"),
+            ("resolved_module pkg.mod::*", "pkg.mod"),
+            ("resolved_module pkg.sub.leaf::*", "pkg.sub.leaf"),
+            ("resolved_module pkg.x.inner::*", ".inner"),
+        ])
+    );
+}
+
+/// B5 (D3): a once-assigned module-level constant folds, also through
+/// `A = NAME`, and the call's existing `REFERENCES` edge onto it stays.
+///
+/// Control (shared with the next test): make `FileModel::note_constant` keep
+/// the first value instead of poisoning on a second assignment.
+#[test]
+fn a_same_file_constant_folds_into_a_dynamic_import() {
+    let source = py(&[
+        "import importlib",
+        "NAME = \"pkg.mod\"",
+        "TARGET = \"pkg.helpers\"",
+        "ALIAS = TARGET",
+        "",
+        "def f():",
+        "    return importlib.import_module(NAME)",
+        "",
+        "def g():",
+        "    return importlib.import_module(ALIAS)",
+    ]);
+    assert_eq!(
+        dynamic_imports_of(&source),
+        pairs(&[
+            IMPORTLIB,
+            ("resolved_module pkg.helpers::*", "pkg.helpers"),
+            ("resolved_module pkg.mod::*", "pkg.mod"),
+        ])
+    );
+    let tree = tree(&[("pkg/mod.py", ""), ("pkg/x.py", &source)]);
+    let graph = tree.extract("pkg/x.py");
+    assert_eq!(graph.edge_between("f", "NAME"), Some((EdgeKind::References, true)));
+}
+
+/// B5 (D3, M3): any second module-level binding of the name poisons the
+/// constant - a reassignment (also a conditional one), `+=`, a `global` write,
+/// `for`, `with ... as`, a walrus - and so does an `A = B`, `B = A` cycle.
+///
+/// Control: make `FileModel::note_constant` keep the first value instead of
+/// poisoning on a second assignment (the first two fixtures then fold).
+#[test]
+fn a_rebound_constant_does_not_fold() {
+    let rebindings: [&[&str]; 8] = [
+        &["NAME = \"pkg.mod\"", "NAME = \"pkg.helpers\""],
+        &["NAME = \"pkg.mod\"", "if len(__file__) > 1:", "    NAME = \"pkg.helpers\""],
+        &["NAME = \"pkg.mod\"", "NAME += \".x\""],
+        &["NAME = \"pkg.mod\"", "def setup():", "    global NAME", "    NAME = \"pkg.helpers\""],
+        &["NAME = \"pkg.mod\"", "for NAME in (\"pkg.helpers\",):", "    pass"],
+        &["NAME = \"pkg.mod\"", "with open(__file__) as NAME:", "    pass"],
+        &["NAME = \"pkg.mod\"", "if (NAME := \"pkg.helpers\"):", "    pass"],
+        &["NAME = OTHER_NAME", "OTHER_NAME = NAME"],
+    ];
+    for rebinding in rebindings {
+        let mut lines = vec!["import importlib"];
+        lines.extend_from_slice(rebinding);
+        lines.extend_from_slice(&["", "def f():", "    return importlib.import_module(NAME)"]);
+        assert_eq!(dynamic_imports_of(&py(&lines)), pairs(&[IMPORTLIB]), "{rebinding:?}");
+    }
+}
+
+/// B6 (D3): a parameter or a local named like the constant is that runtime
+/// value, not the constant: no edge, and in particular not the constant's.
+///
+/// Control: drop the non-module `frame.binds(name)` check in `Bodies::fold`'s
+/// identifier branch.
+#[test]
+fn a_parameter_or_local_shadowing_a_constant_does_not_fold() {
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "import importlib",
+            "NAME = \"pkg.mod\"",
+            "",
+            "def by_parameter(NAME):",
+            "    return importlib.import_module(NAME)",
+            "",
+            "def by_local():",
+            "    NAME = \"pkg.helpers\"",
+            "    return importlib.import_module(NAME)",
+        ])),
+        pairs(&[IMPORTLIB])
+    );
+}
+
+/// B7 (D2): only a plain string literal or a same-file constant folds.
+/// f-strings (with or without a field), concatenation of any kind, `%` and
+/// `.format`, an escape, a byte string, a name from another file, a call
+/// result, an empty or non-identifier name, and `*args` all give nothing.
+///
+/// Control: make `syntax::plain_string` delegate to `string_literal` (the
+/// f-strings then fold to `pkg.{x}` / `pkg.mod`).
+#[test]
+fn an_unfoldable_module_name_gives_no_edge() {
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "import importlib",
+            "from pkg.other import OTHER",
+            "",
+            "def name():",
+            "    return \"pkg.mod\"",
+            "",
+            "def load(x, args):",
+            "    importlib.import_module(f\"pkg.{x}\")",
+            "    importlib.import_module(f\"pkg.mod\")",
+            "    importlib.import_module(\"pkg.\" + x)",
+            "    importlib.import_module(\"pkg\" \".mod\")",
+            "    importlib.import_module(\"pkg.%s\" % x)",
+            "    importlib.import_module(\"pkg.{}\".format(x))",
+            "    importlib.import_module(\"pkg\\x2emod\")",
+            "    importlib.import_module(b\"pkg.mod\")",
+            "    importlib.import_module(OTHER)",
+            "    importlib.import_module(name())",
+            "    importlib.import_module(\"\")",
+            "    importlib.import_module(\"pkg..mod\")",
+            "    importlib.import_module(\"pkg-mod\")",
+            "    return importlib.import_module(*args)",
+        ])),
+        pairs(&[IMPORTLIB, ("resolved_module pkg.other::*", "pkg.other")])
+    );
+}
+
+/// B8 (D1a): an `import_module` that is not importlib's is not the callee:
+/// one from another library, and importlib's own once a later unconditional
+/// module-level import rebinds the name.
+///
+/// Control: make `FileModel::note_importlib(local, None, true)` a no-op, so
+/// the stale importlib entry survives the rebinding.
+#[test]
+fn an_import_module_that_is_not_importlibs_gives_no_edge() {
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "from mylib import import_module",
+            "",
+            "def load():",
+            "    return import_module(\"pkg.mod\")",
+        ])),
+        pairs(&[("external_module mylib", "mylib")])
+    );
+    assert_eq!(
+        dynamic_imports_of(&py(&[
+            "from importlib import import_module",
+            "from mylib import import_module",
+            "",
+            "def load():",
+            "    return import_module(\"pkg.mod\")",
+        ])),
+        pairs(&[IMPORTLIB, ("external_module mylib", "mylib")])
+    );
+}
+
+/// The dynamic-import targets (`pkg.*`) among `edges`.
+fn pkg_targets(edges: &[(String, String)]) -> Vec<&str> {
+    edges.iter().map(|(_, t)| t.as_str()).filter(|t| t.starts_with("pkg.")).collect()
+}
+
+/// F1: a class body sees its own class-level names first, so a call there
+/// whose argument name is rebound by the class folds to nothing (not the
+/// module constant, not the class value). A method does not see class-level
+/// names, so it still folds to the module constant.
+///
+/// Control: remove `|| frame.class_binds(name)` in `Bodies::fold`.
+#[test]
+fn a_class_level_name_shadows_the_module_constant_in_the_class_body_only() {
+    let class_body = dynamic_imports_of(&py(&[
+        "import importlib",
+        "NAME = \"pkg.mod\"",
+        "",
+        "class C:",
+        "    NAME = \"pkg.helpers\"",
+        "    importlib.import_module(NAME)",
+    ]));
+    assert_eq!(pkg_targets(&class_body), Vec::<&str>::new(), "{class_body:?}");
+
+    let method = dynamic_imports_of(&py(&[
+        "import importlib",
+        "NAME = \"pkg.mod\"",
+        "",
+        "class C:",
+        "    NAME = \"pkg.helpers\"",
+        "",
+        "    def load(self):",
+        "        return importlib.import_module(NAME)",
+    ]));
+    assert_eq!(pkg_targets(&method), vec!["pkg.mod"], "{method:?}");
+}
+
+/// F2: when the project has its own `importlib` package, `importlib` and
+/// `import_module` inside a function are not the standard library's, so no
+/// dynamic edge is emitted.
+///
+/// Control: remove the `!self.project.has_container("importlib")` clause in
+/// the frame branch of `Bodies::binding_is_importlib`.
+#[test]
+fn a_project_own_importlib_gives_no_dynamic_edge_inside_a_function() {
+    let source = py(&[
+        "def a():",
+        "    import importlib",
+        "    return importlib.import_module(\"pkg.mod\")",
+        "",
+        "def b():",
+        "    from importlib import import_module",
+        "    return import_module(\"pkg.helpers\")",
+    ]);
+    let tree = tree(&[
+        ("importlib/__init__.py", "def import_module(name):\n    pass\n"),
+        ("pkg/mod.py", ""),
+        ("pkg/helpers.py", ""),
+        ("pkg/x.py", &source),
+    ]);
+    let edges = import_specifiers(&tree, "pkg/x.py");
+    assert_eq!(pkg_targets(&edges), Vec::<&str>::new(), "{edges:?}");
+}
