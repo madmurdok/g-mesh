@@ -1,9 +1,14 @@
+# The only reference left behind is the `import type` line (src/main.ts:1):
+# a real non-call usage. The member calls `box.cb()` / `opts.go()` land on no
+# CALLS edge to the owner (the bridge's own-name check) and are not disclosed.
 [[callers]]
 symbol = "Box"
 file = "src/box.ts"
 expect = []
+excluded_references = { count = 1, files = ["src/main.ts:1"] }
 
 [[callers]]
 symbol = "Opts"
 file = "src/box.ts"
 expect = []
+excluded_references = { count = 1, files = ["src/main.ts:1"] }

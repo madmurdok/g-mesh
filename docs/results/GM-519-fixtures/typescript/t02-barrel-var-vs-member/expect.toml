@@ -1,6 +1,9 @@
+# `handler` (the exported const) and `Router#handler` share a name, and the
+# runner narrows an ambiguous name by `file` alone, so Router lives in its own
+# file: each expectation then selects exactly one symbol.
 [[callers]]
 symbol = "Router#handler"
-file = "src/x.ts"
+file = "src/router.ts"
 expect = []
 
 [[callers]]
