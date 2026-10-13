@@ -1,0 +1,4 @@
+[[callers]]
+symbol = "Registry.create"
+file = "src/reg.ts"
+expect = ["src/main.ts:make"]

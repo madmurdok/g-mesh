@@ -88,8 +88,8 @@ mod resolve;
 pub use bridge::{Budgets, LspBridge};
 pub use config::{OverloadDisambiguation, SemanticConfig, ServerReadiness};
 pub use resolve::{
-    is_bare, npm_candidates, probe, resolve, script_spellings, Candidate, NpmServer, Resolved,
-    HOST_SCRIPT_EXTENSIONS, PROBE_BUDGET, WINDOWS_SCRIPT_EXTENSIONS,
+    is_bare, npm_candidates, npm_candidates_on_path, probe, resolve, script_spellings, Candidate, NpmServer,
+    Resolved, HOST_SCRIPT_EXTENSIONS, PROBE_BUDGET, WINDOWS_SCRIPT_EXTENSIONS,
 };
 
 /// Public only so an integration test can take the lifeline's path; a

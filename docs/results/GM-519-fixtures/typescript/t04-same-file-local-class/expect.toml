@@ -1,0 +1,4 @@
+[[callers]]
+symbol = "Counter#bump"
+file = "src/local.ts"
+expect = ["src/local.ts:tally"]

@@ -1,0 +1,8 @@
+[[callers]]
+symbol = "net::Socket::close"
+file = "src/lib.rs"
+expect = []
+[[callers]]
+symbol = "file::File::close"
+file = "src/lib.rs"
+expect = ["src/lib.rs:shut"]

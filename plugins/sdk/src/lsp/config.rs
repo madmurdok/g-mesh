@@ -51,9 +51,12 @@
 //! So the server inherits the plugin's environment, which is the daemon's,
 //! which is the developer's. [`SemanticConfig::env`] adds to it (or overrides
 //! a variable) for the cases a manifest genuinely needs to state - a log
-//! level, a server-specific switch. Nothing here removes a variable: a plugin
-//! that wants a scrubbed environment has a bigger question to answer than
-//! this file can.
+//! level, a server-specific switch - and a plugin adds its own overrides on
+//! top, the ones that keep a server from running code the project configures
+//! (a pinned toolchain, an empty compiler wrapper; see
+//! [ADR 0032](../../../../docs/adr/0032-semantic-tiers-execute-no-project-code.md)).
+//! Nothing here removes a variable: a plugin that wants a scrubbed
+//! environment has a bigger question to answer than this file can.
 //!
 //! # Settings: `initializationOptions` is not the only channel, and for some
 //! servers it is not a channel at all (GM-299)

@@ -1,0 +1,8 @@
+[[callers]]
+symbol = "Socket#close"
+file = "src/sockets.ts"
+expect = []
+[[callers]]
+symbol = "FileHandle#close"
+file = "src/files.ts"
+expect = ["src/main.ts:shut"]

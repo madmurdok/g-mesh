@@ -78,34 +78,35 @@ one question per **open site** - which for Python means one question per
 receiver call, `obj.method()`, and nothing else. An answer becomes a `CALLS`
 edge with `source: semantic` and `engine: pyright`; no answer becomes no edge.
 
-It is found in three places, in order, and each is *probed* before it is used:
-`PATH`, then the indexed project's own `node_modules/.bin`, then
-`npx --yes --package pyright pyright-langserver`. The probe runs
+It is found on `PATH` only, and *probed* before it is used: the probe runs
 `pyright --version` - the CLI twin from the same npm package - because
-`pyright-langserver --version` has no such flag and exits 1.
+`pyright-langserver --version` has no such flag and exits 1. Install it with
+`npm install -g pyright`.
 
-The `npx` branch is last, and there are two reasons rather than one. It is the
-only one that can **reach the network**: on a machine with no pyright anywhere
-it fetches the package into npm's `_npx` cache, which cost 4.94s measured here
-and costs more on a slow link. It is bounded rather than trusted (60s, then the
-child is killed). And it is measurably more expensive even once cached: on the
-conformance fixture the whole-project pass goes from ~3.4s to 4.13s, and peak
-process-tree RSS from 131 MiB to **204 MiB**, because `npm` stays resident
-beside the server it launched - 74 MiB of launcher, charged to this plugin by
-`[plugin] memoryLimitMb` like everything else in its tree. Install pyright in
-the project or globally and the branch is never reached; the log line always
-names which of the three answered.
+The indexed project's own `node_modules/.bin` is never looked in, and `npx` is
+not used: a project does not get to ship the server that runs on it, and
+`npx` run in the project executes the project's own `node_modules/pyright`
+(it also contacts the registry the project's `.npmrc` names, on every start).
+See [ADR 0032](../../docs/adr/0032-semantic-tiers-execute-no-project-code.md).
+With no `pyright-langserver` on `PATH` the log line names the remedy.
 
 **No pyright at all is not an error**: the plugin logs one line, answers every
 pass with an empty *incomplete* diff, and the structural index is untouched.
 `semanticPassAt` stays unset, so the receiver gap below keeps being listed
 until a pyright is actually there.
 
-If the project has a virtual environment (`<root>/.venv` or `<root>/venv`),
-its interpreter is passed to pyright as `python.pythonPath`, so third-party
-imports resolve against the environment the code actually runs in. `$VIRTUAL_ENV`
-is deliberately **not** read: it describes whatever shell started the daemon,
-which is as likely to be another project's environment as this one's.
+pyright runs **no Python interpreter**, neither the project's nor one from
+`PATH`. If the project has a virtual environment (`<root>/.venv` or
+`<root>/venv`), its `site-packages` directory, found by reading directories,
+is passed as `python.analysis.extraPaths`, so third-party imports and
+editable installs (`.pth` path lines) resolve against it. What only a running
+interpreter knows is not resolved: `.pth` files that compute paths with
+`import` lines, `sitecustomize` path changes, conda/pyenv layouts outside
+`lib/python*/site-packages`, and the interpreter's exact Python version. See
+[ADR 0032](../../docs/adr/0032-semantic-tiers-execute-no-project-code.md).
+`$VIRTUAL_ENV` is deliberately **not** read: it describes whatever shell
+started the daemon, which is as likely to be another project's environment as
+this one's.
 
 ### What a resolved receiver call resolves *to*
 
