@@ -889,4 +889,32 @@ mod tests {
         assert_eq!(answer.as_array().map(Vec::len), Some(2));
         assert_eq!(answer[0], answer[1]);
     }
+
+    /// The server runs with `NoDefaultCurrentDirectoryInExePath=1` even when
+    /// the manifest's `env` sets it to something else: its current directory
+    /// is the indexed project, where on Windows `cmd.exe` would otherwise
+    /// look for `node.exe` first.
+    #[cfg(unix)]
+    #[test]
+    fn the_server_runs_with_no_current_directory_exe_lookup_whatever_the_manifest_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen");
+        let mut config = SemanticConfig::new("/bin/sh");
+        config.args = vec![
+            "-c".to_string(),
+            format!("printf '%s' \"${{NoDefaultCurrentDirectoryInExePath-unset}}\" > '{}'", seen.display()),
+        ];
+        config.env.insert("NoDefaultCurrentDirectoryInExePath".to_string(), "0".to_string());
+
+        let started =
+            LspClient::start("test", &config, dir.path(), Instant::now() + Duration::from_secs(30), false);
+        assert!(started.is_err(), "a server that exits at once is not a client");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let read = || std::fs::read_to_string(&seen).unwrap_or_default();
+        while read().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(read(), "1");
+    }
 }

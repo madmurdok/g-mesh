@@ -445,6 +445,22 @@ mod tests {
         assert!(format!("{err:#}").contains("could not run /nonexistent/some-langserver"), "{err:#}");
     }
 
+    /// Every probe runs with `NoDefaultCurrentDirectoryInExePath=1`, whether
+    /// or not this process has it: on Windows it keeps `cmd.exe` from running
+    /// a `node.exe` out of its current directory. The variable is removed from
+    /// this process first, so an inherited value cannot pass for the probe's.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_runs_with_no_current_directory_exe_lookup() {
+        std::env::remove_var("NoDefaultCurrentDirectoryInExePath");
+        let script = "printf '%s' \"${NoDefaultCurrentDirectoryInExePath-unset}\"";
+        let direct = std::process::Command::new("/bin/sh").args(["-c", script]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&direct.stdout), "unset", "sanity: this process no longer has it");
+
+        let (program, args) = sh(script);
+        assert_eq!(probe(&program, &args, Duration::from_secs(10)).unwrap(), "1");
+    }
+
     /// The first candidate that answers wins, and the ones after it are never
     /// probed. `resolve` probes in order, one at a time.
     #[cfg(unix)]
