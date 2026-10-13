@@ -341,6 +341,39 @@ fn base_mode_counts_committed_staged_unstaged_and_untracked_changes() {
     assert_eq!(selection_in(root, &["--base", "release-9.9.9"]), "full", "staged wire");
 }
 
+/// `--go` (GM-573): does the diff need the Go plugin's own tests?
+fn go_query(paths: &[&str]) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let list = dir.path().join("paths.txt");
+    fs::write(&list, paths.iter().map(|p| format!("{p}\n")).collect::<String>()).unwrap();
+    let output = select_script(&repo_root(), &["--go", "--paths-from", list.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", describe(&output));
+    stdout_of(&output).trim_end().to_owned()
+}
+
+#[test]
+fn go_query_is_1_for_a_path_under_plugins_go_and_0_for_other_changes() {
+    assert_eq!(go_query(&["plugins/go/main.go"]), "1");
+    assert_eq!(go_query(&["docs/a.md", "plugins/go/internal/x.go"]), "1");
+    assert_eq!(go_query(&["docs/a.md"]), "0");
+    assert_eq!(go_query(&["core/src/cli/status.rs", "plugins/rust/src/lib.rs", "plugins/typescript/a.ts"]), "0");
+}
+
+#[test]
+fn go_query_is_1_when_the_selection_is_full() {
+    assert_eq!(go_query(&["wire/src/lib.rs"]), "1");
+    assert_eq!(go_query(&["Cargo.toml"]), "1");
+}
+
+#[test]
+fn go_query_in_base_mode_sees_an_untracked_go_file() {
+    let repo = scratch_repo();
+    let root = repo.path();
+    assert_eq!(selection_in(root, &["--go", "--base", "release-9.9.9"]), "0");
+    write_file(root, "plugins/go/main.go", "package main\n");
+    assert_eq!(selection_in(root, &["--go", "--base", "release-9.9.9"]), "1");
+}
+
 #[test]
 fn base_mode_sees_a_file_moved_out_of_wire() {
     let repo = scratch_repo();

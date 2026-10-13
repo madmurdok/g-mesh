@@ -87,6 +87,15 @@ elif args[:2] == ["nextest", "run"] and "--no-run" not in args:
     print("     Summary [   0.1s] 1 test run: 1 passed, 0 skipped")
 "#;
 
+/// The stand-in `go`: appends `<cwd>|<args>` to `$FAKE_GO_LOG`, exits
+/// `$FAKE_GO_EXIT` (default 0).
+const FAKE_GO: &str = r#"#!/bin/sh
+echo "$PWD|$*" >> "$FAKE_GO_LOG"
+code="${FAKE_GO_EXIT:-0}"
+if [ "$code" -eq 0 ]; then echo "ok  	example/go	0.01s"; else echo "FAIL	example/go	0.01s"; fi
+exit "$code"
+"#;
+
 /// One recorded `cargo` call.
 struct Call {
     args: Vec<String>,
@@ -112,6 +121,13 @@ impl Call {
 /// Runs `scripts/test-local.sh args` with the stand-in cargo and
 /// `extra_env`, returning its output and the recorded calls.
 fn run_local(args: &[&str], extra_env: &[(&str, &str)]) -> (Output, Vec<Call>) {
+    let (output, calls, _) = run_local_go(args, extra_env, true);
+    (output, calls)
+}
+
+/// `run_local` that also returns the stand-in `go`'s calls (`<cwd>|<args>`).
+/// Without `with_go` no `go` is on `PATH` at all.
+fn run_local_go(args: &[&str], extra_env: &[(&str, &str)], with_go: bool) -> (Output, Vec<Call>, Vec<String>) {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -119,11 +135,24 @@ fn run_local(args: &[&str], extra_env: &[(&str, &str)]) -> (Output, Vec<Call>) {
     fs::write(&cargo, FAKE_CARGO).unwrap();
     fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
     let log = dir.path().join("cargo-calls.jsonl");
+    let go_log = dir.path().join("go-calls.txt");
+    let mut path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    if with_go {
+        let go = bin.join("go");
+        fs::write(&go, FAKE_GO).unwrap();
+        fs::set_permissions(&go, fs::Permissions::from_mode(0o755)).unwrap();
+    } else {
+        // Only the system directories, where no `go` lives.
+        path = format!("{}:/usr/bin:/bin", bin.display());
+        assert!(!Path::new("/usr/bin/go").exists() && !Path::new("/bin/go").exists());
+    }
 
     let mut cmd = Command::new("bash");
     cmd.arg(repo_root().join("scripts/test-local.sh"))
         .args(args)
-        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+        .env("PATH", path)
+        .env("FAKE_GO_LOG", &go_log)
+        .env_remove("FAKE_GO_EXIT")
         .env("CARGO_TARGET_DIR", dir.path().join("target"))
         .env("FAKE_CARGO_LOG", &log)
         .env_remove("G_MESH_CONTAINERS_SEEDS")
@@ -151,7 +180,8 @@ fn run_local(args: &[&str], extra_env: &[(&str, &str)]) -> (Output, Vec<Call>) {
             }
         })
         .collect();
-    (output, calls)
+    let go_calls = fs::read_to_string(&go_log).unwrap_or_default().lines().map(str::to_owned).collect();
+    (output, calls, go_calls)
 }
 
 /// A `--paths-from` file listing `paths`, kept alive by the returned dir.
@@ -363,6 +393,117 @@ fn full_takes_no_other_option() {
         assert_eq!(output.status.code(), Some(2), "{args:?}\n{}", describe(&output));
         assert!(calls.is_empty(), "{args:?}: cargo was called");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The Go step (GM-573): `go test ./...` in plugins/go
+
+const GO_CALL: &str = "plugins/go|test ./...";
+
+/// The stand-in `go`'s calls with the repo root cut off the directory.
+fn go_calls_of(go: &[String]) -> Vec<String> {
+    let root = fs::canonicalize(repo_root()).unwrap();
+    go.iter().map(|c| c.replace(&format!("{}/", root.display()), "")).collect()
+}
+
+#[test]
+fn a_go_plugin_diff_runs_go_test_in_plugins_go() {
+    let (_dir, file) = paths_file(&["plugins/go/main.go"]);
+    let (output, _, go) = run_local_go(&["--paths-from", &file], &[], true);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert_eq!(go_calls_of(&go), [GO_CALL], "{}", describe(&output));
+    let stdout = stdout_of(&output);
+    assert!(stdout.contains("(+ go tests)"), "{}", describe(&output));
+    assert!(stdout.contains("== go: PASS"), "{}", describe(&output));
+}
+
+#[test]
+fn a_diff_without_a_go_path_never_runs_go() {
+    let (_dir, file) = paths_file(&["core/src/cli/status.rs", "plugins/rust/src/lib.rs", "docs/a.md"]);
+    let (output, _, go) = run_local_go(&["--paths-from", &file], &[], true);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert!(go.is_empty(), "go ran: {go:?}");
+    assert!(!stdout_of(&output).contains("== go:"), "{}", describe(&output));
+}
+
+/// A Go-only diff selects core sections too, but a docs-only diff selects
+/// nothing and must still exit early without a Go step.
+#[test]
+fn a_docs_only_diff_runs_nothing_including_go() {
+    let (_dir, file) = paths_file(&["docs/a.md"]);
+    let (output, calls, go) = run_local_go(&["--paths-from", &file], &[], false);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert!(calls.is_empty() && go.is_empty());
+    assert!(stdout_of(&output).contains("== no sections selected"), "{}", describe(&output));
+}
+
+#[test]
+fn full_always_runs_the_go_step() {
+    let (output, _, go) = run_local_go(&["--full"], &[], true);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert_eq!(go_calls_of(&go), [GO_CALL], "{}", describe(&output));
+}
+
+#[test]
+fn dry_run_names_the_go_step_and_runs_no_go() {
+    let (_dir, file) = paths_file(&["plugins/go/main.go"]);
+    let (output, _, go) = run_local_go(&["--dry-run", "--paths-from", &file], &[], true);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert!(go.is_empty(), "go ran under --dry-run: {go:?}");
+    assert!(stdout_of(&output).contains("== go: go test ./... (in plugins/go)"), "{}", describe(&output));
+}
+
+#[test]
+fn a_failing_go_test_fails_the_run() {
+    let (_dir, file) = paths_file(&["plugins/go/main.go"]);
+    let (output, _, go) = run_local_go(&["--paths-from", &file], &[("FAKE_GO_EXIT", "1")], true);
+    assert_eq!(go.len(), 1, "{}", describe(&output));
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(stdout_of(&output).contains("== go: FAIL"), "{}", describe(&output));
+
+    let (output, _, _) = run_local_go(&["--full"], &[("FAKE_GO_EXIT", "1")], true);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(stdout_of(&output).contains("== go: FAIL"), "{}", describe(&output));
+}
+
+#[test]
+fn a_missing_go_toolchain_fails_a_go_diff_and_never_skips() {
+    let (_dir, file) = paths_file(&["plugins/go/main.go"]);
+    let (output, _, go) = run_local_go(&["--paths-from", &file], &[], false);
+    assert!(go.is_empty());
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(stdout_of(&output).contains("== go: FAIL, the go toolchain is not installed"), "{}", describe(&output));
+
+    let (output, _, _) = run_local_go(&["--full"], &[], false);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(stdout_of(&output).contains("== go: FAIL, the go toolchain is not installed"), "{}", describe(&output));
+}
+
+/// A diff with no Go path needs no toolchain.
+#[test]
+fn a_missing_go_toolchain_is_fine_when_the_diff_has_no_go_path() {
+    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let (output, _, _) = run_local_go(&["--paths-from", &file], &[], false);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+}
+
+#[test]
+fn an_earlier_failure_skips_the_go_step_unless_keep_going() {
+    let (_dir, file) = paths_file(&["plugins/go/main.go"]);
+    let failing = [("FAKE_CARGO_TEST_EXIT", "101")];
+
+    let (output, _, go) = run_local_go(&["--paths-from", &file], &failing, true);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(go.is_empty(), "go ran after an earlier failure: {go:?}");
+    assert!(
+        stdout_of(&output).contains("== go: not run, an earlier part failed"),
+        "{}",
+        describe(&output)
+    );
+
+    let (output, _, go) = run_local_go(&["--keep-going", "--paths-from", &file], &failing, true);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert_eq!(go_calls_of(&go), [GO_CALL], "{}", describe(&output));
 }
 
 // ---------------------------------------------------------------------------
