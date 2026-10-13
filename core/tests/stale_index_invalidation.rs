@@ -50,12 +50,24 @@ struct Project {
 }
 
 impl Project {
+    /// Each fixture file is backdated an hour, as a real project's files are
+    /// older than its walk. The walk records no staleness baseline for a file
+    /// modified within `WALK_BASELINE_MTIME_MARGIN` of its start, and a
+    /// restarted daemon's offline-change reconcile reindexes every file
+    /// without one, which would put the stripped import edges back and race
+    /// the query made right after the restart.
     fn new() -> Self {
         let project = Self { dir: tempfile::tempdir().expect("failed to create a temp project root") };
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         for (rel, contents) in FILES {
             let path = project.root().join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create a fixture directory");
             std::fs::write(&path, contents).expect("failed to write a fixture file");
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(an_hour_ago))
+                .expect("failed to backdate a fixture file's mtime");
         }
         project
     }
