@@ -24,9 +24,14 @@
 //!
 //! The test process's own environment is scrubbed of everything cargo and
 //! rustup set for it (`RUSTUP_TOOLCHAIN`, `CARGO`, `RUSTC_WRAPPER`, ...), and
-//! `PATH` starts with rustup's proxy directory: otherwise the inherited pin
-//! would hide a missing one, and `rust-analyzer` on `PATH` would be the real
-//! binary rather than the proxy a user's daemon finds. The working directory
+//! `PATH` starts with a directory of rustup proxies: otherwise the inherited
+//! pin would hide a missing one, and `rust-analyzer` on `PATH` would be the
+//! real binary rather than the proxy a user's daemon finds. The test makes
+//! that directory itself (`cargo`, `rustc`, `rust-analyzer` linked to the
+//! `rustup` on `PATH`, which dispatches on its program name exactly as an
+//! installed proxy does) instead of assuming the directory holding `rustup`
+//! also holds the proxies: on a Homebrew rustup (the macOS arm64 runner) it
+//! does not (GM-574). The working directory
 //! is the fixture, as a daemon started there would have it: the proxy picks
 //! its toolchain from the working directory.
 //!
@@ -45,8 +50,8 @@ use g_mesh_plugin_sdk::{walk_project, Extractor, RelPath, SdkIndex, MANIFEST_PAT
 struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("g-mesh-rust-gm513-{}", std::process::id()));
+    fn new(name: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("g-mesh-rust-gm513-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         Scratch(root.canonicalize().unwrap())
@@ -64,10 +69,11 @@ fn write(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-/// The real toolchain: rustup's default, asked outside any project, and the
-/// absolute binaries in it.
+/// The real toolchain: rustup's default, asked outside any project, the
+/// absolute binaries in it, and a directory of rustup proxies.
 struct RealToolchain {
     proxy_dir: PathBuf,
+    _proxies: Scratch,
     rustc: PathBuf,
     cargo: PathBuf,
     rust_analyzer: PathBuf,
@@ -95,19 +101,39 @@ fn real_toolchain() -> RealToolchain {
         rust_analyzer.display()
     );
     let rustup_bin = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|dir| dir.join("rustup"))
+        .map(|dir| dir.join(format!("rustup{}", std::env::consts::EXE_SUFFIX)))
         .find(|candidate| candidate.is_file())
         .expect("rustup is on PATH");
+    let proxies = Scratch::new("proxies");
+    link_rustup_proxies(&proxies.0, &rustup_bin);
     RealToolchain {
-        proxy_dir: rustup_bin.parent().unwrap().to_path_buf(),
+        proxy_dir: proxies.0.clone(),
+        _proxies: proxies,
         rustc: which("rustc"),
         cargo: which("cargo"),
         rust_analyzer,
     }
 }
 
-/// Clears what cargo and rustup set for this test process, and puts rustup's
-/// proxies first on `PATH`.
+/// Links `cargo`, `rustc` and `rust-analyzer` in `dir` to `rustup`: rustup
+/// runs as the proxy its program name says, which is all an installed proxy
+/// is. Not the directory `rustup` sits in: whether that one holds the proxies
+/// is the installer's choice (rustup-init's `~/.cargo/bin` does, Homebrew's
+/// `bin` does not), and a missing one is a spawn error, not a finding.
+fn link_rustup_proxies(dir: &Path, rustup: &Path) {
+    for name in ["cargo", "rustc", "rust-analyzer"] {
+        let proxy = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(rustup, &proxy).unwrap();
+        #[cfg(not(unix))]
+        if std::fs::hard_link(rustup, &proxy).is_err() {
+            std::fs::copy(rustup, &proxy).unwrap();
+        }
+    }
+}
+
+/// Clears what cargo and rustup set for this test process, and puts the
+/// rustup proxies first on `PATH`.
 fn scrub_environment(proxy_dir: &Path) {
     let names: Vec<String> = std::env::vars_os()
         .filter_map(|(name, _)| name.into_string().ok())
@@ -304,7 +330,7 @@ fn assert_the_hostile_config_is_in_force(fixture: &Fixture, real: &RealToolchain
 #[test]
 fn rust_analyzer_runs_no_build_script_proc_macro_toolchain_or_rustc_the_project_names() {
     let real = real_toolchain();
-    let scratch = Scratch::new();
+    let scratch = Scratch::new("project");
     let fixture = write_fixture(&scratch.0, &real);
     scrub_environment(&real.proxy_dir);
     std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));

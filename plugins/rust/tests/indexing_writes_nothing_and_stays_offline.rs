@@ -149,9 +149,15 @@ fn rustup(args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// rustup's proxy directory, after checking the default toolchain has a
-/// working rust-analyzer.
-fn proxy_dir() -> PathBuf {
+/// A directory of rustup proxies made in `dir`, after checking the default
+/// toolchain has a working rust-analyzer.
+///
+/// `cargo`, `rustc` and `rust-analyzer` are linked to the `rustup` on `PATH`,
+/// which runs as the proxy its program name says - all an installed proxy
+/// is. Not the directory `rustup` sits in: whether that one holds the proxies
+/// is the installer's choice (rustup-init's `~/.cargo/bin` does, Homebrew's
+/// `bin` does not, GM-574).
+fn proxy_dir(dir: &Path) -> PathBuf {
     let default = rustup(&["default"]);
     let pin = default.split_whitespace().next().expect("`rustup default` names a toolchain").to_string();
     let rust_analyzer = PathBuf::from(rustup(&["which", "--toolchain", &pin, "rust-analyzer"]));
@@ -160,13 +166,21 @@ fn proxy_dir() -> PathBuf {
         "{} does not answer --version: install it with `rustup component add rust-analyzer`",
         rust_analyzer.display()
     );
-    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|dir| dir.join("rustup"))
+    let rustup = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join(format!("rustup{}", std::env::consts::EXE_SUFFIX)))
         .find(|candidate| candidate.is_file())
-        .expect("rustup is on PATH")
-        .parent()
-        .unwrap()
-        .to_path_buf()
+        .expect("rustup is on PATH");
+    std::fs::create_dir_all(dir).unwrap();
+    for name in ["cargo", "rustc", "rust-analyzer"] {
+        let proxy = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&rustup, &proxy).unwrap();
+        #[cfg(not(unix))]
+        if std::fs::hard_link(&rustup, &proxy).is_err() {
+            std::fs::copy(&rustup, &proxy).unwrap();
+        }
+    }
+    dir.to_path_buf()
 }
 
 /// Clears what cargo and rustup set for this test process, puts rustup's
@@ -288,8 +302,8 @@ fn index_and_check(root: &Path, sink: &Sink, what: &str) {
 
 #[test]
 fn indexing_reaches_no_network_and_writes_nothing_under_the_root() {
-    let proxies = proxy_dir();
     let scratch = Scratch::new();
+    let proxies = proxy_dir(&scratch.0.join("rustup-proxies"));
     let sink = Sink::start();
     let cargo_home = scratch.0.join("cargo-home");
     std::fs::create_dir_all(&cargo_home).unwrap();
