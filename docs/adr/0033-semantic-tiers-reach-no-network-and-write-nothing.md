@@ -48,8 +48,10 @@ nothing under the project root.
   checksums it records in the user's `GOSUMDB` directly, not through
   `GOPROXY`, sending module paths there (measured, go1.27: `CONNECT
   sum.golang.org:443`; a private path too if `GOPRIVATE` were cleared). With
-  `GOPROXY=off` nothing is downloaded, so turning the checksum database off
-  weakens no verification. `GOINSECURE` and `GONOSUMDB` re-enable no fetch
+  `GOPROXY=off` nothing is downloaded. The cost: in the exception below, the
+  hashes go records in `go.work.sum` come from the module cache without a
+  checksum-database check (the cache was checked when it was filled); the
+  owner accepted this over sending module paths out. `GOINSECURE` and `GONOSUMDB` re-enable no fetch
   with `GOPROXY=off` (measured), so they stay the user's.
 - **D4 - go: an explicit `-mod` build flag.** `-mod=vendor` when the
   governing `go.work` (else `go.mod`) has `vendor/modules.txt` beside it,

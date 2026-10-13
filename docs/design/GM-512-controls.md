@@ -48,7 +48,7 @@ intended failure.
 | C10 | `plugins/go/semantic.go`, `modFlag` | both `return "-mod=readonly"` in the `go env` error branches become `return ""` | `TestModFlagFallsBackToReadonlyWhenGoEnvFails` (both subtests) | "modFlag with a broken `go env` = \"\", want -mod=readonly" |
 | C11 | `plugins/go/semantic.go`, `modFlag` | `cmd.Env = env` becomes `cmd.Env = os.Environ()` (`go env` no longer runs under the load's env) | `TestModFlagFollowsTheGoverningFile` | subtests `GO111MODULE=off`, `GO111MODULE=off, vendored`, `GOWORK=off ...`: the settings passed only in the env slice are lost |
 | C12 | `plugins/go/semantic.go`, `loadEnv` | remove `"GONOPROXY=-",` from the appended list | `TestSemanticPassFetchesNoPrivateModuleDirectly` (both subtests) | "the semantic pass connected out with GOPRIVATE=example.com: [CONNECT example.com:443 ...]", same for GONOPROXY |
-| C13 | `plugins/go/semantic.go`, `loadEnv` | remove `"GOSUMDB=off"` from the appended list (and the comma before it) | `TestSemanticPassInAWorkspaceWritesOnlyGoWorkSum` | "the semantic pass connected out in the workspace: [CONNECT sum.golang.org:443 ...]" |
+| C13 | `plugins/go/semantic.go`, `loadEnv` | remove `"GOSUMDB=off"` from the appended list (and the comma before it) | `TestSemanticPassInAWorkspaceWritesOnlyGoWorkSum` | fails on the missing `useDep` edge (sanity check near test line 193): without GOSUMDB=off the offline lookup fails before the connect assertion is reached |
 
 The go.work.sum write in a workspace whose member go.sum lacks entries for
 cached modules is go's own, the owner-accepted exception in ADR 0033: it is

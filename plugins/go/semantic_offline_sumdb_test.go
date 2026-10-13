@@ -38,8 +38,8 @@ func proxyThroughSink(t *testing.T, sink *networkSink) {
 	t.Setenv("GIT_TERMINAL_PROMPT", "0")
 }
 
-// loadEnvWithout is loadEnv() minus the entries given: the load's
-// environment as it was before that setting existed.
+// loadEnvWithout is loadEnv() minus the entries given, so a sanity check can
+// show what go does without one of them.
 func loadEnvWithout(drop ...string) []string {
 	var env []string
 	for _, entry := range loadEnv() {

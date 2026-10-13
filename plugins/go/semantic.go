@@ -369,8 +369,9 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 //
 // GOSUMDB=off: go still looks up checksums it records for modules already in
 // GOMODCACHE (go.work.sum in workspace mode), and that lookup goes to the
-// checksum database directly, not through GOPROXY. Nothing is downloaded, so
-// there is nothing for the checksum database to verify.
+// checksum database directly, not through GOPROXY. With it off, the hashes
+// recorded in go.work.sum come from the module cache unchecked against the
+// checksum database; nothing is downloaded.
 func loadEnv() []string {
 	return append(os.Environ(),
 		"GOTOOLCHAIN=local", "GOPACKAGESDRIVER=off", "GOPROXY=off", "GONOPROXY=-",
