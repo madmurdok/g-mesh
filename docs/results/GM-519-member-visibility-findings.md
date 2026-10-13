@@ -282,3 +282,12 @@ Result: TS 82 `kind_mismatch`, Go 114 `ambiguous_at_address`, Rust 51
 rows were listed with their candidate's file, kind and visibility, and the
 same-file split compares `placeholder_targets.fromFile` with the candidate's
 `filePath`.
+
+## Owner decisions (2026-10-13)
+
+- D1: "B: семантика мимо видимости" (B over the recommended C).
+- D2: "C1: отбрасывать члены типа (Recommended)".
+- D3: "Через B (если B в D1)".
+- D4: "Две задачи в бэклог (Recommended)".
+
+Each becomes a backlog task; no production change in GM-519.
