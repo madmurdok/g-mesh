@@ -28,8 +28,8 @@ excalidraw (655 TS/JS files) without and with `node_modules`.
    they never reach the bridge.
 
 Two costs: a cold vtsls spends 13-33 s loading projects on a project of this
-size, and without `node_modules` tsserver's automatic type acquisition
-downloads `@types/*` into a machine-wide cache during the pass.
+size. Automatic type acquisition is off (`plugin.toml`), so a project
+without `node_modules` gets no `@types/*` download during the pass.
 
 ## Cold start
 

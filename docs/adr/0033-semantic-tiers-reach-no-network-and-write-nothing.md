@@ -36,13 +36,6 @@ nothing under the project root.
   `.cargo/config.toml` `net.offline`.
 - **D2 - python: no `npx`.** Done by ADR 0032 D4; pyright comes from `PATH`
   only. Nothing further.
-- **D5 - TypeScript: no `npx`, no automatic type acquisition.** Added
-  2026-10-13 (GM-566). vtsls comes from `PATH` only (ADR 0032 D7), which
-  removes the per-start registry contact of the `npx` candidate.
-  `typescript.disableAutomaticTypeAcquisition = true`
-  (`plugins/typescript/plugin.toml`): with it on, opening a JavaScript file
-  made tsserver's typings installer run `npm install types-registry@latest`
-  and `npm install @types/<dependency>` against the registry (measured).
 - **D3 - go: `GOPROXY=off`, `GONOPROXY=-` and `GOSUMDB=off`, always.** Appended to
   `go list`'s environment (`plugins/go/semantic.go`, `loadEnv`); later
   entries win over the user's. `GOPROXY=off` alone covers only modules go
@@ -68,6 +61,13 @@ nothing under the project root.
   counts as well as the process environment. A
   command-line `-mod` overrides only the `-mod` in the user's `GOFLAGS`; the
   user's other flags stay. `GOFLAGS` itself is not replaced.
+- **D5 - TypeScript: no `npx`, no automatic type acquisition.** Added
+  2026-10-13 (GM-566). vtsls comes from `PATH` only (ADR 0032 D7), which
+  removes the per-start registry contact of the `npx` candidate.
+  `typescript.disableAutomaticTypeAcquisition = true`
+  (`plugins/typescript/plugin.toml`): with it on, opening a JavaScript file
+  made tsserver's typings installer run `npm install types-registry@latest`
+  and `npm install @types/<dependency>` against the registry (measured).
 
 Exception, documented rather than prevented (owner decision): **go itself
 writes `go.work.sum` in workspace mode.** Trigger: the governing `go.work`
