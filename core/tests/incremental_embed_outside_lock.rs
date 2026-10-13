@@ -270,25 +270,39 @@ fn outline_symbol_names(response: &Value) -> Vec<String> {
 /// (`daemon::lifecycle`'s "Lock order" section) and which this test is
 /// deliberately not about: only `conn`'s lock is what GM-396 changes.
 ///
-/// # Why `b.ts` needs a warm-up query first
+/// # Why the fixtures are backdated, and the warm-up query
 ///
-/// `indexed_files` - the table `watcher::staleness::ensure_fresh`'s two-tier
-/// check reads - is written only by that check itself, never by a bulk walk
-/// (`g-mesh init`'s own walk, or a daemon's cold start, populate `nodes`/
-/// `edges`, not this table). So immediately after `init_project`, *every*
-/// file looks "never indexed" to `is_stale`, `b.ts` included - querying it
-/// cold would need a real round trip of its own (`Decision::NeedsReindex`),
-/// which would then compete for the very same
+/// `b.ts` must hit `is_stale`'s fast path - a stat against its
+/// `indexed_files` baseline, the table `watcher::staleness::ensure_fresh`'s
+/// two-tier check reads - when the measured query arrives. Without a
+/// baseline it would look "never indexed" and need a real round trip of its
+/// own (`Decision::NeedsReindex`), competing for the very same
 /// `PluginSupervisor::inner`/`PluginProcess::state` lock `a.ts`'s reparse is
-/// holding, and defeat the point of using `b.ts` as an unrelated control at
-/// all. One query for `b.ts` before the hold is armed records its baseline
-/// the ordinary way an `ensure_fresh` slow path always does, so the query
-/// this test actually measures hits `is_stale`'s fast path as intended.
+/// holding, which defeats the point of using `b.ts` as an unrelated control.
+///
+/// A bulk walk (`g-mesh init`'s here) records a baseline only for a file
+/// whose mtime predates the walk's start by
+/// `watcher::staleness::WALK_BASELINE_MTIME_MARGIN`; fixtures written just
+/// before `init` do not, so both are dated an hour back
+/// (`common::backdate_an_hour`). That also keeps the daemon's startup
+/// offline-change reconcile from sending round trips of its own that the
+/// hold could catch in place of the edit's. The warm-up
+/// query for `b.ts` before the hold is armed then only confirms the daemon
+/// serves it from the index; were a baseline still missing, it would record
+/// one the ordinary way an `ensure_fresh` slow path does, before the hold.
 #[test]
 fn a_tool_call_against_an_unrelated_file_is_not_blocked_by_a_reparses_lock_free_embedding_window() {
     let mut project = Project::new();
     project.write("src/a.ts", "export function alpha(): number {\n  return 1;\n}\n");
     project.write("src/b.ts", "export function beta(): number {\n  return 2;\n}\n");
+    // Dated back so that `init`'s walk records both baselines: otherwise the
+    // daemon's offline-change reconcile sends its own round trips
+    // for them at startup, and one still in flight when the hold is armed
+    // below is caught in place of the edit's - wedging the watcher's consumer
+    // the edit has to go through.
+    for file in ["src/a.ts", "src/b.ts"] {
+        common::backdate_an_hour(&project.root().join(file));
+    }
 
     init_project(project.root());
 

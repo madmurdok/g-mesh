@@ -79,8 +79,14 @@ impl Project {
         Connection::open(db).expect("failed to open the project's index")
     }
 
-    /// Builds the project's index the way a user does, with `g-mesh init`.
+    /// Builds the project's index the way a user does, with `g-mesh init`,
+    /// over the fixtures dated an hour back first, so that the
+    /// walk records their baselines and the next daemon start's offline-change
+    /// reconcile finds nothing to reindex (`common::backdate_an_hour`).
     fn init(&self) {
+        for (rel, _) in FILES {
+            common::backdate_an_hour(&self.root().join(rel));
+        }
         let init = std::process::Command::new(BIN)
             .arg("init")
             .current_dir(self.root())
