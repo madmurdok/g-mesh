@@ -36,8 +36,19 @@ nothing under the project root.
   `.cargo/config.toml` `net.offline`.
 - **D2 - python: no `npx`.** Done by ADR 0032 D4; pyright comes from `PATH`
   only. Nothing further.
-- **D3 - go: `GOPROXY=off`, always.** Appended to `go list`'s environment
-  (`plugins/go/semantic.go`, `loadEnv`); later entries win over the user's.
+- **D3 - go: `GOPROXY=off` and `GONOPROXY=-`, always.** Appended to
+  `go list`'s environment (`plugins/go/semantic.go`, `loadEnv`); later
+  entries win over the user's. `GOPROXY=off` alone covers only modules go
+  fetches through the proxy list: a module matched by `GONOPROXY` (which
+  defaults to `GOPRIVATE`, from the environment or `go env -w`) is fetched
+  directly from its host, `https://<path>?go-get=1` then a VCS clone, and
+  `GOVCS=*:off` does not stop the HTTPS step. `GONOPROXY=-` is a pattern no
+  module path matches (a path never begins with `-`), so every module goes
+  through `off`. `GOPRIVATE` itself is left alone: clearing it would also
+  clear `GONOSUMDB`'s default and send private module paths to the checksum
+  database (measured, go1.27: `CONNECT sum.golang.org` under the exception
+  below). `GOINSECURE` and `GONOSUMDB` re-enable no fetch with
+  `GOPROXY=off` (measured), so they stay the user's.
 - **D4 - go: an explicit `-mod` build flag.** `-mod=vendor` when the
   governing `go.work` (else `go.mod`) has `vendor/modules.txt` beside it,
   `-mod=readonly` otherwise, none outside module mode (`modFlag`). The
@@ -46,6 +57,20 @@ nothing under the project root.
   counts as well as the process environment. A
   command-line `-mod` overrides only the `-mod` in the user's `GOFLAGS`; the
   user's other flags stay. `GOFLAGS` itself is not replaced.
+
+Exception, documented rather than prevented (owner decision): **go itself
+writes `go.work.sum` in workspace mode.** Trigger: the governing `go.work`
+has no `vendor/modules.txt` beside it (so the flag is `-mod=readonly`), and
+a member module's `go.sum` lacks the entries for a required module that is
+in `GOMODCACHE`. go then records those checksums in `go.work.sum` beside
+`go.work`, under the project root; `-mod=readonly` does not apply its go.sum
+check in workspace mode. In the same trigger go may first look the checksums
+up in the user's `GOSUMDB` (not `GOPROXY`), unless `GONOSUMDB` (by default
+`GOPRIVATE`) matches the module or the lookup is already in the local
+checksum-database cache; that host is the user's setting, never the
+project's. Module mode (`GOWORK=off`, or no `go.work`) writes nothing, and a
+member whose `go.sum` is complete writes nothing. A test pins the exception
+so a go release that changes it shows up.
 
 Not set: `GOSUMDB=off` (would weaken verification if anything ever did
 download), `GOMODCACHE`/`GOCACHE`/`CARGO_HOME` (the user's, outside the root).
@@ -65,6 +90,10 @@ config (works only for a user whose npm cache already holds pyright).
 - With the network down, cached dependencies now resolve where before the
   online attempt failed the whole `cargo metadata`.
 - A Go user with `GOFLAGS=-mod=mod` no longer has `go.mod` tidied by g-mesh.
+- A Go module matched by the user's `GOPRIVATE`/`GONOPROXY` and missing from
+  `GOMODCACHE` is not fetched either; it loses its edges like any other.
+- A Go workspace whose members' `go.sum` files are incomplete can gain a
+  `go.work.sum` (the exception above).
 - `Cargo.lock` is not written because rust-analyzer 1.97.1 passes
   `-Zlockfile-path`; an older rust-analyzer may write one. No configuration
   of ours prevents that; the tests pin it for the version CI installs.

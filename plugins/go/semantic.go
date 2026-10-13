@@ -55,10 +55,15 @@ package main
 //
 // # What `go list` may touch
 //
-// No network and nothing under the project root: GOPROXY=off, so a module
-// missing from GOMODCACHE fails to load instead of being downloaded, and
+// No network and nothing under the project root: GOPROXY=off with a
+// GONOPROXY that matches nothing, so a module missing from GOMODCACHE fails
+// to load instead of being downloaded, private or not, and
 // `-mod=readonly` (or `-mod=vendor` for a vendored module or workspace) as a
-// build flag, so `go list` never rewrites go.mod or go.sum. The build flag
+// build flag, so `go list` never rewrites go.mod or go.sum. One exception go
+// itself makes: in workspace mode, when a member's go.sum lacks entries for a
+// module in GOMODCACHE, go adds them to go.work.sum beside go.work, under
+// `-mod=readonly` too, and may look them up in the user's GOSUMDB first
+// (unless GONOSUMDB, by default GOPRIVATE, matches). The build flag
 // overrides only `-mod` in the user's GOFLAGS; the rest of it still applies.
 // Imports of a module that is not in the cache do not type-check; local code
 // still resolves. See [loadEnv], [modFlag] and
@@ -356,8 +361,16 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 // the Go toolchain pinned to the installed one, no packages driver and no
 // module proxy (so nothing is downloaded). Later entries win, so these
 // override the user's own settings.
+//
+// GOPROXY=off covers only modules fetched through the proxy list: a module
+// matched by GONOPROXY (which defaults to GOPRIVATE) is fetched directly from
+// its host whatever GOPROXY says. GONOPROXY is therefore set to "-", a
+// pattern no module path matches (a path never begins with '-'). GOPRIVATE is
+// left alone, so GONOSUMDB keeps defaulting to it and private module paths
+// are never sent to the checksum database.
 func loadEnv() []string {
-	return append(os.Environ(), "GOTOOLCHAIN=local", "GOPACKAGESDRIVER=off", "GOPROXY=off")
+	return append(os.Environ(),
+		"GOTOOLCHAIN=local", "GOPACKAGESDRIVER=off", "GOPROXY=off", "GONOPROXY=-")
 }
 
 // modFlag is the `-mod` build flag `go list` runs with from dir under env,
