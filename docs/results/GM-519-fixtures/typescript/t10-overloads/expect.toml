@@ -1,0 +1,6 @@
+# The top-level `format` cannot be anchored by name here (it and
+# Formatter#format share a file), so only the overloaded member is asserted.
+[[callers]]
+symbol = "Formatter#format"
+file = "src/fmt.ts"
+expect = ["src/main.ts:both"]

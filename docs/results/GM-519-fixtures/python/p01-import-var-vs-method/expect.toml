@@ -1,0 +1,4 @@
+[[callers]]
+symbol = "Router.handler"
+file = "pkg/x.py"
+expect = []

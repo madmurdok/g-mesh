@@ -1,0 +1,4 @@
+[[callers]]
+symbol = "ServiceImpl#start"
+file = "src/svc.ts"
+expect = ["src/main.ts:boot"]

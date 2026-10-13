@@ -1,0 +1,4 @@
+[[callers]]
+symbol = "Engine#ignite"
+file = "src/impl.ts"
+expect = ["src/main.ts:go"]

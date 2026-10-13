@@ -1,0 +1,4 @@
+[[callers]]
+symbol = "describe"
+file = "src/lib.rs"
+expect = ["src/lib.rs:view::render"]

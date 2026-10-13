@@ -1,0 +1,8 @@
+[[callers]]
+symbol = "Meter.read"
+file = "meter/meter.go"
+expect = ["meter/report.go:Show"]
+[[callers]]
+symbol = "Show"
+file = "meter/report.go"
+expect = ["meter/meter_ext_test.go:TestShow"]

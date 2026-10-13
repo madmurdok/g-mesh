@@ -1,0 +1,4 @@
+[[callers]]
+symbol = "Base#log"
+file = "src/base.ts"
+expect = ["src/child.ts:Child#run"]
