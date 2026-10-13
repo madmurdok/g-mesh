@@ -92,7 +92,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind};
+
+use crate::process::{is_process, process_snapshot};
 
 /// One `sysinfo` snapshot's worth of truth about a process tree: every member
 /// the walk from `root_pid` reached, each with its own resident memory, and
@@ -180,8 +182,10 @@ pub fn process_tree_rss_mb(root_pid: u32) -> Option<u64> {
 /// `root_pid` absent from a fresh whole-system snapshot, or process
 /// enumeration answering nothing at all on this platform/build.
 pub fn process_tree_sample(root_pid: u32) -> Option<ProcessTreeSample> {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
+    // Processes only, never threads: on Linux each thread would otherwise be
+    // listed as a child of its process carrying that whole process's RSS, so
+    // a tree's total would count every process once per thread.
+    let system = process_snapshot(ProcessRefreshKind::nothing().with_memory());
 
     let root = Pid::from_u32(root_pid);
     // Confirmed present before anything else: a `root_pid` gone from this
@@ -197,7 +201,7 @@ pub fn process_tree_sample(root_pid: u32) -> Option<ProcessTreeSample> {
     // second sysinfo call per child, however many generations deep the tree
     // goes.
     let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
-    for (pid, process) in system.processes() {
+    for (pid, process) in system.processes().iter().filter(|(_, p)| is_process(p)) {
         if let Some(parent) = process.parent() {
             children.entry(parent).or_default().push(*pid);
         }
