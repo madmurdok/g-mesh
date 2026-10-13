@@ -1,0 +1,9 @@
+[[callers]]
+symbol = "Box"
+file = "src/box.ts"
+expect = []
+
+[[callers]]
+symbol = "Opts"
+file = "src/box.ts"
+expect = []

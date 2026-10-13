@@ -2,3 +2,8 @@
 symbol = "Router#handler"
 file = "src/x.ts"
 expect = []
+
+[[callers]]
+symbol = "handler"
+file = "src/x.ts"
+expect = ["src/main.ts:run"]

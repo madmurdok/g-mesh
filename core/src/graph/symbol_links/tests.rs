@@ -4534,3 +4534,184 @@ fn a_file_visible_declaration_arriving_late_wakes_an_engine_answer() {
     assert_eq!(link_diff(&mut conn, &declaration).unwrap(), LinkSummary { linked_edges: 1 });
     assert_eq!(edge_target(&conn, &edge_id), (TS_SERVICE_START.to_string(), true));
 }
+
+// --- An engine's exact call answer may land on a Variable or a Type ------
+//
+// A semantic tier resolves a call to whatever it calls: a function bound to
+// a `const`, or a tuple struct called as its constructor. Its exact `CALLS`
+// answer accepts `Function`, then `Variable`, then `Type`; every other
+// `CALLS` still lands only on a `Function`. See
+// docs/adr/0035-engine-calls-answers-kind-rule.md.
+
+const TS_CONST_HANDLER: &str = "Variable:src/x.ts:handler";
+const RUST_TUPLE_STRUCT: &str = "Type:src/util.rs:mycrate::util::Pair";
+
+/// The barrel shape of a TS `export const handler = make()` beside a class
+/// method of the same name (`Router.handler`), and a Rust tuple struct
+/// `mycrate::util::Pair` called as `Pair(1)` from the sibling module
+/// `mycrate::prelude`. Both calls are sent as exact answers with `source`
+/// and linked by `link_all`. Returns `(const call, constructor call)`.
+fn calls_onto_non_functions(source: &str) -> (Connection, [String; 2], LinkSummary) {
+    let mut conn = setup();
+    let mut method = symbol("src/x.ts", "Router.handler", "Function", false);
+    method.name = "handler".to_string();
+    let mut nodes = vec![
+        symbol("src/main.ts", "run", "Function", true),
+        symbol("src/x.ts", "handler", "Variable", true),
+        symbol("src/x.ts", "Router", "Type", true),
+        method,
+        member(rust_prelude(), "Function", "mycrate::prelude::marker", Vis::Public),
+        member(rust_util(), "Type", "mycrate::util::Pair", Vis::Public),
+    ];
+    nodes.extend(rust_lib_nodes());
+    upsert(&mut conn, nodes);
+
+    let const_call = use_from_source(
+        &mut conn,
+        "Function:src/main.ts:run",
+        "CALLS",
+        exact_placeholder("src/main.ts", "src/x.ts", "handler"),
+        source,
+    );
+    let constructor_call = use_from_source(
+        &mut conn,
+        "Function:src/prelude.rs:mycrate::prelude::marker",
+        "CALLS",
+        container_placeholder(rust_prelude(), "mycrate::util", KEY_QUALIFIED_NAME, "mycrate::util::Pair"),
+        source,
+    );
+    let summary = link_all(&mut conn).unwrap();
+    (conn, [const_call, constructor_call], summary)
+}
+
+/// An engine's exact call answer onto a function bound to a `const` links
+/// to that `Variable`, not to the same-named class method.
+///
+/// Control: `required_target_kind` ignores `engine_answer` - it stays on its
+/// placeholder.
+#[test]
+fn an_engine_call_answer_links_a_const_bound_function() {
+    let (conn, [const_call, _], _) = calls_onto_non_functions(SEMANTIC_SOURCE);
+    assert_eq!(edge_target(&conn, &const_call), (TS_CONST_HANDLER.to_string(), true));
+    assert_eq!(edge_source(&conn, &const_call), "semantic");
+}
+
+/// An engine's exact call answer onto a tuple-struct constructor links to
+/// the struct.
+///
+/// Control: drop `"Type"` from `ENGINE_ANSWER_CALL_TARGET_KINDS` - it stays
+/// on its placeholder.
+#[test]
+fn an_engine_call_answer_links_a_tuple_struct_constructor_to_the_struct() {
+    let (conn, [_, constructor_call], summary) = calls_onto_non_functions(SEMANTIC_SOURCE);
+    assert_eq!(summary, LinkSummary { linked_edges: 2 });
+    assert_eq!(edge_target(&conn, &constructor_call), (RUST_TUPLE_STRUCT.to_string(), true));
+}
+
+/// The same two addresses sent structurally stay on their placeholders: a
+/// structural `CALLS` still lands only on a `Function`, even under an exact
+/// key.
+///
+/// Control: `required_target_kind` widens every `CALLS`, not only an
+/// engine's answer - both link.
+#[test]
+fn a_structural_call_onto_a_variable_or_a_type_stays_unlinked() {
+    let (conn, edges, summary) = calls_onto_non_functions(STRUCTURAL_SOURCE);
+    assert_eq!(summary, LinkSummary { linked_edges: 0 });
+    for edge in &edges {
+        let (to, resolved) = edge_target(&conn, edge);
+        assert!(!resolved && to.starts_with("pending:"), "{edge} must stay on its placeholder, is on {to}");
+    }
+}
+
+/// Under one exact address the kinds are tried in order, the first that
+/// fits winning: a `Function` over a same-named `Variable` and `Type`, and
+/// with no `Function`, the `Variable` over the `Type`.
+///
+/// Control: reorder `ENGINE_ANSWER_CALL_TARGET_KINDS` to `Variable` first -
+/// the first call lands on the `Variable`.
+#[test]
+fn an_engine_call_answer_prefers_a_function_then_a_variable_then_a_type() {
+    let mut conn = setup();
+    let mut nodes = vec![member(rust_prelude(), "Function", "mycrate::prelude::marker", Vis::Public)];
+    for kind in ["Function", "Variable", "Type"] {
+        nodes.push(member(rust_util(), kind, "mycrate::util::all", Vis::Public));
+    }
+    for kind in ["Variable", "Type"] {
+        nodes.push(member(rust_util(), kind, "mycrate::util::no_fn", Vis::Public));
+    }
+    nodes.extend(rust_lib_nodes());
+    upsert(&mut conn, nodes);
+    let call = |conn: &mut Connection, key: &str| {
+        use_from_source(
+            conn,
+            "Function:src/prelude.rs:mycrate::prelude::marker",
+            "CALLS",
+            container_placeholder(rust_prelude(), "mycrate::util", KEY_QUALIFIED_NAME, key),
+            SEMANTIC_SOURCE,
+        )
+    };
+    let all = call(&mut conn, "mycrate::util::all");
+    let no_fn = call(&mut conn, "mycrate::util::no_fn");
+
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 2 });
+    assert_eq!(edge_target(&conn, &all), ("Function:src/util.rs:mycrate::util::all".to_string(), true));
+    assert_eq!(edge_target(&conn, &no_fn), ("Variable:src/util.rs:mycrate::util::no_fn".to_string(), true));
+}
+
+/// One placeholder carrying a structural and a semantic `CALLS`, the only
+/// candidate a `Variable`: the semantic edge links, the structural one stays
+/// on the placeholder - and a second pass leaves both where they are.
+#[test]
+fn a_structural_and_a_semantic_call_onto_a_variable_are_decided_apart() {
+    let mut conn = setup();
+    upsert(
+        &mut conn,
+        vec![
+            symbol("src/main.ts", "run", "Function", true),
+            symbol("src/main.ts", "init", "Function", true),
+            symbol("src/x.ts", "handler", "Variable", true),
+        ],
+    );
+    let placeholder = || exact_placeholder("src/main.ts", "src/x.ts", "handler");
+    let structural =
+        use_from_source(&mut conn, "Function:src/main.ts:init", "CALLS", placeholder(), STRUCTURAL_SOURCE);
+    let semantic =
+        use_from_source(&mut conn, "Function:src/main.ts:run", "CALLS", placeholder(), SEMANTIC_SOURCE);
+
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    for pass in ["first", "second"] {
+        assert_eq!(
+            edge_target(&conn, &semantic),
+            (TS_CONST_HANDLER.to_string(), true),
+            "{pass} pass: semantic"
+        );
+        assert_eq!(edge_target(&conn, &structural), (placeholder().id, false), "{pass} pass: structural");
+        link_all(&mut conn).unwrap();
+    }
+}
+
+/// A semantic `CALLS` under a `name` key is not an engine's exact answer,
+/// so it still lands only on a `Function`: an exported `Variable` of that
+/// name does not take it.
+///
+/// Control: `is_engine_answer` without its `Key::QualifiedName` condition -
+/// it links.
+#[test]
+fn a_semantic_name_keyed_call_onto_a_variable_stays_unlinked() {
+    let mut conn = setup();
+    upsert(
+        &mut conn,
+        vec![symbol("src/main.ts", "run", "Function", true), symbol("src/x.ts", "handler", "Variable", true)],
+    );
+    let edge = use_from_source(
+        &mut conn,
+        "Function:src/main.ts:run",
+        "CALLS",
+        placeholder_node("src/main.ts", "src/x.ts", "handler"),
+        SEMANTIC_SOURCE,
+    );
+
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    assert!(!edge_target(&conn, &edge).1);
+}

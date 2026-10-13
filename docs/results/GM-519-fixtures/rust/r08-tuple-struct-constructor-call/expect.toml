@@ -1,0 +1,9 @@
+[[callers]]
+symbol = "Pair"
+file = "src/lib.rs"
+expect = ["src/lib.rs:make"]
+
+[[callers]]
+symbol = "Shape"
+file = "src/lib.rs"
+expect = []

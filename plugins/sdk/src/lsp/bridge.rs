@@ -3615,6 +3615,98 @@ mod tests {
         );
     }
 
+    /// [`untyped_index`] with `a.toy` replaced by declarations a definition
+    /// can land inside without a node of its own: a class field `cb`, an
+    /// interface property `go`, an object-literal method that repeats its
+    /// const's name, a const-bound function `tick`, a tuple struct `Pair`,
+    /// and a local `inner` in a function body.
+    fn landing_index() -> (SdkIndex, String) {
+        let (mut index, caller) = untyped_index();
+        let source = "class Box {\n  cb = wrap();\n}\ninterface Opts {\n  go: () => void;\n}\n\
+                      const handler = { handler() {} };\nconst tick = () => 1;\nstruct Pair(u8);\n\
+                      fn outer() { let inner = 1; }\n";
+        let a = RelPath::new("a.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &a);
+        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 10, col: 0 } });
+        for (kind, name, start, end) in [
+            (NodeKind::Type, "Box", (0, 0), (2, 1)),
+            (NodeKind::Type, "Opts", (3, 0), (5, 1)),
+            (NodeKind::Variable, "handler", (6, 0), (6, 33)),
+            (NodeKind::Variable, "tick", (7, 0), (7, 21)),
+            (NodeKind::Type, "Pair", (8, 0), (8, 16)),
+            (NodeKind::Function, "outer", (9, 0), (9, 29)),
+        ] {
+            let range = Range {
+                start: Position { line: start.0, col: start.1 },
+                end: Position { line: end.0, col: end.1 },
+            };
+            builder.add_node(NodeSpec::new(kind, name, name, range).native_kind("decl").public());
+        }
+        index.insert(a, source.to_string(), builder.finish());
+        (index, caller)
+    }
+
+    /// A definition answer in `a.toy` at `(line, character)`.
+    fn in_a(line: u32, character: u32) -> Value {
+        json!({ "uri": "file:///p/a.toy", "range": { "start": { "line": line, "character": character } } })
+    }
+
+    /// A call answered inside a node with no node of its own there - a class
+    /// field, an interface property - names the encloser, which is not what
+    /// is called: no edge. At the encloser's own name it is recorded, and a
+    /// reference may still land on the encloser.
+    ///
+    /// Control: `lands_on_name` returns `true` - the field and the property
+    /// calls are recorded on their owners.
+    #[test]
+    fn a_call_answered_at_a_member_without_a_node_never_lands_on_its_owner() {
+        let (index, caller) = landing_index();
+        let call = || site_of(&index, "len", 1);
+        assert_eq!(answered_by(&index, &caller, call(), in_a(1, 2)).1, 0, "a class field");
+        assert_eq!(answered_by(&index, &caller, call(), in_a(4, 2)).1, 0, "an interface property");
+        assert_eq!(answered_by(&index, &caller, call(), in_a(0, 6)).1, 1, "the class's own name");
+        assert_eq!(
+            answered_by(&index, &caller, site_of(&index, "fld", 5), in_a(1, 2)).1,
+            1,
+            "a field read, a reference, is not held to the name"
+        );
+    }
+
+    /// A const-bound function and a tuple struct are called at their own
+    /// names, so those answers are recorded.
+    #[test]
+    fn a_call_answered_at_a_variable_or_type_name_is_recorded() {
+        let (index, caller) = landing_index();
+        let call = || site_of(&index, "len", 1);
+        assert_eq!(answered_by(&index, &caller, call(), in_a(7, 6)).1, 1, "a const-bound function");
+        assert_eq!(answered_by(&index, &caller, call(), in_a(8, 7)).1, 1, "a tuple struct");
+    }
+
+    /// `const handler = { handler() {} }` answered at the inner `handler`:
+    /// the word under the answer is the const's name, but the const names
+    /// itself first, so the method's answer is not the const's.
+    ///
+    /// Control: `lands_on_name` accepts any whole-word occurrence of the name,
+    /// not only the first - the inner one is recorded.
+    #[test]
+    fn a_call_answered_at_a_member_sharing_its_owners_name_is_not_recorded() {
+        let (index, caller) = landing_index();
+        let call = || site_of(&index, "len", 1);
+        assert_eq!(answered_by(&index, &caller, call(), in_a(6, 18)).1, 0, "the object-literal method");
+        assert_eq!(answered_by(&index, &caller, call(), in_a(6, 6)).1, 1, "the const's own name");
+    }
+
+    /// A call landing on a function is recorded wherever in it the answer
+    /// points: only a non-function target is held to its name.
+    ///
+    /// Control: drop the `node.kind == NodeKind::Function` arm - the answer
+    /// inside `outer`'s body records nothing.
+    #[test]
+    fn a_call_answered_inside_a_function_still_lands_on_it() {
+        let (index, caller) = landing_index();
+        assert_eq!(answered_by(&index, &caller, site_of(&index, "len", 1), in_a(9, 17)).1, 1);
+    }
+
     fn answered(counts: &[(&str, &str, usize)]) -> HashMap<(String, String), usize> {
         counts.iter().map(|(from, name, n)| ((from.to_string(), name.to_string()), *n)).collect()
     }
