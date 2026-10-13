@@ -356,7 +356,10 @@ fn go_query_is_1_for_a_path_under_plugins_go_and_0_for_other_changes() {
     assert_eq!(go_query(&["plugins/go/main.go"]), "1");
     assert_eq!(go_query(&["docs/a.md", "plugins/go/internal/x.go"]), "1");
     assert_eq!(go_query(&["docs/a.md"]), "0");
-    assert_eq!(go_query(&["core/src/cli/status.rs", "plugins/rust/src/lib.rs", "plugins/typescript/a.ts"]), "0");
+    assert_eq!(
+        go_query(&["core/src/cli/status.rs", "plugins/rust/src/lib.rs", "plugins/typescript/a.ts"]),
+        "0"
+    );
 }
 
 #[test]

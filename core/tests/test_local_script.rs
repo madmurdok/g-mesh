@@ -127,7 +127,11 @@ fn run_local(args: &[&str], extra_env: &[(&str, &str)]) -> (Output, Vec<Call>) {
 
 /// `run_local` that also returns the stand-in `go`'s calls (`<cwd>|<args>`).
 /// Without `with_go` no `go` is on `PATH` at all.
-fn run_local_go(args: &[&str], extra_env: &[(&str, &str)], with_go: bool) -> (Output, Vec<Call>, Vec<String>) {
+fn run_local_go(
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    with_go: bool,
+) -> (Output, Vec<Call>, Vec<String>) {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -472,11 +476,19 @@ fn a_missing_go_toolchain_fails_a_go_diff_and_never_skips() {
     let (output, _, go) = run_local_go(&["--paths-from", &file], &[], false);
     assert!(go.is_empty());
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
-    assert!(stdout_of(&output).contains("== go: FAIL, the go toolchain is not installed"), "{}", describe(&output));
+    assert!(
+        stdout_of(&output).contains("== go: FAIL, the go toolchain is not installed"),
+        "{}",
+        describe(&output)
+    );
 
     let (output, _, _) = run_local_go(&["--full"], &[], false);
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
-    assert!(stdout_of(&output).contains("== go: FAIL, the go toolchain is not installed"), "{}", describe(&output));
+    assert!(
+        stdout_of(&output).contains("== go: FAIL, the go toolchain is not installed"),
+        "{}",
+        describe(&output)
+    );
 }
 
 /// A diff with no Go path needs no toolchain.
@@ -495,11 +507,7 @@ fn an_earlier_failure_skips_the_go_step_unless_keep_going() {
     let (output, _, go) = run_local_go(&["--paths-from", &file], &failing, true);
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     assert!(go.is_empty(), "go ran after an earlier failure: {go:?}");
-    assert!(
-        stdout_of(&output).contains("== go: not run, an earlier part failed"),
-        "{}",
-        describe(&output)
-    );
+    assert!(stdout_of(&output).contains("== go: not run, an earlier part failed"), "{}", describe(&output));
 
     let (output, _, go) = run_local_go(&["--keep-going", "--paths-from", &file], &failing, true);
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
