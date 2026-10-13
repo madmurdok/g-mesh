@@ -375,29 +375,48 @@ fn assert_the_hostile_config_is_in_force(fixture: &Fixture, real: &RealToolchain
             String::from_utf8_lossy(&output.stderr)
         );
     };
+    // Every run starts with no log and no marker and is judged on its own,
+    // so each assertion names the run that fired the hook.
+    let mark_backend = fixture.root.join("MARK_codegen_backend");
+    let reset = || {
+        fixture.clear_logs();
+        let _ = std::fs::remove_file(&mark_backend);
+    };
+    let assert_logged = |run: &str, names: &[&str]| {
+        for name in names {
+            assert!(
+                fixture.log(name).is_file(),
+                "sanity: {run} in the fixture never ran the project's `{name}` hook, so this test would \
+                 prove nothing about it"
+            );
+        }
+    };
     let metadata: &[&str] = &["metadata", "--format-version", "1"];
+
+    reset();
     run(real.proxy_dir.join("rust-analyzer"), &["--version"], &[], true);
+    assert_logged("the unpinned `rust-analyzer --version`", &["evil-rust-analyzer"]);
+
     // A stable `rustc` refuses the `-Z` flag, so this run leaves the
     // rustflags out; the next one puts them back.
+    reset();
     run(real.proxy_dir.join("cargo"), metadata, &[("CARGO_ENCODED_RUSTFLAGS", "")], true);
-    let mark_backend = fixture.root.join("MARK_codegen_backend");
+    assert_logged("the unpinned stable `cargo metadata`", &["evil-cargo", "build-rustc", "rustc-wrapper"]);
+    assert!(
+        !mark_backend.exists(),
+        "the stable `cargo metadata` with empty rustflags loaded the `-Zcodegen-backend` dylib"
+    );
+
     if fixture.marks.contains(&mark_backend) {
+        reset();
         run(real.proxy_dir.join("cargo"), metadata, &[("RUSTC_BOOTSTRAP", "1")], false);
         assert!(
             mark_backend.is_file(),
-            "sanity: the unpinned proxies in the fixture never loaded the project's `-Zcodegen-backend` \
-             dylib, so this test would prove nothing about it"
-        );
-        std::fs::remove_file(&mark_backend).unwrap();
-    }
-    for name in ["evil-rust-analyzer", "evil-cargo", "build-rustc", "rustc-wrapper"] {
-        assert!(
-            fixture.log(name).is_file(),
-            "sanity: the unpinned proxies in the fixture never ran the project's `{name}` hook, so this \
-             test would prove nothing about it"
+            "sanity: the unpinned `RUSTC_BOOTSTRAP=1 cargo metadata` in the fixture never loaded the \
+             project's `-Zcodegen-backend` dylib, so this test would prove nothing about it"
         );
     }
-    fixture.clear_logs();
+    reset();
     let _ = std::fs::remove_file(fixture.root.join("Cargo.lock"));
     let _ = std::fs::remove_dir_all(fixture.root.join("target"));
 }

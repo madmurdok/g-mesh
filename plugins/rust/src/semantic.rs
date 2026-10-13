@@ -521,6 +521,139 @@ mod tests {
         }
     }
 
+    /// `CARGO_UNSTABLE_HOST_CONFIG=false` outranks a config's `[unstable]
+    /// host-config = true`, which under `RUSTC_BOOTSTRAP=1` hands host units
+    /// `[host]` `rustflags` past the empty `CARGO_ENCODED_RUSTFLAGS`.
+    ///
+    /// Controls: delete the insert in `pinned_env`, or set it to "true".
+    #[test]
+    fn the_server_env_turns_off_unstable_host_config() {
+        for toolchain in
+            [Toolchain { pin: Some("gm572-pin".to_string()), ..Toolchain::default() }, Toolchain::default()]
+        {
+            let env = pinned_env(&toolchain);
+            assert_eq!(env.get("CARGO_UNSTABLE_HOST_CONFIG").map(String::as_str), Some("false"), "{env:?}");
+        }
+    }
+
+    /// The host-config channel end to end, with the real `pinned_env`: a
+    /// project whose `.cargo/config.toml` turns on `[unstable] host-config`
+    /// and names a `-Zcodegen-backend` dylib in `[host]` (config A) or
+    /// `[host.<triple>]` (config B) `rustflags`. `RUSTC_BOOTSTRAP=1 cargo
+    /// metadata` with `pinned_env` loads no dylib; the same call without
+    /// `CARGO_UNSTABLE_HOST_CONFIG` loads it, so the channel is live and the
+    /// first result means something. The marker is removed before every run
+    /// and read after it, so each assertion names the run that fired.
+    ///
+    /// A unit test because it needs the private `pinned_env`; rust-analyzer's
+    /// own cargo calls do not take this channel (ADR 0032 D2), so the engine
+    /// pass in `tests/semantic_runs_no_project_code.rs` cannot observe it.
+    /// The wrapper variables stay empty in both runs, as `pinned_env` has
+    /// them: a user's global `rustc-wrapper` (sccache) runs rustc in its own
+    /// process and hides the marker.
+    ///
+    /// Control: delete the `CARGO_UNSTABLE_HOST_CONFIG` insert in
+    /// `pinned_env` - the pinned run loads the dylib.
+    #[cfg(unix)]
+    #[test]
+    fn pinned_env_keeps_host_config_rustflags_out_of_a_bootstrapped_cargo() {
+        let scratch = Scratch::new("hostcfg");
+        let root = &scratch.0;
+        let mark = root.join("MARK_host_backend");
+        let source = root.join("marker.c");
+        std::fs::write(
+            &source,
+            format!(
+                "#include <stdio.h>\n__attribute__((constructor)) static void fire(void) {{\n    \
+                 FILE *f = fopen({:?}, \"a\");\n    if (f) {{ fputs(\"x\\n\", f); fclose(f); }}\n}}\n",
+                mark.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let dylib = root.join(if cfg!(target_os = "macos") { "marker.dylib" } else { "marker.so" });
+        let shared: &[&str] =
+            if cfg!(target_os = "macos") { &["-dynamiclib"] } else { &["-shared", "-fPIC"] };
+        match Command::new("cc").args(shared).arg("-o").arg(&dylib).arg(&source).output() {
+            Ok(output) if output.status.success() => {}
+            result => {
+                println!("SKIPPED: `cc` did not build the marker dylib ({result:?})");
+                return;
+            }
+        }
+
+        let toolchain = Toolchain::detect();
+        let cargo = toolchain.cargo.clone().unwrap_or_else(|| PathBuf::from("cargo"));
+        let rustc = toolchain.rustc.clone().unwrap_or_else(|| PathBuf::from("rustc"));
+        let version = Command::new(&rustc).arg("-vV").output().unwrap();
+        let triple = String::from_utf8_lossy(&version.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("host: ").map(str::to_string))
+            .expect("`rustc -vV` names the host");
+        let project = root.join("fx");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(project.join(".cargo")).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let pinned = pinned_env(&toolchain);
+        let mut unpinned = pinned.clone();
+        unpinned.remove("CARGO_UNSTABLE_HOST_CONFIG");
+        // Everything cargo, rustc and rustup set for this test process, so the
+        // child sees only the inherited user environment plus the map.
+        let inherited: Vec<String> = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| {
+                (name.starts_with("CARGO") && name != "CARGO_HOME")
+                    || name.starts_with("RUSTC")
+                    || name.starts_with("RUSTDOC")
+                    || name == "RUSTFLAGS"
+            })
+            .collect();
+        let fires = |env: &BTreeMap<String, String>| {
+            let _ = std::fs::remove_file(&mark);
+            let mut command = Command::new(&cargo);
+            for name in &inherited {
+                command.env_remove(name);
+            }
+            let output = command
+                .args(["metadata", "--format-version", "1"])
+                .envs(env)
+                .env("RUSTC_BOOTSTRAP", "1")
+                .current_dir(&project)
+                .output()
+                .unwrap();
+            (mark.is_file(), String::from_utf8_lossy(&output.stderr).into_owned())
+        };
+
+        let backend = format!("-Zcodegen-backend={}", dylib.to_string_lossy());
+        for (label, table) in [("A", "host".to_string()), ("B", format!("host.{triple}"))] {
+            std::fs::write(
+                project.join(".cargo/config.toml"),
+                format!(
+                    "target-applies-to-host = false\n\n[unstable]\nhost-config = true\n\
+                     target-applies-to-host = true\n\n[{table}]\nrustflags = [{backend:?}]\n"
+                ),
+            )
+            .unwrap();
+            let (fired, stderr) = fires(&unpinned);
+            assert!(
+                fired,
+                "sanity, config {label} ([{table}]): without CARGO_UNSTABLE_HOST_CONFIG the bootstrapped \
+                 cargo never loaded the project's dylib, so the pinned run would prove nothing: {stderr}"
+            );
+            let (fired, stderr) = fires(&pinned);
+            assert!(
+                !fired,
+                "config {label} ([{table}]): `pinned_env` let `RUSTC_BOOTSTRAP=1 cargo metadata` load the \
+                 project's `-Zcodegen-backend` dylib: {stderr}"
+            );
+        }
+    }
+
     /// `engine` starts the server with `pinned_env` on top of the manifest's
     /// env, so the unit test above is the env the server really gets.
     #[test]
