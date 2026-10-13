@@ -36,7 +36,7 @@ nothing under the project root.
   `.cargo/config.toml` `net.offline`.
 - **D2 - python: no `npx`.** Done by ADR 0032 D4; pyright comes from `PATH`
   only. Nothing further.
-- **D3 - go: `GOPROXY=off` and `GONOPROXY=-`, always.** Appended to
+- **D3 - go: `GOPROXY=off`, `GONOPROXY=-` and `GOSUMDB=off`, always.** Appended to
   `go list`'s environment (`plugins/go/semantic.go`, `loadEnv`); later
   entries win over the user's. `GOPROXY=off` alone covers only modules go
   fetches through the proxy list: a module matched by `GONOPROXY` (which
@@ -44,11 +44,13 @@ nothing under the project root.
   directly from its host, `https://<path>?go-get=1` then a VCS clone, and
   `GOVCS=*:off` does not stop the HTTPS step. `GONOPROXY=-` is a pattern no
   module path matches (a path never begins with `-`), so every module goes
-  through `off`. `GOPRIVATE` itself is left alone: clearing it would also
-  clear `GONOSUMDB`'s default and send private module paths to the checksum
-  database (measured, go1.27: `CONNECT sum.golang.org` under the exception
-  below). `GOINSECURE` and `GONOSUMDB` re-enable no fetch with
-  `GOPROXY=off` (measured), so they stay the user's.
+  through `off`. `GOSUMDB=off`: in the exception below go looks up the
+  checksums it records in the user's `GOSUMDB` directly, not through
+  `GOPROXY`, sending module paths there (measured, go1.27: `CONNECT
+  sum.golang.org:443`; a private path too if `GOPRIVATE` were cleared). With
+  `GOPROXY=off` nothing is downloaded, so turning the checksum database off
+  weakens no verification. `GOINSECURE` and `GONOSUMDB` re-enable no fetch
+  with `GOPROXY=off` (measured), so they stay the user's.
 - **D4 - go: an explicit `-mod` build flag.** `-mod=vendor` when the
   governing `go.work` (else `go.mod`) has `vendor/modules.txt` beside it,
   `-mod=readonly` otherwise, none outside module mode (`modFlag`). The
@@ -64,16 +66,11 @@ has no `vendor/modules.txt` beside it (so the flag is `-mod=readonly`), and
 a member module's `go.sum` lacks the entries for a required module that is
 in `GOMODCACHE`. go then records those checksums in `go.work.sum` beside
 `go.work`, under the project root; `-mod=readonly` does not apply its go.sum
-check in workspace mode. In the same trigger go may first look the checksums
-up in the user's `GOSUMDB` (not `GOPROXY`), unless `GONOSUMDB` (by default
-`GOPRIVATE`) matches the module or the lookup is already in the local
-checksum-database cache; that host is the user's setting, never the
-project's. Module mode (`GOWORK=off`, or no `go.work`) writes nothing, and a
+check in workspace mode. Module mode (`GOWORK=off`, or no `go.work`) writes nothing, and a
 member whose `go.sum` is complete writes nothing. A test pins the exception
 so a go release that changes it shows up.
 
-Not set: `GOSUMDB=off` (would weaken verification if anything ever did
-download), `GOMODCACHE`/`GOCACHE`/`CARGO_HOME` (the user's, outside the root).
+Not set: `GOMODCACHE`/`GOCACHE`/`CARGO_HOME` (the user's, outside the root).
 
 Rejected: rust-analyzer `cargo.noDeps = true` (no network and faster, but
 drops cached dependencies too); a user-config opt-in to network (a knob and a
