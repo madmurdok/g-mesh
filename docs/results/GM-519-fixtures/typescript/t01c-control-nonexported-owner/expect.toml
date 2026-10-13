@@ -1,0 +1,5 @@
+# Control for t01: Router not exported, so its member is `file`-visible (pre-option-A shape).
+[[callers]]
+symbol = "Router#handler"
+file = "src/x.ts"
+expect = []

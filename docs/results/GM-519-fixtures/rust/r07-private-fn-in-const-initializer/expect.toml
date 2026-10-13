@@ -1,0 +1,5 @@
+[[callers]]
+symbol = "base"
+file = "src/lib.rs"
+expect = ["src/lib.rs:limits::MAX", "src/lib.rs:limits::nested::HALF"]
+files = ["src/lib.rs:2"]

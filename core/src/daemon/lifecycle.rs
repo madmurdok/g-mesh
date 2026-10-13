@@ -836,8 +836,9 @@ impl Drop for ConnectionGuard {
 /// The daemon's main thread once startup is over: runs the tick (see the
 /// module doc) for every language in the registry until the accept loop
 /// stops, the core's idle timeout expires, or the daemon is orphaned.
-/// `Ok(())` means the process should end; the next shim cold-starts a fresh
-/// daemon. Every exit is a `return` after [`sleep_now`] on every plugin, never
+/// `Ok(exit)` means the process should end; the next shim cold-starts a fresh
+/// daemon. Every return ends the rest of the process group first
+/// ([`end_process_group`]). Every exit is a `return` after [`sleep_now`] on every plugin, never
 /// a `std::process::exit`: the watcher thread holds the supervisor's lock for
 /// a file change's whole round trip including its commit, so the sleep cannot
 /// return until that transaction is durable.
@@ -850,15 +851,21 @@ pub fn supervise(
     core: &CoreActivity,
     timeouts: IdleTimeouts,
     accept_loop: Receiver<Result<()>>,
-) -> Result<()> {
+) -> Result<Exit> {
     let tick = timeouts.tick();
     // Read once: the variable is fixed for the process's lifetime.
     let lifeline = lifeline_pid();
     loop {
         match accept_loop.recv_timeout(tick) {
             // The accept loop only ever ends by failing; its error is the daemon's.
-            Ok(result) => return result,
-            Err(RecvTimeoutError::Disconnected) => bail!("the daemon's MCP accept loop panicked"),
+            Ok(result) => {
+                end_process_group();
+                return result.map(|()| Exit::Idle);
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                end_process_group();
+                bail!("the daemon's MCP accept loop panicked");
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
 
@@ -871,8 +878,9 @@ pub fn supervise(
             );
             // The same teardown as the idle exit below.
             registry.sleep_all_now("the core has been orphaned and is shutting down");
+            end_process_group();
             release_state_files(state_dir);
-            return Ok(());
+            return Ok(Exit::Orphaned(orphan));
         }
 
         registry.sleep_if_idle_all();
@@ -885,9 +893,88 @@ pub fn supervise(
                  will start a fresh daemon for this project"
             );
             registry.sleep_all_now("the core is shutting down");
+            end_process_group();
             release_state_files(state_dir);
-            return Ok(());
+            return Ok(Exit::Idle);
         }
+    }
+}
+
+/// Why [`supervise`] returned `Ok`: the caller purges the state directory
+/// only for [`Orphaned::ProjectRootGone`], after it has released the
+/// singleton lock (see [`purge_state_dir`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exit {
+    /// Idle past the core timeout, or the accept loop ended without an error.
+    Idle,
+    /// [`orphan_check`] ended it.
+    Orphaned(Orphaned),
+}
+
+/// How long the rest of the daemon's process group gets between `SIGTERM`
+/// and `SIGKILL`. The plugins are already asleep by then; what is left is
+/// what they started and did not stop (rust-analyzer's `cargo`/`rustc`),
+/// none of which has anything to save.
+const GROUP_EXIT_GRACE: Duration = Duration::from_secs(1);
+
+/// Ends every process this daemon's group still holds (GM-524 D2): plugins,
+/// their language servers, and those servers' children - rust-analyzer's
+/// `cargo`, which otherwise kept building into the project after the daemon
+/// was gone. Called on every exit [`supervise`] controls, after the plugins
+/// were put to sleep where there was a chance to, and before the pid file
+/// goes, so nothing the daemon started outlives what describes it.
+/// A no-op unless the daemon leads its own group, which it does when a shim
+/// started it (`process::detach`); one run by hand or by a test harness shares
+/// its starter's group, and that group is not the daemon's to end.
+fn end_process_group() {
+    match crate::process::kill_own_group(GROUP_EXIT_GRACE) {
+        crate::process::GroupSweep::Swept { terminated, killed } if terminated > 0 => {
+            crate::log_line!(
+                "g-mesh daemon: ended {terminated} process(es) left in its process group \
+                 ({killed} needed SIGKILL)"
+            );
+        }
+        _ => {}
+    }
+}
+
+/// On [`Orphaned::ProjectRootGone`], deletes this daemon's whole state
+/// directory (GM-524 D1): the index and every lock and log file of a project
+/// that no longer exists. Called by `daemon::run` and `front::run` after the
+/// singleton lock is dropped, so the directory is judged by exactly the rules
+/// `clean orphaned --force` uses (`cli::clean::purge_orphaned_state_dir`): the
+/// root's parent must still exist, nothing may be running for it, and the
+/// root is re-checked under the bootstrap lock in case it came back.
+///
+/// Open handles - the index the other threads still hold, `daemon.log` as this
+/// process's stderr - are no obstacle on Unix, where an unlinked file stays
+/// usable until closed and the process ends right after this. Windows cannot
+/// delete an open file, so there the directory is left for the shim's startup
+/// sweep, which runs when no daemon holds it.
+pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
+    let Exit::Orphaned(Orphaned::ProjectRootGone(root)) = exit else {
+        return;
+    };
+    if cfg!(windows) {
+        return;
+    }
+    match crate::cli::clean::purge_orphaned_state_dir(state_dir) {
+        Ok(crate::cli::clean::Purge::Deleted) => crate::log_line!(
+            "g-mesh daemon: deleted the state of {} ({}) - its project root no longer exists",
+            root.display(),
+            state_dir.display()
+        ),
+        Ok(crate::cli::clean::Purge::Kept(reason)) => crate::log_line!(
+            "g-mesh daemon: kept the state of {} ({}): {reason}",
+            root.display(),
+            state_dir.display()
+        ),
+        Err(err) => crate::log_line!(
+            "g-mesh daemon: could not delete the state of {} ({}): {err:#} - `g-mesh clean orphaned` \
+             or the next shim's sweep will",
+            root.display(),
+            state_dir.display()
+        ),
     }
 }
 

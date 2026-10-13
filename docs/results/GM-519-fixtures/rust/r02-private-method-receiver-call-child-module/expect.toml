@@ -1,0 +1,5 @@
+[[callers]]
+symbol = "read"
+file = "src/lib.rs"
+expect = ["src/lib.rs:report::show", "src/lib.rs:total"]
+files = ["src/lib.rs:2"]

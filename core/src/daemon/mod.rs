@@ -166,6 +166,12 @@ pub fn lock_path(root: &Path) -> Result<PathBuf> {
     Ok(project_dir(root)?.join(BOOTSTRAP_LOCK_FILE))
 }
 
+/// [`lock_path`] inside an already-known state directory, for a caller whose
+/// project root may be gone (`project_hash` cannot be computed for it then).
+pub(crate) fn bootstrap_lock_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(BOOTSTRAP_LOCK_FILE)
+}
+
 /// [`lock_path`] under the g-mesh home `home` rather than the one the
 /// environment names (see `storage::connection::project_dir_under`).
 pub(crate) fn lock_path_under(home: &Path, root: &Path) -> Result<PathBuf> {
@@ -483,7 +489,13 @@ pub fn run(root: &Path) -> Result<()> {
         if needs_semantic_pass_retry || !retry_languages.is_empty() {
             Some(watcher)
         } else {
-            spawn_watch_consumer(watcher, Arc::clone(&conn), Arc::clone(&registry), canonical_root.clone());
+            spawn_watch_consumer(
+                watcher,
+                Arc::clone(&conn),
+                Arc::clone(&registry),
+                canonical_root.clone(),
+                true,
+            );
             None
         }
     };
@@ -515,7 +527,11 @@ pub fn run(root: &Path) -> Result<()> {
     // Released explicitly: the lock is now the only claim on this project, and
     // a slow teardown while holding it would wedge the project.
     drop(singleton);
-    outcome
+    let exit = outcome?;
+    // After the lock, so the purge judges the directory as `clean` would; the
+    // index this process still has open is no obstacle (see the function).
+    lifecycle::purge_state_dir(&dir, &exit);
+    Ok(())
 }
 
 /// What a daemon that lost the singleton race does: quiet success against a
@@ -539,18 +555,26 @@ fn stand_down(root: &Path) -> Result<()> {
 }
 
 /// Starts the watcher's consumer thread, once no structural walk or
-/// whole-project semantic pass can still race it.
+/// whole-project semantic pass can still race it. `reconcile`: whether the
+/// index may predate the files on disk (no walk in this process), so the
+/// thread first reconciles it with them.
 fn spawn_watch_consumer(
     watcher: ProjectWatcher,
     conn: Arc<IndexStore>,
     registry: Arc<PluginRegistry>,
     root: PathBuf,
+    reconcile: bool,
 ) {
     thread::spawn(move || {
         // GM-508, Q3: `.gitignore` edits made while no daemon watched. On
         // this thread, before the first batch, as an in-session edit would
         // be; events meanwhile queue in the watcher's channel.
         registry.recheck_gitignores_since_index(&conn);
+        // Every other file changed while no daemon watched, likewise before
+        // the first batch.
+        if reconcile {
+            registry.reconcile_since_index(&conn);
+        }
         let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
         loop {
             watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);

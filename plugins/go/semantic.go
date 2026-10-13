@@ -44,6 +44,31 @@ package main
 // golang.org/x/tools at all, so "the engine started" and "a semanticPass
 // arrived" cannot come apart.
 //
+// # What `go list` may run
+//
+// Nothing the module chooses: `go list` runs with GOTOOLCHAIN=local, so a
+// `go`/`toolchain` line newer than the installed Go fails to load (and
+// degrades below) instead of downloading and running another toolchain, and
+// with GOPACKAGESDRIVER=off, so no driver binary on PATH replaces it. cgo
+// stays on: it runs the user's own `cc`/`pkg-config`. See [loadEnv] and
+// docs/adr/0032-semantic-tiers-execute-no-project-code.md.
+//
+// # What `go list` may touch
+//
+// No network and nothing under the project root: GOPROXY=off with a
+// GONOPROXY that matches nothing, so a module missing from GOMODCACHE fails
+// to load instead of being downloaded, private or not, GOSUMDB=off, so no
+// checksum is looked up, and
+// `-mod=readonly` (or `-mod=vendor` for a vendored module or workspace) as a
+// build flag, so `go list` never rewrites go.mod or go.sum. One exception go
+// itself makes: in workspace mode, when a member's go.sum lacks entries for a
+// module in GOMODCACHE, go adds them to go.work.sum beside go.work, under
+// `-mod=readonly` too. The build flag
+// overrides only `-mod` in the user's GOFLAGS; the rest of it still applies.
+// Imports of a module that is not in the cache do not type-check; local code
+// still resolves. See [loadEnv], [modFlag] and
+// docs/adr/0033-semantic-tiers-reach-no-network-and-write-nothing.md.
+//
 // # Degradation
 //
 // No `go` on PATH, or a `packages.Load` that fails outright: log once and
@@ -80,6 +105,7 @@ package main
 //     accepts today.
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/token"
 	"go/types"
@@ -310,7 +336,11 @@ func newResolutions() *resolutions {
 // semantic tier becomes useless in exactly the repositories that need it.
 func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) error {
 	fset := token.NewFileSet()
-	cfg := &packages.Config{Mode: loadMode, Dir: dir, Tests: true, Fset: fset}
+	env := loadEnv()
+	cfg := &packages.Config{Mode: loadMode, Dir: dir, Tests: true, Fset: fset, Env: env}
+	if flag := modFlag(dir, env); flag != "" {
+		cfg.BuildFlags = []string{flag}
+	}
 
 	// The engine is starting *now* - see markSemanticEngineStarted.
 	markSemanticEngineStarted()
@@ -325,6 +355,77 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 		e.foldPackage(into, fset, pkg)
 	}
 	return nil
+}
+
+// loadEnv is the environment `go list` runs with: the inherited one, with
+// the Go toolchain pinned to the installed one, no packages driver and no
+// module proxy (so nothing is downloaded). Later entries win, so these
+// override the user's own settings.
+//
+// GOPROXY=off covers only modules fetched through the proxy list: a module
+// matched by GONOPROXY (which defaults to GOPRIVATE) is fetched directly from
+// its host whatever GOPROXY says. GONOPROXY is therefore set to "-", a
+// pattern no module path matches (a path never begins with '-').
+//
+// GOSUMDB=off: go still looks up checksums it records for modules already in
+// GOMODCACHE (go.work.sum in workspace mode), and that lookup goes to the
+// checksum database directly, not through GOPROXY. With it off, the hashes
+// recorded in go.work.sum come from the module cache unchecked against the
+// checksum database; nothing is downloaded.
+func loadEnv() []string {
+	return append(os.Environ(),
+		"GOTOOLCHAIN=local", "GOPACKAGESDRIVER=off", "GOPROXY=off", "GONOPROXY=-",
+		"GOSUMDB=off")
+}
+
+// modFlag is the `-mod` build flag `go list` runs with from dir under env,
+// so it never writes go.mod or go.sum: "-mod=vendor" when the governing
+// go.work (else go.mod) has a vendor/modules.txt beside it, "-mod=readonly"
+// otherwise, and "" when dir is not in module mode or has no go.mod or
+// go.work above it, where go rejects the flag and writes neither file anyway.
+//
+// The governing files are the ones go itself resolves (`go env GOWORK
+// GOMOD`, run from dir under the load's own env), so every source of go's
+// settings counts: the process environment, the go env file (GOENV,
+// `go env -w`) and go's defaults. When go cannot answer, the answer is
+// "-mod=readonly", the flag that never writes.
+func modFlag(dir string, env []string) string {
+	cmd := exec.Command("go", "env", "-json", "GOWORK", "GOMOD")
+	cmd.Dir = dir
+	cmd.Env = env
+	out, err := cmd.Output()
+	if err != nil {
+		return "-mod=readonly"
+	}
+	var resolved struct{ GOWORK, GOMOD string }
+	if err := json.Unmarshal(out, &resolved); err != nil {
+		return "-mod=readonly"
+	}
+	return modFlagFor(resolved.GOWORK, resolved.GOMOD)
+}
+
+// modFlagFor is [modFlag]'s answer for go's resolved GOWORK and GOMOD:
+// GOWORK is the workspace file in effect ("" or "off" for none), GOMOD the
+// main module's go.mod ("" outside module mode, os.DevNull in module mode
+// with no go.mod).
+func modFlagFor(gowork, gomod string) string {
+	if gomod == "" {
+		return ""
+	}
+	governing := gowork
+	if governing == "off" {
+		governing = ""
+	}
+	if governing == "" && gomod != os.DevNull {
+		governing = gomod
+	}
+	if governing == "" {
+		return ""
+	}
+	if info, err := os.Stat(filepath.Join(filepath.Dir(governing), "vendor", "modules.txt")); err == nil && info.Mode().IsRegular() {
+		return "-mod=vendor"
+	}
+	return "-mod=readonly"
 }
 
 // foldPackage indexes one loaded package's type information by position and

@@ -86,6 +86,10 @@ impl Project {
             let path = project.root().join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create a fixture directory");
             std::fs::write(&path, contents).expect("failed to write a fixture file");
+            // So that `init`'s walk records its baseline, and the daemon
+            // started after it answers from the index `init` built instead
+            // of reindexing the file underneath the query.
+            common::backdate_an_hour(&path);
         }
         project
     }

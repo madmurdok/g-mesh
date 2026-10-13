@@ -1,0 +1,8 @@
+[[callers]]
+symbol = "glow"
+file = "src/plugin.ts"
+expect = ["src/main.ts:show"]
+[[callers]]
+symbol = "Widget#draw"
+file = "src/base.ts"
+expect = ["src/main.ts:show"]

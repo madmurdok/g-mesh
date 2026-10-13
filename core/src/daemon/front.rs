@@ -102,7 +102,10 @@ pub(super) fn run(root: &Path, dir: &Path, singleton: File, detection: Detection
         lifecycle::supervise(&canonical_root, dir, &registry, &core_activity, timeouts, accept_loop);
 
     drop(singleton);
-    outcome
+    // A removed folder's front state goes the way a project's does: it is
+    // small, but nothing will ever read it again.
+    lifecycle::purge_state_dir(dir, &outcome?);
+    Ok(())
 }
 
 /// `daemon::serve_forever`'s shape, serving `mcp::front` instead.

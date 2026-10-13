@@ -249,7 +249,7 @@ fn clean_many(scope: Scope, projects_root: &Path, idle_threshold_days: u64) -> R
 /// id, and being asked to name them is a smaller cost than a delete nobody
 /// asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RootState {
+pub(crate) enum RootState {
     /// The project is still on disk.
     Live,
     /// The project directory is gone, but the directory that held it is
@@ -265,7 +265,7 @@ enum RootState {
     Legacy,
 }
 
-fn root_state(root: Option<&Path>) -> RootState {
+pub(crate) fn root_state(root: Option<&Path>) -> RootState {
     let Some(root) = root else {
         return RootState::Legacy;
     };
@@ -313,6 +313,208 @@ fn clean_orphaned(force: bool, projects_root: &Path) -> Result<Outcome> {
     }
 
     Ok(Outcome::Orphaned { deleted: force, orphaned, skipped_running, unreachable, legacy })
+}
+
+/// What [`purge_orphaned_state_dir`] decided for one state directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Purge {
+    /// The directory was orphaned, idle and unlocked, and is gone.
+    Deleted,
+    /// The directory was left alone, for the reason given.
+    Kept(&'static str),
+}
+
+/// Deletes one project's state directory, but only under the rules
+/// `clean orphaned --force` applies to it: its recorded root is
+/// [`RootState::Orphaned`] (gone, while the directory that held it is not -
+/// never an unmounted volume, never a directory with no `project.root`), and
+/// nothing is running for it ([`daemon_is_running`], plus the daemon's
+/// singleton lock, which a daemon whose pid file is already gone still holds).
+///
+/// Taken under the project's bootstrap lock, then re-judged: a shim can only
+/// bootstrap a project whose root exists (`project_hash` canonicalizes it), so
+/// a root recreated between the first look and the lock is seen by the second
+/// one and the directory kept. The lock is only *tried*: a shim holding it is
+/// bootstrapping this project right now, which is reason enough to keep it.
+///
+/// Shared by the daemon's own purge on `ProjectRootGone`
+/// (`daemon::lifecycle::purge_state_dir`, GM-524 D1) and the shim's startup
+/// sweep ([`sweep_orphaned`]), so the two can never disagree with
+/// `clean orphaned` on what is safe to delete.
+pub(crate) fn purge_orphaned_state_dir(state_dir: &Path) -> Result<Purge> {
+    let judge = || -> Option<Purge> {
+        let root = daemon::identity::read_project_root(state_dir);
+        if root_state(root.as_deref()) != RootState::Orphaned {
+            return Some(Purge::Kept("its project root exists, is unreachable, or is not recorded"));
+        }
+        if daemon_is_running(state_dir) || singleton_lock_is_held(state_dir) {
+            return Some(Purge::Kept("a daemon or plugin is still running for it"));
+        }
+        None
+    };
+    if let Some(kept) = judge() {
+        return Ok(kept);
+    }
+
+    let lock_path = daemon::bootstrap_lock_path_in(state_dir);
+    let lock = match fs::File::options().create(true).write(true).truncate(false).open(&lock_path) {
+        Ok(file) => file,
+        // The directory went between the judgement and here: someone else
+        // purged it, which is the outcome asked for.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Purge::Deleted),
+        Err(err) => return Err(err).with_context(|| format!("failed to open {}", lock_path.display())),
+    };
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Ok(Purge::Kept("a shim is bootstrapping it")),
+        Err(fs::TryLockError::Error(err)) => {
+            return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+        }
+    }
+    if let Some(kept) = judge() {
+        return Ok(kept);
+    }
+    // Windows cannot delete a file this process holds open; on Unix the lock
+    // is held across the delete, so no bootstrap can slip in between.
+    #[cfg(windows)]
+    drop(lock);
+    delete_root_record_last(state_dir)?;
+    Ok(Purge::Deleted)
+}
+
+/// [`delete`], with `project.root` removed only after everything else. A
+/// delete cut short (a shim that exits mid-sweep, a daemon killed mid-purge)
+/// then leaves a directory that still reads as orphaned and is finished by the
+/// next sweep, never one without its root record, which would be
+/// [`RootState::Legacy`] and kept forever.
+fn delete_root_record_last(state_dir: &Path) -> Result<()> {
+    let entries =
+        fs::read_dir(state_dir).with_context(|| format!("failed to read {}", state_dir.display()))?;
+    for entry in entries.flatten() {
+        if entry.file_name() == daemon::identity::ROOT_FILE {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("failed to delete {}", path.display())),
+        }
+    }
+    delete(state_dir)
+}
+
+/// Whether some process holds the daemon's singleton lock in `state_dir`.
+/// A lock that cannot be checked counts as held, for the reason
+/// [`daemon_is_running`] gives for an unreadable pid file.
+fn singleton_lock_is_held(state_dir: &Path) -> bool {
+    let path = daemon::daemon_lock_path_in(state_dir);
+    let file = match fs::File::options().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(err) => return err.kind() != std::io::ErrorKind::NotFound,
+    };
+    !matches!(file.try_lock(), Ok(()))
+}
+
+/// The shim's startup sweep of orphaned state directories (GM-524 D1, option
+/// (c)): what `clean orphaned --force` would delete, deleted without being
+/// asked, for the daemons that never got to purge their own state (one killed
+/// with `-9`, a machine that slept through the removal, Windows).
+///
+/// Cheap by construction on a store of thousands of directories: per entry
+/// it reads `project.root` and stats the root and its parent; only an
+/// orphaned one goes on to the pid files and locks. It skips `lastUsed`,
+/// which [`candidates`] reads from each `index.db`. Nothing else is
+/// touched: names that are not project ids, files, and every directory whose
+/// root is live, unreachable or unrecorded are left exactly as they are.
+/// One directory failing to delete does not stop the rest.
+pub(crate) fn sweep_orphaned(projects_root: &Path) -> Result<usize> {
+    let entries = match fs::read_dir(projects_root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", projects_root.display())),
+    };
+    let mut deleted = 0;
+    for entry in entries.flatten() {
+        let is_project_id = entry.file_name().to_str().is_some_and(|id| validate_id(id).is_ok());
+        if !is_project_id || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        match purge_orphaned_state_dir(&entry.path()) {
+            Ok(Purge::Deleted) => deleted += 1,
+            Ok(Purge::Kept(_)) => {}
+            Err(err) => {
+                crate::log_line!("g-mesh: orphan sweep could not delete {}: {err:#}", entry.path().display())
+            }
+        }
+    }
+    Ok(deleted)
+}
+
+/// How often the startup sweep runs at most. Shims start many times an hour
+/// across sessions and agents, the sweep is a backstop for the daemon's own
+/// purge rather than the main path, and an orphaned directory costs disk, not
+/// correctness - so a few times a day is plenty.
+pub(crate) const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// The marker whose mtime records the last sweep, in the g-mesh home rather
+/// than in `projects/`, where it would be one more entry for every scan.
+const ORPHAN_SWEEP_MARKER: &str = "orphan-sweep.stamp";
+
+/// What [`sweep_orphaned_if_due`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sweep {
+    /// The last sweep was less than the interval ago.
+    NotDue,
+    /// Another process is sweeping right now.
+    Busy,
+    /// Swept; this many directories were deleted.
+    Swept(usize),
+}
+
+/// [`sweep_orphaned`] over `home`'s projects, at most once per `interval`.
+///
+/// The marker's mtime is the clock, and the marker's lock makes one sweep at a
+/// time: the mtime is bumped *before* the scan, under the lock, so every other
+/// shim starting meanwhile reads it as not due or finds the lock taken. A
+/// marker that cannot be read (first run, clock skew into the future aside)
+/// counts as due.
+pub(crate) fn sweep_orphaned_if_due(home: &Path, interval: Duration) -> Result<Sweep> {
+    fs::create_dir_all(home).with_context(|| format!("failed to create {}", home.display()))?;
+    let marker_path = home.join(ORPHAN_SWEEP_MARKER);
+    let marker = fs::File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&marker_path)
+        .with_context(|| format!("failed to open {}", marker_path.display()))?;
+    match marker.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => return Ok(Sweep::Busy),
+        Err(fs::TryLockError::Error(err)) => {
+            return Err(err).with_context(|| format!("failed to lock {}", marker_path.display()));
+        }
+    }
+    // A marker this call just created has length 0 and was never stamped.
+    let stamped = marker.metadata().ok().filter(|meta| meta.len() > 0).and_then(|meta| meta.modified().ok());
+    let due = stamped.is_none_or(|at| at.elapsed().map_or(true, |age| age >= interval));
+    if !due {
+        return Ok(Sweep::NotDue);
+    }
+    // Written (not just touched) so the length tells a stamped marker from a
+    // freshly created one, and the write moves the mtime to now.
+    use std::io::Write as _;
+    let mut stamp = &marker;
+    stamp
+        .set_len(0)
+        .and_then(|()| stamp.write_all(b"swept\n"))
+        .with_context(|| format!("failed to stamp {}", marker_path.display()))?;
+    Ok(Sweep::Swept(sweep_orphaned(&crate::storage::connection::projects_root_under(home))?))
 }
 
 /// Rejects anything that is not a bare directory name.
@@ -1062,5 +1264,103 @@ mod tests {
 
         assert!(rendered.contains("deleted project a1b2c3d4"), "{rendered}");
         assert!(rendered.contains("/home/u/.g-mesh/projects/a1b2c3d4"), "{rendered}");
+    }
+
+    // -----------------------------------------------------------------
+    // The shim's startup sweep
+    // -----------------------------------------------------------------
+
+    /// The sweep deletes exactly what `clean orphaned --force` would: only
+    /// the deleted project's state, never a live, unreachable, unrecorded or
+    /// still-served one.
+    ///
+    /// Control: make `purge_orphaned_state_dir` skip the
+    /// `daemon_is_running` check: eeee5555 (served by a live pid) is deleted.
+    #[test]
+    fn the_sweep_deletes_only_state_whose_project_directory_was_deleted() {
+        let fixture = orphan_fixture();
+
+        assert_eq!(sweep_orphaned(fixture.projects.root()).unwrap(), 1);
+
+        assert!(!fixture.projects.exists("bbbb2222"), "the deleted project's state survived");
+        for survivor in ["aaaa1111", "cccc3333", "dddd4444", "eeee5555"] {
+            assert!(fixture.projects.exists(survivor), "{survivor} must not have been deleted");
+        }
+    }
+
+    /// A daemon whose pid file is already gone still holds its singleton
+    /// lock while it runs; the sweep keeps its state.
+    #[test]
+    fn the_sweep_keeps_state_whose_daemon_lock_is_held() {
+        let fixture = orphan_fixture();
+        let state = fixture.projects.root().join("bbbb2222");
+        let lock = fs::File::create(daemon::daemon_lock_path_in(&state)).unwrap();
+        lock.lock().unwrap();
+
+        assert_eq!(sweep_orphaned(fixture.projects.root()).unwrap(), 0);
+        assert!(fixture.projects.exists("bbbb2222"), "a locked daemon's state must stay");
+
+        drop(lock);
+        assert_eq!(sweep_orphaned(fixture.projects.root()).unwrap(), 1, "and goes once the lock is free");
+    }
+
+    /// A home holding one orphaned project's state, as the sweep sees it:
+    /// `<home>/projects/<id>/` with a recorded root that was deleted.
+    struct SweepHome {
+        home: tempfile::TempDir,
+        parent: tempfile::TempDir,
+    }
+
+    impl SweepHome {
+        fn new() -> Self {
+            Self { home: tempfile::tempdir().unwrap(), parent: tempfile::tempdir().unwrap() }
+        }
+
+        fn add_orphan(&self, id: &str) -> PathBuf {
+            let state = crate::storage::connection::projects_root_under(self.home.path()).join(id);
+            fs::create_dir_all(&state).unwrap();
+            let root = self.parent.path().join(id);
+            fs::create_dir(&root).unwrap();
+            crate::daemon::identity::record_project_root(&state, &root).unwrap();
+            fs::remove_dir(&root).unwrap();
+            state
+        }
+    }
+
+    /// At most one sweep per interval: a second call within it does nothing,
+    /// and leaves an orphan made in between for a later sweep.
+    ///
+    /// Control: make `sweep_orphaned_if_due` treat every call as due: the
+    /// second call sweeps.
+    #[test]
+    fn the_sweep_runs_at_most_once_per_interval() {
+        let fixture = SweepHome::new();
+        let first = fixture.add_orphan("aaaa1111");
+
+        assert_eq!(
+            sweep_orphaned_if_due(fixture.home.path(), ORPHAN_SWEEP_INTERVAL).unwrap(),
+            Sweep::Swept(1)
+        );
+        assert!(!first.exists());
+
+        let second = fixture.add_orphan("bbbb2222");
+        assert_eq!(sweep_orphaned_if_due(fixture.home.path(), ORPHAN_SWEEP_INTERVAL).unwrap(), Sweep::NotDue);
+        assert!(second.exists(), "a sweep that is not due deletes nothing");
+
+        assert_eq!(sweep_orphaned_if_due(fixture.home.path(), Duration::ZERO).unwrap(), Sweep::Swept(1));
+        assert!(!second.exists(), "once due again, it sweeps");
+    }
+
+    /// Another process sweeping (holding the marker's lock) makes this one
+    /// step aside rather than sweep beside it.
+    #[test]
+    fn the_sweep_steps_aside_while_another_one_runs() {
+        let fixture = SweepHome::new();
+        let orphan = fixture.add_orphan("aaaa1111");
+        let marker = fs::File::create(fixture.home.path().join(ORPHAN_SWEEP_MARKER)).unwrap();
+        marker.lock().unwrap();
+
+        assert_eq!(sweep_orphaned_if_due(fixture.home.path(), Duration::ZERO).unwrap(), Sweep::Busy);
+        assert!(orphan.exists());
     }
 }
