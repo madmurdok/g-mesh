@@ -64,6 +64,7 @@
 //! component and restarting the daemon then gets the pass; a
 //! completed-but-empty pass would have recorded "done" and never asked again.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -77,6 +78,12 @@ const LANGUAGE: &str = "rust";
 /// Builds the semantic engine for `root` - the
 /// [`SemanticEngineFactory`](g_mesh_plugin_sdk::SemanticEngineFactory) body,
 /// called on the first `semanticPass` and never before.
+///
+/// The server runs no build script, proc macro, project toolchain or
+/// project-named `rustc`/wrapper: the manifest turns build scripts and proc
+/// macros off, and [`pinned_env`] pins the toolchain and the compiler over
+/// whatever the project's `rust-toolchain.toml` and `.cargo/config.toml` name
+/// ([ADR 0032](../../../docs/adr/0032-semantic-tiers-execute-no-project-code.md)).
 pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     let mut config = SemanticConfig::from_manifest()
         .context("reading [plugin.semantic] from this plugin's manifest")?
@@ -87,25 +94,100 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
             )
         })?;
 
-    let resolved = resolve(&config.command)?;
+    let toolchain = Toolchain::detect();
+    let resolved = resolve(&config.command, &toolchain)?;
     g_mesh_plugin_sdk::log_line!(
-        "[{LANGUAGE}] semantic tier: {} ({})",
+        "[{LANGUAGE}] semantic tier: {} ({}, toolchain {})",
         resolved.command.display(),
-        resolved.version
+        resolved.version,
+        toolchain.pin.as_deref().unwrap_or("not rustup-managed")
     );
     config.command = resolved.command;
+    config.env.extend(pinned_env(&toolchain));
     // GM-550: rust-analyzer's start-up phases can be separated by more than
     // the bridge's 2s settle under load (2.04s and 2.47s measured), so its
     // readiness is its own `quiescent` status rather than a quiet period.
     Ok(Box::new(LspBridge::new(LANGUAGE, root, config).quiescent_signal()))
 }
 
+/// The toolchain the server and every cargo/rustc it starts run from, found
+/// without consulting the project: every `rustup` call runs in
+/// [`neutral_dir`], so no `rust-toolchain.toml` is in scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Toolchain {
+    /// The rustup toolchain name: the daemon's own `RUSTUP_TOOLCHAIN`, else
+    /// `rustup default`. `None` without rustup or without a default.
+    pin: Option<String>,
+    /// The directory `rustup` lives in, and with it every rustup proxy.
+    /// `None` when rustup is not on `PATH`.
+    proxy_dir: Option<PathBuf>,
+    /// The toolchain's own binaries, as absolute paths (never proxies).
+    rust_analyzer: Option<PathBuf>,
+    rustc: Option<PathBuf>,
+    cargo: Option<PathBuf>,
+}
+
+impl Toolchain {
+    fn detect() -> Self {
+        let proxy_dir = on_path("rustup").and_then(|rustup| rustup.parent().map(Path::to_path_buf));
+        if proxy_dir.is_none() {
+            // Not rustup-managed: no proxy reads a toolchain file, and the
+            // binaries on `PATH` are the user's own.
+            return Toolchain { rustc: on_path("rustc"), cargo: on_path("cargo"), ..Toolchain::default() };
+        }
+        let pin = std::env::var("RUSTUP_TOOLCHAIN").ok().filter(|pin| !pin.trim().is_empty()).or_else(|| {
+            rustup(&["default"]).and_then(|out| out.split_whitespace().next().map(str::to_string))
+        });
+        let which = |name: &str| {
+            let pin = pin.as_deref()?;
+            rustup(&["which", "--toolchain", pin, name]).map(PathBuf::from)
+        };
+        Toolchain {
+            rust_analyzer: which("rust-analyzer"),
+            rustc: which("rustc"),
+            cargo: which("cargo"),
+            pin,
+            proxy_dir,
+        }
+    }
+}
+
+/// The environment the server starts with on top of the inherited one: the
+/// pinned toolchain, its own `rustc` and `cargo`, and no `rustc` wrapper.
+///
+/// Environment variables outrank `.cargo/config.toml` (`build.rustc`,
+/// `build.rustc-wrapper`, `build.rustc-workspace-wrapper`) and
+/// `RUSTUP_TOOLCHAIN` outranks `rust-toolchain.toml`, so a project file can
+/// name none of these. An empty wrapper is cargo's "no wrapper".
+fn pinned_env(toolchain: &Toolchain) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    if let Some(pin) = &toolchain.pin {
+        env.insert("RUSTUP_TOOLCHAIN".to_string(), pin.clone());
+    }
+    if let Some(rustc) = &toolchain.rustc {
+        let rustc = rustc.to_string_lossy().into_owned();
+        env.insert("RUSTC".to_string(), rustc.clone());
+        env.insert("CARGO_BUILD_RUSTC".to_string(), rustc);
+    }
+    if let Some(cargo) = &toolchain.cargo {
+        env.insert("CARGO".to_string(), cargo.to_string_lossy().into_owned());
+    }
+    for wrapper in [
+        "RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    ] {
+        env.insert(wrapper.to_string(), String::new());
+    }
+    env
+}
+
 /// The server to run, and the version string it answered with.
 ///
-/// A bare `command` (the manifest's default, `rust-analyzer`) is looked up on
-/// `PATH` by the operating system - `Command::new` does that for us, on every
-/// platform - and, if that candidate does not behave like a server, `rustup
-/// which` is asked for the toolchain's own copy.
+/// A bare `command` (the manifest's default, `rust-analyzer`) is the pinned
+/// toolchain's own copy first, then a `PATH` install that is not a rustup
+/// proxy - see [`candidates`].
 ///
 /// **Correction, GM-341:** an earlier version of this comment said
 /// `Command::new`'s `PATH` lookup honours Windows' `PATHEXT` rules. It does
@@ -128,20 +210,14 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
 ///
 /// Each candidate's `--version` runs under [`PROBE_BUDGET`], like every
 /// plugin's, and is itself the probe: rust-analyzer answers `--version`.
-fn resolve(command: &Path) -> Result<lsp::Resolved> {
-    let bare = is_bare(command);
-    let candidates = candidates(command)
+fn resolve(command: &Path, toolchain: &Toolchain) -> Result<lsp::Resolved> {
+    let candidates = candidates(command, toolchain)
         .into_iter()
-        .enumerate()
-        .map(|(index, command)| Candidate {
+        .map(|(command, origin)| Candidate {
             probe: (command.clone(), Vec::new()),
             command,
             prefix_args: Vec::new(),
-            origin: match (index, bare) {
-                (0, true) => "PATH",
-                (0, false) => "the path the manifest names",
-                _ => "rustup which",
-            },
+            origin,
         })
         .collect();
     lsp::resolve(
@@ -153,35 +229,65 @@ fn resolve(command: &Path) -> Result<lsp::Resolved> {
     )
 }
 
-/// The binaries worth probing, in order: what the manifest says, then - only
-/// for a bare name - whatever `rustup which` resolves that name to.
-fn candidates(command: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![command.to_path_buf()];
+/// The binaries worth probing, in order, with their origins.
+///
+/// A path is the only candidate. A bare name is the pinned toolchain's
+/// absolute binary, then the `PATH` lookup - unless that lookup lands in
+/// rustup's own directory: a rustup proxy picks its toolchain from the
+/// working directory's `rust-toolchain.toml`, so it is never probed or run.
+fn candidates(command: &Path, toolchain: &Toolchain) -> Vec<(PathBuf, &'static str)> {
     if !is_bare(command) {
-        return candidates;
+        return vec![(command.to_path_buf(), "the path the manifest names")];
     }
-    let name = command.to_string_lossy().into_owned();
-    if let Some(path) = rustup_which(&name) {
-        if path != candidates[0] {
-            candidates.push(path);
+    let mut candidates = Vec::new();
+    if let Some(path) = &toolchain.rust_analyzer {
+        candidates.push((path.clone(), "rustup which"));
+    }
+    match &toolchain.proxy_dir {
+        None => candidates.push((command.to_path_buf(), "PATH")),
+        Some(proxy_dir) => {
+            if let Some(found) = on_path(&command.to_string_lossy()) {
+                if found.parent() != Some(proxy_dir.as_path()) && !candidates.iter().any(|(c, _)| *c == found)
+                {
+                    candidates.push((found, "PATH"));
+                }
+            }
         }
     }
     candidates
 }
 
-/// `rustup which <name>`, or `None` if rustup is not installed, does not know
-/// the name, or the toolchain does not have that component.
+/// `rustup <args>`'s trimmed stdout, or `None` if rustup is missing or fails.
 ///
-/// The failure is silent here and reported by [`resolve`] as part of one
-/// message, because on a machine with no rustup at all this is not news: the
-/// `PATH` candidate is then the only one there ever was.
-fn rustup_which(name: &str) -> Option<PathBuf> {
-    let output = Command::new("rustup").args(["which", name]).output().ok()?;
+/// Runs in [`neutral_dir`], so no project's `rust-toolchain.toml` is in
+/// scope.
+fn rustup(args: &[&str]) -> Option<String> {
+    let output = Command::new("rustup").args(args).current_dir(neutral_dir()).output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!path.is_empty()).then(|| PathBuf::from(path))
+    let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// A working directory no project can configure: this plugin binary's own
+/// directory, or the system temp directory.
+fn neutral_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// The first absolute `PATH` entry holding an executable file named `name`
+/// (with the platform's executable suffix tried too). Relative entries are
+/// skipped: they resolve against whatever directory is current.
+fn on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let spellings = [name.to_string(), format!("{name}{}", std::env::consts::EXE_SUFFIX)];
+    std::env::split_paths(&path).filter(|dir| dir.is_absolute()).find_map(|dir| {
+        spellings.iter().map(|spelling| dir.join(spelling)).find(|candidate| candidate.is_file())
+    })
 }
 
 #[cfg(test)]
@@ -193,19 +299,35 @@ mod tests {
     /// [`resolve`]'s doc.
     #[test]
     fn a_command_that_is_a_path_is_the_only_candidate() {
-        assert_eq!(candidates(Path::new("/opt/ra/rust-analyzer")).len(), 1);
-        assert_eq!(candidates(Path::new("servers/rust-analyzer")).len(), 1);
+        let toolchain = Toolchain::detect();
+        assert_eq!(candidates(Path::new("/opt/ra/rust-analyzer"), &toolchain).len(), 1);
+        assert_eq!(candidates(Path::new("servers/rust-analyzer"), &toolchain).len(), 1);
     }
 
-    /// A bare name is a `PATH` lookup first, and `rustup which` only as a
-    /// second candidate - never the other way round, and never instead.
+    /// Without rustup a bare name is the `PATH` lookup alone, as written.
     #[test]
-    fn a_bare_name_keeps_its_path_lookup_first() {
-        let candidates = candidates(Path::new("rust-analyzer"));
-        assert_eq!(candidates[0], PathBuf::from("rust-analyzer"), "the bare name stays a PATH lookup");
-        assert!(candidates.len() <= 2, "{candidates:?}");
-        if let Some(second) = candidates.get(1) {
-            assert!(second.is_absolute(), "rustup answers with a path: {second:?}");
+    fn without_rustup_a_bare_name_is_a_path_lookup() {
+        let candidates = candidates(Path::new("rust-analyzer"), &Toolchain::default());
+        assert_eq!(candidates, vec![(PathBuf::from("rust-analyzer"), "PATH")]);
+    }
+
+    /// With rustup the pinned toolchain's absolute binary comes first, and a
+    /// `PATH` hit inside rustup's own directory - a proxy - is never a
+    /// candidate.
+    #[test]
+    fn with_rustup_the_pinned_binary_comes_first_and_no_proxy_follows() {
+        let toolchain = Toolchain::detect();
+        let candidates = candidates(Path::new("rust-analyzer"), &toolchain);
+        if let (Some(pinned), Some(first)) = (&toolchain.rust_analyzer, candidates.first()) {
+            assert_eq!(first, &(pinned.clone(), "rustup which"), "{candidates:?}");
+        }
+        if let Some(proxy_dir) = &toolchain.proxy_dir {
+            assert!(
+                candidates
+                    .iter()
+                    .all(|(path, _)| path.is_absolute() && path.parent() != Some(proxy_dir.as_path())),
+                "{candidates:?}"
+            );
         }
     }
 
@@ -230,6 +352,16 @@ mod tests {
         );
         let options = config.initialization_options.expect("rust-analyzer is configured for a batch pass");
         assert_eq!(options.get("checkOnSave"), Some(&serde_json::json!(false)), "{options}");
+        assert_eq!(
+            options.pointer("/cargo/buildScripts/enable"),
+            Some(&serde_json::json!(false)),
+            "no build script runs: {options}"
+        );
+        assert_eq!(
+            options.pointer("/procMacro/enable"),
+            Some(&serde_json::json!(false)),
+            "no proc macro runs: {options}"
+        );
         assert_eq!(
             options.get("cachePriming"),
             None,
@@ -267,7 +399,8 @@ mod tests {
     /// SDK's shared format.
     #[test]
     fn nothing_usable_names_the_remedy() {
-        let err = resolve(Path::new("/nonexistent/rust-analyzer")).expect_err("must not resolve");
+        let err = resolve(Path::new("/nonexistent/rust-analyzer"), &Toolchain::default())
+            .expect_err("must not resolve");
         let message = format!("{err:#}");
         assert!(message.contains("rustup component add rust-analyzer"), "{message}");
         assert!(
@@ -284,7 +417,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_path_that_answers_resolves_with_its_origin() {
-        let resolved = resolve(Path::new("/bin/echo")).expect("echo answers");
+        let resolved = resolve(Path::new("/bin/echo"), &Toolchain::default()).expect("echo answers");
         assert_eq!(resolved.command, PathBuf::from("/bin/echo"));
         assert!(resolved.prefix_args.is_empty(), "{:?}", resolved.prefix_args);
         assert_eq!(resolved.origin, "the path the manifest names");

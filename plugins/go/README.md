@@ -59,6 +59,12 @@ or a `workspaceChanged`, only by a `semanticPass`. That is what
 `g-mesh plugins check`'s `capabilities.semantic-engine-lazy` verifies, through
 a marker the pass writes at the moment it first calls `packages.Load`.
 
+`go list` runs with `GOTOOLCHAIN=local` and `GOPACKAGESDRIVER=off`: a module
+whose `go` line is newer than your installed Go is not loaded (the pass
+degrades, logged) rather than downloading and running another toolchain, and
+a `gopackagesdriver` on `PATH` is not used. cgo stays on. See
+[ADR 0032](../../docs/adr/0032-semantic-tiers-execute-no-project-code.md).
+
 Every answer is a `qualifiedName`-keyed placeholder addressed at the
 *declaring* package's container, plus one `semantic` / `go-types` edge onto
 it. `Close` as a bare name is worthless — it exists on dozens of types — so

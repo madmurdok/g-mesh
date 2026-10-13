@@ -1,5 +1,12 @@
-//! The Python plugin's semantic tier: finding pyright, telling it about the
-//! project's interpreter, and handing it to the SDK's generic [`LspBridge`].
+//! The Python plugin's semantic tier: finding pyright, telling it where the
+//! project's venv packages are, and handing it to the SDK's generic
+//! [`LspBridge`].
+//!
+//! pyright runs no code the project supplies: no interpreter (it is handed
+//! [`no_interpreter`] as `python.pythonPath` and the venv's site-packages as
+//! `python.analysis.extraPaths`) and no server binary from the project's
+//! `node_modules/.bin`
+//! ([ADR 0032](../../../docs/adr/0032-semantic-tiers-execute-no-project-code.md)).
 //!
 //! Everything about *driving* a language server is the SDK's
 //! (`plugins/sdk/src/lsp/`, whose module doc carries the decision table).
@@ -8,7 +15,7 @@
 //! from the rust-analyzer precedent `plugins/rust/src/semantic.rs` set, in
 //! ways that are measured here rather than assumed.
 //!
-//! # Decision 1: three places to look, each probed rather than believed
+//! # Decision 1: two places to look, each probed rather than believed
 //!
 //! GM-290's rule was "find it, then prove it", and the proof was
 //! `<candidate> --version`. The rule survives; the proof does not, because
@@ -33,20 +40,14 @@
 //! line, because "which pyright answered this pass" is the first thing anyone
 //! asks of a semantic index that looks wrong.
 //!
-//! The three places, in order, and what each one is for:
+//! The two places, in order, and what each one is for:
 //!
 //! 1. **`PATH`.** The manifest's bare `pyright-langserver`, looked up by the
 //!    operating system - `Command::new` does that on every platform. This is
 //!    a global `npm i -g pyright`, a `pipx install pyright`, or a distro
 //!    package. On Windows this candidate needs more than a plain lookup - see
 //!    Decision 1b, right after this list.
-//! 2. **The indexed project's own `node_modules/.bin`.** Resolved against the
-//!    *project root*, not against the manifest, and this is the reason the
-//!    factory takes a root at all: a project that pins its own pyright is
-//!    stating which version its code type-checks against, and running a
-//!    different global one would answer a question nobody asked. It is also
-//!    the least invasive way to have a pyright at all - no global install.
-//! 3. **`npx`.** Last, deliberately: it is the only candidate that can touch
+//! 2. **`npx`.** Last, deliberately: it is the only candidate that can touch
 //!    the network, and it is the one that most needs the probe. `npx` is to
 //!    pyright what `~/.cargo/bin/rust-analyzer` was to rust-analyzer in
 //!    GM-290 - a binary that always exists and always starts, whether or not
@@ -84,7 +85,7 @@
 //!
 //! # Decision 1b: `Command::new` does not walk `PATHEXT`, so this module does
 //!
-//! GM-341: none of the three candidates above start on Windows when pyright
+//! GM-341: none of the candidates above start on Windows when pyright
 //! is installed the ordinary way, `npm install pyright`. npm's Windows shim
 //! for a bin is not a `.exe` - `bin-links` writes `<name>.cmd` (a `cmd.exe`
 //! batch file usable from `cmd.exe`, PowerShell, and this process) alongside
@@ -95,9 +96,8 @@
 //! as given and then `<name>.exe`, nothing else. `PATHEXT` is `cmd.exe`'s own
 //! rule, consulted by the shell that parses a typed command line - not by
 //! `CreateProcess`, and not by anything standing between it and `Command`.
-//! Concretely: candidate 1 looks for `pyright-langserver.exe`; candidate 2
-//! names `node_modules/.bin/pyright-langserver`, a path with a separator, so
-//! *no* extension is tried at all; and even candidate 3 fails the same way,
+//! Concretely: candidate 1 looks for `pyright-langserver.exe`; and even
+//! candidate 2 fails the same way,
 //! because `npx` itself ships as `npx.cmd` beside `node.exe` on a machine
 //! whose Node came from the official Windows installer. Not measured on a
 //! Windows host - there is none here - but is documented `CreateProcess`
@@ -106,7 +106,7 @@
 //! which carried the same naive candidate list this module did - still
 //! reported no usable pyright.
 //!
-//! The fix is [`lsp::script_spellings`]: every final candidate path from all three
+//! The fix is [`lsp::script_spellings`]: every final candidate path from both
 //! branches above, and a path the manifest names explicitly, is tried both as
 //! written and, when it has no extension of its own, with `.cmd` appended.
 //! Only `.cmd` - not `.bat`, which current npm does not write (listing a
@@ -116,7 +116,7 @@
 //! `powershell -File` wrapper this module does not add, so trying the bare
 //! `.ps1` path would add a candidate that can never succeed rather than a
 //! real fallback. `npx` is not special-cased - it goes through the same
-//! expansion as the manifest path and the two npm-install candidates, which
+//! expansion as the manifest path and the npm-install candidate, which
 //! is what makes this a fix rather than a list of two spellings with a third
 //! exception waiting to be discovered the same way this one was. The
 //! extension list is a parameter, not a fact [`lsp::script_spellings`] reads
@@ -131,8 +131,8 @@
 //! # Decision 2: the probe is bounded, because this one can reach the network
 //!
 //! rust-analyzer's `--version` is about twenty milliseconds of local work.
-//! Measured here, the three candidates are not one cost but two -
-//! `node_modules/.bin/pyright --version` is 0.89s (node start-up), and
+//! Measured here, the candidates are not one cost but two - an installed
+//! `pyright --version` is 0.89s (node start-up), and
 //! `npx --yes pyright --version` is 4.94s when it has to populate npm's `_npx`
 //! cache and longer when it has to download. A registry that is unreachable
 //! rather than absent does not fail fast, and the factory runs *inside* the
@@ -162,9 +162,11 @@
 //!   effect on this fixture is 4 diagnostics at `basic` against 39 at
 //!   `strict`. Inference, which is the part that answers `definition`, is the
 //!   same at every level.
-//! - `python.pythonPath`, from [`interpreter`], when the project has a venv.
-//!   This one cannot come from the manifest: it is a path inside the project
-//!   being indexed, and the manifest ships beside the plugin binary.
+//! - `python.pythonPath` = [`no_interpreter`], always, and
+//!   `python.analysis.extraPaths` = [`site_packages`], when the project has a
+//!   venv. pyright executes any `pythonPath` it is given and falls back to
+//!   `python3`/`python` on `PATH` when it is unset; a path that cannot exist
+//!   makes it run none and resolve imports from `extraPaths` alone.
 //! - `python.analysis.exclude`, from the SDK's `walk_scope`: the directories
 //!   the walk leaves out, so pyright does not scan a gitignored build tree
 //!   before its first answer. Only `exclude`, never `include`, and taken once
@@ -219,8 +221,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use g_mesh_plugin_sdk::lsp::{
-    self, npm_candidates, Candidate, LspBridge, NpmServer, Resolved, SemanticConfig, HOST_SCRIPT_EXTENSIONS,
-    PROBE_BUDGET,
+    self, npm_candidates_outside_project, Candidate, LspBridge, NpmServer, Resolved, SemanticConfig,
+    HOST_SCRIPT_EXTENSIONS, PROBE_BUDGET,
 };
 use g_mesh_plugin_sdk::{walk_scope, SemanticEngine, WalkScope};
 
@@ -253,9 +255,9 @@ const PYRIGHT: NpmServer<'static> =
 ///
 /// Deliberately the same two names `crate::project::EXCLUDE_DIRS` skips when
 /// walking - a directory whose contents are never indexed is exactly the
-/// directory an interpreter lives in, and keeping the two lists in agreement
-/// is what stops a venv being both invisible to the walk and invisible to the
-/// type checker.
+/// directory a venv's packages live in, and keeping the two lists in
+/// agreement is what stops a venv being both invisible to the walk and
+/// invisible to the type checker.
 const VENV_DIRS: [&str; 2] = [".venv", "venv"];
 
 /// Builds the semantic engine for `root` - the
@@ -277,7 +279,7 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
 /// Turns the manifest's `config` into the one the server for `root` runs
 /// with: the resolved command and its args, then [`add_project_settings`].
 fn prepare(config: &mut SemanticConfig, root: &Path) -> Result<()> {
-    let resolved = resolve(&config.command, root, HOST_SCRIPT_EXTENSIONS)?;
+    let resolved = resolve(&config.command, HOST_SCRIPT_EXTENSIONS)?;
     let mut args = resolved.prefix_args;
     args.extend(config.args.iter().cloned());
     g_mesh_plugin_sdk::log_line!(
@@ -293,14 +295,17 @@ fn prepare(config: &mut SemanticConfig, root: &Path) -> Result<()> {
 }
 
 /// Adds the settings that depend on the project at `root` rather than on the
-/// manifest: its interpreter, when it has one, and the walk's exclude list.
+/// manifest: no interpreter, the venv's site-packages when it has a venv, and
+/// the walk's exclude list.
 fn add_project_settings(config: &mut SemanticConfig, root: &Path) {
-    // A project with no venv is the ordinary case and not a warning: pyright
-    // then finds an interpreter itself and says which one it assumed in its
-    // own log, which the bridge forwards.
-    if let Some(python) = interpreter(root) {
-        g_mesh_plugin_sdk::log_line!("[{LANGUAGE}] semantic tier: python.pythonPath = {}", python.display());
-        set_python_path(config, &python);
+    set_python_path(config, &no_interpreter());
+    let packages = site_packages(root);
+    if !packages.is_empty() {
+        g_mesh_plugin_sdk::log_line!(
+            "[{LANGUAGE}] semantic tier: python.analysis.extraPaths += {}",
+            packages.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")
+        );
+        add_extra_paths(config, &packages);
     }
 
     let exclude: Vec<String> = crate::project::EXCLUDE_DIRS.iter().map(|dir| (*dir).to_string()).collect();
@@ -320,20 +325,21 @@ fn add_project_settings(config: &mut SemanticConfig, root: &Path) {
 ///
 /// `script_extensions` is [`HOST_SCRIPT_EXTENSIONS`] in production; it is a
 /// parameter so tests can exercise the Windows spellings from any host.
-fn resolve(command: &Path, root: &Path, script_extensions: &[&str]) -> Result<Resolved> {
+fn resolve(command: &Path, script_extensions: &[&str]) -> Result<Resolved> {
     lsp::resolve(
-        candidates(command, root, script_extensions),
+        candidates(command, script_extensions),
         PROBE_BUDGET,
         "pyright",
-        "Install it with `npm install pyright` in the project (its node_modules/.bin is looked in), \
-         or `npm install -g pyright`, or point [plugin.semantic] command in plugins/python/plugin.toml \
-         at a pyright-langserver",
+        "Install it with `npm install -g pyright`, or point [plugin.semantic] command in \
+         plugins/python/plugin.toml at a pyright-langserver",
     )
 }
 
-/// The spellings worth probing, in order - [`npm_candidates`] for pyright.
-fn candidates(command: &Path, root: &Path, script_extensions: &[&str]) -> Vec<Candidate> {
-    npm_candidates(command, root, &PYRIGHT, script_extensions)
+/// The spellings worth probing, in order -
+/// [`npm_candidates_outside_project`] for pyright: never the indexed
+/// project's own `node_modules/.bin`.
+fn candidates(command: &Path, script_extensions: &[&str]) -> Vec<Candidate> {
+    npm_candidates_outside_project(command, &PYRIGHT, script_extensions)
 }
 
 /// The CLI entry point beside a language-server one: `…/pyright-langserver`
@@ -363,27 +369,43 @@ fn cli_twin(command: &Path) -> PathBuf {
     }
 }
 
-/// The project's own interpreter, if it has one: `<root>/.venv/bin/python`, or
-/// the `venv` spelling, or the Windows layout of either.
+/// The project venv's site-packages directories, found by reading
+/// directories only: `<venv>/lib/python*/site-packages` and the Windows
+/// `<venv>/Lib/site-packages`, for the first of [`VENV_DIRS`] that has any.
 ///
-/// **Only a directory under the project root.** `$VIRTUAL_ENV` is deliberately
-/// not consulted, and that is a decision rather than an omission: the
-/// environment this process inherits is the daemon's, which is whatever shell
-/// started `g-mesh`, which on a machine with several checked-out projects is
-/// as likely to name *another* project's environment as this one's. A wrong
-/// interpreter is worse than none - pyright resolves third-party imports
-/// against it, so every `import` that a project's real environment provides
-/// would resolve to the wrong package or to nothing.
-fn interpreter(root: &Path) -> Option<PathBuf> {
+/// **Only a directory under the project root.** `$VIRTUAL_ENV` is not
+/// consulted: the daemon's environment may name another project's venv, and
+/// a wrong venv resolves imports to the wrong packages.
+fn site_packages(root: &Path) -> Vec<PathBuf> {
     for dir in VENV_DIRS {
-        for relative in ["bin/python", "bin/python3", "Scripts/python.exe"] {
-            let candidate = root.join(dir).join(relative);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+        let venv = root.join(dir);
+        let mut found: Vec<PathBuf> = std::fs::read_dir(venv.join("lib"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("python"))
+            .map(|entry| entry.path().join("site-packages"))
+            .chain(std::iter::once(venv.join("Lib").join("site-packages")))
+            .filter(|path| path.is_dir())
+            .collect();
+        if !found.is_empty() {
+            found.sort();
+            found.dedup();
+            return found;
         }
     }
-    None
+    Vec::new()
+}
+
+/// A `pythonPath` that names no file and never can: a child of this plugin's
+/// own executable, which is a file. pyright fails to run it and runs no
+/// other interpreter in its place.
+fn no_interpreter() -> PathBuf {
+    let parent = std::env::current_exe().unwrap_or_else(|_| {
+        // Still a file on every platform, so the child path cannot exist.
+        PathBuf::from(if cfg!(windows) { r"C:\Windows\System32\cmd.exe" } else { "/dev/null" })
+    });
+    parent.join("g-mesh-no-python-interpreter")
 }
 
 /// Adds `pythonPath` to the `python` section of `config.settings`, keeping
@@ -397,6 +419,20 @@ fn set_python_path(config: &mut SemanticConfig, python: &Path) {
     let section =
         as_object(config.settings.entry("python".to_string()).or_insert_with(|| serde_json::json!({})));
     section.insert("pythonPath".to_string(), serde_json::json!(python.to_string_lossy()));
+}
+
+/// Appends `paths` to `python.analysis.extraPaths`, after any the manifest
+/// already lists.
+fn add_extra_paths(config: &mut SemanticConfig, paths: &[PathBuf]) {
+    let section =
+        as_object(config.settings.entry("python".to_string()).or_insert_with(|| serde_json::json!({})));
+    let analysis = as_object(section.entry("analysis").or_insert_with(|| serde_json::json!({})));
+    let extra = analysis.entry("extraPaths").or_insert_with(|| serde_json::json!([]));
+    if !extra.is_array() {
+        *extra = serde_json::json!([]);
+    }
+    let extra = extra.as_array_mut().expect("just made an array");
+    extra.extend(paths.iter().map(|path| serde_json::json!(path.to_string_lossy())));
 }
 
 /// Adds `analysis.exclude` to the `python` section of `config.settings`: the
@@ -435,31 +471,25 @@ fn as_object(value: &mut serde_json::Value) -> &mut serde_json::Map<String, serd
 #[cfg(test)]
 mod tests {
     use super::*;
-    use g_mesh_plugin_sdk::lsp::{probe, ServerReadiness, WINDOWS_SCRIPT_EXTENSIONS};
+    use g_mesh_plugin_sdk::lsp::{ServerReadiness, WINDOWS_SCRIPT_EXTENSIONS};
 
-    /// Where a project keeps a locally installed pyright.
-    const NODE_BIN_DIR: &str = "node_modules/.bin";
-
-    /// A bare name is three places in one fixed order, and the middle one is
-    /// resolved against the *project*, not against the manifest.
+    /// A bare name is `PATH`, then `npx`, and never a `node_modules/.bin`.
     #[test]
-    fn a_bare_name_is_path_then_the_projects_node_modules_then_npx() {
-        let root = Path::new("/projects/thing");
-        let candidates = candidates(Path::new(SERVER_BIN), root, &[]);
-        assert_eq!(candidates.len(), 3, "{candidates:#?}");
+    fn a_bare_name_is_path_then_npx_and_never_a_project_install() {
+        let candidates = candidates(Path::new(SERVER_BIN), &[]);
+        assert_eq!(candidates.len(), 2, "{candidates:#?}");
 
         assert_eq!(candidates[0].command, PathBuf::from(SERVER_BIN), "the bare name stays a PATH lookup");
         assert!(candidates[0].prefix_args.is_empty());
 
-        assert_eq!(
-            candidates[1].command,
-            root.join("node_modules/.bin").join(SERVER_BIN),
-            "the project's own install, under the root being indexed"
+        assert!(
+            candidates.iter().all(|candidate| !candidate.command.to_string_lossy().contains("node_modules")),
+            "no project-local install is probed or run: {candidates:#?}"
         );
 
-        assert_eq!(candidates[2].command, PathBuf::from("npx"));
+        assert_eq!(candidates[1].command, PathBuf::from("npx"));
         assert_eq!(
-            candidates[2].prefix_args,
+            candidates[1].prefix_args,
             vec!["--yes", "--package", NPM_PACKAGE, SERVER_BIN],
             "the bin is not a package: `npx --yes pyright-langserver` is a 404 - see Decision 1"
         );
@@ -469,8 +499,7 @@ mod tests {
     /// server itself has no `--version` - see this module's doc, Decision 1.
     #[test]
     fn every_candidate_is_probed_through_the_cli_twin_and_never_the_server() {
-        let root = Path::new("/projects/thing");
-        for candidate in candidates(Path::new(SERVER_BIN), root, &WINDOWS_SCRIPT_EXTENSIONS) {
+        for candidate in candidates(Path::new(SERVER_BIN), &WINDOWS_SCRIPT_EXTENSIONS) {
             let (probe, args) = &candidate.probe;
             assert!(
                 !probe.to_string_lossy().contains("langserver"),
@@ -517,97 +546,52 @@ mod tests {
         );
     }
 
-    /// The project-local branch against a **real** pyright, not a stand-in.
-    ///
-    /// The conformance kit cannot exercise this branch: it runs the plugin
-    /// against a scratch *copy* of the fixture and `copy_tree` skips symlinks
-    /// deliberately, so an npm `.bin` directory - which is nothing but
-    /// symlinks on unix - does not survive the copy. That is a fact about the
-    /// kit and not about this plugin, so the branch is proved here instead,
-    /// with a project tree built for the purpose and the real install behind
-    /// it: the probe really runs, and the version it reports is pyright's own.
-    ///
-    /// The one thing this cannot assert unconditionally is that branch 2
-    /// *won*: on a machine with a global pyright, branch 1 legitimately wins.
-    /// So the invariant asserted in both worlds is the one that matters -
-    /// a project-local install is found without reaching for the network -
-    /// and the exact answer is asserted when `PATH` has nothing.
-    #[cfg(unix)]
+    /// The venv lookup reads the project's directories, and only the
+    /// project's.
     #[test]
-    fn a_project_local_install_is_found_and_probed_for_real() {
-        let installed = installed_bin_dir();
-        let guard = tempfile::Builder::new().prefix("g-mesh-py-local-").tempdir().unwrap();
-        let root = guard.path().to_path_buf();
-        let bin = root.join(NODE_BIN_DIR);
-        std::fs::create_dir_all(&bin).unwrap();
-        for name in [SERVER_BIN, CLI_BIN] {
-            std::os::unix::fs::symlink(installed.join(name), bin.join(name)).unwrap();
-        }
-
-        let version = probe(&bin.join(CLI_BIN), &[], PROBE_BUDGET)
-            .expect("the project-local CLI twin answers --version");
-        assert!(version.starts_with("pyright "), "the probe reports pyright's own version: {version}");
-
-        let resolved =
-            resolve(Path::new(SERVER_BIN), &root, HOST_SCRIPT_EXTENSIONS).expect("a local install resolves");
-        assert_ne!(resolved.origin, "npx", "a local install must be found without the network");
-        if probe(Path::new(CLI_BIN), &[], PROBE_BUDGET).is_err() {
-            assert_eq!(resolved.origin, "the project's node_modules/.bin");
-            assert_eq!(resolved.command, bin.join(SERVER_BIN), "and it is the server, not the CLI");
-            assert!(resolved.prefix_args.is_empty(), "no npx wrapping: {resolved:?}");
-        }
-    }
-
-    /// Where `scripts/test-deps.sh pyright` (an `npm ci` in `plugins/python`,
-    /// against its committed package.json and lock) puts its bins.
-    ///
-    /// Deliberately not a `None` that turns into a skip - the same rule
-    /// `plugins/rust/tests/conformance.rs` states for rust-analyzer: a check
-    /// that passes because it did not run is the failure this whole thing
-    /// exists to remove.
-    fn installed_bin_dir() -> PathBuf {
-        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/node_modules/.bin"));
-        match probe(&dir.join(CLI_BIN), &[], PROBE_BUDGET) {
-            Ok(_) => dir.to_path_buf(),
-            Err(err) => panic!(
-                "these tests drive a real pyright and there is none in {}: {err:#}. Install it with \
-                 `scripts/test-deps.sh pyright` from the repository root (`npm ci` of the version \
-                 plugins/python/package.json pins, as CI does; node_modules/ is gitignored there).",
-                dir.display()
-            ),
-        }
-    }
-
-    /// The venv lookup reads the project, and only the project.
-    #[test]
-    fn an_interpreter_is_found_under_the_root_and_nowhere_else() {
+    fn site_packages_are_found_under_the_root_and_nowhere_else() {
         let guard = tempfile::Builder::new().prefix("g-mesh-py-venv-").tempdir().unwrap();
         let dir = guard.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".venv/bin")).unwrap();
-        assert_eq!(interpreter(&dir), None, "an empty .venv is not an interpreter");
-
         std::fs::write(dir.join(".venv/bin/python"), "#!/bin/sh\n").unwrap();
-        assert_eq!(interpreter(&dir), Some(dir.join(".venv/bin/python")));
+        assert!(site_packages(&dir).is_empty(), "an interpreter alone is not a site-packages");
+
+        std::fs::create_dir_all(dir.join(".venv/lib/python3.12/site-packages")).unwrap();
+        assert_eq!(site_packages(&dir), vec![dir.join(".venv/lib/python3.12/site-packages")]);
 
         let empty = dir.join("no-venv-here");
         std::fs::create_dir_all(&empty).unwrap();
-        assert_eq!(interpreter(&empty), None);
+        assert!(site_packages(&empty).is_empty());
     }
 
-    /// `pythonPath` joins the manifest's own settings rather than replacing
-    /// the section they live in.
+    /// The `pythonPath` handed to pyright is not a file, and is not a bare
+    /// name pyright would look up on `PATH`.
     #[test]
-    fn the_interpreter_is_merged_into_the_manifests_own_python_section() {
+    fn the_python_path_names_no_interpreter() {
+        let python = no_interpreter();
+        assert!(python.is_absolute(), "{python:?}");
+        assert!(!python.exists(), "{python:?}");
+    }
+
+    /// `pythonPath` and `extraPaths` join the manifest's own settings rather
+    /// than replacing the section they live in.
+    #[test]
+    fn the_venv_settings_are_merged_into_the_manifests_own_python_section() {
         let mut config = SemanticConfig::new(SERVER_BIN);
-        config
-            .settings
-            .insert("python".to_string(), serde_json::json!({ "analysis": { "typeCheckingMode": "basic" } }));
-        set_python_path(&mut config, Path::new("/p/.venv/bin/python"));
+        config.settings.insert(
+            "python".to_string(),
+            serde_json::json!({ "analysis": { "typeCheckingMode": "basic", "extraPaths": ["mine"] } }),
+        );
+        set_python_path(&mut config, Path::new("/none"));
+        add_extra_paths(&mut config, &[PathBuf::from("/p/.venv/lib/python3.12/site-packages")]);
         assert_eq!(
             config.settings["python"],
             serde_json::json!({
-                "analysis": { "typeCheckingMode": "basic" },
-                "pythonPath": "/p/.venv/bin/python",
+                "analysis": {
+                    "typeCheckingMode": "basic",
+                    "extraPaths": ["mine", "/p/.venv/lib/python3.12/site-packages"],
+                },
+                "pythonPath": "/none",
             })
         );
     }
@@ -977,10 +961,9 @@ mod tests {
     #[test]
     fn nothing_usable_names_the_remedy() {
         let command = Path::new("/nonexistent/pyright-langserver");
-        let err = resolve(command, Path::new("/projects/thing"), HOST_SCRIPT_EXTENSIONS)
-            .expect_err("must not resolve");
+        let err = resolve(command, HOST_SCRIPT_EXTENSIONS).expect_err("must not resolve");
         let message = format!("{err:#}");
-        assert!(message.contains("npm install pyright"), "{message}");
+        assert!(message.contains("npm install -g pyright"), "{message}");
         // The candidate is rendered by `Path::display()` from what `cli_twin`
         // built with `Path::join`, so on Windows it reads `/nonexistent\pyright`
         // and this assertion used to spell `/nonexistent/pyright` by hand and

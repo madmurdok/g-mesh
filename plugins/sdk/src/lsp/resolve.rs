@@ -125,6 +125,29 @@ pub fn script_spellings(path: &Path, extensions: &[&str]) -> Vec<PathBuf> {
 /// candidate's probe is its own argv with `npm.probe_bin` in place of the
 /// server's bin, so the probe proves the argv shape that will run.
 pub fn npm_candidates(command: &Path, root: &Path, npm: &NpmServer, extensions: &[&str]) -> Vec<Candidate> {
+    npm_candidates_in(command, Some(root), npm, extensions)
+}
+
+/// [`npm_candidates`] without the project's `node_modules/.bin`: `PATH`, then
+/// `npx`. Nothing under the indexed project is probed or run, so a project
+/// cannot ship the server binary
+/// ([ADR 0032](../../../../docs/adr/0032-semantic-tiers-execute-no-project-code.md)).
+pub fn npm_candidates_outside_project(
+    command: &Path,
+    npm: &NpmServer,
+    extensions: &[&str],
+) -> Vec<Candidate> {
+    npm_candidates_in(command, None, npm, extensions)
+}
+
+/// The candidates, with the `<root>/node_modules/.bin` origin only when a
+/// `root` is given.
+fn npm_candidates_in(
+    command: &Path,
+    root: Option<&Path>,
+    npm: &NpmServer,
+    extensions: &[&str],
+) -> Vec<Candidate> {
     let installed = |command: PathBuf, origin: &'static str| Candidate {
         probe: ((npm.twin)(&command), Vec::new()),
         command,
@@ -139,7 +162,6 @@ pub fn npm_candidates(command: &Path, root: &Path, npm: &NpmServer, extensions: 
     }
 
     let name = command.to_string_lossy().into_owned();
-    let local = root.join(NODE_BIN_DIR).join(&name);
     let npx_args = |bin: &str| -> Vec<String> {
         vec!["--yes".to_string(), "--package".to_string(), npm.package.to_string(), bin.to_string()]
     };
@@ -147,8 +169,10 @@ pub fn npm_candidates(command: &Path, root: &Path, npm: &NpmServer, extensions: 
     for command in script_spellings(command, extensions) {
         candidates.push(installed(command, "PATH"));
     }
-    for command in script_spellings(&local, extensions) {
-        candidates.push(installed(command, "the project's node_modules/.bin"));
+    if let Some(root) = root {
+        for command in script_spellings(&root.join(NODE_BIN_DIR).join(&name), extensions) {
+            candidates.push(installed(command, "the project's node_modules/.bin"));
+        }
     }
     for command in script_spellings(Path::new("npx"), extensions) {
         candidates.push(Candidate {
