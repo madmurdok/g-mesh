@@ -100,6 +100,7 @@ package main
 //     accepts today.
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/token"
 	"go/types"
@@ -330,8 +331,9 @@ func newResolutions() *resolutions {
 // semantic tier becomes useless in exactly the repositories that need it.
 func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) error {
 	fset := token.NewFileSet()
-	cfg := &packages.Config{Mode: loadMode, Dir: dir, Tests: true, Fset: fset, Env: loadEnv()}
-	if flag := modFlag(dir, os.Getenv); flag != "" {
+	env := loadEnv()
+	cfg := &packages.Config{Mode: loadMode, Dir: dir, Tests: true, Fset: fset, Env: env}
+	if flag := modFlag(dir, env); flag != "" {
 		cfg.BuildFlags = []string{flag}
 	}
 
@@ -358,29 +360,46 @@ func loadEnv() []string {
 	return append(os.Environ(), "GOTOOLCHAIN=local", "GOPACKAGESDRIVER=off", "GOPROXY=off")
 }
 
-// modFlag is the `-mod` build flag `go list` runs with from dir, so it never
-// writes go.mod or go.sum: "-mod=vendor" when the governing go.work (else
-// go.mod) has a vendor/modules.txt beside it, "-mod=readonly" otherwise, and
-// "" when dir is not in module mode (GO111MODULE=off, or no go.mod or go.work
-// above it), where go rejects the flag and writes neither file anyway.
+// modFlag is the `-mod` build flag `go list` runs with from dir under env,
+// so it never writes go.mod or go.sum: "-mod=vendor" when the governing
+// go.work (else go.mod) has a vendor/modules.txt beside it, "-mod=readonly"
+// otherwise, and "" when dir is not in module mode or has no go.mod or
+// go.work above it, where go rejects the flag and writes neither file anyway.
 //
-// The governing files are found the way go finds them: GOWORK names the
-// workspace file ("off" for none), else the nearest go.work at or above dir;
-// the module file is the nearest go.mod at or above dir.
-func modFlag(dir string, getenv func(string) string) string {
-	if getenv("GO111MODULE") == "off" {
+// The governing files are the ones go itself resolves (`go env GOWORK
+// GOMOD`, run from dir under the load's own env), so every source of go's
+// settings counts: the process environment, the go env file (GOENV,
+// `go env -w`) and go's defaults. When go cannot answer, the answer is
+// "-mod=readonly", the flag that never writes.
+func modFlag(dir string, env []string) string {
+	cmd := exec.Command("go", "env", "-json", "GOWORK", "GOMOD")
+	cmd.Dir = dir
+	cmd.Env = env
+	out, err := cmd.Output()
+	if err != nil {
+		return "-mod=readonly"
+	}
+	var resolved struct{ GOWORK, GOMOD string }
+	if err := json.Unmarshal(out, &resolved); err != nil {
+		return "-mod=readonly"
+	}
+	return modFlagFor(resolved.GOWORK, resolved.GOMOD)
+}
+
+// modFlagFor is [modFlag]'s answer for go's resolved GOWORK and GOMOD:
+// GOWORK is the workspace file in effect ("" or "off" for none), GOMOD the
+// main module's go.mod ("" outside module mode, os.DevNull in module mode
+// with no go.mod).
+func modFlagFor(gowork, gomod string) string {
+	if gomod == "" {
 		return ""
 	}
-	governing := ""
-	switch gowork := getenv("GOWORK"); gowork {
-	case "off":
-	case "":
-		governing = findUp(dir, "go.work")
-	default:
-		governing = gowork
+	governing := gowork
+	if governing == "off" {
+		governing = ""
 	}
-	if governing == "" {
-		governing = findUp(dir, "go.mod")
+	if governing == "" && gomod != os.DevNull {
+		governing = gomod
 	}
 	if governing == "" {
 		return ""
@@ -389,22 +408,6 @@ func modFlag(dir string, getenv func(string) string) string {
 		return "-mod=vendor"
 	}
 	return "-mod=readonly"
-}
-
-// findUp is the path of the nearest regular file called name in dir or one
-// of its ancestors, or "" when there is none.
-func findUp(dir, name string) string {
-	for {
-		candidate := filepath.Join(dir, name)
-		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
-			return candidate
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return ""
-		}
-		dir = parent
-	}
 }
 
 // foldPackage indexes one loaded package's type information by position and

@@ -40,7 +40,10 @@ nothing under the project root.
   (`plugins/go/semantic.go`, `loadEnv`); later entries win over the user's.
 - **D4 - go: an explicit `-mod` build flag.** `-mod=vendor` when the
   governing `go.work` (else `go.mod`) has `vendor/modules.txt` beside it,
-  `-mod=readonly` otherwise, none outside module mode (`modFlag`). A
+  `-mod=readonly` otherwise, none outside module mode (`modFlag`). The
+  governing files are the ones `go env GOWORK GOMOD` resolves from the load's
+  directory under the load's environment, so the go env file (`go env -w`)
+  counts as well as the process environment. A
   command-line `-mod` overrides only the `-mod` in the user's `GOFLAGS`; the
   user's other flags stay. `GOFLAGS` itself is not replaced.
 

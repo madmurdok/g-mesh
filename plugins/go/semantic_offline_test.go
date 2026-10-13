@@ -405,8 +405,17 @@ func TestModFlagFollowsTheGoverningFile(t *testing.T) {
 		"dirvendor/go.mod":                  "module example.com/d\n",
 		"dirvendor/vendor/modules.txt/keep": "",
 	})
-	env := func(vars map[string]string) func(string) string {
-		return func(name string) string { return vars[name] }
+	// An empty go env file, so the user's `go env -w` settings stay out.
+	goenv := filepath.Join(t.TempDir(), "go.env")
+	if err := os.WriteFile(goenv, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := func(vars map[string]string) []string {
+		out := append(loadEnv(), "GOENV="+goenv, "GO111MODULE=", "GOWORK=")
+		for name, value := range vars {
+			out = append(out, name+"="+value)
+		}
+		return out
 	}
 	at := func(rel string) string { return filepath.Join(root, filepath.FromSlash(rel)) }
 	for _, tc := range []struct {
