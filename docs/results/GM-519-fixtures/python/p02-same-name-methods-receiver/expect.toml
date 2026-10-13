@@ -1,0 +1,8 @@
+[[callers]]
+symbol = "Socket.close"
+file = "pkg/sockets.py"
+expect = []
+[[callers]]
+symbol = "FileHandle.close"
+file = "pkg/files.py"
+expect = ["pkg/main.py:shut"]

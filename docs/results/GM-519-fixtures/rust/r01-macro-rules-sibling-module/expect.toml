@@ -1,0 +1,4 @@
+[[callers]]
+symbol = "twice"
+file = "src/macros.rs"
+expect = ["src/user.rs:user::doubled"]

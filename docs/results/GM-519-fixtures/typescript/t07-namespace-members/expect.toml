@@ -1,0 +1,8 @@
+[[callers]]
+symbol = "area"
+file = "src/geo.ts"
+expect = ["src/main.ts:measure"]
+[[callers]]
+symbol = "radius"
+file = "src/geo.ts"
+expect = ["src/main.ts:measure"]

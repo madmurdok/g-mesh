@@ -1,0 +1,5 @@
+# Correct: `handler()` calls the exported const `handler` (a Variable), never Router#handler.
+[[callers]]
+symbol = "Router#handler"
+file = "src/x.ts"
+expect = []

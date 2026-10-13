@@ -1,0 +1,4 @@
+[[callers]]
+symbol = "Money#raw"
+file = "src/money.ts"
+expect = ["src/money.ts:Money#equals"]
