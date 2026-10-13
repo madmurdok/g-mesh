@@ -42,6 +42,18 @@ Nothing the project's files name is executed.
   empty. Environment outranks `.cargo/config.toml` and `rust-toolchain.toml`.
   Without rustup, `RUSTC`/`CARGO` are the `PATH` ones and the wrappers are
   still emptied. The daemon's own `RUSTUP_TOOLCHAIN`, if set, is the pin.
+  The same map sets `CARGO_ENCODED_RUSTFLAGS` empty: it outranks a project's
+  `.cargo/config.toml` `[build]`/`[target.*]` `rustflags`, which otherwise
+  reach the `rustc` probes of `cargo metadata` and can carry `-Z` flags such
+  as `-Zcodegen-backend=<project dylib>`. It does not reach host units when
+  cargo honours the config's `[unstable]` table (nightly cargo, or
+  `RUSTC_BOOTSTRAP=1`): `host-config = true` with
+  `target-applies-to-host = false` hands them `[host]` `rustflags` past the
+  empty value (measured, cargo 1.97.1 with `RUSTC_BOOTSTRAP=1`; rust-analyzer
+  1.97.1's own cargo calls did not do this). The map therefore also sets
+  `CARGO_UNSTABLE_HOST_CONFIG=false`, which outranks that `[unstable]` key;
+  stable cargo ignores it. Project-chosen `--cfg` flags in
+  `rustflags` are not resolved, like the other project-chosen cfgs.
 - **D3 - pyright runs no interpreter.** `python.pythonPath` is a path that
   cannot exist (a child of the plugin's executable file); pyright fails to
   run it and does not fall back to `PATH` (measured, pyright 1.1.414). The
@@ -109,6 +121,14 @@ selects) and relying on vtsls's `autoUseWorkspaceTsdk` default unwritten.
   reachable through `npx`,** get no semantic tier until they run
   `npm install -g @vtsls/language-server`; the resolution failure's log
   line says so (D7).
+- **Known residual, rust:** cargo applies a project's `.cargo/config.toml`
+  `[env]` table to the `rustc` children of `cargo metadata`, so
+  `DYLD_INSERT_LIBRARIES` (macOS) or `LD_PRELOAD` (Linux), with `force = true`
+  if need be, loads a project-named library on first index. Empty parent
+  values do not stop it and `force = true` overrides any parent value, so
+  environment precedence cannot close this channel. It needs a prebuilt
+  library committed to the repository. A follow-up backlog task tracks an
+  OS-level sandbox for the server process.
 - Faster rust-analyzer start; no `target/` under the project.
 - Follow-ups: no network and no writes under the root:
   [ADR 0033](0033-semantic-tiers-reach-no-network-and-write-nothing.md),
