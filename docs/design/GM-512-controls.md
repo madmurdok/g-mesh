@@ -15,7 +15,11 @@ test) in a throwaway worktree; the named test must then fail. The tests are:
   `TestSemanticPassFetchesNoModule`,
   `TestSemanticPassRewritesNoGoModUnderUserModMod`,
   `TestSemanticPassLoadsAVendoredDependencyFromVendor` (subtests `module`,
-  `workspace`), `TestModFlagFollowsTheGoverningFile`.
+  `workspace`), `TestModFlagFollowsTheGoverningFile`; and
+  `plugins/go/semantic_goenv_test.go` (the go env file, GOENV), tests
+  `TestSemanticPassLoadsGOPATHModeFromTheGoEnvFile`,
+  `TestSemanticPassLoadsAWorkspaceMemberUnderGoWorkOffFromTheGoEnvFile`,
+  `TestModFlagForResolvedGoEnv`, `TestModFlagFallsBackToReadonlyWhenGoEnvFails`.
 
 A failure is judged from stdout+stderr: a non-zero exit **and** the named
 test reported as failed (cargo prints `test <name> ... FAILED` and
@@ -32,9 +36,13 @@ intended failure.
 | C2 | `plugins/rust/plugin.toml` | under `[plugin.semantic.initialization_options.cargo.buildScripts]` set `enable = true` | rust integration test | "writes fixture: the semantic pass wrote under the project root" (`added target`, ...) |
 | C3 | `plugins/sdk/src/lsp/resolve.rs`, `npm_candidates_in` | delete the `if !npx { return candidates; }` early return (python gets the `npx` candidate back) | python lib `semantic::tests::a_bare_name_is_path_only_never_a_project_install_or_npx` and `a_real_npx_in_the_project_never_runs_the_projects_pyright` | Same as GM-513 F1 (`docs/design/GM-513-controls.md`); listed so the GM-512 python criterion has its control. The new python integration test is not expected to fail under it: pyright is on `PATH`, and that candidate comes first |
 | C4 | `plugins/go/semantic.go`, `loadEnv` | remove `, "GOPROXY=off"` from the appended list | `TestSemanticPassFetchesNoModule` | "the semantic pass reached the module proxy: [GET /example.com/gm512missing/@v/v1.0.0.zip ..., GET .../v1.0.0.mod ...]" |
-| C5 | `plugins/go/semantic.go`, `semanticEngine.load` | delete the `if flag := modFlag(dir, os.Getenv); flag != "" { cfg.BuildFlags = ... }` block | `TestSemanticPassRewritesNoGoModUnderUserModMod` | "the semantic pass wrote under the root: [changed dep/go.mod changed go.mod]". `TestSemanticPassLoadsAVendoredDependencyFromVendor` also fails (sanity: `useDep` unresolved, the user's GOFLAGS wins) |
-| C6 | `plugins/go/semantic.go`, `modFlag` | `return "-mod=vendor"` becomes `return "-mod=readonly"` | `TestSemanticPassLoadsAVendoredDependencyFromVendor` (both subtests) | "sanity: the semantic pass did not resolve [app/]a.go:useDep CALLS example.com/gv#Plain.Seven" - the dependency is unloadable without vendor/, which is the intended failure. `TestModFlagFollowsTheGoverningFile` also fails on the vendor cases |
-| C7 | `plugins/go/semantic.go`, `modFlag` | both `return ""` (after the `GO111MODULE == "off"` check and after `governing == ""`) become `return "-mod=readonly"` | `TestModFlagFollowsTheGoverningFile` | `modFlag(mod) = "-mod=readonly", want ""` (GO111MODULE=off), same for `vmod`, `none` |
+| C5 | `plugins/go/semantic.go`, `semanticEngine.load` | delete the `if flag := modFlag(dir, env); flag != "" { cfg.BuildFlags = ... }` block | `TestSemanticPassRewritesNoGoModUnderUserModMod` | "the semantic pass wrote under the root: [changed dep/go.mod changed go.mod]". `TestSemanticPassLoadsAVendoredDependencyFromVendor` also fails (sanity: `useDep` unresolved, the user's GOFLAGS wins) |
+| C6 | `plugins/go/semantic.go`, `modFlagFor` | `return "-mod=vendor"` becomes `return "-mod=readonly"` | `TestSemanticPassLoadsAVendoredDependencyFromVendor` (both subtests) | "sanity: the semantic pass did not resolve [app/]a.go:useDep CALLS example.com/gv#Plain.Seven" - the dependency is unloadable without vendor/, which is the intended failure. `TestModFlagFollowsTheGoverningFile` also fails on the vendor cases |
+| C7 | `plugins/go/semantic.go`, `modFlagFor` | both `return ""` (after `gomod == ""` and after `governing == ""`) become `return "-mod=readonly"` | `TestModFlagFollowsTheGoverningFile` | `modFlag(mod) = "-mod=readonly", want ""` (GO111MODULE=off), same for `vmod`, `none` |
+| C8 | `plugins/go/semantic.go`, `modFlag` | `cmd.Env = env` becomes `cmd.Env = append(env, "GOENV=off")` (the flag is chosen without the go env file, as when only the process environment was read) | `TestSemanticPassLoadsGOPATHModeFromTheGoEnvFile` and `TestSemanticPassLoadsAWorkspaceMemberUnderGoWorkOffFromTheGoEnvFile` | "the semantic pass did not load the GOPATH-mode package" (-mod=readonly in GOPATH mode, go rejects it) and "the semantic pass did not resolve app/a.go:use CALLS ... under GOWORK=off" (-mod=vendor from the workspace, inconsistent vendoring) |
+| C9 | `plugins/go/semantic.go`, `modFlagFor` | delete the `if gomod == "" { return "" }` guard | `TestModFlagForResolvedGoEnv` | subtest `GOPATH mode, GOWORK still set`: `= "-mod=vendor", want ""` |
+| C10 | `plugins/go/semantic.go`, `modFlag` | both `return "-mod=readonly"` in the `go env` error branches become `return ""` | `TestModFlagFallsBackToReadonlyWhenGoEnvFails` (both subtests) | "modFlag with a broken `go env` = \"\", want -mod=readonly" |
+| C11 | `plugins/go/semantic.go`, `modFlag` | `cmd.Env = env` becomes `cmd.Env = os.Environ()` (`go env` no longer runs under the load's env) | `TestModFlagFollowsTheGoverningFile` | subtests `GO111MODULE=off`, `GO111MODULE=off, vendored`, `GOWORK=off ...`: the settings passed only in the env slice are lost |
 
 `Cargo.lock` absence is pinned by the rust test's snapshot and has no
 control: no code of ours prevents it (design 1.rust.2).
@@ -54,6 +62,10 @@ runtime manifest, so its rust run reuses C1's build after the checkout.
 | G2 | C2 + C5 | rust command as G1 ; `(cd plugins/go && go test -count=1 -run 'TestSemanticPassRewritesNoGoModUnderUserModMod' .)` |
 | G3 | C3 + C6 | `cargo test -p g-mesh-plugin-python --lib a_bare_name_is_path_only` and `--test semantic_runs_no_project_code` ; `(cd plugins/go && go test -count=1 -run 'TestSemanticPassLoadsAVendoredDependencyFromVendor' .)` |
 | G4 | C7 | `(cd plugins/go && go test -count=1 -run 'TestModFlagFollowsTheGoverningFile' .)` |
+| G5 | C8 | `(cd plugins/go && go test -count=1 -run 'FromTheGoEnvFile' .)` |
+| G6 | C9 | `(cd plugins/go && go test -count=1 -run 'TestModFlagForResolvedGoEnv' .)` |
+| G7 | C10 | `(cd plugins/go && go test -count=1 -run 'TestModFlagFallsBackToReadonlyWhenGoEnvFails' .)` |
+| G8 | C11 | `(cd plugins/go && go test -count=1 -run 'TestModFlagFollowsTheGoverningFile' .)` |
 
 ## Results in the tests slice
 
@@ -61,3 +73,12 @@ C1 was dry-run in a throwaway worktree (target cloned): it failed as
 intended, exit 101, on "network fixture: the semantic pass made network
 connections". C4-C7 were each run there too and failed with the assertions
 in the table. C2 and C3 are left to verify.
+
+C8-C11 come from the fix round on the go env file: they pin behaviours
+(the go env file, the `gomod == ""` guard, the `go env` failure fallback,
+`go env` under the load's env) that C1-C7 do not tell apart, hence more than
+eight controls in this task. C8 was dry-run in a throwaway worktree (Go
+only): exit 1, both `FromTheGoEnvFile` tests failed with "did not load the
+GOPATH-mode package; edges = []" and "did not resolve app/a.go:use CALLS
+example.com/gv#Plain.Seven under GOWORK=off; edges = []". C9-C11 are left
+to verify.
