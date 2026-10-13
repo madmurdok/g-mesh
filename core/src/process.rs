@@ -152,6 +152,24 @@ pub fn kill_own_group(grace: std::time::Duration) -> GroupSweep {
     imp::kill_own_group(grace)
 }
 
+/// A fresh snapshot of every process on the system, with `refresh` saying
+/// which per-process facts to read beyond those `sysinfo` always reads (pid,
+/// parent, status). Threads are never listed: on Linux `sysinfo` otherwise
+/// lists every thread as a process of its own, parented to its process and
+/// reporting that whole process's memory and group. Iterate it through
+/// [`is_process`], which drops any thread entry that still appears.
+pub fn process_snapshot(refresh: sysinfo::ProcessRefreshKind) -> sysinfo::System {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(sysinfo::ProcessesToUpdate::All, true, refresh.without_tasks());
+    system
+}
+
+/// Whether a snapshot entry is a process rather than one of a process's
+/// threads. Always true outside Linux, where `sysinfo` lists no threads.
+pub fn is_process(process: &sysinfo::Process) -> bool {
+    process.thread_kind().is_none()
+}
+
 /// The one lock every plugin spawn is taken under - see [`spawn_serialized`].
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -287,24 +305,19 @@ mod imp {
     /// one cannot be signalled away, and waiting on it would only spend the
     /// whole grace.
     ///
-    /// Processes only, never threads (GM-577). On Linux `sysinfo` lists every
-    /// thread as a process of its own unless told not to, and a thread's id
-    /// shares its process's group: this daemon's own threads passed the
-    /// `pid != me` filter, and `kill(tid, SIGTERM)` is delivered to the whole
-    /// thread group - the daemon ended itself mid-sweep, before signalling the
-    /// rest of its group and before releasing its pid file.
+    /// Processes only, never threads (see [`super::process_snapshot`]): a
+    /// thread's id shares its process's group, so this daemon's own threads
+    /// would pass the `pid != me` filter, and `kill(tid, SIGTERM)` is
+    /// delivered to the whole thread group - the daemon would end itself
+    /// mid-sweep, before signalling the rest of its group and before
+    /// releasing its pid file.
     fn group_members(pgid: u32, me: u32) -> Vec<u32> {
-        use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
-        let mut system = System::new();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().without_tasks(),
-        );
+        use sysinfo::{ProcessRefreshKind, ProcessStatus};
+        let system = super::process_snapshot(ProcessRefreshKind::nothing());
         system
             .processes()
             .iter()
-            .filter(|(_, process)| process.thread_kind().is_none())
+            .filter(|(_, process)| super::is_process(process))
             .filter(|(_, process)| process.status() != ProcessStatus::Zombie)
             .map(|(pid, _)| pid.as_u32())
             .filter(|&pid| pid != me && pgid_of(pid) == Some(pgid))
@@ -341,6 +354,47 @@ mod imp {
         }
         signal_members(&left, pgid, libc::SIGKILL);
         super::GroupSweep::Swept { terminated: members.len(), killed: left.len() }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        use super::*;
+
+        /// On Linux a thread's id shares its process's group, so listing it
+        /// as a group member would make the sweep signal a thread - which
+        /// ends the whole process it belongs to. Asked about this test
+        /// process's own group while it runs extra threads, the listing
+        /// holds none of their ids.
+        #[test]
+        fn a_group_listing_holds_no_thread_ids() {
+            let me = std::process::id();
+            let (stop, parked) = std::sync::mpsc::channel::<()>();
+            let parked = std::sync::Arc::new(std::sync::Mutex::new(parked));
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let parked = std::sync::Arc::clone(&parked);
+                    std::thread::spawn(move || {
+                        let _ = parked.lock().map(|rx| rx.recv());
+                    })
+                })
+                .collect();
+
+            let thread_ids: Vec<u32> = std::fs::read_dir("/proc/self/task")
+                .expect("a Linux process has a /proc task list")
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+                .filter(|&tid| tid != me)
+                .collect();
+            assert!(!thread_ids.is_empty(), "precondition: this test process must be multi-threaded");
+
+            let members = group_members(own_pgid(), 0);
+
+            drop(stop);
+            for thread in threads {
+                let _ = thread.join();
+            }
+            let listed: Vec<u32> = thread_ids.iter().copied().filter(|tid| members.contains(tid)).collect();
+            assert!(listed.is_empty(), "thread ids {listed:?} were listed as group members: {members:?}");
+        }
     }
 }
 
