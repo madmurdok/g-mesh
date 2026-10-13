@@ -103,3 +103,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0030 | [The test suite runs as named sections, defined in one script](0030-test-sections.md) | Accepted |
 | 0031 | [Local test runs: lib tests in one process, heavy tests at batch end](0031-local-test-runs.md) | Accepted |
 | 0032 | [Semantic tiers execute no project code](0032-semantic-tiers-execute-no-project-code.md) | Accepted |
+| 0033 | [Semantic tiers reach no network and write nothing under the project root](0033-semantic-tiers-reach-no-network-and-write-nothing.md) | Accepted |

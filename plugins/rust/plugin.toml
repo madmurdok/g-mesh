@@ -137,6 +137,11 @@ readiness = "indexed"
 # no `target/`. Derive-generated impls and `OUT_DIR` code are not resolved.
 # See docs/adr/0032-semantic-tiers-execute-no-project-code.md.
 #
+# It also reaches no network: the plugin starts the server with
+# `CARGO_NET_OFFLINE=true`, so dependencies not in the local cargo cache are
+# not fetched and their edges stay unresolved until `cargo fetch`. See
+# docs/adr/0033-semantic-tiers-reach-no-network-and-write-nothing.md.
+#
 # `checkOnSave` runs `cargo check` to produce diagnostics this bridge never
 # reads, and it builds: it writes `target/` and `Cargo.lock`. Off.
 #
