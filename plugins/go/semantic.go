@@ -337,8 +337,9 @@ type resolutions struct {
 	// for, so neither a package's test variants nor a second load re-parse
 	// its files.
 	twinsKnown map[string]bool
-	// referenced is every project package path an answer resolved into.
-	// A package this pass did not fold itself (a per-file pass's imports)
+	// referenced is every project package path an answer of the load in
+	// progress resolved into (loadFor starts a fresh set per module). A
+	// package this pass did not fold itself (a per-file pass's imports)
 	// still needs its twins, or an edit to the importing file would flip
 	// its answers back to the ambiguous container address.
 	referenced map[string]bool
@@ -386,41 +387,86 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 	return cfg, nil
 }
 
+// twinListing is the project packages one load configuration's answers
+// resolved into, to be listed for twins with that same configuration.
+type twinListing struct {
+	cfg   *packages.Config
+	paths map[string]bool
+}
+
+// twinListingKey identifies a load configuration by what decides how
+// `go list` resolves an import path and evaluates build constraints.
+func twinListingKey(cfg *packages.Config) string {
+	return strings.Join([]string{
+		cfg.Dir,
+		strings.Join(cfg.Env, "\x01"),
+		strings.Join(cfg.BuildFlags, "\x01"),
+	}, "\x00")
+}
+
 // loadReferencedTwins computes the twinned names of every project package an
-// answer resolved into but no load has folded yet - in a per-file pass, the
+// answer resolved into but no load has folded - in a per-file pass, the
 // imported packages, which the type checker read from export data and
 // go/packages therefore reports without their IgnoredFiles. It asks `go list`
-// for names and files only (no type checking), from the same directory and
-// with the same flags as the load that found them, so the build constraints
-// are evaluated the same way. A failure leaves those packages without twins,
-// which keeps their answers container-scoped, as before GM-570.
-func (e *semanticEngine) loadReferencedTwins(into *resolutions, base *packages.Config) {
-	var missing []string
-	for path := range into.referenced {
-		if !into.twinsKnown[path] {
-			missing = append(missing, path)
+// for names and files only (no type checking), once per load configuration,
+// from the directory and with the flags of the load whose answers referenced
+// the package: an import path resolves only in a module that requires it, and
+// build constraints are evaluated the same way as in that load.
+//
+// What is missing is decided for every group before any listing runs, so a
+// package one module lists is still listed by every other module that
+// referenced it. A name twinned in any module's view is twinned: its
+// container address is ambiguous there. A failed listing leaves its packages
+// without twins from it, which keeps their answers container-scoped.
+func (e *semanticEngine) loadReferencedTwins(into *resolutions, listings map[string]*twinListing) {
+	missingBy := map[string][]string{}
+	for key, l := range listings {
+		for path := range l.paths {
+			if !into.twinsKnown[path] {
+				missingBy[key] = append(missingBy[key], path)
+			}
 		}
 	}
-	if len(missing) == 0 {
-		return
+	for _, key := range sortedKeys(missingBy) {
+		missing := missingBy[key]
+		sort.Strings(missing)
+		base := listings[key].cfg
+		cfg := &packages.Config{
+			Mode:       packages.NeedName | packages.NeedFiles,
+			Dir:        base.Dir,
+			Env:        base.Env,
+			BuildFlags: base.BuildFlags,
+		}
+		listed, err := packages.Load(cfg, missing...)
+		if err != nil {
+			logf("semantic pass: listing %d imported package(s) from %s for build-tag twins failed: %v",
+				len(missing), base.Dir, err)
+			continue
+		}
+		wanted := map[string]bool{}
+		for _, path := range missing {
+			wanted[path] = true
+		}
+		for _, pkg := range listed {
+			if !wanted[pkg.PkgPath] {
+				continue
+			}
+			names := twinnedNames(pkg.Name, pkg.GoFiles, pkg.IgnoredFiles)
+			if len(names) == 0 {
+				continue
+			}
+			if into.twinned[pkg.PkgPath] == nil {
+				into.twinned[pkg.PkgPath] = map[string]bool{}
+			}
+			for name := range names {
+				into.twinned[pkg.PkgPath][name] = true
+			}
+		}
 	}
-	sort.Strings(missing)
-	cfg := &packages.Config{
-		Mode:       packages.NeedName | packages.NeedFiles,
-		Dir:        base.Dir,
-		Env:        base.Env,
-		BuildFlags: base.BuildFlags,
-	}
-	listed, err := packages.Load(cfg, missing...)
-	if err != nil {
-		logf("semantic pass: listing %d imported package(s) for build-tag twins failed: %v", len(missing), err)
-		listed = nil
-	}
-	for _, pkg := range listed {
-		e.collectTwins(into, pkg)
-	}
-	for _, path := range missing {
-		into.twinsKnown[path] = true
+	for _, missing := range missingBy {
+		for _, path := range missing {
+			into.twinsKnown[path] = true
+		}
 	}
 }
 
@@ -570,14 +616,14 @@ func (e *semanticEngine) recordDeclaration(into *resolutions, fset *token.FileSe
 	if obj == nil || obj.Pkg() == nil {
 		return
 	}
-	if _, done := into.declaredIn[obj]; done {
-		return
-	}
 	path := obj.Pkg().Path()
 	if !e.isProjectContainer(path) {
 		return
 	}
 	into.referenced[path] = true
+	if _, done := into.declaredIn[obj]; done {
+		return
+	}
 	if at, ok := e.positionOf(fset, obj.Pos()); ok {
 		into.declaredIn[obj] = at.file
 	}
@@ -926,26 +972,36 @@ func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject 
 	}
 
 	outcome := loadOutcome{failed: map[string]error{}}
-	var baseCfg *packages.Config
+	listings := map[string]*twinListing{}
 	for _, dir := range sortedKeys(byModule) {
 		patterns := byModule[dir]
 		sort.Strings(patterns)
+		into.referenced = map[string]bool{}
 		cfg, err := e.load(into, filepath.Join(e.realRoot, filepath.FromSlash(dir)), patterns)
 		if err != nil {
 			outcome.failed[dir] = err
-		} else {
-			outcome.loaded++
-			if baseCfg == nil {
-				baseCfg = cfg
-			}
+			continue
+		}
+		outcome.loaded++
+		if len(into.referenced) == 0 {
+			continue
+		}
+		key := twinListingKey(cfg)
+		l := listings[key]
+		if l == nil {
+			l = &twinListing{cfg: cfg, paths: map[string]bool{}}
+			listings[key] = l
+		}
+		for path := range into.referenced {
+			l.paths[path] = true
 		}
 	}
 	// Only a per-file pass needs the extra listing (imported packages come
 	// from export data without IgnoredFiles); a whole-project pass folds
-	// every project package itself. Once, after all modules loaded, so a
-	// listing cannot mark a later module's twins as already known.
-	if !wholeProject && baseCfg != nil {
-		e.loadReferencedTwins(into, baseCfg)
+	// every project package itself. After all modules loaded, so a listing
+	// cannot mark a later module's folded twins as already known.
+	if !wholeProject {
+		e.loadReferencedTwins(into, listings)
 	}
 	return outcome
 }
