@@ -4,7 +4,7 @@ Counts only; no interpretation (S3).
 
 ## Setup
 
-- g-mesh 4.6.0 (`~/.local/share/g-mesh/bin/g-mesh`), `g-mesh reindex` per corpus, then `docs/results/GM-519-count-refusals.sql` over `<stateDir>/index.db` (method: `GM-519-findings-draft.md`, "S2 counting method").
+- g-mesh 4.6.0 (`~/.local/share/g-mesh/bin/g-mesh`), `g-mesh reindex` per corpus, then `docs/results/GM-519-count-refusals.sql` over `<stateDir>/index.db` (method: `GM-519-member-visibility-findings.md`, "Method").
 - Every reindex ended with `semanticPass.completed = true`, no failures, leftovers, owed or pending.
 - Language servers: vtsls 0.3.0, pyright 1.1.414, rust-analyzer 1.97.1, go/types via the Go plugin.
 - Machine: `uptime` at the start of the run: up 7 days, load averages 8.7 / 18.1 / 18.6 (3:54); the load stayed 9-15 (1-min) across the corpora, so the machine was busy.
