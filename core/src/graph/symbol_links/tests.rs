@@ -1467,8 +1467,7 @@ fn accessors_without_a_sole_getter_or_beside_a_variable_stay_unlinked() {
 }
 
 /// Go's unexported: visible to its own package, and only to it - under a
-/// name key, and under a qualifiedName key too, which is what stops a
-/// semantic tier's mistake from linking a private symbol from outside.
+/// name key, and under a structural qualifiedName key too.
 #[test]
 fn a_go_unexported_symbol_links_within_its_package_and_not_from_outside() {
     let mut conn = setup();
@@ -1967,6 +1966,16 @@ fn equivalence_fixture() -> (Vec<Diff>, Expected) {
     let mut edges = Vec::new();
     uses(&mut edges, "Function:caller.ts:again", "CALLS", &reused, Some("Function:target.ts:mutate"));
     diffs.push(diff(vec![symbol("caller.ts", "again", "Function", false)], edges));
+
+    // An engine's exact answer onto a TS non-exported member, whose
+    // declaration may arrive before or after it. Movable, so inserted before
+    // the last diff.
+    let exact = exact_placeholder("src/main.ts", "src/svc.ts", "ServiceImpl.start");
+    let edge = usage_edge_from("Function:src/main.ts:boot", "CALLS", &exact, SEMANTIC_SOURCE);
+    expected.push((edge.id.clone(), Some(TS_SERVICE_START)));
+    let last = diffs.len() - 1;
+    diffs.insert(last, diff(vec![ts_private_member("src/svc.ts", "ServiceImpl.start")], Vec::new()));
+    diffs.insert(last + 1, diff(vec![symbol("src/main.ts", "boot", "Function", true), exact], vec![edge]));
 
     (diffs, expected)
 }
@@ -4163,4 +4172,365 @@ fn gm533_rust_and_typescript_keep_a_declaration_over_a_later_glob() {
     assert_eq!(gm533_rust_call(false), ("Function:src/n.rs:krate::n::f".to_string(), true));
     assert_eq!(gm533_ts_call(true), ("Function:index.ts:mutate".to_string(), true));
     assert_eq!(gm533_ts_call(false), ("Function:b.ts:mutate".to_string(), true));
+}
+
+// --- An engine's exact answer skips the visibility check -----------------
+//
+// A `semantic` `CALLS`/`REFERENCES` edge on a placeholder with a
+// `qualifiedName` key is admitted whatever the target's visibility; every
+// other edge (structural, `name`-keyed, `SUPERTYPE_OF`) stays checked. See
+// docs/adr/0034-semantic-answers-bypass-visibility.md.
+
+/// The legacy label `apply_diff` maps to `semantic` (and engine
+/// `ts-compiler`); every semantic edge below is sent with it.
+const SEMANTIC_SOURCE: &str = "ts-compiler";
+/// The structural label, mapped to `syntactic`.
+const STRUCTURAL_SOURCE: &str = "tree-sitter";
+
+/// A non-exported TS method `qualified_name` (`ServiceImpl.start`) in
+/// `file`: `file`-visible and containerless, as the TS plugin sends a member
+/// of a non-exported class. Named by its last segment.
+fn ts_private_member(file: &str, qualified_name: &str) -> NodeRecord {
+    let mut node = symbol(file, qualified_name, "Function", false);
+    node.name = last_segment(qualified_name).to_string();
+    node
+}
+
+/// The semantic pass's placeholder for an answer it found: in `importer`,
+/// addressed by exact `qualified_name` at the declaring `target_file`.
+fn exact_placeholder(importer: &str, target_file: &str, qualified_name: &str) -> NodeRecord {
+    let mut node = placeholder_node(importer, target_file, qualified_name);
+    node.target = Some(target(SCOPE_FILE, target_file, KEY_QUALIFIED_NAME, qualified_name, None));
+    node
+}
+
+/// `caller` (already in the index) uses `placeholder` through a `kind` edge
+/// sent with `source`, both in one diff - as each tier sends its own copy of
+/// a placeholder they share. Returns the edge id.
+fn use_from_source(
+    conn: &mut Connection,
+    caller: &str,
+    kind: &str,
+    placeholder: NodeRecord,
+    source: &str,
+) -> String {
+    let edge = usage_edge_from(caller, kind, &placeholder, source);
+    let edge_id = edge.id.clone();
+    apply_diff(
+        conn,
+        &Diff { upsert_nodes: vec![placeholder], upsert_edges: vec![edge], ..Default::default() },
+    )
+    .unwrap();
+    edge_id
+}
+
+const TS_SERVICE_START: &str = "Function:src/svc.ts:ServiceImpl.start";
+const TS_COUNTER_BUMP: &str = "Function:src/counter.ts:Counter.bump";
+const RUST_PRIVATE_HELPER: &str = "Function:src/util.rs:mycrate::util::private_helper";
+
+/// Three exact answers onto members the requester cannot see, every edge
+/// sent with `source`, linked by `link_all`. Returns the edges of: a TS
+/// method of a non-exported class in another file (fixture t03), one in the
+/// caller's own file (t04, a `REFERENCES`), and a Rust fn private to
+/// `mycrate::util` called from the sibling `mycrate::prelude` (r01).
+fn hidden_members(source: &str) -> (Connection, [String; 3], LinkSummary) {
+    let mut conn = setup();
+    let mut nodes = vec![
+        ts_private_member("src/svc.ts", "ServiceImpl.start"),
+        ts_private_member("src/counter.ts", "Counter.bump"),
+        symbol("src/counter.ts", "tally", "Function", true),
+        symbol("src/main.ts", "boot", "Function", true),
+        member(rust_prelude(), "Function", "mycrate::prelude::marker", Vis::Public),
+    ];
+    nodes.extend(rust_lib_nodes());
+    nodes.extend(rust_util_nodes());
+    upsert(&mut conn, nodes);
+
+    let other_file = use_from_source(
+        &mut conn,
+        "Function:src/main.ts:boot",
+        "CALLS",
+        exact_placeholder("src/main.ts", "src/svc.ts", "ServiceImpl.start"),
+        source,
+    );
+    let same_file = use_from_source(
+        &mut conn,
+        "Function:src/counter.ts:tally",
+        "REFERENCES",
+        exact_placeholder("src/counter.ts", "src/counter.ts", "Counter.bump"),
+        source,
+    );
+    let sibling_module = use_from_source(
+        &mut conn,
+        "Function:src/prelude.rs:mycrate::prelude::marker",
+        "CALLS",
+        container_placeholder(
+            rust_prelude(),
+            "mycrate::util",
+            KEY_QUALIFIED_NAME,
+            "mycrate::util::private_helper",
+        ),
+        source,
+    );
+    let summary = link_all(&mut conn).unwrap();
+    (conn, [other_file, same_file, sibling_module], summary)
+}
+
+/// B1: an engine's exact `CALLS`/`REFERENCES` answer links onto a member the
+/// requester cannot see - in another file, in its own file under a file
+/// scope, and in a sibling Rust module.
+///
+/// Control: `Resolver::admits` returns `self.visible(..)` only - nothing links.
+#[test]
+fn an_engine_answer_links_a_member_the_requester_cannot_see() {
+    let (conn, [other_file, same_file, sibling_module], summary) = hidden_members(SEMANTIC_SOURCE);
+    assert_eq!(summary, LinkSummary { linked_edges: 3 });
+    assert_eq!(edge_target(&conn, &other_file), (TS_SERVICE_START.to_string(), true), "t03: another file");
+    assert_eq!(edge_target(&conn, &same_file), (TS_COUNTER_BUMP.to_string(), true), "t04: its own file");
+    assert_eq!(
+        edge_target(&conn, &sibling_module),
+        (RUST_PRIVATE_HELPER.to_string(), true),
+        "r01: a sibling module"
+    );
+    assert_eq!(edge_source(&conn, &other_file), "semantic");
+}
+
+/// B2: the same addresses under structural edges stay checked: a structural
+/// `qualifiedName` key is not an engine's answer.
+///
+/// Control: `is_engine_answer` without its `source` condition - all three link.
+#[test]
+fn a_structural_exact_key_onto_a_hidden_member_stays_unlinked() {
+    let (conn, edges, summary) = hidden_members(STRUCTURAL_SOURCE);
+    assert_eq!(summary, LinkSummary { linked_edges: 0 });
+    for edge in &edges {
+        let (to, resolved) = edge_target(&conn, edge);
+        assert!(!resolved && to.starts_with("pending:"), "{edge} must stay on its placeholder, is on {to}");
+    }
+}
+
+/// B3: one placeholder carrying a structural and a semantic `CALLS` (the
+/// tiers derive the placeholder id from the address, so they share it): the
+/// semantic edge links, the structural one stays on the placeholder - and a
+/// second pass leaves both where they are.
+///
+/// Control: drop `AND source = ?` from `repoint` and `unlink` - the groups
+/// move each other's edges and the semantic one ends unlinked.
+#[test]
+fn a_structural_and_a_semantic_call_on_one_placeholder_are_decided_apart() {
+    let mut conn = setup();
+    upsert(
+        &mut conn,
+        vec![
+            ts_private_member("src/svc.ts", "ServiceImpl.start"),
+            symbol("src/main.ts", "boot", "Function", true),
+            symbol("src/main.ts", "init", "Function", true),
+        ],
+    );
+    let placeholder = || exact_placeholder("src/main.ts", "src/svc.ts", "ServiceImpl.start");
+    let structural =
+        use_from_source(&mut conn, "Function:src/main.ts:init", "CALLS", placeholder(), STRUCTURAL_SOURCE);
+    let semantic =
+        use_from_source(&mut conn, "Function:src/main.ts:boot", "CALLS", placeholder(), SEMANTIC_SOURCE);
+    let placeholder_id = placeholder().id;
+
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    for pass in ["first", "second"] {
+        assert_eq!(
+            edge_target(&conn, &semantic),
+            (TS_SERVICE_START.to_string(), true),
+            "{pass} pass: semantic"
+        );
+        assert_eq!(
+            edge_target(&conn, &structural),
+            (placeholder_id.clone(), false),
+            "{pass} pass: structural"
+        );
+        link_all(&mut conn).unwrap();
+    }
+}
+
+/// B4: a semantic `SUPERTYPE_OF` stays checked. The gin shape: Go's
+/// `answerImplements` relates `gin.errorMsgs` to the unexported
+/// `binding.testInterface`, which no code in `gin` can name. A semantic
+/// `REFERENCES` on the same placeholder links, so visibility is the only
+/// thing refusing the supertype edge.
+///
+/// Control: add `SUPERTYPE_OF` to `ENGINE_ANSWER_EDGE_KINDS` - it links.
+#[test]
+fn a_semantic_supertype_onto_an_unexported_interface_of_another_package_stays_unlinked() {
+    const BINDING: &str = "example.com/gin/binding";
+    let binding = At { file: "binding/binding_test.go", language: "go", container: BINDING, parent: None };
+    let gin = At { file: "errors.go", language: "go", container: "example.com/gin", parent: None };
+    let mut conn = setup();
+    upsert(
+        &mut conn,
+        vec![
+            member(binding, "Type", "testInterface", Vis::Container(BINDING)),
+            member(gin, "Type", "errorMsgs", Vis::Public),
+        ],
+    );
+    let placeholder = || container_placeholder(gin, BINDING, KEY_QUALIFIED_NAME, "testInterface");
+    let from = "Type:errors.go:errorMsgs";
+    let supertype = use_from_source(&mut conn, from, "SUPERTYPE_OF", placeholder(), SEMANTIC_SOURCE);
+    let reference = use_from_source(&mut conn, from, "REFERENCES", placeholder(), SEMANTIC_SOURCE);
+
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(
+        edge_target(&conn, &reference),
+        ("Type:binding/binding_test.go:testInterface".to_string(), true)
+    );
+    assert_eq!(edge_target(&conn, &supertype), (placeholder().id, false));
+}
+
+/// B5: a semantic edge under a `name` key keeps the self-import guard of
+/// [`a_self_addressed_placeholder_sees_only_what_its_file_exports`]: only an
+/// exact key is an engine's answer.
+///
+/// Control: drop the `Key::QualifiedName` condition from both
+/// `is_engine_answer` and `Resolver::admits` (either alone still guards) -
+/// `paint` links.
+#[test]
+fn a_semantic_name_key_still_sees_only_what_its_file_exports() {
+    let mut conn = setup();
+    let mut method = symbol("view.ts", "View.render", "Function", false);
+    method.name = "render".to_string();
+    upsert(
+        &mut conn,
+        vec![
+            symbol("view.ts", "run", "Function", true),
+            symbol("view.ts", "render", "Function", true),
+            method,
+            symbol("view.ts", "paint", "Function", false),
+        ],
+    );
+    let run = "Function:view.ts:run";
+    let exported = use_from_source(
+        &mut conn,
+        run,
+        "CALLS",
+        placeholder_node("view.ts", "view.ts", "render"),
+        SEMANTIC_SOURCE,
+    );
+    let private = use_from_source(
+        &mut conn,
+        run,
+        "CALLS",
+        placeholder_node("view.ts", "view.ts", "paint"),
+        SEMANTIC_SOURCE,
+    );
+
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &exported).0, "Function:view.ts:render", "the export, not an ambiguity");
+    assert!(!edge_target(&conn, &private).1, "a name key never finds a non-exported symbol of a file scope");
+}
+
+/// `node` visible in the Rust module `module` only.
+fn private_to(mut node: NodeRecord, module: &str) -> NodeRecord {
+    node.visibility = VISIBILITY_CONTAINER.to_string();
+    node.visibility_container = Some(module.to_string());
+    node.exported = false;
+    node
+}
+
+/// The re-exported-member rows with the head `a::T` and its members `T.f`/`T::m` made
+/// private to `krate::a` as asked, `T` re-exported by `krate::named`, and
+/// one user per `(file, module, source)` addressing both members through
+/// `krate::named` with their `keyPath`. Linked by `link_all`; returns each
+/// user's `(field edge, method edge)`.
+fn members_through_head(
+    private_head: bool,
+    private_members: bool,
+    users: &[(&'static str, &'static str, &str)],
+) -> (Connection, Vec<(String, String)>) {
+    let hide = |node: NodeRecord, private: bool| if private { private_to(node, "krate::a") } else { node };
+    let mut conn = setup();
+    let mut nodes = vec![
+        hide(gm472_type(), private_head),
+        hide(gm472_field(), private_members),
+        hide(gm472_method(), private_members),
+    ];
+    nodes.extend(gm472_named());
+    upsert(&mut conn, nodes);
+    let mut edges = Vec::new();
+    for (file, user, source) in users {
+        let nodes = gm472_user(file, user, "krate::named", "T", true);
+        let field = usage_edge_from(&nodes[0].id, "REFERENCES", &nodes[1], source);
+        let method = usage_edge_from(&nodes[0].id, "CALLS", &nodes[2], source);
+        edges.push((field.id.clone(), method.id.clone()));
+        apply_diff(
+            &mut conn,
+            &Diff { upsert_nodes: nodes, upsert_edges: vec![field, method], ..Default::default() },
+        )
+        .unwrap();
+    }
+    link_all(&mut conn).unwrap();
+    (conn, edges)
+}
+
+/// B6, member half: through a re-exported (visible) head, an engine's exact
+/// answer reaches members private to the head's module; the same addresses
+/// sent structurally stay checked.
+///
+/// Control: `through_head`'s member loop calls `visible` instead of
+/// `admits` - the semantic edges stay unresolved.
+#[test]
+fn an_engine_answer_reaches_a_private_member_through_a_reexported_head() {
+    let (conn, edges) = members_through_head(
+        false,
+        true,
+        &[
+            ("src/user_semantic.rs", "krate::user_semantic", SEMANTIC_SOURCE),
+            ("src/user_structural.rs", "krate::user_structural", STRUCTURAL_SOURCE),
+        ],
+    );
+    gm472_assert_linked(&conn, &edges[0]);
+    gm472_assert_unresolved(&conn, &edges[1]);
+}
+
+/// B6, head half: the head is walked by name and stays checked, so a private
+/// head is not followed even for an engine's exact answer of a public member.
+///
+/// Control (combined - the head walk is keyed by name, so a trusted head
+/// requester alone is still refused by `admits`' key condition, and that
+/// condition alone never sees a trusted head requester): `through_head`
+/// walks the head under `requester` itself *and* `admits` drops its
+/// `Key::QualifiedName` condition - both members link.
+#[test]
+fn a_private_head_is_not_followed_even_for_an_engine_answer() {
+    let (conn, edges) = members_through_head(
+        true,
+        false,
+        &[("src/user_semantic.rs", "krate::user_semantic", SEMANTIC_SOURCE)],
+    );
+    gm472_assert_unresolved(&conn, &edges[0]);
+}
+
+/// B7: `link_diff` wakes an engine's exact answer when the `file`-visible
+/// declaration it names arrives after it - the exact seed at the
+/// declaration's own file, its only one (a TS non-exported member has no
+/// container). Also a case of [`link_all_and_link_diff_agree_on_the_same_end_state`].
+///
+/// Control: remove the `file`-visible exact seed from `seeds` - 0 linked.
+#[test]
+fn a_file_visible_declaration_arriving_late_wakes_an_engine_answer() {
+    let mut conn = setup();
+    let placeholder = exact_placeholder("src/main.ts", "src/svc.ts", "ServiceImpl.start");
+    let edge = usage_edge_from("Function:src/main.ts:boot", "CALLS", &placeholder, SEMANTIC_SOURCE);
+    let edge_id = edge.id.clone();
+    let caller = Diff {
+        upsert_nodes: vec![symbol("src/main.ts", "boot", "Function", true), placeholder],
+        upsert_edges: vec![edge],
+        ..Default::default()
+    };
+    apply_diff(&mut conn, &caller).unwrap();
+    assert_eq!(link_diff(&mut conn, &caller).unwrap(), LinkSummary { linked_edges: 0 });
+
+    let declaration = Diff {
+        upsert_nodes: vec![ts_private_member("src/svc.ts", "ServiceImpl.start")],
+        ..Default::default()
+    };
+    apply_diff(&mut conn, &declaration).unwrap();
+    assert_eq!(link_diff(&mut conn, &declaration).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge_id), (TS_SERVICE_START.to_string(), true));
 }

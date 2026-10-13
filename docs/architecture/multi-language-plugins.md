@@ -700,8 +700,11 @@ edge of kind `K`:
      own file.
    - `container(c)`: visible iff `fromContainer` is `c` or has `c` on its parent
      chain (from `containers.parentKey`).
-   - A `qualifiedName` key is checked too, so a semantic tier's mistake cannot link
-     a private symbol from outside.
+   - A structural `qualifiedName` key is checked too. An engine's exact answer
+     (a `semantic` `CALLS` or `REFERENCES` edge under a `qualifiedName` key) is
+     admitted without the check; under a re-exported head only the member lookup
+     is, the head walk stays checked
+     ([ADR 0034](../adr/0034-semantic-answers-bypass-visibility.md)).
 
 `link_diff` gains one trigger: a node upserted into a container can answer
 placeholders waiting on that container, the counterpart of today's
