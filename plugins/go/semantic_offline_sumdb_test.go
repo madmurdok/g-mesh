@@ -17,6 +17,7 @@ package main
 
 import (
 	"archive/zip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -147,7 +148,7 @@ func fillModuleCache(t *testing.T) {
 
 	cmd := exec.Command("go", "mod", "download", cachedDepModule+"@v1.0.0")
 	cmd.Dir = t.TempDir()
-	cmd.Env = append(os.Environ(), "GOPROXY=file://"+filepath.ToSlash(proxy), "GOSUMDB=off", "GOFLAGS=", "GOWORK=off")
+	cmd.Env = append(os.Environ(), "GOPROXY="+fileURL(proxy), "GOSUMDB=off", "GOFLAGS=", "GOWORK=off")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("sanity: filling the module cache from %s: %v: %s", proxy, err, out)
 	}
@@ -203,4 +204,16 @@ func TestSemanticPassInAWorkspaceWritesOnlyGoWorkSum(t *testing.T) {
 	case len(changes) != 1 || changes[0] != "added go.work.sum":
 		t.Fatalf("the semantic pass wrote more under the root than the documented go.work.sum: %v", changes)
 	}
+}
+
+// fileURL is the file:// URL of the absolute path p, as cmd/go parses it on
+// every OS: file:///tmp/x on Unix, file:///C:/x on Windows. Gluing
+// "file://" to a Windows path puts the drive in the host ("file://C:/x"),
+// which GOPROXY rejects as a file URL with non-path elements.
+func fileURL(p string) string {
+	slashed := filepath.ToSlash(p)
+	if !strings.HasPrefix(slashed, "/") {
+		slashed = "/" + slashed
+	}
+	return (&url.URL{Scheme: "file", Path: slashed}).String()
 }

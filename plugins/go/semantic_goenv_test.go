@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -187,17 +188,15 @@ func TestModFlagForResolvedGoEnv(t *testing.T) {
 // JSON), modFlag says -mod=readonly, the flag that never writes. Control
 // C10.
 func TestModFlagFallsBackToReadonlyWhenGoEnvFails(t *testing.T) {
+	requireGoToolchain(t)
 	dir := writeTree(t, map[string]string{"go.mod": "module example.com/m\n"})
-	for _, tc := range []struct{ name, script string }{
-		{"go env fails", "#!/bin/sh\nexit 1\n"},
-		{"go env prints no JSON", "#!/bin/sh\necho not-json\n"},
+	for _, tc := range []struct{ name, body string }{
+		{"go env fails", "os.Exit(1)"},
+		{"go env prints no JSON", "os.Stdout.WriteString(\"not-json\\n\")"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bin := t.TempDir()
-			fake := filepath.Join(bin, "go")
-			if err := os.WriteFile(fake, []byte(tc.script), 0o755); err != nil {
-				t.Fatal(err)
-			}
+			fake := buildFakeGo(t, bin, tc.body)
 			t.Setenv("PATH", bin)
 			// Sanity: the fake is the `go` modFlag runs.
 			if found, err := exec.LookPath("go"); err != nil || found != fake {
@@ -208,4 +207,27 @@ func TestModFlagFallsBackToReadonlyWhenGoEnvFails(t *testing.T) {
 			}
 		})
 	}
+}
+
+// buildFakeGo compiles a `go` into dir whose main runs body, and returns its
+// path. A compiled binary rather than a shell script, so that it runs on
+// every OS: on Windows it is go.exe, which exec.LookPath("go") finds
+// through PATHEXT.
+func buildFakeGo(t *testing.T, dir, body string) string {
+	t.Helper()
+	src := filepath.Join(t.TempDir(), "main.go")
+	if err := os.WriteFile(src, []byte("package main\n\nimport \"os\"\n\nfunc main() { "+body+" }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(dir, "go")
+	if runtime.GOOS == "windows" {
+		fake += ".exe"
+	}
+	cmd := exec.Command("go", "build", "-o", fake, src)
+	cmd.Dir = filepath.Dir(src)
+	cmd.Env = append(os.Environ(), "GOFLAGS=", "GOWORK=off", "GO111MODULE=on")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("sanity: building the fake go: %v: %s", err, out)
+	}
+	return fake
 }
