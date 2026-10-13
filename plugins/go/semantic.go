@@ -363,7 +363,7 @@ func newResolutions() *resolutions {
 // broken sibling still has exact type information for everything the checker
 // did get through, and refusing the whole pass over one bad package is how a
 // semantic tier becomes useless in exactly the repositories that need it.
-func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) error {
+func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) (*packages.Config, error) {
 	fset := token.NewFileSet()
 	env := loadEnv()
 	cfg := &packages.Config{Mode: loadMode, Dir: dir, Tests: true, Fset: fset, Env: env}
@@ -378,13 +378,12 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 	if err != nil {
 		e.degrade("semantic pass degraded: packages.Load in %s failed: %v - "+
 			"answering incomplete, with whatever the other modules resolved", dir, err)
-		return err
+		return nil, err
 	}
 	for _, pkg := range loaded {
 		e.foldPackage(into, fset, pkg)
 	}
-	e.loadReferencedTwins(into, cfg)
-	return nil
+	return cfg, nil
 }
 
 // loadReferencedTwins computes the twinned names of every project package an
@@ -927,14 +926,26 @@ func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject 
 	}
 
 	outcome := loadOutcome{failed: map[string]error{}}
+	var baseCfg *packages.Config
 	for _, dir := range sortedKeys(byModule) {
 		patterns := byModule[dir]
 		sort.Strings(patterns)
-		if err := e.load(into, filepath.Join(e.realRoot, filepath.FromSlash(dir)), patterns); err != nil {
+		cfg, err := e.load(into, filepath.Join(e.realRoot, filepath.FromSlash(dir)), patterns)
+		if err != nil {
 			outcome.failed[dir] = err
 		} else {
 			outcome.loaded++
+			if baseCfg == nil {
+				baseCfg = cfg
+			}
 		}
+	}
+	// Only a per-file pass needs the extra listing (imported packages come
+	// from export data without IgnoredFiles); a whole-project pass folds
+	// every project package itself. Once, after all modules loaded, so a
+	// listing cannot mark a later module's twins as already known.
+	if !wholeProject && baseCfg != nil {
+		e.loadReferencedTwins(into, baseCfg)
 	}
 	return outcome
 }
