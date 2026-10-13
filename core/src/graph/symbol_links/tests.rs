@@ -2417,8 +2417,8 @@ fn a_free_fn_with_no_same_named_member_links() {
 }
 
 /// A field `T.f` and `fn f`: the `REFERENCES` a `use a::f` sends lands on
-/// the fn. Control: return `Ok(None)` at the top of
-/// `Resolver::sole_non_member` - the edge stays on its placeholder.
+/// the fn. Control: return all of `candidates` at the top of
+/// `Resolver::drop_type_members` - the edge stays on its placeholder.
 #[test]
 fn a_name_beside_a_same_named_field_lands_on_the_free_fn() {
     let mut conn = setup();
@@ -2503,8 +2503,8 @@ fn a_name_matching_only_members_stays_unresolved() {
 }
 
 /// Two free fns of one name beside a member are still two candidates.
-/// Control: link the first non-member instead of requiring exactly one in
-/// `Resolver::sole_non_member` - the edge lands on one of them.
+/// Control: keep only the first non-member in
+/// `Resolver::drop_type_members` - the edge lands on it.
 #[test]
 fn two_free_fns_of_one_name_stay_unresolved_beside_a_member() {
     let mut conn = setup();
@@ -2555,7 +2555,7 @@ fn a_trait_impl_method_is_a_member_through_its_alias() {
 
 /// A `qualifiedName` key gets no tie-break: a member and a non-member under
 /// one qualifiedName stay ambiguous. Control: drop the `Key::Name` check at
-/// the top of `Resolver::sole_non_member` - the edge lands on the
+/// the top of `Resolver::drop_type_members` - the edge lands on the
 /// non-member.
 #[test]
 fn a_qualified_name_key_matching_a_member_and_a_non_member_stays_unresolved() {
@@ -2574,6 +2574,115 @@ fn a_qualified_name_key_matching_a_member_and_a_non_member_stays_unresolved() {
     );
     assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
     assert!(!edge_target(&conn, &edge).1, "a qualifiedName key must refuse two declarations");
+}
+
+// --- GM-568: type members dropped before the kind rule ---------------------
+//
+// Under a `name` key the members go before the kind filter, so a member
+// cannot be linked for being the only candidate of the edge's kind: the
+// shape of GM-519's fixtures t01 (`import { handler }` of a const beside a
+// method `Router#handler`) and p01 (the same in Python). See
+// docs/results/GM-519-member-visibility-findings.md, C1.
+
+const A_VAR_M: &str = "Variable:src/a.rs:a::m";
+
+/// `const m` declared at the top of `krate::a`, beside `gm472_method`.
+fn module_var_m() -> NodeRecord {
+    gm472_member(module_a(), "Variable", "const", &[("::", "m")])
+}
+
+/// A variable `m` and a method `T::m`: a call of `m` by name gets no edge,
+/// neither onto the variable (not a `Function`) nor onto the method (a
+/// member). Controls: restore `Resolver::sole_non_member` after the kind rule
+/// (b259cd1^), or do not call `Resolver::drop_type_members` in `link` - the
+/// edge lands on the method.
+#[test]
+fn a_call_by_name_beside_a_variable_and_a_same_named_method_stays_unresolved() {
+    let mut conn = setup();
+    upsert(&mut conn, vec![gm472_type(), gm472_method(), module_var_m()]);
+    let edge = use_by_name(&mut conn, "CALLS", "krate::a", "m");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 0 });
+    let (target, resolved) = edge_target(&conn, &edge);
+    assert!(!resolved, "a name key must not land on a member: {target}");
+    assert_ne!(target, GM472_M);
+}
+
+/// The incremental pass runs the same rule. Controls: as above.
+#[test]
+fn a_diff_leaves_a_call_by_name_beside_a_variable_and_a_same_named_method_unresolved() {
+    let mut conn = setup();
+    upsert(&mut conn, vec![gm472_type(), gm472_method(), module_var_m()]);
+    let at = gm472_at("src/user.rs", "krate::user");
+    let run = member(at, "Function", "user::run", Vis::Public);
+    let placeholder = container_placeholder(at, "krate::a", KEY_NAME, "m");
+    let edge = usage_edge(&run.id, "CALLS", &placeholder);
+    let edge_id = edge.id.clone();
+    let diff = Diff { upsert_nodes: vec![run, placeholder], upsert_edges: vec![edge], ..Default::default() };
+    assert_eq!(gm472_apply_and_link_diff(&mut conn, &diff), LinkSummary { linked_edges: 0 });
+    let (target, resolved) = edge_target(&conn, &edge_id);
+    assert!(!resolved, "a name key must not land on a member: {target}");
+    assert_ne!(target, GM472_M);
+}
+
+/// A `REFERENCES` edge has no kind rule: beside the method it lands on the
+/// variable, as before GM-568. Control: return all of `candidates` at the top
+/// of `Resolver::drop_type_members` - the edge stays on its placeholder.
+#[test]
+fn a_reference_by_name_beside_a_variable_and_a_same_named_method_lands_on_the_variable() {
+    let mut conn = setup();
+    upsert(&mut conn, vec![gm472_type(), gm472_method(), module_var_m()]);
+    let edge = use_by_name(&mut conn, "REFERENCES", "krate::a", "m");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge), (A_VAR_M.to_string(), true));
+}
+
+/// Members alone are kept: a name matching only a method links to it.
+/// Control: make `Resolver::drop_type_members` return the non-members even
+/// when there are none (drop its `candidates.len() < 2` shortcut and its
+/// `non_members.is_empty()` return) - the edge stays on its placeholder.
+#[test]
+fn a_name_matching_only_one_member_links_to_it() {
+    let mut conn = setup();
+    upsert(&mut conn, vec![gm472_type(), gm472_method()]);
+    let edge = use_by_name(&mut conn, "CALLS", "krate::a", "m");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge), (GM472_M.to_string(), true));
+}
+
+/// A field and a method of one name, called by name: both are members, so
+/// both stay, and the kind rule picks the method, as before GM-568.
+/// Control: as above.
+#[test]
+fn a_call_by_name_matching_a_field_and_a_method_links_the_method() {
+    let mut conn = setup();
+    let method = gm472_member(module_a(), "Function", "method", &[("::", "T"), ("::", "f")]);
+    upsert(&mut conn, vec![gm472_type(), gm472_field(), method]);
+    let edge = use_by_name(&mut conn, "CALLS", "krate::a", "f");
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge), ("Function:src/a.rs:a::T::f".to_string(), true));
+}
+
+/// A `qualifiedName` key keeps its members: a variable and the method under
+/// one qualifiedName, called, land on the method by the kind rule. Control:
+/// drop the `Key::Name` check at the top of `Resolver::drop_type_members` -
+/// the method is dropped and the edge stays on its placeholder.
+#[test]
+fn a_qualified_name_key_keeps_the_member_the_kind_rule_picks() {
+    let mut conn = setup();
+    let mut no_path = member(gm472_at("src/a_other.rs", "krate::a"), "Variable", "a::T::m", Vis::Public);
+    no_path.qualified_path = None;
+    upsert(&mut conn, vec![gm472_type(), gm472_method(), no_path]);
+    let at = gm472_at("src/user.rs", "krate::user");
+    let run = member(at, "Function", "user::run", Vis::Public);
+    let edge = use_through(
+        &mut conn,
+        vec![run],
+        "Function:src/user.rs:user::run",
+        "CALLS",
+        container_placeholder(at, "krate::a", KEY_QUALIFIED_NAME, "a::T::m"),
+    );
+    assert_eq!(link_all(&mut conn).unwrap(), LinkSummary { linked_edges: 1 });
+    assert_eq!(edge_target(&conn, &edge), (GM472_M.to_string(), true));
 }
 
 // --- GM-479: private imports reached through `use super::*` ----------------
