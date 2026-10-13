@@ -319,14 +319,29 @@ mod tests {
         // task's own note that process-tree sampling is only verified on
         // macOS/Linux.
         let mut child = Command::new("sleep")
-            .arg("5")
+            .arg("30")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("failed to spawn the child helper process");
         let child_pid = child.id();
 
-        let sample = process_tree_sample(std::process::id()).expect("the current process must be found");
+        // `spawn` returns once the child has released the parent's memory,
+        // which on Linux is partway through its `execve`: a sample taken at
+        // that instant can find the child with no resident pages counted yet.
+        // So sample until the child is observable with resident memory, up
+        // to a deadline well inside the child's own lifetime; the assertions
+        // below then read the last sample, so a child that never shows up,
+        // or never shows memory, still fails them.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let sample = loop {
+            let sample = process_tree_sample(std::process::id()).expect("the current process must be found");
+            let observable = sample.rss_bytes_of(child_pid).is_some_and(|bytes| bytes > 0);
+            if observable || std::time::Instant::now() >= deadline {
+                break sample;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
 
         assert!(
             sample.contains(child_pid),
