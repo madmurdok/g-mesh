@@ -37,9 +37,20 @@ and restarting the daemon is enough to get the pass.
 
 A `rust-analyzer` on `PATH` is not proof of one: `~/.cargo/bin/rust-analyzer`
 is a rustup proxy that exists for every component rustup knows, installed or
-not, and exits 1 when the one behind it is missing. `src/semantic.rs` tries
-the `PATH` name and then `rustup which`, and probes each with `--version`
-before believing it.
+not, and exits 1 when the one behind it is missing. `src/semantic.rs` takes
+the absolute binary `rustup which --toolchain <default>` names, then a
+`PATH` install that is not a rustup proxy (it does not resolve to the
+`rustup` binary or sit beside it), and probes each with
+`--version` before believing it.
+
+rust-analyzer runs no code the project supplies: build scripts and proc
+macros are off, the toolchain is pinned to your rustup default (the project's
+`rust-toolchain.toml` is ignored), and `rustc`, `cargo` and any `rustc`
+wrapper named by `.cargo/config.toml` are overridden by environment
+variables. Derive-generated impls (`#[derive(Serialize)]`), function-like
+macro output and `OUT_DIR` code are therefore not resolved, and nothing is
+written to `target/`. See
+[ADR 0032](../../docs/adr/0032-semantic-tiers-execute-no-project-code.md).
 
 ## What it indexes
 

@@ -5,7 +5,7 @@ This directory is the index and home for g-mesh's architecture decisions.
 ## Template
 
 New decisions get their own file: `docs/adr/NNNN-<slug>.md` (four-digit,
-zero-padded, incrementing — the next free number is `0030`). Use this
+zero-padded, incrementing — the next free number is `0033`). Use this
 template:
 
 ```markdown
@@ -102,3 +102,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0029 | [Core ships its link result to the semantic tier, and the tier decides agreement with it](0029-core-ships-its-link-result-to-the-semantic-tier.md) | Accepted |
 | 0030 | [The test suite runs as named sections, defined in one script](0030-test-sections.md) | Accepted |
 | 0031 | [Local test runs: lib tests in one process, heavy tests at batch end](0031-local-test-runs.md) | Accepted |
+| 0032 | [Semantic tiers execute no project code](0032-semantic-tiers-execute-no-project-code.md) | Accepted |

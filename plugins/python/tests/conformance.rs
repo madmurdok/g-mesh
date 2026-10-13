@@ -58,12 +58,9 @@
 //! `conformance/project/node_modules`, because the kit runs a plugin against a
 //! scratch **copy** of the fixture and `session::copy_tree` skips symlinks
 //! deliberately - and an npm `.bin` directory on unix is nothing but symlinks,
-//! so a project-local install would not survive the copy. The resolution
-//! branch that reads a project's own `node_modules/.bin` is therefore proved
-//! against a real install in `src/semantic.rs`'s
-//! `a_project_local_install_is_found_and_probed_for_real`, which builds its own
-//! tree, and the arms here pass the server's absolute path the same way
-//! `plugins/rust` passes rust-analyzer's.
+//! so a project-local install would not survive the copy. The arms here pass
+//! the server's absolute path the same way `plugins/rust` passes
+//! rust-analyzer's.
 
 use std::path::{Path, PathBuf};
 
@@ -541,7 +538,7 @@ fn a_missing_pyright_is_reported_once_and_degrades_to_structural() {
     assert_eq!(reports.len(), 1, "exactly one report, not one per pass:\n{}", outcome.stderr);
     let report = reports[0];
     assert!(report.contains("no usable pyright"), "{report}");
-    assert!(report.contains("npm install pyright"), "the remedy is named: {report}");
+    assert!(report.contains("npm install -g pyright"), "the remedy is named: {report}");
     assert!(
         report.contains("structurally only for the rest of this process's life"),
         "and the consequence: {report}"

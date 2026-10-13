@@ -44,6 +44,15 @@ package main
 // golang.org/x/tools at all, so "the engine started" and "a semanticPass
 // arrived" cannot come apart.
 //
+// # What `go list` may run
+//
+// Nothing the module chooses: `go list` runs with GOTOOLCHAIN=local, so a
+// `go`/`toolchain` line newer than the installed Go fails to load (and
+// degrades below) instead of downloading and running another toolchain, and
+// with GOPACKAGESDRIVER=off, so no driver binary on PATH replaces it. cgo
+// stays on: it runs the user's own `cc`/`pkg-config`. See [loadEnv] and
+// docs/adr/0032-semantic-tiers-execute-no-project-code.md.
+//
 // # Degradation
 //
 // No `go` on PATH, or a `packages.Load` that fails outright: log once and
@@ -310,7 +319,7 @@ func newResolutions() *resolutions {
 // semantic tier becomes useless in exactly the repositories that need it.
 func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) error {
 	fset := token.NewFileSet()
-	cfg := &packages.Config{Mode: loadMode, Dir: dir, Tests: true, Fset: fset}
+	cfg := &packages.Config{Mode: loadMode, Dir: dir, Tests: true, Fset: fset, Env: loadEnv()}
 
 	// The engine is starting *now* - see markSemanticEngineStarted.
 	markSemanticEngineStarted()
@@ -325,6 +334,13 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 		e.foldPackage(into, fset, pkg)
 	}
 	return nil
+}
+
+// loadEnv is the environment `go list` runs with: the inherited one, with
+// the Go toolchain pinned to the installed one and no packages driver.
+// Later entries win, so these override the user's own settings.
+func loadEnv() []string {
+	return append(os.Environ(), "GOTOOLCHAIN=local", "GOPACKAGESDRIVER=off")
 }
 
 // foldPackage indexes one loaded package's type information by position and
