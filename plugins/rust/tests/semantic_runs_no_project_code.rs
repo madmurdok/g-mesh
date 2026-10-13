@@ -12,7 +12,10 @@
 //! - `rust-toolchain.toml` names a `path` toolchain whose `cargo`, `rustc`
 //!   and `rust-analyzer` log and then run the real ones (unix);
 //! - `.cargo/config.toml` sets `build.rustc`, `build.rustc-wrapper` and
-//!   `build.rustc-workspace-wrapper` to logging shims (unix);
+//!   `build.rustc-workspace-wrapper` to logging shims, and `[target.<host>]
+//!   rustflags` to `-Zcodegen-backend=<dylib>`, whose constructor writes
+//!   `MARK_codegen_backend` when any `rustc` loads it (unix, when a C
+//!   compiler builds the dylib);
 //! - a project `rust-analyzer.toml` turns build scripts and proc macros back
 //!   on.
 //!
@@ -196,11 +199,58 @@ impl Fixture {
     }
 }
 
+/// The host triple `rustc -vV` reports: the `[target.<triple>]` table
+/// cargo applies to a host build.
+#[cfg(unix)]
+fn host_triple(rustc: &Path) -> String {
+    let output = Command::new(rustc).arg("-vV").output().unwrap();
+    assert!(output.status.success(), "{} -vV: {}", rustc.display(), String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("`rustc -vV` names the host")
+        .trim()
+        .to_string()
+}
+
+/// A shared library whose load-time constructor writes `mark`: what a
+/// project could ship prebuilt and name as a `-Zcodegen-backend`, which
+/// `rustc` loads before it checks the backend's symbol. `None`, with a
+/// message, when no C compiler `cc` builds it.
+#[cfg(unix)]
+fn build_marker_dylib(dir: &Path, mark: &Path) -> Option<PathBuf> {
+    let source = dir.join("marker.c");
+    write(
+        &source,
+        &format!(
+            "#include <stdio.h>\n__attribute__((constructor)) static void fire(void) {{\n    \
+             FILE *f = fopen({:?}, \"a\");\n    if (f) {{ fputs(\"x\\n\", f); fclose(f); }}\n}}\n",
+            mark.to_string_lossy()
+        ),
+    );
+    let dylib = dir.join(if cfg!(target_os = "macos") { "marker.dylib" } else { "marker.so" });
+    let shared: &[&str] = if cfg!(target_os = "macos") { &["-dynamiclib"] } else { &["-shared", "-fPIC"] };
+    match Command::new("cc").args(shared).arg("-o").arg(&dylib).arg(&source).output() {
+        Ok(output) if output.status.success() => Some(dylib),
+        result => {
+            println!(
+                "SKIPPED the `[target.*] rustflags` -Zcodegen-backend hook: `cc` did not build the marker \
+                 dylib ({result:?})"
+            );
+            None
+        }
+    }
+}
+
 /// `rfx`: workspace `app` + proc macro `mac`, plus (unix) the toolchain file,
 /// the cargo config and their shims.
 fn write_fixture(root: &Path, #[allow(unused_variables)] real: &RealToolchain) -> Fixture {
     let mark_buildrs = root.join("MARK_buildrs");
     let mark_procmacro = root.join("MARK_procmacro");
+    #[cfg(unix)]
+    let mark_backend = root.join("MARK_codegen_backend");
+    #[allow(unused_mut)]
+    let mut marks = vec![mark_buildrs.clone(), mark_procmacro.clone()];
     write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\", \"mac\"]\nresolver = \"2\"\n");
     write(
         &root.join("app/Cargo.toml"),
@@ -270,20 +320,26 @@ fn write_fixture(root: &Path, #[allow(unused_variables)] real: &RealToolchain) -
         shim(&shims.join("rustc"), &logs_dir.join("build-rustc"), &quoted(&real.rustc));
         shim(&shims.join("wrapper"), &logs_dir.join("rustc-wrapper"), "");
         shim(&shims.join("workspace-wrapper"), &logs_dir.join("rustc-workspace-wrapper"), "");
-        write(
-            &root.join(".cargo/config.toml"),
-            &format!(
-                "[build]\nrustc = {:?}\nrustc-wrapper = {:?}\nrustc-workspace-wrapper = {:?}\n",
-                shims.join("rustc").to_string_lossy(),
-                shims.join("wrapper").to_string_lossy(),
-                shims.join("workspace-wrapper").to_string_lossy()
-            ),
+        let mut config = format!(
+            "[build]\nrustc = {:?}\nrustc-wrapper = {:?}\nrustc-workspace-wrapper = {:?}\n",
+            shims.join("rustc").to_string_lossy(),
+            shims.join("wrapper").to_string_lossy(),
+            shims.join("workspace-wrapper").to_string_lossy()
         );
+        if let Some(backend) = build_marker_dylib(&shims, &mark_backend) {
+            config.push_str(&format!(
+                "\n[target.{}]\nrustflags = [{:?}]\n",
+                host_triple(&real.rustc),
+                format!("-Zcodegen-backend={}", backend.to_string_lossy())
+            ));
+            marks.push(mark_backend);
+        }
+        write(&root.join(".cargo/config.toml"), &config);
     }
 
     Fixture {
         root: root.to_path_buf(),
-        marks: vec![mark_buildrs, mark_procmacro],
+        marks,
         #[cfg(unix)]
         logs: [
             "evil-cargo",
@@ -301,20 +357,39 @@ fn write_fixture(root: &Path, #[allow(unused_variables)] real: &RealToolchain) -
 
 /// The hostile config is live: run the way an unpinned rustup user runs them
 /// in this directory, the proxies reach the project's toolchain, `build.rustc`
-/// and the wrapper.
+/// and the wrapper; with `RUSTC_BOOTSTRAP=1`, as rust-analyzer runs some
+/// `rustc` probes, the `[target.*]` rustflags load the codegen-backend dylib.
 #[cfg(unix)]
 fn assert_the_hostile_config_is_in_force(fixture: &Fixture, real: &RealToolchain) {
-    let run = |program: PathBuf, args: &[&str]| {
-        let output = Command::new(&program).args(args).current_dir(&fixture.root).output().unwrap();
+    let run = |program: PathBuf, args: &[&str], env: &[(&str, &str)], must_succeed: bool| {
+        let output = Command::new(&program)
+            .args(args)
+            .envs(env.iter().copied())
+            .current_dir(&fixture.root)
+            .output()
+            .unwrap();
         assert!(
-            output.status.success(),
+            !must_succeed || output.status.success(),
             "{} {args:?} in the fixture: {}",
             program.display(),
             String::from_utf8_lossy(&output.stderr)
         );
     };
-    run(real.proxy_dir.join("rust-analyzer"), &["--version"]);
-    run(real.proxy_dir.join("cargo"), &["metadata", "--format-version", "1"]);
+    let metadata: &[&str] = &["metadata", "--format-version", "1"];
+    run(real.proxy_dir.join("rust-analyzer"), &["--version"], &[], true);
+    // A stable `rustc` refuses the `-Z` flag, so this run leaves the
+    // rustflags out; the next one puts them back.
+    run(real.proxy_dir.join("cargo"), metadata, &[("CARGO_ENCODED_RUSTFLAGS", "")], true);
+    let mark_backend = fixture.root.join("MARK_codegen_backend");
+    if fixture.marks.contains(&mark_backend) {
+        run(real.proxy_dir.join("cargo"), metadata, &[("RUSTC_BOOTSTRAP", "1")], false);
+        assert!(
+            mark_backend.is_file(),
+            "sanity: the unpinned proxies in the fixture never loaded the project's `-Zcodegen-backend` \
+             dylib, so this test would prove nothing about it"
+        );
+        std::fs::remove_file(&mark_backend).unwrap();
+    }
     for name in ["evil-rust-analyzer", "evil-cargo", "build-rustc", "rustc-wrapper"] {
         assert!(
             fixture.log(name).is_file(),

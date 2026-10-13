@@ -500,6 +500,19 @@ mod tests {
         assert!(!unpinned.contains_key("RUSTUP_TOOLCHAIN"), "no pin, no RUSTUP_TOOLCHAIN: {unpinned:?}");
     }
 
+    /// An empty `CARGO_ENCODED_RUSTFLAGS` outranks every config `rustflags`
+    /// (GM-572): absent lets `.cargo/config.toml` `[target.*] rustflags`
+    /// through, and any non-empty value is a flag of ours, not "no flags".
+    #[test]
+    fn the_server_env_pins_empty_encoded_rustflags() {
+        for toolchain in
+            [Toolchain { pin: Some("gm572-pin".to_string()), ..Toolchain::default() }, Toolchain::default()]
+        {
+            let env = pinned_env(&toolchain);
+            assert_eq!(env.get("CARGO_ENCODED_RUSTFLAGS").map(String::as_str), Some(""), "{env:?}");
+        }
+    }
+
     /// `engine` starts the server with `pinned_env` on top of the manifest's
     /// env, so the unit test above is the env the server really gets.
     #[test]
