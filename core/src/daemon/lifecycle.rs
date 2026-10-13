@@ -911,19 +911,6 @@ pub enum Exit {
     Orphaned(Orphaned),
 }
 
-impl Exit {
-    /// Whether [`purge_state_dir`] deletes the state directory for this exit,
-    /// so the caller knows to close the index first.
-    pub fn purges_state(&self) -> bool {
-        matches!(self, Exit::Orphaned(Orphaned::ProjectRootGone(_)))
-    }
-}
-
-/// How long [`purge_state_dir`] keeps retrying a delete that failed.
-const PURGE_RETRY_BUDGET: Duration = Duration::from_secs(2);
-/// The pause between two of those attempts.
-const PURGE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-
 /// How long the rest of the daemon's process group gets between `SIGTERM`
 /// and `SIGKILL`. The plugins are already asleep by then; what is left is
 /// what they started and did not stop (rust-analyzer's `cargo`/`rustc`),
@@ -959,25 +946,19 @@ fn end_process_group() {
 /// root's parent must still exist, nothing may be running for it, and the
 /// root is re-checked under the bootstrap lock in case it came back.
 ///
-/// The caller closes the index first (`IndexStore::close_file`): Windows
-/// cannot delete a file this process holds open. `daemon.log`, this process's
-/// stderr, is opened with delete sharing, so it is no obstacle on either
-/// platform. A failed delete is retried for [`PURGE_RETRY_BUDGET`] (a scanner
-/// may hold a file for a moment on Windows), then logged and left for
-/// `g-mesh clean orphaned` or the next shim's sweep.
+/// Open handles - the index the other threads still hold, `daemon.log` as this
+/// process's stderr - are no obstacle on Unix, where an unlinked file stays
+/// usable until closed and the process ends right after this. Windows cannot
+/// delete an open file, so there the directory is left for the shim's startup
+/// sweep, which runs when no daemon holds it.
 pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
     let Exit::Orphaned(Orphaned::ProjectRootGone(root)) = exit else {
         return;
     };
-    let deadline = std::time::Instant::now() + PURGE_RETRY_BUDGET;
-    let purged = loop {
-        let attempt = crate::cli::clean::purge_orphaned_state_dir(state_dir);
-        if attempt.is_ok() || std::time::Instant::now() >= deadline {
-            break attempt;
-        }
-        std::thread::sleep(PURGE_RETRY_INTERVAL);
-    };
-    match purged {
+    if cfg!(windows) {
+        return;
+    }
+    match crate::cli::clean::purge_orphaned_state_dir(state_dir) {
         Ok(crate::cli::clean::Purge::Deleted) => crate::log_line!(
             "g-mesh daemon: deleted the state of {} ({}) - its project root no longer exists",
             root.display(),

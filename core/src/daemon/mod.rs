@@ -528,14 +528,8 @@ pub fn run(root: &Path) -> Result<()> {
     // a slow teardown while holding it would wedge the project.
     drop(singleton);
     let exit = outcome?;
-    // Closed first: Windows cannot delete the index while this process holds
-    // it open, and other threads still hold the store.
-    if exit.purges_state() {
-        if let Err(err) = conn.close_file() {
-            crate::log_line!("g-mesh daemon: could not close the index before deleting it: {err:#}");
-        }
-    }
-    // After the lock, so the purge judges the directory as `clean` would.
+    // After the lock, so the purge judges the directory as `clean` would; the
+    // index this process still has open is no obstacle (see the function).
     lifecycle::purge_state_dir(&dir, &exit);
     Ok(())
 }
