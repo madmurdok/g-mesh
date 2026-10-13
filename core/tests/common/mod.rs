@@ -103,6 +103,23 @@ pub fn startup_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Dates the file at `path` an hour back.
+///
+/// A walk records no staleness baseline for a file modified within seconds of
+/// its start (it cannot tell one from a file still being written), and the
+/// next daemon start's offline-change reconcile (GM-524) reindexes every file
+/// without one, in the background. A fixture written right before a walk -
+/// a daemon's or `g-mesh init`'s - that a later start is expected to leave
+/// alone must therefore look as old as a real project's files (GM-576, GM-582).
+pub fn backdate_an_hour(path: &Path) {
+    let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(an_hour_ago))
+        .unwrap_or_else(|err| panic!("failed to backdate {}: {err}", path.display()));
+}
+
 /// Polls `ready` every 10ms until it returns `true`, or panics naming `what`
 /// once `timeout` has elapsed.
 ///

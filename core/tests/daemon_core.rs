@@ -63,6 +63,13 @@ impl Project {
         }
         std::fs::write(&path, contents).expect("failed to seed a fixture file");
     }
+
+    /// [`seed`](Self::seed), dated an hour back so that the walk records its
+    /// baseline and a restart leaves it alone (`common::backdate_an_hour`).
+    fn seed_before_walk(&self, relative_path: &str, contents: &str) {
+        self.seed(relative_path, contents);
+        common::backdate_an_hour(&self.root().join(relative_path));
+    }
 }
 
 impl Drop for Project {
@@ -74,6 +81,18 @@ impl Drop for Project {
 }
 
 fn spawn_daemon(root: &Path) -> Child {
+    spawn_daemon_with_stderr(root, Stdio::null())
+}
+
+/// [`spawn_daemon`], with the daemon's log written to `log`.
+fn spawn_daemon_logging_to(root: &Path, log: &Path) -> Child {
+    spawn_daemon_with_stderr(
+        root,
+        std::fs::File::create(log).expect("failed to create the daemon log").into(),
+    )
+}
+
+fn spawn_daemon_with_stderr(root: &Path, stderr: Stdio) -> Child {
     Command::new(BIN)
         .lifeline()
         .arg("daemon")
@@ -81,9 +100,22 @@ fn spawn_daemon(root: &Path) -> Child {
         .arg(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("failed to spawn the daemon")
+}
+
+/// The daemon's one "reconciled N files with the disk" line in `log`, waiting
+/// for it: the restart's offline-change reconcile has finished once it is
+/// there (`PluginRegistry::reconcile_since_index`).
+fn reconciled_line(log: &Path) -> String {
+    let mut line = None;
+    wait_for("the restarted daemon to reconcile the index with the disk", || {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        line = text.lines().find(|line| line.contains("files with the disk in")).map(str::to_string);
+        line.is_some()
+    });
+    line.expect("wait_for returned, so the line was found")
 }
 
 /// GM-301: see `common::wait_for`'s doc comment for why this delegates
@@ -263,22 +295,26 @@ fn a_pre_existing_project_is_indexed_by_the_cold_start_walk_alone() {
 
 /// The other half of that guarantee: the walk is a *cold start*, not a
 /// startup routine - a restart against an already-indexed project must not
-/// re-crawl the whole tree. Proven here by a file added while no daemon was
-/// running that nothing ever asks about (`src/third.ts`): if the second start
-/// had walked the project again, it would be in the index; it must not be.
+/// re-crawl the whole tree into the index. What it does instead is the
+/// offline-change reconcile (GM-524, D4 in
+/// docs/design/GM-524-worktree-daemon-lifecycle.md): it stats every file and
+/// reindexes only the ones created, edited or deleted while no daemon ran.
 ///
-/// `src/second.ts`, also added while no daemon was running, *is* asked about
-/// (via `get_file_outline`) and *is* expected to come back - not because the
-/// restart walked the project, but because `watcher::staleness::ensure_fresh`
-/// (task 117) now runs a per-file mtime/hash check before that one handler
-/// answers and synchronously reindexes just the file the query named. That is
-/// what keeps this consistent with the guarantee this test is really about:
-/// `src/third.ts` proves no bulk walk happened; `src/second.ts` proves a
-/// query-time, single-file catch-up is not the same thing as one.
+/// `src/first.ts` predates the first walk and is untouched since; `src/second.ts`
+/// and `src/third.ts` are created while no daemon runs. The restart's
+/// reconcile line must count the two creations and reindex exactly those two:
+/// a re-walk would reindex `first.ts` as well, and would not print a reconcile
+/// line at all (a start that walks is its own reconcile). The index then has
+/// all three, `third.ts` with no query ever naming it - by design, not a walk.
+///
+/// GM-582: this test used to assert `third.ts` stayed *out* of the index,
+/// which held only while the test's own count beat the reconcile running on
+/// the watcher's consumer thread; Windows CI lost that race. The reconcile's
+/// completion is now waited for, so nothing here races it.
 #[test]
 fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     let project = Project::new();
-    project.seed("src/first.ts", "export function first(): number {\n  return 1;\n}\n");
+    project.seed_before_walk("src/first.ts", "export function first(): number {\n  return 1;\n}\n");
 
     let mut first_daemon = spawn_daemon(project.root());
     let pid_file = daemon::pid_path(project.root()).unwrap();
@@ -293,16 +329,26 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     // dead one's file, and the session below could race the real startup.
     std::fs::remove_file(&pid_file).expect("failed to clear the stale pid file");
 
-    // Both written with nothing watching and nothing serving: only a second
-    // full walk could get either into the index on its own. `second.ts` is
-    // queried below and must be caught by the per-file staleness check;
-    // `third.ts` is never queried by anything and must stay uncaught by it -
-    // that asymmetry is what tells a full re-walk apart from one.
+    // Both created with nothing watching and nothing serving: only the
+    // restart's reconcile can bring them in before a query names them.
     project.seed("src/second.ts", "export function second(): number {\n  return 2;\n}\n");
     project.seed("src/third.ts", "export function third(): number {\n  return 3;\n}\n");
 
-    let mut second_daemon = spawn_daemon(project.root());
+    // Outside the project, so the log is never one of the files walked.
+    let logs = tempfile::tempdir().expect("failed to create a log directory");
+    let log = logs.path().join("second-daemon.log");
+    let mut second_daemon = spawn_daemon_logging_to(project.root(), &log);
     wait_for("the second daemon to start listening", || pid_file.exists());
+    // A first daemon killed before its semantic pass finished leaves the
+    // restart owing that pass, and its reconcile then waits for activation;
+    // this activates without naming any file, so nothing else is reindexed.
+    common::trigger_activation(project.root());
+    let reconciled = reconciled_line(&log);
+    assert!(
+        reconciled.ends_with(": 0 deleted, 2 created, 2 reindexed"),
+        "the restart must reindex the two files created while no daemon ran and leave the \
+         untouched one alone: {reconciled}"
+    );
 
     let endpoint = daemon::endpoint(project.root()).unwrap();
     let responses =
@@ -316,23 +362,16 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     assert_eq!(symbol_names(&responses[0]), vec!["first".to_string()]);
     assert_eq!(
         responses[1]["result"]["isError"], false,
-        "a file added while no daemon was running must still be caught by the query-time \
-         staleness check once something asks about it: {}",
+        "a file added while no daemon was running must be in the index after the restart: {}",
         responses[1]
     );
     assert_eq!(symbol_names(&responses[1]), vec!["second".to_string()]);
 
-    // The file nothing asked about must still be missing - the query-time
-    // check above reindexed exactly the one file it was asked about, not the
-    // project.
     let db_path = project_dir(project.root()).unwrap().join("index.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let third_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM nodes WHERE name = 'third'", [], |row| row.get(0)).unwrap();
-    assert_eq!(
-        third_count, 0,
-        "a file nothing queried must not appear, or the restart walked the project after all"
-    );
+    assert_eq!(third_count, 1, "the reconcile, not a query, must have brought in the file nothing queried");
 
     let _ = second_daemon.kill();
     let _ = second_daemon.wait();
