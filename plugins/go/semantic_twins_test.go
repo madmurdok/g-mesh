@@ -403,7 +403,7 @@ func TestLoadReferencedTwinsListsUnderTheOfflineEnv(t *testing.T) {
 }
 
 // buildRecordingGo compiles a `go` into dir that appends
-// "GOPROXY=..|GOSUMDB=..|GOFLAGS=..|<args>" to log and then runs realGo
+// "GOPROXY=..|GOSUMDB=..|GOFLAGS=..|<args>|DIR=<working dir>" to log and then runs realGo
 // with the same arguments, environment and stdio.
 func buildRecordingGo(t *testing.T, dir, realGo, log string) {
 	t.Helper()
@@ -417,10 +417,11 @@ import (
 )
 
 func main() {
+	wd, _ := os.Getwd()
 	f, err := os.OpenFile(` + "`" + log + "`" + `, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err == nil {
 		f.WriteString("GOPROXY=" + os.Getenv("GOPROXY") + "|GOSUMDB=" + os.Getenv("GOSUMDB") +
-			"|GOFLAGS=" + os.Getenv("GOFLAGS") + "|" + strings.Join(os.Args[1:], " ") + "\n")
+			"|GOFLAGS=" + os.Getenv("GOFLAGS") + "|" + strings.Join(os.Args[1:], " ") + "|DIR=" + wd + "\n")
 		f.Close()
 	}
 	cmd := exec.Command(` + "`" + realGo + "`" + `, os.Args[1:]...)
