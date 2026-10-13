@@ -12,7 +12,8 @@
 #
 # Prints exactly one line: `full`, `none`, or section names in run order,
 # space-separated. The output is valid arguments for
-# `scripts/test-sections.sh run`.
+# `scripts/test-sections.sh run`. With `--go` it prints `1` if the diff needs
+# the Go plugin's own tests (plugins/go/), `0` otherwise.
 #
 # With git, the changed paths are `git diff <base>...HEAD` plus uncommitted and
 # untracked files. The default base is the merge-base with the nearest

@@ -26,7 +26,8 @@ CI must keep running everything exactly as before.
   `scripts/test-local.sh --base <release-branch>`; the batch-end slice runs
   `scripts/test-local.sh --full`. CI does not call it.
 - **The Go plugin's suite is a separate step** (`go test ./...` in
-  `plugins/go`, as CI's Go job runs it; GM-573). It is not a nextest section,
+  `plugins/go`, CI's Go job's test command; its `go vet` and `gofmt`
+  checks are not run locally; GM-573). It is not a nextest section,
   so `scripts/test-select.sh --go` answers whether a diff needs it: any path
   under `plugins/go/` or a full selection. `--full` always runs it. A failing
   Go test fails the run, and a missing `go` toolchain fails it too, never

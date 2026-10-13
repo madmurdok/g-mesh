@@ -5,12 +5,14 @@
 #   scripts/test-local.sh [--base <ref> | --paths-from <file>] [--per-process] [--keep-going] [--dry-run]
 #   scripts/test-local.sh --full [--dry-run]
 #
-# In two parts:
+# In two parts, then the Go step:
 #   1. lib: the selected lib tests, one libtest process per crate
 #      (`cargo test -p <crate> --lib -- --exact <names>`), names from
 #      `cargo nextest list`. Skipped with --per-process.
 #   2. nextest: every other selected test, one `cargo nextest run`
 #      (integration tests, binaries, ISOLATED).
+#   Go: `go test ./...` in plugins/go, when scripts/test-select.sh --go says
+#      the diff needs it, and always with --full.
 # Without --full: the sections scripts/test-select.sh picks, profile `local`
 # (its heavy tests skipped), G_MESH_CONTAINERS_SEEDS=2. --dry-run lists what
 # each part would run and runs no test.
