@@ -355,6 +355,47 @@ mod imp {
         signal_members(&left, pgid, libc::SIGKILL);
         super::GroupSweep::Swept { terminated: members.len(), killed: left.len() }
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        use super::*;
+
+        /// On Linux a thread's id shares its process's group, so listing it
+        /// as a group member would make the sweep signal a thread - which
+        /// ends the whole process it belongs to. Asked about this test
+        /// process's own group while it runs extra threads, the listing
+        /// holds none of their ids.
+        #[test]
+        fn a_group_listing_holds_no_thread_ids() {
+            let me = std::process::id();
+            let (stop, parked) = std::sync::mpsc::channel::<()>();
+            let parked = std::sync::Arc::new(std::sync::Mutex::new(parked));
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let parked = std::sync::Arc::clone(&parked);
+                    std::thread::spawn(move || {
+                        let _ = parked.lock().map(|rx| rx.recv());
+                    })
+                })
+                .collect();
+
+            let thread_ids: Vec<u32> = std::fs::read_dir("/proc/self/task")
+                .expect("a Linux process has a /proc task list")
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+                .filter(|&tid| tid != me)
+                .collect();
+            assert!(!thread_ids.is_empty(), "precondition: this test process must be multi-threaded");
+
+            let members = group_members(own_pgid(), 0);
+
+            drop(stop);
+            for thread in threads {
+                let _ = thread.join();
+            }
+            let listed: Vec<u32> = thread_ids.iter().copied().filter(|tid| members.contains(tid)).collect();
+            assert!(listed.is_empty(), "thread ids {listed:?} were listed as group members: {members:?}");
+        }
+    }
 }
 
 #[cfg(windows)]
