@@ -166,9 +166,16 @@ impl Toolchain {
 /// `RUSTUP_TOOLCHAIN` outranks `rust-toolchain.toml`, so a project file can
 /// name none of these. An empty wrapper is cargo's "no wrapper".
 /// `CARGO_ENCODED_RUSTFLAGS` empty outranks `.cargo/config.toml`
-/// `[build]` and `[target.*]` `rustflags`, so no project flag (`-Z`
-/// codegen-backend, `-Zcrate-attr`, ...) reaches a `rustc` that
-/// rust-analyzer or cargo runs.
+/// `[build]` and `[target.*]` `rustflags`, so no `rustflags` entry of a
+/// project config (`-Zcodegen-backend`, `-Zcrate-attr`, ...) reaches a
+/// `rustc` that cargo runs for the server. It does not cover host units
+/// when cargo honours the config's `[unstable]` table (a nightly cargo, or
+/// `RUSTC_BOOTSTRAP=1`): `host-config` with `target-applies-to-host = false`
+/// gives them `[host]` `rustflags` instead. `CARGO_UNSTABLE_HOST_CONFIG=false`
+/// outranks that `[unstable]` key, so host units get the empty
+/// `CARGO_ENCODED_RUSTFLAGS` or no flags at all. Stable cargo ignores the
+/// variable. The config's `[env]` table reaches `rustc` by another route
+/// and is not covered.
 /// `CARGO_NET_OFFLINE` reaches every cargo the server runs (`metadata`,
 /// `locate-project`, `config get`), so none of them downloads a dependency
 /// or refreshes a registry index.
@@ -176,6 +183,7 @@ fn pinned_env(toolchain: &Toolchain) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("CARGO_NET_OFFLINE".to_string(), "true".to_string());
     env.insert("CARGO_ENCODED_RUSTFLAGS".to_string(), String::new());
+    env.insert("CARGO_UNSTABLE_HOST_CONFIG".to_string(), "false".to_string());
     if let Some(pin) = &toolchain.pin {
         env.insert("RUSTUP_TOOLCHAIN".to_string(), pin.clone());
     }

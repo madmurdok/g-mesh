@@ -45,7 +45,14 @@ Nothing the project's files name is executed.
   The same map sets `CARGO_ENCODED_RUSTFLAGS` empty: it outranks a project's
   `.cargo/config.toml` `[build]`/`[target.*]` `rustflags`, which otherwise
   reach the `rustc` probes of `cargo metadata` and can carry `-Z` flags such
-  as `-Zcodegen-backend=<project dylib>`. Project-chosen `--cfg` flags in
+  as `-Zcodegen-backend=<project dylib>`. It does not reach host units when
+  cargo honours the config's `[unstable]` table (nightly cargo, or
+  `RUSTC_BOOTSTRAP=1`): `host-config = true` with
+  `target-applies-to-host = false` hands them `[host]` `rustflags` past the
+  empty value (measured, cargo 1.97.1 with `RUSTC_BOOTSTRAP=1`; rust-analyzer
+  1.97.1's own cargo calls did not do this). The map therefore also sets
+  `CARGO_UNSTABLE_HOST_CONFIG=false`, which outranks that `[unstable]` key;
+  stable cargo ignores it. Project-chosen `--cfg` flags in
   `rustflags` are not resolved, like the other project-chosen cfgs.
 - **D3 - pyright runs no interpreter.** `python.pythonPath` is a path that
   cannot exist (a child of the plugin's executable file); pyright fails to
