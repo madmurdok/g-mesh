@@ -286,13 +286,25 @@ mod imp {
     /// Every live process in group `pgid` except `me`. Zombies are left out:
     /// one cannot be signalled away, and waiting on it would only spend the
     /// whole grace.
+    ///
+    /// Processes only, never threads (GM-577). On Linux `sysinfo` lists every
+    /// thread as a process of its own unless told not to, and a thread's id
+    /// shares its process's group: this daemon's own threads passed the
+    /// `pid != me` filter, and `kill(tid, SIGTERM)` is delivered to the whole
+    /// thread group - the daemon ended itself mid-sweep, before signalling the
+    /// rest of its group and before releasing its pid file.
     fn group_members(pgid: u32, me: u32) -> Vec<u32> {
         use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
         let mut system = System::new();
-        system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().without_tasks(),
+        );
         system
             .processes()
             .iter()
+            .filter(|(_, process)| process.thread_kind().is_none())
             .filter(|(_, process)| process.status() != ProcessStatus::Zombie)
             .map(|(pid, _)| pid.as_u32())
             .filter(|&pid| pid != me && pgid_of(pid) == Some(pgid))
