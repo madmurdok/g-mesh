@@ -37,3 +37,7 @@ or const around it, the encloser.
   still links the function; one shared by a const and a type links the const.
 - Rust tuple-variant constructors (`Enum::Variant(..)`) have no node and land
   on the enum away from its name, so they stay unlinked.
+- Python `Foo()` and TS `new Foo()` on a class with no explicit constructor
+  now produce `CALLS` onto the class, so `find_callers` on a class lists its
+  constructions, which some users read as "references". None measured on
+  py-requests (0 refusals).
