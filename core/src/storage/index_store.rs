@@ -209,6 +209,22 @@ impl IndexStore {
         self.conn.into_inner()
     }
 
+    /// Closes the index file - `index.db` and its `-wal`/`-shm` - for a
+    /// daemon that is about to delete its own state directory
+    /// (`daemon::lifecycle::purge_state_dir`). Windows cannot delete a
+    /// file this process holds open, and other threads still hold clones of
+    /// the store, so the connection is swapped for an empty in-memory one
+    /// rather than dropped with the last `Arc`: whatever still runs against
+    /// the store until the process exits fails with an SQL error instead of
+    /// reaching a file that is being deleted. Waits for the store like any
+    /// other operation; a poisoned lock is closed all the same.
+    pub fn close_file(&self) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+        let in_memory = Connection::open_in_memory().context("failed to open an in-memory stand-in")?;
+        let file = std::mem::replace(&mut *conn, in_memory);
+        file.close().map_err(|(_, err)| err).context("failed to close the index")
+    }
+
     fn acquire(&self) -> StoreGuard<'_> {
         self.lock().unwrap()
     }
