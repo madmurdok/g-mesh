@@ -45,7 +45,7 @@
 //! # One sample is one instant, and the tree is not the caller's alone (GM-307)
 //!
 //! Everything below returns a [`ProcessTreeSample`] built from *one*
-//! `sysinfo::refresh_processes` snapshot, and that framing is load-bearing
+//! process snapshot (`crate::process::process_snapshot`), and that framing is load-bearing
 //! rather than incidental. A process tree's membership is not stable: a
 //! `rust-analyzer` shells out to `rustc` and to build scripts, a `tsserver`
 //! forks for a project reload, and each of those is a real, transient member
