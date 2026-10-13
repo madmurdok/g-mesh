@@ -84,6 +84,10 @@ const LANGUAGE: &str = "rust";
 /// macros off, and [`pinned_env`] pins the toolchain and the compiler over
 /// whatever the project's `rust-toolchain.toml` and `.cargo/config.toml` name
 /// ([ADR 0032](../../../docs/adr/0032-semantic-tiers-execute-no-project-code.md)).
+/// It reaches no network either: [`pinned_env`] runs every cargo it starts
+/// offline, so a dependency missing from the local cargo cache is not
+/// fetched and its edges stay unresolved until the user runs `cargo fetch`
+/// ([ADR 0033](../../../docs/adr/0033-semantic-tiers-reach-no-network-and-write-nothing.md)).
 pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     let mut config = SemanticConfig::from_manifest()
         .context("reading [plugin.semantic] from this plugin's manifest")?
@@ -97,7 +101,8 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     let toolchain = Toolchain::detect();
     let resolved = resolve(&config.command, &toolchain)?;
     g_mesh_plugin_sdk::log_line!(
-        "[{LANGUAGE}] semantic tier: {} ({}, toolchain {})",
+        "[{LANGUAGE}] semantic tier: {} ({}, toolchain {}, cargo offline: dependencies not in the \
+         local cargo cache stay unresolved until `cargo fetch`)",
         resolved.command.display(),
         resolved.version,
         toolchain.pin.as_deref().unwrap_or("not rustup-managed")
@@ -153,14 +158,19 @@ impl Toolchain {
 }
 
 /// The environment the server starts with on top of the inherited one: the
-/// pinned toolchain, its own `rustc` and `cargo`, and no `rustc` wrapper.
+/// pinned toolchain, its own `rustc` and `cargo`, no `rustc` wrapper, and
+/// cargo offline.
 ///
 /// Environment variables outrank `.cargo/config.toml` (`build.rustc`,
-/// `build.rustc-wrapper`, `build.rustc-workspace-wrapper`) and
+/// `build.rustc-wrapper`, `build.rustc-workspace-wrapper`, `net.offline`) and
 /// `RUSTUP_TOOLCHAIN` outranks `rust-toolchain.toml`, so a project file can
 /// name none of these. An empty wrapper is cargo's "no wrapper".
+/// `CARGO_NET_OFFLINE` reaches every cargo the server runs (`metadata`,
+/// `locate-project`, `config get`), so none of them downloads a dependency
+/// or refreshes a registry index.
 fn pinned_env(toolchain: &Toolchain) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
+    env.insert("CARGO_NET_OFFLINE".to_string(), "true".to_string());
     if let Some(pin) = &toolchain.pin {
         env.insert("RUSTUP_TOOLCHAIN".to_string(), pin.clone());
     }

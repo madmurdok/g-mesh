@@ -53,6 +53,17 @@ package main
 // stays on: it runs the user's own `cc`/`pkg-config`. See [loadEnv] and
 // docs/adr/0032-semantic-tiers-execute-no-project-code.md.
 //
+// # What `go list` may touch
+//
+// No network and nothing under the project root: GOPROXY=off, so a module
+// missing from GOMODCACHE fails to load instead of being downloaded, and
+// `-mod=readonly` (or `-mod=vendor` for a vendored module or workspace) as a
+// build flag, so `go list` never rewrites go.mod or go.sum. The build flag
+// overrides only `-mod` in the user's GOFLAGS; the rest of it still applies.
+// Imports of a module that is not in the cache do not type-check; local code
+// still resolves. See [loadEnv], [modFlag] and
+// docs/adr/0033-semantic-tiers-reach-no-network-and-write-nothing.md.
+//
 // # Degradation
 //
 // No `go` on PATH, or a `packages.Load` that fails outright: log once and
@@ -320,6 +331,9 @@ func newResolutions() *resolutions {
 func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) error {
 	fset := token.NewFileSet()
 	cfg := &packages.Config{Mode: loadMode, Dir: dir, Tests: true, Fset: fset, Env: loadEnv()}
+	if flag := modFlag(dir, os.Getenv); flag != "" {
+		cfg.BuildFlags = []string{flag}
+	}
 
 	// The engine is starting *now* - see markSemanticEngineStarted.
 	markSemanticEngineStarted()
@@ -337,10 +351,60 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 }
 
 // loadEnv is the environment `go list` runs with: the inherited one, with
-// the Go toolchain pinned to the installed one and no packages driver.
-// Later entries win, so these override the user's own settings.
+// the Go toolchain pinned to the installed one, no packages driver and no
+// module proxy (so nothing is downloaded). Later entries win, so these
+// override the user's own settings.
 func loadEnv() []string {
-	return append(os.Environ(), "GOTOOLCHAIN=local", "GOPACKAGESDRIVER=off")
+	return append(os.Environ(), "GOTOOLCHAIN=local", "GOPACKAGESDRIVER=off", "GOPROXY=off")
+}
+
+// modFlag is the `-mod` build flag `go list` runs with from dir, so it never
+// writes go.mod or go.sum: "-mod=vendor" when the governing go.work (else
+// go.mod) has a vendor/modules.txt beside it, "-mod=readonly" otherwise, and
+// "" when dir is not in module mode (GO111MODULE=off, or no go.mod or go.work
+// above it), where go rejects the flag and writes neither file anyway.
+//
+// The governing files are found the way go finds them: GOWORK names the
+// workspace file ("off" for none), else the nearest go.work at or above dir;
+// the module file is the nearest go.mod at or above dir.
+func modFlag(dir string, getenv func(string) string) string {
+	if getenv("GO111MODULE") == "off" {
+		return ""
+	}
+	governing := ""
+	switch gowork := getenv("GOWORK"); gowork {
+	case "off":
+	case "":
+		governing = findUp(dir, "go.work")
+	default:
+		governing = gowork
+	}
+	if governing == "" {
+		governing = findUp(dir, "go.mod")
+	}
+	if governing == "" {
+		return ""
+	}
+	if info, err := os.Stat(filepath.Join(filepath.Dir(governing), "vendor", "modules.txt")); err == nil && info.Mode().IsRegular() {
+		return "-mod=vendor"
+	}
+	return "-mod=readonly"
+}
+
+// findUp is the path of the nearest regular file called name in dir or one
+// of its ancestors, or "" when there is none.
+func findUp(dir, name string) string {
+	for {
+		candidate := filepath.Join(dir, name)
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			return candidate
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
 }
 
 // foldPackage indexes one loaded package's type information by position and

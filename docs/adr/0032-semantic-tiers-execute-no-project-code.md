@@ -89,5 +89,6 @@ origin here (outside this task's analysis).
   load; its pass degrades (logged) until the user upgrades Go.
 - Faster rust-analyzer start; no `target/` under the project.
 - Follow-ups: TypeScript's project-local server origin and its `npx`
-  candidate (same exposure as python's had); GM-512 (no writes,
-  no network) adds its environment to the same rust env map.
+  candidate (same exposure as python's had); no network and no writes
+  under the root: [ADR 0033](0033-semantic-tiers-reach-no-network-and-write-nothing.md),
+  whose rust setting joins the same env map.
