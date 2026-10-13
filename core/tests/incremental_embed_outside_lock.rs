@@ -296,10 +296,10 @@ fn a_tool_call_against_an_unrelated_file_is_not_blocked_by_a_reparses_lock_free_
     project.write("src/a.ts", "export function alpha(): number {\n  return 1;\n}\n");
     project.write("src/b.ts", "export function beta(): number {\n  return 2;\n}\n");
     // Dated back so that `init`'s walk records both baselines: otherwise the
-    // daemon's offline-change reconcile (GM-524) sends its own round trips
+    // daemon's offline-change reconcile sends its own round trips
     // for them at startup, and one still in flight when the hold is armed
     // below is caught in place of the edit's - wedging the watcher's consumer
-    // the edit has to go through (GM-582).
+    // the edit has to go through.
     for file in ["src/a.ts", "src/b.ts"] {
         common::backdate_an_hour(&project.root().join(file));
     }

@@ -88,7 +88,7 @@ impl Project {
             std::fs::write(&path, contents).expect("failed to write a fixture file");
             // So that `init`'s walk records its baseline, and the daemon
             // started after it answers from the index `init` built instead
-            // of reindexing the file underneath the query (GM-582).
+            // of reindexing the file underneath the query.
             common::backdate_an_hour(&path);
         }
         project

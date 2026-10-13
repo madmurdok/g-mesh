@@ -296,9 +296,8 @@ fn a_pre_existing_project_is_indexed_by_the_cold_start_walk_alone() {
 /// The other half of that guarantee: the walk is a *cold start*, not a
 /// startup routine - a restart against an already-indexed project must not
 /// re-crawl the whole tree into the index. What it does instead is the
-/// offline-change reconcile (GM-524, D4 in
-/// docs/design/GM-524-worktree-daemon-lifecycle.md): it stats every file and
-/// reindexes only the ones created, edited or deleted while no daemon ran.
+/// offline-change reconcile: it stats every file and reindexes
+/// only the ones created, edited or deleted while no daemon ran.
 ///
 /// `src/first.ts` predates the first walk and is untouched since; `src/second.ts`
 /// and `src/third.ts` are created while no daemon runs. The restart's
@@ -306,11 +305,6 @@ fn a_pre_existing_project_is_indexed_by_the_cold_start_walk_alone() {
 /// a re-walk would reindex `first.ts` as well, and would not print a reconcile
 /// line at all (a start that walks is its own reconcile). The index then has
 /// all three, `third.ts` with no query ever naming it - by design, not a walk.
-///
-/// GM-582: this test used to assert `third.ts` stayed *out* of the index,
-/// which held only while the test's own count beat the reconcile running on
-/// the watcher's consumer thread; Windows CI lost that race. The reconcile's
-/// completion is now waited for, so nothing here races it.
 #[test]
 fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     let project = Project::new();

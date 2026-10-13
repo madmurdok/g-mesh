@@ -107,10 +107,10 @@ pub fn startup_timeout() -> Duration {
 ///
 /// A walk records no staleness baseline for a file modified within seconds of
 /// its start (it cannot tell one from a file still being written), and the
-/// next daemon start's offline-change reconcile (GM-524) reindexes every file
+/// next daemon start's offline-change reconcile reindexes every file
 /// without one, in the background. A fixture written right before a walk -
 /// a daemon's or `g-mesh init`'s - that a later start is expected to leave
-/// alone must therefore look as old as a real project's files (GM-576, GM-582).
+/// alone must therefore look as old as a real project's files.
 pub fn backdate_an_hour(path: &Path) {
     let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
     std::fs::File::options()
