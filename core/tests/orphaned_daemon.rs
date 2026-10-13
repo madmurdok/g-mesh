@@ -230,6 +230,65 @@ fn assert_released_everything(project: &Project, daemon_process: &mut Daemon, pl
     }
 }
 
+/// The marker whose mtime spaces the shim's startup sweeps
+/// (`cli::clean::ORPHAN_SWEEP_MARKER`, private to that module).
+const ORPHAN_SWEEP_MARKER: &str = "orphan-sweep.stamp";
+
+/// How long one shim is given to sweep `state_dir` before another is started.
+const SWEEP_ATTEMPT: Duration = Duration::from_secs(10);
+
+/// Starts shims, one at a time, until `state_dir` has been swept away or
+/// [`orphan_budget`] runs out: the path Windows takes to the state an orphaned
+/// daemon could not delete itself (GM-524 D1).
+///
+/// Over the home the suite shares, because that is where the daemon kept its
+/// state. The sweep runs at most once per `ORPHAN_SWEEP_INTERVAL` per home, so
+/// each attempt first removes the marker that spaces them. Another test's shim
+/// may still stamp it in between, or hold the sweep's lock with a scan that
+/// judged this directory while its daemon was still running; either way that
+/// shim sweeps nothing for this directory, so the next attempt is a fresh one
+/// rather than a longer wait. A sweep over the shared home deletes only what
+/// any shim start in the suite would: the state of projects whose directory
+/// is gone, with nothing running for them.
+fn sweep_with_a_shim(state_dir: &Path) {
+    let home = g_mesh::paths::g_mesh_home().expect("failed to resolve the g-mesh home");
+    // A live project for the shim to serve: it connects (bootstrapping a
+    // daemon this fixture's `Drop` stops) before it starts the sweep.
+    let shim_project = Project::new();
+    let aux = tempfile::tempdir().expect("failed to create a directory for the shim's stderr");
+    let deadline = std::time::Instant::now() + orphan_budget();
+    let mut attempt = 0;
+    while state_dir.exists() {
+        attempt += 1;
+        let stderr_path = aux.path().join(format!("shim-{attempt}.stderr"));
+        let _ = std::fs::remove_file(home.join(ORPHAN_SWEEP_MARKER));
+        let mut shim = Command::new(BIN)
+            .lifeline()
+            .arg("mcp-shim")
+            .current_dir(shim_project.root())
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).expect("failed to create the shim's stderr file"))
+            .spawn()
+            .expect("failed to spawn the shim");
+        let attempt_deadline = std::time::Instant::now() + SWEEP_ATTEMPT;
+        while state_dir.exists() && std::time::Instant::now() < attempt_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = shim.kill();
+        let _ = shim.wait();
+        if state_dir.exists() && std::time::Instant::now() >= deadline {
+            panic!(
+                "no shim swept {} within {:?} ({attempt} attempt(s)); last shim's stderr:\n{}",
+                state_dir.display(),
+                orphan_budget(),
+                std::fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+        }
+    }
+}
+
 /// The observed case, end to end: four daemons were found running from
 /// directories that no longer existed. This is one of them, reproduced.
 #[test]
@@ -243,7 +302,13 @@ fn a_daemon_whose_project_root_is_deleted_stops_itself() {
 
     common::wait_for("the orphaned daemon to stop itself", orphan_budget(), || !daemon_process.is_running());
     assert_released_everything(&project, &mut daemon_process, plugin_pid);
-    // The purge runs before the process exits, and the exit was reaped above.
+    // On Unix the purge runs before the process exits, and the exit was reaped
+    // above. Windows cannot delete the files the daemon still holds open, so
+    // there the directory is left for the shim's startup sweep (GM-524 D1,
+    // `lifecycle::purge_state_dir`), which this runs.
+    if cfg!(windows) {
+        sweep_with_a_shim(&project.state_dir);
+    }
     assert!(
         !project.state_dir.exists(),
         "the state of a project whose directory was deleted (its parent still there) must go with its \
