@@ -277,8 +277,8 @@ fn the_projects_own_pyright_is_never_probed_or_run() {
 /// that local package and runs it - checked as a sanity step - so the plugin
 /// must not reach `npx` at all, and must report the tier off with the remedy.
 ///
-/// Control F1: in `plugins/sdk/src/lsp/resolve.rs`, `npm_candidates_in`,
-/// delete the `if !npx { return candidates; }` early return.
+/// Control F1: in `plugins/sdk/src/lsp/resolve.rs`, `npm_candidates_on_path`,
+/// append an `npx --yes --package pyright <bin>` candidate for a bare name.
 #[test]
 fn a_real_npx_in_the_project_never_runs_the_projects_pyright() {
     let _guard = ENVIRONMENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

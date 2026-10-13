@@ -2,17 +2,20 @@
 //! bridge is handed it.
 //!
 //! A plugin builds an ordered list of [`Candidate`]s - by hand, or with
-//! [`npm_candidates`] for a server published on npm - and [`resolve`] runs
-//! each one's `--version` probe under a budget, taking the first that
-//! answers. A candidate is accepted for answering, never for existing: a
-//! shim that always exists and always starts (a rustup proxy for an
-//! uninstalled component, `npx` with no network) is otherwise a server that
-//! dies at handshake once per pass, which the bridge cannot tell from a
-//! missing one.
+//! [`npm_candidates_on_path`] for a server published on npm - and
+//! [`resolve`] runs each one's `--version` probe under a budget, taking the
+//! first that answers. A candidate is accepted for answering, never for
+//! existing: a shim that always exists and always starts (a rustup proxy for
+//! an uninstalled component) is otherwise a server that dies at handshake
+//! once per pass, which the bridge cannot tell from a missing one.
 //!
-//! The rationale for the candidate order, the `.cmd` spellings and the probe
-//! budget is in `docs/architecture/gm-325-typescript-lsp-semantics.md`, §2
-//! and §5, and in `plugins/python/src/semantic.rs`'s module doc.
+//! Nothing under the indexed project is a candidate, and every probe and
+//! server runs with `NoDefaultCurrentDirectoryInExePath` set
+//! ([`NO_CWD_EXE_LOOKUP`]): the semantic tiers execute no project code
+//! ([ADR 0032](../../../../docs/adr/0032-semantic-tiers-execute-no-project-code.md)).
+//! The rationale for the `.cmd` spellings and the probe budget is in
+//! `docs/architecture/gm-325-typescript-lsp-semantics.md`, §2 and §5, and in
+//! `plugins/python/src/semantic.rs`'s module doc.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -29,7 +32,7 @@ pub const WINDOWS_SCRIPT_EXTENSIONS: [&str; 1] = [".cmd"];
 /// The script extensions worth trying on the host this process runs on:
 /// [`WINDOWS_SCRIPT_EXTENSIONS`] on Windows, none elsewhere.
 ///
-/// [`script_spellings`] and [`npm_candidates`] take the list as a parameter
+/// [`script_spellings`] and [`npm_candidates_on_path`] take the list as a parameter
 /// rather than reading this, so their Windows arm runs under tests on any
 /// host.
 #[cfg(windows)]
@@ -39,20 +42,24 @@ pub const HOST_SCRIPT_EXTENSIONS: &[&str] = &WINDOWS_SCRIPT_EXTENSIONS;
 pub const HOST_SCRIPT_EXTENSIONS: &[&str] = &[];
 
 /// How long one candidate's `--version` may take before it is killed and
-/// counted as a failure. It runs inside a semantic pass, and an `npx` probe
-/// against an unreachable registry does not fail fast.
+/// counted as a failure. It runs inside a semantic pass, and a wedged
+/// server's `--version` must not hold it.
 pub const PROBE_BUDGET: Duration = Duration::from_secs(60);
 
-/// Where an npm project keeps its locally installed bins.
-const NODE_BIN_DIR: &str = "node_modules/.bin";
+/// The environment entry set on every probe and every language server, as
+/// `(name, value)`. On Windows it stops `cmd.exe` - which runs npm's `.cmd`
+/// shims - from looking for `node.exe` in its current directory before
+/// `PATH`, and that directory is the indexed project for a server. Elsewhere
+/// nothing reads it.
+pub const NO_CWD_EXE_LOOKUP: (&str, &str) = ("NoDefaultCurrentDirectoryInExePath", "1");
 
 /// One spelling of "run this language server", and how to prove it is one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     /// argv\[0\] for the server.
     pub command: PathBuf,
-    /// argv entries that come *before* the manifest's own `args` - the
-    /// package, for an `npx` candidate, and nothing for the others.
+    /// argv entries that come *before* the manifest's own `args`; none for an
+    /// npm-published server.
     pub prefix_args: Vec<String>,
     /// The program to ask `--version`, and the args that precede it.
     pub probe: (PathBuf, Vec<String>),
@@ -76,14 +83,8 @@ pub struct Resolved {
 /// A language server published on npm.
 #[derive(Debug, Clone, Copy)]
 pub struct NpmServer<'a> {
-    /// The npm *package*, which is what `npx --package` wants; a bin name
-    /// there is a registry 404 when the two differ.
-    pub package: &'a str,
     /// The package's language-server bin, the manifest's usual `command`.
     pub bin: &'a str,
-    /// The bin the `npx` candidate's probe runs. It differs from the server's
-    /// bin only when the server itself has no `--version`.
-    pub probe_bin: &'a str,
     /// Maps an installed server path to the path its probe runs, keeping the
     /// directory and extension. Identity when the server answers `--version`.
     pub twin: fn(&Path) -> PathBuf,
@@ -116,75 +117,27 @@ pub fn script_spellings(path: &Path, extensions: &[&str]) -> Vec<PathBuf> {
 
 /// The candidates for an npm-published server, in order.
 ///
-/// A `command` that is a path is the only origin. A bare one is `PATH`, then
-/// `<root>/node_modules/.bin`, then `npx --yes --package <package> <command>`.
-/// Within each origin every [`script_spellings`] spelling is tried before the
-/// next origin: origin priority outranks spelling.
-///
-/// Every installed candidate is probed through `npm.twin`; the `npx`
-/// candidate's probe is its own argv with `npm.probe_bin` in place of the
-/// server's bin, so the probe proves the argv shape that will run.
-pub fn npm_candidates(command: &Path, root: &Path, npm: &NpmServer, extensions: &[&str]) -> Vec<Candidate> {
-    npm_candidates_in(command, Some(root), true, npm, extensions)
-}
-
-/// [`npm_candidates`] with `PATH` as the only origin for a bare name: no
-/// `<root>/node_modules/.bin` and no `npx`. Nothing under the indexed project
-/// is probed or run, so a project cannot ship the server binary - and `npx`
-/// cannot either, because run with the project as its cwd it executes the
-/// project's own `node_modules/<package>` instead of fetching one
+/// A `command` that is a path is the only origin. A bare one is looked up on
+/// `PATH` only: never `<root>/node_modules/.bin` and never `npx`. Nothing
+/// under the indexed project is probed or run, so a project cannot ship the
+/// server binary - and `npx` cannot either, because run with the project as
+/// its cwd it executes the project's own `node_modules/<package>` instead of
+/// fetching one
 /// ([ADR 0032](../../../../docs/adr/0032-semantic-tiers-execute-no-project-code.md)).
+///
+/// Every [`script_spellings`] spelling is a candidate, in order, probed
+/// through `npm.twin` with no args of its own.
 pub fn npm_candidates_on_path(command: &Path, npm: &NpmServer, extensions: &[&str]) -> Vec<Candidate> {
-    npm_candidates_in(command, None, false, npm, extensions)
-}
-
-/// The candidates, with the `<root>/node_modules/.bin` origin only when a
-/// `root` is given and the `npx` origin only when `npx` is set.
-fn npm_candidates_in(
-    command: &Path,
-    root: Option<&Path>,
-    npx: bool,
-    npm: &NpmServer,
-    extensions: &[&str],
-) -> Vec<Candidate> {
-    let installed = |command: PathBuf, origin: &'static str| Candidate {
-        probe: ((npm.twin)(&command), Vec::new()),
-        command,
-        prefix_args: Vec::new(),
-        origin,
-    };
-    if !is_bare(command) {
-        return script_spellings(command, extensions)
-            .into_iter()
-            .map(|command| installed(command, "the path the manifest names"))
-            .collect();
-    }
-
-    let name = command.to_string_lossy().into_owned();
-    let npx_args = |bin: &str| -> Vec<String> {
-        vec!["--yes".to_string(), "--package".to_string(), npm.package.to_string(), bin.to_string()]
-    };
-    let mut candidates = Vec::new();
-    for command in script_spellings(command, extensions) {
-        candidates.push(installed(command, "PATH"));
-    }
-    if let Some(root) = root {
-        for command in script_spellings(&root.join(NODE_BIN_DIR).join(&name), extensions) {
-            candidates.push(installed(command, "the project's node_modules/.bin"));
-        }
-    }
-    if !npx {
-        return candidates;
-    }
-    for command in script_spellings(Path::new("npx"), extensions) {
-        candidates.push(Candidate {
-            prefix_args: npx_args(&name),
-            probe: (command.clone(), npx_args(npm.probe_bin)),
+    let origin = if is_bare(command) { "PATH" } else { "the path the manifest names" };
+    script_spellings(command, extensions)
+        .into_iter()
+        .map(|command| Candidate {
+            probe: ((npm.twin)(&command), Vec::new()),
             command,
-            origin: "npx",
-        });
-    }
-    candidates
+            prefix_args: Vec::new(),
+            origin,
+        })
+        .collect()
 }
 
 /// Runs `<command> <args…> --version` and returns what it printed, killing it
@@ -196,6 +149,7 @@ pub fn probe(command: &Path, args: &[String], budget: Duration) -> Result<String
     let mut child = Command::new(command)
         .args(args)
         .arg("--version")
+        .env(NO_CWD_EXE_LOOKUP.0, NO_CWD_EXE_LOOKUP.1)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -342,14 +296,9 @@ mod tests {
         PathBuf::from(format!("{}#probe", command.display()))
     }
 
-    /// A server whose probe bin differs from its server bin, as pyright's does.
+    /// A server probed through a twin, as pyright is.
     fn split_server() -> NpmServer<'static> {
-        NpmServer {
-            package: "some-package",
-            bin: "some-langserver",
-            probe_bin: "some-cli",
-            twin: marked_twin,
-        }
+        NpmServer { bin: "some-langserver", twin: marked_twin }
     }
 
     #[test]
@@ -391,8 +340,7 @@ mod tests {
     #[test]
     fn a_command_that_is_a_path_is_the_only_origin() {
         for path in ["/opt/servers/some-langserver", "servers/some-langserver"] {
-            let candidates =
-                npm_candidates(Path::new(path), Path::new("/project"), &split_server(), &[".cmd"]);
+            let candidates = npm_candidates_on_path(Path::new(path), &split_server(), &[".cmd"]);
             let cmd = format!("{path}.cmd");
             assert_eq!(
                 candidates,
@@ -415,14 +363,12 @@ mod tests {
         }
     }
 
-    /// Origin priority outranks spelling: every spelling on `PATH` before any
-    /// in `node_modules/.bin`, and every one of those before `npx`.
+    /// A bare name is `PATH` only, in every spelling: no
+    /// `node_modules/.bin` and no `npx` candidate.
     #[test]
-    fn a_bare_name_is_path_then_node_modules_then_npx() {
-        let root = Path::new("/project");
-        let local = root.join("node_modules/.bin");
+    fn a_bare_name_is_path_only() {
         let order = |extensions: &[&str]| -> Vec<(PathBuf, &'static str)> {
-            npm_candidates(Path::new("some-langserver"), root, &split_server(), extensions)
+            npm_candidates_on_path(Path::new("some-langserver"), &split_server(), extensions)
                 .into_iter()
                 .map(|candidate| (candidate.command, candidate.origin))
                 .collect()
@@ -430,58 +376,24 @@ mod tests {
 
         assert_eq!(
             order(&[".cmd"]),
-            vec![
-                (PathBuf::from("some-langserver"), "PATH"),
-                (PathBuf::from("some-langserver.cmd"), "PATH"),
-                (local.join("some-langserver"), "the project's node_modules/.bin"),
-                (local.join("some-langserver.cmd"), "the project's node_modules/.bin"),
-                (PathBuf::from("npx"), "npx"),
-                (PathBuf::from("npx.cmd"), "npx"),
-            ]
+            vec![(PathBuf::from("some-langserver"), "PATH"), (PathBuf::from("some-langserver.cmd"), "PATH")]
         );
         assert_eq!(
             order(&[]),
-            vec![
-                (PathBuf::from("some-langserver"), "PATH"),
-                (local.join("some-langserver"), "the project's node_modules/.bin"),
-                (PathBuf::from("npx"), "npx"),
-            ],
-            "no host extensions: one spelling per origin"
+            vec![(PathBuf::from("some-langserver"), "PATH")],
+            "no host extensions: one spelling"
         );
     }
 
-    /// Installed candidates run as written and are probed through the twin;
-    /// only `npx` carries prefix args.
+    /// Every candidate runs as written, with no prefix args, and is probed
+    /// through the twin.
     #[test]
-    fn installed_candidates_are_probed_through_the_twin() {
-        let candidates =
-            npm_candidates(Path::new("some-langserver"), Path::new("/project"), &split_server(), &[]);
-        let installed: Vec<&Candidate> =
-            candidates.iter().filter(|candidate| candidate.origin != "npx").collect();
-        assert_eq!(installed.len(), 2, "{candidates:?}");
-        for candidate in installed {
+    fn candidates_are_probed_through_the_twin() {
+        let candidates = npm_candidates_on_path(Path::new("some-langserver"), &split_server(), &[".cmd"]);
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        for candidate in candidates {
             assert!(candidate.prefix_args.is_empty(), "{candidate:?}");
             assert_eq!(candidate.probe, (marked_twin(&candidate.command), Vec::new()), "{candidate:?}");
-        }
-    }
-
-    /// The server runs `npx --yes --package <package> <command>`, and the
-    /// probe runs the same argv with the probe bin in the command's place.
-    /// Nothing here runs `npx`.
-    #[test]
-    fn the_npx_candidate_names_the_package_and_probes_the_probe_bin() {
-        let candidates =
-            npm_candidates(Path::new("some-langserver"), Path::new("/project"), &split_server(), &[".cmd"]);
-        let npx: Vec<&Candidate> = candidates.iter().filter(|candidate| candidate.origin == "npx").collect();
-        assert_eq!(npx.len(), 2, "{candidates:?}");
-        let server_args: Vec<String> =
-            ["--yes", "--package", "some-package", "some-langserver"].map(String::from).to_vec();
-        let probe_args: Vec<String> =
-            ["--yes", "--package", "some-package", "some-cli"].map(String::from).to_vec();
-        for (candidate, program) in npx.into_iter().zip(["npx", "npx.cmd"]) {
-            assert_eq!(candidate.command, PathBuf::from(program));
-            assert_eq!(candidate.prefix_args, server_args, "{candidate:?}");
-            assert_eq!(candidate.probe, (PathBuf::from(program), probe_args.clone()), "{candidate:?}");
         }
     }
 
