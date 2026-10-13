@@ -15,8 +15,12 @@ The rule applied to every edge, whoever sent it.
 A semantic tier's answer is different from a structural guess: the engine
 resolved a name written in code it compiled and named one declaration by
 `qualifiedName`. The visibility check then refused correct answers: on
-excalidraw, 62 `CALLS` edges onto TS non-exported (`file`) declarations,
-among them every caller of a non-exported class's methods; in Rust, a
+excalidraw, 62 `CALLS` edges onto TS non-exported (`file`) declarations
+were refused, among them every caller of a non-exported class's methods.
+Measured after this decision: 24 of them link, 20 correct and 4 self-loops
+where the bridge took the enclosing function for a call of something with
+no node; the other 38 land on a class, interface or const and stay refused
+by the kind rule (ADR 0035). In Rust, a
 `macro_rules!` macro used from a sibling module through `#[macro_use]`.
 
 ## Decision
