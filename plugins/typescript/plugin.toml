@@ -63,8 +63,8 @@ receiver_calls_structural = "unresolved"
 member_overrides = "by_name"
 
 [plugin.semantic]
-# A bare name: a `PATH` lookup, then the indexed project's own
-# `node_modules/.bin`, then `npx --yes --package @vtsls/language-server vtsls`.
+# A bare name: a `PATH` lookup only - never the indexed project's own
+# `node_modules/.bin` and never `npx`, so no project code runs (ADR 0032).
 # Each candidate is proved by `<candidate> --version` under a budget before it
 # runs. Point this at a specific binary and it is used as written, probed and
 # not searched around. The project's own `typescript` is never used: see
@@ -88,8 +88,21 @@ implementation_kinds = []
 # project loads, and its `definition` of an imported name is the import
 # itself - a non-empty wrong answer the bridge cannot tell from a right one.
 # A single server instead holds the question until the project is loaded.
+#
+# The server runs vtsls's bundled TypeScript and nothing from the project
+# (docs/adr/0032-semantic-tiers-execute-no-project-code.md):
+# `autoUseWorkspaceTsdk = false` keeps the project's `node_modules/typescript`
+# - and with it every tsconfig `plugins` package - from loading. It is vtsls's
+# default, written out so a changed default cannot flip it. Never add
+# `typescript.tsdk`, `typescript.tsserver.pluginPaths`,
+# `vtsls.tsserver.globalPlugins` or `typescript.tsserver.nodePath`: each runs
+# code the project chooses. Automatic type acquisition is off because it runs
+# `npm install @types/...` against the registry
+# (docs/adr/0033-semantic-tiers-reach-no-network-and-write-nothing.md).
 [plugin.semantic.settings.""]
 typescript.tsserver.useSyntaxServer = "never"
+typescript.disableAutomaticTypeAcquisition = true
+vtsls.autoUseWorkspaceTsdk = false
 
 [plugin.grammars]
 # Which tree-sitter grammar parses which extension. Read by this plugin's tests

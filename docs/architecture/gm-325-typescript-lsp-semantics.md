@@ -17,7 +17,7 @@ taken at `af8a588`.
 | Question | Answer | Evidence |
 |---|---|---|
 | Server | **vtsls** (`@vtsls/language-server`), engine label `vtsls` | §1. It answered every traced question, including the **bound overload** at both overloaded calls. It bundles TypeScript 5.9.3, the same tsserver version the Node pass drove, so it does not depend on the project's TypeScript. typescript-language-server answers the same questions but fails at `initialize` in a TypeScript 7 project, after its `--version` probe has passed. The native port answers fastest, but returns the whole overload set and its hover cannot bind an imported overload. |
-| Resolution order | PATH, then `<root>/node_modules/.bin`, then `npx --yes --package @vtsls/language-server vtsls`. Every candidate is probed with `--version` under a budget. | §2 |
+| Resolution order | PATH, then `<root>/node_modules/.bin`, then `npx --yes --package @vtsls/language-server vtsls`. Every candidate is probed with `--version` under a budget. **Superseded:** `PATH` only, by [ADR 0032](../adr/0032-semantic-tiers-execute-no-project-code.md) D7. | §2 |
 | Readiness | `on-demand` | §3. tsserver loads a project when a document is opened; there is no workspace index to wait for. Its one false-empty answer arrives inside the bridge's 2 s deferral window. |
 | `receiver_calls` | Flips to `"resolved"`. `receiver_calls_structural` stays `"unresolved"`. The plugin also records a `ReceiverCall` site for an unbound `this.m()` / `super.m()`. | §4. All three servers answered `g.greet()` on an interface parameter, `s.pick()` on a local, and inherited `this.hello()` / `super.hello()` from another file. |
 | SDK lift | New `plugins/sdk/src/lsp/resolve.rs`. python and rust both use it. | §5, with the g-mesh caller list |
@@ -201,6 +201,12 @@ either the bridge can strip a hover prefix per language or tsgo narrows
 
 ## 2. Resolution order
 
+> **Superseded** by [ADR 0032](../adr/0032-semantic-tiers-execute-no-project-code.md)
+> D7: a bare `vtsls` is now looked up on `PATH` only - neither
+> `<root>/node_modules/.bin` nor `npx` is a candidate, and the remedy names
+> the global install only. The order below is the original design, kept as
+> written.
+
 The python precedent (`plugins/python/src/semantic.rs:413-455`), with vtsls's
 names:
 
@@ -370,6 +376,10 @@ core's linker cannot settle it when `f` re-exports `n` ambiguously
   replaces the edge with an equivalent one.
 
 ## 5. Lifting server resolution into the SDK
+
+> **Superseded in part** by [ADR 0032](../adr/0032-semantic-tiers-execute-no-project-code.md)
+> D4/D7: `npm_candidates` and its `npx` origin are gone; the SDK keeps
+> `npm_candidates_on_path` (`PATH` only), and `NpmServer` is `{ bin, twin }`.
 
 ### 5.1 What exists (g-mesh, project `g-mesh`, main-checkout index)
 
