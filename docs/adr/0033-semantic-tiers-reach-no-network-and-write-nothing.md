@@ -36,8 +36,10 @@ nothing under the project root.
   `.cargo/config.toml` `net.offline`. The same map pins
   `CARGO_ENCODED_RUSTFLAGS` empty and `CARGO_UNSTABLE_HOST_CONFIG=false`
   (ADR 0032 D2), which keep a project's `.cargo/config.toml` `rustflags`,
-  `[host]` ones included, from reaching `rustc`; the `[env]` dynamic-linker
-  channel stays open (ADR 0032, Consequences).
+  `[host]` ones included, from reaching the `rustc` probes rust-analyzer
+  runs. Profile rustflags (`[unstable] profile-rustflags`) are not covered:
+  they apply only when cargo compiles, which the server never asks for. The
+  `[env]` dynamic-linker channel stays open (ADR 0032, Consequences).
 - **D2 - python: no `npx`.** Done by ADR 0032 D4; pyright comes from `PATH`
   only. Nothing further.
 - **D3 - go: `GOPROXY=off`, `GONOPROXY=-` and `GOSUMDB=off`, always.** Appended to
