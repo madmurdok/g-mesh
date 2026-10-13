@@ -63,11 +63,12 @@
 //!     ambiguity to refuse" is the normal case, not a licence to pick one if a
 //!     plugin ever sends two declarations under one qualifiedName.
 //!
-//!     One exception, under a `name` key only: when several fit and exactly
-//!     one of them is not a type member (its qualifiedPath's parent is a
-//!     `Type` of its container), that one is linked. A name in a module scope
-//!     never denotes a field or method, which plugins store in the module's
-//!     container beside the free declarations ([`Resolver::sole_non_member`]).
+//!     Under a `name` key only, type members (a qualifiedPath whose parent is
+//!     a `Type` of its container) are dropped before the kind filter whenever
+//!     a candidate that is not one was found: a name in a module scope never
+//!     denotes a field or method, which plugins store in the module's
+//!     container beside the free declarations ([`Resolver::drop_type_members`]).
+//!     Members alone are kept.
 //!
 //! ## Visibility
 //!
@@ -1285,17 +1286,24 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
                 let Some(required) = required_target_kind(&edge_kind) else {
                     continue; // not a usage edge - nothing here linked it, so nothing here moves it
                 };
+                // Before the kind rule, so a member cannot win by being the
+                // only candidate of the right kind.
+                let candidates = resolver.drop_type_members(&placeholder.key, &candidates)?;
                 // The first accepted kind any candidate has decides; the
                 // others are not considered beside it.
                 let fitting: Vec<&Candidate> = match required {
                     Some(kinds) => kinds
                         .iter()
                         .map(|kind| {
-                            candidates.iter().filter(|candidate| candidate.kind == *kind).collect::<Vec<_>>()
+                            candidates
+                                .iter()
+                                .copied()
+                                .filter(|candidate| candidate.kind == *kind)
+                                .collect::<Vec<_>>()
                         })
                         .find(|fitting| !fitting.is_empty())
                         .unwrap_or_default(),
-                    None => candidates.iter().collect(),
+                    None => candidates,
                 };
                 let target_id = match fitting.as_slice() {
                     [candidate] => Some(candidate.id.clone()),
@@ -1303,10 +1311,9 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
                     [] => None,
                     // Several equally good candidates: a missing edge beats a
                     // wrong one.
-                    several => resolver
-                        .sole_non_member(&placeholder.key, several)?
-                        .or_else(|| sole_accessor_getter(&placeholder.key, several))
-                        .map(|candidate| candidate.id.clone()),
+                    several => {
+                        sole_accessor_getter(&placeholder.key, several).map(|candidate| candidate.id.clone())
+                    }
                 };
 
                 match target_id {
@@ -1726,33 +1733,43 @@ impl<'c> Resolver<'c> {
         Ok(members)
     }
 
-    /// The one candidate of `several` that is not a type member, when a
-    /// `name` key found exactly one such candidate among type members.
+    /// `candidates` without its type members, under a `name` key that found
+    /// both type members and at least one candidate that is not one;
+    /// otherwise all of `candidates`. Applied before the kind rule.
     ///
     /// A name looked up in a module scope denotes a module-level declaration,
-    /// never an associated item: Rust's `use m::y` / `m::y()`, Go's `m.Y()`
-    /// and Python's `from a import y` cannot reach a field or method of a type
-    /// declared in `m`. Plugins store those members in the module's container
-    /// beside the free declarations, so they share the name lookup, and are
-    /// discarded here. Two or more non-members are still ambiguous, and so
-    /// are members alone (a field and a getter of one name). A `qualifiedName`
-    /// key names one declaration and gets no tie-break here; the accessors of
-    /// one property that share it are settled by [`sole_accessor_getter`].
-    /// Design: docs/architecture/gm-470-member-free-fn-collision.md.
-    fn sole_non_member<'a>(&mut self, key: &Key, several: &[&'a Candidate]) -> Result<Option<&'a Candidate>> {
-        if !matches!(key, Key::Name(_)) {
-            return Ok(None);
+    /// never an associated item: Rust's `use m::y` / `m::y()`, Go's `m.Y()`,
+    /// Python's `from a import y` and TypeScript's `import { y }` cannot reach
+    /// a field or method of a type declared in `m`. Plugins store those
+    /// members in the module's container beside the free declarations, so
+    /// they share the name lookup, and are discarded here. Discarding them
+    /// before the kind rule keeps a member from being the only candidate of
+    /// the edge's kind: `import { handler }` of a const `handler` beside a
+    /// method `Router#handler` links its call nowhere, not to the method
+    /// (GM-568). Members alone are kept, and stay ambiguous when several fit
+    /// (a field and a getter of one name). A `qualifiedName` key names one
+    /// declaration and is not filtered here; the accessors of one property
+    /// that share it are settled by [`sole_accessor_getter`].
+    /// Design: docs/architecture/gm-470-member-free-fn-collision.md,
+    /// docs/results/GM-519-member-visibility-findings.md (C1).
+    fn drop_type_members<'a>(
+        &mut self,
+        key: &Key,
+        candidates: &'a [Candidate],
+    ) -> Result<Vec<&'a Candidate>> {
+        if !matches!(key, Key::Name(_)) || candidates.len() < 2 {
+            return Ok(candidates.iter().collect());
         }
-        let mut non_member = None;
-        for candidate in several {
-            if self.is_type_member(candidate)? {
-                continue;
-            }
-            if non_member.replace(*candidate).is_some() {
-                return Ok(None);
+        let mut non_members = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if !self.is_type_member(candidate)? {
+                non_members.push(candidate);
             }
         }
-        Ok(non_member)
+        if non_members.is_empty() {
+            return Ok(candidates.iter().collect());
+        }
+        Ok(non_members)
     }
 
     /// Whether `candidate` is a member of a type: its `qualifiedPath`, or one
@@ -2028,7 +2045,7 @@ const ACCESSOR_NATIVE_KINDS: [&str; 2] = ["setter", "deleter"];
 /// else stays ambiguous: candidates from two files, two getter-like
 /// candidates (a TypeScript `static x()` beside `get x()`), a candidate of
 /// another `nativeKind` (a variable `C.x`), accessors without a getter, or a
-/// `name` key, where members alone are ambiguous ([`Resolver::sole_non_member`]).
+/// `name` key, where members alone are ambiguous ([`Resolver::drop_type_members`]).
 /// Design: docs/architecture/gm-530-accessor-tie-break.md.
 fn sole_accessor_getter<'a>(key: &Key, several: &[&'a Candidate]) -> Option<&'a Candidate> {
     if !matches!(key, Key::QualifiedName(_)) {
