@@ -48,10 +48,16 @@ Nothing the project's files name is executed.
   venv's `lib/python*/site-packages` (or `Lib/site-packages`), found by
   reading directories under `<root>/.venv` or `<root>/venv`, goes to
   `python.analysis.extraPaths`.
-- **D4 - pyright is never taken from the project's `node_modules/.bin`.**
-  Python resolves `PATH`, then `npx`
-  (`lsp::npm_candidates_outside_project`). TypeScript keeps the
-  project-local origin until its own task.
+- **D4 - pyright is never taken from the project's `node_modules/.bin`,
+  and never through `npx`.** Python resolves `PATH` only
+  (`lsp::npm_candidates_on_path`). `npx --yes --package pyright`, run with
+  the project as its cwd, executes the project's own `node_modules/pyright`
+  (measured, npm 9.8.1: a directory holding only that package and its
+  `.bin` links ran the project's script with no `pyright` on `PATH`), so it
+  is the same channel as `node_modules/.bin`; it also reaches the registry
+  the project's `.npmrc` names on every start (GM-512, D2: "Убрать npx для
+  python, TS отдельно"). TypeScript keeps the project-local origin and `npx`
+  until its own task.
 - **D5 - Go cgo stays on.** It runs the user's `cc`/`pkg-config` with
   Go-allowlisted flags; those are not project binaries.
 - **D6 - `go list` runs with `GOTOOLCHAIN=local` and
@@ -75,10 +81,13 @@ origin here (outside this task's analysis).
   `import` lines that compute paths, `sitecustomize` path changes, conda/pyenv
   layouts outside `lib/python*/site-packages`, the exact Python version.
   Plain `.pth` path lines (editable installs) still resolve.
-- **Python users with pyright only inside the indexed project** get no
-  semantic tier until they install it globally.
+- **Python users with pyright only inside the indexed project, or only
+  reachable through `npx`,** get no semantic tier (structural stays) until
+  they install it globally (`npm install -g pyright`); the resolution
+  failure's log line says so.
 - **Go:** a module whose `go` line is newer than the installed Go does not
   load; its pass degrades (logged) until the user upgrades Go.
 - Faster rust-analyzer start; no `target/` under the project.
-- Follow-ups: TypeScript's project-local server origin; GM-512 (no writes,
+- Follow-ups: TypeScript's project-local server origin and its `npx`
+  candidate (same exposure as python's had); GM-512 (no writes,
   no network) adds its environment to the same rust env map.

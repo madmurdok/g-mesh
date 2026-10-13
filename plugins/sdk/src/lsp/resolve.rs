@@ -125,26 +125,25 @@ pub fn script_spellings(path: &Path, extensions: &[&str]) -> Vec<PathBuf> {
 /// candidate's probe is its own argv with `npm.probe_bin` in place of the
 /// server's bin, so the probe proves the argv shape that will run.
 pub fn npm_candidates(command: &Path, root: &Path, npm: &NpmServer, extensions: &[&str]) -> Vec<Candidate> {
-    npm_candidates_in(command, Some(root), npm, extensions)
+    npm_candidates_in(command, Some(root), true, npm, extensions)
 }
 
-/// [`npm_candidates`] without the project's `node_modules/.bin`: `PATH`, then
-/// `npx`. Nothing under the indexed project is probed or run, so a project
-/// cannot ship the server binary
+/// [`npm_candidates`] with `PATH` as the only origin for a bare name: no
+/// `<root>/node_modules/.bin` and no `npx`. Nothing under the indexed project
+/// is probed or run, so a project cannot ship the server binary - and `npx`
+/// cannot either, because run with the project as its cwd it executes the
+/// project's own `node_modules/<package>` instead of fetching one
 /// ([ADR 0032](../../../../docs/adr/0032-semantic-tiers-execute-no-project-code.md)).
-pub fn npm_candidates_outside_project(
-    command: &Path,
-    npm: &NpmServer,
-    extensions: &[&str],
-) -> Vec<Candidate> {
-    npm_candidates_in(command, None, npm, extensions)
+pub fn npm_candidates_on_path(command: &Path, npm: &NpmServer, extensions: &[&str]) -> Vec<Candidate> {
+    npm_candidates_in(command, None, false, npm, extensions)
 }
 
 /// The candidates, with the `<root>/node_modules/.bin` origin only when a
-/// `root` is given.
+/// `root` is given and the `npx` origin only when `npx` is set.
 fn npm_candidates_in(
     command: &Path,
     root: Option<&Path>,
+    npx: bool,
     npm: &NpmServer,
     extensions: &[&str],
 ) -> Vec<Candidate> {
@@ -173,6 +172,9 @@ fn npm_candidates_in(
         for command in script_spellings(&root.join(NODE_BIN_DIR).join(&name), extensions) {
             candidates.push(installed(command, "the project's node_modules/.bin"));
         }
+    }
+    if !npx {
+        return candidates;
     }
     for command in script_spellings(Path::new("npx"), extensions) {
         candidates.push(Candidate {

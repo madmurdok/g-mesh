@@ -4,8 +4,9 @@
 //!
 //! pyright runs no code the project supplies: no interpreter (it is handed
 //! [`no_interpreter`] as `python.pythonPath` and the venv's site-packages as
-//! `python.analysis.extraPaths`) and no server binary from the project's
-//! `node_modules/.bin`
+//! `python.analysis.extraPaths`), no server binary from the project's
+//! `node_modules/.bin`, and no `npx`, which would run the project's own
+//! `node_modules/pyright` (Decision 1)
 //! ([ADR 0032](../../../docs/adr/0032-semantic-tiers-execute-no-project-code.md)).
 //!
 //! Everything about *driving* a language server is the SDK's
@@ -15,7 +16,7 @@
 //! from the rust-analyzer precedent `plugins/rust/src/semantic.rs` set, in
 //! ways that are measured here rather than assumed.
 //!
-//! # Decision 1: two places to look, each probed rather than believed
+//! # Decision 1: one place to look, probed rather than believed
 //!
 //! GM-290's rule was "find it, then prove it", and the proof was
 //! `<candidate> --version`. The rule survives; the proof does not, because
@@ -33,49 +34,39 @@
 //! from the `pyright` CLI (`package.json`'s `"bin"` names both,
 //! `langserver.index.js` and `index.js`), and only the CLI answers
 //! `--version`. So each candidate is probed through its **CLI twin**: the
-//! same resolution, one directory or one npx invocation, with
+//! same resolution, one directory, with
 //! `pyright-langserver` replaced by `pyright`. What that proves is what the
 //! probe is for - that a real, runnable pyright package is behind this
 //! spelling - and the version it prints (`pyright 1.1.414`) goes in the log
 //! line, because "which pyright answered this pass" is the first thing anyone
 //! asks of a semantic index that looks wrong.
 //!
-//! The two places, in order, and what each one is for:
+//! The one place, and what it is for:
 //!
 //! 1. **`PATH`.** The manifest's bare `pyright-langserver`, looked up by the
 //!    operating system - `Command::new` does that on every platform. This is
 //!    a global `npm i -g pyright`, a `pipx install pyright`, or a distro
 //!    package. On Windows this candidate needs more than a plain lookup - see
 //!    Decision 1b, right after this list.
-//! 2. **`npx`.** Last, deliberately: it is the only candidate that can touch
-//!    the network, and it is the one that most needs the probe. `npx` is to
-//!    pyright what `~/.cargo/bin/rust-analyzer` was to rust-analyzer in
-//!    GM-290 - a binary that always exists and always starts, whether or not
-//!    a server comes out the other end - so without a probe a machine with no
-//!    network would get a server that starts and dies, which is not
-//!    `ErrorKind::NotFound`, so the bridge's permanent degradation never fires
-//!    and the plugin re-spawns it once per pass until `MAX_SERVER_STARTS`
-//!    stops it four starts later.
 //!
-//!    The spelling is `npx --yes --package pyright pyright-langserver
-//!    --stdio`, and the `--package` is not decoration. The obvious
-//!    `npx --yes pyright-langserver` reads its argument as a *package* name,
-//!    and there is no npm package by that name - `pyright-langserver` is one
-//!    of the `pyright` package's two `"bin"` entries. Measured, in the first
-//!    conformance run this tier ever survived to:
-//!
-//!    ```text
-//!    npm ERR! 404 Not Found - GET https://registry.npmjs.org/pyright-langserver
-//!    npm ERR! 404  'pyright-langserver@*' is not in this registry.
-//!    ```
-//!
-//!    What makes that worth writing down is *how it got past the probe*: the
-//!    probe was `npx --yes pyright --version`, which succeeds, because
-//!    `pyright` is a real package whose default bin is `pyright`. A probe that
-//!    proves the package rather than the **argv shape** proves the wrong
-//!    thing. So the npx probe now carries the same `--package` and differs
-//!    from the server invocation in exactly one token - the bin name - which
-//!    is the smallest difference that can still be a `--version`.
+//! There used to be a second place, `npx --yes --package pyright
+//! pyright-langserver`, last. GM-513 removed it: `npx` run with the project
+//! as its cwd (the server's cwd is the root) runs the project's own
+//! `node_modules/pyright` when one is there - measured with npm 9.8.1, a
+//! directory holding only `node_modules/pyright/{package.json,evil.js}` and
+//! its `.bin` links, no `pyright` on `PATH`: `npx --yes --package pyright
+//! pyright --version` ran the project's script. It also contacts the
+//! registry on every start, and the registry is the project's `.npmrc`
+//! choice (GM-512). The owner's decision (GM-512, D2): python stops using
+//! `npx`. A machine with no `pyright-langserver` on `PATH` loses the semantic
+//! tier (the structural index stays), and the resolution failure's log line
+//! names the remedy, `npm install -g pyright`. While it existed, its argv had
+//! to be `--package pyright pyright-langserver`, not `npx --yes
+//! pyright-langserver` (a 404: `pyright-langserver` is a bin of the `pyright`
+//! package, not a package), and its probe had to differ from that argv only
+//! in the bin name - a probe that proves the package rather than the argv
+//! shape proves the wrong thing. TypeScript still has an `npx` candidate,
+//! with the same exposure (its own follow-up task).
 //!
 //! A `command` that is a *path* is not searched around, exactly as GM-290
 //! decided: someone who wrote a path into the manifest meant that file. It is
@@ -96,18 +87,17 @@
 //! as given and then `<name>.exe`, nothing else. `PATHEXT` is `cmd.exe`'s own
 //! rule, consulted by the shell that parses a typed command line - not by
 //! `CreateProcess`, and not by anything standing between it and `Command`.
-//! Concretely: candidate 1 looks for `pyright-langserver.exe`; and even
-//! candidate 2 fails the same way,
+//! Concretely: the `PATH` candidate looks for `pyright-langserver.exe`
+//! (and the `npx` candidate this module had then failed the same way,
 //! because `npx` itself ships as `npx.cmd` beside `node.exe` on a machine
-//! whose Node came from the official Windows installer. Not measured on a
+//! whose Node came from the official Windows installer). Not measured on a
 //! Windows host - there is none here - but is documented `CreateProcess`
 //! behaviour plus the CI evidence this task was cut from: CI's own step had
 //! already run `npm install pyright` successfully, and the conformance test -
 //! which carried the same naive candidate list this module did - still
 //! reported no usable pyright.
 //!
-//! The fix is [`lsp::script_spellings`]: every final candidate path from both
-//! branches above, and a path the manifest names explicitly, is tried both as
+//! The fix is [`lsp::script_spellings`]: every final candidate path, and a path the manifest names explicitly, is tried both as
 //! written and, when it has no extension of its own, with `.cmd` appended.
 //! Only `.cmd` - not `.bat`, which current npm does not write (listing a
 //! spelling nothing installs would only make a failure message name a
@@ -115,10 +105,10 @@
 //! cannot execute directly either: running one needs an explicit
 //! `powershell -File` wrapper this module does not add, so trying the bare
 //! `.ps1` path would add a candidate that can never succeed rather than a
-//! real fallback. `npx` is not special-cased - it goes through the same
-//! expansion as the manifest path and the npm-install candidate, which
-//! is what makes this a fix rather than a list of two spellings with a third
-//! exception waiting to be discovered the same way this one was. The
+//! real fallback. No candidate is special-cased - each goes through the same
+//! expansion, which is what makes this a fix rather than a list of two
+//! spellings with a third exception waiting to be discovered the same way
+//! this one was. The
 //! extension list is a parameter, not a fact [`lsp::script_spellings`] reads
 //! for itself - [`lsp::HOST_SCRIPT_EXTENSIONS`] is the one place that picks
 //! [`lsp::WINDOWS_SCRIPT_EXTENSIONS`] under `#[cfg(windows)]`, the same shape
@@ -128,15 +118,13 @@
 //! sitting behind a `#[cfg(windows)]` nobody here can run. GM-335 is what a
 //! test that never runs costs.
 //!
-//! # Decision 2: the probe is bounded, because this one can reach the network
+//! # Decision 2: the probe is bounded
 //!
 //! rust-analyzer's `--version` is about twenty milliseconds of local work.
-//! Measured here, the candidates are not one cost but two - an installed
-//! `pyright --version` is 0.89s (node start-up), and
-//! `npx --yes pyright --version` is 4.94s when it has to populate npm's `_npx`
-//! cache and longer when it has to download. A registry that is unreachable
-//! rather than absent does not fail fast, and the factory runs *inside* the
-//! pass core is timing. So [`PROBE_BUDGET`] bounds it and the child is killed
+//! Measured here, an installed `pyright --version` is 0.89s (node start-up);
+//! the `npx` candidate this module had until GM-513 was 4.94s when it had to
+//! populate npm's `_npx` cache and longer when it had to download. The
+//! factory runs *inside* the pass core is timing, so [`PROBE_BUDGET`] bounds it and the child is killed
 //! rather than waited on. The SDK's probe does this for every plugin, so
 //! rust-analyzer's is bounded too.
 //!
@@ -221,7 +209,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use g_mesh_plugin_sdk::lsp::{
-    self, npm_candidates_outside_project, Candidate, LspBridge, NpmServer, Resolved, SemanticConfig,
+    self, npm_candidates_on_path, Candidate, LspBridge, NpmServer, Resolved, SemanticConfig,
     HOST_SCRIPT_EXTENSIONS, PROBE_BUDGET,
 };
 use g_mesh_plugin_sdk::{walk_scope, SemanticEngine, WalkScope};
@@ -242,6 +230,7 @@ const CLI_BIN: &str = "pyright";
 /// today, because they are different kinds of name and only one of them is
 /// what `npx --package` wants: `npx --yes pyright-langserver` asks the
 /// registry for a package called `pyright-langserver` and is answered 404.
+/// This plugin runs no `npx` (Decision 1); [`NpmServer`] still names it.
 const NPM_PACKAGE: &str = "pyright";
 
 /// pyright as an npm package: the server is probed through its CLI twin,
@@ -330,16 +319,17 @@ fn resolve(command: &Path, script_extensions: &[&str]) -> Result<Resolved> {
         candidates(command, script_extensions),
         PROBE_BUDGET,
         "pyright",
-        "Install it with `npm install -g pyright`, or point [plugin.semantic] command in \
+        "Install it with `npm install -g pyright` so pyright-langserver is on PATH (neither the \
+         project's node_modules nor npx is used: ADR 0032), or point [plugin.semantic] command in \
          plugins/python/plugin.toml at a pyright-langserver",
     )
 }
 
-/// The spellings worth probing, in order -
-/// [`npm_candidates_outside_project`] for pyright: never the indexed
-/// project's own `node_modules/.bin`.
+/// The spellings worth probing, in order - [`npm_candidates_on_path`] for
+/// pyright: `PATH` only, never the indexed project's own `node_modules/.bin`
+/// and never `npx` (Decision 1).
 fn candidates(command: &Path, script_extensions: &[&str]) -> Vec<Candidate> {
-    npm_candidates_outside_project(command, &PYRIGHT, script_extensions)
+    npm_candidates_on_path(command, &PYRIGHT, script_extensions)
 }
 
 /// The CLI entry point beside a language-server one: `…/pyright-langserver`
@@ -473,11 +463,11 @@ mod tests {
     use super::*;
     use g_mesh_plugin_sdk::lsp::{ServerReadiness, WINDOWS_SCRIPT_EXTENSIONS};
 
-    /// A bare name is `PATH`, then `npx`, and never a `node_modules/.bin`.
+    /// A bare name is `PATH` only: never a `node_modules/.bin`, never `npx`.
     #[test]
-    fn a_bare_name_is_path_then_npx_and_never_a_project_install() {
+    fn a_bare_name_is_path_only_never_a_project_install_or_npx() {
         let candidates = candidates(Path::new(SERVER_BIN), &[]);
-        assert_eq!(candidates.len(), 2, "{candidates:#?}");
+        assert_eq!(candidates.len(), 1, "{candidates:#?}");
 
         assert_eq!(candidates[0].command, PathBuf::from(SERVER_BIN), "the bare name stays a PATH lookup");
         assert!(candidates[0].prefix_args.is_empty());
@@ -486,12 +476,10 @@ mod tests {
             candidates.iter().all(|candidate| !candidate.command.to_string_lossy().contains("node_modules")),
             "no project-local install is probed or run: {candidates:#?}"
         );
-
-        assert_eq!(candidates[1].command, PathBuf::from("npx"));
-        assert_eq!(
-            candidates[1].prefix_args,
-            vec!["--yes", "--package", NPM_PACKAGE, SERVER_BIN],
-            "the bin is not a package: `npx --yes pyright-langserver` is a 404 - see Decision 1"
+        assert!(
+            candidates.iter().all(|candidate| candidate.origin != "npx"
+                && !candidate.command.to_string_lossy().starts_with("npx")),
+            "npx runs the project's own node_modules/pyright - see Decision 1: {candidates:#?}"
         );
     }
 
@@ -508,20 +496,10 @@ mod tests {
             assert!(
                 probe
                     .file_name()
-                    .is_some_and(|name| name == CLI_BIN || name == format!("{CLI_BIN}.cmd").as_str())
-                    || args.iter().any(|arg| arg == CLI_BIN),
+                    .is_some_and(|name| name == CLI_BIN || name == format!("{CLI_BIN}.cmd").as_str()),
                 "and the twin is pyright's own CLI, extension included: {candidate:#?}"
             );
-            // The npx probe must run the command the server will run, differing
-            // only in the bin name, or a green probe proves a different command.
-            if candidate.origin == "npx" {
-                let expected: Vec<String> = candidate
-                    .prefix_args
-                    .iter()
-                    .map(|arg| if arg == SERVER_BIN { CLI_BIN.to_string() } else { arg.clone() })
-                    .collect();
-                assert_eq!(args, &expected, "the npx probe differs only in the bin name: {candidate:#?}");
-            }
+            assert!(args.is_empty(), "an installed twin takes no args before --version: {candidate:#?}");
         }
     }
 
@@ -684,10 +662,10 @@ mod tests {
 
     /// A real pyright, handed the config [`prepare`] builds, does not track
     /// the pruned `junk/` and still resolves an import into the pruned
-    /// `genpkg/`. Ignored by default because it needs pyright (locally or
-    /// through `npx`): `cargo test -p g-mesh-plugin-python -- --ignored`.
+    /// `genpkg/`. Ignored by default because it needs `pyright-langserver`
+    /// on `PATH`: `cargo test -p g-mesh-plugin-python -- --ignored`.
     #[test]
-    #[ignore = "needs pyright, locally installed or through npx"]
+    #[ignore = "needs pyright-langserver on PATH"]
     fn real_pyright_skips_a_pruned_tree_and_still_resolves_imports_into_one() {
         let (_guard, root) = scoped_project("pyright");
         let mut config = shipped_config();
@@ -734,7 +712,7 @@ mod tests {
         use g_mesh_plugin_sdk::lsp::SemanticConfig;
         use serde_json::{json, Value};
 
-        /// How long one request may take, `npx` download included.
+        /// How long one request may take, pyright's first analysis included.
         const ANSWER_BUDGET: Duration = Duration::from_secs(180);
 
         pub fn uri(path: &Path) -> String {

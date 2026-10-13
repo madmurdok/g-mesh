@@ -104,11 +104,12 @@ resolution_delta = true
 # structural tier down with it (see plugins/sdk/src/lsp/config.rs's module doc
 # for the argument in full).
 [plugin.semantic]
-# A bare name: a `PATH` lookup, then `npx --yes --package pyright
-# pyright-langserver` - never the indexed project's own `node_modules/.bin`,
-# so a project cannot ship the server that runs
-# (docs/adr/0032-semantic-tiers-execute-no-project-code.md). Each candidate is
-# proved by running its *CLI twin* (`pyright --version`), never the server
+# A bare name: a `PATH` lookup only - never the indexed project's own
+# `node_modules/.bin` and never `npx` (which, run in the project, executes the
+# project's own `node_modules/pyright`), so a project cannot ship the server
+# that runs (docs/adr/0032-semantic-tiers-execute-no-project-code.md). Not on
+# `PATH`: no semantic tier, and the log line says `npm install -g pyright`.
+# The candidate is proved by running its *CLI twin* (`pyright --version`), never the server
 # itself, because `pyright-langserver --version` exits 1 with "Connection
 # input stream is not set" - it has no such flag. See src/semantic.rs, which
 # has the measurement. Edit this to point at a specific binary and it will be

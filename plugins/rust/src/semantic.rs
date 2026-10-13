@@ -118,9 +118,9 @@ struct Toolchain {
     /// The rustup toolchain name: the daemon's own `RUSTUP_TOOLCHAIN`, else
     /// `rustup default`. `None` without rustup or without a default.
     pin: Option<String>,
-    /// The directory `rustup` lives in, and with it every rustup proxy.
-    /// `None` when rustup is not on `PATH`.
-    proxy_dir: Option<PathBuf>,
+    /// The `rustup` binary every proxy runs, canonicalized (symlinks
+    /// resolved). `None` when rustup is not on `PATH`.
+    rustup: Option<PathBuf>,
     /// The toolchain's own binaries, as absolute paths (never proxies).
     rust_analyzer: Option<PathBuf>,
     rustc: Option<PathBuf>,
@@ -129,8 +129,8 @@ struct Toolchain {
 
 impl Toolchain {
     fn detect() -> Self {
-        let proxy_dir = on_path("rustup").and_then(|rustup| rustup.parent().map(Path::to_path_buf));
-        if proxy_dir.is_none() {
+        let rustup_bin = on_path("rustup").map(|rustup| std::fs::canonicalize(&rustup).unwrap_or(rustup));
+        if rustup_bin.is_none() {
             // Not rustup-managed: no proxy reads a toolchain file, and the
             // binaries on `PATH` are the user's own.
             return Toolchain { rustc: on_path("rustc"), cargo: on_path("cargo"), ..Toolchain::default() };
@@ -147,7 +147,7 @@ impl Toolchain {
             rustc: which("rustc"),
             cargo: which("cargo"),
             pin,
-            proxy_dir,
+            rustup: rustup_bin,
         }
     }
 }
@@ -232,9 +232,9 @@ fn resolve(command: &Path, toolchain: &Toolchain) -> Result<lsp::Resolved> {
 /// The binaries worth probing, in order, with their origins.
 ///
 /// A path is the only candidate. A bare name is the pinned toolchain's
-/// absolute binary, then the `PATH` lookup - unless that lookup lands in
-/// rustup's own directory: a rustup proxy picks its toolchain from the
-/// working directory's `rust-toolchain.toml`, so it is never probed or run.
+/// absolute binary, then the `PATH` lookup - unless that lookup is a rustup
+/// proxy ([`is_rustup_proxy`]): a proxy picks its toolchain from the working
+/// directory's `rust-toolchain.toml`, so it is never probed or run.
 fn candidates(command: &Path, toolchain: &Toolchain) -> Vec<(PathBuf, &'static str)> {
     if !is_bare(command) {
         return vec![(command.to_path_buf(), "the path the manifest names")];
@@ -243,18 +243,49 @@ fn candidates(command: &Path, toolchain: &Toolchain) -> Vec<(PathBuf, &'static s
     if let Some(path) = &toolchain.rust_analyzer {
         candidates.push((path.clone(), "rustup which"));
     }
-    match &toolchain.proxy_dir {
+    match &toolchain.rustup {
         None => candidates.push((command.to_path_buf(), "PATH")),
-        Some(proxy_dir) => {
+        Some(rustup) => {
             if let Some(found) = on_path(&command.to_string_lossy()) {
-                if found.parent() != Some(proxy_dir.as_path()) && !candidates.iter().any(|(c, _)| *c == found)
-                {
+                if !is_rustup_proxy(&found, rustup) && !candidates.iter().any(|(c, _)| *c == found) {
                     candidates.push((found, "PATH"));
                 }
             }
         }
     }
     candidates
+}
+
+/// Whether `found` runs `rustup` (canonicalized), i.e. is a rustup proxy.
+///
+/// Compared by what the file *is*, not by where it is spelled: rustup's
+/// proxies are symlinks (or, on some installs, hard links) to `rustup`, so a
+/// proxy in another `PATH` directory than the `rustup` found first (a
+/// Homebrew rustup plus `~/.cargo/bin`), or under a symlinked spelling of the
+/// same directory, is still caught. A file beside the canonical `rustup` is
+/// treated as a proxy too, as the directory-only rule before it did.
+fn is_rustup_proxy(found: &Path, rustup: &Path) -> bool {
+    let Ok(target) = std::fs::canonicalize(found) else {
+        // Unresolvable (dangling, unreadable): not a server anyone can run.
+        return true;
+    };
+    target == rustup || target.parent() == rustup.parent() || same_inode(&target, rustup)
+}
+
+/// Two names for one file (a hard link), where the platform can tell.
+#[cfg(unix)]
+fn same_inode(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Two names for one file: not checked off Unix.
+#[cfg(not(unix))]
+fn same_inode(_: &Path, _: &Path) -> bool {
+    false
 }
 
 /// `rustup <args>`'s trimmed stdout, or `None` if rustup is missing or fails.
@@ -312,8 +343,7 @@ mod tests {
     }
 
     /// With rustup the pinned toolchain's absolute binary comes first, and a
-    /// `PATH` hit inside rustup's own directory - a proxy - is never a
-    /// candidate.
+    /// `PATH` hit that is a rustup proxy is never a candidate.
     #[test]
     fn with_rustup_the_pinned_binary_comes_first_and_no_proxy_follows() {
         let toolchain = Toolchain::detect();
@@ -321,11 +351,9 @@ mod tests {
         if let (Some(pinned), Some(first)) = (&toolchain.rust_analyzer, candidates.first()) {
             assert_eq!(first, &(pinned.clone(), "rustup which"), "{candidates:?}");
         }
-        if let Some(proxy_dir) = &toolchain.proxy_dir {
+        if let Some(rustup) = &toolchain.rustup {
             assert!(
-                candidates
-                    .iter()
-                    .all(|(path, _)| path.is_absolute() && path.parent() != Some(proxy_dir.as_path())),
+                candidates.iter().all(|(path, _)| path.is_absolute() && !is_rustup_proxy(path, rustup)),
                 "{candidates:?}"
             );
         }

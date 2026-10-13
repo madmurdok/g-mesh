@@ -465,6 +465,10 @@ degrades (logged); a `toolchain go1.28` line alone is ignored and it loads.
   introduces, not a second mechanism.
 - Python: with D3 (a) pyright runs no interpreter; the `npx --yes` fallback
   in `npm_candidates` is a network download and stays GM-512's.
+  *Amended by the verify (finding 1):* run with the project as cwd, `npx`
+  executes the project's own `node_modules/pyright`, so it is a D4 channel
+  too; python drops `npx` here (GM-512's D2 decision, "Убрать npx для
+  python, TS отдельно"), resolving `PATH` only (`npm_candidates_on_path`).
 - Go: `GOTOOLCHAIN=local` removes toolchain downloads; module downloads
   (`GOPROXY`, `GOFLAGS=-mod=…`) remain GM-512's. `go list -export` writes
   `GOCACHE` (outside the root).

@@ -39,7 +39,8 @@ A `rust-analyzer` on `PATH` is not proof of one: `~/.cargo/bin/rust-analyzer`
 is a rustup proxy that exists for every component rustup knows, installed or
 not, and exits 1 when the one behind it is missing. `src/semantic.rs` takes
 the absolute binary `rustup which --toolchain <default>` names, then a
-`PATH` install outside rustup's proxy directory, and probes each with
+`PATH` install that is not a rustup proxy (it does not resolve to the
+`rustup` binary or sit beside it), and probes each with
 `--version` before believing it.
 
 rust-analyzer runs no code the project supplies: build scripts and proc

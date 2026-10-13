@@ -12,8 +12,8 @@
 //!   the venv's packages must still resolve (the server really answered);
 //! - the same with a project `pyrightconfig.json` naming that venv;
 //! - a logging `node_modules/.bin/pyright` in the project, with no pyright
-//!   on `PATH` and an `npx` that fails: the project's copy must not be
-//!   probed or run, so no server resolves at all.
+//!   on `PATH` and a logging `npx` on `PATH`: neither the project's copy nor
+//!   `npx` may be probed or run, so no server resolves at all.
 //!
 //! The shims are shell scripts, so the whole file is unix only. The tests
 //! rewrite `PATH` and the working directory of this process, so they hold
@@ -262,6 +262,6 @@ fn the_projects_own_pyright_is_never_probed_or_run() {
         Vec::<String>::new(),
         "the plugin probed or ran the project's node_modules/.bin/pyright"
     );
-    assert!(npx_log.is_file(), "sanity: resolution went past PATH to npx");
-    assert!(engine.is_err(), "with no pyright on PATH and npx failing, nothing may resolve");
+    assert!(!npx_log.exists(), "npx was run: in the project it runs the project's own node_modules/pyright");
+    assert!(engine.is_err(), "with no pyright on PATH, nothing may resolve");
 }

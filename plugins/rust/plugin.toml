@@ -92,8 +92,9 @@ resolution_delta = true
 # structural tier down with it (see plugins/sdk/src/lsp/config.rs's module
 # doc for the argument in full).
 [plugin.semantic]
-# A bare name: a `PATH` lookup, with `rustup which rust-analyzer` as the
-# fallback. Both candidates are probed with `--version` before either is
+# A bare name: the absolute `rustup which --toolchain <default>
+# rust-analyzer`, then a `PATH` lookup that is not a rustup proxy (one that
+# resolves to the `rustup` binary). Both candidates are probed with `--version` before either is
 # used, because `~/.cargo/bin/rust-analyzer` is a rustup *proxy* that exists
 # whether or not the component behind it does - see src/semantic.rs, which
 # has the measurement. Edit this to point at a specific binary and it will be
