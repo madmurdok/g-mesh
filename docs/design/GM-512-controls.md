@@ -19,7 +19,11 @@ test) in a throwaway worktree; the named test must then fail. The tests are:
   `plugins/go/semantic_goenv_test.go` (the go env file, GOENV), tests
   `TestSemanticPassLoadsGOPATHModeFromTheGoEnvFile`,
   `TestSemanticPassLoadsAWorkspaceMemberUnderGoWorkOffFromTheGoEnvFile`,
-  `TestModFlagForResolvedGoEnv`, `TestModFlagFallsBackToReadonlyWhenGoEnvFails`.
+  `TestModFlagForResolvedGoEnv`, `TestModFlagFallsBackToReadonlyWhenGoEnvFails`;
+  and `plugins/go/semantic_offline_sumdb_test.go` (direct connections that
+  bypass GOPROXY=off, seen through an HTTPS_PROXY sink), tests
+  `TestSemanticPassFetchesNoPrivateModuleDirectly` (subtests `GOPRIVATE`,
+  `GONOPROXY`), `TestSemanticPassInAWorkspaceWritesOnlyGoWorkSum`.
 
 A failure is judged from stdout+stderr: a non-zero exit **and** the named
 test reported as failed (cargo prints `test <name> ... FAILED` and
@@ -43,6 +47,14 @@ intended failure.
 | C9 | `plugins/go/semantic.go`, `modFlagFor` | delete the `if gomod == "" { return "" }` guard | `TestModFlagForResolvedGoEnv` | subtest `GOPATH mode, GOWORK still set`: `= "-mod=vendor", want ""` |
 | C10 | `plugins/go/semantic.go`, `modFlag` | both `return "-mod=readonly"` in the `go env` error branches become `return ""` | `TestModFlagFallsBackToReadonlyWhenGoEnvFails` (both subtests) | "modFlag with a broken `go env` = \"\", want -mod=readonly" |
 | C11 | `plugins/go/semantic.go`, `modFlag` | `cmd.Env = env` becomes `cmd.Env = os.Environ()` (`go env` no longer runs under the load's env) | `TestModFlagFollowsTheGoverningFile` | subtests `GO111MODULE=off`, `GO111MODULE=off, vendored`, `GOWORK=off ...`: the settings passed only in the env slice are lost |
+| C12 | `plugins/go/semantic.go`, `loadEnv` | remove `"GONOPROXY=-",` from the appended list | `TestSemanticPassFetchesNoPrivateModuleDirectly` (both subtests) | "the semantic pass connected out with GOPRIVATE=example.com: [CONNECT example.com:443 ...]", same for GONOPROXY |
+| C13 | `plugins/go/semantic.go`, `loadEnv` | remove `"GOSUMDB=off"` from the appended list (and the comma before it) | `TestSemanticPassInAWorkspaceWritesOnlyGoWorkSum` | "the semantic pass connected out in the workspace: [CONNECT sum.golang.org:443 ...]" |
+
+The go.work.sum write in a workspace whose member go.sum lacks entries for
+cached modules is go's own, the owner-accepted exception in ADR 0033: it is
+pinned by `TestSemanticPassInAWorkspaceWritesOnlyGoWorkSum` (the only change
+under the root) and has no control. Clearing GOPRIVATE was superseded by
+GOSUMDB=off and has no control either.
 
 `Cargo.lock` absence is pinned by the rust test's snapshot and has no
 control: no code of ours prevents it (design 1.rust.2).
@@ -66,6 +78,8 @@ runtime manifest, so its rust run reuses C1's build after the checkout.
 | G6 | C9 | `(cd plugins/go && go test -count=1 -run 'TestModFlagForResolvedGoEnv' .)` |
 | G7 | C10 | `(cd plugins/go && go test -count=1 -run 'TestModFlagFallsBackToReadonlyWhenGoEnvFails' .)` |
 | G8 | C11 | `(cd plugins/go && go test -count=1 -run 'TestModFlagFollowsTheGoverningFile' .)` |
+| G9 | C12 | `(cd plugins/go && go test -count=1 -run 'TestSemanticPassFetchesNoPrivateModuleDirectly' .)` |
+| G10 | C13 | `(cd plugins/go && go test -count=1 -run 'TestSemanticPassInAWorkspaceWritesOnlyGoWorkSum' .)` |
 
 ## Results in the tests slice
 
@@ -82,3 +96,9 @@ only): exit 1, both `FromTheGoEnvFile` tests failed with "did not load the
 GOPATH-mode package; edges = []" and "did not resolve app/a.go:use CALLS
 example.com/gv#Plain.Seven under GOWORK=off; edges = []". C9-C11 are left
 to verify.
+
+C12-C13 come from the GOPROXY=off bypass round (GONOPROXY=-, GOSUMDB=off).
+C12 was dry-run in a throwaway worktree (Go only): exit 1, both subtests of
+`TestSemanticPassFetchesNoPrivateModuleDirectly` failed with "the semantic
+pass connected out with GOPRIVATE=example.com: [CONNECT example.com:443
+HTTP/1.1]" (same for GONOPROXY). C13 is left to verify.
