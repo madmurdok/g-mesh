@@ -113,8 +113,15 @@ else
 	selection="$(scripts/test-select.sh --narrow "${select_args[@]+"${select_args[@]}"}")"
 	export G_MESH_CONTAINERS_SEEDS=2
 fi
-echo "== selected: $selection"
-if [ "$selection" = none ]; then
+# The Go plugin's own suite is not a nextest section (CI's Go job runs it), so
+# the selector answers separately: --full always, else a diff under plugins/go/.
+if [ "$full" -eq 1 ]; then
+	run_go=1
+else
+	run_go="$(scripts/test-select.sh --go "${select_args[@]+"${select_args[@]}"}")"
+fi
+echo "== selected: $selection$([ "$run_go" -eq 1 ] && echo " (+ go tests)")"
+if [ "$selection" = none ] && [ "$run_go" -eq 0 ]; then
 	echo "== no sections selected"
 	exit 0
 fi
@@ -304,6 +311,29 @@ else
 		else
 			echo "test-local: no $junit; no heavy-list report" >&2
 		fi
+	fi
+fi
+
+# Go plugin tests, as CI's Go job runs them (`go test ./...` in plugins/go).
+# A missing toolchain fails the run for a Go diff; it never skips.
+if [ "$run_go" -eq 1 ]; then
+	if [ "$dry_run" -eq 1 ]; then
+		echo "== go: go test ./... (in plugins/go)"
+	elif [ "$failed" -eq 1 ] && [ "$keep_going" -eq 0 ]; then
+		summary+=("== go: not run, an earlier part failed (--keep-going runs it)")
+	elif ! command -v go >/dev/null 2>&1; then
+		summary+=("== go: FAIL, the go toolchain is not installed (plugins/go changed or --full)")
+		failed=1
+	else
+		start=$SECONDS
+		status=0
+		(cd plugins/go && go test ./...) 2>&1 | tee "$log_dir/go.log" || status=$?
+		result=PASS
+		[ "$status" -eq 0 ] || {
+			result=FAIL
+			failed=1
+		}
+		summary+=("== go: $result, $((SECONDS - start))s (log: $log_dir/go.log)")
 	fi
 fi
 

@@ -34,6 +34,7 @@ cd "$(dirname "$0")/.."
 usage() {
 	cat >&2 <<'EOF'
 usage: scripts/test-select.sh [--narrow] [--base <ref>]
+       scripts/test-select.sh --go [--base <ref> | --paths-from <file>]
        scripts/test-select.sh [--narrow] --paths-from <file>
 EOF
 }
@@ -46,10 +47,15 @@ die() {
 base=""
 paths_from=""
 narrow=""
+go_query=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--narrow)
 		narrow=1
+		shift
+		;;
+	--go)
+		go_query=1
 		shift
 		;;
 	--base)
@@ -120,6 +126,7 @@ for s in "${SECTIONS[@]}"; do
 done
 
 full=0
+go=0
 selected=" "
 add() {
 	local s
@@ -145,7 +152,10 @@ classify() {
 		local plugin="${1#plugins/}"
 		add "plugin-${plugin%%/*}" "${CORE[@]}"
 		;;
-	plugins/go/*) add "${CORE[@]}" ;;
+	plugins/go/*)
+		go=1
+		add "${CORE[@]}"
+		;;
 	README.md) add core-cli ;;
 	scripts/*) add core-it core-cli ;;
 	eval/*) add core-cli ;;
@@ -165,7 +175,11 @@ while IFS= read -r path; do
 	[ "$full" -eq 0 ] || break
 done <<<"$paths"
 
-if [ "$full" -eq 1 ]; then
+if [ -n "$go_query" ]; then
+	# `--go`: does the diff need the Go plugin's own tests (plugins/go/)? A
+	# full selection always does. Prints 1 or 0.
+	if [ "$full" -eq 1 ] || [ "$go" -eq 1 ]; then echo 1; else echo 0; fi
+elif [ "$full" -eq 1 ]; then
 	echo full
 elif [ "$selected" = " " ]; then
 	echo none

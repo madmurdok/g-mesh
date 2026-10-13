@@ -25,6 +25,12 @@ CI must keep running everything exactly as before.
 - **One local entry point, `scripts/test-local.sh`.** A verify slice runs
   `scripts/test-local.sh --base <release-branch>`; the batch-end slice runs
   `scripts/test-local.sh --full`. CI does not call it.
+- **The Go plugin's suite is a separate step** (`go test ./...` in
+  `plugins/go`, as CI's Go job runs it; GM-573). It is not a nextest section,
+  so `scripts/test-select.sh --go` answers whether a diff needs it: any path
+  under `plugins/go/` or a full selection. `--full` always runs it. A failing
+  Go test fails the run, and a missing `go` toolchain fails it too, never
+  skips.
 - **The selected lib tests run in one libtest process per crate**
   (`cargo test -p <crate> --lib -- --exact <names>`; g-mesh, the plugin, sdk
   and wire crates, GM-556). The names come from `cargo nextest list`, so
