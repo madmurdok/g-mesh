@@ -137,6 +137,10 @@ These are gaps this plugin has and will report honestly rather than guess at.
   there gets no `SUPERTYPE_OF` edge. Cross-compiling the pass per target was
   rejected: it multiplies the cost of the pass by the number of targets to
   answer questions about code the machine asking is not building.
+  A name declared in two such files (a build-tag twin, e.g. `json.go` /
+  `jsoniter.go`) gets its engine edges on the twin the host builds, addressed
+  by that file; which twin that is depends on the host and on `GOFLAGS` tags,
+  so the same repository can link it differently on Linux and macOS.
 - **Dependents are refreshed on their next check.** A per-file `semanticPass`
   re-checks that file's own package and no other. An edge from a *different*
   package into a symbol the edit moved is therefore stale until that package

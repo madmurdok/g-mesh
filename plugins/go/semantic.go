@@ -9,7 +9,8 @@ package main
 // # What a pass emits, and why a placeholder rather than a node id
 //
 // Every answer is a `qualifiedName`-keyed placeholder in the *declaring*
-// package's container, plus one `semantic` / `go-types` edge onto it:
+// package's container (or, for a build-tag twin, the declaring file - see
+// twinnedNames), plus one `semantic` / `go-types` edge onto it:
 //
 //	target = { scope: { container: "<import path>" },
 //	           key:   { qualifiedName: "Server.Close" },
@@ -94,6 +95,14 @@ package main
 //     keeps every node and edge extract.go gave it; only the receiver calls
 //     inside it stay open. Documented in plugins/go/README.md rather than
 //     hidden.
+//   - **Which of two build-tag twins a name means, beyond the host's
+//     choice.** When a package declares one name in two files that the build
+//     constraints keep apart (`binding.go` / `binding_nomsgpack.go`), a
+//     container-scoped address matches both and core refuses it as
+//     ambiguous. Such a *twinned* name (see twinnedNames) is addressed by
+//     the file the host build declares it in instead, so its answer lands on
+//     the twin this host compiles - which twin that is depends on the host
+//     and on GOFLAGS tags, exactly as the rest of this pass does (GM-570).
 //   - **Struct fields.** `x.field` resolves exactly, but this plugin emits
 //     no node for a struct field (extract.go models declarations, not
 //     members), so there is nothing for an edge to land on. The site is
@@ -107,6 +116,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"os"
@@ -310,12 +321,27 @@ type resolutions struct {
 	// two package variants (`app` and `app [app.test]`) collapses to one.
 	namedTypes map[*types.TypeName]*types.Named
 	interfaces map[*types.TypeName]*types.Named
-	// declaredIn is the project-relative file each of those was declared in.
-	// It is recorded while folding, not derived later, because a
-	// `types.Object` carries a `token.Pos` that only means something in the
-	// `token.FileSet` it was type-checked with - and this pass creates one
-	// per `packages.Load` call.
-	declaredIn map[*types.TypeName]string
+	// declaredIn is the project-relative file each of those - and each
+	// project object an answer in `uses` or `selections` resolves to - was
+	// declared in. It is recorded while folding, not derived later, because
+	// a `types.Object` carries a `token.Pos` that only means something in
+	// the `token.FileSet` it was type-checked with - and this pass creates
+	// one per `packages.Load` call.
+	declaredIn map[types.Object]string
+
+	// twinned is, per package path, the qualifiedName spellings the package
+	// declares in a file the host build loads *and* in one it excludes (see
+	// twinnedNames). Only these are addressed by file (GM-570).
+	twinned map[string]map[string]bool
+	// twinsKnown is every package path twinned has already been computed
+	// for, so neither a package's test variants nor a second load re-parse
+	// its files.
+	twinsKnown map[string]bool
+	// referenced is every project package path an answer resolved into.
+	// A package this pass did not fold itself (a per-file pass's imports)
+	// still needs its twins, or an edit to the importing file would flip
+	// its answers back to the ambiguous container address.
+	referenced map[string]bool
 }
 
 func newResolutions() *resolutions {
@@ -324,7 +350,10 @@ func newResolutions() *resolutions {
 		uses:       map[sitePos]types.Object{},
 		namedTypes: map[*types.TypeName]*types.Named{},
 		interfaces: map[*types.TypeName]*types.Named{},
-		declaredIn: map[*types.TypeName]string{},
+		declaredIn: map[types.Object]string{},
+		twinned:    map[string]map[string]bool{},
+		twinsKnown: map[string]bool{},
+		referenced: map[string]bool{},
 	}
 }
 
@@ -354,7 +383,46 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 	for _, pkg := range loaded {
 		e.foldPackage(into, fset, pkg)
 	}
+	e.loadReferencedTwins(into, cfg)
 	return nil
+}
+
+// loadReferencedTwins computes the twinned names of every project package an
+// answer resolved into but no load has folded yet - in a per-file pass, the
+// imported packages, which the type checker read from export data and
+// go/packages therefore reports without their IgnoredFiles. It asks `go list`
+// for names and files only (no type checking), from the same directory and
+// with the same flags as the load that found them, so the build constraints
+// are evaluated the same way. A failure leaves those packages without twins,
+// which keeps their answers container-scoped, as before GM-570.
+func (e *semanticEngine) loadReferencedTwins(into *resolutions, base *packages.Config) {
+	var missing []string
+	for path := range into.referenced {
+		if !into.twinsKnown[path] {
+			missing = append(missing, path)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	sort.Strings(missing)
+	cfg := &packages.Config{
+		Mode:       packages.NeedName | packages.NeedFiles,
+		Dir:        base.Dir,
+		Env:        base.Env,
+		BuildFlags: base.BuildFlags,
+	}
+	listed, err := packages.Load(cfg, missing...)
+	if err != nil {
+		logf("semantic pass: listing %d imported package(s) for build-tag twins failed: %v", len(missing), err)
+		listed = nil
+	}
+	for _, pkg := range listed {
+		e.collectTwins(into, pkg)
+	}
+	for _, path := range missing {
+		into.twinsKnown[path] = true
+	}
 }
 
 // loadEnv is the environment `go list` runs with: the inherited one, with
@@ -438,6 +506,7 @@ func (e *semanticEngine) foldPackage(into *resolutions, fset *token.FileSet, pkg
 			}
 			if key, ok := e.positionOf(fset, expr.Sel.Pos()); ok {
 				into.selections[key] = selection
+				e.recordDeclaration(into, fset, selection.Obj())
 			}
 		}
 		for ident, obj := range pkg.TypesInfo.Uses {
@@ -449,11 +518,16 @@ func (e *semanticEngine) foldPackage(into *resolutions, fset *token.FileSet, pkg
 				// variants it is compiled into).
 				if _, taken := into.selections[key]; !taken {
 					into.uses[key] = obj
+					e.recordDeclaration(into, fset, obj)
 				}
 			}
 		}
 	}
-	if pkg.Types == nil || !e.isProjectContainer(pkg.PkgPath) {
+	if !e.isProjectContainer(pkg.PkgPath) {
+		return
+	}
+	e.collectTwins(into, pkg)
+	if pkg.Types == nil {
 		return
 	}
 	scope := pkg.Types.Scope()
@@ -488,6 +562,165 @@ func (e *semanticEngine) foldPackage(into *resolutions, fset *token.FileSet, pkg
 			into.interfaces[typeName] = named
 		}
 	}
+}
+
+// recordDeclaration records the project file a project object an answer
+// resolved to is declared in, and that its package was referenced. Objects
+// outside the project are skipped: addressOf never addresses them.
+func (e *semanticEngine) recordDeclaration(into *resolutions, fset *token.FileSet, obj types.Object) {
+	if obj == nil || obj.Pkg() == nil {
+		return
+	}
+	if _, done := into.declaredIn[obj]; done {
+		return
+	}
+	path := obj.Pkg().Path()
+	if !e.isProjectContainer(path) {
+		return
+	}
+	into.referenced[path] = true
+	if at, ok := e.positionOf(fset, obj.Pos()); ok {
+		into.declaredIn[obj] = at.file
+	}
+}
+
+// collectTwins computes (once per package path) the twinned names of one
+// project package from its loaded and its build-excluded files.
+func (e *semanticEngine) collectTwins(into *resolutions, pkg *packages.Package) {
+	if pkg.PkgPath == "" || into.twinsKnown[pkg.PkgPath] {
+		return
+	}
+	into.twinsKnown[pkg.PkgPath] = true
+	if names := twinnedNames(pkg.Name, pkg.GoFiles, pkg.IgnoredFiles); len(names) > 0 {
+		into.twinned[pkg.PkgPath] = names
+	}
+}
+
+// twinnedNames is the set of qualifiedName spellings (extract.go's: `F`, `T`,
+// `T.M` for a method or an interface method, and each var/const name) that
+// package `pkgName` declares both in a file the host build loads and in one
+// its build constraints exclude - a build-tag twin (GM-570). Core cannot tell
+// the two declarations apart by container and name, so an answer onto such a
+// name has to say which file it means.
+//
+// Only twins are reported, not every name of a package with an excluded
+// file: a name declared once keeps its container address, and with it the
+// placeholder id it has always had.
+//
+// `_test.go` files are skipped on both sides: with `Tests: true` they are
+// loaded rather than ignored, and a test file's names are not what a twin in
+// production code collides with. An excluded file of another package (an
+// `//go:build ignore` `package main` generator) declares nothing here.
+func twinnedNames(pkgName string, loadedFiles, ignoredFiles []string) map[string]bool {
+	excluded := spellingsOf(pkgName, ignoredFiles)
+	if len(excluded) == 0 {
+		return nil
+	}
+	loaded := spellingsOf(pkgName, loadedFiles)
+	twinned := map[string]bool{}
+	for name := range excluded {
+		if loaded[name] {
+			twinned[name] = true
+		}
+	}
+	return twinned
+}
+
+// spellingsOf parses each non-test `.go` file of package `pkgName` and
+// collects its declarations' qualifiedName spellings. A file that does not
+// parse contributes what the parser recovered.
+func spellingsOf(pkgName string, files []string) map[string]bool {
+	out := map[string]bool{}
+	fset := token.NewFileSet()
+	for _, path := range files {
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		file, _ := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if file == nil || file.Name == nil || file.Name.Name != pkgName {
+			continue
+		}
+		declaredSpellings(file, out)
+	}
+	return out
+}
+
+// declaredSpellings adds a file's package-level declarations to `into`,
+// spelled exactly as extract.go's declareFunc / declareType /
+// declareInterfaceMethods / declareValues spell their qualifiedNames.
+func declaredSpellings(file *ast.File, into map[string]bool) {
+	add := func(names ...string) {
+		for _, name := range names {
+			if name == "" || name == "_" {
+				return
+			}
+		}
+		into[joinPath(dotPath(names...))] = true
+	}
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Name == nil {
+				continue
+			}
+			if d.Recv != nil && len(d.Recv.List) > 0 {
+				if receiver, ok := receiverTypeName(d.Recv.List[0].Type); ok {
+					add(receiver, d.Name.Name)
+				}
+			} else if d.Name.Name != "init" {
+				add(d.Name.Name)
+			}
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					if s.Name == nil {
+						continue
+					}
+					add(s.Name.Name)
+					iface, ok := s.Type.(*ast.InterfaceType)
+					if !ok || iface.Methods == nil {
+						continue
+					}
+					for _, field := range iface.Methods.List {
+						if _, ok := field.Type.(*ast.FuncType); !ok {
+							continue
+						}
+						for _, method := range field.Names {
+							if method != nil {
+								add(s.Name.Name, method.Name)
+							}
+						}
+					}
+				case *ast.ValueSpec:
+					for _, ident := range s.Names {
+						if ident != nil {
+							add(ident.Name)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// targetScopeOf is the scope an answer onto `obj`, addressed as
+// `container`/`key`, is sent with: the declaring file when the name is a
+// build-tag twin in its package and that file is known to be a Go file of
+// this project, the package's container otherwise.
+//
+// The file is the one the host build declares the name in, so a twinned
+// answer means "the declaration this host compiles" (GM-570). When it is not
+// known - a declaration outside the project root, or a `//line` directive
+// naming a non-Go source - the container scope is kept: the edge stays
+// ambiguous, as before, rather than being dropped.
+func (r *resolutions) targetScopeOf(obj types.Object, container string, key []pathSegment) targetScope {
+	if r.twinned[container][joinPath(key)] {
+		if file := r.declaredIn[obj]; strings.HasSuffix(file, ".go") {
+			return targetScope{File: file}
+		}
+	}
+	return targetScope{Container: container}
 }
 
 // positionOf turns a `go/token` position into this plugin's own
@@ -785,7 +1018,8 @@ func (e *semanticEngine) answerFile(
 		if !ok {
 			continue
 		}
-		toID := builder.placeholder(relPath, file.container, container, key,
+		toID := builder.placeholder(relPath, file.container, container,
+			resolved.targetScopeOf(obj, container, key), key,
 			wirePosition{Line: site.Line, Col: site.Col}, site.Name)
 		if site.IsCall && isFunc && site.EnclosingCallerID != "" {
 			builder.edge(relPath, site.EnclosingCallerID, edgeKindCalls, toID)
@@ -817,7 +1051,8 @@ func (e *semanticEngine) answerFile(
 		if call.EnclosingSymbolID == "" {
 			continue
 		}
-		toID := builder.placeholder(relPath, file.container, container, key,
+		toID := builder.placeholder(relPath, file.container, container,
+			resolved.targetScopeOf(obj, container, key), key,
 			wirePosition{Line: call.Line, Col: call.Col}, call.Name)
 		builder.edge(relPath, call.EnclosingSymbolID, edgeKindReferences, toID)
 		answered++
@@ -1013,7 +1248,9 @@ func (e *semanticEngine) answerImplements(
 				!types.Implements(types.NewPointer(subtype.named), iface) {
 				continue
 			}
-			toID := builder.placeholder(file, node.Container, ifaceObj.Pkg().Path(), dotPath(ifaceObj.Name()),
+			ifaceContainer, ifaceKey := ifaceObj.Pkg().Path(), dotPath(ifaceObj.Name())
+			toID := builder.placeholder(file, node.Container, ifaceContainer,
+				resolved.targetScopeOf(ifaceObj, ifaceContainer, ifaceKey), ifaceKey,
 				node.Range.Start, ifaceObj.Name())
 			builder.edge(file, node.ID, edgeKindSupertypeOf, toID)
 			emitted++
@@ -1109,15 +1346,28 @@ func newSemanticDiff() *semanticDiff {
 // `placeholder_targets`, never off this field (symbol_links.rs, "The address
 // is a row, not a string"). It is spelled that way because it is the one
 // rendering a human reading a diff can act on.
+//
+// `scope` is where core looks the key up: the container, or - for a
+// build-tag twin - the declaring file (targetScopeOf). A file-scoped
+// placeholder hashes that file into its id. Without it, the id would be the
+// one extract.go's placeholderFor gives a structural placeholder for the
+// same name in the same file, the two tiers would write one node, and
+// whichever wrote last would decide its address (GM-570). A container-scoped
+// id is unchanged, so no existing placeholder or edge id moves.
 func (d *semanticDiff) placeholder(
 	relPath, fromContainer, container string,
+	scope targetScope,
 	key []pathSegment,
 	at wirePosition,
 	displayName string,
 ) string {
 	qualifiedName := joinPath(key)
 	address := container + "." + qualifiedName
-	id := nodeIDFor(relPath, nodeKindModule, address, pendingSymbolNativeKind)
+	hashed := address
+	if scope.File != "" {
+		hashed = address + "@" + scope.File
+	}
+	id := nodeIDFor(relPath, nodeKindModule, hashed, pendingSymbolNativeKind)
 	if _, exists := d.nodes[id]; exists {
 		return id
 	}
@@ -1135,7 +1385,7 @@ func (d *semanticDiff) placeholder(
 		Language:   languageName,
 		NativeKind: pendingSymbolNativeKind,
 		Target: &placeholderTarget{
-			Scope:         targetScope{Container: container},
+			Scope:         scope,
 			Key:           targetKey{QualifiedName: qualifiedName},
 			FromContainer: fromContainer,
 			KeyPath:       key,
