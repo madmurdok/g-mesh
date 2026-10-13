@@ -1467,8 +1467,7 @@ fn accessors_without_a_sole_getter_or_beside_a_variable_stay_unlinked() {
 }
 
 /// Go's unexported: visible to its own package, and only to it - under a
-/// name key, and under a qualifiedName key too, which is what stops a
-/// semantic tier's mistake from linking a private symbol from outside.
+/// name key, and under a structural qualifiedName key too.
 #[test]
 fn a_go_unexported_symbol_links_within_its_package_and_not_from_outside() {
     let mut conn = setup();

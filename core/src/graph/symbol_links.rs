@@ -51,9 +51,10 @@
 //!     `(placeholder language, scope)`. Placeholders and core's container
 //!     nodes are never candidates, whatever their visibility says.
 //!  2. **Key filter.** `name`: `name = key`. `qualifiedName`: `qualifiedName =
-//!     key`. Either way the candidate must be *visible* to the requester
-//!     (below) - a semantic tier's mistake must not be able to link a private
-//!     symbol from outside either.
+//!     key`. The candidate must be *visible* to the requester (below), except
+//!     for an engine's exact answer: a `semantic` `CALLS` or `REFERENCES`
+//!     edge under a `qualifiedName` key ([`is_engine_answer`]). A structural
+//!     key, and any `name` key, is always checked.
 //!  3. **Kind filter.** `CALLS` lands only on a `Function`, `SUPERTYPE_OF`
 //!     only on a `Type`, `REFERENCES` on anything.
 //!  4. **Exactly one.** One fitting candidate: repoint and set `resolved = 1`.
@@ -106,6 +107,17 @@
 //! extraction). The one place `file` visibility carries information a
 //! placeholder can ask about is a container shared by several files, which is
 //! the case the narrowed rule keeps.
+//!
+//! An engine's exact answer is admitted without this check: a `semantic`
+//! edge of a kind in [`ENGINE_ANSWER_EDGE_KINDS`] whose placeholder has a
+//! `qualifiedName` key ([`Resolver::admits`]). The engine resolved a written
+//! name in code it compiled and named one declaration, so the self-import
+//! worry above (a `name` key finding a second, non-exported node) does not
+//! arise. Under a re-exported head ([`Resolver::through_head`]) only the
+//! member lookup is admitted; the head is walked by name and stays checked.
+//! The edge's source, not the placeholder, decides: one placeholder can carry
+//! a structural and a semantic edge, and each is linked on its own.
+//! Design: docs/adr/0034-semantic-answers-bypass-visibility.md.
 //!
 //! ## Re-export chains
 //!
@@ -221,10 +233,11 @@
 //! never sees the bare name at the use site, only a property access
 //! (`recordImportBindings` in extract.ts). The semantic pass asks `tsserver`
 //! where the member is declared and sends a placeholder addressed at *that*
-//! answer, with the usage edge marked `source: "ts-compiler"`. Nothing here
-//! treats one differently: the target is the entire contract, who worked it
-//! out is the plugin's business, and repointing settles what an edge points
-//! at, never who answered it. Where the checker stops at a re-export statement
+//! answer, with the usage edge marked `source: "ts-compiler"`. Who answered
+//! matters in one place only: an exact (`qualifiedName`) answer of a `CALLS`
+//! or `REFERENCES` edge skips the visibility check (see "Visibility"). The
+//! scope and key are otherwise the entire contract, and repointing settles
+//! what an edge points at, never who answered it. Where the checker stops at a re-export statement
 //! instead of a declaration, that is an ordinary barrel address and the walk
 //! above finishes the job.
 //!
@@ -339,6 +352,22 @@ const VISIBILITY_CONTAINER: &str = "container";
 /// the catch-all usage edge and accepts whatever the scope offers.
 const LINKABLE_EDGE_KINDS: [(&str, Option<&[&str]>); 3] =
     [("CALLS", Some(&["Function"])), ("SUPERTYPE_OF", Some(&["Type", "Function"])), ("REFERENCES", None)];
+
+/// The edge kinds whose engine answers ([`is_engine_answer`]) are admitted
+/// without the visibility check: those an engine produces by resolving a
+/// name written in the code. Every other kind stays checked whoever sent it.
+const ENGINE_ANSWER_EDGE_KINDS: [&str; 2] = ["CALLS", "REFERENCES"];
+
+/// `edges.source` of an edge a semantic tier (an engine) sent.
+const SOURCE_SEMANTIC: &str = "semantic";
+
+/// Whether an edge of `source` hanging on a placeholder keyed by `key` is an
+/// engine's exact answer: sent by a semantic tier and naming one declaration
+/// by its `qualifiedName`. A structural `qualifiedName` key, or any `name`
+/// key, is not.
+fn is_engine_answer(source: &str, key: &Key) -> bool {
+    source == SOURCE_SEMANTIC && matches!(key, Key::QualifiedName(_))
+}
 
 fn required_target_kind(edge_kind: &str) -> Option<Option<&'static [&'static str]>> {
     LINKABLE_EDGE_KINDS.iter().find(|(kind, _)| *kind == edge_kind).map(|(_, required)| *required)
@@ -498,6 +527,11 @@ struct Requester {
     file: String,
     container: Option<String>,
     language: String,
+    /// Whether the lookup answers an engine's exact answer of a kind in
+    /// [`ENGINE_ANSWER_EDGE_KINDS`]: a `qualifiedName` candidate is then
+    /// admitted whatever its visibility ([`Resolver::admits`]). False for
+    /// every placeholder as read; [`link`] sets it per edge group.
+    engine_answer: bool,
 }
 
 /// One pending placeholder with its target read back out of
@@ -557,6 +591,7 @@ fn placeholder_from_row(row: &Row) -> rusqlite::Result<Option<Placeholder>> {
             file: from_file,
             container: from_container.filter(|key| !key.is_empty()),
             language,
+            engine_answer: false,
         },
     }))
 }
@@ -774,10 +809,11 @@ fn is_reexport(kind: &str, native_kind: Option<&str>) -> bool {
 /// A declaration is a seed under every scope a placeholder could find it in
 /// *and* see it from: its file and its container for `public` and
 /// `container(..)` visibility, its container alone for `file` visibility,
-/// which no file-scoped lookup ever accepts (see the module doc). A TS
-/// non-exported symbol has no container, so it is no seed at all - exactly
-/// the old "exported symbols only" rule; the only lookups added for TS are
-/// the exact ones for an exported symbol whose qualifiedName is not its name.
+/// which no file-scoped `name` lookup ever accepts (see the module doc). A
+/// `file`-visible declaration is also an exact seed at its own file, where an
+/// engine's exact answer can find it ([`Resolver::admits`]); that seed is
+/// never walked up re-export chains. A TS non-exported symbol has no
+/// container, so its exact seed at its file is its only one.
 fn seeds(diff: &Diff) -> (Vec<Address>, Vec<Address>) {
     let mut named = Vec::new();
     let mut exact = Vec::new();
@@ -799,6 +835,9 @@ fn seeds(diff: &Diff) -> (Vec<Address>, Vec<Address>) {
                 exact.push((scope.clone(), node.qualified_name.clone()));
             }
             named.push((scope, node.name.clone()));
+        }
+        if node.visibility == VISIBILITY_FILE {
+            exact.push((Scope::File(node.file_path.clone()), node.qualified_name.clone()));
         }
     }
     (named, exact)
@@ -1247,31 +1286,37 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
     let tx = conn.transaction().context("failed to start the symbol-linking transaction")?;
     let untargeted_reexports;
     {
-        // The kinds still on the placeholder, and the kinds it already linked.
-        let mut pending_kinds = tx
+        // The (kind, source) groups still on the placeholder, and those it
+        // already linked. Each group is decided and moved on its own: a
+        // structural and a semantic edge of one kind can share a placeholder
+        // and still differ in whether visibility is checked.
+        let mut pending_groups = tx
             .prepare(
-                "SELECT kind FROM edges WHERE toId = ?1
-                 UNION SELECT kind FROM edges WHERE linkedFrom = ?1",
+                "SELECT kind, source FROM edges WHERE toId = ?1
+                 UNION SELECT kind, source FROM edges WHERE linkedFrom = ?1",
             )
             .context("failed to prepare the pending-edge-kind scan")?;
         let mut repoint = tx
             .prepare(
                 "UPDATE edges SET toId = ?1, resolved = 1, linkedFrom = ?2
-                 WHERE (toId = ?2 OR linkedFrom = ?2) AND kind = ?3 AND toId != ?1",
+                 WHERE (toId = ?2 OR linkedFrom = ?2) AND kind = ?3 AND source = ?4 AND toId != ?1",
             )
             .context("failed to prepare the edge repoint")?;
         let mut unlink = tx
-            .prepare("UPDATE edges SET toId = ?1, resolved = 0, linkedFrom = NULL WHERE linkedFrom = ?1 AND kind = ?2")
+            .prepare(
+                "UPDATE edges SET toId = ?1, resolved = 0, linkedFrom = NULL
+                 WHERE linkedFrom = ?1 AND kind = ?2 AND source = ?3",
+            )
             .context("failed to prepare the edge unlink")?;
         let mut resolver = Resolver::new(&tx, rules)?;
 
         for placeholder in placeholders {
-            let edge_kinds: Vec<String> = pending_kinds
-                .query_map(params![placeholder.id], |row| row.get(0))
+            let groups: Vec<(String, String)> = pending_groups
+                .query_map(params![placeholder.id], |row| Ok((row.get(0)?, row.get(1)?)))
                 .context("failed to read a placeholder's edge kinds")?
                 .collect::<rusqlite::Result<_>>()
                 .context("failed to collect a placeholder's edge kinds")?;
-            if edge_kinds.is_empty() {
+            if groups.is_empty() {
                 continue; // no usages, on the placeholder or linked from it
             }
 
@@ -1280,51 +1325,34 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
             // (gitignored, excluded, another language), does not offer it to
             // this requester, or ends its chain somewhere that does not.
             // Leaving the usage on its placeholder *is* the graceful fallback.
-            let candidates = resolver.resolve(&placeholder)?;
+            // At most two lists per placeholder, each computed only when a
+            // group needs it: checked, and admitting an engine's exact answer.
+            let mut checked: Option<Vec<Candidate>> = None;
+            let mut admitted: Option<Vec<Candidate>> = None;
 
-            for edge_kind in edge_kinds {
+            for (edge_kind, source) in groups {
                 let Some(required) = required_target_kind(&edge_kind) else {
                     continue; // not a usage edge - nothing here linked it, so nothing here moves it
                 };
-                // Before the kind rule, so a member cannot win by being the
-                // only candidate of the right kind.
-                let candidates = resolver.drop_type_members(&placeholder.key, &candidates)?;
-                // The first accepted kind any candidate has decides; the
-                // others are not considered beside it.
-                let fitting: Vec<&Candidate> = match required {
-                    Some(kinds) => kinds
-                        .iter()
-                        .map(|kind| {
-                            candidates
-                                .iter()
-                                .copied()
-                                .filter(|candidate| candidate.kind == *kind)
-                                .collect::<Vec<_>>()
-                        })
-                        .find(|fitting| !fitting.is_empty())
-                        .unwrap_or_default(),
-                    None => candidates,
-                };
-                let target_id = match fitting.as_slice() {
-                    [candidate] => Some(candidate.id.clone()),
-                    // Nothing (of the right kind): a missing edge beats a wrong one.
-                    [] => None,
-                    // Several equally good candidates: a missing edge beats a
-                    // wrong one.
-                    several => {
-                        sole_accessor_getter(&placeholder.key, several).map(|candidate| candidate.id.clone())
-                    }
-                };
+                let engine_answer = is_engine_answer(&source, &placeholder.key)
+                    && ENGINE_ANSWER_EDGE_KINDS.contains(&edge_kind.as_str());
+                let slot = if engine_answer { &mut admitted } else { &mut checked };
+                if slot.is_none() {
+                    let requester = Requester { engine_answer, ..placeholder.requester.clone() };
+                    *slot = Some(resolver.resolve(&placeholder, &requester)?);
+                }
+                let candidates = slot.as_deref().unwrap_or_default();
+                let target_id = resolver.choose(&placeholder.key, required, candidates)?;
 
                 match target_id {
                     Some(target_id) => {
                         summary.linked_edges += repoint
-                            .execute(params![target_id, placeholder.id, edge_kind])
+                            .execute(params![target_id, placeholder.id, edge_kind, source])
                             .context("failed to repoint a usage edge")?;
                     }
                     None => {
                         unlink
-                            .execute(params![placeholder.id, edge_kind])
+                            .execute(params![placeholder.id, edge_kind, source])
                             .context("failed to unlink a usage edge")?;
                     }
                 }
@@ -1484,13 +1512,16 @@ impl<'c> Resolver<'c> {
     /// answer, and they are all returned: the caller refuses to move an edge
     /// that more than one candidate fits, which is the same rule as for a name
     /// a single scope declares twice.
-    fn resolve(&mut self, placeholder: &Placeholder) -> Result<Vec<Candidate>> {
-        let (candidates, _) = self.walk(&placeholder.scope, &placeholder.key, &placeholder.requester)?;
+    ///
+    /// `requester` is the placeholder's own, with
+    /// [`Requester::engine_answer`] set for the edge group being decided.
+    fn resolve(&mut self, placeholder: &Placeholder, requester: &Requester) -> Result<Vec<Candidate>> {
+        let (candidates, _) = self.walk(&placeholder.scope, &placeholder.key, requester)?;
         if !candidates.is_empty() {
             return Ok(candidates);
         }
         match (&placeholder.key, &placeholder.key_path) {
-            (Key::QualifiedName(_), Some(key_path)) => self.through_head(placeholder, key_path),
+            (Key::QualifiedName(_), Some(key_path)) => self.through_head(placeholder, key_path, requester),
             _ => Ok(Vec::new()),
         }
     }
@@ -1534,7 +1565,7 @@ impl<'c> Resolver<'c> {
             for (index, (scope, key)) in frontier.iter().enumerate() {
                 let mut found = Vec::new();
                 for candidate in self.declared(scope, key)? {
-                    if self.visible(&candidate, scope, requester)? {
+                    if self.admits(&candidate, scope, key, requester)? {
                         found.push(candidate);
                     }
                 }
@@ -1699,16 +1730,19 @@ impl<'c> Resolver<'c> {
     /// looked up once by exact `qualifiedName` beside the head. Empty unless
     /// exactly one visible head turns up at depth 1 or deeper - at depth 0 the
     /// scope declares the head itself, so the member is simply not there.
+    /// The head is always walked with visibility checked; only the member
+    /// lookup is admitted for an engine's exact answer.
     fn through_head(
         &mut self,
         placeholder: &Placeholder,
         key_path: &QualifiedPath,
+        requester: &Requester,
     ) -> Result<Vec<Candidate>> {
         let (Some(head), Some(member)) = (head_name(key_path), key_path.last()) else {
             return Ok(Vec::new());
         };
-        let (heads, depth) =
-            self.walk(&placeholder.scope, &Key::Name(head.to_string()), &placeholder.requester)?;
+        let head_requester = Requester { engine_answer: false, ..requester.clone() };
+        let (heads, depth) = self.walk(&placeholder.scope, &Key::Name(head.to_string()), &head_requester)?;
         let [head] = heads.as_slice() else {
             return Ok(Vec::new()); // none, or ambiguous: a missing edge beats a wrong one
         };
@@ -1726,11 +1760,44 @@ impl<'c> Resolver<'c> {
         ));
         let mut members = Vec::new();
         for candidate in self.declared(&scope, &member_key)? {
-            if self.visible(&candidate, &scope, &placeholder.requester)? {
+            if self.admits(&candidate, &scope, &member_key, requester)? {
                 members.push(candidate);
             }
         }
         Ok(members)
+    }
+
+    /// The target an edge whose kind accepts `required` links to, out of
+    /// `candidates` found under `key`: type members dropped under a `name`
+    /// key, then the first accepted kind any candidate has, then exactly one
+    /// (or the getter of one property's accessors). `None`: nothing fits, or
+    /// several do - a missing edge beats a wrong one.
+    fn choose(
+        &mut self,
+        key: &Key,
+        required: Option<&[&str]>,
+        candidates: &[Candidate],
+    ) -> Result<Option<String>> {
+        // Before the kind rule, so a member cannot win by being the
+        // only candidate of the right kind.
+        let candidates = self.drop_type_members(key, candidates)?;
+        // The first accepted kind any candidate has decides; the
+        // others are not considered beside it.
+        let fitting: Vec<&Candidate> = match required {
+            Some(kinds) => kinds
+                .iter()
+                .map(|kind| {
+                    candidates.iter().copied().filter(|candidate| candidate.kind == *kind).collect::<Vec<_>>()
+                })
+                .find(|fitting| !fitting.is_empty())
+                .unwrap_or_default(),
+            None => candidates,
+        };
+        Ok(match fitting.as_slice() {
+            [candidate] => Some(candidate.id.clone()),
+            [] => None,
+            several => sole_accessor_getter(key, several).map(|candidate| candidate.id.clone()),
+        })
     }
 
     /// `candidates` without its type members, under a `name` key that found
@@ -1985,6 +2052,22 @@ impl<'c> Resolver<'c> {
 
         self.hops.insert(cache_key, hops.clone());
         Ok(hops)
+    }
+
+    /// Whether `candidate`, found in `scope` under `key`, is a candidate for
+    /// `requester`: an engine's exact answer under a `qualifiedName` key
+    /// always, anything else only when [`Resolver::visible`].
+    fn admits(
+        &mut self,
+        candidate: &Candidate,
+        scope: &Scope,
+        key: &Key,
+        requester: &Requester,
+    ) -> Result<bool> {
+        if requester.engine_answer && matches!(key, Key::QualifiedName(_)) {
+            return Ok(true);
+        }
+        self.visible(candidate, scope, requester)
     }
 
     /// Contract step 5, as the module doc's "Visibility" section states it -
