@@ -1907,6 +1907,11 @@ fn wire_position(
 }
 
 /// The node a location points at, together with the file it is in.
+///
+/// The tightest node containing the location, which may be an encloser of
+/// what the server meant: a class field or an object-literal method has no
+/// node of its own, so a definition at one lands on the class or the const
+/// around it. [`lands_on_name`] tells the two apart.
 fn node_at<'i>(
     index: &'i SdkIndex,
     roots: [&Path; 2],
@@ -1917,6 +1922,36 @@ fn node_at<'i>(
     let at = wire_position(index, &path, encoding, location);
     let node = index.node_at(&path, at)?;
     is_addressable(node).then_some((path, node))
+}
+
+/// Whether `at` (wire columns) is where `node` names itself: the start of
+/// the first whole-word occurrence of its name at or after the start of its
+/// range. A definition answer points at a declaration's name, and a node's
+/// range starts at the declaration, so a precise answer passes; one that
+/// landed on an encloser points at a member's name and fails, even a member
+/// sharing the encloser's name, which occurs after the encloser's own.
+fn lands_on_name(index: &SdkIndex, path: &RelPath, at: Position, node: &WireNode) -> bool {
+    let name: Vec<char> = node.name.chars().collect();
+    if name.is_empty() {
+        return false;
+    }
+    let Some(source) = index.source(path) else { return false };
+    let is_word = |character: char| character.is_alphanumeric() || character == '_' || character == '$';
+    let (start, end) = (node.range.start, node.range.end);
+    for line in start.line..=end.line {
+        let text: Vec<char> = line_text(source, line).chars().collect();
+        let from = if line == start.line { start.col as usize } else { 0 };
+        let mut col = from;
+        while col + name.len() <= text.len() {
+            let before = col > 0 && is_word(text[col - 1]);
+            let after = text.get(col + name.len()).is_some_and(|character| is_word(*character));
+            if !before && !after && text[col..col + name.len()] == name[..] {
+                return at == Position { line, col: col as u32 };
+            }
+            col += 1;
+        }
+    }
+    false
 }
 
 /// The overload declaration a location points into: the tightest
@@ -2477,24 +2512,34 @@ fn record_answer(
             // core's linker refuses an ambiguous address by design, and
             // picking one here would be this bridge making the guess the
             // linker declines to make.
-            let mut target: Option<(RelPath, &WireNode)> = None;
+            let mut target: Option<(RelPath, &WireNode, &ServerLocation)> = None;
             let mut agree = true;
             for location in &found {
                 let Some((path, node)) = node_at(index, roots, encoding, location) else { continue };
                 match &target {
-                    Some((_, chosen)) if chosen.id != node.id => {
+                    Some((_, chosen, _)) if chosen.id != node.id => {
                         agree = false;
                         break;
                     }
                     Some(_) => {}
-                    None => target = Some((path, node)),
+                    None => target = Some((path, node, location)),
                 }
             }
             if untyped_call_answered(index, roots, site, &found, agree && target.is_some()) {
                 *answers.untyped_answered.entry((site.from_id.clone(), site.name.clone())).or_default() += 1;
             }
-            let landed = if agree { target } else { None };
-            let Some((_, node)) = landed else {
+            // A call landing on anything but a function is kept only when
+            // the server pointed at that node's own name: a const-bound
+            // function or a tuple-struct constructor. Pointing inside it at
+            // something without a node (a field, an object-literal method)
+            // names the encloser, which is not what is called.
+            let landed = target.filter(|(path, node, location)| {
+                agree
+                    && (site.edge_kind != EdgeKind::Calls
+                        || node.kind == NodeKind::Function
+                        || lands_on_name(index, path, wire_position(index, path, encoding, location), node))
+            });
+            let Some((_, node, _)) = landed else {
                 // Empty, ambiguous, or nothing this index holds: no evidence
                 // against the structural edge, which therefore stands (R1).
                 if let Some(replaced) = &site.replaces {

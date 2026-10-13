@@ -322,6 +322,8 @@ CREATE INDEX idx_targets_scope ON placeholder_targets(scopeKind, scope, key);
   declaration", so it matches on `(scope, qualifiedName)` only. There is no
   ambiguity to refuse, and it still gets the visibility check. This is what makes
   `T.Close` distinguishable from `U.Close`.
+  A semantic `CALLS` under it lands on a `Function`, else a `Variable`, else a
+  `Type` (a const-bound function, a tuple-struct constructor; ADR 0035).
 - `resolved_module` imports gain `scopeKind = 'container'`, and `graph::imports`
   links onto a container node as well as onto a `File`.
 
@@ -684,7 +686,9 @@ edge of kind `K`:
 2. **Key filter.**
    - `name`: `name = key` and the node is *visible* to the requester (below).
    - `qualifiedName`: `qualifiedName = key`.
-3. **Kind filter.** `CALLS` → `Function`, `SUPERTYPE_OF` → `Type`, `REFERENCES` → any.
+3. **Kind filter.** `CALLS` → `Function` (a semantic `qualifiedName` answer:
+   `Function`, then `Variable`, then `Type`), `SUPERTYPE_OF` → `Type`,
+   `REFERENCES` → any.
 4. **Result.**
    - Exactly one candidate: repoint the edge and set `resolved = 1`.
    - None under a `name` key: walk the re-exports of `scope` as today (bounded at

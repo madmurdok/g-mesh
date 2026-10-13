@@ -55,8 +55,10 @@
 //!     for an engine's exact answer: a `semantic` `CALLS` or `REFERENCES`
 //!     edge under a `qualifiedName` key ([`is_engine_answer`]). A structural
 //!     key, and any `name` key, is always checked.
-//!  3. **Kind filter.** `CALLS` lands only on a `Function`, `SUPERTYPE_OF`
-//!     only on a `Type`, `REFERENCES` on anything.
+//!  3. **Kind filter.** `CALLS` lands only on a `Function`; an engine's
+//!     exact answer also on a `Variable`, then a `Type`
+//!     ([`ENGINE_ANSWER_CALL_TARGET_KINDS`]). `SUPERTYPE_OF` lands only on a
+//!     `Type`, `REFERENCES` on anything.
 //!  4. **Exactly one.** One fitting candidate: repoint and set `resolved = 1`.
 //!     None at all under a `name` key: walk the scope's re-exports (below).
 //!     Anything else - several, or none of the right kind - leaves the edge
@@ -207,7 +209,8 @@
 //!    or through any re-export chain short enough to follow;
 //!  - several visible nodes fit and neither the edge kind nor the type-member
 //!    exception (contract step 4) singles one out;
-//!  - the only fits are of the wrong kind for the edge;
+//!  - the only fits are of the wrong kind for the edge (its kind and, for
+//!    `CALLS`, whether it is an engine's exact answer);
 //!  - the placeholder has no target row at all - a legacy v1 address
 //!    `derive_legacy_target` could not read. It is left exactly as it is and
 //!    reported once per pass, never guessed from its `qualifiedName`;
@@ -344,7 +347,8 @@ const VISIBILITY_CONTAINER: &str = "container";
 
 /// The edge kinds a pending-symbol placeholder can carry, and the node kinds
 /// each one accepts for the symbol it is linked to, in order of preference.
-/// `CALLS` is Function -> Function by definition. `SUPERTYPE_OF` relates two
+/// `CALLS` is Function -> Function by definition (an engine's exact answer
+/// widens it: [`ENGINE_ANSWER_CALL_TARGET_KINDS`]). `SUPERTYPE_OF` relates two
 /// types, and also a trait-impl method to the trait method it implements
 /// (`<Square as Shape>::area -> Shape::area`), so it accepts a `Function` -
 /// but only where no `Type` fits, so a placeholder that can link to a type
@@ -369,7 +373,20 @@ fn is_engine_answer(source: &str, key: &Key) -> bool {
     source == SOURCE_SEMANTIC && matches!(key, Key::QualifiedName(_))
 }
 
-fn required_target_kind(edge_kind: &str) -> Option<Option<&'static [&'static str]>> {
+/// The node kinds an engine's exact `CALLS` answer accepts, in order of
+/// preference: the callee a semantic tier resolved may be a function bound to
+/// a variable, or a type called as a constructor (a tuple struct). A
+/// structural `CALLS` still accepts only a `Function`.
+const ENGINE_ANSWER_CALL_TARGET_KINDS: [&str; 3] = ["Function", "Variable", "Type"];
+
+/// The node kinds an edge of `edge_kind` accepts as its target, in order of
+/// preference (`None` inside: any kind); `None`: not a usage edge this module
+/// links. `engine_answer` is whether the edge group is an engine's exact
+/// answer of a kind in [`ENGINE_ANSWER_EDGE_KINDS`].
+fn required_target_kind(edge_kind: &str, engine_answer: bool) -> Option<Option<&'static [&'static str]>> {
+    if engine_answer && edge_kind == "CALLS" {
+        return Some(Some(&ENGINE_ANSWER_CALL_TARGET_KINDS));
+    }
     LINKABLE_EDGE_KINDS.iter().find(|(kind, _)| *kind == edge_kind).map(|(_, required)| *required)
 }
 
@@ -770,7 +787,7 @@ pub fn link_diff(conn: &mut Connection, diff: &Diff, rules: &LinkRules) -> Resul
     ids.extend(
         diff.upsert_edges
             .iter()
-            .filter(|edge| required_target_kind(&edge.kind).is_some())
+            .filter(|edge| required_target_kind(&edge.kind, false).is_some())
             .map(|edge| edge.to_id.clone()),
     );
     ids.extend(requesters_below_new_containers(conn, diff)?);
@@ -1331,11 +1348,11 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
             let mut admitted: Option<Vec<Candidate>> = None;
 
             for (edge_kind, source) in groups {
-                let Some(required) = required_target_kind(&edge_kind) else {
-                    continue; // not a usage edge - nothing here linked it, so nothing here moves it
-                };
                 let engine_answer = is_engine_answer(&source, &placeholder.key)
                     && ENGINE_ANSWER_EDGE_KINDS.contains(&edge_kind.as_str());
+                let Some(required) = required_target_kind(&edge_kind, engine_answer) else {
+                    continue; // not a usage edge - nothing here linked it, so nothing here moves it
+                };
                 let slot = if engine_answer { &mut admitted } else { &mut checked };
                 if slot.is_none() {
                     let requester = Requester { engine_answer, ..placeholder.requester.clone() };
