@@ -468,4 +468,147 @@ mod tests {
             "`engine` must turn on the bridge's quiescent signal:\n{body}"
         );
     }
+
+    /// `pinned_env` carries the toolchain pin as `RUSTUP_TOOLCHAIN`, which
+    /// outranks a project's `rust-toolchain.toml` for every rustup proxy the
+    /// server reaches. The integration test cannot observe it: `RUSTC` and
+    /// `CARGO` name absolute binaries there, so no proxy is reached.
+    ///
+    /// Control C2(a): delete the `RUSTUP_TOOLCHAIN` insert in `pinned_env`.
+    #[test]
+    fn the_server_env_pins_the_toolchain_by_name() {
+        let toolchain = Toolchain { pin: Some("gm513-pin".to_string()), ..Toolchain::default() };
+        let env = pinned_env(&toolchain);
+        assert_eq!(env.get("RUSTUP_TOOLCHAIN").map(String::as_str), Some("gm513-pin"), "{env:?}");
+
+        let unpinned = pinned_env(&Toolchain::default());
+        assert!(!unpinned.contains_key("RUSTUP_TOOLCHAIN"), "no pin, no RUSTUP_TOOLCHAIN: {unpinned:?}");
+    }
+
+    /// `engine` starts the server with `pinned_env` on top of the manifest's
+    /// env, so the unit test above is the env the server really gets.
+    #[test]
+    fn the_engine_starts_the_server_with_the_pinned_env() {
+        let source = include_str!("semantic.rs");
+        let engine = &source[source.find("pub fn engine(").expect("this file defines `engine`")..];
+        let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
+        assert!(body.contains("config.env.extend(pinned_env(&toolchain));"), "{body}");
+    }
+
+    /// A scratch directory, canonicalized (macOS' temp dir is a symlink),
+    /// that removes itself.
+    #[cfg(unix)]
+    struct Scratch(PathBuf);
+
+    #[cfg(unix)]
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("g-mesh-rs-gm513-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Scratch(root.canonicalize().unwrap())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An executable file at `path` that exits 1.
+    #[cfg(unix)]
+    fn executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The fixture for the proxy-identity tests:
+    ///
+    /// - `rustup-home/rustup`, the real (canonical) rustup;
+    /// - `other/rust-analyzer`, a symlink to it from another directory (a
+    ///   Homebrew rustup plus `~/.cargo/bin`);
+    /// - `alias`, a symlink to `rustup-home`, so `alias/rust-analyzer` is a
+    ///   proxy under a symlinked `PATH` spelling;
+    /// - `hard/rust-analyzer`, a hard link to `rustup`;
+    /// - `own/rust-analyzer`, an unrelated real binary.
+    #[cfg(unix)]
+    fn proxy_fixture(name: &str) -> (Scratch, PathBuf) {
+        let scratch = Scratch::new(name);
+        let rustup = scratch.0.join("rustup-home/rustup");
+        executable(&rustup);
+        std::fs::create_dir_all(scratch.0.join("other")).unwrap();
+        std::os::unix::fs::symlink(&rustup, scratch.0.join("other/rust-analyzer")).unwrap();
+        std::os::unix::fs::symlink("rustup", scratch.0.join("rustup-home/rust-analyzer")).unwrap();
+        std::os::unix::fs::symlink(scratch.0.join("rustup-home"), scratch.0.join("alias")).unwrap();
+        std::fs::create_dir_all(scratch.0.join("hard")).unwrap();
+        std::fs::hard_link(&rustup, scratch.0.join("hard/rust-analyzer")).unwrap();
+        executable(&scratch.0.join("own/rust-analyzer"));
+        (scratch, rustup)
+    }
+
+    /// A proxy is recognised by what the file is, not where it is spelled.
+    ///
+    /// Control F2: `is_rustup_proxy`'s body becomes the old
+    /// `found.parent() == rustup.parent()` - the first two assertions fail.
+    #[cfg(unix)]
+    #[test]
+    fn a_proxy_is_a_proxy_wherever_it_is_spelled() {
+        let (scratch, rustup) = proxy_fixture("identity");
+        let root = &scratch.0;
+        assert!(is_rustup_proxy(&root.join("other/rust-analyzer"), &rustup), "a symlink from another dir");
+        assert!(is_rustup_proxy(&root.join("alias/rust-analyzer"), &rustup), "a symlinked PATH dir");
+        assert!(is_rustup_proxy(&root.join("hard/rust-analyzer"), &rustup), "a hard link");
+        assert!(is_rustup_proxy(&root.join("rustup-home/rust-analyzer"), &rustup), "beside rustup");
+        assert!(!is_rustup_proxy(&root.join("own/rust-analyzer"), &rustup), "an unrelated binary");
+    }
+
+    /// The env var that makes [`candidates_never_offer_a_proxy_child`] run.
+    #[cfg(unix)]
+    const CANDIDATES_CHILD: &str = "G_MESH_RS_GM513_CANDIDATES_CHILD";
+
+    /// `candidates` drops a `PATH` hit that is a proxy under any spelling and
+    /// keeps an unrelated one. `candidates` reads this process's `PATH`, so the
+    /// check runs in a child test process (this binary, one test, its own
+    /// `PATH`) and no other test sees the change under either runner.
+    #[cfg(unix)]
+    #[test]
+    fn candidates_never_offer_a_proxy_under_any_path_spelling() {
+        let (scratch, _) = proxy_fixture("candidates");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "semantic::tests::candidates_never_offer_a_proxy_child", "--nocapture"])
+            .env(CANDIDATES_CHILD, &scratch.0)
+            .output()
+            .unwrap();
+        let text =
+            format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "the child failed:\n{text}");
+        assert!(text.contains("GM513-CHILD-RAN"), "the child test did not run:\n{text}");
+    }
+
+    /// The child half of the test above; a no-op unless [`CANDIDATES_CHILD`]
+    /// names the fixture.
+    #[cfg(unix)]
+    #[test]
+    fn candidates_never_offer_a_proxy_child() {
+        let Some(root) = std::env::var_os(CANDIDATES_CHILD).map(PathBuf::from) else {
+            return;
+        };
+        let toolchain = Toolchain { rustup: Some(root.join("rustup-home/rustup")), ..Toolchain::default() };
+        for dir in ["other", "alias", "hard", "rustup-home"] {
+            std::env::set_var("PATH", root.join(dir));
+            let found = candidates(Path::new("rust-analyzer"), &toolchain);
+            assert!(found.is_empty(), "PATH={dir}: a proxy was offered: {found:?}");
+        }
+        std::env::set_var("PATH", root.join("own"));
+        assert_eq!(
+            candidates(Path::new("rust-analyzer"), &toolchain),
+            vec![(root.join("own/rust-analyzer"), "PATH")],
+            "sanity: a real binary on PATH is offered"
+        );
+        println!("GM513-CHILD-RAN");
+    }
 }

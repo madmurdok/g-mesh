@@ -13,7 +13,10 @@
 //! - the same with a project `pyrightconfig.json` naming that venv;
 //! - a logging `node_modules/.bin/pyright` in the project, with no pyright
 //!   on `PATH` and a logging `npx` on `PATH`: neither the project's copy nor
-//!   `npx` may be probed or run, so no server resolves at all.
+//!   `npx` may be probed or run, so no server resolves at all;
+//! - a project `node_modules/pyright` package with a *real* `npx` and `node`
+//!   on `PATH` (no pyright): `npx` there would run the project's package, so
+//!   it must never run, and the tier is off with the remedy.
 //!
 //! The shims are shell scripts, so the whole file is unix only. The tests
 //! rewrite `PATH` and the working directory of this process, so they hold
@@ -264,4 +267,78 @@ fn the_projects_own_pyright_is_never_probed_or_run() {
     );
     assert!(!npx_log.exists(), "npx was run: in the project it runs the project's own node_modules/pyright");
     assert!(engine.is_err(), "with no pyright on PATH, nothing may resolve");
+}
+
+/// The test above stubs `npx` with `exit 1`, so it cannot see what a real
+/// `npx` does in the project. Here `npx` is the real one
+/// (behind a logging shim), with `node` beside it and no pyright on `PATH`,
+/// and the project ships `node_modules/pyright` whose bins write a marker.
+/// `npx --yes --package pyright pyright …` run with the project as cwd finds
+/// that local package and runs it - checked as a sanity step - so the plugin
+/// must not reach `npx` at all, and must report the tier off with the remedy.
+///
+/// Control F1: in `plugins/sdk/src/lsp/resolve.rs`, `npm_candidates_in`,
+/// delete the `if !npx { return candidates; }` early return.
+#[test]
+fn a_real_npx_in_the_project_never_runs_the_projects_pyright() {
+    let _guard = ENVIRONMENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let node = absolute("node");
+    let npx = absolute("npx");
+    let scratch = Scratch::new("npx");
+    let root = scratch.0.join("project");
+    let logs_dir = scratch.0.join("logs");
+    let marker = logs_dir.join("project-pyright-package");
+    let npx_log = logs_dir.join("npx");
+
+    write(&root.join("main.py"), LIB_PY);
+    let package = root.join("node_modules/pyright");
+    write(
+        &package.join("package.json"),
+        "{\"name\": \"pyright\", \"version\": \"1.1.999\", \"bin\": {\"pyright\": \"cli.js\", \
+         \"pyright-langserver\": \"langserver.js\"}}\n",
+    );
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    let bin_dir = root.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    for (bin, file) in [("pyright", "cli.js"), ("pyright-langserver", "langserver.js")] {
+        write(
+            &package.join(file),
+            &format!(
+                "#!/usr/bin/env node\nrequire('fs').appendFileSync({:?}, process.argv.slice(1).join(' ') + \
+                 '\\n');\nconsole.log('pyright 1.1.999');\n",
+                marker.display().to_string()
+            ),
+        );
+        std::fs::set_permissions(package.join(file), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(format!("../pyright/{file}"), bin_dir.join(bin)).unwrap();
+    }
+    let shims = scratch.0.join("shims");
+    std::fs::create_dir_all(&shims).unwrap();
+    std::os::unix::fs::symlink(&node, shims.join("node")).unwrap();
+    shim(&shims.join("npx"), &npx_log, &format!("exec '{}' \"$@\"", npx.display()));
+
+    set_environment(&[shims, PathBuf::from("/usr/bin"), PathBuf::from("/bin")], &root);
+
+    // Sanity: no pyright on PATH, and the real npx in the project runs the
+    // project's package (the probe the npx candidate would run).
+    for name in ["pyright", "pyright-langserver"] {
+        assert!(Command::new(name).arg("--version").output().is_err(), "sanity: no {name} on PATH");
+    }
+    run(Path::new("npx"), &["--yes", "--package", "pyright", "pyright", "--version"], &root);
+    assert!(marker.exists(), "sanity: npx in the project runs the project's node_modules/pyright");
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&npx_log);
+
+    let engine = semantic::engine(&root);
+
+    assert_eq!(
+        written(&[marker, npx_log]),
+        Vec::<String>::new(),
+        "the plugin ran npx, which ran the project's own node_modules/pyright"
+    );
+    let message = format!("{:#}", engine.err().expect("with no pyright on PATH, the semantic tier is off"));
+    assert!(
+        message.contains("npm install -g pyright") && message.contains("PATH"),
+        "remedy missing: {message}"
+    );
 }
