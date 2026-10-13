@@ -42,6 +42,11 @@ Nothing the project's files name is executed.
   empty. Environment outranks `.cargo/config.toml` and `rust-toolchain.toml`.
   Without rustup, `RUSTC`/`CARGO` are the `PATH` ones and the wrappers are
   still emptied. The daemon's own `RUSTUP_TOOLCHAIN`, if set, is the pin.
+  The same map sets `CARGO_ENCODED_RUSTFLAGS` empty: it outranks a project's
+  `.cargo/config.toml` `[build]`/`[target.*]` `rustflags`, which otherwise
+  reach the `rustc` probes of `cargo metadata` and can carry `-Z` flags such
+  as `-Zcodegen-backend=<project dylib>`. Project-chosen `--cfg` flags in
+  `rustflags` are not resolved, like the other project-chosen cfgs.
 - **D3 - pyright runs no interpreter.** `python.pythonPath` is a path that
   cannot exist (a child of the plugin's executable file); pyright fails to
   run it and does not fall back to `PATH` (measured, pyright 1.1.414). The
@@ -87,6 +92,14 @@ origin here (outside this task's analysis).
   failure's log line says so.
 - **Go:** a module whose `go` line is newer than the installed Go does not
   load; its pass degrades (logged) until the user upgrades Go.
+- **Known residual, rust:** cargo applies a project's `.cargo/config.toml`
+  `[env]` table to the `rustc` children of `cargo metadata`, so
+  `DYLD_INSERT_LIBRARIES` (macOS) or `LD_PRELOAD` (Linux), with `force = true`
+  if need be, loads a project-named library on first index. Empty parent
+  values do not stop it and `force = true` overrides any parent value, so
+  environment precedence cannot close this channel. It needs a prebuilt
+  library committed to the repository. A follow-up backlog task tracks an
+  OS-level sandbox for the server process.
 - Faster rust-analyzer start; no `target/` under the project.
 - Follow-ups: TypeScript's project-local server origin and its `npx`
   candidate (same exposure as python's had); no network and no writes

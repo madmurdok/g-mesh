@@ -33,7 +33,10 @@ nothing under the project root.
   environment next to ADR 0032's toolchain pin
   (`plugins/rust/src/semantic.rs`, `pinned_env`), so it reaches every cargo
   rust-analyzer starts. Environment outranks a project's
-  `.cargo/config.toml` `net.offline`.
+  `.cargo/config.toml` `net.offline`. The same map pins
+  `CARGO_ENCODED_RUSTFLAGS` empty (ADR 0032 D2), which closes project
+  `rustflags` as an execution channel; the `[env]` dynamic-linker channel
+  stays open (ADR 0032, Consequences).
 - **D2 - python: no `npx`.** Done by ADR 0032 D4; pyright comes from `PATH`
   only. Nothing further.
 - **D3 - go: `GOPROXY=off`, `GONOPROXY=-` and `GOSUMDB=off`, always.** Appended to
