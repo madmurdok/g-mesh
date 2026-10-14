@@ -938,6 +938,12 @@ fn end_process_group() {
     }
 }
 
+/// How long [`purge_state_dir`] waits for a bootstrap lock another process
+/// holds: long enough for a sweeper to finish deleting the directory under
+/// load, short enough that an orphaned daemon's exit (which only tests and
+/// `stop` wait on) is not held up for long.
+const PURGE_LOCK_WAIT: Duration = Duration::from_secs(10);
+
 /// On [`Orphaned::ProjectRootGone`], deletes this daemon's whole state
 /// directory (GM-524 D1): the index and every lock and log file of a project
 /// that no longer exists. Called by `daemon::run` and `front::run` after the
@@ -951,6 +957,12 @@ fn end_process_group() {
 /// usable until closed and the process ends right after this. Windows cannot
 /// delete an open file, so there the directory is left for the shim's startup
 /// sweep, which runs when no daemon holds it.
+///
+/// A shim's startup sweep can hold the bootstrap lock of this very directory
+/// (it is orphaned from the moment the singleton is dropped), so the purge
+/// waits up to [`PURGE_LOCK_WAIT`] for it rather than giving up. Either way,
+/// when this returns the directory is gone, or was kept for the reason logged:
+/// the purge never runs on after the process exits.
 pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
     let Exit::Orphaned(Orphaned::ProjectRootGone(root)) = exit else {
         return;
@@ -958,7 +970,8 @@ pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
     if cfg!(windows) {
         return;
     }
-    match crate::cli::clean::purge_orphaned_state_dir(state_dir) {
+    let wait = crate::cli::clean::LockWait::UpTo(PURGE_LOCK_WAIT);
+    match crate::cli::clean::purge_orphaned_state_dir(state_dir, wait) {
         Ok(crate::cli::clean::Purge::Deleted) => crate::log_line!(
             "g-mesh daemon: deleted the state of {} ({}) - its project root no longer exists",
             root.display(),

@@ -108,11 +108,22 @@ fn spawn_daemon_with_stderr(root: &Path, stderr: Stdio) -> Child {
 /// The daemon's one "reconciled N files with the disk" line in `log`, waiting
 /// for it: the restart's offline-change reconcile has finished once it is
 /// there (`PluginRegistry::reconcile_since_index`).
-fn reconciled_line(log: &Path) -> String {
+///
+/// Only complete lines count: the log is read while the daemon writes it, and
+/// a line without its `\n` yet may be cut short. A restart that walks the
+/// project instead never prints this line, so the wait fails at once when the
+/// restarted daemon's phase file reads `walking` (only a walk publishes it)
+/// rather than when the whole budget runs out.
+fn reconciled_line(root: &Path, log: &Path) -> String {
+    let state_dir = project_dir(root).expect("failed to resolve the state directory");
     let mut line = None;
     wait_for("the restarted daemon to reconcile the index with the disk", || {
         let text = std::fs::read_to_string(log).unwrap_or_default();
-        line = text.lines().find(|line| line.contains("files with the disk in")).map(str::to_string);
+        let whole = &text[..text.rfind('\n').map_or(0, |end| end + 1)];
+        line = whole.lines().find(|line| line.contains("files with the disk in")).map(str::to_string);
+        if line.is_none() && daemon::read_phase_in(&state_dir).as_deref() == Some("walking") {
+            panic!("the restarted daemon is walking the project instead of reconciling it; its log:\n{text}");
+        }
         line.is_some()
     });
     line.expect("wait_for returned, so the line was found")
@@ -337,7 +348,7 @@ fn a_restart_against_an_already_indexed_project_does_not_walk_it_again() {
     // restart owing that pass, and its reconcile then waits for activation;
     // this activates without naming any file, so nothing else is reindexed.
     common::trigger_activation(project.root());
-    let reconciled = reconciled_line(&log);
+    let reconciled = reconciled_line(project.root(), &log);
     assert!(
         reconciled.ends_with(": 0 deleted, 2 created, 2 reindexed"),
         "the restart must reindex the two files created while no daemon ran and leave the \

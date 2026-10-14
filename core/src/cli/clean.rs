@@ -41,7 +41,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -324,6 +324,23 @@ pub(crate) enum Purge {
     Kept(&'static str),
 }
 
+/// How [`purge_orphaned_state_dir`] treats a bootstrap lock someone else
+/// holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LockWait {
+    /// Try once and keep the directory if the lock is busy. The shim's
+    /// startup sweep uses this, so it never stalls a shim's start.
+    Try,
+    /// Poll for the lock for up to this long. The daemon's own purge uses
+    /// this: a sweeper holding the lock is about to delete the same directory
+    /// (or died mid-delete and left the rest), and giving up at once would let
+    /// the daemon exit with its state still on disk.
+    UpTo(Duration),
+}
+
+/// How often [`LockWait::UpTo`] retries a busy bootstrap lock.
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(15);
+
 /// Deletes one project's state directory, but only under the rules
 /// `clean orphaned --force` applies to it: its recorded root is
 /// [`RootState::Orphaned`] (gone, while the directory that held it is not -
@@ -334,14 +351,18 @@ pub(crate) enum Purge {
 /// Taken under the project's bootstrap lock, then re-judged: a shim can only
 /// bootstrap a project whose root exists (`project_hash` canonicalizes it), so
 /// a root recreated between the first look and the lock is seen by the second
-/// one and the directory kept. The lock is only *tried*: a shim holding it is
-/// bootstrapping this project right now, which is reason enough to keep it.
+/// one and the directory kept. `wait` says what a busy lock means: under
+/// [`LockWait::Try`] a shim holding it may be bootstrapping this project, which
+/// is reason enough to keep it; under [`LockWait::UpTo`] the lock is polled
+/// until it is free or the bound runs out. A directory that is gone once the
+/// lock is taken was deleted by whoever held it, which is the outcome asked
+/// for.
 ///
 /// Shared by the daemon's own purge on `ProjectRootGone`
 /// (`daemon::lifecycle::purge_state_dir`, GM-524 D1) and the shim's startup
 /// sweep ([`sweep_orphaned`]), so the two can never disagree with
 /// `clean orphaned` on what is safe to delete.
-pub(crate) fn purge_orphaned_state_dir(state_dir: &Path) -> Result<Purge> {
+pub(crate) fn purge_orphaned_state_dir(state_dir: &Path, wait: LockWait) -> Result<Purge> {
     let judge = || -> Option<Purge> {
         let root = daemon::identity::read_project_root(state_dir);
         if root_state(root.as_deref()) != RootState::Orphaned {
@@ -364,12 +385,32 @@ pub(crate) fn purge_orphaned_state_dir(state_dir: &Path) -> Result<Purge> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Purge::Deleted),
         Err(err) => return Err(err).with_context(|| format!("failed to open {}", lock_path.display())),
     };
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(fs::TryLockError::WouldBlock) => return Ok(Purge::Kept("a shim is bootstrapping it")),
-        Err(fs::TryLockError::Error(err)) => {
-            return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+    let deadline = match wait {
+        LockWait::Try => None,
+        LockWait::UpTo(bound) => Some(Instant::now() + bound),
+    };
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => match deadline {
+                None => return Ok(Purge::Kept("a shim is bootstrapping it")),
+                Some(deadline) if Instant::now() >= deadline => {
+                    return Ok(Purge::Kept("a shim held its bootstrap lock past the wait"));
+                }
+                Some(_) => std::thread::sleep(LOCK_POLL_INTERVAL),
+            },
+            Err(fs::TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+            }
         }
+    }
+    // The lock is taken on a file opened before whoever held it deleted the
+    // directory, so a gone directory must be told apart here: re-judged, it
+    // would read as "not recorded" and be reported as kept.
+    match fs::symlink_metadata(state_dir) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Purge::Deleted),
+        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", state_dir.display())),
     }
     if let Some(kept) = judge() {
         return Ok(kept);
@@ -445,7 +486,7 @@ pub(crate) fn sweep_orphaned(projects_root: &Path) -> Result<usize> {
         if !is_project_id || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        match purge_orphaned_state_dir(&entry.path()) {
+        match purge_orphaned_state_dir(&entry.path(), LockWait::Try) {
             Ok(Purge::Deleted) => deleted += 1,
             Ok(Purge::Kept(_)) => {}
             Err(err) => {
