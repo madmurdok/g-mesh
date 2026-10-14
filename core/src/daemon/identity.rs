@@ -174,4 +174,28 @@ mod tests {
             assert!(hashes.insert(hash), "hash collision at project-{i}");
         }
     }
+
+    /// Test 6 (GM-565): recording a root records the device it is on, a
+    /// later record replaces a stale value, and a missing or unparsable file
+    /// reads as `None` rather than failing.
+    #[cfg(unix)]
+    #[test]
+    fn recording_a_root_records_its_device() {
+        use std::os::unix::fs::MetadataExt;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let real = std::fs::metadata(project.path()).unwrap().dev();
+
+        assert_eq!(read_root_device(state.path()), None, "nothing recorded yet");
+
+        record_project_root(state.path(), project.path()).unwrap();
+        assert_eq!(read_root_device(state.path()), Some(real));
+
+        std::fs::write(state.path().join(DEVICE_FILE), real.wrapping_add(1).to_string()).unwrap();
+        record_project_root(state.path(), project.path()).unwrap();
+        assert_eq!(read_root_device(state.path()), Some(real), "a stale device was not replaced");
+
+        std::fs::write(state.path().join(DEVICE_FILE), "not a number").unwrap();
+        assert_eq!(read_root_device(state.path()), None);
+    }
 }

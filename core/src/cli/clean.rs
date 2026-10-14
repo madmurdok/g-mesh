@@ -1413,4 +1413,259 @@ mod tests {
         assert_eq!(sweep_orphaned_if_due(fixture.home.path(), Duration::ZERO).unwrap(), Sweep::Busy);
         assert!(orphan.exists());
     }
+
+    // -----------------------------------------------------------------
+    // Roots that are not present but were not deleted (GM-565)
+    // -----------------------------------------------------------------
+
+    /// The device id `path` is on right now.
+    #[cfg(unix)]
+    fn device_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().dev()
+    }
+
+    /// Restores a directory's mode on drop, so a panicking assertion cannot
+    /// leave a `chmod 000` directory the tempdir cleanup cannot remove.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Makes `dir` unsearchable. `None` when the process bypasses
+    /// permissions (running as root): the caller then has nothing to test
+    /// and says so instead of asserting nothing silently.
+    #[cfg(unix)]
+    fn make_unsearchable(dir: &Path, probe: &Path) -> Option<RestoreMode> {
+        use std::os::unix::fs::PermissionsExt;
+        let guard = RestoreMode(dir.to_path_buf());
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::metadata(probe).is_ok() {
+            eprintln!(
+                "note: {} is still readable after chmod 000 (running as root?); skipped",
+                probe.display()
+            );
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// Test 1: a root whose `stat` fails for a reason other than `NotFound`
+    /// (an ancestor lost its search permission) is not judged as deleted,
+    /// even though the root's parent itself still stats fine.
+    #[cfg(unix)]
+    #[test]
+    fn root_state_keeps_a_root_whose_parent_cannot_be_searched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("p");
+        let root = parent.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        daemon::identity::record_project_root(state.path(), &root).unwrap();
+        let recorded = daemon::identity::read_project_root(state.path()).unwrap();
+        let device = daemon::identity::read_root_device(state.path());
+
+        let Some(_restore) = make_unsearchable(&parent, &recorded) else {
+            return;
+        };
+
+        assert_eq!(root_state(Some(&recorded), device), RootState::Unreachable);
+    }
+
+    /// Test 2: the same unreadable root through the shim's sweep and through
+    /// `clean orphaned --force`: kept, and listed as unreachable.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_keeps_state_whose_root_is_only_unreadable() {
+        let projects = Projects::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("p");
+        let root = parent.join("root");
+        fs::create_dir_all(&root).unwrap();
+        projects.add("aaaa1111", 1);
+        projects.record_root("aaaa1111", &root);
+        let recorded = daemon::identity::read_project_root(&projects.root().join("aaaa1111")).unwrap();
+
+        let Some(_restore) = make_unsearchable(&parent, &recorded) else {
+            return;
+        };
+
+        assert_eq!(sweep_orphaned(projects.root()).unwrap(), 0);
+        assert!(projects.exists("aaaa1111"), "the sweep deleted state whose root is only unreadable");
+
+        let outcome = clean_in(&projects, Target::Orphaned, true).unwrap();
+        let Outcome::Orphaned { orphaned, unreachable, .. } = outcome else {
+            panic!("expected an orphaned outcome, got {outcome:?}");
+        };
+        assert!(orphaned.is_empty(), "{orphaned:?}");
+        assert_eq!(unreachable.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), ["aaaa1111"]);
+        assert!(projects.exists("aaaa1111"), "clean orphaned --force deleted an unreadable root's state");
+    }
+
+    /// Records `root` for `id`, deletes the root (its parent stays), and
+    /// overwrites the recorded device with one the parent is not on - the
+    /// shape both unmounted-volume layouts leave (`/Volumes/Ext` and
+    /// `/mnt/ext/proj`): the parent is now on another filesystem than the root
+    /// was. The value is computed from the real device, never a literal.
+    #[cfg(unix)]
+    fn record_then_unmount(projects: &Projects, id: &str, root: &Path) {
+        fs::create_dir(root).unwrap();
+        projects.record_root(id, root);
+        fs::remove_dir(root).unwrap();
+        let other = device_of(root.parent().unwrap()).wrapping_add(1);
+        fs::write(projects.root().join(id).join(daemon::identity::DEVICE_FILE), other.to_string()).unwrap();
+    }
+
+    /// Test 3: a missing root whose parent is on another device than the one
+    /// recorded is not judged; the same root with the real device is.
+    #[cfg(unix)]
+    #[test]
+    fn root_state_keeps_a_root_whose_parent_is_on_another_device() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("gone");
+        let real = device_of(parent.path());
+
+        assert_eq!(root_state(Some(&root), Some(real)), RootState::Orphaned);
+        assert_eq!(root_state(Some(&root), Some(real.wrapping_add(1))), RootState::Unreachable);
+    }
+
+    /// Test 4: the unmounted-volume shape through the shim's sweep and the
+    /// daemon's own purge; a really deleted sibling beside it still goes, so
+    /// the sweep is shown to run.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_keeps_state_of_a_project_on_an_unmounted_volume() {
+        let projects = Projects::new();
+        let parent = tempfile::tempdir().unwrap();
+        projects.add("aaaa1111", 1);
+        record_then_unmount(&projects, "aaaa1111", &parent.path().join("on-volume"));
+        let deleted = parent.path().join("deleted");
+        fs::create_dir(&deleted).unwrap();
+        projects.add("bbbb2222", 1);
+        projects.record_root("bbbb2222", &deleted);
+        fs::remove_dir(&deleted).unwrap();
+
+        assert!(matches!(
+            purge_orphaned_state_dir(&projects.root().join("aaaa1111")).unwrap(),
+            Purge::Kept(_)
+        ));
+        assert!(projects.exists("aaaa1111"));
+
+        assert_eq!(sweep_orphaned(projects.root()).unwrap(), 1);
+        assert!(projects.exists("aaaa1111"), "the sweep deleted state of a project on an unmounted volume");
+        assert!(!projects.exists("bbbb2222"), "the really deleted project's state survived");
+    }
+
+    /// Test 5 (D3): a root recorded before `project.dev` existed is not
+    /// judged on Unix, even when it reads exactly like a deletion.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_recorded_without_a_device_is_not_judged() {
+        let projects = Projects::new();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("gone");
+        fs::create_dir(&root).unwrap();
+        projects.add("aaaa1111", 1);
+        projects.record_root("aaaa1111", &root);
+        fs::remove_dir(&root).unwrap();
+        let state = projects.root().join("aaaa1111");
+        fs::remove_file(state.join(daemon::identity::DEVICE_FILE)).unwrap();
+
+        let recorded = daemon::identity::read_project_root(&state).unwrap();
+        assert_eq!(daemon::identity::read_root_device(&state), None);
+        assert_eq!(root_state(Some(&recorded), None), RootState::Unreachable);
+        assert!(matches!(purge_orphaned_state_dir(&state).unwrap(), Purge::Kept(_)));
+        assert!(projects.exists("aaaa1111"));
+    }
+
+    /// Test 8 (D4): a purge cut short after deleting everything but the two
+    /// root records leaves a directory that still reads as orphaned and is
+    /// finished by the next sweep. One cut between the last two removals
+    /// leaves only `project.dev`, which reads `Legacy` and is kept.
+    #[test]
+    fn an_interrupted_purge_is_finished_by_the_next_sweep() {
+        let projects = Projects::new();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("gone");
+        fs::create_dir(&root).unwrap();
+        projects.add_empty("aaaa1111");
+        projects.record_root("aaaa1111", &root);
+        fs::remove_dir(&root).unwrap();
+        let state = projects.root().join("aaaa1111");
+
+        let recorded = daemon::identity::read_project_root(&state);
+        let device = daemon::identity::read_root_device(&state);
+        assert_eq!(root_state(recorded.as_deref(), device), RootState::Orphaned);
+
+        let only_device = projects.add_empty("bbbb2222");
+        fs::write(only_device.join(daemon::identity::DEVICE_FILE), "1").unwrap();
+        assert_eq!(
+            root_state(daemon::identity::read_project_root(&only_device).as_deref(), Some(1)),
+            RootState::Legacy
+        );
+
+        assert_eq!(sweep_orphaned(projects.root()).unwrap(), 1);
+        assert!(!projects.exists("aaaa1111"), "the interrupted purge was not finished");
+        assert!(projects.exists("bbbb2222"), "a directory with only project.dev must be kept");
+    }
+
+    /// Optional real-volume proof (macOS, needs `hdiutil`, no root): index a
+    /// project on a mounted disk image, detach it, and check the sweep keeps
+    /// its state. Run by hand:
+    /// `cargo test -p g-mesh --lib -- --ignored a_project_on_a_detached_disk_image_is_kept`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "mounts a disk image with hdiutil; run by hand"]
+    fn a_project_on_a_detached_disk_image_is_kept() {
+        use std::process::Command;
+
+        struct Detach(PathBuf);
+        impl Drop for Detach {
+            fn drop(&mut self) {
+                let _ = Command::new("hdiutil").arg("detach").arg("-force").arg(&self.0).output();
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("vol.dmg");
+        let mount = tmp.path().join("vol");
+        fs::create_dir(&mount).unwrap();
+        let created = Command::new("hdiutil")
+            .args(["create", "-size", "2m", "-fs", "APFS", "-volname", "gm565"])
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        let attached = Command::new("hdiutil")
+            .args(["attach", "-nobrowse", "-mountpoint"])
+            .arg(&mount)
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(attached.status.success(), "{}", String::from_utf8_lossy(&attached.stderr));
+        let mut detach = Some(Detach(mount.clone()));
+
+        let root = mount.join("proj");
+        fs::create_dir(&root).unwrap();
+        let projects = Projects::new();
+        projects.add("aaaa1111", 1);
+        projects.record_root("aaaa1111", &root);
+        assert_ne!(
+            daemon::identity::read_root_device(&projects.root().join("aaaa1111")),
+            Some(device_of(tmp.path())),
+            "the image did not mount on its own device"
+        );
+
+        drop(detach.take());
+        assert!(!root.exists(), "the image is still mounted");
+
+        assert_eq!(sweep_orphaned(projects.root()).unwrap(), 0);
+        assert!(projects.exists("aaaa1111"), "the sweep deleted state of a project on a detached volume");
+    }
 }
