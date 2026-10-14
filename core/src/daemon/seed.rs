@@ -46,12 +46,40 @@ pub struct SeedOrigin {
 /// Whether seeding is switched on, from `G_MESH_SEED` and
 /// [`SEEDING_DEFAULT`].
 fn seed_enabled() -> bool {
-    match std::env::var(SEED_ENV).ok().as_deref().map(str::trim) {
+    seed_enabled_from(std::env::var(SEED_ENV).ok().as_deref())
+}
+
+/// [`seed_enabled`] with the variable's value passed in, so a test need not
+/// `set_var` what other threads read.
+fn seed_enabled_from(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
         Some("0") => false,
         Some("1") => true,
         _ => SEEDING_DEFAULT,
     }
 }
+
+/// Test-only: holds a seeded start's reconcile, before it reads anything,
+/// for as long as the file named by [`HOLD_RECONCILE_FILE_ENV`] exists, so a
+/// test can issue a tool call while the seed is still unreconciled. Bounded,
+/// so a test that forgets the file fails instead of wedging the daemon. A
+/// no-op unless set.
+pub(crate) fn hold_the_seeded_reconcile_for_tests() {
+    let Some(path) = std::env::var_os(HOLD_RECONCILE_FILE_ENV).filter(|p| !p.is_empty()) else { return };
+    let path = PathBuf::from(path);
+    crate::log_line!(
+        "g-mesh daemon: holding the seeded reconcile until {} is removed ({HOLD_RECONCILE_FILE_ENV})",
+        path.display()
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Path whose deletion releases a seeded reconcile held by
+/// [`hold_the_seeded_reconcile_for_tests`].
+pub const HOLD_RECONCILE_FILE_ENV: &str = "G_MESH_SEED_HOLD_RECONCILE_FILE";
 
 /// Held by whoever runs a seeded index's first-start reconcile; while it is
 /// held the phase stays `Walking`, so tool calls wait on `Need::Structural`.
@@ -185,11 +213,29 @@ pub(crate) fn seed_if_eligible(root: &Path, state_dir: &Path, indexer_version: &
     if !seed_enabled() {
         return None;
     }
+    let home = match crate::paths::g_mesh_home() {
+        Ok(home) => home,
+        Err(err) => {
+            crate::log_line!("g-mesh daemon: not seeding - no g-mesh home ({err:#})");
+            return None;
+        }
+    };
+    seed_if_eligible_under(&home, root, state_dir, indexer_version)
+}
+
+/// [`seed_if_eligible`] past the `G_MESH_SEED` switch, with the source's
+/// state directory resolved under the g-mesh home `home`.
+fn seed_if_eligible_under(
+    home: &Path,
+    root: &Path,
+    state_dir: &Path,
+    indexer_version: &str,
+) -> Option<SeedOrigin> {
     if fs::symlink_metadata(state_dir.join("index.db")).is_ok() {
         return None;
     }
     let source_root = main_checkout(root)?;
-    let source_db = match connection::project_dir(&source_root) {
+    let source_db = match connection::project_dir_under(home, &source_root) {
         Ok(dir) => dir.join("index.db"),
         Err(err) => {
             crate::log_line!(
@@ -308,3 +354,6 @@ fn remove_seed_side_files(state_dir: &Path) {
         let _ = fs::remove_file(state_dir.join(format!("{SEED_TMP}{suffix}")));
     }
 }
+
+#[cfg(test)]
+mod tests;

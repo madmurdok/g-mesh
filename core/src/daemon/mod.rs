@@ -634,6 +634,7 @@ fn spawn_watch_consumer(
                 registry.reconcile_since_index(&conn, registry::ReconcileMode::Plain);
             }
             ConsumerStart::Seeded(gate) => {
+                seed::hold_the_seeded_reconcile_for_tests();
                 // The reparsed files are recorded semantic-pending; the
                 // start's scoped pass below reads them back.
                 registry.reconcile_since_index(&conn, registry::ReconcileMode::Seeded);
