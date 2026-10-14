@@ -46,8 +46,10 @@ use crate::daemon::indexing_status::{IndexingStatus, Phase};
 use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::manifest::DiscoveredPlugins;
 use crate::daemon::registry::PluginRegistry;
+use crate::daemon::seed::SeedGate;
 use crate::daemon::semantic;
 use crate::daemon::workspace_reindex;
+use crate::daemon::ConsumerStart;
 use crate::embedding::EmbeddingPipeline;
 use crate::languages::LanguageOutcome;
 use crate::storage::index_store::IndexStore;
@@ -90,6 +92,12 @@ pub(super) struct ActivationCtx {
     /// apart, and for the latter this activation registers the watcher
     /// itself, before its walk.
     pub watcher: Option<ProjectWatcher>,
+    /// An unreconciled seed's gate, when this activation starts the
+    /// consumer (`watcher` is `Some`): the consumer gets it.
+    pub seed_gate: Option<SeedGate>,
+    /// Signalled once an unreconciled seed's reconcile has opened the gate;
+    /// the embedding backfill (and its `Embedding` phase) waits for it.
+    pub seed_reconciled: Option<Receiver<()>>,
 }
 
 /// Starts the parked activation thread. It does nothing until `triggered`
@@ -172,12 +180,17 @@ impl ActivationCtx {
         // (see `embedding::backfill::run`), and an edit made during it
         // should still be applied rather than left queued until it returns.
         if let Some(watcher) = self.watcher.take() {
+            let start = match (reconcile, self.seed_gate.take()) {
+                (false, _) => ConsumerStart::AfterWalk,
+                (true, Some(gate)) => ConsumerStart::Seeded(gate),
+                (true, None) => ConsumerStart::Reconcile,
+            };
             super::spawn_watch_consumer(
                 watcher,
                 Arc::clone(&self.conn),
                 Arc::clone(&self.registry),
                 self.canonical_root.clone(),
-                reconcile,
+                start,
             );
         }
 
@@ -199,6 +212,13 @@ impl ActivationCtx {
         // would error over a pass only `search_code` needs, and each retry
         // would re-run the same pass. Nodes left without a vector are picked
         // up by the next start's backfill.
+        // Never past an unreconciled seed's `Walking`: the phase moves on
+        // only after the consumer has opened the gate (or dropped it).
+        // A gate no consumer took (none was started) opens here.
+        drop(self.seed_gate.take());
+        if let Some(reconciled) = self.seed_reconciled.take() {
+            let _ = reconciled.recv();
+        }
         self.indexing.set_phase(Phase::Embedding);
         let backfill = panic::catch_unwind(AssertUnwindSafe(|| {
             crate::embedding::backfill::run(&self.conn, &self.embedding, &self.indexing)

@@ -102,8 +102,10 @@ use crate::daemon::manifest::{self, extension_of, under_excluded_dir, Discovered
 use crate::daemon::plugin;
 use crate::embedding::EmbeddingPipeline;
 use crate::languages::LanguageOutcome;
-use crate::storage::index_store::{self, IndexStore};
+use crate::storage::file_rows::FileScope;
+use crate::storage::index_store::{self, IndexStore, Unit};
 use crate::storage::schema::{self, CURRENT_INDEXER_VERSION};
+use crate::storage::write::Diff;
 use crate::watcher::staleness::{self, StalenessOutcome};
 
 /// Where a language's plugin pid is recorded, relative to the project's state
@@ -363,6 +365,20 @@ fn indexed_files_under(
         }
     }
     Ok(files)
+}
+
+/// How [`PluginRegistry::reconcile_since_index`] treats the index it
+/// reconciles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileMode {
+    /// An index this project walked itself: deleted = live and absent on
+    /// disk; a reparse runs its per-file semantic pass inline.
+    Plain,
+    /// An index copied from the main working tree (`daemon::seed`) and not
+    /// reconciled yet: deleted = live and not walked, a reparse is structural
+    /// only, and the reparsed files are returned for one scoped semantic pass
+    /// per language.
+    Seeded,
 }
 
 /// Every file the index holds anything for: an `indexed_files` baseline or a
@@ -1279,7 +1295,14 @@ impl PluginRegistry {
     /// `.gitignore` deleted while the daemon was down leaves no mtime and is
     /// not seen here.
     pub(crate) fn recheck_gitignores_since_index(&self, conn: &IndexStore) {
-        let indexed_at = match conn.with(schema::bulk_indexed_at_unix) {
+        // A seeded index's reconcile compared every walked file under the
+        // `.gitignore` files of that moment, as a walk does: it counts as one.
+        let indexed_at = conn.with(|conn| {
+            let walked = schema::bulk_indexed_at_unix(conn)?;
+            let seeded = schema::seed_reconciled_at_unix(conn)?;
+            Ok::<_, anyhow::Error>(walked.map(|walked| seeded.map_or(walked, |seeded| walked.max(seeded))))
+        });
+        let indexed_at = match indexed_at {
             Ok(Some(indexed_at)) => indexed_at,
             Ok(None) => return,
             Err(err) => {
@@ -1334,15 +1357,32 @@ impl PluginRegistry {
     /// [`recheck_gitignores_since_index`](Self::recheck_gitignores_since_index).
     /// Errors are logged per file; nothing here propagates.
     ///
+    /// [`ReconcileMode::Seeded`] differs in three ways: every live file not
+    /// walked is a deletion, retired from the index directly rather than
+    /// routed (a file still on disk, ignored here but indexed in the main
+    /// checkout, would be reparsed); a reparse leaves out its semantic pass;
+    /// and the
+    /// reparsed files of each language whose plugin runs semantic passes are
+    /// recorded as semantic-pending and returned; the start's
+    /// [`owed_semantic_file_passes`](Self::owed_semantic_file_passes) reads
+    /// them back from the index. `Plain` returns an empty map. Watch files
+    /// are not compared here: a seeded start does that next, in
+    /// [`reconcile_watch_files_with_seed`](Self::reconcile_watch_files_with_seed).
+    ///
     /// [`project_files`]: crate::project_walk::project_files
     /// [`indexing_language`]: DiscoveredPlugins::indexing_language
-    pub(crate) fn reconcile_since_index(&self, conn: &IndexStore) {
+    pub(crate) fn reconcile_since_index(
+        &self,
+        conn: &IndexStore,
+        mode: ReconcileMode,
+    ) -> BTreeMap<String, Vec<String>> {
+        let mut reparsed: BTreeMap<String, Vec<String>> = BTreeMap::new();
         match conn.with(schema::bulk_indexed_at_unix) {
             Ok(Some(_)) => {}
-            Ok(None) => return,
+            Ok(None) => return reparsed,
             Err(err) => {
                 crate::log_line!("g-mesh daemon: could not read when the project was last walked: {err:#}");
-                return;
+                return reparsed;
             }
         }
         let started = std::time::Instant::now();
@@ -1353,7 +1393,7 @@ impl PluginRegistry {
                     "g-mesh daemon: could not read the indexed files - changes made while no daemon \
                      ran are not reconciled: {err:#}"
                 );
-                return;
+                return reparsed;
             }
         };
         let pruned = self.discovered.excluded_by_every_language();
@@ -1363,19 +1403,51 @@ impl PluginRegistry {
             })
             .map(|file| file.relative)
             .collect();
-        let deleted: Vec<String> =
-            live.iter().filter(|file_path| !self.project_root.join(file_path).exists()).cloned().collect();
+        let seeded = mode == ReconcileMode::Seeded;
+        // Seeded: the live side is the main checkout's, so a file it indexed
+        // and this worktree does not walk is gone here even when it is on
+        // disk. Every such file is retired without its plugin: routing would
+        // reparse one still on disk, and would start a language server for
+        // the semantic pass after one that is not.
+        let (deleted, unwalked): (Vec<String>, Vec<String>) = if seeded {
+            let walked_set: HashSet<&String> = walked.iter().collect();
+            (Vec::new(), live.iter().filter(|file_path| !walked_set.contains(file_path)).cloned().collect())
+        } else {
+            let deleted = live
+                .iter()
+                .filter(|file_path| !self.project_root.join(file_path).exists())
+                .cloned()
+                .collect();
+            (deleted, Vec::new())
+        };
         let (known, created): (Vec<String>, Vec<String>) =
             walked.into_iter().partition(|file_path| live.contains(file_path));
 
         for file_path in &deleted {
             self.route_settled_path(conn, file_path.clone());
         }
+        for file_path in &unwalked {
+            if let Err(err) = self.retire_file(conn, file_path) {
+                crate::log_line!(
+                    "g-mesh daemon: could not drop {file_path}, which this worktree does not walk, from the \
+                     seeded index: {err:#}"
+                );
+            }
+        }
         self.announce_created(&created);
+        let semantic_languages: HashSet<String> =
+            if seeded { self.semantic_pass_languages().into_iter().collect() } else { HashSet::new() };
         let mut reindexed = 0usize;
         for file_path in created.iter().chain(&known) {
-            match self.ensure_fresh(conn, file_path) {
-                Ok(Some(outcome)) if outcome.reindexed() => reindexed += 1,
+            match self.ensure_fresh_with(conn, file_path, seeded) {
+                Ok(Some(outcome)) if outcome.reindexed() => {
+                    reindexed += 1;
+                    if let Some(language) = self.language_for(file_path) {
+                        if semantic_languages.contains(language) && !self.is_semantic_suspended(language) {
+                            reparsed.entry(language.to_string()).or_default().push(file_path.clone());
+                        }
+                    }
+                }
                 Ok(_) => {}
                 Err(err) => crate::log_line!(
                     "g-mesh daemon: could not reconcile {file_path} with the disk: {err:#} - the next \
@@ -1383,14 +1455,169 @@ impl PluginRegistry {
                 ),
             }
         }
+        for (language, file_paths) in &reparsed {
+            if let Err(err) =
+                conn.with(|conn| schema::record_semantic_pending_files(conn, language, file_paths))
+            {
+                crate::log_line!(
+                    "g-mesh daemon: could not record {language}'s reparsed files as semantic-pending: {err:#}"
+                );
+            }
+        }
         crate::log_line!(
-            "g-mesh daemon: reconciled {} files with the disk in {} ms: {} deleted, {} created, {} reindexed",
-            known.len() + created.len() + deleted.len(),
+            "g-mesh daemon: reconciled {} files{} with the disk in {} ms: {} deleted, {} created, {} reindexed",
+            known.len() + created.len() + deleted.len() + unwalked.len(),
+            if seeded { " of the seeded index" } else { "" },
             started.elapsed().as_millis(),
-            deleted.len(),
+            deleted.len() + unwalked.len(),
             created.len(),
             reindexed
         );
+        reparsed
+    }
+
+    /// Removes `file_path`'s rows from the index without asking its plugin,
+    /// as a deletion from disk would: its nodes, their outgoing edges, its
+    /// baseline and its semantic bookkeeping. Edges into its nodes from other
+    /// files stay, as for every node delete (`storage::write::apply_diff`).
+    fn retire_file(&self, conn: &IndexStore, file_path: &str) -> Result<()> {
+        conn.unit(Unit::WatcherApply, |store| {
+            store.apply_file_diff_linked(&mut Diff::default(), file_path, FileScope::Gone, "seeded deletion")
+        })
+    }
+
+    /// A seeded start's watch-file reconcile, after
+    /// [`reconcile_since_index`](Self::reconcile_since_index): every
+    /// `[plugin.workspace] watch_files` file of this worktree is compared,
+    /// byte for byte, with the file at the same relative path in the working
+    /// tree the seed was copied from (`seed_origin.sourceRoot`; the index
+    /// records no watch-file content of its own). A file on one side only
+    /// differs too. Each language with a differing watch file gets what the
+    /// watcher gives a settled edit of it,
+    /// [`workspace_file_changed`](Self::workspace_file_changed) with the
+    /// first differing file as the trigger (a `resolution_delta` plugin is
+    /// asked against the seed's stored facts first). Both sides are walked as
+    /// the bulk walk walks (`.gitignore` honoured, the directories every
+    /// language excludes pruned) and filtered by
+    /// [`workspace_language_matches`](Self::workspace_language_matches). The
+    /// source's watch files are read as they are now, not as its index read
+    /// them: an edit there that its own daemon has not indexed is missed, as
+    /// the source's own next start would miss it. A failed language is
+    /// skipped; nothing here propagates.
+    pub(crate) fn reconcile_watch_files_with_seed(&self, conn: &IndexStore) {
+        let source_root = match conn.with(schema::seed_source_root) {
+            Ok(Some(source_root)) => PathBuf::from(source_root),
+            Ok(None) => return,
+            Err(err) => {
+                crate::log_line!(
+                    "g-mesh daemon: could not read where the seeded index came from - its watch files are \
+                     not compared: {err:#}"
+                );
+                return;
+            }
+        };
+        let pruned = self.discovered.excluded_by_every_language();
+        let watch_files_under = |root: &Path| -> HashSet<String> {
+            crate::project_walk::project_files(root, &pruned)
+                .map(|file| file.relative)
+                .filter(|relative| !self.workspace_language_matches(relative).is_empty())
+                .collect()
+        };
+        let mine = watch_files_under(&self.project_root);
+        let theirs = if source_root.is_dir() {
+            watch_files_under(&source_root)
+        } else {
+            crate::log_line!(
+                "g-mesh daemon: {} (the seed's source) is gone - every watch file of this worktree counts as \
+                 changed",
+                source_root.display()
+            );
+            HashSet::new()
+        };
+        let mut differing: Vec<&String> = mine
+            .symmetric_difference(&theirs)
+            .chain(mine.intersection(&theirs).filter(|relative| {
+                let here = fs::read(self.project_root.join(relative.as_str()));
+                let there = fs::read(source_root.join(relative.as_str()));
+                !matches!((here, there), (Ok(here), Ok(there)) if here == there)
+            }))
+            .collect();
+        differing.sort();
+        let mut triggers: BTreeMap<String, String> = BTreeMap::new();
+        for relative in differing {
+            for language in self.workspace_language_matches(relative) {
+                triggers.entry(language).or_insert_with(|| relative.clone());
+            }
+        }
+        for (language, trigger) in triggers {
+            if self.is_failed_language(&language) {
+                continue;
+            }
+            crate::log_line!(
+                "g-mesh daemon: {trigger} differs from the seed's source - reindexing {language} as an edit of it would"
+            );
+            self.workspace_file_changed(conn, &language, &trigger);
+        }
+    }
+
+    /// At every start, before the watcher's first batch: per language, one
+    /// scoped `semanticPass` over the `semantic_pending_files` rows a per-file
+    /// pass still owes ([`schema::owed_semantic_pending_files`]: the seeded
+    /// reconcile's reparsed files, including those of an earlier start that
+    /// died before their pass), plus the language's owed files. The rows
+    /// clear only when that pass completes ([`watcher::apply`]'s per-file
+    /// settling); an unfinished or failed pass leaves them for the next
+    /// start. Best-effort: a failure is logged and the files keep their
+    /// structural edges.
+    ///
+    /// [`watcher::apply`]: crate::watcher::apply
+    pub(crate) fn owed_semantic_file_passes(&self, conn: &IndexStore) {
+        let owed = match conn.with(schema::owed_semantic_pending_files) {
+            Ok(owed) => owed,
+            Err(err) => {
+                crate::log_line!(
+                    "g-mesh daemon: could not read the semantic-pending files a pass still owes - none is \
+                     retried this start: {err:#}"
+                );
+                return;
+            }
+        };
+        for (language, file_paths) in owed {
+            if file_paths.is_empty() || self.is_failed_language(&language) {
+                continue;
+            }
+            let supervisor = match self.get_or_spawn(&language) {
+                Ok(supervisor) => supervisor,
+                Err(err) => {
+                    crate::log_line!(
+                        "g-mesh daemon: could not start the {language} plugin for the semantic pass over \
+                         {} semantic-pending file(s): {err:#}",
+                        file_paths.len()
+                    );
+                    continue;
+                }
+            };
+            if !supervisor.manifest().capabilities.semantic_pass || supervisor.is_semantic_suspended() {
+                continue;
+            }
+            let count = file_paths.len();
+            let embedding = self.embedding();
+            let started = std::time::Instant::now();
+            let passed = supervisor.with_awake_exclusive_access(|process| {
+                process.scoped_semantic_pass(conn, file_paths, embedding)
+            });
+            match passed.and_then(|passed| passed) {
+                Ok(()) => crate::log_line!(
+                    "g-mesh daemon: semantic pass over {count} semantic-pending {language} file(s) in {} ms",
+                    started.elapsed().as_millis()
+                ),
+                Err(err) => crate::log_line!(
+                    "g-mesh daemon: the semantic pass over {count} semantic-pending {language} file(s) failed \
+                     ({err:#}) - their edges keep whatever the structural pass resolved, and the next start \
+                     asks them again"
+                ),
+            }
+        }
     }
 
     /// The message to log for a file no plugin claims, or `None` if this
@@ -1644,6 +1871,18 @@ impl PluginRegistry {
     /// [`file_changed`](Self::file_changed) already has for an unroutable
     /// file.
     pub fn ensure_fresh(&self, conn: &IndexStore, file_path: &str) -> Result<Option<StalenessOutcome>> {
+        self.ensure_fresh_with(conn, file_path, false)
+    }
+
+    /// [`ensure_fresh`](Self::ensure_fresh); `defer_semantic` leaves the
+    /// reparse's per-file semantic pass to the caller
+    /// (`PluginSupervisor::ensure_fresh_structural`).
+    fn ensure_fresh_with(
+        &self,
+        conn: &IndexStore,
+        file_path: &str,
+        defer_semantic: bool,
+    ) -> Result<Option<StalenessOutcome>> {
         let Some(language) = self.language_for(file_path).map(str::to_string) else {
             return Ok(None);
         };
@@ -1657,7 +1896,11 @@ impl PluginRegistry {
         }
 
         let supervisor = self.get_or_spawn(&language)?;
-        let outcome = supervisor.ensure_fresh(conn, file_path);
+        let outcome = if defer_semantic {
+            supervisor.ensure_fresh_structural(conn, file_path)
+        } else {
+            supervisor.ensure_fresh(conn, file_path)
+        };
         // Rare (see `run_owed_reindex`), and the query waits for it: the
         // graph it reads is otherwise known to be stale.
         self.run_owed_reindex(conn, &supervisor);

@@ -111,6 +111,12 @@ pub enum ColdCause {
     /// The index is the current generation, but its walk never finished
     /// (`bulkIndexedAt` unset).
     Incomplete,
+    /// The index was copied from the main working tree's (`daemon::seed`) and
+    /// its first-start reconcile with this worktree's files has not finished:
+    /// the phase starts at [`Phase::Walking`], and the watcher's consumer
+    /// moves it to [`Phase::Structural`]. Meaningful while the phase is
+    /// `Walking`.
+    Seeded,
 }
 
 const UNINDEXED: u8 = 0;
@@ -277,7 +283,14 @@ impl IndexingStatus {
     /// reaches [`Phase::Structural`]. Used by tests; the daemon starts at
     /// [`unindexed`](Self::unindexed).
     pub fn walking() -> Self {
-        Self::starting_at(WALKING, ColdCause::Fresh)
+        Self::walking_because(ColdCause::Fresh)
+    }
+
+    /// [`walking`](Self::walking), recording why: a seeded index
+    /// ([`ColdCause::Seeded`]) starts here, so tool calls wait for its
+    /// reconcile.
+    pub fn walking_because(cause: ColdCause) -> Self {
+        Self::starting_at(WALKING, cause)
     }
 
     /// A daemon whose walk was complete when it started (every restart of an
@@ -581,6 +594,9 @@ impl IndexingStatus {
     pub fn progress_detail(&self) -> String {
         match self.phase() {
             Phase::Unindexed => "starting".to_string(),
+            Phase::Walking if self.cold_cause() == ColdCause::Seeded => {
+                "reconciling the index copied from the main checkout with this worktree's files".to_string()
+            }
             Phase::Walking => {
                 let (done, total, current) = self.language_progress();
                 let items = group_thousands(self.items_ingested());

@@ -482,6 +482,22 @@ impl PluginSupervisor {
     /// daemon was down, or dropped by the backend). The common case resolves off
     /// `indexed_files` alone, without the plugin lock; only a reindex wakes it.
     pub fn ensure_fresh(&self, conn: &IndexStore, file_path: &str) -> Result<StalenessOutcome> {
+        self.ensure_fresh_with(conn, file_path, false)
+    }
+
+    /// [`ensure_fresh`](Self::ensure_fresh) with the reparse's per-file
+    /// semantic pass left out: the caller runs one scoped pass over every
+    /// file it reparsed this way (the seeded start, `daemon::seed`).
+    pub fn ensure_fresh_structural(&self, conn: &IndexStore, file_path: &str) -> Result<StalenessOutcome> {
+        self.ensure_fresh_with(conn, file_path, true)
+    }
+
+    fn ensure_fresh_with(
+        &self,
+        conn: &IndexStore,
+        file_path: &str,
+        defer_semantic: bool,
+    ) -> Result<StalenessOutcome> {
         if !conn.with(|conn| staleness::is_stale(conn, &self.project_root, file_path))? {
             return Ok(StalenessOutcome::AlreadyFresh);
         }
@@ -500,8 +516,14 @@ impl PluginSupervisor {
         }
         self.touch();
         let process = inner.process.as_ref().expect("just spawned or already running");
-        let (outcome, change) =
-            process.ensure_fresh(conn, file_path, &self.embedding, self.is_semantic_suspended())?;
+        // A suspended language and a deferred pass both take the reparse's
+        // structural-only branch.
+        let (outcome, change) = process.ensure_fresh(
+            conn,
+            file_path,
+            &self.embedding,
+            self.is_semantic_suspended() || defer_semantic,
+        )?;
         self.note(file_path, change);
         Ok(outcome)
     }
