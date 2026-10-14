@@ -5,53 +5,78 @@
 //! is a folder of projects, the daemon is a *front*, and a `select_project`
 //! result carries `_meta["g-mesh/switchProject"].root = C`. The router then
 //! connects to `C`'s own, normal daemon, replays the client's recorded
-//! `initialize` to it, and from then on routes the session there - except
-//! `select_project` and `tools/list`, which keep going to the front so the
-//! agent can switch again.
+//! `initialize` to it, and from then on routes calls without a `project`
+//! argument there - except `select_project` and `tools/list`, which keep
+//! going to the front so the agent can switch again.
 //!
 //! # What gets parsed
 //!
 //! Client frames are parsed, to learn which ones to record or route
-//! specially; they are forwarded as the original bytes, never re-serialized.
-//! Every upstream frame is scanned for its `id` and `method` only (the rest,
-//! such as a large tool result, is skipped, not built), to settle the request
-//! it answers. Upstream frames are parsed in full only on the front's
+//! specially; they are forwarded as the original bytes, except a `tools/call`
+//! that carries `project` (below), which is re-serialized without it. Every
+//! upstream frame is scanned for its `id` and `method` only (the rest, such as
+//! a large tool result, is skipped, not built), to settle the request it
+//! answers. Upstream frames are parsed in full only on the front's
 //! connection, and only while a `select_project` call is outstanding. A
 //! single-project session never has a switch directive to act on, so for it
-//! every frame crosses byte-for-byte, as it did before this module existed; a
-//! frame that fails to parse is forwarded raw. The one exception is the
-//! restart line below.
+//! every frame without `project` crosses byte-for-byte, as it did before this
+//! module existed; a frame that fails to parse is forwarded raw. The one
+//! exception is the restart line below.
+//!
+//! # Per-call routing
+//!
+//! Every agent on one client connection shares the session, and the shim
+//! cannot tell them apart, so isolation comes from the call itself
+//! (`docs/adr/0036-per-call-project-routing.md`). A `tools/call` whose
+//! arguments carry `project` (a path relative to the root, or absolute; the
+//! front adds the property to the eight tools' schemas) goes to that
+//! project's daemon whatever is selected; the shim resolves the name by
+//! probing its path ([`candidates::resolve`]) and removes the argument
+//! before forwarding, so no daemon sees it. A name that resolves to no
+//! project is answered by the shim, and nothing is sent. In a single-project
+//! session `project` may only name the root itself.
+//!
+//! A call without `project` goes to the selected project while only one
+//! project was ever selected on the connection. Once a second, different one
+//! has been, the selection is *contested* for the rest of the session: such a
+//! call is refused by the shim, since another agent may have made either
+//! selection. Selecting and the contested flag change under the router lock,
+//! so no call is routed between them.
+//!
+//! Sub-project connections form a pool keyed by canonical root, at most
+//! [`POOL_CAP`] live, least recently used retired first. A project's guidance
+//! (its daemon's `instructions`) reaches the agent in the `select_project`
+//! result, or, for a project only ever reached through `project`, as a
+//! trailing text item of its first `tools/call` answer ([`guidance_line`]).
 //!
 //! # Which project answered
 //!
-//! Every agent on one client connection shares the session's selection, and
-//! the shim cannot tell them apart, so one agent's `select_project` reroutes
-//! another's later calls. A `tools/call` result that a sub-project's daemon
-//! answers therefore starts with a text item naming that project, relative
-//! to the shim's root ([`answered_from`]): the root of the upstream the call
-//! was sent to, not the selection at the time the answer arrives. Such a
-//! result is parsed and re-serialized to add it. Front answers, JSON-RPC
-//! error responses, and answers the shim makes itself are not stamped (see
+//! A `tools/call` result that a sub-project's daemon answers starts with a
+//! text item naming that project, relative to the shim's root
+//! ([`answered_from`]): the root of the upstream the call was sent to, not
+//! the selection at the time the answer arrives. Such a result is parsed and
+//! re-serialized to add it. Front answers, JSON-RPC error responses, and
+//! answers the shim makes itself are not stamped (see
 //! `docs/adr/0014-answering-project-stamp.md`).
 //!
 //! # Every forwarded request is answered
 //!
 //! Each request forwarded upstream is recorded with the upstream it went to
-//! until its response passes back. A switch does not close the previous
-//! sub-project upstream while it still owes answers: it is *retired*, and
-//! half-closed once its last one has passed. An upstream that ends while it
+//! until its response passes back. A pool connection evicted while it still
+//! owes answers is *retired*, and half-closed once its last one has passed. An upstream that ends while it
 //! still owes answers has the shim answer each of them with an error, so the
 //! client never waits on a request nobody will answer. Nothing is replayed: a
 //! call may not be idempotent, so retrying it is the client's decision.
 //!
 //! # A daemon that goes away
 //!
-//! The session outlives its daemons. When the front's or the selected
+//! The session outlives its daemons. When the front's or a pooled
 //! sub-project's connection ends (`g-mesh reindex`, `init` or `stop`, a newer
 //! build retiring it, a crash), that upstream is marked *lost*: its root is
 //! kept, so the selection survives, and the next request routed to it
 //! reconnects first, bootstrapping a daemon if none is running, and replays
-//! `initialize` to it. Nothing reconnects eagerly, so `g-mesh stop` is not
+//! `initialize` to it. A connection opened for a project the pool does not
+//! hold (never reached, or evicted) is not a reconnect. Nothing reconnects eagerly, so `g-mesh stop` is not
 //! undone by a session that is not calling anything. A lost sub-project never
 //! falls back to the front. A request that cannot reconnect is answered by the
 //! shim: while the CLI rebuilds that root's index ([`Rebuilding`]) with an
@@ -100,7 +125,8 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::mcp::front::{SELECT_PROJECT, SWITCH_PROJECT_META};
+use crate::daemon::candidates::{self, relative_to_root, segments};
+use crate::mcp::front::{PROJECT_ARG, SELECT_PROJECT, SWITCH_PROJECT_META};
 use crate::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 
 /// One connection to a daemon, split into what the router needs of it.
@@ -119,11 +145,20 @@ pub(crate) type Connector = Box<dyn Fn(&Path) -> Result<Link> + Send + Sync>;
 /// Reports the CLI rebuild holding a root's index, if one is running.
 pub(crate) type RebuildProbe = Box<dyn Fn(&Path) -> Option<Rebuilding> + Send + Sync>;
 
+/// Reports whether a root is a folder of projects (served by a front).
+pub(crate) type FolderProbe = Box<dyn Fn(&Path) -> bool + Send + Sync>;
+
 /// How the router reaches daemons.
 pub(crate) struct Daemons {
     pub connect: Connector,
     pub rebuilding: RebuildProbe,
+    /// Asked once per session, on the first call that carries `project`.
+    pub is_folder: FolderProbe,
 }
+
+/// Live sub-project connections the pool keeps; above it the least recently
+/// used one is retired. A live connection holds its daemon up.
+const POOL_CAP: usize = 4;
 
 /// A root whose index `g-mesh reindex` or `g-mesh init` is rebuilding: no
 /// daemon may serve it until the rebuild ends.
@@ -181,7 +216,7 @@ impl Upstream {
     }
 }
 
-/// The front's or the selected sub-project's place in the session.
+/// The front's or a pooled sub-project's place in the session.
 enum Slot {
     Live(Upstream),
     /// Its connection ended; the next request routed here reconnects to the
@@ -206,11 +241,13 @@ impl Slot {
 }
 
 /// Which slot a frame is routed to.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Which {
     Front,
     /// The selected sub-project, or the front before any switch.
     Current,
+    /// The sub-project at this canonical root, named by a call's `project`.
+    Project(PathBuf),
 }
 
 struct Router {
@@ -219,11 +256,26 @@ struct Router {
     /// The connection to the root's daemon (the front, in a multi-project
     /// session).
     front: Slot,
-    /// The selected sub-project's daemon, once a switch has happened.
-    sub: Option<Slot>,
-    /// Sub-project upstreams switched away from while they still owed
-    /// answers. Each is half-closed once it owes none, and dropped from here
-    /// when its connection ends.
+    /// Sub-project connections by canonical root: the selected one and those
+    /// reached through `project`. Every key is in `lru`.
+    subs: HashMap<PathBuf, Slot>,
+    /// `subs`' roots, least recently used first.
+    lru: Vec<PathBuf>,
+    /// The project the last successful `select_project` switched to.
+    selected: Option<PathBuf>,
+    /// Every distinct project a `select_project` switched to, in order; two
+    /// or more make the session contested.
+    selections: Vec<PathBuf>,
+    /// The instructions each sub-project's daemon answered its latest
+    /// handshake with.
+    guidance: HashMap<PathBuf, String>,
+    /// Sub-projects whose guidance this session already delivered.
+    guided: HashSet<PathBuf>,
+    /// Whether the root is a folder of projects; asked lazily.
+    folder: Option<bool>,
+    /// Pool connections evicted while they still owed answers. Each is
+    /// half-closed once it owes none, and dropped from here when its
+    /// connection ends.
     retired: Vec<Retired>,
     /// Client requests forwarded upstream and not yet answered, by id.
     pending: HashMap<Value, InFlight>,
@@ -243,8 +295,6 @@ struct Router {
 
 struct Retired {
     upstream: Upstream,
-    /// The root the session switched to when this upstream was retired.
-    switched_to: PathBuf,
 }
 
 struct InFlight {
@@ -254,35 +304,70 @@ struct InFlight {
 }
 
 impl Router {
-    /// Never falls back from a selected sub-project to the front: the front
-    /// serves only `select_project`.
-    fn slot(&self, which: Which) -> &Slot {
-        match (which, &self.sub) {
-            (Which::Current, Some(sub)) => sub,
-            _ => &self.front,
+    /// The root slot `which` serves.
+    fn root_of<'a>(&'a self, which: &'a Which) -> &'a Path {
+        match which {
+            Which::Front => &self.root,
+            Which::Current => self.selected.as_deref().unwrap_or(&self.root),
+            Which::Project(root) => root,
         }
     }
 
-    fn slot_mut(&mut self, which: Which) -> &mut Slot {
-        match (which, &mut self.sub) {
-            (Which::Current, Some(sub)) => sub,
-            _ => &mut self.front,
+    /// `None` for a sub-project the pool does not hold. Never falls back from
+    /// a selected sub-project to the front: the front serves only
+    /// `select_project`.
+    fn slot(&self, which: &Which) -> Option<&Slot> {
+        match (which, &self.selected) {
+            (Which::Front, _) | (Which::Current, None) => Some(&self.front),
+            (Which::Current, Some(root)) | (Which::Project(root), _) => self.subs.get(root),
         }
+    }
+
+    fn contested(&self) -> bool {
+        self.selections.len() > 1
     }
 
     fn upstream(&self, id: u64) -> Option<&Upstream> {
-        [self.front.live(), self.sub.as_ref().and_then(Slot::live)]
-            .into_iter()
-            .flatten()
-            .chain(self.retired.iter().map(|retired| &retired.upstream))
-            .find(|upstream| upstream.id == id)
+        self.open_upstreams().find(|upstream| upstream.id == id)
     }
 
     fn open_upstreams(&self) -> impl Iterator<Item = &Upstream> {
-        [self.front.live(), self.sub.as_ref().and_then(Slot::live)]
+        self.front
+            .live()
             .into_iter()
-            .flatten()
+            .chain(self.subs.values().filter_map(Slot::live))
             .chain(self.retired.iter().map(|retired| &retired.upstream))
+    }
+
+    /// Marks sub-project `root` as the most recently used.
+    fn touch(&mut self, root: &Path) {
+        if root == self.root {
+            return;
+        }
+        self.lru.retain(|used| used != root);
+        self.lru.push(root.to_path_buf());
+    }
+
+    /// Puts a new sub-project connection in the pool, then retires the least
+    /// recently used ones above [`POOL_CAP`].
+    fn admit(&mut self, upstream: Upstream) {
+        let root = upstream.root.clone();
+        if let Some(Slot::Live(previous)) = self.subs.insert(root.clone(), Slot::Live(upstream)) {
+            self.retire(previous);
+        }
+        self.touch(&root);
+        while self.lru.len() > POOL_CAP {
+            let oldest = self.lru.remove(0);
+            if let Some(Slot::Live(evicted)) = self.subs.remove(&oldest) {
+                self.retire(evicted);
+            }
+        }
+    }
+
+    fn retire(&mut self, upstream: Upstream) {
+        let id = upstream.id;
+        self.retired.push(Retired { upstream });
+        self.release_if_drained(id);
     }
 
     /// Half-closes upstream `id` if it is retired and owes no answers. Its
@@ -314,6 +399,11 @@ enum ClientFrame {
     Initialize,
     Initialized,
     SelectProject(Value),
+    /// `tools/call` of any other tool, with its `project` argument when
+    /// present and not null.
+    Call {
+        project: Option<Value>,
+    },
     ToolsList,
     /// `notifications/cancelled` for the request with this id.
     Cancelled(Value),
@@ -345,7 +435,15 @@ fn classify(frame: &[u8]) -> (ClientFrame, Option<(Value, String)>) {
             let name = message.get("params").and_then(|params| params.get("name")).and_then(Value::as_str);
             match (name, message.get("id")) {
                 (Some(SELECT_PROJECT), Some(id)) => ClientFrame::SelectProject(id.clone()),
-                _ => ClientFrame::Other,
+                _ => {
+                    let project = message
+                        .get("params")
+                        .and_then(|params| params.get("arguments"))
+                        .and_then(|arguments| arguments.get(PROJECT_ARG))
+                        .filter(|project| !project.is_null())
+                        .cloned();
+                    ClientFrame::Call { project }
+                }
             }
         }
         _ => ClientFrame::Other,
@@ -389,7 +487,13 @@ where
         router: Mutex::new(Router {
             root: root.clone(),
             front: Slot::Live(Upstream::new(0, root.clone(), writer, closer)),
-            sub: None,
+            subs: HashMap::new(),
+            lru: Vec::new(),
+            selected: None,
+            selections: Vec::new(),
+            guidance: HashMap::new(),
+            guided: HashSet::new(),
+            folder: None,
             retired: Vec::new(),
             pending: HashMap::new(),
             init_frame: None,
@@ -485,7 +589,9 @@ impl Shared {
     /// Records that upstream `upstream` answered request `id`. Returns the
     /// text items the answer must start with, when it answers a `tools/call`:
     /// [`answered_from`] when `upstream` serves a sub-project, then
-    /// [`restarted`] when it is the first answer since a reconnect.
+    /// [`restarted`] when it is the first answer since a reconnect, then
+    /// [`guidance_line`] when it is the first answer from a sub-project whose
+    /// guidance this session has not delivered.
     fn settle(&self, upstream: u64, id: &Value) -> Vec<String> {
         let mut router = self.lock();
         if !router.pending.get(id).is_some_and(|in_flight| in_flight.upstream == upstream) {
@@ -508,10 +614,15 @@ impl Shared {
         if router.restarted.remove(&upstream) {
             lines.push(restarted(&router.root, &served));
         }
+        if served != router.root && router.guided.insert(served.clone()) {
+            if let Some(guidance) = router.guidance.get(&served) {
+                lines.push(guidance_line(&router.root, &served, guidance));
+            }
+        }
         lines
     }
 
-    fn on_client_frame(self: &Arc<Self>, frame: Vec<u8>) {
+    fn on_client_frame(self: &Arc<Self>, mut frame: Vec<u8>) {
         let (kind, request) = classify(&frame);
         if self.answered_before_session(&kind, request.as_ref()) {
             return;
@@ -525,14 +636,14 @@ impl Shared {
                 ClientFrame::Initialize => {
                     router.init_frame = Some(frame.clone());
                     // This frame is the initialize a reconnect would replay.
-                    self.reach(&mut router, Which::Current, false, request.as_ref())
+                    self.reach(&mut router, &Which::Current, false, request.as_ref())
                 }
                 ClientFrame::Initialized => {
                     router.initialized_frame = Some(frame.clone());
-                    self.reach(&mut router, Which::Current, true, request.as_ref())
+                    self.reach(&mut router, &Which::Current, true, request.as_ref())
                 }
                 ClientFrame::SelectProject(id) => {
-                    let front = self.reach(&mut router, Which::Front, true, request.as_ref());
+                    let front = self.reach(&mut router, &Which::Front, true, request.as_ref());
                     if front.is_some() {
                         // Recorded before the frame is sent, so the answer
                         // can never overtake it.
@@ -549,9 +660,22 @@ impl Shared {
                         cancelled_on = Some(in_flight.upstream);
                         router.upstream(in_flight.upstream).cloned()
                     }
-                    None => router.slot(Which::Current).live().cloned(),
+                    None => router.slot(&Which::Current).and_then(Slot::live).cloned(),
                 },
-                ClientFrame::Other => self.reach(&mut router, Which::Current, true, request.as_ref()),
+                ClientFrame::Call { project: Some(project) } => match self.route(&mut router, &project) {
+                    Ok(which) => {
+                        frame = without_project(&frame);
+                        self.reach(&mut router, &which, true, request.as_ref())
+                    }
+                    Err(text) => self.refuse(request.as_ref(), &text),
+                },
+                ClientFrame::Call { project: None } if router.contested() => {
+                    let text = contested_text(&router);
+                    self.refuse(request.as_ref(), &text)
+                }
+                ClientFrame::Call { project: None } | ClientFrame::Other => {
+                    self.reach(&mut router, &Which::Current, true, request.as_ref())
+                }
             };
             // Recorded before the frame is sent, so the answer can never
             // overtake it.
@@ -571,26 +695,83 @@ impl Shared {
         }
     }
 
-    /// The upstream in slot `which`, reconnecting it first when it is lost
-    /// and the frame is a request. A request that cannot reconnect is
-    /// answered here, and a notification for a lost slot is dropped: both
-    /// return `None`. `replay` says whether the reconnect replays the
-    /// recorded `initialize` (not when the frame is that `initialize`).
+    /// The slot a call's `project` names, or the text the shim answers it
+    /// with. In a folder of projects the name is resolved by probing its
+    /// path; in a single-project session it may only name the root itself.
+    fn route(&self, router: &mut Router, project: &Value) -> Result<Which, String> {
+        let root = router.root.clone();
+        let Some(name) = project.as_str() else {
+            return Err(format!(
+                "g-mesh: \"project\" must be a string: a project's path relative to {}, or an absolute one. \
+                 Nothing was sent.",
+                root.display()
+            ));
+        };
+        let folder = match router.folder {
+            Some(folder) => folder,
+            None => {
+                let folder = (self.daemons.is_folder)(&root);
+                router.folder = Some(folder);
+                folder
+            }
+        };
+        if !folder {
+            if names_root(&root, name) {
+                return Ok(Which::Current);
+            }
+            return Err(format!(
+                "g-mesh: this session serves the single project {root}, and \"project\": \"{name}\" names \
+                 something else. Omit \"project\", or pass {root}. Nothing was sent.",
+                root = root.display()
+            ));
+        }
+        match candidates::resolve(&root, name) {
+            Ok(candidate) => {
+                let abs = candidate.abs_path.canonicalize().unwrap_or(candidate.abs_path);
+                Ok(Which::Project(abs))
+            }
+            Err(reason) => Err(format!(
+                "g-mesh: \"project\": \"{name}\" is not a project under {}: {reason}. Nothing was sent; call \
+                 select_project with no argument to list the projects.",
+                root.display()
+            )),
+        }
+    }
+
+    /// Answers request `request` with `text` instead of forwarding it.
+    /// Returns `None`, the target of a frame sent nowhere.
+    fn refuse(&self, request: Option<&(Value, String)>, text: &str) -> Option<Upstream> {
+        if let Some((id, method)) = request {
+            let _ = self.events.send(Event::Frame(unanswered(id, method, text)));
+        }
+        None
+    }
+
+    /// The upstream in slot `which`, connecting it first when it is lost or
+    /// not in the pool and the frame is a request. A request that cannot
+    /// connect is answered here, and a notification for such a slot is
+    /// dropped: both return `None`. `replay` says whether the connect
+    /// replays the recorded `initialize` (not when the frame is that
+    /// `initialize`).
     fn reach(
         self: &Arc<Self>,
         router: &mut Router,
-        which: Which,
+        which: &Which,
         replay: bool,
         request: Option<&(Value, String)>,
     ) -> Option<Upstream> {
-        if let Some(upstream) = router.slot(which).live() {
-            return Some(upstream.clone());
+        if let Some(upstream) = router.slot(which).and_then(Slot::live).cloned() {
+            router.touch(&upstream.root);
+            return Some(upstream);
         }
         let (id, method) = request?;
-        match self.reconnect(router, which, replay) {
+        // A lost slot is a restart; a project the pool does not hold (never
+        // reached, or evicted) is not.
+        let restart = router.slot(which).is_some();
+        match self.connect(router, which, replay, restart) {
             Ok(upstream) => Some(upstream),
             Err(err) => {
-                let text = unreachable_text(router.slot(which).root(), &err);
+                let text = unreachable_text(router.root_of(which), &err);
                 let _ = self.events.send(Event::Frame(unanswered(id, method, &text)));
                 None
             }
@@ -598,7 +779,7 @@ impl Shared {
     }
 
     /// `tools/list` goes to the front, which lists `select_project`. When the
-    /// front cannot be reached, a selected sub-project's own list is the
+    /// front cannot be reached, the selected sub-project's own list is the
     /// best answer left.
     fn reach_for_tools_list(
         self: &Arc<Self>,
@@ -608,11 +789,12 @@ impl Shared {
         if let Some(front) = router.front.live() {
             return Some(front.clone());
         }
-        let error = match self.reconnect(router, Which::Front, true) {
+        let error = match self.connect(router, &Which::Front, true, true) {
             Ok(front) => return Some(front),
             Err(err) => err,
         };
-        if let Some(sub) = router.sub.as_ref().and_then(Slot::live) {
+        let selected = router.selected.as_ref().and_then(|root| router.subs.get(root));
+        if let Some(sub) = selected.and_then(Slot::live) {
             return Some(sub.clone());
         }
         let (id, method) = request?;
@@ -621,23 +803,40 @@ impl Shared {
         None
     }
 
-    /// Replaces lost slot `which` with a new connection to the daemon serving
-    /// its root. On error the slot stays lost.
-    fn reconnect(self: &Arc<Self>, router: &mut Router, which: Which, replay: bool) -> Result<Upstream> {
-        let root = router.slot(which).root().to_path_buf();
-        let is_front = matches!(which, Which::Front) || router.sub.is_none();
+    /// Opens a new connection for slot `which`: the front's replaces it, a
+    /// sub-project's enters the pool ([`Router::admit`]). `restart` marks it
+    /// as replacing a lost connection, for the [`restarted`] line. On error
+    /// nothing changes.
+    fn connect(
+        self: &Arc<Self>,
+        router: &mut Router,
+        which: &Which,
+        replay: bool,
+        restart: bool,
+    ) -> Result<Upstream> {
+        let root = router.root_of(which).to_path_buf();
+        let is_front = root == router.root;
         let mut link = (self.daemons.connect)(&root)?;
         if replay {
-            self.handshake(router, &mut link)?;
+            let guidance = self.handshake(router, &mut link)?;
+            if !is_front {
+                router.guidance.insert(root.clone(), guidance);
+            }
         }
         let Link { reader, writer, closer } = link;
         let id = router.next_upstream;
         router.next_upstream += 1;
         spawn_reader(self, id, reader, is_front);
         let upstream = Upstream::new(id, root, writer, closer);
-        *router.slot_mut(which) = Slot::Live(upstream.clone());
-        router.restarted.insert(id);
-        eprintln!("g-mesh mcp-shim: reconnected to the daemon serving {}", upstream.root.display());
+        if is_front {
+            router.front = Slot::Live(upstream.clone());
+        } else {
+            router.admit(upstream.clone());
+        }
+        if restart {
+            router.restarted.insert(id);
+            eprintln!("g-mesh mcp-shim: reconnected to the daemon serving {}", upstream.root.display());
+        }
         Ok(upstream)
     }
 
@@ -704,12 +903,13 @@ impl Shared {
         let (text, is_error) = match self.switch(&mut router, &target) {
             Ok((served, guidance)) => (
                 format!(
-                    "g-mesh: this session now serves {served}; file paths are relative to it. Agents \
-                     sharing this connection share this choice, so each tool result from here on starts \
-                     with `g-mesh: answered from project <name>.`; if it names a project other than the \
-                     one you selected, call select_project again before using the result. Guidance for \
-                     this project, as a session started in {served} would receive it:\n\n{guidance}",
-                    served = served.display()
+                    "g-mesh: this session now serves {served}; file paths are relative to it. Calls without \
+                     `project` go here only while this is the only project selected on this connection; \
+                     when other agents share it, pass `project` (e.g. \"{name}\") on every call. Each tool \
+                     result starts with `g-mesh: answered from project <name>.`. Guidance for this project, \
+                     as a session started in {served} would receive it:\n\n{guidance}",
+                    served = served.display(),
+                    name = project_name(&router.root, &served),
                 ),
                 false,
             ),
@@ -740,26 +940,33 @@ impl Shared {
         None
     }
 
-    /// D11 step 3.1-3.5 and 3.7. On error nothing about routing has changed.
+    /// D11 step 3.1-3.5 and 3.7: selects `target`, reusing its pool
+    /// connection when one is live, and records the selection (D3 of
+    /// `docs/adr/0036-per-call-project-routing.md`). On error nothing about
+    /// routing has changed.
     fn switch(self: &Arc<Self>, router: &mut Router, target: &Path) -> Result<(PathBuf, String)> {
         let target = target.canonicalize().with_context(|| format!("cannot resolve {}", target.display()))?;
         if target == router.root || !target.starts_with(&router.root) {
             bail!("{} is not a project below {}", target.display(), router.root.display());
         }
-        let mut link = (self.daemons.connect)(&target)?;
-        let guidance = self.handshake(router, &mut link)?;
-
-        let Link { reader, writer, closer } = link;
-        let id = router.next_upstream;
-        router.next_upstream += 1;
-        spawn_reader(self, id, reader, false);
-        let upstream = Upstream::new(id, target.clone(), writer, closer);
-        if let Some(Slot::Live(previous)) = router.sub.replace(Slot::Live(upstream)) {
-            // Its reader passes the replies it still owes, then ends.
-            let previous_id = previous.id;
-            router.retired.push(Retired { upstream: previous, switched_to: target.clone() });
-            router.release_if_drained(previous_id);
+        let which = Which::Project(target.clone());
+        let live = router.slot(&which).is_some_and(|slot| slot.live().is_some());
+        let guidance = match router.guidance.get(&target) {
+            Some(guidance) if live => {
+                let guidance = guidance.clone();
+                router.touch(&target);
+                guidance
+            }
+            _ => {
+                self.connect(router, &which, true, false)?;
+                router.guidance.get(&target).cloned().unwrap_or_default()
+            }
+        };
+        router.selected = Some(target.clone());
+        if !router.selections.contains(&target) {
+            router.selections.push(target.clone());
         }
+        router.guided.insert(target.clone());
         Ok((target, guidance))
     }
 
@@ -821,14 +1028,14 @@ impl Shared {
                 let _ = self.events.send(Event::Frame(error_result(&pending, &message)));
             }
         }
-        if let Some(Slot::Live(sub)) = &router.sub {
-            if sub.id == id {
-                router.sub = Some(Slot::Lost(sub.root.clone()));
-            }
+        if let Some(slot) = router.subs.values_mut().find(|slot| slot.live().is_some_and(|sub| sub.id == id))
+        {
+            let root = slot.root().to_path_buf();
+            *slot = Slot::Lost(root);
         }
         router.restarted.remove(&id);
-        let switched = router.retired.iter().position(|retired| retired.upstream.id == id);
-        let switched = switched.map(|index| router.retired.remove(index).switched_to);
+        let evicted = router.retired.iter().position(|retired| retired.upstream.id == id);
+        let evicted = evicted.map(|index| router.retired.remove(index)).is_some();
         let owed: Vec<Value> = router
             .pending
             .iter()
@@ -837,13 +1044,15 @@ impl Shared {
             .collect();
         let served = served.unwrap_or_else(|| router.root.clone());
         if !owed.is_empty() {
-            let reason = match (switched, (self.daemons.rebuilding)(&served)) {
-                (Some(switched_to), _) => format!(" (the session had switched to {})", switched_to.display()),
-                (None, Some(rebuild)) => format!(
+            let reason = match (evicted, (self.daemons.rebuilding)(&served)) {
+                (true, _) => format!(
+                    " (the session had closed it to keep at most {POOL_CAP} project connections open)"
+                ),
+                (false, Some(rebuild)) => format!(
                     " (it was stopped for g-mesh {}, pid {}, which is rebuilding its index)",
                     rebuild.command, rebuild.pid
                 ),
-                (None, None) => String::new(),
+                (false, None) => String::new(),
             };
             for request in owed {
                 let Some(in_flight) = router.pending.remove(&request) else { continue };
@@ -863,12 +1072,55 @@ impl Shared {
     }
 }
 
+/// `served`, a project below `root`, relative to it and `/`-separated.
+fn project_name(root: &Path, served: &Path) -> String {
+    let relative = served.strip_prefix(root).unwrap_or(served);
+    let name: Vec<_> = relative.components().map(|part| part.as_os_str().to_string_lossy()).collect();
+    name.join("/")
+}
+
 /// The first text item of a `tools/call` result answered by the daemon
 /// serving `served`, a project below `root`.
 fn answered_from(root: &Path, served: &Path) -> String {
-    let relative = served.strip_prefix(root).unwrap_or(served);
-    let name: Vec<_> = relative.components().map(|part| part.as_os_str().to_string_lossy()).collect();
-    format!("g-mesh: answered from project {}.", name.join("/"))
+    format!("g-mesh: answered from project {}.", project_name(root, served))
+}
+
+/// The text item carrying `served`'s guidance, on the first answer from a
+/// project this session reached only through `project`.
+fn guidance_line(root: &Path, served: &Path, guidance: &str) -> String {
+    format!(
+        "g-mesh: guidance for project {}, given once per session, as a session started in {} would receive \
+         it:\n\n{guidance}",
+        project_name(root, served),
+        served.display()
+    )
+}
+
+/// The shim's answer to a call without `project` once two different
+/// projects were selected on this connection.
+fn contested_text(router: &Router) -> String {
+    let names: Vec<String> = router.selections.iter().map(|root| project_name(&router.root, root)).collect();
+    let example = names.last().cloned().unwrap_or_default();
+    format!(
+        "g-mesh: more than one project was selected on this connection ({}), which other agents may share, so \
+         a call without \"project\" is not answered. Pass \"project\" with the project you mean, e.g. \
+         \"{example}\".",
+        names.join(", then ")
+    )
+}
+
+/// Whether `project` names `root` itself: a rooted path that is `root`, or a
+/// relative one that is empty or `root`'s own directory name.
+fn names_root(root: &Path, project: &str) -> bool {
+    let as_path = Path::new(project);
+    if as_path.has_root() {
+        return relative_to_root(root, as_path).is_some_and(|rel| rel.as_os_str().is_empty());
+    }
+    match segments(project).as_slice() {
+        [] => true,
+        [name] => root.file_name().is_some_and(|own| own.to_string_lossy() == *name),
+        _ => false,
+    }
 }
 
 /// The text item the first `tools/call` result after a reconnect carries:
@@ -930,6 +1182,22 @@ fn stamped(frame: Vec<u8>, lines: &[String]) -> Vec<u8> {
     };
     for (index, line) in lines.iter().enumerate() {
         items.insert(index, json!({ "type": "text", "text": line }));
+    }
+    serde_json::to_vec(&message).expect("a Value always serializes")
+}
+
+/// `frame`, a `tools/call`, without its `project` argument. A frame that
+/// does not parse is returned unchanged.
+fn without_project(frame: &[u8]) -> Vec<u8> {
+    let Ok(mut message) = serde_json::from_slice::<Value>(frame) else {
+        return frame.to_vec();
+    };
+    if let Some(arguments) = message
+        .get_mut("params")
+        .and_then(|params| params.get_mut("arguments"))
+        .and_then(Value::as_object_mut)
+    {
+        arguments.remove(PROJECT_ARG);
     }
     serde_json::to_vec(&message).expect("a Value always serializes")
 }
@@ -996,6 +1264,7 @@ mod tests {
         let daemons = Daemons {
             connect: Box::new(|_| bail!("a single-project session never connects elsewhere")),
             rebuilding: Box::new(|_| None),
+            is_folder: Box::new(|_| false),
         };
         let session = thread::spawn(move || {
             serve(BufReader::new(client_r), out_w, front, PathBuf::from("/nowhere"), daemons)
@@ -1137,7 +1406,7 @@ mod tests {
         }
     }
 
-    /// A session over a folder holding projects `a` and `b`, initialized.
+    /// A session over a folder holding projects `a` to `e`, initialized.
     struct Session {
         root: PathBuf,
         client: io::PipeWriter,
@@ -1176,8 +1445,10 @@ mod tests {
         fn open() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            std::fs::create_dir(root.join("a")).unwrap();
-            std::fs::create_dir(root.join("b")).unwrap();
+            for project in ["a", "b", "c", "d", "e"] {
+                std::fs::create_dir(root.join(project)).unwrap();
+                std::fs::write(root.join(project).join("go.mod"), "").unwrap();
+            }
             let (front_link, front) = Fake::spawn(root.clone());
             let (daemon_tx, daemons) = mpsc::channel();
             let daemon_tx = Mutex::new(daemon_tx);
@@ -1193,6 +1464,7 @@ mod tests {
                     Ok(link)
                 }),
                 rebuilding: Box::new(move |path| rebuild_of(&probed, path)),
+                is_folder: Box::new(|_| true),
             };
             let (client_r, client) = io::pipe().unwrap();
             let (out_r, out_w) = io::pipe().unwrap();
@@ -1231,6 +1503,16 @@ mod tests {
                 "id": id,
                 "method": "tools/call",
                 "params": { "name": "find_references", "arguments": {} },
+            }));
+        }
+
+        /// A call that names its project.
+        fn call_in(&mut self, id: u64, project: &str) {
+            self.send(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": "find_references", "arguments": { "project": project } },
             }));
         }
 
@@ -1288,13 +1570,11 @@ mod tests {
         }
     }
 
-    /// Re-selecting the project already served is a full switch: a second
-    /// connection, while the first stays open for the call in flight on it,
-    /// whose late answer reaches the client.
+    /// Re-selecting the project already served reuses its live connection:
+    /// the call in flight on it is answered, nothing new connects, and the
+    /// session is not contested.
     ///
-    /// Control: restore `previous.close(Shutdown::Write)` at the switch and
-    /// drop the pending-id tracking: the first connection is half-closed at
-    /// once, and id 7's answer never arrives within 2 s.
+    /// Control: make `switch` always connect: a second daemon connects.
     #[test]
     fn reselecting_the_served_project_keeps_a_call_in_flight() {
         let mut session = Session::start();
@@ -1304,25 +1584,23 @@ mod tests {
         assert_eq!(first.expect("tools/call")["id"], 7);
 
         session.select(2, "a");
-        let second = session.daemon();
-        assert_eq!(second.root, first.root, "a reselect reconnects to the same project");
-        assert!(first.closes().is_empty(), "the first connection still owes 7");
+        assert!(session.daemons.try_recv().is_err(), "a reselect reuses the live connection");
+        assert!(first.closes().is_empty(), "the connection still owes 7");
 
         first.answer(7);
         let answer = session.recv();
         assert_eq!(answer["id"], 7, "{answer}");
         assert!(answer["result"]["isError"].is_null(), "{answer}");
-        assert_eq!(first.closes(), vec![Shutdown::Write], "closed once it owes nothing");
+        session.call(8);
+        assert_eq!(first.expect("tools/call")["id"], 8, "one project selected twice is not contested");
     }
 
-    /// A switch keeps the previous project's connection open while it owes
-    /// answers, passes its late answers through, and when that connection
-    /// ends with one still owed, the shim answers it with an error naming
-    /// the switch.
+    /// A switch keeps the previous project's connection open in the pool,
+    /// passes its late answers through, and when that connection ends with
+    /// one still owed, the shim answers it with an error.
     ///
-    /// Control: restore `previous.close(Shutdown::Write)` at the switch and
-    /// drop the pending-id tracking: the old connection is half-closed at
-    /// once, and id 8 gets no answer within 2 s.
+    /// Control: close the previous connection at the switch and drop the
+    /// pending-id tracking: id 7's answer never arrives within 2 s.
     #[test]
     fn a_switch_never_drops_a_call_in_flight() {
         let mut session = Session::start();
@@ -1343,8 +1621,8 @@ mod tests {
         assert!(answer["result"]["content"][1]["text"].as_str().unwrap().contains("answer from"), "{answer}");
         assert!(a.closes().is_empty(), "a still owes 8");
 
-        session.call(9);
-        assert_eq!(b.expect("tools/call")["id"], 9, "calls after the switch go to b");
+        session.call_in(9, "b");
+        assert_eq!(b.expect("tools/call")["id"], 9, "a call naming b goes to b");
 
         a.hang_up();
         let answer = session.recv();
@@ -1352,7 +1630,6 @@ mod tests {
         assert_eq!(answer["result"]["isError"], true, "{answer}");
         let text = answer["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains(&format!("the daemon serving {} ended", a.root.display())), "{text}");
-        assert!(text.contains(&format!("(the session had switched to {})", b.root.display())), "{text}");
         assert!(text.contains("call the tool again"), "{text}");
     }
 
@@ -1362,17 +1639,15 @@ mod tests {
         answer["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("no text item: {answer}"))
     }
 
-    /// Two agents sharing one client connection share one selection: agent
-    /// A selects `a`, agent B selects `b`, and A's next call is routed to
-    /// `b`. The answer says so in its first text item, so A can tell and
-    /// re-select. The JSON-RPC ids are the only thing telling the two agents
-    /// apart here, exactly as on a real shared connection.
+    /// Two agents sharing one client connection: agent A selects `a`, agent
+    /// B selects `b`, and A's next call without `project` is refused, naming
+    /// both selections, instead of being answered from `b`. The JSON-RPC ids
+    /// are the only thing telling the two agents apart here, exactly as on a
+    /// real shared connection.
     ///
-    /// Control: make `settle` return `None` always: id 11's first text item
-    /// is `b`'s own answer, and the `answered from project b.` assertion
-    /// fails.
+    /// Control: never treat the session as contested: id 11 reaches `b`.
     #[test]
-    fn another_agents_select_is_named_in_this_agents_answer() {
+    fn another_agents_select_contests_this_agents_calls() {
         let mut session = Session::start();
         // Agent A.
         session.select(1, "a");
@@ -1386,18 +1661,18 @@ mod tests {
 
         // Agent B, on the same connection.
         let selected = session.select(2, "b");
-        assert!(selected.contains("call select_project again"), "{selected}");
+        assert!(selected.contains("pass `project` (e.g. \"b\") on every call"), "{selected}");
         let b = session.daemon();
 
-        // Agent A again: its call goes to b, and the answer says so.
+        // Agent A again: its call names no project, so it is refused.
         session.call(11);
-        assert_eq!(b.expect("tools/call")["id"], 11);
-        b.answer(11);
         let answer = session.recv();
         assert_eq!(answer["id"], 11, "{answer}");
-        assert_eq!(first_text(&answer), "g-mesh: answered from project b.", "{answer}");
-        let served = answer["result"]["content"][1]["text"].as_str().unwrap();
-        assert_eq!(served, format!("answer from {}", b.root.display()), "the answer itself is untouched");
+        assert_eq!(answer["result"]["isError"], true, "{answer}");
+        assert!(first_text(&answer).contains("(a, then b)"), "{answer}");
+        thread::sleep(Duration::from_millis(300));
+        let on_b: Vec<Value> = b.got.try_iter().filter(|message| message["method"] == "tools/call").collect();
+        assert!(on_b.is_empty(), "a refused call reached b: {on_b:?}");
     }
 
     /// The stamp names the daemon a call was sent to, not the selection when
@@ -1494,12 +1769,12 @@ mod tests {
         assert_eq!(session.recv(), error);
     }
 
-    /// A previous project's connection is half-closed once it owes nothing:
-    /// a cancelled call is no longer owed, and its cancel goes to the daemon
-    /// the call went to.
+    /// A connection evicted from the pool is half-closed once it owes
+    /// nothing: a cancelled call is no longer owed, and its cancel goes to
+    /// the daemon the call went to.
     ///
     /// Control: route `notifications/cancelled` to the current upstream and
-    /// keep the cancelled id pending: the cancel reaches `b`, and `a` is
+    /// keep the cancelled id pending: the cancel reaches `e`, and `a` is
     /// never closed.
     #[test]
     fn a_retired_connection_closes_once_it_owes_nothing() {
@@ -1510,8 +1785,12 @@ mod tests {
         session.call(8);
         assert_eq!(a.expect("tools/call")["id"], 7);
         assert_eq!(a.expect("tools/call")["id"], 8);
-        session.select(2, "b");
-        let b = session.daemon();
+        let mut others = Vec::new();
+        for (id, project) in [(2, "b"), (3, "c"), (4, "d"), (5, "e")] {
+            session.select(id, project);
+            others.push(session.daemon());
+        }
+        let b = &others[0];
 
         session.send(json!({
             "jsonrpc": "2.0",

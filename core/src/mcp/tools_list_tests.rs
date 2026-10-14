@@ -33,14 +33,25 @@ fn the_tools_list_fits_its_ceiling() {
     );
 }
 
-/// A project daemon lists a subset of the front's tools, so the front's
-/// ceiling bounds it too.
+/// The front's tool with the `project` property it adds removed.
+fn without_project(mut tool: Tool) -> Tool {
+    let mut schema = (*tool.input_schema).clone();
+    if let Some(properties) = schema.get_mut("properties").and_then(|value| value.as_object_mut()) {
+        properties.remove(front::PROJECT_ARG);
+    }
+    tool.input_schema = std::sync::Arc::new(schema);
+    tool
+}
+
+/// A project daemon lists a subset of the front's tools, modulo the
+/// `project` property the front adds to each, so the front's ceiling bounds
+/// it too.
 #[test]
 fn a_project_daemon_lists_a_subset_of_the_front() {
     let daemon = GMeshMcpServer::tool_router().list_all();
-    let front = front::listed_tools();
+    let front: Vec<Tool> = front::listed_tools().into_iter().map(without_project).collect();
     for tool in &daemon {
         assert!(front.contains(tool), "{} is listed by a project daemon but not by a front", tool.name);
     }
-    assert!(serialized_len(daemon) < serialized_len(front));
+    assert!(serialized_len(daemon) < serialized_len(front::listed_tools()));
 }

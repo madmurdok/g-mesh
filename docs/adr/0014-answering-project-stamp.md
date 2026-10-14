@@ -72,3 +72,10 @@ flight across a switch names the project that really served it.
   last text item.
 - A hard guarantee (a `project` argument required in multi-project sessions)
   remains possible later and combines with this.
+- Amended by [ADR 0036](0036-per-call-project-routing.md): a call may name
+  its project, and once two different projects were selected on a
+  connection a call that does not is refused rather than misrouted. The
+  stamp stays: it names the project a `project`-routed call was answered
+  from too. The `select_project` result no longer says to call
+  `select_project` again; it says to pass `project` when other agents share
+  the connection.

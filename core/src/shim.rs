@@ -15,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use crate::cli::stop;
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
+use crate::daemon::candidates;
 use crate::ipc;
 use crate::process;
 use crate::storage::connection::{ensure_project_dir, ensure_project_dir_under};
@@ -127,6 +128,9 @@ pub fn run() -> Result<()> {
         router::Daemons {
             connect: Box::new(move |root: &Path| link(connect_or_bootstrap(root, &origin)?)),
             rebuilding: Box::new(rebuilding),
+            is_folder: Box::new(|root: &Path| {
+                candidates::detect(root, candidates::Limits::default()).mode == candidates::Mode::Multi
+            }),
         },
     )
 }

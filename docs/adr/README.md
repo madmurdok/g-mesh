@@ -106,3 +106,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0033 | [Semantic tiers reach no network and write nothing under the project root](0033-semantic-tiers-reach-no-network-and-write-nothing.md) | Accepted |
 | 0034 | [Semantic exact answers of CALLS and REFERENCES bypass the linker's visibility check](0034-semantic-answers-bypass-visibility.md) | Accepted |
 | 0035 | [Engine CALLS answers link to functions, variables and types; the bridge drops enclosing-node landings](0035-engine-calls-answers-kind-rule.md) | Accepted |
+| 0036 | [A call names its project; a contested selection refuses calls that do not](0036-per-call-project-routing.md) | Accepted |
