@@ -1557,6 +1557,22 @@ pub fn semantic_pending_files_among(
     Ok(pending)
 }
 
+/// Records `file_paths` of `language` as semantic-pending files: reparsed
+/// structurally, their semantic edges not refreshed yet. A complete per-file
+/// pass over them clears the rows ([`clear_semantic_pending_files`]).
+pub fn record_semantic_pending_files(conn: &Connection, language: &str, file_paths: &[String]) -> Result<()> {
+    in_savepoint(conn, || {
+        for path in file_paths {
+            conn.execute(
+                "INSERT OR IGNORE INTO semantic_pending_files (language, filePath) VALUES (?1, ?2)",
+                params![language, path],
+            )
+            .with_context(|| format!("failed to record the semantic-pending file {path}"))?;
+        }
+        Ok(())
+    })
+}
+
 /// Deletes the semantic-pending file rows of `file_paths`, whatever their
 /// language (a file belongs to one), after a complete per-file semantic pass
 /// over them. The language rows stay: a per-file pass does not re-resolve
@@ -2013,6 +2029,20 @@ pub fn record_seed_reconciled(conn: &Connection) -> Result<()> {
     conn.execute("UPDATE seed_origin SET reconciledAt = CURRENT_TIMESTAMP WHERE id = 1", [])
         .context("failed to record that the seed was reconciled")?;
     Ok(())
+}
+
+/// When the seed's first-start reconcile finished, in Unix seconds; `None`
+/// for an index that is not a seed or whose reconcile has not finished.
+pub fn seed_reconciled_at_unix(conn: &Connection) -> Result<Option<i64>> {
+    let recorded: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT CAST(strftime('%s', reconciledAt) AS INTEGER) FROM seed_origin WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read seed_origin.reconciledAt")?;
+    Ok(recorded.flatten())
 }
 
 fn record_version(conn: &Connection, indexer_version: &str) -> Result<()> {

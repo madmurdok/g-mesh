@@ -334,6 +334,45 @@ Read for context (not edited): `connection::open` (`connection.rs:119-132`),
 - The temp copy's `seed_origin` row is written with the copy's own
   connection (foreign keys off, as `connection::open` sets).
 
+## Must-confirm: answers from the code slice
+
+- Gate: a seeded start begins at `Walking` (`ColdCause::Seeded`) with
+  `needs_walk = false`. `request_activation` changes the phase only from
+  `Unindexed`/`Failed`, and `activate` walks only when `needs_walk`, so
+  neither starts a walk. The consumer holds a `seed::SeedGate`; opening it
+  (or dropping it, on a panic) moves `Walking` to `Structural`. `activate`
+  waits on the gate's receiver before it sets `Embedding`, so the phase
+  never skips past or returns to `Structural`. When a semantic or
+  failed-language retry is owed, the gate travels in `ActivationCtx` to the
+  consumer `activate` starts; the gate then opens after those retries (tool
+  calls wait for them too).
+- Deletions: a seeded deletion is never routed. Every live file the worktree
+  does not walk (on disk or not) is retired by
+  `PluginRegistry::retire_file`: an empty diff applied with
+  `FileScope::Gone` (nodes, outgoing edges, baseline, semantic rows), no
+  plugin, so no reparse of an ignored file and no language-server start for
+  a deleted one.
+- Pending rows: `record_semantic_pending_files` writes rows for the reparsed
+  files of semantic-capable, unsuspended languages; the scoped pass clears
+  the requested files' rows when it completes without a list, the settled
+  ones when it names `unfinishedFiles` (the rest become owed), and none when
+  it is incomplete without a list or fails. Those rows speak (`staleFiles`)
+  only while the language's semantic pass is not done; a later start's
+  `remove_stale_semantic_pending` clears them for a done language.
+- Read-only source: a `SQLITE_OPEN_READ_ONLY` connection cannot open a WAL
+  database with no `-wal` (a cleanly exited main daemon), checked with SQLite
+  3.51: "unable to open database file". The source is opened
+  `SQLITE_OPEN_READ_WRITE` without `CREATE`; it only reads. With `-wal`
+  present and `-shm` missing, both modes read the WAL-only rows.
+- The copy's `seed_origin` row is written on the copy's own connection after
+  `PRAGMA foreign_keys = OFF` (`seed_from`).
+- D7's lockfile claim does not hold: the reconcile walks only files a
+  language indexes, so a `watch_files` file that differs between branches is
+  not routed at start (plain and seeded alike); its next edit is.
+- After the seeded start, `recheck_gitignores_since_index` takes the later of
+  `bulkIndexedAt` and `seed_origin.reconciledAt`, so the second (plain) start
+  does not re-check every fresh `.gitignore`.
+
 ## Behaviours the tests must pin
 
 Unit (`core/src/daemon/seed.rs` tests, temp dirs, a real `git worktree add`

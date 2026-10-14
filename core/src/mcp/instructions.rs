@@ -51,6 +51,9 @@ fn cold_start_line(root: &Path, walking: bool, cause: ColdCause) -> String {
 /// runs: by then the wait is the same whatever owed it.
 fn cold_start_line_fallback(walking: bool, cause: ColdCause) -> String {
     let state = match (walking, cause) {
+        (_, ColdCause::Seeded) => {
+            "Copied from the main checkout, reconciling with this worktree - the first tool call waits for it"
+        }
         (true, _) => "Being built now - the first tool call waits for it to finish before answering",
         (false, ColdCause::Fresh) => {
             "Not indexed yet - the first tool call builds it (structural first; semantic search after) and \

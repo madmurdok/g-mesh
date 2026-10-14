@@ -165,6 +165,8 @@ impl Fixture {
             needs_semantic_pass_retry,
             retry_languages,
             watcher,
+            seed_gate: None,
+            seed_reconciled: None,
         };
         Start { ctx, registry }
     }

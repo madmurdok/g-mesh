@@ -631,6 +631,28 @@ is no rescan on start, so such a file is only picked up the next time it
 changes with a daemon up — or by deleting the project's state directory (see
 below) to force a fresh full walk.
 
+### A linked `git worktree`: seeded from the main checkout
+
+A linked worktree (`git worktree add`) gets an index of its own. When it has
+none yet and the main working tree has a complete index built by the same
+g-mesh and plugin builds, the daemon copies that index (SQLite online backup,
+about a second for 110 MB) instead of walking. Its first start then
+reconciles the copy with the worktree: every walked file is hashed, the ones
+that differ are reparsed, and files the main checkout indexed that the
+worktree does not walk are dropped. Tool calls wait for that (seconds,
+proportional to the files hashed and reparsed), not for a cold walk; the
+semantic refresh of the reparsed files runs right after, in the background.
+The log says `index seeded from <main checkout>`; `G_MESH_SEED=0` turns
+seeding off (a cold walk, as before).
+
+One difference from a cold index remains until the worktree has its own
+dependencies: edges the main checkout's language servers resolved into
+gitignored inputs (`node_modules`, a virtualenv, build output) are copied
+too, so before `npm ci` or a build the seeded worktree answers as if those
+were installed, where a cold index would leave them unresolved. A lockfile or
+manifest that differs between the branches is not reconciled at start
+either; its next edit with the daemon up reindexes the language.
+
 ## Idle behaviour
 
 The daemon is two processes with very different costs, and each has its own

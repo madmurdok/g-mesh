@@ -389,6 +389,20 @@ pub fn run(root: &Path) -> Result<()> {
             Vec::new()
         })
     };
+    // A seed copied before this open (or by a start that died before its
+    // reconcile finished) is served only after that reconcile.
+    let seeded = !needs_bulk_index
+        && schema::seed_pending(&conn).unwrap_or_else(|err| {
+            crate::log_line!(
+                "g-mesh daemon: could not read whether the index is an unreconciled seed: {err:#}"
+            );
+            false
+        });
+    if seeded {
+        crate::log_line!(
+            "g-mesh daemon: the index is a seed - reconciling it with this worktree before tool calls answer"
+        );
+    }
     let conn =
         Arc::new(IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())));
 
@@ -416,10 +430,13 @@ pub fn run(root: &Path) -> Result<()> {
     write_pid_file(&pid_file, std::process::id());
 
     // Unwalked: `Unindexed` until the first index-needing tool call; walked:
-    // `Structural` (the embedding backfill is still owed). The phase file is
+    // `Structural` (the embedding backfill is still owed); an unreconciled
+    // seed: `Walking` until its reconcile opens the gate. The phase file is
     // published next to the pid file, before its absence could mean anything.
     let indexing = if needs_bulk_index {
         IndexingStatus::unindexed_because(cold_cause)
+    } else if seeded {
+        IndexingStatus::walking_because(ColdCause::Seeded)
     } else {
         IndexingStatus::structural()
     };
@@ -492,6 +509,14 @@ pub fn run(root: &Path) -> Result<()> {
     // so that no edit of it routes while it is still failed (activation
     // starts the consumer after those).
     // A watcher failure here is fatal: this is startup, with no session to lose.
+    // A seeded start's gate goes with the watcher to whoever starts its
+    // consumer; the activation waits on `seed_reconciled` before its backfill.
+    let (mut seed_gate, seed_reconciled) = if seeded {
+        let (gate, reconciled) = seed::SeedGate::new(indexing.clone());
+        (Some(gate), Some(reconciled))
+    } else {
+        (None, None)
+    };
     let pending_watcher = if needs_bulk_index {
         None
     } else {
@@ -499,12 +524,16 @@ pub fn run(root: &Path) -> Result<()> {
         if needs_semantic_pass_retry || !retry_languages.is_empty() {
             Some(watcher)
         } else {
+            let start = match seed_gate.take() {
+                Some(gate) => ConsumerStart::Seeded(gate),
+                None => ConsumerStart::Reconcile,
+            };
             spawn_watch_consumer(
                 watcher,
                 Arc::clone(&conn),
                 Arc::clone(&registry),
                 canonical_root.clone(),
-                true,
+                start,
             );
             None
         }
@@ -525,6 +554,8 @@ pub fn run(root: &Path) -> Result<()> {
             needs_semantic_pass_retry,
             retry_languages,
             watcher: pending_watcher,
+            seed_gate,
+            seed_reconciled,
         },
         activation_trigger,
     )?;
@@ -564,26 +595,54 @@ fn stand_down(root: &Path) -> Result<()> {
     }
 }
 
+/// What the watcher's consumer does before its first batch.
+pub(crate) enum ConsumerStart {
+    /// The index was walked in this process: only the `.gitignore` re-check.
+    AfterWalk,
+    /// The index may predate the files on disk (no walk in this process):
+    /// the `.gitignore` re-check, then the plain reconcile.
+    Reconcile,
+    /// The index is an unreconciled seed (`daemon::seed`): the seeded
+    /// reconcile, no `.gitignore` re-check (every `.gitignore` of a fresh
+    /// checkout is newer than the copied walk), then the gate opens, the seed
+    /// is stamped reconciled, and the deferred semantic passes run.
+    Seeded(seed::SeedGate),
+}
+
 /// Starts the watcher's consumer thread, once no structural walk or
-/// whole-project semantic pass can still race it. `reconcile`: whether the
-/// index may predate the files on disk (no walk in this process), so the
-/// thread first reconciles it with them.
+/// whole-project semantic pass can still race it; `start` says what it does
+/// before its first batch.
 fn spawn_watch_consumer(
     watcher: ProjectWatcher,
     conn: Arc<IndexStore>,
     registry: Arc<PluginRegistry>,
     root: PathBuf,
-    reconcile: bool,
+    start: ConsumerStart,
 ) {
     thread::spawn(move || {
-        // GM-508, Q3: `.gitignore` edits made while no daemon watched. On
-        // this thread, before the first batch, as an in-session edit would
+        // On this thread, before the first batch, as an in-session edit would
         // be; events meanwhile queue in the watcher's channel.
-        registry.recheck_gitignores_since_index(&conn);
-        // Every other file changed while no daemon watched, likewise before
-        // the first batch.
-        if reconcile {
-            registry.reconcile_since_index(&conn);
+        match start {
+            ConsumerStart::AfterWalk => registry.recheck_gitignores_since_index(&conn),
+            ConsumerStart::Reconcile => {
+                // `.gitignore` edits made while no daemon watched, then every
+                // other file changed meanwhile.
+                registry.recheck_gitignores_since_index(&conn);
+                registry.reconcile_since_index(&conn, registry::ReconcileMode::Plain);
+            }
+            ConsumerStart::Seeded(gate) => {
+                let reparsed = registry.reconcile_since_index(&conn, registry::ReconcileMode::Seeded);
+                gate.open();
+                // After the gate: a daemon killed before this line repeats
+                // the seeded reconcile, which finds the files fresh.
+                if let Err(err) = conn.with(schema::record_seed_reconciled) {
+                    crate::log_line!(
+                        "g-mesh daemon: could not record that the seeded index was reconciled - the next start \
+                         reconciles it again: {err:#}"
+                    );
+                }
+                registry.seeded_semantic_passes(&conn, reparsed);
+            }
         }
         let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
         loop {

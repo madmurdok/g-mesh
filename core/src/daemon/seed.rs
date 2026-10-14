@@ -7,32 +7,34 @@
 //! records where it came from (`seed_origin`), and renames it into place
 //! before `connection::open` runs. Every failure means "no seed": the daemon
 //! then cold-walks as it always did.
+//!
+//! A seeded index's first start (`schema::seed_pending`) begins at phase
+//! `Walking` and reconciles the copy with this worktree's files on the
+//! watcher's consumer thread (`registry::ReconcileMode::Seeded`); the
+//! [`SeedGate`] it holds moves the phase to `Structural` once the reparse is
+//! done, so no tool call answers from the main checkout's content.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{Connection, OpenFlags};
 
+use crate::daemon::indexing_status::{IndexingStatus, Phase};
 use crate::storage::{connection, schema, vectors};
 
 /// The temp file a seed is copied into before its rename to `index.db`.
 const SEED_TMP: &str = "index.db.seed-tmp";
 
-/// Environment switch: `0` disables seeding, `1` enables it even while
-/// [`SEEDED_RECONCILE_READY`] is false.
+/// Environment switch: `0` disables seeding (also the opt-out for a user),
+/// `1` enables it even when [`SEEDING_DEFAULT`] is off.
 pub const SEED_ENV: &str = "G_MESH_SEED";
 
-/// HOOK POINT (GM-564 D4/D5, next slice): whether the seeded first-start
-/// reconcile exists. Until it does, a seeded index would go through the plain
-/// reconcile, which keeps files ignored in the worktree but indexed in main,
-/// may reindex whole languages on the fresh `.gitignore` mtimes, and answers
-/// tool calls with main's content before reconciling. So seeding is off by
-/// default and only `G_MESH_SEED=1` turns it on. The slice that adds the
-/// seeded reconcile (driven by `schema::seed_pending`) flips this to `true`.
-const SEEDED_RECONCILE_READY: bool = false;
+/// Whether a daemon seeds without [`SEED_ENV`] set.
+const SEEDING_DEFAULT: bool = true;
 
 /// Where a seeded index came from, for the start log line.
 #[derive(Debug, Clone)]
@@ -42,12 +44,51 @@ pub struct SeedOrigin {
 }
 
 /// Whether seeding is switched on, from `G_MESH_SEED` and
-/// [`SEEDED_RECONCILE_READY`].
+/// [`SEEDING_DEFAULT`].
 fn seed_enabled() -> bool {
     match std::env::var(SEED_ENV).ok().as_deref().map(str::trim) {
         Some("0") => false,
         Some("1") => true,
-        _ => SEEDED_RECONCILE_READY,
+        _ => SEEDING_DEFAULT,
+    }
+}
+
+/// Held by whoever runs a seeded index's first-start reconcile; while it is
+/// held the phase stays `Walking`, so tool calls wait on `Need::Structural`.
+/// [`open`](Self::open) (or a drop, a panicking reconcile included) moves a
+/// `Walking` phase to `Structural` and tells the activation, which must not
+/// move the phase on to `Embedding` before that.
+pub(crate) struct SeedGate {
+    indexing: IndexingStatus,
+    reconciled: Option<mpsc::Sender<()>>,
+}
+
+impl SeedGate {
+    /// A closed gate over `indexing`, and the receiver the activation waits
+    /// on before its embedding backfill.
+    pub(crate) fn new(indexing: IndexingStatus) -> (Self, mpsc::Receiver<()>) {
+        let (reconciled, wait) = mpsc::channel();
+        (Self { indexing, reconciled: Some(reconciled) }, wait)
+    }
+
+    /// Opens the gate: the seeded index now reflects this worktree's files.
+    pub(crate) fn open(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        let Some(reconciled) = self.reconciled.take() else { return };
+        // Only from `Walking`: the phase never moves backwards.
+        if self.indexing.phase() == Phase::Walking {
+            self.indexing.set_phase(Phase::Structural);
+        }
+        let _ = reconciled.send(());
+    }
+}
+
+impl Drop for SeedGate {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -195,11 +236,14 @@ fn seed_from(
 ) -> Result<Option<SeedOrigin>> {
     vectors::register_extension();
     let started = Instant::now();
+    // Read-write without create, though it only reads: a read-only
+    // connection cannot open a WAL database whose `-wal` is absent, which is
+    // the state a main daemon's clean exit leaves.
     let source = Connection::open_with_flags(
         source_db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
     )
-    .with_context(|| format!("failed to open {} read-only", source_db.display()))?;
+    .with_context(|| format!("failed to open {}", source_db.display()))?;
     source.busy_timeout(Duration::from_secs(5)).context("failed to set a busy timeout")?;
     // Checked before copying, so a mismatch never costs a copy.
     if let Err(reason) = check_source(&source, indexer_version) {
