@@ -110,7 +110,7 @@ impl Folder {
 
 impl Drop for Folder {
     fn drop(&mut self) {
-        for dir in [self.root().to_path_buf(), self.sub("a"), self.sub("b"), self.sub("c")] {
+        for dir in [self.root().to_path_buf(), self.sub("a"), self.sub("b"), self.sub("c"), self.sub("d")] {
             let Ok(state) = project_dir(&dir) else { continue };
             // `a_failed_switch_leaves_the_session_on_the_front` makes one
             // unreadable; give it back before looking inside.
@@ -681,4 +681,80 @@ async fn reindexing_one_project_leaves_the_front_and_other_projects_alone() {
 
     client.cancel().await.expect("failed to shut the client down");
     other.cancel().await.expect("failed to shut the client down");
+}
+
+// ---- GM-571: per-call `project` and projects created after the start ----
+
+/// T7 (D6): a project created after the session started is reachable by a
+/// call's `project` without any select (the shim probes its path), and its
+/// first answer is stamped and carries its guidance once; `select_project`
+/// finds it too.
+///
+/// Control C7: make `Front::select_project` resolve against a walk taken
+/// once in `Front::new`: selecting `d` fails as unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_created_after_the_session_started_is_selectable_and_routable() {
+    let folder = Folder::new();
+    let client = folder.connect(None).await;
+    let d = folder.sub("d");
+    std::fs::create_dir_all(d.join(".git")).unwrap();
+    std::fs::write(d.join("d.ts"), "export const d = 4;\n").unwrap();
+
+    let outline = call(&client, "get_file_outline", json!({ "file_path": "d.ts", "project": "d" })).await;
+    assert_eq!(outline_names(&outline), Some(vec!["d".to_string()]), "{}", text_of(&outline));
+    let texts = texts_of(&outline);
+    assert_eq!(texts.first(), Some(&"g-mesh: answered from project d."), "{}", text_of(&outline));
+    assert!(
+        texts
+            .get(1)
+            .is_some_and(|text| text.starts_with("g-mesh: guidance for project d, given once per session")),
+        "{}",
+        text_of(&outline)
+    );
+
+    guidance_of(&select(&client, "d").await, &d);
+    let outline = call(&client, "get_file_outline", json!({ "file_path": "d.ts" })).await;
+    assert_eq!(outline_names(&outline), Some(vec!["d".to_string()]), "{}", text_of(&outline));
+    assert_eq!(
+        texts_of(&outline).len(),
+        2,
+        "a stamp and the outline, no second guidance: {}",
+        text_of(&outline)
+    );
+
+    client.cancel().await.expect("failed to shut the client down");
+}
+
+/// T8 (D7): the front builds its instructions per connection. A project
+/// created while the front runs is listed to the next session, one deleted
+/// drops out again, and the text says the list is a snapshot.
+///
+/// Control C8: build the instructions once in `Front::new` and hand every
+/// connection that text: session 2 still lists only a, b, c.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_connection_lists_a_project_created_after_the_front_started() {
+    let folder = Folder::new();
+    let instructions_of = |client: &RunningService<RoleClient, ()>| {
+        client.peer_info().and_then(|info| info.instructions.clone()).expect("front instructions")
+    };
+    let first = folder.connect(None).await;
+    let pid = std::fs::read_to_string(folder.pid_file()).expect("the front's pid file");
+    assert!(instructions_of(&first).ends_with("Projects: a, b, c."), "{}", instructions_of(&first));
+
+    std::fs::create_dir_all(folder.sub("e").join(".git")).unwrap();
+    let second = folder.connect(None).await;
+    assert_eq!(std::fs::read_to_string(folder.pid_file()).ok(), Some(pid.clone()), "the same front answers");
+    let instructions = instructions_of(&second);
+    assert!(instructions.contains("is a folder of 4 projects"), "{instructions}");
+    assert!(instructions.ends_with("Projects: a, b, c, e."), "{instructions}");
+    assert!(instructions.contains("The list is a snapshot as of session start"), "{instructions}");
+
+    std::fs::remove_dir_all(folder.sub("e")).unwrap();
+    let third = folder.connect(None).await;
+    assert_eq!(std::fs::read_to_string(folder.pid_file()).ok(), Some(pid), "the same front answers");
+    assert!(instructions_of(&third).ends_with("Projects: a, b, c."), "{}", instructions_of(&third));
+
+    for client in [third, second, first] {
+        client.cancel().await.expect("failed to shut a client down");
+    }
 }

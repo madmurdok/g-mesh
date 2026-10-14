@@ -1443,6 +1443,19 @@ mod tests {
 
         /// A session the client has not initialized yet.
         fn open() -> Self {
+            Self::open_as(true)
+        }
+
+        /// A single-project session (the root is not a folder of projects),
+        /// initialized. Its "front" fake is the root's own daemon.
+        fn start_single() -> Self {
+            let mut session = Self::open_as(false);
+            session.initialize();
+            session
+        }
+
+        /// A session whose folder probe answers `folder`.
+        fn open_as(folder: bool) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
             for project in ["a", "b", "c", "d", "e"] {
@@ -1464,7 +1477,7 @@ mod tests {
                     Ok(link)
                 }),
                 rebuilding: Box::new(move |path| rebuild_of(&probed, path)),
-                is_folder: Box::new(|_| true),
+                is_folder: Box::new(move |_| folder),
             };
             let (client_r, client) = io::pipe().unwrap();
             let (out_r, out_w) = io::pipe().unwrap();
@@ -2064,5 +2077,283 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         handle.join().unwrap().expect("the session must end cleanly");
+    }
+
+    // ---- GM-571: per-call `project` routing (T1-T5 of the design note) ----
+
+    /// The next `tools/call` `daemon` received must be `id`. The client loop
+    /// forwards frames in the order it reads them, so a call refused or
+    /// routed elsewhere before `id` can never come after it.
+    fn next_call_is(daemon: &Fake, id: u64) -> Value {
+        let call = daemon.expect("tools/call");
+        assert_eq!(call["id"], id, "{call}");
+        call
+    }
+
+    /// T1 (D1, D4): with `a` selected and a call in flight on it, a call
+    /// naming `b` reaches `b`'s daemon without its `project` argument, is
+    /// stamped `b` and carries `b`'s guidance once, after the stamp and
+    /// before the tool's own items. The call on `a` is still answered by
+    /// `a`, the selection is unchanged, and `b`'s next answer carries no
+    /// guidance.
+    ///
+    /// Control C1: in `classify`, never read `project` (`Call { project:
+    /// None }`): id 8 goes to `a`, no daemon for `b` connects. D4 control:
+    /// drop the guidance push in `settle`: id 8 has two text items.
+    #[test]
+    fn a_call_with_project_is_answered_by_that_project_whatever_is_selected() {
+        let mut session = Session::start();
+        session.select(1, "a");
+        let a = session.daemon();
+        session.call(7);
+        next_call_is(&a, 7);
+
+        session.call_in(8, "b");
+        let b = session.daemon();
+        assert_eq!(b.root, session.root.join("b"));
+        let forwarded = next_call_is(&b, 8);
+        assert_eq!(forwarded["params"]["arguments"], json!({}), "the shim strips `project`: {forwarded}");
+        assert_eq!(forwarded["params"]["name"], "find_references", "{forwarded}");
+
+        b.answer(8);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 8, "{answer}");
+        let b_root = b.root.display().to_string();
+        assert_eq!(
+            texts(&answer),
+            [
+                "g-mesh: answered from project b.".to_string(),
+                format!(
+                    "g-mesh: guidance for project b, given once per session, as a session started in \
+                     {b_root} would receive it:\n\nguidance for {b_root}"
+                ),
+                format!("answer from {b_root}"),
+            ],
+            "{answer}"
+        );
+
+        a.answer(7);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert_eq!(
+            texts(&answer),
+            ["g-mesh: answered from project a.".to_string(), format!("answer from {}", a.root.display())],
+            "a selected project's guidance came with select_project: {answer}"
+        );
+
+        session.call_in(9, "b");
+        next_call_is(&b, 9);
+        assert!(session.daemons.try_recv().is_err(), "b's pool connection is reused");
+        b.answer(9);
+        let answer = session.recv();
+        assert_eq!(
+            texts(&answer),
+            ["g-mesh: answered from project b.".to_string(), format!("answer from {b_root}")],
+            "guidance comes once per project: {answer}"
+        );
+
+        session.call(10);
+        next_call_is(&a, 10);
+    }
+
+    /// T2 (D3): once a second, different project was selected, a call
+    /// without `project` is answered by the shim, naming both selections,
+    /// and reaches no daemon; calls naming a project are still answered.
+    ///
+    /// Control C2: make `Router::contested` return `false`: id 11 reaches
+    /// `b` and `b`'s next call is 11, not 13.
+    #[test]
+    fn a_second_distinct_selection_refuses_calls_without_project() {
+        let mut session = Session::start();
+        session.select(1, "a");
+        let a = session.daemon();
+        session.call(10);
+        next_call_is(&a, 10);
+        a.answer(10);
+        assert_eq!(first_text(&session.recv()), "g-mesh: answered from project a.");
+
+        session.select(2, "b");
+        let b = session.daemon();
+        session.call(11);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 11, "{answer}");
+        assert_eq!(answer["result"]["isError"], true, "{answer}");
+        assert_eq!(
+            texts(&answer),
+            [
+                "g-mesh: more than one project was selected on this connection (a, then b), which other agents \
+                 may share, so a call without \"project\" is not answered. Pass \"project\" with the project \
+                 you mean, e.g. \"b\"."
+            ],
+            "{answer}"
+        );
+
+        session.call_in(12, "a");
+        session.call_in(13, "b");
+        next_call_is(&a, 12);
+        next_call_is(&b, 13);
+        b.answer(13);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 13, "{answer}");
+        assert!(answer["result"]["isError"].is_null(), "{answer}");
+        assert_eq!(first_text(&answer), "g-mesh: answered from project b.", "{answer}");
+        a.answer(12);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 12, "{answer}");
+        assert_eq!(first_text(&answer), "g-mesh: answered from project a.", "{answer}");
+    }
+
+    /// T3 (D3): selecting the same project again, under another spelling
+    /// too, does not contest the session.
+    ///
+    /// Control C3: in `switch`, push every selection into `selections`
+    /// (drop the `contains` check): id 5 is refused.
+    #[test]
+    fn reselecting_the_same_project_does_not_contest() {
+        let mut session = Session::start();
+        session.select(1, "a");
+        let a = session.daemon();
+        session.select(2, "a");
+        session.select(3, "./a/");
+        session.call(5);
+        next_call_is(&a, 5);
+        a.answer(5);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 5, "{answer}");
+        assert!(answer["result"]["isError"].is_null(), "{answer}");
+        assert_eq!(first_text(&answer), "g-mesh: answered from project a.", "{answer}");
+    }
+
+    /// T4 (D6): a `project` that names no project below the folder, or is
+    /// not a string, is answered by the shim with the reason, and nothing
+    /// is sent upstream or connected.
+    ///
+    /// Control C4: in `route`, turn a resolve miss into `Ok(Which::Current)`:
+    /// id 5 reaches the front, whose next call is then 5, not 8.
+    #[test]
+    fn an_unknown_project_is_refused_not_routed() {
+        let mut session = Session::start();
+        std::fs::create_dir(session.root.join("a").join("pkg")).unwrap();
+        std::fs::write(session.root.join("a").join("pkg").join("package.json"), "").unwrap();
+
+        let refused = |session: &Session, id: u64| {
+            let answer = session.recv();
+            assert_eq!(answer["id"], id, "{answer}");
+            assert_eq!(answer["result"]["isError"], true, "{answer}");
+            first_text(&answer).to_string()
+        };
+        session.call_in(5, "zz");
+        let text = refused(&session, 5);
+        assert!(text.contains("\"project\": \"zz\" is not a project under"), "{text}");
+        assert!(text.contains("'zz' does not exist"), "{text}");
+        assert!(text.contains("Nothing was sent"), "{text}");
+
+        session.call_in(6, "a/pkg");
+        let text = refused(&session, 6);
+        assert!(text.contains("it lies inside the project 'a'"), "{text}");
+
+        session.send(json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": { "name": "find_references", "arguments": { "project": 3 } },
+        }));
+        let text = refused(&session, 7);
+        assert!(text.contains("\"project\" must be a string"), "{text}");
+
+        session.call(8);
+        next_call_is(&session.front, 8);
+        assert!(session.daemons.try_recv().is_err(), "a refused project connects nothing");
+    }
+
+    /// T5 (D5): a fifth project in the pool retires the least recently used
+    /// connection, half-closed at once because it owes nothing; the others
+    /// stay open. That project's next call opens a fresh connection whose
+    /// answer carries no restart line (eviction is not a restart) and no
+    /// second guidance, and it retires the next least recently used one.
+    ///
+    /// Controls C5: in `Router::admit`, drop the eviction loop: `a` is never
+    /// closed. C5b: in `reach`, pass `restart = true` for a slot the pool
+    /// does not hold: id 6's answer carries the restart line.
+    #[test]
+    fn the_least_recently_used_connection_is_retired_above_the_cap() {
+        let mut session = Session::start();
+        let mut daemons = Vec::new();
+        for (id, project) in [(1, "a"), (2, "b"), (3, "c"), (4, "d")] {
+            session.call_in(id, project);
+            let daemon = session.daemon();
+            next_call_is(&daemon, id);
+            daemon.answer(id);
+            assert_eq!(session.recv()["id"], id);
+            daemons.push(daemon);
+        }
+        // `a` becomes the most recently used: `b` is now the oldest.
+        session.call_in(5, "a");
+        next_call_is(&daemons[0], 5);
+        daemons[0].answer(5);
+        assert_eq!(session.recv()["id"], 5);
+
+        session.call_in(6, "e");
+        let e = session.daemon();
+        next_call_is(&e, 6);
+        // The eviction happened before 6 was forwarded.
+        assert_eq!(daemons[1].closes(), vec![Shutdown::Write], "b is the least recently used");
+        for daemon in [&daemons[0], &daemons[2], &daemons[3]] {
+            assert!(daemon.closes().is_empty(), "{} must stay open", daemon.root.display());
+        }
+        e.answer(6);
+        assert_eq!(session.recv()["id"], 6);
+
+        session.call_in(7, "b");
+        let b = session.daemon();
+        assert_eq!(b.root, session.root.join("b"));
+        next_call_is(&b, 7);
+        assert_eq!(daemons[2].closes(), vec![Shutdown::Write], "c is now the least recently used");
+        b.answer(7);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 7, "{answer}");
+        let restart = session.restart_line(&b.root);
+        assert!(!texts(&answer).iter().any(|text| text.starts_with(&restart)), "{answer}");
+        assert_eq!(
+            texts(&answer),
+            ["g-mesh: answered from project b.".to_string(), format!("answer from {}", b.root.display())],
+            "{answer}"
+        );
+    }
+
+    /// In a single-project session `project` may only name the root (by its
+    /// directory name or its path); the call then reaches the root's daemon
+    /// without the argument. Any other name is refused and sent nowhere.
+    ///
+    /// Control: make `names_root` return `true`: id 6 reaches the daemon.
+    #[test]
+    fn a_single_project_session_accepts_only_its_own_root_as_project() {
+        let mut session = Session::start_single();
+        let own_name = session.root.file_name().unwrap().to_string_lossy().into_owned();
+        session.call_in(5, &own_name);
+        let forwarded = next_call_is(&session.front, 5);
+        assert_eq!(forwarded["params"]["arguments"], json!({}), "{forwarded}");
+
+        session.call_in(6, "a");
+        let answer = session.recv();
+        assert_eq!(answer["id"], 6, "{answer}");
+        assert_eq!(answer["result"]["isError"], true, "{answer}");
+        let text = first_text(&answer);
+        assert!(text.contains("this session serves the single project"), "{text}");
+        assert!(text.contains("\"project\": \"a\" names something else"), "{text}");
+
+        let rooted = session.root.display().to_string();
+        session.call_in(7, &rooted);
+        next_call_is(&session.front, 7);
+        assert!(session.daemons.try_recv().is_err(), "a single-project session opens no sub-project");
+
+        session.front.answer(5);
+        let answer = session.recv();
+        assert_eq!(answer["id"], 5, "{answer}");
+        assert_eq!(
+            texts(&answer),
+            [format!("answer from {}", session.root.display())],
+            "not stamped: {answer}"
+        );
     }
 }

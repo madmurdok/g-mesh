@@ -745,4 +745,131 @@ mod tests {
         assert_eq!(resolve(&root, "alias"), Err(Unresolved::NotADirectory("alias".into())));
         assert_eq!(resolve(&root, "../root/a"), Err(Unresolved::NotBelowRoot));
     }
+
+    // ---- GM-571 T6: `resolve` agrees with `walk` ----
+
+    /// A folder with every shape the walk distinguishes: repositories, a
+    /// worktree, a project at depth two, a repository with nested packages,
+    /// skipped and dot directories with markers inside, a marker at depth
+    /// three, an unmarked directory, a file and (on unix) a symlink to a
+    /// repository.
+    fn agreement_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        mkdir(root, "a/.git");
+        touch(root, "b/Cargo.toml");
+        touch(root, "group/c/go.mod");
+        touch(root, "worktrees/wt/.git");
+        mkdir(root, "mono/.git");
+        touch(root, "mono/y/package.json");
+        touch(root, "mono/plugins/x/package.json");
+        touch(root, "node_modules/x/package.json");
+        touch(root, "target/pyproject.toml");
+        touch(root, ".hidden/go.mod");
+        touch(root, "x/y/z/go.mod");
+        mkdir(root, "plain/dir");
+        touch(root, "file.txt");
+        let elsewhere = tempfile::tempdir().unwrap();
+        mkdir(elsewhere.path(), "repo/.git");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere.path().join("repo"), root.join("linked")).unwrap();
+        let canonical = root.canonicalize().unwrap();
+        (dir, elsewhere, canonical)
+    }
+
+    /// Every entry below `root` down to `depth` levels, `/`-separated,
+    /// symlinks included but not followed.
+    fn entries_below(root: &Path, rel: &str, depth: usize, out: &mut Vec<String>) {
+        if depth == 0 {
+            return;
+        }
+        let dir = if rel.is_empty() { root.to_path_buf() } else { root.join(rel) };
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+            out.push(child.clone());
+            if entry.file_type().unwrap().is_dir() {
+                entries_below(root, &child, depth - 1, out);
+            }
+        }
+    }
+
+    /// D6 risk: two implementations of "what is a candidate". Every walk
+    /// candidate resolves to the very same `Candidate`, and of every entry
+    /// in the fixture down to depth three, exactly the walk's candidates
+    /// resolve.
+    ///
+    /// Control C6: in `resolve_segments`, drop the "no marked ancestor"
+    /// check (the `InsideCandidate` return): `mono/y` resolves although the
+    /// walk never lists it.
+    #[test]
+    fn resolve_accepts_exactly_the_walks_candidates() {
+        let (_dir, _elsewhere, root) = agreement_fixture();
+        let walked = walk(&root, Limits::default());
+        assert!(!walked.truncated);
+        assert_eq!(rels(&walked.candidates), ["a", "b", "group/c", "mono", "worktrees/wt"]);
+        for candidate in &walked.candidates {
+            assert_eq!(resolve(&root, &candidate.rel_path).as_ref(), Ok(candidate), "{}", candidate.rel_path);
+        }
+
+        let mut entries = Vec::new();
+        entries_below(&root, "", 3, &mut entries);
+        assert!(entries.len() > 20, "the fixture must be walked: {entries:?}");
+        let listed: Vec<&str> = rels(&walked.candidates);
+        for entry in &entries {
+            assert_eq!(
+                resolve(&root, entry).is_ok(),
+                listed.contains(&entry.as_str()),
+                "{entry}: {:?}",
+                resolve(&root, entry)
+            );
+        }
+    }
+
+    /// Each kind of path the walk would never list is refused with its own
+    /// reason.
+    ///
+    /// Control C6 (as above): `mono/y` resolves instead of being refused.
+    #[test]
+    fn resolve_refuses_nested_skipped_symlinked_and_deep_dirs() {
+        let (_dir, _elsewhere, root) = agreement_fixture();
+        assert_eq!(resolve(&root, "mono/y"), Err(Unresolved::InsideCandidate("mono".into())));
+        assert_eq!(resolve(&root, "node_modules/x"), Err(Unresolved::Skipped("node_modules".into())));
+        assert_eq!(resolve(&root, "target"), Err(Unresolved::Skipped("target".into())));
+        assert_eq!(resolve(&root, ".hidden"), Err(Unresolved::Skipped(".hidden".into())));
+        assert_eq!(resolve(&root, "x/y/z"), Err(Unresolved::TooDeep { max_depth: 2 }));
+        assert_eq!(resolve(&root, "plain"), Err(Unresolved::NoMarker));
+        assert_eq!(resolve(&root, "file.txt"), Err(Unresolved::NotADirectory("file.txt".into())));
+        assert_eq!(resolve(&root, "nope"), Err(Unresolved::Missing("nope".into())));
+        assert_eq!(resolve(&root, "../a"), Err(Unresolved::NotBelowRoot));
+        assert_eq!(resolve(&root, ""), Err(Unresolved::IsRoot));
+        #[cfg(unix)]
+        assert_eq!(resolve(&root, "linked"), Err(Unresolved::NotADirectory("linked".into())));
+
+        let reason = resolve(&root, "mono/y").unwrap_err().to_string();
+        assert_eq!(reason, "it lies inside the project 'mono'");
+        let reason = resolve(&root, "x/y/z").unwrap_err().to_string();
+        assert_eq!(reason, "projects lie at most 2 levels below the folder");
+    }
+
+    /// The walk stops at its candidate limit; `resolve` probes one path and
+    /// finds every project, the ones past the limit included.
+    #[test]
+    fn resolve_finds_a_project_past_the_walk_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..3 {
+            mkdir(dir.path(), &format!("r{n}/.git"));
+        }
+        let root = dir.path().canonicalize().unwrap();
+        let walked = walk(&root, Limits { max_candidates: 1, ..Limits::default() });
+        assert!(walked.truncated);
+        assert_eq!(walked.candidates.len(), 1);
+        for n in 0..3 {
+            let project = format!("r{n}");
+            let found = resolve(&root, &project).unwrap_or_else(|err| panic!("{project}: {err}"));
+            assert_eq!(found.abs_path, root.join(&project));
+            assert_eq!(found.markers, [".git"]);
+        }
+    }
 }
