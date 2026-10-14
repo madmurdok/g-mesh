@@ -479,3 +479,226 @@ fn rust_analyzer_runs_no_build_script_proc_macro_toolchain_or_rustc_the_project_
         "the semantic tier ran code the project supplied (markers, shim logs or a target/ dir)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GM-591: a project `rust-analyzer.toml`'s `cargo.extraEnv` is not applied.
+//
+// rust-analyzer 1.97.1 reads a project `rust-analyzer.toml` (workspace root
+// or crate level) but ignores its `cargo.extraEnv`, while a client-side
+// `extraEnv` (initialization options) does override `pinned_env`. If a
+// rust-analyzer that honours the project file ever shipped, a project could
+// set `CARGO_ENCODED_RUSTFLAGS` / `CARGO_UNSTABLE_HOST_CONFIG` and reopen the
+// rustflags and host-config channels (GM-572) that `pinned_env` closes.
+// These tests pin the observed behaviour; the control proves the fixture's
+// values are live by sending the same values through the client channel.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod project_extra_env {
+    use super::*;
+    use g_mesh_plugin_sdk::lsp::{LspBridge, SemanticConfig};
+
+    /// Where the project's `rust-analyzer.toml` sits.
+    #[derive(Clone, Copy)]
+    enum TomlAt {
+        Root,
+        Crate,
+    }
+
+    struct ExtraEnvFixture {
+        root: PathBuf,
+        rustflags_mark: PathBuf,
+        host_mark: PathBuf,
+        /// The `cargo.extraEnv` object: marker-firing values for both channels.
+        extra_env: serde_json::Value,
+    }
+
+    impl ExtraEnvFixture {
+        fn fired(&self) -> Vec<String> {
+            [&self.rustflags_mark, &self.host_mark]
+                .iter()
+                .filter(|mark| mark.exists())
+                .map(|mark| mark.display().to_string())
+                .collect()
+        }
+    }
+
+    /// A plain package with no build script, proc macro, toolchain file or
+    /// shim, so the only code a rustc could load is a marker dylib named by
+    /// the two channels: `CARGO_ENCODED_RUSTFLAGS` (a `-Zcodegen-backend`)
+    /// and `CARGO_UNSTABLE_HOST_CONFIG=true` (which lets the config's
+    /// `[host] rustflags` through). `None` when no C compiler builds the dylibs.
+    fn write_extra_env_fixture(
+        root: &Path,
+        real: &RealToolchain,
+        at: Option<TomlAt>,
+    ) -> Option<ExtraEnvFixture> {
+        let rustflags_mark = root.join("MARK_extraenv_rustflags");
+        let host_mark = root.join("MARK_extraenv_host_config");
+        let rustflags_dylib = build_marker_dylib(&root.join("dylib_rustflags"), &rustflags_mark)?;
+        let host_dylib = build_marker_dylib(&root.join("dylib_host"), &host_mark)?;
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(
+            &root.join("app/src/main.rs"),
+            "mod util;\n\nfn main() {\n    let thing = util::Thing;\n    thing.method();\n}\n",
+        );
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        write(
+            &root.join(".cargo/config.toml"),
+            &format!(
+                "target-applies-to-host = false\n\n[unstable]\nhost-config = true\ntarget-applies-to-host = true\n\n\
+                 [host]\nrustflags = [{:?}]\n",
+                format!("-Zcodegen-backend={}", host_dylib.to_string_lossy())
+            ),
+        );
+        let _ = real;
+        let extra_env = serde_json::json!({
+            "CARGO_ENCODED_RUSTFLAGS": format!("-Zcodegen-backend={}", rustflags_dylib.to_string_lossy()),
+            "CARGO_UNSTABLE_HOST_CONFIG": "true",
+            // A stable cargo honours the config's `[unstable]` table, which
+            // `host-config` needs, only when bootstrapped.
+            "RUSTC_BOOTSTRAP": "1",
+        });
+        let table = format!(
+            "[cargo.extraEnv]\nCARGO_ENCODED_RUSTFLAGS = {:?}\nCARGO_UNSTABLE_HOST_CONFIG = \"true\"\nRUSTC_BOOTSTRAP = \"1\"\n",
+            extra_env["CARGO_ENCODED_RUSTFLAGS"].as_str().unwrap()
+        );
+        match at {
+            Some(TomlAt::Root) => write(&root.join("rust-analyzer.toml"), &table),
+            Some(TomlAt::Crate) => write(&root.join("app/rust-analyzer.toml"), &table),
+            None => {}
+        }
+        Some(ExtraEnvFixture { root: root.to_path_buf(), rustflags_mark, host_mark, extra_env })
+    }
+
+    fn index_of(root: &Path) -> SdkIndex {
+        let project = ProjectContext::load(root).expect("the fixture is a loadable Rust project");
+        let mut index = SdkIndex::new();
+        for path in walk_project(root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+            let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+            let graph = RustExtractor.extract(&project, &path, &source);
+            index.insert(path, source, graph);
+        }
+        index
+    }
+
+    /// Whether the answer resolved `thing.method()` across files: the server
+    /// really indexed the fixture.
+    fn resolved_method(index: &SdkIndex, answer: &g_mesh_plugin_sdk::SemanticAnswer) -> bool {
+        let main = index
+            .graph(&RelPath::new("app/src/main.rs"))
+            .expect("app/src/main.rs is indexed")
+            .nodes
+            .iter()
+            .find(|node| node.name == "main")
+            .expect("the extractor emits `main`")
+            .id
+            .clone();
+        answer
+            .diff
+            .upsert_edges
+            .iter()
+            .filter(|edge| edge.from_id == main && edge.source == SourceTier::Semantic)
+            .filter_map(|edge| answer.diff.upsert_nodes.iter().find(|node| node.id == edge.to_id))
+            .any(|node| node.name == "method")
+    }
+
+    /// Indexes the fixture. `client_extra_env: None` runs the production
+    /// `semantic::engine`; `Some(env)` runs a bridge built the way `engine`
+    /// builds one (manifest config, the same pinned values) with `env` added
+    /// as the client's `cargo.extraEnv` initialization option.
+    fn index_fixture(
+        fixture: &ExtraEnvFixture,
+        real: &RealToolchain,
+        client_extra_env: Option<&serde_json::Value>,
+    ) {
+        scrub_environment(&real.proxy_dir);
+        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+        std::env::set_current_dir(&fixture.root).unwrap();
+        let index = index_of(&fixture.root);
+        let mut engine: Box<dyn g_mesh_plugin_sdk::SemanticEngine> = match client_extra_env {
+            None => semantic::engine(&fixture.root).expect("the engine resolves a rust-analyzer"),
+            Some(env) => {
+                let mut config =
+                    SemanticConfig::from_manifest().unwrap().expect("the manifest has [plugin.semantic]");
+                config.command = real.rust_analyzer.clone();
+                for (name, value) in [
+                    ("CARGO_NET_OFFLINE", "true".to_string()),
+                    ("CARGO_ENCODED_RUSTFLAGS", String::new()),
+                    ("CARGO_UNSTABLE_HOST_CONFIG", "false".to_string()),
+                    ("RUSTC", real.rustc.to_string_lossy().into_owned()),
+                    ("CARGO", real.cargo.to_string_lossy().into_owned()),
+                ] {
+                    config.env.insert(name.to_string(), value);
+                }
+                let options = config.initialization_options.get_or_insert_with(|| serde_json::json!({}));
+                options["cargo"]["extraEnv"] = env.clone();
+                Box::new(LspBridge::new("rust", &fixture.root, config).quiescent_signal())
+            }
+        };
+        let answer = engine.answer(&[], &index).expect("the engine answers");
+        drop(engine);
+        assert!(
+            resolved_method(&index, &answer),
+            "sanity: rust-analyzer did not resolve `thing.method()` (complete: {}, reason: {:?})",
+            answer.complete,
+            answer.reason
+        );
+    }
+
+    fn assert_project_extra_env_is_ignored(at: TomlAt) {
+        let real = real_toolchain();
+        let scratch = Scratch::new("extraenv");
+        let Some(fixture) = write_extra_env_fixture(&scratch.0, &real, Some(at)) else { return };
+        index_fixture(&fixture, &real, None);
+        assert_eq!(
+            fixture.fired(),
+            Vec::<String>::new(),
+            "a project rust-analyzer.toml's cargo.extraEnv reached the server's cargo/rustc: the rustflags \
+             or host-config channel is open again (GM-572)"
+        );
+    }
+
+    #[test]
+    fn a_root_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker() {
+        assert_project_extra_env_is_ignored(TomlAt::Root);
+    }
+
+    #[test]
+    fn a_crate_level_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker() {
+        assert_project_extra_env_is_ignored(TomlAt::Crate);
+    }
+
+    /// Control: the same values through the client's `cargo.extraEnv` beat
+    /// the pinned env and fire the markers, so the fixture's values are live
+    /// and the two tests above are not silent for want of a working hook.
+    /// The control reverses by construction: it is the same fixture and the
+    /// same pass, with the values moved from the project file to the client.
+    #[test]
+    fn the_same_extra_env_through_the_client_fires_the_markers() {
+        let real = real_toolchain();
+        let scratch = Scratch::new("extraenv-ctl");
+        let Some(fixture) = write_extra_env_fixture(&scratch.0, &real, None) else { return };
+        let env = fixture.extra_env.clone();
+        index_fixture(&fixture, &real, Some(&env));
+        assert!(
+            fixture.rustflags_mark.exists(),
+            "sanity: the client's CARGO_ENCODED_RUSTFLAGS fired no marker (fired: {:?}), so the project-file \
+             tests prove nothing about that channel",
+            fixture.fired()
+        );
+        assert!(
+            fixture.host_mark.exists(),
+            "sanity: the client's CARGO_UNSTABLE_HOST_CONFIG fired no marker (fired: {:?}), so the project-file \
+             tests prove nothing about that channel",
+            fixture.fired()
+        );
+    }
+}
