@@ -669,6 +669,19 @@ CREATE TABLE IF NOT EXISTS semantic_gap_files (
     filePath TEXT NOT NULL,
     PRIMARY KEY (language, filePath)
 );
+
+-- Where a seeded index was copied from (daemon::seed): one row, written into
+-- the copy before its rename into place. `reconciledAt` NULL means the seeded
+-- first-start reconcile still owes this worktree its pass. Dropped by `wipe`,
+-- so a reset index is no longer seeded. Added by `CREATE TABLE IF NOT
+-- EXISTS`, so an existing index gains it without a schema-version bump.
+CREATE TABLE IF NOT EXISTS seed_origin (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    sourceRoot          TEXT NOT NULL,
+    sourceBulkIndexedAt TEXT NOT NULL,
+    seededAt            TEXT NOT NULL,
+    reconciledAt        TEXT
+);
 "#;
 
 /// Applies the graph schema DDL to a fresh (or already up-to-date) connection.
@@ -1958,9 +1971,48 @@ fn wipe(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS semantic_owed_files; DROP TABLE IF EXISTS semantic_residual; \
          DROP TABLE IF EXISTS semantic_gap_files; DROP TABLE IF EXISTS language_outcome; \
          DROP TABLE IF EXISTS language_retry; \
-         DROP TABLE IF EXISTS resolution_facts;",
+         DROP TABLE IF EXISTS resolution_facts; DROP TABLE IF EXISTS seed_origin;",
     )
     .context("failed to wipe schema")
+}
+
+/// Records that this index is a seed copied from the index of `source_root`
+/// (`daemon::seed`), with the source's `bulkIndexedAt` and no `reconciledAt`.
+/// Runs on the copy's own connection, before its rename into place.
+pub fn record_seed_origin(conn: &Connection, source_root: &str) -> Result<()> {
+    apply(conn)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO seed_origin (id, sourceRoot, sourceBulkIndexedAt, seededAt, reconciledAt) \
+         SELECT 1, ?1, bulkIndexedAt, CURRENT_TIMESTAMP, NULL FROM meta WHERE id = 1 AND bulkIndexedAt IS NOT NULL",
+        rusqlite::params![source_root],
+    )
+    .and_then(|written| {
+        if written == 1 {
+            Ok(())
+        } else {
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        }
+    })
+    .context("failed to record the seed's origin")
+}
+
+/// Whether this index is a seed whose first-start reconcile has not run yet
+/// (a `seed_origin` row with `reconciledAt` NULL). Hook point for the seeded
+/// start (GM-564 D4): a daemon must not serve such an index before that
+/// reconcile.
+pub fn seed_pending(conn: &Connection) -> Result<bool> {
+    let row: Option<Option<String>> = conn
+        .query_row("SELECT reconciledAt FROM seed_origin WHERE id = 1", [], |row| row.get(0))
+        .optional()
+        .context("failed to read seed_origin")?;
+    Ok(matches!(row, Some(None)))
+}
+
+/// Stamps the seed's first-start reconcile as done.
+pub fn record_seed_reconciled(conn: &Connection) -> Result<()> {
+    conn.execute("UPDATE seed_origin SET reconciledAt = CURRENT_TIMESTAMP WHERE id = 1", [])
+        .context("failed to record that the seed was reconciled")?;
+    Ok(())
 }
 
 fn record_version(conn: &Connection, indexer_version: &str) -> Result<()> {

@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod memory;
 pub mod plugin;
 pub mod registry;
+pub mod seed;
 pub mod semantic;
 /// A fake, protocol-speaking plugin for unit tests that need two languages.
 #[cfg(test)]
@@ -334,6 +335,15 @@ pub fn run(root: &Path) -> Result<()> {
     // Before the index is opened and before any reindex can run: a staging
     // file left here belongs to a reindex that died.
     workspace_reindex::remove_stale_staging(&dir);
+    seed::remove_stale_seed_tmp(&dir);
+    // Before `connection::open`, which would create an empty `index.db`.
+    if let Some(origin) = seed::seed_if_eligible(root, &dir, &registry::indexer_version(&discovered)) {
+        crate::log_line!(
+            "g-mesh daemon: index seeded from {} in {} ms",
+            origin.source_root.display(),
+            origin.copy_ms
+        );
+    }
     let conn = connection::open(root).context("failed to open the project's SQLite index")?;
     // Read before `ensure_current`, whose reset would hide that one existed:
     // the session instructions say whether a cold start throws an index away.

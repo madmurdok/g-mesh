@@ -42,6 +42,7 @@ fn creates_all_tables_and_indexes() {
             "qualified_suffixes",
             "reextract_owed_files",
             "resolution_facts",
+            "seed_origin",
             "semantic_gap_files",
             "semantic_owed_files",
             "semantic_pending",
