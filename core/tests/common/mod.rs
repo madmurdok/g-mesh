@@ -54,7 +54,7 @@ use rusqlite::Connection;
 /// cold file cache: measured at 7-9s on a quiet machine, but 38.5s during a
 /// 2.4.0 release run, which reported an environmental slowdown as a test
 /// failure and forced the release gate to be skipped.
-const DEFAULT_INDEXED_TIMEOUT_SECS: u64 = 90;
+pub const DEFAULT_INDEXED_TIMEOUT_SECS: u64 = 90;
 
 /// [`DEFAULT_INDEXED_TIMEOUT_SECS`], or `G_MESH_TEST_INDEXED_TIMEOUT_SECS` if
 /// it is set to a parsable number - an unparsable value falls back to the
@@ -96,7 +96,7 @@ fn indexed_timeout() -> Duration {
 /// `.config/nextest.toml`: `period * terminate-after`, 210s). A wait with a
 /// larger budget is killed by nextest before it can fail, and its own panic
 /// message - the one that says what it was waiting for - is never shown.
-const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 180;
+pub const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 180;
 
 /// [`DEFAULT_STARTUP_TIMEOUT_SECS`], or `G_MESH_TEST_STARTUP_TIMEOUT_SECS` if
 /// it names a parsable number. Same "unparsable is not fatal" rule as

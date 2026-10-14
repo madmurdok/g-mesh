@@ -129,6 +129,84 @@ fn reconciled_line(root: &Path, log: &Path) -> String {
     line.expect("wait_for returned, so the line was found")
 }
 
+/// `reconciled_line` takes only a complete line: a line the daemon has not
+/// finished writing is waited out, not returned cut short.
+///
+/// Control: let it match the unterminated last line too (`text.lines()`): it
+/// returns the cut-off line.
+#[test]
+fn reconciled_line_waits_for_an_unterminated_line_to_be_finished() {
+    let root = tempfile::tempdir().expect("failed to create a temp project root");
+    let aux = tempfile::tempdir().expect("failed to create a directory for the log");
+    let log = aux.path().join("daemon.log");
+    let whole = "g-mesh daemon: reconciled 4 files with the disk in 3 ms: 0 deleted, 2 created, 2 reindexed";
+    let (head, tail) = whole.split_at(whole.len() - "indexed".len());
+    std::fs::write(&log, format!("g-mesh daemon: serving\n{head}")).expect("failed to write the log");
+
+    let writer = {
+        let log = log.clone();
+        let tail = format!("{tail}\n");
+        thread::spawn(move || {
+            // Long enough that the wait reads the cut-off line first.
+            thread::sleep(std::time::Duration::from_secs(1));
+            let mut file =
+                std::fs::OpenOptions::new().append(true).open(&log).expect("failed to open the log");
+            file.write_all(tail.as_bytes()).expect("failed to finish the line");
+        })
+    };
+    let line = reconciled_line(root.path(), &log);
+    writer.join().expect("the writer thread panicked");
+
+    assert_eq!(line, whole, "only the finished line may be returned");
+}
+
+/// A restart that walks instead of reconciling never prints the line;
+/// `reconciled_line` says so as soon as the phase reads `walking`, rather
+/// than after the whole startup budget.
+///
+/// Control: drop the phase check: the wait runs on past this test's bound.
+#[test]
+fn reconciled_line_fails_at_once_when_the_restart_walks() {
+    /// Far below the startup budget the wait would otherwise spend.
+    const FAIL_FAST_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Removes the state directory this test publishes a phase in.
+    struct RemoveOnDrop(std::path::PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let root = tempfile::tempdir().expect("failed to create a temp project root");
+    let aux = tempfile::tempdir().expect("failed to create a directory for the log");
+    let log = aux.path().join("daemon.log");
+    std::fs::write(&log, "g-mesh daemon: serving\n").expect("failed to write the log");
+    let state_dir = RemoveOnDrop(project_dir(root.path()).expect("failed to resolve the state directory"));
+    std::fs::create_dir_all(&state_dir.0).expect("failed to create the state directory");
+    std::fs::write(daemon::phase_path_in(&state_dir.0), "walking\n").expect("failed to publish the phase");
+
+    let wait = {
+        let root = root.path().to_path_buf();
+        thread::spawn(move || reconciled_line(&root, &log))
+    };
+    let started = std::time::Instant::now();
+    while !wait.is_finished() {
+        assert!(
+            started.elapsed() < FAIL_FAST_BOUND,
+            "the wait did not fail within {FAIL_FAST_BOUND:?} of a walk"
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let panic = wait.join().expect_err("there is no line to find, so the wait must fail");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(message.contains("walking the project instead"), "the failure must name the walk: {message}");
+}
+
 /// GM-301: see `common::wait_for`'s doc comment for why this delegates
 /// instead of polling against a file-local timeout constant.
 fn wait_for(what: &str, ready: impl FnMut() -> bool) {

@@ -317,6 +317,57 @@ fn a_daemon_whose_project_root_is_deleted_stops_itself() {
     );
 }
 
+/// How long the test keeps holding the bootstrap lock after the orphaned
+/// daemon has released its project: a purge that does not wait for the lock
+/// has let the daemon exit well within it.
+const HOLD_PAST_RELEASE: Duration = Duration::from_secs(1);
+
+/// A shim's startup sweep may hold the project's bootstrap lock at the very
+/// moment the orphaned daemon purges its state. The daemon waits for the lock
+/// rather than exiting with the state still on disk, and deletes it once the
+/// lock is free.
+///
+/// Unix only: on Windows the purge is left to the shim's sweep.
+///
+/// Control: make the daemon's purge only try the lock (`LockWait::Try`): it
+/// exits while the lock is held, and the state stays.
+#[cfg(unix)]
+#[test]
+fn a_purge_that_finds_the_bootstrap_lock_held_waits_for_it() {
+    let mut project = Project::new();
+    let lock_path = daemon::lock_path(project.root()).expect("failed to resolve the bootstrap lock");
+    let mut daemon_process = Daemon::spawn(Path::new(BIN), project.root());
+    let _plugin_pid = wait_until_fully_up(&project);
+    let lock = std::fs::File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("failed to open the bootstrap lock");
+    lock.try_lock().expect("nothing else may hold the bootstrap lock of a daemon spawned directly");
+
+    project.delete();
+    common::wait_for("the orphaned daemon to release its project", orphan_budget(), || {
+        !project.core_pid_file().exists()
+    });
+    std::thread::sleep(HOLD_PAST_RELEASE);
+    assert!(
+        daemon_process.is_running(),
+        "an orphaned daemon whose purge finds the bootstrap lock held must wait for it, not exit"
+    );
+    assert!(project.state_dir.exists(), "nothing may be deleted while the lock is held");
+
+    drop(lock);
+    common::wait_for("the daemon to finish its purge and exit", orphan_budget(), || {
+        !daemon_process.is_running()
+    });
+    assert!(
+        !project.state_dir.exists(),
+        "once the lock is free the purge must delete the state: {} is still there",
+        project.state_dir.display()
+    );
+}
+
 /// A root whose parent is gone too is not judged deleted (it may be an
 /// unmounted volume): the daemon still stops, but keeps the project's state.
 ///
