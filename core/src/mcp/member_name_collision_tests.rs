@@ -222,9 +222,9 @@ pub fn use_field(s: &S) -> u32 { s.x }
 /// not on the field or method of that name; the members keep their own
 /// usages, and the field-vs-method pair of `U` stays as it is.
 ///
-/// Control: return `Ok(None)` at the top of `Resolver::sole_non_member`
-/// (`graph::symbol_links`): `m::x` and `m::y` lose their `src/user.rs` rows
-/// and report `unlinkedUsages`.
+/// Control: return all of `candidates` at the top of
+/// `Resolver::drop_type_members` (`graph::symbol_links`): `m::x` and `m::y`
+/// lose their `src/user.rs` rows and report `unlinkedUsages`.
 #[test]
 fn rust_a_module_scoped_name_lands_on_the_free_fn_beside_a_same_named_member() {
     let walked = Walked::new(
@@ -417,10 +417,11 @@ func UseMembers(t m.T, s m.S) int { return t.Y() + s.X }
 
 /// `m.Y()` lands on `func Y`, not on method `T.Y` of the same package.
 ///
-/// Controls: return `Ok(None)` at the top of `Resolver::sole_non_member`
-/// (`graph::symbol_links`), or look the receiver type up in the member's
-/// file instead of its container (`type_in_file` for every candidate): `Y`
-/// loses `UseFree` and reports `unlinkedUsages`.
+/// Controls: return all of `candidates` at the top of
+/// `Resolver::drop_type_members` (`graph::symbol_links`), or look the
+/// receiver type up in the member's file instead of its container
+/// (`type_in_file` for every candidate): `Y` loses `UseFree` and reports
+/// `unlinkedUsages`.
 #[test]
 fn go_a_package_qualified_call_lands_on_the_func_beside_a_same_named_method() {
     let walked = Walked::new(
@@ -471,9 +472,9 @@ def use_members(t: T) -> int:
 
 /// `from pkg.a import y` and `y()` land on `def y`, not on method `T.y`.
 ///
-/// Control: return `Ok(None)` at the top of `Resolver::sole_non_member`
-/// (`graph::symbol_links`): `y` loses its `pkg/b.py` rows and reports
-/// `unlinkedUsages`.
+/// Control: return all of `candidates` at the top of
+/// `Resolver::drop_type_members` (`graph::symbol_links`): `y` loses its
+/// `pkg/b.py` rows and reports `unlinkedUsages`.
 #[test]
 fn python_an_imported_name_lands_on_the_function_beside_a_same_named_method() {
     let walked =
@@ -514,9 +515,13 @@ export function useFree(): number { return x() + y() + a.x() + a.y(); }
 export function useMembers(t: T): number { return t.y(); }
 "#;
 
-/// TypeScript's members are `file`-visible and `#`-qualified, so a
-/// file-scoped name never reaches them and the type-member rule never runs:
-/// these usages link with or without it.
+/// Members of an exported TypeScript class are `public`, so `import { y }`
+/// from another file finds both `function y` and method `T#y`; the member
+/// is dropped and the free functions keep their usages.
+///
+/// Control: return all of `candidates` at the top of
+/// `Resolver::drop_type_members` (`graph::symbol_links`): `y` reports an
+/// `unlinkedUsages` row in `src/b.ts`.
 #[test]
 fn typescript_free_functions_beside_same_named_members_link_as_before() {
     let walked = Walked::new("typescript", ".ts", &[("src/a.ts", TS_A), ("src/b.ts", TS_B)]);
@@ -530,4 +535,74 @@ fn typescript_free_functions_beside_same_named_members_link_as_before() {
         usages(&[("CALLS", "T#callY"), ("CALLS", "local"), ("CALLS", "useFree")])
     );
     assert_eq!(walked.exact_usages("T#y"), usages(&[("CALLS", "T#callY")]));
+}
+
+const T01_X: &str = r#"function make(): () => number {
+  return () => 1;
+}
+export const handler = make();
+export class Router {
+  handler(): number {
+    return 2;
+  }
+}
+"#;
+
+const T01_MAIN: &str = r#"import { handler } from "./x";
+export function run(): number {
+  return handler();
+}
+"#;
+
+/// GM-519 fixture t01: `import { handler }` of a const, beside a method
+/// `Router#handler` of an exported class. The call reaches neither: the
+/// const is no `Function` and the method is a member (GM-568).
+///
+/// Controls: restore `Resolver::sole_non_member` after the kind rule
+/// (b259cd1^), or do not call `Resolver::drop_type_members` in `link`
+/// (`graph::symbol_links`): `run` calls `Router#handler`.
+#[test]
+fn typescript_an_imported_const_call_does_not_land_on_a_same_named_method() {
+    let walked = Walked::new("typescript", ".ts", &[("src/x.ts", T01_X), ("src/main.ts", T01_MAIN)]);
+
+    assert_eq!(walked.callers("Router#handler"), BTreeSet::new());
+    let calls = walked.targets_of("run", "CALLS");
+    assert!(calls.iter().all(|(name, _)| name != "Router#handler"), "{calls:?}");
+}
+
+const P01_X: &str = r#"def _make():
+    return lambda: 1
+
+
+handler = _make()
+
+
+class Router:
+    def handler(self):
+        return 2
+"#;
+
+const P01_MAIN: &str = r#"from pkg.x import handler
+
+
+def run():
+    return handler()
+"#;
+
+/// GM-519 fixture p01: `from pkg.x import handler` of a module variable,
+/// beside a method `Router.handler`. The call reaches neither (GM-568).
+///
+/// Controls: as for the TypeScript case above - `run` calls
+/// `Router.handler`.
+#[test]
+fn python_an_imported_variable_call_does_not_land_on_a_same_named_method() {
+    let walked = Walked::new(
+        "python",
+        ".py",
+        &[("pkg/__init__.py", ""), ("pkg/x.py", P01_X), ("pkg/main.py", P01_MAIN)],
+    );
+
+    assert_eq!(walked.callers("Router.handler"), BTreeSet::new());
+    let calls = walked.targets_of("run", "CALLS");
+    assert!(calls.iter().all(|(name, _)| name != "Router.handler"), "{calls:?}");
 }

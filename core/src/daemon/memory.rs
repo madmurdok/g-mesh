@@ -45,7 +45,7 @@
 //! # One sample is one instant, and the tree is not the caller's alone (GM-307)
 //!
 //! Everything below returns a [`ProcessTreeSample`] built from *one*
-//! `sysinfo::refresh_processes` snapshot, and that framing is load-bearing
+//! process snapshot (`crate::process::process_snapshot`), and that framing is load-bearing
 //! rather than incidental. A process tree's membership is not stable: a
 //! `rust-analyzer` shells out to `rustc` and to build scripts, a `tsserver`
 //! forks for a project reload, and each of those is a real, transient member
@@ -92,7 +92,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind};
+
+use crate::process::{is_process, process_snapshot};
 
 /// One `sysinfo` snapshot's worth of truth about a process tree: every member
 /// the walk from `root_pid` reached, each with its own resident memory, and
@@ -180,8 +182,10 @@ pub fn process_tree_rss_mb(root_pid: u32) -> Option<u64> {
 /// `root_pid` absent from a fresh whole-system snapshot, or process
 /// enumeration answering nothing at all on this platform/build.
 pub fn process_tree_sample(root_pid: u32) -> Option<ProcessTreeSample> {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
+    // Processes only, never threads: on Linux each thread would otherwise be
+    // listed as a child of its process carrying that whole process's RSS, so
+    // a tree's total would count every process once per thread.
+    let system = process_snapshot(ProcessRefreshKind::nothing().with_memory());
 
     let root = Pid::from_u32(root_pid);
     // Confirmed present before anything else: a `root_pid` gone from this
@@ -197,7 +201,7 @@ pub fn process_tree_sample(root_pid: u32) -> Option<ProcessTreeSample> {
     // second sysinfo call per child, however many generations deep the tree
     // goes.
     let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
-    for (pid, process) in system.processes() {
+    for (pid, process) in system.processes().iter().filter(|(_, p)| is_process(p)) {
         if let Some(parent) = process.parent() {
             children.entry(parent).or_default().push(*pid);
         }
@@ -315,14 +319,29 @@ mod tests {
         // task's own note that process-tree sampling is only verified on
         // macOS/Linux.
         let mut child = Command::new("sleep")
-            .arg("5")
+            .arg("30")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("failed to spawn the child helper process");
         let child_pid = child.id();
 
-        let sample = process_tree_sample(std::process::id()).expect("the current process must be found");
+        // `spawn` returns once the child has released the parent's memory,
+        // which on Linux is partway through its `execve`: a sample taken at
+        // that instant can find the child with no resident pages counted yet.
+        // So sample until the child is observable with resident memory, up
+        // to a deadline well inside the child's own lifetime; the assertions
+        // below then read the last sample, so a child that never shows up,
+        // or never shows memory, still fails them.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let sample = loop {
+            let sample = process_tree_sample(std::process::id()).expect("the current process must be found");
+            let observable = sample.rss_bytes_of(child_pid).is_some_and(|bytes| bytes > 0);
+            if observable || std::time::Instant::now() >= deadline {
+                break sample;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
 
         assert!(
             sample.contains(child_pid),
@@ -400,5 +419,160 @@ mod tests {
         assert_eq!(sample.rss_bytes_of(44), None);
         assert_eq!(sample.rss_mb(), 4);
         assert_eq!(sample.members().len(), 3);
+    }
+
+    /// Threads the helper child starts on top of its main thread.
+    #[cfg(target_os = "linux")]
+    const HELPER_THREADS: usize = 8;
+
+    /// Line the helper child prints once all its threads are running.
+    #[cfg(target_os = "linux")]
+    const HELPER_READY: &str = "THREADED-CHILD-READY";
+
+    /// Set in the helper child's environment; without it the helper is a
+    /// no-op, so `--ignored` runs of this binary do not hang on it.
+    #[cfg(target_os = "linux")]
+    const HELPER_ENV: &str = "G_MESH_TEST_THREADED_CHILD";
+
+    /// Not a test: the body of the multi-threaded child the Linux tests below
+    /// spawn by re-running this test binary. Starts [`HELPER_THREADS`] parked
+    /// threads, announces [`HELPER_READY`] and exits once stdin closes.
+    #[test]
+    #[ignore = "helper process for the multi-threaded child tests, not a test of its own"]
+    #[cfg(target_os = "linux")]
+    fn threaded_child_helper() {
+        use std::io::{Read, Write};
+
+        if std::env::var_os(HELPER_ENV).is_none() {
+            return;
+        }
+        for _ in 0..HELPER_THREADS {
+            std::thread::spawn(|| loop {
+                std::thread::park();
+            });
+        }
+        let mut stdout = std::io::stdout();
+        writeln!(stdout, "{HELPER_READY}").expect("failed to announce readiness");
+        stdout.flush().expect("failed to flush readiness");
+        let _ = std::io::stdin().read_to_end(&mut Vec::new());
+        std::process::exit(0);
+    }
+
+    /// A live child running [`threaded_child_helper`]; killed and reaped on
+    /// drop, so a failed assertion does not leak it.
+    #[cfg(target_os = "linux")]
+    struct ThreadedChild {
+        child: std::process::Child,
+        pid: u32,
+        /// Every thread id of the child other than its main thread's (which
+        /// equals `pid`), read from `/proc/<pid>/task` once it was ready.
+        thread_ids: Vec<u32>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ThreadedChild {
+        fn spawn() -> Self {
+            use std::io::BufRead;
+
+            let exe = std::env::current_exe().expect("the test binary's own path");
+            let mut child = Command::new(exe)
+                .args([
+                    "--exact",
+                    "daemon::memory::tests::threaded_child_helper",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(HELPER_ENV, "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("failed to spawn the multi-threaded helper child");
+            let pid = child.id();
+            let stdout = child.stdout.take().expect("stdout was piped");
+            let mut this = ThreadedChild { child, pid, thread_ids: Vec::new() };
+
+            let mut ready = false;
+            for line in std::io::BufReader::new(stdout).lines() {
+                let line = line.expect("failed to read the helper child's stdout");
+                if line.contains(HELPER_READY) {
+                    ready = true;
+                    break;
+                }
+            }
+            assert!(ready, "the helper child {pid} exited without announcing readiness");
+
+            this.thread_ids = std::fs::read_dir(format!("/proc/{pid}/task"))
+                .expect("the ready helper child has a /proc task list")
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+                .filter(|&tid| tid != pid)
+                .collect();
+            assert!(
+                this.thread_ids.len() >= HELPER_THREADS,
+                "precondition: the helper child must be multi-threaded; /proc/{pid}/task listed \
+                 {} thread(s) besides the main one",
+                this.thread_ids.len()
+            );
+            this
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ThreadedChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// On Linux every thread also has an entry under `/proc`, parented to its
+    /// process and reporting that whole process's memory. A multi-threaded
+    /// process sampled as a root is still exactly one member, and the tree's
+    /// total is its own resident memory - not that memory once per thread,
+    /// which would put a plugin over `memoryLimitMb` far below the limit.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_multi_threaded_process_is_one_member_with_its_own_rss() {
+        let child = ThreadedChild::spawn();
+
+        let sample = process_tree_sample(child.pid).expect("the live helper child must be found");
+
+        assert_eq!(
+            sample.members().len(),
+            1,
+            "a process with no child processes is a tree of one, whatever its thread count; \
+             members were {:?}, the child's thread ids {:?}",
+            sample.members(),
+            child.thread_ids
+        );
+        let own = sample.rss_bytes_of(child.pid).expect("the root is a member of its own sample");
+        assert!(own > 0, "a live process has resident memory");
+        assert_eq!(
+            sample.rss_bytes(),
+            own,
+            "the tree's total is the process's own RSS, not that RSS once per thread"
+        );
+    }
+
+    /// Walked from its parent, a multi-threaded child is reached once, and
+    /// none of its thread ids is counted as a process of the tree.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_multi_threaded_child_appears_once_and_none_of_its_threads_does() {
+        let child = ThreadedChild::spawn();
+
+        let sample = process_tree_sample(std::process::id()).expect("the current process must be found");
+
+        let times_listed = sample.members().iter().filter(|(pid, _)| *pid == child.pid).count();
+        assert_eq!(times_listed, 1, "members were {:?}", sample.members());
+        let threads_listed: Vec<u32> =
+            child.thread_ids.iter().copied().filter(|&tid| sample.contains(tid)).collect();
+        assert!(
+            threads_listed.is_empty(),
+            "thread ids {threads_listed:?} of child {} were walked as processes; members were {:?}",
+            child.pid,
+            sample.members()
+        );
     }
 }

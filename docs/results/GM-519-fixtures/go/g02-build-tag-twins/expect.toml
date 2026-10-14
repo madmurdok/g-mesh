@@ -1,0 +1,16 @@
+[[callers]]
+symbol = "Binder.Bind"
+file = "lib/binding.go"
+expect = ["app/app.go:Use"]
+[[callers]]
+symbol = "Binder.Bind"
+file = "lib/binding_tagx.go"
+expect = []
+[[implementations]]
+symbol = "Binder"
+file = "lib/binding.go"
+expect = ["lib/binding.go:impl"]
+[[implementations]]
+symbol = "Binder"
+file = "lib/binding_tagx.go"
+expect = []

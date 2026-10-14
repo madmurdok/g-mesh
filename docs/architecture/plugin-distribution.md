@@ -240,7 +240,9 @@ tier is compiled in).
 anything that can answer a TypeScript semantic question. The plugin resolves
 `vtsls` at run time (`plugins/typescript/plugin.toml`, `[plugin.semantic]`):
 `vtsls` on `PATH`, then the project's own `node_modules/.bin`, then
-`npx --yes --package @vtsls/language-server vtsls`. So in practice:
+`npx --yes --package @vtsls/language-server vtsls`. (Since
+[ADR 0032](../adr/0032-semantic-tiers-execute-no-project-code.md) D7 it is
+`PATH` only; the `npx` path below no longer exists.) So in practice:
 
 - with `vtsls` installed, or Node and network for `npx`, TypeScript keeps a
   semantic tier - but it is now a program g-mesh does not ship or pin, and the

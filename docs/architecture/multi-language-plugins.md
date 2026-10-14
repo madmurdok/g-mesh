@@ -322,6 +322,8 @@ CREATE INDEX idx_targets_scope ON placeholder_targets(scopeKind, scope, key);
   declaration", so it matches on `(scope, qualifiedName)` only. There is no
   ambiguity to refuse, and it still gets the visibility check. This is what makes
   `T.Close` distinguishable from `U.Close`.
+  A semantic `CALLS` under it lands on a `Function`, else a `Variable`, else a
+  `Type` (a const-bound function, a tuple-struct constructor; ADR 0035).
 - `resolved_module` imports gain `scopeKind = 'container'`, and `graph::imports`
   links onto a container node as well as onto a `File`.
 
@@ -684,7 +686,9 @@ edge of kind `K`:
 2. **Key filter.**
    - `name`: `name = key` and the node is *visible* to the requester (below).
    - `qualifiedName`: `qualifiedName = key`.
-3. **Kind filter.** `CALLS` → `Function`, `SUPERTYPE_OF` → `Type`, `REFERENCES` → any.
+3. **Kind filter.** `CALLS` → `Function` (a semantic `qualifiedName` answer:
+   `Function`, then `Variable`, then `Type`), `SUPERTYPE_OF` → `Type`,
+   `REFERENCES` → any.
 4. **Result.**
    - Exactly one candidate: repoint the edge and set `resolved = 1`.
    - None under a `name` key: walk the re-exports of `scope` as today (bounded at
@@ -700,8 +704,11 @@ edge of kind `K`:
      own file.
    - `container(c)`: visible iff `fromContainer` is `c` or has `c` on its parent
      chain (from `containers.parentKey`).
-   - A `qualifiedName` key is checked too, so a semantic tier's mistake cannot link
-     a private symbol from outside.
+   - A structural `qualifiedName` key is checked too. An engine's exact answer
+     (a `semantic` `CALLS` or `REFERENCES` edge under a `qualifiedName` key) is
+     admitted without the check; under a re-exported head only the member lookup
+     is, the head walk stays checked
+     ([ADR 0034](../adr/0034-semantic-answers-bypass-visibility.md)).
 
 `link_diff` gains one trigger: a node upserted into a container can answer
 placeholders waiting on that container, the counterpart of today's

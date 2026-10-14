@@ -1907,6 +1907,11 @@ fn wire_position(
 }
 
 /// The node a location points at, together with the file it is in.
+///
+/// The tightest node containing the location, which may be an encloser of
+/// what the server meant: a class field or an object-literal method has no
+/// node of its own, so a definition at one lands on the class or the const
+/// around it. [`lands_on_name`] tells the two apart.
 fn node_at<'i>(
     index: &'i SdkIndex,
     roots: [&Path; 2],
@@ -1917,6 +1922,36 @@ fn node_at<'i>(
     let at = wire_position(index, &path, encoding, location);
     let node = index.node_at(&path, at)?;
     is_addressable(node).then_some((path, node))
+}
+
+/// Whether `at` (wire columns) is where `node` names itself: the start of
+/// the first whole-word occurrence of its name at or after the start of its
+/// range. A definition answer points at a declaration's name, and a node's
+/// range starts at the declaration, so a precise answer passes; one that
+/// landed on an encloser points at a member's name and fails, even a member
+/// sharing the encloser's name, which occurs after the encloser's own.
+fn lands_on_name(index: &SdkIndex, path: &RelPath, at: Position, node: &WireNode) -> bool {
+    let name: Vec<char> = node.name.chars().collect();
+    if name.is_empty() {
+        return false;
+    }
+    let Some(source) = index.source(path) else { return false };
+    let is_word = |character: char| character.is_alphanumeric() || character == '_' || character == '$';
+    let (start, end) = (node.range.start, node.range.end);
+    for line in start.line..=end.line {
+        let text: Vec<char> = line_text(source, line).chars().collect();
+        let from = if line == start.line { start.col as usize } else { 0 };
+        let mut col = from;
+        while col + name.len() <= text.len() {
+            let before = col > 0 && is_word(text[col - 1]);
+            let after = text.get(col + name.len()).is_some_and(|character| is_word(*character));
+            if !before && !after && text[col..col + name.len()] == name[..] {
+                return at == Position { line, col: col as u32 };
+            }
+            col += 1;
+        }
+    }
+    false
 }
 
 /// The overload declaration a location points into: the tightest
@@ -2477,24 +2512,34 @@ fn record_answer(
             // core's linker refuses an ambiguous address by design, and
             // picking one here would be this bridge making the guess the
             // linker declines to make.
-            let mut target: Option<(RelPath, &WireNode)> = None;
+            let mut target: Option<(RelPath, &WireNode, &ServerLocation)> = None;
             let mut agree = true;
             for location in &found {
                 let Some((path, node)) = node_at(index, roots, encoding, location) else { continue };
                 match &target {
-                    Some((_, chosen)) if chosen.id != node.id => {
+                    Some((_, chosen, _)) if chosen.id != node.id => {
                         agree = false;
                         break;
                     }
                     Some(_) => {}
-                    None => target = Some((path, node)),
+                    None => target = Some((path, node, location)),
                 }
             }
             if untyped_call_answered(index, roots, site, &found, agree && target.is_some()) {
                 *answers.untyped_answered.entry((site.from_id.clone(), site.name.clone())).or_default() += 1;
             }
-            let landed = if agree { target } else { None };
-            let Some((_, node)) = landed else {
+            // A call landing on anything but a function is kept only when
+            // the server pointed at that node's own name: a const-bound
+            // function or a tuple-struct constructor. Pointing inside it at
+            // something without a node (a field, an object-literal method)
+            // names the encloser, which is not what is called.
+            let landed = target.filter(|(path, node, location)| {
+                agree
+                    && (site.edge_kind != EdgeKind::Calls
+                        || node.kind == NodeKind::Function
+                        || lands_on_name(index, path, wire_position(index, path, encoding, location), node))
+            });
+            let Some((_, node, _)) = landed else {
                 // Empty, ambiguous, or nothing this index holds: no evidence
                 // against the structural edge, which therefore stands (R1).
                 if let Some(replaced) = &site.replaces {
@@ -3568,6 +3613,98 @@ mod tests {
             (0, 0),
             "a field read is not a receiver call (GM-497)"
         );
+    }
+
+    /// [`untyped_index`] with `a.toy` replaced by declarations a definition
+    /// can land inside without a node of its own: a class field `cb`, an
+    /// interface property `go`, an object-literal method that repeats its
+    /// const's name, a const-bound function `tick`, a tuple struct `Pair`,
+    /// and a local `inner` in a function body.
+    fn landing_index() -> (SdkIndex, String) {
+        let (mut index, caller) = untyped_index();
+        let source = "class Box {\n  cb = wrap();\n}\ninterface Opts {\n  go: () => void;\n}\n\
+                      const handler = { handler() {} };\nconst tick = () => 1;\nstruct Pair(u8);\n\
+                      fn outer() { let inner = 1; }\n";
+        let a = RelPath::new("a.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &a);
+        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 10, col: 0 } });
+        for (kind, name, start, end) in [
+            (NodeKind::Type, "Box", (0, 0), (2, 1)),
+            (NodeKind::Type, "Opts", (3, 0), (5, 1)),
+            (NodeKind::Variable, "handler", (6, 0), (6, 33)),
+            (NodeKind::Variable, "tick", (7, 0), (7, 21)),
+            (NodeKind::Type, "Pair", (8, 0), (8, 16)),
+            (NodeKind::Function, "outer", (9, 0), (9, 29)),
+        ] {
+            let range = Range {
+                start: Position { line: start.0, col: start.1 },
+                end: Position { line: end.0, col: end.1 },
+            };
+            builder.add_node(NodeSpec::new(kind, name, name, range).native_kind("decl").public());
+        }
+        index.insert(a, source.to_string(), builder.finish());
+        (index, caller)
+    }
+
+    /// A definition answer in `a.toy` at `(line, character)`.
+    fn in_a(line: u32, character: u32) -> Value {
+        json!({ "uri": "file:///p/a.toy", "range": { "start": { "line": line, "character": character } } })
+    }
+
+    /// A call answered inside a node with no node of its own there - a class
+    /// field, an interface property - names the encloser, which is not what
+    /// is called: no edge. At the encloser's own name it is recorded, and a
+    /// reference may still land on the encloser.
+    ///
+    /// Control: `lands_on_name` returns `true` - the field and the property
+    /// calls are recorded on their owners.
+    #[test]
+    fn a_call_answered_at_a_member_without_a_node_never_lands_on_its_owner() {
+        let (index, caller) = landing_index();
+        let call = || site_of(&index, "len", 1);
+        assert_eq!(answered_by(&index, &caller, call(), in_a(1, 2)).1, 0, "a class field");
+        assert_eq!(answered_by(&index, &caller, call(), in_a(4, 2)).1, 0, "an interface property");
+        assert_eq!(answered_by(&index, &caller, call(), in_a(0, 6)).1, 1, "the class's own name");
+        assert_eq!(
+            answered_by(&index, &caller, site_of(&index, "fld", 5), in_a(1, 2)).1,
+            1,
+            "a field read, a reference, is not held to the name"
+        );
+    }
+
+    /// A const-bound function and a tuple struct are called at their own
+    /// names, so those answers are recorded.
+    #[test]
+    fn a_call_answered_at_a_variable_or_type_name_is_recorded() {
+        let (index, caller) = landing_index();
+        let call = || site_of(&index, "len", 1);
+        assert_eq!(answered_by(&index, &caller, call(), in_a(7, 6)).1, 1, "a const-bound function");
+        assert_eq!(answered_by(&index, &caller, call(), in_a(8, 7)).1, 1, "a tuple struct");
+    }
+
+    /// `const handler = { handler() {} }` answered at the inner `handler`:
+    /// the word under the answer is the const's name, but the const names
+    /// itself first, so the method's answer is not the const's.
+    ///
+    /// Control: `lands_on_name` accepts any whole-word occurrence of the name,
+    /// not only the first - the inner one is recorded.
+    #[test]
+    fn a_call_answered_at_a_member_sharing_its_owners_name_is_not_recorded() {
+        let (index, caller) = landing_index();
+        let call = || site_of(&index, "len", 1);
+        assert_eq!(answered_by(&index, &caller, call(), in_a(6, 18)).1, 0, "the object-literal method");
+        assert_eq!(answered_by(&index, &caller, call(), in_a(6, 6)).1, 1, "the const's own name");
+    }
+
+    /// A call landing on a function is recorded wherever in it the answer
+    /// points: only a non-function target is held to its name.
+    ///
+    /// Control: drop the `node.kind == NodeKind::Function` arm - the answer
+    /// inside `outer`'s body records nothing.
+    #[test]
+    fn a_call_answered_inside_a_function_still_lands_on_it() {
+        let (index, caller) = landing_index();
+        assert_eq!(answered_by(&index, &caller, site_of(&index, "len", 1), in_a(9, 17)).1, 1);
     }
 
     fn answered(counts: &[(&str, &str, usize)]) -> HashMap<(String, String), usize> {

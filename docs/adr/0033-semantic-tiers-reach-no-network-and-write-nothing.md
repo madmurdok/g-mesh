@@ -33,7 +33,13 @@ nothing under the project root.
   environment next to ADR 0032's toolchain pin
   (`plugins/rust/src/semantic.rs`, `pinned_env`), so it reaches every cargo
   rust-analyzer starts. Environment outranks a project's
-  `.cargo/config.toml` `net.offline`.
+  `.cargo/config.toml` `net.offline`. The same map pins
+  `CARGO_ENCODED_RUSTFLAGS` empty and `CARGO_UNSTABLE_HOST_CONFIG=false`
+  (ADR 0032 D2), which keep a project's `.cargo/config.toml` `rustflags`,
+  `[host]` ones included, from reaching the `rustc` probes rust-analyzer
+  runs. Profile rustflags (`[unstable] profile-rustflags`) are not covered:
+  they apply only when cargo compiles, which the server never asks for. The
+  `[env]` dynamic-linker channel stays open (ADR 0032, Consequences).
 - **D2 - python: no `npx`.** Done by ADR 0032 D4; pyright comes from `PATH`
   only. Nothing further.
 - **D3 - go: `GOPROXY=off`, `GONOPROXY=-` and `GOSUMDB=off`, always.** Appended to
@@ -61,6 +67,13 @@ nothing under the project root.
   counts as well as the process environment. A
   command-line `-mod` overrides only the `-mod` in the user's `GOFLAGS`; the
   user's other flags stay. `GOFLAGS` itself is not replaced.
+- **D5 - TypeScript: no `npx`, no automatic type acquisition.** Added
+  2026-10-13 (GM-566). vtsls comes from `PATH` only (ADR 0032 D7), which
+  removes the per-start registry contact of the `npx` candidate.
+  `typescript.disableAutomaticTypeAcquisition = true`
+  (`plugins/typescript/plugin.toml`): with it on, opening a JavaScript file
+  made tsserver's typings installer run `npm install types-registry@latest`
+  and `npm install @types/<dependency>` against the registry (measured).
 
 Exception, documented rather than prevented (owner decision): **go itself
 writes `go.work.sum` in workspace mode.** Trigger: the governing `go.work`
@@ -96,5 +109,6 @@ config (works only for a user whose npm cache already holds pyright).
 - `Cargo.lock` is not written because rust-analyzer 1.97.1 passes
   `-Zlockfile-path`; an older rust-analyzer may write one. No configuration
   of ours prevents that; the tests pin it for the version CI installs.
-- Follow-up: TypeScript's `npx` candidate (same network exposure as
-  python's had), in its own task.
+- A JavaScript project loses types only automatic type acquisition would
+  have downloaded (`@types/*` for an untyped dependency); those targets are
+  third-party and outside the index either way (D5).

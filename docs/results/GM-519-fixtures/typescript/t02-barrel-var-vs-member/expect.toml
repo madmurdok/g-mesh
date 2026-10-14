@@ -1,4 +1,13 @@
+# The exported const `handler` (a Variable) and `Router#handler` share a name
+# and a module, and main.ts reaches them through the barrel `export * from
+# "./x"`. `file` matches both, so the second entry adds `kind`.
 [[callers]]
 symbol = "Router#handler"
 file = "src/x.ts"
 expect = []
+
+[[callers]]
+symbol = "handler"
+file = "src/x.ts"
+kind = "Variable"
+expect = ["src/main.ts:run"]

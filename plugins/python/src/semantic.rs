@@ -65,8 +65,8 @@
 //! pyright-langserver` (a 404: `pyright-langserver` is a bin of the `pyright`
 //! package, not a package), and its probe had to differ from that argv only
 //! in the bin name - a probe that proves the package rather than the argv
-//! shape proves the wrong thing. TypeScript still has an `npx` candidate,
-//! with the same exposure (its own follow-up task).
+//! shape proves the wrong thing. TypeScript resolves vtsls the same way,
+//! `PATH` only (ADR 0032, D7).
 //!
 //! A `command` that is a *path* is not searched around, exactly as GM-290
 //! decided: someone who wrote a path into the manifest meant that file. It is
@@ -224,20 +224,10 @@ const LANGUAGE: &str = "python";
 const SERVER_BIN: &str = "pyright-langserver";
 const CLI_BIN: &str = "pyright";
 
-/// The npm *package* both of those bins belong to.
-///
-/// Spelled separately from [`CLI_BIN`] although the two strings are equal
-/// today, because they are different kinds of name and only one of them is
-/// what `npx --package` wants: `npx --yes pyright-langserver` asks the
-/// registry for a package called `pyright-langserver` and is answered 404.
-/// This plugin runs no `npx` (Decision 1); [`NpmServer`] still names it.
-const NPM_PACKAGE: &str = "pyright";
-
 /// pyright as an npm package: the server is probed through its CLI twin,
 /// because `pyright-langserver` has no `--version` (this module's doc,
 /// Decision 1).
-const PYRIGHT: NpmServer<'static> =
-    NpmServer { package: NPM_PACKAGE, bin: SERVER_BIN, probe_bin: CLI_BIN, twin: cli_twin };
+const PYRIGHT: NpmServer<'static> = NpmServer { bin: SERVER_BIN, twin: cli_twin };
 
 /// The virtual-environment directory names looked for under the project root,
 /// in order.

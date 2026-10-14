@@ -15,14 +15,22 @@
 //! overloaded call, so `overload_disambiguation` stays at its default and
 //! the bridge's containment path binds it (design note §1.4).
 //!
-//! # Resolution: `PATH`, then the project's `node_modules/.bin`, then `npx`
+//! # Resolution: `PATH` only
 //!
-//! The SDK's [`npm_candidates`], as for pyright. vtsls answers `--version`
-//! itself and exits, so there is no CLI twin: every candidate is probed as
-//! the server it would run, and the `npx` probe is the server's argv with
-//! `--version`. The project's own `typescript` is deliberately **not** a
-//! candidate: TypeScript 6 and older have no LSP entry point, and 7's native
-//! server cannot bind an imported overload (§2).
+//! The SDK's [`npm_candidates_on_path`], as for pyright: never the indexed
+//! project's own `node_modules/.bin` and never `npx`, which run with the
+//! project as cwd executes the project's own `@vtsls/language-server`
+//! ([ADR 0032](../../../docs/adr/0032-semantic-tiers-execute-no-project-code.md)).
+//! vtsls answers `--version` itself and exits, so there is no CLI twin: every
+//! candidate is probed as the server it would run. The project's own
+//! `typescript` is deliberately **not** a candidate: TypeScript 6 and older
+//! have no LSP entry point, and 7's native server cannot bind an imported
+//! overload (§2).
+//!
+//! The server runs vtsls's bundled TypeScript, never the project's, so no
+//! project `typescript` and no tsconfig `plugins` package loads; and automatic
+//! type acquisition is off, so tsserver runs no `npm`. Both are pinned in
+//! `plugins/typescript/plugin.toml`'s `[plugin.semantic.settings.""]`.
 //!
 //! # Failure
 //!
@@ -37,8 +45,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use g_mesh_plugin_sdk::lsp::{
-    self, npm_candidates, Candidate, LspBridge, NpmServer, Resolved, SemanticConfig, HOST_SCRIPT_EXTENSIONS,
-    PROBE_BUDGET,
+    self, npm_candidates_on_path, Candidate, LspBridge, NpmServer, Resolved, SemanticConfig,
+    HOST_SCRIPT_EXTENSIONS, PROBE_BUDGET,
 };
 use g_mesh_plugin_sdk::SemanticEngine;
 
@@ -74,14 +82,9 @@ const WARM_UP: Duration = Duration::from_secs(120);
 /// The npm package's language-server bin, the manifest's `command`.
 const SERVER_BIN: &str = "vtsls";
 
-/// The npm *package* that bin belongs to: `npx --package` wants this, and
-/// `npx --yes vtsls` would ask the registry for a package called `vtsls`.
-const NPM_PACKAGE: &str = "@vtsls/language-server";
-
 /// vtsls as an npm package. The server answers `--version` itself, so it is
 /// its own probe.
-const VTSLS: NpmServer<'static> =
-    NpmServer { package: NPM_PACKAGE, bin: SERVER_BIN, probe_bin: SERVER_BIN, twin: same_binary };
+const VTSLS: NpmServer<'static> = NpmServer { bin: SERVER_BIN, twin: same_binary };
 
 /// Builds the semantic engine for `root` - the
 /// [`SemanticEngineFactory`](g_mesh_plugin_sdk::SemanticEngineFactory) body,
@@ -95,15 +98,15 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
                  server to run - see plugins/typescript/plugin.toml"
             )
         })?;
-    prepare(&mut config, root)?;
+    prepare(&mut config)?;
     Ok(Box::new(LspBridge::new(LANGUAGE, root, config).language_ids(&LANGUAGE_IDS).warm_up(WARM_UP)))
 }
 
-/// Turns the manifest's `config` into the one the server for `root` runs
-/// with: the resolved command, then the manifest's own args after any the
-/// candidate needs first (`npx`'s package).
-fn prepare(config: &mut SemanticConfig, root: &Path) -> Result<()> {
-    let resolved = resolve(&config.command, root, HOST_SCRIPT_EXTENSIONS)?;
+/// Turns the manifest's `config` into the one the server runs with: the
+/// resolved command, then the manifest's own args after any the candidate
+/// needs first.
+fn prepare(config: &mut SemanticConfig) -> Result<()> {
+    let resolved = resolve(&config.command, HOST_SCRIPT_EXTENSIONS)?;
     let mut args = resolved.prefix_args;
     args.extend(config.args.iter().cloned());
     g_mesh_plugin_sdk::log_line!(
@@ -121,20 +124,22 @@ fn prepare(config: &mut SemanticConfig, root: &Path) -> Result<()> {
 ///
 /// `script_extensions` is [`HOST_SCRIPT_EXTENSIONS`] in production; it is a
 /// parameter so tests can exercise the Windows spellings from any host.
-fn resolve(command: &Path, root: &Path, script_extensions: &[&str]) -> Result<Resolved> {
+fn resolve(command: &Path, script_extensions: &[&str]) -> Result<Resolved> {
     lsp::resolve(
-        candidates(command, root, script_extensions),
+        candidates(command, script_extensions),
         PROBE_BUDGET,
         "vtsls",
-        "Install it with npm install -g @vtsls/language-server (or in the project, whose \
-         node_modules/.bin is looked in), or point [plugin.semantic] command in \
+        "Install it with `npm install -g @vtsls/language-server` so vtsls is on PATH (neither the \
+         project's node_modules nor npx is used: ADR 0032), or point [plugin.semantic] command in \
          plugins/typescript/plugin.toml at a TypeScript language server",
     )
 }
 
-/// The spellings worth probing, in order - [`npm_candidates`] for vtsls.
-fn candidates(command: &Path, root: &Path, script_extensions: &[&str]) -> Vec<Candidate> {
-    npm_candidates(command, root, &VTSLS, script_extensions)
+/// The spellings worth probing, in order - [`npm_candidates_on_path`] for
+/// vtsls: `PATH` only, never the indexed project's own `node_modules/.bin`
+/// and never `npx`.
+fn candidates(command: &Path, script_extensions: &[&str]) -> Vec<Candidate> {
+    npm_candidates_on_path(command, &VTSLS, script_extensions)
 }
 
 /// vtsls's probe path: the server itself, which answers `--version`.
@@ -154,41 +159,24 @@ mod tests {
         toml::from_str(&text).expect("plugins/typescript/plugin.toml parses")
     }
 
-    /// A bare `vtsls` is `PATH`, then the project's `node_modules/.bin`, then
-    /// `npx` with the package named - each spelled bare and then with every
-    /// script extension before the next origin. Every installed candidate is
-    /// probed as itself, and the `npx` probe is the server's own argv.
+    /// A bare `vtsls` is `PATH` only, spelled bare and then with every script
+    /// extension: no project `node_modules/.bin`, no `npx`. Every candidate
+    /// is probed as itself, with no args of its own.
     #[test]
-    fn a_bare_vtsls_is_path_then_the_projects_node_modules_then_npx() {
-        let root = Path::new("/projects/thing");
-        let candidates = candidates(Path::new(SERVER_BIN), root, &WINDOWS_SCRIPT_EXTENSIONS);
-        let local = root.join("node_modules/.bin");
+    fn a_bare_vtsls_is_path_only_in_every_spelling() {
+        let candidates = candidates(Path::new(SERVER_BIN), &WINDOWS_SCRIPT_EXTENSIONS);
         let spelled: Vec<(&str, PathBuf)> =
             candidates.iter().map(|candidate| (candidate.origin, candidate.command.clone())).collect();
         assert_eq!(
             spelled,
-            vec![
-                ("PATH", PathBuf::from("vtsls")),
-                ("PATH", PathBuf::from("vtsls.cmd")),
-                ("the project's node_modules/.bin", local.join("vtsls")),
-                ("the project's node_modules/.bin", local.join("vtsls.cmd")),
-                ("npx", PathBuf::from("npx")),
-                ("npx", PathBuf::from("npx.cmd")),
-            ],
+            vec![("PATH", PathBuf::from("vtsls")), ("PATH", PathBuf::from("vtsls.cmd"))],
             "{candidates:#?}"
         );
-        let npx_args = vec!["--yes", "--package", "@vtsls/language-server", "vtsls"];
         for candidate in &candidates {
             let (probe, probe_args) = &candidate.probe;
-            if candidate.origin == "npx" {
-                assert_eq!(candidate.prefix_args, npx_args, "{candidate:#?}");
-                assert_eq!(probe, &candidate.command, "{candidate:#?}");
-                assert_eq!(probe_args, &npx_args, "the probe runs the server's own bin: {candidate:#?}");
-            } else {
-                assert!(candidate.prefix_args.is_empty(), "{candidate:#?}");
-                assert_eq!(probe, &candidate.command, "vtsls is its own probe: {candidate:#?}");
-                assert!(probe_args.is_empty(), "{candidate:#?}");
-            }
+            assert!(candidate.prefix_args.is_empty(), "{candidate:#?}");
+            assert_eq!(probe, &candidate.command, "vtsls is its own probe: {candidate:#?}");
+            assert!(probe_args.is_empty(), "{candidate:#?}");
         }
     }
 
@@ -197,8 +185,7 @@ mod tests {
     #[test]
     fn nothing_usable_names_vtsls_and_the_remedy() {
         let err =
-            resolve(Path::new("/nonexistent/vtsls"), Path::new("/projects/thing"), HOST_SCRIPT_EXTENSIONS)
-                .expect_err("must not resolve");
+            resolve(Path::new("/nonexistent/vtsls"), HOST_SCRIPT_EXTENSIONS).expect_err("must not resolve");
         let message = format!("{err:#}");
         assert!(message.contains("no usable vtsls"), "{message}");
         assert!(message.contains("npm install -g @vtsls/language-server"), "{message}");
@@ -219,10 +206,18 @@ mod tests {
         assert!(config.implementation_kinds.is_empty(), "{:?}", config.implementation_kinds);
         assert_eq!(config.overload_disambiguation, OverloadDisambiguation::None);
         assert_eq!(
-            config.settings.get(""),
-            Some(&serde_json::json!({ "typescript": { "tsserver": { "useSyntaxServer": "never" } } })),
-            "{:?}",
-            config.settings
+            config.settings,
+            std::collections::BTreeMap::from([(
+                String::new(),
+                serde_json::json!({
+                    "typescript": {
+                        "tsserver": { "useSyntaxServer": "never" },
+                        "disableAutomaticTypeAcquisition": true,
+                    },
+                    "vtsls": { "autoUseWorkspaceTsdk": false },
+                })
+            )]),
+            "exactly these settings: no tsdk, plugin path, global plugin or node path may be added"
         );
 
         let parsed = manifest();

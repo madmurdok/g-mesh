@@ -1,0 +1,15 @@
+# The one reference each CALLS walk leaves behind is the `-> Pair` / `-> Shape`
+# return type, a non-call usage. `Pair` has no file tally entry because its
+# only caller row already sits in src/lib.rs; `Shape::Dot(1)` is a call on the
+# variant, dropped from Shape by the bridge's own-name check.
+[[callers]]
+symbol = "Pair"
+file = "src/lib.rs"
+expect = ["src/lib.rs:make"]
+excluded_references = { count = 1, files = [] }
+
+[[callers]]
+symbol = "Shape"
+file = "src/lib.rs"
+expect = []
+excluded_references = { count = 1, files = ["src/lib.rs:1"] }

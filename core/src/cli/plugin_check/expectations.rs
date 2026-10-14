@@ -135,15 +135,21 @@
 //!    `fileName`, or `semanticNeighbours`; see `find_definition::ResolvedBy`
 //!    - alongside a top-level `"results"` array; see [`is_candidate_page`]).
 //!
-//!    If the expectation gave an optional `file`, and *exactly one*
-//!    candidate's `filePath` matches it, that candidate is the answer: the
-//!    handler is re-called with `symbol_id` set to the candidate's `id` -
-//!    still the same handler code, now anchored precisely rather than by a
-//!    name that turned out ambiguous. All five tools take `symbol_id`, so a
-//!    candidate whose `qualifiedName` is itself shared (a bare Go func name
-//!    against a method, `shapes::Gauge` in two Rust crates) narrows to one
-//!    as surely as any other.
-//! 3. **No `file`, or `file` narrows to zero or more than one candidate**:
+//!    If the expectation gave any of the optional narrowing keys - `file`
+//!    (the candidate's `filePath`), `kind` (its `kind`: `"Function"`,
+//!    `"Variable"`, `"Type"`, ...) and `qualified_name` (its
+//!    `qualifiedName`) - and *exactly one* candidate matches every key it
+//!    gave, that candidate is the answer: the handler is re-called with
+//!    `symbol_id` set to the candidate's `id` - still the same handler code,
+//!    now anchored precisely rather than by a name that turned out
+//!    ambiguous. All five tools take `symbol_id`, so a candidate whose
+//!    `qualifiedName` is itself shared (a bare Go func name against a method,
+//!    `shapes::Gauge` in two Rust crates) narrows to one as surely as any
+//!    other. `file` alone cannot tell apart two declarations of one file
+//!    sharing a name (a TS `export const handler` beside `Router#handler`);
+//!    `kind` or `qualified_name` can.
+//! 3. **No narrowing key, or the keys narrow to zero or more than one
+//!    candidate**:
 //!    the expectation fails, with every candidate's `id`/`qualifiedName`/
 //!    `filePath`/`kind` printed - never a silent pick, per the task's own
 //!    instruction.
@@ -699,6 +705,15 @@ struct SymbolExpectation {
     /// when the plain name turns out ambiguous.
     #[serde(default)]
     file: Option<String>,
+    /// Narrows like `file`, by the candidate's `kind` (`"Variable"`,
+    /// `"Function"`, ...) - decision 3. For two candidates `file` cannot
+    /// tell apart.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Narrows like `file`, by the candidate's exact `qualifiedName` -
+    /// decision 3.
+    #[serde(default)]
+    qualified_name: Option<String>,
     expect: Vec<String>,
     /// Decision 6. Absent means `Structural`.
     #[serde(default)]
@@ -727,6 +742,59 @@ struct SymbolExpectation {
     /// response must carry no block at all.
     #[serde(default)]
     excluded_references: Option<ExcludedExpectation>,
+}
+
+impl SymbolExpectation {
+    fn narrowing(&self) -> Narrowing<'_> {
+        Narrowing {
+            file: self.file.as_deref(),
+            kind: self.kind.as_deref(),
+            qualified_name: self.qualified_name.as_deref(),
+        }
+    }
+}
+
+/// The keys an entry picks one candidate of an ambiguous `symbol` by -
+/// decision 3. Every key given must match; none given never picks.
+#[derive(Debug, Default, Clone, Copy)]
+struct Narrowing<'a> {
+    file: Option<&'a str>,
+    kind: Option<&'a str>,
+    qualified_name: Option<&'a str>,
+}
+
+impl Narrowing<'_> {
+    /// The keys given, each with the candidate field it is compared to.
+    fn keys(&self) -> Vec<(&'static str, &'static str, &str)> {
+        [
+            ("file", "filePath", self.file),
+            ("kind", "kind", self.kind),
+            ("qualified_name", "qualifiedName", self.qualified_name),
+        ]
+        .into_iter()
+        .filter_map(|(key, field, value)| value.map(|value| (key, field, value)))
+        .collect()
+    }
+
+    fn matches(&self, candidate: &Value) -> bool {
+        self.keys()
+            .iter()
+            .all(|(_, field, value)| candidate.get(*field).and_then(Value::as_str) == Some(*value))
+    }
+
+    /// `filePath == "a.ts", kind == "Variable"`: what a candidate had to match.
+    fn describe_fields(&self) -> String {
+        self.keys()
+            .iter()
+            .map(|(_, field, value)| format!("{field} == \"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// `, file = "a.ts", kind = "Variable"`: the keys as the entry spelled them.
+    fn describe_keys(&self) -> String {
+        self.keys().iter().map(|(key, _, value)| format!(", {key} = \"{value}\"")).collect()
+    }
 }
 
 /// Decision 13's `excluded_references` block. Both fields are required once
@@ -1015,8 +1083,8 @@ fn eval_symbol_expectation(
     tool: SymbolTool,
 ) -> CheckResult {
     let id = format!("expectations.{kind}[{index}]");
-    match resolve_and_call(ctx, &tool, &item.symbol, item.file.as_deref()) {
-        Err(findings) => fail(id, context_lines(&item.symbol, item.file.as_deref(), findings)),
+    match resolve_and_call(ctx, &tool, &item.symbol, item.narrowing()) {
+        Err(findings) => fail(id, context_lines(&item.symbol, item.narrowing(), findings)),
         Ok(value) => {
             if let Some(finding) = page_truncation_finding(&value, tool.label()) {
                 return fail(id, vec![finding]);
@@ -1051,15 +1119,15 @@ fn eval_symbol_expectation(
 
 /// Calls `tool` for `symbol`, resolving via the tool's own `symbol_name`
 /// handling (decision 3). If that comes back as a candidate page, narrows
-/// it by `file` and re-calls by the winning candidate's `symbol_id` -
-/// genuinely the same handler, just anchored precisely, never a hand-built
-/// answer. Returns the finished result JSON, or the findings to report
-/// instead.
+/// it by the entry's narrowing keys and re-calls by the winning candidate's
+/// `symbol_id` - genuinely the same handler, just anchored precisely, never a
+/// hand-built answer. Returns the finished result JSON, or the findings to
+/// report instead.
 fn resolve_and_call(
     ctx: &EvalContext,
     tool: &SymbolTool,
     symbol: &str,
-    file: Option<&str>,
+    narrowing: Narrowing,
 ) -> Result<Value, Vec<String>> {
     let limit = Some(pagination::MAX_PAGE_SIZE as u32);
     let first = SymbolQueryParams {
@@ -1077,7 +1145,7 @@ fn resolve_and_call(
 
     let candidate_id = {
         let candidate =
-            pick_candidate(&value, file).map_err(|reason| candidate_failure(symbol, &value, &reason))?;
+            pick_candidate(&value, narrowing).map_err(|reason| candidate_failure(symbol, &value, &reason))?;
         candidate.get("id").and_then(Value::as_str).unwrap_or_default().to_string()
     };
     let retry = SymbolQueryParams {
@@ -1389,8 +1457,8 @@ fn import_rows(value: &Value) -> Vec<String> {
 
 fn eval_definition_expectation(ctx: &EvalContext, index: usize, item: &SymbolExpectation) -> CheckResult {
     let id = format!("expectations.definition[{index}]");
-    match resolve_definition(ctx, &item.symbol, item.file.as_deref()) {
-        Err(findings) => fail(id, context_lines(&item.symbol, item.file.as_deref(), findings)),
+    match resolve_definition(ctx, &item.symbol, item.narrowing()) {
+        Err(findings) => fail(id, context_lines(&item.symbol, item.narrowing(), findings)),
         Ok(value) => {
             let actual: BTreeSet<String> = match (
                 value.get("filePath").and_then(Value::as_str),
@@ -1429,7 +1497,7 @@ fn eval_definition_expectation(ctx: &EvalContext, index: usize, item: &SymbolExp
 
 /// `find_definition`'s own version of [`resolve_and_call`] - decision 3,
 /// with `find_definition`'s parameters in place of `SymbolQueryParams`.
-fn resolve_definition(ctx: &EvalContext, symbol: &str, file: Option<&str>) -> Result<Value, Vec<String>> {
+fn resolve_definition(ctx: &EvalContext, symbol: &str, narrowing: Narrowing) -> Result<Value, Vec<String>> {
     let value = tool_json(call_definition(ctx, symbol.to_string())).map_err(|e| vec![e])?;
     if !is_candidate_page(&value) {
         return Ok(value);
@@ -1437,7 +1505,7 @@ fn resolve_definition(ctx: &EvalContext, symbol: &str, file: Option<&str>) -> Re
 
     let candidate_id = {
         let candidate =
-            pick_candidate(&value, file).map_err(|reason| candidate_failure(symbol, &value, &reason))?;
+            pick_candidate(&value, narrowing).map_err(|reason| candidate_failure(symbol, &value, &reason))?;
         candidate.get("id").and_then(Value::as_str).unwrap_or_default().to_string()
     };
     let retry = FindDefinitionParams { symbol_id: Some(candidate_id), ..definition_params() };
@@ -1644,24 +1712,27 @@ fn is_candidate_page(value: &Value) -> bool {
     value.get("resolvedBy").is_some() && value.get("results").is_some_and(Value::is_array)
 }
 
-/// Picks the one candidate `file` names, or explains why it can't - decision
-/// 3. Never guesses when `file` is absent or does not narrow to exactly one.
-fn pick_candidate<'a>(value: &'a Value, file: Option<&str>) -> Result<&'a Value, String> {
+/// Picks the one candidate the narrowing keys name, or explains why it
+/// can't (decision 3). Never guesses when no key is given or the keys do not
+/// narrow to exactly one.
+fn pick_candidate<'a>(value: &'a Value, narrowing: Narrowing) -> Result<&'a Value, String> {
     let results = value.get("results").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
-    let Some(file) = file else {
-        return Err("ambiguous, and no `file` was given to disambiguate".to_string());
-    };
-    let matches: Vec<&Value> =
-        results.iter().filter(|c| c.get("filePath").and_then(Value::as_str) == Some(file)).collect();
+    if narrowing.keys().is_empty() {
+        return Err(
+            "ambiguous, and no `file` was given to disambiguate (nor `kind` or `qualified_name`)".to_string()
+        );
+    }
+    let matches: Vec<&Value> = results.iter().filter(|candidate| narrowing.matches(candidate)).collect();
+    let wanted = narrowing.describe_fields();
     match matches.len() {
         1 => Ok(matches[0]),
-        0 => Err(format!("no candidate has filePath == \"{file}\"")),
-        n => Err(format!("{n} candidates still share filePath == \"{file}\"")),
+        0 => Err(format!("no candidate has {wanted}")),
+        n => Err(format!("{n} candidates still share {wanted}")),
     }
 }
 
 /// The findings for a candidate page that could not be resolved to one
-/// answer: why (`reason`, already naming `file` when one was given - see
+/// answer: why (`reason`, already naming the narrowing keys given - see
 /// [`pick_candidate`]), plus every candidate's identifying fields, so a
 /// human (or the wrong-expectation test) can see exactly what was on offer.
 fn candidate_failure(symbol: &str, value: &Value, reason: &str) -> Vec<String> {
@@ -1841,11 +1912,8 @@ fn set_diff_outcome(expected: &BTreeSet<String>, actual: &BTreeSet<String>) -> O
     Outcome::Fail(findings)
 }
 
-fn context_lines(symbol: &str, file: Option<&str>, findings: Vec<String>) -> Vec<String> {
-    let mut out = vec![format!(
-        "symbol = \"{symbol}\"{}",
-        file.map(|f| format!(", file = \"{f}\"")).unwrap_or_default()
-    )];
+fn context_lines(symbol: &str, narrowing: Narrowing, findings: Vec<String>) -> Vec<String> {
+    let mut out = vec![format!("symbol = \"{symbol}\"{}", narrowing.describe_keys())];
     out.extend(findings);
     out
 }

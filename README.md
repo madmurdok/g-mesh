@@ -372,10 +372,11 @@ semantic tier needs `vtsls`.
 (tree-sitter grammars linked in), so the whole structural graph is built on a
 machine with no Node installed. The archive does *not* carry a TypeScript
 language server: the semantic pass that upgrades unresolved edges drives
-`vtsls`, found on `PATH`, in the indexed project's own `node_modules/.bin`, or
-through `npx --yes --package @vtsls/language-server vtsls` — each of which
-needs Node.js. Without one the semantic pass is skipped and every structural
-edge is still indexed.
+`vtsls`, found on `PATH` only (`npm install -g @vtsls/language-server`, which
+needs Node.js): never the indexed project's own `node_modules/.bin`, never
+`npx`, and never the project's own TypeScript or tsconfig plugins, so indexing
+runs no project code. Without one the semantic pass is skipped and every
+structural edge is still indexed.
 
 Building an archive needs Rust and Go, not Node, and each archive is built on
 the platform it targets, because core and the cargo plugins compile C (SQLite,
