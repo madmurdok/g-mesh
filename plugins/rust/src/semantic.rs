@@ -63,6 +63,10 @@
 //! missing (`core::mcp::provenance`). Installing the
 //! component and restarting the daemon then gets the pass; a
 //! completed-but-empty pass would have recorded "done" and never asked again.
+//!
+//! The same factory failure is how a project is refused the tier when a
+//! cargo config in effect for it sets a dynamic-loader variable in `[env]`
+//! ([ADR 0036](../../../docs/adr/0036-rust-tier-refuses-cargo-env-loader-vars.md)).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -88,6 +92,12 @@ const LANGUAGE: &str = "rust";
 /// offline, so a dependency missing from the local cargo cache is not
 /// fetched and its edges stay unresolved until the user runs `cargo fetch`
 /// ([ADR 0033](../../../docs/adr/0033-semantic-tiers-reach-no-network-and-write-nothing.md)).
+///
+/// A project `.cargo/config.toml`/`CARGO_HOME` config whose `[env]` sets a
+/// dynamic-loader variable is refused to the structural tier, because cargo
+/// applies that table to the `rustc` children of `cargo metadata` and
+/// `force = true` defeats any environment override: this returns `Err`
+/// naming the key and the file, and the plugin stays structural-only.
 pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     let mut config = SemanticConfig::from_manifest()
         .context("reading [plugin.semantic] from this plugin's manifest")?
@@ -99,6 +109,14 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
         })?;
 
     let toolchain = Toolchain::detect();
+    if let Some((var, file)) = cargo_env_loader_var(root) {
+        anyhow::bail!(
+            "semantic tier refused: the cargo config {} sets {var} in [env], a dynamic-loader \
+             variable cargo would pass to every rustc it starts for rust-analyzer; this project \
+             is indexed at the structural tier only (docs/adr/0036)",
+            file.display()
+        );
+    }
     let resolved = resolve(&config.command, &toolchain)?;
     g_mesh_plugin_sdk::log_line!(
         "[{LANGUAGE}] semantic tier: {} ({}, toolchain {}, cargo offline: dependencies not in the \
@@ -174,8 +192,10 @@ impl Toolchain {
 /// gives them `[host]` `rustflags` instead. `CARGO_UNSTABLE_HOST_CONFIG=false`
 /// outranks that `[unstable]` key, so host units get the empty
 /// `CARGO_ENCODED_RUSTFLAGS` or no flags at all. Stable cargo ignores the
-/// variable. The config's `[env]` table reaches `rustc` by another route
-/// and is not covered.
+/// variable. The config's `[env]` table reaches `rustc` by another route,
+/// which no variable here outranks (`force = true` overrides any inherited
+/// value): a dynamic-loader variable in it is refused by [`engine`] (see
+/// [`cargo_env_loader_var`]), and its other entries stay outside this map.
 /// `CARGO_NET_OFFLINE` reaches every cargo the server runs (`metadata`,
 /// `locate-project`, `config get`), so none of them downloads a dependency
 /// or refreshes a registry index.
@@ -204,6 +224,116 @@ fn pinned_env(toolchain: &Toolchain) -> BTreeMap<String, String> {
         env.insert(wrapper.to_string(), String::new());
     }
     env
+}
+
+/// The dynamic-loader variables a cargo config `[env]` table may not set
+/// for the server to start: each one makes the loader map a file the
+/// project names into every `rustc` and `rustup` that cargo starts.
+const LOADER_VARS: [&str; 6] = [
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+];
+
+/// The first [`LOADER_VARS`] key that a cargo config in effect for `root`
+/// sets in its `[env]` table, and the config file that sets it. `None` when
+/// no such config sets one.
+///
+/// The configs are the ones cargo reads for a command run in `root`, in its
+/// order: `.cargo/config.toml` then the legacy `.cargo/config` in `root` and
+/// in each ancestor up to the filesystem root, then `config.toml` and
+/// `config` in `$CARGO_HOME` (default `~/.cargo`). Each file's `include`
+/// (a path, an array of paths, or tables with a `path`, relative to the
+/// including file's directory) is followed transitively. The configs of
+/// `root`'s immediate subdirectories are read too, because rust-analyzer
+/// runs `cargo metadata` in a subdirectory holding the project's
+/// `Cargo.toml` when `root` holds none.
+///
+/// Both `[env]` forms count: `KEY = "value"` and `KEY = { value = "...",
+/// force = ..., relative = ... }`. A file that does not parse is matched by
+/// text instead, so a syntax this parser does not accept and cargo does
+/// cannot hide a key. A file that cannot be read is skipped: cargo cannot
+/// read it either.
+fn cargo_env_loader_var(root: &Path) -> Option<(String, PathBuf)> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(children) = std::fs::read_dir(root) {
+        let mut children: Vec<PathBuf> = children
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .filter(|dir| dir.file_name().is_some_and(|name| name != ".cargo"))
+            .collect();
+        children.sort();
+        dirs.extend(children.into_iter().map(|dir| dir.join(".cargo")));
+    }
+    dirs.splice(0..0, root.ancestors().map(|dir| dir.join(".cargo")));
+    if let Some(cargo_home) = cargo_home() {
+        dirs.push(cargo_home);
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    let mut pending: Vec<PathBuf> =
+        dirs.iter().flat_map(|dir| [dir.join("config.toml"), dir.join("config")]).collect();
+    // Depth-first in discovery order: a file's includes are read before the
+    // next discovered file, so the first match is the nearest config's.
+    pending.reverse();
+    while let Some(file) = pending.pop() {
+        let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+        if !file.is_file() || !visited.insert(key) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        let table = match text.parse::<toml::Table>() {
+            Ok(table) => table,
+            Err(_) => {
+                if let Some(var) = LOADER_VARS.iter().find(|var| text.contains(*var)) {
+                    return Some((var.to_string(), file));
+                }
+                continue;
+            }
+        };
+        if let Some(env) = table.get("env").and_then(toml::Value::as_table) {
+            if let Some(var) = LOADER_VARS.iter().find(|var| env.contains_key(**var)) {
+                return Some((var.to_string(), file));
+            }
+        }
+        let base = file.parent().unwrap_or(Path::new("."));
+        let mut includes =
+            config_includes(table.get("include")).into_iter().map(|path| base.join(path)).collect::<Vec<_>>();
+        includes.reverse();
+        pending.extend(includes);
+    }
+    None
+}
+
+/// The paths a cargo config's `include` value names: a string, or an array
+/// of strings and of tables with a `path`.
+fn config_includes(include: Option<&toml::Value>) -> Vec<PathBuf> {
+    let path_of = |value: &toml::Value| match value {
+        toml::Value::String(path) => Some(PathBuf::from(path)),
+        toml::Value::Table(table) => table.get("path").and_then(toml::Value::as_str).map(PathBuf::from),
+        _ => None,
+    };
+    match include {
+        Some(toml::Value::Array(items)) => items.iter().filter_map(path_of).collect(),
+        Some(value) => path_of(value).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Cargo's home directory: `$CARGO_HOME` when set and non-empty, else
+/// `.cargo` in the user's home directory.
+fn cargo_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("CARGO_HOME").filter(|home| !home.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())?;
+    Some(PathBuf::from(home).join(".cargo"))
 }
 
 /// The server to run, and the version string it answered with.
