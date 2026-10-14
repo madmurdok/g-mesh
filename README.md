@@ -646,6 +646,14 @@ semantic refresh of the reparsed files runs right after, in the background
 The log says `index seeded from <main checkout>`; `G_MESH_SEED=0` turns
 seeding off (a cold walk, as before).
 
+The gain depends on how far the worktree is from the main checkout. Measured
+on g-mesh ([results](docs/results/GM-564-seeded-worktree-first-answer.md)): a
+worktree of the main checkout's commit answers its first call in about 1 s
+and is ready in about 2 s, against 15 s and 165 s cold; a worktree about a
+thousand files away answers its first call in about 25 s, later than a cold
+walk's first structural answer, because calls wait for the whole reconcile,
+but is still ready several times sooner.
+
 One difference from a cold index remains until the worktree has its own
 dependencies: edges the main checkout's language servers resolved into
 gitignored inputs (`node_modules`, a virtualenv, build output) are copied
