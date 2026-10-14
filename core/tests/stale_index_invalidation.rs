@@ -130,10 +130,10 @@ async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
 }
 
 /// [`importers_of`], but the answer is the one given after the restarted
-/// daemon's background offline-change reconcile has logged that it finished
-/// and reindexed nothing. A reconcile that wrongly reindexes unchanged files
-/// puts the stripped edges back, but only once it gets to them; answering
-/// before it finishes would pass whatever it does later (GM-578).
+/// daemon's background offline-change reconcile has logged that it finished,
+/// and the reconcile must have reindexed nothing. A reconcile that wrongly
+/// reindexes unchanged files puts the stripped edges back, but only once it
+/// gets to them; answering before it finishes would pass whatever it does later.
 async fn importers_of_reconciled(project: &Project, file_path: &str) -> Vec<String> {
     importers_of_after(project, file_path, true).await
 }
@@ -141,7 +141,7 @@ async fn importers_of_reconciled(project: &Project, file_path: &str) -> Vec<Stri
 async fn importers_of_after(project: &Project, file_path: &str, wait_for_reconcile: bool) -> Vec<String> {
     // Lines already in the (appended-to) daemon log belong to earlier daemons.
     let log = project_dir(project.root()).expect("failed to resolve the state directory").join("daemon.log");
-    let seen = clean_reconcile_lines(&log);
+    let seen = reconcile_lines(&log).len();
 
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
         cmd.lifeline();
@@ -163,12 +163,18 @@ async fn importers_of_after(project: &Project, file_path: &str, wait_for_reconci
     let mut walk = query_importers(&client, file_path).await;
     if wait_for_reconcile {
         // The query above is also what activates the daemon, which the
-        // reconcile may be waiting for. 120 s stays under nextest's 210 s
-        // slow-timeout (.config/nextest.toml) so a hang is this panic.
+        // reconcile may be waiting for. The fixture is a handful of files, so
+        // the wait is short: with the two index waits it stays under nextest's
+        // slow-timeout (.config/nextest.toml), and a hang is this panic.
         common::wait_for(
-            "the restarted daemon to finish reconciling without reindexing anything",
-            std::time::Duration::from_secs(120),
-            || clean_reconcile_lines(&log) > seen,
+            "the restarted daemon to finish reconciling",
+            std::time::Duration::from_secs(20),
+            || reconcile_lines(&log).len() > seen,
+        );
+        let line = reconcile_lines(&log).swap_remove(seen);
+        assert!(
+            line.ends_with(", 0 reindexed"),
+            "the restarted daemon reindexed files the index already had: {line}"
         );
         walk = query_importers(&client, file_path).await;
     }
@@ -178,12 +184,12 @@ async fn importers_of_after(project: &Project, file_path: &str, wait_for_reconci
     walk
 }
 
-/// Complete (newline-terminated) "reconciled ... 0 reindexed" lines in `log`;
-/// a half-written last line is not one.
-fn clean_reconcile_lines(log: &Path) -> usize {
+/// Complete (newline-terminated) reconcile summary lines in `log`, oldest
+/// first; a half-written last line is not one.
+fn reconcile_lines(log: &Path) -> Vec<String> {
     let text = std::fs::read_to_string(log).unwrap_or_default();
     let complete = &text[..text.rfind('\n').map_or(0, |i| i + 1)];
-    complete.lines().filter(|l| l.contains("files with the disk in") && l.ends_with(", 0 reindexed")).count()
+    complete.lines().filter(|l| l.contains("files with the disk in")).map(str::to_string).collect()
 }
 
 async fn query_importers(
