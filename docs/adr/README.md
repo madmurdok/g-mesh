@@ -106,3 +106,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0033 | [Semantic tiers reach no network and write nothing under the project root](0033-semantic-tiers-reach-no-network-and-write-nothing.md) | Accepted |
 | 0034 | [Semantic exact answers of CALLS and REFERENCES bypass the linker's visibility check](0034-semantic-answers-bypass-visibility.md) | Accepted |
 | 0035 | [Engine CALLS answers link to functions, variables and types; the bridge drops enclosing-node landings](0035-engine-calls-answers-kind-rule.md) | Accepted |
+| 0037 | [The rust tier refuses a cargo config `[env]` that sets a dynamic-loader variable](0037-rust-tier-refuses-cargo-env-loader-vars.md) | Accepted |

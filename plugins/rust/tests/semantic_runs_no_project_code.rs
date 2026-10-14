@@ -53,8 +53,13 @@ use g_mesh_plugin_sdk::{walk_project, Extractor, RelPath, SdkIndex, MANIFEST_PAT
 struct Scratch(PathBuf);
 
 impl Scratch {
+    /// Unique per call: the tests in this binary run in parallel and each
+    /// makes its own `proxies` directory, which a shared name would let one
+    /// test's `Drop` delete under another (GM-587).
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("g-mesh-rust-gm513-{name}-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("g-mesh-rust-gm513-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         Scratch(root.canonicalize().unwrap())
@@ -699,6 +704,100 @@ mod project_extra_env {
             "sanity: the client's CARGO_UNSTABLE_HOST_CONFIG fired no marker (fired: {:?}), so the project-file \
              tests prove nothing about that channel",
             fixture.fired()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GM-587: a cargo config `[env]` that sets a dynamic-loader variable with
+// `force = true` would load a project dylib into every rustc that the
+// server's `cargo metadata` starts; `semantic::engine` refuses such a project
+// to the structural tier instead (docs/adr/0037).
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod cargo_env_loader_var {
+    use super::*;
+
+    /// The loader variable this platform's dynamic loader honours.
+    const LOADER_VAR: &str = if cfg!(target_os = "macos") { "DYLD_INSERT_LIBRARIES" } else { "LD_PRELOAD" };
+
+    #[test]
+    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker() {
+        let real = real_toolchain();
+        let scratch = Scratch::new("loader-env");
+        let root = scratch.0.clone();
+        let mark = root.join("MARK_cargo_env_loader");
+        let Some(dylib) = build_marker_dylib(&root.join("dylib"), &mark) else { return };
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        let config = root.join(".cargo/config.toml");
+        write(
+            &config,
+            &format!("[env]\n{LOADER_VAR} = {{ value = {:?}, force = true }}\n", dylib.to_string_lossy()),
+        );
+
+        scrub_environment(&real.proxy_dir);
+        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+
+        // Sanity: the hostile config is live - an unpinned `cargo metadata`
+        // in the fixture loads the dylib into the rustc it starts.
+        let output = Command::new(real.proxy_dir.join("cargo"))
+            .args(["metadata", "--format-version", "1"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cargo metadata in the fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            mark.is_file(),
+            "sanity: `cargo metadata` in the fixture never loaded the [env] {LOADER_VAR} dylib, so this test \
+             would prove nothing about that channel"
+        );
+        std::fs::remove_file(&mark).unwrap();
+        let _ = std::fs::remove_file(root.join("Cargo.lock"));
+
+        let refusal = match semantic::engine(&root) {
+            Err(error) => Some(format!("{error:#}")),
+            Ok(mut engine) => {
+                let index = {
+                    let project =
+                        ProjectContext::load(&root).expect("the fixture is a loadable Rust project");
+                    let mut index = SdkIndex::new();
+                    for path in walk_project(&root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+                        let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+                        let graph = RustExtractor.extract(&project, &path, &source);
+                        index.insert(path, source, graph);
+                    }
+                    index
+                };
+                let _ = engine.answer(&[], &index);
+                drop(engine);
+                None
+            }
+        };
+
+        assert!(
+            !mark.exists(),
+            "the semantic tier started a rustc that loaded the project's [env] {LOADER_VAR} dylib"
+        );
+        let reason =
+            refusal.expect("the engine started a server for a project whose cargo config sets a loader var");
+        assert!(
+            reason.contains(LOADER_VAR) && reason.contains(&config.display().to_string()),
+            "the engine failed, but not by refusing the [env] {LOADER_VAR} in {}: {reason}",
+            config.display()
         );
     }
 }

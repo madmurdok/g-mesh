@@ -63,6 +63,10 @@
 //! missing (`core::mcp::provenance`). Installing the
 //! component and restarting the daemon then gets the pass; a
 //! completed-but-empty pass would have recorded "done" and never asked again.
+//!
+//! The same factory failure is how a project is refused the tier when a
+//! cargo config in effect for it sets a dynamic-loader variable in `[env]`
+//! ([ADR 0037](../../../docs/adr/0037-rust-tier-refuses-cargo-env-loader-vars.md)).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -88,6 +92,12 @@ const LANGUAGE: &str = "rust";
 /// offline, so a dependency missing from the local cargo cache is not
 /// fetched and its edges stay unresolved until the user runs `cargo fetch`
 /// ([ADR 0033](../../../docs/adr/0033-semantic-tiers-reach-no-network-and-write-nothing.md)).
+///
+/// A project `.cargo/config.toml`/`CARGO_HOME` config whose `[env]` sets a
+/// dynamic-loader variable is refused to the structural tier, because cargo
+/// applies that table to the `rustc` children of `cargo metadata` and
+/// `force = true` defeats any environment override: this returns `Err`
+/// naming the key and the file, and the plugin stays structural-only.
 pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     let mut config = SemanticConfig::from_manifest()
         .context("reading [plugin.semantic] from this plugin's manifest")?
@@ -99,6 +109,14 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
         })?;
 
     let toolchain = Toolchain::detect();
+    if let Some((var, file)) = cargo_env_loader_var(root) {
+        anyhow::bail!(
+            "semantic tier refused: the cargo config {} sets {var} in [env], a dynamic-loader \
+             variable cargo would pass to every rustc it starts for rust-analyzer; this project \
+             is indexed at the structural tier only (docs/adr/0037)",
+            file.display()
+        );
+    }
     let resolved = resolve(&config.command, &toolchain)?;
     g_mesh_plugin_sdk::log_line!(
         "[{LANGUAGE}] semantic tier: {} ({}, toolchain {}, cargo offline: dependencies not in the \
@@ -174,8 +192,10 @@ impl Toolchain {
 /// gives them `[host]` `rustflags` instead. `CARGO_UNSTABLE_HOST_CONFIG=false`
 /// outranks that `[unstable]` key, so host units get the empty
 /// `CARGO_ENCODED_RUSTFLAGS` or no flags at all. Stable cargo ignores the
-/// variable. The config's `[env]` table reaches `rustc` by another route
-/// and is not covered.
+/// variable. The config's `[env]` table reaches `rustc` by another route,
+/// which no variable here outranks (`force = true` overrides any inherited
+/// value): a dynamic-loader variable in it is refused by [`engine`] (see
+/// [`cargo_env_loader_var`]), and its other entries stay outside this map.
 /// `CARGO_NET_OFFLINE` reaches every cargo the server runs (`metadata`,
 /// `locate-project`, `config get`), so none of them downloads a dependency
 /// or refreshes a registry index.
@@ -204,6 +224,116 @@ fn pinned_env(toolchain: &Toolchain) -> BTreeMap<String, String> {
         env.insert(wrapper.to_string(), String::new());
     }
     env
+}
+
+/// The dynamic-loader variables a cargo config `[env]` table may not set
+/// for the server to start: each one makes the loader map a file the
+/// project names into every `rustc` and `rustup` that cargo starts.
+const LOADER_VARS: [&str; 6] = [
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+];
+
+/// The first [`LOADER_VARS`] key that a cargo config in effect for `root`
+/// sets in its `[env]` table, and the config file that sets it. `None` when
+/// no such config sets one.
+///
+/// The configs are the ones cargo reads for a command run in `root`, in its
+/// order: `.cargo/config.toml` then the legacy `.cargo/config` in `root` and
+/// in each ancestor up to the filesystem root, then `config.toml` and
+/// `config` in `$CARGO_HOME` (default `~/.cargo`). Each file's `include`
+/// (a path, an array of paths, or tables with a `path`, relative to the
+/// including file's directory) is followed transitively. The configs of
+/// `root`'s immediate subdirectories are read too, because rust-analyzer
+/// runs `cargo metadata` in a subdirectory holding the project's
+/// `Cargo.toml` when `root` holds none.
+///
+/// Both `[env]` forms count: `KEY = "value"` and `KEY = { value = "...",
+/// force = ..., relative = ... }`. A file that does not parse is matched by
+/// text instead, so a syntax this parser does not accept and cargo does
+/// cannot hide a key. A file that cannot be read is skipped: cargo cannot
+/// read it either.
+fn cargo_env_loader_var(root: &Path) -> Option<(String, PathBuf)> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(children) = std::fs::read_dir(root) {
+        let mut children: Vec<PathBuf> = children
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .filter(|dir| dir.file_name().is_some_and(|name| name != ".cargo"))
+            .collect();
+        children.sort();
+        dirs.extend(children.into_iter().map(|dir| dir.join(".cargo")));
+    }
+    dirs.splice(0..0, root.ancestors().map(|dir| dir.join(".cargo")));
+    if let Some(cargo_home) = cargo_home() {
+        dirs.push(cargo_home);
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    let mut pending: Vec<PathBuf> =
+        dirs.iter().flat_map(|dir| [dir.join("config.toml"), dir.join("config")]).collect();
+    // Depth-first in discovery order: a file's includes are read before the
+    // next discovered file, so the first match is the nearest config's.
+    pending.reverse();
+    while let Some(file) = pending.pop() {
+        let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+        if !file.is_file() || !visited.insert(key) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        let table = match text.parse::<toml::Table>() {
+            Ok(table) => table,
+            Err(_) => {
+                if let Some(var) = LOADER_VARS.iter().find(|var| text.contains(*var)) {
+                    return Some((var.to_string(), file));
+                }
+                continue;
+            }
+        };
+        if let Some(env) = table.get("env").and_then(toml::Value::as_table) {
+            if let Some(var) = LOADER_VARS.iter().find(|var| env.contains_key(**var)) {
+                return Some((var.to_string(), file));
+            }
+        }
+        let base = file.parent().unwrap_or(Path::new("."));
+        let mut includes =
+            config_includes(table.get("include")).into_iter().map(|path| base.join(path)).collect::<Vec<_>>();
+        includes.reverse();
+        pending.extend(includes);
+    }
+    None
+}
+
+/// The paths a cargo config's `include` value names: a string, or an array
+/// of strings and of tables with a `path`.
+fn config_includes(include: Option<&toml::Value>) -> Vec<PathBuf> {
+    let path_of = |value: &toml::Value| match value {
+        toml::Value::String(path) => Some(PathBuf::from(path)),
+        toml::Value::Table(table) => table.get("path").and_then(toml::Value::as_str).map(PathBuf::from),
+        _ => None,
+    };
+    match include {
+        Some(toml::Value::Array(items)) => items.iter().filter_map(path_of).collect(),
+        Some(value) => path_of(value).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Cargo's home directory: `$CARGO_HOME` when set and non-empty, else
+/// `.cargo` in the user's home directory.
+fn cargo_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("CARGO_HOME").filter(|home| !home.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())?;
+    Some(PathBuf::from(home).join(".cargo"))
 }
 
 /// The server to run, and the version string it answered with.
@@ -779,5 +909,250 @@ mod tests {
             "sanity: a real binary on PATH is offered"
         );
         println!("GM513-CHILD-RAN");
+    }
+
+    // -----------------------------------------------------------------------
+    // GM-587: a cargo config `[env]` loader variable refuses the semantic
+    // tier. Every detection runs in a child of this test binary with
+    // `CARGO_HOME` pointed at a scratch directory, so no assertion reads the
+    // real `~/.cargo` and no other test sees the variable change.
+    // -----------------------------------------------------------------------
+
+    /// The child's fixture root; set only for the child.
+    const LOADER_CHILD_ROOT: &str = "G_MESH_RS_GM587_LOADER_CHILD_ROOT";
+    /// `detect` runs [`cargo_env_loader_var`], `engine` runs [`engine`].
+    const LOADER_CHILD_MODE: &str = "G_MESH_RS_GM587_LOADER_CHILD_MODE";
+
+    /// A scratch directory (canonical, so ancestors and file names compare
+    /// exactly) that removes itself.
+    struct LoaderScratch(PathBuf);
+
+    impl LoaderScratch {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("g-mesh-rs-gm587-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            LoaderScratch(root.canonicalize().unwrap())
+        }
+
+        /// Writes `contents` at `rel`, creating its directories.
+        fn write(&self, rel: &str, contents: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            path
+        }
+    }
+
+    impl Drop for LoaderScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Runs the child in `mode` on `root` with `CARGO_HOME=cargo_home`, and
+    /// returns the line it printed after `GM587-CHILD: `.
+    fn loader_child(mode: &str, root: &Path, cargo_home: &Path) -> String {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "semantic::tests::cargo_env_loader_var_child", "--nocapture"])
+            .env(LOADER_CHILD_ROOT, root)
+            .env(LOADER_CHILD_MODE, mode)
+            .env("CARGO_HOME", cargo_home)
+            .env(g_mesh_plugin_sdk::MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))
+            .output()
+            .unwrap();
+        let text =
+            format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "the child failed:\n{text}");
+        text.lines()
+            .find_map(|line| line.strip_prefix("GM587-CHILD: "))
+            .unwrap_or_else(|| panic!("the child test did not run:\n{text}"))
+            .to_string()
+    }
+
+    /// What [`cargo_env_loader_var`] finds for `scratch/root_rel`, with
+    /// `scratch/home_rel` as `CARGO_HOME`: `Some((key, file))` or `None`.
+    fn detect(scratch: &LoaderScratch, root_rel: &str, home_rel: &str) -> Option<(String, PathBuf)> {
+        let home = scratch.0.join(home_rel);
+        std::fs::create_dir_all(&home).unwrap();
+        let root = scratch.0.join(root_rel);
+        std::fs::create_dir_all(&root).unwrap();
+        let line = loader_child("detect", &root, &home);
+        if line == "none" {
+            return None;
+        }
+        let (key, file) = line.split_once('|').expect("the child prints key|file");
+        Some((key.to_string(), PathBuf::from(file)))
+    }
+
+    /// The child half of the tests below; a no-op unless
+    /// [`LOADER_CHILD_ROOT`] names a fixture.
+    #[test]
+    fn cargo_env_loader_var_child() {
+        let Some(root) = std::env::var_os(LOADER_CHILD_ROOT).map(PathBuf::from) else {
+            return;
+        };
+        match std::env::var(LOADER_CHILD_MODE).as_deref() {
+            Ok("detect") => match cargo_env_loader_var(&root) {
+                Some((key, file)) => println!("GM587-CHILD: {key}|{}", file.display()),
+                None => println!("GM587-CHILD: none"),
+            },
+            Ok("engine") => match engine(&root) {
+                Err(error) => println!("GM587-CHILD: err {}", format!("{error:#}").replace('\n', " ")),
+                Ok(_) => println!("GM587-CHILD: ok"),
+            },
+            mode => panic!("unknown child mode {mode:?}"),
+        }
+    }
+
+    /// The `{ value, force = true }` form: what a hostile project writes,
+    /// because `force` beats any environment override.
+    #[test]
+    fn a_forced_loader_var_in_the_root_config_is_found() {
+        let scratch = LoaderScratch::new("forced");
+        let config = scratch.write(
+            "ws/.cargo/config.toml",
+            "[env]\nDYLD_INSERT_LIBRARIES = { value = \"/x/evil.dylib\", force = true }\n",
+        );
+        assert_eq!(detect(&scratch, "ws", "home"), Some(("DYLD_INSERT_LIBRARIES".to_string(), config)));
+    }
+
+    #[test]
+    fn a_scalar_loader_var_is_found() {
+        let scratch = LoaderScratch::new("scalar");
+        let config = scratch.write("ws/.cargo/config.toml", "[env]\nLD_PRELOAD = \"/x/evil.so\"\n");
+        assert_eq!(detect(&scratch, "ws", "home"), Some(("LD_PRELOAD".to_string(), config)));
+    }
+
+    #[test]
+    fn a_table_form_without_force_is_found() {
+        let scratch = LoaderScratch::new("noforce");
+        let config = scratch.write(
+            "ws/.cargo/config.toml",
+            "[env]\nLD_AUDIT = { value = \"evil.so\", force = false, relative = true }\n",
+        );
+        assert_eq!(detect(&scratch, "ws", "home"), Some(("LD_AUDIT".to_string(), config)));
+    }
+
+    /// Every key of D3's list is refused, not only the two the fixture uses.
+    #[test]
+    fn every_listed_loader_var_is_found() {
+        let scratch = LoaderScratch::new("keys");
+        for key in [
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_FRAMEWORK_PATH",
+            "DYLD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "LD_AUDIT",
+            "LD_LIBRARY_PATH",
+        ] {
+            let config = scratch.write("ws/.cargo/config.toml", &format!("[env]\n{key} = \"/x\"\n"));
+            assert_eq!(detect(&scratch, "ws", "home"), Some((key.to_string(), config)), "{key}");
+        }
+    }
+
+    /// A benign `[env]`, and a loader name outside `[env]`, are not refused.
+    #[test]
+    fn a_benign_env_table_is_not_refused() {
+        let scratch = LoaderScratch::new("benign");
+        scratch.write(
+            "ws/.cargo/config.toml",
+            "[env]\nRUST_LOG = \"debug\"\nMY_FLAG = { value = \"1\", force = true }\n\n\
+             [alias]\nLD_PRELOAD = \"build\"\n",
+        );
+        scratch.write("home/config.toml", "[env]\nOTHER = \"x\"\n");
+        assert_eq!(detect(&scratch, "ws", "home"), None);
+    }
+
+    /// Cargo reads `.cargo/config.toml` in every ancestor of the directory
+    /// it runs in.
+    #[test]
+    fn a_loader_var_in_a_parent_directory_config_is_found() {
+        let scratch = LoaderScratch::new("parent");
+        let config = scratch.write(
+            "outer/.cargo/config.toml",
+            "[env]\nDYLD_LIBRARY_PATH = { value = \"/x\", force = true }\n",
+        );
+        scratch.write("outer/ws/Cargo.toml", "[workspace]\n");
+        assert_eq!(detect(&scratch, "outer/ws", "home"), Some(("DYLD_LIBRARY_PATH".to_string(), config)));
+    }
+
+    #[test]
+    fn a_loader_var_in_the_legacy_config_file_is_found() {
+        let scratch = LoaderScratch::new("legacy");
+        let config = scratch.write("ws/.cargo/config", "[env]\nLD_LIBRARY_PATH = \"/x\"\n");
+        assert_eq!(detect(&scratch, "ws", "home"), Some(("LD_LIBRARY_PATH".to_string(), config)));
+    }
+
+    #[test]
+    fn a_loader_var_in_the_cargo_home_config_is_found() {
+        let scratch = LoaderScratch::new("cargohome");
+        scratch.write("ws/Cargo.toml", "[workspace]\n");
+        let config = scratch.write("home/config.toml", "[env]\nDYLD_FRAMEWORK_PATH = \"/x\"\n");
+        assert_eq!(detect(&scratch, "ws", "home"), Some(("DYLD_FRAMEWORK_PATH".to_string(), config)));
+    }
+
+    /// rust-analyzer runs `cargo metadata` in a subdirectory holding the
+    /// `Cargo.toml` when the root holds none, so that subdirectory's
+    /// config is in effect too.
+    #[test]
+    fn a_loader_var_in_an_immediate_subdirectory_config_is_found() {
+        let scratch = LoaderScratch::new("subdir");
+        let config = scratch.write("ws/crate/.cargo/config.toml", "[env]\nLD_PRELOAD = \"/x\"\n");
+        scratch.write("ws/crate/Cargo.toml", "[package]\nname = \"c\"\n");
+        assert_eq!(detect(&scratch, "ws", "home"), Some(("LD_PRELOAD".to_string(), config)));
+    }
+
+    /// `include` as a string, relative to the including file's directory.
+    #[test]
+    fn a_loader_var_in_an_included_file_is_found() {
+        let scratch = LoaderScratch::new("include-str");
+        scratch.write("ws/.cargo/config.toml", "include = \"extra.toml\"\n");
+        let config =
+            scratch.write("ws/.cargo/extra.toml", "[env]\nLD_PRELOAD = { value = \"/x\", force = true }\n");
+        assert_eq!(detect(&scratch, "ws", "home"), Some(("LD_PRELOAD".to_string(), config)));
+    }
+
+    /// `include` as an array of strings and `{ path }` tables, followed
+    /// transitively.
+    #[test]
+    fn includes_in_array_and_table_form_are_followed_transitively() {
+        let scratch = LoaderScratch::new("include-arr");
+        scratch
+            .write("ws/.cargo/config.toml", "include = [\"benign.toml\", { path = \"sub/first.toml\" }]\n");
+        scratch.write("ws/.cargo/benign.toml", "[env]\nRUST_LOG = \"x\"\n");
+        scratch
+            .write("ws/.cargo/sub/first.toml", "include = [{ path = \"second.toml\", optional = true }]\n");
+        let config = scratch.write("ws/.cargo/sub/second.toml", "[env]\nDYLD_INSERT_LIBRARIES = \"/x\"\n");
+        assert_eq!(detect(&scratch, "ws", "home"), Some(("DYLD_INSERT_LIBRARIES".to_string(), config)));
+    }
+
+    /// A config this parser rejects still cannot hide a key: it is matched
+    /// by text.
+    #[test]
+    fn an_unparseable_config_is_matched_by_text() {
+        let scratch = LoaderScratch::new("unparseable");
+        let config = scratch.write("ws/.cargo/config.toml", "[env\nLD_PRELOAD = \"/x\"\n");
+        assert_eq!(detect(&scratch, "ws", "home"), Some(("LD_PRELOAD".to_string(), config)));
+    }
+
+    /// `engine` refuses with an error naming the key and the file, so the
+    /// plugin stays structural (D1).
+    #[test]
+    fn the_engine_refuses_naming_the_key_and_the_config_file() {
+        let scratch = LoaderScratch::new("engine");
+        std::fs::create_dir_all(scratch.0.join("home")).unwrap();
+        let config = scratch.write(
+            "ws/.cargo/config.toml",
+            "[env]\nDYLD_INSERT_LIBRARIES = { value = \"/x/evil.dylib\", force = true }\n",
+        );
+        let line = loader_child("engine", &scratch.0.join("ws"), &scratch.0.join("home"));
+        let reason = line.strip_prefix("err ").unwrap_or_else(|| panic!("the engine did not refuse: {line}"));
+        assert!(reason.contains("DYLD_INSERT_LIBRARIES"), "the refusal does not name the key: {reason}");
+        assert!(
+            reason.contains(&config.display().to_string()),
+            "the refusal does not name {}: {reason}",
+            config.display()
+        );
     }
 }
