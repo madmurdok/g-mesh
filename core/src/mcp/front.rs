@@ -84,32 +84,47 @@ pub(super) fn listed_tools() -> Vec<Tool> {
     tools
 }
 
-/// Everything a front's connections share, built once at startup.
+/// Everything a front's connections share, built once at startup. The
+/// instructions are not among them: each connection builds its own from a
+/// fresh walk ([`Front::instructions`]), so a worktree created since the
+/// daemon started is listed to the next session.
 pub struct Front {
     /// Canonical.
     root: PathBuf,
-    instructions: String,
     tools: Vec<Tool>,
     /// The eight index-backed tools, by name.
     index_tools: HashSet<String>,
 }
 
 impl Front {
-    pub fn new(root: PathBuf, detection: &Detection) -> Self {
+    pub fn new(root: PathBuf) -> Self {
         let tools = listed_tools();
         let index_tools = tools
             .iter()
             .filter(|tool| tool.name != SELECT_PROJECT)
             .map(|tool| tool.name.to_string())
             .collect();
-        let indexed: HashSet<&str> = detection
+        Self { root, tools, index_tools }
+    }
+
+    /// One connection's instructions: a fresh walk, then the text built from it.
+    async fn instructions(&self) -> String {
+        let walk = self.candidates().await;
+        let indexed: HashSet<&str> = walk
             .candidates
             .iter()
             .filter(|candidate| candidates::has_completed_index(&candidate.abs_path))
             .map(|candidate| candidate.rel_path.as_str())
             .collect();
-        let instructions = instructions::build_front(&root, detection, &indexed);
-        Self { root, instructions, tools, index_tools }
+        let detection = Detection {
+            mode: candidates::Mode::Multi,
+            entries_read: walk.entries_read,
+            elapsed: walk.elapsed,
+            truncated: walk.truncated,
+            walked: true,
+            candidates: walk.candidates.clone(),
+        };
+        instructions::build_front(&self.root, &detection, &indexed)
     }
 
     /// A fresh walk of the folder: cheap, bounded, and always current.
@@ -249,8 +264,12 @@ pub async fn serve_connection(
     front: Arc<Front>,
     core_activity: Arc<CoreActivity>,
 ) -> Result<()> {
-    let service =
-        FrontServer { front, core_activity }.serve(stream).await.context("MCP initialization failed")?;
+    // `get_info` is synchronous and runs inside `serve`, so the walk comes first.
+    let instructions = front.instructions().await;
+    let service = FrontServer { front, instructions, core_activity }
+        .serve(stream)
+        .await
+        .context("MCP initialization failed")?;
     service.waiting().await.context("MCP session task failed")?;
     Ok(())
 }
@@ -258,6 +277,8 @@ pub async fn serve_connection(
 #[derive(Clone)]
 pub struct FrontServer {
     front: Arc<Front>,
+    /// Built for this connection when it opened.
+    instructions: String,
     core_activity: Arc<CoreActivity>,
 }
 
@@ -267,7 +288,7 @@ impl ServerHandler for FrontServer {
         // tell a front from a project daemon by anything but the text.
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("g-mesh", env!("CARGO_PKG_VERSION")))
-            .with_instructions(self.front.instructions.clone())
+            .with_instructions(self.instructions.clone())
     }
 
     async fn list_tools(

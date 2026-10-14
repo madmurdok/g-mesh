@@ -519,7 +519,7 @@ async fn progress_passes_through_after_a_switch() {
 /// say "has indexed none of them" - they count `b` and list it first,
 /// marked.
 ///
-/// Control: in `mcp::front::Front::new`, pass an empty set to `build_front`
+/// Control: in `mcp::front::Front::instructions`, pass an empty set to `build_front`
 /// instead of the candidates `has_completed_index` accepts: the text says
 /// "has indexed none of them" and lists `a, b, c.` again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
