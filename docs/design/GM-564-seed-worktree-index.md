@@ -268,10 +268,21 @@ cold in a worktree without `node_modules`, it is unresolved.
   intended state; no work. Risk: until then the seeded index answers as if
   the dependencies were installed; a dependency *version* differing between
   branches (lockfile change) is only caught when the lockfile's
-  `[plugin.workspace] watch_files` triggers a reindex - which the seeded
-  reconcile does route (the lockfile is walked and differs).
+  `[plugin.workspace] watch_files` triggers a reindex. The file reconcile
+  does not route it (it walks only files a language indexes), so a seeded
+  start compares the watch files separately (owner decision "Reconcile on
+  seeded start", after S7): `reconcile_watch_files_with_seed` compares each
+  watch file of the worktree byte for byte with the file at the same path in
+  `seed_origin.sourceRoot` (the index stores no watch-file content), a file
+  on one side only counting as different, and gives each language with a
+  difference the watcher's `workspace_file_changed` (a `resolution_delta`
+  plugin is asked against the seed's stored facts first). It runs after the
+  gate opens and before the seed is stamped reconciled, so the old graph
+  serves until the reindex swaps, as for a live edit, and a daemon killed
+  meanwhile compares again. A plain start still does not reconcile watch
+  files: it has no source to compare with, and would need stored hashes.
 - (b) Reindex every language with a `watch_files` difference eagerly.
-  Benefit: none beyond (a) - that already happens through routing. 
+  Benefit: none beyond (a) - that is what the watch-file compare does. 
 - (c) Skip seeding for languages whose resolution depends on gitignored
   inputs. Risk: partial seeding is not possible with one `index.db`; it
   would mean per-language wipes after the copy. Not recommended.
@@ -356,9 +367,16 @@ Read for context (not edited): `connection::open` (`connection.rs:119-132`),
   files of semantic-capable, unsuspended languages; the scoped pass clears
   the requested files' rows when it completes without a list, the settled
   ones when it names `unfinishedFiles` (the rest become owed), and none when
-  it is incomplete without a list or fails. Those rows speak (`staleFiles`)
-  only while the language's semantic pass is not done; a later start's
-  `remove_stale_semantic_pending` clears them for a done language.
+  it is incomplete without a list or fails. Owner decision "Retry pending on
+  start", after S7: every start (plain, seeded, after a walk) runs
+  `owed_semantic_file_passes` before the watcher's first batch, one scoped
+  pass per language over its file rows (`owed_semantic_pending_files`: a
+  language whose pass is done and has no `semantic_pending` row; one whose
+  pass is not done gets the whole-project retry instead). The rows clear only
+  when that pass completes, so a daemon killed between the seeded reparse and
+  the scoped pass leaves them for the next start. `remove_stale_semantic_pending`
+  now clears only the language row of a done language and keeps its file
+  rows. The seeded reconcile's returned map is no longer what the pass reads.
 - Read-only source: a `SQLITE_OPEN_READ_ONLY` connection cannot open a WAL
   database with no `-wal` (a cleanly exited main daemon), checked with SQLite
   3.51: "unable to open database file". The source is opened
@@ -366,9 +384,10 @@ Read for context (not edited): `connection::open` (`connection.rs:119-132`),
   present and `-shm` missing, both modes read the WAL-only rows.
 - The copy's `seed_origin` row is written on the copy's own connection after
   `PRAGMA foreign_keys = OFF` (`seed_from`).
-- D7's lockfile claim does not hold: the reconcile walks only files a
-  language indexes, so a `watch_files` file that differs between branches is
-  not routed at start (plain and seeded alike); its next edit is.
+- D7's lockfile claim did not hold: the reconcile walks only files a
+  language indexes, so a `watch_files` file that differs between branches
+  was not routed at start. Fixed for seeded starts by
+  `reconcile_watch_files_with_seed` (D7 (a)); plain starts are unchanged.
 - After the seeded start, `recheck_gitignores_since_index` takes the later of
   `bulkIndexedAt` and `seed_origin.reconciledAt`, so the second (plain) start
   does not re-check every fresh `.gitignore`.

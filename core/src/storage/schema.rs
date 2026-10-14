@@ -1713,10 +1713,14 @@ pub fn clear_semantic_leftovers(conn: &Connection, language: &str) -> Result<()>
     Ok(())
 }
 
-/// Deletes the semantic-pending rows no pass will ever clear: those of a
+/// Deletes the semantic-pending rows no pass will ever clear: every row of a
 /// language not in `semantic_pass_languages` (its plugin is gone or declares
-/// no semantic tier) and those of a language whose pass is recorded done (a
-/// clear whose write failed). Returns how many languages were cleared.
+/// no semantic tier), and the language row of a language whose pass is
+/// recorded done (a clear whose write failed). A done language's file rows
+/// stay: they are files a per-file or scoped pass still owes (a daemon
+/// killed between a seeded reparse and its scoped pass), which the start's
+/// [`owed_semantic_pending_files`] pass asks again. Returns how many
+/// languages were cleared.
 pub fn clear_stale_semantic_pending(
     conn: &Connection,
     semantic_pass_languages: &HashSet<String>,
@@ -1727,12 +1731,42 @@ pub fn clear_stale_semantic_pending(
         .context("failed to read the semantic-pending languages")?;
     let mut cleared = 0;
     for language in languages {
-        if !semantic_pass_languages.contains(&language) || language_semantic_pass_done(conn, &language)? {
+        if !semantic_pass_languages.contains(&language) {
             clear_semantic_pending(conn, &language)?;
+            cleared += 1;
+        } else if language_semantic_pass_done(conn, &language)?
+            && semantic_pending_since(conn, &language)?.is_some()
+        {
+            clear_semantic_pending_language(conn, &language)?;
             cleared += 1;
         }
     }
     Ok(cleared)
+}
+
+/// The `semantic_pending_files` rows a per-file pass still owes, per
+/// language, sorted: the rows of each language whose whole-project pass is
+/// recorded done and that has no `semantic_pending` row. A language whose
+/// pass is not done is left out: the start's whole-project retry
+/// (`daemon::semantic`) re-asks every one of its files and clears them.
+pub fn owed_semantic_pending_files(conn: &Connection) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT f.language, f.filePath FROM semantic_pending_files f
+             JOIN language_state s ON s.language = f.language AND s.semanticPassAt IS NOT NULL
+             WHERE NOT EXISTS (SELECT 1 FROM semantic_pending p WHERE p.language = f.language)
+             ORDER BY f.language, f.filePath",
+        )
+        .context("failed to prepare the owed semantic-pending files read")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .context("failed to read the owed semantic-pending files")?;
+    let mut owed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows {
+        let (language, file_path) = row.context("failed to read the owed semantic-pending files")?;
+        owed.entry(language).or_default().push(file_path);
+    }
+    Ok(owed)
 }
 
 /// Every `(language, since, pending file count)` with a semantic-pending row,
@@ -2029,6 +2063,14 @@ pub fn record_seed_reconciled(conn: &Connection) -> Result<()> {
     conn.execute("UPDATE seed_origin SET reconciledAt = CURRENT_TIMESTAMP WHERE id = 1", [])
         .context("failed to record that the seed was reconciled")?;
     Ok(())
+}
+
+/// The working tree a seeded index was copied from (`seed_origin.sourceRoot`),
+/// or `None` for an index that is not a seed.
+pub fn seed_source_root(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row("SELECT sourceRoot FROM seed_origin WHERE id = 1", [], |row| row.get(0))
+        .optional()
+        .context("failed to read seed_origin.sourceRoot")
 }
 
 /// When the seed's first-start reconcile finished, in Unix seconds; `None`

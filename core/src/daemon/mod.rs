@@ -604,14 +604,17 @@ pub(crate) enum ConsumerStart {
     Reconcile,
     /// The index is an unreconciled seed (`daemon::seed`): the seeded
     /// reconcile, no `.gitignore` re-check (every `.gitignore` of a fresh
-    /// checkout is newer than the copied walk), then the gate opens, the seed
-    /// is stamped reconciled, and the deferred semantic passes run.
+    /// checkout is newer than the copied walk), then the gate opens, the
+    /// watch files are compared with the seed's source, and the seed is
+    /// stamped reconciled.
     Seeded(seed::SeedGate),
 }
 
 /// Starts the watcher's consumer thread, once no structural walk or
 /// whole-project semantic pass can still race it; `start` says what it does
-/// before its first batch.
+/// before its first batch, after which every start runs the scoped semantic
+/// pass over the semantic-pending files still owed
+/// ([`PluginRegistry::owed_semantic_file_passes`]).
 fn spawn_watch_consumer(
     watcher: ProjectWatcher,
     conn: Arc<IndexStore>,
@@ -631,19 +634,27 @@ fn spawn_watch_consumer(
                 registry.reconcile_since_index(&conn, registry::ReconcileMode::Plain);
             }
             ConsumerStart::Seeded(gate) => {
-                let reparsed = registry.reconcile_since_index(&conn, registry::ReconcileMode::Seeded);
+                // The reparsed files are recorded semantic-pending; the
+                // start's scoped pass below reads them back.
+                registry.reconcile_since_index(&conn, registry::ReconcileMode::Seeded);
                 gate.open();
-                // After the gate: a daemon killed before this line repeats
-                // the seeded reconcile, which finds the files fresh.
+                // After the gate, as the watcher's reindex of a live edit
+                // serves the old graph until its swap; before the stamp, so a
+                // daemon killed meanwhile compares them again.
+                registry.reconcile_watch_files_with_seed(&conn);
+                // A daemon killed before this line repeats the seeded
+                // reconcile, which finds the files fresh.
                 if let Err(err) = conn.with(schema::record_seed_reconciled) {
                     crate::log_line!(
                         "g-mesh daemon: could not record that the seeded index was reconciled - the next start \
                          reconciles it again: {err:#}"
                     );
                 }
-                registry.seeded_semantic_passes(&conn, reparsed);
             }
         }
+        // Any start: files a per-file pass still owes (a seeded reparse, or
+        // one an earlier start's death left semantic-pending).
+        registry.owed_semantic_file_passes(&conn);
         let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
         loop {
             watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);

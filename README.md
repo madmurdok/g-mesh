@@ -641,7 +641,8 @@ reconciles the copy with the worktree: every walked file is hashed, the ones
 that differ are reparsed, and files the main checkout indexed that the
 worktree does not walk are dropped. Tool calls wait for that (seconds,
 proportional to the files hashed and reparsed), not for a cold walk; the
-semantic refresh of the reparsed files runs right after, in the background.
+semantic refresh of the reparsed files runs right after, in the background
+(a start that dies before it finishes leaves it owed to the next start).
 The log says `index seeded from <main checkout>`; `G_MESH_SEED=0` turns
 seeding off (a cold walk, as before).
 
@@ -650,8 +651,12 @@ dependencies: edges the main checkout's language servers resolved into
 gitignored inputs (`node_modules`, a virtualenv, build output) are copied
 too, so before `npm ci` or a build the seeded worktree answers as if those
 were installed, where a cold index would leave them unresolved. A lockfile or
-manifest that differs between the branches is not reconciled at start
-either; its next edit with the daemon up reindexes the language.
+manifest a plugin watches (`[plugin.workspace] watch_files`) is compared with
+the main checkout's file at the same path: each language whose watch files
+differ is reindexed at that start, as an edit of the file would, while the
+copied graph keeps answering until the reindex swaps in. A later start (no
+longer seeded) does not compare them; their next edit with the daemon up
+reindexes the language.
 
 ## Idle behaviour
 

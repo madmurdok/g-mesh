@@ -136,9 +136,10 @@ pub(crate) fn remove_stale_staging(state_dir: &Path) {
 }
 
 /// Deletes the semantic-pending rows (ADR 0009) of languages no discovered
-/// plugin runs a semantic pass for, and of languages whose pass is recorded
-/// done. Called once at daemon start. Best-effort: readers ignore such rows
-/// anyway.
+/// plugin runs a semantic pass for, and the language row of languages whose
+/// pass is recorded done; their file rows stay for the start's scoped pass
+/// (`PluginRegistry::owed_semantic_file_passes`). Called once at daemon
+/// start. Best-effort: readers ignore such rows anyway.
 pub(crate) fn remove_stale_semantic_pending(
     conn: &rusqlite::Connection,
     manifests: &std::collections::HashMap<String, PluginManifest>,

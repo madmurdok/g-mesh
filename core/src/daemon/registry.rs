@@ -1363,9 +1363,11 @@ impl PluginRegistry {
     /// checkout, would be reparsed); a reparse leaves out its semantic pass;
     /// and the
     /// reparsed files of each language whose plugin runs semantic passes are
-    /// recorded as semantic-pending and returned, for
-    /// [`seeded_semantic_passes`](Self::seeded_semantic_passes). `Plain`
-    /// returns an empty map.
+    /// recorded as semantic-pending and returned; the start's
+    /// [`owed_semantic_file_passes`](Self::owed_semantic_file_passes) reads
+    /// them back from the index. `Plain` returns an empty map. Watch files
+    /// are not compared here: a seeded start does that next, in
+    /// [`reconcile_watch_files_with_seed`](Self::reconcile_watch_files_with_seed).
     ///
     /// [`project_files`]: crate::project_walk::project_files
     /// [`indexing_language`]: DiscoveredPlugins::indexing_language
@@ -1484,13 +1486,103 @@ impl PluginRegistry {
         })
     }
 
-    /// The semantic half the seeded reconcile left out: per language, one
-    /// scoped `semanticPass` over the files it reparsed (plus the language's
-    /// owed files), which clears their semantic-pending rows when it
-    /// completes and leaves the unfinished ones owed. Best-effort: a failure
-    /// is logged and the files keep their structural edges.
-    pub(crate) fn seeded_semantic_passes(&self, conn: &IndexStore, reparsed: BTreeMap<String, Vec<String>>) {
-        for (language, file_paths) in reparsed {
+    /// A seeded start's watch-file reconcile, after
+    /// [`reconcile_since_index`](Self::reconcile_since_index): every
+    /// `[plugin.workspace] watch_files` file of this worktree is compared,
+    /// byte for byte, with the file at the same relative path in the working
+    /// tree the seed was copied from (`seed_origin.sourceRoot`; the index
+    /// records no watch-file content of its own). A file on one side only
+    /// differs too. Each language with a differing watch file gets what the
+    /// watcher gives a settled edit of it,
+    /// [`workspace_file_changed`](Self::workspace_file_changed) with the
+    /// first differing file as the trigger (a `resolution_delta` plugin is
+    /// asked against the seed's stored facts first). Both sides are walked as
+    /// the bulk walk walks (`.gitignore` honoured, the directories every
+    /// language excludes pruned) and filtered by
+    /// [`workspace_language_matches`](Self::workspace_language_matches). The
+    /// source's watch files are read as they are now, not as its index read
+    /// them: an edit there that its own daemon has not indexed is missed, as
+    /// the source's own next start would miss it. A failed language is
+    /// skipped; nothing here propagates.
+    pub(crate) fn reconcile_watch_files_with_seed(&self, conn: &IndexStore) {
+        let source_root = match conn.with(schema::seed_source_root) {
+            Ok(Some(source_root)) => PathBuf::from(source_root),
+            Ok(None) => return,
+            Err(err) => {
+                crate::log_line!(
+                    "g-mesh daemon: could not read where the seeded index came from - its watch files are \
+                     not compared: {err:#}"
+                );
+                return;
+            }
+        };
+        let pruned = self.discovered.excluded_by_every_language();
+        let watch_files_under = |root: &Path| -> HashSet<String> {
+            crate::project_walk::project_files(root, &pruned)
+                .map(|file| file.relative)
+                .filter(|relative| !self.workspace_language_matches(relative).is_empty())
+                .collect()
+        };
+        let mine = watch_files_under(&self.project_root);
+        let theirs = if source_root.is_dir() {
+            watch_files_under(&source_root)
+        } else {
+            crate::log_line!(
+                "g-mesh daemon: {} (the seed's source) is gone - every watch file of this worktree counts as \
+                 changed",
+                source_root.display()
+            );
+            HashSet::new()
+        };
+        let mut differing: Vec<&String> = mine
+            .symmetric_difference(&theirs)
+            .chain(mine.intersection(&theirs).filter(|relative| {
+                let here = fs::read(self.project_root.join(relative.as_str()));
+                let there = fs::read(source_root.join(relative.as_str()));
+                !matches!((here, there), (Ok(here), Ok(there)) if here == there)
+            }))
+            .collect();
+        differing.sort();
+        let mut triggers: BTreeMap<String, String> = BTreeMap::new();
+        for relative in differing {
+            for language in self.workspace_language_matches(relative) {
+                triggers.entry(language).or_insert_with(|| relative.clone());
+            }
+        }
+        for (language, trigger) in triggers {
+            if self.is_failed_language(&language) {
+                continue;
+            }
+            crate::log_line!(
+                "g-mesh daemon: {trigger} differs from the seed's source - reindexing {language} as an edit of it would"
+            );
+            self.workspace_file_changed(conn, &language, &trigger);
+        }
+    }
+
+    /// At every start, before the watcher's first batch: per language, one
+    /// scoped `semanticPass` over the `semantic_pending_files` rows a per-file
+    /// pass still owes ([`schema::owed_semantic_pending_files`]: the seeded
+    /// reconcile's reparsed files, including those of an earlier start that
+    /// died before their pass), plus the language's owed files. The rows
+    /// clear only when that pass completes ([`watcher::apply`]'s per-file
+    /// settling); an unfinished or failed pass leaves them for the next
+    /// start. Best-effort: a failure is logged and the files keep their
+    /// structural edges.
+    ///
+    /// [`watcher::apply`]: crate::watcher::apply
+    pub(crate) fn owed_semantic_file_passes(&self, conn: &IndexStore) {
+        let owed = match conn.with(schema::owed_semantic_pending_files) {
+            Ok(owed) => owed,
+            Err(err) => {
+                crate::log_line!(
+                    "g-mesh daemon: could not read the semantic-pending files a pass still owes - none is \
+                     retried this start: {err:#}"
+                );
+                return;
+            }
+        };
+        for (language, file_paths) in owed {
             if file_paths.is_empty() || self.is_failed_language(&language) {
                 continue;
             }
@@ -1498,8 +1590,8 @@ impl PluginRegistry {
                 Ok(supervisor) => supervisor,
                 Err(err) => {
                     crate::log_line!(
-                        "g-mesh daemon: could not start the {language} plugin for the semantic pass over the \
-                         seeded index's {} reparsed file(s): {err:#}",
+                        "g-mesh daemon: could not start the {language} plugin for the semantic pass over \
+                         {} semantic-pending file(s): {err:#}",
                         file_paths.len()
                     );
                     continue;
@@ -1516,13 +1608,13 @@ impl PluginRegistry {
             });
             match passed.and_then(|passed| passed) {
                 Ok(()) => crate::log_line!(
-                    "g-mesh daemon: semantic pass over the seeded index's {count} reparsed {language} file(s) \
-                     in {} ms",
+                    "g-mesh daemon: semantic pass over {count} semantic-pending {language} file(s) in {} ms",
                     started.elapsed().as_millis()
                 ),
                 Err(err) => crate::log_line!(
-                    "g-mesh daemon: the semantic pass over the seeded index's {count} reparsed {language} \
-                     file(s) failed ({err:#}) - their edges keep whatever the structural pass resolved"
+                    "g-mesh daemon: the semantic pass over {count} semantic-pending {language} file(s) failed \
+                     ({err:#}) - their edges keep whatever the structural pass resolved, and the next start \
+                     asks them again"
                 ),
             }
         }
