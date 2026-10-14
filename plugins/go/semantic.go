@@ -337,6 +337,14 @@ type resolutions struct {
 	// for, so neither a package's test variants nor a second load re-parse
 	// its files.
 	twinsKnown map[string]bool
+	// builtFiles is, per twinned package path, the project-relative files
+	// of the package's GoFiles - the ones the host build compiles - unioned
+	// across module views like twinned. A twinned answer is addressed by
+	// file only when its declaring file is in this set: membership is what
+	// "a file of this project the host builds" means, whatever the path's
+	// spelling (a `//line` directive can name a template, a phantom path or
+	// a Windows path outside the root).
+	builtFiles map[string]map[string]bool
 	// referenced is every project package path an answer of the load in
 	// progress resolved into (loadFor starts a fresh set per module). A
 	// package this pass did not fold itself (a per-file pass's imports)
@@ -354,6 +362,7 @@ func newResolutions() *resolutions {
 		declaredIn: map[types.Object]string{},
 		twinned:    map[string]map[string]bool{},
 		twinsKnown: map[string]bool{},
+		builtFiles: map[string]map[string]bool{},
 		referenced: map[string]bool{},
 	}
 }
@@ -461,6 +470,7 @@ func (e *semanticEngine) loadReferencedTwins(into *resolutions, listings map[str
 			for name := range names {
 				into.twinned[pkg.PkgPath][name] = true
 			}
+			e.recordBuiltFiles(into, pkg)
 		}
 	}
 	for _, missing := range missingBy {
@@ -638,6 +648,20 @@ func (e *semanticEngine) collectTwins(into *resolutions, pkg *packages.Package) 
 	into.twinsKnown[pkg.PkgPath] = true
 	if names := twinnedNames(pkg.Name, pkg.GoFiles, pkg.IgnoredFiles); len(names) > 0 {
 		into.twinned[pkg.PkgPath] = names
+		e.recordBuiltFiles(into, pkg)
+	}
+}
+
+// recordBuiltFiles adds the project-relative GoFiles of a twinned package to
+// into.builtFiles; a file outside the project root is skipped.
+func (e *semanticEngine) recordBuiltFiles(into *resolutions, pkg *packages.Package) {
+	if into.builtFiles[pkg.PkgPath] == nil {
+		into.builtFiles[pkg.PkgPath] = map[string]bool{}
+	}
+	for _, f := range pkg.GoFiles {
+		if rel, ok := e.relPathOf(f); ok {
+			into.builtFiles[pkg.PkgPath][rel] = true
+		}
 	}
 }
 
@@ -751,17 +775,18 @@ func declaredSpellings(file *ast.File, into map[string]bool) {
 
 // targetScopeOf is the scope an answer onto `obj`, addressed as
 // `container`/`key`, is sent with: the declaring file when the name is a
-// build-tag twin in its package and that file is known to be a Go file of
-// this project, the package's container otherwise.
+// build-tag twin in its package and that file is one the host build compiles
+// for that package, the package's container otherwise.
 //
 // The file is the one the host build declares the name in, so a twinned
 // answer means "the declaration this host compiles" (GM-570). When it is not
 // known - a declaration outside the project root, or a `//line` directive
-// naming a non-Go source - the container scope is kept: the edge stays
+// naming a non-Go source or a path the build does not compile - the
+// container scope is kept: the edge stays
 // ambiguous, as before, rather than being dropped.
 func (r *resolutions) targetScopeOf(obj types.Object, container string, key []pathSegment) targetScope {
 	if r.twinned[container][joinPath(key)] {
-		if file := r.declaredIn[obj]; strings.HasSuffix(file, ".go") {
+		if file := r.declaredIn[obj]; r.builtFiles[container][file] {
 			return targetScope{File: file}
 		}
 	}
