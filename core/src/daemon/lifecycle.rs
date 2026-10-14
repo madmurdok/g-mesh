@@ -943,7 +943,8 @@ fn end_process_group() {
 /// that no longer exists. Called by `daemon::run` and `front::run` after the
 /// singleton lock is dropped, so the directory is judged by exactly the rules
 /// `clean orphaned --force` uses (`cli::clean::purge_orphaned_state_dir`): the
-/// root's parent must still exist, nothing may be running for it, and the
+/// root must read as deleted by `root_state` (`NotFound`, parent present on
+/// the recorded device), nothing may be running for it, and the
 /// root is re-checked under the bootstrap lock in case it came back.
 ///
 /// Open handles - the index the other threads still hold, `daemon.log` as this

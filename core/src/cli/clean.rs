@@ -23,8 +23,8 @@
 //! criterion is far less conservative: "the project directory is not there"
 //! is a fact about this instant, where "idle for 90 days" is a fact about a
 //! quarter of a year. The preview is what lets a caller notice that the
-//! answer changed because a disk is unmounted - see `RootState` for the rest
-//! of that guard.
+//! answer changed because a disk is unmounted or a directory unreadable - see
+//! `RootState` for the rest of that guard.
 //!
 //! None of this is dangerous by construction, and for the same reason schema
 //! versioning can wipe and rebuild: an index is a reproducible local cache,
@@ -236,13 +236,18 @@ fn clean_many(scope: Scope, projects_root: &Path, idle_threshold_days: u64) -> R
 /// What the recorded project root of a state directory says about it.
 ///
 /// The distinction that carries the whole risk of this command is the last
-/// two. A root that is missing *along with the directory that contained it*
-/// is exactly what an unmounted external disk looks like: `/Volumes/Ext/proj`
-/// and `/Volumes/Ext` both vanish when the disk is ejected, while deleting a
-/// project on a filesystem that is still mounted leaves its parent in place.
-/// Treating "not present right now" as "gone forever" is the one way this
-/// feature could destroy an index someone wanted, so an absent parent is
-/// reported and never deleted.
+/// two. "Not present right now" is not "gone forever": `stat` fails for a
+/// missing directory, but also for a permission change on an ancestor and for
+/// a volume that is not mounted. Only these read as deleted (GM-565):
+///
+/// - `stat(root)` fails with `NotFound` (any other error is `Unreachable`);
+/// - the parent is a readable directory; and
+/// - on Unix, the parent is on the device the root was recorded on
+///   (`project.dev`). A deleted directory leaves its parent on its own
+///   filesystem; an unmounted volume leaves a parent on another one
+///   (`/Volumes` for `/Volumes/Ext`, the empty mount point for
+///   `/mnt/ext/proj`). A root recorded without a device is not judged on
+///   Unix.
 ///
 /// Deleting a whole tree of projects at once therefore also reads as
 /// `Unreachable`. That is the trade accepted knowingly: those are cleaned by
@@ -252,12 +257,14 @@ fn clean_many(scope: Scope, projects_root: &Path, idle_threshold_days: u64) -> R
 pub(crate) enum RootState {
     /// The project is still on disk.
     Live,
-    /// The project directory is gone, but the directory that held it is
-    /// still there - so the filesystem it lived on is present and it really
-    /// was deleted.
+    /// The project directory is gone (`NotFound`), but the directory that
+    /// held it is still there, on the filesystem the root was recorded on -
+    /// so it really was deleted.
     Orphaned,
-    /// The root is missing and so is its parent: possibly deleted, possibly
-    /// an unmounted volume or a moved tree. Not judged.
+    /// Possibly deleted, possibly not: the root's `stat` failed for a reason
+    /// other than `NotFound` (permissions, I/O), its parent is missing or
+    /// unreadable, the parent is on another device than the root was (an
+    /// unmounted volume), or no device was recorded. Not judged.
     Unreachable,
     /// No `project.root` file - a state directory created before g-mesh
     /// recorded roots. Not judged, and never guessed at: `project_hash` is
@@ -265,17 +272,36 @@ pub(crate) enum RootState {
     Legacy,
 }
 
-pub(crate) fn root_state(root: Option<&Path>) -> RootState {
+/// Judges a recorded root against the disk; see [`RootState`] for the rules.
+/// `device` is the recorded `project.dev` ([`daemon::identity::read_root_device`]).
+pub(crate) fn root_state(root: Option<&Path>, device: Option<u64>) -> RootState {
     let Some(root) = root else {
         return RootState::Legacy;
     };
-    if root.exists() {
-        return RootState::Live;
+    match fs::metadata(root) {
+        Ok(_) => return RootState::Live,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return RootState::Unreachable,
     }
-    match root.parent() {
-        Some(parent) if parent.exists() => RootState::Orphaned,
-        _ => RootState::Unreachable,
+    let Some(parent) = root.parent() else {
+        return RootState::Unreachable;
+    };
+    let Ok(parent_meta) = fs::metadata(parent) else {
+        return RootState::Unreachable;
+    };
+    if !parent_meta.is_dir() {
+        return RootState::Unreachable;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if device != Some(parent_meta.dev()) {
+            return RootState::Unreachable;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = device;
+    RootState::Orphaned
 }
 
 /// `clean orphaned`: deletes state whose project directory was deleted.
@@ -290,7 +316,7 @@ fn clean_orphaned(force: bool, projects_root: &Path) -> Result<Outcome> {
 
     for candidate in candidates(projects_root)? {
         let entry = || Orphan { id: candidate.id.clone(), root: candidate.root.clone().unwrap_or_default() };
-        match root_state(candidate.root.as_deref()) {
+        match root_state(candidate.root.as_deref(), candidate.device) {
             RootState::Live => continue,
             RootState::Legacy => legacy += 1,
             RootState::Unreachable => unreachable.push(entry()),
@@ -344,7 +370,8 @@ pub(crate) enum Purge {
 pub(crate) fn purge_orphaned_state_dir(state_dir: &Path) -> Result<Purge> {
     let judge = || -> Option<Purge> {
         let root = daemon::identity::read_project_root(state_dir);
-        if root_state(root.as_deref()) != RootState::Orphaned {
+        let device = daemon::identity::read_root_device(state_dir);
+        if root_state(root.as_deref(), device) != RootState::Orphaned {
             return Some(Purge::Kept("its project root exists, is unreachable, or is not recorded"));
         }
         if daemon_is_running(state_dir) || singleton_lock_is_held(state_dir) {
@@ -382,16 +409,20 @@ pub(crate) fn purge_orphaned_state_dir(state_dir: &Path) -> Result<Purge> {
     Ok(Purge::Deleted)
 }
 
-/// [`delete`], with `project.root` removed only after everything else. A
-/// delete cut short (a shim that exits mid-sweep, a daemon killed mid-purge)
-/// then leaves a directory that still reads as orphaned and is finished by the
-/// next sweep, never one without its root record, which would be
-/// [`RootState::Legacy`] and kept forever.
+/// [`delete`], with `project.root` and `project.dev` removed only after
+/// everything else, in that order. A delete cut short (a shim that exits
+/// mid-sweep, a daemon killed mid-purge) then leaves a directory that still
+/// reads as orphaned and is finished by the next sweep, never one without its
+/// root record, which would be [`RootState::Legacy`] and kept forever. An
+/// interruption between the last two removals leaves only `project.dev`: it
+/// reads `Legacy` and is kept (a few bytes, accepted).
 fn delete_root_record_last(state_dir: &Path) -> Result<()> {
     let entries =
         fs::read_dir(state_dir).with_context(|| format!("failed to read {}", state_dir.display()))?;
     for entry in entries.flatten() {
-        if entry.file_name() == daemon::identity::ROOT_FILE {
+        if entry.file_name() == daemon::identity::ROOT_FILE
+            || entry.file_name() == daemon::identity::DEVICE_FILE
+        {
             continue;
         }
         let path = entry.path();
@@ -404,6 +435,13 @@ fn delete_root_record_last(state_dir: &Path) -> Result<()> {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err).with_context(|| format!("failed to delete {}", path.display())),
+        }
+    }
+    for name in [daemon::identity::ROOT_FILE, daemon::identity::DEVICE_FILE] {
+        match fs::remove_file(state_dir.join(name)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("failed to delete {name}")),
         }
     }
     delete(state_dir)
@@ -544,6 +582,9 @@ struct Candidate {
     /// The project root this directory records, or `None` if it records none
     /// - see [`RootState::Legacy`].
     root: Option<PathBuf>,
+    /// The device id recorded beside the root, if any - see
+    /// [`daemon::identity::DEVICE_FILE`].
+    device: Option<u64>,
 }
 
 impl Candidate {
@@ -581,6 +622,7 @@ fn candidates(projects_root: &Path) -> Result<Vec<Candidate>> {
             idle: last_used::read_from_project_dir(&path).unwrap_or(None).map(|record| record.idle),
             daemon_running: daemon_is_running(&path),
             root: daemon::identity::read_project_root(&path),
+            device: daemon::identity::read_root_device(&path),
             id,
             path,
         });
@@ -675,9 +717,9 @@ pub fn render(outcome: &Outcome) -> String {
             if !unreachable.is_empty() {
                 let _ = writeln!(
                     out,
-                    "  left alone: {} project(s) whose root is missing along with the directory \
-                     that held it - an unmounted disk looks exactly like this. Delete one by id \
-                     if you are sure:",
+                    "  left alone: {} project(s) whose root is unreachable, unreadable, or on a \
+                     volume that is not mounted - none of these can be told from a deleted \
+                     project. Delete one by id if you are sure:",
                     unreachable.len()
                 );
                 for orphan in unreachable {
@@ -1200,13 +1242,21 @@ mod tests {
         let live = parent.path().join("live");
         fs::create_dir(&live).unwrap();
 
-        assert_eq!(root_state(Some(&live)), RootState::Live);
-        assert_eq!(root_state(Some(&parent.path().join("gone"))), RootState::Orphaned);
+        #[cfg(unix)]
+        let device = {
+            use std::os::unix::fs::MetadataExt;
+            Some(fs::metadata(parent.path()).unwrap().dev())
+        };
+        #[cfg(not(unix))]
+        let device = None;
+
+        assert_eq!(root_state(Some(&live), device), RootState::Live);
+        assert_eq!(root_state(Some(&parent.path().join("gone")), device), RootState::Orphaned);
         assert_eq!(
-            root_state(Some(&parent.path().join("unmounted").join("project"))),
+            root_state(Some(&parent.path().join("unmounted").join("project")), device),
             RootState::Unreachable
         );
-        assert_eq!(root_state(None), RootState::Legacy);
+        assert_eq!(root_state(None, device), RootState::Legacy);
     }
 
     #[test]
@@ -1251,7 +1301,7 @@ mod tests {
         assert!(rendered.contains("a1b2c3d4e5f6a7b8"), "{rendered}");
         assert!(rendered.contains("/home/u/work/deleted-project"), "{rendered}");
         assert!(rendered.contains("/Volumes/Ext/project"), "{rendered}");
-        assert!(rendered.contains("unmounted disk"), "{rendered}");
+        assert!(rendered.contains("volume that is not mounted"), "{rendered}");
         assert!(rendered.contains("7 project(s) indexed before"), "{rendered}");
     }
 

@@ -29,6 +29,14 @@ pub fn project_hash(root: &Path) -> Result<String> {
 /// where the project was.
 pub const ROOT_FILE: &str = "project.root";
 
+/// The device id (`st_dev`) of the filesystem the project root was on when
+/// [`record_project_root`] last ran, beside [`ROOT_FILE`]. Unix only.
+///
+/// It is what lets `cli::clean::root_state` tell a deleted directory from an
+/// unmounted volume: a deleted root leaves its parent on the root's own
+/// device, while an unmounted volume leaves a parent on another one.
+pub const DEVICE_FILE: &str = "project.dev";
+
 /// Records `root` as the project `state_dir` holds the state for.
 ///
 /// Idempotent - rewritten every time the state directory is opened, which is
@@ -39,13 +47,38 @@ pub const ROOT_FILE: &str = "project.root";
 /// spellings of one root (a relative path, a symlink, a trailing slash) must
 /// not produce a state directory that disagrees with itself about where its
 /// project is.
+///
+/// On Unix the root's device id is also written, to [`DEVICE_FILE`]. It is a
+/// sidecar file and not a second line of `project.root` on purpose: an older
+/// g-mesh reads the whole of `project.root` as the path, so a second line
+/// would turn the path into something whose parent exists and let that
+/// binary delete a live project.
 pub fn record_project_root(state_dir: &Path, root: &Path) -> Result<()> {
     let canonical = root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
     let path = state_dir.join(ROOT_FILE);
     fs::write(&path, canonical.to_string_lossy().as_bytes())
-        .with_context(|| format!("failed to record the project root at {}", path.display()))
+        .with_context(|| format!("failed to record the project root at {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dev = fs::metadata(&canonical)
+            .with_context(|| format!("failed to stat project root {}", canonical.display()))?
+            .dev();
+        let dev_path = state_dir.join(DEVICE_FILE);
+        fs::write(&dev_path, dev.to_string().as_bytes())
+            .with_context(|| format!("failed to record the project device at {}", dev_path.display()))?;
+    }
+    Ok(())
+}
+
+/// The device id [`record_project_root`] wrote, or `None` if there is none
+/// (a directory recorded before [`DEVICE_FILE`] existed, a non-Unix platform,
+/// an unreadable or unparsable file). `None` is "cannot be judged", the same
+/// posture as [`read_project_root`].
+pub fn read_root_device(state_dir: &Path) -> Option<u64> {
+    fs::read_to_string(state_dir.join(DEVICE_FILE)).ok()?.trim().parse().ok()
 }
 
 /// The root [`record_project_root`] wrote, or `None` if this state directory
