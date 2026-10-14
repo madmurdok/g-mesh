@@ -41,7 +41,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -350,6 +350,27 @@ pub(crate) enum Purge {
     Kept(&'static str),
 }
 
+/// How [`purge_orphaned_state_dir`] treats a lock someone else holds: the
+/// project's bootstrap lock, or the daemon's singleton lock it probes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LockWait {
+    /// Try once and keep the directory if either lock is busy. The shim's
+    /// startup sweep uses this, so it never stalls a shim's start.
+    Try,
+    /// Poll for both locks for up to this long, one deadline for the two.
+    /// The daemon's own purge uses this: a sweeper holding the bootstrap lock
+    /// is about to delete the same directory (or died mid-delete and left the
+    /// rest), and a sweeper judging the directory holds the singleton lock
+    /// for the instant of its probe; giving up at once on either would let
+    /// the daemon exit with its state still on disk. A daemon that really is
+    /// running holds the singleton lock for good, so that wait ends in
+    /// `Kept` at the deadline.
+    UpTo(Duration),
+}
+
+/// How often [`LockWait::UpTo`] retries a busy bootstrap or singleton lock.
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(15);
+
 /// Deletes one project's state directory, but only under the rules
 /// `clean orphaned --force` applies to it: its recorded root is
 /// [`RootState::Orphaned`] (gone, while the directory that held it is not -
@@ -360,24 +381,49 @@ pub(crate) enum Purge {
 /// Taken under the project's bootstrap lock, then re-judged: a shim can only
 /// bootstrap a project whose root exists (`project_hash` canonicalizes it), so
 /// a root recreated between the first look and the lock is seen by the second
-/// one and the directory kept. The lock is only *tried*: a shim holding it is
-/// bootstrapping this project right now, which is reason enough to keep it.
+/// one and the directory kept. `wait` says what a busy lock means: under
+/// [`LockWait::Try`] a shim holding the bootstrap lock may be bootstrapping
+/// this project, and a held singleton lock may be a running daemon, either of
+/// which is reason enough to keep it; under [`LockWait::UpTo`] both are polled
+/// until free or the bound runs out, because another process's sweep probes
+/// the singleton lock (a brief `try_lock`) and holds the bootstrap lock while
+/// it deletes. A live pid file is never waited for. A directory that is gone
+/// once the bootstrap lock is taken was deleted by whoever held it, which is
+/// the outcome asked for.
 ///
 /// Shared by the daemon's own purge on `ProjectRootGone`
 /// (`daemon::lifecycle::purge_state_dir`, GM-524 D1) and the shim's startup
 /// sweep ([`sweep_orphaned`]), so the two can never disagree with
 /// `clean orphaned` on what is safe to delete.
-pub(crate) fn purge_orphaned_state_dir(state_dir: &Path) -> Result<Purge> {
+pub(crate) fn purge_orphaned_state_dir(state_dir: &Path, wait: LockWait) -> Result<Purge> {
+    const RUNNING: &str = "a daemon or plugin is still running for it";
+    let deadline = match wait {
+        LockWait::Try => None,
+        LockWait::UpTo(bound) => Some(Instant::now() + bound),
+    };
+    // `None` when the directory may go; a held singleton lock is polled under
+    // `UpTo`, since a sweeper's probe holds it for an instant.
     let judge = || -> Option<Purge> {
-        let root = daemon::identity::read_project_root(state_dir);
-        let device = daemon::identity::read_root_device(state_dir);
-        if root_state(root.as_deref(), device) != RootState::Orphaned {
-            return Some(Purge::Kept("its project root exists, is unreachable, or is not recorded"));
+        loop {
+            let root = daemon::identity::read_project_root(state_dir);
+            let device = daemon::identity::read_root_device(state_dir);
+            if root_state(root.as_deref(), device) != RootState::Orphaned {
+                return Some(Purge::Kept("its project root exists, is unreachable, or is not recorded"));
+            }
+            if daemon_is_running(state_dir) {
+                return Some(Purge::Kept(RUNNING));
+            }
+            if !singleton_lock_is_held(state_dir) {
+                return None;
+            }
+            match deadline {
+                None => return Some(Purge::Kept(RUNNING)),
+                Some(deadline) if Instant::now() >= deadline => {
+                    return Some(Purge::Kept("a daemon or plugin held its singleton lock past the wait"));
+                }
+                Some(_) => std::thread::sleep(LOCK_POLL_INTERVAL),
+            }
         }
-        if daemon_is_running(state_dir) || singleton_lock_is_held(state_dir) {
-            return Some(Purge::Kept("a daemon or plugin is still running for it"));
-        }
-        None
     };
     if let Some(kept) = judge() {
         return Ok(kept);
@@ -391,12 +437,28 @@ pub(crate) fn purge_orphaned_state_dir(state_dir: &Path) -> Result<Purge> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Purge::Deleted),
         Err(err) => return Err(err).with_context(|| format!("failed to open {}", lock_path.display())),
     };
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(fs::TryLockError::WouldBlock) => return Ok(Purge::Kept("a shim is bootstrapping it")),
-        Err(fs::TryLockError::Error(err)) => {
-            return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => match deadline {
+                None => return Ok(Purge::Kept("a shim is bootstrapping it")),
+                Some(deadline) if Instant::now() >= deadline => {
+                    return Ok(Purge::Kept("a shim held its bootstrap lock past the wait"));
+                }
+                Some(_) => std::thread::sleep(LOCK_POLL_INTERVAL),
+            },
+            Err(fs::TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+            }
         }
+    }
+    // The lock is taken on a file opened before whoever held it deleted the
+    // directory, so a gone directory must be told apart here: re-judged, it
+    // would read as "not recorded" and be reported as kept.
+    match fs::symlink_metadata(state_dir) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Purge::Deleted),
+        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", state_dir.display())),
     }
     if let Some(kept) = judge() {
         return Ok(kept);
@@ -483,7 +545,7 @@ pub(crate) fn sweep_orphaned(projects_root: &Path) -> Result<usize> {
         if !is_project_id || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        match purge_orphaned_state_dir(&entry.path()) {
+        match purge_orphaned_state_dir(&entry.path(), LockWait::Try) {
             Ok(Purge::Deleted) => deleted += 1,
             Ok(Purge::Kept(_)) => {}
             Err(err) => {
@@ -1552,7 +1614,7 @@ mod tests {
         fs::remove_dir(&deleted).unwrap();
 
         assert!(matches!(
-            purge_orphaned_state_dir(&projects.root().join("aaaa1111")).unwrap(),
+            purge_orphaned_state_dir(&projects.root().join("aaaa1111"), LockWait::Try).unwrap(),
             Purge::Kept(_)
         ));
         assert!(projects.exists("aaaa1111"));
@@ -1580,7 +1642,7 @@ mod tests {
         let recorded = daemon::identity::read_project_root(&state).unwrap();
         assert_eq!(daemon::identity::read_root_device(&state), None);
         assert_eq!(root_state(Some(&recorded), None), RootState::Unreachable);
-        assert!(matches!(purge_orphaned_state_dir(&state).unwrap(), Purge::Kept(_)));
+        assert!(matches!(purge_orphaned_state_dir(&state, LockWait::Try).unwrap(), Purge::Kept(_)));
         assert!(projects.exists("aaaa1111"));
     }
 
@@ -1667,5 +1729,185 @@ mod tests {
 
         assert_eq!(sweep_orphaned(projects.root()).unwrap(), 0);
         assert!(projects.exists("aaaa1111"), "the sweep deleted state of a project on a detached volume");
+    }
+
+    // -----------------------------------------------------------------
+    // A purge that finds the bootstrap lock held
+    // -----------------------------------------------------------------
+
+    /// Takes `state`'s bootstrap lock on a file of its own, as a
+    /// bootstrapping shim or another process's sweep holds it.
+    fn hold_bootstrap_lock(state: &Path) -> fs::File {
+        let lock = fs::File::create(daemon::bootstrap_lock_path_in(state)).unwrap();
+        lock.try_lock().unwrap();
+        lock
+    }
+
+    /// How long a test lets a purge run against a held lock before it acts:
+    /// a purge that does not wait has returned well within it.
+    const WATCH: Duration = Duration::from_millis(300);
+
+    /// A bound no test here reaches: the lock is always released first.
+    const LONG_WAIT: Duration = Duration::from_secs(60);
+
+    /// Runs the purge on its own thread, so the test can release the lock
+    /// (or delete the directory) while it waits.
+    fn purge_in_background(state: &Path, wait: LockWait) -> std::thread::JoinHandle<Result<Purge>> {
+        let state = state.to_path_buf();
+        std::thread::spawn(move || purge_orphaned_state_dir(&state, wait))
+    }
+
+    /// The daemon's purge: a lock that is held and then released over a
+    /// directory still orphaned is waited for, and the directory deleted.
+    ///
+    /// Control: make `LockWait::UpTo` give up at once like `Try`: the purge
+    /// returns `Kept` while the lock is held.
+    #[test]
+    fn a_waiting_purge_deletes_the_directory_once_the_lock_is_released() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let lock = hold_bootstrap_lock(&state);
+
+        let purge = purge_in_background(&state, LockWait::UpTo(LONG_WAIT));
+        std::thread::sleep(WATCH);
+        assert!(!purge.is_finished(), "the purge must wait for the held lock, not give up on it");
+        assert!(state.exists(), "nothing may be deleted while the lock is held");
+
+        drop(lock);
+        assert_eq!(purge.join().unwrap().unwrap(), Purge::Deleted);
+        assert!(!state.exists(), "the directory must go once the lock is free");
+    }
+
+    /// A holder that deletes the directory itself (a sweep) and then releases
+    /// the lock has done what the purge was for: that is `Deleted`, not a
+    /// directory "kept" because its root record went with it.
+    ///
+    /// Unix only: Windows cannot delete the lock file the purge holds open.
+    ///
+    /// Control: drop the purge's check for a directory gone once the lock is
+    /// taken: the re-judgement reports it kept as not recorded.
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_purge_whose_directory_the_holder_deleted_reports_it_deleted() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let lock = hold_bootstrap_lock(&state);
+
+        let purge = purge_in_background(&state, LockWait::UpTo(LONG_WAIT));
+        // Once the purge has opened the lock file and is waiting on it: a
+        // purge that started after the delete would find no directory to
+        // open the lock in, which says `Deleted` without the path under test.
+        std::thread::sleep(WATCH);
+        assert!(!purge.is_finished(), "the purge must still be waiting for the held lock");
+        fs::remove_dir_all(&state).unwrap();
+        drop(lock);
+
+        assert_eq!(purge.join().unwrap().unwrap(), Purge::Deleted);
+    }
+
+    /// A lock held past the bound keeps the directory, saying why, rather
+    /// than waiting on.
+    ///
+    /// Control: make `LockWait::UpTo` give up at once like `Try`: the reason
+    /// is the one for a bootstrapping shim instead.
+    #[test]
+    fn a_purge_whose_lock_stays_held_past_the_bound_keeps_the_directory() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let _lock = hold_bootstrap_lock(&state);
+        let bound = Duration::from_millis(200);
+
+        let started = Instant::now();
+        let purge = purge_orphaned_state_dir(&state, LockWait::UpTo(bound)).unwrap();
+
+        assert_eq!(purge, Purge::Kept("a shim held its bootstrap lock past the wait"));
+        assert!(started.elapsed() >= bound, "the purge must wait out its bound first");
+        assert!(state.exists());
+    }
+
+    /// The shim's sweep never waits: a busy lock keeps the directory on the
+    /// first try.
+    ///
+    /// Control: make `LockWait::Try` poll like `UpTo`: the purge waits and
+    /// reports the lock held past the wait instead.
+    #[test]
+    fn a_trying_purge_keeps_the_directory_of_a_busy_lock_at_once() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let _lock = hold_bootstrap_lock(&state);
+
+        let purge = purge_orphaned_state_dir(&state, LockWait::Try).unwrap();
+
+        assert_eq!(purge, Purge::Kept("a shim is bootstrapping it"));
+        assert!(state.exists());
+    }
+
+    // A purge that finds the daemon's singleton lock held
+    // -----------------------------------------------------------------
+
+    /// Takes `state`'s singleton lock on a file of its own, as a running
+    /// daemon holds it or another process's sweep probes it.
+    fn hold_singleton_lock(state: &Path) -> fs::File {
+        let lock = fs::File::create(daemon::daemon_lock_path_in(state)).unwrap();
+        lock.try_lock().unwrap();
+        lock
+    }
+
+    /// The daemon's purge: a singleton lock held for a moment (a sweeper's
+    /// probe) over a directory still orphaned is waited out, and the
+    /// directory deleted.
+    ///
+    /// Control: return `Kept` at once on a held singleton lock under
+    /// `LockWait::UpTo` too: the purge keeps the directory.
+    #[test]
+    fn a_waiting_purge_deletes_the_directory_once_the_singleton_lock_is_released() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let lock = hold_singleton_lock(&state);
+
+        let purge = purge_in_background(&state, LockWait::UpTo(LONG_WAIT));
+        std::thread::sleep(WATCH);
+        assert!(!purge.is_finished(), "the purge must wait for the held singleton lock, not give up on it");
+        assert!(state.exists(), "nothing may be deleted while the singleton lock is held");
+
+        drop(lock);
+        assert_eq!(purge.join().unwrap().unwrap(), Purge::Deleted);
+        assert!(!state.exists(), "the directory must go once the singleton lock is free");
+    }
+
+    /// A singleton lock held past the bound - a daemon that really runs -
+    /// keeps the directory, saying why, once the bound is spent.
+    ///
+    /// Control: return `Kept` at once on a held singleton lock under
+    /// `LockWait::UpTo` too: the reason is the one for a running daemon.
+    #[test]
+    fn a_purge_whose_singleton_lock_stays_held_past_the_bound_keeps_the_directory() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let _lock = hold_singleton_lock(&state);
+        let bound = Duration::from_millis(200);
+
+        let started = Instant::now();
+        let purge = purge_orphaned_state_dir(&state, LockWait::UpTo(bound)).unwrap();
+
+        assert_eq!(purge, Purge::Kept("a daemon or plugin held its singleton lock past the wait"));
+        assert!(started.elapsed() >= bound, "the purge must wait out its bound first");
+        assert!(state.exists());
+    }
+
+    /// The shim's sweep never waits: a held singleton lock keeps the
+    /// directory on the first try, as a running daemon's.
+    #[test]
+    fn a_trying_purge_keeps_the_directory_of_a_held_singleton_lock_at_once() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let _lock = hold_singleton_lock(&state);
+
+        let started = Instant::now();
+        let purge = purge_orphaned_state_dir(&state, LockWait::Try).unwrap();
+
+        assert_eq!(purge, Purge::Kept("a daemon or plugin is still running for it"));
+        assert!(started.elapsed() < WATCH, "a trying purge must not wait on the lock");
+        assert!(state.exists());
     }
 }

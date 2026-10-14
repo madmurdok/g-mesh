@@ -43,6 +43,12 @@ fail-fast = false
 # largest - so 150s before the test's own assertion fires. Terminating below
 # that would replace a precise "timed out waiting for X" panic with an opaque
 # kill, which is worse than having no timeout at all.
+#
+# Every single wait budget in `core/tests/common/mod.rs` must stay below this
+# limit (period * terminate-after = 210s), or nextest kills the wait before it
+# can fail with its own message: `DEFAULT_STARTUP_TIMEOUT_SECS` (180s, also
+# `orphan_budget` in `orphaned_daemon.rs`) and `DEFAULT_INDEXED_TIMEOUT_SECS`
+# (90s). Raising one of them past 210s, or lowering this, breaks that.
 slow-timeout = { period = "30s", terminate-after = 7 }
 
 # Deliberately absent: `retries`. Three load-dependent races surfaced this
