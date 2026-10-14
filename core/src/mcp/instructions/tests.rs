@@ -445,6 +445,22 @@ fn build_front_with_64_long_names_under_a_103_byte_root_fits_the_ceiling() {
     assert!(rendered.contains("is a folder of 64 projects"));
 }
 
+/// GM-571 D7: the front's list is a snapshot, and the text says so and
+/// says how to reach a project that is not in it (a worktree created after
+/// the session started): pass it as `project` or to select_project.
+///
+/// Control: drop the snapshot sentence from `front_sentence`.
+#[test]
+fn build_front_says_its_list_is_a_snapshot_and_how_to_reach_a_newer_project() {
+    let names = vec!["a".to_string(), "b".to_string()];
+    let rendered = build_front(Path::new("/f"), &front_detection(&names, false), &HashSet::new());
+    assert!(rendered.contains("The list is a snapshot as of session start"), "{rendered}");
+    assert!(rendered.contains("a worktree created since included"), "{rendered}");
+    assert!(rendered.contains("passed as `project` on a tool call or to select_project"), "{rendered}");
+    assert!(rendered.ends_with("Projects: a, b."), "{rendered}");
+    assert!(rendered.len() <= INSTRUCTIONS_BYTE_CEILING, "{} bytes", rendered.len());
+}
+
 /// GM-399 follow-up: with no candidate indexed, the front keeps D12's
 /// original wording and lists the names unmarked, in walk order.
 ///

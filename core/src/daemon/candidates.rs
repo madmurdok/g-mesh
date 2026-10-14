@@ -307,6 +307,137 @@ pub fn walk(root: &Path, limits: Limits) -> Walk {
     Walk { candidates, entries_read, elapsed: started.elapsed(), truncated }
 }
 
+/// Why [`resolve`] found no project at a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unresolved {
+    /// The path is not below the root, or climbs out of it (`..`).
+    NotBelowRoot,
+    /// The path names the root itself.
+    IsRoot,
+    /// More segments than the walk descends ([`Limits::max_depth`]).
+    TooDeep { max_depth: usize },
+    /// A segment the walk never enters: a dot-directory or one of the
+    /// skipped names (`node_modules`, `target`, ...).
+    Skipped(String),
+    /// Nothing exists at this path, relative to the root.
+    Missing(String),
+    /// A symlink or a file, which the walk never takes for a directory.
+    NotADirectory(String),
+    /// A directory without any of [`MARKERS`].
+    NoMarker,
+    /// A directory between the root and the path carries a marker, so that
+    /// one is the candidate and this path lies inside it.
+    InsideCandidate(String),
+}
+
+impl std::fmt::Display for Unresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unresolved::NotBelowRoot => write!(f, "it is not below the folder"),
+            Unresolved::IsRoot => write!(f, "it names the folder itself, not a project below it"),
+            Unresolved::TooDeep { max_depth } => {
+                write!(f, "projects lie at most {max_depth} levels below the folder")
+            }
+            Unresolved::Skipped(segment) => {
+                write!(f, "'{segment}' is a directory projects are never found in")
+            }
+            Unresolved::Missing(rel) => write!(f, "'{rel}' does not exist"),
+            Unresolved::NotADirectory(rel) => write!(f, "'{rel}' is not a directory (or is a symlink)"),
+            Unresolved::NoMarker => write!(f, "it carries none of {}", MARKERS.join(", ")),
+            Unresolved::InsideCandidate(rel) => write!(f, "it lies inside the project '{rel}'"),
+        }
+    }
+}
+
+/// `path`'s segments, split on `/` and `\` alike, without empty and `.` ones.
+pub(crate) fn segments(path: &str) -> Vec<&str> {
+    path.split(['/', '\\']).filter(|s| !s.is_empty() && *s != ".").collect()
+}
+
+/// `path` below `root`, compared by components. `root` is canonical, so a
+/// spelling of it that differs textually (a symlink, or on Windows the `\\?\`
+/// prefix `canonicalize` adds) is retried canonicalized.
+pub(crate) fn relative_to_root(root: &Path, path: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return Some(rel.to_path_buf());
+    }
+    path.canonicalize().ok()?.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+/// The candidate `project` names, found by probing that one path rather than
+/// walking the folder: fresh, and not bounded by the walk's entry or
+/// candidate limits. `project` is a path relative to `root` (`/` or `\`
+/// separated) or a rooted path below it. It accepts exactly what [`walk`]
+/// would list with the default limits: at most [`Limits::max_depth`]
+/// segments, none skipped, each a real directory (not a symlink), the last
+/// one marked and none before it.
+///
+/// `has_root` rather than `is_absolute` picks the branch: on Windows
+/// `/root/a` has a root but no drive. A rooted path whose segments below
+/// `root` name no candidate (a symlink inside it, `..` in it) is retried
+/// canonicalized.
+pub fn resolve(root: &Path, project: &str) -> Result<Candidate, Unresolved> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let as_path = Path::new(project);
+    if !as_path.has_root() {
+        return resolve_segments(&root, &segments(project));
+    }
+    let Some(rel) = relative_to_root(&root, as_path) else {
+        return Err(Unresolved::NotBelowRoot);
+    };
+    let rel = rel.to_string_lossy().into_owned();
+    let first = resolve_segments(&root, &segments(&rel));
+    if first.is_ok() {
+        return first;
+    }
+    let canonical =
+        as_path.canonicalize().ok().and_then(|path| path.strip_prefix(&root).ok().map(Path::to_path_buf));
+    match canonical {
+        Some(canonical) if canonical.to_string_lossy() != rel => {
+            resolve_segments(&root, &segments(&canonical.to_string_lossy())).or(first)
+        }
+        _ => first,
+    }
+}
+
+fn resolve_segments(root: &Path, segments: &[&str]) -> Result<Candidate, Unresolved> {
+    let max_depth = Limits::default().max_depth;
+    if segments.contains(&"..") {
+        return Err(Unresolved::NotBelowRoot);
+    }
+    if segments.is_empty() {
+        return Err(Unresolved::IsRoot);
+    }
+    if segments.len() > max_depth {
+        return Err(Unresolved::TooDeep { max_depth });
+    }
+    if let Some(skipped) = segments.iter().find(|segment| is_skipped(segment)) {
+        return Err(Unresolved::Skipped((*skipped).to_string()));
+    }
+    let mut dir = root.to_path_buf();
+    for (index, segment) in segments.iter().enumerate() {
+        dir.push(segment);
+        let rel = segments[..=index].join("/");
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(Unresolved::NotADirectory(rel)),
+            Err(_) => return Err(Unresolved::Missing(rel)),
+        }
+        let (markers, is_worktree) = probe(&dir);
+        if index + 1 < segments.len() {
+            if !markers.is_empty() {
+                return Err(Unresolved::InsideCandidate(rel));
+            }
+            continue;
+        }
+        if markers.is_empty() {
+            return Err(Unresolved::NoMarker);
+        }
+        return Ok(Candidate { rel_path: rel, abs_path: dir, markers, is_worktree });
+    }
+    unreachable!("segments is not empty")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +658,218 @@ mod tests {
 
         let detection = detect_fresh(root.path(), Limits::default());
         assert_eq!(rels(&detection.candidates), ["a", "b"]);
+    }
+
+    /// A folder holding the projects `a` and `group/c`, canonical.
+    fn resolve_fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        touch(&root, "a/.git");
+        touch(&root, "group/c/go.mod");
+        let root = root.canonicalize().unwrap();
+        (dir, root)
+    }
+
+    fn resolved(root: &Path, project: &str) -> Option<String> {
+        resolve(root, project).ok().map(|c| c.rel_path)
+    }
+
+    #[test]
+    fn a_project_is_found_by_its_relative_path() {
+        let (_dir, root) = resolve_fixture();
+        let hit = |project: &str| resolved(&root, project);
+        assert_eq!(hit("group/c/").as_deref(), Some("group/c"));
+        assert_eq!(hit("./a").as_deref(), Some("a"));
+        assert_eq!(hit("group\\c").as_deref(), Some("group/c"));
+        assert_eq!(hit(".\\group/c\\").as_deref(), Some("group/c"), "mixed separators");
+        assert_eq!(resolve(&root, "c"), Err(Unresolved::Missing("c".into())));
+        assert_eq!(resolve(&root, "group"), Err(Unresolved::NoMarker));
+    }
+
+    /// A path with a root is matched below the served root by its segments.
+    /// On Windows `/root/group/c` has a root but no drive, so it is not
+    /// absolute: this is the shape an `is_absolute` branch sent down the
+    /// relative path.
+    #[test]
+    fn a_project_is_found_by_a_rooted_path_under_the_root() {
+        let (dir, root) = resolve_fixture();
+        let under = |rel: &str| format!("{}/{rel}", root.display());
+        assert_eq!(resolved(&root, &under("group/c")).as_deref(), Some("group/c"));
+        assert_eq!(resolved(&root, &under("a/")).as_deref(), Some("a"));
+        assert_eq!(resolved(&root, &under("group\\c")).as_deref(), Some("group/c"), "mixed separators");
+        assert_eq!(resolved(&root, &under("c")), None, "whole segments, not a suffix");
+        assert_eq!(
+            resolve(&root, &under("group")),
+            Err(Unresolved::NoMarker),
+            "a directory above a candidate"
+        );
+        let elsewhere = dir.path().join("elsewhere").join("group").join("c");
+        assert_eq!(resolve(&root, elsewhere.to_str().unwrap()), Err(Unresolved::NotBelowRoot));
+    }
+
+    /// The root is canonical; a project path spelling it differently (here a
+    /// symlink) is retried canonicalized.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_through_another_spelling_of_the_root_is_found() {
+        let (dir, root) = resolve_fixture();
+        std::os::unix::fs::symlink(&root, dir.path().join("link")).unwrap();
+        let project = dir.path().join("link").join("group").join("c");
+        assert_eq!(resolved(&root, project.to_str().unwrap()).as_deref(), Some("group/c"));
+    }
+
+    /// The Windows shape of the test above: the served root carries the
+    /// verbatim prefix `canonicalize` adds, the client's path does not.
+    #[cfg(windows)]
+    #[test]
+    fn a_project_without_the_verbatim_prefix_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("root");
+        touch(&plain, "group/c/go.mod");
+        let root = plain.canonicalize().unwrap();
+        let project = plain.join("group").join("c");
+        assert_eq!(resolved(&root, project.to_str().unwrap()).as_deref(), Some("group/c"));
+    }
+
+    /// A rooted path below the root whose segments name no candidate (a
+    /// symlink inside the root, a `..`) still resolves to the candidate its
+    /// canonical form is.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_whose_segments_differ_is_found_by_its_canonical_path() {
+        let (_dir, root) = resolve_fixture();
+        std::os::unix::fs::symlink(root.join("group").join("c"), root.join("alias")).unwrap();
+        let hit = |project: PathBuf| resolved(&root, project.to_str().unwrap());
+        assert_eq!(hit(root.join("alias")).as_deref(), Some("group/c"));
+        assert_eq!(hit(root.join("group").join("..").join("group").join("c")).as_deref(), Some("group/c"));
+        assert_eq!(resolve(&root, "alias"), Err(Unresolved::NotADirectory("alias".into())));
+        assert_eq!(resolve(&root, "../root/a"), Err(Unresolved::NotBelowRoot));
+    }
+
+    // ---- GM-571 T6: `resolve` agrees with `walk` ----
+
+    /// A folder with every shape the walk distinguishes: repositories, a
+    /// worktree, a project at depth two, a repository with nested packages,
+    /// skipped and dot directories with markers inside, a marker at depth
+    /// three, an unmarked directory, a file and (on unix) a symlink to a
+    /// repository.
+    fn agreement_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        mkdir(root, "a/.git");
+        touch(root, "b/Cargo.toml");
+        touch(root, "group/c/go.mod");
+        touch(root, "worktrees/wt/.git");
+        mkdir(root, "mono/.git");
+        touch(root, "mono/y/package.json");
+        touch(root, "mono/plugins/x/package.json");
+        touch(root, "node_modules/x/package.json");
+        touch(root, "target/pyproject.toml");
+        touch(root, ".hidden/go.mod");
+        touch(root, "x/y/z/go.mod");
+        mkdir(root, "plain/dir");
+        touch(root, "file.txt");
+        let elsewhere = tempfile::tempdir().unwrap();
+        mkdir(elsewhere.path(), "repo/.git");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere.path().join("repo"), root.join("linked")).unwrap();
+        let canonical = root.canonicalize().unwrap();
+        (dir, elsewhere, canonical)
+    }
+
+    /// Every entry below `root` down to `depth` levels, `/`-separated,
+    /// symlinks included but not followed.
+    fn entries_below(root: &Path, rel: &str, depth: usize, out: &mut Vec<String>) {
+        if depth == 0 {
+            return;
+        }
+        let dir = if rel.is_empty() { root.to_path_buf() } else { root.join(rel) };
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+            out.push(child.clone());
+            if entry.file_type().unwrap().is_dir() {
+                entries_below(root, &child, depth - 1, out);
+            }
+        }
+    }
+
+    /// D6 risk: two implementations of "what is a candidate". Every walk
+    /// candidate resolves to the very same `Candidate`, and of every entry
+    /// in the fixture down to depth three, exactly the walk's candidates
+    /// resolve.
+    ///
+    /// Control C6: in `resolve_segments`, drop the "no marked ancestor"
+    /// check (the `InsideCandidate` return): `mono/y` resolves although the
+    /// walk never lists it.
+    #[test]
+    fn resolve_accepts_exactly_the_walks_candidates() {
+        let (_dir, _elsewhere, root) = agreement_fixture();
+        let walked = walk(&root, Limits::default());
+        assert!(!walked.truncated);
+        assert_eq!(rels(&walked.candidates), ["a", "b", "group/c", "mono", "worktrees/wt"]);
+        for candidate in &walked.candidates {
+            assert_eq!(resolve(&root, &candidate.rel_path).as_ref(), Ok(candidate), "{}", candidate.rel_path);
+        }
+
+        let mut entries = Vec::new();
+        entries_below(&root, "", 3, &mut entries);
+        assert!(entries.len() > 20, "the fixture must be walked: {entries:?}");
+        let listed: Vec<&str> = rels(&walked.candidates);
+        for entry in &entries {
+            assert_eq!(
+                resolve(&root, entry).is_ok(),
+                listed.contains(&entry.as_str()),
+                "{entry}: {:?}",
+                resolve(&root, entry)
+            );
+        }
+    }
+
+    /// Each kind of path the walk would never list is refused with its own
+    /// reason.
+    ///
+    /// Control C6 (as above): `mono/y` resolves instead of being refused.
+    #[test]
+    fn resolve_refuses_nested_skipped_symlinked_and_deep_dirs() {
+        let (_dir, _elsewhere, root) = agreement_fixture();
+        assert_eq!(resolve(&root, "mono/y"), Err(Unresolved::InsideCandidate("mono".into())));
+        assert_eq!(resolve(&root, "node_modules/x"), Err(Unresolved::Skipped("node_modules".into())));
+        assert_eq!(resolve(&root, "target"), Err(Unresolved::Skipped("target".into())));
+        assert_eq!(resolve(&root, ".hidden"), Err(Unresolved::Skipped(".hidden".into())));
+        assert_eq!(resolve(&root, "x/y/z"), Err(Unresolved::TooDeep { max_depth: 2 }));
+        assert_eq!(resolve(&root, "plain"), Err(Unresolved::NoMarker));
+        assert_eq!(resolve(&root, "file.txt"), Err(Unresolved::NotADirectory("file.txt".into())));
+        assert_eq!(resolve(&root, "nope"), Err(Unresolved::Missing("nope".into())));
+        assert_eq!(resolve(&root, "../a"), Err(Unresolved::NotBelowRoot));
+        assert_eq!(resolve(&root, ""), Err(Unresolved::IsRoot));
+        #[cfg(unix)]
+        assert_eq!(resolve(&root, "linked"), Err(Unresolved::NotADirectory("linked".into())));
+
+        let reason = resolve(&root, "mono/y").unwrap_err().to_string();
+        assert_eq!(reason, "it lies inside the project 'mono'");
+        let reason = resolve(&root, "x/y/z").unwrap_err().to_string();
+        assert_eq!(reason, "projects lie at most 2 levels below the folder");
+    }
+
+    /// The walk stops at its candidate limit; `resolve` probes one path and
+    /// finds every project, the ones past the limit included.
+    #[test]
+    fn resolve_finds_a_project_past_the_walk_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..3 {
+            mkdir(dir.path(), &format!("r{n}/.git"));
+        }
+        let root = dir.path().canonicalize().unwrap();
+        let walked = walk(&root, Limits { max_candidates: 1, ..Limits::default() });
+        assert!(walked.truncated);
+        assert_eq!(walked.candidates.len(), 1);
+        for n in 0..3 {
+            let project = format!("r{n}");
+            let found = resolve(&root, &project).unwrap_or_else(|err| panic!("{project}: {err}"));
+            assert_eq!(found.abs_path, root.join(&project));
+            assert_eq!(found.markers, [".git"]);
+        }
     }
 }
