@@ -70,13 +70,18 @@ fn a_candidate_page_is_recognized_by_its_top_level_resolved_by() {
     assert!(is_candidate_page(&page));
 }
 
+fn by_file(file: &str) -> Narrowing<'_> {
+    Narrowing { file: Some(file), ..Narrowing::default() }
+}
+
 #[test]
 fn pick_candidate_refuses_without_a_file_even_with_one_candidate() {
     let page = serde_json::json!({
         "resolvedBy": "nameAmbiguous",
         "results": [{"id": "n1", "qualifiedName": "f", "filePath": "a.ts", "kind": "Function"}],
     });
-    assert!(pick_candidate(&page, None).is_err());
+    let err = pick_candidate(&page, Narrowing::default()).unwrap_err();
+    assert!(err.contains("no `file` was given to disambiguate"), "{err}");
 }
 
 #[test]
@@ -88,7 +93,7 @@ fn pick_candidate_narrows_by_file_to_exactly_one() {
             {"id": "n2", "qualifiedName": "f", "filePath": "b.ts", "kind": "Function"},
         ],
     });
-    let picked = pick_candidate(&page, Some("b.ts")).unwrap();
+    let picked = pick_candidate(&page, by_file("b.ts")).unwrap();
     assert_eq!(picked.get("id").and_then(Value::as_str), Some("n2"));
 }
 
@@ -101,7 +106,51 @@ fn pick_candidate_refuses_a_file_matching_more_than_one_candidate() {
             {"id": "n2", "qualifiedName": "f", "filePath": "a.ts", "kind": "Function"},
         ],
     });
-    assert!(pick_candidate(&page, Some("a.ts")).is_err());
+    assert!(pick_candidate(&page, by_file("a.ts")).is_err());
+}
+
+/// Two declarations of one file sharing a name (fixture t02: a TS
+/// `export const handler` beside `Router#handler`): `file` matches both,
+/// `kind` or `qualified_name` picks one, and every key given must match.
+#[test]
+fn pick_candidate_narrows_one_file_by_kind_or_qualified_name() {
+    let page = serde_json::json!({
+        "resolvedBy": "nameAmbiguous",
+        "results": [
+            {"id": "n1", "qualifiedName": "handler", "filePath": "x.ts", "kind": "Variable"},
+            {"id": "n2", "qualifiedName": "Router#handler", "filePath": "x.ts", "kind": "Function"},
+        ],
+    });
+    let pick = |narrowing| pick_candidate(&page, narrowing).map(|c| c.get("id").and_then(Value::as_str));
+    assert!(pick(by_file("x.ts")).is_err());
+    let by_kind = Narrowing { kind: Some("Variable"), ..by_file("x.ts") };
+    assert_eq!(pick(by_kind), Ok(Some("n1")));
+    let by_name = Narrowing { qualified_name: Some("Router#handler"), ..Narrowing::default() };
+    assert_eq!(pick(by_name), Ok(Some("n2")));
+    // Every key given must match: the right kind in the wrong file is no match.
+    let err = pick(Narrowing { kind: Some("Variable"), ..by_file("y.ts") }).unwrap_err();
+    assert!(err.contains("filePath == \"y.ts\", kind == \"Variable\""), "{err}");
+}
+
+#[test]
+fn the_narrowing_keys_parse_and_are_echoed_as_spelled() {
+    let file: ExpectFile = toml::from_str(
+        "[[callers]]\nsymbol = \"handler\"\nfile = \"x.ts\"\nkind = \"Variable\"\nexpect = []\n\n\
+         [[definition]]\nsymbol = \"handler\"\nqualified_name = \"Router#handler\"\nexpect = []\n",
+    )
+    .unwrap();
+    let narrowing = file.callers[0].narrowing();
+    assert_eq!(
+        (narrowing.file, narrowing.kind, narrowing.qualified_name),
+        (Some("x.ts"), Some("Variable"), None)
+    );
+    assert_eq!(narrowing.describe_keys(), ", file = \"x.ts\", kind = \"Variable\"");
+    assert_eq!(file.definition[0].narrowing().qualified_name, Some("Router#handler"));
+    let err =
+        toml::from_str::<ExpectFile>("[[callers]]\nsymbol = \"f\"\nexpect = []\nqualifiedName = \"f\"\n")
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("qualifiedName"), "{err}");
 }
 
 #[test]

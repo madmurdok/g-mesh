@@ -19,8 +19,8 @@ excalidraw, 62 `CALLS` edges onto TS non-exported (`file`) declarations
 were refused, among them every caller of a non-exported class's methods.
 Measured after this decision: 24 of them link, 20 correct and 4 self-loops
 where the bridge took the enclosing function for a call of something with
-no node; the other 38 land on a class, interface or const and stay refused
-by the kind rule (ADR 0035). In Rust, a
+no node; the other 38 land on a class, interface or const and stay unlinked: the
+bridge's own-name check drops them before linking (ADR 0035). In Rust, a
 `macro_rules!` macro used from a sibling module through `#[macro_use]`.
 
 ## Decision
