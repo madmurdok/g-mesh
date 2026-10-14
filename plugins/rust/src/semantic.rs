@@ -66,7 +66,7 @@
 //!
 //! The same factory failure is how a project is refused the tier when a
 //! cargo config in effect for it sets a dynamic-loader variable in `[env]`
-//! ([ADR 0036](../../../docs/adr/0036-rust-tier-refuses-cargo-env-loader-vars.md)).
+//! ([ADR 0037](../../../docs/adr/0037-rust-tier-refuses-cargo-env-loader-vars.md)).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -113,7 +113,7 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
         anyhow::bail!(
             "semantic tier refused: the cargo config {} sets {var} in [env], a dynamic-loader \
              variable cargo would pass to every rustc it starts for rust-analyzer; this project \
-             is indexed at the structural tier only (docs/adr/0036)",
+             is indexed at the structural tier only (docs/adr/0037)",
             file.display()
         );
     }

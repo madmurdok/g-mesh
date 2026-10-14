@@ -1,4 +1,4 @@
-# 0036. The rust tier refuses a cargo config `[env]` that sets a dynamic-loader variable
+# 0037. The rust tier refuses a cargo config `[env]` that sets a dynamic-loader variable
 
 ## Status
 Accepted 2026-10-14 (GM-587, owner decisions D1-D3). Experiments, the
