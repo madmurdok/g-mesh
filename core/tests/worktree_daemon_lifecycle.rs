@@ -437,8 +437,11 @@ async fn a_call_to_a_deleted_selection_says_it_no_longer_exists() {
     assert!(text.contains("call select_project"), "{text}");
     assert!(!b.exists(), "answering for a deleted selection must not recreate it");
 
+    // b, then a: the connection is contested (D3 of GM-571), so the call
+    // names its project, which must resolve although only one project is
+    // left in the folder.
     select(&client, "a").await;
-    let outline = call(&client, "get_file_outline", json!({ "file_path": "a.ts" })).await;
+    let outline = call(&client, "get_file_outline", json!({ "file_path": "a.ts", "project": "a" })).await;
     assert_ne!(outline.is_error, Some(true), "the session serves another project: {:?}", texts_of(&outline));
     assert!(
         texts_of(&outline).first().is_some_and(|line| line == "g-mesh: answered from project a."),

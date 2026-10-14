@@ -99,6 +99,9 @@ risk. Recommended option first.
 - **Benefit/risk (b):** one schema everywhere, a daemon-side check; but six
   param structs and eight handlers change, and single-project users pay the
   schema every turn.
+- **Accepted deviation (implementation):** `TOOLS_LIST_BYTE_CEILING` is
+  13 600, +1.8 kB over the previous ceiling against the ~1.1 kB estimated for
+  the `project` property on the eight tools' schemas.
 
 ### D3. A call without `project`: refuse once the session's selection is contested (Recommended)
 
@@ -149,6 +152,12 @@ risk. Recommended option first.
   a second subagent on the same project in the same session does not get it
   again (guidance is mostly static, and the first agent's need is the main
   one).
+- **Accepted deviation (implementation):** the guidance item is placed after
+  the stamp and before the tool's own items, not trailing.
+- `select_project` always re-handshakes (a new connection replaces a live
+  pooled one, which drains the answers it owes), so its result carries the
+  project's guidance as of now; reselecting the same project still does not
+  contest (D3).
 
 ### D5. Pool of sub-project connections: LRU, at most 4 live (Recommended)
 

@@ -710,7 +710,10 @@ impl Shared {
         let folder = match router.folder {
             Some(folder) => folder,
             None => {
-                let folder = (self.daemons.is_folder)(&root);
+                // A switch comes only from a front, so a session that made
+                // one is a folder even if its projects have since dwindled
+                // to one (the probe would then call it a single project).
+                let folder = !router.selections.is_empty() || (self.daemons.is_folder)(&root);
                 router.folder = Some(folder);
                 folder
             }
@@ -940,8 +943,8 @@ impl Shared {
         None
     }
 
-    /// D11 step 3.1-3.5 and 3.7: selects `target`, reusing its pool
-    /// connection when one is live, and records the selection (D3 of
+    /// D11 step 3.1-3.5 and 3.7: selects `target` over a new connection
+    /// (replacing its pool connection, if any), and records the selection (D3 of
     /// `docs/adr/0036-per-call-project-routing.md`). On error nothing about
     /// routing has changed.
     fn switch(self: &Arc<Self>, router: &mut Router, target: &Path) -> Result<(PathBuf, String)> {
@@ -949,19 +952,11 @@ impl Shared {
         if target == router.root || !target.starts_with(&router.root) {
             bail!("{} is not a project below {}", target.display(), router.root.display());
         }
-        let which = Which::Project(target.clone());
-        let live = router.slot(&which).is_some_and(|slot| slot.live().is_some());
-        let guidance = match router.guidance.get(&target) {
-            Some(guidance) if live => {
-                let guidance = guidance.clone();
-                router.touch(&target);
-                guidance
-            }
-            _ => {
-                self.connect(router, &which, true, false)?;
-                router.guidance.get(&target).cloned().unwrap_or_default()
-            }
-        };
+        // Always a fresh handshake, so the guidance reflects the project's
+        // state now; a live pooled connection is retired by `admit` and
+        // still passes the answers it owes.
+        self.connect(router, &Which::Project(target.clone()), true, false)?;
+        let guidance = router.guidance.get(&target).cloned().unwrap_or_default();
         router.selected = Some(target.clone());
         if !router.selections.contains(&target) {
             router.selections.push(target.clone());
@@ -1583,11 +1578,12 @@ mod tests {
         }
     }
 
-    /// Re-selecting the project already served reuses its live connection:
-    /// the call in flight on it is answered, nothing new connects, and the
-    /// session is not contested.
+    /// Re-selecting the project already selected re-handshakes over a new
+    /// connection, so its guidance is fresh, while the first connection stays
+    /// open for the call in flight on it and closes once it owes nothing.
     ///
-    /// Control: make `switch` always connect: a second daemon connects.
+    /// Control: make `switch` reuse a live pool connection and its cached
+    /// guidance: no second daemon connects.
     #[test]
     fn reselecting_the_served_project_keeps_a_call_in_flight() {
         let mut session = Session::start();
@@ -1597,15 +1593,17 @@ mod tests {
         assert_eq!(first.expect("tools/call")["id"], 7);
 
         session.select(2, "a");
-        assert!(session.daemons.try_recv().is_err(), "a reselect reuses the live connection");
-        assert!(first.closes().is_empty(), "the connection still owes 7");
+        let second = session.daemon();
+        assert_eq!(second.root, first.root, "a reselect reconnects to the same project");
+        assert!(first.closes().is_empty(), "the first connection still owes 7");
 
         first.answer(7);
         let answer = session.recv();
         assert_eq!(answer["id"], 7, "{answer}");
         assert!(answer["result"]["isError"].is_null(), "{answer}");
+        assert_eq!(first.closes(), vec![Shutdown::Write], "closed once it owes nothing");
         session.call(8);
-        assert_eq!(first.expect("tools/call")["id"], 8, "one project selected twice is not contested");
+        assert_eq!(second.expect("tools/call")["id"], 8, "one project selected twice is not contested");
     }
 
     /// A switch keeps the previous project's connection open in the pool,
@@ -2212,9 +2210,10 @@ mod tests {
     fn reselecting_the_same_project_does_not_contest() {
         let mut session = Session::start();
         session.select(1, "a");
-        let a = session.daemon();
         session.select(2, "a");
         session.select(3, "./a/");
+        let _ = (session.daemon(), session.daemon());
+        let a = session.daemon();
         session.call(5);
         next_call_is(&a, 5);
         a.answer(5);

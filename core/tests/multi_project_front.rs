@@ -407,10 +407,14 @@ async fn reselecting_the_same_project_refreshes_its_guidance() {
     client.cancel().await.expect("failed to shut the client down");
 }
 
-/// Selecting another project moves the session again.
+/// Selecting another project switches to it: the switch serves `a`, and a
+/// call naming `a` reaches `a`'s daemon, which does not know `b.ts`. Two
+/// distinct selections contest the connection (D3 of GM-571), so a call
+/// without `project` is refused, naming both in order and suggesting the
+/// latest.
 ///
-/// Control: keep routing to the first sub-project upstream (don't replace
-/// `router.sub` once set): `a.ts` is not found and `b.ts` still answers.
+/// Control: in `switch`, skip recording the selection in `selections`: the
+/// call without `project` is answered by `a`, not refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reselecting_switches_again() {
     let folder = Folder::new();
@@ -419,9 +423,17 @@ async fn reselecting_switches_again() {
     guidance_of(&select(&client, "b").await, &folder.sub("b"));
     guidance_of(&select(&client, "a").await, &folder.sub("a"));
 
-    let a = call(&client, "get_file_outline", json!({ "file_path": "a.ts" })).await;
+    let bare = call(&client, "get_file_outline", json!({ "file_path": "a.ts" })).await;
+    assert_eq!(bare.is_error, Some(true), "a contested call without project is refused: {}", text_of(&bare));
+    assert!(
+        text_of(&bare).contains("(b, then a)") && text_of(&bare).contains("e.g. \"a\""),
+        "the refusal names both selections and suggests the latest: {}",
+        text_of(&bare)
+    );
+
+    let a = call(&client, "get_file_outline", json!({ "file_path": "a.ts", "project": "a" })).await;
     assert_eq!(outline_names(&a), Some(vec!["a".to_string()]), "{}", text_of(&a));
-    let b = call(&client, "get_file_outline", json!({ "file_path": "b.ts" })).await;
+    let b = call(&client, "get_file_outline", json!({ "file_path": "b.ts", "project": "a" })).await;
     let names = outline_names(&b);
     assert!(
         names.as_ref().is_none_or(|names| names.is_empty()),
