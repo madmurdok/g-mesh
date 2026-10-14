@@ -939,7 +939,7 @@ fn end_process_group() {
 }
 
 /// How long [`purge_state_dir`] waits for a bootstrap lock another process
-/// holds: long enough for a sweeper to finish deleting the directory under
+/// holds, or for its singleton lock to come free of a sweeper's probe: long enough for a sweeper to finish deleting the directory under
 /// load, short enough that an orphaned daemon's exit (which only tests and
 /// `stop` wait on) is not held up for long.
 const PURGE_LOCK_WAIT: Duration = Duration::from_secs(10);
@@ -959,8 +959,9 @@ const PURGE_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// sweep, which runs when no daemon holds it.
 ///
 /// A shim's startup sweep can hold the bootstrap lock of this very directory
-/// (it is orphaned from the moment the singleton is dropped), so the purge
-/// waits up to [`PURGE_LOCK_WAIT`] for it rather than giving up. Either way,
+/// (it is orphaned from the moment the singleton is dropped), or probe its
+/// singleton lock at the instant the purge does, so the purge waits up to
+/// [`PURGE_LOCK_WAIT`] for either rather than giving up. Either way,
 /// when this returns the directory is gone, or was kept for the reason logged:
 /// the purge never runs on after the process exits.
 pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
