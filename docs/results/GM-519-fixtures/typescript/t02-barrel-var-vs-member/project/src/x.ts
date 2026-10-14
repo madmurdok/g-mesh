@@ -1,12 +1,9 @@
 function make(): () => number {
   return () => 1;
 }
-class Local {
-  a(): number {
-    return 1;
-  }
-  b(): number {
+export const handler = make();
+export class Router {
+  handler(): number {
     return 2;
   }
 }
-export const handler = make();

@@ -1,6 +1,19 @@
-# The only reference left behind is the `import type` line (src/main.ts:1):
-# a real non-call usage. The member calls `box.cb()` / `opts.go()` land on no
-# CALLS edge to the owner (the bridge's own-name check) and are not disclosed.
+# A call of a member g-mesh has no node for (the class field `cb`, the
+# interface property `go`) is answered by vtsls at that member, and the
+# bridge's `node_at` lands on the owner around it.
+#
+# Bag and Cfg are reached through `import type * as B` (src/ns.ts): the answer
+# gets a qualifiedName-keyed placeholder of its own, which the linker would
+# take as an engine answer and link onto the Type. Only the bridge's own-name
+# check (`lands_on_name`) keeps `open -> Bag` and `load -> Cfg` out; without
+# it both entries fail.
+#
+# Box and Opts are imported by name (src/main.ts): the answer then shares the
+# import's placeholder (a placeholder id ignores the key kind), whose `name`
+# key makes the linker judge it as a structural CALLS, Function only. These
+# two pass with or without the check. Their one excluded reference is the
+# parameter type (`box: Box`, `opts: Opts`); `src/main.ts:1` is a file tally,
+# one reference in src/main.ts, not a line.
 [[callers]]
 symbol = "Box"
 file = "src/box.ts"
@@ -12,3 +25,13 @@ symbol = "Opts"
 file = "src/box.ts"
 expect = []
 excluded_references = { count = 1, files = ["src/main.ts:1"] }
+
+[[callers]]
+symbol = "Bag"
+file = "src/box.ts"
+expect = []
+
+[[callers]]
+symbol = "Cfg"
+file = "src/box.ts"
+expect = []

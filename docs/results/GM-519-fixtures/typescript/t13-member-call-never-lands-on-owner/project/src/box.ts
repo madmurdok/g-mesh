@@ -7,3 +7,9 @@ export class Box {
 export interface Opts {
   go: () => number;
 }
+export class Bag {
+  cb = wrap(() => 1);
+}
+export interface Cfg {
+  go: () => number;
+}
