@@ -229,8 +229,16 @@ fn force_kill(pid: u32) {
 /// way out, so a process it (or its plugin's language server) started stops
 /// writing into the deleted root, and the root stays gone.
 ///
-/// Control: drop the `end_process_group()` call on the orphan exit in
-/// `lifecycle::supervise`: the member outlives the daemon.
+/// The daemon must also finish its own way out: the sweep runs before the
+/// pid file goes, so a released pid file says the sweep returned instead of
+/// ending the daemon. That holds whatever order the sweep visits the group
+/// in, unlike the member's fate: a sweep that signals one of the daemon's
+/// own threads kills the daemon at that point, and the member survives only
+/// when it happens to come later in the listing.
+///
+/// Controls: drop the `end_process_group()` call on the orphan exit in
+/// `lifecycle::supervise`: the member outlives the daemon. Let
+/// `process::group_members` list threads: the pid file stays behind.
 #[test]
 fn an_orphaned_daemon_ends_its_process_group_and_the_root_stays_gone() {
     let mut project = Project::new();
@@ -242,6 +250,11 @@ fn an_orphaned_daemon_ends_its_process_group_and_the_root_stays_gone() {
     common::wait_for("the orphaned daemon to stop itself", common::startup_timeout(), || {
         !daemon::is_process_alive(core)
     });
+    assert!(
+        !project.pid_file().exists(),
+        "the orphaned daemon must release its pid file on the way out, after ending its group; \
+         a pid file left behind means the daemon was killed mid-exit"
+    );
 
     let status = member.wait_exit("after its orphaned daemon exited");
     assert!(status.signal().is_some(), "the member must have been ended by a signal: {status}");
