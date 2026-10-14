@@ -126,6 +126,23 @@ fn body(result: &CallToolResult) -> Value {
 /// the whole stack down again - so that each phase of the test observes a
 /// daemon that had to make its own decision about the index on disk.
 async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
+    importers_of_after(project, file_path, false).await
+}
+
+/// [`importers_of`], but the answer is the one given after the restarted
+/// daemon's background offline-change reconcile has logged that it finished
+/// and reindexed nothing. A reconcile that wrongly reindexes unchanged files
+/// puts the stripped edges back, but only once it gets to them; answering
+/// before it finishes would pass whatever it does later (GM-578).
+async fn importers_of_reconciled(project: &Project, file_path: &str) -> Vec<String> {
+    importers_of_after(project, file_path, true).await
+}
+
+async fn importers_of_after(project: &Project, file_path: &str, wait_for_reconcile: bool) -> Vec<String> {
+    // Lines already in the (appended-to) daemon log belong to earlier daemons.
+    let log = project_dir(project.root()).expect("failed to resolve the state directory").join("daemon.log");
+    let seen = clean_reconcile_lines(&log);
+
     let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
         cmd.lifeline();
         // `kill_on_drop`, because a shim that outlives the test wedges the
@@ -143,6 +160,36 @@ async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
     // so a marker still readable here could only be the new walk's own.
     wait_until_indexed(project.root());
 
+    let mut walk = query_importers(&client, file_path).await;
+    if wait_for_reconcile {
+        // The query above is also what activates the daemon, which the
+        // reconcile may be waiting for. 120 s stays under nextest's 210 s
+        // slow-timeout (.config/nextest.toml) so a hang is this panic.
+        common::wait_for(
+            "the restarted daemon to finish reconciling without reindexing anything",
+            std::time::Duration::from_secs(120),
+            || clean_reconcile_lines(&log) > seen,
+        );
+        walk = query_importers(&client, file_path).await;
+    }
+
+    client.cancel().await.expect("failed to shut the client down");
+    project.stop();
+    walk
+}
+
+/// Complete (newline-terminated) "reconciled ... 0 reindexed" lines in `log`;
+/// a half-written last line is not one.
+fn clean_reconcile_lines(log: &Path) -> usize {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let complete = &text[..text.rfind('\n').map_or(0, |i| i + 1)];
+    complete.lines().filter(|l| l.contains("files with the disk in") && l.ends_with(", 0 reindexed")).count()
+}
+
+async fn query_importers(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    file_path: &str,
+) -> Vec<String> {
     let result = client
         .call_tool(
             CallToolRequestParams::new("get_dependencies").with_arguments(
@@ -155,9 +202,6 @@ async fn importers_of(project: &Project, file_path: &str) -> Vec<String> {
         .await
         .expect("tools/call failed");
     let walk = body(&result);
-
-    client.cancel().await.expect("failed to shut the client down");
-    project.stop();
 
     let mut paths: Vec<String> = walk["results"]
         .as_array()
@@ -226,7 +270,7 @@ async fn an_index_this_indexer_built_is_taken_at_its_word_across_a_restart() {
     strip_import_edges(&project.index_path());
 
     assert!(
-        importers_of(&project, "src/db/connection.ts").await.is_empty(),
+        importers_of_reconciled(&project, "src/db/connection.ts").await.is_empty(),
         "an index stamped with the current generation is not re-walked while its files are unchanged"
     );
 }
