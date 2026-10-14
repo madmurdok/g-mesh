@@ -1536,4 +1536,73 @@ mod tests {
         assert_eq!(purge, Purge::Kept("a shim is bootstrapping it"));
         assert!(state.exists());
     }
+
+    // A purge that finds the daemon's singleton lock held
+    // -----------------------------------------------------------------
+
+    /// Takes `state`'s singleton lock on a file of its own, as a running
+    /// daemon holds it or another process's sweep probes it.
+    fn hold_singleton_lock(state: &Path) -> fs::File {
+        let lock = fs::File::create(daemon::daemon_lock_path_in(state)).unwrap();
+        lock.try_lock().unwrap();
+        lock
+    }
+
+    /// The daemon's purge: a singleton lock held for a moment (a sweeper's
+    /// probe) over a directory still orphaned is waited out, and the
+    /// directory deleted.
+    ///
+    /// Control: return `Kept` at once on a held singleton lock under
+    /// `LockWait::UpTo` too: the purge keeps the directory.
+    #[test]
+    fn a_waiting_purge_deletes_the_directory_once_the_singleton_lock_is_released() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let lock = hold_singleton_lock(&state);
+
+        let purge = purge_in_background(&state, LockWait::UpTo(LONG_WAIT));
+        std::thread::sleep(WATCH);
+        assert!(!purge.is_finished(), "the purge must wait for the held singleton lock, not give up on it");
+        assert!(state.exists(), "nothing may be deleted while the singleton lock is held");
+
+        drop(lock);
+        assert_eq!(purge.join().unwrap().unwrap(), Purge::Deleted);
+        assert!(!state.exists(), "the directory must go once the singleton lock is free");
+    }
+
+    /// A singleton lock held past the bound - a daemon that really runs -
+    /// keeps the directory, saying why, once the bound is spent.
+    ///
+    /// Control: return `Kept` at once on a held singleton lock under
+    /// `LockWait::UpTo` too: the reason is the one for a running daemon.
+    #[test]
+    fn a_purge_whose_singleton_lock_stays_held_past_the_bound_keeps_the_directory() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let _lock = hold_singleton_lock(&state);
+        let bound = Duration::from_millis(200);
+
+        let started = Instant::now();
+        let purge = purge_orphaned_state_dir(&state, LockWait::UpTo(bound)).unwrap();
+
+        assert_eq!(purge, Purge::Kept("a daemon or plugin held its singleton lock past the wait"));
+        assert!(started.elapsed() >= bound, "the purge must wait out its bound first");
+        assert!(state.exists());
+    }
+
+    /// The shim's sweep never waits: a held singleton lock keeps the
+    /// directory on the first try, as a running daemon's.
+    #[test]
+    fn a_trying_purge_keeps_the_directory_of_a_held_singleton_lock_at_once() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let _lock = hold_singleton_lock(&state);
+
+        let started = Instant::now();
+        let purge = purge_orphaned_state_dir(&state, LockWait::Try).unwrap();
+
+        assert_eq!(purge, Purge::Kept("a daemon or plugin is still running for it"));
+        assert!(started.elapsed() < WATCH, "a trying purge must not wait on the lock");
+        assert!(state.exists());
+    }
 }
