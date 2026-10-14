@@ -939,8 +939,9 @@ fn end_process_group() {
 }
 
 /// How long [`purge_state_dir`] waits for a bootstrap lock another process
-/// holds, or for its singleton lock to come free of a sweeper's probe: long enough for a sweeper to finish deleting the directory under
-/// load, short enough that an orphaned daemon's exit (which only tests and
+/// holds, or for its singleton lock to come free of a sweeper's probe: long
+/// enough for a sweeper to finish deleting the directory under load, short
+/// enough that an orphaned daemon's exit (which only tests and
 /// `stop` wait on) is not held up for long.
 const PURGE_LOCK_WAIT: Duration = Duration::from_secs(10);
 

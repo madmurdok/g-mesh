@@ -35,6 +35,7 @@ use std::time::Duration;
 use g_mesh::daemon;
 use g_mesh::daemon::lifecycle::{CORE_IDLE_ENV, PLUGIN_IDLE_ENV};
 use g_mesh::daemon::manifest;
+use g_mesh::shim::DAEMON_LOG_FILE;
 use g_mesh::storage::connection::project_dir;
 
 mod common;
@@ -161,7 +162,7 @@ impl Daemon {
             .env(CORE_IDLE_ENV, CORE_IDLE_EFFECTIVELY_NEVER.as_millis().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(daemon_log_stdio(root))
             .spawn()
             .expect("failed to spawn the daemon");
         Self { child }
@@ -180,6 +181,60 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// The daemon's stderr: the project's `daemon.log`, appended to the way a
+/// shim-bootstrapped daemon's is, so a failure has the purge's own account of
+/// what it deleted or kept. `/dev/null` if the file cannot be opened.
+fn daemon_log_stdio(root: &Path) -> Stdio {
+    let opened = project_dir(root).ok().and_then(|state_dir| {
+        std::fs::create_dir_all(&state_dir).ok()?;
+        std::fs::OpenOptions::new().create(true).append(true).open(state_dir.join(DAEMON_LOG_FILE)).ok()
+    });
+    opened.map_or_else(Stdio::null, Stdio::from)
+}
+
+/// What a "state directory still there" failure needs before
+/// [`Project`]'s `Drop` deletes it: the tail of the daemon's log, which says
+/// why the purge kept the directory, and a recursive listing of what is left.
+/// Anything missing reads `(absent)`; this never panics.
+fn state_dir_evidence(state_dir: &Path) -> String {
+    const LOG_TAIL_LINES: usize = 60;
+    let log = match std::fs::read(state_dir.join(DAEMON_LOG_FILE)) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len().saturating_sub(LOG_TAIL_LINES)..].join("\n")
+        }
+        Err(_) => "(absent)".to_string(),
+    };
+    let mut listing = String::new();
+    list_with_sizes(state_dir, state_dir, &mut listing);
+    if listing.is_empty() {
+        listing.push_str("(absent)\n");
+    }
+    format!(
+        "--- last {LOG_TAIL_LINES} lines of daemon.log ---\n{log}\n--- {} ---\n{listing}",
+        state_dir.display()
+    )
+}
+
+fn list_with_sizes(base: &Path, dir: &Path, out: &mut String) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let relative = path.strip_prefix(base).unwrap_or(&path).display().to_string();
+        match entry.metadata() {
+            Ok(meta) if meta.is_dir() => {
+                out.push_str(&format!("{relative}/\n"));
+                list_with_sizes(base, &path, out);
+            }
+            Ok(meta) => out.push_str(&format!("{relative}  {} bytes\n", meta.len())),
+            Err(_) => out.push_str(&format!("{relative}  (absent)\n")),
+        }
     }
 }
 
@@ -312,8 +367,9 @@ fn a_daemon_whose_project_root_is_deleted_stops_itself() {
     assert!(
         !project.state_dir.exists(),
         "the state of a project whose directory was deleted (its parent still there) must go with its \
-         daemon: {} is still there",
-        project.state_dir.display()
+         daemon: {} is still there\n{}",
+        project.state_dir.display(),
+        state_dir_evidence(&project.state_dir)
     );
 }
 
@@ -355,7 +411,12 @@ fn a_purge_that_finds_the_bootstrap_lock_held_waits_for_it() {
         daemon_process.is_running(),
         "an orphaned daemon whose purge finds the bootstrap lock held must wait for it, not exit"
     );
-    assert!(project.state_dir.exists(), "nothing may be deleted while the lock is held");
+    assert!(
+        project.state_dir.exists(),
+        "nothing may be deleted while the lock is held: {} is gone\n{}",
+        project.state_dir.display(),
+        state_dir_evidence(&project.state_dir)
+    );
 
     drop(lock);
     common::wait_for("the daemon to finish its purge and exit", orphan_budget(), || {
@@ -363,8 +424,9 @@ fn a_purge_that_finds_the_bootstrap_lock_held_waits_for_it() {
     });
     assert!(
         !project.state_dir.exists(),
-        "once the lock is free the purge must delete the state: {} is still there",
-        project.state_dir.display()
+        "once the lock is free the purge must delete the state: {} is still there\n{}",
+        project.state_dir.display(),
+        state_dir_evidence(&project.state_dir)
     );
 }
 
@@ -386,8 +448,9 @@ fn a_daemon_whose_root_and_its_parent_are_gone_keeps_its_state() {
     assert_released_everything(&project, &mut daemon_process, plugin_pid);
     assert!(
         project.state_dir.join("index.db").exists(),
-        "a project whose root's parent is gone too keeps its index: {}",
-        project.state_dir.display()
+        "a project whose root's parent is gone too keeps its index: {}\n{}",
+        project.state_dir.display(),
+        state_dir_evidence(&project.state_dir)
     );
 }
 
