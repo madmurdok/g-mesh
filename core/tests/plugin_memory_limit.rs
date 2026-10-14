@@ -105,6 +105,7 @@ use g_mesh::config::{self, PluginConfig, ProjectConfig};
 use g_mesh::daemon::bulk_index;
 use g_mesh::daemon::lifecycle::PluginSupervisor;
 use g_mesh::daemon::manifest::{read_manifest, DiscoveredPlugins, PluginManifest};
+use g_mesh::daemon::memory::process_tree_sample;
 use g_mesh::daemon::registry;
 use g_mesh::embedding::EmbeddingPipeline;
 use g_mesh::storage::connection::project_dir;
@@ -121,29 +122,38 @@ use common::Lifeline;
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 /// GM-290's own conformance fixture - a real two-crate Cargo workspace with
-/// no external dependencies (offline-friendly), already measured by that
-/// task to plateau at 535-555MiB of rust-analyzer RSS. Reused rather than a
-/// smaller ad hoc fixture so this test's own numbers are directly comparable
-/// to GM-290's.
+/// no external dependencies (offline-friendly). With the standard library's
+/// sources loaded, rust-analyzer's RSS over it plateaus at 535-570MiB, almost
+/// all of it the sysroot (std/core/alloc) that cache priming walks. Without
+/// them - a runner where rust-analyzer cannot load the sysroot - the settled
+/// tree is ~45MB. Reused rather than a smaller ad hoc fixture so this test's
+/// own numbers are directly comparable to GM-290's.
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/rust/conformance/project");
 const RUST_PLUGIN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/rust");
 
-/// Comfortably above the plugin's own structural-only baseline (~5-6MB,
-/// measured in this task's own manual sampling before rust-analyzer ever
-/// spawns) and comfortably below the plateau (535-580MB across GM-290's and
-/// this task's own measurements) - so suspension is caused by the semantic
-/// engine's real memory, not tree-sitter overhead, and is not a hair's-
-/// breadth threshold a loaded machine could cross by accident in either
-/// direction (the same margin argument GM-274's own 100MB-for-a-200MB-hog
-/// threshold makes for its synthetic fixture).
-const LOW_LIMIT_MB: u64 = 150;
+/// Must sit between two measured bounds, whether or not rust-analyzer loads
+/// the standard library (measured on x86_64 macOS, rust-analyzer 1.97.1):
+///
+/// - the plugin alone, before rust-analyzer spawns: 2-7MB;
+/// - the settled tree with rust-analyzer running and no std: 44-48MB;
+/// - the settled tree with std loaded: 540-570MB.
+///
+/// A limit between "with std" and "without std" (150MB once stood here)
+/// passes only on runners that happen to load std, and fails every run on
+/// one that cannot. 24MB is 3.4x over the plugin alone and 1.8x under the
+/// no-std floor, so suspension is caused by the semantic engine's own memory
+/// on either kind of runner. The no-std variant of the suspension test below
+/// keeps the limit under the no-std floor; the baseline assertion in that
+/// test keeps it over the plugin alone.
+const LOW_LIMIT_MB: u64 = 24;
 
 /// Nowhere near real usage (the plateau tops out under 600MB even on the
 /// large end of what GM-290 measured) - the discriminating control.
 const UNREACHABLE_LIMIT_MB: u64 = 1_000_000;
 
 /// Generous next to the 9-25s this task measured for a cold pass across load
-/// averages from 4 to 150+ today - a deadlock guard, not a timing assertion.
+/// averages from 4 to 150+ today (3.5-6s when std is not loaded) - a deadlock
+/// guard, not a timing assertion.
 const TIMEOUT: Duration = Duration::from_secs(180);
 
 fn copy_dir(src: &Path, dest: &Path) {
@@ -313,16 +323,106 @@ fn race_pass_against_memory_check(
     (pass_returned_at, pass_result, check_returned_at)
 }
 
+/// The real rust plugin's manifest, except that rust-analyzer's
+/// `cargo.sysrootSrc` points at an empty directory under `scratch`, so it
+/// cannot load the standard library. That is the condition of a runner where
+/// rust-analyzer fails to load the sysroot: the settled tree drops from
+/// ~560MB to ~45MB. The patched `plugin.toml` is written to `scratch` and the
+/// manifest is pointed at it, so the plugin reads the same file core does
+/// (see `PluginManifest::path`); the plugin's command still resolves from the
+/// real plugin directory.
+fn manifest_without_std(scratch: &Path) -> PluginManifest {
+    let mut manifest =
+        read_manifest(Path::new(RUST_PLUGIN_DIR)).expect("plugins/rust/plugin.toml must parse");
+    let text = std::fs::read_to_string(manifest.path()).expect("failed to read plugins/rust/plugin.toml");
+    let mut doc: toml::Table = toml::from_str(&text).expect("plugins/rust/plugin.toml must parse as TOML");
+
+    let empty_sysroot_src = scratch.join("empty-sysroot-src");
+    std::fs::create_dir_all(&empty_sysroot_src).expect("failed to create the empty sysroot source directory");
+
+    let options = doc
+        .get_mut("plugin")
+        .and_then(|plugin| plugin.get_mut("semantic"))
+        .and_then(|semantic| semantic.get_mut("initialization_options"))
+        .and_then(|options| options.as_table_mut())
+        .expect("plugins/rust/plugin.toml must have [plugin.semantic.initialization_options]");
+    let cargo = options
+        .entry("cargo")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .expect("initialization_options.cargo must be a table");
+    cargo.insert(
+        "sysrootSrc".to_string(),
+        toml::Value::String(empty_sysroot_src.to_str().expect("a UTF-8 scratch path").to_string()),
+    );
+
+    let manifest_dir = scratch.join("plugin");
+    std::fs::create_dir_all(&manifest_dir).expect("failed to create the patched manifest's directory");
+    manifest.manifest_dir = manifest_dir;
+    std::fs::write(manifest.path(), toml::to_string(&doc).expect("failed to serialize the patched manifest"))
+        .expect("failed to write the patched manifest");
+    manifest
+}
+
+/// `pid`'s process tree, member by member with each one's RSS and (where `ps`
+/// exists) its command name, for a failure message: a tree that did not trip
+/// the limit should say what it was made of.
+fn describe_process_tree(pid: u32) -> String {
+    let Some(sample) = process_tree_sample(pid) else {
+        return format!("no sample: pid {pid} is gone or process enumeration answered nothing");
+    };
+    let pids: Vec<String> = sample.members().iter().map(|(member, _)| member.to_string()).collect();
+    let names: HashMap<u32, String> = std::process::Command::new("ps")
+        .args(["-o", "pid=,comm=", "-p", &pids.join(",")])
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let (member, name) = line.trim().split_once(char::is_whitespace)?;
+                    Some((member.parse().ok()?, name.trim().to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let members: Vec<String> = sample
+        .members()
+        .iter()
+        .map(|(member, bytes)| {
+            let name = names.get(member).map(String::as_str).unwrap_or("?");
+            format!("{member} {name} {}MB", bytes / (1024 * 1024))
+        })
+        .collect();
+    format!("tree total {}MB: [{}]", sample.rss_mb(), members.join(", "))
+}
+
 #[test]
 fn a_real_rust_analyzer_over_its_memory_limit_is_suspended_and_structural_work_continues() {
+    let manifest = read_manifest(Path::new(RUST_PLUGIN_DIR)).expect("plugins/rust/plugin.toml must parse");
+    assert_over_its_memory_limit_is_suspended_and_structural_work_continues(manifest);
+}
+
+/// The same test on a rust-analyzer that cannot load the standard library,
+/// the condition under which a limit placed between "with std" and "without
+/// std" never trips. Every run checks the lower bound `LOW_LIMIT_MB` must
+/// clear, not only runs on a runner that happens to lack std.
+#[test]
+fn a_real_rust_analyzer_without_std_over_its_memory_limit_is_suspended_and_structural_work_continues() {
+    let scratch = tempfile::tempdir().expect("failed to create a scratch directory");
+    assert_over_its_memory_limit_is_suspended_and_structural_work_continues(manifest_without_std(
+        scratch.path(),
+    ));
+}
+
+fn assert_over_its_memory_limit_is_suspended_and_structural_work_continues(manifest: PluginManifest) {
     let load = std::process::Command::new("uptime")
         .output()
         .ok()
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
-    eprintln!("GM-291: machine state before this test's real rust-analyzer run: {load:?}");
+    eprintln!("machine state before this test's real rust-analyzer run: {load:?}");
+    eprintln!("plugin manifest: {}", manifest.path().display());
 
     let project = fixture_project();
-    let manifest = read_manifest(Path::new(RUST_PLUGIN_DIR)).expect("plugins/rust/plugin.toml must parse");
     let conn = Arc::new(in_memory_index());
     structural_bulk_index(project.path(), &conn, &manifest);
 
@@ -331,7 +431,18 @@ fn a_real_rust_analyzer_over_its_memory_limit_is_suspended_and_structural_work_c
 
     let (supervisor, _pid_dir) = start_supervisor(project.path(), manifest.clone(), Some(LOW_LIMIT_MB));
     assert!(!supervisor.is_semantic_suspended(), "not suspended before any pass or check has run");
-    assert!(supervisor.pid().is_some(), "a freshly started plugin is awake");
+    let plugin_pid = supervisor.pid().expect("a freshly started plugin is awake");
+
+    // The limit must be tripped by rust-analyzer, not by the plugin alone: the
+    // tree before any semantic pass has to sit well under it.
+    let baseline = process_tree_sample(plugin_pid).expect("the freshly started plugin must be sampleable");
+    eprintln!("plugin alone before the pass: {}", describe_process_tree(plugin_pid));
+    assert!(
+        baseline.rss_mb() < LOW_LIMIT_MB / 2,
+        "the plugin alone must sit under half of the {LOW_LIMIT_MB}MB limit, so that only rust-analyzer's \
+         memory can trip it: {}",
+        describe_process_tree(plugin_pid)
+    );
 
     let (pass_returned_at, pass_result, check_returned_at) =
         race_pass_against_memory_check(&supervisor, &conn, file_count);
@@ -346,7 +457,12 @@ fn a_real_rust_analyzer_over_its_memory_limit_is_suspended_and_structural_work_c
     pass_result.expect("the real rust-analyzer whole-project pass must not error");
 
     // 1) the limit trips and the plugin is put to sleep.
-    assert!(supervisor.pid().is_none(), "a plugin over its memory limit must be put to sleep");
+    if let Some(pid) = supervisor.pid() {
+        panic!(
+            "a plugin over its {LOW_LIMIT_MB}MB memory limit must be put to sleep; its tree now: {}",
+            describe_process_tree(pid)
+        );
+    }
     // 2) the semantic tier is suspended.
     assert!(supervisor.is_semantic_suspended(), "its language's semantic passes must be suspended");
 
