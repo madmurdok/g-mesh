@@ -244,3 +244,38 @@ child-process envs as GM-588 did for Python. Not the cause here.
 - `find_callers LazyEngine::workspace_changed` -> `run::Session::handle`,
   `run::Session::resolution_changed`, one sdk unit test (plus 2 untyped
   receiver calls in `plugins/sdk/tests/lsp_bridge.rs`).
+
+## Implemented: client-side file watching and forwarding
+
+- **The rust plugin opts in.** The SDK `LspBridge` claims client file
+  watching only when the plugin calls `client_watches_files()`; today only
+  the rust plugin does. rust-analyzer then registers its globs through
+  `didChangeWatchedFiles` dynamic registration (its default
+  `files.watcher = "client"`) and runs no watcher of its own. A bridge that
+  never opts in (TypeScript, Python) forwards nothing.
+- **`cargo.autoreload = false` was dropped.** F2 proposed it so
+  rust-analyzer never reruns `cargo metadata` on its own after a manifest
+  or config edit. It broke the conformance suite, and it changed how every
+  Rust project picks up manifest edits, so it is not shipped. The gate is
+  the re-check of the cargo configs before each pass, server start and
+  `workspaceChanged`, which now also covers what the bridge forwards.
+- **Pending files are forwarded after the re-check.** The bridge records
+  each file a pass is sent as pending and sends it as
+  `workspace/didChangeWatchedFiles` (`Changed` when on disk, `Deleted`
+  when gone) inside the checked pass, after the clean re-check. A file the
+  server holds open is re-synced with `didChange` instead. Files stay
+  pending until a pass reaches the server.
+- **Manifests and configs are never forwarded.** Only the files core sends
+  a pass are announced; a whole-project pass and a workspace change announce
+  nothing. A `Cargo.toml` or cargo config edit reaches `cargo metadata`
+  only through the reload `workspaceChanged` asks for after a clean
+  re-check, so a config added with a manifest edit is refused before
+  rust-analyzer reloads.
+- **rust-analyzer refetches on created or deleted files.** It refetches the
+  workspace (`cargo metadata`) on a created or deleted file of any kind and
+  on a `Cargo.toml`, `Cargo.lock` or `.cargo/config*` change, but not on an
+  edit to an existing `.rs` file (`should_refresh_for_change` and
+  `process_changes`, rust-analyzer 1.97.1). Every forwarded event is
+  therefore sent after a clean re-check.
+
+Wording follows [ADR 0037](../adr/0037-rust-tier-refuses-cargo-env-loader-vars.md).

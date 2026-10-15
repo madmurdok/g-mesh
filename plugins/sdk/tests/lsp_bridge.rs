@@ -4164,6 +4164,41 @@ fn a_watching_bridge_announces_the_files_a_pass_is_sent_and_resyncs_open_ones() 
     );
 }
 
+/// A bridge whose plugin never claimed client file watching announces
+/// nothing: its server watches the project itself (or the plugin has no use
+/// for the announcement), so the files a pass is sent, changed, new or
+/// deleted, are not forwarded as `workspace/didChangeWatchedFiles`. The
+/// TypeScript and Python plugins rely on this opt-in alone.
+///
+/// Control: in `LspBridge::answer`, queue the files a pass is sent whether or
+/// not the bridge opted in (`if true` for the `client_watches_files` check).
+#[test]
+fn a_bridge_that_does_not_watch_files_announces_nothing() {
+    let scratch = Scratch::new("watched-optout");
+    let (index, _) = fixture(&scratch);
+    let events = scratch.path().join("events.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "fileEventsLog": events.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    // The first pass opens b.toy; the second is sent a file the server does
+    // not hold (a.toy), a deleted one and one that was never indexed.
+    let b = RelPath::new("src/b.toy");
+    let first = bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
+    assert_eq!(semantic_edges(&first).len(), 1, "the pass reaches the server: {:#?}", first.diff);
+    let files = ["src/a.toy", "src/b.toy", "src/gone.toy"].map(RelPath::new);
+    bridge.answer(&files, &index).expect("the bridge answers");
+    assert!(pass(&mut bridge, &index).complete);
+
+    let watched: Vec<String> =
+        file_events(&scratch, &events).into_iter().filter(|event| event.starts_with("watched")).collect();
+    assert!(watched.is_empty(), "a bridge that never opted in announced files: {watched:?}");
+}
+
 /// A pass that reaches no server - nothing to ask in its files, or none of
 /// them indexed any more - has no one to tell about them: the files stay
 /// pending, and the next pass that reaches the server announces them.
