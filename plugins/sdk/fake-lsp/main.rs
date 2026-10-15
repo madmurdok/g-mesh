@@ -318,6 +318,14 @@ struct Script {
     /// assert which language each document was opened as.
     #[serde(default)]
     opened_log: Option<String>,
+    /// Where to append what the client said about files changing on disk:
+    /// `watched <type> <uri>` per change of a
+    /// `workspace/didChangeWatchedFiles` (`type` as the protocol numbers
+    /// it: 1 created, 2 changed, 3 deleted) and `didChange <uri>` per
+    /// `textDocument/didChange`, so a test can assert which files the client
+    /// announced and how.
+    #[serde(default)]
+    file_events_log: Option<String>,
     /// Hold the nth definition/implementation answer (1-based, counted per
     /// server process, in the order the requests arrive) for `holdMs[n-1]`
     /// milliseconds, on its own thread, while this server goes on reading -
@@ -382,6 +390,7 @@ fn main() {
         if method == "textDocument/didOpen" {
             log_opened(&script, &params);
         }
+        log_file_events(&script, &method, &params);
 
         match method.as_str() {
             "initialize" => {
@@ -809,6 +818,26 @@ fn log_opened(script: &Script, params: &Value) {
     );
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn log_file_events(script: &Script, method: &str, params: &Value) {
+    let Some(path) = &script.file_events_log else { return };
+    let lines: String = match method {
+        "workspace/didChangeWatchedFiles" => params["changes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|change| format!("watched {} {}\n", change["type"], change["uri"].as_str().unwrap_or("")))
+            .collect(),
+        "textDocument/didChange" => {
+            format!("didChange {}\n", params["textDocument"]["uri"].as_str().unwrap_or(""))
+        }
+        _ => return,
+    };
+    // One `write` for the whole message, for the reason `log` gives.
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(lines.as_bytes());
     }
 }
 

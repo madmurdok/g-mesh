@@ -46,7 +46,7 @@ use std::process::Command;
 use g_mesh_plugin_rust::extractor::RustExtractor;
 use g_mesh_plugin_rust::project::{ProjectContext, EXCLUDE_DIRS};
 use g_mesh_plugin_rust::semantic;
-use g_mesh_plugin_sdk::wire::SourceTier;
+use g_mesh_plugin_sdk::wire::{SourceTier, TargetKey};
 use g_mesh_plugin_sdk::{walk_project, Extractor, RelPath, SdkIndex, MANIFEST_PATH_ENV};
 
 /// A scratch directory that removes itself.
@@ -903,6 +903,200 @@ mod cargo_env_loader_var {
             mark.is_file(),
             "sanity: `cargo metadata` in the fixture never loaded the [env] {LOADER_VAR} dylib, so this test \
              would prove nothing about that channel"
+        );
+    }
+
+    /// The bridge forwards every file a pass is sent to rust-analyzer, and a
+    /// created one makes it refetch the workspace (`cargo metadata`, which
+    /// loads an `[env]` loader var). So a pass after the config turned
+    /// hostile must refuse before anything is forwarded: with no workspace
+    /// change in between, a file created with the config, and a file left
+    /// pending by an earlier pass that reached no server. No rustc may load
+    /// the dylib.
+    ///
+    /// Control: let `CheckedBridge::answer` skip the re-check
+    /// (`self.bridge.as_mut()` for `self.checked()`).
+    #[test]
+    fn a_pass_after_the_config_turned_hostile_refuses_before_forwarding_any_file() {
+        use std::time::Duration;
+
+        let real = real_toolchain();
+        let scratch = Scratch::new("loader-env-pending");
+        let root = scratch.0.clone();
+        let mark = root.join("MARK_cargo_env_loader");
+        let Some(dylib) = build_marker_dylib(&root.join("dylib"), &mark) else { return };
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        scrub_environment(&real.proxy_dir);
+        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+
+        let mut engine = semantic::engine(&root).expect("no cargo config yet: the engine starts");
+        if let Err(error) = engine.answer(&[], &index_of(&root)) {
+            panic!("the first pass on a clean fixture failed: {error:#}");
+        }
+
+        // util.rs has no call site: a pass about it alone asks nothing,
+        // reaches no server, and leaves util.rs pending.
+        let util = RelPath::new("app/src/util.rs");
+        write(
+            &root.join(util.as_str()),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n\npub fn helper() {}\n",
+        );
+        if let Err(error) = engine.answer(&[util], &index_of(&root)) {
+            panic!("a pass about util.rs on a clean fixture failed: {error:#}");
+        }
+
+        let config = root.join(".cargo/config.toml");
+        write(
+            &config,
+            &format!("[env]\n{LOADER_VAR} = {{ value = {:?}, force = true }}\n", dylib.to_string_lossy()),
+        );
+        write(&root.join("app/src/bin/extra.rs"), "fn main() {}\n");
+        let files = [RelPath::new("app/src/main.rs"), RelPath::new("app/src/bin/extra.rs")];
+        let reason = match engine.answer(&files, &index_of(&root)) {
+            Ok(_) => panic!("a pass ran after the cargo config turned hostile"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            reason.contains(LOADER_VAR) && reason.contains(&config.display().to_string()),
+            "the pass failed, but not by refusing the [env] {LOADER_VAR} in {}: {reason}",
+            config.display()
+        );
+        if let Err(after) = mark_stays_absent(&mark, Duration::from_secs(10)) {
+            panic!("a rustc loaded the [env] {LOADER_VAR} dylib {after:?} after the refused pass");
+        }
+        drop(engine);
+
+        // Sanity: the hostile config is live, as in the test above.
+        let output = Command::new(real.proxy_dir.join("cargo"))
+            .args(["metadata", "--format-version", "1"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cargo metadata in the fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            mark.is_file(),
+            "sanity: `cargo metadata` in the fixture never loaded the [env] {LOADER_VAR} dylib, so this test \
+             would prove nothing about that channel"
+        );
+    }
+
+    fn index_of(root: &Path) -> SdkIndex {
+        let project = ProjectContext::load(root).expect("the fixture is a loadable Rust project");
+        let mut index = SdkIndex::new();
+        for path in walk_project(root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+            let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+            let graph = RustExtractor.extract(&project, &path, &source);
+            index.insert(path, source, graph);
+        }
+        index
+    }
+}
+
+/// rust-analyzer runs no file watcher of its own (the bridge claims client
+/// file watching), so an edit on disk reaches it only through the engine.
+mod source_freshness {
+    use super::*;
+
+    fn index_of(root: &Path) -> SdkIndex {
+        let project = ProjectContext::load(root).expect("the fixture is a loadable Rust project");
+        let mut index = SdkIndex::new();
+        for path in walk_project(root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+            let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+            let graph = RustExtractor.extract(&project, &path, &source);
+            index.insert(path, source, graph);
+        }
+        index
+    }
+
+    /// What `main`'s semantic edges in `answer` point at: the qualified name
+    /// each target placeholder is keyed by (`util::Thing::method`).
+    fn called_by_main(index: &SdkIndex, answer: &g_mesh_plugin_sdk::SemanticAnswer) -> Vec<String> {
+        let main = index
+            .graph(&RelPath::new("app/src/main.rs"))
+            .expect("app/src/main.rs is indexed")
+            .nodes
+            .iter()
+            .find(|node| node.name == "main")
+            .expect("the extractor emits `main`")
+            .id
+            .clone();
+        answer
+            .diff
+            .upsert_edges
+            .iter()
+            .filter(|edge| edge.from_id == main && edge.source == SourceTier::Semantic)
+            .map(|edge| {
+                let target = answer.diff.upsert_nodes.iter().find(|node| node.id == edge.to_id);
+                match target.and_then(|node| node.target.as_ref()).map(|target| &target.key) {
+                    Some(TargetKey::QualifiedName(name)) => name.clone(),
+                    other => format!("{} (target {other:?})", edge.to_id),
+                }
+            })
+            .collect()
+    }
+
+    /// An edit to a file no question is asked in (util.rs has no call site,
+    /// so it is never opened on the server) still reaches rust-analyzer, and
+    /// the answer about its caller is built from the edited text. The edit
+    /// moves `Thing::method` down and puts `Other::method` on its old lines:
+    /// a server still holding the old text answers with the old position,
+    /// which now lands on `Other::method`.
+    ///
+    /// Control: in `LspBridge::answer`, forward nothing (an empty set for the
+    /// `forward_watched` call).
+    #[test]
+    fn an_edit_to_a_file_no_question_touched_reaches_the_answer_about_its_caller() {
+        let real = real_toolchain();
+        let scratch = Scratch::new("fresh-unasked");
+        let root = scratch.0.clone();
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        scrub_environment(&real.proxy_dir);
+        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+
+        let mut engine = semantic::engine(&root).expect("the engine starts");
+        let before = index_of(&root);
+        let first = engine.answer(&[], &before).expect("the first pass answers");
+        assert_eq!(
+            called_by_main(&before, &first),
+            ["util::Thing::method"],
+            "sanity: the first pass resolves `main -> Thing::method`"
+        );
+
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Other;\n\nimpl Other {\n    pub fn method(&self) {}\n}\n\n\
+             pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        let after = index_of(&root);
+        let files = [RelPath::new("app/src/util.rs"), RelPath::new("app/src/main.rs")];
+        let second = engine.answer(&files, &after).expect("the second pass answers");
+        assert_eq!(
+            called_by_main(&after, &second),
+            ["util::Thing::method"],
+            "`main -> method` must land on the edited `Thing::method`; `Other::method` is where the old \
+             text had it"
         );
     }
 }
