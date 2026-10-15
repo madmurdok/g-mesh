@@ -354,14 +354,50 @@ pub(crate) fn segments(path: &str) -> Vec<&str> {
     path.split(['/', '\\']).filter(|s| !s.is_empty() && *s != ".").collect()
 }
 
-/// `path` below `root`, compared by components. `root` is canonical, so a
-/// spelling of it that differs textually (a symlink, or on Windows the `\\?\`
-/// prefix `canonicalize` adds) is retried canonicalized.
+/// `path` below `root`, compared by components. On Windows it is then
+/// compared by segments ([`windows_segments_below`]): a verbatim path treats
+/// only `\\` as a separator, so `\\?\C:\root/group/c` has no component
+/// `group`. `root` is canonical, so a spelling of it that differs otherwise
+/// (a symlink, an 8.3 short name, a `..`) is retried canonicalized.
 pub(crate) fn relative_to_root(root: &Path, path: &Path) -> Option<PathBuf> {
     if let Ok(rel) = path.strip_prefix(root) {
         return Some(rel.to_path_buf());
     }
+    if cfg!(windows) {
+        let (root, path_text) = (root.to_string_lossy(), path.to_string_lossy());
+        let below = windows_segments_below(&root, &path_text);
+        if let Some(below) = below.filter(|below| !below.contains(&"..")) {
+            return Some(PathBuf::from(below.join("/")));
+        }
+    }
     path.canonicalize().ok()?.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+/// `path`'s segments below `root`'s, both read as Windows paths whatever the
+/// host: split on `/` and `\\` alike, with the verbatim prefix (`\\?\`, or
+/// `\\?\UNC\` for a share) dropped and drive letters compared ignoring
+/// case. A share path matches only a share root, so `\\srv\share` is not
+/// `\srv\share` on the current drive. `None` when `root`'s segments do not
+/// begin `path`'s.
+pub(crate) fn windows_segments_below<'a>(root: &str, path: &'a str) -> Option<Vec<&'a str>> {
+    fn parts(path: &str) -> (bool, Vec<&str>) {
+        let (unc, rest) = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            (true, rest)
+        } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+            (false, rest)
+        } else {
+            let mut chars = path.chars();
+            let separator = |c: Option<char>| matches!(c, Some('/' | '\\'));
+            (separator(chars.next()) && separator(chars.next()), path)
+        };
+        (unc, segments(rest))
+    }
+    let same = |a: &&str, b: &&str| a == b || (a.len() == 2 && a.ends_with(':') && a.eq_ignore_ascii_case(b));
+    let (root_unc, root) = parts(root);
+    let (path_unc, path) = parts(path);
+    let begins =
+        root_unc == path_unc && path.len() >= root.len() && root.iter().zip(&path).all(|(a, b)| same(a, b));
+    begins.then(|| path[root.len()..].to_vec())
 }
 
 /// The candidate `project` names, found by probing that one path rather than
@@ -729,6 +765,74 @@ mod tests {
         let root = plain.canonicalize().unwrap();
         let project = plain.join("group").join("c");
         assert_eq!(resolved(&root, project.to_str().unwrap()).as_deref(), Some("group/c"));
+    }
+
+    /// `\\?\C:\u\root/group\c` is what a client gets by joining the served
+    /// (verbatim) root with a `/` path: below the root by its segments.
+    #[test]
+    fn a_verbatim_root_takes_a_suffix_in_either_separator() {
+        let root = r"\\?\C:\u\root";
+        let below = |path: &'static str| windows_segments_below(root, path);
+        assert_eq!(below(r"\\?\C:\u\root/group\c"), Some(vec!["group", "c"]));
+        assert_eq!(below(r"\\?\C:\u\root/group/c/"), Some(vec!["group", "c"]));
+        assert_eq!(below(r"\\?\C:\u\root\a"), Some(vec!["a"]));
+        assert_eq!(below(r"\\?\C:\u\root"), Some(vec![]), "the root itself");
+    }
+
+    /// The verbatim prefix is a spelling, not a different place.
+    #[test]
+    fn verbatim_and_plain_spellings_of_a_drive_path_match_each_other() {
+        assert_eq!(windows_segments_below(r"\\?\C:\u\root", "C:/u/root/a"), Some(vec!["a"]));
+        assert_eq!(windows_segments_below(r"\\?\C:\u\root", r"C:\u\root\group/c"), Some(vec!["group", "c"]));
+        assert_eq!(windows_segments_below(r"C:\u\root", r"\\?\C:\u\root\a"), Some(vec!["a"]));
+        assert_eq!(windows_segments_below("C:/u/root", r"C:\u\root\a"), Some(vec!["a"]));
+    }
+
+    #[test]
+    fn drive_letters_match_ignoring_case() {
+        assert_eq!(windows_segments_below(r"C:\u\root", r"c:\u\root\a"), Some(vec!["a"]));
+        assert_eq!(windows_segments_below(r"c:\u\root", "C:/u/root/a"), Some(vec!["a"]));
+        assert_eq!(windows_segments_below(r"\\?\C:\u\root", "c:/u/root/a"), Some(vec!["a"]));
+        assert_eq!(windows_segments_below(r"C:\u\root", r"D:\u\root\a"), None, "another drive");
+    }
+
+    #[test]
+    fn only_whole_segments_below_the_root_match() {
+        let root = r"\\?\C:\u\root";
+        let below = |path: &'static str| windows_segments_below(root, path);
+        assert_eq!(below(r"\\?\C:\u\rootx\a"), None, "a longer last segment");
+        assert_eq!(below("C:/u/rootx/a"), None);
+        assert_eq!(below(r"C:\u\roo\a"), None, "a shorter last segment");
+        assert_eq!(below(r"C:\u"), None, "above the root");
+        assert_eq!(below(r"C:\v\root\a"), None, "a differing middle segment");
+    }
+
+    /// `\\srv\share` is a network share; `\srv\share` is a folder on the
+    /// current drive. Each matches only a root of its own kind.
+    #[test]
+    fn a_share_path_matches_only_a_share_root() {
+        let root = r"\\?\UNC\srv\share\r";
+        let below = |path: &'static str| windows_segments_below(root, path);
+        assert_eq!(below(r"\\srv\share\r\a"), Some(vec!["a"]));
+        assert_eq!(below("//srv/share/r/a"), Some(vec!["a"]));
+        assert_eq!(below(r"\\?\UNC\srv\share\r/a"), Some(vec!["a"]));
+        assert_eq!(below(r"\srv\share\r\a"), None, "a drive-relative path is not the share");
+        assert_eq!(below(r"\\?\srv\share\r\a"), None, "a verbatim drive-style path is not the share");
+        assert_eq!(windows_segments_below(r"\srv\share\r", r"\\srv\share\r\a"), None);
+        assert_eq!(windows_segments_below(r"\\srv\share\r", r"\\?\UNC\srv\share\r\a"), Some(vec!["a"]));
+    }
+
+    /// Segments with `..` are no answer: the path is retried canonicalized,
+    /// so `group\..\group\c` below the root is `group\c`, not itself.
+    #[cfg(windows)]
+    #[test]
+    fn a_dotdot_below_a_verbatim_root_is_matched_by_its_canonical_form() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("root"), "group/c/go.mod");
+        let root = dir.path().join("root").canonicalize().unwrap();
+        let plain = root.to_str().unwrap().strip_prefix(r"\\?\").expect("a canonical root is verbatim");
+        let project = Path::new(plain).join("group").join("..").join("group").join("c");
+        assert_eq!(relative_to_root(&root, &project), Some(PathBuf::from("group").join("c")));
     }
 
     /// A rooted path below the root whose segments name no candidate (a
