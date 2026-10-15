@@ -67,14 +67,18 @@
 //! The same factory failure is how a project is refused the tier when a
 //! cargo config in effect for it sets a dynamic-loader variable in `[env]`
 //! ([ADR 0037](../../../docs/adr/0037-rust-tier-refuses-cargo-env-loader-vars.md)).
+//! A config that turns hostile after the factory ran is caught by
+//! `CheckedBridge`'s re-check instead: the server stops and every later
+//! pass is an `Err`, which the SDK answers as an empty, incomplete diff.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use g_mesh_plugin_sdk::lsp::{self, is_bare, Candidate, LspBridge, SemanticConfig, PROBE_BUDGET};
-use g_mesh_plugin_sdk::SemanticEngine;
+use g_mesh_plugin_sdk::{RelPath, SdkIndex, SemanticAnswer, SemanticEngine};
 
 /// The language id this plugin speaks, for `didOpen` and for log lines.
 const LANGUAGE: &str = "rust";
@@ -109,13 +113,8 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
         })?;
 
     let toolchain = Toolchain::detect();
-    if let Some((var, file)) = cargo_env_loader_var(root) {
-        anyhow::bail!(
-            "semantic tier refused: the cargo config {} sets {var} in [env], a dynamic-loader \
-             variable cargo would pass to every rustc it starts for rust-analyzer; this project \
-             is indexed at the structural tier only (docs/adr/0037)",
-            file.display()
-        );
+    if let Some(refusal) = cargo_env_loader_var(root).refusal() {
+        anyhow::bail!("{refusal}");
     }
     let resolved = resolve(&config.command, &toolchain)?;
     g_mesh_plugin_sdk::log_line!(
@@ -130,7 +129,75 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     // GM-550: rust-analyzer's start-up phases can be separated by more than
     // the bridge's 2s settle under load (2.04s and 2.47s measured), so its
     // readiness is its own `quiescent` status rather than a quiet period.
-    Ok(Box::new(LspBridge::new(LANGUAGE, root, config).quiescent_signal()))
+    Ok(Box::new(CheckedBridge::new(root, LspBridge::new(LANGUAGE, root, config).quiescent_signal())))
+}
+
+/// The engine [`engine`] returns: the bridge, behind a re-check of the cargo
+/// configs before every pass, every server start and every project reload.
+///
+/// The configs can change after the factory checked them (a checkout that
+/// adds `.cargo/config.toml`), and rust-analyzer reruns `cargo metadata` on
+/// a reload. [`SemanticEngine::workspace_changed`] asks for that reload only
+/// after a clean re-check. A hostile or unreadable config stops the server
+/// and makes every later pass `Err`: the plugin is structural-only from then
+/// on. rust-analyzer's own reload on a manifest change (`cargo.autoreload`,
+/// left on) is not gated by this check.
+struct CheckedBridge {
+    root: PathBuf,
+    /// `None` once refused: dropping the bridge shuts its server down.
+    bridge: Option<LspBridge>,
+    refusal: Option<String>,
+}
+
+impl CheckedBridge {
+    fn new(root: &Path, bridge: LspBridge) -> Self {
+        Self { root: root.to_path_buf(), bridge: Some(bridge), refusal: None }
+    }
+
+    /// The bridge, when the configs are still clean; otherwise stops the
+    /// server (once) and answers `None`.
+    fn checked(&mut self) -> Option<&mut LspBridge> {
+        if self.refusal.is_none() {
+            if let Some(refusal) = cargo_env_loader_var(&self.root).refusal() {
+                g_mesh_plugin_sdk::log_line!("[{LANGUAGE}] {refusal}; stopping the language server");
+                self.bridge = None;
+                self.refusal = Some(refusal);
+            }
+        }
+        self.bridge.as_mut()
+    }
+}
+
+impl SemanticEngine for CheckedBridge {
+    fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer> {
+        match self.checked() {
+            Some(bridge) => bridge.answer(files, index),
+            None => Err(anyhow::anyhow!("{}", self.refusal.as_deref().unwrap_or("semantic tier refused"))),
+        }
+    }
+
+    fn workspace_changed(&mut self) {
+        let Some(bridge) = self.checked() else { return };
+        bridge.workspace_changed();
+        match bridge.request("rust-analyzer/reloadWorkspace", serde_json::Value::Null) {
+            Ok(_) => {}
+            Err(error) => {
+                g_mesh_plugin_sdk::log_line!("[{LANGUAGE}] could not ask the server to reload: {error:#}")
+            }
+        }
+    }
+
+    fn prepare(&mut self) {
+        if let Some(bridge) = self.checked() {
+            bridge.prepare();
+        }
+    }
+
+    fn set_pass_deadline(&mut self, deadline: Option<Instant>) {
+        if let Some(bridge) = self.bridge.as_mut() {
+            bridge.set_pass_deadline(deadline);
+        }
+    }
 }
 
 /// The toolchain the server and every cargo/rustc it starts run from, found
@@ -238,9 +305,52 @@ const LOADER_VARS: [&str; 6] = [
     "LD_LIBRARY_PATH",
 ];
 
+/// What [`cargo_env_loader_var`] concluded about the cargo configs in effect
+/// for a project root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoaderCheck {
+    /// Every config cargo would read was read, and none sets a loader var.
+    Clean,
+    /// `file` sets `var` in its `[env]` table.
+    Found { var: String, file: PathBuf },
+    /// `file` may exist but could not be read (`error`), so whether it sets
+    /// a loader var is unknown.
+    Unchecked { file: PathBuf, error: String },
+}
+
+impl LoaderCheck {
+    fn unchecked(file: &Path, error: impl std::fmt::Display) -> Self {
+        Self::Unchecked { file: file.to_path_buf(), error: error.to_string() }
+    }
+
+    /// Why the semantic tier is refused, or `None` when it is not.
+    fn refusal(&self) -> Option<String> {
+        match self {
+            Self::Clean => None,
+            Self::Found { var, file } => Some(format!(
+                "semantic tier refused: the cargo config {} sets {var} in [env], a dynamic-loader \
+                 variable cargo would pass to every rustc it starts for rust-analyzer; this project \
+                 is indexed at the structural tier only (docs/adr/0037)",
+                file.display()
+            )),
+            Self::Unchecked { file, error } => Some(format!(
+                "semantic tier refused: could not read {}: {error}; refused rather than unchecked, \
+                 since a cargo config there could set a dynamic-loader variable in [env]; this \
+                 project is indexed at the structural tier only (docs/adr/0037)",
+                file.display()
+            )),
+        }
+    }
+}
+
+/// Whether an I/O error means "there is no such file here" - the one error
+/// that proves nothing is there to check.
+fn absent(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+}
+
 /// The first [`LOADER_VARS`] key that a cargo config in effect for `root`
-/// sets in its `[env]` table, and the config file that sets it. `None` when
-/// no such config sets one.
+/// sets in its `[env]` table, and the config file that sets it.
 ///
 /// The configs are the ones cargo reads for a command run in `root`, in its
 /// order: `.cargo/config.toml` then the legacy `.cargo/config` in `root` and
@@ -255,19 +365,39 @@ const LOADER_VARS: [&str; 6] = [
 /// Both `[env]` forms count: `KEY = "value"` and `KEY = { value = "...",
 /// force = ..., relative = ... }`. A file that does not parse is matched by
 /// text instead, so a syntax this parser does not accept and cargo does
-/// cannot hide a key. A file that cannot be read is skipped: cargo cannot
-/// read it either.
-fn cargo_env_loader_var(root: &Path) -> Option<(String, PathBuf)> {
+/// cannot hide a key.
+///
+/// Fails closed: only a path that does not exist (`NotFound`, or a parent
+/// that is not a directory) is skipped. Any other error listing `root`,
+/// `stat`ing or reading a config, and a config path that exists but is not
+/// a regular file, is [`LoaderCheck::Unchecked`], never `Clean`.
+fn cargo_env_loader_var(root: &Path) -> LoaderCheck {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(children) = std::fs::read_dir(root) {
-        let mut children: Vec<PathBuf> = children
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .map(|entry| entry.path())
-            .filter(|dir| dir.file_name().is_some_and(|name| name != ".cargo"))
-            .collect();
-        children.sort();
-        dirs.extend(children.into_iter().map(|dir| dir.join(".cargo")));
+    match std::fs::read_dir(root) {
+        Ok(children) => {
+            let mut subdirs = Vec::new();
+            for entry in children {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => return LoaderCheck::unchecked(root, error),
+                };
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => {
+                        if path.file_name().is_some_and(|name| name != ".cargo") {
+                            subdirs.push(path);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) if absent(&error) => {}
+                    Err(error) => return LoaderCheck::unchecked(&path, error),
+                }
+            }
+            subdirs.sort();
+            dirs.extend(subdirs.into_iter().map(|dir| dir.join(".cargo")));
+        }
+        Err(error) if absent(&error) => {}
+        Err(error) => return LoaderCheck::unchecked(root, error),
     }
     dirs.splice(0..0, root.ancestors().map(|dir| dir.join(".cargo")));
     if let Some(cargo_home) = cargo_home() {
@@ -281,23 +411,33 @@ fn cargo_env_loader_var(root: &Path) -> Option<(String, PathBuf)> {
     // next discovered file, so the first match is the nearest config's.
     pending.reverse();
     while let Some(file) = pending.pop() {
+        match std::fs::metadata(&file) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return LoaderCheck::unchecked(&file, "it exists but is not a regular file"),
+            Err(error) if absent(&error) => continue,
+            Err(error) => return LoaderCheck::unchecked(&file, error),
+        }
         let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
-        if !file.is_file() || !visited.insert(key) {
+        if !visited.insert(key) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(error) if absent(&error) => continue,
+            Err(error) => return LoaderCheck::unchecked(&file, error),
+        };
         let table = match text.parse::<toml::Table>() {
             Ok(table) => table,
             Err(_) => {
                 if let Some(var) = LOADER_VARS.iter().find(|var| text.contains(*var)) {
-                    return Some((var.to_string(), file));
+                    return LoaderCheck::Found { var: var.to_string(), file };
                 }
                 continue;
             }
         };
         if let Some(env) = table.get("env").and_then(toml::Value::as_table) {
             if let Some(var) = LOADER_VARS.iter().find(|var| env.contains_key(**var)) {
-                return Some((var.to_string(), file));
+                return LoaderCheck::Found { var: var.to_string(), file };
             }
         }
         let base = file.parent().unwrap_or(Path::new("."));
@@ -306,7 +446,7 @@ fn cargo_env_loader_var(root: &Path) -> Option<(String, PathBuf)> {
         includes.reverse();
         pending.extend(includes);
     }
-    None
+    LoaderCheck::Clean
 }
 
 /// The paths a cargo config's `include` value names: a string, or an array
@@ -981,6 +1121,7 @@ mod tests {
         if line == "none" {
             return None;
         }
+        assert!(!line.starts_with("unchecked "), "the check could not read a config: {line}");
         let (key, file) = line.split_once('|').expect("the child prints key|file");
         Some((key.to_string(), PathBuf::from(file)))
     }
@@ -994,8 +1135,11 @@ mod tests {
         };
         match std::env::var(LOADER_CHILD_MODE).as_deref() {
             Ok("detect") => match cargo_env_loader_var(&root) {
-                Some((key, file)) => println!("GM587-CHILD: {key}|{}", file.display()),
-                None => println!("GM587-CHILD: none"),
+                LoaderCheck::Found { var, file } => println!("GM587-CHILD: {var}|{}", file.display()),
+                LoaderCheck::Clean => println!("GM587-CHILD: none"),
+                LoaderCheck::Unchecked { file, error } => {
+                    println!("GM587-CHILD: unchecked {}: {}", file.display(), error.replace('\n', " "))
+                }
             },
             Ok("engine") => match engine(&root) {
                 Err(error) => println!("GM587-CHILD: err {}", format!("{error:#}").replace('\n', " ")),

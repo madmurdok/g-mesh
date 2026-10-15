@@ -35,6 +35,16 @@ rust-analyzer's `cargo.extraEnv`, did not stop it.
   (`plugins/rust/src/semantic.rs`, `engine` and `cargo_env_loader_var`).
   A config that does not parse is matched by text, so a syntax the plugin's
   TOML parser rejects and cargo accepts cannot hide a key.
+  The check fails closed: a config path that exists but cannot be `stat`ed
+  or read (any error but "not found"), or is not a regular file, refuses
+  the tier the same way, naming the file and the error. The check runs
+  again before every pass, server start and `workspaceChanged` (which
+  then asks rust-analyzer to reload); a config that turns hostile later
+  stops the server and leaves the plugin structural-only for the rest of
+  the process. rust-analyzer's own reload on a manifest change
+  (`cargo.autoreload`) is still on and not gated by the check, so a config
+  added together with a manifest edit can reach `cargo metadata` before
+  the next re-check, until the sandbox (D2) contains it.
 - **D3 - the key list is broad:** `DYLD_INSERT_LIBRARIES`,
   `DYLD_FRAMEWORK_PATH`, `DYLD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`,
   `LD_LIBRARY_PATH`.

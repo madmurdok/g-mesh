@@ -596,6 +596,20 @@ impl LspBridge {
         self
     }
 
+    /// Sends `method` with `params` to the running server as a request whose
+    /// answer nobody waits for: a pass's poll loop drops an answer to an id
+    /// it did not ask. For a plugin that must tell its server something the
+    /// bridge has no verb for, such as rust-analyzer's
+    /// `rust-analyzer/reloadWorkspace`. Starts nothing: with no server
+    /// running it sends nothing and answers `Ok(false)`, since a server
+    /// started later reads the project fresh anyway.
+    pub fn request(&mut self, method: &str, params: Value) -> Result<bool> {
+        match self.client.as_mut() {
+            Some(client) => client.request(method, params).map(|_| true),
+            None => Ok(false),
+        }
+    }
+
     /// [`LspBridge::new`] with budgets a test can make small - see
     /// [`Budgets`].
     pub fn with_budgets(language: &str, root: &Path, config: SemanticConfig, budgets: Budgets) -> Self {
