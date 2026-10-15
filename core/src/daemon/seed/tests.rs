@@ -14,7 +14,7 @@
 //! - make `for_git` return its input unchanged: the verbatim paths reach
 //!   git (`for_git_strips_the_verbatim_prefix`).
 //!
-//! The seed's `sync_all` through a writable handle (GM-609) is driven on every
+//! The seed's `sync_all` through a writable handle is driven on every
 //! OS by the seeding tests below, but only Windows tells it from a read-only
 //! one (`FlushFileBuffers` needs write access; `fsync` takes any fd): its
 //! control, `fs::File::open(&tmp)` before `sync_all`, fails those tests on
