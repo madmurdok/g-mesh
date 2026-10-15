@@ -140,6 +140,9 @@ async fn importers_of_reconciled(project: &Project, file_path: &str) -> Vec<Stri
 
 async fn importers_of_after(project: &Project, file_path: &str, wait_for_reconcile: bool) -> Vec<String> {
     // Lines already in the (appended-to) daemon log belong to earlier daemons.
+    // The log is named on the shim explicitly: an inherited
+    // `G_MESH_DAEMON_LOG` (CI sets one for the whole run) would otherwise send
+    // the daemon's stderr somewhere this function never reads.
     let log = project_dir(project.root()).expect("failed to resolve the state directory").join("daemon.log");
     let seen = reconcile_lines(&log).len();
 
@@ -150,7 +153,8 @@ async fn importers_of_after(project: &Project, file_path: &str, wait_for_reconci
         cmd.kill_on_drop(true)
             .arg("mcp-shim")
             .current_dir(project.root())
-            .env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+            .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
+            .env(g_mesh::shim::DAEMON_LOG_ENV, &log);
     }))
     .expect("failed to spawn the shim");
     let client = ().serve(transport).await.expect("MCP initialization failed");
