@@ -4058,6 +4058,42 @@ fn only_a_signalled_bridge_asks_for_the_server_status() {
     }
 }
 
+/// Only a bridge built with `client_watches_files` claims
+/// `workspace.didChangeWatchedFiles` dynamic registration, which is what
+/// tells rust-analyzer not to run its own file watcher; every other bridge
+/// sends the workspace capabilities it always sent.
+///
+/// Control: make `client_watches_files` default to `true` in
+/// `LspBridge::with_budgets`; the plain arm claims it too.
+#[test]
+fn only_a_bridge_that_opts_in_claims_client_file_watching() {
+    for opted_in in [true, false] {
+        let scratch = Scratch::new(if opted_in { "watch-claimed" } else { "watch-not-claimed" });
+        let (index, _) = fixture(&scratch);
+        let out = scratch.path().join("workspace.json");
+        let config = scratch.server(json!({
+            "readiness": { "kind": "none" },
+            "positionEncoding": "utf-16",
+            "answers": answers_the_site(&scratch),
+            "workspaceCapabilitiesOut": out.to_string_lossy(),
+        }));
+        let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+        if opted_in {
+            bridge = bridge.client_watches_files();
+        }
+
+        assert!(pass(&mut bridge, &index).complete);
+        let workspace: Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).expect("the server saw an initialize"))
+                .unwrap();
+        let mut expected = json!({ "configuration": true, "workspaceFolders": true });
+        if opted_in {
+            expected["didChangeWatchedFiles"] = json!({ "dynamicRegistration": true });
+        }
+        assert_eq!(workspace, expected, "opted_in = {opted_in}");
+    }
+}
+
 /// The GM-550 flake: rust-analyzer under load paused longer than the settle
 /// between two start-up phases, and the bridge called it ready in the gap.
 /// Here the gap (2.5s) is longer than the settle (2s), as measured, and the

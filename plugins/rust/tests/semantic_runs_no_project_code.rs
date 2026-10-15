@@ -800,4 +800,109 @@ mod cargo_env_loader_var {
             config.display()
         );
     }
+
+    /// Watches `mark` for `span`; `Err` with how long it took when it appears.
+    fn mark_stays_absent(mark: &Path, span: std::time::Duration) -> Result<(), std::time::Duration> {
+        let start = std::time::Instant::now();
+        loop {
+            if mark.exists() {
+                return Err(start.elapsed());
+            }
+            if start.elapsed() >= span {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    /// A loader var added after the engine started: a checkout writes the
+    /// config and edits a manifest, and core's notice of it lags. Until the
+    /// notice, rust-analyzer must not reload on its own; at the notice the
+    /// engine re-checks the configs, stops the server and answers `Err`
+    /// naming the config, and no rustc ever loads the dylib.
+    #[test]
+    fn a_loader_var_added_after_start_stops_the_server_before_any_reload() {
+        use std::time::Duration;
+
+        let real = real_toolchain();
+        let scratch = Scratch::new("loader-env-late");
+        let root = scratch.0.clone();
+        let mark = root.join("MARK_cargo_env_loader");
+        let Some(dylib) = build_marker_dylib(&root.join("dylib"), &mark) else { return };
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        write(&root.join("app/Cargo.toml"), manifest);
+        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        scrub_environment(&real.proxy_dir);
+        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+
+        let mut engine = semantic::engine(&root).expect("no cargo config yet: the engine starts");
+        let index = {
+            let project = ProjectContext::load(&root).expect("the fixture is a loadable Rust project");
+            let mut index = SdkIndex::new();
+            for path in walk_project(&root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+                let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+                let graph = RustExtractor.extract(&project, &path, &source);
+                index.insert(path, source, graph);
+            }
+            index
+        };
+        if let Err(error) = engine.answer(&[], &index) {
+            panic!("the first pass on a clean fixture failed: {error:#}");
+        }
+
+        let config = root.join(".cargo/config.toml");
+        write(
+            &config,
+            &format!("[env]\n{LOADER_VAR} = {{ value = {:?}, force = true }}\n", dylib.to_string_lossy()),
+        );
+        write(&root.join("app/Cargo.toml"), &format!("{manifest}\n[dependencies]\n"));
+        // Core's notice lags the edit; the engine hears nothing meanwhile.
+        if let Err(after) = mark_stays_absent(&mark, Duration::from_secs(15)) {
+            panic!(
+                "rust-analyzer reloaded on its own {after:?} after the manifest edit and a rustc loaded \
+                 the [env] {LOADER_VAR} dylib before the engine could re-check the configs"
+            );
+        }
+
+        engine.workspace_changed();
+        if let Err(after) = mark_stays_absent(&mark, Duration::from_secs(10)) {
+            panic!("a rustc loaded the [env] {LOADER_VAR} dylib {after:?} after workspace_changed");
+        }
+        let reason = match engine.answer(&[], &index) {
+            Ok(_) => panic!("a pass ran after the cargo config turned hostile"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            reason.contains(LOADER_VAR) && reason.contains(&config.display().to_string()),
+            "the pass failed, but not by refusing the [env] {LOADER_VAR} in {}: {reason}",
+            config.display()
+        );
+        if let Err(after) = mark_stays_absent(&mark, Duration::from_secs(5)) {
+            panic!("a rustc loaded the [env] {LOADER_VAR} dylib {after:?} after the refusal");
+        }
+        drop(engine);
+
+        // Sanity: the hostile config is live - an unpinned `cargo metadata`
+        // in the fixture loads the dylib into the rustc it starts.
+        let output = Command::new(real.proxy_dir.join("cargo"))
+            .args(["metadata", "--format-version", "1"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cargo metadata in the fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            mark.is_file(),
+            "sanity: `cargo metadata` in the fixture never loaded the [env] {LOADER_VAR} dylib, so this test \
+             would prove nothing about that channel"
+        );
+    }
 }

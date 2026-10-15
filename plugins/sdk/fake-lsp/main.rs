@@ -297,6 +297,11 @@ struct Script {
     /// assert which extensions the client asked for.
     #[serde(default)]
     capabilities_out: Option<String>,
+    /// Where to write `capabilities.workspace` from the client's
+    /// `initialize`, verbatim (`null` when it sent none), so a test can
+    /// assert which workspace features the client claimed.
+    #[serde(default)]
+    workspace_capabilities_out: Option<String>,
     /// Sections to ask the *client* for with `workspace/configuration`, right
     /// after `initialized` - which is when pyright asks, and the only channel
     /// it takes settings through at all (GM-299). A server asking its client
@@ -385,6 +390,10 @@ fn main() {
                 status_asked = experimental.get("serverStatusNotification") == Some(&json!(true));
                 if let Some(path) = &script.capabilities_out {
                     let _ = std::fs::write(path, experimental.to_string());
+                }
+                if let Some(path) = &script.workspace_capabilities_out {
+                    let workspace = params.pointer("/capabilities/workspace").cloned().unwrap_or(Value::Null);
+                    let _ = std::fs::write(path, workspace.to_string());
                 }
                 let mut capabilities = json!({
                     "definitionProvider": true,

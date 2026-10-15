@@ -1306,4 +1306,132 @@ mod tests {
             config.display()
         );
     }
+
+    // -----------------------------------------------------------------------
+    // The check fails closed: a config path it cannot stat, read or list is
+    // a refusal naming that path, never "clean".
+    // -----------------------------------------------------------------------
+
+    /// What [`cargo_env_loader_var`] could not read for `root` (with
+    /// `scratch/home` as `CARGO_HOME`): the file it names and the error.
+    /// Panics when the check came back clean or found a key instead.
+    fn unchecked(scratch: &LoaderScratch, root: &Path) -> (PathBuf, String) {
+        let home = scratch.0.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let line = loader_child("detect", root, &home);
+        let rest = line
+            .strip_prefix("unchecked ")
+            .unwrap_or_else(|| panic!("a config the check could not read did not refuse: {line}"));
+        let (file, error) = rest.split_once(": ").expect("the child prints `unchecked <file>: <error>`");
+        (PathBuf::from(file), error.to_string())
+    }
+
+    /// Sets `path`'s mode, and puts `restore` back on drop so the scratch
+    /// directory can be removed even when the test fails.
+    #[cfg(unix)]
+    struct ModeGuard {
+        path: PathBuf,
+        restore: u32,
+    }
+
+    #[cfg(unix)]
+    impl ModeGuard {
+        fn set(path: &Path, mode: u32, restore: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            ModeGuard { path: path.to_path_buf(), restore }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.restore));
+        }
+    }
+
+    /// Whether this process is denied a mode-000 file. Root (and any process
+    /// with the capability to bypass file modes) is not, so a test that needs
+    /// an unreadable path skips there instead of passing for the wrong reason.
+    #[cfg(unix)]
+    fn file_modes_are_enforced(scratch: &LoaderScratch) -> bool {
+        let probe = scratch.write("mode-probe", "x");
+        let enforced = {
+            let _locked = ModeGuard::set(&probe, 0o000, 0o644);
+            std::fs::read(&probe).is_err()
+        };
+        if !enforced {
+            println!("SKIPPED: this process reads a mode-000 file (root?), so no path is unreadable to it");
+        }
+        enforced
+    }
+
+    /// A `.cargo/config.toml` that exists but is a directory is not "no
+    /// config here": the check refuses, naming it, and so does the engine.
+    #[test]
+    fn a_config_path_that_is_a_directory_refuses_naming_it() {
+        let scratch = LoaderScratch::new("config-is-dir");
+        let config = scratch.0.join("ws/.cargo/config.toml");
+        std::fs::create_dir_all(&config).unwrap();
+        let (file, error) = unchecked(&scratch, &scratch.0.join("ws"));
+        assert_eq!(file, config, "the refusal names another path ({error})");
+
+        let line = loader_child("engine", &scratch.0.join("ws"), &scratch.0.join("home"));
+        let reason = line.strip_prefix("err ").unwrap_or_else(|| panic!("the engine did not refuse: {line}"));
+        assert!(
+            reason.contains(&config.display().to_string()),
+            "the refusal does not name {}: {reason}",
+            config.display()
+        );
+    }
+
+    /// A config whose directory cannot be searched `stat`s with
+    /// `PermissionDenied`, not `NotFound`: whatever it says is unknown, so
+    /// the check refuses, naming the config path.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_whose_directory_is_unsearchable_refuses_naming_it() {
+        let scratch = LoaderScratch::new("config-dir-locked");
+        if !file_modes_are_enforced(&scratch) {
+            return;
+        }
+        let config = scratch.write("ws/.cargo/config.toml", "[env]\nLD_PRELOAD = \"/x/evil.so\"\n");
+        let _locked = ModeGuard::set(&scratch.0.join("ws/.cargo"), 0o000, 0o755);
+        let (file, error) = unchecked(&scratch, &scratch.0.join("ws"));
+        assert_eq!(file, config, "the refusal names another path ({error})");
+    }
+
+    /// A config that `stat`s as a regular file but cannot be read refuses,
+    /// naming it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_config_file_refuses_naming_it() {
+        let scratch = LoaderScratch::new("config-unreadable");
+        if !file_modes_are_enforced(&scratch) {
+            return;
+        }
+        let config = scratch.write("ws/.cargo/config.toml", "[env]\nLD_PRELOAD = \"/x/evil.so\"\n");
+        let _locked = ModeGuard::set(&config, 0o000, 0o644);
+        let (file, error) = unchecked(&scratch, &scratch.0.join("ws"));
+        assert_eq!(file, config, "the refusal names another path ({error})");
+    }
+
+    /// A root that cannot be listed hides its subdirectories' configs: the
+    /// check refuses, naming the root. The root stays searchable (`-wx`), so
+    /// its own `.cargo/config.toml` is a clean `NotFound` and only the
+    /// listing fails.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_root_refuses_naming_it() {
+        let scratch = LoaderScratch::new("root-unlistable");
+        if !file_modes_are_enforced(&scratch) {
+            return;
+        }
+        let root = scratch.0.join("ws");
+        scratch.write("ws/app/.cargo/config.toml", "[env]\nLD_PRELOAD = \"/x/evil.so\"\n");
+        let _locked = ModeGuard::set(&root, 0o300, 0o755);
+        let (file, error) = unchecked(&scratch, &root);
+        assert_eq!(file, root, "the refusal names another path ({error})");
+    }
 }
