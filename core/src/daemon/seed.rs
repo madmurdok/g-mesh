@@ -326,7 +326,11 @@ fn seed_from(
         schema::record_seed_origin(&dest, &source_root.to_string_lossy())?;
         dest.pragma_update(None, "wal_checkpoint", "TRUNCATE").context("failed to checkpoint the copy")?;
     }
-    fs::File::open(&tmp)
+    // Opened for writing: Windows flushes (`FlushFileBuffers`) only through a
+    // handle with write access, so a read-only handle's `sync_all` fails.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp)
         .and_then(|file| file.sync_all())
         .with_context(|| format!("failed to sync {}", tmp.display()))?;
     // A crashed daemon's side files with no `index.db` would be applied to

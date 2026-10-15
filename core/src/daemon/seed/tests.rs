@@ -10,7 +10,15 @@
 //!   WAL-only row is missing (`a_seed_holds_commits_still_only_in_the_sources_wal`);
 //! - in `main_checkout`, use the gitdir itself as the common dir when it has
 //!   no `commondir`: the separate-git-dir checkout maps to a "main"
-//!   (`main_checkout_is_none_without_a_commondir`).
+//!   (`main_checkout_is_none_without_a_commondir`);
+//! - make `for_git` return its input unchanged: the verbatim paths reach
+//!   git (`for_git_strips_the_verbatim_prefix`).
+//!
+//! The seed's `sync_all` through a writable handle is driven on every
+//! OS by the seeding tests below, but only Windows tells it from a read-only
+//! one (`FlushFileBuffers` needs write access; `fsync` takes any fd): its
+//! control, `fs::File::open(&tmp)` before `sync_all`, fails those tests on
+//! the Windows CI job only.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,11 +30,31 @@ use crate::daemon::indexing_status::ColdCause;
 
 const VERSION: &str = "seed-test-generation";
 
+/// `path` as git takes it: without the verbatim prefix (`\\?\`) that
+/// `canonicalize` adds on Windows, which git mangles into `//?/C:/...` and
+/// cannot create directories under. The fixtures keep canonical paths, as
+/// `main_checkout` returns them; only what is handed to git is stripped.
+fn for_git(path: &Path) -> String {
+    let path = path.to_str().expect("a UTF-8 temp path");
+    match path.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{share}"),
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_string(),
+    }
+}
+
+#[test]
+fn for_git_strips_the_verbatim_prefix() {
+    assert_eq!(for_git(Path::new(r"\\?\C:\Users\me\tmp\wt")), r"C:\Users\me\tmp\wt", "a verbatim drive path");
+    assert_eq!(for_git(Path::new(r"\\?\UNC\server\share\wt")), r"\\server\share\wt", "a verbatim UNC path");
+    assert_eq!(for_git(Path::new(r"C:\Users\me\tmp\wt")), r"C:\Users\me\tmp\wt", "a plain drive path");
+    assert_eq!(for_git(Path::new("/tmp/g-mesh/wt")), "/tmp/g-mesh/wt", "a plain unix path");
+}
+
 /// Runs git in `dir`, with an identity and no signing, so the user's global
 /// config cannot change what a commit needs.
 fn git(dir: &Path, args: &[&str]) {
     let output = Command::new("git")
-        .current_dir(dir)
+        .current_dir(for_git(dir))
         .args([
             "-c",
             "user.name=g-mesh test",
@@ -66,7 +94,7 @@ fn repos() -> Repos {
     git(&main, &["add", "."]);
     git(&main, &["commit", "-q", "-m", "init"]);
     let worktree = base.join("wt");
-    git(&main, &["worktree", "add", "-q", "-b", "wt-branch", worktree.to_str().unwrap()]);
+    git(&main, &["worktree", "add", "-q", "-b", "wt-branch", &for_git(&worktree)]);
     Repos { _dir: dir, main, worktree }
 }
 
@@ -128,7 +156,7 @@ fn main_checkout_is_none_without_a_commondir() {
     let modules = repos.main.join(".git/modules/module");
     fs::create_dir_all(&submodule).unwrap();
     fs::create_dir_all(modules.parent().unwrap()).unwrap();
-    git(&submodule, &["init", "-q", "--separate-git-dir", modules.to_str().unwrap()]);
+    git(&submodule, &["init", "-q", "--separate-git-dir", &for_git(&modules)]);
     assert!(submodule.join(".git").is_file());
     assert_eq!(main_checkout(&submodule), None, "a submodule");
 
@@ -137,7 +165,7 @@ fn main_checkout_is_none_without_a_commondir() {
     let separate = base.join("separate");
     fs::create_dir_all(&elsewhere).unwrap();
     fs::create_dir_all(&separate).unwrap();
-    git(&separate, &["init", "-q", "--separate-git-dir", elsewhere.join(".git").to_str().unwrap()]);
+    git(&separate, &["init", "-q", "--separate-git-dir", &for_git(&elsewhere.join(".git"))]);
     assert!(separate.join(".git").is_file() && elsewhere.join(".git").is_dir());
     assert_eq!(main_checkout(&separate), None, "a separate git dir named .git");
 }
@@ -151,9 +179,9 @@ fn main_checkout_is_none_for_a_bare_repos_worktree() {
     let bare_parent = base.join("bare");
     fs::create_dir_all(&bare_parent).unwrap();
     let bare = bare_parent.join(".git");
-    git(base, &["clone", "-q", "--bare", repos.main.to_str().unwrap(), bare.to_str().unwrap()]);
+    git(base, &["clone", "-q", "--bare", &for_git(&repos.main), &for_git(&bare)]);
     let worktree = base.join("bare-wt");
-    git(&bare, &["worktree", "add", "-q", "-b", "bare-branch", worktree.to_str().unwrap()]);
+    git(&bare, &["worktree", "add", "-q", "-b", "bare-branch", &for_git(&worktree)]);
     assert!(worktree.join(".git").is_file());
     assert_eq!(main_checkout(&worktree), None);
 }
