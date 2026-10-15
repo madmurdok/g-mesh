@@ -129,7 +129,12 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     // GM-550: rust-analyzer's start-up phases can be separated by more than
     // the bridge's 2s settle under load (2.04s and 2.47s measured), so its
     // readiness is its own `quiescent` status rather than a quiet period.
-    Ok(Box::new(CheckedBridge::new(root, LspBridge::new(LANGUAGE, root, config).quiescent_signal())))
+    // rust-analyzer's own file watcher would rerun `cargo metadata` on a
+    // manifest change before `CheckedBridge` could re-check the configs, so
+    // the server is told the client watches files: it registers its globs
+    // here and reloads only when `CheckedBridge::workspace_changed` asks.
+    let bridge = LspBridge::new(LANGUAGE, root, config).quiescent_signal().client_watches_files();
+    Ok(Box::new(CheckedBridge::new(root, bridge)))
 }
 
 /// The engine [`engine`] returns: the bridge, behind a re-check of the cargo
@@ -140,8 +145,10 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
 /// a reload. [`SemanticEngine::workspace_changed`] asks for that reload only
 /// after a clean re-check. A hostile or unreadable config stops the server
 /// and makes every later pass `Err`: the plugin is structural-only from then
-/// on. rust-analyzer's own reload on a manifest change (`cargo.autoreload`,
-/// left on) is not gated by this check.
+/// on. rust-analyzer runs no watcher of its own (the bridge claims client
+/// file watching and forwards no file events), so a reload happens only at
+/// start-up and when [`SemanticEngine::workspace_changed`] asks for one, each
+/// after a clean re-check.
 struct CheckedBridge {
     root: PathBuf,
     /// `None` once refused: dropping the bridge shuts its server down.

@@ -543,6 +543,9 @@ pub struct LspBridge {
     /// Whether readiness reads the server's `experimental/serverStatus`
     /// `quiescent` bit - see [`LspBridge::quiescent_signal`].
     quiescent_signal: bool,
+    /// Whether the server is told this client watches files - see
+    /// [`LspBridge::client_watches_files`].
+    client_watches_files: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -596,6 +599,21 @@ impl LspBridge {
         self
     }
 
+    /// Tells the server this client watches files for it
+    /// (`workspace.didChangeWatchedFiles.dynamicRegistration`), so a server
+    /// that would otherwise run its own file watcher registers its globs
+    /// with the client instead. The bridge forwards no file events, so the
+    /// server reacts to a change on disk only when the plugin asks it to
+    /// (for rust-analyzer, `rust-analyzer/reloadWorkspace` through
+    /// [`LspBridge::request`]): for a plugin that must vet a change before
+    /// the server may react to it. Documents the bridge opens are still
+    /// synced as before.
+    #[must_use]
+    pub fn client_watches_files(mut self) -> Self {
+        self.client_watches_files = true;
+        self
+    }
+
     /// Sends `method` with `params` to the running server as a request whose
     /// answer nobody waits for: a pass's poll loop drops an answer to an id
     /// it did not ask. For a plugin that must tell its server something the
@@ -632,6 +650,7 @@ impl LspBridge {
             trimmed: BTreeMap::new(),
             core_deadline: None,
             quiescent_signal: false,
+            client_watches_files: false,
         }
     }
 
@@ -689,8 +708,14 @@ impl LspBridge {
                 return None;
             }
             self.starts += 1;
-            match LspClient::start(&self.language, &self.config, &self.root, deadline, self.quiescent_signal)
-            {
+            match LspClient::start(
+                &self.language,
+                &self.config,
+                &self.root,
+                deadline,
+                self.quiescent_signal,
+                self.client_watches_files,
+            ) {
                 Ok(client) => self.client = Some(client),
                 Err(err) => {
                     self.start_failure = Some(format!(

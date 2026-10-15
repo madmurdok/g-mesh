@@ -41,10 +41,13 @@ rust-analyzer's `cargo.extraEnv`, did not stop it.
   again before every pass, server start and `workspaceChanged` (which
   then asks rust-analyzer to reload); a config that turns hostile later
   stops the server and leaves the plugin structural-only for the rest of
-  the process. rust-analyzer's own reload on a manifest change
-  (`cargo.autoreload`) is still on and not gated by the check, so a config
-  added together with a manifest edit can reach `cargo metadata` before
-  the next re-check, until the sandbox (D2) contains it.
+  the process. rust-analyzer runs no file watcher of its own: the bridge
+  claims client file watching (`didChangeWatchedFiles` dynamic
+  registration, with rust-analyzer's default `files.watcher = "client"`)
+  and forwards no file events, so a manifest or config edit reaches
+  `cargo metadata` only through the reload `workspaceChanged` asks for
+  after a clean re-check. A config added together with a manifest edit is
+  therefore refused before rust-analyzer reloads.
 - **D3 - the key list is broad:** `DYLD_INSERT_LIBRARIES`,
   `DYLD_FRAMEWORK_PATH`, `DYLD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`,
   `LD_LIBRARY_PATH`.

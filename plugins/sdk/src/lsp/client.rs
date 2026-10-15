@@ -196,6 +196,9 @@ pub(crate) struct LspClient {
     /// `experimental/serverStatus` notification and reads its `quiescent`
     /// bit as readiness (GM-550) - see [`LspClient::settle`].
     quiescent_signal: bool,
+    /// Whether `initialize` claims `workspace.didChangeWatchedFiles`
+    /// dynamic registration - see [`super::bridge::LspBridge::client_watches_files`].
+    client_watches_files: bool,
     /// The `quiescent` bit of the last `experimental/serverStatus` the server
     /// sent, or `None` while it has sent none. Read only when
     /// [`quiescent_signal`](LspClient::quiescent_signal) is set.
@@ -225,6 +228,7 @@ impl LspClient {
         root: &Path,
         deadline: Instant,
         quiescent_signal: bool,
+        client_watches_files: bool,
     ) -> Result<Self> {
         let mut command = Command::new(&config.command);
         command
@@ -283,6 +287,7 @@ impl LspClient {
             closed: false,
             warmed_up: false,
             quiescent_signal,
+            client_watches_files,
             quiescent: None,
             reloading: false,
         };
@@ -324,6 +329,16 @@ impl LspClient {
             // `quiescent: false` from the first moment it starts loading the
             // project until it has loaded it and primed its caches (GM-550).
             params["capabilities"]["experimental"] = json!({ "serverStatusNotification": true });
+        }
+        if self.client_watches_files {
+            // A server that would otherwise watch the project itself
+            // (rust-analyzer with `files.watcher = "client"`, its default)
+            // registers its globs with this client instead. The registration
+            // request is answered `null` like every other one, and no file
+            // event is ever forwarded on its strength: the server reacts to a
+            // change on disk only when the plugin asks it to.
+            params["capabilities"]["workspace"]["didChangeWatchedFiles"] =
+                json!({ "dynamicRegistration": true });
         }
         if let Some(options) = &config.initialization_options {
             params["initializationOptions"] = options.clone();
@@ -780,8 +795,10 @@ impl Drop for LspClient {
 ///
 /// Everything else gets `null`, which covers
 /// `window/workDoneProgress/create` (an acknowledgement),
-/// `client/registerCapability` (this client registers nothing dynamically,
-/// and saying so is better than not answering) and whatever a future server
+/// `client/registerCapability` (an acknowledgement: a server registering
+/// file watchers with a bridge built with
+/// [`client_watches_files`](super::bridge::LspBridge::client_watches_files)
+/// is told yes and then hears only what the plugin forwards) and whatever a future server
 /// invents. None of these is language-specific: they are base-protocol
 /// methods.
 ///
@@ -906,8 +923,14 @@ mod tests {
         ];
         config.env.insert("NoDefaultCurrentDirectoryInExePath".to_string(), "0".to_string());
 
-        let started =
-            LspClient::start("test", &config, dir.path(), Instant::now() + Duration::from_secs(30), false);
+        let started = LspClient::start(
+            "test",
+            &config,
+            dir.path(),
+            Instant::now() + Duration::from_secs(30),
+            false,
+            false,
+        );
         assert!(started.is_err(), "a server that exits at once is not a client");
 
         let deadline = Instant::now() + Duration::from_secs(10);
