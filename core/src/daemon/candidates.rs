@@ -354,14 +354,50 @@ pub(crate) fn segments(path: &str) -> Vec<&str> {
     path.split(['/', '\\']).filter(|s| !s.is_empty() && *s != ".").collect()
 }
 
-/// `path` below `root`, compared by components. `root` is canonical, so a
-/// spelling of it that differs textually (a symlink, or on Windows the `\\?\`
-/// prefix `canonicalize` adds) is retried canonicalized.
+/// `path` below `root`, compared by components. On Windows it is then
+/// compared by segments ([`windows_segments_below`]): a verbatim path treats
+/// only `\\` as a separator, so `\\?\C:\root/group/c` has no component
+/// `group`. `root` is canonical, so a spelling of it that differs otherwise
+/// (a symlink, an 8.3 short name, a `..`) is retried canonicalized.
 pub(crate) fn relative_to_root(root: &Path, path: &Path) -> Option<PathBuf> {
     if let Ok(rel) = path.strip_prefix(root) {
         return Some(rel.to_path_buf());
     }
+    if cfg!(windows) {
+        let (root, path_text) = (root.to_string_lossy(), path.to_string_lossy());
+        let below = windows_segments_below(&root, &path_text);
+        if let Some(below) = below.filter(|below| !below.contains(&"..")) {
+            return Some(PathBuf::from(below.join("/")));
+        }
+    }
     path.canonicalize().ok()?.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+/// `path`'s segments below `root`'s, both read as Windows paths whatever the
+/// host: split on `/` and `\\` alike, with the verbatim prefix (`\\?\`, or
+/// `\\?\UNC\` for a share) dropped and drive letters compared ignoring
+/// case. A share path matches only a share root, so `\\srv\share` is not
+/// `\srv\share` on the current drive. `None` when `root`'s segments do not
+/// begin `path`'s.
+pub(crate) fn windows_segments_below<'a>(root: &str, path: &'a str) -> Option<Vec<&'a str>> {
+    fn parts(path: &str) -> (bool, Vec<&str>) {
+        let (unc, rest) = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            (true, rest)
+        } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+            (false, rest)
+        } else {
+            let mut chars = path.chars();
+            let separator = |c: Option<char>| matches!(c, Some('/' | '\\'));
+            (separator(chars.next()) && separator(chars.next()), path)
+        };
+        (unc, segments(rest))
+    }
+    let same = |a: &&str, b: &&str| a == b || (a.len() == 2 && a.ends_with(':') && a.eq_ignore_ascii_case(b));
+    let (root_unc, root) = parts(root);
+    let (path_unc, path) = parts(path);
+    let begins =
+        root_unc == path_unc && path.len() >= root.len() && root.iter().zip(&path).all(|(a, b)| same(a, b));
+    begins.then(|| path[root.len()..].to_vec())
 }
 
 /// The candidate `project` names, found by probing that one path rather than
