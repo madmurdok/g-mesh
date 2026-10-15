@@ -4058,6 +4058,223 @@ fn only_a_signalled_bridge_asks_for_the_server_status() {
     }
 }
 
+/// Only a bridge built with `client_watches_files` claims
+/// `workspace.didChangeWatchedFiles` dynamic registration, which is what
+/// tells rust-analyzer not to run its own file watcher; every other bridge
+/// sends the workspace capabilities it always sent.
+///
+/// Control: make `client_watches_files` default to `true` in
+/// `LspBridge::with_budgets`; the plain arm claims it too.
+#[test]
+fn only_a_bridge_that_opts_in_claims_client_file_watching() {
+    for opted_in in [true, false] {
+        let scratch = Scratch::new(if opted_in { "watch-claimed" } else { "watch-not-claimed" });
+        let (index, _) = fixture(&scratch);
+        let out = scratch.path().join("workspace.json");
+        let config = scratch.server(json!({
+            "readiness": { "kind": "none" },
+            "positionEncoding": "utf-16",
+            "answers": answers_the_site(&scratch),
+            "workspaceCapabilitiesOut": out.to_string_lossy(),
+        }));
+        let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+        if opted_in {
+            bridge = bridge.client_watches_files();
+        }
+
+        assert!(pass(&mut bridge, &index).complete);
+        let workspace: Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).expect("the server saw an initialize"))
+                .unwrap();
+        let mut expected = json!({ "configuration": true, "workspaceFolders": true });
+        if opted_in {
+            expected["didChangeWatchedFiles"] = json!({ "dynamicRegistration": true });
+        }
+        assert_eq!(workspace, expected, "opted_in = {opted_in}");
+    }
+}
+
+/// What the scripted server was told about files changing on disk, from its
+/// `fileEventsLog`, in arrival order, with the scratch root cut off the URIs:
+/// `watched <type> src/a.toy` (2 changed, 3 deleted) and `didChange src/b.toy`.
+fn file_events(scratch: &Scratch, log: &Path) -> Vec<String> {
+    let roots = [scratch.uri(""), scratch.real_uri("")];
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| roots.iter().fold(line.to_string(), |line, root| line.replace(root.as_str(), "")))
+        .collect()
+}
+
+fn sorted(mut events: Vec<String>) -> Vec<String> {
+    events.sort();
+    events
+}
+
+/// A server that watches no files itself (the bridge claims client file
+/// watching) hears of a change on disk only from the bridge: every file a
+/// pass is sent is announced as `workspace/didChangeWatchedFiles`, `Changed`
+/// when it is on disk and `Deleted` when it is gone. A file the server holds
+/// open is re-synced with `didChange` instead, even when the pass asks
+/// nothing in it: the server reads an open file from the client, not from
+/// disk.
+///
+/// Control: in `LspBridge::forward_watched`, announce an open file like any
+/// other (`if false` for the `opened` check).
+#[test]
+fn a_watching_bridge_announces_the_files_a_pass_is_sent_and_resyncs_open_ones() {
+    let scratch = Scratch::new("watched-forward");
+    let (mut index, _) = fixture(&scratch);
+    let events = scratch.path().join("events.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "fileEventsLog": events.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    let b = RelPath::new("src/b.toy");
+    let first = bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
+    assert_eq!(semantic_edges(&first).len(), 1, "the first pass opens b.toy: {:#?}", first.diff);
+    let before = file_events(&scratch, &events).len();
+
+    // b.toy loses its call: still open on the server, and asked nothing now.
+    // c.toy is new and has a call, so the pass reaches the server; gone.toy
+    // was deleted.
+    let b_source = "fn caller\n";
+    scratch.write("src/b.toy", b_source);
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &b);
+    builder.file_node(range(0, 0, 1, 0));
+    builder.add_node(
+        NodeSpec::new(NodeKind::Function, "caller", "caller", range(0, 0, 0, 9))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    index.insert(b.clone(), b_source.to_string(), builder.finish());
+    crowd_file(&scratch, &mut index, "src/c.toy", 1);
+    let files = ["src/a.toy", "src/b.toy", "src/c.toy", "src/gone.toy"].map(RelPath::new);
+    bridge.answer(&files, &index).expect("the bridge answers");
+
+    let second = file_events(&scratch, &events).split_off(before);
+    assert_eq!(
+        sorted(second.clone()),
+        ["didChange src/b.toy", "watched 2 src/a.toy", "watched 2 src/c.toy", "watched 3 src/gone.toy"],
+        "what the second pass told the server: {second:?}"
+    );
+}
+
+/// A bridge whose plugin never claimed client file watching announces
+/// nothing: its server watches the project itself (or the plugin has no use
+/// for the announcement), so the files a pass is sent, changed, new or
+/// deleted, are not forwarded as `workspace/didChangeWatchedFiles`. The
+/// TypeScript and Python plugins rely on this opt-in alone.
+///
+/// Control: in `LspBridge::answer`, queue the files a pass is sent whether or
+/// not the bridge opted in (`if true` for the `client_watches_files` check).
+#[test]
+fn a_bridge_that_does_not_watch_files_announces_nothing() {
+    let scratch = Scratch::new("watched-optout");
+    let (index, _) = fixture(&scratch);
+    let events = scratch.path().join("events.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "fileEventsLog": events.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+
+    // The first pass opens b.toy; the second is sent a file the server does
+    // not hold (a.toy), a deleted one and one that was never indexed.
+    let b = RelPath::new("src/b.toy");
+    let first = bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
+    assert_eq!(semantic_edges(&first).len(), 1, "the pass reaches the server: {:#?}", first.diff);
+    let files = ["src/a.toy", "src/b.toy", "src/gone.toy"].map(RelPath::new);
+    bridge.answer(&files, &index).expect("the bridge answers");
+    assert!(pass(&mut bridge, &index).complete);
+
+    let watched: Vec<String> =
+        file_events(&scratch, &events).into_iter().filter(|event| event.starts_with("watched")).collect();
+    assert!(watched.is_empty(), "a bridge that never opted in announced files: {watched:?}");
+}
+
+/// A pass that reaches no server - nothing to ask in its files, or none of
+/// them indexed any more - has no one to tell about them: the files stay
+/// pending, and the next pass that reaches the server announces them.
+///
+/// Control: on `LspBridge::answer`'s nothing-to-ask return, drop the pending
+/// files (`self.unforwarded.clear()`).
+#[test]
+fn files_a_serverless_pass_was_sent_are_announced_by_the_next_pass_that_reaches_the_server() {
+    let scratch = Scratch::new("watched-carry");
+    let (index, _) = fixture(&scratch);
+    let events = scratch.path().join("events.log");
+    let log = scratch.path().join("asked.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "fileEventsLog": events.to_string_lossy(),
+        "log": log.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+
+    // a.toy has no call site; gone.toy is not in the index.
+    for file in ["src/a.toy", "src/gone.toy"] {
+        let answer = bridge.answer(&[RelPath::new(file)], &index).expect("the bridge answers");
+        assert!(answer.complete, "{file}: {:?}", answer.reason);
+    }
+    assert_eq!(asked(&log, "initialize"), 0, "neither pass started a server");
+
+    bridge.answer(&[RelPath::new("src/b.toy")], &index).expect("the bridge answers");
+    let told = file_events(&scratch, &events);
+    assert_eq!(
+        sorted(told.clone()),
+        ["watched 2 src/a.toy", "watched 2 src/b.toy", "watched 3 src/gone.toy"],
+        "what the server was told once a pass reached it: {told:?}"
+    );
+}
+
+/// Only the files core sends a pass are announced, and a manifest or a
+/// config is never one of them: a whole-project pass (sent no files)
+/// announces nothing, and neither does a workspace change. A server that
+/// watches nothing itself hears of such an edit only when its plugin asks
+/// it to reload, which is how the Rust plugin keeps a reload behind its
+/// re-check of the cargo configs.
+///
+/// Control: make `LspBridge::workspace_changed` queue every file at the
+/// project root as pending.
+#[test]
+fn a_watching_bridge_never_announces_a_manifest_or_a_config() {
+    let scratch = Scratch::new("watched-manifest");
+    let (index, _) = fixture(&scratch);
+    std::fs::create_dir_all(scratch.path().join(".cargo")).unwrap();
+    scratch.write("Cargo.toml", "[package]\nname = \"toy\"\n");
+    scratch.write(".cargo/config.toml", "[env]\n");
+    let events = scratch.path().join("events.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "fileEventsLog": events.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    assert!(pass(&mut bridge, &index).complete);
+
+    scratch.write("Cargo.toml", "[package]\nname = \"toy\"\nversion = \"0.2.0\"\n");
+    scratch.write(".cargo/config.toml", "[env]\nTOY = \"1\"\n");
+    bridge.workspace_changed();
+    assert!(pass(&mut bridge, &index).complete);
+    // b.toy is open (asked by the whole-project passes), a.toy is not: the
+    // one announcement is a.toy's, which shows the log does record them.
+    let files = ["src/a.toy", "src/b.toy"].map(RelPath::new);
+    bridge.answer(&files, &index).expect("the bridge answers");
+
+    let told = file_events(&scratch, &events);
+    assert_eq!(told, ["watched 2 src/a.toy"], "only a file a pass was sent is announced");
+}
+
 /// The GM-550 flake: rust-analyzer under load paused longer than the settle
 /// between two start-up phases, and the bridge called it ready in the gap.
 /// Here the gap (2.5s) is longer than the settle (2s), as measured, and the

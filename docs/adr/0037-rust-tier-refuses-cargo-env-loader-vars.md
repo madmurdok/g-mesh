@@ -35,6 +35,28 @@ rust-analyzer's `cargo.extraEnv`, did not stop it.
   (`plugins/rust/src/semantic.rs`, `engine` and `cargo_env_loader_var`).
   A config that does not parse is matched by text, so a syntax the plugin's
   TOML parser rejects and cargo accepts cannot hide a key.
+  The check fails closed: a config path that exists but cannot be `stat`ed
+  or read (any error but "not found"), or is not a regular file, refuses
+  the tier the same way, naming the file and the error. The check runs
+  again before every pass, server start and `workspaceChanged` (which
+  then asks rust-analyzer to reload); a config that turns hostile later
+  stops the server and leaves the plugin structural-only for the rest of
+  the process. rust-analyzer runs no file watcher of its own: the bridge
+  claims client file watching (`didChangeWatchedFiles` dynamic
+  registration, with rust-analyzer's default `files.watcher = "client"`)
+  and forwards, as `workspace/didChangeWatchedFiles`, only the `.rs` files
+  core sends a pass, inside the checked pass. rust-analyzer refetches the
+  workspace (`cargo metadata`) on a created or deleted file of any kind and
+  on a `Cargo.toml`, `Cargo.lock` or `.cargo/config*` change, but not on an
+  edit to an existing `.rs` file (`should_refresh_for_change` and
+  `process_changes`, rust-analyzer 1.97.1), so every forwarded event is
+  sent after a clean re-check. A manifest or config edit is never
+  forwarded: it reaches `cargo metadata` only through the reload
+  `workspaceChanged` asks for after a clean re-check. A config added
+  together with a manifest edit is therefore refused before rust-analyzer
+  reloads. Without the forwarding, an edit to a file no pass asks about
+  never reached the server, and answers in files that depend on it went
+  stale.
 - **D3 - the key list is broad:** `DYLD_INSERT_LIBRARIES`,
   `DYLD_FRAMEWORK_PATH`, `DYLD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`,
   `LD_LIBRARY_PATH`.
