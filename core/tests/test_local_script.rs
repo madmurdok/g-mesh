@@ -130,7 +130,7 @@ fn run_local(args: &[&str], extra_env: &[(&str, &str)]) -> (Output, Vec<Call>) {
 const SCRIPT_TOOLS: &[&str] = &[
     "bash", "env", "git", "sed", "awk", "grep", "tr", "cat", "dirname", "basename", "mkdir", "rm", "mv",
     "ls", "find", "stat", "date", "diff", "mktemp", "rev", "python3", "python", "tee", "sleep", "kill",
-    "sort", "uniq", "wc", "head", "tail", "cut", "xargs", "cp", "touch",
+    "sort", "uniq", "wc", "head", "tail", "cut", "xargs", "cp", "touch", "uname",
 ];
 
 /// `run_local` that also returns the stand-in `go`'s calls (`<cwd>|<args>`).
