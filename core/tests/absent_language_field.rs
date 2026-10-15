@@ -348,8 +348,11 @@ async fn the_field_appears_after_a_plugin_is_removed_mid_session() {
         !daemon::is_listening(&a).unwrap_or(true)
     });
 
+    // Two distinct selections contest the connection (D3 of GM-571), so the
+    // call names its project.
     select(&client, "a").await;
-    let after = call(&client, "get_file_outline", json!({ "file_path": "tools/gen.py" })).await;
+    let after =
+        call(&client, "get_file_outline", json!({ "file_path": "tools/gen.py", "project": "a" })).await;
     assert_absent_refusal(&after, "g-mesh: no file 'tools/gen.py' found in the index");
 
     client.cancel().await.expect("failed to shut the client down");

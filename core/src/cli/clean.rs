@@ -23,8 +23,8 @@
 //! criterion is far less conservative: "the project directory is not there"
 //! is a fact about this instant, where "idle for 90 days" is a fact about a
 //! quarter of a year. The preview is what lets a caller notice that the
-//! answer changed because a disk is unmounted - see `RootState` for the rest
-//! of that guard.
+//! answer changed because a disk is unmounted or a directory unreadable - see
+//! `RootState` for the rest of that guard.
 //!
 //! None of this is dangerous by construction, and for the same reason schema
 //! versioning can wipe and rebuild: an index is a reproducible local cache,
@@ -41,7 +41,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -236,13 +236,18 @@ fn clean_many(scope: Scope, projects_root: &Path, idle_threshold_days: u64) -> R
 /// What the recorded project root of a state directory says about it.
 ///
 /// The distinction that carries the whole risk of this command is the last
-/// two. A root that is missing *along with the directory that contained it*
-/// is exactly what an unmounted external disk looks like: `/Volumes/Ext/proj`
-/// and `/Volumes/Ext` both vanish when the disk is ejected, while deleting a
-/// project on a filesystem that is still mounted leaves its parent in place.
-/// Treating "not present right now" as "gone forever" is the one way this
-/// feature could destroy an index someone wanted, so an absent parent is
-/// reported and never deleted.
+/// two. "Not present right now" is not "gone forever": `stat` fails for a
+/// missing directory, but also for a permission change on an ancestor and for
+/// a volume that is not mounted. Only these read as deleted (GM-565):
+///
+/// - `stat(root)` fails with `NotFound` (any other error is `Unreachable`);
+/// - the parent is a readable directory; and
+/// - on Unix, the parent is on the device the root was recorded on
+///   (`project.dev`). A deleted directory leaves its parent on its own
+///   filesystem; an unmounted volume leaves a parent on another one
+///   (`/Volumes` for `/Volumes/Ext`, the empty mount point for
+///   `/mnt/ext/proj`). A root recorded without a device is not judged on
+///   Unix.
 ///
 /// Deleting a whole tree of projects at once therefore also reads as
 /// `Unreachable`. That is the trade accepted knowingly: those are cleaned by
@@ -252,12 +257,14 @@ fn clean_many(scope: Scope, projects_root: &Path, idle_threshold_days: u64) -> R
 pub(crate) enum RootState {
     /// The project is still on disk.
     Live,
-    /// The project directory is gone, but the directory that held it is
-    /// still there - so the filesystem it lived on is present and it really
-    /// was deleted.
+    /// The project directory is gone (`NotFound`), but the directory that
+    /// held it is still there, on the filesystem the root was recorded on -
+    /// so it really was deleted.
     Orphaned,
-    /// The root is missing and so is its parent: possibly deleted, possibly
-    /// an unmounted volume or a moved tree. Not judged.
+    /// Possibly deleted, possibly not: the root's `stat` failed for a reason
+    /// other than `NotFound` (permissions, I/O), its parent is missing or
+    /// unreadable, the parent is on another device than the root was (an
+    /// unmounted volume), or no device was recorded. Not judged.
     Unreachable,
     /// No `project.root` file - a state directory created before g-mesh
     /// recorded roots. Not judged, and never guessed at: `project_hash` is
@@ -265,17 +272,36 @@ pub(crate) enum RootState {
     Legacy,
 }
 
-pub(crate) fn root_state(root: Option<&Path>) -> RootState {
+/// Judges a recorded root against the disk; see [`RootState`] for the rules.
+/// `device` is the recorded `project.dev` ([`daemon::identity::read_root_device`]).
+pub(crate) fn root_state(root: Option<&Path>, device: Option<u64>) -> RootState {
     let Some(root) = root else {
         return RootState::Legacy;
     };
-    if root.exists() {
-        return RootState::Live;
+    match fs::metadata(root) {
+        Ok(_) => return RootState::Live,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return RootState::Unreachable,
     }
-    match root.parent() {
-        Some(parent) if parent.exists() => RootState::Orphaned,
-        _ => RootState::Unreachable,
+    let Some(parent) = root.parent() else {
+        return RootState::Unreachable;
+    };
+    let Ok(parent_meta) = fs::metadata(parent) else {
+        return RootState::Unreachable;
+    };
+    if !parent_meta.is_dir() {
+        return RootState::Unreachable;
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if device != Some(parent_meta.dev()) {
+            return RootState::Unreachable;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = device;
+    RootState::Orphaned
 }
 
 /// `clean orphaned`: deletes state whose project directory was deleted.
@@ -290,7 +316,7 @@ fn clean_orphaned(force: bool, projects_root: &Path) -> Result<Outcome> {
 
     for candidate in candidates(projects_root)? {
         let entry = || Orphan { id: candidate.id.clone(), root: candidate.root.clone().unwrap_or_default() };
-        match root_state(candidate.root.as_deref()) {
+        match root_state(candidate.root.as_deref(), candidate.device) {
             RootState::Live => continue,
             RootState::Legacy => legacy += 1,
             RootState::Unreachable => unreachable.push(entry()),
@@ -324,6 +350,27 @@ pub(crate) enum Purge {
     Kept(&'static str),
 }
 
+/// How [`purge_orphaned_state_dir`] treats a lock someone else holds: the
+/// project's bootstrap lock, or the daemon's singleton lock it probes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LockWait {
+    /// Try once and keep the directory if either lock is busy. The shim's
+    /// startup sweep uses this, so it never stalls a shim's start.
+    Try,
+    /// Poll for both locks for up to this long, one deadline for the two.
+    /// The daemon's own purge uses this: a sweeper holding the bootstrap lock
+    /// is about to delete the same directory (or died mid-delete and left the
+    /// rest), and a sweeper judging the directory holds the singleton lock
+    /// for the instant of its probe; giving up at once on either would let
+    /// the daemon exit with its state still on disk. A daemon that really is
+    /// running holds the singleton lock for good, so that wait ends in
+    /// `Kept` at the deadline.
+    UpTo(Duration),
+}
+
+/// How often [`LockWait::UpTo`] retries a busy bootstrap or singleton lock.
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(15);
+
 /// Deletes one project's state directory, but only under the rules
 /// `clean orphaned --force` applies to it: its recorded root is
 /// [`RootState::Orphaned`] (gone, while the directory that held it is not -
@@ -334,23 +381,49 @@ pub(crate) enum Purge {
 /// Taken under the project's bootstrap lock, then re-judged: a shim can only
 /// bootstrap a project whose root exists (`project_hash` canonicalizes it), so
 /// a root recreated between the first look and the lock is seen by the second
-/// one and the directory kept. The lock is only *tried*: a shim holding it is
-/// bootstrapping this project right now, which is reason enough to keep it.
+/// one and the directory kept. `wait` says what a busy lock means: under
+/// [`LockWait::Try`] a shim holding the bootstrap lock may be bootstrapping
+/// this project, and a held singleton lock may be a running daemon, either of
+/// which is reason enough to keep it; under [`LockWait::UpTo`] both are polled
+/// until free or the bound runs out, because another process's sweep probes
+/// the singleton lock (a brief `try_lock`) and holds the bootstrap lock while
+/// it deletes. A live pid file is never waited for. A directory that is gone
+/// once the bootstrap lock is taken was deleted by whoever held it, which is
+/// the outcome asked for.
 ///
 /// Shared by the daemon's own purge on `ProjectRootGone`
 /// (`daemon::lifecycle::purge_state_dir`, GM-524 D1) and the shim's startup
 /// sweep ([`sweep_orphaned`]), so the two can never disagree with
 /// `clean orphaned` on what is safe to delete.
-pub(crate) fn purge_orphaned_state_dir(state_dir: &Path) -> Result<Purge> {
+pub(crate) fn purge_orphaned_state_dir(state_dir: &Path, wait: LockWait) -> Result<Purge> {
+    const RUNNING: &str = "a daemon or plugin is still running for it";
+    let deadline = match wait {
+        LockWait::Try => None,
+        LockWait::UpTo(bound) => Some(Instant::now() + bound),
+    };
+    // `None` when the directory may go; a held singleton lock is polled under
+    // `UpTo`, since a sweeper's probe holds it for an instant.
     let judge = || -> Option<Purge> {
-        let root = daemon::identity::read_project_root(state_dir);
-        if root_state(root.as_deref()) != RootState::Orphaned {
-            return Some(Purge::Kept("its project root exists, is unreachable, or is not recorded"));
+        loop {
+            let root = daemon::identity::read_project_root(state_dir);
+            let device = daemon::identity::read_root_device(state_dir);
+            if root_state(root.as_deref(), device) != RootState::Orphaned {
+                return Some(Purge::Kept("its project root exists, is unreachable, or is not recorded"));
+            }
+            if daemon_is_running(state_dir) {
+                return Some(Purge::Kept(RUNNING));
+            }
+            if !singleton_lock_is_held(state_dir) {
+                return None;
+            }
+            match deadline {
+                None => return Some(Purge::Kept(RUNNING)),
+                Some(deadline) if Instant::now() >= deadline => {
+                    return Some(Purge::Kept("a daemon or plugin held its singleton lock past the wait"));
+                }
+                Some(_) => std::thread::sleep(LOCK_POLL_INTERVAL),
+            }
         }
-        if daemon_is_running(state_dir) || singleton_lock_is_held(state_dir) {
-            return Some(Purge::Kept("a daemon or plugin is still running for it"));
-        }
-        None
     };
     if let Some(kept) = judge() {
         return Ok(kept);
@@ -364,12 +437,28 @@ pub(crate) fn purge_orphaned_state_dir(state_dir: &Path) -> Result<Purge> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Purge::Deleted),
         Err(err) => return Err(err).with_context(|| format!("failed to open {}", lock_path.display())),
     };
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(fs::TryLockError::WouldBlock) => return Ok(Purge::Kept("a shim is bootstrapping it")),
-        Err(fs::TryLockError::Error(err)) => {
-            return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => match deadline {
+                None => return Ok(Purge::Kept("a shim is bootstrapping it")),
+                Some(deadline) if Instant::now() >= deadline => {
+                    return Ok(Purge::Kept("a shim held its bootstrap lock past the wait"));
+                }
+                Some(_) => std::thread::sleep(LOCK_POLL_INTERVAL),
+            },
+            Err(fs::TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+            }
         }
+    }
+    // The lock is taken on a file opened before whoever held it deleted the
+    // directory, so a gone directory must be told apart here: re-judged, it
+    // would read as "not recorded" and be reported as kept.
+    match fs::symlink_metadata(state_dir) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Purge::Deleted),
+        Err(err) => return Err(err).with_context(|| format!("failed to stat {}", state_dir.display())),
     }
     if let Some(kept) = judge() {
         return Ok(kept);
@@ -382,16 +471,20 @@ pub(crate) fn purge_orphaned_state_dir(state_dir: &Path) -> Result<Purge> {
     Ok(Purge::Deleted)
 }
 
-/// [`delete`], with `project.root` removed only after everything else. A
-/// delete cut short (a shim that exits mid-sweep, a daemon killed mid-purge)
-/// then leaves a directory that still reads as orphaned and is finished by the
-/// next sweep, never one without its root record, which would be
-/// [`RootState::Legacy`] and kept forever.
+/// [`delete`], with `project.root` and `project.dev` removed only after
+/// everything else, in that order. A delete cut short (a shim that exits
+/// mid-sweep, a daemon killed mid-purge) then leaves a directory that still
+/// reads as orphaned and is finished by the next sweep, never one without its
+/// root record, which would be [`RootState::Legacy`] and kept forever. An
+/// interruption between the last two removals leaves only `project.dev`: it
+/// reads `Legacy` and is kept (a few bytes, accepted).
 fn delete_root_record_last(state_dir: &Path) -> Result<()> {
     let entries =
         fs::read_dir(state_dir).with_context(|| format!("failed to read {}", state_dir.display()))?;
     for entry in entries.flatten() {
-        if entry.file_name() == daemon::identity::ROOT_FILE {
+        if entry.file_name() == daemon::identity::ROOT_FILE
+            || entry.file_name() == daemon::identity::DEVICE_FILE
+        {
             continue;
         }
         let path = entry.path();
@@ -404,6 +497,13 @@ fn delete_root_record_last(state_dir: &Path) -> Result<()> {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err).with_context(|| format!("failed to delete {}", path.display())),
+        }
+    }
+    for name in [daemon::identity::ROOT_FILE, daemon::identity::DEVICE_FILE] {
+        match fs::remove_file(state_dir.join(name)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("failed to delete {name}")),
         }
     }
     delete(state_dir)
@@ -445,7 +545,7 @@ pub(crate) fn sweep_orphaned(projects_root: &Path) -> Result<usize> {
         if !is_project_id || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        match purge_orphaned_state_dir(&entry.path()) {
+        match purge_orphaned_state_dir(&entry.path(), LockWait::Try) {
             Ok(Purge::Deleted) => deleted += 1,
             Ok(Purge::Kept(_)) => {}
             Err(err) => {
@@ -544,6 +644,9 @@ struct Candidate {
     /// The project root this directory records, or `None` if it records none
     /// - see [`RootState::Legacy`].
     root: Option<PathBuf>,
+    /// The device id recorded beside the root, if any - see
+    /// [`daemon::identity::DEVICE_FILE`].
+    device: Option<u64>,
 }
 
 impl Candidate {
@@ -581,6 +684,7 @@ fn candidates(projects_root: &Path) -> Result<Vec<Candidate>> {
             idle: last_used::read_from_project_dir(&path).unwrap_or(None).map(|record| record.idle),
             daemon_running: daemon_is_running(&path),
             root: daemon::identity::read_project_root(&path),
+            device: daemon::identity::read_root_device(&path),
             id,
             path,
         });
@@ -675,9 +779,9 @@ pub fn render(outcome: &Outcome) -> String {
             if !unreachable.is_empty() {
                 let _ = writeln!(
                     out,
-                    "  left alone: {} project(s) whose root is missing along with the directory \
-                     that held it - an unmounted disk looks exactly like this. Delete one by id \
-                     if you are sure:",
+                    "  left alone: {} project(s) whose root is unreachable, unreadable, or on a \
+                     volume that is not mounted - none of these can be told from a deleted \
+                     project. Delete one by id if you are sure:",
                     unreachable.len()
                 );
                 for orphan in unreachable {
@@ -1200,13 +1304,21 @@ mod tests {
         let live = parent.path().join("live");
         fs::create_dir(&live).unwrap();
 
-        assert_eq!(root_state(Some(&live)), RootState::Live);
-        assert_eq!(root_state(Some(&parent.path().join("gone"))), RootState::Orphaned);
+        #[cfg(unix)]
+        let device = {
+            use std::os::unix::fs::MetadataExt;
+            Some(fs::metadata(parent.path()).unwrap().dev())
+        };
+        #[cfg(not(unix))]
+        let device = None;
+
+        assert_eq!(root_state(Some(&live), device), RootState::Live);
+        assert_eq!(root_state(Some(&parent.path().join("gone")), device), RootState::Orphaned);
         assert_eq!(
-            root_state(Some(&parent.path().join("unmounted").join("project"))),
+            root_state(Some(&parent.path().join("unmounted").join("project")), device),
             RootState::Unreachable
         );
-        assert_eq!(root_state(None), RootState::Legacy);
+        assert_eq!(root_state(None, device), RootState::Legacy);
     }
 
     #[test]
@@ -1251,7 +1363,7 @@ mod tests {
         assert!(rendered.contains("a1b2c3d4e5f6a7b8"), "{rendered}");
         assert!(rendered.contains("/home/u/work/deleted-project"), "{rendered}");
         assert!(rendered.contains("/Volumes/Ext/project"), "{rendered}");
-        assert!(rendered.contains("unmounted disk"), "{rendered}");
+        assert!(rendered.contains("volume that is not mounted"), "{rendered}");
         assert!(rendered.contains("7 project(s) indexed before"), "{rendered}");
     }
 
@@ -1362,5 +1474,440 @@ mod tests {
 
         assert_eq!(sweep_orphaned_if_due(fixture.home.path(), Duration::ZERO).unwrap(), Sweep::Busy);
         assert!(orphan.exists());
+    }
+
+    // -----------------------------------------------------------------
+    // Roots that are not present but were not deleted (GM-565)
+    // -----------------------------------------------------------------
+
+    /// The device id `path` is on right now.
+    #[cfg(unix)]
+    fn device_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().dev()
+    }
+
+    /// Restores a directory's mode on drop, so a panicking assertion cannot
+    /// leave a `chmod 000` directory the tempdir cleanup cannot remove.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Makes `dir` unsearchable. `None` when the process bypasses
+    /// permissions (running as root): the caller then has nothing to test
+    /// and says so instead of asserting nothing silently.
+    #[cfg(unix)]
+    fn make_unsearchable(dir: &Path, probe: &Path) -> Option<RestoreMode> {
+        use std::os::unix::fs::PermissionsExt;
+        let guard = RestoreMode(dir.to_path_buf());
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::metadata(probe).is_ok() {
+            eprintln!(
+                "note: {} is still readable after chmod 000 (running as root?); skipped",
+                probe.display()
+            );
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// Test 1: a root whose `stat` fails for a reason other than `NotFound`
+    /// (an ancestor lost its search permission) is not judged as deleted,
+    /// even though the root's parent itself still stats fine.
+    #[cfg(unix)]
+    #[test]
+    fn root_state_keeps_a_root_whose_parent_cannot_be_searched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("p");
+        let root = parent.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let state = tempfile::tempdir().unwrap();
+        daemon::identity::record_project_root(state.path(), &root).unwrap();
+        let recorded = daemon::identity::read_project_root(state.path()).unwrap();
+        let device = daemon::identity::read_root_device(state.path());
+
+        let Some(_restore) = make_unsearchable(&parent, &recorded) else {
+            return;
+        };
+
+        assert_eq!(root_state(Some(&recorded), device), RootState::Unreachable);
+    }
+
+    /// Test 2: the same unreadable root through the shim's sweep and through
+    /// `clean orphaned --force`: kept, and listed as unreachable.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_keeps_state_whose_root_is_only_unreadable() {
+        let projects = Projects::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("p");
+        let root = parent.join("root");
+        fs::create_dir_all(&root).unwrap();
+        projects.add("aaaa1111", 1);
+        projects.record_root("aaaa1111", &root);
+        let recorded = daemon::identity::read_project_root(&projects.root().join("aaaa1111")).unwrap();
+
+        let Some(_restore) = make_unsearchable(&parent, &recorded) else {
+            return;
+        };
+
+        assert_eq!(sweep_orphaned(projects.root()).unwrap(), 0);
+        assert!(projects.exists("aaaa1111"), "the sweep deleted state whose root is only unreadable");
+
+        let outcome = clean_in(&projects, Target::Orphaned, true).unwrap();
+        let Outcome::Orphaned { orphaned, unreachable, .. } = outcome else {
+            panic!("expected an orphaned outcome, got {outcome:?}");
+        };
+        assert!(orphaned.is_empty(), "{orphaned:?}");
+        assert_eq!(unreachable.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), ["aaaa1111"]);
+        assert!(projects.exists("aaaa1111"), "clean orphaned --force deleted an unreadable root's state");
+    }
+
+    /// Records `root` for `id`, deletes the root (its parent stays), and
+    /// overwrites the recorded device with one the parent is not on - the
+    /// shape both unmounted-volume layouts leave (`/Volumes/Ext` and
+    /// `/mnt/ext/proj`): the parent is now on another filesystem than the root
+    /// was. The value is computed from the real device, never a literal.
+    #[cfg(unix)]
+    fn record_then_unmount(projects: &Projects, id: &str, root: &Path) {
+        fs::create_dir(root).unwrap();
+        projects.record_root(id, root);
+        fs::remove_dir(root).unwrap();
+        let other = device_of(root.parent().unwrap()).wrapping_add(1);
+        fs::write(projects.root().join(id).join(daemon::identity::DEVICE_FILE), other.to_string()).unwrap();
+    }
+
+    /// Test 3: a missing root whose parent is on another device than the one
+    /// recorded is not judged; the same root with the real device is.
+    #[cfg(unix)]
+    #[test]
+    fn root_state_keeps_a_root_whose_parent_is_on_another_device() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("gone");
+        let real = device_of(parent.path());
+
+        assert_eq!(root_state(Some(&root), Some(real)), RootState::Orphaned);
+        assert_eq!(root_state(Some(&root), Some(real.wrapping_add(1))), RootState::Unreachable);
+    }
+
+    /// Test 4: the unmounted-volume shape through the shim's sweep and the
+    /// daemon's own purge; a really deleted sibling beside it still goes, so
+    /// the sweep is shown to run.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_keeps_state_of_a_project_on_an_unmounted_volume() {
+        let projects = Projects::new();
+        let parent = tempfile::tempdir().unwrap();
+        projects.add("aaaa1111", 1);
+        record_then_unmount(&projects, "aaaa1111", &parent.path().join("on-volume"));
+        let deleted = parent.path().join("deleted");
+        fs::create_dir(&deleted).unwrap();
+        projects.add("bbbb2222", 1);
+        projects.record_root("bbbb2222", &deleted);
+        fs::remove_dir(&deleted).unwrap();
+
+        assert!(matches!(
+            purge_orphaned_state_dir(&projects.root().join("aaaa1111"), LockWait::Try).unwrap(),
+            Purge::Kept(_)
+        ));
+        assert!(projects.exists("aaaa1111"));
+
+        assert_eq!(sweep_orphaned(projects.root()).unwrap(), 1);
+        assert!(projects.exists("aaaa1111"), "the sweep deleted state of a project on an unmounted volume");
+        assert!(!projects.exists("bbbb2222"), "the really deleted project's state survived");
+    }
+
+    /// Test 5 (D3): a root recorded before `project.dev` existed is not
+    /// judged on Unix, even when it reads exactly like a deletion.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_recorded_without_a_device_is_not_judged() {
+        let projects = Projects::new();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("gone");
+        fs::create_dir(&root).unwrap();
+        projects.add("aaaa1111", 1);
+        projects.record_root("aaaa1111", &root);
+        fs::remove_dir(&root).unwrap();
+        let state = projects.root().join("aaaa1111");
+        fs::remove_file(state.join(daemon::identity::DEVICE_FILE)).unwrap();
+
+        let recorded = daemon::identity::read_project_root(&state).unwrap();
+        assert_eq!(daemon::identity::read_root_device(&state), None);
+        assert_eq!(root_state(Some(&recorded), None), RootState::Unreachable);
+        assert!(matches!(purge_orphaned_state_dir(&state, LockWait::Try).unwrap(), Purge::Kept(_)));
+        assert!(projects.exists("aaaa1111"));
+    }
+
+    /// Test 8 (D4): a purge cut short after deleting everything but the two
+    /// root records leaves a directory that still reads as orphaned and is
+    /// finished by the next sweep. One cut between the last two removals
+    /// leaves only `project.dev`, which reads `Legacy` and is kept.
+    #[test]
+    fn an_interrupted_purge_is_finished_by_the_next_sweep() {
+        let projects = Projects::new();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("gone");
+        fs::create_dir(&root).unwrap();
+        projects.add_empty("aaaa1111");
+        projects.record_root("aaaa1111", &root);
+        fs::remove_dir(&root).unwrap();
+        let state = projects.root().join("aaaa1111");
+
+        let recorded = daemon::identity::read_project_root(&state);
+        let device = daemon::identity::read_root_device(&state);
+        assert_eq!(root_state(recorded.as_deref(), device), RootState::Orphaned);
+
+        let only_device = projects.add_empty("bbbb2222");
+        fs::write(only_device.join(daemon::identity::DEVICE_FILE), "1").unwrap();
+        assert_eq!(
+            root_state(daemon::identity::read_project_root(&only_device).as_deref(), Some(1)),
+            RootState::Legacy
+        );
+
+        assert_eq!(sweep_orphaned(projects.root()).unwrap(), 1);
+        assert!(!projects.exists("aaaa1111"), "the interrupted purge was not finished");
+        assert!(projects.exists("bbbb2222"), "a directory with only project.dev must be kept");
+    }
+
+    /// Optional real-volume proof (macOS, needs `hdiutil`, no root): index a
+    /// project on a mounted disk image, detach it, and check the sweep keeps
+    /// its state. Run by hand:
+    /// `cargo test -p g-mesh --lib -- --ignored a_project_on_a_detached_disk_image_is_kept`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "mounts a disk image with hdiutil; run by hand"]
+    fn a_project_on_a_detached_disk_image_is_kept() {
+        use std::process::Command;
+
+        struct Detach(PathBuf);
+        impl Drop for Detach {
+            fn drop(&mut self) {
+                let _ = Command::new("hdiutil").arg("detach").arg("-force").arg(&self.0).output();
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("vol.dmg");
+        let mount = tmp.path().join("vol");
+        fs::create_dir(&mount).unwrap();
+        let created = Command::new("hdiutil")
+            .args(["create", "-size", "2m", "-fs", "APFS", "-volname", "gm565"])
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{}", String::from_utf8_lossy(&created.stderr));
+        let attached = Command::new("hdiutil")
+            .args(["attach", "-nobrowse", "-mountpoint"])
+            .arg(&mount)
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(attached.status.success(), "{}", String::from_utf8_lossy(&attached.stderr));
+        let mut detach = Some(Detach(mount.clone()));
+
+        let root = mount.join("proj");
+        fs::create_dir(&root).unwrap();
+        let projects = Projects::new();
+        projects.add("aaaa1111", 1);
+        projects.record_root("aaaa1111", &root);
+        assert_ne!(
+            daemon::identity::read_root_device(&projects.root().join("aaaa1111")),
+            Some(device_of(tmp.path())),
+            "the image did not mount on its own device"
+        );
+
+        drop(detach.take());
+        assert!(!root.exists(), "the image is still mounted");
+
+        assert_eq!(sweep_orphaned(projects.root()).unwrap(), 0);
+        assert!(projects.exists("aaaa1111"), "the sweep deleted state of a project on a detached volume");
+    }
+
+    // -----------------------------------------------------------------
+    // A purge that finds the bootstrap lock held
+    // -----------------------------------------------------------------
+
+    /// Takes `state`'s bootstrap lock on a file of its own, as a
+    /// bootstrapping shim or another process's sweep holds it.
+    fn hold_bootstrap_lock(state: &Path) -> fs::File {
+        let lock = fs::File::create(daemon::bootstrap_lock_path_in(state)).unwrap();
+        lock.try_lock().unwrap();
+        lock
+    }
+
+    /// How long a test lets a purge run against a held lock before it acts:
+    /// a purge that does not wait has returned well within it.
+    const WATCH: Duration = Duration::from_millis(300);
+
+    /// A bound no test here reaches: the lock is always released first.
+    const LONG_WAIT: Duration = Duration::from_secs(60);
+
+    /// Runs the purge on its own thread, so the test can release the lock
+    /// (or delete the directory) while it waits.
+    fn purge_in_background(state: &Path, wait: LockWait) -> std::thread::JoinHandle<Result<Purge>> {
+        let state = state.to_path_buf();
+        std::thread::spawn(move || purge_orphaned_state_dir(&state, wait))
+    }
+
+    /// The daemon's purge: a lock that is held and then released over a
+    /// directory still orphaned is waited for, and the directory deleted.
+    ///
+    /// Control: make `LockWait::UpTo` give up at once like `Try`: the purge
+    /// returns `Kept` while the lock is held.
+    #[test]
+    fn a_waiting_purge_deletes_the_directory_once_the_lock_is_released() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let lock = hold_bootstrap_lock(&state);
+
+        let purge = purge_in_background(&state, LockWait::UpTo(LONG_WAIT));
+        std::thread::sleep(WATCH);
+        assert!(!purge.is_finished(), "the purge must wait for the held lock, not give up on it");
+        assert!(state.exists(), "nothing may be deleted while the lock is held");
+
+        drop(lock);
+        assert_eq!(purge.join().unwrap().unwrap(), Purge::Deleted);
+        assert!(!state.exists(), "the directory must go once the lock is free");
+    }
+
+    /// A holder that deletes the directory itself (a sweep) and then releases
+    /// the lock has done what the purge was for: that is `Deleted`, not a
+    /// directory "kept" because its root record went with it.
+    ///
+    /// Unix only: Windows cannot delete the lock file the purge holds open.
+    ///
+    /// Control: drop the purge's check for a directory gone once the lock is
+    /// taken: the re-judgement reports it kept as not recorded.
+    #[cfg(unix)]
+    #[test]
+    fn a_waiting_purge_whose_directory_the_holder_deleted_reports_it_deleted() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let lock = hold_bootstrap_lock(&state);
+
+        let purge = purge_in_background(&state, LockWait::UpTo(LONG_WAIT));
+        // Once the purge has opened the lock file and is waiting on it: a
+        // purge that started after the delete would find no directory to
+        // open the lock in, which says `Deleted` without the path under test.
+        std::thread::sleep(WATCH);
+        assert!(!purge.is_finished(), "the purge must still be waiting for the held lock");
+        fs::remove_dir_all(&state).unwrap();
+        drop(lock);
+
+        assert_eq!(purge.join().unwrap().unwrap(), Purge::Deleted);
+    }
+
+    /// A lock held past the bound keeps the directory, saying why, rather
+    /// than waiting on.
+    ///
+    /// Control: make `LockWait::UpTo` give up at once like `Try`: the reason
+    /// is the one for a bootstrapping shim instead.
+    #[test]
+    fn a_purge_whose_lock_stays_held_past_the_bound_keeps_the_directory() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let _lock = hold_bootstrap_lock(&state);
+        let bound = Duration::from_millis(200);
+
+        let started = Instant::now();
+        let purge = purge_orphaned_state_dir(&state, LockWait::UpTo(bound)).unwrap();
+
+        assert_eq!(purge, Purge::Kept("a shim held its bootstrap lock past the wait"));
+        assert!(started.elapsed() >= bound, "the purge must wait out its bound first");
+        assert!(state.exists());
+    }
+
+    /// The shim's sweep never waits: a busy lock keeps the directory on the
+    /// first try.
+    ///
+    /// Control: make `LockWait::Try` poll like `UpTo`: the purge waits and
+    /// reports the lock held past the wait instead.
+    #[test]
+    fn a_trying_purge_keeps_the_directory_of_a_busy_lock_at_once() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let _lock = hold_bootstrap_lock(&state);
+
+        let purge = purge_orphaned_state_dir(&state, LockWait::Try).unwrap();
+
+        assert_eq!(purge, Purge::Kept("a shim is bootstrapping it"));
+        assert!(state.exists());
+    }
+
+    // A purge that finds the daemon's singleton lock held
+    // -----------------------------------------------------------------
+
+    /// Takes `state`'s singleton lock on a file of its own, as a running
+    /// daemon holds it or another process's sweep probes it.
+    fn hold_singleton_lock(state: &Path) -> fs::File {
+        let lock = fs::File::create(daemon::daemon_lock_path_in(state)).unwrap();
+        lock.try_lock().unwrap();
+        lock
+    }
+
+    /// The daemon's purge: a singleton lock held for a moment (a sweeper's
+    /// probe) over a directory still orphaned is waited out, and the
+    /// directory deleted.
+    ///
+    /// Control: return `Kept` at once on a held singleton lock under
+    /// `LockWait::UpTo` too: the purge keeps the directory.
+    #[test]
+    fn a_waiting_purge_deletes_the_directory_once_the_singleton_lock_is_released() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let lock = hold_singleton_lock(&state);
+
+        let purge = purge_in_background(&state, LockWait::UpTo(LONG_WAIT));
+        std::thread::sleep(WATCH);
+        assert!(!purge.is_finished(), "the purge must wait for the held singleton lock, not give up on it");
+        assert!(state.exists(), "nothing may be deleted while the singleton lock is held");
+
+        drop(lock);
+        assert_eq!(purge.join().unwrap().unwrap(), Purge::Deleted);
+        assert!(!state.exists(), "the directory must go once the singleton lock is free");
+    }
+
+    /// A singleton lock held past the bound - a daemon that really runs -
+    /// keeps the directory, saying why, once the bound is spent.
+    ///
+    /// Control: return `Kept` at once on a held singleton lock under
+    /// `LockWait::UpTo` too: the reason is the one for a running daemon.
+    #[test]
+    fn a_purge_whose_singleton_lock_stays_held_past_the_bound_keeps_the_directory() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let _lock = hold_singleton_lock(&state);
+        let bound = Duration::from_millis(200);
+
+        let started = Instant::now();
+        let purge = purge_orphaned_state_dir(&state, LockWait::UpTo(bound)).unwrap();
+
+        assert_eq!(purge, Purge::Kept("a daemon or plugin held its singleton lock past the wait"));
+        assert!(started.elapsed() >= bound, "the purge must wait out its bound first");
+        assert!(state.exists());
+    }
+
+    /// The shim's sweep never waits: a held singleton lock keeps the
+    /// directory on the first try, as a running daemon's.
+    #[test]
+    fn a_trying_purge_keeps_the_directory_of_a_held_singleton_lock_at_once() {
+        let fixture = SweepHome::new();
+        let state = fixture.add_orphan("aaaa1111");
+        let _lock = hold_singleton_lock(&state);
+
+        let started = Instant::now();
+        let purge = purge_orphaned_state_dir(&state, LockWait::Try).unwrap();
+
+        assert_eq!(purge, Purge::Kept("a daemon or plugin is still running for it"));
+        assert!(started.elapsed() < WATCH, "a trying purge must not wait on the lock");
+        assert!(state.exists());
     }
 }

@@ -543,6 +543,14 @@ pub struct LspBridge {
     /// Whether readiness reads the server's `experimental/serverStatus`
     /// `quiescent` bit - see [`LspBridge::quiescent_signal`].
     quiescent_signal: bool,
+    /// Whether the server is told this client watches files - see
+    /// [`LspBridge::client_watches_files`].
+    client_watches_files: bool,
+    /// Files passes were sent whose change on disk the server has not been
+    /// told about yet: a pass that starts no server (nothing to ask) leaves
+    /// them for the next one that does. Only filled when
+    /// [`client_watches_files`](LspBridge::client_watches_files) is set.
+    unforwarded: BTreeSet<RelPath>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -596,6 +604,39 @@ impl LspBridge {
         self
     }
 
+    /// Tells the server this client watches files for it
+    /// (`workspace.didChangeWatchedFiles.dynamicRegistration`), so a server
+    /// that would otherwise run its own file watcher registers its globs
+    /// with the client instead. The bridge then forwards, as
+    /// `workspace/didChangeWatchedFiles`, only the files core sends a pass
+    /// (the plugin's own source files, which changed), and only inside
+    /// [`SemanticEngine::answer`], just before that pass's documents are
+    /// synced; an already open one is re-synced with `didChange` instead.
+    /// Any other change on disk (a manifest, a config) reaches the server
+    /// only when the plugin asks it to (for rust-analyzer,
+    /// `rust-analyzer/reloadWorkspace` through [`LspBridge::request`]): for a
+    /// plugin that must vet a change before the server may react to it, and
+    /// that wraps `answer` in that vetting.
+    #[must_use]
+    pub fn client_watches_files(mut self) -> Self {
+        self.client_watches_files = true;
+        self
+    }
+
+    /// Sends `method` with `params` to the running server as a request whose
+    /// answer nobody waits for: a pass's poll loop drops an answer to an id
+    /// it did not ask. For a plugin that must tell its server something the
+    /// bridge has no verb for, such as rust-analyzer's
+    /// `rust-analyzer/reloadWorkspace`. Starts nothing: with no server
+    /// running it sends nothing and answers `Ok(false)`, since a server
+    /// started later reads the project fresh anyway.
+    pub fn request(&mut self, method: &str, params: Value) -> Result<bool> {
+        match self.client.as_mut() {
+            Some(client) => client.request(method, params).map(|_| true),
+            None => Ok(false),
+        }
+    }
+
     /// [`LspBridge::new`] with budgets a test can make small - see
     /// [`Budgets`].
     pub fn with_budgets(language: &str, root: &Path, config: SemanticConfig, budgets: Budgets) -> Self {
@@ -618,6 +659,8 @@ impl LspBridge {
             trimmed: BTreeMap::new(),
             core_deadline: None,
             quiescent_signal: false,
+            client_watches_files: false,
+            unforwarded: BTreeSet::new(),
         }
     }
 
@@ -675,8 +718,14 @@ impl LspBridge {
                 return None;
             }
             self.starts += 1;
-            match LspClient::start(&self.language, &self.config, &self.root, deadline, self.quiescent_signal)
-            {
+            match LspClient::start(
+                &self.language,
+                &self.config,
+                &self.root,
+                deadline,
+                self.quiescent_signal,
+                self.client_watches_files,
+            ) {
                 Ok(client) => self.client = Some(client),
                 Err(err) => {
                     self.start_failure = Some(format!(
@@ -781,6 +830,39 @@ impl LspBridge {
                 }
             }
         }
+    }
+
+    /// Tells the server about every file in `pending` - see
+    /// [`LspBridge::client_watches_files`]. A file the server holds open is
+    /// not announced: its text is the client's, so it is answered with the
+    /// open files to re-sync, which this returns. Created and changed files
+    /// are both `Changed`: the server reads the file either way and tells
+    /// the two apart by what it had.
+    fn forward_watched(
+        client: &mut LspClient,
+        pending: &mut BTreeSet<RelPath>,
+        opened: &BTreeMap<RelPath, OpenDocument>,
+        root: &Path,
+    ) -> BTreeSet<RelPath> {
+        const CHANGED: u32 = 2;
+        const DELETED: u32 = 3;
+        let mut resync = BTreeSet::new();
+        let mut changes = Vec::new();
+        for path in std::mem::take(pending) {
+            if opened.contains_key(&path) {
+                resync.insert(path);
+                continue;
+            }
+            let absolute = path.to_absolute(root);
+            let kind = if absolute.exists() { CHANGED } else { DELETED };
+            changes.push(json!({ "uri": file_uri(&absolute), "type": kind }));
+        }
+        if !changes.is_empty() {
+            let _ = client.notify("workspace/didChangeWatchedFiles", json!({ "changes": changes }));
+            // Same reasoning as a `didChange`: the server reanalyses.
+            client.mark_edited();
+        }
+        resync
     }
 
     /// Waits until the server is ready to be believed - see this type's doc
@@ -2839,6 +2921,9 @@ impl SemanticEngine for LspBridge {
 
     fn answer(&mut self, files: &[RelPath], index: &SdkIndex) -> Result<SemanticAnswer> {
         let whole_project = files.is_empty();
+        if self.client_watches_files {
+            self.unforwarded.extend(files.iter().cloned());
+        }
         // What this pass was sent - core adds the files earlier passes did not
         // finish itself. A file no longer in the index was deleted or
         // failed to extract: there is nothing left to ask about it, so it is
@@ -2904,6 +2989,7 @@ impl SemanticEngine for LspBridge {
         let root = self.root.clone();
         let real_root = self.real_root.clone();
         let mut opened = std::mem::take(&mut self.opened);
+        let mut unforwarded = std::mem::take(&mut self.unforwarded);
         let asked_about: BTreeSet<RelPath> =
             plan.asking.iter().map(|question| question.file.clone()).collect();
         let outcome = {
@@ -2913,15 +2999,12 @@ impl SemanticEngine for LspBridge {
                 None => Err(None),
                 Some(client) => {
                     client.drain();
-                    Self::sync_documents(
-                        client,
-                        &mut opened,
-                        &root,
-                        index,
-                        &asked_about,
-                        &language,
-                        language_ids,
-                    );
+                    // An open file this pass was sent is re-synced even when
+                    // nothing in it is asked: the server reads it from the
+                    // client, not from disk.
+                    let mut synced = Self::forward_watched(client, &mut unforwarded, &opened, &root);
+                    synced.extend(asked_about.iter().cloned());
+                    Self::sync_documents(client, &mut opened, &root, index, &synced, &language, language_ids);
                     match Self::wait_ready(client, &budgets, deadline, &language) {
                         Ok(()) => Ok(run_pass(
                             client,
@@ -2940,6 +3023,7 @@ impl SemanticEngine for LspBridge {
             }
         };
         self.opened = opened;
+        self.unforwarded = unforwarded;
 
         let (mut answers, covered, failure) = match outcome {
             Ok(outcome) => outcome,

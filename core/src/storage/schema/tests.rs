@@ -42,6 +42,7 @@ fn creates_all_tables_and_indexes() {
             "qualified_suffixes",
             "reextract_owed_files",
             "resolution_facts",
+            "seed_origin",
             "semantic_gap_files",
             "semantic_owed_files",
             "semantic_pending",
@@ -974,7 +975,9 @@ fn a_completion_recorded_inside_a_transaction_commits_with_it() {
 }
 
 /// The startup cleanup removes rows of a language no capable plugin runs and
-/// of a language whose pass is recorded done, and keeps an owed capable one.
+/// the language row of a language whose pass is recorded done, keeping that
+/// language's file rows (owed to the start's scoped pass) and an owed
+/// capable language.
 #[test]
 fn stale_semantic_pending_rows_are_cleared_and_owed_ones_kept() {
     let conn = setup();
@@ -994,7 +997,10 @@ fn stale_semantic_pending_rows_are_cleared_and_owed_ones_kept() {
         semantic_pending(&conn).unwrap(),
         vec![("rust".to_string(), "2026-09-26T10:14:03Z".to_string(), 1)]
     );
-    assert_eq!(semantic_pending_file_rows(&conn), vec![("rust".to_string(), "a.rs".to_string())]);
+    assert_eq!(
+        semantic_pending_file_rows(&conn),
+        vec![("go".to_string(), "a.go".to_string()), ("rust".to_string(), "a.rs".to_string())]
+    );
 }
 
 /// A complete per-file pass clears its files, whatever their language, and

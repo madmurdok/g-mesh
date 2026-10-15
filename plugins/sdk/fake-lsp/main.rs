@@ -297,6 +297,11 @@ struct Script {
     /// assert which extensions the client asked for.
     #[serde(default)]
     capabilities_out: Option<String>,
+    /// Where to write `capabilities.workspace` from the client's
+    /// `initialize`, verbatim (`null` when it sent none), so a test can
+    /// assert which workspace features the client claimed.
+    #[serde(default)]
+    workspace_capabilities_out: Option<String>,
     /// Sections to ask the *client* for with `workspace/configuration`, right
     /// after `initialized` - which is when pyright asks, and the only channel
     /// it takes settings through at all (GM-299). A server asking its client
@@ -313,6 +318,14 @@ struct Script {
     /// assert which language each document was opened as.
     #[serde(default)]
     opened_log: Option<String>,
+    /// Where to append what the client said about files changing on disk:
+    /// `watched <type> <uri>` per change of a
+    /// `workspace/didChangeWatchedFiles` (`type` as the protocol numbers
+    /// it: 1 created, 2 changed, 3 deleted) and `didChange <uri>` per
+    /// `textDocument/didChange`, so a test can assert which files the client
+    /// announced and how.
+    #[serde(default)]
+    file_events_log: Option<String>,
     /// Hold the nth definition/implementation answer (1-based, counted per
     /// server process, in the order the requests arrive) for `holdMs[n-1]`
     /// milliseconds, on its own thread, while this server goes on reading -
@@ -377,6 +390,7 @@ fn main() {
         if method == "textDocument/didOpen" {
             log_opened(&script, &params);
         }
+        log_file_events(&script, &method, &params);
 
         match method.as_str() {
             "initialize" => {
@@ -385,6 +399,10 @@ fn main() {
                 status_asked = experimental.get("serverStatusNotification") == Some(&json!(true));
                 if let Some(path) = &script.capabilities_out {
                     let _ = std::fs::write(path, experimental.to_string());
+                }
+                if let Some(path) = &script.workspace_capabilities_out {
+                    let workspace = params.pointer("/capabilities/workspace").cloned().unwrap_or(Value::Null);
+                    let _ = std::fs::write(path, workspace.to_string());
                 }
                 let mut capabilities = json!({
                     "definitionProvider": true,
@@ -800,6 +818,26 @@ fn log_opened(script: &Script, params: &Value) {
     );
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn log_file_events(script: &Script, method: &str, params: &Value) {
+    let Some(path) = &script.file_events_log else { return };
+    let lines: String = match method {
+        "workspace/didChangeWatchedFiles" => params["changes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|change| format!("watched {} {}\n", change["type"], change["uri"].as_str().unwrap_or("")))
+            .collect(),
+        "textDocument/didChange" => {
+            format!("didChange {}\n", params["textDocument"]["uri"].as_str().unwrap_or(""))
+        }
+        _ => return,
+    };
+    // One `write` for the whole message, for the reason `log` gives.
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(lines.as_bytes());
     }
 }
 

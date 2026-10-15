@@ -87,7 +87,7 @@ pub(super) fn run(root: &Path, dir: &Path, singleton: File, detection: Detection
         Arc::new(EmbeddingPipeline::disabled()),
     );
     let core_activity = CoreActivity::new();
-    let front = Arc::new(mcp::front::Front::new(canonical_root.clone(), &detection));
+    let front = Arc::new(mcp::front::Front::new(canonical_root.clone()));
 
     let (accept_result, accept_loop) = mpsc::channel();
     {

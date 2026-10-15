@@ -669,6 +669,19 @@ CREATE TABLE IF NOT EXISTS semantic_gap_files (
     filePath TEXT NOT NULL,
     PRIMARY KEY (language, filePath)
 );
+
+-- Where a seeded index was copied from (daemon::seed): one row, written into
+-- the copy before its rename into place. `reconciledAt` NULL means the seeded
+-- first-start reconcile still owes this worktree its pass. Dropped by `wipe`,
+-- so a reset index is no longer seeded. Added by `CREATE TABLE IF NOT
+-- EXISTS`, so an existing index gains it without a schema-version bump.
+CREATE TABLE IF NOT EXISTS seed_origin (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    sourceRoot          TEXT NOT NULL,
+    sourceBulkIndexedAt TEXT NOT NULL,
+    seededAt            TEXT NOT NULL,
+    reconciledAt        TEXT
+);
 "#;
 
 /// Applies the graph schema DDL to a fresh (or already up-to-date) connection.
@@ -1544,6 +1557,22 @@ pub fn semantic_pending_files_among(
     Ok(pending)
 }
 
+/// Records `file_paths` of `language` as semantic-pending files: reparsed
+/// structurally, their semantic edges not refreshed yet. A complete per-file
+/// pass over them clears the rows ([`clear_semantic_pending_files`]).
+pub fn record_semantic_pending_files(conn: &Connection, language: &str, file_paths: &[String]) -> Result<()> {
+    in_savepoint(conn, || {
+        for path in file_paths {
+            conn.execute(
+                "INSERT OR IGNORE INTO semantic_pending_files (language, filePath) VALUES (?1, ?2)",
+                params![language, path],
+            )
+            .with_context(|| format!("failed to record the semantic-pending file {path}"))?;
+        }
+        Ok(())
+    })
+}
+
 /// Deletes the semantic-pending file rows of `file_paths`, whatever their
 /// language (a file belongs to one), after a complete per-file semantic pass
 /// over them. The language rows stay: a per-file pass does not re-resolve
@@ -1684,10 +1713,14 @@ pub fn clear_semantic_leftovers(conn: &Connection, language: &str) -> Result<()>
     Ok(())
 }
 
-/// Deletes the semantic-pending rows no pass will ever clear: those of a
+/// Deletes the semantic-pending rows no pass will ever clear: every row of a
 /// language not in `semantic_pass_languages` (its plugin is gone or declares
-/// no semantic tier) and those of a language whose pass is recorded done (a
-/// clear whose write failed). Returns how many languages were cleared.
+/// no semantic tier), and the language row of a language whose pass is
+/// recorded done (a clear whose write failed). A done language's file rows
+/// stay: they are files a per-file or scoped pass still owes (a daemon
+/// killed between a seeded reparse and its scoped pass), which the start's
+/// [`owed_semantic_pending_files`] pass asks again. Returns how many
+/// languages were cleared.
 pub fn clear_stale_semantic_pending(
     conn: &Connection,
     semantic_pass_languages: &HashSet<String>,
@@ -1698,12 +1731,42 @@ pub fn clear_stale_semantic_pending(
         .context("failed to read the semantic-pending languages")?;
     let mut cleared = 0;
     for language in languages {
-        if !semantic_pass_languages.contains(&language) || language_semantic_pass_done(conn, &language)? {
+        if !semantic_pass_languages.contains(&language) {
             clear_semantic_pending(conn, &language)?;
+            cleared += 1;
+        } else if language_semantic_pass_done(conn, &language)?
+            && semantic_pending_since(conn, &language)?.is_some()
+        {
+            clear_semantic_pending_language(conn, &language)?;
             cleared += 1;
         }
     }
     Ok(cleared)
+}
+
+/// The `semantic_pending_files` rows a per-file pass still owes, per
+/// language, sorted: the rows of each language whose whole-project pass is
+/// recorded done and that has no `semantic_pending` row. A language whose
+/// pass is not done is left out: the start's whole-project retry
+/// (`daemon::semantic`) re-asks every one of its files and clears them.
+pub fn owed_semantic_pending_files(conn: &Connection) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT f.language, f.filePath FROM semantic_pending_files f
+             JOIN language_state s ON s.language = f.language AND s.semanticPassAt IS NOT NULL
+             WHERE NOT EXISTS (SELECT 1 FROM semantic_pending p WHERE p.language = f.language)
+             ORDER BY f.language, f.filePath",
+        )
+        .context("failed to prepare the owed semantic-pending files read")?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .context("failed to read the owed semantic-pending files")?;
+    let mut owed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows {
+        let (language, file_path) = row.context("failed to read the owed semantic-pending files")?;
+        owed.entry(language).or_default().push(file_path);
+    }
+    Ok(owed)
 }
 
 /// Every `(language, since, pending file count)` with a semantic-pending row,
@@ -1958,9 +2021,70 @@ fn wipe(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS semantic_owed_files; DROP TABLE IF EXISTS semantic_residual; \
          DROP TABLE IF EXISTS semantic_gap_files; DROP TABLE IF EXISTS language_outcome; \
          DROP TABLE IF EXISTS language_retry; \
-         DROP TABLE IF EXISTS resolution_facts;",
+         DROP TABLE IF EXISTS resolution_facts; DROP TABLE IF EXISTS seed_origin;",
     )
     .context("failed to wipe schema")
+}
+
+/// Records that this index is a seed copied from the index of `source_root`
+/// (`daemon::seed`), with the source's `bulkIndexedAt` and no `reconciledAt`.
+/// Runs on the copy's own connection, before its rename into place.
+pub fn record_seed_origin(conn: &Connection, source_root: &str) -> Result<()> {
+    apply(conn)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO seed_origin (id, sourceRoot, sourceBulkIndexedAt, seededAt, reconciledAt) \
+         SELECT 1, ?1, bulkIndexedAt, CURRENT_TIMESTAMP, NULL FROM meta WHERE id = 1 AND bulkIndexedAt IS NOT NULL",
+        rusqlite::params![source_root],
+    )
+    .and_then(|written| {
+        if written == 1 {
+            Ok(())
+        } else {
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        }
+    })
+    .context("failed to record the seed's origin")
+}
+
+/// Whether this index is a seed whose first-start reconcile has not run yet
+/// (a `seed_origin` row with `reconciledAt` NULL). Hook point for the seeded
+/// start (GM-564 D4): a daemon must not serve such an index before that
+/// reconcile.
+pub fn seed_pending(conn: &Connection) -> Result<bool> {
+    let row: Option<Option<String>> = conn
+        .query_row("SELECT reconciledAt FROM seed_origin WHERE id = 1", [], |row| row.get(0))
+        .optional()
+        .context("failed to read seed_origin")?;
+    Ok(matches!(row, Some(None)))
+}
+
+/// Stamps the seed's first-start reconcile as done.
+pub fn record_seed_reconciled(conn: &Connection) -> Result<()> {
+    conn.execute("UPDATE seed_origin SET reconciledAt = CURRENT_TIMESTAMP WHERE id = 1", [])
+        .context("failed to record that the seed was reconciled")?;
+    Ok(())
+}
+
+/// The working tree a seeded index was copied from (`seed_origin.sourceRoot`),
+/// or `None` for an index that is not a seed.
+pub fn seed_source_root(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row("SELECT sourceRoot FROM seed_origin WHERE id = 1", [], |row| row.get(0))
+        .optional()
+        .context("failed to read seed_origin.sourceRoot")
+}
+
+/// When the seed's first-start reconcile finished, in Unix seconds; `None`
+/// for an index that is not a seed or whose reconcile has not finished.
+pub fn seed_reconciled_at_unix(conn: &Connection) -> Result<Option<i64>> {
+    let recorded: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT CAST(strftime('%s', reconciledAt) AS INTEGER) FROM seed_origin WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read seed_origin.reconciledAt")?;
+    Ok(recorded.flatten())
 }
 
 fn record_version(conn: &Connection, indexer_version: &str) -> Result<()> {

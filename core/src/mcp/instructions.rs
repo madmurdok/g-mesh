@@ -51,6 +51,9 @@ fn cold_start_line(root: &Path, walking: bool, cause: ColdCause) -> String {
 /// runs: by then the wait is the same whatever owed it.
 fn cold_start_line_fallback(walking: bool, cause: ColdCause) -> String {
     let state = match (walking, cause) {
+        (_, ColdCause::Seeded) => {
+            "Copied from the main checkout, reconciling with this worktree - the first tool call waits for it"
+        }
         (true, _) => "Being built now - the first tool call waits for it to finish before answering",
         (false, ColdCause::Fresh) => {
             "Not indexed yet - the first tool call builds it (structural first; semantic search after) and \
@@ -562,7 +565,8 @@ const INDEXED_MARK: &str = " (indexed)";
 /// step 5): it says "before any other tool", never "nothing is selected".
 /// `indexed` counts the candidates with a completed index
 /// (`candidates::has_completed_index`); when non-zero the sentence says they
-/// are listed first and marked with [`INDEXED_MARK`].
+/// are listed first and marked with [`INDEXED_MARK`]. The list is a snapshot of
+/// the connection's start (D7), and the sentence says so.
 fn front_sentence(subject: &str, count: &str, indexed: usize) -> String {
     let state = if indexed == 0 {
         "has indexed none of them".to_string()
@@ -573,7 +577,9 @@ fn front_sentence(subject: &str, count: &str, indexed: usize) -> String {
         "{subject} {count} projects; g-mesh serves one at a time and {state}. \
          Before any other g-mesh tool, call select_project with the one you are working on (ask the \
          user if unclear). Its result names the project this session then serves and carries that \
-         project's guidance; call it again to switch, or to re-read that guidance. Projects: "
+         project's guidance; call it again to switch, or to re-read that guidance. The list is a snapshot as \
+         of session start: any project below this folder, a worktree created since included, can be \
+         passed as `project` on a tool call or to select_project, by name or path. Projects: "
     )
 }
 

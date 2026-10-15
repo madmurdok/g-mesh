@@ -165,6 +165,8 @@ impl Fixture {
             needs_semantic_pass_retry,
             retry_languages,
             watcher,
+            seed_gate: None,
+            seed_reconciled: None,
         };
         Start { ctx, registry }
     }
@@ -399,4 +401,30 @@ fn edits_made_during_a_retry_are_routed_once_it_is_done() {
     };
     wait_until("alpha's edit to route", || routed(&fixture.alpha, ALPHA_FILE));
     wait_until("beta's edit to route", || routed(&fixture.beta, BETA_FILE));
+}
+
+/// An unreconciled seed's activation holds its phase at `Walking` until the
+/// seeded reconcile signals, and only then moves on to the embedding
+/// backfill.
+///
+/// Control: drop the `seed_reconciled` wait in `activate`: the activation
+/// finishes, and leaves `Walking`, while the reconcile is still held.
+#[test]
+fn a_seeded_activation_waits_for_the_seeded_reconcile_before_embedding() {
+    let fixture = Fixture::new();
+    fixture.full_walk();
+    let Start { mut ctx, .. } = fixture.prepare(false);
+    let indexing = IndexingStatus::walking_because(crate::daemon::indexing_status::ColdCause::Seeded);
+    ctx.indexing = indexing.clone();
+    let (reconciled, wait) = std::sync::mpsc::channel();
+    ctx.seed_reconciled = Some(wait);
+    let activation = thread::spawn(move || ctx.activate());
+
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(indexing.phase(), Phase::Walking, "no phase change before the seeded reconcile");
+    assert!(!activation.is_finished(), "the activation waits for the seeded reconcile");
+
+    reconciled.send(()).unwrap();
+    activation.join().unwrap().expect("the activation succeeds");
+    assert_ne!(indexing.phase(), Phase::Walking);
 }

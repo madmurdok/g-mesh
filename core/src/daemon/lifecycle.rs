@@ -482,6 +482,22 @@ impl PluginSupervisor {
     /// daemon was down, or dropped by the backend). The common case resolves off
     /// `indexed_files` alone, without the plugin lock; only a reindex wakes it.
     pub fn ensure_fresh(&self, conn: &IndexStore, file_path: &str) -> Result<StalenessOutcome> {
+        self.ensure_fresh_with(conn, file_path, false)
+    }
+
+    /// [`ensure_fresh`](Self::ensure_fresh) with the reparse's per-file
+    /// semantic pass left out: the caller runs one scoped pass over every
+    /// file it reparsed this way (the seeded start, `daemon::seed`).
+    pub fn ensure_fresh_structural(&self, conn: &IndexStore, file_path: &str) -> Result<StalenessOutcome> {
+        self.ensure_fresh_with(conn, file_path, true)
+    }
+
+    fn ensure_fresh_with(
+        &self,
+        conn: &IndexStore,
+        file_path: &str,
+        defer_semantic: bool,
+    ) -> Result<StalenessOutcome> {
         if !conn.with(|conn| staleness::is_stale(conn, &self.project_root, file_path))? {
             return Ok(StalenessOutcome::AlreadyFresh);
         }
@@ -500,8 +516,14 @@ impl PluginSupervisor {
         }
         self.touch();
         let process = inner.process.as_ref().expect("just spawned or already running");
-        let (outcome, change) =
-            process.ensure_fresh(conn, file_path, &self.embedding, self.is_semantic_suspended())?;
+        // A suspended language and a deferred pass both take the reparse's
+        // structural-only branch.
+        let (outcome, change) = process.ensure_fresh(
+            conn,
+            file_path,
+            &self.embedding,
+            self.is_semantic_suspended() || defer_semantic,
+        )?;
         self.note(file_path, change);
         Ok(outcome)
     }
@@ -938,12 +960,20 @@ fn end_process_group() {
     }
 }
 
+/// How long [`purge_state_dir`] waits for a bootstrap lock another process
+/// holds, or for its singleton lock to come free of a sweeper's probe: long
+/// enough for a sweeper to finish deleting the directory under load, short
+/// enough that an orphaned daemon's exit (which only tests and
+/// `stop` wait on) is not held up for long.
+const PURGE_LOCK_WAIT: Duration = Duration::from_secs(10);
+
 /// On [`Orphaned::ProjectRootGone`], deletes this daemon's whole state
 /// directory (GM-524 D1): the index and every lock and log file of a project
 /// that no longer exists. Called by `daemon::run` and `front::run` after the
 /// singleton lock is dropped, so the directory is judged by exactly the rules
 /// `clean orphaned --force` uses (`cli::clean::purge_orphaned_state_dir`): the
-/// root's parent must still exist, nothing may be running for it, and the
+/// root must read as deleted by `root_state` (`NotFound`, parent present on
+/// the recorded device), nothing may be running for it, and the
 /// root is re-checked under the bootstrap lock in case it came back.
 ///
 /// Open handles - the index the other threads still hold, `daemon.log` as this
@@ -951,6 +981,13 @@ fn end_process_group() {
 /// usable until closed and the process ends right after this. Windows cannot
 /// delete an open file, so there the directory is left for the shim's startup
 /// sweep, which runs when no daemon holds it.
+///
+/// A shim's startup sweep can hold the bootstrap lock of this very directory
+/// (it is orphaned from the moment the singleton is dropped), or probe its
+/// singleton lock at the instant the purge does, so the purge waits up to
+/// [`PURGE_LOCK_WAIT`] for either rather than giving up. Either way,
+/// when this returns the directory is gone, or was kept for the reason logged:
+/// the purge never runs on after the process exits.
 pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
     let Exit::Orphaned(Orphaned::ProjectRootGone(root)) = exit else {
         return;
@@ -958,7 +995,8 @@ pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
     if cfg!(windows) {
         return;
     }
-    match crate::cli::clean::purge_orphaned_state_dir(state_dir) {
+    let wait = crate::cli::clean::LockWait::UpTo(PURGE_LOCK_WAIT);
+    match crate::cli::clean::purge_orphaned_state_dir(state_dir, wait) {
         Ok(crate::cli::clean::Purge::Deleted) => crate::log_line!(
             "g-mesh daemon: deleted the state of {} ({}) - its project root no longer exists",
             root.display(),

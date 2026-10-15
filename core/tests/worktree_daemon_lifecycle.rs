@@ -229,8 +229,16 @@ fn force_kill(pid: u32) {
 /// way out, so a process it (or its plugin's language server) started stops
 /// writing into the deleted root, and the root stays gone.
 ///
-/// Control: drop the `end_process_group()` call on the orphan exit in
-/// `lifecycle::supervise`: the member outlives the daemon.
+/// The daemon must also finish its own way out: the sweep runs before the
+/// pid file goes, so a released pid file says the sweep returned instead of
+/// ending the daemon. That holds whatever order the sweep visits the group
+/// in, unlike the member's fate: a sweep that signals one of the daemon's
+/// own threads kills the daemon at that point, and the member survives only
+/// when it happens to come later in the listing.
+///
+/// Controls: drop the `end_process_group()` call on the orphan exit in
+/// `lifecycle::supervise`: the member outlives the daemon. Let
+/// `process::group_members` list threads: the pid file stays behind.
 #[test]
 fn an_orphaned_daemon_ends_its_process_group_and_the_root_stays_gone() {
     let mut project = Project::new();
@@ -242,6 +250,11 @@ fn an_orphaned_daemon_ends_its_process_group_and_the_root_stays_gone() {
     common::wait_for("the orphaned daemon to stop itself", common::startup_timeout(), || {
         !daemon::is_process_alive(core)
     });
+    assert!(
+        !project.pid_file().exists(),
+        "the orphaned daemon must release its pid file on the way out, after ending its group; \
+         a pid file left behind means the daemon was killed mid-exit"
+    );
 
     let status = member.wait_exit("after its orphaned daemon exited");
     assert!(status.signal().is_some(), "the member must have been ended by a signal: {status}");
@@ -437,8 +450,11 @@ async fn a_call_to_a_deleted_selection_says_it_no_longer_exists() {
     assert!(text.contains("call select_project"), "{text}");
     assert!(!b.exists(), "answering for a deleted selection must not recreate it");
 
+    // b, then a: the connection is contested (D3 of GM-571), so the call
+    // names its project, which must resolve although only one project is
+    // left in the folder.
     select(&client, "a").await;
-    let outline = call(&client, "get_file_outline", json!({ "file_path": "a.ts" })).await;
+    let outline = call(&client, "get_file_outline", json!({ "file_path": "a.ts", "project": "a" })).await;
     assert_ne!(outline.is_error, Some(true), "the session serves another project: {:?}", texts_of(&outline));
     assert!(
         texts_of(&outline).first().is_some_and(|line| line == "g-mesh: answered from project a."),

@@ -46,15 +46,20 @@ use std::process::Command;
 use g_mesh_plugin_rust::extractor::RustExtractor;
 use g_mesh_plugin_rust::project::{ProjectContext, EXCLUDE_DIRS};
 use g_mesh_plugin_rust::semantic;
-use g_mesh_plugin_sdk::wire::SourceTier;
+use g_mesh_plugin_sdk::wire::{SourceTier, TargetKey};
 use g_mesh_plugin_sdk::{walk_project, Extractor, RelPath, SdkIndex, MANIFEST_PATH_ENV};
 
 /// A scratch directory that removes itself.
 struct Scratch(PathBuf);
 
 impl Scratch {
+    /// Unique per call: the tests in this binary run in parallel and each
+    /// makes its own `proxies` directory, which a shared name would let one
+    /// test's `Drop` delete under another (GM-587).
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("g-mesh-rust-gm513-{name}-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("g-mesh-rust-gm513-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         Scratch(root.canonicalize().unwrap())
@@ -478,4 +483,620 @@ fn rust_analyzer_runs_no_build_script_proc_macro_toolchain_or_rustc_the_project_
         Vec::<String>::new(),
         "the semantic tier ran code the project supplied (markers, shim logs or a target/ dir)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// GM-591: a project `rust-analyzer.toml`'s `cargo.extraEnv` is not applied.
+//
+// rust-analyzer 1.97.1 reads a project `rust-analyzer.toml` (workspace root
+// or crate level) but ignores its `cargo.extraEnv`, while a client-side
+// `extraEnv` (initialization options) does override `pinned_env`. If a
+// rust-analyzer that honours the project file ever shipped, a project could
+// set `CARGO_ENCODED_RUSTFLAGS` / `CARGO_UNSTABLE_HOST_CONFIG` and reopen the
+// rustflags and host-config channels (GM-572) that `pinned_env` closes.
+// These tests pin the observed behaviour; the control proves the fixture's
+// values are live by sending the same values through the client channel.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod project_extra_env {
+    use super::*;
+    use g_mesh_plugin_sdk::lsp::{LspBridge, SemanticConfig};
+
+    /// Where the project's `rust-analyzer.toml` sits.
+    #[derive(Clone, Copy)]
+    enum TomlAt {
+        Root,
+        Crate,
+    }
+
+    struct ExtraEnvFixture {
+        root: PathBuf,
+        rustflags_mark: PathBuf,
+        host_mark: PathBuf,
+        /// The `cargo.extraEnv` object: marker-firing values for both channels.
+        extra_env: serde_json::Value,
+    }
+
+    impl ExtraEnvFixture {
+        fn fired(&self) -> Vec<String> {
+            [&self.rustflags_mark, &self.host_mark]
+                .iter()
+                .filter(|mark| mark.exists())
+                .map(|mark| mark.display().to_string())
+                .collect()
+        }
+    }
+
+    /// A plain package with no build script, proc macro, toolchain file or
+    /// shim, so the only code a rustc could load is a marker dylib named by
+    /// the two channels: `CARGO_ENCODED_RUSTFLAGS` (a `-Zcodegen-backend`)
+    /// and `CARGO_UNSTABLE_HOST_CONFIG=true` (which lets the config's
+    /// `[host] rustflags` through). `None` when no C compiler builds the dylibs.
+    fn write_extra_env_fixture(
+        root: &Path,
+        real: &RealToolchain,
+        at: Option<TomlAt>,
+    ) -> Option<ExtraEnvFixture> {
+        let rustflags_mark = root.join("MARK_extraenv_rustflags");
+        let host_mark = root.join("MARK_extraenv_host_config");
+        let rustflags_dylib = build_marker_dylib(&root.join("dylib_rustflags"), &rustflags_mark)?;
+        let host_dylib = build_marker_dylib(&root.join("dylib_host"), &host_mark)?;
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(
+            &root.join("app/src/main.rs"),
+            "mod util;\n\nfn main() {\n    let thing = util::Thing;\n    thing.method();\n}\n",
+        );
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        write(
+            &root.join(".cargo/config.toml"),
+            &format!(
+                "target-applies-to-host = false\n\n[unstable]\nhost-config = true\ntarget-applies-to-host = true\n\n\
+                 [host]\nrustflags = [{:?}]\n",
+                format!("-Zcodegen-backend={}", host_dylib.to_string_lossy())
+            ),
+        );
+        let _ = real;
+        let extra_env = serde_json::json!({
+            "CARGO_ENCODED_RUSTFLAGS": format!("-Zcodegen-backend={}", rustflags_dylib.to_string_lossy()),
+            "CARGO_UNSTABLE_HOST_CONFIG": "true",
+            // A stable cargo honours the config's `[unstable]` table, which
+            // `host-config` needs, only when bootstrapped.
+            "RUSTC_BOOTSTRAP": "1",
+        });
+        let table = format!(
+            "[cargo.extraEnv]\nCARGO_ENCODED_RUSTFLAGS = {:?}\nCARGO_UNSTABLE_HOST_CONFIG = \"true\"\nRUSTC_BOOTSTRAP = \"1\"\n",
+            extra_env["CARGO_ENCODED_RUSTFLAGS"].as_str().unwrap()
+        );
+        match at {
+            Some(TomlAt::Root) => write(&root.join("rust-analyzer.toml"), &table),
+            Some(TomlAt::Crate) => write(&root.join("app/rust-analyzer.toml"), &table),
+            None => {}
+        }
+        Some(ExtraEnvFixture { root: root.to_path_buf(), rustflags_mark, host_mark, extra_env })
+    }
+
+    fn index_of(root: &Path) -> SdkIndex {
+        let project = ProjectContext::load(root).expect("the fixture is a loadable Rust project");
+        let mut index = SdkIndex::new();
+        for path in walk_project(root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+            let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+            let graph = RustExtractor.extract(&project, &path, &source);
+            index.insert(path, source, graph);
+        }
+        index
+    }
+
+    /// Whether the answer resolved `thing.method()` across files: the server
+    /// really indexed the fixture.
+    fn resolved_method(index: &SdkIndex, answer: &g_mesh_plugin_sdk::SemanticAnswer) -> bool {
+        let main = index
+            .graph(&RelPath::new("app/src/main.rs"))
+            .expect("app/src/main.rs is indexed")
+            .nodes
+            .iter()
+            .find(|node| node.name == "main")
+            .expect("the extractor emits `main`")
+            .id
+            .clone();
+        answer
+            .diff
+            .upsert_edges
+            .iter()
+            .filter(|edge| edge.from_id == main && edge.source == SourceTier::Semantic)
+            .filter_map(|edge| answer.diff.upsert_nodes.iter().find(|node| node.id == edge.to_id))
+            .any(|node| node.name == "method")
+    }
+
+    /// Indexes the fixture. `client_extra_env: None` runs the production
+    /// `semantic::engine`; `Some(env)` runs a bridge built the way `engine`
+    /// builds one (manifest config, the same pinned values) with `env` added
+    /// as the client's `cargo.extraEnv` initialization option.
+    fn index_fixture(
+        fixture: &ExtraEnvFixture,
+        real: &RealToolchain,
+        client_extra_env: Option<&serde_json::Value>,
+    ) {
+        scrub_environment(&real.proxy_dir);
+        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+        std::env::set_current_dir(&fixture.root).unwrap();
+        let index = index_of(&fixture.root);
+        let mut engine: Box<dyn g_mesh_plugin_sdk::SemanticEngine> = match client_extra_env {
+            None => semantic::engine(&fixture.root).expect("the engine resolves a rust-analyzer"),
+            Some(env) => {
+                let mut config =
+                    SemanticConfig::from_manifest().unwrap().expect("the manifest has [plugin.semantic]");
+                config.command = real.rust_analyzer.clone();
+                for (name, value) in [
+                    ("CARGO_NET_OFFLINE", "true".to_string()),
+                    ("CARGO_ENCODED_RUSTFLAGS", String::new()),
+                    ("CARGO_UNSTABLE_HOST_CONFIG", "false".to_string()),
+                    ("RUSTC", real.rustc.to_string_lossy().into_owned()),
+                    ("CARGO", real.cargo.to_string_lossy().into_owned()),
+                ] {
+                    config.env.insert(name.to_string(), value);
+                }
+                let options = config.initialization_options.get_or_insert_with(|| serde_json::json!({}));
+                options["cargo"]["extraEnv"] = env.clone();
+                Box::new(LspBridge::new("rust", &fixture.root, config).quiescent_signal())
+            }
+        };
+        let answer = engine.answer(&[], &index).expect("the engine answers");
+        drop(engine);
+        assert!(
+            resolved_method(&index, &answer),
+            "sanity: rust-analyzer did not resolve `thing.method()` (complete: {}, reason: {:?})",
+            answer.complete,
+            answer.reason
+        );
+    }
+
+    fn assert_project_extra_env_is_ignored(at: TomlAt) {
+        let real = real_toolchain();
+        let scratch = Scratch::new("extraenv");
+        let Some(fixture) = write_extra_env_fixture(&scratch.0, &real, Some(at)) else { return };
+        index_fixture(&fixture, &real, None);
+        assert_eq!(
+            fixture.fired(),
+            Vec::<String>::new(),
+            "a project rust-analyzer.toml's cargo.extraEnv reached the server's cargo/rustc: the rustflags \
+             or host-config channel is open again (GM-572)"
+        );
+    }
+
+    #[test]
+    fn a_root_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker() {
+        assert_project_extra_env_is_ignored(TomlAt::Root);
+    }
+
+    #[test]
+    fn a_crate_level_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker() {
+        assert_project_extra_env_is_ignored(TomlAt::Crate);
+    }
+
+    /// Control: the same values through the client's `cargo.extraEnv` beat
+    /// the pinned env and fire the markers, so the fixture's values are live
+    /// and the two tests above are not silent for want of a working hook.
+    /// The control reverses by construction: it is the same fixture and the
+    /// same pass, with the values moved from the project file to the client.
+    #[test]
+    fn the_same_extra_env_through_the_client_fires_the_markers() {
+        let real = real_toolchain();
+        let scratch = Scratch::new("extraenv-ctl");
+        let Some(fixture) = write_extra_env_fixture(&scratch.0, &real, None) else { return };
+        let env = fixture.extra_env.clone();
+        index_fixture(&fixture, &real, Some(&env));
+        assert!(
+            fixture.rustflags_mark.exists(),
+            "sanity: the client's CARGO_ENCODED_RUSTFLAGS fired no marker (fired: {:?}), so the project-file \
+             tests prove nothing about that channel",
+            fixture.fired()
+        );
+        assert!(
+            fixture.host_mark.exists(),
+            "sanity: the client's CARGO_UNSTABLE_HOST_CONFIG fired no marker (fired: {:?}), so the project-file \
+             tests prove nothing about that channel",
+            fixture.fired()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GM-587: a cargo config `[env]` that sets a dynamic-loader variable with
+// `force = true` would load a project dylib into every rustc that the
+// server's `cargo metadata` starts; `semantic::engine` refuses such a project
+// to the structural tier instead (docs/adr/0037).
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod cargo_env_loader_var {
+    use super::*;
+
+    /// The loader variable this platform's dynamic loader honours.
+    const LOADER_VAR: &str = if cfg!(target_os = "macos") { "DYLD_INSERT_LIBRARIES" } else { "LD_PRELOAD" };
+
+    #[test]
+    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker() {
+        let real = real_toolchain();
+        let scratch = Scratch::new("loader-env");
+        let root = scratch.0.clone();
+        let mark = root.join("MARK_cargo_env_loader");
+        let Some(dylib) = build_marker_dylib(&root.join("dylib"), &mark) else { return };
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        let config = root.join(".cargo/config.toml");
+        write(
+            &config,
+            &format!("[env]\n{LOADER_VAR} = {{ value = {:?}, force = true }}\n", dylib.to_string_lossy()),
+        );
+
+        scrub_environment(&real.proxy_dir);
+        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+
+        // Sanity: the hostile config is live - an unpinned `cargo metadata`
+        // in the fixture loads the dylib into the rustc it starts.
+        let output = Command::new(real.proxy_dir.join("cargo"))
+            .args(["metadata", "--format-version", "1"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cargo metadata in the fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            mark.is_file(),
+            "sanity: `cargo metadata` in the fixture never loaded the [env] {LOADER_VAR} dylib, so this test \
+             would prove nothing about that channel"
+        );
+        std::fs::remove_file(&mark).unwrap();
+        let _ = std::fs::remove_file(root.join("Cargo.lock"));
+
+        let refusal = match semantic::engine(&root) {
+            Err(error) => Some(format!("{error:#}")),
+            Ok(mut engine) => {
+                let index = {
+                    let project =
+                        ProjectContext::load(&root).expect("the fixture is a loadable Rust project");
+                    let mut index = SdkIndex::new();
+                    for path in walk_project(&root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+                        let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+                        let graph = RustExtractor.extract(&project, &path, &source);
+                        index.insert(path, source, graph);
+                    }
+                    index
+                };
+                let _ = engine.answer(&[], &index);
+                drop(engine);
+                None
+            }
+        };
+
+        assert!(
+            !mark.exists(),
+            "the semantic tier started a rustc that loaded the project's [env] {LOADER_VAR} dylib"
+        );
+        let reason =
+            refusal.expect("the engine started a server for a project whose cargo config sets a loader var");
+        assert!(
+            reason.contains(LOADER_VAR) && reason.contains(&config.display().to_string()),
+            "the engine failed, but not by refusing the [env] {LOADER_VAR} in {}: {reason}",
+            config.display()
+        );
+    }
+
+    /// Watches `mark` for `span`; `Err` with how long it took when it appears.
+    fn mark_stays_absent(mark: &Path, span: std::time::Duration) -> Result<(), std::time::Duration> {
+        let start = std::time::Instant::now();
+        loop {
+            if mark.exists() {
+                return Err(start.elapsed());
+            }
+            if start.elapsed() >= span {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    /// A loader var added after the engine started: a checkout writes the
+    /// config and edits a manifest, and core's notice of it lags. Until the
+    /// notice, rust-analyzer must not reload on its own; at the notice the
+    /// engine re-checks the configs, stops the server and answers `Err`
+    /// naming the config, and no rustc ever loads the dylib.
+    #[test]
+    fn a_loader_var_added_after_start_stops_the_server_before_any_reload() {
+        use std::time::Duration;
+
+        let real = real_toolchain();
+        let scratch = Scratch::new("loader-env-late");
+        let root = scratch.0.clone();
+        let mark = root.join("MARK_cargo_env_loader");
+        let Some(dylib) = build_marker_dylib(&root.join("dylib"), &mark) else { return };
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        write(&root.join("app/Cargo.toml"), manifest);
+        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        scrub_environment(&real.proxy_dir);
+        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+
+        let mut engine = semantic::engine(&root).expect("no cargo config yet: the engine starts");
+        let index = {
+            let project = ProjectContext::load(&root).expect("the fixture is a loadable Rust project");
+            let mut index = SdkIndex::new();
+            for path in walk_project(&root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+                let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+                let graph = RustExtractor.extract(&project, &path, &source);
+                index.insert(path, source, graph);
+            }
+            index
+        };
+        if let Err(error) = engine.answer(&[], &index) {
+            panic!("the first pass on a clean fixture failed: {error:#}");
+        }
+
+        let config = root.join(".cargo/config.toml");
+        write(
+            &config,
+            &format!("[env]\n{LOADER_VAR} = {{ value = {:?}, force = true }}\n", dylib.to_string_lossy()),
+        );
+        write(&root.join("app/Cargo.toml"), &format!("{manifest}\n[dependencies]\n"));
+        // Core's notice lags the edit; the engine hears nothing meanwhile.
+        if let Err(after) = mark_stays_absent(&mark, Duration::from_secs(15)) {
+            panic!(
+                "rust-analyzer reloaded on its own {after:?} after the manifest edit and a rustc loaded \
+                 the [env] {LOADER_VAR} dylib before the engine could re-check the configs"
+            );
+        }
+
+        engine.workspace_changed();
+        if let Err(after) = mark_stays_absent(&mark, Duration::from_secs(10)) {
+            panic!("a rustc loaded the [env] {LOADER_VAR} dylib {after:?} after workspace_changed");
+        }
+        let reason = match engine.answer(&[], &index) {
+            Ok(_) => panic!("a pass ran after the cargo config turned hostile"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            reason.contains(LOADER_VAR) && reason.contains(&config.display().to_string()),
+            "the pass failed, but not by refusing the [env] {LOADER_VAR} in {}: {reason}",
+            config.display()
+        );
+        if let Err(after) = mark_stays_absent(&mark, Duration::from_secs(5)) {
+            panic!("a rustc loaded the [env] {LOADER_VAR} dylib {after:?} after the refusal");
+        }
+        drop(engine);
+
+        // Sanity: the hostile config is live - an unpinned `cargo metadata`
+        // in the fixture loads the dylib into the rustc it starts.
+        let output = Command::new(real.proxy_dir.join("cargo"))
+            .args(["metadata", "--format-version", "1"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cargo metadata in the fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            mark.is_file(),
+            "sanity: `cargo metadata` in the fixture never loaded the [env] {LOADER_VAR} dylib, so this test \
+             would prove nothing about that channel"
+        );
+    }
+
+    /// The bridge forwards every file a pass is sent to rust-analyzer, and a
+    /// created one makes it refetch the workspace (`cargo metadata`, which
+    /// loads an `[env]` loader var). So a pass after the config turned
+    /// hostile must refuse before anything is forwarded: with no workspace
+    /// change in between, a file created with the config, and a file left
+    /// pending by an earlier pass that reached no server. No rustc may load
+    /// the dylib.
+    ///
+    /// Control: let `CheckedBridge::answer` skip the re-check
+    /// (`self.bridge.as_mut()` for `self.checked()`).
+    #[test]
+    fn a_pass_after_the_config_turned_hostile_refuses_before_forwarding_any_file() {
+        use std::time::Duration;
+
+        let real = real_toolchain();
+        let scratch = Scratch::new("loader-env-pending");
+        let root = scratch.0.clone();
+        let mark = root.join("MARK_cargo_env_loader");
+        let Some(dylib) = build_marker_dylib(&root.join("dylib"), &mark) else { return };
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        scrub_environment(&real.proxy_dir);
+        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+
+        let mut engine = semantic::engine(&root).expect("no cargo config yet: the engine starts");
+        if let Err(error) = engine.answer(&[], &index_of(&root)) {
+            panic!("the first pass on a clean fixture failed: {error:#}");
+        }
+
+        // util.rs has no call site: a pass about it alone asks nothing,
+        // reaches no server, and leaves util.rs pending.
+        let util = RelPath::new("app/src/util.rs");
+        write(
+            &root.join(util.as_str()),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n\npub fn helper() {}\n",
+        );
+        if let Err(error) = engine.answer(&[util], &index_of(&root)) {
+            panic!("a pass about util.rs on a clean fixture failed: {error:#}");
+        }
+
+        let config = root.join(".cargo/config.toml");
+        write(
+            &config,
+            &format!("[env]\n{LOADER_VAR} = {{ value = {:?}, force = true }}\n", dylib.to_string_lossy()),
+        );
+        write(&root.join("app/src/bin/extra.rs"), "fn main() {}\n");
+        let files = [RelPath::new("app/src/main.rs"), RelPath::new("app/src/bin/extra.rs")];
+        let reason = match engine.answer(&files, &index_of(&root)) {
+            Ok(_) => panic!("a pass ran after the cargo config turned hostile"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            reason.contains(LOADER_VAR) && reason.contains(&config.display().to_string()),
+            "the pass failed, but not by refusing the [env] {LOADER_VAR} in {}: {reason}",
+            config.display()
+        );
+        if let Err(after) = mark_stays_absent(&mark, Duration::from_secs(10)) {
+            panic!("a rustc loaded the [env] {LOADER_VAR} dylib {after:?} after the refused pass");
+        }
+        drop(engine);
+
+        // Sanity: the hostile config is live, as in the test above.
+        let output = Command::new(real.proxy_dir.join("cargo"))
+            .args(["metadata", "--format-version", "1"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cargo metadata in the fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            mark.is_file(),
+            "sanity: `cargo metadata` in the fixture never loaded the [env] {LOADER_VAR} dylib, so this test \
+             would prove nothing about that channel"
+        );
+    }
+
+    fn index_of(root: &Path) -> SdkIndex {
+        let project = ProjectContext::load(root).expect("the fixture is a loadable Rust project");
+        let mut index = SdkIndex::new();
+        for path in walk_project(root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+            let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+            let graph = RustExtractor.extract(&project, &path, &source);
+            index.insert(path, source, graph);
+        }
+        index
+    }
+}
+
+/// rust-analyzer runs no file watcher of its own (the bridge claims client
+/// file watching), so an edit on disk reaches it only through the engine.
+mod source_freshness {
+    use super::*;
+
+    fn index_of(root: &Path) -> SdkIndex {
+        let project = ProjectContext::load(root).expect("the fixture is a loadable Rust project");
+        let mut index = SdkIndex::new();
+        for path in walk_project(root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+            let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+            let graph = RustExtractor.extract(&project, &path, &source);
+            index.insert(path, source, graph);
+        }
+        index
+    }
+
+    /// What `main`'s semantic edges in `answer` point at: the qualified name
+    /// each target placeholder is keyed by (`util::Thing::method`).
+    fn called_by_main(index: &SdkIndex, answer: &g_mesh_plugin_sdk::SemanticAnswer) -> Vec<String> {
+        let main = index
+            .graph(&RelPath::new("app/src/main.rs"))
+            .expect("app/src/main.rs is indexed")
+            .nodes
+            .iter()
+            .find(|node| node.name == "main")
+            .expect("the extractor emits `main`")
+            .id
+            .clone();
+        answer
+            .diff
+            .upsert_edges
+            .iter()
+            .filter(|edge| edge.from_id == main && edge.source == SourceTier::Semantic)
+            .map(|edge| {
+                let target = answer.diff.upsert_nodes.iter().find(|node| node.id == edge.to_id);
+                match target.and_then(|node| node.target.as_ref()).map(|target| &target.key) {
+                    Some(TargetKey::QualifiedName(name)) => name.clone(),
+                    other => format!("{} (target {other:?})", edge.to_id),
+                }
+            })
+            .collect()
+    }
+
+    /// An edit to a file no question is asked in (util.rs has no call site,
+    /// so it is never opened on the server) still reaches rust-analyzer, and
+    /// the answer about its caller is built from the edited text. The edit
+    /// moves `Thing::method` down and puts `Other::method` on its old lines:
+    /// a server still holding the old text answers with the old position,
+    /// which now lands on `Other::method`.
+    ///
+    /// Control: in `LspBridge::answer`, forward nothing (an empty set for the
+    /// `forward_watched` call).
+    #[test]
+    fn an_edit_to_a_file_no_question_touched_reaches_the_answer_about_its_caller() {
+        let real = real_toolchain();
+        let scratch = Scratch::new("fresh-unasked");
+        let root = scratch.0.clone();
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        scrub_environment(&real.proxy_dir);
+        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+
+        let mut engine = semantic::engine(&root).expect("the engine starts");
+        let before = index_of(&root);
+        let first = engine.answer(&[], &before).expect("the first pass answers");
+        assert_eq!(
+            called_by_main(&before, &first),
+            ["util::Thing::method"],
+            "sanity: the first pass resolves `main -> Thing::method`"
+        );
+
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Other;\n\nimpl Other {\n    pub fn method(&self) {}\n}\n\n\
+             pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        let after = index_of(&root);
+        let files = [RelPath::new("app/src/util.rs"), RelPath::new("app/src/main.rs")];
+        let second = engine.answer(&files, &after).expect("the second pass answers");
+        assert_eq!(
+            called_by_main(&after, &second),
+            ["util::Thing::method"],
+            "`main -> method` must land on the edited `Thing::method`; `Other::method` is where the old \
+             text had it"
+        );
+    }
 }

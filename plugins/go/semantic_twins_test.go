@@ -18,6 +18,8 @@ package main
 
 import (
 	"bufio"
+	"go/token"
+	"go/types"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +27,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"golang.org/x/tools/go/packages"
 )
 
 const twinModule = "example.com/twins"
@@ -51,10 +55,13 @@ func (impl) Bind() string { return "%s" }
 var twinFiles = map[string]string{
 	"go.mod": "module " + twinModule + "\n\ngo 1.22\n",
 
-	// The host-built twin. Its last two declarations sit behind `//line`
-	// directives (T6): Legacy's declaring file becomes lib/legacy.tmpl, a
-	// project file that is not Go source, and Outside's a path outside the
-	// project root.
+	// The host-built twin. Its last three declarations sit behind `//line`
+	// directives (T6), so their declaring file is not one the host build
+	// compiles for lib: Legacy's becomes lib/legacy.tmpl, a project file
+	// that is not Go source; Outside's an absolute path outside the project
+	// root (the {{OUTSIDE}} placeholder twinFixture fills in); Phantom's
+	// lib/not-in-build/phantom.go, a .go path inside the root that no build
+	// compiles.
 	"lib/binding.go": "//go:build !tagx\n\npackage lib\n" +
 		strings.ReplaceAll(twinDecls, "%s", "json") + `
 //line legacy.tmpl:1
@@ -62,9 +69,14 @@ type Legacy interface {
 	Run() string
 }
 
-//line /gm570-outside/outside.go:1
+//line {{OUTSIDE}}:1
 type Outside interface {
 	Walk() string
+}
+
+//line not-in-build/phantom.go:1
+type Phantom interface {
+	Probe() string
 }
 `,
 
@@ -76,6 +88,10 @@ type Legacy interface {
 
 type Outside interface {
 	Walk() string
+}
+
+type Phantom interface {
+	Probe() string
 }
 `,
 
@@ -135,6 +151,8 @@ func UseSize() int {
 func UseLegacy(l lib.Legacy) string { return l.Run() }
 
 func UseOutside(o lib.Outside) string { return o.Walk() }
+
+func UsePhantom(p lib.Phantom) string { return p.Probe() }
 
 func Convert() interface{} { return lib.Kelvin(3) }
 
@@ -205,10 +223,24 @@ func renderTwinEdges(t *testing.T, root string, diff fileChangeDiff) ([]string, 
 	return out, nodes
 }
 
+// twinFixture writes twinFiles to a fresh root, with Outside's `//line`
+// path made absolute on every OS: a file in a sibling temp directory, which
+// relPathOf refuses. A bare `/outside/outside.go` is absolute only on Unix;
+// on Windows it has no drive and lands inside the root.
+func twinFixture(t *testing.T) string {
+	t.Helper()
+	outside := filepath.ToSlash(filepath.Join(t.TempDir(), "outside-project-root", "outside.go"))
+	files := make(map[string]string, len(twinFiles))
+	for name, contents := range twinFiles {
+		files[name] = strings.ReplaceAll(contents, "{{OUTSIDE}}", outside)
+	}
+	return writeTree(t, files)
+}
+
 func twinWholePass(t *testing.T) (string, []string, map[string]wireNode) {
 	t.Helper()
 	requireGoToolchain(t)
-	root := writeTree(t, twinFiles)
+	root := twinFixture(t)
 	diff, reason, _ := newPluginState(root).handleSemanticPass(nil)
 	if reason != "" {
 		t.Fatalf("a whole-project pass answered incomplete: %s", reason)
@@ -234,8 +266,9 @@ func requireTwinNode(t *testing.T, nodes map[string]wireNode, key string) wireNo
 // T1, T2, T3, T5, T6 and the two filters in one whole-project pass: every
 // answer, with the scope it is sent with. Twinned names (Binder, Binder.Bind,
 // Kelvin, Codec.Encode) are addressed by the host-built twin; everything else
-// keeps its container, including the twins whose declaring file is not a Go
-// file of this project (Legacy.Run, Outside.Walk).
+// keeps its container, including the twins whose declaring file is not one
+// the host build compiles for lib (Legacy.Run in a template, Outside.Walk
+// outside the root, Phantom.Probe in an in-root .go path no build compiles).
 func TestSemanticPassAddressesBuildTagTwinsByTheHostBuiltFile(t *testing.T) {
 	_, got, _ := twinWholePass(t)
 
@@ -249,10 +282,14 @@ func TestSemanticPassAddressesBuildTagTwinsByTheHostBuiltFile(t *testing.T) {
 		// an ignored test file: neither makes a twin.
 		"app/app.go:UseName CALLS " + lib + "#Codec.Name",
 		"app/app.go:UseSize CALLS " + lib + "#Codec.Size",
-		// T6: a twin whose declaring file is not a project Go file keeps the
-		// container scope rather than losing the edge.
+		// T6: a twin whose declaring file is not one the host build
+		// compiles keeps the container scope rather than losing the edge:
+		// lib/legacy.tmpl, a file under outside-project-root, and
+		// lib/not-in-build/phantom.go (a .go name, so a suffix check alone
+		// would file-scope it onto a file core never indexed).
 		"app/app.go:UseLegacy CALLS " + lib + "#Legacy.Run",
 		"app/app.go:UseOutside CALLS " + lib + "#Outside.Walk",
+		"app/app.go:UsePhantom CALLS " + lib + "#Phantom.Probe",
 		// A conversion of a twinned and of a plain type.
 		"app/app.go:Convert REFERENCES file:lib/binding.go#Kelvin",
 		"app/app.go:ConvertMeters REFERENCES " + lib + "#Meters",
@@ -326,7 +363,7 @@ func TestSemanticPassGivesAFileScopedPlaceholderItsOwnID(t *testing.T) {
 // container address.
 func TestSemanticPassPerFileKeepsTwinsOfAnImportedPackage(t *testing.T) {
 	requireGoToolchain(t)
-	root := writeTree(t, twinFiles)
+	root := twinFixture(t)
 
 	diff, reason, _ := newPluginState(root).handleSemanticPass([]string{"app/app.go"})
 	if reason != "" {
@@ -357,13 +394,13 @@ func TestLoadReferencedTwinsListsUnderTheOfflineEnv(t *testing.T) {
 	if err != nil {
 		t.Skip("no go on PATH")
 	}
-	root := writeTree(t, twinFiles)
+	root := twinFixture(t)
 	log := filepath.Join(t.TempDir(), "go.log")
 	binDir := t.TempDir()
 	buildRecordingGo(t, binDir, realGo, log)
 
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("GOPROXY", "https://gm570-proxy.invalid")
+	t.Setenv("GOPROXY", "https://user-proxy.invalid")
 	t.Setenv("GOSUMDB", "sum.golang.org")
 	t.Setenv("GOFLAGS", "-mod=mod")
 	t.Setenv("GOENV", "off")
@@ -514,5 +551,56 @@ func init() {}
 
 	if twins := twinnedNames("lib", loaded, nil); len(twins) != 0 {
 		t.Fatalf("a package with no excluded file has twins: %v", twins)
+	}
+}
+
+// T6 on targetScopeOf alone, with no `go list`: a twinned answer is
+// file-scoped only when its declaring file is one the host build compiles
+// for the package (builtFiles). A `.go` name is not enough - an in-root
+// phantom path a `//line` directive names has one, on every OS.
+func TestTargetScopeOfKeepsTheContainerForAFileTheHostDoesNotBuild(t *testing.T) {
+	const pkg = twinModule + "/lib"
+	r := newResolutions()
+	r.twinned[pkg] = map[string]bool{"Outside": true}
+	r.builtFiles[pkg] = map[string]bool{"lib/binding.go": true}
+	obj := types.NewTypeName(token.NoPos, nil, "Outside", nil)
+	key := dotPath("Outside")
+	for file, want := range map[string]targetScope{
+		"lib/binding.go":              {File: "lib/binding.go"},
+		"lib/not-in-build/phantom.go": {Container: pkg},
+		"lib/legacy.tmpl":             {Container: pkg},
+	} {
+		r.declaredIn[obj] = file
+		if got := r.targetScopeOf(obj, pkg, key); got != want {
+			t.Errorf("declared in %s: targetScopeOf = %+v, want %+v", file, got, want)
+		}
+	}
+}
+
+// builtFiles is a union across module views, like twinned: a second view
+// of the same package path adds its files and never drops the first
+// view's, and a GoFiles entry outside the project root is skipped.
+func TestRecordBuiltFilesUnionsViewsAndSkipsFilesOutsideTheRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside-project-root", "outside.go")
+	e := newSemanticEngine(root)
+	r := newResolutions()
+	const pkg = twinModule + "/lib"
+
+	e.recordBuiltFiles(r, &packages.Package{PkgPath: pkg, GoFiles: []string{
+		filepath.Join(root, "lib", "binding.go"),
+		outside,
+	}})
+	e.recordBuiltFiles(r, &packages.Package{PkgPath: pkg, GoFiles: []string{
+		filepath.Join(root, "lib", "plain.go"),
+	}})
+
+	var got []string
+	for file := range r.builtFiles[pkg] {
+		got = append(got, file)
+	}
+	sort.Strings(got)
+	if want := []string{"lib/binding.go", "lib/plain.go"}; !equalStrings(got, want) {
+		t.Fatalf("builtFiles[%s] = %v, want %v", pkg, got, want)
 	}
 }

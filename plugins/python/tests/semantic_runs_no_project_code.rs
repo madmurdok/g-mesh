@@ -18,16 +18,18 @@
 //!   on `PATH` (no pyright): `npx` there would run the project's package, so
 //!   it must never run, and the tier is off with the remedy.
 //!
-//! The shims are shell scripts, so the whole file is unix only. The tests
-//! rewrite `PATH` and the working directory of this process, so they hold
-//! one lock.
+//! The shims are shell scripts, so the whole file is unix only. Each test
+//! builds its fixture in this process, then re-runs this test binary as a
+//! child limited to an `#[ignore]`d `<test>_in_its_env` test, with the
+//! fixture's `PATH`, manifest, working directory and scratch path. The child
+//! runs the engine and the assertions. No test changes this process's
+//! environment or working directory, so the tests are independent of order.
 
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 
 use g_mesh_plugin_python::extractor::PythonExtractor;
 use g_mesh_plugin_python::project::{ProjectContext, EXCLUDE_DIRS};
@@ -35,7 +37,9 @@ use g_mesh_plugin_python::semantic;
 use g_mesh_plugin_sdk::wire::SourceTier;
 use g_mesh_plugin_sdk::{walk_project, Extractor, SdkIndex, MANIFEST_PATH_ENV};
 
-static ENVIRONMENT: Mutex<()> = Mutex::new(());
+/// The scratch directory a child test reads its fixture from. Only the
+/// parent test sets it.
+const SCRATCH_ENV: &str = "G_MESH_PY_GM513_SCRATCH";
 
 const MAIN_PY: &str = "from vpkg import vfunc\n\n\ndef use():\n    made = vfunc()\n    made.method()\n";
 const LIB_PY: &str = "class Thing:\n    def method(self):\n        return 1\n";
@@ -111,18 +115,46 @@ fn written(logs: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-fn set_environment(path: &[PathBuf], cwd: &Path) {
-    std::env::set_var("PATH", std::env::join_paths(path).unwrap());
-    std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
-    std::env::remove_var("VIRTUAL_ENV");
-    std::env::set_current_dir(cwd).unwrap();
+/// The line a child test prints once its assertions have passed.
+fn ran_marker(test: &str) -> String {
+    format!("{test}: ran in its environment")
 }
 
-/// `pfx`, a whole-project pass over it, and the assertions. With
-/// `config_names_the_venv`, the project also has a `pyrightconfig.json`
-/// pointing pyright at its venv.
-fn pyright_runs_no_interpreter(config_names_the_venv: bool) {
-    let _guard = ENVIRONMENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+/// Runs the ignored test `test` of this binary in a child process with `path`
+/// as `PATH`, the shipped manifest, no `VIRTUAL_ENV`, `cwd` as working
+/// directory and `scratch` in [`SCRATCH_ENV`]; asserts that it ran and passed.
+fn in_its_env(test: &str, path: &[PathBuf], cwd: &Path, scratch: &Path) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+        .env("PATH", std::env::join_paths(path).unwrap())
+        .env(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))
+        .env_remove("VIRTUAL_ENV")
+        .env(SCRATCH_ENV, scratch)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains(&ran_marker(test)),
+        "{test} did not pass in its environment ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+        output.status
+    );
+}
+
+/// The fixture of a child test, or `None` when the test was started without
+/// its parent (`--ignored`/`--run-ignored`), which then tests nothing.
+fn scratch_from_env(test: &str) -> Option<PathBuf> {
+    let scratch = std::env::var_os(SCRATCH_ENV).map(PathBuf::from);
+    if scratch.is_none() {
+        println!("{test}: skipped, it runs only as the child of its parent test, which sets {SCRATCH_ENV}");
+    }
+    scratch
+}
+
+/// `pfx`, run by `child` in its environment. With `config_names_the_venv`,
+/// the project also has a `pyrightconfig.json` pointing pyright at its venv.
+fn pyright_runs_no_interpreter(config_names_the_venv: bool, child: &str) {
     let installed = installed_bin();
     let real_python = absolute("python3");
     let node_dir = absolute("node").parent().unwrap().to_path_buf();
@@ -158,10 +190,22 @@ fn pyright_runs_no_interpreter(config_names_the_venv: bool) {
         shim(&shims.join(name), &path_log, &exec_python);
     }
 
-    set_environment(
-        &[shims.clone(), installed.clone(), node_dir, PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+    in_its_env(
+        child,
+        &[shims, installed, node_dir, PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
         &root,
+        &scratch.0,
     );
+}
+
+/// The child of [`pyright_runs_no_interpreter`]: a whole-project pass over
+/// `pfx` and the assertions.
+fn pyright_answers_without_interpreter(test: &str) {
+    let Some(scratch) = scratch_from_env(test) else { return };
+    let root = scratch.join("project");
+    let logs_dir = scratch.join("logs");
+    let venv_log = logs_dir.join("venv-python");
+    let path_log = logs_dir.join("path-python");
 
     // Sanity: both interpreters are the shims, and they log.
     run(&root.join(".venv/bin/python"), &["-c", "pass"], &root);
@@ -213,21 +257,38 @@ fn pyright_runs_no_interpreter(config_names_the_venv: bool) {
         Vec::<String>::new(),
         "pyright ran a Python interpreter (the project venv's or one from PATH)"
     );
+    println!("{}", ran_marker(test));
 }
 
 #[test]
 fn pyright_runs_neither_the_venv_python_nor_one_from_path() {
-    pyright_runs_no_interpreter(false);
+    pyright_runs_no_interpreter(false, "pyright_runs_neither_the_venv_python_nor_one_from_path_in_its_env");
+}
+
+#[test]
+#[ignore = "run by its parent test in the fixture's environment"]
+fn pyright_runs_neither_the_venv_python_nor_one_from_path_in_its_env() {
+    pyright_answers_without_interpreter("pyright_runs_neither_the_venv_python_nor_one_from_path_in_its_env");
 }
 
 #[test]
 fn a_pyrightconfig_naming_the_venv_runs_no_interpreter_either() {
-    pyright_runs_no_interpreter(true);
+    pyright_runs_no_interpreter(
+        true,
+        "a_pyrightconfig_naming_the_venv_runs_no_interpreter_either_in_its_env",
+    );
+}
+
+#[test]
+#[ignore = "run by its parent test in the fixture's environment"]
+fn a_pyrightconfig_naming_the_venv_runs_no_interpreter_either_in_its_env() {
+    pyright_answers_without_interpreter(
+        "a_pyrightconfig_naming_the_venv_runs_no_interpreter_either_in_its_env",
+    );
 }
 
 #[test]
 fn the_projects_own_pyright_is_never_probed_or_run() {
-    let _guard = ENVIRONMENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let installed = installed_bin();
     let node = absolute("node");
     let scratch = Scratch::new("local");
@@ -249,7 +310,24 @@ fn the_projects_own_pyright_is_never_probed_or_run() {
     let shims = scratch.0.join("shims");
     shim(&shims.join("npx"), &npx_log, "exit 1");
 
-    set_environment(&[shims, PathBuf::from("/usr/bin"), PathBuf::from("/bin")], &root);
+    in_its_env(
+        "the_projects_own_pyright_is_never_probed_or_run_in_its_env",
+        &[shims, PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+        &root,
+        &scratch.0,
+    );
+}
+
+#[test]
+#[ignore = "run by its parent test in the fixture's environment"]
+fn the_projects_own_pyright_is_never_probed_or_run_in_its_env() {
+    let test = "the_projects_own_pyright_is_never_probed_or_run_in_its_env";
+    let Some(scratch) = scratch_from_env(test) else { return };
+    let root = scratch.join("project");
+    let logs_dir = scratch.join("logs");
+    let local_log = logs_dir.join("project-pyright");
+    let npx_log = logs_dir.join("npx");
+    let local_bin = root.join("node_modules/.bin");
 
     // Sanity: the project's copy is a working pyright and logs, and no other
     // pyright is reachable.
@@ -267,6 +345,7 @@ fn the_projects_own_pyright_is_never_probed_or_run() {
     );
     assert!(!npx_log.exists(), "npx was run: in the project it runs the project's own node_modules/pyright");
     assert!(engine.is_err(), "with no pyright on PATH, nothing may resolve");
+    println!("{}", ran_marker(test));
 }
 
 /// The test above stubs `npx` with `exit 1`, so it cannot see what a real
@@ -281,7 +360,6 @@ fn the_projects_own_pyright_is_never_probed_or_run() {
 /// append an `npx --yes --package pyright <bin>` candidate for a bare name.
 #[test]
 fn a_real_npx_in_the_project_never_runs_the_projects_pyright() {
-    let _guard = ENVIRONMENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let node = absolute("node");
     let npx = absolute("npx");
     let scratch = Scratch::new("npx");
@@ -317,7 +395,23 @@ fn a_real_npx_in_the_project_never_runs_the_projects_pyright() {
     std::os::unix::fs::symlink(&node, shims.join("node")).unwrap();
     shim(&shims.join("npx"), &npx_log, &format!("exec '{}' \"$@\"", npx.display()));
 
-    set_environment(&[shims, PathBuf::from("/usr/bin"), PathBuf::from("/bin")], &root);
+    in_its_env(
+        "a_real_npx_in_the_project_never_runs_the_projects_pyright_in_its_env",
+        &[shims, PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+        &root,
+        &scratch.0,
+    );
+}
+
+#[test]
+#[ignore = "run by its parent test in the fixture's environment"]
+fn a_real_npx_in_the_project_never_runs_the_projects_pyright_in_its_env() {
+    let test = "a_real_npx_in_the_project_never_runs_the_projects_pyright_in_its_env";
+    let Some(scratch) = scratch_from_env(test) else { return };
+    let root = scratch.join("project");
+    let logs_dir = scratch.join("logs");
+    let marker = logs_dir.join("project-pyright-package");
+    let npx_log = logs_dir.join("npx");
 
     // Sanity: no pyright on PATH, and the real npx in the project runs the
     // project's package (the probe the npx candidate would run).
@@ -341,4 +435,5 @@ fn a_real_npx_in_the_project_never_runs_the_projects_pyright() {
         message.contains("npm install -g pyright") && message.contains("PATH"),
         "remedy missing: {message}"
     );
+    println!("{}", ran_marker(test));
 }

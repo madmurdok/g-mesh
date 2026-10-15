@@ -631,6 +631,41 @@ is no rescan on start, so such a file is only picked up the next time it
 changes with a daemon up — or by deleting the project's state directory (see
 below) to force a fresh full walk.
 
+### A linked `git worktree`: seeded from the main checkout
+
+A linked worktree (`git worktree add`) gets an index of its own. When it has
+none yet and the main working tree has a complete index built by the same
+g-mesh and plugin builds, the daemon copies that index (SQLite online backup,
+about a second for 110 MB) instead of walking. Its first start then
+reconciles the copy with the worktree: every walked file is hashed, the ones
+that differ are reparsed, and files the main checkout indexed that the
+worktree does not walk are dropped. Tool calls wait for that (seconds,
+proportional to the files hashed and reparsed), not for a cold walk; the
+semantic refresh of the reparsed files runs right after, in the background
+(a start that dies before it finishes leaves it owed to the next start).
+The log says `index seeded from <main checkout>`; `G_MESH_SEED=0` turns
+seeding off (a cold walk, as before).
+
+The gain depends on how far the worktree is from the main checkout. Measured
+on g-mesh ([results](docs/results/GM-564-seeded-worktree-first-answer.md)): a
+worktree of the main checkout's commit answers its first call in about 1 s
+and is ready in about 2 s, against 15 s and 165 s cold; a worktree about a
+thousand files away answers its first call in about 25 s, later than a cold
+walk's first structural answer, because calls wait for the whole reconcile,
+but is still ready several times sooner.
+
+One difference from a cold index remains until the worktree has its own
+dependencies: edges the main checkout's language servers resolved into
+gitignored inputs (`node_modules`, a virtualenv, build output) are copied
+too, so before `npm ci` or a build the seeded worktree answers as if those
+were installed, where a cold index would leave them unresolved. A lockfile or
+manifest a plugin watches (`[plugin.workspace] watch_files`) is compared with
+the main checkout's file at the same path: each language whose watch files
+differ is reindexed at that start, as an edit of the file would, while the
+copied graph keeps answering until the reindex swaps in. A later start (no
+longer seeded) does not compare them; their next edit with the daemon up
+reindexes the language.
+
 ## Idle behaviour
 
 The daemon is two processes with very different costs, and each has its own
