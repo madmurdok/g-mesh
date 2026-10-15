@@ -125,6 +125,14 @@ fn run_local(args: &[&str], extra_env: &[(&str, &str)]) -> (Output, Vec<Call>) {
     (output, calls)
 }
 
+/// The programs `scripts/test-local.sh` and the scripts it calls run, `go`
+/// aside; the go-less `PATH` links just these.
+const SCRIPT_TOOLS: &[&str] = &[
+    "bash", "env", "git", "sed", "awk", "grep", "tr", "cat", "dirname", "basename", "mkdir", "rm", "mv",
+    "ls", "find", "stat", "date", "diff", "mktemp", "rev", "python3", "python", "tee", "sleep", "kill",
+    "sort", "uniq", "wc", "head", "tail", "cut", "xargs", "cp", "touch", "uname",
+];
+
 /// `run_local` that also returns the stand-in `go`'s calls (`<cwd>|<args>`).
 /// Without `with_go` no `go` is on `PATH` at all.
 fn run_local_go(
@@ -146,9 +154,24 @@ fn run_local_go(
         fs::write(&go, FAKE_GO).unwrap();
         fs::set_permissions(&go, fs::Permissions::from_mode(0o755)).unwrap();
     } else {
-        // Only the system directories, where no `go` lives.
-        path = format!("{}:/usr/bin:/bin", bin.display());
-        assert!(!Path::new("/usr/bin/go").exists() && !Path::new("/bin/go").exists());
+        // No system directory on `PATH` (one may hold a `go`, as on CI's
+        // runner): a directory of links to the tools the script runs, `go`
+        // not among them.
+        let tools = dir.path().join("tools");
+        fs::create_dir_all(&tools).unwrap();
+        let real_path = std::env::var_os("PATH").unwrap_or_default();
+        for name in SCRIPT_TOOLS {
+            let found = std::env::split_paths(&real_path)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file() && fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0));
+            if let Some(found) = found {
+                std::os::unix::fs::symlink(found, tools.join(name)).unwrap();
+            }
+        }
+        path = format!("{}:{}", bin.display(), tools.display());
+        for dir in path.split(':') {
+            assert!(!Path::new(dir).join("go").exists(), "a go on the go-less PATH: {dir}");
+        }
     }
 
     let mut cmd = Command::new("bash");
