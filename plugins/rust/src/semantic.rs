@@ -133,6 +133,9 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     // manifest change before `CheckedBridge` could re-check the configs, so
     // the server is told the client watches files: it registers its globs
     // here and reloads only when `CheckedBridge::workspace_changed` asks.
+    // The bridge forwards the `.rs` files a pass is sent, inside
+    // `CheckedBridge::answer`, so even a created or deleted one (which makes
+    // rust-analyzer refetch the workspace) reaches it only after a re-check.
     let bridge = LspBridge::new(LANGUAGE, root, config).quiescent_signal().client_watches_files();
     Ok(Box::new(CheckedBridge::new(root, bridge)))
 }
@@ -146,9 +149,11 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
 /// after a clean re-check. A hostile or unreadable config stops the server
 /// and makes every later pass `Err`: the plugin is structural-only from then
 /// on. rust-analyzer runs no watcher of its own (the bridge claims client
-/// file watching and forwards no file events), so a reload happens only at
-/// start-up and when [`SemanticEngine::workspace_changed`] asks for one, each
-/// after a clean re-check.
+/// file watching), so it hears of a change on disk only from this engine:
+/// the source files a pass is sent, forwarded by the bridge inside
+/// [`SemanticEngine::answer`], and a reload when
+/// [`SemanticEngine::workspace_changed`] asks for one, each after a clean
+/// re-check. A manifest or cargo config is never forwarded.
 struct CheckedBridge {
     root: PathBuf,
     /// `None` once refused: dropping the bridge shuts its server down.

@@ -44,10 +44,19 @@ rust-analyzer's `cargo.extraEnv`, did not stop it.
   the process. rust-analyzer runs no file watcher of its own: the bridge
   claims client file watching (`didChangeWatchedFiles` dynamic
   registration, with rust-analyzer's default `files.watcher = "client"`)
-  and forwards no file events, so a manifest or config edit reaches
-  `cargo metadata` only through the reload `workspaceChanged` asks for
-  after a clean re-check. A config added together with a manifest edit is
-  therefore refused before rust-analyzer reloads.
+  and forwards, as `workspace/didChangeWatchedFiles`, only the `.rs` files
+  core sends a pass, inside the checked pass. rust-analyzer refetches the
+  workspace (`cargo metadata`) on a created or deleted file of any kind and
+  on a `Cargo.toml`, `Cargo.lock` or `.cargo/config*` change, but not on an
+  edit to an existing `.rs` file (`should_refresh_for_change` and
+  `process_changes`, rust-analyzer 1.97.1), so every forwarded event is
+  sent after a clean re-check. A manifest or config edit is never
+  forwarded: it reaches `cargo metadata` only through the reload
+  `workspaceChanged` asks for after a clean re-check. A config added
+  together with a manifest edit is therefore refused before rust-analyzer
+  reloads. Without the forwarding, an edit to a file no pass asks about
+  never reached the server, and answers in files that depend on it went
+  stale.
 - **D3 - the key list is broad:** `DYLD_INSERT_LIBRARIES`,
   `DYLD_FRAMEWORK_PATH`, `DYLD_LIBRARY_PATH`, `LD_PRELOAD`, `LD_AUDIT`,
   `LD_LIBRARY_PATH`.
