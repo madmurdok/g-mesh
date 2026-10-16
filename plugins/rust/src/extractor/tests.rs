@@ -739,6 +739,89 @@ fn a_type_qualified_path_call_is_a_qualified_name_placeholder() {
     );
 }
 
+/// Open sites out of `from` whose name is `name`.
+fn open_sites_from<'g>(graph: &'g Graph, from: &str, name: &str) -> Vec<&'g OpenSite> {
+    let from = graph.node(from).id.clone();
+    graph.0.open_sites.iter().filter(|site| site.from_id == from && site.name == name).collect()
+}
+
+/// GM-594: a path pattern (`Mode::A =>`) names a variant and binds nothing,
+/// so a type-qualified path inside its arm is resolved like anywhere else -
+/// a `qualifiedName` placeholder or a same-file edge - and is never opened
+/// to the semantic tier at its qualifier.
+#[test]
+fn a_type_qualified_call_inside_a_path_pattern_arm_keeps_its_structural_edge() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub enum Mode { A, B(u8) }\n\
+         impl Mode {\n  pub fn new() -> Mode { Mode::A }\n  \
+         pub fn set(&mut self) { match *self { Mode::A => { *self = Mode::B(1); Mode::new(); } Mode::B(_) => {} } }\n}\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    let targets = graph.targets(EdgeKind::Calls, "Mode::set");
+    assert!(targets.contains(&"Mode::new".to_string()), "{targets:?}");
+    assert!(
+        targets.iter().any(|target| target.starts_with("pending_symbol ") && target.ends_with("Mode::B")),
+        "{targets:?}"
+    );
+    for name in ["Mode::new", "Mode::B"] {
+        assert!(open_sites_from(&graph, "Mode::set", name).is_empty(), "{name}: {:#?}", graph.0.open_sites);
+    }
+}
+
+/// The names a pattern really introduces still shadow: a call of a local
+/// `x` bound by any of these forms is a local's call, not an edge to the free
+/// `fn x` beside it. `unbound` shows that edge is what an unbound `x()` gets.
+#[test]
+fn identifier_bindings_in_a_pattern_still_shadow_an_item_of_the_same_name() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub fn x() {}
+pub struct S { pub x: fn() }
+pub fn unbound(o: Option<fn()>) { match o { Some(_) => x(), None => {} } }
+pub fn plain(o: fn()) { match o { x => x() } }
+pub fn by_ref(o: fn()) { match o { ref x => x() } }
+pub fn at(o: Option<fn()>) { match o { x @ Some(_) => { x.unwrap()(); x(); } None => {} } }
+pub fn shorthand(s: S) { match s { S { x } => x() } }
+pub fn variant(o: Option<fn()>) { match o { Some(x) => x(), None => {} } }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "unbound"), vec!["x"]);
+    for function in ["plain", "by_ref", "at", "shorthand", "variant"] {
+        assert!(
+            !graph.targets(EdgeKind::Calls, function).contains(&"x".to_string()),
+            "{function}: {:?}",
+            graph.targets(EdgeKind::Calls, function)
+        );
+    }
+}
+
+/// `if let` and `let ... else` bind through the same walk: a path pattern
+/// there binds nothing either, and `Mode::new()` after it stays structural.
+#[test]
+fn if_let_and_let_else_with_a_path_pattern_bind_nothing() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub enum Mode { A, B }
+impl Mode { pub fn new() -> Mode { Mode::A } }
+pub fn if_let(m: Mode) { if let Mode::A = m { Mode::new(); } }
+pub fn let_else(m: Mode) { let Mode::B = m else { return; }; Mode::new(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for function in ["if_let", "let_else"] {
+        assert_eq!(graph.targets(EdgeKind::Calls, function), vec!["Mode::new"], "{function}");
+        assert!(
+            open_sites_from(&graph, function, "Mode::new").is_empty(),
+            "{function}: {:#?}",
+            graph.0.open_sites
+        );
+    }
+}
+
 #[test]
 fn self_and_self_dot_inside_an_impl_reach_the_impl_types_own_method() {
     let krate = Crate::new(&[(
