@@ -235,6 +235,23 @@ fn child_fixture(test: &str) -> Option<(PathBuf, RealToolchain)> {
     Some((scratch, real))
 }
 
+/// The tests are independent of order and threads only while none of them
+/// changes this process's environment or working directory: a child gets
+/// its own through [`in_its_env`] instead. A run in one order can
+/// miss a change that breaks another, so this reads the source.
+#[test]
+fn no_test_changes_the_process_environment_or_working_directory() {
+    let source = include_str!("semantic_runs_no_project_code.rs");
+    for call in ["set_var", "remove_var", "set_current_dir"] {
+        let call = format!("{call}(");
+        assert!(
+            !source.contains(&call),
+            "a test calls `{call}`: it changes this process for every test after it; give the child test \
+             that environment through `in_its_env` instead"
+        );
+    }
+}
+
 /// Every log and marker a project hook writes, by what wrote it.
 struct Fixture {
     root: PathBuf,
