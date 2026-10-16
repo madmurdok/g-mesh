@@ -539,6 +539,9 @@ pub fn run(root: &Path) -> Result<()> {
         }
     };
 
+    // Kept for `supervise`, which detaches the state files before releasing
+    // them (GM-605); the original moves into the activation thread.
+    let indexing_for_teardown = indexing.clone();
     // Parked until the first tool call - see `daemon::activation`.
     activation::spawn(
         activation::ActivationCtx {
@@ -562,8 +565,15 @@ pub fn run(root: &Path) -> Result<()> {
 
     // `canonical_root`: the orphan check must stat the same spelling
     // everything else resolved against.
-    let outcome =
-        lifecycle::supervise(&canonical_root, &dir, &registry, &core_activity, timeouts, accept_loop);
+    let outcome = lifecycle::supervise(
+        &canonical_root,
+        &dir,
+        &registry,
+        &core_activity,
+        Some(&indexing_for_teardown),
+        timeouts,
+        accept_loop,
+    );
 
     // Released explicitly: the lock is now the only claim on this project, and
     // a slow teardown while holding it would wedge the project.
