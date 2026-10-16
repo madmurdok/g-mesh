@@ -154,11 +154,11 @@ type fileGraph struct {
 	// pass; never sent to core, which has no concept of one. The design
 	// doc's `FileGraph.open_sites`, and semantic.go's input.
 	openSites []openSite
-	// CALLS edges this tier emitted onto a placeholder, which the semantic
-	// pass retracts where the name turns out to be a type rather than a
-	// function - see placeholderCall's own doc comment. Never sent to core
-	// either.
-	placeholderCalls []placeholderCall
+	// Edges this tier emitted onto a placeholder, which the semantic pass
+	// retracts where the name turns out to be a type rather than a function,
+	// or a name declared in build-tag twins - see placeholderUse's own doc
+	// comment. Never sent to core either.
+	placeholderUses []placeholderUse
 	// container is the file's package as a container key, which every
 	// declaration node of the file also carries. Recorded here so the
 	// semantic pass can state `fromContainer` on the placeholders it emits
@@ -211,11 +211,11 @@ func extractFile(ws *workspace, relPath string, content []byte) fileGraph {
 	e.useAll(astFile)
 
 	return fileGraph{
-		nodes:            e.nodes,
-		edges:            e.edges,
-		openSites:        e.openSites,
-		placeholderCalls: e.placeholderCalls,
-		container:        e.container,
+		nodes:           e.nodes,
+		edges:           e.edges,
+		openSites:       e.openSites,
+		placeholderUses: e.placeholderUses,
+		container:       e.container,
 	}
 }
 
@@ -255,8 +255,8 @@ type extractor struct {
 	// see collectImports.
 	hasDotImport bool
 
-	openSites        []openSite
-	placeholderCalls []placeholderCall
+	openSites       []openSite
+	placeholderUses []placeholderUse
 	// initOrdinal counts `func init()` declarations within this file, so
 	// several of them get distinct node ids - see declareFunc.
 	initOrdinal int

@@ -130,7 +130,12 @@
 //!    `find_definition`, which has no `"anchor"` wrapper - and which, on this
 //!    rung, echoes its own `resolvedBy` at the top level too, exactly the
 //!    shape case 2 below matches on; see [`is_candidate_page`] for the extra
-//!    field that tells the two apart) - the happy path, used directly.
+//!    field that tells the two apart) - the happy path. Every narrowing key
+//!    the entry gave (`file`, `kind`, `qualified_name`, below) is still
+//!    checked against that one symbol (the `anchor`, or the node itself),
+//!    and a key that does not match fails the entry naming the key, the
+//!    expected and the actual value - a key that matched nothing must not
+//!    pass just because the name happened to be unique (GM-597).
 //! 2. **A candidate page** (a top-level `"resolvedBy"` key - `nameAmbiguous`,
 //!    `fileName`, or `semanticNeighbours`; see `find_definition::ResolvedBy`
 //!    - alongside a top-level `"results"` array; see [`is_candidate_page`]).
@@ -795,6 +800,39 @@ impl Narrowing<'_> {
     fn describe_keys(&self) -> String {
         self.keys().iter().map(|(key, _, value)| format!(", {key} = \"{value}\"")).collect()
     }
+
+    /// Decision 3 case 1: every key given, checked against the one symbol a
+    /// name resolved to directly - `node` is the `anchor` wrapper of the four
+    /// edge-walking tools or `find_definition`'s own top-level node. A key
+    /// that does not match is a finding naming the key, the value the entry
+    /// gave and the value the symbol has; without this, a key that matched
+    /// nothing passed silently whenever the name was unique (GM-597).
+    fn mismatches(&self, node: &Value) -> Vec<String> {
+        self.keys()
+            .into_iter()
+            .filter_map(|(key, field, expected)| {
+                let actual = node.get(field).and_then(Value::as_str);
+                (actual != Some(expected)).then(|| {
+                    let actual = actual.map_or_else(|| "<absent>".to_string(), |a| format!("\"{a}\""));
+                    format!(
+                        "selector `{key}` does not match the symbol the name resolved to: expected \
+                         {field} \"{expected}\", actual {field} {actual}"
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
+/// The finished answer of a name that resolved to one symbol directly
+/// (decision 3 case 1), or the selector mismatches that fail it.
+fn checked_direct_answer(value: Value, narrowing: Narrowing) -> Result<Value, Vec<String>> {
+    let mismatches = narrowing.mismatches(value.get("anchor").unwrap_or(&value));
+    if mismatches.is_empty() {
+        Ok(value)
+    } else {
+        Err(mismatches)
+    }
 }
 
 /// Decision 13's `excluded_references` block. Both fields are required once
@@ -1140,7 +1178,7 @@ fn resolve_and_call(
     };
     let value = tool_json(tool.call(ctx, first)).map_err(|e| vec![e])?;
     if !is_candidate_page(&value) {
-        return Ok(value);
+        return checked_direct_answer(value, narrowing);
     }
 
     let candidate_id = {
@@ -1500,7 +1538,7 @@ fn eval_definition_expectation(ctx: &EvalContext, index: usize, item: &SymbolExp
 fn resolve_definition(ctx: &EvalContext, symbol: &str, narrowing: Narrowing) -> Result<Value, Vec<String>> {
     let value = tool_json(call_definition(ctx, symbol.to_string())).map_err(|e| vec![e])?;
     if !is_candidate_page(&value) {
-        return Ok(value);
+        return checked_direct_answer(value, narrowing);
     }
 
     let candidate_id = {

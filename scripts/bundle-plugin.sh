@@ -72,6 +72,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/runnable.sh
+. "$REPO_ROOT/scripts/lib/runnable.sh"
 PLUGIN_DIR="$REPO_ROOT/plugins/typescript"
 CARGO_PROFILE="${CARGO_PROFILE:-release}"
 
@@ -161,11 +163,14 @@ main() {
 	grep -qF "command = \"./$exe_name\"" "$stage/plugin.toml" ||
 		die "failed to rewrite the command line in the staged manifest"
 
-	# Only meaningful when we built for the machine we are standing on - a
-	# cross-built binary cannot be executed here.
+	# Only meaningful where the staged binary can be executed: natively, or
+	# (GM-613) x86_64 macOS under Rosetta on an arm64 Mac - see
+	# scripts/lib/runnable.sh. The architecture is asserted first, so Rosetta
+	# cannot quietly run a mislabelled arm64 binary.
 	local host
 	host="$(host_triple)"
-	if [ "$target" = "$host" ]; then
+	assert_macho_arch "$stage/$exe_name" "$target"
+	if can_run_target "$target" "$host"; then
 		log "smoke test: handshake with no input"
 		local handshake
 		handshake="$(printf '' | "$stage/$exe_name" "$REPO_ROOT" 2>/dev/null || true)"
@@ -174,7 +179,7 @@ main() {
 		*) die "the staged TypeScript plugin did not produce a handshake (got: ${handshake:-<nothing>})" ;;
 		esac
 	else
-		log "smoke test skipped: $target is not the host ($host)"
+		smoke_skip_or_die "the staged TypeScript plugin's handshake" "$target" "$host"
 	fi
 
 	log "staged: $stage ($(du -sh "$stage" | cut -f1))"

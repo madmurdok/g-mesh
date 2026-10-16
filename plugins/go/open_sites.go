@@ -84,36 +84,51 @@ type openSite struct {
 	EnclosingCallerID string
 }
 
-// placeholderCall is the opposite of an open site: a call this tier *did*
-// answer, with an address that may turn out to name something a `CALLS` edge
-// can never land on.
+// placeholderUse is the opposite of an open site: a use this tier *did*
+// answer, onto a name-keyed placeholder whose address `go/types` can sharpen
+// or correct. One is recorded for every edge onto a placeholder, CALLS and
+// REFERENCES alike; the semantic pass retracts the structural edge in two
+// cases and leaves every other use alone.
 //
-// `pkg.T(x)` and `T(x)` are conversions, not calls, and they are written
-// exactly like a call - so the structural tier, which cannot tell a type
-// from a function across a file boundary, emits `CALLS` onto a name-keyed
-// placeholder for both. Core's kind filter then refuses to land that edge on
-// a `Type` (core/src/graph/symbol_links.rs, step 3), so the edge survives as
-// a permanently unresolved claim about a call that never happens. Recording
-// the site lets the semantic pass retract exactly those edges - it knows
-// whether the name is a func or a type - and re-state them as the
-// `REFERENCES` edge a conversion actually is. A site whose name really is a
-// function is left completely alone: the structural edge was right, and core
-// has already linked it.
+// A conversion. `pkg.T(x)` and `T(x)` are conversions, not calls, and they
+// are written exactly like a call - so the structural tier, which cannot
+// tell a type from a function across a file boundary, emits `CALLS` onto a
+// name-keyed placeholder for both. Core's kind filter then refuses to land
+// that edge on a `Type` (core/src/graph/symbol_links.rs, step 3), so the
+// edge survives as a permanently unresolved claim about a call that never
+// happens. The semantic pass knows whether the name is a func or a type,
+// and re-states a conversion as the `REFERENCES` edge it actually is.
 //
-// Only calls onto a *placeholder* are recorded. A same-file callee is a node
+// A twinned answer (GM-589). A name declared in two build-tag twins of one
+// package (gin's `binding.JSON`) gives the name-keyed placeholder two
+// candidates, so core refuses the edge. When `go/types` resolves the use to
+// the twin the host build compiles, the semantic pass retracts the
+// structural edge and emits one of the same kind onto a file-scoped
+// placeholder (GM-570's `targetScopeOf`), which links.
+//
+// Only uses onto a *placeholder* are recorded. A same-file target is a node
 // this file already emitted, so `emitUse` reads its kind directly and never
 // gets this wrong in the first place.
-type placeholderCall struct {
+type placeholderUse struct {
 	FilePath string
 	Line     int
 	Col      int
 	Name     string
-	// EdgeID is the CALLS edge the structural tier emitted, so the semantic
-	// pass can retract it by id without re-deriving anything.
+	// Kind is the kind of the structural edge EdgeID names: CALLS or
+	// REFERENCES.
+	Kind string
+	// EdgeID is the edge the structural tier emitted, so the semantic pass
+	// can retract it by id without re-deriving anything. Several sites of
+	// one `from` share one structural edge; retracting it twice is a no-op.
 	EdgeID string
+	// FromID is the `from` of that structural edge (the caller id for
+	// CALLS, the enclosing symbol id for REFERENCES), and of a twinned
+	// answer that replaces it with an edge of the same kind.
+	FromID string
 	// EnclosingSymbolID is the `from` of the REFERENCES edge that replaces
-	// it. (The `from` of the retracted CALLS edge was the caller id, which is
-	// the same node whenever a CALLS edge was emitted at all.)
+	// a conversion's CALLS edge. (The `from` of the retracted CALLS edge was
+	// the caller id, which is the same node whenever a CALLS edge was
+	// emitted at all.)
 	EnclosingSymbolID string
 }
 
@@ -147,17 +162,21 @@ func (e *extractor) recordBareNameSite(ident *ast.Ident, ctx useContext, isCall 
 	})
 }
 
-func (e *extractor) recordPlaceholderCall(at *ast.Ident, ctx useContext, edgeID string) {
-	if at == nil || edgeID == "" {
+// recordPlaceholderUse records the edge `emitUse` just wrote from `fromID`
+// onto `toID`, when `toID` is a placeholder - see [placeholderUse].
+func (e *extractor) recordPlaceholderUse(at *ast.Ident, ctx useContext, kind, fromID, toID string) {
+	if at == nil || fromID == "" || !e.placeholder[toID] {
 		return
 	}
 	pos := e.position(at.Pos())
-	e.placeholderCalls = append(e.placeholderCalls, placeholderCall{
+	e.placeholderUses = append(e.placeholderUses, placeholderUse{
 		FilePath:          e.relPath,
 		Line:              pos.Line,
 		Col:               pos.Col,
 		Name:              at.Name,
-		EdgeID:            edgeID,
+		Kind:              kind,
+		EdgeID:            edgeIDFor(fromID, kind, toID, nil),
+		FromID:            fromID,
 		EnclosingSymbolID: ctx.symbolID,
 	})
 }

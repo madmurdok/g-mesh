@@ -126,6 +126,13 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     );
     config.command = resolved.command;
     config.env.extend(pinned_env(&toolchain));
+    if let Some(sysroot) = &toolchain.sysroot {
+        pin_sysroot(&mut config.initialization_options, sysroot);
+        let rust_src_path_set = std::env::var_os("RUST_SRC_PATH").is_some_and(|path| !path.is_empty());
+        if let Some(hint) = rust_src_hint(sysroot, toolchain.pin.as_deref(), rust_src_path_set) {
+            g_mesh_plugin_sdk::log_line!("{hint}");
+        }
+    }
     // GM-550: rust-analyzer's start-up phases can be separated by more than
     // the bridge's 2s settle under load (2.04s and 2.47s measured), so its
     // readiness is its own `quiescent` status rather than a quiet period.
@@ -227,6 +234,11 @@ struct Toolchain {
     rust_analyzer: Option<PathBuf>,
     rustc: Option<PathBuf>,
     cargo: Option<PathBuf>,
+    /// `rustc --print sysroot` of [`Toolchain::rustc`], run in
+    /// [`neutral_dir`]. The server gets it as `cargo.sysroot` (GM-603), so it
+    /// loads std from this toolchain and never runs `rustup component add
+    /// rust-src` itself. `None` when there is no `rustc` or it fails.
+    sysroot: Option<PathBuf>,
 }
 
 impl Toolchain {
@@ -235,7 +247,9 @@ impl Toolchain {
         if rustup_bin.is_none() {
             // Not rustup-managed: no proxy reads a toolchain file, and the
             // binaries on `PATH` are the user's own.
-            return Toolchain { rustc: on_path("rustc"), cargo: on_path("cargo"), ..Toolchain::default() };
+            let rustc = on_path("rustc");
+            let sysroot = rustc.as_deref().and_then(sysroot_of);
+            return Toolchain { rustc, cargo: on_path("cargo"), sysroot, ..Toolchain::default() };
         }
         let pin = std::env::var("RUSTUP_TOOLCHAIN").ok().filter(|pin| !pin.trim().is_empty()).or_else(|| {
             rustup(&["default"]).and_then(|out| out.split_whitespace().next().map(str::to_string))
@@ -244,14 +258,69 @@ impl Toolchain {
             let pin = pin.as_deref()?;
             rustup(&["which", "--toolchain", pin, name]).map(PathBuf::from)
         };
+        let rustc = which("rustc");
+        let sysroot = rustc.as_deref().and_then(sysroot_of);
         Toolchain {
             rust_analyzer: which("rust-analyzer"),
-            rustc: which("rustc"),
+            rustc,
             cargo: which("cargo"),
+            sysroot,
             pin,
             rustup: rustup_bin,
         }
     }
+}
+
+/// `<rustc> --print sysroot`, run in [`neutral_dir`]. `rustc` is the
+/// toolchain's own binary (never a proxy), so the answer is that toolchain's
+/// sysroot whatever `rust-toolchain.toml` is around.
+fn sysroot_of(rustc: &Path) -> Option<PathBuf> {
+    let output = Command::new(rustc).args(["--print", "sysroot"]).current_dir(neutral_dir()).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!out.is_empty()).then(|| PathBuf::from(out))
+}
+
+/// Sets `cargo.sysroot` in the server's `initializationOptions` to `sysroot`
+/// (GM-603). rust-analyzer's default, `"discover"`, runs `rustup component
+/// add rust-src` when the source is missing: a network download from the
+/// semantic tier (ADR 0033) and, on CI, an install racing the suite. A path
+/// is `RustLibSource::Path`, which never installs anything. A `cargo.sysroot`
+/// already present (the manifest's, a test's) is kept, and every other key
+/// is left as it is; options that are not a JSON object are left alone.
+fn pin_sysroot(options: &mut Option<serde_json::Value>, sysroot: &Path) {
+    let options = options.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(options) = options.as_object_mut() else {
+        return;
+    };
+    let cargo = options.entry("cargo").or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(cargo) = cargo.as_object_mut() else {
+        return;
+    };
+    cargo
+        .entry("sysroot")
+        .or_insert_with(|| serde_json::Value::String(sysroot.to_string_lossy().into_owned()));
+}
+
+/// The line [`engine`] logs when the server will not load std (GM-603): the
+/// sysroot has no `rust-src` (`lib/rustlib/src/rust/library/Cargo.toml`) and
+/// `RUST_SRC_PATH`, which rust-analyzer consults first, is unset. The plugin
+/// never installs it, so the line names the command that does. `None` when
+/// std will load.
+fn rust_src_hint(sysroot: &Path, pin: Option<&str>, rust_src_path_set: bool) -> Option<String> {
+    if rust_src_path_set || sysroot.join("lib/rustlib/src/rust/library/Cargo.toml").is_file() {
+        return None;
+    }
+    let remedy = match pin {
+        Some(pin) => format!("run `rustup component add rust-src --toolchain {pin}`"),
+        None => format!("install the standard library source under {}", sysroot.display()),
+    };
+    Some(format!(
+        "[{LANGUAGE}] std not loaded: rust-src is not installed for toolchain {}; {remedy}",
+        pin.unwrap_or("not rustup-managed")
+    ))
 }
 
 /// The environment the server starts with on top of the inherited one: the
@@ -944,6 +1013,168 @@ mod tests {
         let engine = &source[source.find("pub fn engine(").expect("this file defines `engine`")..];
         let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
         assert!(body.contains("config.env.extend(pinned_env(&toolchain));"), "{body}");
+    }
+
+    /// GM-603: with no options at all, `pin_sysroot` creates
+    /// `{"cargo": {"sysroot": <path>}}`, so rust-analyzer takes
+    /// `RustLibSource::Path` and never runs `rustup component add rust-src`.
+    ///
+    /// Control: make `pin_sysroot` return before the `cargo.sysroot` insert.
+    #[test]
+    fn pin_sysroot_sets_cargo_sysroot_to_the_detected_sysroot() {
+        let sysroot = Path::new("/gm603/toolchains/stable-x86_64-apple-darwin");
+        let mut options = None;
+        pin_sysroot(&mut options, sysroot);
+        assert_eq!(options, Some(serde_json::json!({ "cargo": { "sysroot": sysroot.to_string_lossy() } })));
+
+        let mut options = Some(serde_json::json!({ "checkOnSave": false }));
+        pin_sysroot(&mut options, sysroot);
+        assert_eq!(
+            options,
+            Some(
+                serde_json::json!({ "checkOnSave": false, "cargo": { "sysroot": sysroot.to_string_lossy() } })
+            )
+        );
+    }
+
+    /// A `cargo.sysroot` the manifest or a test already set wins, and the
+    /// other `cargo` keys survive the merge.
+    ///
+    /// Controls: replace `entry("sysroot").or_insert_with(..)` with an
+    /// unconditional `insert`; or replace the `cargo` object instead of
+    /// merging into it.
+    #[test]
+    fn pin_sysroot_keeps_an_existing_sysroot_and_the_other_cargo_keys() {
+        let sysroot = Path::new("/gm603/detected");
+        let mut options = Some(serde_json::json!({
+            "cargo": { "sysroot": "/gm603/manifest", "buildScripts": { "enable": false } },
+            "procMacro": { "enable": false }
+        }));
+        pin_sysroot(&mut options, sysroot);
+        assert_eq!(
+            options,
+            Some(serde_json::json!({
+                "cargo": { "sysroot": "/gm603/manifest", "buildScripts": { "enable": false } },
+                "procMacro": { "enable": false }
+            }))
+        );
+
+        let mut options = Some(serde_json::json!({ "cargo": { "buildScripts": { "enable": false } } }));
+        pin_sysroot(&mut options, sysroot);
+        assert_eq!(
+            options,
+            Some(serde_json::json!({
+                "cargo": { "buildScripts": { "enable": false }, "sysroot": "/gm603/detected" }
+            }))
+        );
+    }
+
+    /// GM-603 B2: a sysroot without `lib/rustlib/src/rust/library/Cargo.toml`
+    /// gets the hint naming the toolchain and the rustup command; one with
+    /// it, or any sysroot while `RUST_SRC_PATH` is set, gets none. The env
+    /// var is a parameter, so no process-global state is touched.
+    ///
+    /// Controls: drop the `is_file()` check (the "has rust-src" case gets a
+    /// hint); drop the `rust_src_path_set` check (the `RUST_SRC_PATH` case
+    /// gets a hint); change the remedy's `rustup component add rust-src
+    /// --toolchain` wording.
+    #[cfg(unix)]
+    #[test]
+    fn rust_src_hint_names_the_rustup_command_only_when_rust_src_is_missing() {
+        let scratch = Scratch::new("gm603-rust-src");
+        let sysroot = &scratch.0;
+        let pin = "stable-x86_64-apple-darwin";
+
+        let hint = rust_src_hint(sysroot, Some(pin), false).expect("no rust-src, no RUST_SRC_PATH: a hint");
+        assert!(hint.contains(&format!("rustup component add rust-src --toolchain {pin}")), "{hint}");
+        assert!(hint.contains("std not loaded"), "{hint}");
+        assert_eq!(rust_src_hint(sysroot, Some(pin), true), None, "RUST_SRC_PATH set: no hint");
+        let unpinned = rust_src_hint(sysroot, None, false).expect("no rust-src without rustup: a hint");
+        assert!(unpinned.contains(&sysroot.display().to_string()), "{unpinned}");
+
+        let manifest = sysroot.join("lib/rustlib/src/rust/library/Cargo.toml");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, "[workspace]\n").unwrap();
+        assert_eq!(rust_src_hint(sysroot, Some(pin), false), None, "rust-src installed: no hint");
+        assert_eq!(rust_src_hint(sysroot, None, false), None, "rust-src installed: no hint");
+    }
+
+    /// `sysroot_of` runs `<rustc> --print sysroot` and returns its trimmed
+    /// stdout; a failing or silent `rustc` gives `None`. The fake `rustc`
+    /// is written by a child shell so no file descriptor to it is open in
+    /// this (multithreaded) process when it is executed (`ETXTBSY`).
+    ///
+    /// Controls: return `None` unconditionally from `sysroot_of`; drop the
+    /// `status.success()` check (the failing fake yields its stdout).
+    #[cfg(unix)]
+    #[test]
+    fn sysroot_of_answers_rustc_print_sysroot() {
+        let scratch = Scratch::new("gm603-sysroot-of");
+        let fake = |name: &str, body: &str| {
+            let path = scratch.0.join(name);
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg("printf '%s\\n' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+                .arg("sh")
+                .arg(&path)
+                .arg(format!("#!/bin/sh\n{body}"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+            path
+        };
+        let good = fake(
+            "rustc-good",
+            "[ \"$1\" = --print ] && [ \"$2\" = sysroot ] && [ $# -eq 2 ] || exit 3\necho '  /gm603/sysroot  '",
+        );
+        assert_eq!(sysroot_of(&good), Some(PathBuf::from("/gm603/sysroot")));
+        let failing = fake("rustc-failing", "echo /gm603/sysroot\nexit 1");
+        assert_eq!(sysroot_of(&failing), None, "a failing rustc has no sysroot");
+        let silent = fake("rustc-silent", "exit 0");
+        assert_eq!(sysroot_of(&silent), None, "an empty answer is no sysroot");
+        assert_eq!(sysroot_of(&scratch.0.join("no-such-rustc")), None);
+    }
+
+    /// `Toolchain::detect` fills `sysroot` from the toolchain's own `rustc`:
+    /// whenever it found a `rustc`, the sysroot it reports has
+    /// `lib/rustlib` (every rustc sysroot does, with or without rust-src).
+    /// Skips on a machine with no `rustc` at all.
+    ///
+    /// Control: drop `sysroot` from either `Toolchain` literal in `detect`
+    /// (leave it `None`).
+    #[test]
+    fn detect_fills_the_sysroot_of_the_toolchains_rustc() {
+        let toolchain = Toolchain::detect();
+        let Some(rustc) = &toolchain.rustc else {
+            println!("SKIPPED: no rustc found");
+            return;
+        };
+        let sysroot =
+            toolchain.sysroot.as_ref().unwrap_or_else(|| panic!("{rustc:?} has no sysroot: {toolchain:?}"));
+        assert!(sysroot.join("lib/rustlib").is_dir(), "{sysroot:?} is not a rustc sysroot");
+        assert_eq!(toolchain.sysroot, sysroot_of(rustc));
+    }
+
+    /// `engine` pins the sysroot and logs the hint after `pinned_env`, and
+    /// before the bridge takes the config. The engine cannot be run here
+    /// without starting rust-analyzer, so this reads `engine`'s body, like
+    /// the tests above.
+    ///
+    /// Controls: delete the `pin_sysroot` call in `engine`; or move it below
+    /// `LspBridge::new`; or pass `false` for `rust_src_path_set`.
+    #[test]
+    fn the_engine_pins_the_sysroot_and_hints_after_the_pinned_env() {
+        let source = include_str!("semantic.rs");
+        let engine = &source[source.find("pub fn engine(").expect("this file defines `engine`")..];
+        let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
+        let at =
+            |needle: &str| body.find(needle).unwrap_or_else(|| panic!("`engine` lacks `{needle}`:\n{body}"));
+        let env = at("config.env.extend(pinned_env(&toolchain));");
+        let pin = at("pin_sysroot(&mut config.initialization_options, sysroot);");
+        let hint = at("rust_src_hint(sysroot, toolchain.pin.as_deref(), rust_src_path_set)");
+        let bridge = at("LspBridge::new(LANGUAGE, root, config)");
+        assert!(env < pin && pin < bridge && hint < bridge, "{body}");
+        assert!(body.contains("std::env::var_os(\"RUST_SRC_PATH\")"), "{body}");
     }
 
     /// A scratch directory, canonicalized (macOS' temp dir is a symlink),

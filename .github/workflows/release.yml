@@ -15,6 +15,12 @@
 # --asset-names`, and `scripts/prepare-release-assets.sh` fails the release if
 # the files on disk disagree with it.
 #
+# GM-613 (written offline, proven by its own workflow_dispatch rehearsal):
+# x86_64 macOS is cross-built on the arm64 `macos-15` runner and smoke-tested
+# there under Rosetta, and the `tests` job is skipped when ci.yml already
+# passed a full run on the same code (`ci-gate` below). The x86_64 *tests*
+# still run on the Intel runner, in ci.yml.
+#
 # ---------------------------------------------------------------------------
 # WHAT THESE ARTIFACTS ARE
 #
@@ -135,10 +141,21 @@
 # aarch64-apple-darwin` on an x86_64 Mac was run while writing this and
 # produced a working arm64 binary (onig_sys, rusqlite/bundled, sqlite-vec and
 # ort-sys all compiled; `otool -L` showed only system dylibs, i.e. ONNX Runtime
-# really is statically linked). So the two macOS rows below can be collapsed
-# onto one runner if that ever becomes necessary. They are kept separate today
-# because a native job can actually *execute* what it just built - the
-# `--version` smoke test in the script - and a cross-built one cannot.
+# really is statically linked).
+#
+# GM-613 uses that escape hatch in the other direction: the x86_64 row runs on
+# the arm64 `macos-15` runner and cross-builds (`--target x86_64-apple-darwin`),
+# because the Intel runner gated the whole release (36-42 min of tests, 14-20
+# min of build, and up to 24 min of queue). The rows stay two (owner decision
+# D1), both on `macos-15`, so the job-per-target view and artifact names are
+# unchanged. A cross-built binary is still *executed* before it ships: Rosetta
+# runs it, and every check that ran natively before (`--version`, `plugins
+# list`, each plugin's handshake, release-smoke.sh's two `reindex` legs) runs
+# the x86_64 code. Rosetta would equally run a mislabelled arm64 binary, so
+# `lipo -archs` asserts the architecture of core and every plugin binary
+# first (scripts/lib/runnable.sh). The shipped x86_64 binary is never run on
+# Intel hardware (owner decision D3); the same code's x86_64 tests are, in
+# ci.yml.
 #
 # `ort` is pinned to `=2.0.0-rc.9` (see core/Cargo.toml for why). Verified
 # against that release's own `dist.txt`: it ships a *static*, execution-
@@ -154,7 +171,10 @@ on:
   # workflow -> "Run workflow" - and the reason publishing is bound to a tag
   # rather than to a button somebody might press by accident. Run this once
   # before cutting the first tag: the `verify` job rehearses everything the
-  # release depends on except the Releases API calls themselves.
+  # release depends on except the Releases API calls themselves. It also runs
+  # the same `ci-gate` a tag does (GM-613, owner decision D4), so a dispatch on
+  # a commit ci.yml already passed in full skips the tests exactly as the tag
+  # would, and one on an untested commit runs them.
   workflow_dispatch:
   # The one trigger that publishes. The repository still has no tags; pushing
   # the first one is the deliberate human act that cuts the first release.
@@ -174,6 +194,10 @@ on:
       - "scripts/bundle-rust-plugin.sh"
       - "scripts/bundle-python-plugin.sh"
       - "scripts/prepare-release-assets.sh"
+      # GM-613: the shared "can this run here" helpers every build script
+      # sources, and the script that decides whether `tests` runs.
+      - "scripts/lib/runnable.sh"
+      - "scripts/ci-green-for-commit.sh"
       # GM-333: a change to any of these three should get the same "watch all
       # four jobs" PR run as a change to the build/package scripts above -
       # they are what the new smoke-test steps in the `build` job actually
@@ -196,21 +220,87 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  # The gate. Calling ci.yml rather than restating its steps is the point: a
-  # copy would drift, and a release gated on a *drifted* copy of the tests is
-  # worse than one gated on nothing, because it looks like it was checked.
+  # GM-613: has ci.yml already passed a *full* run on this code? A tag is cut
+  # by scripts/cut-release.sh only after GM-391 checked the release branch's
+  # ci.yml run, and the tag commit's tree is that commit's tree, so testing it
+  # again repeats a result already in hand (~41-60 minutes, most of it the
+  # Intel runner). scripts/ci-green-for-commit.sh looks for a successful ci.yml
+  # run whose "Full test suite ran" job succeeded, on this commit or on a
+  # parent with the identical tree (owner decision D2), and answers
+  # `green=false` on anything it cannot prove - any API error included - so a
+  # failure here runs the tests, never skips them. Runs on every event (D4).
   #
-  # This costs the release a full test run on four platforms before the first
-  # artifact is compiled. That is the trade being made deliberately: until now
-  # this workflow could publish four binaries from a commit no test had ever
-  # been executed against, on any platform.
+  # The only job that holds `actions: read` (to list ci.yml runs and jobs);
+  # the workflow floor stays `contents: read`, and the jobs that compile
+  # third-party code never get it.
+  ci-gate:
+    name: CI already green on this code?
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      green: ${{ steps.gate.outputs.green }}
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Look for a green full ci.yml run on this commit or a same-tree parent
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          out="$(bash scripts/ci-green-for-commit.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA")" || out="green=false"
+          # Only an exact `green=true` line skips the tests.
+          green=false run="" sha=""
+          if printf '%s\n' "$out" | grep -qx 'green=true'; then
+            green=true
+            run="$(printf '%s\n' "$out" | sed -n 's/^run=//p')"
+            sha="$(printf '%s\n' "$out" | sed -n 's/^sha=//p')"
+          fi
+          {
+            echo "green=$green"
+            echo "run=$run"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo '### CI gate'
+            echo
+            if [ "$green" = true ]; then
+              echo "Tests skipped: ci.yml run [$run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run) passed a full run on \`$sha\` (same tree as \`$GITHUB_SHA\`)."
+            else
+              echo "Tests run: no green full ci.yml run found on \`$GITHUB_SHA\` or a same-tree parent (or the lookup failed)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The test gate. Calling ci.yml rather than restating its steps is the
+  # point: a copy would drift, and a release gated on a *drifted* copy of the
+  # tests is worse than one gated on nothing, because it looks like it was
+  # checked.
+  #
+  # Until GM-613 this cost every release a full test run on four platforms
+  # before the first artifact was compiled. It still does whenever `ci-gate`
+  # cannot prove ci.yml already passed in full on this code - an untested
+  # commit is never published untested. When it can, this job is skipped and
+  # `build` starts at once. ci.yml's per-row limits (GM-612) live in its own
+  # matrix, so this call inherits them.
   tests:
+    needs: ci-gate
+    if: needs.ci-gate.outputs.green != 'true'
     uses: ./.github/workflows/ci.yml
 
   build:
     name: ${{ matrix.target }}
-    needs: tests
+    needs: [ci-gate, tests]
+    # `tests` is either green or deliberately skipped by the gate. Not
+    # `always()`: a cancelled release must not start building; and a failed
+    # `tests` or `ci-gate` skips this job, and with it publish/verify.
+    if: ${{ !cancelled() && needs.ci-gate.result == 'success' && (needs.tests.result == 'success' || needs.tests.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
+    # GM-613: a smoke check that cannot run fails the build instead of
+    # logging "smoke test skipped" (scripts/lib/runnable.sh).
+    env:
+      G_MESH_REQUIRE_SMOKE: "1"
     # A full build compiles ONNX Runtime bindings, bundled SQLite and Oniguruma
     # from scratch (no cache is used - a release build should not be able to
     # pick up a stale object file), which is slow on the macOS images.
@@ -220,13 +310,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Intel macOS. NOT `macos-13`: that image was retired on 2025-12-04.
-          # `macos-15-intel` is the current Intel image and GitHub has
-          # announced it as the last one - x86_64 macOS runners go away in
-          # autumn 2027, at which point this row needs a rethink (a local
-          # Intel Mac, or dropping the target).
+          # Intel macOS, cross-built on the arm64 runner and smoke-tested
+          # there under Rosetta (GM-613; see "WHY A MATRIX ON NATIVE
+          # RUNNERS" above). Its *tests* still run on real Intel
+          # (`macos-15-intel`) in ci.yml - only the build moved. That image
+          # is GitHub's last Intel one; x86_64 macOS runners go away in
+          # autumn 2027, after which only this cross-build remains.
           - target: x86_64-apple-darwin
-            runner: macos-15-intel
+            runner: macos-15
           - target: aarch64-apple-darwin
             runner: macos-15
           # Pinned to the oldest supported Ubuntu on purpose: the glibc the
@@ -308,6 +399,20 @@ jobs:
           go-version-file: plugins/go/go.mod
           cache: false
 
+      # GM-613: the x86_64 row executes its cross-built binary under Rosetta.
+      # GitHub's arm64 macOS images install it today; if one ever does not,
+      # install it here rather than let the smoke checks be skipped (they
+      # could not be anyway: G_MESH_REQUIRE_SMOKE=1 makes a skip fatal).
+      - name: Rosetta available
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          if ! arch -x86_64 /usr/bin/true; then
+            softwareupdate --install-rosetta --agree-to-license
+            arch -x86_64 /usr/bin/true
+          fi
+          echo "Rosetta runs x86_64 code on this $(uname -m) runner"
+
       # All naming/staging/archiving lives in the script so that what CI
       # produces is exactly what a developer can reproduce locally. Invoked via
       # `bash` rather than as an executable because the checkout on Windows
@@ -336,21 +441,23 @@ jobs:
 
       # GM-333. `build_one()` above already proves the staged binary starts
       # and sees the plugins staged beside it (`--version`/`plugins list`,
-      # gated on `target == host` inside build-targets.sh - which, in this
-      # matrix, is every leg, since each target builds natively on its own
-      # runner). It never spawns a plugin process, indexes anything, or
+      # gated on `can_run_target` inside build-targets.sh - which, in this
+      # matrix, is every leg: natively, or for x86_64 macOS under Rosetta,
+      # GM-613; with G_MESH_REQUIRE_SMOKE=1 a leg that cannot run them
+      # fails). It never spawns a plugin process, indexes anything, or
       # touches the network - exactly what GM-206 went and checked by hand,
       # once, on one platform, and exactly what a build cannot reveal on its
       # own ("CI produced it" is not "it works"). This runs `<staged binary>
       # reindex` against an in-tree multi-language fixture
-      # (scripts/release-smoke-fixture) on this target's own runner, so every
+      # (scripts/release-smoke-fixture) on this target's own runner (x86_64
+      # macOS: under Rosetta), so every
       # release gets that on all four - see scripts/release-smoke.sh's own
       # header for exactly what it checks and why, including the fixture
       # choice and why `g-mesh model fetch` is deliberately not part of this.
       #
       # Runs unconditionally - on a manual dispatch, a PR touching the
       # pipeline, and a tag alike - not only on a tag: `tests:` above already
-      # makes this argument once for gating this whole job on nothing, and a
+      # makes this argument once for never building on untested code, and a
       # check that only runs at release time is a check that tells you after
       # it shipped.
       - name: Smoke test the staged artifact (GM-333)
@@ -570,7 +677,11 @@ jobs:
   verify:
     name: Verify assets (dry run)
     needs: build
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    # `!cancelled() && needs.build.result == 'success'` rather than the
+    # implicit success(): that one also looks at `build`'s own ancestors, and
+    # `tests` is skipped whenever ci-gate found a green run (GM-613), which
+    # would skip this job too although `build` succeeded.
+    if: ${{ !cancelled() && needs.build.result == 'success' && !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
@@ -600,18 +711,20 @@ jobs:
 
   publish:
     name: Publish draft Release
-    # This is the "all four or nothing" rule, and it needs no `if` of its own:
-    # the matrix is `fail-fast: false` so one platform's failure cannot hide
-    # the other three, but `build` as a whole only succeeds when every leg
-    # does, and a job whose `needs` did not succeed is skipped. The `if` below
-    # narrows *when* this job runs; it does not weaken that (only `always()`,
-    # `failure()` or `cancelled()` would, which is exactly why none appear
-    # here).
+    # This is the "all four or nothing" rule: the matrix is `fail-fast: false`
+    # so one platform's failure cannot hide the other three, but `build` as a
+    # whole only has the result `success` when every leg does, and the `if`
+    # below demands exactly that. It is spelled out rather than left to the
+    # implicit success() because that one also looks at `build`'s ancestors,
+    # and `tests` is *skipped* whenever ci-gate found a green full run
+    # (GM-613) - the implicit check would then skip publishing although all
+    # four legs succeeded. `!cancelled()` (not `always()`) keeps a cancelled
+    # release from publishing.
     needs: build
     # Publishing is bound to a version tag and nothing else. Manual and PR runs
     # still build and upload all four artifacts, so the pipeline stays testable
     # without any path from a button press to a public Release.
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !cancelled() && needs.build.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     permissions:

@@ -531,6 +531,10 @@ impl FileGraphBuilder {
     /// is `<file>#<key>` for a file scope and `<container>::<key>` for a
     /// container scope; the two shapes cannot collide, and `nativeKind` -
     /// also in the id - keeps the placeholder kinds apart on top of that.
+    /// The key's kind is part of the address too: a `qualifiedName` key
+    /// renders as `=<key>`, so a placeholder waiting on name `n` and one
+    /// waiting on qualified name `n` in the same scope get different ids
+    /// (see [`render_target`]).
     ///
     /// `range` is where the *use site* is: a placeholder is a node of the
     /// file that is waiting, not of the file it is waiting on.
@@ -680,14 +684,24 @@ fn fold_untyped_calls(graph: &mut FileGraph) {
 /// this string. What it has to be is *injective enough* that two placeholders
 /// in one file waiting on different things get different ids.
 ///
+/// A [`TargetKey::Name`](g_mesh_wire::TargetKey::Name) key renders as is
+/// (`src/x.ts#handler`, `crate::m::Name`); a
+/// [`TargetKey::QualifiedName`](g_mesh_wire::TargetKey::QualifiedName) key
+/// gets a `=` sigil right after the separator (`src/x.ts#=handler`,
+/// `crate::m::=path::Name`). No identifier in the languages the SDK serves
+/// starts with `=`, and neither do the special name keys `*` and `default`,
+/// so the two renderings never collide: a name-keyed and a QN-keyed
+/// placeholder with the same key string are two things waiting on two
+/// different addresses, and must not share an id (GM-596).
+///
 /// Public because a plugin that builds a placeholder's `NodeSpec` itself -
 /// `plugins/rust`'s re-export node - has to spell the label the same way, and
 /// a second copy of the rendering is a second thing to keep in step.
 pub fn render_target(target: &PlaceholderTarget) -> String {
     use g_mesh_wire::{TargetKey, TargetScope};
     let key = match &target.key {
-        TargetKey::Name(name) => name,
-        TargetKey::QualifiedName(qualified_name) => qualified_name,
+        TargetKey::Name(name) => name.clone(),
+        TargetKey::QualifiedName(qualified_name) => format!("={qualified_name}"),
     };
     match &target.scope {
         TargetScope::File(path) => format!("{path}#{key}"),
@@ -697,6 +711,8 @@ pub fn render_target(target: &PlaceholderTarget) -> String {
 
 /// The id [`FileGraphBuilder::add_placeholder`] will give a placeholder,
 /// derived from the only three things it depends on - and nothing else.
+/// The target counts with its key's kind: a name key and a qualified-name key
+/// with the same string are different addresses, so different ids.
 ///
 /// A placeholder's `name` and `range` describe one *use site*, and an address
 /// reached from several sites has several of those. A caller that has to
@@ -798,6 +814,59 @@ mod tests {
                 assert_ne!(one, two, "two placeholders collided on one id");
             }
         }
+    }
+
+    /// **GM-596.** A placeholder waiting on *name* `n` and one waiting on
+    /// *qualified name* `n` in the same scope wait on two different
+    /// addresses - the linker matches the first against names and the second
+    /// against qualified names - so they never share an id, in a file scope
+    /// or in a container scope. A name key renders exactly as it always has.
+    ///
+    /// Controls, each in `render_target`: drop the `=` sigil for a `File`
+    /// scope only (the file-scope pair collides); drop it for a `Container`
+    /// scope only (the container-scope pair collides).
+    #[test]
+    fn a_name_key_and_a_qualified_name_key_with_one_string_are_two_addresses() {
+        let target = |scope: TargetScope, key: TargetKey| PlaceholderTarget {
+            scope,
+            key,
+            from_container: None,
+            key_path: None,
+        };
+        let file = || TargetScope::File("src/x.ts".into());
+        let container = || TargetScope::Container("crate::m".into());
+        let name = || TargetKey::Name("handler".into());
+        let qualified = || TargetKey::QualifiedName("handler".into());
+        let at = RelPath::new("src/main.ts");
+
+        for (scope, by_name, by_qualified) in [
+            ("file", target(file(), name()), target(file(), qualified())),
+            ("container", target(container(), name()), target(container(), qualified())),
+        ] {
+            assert_ne!(
+                render_target(&by_name),
+                render_target(&by_qualified),
+                "{scope} scope: one label for two addresses"
+            );
+            assert_ne!(
+                placeholder_id(&at, PlaceholderKind::PendingSymbol, &by_name),
+                placeholder_id(&at, PlaceholderKind::PendingSymbol, &by_qualified),
+                "{scope} scope: one id for two addresses"
+            );
+            let mut graph = FileGraphBuilder::new("toy", "toy-parser", &at);
+            let a = graph.add_placeholder(PlaceholderKind::PendingSymbol, "handler", by_name, range(1, 1));
+            let b =
+                graph.add_placeholder(PlaceholderKind::PendingSymbol, "handler", by_qualified, range(2, 2));
+            assert_ne!(a, b, "{scope} scope: the builder merged two placeholders");
+            assert_eq!(graph.finish().nodes.len(), 2, "{scope} scope: both placeholders are kept");
+        }
+
+        assert_eq!(render_target(&target(file(), name())), "src/x.ts#handler", "a name key is unchanged");
+        assert_eq!(
+            render_target(&target(container(), name())),
+            "crate::m::handler",
+            "a name key is unchanged"
+        );
     }
 
     /// **GM-378.** And the id is that address and nothing else, so a caller

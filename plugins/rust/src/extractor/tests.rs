@@ -729,7 +729,7 @@ fn a_type_qualified_path_call_is_a_qualified_name_placeholder() {
     let graph = krate.extract("src/b.rs");
     assert_eq!(
         graph.targets(EdgeKind::Calls, "b::run"),
-        vec!["pending_symbol krate::a::a::Reader::new"],
+        vec!["pending_symbol krate::a::=a::Reader::new"],
         "exact, because a module full of `new`s has nothing to tell them apart by name"
     );
     let placeholder = graph.placeholder("pending_symbol", "new");
@@ -737,6 +737,89 @@ fn a_type_qualified_path_call_is_a_qualified_name_placeholder() {
         graph.target_of(placeholder),
         (container("krate::a"), TargetKey::QualifiedName("a::Reader::new".into()))
     );
+}
+
+/// Open sites out of `from` whose name is `name`.
+fn open_sites_from<'g>(graph: &'g Graph, from: &str, name: &str) -> Vec<&'g OpenSite> {
+    let from = graph.node(from).id.clone();
+    graph.0.open_sites.iter().filter(|site| site.from_id == from && site.name == name).collect()
+}
+
+/// GM-594: a path pattern (`Mode::A =>`) names a variant and binds nothing,
+/// so a type-qualified path inside its arm is resolved like anywhere else -
+/// a `qualifiedName` placeholder or a same-file edge - and is never opened
+/// to the semantic tier at its qualifier.
+#[test]
+fn a_type_qualified_call_inside_a_path_pattern_arm_keeps_its_structural_edge() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub enum Mode { A, B(u8) }\n\
+         impl Mode {\n  pub fn new() -> Mode { Mode::A }\n  \
+         pub fn set(&mut self) { match *self { Mode::A => { *self = Mode::B(1); Mode::new(); } Mode::B(_) => {} } }\n}\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    let targets = graph.targets(EdgeKind::Calls, "Mode::set");
+    assert!(targets.contains(&"Mode::new".to_string()), "{targets:?}");
+    assert!(
+        targets.iter().any(|target| target.starts_with("pending_symbol ") && target.ends_with("Mode::B")),
+        "{targets:?}"
+    );
+    for name in ["Mode::new", "Mode::B"] {
+        assert!(open_sites_from(&graph, "Mode::set", name).is_empty(), "{name}: {:#?}", graph.0.open_sites);
+    }
+}
+
+/// The names a pattern really introduces still shadow: a call of a local
+/// `x` bound by any of these forms is a local's call, not an edge to the free
+/// `fn x` beside it. `unbound` shows that edge is what an unbound `x()` gets.
+#[test]
+fn identifier_bindings_in_a_pattern_still_shadow_an_item_of_the_same_name() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub fn x() {}
+pub struct S { pub x: fn() }
+pub fn unbound(o: Option<fn()>) { match o { Some(_) => x(), None => {} } }
+pub fn plain(o: fn()) { match o { x => x() } }
+pub fn by_ref(o: fn()) { match o { ref x => x() } }
+pub fn at(o: Option<fn()>) { match o { x @ Some(_) => { x.unwrap()(); x(); } None => {} } }
+pub fn shorthand(s: S) { match s { S { x } => x() } }
+pub fn variant(o: Option<fn()>) { match o { Some(x) => x(), None => {} } }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(graph.targets(EdgeKind::Calls, "unbound"), vec!["x"]);
+    for function in ["plain", "by_ref", "at", "shorthand", "variant"] {
+        assert!(
+            !graph.targets(EdgeKind::Calls, function).contains(&"x".to_string()),
+            "{function}: {:?}",
+            graph.targets(EdgeKind::Calls, function)
+        );
+    }
+}
+
+/// `if let` and `let ... else` bind through the same walk: a path pattern
+/// there binds nothing either, and `Mode::new()` after it stays structural.
+#[test]
+fn if_let_and_let_else_with_a_path_pattern_bind_nothing() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub enum Mode { A, B }
+impl Mode { pub fn new() -> Mode { Mode::A } }
+pub fn if_let(m: Mode) { if let Mode::A = m { Mode::new(); } }
+pub fn let_else(m: Mode) { let Mode::B = m else { return; }; Mode::new(); }
+"#,
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for function in ["if_let", "let_else"] {
+        assert_eq!(graph.targets(EdgeKind::Calls, function), vec!["Mode::new"], "{function}");
+        assert!(
+            open_sites_from(&graph, function, "Mode::new").is_empty(),
+            "{function}: {:#?}",
+            graph.0.open_sites
+        );
+    }
 }
 
 #[test]
@@ -868,7 +951,7 @@ fn a_return_type_written_in_another_file_types_nothing() {
         ("src/caller.rs", "use crate::m::{A, Q};\npub fn run(a: &A) { let s = a.shapes(); s.refuses(); }\n"),
     ]);
     let graph = krate.extract("src/caller.rs");
-    assert_eq!(graph.targets(EdgeKind::Calls, "caller::run"), vec!["pending_symbol krate::m::m::A::shapes"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "caller::run"), vec!["pending_symbol krate::m::=m::A::shapes"]);
     let placeholder = graph.placeholder("pending_symbol", "shapes");
     assert_eq!(
         graph.target_of(placeholder),
@@ -971,7 +1054,7 @@ pub fn run() { let p = own().unwrap(); p.m(); }
     // `Option`'s own method, a placeholder since this file declares none.
     assert_eq!(
         b.targets(EdgeKind::Calls, "b::run"),
-        vec!["b::own", "pending_symbol krate::b::b::Option::unwrap"],
+        vec!["b::own", "pending_symbol krate::b::=b::Option::unwrap"],
         "a project `Option` is not unwrapped"
     );
 }
@@ -995,7 +1078,7 @@ pub fn traitish(p: &P) { p.t(); }
     )]);
     let graph = krate.extract("src/lib.rs");
     assert_eq!(graph.targets(EdgeKind::Calls, "inherent"), vec!["P::m"]);
-    assert_eq!(graph.targets(EdgeKind::Calls, "traitish"), vec!["pending_symbol krate::P::t"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "traitish"), vec!["pending_symbol krate::=P::t"]);
 }
 
 /// The receiver-call open sites named `name` out of `from`, in source order.
@@ -1370,7 +1453,7 @@ pub fn run(o: Outer) { o.inner.t(); }
 "#,
     )]);
     let graph = krate.extract("src/lib.rs");
-    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["pending_symbol krate::Inner::t"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["pending_symbol krate::=Inner::t"]);
 }
 
 /// Decision 1, the trap this plugin is most at risk of: a local must never
@@ -1564,7 +1647,7 @@ fn a_trait_impl_method_of_a_trait_in_another_file_points_at_a_placeholder() {
     let graph = krate.extract("src/lib.rs");
     assert_eq!(
         graph.targets(EdgeKind::SupertypeOf, "<Ci as Shape>::area"),
-        vec!["pending_symbol krate::shapes::shapes::Shape::area"]
+        vec!["pending_symbol krate::shapes::=shapes::Shape::area"]
     );
     let placeholder = graph.placeholder("pending_symbol", "area");
     assert_eq!(
@@ -1879,9 +1962,9 @@ pub fn drain(ledger: Ledger) -> Option<u8> {
     assert_eq!(
         tally,
         vec![
+            "pending_symbol krate::store::=store::Ledger.all_unresolved",
+            "pending_symbol krate::store::=store::Ledger.truncated_by",
             "pending_symbol krate::store::Ledger",
-            "pending_symbol krate::store::store::Ledger.all_unresolved",
-            "pending_symbol krate::store::store::Ledger.truncated_by",
         ]
     );
     for name in ["all_unresolved", "truncated_by"] {
@@ -1906,7 +1989,7 @@ pub fn drain(ledger: Ledger) -> Option<u8> {
     // A destructuring pattern names the field too.
     assert!(
         user.targets(EdgeKind::References, "user::drain")
-            .contains(&"pending_symbol krate::store::store::Ledger.truncated_by".to_string()),
+            .contains(&"pending_symbol krate::store::=store::Ledger.truncated_by".to_string()),
         "{:?}",
         user.targets(EdgeKind::References, "user::drain")
     );
@@ -1962,8 +2045,8 @@ pub fn take(holder: Holder) -> u8 { let Holder { inner } = holder; inner }
     assert!(store.targets(EdgeKind::References, "store::Holder::twice").is_empty());
 
     let user = krate.extract("src/user.rs");
-    let field_ref = "pending_symbol krate::store::store::Holder.inner".to_string();
-    let method_ref = "pending_symbol krate::store::store::Holder::inner".to_string();
+    let field_ref = "pending_symbol krate::store::=store::Holder.inner".to_string();
+    let method_ref = "pending_symbol krate::store::=store::Holder::inner".to_string();
     assert!(user.targets(EdgeKind::References, "user::make").contains(&field_ref));
     assert!(user.targets(EdgeKind::References, "user::take").contains(&field_ref));
     assert_eq!(user.targets(EdgeKind::Calls, "user::get"), vec![method_ref]);

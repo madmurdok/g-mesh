@@ -309,15 +309,26 @@ fn drain_startup_noise(
 /// pump ended before the plugin had answered.
 const ROUND_TRIP_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Debounce window for the burst tests. Deliberately wider than
+/// [`DEBOUNCE_WINDOW`]: the debouncer's clock runs on the consumer side, so
+/// when FSEvents delivery lags under load the events of one burst reach it
+/// further apart than they were written, and a window as small as
+/// `DEBOUNCE_WINDOW` can split the burst (GM-607). The tests assert
+/// coalescing, not the production window length.
+const BURST_TEST_WINDOW: Duration = Duration::from_secs(2);
+
 /// Pumps `watch_and_route_once` until the plugin has logged at least
-/// `expected` `fileChanged` round trips or [`ROUND_TRIP_DEADLINE`] passes,
-/// then keeps pumping for a settle period of `DEBOUNCE_WINDOW * 3`, and
-/// returns every round trip logged by then.
+/// `expected` round trips for *distinct* paths have been logged or
+/// [`ROUND_TRIP_DEADLINE`] passes, then keeps pumping for a settle period of
+/// `window * 2`, and returns every round trip logged by then (repeats of a
+/// path included, so the caller can assert on them). `window` is the
+/// debounce window the caller's [`Debouncer`] was built with.
 ///
 /// The settle period is what lets a caller assert *exactly* `expected`:
 /// any path still in the debouncer when the last expected trip was seen
-/// becomes ready within one [`DEBOUNCE_WINDOW`], so an extra trip that
+/// becomes ready within one `window`, so an extra trip that
 /// coalescing should have absorbed fires, and is logged, inside it.
+#[allow(clippy::too_many_arguments)]
 fn pump_until_round_trips(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
@@ -326,14 +337,19 @@ fn pump_until_round_trips(
     registry: &PluginRegistry,
     plugin_dir: &Path,
     expected: usize,
+    window: Duration,
 ) -> Vec<String> {
     let deadline = std::time::Instant::now() + ROUND_TRIP_DEADLINE;
-    while test_plugin::file_changed_requests(plugin_dir).len() < expected
-        && std::time::Instant::now() < deadline
-    {
+    let distinct = |dir: &Path| {
+        let mut paths = test_plugin::file_changed_requests(dir);
+        paths.sort();
+        paths.dedup();
+        paths.len()
+    };
+    while distinct(plugin_dir) < expected && std::time::Instant::now() < deadline {
         watch_and_route_once(watcher, debouncer, root, conn, registry);
     }
-    let settled = std::time::Instant::now() + DEBOUNCE_WINDOW * 3;
+    let settled = std::time::Instant::now() + window * 2;
     while std::time::Instant::now() < settled {
         watch_and_route_once(watcher, debouncer, root, conn, registry);
     }
@@ -358,7 +374,7 @@ fn a_burst_of_rapid_saves_to_the_same_file_costs_one_plugin_round_trip_not_one_p
     let root = project.path().canonicalize().unwrap();
 
     let watcher = ProjectWatcher::new(&root).unwrap();
-    let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+    let mut debouncer = Debouncer::new(BURST_TEST_WINDOW);
     drain_startup_noise(&watcher, &mut debouncer, &root, &conn, &registry);
 
     let file = root.join("a.python-src");
@@ -368,7 +384,7 @@ fn a_burst_of_rapid_saves_to_the_same_file_costs_one_plugin_round_trip_not_one_p
         watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
     }
 
-    // Every write so far was well under DEBOUNCE_WINDOW apart, so nothing
+    // Every write so far was well under BURST_TEST_WINDOW apart, so nothing
     // must have settled and fired yet - proof this is actually debounced
     // rather than merely fast.
     assert!(
@@ -376,7 +392,16 @@ fn a_burst_of_rapid_saves_to_the_same_file_costs_one_plugin_round_trip_not_one_p
         "a burst still in progress must not have reached the plugin yet"
     );
 
-    let requested = pump_until_round_trips(&watcher, &mut debouncer, &root, &conn, &registry, plugin_dir, 1);
+    let requested = pump_until_round_trips(
+        &watcher,
+        &mut debouncer,
+        &root,
+        &conn,
+        &registry,
+        plugin_dir,
+        1,
+        BURST_TEST_WINDOW,
+    );
 
     assert_eq!(
         requested.len(),
@@ -399,7 +424,16 @@ fn an_isolated_save_still_reaches_the_plugin_exactly_once() {
     drain_startup_noise(&watcher, &mut debouncer, &root, &conn, &registry);
 
     fs::write(root.join("a.python-src"), "v0").unwrap();
-    let requested = pump_until_round_trips(&watcher, &mut debouncer, &root, &conn, &registry, plugin_dir, 1);
+    let requested = pump_until_round_trips(
+        &watcher,
+        &mut debouncer,
+        &root,
+        &conn,
+        &registry,
+        plugin_dir,
+        1,
+        DEBOUNCE_WINDOW,
+    );
 
     assert_eq!(requested.len(), 1, "a single isolated save must still reach the plugin, exactly once");
 }
@@ -415,16 +449,25 @@ fn two_different_files_in_the_same_burst_each_get_their_own_round_trip() {
     let root = project.path().canonicalize().unwrap();
 
     let watcher = ProjectWatcher::new(&root).unwrap();
-    let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
+    let mut debouncer = Debouncer::new(BURST_TEST_WINDOW);
     drain_startup_noise(&watcher, &mut debouncer, &root, &conn, &registry);
 
     fs::write(root.join("a.python-src"), "a").unwrap();
     thread::sleep(Duration::from_millis(20));
     watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
     fs::write(root.join("b.python-src"), "b").unwrap();
-    let mut requested =
-        pump_until_round_trips(&watcher, &mut debouncer, &root, &conn, &registry, plugin_dir, 2);
+    let mut requested = pump_until_round_trips(
+        &watcher,
+        &mut debouncer,
+        &root,
+        &conn,
+        &registry,
+        plugin_dir,
+        2,
+        BURST_TEST_WINDOW,
+    );
     requested.sort();
+    requested.dedup();
     assert_eq!(
         requested,
         vec!["a.python-src".to_string(), "b.python-src".to_string()],

@@ -14,8 +14,7 @@
 //! - `.cargo/config.toml` sets `build.rustc`, `build.rustc-wrapper` and
 //!   `build.rustc-workspace-wrapper` to logging shims, and `[target.<host>]
 //!   rustflags` to `-Zcodegen-backend=<dylib>`, whose constructor writes
-//!   `MARK_codegen_backend` when any `rustc` loads it (unix, when a C
-//!   compiler builds the dylib);
+//!   `MARK_codegen_backend` when any `rustc` loads it (unix);
 //! - a project `rust-analyzer.toml` turns build scripts and proc macros back
 //!   on.
 //!
@@ -25,8 +24,8 @@
 //! files (the server really answered), and no marker, no log and no
 //! `target/` may exist.
 //!
-//! The test process's own environment is scrubbed of everything cargo and
-//! rustup set for it (`RUSTUP_TOOLCHAIN`, `CARGO`, `RUSTC_WRAPPER`, ...), and
+//! The child environment holds nothing cargo and rustup set for the test
+//! process (`RUSTUP_TOOLCHAIN`, `CARGO`, `RUSTC_WRAPPER`, ...), and its
 //! `PATH` starts with a directory of rustup proxies: otherwise the inherited
 //! pin would hide a missing one, and `rust-analyzer` on `PATH` would be the
 //! real binary rather than the proxy a user's daemon finds. The test makes
@@ -34,11 +33,20 @@
 //! `rustup` on `PATH`, which dispatches on its program name exactly as an
 //! installed proxy does) instead of assuming the directory holding `rustup`
 //! also holds the proxies: on a Homebrew rustup (the macOS arm64 runner) it
-//! does not (GM-574). The working directory
-//! is the fixture, as a daemon started there would have it: the proxy picks
-//! its toolchain from the working directory.
+//! does not (GM-574). Where the original test changed directory, the working
+//! directory is the fixture, as a daemon started there would have it: the
+//! proxy picks its toolchain from the working directory.
 //!
-//! One test in this binary, because it rewrites the process environment.
+//! Each test builds its fixture in this process, then re-runs this test
+//! binary as a child limited to an `#[ignore]`d `<test>_in_its_env` test,
+//! with that environment, the shipped manifest, the working directory and
+//! the fixture's paths (GM-602, after GM-588 option A). The child runs the
+//! engine and the assertions. No test changes this process's environment or
+//! working directory, so the tests are independent of order and threads.
+//!
+//! On unix every marker dylib is built with the C compiler `cc`; a test
+//! whose hook needs one fails when `cc` cannot build it, rather than
+//! passing without testing that hook.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,6 +56,11 @@ use g_mesh_plugin_rust::project::{ProjectContext, EXCLUDE_DIRS};
 use g_mesh_plugin_rust::semantic;
 use g_mesh_plugin_sdk::wire::{SourceTier, TargetKey};
 use g_mesh_plugin_sdk::{walk_project, Extractor, RelPath, SdkIndex, MANIFEST_PATH_ENV};
+
+/// What a child test reads its fixture from, as one path list: the scratch
+/// root, then the parent's rustup proxy directory, `rustc`, `cargo` and
+/// `rust-analyzer`. Only the parent test sets it.
+const CHILD_ENV: &str = "G_MESH_RS_GM513_CHILD";
 
 /// A scratch directory that removes itself.
 struct Scratch(PathBuf);
@@ -81,7 +94,8 @@ fn write(path: &Path, contents: &str) {
 /// absolute binaries in it, and a directory of rustup proxies.
 struct RealToolchain {
     proxy_dir: PathBuf,
-    _proxies: Scratch,
+    /// The parent owns the proxy directory; a child only borrows its path.
+    _proxies: Option<Scratch>,
     rustc: PathBuf,
     cargo: PathBuf,
     rust_analyzer: PathBuf,
@@ -116,7 +130,7 @@ fn real_toolchain() -> RealToolchain {
     link_rustup_proxies(&proxies.0, &rustup_bin);
     RealToolchain {
         proxy_dir: proxies.0.clone(),
-        _proxies: proxies,
+        _proxies: Some(proxies),
         rustc: which("rustc"),
         cargo: which("cargo"),
         rust_analyzer,
@@ -140,27 +154,102 @@ fn link_rustup_proxies(dir: &Path, rustup: &Path) {
     }
 }
 
-/// Clears what cargo and rustup set for this test process, and puts the
-/// rustup proxies first on `PATH`.
-fn scrub_environment(proxy_dir: &Path) {
-    let names: Vec<String> = std::env::vars_os()
-        .filter_map(|(name, _)| name.into_string().ok())
+/// What cargo and rustup set for this test process, which a child must not
+/// inherit.
+fn cargo_and_rustup_vars() -> Vec<std::ffi::OsString> {
+    std::env::vars_os()
+        .map(|(name, _)| name)
         .filter(|name| {
+            let Some(name) = name.to_str() else { return false };
             (name.starts_with("CARGO") && name != "CARGO_HOME")
                 || name.starts_with("RUSTC")
                 || name.starts_with("RUSTDOC")
                 || name == "RUSTFLAGS"
                 || name == "RUSTUP_TOOLCHAIN"
         })
-        .collect();
-    for name in names {
-        std::env::remove_var(name);
-    }
+        .collect()
+}
+
+/// This process's `PATH` with the rustup proxies first and no toolchain
+/// directory cargo put on it.
+fn child_path(proxy_dir: &Path) -> std::ffi::OsString {
     let rest = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .filter(|dir| dir != proxy_dir && !dir.to_string_lossy().contains("/toolchains/"))
         .collect::<Vec<_>>();
-    let path = std::env::join_paths(std::iter::once(proxy_dir.to_path_buf()).chain(rest)).unwrap();
-    std::env::set_var("PATH", path);
+    std::env::join_paths(std::iter::once(proxy_dir.to_path_buf()).chain(rest)).unwrap()
+}
+
+/// The line a child test prints once its assertions have passed.
+fn ran_marker(test: &str) -> String {
+    format!("{test}: ran in its environment")
+}
+
+/// Runs the ignored test `test` of this binary in a child process with none
+/// of [`cargo_and_rustup_vars`], [`child_path`] as `PATH`, the shipped
+/// manifest, `cwd` as working directory when given (this process's
+/// otherwise), and `scratch` and `real` in [`CHILD_ENV`]; asserts that it ran
+/// and passed.
+fn in_its_env(test: &str, scratch: &Path, real: &RealToolchain, cwd: Option<&Path>) {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args([test, "--exact", "--ignored", "--nocapture", "--test-threads=1"]);
+    for name in cargo_and_rustup_vars() {
+        command.env_remove(name);
+    }
+    let fixture = [scratch, &real.proxy_dir, &real.rustc, &real.cargo, &real.rust_analyzer];
+    command
+        .env("PATH", child_path(&real.proxy_dir))
+        .env(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))
+        .env(CHILD_ENV, std::env::join_paths(fixture).unwrap());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains(&ran_marker(test)),
+        "{test} did not pass in its environment ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+        output.status
+    );
+}
+
+/// The scratch root and the parent's toolchain of a child test, or `None`
+/// when the test was started without its parent (`--ignored`/
+/// `--run-ignored`), which then tests nothing.
+fn child_fixture(test: &str) -> Option<(PathBuf, RealToolchain)> {
+    let Some(list) = std::env::var_os(CHILD_ENV) else {
+        println!("{test}: skipped, it runs only as the child of its parent test, which sets {CHILD_ENV}");
+        return None;
+    };
+    let mut paths = std::env::split_paths(&list);
+    let mut next =
+        || paths.next().unwrap_or_else(|| panic!("{CHILD_ENV} lists the scratch and the toolchain"));
+    let scratch = next();
+    let real = RealToolchain {
+        proxy_dir: next(),
+        _proxies: None,
+        rustc: next(),
+        cargo: next(),
+        rust_analyzer: next(),
+    };
+    Some((scratch, real))
+}
+
+/// The tests are independent of order and threads only while none of them
+/// changes this process's environment or working directory: a child gets
+/// its own through [`in_its_env`] instead. A run in one order can
+/// miss a change that breaks another, so this reads the source.
+#[test]
+fn no_test_changes_the_process_environment_or_working_directory() {
+    let source = include_str!("semantic_runs_no_project_code.rs");
+    for call in ["set_var", "remove_var", "set_current_dir"] {
+        let call = format!("{call}(");
+        assert!(
+            !source.contains(&call),
+            "a test calls `{call}`: it changes this process for every test after it; give the child test \
+             that environment through `in_its_env` instead"
+        );
+    }
 }
 
 /// Every log and marker a project hook writes, by what wrote it.
@@ -172,6 +261,31 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// The markers and logs of the `rfx` fixture [`write_fixture`] wrote at
+    /// `root`.
+    fn at(root: &Path) -> Self {
+        #[allow(unused_mut)]
+        let mut marks = vec![root.join("MARK_buildrs"), root.join("MARK_procmacro")];
+        #[cfg(unix)]
+        marks.push(root.join("MARK_codegen_backend"));
+        Fixture {
+            root: root.to_path_buf(),
+            marks,
+            #[cfg(unix)]
+            logs: [
+                "evil-cargo",
+                "evil-rustc",
+                "evil-rust-analyzer",
+                "build-rustc",
+                "rustc-wrapper",
+                "rustc-workspace-wrapper",
+            ]
+            .iter()
+            .map(|name| root.join("logs").join(name))
+            .collect(),
+        }
+    }
+
     #[cfg(unix)]
     fn log(&self, name: &str) -> PathBuf {
         self.root.join("logs").join(name)
@@ -218,12 +332,18 @@ fn host_triple(rustc: &Path) -> String {
         .to_string()
 }
 
-/// A shared library whose load-time constructor writes `mark`: what a
-/// project could ship prebuilt and name as a `-Zcodegen-backend`, which
-/// `rustc` loads before it checks the backend's symbol. `None`, with a
-/// message, when no C compiler `cc` builds it.
+/// Where [`build_marker_dylib`] puts the dylib it builds in `dir`.
 #[cfg(unix)]
-fn build_marker_dylib(dir: &Path, mark: &Path) -> Option<PathBuf> {
+fn marker_dylib(dir: &Path) -> PathBuf {
+    dir.join(if cfg!(target_os = "macos") { "marker.dylib" } else { "marker.so" })
+}
+
+/// A shared library whose load-time constructor writes `mark`: what a
+/// project could ship prebuilt and have a `rustc` load, through `hook`.
+/// Panics, naming `hook`, when no C compiler `cc` builds it: a test without
+/// the dylib would pass while testing nothing about that hook.
+#[cfg(unix)]
+fn build_marker_dylib(dir: &Path, mark: &Path, hook: &str) -> PathBuf {
     let source = dir.join("marker.c");
     write(
         &source,
@@ -233,29 +353,24 @@ fn build_marker_dylib(dir: &Path, mark: &Path) -> Option<PathBuf> {
             mark.to_string_lossy()
         ),
     );
-    let dylib = dir.join(if cfg!(target_os = "macos") { "marker.dylib" } else { "marker.so" });
+    let dylib = marker_dylib(dir);
     let shared: &[&str] = if cfg!(target_os = "macos") { &["-dynamiclib"] } else { &["-shared", "-fPIC"] };
     match Command::new("cc").args(shared).arg("-o").arg(&dylib).arg(&source).output() {
-        Ok(output) if output.status.success() => Some(dylib),
-        result => {
-            println!(
-                "SKIPPED the `[target.*] rustflags` -Zcodegen-backend hook: `cc` did not build the marker \
-                 dylib ({result:?})"
-            );
-            None
-        }
+        Ok(output) if output.status.success() => dylib,
+        result => panic!(
+            "this test needs a C compiler `cc` to build the marker dylib for {hook}; without it the test \
+             would prove nothing about that hook ({result:?})"
+        ),
     }
 }
 
 /// `rfx`: workspace `app` + proc macro `mac`, plus (unix) the toolchain file,
 /// the cargo config and their shims.
-fn write_fixture(root: &Path, #[allow(unused_variables)] real: &RealToolchain) -> Fixture {
+fn write_fixture(root: &Path, #[allow(unused_variables)] real: &RealToolchain) {
     let mark_buildrs = root.join("MARK_buildrs");
     let mark_procmacro = root.join("MARK_procmacro");
     #[cfg(unix)]
     let mark_backend = root.join("MARK_codegen_backend");
-    #[allow(unused_mut)]
-    let mut marks = vec![mark_buildrs.clone(), mark_procmacro.clone()];
     write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\", \"mac\"]\nresolver = \"2\"\n");
     write(
         &root.join("app/Cargo.toml"),
@@ -331,32 +446,17 @@ fn write_fixture(root: &Path, #[allow(unused_variables)] real: &RealToolchain) -
             shims.join("wrapper").to_string_lossy(),
             shims.join("workspace-wrapper").to_string_lossy()
         );
-        if let Some(backend) = build_marker_dylib(&shims, &mark_backend) {
-            config.push_str(&format!(
-                "\n[target.{}]\nrustflags = [{:?}]\n",
-                host_triple(&real.rustc),
-                format!("-Zcodegen-backend={}", backend.to_string_lossy())
-            ));
-            marks.push(mark_backend);
-        }
+        let backend = build_marker_dylib(
+            &shims,
+            &mark_backend,
+            "the `[target.<host>] rustflags` `-Zcodegen-backend` hook",
+        );
+        config.push_str(&format!(
+            "\n[target.{}]\nrustflags = [{:?}]\n",
+            host_triple(&real.rustc),
+            format!("-Zcodegen-backend={}", backend.to_string_lossy())
+        ));
         write(&root.join(".cargo/config.toml"), &config);
-    }
-
-    Fixture {
-        root: root.to_path_buf(),
-        marks,
-        #[cfg(unix)]
-        logs: [
-            "evil-cargo",
-            "evil-rustc",
-            "evil-rust-analyzer",
-            "build-rustc",
-            "rustc-wrapper",
-            "rustc-workspace-wrapper",
-        ]
-        .iter()
-        .map(|name| root.join("logs").join(name))
-        .collect(),
     }
 }
 
@@ -412,15 +512,13 @@ fn assert_the_hostile_config_is_in_force(fixture: &Fixture, real: &RealToolchain
         "the stable `cargo metadata` with empty rustflags loaded the `-Zcodegen-backend` dylib"
     );
 
-    if fixture.marks.contains(&mark_backend) {
-        reset();
-        run(real.proxy_dir.join("cargo"), metadata, &[("RUSTC_BOOTSTRAP", "1")], false);
-        assert!(
-            mark_backend.is_file(),
-            "sanity: the unpinned `RUSTC_BOOTSTRAP=1 cargo metadata` in the fixture never loaded the \
-             project's `-Zcodegen-backend` dylib, so this test would prove nothing about it"
-        );
-    }
+    reset();
+    run(real.proxy_dir.join("cargo"), metadata, &[("RUSTC_BOOTSTRAP", "1")], false);
+    assert!(
+        mark_backend.is_file(),
+        "sanity: the unpinned `RUSTC_BOOTSTRAP=1 cargo metadata` in the fixture never loaded the \
+         project's `-Zcodegen-backend` dylib, so this test would prove nothing about it"
+    );
     reset();
     let _ = std::fs::remove_file(fixture.root.join("Cargo.lock"));
     let _ = std::fs::remove_dir_all(fixture.root.join("target"));
@@ -430,10 +528,25 @@ fn assert_the_hostile_config_is_in_force(fixture: &Fixture, real: &RealToolchain
 fn rust_analyzer_runs_no_build_script_proc_macro_toolchain_or_rustc_the_project_names() {
     let real = real_toolchain();
     let scratch = Scratch::new("project");
-    let fixture = write_fixture(&scratch.0, &real);
-    scrub_environment(&real.proxy_dir);
-    std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
-    std::env::set_current_dir(&fixture.root).unwrap();
+    write_fixture(&scratch.0, &real);
+    in_its_env(
+        "rust_analyzer_runs_no_build_script_proc_macro_toolchain_or_rustc_the_project_names_in_its_env",
+        &scratch.0,
+        &real,
+        Some(&scratch.0),
+    );
+}
+
+#[test]
+#[ignore = "run by its parent test in the fixture's environment"]
+fn rust_analyzer_runs_no_build_script_proc_macro_toolchain_or_rustc_the_project_names_in_its_env() {
+    let test =
+        "rust_analyzer_runs_no_build_script_proc_macro_toolchain_or_rustc_the_project_names_in_its_env";
+    #[allow(unused_variables)]
+    let Some((root, real)) = child_fixture(test) else {
+        return;
+    };
+    let fixture = Fixture::at(&root);
 
     #[cfg(unix)]
     assert_the_hostile_config_is_in_force(&fixture, &real);
@@ -483,6 +596,7 @@ fn rust_analyzer_runs_no_build_script_proc_macro_toolchain_or_rustc_the_project_
         Vec::<String>::new(),
         "the semantic tier ran code the project supplied (markers, shim logs or a target/ dir)"
     );
+    println!("{}", ran_marker(test));
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +633,24 @@ mod project_extra_env {
     }
 
     impl ExtraEnvFixture {
+        /// The fixture [`write_extra_env_fixture`] wrote at `root`.
+        fn at(root: &Path) -> Self {
+            let rustflags_dylib = marker_dylib(&root.join("dylib_rustflags"));
+            let extra_env = serde_json::json!({
+                "CARGO_ENCODED_RUSTFLAGS": format!("-Zcodegen-backend={}", rustflags_dylib.to_string_lossy()),
+                "CARGO_UNSTABLE_HOST_CONFIG": "true",
+                // A stable cargo honours the config's `[unstable]` table, which
+                // `host-config` needs, only when bootstrapped.
+                "RUSTC_BOOTSTRAP": "1",
+            });
+            ExtraEnvFixture {
+                root: root.to_path_buf(),
+                rustflags_mark: root.join("MARK_extraenv_rustflags"),
+                host_mark: root.join("MARK_extraenv_host_config"),
+                extra_env,
+            }
+        }
+
         fn fired(&self) -> Vec<String> {
             [&self.rustflags_mark, &self.host_mark]
                 .iter()
@@ -532,16 +664,19 @@ mod project_extra_env {
     /// shim, so the only code a rustc could load is a marker dylib named by
     /// the two channels: `CARGO_ENCODED_RUSTFLAGS` (a `-Zcodegen-backend`)
     /// and `CARGO_UNSTABLE_HOST_CONFIG=true` (which lets the config's
-    /// `[host] rustflags` through). `None` when no C compiler builds the dylibs.
-    fn write_extra_env_fixture(
-        root: &Path,
-        real: &RealToolchain,
-        at: Option<TomlAt>,
-    ) -> Option<ExtraEnvFixture> {
-        let rustflags_mark = root.join("MARK_extraenv_rustflags");
-        let host_mark = root.join("MARK_extraenv_host_config");
-        let rustflags_dylib = build_marker_dylib(&root.join("dylib_rustflags"), &rustflags_mark)?;
-        let host_dylib = build_marker_dylib(&root.join("dylib_host"), &host_mark)?;
+    /// `[host] rustflags` through).
+    fn write_extra_env_fixture(root: &Path, at: Option<TomlAt>) {
+        let fixture = ExtraEnvFixture::at(root);
+        build_marker_dylib(
+            &root.join("dylib_rustflags"),
+            &fixture.rustflags_mark,
+            "the `cargo.extraEnv` `CARGO_ENCODED_RUSTFLAGS` hook",
+        );
+        let host_dylib = build_marker_dylib(
+            &root.join("dylib_host"),
+            &fixture.host_mark,
+            "the `cargo.extraEnv` `CARGO_UNSTABLE_HOST_CONFIG` + config `[host] rustflags` hook",
+        );
         write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
         write(
             &root.join("app/Cargo.toml"),
@@ -563,24 +698,15 @@ mod project_extra_env {
                 format!("-Zcodegen-backend={}", host_dylib.to_string_lossy())
             ),
         );
-        let _ = real;
-        let extra_env = serde_json::json!({
-            "CARGO_ENCODED_RUSTFLAGS": format!("-Zcodegen-backend={}", rustflags_dylib.to_string_lossy()),
-            "CARGO_UNSTABLE_HOST_CONFIG": "true",
-            // A stable cargo honours the config's `[unstable]` table, which
-            // `host-config` needs, only when bootstrapped.
-            "RUSTC_BOOTSTRAP": "1",
-        });
         let table = format!(
             "[cargo.extraEnv]\nCARGO_ENCODED_RUSTFLAGS = {:?}\nCARGO_UNSTABLE_HOST_CONFIG = \"true\"\nRUSTC_BOOTSTRAP = \"1\"\n",
-            extra_env["CARGO_ENCODED_RUSTFLAGS"].as_str().unwrap()
+            fixture.extra_env["CARGO_ENCODED_RUSTFLAGS"].as_str().unwrap()
         );
         match at {
             Some(TomlAt::Root) => write(&root.join("rust-analyzer.toml"), &table),
             Some(TomlAt::Crate) => write(&root.join("app/rust-analyzer.toml"), &table),
             None => {}
         }
-        Some(ExtraEnvFixture { root: root.to_path_buf(), rustflags_mark, host_mark, extra_env })
     }
 
     fn index_of(root: &Path) -> SdkIndex {
@@ -618,15 +744,13 @@ mod project_extra_env {
     /// Indexes the fixture. `client_extra_env: None` runs the production
     /// `semantic::engine`; `Some(env)` runs a bridge built the way `engine`
     /// builds one (manifest config, the same pinned values) with `env` added
-    /// as the client's `cargo.extraEnv` initialization option.
+    /// as the client's `cargo.extraEnv` initialization option. Runs in the
+    /// child, whose working directory is the fixture.
     fn index_fixture(
         fixture: &ExtraEnvFixture,
         real: &RealToolchain,
         client_extra_env: Option<&serde_json::Value>,
     ) {
-        scrub_environment(&real.proxy_dir);
-        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
-        std::env::set_current_dir(&fixture.root).unwrap();
         let index = index_of(&fixture.root);
         let mut engine: Box<dyn g_mesh_plugin_sdk::SemanticEngine> = match client_extra_env {
             None => semantic::engine(&fixture.root).expect("the engine resolves a rust-analyzer"),
@@ -658,10 +782,19 @@ mod project_extra_env {
         );
     }
 
-    fn assert_project_extra_env_is_ignored(at: TomlAt) {
+    /// The parent: writes the fixture with its `rust-analyzer.toml` `at`,
+    /// then runs `child` in the fixture's environment.
+    fn extra_env_in_its_env(name: &str, at: Option<TomlAt>, child: &str) {
         let real = real_toolchain();
-        let scratch = Scratch::new("extraenv");
-        let Some(fixture) = write_extra_env_fixture(&scratch.0, &real, Some(at)) else { return };
+        let scratch = Scratch::new(name);
+        write_extra_env_fixture(&scratch.0, at);
+        in_its_env(child, &scratch.0, &real, Some(&scratch.0));
+    }
+
+    /// The child of both project-file tests.
+    fn assert_project_extra_env_is_ignored(test: &str) {
+        let Some((root, real)) = child_fixture(test) else { return };
+        let fixture = ExtraEnvFixture::at(&root);
         index_fixture(&fixture, &real, None);
         assert_eq!(
             fixture.fired(),
@@ -669,16 +802,41 @@ mod project_extra_env {
             "a project rust-analyzer.toml's cargo.extraEnv reached the server's cargo/rustc: the rustflags \
              or host-config channel is open again (GM-572)"
         );
+        println!("{}", ran_marker(test));
     }
 
     #[test]
     fn a_root_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker() {
-        assert_project_extra_env_is_ignored(TomlAt::Root);
+        extra_env_in_its_env(
+            "extraenv",
+            Some(TomlAt::Root),
+            "project_extra_env::a_root_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker_in_its_env",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_root_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker_in_its_env() {
+        assert_project_extra_env_is_ignored(
+            "project_extra_env::a_root_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker_in_its_env",
+        );
     }
 
     #[test]
     fn a_crate_level_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker() {
-        assert_project_extra_env_is_ignored(TomlAt::Crate);
+        extra_env_in_its_env(
+            "extraenv",
+            Some(TomlAt::Crate),
+            "project_extra_env::a_crate_level_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker_in_its_env",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_crate_level_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker_in_its_env() {
+        assert_project_extra_env_is_ignored(
+            "project_extra_env::a_crate_level_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker_in_its_env",
+        );
     }
 
     /// Control: the same values through the client's `cargo.extraEnv` beat
@@ -688,9 +846,19 @@ mod project_extra_env {
     /// same pass, with the values moved from the project file to the client.
     #[test]
     fn the_same_extra_env_through_the_client_fires_the_markers() {
-        let real = real_toolchain();
-        let scratch = Scratch::new("extraenv-ctl");
-        let Some(fixture) = write_extra_env_fixture(&scratch.0, &real, None) else { return };
+        extra_env_in_its_env(
+            "extraenv-ctl",
+            None,
+            "project_extra_env::the_same_extra_env_through_the_client_fires_the_markers_in_its_env",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn the_same_extra_env_through_the_client_fires_the_markers_in_its_env() {
+        let test = "project_extra_env::the_same_extra_env_through_the_client_fires_the_markers_in_its_env";
+        let Some((root, real)) = child_fixture(test) else { return };
+        let fixture = ExtraEnvFixture::at(&root);
         let env = fixture.extra_env.clone();
         index_fixture(&fixture, &real, Some(&env));
         assert!(
@@ -705,6 +873,7 @@ mod project_extra_env {
              tests prove nothing about that channel",
             fixture.fired()
         );
+        println!("{}", ran_marker(test));
     }
 }
 
@@ -722,31 +891,56 @@ mod cargo_env_loader_var {
     /// The loader variable this platform's dynamic loader honours.
     const LOADER_VAR: &str = if cfg!(target_os = "macos") { "DYLD_INSERT_LIBRARIES" } else { "LD_PRELOAD" };
 
-    #[test]
-    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker() {
+    const LOADER_MANIFEST: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+
+    /// The marker a loaded dylib writes and the dylib, in the fixture at `root`.
+    fn mark_and_dylib(root: &Path) -> (PathBuf, PathBuf) {
+        (root.join("MARK_cargo_env_loader"), marker_dylib(&root.join("dylib")))
+    }
+
+    /// The parent: writes a clean package (no cargo config yet) and the
+    /// marker dylib, then runs `child` in the fixture's environment, from
+    /// this process's working directory.
+    fn loader_fixture_in_its_env(name: &str, child: &str) {
         let real = real_toolchain();
-        let scratch = Scratch::new("loader-env");
+        let scratch = Scratch::new(name);
         let root = scratch.0.clone();
-        let mark = root.join("MARK_cargo_env_loader");
-        let Some(dylib) = build_marker_dylib(&root.join("dylib"), &mark) else { return };
-        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
-        write(
-            &root.join("app/Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        let (mark, _) = mark_and_dylib(&root);
+        build_marker_dylib(
+            &root.join("dylib"),
+            &mark,
+            &format!("the cargo config `[env] {LOADER_VAR}` hook"),
         );
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        write(&root.join("app/Cargo.toml"), LOADER_MANIFEST);
         write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
         write(
             &root.join("app/src/util.rs"),
             "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
         );
+        in_its_env(child, &root, &real, None);
+    }
+
+    #[test]
+    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker() {
+        loader_fixture_in_its_env(
+            "loader-env",
+            "cargo_env_loader_var::a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env() {
+        let test =
+            "cargo_env_loader_var::a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env";
+        let Some((root, real)) = child_fixture(test) else { return };
+        let (mark, dylib) = mark_and_dylib(&root);
         let config = root.join(".cargo/config.toml");
         write(
             &config,
             &format!("[env]\n{LOADER_VAR} = {{ value = {:?}, force = true }}\n", dylib.to_string_lossy()),
         );
-
-        scrub_environment(&real.proxy_dir);
-        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
 
         // Sanity: the hostile config is live - an unpinned `cargo metadata`
         // in the fixture loads the dylib into the rustc it starts.
@@ -799,6 +993,7 @@ mod cargo_env_loader_var {
             "the engine failed, but not by refusing the [env] {LOADER_VAR} in {}: {reason}",
             config.display()
         );
+        println!("{}", ran_marker(test));
     }
 
     /// Watches `mark` for `span`; `Err` with how long it took when it appears.
@@ -822,23 +1017,21 @@ mod cargo_env_loader_var {
     /// naming the config, and no rustc ever loads the dylib.
     #[test]
     fn a_loader_var_added_after_start_stops_the_server_before_any_reload() {
+        loader_fixture_in_its_env(
+            "loader-env-late",
+            "cargo_env_loader_var::a_loader_var_added_after_start_stops_the_server_before_any_reload_in_its_env",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_loader_var_added_after_start_stops_the_server_before_any_reload_in_its_env() {
         use std::time::Duration;
 
-        let real = real_toolchain();
-        let scratch = Scratch::new("loader-env-late");
-        let root = scratch.0.clone();
-        let mark = root.join("MARK_cargo_env_loader");
-        let Some(dylib) = build_marker_dylib(&root.join("dylib"), &mark) else { return };
-        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
-        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
-        write(&root.join("app/Cargo.toml"), manifest);
-        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
-        write(
-            &root.join("app/src/util.rs"),
-            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
-        );
-        scrub_environment(&real.proxy_dir);
-        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+        let test = "cargo_env_loader_var::a_loader_var_added_after_start_stops_the_server_before_any_reload_in_its_env";
+        let Some((root, real)) = child_fixture(test) else { return };
+        let (mark, dylib) = mark_and_dylib(&root);
+        let manifest = LOADER_MANIFEST;
 
         let mut engine = semantic::engine(&root).expect("no cargo config yet: the engine starts");
         let index = {
@@ -904,6 +1097,7 @@ mod cargo_env_loader_var {
             "sanity: `cargo metadata` in the fixture never loaded the [env] {LOADER_VAR} dylib, so this test \
              would prove nothing about that channel"
         );
+        println!("{}", ran_marker(test));
     }
 
     /// The bridge forwards every file a pass is sent to rust-analyzer, and a
@@ -918,25 +1112,21 @@ mod cargo_env_loader_var {
     /// (`self.bridge.as_mut()` for `self.checked()`).
     #[test]
     fn a_pass_after_the_config_turned_hostile_refuses_before_forwarding_any_file() {
+        loader_fixture_in_its_env(
+            "loader-env-pending",
+            "cargo_env_loader_var::a_pass_after_the_config_turned_hostile_refuses_before_forwarding_any_file_in_its_env",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_pass_after_the_config_turned_hostile_refuses_before_forwarding_any_file_in_its_env() {
         use std::time::Duration;
 
-        let real = real_toolchain();
-        let scratch = Scratch::new("loader-env-pending");
-        let root = scratch.0.clone();
-        let mark = root.join("MARK_cargo_env_loader");
-        let Some(dylib) = build_marker_dylib(&root.join("dylib"), &mark) else { return };
-        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
-        write(
-            &root.join("app/Cargo.toml"),
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        );
-        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
-        write(
-            &root.join("app/src/util.rs"),
-            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
-        );
-        scrub_environment(&real.proxy_dir);
-        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+        let test =
+            "cargo_env_loader_var::a_pass_after_the_config_turned_hostile_refuses_before_forwarding_any_file_in_its_env";
+        let Some((root, real)) = child_fixture(test) else { return };
+        let (mark, dylib) = mark_and_dylib(&root);
 
         let mut engine = semantic::engine(&root).expect("no cargo config yet: the engine starts");
         if let Err(error) = engine.answer(&[], &index_of(&root)) {
@@ -991,6 +1181,7 @@ mod cargo_env_loader_var {
             "sanity: `cargo metadata` in the fixture never loaded the [env] {LOADER_VAR} dylib, so this test \
              would prove nothing about that channel"
         );
+        println!("{}", ran_marker(test));
     }
 
     fn index_of(root: &Path) -> SdkIndex {
@@ -1072,9 +1263,20 @@ mod source_freshness {
             &root.join("app/src/util.rs"),
             "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
         );
-        scrub_environment(&real.proxy_dir);
-        std::env::set_var(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"));
+        in_its_env(
+            "source_freshness::an_edit_to_a_file_no_question_touched_reaches_the_answer_about_its_caller_in_its_env",
+            &root,
+            &real,
+            None,
+        );
+    }
 
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn an_edit_to_a_file_no_question_touched_reaches_the_answer_about_its_caller_in_its_env() {
+        let test =
+            "source_freshness::an_edit_to_a_file_no_question_touched_reaches_the_answer_about_its_caller_in_its_env";
+        let Some((root, _real)) = child_fixture(test) else { return };
         let mut engine = semantic::engine(&root).expect("the engine starts");
         let before = index_of(&root);
         let first = engine.answer(&[], &before).expect("the first pass answers");
@@ -1098,5 +1300,6 @@ mod source_freshness {
             "`main -> method` must land on the edited `Thing::method`; `Other::method` is where the old \
              text had it"
         );
+        println!("{}", ran_marker(test));
     }
 }

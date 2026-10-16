@@ -28,7 +28,8 @@
 //! hex, first 32 characters.
 
 use g_mesh_plugin_sdk::ids::{edge_id, node_id};
-use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind};
+use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PlaceholderTarget, TargetKey, TargetScope};
+use g_mesh_plugin_sdk::{placeholder_id, PlaceholderKind, RelPath};
 
 /// `(filePath, kind, qualifiedName, nativeKind) -> id`, as the TS plugin
 /// computes it.
@@ -94,4 +95,29 @@ fn edge_ids_match_the_typescript_plugins() {
              TypeScript plugin's - the id scheme is a cross-plugin contract, see `ids`' module doc"
         );
     }
+}
+
+/// **GM-596.** A placeholder keyed by *name* still gets the id the TS plugin
+/// recorded for its label (`src/b.ts#helper`, the `pending_symbol` row of
+/// `NODE_CASES`): putting the key kind into the label changed only the
+/// qualified-name rendering. The qualified-name key with the same string gets
+/// another id.
+#[test]
+fn a_name_keyed_placeholder_keeps_its_recorded_id() {
+    let target = |key| PlaceholderTarget {
+        scope: TargetScope::File("src/b.ts".to_string()),
+        key,
+        from_container: None,
+        key_path: None,
+    };
+    let at = RelPath::new("src/a.ts");
+    let by_name =
+        placeholder_id(&at, PlaceholderKind::PendingSymbol, &target(TargetKey::Name("helper".into())));
+    assert_eq!(by_name, "5314e55c6fd3d950a54751b0bcabebc4");
+    let by_qualified = placeholder_id(
+        &at,
+        PlaceholderKind::PendingSymbol,
+        &target(TargetKey::QualifiedName("helper".into())),
+    );
+    assert_ne!(by_qualified, by_name, "a qualified-name key is a different address");
 }

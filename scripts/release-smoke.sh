@@ -5,9 +5,9 @@
 # thing works.
 #
 # `build_one()` in scripts/build-targets.sh already runs `--version` and
-# `plugins list` against the staged binary whenever it was built for the host
-# (which, in the release matrix, is always - every leg builds natively on its
-# own target's runner). That proves the binary starts and that it *sees* the
+# `plugins list` against the staged binary whenever this machine can execute
+# it (which, in the release matrix, is always - natively, or for x86_64 macOS
+# under Rosetta on the arm64 runner, GM-613). That proves the binary starts and that it *sees* the
 # plugins staged beside it. It does not spawn a single plugin process, index
 # a single file, or touch the index this binary is meant to serve - the exact
 # gap GM-206 found by doing this once, by hand, on one platform.

@@ -865,12 +865,21 @@ impl Drop for ConnectionGuard {
 /// a file change's whole round trip including its commit, so the sleep cannot
 /// return until that transaction is durable.
 ///
+/// `indexing`, when given, is detached from its phase and progress files
+/// before the orphan and idle exits release the state files
+/// ([`IndexingStatus::detach_state_files`]): the activation thread is not
+/// stopped by the teardown and would otherwise write them back into a state
+/// directory being purged (GM-605). `daemon::run` passes its status; the front
+/// daemon has none.
+///
 /// [`sleep_now`]: PluginSupervisor::sleep_now
+/// [`IndexingStatus::detach_state_files`]: crate::daemon::indexing_status::IndexingStatus::detach_state_files
 pub fn supervise(
     project_root: &Path,
     state_dir: &Path,
     registry: &crate::daemon::registry::PluginRegistry,
     core: &CoreActivity,
+    indexing: Option<&crate::daemon::indexing_status::IndexingStatus>,
     timeouts: IdleTimeouts,
     accept_loop: Receiver<Result<()>>,
 ) -> Result<Exit> {
@@ -901,6 +910,9 @@ pub fn supervise(
             // The same teardown as the idle exit below.
             registry.sleep_all_now("the core has been orphaned and is shutting down");
             end_process_group();
+            if let Some(indexing) = indexing {
+                indexing.detach_state_files();
+            }
             release_state_files(state_dir);
             return Ok(Exit::Orphaned(orphan));
         }
@@ -916,6 +928,9 @@ pub fn supervise(
             );
             registry.sleep_all_now("the core is shutting down");
             end_process_group();
+            if let Some(indexing) = indexing {
+                indexing.detach_state_files();
+            }
             release_state_files(state_dir);
             return Ok(Exit::Idle);
         }

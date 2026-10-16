@@ -85,7 +85,7 @@ jobs:
           # The same four rows release.yml builds. Kept in step with the
           # comment that used to sit on the literal matrix below.
           all='[
-            {"target":"x86_64-apple-darwin","runner":"macos-15-intel"},
+            {"target":"x86_64-apple-darwin","runner":"macos-15-intel","timeout":75,"build_timeout":30,"it_timeout":25},
             {"target":"aarch64-apple-darwin","runner":"macos-15"},
             {"target":"x86_64-unknown-linux-gnu","runner":"ubuntu-22.04"},
             {"target":"x86_64-pc-windows-msvc","runner":"windows-2022"}
@@ -269,6 +269,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run scripts/test-install.sh
         run: bash scripts/test-install.sh
+      # release.yml's test gate and the smoke/architecture guards of the
+      # release build, offline: the GitHub API is a stub, so no token or
+      # network. The Mach-O cases run on macos-15 only (they need lipo).
+      - name: Run scripts/test-ci-green-for-commit.sh
+        run: bash scripts/test-ci-green-for-commit.sh
 
   test:
     name: tests (${{ matrix.target }})
@@ -283,11 +288,13 @@ jobs:
     # plugin, and a cold build compiles ONNX Runtime bindings, bundled SQLite
     # and Oniguruma from scratch. A deadlock guard, not a target.
     #
-    # 45 rather than 90: a healthy run finishes in about five minutes on Linux
-    # and macOS, so 90 only bought a longer wait for the same answer - Windows
-    # hung for the whole budget and produced nothing usable. Fail sooner and
-    # collect the log instead.
-    timeout-minutes: 45
+    # 45 rather than 90: a healthy run finishes in 10-19 minutes on Linux,
+    # Windows and arm macOS, so 90 only bought a longer wait for the same
+    # answer - Windows hung for the whole budget and produced nothing usable.
+    # Fail sooner and collect the log instead. The x86_64 macOS row runs 24-50
+    # minutes on a slower host, so it carries its own limits (`timeout`,
+    # `build_timeout`, `it_timeout` on its matrix row); other rows use these.
+    timeout-minutes: ${{ matrix.timeout || 45 }}
     strategy:
       # One platform failing must not hide whether the other three work -
       # which is the whole point here, since before this job the Windows port
@@ -306,6 +313,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      # Runner state, so a slow run can be attributed to its host from the log.
+      - name: Runner state
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          uptime
+          if [ "$RUNNER_OS" = macOS ]; then
+            sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          else
+            nproc
+            grep -m1 'model name' /proc/cpuinfo
+            free -g
+          fi
 
       # GM-342. `scripts/install.ps1` is 616 lines that, until this step, had
       # never been executed OR parsed by anything: PowerShell is absent from
@@ -491,10 +512,16 @@ jobs:
       # binary in toolchain" when the component behind it is missing. The
       # plugin makes exactly this check at run time, for exactly this reason
       # (plugins/rust/src/semantic.rs).
+      #
+      # `rust-src` too (GM-603): without it rust-analyzer has no std to load.
+      # The plugin pins `cargo.sysroot`, so the server never installs it
+      # itself; before that pin it ran `rustup component add rust-src`
+      # mid-suite, and an install that failed under the parallel tests left
+      # std unloaded for the rest of the job on the x86_64 macOS runner.
       - name: Install rust-analyzer
         shell: bash
         run: |
-          rustup component add rust-analyzer --toolchain "$RUST_VERSION"
+          rustup component add rust-analyzer rust-src --toolchain "$RUST_VERSION"
           rust-analyzer --version
 
       # Node is only here for npm: the "Install pyright" step below runs
@@ -730,7 +757,7 @@ jobs:
       #   `default` profile's.
       - name: Build the test binaries
         id: build
-        timeout-minutes: 25
+        timeout-minutes: ${{ matrix.build_timeout || 25 }}
         shell: bash
         run: cargo nextest run --workspace --profile ci --no-run
 
@@ -743,7 +770,7 @@ jobs:
 
       - name: "tests: core-it"
         if: ${{ !cancelled() && steps.build.outcome == 'success' && (needs.select.outputs.mode == 'full' || contains(format(' {0} ', needs.select.outputs.sections), ' core-it ')) }}
-        timeout-minutes: 20
+        timeout-minutes: ${{ matrix.it_timeout || 20 }}
         shell: bash
         run: scripts/test-sections.sh run --profile ci core-it
 
@@ -884,6 +911,39 @@ jobs:
           else
             echo "no daemon log at $log - nothing ever wrote one, which is itself the answer"
           fi
+
+      # Prints the toolchain's rust-src state and reruns rust-analyzer's
+      # sysroot `cargo metadata` with the plugin's pinned env
+      # (plugins/rust/src/semantic.rs `pinned_env`), because rust-analyzer's
+      # own log of a failure keeps only "Failed to run `...`", not cargo's
+      # stderr. Temporary diagnostic, see docs/design/GM-603-x86-macos-ra-sysroot.md.
+      - name: rust-src state and the sysroot cargo metadata
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        run: |
+          set +e
+          tc="$(rustup default | cut -d' ' -f1)"
+          sysroot="$(rustc --print sysroot)"
+          lib="$sysroot/lib/rustlib/src/rust/library"
+          echo "toolchain $tc, sysroot $sysroot"
+          rustup component list --installed --toolchain "$tc"
+          if [ ! -d "$lib" ]; then
+            echo "no $lib - rust-src was never installed in this job"
+            exit 0
+          fi
+          echo "library: $(find "$lib" -type f | wc -l | tr -d ' ') files, vendor: $(ls "$lib/vendor" 2>/dev/null | wc -l | tr -d ' ') crates"
+          ls -la "$lib" "$lib/.cargo" 2>&1
+          lk="$(mktemp -d)"; cp "$lib/Cargo.lock" "$lk/Cargo.lock"
+          (cd "$lib" && \
+            CARGO_NET_OFFLINE=true CARGO_ENCODED_RUSTFLAGS= CARGO_UNSTABLE_HOST_CONFIG=false \
+            RUSTUP_TOOLCHAIN="$tc" RUSTC="$(rustup which --toolchain "$tc" rustc)" \
+            CARGO_BUILD_RUSTC="$(rustup which --toolchain "$tc" rustc)" CARGO="$(rustup which --toolchain "$tc" cargo)" \
+            RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER= \
+            CARGO_RESOLVER_LOCKFILE_PATH="$lk/Cargo.lock" RUSTUP_AUTO_INSTALL=0 \
+            __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly \
+            "$HOME/.cargo/bin/cargo" metadata --format-version 1 --manifest-path "$lib/Cargo.toml" \
+              --filter-platform "$(rustc -vV | sed -n 's/^host: //p')" -Zlockfile-path -Zunstable-options > /dev/null)
+          echo "sysroot cargo metadata exit: $?"
 
   # GM-282's other half of "the Go toolchain is available on all CI
   # runners" (the `test` job above, all four platforms): one job proves the

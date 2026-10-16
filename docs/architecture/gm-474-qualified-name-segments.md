@@ -74,7 +74,7 @@ byte, so plain `grep` treats it as binary and reports nothing; it needs
 
 | producer | how `qualifiedName` is built | separators in use |
 |---|---|---|
-| `plugins/sdk` (`graph.rs` `NodeSpec`, `FileGraphBuilder`, `render_target`, `ids::node_id`; `lsp/bridge.rs::address_of`) | passed through from the plugin. `render_target` builds a placeholder label `<file>#<key>` or `<container>::<key>`. The LSP bridge copies a declaration's `qualifiedName` into a `TargetKey::QualifiedName`. | as given |
+| `plugins/sdk` (`graph.rs` `NodeSpec`, `FileGraphBuilder`, `render_target`, `ids::node_id`; `lsp/bridge.rs::address_of`) | passed through from the plugin. `render_target` builds a placeholder label `<file>#<key>` or `<container>::<key>`, with `=` before a `qualifiedName` key (`<file>#=<key>`, `<container>::=<key>`; GM-596). The LSP bridge copies a declaration's `qualifiedName` into a `TargetKey::QualifiedName`. | as given |
 | Rust (`extractor/keys.rs` `qualified`/`qualified_in`, `decls.rs` `BlockCtx::tail`, `field_tail`, `impl_block`; `bodies.rs::tail_in`) | module path within the crate, then `T::m`, `T.f` (GM-450), `<X as Tr>::m`, impl-block nodes named `<X as Tr>`, raw identifiers `r#async` | `::`, `.` |
 | Python (`decls.rs` via `scope::child_path`, `bodies.rs:718` keys, `emit.rs` labels) | lexical path within the module (`Outer.Inner.m`), and a module announcement whose name is its dotted key | `.` |
 | TypeScript (`extract.ts::qualify`, :811, with call sites :1649 to :2000) | `prefix + sep + name`. Instance members use `#` and static or namespace members use `.`. Ambient module names such as `*.scss` and `png-chunk-text` are used as written. A private member is `C##priv`. | `#`, `.` |
@@ -439,8 +439,9 @@ touches symbol names. Three related items, none of them about
 | `mcp/find_definition.rs::is_module_specifier` (`@` prefix or contains `/`) | gates the semantic-neighbour rung | yes: the shape of an npm or Go import specifier | kept as a spelling rule: a lookup cannot express it (GM-475, below) |
 | `embedding/text.rs` (Markdown headings, `<url>` links in doc comments) | embedding text | doc-comment Markdown, shared by all languages | none needed |
 
-The SDK's `render_target` (`<file>#<key>`, `<container>::<key>`) builds
-placeholder labels on the plugin side, so it is not core.
+The SDK's `render_target` (`<file>#<key>`, `<container>::<key>`, a
+`qualifiedName` key prefixed with `=`) builds placeholder labels on the
+plugin side, so it is not core.
 
 **`is_module_specifier` stays a spelling rule (GM-475).** The proposed
 lookup, "the query equals a stored module key or file path", was built and

@@ -105,6 +105,8 @@ impl BundleRoot {
     fn new(edit_manifest: impl FnOnce(String) -> String) -> Self {
         let root = tempfile::tempdir().expect("failed to create a scratch repo root");
         copy_from_repo(root.path(), "scripts/bundle-plugin.sh");
+        // Sourced by the script (GM-613).
+        copy_from_repo(root.path(), "scripts/lib/runnable.sh");
         let manifest = fs::read_to_string(repo_root().join("plugins/typescript/plugin.toml")).unwrap();
         let target = root.path().join("plugins/typescript/plugin.toml");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -134,6 +136,9 @@ impl BundleRoot {
             .arg(self.dest())
             .env("PATH", path_with(&self.root.path().join("fake-bin")))
             .env("CARGO_PROFILE", "release")
+            // A skipped smoke check is logged, not fatal, whatever the caller's
+            // environment says.
+            .env_remove("G_MESH_REQUIRE_SMOKE")
             .env("FAKE_REPO_ROOT", self.root.path())
             .env("FAKE_CARGO_PAYLOAD", self.root.path().join("payload/g-mesh-plugin-typescript"))
             .env("FAKE_CARGO_OUTPUT", exe)
@@ -309,6 +314,8 @@ fn build_targets_root() -> tempfile::TempDir {
     let root = tempfile::tempdir().expect("failed to create a scratch repo root");
     let path = root.path();
     copy_from_repo(path, "scripts/build-targets.sh");
+    // Sourced by the script (GM-613); the stand-in bundlers below do not.
+    copy_from_repo(path, "scripts/lib/runnable.sh");
     write_executable(
         &path.join("scripts/bundle-plugin.sh"),
         r#"#!/bin/bash
@@ -363,6 +370,7 @@ fn run_build_targets(root: &Path, stage_ts_binary: bool, plugins_list: &str) -> 
         .env("G_MESH_VERSION", "9.9.9")
         .env("DIST_DIR", root.join("dist"))
         .env_remove("G_MESH_SKIP_PLUGIN_BUNDLE")
+        .env_remove("G_MESH_REQUIRE_SMOKE")
         .env("FAKE_REPO_ROOT", root)
         .env("FAKE_CARGO_PAYLOAD", root.join("payload/g-mesh"))
         .env("FAKE_CARGO_OUTPUT", "g-mesh")

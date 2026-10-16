@@ -218,6 +218,12 @@ type semanticEngine struct {
 	// rows nothing reads.
 	emittedEdges map[string][]string
 
+	// supertypes is, per file, what each SUPERTYPE_OF edge in emittedEdges
+	// was produced from, so a pass that could not re-evaluate the edge's
+	// interface (its package was neither folded nor imported this pass)
+	// carries the edge forward instead of retracting it (GM-590).
+	supertypes map[string]map[string]supertypeRecord
+
 	// ws is the module layout of the pass currently running, set by `run`
 	// and cleared when it returns. A pass is strictly sequential within one
 	// process (the control loop reads and answers one frame at a time), so
@@ -233,6 +239,7 @@ func newSemanticEngine(projectRoot string) *semanticEngine {
 		projectRoot:  projectRoot,
 		realRoot:     canonicalizeProjectRoot(projectRoot),
 		emittedEdges: map[string][]string{},
+		supertypes:   map[string]map[string]supertypeRecord{},
 	}
 }
 
@@ -247,13 +254,13 @@ func (e *semanticEngine) degrade(format string, args ...interface{}) {
 // --- the structural view ------------------------------------------------
 
 // structuralFile is what extract.go says about one file, reduced to the
-// three things a resolution needs: the open questions, the calls that may
-// have been addressed at a type, and the node ids an answer can be written
-// from.
+// three things a resolution needs: the open questions, the uses onto a
+// placeholder that go/types may correct (a conversion) or sharpen (a twinned
+// name), and the node ids an answer can be written from.
 type structuralFile struct {
-	container        string
-	openSites        []openSite
-	placeholderCalls []placeholderCall
+	container       string
+	openSites       []openSite
+	placeholderUses []placeholderUse
 	// typeNodes are the file's `Type` declarations by name - the `from` of
 	// every SUPERTYPE_OF edge.
 	typeNodes map[string]wireNode
@@ -278,10 +285,10 @@ func (e *semanticEngine) extractStructural(ws *workspace, relPaths []string) map
 		}
 		graph := extractFile(ws, relPath, content)
 		file := structuralFile{
-			container:        graph.container,
-			openSites:        graph.openSites,
-			placeholderCalls: graph.placeholderCalls,
-			typeNodes:        map[string]wireNode{},
+			container:       graph.container,
+			openSites:       graph.openSites,
+			placeholderUses: graph.placeholderUses,
+			typeNodes:       map[string]wireNode{},
 		}
 		for _, node := range graph.nodes {
 			if node.Kind == nodeKindType {
@@ -351,6 +358,29 @@ type resolutions struct {
 	// still needs its twins, or an edit to the importing file would flip
 	// its answers back to the ambiguous container address.
 	referenced map[string]bool
+
+	// folded is every project package path whose own source this pass
+	// type-checked: its interfaces are all in `interfaces`, so an edge onto
+	// one that is missing describes an interface that is gone.
+	folded map[string]bool
+	// importedInterfaces is every `<package path>.<name>` interface added
+	// from an imported project package's export data (foldImportedInterfaces):
+	// re-evaluated exactly this pass, never carried forward.
+	importedInterfaces map[string]bool
+	// importedPackages is every project package path walked from export
+	// data. Export data holds every exported declaration, so an exported
+	// interface of one of these that is not in importedInterfaces is gone
+	// (an unexported one may simply not have been exported).
+	importedPackages map[string]bool
+	// importsWalked is every imported *types.Package already walked. Keyed by
+	// object, not path: each module's load has its own copy of a package,
+	// and a type is checked against the copy its own load imported.
+	importsWalked map[*types.Package]bool
+	// exhaustive is a whole-project pass in which every module loaded: every
+	// project interface was evaluated, so nothing is carried forward, and
+	// every referenced project package was folded, so no package's twins had
+	// to be listed. Set by [semanticEngine.loadFor].
+	exhaustive bool
 }
 
 func newResolutions() *resolutions {
@@ -364,6 +394,11 @@ func newResolutions() *resolutions {
 		twinsKnown: map[string]bool{},
 		builtFiles: map[string]map[string]bool{},
 		referenced: map[string]bool{},
+
+		folded:             map[string]bool{},
+		importedInterfaces: map[string]bool{},
+		importedPackages:   map[string]bool{},
+		importsWalked:      map[*types.Package]bool{},
 	}
 }
 
@@ -414,9 +449,10 @@ func twinListingKey(cfg *packages.Config) string {
 }
 
 // loadReferencedTwins computes the twinned names of every project package an
-// answer resolved into but no load has folded - in a per-file pass, the
-// imported packages, which the type checker read from export data and
-// go/packages therefore reports without their IgnoredFiles. It asks `go list`
+// answer resolved into but no load has folded - in a per-file pass, or a
+// whole-project pass with a failed module, the imported packages, which the
+// type checker read from export data and go/packages therefore reports
+// without their IgnoredFiles. It asks `go list`
 // for names and files only (no type checking), once per load configuration,
 // from the directory and with the flags of the load whose answers referenced
 // the package: an import path resolves only in a module that requires it, and
@@ -585,6 +621,8 @@ func (e *semanticEngine) foldPackage(into *resolutions, fset *token.FileSet, pkg
 	if pkg.Types == nil {
 		return
 	}
+	into.folded[pkg.PkgPath] = true
+	e.foldImportedInterfaces(into, fset, pkg.Types)
 	scope := pkg.Types.Scope()
 	for _, name := range scope.Names() {
 		typeName, ok := scope.Lookup(name).(*types.TypeName)
@@ -616,6 +654,51 @@ func (e *semanticEngine) foldPackage(into *resolutions, fset *token.FileSet, pkg
 			// find_implementations answers.
 			into.interfaces[typeName] = named
 		}
+	}
+}
+
+// foldImportedInterfaces adds the interfaces of every project package `from`
+// imports, transitively, to `into.interfaces` (GM-590). A per-file pass folds
+// only the file's own package; its imports come from export data, and without
+// this a type would never be checked against an imported interface, so the
+// SUPERTYPE_OF edge a whole-project pass gave it would be retracted. The
+// export-data objects share the importing package's universe, so
+// types.Implements answers exactly. The walk stops at non-project packages: a
+// dependency cannot import back into the project.
+func (e *semanticEngine) foldImportedInterfaces(into *resolutions, fset *token.FileSet, from *types.Package) {
+	for _, imp := range from.Imports() {
+		path := imp.Path()
+		if into.importsWalked[imp] || !e.isProjectContainer(path) {
+			continue
+		}
+		into.importsWalked[imp] = true
+		into.importedPackages[path] = true
+		// Its twins are listed like any other package an answer resolved
+		// into, so targetScopeOf can address a twinned interface by file.
+		into.referenced[path] = true
+		scope := imp.Scope()
+		for _, name := range scope.Names() {
+			typeName, ok := scope.Lookup(name).(*types.TypeName)
+			if !ok || typeName.IsAlias() {
+				continue
+			}
+			named, ok := typeName.Type().(*types.Named)
+			if !ok || named.TypeParams().Len() > 0 {
+				continue
+			}
+			iface, ok := named.Underlying().(*types.Interface)
+			if !ok || iface.NumMethods() == 0 || !iface.IsMethodSet() {
+				continue
+			}
+			into.interfaces[typeName] = named
+			into.importedInterfaces[path+"."+name] = true
+			if _, done := into.declaredIn[typeName]; !done {
+				if at, ok := e.positionOf(fset, typeName.Pos()); ok {
+					into.declaredIn[typeName] = at.file
+				}
+			}
+		}
+		e.foldImportedInterfaces(into, fset, imp)
 	}
 }
 
@@ -921,7 +1004,7 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 	}
 	implementsEdges := e.answerImplements(builder, resolved, structural)
 
-	diff := builder.finish(e, scope)
+	diff := builder.finish(e, scope, resolved, structural)
 	logf("semantic pass: %d file(s), %d resolved site(s), %d implements edge(s), "+
 		"%d node(s)/%d edge(s) upserted, %d edge(s) retracted, in %s",
 		len(scope), sites, implementsEdges, len(diff.UpsertNodes), len(diff.UpsertEdges),
@@ -1021,11 +1104,14 @@ func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject 
 			l.paths[path] = true
 		}
 	}
-	// Only a per-file pass needs the extra listing (imported packages come
-	// from export data without IgnoredFiles); a whole-project pass folds
-	// every project package itself. After all modules loaded, so a listing
-	// cannot mark a later module's folded twins as already known.
-	if !wholeProject {
+	// Only an exhaustive pass folds every project package itself. A per-file
+	// pass, and a whole-project pass with a failed module (whose packages
+	// root's answers reach through export data), list the referenced packages
+	// no load folded (they come without IgnoredFiles). After all modules
+	// loaded, so a listing cannot mark a later module's folded twins as
+	// already known.
+	into.exhaustive = wholeProject && len(outcome.failed) == 0
+	if !into.exhaustive {
 		e.loadReferencedTwins(into, listings)
 	}
 	return outcome
@@ -1095,7 +1181,7 @@ func moduleDirFor(ws *workspace, relDir string) string {
 
 // --- answering one file -------------------------------------------------
 
-// answerFile resolves one file's open sites and placeholder calls, returning
+// answerFile resolves one file's open sites and placeholder uses, returning
 // how many sites produced an edge.
 func (e *semanticEngine) answerFile(
 	builder *semanticDiff,
@@ -1123,30 +1209,53 @@ func (e *semanticEngine) answerFile(
 		answered++
 	}
 
-	for _, call := range file.placeholderCalls {
-		// `Uses`, never `Selections`: a placeholder call is always either a
+	for _, use := range file.placeholderUses {
+		// `Uses`, never `Selections`: a placeholder use is always either a
 		// bare name (`T(x)`) or a package-qualified one (`pkg.T(x)`), and
 		// both are plain identifier uses. A selection through a value never
 		// produced a structural edge in the first place - it is an open
 		// site, handled above.
-		obj := resolved.uses[sitePos{file: relPath, line: call.Line, col: call.Col}]
+		obj := resolved.uses[sitePos{file: relPath, line: use.Line, col: use.Col}]
 		container, key, isFunc, ok := e.addressOf(obj)
-		if !ok || isFunc {
-			// Either nothing to say, or the structural tier was right and
-			// core has already linked its edge. Leaving a correct edge alone
-			// is what keeps this pass's diff small.
+		if !ok {
 			continue
 		}
-		// A conversion, not a call. Retract the CALLS edge core's kind filter
-		// will never land, and say the true thing instead.
-		builder.retract(relPath, call.EdgeID)
-		if call.EnclosingSymbolID == "" {
+		scope := resolved.targetScopeOf(obj, container, key)
+		at := wirePosition{Line: use.Line, Col: use.Col}
+		if use.Kind == edgeKindCalls && !isFunc {
+			// A conversion, not a call. Retract the CALLS edge core's kind
+			// filter will never land, and say the true thing instead.
+			builder.retract(relPath, use.EdgeID)
+			if use.EnclosingSymbolID == "" {
+				continue
+			}
+			toID := builder.placeholder(relPath, file.container, container, scope, key, at, use.Name)
+			builder.edge(relPath, use.EnclosingSymbolID, edgeKindReferences, toID)
+			answered++
 			continue
 		}
-		toID := builder.placeholder(relPath, file.container, container,
-			resolved.targetScopeOf(obj, container, key), key,
-			wirePosition{Line: call.Line, Col: call.Col}, call.Name)
-		builder.edge(relPath, call.EnclosingSymbolID, edgeKindReferences, toID)
+		if scope.File == "" {
+			// The structural tier was right, and core has already linked its
+			// edge (or refuses it for a reason a container-scoped answer would
+			// not change). Leaving it alone is what keeps this pass's diff
+			// small.
+			continue
+		}
+		// A twinned name answered by the twin the host build compiles
+		// (GM-589). The structural edge has two candidates and core refuses
+		// it; the file-scoped edge links.
+		//
+		// Known gap, accepted (GM-589 design D2 a): if the other twin is
+		// later deleted, the name stops being twinned and this branch no
+		// longer fires. A whole-project pass in this same process then
+		// retracts this semantic edge through `emittedEdges` (in `finish`)
+		// without re-sending the structural edge retracted here, so the use
+		// has no edge until this file is next re-extracted by core, which
+		// restores the structural edge and now links it. The edge is
+		// missing for that window, never wrong.
+		builder.retract(relPath, use.EdgeID)
+		toID := builder.placeholder(relPath, file.container, container, scope, key, at, use.Name)
+		builder.edge(relPath, use.FromID, use.Kind, toID)
 		answered++
 	}
 	return answered
@@ -1341,10 +1450,18 @@ func (e *semanticEngine) answerImplements(
 				continue
 			}
 			ifaceContainer, ifaceKey := ifaceObj.Pkg().Path(), dotPath(ifaceObj.Name())
-			toID := builder.placeholder(file, node.Container, ifaceContainer,
-				resolved.targetScopeOf(ifaceObj, ifaceContainer, ifaceKey), ifaceKey,
-				node.Range.Start, ifaceObj.Name())
-			builder.edge(file, node.ID, edgeKindSupertypeOf, toID)
+			record := supertypeRecord{
+				subtype:       subtype.obj.Name(),
+				subtypePkg:    subtype.obj.Pkg().Path(),
+				ifacePkg:      ifaceContainer,
+				ifaceName:     ifaceObj.Name(),
+				ifaceKey:      ifaceKey,
+				ifaceScope:    resolved.targetScopeOf(ifaceObj, ifaceContainer, ifaceKey),
+				ifaceMethods:  interfaceMethodNames(iface),
+				subtypeNodeID: node.ID,
+				subtypeOwnPkg: node.Container,
+			}
+			builder.supertype(file, record, node.Range.Start)
 			emitted++
 		}
 	}
@@ -1392,6 +1509,14 @@ func methodNames(named *types.Named) map[string]bool {
 	return out
 }
 
+func interfaceMethodNames(iface *types.Interface) []string {
+	out := make([]string, 0, iface.NumMethods())
+	for i := 0; i < iface.NumMethods(); i++ {
+		out = append(out, iface.Method(i).Name())
+	}
+	return out
+}
+
 func hasAllMethods(have map[string]bool, iface *types.Interface) bool {
 	for i := 0; i < iface.NumMethods(); i++ {
 		if !have[iface.Method(i).Name()] {
@@ -1418,6 +1543,24 @@ type semanticDiff struct {
 	// semanticEngine.emittedEdges.
 	edgesByFile map[string][]string
 	retracted   map[string]bool
+	// supertypes is this pass's SUPERTYPE_OF records per file and edge id -
+	// see semanticEngine.supertypes.
+	supertypes map[string]map[string]supertypeRecord
+}
+
+// supertypeRecord is what one SUPERTYPE_OF edge was produced from: enough to
+// re-emit the edge and its placeholder in a later pass that cannot see the
+// interface (GM-590), and to check the subtype can still satisfy it.
+type supertypeRecord struct {
+	subtype       string // the subtype's name
+	subtypePkg    string // the subtype's package path
+	subtypeNodeID string // the subtype's structural node, the edge's `from`
+	subtypeOwnPkg string // that node's container, the placeholder's fromContainer
+	ifacePkg      string
+	ifaceName     string
+	ifaceKey      []pathSegment
+	ifaceScope    targetScope
+	ifaceMethods  []string
 }
 
 func newSemanticDiff() *semanticDiff {
@@ -1426,6 +1569,7 @@ func newSemanticDiff() *semanticDiff {
 		edges:       map[string]wireEdge{},
 		edgesByFile: map[string][]string{},
 		retracted:   map[string]bool{},
+		supertypes:  map[string]map[string]supertypeRecord{},
 	}
 }
 
@@ -1510,6 +1654,88 @@ func (d *semanticDiff) edge(relPath, fromID, kind, toID string) {
 	d.edgesByFile[relPath] = append(d.edgesByFile[relPath], id)
 }
 
+// supertype emits one SUPERTYPE_OF edge (and its placeholder) from a record,
+// placing the placeholder at the subtype node's current position, and records
+// it for the next pass of the file. Returns the edge id.
+func (d *semanticDiff) supertype(relPath string, r supertypeRecord, at wirePosition) string {
+	toID := d.placeholder(relPath, r.subtypeOwnPkg, r.ifacePkg, r.ifaceScope, r.ifaceKey, at, r.ifaceName)
+	d.edge(relPath, r.subtypeNodeID, edgeKindSupertypeOf, toID)
+	id := edgeIDFor(r.subtypeNodeID, edgeKindSupertypeOf, toID, nil)
+	if d.supertypes[relPath] == nil {
+		d.supertypes[relPath] = map[string]supertypeRecord{}
+	}
+	d.supertypes[relPath][id] = r
+	return id
+}
+
+// carryForward re-emits the prior SUPERTYPE_OF edges of the files in scope
+// that this pass did not produce and could not have: the interface's package
+// was neither folded from source nor imported (GM-590), so "not produced"
+// says nothing about whether the type still satisfies it. An edge is carried
+// only while its subtype is still a type of this file, with the same node,
+// and still has every method the interface had; otherwise finish retracts it.
+// The edge is re-upserted rather than merely not retracted: its placeholder
+// lives in this file, and core retires a placeholder a Complete reparse does
+// not upsert.
+func (d *semanticDiff) carryForward(
+	e *semanticEngine,
+	scope []string,
+	resolved *resolutions,
+	structural map[string]structuralFile,
+) {
+	if resolved.exhaustive {
+		return
+	}
+	type subtypeAt struct{ pkg, name, file string }
+	current := map[subtypeAt]*types.Named{}
+	for obj, named := range resolved.namedTypes {
+		current[subtypeAt{obj.Pkg().Path(), obj.Name(), resolved.declaredIn[obj]}] = named
+	}
+	for _, relPath := range scope {
+		still := map[string]bool{}
+		for _, id := range d.edgesByFile[relPath] {
+			still[id] = true
+		}
+		prior := e.supertypes[relPath]
+		for _, id := range sortedKeys(prior) {
+			r := prior[id]
+			if still[id] || !resolved.unevaluated(r.ifacePkg, r.ifaceName) {
+				continue
+			}
+			node, ok := structural[relPath].typeNodes[r.subtype]
+			if !ok || node.ID != r.subtypeNodeID {
+				continue
+			}
+			named, ok := current[subtypeAt{r.subtypePkg, r.subtype, relPath}]
+			if !ok {
+				continue
+			}
+			have := methodNames(named)
+			satisfied := true
+			for _, method := range r.ifaceMethods {
+				if !have[method] {
+					satisfied = false
+					break
+				}
+			}
+			if satisfied {
+				d.supertype(relPath, r, node.Range.Start)
+			}
+		}
+	}
+}
+
+// unevaluated reports whether this pass could not have checked any type
+// against the interface `pkg.name`: its package was not folded from source,
+// it did not come in from export data, and it is not an exported name of a
+// package that did (export data would have carried it, so it is gone).
+func (r *resolutions) unevaluated(pkg, name string) bool {
+	if r.folded[pkg] || r.importedInterfaces[pkg+"."+name] {
+		return false
+	}
+	return !(r.importedPackages[pkg] && token.IsExported(name))
+}
+
 func (d *semanticDiff) retract(relPath, edgeID string) {
 	_ = relPath
 	if edgeID != "" {
@@ -1520,7 +1746,13 @@ func (d *semanticDiff) retract(relPath, edgeID string) {
 // finish renders the accumulated answer as a wire diff and records what was
 // emitted per file, so the next pass over the same file can retract whatever
 // it no longer produces.
-func (d *semanticDiff) finish(e *semanticEngine, scope []string) fileChangeDiff {
+func (d *semanticDiff) finish(
+	e *semanticEngine,
+	scope []string,
+	resolved *resolutions,
+	structural map[string]structuralFile,
+) fileChangeDiff {
+	d.carryForward(e, scope, resolved, structural)
 	diff := emptyDiff()
 
 	for _, id := range sortedKeys(d.nodes) {
@@ -1544,6 +1776,7 @@ func (d *semanticDiff) finish(e *semanticEngine, scope []string) fileChangeDiff 
 			}
 		}
 		e.emittedEdges[relPath] = d.edgesByFile[relPath]
+		e.supertypes[relPath] = d.supertypes[relPath]
 	}
 	for _, id := range sortedKeys(d.retracted) {
 		if _, kept := d.edges[id]; !kept {

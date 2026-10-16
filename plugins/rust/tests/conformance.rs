@@ -147,7 +147,10 @@ const EXPECTATIONS: usize = 33;
 // trait clause reached through a glob is addressed through the module.
 // 5 with `[[implementations]] sirens::Wail`: an impl a `macro_rules!` of
 // `alpha` writes in `beta`, which only rust-analyzer's sweep finds.
-const SEMANTIC_EXPECTATIONS: usize = 5;
+// 4 once `[[references]] shapes::Shape` lost its tag (GM-596): the semantic
+// tier no longer records an implementor a structural `SUPERTYPE_OF` already
+// states, so its `files` tally is the same in both arms.
+const SEMANTIC_EXPECTATIONS: usize = 4;
 
 /// GM-380: the tripwire above only works if tripping it says what to do.
 ///
@@ -386,7 +389,7 @@ fn the_linked_index_answers_the_acceptance_criteria() {
 }
 
 /// Without a semantic tier the structural results are the 3.2.0 results:
-/// every entry `expect.toml` leaves untagged still passes, and the five
+/// every entry `expect.toml` leaves untagged still passes, and the four
 /// semantic ones report `Skip` rather than being quietly dropped.
 ///
 /// The manifest here is 3.2.0's own - `semantic_pass = false`, no

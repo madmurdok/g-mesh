@@ -19,7 +19,17 @@ or const around it, the encloser.
   that lands on a node of any kind but `Function` is kept only when the
   location is at that node's own name: the first whole-word occurrence of the
   name at or after the node's range start. Otherwise the answer is treated as
-  "nothing this index holds" and the structural edge stands.
+  "nothing this index holds" and the structural edge stands. GM-593 holds a
+  `CALLS` answer landing on its own caller (a `Function`) to the same check:
+  such a landing is the encloser fallback for a declaration with no node (a
+  default import, a nested fn) unless it is at the caller's name (recursion).
+  The same check settles a `CALLS` answer whose locations land on different
+  nodes (GM-596): only the locations at their node's own name count, and one
+  node left is the target. TypeScript answers a call onto a const produced
+  by a factory (`const f = throttle(g)`) with the const's name and the call
+  signature's declaration inside the factory's body, which names no node.
+  Locations at two different names (`cfg` or overload twins) still record
+  nothing.
 - **D2: engine `CALLS` may land on a `Variable`.**
 - **D3: engine `CALLS` may land on a `Type`.** The accepted kinds, in order
   of preference, are `Function`, `Variable`, `Type`: the first kind any
@@ -36,8 +46,26 @@ or const around it, the encloser.
 - A `qualifiedName` shared by a function and a type (TS declaration merging)
   still links the function; one shared by a const and a type links the const.
 - Rust tuple-variant constructors (`Enum::Variant(..)`) have no node and land
-  on the enum away from its name, so they stay unlinked.
+  on the enum away from its name, so they stay unlinked. (GM-594: the 3 that
+  linked on ripgrep came from a unit-variant path pattern over-binding the
+  enum's name, fixed in the Rust plugin.)
 - Python `Foo()` and TS `new Foo()` on a class with no explicit constructor
   now produce `CALLS` onto the class, so `find_callers` on a class lists its
   constructions, which some users read as "references". None measured on
   py-requests (0 refusals).
+- Nested-fn and local-binding calls no longer produce `CALLS` self-loops on
+  their encloser; recursion stays (GM-593).
+- A direct named import of a const-bound function (`import { handler }`,
+  `handler()`) now links too (GM-596): the bridge asks a `CALLS` hop whose
+  file declares the name only as a non-function (and a `SUPERTYPE_OF` hop
+  whose file declares it as neither type nor function), and a name-keyed
+  placeholder and a qualified-name-keyed one never share an id - the label
+  renders a `qualifiedName` key as `=<key>` - so the engine answer is
+  recorded instead of being taken for agreement with the structural edge.
+- An engine implementor answer (`SUPERTYPE_OF`) whose file already holds a
+  structural `SUPERTYPE_OF` edge from the same type that reaches the anchor
+  records nothing (GM-596): the edge targets the anchor, core linked it onto
+  the anchor, or its placeholder is name-keyed in the anchor's scope with the
+  anchor's `qualifiedName` as the name. The `=<key>` label made such an
+  answer a second row next to the structural one; the structural row stays,
+  so these edges show `source=syntactic`.
