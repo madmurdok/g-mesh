@@ -40,6 +40,12 @@ nothing under the project root.
   runs. Profile rustflags (`[unstable] profile-rustflags`) are not covered:
   they apply only when cargo compiles, which the server never asks for. The
   `[env]` dynamic-linker channel stays open (ADR 0032, Consequences).
+  Added 2026-10-16 (GM-603): `cargo.sysroot` is set to the pinned
+  toolchain's `rustc --print sysroot` (`engine`, `pin_sysroot`).
+  rust-analyzer's default, `"discover"`, ran `rustup component add rust-src`
+  when the source was missing, a download this decision did not cover; a
+  path never installs. Without `rust-src` std is not loaded and the plugin
+  logs the `rustup component add` command instead.
 - **D2 - python: no `npx`.** Done by ADR 0032 D4; pyright comes from `PATH`
   only. Nothing further.
 - **D3 - go: `GOPROXY=off`, `GONOPROXY=-` and `GOSUMDB=off`, always.** Appended to

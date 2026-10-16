@@ -27,7 +27,13 @@ core asks for it and rust-analyzer is there.
 
 ```bash
 rustup component add rust-analyzer    # what the semantic tier needs
+rustup component add rust-src         # std, core and alloc for it (GM-603)
 ```
+
+std needs `rust-src` for the pinned toolchain: the plugin points
+rust-analyzer at that toolchain's sysroot (`cargo.sysroot`) and never
+installs the component. Without it std is not loaded, and the plugin logs
+the `rustup component add rust-src --toolchain <pin>` line to run.
 
 Without it the plugin logs one line, answers empty semantic diffs, and serves
 the structural graph unchanged - and because those diffs are reported
