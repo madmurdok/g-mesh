@@ -1015,6 +1015,168 @@ mod tests {
         assert!(body.contains("config.env.extend(pinned_env(&toolchain));"), "{body}");
     }
 
+    /// GM-603: with no options at all, `pin_sysroot` creates
+    /// `{"cargo": {"sysroot": <path>}}`, so rust-analyzer takes
+    /// `RustLibSource::Path` and never runs `rustup component add rust-src`.
+    ///
+    /// Control: make `pin_sysroot` return before the `cargo.sysroot` insert.
+    #[test]
+    fn pin_sysroot_sets_cargo_sysroot_to_the_detected_sysroot() {
+        let sysroot = Path::new("/gm603/toolchains/stable-x86_64-apple-darwin");
+        let mut options = None;
+        pin_sysroot(&mut options, sysroot);
+        assert_eq!(options, Some(serde_json::json!({ "cargo": { "sysroot": sysroot.to_string_lossy() } })));
+
+        let mut options = Some(serde_json::json!({ "checkOnSave": false }));
+        pin_sysroot(&mut options, sysroot);
+        assert_eq!(
+            options,
+            Some(
+                serde_json::json!({ "checkOnSave": false, "cargo": { "sysroot": sysroot.to_string_lossy() } })
+            )
+        );
+    }
+
+    /// A `cargo.sysroot` the manifest or a test already set wins, and the
+    /// other `cargo` keys survive the merge.
+    ///
+    /// Controls: replace `entry("sysroot").or_insert_with(..)` with an
+    /// unconditional `insert`; or replace the `cargo` object instead of
+    /// merging into it.
+    #[test]
+    fn pin_sysroot_keeps_an_existing_sysroot_and_the_other_cargo_keys() {
+        let sysroot = Path::new("/gm603/detected");
+        let mut options = Some(serde_json::json!({
+            "cargo": { "sysroot": "/gm603/manifest", "buildScripts": { "enable": false } },
+            "procMacro": { "enable": false }
+        }));
+        pin_sysroot(&mut options, sysroot);
+        assert_eq!(
+            options,
+            Some(serde_json::json!({
+                "cargo": { "sysroot": "/gm603/manifest", "buildScripts": { "enable": false } },
+                "procMacro": { "enable": false }
+            }))
+        );
+
+        let mut options = Some(serde_json::json!({ "cargo": { "buildScripts": { "enable": false } } }));
+        pin_sysroot(&mut options, sysroot);
+        assert_eq!(
+            options,
+            Some(serde_json::json!({
+                "cargo": { "buildScripts": { "enable": false }, "sysroot": "/gm603/detected" }
+            }))
+        );
+    }
+
+    /// GM-603 B2: a sysroot without `lib/rustlib/src/rust/library/Cargo.toml`
+    /// gets the hint naming the toolchain and the rustup command; one with
+    /// it, or any sysroot while `RUST_SRC_PATH` is set, gets none. The env
+    /// var is a parameter, so no process-global state is touched.
+    ///
+    /// Controls: drop the `is_file()` check (the "has rust-src" case gets a
+    /// hint); drop the `rust_src_path_set` check (the `RUST_SRC_PATH` case
+    /// gets a hint); change the remedy's `rustup component add rust-src
+    /// --toolchain` wording.
+    #[cfg(unix)]
+    #[test]
+    fn rust_src_hint_names_the_rustup_command_only_when_rust_src_is_missing() {
+        let scratch = Scratch::new("gm603-rust-src");
+        let sysroot = &scratch.0;
+        let pin = "stable-x86_64-apple-darwin";
+
+        let hint = rust_src_hint(sysroot, Some(pin), false).expect("no rust-src, no RUST_SRC_PATH: a hint");
+        assert!(hint.contains(&format!("rustup component add rust-src --toolchain {pin}")), "{hint}");
+        assert!(hint.contains("std not loaded"), "{hint}");
+        assert_eq!(rust_src_hint(sysroot, Some(pin), true), None, "RUST_SRC_PATH set: no hint");
+        let unpinned = rust_src_hint(sysroot, None, false).expect("no rust-src without rustup: a hint");
+        assert!(unpinned.contains(&sysroot.display().to_string()), "{unpinned}");
+
+        let manifest = sysroot.join("lib/rustlib/src/rust/library/Cargo.toml");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, "[workspace]\n").unwrap();
+        assert_eq!(rust_src_hint(sysroot, Some(pin), false), None, "rust-src installed: no hint");
+        assert_eq!(rust_src_hint(sysroot, None, false), None, "rust-src installed: no hint");
+    }
+
+    /// `sysroot_of` runs `<rustc> --print sysroot` and returns its trimmed
+    /// stdout; a failing or silent `rustc` gives `None`. The fake `rustc`
+    /// is written by a child shell so no file descriptor to it is open in
+    /// this (multithreaded) process when it is executed (`ETXTBSY`).
+    ///
+    /// Controls: return `None` unconditionally from `sysroot_of`; drop the
+    /// `status.success()` check (the failing fake yields its stdout).
+    #[cfg(unix)]
+    #[test]
+    fn sysroot_of_answers_rustc_print_sysroot() {
+        let scratch = Scratch::new("gm603-sysroot-of");
+        let fake = |name: &str, body: &str| {
+            let path = scratch.0.join(name);
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg("printf '%s\\n' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+                .arg("sh")
+                .arg(&path)
+                .arg(format!("#!/bin/sh\n{body}"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+            path
+        };
+        let good = fake(
+            "rustc-good",
+            "[ \"$1\" = --print ] && [ \"$2\" = sysroot ] && [ $# -eq 2 ] || exit 3\necho '  /gm603/sysroot  '",
+        );
+        assert_eq!(sysroot_of(&good), Some(PathBuf::from("/gm603/sysroot")));
+        let failing = fake("rustc-failing", "echo /gm603/sysroot\nexit 1");
+        assert_eq!(sysroot_of(&failing), None, "a failing rustc has no sysroot");
+        let silent = fake("rustc-silent", "exit 0");
+        assert_eq!(sysroot_of(&silent), None, "an empty answer is no sysroot");
+        assert_eq!(sysroot_of(&scratch.0.join("no-such-rustc")), None);
+    }
+
+    /// `Toolchain::detect` fills `sysroot` from the toolchain's own `rustc`:
+    /// whenever it found a `rustc`, the sysroot it reports has
+    /// `lib/rustlib` (every rustc sysroot does, with or without rust-src).
+    /// Skips on a machine with no `rustc` at all.
+    ///
+    /// Control: drop `sysroot` from either `Toolchain` literal in `detect`
+    /// (leave it `None`).
+    #[test]
+    fn detect_fills_the_sysroot_of_the_toolchains_rustc() {
+        let toolchain = Toolchain::detect();
+        let Some(rustc) = &toolchain.rustc else {
+            println!("SKIPPED: no rustc found");
+            return;
+        };
+        let sysroot =
+            toolchain.sysroot.as_ref().unwrap_or_else(|| panic!("{rustc:?} has no sysroot: {toolchain:?}"));
+        assert!(sysroot.join("lib/rustlib").is_dir(), "{sysroot:?} is not a rustc sysroot");
+        assert_eq!(toolchain.sysroot, sysroot_of(rustc));
+    }
+
+    /// `engine` pins the sysroot and logs the hint after `pinned_env`, and
+    /// before the bridge takes the config. The engine cannot be run here
+    /// without starting rust-analyzer, so this reads `engine`'s body, like
+    /// the tests above.
+    ///
+    /// Controls: delete the `pin_sysroot` call in `engine`; or move it below
+    /// `LspBridge::new`; or pass `false` for `rust_src_path_set`.
+    #[test]
+    fn the_engine_pins_the_sysroot_and_hints_after_the_pinned_env() {
+        let source = include_str!("semantic.rs");
+        let engine = &source[source.find("pub fn engine(").expect("this file defines `engine`")..];
+        let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
+        let at =
+            |needle: &str| body.find(needle).unwrap_or_else(|| panic!("`engine` lacks `{needle}`:\n{body}"));
+        let env = at("config.env.extend(pinned_env(&toolchain));");
+        let pin = at("pin_sysroot(&mut config.initialization_options, sysroot);");
+        let hint = at("rust_src_hint(sysroot, toolchain.pin.as_deref(), rust_src_path_set)");
+        let bridge = at("LspBridge::new(LANGUAGE, root, config)");
+        assert!(env < pin && pin < bridge && hint < bridge, "{body}");
+        assert!(body.contains("std::env::var_os(\"RUST_SRC_PATH\")"), "{body}");
+    }
+
     /// A scratch directory, canonicalized (macOS' temp dir is a symlink),
     /// that removes itself.
     #[cfg(unix)]
