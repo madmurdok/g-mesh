@@ -126,6 +126,13 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     );
     config.command = resolved.command;
     config.env.extend(pinned_env(&toolchain));
+    if let Some(sysroot) = &toolchain.sysroot {
+        pin_sysroot(&mut config.initialization_options, sysroot);
+        let rust_src_path_set = std::env::var_os("RUST_SRC_PATH").is_some_and(|path| !path.is_empty());
+        if let Some(hint) = rust_src_hint(sysroot, toolchain.pin.as_deref(), rust_src_path_set) {
+            g_mesh_plugin_sdk::log_line!("{hint}");
+        }
+    }
     // GM-550: rust-analyzer's start-up phases can be separated by more than
     // the bridge's 2s settle under load (2.04s and 2.47s measured), so its
     // readiness is its own `quiescent` status rather than a quiet period.
@@ -227,6 +234,11 @@ struct Toolchain {
     rust_analyzer: Option<PathBuf>,
     rustc: Option<PathBuf>,
     cargo: Option<PathBuf>,
+    /// `rustc --print sysroot` of [`Toolchain::rustc`], run in
+    /// [`neutral_dir`]. The server gets it as `cargo.sysroot` (GM-603), so it
+    /// loads std from this toolchain and never runs `rustup component add
+    /// rust-src` itself. `None` when there is no `rustc` or it fails.
+    sysroot: Option<PathBuf>,
 }
 
 impl Toolchain {
@@ -235,7 +247,9 @@ impl Toolchain {
         if rustup_bin.is_none() {
             // Not rustup-managed: no proxy reads a toolchain file, and the
             // binaries on `PATH` are the user's own.
-            return Toolchain { rustc: on_path("rustc"), cargo: on_path("cargo"), ..Toolchain::default() };
+            let rustc = on_path("rustc");
+            let sysroot = rustc.as_deref().and_then(sysroot_of);
+            return Toolchain { rustc, cargo: on_path("cargo"), sysroot, ..Toolchain::default() };
         }
         let pin = std::env::var("RUSTUP_TOOLCHAIN").ok().filter(|pin| !pin.trim().is_empty()).or_else(|| {
             rustup(&["default"]).and_then(|out| out.split_whitespace().next().map(str::to_string))
@@ -244,14 +258,69 @@ impl Toolchain {
             let pin = pin.as_deref()?;
             rustup(&["which", "--toolchain", pin, name]).map(PathBuf::from)
         };
+        let rustc = which("rustc");
+        let sysroot = rustc.as_deref().and_then(sysroot_of);
         Toolchain {
             rust_analyzer: which("rust-analyzer"),
-            rustc: which("rustc"),
+            rustc,
             cargo: which("cargo"),
+            sysroot,
             pin,
             rustup: rustup_bin,
         }
     }
+}
+
+/// `<rustc> --print sysroot`, run in [`neutral_dir`]. `rustc` is the
+/// toolchain's own binary (never a proxy), so the answer is that toolchain's
+/// sysroot whatever `rust-toolchain.toml` is around.
+fn sysroot_of(rustc: &Path) -> Option<PathBuf> {
+    let output = Command::new(rustc).args(["--print", "sysroot"]).current_dir(neutral_dir()).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!out.is_empty()).then(|| PathBuf::from(out))
+}
+
+/// Sets `cargo.sysroot` in the server's `initializationOptions` to `sysroot`
+/// (GM-603). rust-analyzer's default, `"discover"`, runs `rustup component
+/// add rust-src` when the source is missing: a network download from the
+/// semantic tier (ADR 0033) and, on CI, an install racing the suite. A path
+/// is `RustLibSource::Path`, which never installs anything. A `cargo.sysroot`
+/// already present (the manifest's, a test's) is kept, and every other key
+/// is left as it is; options that are not a JSON object are left alone.
+fn pin_sysroot(options: &mut Option<serde_json::Value>, sysroot: &Path) {
+    let options = options.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(options) = options.as_object_mut() else {
+        return;
+    };
+    let cargo = options.entry("cargo").or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(cargo) = cargo.as_object_mut() else {
+        return;
+    };
+    cargo
+        .entry("sysroot")
+        .or_insert_with(|| serde_json::Value::String(sysroot.to_string_lossy().into_owned()));
+}
+
+/// The line [`engine`] logs when the server will not load std (GM-603): the
+/// sysroot has no `rust-src` (`lib/rustlib/src/rust/library/Cargo.toml`) and
+/// `RUST_SRC_PATH`, which rust-analyzer consults first, is unset. The plugin
+/// never installs it, so the line names the command that does. `None` when
+/// std will load.
+fn rust_src_hint(sysroot: &Path, pin: Option<&str>, rust_src_path_set: bool) -> Option<String> {
+    if rust_src_path_set || sysroot.join("lib/rustlib/src/rust/library/Cargo.toml").is_file() {
+        return None;
+    }
+    let remedy = match pin {
+        Some(pin) => format!("run `rustup component add rust-src --toolchain {pin}`"),
+        None => format!("install the standard library source under {}", sysroot.display()),
+    };
+    Some(format!(
+        "[{LANGUAGE}] std not loaded: rust-src is not installed for toolchain {}; {remedy}",
+        pin.unwrap_or("not rustup-managed")
+    ))
 }
 
 /// The environment the server starts with on top of the inherited one: the

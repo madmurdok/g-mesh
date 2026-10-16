@@ -491,10 +491,16 @@ jobs:
       # binary in toolchain" when the component behind it is missing. The
       # plugin makes exactly this check at run time, for exactly this reason
       # (plugins/rust/src/semantic.rs).
+      #
+      # `rust-src` too (GM-603): without it rust-analyzer has no std to load.
+      # The plugin pins `cargo.sysroot`, so the server never installs it
+      # itself; before that pin it ran `rustup component add rust-src`
+      # mid-suite, and an install that failed under the parallel tests left
+      # std unloaded for the rest of the job on the x86_64 macOS runner.
       - name: Install rust-analyzer
         shell: bash
         run: |
-          rustup component add rust-analyzer --toolchain "$RUST_VERSION"
+          rustup component add rust-analyzer rust-src --toolchain "$RUST_VERSION"
           rust-analyzer --version
 
       # Node is only here for npm: the "Install pyright" step below runs

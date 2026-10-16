@@ -142,6 +142,13 @@ readiness = "indexed"
 # not fetched and their edges stay unresolved until `cargo fetch`. See
 # docs/adr/0033-semantic-tiers-reach-no-network-and-write-nothing.md.
 #
+# `cargo.sysroot` is not set here: the plugin adds it at run time, as the
+# pinned toolchain's `rustc --print sysroot` (GM-603), unless this table
+# already sets it. rust-analyzer's default, "discover", runs `rustup component
+# add rust-src` when the source is missing - a network download, and on CI an
+# install racing the suite. A path never installs anything; without rust-src
+# std is not loaded, and the plugin logs the `rustup component add` line.
+#
 # `checkOnSave` runs `cargo check` to produce diagnostics this bridge never
 # reads, and it builds: it writes `target/` and `Cargo.lock`. Off.
 #
