@@ -19,7 +19,10 @@ or const around it, the encloser.
   that lands on a node of any kind but `Function` is kept only when the
   location is at that node's own name: the first whole-word occurrence of the
   name at or after the node's range start. Otherwise the answer is treated as
-  "nothing this index holds" and the structural edge stands.
+  "nothing this index holds" and the structural edge stands. GM-593 holds a
+  `CALLS` answer landing on its own caller (a `Function`) to the same check:
+  such a landing is the encloser fallback for a declaration with no node (a
+  default import, a nested fn) unless it is at the caller's name (recursion).
 - **D2: engine `CALLS` may land on a `Variable`.**
 - **D3: engine `CALLS` may land on a `Type`.** The accepted kinds, in order
   of preference, are `Function`, `Variable`, `Type`: the first kind any
@@ -41,3 +44,5 @@ or const around it, the encloser.
   now produce `CALLS` onto the class, so `find_callers` on a class lists its
   constructions, which some users read as "references". None measured on
   py-requests (0 refusals).
+- Nested-fn and local-binding calls no longer produce `CALLS` self-loops on
+  their encloser; recursion stays (GM-593).
