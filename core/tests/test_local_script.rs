@@ -143,7 +143,17 @@ fn run_local_go(
     extra_env: &[(&str, &str)],
     with_go: bool,
 ) -> (Output, Vec<Call>, Vec<String>) {
-    run_local_at(&repo_root(), args, extra_env, with_go)
+    // A fake root with empty plugin `.bin` dirs: the script's test-deps check
+    // passes whether or not the checkout has installed the plugins.
+    let root = fake_root(true);
+    let (output, calls, go) = run_local_at(root.path(), args, extra_env, with_go);
+    // The go calls' directories relative to the root, as the repo root would give.
+    let prefixes = [
+        format!("{}/", fs::canonicalize(root.path()).unwrap().display()),
+        format!("{}/", root.path().display()),
+    ];
+    let go = go.into_iter().map(|c| prefixes.iter().fold(c, |c, p| c.replace(p, ""))).collect();
+    (output, calls, go)
 }
 
 /// `run_local_go` with the script taken from `root` (`root/scripts/...`).
@@ -641,6 +651,8 @@ fn fake_root(plugins: bool) -> tempfile::TempDir {
             Command::new("cp").arg("-R").arg(repo_root().join(dir)).arg(root.path()).status().unwrap();
         assert!(status.success());
     }
+    // The go step runs in `plugins/go`.
+    fs::create_dir_all(root.path().join("plugins/go")).unwrap();
     if plugins {
         for plugin in ["typescript", "python"] {
             fs::create_dir_all(root.path().join("plugins").join(plugin).join("node_modules/.bin")).unwrap();
