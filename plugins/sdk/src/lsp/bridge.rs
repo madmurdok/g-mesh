@@ -3710,15 +3710,16 @@ mod tests {
     /// can land inside without a node of its own: a class field `cb`, an
     /// interface property `go`, an object-literal method that repeats its
     /// const's name, a const-bound function `tick`, a tuple struct `Pair`,
-    /// and a local `inner` in a function body.
+    /// a local `inner` in a function body, and an anonymous `export default`
+    /// function (node `default`, its range starting at `(`, GM-593).
     fn landing_index() -> (SdkIndex, String) {
         let (mut index, caller) = untyped_index();
         let source = "class Box {\n  cb = wrap();\n}\ninterface Opts {\n  go: () => void;\n}\n\
                       const handler = { handler() {} };\nconst tick = () => 1;\nstruct Pair(u8);\n\
-                      fn outer() { let inner = 1; }\n";
+                      fn outer() { let inner = 1; }\nexport default () => { go(); };\n";
         let a = RelPath::new("a.toy");
         let mut builder = FileGraphBuilder::new("toy", "toy-parser", &a);
-        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 10, col: 0 } });
+        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 11, col: 0 } });
         for (kind, name, start, end) in [
             (NodeKind::Type, "Box", (0, 0), (2, 1)),
             (NodeKind::Type, "Opts", (3, 0), (5, 1)),
@@ -3726,6 +3727,7 @@ mod tests {
             (NodeKind::Variable, "tick", (7, 0), (7, 21)),
             (NodeKind::Type, "Pair", (8, 0), (8, 16)),
             (NodeKind::Function, "outer", (9, 0), (9, 29)),
+            (NodeKind::Function, "default", (10, 15), (10, 30)),
         ] {
             let range = Range {
                 start: Position { line: start.0, col: start.1 },
@@ -3796,6 +3798,96 @@ mod tests {
     fn a_call_answered_inside_a_function_still_lands_on_it() {
         let (index, caller) = landing_index();
         assert_eq!(answered_by(&index, &caller, site_of(&index, "len", 1), in_a(9, 17)).1, 1);
+    }
+
+    /// The id of `a.toy`'s node called `name` in [`landing_index`].
+    fn a_node(index: &SdkIndex, name: &str) -> String {
+        let entry = index.entry(&RelPath::new("a.toy")).unwrap();
+        entry.graph.nodes.iter().find(|node| node.name == name).unwrap().id.clone()
+    }
+
+    /// The `len` call site of line 1 (an untyped receiver call), moved into
+    /// `a.toy`'s `from`: an answer landing on `from` is a self-landing.
+    fn self_call(index: &SdkIndex, from: &str) -> (String, OpenSite) {
+        let id = a_node(index, from);
+        let mut site = site_of(index, "len", 1);
+        site.from_id = id.clone();
+        (id, site)
+    }
+
+    /// **GM-593.** A call answered inside its own caller, away from the
+    /// caller's name, is the enclosing-node fallback for a declaration with
+    /// no node of its own (a nested fn, a local): no self-loop. The site
+    /// still counts as answered, because the server did answer it.
+    ///
+    /// Control: drop `&& node.id != site.from_id` in `record_answer` - one
+    /// edge `outer -> outer`.
+    #[test]
+    fn a_call_answered_inside_its_own_caller_records_no_self_loop() {
+        let (index, _) = landing_index();
+        let (outer, site) = self_call(&index, "outer");
+        assert_eq!(answered_by(&index, &outer, site, in_a(9, 17)), (1, 0), "`inner` inside `outer`");
+    }
+
+    /// **GM-593.** A dropped self-loop still counts the site as answered:
+    /// the count is decided before the landing filter, from the
+    /// unfiltered target.
+    ///
+    /// Control: in `record_answer`, call `untyped_call_answered` after the
+    /// filter with `landed.is_some()` - the count drops to 0, the answer
+    /// lies in an indexed file.
+    #[test]
+    fn a_dropped_self_loop_still_counts_as_answered() {
+        let (index, _) = landing_index();
+        let (outer, site) = self_call(&index, "outer");
+        assert_eq!(answered_by(&index, &outer, site, in_a(9, 17)).0, 1);
+    }
+
+    /// **GM-593.** Recursion: a self-landing at the caller's own name
+    /// records the edge.
+    ///
+    /// Control: drop every self-landing (option B: `node.id != site.from_id
+    /// &&` before the whole `CALLS` clause) - 0 edges.
+    #[test]
+    fn a_call_answered_at_its_own_callers_name_is_recursion() {
+        let (index, _) = landing_index();
+        let (outer, site) = self_call(&index, "outer");
+        assert_eq!(answered_by(&index, &outer, site, in_a(9, 3)), (1, 1));
+    }
+
+    /// **GM-593.** An anonymous `export default` function (node `default`)
+    /// cannot call itself by name, so a self-landing in its body is always
+    /// the fallback: nothing recorded. A call into it from another function
+    /// is not a self-landing and is recorded.
+    ///
+    /// Controls: drop `&& node.id != site.from_id` - the self-landing records
+    /// one edge; drop the `Function` arm (option A) - the call from `caller`
+    /// records nothing.
+    #[test]
+    fn a_self_landing_in_an_anonymous_default_export_records_nothing() {
+        let (index, caller) = landing_index();
+        let (default, site) = self_call(&index, "default");
+        assert_eq!(answered_by(&index, &default, site, in_a(10, 23)).1, 0, "self-landing at `go`");
+        assert_eq!(
+            answered_by(&index, &caller, site_of(&index, "len", 1), in_a(10, 23)).1,
+            1,
+            "a call from `caller` into it"
+        );
+    }
+
+    /// **GM-593.** Only `CALLS` answers are held to the self-landing rule: a
+    /// reference landing inside its own encloser is recorded as before.
+    ///
+    /// Control: hold every edge kind to it (`(node.id != site.from_id ||
+    /// lands_on_name(..)) &&` before the `site.edge_kind != Calls` clause) -
+    /// 0 edges.
+    #[test]
+    fn a_reference_landing_inside_its_own_encloser_is_recorded() {
+        let (index, _) = landing_index();
+        let outer = a_node(&index, "outer");
+        let mut site = site_of(&index, "fld", 5);
+        site.from_id = outer.clone();
+        assert_eq!(answered_by(&index, &outer, site, in_a(9, 17)).1, 1);
     }
 
     fn answered(counts: &[(&str, &str, usize)]) -> HashMap<(String, String), usize> {
