@@ -885,6 +885,39 @@ jobs:
             echo "no daemon log at $log - nothing ever wrote one, which is itself the answer"
           fi
 
+      # Prints the toolchain's rust-src state and reruns rust-analyzer's
+      # sysroot `cargo metadata` with the plugin's pinned env
+      # (plugins/rust/src/semantic.rs `pinned_env`), because rust-analyzer's
+      # own log of a failure keeps only "Failed to run `...`", not cargo's
+      # stderr. Temporary diagnostic, see docs/design/GM-603-x86-macos-ra-sysroot.md.
+      - name: rust-src state and the sysroot cargo metadata
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        run: |
+          set +e
+          tc="$(rustup default | cut -d' ' -f1)"
+          sysroot="$(rustc --print sysroot)"
+          lib="$sysroot/lib/rustlib/src/rust/library"
+          echo "toolchain $tc, sysroot $sysroot"
+          rustup component list --installed --toolchain "$tc"
+          if [ ! -d "$lib" ]; then
+            echo "no $lib - rust-src was never installed in this job"
+            exit 0
+          fi
+          echo "library: $(find "$lib" -type f | wc -l | tr -d ' ') files, vendor: $(ls "$lib/vendor" 2>/dev/null | wc -l | tr -d ' ') crates"
+          ls -la "$lib" "$lib/.cargo" 2>&1
+          lk="$(mktemp -d)"; cp "$lib/Cargo.lock" "$lk/Cargo.lock"
+          (cd "$lib" && \
+            CARGO_NET_OFFLINE=true CARGO_ENCODED_RUSTFLAGS= CARGO_UNSTABLE_HOST_CONFIG=false \
+            RUSTUP_TOOLCHAIN="$tc" RUSTC="$(rustup which --toolchain "$tc" rustc)" \
+            CARGO_BUILD_RUSTC="$(rustup which --toolchain "$tc" rustc)" CARGO="$(rustup which --toolchain "$tc" cargo)" \
+            RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER= \
+            CARGO_RESOLVER_LOCKFILE_PATH="$lk/Cargo.lock" RUSTUP_AUTO_INSTALL=0 \
+            __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly \
+            "$HOME/.cargo/bin/cargo" metadata --format-version 1 --manifest-path "$lib/Cargo.toml" \
+              --filter-platform "$(rustc -vV | sed -n 's/^host: //p')" -Zlockfile-path -Zunstable-options > /dev/null)
+          echo "sysroot cargo metadata exit: $?"
+
   # GM-282's other half of "the Go toolchain is available on all CI
   # runners" (the `test` job above, all four platforms): one job proves the
   # opposite - a `go` binary off `PATH` - and asserts the *reduced*
