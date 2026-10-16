@@ -50,7 +50,8 @@ const FAKE_CARGO: &str = r#"#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_CARGO_LOG"], "a") as log:
-    log.write(json.dumps({"args": args, "seeds": os.environ.get("G_MESH_CONTAINERS_SEEDS")}) + "\n")
+    log.write(json.dumps({"args": args, "seeds": os.environ.get("G_MESH_CONTAINERS_SEEDS"),
+                          "path": os.environ.get("PATH")}) + "\n")
 if args[:2] == ["nextest", "list"]:
     matches = {"filter-match": {"status": "matches"}}
     suites = {
@@ -100,6 +101,8 @@ exit "$code"
 struct Call {
     args: Vec<String>,
     seeds: Option<String>,
+    /// The `PATH` the call ran with.
+    path: String,
 }
 
 impl Call {
@@ -140,6 +143,16 @@ fn run_local_go(
     extra_env: &[(&str, &str)],
     with_go: bool,
 ) -> (Output, Vec<Call>, Vec<String>) {
+    run_local_at(&repo_root(), args, extra_env, with_go)
+}
+
+/// `run_local_go` with the script taken from `root` (`root/scripts/...`).
+fn run_local_at(
+    root: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    with_go: bool,
+) -> (Output, Vec<Call>, Vec<String>) {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -175,7 +188,7 @@ fn run_local_go(
     }
 
     let mut cmd = Command::new("bash");
-    cmd.arg(repo_root().join("scripts/test-local.sh"))
+    cmd.arg(root.join("scripts/test-local.sh"))
         .args(args)
         .env("PATH", path)
         .env("FAKE_GO_LOG", &go_log)
@@ -204,6 +217,7 @@ fn run_local_go(
                     .map(|a| a.as_str().unwrap().to_owned())
                     .collect(),
                 seeds: call["seeds"].as_str().map(str::to_owned),
+                path: call["path"].as_str().unwrap().to_owned(),
             }
         })
         .collect();
@@ -613,4 +627,69 @@ fn the_heavy_report_refuses_a_config_without_a_local_profile() {
     let output = heavy_report("[profile.default]\nslow-timeout = \"60s\"\n", HEAVY_JUNIT);
     assert_ne!(output.status.code(), Some(0), "{}", describe(&output));
     assert!(String::from_utf8_lossy(&output.stderr).contains("no [profile.local]"), "{}", describe(&output));
+}
+
+// ---------------------------------------------------------------------------
+// The plugins' node_modules/.bin on PATH (GM-598)
+
+/// A copy of the scripts the run reads, as a repo root; with `plugins`, each
+/// of them has its `node_modules/.bin` directory.
+fn fake_root(plugins: bool) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    for dir in ["scripts", ".config"] {
+        let status =
+            Command::new("cp").arg("-R").arg(repo_root().join(dir)).arg(root.path()).status().unwrap();
+        assert!(status.success());
+    }
+    if plugins {
+        for plugin in ["typescript", "python"] {
+            fs::create_dir_all(root.path().join("plugins").join(plugin).join("node_modules/.bin")).unwrap();
+        }
+    }
+    root
+}
+
+/// With both plugins' `node_modules/.bin` present, the commands the run starts
+/// see them first on `PATH`, typescript's then python's, as CI sets it.
+#[test]
+fn the_plugin_bin_dirs_come_first_on_the_path_of_the_test_commands() {
+    let root = fake_root(true);
+    let (_dir, file) = paths_file(&["core/src/cli/mod.rs"]);
+    let (output, calls, _) = run_local_at(root.path(), &["--paths-from", &file], &[], true);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let run = test_runs(&calls);
+    assert!(!run.is_empty(), "no nextest run: {}", describe(&output));
+    let rootp = fs::canonicalize(root.path()).unwrap();
+    let expected = format!(
+        "{0}/plugins/typescript/node_modules/.bin:{0}/plugins/python/node_modules/.bin:",
+        rootp.display()
+    );
+    for call in run {
+        let path = call.path.replace(&root.path().display().to_string(), &rootp.display().to_string());
+        assert!(path.starts_with(&expected), "PATH {path} does not start with {expected}");
+    }
+}
+
+/// A real run with a plugin's `node_modules/.bin` missing exits 2 before any
+/// cargo call and names `scripts/test-deps.sh`.
+#[test]
+fn a_run_without_the_plugin_node_modules_exits_2_and_names_test_deps() {
+    let root = fake_root(false);
+    let (_dir, file) = paths_file(&["core/src/cli/mod.rs"]);
+    let (output, calls, _) = run_local_at(root.path(), &["--paths-from", &file], &[], true);
+    assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("scripts/test-deps.sh"), "{}", describe(&output));
+    assert!(calls.is_empty(), "cargo was called: {:?}", calls.iter().map(|c| &c.args).collect::<Vec<_>>());
+}
+
+/// A dry run runs no test and needs no plugin dependency: it succeeds
+/// without `node_modules`.
+#[test]
+fn a_dry_run_without_the_plugin_node_modules_still_succeeds() {
+    let root = fake_root(false);
+    let (_dir, file) = paths_file(&["core/src/cli/mod.rs"]);
+    let (output, _, _) = run_local_at(root.path(), &["--paths-from", &file, "--dry-run"], &[], true);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert!(stdout_of(&output).contains("== nextest:"), "{}", describe(&output));
 }
