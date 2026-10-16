@@ -85,7 +85,7 @@ jobs:
           # The same four rows release.yml builds. Kept in step with the
           # comment that used to sit on the literal matrix below.
           all='[
-            {"target":"x86_64-apple-darwin","runner":"macos-15-intel"},
+            {"target":"x86_64-apple-darwin","runner":"macos-15-intel","timeout":75,"build_timeout":30,"it_timeout":25},
             {"target":"aarch64-apple-darwin","runner":"macos-15"},
             {"target":"x86_64-unknown-linux-gnu","runner":"ubuntu-22.04"},
             {"target":"x86_64-pc-windows-msvc","runner":"windows-2022"}
@@ -283,11 +283,13 @@ jobs:
     # plugin, and a cold build compiles ONNX Runtime bindings, bundled SQLite
     # and Oniguruma from scratch. A deadlock guard, not a target.
     #
-    # 45 rather than 90: a healthy run finishes in about five minutes on Linux
-    # and macOS, so 90 only bought a longer wait for the same answer - Windows
-    # hung for the whole budget and produced nothing usable. Fail sooner and
-    # collect the log instead.
-    timeout-minutes: 45
+    # 45 rather than 90: a healthy run finishes in 10-19 minutes on Linux,
+    # Windows and arm macOS, so 90 only bought a longer wait for the same
+    # answer - Windows hung for the whole budget and produced nothing usable.
+    # Fail sooner and collect the log instead. The x86_64 macOS row runs 24-50
+    # minutes on a slower host, so it carries its own limits (`timeout`,
+    # `build_timeout`, `it_timeout` on its matrix row); other rows use these.
+    timeout-minutes: ${{ matrix.timeout || 45 }}
     strategy:
       # One platform failing must not hide whether the other three work -
       # which is the whole point here, since before this job the Windows port
@@ -306,6 +308,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      # Runner state, so a slow run can be attributed to its host from the log.
+      - name: Runner state
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          uptime
+          if [ "$RUNNER_OS" = macOS ]; then
+            sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          else
+            nproc
+            grep -m1 'model name' /proc/cpuinfo
+            free -g
+          fi
 
       # GM-342. `scripts/install.ps1` is 616 lines that, until this step, had
       # never been executed OR parsed by anything: PowerShell is absent from
@@ -736,7 +752,7 @@ jobs:
       #   `default` profile's.
       - name: Build the test binaries
         id: build
-        timeout-minutes: 25
+        timeout-minutes: ${{ matrix.build_timeout || 25 }}
         shell: bash
         run: cargo nextest run --workspace --profile ci --no-run
 
@@ -749,7 +765,7 @@ jobs:
 
       - name: "tests: core-it"
         if: ${{ !cancelled() && steps.build.outcome == 'success' && (needs.select.outputs.mode == 'full' || contains(format(' {0} ', needs.select.outputs.sections), ' core-it ')) }}
-        timeout-minutes: 20
+        timeout-minutes: ${{ matrix.it_timeout || 20 }}
         shell: bash
         run: scripts/test-sections.sh run --profile ci core-it
 
