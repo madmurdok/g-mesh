@@ -247,13 +247,13 @@ func (e *semanticEngine) degrade(format string, args ...interface{}) {
 // --- the structural view ------------------------------------------------
 
 // structuralFile is what extract.go says about one file, reduced to the
-// three things a resolution needs: the open questions, the calls that may
-// have been addressed at a type, and the node ids an answer can be written
-// from.
+// three things a resolution needs: the open questions, the uses onto a
+// placeholder that go/types may correct (a conversion) or sharpen (a twinned
+// name), and the node ids an answer can be written from.
 type structuralFile struct {
-	container        string
-	openSites        []openSite
-	placeholderCalls []placeholderCall
+	container       string
+	openSites       []openSite
+	placeholderUses []placeholderUse
 	// typeNodes are the file's `Type` declarations by name - the `from` of
 	// every SUPERTYPE_OF edge.
 	typeNodes map[string]wireNode
@@ -278,10 +278,10 @@ func (e *semanticEngine) extractStructural(ws *workspace, relPaths []string) map
 		}
 		graph := extractFile(ws, relPath, content)
 		file := structuralFile{
-			container:        graph.container,
-			openSites:        graph.openSites,
-			placeholderCalls: graph.placeholderCalls,
-			typeNodes:        map[string]wireNode{},
+			container:       graph.container,
+			openSites:       graph.openSites,
+			placeholderUses: graph.placeholderUses,
+			typeNodes:       map[string]wireNode{},
 		}
 		for _, node := range graph.nodes {
 			if node.Kind == nodeKindType {
@@ -1095,7 +1095,7 @@ func moduleDirFor(ws *workspace, relDir string) string {
 
 // --- answering one file -------------------------------------------------
 
-// answerFile resolves one file's open sites and placeholder calls, returning
+// answerFile resolves one file's open sites and placeholder uses, returning
 // how many sites produced an edge.
 func (e *semanticEngine) answerFile(
 	builder *semanticDiff,
@@ -1123,30 +1123,53 @@ func (e *semanticEngine) answerFile(
 		answered++
 	}
 
-	for _, call := range file.placeholderCalls {
-		// `Uses`, never `Selections`: a placeholder call is always either a
+	for _, use := range file.placeholderUses {
+		// `Uses`, never `Selections`: a placeholder use is always either a
 		// bare name (`T(x)`) or a package-qualified one (`pkg.T(x)`), and
 		// both are plain identifier uses. A selection through a value never
 		// produced a structural edge in the first place - it is an open
 		// site, handled above.
-		obj := resolved.uses[sitePos{file: relPath, line: call.Line, col: call.Col}]
+		obj := resolved.uses[sitePos{file: relPath, line: use.Line, col: use.Col}]
 		container, key, isFunc, ok := e.addressOf(obj)
-		if !ok || isFunc {
-			// Either nothing to say, or the structural tier was right and
-			// core has already linked its edge. Leaving a correct edge alone
-			// is what keeps this pass's diff small.
+		if !ok {
 			continue
 		}
-		// A conversion, not a call. Retract the CALLS edge core's kind filter
-		// will never land, and say the true thing instead.
-		builder.retract(relPath, call.EdgeID)
-		if call.EnclosingSymbolID == "" {
+		scope := resolved.targetScopeOf(obj, container, key)
+		at := wirePosition{Line: use.Line, Col: use.Col}
+		if use.Kind == edgeKindCalls && !isFunc {
+			// A conversion, not a call. Retract the CALLS edge core's kind
+			// filter will never land, and say the true thing instead.
+			builder.retract(relPath, use.EdgeID)
+			if use.EnclosingSymbolID == "" {
+				continue
+			}
+			toID := builder.placeholder(relPath, file.container, container, scope, key, at, use.Name)
+			builder.edge(relPath, use.EnclosingSymbolID, edgeKindReferences, toID)
+			answered++
 			continue
 		}
-		toID := builder.placeholder(relPath, file.container, container,
-			resolved.targetScopeOf(obj, container, key), key,
-			wirePosition{Line: call.Line, Col: call.Col}, call.Name)
-		builder.edge(relPath, call.EnclosingSymbolID, edgeKindReferences, toID)
+		if scope.File == "" {
+			// The structural tier was right, and core has already linked its
+			// edge (or refuses it for a reason a container-scoped answer would
+			// not change). Leaving it alone is what keeps this pass's diff
+			// small.
+			continue
+		}
+		// A twinned name answered by the twin the host build compiles
+		// (GM-589). The structural edge has two candidates and core refuses
+		// it; the file-scoped edge links.
+		//
+		// Known gap, accepted (GM-589 design D2 a): if the other twin is
+		// later deleted, the name stops being twinned and this branch no
+		// longer fires. A whole-project pass in this same process then
+		// retracts this semantic edge through `emittedEdges` (in `finish`)
+		// without re-sending the structural edge retracted here, so the use
+		// has no edge until this file is next re-extracted by core, which
+		// restores the structural edge and now links it. The edge is
+		// missing for that window, never wrong.
+		builder.retract(relPath, use.EdgeID)
+		toID := builder.placeholder(relPath, file.container, container, scope, key, at, use.Name)
+		builder.edge(relPath, use.FromID, use.Kind, toID)
 		answered++
 	}
 	return answered

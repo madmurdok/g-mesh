@@ -743,20 +743,20 @@ func (e *extractor) useSelector(sel *ast.SelectorExpr, sc *scope, ctx useContext
 // function" is the right claim to make: core applies the kind filter to the
 // candidates it finds, and refuses rather than mislands.
 //
-// A CALLS edge onto a placeholder is *also* recorded as a
-// [placeholderCall], because "can be a function" is a guess this tier cannot
-// check and `go/types` can - see that type's own doc comment. `at` is the
-// identifier the call names, which is the position the semantic pass asks
-// `types.Info` about.
+// Every edge onto a placeholder, CALLS or REFERENCES, is *also* recorded as
+// a [placeholderUse]: "can be a function" is a guess this tier cannot check
+// and `go/types` can, and a name declared in build-tag twins is an address
+// only `go/types` can narrow to one file - see that type's own doc comment.
+// `at` is the identifier the use names, which is the position the semantic
+// pass asks `types.Info` about.
 func (e *extractor) emitUse(ctx useContext, isCall bool, toID string, targetMayBeFunction bool, at *ast.Ident) {
 	if isCall && targetMayBeFunction && ctx.callerID != "" {
 		e.addEdge(ctx.callerID, edgeKindCalls, toID)
-		if e.placeholder[toID] {
-			e.recordPlaceholderCall(at, ctx, edgeIDFor(ctx.callerID, edgeKindCalls, toID, nil))
-		}
+		e.recordPlaceholderUse(at, ctx, edgeKindCalls, ctx.callerID, toID)
 		return
 	}
 	e.addEdge(ctx.symbolID, edgeKindReferences, toID)
+	e.recordPlaceholderUse(at, ctx, edgeKindReferences, ctx.symbolID, toID)
 }
 
 // placeholderFor returns the node that addresses `name` inside `container`,

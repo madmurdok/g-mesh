@@ -247,13 +247,13 @@ func TestSemanticPassRetractsCallsOntoAType(t *testing.T) {
 		}
 	}
 	converts := map[string]string{}
-	for _, call := range graph.placeholderCalls {
-		if call.Name == "Kelvin" || call.Name == "Celsius" {
+	for _, call := range graph.placeholderUses {
+		if call.Kind == edgeKindCalls && (call.Name == "Kelvin" || call.Name == "Celsius") {
 			converts[call.Name] = call.EdgeID
 		}
 	}
 	if len(converts) != 2 {
-		t.Fatalf("expected the two conversions to be recorded as placeholder calls, got %+v", graph.placeholderCalls)
+		t.Fatalf("expected the two conversions to be recorded as placeholder calls, got %+v", graph.placeholderUses)
 	}
 	for name, id := range converts {
 		if !structural[id] {
@@ -275,8 +275,8 @@ func TestSemanticPassRetractsCallsOntoAType(t *testing.T) {
 		}
 	}
 	// And nothing that *is* a call was retracted along with them.
-	for _, call := range graph.placeholderCalls {
-		if call.Name == "newHandle" && retracted[call.EdgeID] {
+	for _, call := range graph.placeholderUses {
+		if call.Kind == edgeKindCalls && call.Name == "newHandle" && retracted[call.EdgeID] {
 			t.Fatalf("a genuine call to newHandle() was retracted")
 		}
 	}
