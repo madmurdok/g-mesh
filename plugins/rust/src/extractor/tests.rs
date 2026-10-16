@@ -729,7 +729,7 @@ fn a_type_qualified_path_call_is_a_qualified_name_placeholder() {
     let graph = krate.extract("src/b.rs");
     assert_eq!(
         graph.targets(EdgeKind::Calls, "b::run"),
-        vec!["pending_symbol krate::a::a::Reader::new"],
+        vec!["pending_symbol krate::a::=a::Reader::new"],
         "exact, because a module full of `new`s has nothing to tell them apart by name"
     );
     let placeholder = graph.placeholder("pending_symbol", "new");
@@ -868,7 +868,7 @@ fn a_return_type_written_in_another_file_types_nothing() {
         ("src/caller.rs", "use crate::m::{A, Q};\npub fn run(a: &A) { let s = a.shapes(); s.refuses(); }\n"),
     ]);
     let graph = krate.extract("src/caller.rs");
-    assert_eq!(graph.targets(EdgeKind::Calls, "caller::run"), vec!["pending_symbol krate::m::m::A::shapes"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "caller::run"), vec!["pending_symbol krate::m::=m::A::shapes"]);
     let placeholder = graph.placeholder("pending_symbol", "shapes");
     assert_eq!(
         graph.target_of(placeholder),
@@ -971,7 +971,7 @@ pub fn run() { let p = own().unwrap(); p.m(); }
     // `Option`'s own method, a placeholder since this file declares none.
     assert_eq!(
         b.targets(EdgeKind::Calls, "b::run"),
-        vec!["b::own", "pending_symbol krate::b::b::Option::unwrap"],
+        vec!["b::own", "pending_symbol krate::b::=b::Option::unwrap"],
         "a project `Option` is not unwrapped"
     );
 }
@@ -995,7 +995,7 @@ pub fn traitish(p: &P) { p.t(); }
     )]);
     let graph = krate.extract("src/lib.rs");
     assert_eq!(graph.targets(EdgeKind::Calls, "inherent"), vec!["P::m"]);
-    assert_eq!(graph.targets(EdgeKind::Calls, "traitish"), vec!["pending_symbol krate::P::t"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "traitish"), vec!["pending_symbol krate::=P::t"]);
 }
 
 /// The receiver-call open sites named `name` out of `from`, in source order.
@@ -1370,7 +1370,7 @@ pub fn run(o: Outer) { o.inner.t(); }
 "#,
     )]);
     let graph = krate.extract("src/lib.rs");
-    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["pending_symbol krate::Inner::t"]);
+    assert_eq!(graph.targets(EdgeKind::Calls, "run"), vec!["pending_symbol krate::=Inner::t"]);
 }
 
 /// Decision 1, the trap this plugin is most at risk of: a local must never
@@ -1564,7 +1564,7 @@ fn a_trait_impl_method_of_a_trait_in_another_file_points_at_a_placeholder() {
     let graph = krate.extract("src/lib.rs");
     assert_eq!(
         graph.targets(EdgeKind::SupertypeOf, "<Ci as Shape>::area"),
-        vec!["pending_symbol krate::shapes::shapes::Shape::area"]
+        vec!["pending_symbol krate::shapes::=shapes::Shape::area"]
     );
     let placeholder = graph.placeholder("pending_symbol", "area");
     assert_eq!(
@@ -1879,9 +1879,9 @@ pub fn drain(ledger: Ledger) -> Option<u8> {
     assert_eq!(
         tally,
         vec![
+            "pending_symbol krate::store::=store::Ledger.all_unresolved",
+            "pending_symbol krate::store::=store::Ledger.truncated_by",
             "pending_symbol krate::store::Ledger",
-            "pending_symbol krate::store::store::Ledger.all_unresolved",
-            "pending_symbol krate::store::store::Ledger.truncated_by",
         ]
     );
     for name in ["all_unresolved", "truncated_by"] {
@@ -1906,7 +1906,7 @@ pub fn drain(ledger: Ledger) -> Option<u8> {
     // A destructuring pattern names the field too.
     assert!(
         user.targets(EdgeKind::References, "user::drain")
-            .contains(&"pending_symbol krate::store::store::Ledger.truncated_by".to_string()),
+            .contains(&"pending_symbol krate::store::=store::Ledger.truncated_by".to_string()),
         "{:?}",
         user.targets(EdgeKind::References, "user::drain")
     );
@@ -1962,8 +1962,8 @@ pub fn take(holder: Holder) -> u8 { let Holder { inner } = holder; inner }
     assert!(store.targets(EdgeKind::References, "store::Holder::twice").is_empty());
 
     let user = krate.extract("src/user.rs");
-    let field_ref = "pending_symbol krate::store::store::Holder.inner".to_string();
-    let method_ref = "pending_symbol krate::store::store::Holder::inner".to_string();
+    let field_ref = "pending_symbol krate::store::=store::Holder.inner".to_string();
+    let method_ref = "pending_symbol krate::store::=store::Holder::inner".to_string();
     assert!(user.targets(EdgeKind::References, "user::make").contains(&field_ref));
     assert!(user.targets(EdgeKind::References, "user::take").contains(&field_ref));
     assert_eq!(user.targets(EdgeKind::Calls, "user::get"), vec![method_ref]);

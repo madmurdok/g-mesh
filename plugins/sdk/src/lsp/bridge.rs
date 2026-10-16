@@ -3836,20 +3836,12 @@ mod tests {
         assert_eq!(answered_by(&index, &caller, call(), in_a(6, 6)).1, 1, "the const's own name");
     }
 
-    /// **GM-596.** `import { tick } from "./a"; tick()` with `const tick =
-    /// () => 1`: the structural `CALLS` waits on a placeholder keyed by
-    /// *name* `tick` in `a.toy`, which the linker never lands on a Variable.
-    /// The answer at the const's own name addresses *qualified name* `tick`
-    /// in `a.toy` - the same string, a different key. It is recorded under
-    /// its own id, not taken for agreement, and the structural edge it
-    /// contradicts is retracted.
-    ///
-    /// Controls: drop the `=` sigil for a `File` scope in `render_target`
-    /// (the answer gets the structural edge's id and records nothing); drop
-    /// the `contradicted`/`retract` inserts after `record` (the structural
-    /// edge is not retracted).
-    #[test]
-    fn a_call_answered_at_a_const_name_keyed_structural_target_is_recorded_under_its_own_id() {
+    /// `u.toy`'s `run` calling `tick()` through a structural `CALLS` onto a
+    /// placeholder keyed by *name* `tick` in `a.toy` - the GM-596 shape -
+    /// answered at `tick`'s own name. Returns `(answers, structural edge id,
+    /// placeholder id, run's id)`. `link` is what core's linker did with the
+    /// structural edge, by name of the node it moved it onto.
+    fn const_call_answered(link: Option<&str>) -> (Answers, String, String, String) {
         let (mut index, _) = landing_index();
         let u = RelPath::new("u.toy");
         let mut builder = FileGraphBuilder::new("toy", "toy-parser", &u);
@@ -3872,6 +3864,10 @@ mod tests {
         builder.open_site(site.clone());
         index.insert(u.clone(), "fn run\n  tick()\n".to_string(), builder.finish());
 
+        if let Some(name) = link {
+            let linked = a_node(&index, name);
+            index.set_linked([(structural.clone(), linked)]);
+        }
         let question = Question { file: u, position: site.position, ask: Ask::Definition(site) };
         let mut answers = Answers::new("toy", "toy-lsp");
         let root = Path::new("/p");
@@ -3884,6 +3880,24 @@ mod tests {
             &in_a(7, 6),
         );
         assert!(again.is_empty());
+        (answers, structural, placeholder, run)
+    }
+
+    /// **GM-596.** `import { tick } from "./a"; tick()` with `const tick =
+    /// () => 1`: the structural `CALLS` waits on a placeholder keyed by
+    /// *name* `tick` in `a.toy`, which the linker never lands on a Variable.
+    /// The answer at the const's own name addresses *qualified name* `tick`
+    /// in `a.toy` - the same string, a different key. It is recorded under
+    /// its own id, not taken for agreement, and the structural edge it
+    /// contradicts is retracted.
+    ///
+    /// Controls: drop the `=` sigil for a `File` scope in `render_target`
+    /// (the answer gets the structural edge's id and records nothing); drop
+    /// the `contradicted`/`retract` inserts after `record` (the structural
+    /// edge is not retracted).
+    #[test]
+    fn a_call_answered_at_a_const_name_keyed_structural_target_is_recorded_under_its_own_id() {
+        let (answers, structural, placeholder, run) = const_call_answered(None);
         let (diff, _) = answers.finish();
 
         assert_eq!(diff.upsert_edges.len(), 1, "the answer is recorded, not taken for agreement");
@@ -3895,6 +3909,26 @@ mod tests {
         assert!(
             diff.delete_edge_ids.contains(&structural),
             "the structural edge the answer contradicts is retracted: {:?}",
+            diff.delete_edge_ids
+        );
+    }
+
+    /// **GM-596, K5.** The same name-keyed structural `CALLS`, but core's
+    /// linker moved it onto `tick` itself (`linked_target`). The answer at
+    /// `tick`'s name addresses qualified name `tick`, so neither its id nor
+    /// the structural edge's own target matches: only the linked target says
+    /// they agree. Agreement records nothing and retracts nothing (R2).
+    ///
+    /// Control: drop `linked_on_it` from R2 - the answer is recorded and the
+    /// structural edge retracted.
+    #[test]
+    fn a_call_agreeing_with_a_name_keyed_edge_core_linked_onto_the_same_node_records_nothing() {
+        let (answers, structural, _, _) = const_call_answered(Some("tick"));
+        let (diff, _) = answers.finish();
+        assert!(diff.upsert_edges.is_empty(), "agreement adds nothing: {:?}", diff.upsert_edges);
+        assert!(
+            !diff.delete_edge_ids.contains(&structural),
+            "the structural edge stands: {:?}",
             diff.delete_edge_ids
         );
     }
