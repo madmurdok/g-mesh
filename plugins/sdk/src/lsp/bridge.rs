@@ -3919,6 +3919,16 @@ mod tests {
     /// what core's linker did with the structural edge, by name of the node it
     /// moved it onto.
     fn const_call_answered(link: Option<&str>, found: Value) -> (Answers, String, String, String) {
+        hop_answered(EdgeKind::Calls, link, found)
+    }
+
+    /// [`const_call_answered`] for a structural edge and open site of
+    /// `edge_kind`.
+    fn hop_answered(
+        edge_kind: EdgeKind,
+        link: Option<&str>,
+        found: Value,
+    ) -> (Answers, String, String, String) {
         let (mut index, _) = landing_index();
         let u = RelPath::new("u.toy");
         let mut builder = FileGraphBuilder::new("toy", "toy-parser", &u);
@@ -3928,13 +3938,13 @@ mod tests {
         let target = file_name("a.toy", "tick");
         let placeholder =
             builder.add_placeholder(PlaceholderKind::PendingSymbol, "tick", target, line_range(1));
-        let structural = builder.placeholder_edge(EdgeKind::Calls, &run, &placeholder);
+        let structural = builder.placeholder_edge(edge_kind, &run, &placeholder);
         let site = OpenSite {
             from_id: run.clone(),
             position: Position { line: 1, col: 2 },
             name: "tick".to_string(),
             kind: OpenSiteKind::Reference,
-            edge_kind: EdgeKind::Calls,
+            edge_kind,
             from_container: None,
             replaces: Some(structural.clone()),
         };
@@ -4052,12 +4062,32 @@ mod tests {
         );
     }
 
+    /// **GM-596, gap 1.** Re-reading a disagreeing answer for the location at
+    /// a node's own name is for `CALLS` only: a `REFERENCES` hop answered at
+    /// `tick`'s name and inside `outer`'s body still disagrees, records
+    /// nothing, and leaves the structural edge standing.
+    ///
+    /// Control: drop the `site.edge_kind == EdgeKind::Calls` guard in
+    /// `record_answer` - the edge onto `tick` is recorded.
+    #[test]
+    fn a_non_call_answered_at_a_const_name_and_inside_another_functions_body_records_nothing() {
+        let found = json!([in_a(TICK.0, TICK.1), in_a(9, 17)]);
+        let (answers, structural, _, _) = hop_answered(EdgeKind::References, None, found);
+        let (diff, _) = answers.finish();
+        assert!(diff.upsert_edges.is_empty(), "no edge: {:?}", diff.upsert_edges);
+        assert!(
+            !diff.delete_edge_ids.contains(&structural),
+            "the structural edge stands: {:?}",
+            diff.delete_edge_ids
+        );
+    }
+
     /// `impl Matcher for RegexMatcher` across two files: `m.toy` declares the
     /// trait `Matcher` (the anchor), `i.toy` declares `RegexMatcher` with a
     /// structural `SUPERTYPE_OF` onto a placeholder addressed by `target`,
-    /// linked onto the anchor when `linked`. The server lists `RegexMatcher`
+    /// linked by core as `linked` says. The server lists `RegexMatcher`
     /// among `Matcher`'s implementations; returns the edges that answer upserts.
-    fn implementor_answered(target: PlaceholderTarget, linked: bool) -> Vec<WireEdge> {
+    fn implementor_answered(target: PlaceholderTarget, linked: LinkedOnto) -> Vec<WireEdge> {
         let mut index = SdkIndex::new();
         let m = RelPath::new("m.toy");
         let mut builder = FileGraphBuilder::new("toy", "toy-parser", &m);
@@ -4078,8 +4108,23 @@ mod tests {
             builder.add_placeholder(PlaceholderKind::PendingSymbol, "Matcher", target, line_range(1));
         let structural = builder.placeholder_edge(EdgeKind::SupertypeOf, &implementor, &placeholder);
         index.insert(i, "struct RegexMatcher\n".to_string(), builder.finish());
-        if linked {
-            index.set_linked([(structural, anchor.clone())]);
+        match linked {
+            LinkedOnto::Nothing => {}
+            LinkedOnto::Anchor => index.set_linked([(structural, anchor.clone())]),
+            LinkedOnto::Elsewhere => {
+                // Another `Matcher`, in another file: what core resolved the
+                // name-keyed placeholder to instead of the anchor.
+                let n = RelPath::new("n.toy");
+                let mut builder = FileGraphBuilder::new("toy", "toy-parser", &n);
+                builder.file_node(line_range(0));
+                let other = builder.add_node(
+                    NodeSpec::new(NodeKind::Type, "Matcher", "Matcher", line_range(0))
+                        .native_kind("trait")
+                        .public(),
+                );
+                index.insert(n, "trait Matcher\n".to_string(), builder.finish());
+                index.set_linked([(structural, other)]);
+            }
         }
 
         let question =
@@ -4102,7 +4147,7 @@ mod tests {
     /// a second, semantic row for the same `impl` is upserted.
     #[test]
     fn an_implementor_whose_structural_supertype_edge_is_linked_onto_the_anchor_records_nothing() {
-        let upserts = implementor_answered(file_name("x.toy", "Alias"), true);
+        let upserts = implementor_answered(file_name("x.toy", "Alias"), LinkedOnto::Anchor);
         assert!(upserts.is_empty(), "the structural edge already says it: {upserts:?}");
     }
 
@@ -4114,7 +4159,7 @@ mod tests {
     /// recorded.
     #[test]
     fn an_implementor_whose_structural_supertype_edge_reaches_elsewhere_is_recorded() {
-        let upserts = implementor_answered(file_name("m.toy", "Other"), false);
+        let upserts = implementor_answered(file_name("m.toy", "Other"), LinkedOnto::Nothing);
         assert_eq!(upserts.len(), 1, "{upserts:?}");
         assert_eq!(upserts[0].kind, EdgeKind::SupertypeOf);
     }
@@ -4129,8 +4174,80 @@ mod tests {
     /// the answer is recorded as a duplicate row.
     #[test]
     fn an_implementor_whose_unlinked_placeholder_is_keyed_by_the_anchors_name_records_nothing() {
-        let upserts = implementor_answered(file_name("m.toy", "Matcher"), false);
+        let upserts = implementor_answered(file_name("m.toy", "Matcher"), LinkedOnto::Nothing);
         assert!(upserts.is_empty(), "the name-keyed placeholder addresses the anchor: {upserts:?}");
+    }
+
+    /// What core's linker did with [`implementor_answered`]'s structural edge.
+    #[derive(Clone, Copy, Debug)]
+    enum LinkedOnto {
+        /// Nothing: a pass that did not link the file.
+        Nothing,
+        /// The anchor itself.
+        Anchor,
+        /// Another node of the anchor's name, in another file.
+        Elsewhere,
+    }
+
+    /// **GM-596, gap 2.** Unlinked, keyed by *name* equal to the anchor's
+    /// qualified name, but in another file's scope: a different `Matcher`'s
+    /// address, so it does not reach the anchor and the answer is recorded.
+    ///
+    /// Control: drop `target.scope == scope` from `supertype_reaches`'
+    /// `name_keyed_on_anchor` - nothing is recorded.
+    #[test]
+    fn an_implementor_whose_name_keyed_placeholder_is_in_another_scope_is_recorded() {
+        let upserts = implementor_answered(file_name("x.toy", "Matcher"), LinkedOnto::Nothing);
+        assert_eq!(upserts.len(), 1, "{upserts:?}");
+        assert_eq!(upserts[0].kind, EdgeKind::SupertypeOf);
+    }
+
+    /// **GM-596, gap 2.** The placeholder is keyed by the anchor's own scope
+    /// and name, but core linked the edge onto a different `Matcher`: the
+    /// structural edge states another supertype, so the answer is recorded.
+    ///
+    /// Control: drop `linked_target(..).is_none()` from `supertype_reaches`'
+    /// name-keyed arm - nothing is recorded.
+    #[test]
+    fn an_implementor_whose_name_keyed_placeholder_core_linked_elsewhere_is_recorded() {
+        let upserts = implementor_answered(file_name("m.toy", "Matcher"), LinkedOnto::Elsewhere);
+        assert_eq!(upserts.len(), 1, "{upserts:?}");
+        assert_eq!(upserts[0].kind, EdgeKind::SupertypeOf);
+    }
+
+    /// **GM-596, gap 2.** `impl Matcher for RegexMatcher` in the trait's own
+    /// file: the structural `SUPERTYPE_OF` is resolved, straight onto the
+    /// anchor, with nothing linked. It already says what the answer would, so
+    /// nothing is recorded.
+    ///
+    /// Control: drop the `edge.to_id == anchor.id` arm of `supertype_reaches`
+    /// - a second, semantic row for the same `impl` is upserted.
+    #[test]
+    fn an_implementor_whose_resolved_structural_supertype_edge_targets_the_anchor_records_nothing() {
+        let mut index = SdkIndex::new();
+        let m = RelPath::new("m.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &m);
+        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 2, col: 0 } });
+        let anchor = builder.add_node(
+            NodeSpec::new(NodeKind::Type, "Matcher", "Matcher", line_range(0)).native_kind("trait").public(),
+        );
+        let implementor = builder.add_node(
+            NodeSpec::new(NodeKind::Type, "RegexMatcher", "RegexMatcher", line_range(1))
+                .native_kind("struct"),
+        );
+        builder.resolved_edge(EdgeKind::SupertypeOf, &implementor, &anchor);
+        index.insert(m.clone(), "trait Matcher\nstruct RegexMatcher\n".to_string(), builder.finish());
+
+        let question =
+            Question { file: m, position: Position { line: 0, col: 6 }, ask: Ask::Implementation { anchor } };
+        let mut answers = Answers::new("toy", "toy-lsp");
+        let root = Path::new("/p");
+        let found = json!({ "uri": "file:///p/m.toy", "range": { "start": { "line": 1, "character": 7 } } });
+        let again =
+            record_answer(&mut answers, &index, [root, root], PositionEncoding::Utf16, &question, &found);
+        assert!(again.is_empty(), "the location is a declaration: no second hop");
+        let upserts = answers.finish().0.upsert_edges;
+        assert!(upserts.is_empty(), "the structural edge already says it: {upserts:?}");
     }
 
     /// A call landing on a function is recorded wherever in it the answer
