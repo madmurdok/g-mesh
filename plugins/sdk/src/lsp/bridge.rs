@@ -1993,7 +1993,8 @@ fn wire_position(
 /// The tightest node containing the location, which may be an encloser of
 /// what the server meant: a class field or an object-literal method has no
 /// node of its own, so a definition at one lands on the class or the const
-/// around it. [`lands_on_name`] tells the two apart.
+/// around it. [`lands_on_name`] tells the two apart, for a `CALLS` answer
+/// landing on its own caller too (GM-593).
 fn node_at<'i>(
     index: &'i SdkIndex,
     roots: [&Path; 2],
@@ -2012,6 +2013,8 @@ fn node_at<'i>(
 /// range starts at the declaration, so a precise answer passes; one that
 /// landed on an encloser points at a member's name and fails, even a member
 /// sharing the encloser's name, which occurs after the encloser's own.
+/// A `CALLS` answer landing on its own caller passes only here: at the
+/// caller's name it is recursion, elsewhere the encloser fallback (GM-593).
 fn lands_on_name(index: &SdkIndex, path: &RelPath, at: Position, node: &WireNode) -> bool {
     let name: Vec<char> = node.name.chars().collect();
     if name.is_empty() {
