@@ -99,7 +99,7 @@ pub(super) fn run(root: &Path, dir: &Path, singleton: File, detection: Detection
 
     let timeouts = IdleTimeouts { plugin: None, core: front_core_idle() };
     let outcome =
-        lifecycle::supervise(&canonical_root, dir, &registry, &core_activity, timeouts, accept_loop);
+        lifecycle::supervise(&canonical_root, dir, &registry, &core_activity, None, timeouts, accept_loop);
 
     drop(singleton);
     // A removed folder's front state goes the way a project's does: it is

@@ -167,7 +167,9 @@ struct Inner {
     /// Where [`Phase`] transitions are published for outside readers
     /// (`cli::status`, tests). Set only by `daemon::run`
     /// ([`IndexingStatus::attach_phase_file`]); a status with no daemon behind it
-    /// writes nothing.
+    /// writes nothing. Cleared again by [`IndexingStatus::detach_state_files`]
+    /// before the daemon releases its state files, so no thread can recreate
+    /// the file after teardown (GM-605).
     phase_file: Mutex<Option<PathBuf>>,
     /// Set once at construction and never written again, so reading it needs
     /// no lock.
@@ -422,6 +424,18 @@ impl IndexingStatus {
             file.interval = interval;
         }
         self.publish_progress(true);
+    }
+
+    /// Disconnects the phase and progress files, so no later
+    /// [`set_phase`](Self::set_phase) or counter update writes into the state
+    /// directory. Called by `lifecycle::supervise` right before it releases the
+    /// state files: the activation thread may still be running then, and a write
+    /// landing during the purge left the directory behind (GM-605). Each writer
+    /// holds its mutex across the whole write, so once this returns no write is
+    /// in flight and none can start.
+    pub(crate) fn detach_state_files(&self) {
+        *self.0.phase_file.lock().unwrap() = None;
+        self.0.progress_file.lock().unwrap().path = None;
     }
 
     /// The counters as they stand now.
@@ -880,6 +894,46 @@ mod tests {
         let snapshot = read();
         assert_eq!(snapshot.phase, "ready");
         assert_eq!(snapshot.embeddings, EmbedProgress { done: 50, total: 200 });
+    }
+
+    /// GM-605: once detached, a phase change must not put the phase file back
+    /// into a state directory the daemon is releasing.
+    #[test]
+    fn no_phase_file_is_written_after_the_state_files_are_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.phase");
+        let status = IndexingStatus::structural();
+        status.attach_phase_file(path.clone());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "structural", "attaching publishes at once");
+
+        status.detach_state_files();
+        std::fs::remove_file(&path).unwrap();
+        status.set_phase(Phase::Embedding);
+        status.set_phase(Phase::Ready);
+        assert!(!path.exists(), "a phase change after detach_state_files wrote {}", path.display());
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "nothing may be written after detach, found {left:?}");
+    }
+
+    /// GM-605: a detached progress file stays unwritten on a forced publish (a
+    /// phase change) and on a counter update with no throttle in the way.
+    #[test]
+    fn no_progress_file_is_written_after_the_state_files_are_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.progress");
+        let status = IndexingStatus::structural();
+        status.attach_progress_file_every(path.clone(), Duration::ZERO);
+        assert!(path.exists(), "attaching publishes at once");
+
+        status.detach_state_files();
+        std::fs::remove_file(&path).unwrap();
+        status.set_phase(Phase::Embedding);
+        status.set_embed_total(10);
+        status.add_embed_done(5);
+        status.set_phase(Phase::Ready);
+        assert!(!path.exists(), "a publish after detach_state_files wrote {}", path.display());
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "nothing may be written after detach, found {left:?}");
     }
 
     #[test]
