@@ -831,7 +831,7 @@ fn a_module_qualified_call_is_a_name_key_and_a_class_qualified_one_is_exact() {
     // A class qualifier is exact, because a container holds many members
     // merely *named* `describe`.
     assert_eq!(
-        graph.placeholder_target("pkg.base::Base.describe"),
+        graph.placeholder_target("pkg.base::=Base.describe"),
         ("container:pkg.base".into(), "qualifiedName:Base.describe".into(), "pkg.mod".into())
     );
 }

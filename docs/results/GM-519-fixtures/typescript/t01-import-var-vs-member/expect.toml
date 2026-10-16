@@ -3,3 +3,14 @@
 symbol = "Router#handler"
 file = "src/x.ts"
 expect = []
+
+# GM-596: the direct named import of a const-bound function links. The
+# structural CALLS waits on a name-keyed placeholder the linker lands only on
+# a Function; the bridge asks vtsls, whose answer gets a qualifiedName-keyed
+# placeholder of its own (`src/x.ts#=handler`) that the linker links onto the
+# Variable as an engine answer. `file` matches both, so this entry adds `kind`.
+[[callers]]
+symbol = "handler"
+file = "src/x.ts"
+kind = "Variable"
+expect = ["src/main.ts:run"]

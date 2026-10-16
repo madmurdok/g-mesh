@@ -69,7 +69,7 @@
 # reference and implementor it names sits on a confirmed edge - in the
 # structural arm as well as the rust-analyzer one.
 #
-# **`tier = "semantic"`** marks the five entries that need a real
+# **`tier = "semantic"`** marks the four entries that need a real
 # rust-analyzer behind the SDK's `LspBridge` (GM-290) - decision 6 of
 # `core/src/cli/plugin_check/expectations.rs`'s own module doc, the same way
 # `plugins/go/conformance/expect.toml` marks its four. `tests/conformance.rs`
@@ -78,26 +78,24 @@
 #   1. with the manifest this plugin ships, where all 33 entries run and pass;
 #   2. with 3.2.0's own manifest (`semantic_pass = false`, no
 #      `[plugin.semantic]`) and `--skip-semantic-expectations`, where those
-#      five report `Skip` and the other 28 - every structural entry here -
+#      four report `Skip` and the other 29 - every structural entry here -
 #      keep passing;
-#   3. with 3.2.0's manifest and *without* the skip flag, where those five
+#   3. with 3.2.0's manifest and *without* the skip flag, where those four
 #      must FAIL.
 #
 # Arm 2 is what "without rust-analyzer, the structural results are the 3.2.0
 # results" means as something a machine checks. Arm 3 is the discrimination,
-# and it is not decoration: measured, it fails exactly five entries, each for
+# and it is not decoration: measured, it fails exactly four entries, each for
 # the reason it was written -
 #
 #   callers[6]  empty, wanted shapes::total                (variable receiver -> the impl's trait method)
 #   callers[7]  empty, wanted total_dyn and gaps::measure  (trait object / generic -> the trait's)
 #   callers[9]  empty, wanted shapes::describe             (a default trait method)
 #   implementations[3]  missing beta's Siren               (an impl a macro of another crate writes)
-#   references[0]       the right six rows, tally 4 not 6  (GM-386; see that entry)
 #
 # - which is how this file is known to be measuring the rust-analyzer tier
-# rather than describing it. The last line is the odd one and says so in its
-# own entry: its rows are structural and match in both arms, and only the
-# `files` tally GM-386 added moves.
+# rather than describing it. `references[0]` was a fifth until GM-596: see
+# that entry for why its tally no longer moves with the tier.
 #
 # 3.2.0's manifest rather than "the shipped one with a broken command" for
 # arm 2 and 3, and the reason is the kit's own rule: a plugin that declares
@@ -359,36 +357,31 @@ expect = [
     "crates/alpha/src/prelude.rs:",
 ]
 # Decision 12, and the tally says something the set above provably cannot:
-# six rows in shapes.rs against four members of the set. Two usages collapsed
-# onto rows already there - decision 8 exempts `[[references]]` from counting
-# repeats, because two rows for one symbol genuinely are two usages - so this
-# is the one assertion in this file that pins how many usages the plugin found
-# rather than which symbols they belong to.
+# four rows in shapes.rs against four members of the set, which only agree
+# because each usage is one row: `describe`'s bound, `total_dyn`'s parameter,
+# and one `SUPERTYPE_OF` each for `impl Shape for Square` and `impl Shape for
+# Circle`. Decision 8 exempts `[[references]]` from counting repeats, because
+# two rows for one symbol genuinely are two usages - so this is the one
+# assertion in this file that pins how many usages the plugin found rather
+# than which symbols they belong to.
 files = [
     "crates/alpha/src/gaps.rs:1",
     "crates/alpha/src/prelude.rs:1",
-    "crates/alpha/src/shapes.rs:6",
+    "crates/alpha/src/shapes.rs:4",
 ]
-# **`tier = "semantic"` is on this entry for the tally alone, and the entry's
-# rows are still structural** - which is a cost GM-386 paid rather than hid.
-# Measured: without rust-analyzer the same six rows come back and the tally
-# reads `crates/alpha/src/shapes.rs:4`. Those two extra usages are the
-# semantic tier's, and since decision 12 makes an omitted `files` an assertion
-# of its own, no single spelling of this entry is true in both arms: the
-# healthy run needs `:6` and the structural-only run needs `:4`.
-#
-# What that costs: arm 2 (`without_a_semantic_tier_the_structural_
-# expectations_still_hold`) now *skips* this entry rather than passing it, so
-# `shapes::Shape`'s structural reference set is no longer asserted there.
-# `[[references]] shapes::Gauge` below is untagged and keeps that category
-# represented in arm 2. Arm 3 gains it as a sixth expected failure, which is
-# why `tests/conformance.rs`'s SEMANTIC_EXPECTATIONS went from 5 to 6.
+# No `tier`: the tally is the same in both arms. GM-386 measured `:6` with
+# rust-analyzer and `:4` without, and tagged this entry `tier = "semantic"`
+# for the tally alone. The two extra rows were rust-analyzer's answers for
+# the two `impl Shape for ..` blocks, each a second row for an `impl` whose
+# structural `SUPERTYPE_OF` already reached `Shape`. GM-596 stopped the
+# semantic tier from recording an implementor a structural edge already
+# states (`supertype_reaches` in the SDK's bridge), so both arms count four,
+# and arm 2 asserts this entry again instead of skipping it.
 #
 # The general rule, worth knowing before adding the next `files`: a tally is a
 # count of *edges*, so any anchor whose edge set grows with the semantic tier
 # has a tier-dependent tally, and asserting it tags the entry. An entry whose
 # anchor is wholly structural - every `[[callers]]` entry above - does not.
-tier = "semantic"
 
 # --- implementations: impl Trait for T, found by find_implementations ---------
 # (GM-286's own acceptance case, kept here rather than duplicated)
