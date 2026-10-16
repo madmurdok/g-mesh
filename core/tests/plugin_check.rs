@@ -1053,6 +1053,72 @@ fn an_ambiguous_symbol_fails_with_its_candidates_and_file_disambiguates_it() {
     assert_eq!(run_callers.outcome("expectations.callers[0]"), "PASS", "{}", run_callers.stdout);
 }
 
+/// One `[[callers]]` (an edge-walking tool, `resolve_and_call`) and one
+/// `[[definition]]` (`resolve_definition`) entry on `helper`, a name declared
+/// once - decision 3 case 1, the direct answer - each carrying the same
+/// `selectors` line(s) and an `expect` set that is correct, so the only thing
+/// that can fail either entry is a selector (GM-597).
+fn run_unique_name_selectors(selectors: &str) -> Run {
+    let fixture = write_fk_fixture(&[("a.fk", "fn helper\nfn user\ncall helper\n")]);
+    let expect = write_expect_file(
+        fixture.path(),
+        &format!(
+            "[[callers]]\nsymbol = \"helper\"\n{selectors}\nexpect = [\"a.fk:user\"]\n\n\
+             [[definition]]\nsymbol = \"helper\"\n{selectors}\nexpect = [\"a.fk:helper\"]\n"
+        ),
+    );
+    let fake = install_fake("none", true);
+    run_check_with_expect(&fake.dir, fixture.path(), &expect)
+}
+
+/// A selector that matches nothing on a unique name fails both entries, each
+/// naming the selector, the expected and the actual value - one finding per
+/// entry, so both call sites are shown checking it.
+fn assert_unique_name_selector_fails(run: &Run, finding: &str) {
+    assert!(!run.success, "a mismatched selector must make the command exit non-zero:\n{}", run.stdout);
+    assert_eq!(run.outcome("expectations.callers[0]"), "FAIL", "{}", run.stdout);
+    assert_eq!(run.outcome("expectations.definition[0]"), "FAIL", "{}", run.stdout);
+    assert_eq!(run.stdout.matches(finding).count(), 2, "one finding per entry expected:\n{}", run.stdout);
+}
+
+#[test]
+fn a_wrong_kind_on_a_unique_name_fails_naming_the_kind() {
+    let run = run_unique_name_selectors("kind = \"Variable\"");
+    assert_unique_name_selector_fails(
+        &run,
+        "selector `kind` does not match the symbol the name resolved to: expected kind \"Variable\", \
+         actual kind \"Function\"",
+    );
+}
+
+#[test]
+fn a_wrong_file_on_a_unique_name_fails_naming_the_file() {
+    let run = run_unique_name_selectors("file = \"b.fk\"");
+    assert_unique_name_selector_fails(
+        &run,
+        "selector `file` does not match the symbol the name resolved to: expected filePath \"b.fk\", \
+         actual filePath \"a.fk\"",
+    );
+}
+
+#[test]
+fn a_wrong_qualified_name_on_a_unique_name_fails_naming_it() {
+    let run = run_unique_name_selectors("qualified_name = \"pkg.helper\"");
+    assert_unique_name_selector_fails(
+        &run,
+        "selector `qualified_name` does not match the symbol the name resolved to: expected \
+         qualifiedName \"pkg.helper\", actual qualifiedName \"helper\"",
+    );
+}
+
+#[test]
+fn correct_selectors_on_a_unique_name_still_pass() {
+    let run = run_unique_name_selectors("file = \"a.fk\"\nkind = \"Function\"\nqualified_name = \"helper\"");
+    assert_eq!(run.outcome("expectations.callers[0]"), "PASS", "{}", run.stdout);
+    assert_eq!(run.outcome("expectations.definition[0]"), "PASS", "{}", run.stdout);
+    assert!(run.success, "{}", run.stdout);
+}
+
 /// Decision 9 (GM-371), both ways round in one run: `[[refusal]]` passes when
 /// the tool genuinely declines to resolve a name, and fails on every other
 /// shape a call can come back in.
