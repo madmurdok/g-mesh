@@ -377,7 +377,9 @@ type resolutions struct {
 	// and a type is checked against the copy its own load imported.
 	importsWalked map[*types.Package]bool
 	// exhaustive is a whole-project pass in which every module loaded: every
-	// project interface was evaluated, so nothing is carried forward.
+	// project interface was evaluated, so nothing is carried forward, and
+	// every referenced project package was folded, so no package's twins had
+	// to be listed. Set by [semanticEngine.loadFor].
 	exhaustive bool
 }
 
@@ -447,9 +449,10 @@ func twinListingKey(cfg *packages.Config) string {
 }
 
 // loadReferencedTwins computes the twinned names of every project package an
-// answer resolved into but no load has folded - in a per-file pass, the
-// imported packages, which the type checker read from export data and
-// go/packages therefore reports without their IgnoredFiles. It asks `go list`
+// answer resolved into but no load has folded - in a per-file pass, or a
+// whole-project pass with a failed module, the imported packages, which the
+// type checker read from export data and go/packages therefore reports
+// without their IgnoredFiles. It asks `go list`
 // for names and files only (no type checking), once per load configuration,
 // from the directory and with the flags of the load whose answers referenced
 // the package: an import path resolves only in a module that requires it, and
@@ -1001,7 +1004,6 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 	}
 	implementsEdges := e.answerImplements(builder, resolved, structural)
 
-	resolved.exhaustive = wholeProject && len(outcome.failed) == 0
 	diff := builder.finish(e, scope, resolved, structural)
 	logf("semantic pass: %d file(s), %d resolved site(s), %d implements edge(s), "+
 		"%d node(s)/%d edge(s) upserted, %d edge(s) retracted, in %s",
@@ -1102,11 +1104,14 @@ func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject 
 			l.paths[path] = true
 		}
 	}
-	// Only a per-file pass needs the extra listing (imported packages come
-	// from export data without IgnoredFiles); a whole-project pass folds
-	// every project package itself. After all modules loaded, so a listing
-	// cannot mark a later module's folded twins as already known.
-	if !wholeProject {
+	// Only an exhaustive pass folds every project package itself. A per-file
+	// pass, and a whole-project pass with a failed module (whose packages
+	// root's answers reach through export data), list the referenced packages
+	// no load folded (they come without IgnoredFiles). After all modules
+	// loaded, so a listing cannot mark a later module's folded twins as
+	// already known.
+	into.exhaustive = wholeProject && len(outcome.failed) == 0
+	if !into.exhaustive {
 		e.loadReferencedTwins(into, listings)
 	}
 	return outcome
