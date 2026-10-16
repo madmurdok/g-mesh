@@ -184,7 +184,8 @@ must reproduce, with the TS source it comes from.
 
 One trap the parity test exists for: the SDK's `FileGraphBuilder::add_placeholder`
 derives a placeholder's qualifiedName as `render_target(target)`, which for a
-`resolved_module` is `path#*`, while the Node plugin uses the bare `path`. The
+`resolved_module` is `path#*` (a `qualifiedName` key would render `path#=<key>`,
+GM-596), while the Node plugin uses the bare `path`. The
 port builds placeholders as plain `NodeSpec`s with the Node qualifiedName and
 target (the route `plugins/rust`'s re-export node already takes), never through
 `add_placeholder`. `emit.rs` owns this, with a unit test per placeholder kind

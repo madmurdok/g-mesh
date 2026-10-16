@@ -1080,10 +1080,12 @@ fn questions(index: &SdkIndex, scope: &[RelPath], config: &SemanticConfig, budge
                     Ask::Overload(site.clone())
                 }
                 OpenSiteKind::Reference if site.replaces.is_some() => {
-                    // A hop through a re-export or a default import: asked
-                    // only while its placeholder is one the linker cannot
-                    // settle on its own. Like a dropped overload call, a
-                    // site not asked is not unanswerable - its structural
+                    // A hop through a re-export or a default import, or a
+                    // call or supertype by name onto a declaration of a kind
+                    // the edge does not accept (a `CALLS` onto a `const`):
+                    // asked only while its placeholder is one the linker
+                    // cannot settle on its own. Like a dropped overload call,
+                    // a site not asked is not unanswerable - its structural
                     // edge stands as the answer.
                     let replaced = site.replaces.as_deref().unwrap_or_default();
                     if !unsettled_hop(index, &entry.graph, replaced) {
@@ -1157,9 +1159,18 @@ fn site_key(site: &OpenSite) -> (String, u32, u32) {
 /// settle, so a [`OpenSiteKind::Reference`] site naming it is worth a
 /// question: the edge lands on a `pending_symbol` placeholder addressed by
 /// file `f` and bare name `n`, `f` is in the index, and `f` itself declares
-/// nothing named `n`. A file that does declare `n` is where the linker lands
-/// the edge already; what is left is `n` re-exported from elsewhere, or
-/// `default`.
+/// no `n` the linker would link this edge to. A file that does is where the
+/// linker lands the edge already; what is left is `n` re-exported from
+/// elsewhere, `default`, or `n` declared with a kind the edge does not accept.
+///
+/// Which kinds count follows core's structural kind rule for a syntactic
+/// edge on a name key (`LINKABLE_EDGE_KINDS` in
+/// `core/src/graph/symbol_links.rs`): a `CALLS` edge links only to a
+/// `Function`, a `SUPERTYPE_OF` edge only to a `Type` or a `Function`, and
+/// any other edge kind to any addressable node. So a call of
+/// `export const handler = make()` imported by name is asked (GM-596): the
+/// linker would leave it unlinked, and only an engine answer widens `CALLS`
+/// to a `Variable`.
 fn unsettled_hop(index: &SdkIndex, graph: &crate::graph::FileGraph, replaced: &str) -> bool {
     let Some(edge) = graph.edges.iter().find(|edge| edge.id == replaced) else { return false };
     let Some(placeholder) = graph.nodes.iter().find(|node| node.id == edge.to_id) else { return false };
@@ -1169,7 +1180,12 @@ fn unsettled_hop(index: &SdkIndex, graph: &crate::graph::FileGraph, replaced: &s
     let Some(target) = &placeholder.target else { return false };
     let (TargetScope::File(file), TargetKey::Name(name)) = (&target.scope, &target.key) else { return false };
     let Some(declaring) = index.entry(&RelPath::new(file)) else { return false };
-    !declaring.graph.nodes.iter().any(|node| node.name == *name && is_addressable(node))
+    let accepts = |kind: NodeKind| match edge.kind {
+        EdgeKind::Calls => kind == NodeKind::Function,
+        EdgeKind::SupertypeOf => matches!(kind, NodeKind::Type | NodeKind::Function),
+        _ => true,
+    };
+    !declaring.graph.nodes.iter().any(|node| node.name == *name && is_addressable(node) && accepts(node.kind))
 }
 
 /// The declarations an [`OpenSiteKind::OverloadCall`] site may be bound to,
@@ -2640,7 +2656,11 @@ fn record_answer(
             if let Some(replaced) = &site.replaces {
                 // R2, agreement adds nothing: the answer lands on the
                 // structural edge's own target (`Bound::Here`), or would get
-                // the structural edge's own id (`Bound::There`, one address),
+                // the structural edge's own id (`Bound::There`, one address
+                // and one key kind: a name-keyed placeholder and the
+                // answer's qualified-name address never share an id, so a
+                // name-keyed structural edge the linker left unlinked is
+                // contradicted, not upheld),
                 // or core linked the structural edge onto it (through a
                 // re-export the edge's placeholder address names, which the
                 // answered declaration's own address never matches).
@@ -3368,9 +3388,10 @@ mod tests {
         }
 
         assert_eq!(
-            rows[0].id, "69f3fc743f4eade2dc01f07e99f541f0",
+            rows[0].id, "1e9a642bc7367b8551f39d6d9c9d50da",
             "the reduction has to be the real instance, not something like it: this is the id \
-             the two rows collided on in an index of ripgrep"
+             the two rows collided on in an index of ripgrep (69f3fc74... before GM-596 put the \
+             key kind into the label)"
         );
 
         assert_eq!(rows[0], rows[1], "the row a shared placeholder carries depends on answer order");
@@ -3438,7 +3459,7 @@ mod tests {
             "the placeholder waits on the enum, whatever the site that reached it was spelled"
         );
         assert_eq!(
-            diff.upsert_nodes[0].qualified_name, "rg::flags::lowargs::flags::lowargs::SearchMode",
+            diff.upsert_nodes[0].qualified_name, "rg::flags::lowargs::=flags::lowargs::SearchMode",
             "and its name agrees with the address its id is derived from"
         );
         assert_eq!(

@@ -46,3 +46,10 @@ or const around it, the encloser.
   py-requests (0 refusals).
 - Nested-fn and local-binding calls no longer produce `CALLS` self-loops on
   their encloser; recursion stays (GM-593).
+- A direct named import of a const-bound function (`import { handler }`,
+  `handler()`) now links too (GM-596): the bridge asks a `CALLS` hop whose
+  file declares the name only as a non-function (and a `SUPERTYPE_OF` hop
+  whose file declares it as neither type nor function), and a name-keyed
+  placeholder and a qualified-name-keyed one never share an id - the label
+  renders a `qualifiedName` key as `=<key>` - so the engine answer is
+  recorded instead of being taken for agreement with the structural edge.

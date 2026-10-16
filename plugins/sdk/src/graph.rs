@@ -531,6 +531,10 @@ impl FileGraphBuilder {
     /// is `<file>#<key>` for a file scope and `<container>::<key>` for a
     /// container scope; the two shapes cannot collide, and `nativeKind` -
     /// also in the id - keeps the placeholder kinds apart on top of that.
+    /// The key's kind is part of the address too: a `qualifiedName` key
+    /// renders as `=<key>`, so a placeholder waiting on name `n` and one
+    /// waiting on qualified name `n` in the same scope get different ids
+    /// (see [`render_target`]).
     ///
     /// `range` is where the *use site* is: a placeholder is a node of the
     /// file that is waiting, not of the file it is waiting on.
@@ -680,14 +684,24 @@ fn fold_untyped_calls(graph: &mut FileGraph) {
 /// this string. What it has to be is *injective enough* that two placeholders
 /// in one file waiting on different things get different ids.
 ///
+/// A [`TargetKey::Name`](g_mesh_wire::TargetKey::Name) key renders as is
+/// (`src/x.ts#handler`, `crate::m::Name`); a
+/// [`TargetKey::QualifiedName`](g_mesh_wire::TargetKey::QualifiedName) key
+/// gets a `=` sigil right after the separator (`src/x.ts#=handler`,
+/// `crate::m::=path::Name`). No identifier in the languages the SDK serves
+/// starts with `=`, and neither do the special name keys `*` and `default`,
+/// so the two renderings never collide: a name-keyed and a QN-keyed
+/// placeholder with the same key string are two things waiting on two
+/// different addresses, and must not share an id (GM-596).
+///
 /// Public because a plugin that builds a placeholder's `NodeSpec` itself -
 /// `plugins/rust`'s re-export node - has to spell the label the same way, and
 /// a second copy of the rendering is a second thing to keep in step.
 pub fn render_target(target: &PlaceholderTarget) -> String {
     use g_mesh_wire::{TargetKey, TargetScope};
     let key = match &target.key {
-        TargetKey::Name(name) => name,
-        TargetKey::QualifiedName(qualified_name) => qualified_name,
+        TargetKey::Name(name) => name.clone(),
+        TargetKey::QualifiedName(qualified_name) => format!("={qualified_name}"),
     };
     match &target.scope {
         TargetScope::File(path) => format!("{path}#{key}"),
@@ -697,6 +711,8 @@ pub fn render_target(target: &PlaceholderTarget) -> String {
 
 /// The id [`FileGraphBuilder::add_placeholder`] will give a placeholder,
 /// derived from the only three things it depends on - and nothing else.
+/// The target counts with its key's kind: a name key and a qualified-name key
+/// with the same string are different addresses, so different ids.
 ///
 /// A placeholder's `name` and `range` describe one *use site*, and an address
 /// reached from several sites has several of those. A caller that has to
