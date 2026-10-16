@@ -989,3 +989,98 @@ fn a_memory_suspension_still_wins_over_a_hold() {
 
     supervisor.sleep_now("test cleanup");
 }
+
+/// One [`supervise`] exit over a state directory whose phase and progress
+/// files an [`IndexingStatus`] keeps rewriting from another thread, as the
+/// activation thread does while an orphaned daemon tears down (GM-605).
+/// `orphan` picks the exit: a deleted project root, or an idle core.
+///
+/// Asserts only what `supervise` guarantees once it has returned:
+/// `detach_state_files` ran before `release_state_files`, and each writer
+/// holds its mutex across its whole write, so no write is in flight or can
+/// start and the directory holds nothing - not while the writer is still
+/// running, and not after one more phase change on this thread.
+fn supervise_exit_leaves_no_state_file_behind(orphan: bool) {
+    use crate::daemon::indexing_status::{IndexingStatus, Phase};
+    use crate::daemon::manifest::DiscoveredPlugins;
+    use crate::daemon::registry::PluginRegistry;
+
+    let project = tempfile::tempdir().expect("failed to create a project root");
+    let state = tempfile::tempdir().expect("failed to create a state dir");
+    let state_dir = state.path();
+    let registry = PluginRegistry::new(
+        project.path(),
+        state_dir.to_path_buf(),
+        DiscoveredPlugins::default(),
+        None,
+        None,
+        Arc::new(EmbeddingPipeline::disabled()),
+    );
+    let core = CoreActivity::new();
+    let indexing = IndexingStatus::structural();
+    indexing.attach_phase_file(crate::daemon::phase_path_in(state_dir));
+    indexing.attach_progress_file_every(crate::daemon::progress_path_in(state_dir), Duration::ZERO);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let indexing = indexing.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                indexing.set_phase(Phase::Embedding);
+                indexing.add_embed_done(1);
+                indexing.set_phase(Phase::Ready);
+            }
+        })
+    };
+
+    // The shortest tick (MIN_TICK) for both exits; the orphan check runs first in
+    // every tick, so a deleted root ends it as orphaned before the idle check.
+    let timeouts = if orphan {
+        IdleTimeouts { plugin: Some(Duration::from_millis(200)), core: None }
+    } else {
+        IdleTimeouts { plugin: None, core: Some(Duration::from_millis(1)) }
+    };
+    let project_root = project.path().to_path_buf();
+    if orphan {
+        project.close().expect("failed to delete the project root");
+    }
+    let (_accept_alive, accept_loop) = std::sync::mpsc::channel::<Result<()>>();
+    let exit = supervise(&project_root, state_dir, &registry, &core, Some(&indexing), timeouts, accept_loop)
+        .expect("supervise must exit cleanly");
+    if orphan {
+        assert_eq!(exit, Exit::Orphaned(Orphaned::ProjectRootGone(project_root)));
+    } else {
+        assert_eq!(exit, Exit::Idle);
+    }
+
+    let listing =
+        || -> Vec<_> { fs::read_dir(state_dir).unwrap().map(|entry| entry.unwrap().file_name()).collect() };
+    let with_writer_running = listing();
+    indexing.set_phase(Phase::Ready);
+    let after_a_phase_change = listing();
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("the writer thread panicked");
+    assert!(
+        with_writer_running.is_empty() && after_a_phase_change.is_empty(),
+        "the state dir must stay empty once supervise returns: {with_writer_running:?} then {after_a_phase_change:?}"
+    );
+}
+
+/// GM-605: the orphan exit detaches the phase and progress files before it
+/// releases them. Repeated so a detach that lands after the release (a
+/// writer slipping into the gap) has many chances to show.
+#[test]
+fn the_orphan_exit_detaches_the_state_files_before_releasing_them() {
+    for _ in 0..40 {
+        supervise_exit_leaves_no_state_file_behind(true);
+    }
+}
+
+/// GM-605: the idle exit does the same as the orphan exit.
+#[test]
+fn the_idle_exit_detaches_the_state_files_before_releasing_them() {
+    for _ in 0..40 {
+        supervise_exit_leaves_no_state_file_behind(false);
+    }
+}

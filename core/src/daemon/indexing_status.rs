@@ -896,6 +896,46 @@ mod tests {
         assert_eq!(snapshot.embeddings, EmbedProgress { done: 50, total: 200 });
     }
 
+    /// GM-605: once detached, a phase change must not put the phase file back
+    /// into a state directory the daemon is releasing.
+    #[test]
+    fn no_phase_file_is_written_after_the_state_files_are_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.phase");
+        let status = IndexingStatus::structural();
+        status.attach_phase_file(path.clone());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "structural", "attaching publishes at once");
+
+        status.detach_state_files();
+        std::fs::remove_file(&path).unwrap();
+        status.set_phase(Phase::Embedding);
+        status.set_phase(Phase::Ready);
+        assert!(!path.exists(), "a phase change after detach_state_files wrote {}", path.display());
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "nothing may be written after detach, found {left:?}");
+    }
+
+    /// GM-605: a detached progress file stays unwritten on a forced publish (a
+    /// phase change) and on a counter update with no throttle in the way.
+    #[test]
+    fn no_progress_file_is_written_after_the_state_files_are_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.progress");
+        let status = IndexingStatus::structural();
+        status.attach_progress_file_every(path.clone(), Duration::ZERO);
+        assert!(path.exists(), "attaching publishes at once");
+
+        status.detach_state_files();
+        std::fs::remove_file(&path).unwrap();
+        status.set_phase(Phase::Embedding);
+        status.set_embed_total(10);
+        status.add_embed_done(5);
+        status.set_phase(Phase::Ready);
+        assert!(!path.exists(), "a publish after detach_state_files wrote {}", path.display());
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "nothing may be written after detach, found {left:?}");
+    }
+
     #[test]
     fn the_semantic_pass_counts_languages_and_names_only_the_running_one() {
         let status = IndexingStatus::structural();
