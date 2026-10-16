@@ -3810,6 +3810,69 @@ mod tests {
         assert_eq!(answered_by(&index, &caller, call(), in_a(6, 6)).1, 1, "the const's own name");
     }
 
+    /// **GM-596.** `import { tick } from "./a"; tick()` with `const tick =
+    /// () => 1`: the structural `CALLS` waits on a placeholder keyed by
+    /// *name* `tick` in `a.toy`, which the linker never lands on a Variable.
+    /// The answer at the const's own name addresses *qualified name* `tick`
+    /// in `a.toy` - the same string, a different key. It is recorded under
+    /// its own id, not taken for agreement, and the structural edge it
+    /// contradicts is retracted.
+    ///
+    /// Controls: drop the `=` sigil for a `File` scope in `render_target`
+    /// (the answer gets the structural edge's id and records nothing); drop
+    /// the `contradicted`/`retract` inserts after `record` (the structural
+    /// edge is not retracted).
+    #[test]
+    fn a_call_answered_at_a_const_name_keyed_structural_target_is_recorded_under_its_own_id() {
+        let (mut index, _) = landing_index();
+        let u = RelPath::new("u.toy");
+        let mut builder = FileGraphBuilder::new("toy", "toy-parser", &u);
+        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 2, col: 0 } });
+        let run = builder
+            .add_node(NodeSpec::new(NodeKind::Function, "run", "run", line_range(1)).native_kind("function"));
+        let target = file_name("a.toy", "tick");
+        let placeholder =
+            builder.add_placeholder(PlaceholderKind::PendingSymbol, "tick", target, line_range(1));
+        let structural = builder.placeholder_edge(EdgeKind::Calls, &run, &placeholder);
+        let site = OpenSite {
+            from_id: run.clone(),
+            position: Position { line: 1, col: 2 },
+            name: "tick".to_string(),
+            kind: OpenSiteKind::Reference,
+            edge_kind: EdgeKind::Calls,
+            from_container: None,
+            replaces: Some(structural.clone()),
+        };
+        builder.open_site(site.clone());
+        index.insert(u.clone(), "fn run\n  tick()\n".to_string(), builder.finish());
+
+        let question = Question { file: u, position: site.position, ask: Ask::Definition(site) };
+        let mut answers = Answers::new("toy", "toy-lsp");
+        let root = Path::new("/p");
+        let again = record_answer(
+            &mut answers,
+            &index,
+            [root, root],
+            PositionEncoding::Utf16,
+            &question,
+            &in_a(7, 6),
+        );
+        assert!(again.is_empty());
+        let (diff, _) = answers.finish();
+
+        assert_eq!(diff.upsert_edges.len(), 1, "the answer is recorded, not taken for agreement");
+        let answer = &diff.upsert_edges[0];
+        assert_ne!(answer.id, structural, "a name key and a qualified-name key never share an edge id");
+        assert_ne!(answer.to_id, placeholder, "nor a placeholder id");
+        assert_eq!(answer.from_id, run);
+        assert_eq!(answer.kind, EdgeKind::Calls);
+        assert!(
+            diff.delete_edge_ids.contains(&structural),
+            "the structural edge the answer contradicts is retracted: {:?}",
+            diff.delete_edge_ids
+        );
+    }
+
     /// A call landing on a function is recorded wherever in it the answer
     /// points: only a non-function target is held to its name.
     ///
@@ -4013,6 +4076,9 @@ mod tests {
     enum Declares {
         Nothing,
         Function,
+        /// `export const n = make()`: a Variable, the GM-596 shape.
+        Variable,
+        Type,
         Placeholder,
     }
 
@@ -4027,6 +4093,16 @@ mod tests {
                     NodeSpec::new(NodeKind::Function, "n", "n", line_range(0))
                         .native_kind("function")
                         .public(),
+                );
+            }
+            Declares::Variable => {
+                builder.add_node(
+                    NodeSpec::new(NodeKind::Variable, "n", "n", line_range(0)).native_kind("const").public(),
+                );
+            }
+            Declares::Type => {
+                builder.add_node(
+                    NodeSpec::new(NodeKind::Type, "n", "n", line_range(0)).native_kind("class").public(),
                 );
             }
             Declares::Placeholder => {
@@ -4092,6 +4168,18 @@ mod tests {
         target: PlaceholderTarget,
         sites: &[(OpenSiteKind, Replaces, u32)],
     ) {
+        using_file_by(index, EdgeKind::Calls, kind, target, sites);
+    }
+
+    /// [`using_file`] with an `edge_kind` edge (and sites) in place of
+    /// `CALLS`.
+    fn using_file_by(
+        index: &mut SdkIndex,
+        edge_kind: EdgeKind,
+        kind: PlaceholderKind,
+        target: PlaceholderTarget,
+        sites: &[(OpenSiteKind, Replaces, u32)],
+    ) {
         let u = RelPath::new("u.toy");
         let mut builder = FileGraphBuilder::new("toy", "toy-parser", &u);
         builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 4, col: 0 } });
@@ -4099,14 +4187,14 @@ mod tests {
             NodeSpec::new(NodeKind::Function, "f", "f", line_range(0)).native_kind("function").public(),
         );
         let placeholder = builder.add_placeholder(kind, "n", target, line_range(1));
-        let edge = builder.placeholder_edge(EdgeKind::Calls, &f, &placeholder);
+        let edge = builder.placeholder_edge(edge_kind, &f, &placeholder);
         for (site_kind, replaces, line) in sites {
             builder.open_site(OpenSite {
                 from_id: f.clone(),
                 position: Position { line: *line, col: 2 },
                 name: "n".to_string(),
                 kind: *site_kind,
-                edge_kind: EdgeKind::Calls,
+                edge_kind,
                 from_container: None,
                 replaces: match replaces {
                     Replaces::TheEdge => Some(edge.clone()),
@@ -4221,6 +4309,46 @@ mod tests {
                 (0..expected).map(|_| (OpenSiteKind::Reference, 1)).collect();
             assert_eq!(asked, want, "{case}");
             assert_eq!(unanswerable, 0, "a hop not asked is not unanswerable: {case}");
+        }
+    }
+
+    /// **GM-596.** Whether a hop is settled depends on the edge's kind as
+    /// well as on what `m.toy` declares as `n`: the linker lands a syntactic
+    /// edge on a name key only on a kind core's structural rule accepts -
+    /// `CALLS` on a `Function`, `SUPERTYPE_OF` on a `Type` or a `Function`,
+    /// any other kind on anything addressable. A hop the linker would leave
+    /// unlinked is asked; one it settles is not.
+    ///
+    /// Controls, each in `unsettled_hop`: `accepts` returns `true` for every
+    /// kind (the `CALLS`/`SUPERTYPE_OF` onto a Variable rows are not asked);
+    /// `accepts` applies the `CALLS` rule to every edge kind (the
+    /// `REFERENCES` onto a Variable row and the `SUPERTYPE_OF` onto a Type
+    /// row are asked).
+    #[test]
+    fn a_hop_onto_a_declaration_the_edge_kind_does_not_accept_is_asked() {
+        let cases = [
+            (EdgeKind::Calls, Declares::Variable, 1, "a call of an imported const"),
+            (EdgeKind::Calls, Declares::Function, 0, "a call of an imported function"),
+            (EdgeKind::SupertypeOf, Declares::Variable, 1, "a supertype named after a const"),
+            (EdgeKind::SupertypeOf, Declares::Type, 0, "a supertype that is a type"),
+            (EdgeKind::SupertypeOf, Declares::Function, 0, "a supertype that is a function"),
+            (EdgeKind::References, Declares::Variable, 0, "a reference to a const"),
+        ];
+        for (edge_kind, declares, expected, case) in cases {
+            let mut index = SdkIndex::new();
+            declaring_file(&mut index, declares);
+            using_file_by(
+                &mut index,
+                edge_kind,
+                PlaceholderKind::PendingSymbol,
+                file_name("m.toy", "n"),
+                &[(OpenSiteKind::Reference, Replaces::TheEdge, 1)],
+            );
+            let (asked, unanswerable) = asked_about_u(&index);
+            let want: Vec<(OpenSiteKind, u32)> =
+                (0..expected).map(|_| (OpenSiteKind::Reference, 1)).collect();
+            assert_eq!(asked, want, "{case} ({edge_kind:?} onto {declares:?})");
+            assert_eq!(unanswerable, 0, "{case}");
         }
     }
 

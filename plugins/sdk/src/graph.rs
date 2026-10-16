@@ -816,6 +816,59 @@ mod tests {
         }
     }
 
+    /// **GM-596.** A placeholder waiting on *name* `n` and one waiting on
+    /// *qualified name* `n` in the same scope wait on two different
+    /// addresses - the linker matches the first against names and the second
+    /// against qualified names - so they never share an id, in a file scope
+    /// or in a container scope. A name key renders exactly as it always has.
+    ///
+    /// Controls, each in `render_target`: drop the `=` sigil for a `File`
+    /// scope only (the file-scope pair collides); drop it for a `Container`
+    /// scope only (the container-scope pair collides).
+    #[test]
+    fn a_name_key_and_a_qualified_name_key_with_one_string_are_two_addresses() {
+        let target = |scope: TargetScope, key: TargetKey| PlaceholderTarget {
+            scope,
+            key,
+            from_container: None,
+            key_path: None,
+        };
+        let file = || TargetScope::File("src/x.ts".into());
+        let container = || TargetScope::Container("crate::m".into());
+        let name = || TargetKey::Name("handler".into());
+        let qualified = || TargetKey::QualifiedName("handler".into());
+        let at = RelPath::new("src/main.ts");
+
+        for (scope, by_name, by_qualified) in [
+            ("file", target(file(), name()), target(file(), qualified())),
+            ("container", target(container(), name()), target(container(), qualified())),
+        ] {
+            assert_ne!(
+                render_target(&by_name),
+                render_target(&by_qualified),
+                "{scope} scope: one label for two addresses"
+            );
+            assert_ne!(
+                placeholder_id(&at, PlaceholderKind::PendingSymbol, &by_name),
+                placeholder_id(&at, PlaceholderKind::PendingSymbol, &by_qualified),
+                "{scope} scope: one id for two addresses"
+            );
+            let mut graph = FileGraphBuilder::new("toy", "toy-parser", &at);
+            let a = graph.add_placeholder(PlaceholderKind::PendingSymbol, "handler", by_name, range(1, 1));
+            let b =
+                graph.add_placeholder(PlaceholderKind::PendingSymbol, "handler", by_qualified, range(2, 2));
+            assert_ne!(a, b, "{scope} scope: the builder merged two placeholders");
+            assert_eq!(graph.finish().nodes.len(), 2, "{scope} scope: both placeholders are kept");
+        }
+
+        assert_eq!(render_target(&target(file(), name())), "src/x.ts#handler", "a name key is unchanged");
+        assert_eq!(
+            render_target(&target(container(), name())),
+            "crate::m::handler",
+            "a name key is unchanged"
+        );
+    }
+
     /// **GM-378.** And the id is that address and nothing else, so a caller
     /// can know it before it has decided which use site the row describes -
     /// which is what [`placeholder_id`] is for.
