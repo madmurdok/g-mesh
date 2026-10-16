@@ -2614,11 +2614,15 @@ fn record_answer(
             // the server pointed at that node's own name: a const-bound
             // function or a tuple-struct constructor. Pointing inside it at
             // something without a node (a field, an object-literal method)
-            // names the encloser, which is not what is called.
+            // names the encloser, which is not what is called. A function
+            // landing on the caller itself is the same fallback (a nested
+            // fn, a local, a destructured binding has no node, so the
+            // caller encloses it) unless it points at the caller's own
+            // name, which is recursion (GM-593).
             let landed = target.filter(|(path, node, location)| {
                 agree
                     && (site.edge_kind != EdgeKind::Calls
-                        || node.kind == NodeKind::Function
+                        || (node.kind == NodeKind::Function && node.id != site.from_id)
                         || lands_on_name(index, path, wire_position(index, path, encoding, location), node))
             });
             let Some((_, node, _)) = landed else {
