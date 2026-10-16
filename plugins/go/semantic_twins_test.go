@@ -277,6 +277,11 @@ func TestSemanticPassAddressesBuildTagTwinsByTheHostBuiltFile(t *testing.T) {
 		// T5: a method with a receiver and an interface method are twins.
 		"app/app.go:UseBinder CALLS file:lib/binding.go#Binder.Bind",
 		"app/app.go:UseCodec CALLS file:lib/binding.go#Codec.Encode",
+		// GM-589: a structural use of a twinned name (lib.New(), a
+		// placeholder CALLS edge core refuses) is re-answered onto the
+		// host-built twin. Twinned uses whose declaring file is not
+		// host-built (UseLegacy's lib.Legacy and its siblings) are left.
+		"app/app.go:UseBinder CALLS file:lib/binding.go#New",
 		// T2: names declared once keep the container address. Codec.Name
 		// is also declared by an ignored `package main` file, Codec.Size by
 		// an ignored test file: neither makes a twin.
