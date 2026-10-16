@@ -273,6 +273,44 @@ mod tests {
         assert!(!scopes.binds("Some"));
     }
 
+    /// Binds every arm pattern of the first `match` in `source`, the way
+    /// `match_arm` does: each named child of the arm's `match_pattern`.
+    fn bound_arms(source: &str) -> Scopes {
+        bound(source, "match_block", |scopes, block, source| {
+            let mut arms = block.walk();
+            for arm in block.named_children(&mut arms).filter(|arm| arm.kind() == "match_arm") {
+                let pattern = arm.child_by_field_name("pattern").unwrap();
+                let mut cursor = pattern.walk();
+                for child in pattern.named_children(&mut cursor) {
+                    scopes.bind_pattern(child, source);
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_path_pattern_binds_nothing_and_its_sub_patterns_still_do() {
+        let scopes = bound_arms("fn f() { match x { E::A => {}, E::B(y) => {}, E::D | m::E::F => {} } }");
+        for name in ["E", "A", "B", "D", "m", "F"] {
+            assert!(!scopes.binds(name), "{name} names a variant or its path, not a binding");
+        }
+        assert!(scopes.binds("y"));
+    }
+
+    /// `E::<u8>::C` is a `scoped_identifier`; a turbofish after the last
+    /// segment (`None::<u8>`, `E::D::<u8>`) is a `generic_pattern`, whose
+    /// path may be a bare `identifier` that the walk would otherwise bind.
+    #[test]
+    fn a_turbofish_path_pattern_binds_nothing() {
+        let source = "fn f() { match x { E::<u8>::C => {}, None::<u8> => {}, E::D::<u8> => {} } }";
+        let tree = parse(source);
+        assert_eq!(first(&tree, "generic_pattern").named_child(0).unwrap().kind(), "identifier");
+        let scopes = bound_arms(source);
+        for name in ["E", "C", "None", "D"] {
+            assert!(!scopes.binds(name), "{name} names a variant or its path, not a binding");
+        }
+    }
+
     #[test]
     fn parameters_bind_their_patterns_and_self() {
         let scopes = bound(
