@@ -269,6 +269,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run scripts/test-install.sh
         run: bash scripts/test-install.sh
+      # release.yml's test gate and the smoke/architecture guards of the
+      # release build, offline: the GitHub API is a stub, so no token or
+      # network. The Mach-O cases run on macos-15 only (they need lipo).
+      - name: Run scripts/test-ci-green-for-commit.sh
+        run: bash scripts/test-ci-green-for-commit.sh
 
   test:
     name: tests (${{ matrix.target }})
