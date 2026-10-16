@@ -2994,7 +2994,10 @@ fn record_implementor(
 /// that reaches `anchor`: it targets the anchor's node, core linked it onto
 /// that node, or its placeholder target is the anchor's own scope with a
 /// `name` key equal to the anchor's `qualifiedName`. The last holds without
-/// the linked map, which a pass that did not link the file lacks.
+/// the linked map, which a pass that did not link the file lacks, but only
+/// while core has not linked the edge onto a different node: a placeholder
+/// core resolved elsewhere names another type that shares the anchor's
+/// name, and the semantic answer is the one to keep.
 fn supertype_reaches(index: &SdkIndex, path: &RelPath, from_id: &str, anchor: &WireNode) -> bool {
     let Some(graph) = index.graph(path) else { return false };
     let scope = address_of(anchor, None).scope;
@@ -3013,7 +3016,7 @@ fn supertype_reaches(index: &SdkIndex, path: &RelPath, from_id: &str, anchor: &W
             && edge.from_id == from_id
             && (edge.to_id == anchor.id
                 || index.linked_target(&edge.id) == Some(anchor.id.as_str())
-                || name_keyed_on_anchor(&edge.to_id))
+                || (index.linked_target(&edge.id).is_none() && name_keyed_on_anchor(&edge.to_id)))
     })
 }
 
