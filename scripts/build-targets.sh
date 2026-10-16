@@ -95,7 +95,10 @@
 # (GOOS/GOARCH, CGO_ENABLED=0 - see scripts/bundle-go-plugin.sh); the other
 # three are built on their target's own runner. Every part of
 # an archive has to be for the *same* platform, which is why each target is
-# built on its own runner (see .github/workflows/release.yml) - the JS/TS,
+# built on its own runner (see .github/workflows/release.yml; since GM-613
+# the one exception is x86_64 macOS, cross-built on the arm64 macOS runner,
+# its architecture asserted with `lipo` and its smoke checks run under
+# Rosetta - scripts/lib/runnable.sh) - the JS/TS,
 # Rust and Python plugins are built the same way core itself is (`rustup
 # target add` + `cargo build --target`, on that target's own runner) rather
 # than through a second, plugin-specific cross-build path - see
@@ -127,6 +130,8 @@ SUPPORTED_TARGETS=(
 BUNDLED_PLUGINS=(typescript go rust python)
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/runnable.sh
+. "$REPO_ROOT/scripts/lib/runnable.sh"
 DIST_DIR="${DIST_DIR:-$REPO_ROOT/dist}"
 CARGO_PROFILE="${CARGO_PROFILE:-release}"
 
@@ -289,6 +294,10 @@ build_one() {
 	rm -rf "$stage_dir"
 	mkdir -p "$stage_dir"
 	cp "$built" "$stage_dir/$bin_name"
+	# GM-613: on a macOS target, the staged binary must be exactly that
+	# target's architecture - the x86_64 one is cross-built on arm64 and run
+	# under Rosetta, which would also run a mislabelled arm64 binary.
+	assert_macho_arch "$stage_dir/$bin_name" "$target"
 	# License texts must travel with the binary (MIT OR Apache-2.0 both require
 	# the notice be distributed); the README explains `g-mesh model fetch`,
 	# which a downloaded binary needs before `search_code` works.
@@ -321,10 +330,12 @@ build_one() {
 
 	(cd "$DIST_DIR" && sha256_of "$(basename "$archive_path")" >"$(basename "$archive_path").sha256")
 
-	# Only meaningful when we built for the machine we are standing on. A
-	# cross-built binary cannot be executed here, so this stays a native-only
-	# check rather than a silently skipped one that looks like it passed.
-	if [ "$target" = "$host" ]; then
+	# Only meaningful where the staged binary can be executed: natively, or
+	# (GM-613) x86_64 macOS under Rosetta on an arm64 Mac - see
+	# scripts/lib/runnable.sh. Elsewhere it is skipped, and with
+	# G_MESH_REQUIRE_SMOKE=1 (release.yml) a skip fails the build rather than
+	# looking like it passed.
+	if can_run_target "$target" "$host"; then
 		log "smoke test: $bin_name --version"
 		local reported
 		reported="$("$stage_dir/$bin_name" --version)"
@@ -367,7 +378,7 @@ build_one() {
 				die "the staged binary does not discover the python plugin staged beside it"
 		fi
 	else
-		log "smoke test skipped: $target is not the host ($host)"
+		smoke_skip_or_die "the staged binary's --version and plugins list checks" "$target" "$host"
 	fi
 
 	log "artifact: $archive_path"

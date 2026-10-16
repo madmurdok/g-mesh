@@ -469,7 +469,9 @@ origin_slug() {
 # `merge_rev` defaults to `main`; it is a parameter so this can be checked
 # against an earlier release's merge commit by sourcing this file.
 #
-# The name of ci.yml's `full-suite` job; the two must stay equal.
+# The name of ci.yml's `full-suite` job. Must stay equal to ci.yml's job name
+# and to CI_FULL_SUITE_JOB in scripts/ci-green-for-commit.sh (GM-613), which
+# asks release.yml's question with the same query.
 CI_FULL_SUITE_JOB="Full test suite ran"
 check_release_branch_ci_passed() {
 	local version="$1" merge_rev="${2:-main}"
