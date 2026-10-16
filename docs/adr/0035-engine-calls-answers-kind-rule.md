@@ -39,7 +39,9 @@ or const around it, the encloser.
 - A `qualifiedName` shared by a function and a type (TS declaration merging)
   still links the function; one shared by a const and a type links the const.
 - Rust tuple-variant constructors (`Enum::Variant(..)`) have no node and land
-  on the enum away from its name, so they stay unlinked.
+  on the enum away from its name, so they stay unlinked. (GM-594: the 3 that
+  linked on ripgrep came from a unit-variant path pattern over-binding the
+  enum's name, fixed in the Rust plugin.)
 - Python `Foo()` and TS `new Foo()` on a class with no explicit constructor
   now produce `CALLS` onto the class, so `find_callers` on a class lists its
   constructions, which some users read as "references". None measured on

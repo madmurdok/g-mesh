@@ -57,6 +57,12 @@
 //! variant it names is worth an edge in principle, but telling a unit variant
 //! from a binding needs name resolution, and guessing either way here would
 //! trade a missing edge for a wrong one.
+//!
+//! Over-binding a *type* name costs more than a missing edge, though:
+//! `resolve_type_qualified` treats a bound qualifier as a generic parameter
+//! and opens its paths, and the engine then answers what the qualifier is,
+//! not what is called. So a form that is exactly known not to bind - a path
+//! pattern (`E::A`) - is skipped, never walked.
 
 use std::collections::HashMap;
 
@@ -123,7 +129,7 @@ impl Scopes {
     /// Walks the pattern rather than matching each of the dozen pattern node
     /// kinds, because the ones that *do not* bind are the short list: a
     /// pattern's own type path (`Some(x)`, `Point { x }`), a struct pattern's
-    /// field names, literals, and `_`.
+    /// field names, a path pattern (`E::A`), literals, and `_`.
     pub(crate) fn bind_pattern(&mut self, pattern: Node, source: &str) {
         match pattern.kind() {
             "identifier" => self.bind(text(pattern, source)),
@@ -132,6 +138,11 @@ impl Scopes {
             // which the generic recursion below reaches as an `identifier`.
             "shorthand_field_identifier" => self.bind(text(pattern, source)),
             "field_identifier" => {}
+            // A path in pattern position (`E::A =>`, `E::<T>::A`) names a
+            // variant or a constant and never binds. Binding its segments
+            // would make a type name a local, which opens every `Type::x`
+            // path in the arm to the semantic tier at the qualifier.
+            "scoped_identifier" | "generic_pattern" => {}
             _ => {
                 let mut cursor = pattern.walk();
                 for child in pattern.named_children(&mut cursor) {
