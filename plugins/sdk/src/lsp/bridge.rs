@@ -1185,7 +1185,33 @@ fn unsettled_hop(index: &SdkIndex, graph: &crate::graph::FileGraph, replaced: &s
         EdgeKind::SupertypeOf => matches!(kind, NodeKind::Type | NodeKind::Function),
         _ => true,
     };
-    !declaring.graph.nodes.iter().any(|node| node.name == *name && is_addressable(node) && accepts(node.kind))
+    let nodes = &declaring.graph.nodes;
+    let named: Vec<&WireNode> =
+        nodes.iter().filter(|node| node.name == *name && is_addressable(node)).collect();
+    // As core's `drop_type_members`, before the kind rule: a name key in a
+    // file scope addresses a module-level declaration, so type members go
+    // whenever a non-member shares the name. Otherwise a method
+    // `Router#handler` would settle the call of a const `handler`.
+    let members: Vec<bool> = named.iter().map(|node| is_type_member(nodes, node)).collect();
+    let keep_members = members.iter().all(|member| *member);
+    !named.iter().zip(&members).any(|(node, member)| (keep_members || !member) && accepts(node.kind))
+}
+
+/// Whether `node` is a member of a type `graph` declares: the parent of its
+/// `qualifiedPath`, or of one of its alias paths, is the `qualifiedName` of
+/// a `Type` node in the same file. Mirrors core's `is_type_member` for a
+/// candidate without a container; a receiver type in another file of a Go
+/// package is not seen here, which only leaves such a hop settled.
+fn is_type_member(graph: &[WireNode], node: &WireNode) -> bool {
+    node.qualified_path
+        .iter()
+        .chain(&node.alias_paths)
+        .filter(|path| path.len() >= 2)
+        .filter_map(|path| path.head())
+        .any(|parent| {
+            let parent = parent.display();
+            graph.iter().any(|ty| ty.kind == NodeKind::Type && ty.qualified_name == parent)
+        })
 }
 
 /// The declarations an [`OpenSiteKind::OverloadCall`] site may be bound to,
