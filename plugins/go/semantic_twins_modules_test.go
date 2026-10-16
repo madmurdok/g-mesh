@@ -88,6 +88,17 @@ type twinListingRun struct {
 // returns the rendered answers, every twin listing, and the whole log.
 func modulesPass(t *testing.T, files map[string]string, scope []string) ([]string, []twinListingRun, []string) {
 	t.Helper()
+	got, listings, lines, reason := modulesPassAllowingIncomplete(t, files, scope)
+	if reason != "" {
+		t.Fatalf("pass over %v answered incomplete: %s", scope, reason)
+	}
+	return got, listings, lines
+}
+
+// modulesPassAllowingIncomplete is modulesPass that returns the pass's
+// incomplete reason instead of failing on it.
+func modulesPassAllowingIncomplete(t *testing.T, files map[string]string, scope []string) ([]string, []twinListingRun, []string, string) {
+	t.Helper()
 	requireGoToolchain(t)
 	realGo, err := exec.LookPath("go")
 	if err != nil {
@@ -102,9 +113,6 @@ func modulesPass(t *testing.T, files map[string]string, scope []string) ([]strin
 	t.Setenv("GOFLAGS", "")
 
 	diff, reason, _ := newPluginState(root).handleSemanticPass(scope)
-	if reason != "" {
-		t.Fatalf("pass over %v answered incomplete: %s", scope, reason)
-	}
 	got, _ := renderTwinEdges(t, root, diff)
 
 	realRoot, err := filepath.EvalSymlinks(root)
@@ -139,7 +147,7 @@ func modulesPass(t *testing.T, files map[string]string, scope []string) ([]strin
 		}
 		listings = append(listings, twinListingRun{dir: filepath.ToSlash(rel), patterns: patterns, line: line})
 	}
-	return got, listings, lines
+	return got, listings, lines, reason
 }
 
 func edgesFrom(edges []string, prefix string) []string {
@@ -253,5 +261,88 @@ func TestLoadReferencedTwinsSkipsAModuleThatReferencesNothing(t *testing.T) {
 
 	if len(listings) != 1 || listings[0].dir != "nested" {
 		t.Fatalf("want exactly one twin listing, from nested; got:\n  %s", listingDump(listings))
+	}
+}
+
+// forkedRoot: root requires example.com/root/nested but replaces it with an
+// in-repo fork, so one import path has two file sets. nested's own view
+// twins only Y; the fork's view twins only X.
+//
+//	nested/lib/b.go        //go:build !tagx  X, Y
+//	nested/lib/b_x.go      //go:build tagx   Y        -> twins {Y}
+//	nested-fork/lib/b.go   //go:build !tagx  X, Y
+//	nested-fork/lib/b_x.go //go:build tagx   X        -> twins {X}
+func forkedRoot() map[string]string {
+	const both = "package lib\n\nfunc X() string { return \"x\" }\n\nfunc Y() string { return \"y\" }\n"
+	const use = "\"example.com/root/nested/lib\"\n\n"
+	return map[string]string{
+		"go.mod": "module example.com/root\n\ngo 1.22\n\nrequire example.com/root/nested v0.0.0\n\n" +
+			"replace example.com/root/nested => ./nested-fork\n",
+		"app/app.go":             "package app\n\nimport " + use + "func Use() string { return lib.X() + lib.Y() }\n",
+		"nested/go.mod":          "module example.com/root/nested\n\ngo 1.22\n",
+		"nested/lib/b.go":        "//go:build !tagx\n\n" + both,
+		"nested/lib/b_x.go":      "//go:build tagx\n\npackage lib\n\nfunc Y() string { return \"yx\" }\n",
+		"nested/use/u.go":        "package use\n\nimport " + use + "func U() string { return lib.X() + lib.Y() }\n",
+		"nested-fork/go.mod":     "module example.com/root/nested\n\ngo 1.22\n",
+		"nested-fork/lib/b.go":   "//go:build !tagx\n\n" + both,
+		"nested-fork/lib/b_x.go": "//go:build tagx\n\npackage lib\n\nfunc X() string { return \"xx\" }\n",
+	}
+}
+
+// 6. Per-file listings of one package path union the module views: root
+// lists nested/lib through the fork (twins {X}), nested lists its own copy
+// (twins {Y}); a name twinned in any view is twinned, so all four answers
+// onto X and Y are file-scoped whichever listing ran last.
+func TestLoadReferencedTwinsUnionsModuleViews(t *testing.T) {
+	got, listings, _ := modulesPass(t, forkedRoot(), []string{"app/app.go", "nested/use/u.go"})
+
+	if len(listings) != 2 {
+		t.Fatalf("sanity: ran %d twin listings, want 2 (root and nested):\n  %s", len(listings), listingDump(listings))
+	}
+	for _, l := range listings {
+		if (l.dir != "." && l.dir != "nested") || !containsString(l.patterns, nestedLib) {
+			t.Fatalf("sanity: want one listing of %s from . and one from nested; got:\n  %s", nestedLib, listingDump(listings))
+		}
+	}
+	if listings[0].dir == listings[1].dir {
+		t.Fatalf("sanity: both listings ran from %s:\n  %s", listings[0].dir, listingDump(listings))
+	}
+	for _, want := range []string{
+		"app/app.go:Use CALLS file:nested-fork/lib/b.go#X",
+		"app/app.go:Use CALLS file:nested-fork/lib/b.go#Y",
+		"nested/use/u.go:U CALLS file:nested/lib/b.go#Y",
+		"nested/use/u.go:U CALLS file:nested/lib/b.go#X",
+	} {
+		if !containsString(got, want) {
+			t.Errorf("did not produce %s; got\n  %s\nlistings:\n  %s", want, strings.Join(got, "\n  "), listingDump(listings))
+		}
+	}
+}
+
+// brokenNestedGoMod still declares nested's module path, so root's replace
+// resolves it (a dependency's go.mod is parsed laxly), but `go` refuses it
+// as the main module: nested's own load fails.
+const brokenNestedGoMod = "module example.com/root/nested\n\ngo 1.22\n\nnot a directive\n"
+
+// 7. A whole-project pass in which a nested module fails to load folds none
+// of its packages, so it lists the referenced ones like a per-file pass:
+// root's answer onto the nested twin stays file-scoped.
+func TestSemanticWholePassListsTwinsOfAFailedNestedModule(t *testing.T) {
+	files := requiringRoot()
+	files["nested/go.mod"] = brokenNestedGoMod
+	got, listings, _, reason := modulesPassAllowingIncomplete(t, files, nil)
+
+	if !strings.Contains(reason, "nested") {
+		t.Fatalf("sanity: want the pass incomplete naming nested; reason %q", reason)
+	}
+	if len(edgesFrom(got, "app/app.go:")) == 0 {
+		t.Fatalf("sanity: root did not load (no app/app.go answers); reason %q", reason)
+	}
+	if len(listings) != 1 || listings[0].dir != "." || !containsString(listings[0].patterns, nestedLib) {
+		t.Errorf("want exactly one twin listing of %s, from .; got:\n  %s", nestedLib, listingDump(listings))
+	}
+	want := "app/app.go:Use CALLS file:nested/lib/b.go#Binder.Bind"
+	if !containsString(got, want) {
+		t.Errorf("did not produce %s; got\n  %s", want, strings.Join(got, "\n  "))
 	}
 }
