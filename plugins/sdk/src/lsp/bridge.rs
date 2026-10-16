@@ -4378,6 +4378,61 @@ mod tests {
         }
     }
 
+    /// **GM-596.** Whether a `CALLS` hop to `handler` is settled follows the
+    /// linker's `Resolver::choose` order: type members go whenever a
+    /// non-member shares the name, and only then does the kind rule apply.
+    /// So `Router#handler` (a Function member) does not settle a call of
+    /// `export const handler = make()`, but settles it when it is the only
+    /// `handler`, and a top-level `function handler` settles it beside the
+    /// member.
+    ///
+    /// Control in `unsettled_hop`: replace `(keep_members || !member) &&
+    /// accepts(..)` with `accepts(..)` (the const-plus-member row is then
+    /// settled, so not asked).
+    #[test]
+    fn a_hop_by_name_drops_type_members_before_the_kind_rule() {
+        let cases = [
+            (Some(NodeKind::Variable), 1, "a const beside a method of the same name"),
+            (None, 0, "a method alone"),
+            (Some(NodeKind::Function), 0, "a function beside a method of the same name"),
+        ];
+        for (top_level, expected, case) in cases {
+            let mut index = SdkIndex::new();
+            let m = RelPath::new("m.toy");
+            let mut builder = FileGraphBuilder::new("toy", "toy-parser", &m);
+            builder.file_node(line_range(0));
+            builder.add_node(
+                NodeSpec::new(NodeKind::Type, "Router", "Router", line_range(0))
+                    .native_kind("class")
+                    .public(),
+            );
+            let member = g_mesh_wire::QualifiedPath::root("Router").child("#", "handler");
+            builder.add_node(
+                NodeSpec::with_path(NodeKind::Function, "handler", member, line_range(0))
+                    .native_kind("method")
+                    .public(),
+            );
+            if let Some(kind) = top_level {
+                builder.add_node(
+                    NodeSpec::new(kind, "handler", "handler", line_range(0)).native_kind("const").public(),
+                );
+            }
+            index.insert(m, "class Router {}\n".to_string(), builder.finish());
+            using_file_by(
+                &mut index,
+                EdgeKind::Calls,
+                PlaceholderKind::PendingSymbol,
+                file_name("m.toy", "handler"),
+                &[(OpenSiteKind::Reference, Replaces::TheEdge, 1)],
+            );
+            let (asked, unanswerable) = asked_about_u(&index);
+            let want: Vec<(OpenSiteKind, u32)> =
+                (0..expected).map(|_| (OpenSiteKind::Reference, 1)).collect();
+            assert_eq!(asked, want, "{case}");
+            assert_eq!(unanswerable, 0, "{case}");
+        }
+    }
+
     /// A `Reference` site with no `replaces`, a `ReceiverCall` and a
     /// `ReceiverField` (GM-497) are asked whatever the placeholder looks
     /// like: the hop rule is about a `Reference`'s `replaces`. Control for
