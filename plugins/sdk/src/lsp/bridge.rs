@@ -2049,6 +2049,28 @@ fn node_at<'i>(
     is_addressable(node).then_some((path, node))
 }
 
+/// The one node a multi-location answer names, counting only the locations
+/// that sit at their node's own name ([`lands_on_name`]); `None` when none
+/// does or when they name different nodes.
+///
+/// For a `CALLS` answer whose locations disagree in [`record_answer`]: a
+/// location inside a body (a call signature declared in another function)
+/// names no declaration, so it is no evidence against the one that does.
+fn named_landing<'i, 'l>(
+    index: &'i SdkIndex,
+    roots: [&Path; 2],
+    encoding: PositionEncoding,
+    found: &'l [ServerLocation],
+) -> Option<(RelPath, &'i WireNode, &'l ServerLocation)> {
+    let mut named = found.iter().filter_map(|location| {
+        let (path, node) = node_at(index, roots, encoding, location)?;
+        lands_on_name(index, &path, wire_position(index, &path, encoding, location), node)
+            .then_some((path, node, location))
+    });
+    let first = named.next()?;
+    named.all(|(_, node, _)| node.id == first.1.id).then_some(first)
+}
+
 /// Whether `at` (wire columns) is where `node` names itself: the start of
 /// the first whole-word occurrence of its name at or after the start of its
 /// range. A definition answer points at a declaration's name, and a node's
@@ -2652,6 +2674,18 @@ fn record_answer(
                     None => target = Some((path, node, location)),
                 }
             }
+            // A call onto a const-bound function produced elsewhere (a
+            // factory's result, `const f = throttle(g)`) is answered with two
+            // locations: the const's name, and the call signature's own
+            // declaration inside the factory, which TypeScript adds when the
+            // signature is not declared by the symbol itself. Only the first
+            // names a declaration, so a disagreeing `CALLS` answer is read
+            // again keeping only the locations at their node's own name; one
+            // node left is the target. `cfg` and overload twins all sit at
+            // names and still disagree, which records nothing.
+            if !agree && site.edge_kind == EdgeKind::Calls {
+                (target, agree) = (named_landing(index, roots, encoding, &found), true);
+            }
             if untyped_call_answered(index, roots, site, &found, agree && target.is_some()) {
                 *answers.untyped_answered.entry((site.from_id.clone(), site.name.clone())).or_default() += 1;
             }
@@ -2903,6 +2937,14 @@ fn trim_untyped_calls(
 /// what is written at that position and gets the implementing declaration -
 /// the same path an `impl` header at a file's top level already took, where
 /// `node_at` found only the `File` node.
+///
+/// # A structural edge that already says it wins
+///
+/// An implementor whose file holds a structural `SUPERTYPE_OF` edge from the
+/// same node that reaches the anchor ([`supertype_reaches`]) is accounted
+/// for and records nothing. The answer's qualified-name address never shares
+/// an id with a name-keyed placeholder, so recording it would leave two rows
+/// for one `impl` - see ADR 0035.
 fn record_implementor(
     answers: &mut Answers,
     index: &SdkIndex,
@@ -2926,6 +2968,10 @@ fn record_implementor(
         // written at it - see this function's own doc.
         return false;
     }
+    if supertype_reaches(index, &path, &node.id, &anchor_node) {
+        // The structural edge already says this; see this function's doc.
+        return true;
+    }
     let (from_id, at, container) = (node.id.clone(), node.range.start, node.container.clone());
     answers.record(
         for_file,
@@ -2942,6 +2988,33 @@ fn record_implementor(
         None,
     );
     true
+}
+
+/// Whether `path`'s structural graph has a `SUPERTYPE_OF` edge from `from_id`
+/// that reaches `anchor`: it targets the anchor's node, core linked it onto
+/// that node, or its placeholder target is the anchor's own scope with a
+/// `name` key equal to the anchor's `qualifiedName`. The last holds without
+/// the linked map, which a pass that did not link the file lacks.
+fn supertype_reaches(index: &SdkIndex, path: &RelPath, from_id: &str, anchor: &WireNode) -> bool {
+    let Some(graph) = index.graph(path) else { return false };
+    let scope = address_of(anchor, None).scope;
+    let name_keyed_on_anchor = |to_id: &str| {
+        graph.nodes.iter().any(|node| {
+            node.id == to_id
+                && node.native_kind.as_deref() == Some("pending_symbol")
+                && node.target.as_ref().is_some_and(|target| {
+                    target.scope == scope
+                        && matches!(&target.key, TargetKey::Name(name) if *name == anchor.qualified_name)
+                })
+        })
+    };
+    graph.edges.iter().any(|edge| {
+        edge.kind == EdgeKind::SupertypeOf
+            && edge.from_id == from_id
+            && (edge.to_id == anchor.id
+                || index.linked_target(&edge.id) == Some(anchor.id.as_str())
+                || name_keyed_on_anchor(&edge.to_id))
+    })
 }
 
 impl SemanticEngine for LspBridge {
