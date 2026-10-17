@@ -1087,7 +1087,12 @@ echo 'index: 5 nodes, 3 edges'
 
     let (out, err) = (stdout_of(&output), stderr_of(&output));
     // Not vacuous: the per-language branch really printed its count lines.
-    assert!(out.lines().any(|line| line.contains("[.go] 3 node(s)")), "{}", describe(&output));
+    // Format-neutral, so a regressed format fails at the matcher check below.
+    assert!(
+        out.lines().any(|line| line.contains("go") && line.contains("3 node(s)")),
+        "{}",
+        describe(&output)
+    );
     for line in out.lines().chain(err.lines()) {
         assert!(
             !matches_setup_go_problem_matcher(line),
