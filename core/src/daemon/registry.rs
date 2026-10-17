@@ -381,6 +381,17 @@ pub(crate) enum ReconcileMode {
     Seeded,
 }
 
+/// Which files [`PluginRegistry::reconcile_since_index`] compares with the
+/// disk, and so what its log line names as the trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileScope<'a> {
+    /// The whole project, at daemon start.
+    Start,
+    /// The subtrees whose events the OS dropped (GM-616): project-relative
+    /// directories, forward-slash separated, `""` being the root.
+    Rescan(&'a [String]),
+}
+
 /// Every file the index holds anything for: an `indexed_files` baseline or a
 /// `File` node. The live side of [`PluginRegistry::reconcile_since_index`].
 fn live_file_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>> {
@@ -1310,8 +1321,18 @@ impl PluginRegistry {
                 return;
             }
         };
+        let newer = self.gitignores_newer_than(indexed_at);
+        if !newer.is_empty() {
+            self.gitignore_changed(conn, &newer, &[]);
+        }
+    }
+
+    /// The project-relative `.gitignore` files (the bulk walk's, with the
+    /// directories every language excludes pruned) whose mtime, in whole
+    /// seconds since the epoch, is strictly greater than `secs`.
+    pub(crate) fn gitignores_newer_than(&self, secs: i64) -> Vec<String> {
         let pruned = self.discovered.excluded_by_every_language();
-        let newer: Vec<String> = crate::project_walk::gitignore_files(&self.project_root, &pruned)
+        crate::project_walk::gitignore_files(&self.project_root, &pruned)
             .filter(|file| {
                 fs::metadata(&file.path)
                     .and_then(|metadata| metadata.modified())
@@ -1321,13 +1342,37 @@ impl PluginRegistry {
                     // a file written in the walk's own last second is taken
                     // as walked (an edit landing there is missed until the
                     // next `.gitignore` event).
-                    .is_some_and(|since_epoch| since_epoch.as_secs() as i64 > indexed_at)
+                    .is_some_and(|since_epoch| since_epoch.as_secs() as i64 > secs)
             })
             .map(|file| file.relative)
-            .collect();
-        if !newer.is_empty() {
-            self.gitignore_changed(conn, &newer, &[]);
+            .collect()
+    }
+
+    /// GM-616: reconciles `subtrees` (project-relative, `""` the root) after
+    /// the OS dropped events under them. Runs on the watcher's consumer
+    /// thread, from `daemon::watch_and_route_once` when its
+    /// [`RescanScheduler`](crate::watcher::rescan::RescanScheduler) says a
+    /// run is due:
+    ///
+    /// 1. reloads the watcher's ignore layers and link table, since a dropped
+    ///    `.gitignore` or link event would otherwise leave them stale;
+    /// 2. passes the links the reload changed, and the `.gitignore` files
+    ///    whose mtime is newer than `gitignores_since` (unix seconds; the
+    ///    previous run's start), to [`gitignore_changed`](Self::gitignore_changed);
+    /// 3. runs the [`ReconcileMode::Plain`] reconcile over `subtrees`.
+    pub(crate) fn rescan_subtrees(
+        &self,
+        conn: &IndexStore,
+        subtrees: &[String],
+        watcher: &crate::watcher::ProjectWatcher,
+        gitignores_since: i64,
+    ) {
+        let links = watcher.reload_ignores();
+        let gitignores = self.gitignores_newer_than(gitignores_since);
+        if !gitignores.is_empty() || !links.is_empty() {
+            self.gitignore_changed(conn, &gitignores, &links);
         }
+        self.reconcile_since_index(conn, ReconcileMode::Plain, ReconcileScope::Rescan(subtrees));
     }
 
     /// At daemon start on an indexed project, brings every file
@@ -1375,6 +1420,7 @@ impl PluginRegistry {
         &self,
         conn: &IndexStore,
         mode: ReconcileMode,
+        scope: ReconcileScope<'_>,
     ) -> BTreeMap<String, Vec<String>> {
         let mut reparsed: BTreeMap<String, Vec<String>> = BTreeMap::new();
         match conn.with(schema::bulk_indexed_at_unix) {
@@ -1386,7 +1432,7 @@ impl PluginRegistry {
             }
         }
         let started = std::time::Instant::now();
-        let live = match conn.with(live_file_paths) {
+        let mut live = match conn.with(live_file_paths) {
             Ok(live) => live,
             Err(err) => {
                 crate::log_line!(
@@ -1397,7 +1443,18 @@ impl PluginRegistry {
             }
         };
         let pruned = self.discovered.excluded_by_every_language();
-        let walked: Vec<String> = crate::project_walk::project_files(&self.project_root, &pruned)
+        let files: Box<dyn Iterator<Item = crate::project_walk::WalkedFile> + '_> = match scope {
+            ReconcileScope::Start => {
+                Box::new(crate::project_walk::project_files(&self.project_root, &pruned))
+            }
+            ReconcileScope::Rescan(subtrees) => {
+                // Only the live files under the rescanned subtrees can have
+                // been deleted or changed there.
+                live.retain(|file_path| crate::project_walk::under_any(file_path, subtrees));
+                Box::new(crate::project_walk::project_files_under(&self.project_root, &pruned, subtrees))
+            }
+        };
+        let walked: Vec<String> = files
             .filter(|file| {
                 self.discovered.indexing_language(&file.relative, file.real_relative.as_deref()).is_some()
             })
@@ -1464,10 +1521,22 @@ impl PluginRegistry {
                 );
             }
         }
+        let trigger = match scope {
+            ReconcileScope::Start if seeded => " of the seeded index".to_string(),
+            ReconcileScope::Start => String::new(),
+            ReconcileScope::Rescan(subtrees) => format!(
+                " after a dropped-event rescan of {}",
+                subtrees
+                    .iter()
+                    .map(|subtree| if subtree.is_empty() { "the project root" } else { subtree.as_str() })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         crate::log_line!(
             "g-mesh daemon: reconciled {} files{} with the disk in {} ms: {} deleted, {} created, {} reindexed",
             known.len() + created.len() + deleted.len() + unwalked.len(),
-            if seeded { " of the seeded index" } else { "" },
+            trigger,
             started.elapsed().as_millis(),
             deleted.len() + unwalked.len(),
             created.len(),

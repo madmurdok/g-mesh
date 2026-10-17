@@ -3,10 +3,11 @@ pub mod batch;
 pub mod burst;
 pub mod debounce;
 pub mod ignore_layers;
+pub mod rescan;
 pub mod staleness;
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -47,7 +48,12 @@ pub struct ProjectWatcher {
     // it couldn't cover. Held for the same reason as `_watcher` - dropping
     // it stops the poll loop.
     _poll_fallback: Option<PollWatcher>,
-    events: Receiver<PathBuf>,
+    events: Receiver<WatchSignal>,
+    // A sender into `events`, so a test can inject a Rescan without an
+    // FSEvents storm ([`Self::inject_rescan`]).
+    #[cfg(test)]
+    #[allow(dead_code)] // Until GM-616's tests slice drives `inject_rescan`.
+    test_events: Sender<WatchSignal>,
     root: PathBuf,
     // The layers and the link table, loaded by one walk. Swapped whole by
     // `reload_ignores` when a `.gitignore` or a link may have changed; read
@@ -89,11 +95,10 @@ impl ProjectWatcher {
         let (tx, rx) = channel();
         let mut watcher = {
             let tx = tx.clone();
+            let root = root.to_path_buf();
             notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 if let Ok(event) = res {
-                    for path in event.paths {
-                        let _ = tx.send(path);
-                    }
+                    forward_event(event, &root, &tx);
                 }
             })
         }
@@ -121,12 +126,11 @@ impl ProjectWatcher {
                 );
 
                 let tx = tx.clone();
+                let poll_root = root.to_path_buf();
                 let mut poll_watcher = PollWatcher::new(
                     move |res: notify::Result<notify::Event>| {
                         if let Ok(event) = res {
-                            for path in event.paths {
-                                let _ = tx.send(path);
-                            }
+                            forward_event(event, &poll_root, &tx);
                         }
                     },
                     Config::default().with_poll_interval(POLL_FALLBACK_INTERVAL),
@@ -146,6 +150,8 @@ impl ProjectWatcher {
             _watcher: watcher,
             _poll_fallback: poll_fallback,
             events: rx,
+            #[cfg(test)]
+            test_events: tx,
             root: root.to_path_buf(),
             ignores,
         })
@@ -221,15 +227,21 @@ impl ProjectWatcher {
         }
     }
 
-    /// Returns the next change to a non-ignored path, waiting up to
-    /// `timeout`, spelled as the walk lists it. `None` means either nothing
-    /// arrived in time or the watcher was dropped.
+    /// Returns the next change, waiting up to `timeout`, spelled as the walk
+    /// lists it. `None` means either nothing arrived in time or the watcher
+    /// was dropped.
     ///
-    /// The link table's remap runs before the ignore check: the real spelling
-    /// of a file reached only through a link is gitignored by construction,
-    /// so filtering first would drop every event for it. A path under a
-    /// refused link is dropped.
-    pub fn next_change(&self, timeout: Duration) -> Option<PathBuf> {
+    /// A [`Change::Path`] is a non-ignored path. The link table's remap runs
+    /// before the ignore check: the real spelling of a file reached only
+    /// through a link is gitignored by construction, so filtering first would
+    /// drop every event for it. A path under a refused link is dropped.
+    ///
+    /// A [`Change::Rescan`] goes through the remap only, never the ignore
+    /// check: it names a directory whose events the OS dropped (GM-616), and
+    /// the ignore layers do not judge directories that way. A rescan the
+    /// remap would drop, or one outside the root, is widened to the root, so
+    /// a dropped event is never lost with it.
+    pub fn next_change(&self, timeout: Duration) -> Option<Change> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -237,7 +249,7 @@ impl ProjectWatcher {
                 return None;
             }
             match self.events.recv_timeout(remaining) {
-                Ok(path) => {
+                Ok(WatchSignal::Path(path)) => {
                     let layers = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let path = match layers.to_indexed(&path) {
                         Remap::Keep => path,
@@ -245,13 +257,86 @@ impl ProjectWatcher {
                         Remap::Drop => continue,
                     };
                     if !layers.is_ignored(&path) {
-                        return Some(path);
+                        return Some(Change::Path(path));
                     }
+                }
+                Ok(WatchSignal::Rescan(path)) => {
+                    let layers = self.ignores.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let path = match layers.to_indexed(&path) {
+                        Remap::Keep => path,
+                        Remap::To(indexed) => indexed,
+                        Remap::Drop => self.root.clone(),
+                    };
+                    let path = if path.starts_with(&self.root) { path } else { self.root.clone() };
+                    return Some(Change::Rescan(path));
                 }
                 Err(RecvTimeoutError::Timeout) => return None,
                 Err(RecvTimeoutError::Disconnected) => return None,
             }
         }
+    }
+
+    /// Test-only seam: queues a Rescan of `path` exactly as the OS callback
+    /// would ([`forward_event`]), so a test can reproduce a dropped-event
+    /// signal without an FSEvents storm. It then reaches
+    /// [`Self::next_change`] like any other signal.
+    #[cfg(test)]
+    #[allow(dead_code)] // Until GM-616's tests slice drives it.
+    pub(crate) fn inject_rescan(&self, path: impl Into<PathBuf>) {
+        let _ = self.test_events.send(WatchSignal::Rescan(path.into()));
+    }
+}
+
+/// What the OS callbacks put on the watcher's channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchSignal {
+    /// An event for this path.
+    Path(PathBuf),
+    /// The OS dropped events under this directory (FSEvents'
+    /// `MustScanSubDirs`/`UserDropped`/`KernelDropped`, inotify's
+    /// `IN_Q_OVERFLOW`): what changed there must be read from the disk.
+    Rescan(PathBuf),
+}
+
+/// What [`ProjectWatcher::next_change`] returns: a [`WatchSignal`] after the
+/// link remap and (for a path) the ignore check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// A change to this non-ignored path, spelled as the walk lists it.
+    Path(PathBuf),
+    /// Events under this directory (inside the root, the root itself
+    /// included) were dropped; it must be reconciled with the disk.
+    Rescan(PathBuf),
+}
+
+impl Change {
+    /// The path either variant names.
+    pub fn into_path(self) -> PathBuf {
+        match self {
+            Change::Path(path) | Change::Rescan(path) => path,
+        }
+    }
+}
+
+/// Puts one notify event on the watcher's channel; shared by the OS watch's
+/// callback and the poll fallback's.
+///
+/// An event flagged `need_rescan()` becomes a [`WatchSignal::Rescan`] per
+/// path, or of `root` when it names none (notify's inotify backend reports a
+/// queue overflow with no path). Any other event becomes a
+/// [`WatchSignal::Path`] per path, as before GM-616.
+pub fn forward_event(event: notify::Event, root: &Path, tx: &Sender<WatchSignal>) {
+    if event.need_rescan() {
+        if event.paths.is_empty() {
+            let _ = tx.send(WatchSignal::Rescan(root.to_path_buf()));
+        }
+        for path in event.paths {
+            let _ = tx.send(WatchSignal::Rescan(path));
+        }
+        return;
+    }
+    for path in event.paths {
+        let _ = tx.send(WatchSignal::Path(path));
     }
 }
 
@@ -286,7 +371,7 @@ mod tests {
         let tracked = tmp.path().join("tracked.txt");
         fs::write(&tracked, b"hello").unwrap();
 
-        let changed = watcher.next_change(EVENT_TIMEOUT);
+        let changed = watcher.next_change(EVENT_TIMEOUT).map(Change::into_path);
         assert_eq!(changed, Some(tracked.canonicalize().unwrap()));
     }
 
@@ -368,7 +453,7 @@ mod tests {
             .expect("a MaxFilesWatch error must trigger a polling fallback, not a hard failure");
 
         fs::write(affected.join("file.txt"), b"hello").unwrap();
-        let changed = watcher.next_change(POLL_EVENT_TIMEOUT);
+        let changed = watcher.next_change(POLL_EVENT_TIMEOUT).map(Change::into_path);
         assert_eq!(
             changed,
             Some(affected.join("file.txt")),
@@ -403,7 +488,7 @@ mod tests {
             if remaining.is_zero() {
                 return None;
             }
-            if let Some(changed) = watcher.next_change(remaining) {
+            if let Some(changed) = watcher.next_change(remaining).map(Change::into_path) {
                 let done = changed == path;
                 seen.push(changed);
                 if done {
@@ -422,7 +507,7 @@ mod tests {
             if remaining.is_zero() {
                 return seen;
             }
-            if let Some(changed) = watcher.next_change(remaining) {
+            if let Some(changed) = watcher.next_change(remaining).map(Change::into_path) {
                 seen.push(changed);
             }
         }

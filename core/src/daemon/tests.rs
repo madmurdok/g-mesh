@@ -297,7 +297,7 @@ fn drain_startup_noise(
     registry: &PluginRegistry,
 ) {
     for _ in 0..2 {
-        watch_and_route_once(watcher, debouncer, root, conn, registry);
+        watch_and_route_once(watcher, debouncer, &mut Rescans::new(), root, conn, registry);
     }
 }
 
@@ -347,11 +347,11 @@ fn pump_until_round_trips(
         paths.len()
     };
     while distinct(plugin_dir) < expected && std::time::Instant::now() < deadline {
-        watch_and_route_once(watcher, debouncer, root, conn, registry);
+        watch_and_route_once(watcher, debouncer, &mut Rescans::new(), root, conn, registry);
     }
     let settled = std::time::Instant::now() + window * 2;
     while std::time::Instant::now() < settled {
-        watch_and_route_once(watcher, debouncer, root, conn, registry);
+        watch_and_route_once(watcher, debouncer, &mut Rescans::new(), root, conn, registry);
     }
     test_plugin::file_changed_requests(plugin_dir)
 }
@@ -381,7 +381,7 @@ fn a_burst_of_rapid_saves_to_the_same_file_costs_one_plugin_round_trip_not_one_p
     for i in 0..5 {
         fs::write(&file, format!("v{i}")).unwrap();
         thread::sleep(Duration::from_millis(20));
-        watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
+        watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), &root, &conn, &registry);
     }
 
     // Every write so far was well under BURST_TEST_WINDOW apart, so nothing
@@ -454,7 +454,7 @@ fn two_different_files_in_the_same_burst_each_get_their_own_round_trip() {
 
     fs::write(root.join("a.python-src"), "a").unwrap();
     thread::sleep(Duration::from_millis(20));
-    watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
+    watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), &root, &conn, &registry);
     fs::write(root.join("b.python-src"), "b").unwrap();
     let mut requested = pump_until_round_trips(
         &watcher,
@@ -495,7 +495,7 @@ fn route_one_batch(root: &Path, conn: &IndexStore, registry: &PluginRegistry, pa
     for path in paths {
         debouncer.record(root.join(path));
     }
-    watch_and_route_once(&watcher, &mut debouncer, root, conn, registry);
+    watch_and_route_once(&watcher, &mut debouncer, &mut Rescans::new(), root, conn, registry);
 }
 
 fn record_baseline(conn: &IndexStore, file_path: &str) {
