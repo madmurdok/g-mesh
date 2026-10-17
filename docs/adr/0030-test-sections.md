@@ -18,6 +18,9 @@ We split the suite into 11 named sections, each a nextest filterset over the
 whole workspace, held in `scripts/test-sections.sh`: `core-it`, `core-mcp`,
 `core-daemon`, `core-cli`, `core-graph`, `core-rest`, `sdk`,
 `plugin-typescript`, `plugin-rust`, `plugin-python`, `wire`.
+(Since GM-623, `core-it` is two binaries, `g-mesh::it` and
+`g-mesh::scripts`, rather than one per file; it still selects them by
+`kind(test)`.)
 
 - **Filtersets in a script, not nextest profiles.** CI needs the `ci`
   profile's JUnit output per section, and a nextest profile cannot inherit

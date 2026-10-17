@@ -72,7 +72,7 @@ func TestProtocolVersionAndLanguageMatchTheManifest(t *testing.T) {
 }
 
 // GM-281's capability flip, asserted from the plugin's own side as well as
-// from core's (`core/tests/plugin_check.rs`'s
+// from core's (`core/tests/it/plugin_check.rs`'s
 // the_go_manifest_declares_a_semantic_tier_that_resolves_receiver_calls):
 // the semantic tier resolves receiver calls, the structural one still does
 // not, and the difference is what keeps core's generated MCP instructions

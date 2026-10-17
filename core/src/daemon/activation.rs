@@ -374,7 +374,7 @@ impl ActivationCtx {
         // structural graph.
         //
         // Inline, not backgrounded, deliberately (task 164, and
-        // `core/tests/overload_call_binding.rs`): this pass and the watcher's
+        // `core/tests/it/overload_call_binding.rs`): this pass and the watcher's
         // incremental per-file passes serialize on the same plugin process,
         // but nothing orders which of two independently-triggered passes
         // commits last, and a whole-project pass landing after a newer

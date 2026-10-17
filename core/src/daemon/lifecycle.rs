@@ -19,7 +19,7 @@
 //! attached or not), each plugin's idle sleep, each plugin's `memoryLimitMb`
 //! check (a breaker on a sustained overage, not a ceiling), then the core's
 //! idle exit. The daemon installs no signal handler: `SIGTERM` kills it and
-//! its plugin tree (`core/tests/daemon_sigterm.rs`).
+//! its plugin tree (`core/tests/it/daemon_sigterm.rs`).
 
 use std::collections::HashSet;
 use std::fmt;

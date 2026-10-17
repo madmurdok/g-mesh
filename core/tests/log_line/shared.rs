@@ -1,4 +1,4 @@
-// The body of `core/tests/log_line_atomic.rs` and
+// The body of `core/tests/it/log_line_atomic.rs` and
 // `plugins/sdk/tests/log_line_atomic.rs`, `include!`d by both: core and the
 // plugin SDK carry identical copies of `log_line!` (the SDK does not depend on
 // core), so one set of tests pins both. The includer brings `log_line!` into
@@ -28,8 +28,15 @@ const ROLE_ENV: &str = "G_MESH_LOG_LINE_TEST_ROLE";
 /// A writer child starts writing once this file exists, so all writers
 /// overlap instead of the first finishing before the last has started.
 const GO_FILE_ENV: &str = "G_MESH_LOG_LINE_TEST_GO";
-/// The one test a child runs.
-const CHILD_TEST: &str = "log_line_child";
+/// The one test a child runs, by its full name in this binary: `--exact`
+/// needs the module path, and the includer may sit in a module (core's `it`
+/// binary) or at the crate root (the SDK's own test binary).
+fn child_test() -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::log_line_child"),
+        None => "log_line_child".to_string(),
+    }
+}
 
 /// T1's shape: the note's N=4 writers of M=5000 lines each.
 const WRITERS: usize = 4;
@@ -100,11 +107,11 @@ fn writer_line(id: usize, n: usize) -> String {
     format!("[w{id}] seq={n} a={} b={} c={} d={} pad={} end={id}:{n}", n * 3, n * 7, id * n, n % 13, pad(n))
 }
 
-/// This test binary, set up to run only [`CHILD_TEST`] in role `role`.
+/// This test binary, set up to run only [`child_test`] in role `role`.
 fn child(role: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().expect("the test binary's own path"));
     command
-        .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads", "1"])
+        .args(["--exact", &child_test(), "--nocapture", "--test-threads", "1"])
         .env(ROLE_ENV, role)
         .stdin(Stdio::null())
         .stdout(Stdio::piped());

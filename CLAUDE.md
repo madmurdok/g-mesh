@@ -84,3 +84,11 @@ The suite runs as named sections (`scripts/test-sections.sh`,
 `test-select.sh` prints `full`, `none` or section names, and counts
 uncommitted and untracked files too. Any path it has no rule for selects
 `full`. The release gate (`scripts/cut-release.sh`) always runs every section.
+
+Core's integration tests are two binaries (GM-623): `core/tests/scripts/`
+for a test whose subject is a file under `scripts/`, `core/tests/it/` for
+every other one. A new file there needs a `mod <file>;` line in that
+directory's `main.rs`; `core/tests/it/layout.rs` fails on a missing one and
+on any new top-level `core/tests/*.rs`. Run one file's tests with
+`cargo nextest run -p g-mesh --test it -E 'test(/^<file>::/)'` (`--test
+scripts` for a script test); nextest names them `<file>::<test>`.

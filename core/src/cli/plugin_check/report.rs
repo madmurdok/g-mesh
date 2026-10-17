@@ -19,7 +19,7 @@
 //! Every result renders as one line that starts with its outcome and its
 //! check id - `FAIL  stream-order` - followed by indented detail lines. The
 //! first two tokens are the stable part: the integration tests
-//! (`core/tests/plugin_check.rs`) assert on exactly those, which is also what
+//! (`core/tests/it/plugin_check.rs`) assert on exactly those, which is also what
 //! a CI log grep would. The detail wording is free to improve.
 //!
 //! # Findings are capped per check

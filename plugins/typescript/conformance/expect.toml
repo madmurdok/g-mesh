@@ -78,7 +78,7 @@ file = "src/math.ts"
 # pass cannot see at all (no bare name at the use site). This entry is the
 # DISCRIMINATION case: with the semantic pass disabled, `useNamespaceImport`
 # drops out of the actual set and this expectation fails - see
-# core/tests/plugin_check.rs's `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`.
+# core/tests/it/plugin_check.rs's `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`.
 expect = ["src/main.ts:run", "src/main.ts:useNamespaceImport"]
 # Decision 12: both rows are in main.ts, one call each.
 files = ["src/main.ts:2"]
@@ -112,7 +112,7 @@ files = ["src/main.ts:2"]
 # right, there is no way to write this entry so that it is true in both arms -
 # the healthy run needs the key and the structural-only run needs its absence.
 # So the entry is tagged for what it actually needs, and
-# `core/tests/plugin_check.rs`'s
+# `core/tests/it/plugin_check.rs`'s
 # `a_namespace_import_caller_needs_the_semantic_pass_to_resolve` was updated
 # to expect it among the failures of its structural arm, naming the tally as
 # the reason rather than dropping the entry from its list.
@@ -130,7 +130,7 @@ tier = "semantic"
 #
 # The structural arm answers nothing, so `tests/conformance.rs`'s structural run without the skip flag lists it
 # among the entries a missing tier must fail, as does
-# `core/tests/plugin_check.rs`'s
+# `core/tests/it/plugin_check.rs`'s
 # `a_namespace_import_caller_needs_the_semantic_pass_to_resolve`.
 [[callers]]
 symbol = "Greetable#greet"

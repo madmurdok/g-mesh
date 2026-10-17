@@ -459,7 +459,7 @@ impl CheckOutcome {
 ///
 /// Parsing the human report rather than asking for a machine-readable one:
 /// the kit has no `--json`, and the report's own shape is what core's
-/// `tests/plugin_check.rs` already parses the same way - so this stays
+/// `tests/it/plugin_check.rs` already parses the same way - so this stays
 /// correct exactly as long as that suite does.
 fn parse_report(stdout: &str) -> BTreeMap<String, Verdict> {
     let mut outcomes = BTreeMap::new();

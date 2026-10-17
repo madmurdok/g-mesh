@@ -31,7 +31,7 @@
 //!
 //! - **Namespace-import resolution needs the semantic pass to have run**
 //!   (the task's own framing): `import * as ns` then `ns.fn()` produces no
-//!   structural edge at all - see `core/tests/namespace_import_resolution.rs`'s
+//!   structural edge at all - see `core/tests/it/namespace_import_resolution.rs`'s
 //!   own module doc - so an expectation over it can only pass once
 //!   `semanticPass` (step 6 of `run_session`) has landed its upgrade through
 //!   `link_diff`.
