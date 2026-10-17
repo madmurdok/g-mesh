@@ -705,3 +705,110 @@ fn a_dry_run_without_the_plugin_node_modules_still_succeeds() {
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert!(stdout_of(&output).contains("== nextest:"), "{}", describe(&output));
 }
+
+// ---------------------------------------------------------------------------
+// The same PATH for cut-release.sh's test step (GM-628)
+
+/// Runs `cut-release.sh`'s `main` from a copy of `scripts/` in `root`, with a
+/// working directory that is not the repo root, and every command it would
+/// run for real (git, cargo, the pre-tag checks) replaced by a shell function
+/// that succeeds. `scripts/test-sections.sh` is a stub that appends its
+/// arguments and `PATH` to the record file, and exits `sections_status`
+/// for `run`. Returns the output and the record's lines.
+fn run_cut_release(root: &Path, args: &[&str], sections_status: i32) -> (Output, Vec<String>) {
+    let stub = format!(
+        "#!/bin/sh\necho \"test-sections $*|$PATH\" >> \"$GM628_RECORD\"\n[ \"$1\" = run ] && exit {sections_status}\nexit 0\n"
+    );
+    let sections = root.join("scripts/test-sections.sh");
+    fs::write(&sections, stub).unwrap();
+    fs::set_permissions(&sections, fs::Permissions::from_mode(0o755)).unwrap();
+    let other_cwd = tempfile::tempdir().unwrap();
+    let record = other_cwd.path().join("record");
+    let driver = r#"
+        source "$1/scripts/cut-release.sh"; shift
+        git() {
+            case "$*" in
+            *rev-parse\ --abbrev-ref*) echo main ;;
+            *status\ --porcelain*) ;;
+            *rev-parse*) echo abc1234 ;;
+            *"tag -l"* | *ls-remote*) ;;
+            *) echo "git $*" >> "$GM628_RECORD" ;;
+            esac
+        }
+        bash() { echo "9.9.9"; }
+        cargo() { echo "cargo $*|$PATH" >> "$GM628_RECORD"; }
+        origin_slug() { echo o/r; }
+        check_no_untagged_prior_releases() { :; }
+        check_release_branch_ci_passed() { :; }
+        check_workspace_versions() { :; }
+        check_crate_backed_plugin_versions() { :; }
+        check_self_versioned_plugin_versions() { :; }
+        check_core_feature_isolation() { :; }
+        main "$@"
+    "#;
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(driver)
+        .arg("cut-release-test")
+        .arg(root)
+        .args(args)
+        .current_dir(other_cwd.path())
+        .env("GM628_RECORD", &record)
+        .output()
+        .expect("failed to run bash");
+    let lines = fs::read_to_string(&record).unwrap_or_default().lines().map(String::from).collect();
+    (output, lines)
+}
+
+/// With both plugins' `node_modules/.bin` present, the test step of a cut
+/// (the sections, the doctests, `cargo test -p g-mesh`) sees them first on
+/// `PATH`, taken from the repo root and not from the working directory.
+#[test]
+fn the_cut_release_test_step_has_the_plugin_bin_dirs_first_on_the_path() {
+    let root = fake_root(true);
+    let (output, record) = run_cut_release(root.path(), &["9.9.9"], 0);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let calls: Vec<&String> = record.iter().filter(|l| !l.starts_with("git ")).collect();
+    assert_eq!(calls.len(), 4, "check, run all, doctest, cargo test: {record:?}");
+    let rootp = fs::canonicalize(root.path()).unwrap().display().to_string();
+    let expected =
+        format!("{0}/plugins/typescript/node_modules/.bin:{0}/plugins/python/node_modules/.bin:", rootp);
+    for line in calls {
+        let path = line.split_once('|').unwrap().1.replace(&root.path().display().to_string(), &rootp);
+        assert!(path.starts_with(&expected), "PATH {path} does not start with {expected}");
+    }
+}
+
+/// Without a plugin's `node_modules/.bin` the cut fails with the helper's
+/// message, naming `scripts/test-deps.sh`, before any test runs and before
+/// the tag exists.
+#[test]
+fn a_cut_release_without_the_plugin_node_modules_fails_before_running_tests() {
+    let root = fake_root(false);
+    let (output, record) = run_cut_release(root.path(), &["9.9.9"], 0);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cut-release: plugins/typescript/node_modules/.bin is missing"),
+        "{}",
+        describe(&output)
+    );
+    assert!(stderr.contains("scripts/test-deps.sh"), "{}", describe(&output));
+    assert!(
+        !record
+            .iter()
+            .any(|l| l.starts_with("test-sections") || l.starts_with("cargo") || l.contains(" tag -a ")),
+        "something ran after the failed check: {record:?}"
+    );
+}
+
+/// `--skip-tests` runs no test, so it needs no plugin dependency: the cut
+/// goes on to the tag without `node_modules`, and no test command runs.
+#[test]
+fn a_cut_release_with_skip_tests_does_not_need_the_plugin_node_modules() {
+    let root = fake_root(false);
+    let (output, record) = run_cut_release(root.path(), &["9.9.9", "--skip-tests"], 0);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert!(record.iter().any(|l| l.contains(" tag -a ")), "no tag: {record:?}");
+    assert!(!record.iter().any(|l| l.starts_with("test-sections") || l.starts_with("cargo")), "{record:?}");
+}
