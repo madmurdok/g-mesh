@@ -262,6 +262,44 @@ func (w *workspace) isProjectImportPath(path string) bool {
 	return false
 }
 
+// moduleCopy is one project directory an import path resolves to from some
+// module: the package directory `dir` of module `module` (both
+// project-relative, "" for the root).
+type moduleCopy struct {
+	module string
+	dir    string
+}
+
+// packageCopies is every directory of the project that holds `importPath`
+// in some module: for each module whose path is the import path or a prefix
+// of it, the directory the remainder names under that module, when that
+// module is the innermost one containing it (as importPath decides). Two
+// modules declaring one path (a fork kept beside the original) give two
+// copies. Pure: whether the directory exists is not checked.
+func (w *workspace) packageCopies(importPath string) []moduleCopy {
+	var copies []moduleCopy
+	for _, module := range w.modules {
+		var dir string
+		switch {
+		case importPath == module.path:
+			dir = module.dir
+		case strings.HasPrefix(importPath, module.path+"/"):
+			suffix := importPath[len(module.path)+1:]
+			if module.dir == "" {
+				dir = suffix
+			} else {
+				dir = module.dir + "/" + suffix
+			}
+		default:
+			continue
+		}
+		if moduleDirFor(w, dir) == module.dir {
+			copies = append(copies, moduleCopy{module: module.dir, dir: dir})
+		}
+	}
+	return copies
+}
+
 // underDir reports whether `child` is `dir` or lies under it, and returns
 // the remainder. `dir == ""` is the project root and contains everything.
 func underDir(dir, child string) (string, bool) {

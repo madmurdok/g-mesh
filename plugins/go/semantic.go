@@ -344,15 +344,22 @@ type resolutions struct {
 
 	// twinned is, per package path, the qualifiedName spellings the package
 	// declares in a file the host build loads *and* in one it excludes (see
-	// twinnedNames). Only these are addressed by file (GM-570).
+	// twinnedNames), unioned across every copy of the path (a directory of
+	// each module the path can resolve to) and every module view. Only
+	// these are addressed by file (GM-570).
 	twinned map[string]map[string]bool
-	// twinsKnown is every package path twinned has already been computed
-	// for, so neither a package's test variants nor a second load re-parse
-	// its files.
+	// twinsKnown is every package path that some load of this pass folded or
+	// listed, so loadReferencedTwins does not list a path again from the
+	// referencing module.
 	twinsKnown map[string]bool
+	// twinCopies is every copy (copyKey: package path and directory) whose
+	// twins are already unioned into twinned and builtFiles, so neither a
+	// package's test variants nor a second load or listing re-parse its
+	// files.
+	twinCopies map[string]bool
 	// builtFiles is, per twinned package path, the project-relative files
 	// of the package's GoFiles - the ones the host build compiles - unioned
-	// across module views like twinned. A twinned answer is addressed by
+	// across copies and module views like twinned. A twinned answer is addressed by
 	// file only when its declaring file is in this set: membership is what
 	// "a file of this project the host builds" means, whatever the path's
 	// spelling (a `//line` directive can name a template, a phantom path or
@@ -398,6 +405,7 @@ func newResolutions() *resolutions {
 		declaredIn: map[types.Object]string{},
 		twinned:    map[string]map[string]bool{},
 		twinsKnown: map[string]bool{},
+		twinCopies: map[string]bool{},
 		builtFiles: map[string]map[string]bool{},
 		referenced: map[string]bool{},
 
@@ -416,11 +424,9 @@ func newResolutions() *resolutions {
 // semantic tier becomes useless in exactly the repositories that need it.
 func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) (*packages.Config, error) {
 	fset := token.NewFileSet()
-	env := loadEnv()
-	cfg := &packages.Config{Mode: loadMode, Dir: dir, Tests: true, Fset: fset, Env: env}
-	if flag := modFlag(dir, env); flag != "" {
-		cfg.BuildFlags = []string{flag}
-	}
+	cfg := loadConfig(dir, loadMode)
+	cfg.Tests = true
+	cfg.Fset = fset
 
 	// The engine is starting *now* - see markSemanticEngineStarted.
 	markSemanticEngineStarted()
@@ -435,6 +441,19 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 		e.foldPackage(into, fset, pkg)
 	}
 	return cfg, nil
+}
+
+// loadConfig is the `go list` configuration a load from dir runs with: its
+// directory, loadEnv and its `-mod` flag. A listing of a module's packages
+// uses it too, so it resolves import paths and evaluates build constraints
+// exactly as that module's load does.
+func loadConfig(dir string, mode packages.LoadMode) *packages.Config {
+	env := loadEnv()
+	cfg := &packages.Config{Mode: mode, Dir: dir, Env: env}
+	if flag := modFlag(dir, env); flag != "" {
+		cfg.BuildFlags = []string{flag}
+	}
+	return cfg
 }
 
 // twinListing is the project packages one load configuration's answers
@@ -469,7 +488,19 @@ func twinListingKey(cfg *packages.Config) string {
 // referenced it. A name twinned in any module's view is twinned: its
 // container address is ambiguous there. A failed listing leaves its packages
 // without twins from it, which keeps their answers container-scoped.
-func (e *semanticEngine) loadReferencedTwins(into *resolutions, listings map[string]*twinListing) {
+//
+// Then every other copy of each path the pass depends on is listed from its
+// own module (listUncoveredCopies), so the twins are the union over every
+// copy of the path, not only the copies the referencing modules resolve to.
+// configs is each loaded module's load configuration and failed each module
+// that did not load, both keyed by project-relative module directory.
+func (e *semanticEngine) loadReferencedTwins(
+	ws *workspace,
+	into *resolutions,
+	listings map[string]*twinListing,
+	configs map[string]*packages.Config,
+	failed map[string]error,
+) {
 	missingBy := map[string][]string{}
 	for key, l := range listings {
 		for path := range l.paths {
@@ -499,20 +530,9 @@ func (e *semanticEngine) loadReferencedTwins(into *resolutions, listings map[str
 			wanted[path] = true
 		}
 		for _, pkg := range listed {
-			if !wanted[pkg.PkgPath] {
-				continue
+			if wanted[pkg.PkgPath] && !into.twinCopies[e.twinCopyKey(pkg)] {
+				e.unionTwins(into, pkg)
 			}
-			names := twinnedNames(pkg.Name, pkg.GoFiles, pkg.IgnoredFiles)
-			if len(names) == 0 {
-				continue
-			}
-			if into.twinned[pkg.PkgPath] == nil {
-				into.twinned[pkg.PkgPath] = map[string]bool{}
-			}
-			for name := range names {
-				into.twinned[pkg.PkgPath][name] = true
-			}
-			e.recordBuiltFiles(into, pkg)
 		}
 	}
 	for _, missing := range missingBy {
@@ -520,6 +540,106 @@ func (e *semanticEngine) loadReferencedTwins(into *resolutions, listings map[str
 			into.twinsKnown[path] = true
 		}
 	}
+	e.listUncoveredCopies(ws, into, listings, configs, failed)
+}
+
+// listUncoveredCopies lists, for their twins, the copies of the paths this
+// pass depends on that no fold or listing of the pass has covered. The
+// dependent paths are every path an answer resolved into and every path the
+// pass folded (an implements answer addresses a folded interface by its
+// path even when no call answer did). Each copy is listed from its own
+// module, with that module's load configuration, all of one module's copies
+// in one `go list`; a listed package counts only when it resolved to the
+// expected directory.
+//
+// Skipped: external test packages (`go list` cannot list them by import
+// path, and an answer reaches one only from its own files, which the pass
+// folded), copies of a module that failed to load in this pass (the listing
+// would fail too), and copy directories without a .go file. A failed listing
+// is logged and leaves its copies' names out.
+func (e *semanticEngine) listUncoveredCopies(
+	ws *workspace,
+	into *resolutions,
+	listings map[string]*twinListing,
+	configs map[string]*packages.Config,
+	failed map[string]error,
+) {
+	if ws == nil {
+		return
+	}
+	dependent := map[string]bool{}
+	for _, l := range listings {
+		for path := range l.paths {
+			dependent[path] = true
+		}
+	}
+	for path := range into.folded {
+		dependent[path] = true
+	}
+	// Module directory -> package path -> the copy's directory.
+	uncovered := map[string]map[string]string{}
+	for _, path := range sortedKeys(dependent) {
+		if strings.HasSuffix(path, "_test") {
+			continue
+		}
+		for _, c := range ws.packageCopies(path) {
+			if into.twinCopies[copyKey(path, c.dir)] {
+				continue
+			}
+			if _, bad := failed[c.module]; bad {
+				continue
+			}
+			if !hasGoFile(filepath.Join(e.realRoot, filepath.FromSlash(c.dir))) {
+				continue
+			}
+			if uncovered[c.module] == nil {
+				uncovered[c.module] = map[string]string{}
+			}
+			uncovered[c.module][path] = c.dir
+		}
+	}
+	for _, module := range sortedKeys(uncovered) {
+		copies := uncovered[module]
+		paths := sortedKeys(copies)
+		var cfg *packages.Config
+		if base := configs[module]; base != nil {
+			cfg = &packages.Config{Dir: base.Dir, Env: base.Env, BuildFlags: base.BuildFlags}
+		} else {
+			cfg = loadConfig(filepath.Join(e.realRoot, filepath.FromSlash(module)), 0)
+		}
+		cfg.Mode = packages.NeedName | packages.NeedFiles
+		listed, err := packages.Load(cfg, paths...)
+		if err != nil {
+			logf("semantic pass: listing %d other module cop(ies) from %s for build-tag twins failed: %v",
+				len(paths), cfg.Dir, err)
+			continue
+		}
+		for _, pkg := range listed {
+			dir, ok := copies[pkg.PkgPath]
+			if !ok {
+				continue
+			}
+			key := e.twinCopyKey(pkg)
+			if key != copyKey(pkg.PkgPath, dir) || into.twinCopies[key] {
+				continue
+			}
+			e.unionTwins(into, pkg)
+		}
+	}
+}
+
+// hasGoFile reports whether dir holds at least one .go file.
+func hasGoFile(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".go") {
+			return true
+		}
+	}
+	return false
 }
 
 // loadEnv is the environment `go list` runs with: the inherited one, with
@@ -728,17 +848,61 @@ func (e *semanticEngine) recordDeclaration(into *resolutions, fset *token.FileSe
 	}
 }
 
-// collectTwins computes (once per package path) the twinned names of one
-// project package from its loaded and its build-excluded files.
+// collectTwins computes (once per copy of a package path) the twinned names
+// of one folded project package from its loaded and its build-excluded
+// files, and unions them with the other copies' (unionTwins).
 func (e *semanticEngine) collectTwins(into *resolutions, pkg *packages.Package) {
-	if pkg.PkgPath == "" || into.twinsKnown[pkg.PkgPath] {
+	if pkg.PkgPath == "" {
 		return
 	}
 	into.twinsKnown[pkg.PkgPath] = true
-	if names := twinnedNames(pkg.Name, pkg.GoFiles, pkg.IgnoredFiles); len(names) > 0 {
-		into.twinned[pkg.PkgPath] = names
-		e.recordBuiltFiles(into, pkg)
+	if into.twinCopies[e.twinCopyKey(pkg)] {
+		return
 	}
+	e.unionTwins(into, pkg)
+}
+
+// unionTwins marks pkg's copy as covered and adds its twinned names to
+// into.twinned and, when it has any, its built files to into.builtFiles.
+func (e *semanticEngine) unionTwins(into *resolutions, pkg *packages.Package) {
+	into.twinCopies[e.twinCopyKey(pkg)] = true
+	names := twinnedNames(pkg.Name, pkg.GoFiles, pkg.IgnoredFiles)
+	if len(names) == 0 {
+		return
+	}
+	if into.twinned[pkg.PkgPath] == nil {
+		into.twinned[pkg.PkgPath] = map[string]bool{}
+	}
+	for name := range names {
+		into.twinned[pkg.PkgPath][name] = true
+	}
+	e.recordBuiltFiles(into, pkg)
+}
+
+// copyKey identifies one copy of a package path: the path and the copy's
+// directory, project-relative ("" for the root) or, outside the project,
+// absolute.
+func copyKey(path, dir string) string {
+	return path + "\x00" + dir
+}
+
+// twinCopyKey is the copyKey of a loaded or listed package: its directory
+// is pkg.Dir, else the directory of its first file. The directory is spelled
+// project-relative through relPathOf, so /var and /private/var are one key.
+func (e *semanticEngine) twinCopyKey(pkg *packages.Package) string {
+	dir := pkg.Dir
+	if dir == "" {
+		for _, files := range [2][]string{pkg.GoFiles, pkg.IgnoredFiles} {
+			if len(files) > 0 {
+				dir = filepath.Dir(files[0])
+				break
+			}
+		}
+	}
+	if rel, ok := e.relPathOf(dir); ok && dir != "" {
+		dir = normalizeDir(rel)
+	}
+	return copyKey(pkg.PkgPath, dir)
 }
 
 // recordBuiltFiles adds the project-relative GoFiles of a twinned package to
@@ -1111,6 +1275,7 @@ func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject 
 
 	outcome := loadOutcome{failed: map[string]error{}}
 	listings := map[string]*twinListing{}
+	configs := map[string]*packages.Config{}
 	for _, dir := range sortedKeys(byModule) {
 		patterns := byModule[dir]
 		sort.Strings(patterns)
@@ -1121,6 +1286,7 @@ func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject 
 			continue
 		}
 		outcome.loaded++
+		configs[dir] = cfg
 		if len(into.referenced) == 0 {
 			continue
 		}
@@ -1139,10 +1305,12 @@ func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject 
 	// root's answers reach through export data), list the referenced packages
 	// no load folded (they come without IgnoredFiles). After all modules
 	// loaded, so a listing cannot mark a later module's folded twins as
-	// already known.
+	// already known. Every other copy of a path the pass depends on is
+	// listed too, from its own module, so the twins match an exhaustive
+	// pass's.
 	into.exhaustive = wholeProject && len(outcome.failed) == 0
 	if !into.exhaustive {
-		e.loadReferencedTwins(into, listings)
+		e.loadReferencedTwins(ws, into, listings, configs, outcome.failed)
 	}
 	return outcome
 }
