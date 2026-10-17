@@ -5066,7 +5066,7 @@ mod tests {
         // The path's own text is counted in characters, after a wide prefix.
         let wide = "    let 🦀 = a::b::f();";
         assert_eq!(covers(Some(&format!("{wide}\n")), at(0, 18), "a::b::f"), ((0, 12), (0, 19)));
-        // The nearest occurrence that covers the asked column wins.
+        // The occurrence that covers the asked column wins, not the first one on the line.
         let twice = "a::f(); a::f();";
         assert_eq!(covers(Some(twice), at(0, 11), "a::f"), ((0, 8), (0, 12)));
         // No source, or the path not written on the line (split across
