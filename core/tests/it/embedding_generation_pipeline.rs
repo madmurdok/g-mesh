@@ -1,0 +1,418 @@
+//! The embedding pipeline, end to end: a fixture file walked by the real
+//! plugin through the real cold-start bulk index (`daemon::bulk_index::run`),
+//! then embedded by the real backfill pass (`embedding::backfill::run`) with
+//! a real `EmbeddingModel` - and the `vectors` rows that come out the far
+//! side.
+//!
+//! Mirrors `overload_declaration_storage.rs`'s `Project`/`walk` shape:
+//! everything below the plugin process is genuine, and the question here is
+//! what a walk embeds, not who asked for it.
+//!
+//! # Real model weights
+//!
+//! The tests that actually call into `EmbeddingModel::embed` need
+//! `model.onnx`/`tokenizer.json` on disk (`g-mesh model fetch`)
+//! and are `#[ignore]`d for the same reason `embedding::model`'s own weight-
+//! dependent tests are: CI and a fresh checkout do not have ~600MiB of ONNX
+//! weights lying around, so a suite that hard-required them would fail
+//! everywhere but a machine that happened to have fetched the model first.
+//! Run them explicitly once the weights are present:
+//!
+//!     g-mesh model fetch      (or core/scripts/fetch-embedding-model.sh)
+//!     cd core && cargo test --test it -- --ignored embedding_generation_pipeline::
+
+use crate::common;
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use g_mesh::daemon::bulk_index;
+use g_mesh::daemon::manifest::DiscoveredPlugins;
+use g_mesh::daemon::plugin::BUNDLED_LANGUAGE;
+use g_mesh::embedding::{default_model_dir, CacheSettings, EmbeddingModel, EmbeddingPipeline};
+use g_mesh::storage::connection::{open, project_dir};
+use g_mesh::storage::index_store::IndexStore;
+use g_mesh::storage::schema;
+use rusqlite::Connection;
+
+/// The single-language discovery every test in this file walks with - just
+/// the bundled TypeScript plugin, built by hand from its manifest rather than
+/// through `daemon::manifest::discover`, so whatever else lives under
+/// `~/.g-mesh/plugins/` on the machine running this suite is not walked.
+fn only_the_bundled_plugin() -> DiscoveredPlugins {
+    DiscoveredPlugins {
+        manifests: HashMap::from([(BUNDLED_LANGUAGE.to_string(), common::typescript_manifest())]),
+        routing: HashMap::new(),
+    }
+}
+
+/// Two functions - one with a doc comment, one without - plus whatever
+/// structural nodes the plugin always emits alongside them (a `File` node
+/// for `src/lib.ts`, notably). The JS/TS plugin fills a `Function` node's
+/// `signature` unconditionally, doc comment or not (see
+/// `plugins/typescript/src/extractor/emit.rs`), so *every* function here has embeddable
+/// text - `bare`'s off its signature alone. The real "nothing to embed" case
+/// in this fixture is the `File` node itself, which carries neither field;
+/// see [`the_file_node_has_no_doc_comment_or_signature_and_is_not_embedded`].
+const FIXTURE: &str = r#"/**
+ * Reads a file from disk and returns its contents as a string.
+ */
+export function readFileAsString(path: string): string {
+  return "";
+}
+
+export function bare(a: number, b: number) {
+  return a + b;
+}
+"#;
+
+struct Project {
+    dir: tempfile::TempDir,
+}
+
+impl Project {
+    fn new() -> Self {
+        Self::with_source(FIXTURE)
+    }
+
+    /// A project whose `src/lib.ts` is `source`.
+    fn with_source(source: &str) -> Self {
+        let project = Self { dir: tempfile::tempdir().expect("failed to create a temp project root") };
+        let path = project.root().join("src/lib.ts");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("failed to create the fixture directory");
+        std::fs::write(&path, source).expect("failed to write the fixture");
+        project
+    }
+
+    fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Runs the structural cold-start walk against this project, then the
+    /// embedding backfill pass with `embedding`, as `daemon::run`/
+    /// `cli::init`/`cli::reindex` run them. Returns the index they filled and
+    /// the backfill pass's summary.
+    fn walk_then_backfill(
+        &self,
+        embedding: &EmbeddingPipeline,
+    ) -> (Connection, g_mesh::embedding::backfill::BackfillSummary) {
+        let conn = open(self.root()).expect("failed to open the project index");
+        schema::ensure_current(&conn, "embedding-generation-pipeline-test")
+            .expect("failed to prepare the index");
+        let conn = IndexStore::new(conn);
+        let discovered = only_the_bundled_plugin();
+        let summary = bulk_index::run(self.root(), &conn, &discovered).expect("the structural walk failed");
+        assert!(summary.nodes > 0, "the walk produced no nodes at all");
+        assert_eq!(summary.skipped_lines, 0, "the plugin emitted a line core could not read");
+
+        let progress = g_mesh::daemon::indexing_status::IndexingStatus::structural();
+        let backfill_summary = g_mesh::embedding::backfill::run(&conn, embedding, &progress);
+        (conn.into_inner().unwrap(), backfill_summary)
+    }
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        if let Ok(state) = project_dir(self.root()) {
+            let _ = std::fs::remove_dir_all(&state);
+        }
+    }
+}
+
+fn node_id(conn: &Connection, name: &str) -> String {
+    conn.query_row("SELECT id FROM nodes WHERE name = ?1 AND kind = 'Function'", [name], |row| row.get(0))
+        .unwrap_or_else(|e| panic!("no Function node named {name}: {e}"))
+}
+
+fn file_node_id(conn: &Connection) -> String {
+    conn.query_row("SELECT id FROM nodes WHERE kind = 'File'", [], |row| row.get(0))
+        .expect("the walk must produce a File node for src/lib.ts")
+}
+
+fn vector_row_exists(conn: &Connection, node_id: &str) -> bool {
+    conn.query_row("SELECT COUNT(*) FROM vectors WHERE nodeId = ?1", [node_id], |row| row.get::<_, i64>(0))
+        .unwrap()
+        > 0
+}
+
+fn model_dir() -> PathBuf {
+    default_model_dir(&g_mesh::config::EmbeddingConfig::default().model).unwrap()
+}
+
+/// Whether the real weights this suite needs are present on disk - the same
+/// check `EmbeddingModel::load` would make, done up front so a test can skip
+/// past the plugin walk entirely rather than fail deep inside it when the
+/// weights are missing.
+fn weights_available() -> bool {
+    let dir = model_dir();
+    dir.join("model.onnx").exists() && dir.join("tokenizer.json").exists()
+}
+
+fn load_real_pipeline() -> EmbeddingPipeline {
+    assert!(
+        weights_available(),
+        "real model weights are required for this test; run `g-mesh model fetch` first"
+    );
+    // Without the machine-wide embedding cache: these tests count what the
+    // model computes, which a cache warmed by an earlier run would serve.
+    let pipeline = EmbeddingPipeline::load_with_cache(&g_mesh::config::EmbeddingConfig::default(), None);
+    assert!(
+        pipeline.is_available(),
+        "{} does not hold the pinned weights (fp32 ones, say); run `g-mesh model fetch`",
+        model_dir().display()
+    );
+    pipeline
+}
+
+/// The acceptance criterion, at the fixture-file level: indexing a real
+/// project through the real plugin, then the backfill pass with the real
+/// model, produces a `vectors` row for every symbol that has embeddable
+/// text - a doc comment, a signature, or both.
+#[test]
+#[ignore = "needs the real model weights; see this file's module doc comment"]
+fn indexing_a_fixture_file_embeds_its_documented_symbols() {
+    let project = Project::new();
+    let pipeline = load_real_pipeline();
+    let (conn, _) = project.walk_then_backfill(&pipeline);
+
+    let documented = node_id(&conn, "readFileAsString");
+    let bare = node_id(&conn, "bare");
+
+    assert!(
+        vector_row_exists(&conn, &documented),
+        "a node with a doc comment and a signature must be embedded"
+    );
+    assert!(
+        vector_row_exists(&conn, &bare),
+        "a node with a signature but no doc comment must still be embedded off its signature"
+    );
+
+    let (embedding_len, version): (i64, String) = conn
+        .query_row(
+            "SELECT LENGTH(embedding), embeddingVersion FROM vectors WHERE nodeId = ?1",
+            [&documented],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    // sqlite-vec's packed format: 4 bytes per f32 dimension.
+    assert_eq!(embedding_len, (g_mesh::embedding::EMBEDDING_DIM as i64) * 4);
+    // The default model's version names its pinned int8 weights and the text form.
+    assert_eq!(version, format!("{}+int8+structured", g_mesh::config::EmbeddingConfig::default().model));
+}
+
+/// The backfill pass's own summary agrees with the rows it wrote: the
+/// fixture's two functions are its only candidates, and both are embedded.
+#[test]
+#[ignore = "needs the real model weights; see this file's module doc comment"]
+fn the_backfill_pass_counts_and_embeds_exactly_the_embeddable_symbols() {
+    let project = Project::new();
+    let pipeline = load_real_pipeline();
+    let (conn, backfill_summary) = project.walk_then_backfill(&pipeline);
+
+    assert_eq!(backfill_summary.candidates, 2, "the fixture has exactly two embeddable nodes");
+    assert_eq!(backfill_summary.embedded, 2, "both candidates must have been embedded");
+
+    let documented = node_id(&conn, "readFileAsString");
+    let bare = node_id(&conn, "bare");
+    assert!(
+        vector_row_exists(&conn, &documented),
+        "a node with a doc comment and a signature must be embedded"
+    );
+    assert!(
+        vector_row_exists(&conn, &bare),
+        "a node with a signature but no doc comment must still be embedded off its signature"
+    );
+}
+
+/// After the backfill pass embeds anything at all, `meta.embedding_model`
+/// names the model that actually produced those rows (see
+/// `storage::schema::set_embedding_model`).
+#[test]
+#[ignore = "needs the real model weights; see this file's module doc comment"]
+fn a_walk_that_embeds_anything_records_the_active_model_in_meta() {
+    let project = Project::new();
+    let pipeline = load_real_pipeline();
+    let (conn, _) = project.walk_then_backfill(&pipeline);
+
+    let recorded: Option<String> =
+        conn.query_row("SELECT embedding_model FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
+    let expected = format!("{}+int8+structured", g_mesh::config::EmbeddingConfig::default().model);
+    assert_eq!(recorded.as_deref(), Some(expected.as_str()));
+}
+
+/// The acceptance criterion's other half: a node with neither a doc comment
+/// nor a signature is skipped rather than embedding an empty string. The
+/// `File` node the walk produces for `src/lib.ts` is exactly that node - see
+/// the fixture's own doc comment for why neither function qualifies.
+#[test]
+#[ignore = "needs the real model weights; see this file's module doc comment"]
+fn the_file_node_has_no_doc_comment_or_signature_and_is_not_embedded() {
+    let project = Project::new();
+    let pipeline = load_real_pipeline();
+    let (conn, _) = project.walk_then_backfill(&pipeline);
+
+    let file = file_node_id(&conn);
+    let (doc_comment, signature): (Option<String>, Option<String>) = conn
+        .query_row("SELECT docComment, signature FROM nodes WHERE id = ?1", [&file], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        (doc_comment, signature),
+        (None, None),
+        "sanity check: this fixture's File node has neither field"
+    );
+
+    assert!(!vector_row_exists(&conn, &file), "a node with neither field must not get a vector row");
+
+    // And it is the *only* omission - every other node the walk produced
+    // (both functions) is embedded, so this is a targeted skip, not a
+    // pipeline that quietly embedded nothing at all.
+    let embedded_names: Vec<String> = conn
+        .prepare("SELECT n.name FROM vectors v JOIN nodes n ON n.id = v.nodeId ORDER BY n.name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(embedded_names, vec!["bare".to_string(), "readFileAsString".to_string()]);
+}
+
+/// `search_code`'s query embedding must land in the same vector space as node
+/// embeddings - i.e. must go through the identical model and pooling, not a
+/// separately loaded instance that happens to use the same weights file.
+#[test]
+#[ignore = "needs the real model weights; see this file's module doc comment"]
+fn embed_query_matches_embedding_the_same_text_directly() {
+    let pipeline = load_real_pipeline();
+    let model = EmbeddingModel::load(&model_dir()).expect("failed to load the real model");
+
+    let expected = model.embed("find a function that reads a file from disk").unwrap();
+    let actual = pipeline.embed_query("find a function that reads a file from disk").unwrap();
+    assert_eq!(actual, expected);
+}
+
+/// Loading a real model directly (not through the pipeline) and comparing
+/// its output to what the pipeline actually stored - proof the pipeline
+/// embeds the doc comment plus signature, not some other text, and that what
+/// lands in `vectors` is exactly what `EmbeddingModel::embed` would produce
+/// for it.
+#[test]
+#[ignore = "needs the real model weights; see this file's module doc comment"]
+fn the_stored_vector_matches_embedding_the_doc_comment_and_signature_directly() {
+    let project = Project::new();
+    let pipeline = load_real_pipeline();
+    let (conn, _) = project.walk_then_backfill(&pipeline);
+    let documented = node_id(&conn, "readFileAsString");
+
+    let (doc_comment, signature): (Option<String>, Option<String>) = conn
+        .query_row("SELECT docComment, signature FROM nodes WHERE id = ?1", [&documented], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    let doc_comment = doc_comment.expect("the fixture function has a doc comment");
+    let signature = signature.expect("the fixture function has a signature");
+
+    let model = EmbeddingModel::load(&model_dir()).expect("failed to load the real model");
+    let expected = model.embed(&format!("{}\n\n{}", doc_comment.trim(), signature.trim())).unwrap();
+
+    let stored: Vec<u8> = conn
+        .query_row("SELECT embedding FROM vectors WHERE nodeId = ?1", [&documented], |row| row.get(0))
+        .unwrap();
+    let stored: Vec<f32> = stored.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+
+    assert_eq!(stored, expected, "the stored vector must be exactly the model's output for doc+signature");
+}
+
+/// Twelve documented functions, for comparing whole indexes' vectors.
+const MANY_DOCUMENTED_FUNCTIONS: &str = r#"
+/** Reads a file from disk and returns its contents as a string. */
+export function readFile(path: string): string { return ""; }
+/** Writes a string to a file, replacing whatever was there. */
+export function writeFile(path: string, text: string): void {}
+/** Parses a JSON document into a plain object. */
+export function parseJson(text: string): unknown { return null; }
+/** Sums every number in a list. */
+export function sum(items: number[]): number { return 0; }
+/** Sorts users by their last login time, newest first. */
+export function sortUsersByLogin(users: string[]): string[] { return users; }
+/** Opens a TCP connection to the given host and port. */
+export function connect(host: string, port: number): void {}
+/** Retries an operation with exponential backoff. */
+export function retry(attempts: number): void {}
+/** Hashes a password with a random salt. */
+export function hashPassword(password: string): string { return ""; }
+/** Renders a date as an ISO-8601 string. */
+export function formatDate(date: Date): string { return ""; }
+/** Splits a path into its directory and file name. */
+export function splitPath(path: string): string[] { return []; }
+/** Counts the words in a paragraph of text. */
+export function countWords(text: string): number { return 0; }
+/** Removes duplicate entries from a list, keeping the first of each. */
+export function unique(items: string[]): string[] { return items; }
+"#;
+
+fn vectors_by_name(conn: &Connection) -> HashMap<String, Vec<u8>> {
+    let mut stmt = conn
+        .prepare("SELECT n.qualifiedName, v.embedding FROM vectors v JOIN nodes n ON n.id = v.nodeId")
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The ten nearest nodes to `query`, ranked the way `search_code` ranks
+/// them (`1 - vec_distance_cosine`, highest first), with each score's bits.
+fn top_ten(conn: &Connection, query: &[f32]) -> Vec<(String, u64)> {
+    let packed: Vec<u8> = query.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let mut stmt = conn
+        .prepare(
+            "SELECT n.qualifiedName, (1.0 - vec_distance_cosine(v.embedding, ?1)) AS score \
+             FROM vectors v JOIN nodes n ON n.id = v.nodeId ORDER BY score DESC, n.qualifiedName LIMIT 10",
+        )
+        .unwrap();
+    stmt.query_map([packed], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?.to_bits())))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The assumption the embedding cache rests on: a vector served from the
+/// cache is bit-for-bit the vector the model computes, so an index filled
+/// from a warm cache, one filled with the cache off and one filled cold are
+/// indistinguishable - down to `search_code`'s ranking and scores.
+///
+/// Control: flip one mantissa bit in `embedding::cache`'s decoder (e.g. XOR
+/// the decoded value's bits with 1) and the warm index's vectors differ.
+#[test]
+#[ignore = "needs the real model weights; see this file's module doc comment"]
+fn cached_vectors_are_bit_identical_to_fresh_ones_and_rank_the_same() {
+    assert!(weights_available(), "real model weights are required for this test");
+    let config = g_mesh::config::EmbeddingConfig::default();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = || Some(CacheSettings::new(cache_dir.path().join("cache.sqlite"), 512));
+
+    let (cold_conn, cold) = Project::with_source(MANY_DOCUMENTED_FUNCTIONS)
+        .walk_then_backfill(&EmbeddingPipeline::load_with_cache(&config, cache()));
+    assert_eq!(cold.cache_hits, 0, "a new cache has nothing to serve");
+    assert!(cold.embedded >= 12, "every documented function is embedded: {cold:?}");
+
+    let (warm_conn, warm) = Project::with_source(MANY_DOCUMENTED_FUNCTIONS)
+        .walk_then_backfill(&EmbeddingPipeline::load_with_cache(&config, cache()));
+    assert_eq!((warm.embedded, warm.cache_hits), (0, cold.embedded), "every vector is a hit");
+
+    let uncached = EmbeddingPipeline::load_with_cache(&config, None);
+    let (off_conn, off) = Project::with_source(MANY_DOCUMENTED_FUNCTIONS).walk_then_backfill(&uncached);
+    assert_eq!((off.embedded, off.cache_hits), (cold.embedded, 0));
+
+    let fresh = vectors_by_name(&off_conn);
+    assert_eq!(fresh.len(), cold.embedded);
+    assert_eq!(vectors_by_name(&warm_conn), fresh, "cached vectors must be byte-identical to fresh ones");
+    assert_eq!(vectors_by_name(&cold_conn), fresh, "a cold-cache run stores what an uncached run stores");
+
+    let query = uncached.embed_query("read the contents of a file").expect("the model embeds the query");
+    let ranking = top_ten(&off_conn, &query);
+    assert_eq!(ranking.len(), 10);
+    assert_eq!(top_ten(&warm_conn, &query), ranking, "search ranks and scores must not depend on the cache");
+}

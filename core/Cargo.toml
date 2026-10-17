@@ -1,6 +1,6 @@
 [package]
 name = "g-mesh"
-version = "4.10.0"
+version = "4.11.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -183,7 +183,7 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 # Also a normal dependency - repeated here because integration tests link
 # against the library's public API plus dev-dependencies only, and
-# `tests/state_isolation.rs` has to spell out the *real* `~/.g-mesh` it must
+# `tests/it/state_isolation.rs` has to spell out the *real* `~/.g-mesh` it must
 # not be writing into.
 dirs = "5"
 rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }

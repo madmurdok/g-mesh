@@ -203,6 +203,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# shellcheck source=scripts/lib/plugin-bins.sh
+. "$REPO_ROOT/scripts/lib/plugin-bins.sh"
+
 die() {
 	echo "cut-release: $*" >&2
 	exit 1
@@ -633,6 +636,9 @@ main() {
 		# them ships inside the release archive. The sections partition the
 		# suite (`check`), so `run all` is the whole suite; it stops at the
 		# first failing section (docs/adr/0030-test-sections.md).
+		# GM-628: the plugins' vtsls/pyright from their node_modules, as CI
+		# and scripts/test-local.sh have them, not whatever is global.
+		plugin_bins_on_path "$REPO_ROOT" 1
 		log "checking that the test sections cover the whole suite"
 		"$REPO_ROOT/scripts/test-sections.sh" check ||
 			die "scripts/test-sections.sh check failed - a test is in no section or in two; fix the filtersets before cutting a release"
@@ -666,9 +672,21 @@ main() {
 		# what ships and what the sections above just tested - this one, or
 		# a different one neither check above was written for - has to fail
 		# a real test to reach a release.
+		#
+		# Three runs, the same `-p g-mesh` scope. Core's integration tests
+		# are two binaries (`it`, `scripts`, GM-623), and most of their tests
+		# spawn a real detached daemon and a Node plugin; at libtest's default
+		# width (num-cpus threads in one process) they can fail from
+		# contention, as nextest's first unconfigured run did
+		# (.config/nextest.toml). So they run two at a time, the width of
+		# nextest's `daemon-spawning` group; the cheap unit tests and the
+		# doctests keep the full width.
 		log "running cargo test -p g-mesh - the exact package scope build-targets.sh ships (GM-302)"
 		test_start="$(date +%s)"
-		(cd "$REPO_ROOT" && cargo test -p g-mesh) ||
+		(cd "$REPO_ROOT" &&
+			cargo test -p g-mesh --lib --bins &&
+			cargo test -p g-mesh --doc &&
+			cargo test -p g-mesh --test it --test scripts -- --test-threads=2) ||
 			die "cargo test -p g-mesh failed - the shipped configuration itself is broken, even though the workspace test sections passed; fix it before cutting a release (see GM-302)"
 		test_end="$(date +%s)"
 		log "cargo test -p g-mesh passed in $((test_end - test_start))s"

@@ -41,7 +41,8 @@ use crate::storage::schema;
 use crate::watcher::batch::{classify_settled, order_for_routing};
 use crate::watcher::debounce::Debouncer;
 use crate::watcher::ignore_layers::GITIGNORE_FILE_NAME;
-use crate::watcher::ProjectWatcher;
+use crate::watcher::rescan::RescanScheduler;
+use crate::watcher::{Change, ProjectWatcher};
 
 /// Unix only: on Windows the endpoint is a pipe name (see `ipc::windows`).
 #[cfg(unix)]
@@ -633,6 +634,9 @@ fn spawn_watch_consumer(
     start: ConsumerStart,
 ) {
     thread::spawn(move || {
+        // Taken before the start's own `.gitignore` recheck and reconcile,
+        // which count as the first run for a later Rescan's recheck.
+        let mut rescans = Rescans::new();
         // On this thread, before the first batch, as an in-session edit would
         // be; events meanwhile queue in the watcher's channel.
         match start {
@@ -641,13 +645,21 @@ fn spawn_watch_consumer(
                 // `.gitignore` edits made while no daemon watched, then every
                 // other file changed meanwhile.
                 registry.recheck_gitignores_since_index(&conn);
-                registry.reconcile_since_index(&conn, registry::ReconcileMode::Plain);
+                registry.reconcile_since_index(
+                    &conn,
+                    registry::ReconcileMode::Plain,
+                    registry::ReconcileScope::Start,
+                );
             }
             ConsumerStart::Seeded(gate) => {
                 seed::hold_the_seeded_reconcile_for_tests();
                 // The reparsed files are recorded semantic-pending; the
                 // start's scoped pass below reads them back.
-                registry.reconcile_since_index(&conn, registry::ReconcileMode::Seeded);
+                registry.reconcile_since_index(
+                    &conn,
+                    registry::ReconcileMode::Seeded,
+                    registry::ReconcileScope::Start,
+                );
                 gate.open();
                 // After the gate, as the watcher's reindex of a live edit
                 // serves the old graph until its swap; before the stamp, so a
@@ -668,9 +680,46 @@ fn spawn_watch_consumer(
         registry.owed_semantic_file_passes(&conn);
         let mut debouncer = Debouncer::new(DEBOUNCE_WINDOW);
         loop {
-            watch_and_route_once(&watcher, &mut debouncer, &root, &conn, &registry);
+            watch_and_route_once(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry);
         }
     });
+}
+
+/// The watcher loop's dropped-event state (GM-616), beside its
+/// [`Debouncer`]: the scheduler holding the subtrees to reconcile, and the
+/// `.gitignore` watermark.
+pub(crate) struct Rescans {
+    pub(crate) scheduler: RescanScheduler,
+    /// Unix seconds when the previous reconcile started (at first, the
+    /// consumer's start): a `.gitignore` with a newer mtime goes through
+    /// [`PluginRegistry::gitignore_changed`] at the next Rescan run.
+    pub(crate) gitignores_since: i64,
+}
+
+impl Rescans {
+    /// The daemon's timings, the watermark at now.
+    pub(crate) fn new() -> Self {
+        Self::with_scheduler(RescanScheduler::new())
+    }
+
+    /// `scheduler`, the watermark at now.
+    pub(crate) fn with_scheduler(scheduler: RescanScheduler) -> Self {
+        Self { scheduler, gitignores_since: gitignore_watermark() }
+    }
+}
+
+/// The `.gitignore` watermark for a reconcile starting now: one second before
+/// now. mtimes are compared in whole seconds and strictly, so a `.gitignore`
+/// written in the same second the run starts, after the run has read it, is
+/// still newer than the next run's watermark. The cost is rechecking a file
+/// once more, which the gate in [`PluginRegistry::gitignore_changed`] absorbs.
+fn gitignore_watermark() -> i64 {
+    unix_now_secs() - 1
+}
+
+/// Whole seconds since the epoch, now (0 if the clock is before it).
+fn unix_now_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64)
 }
 
 /// One iteration of the watcher loop: waits up to [`DEBOUNCE_WINDOW`] for a
@@ -686,15 +735,27 @@ fn spawn_watch_consumer(
 /// routing, the batch's `.gitignore` paths and the links whose row the reload
 /// changed go through [`PluginRegistry::gitignore_changed`], which reindexes
 /// each language whose indexed files they changed.
+///
+/// A Rescan (events the OS dropped, GM-616) skips the debouncer: it goes to
+/// `rescans`' scheduler, and after the batch, when the scheduler says a run is
+/// due, [`PluginRegistry::rescan_subtrees`] reconciles the pending subtrees
+/// with the disk.
 fn watch_and_route_once(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
+    rescans: &mut Rescans,
     root: &Path,
     conn: &IndexStore,
     registry: &PluginRegistry,
 ) {
-    if let Some(path) = watcher.next_change(DEBOUNCE_WINDOW) {
-        debouncer.record(path);
+    match watcher.next_change(DEBOUNCE_WINDOW) {
+        Some(Change::Path(path)) => debouncer.record(path),
+        // `next_change` widens a Rescan outside the root to the root; `""`
+        // is the root here as well.
+        Some(Change::Rescan(path)) => {
+            rescans.scheduler.record(relative_wire_path(root, &path).unwrap_or_default())
+        }
+        None => {}
     }
     let mut settled_paths = debouncer.drain_ready();
     let mut links = Vec::new();
@@ -735,6 +796,12 @@ fn watch_and_route_once(
     // the graph's new state, so the gate compares against it.
     if !gitignores.is_empty() || !links.is_empty() {
         registry.gitignore_changed(conn, &gitignores, &links);
+    }
+    if let Some(subtrees) = rescans.scheduler.due() {
+        let started = std::time::Instant::now();
+        let gitignores_since = std::mem::replace(&mut rescans.gitignores_since, gitignore_watermark());
+        registry.rescan_subtrees(conn, &subtrees, watcher, gitignores_since);
+        rescans.scheduler.ran(started.elapsed());
     }
 }
 

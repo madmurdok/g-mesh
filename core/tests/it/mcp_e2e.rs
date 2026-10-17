@@ -1,0 +1,184 @@
+//! The acceptance test for the MCP surface: a real `rmcp` client spawns the
+//! real `g-mesh mcp-shim` binary, which bootstraps a real daemon, and the
+//! whole MCP handshake happens over that chain.
+//!
+//! A genuine client rather than hand-written JSON on purpose - it exercises
+//! the exact path a real MCP client takes, and cannot be subtly wrong about
+//! the protocol in the same way a hand-rolled probe can. `daemon_core.rs` and
+//! `shim_bootstrap.rs` keep the hand-rolled probes, so the literal wire format
+//! stays pinned by something that does not share the server's own code.
+
+use std::path::{Path, PathBuf};
+
+use g_mesh::daemon;
+use g_mesh::storage::connection::project_dir;
+use rmcp::model::CallToolRequestParams;
+use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
+use rmcp::ServiceExt;
+use serde_json::json;
+use tokio::process::Command;
+
+use crate::common;
+
+use crate::common::Lifeline;
+
+const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
+
+/// Name plus the parameters a caller must supply - the half of each schema a
+/// follow-up ticket is not allowed to quietly change.
+const EXPECTED_TOOLS: [(&str, &[&str]); 8] = [
+    ("find_callees", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths", "answer"]),
+    ("find_callers", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths", "answer"]),
+    ("find_definition", &["symbol_name", "symbol_id", "file_path", "position", "cursor", "include_source"]),
+    (
+        "find_implementations",
+        &[
+            "symbol_id",
+            "symbol_name",
+            "cursor",
+            "limit",
+            "file_paths",
+            "transitive",
+            "max_depth",
+            "resume_token",
+        ],
+    ),
+    ("find_references", &["symbol_id", "symbol_name", "cursor", "limit", "file_paths", "answer"]),
+    ("get_dependencies", &["file_path", "module_id", "direction", "max_depth", "max_fanout", "resume_token"]),
+    ("get_file_outline", &["file_path", "cursor", "limit", "detail"]),
+    ("search_code", &["query", "cursor", "limit"]),
+];
+
+/// Temp project root plus teardown of the daemon the shim bootstraps for it
+/// and the `~/.g-mesh/projects/<hash>/` directory it lives in.
+struct Project {
+    dir: tempfile::TempDir,
+}
+
+impl Project {
+    fn new() -> Self {
+        Self { dir: tempfile::tempdir().expect("failed to create a temp project root") }
+    }
+
+    fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn pid_file(&self) -> PathBuf {
+        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+    }
+
+    fn daemon_pid(&self) -> u32 {
+        std::fs::read_to_string(self.pid_file())
+            .expect("no daemon pid file - the shim never bootstrapped one")
+            .trim()
+            .parse()
+            .expect("pid file does not contain a pid")
+    }
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        if self.pid_file().exists() {
+            let pid = self.daemon_pid();
+            common::kill_and_wait(pid);
+        }
+        if let Ok(state) = project_dir(self.root()) {
+            let _ = std::fs::remove_dir_all(&state);
+        }
+    }
+}
+
+fn is_alive(pid: u32) -> bool {
+    daemon::is_process_alive(pid)
+}
+
+/// GM-301: see `common::wait_for`'s doc comment for why this delegates
+/// instead of polling against a file-local timeout constant.
+fn wait_for(what: &str, ready: impl FnMut() -> bool) {
+    common::wait_for(what, common::startup_timeout(), ready);
+}
+
+#[tokio::test]
+async fn a_real_mcp_client_discovers_and_calls_the_tool_surface_through_the_shim() {
+    let project = Project::new();
+    let root = project.root().to_path_buf();
+
+    // Same spawn shape the MCP client of a real editor uses: the project
+    // directory as cwd is the shim's entire notion of project identity.
+    let transport = TokioChildProcess::new(Command::new(BIN).configure(|cmd| {
+        cmd.lifeline();
+        // `kill_on_drop`, because a shim that outlives the test wedges the
+        // whole process on Windows (GM-249 - see `common::kill_and_wait`).
+        cmd.kill_on_drop(true).arg("mcp-shim").current_dir(&root).env_remove(g_mesh::shim::PROJECT_DIR_ENV);
+    }))
+    .expect("failed to spawn the shim");
+
+    let client = ().serve(transport).await.expect("MCP initialization failed");
+
+    let info = client.peer_info().expect("server never reported its info");
+    assert_eq!(info.server_info.name, "g-mesh");
+    assert!(info.capabilities.tools.is_some(), "a server with tools must advertise them");
+
+    let listed = client.list_tools(None).await.expect("tools/list failed");
+    let mut tools = listed.tools;
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+    let expected_names: Vec<&str> = EXPECTED_TOOLS.iter().map(|(name, _)| *name).collect();
+    assert_eq!(names, expected_names);
+
+    for (tool, (name, params)) in tools.iter().zip(EXPECTED_TOOLS) {
+        let schema = &tool.input_schema;
+        assert_eq!(schema.get("type").and_then(|t| t.as_str()), Some("object"), "{name} schema");
+        let properties = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .unwrap_or_else(|| panic!("{name} publishes no parameter properties"));
+        for param in params {
+            assert!(properties.contains_key(*param), "{name} is missing parameter `{param}`");
+        }
+        assert_eq!(properties.len(), params.len(), "{name} publishes unexpected parameters: {properties:?}");
+        assert!(
+            tool.description.as_ref().is_some_and(|d| !d.is_empty()),
+            "{name} has no description for an agent to choose it by"
+        );
+    }
+
+    let search_code = tools.iter().find(|tool| tool.name == "search_code").expect("search_code is listed");
+    assert!(
+        search_code.description.as_deref().is_some_and(
+            |d| d.contains("first for a \"find the code that does X\" prompt that names no symbol")
+        ),
+        "search_code's description must say when to reach for it first: {:?}",
+        search_code.description
+    );
+
+    // Every tool is a stub for now, so this is the "answers instead of
+    // crashing" check: a tool-level error result, connection intact.
+    let called = client
+        .call_tool(
+            CallToolRequestParams::new("find_references").with_arguments(
+                json!({ "symbol_id": "does-not-exist" })
+                    .as_object()
+                    .cloned()
+                    .expect("arguments literal is an object"),
+            ),
+        )
+        .await
+        .expect("tools/call must return a result, not a protocol failure");
+    assert_eq!(called.is_error, Some(true));
+
+    // Both processes have to survive the call: the session still answering
+    // after it is the strongest form of that assertion.
+    let pid = project.daemon_pid();
+    assert!(is_alive(pid), "the daemon died during the session");
+    let listed_again = client.list_tools(None).await.expect("the session must survive a failed tool call");
+    assert_eq!(listed_again.tools.len(), EXPECTED_TOOLS.len());
+
+    client.cancel().await.expect("failed to shut the client down");
+
+    // The daemon is detached by design: it outlives the shim that spawned it,
+    // ready for the next client.
+    wait_for("the daemon to stay up after the client leaves", || is_alive(pid));
+}

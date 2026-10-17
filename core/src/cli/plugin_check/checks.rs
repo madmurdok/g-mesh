@@ -5,7 +5,7 @@
 //! the bulk streams and the control-plane transcript and returns a verdict.
 //! That split is what makes each rule unit-testable against a hand-built
 //! transcript (this module's tests) *and* provable end to end by a fake plugin
-//! that breaks only that rule (`core/tests/plugin_check.rs`).
+//! that breaks only that rule (`core/tests/it/plugin_check.rs`).
 //!
 //! # The checks, and the evidence each one reads
 //!

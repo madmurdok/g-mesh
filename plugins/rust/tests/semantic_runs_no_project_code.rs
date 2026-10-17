@@ -1302,4 +1302,77 @@ mod source_freshness {
         );
         println!("{}", ran_marker(test));
     }
+
+    /// The answer about a call into an edited file follows the text the
+    /// index holds, not whatever the disk holds by the time the server reads
+    /// it. util.rs is edited and indexed (`Thing::method` on line 9), then
+    /// rewritten once more on disk before the pass: `Thing` moves further
+    /// down and `Third::method` takes line 9. The server must answer against
+    /// the indexed text, which only an open document with that text makes
+    /// it do; one that reads util.rs off disk answers with the newer position
+    /// (or, until it reads, the old one), and neither is `Thing::method` in
+    /// the index.
+    ///
+    /// Control: in `LspBridge::forward_watched`, drop the block that moves an
+    /// indexed file on disk into the resync set.
+    #[test]
+    fn the_answer_about_an_edited_file_follows_the_indexed_text_not_a_newer_disk() {
+        let real = real_toolchain();
+        let scratch = Scratch::new("fresh-newer-disk");
+        let root = scratch.0.clone();
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        in_its_env(
+            "source_freshness::the_answer_about_an_edited_file_follows_the_indexed_text_not_a_newer_disk_in_its_env",
+            &root,
+            &real,
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn the_answer_about_an_edited_file_follows_the_indexed_text_not_a_newer_disk_in_its_env() {
+        let test =
+            "source_freshness::the_answer_about_an_edited_file_follows_the_indexed_text_not_a_newer_disk_in_its_env";
+        let Some((root, _real)) = child_fixture(test) else { return };
+        let mut engine = semantic::engine(&root).expect("the engine starts");
+        let before = index_of(&root);
+        let first = engine.answer(&[], &before).expect("the first pass answers");
+        assert_eq!(
+            called_by_main(&before, &first),
+            ["util::Thing::method"],
+            "sanity: the first pass resolves `main -> Thing::method`"
+        );
+
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Other;\n\nimpl Other {\n    pub fn method(&self) {}\n}\n\n\
+             pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        let after = index_of(&root);
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Other;\n\nimpl Other {\n    pub fn method(&self) {}\n}\n\n\
+             pub struct Third;\n\nimpl Third {\n    pub fn method(&self) {}\n}\n\n\
+             pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+        let files = [RelPath::new("app/src/util.rs"), RelPath::new("app/src/main.rs")];
+        let second = engine.answer(&files, &after).expect("the second pass answers");
+        assert_eq!(
+            called_by_main(&after, &second),
+            ["util::Thing::method"],
+            "`main -> method` must land on `Thing::method` as the index has it; the disk has `Third::method` \
+             there and `Thing::method` further down"
+        );
+        println!("{}", ran_marker(test));
+    }
 }

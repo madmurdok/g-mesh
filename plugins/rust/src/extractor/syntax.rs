@@ -93,6 +93,20 @@ pub(crate) fn flatten_path<'s>(node: Node, source: &'s str) -> Option<Vec<Seg<'s
     }
 }
 
+/// The node of a path's last segment: `Limited` in `ContextMode::Limited`,
+/// `new` in `T::new` or `Vec::<u8>::new`, the type in a `generic_type`. Any
+/// other node is its own last segment. A semantic engine asked at a path's
+/// start answers the qualifier (the type or module), not the item the path
+/// names (GM-618).
+pub(crate) fn path_last_segment(node: Node) -> Node {
+    let next = match node.kind() {
+        "scoped_identifier" | "scoped_type_identifier" => node.child_by_field_name("name"),
+        "generic_type" => node.child_by_field_name("type"),
+        _ => None,
+    };
+    next.map_or(node, path_last_segment)
+}
+
 /// A path's own name - its last segment - for the common case where only that
 /// is wanted. `None` for a path whose last segment is a keyword, which no
 /// declaration is ever called.
@@ -353,5 +367,29 @@ mod tests {
         assert!(!looks_like_type("point"));
         assert!(!looks_like_type("_private"));
         assert!(!looks_like_type(""));
+    }
+
+    /// GM-618: the node a semantic engine is asked at for a path - its last
+    /// segment, through scoped paths and generic types alike - and any other
+    /// node is its own last segment.
+    ///
+    /// Control: delete the `"generic_type"` arm of `path_last_segment` (the
+    /// `Vec<u8>` row names the whole type); return `node` unchanged (every
+    /// path row names its start).
+    #[test]
+    fn the_last_segment_of_a_path_is_the_name_it_ends_in() {
+        let source = "type X = Vec<u8>;\ntype Y = a::b::T;\nfn f() { a::b::c(); }";
+        let tree = parse(source);
+        let last = |kind: &str| {
+            let node = first(&tree, kind);
+            (source[node.byte_range()].to_string(), source[path_last_segment(node).byte_range()].to_string())
+        };
+        // A generic type is asked at the type it applies, not at its arguments.
+        assert_eq!(last("generic_type"), ("Vec<u8>".to_string(), "Vec".to_string()));
+        // The deepest `name` of a scoped path, through the qualifiers.
+        assert_eq!(last("scoped_type_identifier"), ("a::b::T".to_string(), "T".to_string()));
+        assert_eq!(last("scoped_identifier"), ("a::b".to_string(), "b".to_string()));
+        // A bare identifier is its own last segment.
+        assert_eq!(last("type_identifier"), ("X".to_string(), "X".to_string()));
     }
 }

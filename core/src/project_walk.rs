@@ -82,7 +82,7 @@ pub fn project_files_under(
 }
 
 /// Whether `relative` lies in one of `subtrees` (`""` is the whole project).
-fn under_any(relative: &str, subtrees: &[String]) -> bool {
+pub(crate) fn under_any(relative: &str, subtrees: &[String]) -> bool {
     subtrees.iter().any(|subtree| {
         subtree.is_empty()
             || relative

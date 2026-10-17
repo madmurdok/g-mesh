@@ -4111,36 +4111,57 @@ fn sorted(mut events: Vec<String>) -> Vec<String> {
     events
 }
 
+/// The files the scripted server was sent a `didOpen` for, from its
+/// `openedLog`, in arrival order, with the scratch root cut off the URIs.
+fn opened(scratch: &Scratch, log: &Path) -> Vec<String> {
+    file_events(scratch, log)
+        .into_iter()
+        .map(|line| line.split_whitespace().next().unwrap_or_default().to_string())
+        .collect()
+}
+
 /// A server that watches no files itself (the bridge claims client file
-/// watching) hears of a change on disk only from the bridge: every file a
-/// pass is sent is announced as `workspace/didChangeWatchedFiles`, `Changed`
-/// when it is on disk and `Deleted` when it is gone. A file the server holds
-/// open is re-synced with `didChange` instead, even when the pass asks
+/// watching) hears of a change on disk only from the bridge. A file the
+/// server holds open is re-synced with `didChange`, even when the pass asks
 /// nothing in it: the server reads an open file from the client, not from
-/// disk.
+/// disk. A file still on disk that the index holds is opened with `didOpen`
+/// and the index text, asked about or not: a
+/// `workspace/didChangeWatchedFiles` is not acknowledged and makes the
+/// server read the disk, which may hold text older or newer than the index.
+/// Only a file the index does not hold is announced: `Changed` when it is
+/// on disk (a manifest), `Deleted` when it is gone.
 ///
-/// Control: in `LspBridge::forward_watched`, announce an open file like any
-/// other (`if false` for the `opened` check).
+/// Controls: in `LspBridge::forward_watched`, drop the block that moves
+/// an indexed file on disk into the resync set (a.toy and c.toy are
+/// announced `Changed`); announce an open file like any other (`if false`
+/// for the `opened` check).
 #[test]
-fn a_watching_bridge_announces_the_files_a_pass_is_sent_and_resyncs_open_ones() {
+fn a_watching_bridge_opens_edited_indexed_files_and_announces_only_the_rest() {
     let scratch = Scratch::new("watched-forward");
     let (mut index, _) = fixture(&scratch);
     let events = scratch.path().join("events.log");
+    let opens = scratch.path().join("opened.log");
     let config = scratch.server(json!({
         "readiness": { "kind": "none" },
         "positionEncoding": "utf-16",
         "answers": answers_the_site(&scratch),
         "fileEventsLog": events.to_string_lossy(),
+        "openedLog": opens.to_string_lossy(),
     }));
     let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
     let b = RelPath::new("src/b.toy");
     let first = bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
     assert_eq!(semantic_edges(&first).len(), 1, "the first pass opens b.toy: {:#?}", first.diff);
     let before = file_events(&scratch, &events).len();
+    let opened_before = opened(&scratch, &opens).len();
+    assert_eq!(opened(&scratch, &opens), ["src/b.toy"], "sanity: only the asked file is open");
 
-    // b.toy loses its call: still open on the server, and asked nothing now.
-    // c.toy is new and has a call, so the pass reaches the server; gone.toy
-    // was deleted.
+    // a.toy is rewritten on disk, indexed and asked nothing. b.toy loses its
+    // call: still open on the server, and asked nothing now. c.toy is new
+    // and has a call, so the pass reaches the server. Cargo.toml is on disk
+    // and not indexed; gone.toy was deleted.
+    scratch.write("src/a.toy", A_TOY);
+    scratch.write("Cargo.toml", "[package]\nname = \"toy\"\n");
     let b_source = "fn caller\n";
     scratch.write("src/b.toy", b_source);
     let mut builder = FileGraphBuilder::new("toy", "toy-parser", &b);
@@ -4153,14 +4174,211 @@ fn a_watching_bridge_announces_the_files_a_pass_is_sent_and_resyncs_open_ones() 
     );
     index.insert(b.clone(), b_source.to_string(), builder.finish());
     crowd_file(&scratch, &mut index, "src/c.toy", 1);
-    let files = ["src/a.toy", "src/b.toy", "src/c.toy", "src/gone.toy"].map(RelPath::new);
+    let files = ["src/a.toy", "src/b.toy", "src/c.toy", "src/gone.toy", "Cargo.toml"].map(RelPath::new);
     bridge.answer(&files, &index).expect("the bridge answers");
 
     let second = file_events(&scratch, &events).split_off(before);
     assert_eq!(
         sorted(second.clone()),
-        ["didChange src/b.toy", "watched 2 src/a.toy", "watched 2 src/c.toy", "watched 3 src/gone.toy"],
+        ["didChange src/b.toy", "watched 2 Cargo.toml", "watched 3 src/gone.toy"],
         "what the second pass told the server: {second:?}"
+    );
+    let opened_now = opened(&scratch, &opens).split_off(opened_before);
+    assert_eq!(
+        sorted(opened_now.clone()),
+        ["src/a.toy", "src/c.toy"],
+        "the second pass opens the indexed files it was sent: {opened_now:?}"
+    );
+}
+
+/// A file gone from disk is announced `Deleted` even while the index still
+/// holds it: there is nothing left for the server to read, and opening it
+/// with the index text would keep a deleted file alive on the server.
+///
+/// Control: in `LspBridge::forward_watched`, drop `exists &&` from the
+/// indexed-file condition (a.toy is opened instead of announced).
+#[test]
+fn a_file_gone_from_disk_is_announced_deleted_even_while_the_index_holds_it() {
+    let scratch = Scratch::new("watched-deleted-indexed");
+    let (index, _) = fixture(&scratch);
+    let events = scratch.path().join("events.log");
+    let opens = scratch.path().join("opened.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "fileEventsLog": events.to_string_lossy(),
+        "openedLog": opens.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    let b = RelPath::new("src/b.toy");
+    bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
+    let events_before = file_events(&scratch, &events).len();
+    let opened_before = opened(&scratch, &opens).len();
+
+    // a.toy is deleted from disk; the index still holds it. b.toy is sent
+    // along so the pass reaches the server.
+    std::fs::remove_file(scratch.path().join("src/a.toy")).expect("a.toy is on disk");
+    assert!(index.entry(&RelPath::new("src/a.toy")).is_some(), "sanity: the index holds a.toy");
+    let files = ["src/a.toy", "src/b.toy"].map(RelPath::new);
+    bridge.answer(&files, &index).expect("the bridge answers");
+
+    let watched: Vec<String> = file_events(&scratch, &events)
+        .split_off(events_before)
+        .into_iter()
+        .filter(|event| event.starts_with("watched"))
+        .collect();
+    assert_eq!(watched, ["watched 3 src/a.toy"], "a.toy is announced deleted");
+    let opened_now = opened(&scratch, &opens).split_off(opened_before);
+    assert!(!opened_now.contains(&"src/a.toy".to_string()), "a deleted file was opened: {opened_now:?}");
+}
+
+/// The versions the scripted server was sent `didOpen` at, from its
+/// `openVersionsLog` (`<uri> <version>`), in arrival order, with the scratch
+/// root cut off the URIs.
+fn open_versions(scratch: &Scratch, log: &Path) -> Vec<String> {
+    let roots = [scratch.uri(""), scratch.real_uri("")];
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| roots.iter().fold(line.to_string(), |line, root| line.replace(root.as_str(), "")))
+        .collect()
+}
+
+/// A bridge over a server that watches no files itself, a.toy opened by a
+/// pass that was sent it edited, and the logs to read back what the server
+/// heard. Returns the bridge, the index and the three logs.
+fn bridge_holding_a_open(scratch: &Scratch) -> (LspBridge, SdkIndex, [PathBuf; 3]) {
+    let (index, _) = fixture(scratch);
+    let events = scratch.path().join("events.log");
+    let opens = scratch.path().join("opened.log");
+    let versions = scratch.path().join("versions.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(scratch),
+        "fileEventsLog": events.to_string_lossy(),
+        "openedLog": opens.to_string_lossy(),
+        "openVersionsLog": versions.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    let b = RelPath::new("src/b.toy");
+    bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
+    scratch.write("src/a.toy", A_TOY);
+    let files = ["src/a.toy", "src/b.toy"].map(RelPath::new);
+    bridge.answer(&files, &index).expect("the bridge answers");
+    assert_eq!(opened(scratch, &opens), ["src/b.toy", "src/a.toy"], "sanity: the edit pass opened a.toy");
+    (bridge, index, [events, opens, versions])
+}
+
+/// A file the server holds open and that is then deleted is closed on the
+/// server (`didClose`), dropped from the bridge's open set and announced
+/// `Deleted`; recreated later, it is opened afresh at version 1.
+///
+/// Control: in `LspBridge::forward_watched`, delete the
+/// `!exists && opened.remove(..)` block and test `opened.contains_key(&path)
+/// || (exists && index.entry(&path).is_some())` for the resync (no
+/// `didClose`, no `Deleted`: the open file is re-synced instead).
+#[test]
+fn a_deleted_open_file_is_closed_and_announced_and_reopened_at_version_one_when_recreated() {
+    let scratch = Scratch::new("watched-deleted-open");
+    let (mut bridge, mut index, [events, opens, versions]) = bridge_holding_a_open(&scratch);
+    assert_eq!(open_versions(&scratch, &versions), ["src/b.toy 1", "src/a.toy 1"]);
+    let files = ["src/a.toy", "src/b.toy"].map(RelPath::new);
+    let a = RelPath::new("src/a.toy");
+    let (source, graph) = {
+        let entry = index.entry(&a).expect("the index holds a.toy");
+        (entry.source.clone(), entry.graph.clone())
+    };
+
+    // a.toy goes from disk and from the index, as an indexing pass would
+    // have it.
+    let before = file_events(&scratch, &events).len();
+    let opened_before = opened(&scratch, &opens).len();
+    std::fs::remove_file(scratch.path().join("src/a.toy")).expect("a.toy is on disk");
+    index.remove(&a);
+    bridge.answer(&files, &index).expect("the bridge answers");
+    assert_eq!(
+        file_events(&scratch, &events).split_off(before),
+        ["didClose src/a.toy", "watched 3 src/a.toy"],
+        "an open deleted file is closed, then announced deleted"
+    );
+    assert_eq!(opened(&scratch, &opens).len(), opened_before, "nothing is opened by the deleting pass");
+
+    // Back on disk and in the index: the bridge no longer holds it open, so
+    // it is a new document.
+    scratch.write("src/a.toy", &source);
+    index.insert(a.clone(), source, graph);
+    bridge.answer(&files, &index).expect("the bridge answers");
+    assert_eq!(
+        opened(&scratch, &opens).split_off(opened_before),
+        ["src/a.toy"],
+        "the recreated file is opened again"
+    );
+    assert_eq!(
+        open_versions(&scratch, &versions).last().map(String::as_str),
+        Some("src/a.toy 1"),
+        "at version 1, not as an edit of the closed document"
+    );
+}
+
+/// A deleted file the server never held open is only announced `Deleted`:
+/// there is nothing to close.
+///
+/// Control: in `LspBridge::forward_watched`, run the `didClose` notification
+/// without the `opened.remove(..)` check (a `didClose` for a.toy appears).
+#[test]
+fn a_deleted_file_the_server_never_opened_is_announced_without_a_close() {
+    let scratch = Scratch::new("watched-deleted-unopened");
+    let (index, _) = fixture(&scratch);
+    let events = scratch.path().join("events.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "fileEventsLog": events.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    let b = RelPath::new("src/b.toy");
+    bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
+    let before = file_events(&scratch, &events).len();
+
+    std::fs::remove_file(scratch.path().join("src/a.toy")).expect("a.toy is on disk");
+    let files = ["src/a.toy", "src/b.toy"].map(RelPath::new);
+    bridge.answer(&files, &index).expect("the bridge answers");
+    assert_eq!(
+        file_events(&scratch, &events).split_off(before),
+        ["watched 3 src/a.toy"],
+        "announced deleted, and nothing closed"
+    );
+}
+
+/// A file deleted and recreated before the pass forwards it is an edit: the
+/// server's open document is re-synced with `didChange`, not closed and not
+/// announced deleted.
+///
+/// Control: in `LspBridge::forward_watched`, read `exists` as `false` for an
+/// open file (`let exists = false && absolute.exists()`): a `didClose` and a
+/// `Deleted` replace the `didChange`.
+#[test]
+fn a_file_deleted_and_recreated_before_the_pass_is_resynced_not_closed() {
+    let scratch = Scratch::new("watched-recreated-open");
+    let (mut bridge, mut index, [events, _opens, _versions]) = bridge_holding_a_open(&scratch);
+    let a = RelPath::new("src/a.toy");
+    let graph = index.entry(&a).expect("the index holds a.toy").graph.clone();
+    let before = file_events(&scratch, &events).len();
+
+    // Gone and back before the pass, with other text.
+    let source = "🦀🦀 add\n";
+    std::fs::remove_file(scratch.path().join("src/a.toy")).expect("a.toy is on disk");
+    scratch.write("src/a.toy", source);
+    index.insert(a, source.to_string(), graph);
+    let files = ["src/a.toy", "src/b.toy"].map(RelPath::new);
+    bridge.answer(&files, &index).expect("the bridge answers");
+    assert_eq!(
+        file_events(&scratch, &events).split_off(before),
+        ["didChange src/a.toy"],
+        "re-synced as an edit: no close, no deleted announcement"
     );
 }
 
@@ -4201,7 +4419,8 @@ fn a_bridge_that_does_not_watch_files_announces_nothing() {
 
 /// A pass that reaches no server - nothing to ask in its files, or none of
 /// them indexed any more - has no one to tell about them: the files stay
-/// pending, and the next pass that reaches the server announces them.
+/// pending, and the next pass that reaches the server opens the indexed
+/// ones and announces the deleted one.
 ///
 /// Control: on `LspBridge::answer`'s nothing-to-ask return, drop the pending
 /// files (`self.unforwarded.clear()`).
@@ -4210,12 +4429,14 @@ fn files_a_serverless_pass_was_sent_are_announced_by_the_next_pass_that_reaches_
     let scratch = Scratch::new("watched-carry");
     let (index, _) = fixture(&scratch);
     let events = scratch.path().join("events.log");
+    let opens = scratch.path().join("opened.log");
     let log = scratch.path().join("asked.log");
     let config = scratch.server(json!({
         "readiness": { "kind": "none" },
         "positionEncoding": "utf-16",
         "answers": answers_the_site(&scratch),
         "fileEventsLog": events.to_string_lossy(),
+        "openedLog": opens.to_string_lossy(),
         "log": log.to_string_lossy(),
     }));
     let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
@@ -4229,10 +4450,12 @@ fn files_a_serverless_pass_was_sent_are_announced_by_the_next_pass_that_reaches_
 
     bridge.answer(&[RelPath::new("src/b.toy")], &index).expect("the bridge answers");
     let told = file_events(&scratch, &events);
+    assert_eq!(told, ["watched 3 src/gone.toy"], "what the server was told once a pass reached it");
+    let opened_now = opened(&scratch, &opens);
     assert_eq!(
-        sorted(told.clone()),
-        ["watched 2 src/a.toy", "watched 2 src/b.toy", "watched 3 src/gone.toy"],
-        "what the server was told once a pass reached it: {told:?}"
+        sorted(opened_now.clone()),
+        ["src/a.toy", "src/b.toy"],
+        "the indexed files are opened once a pass reached the server: {opened_now:?}"
     );
 }
 
@@ -4266,13 +4489,14 @@ fn a_watching_bridge_never_announces_a_manifest_or_a_config() {
     scratch.write(".cargo/config.toml", "[env]\nTOY = \"1\"\n");
     bridge.workspace_changed();
     assert!(pass(&mut bridge, &index).complete);
-    // b.toy is open (asked by the whole-project passes), a.toy is not: the
-    // one announcement is a.toy's, which shows the log does record them.
-    let files = ["src/a.toy", "src/b.toy"].map(RelPath::new);
+    // b.toy is open (asked by the whole-project passes), a.toy is indexed
+    // and gone.toy is deleted: the one announcement is gone.toy's, which
+    // shows the log does record them.
+    let files = ["src/a.toy", "src/b.toy", "src/gone.toy"].map(RelPath::new);
     bridge.answer(&files, &index).expect("the bridge answers");
 
     let told = file_events(&scratch, &events);
-    assert_eq!(told, ["watched 2 src/a.toy"], "only a file a pass was sent is announced");
+    assert_eq!(told, ["watched 3 src/gone.toy"], "only a file a pass was sent is announced");
 }
 
 /// The GM-550 flake: rust-analyzer under load paused longer than the settle
@@ -4529,5 +4753,89 @@ fn a_new_bridge_does_not_retract_what_an_earlier_process_emitted() {
         !second.diff.delete_edge_ids.contains(&old),
         "a new process retracts nothing it did not emit: {:#?}",
         second.diff.delete_edge_ids
+    );
+}
+
+// --- GM-618: a path call is asked at its last segment ------------------------
+
+/// The range of the placeholder an answer records for one `CALLS` site of
+/// `b.toy`'s line 1, asked at `(1, asked)` and named `written`. The server
+/// answers that exact question with `a.toy`'s `new`.
+fn answered_range(tag: &str, line: &str, asked: u32, written: &str) -> Range {
+    let scratch = Scratch::new(tag);
+    let mut index = SdkIndex::new();
+
+    let a_source = "fn new\n";
+    scratch.write("src/a.toy", a_source);
+    let a = RelPath::new("src/a.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &a);
+    builder.file_node(range(0, 0, 1, 0));
+    builder.add_node(
+        NodeSpec::new(NodeKind::Function, "new", "new", range(0, 3, 0, 6))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    index.insert(a, a_source.to_string(), builder.finish());
+
+    let b_source = format!("fn caller\n{line}\n");
+    scratch.write("src/b.toy", &b_source);
+    let b = RelPath::new("src/b.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &b);
+    builder.file_node(range(0, 0, 2, 0));
+    let caller = builder.add_node(
+        NodeSpec::new(NodeKind::Function, "caller", "caller", range(0, 0, 1, 15))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    builder.open_site(OpenSite {
+        from_id: caller,
+        position: Position { line: 1, col: asked },
+        name: written.to_string(),
+        kind: OpenSiteKind::Reference,
+        edge_kind: EdgeKind::Calls,
+        from_container: Some("pkg".to_string()),
+        replaces: None,
+    });
+    index.insert(b, b_source, builder.finish());
+
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": [{
+            "uri": scratch.uri("src/b.toy"),
+            "line": 1,
+            "character": asked,
+            "definition": { "uri": scratch.uri("src/a.toy"), "line": 0, "character": 3 },
+        }],
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "{tag}: the site was asked at ({asked}) and answered");
+    let edges = semantic_edges(&answer);
+    assert_eq!(edges.len(), 1, "{tag}: {:#?}", answer.diff);
+    placeholder(&answer, edges[0]).range
+}
+
+/// GM-618: the bridge asks at the position the plugin gives (the path's last
+/// segment), and the recorded range is the written path, not the asked column
+/// plus the path's length. A site asked at its own start is unchanged.
+///
+/// Control: in `site_range` (bridge.rs), append `.and(None)` to the
+/// `written_start(..)` call; the path row ends at column 39 instead of 23.
+#[test]
+fn a_path_call_asked_at_its_last_segment_records_the_written_path_as_its_range() {
+    let path = "    super::Q::<u8>::new();";
+    let asked = path.find("new").unwrap() as u32;
+    assert_eq!(
+        answered_range("path-range", path, asked, "super::Q::<u8>::new"),
+        range(1, 4, 1, 23),
+        "the whole written path"
+    );
+    assert_eq!(
+        answered_range("own-range", "    new();", 4, "new"),
+        range(1, 4, 1, 7),
+        "a site asked at its own start covers its own text"
     );
 }

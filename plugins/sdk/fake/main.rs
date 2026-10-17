@@ -58,16 +58,16 @@
 //! present; `<root>/.<L>-bulk.ndjson` replaces the whole stream and
 //! `<root>/.<L>-bulk.exit` sets the exit status after it.
 //!
-//! **Stub** (no `--dir`, `core/tests/semantic_pass_trigger.rs`). Appends each
+//! **Stub** (no `--dir`, `core/tests/it/semantic_pass_trigger.rs`). Appends each
 //! received method (and `bulkIndex` for a walk) to `$G_MESH_FAKE_PLUGIN_LOG`
 //! when set, answers `fileChanged`/`semanticPass` with an empty diff and any
 //! other request with `{"acknowledged": true}`, and walks to one canned `File`
 //! node for `seed.ts`. With `$G_MESH_FAKE_PLUGIN_STDERR_SPAM` naming a file,
 //! the control-plane process also logs `g-mesh-fake-plugin: spam seq=<n> ...`
 //! lines through `log_line!` in a tight loop for as long as that file exists
-//! (`core/tests/daemon_log_lines.rs`).
+//! (`core/tests/it/daemon_log_lines.rs`).
 //!
-//! **Toy** (`--toy <defect>`, `core/tests/plugin_check.rs`): a conformant
+//! **Toy** (`--toy <defect>`, `core/tests/it/plugin_check.rs`): a conformant
 //! plugin for the toy `.fk` language plus one deliberate defect, for
 //! `g-mesh plugins check` to catch - see `toy.rs`. The first positional
 //! argument is the project root it serves.

@@ -17,7 +17,7 @@ use super::client::{LspClient, Poll, CONTENT_MODIFIED};
 use super::config::{OverloadDisambiguation, SemanticConfig};
 use super::position::{file_uri, line_text, path_from_uri, without_verbatim_prefix, PositionEncoding};
 use crate::graph::{EdgeSpec, FileGraphBuilder, OpenSite, OpenSiteKind, PlaceholderKind};
-use crate::index::SdkIndex;
+use crate::index::{contains as node_contains, SdkIndex};
 use crate::path::RelPath;
 use crate::semantic::{SemanticAnswer, SemanticEngine};
 
@@ -611,7 +611,9 @@ impl LspBridge {
     /// `workspace/didChangeWatchedFiles`, only the files core sends a pass
     /// (the plugin's own source files, which changed), and only inside
     /// [`SemanticEngine::answer`], just before that pass's documents are
-    /// synced; an already open one is re-synced with `didChange` instead.
+    /// synced; an already open one is re-synced with `didChange`, and one the
+    /// index holds is opened with `didOpen`, instead (GM-624) - so in
+    /// practice only deleted files and files outside the index are announced.
     /// Any other change on disk (a manifest, a config) reaches the server
     /// only when the plugin asks it to (for rust-analyzer,
     /// `rust-analyzer/reloadWorkspace` through [`LspBridge::request`]): for a
@@ -773,10 +775,18 @@ impl LspBridge {
     /// about gains nothing by being open, because the server reads the ones it
     /// merely has to *resolve into* off disk itself.
     ///
-    /// Nothing is ever closed again. A `didClose` after each pass would free
+    /// Plus, when [`LspBridge::client_watches_files`] is set, every indexed
+    /// file a pass was sent (an edited one), asked about or not - see
+    /// [`LspBridge::forward_watched`] (GM-624). Those stay open too, so what
+    /// `memoryLimitMb` is charged for grows with the files edited during the
+    /// session, not only with the files asked about.
+    ///
+    /// Nothing is closed again, except a file deleted from disk - see
+    /// [`LspBridge::forward_watched`]. A `didClose` after each pass would free
     /// that text and make the next pass re-send every byte of it, and the
     /// per-file passes that follow every edit are exactly where that would be
-    /// paid over and over.
+    /// paid over and over. It would also undo the GM-624 fix: a closed file
+    /// goes back to the server reading it from disk, asynchronously.
     fn sync_documents(
         client: &mut LspClient,
         opened: &mut BTreeMap<RelPath, OpenDocument>,
@@ -833,28 +843,55 @@ impl LspBridge {
     }
 
     /// Tells the server about every file in `pending` - see
-    /// [`LspBridge::client_watches_files`]. A file the server holds open is
-    /// not announced: its text is the client's, so it is answered with the
-    /// open files to re-sync, which this returns. Created and changed files
-    /// are both `Changed`: the server reads the file either way and tells
-    /// the two apart by what it had.
+    /// [`LspBridge::client_watches_files`] - and returns the ones to hand to
+    /// [`LspBridge::sync_documents`] instead of announcing them.
+    ///
+    /// A file the server holds open is not announced: its text is the
+    /// client's, so it is re-synced. Neither is a file still on disk that
+    /// the index holds (GM-624): it is opened with the index text. A
+    /// `workspace/didChangeWatchedFiles` has no acknowledgement - the server
+    /// reads the file whenever it gets to it, so the next request may still
+    /// see the old text - and what it reads is the disk, which may already
+    /// have moved past the text this pass's positions were computed against.
+    /// A `didOpen` is applied before the next request and carries exactly
+    /// that text. Only deleted files and files the index does not hold
+    /// (a manifest, say) are still announced. Created and changed files are
+    /// both `Changed`: the server reads the file either way and tells the
+    /// two apart by what it had.
+    ///
+    /// A deleted file the server holds open is closed first (`didClose`),
+    /// dropped from `opened`, and then announced `Deleted` like any other
+    /// deleted file. Re-syncing it instead would send nothing - the index no
+    /// longer holds it, so [`LspBridge::sync_documents`] skips it - and the
+    /// server would go on resolving into the deleted file's last text (a
+    /// `mod util;` still finding the removed `util.rs`). Whether a file is
+    /// deleted is read off disk when the batch is forwarded, so one deleted
+    /// and recreated before then is simply an edit.
     fn forward_watched(
         client: &mut LspClient,
         pending: &mut BTreeSet<RelPath>,
-        opened: &BTreeMap<RelPath, OpenDocument>,
+        opened: &mut BTreeMap<RelPath, OpenDocument>,
         root: &Path,
+        index: &SdkIndex,
     ) -> BTreeSet<RelPath> {
         const CHANGED: u32 = 2;
         const DELETED: u32 = 3;
         let mut resync = BTreeSet::new();
         let mut changes = Vec::new();
         for path in std::mem::take(pending) {
-            if opened.contains_key(&path) {
+            let absolute = path.to_absolute(root);
+            let exists = absolute.exists();
+            if exists && (opened.contains_key(&path) || index.entry(&path).is_some()) {
                 resync.insert(path);
                 continue;
             }
-            let absolute = path.to_absolute(root);
-            let kind = if absolute.exists() { CHANGED } else { DELETED };
+            if !exists && opened.remove(&path).is_some() {
+                let _ = client.notify(
+                    "textDocument/didClose",
+                    json!({ "textDocument": { "uri": file_uri(&absolute) } }),
+                );
+            }
+            let kind = if exists { CHANGED } else { DELETED };
             changes.push(json!({ "uri": file_uri(&absolute), "type": kind }));
         }
         if !changes.is_empty() {
@@ -1412,6 +1449,8 @@ struct Landing {
     node_id: String,
     node_name: String,
     address: PlaceholderTarget,
+    /// What the site covers - see [`site_range`].
+    range: Range,
 }
 
 /// One semantic edge this pass recorded, waiting for [`Answers::finish`].
@@ -1491,11 +1530,37 @@ fn witness_rank<'a>(name: &'a str, range: &Range) -> (u32, u32, u32, u32, &'a st
     (range.start.line, range.start.col, range.end.line, range.end.col, name)
 }
 
-/// What a use site covers: the name written at it, starting where the site
-/// starts. `written` is the source text, which is not always the name the
-/// placeholder ends up carrying - see [`Placeholder`].
-fn site_range(at: Position, written: &str) -> Range {
-    Range { start: at, end: Position { line: at.line, col: at.col + written.chars().count() as u32 } }
+/// What a use site covers: the text written at it. `written` is the source
+/// text, which is not always the name the placeholder ends up carrying - see
+/// [`Placeholder`].
+///
+/// The site's position is where the server is asked, which is not always
+/// where `written` starts: a path call is asked at its last segment (`new` in
+/// `super::Q::<u8>::new()`, GM-618), because asked at the path's start a
+/// server answers the qualifier. The range still covers the whole path, as
+/// the structural tier's range for the same call does, so it starts at the
+/// occurrence of `written` in `source`'s line that covers the position,
+/// nearest first. With no source, or no such occurrence on that line (a path
+/// written across lines), it starts at the position.
+fn site_range(source: Option<&str>, at: Position, written: &str) -> Range {
+    let width = written.chars().count() as u32;
+    let start = source
+        .and_then(|source| source.split('\n').nth(at.line as usize))
+        .and_then(|line| written_start(line, at.col, written, width))
+        .unwrap_or(at.col);
+    Range {
+        start: Position { line: at.line, col: start },
+        end: Position { line: at.line, col: start + width },
+    }
+}
+
+/// The column, in characters, where an occurrence of `written` (`width`
+/// characters) in `line` starts and covers `col`, the nearest one to `col`.
+fn written_start(line: &str, col: u32, written: &str, width: u32) -> Option<u32> {
+    let lowest = (col + 1).saturating_sub(width);
+    (lowest..=col)
+        .rev()
+        .find(|&start| line.chars().skip(start as usize).take(width as usize).eq(written.chars()))
 }
 
 /// Everything a placeholder's identity is derived from, in a form that can key
@@ -1758,7 +1823,7 @@ impl Answers {
             &site.from_id,
             site.edge_kind,
             &landing.node_name,
-            site_range(site.position, &site.name),
+            landing.range,
             landing.address.clone(),
             &landing.node_id,
             ordinal,
@@ -2035,8 +2100,8 @@ fn wire_position(
 /// The tightest node containing the location, which may be an encloser of
 /// what the server meant: a class field or an object-literal method has no
 /// node of its own, so a definition at one lands on the class or the const
-/// around it. [`lands_on_name`] tells the two apart, for a `CALLS` answer
-/// landing on its own caller too (GM-593).
+/// around it. [`lands_on_name`] tells the two apart, for a landing on the
+/// referrer or on a node containing the site too, any edge kind.
 fn node_at<'i>(
     index: &'i SdkIndex,
     roots: [&Path; 2],
@@ -2077,8 +2142,9 @@ fn named_landing<'i, 'l>(
 /// range starts at the declaration, so a precise answer passes; one that
 /// landed on an encloser points at a member's name and fails, even a member
 /// sharing the encloser's name, which occurs after the encloser's own.
-/// A `CALLS` answer landing on its own caller passes only here: at the
-/// caller's name it is recursion, elsewhere the encloser fallback (GM-593).
+/// A landing on the referrer or on a node containing the site, any edge
+/// kind, passes only here: at that node's name it is recursion or `Self`,
+/// elsewhere the encloser fallback.
 fn lands_on_name(index: &SdkIndex, path: &RelPath, at: Position, node: &WireNode) -> bool {
     let name: Vec<char> = node.name.chars().collect();
     if name.is_empty() {
@@ -2651,6 +2717,7 @@ fn record_answer(
                             node_id: node.id.clone(),
                             node_name: node.name.clone(),
                             address: address_of(node, site.from_container.clone()),
+                            range: site_range(index.source(&question.file), site.position, &site.name),
                         };
                         return answers.bind_overload(index, landing, node, &path, &ordinals);
                     }
@@ -2693,15 +2760,18 @@ fn record_answer(
             // the server pointed at that node's own name: a const-bound
             // function or a tuple-struct constructor. Pointing inside it at
             // something without a node (a field, an object-literal method)
-            // names the encloser, which is not what is called. A function
-            // landing on the caller itself is the same fallback (a nested
-            // fn, a local, a destructured binding has no node, so the
-            // caller encloses it) unless it points at the caller's own
-            // name, which is recursion (GM-593).
+            // names the encloser, which is not what is called. Any edge
+            // kind: a landing on the referrer or on anything containing the
+            // site is the encloser fallback for a declaration with no node
+            // (a nested fn or enum, a local, a generic parameter), unless it
+            // points at that node's own name (recursion, `Self`).
+            let encloses = |path: &RelPath, node: &WireNode| {
+                node.id == site.from_id || (*path == question.file && node_contains(node, site.position))
+            };
             let landed = target.filter(|(path, node, location)| {
                 agree
-                    && (site.edge_kind != EdgeKind::Calls
-                        || (node.kind == NodeKind::Function && node.id != site.from_id)
+                    && ((!encloses(path, node)
+                        && (site.edge_kind != EdgeKind::Calls || node.kind == NodeKind::Function))
                         || lands_on_name(index, path, wire_position(index, path, encoding, location), node))
             });
             let Some((_, node, _)) = landed else {
@@ -2756,7 +2826,7 @@ fn record_answer(
                 &site.from_id,
                 site.edge_kind,
                 &node.name,
-                site_range(site.position, &site.name),
+                site_range(index.source(&question.file), site.position, &site.name),
                 address,
                 &node.id,
                 None,
@@ -2812,6 +2882,7 @@ fn record_answer(
                 node_id: node.id.clone(),
                 node_name: node.name.clone(),
                 address: address_of(node, site.from_container.clone()),
+                range: site_range(index.source(&question.file), site.position, &site.name),
             };
             answers.bind_overload(index, landing, node, &path, &ordinals)
         }
@@ -2982,7 +3053,7 @@ fn record_implementor(
         // answer and points at the anchor.
         EdgeKind::SupertypeOf,
         &anchor_node.name,
-        site_range(at, &anchor_node.name),
+        site_range(None, at, &anchor_node.name),
         address_of(&anchor_node, container),
         &anchor_node.id,
         None,
@@ -3128,10 +3199,11 @@ impl SemanticEngine for LspBridge {
                 None => Err(None),
                 Some(client) => {
                     client.drain();
-                    // An open file this pass was sent is re-synced even when
-                    // nothing in it is asked: the server reads it from the
-                    // client, not from disk.
-                    let mut synced = Self::forward_watched(client, &mut unforwarded, &opened, &root);
+                    // An open or indexed file this pass was sent is synced
+                    // even when nothing in it is asked: the server then reads
+                    // it from the client, not from disk (GM-624).
+                    let mut synced =
+                        Self::forward_watched(client, &mut unforwarded, &mut opened, &root, index);
                     synced.extend(asked_about.iter().cloned());
                     Self::sync_documents(client, &mut opened, &root, index, &synced, &language, language_ids);
                     match Self::wait_ready(client, &budgets, deadline, &language) {
@@ -3478,7 +3550,7 @@ mod tests {
                     "from",
                     EdgeKind::References,
                     &declaration.name,
-                    site_range(at, written),
+                    site_range(None, at, written),
                     address_of(&declaration, Some("rg::flags::hiargs".to_string())),
                     &declaration.id,
                     None,
@@ -3566,7 +3638,7 @@ mod tests {
         );
         assert_eq!(
             diff.upsert_nodes[0].range,
-            site_range(Position { line: 140, col: 28 }, "SearchMode::Count"),
+            site_range(None, Position { line: 140, col: 28 }, "SearchMode::Count"),
             "the range is still the site's own extent, as wide as what is written there"
         );
     }
@@ -3745,8 +3817,20 @@ mod tests {
     /// How many sites of `(caller, name)` one answer `found` counted as
     /// answered, and how many edges it recorded.
     fn answered_by(index: &SdkIndex, caller: &str, site: OpenSite, found: Value) -> (usize, usize) {
+        answered_in(index, "b.toy", caller, site, found)
+    }
+
+    /// [`answered_by`] for a question asked in `file`, which is where a landing
+    /// can enclose the site.
+    fn answered_in(
+        index: &SdkIndex,
+        file: &str,
+        caller: &str,
+        site: OpenSite,
+        found: Value,
+    ) -> (usize, usize) {
         let question = Question {
-            file: RelPath::new("b.toy"),
+            file: RelPath::new(file),
             position: site.position,
             ask: Ask::Definition(site.clone()),
         };
@@ -3834,15 +3918,18 @@ mod tests {
     /// interface property `go`, an object-literal method that repeats its
     /// const's name, a const-bound function `tick`, a tuple struct `Pair`,
     /// a local `inner` in a function body, and an anonymous `export default`
-    /// function (node `default`, its range starting at `(`, GM-593).
+    /// function (node `default`, its range starting at `(`, GM-593), and an
+    /// impl `impl<S> Sink` (Type node `<S as Sink>`) holding a method `m`,
+    /// whose return type `S::E` is a site inside both (GM-614).
     fn landing_index() -> (SdkIndex, String) {
         let (mut index, caller) = untyped_index();
         let source = "class Box {\n  cb = wrap();\n}\ninterface Opts {\n  go: () => void;\n}\n\
                       const handler = { handler() {} };\nconst tick = () => 1;\nstruct Pair(u8);\n\
-                      fn outer() { let inner = 1; }\nexport default () => { go(); };\n";
+                      fn outer() { let inner = 1; }\nexport default () => { go(); };\n\
+                      impl<S> Sink {\n  fn m() -> S::E {}\n}\n";
         let a = RelPath::new("a.toy");
         let mut builder = FileGraphBuilder::new("toy", "toy-parser", &a);
-        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 11, col: 0 } });
+        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 14, col: 0 } });
         for (kind, name, start, end) in [
             (NodeKind::Type, "Box", (0, 0), (2, 1)),
             (NodeKind::Type, "Opts", (3, 0), (5, 1)),
@@ -3851,6 +3938,8 @@ mod tests {
             (NodeKind::Type, "Pair", (8, 0), (8, 16)),
             (NodeKind::Function, "outer", (9, 0), (9, 29)),
             (NodeKind::Function, "default", (10, 15), (10, 30)),
+            (NodeKind::Type, "<S as Sink>", (11, 0), (13, 1)),
+            (NodeKind::Function, "m", (12, 2), (12, 20)),
         ] {
             let range = Range {
                 start: Position { line: start.0, col: start.1 },
@@ -4336,19 +4425,83 @@ mod tests {
         );
     }
 
-    /// **GM-593.** Only `CALLS` answers are held to the self-landing rule: a
-    /// reference landing inside its own encloser is recorded as before.
+    /// **GM-614, T1.** A `REFERENCES` answer inside its own referrer, away
+    /// from the referrer's name, is the enclosing-node fallback for a
+    /// declaration with no node of its own (a generic parameter): no edge.
     ///
-    /// Control: hold every edge kind to it (`(node.id != site.from_id ||
-    /// lands_on_name(..)) &&` before the `site.edge_kind != Calls` clause) -
-    /// 0 edges.
+    /// Control: skip the rule for non-`CALLS` (`site.edge_kind != Calls ||`
+    /// as the first disjunct of the filter) - 1 edge.
     #[test]
-    fn a_reference_landing_inside_its_own_encloser_is_recorded() {
+    fn a_reference_landing_inside_its_own_encloser_is_not_recorded() {
         let (index, _) = landing_index();
         let outer = a_node(&index, "outer");
         let mut site = site_of(&index, "fld", 5);
         site.from_id = outer.clone();
-        assert_eq!(answered_by(&index, &outer, site, in_a(9, 17)).1, 1);
+        assert_eq!(answered_by(&index, &outer, site, in_a(9, 17)).1, 0);
+    }
+
+    /// **GM-614, T2.** A `REFERENCES` answer at the referrer's own name
+    /// (`Self`) is kept.
+    ///
+    /// Control: drop the `lands_on_name` escape for enclosing landings - 0
+    /// edges.
+    #[test]
+    fn a_reference_landing_at_its_own_encloser_name_is_recorded() {
+        let (index, _) = landing_index();
+        let outer = a_node(&index, "outer");
+        let mut site = site_of(&index, "fld", 5);
+        site.from_id = outer.clone();
+        assert_eq!(answered_by(&index, &outer, site, in_a(9, 3)).1, 1);
+    }
+
+    /// A `REFERENCES` site at `S::E` in `a.toy`'s `m`, inside `impl<S> Sink`.
+    fn reference_in_m(index: &SdkIndex) -> (String, OpenSite) {
+        let m = a_node(index, "m");
+        let mut site = site_of(index, "fld", 5);
+        site.from_id = m.clone();
+        site.position = Position { line: 12, col: 12 };
+        (m, site)
+    }
+
+    /// **GM-614, T3.** A `REFERENCES` answer on a non-self node that
+    /// contains the site (the impl), away from its name, is recorded
+    /// nowhere.
+    ///
+    /// Control: `encloses` is `node.id == site.from_id` only (option A) - 1
+    /// edge on the impl.
+    #[test]
+    fn a_reference_landing_on_a_non_self_encloser_is_not_recorded() {
+        let (index, _) = landing_index();
+        let (m, site) = reference_in_m(&index);
+        assert_eq!(answered_in(&index, "a.toy", &m, site, in_a(11, 5)).1, 0, "`S` of `impl<S>`");
+    }
+
+    /// **GM-614, T4.** A `REFERENCES` answer inside a node that does not
+    /// enclose the site is recorded as before, away from the name too.
+    ///
+    /// Control: hold every `REFERENCES` landing to its name (drop the
+    /// `!encloses` arm) - 0 edges.
+    #[test]
+    fn a_reference_landing_inside_a_node_that_does_not_enclose_it_is_recorded() {
+        let (index, caller) = landing_index();
+        assert_eq!(answered_by(&index, &caller, site_of(&index, "fld", 5), in_a(9, 17)).1, 1);
+    }
+
+    /// **GM-614, T5.** A `CALLS` answer on a non-self `Function` that
+    /// contains the site, away from its name, is recorded nowhere. The site
+    /// is placed inside `outer` while its referrer is `m`, as a nested
+    /// function's call is. GM-593's tests stay green.
+    ///
+    /// Control: for `CALLS` use `node.id != site.from_id` in place of
+    /// `!encloses` - 1 edge on `outer`.
+    #[test]
+    fn a_call_landing_on_a_non_self_enclosing_function_is_not_recorded() {
+        let (index, _) = landing_index();
+        let m = a_node(&index, "m");
+        let mut site = site_of(&index, "len", 1);
+        site.from_id = m.clone();
+        site.position = Position { line: 9, col: 14 };
+        assert_eq!(answered_in(&index, "a.toy", &m, site, in_a(9, 17)).1, 0);
     }
 
     fn answered(counts: &[(&str, &str, usize)]) -> HashMap<(String, String), usize> {
@@ -4924,5 +5077,40 @@ mod tests {
         assert_eq!(id("src/a.js"), "javascript");
         assert_eq!(id("src/a.ts"), "typescript");
         assert_eq!(language_id(&RelPath::new("src/a.tsx"), "typescript", &[]), "typescript");
+    }
+
+    /// GM-618: a path call is asked at its last segment, but what the site
+    /// covers is the whole written path. The range is found on the source
+    /// line from the asked column, not started there.
+    ///
+    /// Control: in `site_range`, make the found start unused
+    /// (`written_start(..).and(None)` after the `and_then`); the path rows
+    /// start at the asked column and overshoot the written text.
+    #[test]
+    fn a_site_asked_at_the_last_segment_covers_the_whole_written_path() {
+        let at = |line: u32, col: u32| Position { line, col };
+        let covers = |source: Option<&str>, position: Position, written: &str| {
+            let range = site_range(source, position, written);
+            ((range.start.line, range.start.col), (range.end.line, range.end.col))
+        };
+        let path = "    super::Q::<u8>::new();";
+        let source = format!("fn run() {{\n{path}\n}}\n");
+        let asked = at(1, path.find("new").unwrap() as u32);
+        // The written path, not [asked, asked + 19).
+        assert_eq!(covers(Some(&source), asked, "super::Q::<u8>::new"), ((1, 4), (1, 23)));
+        // A site asked at its own start is unchanged.
+        let own = "    foo();";
+        assert_eq!(covers(Some(&format!("{own}\n")), at(0, 4), "foo"), ((0, 4), (0, 7)));
+        // The path's own text is counted in characters, after a wide prefix.
+        let wide = "    let 🦀 = a::b::f();";
+        assert_eq!(covers(Some(&format!("{wide}\n")), at(0, 18), "a::b::f"), ((0, 12), (0, 19)));
+        // The occurrence that covers the asked column wins, not the first one on the line.
+        let twice = "a::f(); a::f();";
+        assert_eq!(covers(Some(twice), at(0, 11), "a::f"), ((0, 8), (0, 12)));
+        // No source, or the path not written on the line (split across
+        // lines): the asked column starts the range, as before.
+        assert_eq!(covers(None, asked, "super::Q::<u8>::new"), ((1, 20), (1, 39)));
+        assert_eq!(covers(Some("fn run() {\n    new();\n}\n"), at(1, 4), "super::Q::new"), ((1, 4), (1, 17)));
+        assert_eq!(covers(Some("x\n"), at(5, 2), "a::f"), ((5, 2), (5, 6)));
     }
 }

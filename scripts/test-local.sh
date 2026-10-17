@@ -101,19 +101,11 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-# The plugins' test dependencies (vtsls, pyright) are found on PATH only
-# (ADR 0032 D7); CI puts each plugin's node_modules/.bin there, so this does
-# too. A dry run runs no test and needs none of them.
-plugin_bin_dirs=""
-for plugin in typescript python; do
-	bin_dir="$PWD/plugins/$plugin/node_modules/.bin"
-	if [ -d "$bin_dir" ]; then
-		plugin_bin_dirs="${plugin_bin_dirs:+$plugin_bin_dirs:}$bin_dir"
-	elif [ "$dry_run" -eq 0 ]; then
-		die "plugins/$plugin/node_modules/.bin is missing; run scripts/test-deps.sh"
-	fi
-done
-[ -z "$plugin_bin_dirs" ] || export PATH="$plugin_bin_dirs:$PATH"
+# The plugins' test dependencies (vtsls, pyright) on PATH, as CI has them
+# (scripts/lib/plugin-bins.sh). A dry run runs no test and needs none of them.
+# shellcheck source=scripts/lib/plugin-bins.sh
+. scripts/lib/plugin-bins.sh
+plugin_bins_on_path "$PWD" "$((dry_run == 0))"
 
 target_dir="${CARGO_TARGET_DIR:-target}"
 

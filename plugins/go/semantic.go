@@ -224,6 +224,12 @@ type semanticEngine struct {
 	// carries the edge forward instead of retracting it (GM-590).
 	supertypes map[string]map[string]supertypeRecord
 
+	// recheckedImplementors is the files outside the requested scope the
+	// last per-file pass re-checked because an interface one of their
+	// SUPERTYPE_OF edges points at changed or went away (GM-620), nil when
+	// that pass needed no second load. Read by tests; the daemon only logs it.
+	recheckedImplementors []string
+
 	// ws is the module layout of the pass currently running, set by `run`
 	// and cleared when it returns. A pass is strictly sequential within one
 	// process (the control loop reads and answers one frame at a time), so
@@ -338,15 +344,22 @@ type resolutions struct {
 
 	// twinned is, per package path, the qualifiedName spellings the package
 	// declares in a file the host build loads *and* in one it excludes (see
-	// twinnedNames). Only these are addressed by file (GM-570).
+	// twinnedNames), unioned across every copy of the path (a directory of
+	// each module the path can resolve to) and every module view. Only
+	// these are addressed by file (GM-570).
 	twinned map[string]map[string]bool
-	// twinsKnown is every package path twinned has already been computed
-	// for, so neither a package's test variants nor a second load re-parse
-	// its files.
+	// twinsKnown is every package path that some load of this pass folded or
+	// listed, so loadReferencedTwins does not list a path again from the
+	// referencing module.
 	twinsKnown map[string]bool
+	// twinCopies is every copy (copyKey: package path and directory) whose
+	// twins are already unioned into twinned and builtFiles, so neither a
+	// package's test variants nor a second load or listing re-parse its
+	// files.
+	twinCopies map[string]bool
 	// builtFiles is, per twinned package path, the project-relative files
 	// of the package's GoFiles - the ones the host build compiles - unioned
-	// across module views like twinned. A twinned answer is addressed by
+	// across copies and module views like twinned. A twinned answer is addressed by
 	// file only when its declaring file is in this set: membership is what
 	// "a file of this project the host builds" means, whatever the path's
 	// spelling (a `//line` directive can name a template, a phantom path or
@@ -392,6 +405,7 @@ func newResolutions() *resolutions {
 		declaredIn: map[types.Object]string{},
 		twinned:    map[string]map[string]bool{},
 		twinsKnown: map[string]bool{},
+		twinCopies: map[string]bool{},
 		builtFiles: map[string]map[string]bool{},
 		referenced: map[string]bool{},
 
@@ -410,11 +424,9 @@ func newResolutions() *resolutions {
 // semantic tier becomes useless in exactly the repositories that need it.
 func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) (*packages.Config, error) {
 	fset := token.NewFileSet()
-	env := loadEnv()
-	cfg := &packages.Config{Mode: loadMode, Dir: dir, Tests: true, Fset: fset, Env: env}
-	if flag := modFlag(dir, env); flag != "" {
-		cfg.BuildFlags = []string{flag}
-	}
+	cfg := loadConfig(dir, loadMode)
+	cfg.Tests = true
+	cfg.Fset = fset
 
 	// The engine is starting *now* - see markSemanticEngineStarted.
 	markSemanticEngineStarted()
@@ -429,6 +441,19 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 		e.foldPackage(into, fset, pkg)
 	}
 	return cfg, nil
+}
+
+// loadConfig is the `go list` configuration a load from dir runs with: its
+// directory, loadEnv and its `-mod` flag. A listing of a module's packages
+// uses it too, so it resolves import paths and evaluates build constraints
+// exactly as that module's load does.
+func loadConfig(dir string, mode packages.LoadMode) *packages.Config {
+	env := loadEnv()
+	cfg := &packages.Config{Mode: mode, Dir: dir, Env: env}
+	if flag := modFlag(dir, env); flag != "" {
+		cfg.BuildFlags = []string{flag}
+	}
+	return cfg
 }
 
 // twinListing is the project packages one load configuration's answers
@@ -463,7 +488,19 @@ func twinListingKey(cfg *packages.Config) string {
 // referenced it. A name twinned in any module's view is twinned: its
 // container address is ambiguous there. A failed listing leaves its packages
 // without twins from it, which keeps their answers container-scoped.
-func (e *semanticEngine) loadReferencedTwins(into *resolutions, listings map[string]*twinListing) {
+//
+// Then every other copy of each path the pass depends on is listed from its
+// own module (listUncoveredCopies), so the twins are the union over every
+// copy of the path, not only the copies the referencing modules resolve to.
+// configs is each loaded module's load configuration and failed each module
+// that did not load, both keyed by project-relative module directory.
+func (e *semanticEngine) loadReferencedTwins(
+	ws *workspace,
+	into *resolutions,
+	listings map[string]*twinListing,
+	configs map[string]*packages.Config,
+	failed map[string]error,
+) {
 	missingBy := map[string][]string{}
 	for key, l := range listings {
 		for path := range l.paths {
@@ -493,20 +530,9 @@ func (e *semanticEngine) loadReferencedTwins(into *resolutions, listings map[str
 			wanted[path] = true
 		}
 		for _, pkg := range listed {
-			if !wanted[pkg.PkgPath] {
-				continue
+			if wanted[pkg.PkgPath] && !into.twinCopies[e.twinCopyKey(pkg)] {
+				e.unionTwins(into, pkg)
 			}
-			names := twinnedNames(pkg.Name, pkg.GoFiles, pkg.IgnoredFiles)
-			if len(names) == 0 {
-				continue
-			}
-			if into.twinned[pkg.PkgPath] == nil {
-				into.twinned[pkg.PkgPath] = map[string]bool{}
-			}
-			for name := range names {
-				into.twinned[pkg.PkgPath][name] = true
-			}
-			e.recordBuiltFiles(into, pkg)
 		}
 	}
 	for _, missing := range missingBy {
@@ -514,6 +540,106 @@ func (e *semanticEngine) loadReferencedTwins(into *resolutions, listings map[str
 			into.twinsKnown[path] = true
 		}
 	}
+	e.listUncoveredCopies(ws, into, listings, configs, failed)
+}
+
+// listUncoveredCopies lists, for their twins, the copies of the paths this
+// pass depends on that no fold or listing of the pass has covered. The
+// dependent paths are every path an answer resolved into and every path the
+// pass folded (an implements answer addresses a folded interface by its
+// path even when no call answer did). Each copy is listed from its own
+// module, with that module's load configuration, all of one module's copies
+// in one `go list`; a listed package counts only when it resolved to the
+// expected directory.
+//
+// Skipped: external test packages (`go list` cannot list them by import
+// path, and an answer reaches one only from its own files, which the pass
+// folded), copies of a module that failed to load in this pass (the listing
+// would fail too), and copy directories without a .go file. A failed listing
+// is logged and leaves its copies' names out.
+func (e *semanticEngine) listUncoveredCopies(
+	ws *workspace,
+	into *resolutions,
+	listings map[string]*twinListing,
+	configs map[string]*packages.Config,
+	failed map[string]error,
+) {
+	if ws == nil {
+		return
+	}
+	dependent := map[string]bool{}
+	for _, l := range listings {
+		for path := range l.paths {
+			dependent[path] = true
+		}
+	}
+	for path := range into.folded {
+		dependent[path] = true
+	}
+	// Module directory -> package path -> the copy's directory.
+	uncovered := map[string]map[string]string{}
+	for _, path := range sortedKeys(dependent) {
+		if strings.HasSuffix(path, "_test") {
+			continue
+		}
+		for _, c := range ws.packageCopies(path) {
+			if into.twinCopies[copyKey(path, c.dir)] {
+				continue
+			}
+			if _, bad := failed[c.module]; bad {
+				continue
+			}
+			if !hasGoFile(filepath.Join(e.realRoot, filepath.FromSlash(c.dir))) {
+				continue
+			}
+			if uncovered[c.module] == nil {
+				uncovered[c.module] = map[string]string{}
+			}
+			uncovered[c.module][path] = c.dir
+		}
+	}
+	for _, module := range sortedKeys(uncovered) {
+		copies := uncovered[module]
+		paths := sortedKeys(copies)
+		var cfg *packages.Config
+		if base := configs[module]; base != nil {
+			cfg = &packages.Config{Dir: base.Dir, Env: base.Env, BuildFlags: base.BuildFlags}
+		} else {
+			cfg = loadConfig(filepath.Join(e.realRoot, filepath.FromSlash(module)), 0)
+		}
+		cfg.Mode = packages.NeedName | packages.NeedFiles
+		listed, err := packages.Load(cfg, paths...)
+		if err != nil {
+			logf("semantic pass: listing %d other module cop(ies) from %s for build-tag twins failed: %v",
+				len(paths), cfg.Dir, err)
+			continue
+		}
+		for _, pkg := range listed {
+			dir, ok := copies[pkg.PkgPath]
+			if !ok {
+				continue
+			}
+			key := e.twinCopyKey(pkg)
+			if key != copyKey(pkg.PkgPath, dir) || into.twinCopies[key] {
+				continue
+			}
+			e.unionTwins(into, pkg)
+		}
+	}
+}
+
+// hasGoFile reports whether dir holds at least one .go file.
+func hasGoFile(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".go") {
+			return true
+		}
+	}
+	return false
 }
 
 // loadEnv is the environment `go list` runs with: the inherited one, with
@@ -722,17 +848,61 @@ func (e *semanticEngine) recordDeclaration(into *resolutions, fset *token.FileSe
 	}
 }
 
-// collectTwins computes (once per package path) the twinned names of one
-// project package from its loaded and its build-excluded files.
+// collectTwins computes (once per copy of a package path) the twinned names
+// of one folded project package from its loaded and its build-excluded
+// files, and unions them with the other copies' (unionTwins).
 func (e *semanticEngine) collectTwins(into *resolutions, pkg *packages.Package) {
-	if pkg.PkgPath == "" || into.twinsKnown[pkg.PkgPath] {
+	if pkg.PkgPath == "" {
 		return
 	}
 	into.twinsKnown[pkg.PkgPath] = true
-	if names := twinnedNames(pkg.Name, pkg.GoFiles, pkg.IgnoredFiles); len(names) > 0 {
-		into.twinned[pkg.PkgPath] = names
-		e.recordBuiltFiles(into, pkg)
+	if into.twinCopies[e.twinCopyKey(pkg)] {
+		return
 	}
+	e.unionTwins(into, pkg)
+}
+
+// unionTwins marks pkg's copy as covered and adds its twinned names to
+// into.twinned and, when it has any, its built files to into.builtFiles.
+func (e *semanticEngine) unionTwins(into *resolutions, pkg *packages.Package) {
+	into.twinCopies[e.twinCopyKey(pkg)] = true
+	names := twinnedNames(pkg.Name, pkg.GoFiles, pkg.IgnoredFiles)
+	if len(names) == 0 {
+		return
+	}
+	if into.twinned[pkg.PkgPath] == nil {
+		into.twinned[pkg.PkgPath] = map[string]bool{}
+	}
+	for name := range names {
+		into.twinned[pkg.PkgPath][name] = true
+	}
+	e.recordBuiltFiles(into, pkg)
+}
+
+// copyKey identifies one copy of a package path: the path and the copy's
+// directory, project-relative ("" for the root) or, outside the project,
+// absolute.
+func copyKey(path, dir string) string {
+	return path + "\x00" + dir
+}
+
+// twinCopyKey is the copyKey of a loaded or listed package: its directory
+// is pkg.Dir, else the directory of its first file. The directory is spelled
+// project-relative through relPathOf, so /var and /private/var are one key.
+func (e *semanticEngine) twinCopyKey(pkg *packages.Package) string {
+	dir := pkg.Dir
+	if dir == "" {
+		for _, files := range [2][]string{pkg.GoFiles, pkg.IgnoredFiles} {
+			if len(files) > 0 {
+				dir = filepath.Dir(files[0])
+				break
+			}
+		}
+	}
+	if rel, ok := e.relPathOf(dir); ok && dir != "" {
+		dir = normalizeDir(rel)
+	}
+	return copyKey(pkg.PkgPath, dir)
 }
 
 // recordBuiltFiles adds the project-relative GoFiles of a twinned package to
@@ -991,9 +1161,33 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 	if outcome.loaded == 0 {
 		return emptyDiff(), reason, nil
 	}
+	// An edit that changed or removed an interface leaves the SUPERTYPE_OF
+	// edges of its implementors in other files stale, and only a pass over
+	// those files can retract them (GM-620). Load again with them as roots
+	// too, so they are checked against the interface's new source. Gated on
+	// an actual interface change: a body edit costs no second load.
+	requested := scope
+	e.recheckedImplementors = nil
+	if !wholeProject {
+		if extra := e.staleImplementorFiles(resolved, scope); len(extra) > 0 {
+			e.recheckedImplementors = extra
+			scope = unionSorted(scope, extra)
+			resolved = newResolutions()
+			outcome = e.loadFor(ws, resolved, false, scope)
+			reason = outcome.incompleteReason()
+			if outcome.loaded == 0 {
+				return emptyDiff(), reason, nil
+			}
+			logf("semantic pass: an interface changed - re-checking %d implementor file(s) in %d package(s)",
+				len(extra), countDirs(extra))
+		}
+	}
 	unfinished := []string{}
 	if len(outcome.failed) > 0 {
 		scope, unfinished = e.withoutFailedModules(ws, scope, outcome.failed)
+		// Core owes a later pass only the files it sent; an implementor file
+		// added here whose module failed keeps its edges as before.
+		unfinished = keepPathsIn(unfinished, requested)
 	}
 	structural := e.extractStructural(ws, scope)
 
@@ -1081,6 +1275,7 @@ func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject 
 
 	outcome := loadOutcome{failed: map[string]error{}}
 	listings := map[string]*twinListing{}
+	configs := map[string]*packages.Config{}
 	for _, dir := range sortedKeys(byModule) {
 		patterns := byModule[dir]
 		sort.Strings(patterns)
@@ -1091,6 +1286,7 @@ func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject 
 			continue
 		}
 		outcome.loaded++
+		configs[dir] = cfg
 		if len(into.referenced) == 0 {
 			continue
 		}
@@ -1109,10 +1305,12 @@ func (e *semanticEngine) loadFor(ws *workspace, into *resolutions, wholeProject 
 	// root's answers reach through export data), list the referenced packages
 	// no load folded (they come without IgnoredFiles). After all modules
 	// loaded, so a listing cannot mark a later module's folded twins as
-	// already known.
+	// already known. Every other copy of a path the pass depends on is
+	// listed too, from its own module, so the twins match an exhaustive
+	// pass's.
 	into.exhaustive = wholeProject && len(outcome.failed) == 0
 	if !into.exhaustive {
-		e.loadReferencedTwins(into, listings)
+		e.loadReferencedTwins(ws, into, listings, configs, outcome.failed)
 	}
 	return outcome
 }
@@ -1458,6 +1656,7 @@ func (e *semanticEngine) answerImplements(
 				ifaceKey:      ifaceKey,
 				ifaceScope:    resolved.targetScopeOf(ifaceObj, ifaceContainer, ifaceKey),
 				ifaceMethods:  interfaceMethodNames(iface),
+				ifaceSig:      interfaceSignature(iface),
 				subtypeNodeID: node.ID,
 				subtypeOwnPkg: node.Container,
 			}
@@ -1517,6 +1716,148 @@ func interfaceMethodNames(iface *types.Interface) []string {
 	return out
 }
 
+// interfaceSignature renders an interface's complete method set - embedded
+// interfaces flattened, each method with its signature - as a canonical
+// string that compares across loads (source or export data): two passes
+// produce the same string exactly when the interface requires the same
+// methods. The rendering (writeCanonicalType) resolves aliases at every depth,
+// so retargeting an alias the interface uses changes the string, and drops
+// parameter and result names, so renaming one does not.
+func interfaceSignature(iface *types.Interface) string {
+	var b strings.Builder
+	for i := 0; i < iface.NumMethods(); i++ {
+		m := iface.Method(i)
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(m.Name())
+		b.WriteString(" ")
+		writeCanonicalType(&b, m.Type())
+	}
+	return b.String()
+}
+
+// writeCanonicalType writes t with every alias resolved, named types
+// qualified by package path, type parameters by index and no parameter
+// names. Recursion stops at named types, so it terminates on recursive types.
+func writeCanonicalType(b *strings.Builder, t types.Type) {
+	switch t := types.Unalias(t).(type) {
+	case *types.Named:
+		obj := t.Obj()
+		if obj.Pkg() != nil {
+			b.WriteString(obj.Pkg().Path())
+			b.WriteString(".")
+		}
+		b.WriteString(obj.Name())
+		if args := t.TypeArgs(); args.Len() > 0 {
+			b.WriteString("[")
+			for i := 0; i < args.Len(); i++ {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				writeCanonicalType(b, args.At(i))
+			}
+			b.WriteString("]")
+		}
+	case *types.TypeParam:
+		fmt.Fprintf(b, "$%d", t.Index())
+	case *types.Pointer:
+		b.WriteString("*")
+		writeCanonicalType(b, t.Elem())
+	case *types.Slice:
+		b.WriteString("[]")
+		writeCanonicalType(b, t.Elem())
+	case *types.Array:
+		fmt.Fprintf(b, "[%d]", t.Len())
+		writeCanonicalType(b, t.Elem())
+	case *types.Map:
+		b.WriteString("map[")
+		writeCanonicalType(b, t.Key())
+		b.WriteString("]")
+		writeCanonicalType(b, t.Elem())
+	case *types.Chan:
+		switch t.Dir() {
+		case types.SendOnly:
+			b.WriteString("chan<- ")
+		case types.RecvOnly:
+			b.WriteString("<-chan ")
+		default:
+			b.WriteString("chan (")
+			writeCanonicalType(b, t.Elem())
+			b.WriteString(")")
+			return
+		}
+		writeCanonicalType(b, t.Elem())
+	case *types.Signature:
+		b.WriteString("func(")
+		writeCanonicalTuple(b, t.Params(), t.Variadic())
+		b.WriteString(") (")
+		writeCanonicalTuple(b, t.Results(), false)
+		b.WriteString(")")
+	case *types.Struct:
+		b.WriteString("struct{")
+		for i := 0; i < t.NumFields(); i++ {
+			if i > 0 {
+				b.WriteString("; ")
+			}
+			f := t.Field(i)
+			if f.Embedded() {
+				// "*" cannot start a field name, so no named field renders the same.
+				b.WriteString("*embedded ")
+			} else {
+				b.WriteString(f.Name())
+				b.WriteString(" ")
+			}
+			writeCanonicalType(b, f.Type())
+			if tag := t.Tag(i); tag != "" {
+				fmt.Fprintf(b, " %q", tag)
+			}
+		}
+		b.WriteString("}")
+	case *types.Interface:
+		b.WriteString("interface{")
+		b.WriteString(interfaceSignature(t))
+		if !t.IsMethodSet() {
+			for i := 0; i < t.NumEmbeddeds(); i++ {
+				b.WriteString("; ")
+				writeCanonicalType(b, t.EmbeddedType(i))
+			}
+		}
+		b.WriteString("}")
+	case *types.Union:
+		for i := 0; i < t.Len(); i++ {
+			if i > 0 {
+				b.WriteString(" | ")
+			}
+			if t.Term(i).Tilde() {
+				b.WriteString("~")
+			}
+			writeCanonicalType(b, t.Term(i).Type())
+		}
+	default:
+		// *types.Basic (and anything future): its name is canonical.
+		b.WriteString(types.TypeString(t, func(p *types.Package) string { return p.Path() }))
+	}
+}
+
+// writeCanonicalTuple writes a parameter or result list as types only,
+// keeping arity and, for parameters, variadic-ness.
+func writeCanonicalTuple(b *strings.Builder, tup *types.Tuple, variadic bool) {
+	for i := 0; i < tup.Len(); i++ {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		t := tup.At(i).Type()
+		if variadic && i == tup.Len()-1 {
+			if s, ok := types.Unalias(t).(*types.Slice); ok {
+				b.WriteString("...")
+				t = s.Elem()
+			}
+		}
+		writeCanonicalType(b, t)
+	}
+}
+
 func hasAllMethods(have map[string]bool, iface *types.Interface) bool {
 	for i := 0; i < iface.NumMethods(); i++ {
 		if !have[iface.Method(i).Name()] {
@@ -1561,6 +1902,11 @@ type supertypeRecord struct {
 	ifaceKey      []pathSegment
 	ifaceScope    targetScope
 	ifaceMethods  []string
+	// ifaceSig is the interface's method set when the edge was produced
+	// (interfaceSignature), so a later pass that folds the interface's
+	// package can tell the interface changed and re-check this edge's file
+	// (GM-620).
+	ifaceSig string
 }
 
 func newSemanticDiff() *semanticDiff {
@@ -1723,6 +2069,99 @@ func (d *semanticDiff) carryForward(
 			}
 		}
 	}
+}
+
+// staleImplementorFiles is the files outside `scope` holding a SUPERTYPE_OF
+// edge onto an interface whose package this pass folded from source, where
+// that interface is now gone or its method set differs from the one the edge
+// was produced against (GM-620). Their edges may no longer hold, and only a
+// pass over their own file can retract them. A recorded file no longer on
+// disk is forgotten instead: core already removed its rows. Sorted.
+func (e *semanticEngine) staleImplementorFiles(resolved *resolutions, scope []string) []string {
+	if len(e.supertypes) == 0 || len(resolved.folded) == 0 {
+		return nil
+	}
+	inScope := map[string]bool{}
+	for _, relPath := range scope {
+		inScope[relPath] = true
+	}
+	var sigs map[string]string
+	var stale []string
+	for _, relPath := range sortedKeys(e.supertypes) {
+		if inScope[relPath] {
+			continue
+		}
+		for _, r := range e.supertypes[relPath] {
+			if !resolved.folded[r.ifacePkg] {
+				continue
+			}
+			if sigs == nil {
+				sigs = map[string]string{}
+				for obj, named := range resolved.interfaces {
+					if !resolved.folded[obj.Pkg().Path()] {
+						continue
+					}
+					if iface, ok := named.Underlying().(*types.Interface); ok {
+						sigs[obj.Pkg().Path()+"."+obj.Name()] = interfaceSignature(iface)
+					}
+				}
+			}
+			if sig, ok := sigs[r.ifacePkg+"."+r.ifaceName]; ok && sig == r.ifaceSig {
+				continue
+			}
+			stale = append(stale, relPath)
+			break
+		}
+	}
+	kept := stale[:0]
+	for _, relPath := range stale {
+		if _, err := os.Stat(filepath.Join(e.realRoot, filepath.FromSlash(relPath))); err != nil && os.IsNotExist(err) {
+			delete(e.emittedEdges, relPath)
+			delete(e.supertypes, relPath)
+			continue
+		}
+		kept = append(kept, relPath)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
+}
+
+// unionSorted is the sorted, de-duplicated union of two path lists.
+func unionSorted(a, b []string) []string {
+	seen := map[string]bool{}
+	for _, p := range a {
+		seen[p] = true
+	}
+	for _, p := range b {
+		seen[p] = true
+	}
+	return sortedKeys(seen)
+}
+
+// keepPathsIn keeps the paths of `a` that are also in `b`, in a's order.
+func keepPathsIn(a, b []string) []string {
+	in := map[string]bool{}
+	for _, p := range b {
+		in[p] = true
+	}
+	out := []string{}
+	for _, p := range a {
+		if in[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// countDirs is how many distinct directories - Go packages - the paths are in.
+func countDirs(paths []string) int {
+	dirs := map[string]bool{}
+	for _, p := range paths {
+		dirs[filepath.ToSlash(filepath.Dir(p))] = true
+	}
+	return len(dirs)
 }
 
 // unevaluated reports whether this pass could not have checked any type

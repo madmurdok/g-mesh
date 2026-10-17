@@ -226,7 +226,7 @@ symbol = "shapes::Square::perimeter"
 # `"silent"` asserts the healthy arm: no disclosure to make. Run against
 # `missing_toolchain()` instead and the call would carry
 # `provenance = {language = "rust", semanticTier = "absent"}`; that arm is
-# pinned in `core/tests/plugin_check.rs`, because a session whose engine
+# pinned in `core/tests/it/plugin_check.rs`, because a session whose engine
 # never starts ends before expectations are evaluated (see
 # `tests/conformance.rs`).
 provenance = "silent"

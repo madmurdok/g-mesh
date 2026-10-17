@@ -2,3 +2,4 @@
 symbol = "Money#raw"
 file = "src/money.ts"
 expect = ["src/money.ts:Money#equals"]
+files = ["src/money.ts:2"]
