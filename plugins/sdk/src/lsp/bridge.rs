@@ -3749,8 +3749,20 @@ mod tests {
     /// How many sites of `(caller, name)` one answer `found` counted as
     /// answered, and how many edges it recorded.
     fn answered_by(index: &SdkIndex, caller: &str, site: OpenSite, found: Value) -> (usize, usize) {
+        answered_in(index, "b.toy", caller, site, found)
+    }
+
+    /// [`answered_by`] for a question asked in `file`, which is where a landing
+    /// can enclose the site.
+    fn answered_in(
+        index: &SdkIndex,
+        file: &str,
+        caller: &str,
+        site: OpenSite,
+        found: Value,
+    ) -> (usize, usize) {
         let question = Question {
-            file: RelPath::new("b.toy"),
+            file: RelPath::new(file),
             position: site.position,
             ask: Ask::Definition(site.clone()),
         };
@@ -3838,15 +3850,18 @@ mod tests {
     /// interface property `go`, an object-literal method that repeats its
     /// const's name, a const-bound function `tick`, a tuple struct `Pair`,
     /// a local `inner` in a function body, and an anonymous `export default`
-    /// function (node `default`, its range starting at `(`, GM-593).
+    /// function (node `default`, its range starting at `(`, GM-593), and an
+    /// impl `impl<S> Sink` (Type node `<S as Sink>`) holding a method `m`,
+    /// whose return type `S::E` is a site inside both (GM-614).
     fn landing_index() -> (SdkIndex, String) {
         let (mut index, caller) = untyped_index();
         let source = "class Box {\n  cb = wrap();\n}\ninterface Opts {\n  go: () => void;\n}\n\
                       const handler = { handler() {} };\nconst tick = () => 1;\nstruct Pair(u8);\n\
-                      fn outer() { let inner = 1; }\nexport default () => { go(); };\n";
+                      fn outer() { let inner = 1; }\nexport default () => { go(); };\n\
+                      impl<S> Sink {\n  fn m() -> S::E {}\n}\n";
         let a = RelPath::new("a.toy");
         let mut builder = FileGraphBuilder::new("toy", "toy-parser", &a);
-        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 11, col: 0 } });
+        builder.file_node(Range { start: Position { line: 0, col: 0 }, end: Position { line: 14, col: 0 } });
         for (kind, name, start, end) in [
             (NodeKind::Type, "Box", (0, 0), (2, 1)),
             (NodeKind::Type, "Opts", (3, 0), (5, 1)),
@@ -3855,6 +3870,8 @@ mod tests {
             (NodeKind::Type, "Pair", (8, 0), (8, 16)),
             (NodeKind::Function, "outer", (9, 0), (9, 29)),
             (NodeKind::Function, "default", (10, 15), (10, 30)),
+            (NodeKind::Type, "<S as Sink>", (11, 0), (13, 1)),
+            (NodeKind::Function, "m", (12, 2), (12, 20)),
         ] {
             let range = Range {
                 start: Position { line: start.0, col: start.1 },
@@ -4340,19 +4357,83 @@ mod tests {
         );
     }
 
-    /// **GM-593.** Only `CALLS` answers are held to the self-landing rule: a
-    /// reference landing inside its own encloser is recorded as before.
+    /// **GM-614, T1.** A `REFERENCES` answer inside its own referrer, away
+    /// from the referrer's name, is the enclosing-node fallback for a
+    /// declaration with no node of its own (a generic parameter): no edge.
     ///
-    /// Control: hold every edge kind to it (`(node.id != site.from_id ||
-    /// lands_on_name(..)) &&` before the `site.edge_kind != Calls` clause) -
-    /// 0 edges.
+    /// Control: skip the rule for non-`CALLS` (`site.edge_kind != Calls ||`
+    /// as the first disjunct of the filter) - 1 edge.
     #[test]
-    fn a_reference_landing_inside_its_own_encloser_is_recorded() {
+    fn a_reference_landing_inside_its_own_encloser_is_not_recorded() {
         let (index, _) = landing_index();
         let outer = a_node(&index, "outer");
         let mut site = site_of(&index, "fld", 5);
         site.from_id = outer.clone();
-        assert_eq!(answered_by(&index, &outer, site, in_a(9, 17)).1, 1);
+        assert_eq!(answered_by(&index, &outer, site, in_a(9, 17)).1, 0);
+    }
+
+    /// **GM-614, T2.** A `REFERENCES` answer at the referrer's own name
+    /// (`Self`) is kept.
+    ///
+    /// Control: drop the `lands_on_name` escape for enclosing landings - 0
+    /// edges.
+    #[test]
+    fn a_reference_landing_at_its_own_encloser_name_is_recorded() {
+        let (index, _) = landing_index();
+        let outer = a_node(&index, "outer");
+        let mut site = site_of(&index, "fld", 5);
+        site.from_id = outer.clone();
+        assert_eq!(answered_by(&index, &outer, site, in_a(9, 3)).1, 1);
+    }
+
+    /// A `REFERENCES` site at `S::E` in `a.toy`'s `m`, inside `impl<S> Sink`.
+    fn reference_in_m(index: &SdkIndex) -> (String, OpenSite) {
+        let m = a_node(index, "m");
+        let mut site = site_of(index, "fld", 5);
+        site.from_id = m.clone();
+        site.position = Position { line: 12, col: 12 };
+        (m, site)
+    }
+
+    /// **GM-614, T3.** A `REFERENCES` answer on a non-self node that
+    /// contains the site (the impl), away from its name, is recorded
+    /// nowhere.
+    ///
+    /// Control: `encloses` is `node.id == site.from_id` only (option A) - 1
+    /// edge on the impl.
+    #[test]
+    fn a_reference_landing_on_a_non_self_encloser_is_not_recorded() {
+        let (index, _) = landing_index();
+        let (m, site) = reference_in_m(&index);
+        assert_eq!(answered_in(&index, "a.toy", &m, site, in_a(11, 5)).1, 0, "`S` of `impl<S>`");
+    }
+
+    /// **GM-614, T4.** A `REFERENCES` answer inside a node that does not
+    /// enclose the site is recorded as before, away from the name too.
+    ///
+    /// Control: hold every `REFERENCES` landing to its name (drop the
+    /// `!encloses` arm) - 0 edges.
+    #[test]
+    fn a_reference_landing_inside_a_node_that_does_not_enclose_it_is_recorded() {
+        let (index, caller) = landing_index();
+        assert_eq!(answered_by(&index, &caller, site_of(&index, "fld", 5), in_a(9, 17)).1, 1);
+    }
+
+    /// **GM-614, T5.** A `CALLS` answer on a non-self `Function` that
+    /// contains the site, away from its name, is recorded nowhere. The site
+    /// is placed inside `outer` while its referrer is `m`, as a nested
+    /// function's call is. GM-593's tests stay green.
+    ///
+    /// Control: for `CALLS` use `node.id != site.from_id` in place of
+    /// `!encloses` - 1 edge on `outer`.
+    #[test]
+    fn a_call_landing_on_a_non_self_enclosing_function_is_not_recorded() {
+        let (index, _) = landing_index();
+        let m = a_node(&index, "m");
+        let mut site = site_of(&index, "len", 1);
+        site.from_id = m.clone();
+        site.position = Position { line: 9, col: 14 };
+        assert_eq!(answered_in(&index, "a.toy", &m, site, in_a(9, 17)).1, 0);
     }
 
     fn answered(counts: &[(&str, &str, usize)]) -> HashMap<(String, String), usize> {
