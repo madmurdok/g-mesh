@@ -1011,6 +1011,92 @@ fn release_smoke_fails_the_plugin_asset_leg_when_one_asset_is_missing() {
     assert!(!stdout_of(&output).contains("PASS (plugin-assets)"), "{}", describe(&output));
 }
 
+/// Whether `line` matches actions/setup-go@v7's problem matcher (owner "go"),
+/// `^\s*(.+\.go):(?:(\d+):(\d+):)? (.*)`, from
+/// `gh api repos/actions/setup-go/contents/matchers.json?ref=v7`. The crate has
+/// no `regex` dev-dependency, so this is the same check as plain string logic:
+/// `.+` needs at least one character before `.go` (leading whitespace counts,
+/// as `\s*` can give it back), and `.go:` must be followed by a space or by
+/// `<digits>:<digits>:` and then a space.
+fn matches_setup_go_problem_matcher(line: &str) -> bool {
+    line.match_indices(".go:").any(|(at, found)| {
+        let rest = &line[at + found.len()..];
+        if at == 0 {
+            return false;
+        }
+        if rest.starts_with(' ') {
+            return true;
+        }
+        let mut parts = rest.splitn(3, ':');
+        let (Some(row), Some(col), Some(tail)) = (parts.next(), parts.next(), parts.next()) else {
+            return false;
+        };
+        let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+        digits(row) && digits(col) && tail.starts_with(' ')
+    })
+}
+
+/// The matcher stand-in agrees with the real regex on the lines at stake.
+#[test]
+fn the_setup_go_matcher_stand_in_flags_the_old_count_line_and_not_the_new_one() {
+    assert!(matches_setup_go_problem_matcher("  .go: 3 node(s)"));
+    assert!(matches_setup_go_problem_matcher("==> release-smoke:   .go: 3 node(s)"));
+    assert!(matches_setup_go_problem_matcher("main.go:12:3: undefined: x"));
+    assert!(matches_setup_go_problem_matcher("  main.go: 3"));
+    assert!(!matches_setup_go_problem_matcher("==> release-smoke:   [.go] 3 node(s)"));
+    assert!(!matches_setup_go_problem_matcher("main.go:12: no column"));
+    assert!(!matches_setup_go_problem_matcher(".go: at line start has no `.+` prefix"));
+}
+
+/// GM-627: the per-language count lines the smoke script prints must not read
+/// as `go` compiler errors to actions/setup-go's problem matcher, which
+/// annotated a passing release job with a false error for `.go: N node(s)`.
+/// The per-language branch needs `sqlite3` and an `index.db`, so both are
+/// stand-ins here (a `sqlite3` first on `PATH` answering 3, a `g-mesh` that
+/// creates `$G_MESH_HOME/projects/p/index.db`), which also makes this run the
+/// same on a machine without `sqlite3`.
+///
+/// Control: put the old `  .$ext: $count node(s)` format back in
+/// `scripts/release-smoke.sh` - the matcher flags the `.go:` line and this
+/// fails.
+#[test]
+fn release_smoke_count_lines_do_not_match_the_setup_go_problem_matcher() {
+    let stage = tempfile::tempdir().expect("failed to create a scratch stage");
+    write_executable(
+        &stage.path().join("g-mesh"),
+        r#"#!/bin/sh
+mkdir -p "$G_MESH_HOME/projects/p"
+: > "$G_MESH_HOME/projects/p/index.db"
+echo 'index: 5 nodes, 3 edges'
+"#,
+    );
+    write_executable(&stage.path().join("plugins/typescript/g-mesh-plugin-typescript"), "#!/bin/sh\n");
+    let fake_bin = tempfile::tempdir().expect("failed to create a scratch bin dir");
+    write_executable(&fake_bin.path().join("sqlite3"), "#!/bin/sh\necho 3\n");
+    let path = format!("{}:{}", fake_bin.path().display(), std::env::var("PATH").unwrap_or_default());
+    let output = Command::new("bash")
+        .arg(repo_root().join("scripts/release-smoke.sh"))
+        .arg(stage.path())
+        .arg(HOST)
+        .env("G_MESH_VERSION", FAKE_VERSION)
+        .env("PATH", path)
+        .env_remove("G_MESH_PLUGIN_ROOTS_OVERRIDE")
+        .output()
+        .expect("failed to run bash");
+    assert!(output.status.success(), "{}", describe(&output));
+
+    let (out, err) = (stdout_of(&output), stderr_of(&output));
+    // Not vacuous: the per-language branch really printed its count lines.
+    assert!(out.lines().any(|line| line.contains("[.go] 3 node(s)")), "{}", describe(&output));
+    for line in out.lines().chain(err.lines()) {
+        assert!(
+            !matches_setup_go_problem_matcher(line),
+            "setup-go matcher would annotate: {line:?}\n{}",
+            describe(&output)
+        );
+    }
+}
+
 fn assert_asset_leg_reports_no_plugin_installed(output: &Output, lang: &str) {
     assert!(!output.status.success(), "{}", describe(output));
     assert!(
