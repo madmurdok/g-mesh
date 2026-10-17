@@ -1166,6 +1166,176 @@ mod tests {
         assert_eq!(rust_src_hint(sysroot, None, false), None, "rust-src installed: no hint");
     }
 
+    /// A fake sysroot under `base/name` whose rust-src has (`true`) a
+    /// `library/Cargo.toml` or is absent.
+    #[cfg(unix)]
+    fn fake_sysroot(base: &Path, name: &str, with_rust_src: bool) -> PathBuf {
+        let sysroot = base.join(name);
+        std::fs::create_dir_all(&sysroot).unwrap();
+        if with_rust_src {
+            let library = sysroot.join("lib/rustlib/src/rust/library");
+            std::fs::create_dir_all(&library).unwrap();
+            std::fs::write(library.join("Cargo.toml"), "[workspace]\n").unwrap();
+        }
+        sysroot
+    }
+
+    /// GM-615: the hint follows the effective `cargo.sysroot`. A user sysroot
+    /// without rust-src gets the hint naming that path, and no rustup command
+    /// (rustup would install into the detected toolchain), even though the
+    /// detected sysroot has rust-src.
+    ///
+    /// Control: `std_source` returns `detected` for a user path.
+    #[cfg(unix)]
+    #[test]
+    fn std_hint_for_a_user_sysroot_without_rust_src_names_that_sysroot() {
+        let scratch = Scratch::new("gm615-user-missing");
+        let detected = fake_sysroot(&scratch.0, "detected", true);
+        let user = fake_sysroot(&scratch.0, "user", false);
+        let options = serde_json::json!({ "cargo": { "sysroot": user.to_str().unwrap() } });
+
+        let source = std_source(Some(&options), &scratch.0, &detected);
+        let hint = std_hint(&source, &detected, Some("stable-x"), false)
+            .expect("user sysroot lacks rust-src: a hint");
+        assert!(hint.contains(&user.display().to_string()), "{hint}");
+        assert!(!hint.contains("rustup component add"), "{hint}");
+    }
+
+    /// GM-615: a user sysroot that has rust-src needs no hint although the
+    /// detected sysroot lacks it.
+    ///
+    /// Control: same as above (`std_source` returns `detected`).
+    #[cfg(unix)]
+    #[test]
+    fn std_hint_for_a_user_sysroot_with_rust_src_is_none_although_detected_lacks_it() {
+        let scratch = Scratch::new("gm615-user-present");
+        let detected = fake_sysroot(&scratch.0, "detected", false);
+        let user = fake_sysroot(&scratch.0, "user", true);
+        let options = serde_json::json!({ "cargo": { "sysroot": user.to_str().unwrap() } });
+
+        let source = std_source(Some(&options), &scratch.0, &detected);
+        assert_eq!(std_hint(&source, &detected, Some("stable-x"), false), None);
+    }
+
+    /// GM-615: no user sysroot (missing key, no options, `"discover"`, a
+    /// non-string value) means the detected one; the hint then keeps the
+    /// rustup command.
+    ///
+    /// Control: drop the `path != "discover"` guard in `std_source`.
+    #[cfg(unix)]
+    #[test]
+    fn std_source_is_the_detected_sysroot_unless_the_user_sets_a_path() {
+        let scratch = Scratch::new("gm615-discover");
+        let detected = fake_sysroot(&scratch.0, "detected", false);
+        let expected = StdSource::Sysroot(detected.clone());
+
+        for options in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({ "cargo": {} })),
+            Some(serde_json::json!({ "cargo": { "sysroot": "discover" } })),
+            Some(serde_json::json!({ "cargo": { "sysroot": 7 } })),
+            Some(serde_json::json!("not an object")),
+        ] {
+            assert_eq!(std_source(options.as_ref(), &scratch.0, &detected), expected, "{options:?}");
+        }
+        let hint =
+            std_hint(&expected, &detected, Some("stable-x"), false).expect("detected lacks rust-src: a hint");
+        assert!(hint.contains("rustup component add rust-src --toolchain stable-x"), "{hint}");
+    }
+
+    /// GM-615: `cargo.sysroot: null` disables sysroot loading, so no hint
+    /// whatever is installed.
+    ///
+    /// Control: delete the `Value::Null` arm of `std_source`.
+    #[cfg(unix)]
+    #[test]
+    fn std_hint_is_none_when_the_sysroot_is_null() {
+        let scratch = Scratch::new("gm615-null");
+        let detected = fake_sysroot(&scratch.0, "detected", false);
+        let options = serde_json::json!({ "cargo": { "sysroot": null } });
+
+        let source = std_source(Some(&options), &scratch.0, &detected);
+        assert_eq!(source, StdSource::Disabled);
+        assert_eq!(std_hint(&source, &detected, Some("stable-x"), false), None);
+    }
+
+    /// GM-615: a relative `cargo.sysroot` is joined to the workspace root; an
+    /// absolute one replaces it.
+    ///
+    /// Control: `root.join(path)` -> `PathBuf::from(path)`.
+    #[test]
+    fn std_source_joins_a_relative_sysroot_to_the_workspace_root() {
+        let root = Path::new("/ws/root");
+        let detected = Path::new("/detected");
+        let relative = serde_json::json!({ "cargo": { "sysroot": "tools/sysroot" } });
+        let absolute = serde_json::json!({ "cargo": { "sysroot": "/abs/sysroot" } });
+
+        assert_eq!(
+            std_source(Some(&relative), root, detected),
+            StdSource::Sysroot(PathBuf::from("/ws/root/tools/sysroot"))
+        );
+        assert_eq!(
+            std_source(Some(&absolute), root, detected),
+            StdSource::Sysroot(PathBuf::from("/abs/sysroot"))
+        );
+    }
+
+    /// GM-615: `cargo.sysrootSrc` is the library itself: the hint is decided by
+    /// its `Cargo.toml` alone, not by the sysroot's rust-src or `RUST_SRC_PATH`.
+    ///
+    /// Control: `std_source` returns `StdSource::Sysroot(sysroot)` for a
+    /// `sysrootSrc`.
+    #[cfg(unix)]
+    #[test]
+    fn std_hint_for_sysroot_src_depends_only_on_that_directorys_cargo_toml() {
+        let scratch = Scratch::new("gm615-sysroot-src");
+        let detected = fake_sysroot(&scratch.0, "detected", true);
+        let missing = scratch.0.join("lib-missing");
+        let present = scratch.0.join("lib-present");
+        std::fs::create_dir_all(&missing).unwrap();
+        std::fs::create_dir_all(&present).unwrap();
+        std::fs::write(present.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let src_options = |library: &str| serde_json::json!({ "cargo": { "sysrootSrc": library } });
+
+        // Relative to the root; the detected sysroot's own rust-src is irrelevant.
+        let source = std_source(Some(&src_options("lib-missing")), &scratch.0, &detected);
+        assert_eq!(source, StdSource::Library(missing.clone()));
+        let hint = std_hint(&source, &detected, Some("stable-x"), false).expect("no Cargo.toml: a hint");
+        assert!(hint.contains(&missing.display().to_string()), "{hint}");
+        assert!(hint.contains("cargo.sysrootSrc"), "{hint}");
+        assert!(!hint.contains("rustup component add"), "{hint}");
+        // RUST_SRC_PATH does not apply to an explicit sysrootSrc.
+        assert!(std_hint(&source, &detected, Some("stable-x"), true).is_some());
+
+        let source = std_source(Some(&src_options("lib-present")), &scratch.0, &detected);
+        assert_eq!(std_hint(&source, &detected, None, false), None);
+
+        // With the detected sysroot lacking rust-src, a present sysrootSrc still needs no hint.
+        let bare = fake_sysroot(&scratch.0, "bare", false);
+        let source = std_source(Some(&src_options("lib-present")), &scratch.0, &bare);
+        assert_eq!(std_hint(&source, &bare, Some("stable-x"), false), None);
+    }
+
+    /// GM-615: the rustup command is named only for the detected sysroot (the
+    /// pinned toolchain's); any other sysroot gets the generic remedy.
+    ///
+    /// Control: `pin.filter(|_| sysroot == detected)` -> `pin` in `std_hint`.
+    #[cfg(unix)]
+    #[test]
+    fn std_hint_names_rustup_only_for_the_detected_sysroot() {
+        let scratch = Scratch::new("gm615-rustup-only");
+        let detected = fake_sysroot(&scratch.0, "detected", false);
+        let other = fake_sysroot(&scratch.0, "other", false);
+        let pin = Some("stable-x");
+
+        let own = std_hint(&StdSource::Sysroot(detected.clone()), &detected, pin, false).expect("a hint");
+        assert!(own.contains("rustup component add rust-src --toolchain stable-x"), "{own}");
+        let foreign = std_hint(&StdSource::Sysroot(other.clone()), &detected, pin, false).expect("a hint");
+        assert!(!foreign.contains("rustup component add"), "{foreign}");
+        assert!(foreign.contains(&other.display().to_string()), "{foreign}");
+    }
+
     /// `sysroot_of` runs `<rustc> --print sysroot` and returns its trimmed
     /// stdout; a failing or silent `rustc` gives `None`. The fake `rustc`
     /// is written by a child shell so no file descriptor to it is open in
