@@ -14,8 +14,7 @@
 
 #![cfg(unix)]
 
-mod typescript_registry;
-use typescript_registry::Harness;
+use crate::typescript_registry::Harness;
 
 fn harness() -> Harness {
     Harness::with_manifest("rust", |text| {

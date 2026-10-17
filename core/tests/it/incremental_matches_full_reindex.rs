@@ -15,7 +15,7 @@
 //! not compared. Neither is the `indexed_files` row of a file that still
 //! exists: watcher-applied edits leave baselines to query-time staleness.
 
-mod common;
+use crate::common;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};

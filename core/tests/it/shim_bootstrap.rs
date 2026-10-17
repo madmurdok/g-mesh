@@ -21,9 +21,9 @@ use g_mesh::protocol::ndjson_frame::{read_ndjson_frame, write_ndjson_frame};
 use g_mesh::storage::connection::project_dir;
 use serde_json::{json, Value};
 
-mod common;
+use crate::common;
 
-use common::Lifeline;
+use crate::common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -364,13 +364,23 @@ fn every_shim_spawn_in_this_suite_decides_which_project_it_serves() {
     let mut undecided: Vec<String> = Vec::new();
     let mut spawns = 0usize;
 
-    let entries = std::fs::read_dir(&tests_dir)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", tests_dir.display()));
-    for entry in entries {
-        let path = entry.expect("failed to read a directory entry").path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-            continue;
+    // Recursive: the suite's files live in `it/` and `scripts/` (GM-623), and
+    // shared helpers in their subdirectories spawn shims too.
+    let mut sources: Vec<std::path::PathBuf> = Vec::new();
+    let mut dirs = vec![tests_dir.clone()];
+    while let Some(dir) = dirs.pop() {
+        let entries =
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("failed to read a directory entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                sources.push(path);
+            }
         }
+    }
+    for path in sources {
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
         let lines: Vec<&str> = source.lines().collect();
@@ -393,8 +403,8 @@ fn every_shim_spawn_in_this_suite_decides_which_project_it_serves() {
                 }
             }
             if !statement.contains("PROJECT_DIR_ENV") {
-                let name = path.file_name().unwrap_or_default();
-                undecided.push(format!("{}:{}", name.to_string_lossy(), index + 1));
+                let name = path.strip_prefix(&tests_dir).unwrap_or(&path);
+                undecided.push(format!("{}:{}", name.display(), index + 1));
             }
         }
     }

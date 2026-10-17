@@ -21,7 +21,7 @@ use std::process::Command;
 use g_mesh::daemon::manifest::read_manifest;
 use g_mesh::daemon::plugin::fingerprint;
 
-include!("../go_plugin_build_flags.rs");
+include!("../../go_plugin_build_flags.rs");
 
 const PLUGIN_BINARY: &str = "g-mesh-plugin-go";
 

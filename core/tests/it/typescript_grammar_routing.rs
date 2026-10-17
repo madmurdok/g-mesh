@@ -15,8 +15,7 @@
 
 #![cfg(unix)]
 
-mod typescript_registry;
-use typescript_registry::Harness;
+use crate::typescript_registry::Harness;
 
 /// Ends with a function TSX cannot reach.
 const TYPE_ASSERTION: &str =

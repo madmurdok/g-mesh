@@ -36,9 +36,9 @@ use std::time::{Duration, Instant};
 use g_mesh::daemon::{self, identity::project_hash};
 use g_mesh::paths::HOME_ENV;
 
-mod common;
+use crate::common;
 
-use common::Lifeline;
+use crate::common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 

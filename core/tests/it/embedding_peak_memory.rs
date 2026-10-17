@@ -9,19 +9,20 @@
 //! was enough (see `embedding::model::DEFAULT_MAX_SEQUENCE_LENGTH` for the
 //! measurements).
 //!
-//! This test is its own file, and the only test in it, on purpose: it reads
+//! This test is its own module, and the only test in it, on purpose: it reads
 //! the process-wide peak RSS (`getrusage`), which any other test running in
-//! the same process would pollute. Cargo runs each integration-test file as
-//! its own binary.
+//! the same process would pollute. nextest runs every test in a process of
+//! its own; under `cargo test` it shares the `it` binary with every other
+//! module, so run it alone, filtered to this module as below (GM-623).
 //!
 //! # Real model weights
 //!
 //! `#[ignore]`d for the same reason every other weight-dependent test is (see
-//! `tests/embedding_generation_pipeline.rs`): CI and a fresh checkout have no
+//! `embedding_generation_pipeline.rs`): CI and a fresh checkout have no
 //! ~600 MiB model on disk. Run it explicitly:
 //!
 //!     g-mesh model fetch      (or core/scripts/fetch-embedding-model.sh)
-//!     cargo test -p g-mesh --release --test embedding_peak_memory -- --ignored
+//!     cargo test -p g-mesh --release --test it -- --ignored embedding_peak_memory::
 //!
 //! `--release` only for speed; on pre-fix code the over-long input alone took
 //! ~65 s in a release build.

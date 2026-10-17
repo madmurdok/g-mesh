@@ -278,7 +278,7 @@ fn the_real_bundled_plugin_root_produces_a_readable_generation() {
 }
 
 /// Kills `pid` the way an OOM-killer would - the same out-of-band crash
-/// `core/tests/plugin_crash_recovery.rs` stages, and deliberately not a
+/// `core/tests/it/plugin_crash_recovery.rs` stages, and deliberately not a
 /// cooperative shutdown. `force_stop` is `SIGKILL` on Unix and
 /// `TerminateProcess` on Windows, which is the same "no chance to clean
 /// up" this asks for on both.
@@ -1297,7 +1297,7 @@ fn a_failed_language_is_not_reindexed_by_a_gitignore_edit() {
 
 /// B8: a language that would gain more than `GITIGNORE_REINDEX_GUARD` files
 /// is not reindexed (the log line pointing at `g-mesh reindex` is pinned by
-/// `core/tests/gitignore_reevaluation.rs`); another language under the guard
+/// `core/tests/it/gitignore_reevaluation.rs`); another language under the guard
 /// still is.
 ///
 /// Control: drop the guard's `continue` - alpha is spawned.

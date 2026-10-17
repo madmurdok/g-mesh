@@ -12,7 +12,7 @@
 //! deterministic way to control exactly when the crash happens relative to
 //! those requests, without racing a real `notify` filesystem watcher.
 
-mod common;
+use crate::common;
 
 use std::fs;
 

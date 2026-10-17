@@ -21,8 +21,7 @@
 
 #![cfg(unix)]
 
-mod typescript_registry;
-use typescript_registry::Harness;
+use crate::typescript_registry::Harness;
 
 fn harness() -> Harness {
     let binary = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

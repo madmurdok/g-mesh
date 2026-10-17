@@ -15,9 +15,9 @@ use std::process::{Command, Stdio};
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
 
-mod common;
+use crate::common;
 
-use common::Lifeline;
+use crate::common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
@@ -174,7 +174,7 @@ fn stop_shuts_down_both_the_core_and_the_plugin() {
     // escalation to `SIGKILL` means this command goes on succeeding if the
     // polite rung quietly stops working, so without this assertion a daemon
     // that ignored every `SIGTERM` would pass this whole file - the verdict is
-    // the only place that difference is visible. `core/tests/daemon_sigterm.rs`
+    // the only place that difference is visible. `core/tests/it/daemon_sigterm.rs`
     // makes the same claim directly against a raw signal; this one makes it
     // about what a user is told.
     assert!(

@@ -637,7 +637,7 @@ jobs:
       # The Go plugin is a bundled plugin with a real toolchain dependency,
       # a test dependency and not only a packaging one: `build.rs` runs `go build` to produce
       # `plugins/go/g-mesh-plugin-go`, and both the Rust integration tests
-      # (`core/tests/plugin_check.rs`'s two `the_go_plugin_*` cases) and the
+      # (`core/tests/it/plugin_check.rs`'s two `the_go_plugin_*` cases) and the
       # conformance step below spawn that binary for real. Without a Go
       # toolchain build.rs downgrades the failure to a warning, the run
       # continues, and those fail much later with "failed to spawn".
@@ -1175,7 +1175,7 @@ jobs:
       # longer rescue this run into a clean `Pass` - it is passed below only
       # for parity with how a real daemon run gates on the same capability,
       # not because it changes this step's outcome any more. See
-      # `core/tests/plugin_check.rs`'s
+      # `core/tests/it/plugin_check.rs`'s
       # `the_go_plugin_without_a_toolchain_fails_the_session_check_with_an_incomplete_whole_project_pass`,
       # which pins exactly this and proves the flag makes no difference here.
       #

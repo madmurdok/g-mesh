@@ -287,7 +287,7 @@ fn run_refuses_an_unknown_or_missing_section_before_calling_cargo() {
 /// on the current build. Ignored because that is twelve full listings; CI
 /// runs the same `scripts/test-sections.sh check` as its own step on the
 /// linux row, and the release gate runs it before the sections. Run it with
-/// `cargo nextest run -p g-mesh --test test_sections_scripts --run-ignored only`.
+/// `cargo nextest run -p g-mesh --test scripts -E 'test(/^test_sections_scripts::/)' --run-ignored only`.
 #[test]
 #[ignore = "lists the whole suite 12 times; CI's coverage-check step runs the same check"]
 fn the_real_sections_partition_the_real_suite() {

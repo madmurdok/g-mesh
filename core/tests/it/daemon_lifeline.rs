@@ -33,9 +33,9 @@ use g_mesh::daemon;
 use g_mesh::daemon::lifecycle::{CORE_IDLE_ENV, LIFELINE_PID_ENV, PLUGIN_IDLE_ENV};
 use g_mesh::storage::connection::project_dir;
 
-mod common;
+use crate::common;
 
-use common::wait_until_indexed;
+use crate::common::wait_until_indexed;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 

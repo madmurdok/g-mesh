@@ -45,9 +45,9 @@ use g_mesh::process;
 use g_mesh::storage::connection::project_dir;
 use rusqlite::Connection;
 
-mod common;
+use crate::common;
 
-use common::Lifeline;
+use crate::common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 

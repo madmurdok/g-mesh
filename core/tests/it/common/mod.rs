@@ -23,7 +23,7 @@
 //! which keeps every test here on the same lazy path a user runs, rather
 //! than behind an eager-mode switch no user has.
 //!
-//! Living in `tests/common/` rather than being copied into each file for the
+//! Living in `tests/it/common/` rather than being copied into each file for the
 //! usual Cargo reason: a subdirectory module is compiled into the test
 //! binaries that ask for it, not built as a test binary of its own.
 

@@ -17,10 +17,10 @@ use g_mesh::storage::connection::project_dir;
 use g_mesh::storage::schema;
 use rusqlite::Connection;
 
-mod common;
+use crate::common;
 
-use common::wait_until_indexed;
-use common::Lifeline;
+use crate::common::wait_until_indexed;
+use crate::common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 

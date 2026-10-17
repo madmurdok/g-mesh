@@ -2,7 +2,7 @@
 //! to exist.
 //!
 //! Every existing test that spawns a plugin spawns the real bundled JS/TS one
-//! (`core/tests/plugin_crash_recovery.rs`, `daemon::plugin`'s own tests, via
+//! (`core/tests/it/plugin_crash_recovery.rs`, `daemon::plugin`'s own tests, via
 //! `daemon::plugin::bundled_manifest`), because until now there was exactly
 //! one plugin to spawn. `daemon::registry`'s whole subject is what happens
 //! with *more* than one - routing between them, spawning them independently,

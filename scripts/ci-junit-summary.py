@@ -11,28 +11,48 @@ The grouping is the test *binary*, which is the unit a cause maps onto: 25
 failures in one binary is one problem, 25 spread across twelve is a different
 situation entirely, and that distinction is what made GM-337 diagnosable.
 
+Core's integration tests are two merged binaries (GM-623): `g-mesh::it` and
+`g-mesh::scripts`, one module per former test file. Those two are split back
+into one row per module (`g-mesh::it::<file>`), so the table keeps the
+per-file grouping the separate binaries used to give it.
+
 Written as a file rather than inlined into the workflow so that it can be run
-- and therefore tested - without a runner. `scripts/ci-diff-runs.sh` (GM-345)
-reads the same artifact.
+- and therefore tested - without a runner (`core/tests/scripts/ci_junit_summary_script.rs`).
+`scripts/ci-diff-runs.sh` (GM-345) reads the same artifact.
 """
 
 import sys
 import xml.etree.ElementTree as ET
 
+# Binaries whose rows are split by the first module segment of the test name.
+MERGED_BINARIES = {"g-mesh::it", "g-mesh::scripts"}
+
+
+def _counts(suite):
+    """Yields (row name, failed, tests) for one <testsuite>."""
+    name = suite.get("name", "?")
+    if name not in MERGED_BINARIES:
+        tests = int(suite.get("tests", "0"))
+        # nextest distinguishes an assertion failure from a harness error;
+        # for "is this binary red" they are the same thing.
+        bad = int(suite.get("failures", "0")) + int(suite.get("errors", "0"))
+        yield name, bad, tests
+        return
+    for case in suite.iter("testcase"):
+        module = case.get("name", "?").split("::", 1)[0]
+        failed = case.find("failure") is not None or case.find("error") is not None
+        yield f"{name}::{module}", int(failed), 1
+
 
 def summarise(junit_paths: list, target: str) -> str:
     # One binary can appear in several files (core's lib is split across
-    # sections), so counts are summed per binary name.
+    # sections), so counts are summed per row name.
     per_binary = {}
     for path in junit_paths:
         for suite in ET.parse(path).getroot().iter("testsuite"):
-            tests = int(suite.get("tests", "0"))
-            # nextest distinguishes an assertion failure from a harness error;
-            # for "is this binary red" they are the same thing.
-            bad = int(suite.get("failures", "0")) + int(suite.get("errors", "0"))
-            name = suite.get("name", "?")
-            prev_bad, prev_tests = per_binary.get(name, (0, 0))
-            per_binary[name] = (prev_bad + bad, prev_tests + tests)
+            for name, bad, tests in _counts(suite):
+                prev_bad, prev_tests = per_binary.get(name, (0, 0))
+                per_binary[name] = (prev_bad + bad, prev_tests + tests)
     total = sum(tests for _, tests in per_binary.values())
     failed_total = sum(bad for bad, _ in per_binary.values())
     rows = [(bad, tests, name) for name, (bad, tests) in per_binary.items() if bad]

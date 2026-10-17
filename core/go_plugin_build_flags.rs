@@ -1,5 +1,5 @@
 // Included (with `include!`) by `core/build.rs` and by
-// `core/tests/go_plugin_fingerprint.rs`, so the test builds the Go plugin
+// `core/tests/it/go_plugin_fingerprint.rs`, so the test builds the Go plugin
 // with exactly the flags the build script does. `scripts/bundle-go-plugin.sh`
 // passes the same flags to its own `go build`; that test checks it does.
 

@@ -4,7 +4,7 @@
 //! a real `EmbeddingModel` - and the `vectors` rows that come out the far
 //! side.
 //!
-//! Mirrors `tests/overload_declaration_storage.rs`'s `Project`/`walk` shape:
+//! Mirrors `overload_declaration_storage.rs`'s `Project`/`walk` shape:
 //! everything below the plugin process is genuine, and the question here is
 //! what a walk embeds, not who asked for it.
 //!
@@ -19,9 +19,9 @@
 //! Run them explicitly once the weights are present:
 //!
 //!     g-mesh model fetch      (or core/scripts/fetch-embedding-model.sh)
-//!     cd core && cargo test --test embedding_generation_pipeline -- --ignored
+//!     cd core && cargo test --test it -- --ignored embedding_generation_pipeline::
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

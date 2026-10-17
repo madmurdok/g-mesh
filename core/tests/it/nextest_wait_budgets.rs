@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-mod common;
+use crate::common;
 
 /// The default profile's `slow-timeout`, as `period * terminate-after`.
 fn nextest_per_test_limit() -> Duration {

@@ -7,7 +7,7 @@
 
 use g_mesh::log_line;
 
-include!("log_line/shared.rs");
+include!("../log_line/shared.rs");
 
 /// Behaviour 1, the long case: a line over 64 KiB is still one `write(2)`.
 /// The socket buffers are grown first, since a datagram socket refuses a

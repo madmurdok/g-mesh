@@ -18,8 +18,7 @@
 
 #![cfg(unix)]
 
-mod typescript_registry;
-use typescript_registry::Harness;
+use crate::typescript_registry::Harness;
 
 const TARGET: &str = "export function target(): number {\n  return 1;\n}\n";
 

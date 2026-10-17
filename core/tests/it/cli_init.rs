@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 use g_mesh::daemon;
 use g_mesh::storage::connection::project_dir;
 
-mod common;
+use crate::common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 

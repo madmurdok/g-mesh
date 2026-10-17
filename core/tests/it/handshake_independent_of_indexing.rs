@@ -87,9 +87,9 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
-mod common;
+use crate::common;
 
-use common::Lifeline;
+use crate::common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 

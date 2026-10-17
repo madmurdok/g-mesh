@@ -29,9 +29,9 @@ use rmcp::ServiceExt;
 use serde_json::json;
 use tokio::process::Command;
 
-mod common;
+use crate::common;
 
-use common::Lifeline;
+use crate::common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const NO_MODEL_DIR: &str = "/nonexistent-g-mesh-test-model-dir";

@@ -1103,7 +1103,7 @@ temp-directory fixtures, so they care about the environment they run in:
   /tmp/g-mesh-test-home` to clear it; `cargo clean` cannot.)
   Without it the suite left ~350 directories a day in the real home and could
   fail against state something else on the machine was mutating;
-  `core/tests/state_isolation.rs` fails loudly if the override stops reaching
+  `core/tests/it/state_isolation.rs` fails loudly if the override stops reaching
   either the test binary or the `g-mesh` processes it spawns. Note that cargo
   applies `[env]` to `cargo run` too — `G_MESH_HOME="$HOME/.g-mesh" cargo run`
   if you want a run against your own state.

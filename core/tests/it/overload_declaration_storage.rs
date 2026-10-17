@@ -17,7 +17,7 @@
 //! no declaration row behind, and that a plugin line for such a node never
 //! mentions the field.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::path::Path;

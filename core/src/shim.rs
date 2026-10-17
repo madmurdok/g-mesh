@@ -696,7 +696,7 @@ mod tests {
 
     /// GM-255, at the level the fix actually operates on.
     ///
-    /// The integration test in `tests/shim_bootstrap.rs` cannot show this:
+    /// The integration test in `tests/it/shim_bootstrap.rs` cannot show this:
     /// `storage::connection::open` also calls `ensure_project_dir`, so any
     /// bootstrap that gets as far as opening the index records the root
     /// regardless of what this function did - the assertion passes with the

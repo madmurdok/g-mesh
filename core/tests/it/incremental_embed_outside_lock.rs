@@ -56,9 +56,9 @@ use g_mesh::watcher::apply::HOLD_COMPUTE_FILE_ENV;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
-mod common;
+use crate::common;
 
-use common::Lifeline;
+use crate::common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const PROTOCOL_VERSION: &str = "2025-06-18";

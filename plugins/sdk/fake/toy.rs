@@ -1,10 +1,10 @@
-//! The **toy** persona (`--toy <defect>`, `core/tests/plugin_check.rs`): a
+//! The **toy** persona (`--toy <defect>`, `core/tests/it/plugin_check.rs`): a
 //! conformant plugin for the toy `.fk` language, plus one deliberate defect.
 //!
 //! It is the fake `g-mesh plugins check` is tested against, so the conformant
 //! baseline (`none`) passes every check and each other defect is that
 //! baseline plus one change that breaks exactly one rule. See
-//! `core/tests/plugin_check.rs`'s module doc for why it is one program.
+//! `core/tests/it/plugin_check.rs`'s module doc for why it is one program.
 //!
 //! The language: `fn NAME` declares a function, `call NAME` calls one
 //! declared in the same file, and `use FILE NAME` references a name from

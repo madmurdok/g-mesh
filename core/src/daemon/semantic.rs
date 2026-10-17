@@ -125,7 +125,7 @@
 //! by an ordinary source edit after that. Keeping the semantic layer current
 //! as files change is the incremental watcher's job already
 //! (`watcher::apply::apply_semantic_pass`, exercised end-to-end by
-//! `core/tests/semantic_pass_trigger.rs`'s
+//! `core/tests/it/semantic_pass_trigger.rs`'s
 //! `core_asks_for_a_semantic_pass_after_each_incremental_reparse`) - every
 //! settled reparse gets its own per-file pass over exactly the file that
 //! changed, which is strictly finer-grained than re-running the whole-project

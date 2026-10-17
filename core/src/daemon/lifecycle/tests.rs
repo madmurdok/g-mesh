@@ -126,7 +126,7 @@ fn a_timed_out_file_change_relaunches_the_plugin_and_replays_the_dirty_file_with
     // which is the most likely reading of the one failure in five this
     // test produced there.
     //
-    // 60s matches `core/tests/common`'s `DEFAULT_STARTUP_TIMEOUT_SECS`,
+    // 60s matches `core/tests/it/common`'s `DEFAULT_STARTUP_TIMEOUT_SECS`,
     // GM-301's one number for every "wait for a process to do a
     // process-shaped thing" in this repo, and for its stated reason: a
     // budget picked on a quiet laptop is not a promise the code ever
@@ -678,7 +678,7 @@ fn a_plugin_over_its_memory_limit_is_put_to_sleep_and_its_language_suspended() {
     // over-limit readings suspend, and
     // `an_unconfirmed_over_limit_sample_leaves_the_plugin_running` proves
     // the other arm. That the *real* sampler can see a real process's
-    // memory belongs to `core/tests/plugin_memory_limit.rs`, against a
+    // memory belongs to `core/tests/it/plugin_memory_limit.rs`, against a
     // real rust-analyzer, where a live measurement is the subject rather
     // than an obstacle.
     let (sampler, _calls) = scripted_sampler(vec![Some(500), Some(480)]);

@@ -17,8 +17,7 @@
 
 #![cfg(unix)]
 
-mod typescript_registry;
-use typescript_registry::Harness;
+use crate::typescript_registry::Harness;
 
 #[test]
 fn an_importer_created_with_its_target_and_routed_first_resolves_the_import() {

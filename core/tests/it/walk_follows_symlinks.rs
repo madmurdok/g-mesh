@@ -26,7 +26,7 @@ use g_mesh::daemon::bulk_index::ABSENT_COUNT_OFF_ENV;
 use g_mesh::storage::connection::project_dir;
 use rusqlite::Connection;
 
-mod common;
+use crate::common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const NO_MODEL_DIR: &str = "/nonexistent-g-mesh-test-model-dir";

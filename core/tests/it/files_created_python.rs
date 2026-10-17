@@ -19,8 +19,7 @@
 
 #![cfg(unix)]
 
-mod typescript_registry;
-use typescript_registry::Harness;
+use crate::typescript_registry::Harness;
 
 /// `(target name, target nativeKind, resolved)` of every syntactic `IMPORTS`
 /// edge out of `from`'s nodes, sorted.

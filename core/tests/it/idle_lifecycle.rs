@@ -34,10 +34,10 @@ use g_mesh::storage::connection::project_dir;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 
-mod common;
+use crate::common;
 
-use common::wait_until_indexed;
-use common::Lifeline;
+use crate::common::wait_until_indexed;
+use crate::common::Lifeline;
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -219,7 +219,7 @@ fn recorded_pid(path: &Path) -> u32 {
 /// Runs one MCP conversation over a fresh connection and returns the
 /// responses, same shape as `daemon_core.rs`'s helper of the same name (and
 /// duplicated for the same reason the other integration tests duplicate it: a
-/// `tests/common` entry would be shared state between suites that have no
+/// `tests/it/common` entry would be shared state between suites that have no
 /// other reason to agree).
 fn mcp_session(endpoint: &ipc::Endpoint, requests: Vec<Value>) -> Vec<Value> {
     let stream =
