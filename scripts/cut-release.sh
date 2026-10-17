@@ -203,6 +203,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# shellcheck source=scripts/lib/plugin-bins.sh
+. "$REPO_ROOT/scripts/lib/plugin-bins.sh"
+
 die() {
 	echo "cut-release: $*" >&2
 	exit 1
@@ -633,6 +636,9 @@ main() {
 		# them ships inside the release archive. The sections partition the
 		# suite (`check`), so `run all` is the whole suite; it stops at the
 		# first failing section (docs/adr/0030-test-sections.md).
+		# GM-628: the plugins' vtsls/pyright from their node_modules, as CI
+		# and scripts/test-local.sh have them, not whatever is global.
+		plugin_bins_on_path "$REPO_ROOT" 1
 		log "checking that the test sections cover the whole suite"
 		"$REPO_ROOT/scripts/test-sections.sh" check ||
 			die "scripts/test-sections.sh check failed - a test is in no section or in two; fix the filtersets before cutting a release"
