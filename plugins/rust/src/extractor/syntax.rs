@@ -93,6 +93,20 @@ pub(crate) fn flatten_path<'s>(node: Node, source: &'s str) -> Option<Vec<Seg<'s
     }
 }
 
+/// The node of a path's last segment: `Limited` in `ContextMode::Limited`,
+/// `new` in `T::new` or `Vec::<u8>::new`, the type in a `generic_type`. Any
+/// other node is its own last segment. A semantic engine asked at a path's
+/// start answers the qualifier (the type or module), not the item the path
+/// names (GM-618).
+pub(crate) fn path_last_segment(node: Node) -> Node {
+    let next = match node.kind() {
+        "scoped_identifier" | "scoped_type_identifier" => node.child_by_field_name("name"),
+        "generic_type" => node.child_by_field_name("type"),
+        _ => None,
+    };
+    next.map_or(node, path_last_segment)
+}
+
 /// A path's own name - its last segment - for the common case where only that
 /// is wanted. `None` for a path whose last segment is a keyword, which no
 /// declaration is ever called.

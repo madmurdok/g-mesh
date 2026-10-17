@@ -86,7 +86,8 @@ use crate::extractor::keys::{
 use crate::extractor::model::{FileModel, Import};
 use crate::extractor::scope::Scopes;
 use crate::extractor::syntax::{
-    flatten_path, item_name, looks_like_type, outer_doc_comment, path_tail, signature, text, Seg,
+    flatten_path, item_name, looks_like_type, outer_doc_comment, path_last_segment, path_tail, signature,
+    text, Seg,
 };
 use crate::extractor::typing::{binding_name, LocalType, Origin, Wrapper, WrittenType, MAX_HOPS};
 use crate::project::ProjectContext;
@@ -1374,6 +1375,11 @@ impl Bodies<'_, '_> {
     /// `replaces` is the id of the structural edge this tier wrote for the
     /// same site, which a semantic answer landing elsewhere retracts; `None`
     /// when it wrote none.
+    ///
+    /// A call site is asked at the callee path's last segment (GM-618): at
+    /// `ContextMode::Limited(..)` or `T::new()` the engine asked at the
+    /// path's start answers the qualifier, the type, which is not what is
+    /// called. Other edge kinds keep the node's start.
     #[allow(clippy::too_many_arguments)]
     fn open_site(
         &mut self,
@@ -1385,7 +1391,8 @@ impl Bodies<'_, '_> {
         edge_kind: EdgeKind,
         replaces: Option<String>,
     ) {
-        let position = self.emitter.positions().at(at.start_position());
+        let asked = if edge_kind == EdgeKind::Calls { path_last_segment(at) } else { at };
+        let position = self.emitter.positions().at(asked.start_position());
         self.emitter.open_site(OpenSite {
             from_id: from.to_string(),
             position,
