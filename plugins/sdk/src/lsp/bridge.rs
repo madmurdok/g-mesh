@@ -781,7 +781,8 @@ impl LspBridge {
     /// `memoryLimitMb` is charged for grows with the files edited during the
     /// session, not only with the files asked about.
     ///
-    /// Nothing is ever closed again. A `didClose` after each pass would free
+    /// Nothing is closed again, except a file deleted from disk - see
+    /// [`LspBridge::forward_watched`]. A `didClose` after each pass would free
     /// that text and make the next pass re-send every byte of it, and the
     /// per-file passes that follow every edit are exactly where that would be
     /// paid over and over. It would also undo the GM-624 fix: a closed file
@@ -857,10 +858,19 @@ impl LspBridge {
     /// (a manifest, say) are still announced. Created and changed files are
     /// both `Changed`: the server reads the file either way and tells the
     /// two apart by what it had.
+    ///
+    /// A deleted file the server holds open is closed first (`didClose`),
+    /// dropped from `opened`, and then announced `Deleted` like any other
+    /// deleted file. Re-syncing it instead would send nothing - the index no
+    /// longer holds it, so [`LspBridge::sync_documents`] skips it - and the
+    /// server would go on resolving into the deleted file's last text (a
+    /// `mod util;` still finding the removed `util.rs`). Whether a file is
+    /// deleted is read off disk when the batch is forwarded, so one deleted
+    /// and recreated before then is simply an edit.
     fn forward_watched(
         client: &mut LspClient,
         pending: &mut BTreeSet<RelPath>,
-        opened: &BTreeMap<RelPath, OpenDocument>,
+        opened: &mut BTreeMap<RelPath, OpenDocument>,
         root: &Path,
         index: &SdkIndex,
     ) -> BTreeSet<RelPath> {
@@ -869,15 +879,17 @@ impl LspBridge {
         let mut resync = BTreeSet::new();
         let mut changes = Vec::new();
         for path in std::mem::take(pending) {
-            if opened.contains_key(&path) {
+            let absolute = path.to_absolute(root);
+            let exists = absolute.exists();
+            if exists && (opened.contains_key(&path) || index.entry(&path).is_some()) {
                 resync.insert(path);
                 continue;
             }
-            let absolute = path.to_absolute(root);
-            let exists = absolute.exists();
-            if exists && index.entry(&path).is_some() {
-                resync.insert(path);
-                continue;
+            if !exists && opened.remove(&path).is_some() {
+                let _ = client.notify(
+                    "textDocument/didClose",
+                    json!({ "textDocument": { "uri": file_uri(&absolute) } }),
+                );
             }
             let kind = if exists { CHANGED } else { DELETED };
             changes.push(json!({ "uri": file_uri(&absolute), "type": kind }));
@@ -3156,7 +3168,8 @@ impl SemanticEngine for LspBridge {
                     // An open or indexed file this pass was sent is synced
                     // even when nothing in it is asked: the server then reads
                     // it from the client, not from disk (GM-624).
-                    let mut synced = Self::forward_watched(client, &mut unforwarded, &opened, &root, index);
+                    let mut synced =
+                        Self::forward_watched(client, &mut unforwarded, &mut opened, &root, index);
                     synced.extend(asked_about.iter().cloned());
                     Self::sync_documents(client, &mut opened, &root, index, &synced, &language, language_ids);
                     match Self::wait_ready(client, &budgets, deadline, &language) {
