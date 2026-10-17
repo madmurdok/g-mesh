@@ -55,11 +55,13 @@ slow-timeout = { period = "30s", terminate-after = 7 }
 # week only because CI reported them; a retry policy would have hidden all
 # three and left the wait-predicate defect underneath them in place.
 
-# `cargo test` runs one binary at a time; nextest runs `num-cpus` tests from
-# anywhere in the suite at once. Each of these integration tests spawns a real
-# detached daemon and a real Node plugin, and the first unconfigured run
-# failed 23 tests that pass under `cargo test` - contention reported as
-# failure. `kind(test)` is exactly the core and plugin integration-test
+# nextest runs `num-cpus` tests from anywhere in the suite at once. Each of
+# these integration tests spawns a real detached daemon and a real Node
+# plugin, and the first unconfigured run failed 23 tests that passed under
+# `cargo test` (then one binary per file, run one at a time) - contention
+# reported as failure. `cargo test` now runs all of core's `it` binary in one
+# process, so `scripts/cut-release.sh` and README.md cap it at the same width
+# (`--test-threads=2`). `kind(test)` is exactly the core and plugin integration-test
 # binaries (core's are `g-mesh::it` and `g-mesh::scripts`), as against
 # `kind(lib)`'s 621 cheap unit tests, which keep the full width.
 [test-groups]

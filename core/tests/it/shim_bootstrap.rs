@@ -372,8 +372,11 @@ fn every_shim_spawn_in_this_suite_decides_which_project_it_serves() {
         let entries =
             std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()));
         for entry in entries {
-            let path = entry.expect("failed to read a directory entry").path();
-            if path.is_dir() {
+            let entry = entry.expect("failed to read a directory entry");
+            let path = entry.path();
+            // `file_type` does not follow symlinks: a symlinked directory is
+            // neither a loop to hang on nor a second count of the same spawns.
+            if entry.file_type().expect("failed to read a file type").is_dir() {
                 dirs.push(path);
             } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
                 sources.push(path);

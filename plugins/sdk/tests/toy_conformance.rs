@@ -44,7 +44,7 @@ use g_mesh_plugin_sdk::testing::{PluginCheck, Verdict};
 /// Every check `g-mesh plugins check` reports, in report order. Asserted in
 /// full so that a check silently dropping out of the report fails this test
 /// rather than passing every "and this one passed" assertion vacuously - the
-/// same guard core's own `tests/plugin_check.rs` keeps.
+/// same guard core's own `tests/it/plugin_check.rs` keeps.
 const ALL_CHECKS: [&str; 17] = [
     "session",
     "shape",

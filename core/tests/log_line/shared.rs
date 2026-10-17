@@ -1,4 +1,4 @@
-// The body of `core/tests/log_line_atomic.rs` and
+// The body of `core/tests/it/log_line_atomic.rs` and
 // `plugins/sdk/tests/log_line_atomic.rs`, `include!`d by both: core and the
 // plugin SDK carry identical copies of `log_line!` (the SDK does not depend on
 // core), so one set of tests pins both. The includer brings `log_line!` into

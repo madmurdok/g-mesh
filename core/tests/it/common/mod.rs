@@ -27,9 +27,9 @@
 //! usual Cargo reason: a subdirectory module is compiled into the test
 //! binaries that ask for it, not built as a test binary of its own.
 
-// Each integration test file is its own crate, so cargo warns about anything
-// this module offers that *that* crate does not happen to use. Every item
-// here is unused by someone, and none of them is dead.
+// Kept from before GM-623, when each test file was its own crate and cargo
+// warned about anything this module offered that *that* crate did not use.
+// In the one `it` crate it only covers an item no file uses at all.
 #![allow(dead_code)]
 
 use std::io::BufReader;

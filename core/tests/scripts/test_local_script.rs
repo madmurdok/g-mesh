@@ -769,7 +769,18 @@ fn the_cut_release_test_step_has_the_plugin_bin_dirs_first_on_the_path() {
     let (output, record) = run_cut_release(root.path(), &["9.9.9"], 0);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     let calls: Vec<&String> = record.iter().filter(|l| !l.starts_with("git ")).collect();
-    assert_eq!(calls.len(), 4, "check, run all, doctest, cargo test: {record:?}");
+    assert_eq!(calls.len(), 6, "check, run all, doctest, then cargo test -p g-mesh's three runs: {record:?}");
+    // GM-623: core's integration tests are two binaries of daemon-spawning
+    // tests, so the gate runs them at nextest's `daemon-spawning` width, and
+    // the unit tests and doctests in runs of their own at full width.
+    let commands: Vec<&str> = calls.iter().map(|l| l.split_once('|').unwrap().0).collect();
+    for expected in [
+        "cargo test -p g-mesh --lib --bins",
+        "cargo test -p g-mesh --doc",
+        "cargo test -p g-mesh --test it --test scripts -- --test-threads=2",
+    ] {
+        assert!(commands.contains(&expected), "no `{expected}` in {commands:?}");
+    }
     let rootp = fs::canonicalize(root.path()).unwrap().display().to_string();
     let expected =
         format!("{0}/plugins/typescript/node_modules/.bin:{0}/plugins/python/node_modules/.bin:", rootp);

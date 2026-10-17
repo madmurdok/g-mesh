@@ -7,7 +7,8 @@
 //! 1. A new top-level `core/tests/foo.rs` is auto-discovered as a binary of its
 //!    own again: it works, but undoes the merge one file at a time (and every
 //!    extra binary is one more ~25 MB link of the whole crate).
-//! 2. A new `core/tests/it/foo.rs` without `mod foo;` in `it/main.rs` is never
+//! 2. A new `core/tests/it/foo.rs` without `mod foo;` in `it/main.rs` (or
+//!    `it/common/foo.rs` without `mod foo;` in `it/common/mod.rs`) is never
 //!    compiled at all, so its tests silently never run.
 //!
 //! Plain file reading, no build and no process: it runs in milliseconds.
@@ -31,10 +32,19 @@ fn tests_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")
 }
 
-fn entries(dir: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = fs::read_dir(dir)
+/// The entries of `dir`, sorted, with whether each is a directory. Dotfiles
+/// (`.DS_Store`, an editor's `.#foo.rs` lock) are skipped: cargo builds none
+/// of them. `file_type` does not follow symlinks, so a symlinked directory is
+/// never descended into (a loop cannot hang the guard) and counts as a file.
+fn entries(dir: &Path) -> Vec<(PathBuf, bool)> {
+    let mut out: Vec<(PathBuf, bool)> = fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()))
-        .map(|entry| entry.expect("failed to read a directory entry").path())
+        .map(|entry| entry.expect("failed to read a directory entry"))
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .map(|entry| {
+            let is_dir = entry.file_type().expect("failed to read a file type").is_dir();
+            (entry.path(), is_dir)
+        })
         .collect();
     out.sort();
     out
@@ -44,12 +54,12 @@ fn file_name(path: &Path) -> String {
     path.file_name().unwrap_or_default().to_string_lossy().into_owned()
 }
 
-/// The module names a `main.rs` declares: `mod x;` / `pub mod x;` lines, with
-/// any `#[cfg]`/`#[path]` attribute on the lines above. An inline `mod x { }`
-/// is not a file and is not counted.
-fn declared_modules(main_rs: &Path) -> BTreeSet<String> {
-    let source =
-        fs::read_to_string(main_rs).unwrap_or_else(|e| panic!("failed to read {}: {e}", main_rs.display()));
+/// The module names a `main.rs`/`mod.rs` declares: `mod x;` / `pub mod x;`
+/// lines, with any `#[cfg]`/`#[path]` attribute on the lines above. An inline
+/// `mod x { }` is not a file and is not counted.
+fn declared_modules(root_file: &Path) -> BTreeSet<String> {
+    let source = fs::read_to_string(root_file)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", root_file.display()));
     source
         .lines()
         .filter_map(|line| {
@@ -62,29 +72,38 @@ fn declared_modules(main_rs: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// The modules a binary directory holds on disk: every `*.rs` but `main.rs`,
-/// and every subdirectory (which must be a `mod.rs` module). Problems found
-/// on the way are pushed onto `problems`.
-fn modules_on_disk(dir: &Path, problems: &mut Vec<String>) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for path in entries(dir) {
+/// Checks one module directory against its root file (`main.rs` for a
+/// binary, `mod.rs` below it): every `*.rs` but the root file and every
+/// subdirectory (which must hold a `mod.rs`) must be declared, and every
+/// declaration must exist. Recurses into each subdirectory module, so an
+/// undeclared `it/common/foo.rs` is caught like an undeclared `it/foo.rs`.
+/// `rel` is `dir` relative to `core/tests`, for the messages.
+fn check_module_dir(dir: &Path, rel: &str, root_file: &str, problems: &mut Vec<String>) {
+    let declared = declared_modules(&dir.join(root_file));
+    let mut on_disk = BTreeSet::new();
+    for (path, is_dir) in entries(dir) {
         let name = file_name(&path);
-        if path.is_dir() {
+        if is_dir {
             if path.join("mod.rs").is_file() {
-                out.insert(name);
+                check_module_dir(&path, &format!("{rel}/{name}"), "mod.rs", problems);
+                on_disk.insert(name);
             } else {
-                problems.push(format!(
-                    "{}/{name}/ has no mod.rs, so nothing under it is compiled",
-                    file_name(dir)
-                ));
+                problems.push(format!("{rel}/{name}/ has no mod.rs, so nothing under it is compiled"));
             }
         } else if let Some(stem) = name.strip_suffix(".rs") {
-            if stem != "main" {
-                out.insert(stem.to_string());
+            if name != root_file {
+                on_disk.insert(stem.to_string());
             }
         }
     }
-    out
+    for missing in on_disk.difference(&declared) {
+        problems.push(format!(
+            "{rel}/{missing} has no `mod {missing};` in {rel}/{root_file}, so its tests never run"
+        ));
+    }
+    for extra in declared.difference(&on_disk) {
+        problems.push(format!("{rel}/{root_file} declares `mod {extra};` but no such file exists"));
+    }
 }
 
 #[test]
@@ -92,9 +111,16 @@ fn core_tests_have_exactly_the_two_binaries() {
     let tests = tests_dir();
     let mut problems: Vec<String> = Vec::new();
 
-    for path in entries(&tests) {
+    for (path, is_dir) in entries(&tests) {
         let name = file_name(&path);
-        if path.is_dir() && TOP_LEVEL_DIRS.contains(&name.as_str()) {
+        if is_dir && TOP_LEVEL_DIRS.contains(&name.as_str()) {
+            // Cargo auto-discovers `tests/<dir>/main.rs`, one level down
+            // only, as a binary: here, that would be a third one. A
+            // `main.rs` deeper down (a fixture crate's `src/main.rs`) is
+            // never built by cargo and is no concern of this guard.
+            if !BINARIES.contains(&name.as_str()) && path.join("main.rs").is_file() {
+                problems.push(format!("core/tests/{name}/main.rs would be a third test binary"));
+            }
             continue;
         }
         if name.ends_with(".rs") {
@@ -108,35 +134,7 @@ fn core_tests_have_exactly_the_two_binaries() {
         let dir = tests.join(binary);
         let main_rs = dir.join("main.rs");
         assert!(main_rs.is_file(), "{} is missing: {RULE}", main_rs.display());
-        let declared = declared_modules(&main_rs);
-        let on_disk = modules_on_disk(&dir, &mut problems);
-        for missing in on_disk.difference(&declared) {
-            problems.push(format!(
-                "{binary}/{missing} has no `mod {missing};` in {binary}/main.rs, so its tests never run"
-            ));
-        }
-        for extra in declared.difference(&on_disk) {
-            problems.push(format!("{binary}/main.rs declares `mod {extra};` but no such file exists"));
-        }
-    }
-
-    // A `main.rs` anywhere else under core/tests is a binary cargo does not
-    // build (only `tests/<dir>/main.rs` one level down is auto-discovered) or,
-    // one level down, a third binary.
-    let mut stack = vec![tests.clone()];
-    while let Some(dir) = stack.pop() {
-        for path in entries(&dir) {
-            if path.is_dir() {
-                stack.push(path);
-            } else if file_name(&path) == "main.rs" {
-                let rel = path.strip_prefix(&tests).unwrap_or(&path);
-                let parent = rel.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-                if !BINARIES.contains(&parent.as_str()) {
-                    problems
-                        .push(format!("core/tests/{} is a main.rs outside it/ and scripts/", rel.display()));
-                }
-            }
-        }
+        check_module_dir(&dir, binary, "main.rs", &mut problems);
     }
 
     assert!(problems.is_empty(), "core/tests/ layout: {problems:#?}\nThe rule: {RULE}.");

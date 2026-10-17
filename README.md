@@ -1059,10 +1059,17 @@ directory that has a `conformance/{project,expect.toml}` pair — see
 
 ```bash
 scripts/test-deps.sh             # once per clone/worktree: the test dependencies CI installs
-cargo test                       # every crate: core, wire, plugins/sdk and the typescript, rust and python plugins
-cargo test -p g-mesh             # core alone
+cargo test                       # every crate: core, wire, plugins/sdk and the typescript, rust and python plugins (core: see below)
+cargo test -p g-mesh --lib --bins                                   # core's unit tests
+cargo test -p g-mesh --test it --test scripts -- --test-threads=2   # core's integration tests
 scripts/check.sh                 # the formatting and lint gates, as CI runs them
 ```
+
+Core's integration tests are two binaries, `it` and `scripts`, and most of
+their tests start a real daemon and a Node plugin. Run them two at a time
+(`--test-threads=2`, the width of nextest's `daemon-spawning` group in
+`.config/nextest.toml`): at libtest's default width they can fail from
+contention, not from a bug. `scripts/cut-release.sh` runs core this way.
 
 `scripts/test-deps.sh` installs what the suite drives for real and cargo
 cannot fetch: rust-analyzer (`plugins/rust`'s semantic tier) and pyright
