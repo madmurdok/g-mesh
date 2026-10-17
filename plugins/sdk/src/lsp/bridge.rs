@@ -17,7 +17,7 @@ use super::client::{LspClient, Poll, CONTENT_MODIFIED};
 use super::config::{OverloadDisambiguation, SemanticConfig};
 use super::position::{file_uri, line_text, path_from_uri, without_verbatim_prefix, PositionEncoding};
 use crate::graph::{EdgeSpec, FileGraphBuilder, OpenSite, OpenSiteKind, PlaceholderKind};
-use crate::index::SdkIndex;
+use crate::index::{contains as node_contains, SdkIndex};
 use crate::path::RelPath;
 use crate::semantic::{SemanticAnswer, SemanticEngine};
 
@@ -2035,8 +2035,8 @@ fn wire_position(
 /// The tightest node containing the location, which may be an encloser of
 /// what the server meant: a class field or an object-literal method has no
 /// node of its own, so a definition at one lands on the class or the const
-/// around it. [`lands_on_name`] tells the two apart, for a `CALLS` answer
-/// landing on its own caller too (GM-593).
+/// around it. [`lands_on_name`] tells the two apart, for a landing on the
+/// referrer or on a node containing the site too, any edge kind.
 fn node_at<'i>(
     index: &'i SdkIndex,
     roots: [&Path; 2],
@@ -2077,8 +2077,9 @@ fn named_landing<'i, 'l>(
 /// range starts at the declaration, so a precise answer passes; one that
 /// landed on an encloser points at a member's name and fails, even a member
 /// sharing the encloser's name, which occurs after the encloser's own.
-/// A `CALLS` answer landing on its own caller passes only here: at the
-/// caller's name it is recursion, elsewhere the encloser fallback (GM-593).
+/// A landing on the referrer or on a node containing the site, any edge
+/// kind, passes only here: at that node's name it is recursion or `Self`,
+/// elsewhere the encloser fallback.
 fn lands_on_name(index: &SdkIndex, path: &RelPath, at: Position, node: &WireNode) -> bool {
     let name: Vec<char> = node.name.chars().collect();
     if name.is_empty() {
@@ -2693,15 +2694,18 @@ fn record_answer(
             // the server pointed at that node's own name: a const-bound
             // function or a tuple-struct constructor. Pointing inside it at
             // something without a node (a field, an object-literal method)
-            // names the encloser, which is not what is called. A function
-            // landing on the caller itself is the same fallback (a nested
-            // fn, a local, a destructured binding has no node, so the
-            // caller encloses it) unless it points at the caller's own
-            // name, which is recursion (GM-593).
+            // names the encloser, which is not what is called. Any edge
+            // kind: a landing on the referrer or on anything containing the
+            // site is the encloser fallback for a declaration with no node
+            // (a nested fn or enum, a local, a generic parameter), unless it
+            // points at that node's own name (recursion, `Self`).
+            let encloses = |path: &RelPath, node: &WireNode| {
+                node.id == site.from_id || (*path == question.file && node_contains(node, site.position))
+            };
             let landed = target.filter(|(path, node, location)| {
                 agree
-                    && (site.edge_kind != EdgeKind::Calls
-                        || (node.kind == NodeKind::Function && node.id != site.from_id)
+                    && ((!encloses(path, node)
+                        && (site.edge_kind != EdgeKind::Calls || node.kind == NodeKind::Function))
                         || lands_on_name(index, path, wire_position(index, path, encoding, location), node))
             });
             let Some((_, node, _)) = landed else {
