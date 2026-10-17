@@ -1549,11 +1549,13 @@ func interfaceMethodNames(iface *types.Interface) []string {
 }
 
 // interfaceSignature renders an interface's complete method set - embedded
-// interfaces flattened, each method with its signature, types qualified by
-// package path - as a string that compares across loads: two passes produce
-// the same string exactly when the interface requires the same methods.
+// interfaces flattened, each method with its signature - as a canonical
+// string that compares across loads (source or export data): two passes
+// produce the same string exactly when the interface requires the same
+// methods. The rendering (writeCanonicalType) resolves aliases at every depth,
+// so retargeting an alias the interface uses changes the string, and drops
+// parameter and result names, so renaming one does not.
 func interfaceSignature(iface *types.Interface) string {
-	qualifier := func(p *types.Package) string { return p.Path() }
 	var b strings.Builder
 	for i := 0; i < iface.NumMethods(); i++ {
 		m := iface.Method(i)
@@ -1562,9 +1564,129 @@ func interfaceSignature(iface *types.Interface) string {
 		}
 		b.WriteString(m.Name())
 		b.WriteString(" ")
-		b.WriteString(types.TypeString(m.Type(), qualifier))
+		writeCanonicalType(&b, m.Type())
 	}
 	return b.String()
+}
+
+// writeCanonicalType writes t with every alias resolved, named types
+// qualified by package path, type parameters by index and no parameter
+// names. Recursion stops at named types, so it terminates on recursive types.
+func writeCanonicalType(b *strings.Builder, t types.Type) {
+	switch t := types.Unalias(t).(type) {
+	case *types.Named:
+		obj := t.Obj()
+		if obj.Pkg() != nil {
+			b.WriteString(obj.Pkg().Path())
+			b.WriteString(".")
+		}
+		b.WriteString(obj.Name())
+		if args := t.TypeArgs(); args.Len() > 0 {
+			b.WriteString("[")
+			for i := 0; i < args.Len(); i++ {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				writeCanonicalType(b, args.At(i))
+			}
+			b.WriteString("]")
+		}
+	case *types.TypeParam:
+		fmt.Fprintf(b, "$%d", t.Index())
+	case *types.Pointer:
+		b.WriteString("*")
+		writeCanonicalType(b, t.Elem())
+	case *types.Slice:
+		b.WriteString("[]")
+		writeCanonicalType(b, t.Elem())
+	case *types.Array:
+		fmt.Fprintf(b, "[%d]", t.Len())
+		writeCanonicalType(b, t.Elem())
+	case *types.Map:
+		b.WriteString("map[")
+		writeCanonicalType(b, t.Key())
+		b.WriteString("]")
+		writeCanonicalType(b, t.Elem())
+	case *types.Chan:
+		switch t.Dir() {
+		case types.SendOnly:
+			b.WriteString("chan<- ")
+		case types.RecvOnly:
+			b.WriteString("<-chan ")
+		default:
+			b.WriteString("chan (")
+			writeCanonicalType(b, t.Elem())
+			b.WriteString(")")
+			return
+		}
+		writeCanonicalType(b, t.Elem())
+	case *types.Signature:
+		b.WriteString("func(")
+		writeCanonicalTuple(b, t.Params(), t.Variadic())
+		b.WriteString(") (")
+		writeCanonicalTuple(b, t.Results(), false)
+		b.WriteString(")")
+	case *types.Struct:
+		b.WriteString("struct{")
+		for i := 0; i < t.NumFields(); i++ {
+			if i > 0 {
+				b.WriteString("; ")
+			}
+			f := t.Field(i)
+			if f.Embedded() {
+				b.WriteString("embed ")
+			} else {
+				b.WriteString(f.Name())
+				b.WriteString(" ")
+			}
+			writeCanonicalType(b, f.Type())
+			if tag := t.Tag(i); tag != "" {
+				fmt.Fprintf(b, " %q", tag)
+			}
+		}
+		b.WriteString("}")
+	case *types.Interface:
+		b.WriteString("interface{")
+		b.WriteString(interfaceSignature(t))
+		if !t.IsMethodSet() {
+			for i := 0; i < t.NumEmbeddeds(); i++ {
+				b.WriteString("; ")
+				writeCanonicalType(b, t.EmbeddedType(i))
+			}
+		}
+		b.WriteString("}")
+	case *types.Union:
+		for i := 0; i < t.Len(); i++ {
+			if i > 0 {
+				b.WriteString(" | ")
+			}
+			if t.Term(i).Tilde() {
+				b.WriteString("~")
+			}
+			writeCanonicalType(b, t.Term(i).Type())
+		}
+	default:
+		// *types.Basic (and anything future): its name is canonical.
+		b.WriteString(types.TypeString(t, func(p *types.Package) string { return p.Path() }))
+	}
+}
+
+// writeCanonicalTuple writes a parameter or result list as types only,
+// keeping arity and, for parameters, variadic-ness.
+func writeCanonicalTuple(b *strings.Builder, tup *types.Tuple, variadic bool) {
+	for i := 0; i < tup.Len(); i++ {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		t := tup.At(i).Type()
+		if variadic && i == tup.Len()-1 {
+			if s, ok := types.Unalias(t).(*types.Slice); ok {
+				b.WriteString("...")
+				t = s.Elem()
+			}
+		}
+		writeCanonicalType(b, t)
+	}
 }
 
 func hasAllMethods(have map[string]bool, iface *types.Interface) bool {
