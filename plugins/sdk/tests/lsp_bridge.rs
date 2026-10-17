@@ -4111,36 +4111,57 @@ fn sorted(mut events: Vec<String>) -> Vec<String> {
     events
 }
 
+/// The files the scripted server was sent a `didOpen` for, from its
+/// `openedLog`, in arrival order, with the scratch root cut off the URIs.
+fn opened(scratch: &Scratch, log: &Path) -> Vec<String> {
+    file_events(scratch, log)
+        .into_iter()
+        .map(|line| line.split_whitespace().next().unwrap_or_default().to_string())
+        .collect()
+}
+
 /// A server that watches no files itself (the bridge claims client file
-/// watching) hears of a change on disk only from the bridge: every file a
-/// pass is sent is announced as `workspace/didChangeWatchedFiles`, `Changed`
-/// when it is on disk and `Deleted` when it is gone. A file the server holds
-/// open is re-synced with `didChange` instead, even when the pass asks
+/// watching) hears of a change on disk only from the bridge. A file the
+/// server holds open is re-synced with `didChange`, even when the pass asks
 /// nothing in it: the server reads an open file from the client, not from
-/// disk.
+/// disk. A file still on disk that the index holds is opened with `didOpen`
+/// and the index text, asked about or not: a
+/// `workspace/didChangeWatchedFiles` is not acknowledged and makes the
+/// server read the disk, which may hold text older or newer than the index.
+/// Only a file the index does not hold is announced: `Changed` when it is
+/// on disk (a manifest), `Deleted` when it is gone.
 ///
-/// Control: in `LspBridge::forward_watched`, announce an open file like any
-/// other (`if false` for the `opened` check).
+/// Controls: in `LspBridge::forward_watched`, drop the block that moves
+/// an indexed file on disk into the resync set (a.toy and c.toy are
+/// announced `Changed`); announce an open file like any other (`if false`
+/// for the `opened` check).
 #[test]
-fn a_watching_bridge_announces_the_files_a_pass_is_sent_and_resyncs_open_ones() {
+fn a_watching_bridge_opens_edited_indexed_files_and_announces_only_the_rest() {
     let scratch = Scratch::new("watched-forward");
     let (mut index, _) = fixture(&scratch);
     let events = scratch.path().join("events.log");
+    let opens = scratch.path().join("opened.log");
     let config = scratch.server(json!({
         "readiness": { "kind": "none" },
         "positionEncoding": "utf-16",
         "answers": answers_the_site(&scratch),
         "fileEventsLog": events.to_string_lossy(),
+        "openedLog": opens.to_string_lossy(),
     }));
     let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
     let b = RelPath::new("src/b.toy");
     let first = bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
     assert_eq!(semantic_edges(&first).len(), 1, "the first pass opens b.toy: {:#?}", first.diff);
     let before = file_events(&scratch, &events).len();
+    let opened_before = opened(&scratch, &opens).len();
+    assert_eq!(opened(&scratch, &opens), ["src/b.toy"], "sanity: only the asked file is open");
 
-    // b.toy loses its call: still open on the server, and asked nothing now.
-    // c.toy is new and has a call, so the pass reaches the server; gone.toy
-    // was deleted.
+    // a.toy is rewritten on disk, indexed and asked nothing. b.toy loses its
+    // call: still open on the server, and asked nothing now. c.toy is new
+    // and has a call, so the pass reaches the server. Cargo.toml is on disk
+    // and not indexed; gone.toy was deleted.
+    scratch.write("src/a.toy", A_TOY);
+    scratch.write("Cargo.toml", "[package]\nname = \"toy\"\n");
     let b_source = "fn caller\n";
     scratch.write("src/b.toy", b_source);
     let mut builder = FileGraphBuilder::new("toy", "toy-parser", &b);
@@ -4153,15 +4174,59 @@ fn a_watching_bridge_announces_the_files_a_pass_is_sent_and_resyncs_open_ones() 
     );
     index.insert(b.clone(), b_source.to_string(), builder.finish());
     crowd_file(&scratch, &mut index, "src/c.toy", 1);
-    let files = ["src/a.toy", "src/b.toy", "src/c.toy", "src/gone.toy"].map(RelPath::new);
+    let files = ["src/a.toy", "src/b.toy", "src/c.toy", "src/gone.toy", "Cargo.toml"].map(RelPath::new);
     bridge.answer(&files, &index).expect("the bridge answers");
 
     let second = file_events(&scratch, &events).split_off(before);
     assert_eq!(
         sorted(second.clone()),
-        ["didChange src/b.toy", "watched 2 src/a.toy", "watched 2 src/c.toy", "watched 3 src/gone.toy"],
+        ["didChange src/b.toy", "watched 2 Cargo.toml", "watched 3 src/gone.toy"],
         "what the second pass told the server: {second:?}"
     );
+    let opened_now = opened(&scratch, &opens).split_off(opened_before);
+    assert_eq!(
+        sorted(opened_now.clone()),
+        ["src/a.toy", "src/c.toy"],
+        "the second pass opens the indexed files it was sent: {opened_now:?}"
+    );
+}
+
+/// A file gone from disk is announced `Deleted` even while the index still
+/// holds it: there is nothing left for the server to read, and opening it
+/// with the index text would keep a deleted file alive on the server.
+///
+/// Control: in `LspBridge::forward_watched`, drop `exists &&` from the
+/// indexed-file condition (a.toy is opened instead of announced).
+#[test]
+fn a_file_gone_from_disk_is_announced_deleted_even_while_the_index_holds_it() {
+    let scratch = Scratch::new("watched-deleted-indexed");
+    let (index, _) = fixture(&scratch);
+    let events = scratch.path().join("events.log");
+    let opens = scratch.path().join("opened.log");
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": answers_the_site(&scratch),
+        "fileEventsLog": events.to_string_lossy(),
+        "openedLog": opens.to_string_lossy(),
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
+    let b = RelPath::new("src/b.toy");
+    bridge.answer(std::slice::from_ref(&b), &index).expect("the bridge answers");
+    let opened_before = opened(&scratch, &opens).len();
+
+    // a.toy is deleted from disk; the index still holds it. b.toy is sent
+    // along so the pass reaches the server.
+    std::fs::remove_file(scratch.path().join("src/a.toy")).expect("a.toy is on disk");
+    assert!(index.entry(&RelPath::new("src/a.toy")).is_some(), "sanity: the index holds a.toy");
+    let files = ["src/a.toy", "src/b.toy"].map(RelPath::new);
+    bridge.answer(&files, &index).expect("the bridge answers");
+
+    let watched: Vec<String> =
+        file_events(&scratch, &events).into_iter().filter(|event| event.starts_with("watched")).collect();
+    assert_eq!(watched, ["watched 3 src/a.toy"], "a.toy is announced deleted");
+    let opened_now = opened(&scratch, &opens).split_off(opened_before);
+    assert!(!opened_now.contains(&"src/a.toy".to_string()), "a deleted file was opened: {opened_now:?}");
 }
 
 /// A bridge whose plugin never claimed client file watching announces
@@ -4201,7 +4266,8 @@ fn a_bridge_that_does_not_watch_files_announces_nothing() {
 
 /// A pass that reaches no server - nothing to ask in its files, or none of
 /// them indexed any more - has no one to tell about them: the files stay
-/// pending, and the next pass that reaches the server announces them.
+/// pending, and the next pass that reaches the server opens the indexed
+/// ones and announces the deleted one.
 ///
 /// Control: on `LspBridge::answer`'s nothing-to-ask return, drop the pending
 /// files (`self.unforwarded.clear()`).
@@ -4210,12 +4276,14 @@ fn files_a_serverless_pass_was_sent_are_announced_by_the_next_pass_that_reaches_
     let scratch = Scratch::new("watched-carry");
     let (index, _) = fixture(&scratch);
     let events = scratch.path().join("events.log");
+    let opens = scratch.path().join("opened.log");
     let log = scratch.path().join("asked.log");
     let config = scratch.server(json!({
         "readiness": { "kind": "none" },
         "positionEncoding": "utf-16",
         "answers": answers_the_site(&scratch),
         "fileEventsLog": events.to_string_lossy(),
+        "openedLog": opens.to_string_lossy(),
         "log": log.to_string_lossy(),
     }));
     let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets()).client_watches_files();
@@ -4229,10 +4297,12 @@ fn files_a_serverless_pass_was_sent_are_announced_by_the_next_pass_that_reaches_
 
     bridge.answer(&[RelPath::new("src/b.toy")], &index).expect("the bridge answers");
     let told = file_events(&scratch, &events);
+    assert_eq!(told, ["watched 3 src/gone.toy"], "what the server was told once a pass reached it");
+    let opened_now = opened(&scratch, &opens);
     assert_eq!(
-        sorted(told.clone()),
-        ["watched 2 src/a.toy", "watched 2 src/b.toy", "watched 3 src/gone.toy"],
-        "what the server was told once a pass reached it: {told:?}"
+        sorted(opened_now.clone()),
+        ["src/a.toy", "src/b.toy"],
+        "the indexed files are opened once a pass reached the server: {opened_now:?}"
     );
 }
 
@@ -4266,13 +4336,14 @@ fn a_watching_bridge_never_announces_a_manifest_or_a_config() {
     scratch.write(".cargo/config.toml", "[env]\nTOY = \"1\"\n");
     bridge.workspace_changed();
     assert!(pass(&mut bridge, &index).complete);
-    // b.toy is open (asked by the whole-project passes), a.toy is not: the
-    // one announcement is a.toy's, which shows the log does record them.
-    let files = ["src/a.toy", "src/b.toy"].map(RelPath::new);
+    // b.toy is open (asked by the whole-project passes), a.toy is indexed
+    // and gone.toy is deleted: the one announcement is gone.toy's, which
+    // shows the log does record them.
+    let files = ["src/a.toy", "src/b.toy", "src/gone.toy"].map(RelPath::new);
     bridge.answer(&files, &index).expect("the bridge answers");
 
     let told = file_events(&scratch, &events);
-    assert_eq!(told, ["watched 2 src/a.toy"], "only a file a pass was sent is announced");
+    assert_eq!(told, ["watched 3 src/gone.toy"], "only a file a pass was sent is announced");
 }
 
 /// The GM-550 flake: rust-analyzer under load paused longer than the settle
