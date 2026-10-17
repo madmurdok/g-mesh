@@ -192,10 +192,9 @@ impl SdkIndex {
     }
 }
 
-/// Whether `position` is inside `node`'s range, treating the range as
-/// half-open at its end in columns and closed in lines - the same convention
-/// the ranges themselves use.
-fn contains(node: &WireNode, position: Position) -> bool {
+/// Whether `position` is inside `node`'s range, both ends included: a
+/// position at the range's end column still counts as inside.
+pub(crate) fn contains(node: &WireNode, position: Position) -> bool {
     let start = (node.range.start.line, node.range.start.col);
     let end = (node.range.end.line, node.range.end.col);
     let at = (position.line, position.col);

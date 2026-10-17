@@ -23,6 +23,9 @@ or const around it, the encloser.
   `CALLS` answer landing on its own caller (a `Function`) to the same check:
   such a landing is the encloser fallback for a declaration with no node (a
   default import, a nested fn) unless it is at the caller's name (recursion).
+  GM-614 widens this to any node containing the site, and to every edge
+  kind: a `REFERENCES` (or `CALLS`) landing on the referrer or on an
+  encloser of the site in the site's file is kept only at that node's name.
   The same check settles a `CALLS` answer whose locations land on different
   nodes (GM-596): only the locations at their node's own name count, and one
   node left is the target. TypeScript answers a call onto a const produced
@@ -62,6 +65,10 @@ or const around it, the encloser.
   py-requests (0 refusals).
 - Nested-fn and local-binding calls no longer produce `CALLS` self-loops on
   their encloser; recursion stays (GM-593).
+- GM-614: `REFERENCES` landings on the referrer or an encloser are held to
+  the name. Generic parameters and nested items no longer make edges onto
+  their declaring fn, struct or impl; a `Self` answer at the type's name
+  stays.
 - A direct named import of a const-bound function (`import { handler }`,
   `handler()`) now links too (GM-596): the bridge asks a `CALLS` hop whose
   file declares the name only as a non-function (and a `SUPERTYPE_OF` hop
