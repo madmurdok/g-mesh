@@ -611,7 +611,9 @@ impl LspBridge {
     /// `workspace/didChangeWatchedFiles`, only the files core sends a pass
     /// (the plugin's own source files, which changed), and only inside
     /// [`SemanticEngine::answer`], just before that pass's documents are
-    /// synced; an already open one is re-synced with `didChange` instead.
+    /// synced; an already open one is re-synced with `didChange`, and one the
+    /// index holds is opened with `didOpen`, instead (GM-624) - so in
+    /// practice only deleted files and files outside the index are announced.
     /// Any other change on disk (a manifest, a config) reaches the server
     /// only when the plugin asks it to (for rust-analyzer,
     /// `rust-analyzer/reloadWorkspace` through [`LspBridge::request`]): for a
@@ -773,10 +775,17 @@ impl LspBridge {
     /// about gains nothing by being open, because the server reads the ones it
     /// merely has to *resolve into* off disk itself.
     ///
+    /// Plus, when [`LspBridge::client_watches_files`] is set, every indexed
+    /// file a pass was sent (an edited one), asked about or not - see
+    /// [`LspBridge::forward_watched`] (GM-624). Those stay open too, so what
+    /// `memoryLimitMb` is charged for grows with the files edited during the
+    /// session, not only with the files asked about.
+    ///
     /// Nothing is ever closed again. A `didClose` after each pass would free
     /// that text and make the next pass re-send every byte of it, and the
     /// per-file passes that follow every edit are exactly where that would be
-    /// paid over and over.
+    /// paid over and over. It would also undo the GM-624 fix: a closed file
+    /// goes back to the server reading it from disk, asynchronously.
     fn sync_documents(
         client: &mut LspClient,
         opened: &mut BTreeMap<RelPath, OpenDocument>,
@@ -833,16 +842,27 @@ impl LspBridge {
     }
 
     /// Tells the server about every file in `pending` - see
-    /// [`LspBridge::client_watches_files`]. A file the server holds open is
-    /// not announced: its text is the client's, so it is answered with the
-    /// open files to re-sync, which this returns. Created and changed files
-    /// are both `Changed`: the server reads the file either way and tells
-    /// the two apart by what it had.
+    /// [`LspBridge::client_watches_files`] - and returns the ones to hand to
+    /// [`LspBridge::sync_documents`] instead of announcing them.
+    ///
+    /// A file the server holds open is not announced: its text is the
+    /// client's, so it is re-synced. Neither is a file still on disk that
+    /// the index holds (GM-624): it is opened with the index text. A
+    /// `workspace/didChangeWatchedFiles` has no acknowledgement - the server
+    /// reads the file whenever it gets to it, so the next request may still
+    /// see the old text - and what it reads is the disk, which may already
+    /// have moved past the text this pass's positions were computed against.
+    /// A `didOpen` is applied before the next request and carries exactly
+    /// that text. Only deleted files and files the index does not hold
+    /// (a manifest, say) are still announced. Created and changed files are
+    /// both `Changed`: the server reads the file either way and tells the
+    /// two apart by what it had.
     fn forward_watched(
         client: &mut LspClient,
         pending: &mut BTreeSet<RelPath>,
         opened: &BTreeMap<RelPath, OpenDocument>,
         root: &Path,
+        index: &SdkIndex,
     ) -> BTreeSet<RelPath> {
         const CHANGED: u32 = 2;
         const DELETED: u32 = 3;
@@ -854,7 +874,12 @@ impl LspBridge {
                 continue;
             }
             let absolute = path.to_absolute(root);
-            let kind = if absolute.exists() { CHANGED } else { DELETED };
+            let exists = absolute.exists();
+            if exists && index.entry(&path).is_some() {
+                resync.insert(path);
+                continue;
+            }
+            let kind = if exists { CHANGED } else { DELETED };
             changes.push(json!({ "uri": file_uri(&absolute), "type": kind }));
         }
         if !changes.is_empty() {
@@ -3128,10 +3153,10 @@ impl SemanticEngine for LspBridge {
                 None => Err(None),
                 Some(client) => {
                     client.drain();
-                    // An open file this pass was sent is re-synced even when
-                    // nothing in it is asked: the server reads it from the
-                    // client, not from disk.
-                    let mut synced = Self::forward_watched(client, &mut unforwarded, &opened, &root);
+                    // An open or indexed file this pass was sent is synced
+                    // even when nothing in it is asked: the server then reads
+                    // it from the client, not from disk (GM-624).
+                    let mut synced = Self::forward_watched(client, &mut unforwarded, &opened, &root, index);
                     synced.extend(asked_about.iter().cloned());
                     Self::sync_documents(client, &mut opened, &root, index, &synced, &language, language_ids);
                     match Self::wait_ready(client, &budgets, deadline, &language) {
