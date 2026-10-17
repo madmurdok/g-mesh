@@ -1412,6 +1412,8 @@ struct Landing {
     node_id: String,
     node_name: String,
     address: PlaceholderTarget,
+    /// What the site covers - see [`site_range`].
+    range: Range,
 }
 
 /// One semantic edge this pass recorded, waiting for [`Answers::finish`].
@@ -1491,11 +1493,37 @@ fn witness_rank<'a>(name: &'a str, range: &Range) -> (u32, u32, u32, u32, &'a st
     (range.start.line, range.start.col, range.end.line, range.end.col, name)
 }
 
-/// What a use site covers: the name written at it, starting where the site
-/// starts. `written` is the source text, which is not always the name the
-/// placeholder ends up carrying - see [`Placeholder`].
-fn site_range(at: Position, written: &str) -> Range {
-    Range { start: at, end: Position { line: at.line, col: at.col + written.chars().count() as u32 } }
+/// What a use site covers: the text written at it. `written` is the source
+/// text, which is not always the name the placeholder ends up carrying - see
+/// [`Placeholder`].
+///
+/// The site's position is where the server is asked, which is not always
+/// where `written` starts: a path call is asked at its last segment (`new` in
+/// `super::Q::<u8>::new()`, GM-618), because asked at the path's start a
+/// server answers the qualifier. The range still covers the whole path, as
+/// the structural tier's range for the same call does, so it starts at the
+/// occurrence of `written` in `source`'s line that covers the position,
+/// nearest first. With no source, or no such occurrence on that line (a path
+/// written across lines), it starts at the position.
+fn site_range(source: Option<&str>, at: Position, written: &str) -> Range {
+    let width = written.chars().count() as u32;
+    let start = source
+        .and_then(|source| source.split('\n').nth(at.line as usize))
+        .and_then(|line| written_start(line, at.col, written, width))
+        .unwrap_or(at.col);
+    Range {
+        start: Position { line: at.line, col: start },
+        end: Position { line: at.line, col: start + width },
+    }
+}
+
+/// The column, in characters, where an occurrence of `written` (`width`
+/// characters) in `line` starts and covers `col`, the nearest one to `col`.
+fn written_start(line: &str, col: u32, written: &str, width: u32) -> Option<u32> {
+    let lowest = (col + 1).saturating_sub(width);
+    (lowest..=col)
+        .rev()
+        .find(|&start| line.chars().skip(start as usize).take(width as usize).eq(written.chars()))
 }
 
 /// Everything a placeholder's identity is derived from, in a form that can key
@@ -1758,7 +1786,7 @@ impl Answers {
             &site.from_id,
             site.edge_kind,
             &landing.node_name,
-            site_range(site.position, &site.name),
+            landing.range,
             landing.address.clone(),
             &landing.node_id,
             ordinal,
@@ -2652,6 +2680,7 @@ fn record_answer(
                             node_id: node.id.clone(),
                             node_name: node.name.clone(),
                             address: address_of(node, site.from_container.clone()),
+                            range: site_range(index.source(&question.file), site.position, &site.name),
                         };
                         return answers.bind_overload(index, landing, node, &path, &ordinals);
                     }
@@ -2760,7 +2789,7 @@ fn record_answer(
                 &site.from_id,
                 site.edge_kind,
                 &node.name,
-                site_range(site.position, &site.name),
+                site_range(index.source(&question.file), site.position, &site.name),
                 address,
                 &node.id,
                 None,
@@ -2816,6 +2845,7 @@ fn record_answer(
                 node_id: node.id.clone(),
                 node_name: node.name.clone(),
                 address: address_of(node, site.from_container.clone()),
+                range: site_range(index.source(&question.file), site.position, &site.name),
             };
             answers.bind_overload(index, landing, node, &path, &ordinals)
         }
@@ -2986,7 +3016,7 @@ fn record_implementor(
         // answer and points at the anchor.
         EdgeKind::SupertypeOf,
         &anchor_node.name,
-        site_range(at, &anchor_node.name),
+        site_range(None, at, &anchor_node.name),
         address_of(&anchor_node, container),
         &anchor_node.id,
         None,
@@ -3482,7 +3512,7 @@ mod tests {
                     "from",
                     EdgeKind::References,
                     &declaration.name,
-                    site_range(at, written),
+                    site_range(None, at, written),
                     address_of(&declaration, Some("rg::flags::hiargs".to_string())),
                     &declaration.id,
                     None,
@@ -3570,7 +3600,7 @@ mod tests {
         );
         assert_eq!(
             diff.upsert_nodes[0].range,
-            site_range(Position { line: 140, col: 28 }, "SearchMode::Count"),
+            site_range(None, Position { line: 140, col: 28 }, "SearchMode::Count"),
             "the range is still the site's own extent, as wide as what is written there"
         );
     }
