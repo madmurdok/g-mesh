@@ -2774,3 +2774,130 @@ fn the_file_node_ends_on_the_files_last_real_line() {
         assert_eq!((file.range.end.line, file.range.end.col), (*line, *col), "{what}: {source:?}");
     }
 }
+
+// --- GM-618: a path call is asked at its last segment --------------------------
+
+/// The open sites of `edge_kind` out of `from`, as `(name, line, col)` in
+/// source order.
+fn asked_at(graph: &Graph, from: &str, edge_kind: EdgeKind) -> Vec<(String, u32, u32)> {
+    let from = graph.node(from).id.clone();
+    let mut asked: Vec<_> = graph
+        .0
+        .open_sites
+        .iter()
+        .filter(|site| site.from_id == from && site.edge_kind == edge_kind)
+        .map(|site| (site.name.clone(), site.position.line, site.position.col))
+        .collect();
+    asked.sort_by_key(|(_, line, col)| (*line, *col));
+    asked
+}
+
+/// The `(name, line, col)` a site is expected at: where `anchor` starts on the
+/// first line of `source` that contains it.
+fn expect_at(source: &str, name: &str, anchor: &str) -> (String, u32, u32) {
+    let (line, text) = source.lines().enumerate().find(|(_, text)| text.contains(anchor)).unwrap();
+    (name.to_string(), line as u32, text.find(anchor).unwrap() as u32)
+}
+
+/// GM-618: the engine answers a path asked at its start with the qualifier,
+/// not the item, so a path call's `CALLS` site is asked at the path's last
+/// segment - never at a generic argument, and never at the qualifier: the
+/// variant of `Mode::Limited(..)`, the fn of `a::b::f()`, the associated fn
+/// of `T::new()` and `Q::<u8>::new()`, the macro of `a::m!()`, each nested
+/// call on its own. The site keeps the whole path as its name.
+///
+/// Control: in `Bodies::open_site`, ask at `at` instead of
+/// `path_last_segment(at)` (every row is asked at its path's start).
+#[test]
+fn a_path_calls_open_site_is_asked_at_the_last_segment() {
+    let source = "pub fn free() {\n\
+         \x20   super::Q::<u8>::new();\n\
+         \x20   super::q::f::<u8>();\n\
+         \x20   super::a::m!();\n\
+         \x20   super::ContextMode::Limited(super::h());\n\
+         }\n\
+         pub fn generic<T: Tr>() {\n\
+         \x20   T::new();\n\
+         \x20   T::<u8>::new();\n\
+         }\n\
+         pub fn on_self() {\n\
+         \x20   Self::d();\n\
+         }\n";
+    let krate = Crate::new(&[("src/lib.rs", source)]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(
+        asked_at(&graph, "free", EdgeKind::Calls),
+        vec![
+            expect_at(source, "super::Q::<u8>::new", "new()"),
+            expect_at(source, "super::q::f", "f::<u8>"),
+            expect_at(source, "super::a::m", "m!"),
+            expect_at(source, "super::ContextMode::Limited", "Limited"),
+            expect_at(source, "super::h", "h()"),
+        ],
+        "{:#?}",
+        graph.0.open_sites
+    );
+    assert_eq!(
+        asked_at(&graph, "generic", EdgeKind::Calls),
+        vec![("T::new".to_string(), 7, 7), ("T::<u8>::new".to_string(), 8, 13)],
+        "{:#?}",
+        graph.0.open_sites
+    );
+    assert_eq!(asked_at(&graph, "on_self", EdgeKind::Calls), vec![("Self::d".to_string(), 11, 10)]);
+}
+
+/// GM-618: only a path moves. A single-segment call is asked where it is
+/// written, turbofish or not, and `<T as Tr>::f()` (no path to flatten) is
+/// asked nowhere. An edge that is not a call keeps the node's start: a path
+/// used as a value or a type (`References`) and `impl super::Tr for T`
+/// (`SupertypeOf`).
+///
+/// Control: in `Bodies::open_site`, ask at `path_last_segment(at)` whatever
+/// the edge kind (the `References` and `SupertypeOf` rows move to the last
+/// segment).
+#[test]
+fn single_segment_calls_and_non_call_sites_are_asked_where_they_always_were() {
+    let source = "pub struct T;\n\
+         pub fn run<U: Tr>() {\n\
+         \x20   ghost();\n\
+         \x20   ghost::<u8>();\n\
+         \x20   <U as Tr>::f();\n\
+         \x20   let _ = super::Mode::A;\n\
+         \x20   let _ = super::q::C;\n\
+         \x20   let _: super::Q = x;\n\
+         }\n\
+         impl super::Tr for T {}\n\
+         impl super::q::Tr for T {}\n";
+    let krate = Crate::new(&[("src/lib.rs", source)]);
+    let graph = krate.extract("src/lib.rs");
+    let at = |name: &str, anchor: &str| expect_at(source, name, anchor);
+    assert_eq!(
+        asked_at(&graph, "run", EdgeKind::Calls),
+        vec![at("ghost", "ghost();"), at("ghost", "ghost::<u8>")],
+        "{:#?}",
+        graph.0.open_sites
+    );
+    assert_eq!(
+        asked_at(&graph, "run", EdgeKind::References),
+        vec![
+            at("super::Mode::A", "super::Mode::A"),
+            at("super::q::C", "super::q::C"),
+            at("super::Q", "super::Q ="),
+        ],
+        "{:#?}",
+        graph.0.open_sites
+    );
+    let supertypes: Vec<_> = graph
+        .0
+        .open_sites
+        .iter()
+        .filter(|site| site.edge_kind == EdgeKind::SupertypeOf)
+        .map(|site| (site.name.clone(), site.position.line, site.position.col))
+        .collect();
+    assert_eq!(
+        supertypes,
+        vec![at("super::Tr", "super::Tr for"), at("super::q::Tr", "super::q::Tr for")],
+        "{:#?}",
+        graph.0.open_sites
+    );
+}

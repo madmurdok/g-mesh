@@ -5040,4 +5040,39 @@ mod tests {
         assert_eq!(id("src/a.ts"), "typescript");
         assert_eq!(language_id(&RelPath::new("src/a.tsx"), "typescript", &[]), "typescript");
     }
+
+    /// GM-618: a path call is asked at its last segment, but what the site
+    /// covers is the whole written path. The range is found on the source
+    /// line from the asked column, not started there.
+    ///
+    /// Control: in `site_range`, make the found start unused
+    /// (`written_start(..).and(None)` after the `and_then`); the path rows
+    /// start at the asked column and overshoot the written text.
+    #[test]
+    fn a_site_asked_at_the_last_segment_covers_the_whole_written_path() {
+        let at = |line: u32, col: u32| Position { line, col };
+        let covers = |source: Option<&str>, position: Position, written: &str| {
+            let range = site_range(source, position, written);
+            ((range.start.line, range.start.col), (range.end.line, range.end.col))
+        };
+        let path = "    super::Q::<u8>::new();";
+        let source = format!("fn run() {{\n{path}\n}}\n");
+        let asked = at(1, path.find("new").unwrap() as u32);
+        // The written path, not [asked, asked + 19).
+        assert_eq!(covers(Some(&source), asked, "super::Q::<u8>::new"), ((1, 4), (1, 23)));
+        // A site asked at its own start is unchanged.
+        let own = "    foo();";
+        assert_eq!(covers(Some(&format!("{own}\n")), at(0, 4), "foo"), ((0, 4), (0, 7)));
+        // The path's own text is counted in characters, after a wide prefix.
+        let wide = "    let 🦀 = a::b::f();";
+        assert_eq!(covers(Some(&format!("{wide}\n")), at(0, 18), "a::b::f"), ((0, 12), (0, 19)));
+        // The nearest occurrence that covers the asked column wins.
+        let twice = "a::f(); a::f();";
+        assert_eq!(covers(Some(twice), at(0, 11), "a::f"), ((0, 8), (0, 12)));
+        // No source, or the path not written on the line (split across
+        // lines): the asked column starts the range, as before.
+        assert_eq!(covers(None, asked, "super::Q::<u8>::new"), ((1, 20), (1, 39)));
+        assert_eq!(covers(Some("fn run() {\n    new();\n}\n"), at(1, 4), "super::Q::new"), ((1, 4), (1, 17)));
+        assert_eq!(covers(Some("x\n"), at(5, 2), "a::f"), ((5, 2), (5, 6)));
+    }
 }

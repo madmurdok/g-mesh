@@ -4531,3 +4531,87 @@ fn a_new_bridge_does_not_retract_what_an_earlier_process_emitted() {
         second.diff.delete_edge_ids
     );
 }
+
+// --- GM-618: a path call is asked at its last segment ------------------------
+
+/// The range of the placeholder an answer records for one `CALLS` site of
+/// `b.toy`'s line 1, asked at `(1, asked)` and named `written`. The server
+/// answers that exact question with `a.toy`'s `new`.
+fn answered_range(tag: &str, line: &str, asked: u32, written: &str) -> Range {
+    let scratch = Scratch::new(tag);
+    let mut index = SdkIndex::new();
+
+    let a_source = "fn new\n";
+    scratch.write("src/a.toy", a_source);
+    let a = RelPath::new("src/a.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &a);
+    builder.file_node(range(0, 0, 1, 0));
+    builder.add_node(
+        NodeSpec::new(NodeKind::Function, "new", "new", range(0, 3, 0, 6))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    index.insert(a, a_source.to_string(), builder.finish());
+
+    let b_source = format!("fn caller\n{line}\n");
+    scratch.write("src/b.toy", &b_source);
+    let b = RelPath::new("src/b.toy");
+    let mut builder = FileGraphBuilder::new("toy", "toy-parser", &b);
+    builder.file_node(range(0, 0, 2, 0));
+    let caller = builder.add_node(
+        NodeSpec::new(NodeKind::Function, "caller", "caller", range(0, 0, 1, 15))
+            .native_kind("function")
+            .in_container("pkg", None)
+            .public(),
+    );
+    builder.open_site(OpenSite {
+        from_id: caller,
+        position: Position { line: 1, col: asked },
+        name: written.to_string(),
+        kind: OpenSiteKind::Reference,
+        edge_kind: EdgeKind::Calls,
+        from_container: Some("pkg".to_string()),
+        replaces: None,
+    });
+    index.insert(b, b_source, builder.finish());
+
+    let config = scratch.server(json!({
+        "readiness": { "kind": "none" },
+        "positionEncoding": "utf-16",
+        "answers": [{
+            "uri": scratch.uri("src/b.toy"),
+            "line": 1,
+            "character": asked,
+            "definition": { "uri": scratch.uri("src/a.toy"), "line": 0, "character": 3 },
+        }],
+    }));
+    let mut bridge = LspBridge::with_budgets("toy", scratch.path(), config, budgets());
+    let answer = pass(&mut bridge, &index);
+    assert!(answer.complete, "{tag}: the site was asked at ({asked}) and answered");
+    let edges = semantic_edges(&answer);
+    assert_eq!(edges.len(), 1, "{tag}: {:#?}", answer.diff);
+    placeholder(&answer, edges[0]).range
+}
+
+/// GM-618: the bridge asks at the position the plugin gives (the path's last
+/// segment), and the recorded range is the written path, not the asked column
+/// plus the path's length. A site asked at its own start is unchanged.
+///
+/// Control: in `site_range` (bridge.rs), append `.and(None)` to the
+/// `written_start(..)` call; the path row ends at column 39 instead of 23.
+#[test]
+fn a_path_call_asked_at_its_last_segment_records_the_written_path_as_its_range() {
+    let path = "    super::Q::<u8>::new();";
+    let asked = path.find("new").unwrap() as u32;
+    assert_eq!(
+        answered_range("path-range", path, asked, "super::Q::<u8>::new"),
+        range(1, 4, 1, 23),
+        "the whole written path"
+    );
+    assert_eq!(
+        answered_range("own-range", "    new();", 4, "new"),
+        range(1, 4, 1, 7),
+        "a site asked at its own start covers its own text"
+    );
+}

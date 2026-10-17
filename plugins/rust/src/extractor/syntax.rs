@@ -368,4 +368,28 @@ mod tests {
         assert!(!looks_like_type("_private"));
         assert!(!looks_like_type(""));
     }
+
+    /// GM-618: the node a semantic engine is asked at for a path - its last
+    /// segment, through scoped paths and generic types alike - and any other
+    /// node is its own last segment.
+    ///
+    /// Control: delete the `"generic_type"` arm of `path_last_segment` (the
+    /// `Vec<u8>` row names the whole type); return `node` unchanged (every
+    /// path row names its start).
+    #[test]
+    fn the_last_segment_of_a_path_is_the_name_it_ends_in() {
+        let source = "type X = Vec<u8>;\ntype Y = a::b::T;\nfn f() { a::b::c(); }";
+        let tree = parse(source);
+        let last = |kind: &str| {
+            let node = first(&tree, kind);
+            (source[node.byte_range()].to_string(), source[path_last_segment(node).byte_range()].to_string())
+        };
+        // A generic type is asked at the type it applies, not at its arguments.
+        assert_eq!(last("generic_type"), ("Vec<u8>".to_string(), "Vec".to_string()));
+        // The deepest `name` of a scoped path, through the qualifiers.
+        assert_eq!(last("scoped_type_identifier"), ("a::b::T".to_string(), "T".to_string()));
+        assert_eq!(last("scoped_identifier"), ("a::b".to_string(), "b".to_string()));
+        // A bare identifier is its own last segment.
+        assert_eq!(last("type_identifier"), ("X".to_string(), "X".to_string()));
+    }
 }
