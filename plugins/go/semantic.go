@@ -1634,7 +1634,8 @@ func writeCanonicalType(b *strings.Builder, t types.Type) {
 			}
 			f := t.Field(i)
 			if f.Embedded() {
-				b.WriteString("embed ")
+				// "*" cannot start a field name, so no named field renders the same.
+				b.WriteString("*embedded ")
 			} else {
 				b.WriteString(f.Name())
 				b.WriteString(" ")
