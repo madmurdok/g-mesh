@@ -198,3 +198,70 @@ func TestSemanticPassInterfaceEditDetectsAnEmbeddedInterfaceChange(t *testing.T)
 	requireRetracted(t, after, carryMineToBinder, before[carryMineToBinder])
 	requireRechecked(t, state, "app/app.go")
 }
+
+// aliasEditFixture builds lib (type ID = string plus the interface) and an
+// implementor in another package whose method spells the alias's target
+// (string) out, so the interface only reaches it through ID.
+func aliasEditFixture(t *testing.T, libTmpl, appMethod string) (string, string) {
+	t.Helper()
+	const header = "package lib\n\ntype ID = string\n\n"
+	lib := header + libTmpl
+	app := "package app\n\nimport \"example.com/x/lib\"\n\ntype Mine struct{}\n\n" +
+		appMethod + "\n\nvar _ lib.Binder = Mine{}\n"
+	root := writeTree(t, map[string]string{
+		"go.mod":     "module example.com/x\n\ngo 1.22\n",
+		"lib/lib.go": lib,
+		"app/app.go": app,
+	})
+	return root, lib
+}
+
+// Retargeting an alias used by an interface method changes the method set
+// the implementor must satisfy even though the interface's text for the
+// method does not change.
+func TestSemanticPassInterfaceEditRetractsOnAnAliasRetarget(t *testing.T) {
+	requireGoToolchain(t)
+	cases := map[string]struct{ iface, method string }{
+		"top level": {
+			"type Binder interface{ Bind(id ID) string }\n",
+			"func (Mine) Bind(id string) string { return id }",
+		},
+		"nested in composite types": {
+			"type Binder interface {\n\tBind(m map[string][]*ID, xs ...ID) string\n}\n",
+			"func (Mine) Bind(m map[string][]*string, xs ...string) string { return \"\" }",
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			root, lib := aliasEditFixture(t, c.iface, c.method)
+			state, before := carryWholePass(t, root, carryMineToBinder)
+
+			after := ifaceEditPass(t, state, root, "lib/lib.go",
+				strings.Replace(lib, "type ID = string", "type ID = int", 1))
+			requireRetracted(t, after, carryMineToBinder, before[carryMineToBinder])
+			requireRechecked(t, state, "app/app.go")
+		})
+	}
+}
+
+// Renaming a parameter of an interface method leaves the method set intact:
+// no implementor is re-checked and the edge is kept.
+func TestSemanticPassInterfaceEditParamRenameDoesNotWiden(t *testing.T) {
+	requireGoToolchain(t)
+	const lib = "package lib\n\ntype Binder interface{ Bind(id string) string }\n"
+	root := writeTree(t, map[string]string{
+		"go.mod":     "module example.com/x\n\ngo 1.22\n",
+		"lib/lib.go": lib,
+		"app/app.go": "package app\n\nimport \"example.com/x/lib\"\n\ntype Mine struct{}\n\n" +
+			"func (Mine) Bind(id string) string { return id }\n\nvar _ lib.Binder = Mine{}\n",
+	})
+	state, before := carryWholePass(t, root, carryMineToBinder)
+
+	after := ifaceEditPass(t, state, root, "lib/lib.go", strings.Replace(lib, "id string", "name string", 1))
+	if state.semantic.recheckedImplementors != nil {
+		t.Errorf("parameter rename re-checked %v", state.semantic.recheckedImplementors)
+	}
+	if carryDeleted(after, before[carryMineToBinder].ID) {
+		t.Errorf("parameter rename retracted %s", carryMineToBinder)
+	}
+}
