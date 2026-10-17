@@ -224,6 +224,12 @@ type semanticEngine struct {
 	// carries the edge forward instead of retracting it (GM-590).
 	supertypes map[string]map[string]supertypeRecord
 
+	// recheckedImplementors is the files outside the requested scope the
+	// last per-file pass re-checked because an interface one of their
+	// SUPERTYPE_OF edges points at changed or went away (GM-620), nil when
+	// that pass needed no second load. Read by tests; the daemon only logs it.
+	recheckedImplementors []string
+
 	// ws is the module layout of the pass currently running, set by `run`
 	// and cleared when it returns. A pass is strictly sequential within one
 	// process (the control loop reads and answers one frame at a time), so
@@ -991,9 +997,33 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 	if outcome.loaded == 0 {
 		return emptyDiff(), reason, nil
 	}
+	// An edit that changed or removed an interface leaves the SUPERTYPE_OF
+	// edges of its implementors in other files stale, and only a pass over
+	// those files can retract them (GM-620). Load again with them as roots
+	// too, so they are checked against the interface's new source. Gated on
+	// an actual interface change: a body edit costs no second load.
+	requested := scope
+	e.recheckedImplementors = nil
+	if !wholeProject {
+		if extra := e.staleImplementorFiles(resolved, scope); len(extra) > 0 {
+			e.recheckedImplementors = extra
+			scope = unionSorted(scope, extra)
+			resolved = newResolutions()
+			outcome = e.loadFor(ws, resolved, false, scope)
+			reason = outcome.incompleteReason()
+			if outcome.loaded == 0 {
+				return emptyDiff(), reason, nil
+			}
+			logf("semantic pass: an interface changed - re-checking %d implementor file(s) in %d package(s)",
+				len(extra), countDirs(extra))
+		}
+	}
 	unfinished := []string{}
 	if len(outcome.failed) > 0 {
 		scope, unfinished = e.withoutFailedModules(ws, scope, outcome.failed)
+		// Core owes a later pass only the files it sent; an implementor file
+		// added here whose module failed keeps its edges as before.
+		unfinished = keepPathsIn(unfinished, requested)
 	}
 	structural := e.extractStructural(ws, scope)
 
@@ -1458,6 +1488,7 @@ func (e *semanticEngine) answerImplements(
 				ifaceKey:      ifaceKey,
 				ifaceScope:    resolved.targetScopeOf(ifaceObj, ifaceContainer, ifaceKey),
 				ifaceMethods:  interfaceMethodNames(iface),
+				ifaceSig:      interfaceSignature(iface),
 				subtypeNodeID: node.ID,
 				subtypeOwnPkg: node.Container,
 			}
@@ -1517,6 +1548,25 @@ func interfaceMethodNames(iface *types.Interface) []string {
 	return out
 }
 
+// interfaceSignature renders an interface's complete method set - embedded
+// interfaces flattened, each method with its signature, types qualified by
+// package path - as a string that compares across loads: two passes produce
+// the same string exactly when the interface requires the same methods.
+func interfaceSignature(iface *types.Interface) string {
+	qualifier := func(p *types.Package) string { return p.Path() }
+	var b strings.Builder
+	for i := 0; i < iface.NumMethods(); i++ {
+		m := iface.Method(i)
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(m.Name())
+		b.WriteString(" ")
+		b.WriteString(types.TypeString(m.Type(), qualifier))
+	}
+	return b.String()
+}
+
 func hasAllMethods(have map[string]bool, iface *types.Interface) bool {
 	for i := 0; i < iface.NumMethods(); i++ {
 		if !have[iface.Method(i).Name()] {
@@ -1561,6 +1611,11 @@ type supertypeRecord struct {
 	ifaceKey      []pathSegment
 	ifaceScope    targetScope
 	ifaceMethods  []string
+	// ifaceSig is the interface's method set when the edge was produced
+	// (interfaceSignature), so a later pass that folds the interface's
+	// package can tell the interface changed and re-check this edge's file
+	// (GM-620).
+	ifaceSig string
 }
 
 func newSemanticDiff() *semanticDiff {
@@ -1723,6 +1778,99 @@ func (d *semanticDiff) carryForward(
 			}
 		}
 	}
+}
+
+// staleImplementorFiles is the files outside `scope` holding a SUPERTYPE_OF
+// edge onto an interface whose package this pass folded from source, where
+// that interface is now gone or its method set differs from the one the edge
+// was produced against (GM-620). Their edges may no longer hold, and only a
+// pass over their own file can retract them. A recorded file no longer on
+// disk is forgotten instead: core already removed its rows. Sorted.
+func (e *semanticEngine) staleImplementorFiles(resolved *resolutions, scope []string) []string {
+	if len(e.supertypes) == 0 || len(resolved.folded) == 0 {
+		return nil
+	}
+	inScope := map[string]bool{}
+	for _, relPath := range scope {
+		inScope[relPath] = true
+	}
+	var sigs map[string]string
+	var stale []string
+	for _, relPath := range sortedKeys(e.supertypes) {
+		if inScope[relPath] {
+			continue
+		}
+		for _, r := range e.supertypes[relPath] {
+			if !resolved.folded[r.ifacePkg] {
+				continue
+			}
+			if sigs == nil {
+				sigs = map[string]string{}
+				for obj, named := range resolved.interfaces {
+					if !resolved.folded[obj.Pkg().Path()] {
+						continue
+					}
+					if iface, ok := named.Underlying().(*types.Interface); ok {
+						sigs[obj.Pkg().Path()+"."+obj.Name()] = interfaceSignature(iface)
+					}
+				}
+			}
+			if sig, ok := sigs[r.ifacePkg+"."+r.ifaceName]; ok && sig == r.ifaceSig {
+				continue
+			}
+			stale = append(stale, relPath)
+			break
+		}
+	}
+	kept := stale[:0]
+	for _, relPath := range stale {
+		if _, err := os.Stat(filepath.Join(e.realRoot, filepath.FromSlash(relPath))); err != nil && os.IsNotExist(err) {
+			delete(e.emittedEdges, relPath)
+			delete(e.supertypes, relPath)
+			continue
+		}
+		kept = append(kept, relPath)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
+}
+
+// unionSorted is the sorted, de-duplicated union of two path lists.
+func unionSorted(a, b []string) []string {
+	seen := map[string]bool{}
+	for _, p := range a {
+		seen[p] = true
+	}
+	for _, p := range b {
+		seen[p] = true
+	}
+	return sortedKeys(seen)
+}
+
+// keepPathsIn keeps the paths of `a` that are also in `b`, in a's order.
+func keepPathsIn(a, b []string) []string {
+	in := map[string]bool{}
+	for _, p := range b {
+		in[p] = true
+	}
+	out := []string{}
+	for _, p := range a {
+		if in[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// countDirs is how many distinct directories - Go packages - the paths are in.
+func countDirs(paths []string) int {
+	dirs := map[string]bool{}
+	for _, p := range paths {
+		dirs[filepath.ToSlash(filepath.Dir(p))] = true
+	}
+	return len(dirs)
 }
 
 // unevaluated reports whether this pass could not have checked any type
