@@ -322,10 +322,15 @@ struct Script {
     /// `watched <type> <uri>` per change of a
     /// `workspace/didChangeWatchedFiles` (`type` as the protocol numbers
     /// it: 1 created, 2 changed, 3 deleted) and `didChange <uri>` per
-    /// `textDocument/didChange`, so a test can assert which files the client
+    /// `textDocument/didChange` and `didClose <uri>` per
+    /// `textDocument/didClose`, so a test can assert which files the client
     /// announced and how.
     #[serde(default)]
     file_events_log: Option<String>,
+    /// Where to append `<uri> <version>` per `didOpen`, so a test can assert
+    /// the version a document was opened at.
+    #[serde(default)]
+    open_versions_log: Option<String>,
     /// Hold the nth definition/implementation answer (1-based, counted per
     /// server process, in the order the requests arrive) for `holdMs[n-1]`
     /// milliseconds, on its own thread, while this server goes on reading -
@@ -389,6 +394,7 @@ fn main() {
         log(&script, &method);
         if method == "textDocument/didOpen" {
             log_opened(&script, &params);
+            log_open_version(&script, &params);
         }
         log_file_events(&script, &method, &params);
 
@@ -821,6 +827,15 @@ fn log_opened(script: &Script, params: &Value) {
     }
 }
 
+fn log_open_version(script: &Script, params: &Value) {
+    let Some(path) = &script.open_versions_log else { return };
+    let document = &params["textDocument"];
+    let line = format!("{} {}\n", document["uri"].as_str().unwrap_or(""), document["version"]);
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 fn log_file_events(script: &Script, method: &str, params: &Value) {
     let Some(path) = &script.file_events_log else { return };
     let lines: String = match method {
@@ -832,6 +847,9 @@ fn log_file_events(script: &Script, method: &str, params: &Value) {
             .collect(),
         "textDocument/didChange" => {
             format!("didChange {}\n", params["textDocument"]["uri"].as_str().unwrap_or(""))
+        }
+        "textDocument/didClose" => {
+            format!("didClose {}\n", params["textDocument"]["uri"].as_str().unwrap_or(""))
         }
         _ => return,
     };
