@@ -1131,3 +1131,67 @@ fn a_gitignore_edit_whose_events_were_dropped_is_rechecked_by_a_rescan() {
     assert!(rechecked, "the rescan's .gitignore recheck must reindex python, which lost a file");
     assert!(!file_node("generated/x.python-src"), "the newly ignored file has left the index");
 }
+
+/// Behaviour 9, the same-second case: a `.gitignore` whose mtime is the whole
+/// second the Rescans watermark was taken in (written after the previous
+/// reconcile read it) is still rechecked, because the watermark is one second
+/// before that.
+#[test]
+fn a_gitignore_written_in_the_watermark_second_is_rechecked_by_a_rescan() {
+    let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+    let plugin_dir = &dirs[0];
+    let root = project.path().canonicalize().unwrap();
+    let conn = walked_index(project.path());
+    for file_path in ["src/a.python-src", "generated/x.python-src"] {
+        indexed_file(&root, &conn, file_path);
+        conn.with(|c| {
+            c.execute(
+                "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+                 VALUES (?1, 'File', ?2, ?2, ?2, 1, 0, 1, 0, 'python')",
+                rusqlite::params![format!("{file_path}:{file_path}"), file_path],
+            )
+        })
+        .unwrap();
+    }
+
+    let watcher = ProjectWatcher::new(&root).unwrap();
+    let mut debouncer = Debouncer::new(SWALLOWING_WINDOW);
+    // The watermark comes from `Rescans::new`'s own clock read; retry until
+    // that read and ours fall in one second, so the second is known.
+    let now_secs = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let (mut rescans, watermark_second) = loop {
+        let before = now_secs();
+        let rescans = immediate_rescans();
+        if now_secs() == before {
+            break (rescans, before);
+        }
+    };
+    let gitignore = root.join(GITIGNORE_FILE_NAME);
+    fs::write(&gitignore, "generated/\n").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&gitignore)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(watermark_second))
+        .unwrap();
+    let file_node = |file_path: &str| {
+        conn.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM nodes WHERE kind = 'File' AND filePath = ?1",
+                [file_path],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .unwrap()
+            > 0
+    };
+    assert!(file_node("generated/x.python-src"));
+
+    watcher.inject_rescan(&root);
+    let rechecked = pump_until(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry, || {
+        !test_plugin::spawns(plugin_dir).is_empty()
+    });
+
+    assert!(rechecked, "a .gitignore from the watermark's own second must reach gitignore_changed");
+    assert!(!file_node("generated/x.python-src"), "the newly ignored file has left the index");
+}
