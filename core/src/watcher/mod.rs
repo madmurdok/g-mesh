@@ -52,7 +52,6 @@ pub struct ProjectWatcher {
     // A sender into `events`, so a test can inject a Rescan without an
     // FSEvents storm ([`Self::inject_rescan`]).
     #[cfg(test)]
-    #[allow(dead_code)] // Until GM-616's tests slice drives `inject_rescan`.
     test_events: Sender<WatchSignal>,
     root: PathBuf,
     // The layers and the link table, loaded by one walk. Swapped whole by
@@ -281,7 +280,6 @@ impl ProjectWatcher {
     /// signal without an FSEvents storm. It then reaches
     /// [`Self::next_change`] like any other signal.
     #[cfg(test)]
-    #[allow(dead_code)] // Until GM-616's tests slice drives it.
     pub(crate) fn inject_rescan(&self, path: impl Into<PathBuf>) {
         let _ = self.test_events.send(WatchSignal::Rescan(path.into()));
     }
@@ -1005,6 +1003,91 @@ mod tests {
                 seen.iter().all(|path| *path != duplicate && !path.starts_with(root.join("cfg"))),
                 "only the winner's spelling surfaces: {seen:?}"
             );
+        }
+    }
+
+    // --- GM-616: the OS's dropped-event signal is forwarded as a Rescan ---
+    // Numbers name the behaviours in docs/design/GM-616-fsevents-rescan.md §6.
+
+    fn forwarded(event: notify::Event, root: &Path) -> Vec<WatchSignal> {
+        let (tx, rx) = channel();
+        forward_event(event, root, &tx);
+        drop(tx);
+        rx.iter().collect()
+    }
+
+    fn rescan_event() -> notify::Event {
+        notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)
+    }
+
+    /// Behaviour 1: a `Flag::Rescan` event naming a directory becomes a
+    /// Rescan of that directory, not a path event.
+    #[test]
+    fn a_rescan_event_with_a_path_is_forwarded_as_a_rescan_of_that_path() {
+        let root = Path::new("/project");
+        let event = rescan_event().add_path(root.join("src"));
+        assert_eq!(forwarded(event, root), vec![WatchSignal::Rescan(root.join("src"))]);
+
+        let root_event = rescan_event().add_path(root.to_path_buf());
+        assert_eq!(forwarded(root_event, root), vec![WatchSignal::Rescan(root.to_path_buf())]);
+    }
+
+    /// Behaviour 2: a pathless Rescan (inotify's queue overflow) becomes a
+    /// Rescan of the root.
+    #[test]
+    fn a_pathless_rescan_event_is_forwarded_as_a_rescan_of_the_root() {
+        let root = Path::new("/project");
+        assert_eq!(forwarded(rescan_event(), root), vec![WatchSignal::Rescan(root.to_path_buf())]);
+    }
+
+    /// An unflagged event is still one path event per path.
+    #[test]
+    fn an_ordinary_event_is_forwarded_as_its_paths() {
+        let root = Path::new("/project");
+        let event =
+            notify::Event::new(notify::EventKind::Any).add_path(root.join("a")).add_path(root.join("b"));
+        assert_eq!(
+            forwarded(event, root),
+            vec![WatchSignal::Path(root.join("a")), WatchSignal::Path(root.join("b"))]
+        );
+    }
+
+    /// The first Rescan `next_change` returns within [`EVENT_TIMEOUT`];
+    /// path changes (FSEvents' startup noise) are skipped.
+    fn next_rescan(watcher: &ProjectWatcher) -> Option<PathBuf> {
+        let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            if let Some(Change::Rescan(path)) = watcher.next_change(remaining) {
+                return Some(path);
+            }
+        }
+    }
+
+    /// Behaviour 3: `next_change` returns a Rescan as [`Change::Rescan`] -
+    /// of the root, of a subdirectory, and of an ignored directory alike (no
+    /// ignore check) - and widens one outside the root to the root.
+    #[test]
+    fn next_change_returns_a_rescan_as_a_rescan_of_its_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        let watcher = ProjectWatcher::new(&root).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+
+        for (injected, expected) in [
+            (root.clone(), root.clone()),
+            (root.join("src"), root.join("src")),
+            (root.join("build"), root.join("build")),
+            (elsewhere.path().canonicalize().unwrap(), root.clone()),
+        ] {
+            watcher.inject_rescan(&injected);
+            assert_eq!(next_rescan(&watcher), Some(expected), "a rescan of {}", injected.display());
         }
     }
 }

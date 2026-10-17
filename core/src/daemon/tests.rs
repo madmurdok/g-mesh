@@ -889,3 +889,245 @@ fn a_rebuild_marker_counts_only_while_its_pid_lives_and_the_daemon_lock_is_held(
     std::fs::write(&marker, "not a pid\n").unwrap();
     assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "an unreadable marker");
 }
+
+// --- GM-616: a Rescan reconciles the subtree whose events the OS dropped ---
+// Numbers name the behaviours in docs/design/GM-616-fsevents-rescan.md §6.
+//
+// These tests drive `watch_and_route_once` over a real watcher whose
+// debouncer window is an hour: every ordinary event the edits below cause is
+// recorded and never settles, exactly as if the OS had dropped it. Only an
+// injected Rescan (`ProjectWatcher::inject_rescan`) can reach the index.
+
+/// Longer than any test runs, so no path event ever settles and routes.
+const SWALLOWING_WINDOW: Duration = Duration::from_secs(3600);
+
+/// A scheduler with no settle time and no gap, so a recorded Rescan is due
+/// on the same `watch_and_route_once` iteration.
+fn immediate_rescans() -> Rescans {
+    Rescans::with_scheduler(RescanScheduler::with_timings(
+        Duration::ZERO,
+        crate::watcher::rescan::RESCAN_MAX_DELAY,
+        0,
+    ))
+}
+
+/// A file-backed index in `project`'s state directory (a language reindex
+/// swaps it by its path) whose project walk has completed
+/// (`meta.bulkIndexedAt` set), as the reconcile requires.
+fn walked_index(project: &Path) -> IndexStore {
+    let conn = crate::storage::connection::open(project).unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    schema::ensure_current(&conn, &registry::fixture_indexer_version()).unwrap();
+    let updated = conn.execute("UPDATE meta SET bulkIndexedAt = CURRENT_TIMESTAMP WHERE id = 1", []).unwrap();
+    assert_eq!(updated, 1, "the fixture index must have its meta row");
+    IndexStore::new(conn)
+}
+
+/// Writes `file_path` under `root` and records it as indexed at its current
+/// mtime: fresh, so a reconcile leaves it alone until it changes.
+fn indexed_file(root: &Path, conn: &IndexStore, file_path: &str) {
+    let path = root.join(file_path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "v0").unwrap();
+    let mtime = crate::watcher::staleness::mtime_millis(&fs::metadata(&path).unwrap()).unwrap();
+    conn.with(|c| crate::storage::write::upsert_indexed_file(c, file_path, mtime, "indexed")).unwrap();
+}
+
+/// Rewrites `file_path` with a later mtime than its indexed one.
+fn edit(root: &Path, file_path: &str) {
+    let path = root.join(file_path);
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, "v1").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(before + Duration::from_secs(2))
+        .unwrap();
+}
+
+fn is_stale(conn: &IndexStore, root: &Path, file_path: &str) -> bool {
+    conn.with(|c| crate::watcher::staleness::is_stale(c, root, file_path)).unwrap()
+}
+
+/// Runs `watch_and_route_once` until `done` holds after an iteration, or
+/// [`ROUND_TRIP_DEADLINE`] passes; returns whether `done` held. A Rescan run
+/// completes inside the iteration that starts it, so `done` sees its whole
+/// effect.
+fn pump_until(
+    watcher: &ProjectWatcher,
+    debouncer: &mut Debouncer,
+    rescans: &mut Rescans,
+    root: &Path,
+    conn: &IndexStore,
+    registry: &PluginRegistry,
+    done: impl Fn() -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + ROUND_TRIP_DEADLINE;
+    while std::time::Instant::now() < deadline {
+        watch_and_route_once(watcher, debouncer, rescans, root, conn, registry);
+        if done() {
+            return true;
+        }
+    }
+    false
+}
+
+fn requested(plugin_dir: &Path, file_path: &str) -> bool {
+    test_plugin::file_changed_requests(plugin_dir).iter().any(|path| path == file_path)
+}
+
+/// Behaviour 4, the core fix: an edit whose events were dropped is reindexed
+/// once a root Rescan arrives; an untouched file is not.
+#[test]
+fn an_edit_whose_events_were_dropped_is_reindexed_after_a_root_rescan() {
+    let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+    let plugin_dir = &dirs[0];
+    let root = project.path().canonicalize().unwrap();
+    let conn = walked_index(project.path());
+    indexed_file(&root, &conn, "a.python-src");
+    indexed_file(&root, &conn, "untouched.python-src");
+
+    let watcher = ProjectWatcher::new(&root).unwrap();
+    let mut debouncer = Debouncer::new(SWALLOWING_WINDOW);
+    let mut rescans = immediate_rescans();
+    edit(&root, "a.python-src");
+    for _ in 0..3 {
+        watch_and_route_once(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry);
+    }
+    assert!(test_plugin::file_changed_requests(plugin_dir).is_empty(), "the edit's own events are swallowed");
+    assert!(is_stale(&conn, &root, "a.python-src"), "the index holds the edited file's old version");
+
+    watcher.inject_rescan(&root);
+    let reindexed = pump_until(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry, || {
+        requested(plugin_dir, "a.python-src")
+    });
+
+    assert!(reindexed, "a root rescan must reindex the edit whose events were dropped");
+    assert_eq!(
+        test_plugin::file_changed_requests(plugin_dir),
+        vec!["a.python-src".to_string()],
+        "only the changed file is reparsed"
+    );
+    assert!(!is_stale(&conn, &root, "a.python-src"), "the index now holds the file as it is on disk");
+}
+
+/// Behaviour 5: a file deleted and one created with no event reaching the
+/// daemon are retired and indexed by a root Rescan.
+#[test]
+fn a_deletion_and_a_creation_whose_events_were_dropped_are_reconciled_by_a_rescan() {
+    let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+    let plugin_dir = &dirs[0];
+    let root = project.path().canonicalize().unwrap();
+    let conn = walked_index(project.path());
+    indexed_file(&root, &conn, "gone.python-src");
+    indexed_file(&root, &conn, "kept.python-src");
+
+    let watcher = ProjectWatcher::new(&root).unwrap();
+    let mut debouncer = Debouncer::new(SWALLOWING_WINDOW);
+    let mut rescans = immediate_rescans();
+    fs::remove_file(root.join("gone.python-src")).unwrap();
+    fs::write(root.join("new.python-src"), "v0").unwrap();
+
+    watcher.inject_rescan(&root);
+    let reconciled = pump_until(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry, || {
+        requested(plugin_dir, "gone.python-src") && requested(plugin_dir, "new.python-src")
+    });
+
+    assert!(
+        reconciled,
+        "the deletion and the creation must both be routed: {:?}",
+        test_plugin::file_changed_requests(plugin_dir)
+    );
+    assert!(!requested(plugin_dir, "kept.python-src"), "an untouched file is not reparsed");
+    let baseline = |file_path: &str| {
+        conn.with(|c| crate::watcher::staleness::has_indexed_baseline(c, file_path)).unwrap()
+    };
+    assert!(!baseline("gone.python-src"), "the deleted file is retired from the index");
+    assert!(baseline("new.python-src"), "the created file is indexed");
+}
+
+/// Behaviour 6: a Rescan of a subtree reconciles only that subtree; an edit
+/// outside it stays stale until a root Rescan.
+#[test]
+fn a_subtree_rescan_reconciles_only_that_subtree() {
+    let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+    let plugin_dir = &dirs[0];
+    let root = project.path().canonicalize().unwrap();
+    let conn = walked_index(project.path());
+    indexed_file(&root, &conn, "sub/inside.python-src");
+    indexed_file(&root, &conn, "outside.python-src");
+
+    let watcher = ProjectWatcher::new(&root).unwrap();
+    let mut debouncer = Debouncer::new(SWALLOWING_WINDOW);
+    let mut rescans = immediate_rescans();
+    edit(&root, "sub/inside.python-src");
+    edit(&root, "outside.python-src");
+
+    watcher.inject_rescan(root.join("sub"));
+    let inside = pump_until(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry, || {
+        requested(plugin_dir, "sub/inside.python-src")
+    });
+    assert!(inside, "the rescanned subtree's edit is reindexed");
+    assert!(
+        !requested(plugin_dir, "outside.python-src"),
+        "an edit outside the rescanned subtree is not reconciled by its run"
+    );
+    assert!(is_stale(&conn, &root, "outside.python-src"), "and stays stale");
+
+    watcher.inject_rescan(&root);
+    let outside = pump_until(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry, || {
+        requested(plugin_dir, "outside.python-src")
+    });
+    assert!(outside, "a root rescan then reconciles it");
+}
+
+/// Behaviour 9: a `.gitignore` edit whose events were dropped, then a
+/// Rescan: the newly ignored file leaves the index, through
+/// `gitignore_changed`'s reindex of its language.
+#[test]
+fn a_gitignore_edit_whose_events_were_dropped_is_rechecked_by_a_rescan() {
+    let (project, _plugins, dirs, registry) = registry_over(&["python"]);
+    let plugin_dir = &dirs[0];
+    let root = project.path().canonicalize().unwrap();
+    let conn = walked_index(project.path());
+    for file_path in ["src/a.python-src", "generated/x.python-src"] {
+        indexed_file(&root, &conn, file_path);
+        conn.with(|c| {
+            c.execute(
+                "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+                 VALUES (?1, 'File', ?2, ?2, ?2, 1, 0, 1, 0, 'python')",
+                rusqlite::params![format!("{file_path}:{file_path}"), file_path],
+            )
+        })
+        .unwrap();
+    }
+
+    let watcher = ProjectWatcher::new(&root).unwrap();
+    let mut debouncer = Debouncer::new(SWALLOWING_WINDOW);
+    let mut rescans = immediate_rescans();
+    fs::write(root.join(GITIGNORE_FILE_NAME), "generated/\n").unwrap();
+    // The previous reconcile started before this edit.
+    let edited = fs::metadata(root.join(GITIGNORE_FILE_NAME)).unwrap().modified().unwrap();
+    rescans.gitignores_since = edited.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - 1;
+    let file_node = |file_path: &str| {
+        conn.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM nodes WHERE kind = 'File' AND filePath = ?1",
+                [file_path],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .unwrap()
+            > 0
+    };
+    assert!(file_node("generated/x.python-src"));
+
+    watcher.inject_rescan(&root);
+    let rechecked = pump_until(&watcher, &mut debouncer, &mut rescans, &root, &conn, &registry, || {
+        !test_plugin::spawns(plugin_dir).is_empty()
+    });
+
+    assert!(rechecked, "the rescan's .gitignore recheck must reindex python, which lost a file");
+    assert!(!file_node("generated/x.python-src"), "the newly ignored file has left the index");
+}
