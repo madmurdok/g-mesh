@@ -305,3 +305,11 @@ covered by C3.
 - A copy outside the project (module cache, `vendor/`, which is not indexed)
   is never listed by the new step; a referencing load that resolves there
   keeps today's behaviour.
+- Found by verify (GM-621/S11): when a project vendors a module that is also
+  one of its own modules, a referencing listing resolves into `vendor/` and
+  leaves the module's own copy uncovered, so a per-file pass lists that copy
+  too (1 listing becomes 2 on the vendored `requiringRoot` probe; edges
+  unchanged). Kept: the whole pass folds that copy as well, so the union now
+  matches it, and the cost (~0.27 s per such pass) arises only in this layout.
+  The "no forks, zero extra listings" claim above holds for projects that do
+  not vendor one of their own modules.
