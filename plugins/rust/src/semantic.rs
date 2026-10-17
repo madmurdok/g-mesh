@@ -129,7 +129,8 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     if let Some(sysroot) = &toolchain.sysroot {
         pin_sysroot(&mut config.initialization_options, sysroot);
         let rust_src_path_set = std::env::var_os("RUST_SRC_PATH").is_some_and(|path| !path.is_empty());
-        if let Some(hint) = rust_src_hint(sysroot, toolchain.pin.as_deref(), rust_src_path_set) {
+        let source = std_source(config.initialization_options.as_ref(), root, sysroot);
+        if let Some(hint) = std_hint(&source, sysroot, toolchain.pin.as_deref(), rust_src_path_set) {
             g_mesh_plugin_sdk::log_line!("{hint}");
         }
     }
@@ -302,6 +303,72 @@ fn pin_sysroot(options: &mut Option<serde_json::Value>, sysroot: &Path) {
     cargo
         .entry("sysroot")
         .or_insert_with(|| serde_json::Value::String(sysroot.to_string_lossy().into_owned()));
+}
+
+/// Where rust-analyzer will look for the standard library source, read from
+/// the effective `cargo.sysroot`/`cargo.sysrootSrc` in `options` (after
+/// [`pin_sysroot`], so a user-set value wins over `detected`).
+#[derive(Debug, PartialEq, Eq)]
+enum StdSource {
+    /// `cargo.sysroot` is `null`: rust-analyzer loads no sysroot, so no
+    /// rust-src would make std load.
+    Disabled,
+    /// A sysroot: rust-src is `lib/rustlib/src/rust/library` under it, unless
+    /// `RUST_SRC_PATH` names one.
+    Sysroot(PathBuf),
+    /// `cargo.sysrootSrc`: the library source itself; rust-analyzer then
+    /// takes it as given and does not consult `RUST_SRC_PATH`.
+    Library(PathBuf),
+}
+
+/// The [`StdSource`] rust-analyzer will use, by its documented semantics of
+/// `cargo.sysroot` ("relative path to the sysroot, or \"discover\" ...
+/// Unsetting this disables sysroot loading") and `cargo.sysrootSrc`
+/// ("relative path to the sysroot library sources ... defaults to
+/// `{cargo.sysroot}/lib/rustlib/src/rust/library`"). Relative paths are
+/// joined to the workspace `root` (rust-analyzer joins them to its root
+/// path); an absolute one replaces it. `"discover"` runs `rustc --print
+/// sysroot` under the pinned toolchain, so it is `detected`. A missing key,
+/// a value of another type (which rust-analyzer rejects for its default,
+/// `"discover"`) and options that are not JSON objects are `detected` too.
+/// `cargo.sysrootSrc` counts only while a sysroot is loaded at all.
+fn std_source(options: Option<&serde_json::Value>, root: &Path, detected: &Path) -> StdSource {
+    let cargo = options.and_then(|options| options.get("cargo")).and_then(serde_json::Value::as_object);
+    let sysroot = match cargo.and_then(|cargo| cargo.get("sysroot")) {
+        Some(serde_json::Value::Null) => return StdSource::Disabled,
+        Some(serde_json::Value::String(path)) if path != "discover" => root.join(path),
+        _ => detected.to_path_buf(),
+    };
+    match cargo.and_then(|cargo| cargo.get("sysrootSrc")).and_then(serde_json::Value::as_str) {
+        Some(library) => StdSource::Library(root.join(library)),
+        None => StdSource::Sysroot(sysroot),
+    }
+}
+
+/// The line [`engine`] logs when std will not load from `source`:
+/// [`rust_src_hint`] for a sysroot, naming the rustup command only
+/// when that sysroot is the `detected` one (the `pin` toolchain's); for a
+/// `cargo.sysrootSrc` with no `Cargo.toml`, a line naming that directory.
+/// `None` when sysroot loading is disabled: no install would load std.
+fn std_hint(
+    source: &StdSource,
+    detected: &Path,
+    pin: Option<&str>,
+    rust_src_path_set: bool,
+) -> Option<String> {
+    match source {
+        StdSource::Disabled => None,
+        StdSource::Sysroot(sysroot) => {
+            rust_src_hint(sysroot, pin.filter(|_| sysroot == detected), rust_src_path_set)
+        }
+        StdSource::Library(library) => (!library.join("Cargo.toml").is_file()).then(|| {
+            format!(
+                "[{LANGUAGE}] std not loaded: cargo.sysrootSrc {} has no standard library source \
+                 (no Cargo.toml); point it at a `library` directory of rust-src",
+                library.display()
+            )
+        }),
+    }
 }
 
 /// The line [`engine`] logs when the server will not load std (GM-603): the
@@ -1171,9 +1238,10 @@ mod tests {
             |needle: &str| body.find(needle).unwrap_or_else(|| panic!("`engine` lacks `{needle}`:\n{body}"));
         let env = at("config.env.extend(pinned_env(&toolchain));");
         let pin = at("pin_sysroot(&mut config.initialization_options, sysroot);");
-        let hint = at("rust_src_hint(sysroot, toolchain.pin.as_deref(), rust_src_path_set)");
+        let source = at("std_source(config.initialization_options.as_ref(), root, sysroot)");
+        let hint = at("std_hint(&source, sysroot, toolchain.pin.as_deref(), rust_src_path_set)");
         let bridge = at("LspBridge::new(LANGUAGE, root, config)");
-        assert!(env < pin && pin < bridge && hint < bridge, "{body}");
+        assert!(env < pin && pin < source && source < hint && hint < bridge, "{body}");
         assert!(body.contains("std::env::var_os(\"RUST_SRC_PATH\")"), "{body}");
     }
 
