@@ -704,8 +704,17 @@ impl Rescans {
 
     /// `scheduler`, the watermark at now.
     pub(crate) fn with_scheduler(scheduler: RescanScheduler) -> Self {
-        Self { scheduler, gitignores_since: unix_now_secs() }
+        Self { scheduler, gitignores_since: gitignore_watermark() }
     }
+}
+
+/// The `.gitignore` watermark for a reconcile starting now: one second before
+/// now. mtimes are compared in whole seconds and strictly, so a `.gitignore`
+/// written in the same second the run starts, after the run has read it, is
+/// still newer than the next run's watermark. The cost is rechecking a file
+/// once more, which the gate in [`PluginRegistry::gitignore_changed`] absorbs.
+fn gitignore_watermark() -> i64 {
+    unix_now_secs() - 1
 }
 
 /// Whole seconds since the epoch, now (0 if the clock is before it).
@@ -790,7 +799,7 @@ fn watch_and_route_once(
     }
     if let Some(subtrees) = rescans.scheduler.due() {
         let started = std::time::Instant::now();
-        let gitignores_since = std::mem::replace(&mut rescans.gitignores_since, unix_now_secs());
+        let gitignores_since = std::mem::replace(&mut rescans.gitignores_since, gitignore_watermark());
         registry.rescan_subtrees(conn, &subtrees, watcher, gitignores_since);
         rescans.scheduler.ran(started.elapsed());
     }
