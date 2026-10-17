@@ -178,7 +178,10 @@ smoke_reindex() {
 		log "per-language check: querying $db"
 		for ext in go rs py ts; do
 			count="$(sqlite3 "$db" "SELECT COUNT(*) FROM nodes WHERE filePath LIKE '%.$ext';")"
-			log "  .$ext: $count node(s)"
+			# No `.$ext:` here: actions/setup-go's problem matcher (owner "go",
+			# `^\s*(.+\.go):(?:(\d+):(\d+):)? (.*)`) reads `.go: ` as a compiler
+			# error and annotates a passing job (GM-627).
+			log "  [.$ext] $count node(s)"
 			[ "$count" -gt 0 ] || die ".$ext contributed 0 nodes - that plugin ran but extracted nothing from its own fixture file (aggregate nodes=$nodes came entirely from the other languages)"
 		done
 	else
