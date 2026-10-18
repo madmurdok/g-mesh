@@ -408,10 +408,10 @@ type loadView struct {
 	// from an imported project package's export data (foldImportedInterfaces):
 	// re-evaluated exactly, never carried forward.
 	importedInterfaces map[string]bool
-	// importedPackages is every project package path walked from export
-	// data. Export data holds every exported declaration, so an exported
-	// interface of one of these that is not in importedInterfaces is gone
-	// (an unexported one may simply not have been exported).
+	// importedPackages is every project package path walked from its own,
+	// complete export data. That holds every exported declaration, so an
+	// exported interface of one of these that is not in importedInterfaces
+	// is gone (an unexported one may simply not have been exported).
 	importedPackages map[string]bool
 }
 
@@ -848,8 +848,13 @@ func (e *semanticEngine) foldImportedInterfaces(into *resolutions, fset *token.F
 			continue
 		}
 		into.importsWalked[imp] = true
-		into.importedPackages[path] = true
-		view.importedPackages[path] = true
+		// A package reached only through another package's export data is
+		// partial: its scope holds just the objects that export data
+		// references, so a missing interface of it is not gone.
+		if imp.Complete() {
+			into.importedPackages[path] = true
+			view.importedPackages[path] = true
+		}
 		// Its twins are listed like any other package an answer resolved
 		// into, so targetScopeOf can address a twinned interface by file.
 		into.referenced[path] = true
@@ -1672,11 +1677,20 @@ func (e *semanticEngine) answerImplements(
 	// the record a pair reached from several loads keeps is deterministic.
 	sort.Slice(types_, func(i, j int) bool { return resolved.loadedObjectLess(types_[i].obj, types_[j].obj) })
 
-	interfaces := make([]*types.TypeName, 0, len(resolved.interfaces))
+	// A pair from two loads is never tested: no build sees both
+	// declarations, and types.Implements across two loads matches only
+	// predeclared signatures. So interfaces are bucketed by load and a type
+	// is checked against its own load's bucket only. A pair several loads
+	// see gives the same edge id from each, so the edge holds if any build
+	// that sees both assigns one to the other.
+	interfacesOf := map[string][]*types.TypeName{}
 	for obj := range resolved.interfaces {
-		interfaces = append(interfaces, obj)
+		load := resolved.loadOf[obj]
+		interfacesOf[load] = append(interfacesOf[load], obj)
 	}
-	sort.Slice(interfaces, func(i, j int) bool { return resolved.loadedObjectLess(interfaces[i], interfaces[j]) })
+	for _, bucket := range interfacesOf {
+		sort.Slice(bucket, func(i, j int) bool { return objectLess(bucket[i], bucket[j]) })
+	}
 
 	emitted := 0
 	for _, subtype := range types_ {
@@ -1684,7 +1698,7 @@ func (e *semanticEngine) answerImplements(
 		if !ok {
 			continue
 		}
-		for _, ifaceObj := range interfaces {
+		for _, ifaceObj := range interfacesOf[resolved.loadOf[subtype.obj]] {
 			// Pointer identity is not enough: `Tests: true` type-checks a
 			// package's test variant (`render [render.test]`) separately
 			// from its production variant, so the same `type Render
@@ -1699,14 +1713,6 @@ func (e *semanticEngine) answerImplements(
 			// both name the same declaration no matter which type-checking
 			// pass produced them.
 			if ifaceObj.Pkg().Path() == subtype.obj.Pkg().Path() && ifaceObj.Name() == subtype.obj.Name() {
-				continue
-			}
-			// A pair from two loads is never tested: no build sees both
-			// declarations, and types.Implements across two loads matches
-			// only predeclared signatures. A pair several loads see gives
-			// the same edge id from each, so the edge holds if any build
-			// that sees both assigns one to the other.
-			if resolved.loadOf[subtype.obj] != resolved.loadOf[ifaceObj] {
 				continue
 			}
 			iface, _ := resolved.interfaces[ifaceObj].Underlying().(*types.Interface)
