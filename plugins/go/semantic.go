@@ -1725,22 +1725,63 @@ func interfaceMethodNames(iface *types.Interface) []string {
 // parameter and result names, so renaming one does not.
 func interfaceSignature(iface *types.Interface) string {
 	var b strings.Builder
-	for i := 0; i < iface.NumMethods(); i++ {
-		m := iface.Method(i)
-		if i > 0 {
-			b.WriteString("; ")
-		}
-		b.WriteString(m.Name())
-		b.WriteString(" ")
-		writeCanonicalType(&b, m.Type())
-	}
+	newCanonicalWriter(&b).methods(iface)
 	return b.String()
 }
 
 // writeCanonicalType writes t with every alias resolved, named types
-// qualified by package path, type parameters by index and no parameter
-// names. Recursion stops at named types, so it terminates on recursive types.
+// qualified by package path (and, for a function-local type, by its ordinal
+// among the package's local types of that name), unexported method and field
+// names qualified by their package, type parameters by index with their
+// constraint, and no parameter names. Recursion stops at named types and at a
+// type parameter already written, so it terminates on recursive types.
 func writeCanonicalType(b *strings.Builder, t types.Type) {
+	newCanonicalWriter(b).typ(t)
+}
+
+// canonicalWriter carries one rendering's state: the type parameters whose
+// constraint is already written, so a constraint that mentions its own
+// parameter (`T interface{ M() T }`) does not recurse forever.
+type canonicalWriter struct {
+	b      *strings.Builder
+	params map[*types.TypeParam]bool
+}
+
+func newCanonicalWriter(b *strings.Builder) *canonicalWriter {
+	return &canonicalWriter{b: b, params: map[*types.TypeParam]bool{}}
+}
+
+// methods writes an interface's method set in types.Interface order, which
+// sorts by Id, and an unexported name's Id carries its package, so the order
+// is the same in every load.
+func (w *canonicalWriter) methods(iface *types.Interface) {
+	for i := 0; i < iface.NumMethods(); i++ {
+		m := iface.Method(i)
+		if i > 0 {
+			w.b.WriteString("; ")
+		}
+		w.name(m)
+		w.b.WriteString(" ")
+		w.typ(m.Type())
+	}
+}
+
+// name writes a method or field name. An unexported one is qualified by its
+// package: the spec makes non-exported names from different packages always
+// different, so `interface{ m() }` from two packages are two types, and
+// retargeting an embedded interface between them must change the string.
+// "/" and "." cannot appear in an identifier, so no exported name renders the
+// same.
+func (w *canonicalWriter) name(obj types.Object) {
+	if !obj.Exported() && obj.Pkg() != nil {
+		w.b.WriteString(obj.Pkg().Path())
+		w.b.WriteString(".")
+	}
+	w.b.WriteString(obj.Name())
+}
+
+func (w *canonicalWriter) typ(t types.Type) {
+	b := w.b
 	switch t := types.Unalias(t).(type) {
 	case *types.Named:
 		obj := t.Obj()
@@ -1749,32 +1790,45 @@ func writeCanonicalType(b *strings.Builder, t types.Type) {
 			b.WriteString(".")
 		}
 		b.WriteString(obj.Name())
+		if n := localTypeOrdinal(obj); n > 0 {
+			// U+00B7 is not a letter, so no declared name contains it.
+			fmt.Fprintf(b, "\u00b7%d", n)
+		}
 		if args := t.TypeArgs(); args.Len() > 0 {
 			b.WriteString("[")
 			for i := 0; i < args.Len(); i++ {
 				if i > 0 {
 					b.WriteString(", ")
 				}
-				writeCanonicalType(b, args.At(i))
+				w.typ(args.At(i))
 			}
 			b.WriteString("]")
 		}
 	case *types.TypeParam:
 		fmt.Fprintf(b, "$%d", t.Index())
+		if !w.params[t] {
+			// The constraint is part of the parameter's meaning; written once,
+			// at the first mention, in brackets ("$" never starts a type, so
+			// "$0[" is never a type argument list).
+			w.params[t] = true
+			b.WriteString("[")
+			w.typ(t.Constraint())
+			b.WriteString("]")
+		}
 	case *types.Pointer:
 		b.WriteString("*")
-		writeCanonicalType(b, t.Elem())
+		w.typ(t.Elem())
 	case *types.Slice:
 		b.WriteString("[]")
-		writeCanonicalType(b, t.Elem())
+		w.typ(t.Elem())
 	case *types.Array:
 		fmt.Fprintf(b, "[%d]", t.Len())
-		writeCanonicalType(b, t.Elem())
+		w.typ(t.Elem())
 	case *types.Map:
 		b.WriteString("map[")
-		writeCanonicalType(b, t.Key())
+		w.typ(t.Key())
 		b.WriteString("]")
-		writeCanonicalType(b, t.Elem())
+		w.typ(t.Elem())
 	case *types.Chan:
 		switch t.Dir() {
 		case types.SendOnly:
@@ -1783,16 +1837,16 @@ func writeCanonicalType(b *strings.Builder, t types.Type) {
 			b.WriteString("<-chan ")
 		default:
 			b.WriteString("chan (")
-			writeCanonicalType(b, t.Elem())
+			w.typ(t.Elem())
 			b.WriteString(")")
 			return
 		}
-		writeCanonicalType(b, t.Elem())
+		w.typ(t.Elem())
 	case *types.Signature:
 		b.WriteString("func(")
-		writeCanonicalTuple(b, t.Params(), t.Variadic())
+		w.tuple(t.Params(), t.Variadic())
 		b.WriteString(") (")
-		writeCanonicalTuple(b, t.Results(), false)
+		w.tuple(t.Results(), false)
 		b.WriteString(")")
 	case *types.Struct:
 		b.WriteString("struct{")
@@ -1803,12 +1857,16 @@ func writeCanonicalType(b *strings.Builder, t types.Type) {
 			f := t.Field(i)
 			if f.Embedded() {
 				// "*" cannot start a field name, so no named field renders the same.
+				// The name is written too: embedding an alias `A = T` names the
+				// field A, and struct{ A } is not identical to struct{ T }.
 				b.WriteString("*embedded ")
+				w.name(f)
+				b.WriteString(" ")
 			} else {
-				b.WriteString(f.Name())
+				w.name(f)
 				b.WriteString(" ")
 			}
-			writeCanonicalType(b, f.Type())
+			w.typ(f.Type())
 			if tag := t.Tag(i); tag != "" {
 				fmt.Fprintf(b, " %q", tag)
 			}
@@ -1816,11 +1874,11 @@ func writeCanonicalType(b *strings.Builder, t types.Type) {
 		b.WriteString("}")
 	case *types.Interface:
 		b.WriteString("interface{")
-		b.WriteString(interfaceSignature(t))
+		w.methods(t)
 		if !t.IsMethodSet() {
 			for i := 0; i < t.NumEmbeddeds(); i++ {
 				b.WriteString("; ")
-				writeCanonicalType(b, t.EmbeddedType(i))
+				w.typ(t.EmbeddedType(i))
 			}
 		}
 		b.WriteString("}")
@@ -1832,7 +1890,7 @@ func writeCanonicalType(b *strings.Builder, t types.Type) {
 			if t.Term(i).Tilde() {
 				b.WriteString("~")
 			}
-			writeCanonicalType(b, t.Term(i).Type())
+			w.typ(t.Term(i).Type())
 		}
 	default:
 		// *types.Basic (and anything future): its name is canonical.
@@ -1840,22 +1898,64 @@ func writeCanonicalType(b *strings.Builder, t types.Type) {
 	}
 }
 
-// writeCanonicalTuple writes a parameter or result list as types only,
-// keeping arity and, for parameters, variadic-ness.
-func writeCanonicalTuple(b *strings.Builder, tup *types.Tuple, variadic bool) {
+// tuple writes a parameter or result list as types only, keeping arity and,
+// for parameters, variadic-ness.
+func (w *canonicalWriter) tuple(tup *types.Tuple, variadic bool) {
 	for i := 0; i < tup.Len(); i++ {
 		if i > 0 {
-			b.WriteString(", ")
+			w.b.WriteString(", ")
 		}
 		t := tup.At(i).Type()
 		if variadic && i == tup.Len()-1 {
 			if s, ok := types.Unalias(t).(*types.Slice); ok {
-				b.WriteString("...")
+				w.b.WriteString("...")
 				t = s.Elem()
 			}
 		}
-		writeCanonicalType(b, t)
+		w.typ(t)
 	}
+}
+
+// localTypeOrdinal is 0 for a package-level type, and for a type declared
+// inside a function its 1-based position among the package's function-local
+// types of the same name, in scope-tree order (files in load order, then
+// source order), so two local `type T` in one package render differently.
+// The ordinal shifts only when a same-named local type is added before it,
+// which costs one extra re-check. A package's test variant is deliberately
+// not told apart: it compiles the same declarations, and its package-level
+// names are unique across the variant's files, so path.Name already names
+// one declaration - and an export-data load (always the production variant)
+// must render the same as a source load of the test variant.
+func localTypeOrdinal(obj *types.TypeName) int {
+	pkg, parent := obj.Pkg(), obj.Parent()
+	if pkg == nil || parent == nil || parent == pkg.Scope() || parent == types.Universe {
+		return 0
+	}
+	n := 0
+	var walk func(s *types.Scope) bool
+	walk = func(s *types.Scope) bool {
+		for i := 0; i < s.NumChildren(); i++ {
+			child := s.Child(i)
+			// A file scope (a child of the package scope) holds only
+			// imports, a dot-imported type among them: never a local type.
+			if found, ok := child.Lookup(obj.Name()).(*types.TypeName); ok && s != pkg.Scope() {
+				n++
+				if found == obj {
+					return true
+				}
+			}
+			if walk(child) {
+				return true
+			}
+		}
+		return false
+	}
+	if walk(pkg.Scope()) {
+		return n
+	}
+	// Not reachable from the package scope (an object the importer made
+	// without a scope tree): still tell it from the package-level name.
+	return 1
 }
 
 func hasAllMethods(have map[string]bool, iface *types.Interface) bool {
