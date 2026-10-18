@@ -2846,17 +2846,18 @@ fn a_path_calls_open_site_is_asked_at_the_last_segment() {
     assert_eq!(asked_at(&graph, "on_self", EdgeKind::Calls), vec![("Self::d".to_string(), 11, 10)]);
 }
 
-/// GM-618: only a path moves. A single-segment call is asked where it is
-/// written, turbofish or not, and `<T as Tr>::f()` (no path to flatten) is
-/// asked nowhere. An edge that is not a call keeps the node's start: a path
-/// used as a value or a type (`References`) and `impl super::Tr for T`
-/// (`SupertypeOf`).
+/// Only a path moves. A single-segment call is asked where it is written,
+/// turbofish or not, and `<T as Tr>::f()` (no path to flatten) is asked
+/// nowhere. A path that is not a call is asked at its last segment too: a
+/// path used as a value or a type (`References`) and the trait of
+/// `impl super::Tr for T` (`SupertypeOf`). The site keeps the whole path as
+/// its name.
 ///
-/// Control: in `Bodies::open_site`, ask at `path_last_segment(at)` whatever
-/// the edge kind (the `References` and `SupertypeOf` rows move to the last
-/// segment).
+/// Control: in `Bodies::open_site`, ask at `path_last_segment(at)` only for
+/// `EdgeKind::Calls` and at `at` otherwise (the `References` and
+/// `SupertypeOf` rows move back to the path's start).
 #[test]
-fn single_segment_calls_and_non_call_sites_are_asked_where_they_always_were() {
+fn single_segment_calls_stay_and_non_call_paths_are_asked_at_the_last_segment() {
     let source = "pub struct T;\n\
          pub fn run<U: Tr>() {\n\
          \x20   ghost();\n\
@@ -2871,6 +2872,11 @@ fn single_segment_calls_and_non_call_sites_are_asked_where_they_always_were() {
     let krate = Crate::new(&[("src/lib.rs", source)]);
     let graph = krate.extract("src/lib.rs");
     let at = |name: &str, anchor: &str| expect_at(source, name, anchor);
+    // Where `anchor` starts, moved to its last occurrence of `tail`.
+    let tail = |name: &str, anchor: &str, tail: &str| {
+        let (name, line, col) = expect_at(source, name, anchor);
+        (name, line, col + anchor.rfind(tail).unwrap() as u32)
+    };
     assert_eq!(
         asked_at(&graph, "run", EdgeKind::Calls),
         vec![at("ghost", "ghost();"), at("ghost", "ghost::<u8>")],
@@ -2880,9 +2886,9 @@ fn single_segment_calls_and_non_call_sites_are_asked_where_they_always_were() {
     assert_eq!(
         asked_at(&graph, "run", EdgeKind::References),
         vec![
-            at("super::Mode::A", "super::Mode::A"),
-            at("super::q::C", "super::q::C"),
-            at("super::Q", "super::Q ="),
+            tail("super::Mode::A", "super::Mode::A", "A"),
+            tail("super::q::C", "super::q::C", "C"),
+            tail("super::Q", "super::Q =", "Q"),
         ],
         "{:#?}",
         graph.0.open_sites
@@ -2896,7 +2902,7 @@ fn single_segment_calls_and_non_call_sites_are_asked_where_they_always_were() {
         .collect();
     assert_eq!(
         supertypes,
-        vec![at("super::Tr", "super::Tr for"), at("super::q::Tr", "super::q::Tr for")],
+        vec![tail("super::Tr", "super::Tr for", "Tr"), tail("super::q::Tr", "super::q::Tr for", "Tr")],
         "{:#?}",
         graph.0.open_sites
     );

@@ -1376,10 +1376,11 @@ impl Bodies<'_, '_> {
     /// same site, which a semantic answer landing elsewhere retracts; `None`
     /// when it wrote none.
     ///
-    /// A call site is asked at the callee path's last segment (GM-618): at
-    /// `ContextMode::Limited(..)` or `T::new()` the engine asked at the
-    /// path's start answers the qualifier, the type, which is not what is
-    /// called. Other edge kinds keep the node's start.
+    /// Every site is asked at its path's last segment, whatever the edge
+    /// kind: asked at the path's start (`ContextMode::Limited(..)`,
+    /// `T::new()`, `deep::K`, `T::C`, `impl deep::Tr for Foo`) the engine
+    /// answers the qualifier - a module, a type or a generic parameter - not
+    /// the item the path names. A single-token site is asked where it is.
     #[allow(clippy::too_many_arguments)]
     fn open_site(
         &mut self,
@@ -1391,7 +1392,7 @@ impl Bodies<'_, '_> {
         edge_kind: EdgeKind,
         replaces: Option<String>,
     ) {
-        let asked = if edge_kind == EdgeKind::Calls { path_last_segment(at) } else { at };
+        let asked = path_last_segment(at);
         let position = self.emitter.positions().at(asked.start_position());
         self.emitter.open_site(OpenSite {
             from_id: from.to_string(),
