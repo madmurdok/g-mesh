@@ -149,7 +149,11 @@ These are gaps this plugin has and will report honestly rather than guess at.
   `SUPERTYPE_OF`: a per-file pass only compares the types declared in that
   file against the interfaces its own load saw, so a type that starts
   satisfying an interface in another package is edged on the next
-  whole-project pass.
+  whole-project pass. `SUPERTYPE_OF` pairs a type only with interfaces of a
+  build that sees both: its own module's, or that of a module importing its
+  package (exported types with methods). Modules that share no build get no
+  edges between them. A per-file pass carries a cross-build edge by method
+  name and re-checks it exactly on the next whole-project pass.
 - **Struct fields have no node.** `x.field` resolves exactly, and is then
   dropped: this plugin models declarations, not type members, so there is
   nothing for the edge to land on.

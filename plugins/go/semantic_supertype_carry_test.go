@@ -248,13 +248,16 @@ func TestSemanticPassExhaustiveRetractsASupertypeOntoADeletedPackage(t *testing.
 }
 
 // A whole-project pass with a failed module keeps the edges onto that
-// module's interfaces: it could not evaluate them.
+// module's interfaces. The root module requires and imports broken, so its
+// own load, which still succeeds, pairs Mine with broken.Binder2.
 func TestSemanticPassKeepsSupertypesOntoAFailedModulesInterfaces(t *testing.T) {
 	requireGoToolchain(t)
 	const label = "app/app.go:Mine SUPERTYPE_OF container:example.com/broken#Binder2"
 	root := writeTree(t, map[string]string{
-		"go.mod":            "module example.com/x\n\ngo 1.22\n",
-		"app/app.go":        "package app\n\ntype Mine struct{}\n\nfunc (Mine) Bind() string { return \"mine\" }\n",
+		"go.mod": "module example.com/x\n\ngo 1.22\n\nrequire example.com/broken v0.0.0\n\n" +
+			"replace example.com/broken => ./broken\n",
+		"app/app.go": "package app\n\nimport \"example.com/broken\"\n\ntype Mine struct{}\n\n" +
+			"func (Mine) Bind() string { return \"mine\" }\n\nvar _ broken.Binder2 = Mine{}\n",
 		"broken/go.mod":     healthyBrokenGoMod,
 		"broken/binder2.go": "package broken\n\ntype Binder2 interface{ Bind() string }\n",
 	})
