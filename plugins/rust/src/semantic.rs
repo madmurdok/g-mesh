@@ -128,9 +128,9 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     config.env.extend(pinned_env(&toolchain));
     if let Some(sysroot) = &toolchain.sysroot {
         pin_sysroot(&mut config.initialization_options, sysroot);
-        let rust_src_path_set = std::env::var_os("RUST_SRC_PATH").is_some_and(|path| !path.is_empty());
+        let rust_src_path = rust_src_path(std::env::var("RUST_SRC_PATH").ok().as_deref());
         let source = std_source(config.initialization_options.as_ref(), root, sysroot);
-        if let Some(hint) = std_hint(&source, sysroot, toolchain.pin.as_deref(), rust_src_path_set) {
+        if let Some(hint) = std_hint(&source, sysroot, toolchain.pin.as_deref(), rust_src_path.as_deref()) {
             g_mesh_plugin_sdk::log_line!("{hint}");
         }
     }
@@ -345,49 +345,120 @@ fn std_source(options: Option<&serde_json::Value>, root: &Path, detected: &Path)
     }
 }
 
+/// Where rust-src puts the standard library source under a sysroot, the
+/// directory rust-analyzer loads when `cargo.sysrootSrc` is unset.
+const SYSROOT_LIBRARY: &str = "lib/rustlib/src/rust/library";
+
+/// Whether rust-analyzer loads std from the library source `library`: it has
+/// the `core` crate's root, `core/src/lib.rs` (or the older `libcore/lib.rs`).
+/// rust-analyzer runs `cargo metadata` on `library/Cargo.toml` when that
+/// exists and otherwise stitches the crates from these roots, and reports a
+/// library without `core` as missing it, so `Cargo.toml` decides nothing.
+fn has_core_source(library: &Path) -> bool {
+    library.join("core/src/lib.rs").is_file() || library.join("libcore/lib.rs").is_file()
+}
+
+/// The library source rust-analyzer takes from `RUST_SRC_PATH` (`value`,
+/// read as UTF-8: rust-analyzer ignores a value that is not): an absolute
+/// path that has a `core` entry. `None` for any other value, which
+/// rust-analyzer ignores in favour of the sysroot's own source. A path it
+/// takes still loads no std unless it has a `core` source
+/// ([`has_core_source`]).
+fn rust_src_path(value: Option<&str>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|path| path.is_absolute() && path.join("core").exists())
+}
+
+/// The line logged when the library source taken from `RUST_SRC_PATH`
+/// (`library`) has no `core` source; `None` when it has one.
+fn rust_src_path_hint(library: &Path) -> Option<String> {
+    (!has_core_source(library)).then(|| {
+        format!(
+            "[{LANGUAGE}] std not loaded: RUST_SRC_PATH {} has no standard library source (no \
+             core/src/lib.rs); point it at a `library` directory of rust-src or unset it",
+            library.display()
+        )
+    })
+}
+
 /// The line [`engine`] logs when std will not load from `source`:
-/// [`rust_src_hint`] for a sysroot, naming the rustup command only
-/// when that sysroot is the `detected` one (the `pin` toolchain's); for a
-/// `cargo.sysrootSrc` with no `Cargo.toml`, a line naming that directory.
-/// `None` when sysroot loading is disabled: no install would load std.
+/// [`rust_src_hint`] for the `detected` sysroot (the `pin` toolchain's), a
+/// line naming the path for a user-set `cargo.sysroot` or
+/// `cargo.sysrootSrc` that does not exist or has no `core` source. `None`
+/// when sysroot loading is disabled: no install would load std.
+/// `rust_src_path` is [`rust_src_path`]'s answer; for a sysroot it replaces
+/// the sysroot's own source ([`rust_src_path_hint`]), and rust-analyzer
+/// ignores it for a `cargo.sysrootSrc`.
 fn std_hint(
     source: &StdSource,
     detected: &Path,
     pin: Option<&str>,
-    rust_src_path_set: bool,
+    rust_src_path: Option<&Path>,
 ) -> Option<String> {
     match source {
         StdSource::Disabled => None,
+        StdSource::Sysroot(sysroot) if sysroot == detected => rust_src_hint(sysroot, pin, rust_src_path),
         StdSource::Sysroot(sysroot) => {
-            rust_src_hint(sysroot, pin.filter(|_| sysroot == detected), rust_src_path_set)
+            if let Some(library) = rust_src_path {
+                rust_src_path_hint(library)
+            } else if !sysroot.is_dir() {
+                Some(format!(
+                    "[{LANGUAGE}] std not loaded: cargo.sysroot {} does not exist; point it at a \
+                     toolchain's sysroot (`rustc --print sysroot`)",
+                    sysroot.display()
+                ))
+            } else if !has_core_source(&sysroot.join(SYSROOT_LIBRARY)) {
+                Some(format!(
+                    "[{LANGUAGE}] std not loaded: cargo.sysroot {} has no standard library source \
+                     (no {SYSROOT_LIBRARY}/core/src/lib.rs); install rust-src for that toolchain or \
+                     point cargo.sysroot at one that has it",
+                    sysroot.display()
+                ))
+            } else {
+                None
+            }
         }
-        StdSource::Library(library) => (!library.join("Cargo.toml").is_file()).then(|| {
+        StdSource::Library(library) if !library.is_dir() => Some(format!(
+            "[{LANGUAGE}] std not loaded: cargo.sysrootSrc {} does not exist; point it at a \
+             `library` directory of rust-src",
+            library.display()
+        )),
+        StdSource::Library(library) => (!has_core_source(library)).then(|| {
             format!(
                 "[{LANGUAGE}] std not loaded: cargo.sysrootSrc {} has no standard library source \
-                 (no Cargo.toml); point it at a `library` directory of rust-src",
+                 (no core/src/lib.rs); point it at a `library` directory of rust-src",
                 library.display()
             )
         }),
     }
 }
 
-/// The line [`engine`] logs when the server will not load std (GM-603): the
-/// sysroot has no `rust-src` (`lib/rustlib/src/rust/library/Cargo.toml`) and
-/// `RUST_SRC_PATH`, which rust-analyzer consults first, is unset. The plugin
-/// never installs it, so the line names the command that does. `None` when
-/// std will load.
-fn rust_src_hint(sysroot: &Path, pin: Option<&str>, rust_src_path_set: bool) -> Option<String> {
-    if rust_src_path_set || sysroot.join("lib/rustlib/src/rust/library/Cargo.toml").is_file() {
+/// The line [`engine`] logs when the server will not load std from the
+/// detected `sysroot`. `RUST_SRC_PATH`, which rust-analyzer consults
+/// first, replaces the sysroot's source when it applies (`rust_src_path`,
+/// [`rust_src_path_hint`]); otherwise std loads when the sysroot has a
+/// `core` source under [`SYSROOT_LIBRARY`]. The plugin never installs
+/// rust-src, so the line names the command that does when the toolchain is
+/// rustup's (`pin`), else where the source goes. `None` when std will load.
+fn rust_src_hint(sysroot: &Path, pin: Option<&str>, rust_src_path: Option<&Path>) -> Option<String> {
+    if let Some(library) = rust_src_path {
+        return rust_src_path_hint(library);
+    }
+    let library = sysroot.join(SYSROOT_LIBRARY);
+    if has_core_source(&library) {
         return None;
     }
-    let remedy = match pin {
-        Some(pin) => format!("run `rustup component add rust-src --toolchain {pin}`"),
-        None => format!("install the standard library source under {}", sysroot.display()),
-    };
-    Some(format!(
-        "[{LANGUAGE}] std not loaded: rust-src is not installed for toolchain {}; {remedy}",
-        pin.unwrap_or("not rustup-managed")
-    ))
+    Some(match pin {
+        Some(pin) => format!(
+            "[{LANGUAGE}] std not loaded: rust-src is not installed for toolchain {pin}; run `rustup \
+             component add rust-src --toolchain {pin}`"
+        ),
+        None => format!(
+            "[{LANGUAGE}] std not loaded: rust-src is not installed in sysroot {} (toolchain not \
+             rustup-managed); install the standard library source under {}",
+            sysroot.display(),
+            library.display()
+        ),
+    })
 }
 
 /// The environment the server starts with on top of the inherited one: the
@@ -1136,13 +1207,14 @@ mod tests {
         );
     }
 
-    /// GM-603 B2: a sysroot without `lib/rustlib/src/rust/library/Cargo.toml`
+    /// GM-603 B2: a sysroot without `lib/rustlib/src/rust/library/core/src/lib.rs`
     /// gets the hint naming the toolchain and the rustup command; one with
-    /// it, or any sysroot while `RUST_SRC_PATH` is set, gets none. The env
-    /// var is a parameter, so no process-global state is touched.
+    /// it, or any sysroot while `RUST_SRC_PATH` names a library with a
+    /// `core` source, gets none. The env var is a parameter, so no
+    /// process-global state is touched.
     ///
-    /// Controls: drop the `is_file()` check (the "has rust-src" case gets a
-    /// hint); drop the `rust_src_path_set` check (the `RUST_SRC_PATH` case
+    /// Controls: drop the `has_core_source` check (the "has rust-src" case gets a
+    /// hint); drop the `rust_src_path` check (the `RUST_SRC_PATH` case
     /// gets a hint); change the remedy's `rustup component add rust-src
     /// --toolchain` wording.
     #[cfg(unix)]
@@ -1152,30 +1224,33 @@ mod tests {
         let sysroot = &scratch.0;
         let pin = "stable-x86_64-apple-darwin";
 
-        let hint = rust_src_hint(sysroot, Some(pin), false).expect("no rust-src, no RUST_SRC_PATH: a hint");
+        let hint = rust_src_hint(sysroot, Some(pin), None).expect("no rust-src, no RUST_SRC_PATH: a hint");
         assert!(hint.contains(&format!("rustup component add rust-src --toolchain {pin}")), "{hint}");
         assert!(hint.contains("std not loaded"), "{hint}");
-        assert_eq!(rust_src_hint(sysroot, Some(pin), true), None, "RUST_SRC_PATH set: no hint");
-        let unpinned = rust_src_hint(sysroot, None, false).expect("no rust-src without rustup: a hint");
+        let src = scratch.0.join("rust-src-path");
+        std::fs::create_dir_all(src.join("core/src")).unwrap();
+        std::fs::write(src.join("core/src/lib.rs"), "").unwrap();
+        assert_eq!(rust_src_hint(sysroot, Some(pin), Some(&src)), None, "RUST_SRC_PATH set: no hint");
+        let unpinned = rust_src_hint(sysroot, None, None).expect("no rust-src without rustup: a hint");
         assert!(unpinned.contains(&sysroot.display().to_string()), "{unpinned}");
 
-        let manifest = sysroot.join("lib/rustlib/src/rust/library/Cargo.toml");
-        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        std::fs::write(&manifest, "[workspace]\n").unwrap();
-        assert_eq!(rust_src_hint(sysroot, Some(pin), false), None, "rust-src installed: no hint");
-        assert_eq!(rust_src_hint(sysroot, None, false), None, "rust-src installed: no hint");
+        let core = sysroot.join("lib/rustlib/src/rust/library/core/src/lib.rs");
+        std::fs::create_dir_all(core.parent().unwrap()).unwrap();
+        std::fs::write(&core, "").unwrap();
+        assert_eq!(rust_src_hint(sysroot, Some(pin), None), None, "rust-src installed: no hint");
+        assert_eq!(rust_src_hint(sysroot, None, None), None, "rust-src installed: no hint");
     }
 
     /// A fake sysroot under `base/name` whose rust-src has (`true`) a
-    /// `library/Cargo.toml` or is absent.
+    /// `library/core/src/lib.rs` or is absent.
     #[cfg(unix)]
     fn fake_sysroot(base: &Path, name: &str, with_rust_src: bool) -> PathBuf {
         let sysroot = base.join(name);
         std::fs::create_dir_all(&sysroot).unwrap();
         if with_rust_src {
-            let library = sysroot.join("lib/rustlib/src/rust/library");
-            std::fs::create_dir_all(&library).unwrap();
-            std::fs::write(library.join("Cargo.toml"), "[workspace]\n").unwrap();
+            let core = sysroot.join("lib/rustlib/src/rust/library/core/src");
+            std::fs::create_dir_all(&core).unwrap();
+            std::fs::write(core.join("lib.rs"), "").unwrap();
         }
         sysroot
     }
@@ -1195,7 +1270,7 @@ mod tests {
         let options = serde_json::json!({ "cargo": { "sysroot": user.to_str().unwrap() } });
 
         let source = std_source(Some(&options), &scratch.0, &detected);
-        let hint = std_hint(&source, &detected, Some("stable-x"), false)
+        let hint = std_hint(&source, &detected, Some("stable-x"), None)
             .expect("user sysroot lacks rust-src: a hint");
         assert!(hint.contains(&user.display().to_string()), "{hint}");
         assert!(!hint.contains("rustup component add"), "{hint}");
@@ -1214,7 +1289,7 @@ mod tests {
         let options = serde_json::json!({ "cargo": { "sysroot": user.to_str().unwrap() } });
 
         let source = std_source(Some(&options), &scratch.0, &detected);
-        assert_eq!(std_hint(&source, &detected, Some("stable-x"), false), None);
+        assert_eq!(std_hint(&source, &detected, Some("stable-x"), None), None);
     }
 
     /// GM-615: no user sysroot (missing key, no options, `"discover"`, a
@@ -1240,7 +1315,7 @@ mod tests {
             assert_eq!(std_source(options.as_ref(), &scratch.0, &detected), expected, "{options:?}");
         }
         let hint =
-            std_hint(&expected, &detected, Some("stable-x"), false).expect("detected lacks rust-src: a hint");
+            std_hint(&expected, &detected, Some("stable-x"), None).expect("detected lacks rust-src: a hint");
         assert!(hint.contains("rustup component add rust-src --toolchain stable-x"), "{hint}");
     }
 
@@ -1257,7 +1332,7 @@ mod tests {
 
         let source = std_source(Some(&options), &scratch.0, &detected);
         assert_eq!(source, StdSource::Disabled);
-        assert_eq!(std_hint(&source, &detected, Some("stable-x"), false), None);
+        assert_eq!(std_hint(&source, &detected, Some("stable-x"), None), None);
     }
 
     /// GM-615: a relative `cargo.sysroot` is joined to the workspace root; an
@@ -1281,46 +1356,63 @@ mod tests {
         );
     }
 
-    /// GM-615: `cargo.sysrootSrc` is the library itself: the hint is decided by
-    /// its `Cargo.toml` alone, not by the sysroot's rust-src or `RUST_SRC_PATH`.
+    /// `cargo.sysrootSrc` is the library itself: the hint is decided by its
+    /// `core` source alone, not by the sysroot's rust-src or `RUST_SRC_PATH`.
+    /// A directory that does not exist is named as missing; one with only a
+    /// `Cargo.toml` gets the "no core/src/lib.rs" hint.
     ///
-    /// Control: `std_source` returns `StdSource::Sysroot(sysroot)` for a
-    /// `sysrootSrc`.
+    /// Controls: `std_source` returns `StdSource::Sysroot(sysroot)` for a
+    /// `sysrootSrc`; delete the `Library(library) if !library.is_dir()` arm.
     #[cfg(unix)]
     #[test]
-    fn std_hint_for_sysroot_src_depends_only_on_that_directorys_cargo_toml() {
+    fn std_hint_for_sysroot_src_depends_only_on_that_directorys_core_source() {
         let scratch = Scratch::new("gm615-sysroot-src");
         let detected = fake_sysroot(&scratch.0, "detected", true);
         let missing = scratch.0.join("lib-missing");
         let present = scratch.0.join("lib-present");
         std::fs::create_dir_all(&missing).unwrap();
-        std::fs::create_dir_all(&present).unwrap();
-        std::fs::write(present.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::create_dir_all(present.join("core/src")).unwrap();
+        std::fs::write(present.join("core/src/lib.rs"), "").unwrap();
         let src_options = |library: &str| serde_json::json!({ "cargo": { "sysrootSrc": library } });
 
         // Relative to the root; the detected sysroot's own rust-src is irrelevant.
         let source = std_source(Some(&src_options("lib-missing")), &scratch.0, &detected);
         assert_eq!(source, StdSource::Library(missing.clone()));
-        let hint = std_hint(&source, &detected, Some("stable-x"), false).expect("no Cargo.toml: a hint");
+        let hint = std_hint(&source, &detected, Some("stable-x"), None).expect("no core source: a hint");
         assert!(hint.contains(&missing.display().to_string()), "{hint}");
         assert!(hint.contains("cargo.sysrootSrc"), "{hint}");
         assert!(!hint.contains("rustup component add"), "{hint}");
         // RUST_SRC_PATH does not apply to an explicit sysrootSrc.
-        assert!(std_hint(&source, &detected, Some("stable-x"), true).is_some());
+        assert!(std_hint(&source, &detected, Some("stable-x"), Some(&present)).is_some());
 
         let source = std_source(Some(&src_options("lib-present")), &scratch.0, &detected);
-        assert_eq!(std_hint(&source, &detected, None, false), None);
+        assert_eq!(std_hint(&source, &detected, None, None), None);
 
         // With the detected sysroot lacking rust-src, a present sysrootSrc still needs no hint.
         let bare = fake_sysroot(&scratch.0, "bare", false);
         let source = std_source(Some(&src_options("lib-present")), &scratch.0, &bare);
-        assert_eq!(std_hint(&source, &bare, Some("stable-x"), false), None);
+        assert_eq!(std_hint(&source, &bare, Some("stable-x"), None), None);
+
+        let missing_hint = std_hint(&StdSource::Library(scratch.0.join("lib-absent")), &detected, None, None)
+            .expect("an absent sysrootSrc: a hint");
+        assert!(missing_hint.contains("does not exist"), "{missing_hint}");
+        assert!(missing_hint.contains(&scratch.0.join("lib-absent").display().to_string()), "{missing_hint}");
+        assert!(!missing_hint.contains("no core/src/lib.rs"), "{missing_hint}");
+
+        let manifest_only = scratch.0.join("lib-manifest-only");
+        std::fs::create_dir_all(&manifest_only).unwrap();
+        std::fs::write(manifest_only.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let hint = std_hint(&StdSource::Library(manifest_only), &detected, None, None)
+            .expect("a Cargo.toml without core: a hint");
+        assert!(hint.contains("no core/src/lib.rs"), "{hint}");
+        assert!(!hint.contains("does not exist"), "{hint}");
     }
 
     /// GM-615: the rustup command is named only for the detected sysroot (the
     /// pinned toolchain's); any other sysroot gets the generic remedy.
     ///
-    /// Control: `pin.filter(|_| sysroot == detected)` -> `pin` in `std_hint`.
+    /// Control: in `std_hint`, drop the `if sysroot == detected` guard of the
+    /// `rust_src_hint` arm (every sysroot gets the detected one's remedy).
     #[cfg(unix)]
     #[test]
     fn std_hint_names_rustup_only_for_the_detected_sysroot() {
@@ -1329,11 +1421,217 @@ mod tests {
         let other = fake_sysroot(&scratch.0, "other", false);
         let pin = Some("stable-x");
 
-        let own = std_hint(&StdSource::Sysroot(detected.clone()), &detected, pin, false).expect("a hint");
+        let own = std_hint(&StdSource::Sysroot(detected.clone()), &detected, pin, None).expect("a hint");
         assert!(own.contains("rustup component add rust-src --toolchain stable-x"), "{own}");
-        let foreign = std_hint(&StdSource::Sysroot(other.clone()), &detected, pin, false).expect("a hint");
+        let foreign = std_hint(&StdSource::Sysroot(other.clone()), &detected, pin, None).expect("a hint");
         assert!(!foreign.contains("rustup component add"), "{foreign}");
         assert!(foreign.contains(&other.display().to_string()), "{foreign}");
+    }
+
+    /// A file at `dir/rel` (its parents created), empty.
+    #[cfg(unix)]
+    fn touch(dir: &Path, rel: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+    }
+
+    /// std loads from a library that has the `core` crate's root as a file,
+    /// `core/src/lib.rs` or `libcore/lib.rs`; a `Cargo.toml`, a bare `core`
+    /// directory or a `core/src/lib.rs` that is a directory decide nothing.
+    ///
+    /// Controls: `has_core_source` -> `library.join("Cargo.toml").is_file()`;
+    /// drop its `libcore/lib.rs` alternative.
+    #[cfg(unix)]
+    #[test]
+    fn has_core_source_is_a_core_crate_root_file() {
+        let scratch = Scratch::new("gm634-core-source");
+        let lib = |name: &str| {
+            let dir = scratch.0.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+
+        let modern = lib("modern");
+        touch(&modern, "core/src/lib.rs");
+        assert!(has_core_source(&modern));
+        let legacy = lib("legacy");
+        touch(&legacy, "libcore/lib.rs");
+        assert!(has_core_source(&legacy));
+
+        let manifest_only = lib("manifest-only");
+        touch(&manifest_only, "Cargo.toml");
+        std::fs::create_dir_all(manifest_only.join("core/src")).unwrap();
+        assert!(!has_core_source(&manifest_only));
+        let lib_rs_dir = lib("lib-rs-dir");
+        std::fs::create_dir_all(lib_rs_dir.join("core/src/lib.rs")).unwrap();
+        assert!(!has_core_source(&lib_rs_dir));
+        assert!(!has_core_source(&scratch.0.join("absent")));
+    }
+
+    /// `RUST_SRC_PATH` is taken only as an absolute path with a `core` entry
+    /// (a directory or not); no value, a relative path (here one that does
+    /// reach a library with `core` from the current directory) and an
+    /// absolute path without `core` are ignored.
+    ///
+    /// Controls: drop `path.is_absolute()` from `rust_src_path`'s filter;
+    /// drop `path.join("core").exists()` from it.
+    #[cfg(unix)]
+    #[test]
+    fn rust_src_path_takes_only_an_absolute_path_with_a_core_entry() {
+        let scratch = Scratch::new("gm634-rust-src-path");
+        let with_core = scratch.0.join("with-core");
+        std::fs::create_dir_all(with_core.join("core")).unwrap();
+        let core_file = scratch.0.join("core-file");
+        touch(&core_file, "core");
+        let without_core = scratch.0.join("without-core");
+        std::fs::create_dir_all(&without_core).unwrap();
+
+        let with_core_str = with_core.to_str().unwrap();
+        assert_eq!(rust_src_path(Some(with_core_str)), Some(with_core.clone()));
+        assert_eq!(rust_src_path(Some(core_file.to_str().unwrap())), Some(core_file.clone()));
+        assert_eq!(rust_src_path(None), None);
+        assert_eq!(rust_src_path(Some(without_core.to_str().unwrap())), None);
+
+        let cwd = std::env::current_dir().unwrap();
+        let ups = cwd.components().count() - 1;
+        let relative = format!("{}{}", "../".repeat(ups), with_core_str.trim_start_matches('/'));
+        assert!(Path::new(&relative).join("core").exists(), "{relative} reaches {with_core_str}");
+        assert_eq!(rust_src_path(Some(&relative)), None, "{relative}");
+    }
+
+    /// A library taken from `RUST_SRC_PATH` without a `core` source gets the
+    /// line naming the variable, the path and both remedies; one with a
+    /// `core` source (either layout) gets none.
+    ///
+    /// Control: covered by `has_core_source`'s controls.
+    #[cfg(unix)]
+    #[test]
+    fn rust_src_path_hint_names_the_variable_unless_it_has_a_core_source() {
+        let scratch = Scratch::new("gm634-rust-src-path-hint");
+        let bare = scratch.0.join("bare");
+        std::fs::create_dir_all(bare.join("core")).unwrap();
+
+        let hint = rust_src_path_hint(&bare).expect("no core source: a hint");
+        assert!(hint.contains(&format!("RUST_SRC_PATH {}", bare.display())), "{hint}");
+        assert!(hint.contains("has no standard library source"), "{hint}");
+        assert!(hint.contains("unset it"), "{hint}");
+
+        touch(&bare, "core/src/lib.rs");
+        assert_eq!(rust_src_path_hint(&bare), None);
+        let legacy = scratch.0.join("legacy");
+        touch(&legacy, "libcore/lib.rs");
+        assert_eq!(rust_src_path_hint(&legacy), None);
+    }
+
+    /// A `RUST_SRC_PATH` that rust-analyzer takes replaces the sysroot's own
+    /// source, for the detected sysroot and a user `cargo.sysroot` alike:
+    /// without a `core` source it is named (although the sysroot has
+    /// rust-src, or does not exist), with one there is no hint (although the
+    /// sysroot lacks rust-src).
+    ///
+    /// Controls: delete `rust_src_hint`'s `if let Some(library) =
+    /// rust_src_path` return; in `std_hint`'s user-sysroot arm, delete the
+    /// `if let Some(library) = rust_src_path` branch.
+    #[cfg(unix)]
+    #[test]
+    fn a_rust_src_path_replaces_the_source_of_the_detected_and_a_user_sysroot() {
+        let scratch = Scratch::new("gm634-rust-src-path-replaces");
+        let detected = fake_sysroot(&scratch.0, "detected", true);
+        let bare_detected = fake_sysroot(&scratch.0, "bare-detected", false);
+        let bad = scratch.0.join("bad-src");
+        std::fs::create_dir_all(bad.join("core")).unwrap();
+        let good = scratch.0.join("good-src");
+        touch(&good, "core/src/lib.rs");
+        let named = |hint: Option<String>, case: &str| {
+            let hint = hint.unwrap_or_else(|| panic!("{case}: a hint"));
+            assert!(hint.contains(&format!("RUST_SRC_PATH {}", bad.display())), "{case}: {hint}");
+            assert!(!hint.contains("rustup component add"), "{case}: {hint}");
+            assert!(!hint.contains("does not exist"), "{case}: {hint}");
+        };
+
+        named(rust_src_hint(&detected, Some("stable-x"), Some(&bad)), "detected, rust-src installed");
+        named(
+            std_hint(&StdSource::Sysroot(detected.clone()), &detected, Some("stable-x"), Some(&bad)),
+            "std_hint, detected",
+        );
+        let user_missing = StdSource::Sysroot(scratch.0.join("no-such-sysroot"));
+        named(std_hint(&user_missing, &detected, Some("stable-x"), Some(&bad)), "user sysroot missing");
+        let user_bare = StdSource::Sysroot(fake_sysroot(&scratch.0, "user-bare", false));
+        named(std_hint(&user_bare, &detected, None, Some(&bad)), "user sysroot without rust-src");
+
+        assert_eq!(rust_src_hint(&bare_detected, Some("stable-x"), Some(&good)), None);
+        assert_eq!(std_hint(&user_missing, &detected, Some("stable-x"), Some(&good)), None);
+        assert_eq!(std_hint(&user_bare, &detected, None, Some(&good)), None);
+    }
+
+    /// The detected sysroot of a toolchain rustup does not manage gets a
+    /// line naming that sysroot, saying so, and naming where the source
+    /// goes; no rustup command. With the source present (a `core` root and
+    /// no `Cargo.toml`) there is no hint; a `Cargo.toml` without `core` gets
+    /// one. `None` for `rust_src_path` is also what a non-UTF-8
+    /// `RUST_SRC_PATH` becomes in `engine` (`std::env::var(..).ok()`), so
+    /// such a value leaves this sysroot hint in place.
+    ///
+    /// Control: the `None` arm of `rust_src_hint` -> the earlier "rust-src is
+    /// not installed for toolchain not rustup-managed; install the standard
+    /// library source under {sysroot}".
+    #[cfg(unix)]
+    #[test]
+    fn rust_src_hint_without_rustup_names_the_sysroot_and_its_library() {
+        let scratch = Scratch::new("gm634-not-rustup");
+        let sysroot = fake_sysroot(&scratch.0, "sysroot", false);
+        let library = sysroot.join("lib/rustlib/src/rust/library");
+
+        let hint = rust_src_hint(&sysroot, None, None).expect("no rust-src: a hint");
+        assert!(
+            hint.contains(&format!("sysroot {} (toolchain not rustup-managed)", sysroot.display())),
+            "{hint}"
+        );
+        assert!(hint.contains(&library.display().to_string()), "{hint}");
+        assert!(!hint.contains("rustup component add"), "{hint}");
+
+        touch(&library, "Cargo.toml");
+        assert!(rust_src_hint(&sysroot, None, None).is_some(), "a Cargo.toml alone loads no std");
+        touch(&library, "core/src/lib.rs");
+        std::fs::remove_file(library.join("Cargo.toml")).unwrap();
+        assert_eq!(rust_src_hint(&sysroot, None, None), None);
+        assert_eq!(rust_src_hint(&sysroot, Some("stable-x"), None), None);
+    }
+
+    /// A user `cargo.sysroot` that does not exist is named as missing; one
+    /// that exists without a `core` source is named as lacking the source,
+    /// with the rust-src remedy; neither text is the detected sysroot's.
+    ///
+    /// Control: in `std_hint`'s user-sysroot arm, delete the
+    /// `!sysroot.is_dir()` branch.
+    #[cfg(unix)]
+    #[test]
+    fn std_hint_for_a_user_sysroot_tells_missing_from_without_source() {
+        let scratch = Scratch::new("gm634-user-sysroot");
+        let detected = fake_sysroot(&scratch.0, "detected", true);
+        let missing = scratch.0.join("no-such-sysroot");
+        let bare = fake_sysroot(&scratch.0, "bare", false);
+        let not_detected = |hint: &str| {
+            assert!(!hint.contains("rust-src is not installed"), "{hint}");
+            assert!(!hint.contains("rustup-managed"), "{hint}");
+            assert!(!hint.contains("rustup component add"), "{hint}");
+        };
+
+        let hint = std_hint(&StdSource::Sysroot(missing.clone()), &detected, Some("stable-x"), None)
+            .expect("a missing user sysroot: a hint");
+        assert!(hint.contains(&format!("cargo.sysroot {} does not exist", missing.display())), "{hint}");
+        not_detected(&hint);
+
+        let hint = std_hint(&StdSource::Sysroot(bare.clone()), &detected, None, None)
+            .expect("a user sysroot without rust-src: a hint");
+        assert!(
+            hint.contains(&format!("cargo.sysroot {} has no standard library source", bare.display())),
+            "{hint}"
+        );
+        assert!(hint.contains("install rust-src for that toolchain"), "{hint}");
+        assert!(!hint.contains("does not exist"), "{hint}");
+        not_detected(&hint);
     }
 
     /// `sysroot_of` runs `<rustc> --print sysroot` and returns its trimmed
@@ -1398,7 +1696,7 @@ mod tests {
     /// the tests above.
     ///
     /// Controls: delete the `pin_sysroot` call in `engine`; or move it below
-    /// `LspBridge::new`; or pass `false` for `rust_src_path_set`.
+    /// `LspBridge::new`; or pass `None` for `rust_src_path`.
     #[test]
     fn the_engine_pins_the_sysroot_and_hints_after_the_pinned_env() {
         let source = include_str!("semantic.rs");
@@ -1409,10 +1707,10 @@ mod tests {
         let env = at("config.env.extend(pinned_env(&toolchain));");
         let pin = at("pin_sysroot(&mut config.initialization_options, sysroot);");
         let source = at("std_source(config.initialization_options.as_ref(), root, sysroot)");
-        let hint = at("std_hint(&source, sysroot, toolchain.pin.as_deref(), rust_src_path_set)");
+        let hint = at("std_hint(&source, sysroot, toolchain.pin.as_deref(), rust_src_path.as_deref())");
         let bridge = at("LspBridge::new(LANGUAGE, root, config)");
         assert!(env < pin && pin < source && source < hint && hint < bridge, "{body}");
-        assert!(body.contains("std::env::var_os(\"RUST_SRC_PATH\")"), "{body}");
+        assert!(body.contains("std::env::var(\"RUST_SRC_PATH\")"), "{body}");
     }
 
     /// A scratch directory, canonicalized (macOS' temp dir is a symlink),
