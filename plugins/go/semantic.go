@@ -334,6 +334,17 @@ type resolutions struct {
 	// two package variants (`app` and `app [app.test]`) collapses to one.
 	namedTypes map[*types.TypeName]*types.Named
 	interfaces map[*types.TypeName]*types.Named
+	// loadOf is the load (the absolute directory `packages.Load` ran from)
+	// each object of namedTypes and interfaces was folded by, whether from
+	// source or from export data. Every object in either map has an entry.
+	// answerImplements pairs only objects of one load: across two loads
+	// types.Implements matches only predeclared signatures, and no build
+	// sees both declarations.
+	loadOf map[*types.TypeName]string
+	// views is folded, importedInterfaces and importedPackages per load, so
+	// carryForward can tell whether the load holding a subtype evaluated an
+	// interface.
+	views map[string]*loadView
 	// declaredIn is the project-relative file each of those - and each
 	// project object an answer in `uses` or `selections` resolves to - was
 	// declared in. It is recorded while folding, not derived later, because
@@ -372,19 +383,9 @@ type resolutions struct {
 	// its answers back to the ambiguous container address.
 	referenced map[string]bool
 
-	// folded is every project package path whose own source this pass
-	// type-checked: its interfaces are all in `interfaces`, so an edge onto
-	// one that is missing describes an interface that is gone.
-	folded map[string]bool
-	// importedInterfaces is every `<package path>.<name>` interface added
-	// from an imported project package's export data (foldImportedInterfaces):
-	// re-evaluated exactly this pass, never carried forward.
-	importedInterfaces map[string]bool
-	// importedPackages is every project package path walked from export
-	// data. Export data holds every exported declaration, so an exported
-	// interface of one of these that is not in importedInterfaces is gone
-	// (an unexported one may simply not have been exported).
-	importedPackages map[string]bool
+	// loadView is the union over every load of the pass:
+	// staleImplementorFiles and listUncoveredCopies read it pass-wide.
+	loadView
 	// importsWalked is every imported *types.Package already walked. Keyed by
 	// object, not path: each module's load has its own copy of a package,
 	// and a type is checked against the copy its own load imported.
@@ -396,12 +397,40 @@ type resolutions struct {
 	exhaustive bool
 }
 
+// loadView is what one load (or, embedded in resolutions, the whole pass)
+// evaluated of the project's interfaces.
+type loadView struct {
+	// folded is every project package path whose own source was
+	// type-checked: its interfaces are all in `interfaces`, so an edge onto
+	// one that is missing describes an interface that is gone.
+	folded map[string]bool
+	// importedInterfaces is every `<package path>.<name>` interface added
+	// from an imported project package's export data (foldImportedInterfaces):
+	// re-evaluated exactly, never carried forward.
+	importedInterfaces map[string]bool
+	// importedPackages is every project package path walked from export
+	// data. Export data holds every exported declaration, so an exported
+	// interface of one of these that is not in importedInterfaces is gone
+	// (an unexported one may simply not have been exported).
+	importedPackages map[string]bool
+}
+
+func newLoadView() *loadView {
+	return &loadView{
+		folded:             map[string]bool{},
+		importedInterfaces: map[string]bool{},
+		importedPackages:   map[string]bool{},
+	}
+}
+
 func newResolutions() *resolutions {
 	return &resolutions{
 		selections: map[sitePos]*types.Selection{},
 		uses:       map[sitePos]types.Object{},
 		namedTypes: map[*types.TypeName]*types.Named{},
 		interfaces: map[*types.TypeName]*types.Named{},
+		loadOf:     map[*types.TypeName]string{},
+		views:      map[string]*loadView{},
 		declaredIn: map[types.Object]string{},
 		twinned:    map[string]map[string]bool{},
 		twinsKnown: map[string]bool{},
@@ -409,11 +438,19 @@ func newResolutions() *resolutions {
 		builtFiles: map[string]map[string]bool{},
 		referenced: map[string]bool{},
 
-		folded:             map[string]bool{},
-		importedInterfaces: map[string]bool{},
-		importedPackages:   map[string]bool{},
-		importsWalked:      map[*types.Package]bool{},
+		loadView:      *newLoadView(),
+		importsWalked: map[*types.Package]bool{},
 	}
+}
+
+// view is the loadView of one load, created on first use.
+func (r *resolutions) view(load string) *loadView {
+	v := r.views[load]
+	if v == nil {
+		v = newLoadView()
+		r.views[load] = v
+	}
+	return v
 }
 
 // load runs `go list` + the type checker over `patterns` from `dir` and folds
@@ -438,7 +475,7 @@ func (e *semanticEngine) load(into *resolutions, dir string, patterns []string) 
 		return nil, err
 	}
 	for _, pkg := range loaded {
-		e.foldPackage(into, fset, pkg)
+		e.foldPackage(into, fset, pkg, dir)
 	}
 	return cfg, nil
 }
@@ -715,7 +752,8 @@ func modFlagFor(gowork, gomod string) string {
 
 // foldPackage indexes one loaded package's type information by position and
 // collects its named types.
-func (e *semanticEngine) foldPackage(into *resolutions, fset *token.FileSet, pkg *packages.Package) {
+// foldPackage folds one root package of the load `load` into `into`.
+func (e *semanticEngine) foldPackage(into *resolutions, fset *token.FileSet, pkg *packages.Package, load string) {
 	if pkg.TypesInfo != nil {
 		for expr, selection := range pkg.TypesInfo.Selections {
 			if expr.Sel == nil {
@@ -748,7 +786,8 @@ func (e *semanticEngine) foldPackage(into *resolutions, fset *token.FileSet, pkg
 		return
 	}
 	into.folded[pkg.PkgPath] = true
-	e.foldImportedInterfaces(into, fset, pkg.Types)
+	into.view(load).folded[pkg.PkgPath] = true
+	e.foldImportedInterfaces(into, fset, pkg.Types, load)
 	scope := pkg.Types.Scope()
 	for _, name := range scope.Names() {
 		typeName, ok := scope.Lookup(name).(*types.TypeName)
@@ -772,6 +811,7 @@ func (e *semanticEngine) foldPackage(into *resolutions, fset *token.FileSet, pkg
 			continue
 		}
 		into.namedTypes[typeName] = named
+		into.loadOf[typeName] = load
 		into.declaredIn[typeName] = declaredIn.file
 		if iface, ok := named.Underlying().(*types.Interface); ok && iface.NumMethods() > 0 && iface.IsMethodSet() {
 			// An empty interface is satisfied by everything, which is true
@@ -783,15 +823,25 @@ func (e *semanticEngine) foldPackage(into *resolutions, fset *token.FileSet, pkg
 	}
 }
 
-// foldImportedInterfaces adds the interfaces of every project package `from`
-// imports, transitively, to `into.interfaces` (GM-590). A per-file pass folds
-// only the file's own package; its imports come from export data, and without
-// this a type would never be checked against an imported interface, so the
-// SUPERTYPE_OF edge a whole-project pass gave it would be retracted. The
-// export-data objects share the importing package's universe, so
-// types.Implements answers exactly. The walk stops at non-project packages: a
-// dependency cannot import back into the project.
-func (e *semanticEngine) foldImportedInterfaces(into *resolutions, fset *token.FileSet, from *types.Package) {
+// foldImportedInterfaces adds, from export data, the interfaces and the
+// candidate implementors of every project package `from` imports,
+// transitively, tagged with the importing load. A per-file pass folds only
+// the file's own package; without the interfaces a type would never be
+// checked against an imported interface, so the SUPERTYPE_OF edge a
+// whole-project pass gave it would be retracted. Without the types, a
+// consumer module that imports both an interface's package and an
+// implementor's package (neither importing the other) would never pair them,
+// although its build can assign one to the other. The export-data objects
+// share the importing package's universe, so types.Implements answers
+// exactly. The walk stops at non-project packages: a dependency cannot
+// import back into the project.
+//
+// Only exported types are folded: export data holds every exported
+// declaration, but an unexported one only when the exported API reaches it,
+// so folding those would make the answer depend on the export-data encoding.
+// A type with no methods satisfies no folded interface and is skipped.
+func (e *semanticEngine) foldImportedInterfaces(into *resolutions, fset *token.FileSet, from *types.Package, load string) {
+	view := into.view(load)
 	for _, imp := range from.Imports() {
 		path := imp.Path()
 		if into.importsWalked[imp] || !e.isProjectContainer(path) {
@@ -799,6 +849,7 @@ func (e *semanticEngine) foldImportedInterfaces(into *resolutions, fset *token.F
 		}
 		into.importsWalked[imp] = true
 		into.importedPackages[path] = true
+		view.importedPackages[path] = true
 		// Its twins are listed like any other package an answer resolved
 		// into, so targetScopeOf can address a twinned interface by file.
 		into.referenced[path] = true
@@ -812,19 +863,28 @@ func (e *semanticEngine) foldImportedInterfaces(into *resolutions, fset *token.F
 			if !ok || named.TypeParams().Len() > 0 {
 				continue
 			}
+			if _, folded := into.namedTypes[typeName]; !folded && typeName.Exported() && len(methodNames(named)) > 0 {
+				if at, ok := e.positionOf(fset, typeName.Pos()); ok {
+					into.namedTypes[typeName] = named
+					into.loadOf[typeName] = load
+					into.declaredIn[typeName] = at.file
+				}
+			}
 			iface, ok := named.Underlying().(*types.Interface)
 			if !ok || iface.NumMethods() == 0 || !iface.IsMethodSet() {
 				continue
 			}
 			into.interfaces[typeName] = named
+			into.loadOf[typeName] = load
 			into.importedInterfaces[path+"."+name] = true
+			view.importedInterfaces[path+"."+name] = true
 			if _, done := into.declaredIn[typeName]; !done {
 				if at, ok := e.positionOf(fset, typeName.Pos()); ok {
 					into.declaredIn[typeName] = at.file
 				}
 			}
 		}
-		e.foldImportedInterfaces(into, fset, imp)
+		e.foldImportedInterfaces(into, fset, imp, load)
 	}
 }
 
@@ -1608,13 +1668,15 @@ func (e *semanticEngine) answerImplements(
 	for obj, named := range resolved.namedTypes {
 		types_ = append(types_, candidate{obj: obj, named: named, methods: methodNames(named)})
 	}
-	sort.Slice(types_, func(i, j int) bool { return objectLess(types_[i].obj, types_[j].obj) })
+	// Equal-name objects of different loads are visited in a fixed order, so
+	// the record a pair reached from several loads keeps is deterministic.
+	sort.Slice(types_, func(i, j int) bool { return resolved.loadedObjectLess(types_[i].obj, types_[j].obj) })
 
 	interfaces := make([]*types.TypeName, 0, len(resolved.interfaces))
 	for obj := range resolved.interfaces {
 		interfaces = append(interfaces, obj)
 	}
-	sort.Slice(interfaces, func(i, j int) bool { return objectLess(interfaces[i], interfaces[j]) })
+	sort.Slice(interfaces, func(i, j int) bool { return resolved.loadedObjectLess(interfaces[i], interfaces[j]) })
 
 	emitted := 0
 	for _, subtype := range types_ {
@@ -1637,6 +1699,14 @@ func (e *semanticEngine) answerImplements(
 			// both name the same declaration no matter which type-checking
 			// pass produced them.
 			if ifaceObj.Pkg().Path() == subtype.obj.Pkg().Path() && ifaceObj.Name() == subtype.obj.Name() {
+				continue
+			}
+			// A pair from two loads is never tested: no build sees both
+			// declarations, and types.Implements across two loads matches
+			// only predeclared signatures. A pair several loads see gives
+			// the same edge id from each, so the edge holds if any build
+			// that sees both assigns one to the other.
+			if resolved.loadOf[subtype.obj] != resolved.loadOf[ifaceObj] {
 				continue
 			}
 			iface, _ := resolved.interfaces[ifaceObj].Underlying().(*types.Interface)
@@ -1974,6 +2044,14 @@ func objectLess(a, b *types.TypeName) bool {
 	return a.Name() < b.Name()
 }
 
+// loadedObjectLess is objectLess, ties broken by the objects' loads.
+func (r *resolutions) loadedObjectLess(a, b *types.TypeName) bool {
+	if objectLess(a, b) || objectLess(b, a) {
+		return objectLess(a, b)
+	}
+	return r.loadOf[a] < r.loadOf[b]
+}
+
 // --- the diff -----------------------------------------------------------
 
 // semanticDiff accumulates one pass's answer, deduplicated by id.
@@ -2115,14 +2193,19 @@ func (d *semanticDiff) supertype(relPath string, r supertypeRecord, at wirePosit
 }
 
 // carryForward re-emits the prior SUPERTYPE_OF edges of the files in scope
-// that this pass did not produce and could not have: the interface's package
-// was neither folded from source nor imported (GM-590), so "not produced"
-// says nothing about whether the type still satisfies it. An edge is carried
-// only while its subtype is still a type of this file, with the same node,
-// and still has every method the interface had; otherwise finish retracts it.
-// The edge is re-upserted rather than merely not retracted: its placeholder
-// lives in this file, and core retires a placeholder a Complete reparse does
-// not upsert.
+// that this pass did not produce and could not have: no load holding the
+// subtype evaluated the interface (its package was neither folded from
+// source nor imported in that load), so "not produced" says nothing about
+// whether the type still satisfies it. A load that holds the subtype and
+// evaluated the interface answered exactly, and an edge it did not produce is
+// retracted. An edge is carried only while its subtype is still a type of
+// this file, with the same node, and still has every method the interface
+// has: its current methods when some load of the pass evaluated it (the
+// edge is then retracted if the interface is gone), else the ones recorded.
+// A carried record takes the current interface's signature, so a later pass
+// of the interface's file does not re-check it again. The edge is re-upserted
+// rather than merely not retracted: its placeholder lives in this file, and
+// core retires a placeholder a Complete reparse does not upsert.
 func (d *semanticDiff) carryForward(
 	e *semanticEngine,
 	scope []string,
@@ -2133,10 +2216,30 @@ func (d *semanticDiff) carryForward(
 		return
 	}
 	type subtypeAt struct{ pkg, name, file string }
-	current := map[subtypeAt]*types.Named{}
-	for obj, named := range resolved.namedTypes {
-		current[subtypeAt{obj.Pkg().Path(), obj.Name(), resolved.declaredIn[obj]}] = named
+	// subtypeLoads is every load holding one subtype, and the object whose
+	// method names are checked: one folded from source when there is one,
+	// the smallest load first, so the answer does not depend on map order.
+	type subtypeLoads struct {
+		named  *types.Named
+		load   string
+		source bool
+		loads  []string
 	}
+	current := map[subtypeAt]*subtypeLoads{}
+	for obj, named := range resolved.namedTypes {
+		key := subtypeAt{obj.Pkg().Path(), obj.Name(), resolved.declaredIn[obj]}
+		load := resolved.loadOf[obj]
+		source := resolved.view(load).folded[obj.Pkg().Path()]
+		at := current[key]
+		if at == nil {
+			at = &subtypeLoads{named: named, load: load, source: source}
+			current[key] = at
+		} else if (source && !at.source) || (source == at.source && load < at.load) {
+			at.named, at.load, at.source = named, load, source
+		}
+		at.loads = append(at.loads, load)
+	}
+	currentIfaces := resolved.currentInterfaces()
 	for _, relPath := range scope {
 		still := map[string]bool{}
 		for _, id := range d.edgesByFile[relPath] {
@@ -2145,20 +2248,40 @@ func (d *semanticDiff) carryForward(
 		prior := e.supertypes[relPath]
 		for _, id := range sortedKeys(prior) {
 			r := prior[id]
-			if still[id] || !resolved.unevaluated(r.ifacePkg, r.ifaceName) {
+			if still[id] {
 				continue
 			}
 			node, ok := structural[relPath].typeNodes[r.subtype]
 			if !ok || node.ID != r.subtypeNodeID {
 				continue
 			}
-			named, ok := current[subtypeAt{r.subtypePkg, r.subtype, relPath}]
+			at, ok := current[subtypeAt{r.subtypePkg, r.subtype, relPath}]
 			if !ok {
 				continue
 			}
-			have := methodNames(named)
+			answered := false
+			for _, load := range at.loads {
+				if !resolved.view(load).unevaluated(r.ifacePkg, r.ifaceName) {
+					answered = true
+					break
+				}
+			}
+			if answered {
+				continue
+			}
+			methods := r.ifaceMethods
+			if cur, ok := currentIfaces[r.ifacePkg+"."+r.ifaceName]; ok {
+				iface := cur.Type().Underlying().(*types.Interface)
+				methods = interfaceMethodNames(iface)
+				r.ifaceMethods = methods
+				r.ifaceSig = interfaceSignature(iface)
+				r.ifaceScope = resolved.targetScopeOf(cur, r.ifacePkg, r.ifaceKey)
+			} else if !resolved.unevaluated(r.ifacePkg, r.ifaceName) {
+				continue
+			}
+			have := methodNames(at.named)
 			satisfied := true
-			for _, method := range r.ifaceMethods {
+			for _, method := range methods {
 				if !have[method] {
 					satisfied = false
 					break
@@ -2169,6 +2292,34 @@ func (d *semanticDiff) carryForward(
 			}
 		}
 	}
+}
+
+// currentInterfaces is, per `<package path>.<name>`, the interface object
+// this pass holds for it: one folded from source when there is one, the
+// smallest load first.
+func (r *resolutions) currentInterfaces() map[string]*types.TypeName {
+	out := map[string]*types.TypeName{}
+	sourceOf := func(obj *types.TypeName) bool {
+		return r.view(r.loadOf[obj]).folded[obj.Pkg().Path()]
+	}
+	for obj := range r.interfaces {
+		key := obj.Pkg().Path() + "." + obj.Name()
+		prev, ok := out[key]
+		if !ok {
+			out[key] = obj
+			continue
+		}
+		if s, ps := sourceOf(obj), sourceOf(prev); s != ps {
+			if s {
+				out[key] = obj
+			}
+			continue
+		}
+		if r.loadOf[obj] < r.loadOf[prev] {
+			out[key] = obj
+		}
+	}
+	return out
 }
 
 // staleImplementorFiles is the files outside `scope` holding a SUPERTYPE_OF
@@ -2264,15 +2415,16 @@ func countDirs(paths []string) int {
 	return len(dirs)
 }
 
-// unevaluated reports whether this pass could not have checked any type
-// against the interface `pkg.name`: its package was not folded from source,
-// it did not come in from export data, and it is not an exported name of a
-// package that did (export data would have carried it, so it is gone).
-func (r *resolutions) unevaluated(pkg, name string) bool {
-	if r.folded[pkg] || r.importedInterfaces[pkg+"."+name] {
+// unevaluated reports whether this load (or, through resolutions, any load
+// of the pass) could not have checked a type against the interface
+// `pkg.name`: its package was not folded from source, it did not come in
+// from export data, and it is not an exported name of a package that did
+// (export data would have carried it, so it is gone).
+func (v *loadView) unevaluated(pkg, name string) bool {
+	if v.folded[pkg] || v.importedInterfaces[pkg+"."+name] {
 		return false
 	}
-	return !(r.importedPackages[pkg] && token.IsExported(name))
+	return !(v.importedPackages[pkg] && token.IsExported(name))
 }
 
 func (d *semanticDiff) retract(relPath, edgeID string) {
