@@ -230,6 +230,26 @@ type semanticEngine struct {
 	// that pass needed no second load. Read by tests; the daemon only logs it.
 	recheckedImplementors []string
 
+	// typeIndex and ifaceSigs are, per package folded from source (keyed by
+	// indexKey: its load and path), its named types' method names and its
+	// interfaces' signatures as of the last pass that folded it. A per-file
+	// pass reads them before refreshIndexes overwrites them, to find the
+	// files outside its scope whose types may newly satisfy an interface it
+	// changed or added. indexSeeded is set once a whole-project pass filled
+	// them: only then does a package with no ifaceSigs entry count as new.
+	typeIndex   map[string]*indexedPackage
+	ifaceSigs   map[string]map[string]string
+	indexSeeded bool
+
+	// newImplementorFiles is the files the last per-file pass added to its
+	// second load because a type there has every method name of an
+	// interface that pass changed or added, nil when it added none.
+	// skippedNewImplementors is how many candidate packages that pass left
+	// to the next whole-project pass instead, because there were more than
+	// maxNewImplementorPkgs. Read by tests; the daemon only logs them.
+	newImplementorFiles    []string
+	skippedNewImplementors int
+
 	// ws is the module layout of the pass currently running, set by `run`
 	// and cleared when it returns. A pass is strictly sequential within one
 	// process (the control loop reads and answers one frame at a time), so
@@ -246,6 +266,8 @@ func newSemanticEngine(projectRoot string) *semanticEngine {
 		realRoot:     canonicalizeProjectRoot(projectRoot),
 		emittedEdges: map[string][]string{},
 		supertypes:   map[string]map[string]supertypeRecord{},
+		typeIndex:    map[string]*indexedPackage{},
+		ifaceSigs:    map[string]map[string]string{},
 	}
 }
 
@@ -1231,20 +1253,34 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 	// those files can retract them (GM-620). Load again with them as roots
 	// too, so they are checked against the interface's new source. Gated on
 	// an actual interface change: a body edit costs no second load.
+	//
+	// The same second load takes the files of types that may newly satisfy
+	// an interface this pass changed or added (newImplementorCandidates).
 	requested := scope
 	e.recheckedImplementors = nil
+	e.newImplementorFiles = nil
+	e.skippedNewImplementors = 0
 	if !wholeProject {
-		if extra := e.staleImplementorFiles(resolved, scope); len(extra) > 0 {
+		extra := e.staleImplementorFiles(resolved, scope)
+		added, skipped, changed := e.newImplementorCandidates(resolved, scope, extra)
+		if skipped > 0 {
+			e.skippedNewImplementors = skipped
+			logf("semantic pass: %s changed - %d package(s) may gain implementors, over the limit of %d; "+
+				"left to the next whole-project pass", strings.Join(changed, ", "), skipped, maxNewImplementorPkgs)
+		}
+		if len(extra) > 0 || len(added) > 0 {
 			e.recheckedImplementors = extra
-			scope = unionSorted(scope, extra)
+			e.newImplementorFiles = added
+			scope = unionSorted(unionSorted(scope, extra), added)
 			resolved = newResolutions()
 			outcome = e.loadFor(ws, resolved, false, scope)
 			reason = outcome.incompleteReason()
 			if outcome.loaded == 0 {
 				return emptyDiff(), reason, nil
 			}
-			logf("semantic pass: an interface changed - re-checking %d implementor file(s) in %d package(s)",
-				len(extra), countDirs(extra))
+			logf("semantic pass: an interface changed - re-checking %d implementor file(s) in %d package(s), "+
+				"checking %d candidate file(s) in %d package(s)",
+				len(extra), countDirs(extra), len(added), countDirs(added))
 		}
 	}
 	unfinished := []string{}
@@ -1262,6 +1298,7 @@ func (e *semanticEngine) run(ws *workspace, filePaths []string) (fileChangeDiff,
 		sites += e.answerFile(builder, resolved, relPath, structural[relPath])
 	}
 	implementsEdges := e.answerImplements(builder, resolved, structural)
+	e.refreshIndexes(resolved, wholeProject)
 
 	diff := builder.finish(e, scope, resolved, structural)
 	logf("semantic pass: %d file(s), %d resolved site(s), %d implements edge(s), "+
@@ -2383,6 +2420,234 @@ func (e *semanticEngine) staleImplementorFiles(resolved *resolutions, scope []st
 		return nil
 	}
 	return kept
+}
+
+// maxNewImplementorPkgs is how many packages outside the pass's own a
+// per-file pass may add to its second load for types that may newly satisfy
+// an interface it changed or added. Over it the pass adds none of them, so
+// the result does not depend on which ones would have been picked. A var so
+// a test can lower it.
+var maxNewImplementorPkgs = 16
+
+// indexedPackage is what typeIndex keeps of one package folded from source.
+type indexedPackage struct {
+	load string
+	pkg  string
+	// imports is every project package path the package imports,
+	// transitively: its own load holds those packages' interfaces.
+	imports map[string]bool
+	// types is keyed by name and declaring file, so a package's test
+	// variant, which may declare more methods, unions into one entry.
+	types map[string]*indexedType
+}
+
+type indexedType struct {
+	name    string
+	file    string
+	methods map[string]bool
+}
+
+// indexKey is the typeIndex and ifaceSigs key of a package in a load.
+func indexKey(load, pkg string) string {
+	return load + "\x00" + pkg
+}
+
+// newImplementorCandidates is the files outside `scope` and `extra` holding a
+// type that may newly satisfy an interface this pass folded from source whose
+// signature differs from the ifaceSigs baseline, or that the baseline lacks.
+// A candidate type has every method name of the interface, has no
+// SUPERTYPE_OF record onto it yet, and is in a load that would hold the
+// interface: the interface's own load, or one where an indexed package
+// imports the interface's package. In the latter, the pair is answered only
+// when the second load also holds such an importer; otherwise the edge stays
+// missing, as before.
+// answerImplements decides each one exactly after the second load.
+//
+// `skipped` is the number of candidate packages not folded this pass when it
+// exceeds maxNewImplementorPkgs; files is then nil. `changed` names the
+// changed or added interfaces, sorted. A candidate file no longer on disk is
+// dropped. Without a baseline for the interface's package and before any
+// whole-project pass, nothing is a candidate.
+func (e *semanticEngine) newImplementorCandidates(
+	resolved *resolutions,
+	scope, extra []string,
+) (files []string, skipped int, changed []string) {
+	if len(e.typeIndex) == 0 {
+		return nil, 0, nil
+	}
+	type changedIface struct {
+		load, pkg, name string
+		iface           *types.Interface
+	}
+	byKey := map[string]changedIface{}
+	for obj, named := range resolved.interfaces {
+		load, pkg := resolved.loadOf[obj], obj.Pkg().Path()
+		if !resolved.view(load).folded[pkg] {
+			continue
+		}
+		base, has := e.ifaceSigs[indexKey(load, pkg)]
+		if !has && !e.indexSeeded {
+			continue
+		}
+		iface, ok := named.Underlying().(*types.Interface)
+		if !ok {
+			continue
+		}
+		if sig, ok := base[obj.Name()]; ok && sig == interfaceSignature(iface) {
+			continue
+		}
+		byKey[indexKey(load, pkg)+"."+obj.Name()] = changedIface{load: load, pkg: pkg, name: obj.Name(), iface: iface}
+	}
+	if len(byKey) == 0 {
+		return nil, 0, nil
+	}
+
+	taken := map[string]bool{}
+	for _, relPath := range scope {
+		taken[relPath] = true
+	}
+	for _, relPath := range extra {
+		taken[relPath] = true
+	}
+	// sees is, per load, every project package some indexed package of it
+	// imports: a load holding one of them holds its interfaces for every
+	// type of the load, as answerImplements pairs them.
+	sees := map[string]map[string]bool{}
+	for _, entry := range e.typeIndex {
+		if sees[entry.load] == nil {
+			sees[entry.load] = map[string]bool{}
+		}
+		for path := range entry.imports {
+			sees[entry.load][path] = true
+		}
+	}
+	found := map[string]bool{}
+	pkgs := map[string]bool{}
+	for _, key := range sortedKeys(byKey) {
+		c := byKey[key]
+		changed = append(changed, c.pkg+"."+c.name)
+		for _, ik := range sortedKeys(e.typeIndex) {
+			entry := e.typeIndex[ik]
+			if entry.load != c.load && !sees[entry.load][c.pkg] {
+				continue
+			}
+			for _, tk := range sortedKeys(entry.types) {
+				t := entry.types[tk]
+				if taken[t.file] || (entry.pkg == c.pkg && t.name == c.name) {
+					continue
+				}
+				if !hasAllMethods(t.methods, c.iface) || e.hasSupertypeRecord(t.file, entry.pkg, t.name, c.pkg, c.name) {
+					continue
+				}
+				found[t.file] = true
+				if !resolved.folded[entry.pkg] {
+					pkgs[ik] = true
+				}
+			}
+		}
+	}
+	for relPath := range found {
+		if _, err := os.Stat(filepath.Join(e.realRoot, filepath.FromSlash(relPath))); err != nil && os.IsNotExist(err) {
+			delete(found, relPath)
+		}
+	}
+	if len(found) == 0 {
+		return nil, 0, changed
+	}
+	if len(pkgs) > maxNewImplementorPkgs {
+		return nil, len(pkgs), changed
+	}
+	return sortedKeys(found), 0, changed
+}
+
+// hasSupertypeRecord reports whether relPath holds a SUPERTYPE_OF edge from
+// subtypePkg.subtype onto ifacePkg.ifaceName.
+func (e *semanticEngine) hasSupertypeRecord(relPath, subtypePkg, subtype, ifacePkg, ifaceName string) bool {
+	for _, r := range e.supertypes[relPath] {
+		if r.subtypePkg == subtypePkg && r.subtype == subtype && r.ifacePkg == ifacePkg && r.ifaceName == ifaceName {
+			return true
+		}
+	}
+	return false
+}
+
+// refreshIndexes replaces the typeIndex and ifaceSigs entries of every
+// package this pass folded from source. An exhaustive pass rebuilds both
+// from scratch, so packages that no longer exist leave them; any
+// whole-project pass marks them seeded.
+func (e *semanticEngine) refreshIndexes(resolved *resolutions, wholeProject bool) {
+	if resolved.exhaustive {
+		e.typeIndex = map[string]*indexedPackage{}
+		e.ifaceSigs = map[string]map[string]string{}
+	}
+	if wholeProject {
+		e.indexSeeded = true
+	}
+	fresh := map[string]*indexedPackage{}
+	sigs := map[string]map[string]string{}
+	for load, view := range resolved.views {
+		for pkg := range view.folded {
+			key := indexKey(load, pkg)
+			fresh[key] = &indexedPackage{load: load, pkg: pkg, imports: map[string]bool{}, types: map[string]*indexedType{}}
+			sigs[key] = map[string]string{}
+		}
+	}
+	memo := map[*types.Package]map[string]bool{}
+	for obj, named := range resolved.namedTypes {
+		load, pkg := resolved.loadOf[obj], obj.Pkg().Path()
+		entry := fresh[indexKey(load, pkg)]
+		if entry == nil || !resolved.view(load).folded[pkg] {
+			continue
+		}
+		for path := range e.projectImports(obj.Pkg(), memo) {
+			entry.imports[path] = true
+		}
+		file := resolved.declaredIn[obj]
+		tk := obj.Name() + "\x00" + file
+		t := entry.types[tk]
+		if t == nil {
+			t = &indexedType{name: obj.Name(), file: file, methods: map[string]bool{}}
+			entry.types[tk] = t
+		}
+		for name := range methodNames(named) {
+			t.methods[name] = true
+		}
+	}
+	for obj, named := range resolved.interfaces {
+		load, pkg := resolved.loadOf[obj], obj.Pkg().Path()
+		into := sigs[indexKey(load, pkg)]
+		if into == nil || !resolved.view(load).folded[pkg] {
+			continue
+		}
+		if iface, ok := named.Underlying().(*types.Interface); ok {
+			into[obj.Name()] = interfaceSignature(iface)
+		}
+	}
+	for key, entry := range fresh {
+		e.typeIndex[key] = entry
+		e.ifaceSigs[key] = sigs[key]
+	}
+}
+
+// projectImports is every project package path `from` imports,
+// transitively, memoized per package object in `memo`: a package's test
+// variant is its own object and can import more than its production one.
+func (e *semanticEngine) projectImports(from *types.Package, memo map[*types.Package]map[string]bool) map[string]bool {
+	if out, ok := memo[from]; ok {
+		return out
+	}
+	out := map[string]bool{}
+	memo[from] = out
+	for _, imp := range from.Imports() {
+		if !e.isProjectContainer(imp.Path()) {
+			continue
+		}
+		out[imp.Path()] = true
+		for path := range e.projectImports(imp, memo) {
+			out[path] = true
+		}
+	}
+	return out
 }
 
 // unionSorted is the sorted, de-duplicated union of two path lists.
