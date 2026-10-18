@@ -1857,7 +1857,11 @@ func (w *canonicalWriter) typ(t types.Type) {
 			f := t.Field(i)
 			if f.Embedded() {
 				// "*" cannot start a field name, so no named field renders the same.
+				// The name is written too: embedding an alias `A = T` names the
+				// field A, and struct{ A } is not identical to struct{ T }.
 				b.WriteString("*embedded ")
+				w.name(f)
+				b.WriteString(" ")
 			} else {
 				w.name(f)
 				b.WriteString(" ")
