@@ -265,3 +265,52 @@ func TestSemanticPassInterfaceEditParamRenameDoesNotWiden(t *testing.T) {
 		t.Errorf("parameter rename retracted %s", carryMineToBinder)
 	}
 }
+
+// sealedLib embeds x.Sealed, whose only method is unexported; y.Sealed has
+// the same text in another package, so it is a different method set.
+const sealedLib = "package lib\n\nimport \"example.com/x/x\"\n\ntype Binder interface {\n\tx.Sealed\n\tBind() string\n}\n"
+
+// sealedFixture: app.Mine satisfies lib.Binder through x.Impl's m().
+func sealedFixture(t *testing.T) string {
+	t.Helper()
+	return writeTree(t, map[string]string{
+		"go.mod":     "module example.com/x\n\ngo 1.22\n",
+		"x/x.go":     "package x\n\ntype Sealed interface{ m() }\n\ntype Impl struct{}\n\nfunc (Impl) m() {}\n",
+		"y/y.go":     "package y\n\ntype Sealed interface{ m() }\n",
+		"lib/lib.go": sealedLib,
+		"app/app.go": "package app\n\nimport \"example.com/x/x\"\n\ntype Mine struct{ x.Impl }\n\nfunc (Mine) Bind() string { return \"\" }\n",
+	})
+}
+
+// Retargeting an embedded interface from x.Sealed to y.Sealed (both
+// `interface{ m() }`) changes the method set: x.m and y.m are different
+// names, so the implementor is re-checked and its edge retracted.
+func TestSemanticPassInterfaceEditRetractsOnAnUnexportedEmbedRetarget(t *testing.T) {
+	requireGoToolchain(t)
+	root := sealedFixture(t)
+	state, before := carryWholePass(t, root, carryMineToBinder)
+
+	retargeted := strings.Replace(strings.Replace(sealedLib, "x/x\"", "x/y\"", 1), "x.Sealed", "y.Sealed", 1)
+	after := ifaceEditPass(t, state, root, "lib/lib.go", retargeted)
+	requireRetracted(t, after, carryMineToBinder, before[carryMineToBinder])
+	requireRechecked(t, state, "app/app.go")
+}
+
+// An interface whose method set is unchanged (here one embedding an
+// unexported method from another package) does not re-check its
+// implementor, over two passes of its file.
+func TestSemanticPassInterfaceEditUnchangedUnexportedEmbedDoesNotWiden(t *testing.T) {
+	requireGoToolchain(t)
+	root := sealedFixture(t)
+	state, before := carryWholePass(t, root, carryMineToBinder)
+
+	for pass, contents := range []string{sealedLib + "\n// touched\n", sealedLib} {
+		after := ifaceEditPass(t, state, root, "lib/lib.go", contents)
+		if slices.Contains(state.semantic.recheckedImplementors, "app/app.go") {
+			t.Errorf("pass %d of an unchanged lib re-checked app: %v", pass+1, state.semantic.recheckedImplementors)
+		}
+		if carryDeleted(after, before[carryMineToBinder].ID) {
+			t.Errorf("pass %d of an unchanged lib retracted %s", pass+1, carryMineToBinder)
+		}
+	}
+}
