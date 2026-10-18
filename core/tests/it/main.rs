@@ -79,6 +79,7 @@ mod reexport_linking;
 mod reexport_member_linking;
 mod repeated_edits_through_a_warm_plugin;
 mod replay_progress;
+mod rust_enum_variants;
 mod rust_glob_trait_overrides;
 mod rust_python_qualified_paths;
 mod semantic_pass_trigger;

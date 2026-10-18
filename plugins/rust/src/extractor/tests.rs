@@ -136,6 +136,8 @@ fn container(key: &str) -> TargetScope {
     TargetScope::Container(key.to_string())
 }
 
+mod variants;
+
 // --- declarations -------------------------------------------------------------
 
 #[test]
@@ -161,6 +163,7 @@ impl Tr for S { fn required(&self) {} }
         ("free", NodeKind::Function, "function"),
         ("S", NodeKind::Type, "struct"),
         ("E", NodeKind::Type, "enum"),
+        ("E::A", NodeKind::Variable, "variant"),
         ("U", NodeKind::Type, "union"),
         ("Alias", NodeKind::Type, "type_alias"),
         ("Tr", NodeKind::Type, "trait"),
@@ -747,8 +750,8 @@ fn open_sites_from<'g>(graph: &'g Graph, from: &str, name: &str) -> Vec<&'g Open
 
 /// GM-594: a path pattern (`Mode::A =>`) names a variant and binds nothing,
 /// so a type-qualified path inside its arm is resolved like anywhere else -
-/// a `qualifiedName` placeholder or a same-file edge - and is never opened
-/// to the semantic tier at its qualifier.
+/// here a same-file edge onto the method and onto the tuple variant's own
+/// node - and is never opened to the semantic tier at its qualifier.
 #[test]
 fn a_type_qualified_call_inside_a_path_pattern_arm_keeps_its_structural_edge() {
     let krate = Crate::new(&[(
@@ -760,10 +763,7 @@ fn a_type_qualified_call_inside_a_path_pattern_arm_keeps_its_structural_edge() {
     let graph = krate.extract("src/lib.rs");
     let targets = graph.targets(EdgeKind::Calls, "Mode::set");
     assert!(targets.contains(&"Mode::new".to_string()), "{targets:?}");
-    assert!(
-        targets.iter().any(|target| target.starts_with("pending_symbol ") && target.ends_with("Mode::B")),
-        "{targets:?}"
-    );
+    assert!(targets.contains(&"Mode::B".to_string()), "{targets:?}");
     for name in ["Mode::new", "Mode::B"] {
         assert!(open_sites_from(&graph, "Mode::set", name).is_empty(), "{name}: {:#?}", graph.0.open_sites);
     }

@@ -75,10 +75,10 @@
 # `plugins/go/conformance/expect.toml` marks its four. `tests/conformance.rs`
 # runs this file three ways, and the three together are the whole point:
 #
-#   1. with the manifest this plugin ships, where all 33 entries run and pass;
+#   1. with the manifest this plugin ships, where all 38 entries run and pass;
 #   2. with 3.2.0's own manifest (`semantic_pass = false`, no
 #      `[plugin.semantic]`) and `--skip-semantic-expectations`, where those
-#      four report `Skip` and the other 29 - every structural entry here -
+#      four report `Skip` and the other 34 - every structural entry here -
 #      keep passing;
 #   3. with 3.2.0's manifest and *without* the skip flag, where those four
 #      must FAIL.
@@ -763,3 +763,36 @@ expect = [
     "crates/alpha/src/gaps.rs:gaps::Ledger::inner",
     "crates/alpha/src/internals.rs:internals::tally",
 ]
+
+# --- enum variants, one of each shape, constructed in another crate
+#     (GM-630, ADR 0038) -------------------------------------------------------
+
+[[callers]]
+symbol = "shapes::Tone::High"
+# A tuple variant is a `Function`, so beta's `Tone::High(1)` - a
+# qualifiedName placeholder through `use alpha::shapes::Tone` - links as a
+# structural `CALLS` (ADR 0035 D4 lands one only on a `Function`).
+expect = ["crates/beta/src/main.rs:tones"]
+
+[[callers]]
+symbol = "shapes::Tone"
+# No roll-up (ADR 0038 D3): the enum's callers are not its variants'
+# constructions. What beta does write is the enum's name - its `use` and
+# `tones`' return type - two REFERENCES this CALLS walk discloses.
+expect = []
+excluded_references = { count = 2, files = ["crates/beta/src/main.rs:2"] }
+
+[[references]]
+symbol = "shapes::Tone::Low"
+# A unit variant is a `Variable`, referenced as a value.
+expect = ["crates/beta/src/main.rs:tones"]
+
+[[references]]
+symbol = "shapes::Tone::Wide"
+# A struct variant is a `Type`, referenced by its literal.
+expect = ["crates/beta/src/main.rs:tones"]
+
+[[definition]]
+symbol = "Tone::High"
+# The variant's own node, through the qualifiedName-suffix rung.
+expect = ["crates/alpha/src/shapes.rs:shapes::Tone::High"]

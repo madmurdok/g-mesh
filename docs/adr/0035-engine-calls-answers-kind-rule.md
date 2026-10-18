@@ -48,17 +48,8 @@ or const around it, the encloser.
   "not at its name" only drops an edge, never adds a wrong one.
 - A `qualifiedName` shared by a function and a type (TS declaration merging)
   still links the function; one shared by a const and a type links the const.
-- Rust tuple-variant constructors (`Enum::Variant(..)`) stay unlinked, by
-  decision (GM-619): a `CALLS` edge lands on the declaration of what is
-  called, and a variant is a member of its enum, not the enum. A tuple
-  struct or a class links because the type is its own constructor. The
-  extractor keys the call by the variant's `qualifiedName`, which no node
-  has; a semantic answer at the variant lands on the enum away from its name
-  and is dropped (D1). On ripgrep that is 142 `CALLS` sites onto 40 enums.
-  Construction sites would come from variant nodes of their own, not from a
-  landing rule on the enum. (GM-594: the 3 that linked on ripgrep came from a
-  unit-variant path pattern over-binding the enum's name, fixed in the Rust
-  plugin.)
+- Rust tuple-variant constructors link to the variant's own node
+  ([ADR 0038](0038-rust-enum-variants-are-nodes.md)), never to the enum.
 - Python `Foo()` and TS `new Foo()` on a class with no explicit constructor
   now produce `CALLS` onto the class, so `find_callers` on a class lists its
   constructions, which some users read as "references". None measured on
