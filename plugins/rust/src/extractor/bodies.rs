@@ -151,7 +151,8 @@ impl Bodies<'_, '_> {
                 // about the thing being declared - a node referencing itself.
                 self.visit_children_except(node, &[node.child_by_field_name("name")], module, block, &id);
             }
-            // An enum variant is not a node (see `decls`), and its name is an
+            // A variant's payload is referenced from its enum, not from the
+            // variant's own node (see `decls`), and its name is an
             // `identifier` that would otherwise read as a use of whatever the
             // module declares under that name.
             "enum_variant" => {

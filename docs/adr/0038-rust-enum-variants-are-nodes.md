@@ -1,7 +1,7 @@
 # 0038. Rust enum variants are nodes, of the kind each shape is in Rust's value namespace
 
 ## Status
-Proposed 2026-10-18 (GM-630, owner decisions D1-D4 pending). Design note,
+Accepted 2026-10-18 (GM-630, owner decisions D1-D4 as proposed). Design note,
 edit map and the behaviours tests pin:
 [`GM-630-rust-enum-variant-nodes.md`](../design/GM-630-rust-enum-variant-nodes.md).
 Follows [ADR 0035](0035-engine-calls-answers-kind-rule.md) and GM-619's
