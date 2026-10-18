@@ -75,6 +75,8 @@ variant nodes as the route to construction sites.
 - A semantic answer at a variant's name now lands on the variant (its
   tightest node) at its own name; a tuple variant is a `Function`, so
   ADR 0035 D1's check does not apply to it.
+- `cfg` alternatives of one `E::V` (in one enum, or in `cfg` copies of the
+  enum) are one node, the first declared, whatever the later ones' shapes.
 - Unchanged gaps: a variant reached through `use E::*` or `use m::E::V`
   (no container `m::E`), and `E::V` in a `use super::*` test module, stay
   unlinked, as type members do today.

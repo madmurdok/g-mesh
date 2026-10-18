@@ -448,7 +448,9 @@ impl Declarer<'_, '_> {
     /// `V { .. }` a `Type`; all three are `nativeKind` `variant`, as visible
     /// as the enum (`own`). A variant is registered by its `E::V` tail only,
     /// never by its bare name, so a bare `V` in the module cannot resolve to
-    /// it. Its fields are not nodes.
+    /// it. Its fields are not nodes. Of several `cfg` alternatives of one
+    /// `E::V`, in one enum or across `cfg` copies of the enum, the first
+    /// declared is the node, whatever the later ones' shapes.
     fn variants(&mut self, item: Node, module: &ModuleCtx, own: &Visibility) {
         let Some(enum_name) = item_name(item, self.source) else { return };
         let Some(body) = item.child_by_field_name("body") else { return };
@@ -465,6 +467,9 @@ impl Declarer<'_, '_> {
             };
             let tail_path = QualifiedPath::root(enum_name).child("::", name);
             let tail = tail_path.display();
+            if !self.model.first_variant(&module.key, &tail) {
+                continue;
+            }
             let mut spec = NodeSpec::with_path(
                 kind,
                 name.to_string(),
