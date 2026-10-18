@@ -136,6 +136,8 @@ fn container(key: &str) -> TargetScope {
     TargetScope::Container(key.to_string())
 }
 
+mod variants;
+
 // --- declarations -------------------------------------------------------------
 
 #[test]
@@ -161,6 +163,7 @@ impl Tr for S { fn required(&self) {} }
         ("free", NodeKind::Function, "function"),
         ("S", NodeKind::Type, "struct"),
         ("E", NodeKind::Type, "enum"),
+        ("E::A", NodeKind::Variable, "variant"),
         ("U", NodeKind::Type, "union"),
         ("Alias", NodeKind::Type, "type_alias"),
         ("Tr", NodeKind::Type, "trait"),

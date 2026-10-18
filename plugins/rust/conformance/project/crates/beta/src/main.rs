@@ -4,6 +4,7 @@
 use alpha::prelude::exported_helper;
 use alpha::prelude::*;
 use alpha::shapes::{describe, Square};
+use alpha::shapes::Tone;
 
 // DELIBERATELY NOT COMPILABLE. `alpha::internals::crate_only` is
 // `pub(crate)`, so `rustc` would reject this `use` - and that is the point:
@@ -53,3 +54,9 @@ mod shapes;
 /// qualifiedName is the bare `Ruler` - see `crates/alpha/src/shapes.rs`'s
 /// `Ruler` for what that used to decide.
 pub struct Ruler;
+
+/// GM-630: one construction of each of `alpha::shapes::Tone`'s variants, all
+/// written `Tone::V` through the named `use` above.
+pub fn tones() -> [Tone; 3] {
+    [Tone::Low, Tone::High(1), Tone::Wide { w: 2 }]
+}
