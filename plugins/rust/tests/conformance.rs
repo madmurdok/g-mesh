@@ -131,7 +131,8 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 // 32 with GM-537's `[[implementations]] shapes::Loud::speak` (structural).
 // 33 with `[[implementations]] sirens::Wail` (semantic).
 // 38 with GM-630's five `shapes::Tone` variant entries (structural).
-const EXPECTATIONS: usize = 38;
+// 40 with GM-637's two `capitals::Keys` module-path caller entries (structural).
+const EXPECTATIONS: usize = 40;
 // 6 since GM-386: `[[references]] shapes::Shape` joined the five receiver/
 // implementation entries, not because its rows need rust-analyzer - they do
 // not - but because the `files` tally it now asserts counts edges, and two of

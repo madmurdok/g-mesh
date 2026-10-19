@@ -55,6 +55,8 @@
 #     redundant-but-armless `file`, `shapes::Square::perimeter` without one,
 #     and GM-360's `Ruler`, where `file` is load-bearing);
 #   - references, a qualifiedName two crates carry (GM-360's `shapes::Gauge`).
+#   - callers, through a module spelled like a type (`capitals::Keys::f` and
+#     `capitals::Keys::Key::Major`), from another crate.
 #
 # Every `expect` is a SET of `"filePath:qualifiedName"` strings - order never
 # matters, and an entry missing from the set is as much of a failure as an
@@ -796,3 +798,26 @@ expect = ["crates/beta/src/main.rs:tones"]
 symbol = "Tone::High"
 # The variant's own node, through the qualifiedName-suffix rung.
 expect = ["crates/alpha/src/shapes.rs:shapes::Tone::High"]
+
+# --- a module spelled like a type, called from another crate -----------------
+
+[[callers]]
+symbol = "capitals::Keys::f"
+# `Keys` is a module (`crates/alpha/src/capitals.rs`), so both calls are a
+# `name` key in container `alpha::capitals::Keys`: the one through
+# `use alpha::capitals::Keys` and the one written in full. Read as a type by
+# its capital letter, either would be a `qualifiedName` in `alpha::capitals`,
+# where no `Keys::f` is declared.
+expect = [
+    "crates/beta/src/capital_calls.rs:capital_calls::imported",
+    "crates/beta/src/capital_calls.rs:capital_calls::full_path",
+]
+# Two rows in one file, so the response tallies them.
+files = ["crates/beta/src/capital_calls.rs:2"]
+
+[[callers]]
+symbol = "capitals::Keys::Key::Major"
+# `Keys::Key::Major(4)` after `use alpha::capitals::Keys`: the imported first
+# segment continues to the module's own container, where the tuple variant's
+# `qualifiedName` `Keys::Key::Major` is declared.
+expect = ["crates/beta/src/capital_calls.rs:capital_calls::variant"]

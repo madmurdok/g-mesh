@@ -323,6 +323,25 @@ mod tests {
         assert!(matches!(saved(&before, &tree), ResolutionDelta::Unknown { .. }), "a member removed");
     }
 
+    /// Format 1's `container_keys` lack inline modules, so a blob written by
+    /// it is not read as this format's facts: it answers `Unknown`, one full
+    /// reindex, rather than a delta against keys it never listed.
+    ///
+    /// Control: set [`FORMAT`] back to 1 - the format-1 blob is read and
+    /// answers a delta.
+    #[test]
+    fn a_format_1_blob_answers_unknown() {
+        let tree = workspace();
+        let project = tree.load();
+        let current = RustFacts::of(&project).encode();
+        assert!(current.contains(&format!("\"format\":{FORMAT}")), "the blob spells its format as expected");
+        let format_1 = current.replacen(&format!("\"format\":{FORMAT}"), "\"format\":1", 1);
+        assert!(
+            matches!(resolution_delta(&format_1, &project), ResolutionDelta::Unknown { .. }),
+            "a format-1 blob was read as facts"
+        );
+    }
+
     /// A blob that is not this format's facts answers `Unknown`, never a
     /// guess.
     #[test]

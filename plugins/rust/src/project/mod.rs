@@ -721,6 +721,50 @@ mod tests {
         }
     }
 
+    /// A module-level inline `mod`, nested or not and in the crate root or a
+    /// file module, is a container key; a key no `mod` declares is not.
+    ///
+    /// Control: drop the `inline_modules` chain from
+    /// [`ProjectContext::rebuild`] - every inline key answers `false`.
+    #[test]
+    fn a_module_level_inline_mod_is_a_container_key() {
+        let tree = workspace();
+        tree.write("crates/alpha/src/nested/deep.rs", "pub mod Outer {\n    pub mod Inner {}\n}\n");
+        let context = ProjectContext::load(&tree.0).unwrap();
+        for key in [
+            "alpha::inline_mod",
+            "alpha::inline_mod::deeper",
+            "alpha::nested::deep::Outer",
+            "alpha::nested::deep::Outer::Inner",
+        ] {
+            assert!(context.has_container(key), "{key}");
+        }
+        for key in ["alpha::deeper", "alpha::Outer", "alpha::nested::Outer", "alpha::nested::deep::Inner"] {
+            assert!(!context.has_container(key), "{key}");
+        }
+    }
+
+    /// A `mod` inside a fn body lives in that block's scope, and one written
+    /// in a `macro_rules!` body is declared nowhere until expanded: neither
+    /// is a container key of the file's module. A module-level inline `mod`
+    /// beside them still is.
+    ///
+    /// Control: in `module_tree::Scan::scan_file`, drop `&& decl.module_level`
+    /// from the inline-module filter - `alpha::Keys` and `alpha::Gen` answer
+    /// `true`.
+    #[test]
+    fn a_mod_in_a_fn_body_or_a_macro_rules_body_is_not_a_container_key() {
+        let tree = workspace();
+        tree.write(
+            "crates/alpha/src/lib.rs",
+            "pub struct Keys;\nfn setup() {\n    mod Keys {}\n}\nmacro_rules! m {\n    () => {\n        pub mod Gen {}\n    };\n}\npub struct Gen;\nmod real {}\n",
+        );
+        let context = ProjectContext::load(&tree.0).unwrap();
+        assert!(!context.has_container("alpha::Keys"), "a fn-local mod");
+        assert!(!context.has_container("alpha::Gen"), "a mod in a macro_rules! body");
+        assert!(context.has_container("alpha::real"), "the file was scanned");
+    }
+
     #[test]
     fn a_file_no_crate_reaches_is_an_orphan_named_after_its_own_path() {
         let tree = workspace();
