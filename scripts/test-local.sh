@@ -21,7 +21,9 @@
 # included, every seed), --keep-going forced. The heavy lib tests stay in
 # part 2, so that its JUnit times every heavy test; then
 # scripts/test-heavy-report.py checks that JUnit against the `local`
-# profile's heavy list. Lib tests in part 1 have no per-test time.
+# profile's heavy list, for every crate in that JUnit (plugin crates
+# included; its per-crate group shows each one). Lib tests in part 1 have no
+# per-test time, so a lib test that reaches 10 s there is in no group.
 #
 # Invariants:
 # - Sections and their filtersets come from scripts/test-sections.sh, the
@@ -316,6 +318,8 @@ else
 		if [ -f "$junit" ]; then
 			"$(python_cmd)" scripts/test-heavy-report.py .config/nextest.toml "$junit" ||
 				echo "test-local: the heavy-list report failed" >&2
+			[ -z "$lib_filter" ] ||
+				echo "== not timed: the ${ntests:-0} lib tests of part 1 (one libtest process per crate, no per-test time)"
 		else
 			echo "test-local: no $junit; no heavy-list report" >&2
 		fi
