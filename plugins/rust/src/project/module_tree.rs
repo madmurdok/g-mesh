@@ -141,6 +141,11 @@ pub(crate) struct CrateTree {
     pub lost: BTreeSet<RelPath>,
     /// The `mod` signature of every claimed file whose text was read.
     pub signatures: BTreeMap<RelPath, ModSignature>,
+    /// The container key of every inline `mod NAME { … }` in a claimed file
+    /// (`<file key>::<enclosing inline modules>::<NAME>`). An inline module
+    /// owns no file, so it is not in `files`; this set is what lets
+    /// `ProjectContext::has_container` still answer for it (GM-637).
+    pub inline_modules: BTreeSet<String>,
     /// Paths whose appearance would change this crate's tree: the candidate
     /// files of a `mod` item that named nothing on disk, and the `<name>.rs`
     /// a `mod name;` resolved past to `<name>/mod.rs`.
@@ -223,6 +228,12 @@ impl Scan<'_> {
         };
 
         let signature = mod_decls(&source);
+        for decl in signature.iter().filter(|decl| decl.inline) {
+            let mut segments = key_segments.to_vec();
+            segments.extend(decl.inline_segments.iter().cloned());
+            segments.push(decl.name.clone());
+            self.tree.inline_modules.insert(full_key(self.crate_key, &segments));
+        }
         for decl in signature.iter().filter(|decl| !decl.inline) {
             // An inline module's body is part of `file` itself, so it needs
             // no `register_file` call - only its file-based children, which

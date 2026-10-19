@@ -33,7 +33,9 @@ use super::ProjectContext;
 
 /// The facts' format. A blob of another version is unreadable, which answers
 /// `Unknown`.
-const FORMAT: u32 = 1;
+///
+/// 2: `container_keys` also lists inline modules (GM-637).
+const FORMAT: u32 = 2;
 
 /// A Rust container key's separator, `crate::a::b`.
 const SEPARATOR: &str = "::";
@@ -327,7 +329,11 @@ mod tests {
     fn unreadable_previous_facts_answer_unknown() {
         let tree = workspace();
         let project = tree.load();
-        let other_format = RustFacts::of(&project).encode().replacen("\"format\":1", "\"format\":2", 1);
+        let other_format = RustFacts::of(&project).encode().replacen(
+            &format!("\"format\":{FORMAT}"),
+            &format!("\"format\":{}", FORMAT + 1),
+            1,
+        );
         assert_ne!(other_format, RustFacts::of(&project).encode(), "the blob spells its format as expected");
         for blob in ["", "not json", "{}", other_format.as_str()] {
             assert!(

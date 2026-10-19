@@ -17,8 +17,14 @@
 //! | `x.f`, any other `x` | nothing: an open site for the semantic tier |
 //!
 //! The split between the second and third rows is the naming convention
-//! ([`looks_like_type`](super::syntax::looks_like_type)), and the reason they
-//! are addressed differently is ambiguity. A module holding
+//! ([`looks_like_type`](super::syntax::looks_like_type)), overruled by the
+//! module registry: a capitalized qualifier that resolves to a module this
+//! file declares or [`ProjectContext::has_container`] knows (`pub mod Keys {
+//! … }`, then `Keys::f()`) is a module, since Rust's one type namespace
+//! cannot also hold a type `Keys` there (GM-637). A capitalized module seen
+//! only through a glob `use`, or declared by a `macro_rules!` body, is still
+//! read as a type - a known limit. The reason the two rows are addressed
+//! differently is ambiguity. A module holding
 //! `impl Reader { fn new() }` and `impl Writer { fn new() }` - which is most
 //! modules - offers two declarations *named* `new`, so a `name`-keyed
 //! `Reader::new()` would find two candidates and core would rightly refuse
@@ -81,7 +87,8 @@ use crate::extractor::decls::{
 };
 use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::{
-    qualified_in, qualified_path_in, resolve_module_path, visibility, ModuleCtx, PathTarget,
+    parent_key, qualified_in, qualified_path_in, resolve_module_path, visibility, ModuleCtx, ModuleNames,
+    PathTarget,
 };
 use crate::extractor::model::{FileModel, Import};
 use crate::extractor::scope::Scopes;
@@ -695,8 +702,7 @@ impl Bodies<'_, '_> {
                 _ => None,
             };
         }
-        let qualifier = segments[segments.len() - 2].name();
-        if qualifier.is_some_and(|qualifier| qualifier == "Self" || looks_like_type(qualifier)) {
+        if self.is_type_qualifier(&segments[..segments.len() - 1], module) {
             return None;
         }
         match resolve_module_path(&segments[..segments.len() - 1], module, self.model, self.project) {
@@ -817,13 +823,15 @@ impl Bodies<'_, '_> {
                 else {
                     return None;
                 };
-                let qualifier = segments.len().checked_sub(2).and_then(|at| segments[at].name());
-                let origin =
-                    if qualifier.is_some_and(|qualifier| qualifier == "Self" || looks_like_type(qualifier)) {
-                        Origin::AssocFnReturn
-                    } else {
-                        Origin::FreeFnReturn
-                    };
+                // Must agree with `resolve_path`'s own type/module split, or
+                // `Keys::make()` for a module `Keys` would type as an
+                // associated fn's return (GM-637).
+                let origin = if self.is_type_qualifier(&segments[..segments.len().saturating_sub(1)], module)
+                {
+                    Origin::AssocFnReturn
+                } else {
+                    Origin::FreeFnReturn
+                };
                 self.returned(&id, origin, 1)
             }
             "field_expression" => {
@@ -1035,8 +1043,7 @@ impl Bodies<'_, '_> {
                 _ => None,
             };
         }
-        let qualifier = segments[segments.len() - 2].name();
-        if qualifier.is_some_and(|qualifier| qualifier == "Self" || looks_like_type(qualifier)) {
+        if self.is_type_qualifier(&segments[..segments.len() - 1], module) {
             return None;
         }
         match resolve_module_path(&segments[..segments.len() - 1], module, self.model, self.project) {
@@ -1186,9 +1193,8 @@ impl Bodies<'_, '_> {
         if segments.len() == 1 {
             return self.resolve_bare(tail, module, block, want);
         }
-        let qualifier = &segments[segments.len() - 2];
-        if let Some(qualifier) = qualifier.name() {
-            if qualifier == "Self" || looks_like_type(qualifier) {
+        if self.is_type_qualifier(&segments[..segments.len() - 1], module) {
+            if let Some(qualifier) = segments[segments.len() - 2].name() {
                 return self.resolve_type_qualified(
                     &segments[..segments.len() - 2],
                     qualifier,
@@ -1218,6 +1224,42 @@ impl Bodies<'_, '_> {
                 crate::census::record(crate::census::Reason::OpenUnresolvedPath, tail, &module.key);
                 Bound::Open
             }
+        }
+    }
+
+    /// Whether `path`'s last segment, the qualifier of a `path::member`, is a
+    /// type (`Self`, or spelled like one) rather than a module. The one
+    /// place the body pass splits the two, so `resolve_path`, `call_type`,
+    /// `resolve_written` and `struct_address` cannot disagree.
+    fn is_type_qualifier(&self, path: &[Seg<'_>], module: &ModuleCtx) -> bool {
+        match path.last().and_then(Seg::name) {
+            Some("Self") => true,
+            Some(name) => looks_like_type(name) && !self.names_module(path, module),
+            None => false,
+        }
+    }
+
+    /// Whether `path` names a module of this project - a `mod` item this
+    /// file declares, or a container the project's module registry holds
+    /// (inline modules included). Rust keeps modules and types in one
+    /// namespace (E0428), so a capitalized module (`pub mod Keys { … }`) is
+    /// told from a type of the same spelling by this alone (GM-637).
+    ///
+    /// A capitalized module reached only through a glob `use` (`use a::*;
+    /// Keys::f()`) has no import record, so its path does not resolve here
+    /// and it is still read as a type; so is one a `macro_rules!` body
+    /// declares, which the module-tree scan does not see. Both are a missing
+    /// edge, never a wrong one.
+    fn names_module(&self, path: &[Seg<'_>], module: &ModuleCtx) -> bool {
+        let PathTarget::Container(key) = resolve_module_path(path, module, self.model, self.project) else {
+            return false;
+        };
+        if self.project.has_container(&key) {
+            return true;
+        }
+        match (parent_key(&key), path.last().and_then(Seg::name)) {
+            (Some(parent), Some(name)) => self.model.declares_module(parent, name),
+            _ => false,
         }
     }
 

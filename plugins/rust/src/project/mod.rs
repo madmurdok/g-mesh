@@ -294,7 +294,12 @@ impl ProjectContext {
     /// `note_layout`.
     fn rebuild(&mut self) {
         self.files = self.trees.iter().flat_map(|tree| tree.files.clone()).collect();
-        self.container_keys = self.files.values().map(|(key, _)| key.clone()).collect();
+        self.container_keys = self
+            .files
+            .values()
+            .map(|(key, _)| key.clone())
+            .chain(self.trees.iter().flat_map(|tree| tree.inline_modules.iter().cloned()))
+            .collect();
         self.notes = self
             .note_layout
             .iter()
@@ -459,13 +464,14 @@ impl ProjectContext {
     /// `b` is real.
     ///
     /// Answered from `files`, the same source [`container_for`](Self::container_for)
-    /// reads - so it inherits that source's one gap: an **inline** `mod b {
-    /// … }` has no file of its own and is not in `files` (see
-    /// `module_tree`'s own doc and its
-    /// `a_file_mod_and_an_inline_mod_both_get_the_right_key` test), so this
-    /// answers `false` for an inline submodule that is genuinely there. That
-    /// is a missing edge, never a wrong one - the same trade-off
-    /// `FileModel::lookup_name` documents for an ambiguous name.
+    /// reads, plus every **inline** `mod b { … }` the module-tree scan saw
+    /// (`CrateTree::inline_modules`; an inline module owns no file, so it is
+    /// not in `files`). The extractor also asks this to tell a capitalized
+    /// module (`pub mod Keys { … }`) from a type of the same spelling, which
+    /// Rust's single type namespace makes decidable (GM-637). What the scan
+    /// cannot see stays a gap: a module declared by a `macro_rules!` body
+    /// answers `false` here - a missing edge, never a wrong one, the same
+    /// trade-off `FileModel::lookup_name` documents for an ambiguous name.
     pub fn has_container(&self, key: &str) -> bool {
         self.container_keys.contains(key)
     }
