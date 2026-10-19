@@ -165,3 +165,12 @@ pub fn calibrate(gauge: &Gauge) -> u8 {
     let _ = gauge;
     1
 }
+
+/// GM-630 (ADR 0038): one variant of each shape, each a node of its own -
+/// `High(u8)` a `Function` (a constructor), `Low` a `Variable`, `Wide { .. }`
+/// a `Type` - which `crates/beta/src/main.rs`'s `tones` builds across crates.
+pub enum Tone {
+    Low,
+    High(u8),
+    Wide { w: u8 },
+}

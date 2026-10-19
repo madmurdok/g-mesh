@@ -67,6 +67,7 @@ written to `target/`. See
 | `type A = …` | `Type` | `type_alias` | `A` |
 | `trait Tr` | `Type` | `trait` | `Tr` |
 | `const` / `static` | `Variable` | `const` / `static` | `C` |
+| tuple / unit / struct variant `V` of `enum E` | `Function` / `Variable` / `Type` | `variant` | `E::V` |
 | `macro_rules! m` | `Function` | `macro` | `m` |
 | `mod m` | `Module` | `module` | `m` |
 | `impl T { fn m }` | `Function` | `method` | `T::m` |

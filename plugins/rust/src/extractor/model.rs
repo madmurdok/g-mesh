@@ -88,6 +88,8 @@ pub(crate) struct FileModel {
     /// `(container, "T.0")`. `None` when `cfg` alternatives disagree, or when
     /// one of them writes a type no receiver could use.
     field_types: HashMap<(String, String), Option<Returns>>,
+    /// Enum variants already declared, by `(container, "E::V")`.
+    variants: HashSet<(String, String)>,
 }
 
 impl FileModel {
@@ -113,6 +115,14 @@ impl FileModel {
     /// to it, nor be made ambiguous by it.
     pub(crate) fn declare_member(&mut self, container: &str, tail: &str, decl: DeclRef) {
         self.by_tail.entry((container.to_string(), tail.to_string())).or_insert(decl);
+    }
+
+    /// Whether `tail` (`E::V`) is the first variant of that name in
+    /// `container`. A later `cfg` alternative of another shape would be a
+    /// second node with the same qualifiedName, so only the first is
+    /// declared.
+    pub(crate) fn first_variant(&mut self, container: &str, tail: &str) -> bool {
+        self.variants.insert((container.to_string(), tail.to_string()))
     }
 
     /// The one declaration of `name` in `container` that fits `want`, or

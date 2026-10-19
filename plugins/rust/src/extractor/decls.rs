@@ -12,6 +12,7 @@
 //! | `const C` / `static S` | `Variable` | `const` / `static` | `C` / `S` |
 //! | named field `f` of `struct`/`union` `T` | `Variable` | `field` | `T.f` |
 //! | positional field `0` of tuple struct `T` | `Variable` | `field` | `T.0` |
+//! | tuple / unit / struct variant `V` of `enum E` | `Function` / `Variable` / `Type` | `variant` | `E::V` |
 //! | `macro_rules! m` | `Function` | `macro` | `m` |
 //! | `mod m` | `Module` | `module` | `m` |
 //! | `impl T { fn m }` | `Function` | `method` | `T::m` |
@@ -21,8 +22,9 @@
 //!
 //! A `macro_rules!` is a `Function` because that is the kind core's linker
 //! demands of a `CALLS` target, and `m!()` is a call in every sense a caller
-//! cares about. Enum variants, and so their fields, are *not* nodes: a
-//! variant's fields would hang off a variant that is not one. A tuple
+//! cares about. An enum variant's kind follows its shape in Rust's value
+//! namespace ([ADR 0038](../../../../docs/adr/0038-rust-enum-variants-are-nodes.md)),
+//! and a variant's fields are not nodes. A tuple
 //! struct's positional field is one, named by its index (`0`, `T.0`): no
 //! identifier can start with a digit, so `T.0` collides with no named field,
 //! and the `.` keeps it apart from every `T::m`. A field is
@@ -382,9 +384,12 @@ impl Declarer<'_, '_> {
                 let own = block
                     .and_then(|block| block.inherited.clone())
                     .unwrap_or_else(|| self.item_visibility(item, module));
-                let declared = self.declare(item, module, block, node_kind, native_kind, own);
+                let declared = self.declare(item, module, block, node_kind, native_kind, own.clone());
                 if declared.is_some() && matches!(kind, "struct_item" | "union_item") {
                     self.fields(item, module);
+                }
+                if declared.is_some() && kind == "enum_item" {
+                    self.variants(item, module, &own);
                 }
             }
         }
@@ -434,6 +439,54 @@ impl Declarer<'_, '_> {
                 .child_by_field_name("type")
                 .and_then(|ty| self.field_type(ty, type_name, module, &generics));
             self.model.set_field_type(&module.key, &tail, returns);
+        }
+    }
+
+    /// The variants of an `enum`, each a node named `E::V` within the module,
+    /// its kind by shape: a tuple variant `V(..)` is a `Function` (a
+    /// constructor), a unit variant `V` a `Variable`, a struct variant
+    /// `V { .. }` a `Type`; all three are `nativeKind` `variant`, as visible
+    /// as the enum (`own`). A variant is registered by its `E::V` tail only,
+    /// never by its bare name, so a bare `V` in the module cannot resolve to
+    /// it. Its fields are not nodes. Of several `cfg` alternatives of one
+    /// `E::V`, in one enum or across `cfg` copies of the enum, the first
+    /// declared is the node, whatever the later ones' shapes.
+    fn variants(&mut self, item: Node, module: &ModuleCtx, own: &Visibility) {
+        let Some(enum_name) = item_name(item, self.source) else { return };
+        let Some(body) = item.child_by_field_name("body") else { return };
+        let mut cursor = body.walk();
+        for variant in body.named_children(&mut cursor) {
+            if variant.kind() != "enum_variant" {
+                continue;
+            }
+            let Some(name) = item_name(variant, self.source) else { continue };
+            let kind = match variant.child_by_field_name("body").map(|body| body.kind()) {
+                Some("ordered_field_declaration_list") => NodeKind::Function,
+                Some("field_declaration_list") => NodeKind::Type,
+                _ => NodeKind::Variable,
+            };
+            let tail_path = QualifiedPath::root(enum_name).child("::", name);
+            let tail = tail_path.display();
+            if !self.model.first_variant(&module.key, &tail) {
+                continue;
+            }
+            let mut spec = NodeSpec::with_path(
+                kind,
+                name.to_string(),
+                module.qualified_path(&tail_path),
+                self.emitter.positions().range(variant),
+            )
+            .native_kind("variant")
+            .visibility(own.clone())
+            .in_container(module.key.clone(), module.parent.clone());
+            spec.signature = self
+                .source
+                .get(variant.start_byte()..variant.end_byte())
+                .map(collapse_whitespace)
+                .filter(|rendered| !rendered.is_empty());
+            spec.doc_comment = outer_doc_comment(variant, self.source);
+            let id = self.emitter.declare(spec, is_public(own));
+            self.model.declare_member(&module.key, &tail, DeclRef { id, kind });
         }
     }
 

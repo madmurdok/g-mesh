@@ -136,6 +136,8 @@ fn container(key: &str) -> TargetScope {
     TargetScope::Container(key.to_string())
 }
 
+mod variants;
+
 // --- declarations -------------------------------------------------------------
 
 #[test]
@@ -161,6 +163,7 @@ impl Tr for S { fn required(&self) {} }
         ("free", NodeKind::Function, "function"),
         ("S", NodeKind::Type, "struct"),
         ("E", NodeKind::Type, "enum"),
+        ("E::A", NodeKind::Variable, "variant"),
         ("U", NodeKind::Type, "union"),
         ("Alias", NodeKind::Type, "type_alias"),
         ("Tr", NodeKind::Type, "trait"),
@@ -747,8 +750,8 @@ fn open_sites_from<'g>(graph: &'g Graph, from: &str, name: &str) -> Vec<&'g Open
 
 /// GM-594: a path pattern (`Mode::A =>`) names a variant and binds nothing,
 /// so a type-qualified path inside its arm is resolved like anywhere else -
-/// a `qualifiedName` placeholder or a same-file edge - and is never opened
-/// to the semantic tier at its qualifier.
+/// here a same-file edge onto the method and onto the tuple variant's own
+/// node - and is never opened to the semantic tier at its qualifier.
 #[test]
 fn a_type_qualified_call_inside_a_path_pattern_arm_keeps_its_structural_edge() {
     let krate = Crate::new(&[(
@@ -760,10 +763,7 @@ fn a_type_qualified_call_inside_a_path_pattern_arm_keeps_its_structural_edge() {
     let graph = krate.extract("src/lib.rs");
     let targets = graph.targets(EdgeKind::Calls, "Mode::set");
     assert!(targets.contains(&"Mode::new".to_string()), "{targets:?}");
-    assert!(
-        targets.iter().any(|target| target.starts_with("pending_symbol ") && target.ends_with("Mode::B")),
-        "{targets:?}"
-    );
+    assert!(targets.contains(&"Mode::B".to_string()), "{targets:?}");
     for name in ["Mode::new", "Mode::B"] {
         assert!(open_sites_from(&graph, "Mode::set", name).is_empty(), "{name}: {:#?}", graph.0.open_sites);
     }
@@ -2846,17 +2846,76 @@ fn a_path_calls_open_site_is_asked_at_the_last_segment() {
     assert_eq!(asked_at(&graph, "on_self", EdgeKind::Calls), vec![("Self::d".to_string(), 11, 10)]);
 }
 
-/// GM-618: only a path moves. A single-segment call is asked where it is
-/// written, turbofish or not, and `<T as Tr>::f()` (no path to flatten) is
-/// asked nowhere. An edge that is not a call keeps the node's start: a path
-/// used as a value or a type (`References`) and `impl super::Tr for T`
-/// (`SupertypeOf`).
+/// A single-token site is asked at its own token, never at what precedes it:
+/// a method call at the method's name (after a path-call receiver), a field read at the field's name (after a path receiver). A
+/// shape with no path to flatten - a qualified path `<U as Tr>::C`, a path in
+/// a pattern, a `use` tree inside a body - opens no site at all.
 ///
-/// Control: in `Bodies::open_site`, ask at `path_last_segment(at)` whatever
-/// the edge kind (the `References` and `SupertypeOf` rows move to the last
-/// segment).
+/// Controls: in `Bodies::receiver_call`, open the site at `target` (the whole
+/// `field_expression`) instead of `field` (the `go` row moves to the
+/// receiver's start); in `Bodies::visit`, drop `"use_declaration"` from the
+/// arm that skips it (the in-body `use` tree opens sites).
 #[test]
-fn single_segment_calls_and_non_call_sites_are_asked_where_they_always_were() {
+fn single_token_sites_stay_on_their_token_and_unflattened_paths_open_none() {
+    let source = "pub fn tok<U: Tr>(v: u8) {\n\
+         \x20   super::q::make().go();\n\
+         \x20   let _ = super::q::V.f;\n\
+         \x20   let _ = <U as Tr>::C;\n\
+         \x20   match v { super::q::K => {}, _ => {} }\n\
+         \x20   if let super::q::T(a) = v {}\n\
+         \x20   use super::q::{self as qq, L};\n\
+         }\n";
+    let krate = Crate::new(&[("src/lib.rs", source)]);
+    let graph = krate.extract("src/lib.rs");
+    let tok = graph.node("tok").id.clone();
+    let mut sites: Vec<_> = graph
+        .0
+        .open_sites
+        .iter()
+        .filter(|site| site.from_id == tok)
+        .map(|site| (site.edge_kind, site.name.clone(), site.position.line, site.position.col))
+        .collect();
+    sites.sort_by_key(|(_, _, line, col)| (*line, *col));
+    // Where the last occurrence of `token` in `anchor` starts.
+    let at = |kind: EdgeKind, name: &str, anchor: &str, token: &str| {
+        let (name, line, col) = expect_at(source, name, anchor);
+        (kind, name, line, col + anchor.rfind(token).unwrap() as u32)
+    };
+    assert_eq!(
+        sites,
+        vec![
+            at(EdgeKind::Calls, "super::q::make", "super::q::make()", "make"),
+            at(EdgeKind::Calls, "go", "super::q::make().go", "go"),
+            at(EdgeKind::References, "super::q::V", "super::q::V.f", "V"),
+            at(EdgeKind::References, "f", "super::q::V.f", "f"),
+        ],
+        "{:#?}",
+        graph.0.open_sites
+    );
+}
+
+/// Only a path moves. A single-segment call is asked where it is written,
+/// turbofish or not, and `<T as Tr>::f()` (no path to flatten) is asked
+/// nowhere. A path that is not a call is asked at its last segment too,
+/// whatever qualifies it (a module, a type, a generic parameter, generic
+/// arguments in the middle, a raw identifier at the end): a path used as a
+/// value, a type or a struct literal (`References`), a tuple-struct ctor
+/// (`Calls`), the trait of `impl super::Tr for T` and the self type of
+/// `impl Tr for super::other::Bar` (`SupertypeOf`). A `References` or trait
+/// site keeps the whole path as its name, written on the asked line so that
+/// the bridge's range starts at the path's start.
+///
+/// Controls: in `Bodies::open_site`, ask at `path_last_segment(at)` only for
+/// `EdgeKind::Calls` and at `at` otherwise (the `References` and
+/// `SupertypeOf` rows move back to the path's start); in
+/// `path_last_segment`, drop `scoped_type_identifier` from the arm that steps
+/// to `name` (the type-position rows `U::Item`, `super::W` move to the path's
+/// start); in `Bodies::open_site`, name the site after `asked` instead of
+/// `name` (the names lose their qualifier); in `Bodies::supertype_edge`, open
+/// the self-type site at `item` instead of `self_type` (the `Bar` row moves to
+/// `impl`).
+#[test]
+fn single_segment_calls_stay_and_non_call_paths_are_asked_at_the_last_segment() {
     let source = "pub struct T;\n\
          pub fn run<U: Tr>() {\n\
          \x20   ghost();\n\
@@ -2865,24 +2924,44 @@ fn single_segment_calls_and_non_call_sites_are_asked_where_they_always_were() {
          \x20   let _ = super::Mode::A;\n\
          \x20   let _ = super::q::C;\n\
          \x20   let _: super::Q = x;\n\
+         \x20   let _ = U::C;\n\
+         \x20   let _: U::Item = x;\n\
+         \x20   let _: super::W<u8> = x;\n\
+         \x20   let _: super::a::W<u8>::X = x;\n\
+         \x20   let _ = super::q::r#type;\n\
+         \x20   let _ = super::q::S { a: 1 };\n\
+         \x20   super::q::P(1);\n\
          }\n\
          impl super::Tr for T {}\n\
-         impl super::q::Tr for T {}\n";
+         impl super::q::Tr for T {}\n\
+         impl super::Tr2<u8> for super::other::Bar {}\n";
     let krate = Crate::new(&[("src/lib.rs", source)]);
     let graph = krate.extract("src/lib.rs");
     let at = |name: &str, anchor: &str| expect_at(source, name, anchor);
+    // Where `anchor` starts, moved to its last occurrence of `tail`.
+    let tail = |name: &str, anchor: &str, tail: &str| {
+        let (name, line, col) = expect_at(source, name, anchor);
+        (name, line, col + anchor.rfind(tail).unwrap() as u32)
+    };
     assert_eq!(
         asked_at(&graph, "run", EdgeKind::Calls),
-        vec![at("ghost", "ghost();"), at("ghost", "ghost::<u8>")],
+        vec![at("ghost", "ghost();"), at("ghost", "ghost::<u8>"), tail("super::q::P", "super::q::P(1)", "P")],
         "{:#?}",
         graph.0.open_sites
     );
+    let references = asked_at(&graph, "run", EdgeKind::References);
     assert_eq!(
-        asked_at(&graph, "run", EdgeKind::References),
+        references,
         vec![
-            at("super::Mode::A", "super::Mode::A"),
-            at("super::q::C", "super::q::C"),
-            at("super::Q", "super::Q ="),
+            tail("super::Mode::A", "super::Mode::A", "A"),
+            tail("super::q::C", "super::q::C", "C"),
+            tail("super::Q", "super::Q =", "Q"),
+            tail("U::C", "U::C;", "C"),
+            tail("U::Item", "U::Item", "Item"),
+            tail("super::W", "super::W<u8>", "W"),
+            tail("super::a::W<u8>::X", "super::a::W<u8>::X", "X"),
+            tail("super::q::r#type", "super::q::r#type", "r#type"),
+            tail("super::q::S", "super::q::S {", "S"),
         ],
         "{:#?}",
         graph.0.open_sites
@@ -2896,8 +2975,21 @@ fn single_segment_calls_and_non_call_sites_are_asked_where_they_always_were() {
         .collect();
     assert_eq!(
         supertypes,
-        vec![at("super::Tr", "super::Tr for"), at("super::q::Tr", "super::q::Tr for")],
+        vec![
+            tail("super::Tr", "super::Tr for", "Tr"),
+            tail("super::q::Tr", "super::q::Tr for", "Tr"),
+            tail("Bar", "super::other::Bar", "Bar"),
+        ],
         "{:#?}",
         graph.0.open_sites
     );
+    // The whole name is written on the asked line, starting before the asked
+    // column and covering it - what the bridge's `site_range` needs to start
+    // the range at the path's start.
+    let lines: Vec<&str> = source.lines().collect();
+    for (name, line, col) in references.iter().chain(&supertypes[..2]) {
+        let start =
+            lines[*line as usize].find(name.as_str()).unwrap_or_else(|| panic!("{name} not on line {line}"));
+        assert!(start as u32 <= *col && *col < (start + name.len()) as u32, "{name} at {line}:{col}");
+    }
 }

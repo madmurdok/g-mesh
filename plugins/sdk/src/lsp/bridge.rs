@@ -5079,8 +5079,9 @@ mod tests {
         assert_eq!(language_id(&RelPath::new("src/a.tsx"), "typescript", &[]), "typescript");
     }
 
-    /// GM-618: a path call is asked at its last segment, but what the site
-    /// covers is the whole written path. The range is found on the source
+    /// GM-618: a path call is asked at its last segment, and so is a
+    /// `References` path, but what the site covers is the whole
+    /// written path. The range is found on the source
     /// line from the asked column, not started there.
     ///
     /// Control: in `site_range`, make the found start unused
@@ -5098,6 +5099,15 @@ mod tests {
         let asked = at(1, path.find("new").unwrap() as u32);
         // The written path, not [asked, asked + 19).
         assert_eq!(covers(Some(&source), asked, "super::Q::<u8>::new"), ((1, 4), (1, 23)));
+        // A `References` path is asked at its last segment too: the range
+        // still starts at the path's start, past generic arguments in the
+        // middle and up to a raw identifier at the end.
+        let typed = "    let _: super::a::W<u8>::X = x;";
+        let asked_x = at(0, typed.rfind('X').unwrap() as u32);
+        assert_eq!(covers(Some(typed), asked_x, "super::a::W<u8>::X"), ((0, 11), (0, 29)));
+        let raw = "    let _ = super::q::r#type;";
+        let asked_raw = at(0, raw.find("r#type").unwrap() as u32);
+        assert_eq!(covers(Some(raw), asked_raw, "super::q::r#type"), ((0, 12), (0, 28)));
         // A site asked at its own start is unchanged.
         let own = "    foo();";
         assert_eq!(covers(Some(&format!("{own}\n")), at(0, 4), "foo"), ((0, 4), (0, 7)));
