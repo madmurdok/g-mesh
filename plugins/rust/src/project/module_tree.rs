@@ -112,14 +112,18 @@ pub(crate) type FileContainers = BTreeMap<RelPath, (String, Option<String>)>;
 
 /// One `mod` item as [`mod_signature`] reads it from a file's text: the
 /// inline modules enclosing it within that file, its name, its `#[path]`
-/// value, and whether it opens an inline body. `#[cfg]` is not part of it
-/// (Decision 2).
+/// value, whether it opens an inline body, and whether it sits at module
+/// level. `#[cfg]` is not part of it (Decision 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModDecl {
     inline_segments: Vec<String>,
     name: String,
     explicit_path: Option<String>,
     inline: bool,
+    /// Every brace enclosing the item is a module's own body. False inside a
+    /// fn body, an `impl` block or a `macro_rules!` body, where a `mod X {`
+    /// lives in a block scope (or nowhere yet), not at `<file key>::X`.
+    module_level: bool,
 }
 
 /// Every `mod` item of one file, in source order. Two texts with the same
@@ -228,7 +232,11 @@ impl Scan<'_> {
         };
 
         let signature = mod_decls(&source);
-        for decl in signature.iter().filter(|decl| decl.inline) {
+        // Only a module-level inline `mod` owns `<file key>::<..>::<name>`:
+        // a fn-local `mod Keys {}` may sit beside a top-level `struct Keys`
+        // (GM-637/F1), and a `macro_rules!` body declares nothing until
+        // expanded.
+        for decl in signature.iter().filter(|decl| decl.inline && decl.module_level) {
             let mut segments = key_segments.to_vec();
             segments.extend(decl.inline_segments.iter().cloned());
             segments.push(decl.name.clone());
@@ -393,6 +401,7 @@ fn mod_decls(source: &str) -> Vec<ModDecl> {
                             name: name.clone(),
                             explicit_path: if opens_body { None } else { explicit_path },
                             inline: opens_body,
+                            module_level: frames.iter().all(|frame| *frame),
                         });
                         if opens_body {
                             // `after` points AT the opening `{`; it is

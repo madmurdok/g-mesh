@@ -466,10 +466,11 @@ impl ProjectContext {
     /// Answered from `files`, the same source [`container_for`](Self::container_for)
     /// reads, plus every **inline** `mod b { … }` the module-tree scan saw
     /// (`CrateTree::inline_modules`; an inline module owns no file, so it is
-    /// not in `files`). The extractor also asks this to tell a capitalized
+    /// not in `files`) at module level - one inside a fn body or a
+    /// `macro_rules!` body is not at that key, and is left out. The extractor also asks this to tell a capitalized
     /// module (`pub mod Keys { … }`) from a type of the same spelling, which
     /// Rust's single type namespace makes decidable (GM-637). What the scan
-    /// cannot see stays a gap: a module declared by a `macro_rules!` body
+    /// leaves out stays a gap: a module a `macro_rules!` expansion declares
     /// answers `false` here - a missing edge, never a wrong one, the same
     /// trade-off `FileModel::lookup_name` documents for an ambiguous name.
     pub fn has_container(&self, key: &str) -> bool {
