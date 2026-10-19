@@ -1413,7 +1413,19 @@ mod tests {
         assert!(fixture.projects.exists("bbbb2222"), "a locked daemon's state must stay");
 
         drop(lock);
-        assert_eq!(sweep_orphaned(fixture.projects.root()).unwrap(), 1, "and goes once the lock is free");
+        // GM-636: a child spawned by another test thread can still hold a
+        // copy of the lock fd for a few ms after the drop. The sweep deletes
+        // nothing while it sees the lock held, so retrying is safe. A local
+        // loop: daemon/tests.rs is a private module of `daemon`.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let swept = loop {
+            let n = sweep_orphaned(fixture.projects.root()).unwrap();
+            if n != 0 || Instant::now() >= deadline {
+                break n;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(swept, 1, "and goes once the lock is free");
     }
 
     /// A home holding one orphaned project's state, as the sweep sees it:
