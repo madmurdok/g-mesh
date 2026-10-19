@@ -22,6 +22,7 @@ mod inline_mod {
 mod imp;
 
 pub mod blanket;
+pub mod capitals;
 pub mod gaps;
 pub mod internals;
 pub mod prelude;

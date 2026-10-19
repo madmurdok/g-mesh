@@ -294,7 +294,12 @@ impl ProjectContext {
     /// `note_layout`.
     fn rebuild(&mut self) {
         self.files = self.trees.iter().flat_map(|tree| tree.files.clone()).collect();
-        self.container_keys = self.files.values().map(|(key, _)| key.clone()).collect();
+        self.container_keys = self
+            .files
+            .values()
+            .map(|(key, _)| key.clone())
+            .chain(self.trees.iter().flat_map(|tree| tree.inline_modules.iter().cloned()))
+            .collect();
         self.notes = self
             .note_layout
             .iter()
@@ -459,13 +464,15 @@ impl ProjectContext {
     /// `b` is real.
     ///
     /// Answered from `files`, the same source [`container_for`](Self::container_for)
-    /// reads - so it inherits that source's one gap: an **inline** `mod b {
-    /// … }` has no file of its own and is not in `files` (see
-    /// `module_tree`'s own doc and its
-    /// `a_file_mod_and_an_inline_mod_both_get_the_right_key` test), so this
-    /// answers `false` for an inline submodule that is genuinely there. That
-    /// is a missing edge, never a wrong one - the same trade-off
-    /// `FileModel::lookup_name` documents for an ambiguous name.
+    /// reads, plus every **inline** `mod b { … }` the module-tree scan saw
+    /// (`CrateTree::inline_modules`; an inline module owns no file, so it is
+    /// not in `files`) at module level - one inside a fn body or a
+    /// `macro_rules!` body is not at that key, and is left out. The extractor also asks this to tell a capitalized
+    /// module (`pub mod Keys { … }`) from a type of the same spelling, which
+    /// Rust's single type namespace makes decidable (GM-637). What the scan
+    /// leaves out stays a gap: a module a `macro_rules!` expansion declares
+    /// answers `false` here - a missing edge, never a wrong one, the same
+    /// trade-off `FileModel::lookup_name` documents for an ambiguous name.
     pub fn has_container(&self, key: &str) -> bool {
         self.container_keys.contains(key)
     }
@@ -712,6 +719,50 @@ mod tests {
                 "{absent} is not a real file and must not have been claimed"
             );
         }
+    }
+
+    /// A module-level inline `mod`, nested or not and in the crate root or a
+    /// file module, is a container key; a key no `mod` declares is not.
+    ///
+    /// Control: drop the `inline_modules` chain from
+    /// [`ProjectContext::rebuild`] - every inline key answers `false`.
+    #[test]
+    fn a_module_level_inline_mod_is_a_container_key() {
+        let tree = workspace();
+        tree.write("crates/alpha/src/nested/deep.rs", "pub mod Outer {\n    pub mod Inner {}\n}\n");
+        let context = ProjectContext::load(&tree.0).unwrap();
+        for key in [
+            "alpha::inline_mod",
+            "alpha::inline_mod::deeper",
+            "alpha::nested::deep::Outer",
+            "alpha::nested::deep::Outer::Inner",
+        ] {
+            assert!(context.has_container(key), "{key}");
+        }
+        for key in ["alpha::deeper", "alpha::Outer", "alpha::nested::Outer", "alpha::nested::deep::Inner"] {
+            assert!(!context.has_container(key), "{key}");
+        }
+    }
+
+    /// A `mod` inside a fn body lives in that block's scope, and one written
+    /// in a `macro_rules!` body is declared nowhere until expanded: neither
+    /// is a container key of the file's module. A module-level inline `mod`
+    /// beside them still is.
+    ///
+    /// Control: in `module_tree::Scan::scan_file`, drop `&& decl.module_level`
+    /// from the inline-module filter - `alpha::Keys` and `alpha::Gen` answer
+    /// `true`.
+    #[test]
+    fn a_mod_in_a_fn_body_or_a_macro_rules_body_is_not_a_container_key() {
+        let tree = workspace();
+        tree.write(
+            "crates/alpha/src/lib.rs",
+            "pub struct Keys;\nfn setup() {\n    mod Keys {}\n}\nmacro_rules! m {\n    () => {\n        pub mod Gen {}\n    };\n}\npub struct Gen;\nmod real {}\n",
+        );
+        let context = ProjectContext::load(&tree.0).unwrap();
+        assert!(!context.has_container("alpha::Keys"), "a fn-local mod");
+        assert!(!context.has_container("alpha::Gen"), "a mod in a macro_rules! body");
+        assert!(context.has_container("alpha::real"), "the file was scanned");
     }
 
     #[test]
