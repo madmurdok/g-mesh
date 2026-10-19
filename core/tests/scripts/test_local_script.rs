@@ -426,6 +426,19 @@ fn full_runs_every_section_in_two_parts_under_the_ci_profile_with_every_seed_the
     assert!(stdout_of(&output).contains("== heavy list: "), "{}", describe(&output));
 }
 
+/// `--full` with lib tests in part 1 says after the report that those lib
+/// tests have no per-test time: the stand-in listing has two.
+#[test]
+fn full_names_the_untimed_lib_tests_of_part_1_after_the_report() {
+    let (output, _) = run_local(&["--full"], &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let stdout = stdout_of(&output);
+    let report = stdout.find("== heavy list: ").unwrap_or_else(|| panic!("no report\n{stdout}"));
+    let line = "== not timed: the 2 lib tests of part 1 ";
+    let at = stdout.find(line).unwrap_or_else(|| panic!("no {line:?}\n{}", describe(&output)));
+    assert!(at > report, "{stdout}");
+}
+
 /// A failing lib part does not stop `--full`: it always runs part 2.
 #[test]
 fn full_runs_nextest_after_a_failing_lib_part() {
@@ -637,6 +650,82 @@ fn the_heavy_report_refuses_a_config_without_a_local_profile() {
     let output = heavy_report("[profile.default]\nslow-timeout = \"60s\"\n", HEAVY_JUNIT);
     assert_ne!(output.status.code(), Some(0), "{}", describe(&output));
     assert!(String::from_utf8_lossy(&output.stderr).contains("no [profile.local]"), "{}", describe(&output));
+}
+
+/// Heavy terms across crates: a plugin crate's lib, a binary of
+/// `g-mesh` (`<package>::bin/<name>`), and the `g-mesh` lib.
+const PER_CRATE_CONFIG: &str = r#"[profile.local]
+default-filter = """
+not (
+    (binary_id(g-mesh-plugin-typescript) & test(=semantic_runs_no_project_code)) |
+    (binary_id(g-mesh-plugin-typescript) & test(=listed::light)) |
+    (binary_id(g-mesh::bin/g-mesh) & test(=listed::bin_slow)) |
+    (binary_id(g-mesh) & test(=listed::slow))
+)
+"""
+"#;
+
+/// Per crate: g-mesh 3 timed, 2 listed and still heavy (one in its `bin/`
+/// binary); g-mesh-plugin-python 1 timed, 0; g-mesh-plugin-typescript 3
+/// timed, 1 (a listed light test and an unlisted heavy one do not count).
+const PER_CRATE_JUNIT: &str = r#"<testsuites><testsuite name="all">
+<testcase classname="g-mesh-plugin-typescript" name="semantic_runs_no_project_code" time="35.9"/>
+<testcase classname="g-mesh-plugin-typescript" name="listed::light" time="2.0"/>
+<testcase classname="g-mesh-plugin-typescript" name="unlisted::heavy" time="12.0"/>
+<testcase classname="g-mesh::bin/g-mesh" name="listed::bin_slow" time="30.0"/>
+<testcase classname="g-mesh" name="listed::slow" time="20.0"/>
+<testcase classname="g-mesh" name="unlisted::fast" time="1.0"/>
+<testcase classname="g-mesh-plugin-python::it" name="unlisted::fast" time="1.0"/>
+</testsuite></testsuites>
+"#;
+
+/// The per-crate group's rows as `(crate, timed, listed and still heavy)`.
+fn per_crate_rows(stdout: &str) -> Vec<(String, usize, usize)> {
+    group(stdout, "== timed per crate")
+        .iter()
+        .map(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            assert_eq!(cols.len(), 3, "{l:?}\n{stdout}");
+            (cols[2].to_owned(), cols[0].parse().unwrap(), cols[1].parse().unwrap())
+        })
+        .collect()
+}
+
+/// Every crate of the JUnit gets one row by its package, plugin crates and
+/// `<package>::<binary>` ids included, so a crate whose only listed test
+/// stays heavy still shows it was timed.
+#[test]
+fn the_heavy_report_groups_timed_tests_by_package_plugin_crates_included() {
+    let output = heavy_report(PER_CRATE_CONFIG, PER_CRATE_JUNIT);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let stdout = stdout_of(&output);
+    let crates: Vec<String> = per_crate_rows(&stdout).into_iter().map(|(c, _, _)| c).collect();
+    assert_eq!(crates, ["g-mesh", "g-mesh-plugin-python", "g-mesh-plugin-typescript"], "{stdout}");
+    let timed: Vec<usize> = per_crate_rows(&stdout).into_iter().map(|(_, t, _)| t).collect();
+    assert_eq!(timed, [3, 1, 3], "{stdout}");
+}
+
+/// The second column counts listed tests at or over the threshold only: not
+/// a listed test under it, not an unlisted heavy one.
+#[test]
+fn the_heavy_reports_per_crate_group_counts_only_listed_tests_still_heavy() {
+    let output = heavy_report(PER_CRATE_CONFIG, PER_CRATE_JUNIT);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let stdout = stdout_of(&output);
+    let still: Vec<(String, usize)> = per_crate_rows(&stdout).into_iter().map(|(c, _, s)| (c, s)).collect();
+    assert_eq!(
+        still,
+        [
+            ("g-mesh".to_owned(), 2),
+            ("g-mesh-plugin-python".to_owned(), 0),
+            ("g-mesh-plugin-typescript".to_owned(), 1)
+        ],
+        "{stdout}"
+    );
+    // The listed light test is still a drop candidate.
+    let lighter = group(&stdout, "== listed, now under");
+    assert_eq!(lighter.len(), 1, "{stdout}");
+    assert!(lighter[0].ends_with("g-mesh-plugin-typescript  listed::light"), "{stdout}");
 }
 
 // ---------------------------------------------------------------------------
