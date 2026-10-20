@@ -107,6 +107,49 @@ pub fn run() { let k = Keys::make(); k.m(); }
     );
 }
 
+/// The census files the local bound to `Keys::make()`, a free fn of a
+/// module spelled like a type, under `FreeFnReturn`, and the local bound to
+/// `Keys::K::new()`, a type's associated fn, under `AssocFnReturn`. Only the
+/// census reads a local's `Origin`, so no edge shows the split. The census
+/// is per thread and a single-threaded run shares one thread between tests:
+/// the typed sites are drained before the extraction and read after it.
+///
+/// Control: in `Bodies::call_type`'s `scoped_identifier` arm, decide the
+/// origin by the bare spelling, `segments.len() >= 2 &&
+/// segments[segments.len() - 2].name().is_some_and(looks_like_type)`,
+/// instead of `self.is_type_qualifier(..)` - `run`'s site turns
+/// `AssocFnReturn`.
+#[test]
+fn the_census_files_a_capitalized_modules_free_fn_return_as_a_free_fn_return() {
+    use crate::census;
+    use crate::extractor::Origin;
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        r#"
+pub mod Keys {
+    pub struct K;
+    impl K {
+        pub fn new() -> K { K }
+        pub fn m(&self) {}
+    }
+    pub fn make() -> K { K }
+}
+pub fn run() { let k = Keys::make(); k.m(); }
+pub fn assoc() { let k = Keys::K::new(); k.m(); }
+"#,
+    )]);
+    census::enable();
+    let _ = census::take_file_typed_sites();
+    let graph = krate.extract("src/lib.rs");
+    let sites = census::take_file_typed_sites();
+    let origins_from = |caller: &str| {
+        let from = &graph.node(caller).id;
+        sites.iter().filter(|site| &site.from == from).map(|site| site.origin).collect::<Vec<_>>()
+    };
+    assert_eq!(origins_from("run"), vec![Origin::FreeFnReturn], "{sites:#?}");
+    assert_eq!(origins_from("assoc"), vec![Origin::AssocFnReturn], "{sites:#?}");
+}
+
 /// A written type `Keys::S` (a parameter annotation) and a
 /// struct literal `Keys::S { .. }` both type their local as the module's
 /// `S`, so `.m()` links.

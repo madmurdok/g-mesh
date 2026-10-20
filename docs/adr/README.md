@@ -109,3 +109,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0036 | [A call names its project; a contested selection refuses calls that do not](0036-per-call-project-routing.md) | Accepted |
 | 0037 | [The rust tier refuses a cargo config `[env]` that sets a dynamic-loader variable](0037-rust-tier-refuses-cargo-env-loader-vars.md) | Accepted |
 | 0038 | [Rust enum variants are nodes, of the kind each shape is in Rust's value namespace](0038-rust-enum-variants-are-nodes.md) | Accepted |
+| 0039 | [The rust server runs under an OS sandbox that denies mapping and exec of project code](0039-rust-server-runs-under-an-os-sandbox.md) | Accepted |

@@ -153,6 +153,7 @@ not (
     (binary_id(g-mesh::it) & test(=orphaned_daemon::a_daemon_whose_project_root_still_exists_is_left_alone)) |
     (binary_id(g-mesh-plugin-rust::conformance) & test(=the_linked_index_answers_the_acceptance_criteria)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=cargo_env_loader_var::a_loader_var_added_after_start_stops_the_server_before_any_reload)) |
+    (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves)) |
     (binary_id(g-mesh-plugin-typescript::indexing_writes_nothing_and_stays_offline) & test(=indexing_reaches_no_network_and_writes_nothing_under_the_root)) |
     (binary_id(g-mesh-plugin-typescript::semantic_runs_no_project_code) & test(=the_shipped_settings_load_no_project_typescript_or_plugin_and_run_no_npm)) |
     (binary_id(g-mesh-plugin-rust::indexing_writes_nothing_and_stays_offline) & test(=indexing_reaches_no_network_and_writes_nothing_under_the_root)) |
@@ -161,6 +162,9 @@ not (
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=source_freshness::an_edit_to_a_file_no_question_touched_reaches_the_answer_about_its_caller)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=project_extra_env::a_crate_level_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker)) |
     (binary_id(g-mesh::it) & test(=worktree_seed::a_tool_call_waits_for_the_seeded_reconcile)) |
+    (binary_id(g-mesh::it) & test(=plugin_build_staleness::a_plugin_rebuilt_under_a_running_daemon_costs_the_project_a_re_walk)) |
+    (binary_id(g-mesh::it) & test(=plugin_build_staleness::a_rebuild_of_any_discovered_plugin_retires_the_daemon_not_only_typescripts)) |
+    (binary_id(g-mesh::it) & test(=plugin_memory_limit::a_real_rust_analyzer_without_std_over_its_memory_limit_is_suspended_and_structural_work_continues)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=project_extra_env::a_root_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=project_extra_env::the_same_extra_env_through_the_client_fires_the_markers)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=source_freshness::the_answer_about_an_edited_file_follows_the_indexed_text_not_a_newer_disk)) |

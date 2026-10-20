@@ -1,7 +1,8 @@
 //! The rust-analyzer tier runs no code the indexed project supplies.
 //!
 //! A hostile workspace (`docs/design/GM-513-semantic-servers-no-project-code.md`,
-//! fixture `rfx`) is indexed through the plugin's own [`semantic::engine`],
+//! fixture `rfx`) is indexed through the plugin's own [`semantic::engine`]
+//! (via `sandboxed_engine`),
 //! with the shipped manifest and its bare `rust-analyzer` command, so the
 //! toolchain detection, the candidate list and the pinned environment are
 //! the production ones. Every hook the project offers writes a marker or a
@@ -56,6 +57,13 @@ use g_mesh_plugin_rust::project::{ProjectContext, EXCLUDE_DIRS};
 use g_mesh_plugin_rust::semantic;
 use g_mesh_plugin_sdk::wire::{SourceTier, TargetKey};
 use g_mesh_plugin_sdk::{walk_project, Extractor, RelPath, SdkIndex, MANIFEST_PATH_ENV};
+
+/// [`semantic::engine`] with the Linux sandbox trampoline run by the plugin
+/// binary, since this test binary has no trampoline entry. Other OSes
+/// ignore the launcher.
+fn sandboxed_engine(root: &Path) -> anyhow::Result<Box<dyn g_mesh_plugin_sdk::SemanticEngine>> {
+    semantic::engine_with(root, Path::new(env!("CARGO_BIN_EXE_g-mesh-plugin-rust")))
+}
 
 /// What a child test reads its fixture from, as one path list: the scratch
 /// root, then the parent's rustup proxy directory, `rustc`, `cargo` and
@@ -560,7 +568,7 @@ fn rust_analyzer_runs_no_build_script_proc_macro_toolchain_or_rustc_the_project_
         index.insert(path, source, graph);
     }
 
-    let mut engine = semantic::engine(&fixture.root).expect("the engine resolves a rust-analyzer");
+    let mut engine = crate::sandboxed_engine(&fixture.root).expect("the engine resolves a rust-analyzer");
     let answer = engine.answer(&[], &index).expect("the engine answers");
     drop(engine);
 
@@ -722,7 +730,7 @@ mod project_extra_env {
 
     /// Whether the answer resolved `thing.method()` across files: the server
     /// really indexed the fixture.
-    fn resolved_method(index: &SdkIndex, answer: &g_mesh_plugin_sdk::SemanticAnswer) -> bool {
+    pub(super) fn resolved_method(index: &SdkIndex, answer: &g_mesh_plugin_sdk::SemanticAnswer) -> bool {
         let main = index
             .graph(&RelPath::new("app/src/main.rs"))
             .expect("app/src/main.rs is indexed")
@@ -753,7 +761,7 @@ mod project_extra_env {
     ) {
         let index = index_of(&fixture.root);
         let mut engine: Box<dyn g_mesh_plugin_sdk::SemanticEngine> = match client_extra_env {
-            None => semantic::engine(&fixture.root).expect("the engine resolves a rust-analyzer"),
+            None => crate::sandboxed_engine(&fixture.root).expect("the engine resolves a rust-analyzer"),
             Some(env) => {
                 let mut config =
                     SemanticConfig::from_manifest().unwrap().expect("the manifest has [plugin.semantic]");
@@ -921,32 +929,20 @@ mod cargo_env_loader_var {
         in_its_env(child, &root, &real, None);
     }
 
-    #[test]
-    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker() {
-        loader_fixture_in_its_env(
-            "loader-env",
-            "cargo_env_loader_var::a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env",
-        );
-    }
-
-    #[test]
-    #[ignore = "run by its parent test in the fixture's environment"]
-    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env() {
-        let test =
-            "cargo_env_loader_var::a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env";
-        let Some((root, real)) = child_fixture(test) else { return };
-        let (mark, dylib) = mark_and_dylib(&root);
+    /// Writes the fixture's `.cargo/config.toml` with `[env] LOADER_VAR`
+    /// forced to the marker dylib, checks that an unpinned `cargo metadata`
+    /// in the fixture then loads it (the hostile config is live), and clears
+    /// what that run left. Returns the marker and the config file.
+    fn write_live_loader_config(root: &Path, real: &RealToolchain) -> (PathBuf, PathBuf) {
+        let (mark, dylib) = mark_and_dylib(root);
         let config = root.join(".cargo/config.toml");
         write(
             &config,
             &format!("[env]\n{LOADER_VAR} = {{ value = {:?}, force = true }}\n", dylib.to_string_lossy()),
         );
-
-        // Sanity: the hostile config is live - an unpinned `cargo metadata`
-        // in the fixture loads the dylib into the rustc it starts.
         let output = Command::new(real.proxy_dir.join("cargo"))
             .args(["metadata", "--format-version", "1"])
-            .current_dir(&root)
+            .current_dir(root)
             .output()
             .unwrap();
         assert!(
@@ -961,8 +957,26 @@ mod cargo_env_loader_var {
         );
         std::fs::remove_file(&mark).unwrap();
         let _ = std::fs::remove_file(root.join("Cargo.lock"));
+        (mark, config)
+    }
 
-        let refusal = match semantic::engine(&root) {
+    #[test]
+    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker() {
+        loader_fixture_in_its_env(
+            "loader-env",
+            "cargo_env_loader_var::a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env() {
+        let test =
+            "cargo_env_loader_var::a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env";
+        let Some((root, real)) = child_fixture(test) else { return };
+        let (mark, config) = write_live_loader_config(&root, &real);
+
+        let refusal = match crate::sandboxed_engine(&root) {
             Err(error) => Some(format!("{error:#}")),
             Ok(mut engine) => {
                 let index = {
@@ -993,6 +1007,139 @@ mod cargo_env_loader_var {
             "the engine failed, but not by refusing the [env] {LOADER_VAR} in {}: {reason}",
             config.display()
         );
+        println!("{}", ran_marker(test));
+    }
+
+    /// On macOS the server `semantic::server_config` builds runs under
+    /// Seatbelt: with the engine's cargo config pre-check bypassed, the
+    /// hostile `[env]` reaches the rustc that the server's `cargo metadata`
+    /// starts, which maps no project dylib (no marker), and the server still
+    /// resolves the workspace-local call `util::Thing.method()`.
+    ///
+    /// Controls: make `seatbelt::confine` return `Confined` without
+    /// rewriting the config; or drop `file-map-executable` from both the
+    /// profile's default deny and the project-root deny (the root deny alone
+    /// already refuses the dylib).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandboxed_server_maps_no_project_dylib_and_still_resolves() {
+        loader_fixture_in_its_env(
+            "loader-sandbox",
+            "cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env() {
+        use g_mesh_plugin_sdk::lsp::LspBridge;
+        use g_mesh_plugin_sdk::SemanticEngine;
+
+        let test =
+            "cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env";
+        let Some((root, real)) = child_fixture(test) else { return };
+        let (mark, _) = write_live_loader_config(&root, &real);
+
+        let config = semantic::server_config(&root).expect("the server config is built and confined");
+        assert_eq!(
+            config.command,
+            Path::new("/usr/bin/sandbox-exec"),
+            "the server does not start under Seatbelt: {config:?}"
+        );
+        let index = index_of(&root);
+        let mut bridge = LspBridge::new("rust", &root, config).quiescent_signal();
+        let answer = bridge.answer(&[], &index).expect("the confined server answers");
+        drop(bridge);
+
+        assert!(
+            !mark.exists(),
+            "the confined server started a rustc that loaded the project's [env] {LOADER_VAR} dylib"
+        );
+        assert!(
+            super::project_extra_env::resolved_method(&index, &answer),
+            "the confined server did not resolve `util::Thing.method()` (complete: {}, reason: {:?})",
+            answer.complete,
+            answer.reason
+        );
+        println!("{}", ran_marker(test));
+    }
+
+    /// On Linux the server `semantic::server_config_with` builds, with the
+    /// plugin binary as the trampoline, runs in the `noexec` mount namespace
+    /// (plus Landlock where the kernel has it): with the engine's cargo
+    /// config pre-check bypassed, the rustc the server's `cargo metadata`
+    /// starts cannot map the project's `[env] LD_PRELOAD` object (no
+    /// marker), and the server still resolves `util::Thing.method()`. On
+    /// GitHub Actions it must be the full tier.
+    ///
+    /// Controls: make `landlock_ns::confine` return `Confined` without
+    /// rewriting the config; or drop `policy.toolchain` from the `--allow`
+    /// list (the resolve assertion fails).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sandboxed_server_maps_no_project_dylib_and_still_resolves() {
+        if !super::linux_sandbox::host_runs_the_mount_layer(
+            "a_sandboxed_server_maps_no_project_dylib_and_still_resolves",
+        ) {
+            return;
+        }
+        loader_fixture_in_its_env(
+            "loader-sandbox",
+            "cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env() {
+        use g_mesh_plugin_sdk::lsp::LspBridge;
+        use g_mesh_plugin_sdk::SemanticEngine;
+
+        let test =
+            "cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env";
+        let Some((root, real)) = child_fixture(test) else { return };
+        let (mark, _) = write_live_loader_config(&root, &real);
+
+        let config = semantic::server_config_with(&root, Path::new(super::linux_sandbox::LAUNCHER))
+            .expect("the server config is built and confined");
+        let launched = format!("{config:?}");
+        let (command, args) = (config.command.clone(), config.args.clone());
+        let index = index_of(&root);
+        let mut bridge = LspBridge::new("rust", &root, config).quiescent_signal();
+        let answer = bridge.answer(&[], &index).expect("the confined server answers");
+        drop(bridge);
+
+        assert!(
+            !mark.exists(),
+            "the confined server started a rustc that loaded the project's [env] {LOADER_VAR} object"
+        );
+        assert!(
+            super::project_extra_env::resolved_method(&index, &answer),
+            "the confined server did not resolve `util::Thing.method()` (complete: {}, reason: {:?})",
+            answer.complete,
+            answer.reason
+        );
+
+        assert_eq!(command, Path::new(super::linux_sandbox::LAUNCHER), "{launched}");
+        assert_eq!(
+            args.get(..2),
+            Some(&["__g-mesh-sandbox".to_string(), "--layers".to_string()][..]),
+            "{launched}"
+        );
+        let layers = args[2].as_str();
+        if super::linux_sandbox::on_ci() {
+            assert_eq!(
+                layers, "mount,landlock",
+                "GitHub Actions' ubuntu-22.04 runs the full tier: {launched}"
+            );
+        } else {
+            assert!(
+                layers == "mount,landlock" || layers == "mount",
+                "the parent saw a working mount layer, but the server runs under `{layers}`: {launched}"
+            );
+        }
         println!("{}", ran_marker(test));
     }
 
@@ -1033,7 +1180,7 @@ mod cargo_env_loader_var {
         let (mark, dylib) = mark_and_dylib(&root);
         let manifest = LOADER_MANIFEST;
 
-        let mut engine = semantic::engine(&root).expect("no cargo config yet: the engine starts");
+        let mut engine = crate::sandboxed_engine(&root).expect("no cargo config yet: the engine starts");
         let index = {
             let project = ProjectContext::load(&root).expect("the fixture is a loadable Rust project");
             let mut index = SdkIndex::new();
@@ -1128,7 +1275,7 @@ mod cargo_env_loader_var {
         let Some((root, real)) = child_fixture(test) else { return };
         let (mark, dylib) = mark_and_dylib(&root);
 
-        let mut engine = semantic::engine(&root).expect("no cargo config yet: the engine starts");
+        let mut engine = crate::sandboxed_engine(&root).expect("no cargo config yet: the engine starts");
         if let Err(error) = engine.answer(&[], &index_of(&root)) {
             panic!("the first pass on a clean fixture failed: {error:#}");
         }
@@ -1277,7 +1424,7 @@ mod source_freshness {
         let test =
             "source_freshness::an_edit_to_a_file_no_question_touched_reaches_the_answer_about_its_caller_in_its_env";
         let Some((root, _real)) = child_fixture(test) else { return };
-        let mut engine = semantic::engine(&root).expect("the engine starts");
+        let mut engine = crate::sandboxed_engine(&root).expect("the engine starts");
         let before = index_of(&root);
         let first = engine.answer(&[], &before).expect("the first pass answers");
         assert_eq!(
@@ -1344,7 +1491,7 @@ mod source_freshness {
         let test =
             "source_freshness::the_answer_about_an_edited_file_follows_the_indexed_text_not_a_newer_disk_in_its_env";
         let Some((root, _real)) = child_fixture(test) else { return };
-        let mut engine = semantic::engine(&root).expect("the engine starts");
+        let mut engine = crate::sandboxed_engine(&root).expect("the engine starts");
         let before = index_of(&root);
         let first = engine.answer(&[], &before).expect("the first pass answers");
         assert_eq!(
@@ -1374,5 +1521,356 @@ mod source_freshness {
              there and `Thing::method` further down"
         );
         println!("{}", ran_marker(test));
+    }
+}
+
+/// The Linux sandbox trampoline, run as the plugin binary runs it:
+/// `g-mesh-plugin-rust __g-mesh-sandbox --layers <l> --root <r> --allow <p>… -- <server> <args…>`.
+///
+/// A test whose layer this host cannot set up (no unprivileged user
+/// namespace, Docker's default seccomp profile, a kernel without Landlock)
+/// prints why and passes, except on GitHub Actions, whose ubuntu-22.04 runner
+/// has both layers: there it fails, so a degraded runner cannot turn these
+/// tests into skips.
+#[cfg(target_os = "linux")]
+mod linux_sandbox {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Output;
+
+    use g_mesh_plugin_rust::sandbox::{self, SandboxOutcome, SandboxPolicy};
+    use g_mesh_plugin_sdk::lsp::SemanticConfig;
+
+    pub(super) const LAUNCHER: &str = env!("CARGO_BIN_EXE_g-mesh-plugin-rust");
+
+    /// `sh` exit code for a command found but not executable.
+    const DENIED: &str = "126";
+
+    pub(super) fn on_ci() -> bool {
+        std::env::var_os("GITHUB_ACTIONS").is_some()
+    }
+
+    /// Runs `server args` under the trampoline with `layers`, `root` and an
+    /// `--allow` per entry of `allow`.
+    fn trampoline(layers: &str, root: &Path, allow: &[&Path], server: &str, args: &[&OsStr]) -> Output {
+        let mut command = Command::new(LAUNCHER);
+        command.args(["__g-mesh-sandbox", "--layers", layers, "--root"]).arg(root);
+        for prefix in allow {
+            command.arg("--allow").arg(prefix);
+        }
+        command.arg("--").arg(server).args(args).output().unwrap()
+    }
+
+    fn describe(output: &Output) -> String {
+        format!(
+            "{}\n--- stdout\n{}\n--- stderr\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// `Err` with the trampoline's reason when it cannot set up `layers` here.
+    fn host_supports(layers: &str) -> Result<(), String> {
+        let scratch = Scratch::new("probe");
+        let output = trampoline(layers, &scratch.0, &[], "/bin/true", &[]);
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(describe(&output))
+        }
+    }
+
+    /// Whether `test` can run its `layers` here; prints why not, or panics
+    /// on GitHub Actions.
+    fn require(layers: &str, test: &str) -> bool {
+        match host_supports(layers) {
+            Ok(()) => true,
+            Err(why) if on_ci() => panic!("{test}: GitHub Actions' runner cannot set up `{layers}`: {why}"),
+            Err(why) => {
+                println!("{test}: skipped, this host cannot set up the `{layers}` layer: {why}");
+                false
+            }
+        }
+    }
+
+    pub(super) fn host_runs_the_mount_layer(test: &str) -> bool {
+        require("mount", test)
+    }
+
+    /// The Landlock ABI version this kernel reports, 0 without Landlock.
+    fn landlock_abi() -> i64 {
+        const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+        let abi = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<libc::c_void>(),
+                0usize,
+                LANDLOCK_CREATE_RULESET_VERSION,
+            )
+        };
+        abi.max(0)
+    }
+
+    /// A copy of `/bin/true` at `dir/true`, run once unconfined before it is
+    /// returned: exec'ing a file another thread's fork still holds open for
+    /// writing fails `ETXTBSY`.
+    fn true_in(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let copy = dir.join("true");
+        std::fs::copy("/bin/true", &copy).unwrap();
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..100 {
+            match Command::new(&copy).status() {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                result => {
+                    assert!(result.as_ref().is_ok_and(|status| status.success()), "{result:?}");
+                    return copy;
+                }
+            }
+        }
+        panic!("{} stayed busy", copy.display())
+    }
+
+    /// `sh -c` that runs each argument as a command and prints their exit
+    /// codes, space-separated.
+    const RUN_EACH: &str = "codes=; for c in \"$@\"; do \"$c\"; codes=\"$codes $?\"; done; echo $codes";
+
+    /// The exit codes of `programs`, each run under the trampoline.
+    fn exit_codes_under(layers: &str, root: &Path, allow: &[&Path], programs: &[&Path]) -> (String, Output) {
+        let mut args: Vec<&OsStr> = vec![OsStr::new("-c"), OsStr::new(RUN_EACH), OsStr::new("sh")];
+        args.extend(programs.iter().map(|program| program.as_os_str()));
+        let output = trampoline(layers, root, allow, "/bin/sh", &args);
+        (String::from_utf8_lossy(&output.stdout).trim().to_string(), output)
+    }
+
+    /// In the mount layer nothing under the root is executable, while a
+    /// copy of the same binary under an `--allow` prefix runs.
+    #[test]
+    fn the_mount_layer_execs_nothing_under_the_root() {
+        let test = "linux_sandbox::the_mount_layer_execs_nothing_under_the_root";
+        if !require("mount", test) {
+            return;
+        }
+        let scratch = Scratch::new("mount-exec");
+        let root = scratch.0.join("proj");
+        let in_root = true_in(&root.join("target/debug"));
+        let allowed = true_in(&scratch.0.join("tool"));
+
+        let (codes, output) =
+            exit_codes_under("mount", &root, &[&scratch.0.join("tool")], &[&in_root, &allowed]);
+        assert_eq!(codes, format!("{DENIED} 0"), "{}", describe(&output));
+    }
+
+    /// A root inside an allowed prefix is still `noexec`: the root's step
+    /// comes after its prefix's, while the rest of the prefix stays
+    /// executable.
+    ///
+    /// Control: drop the root's step from `mount_plan`.
+    #[test]
+    fn the_mount_layer_execs_nothing_under_a_root_inside_an_allowed_prefix() {
+        let test = "linux_sandbox::the_mount_layer_execs_nothing_under_a_root_inside_an_allowed_prefix";
+        if !require("mount", test) {
+            return;
+        }
+        let scratch = Scratch::new("mount-nested");
+        let root = scratch.0.join("proj");
+        let in_root = true_in(&root);
+        let beside = true_in(&scratch.0.join("tool"));
+
+        let (codes, output) = exit_codes_under("mount", &root, &[&scratch.0], &[&in_root, &beside]);
+        assert_eq!(codes, format!("{DENIED} 0"), "{}", describe(&output));
+    }
+
+    /// In the mount layer the loader cannot map a shared object under the
+    /// root (`LD_PRELOAD`, set inside the sandbox by `env`), and does map
+    /// the same object from an allowed prefix, whose constructor writes its
+    /// marker from inside the sandbox.
+    #[test]
+    fn the_mount_layer_maps_no_shared_object_under_the_root() {
+        let test = "linux_sandbox::the_mount_layer_maps_no_shared_object_under_the_root";
+        if !require("mount", test) {
+            return;
+        }
+        let scratch = Scratch::new("mount-preload");
+        let root = scratch.0.join("proj");
+        let tool = scratch.0.join("tool");
+        let root_mark = root.join("MARK_root_object");
+        let tool_mark = root.join("MARK_allowed_object");
+        let root_object = build_marker_dylib(&root.join("dylib"), &root_mark, "LD_PRELOAD from the root");
+        let tool_object = build_marker_dylib(&tool, &tool_mark, "LD_PRELOAD from an allowed prefix");
+        let preload = |object: &Path| format!("LD_PRELOAD={}", object.display());
+
+        let unconfined =
+            Command::new("/usr/bin/env").arg(preload(&root_object)).arg("/bin/true").status().unwrap();
+        assert!(
+            unconfined.success() && root_mark.is_file(),
+            "sanity: the root object does not load unconfined"
+        );
+        std::fs::remove_file(&root_mark).unwrap();
+
+        for object in [&root_object, &tool_object] {
+            let preload = preload(object);
+            let output = trampoline(
+                "mount",
+                &root,
+                &[&tool],
+                "/usr/bin/env",
+                &[OsStr::new(&preload), OsStr::new("/bin/true")],
+            );
+            assert!(output.status.success(), "{preload}: {}", describe(&output));
+        }
+        assert!(!root_mark.exists(), "a process in the mount layer mapped a shared object under the root");
+        assert!(
+            tool_mark.is_file(),
+            "the object under the allowed prefix did not load: the test proves nothing"
+        );
+    }
+
+    /// The server cannot undo the mount layer: even as uid 0 (root in its
+    /// user namespace) a `mount -o remount,bind,exec` of the root leaves it
+    /// `noexec`. Discriminating only when the test runs as uid 0, where the
+    /// exec'd server would otherwise keep the namespace's capabilities.
+    ///
+    /// Control (as uid 0): make `drop_capabilities` return `Ok(())` at once.
+    #[test]
+    fn a_root_server_cannot_remount_the_project_root_exec() {
+        let test = "linux_sandbox::a_root_server_cannot_remount_the_project_root_exec";
+        if !require("mount", test) {
+            return;
+        }
+        let uid = unsafe { libc::getuid() };
+        if uid != 0 {
+            println!("{test}: runs as uid {uid}; it discriminates a capability drop only as uid 0");
+        }
+        let scratch = Scratch::new("remount");
+        let root = scratch.0.join("proj");
+        let in_root = true_in(&root);
+        let script = "mount -o remount,bind,exec \"$1\" 2>&1; \"$2\"; echo \"rc=$?\"";
+        let output = trampoline(
+            "mount",
+            &root,
+            &[],
+            "/bin/sh",
+            &[OsStr::new("-c"), OsStr::new(script), OsStr::new("sh"), root.as_os_str(), in_root.as_os_str()],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.trim_end().ends_with(&format!("rc={DENIED}")), "{}", describe(&output));
+    }
+
+    /// Landlock alone allows exec only under the allowed prefixes: a binary
+    /// outside them does not run, one inside does.
+    ///
+    /// Control: give `landlock_layer` an `Execute` rule on `/`.
+    #[test]
+    fn landlock_alone_denies_exec_outside_the_allowlist() {
+        let test = "linux_sandbox::landlock_alone_denies_exec_outside_the_allowlist";
+        if !require("landlock", test) {
+            return;
+        }
+        let scratch = Scratch::new("landlock-exec");
+        let root = scratch.0.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = true_in(&scratch.0.join("elsewhere"));
+        let allowed = true_in(&scratch.0.join("tool"));
+
+        let (codes, output) =
+            exit_codes_under("landlock", &root, &[&scratch.0.join("tool")], &[&outside, &allowed]);
+        assert_eq!(codes, format!("{DENIED} 0"), "{}", describe(&output));
+    }
+
+    /// Landlock alone (ABI >= 4) refuses a TCP connect that the same shell
+    /// makes unconfined.
+    #[test]
+    fn landlock_alone_refuses_tcp_connect() {
+        let test = "linux_sandbox::landlock_alone_refuses_tcp_connect";
+        if !require("landlock", test) {
+            return;
+        }
+        let abi = landlock_abi();
+        if abi < 4 {
+            assert!(
+                !on_ci(),
+                "{test}: GitHub Actions' kernel reports Landlock ABI {abi}, which has no TCP rights"
+            );
+            println!("{test}: skipped, Landlock ABI {abi} has no TCP rights (needs 4)");
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo connected");
+        let unconfined = Command::new("/bin/bash").args(["-c", &script]).output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&unconfined.stdout).contains("connected"),
+            "sanity: bash does not connect unconfined: {}",
+            describe(&unconfined)
+        );
+
+        let scratch = Scratch::new("landlock-tcp");
+        let output =
+            trampoline("landlock", &scratch.0, &[], "/bin/bash", &[OsStr::new("-c"), OsStr::new(&script)]);
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("connected") && !output.status.success(),
+            "a process under Landlock connected over TCP: {}",
+            describe(&output)
+        );
+    }
+
+    /// `confine` picks the tier this host's layers allow: both -> full,
+    /// mount only -> mount-only, Landlock only -> `Partial`, neither ->
+    /// `Failed` naming both reasons and leaving the config alone. GitHub
+    /// Actions must get the full tier.
+    #[test]
+    fn confine_picks_the_tier_this_host_supports() {
+        let mount = host_supports("mount");
+        let landlock = host_supports("landlock");
+        let scratch = Scratch::new("tier");
+        let policy = SandboxPolicy::new(&scratch.0, []);
+        let untouched = SemanticConfig::new(Path::new("/bin/true"));
+        let mut config = untouched.clone();
+
+        let outcome = sandbox::confine(&mut config, &policy, Path::new(LAUNCHER));
+        println!("mount layer: {mount:?}\nLandlock layer: {landlock:?}\noutcome: {outcome:?}");
+        if on_ci() {
+            assert_eq!(outcome, SandboxOutcome::Confined { backend: "noexec mounts + Landlock" });
+        }
+        let layers = match (mount.is_ok(), landlock.is_ok()) {
+            (true, true) => {
+                assert_eq!(outcome, SandboxOutcome::Confined { backend: "noexec mounts + Landlock" });
+                Some("mount,landlock")
+            }
+            (true, false) => {
+                assert_eq!(outcome, SandboxOutcome::Confined { backend: "noexec mounts" });
+                Some("mount")
+            }
+            (false, true) => {
+                assert!(
+                    matches!(&outcome, SandboxOutcome::Partial { backend: "Landlock", gap }
+                        if gap.contains("noexec mount namespace cannot be set up")),
+                    "{outcome:?}"
+                );
+                Some("landlock")
+            }
+            (false, false) => {
+                assert!(
+                    matches!(&outcome, SandboxOutcome::Failed(reason)
+                        if reason.contains("noexec mount namespace cannot be set up")
+                            && reason.contains("Landlock cannot be applied")),
+                    "{outcome:?}"
+                );
+                None
+            }
+        };
+        match layers {
+            Some(layers) => {
+                assert_eq!(config.command, Path::new(LAUNCHER));
+                assert_eq!(config.args.get(1..3), Some(&["--layers".to_string(), layers.to_string()][..]));
+                assert_eq!(config.args.last().map(String::as_str), Some("/bin/true"));
+            }
+            None => assert_eq!(config, untouched, "a failed confine changed the config"),
+        }
     }
 }
