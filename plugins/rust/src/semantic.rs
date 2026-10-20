@@ -108,7 +108,10 @@ const LANGUAGE: &str = "rust";
 /// On macOS the server and every process it starts run under Seatbelt and
 /// may map or exec nothing under `root`; when the sandbox cannot be applied
 /// this returns `Err` with the reason instead of starting an unconfined
-/// server (see [`server_config`]).
+/// server (see [`server_config`]). On Linux they run in a `noexec` mount
+/// namespace plus Landlock, or whichever of the two the host supports
+/// (Landlock alone is logged as not blocking shared-object loads); with
+/// neither this returns `Err` the same way.
 pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
     if let Some(refusal) = cargo_env_loader_var(root).refusal() {
         anyhow::bail!("{refusal}");
@@ -137,10 +140,24 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
 /// On macOS the server and every child run under Seatbelt, which lets them
 /// map and exec only the toolchain and the OS, never anything under `root`;
 /// when it cannot be applied this returns `Err` with the reason, and no
-/// unsandboxed server is started. On an OS with no sandbox backend the
-/// server starts unconfined
+/// unsandboxed server is started. On Linux the plugin binary re-executes
+/// itself as a trampoline that sets up the layers and execs the server: a
+/// `noexec` mount namespace (only the toolchain and the OS executable,
+/// never `root`) plus Landlock (exec allowlist, no TCP) where both work;
+/// the mount namespace alone without Landlock; Landlock alone, logged as
+/// not blocking shared-object loads, without a usable user namespace;
+/// `Err` with neither. On an OS with no sandbox backend the server starts
+/// unconfined
 /// ([ADR 0039](../../../docs/adr/0039-rust-server-runs-under-an-os-sandbox.md)).
 pub fn server_config(root: &Path) -> Result<SemanticConfig> {
+    server_config_with(root, Path::new("/proc/self/exe"))
+}
+
+/// [`server_config`] with the Linux trampoline run by `launcher` instead of
+/// this process's own binary: a test process is not the plugin binary.
+/// Ignored on other OSes.
+#[doc(hidden)]
+pub fn server_config_with(root: &Path, launcher: &Path) -> Result<SemanticConfig> {
     let mut config = SemanticConfig::from_manifest()
         .context("reading [plugin.semantic] from this plugin's manifest")?
         .ok_or_else(|| {
@@ -170,13 +187,13 @@ pub fn server_config(root: &Path) -> Result<SemanticConfig> {
         }
     }
     let policy = SandboxPolicy::for_server(root, &toolchain, &config.command);
-    admit(sandbox::confine(&mut config, &policy), &policy)?;
+    admit(sandbox::confine(&mut config, &policy, launcher), &policy)?;
     Ok(config)
 }
 
 /// Whether the server may start after [`sandbox::confine`] reported
-/// `outcome`: a confined or a backend-less start is logged and admitted; a
-/// backend that could not confine is `Err`, so the project stays on the
+/// `outcome`: a confined, partly confined or backend-less start is logged
+/// and admitted; a backend that could not confine is `Err`, so the project stays on the
 /// structural tier rather than run an unconfined server.
 fn admit(outcome: SandboxOutcome, policy: &SandboxPolicy) -> Result<()> {
     match outcome {
@@ -187,6 +204,14 @@ fn admit(outcome: SandboxOutcome, policy: &SandboxPolicy) -> Result<()> {
                  the OS, package-manager prefixes and {}, and nothing under {}",
                 allowed.join(", "),
                 policy.project_root.display()
+            );
+            Ok(())
+        }
+        SandboxOutcome::Partial { backend, gap } => {
+            g_mesh_plugin_sdk::log_line!(
+                "[{LANGUAGE}] semantic tier: rust-analyzer runs under {backend} only; shared-object loads \
+                 from the project are not blocked ({gap}); the cargo config pre-check still refuses the \
+                 [env] loader channel"
             );
             Ok(())
         }
@@ -1203,8 +1228,8 @@ mod tests {
     #[test]
     fn the_engine_starts_the_server_with_the_pinned_env() {
         let source = include_str!("semantic.rs");
-        let engine =
-            &source[source.find("pub fn server_config(").expect("this file defines `server_config`")..];
+        let engine = &source
+            [source.find("pub fn server_config_with(").expect("this file defines `server_config_with`")..];
         let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
         assert!(body.contains("config.env.extend(pinned_env(&toolchain));"), "{body}");
     }
@@ -1757,8 +1782,8 @@ mod tests {
     #[test]
     fn the_engine_pins_the_sysroot_and_hints_after_the_pinned_env() {
         let source = include_str!("semantic.rs");
-        let engine =
-            &source[source.find("pub fn server_config(").expect("this file defines `server_config`")..];
+        let engine = &source
+            [source.find("pub fn server_config_with(").expect("this file defines `server_config_with`")..];
         let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
         let at =
             |needle: &str| body.find(needle).unwrap_or_else(|| panic!("`engine` lacks `{needle}`:\n{body}"));
@@ -1766,7 +1791,7 @@ mod tests {
         let pin = at("pin_sysroot(&mut config.initialization_options, sysroot);");
         let source = at("std_source(config.initialization_options.as_ref(), root, sysroot)");
         let hint = at("std_hint(&source, sysroot, toolchain.pin.as_deref(), rust_src_path.as_deref())");
-        let confine = at("sandbox::confine(&mut config, &policy)");
+        let confine = at("sandbox::confine(&mut config, &policy, launcher)");
         assert!(env < pin && pin < source && source < hint && hint < confine, "{body}");
         assert!(body.contains("std::env::var(\"RUST_SRC_PATH\")"), "{body}");
     }
@@ -2280,7 +2305,7 @@ mod tests {
         let policy = SandboxPolicy::new(&scratch.0, []);
         let mut config = SemanticConfig::new(&server);
 
-        let outcome = sandbox::confine(&mut config, &policy);
+        let outcome = sandbox::confine(&mut config, &policy, Path::new("/proc/self/exe"));
         assert!(
             matches!(outcome, SandboxOutcome::Failed(_)),
             "sanity: a server under the project root passed the preflight: {outcome:?}"

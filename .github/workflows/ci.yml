@@ -326,6 +326,11 @@ jobs:
             nproc
             grep -m1 'model name' /proc/cpuinfo
             free -g
+            uname -r
+            cat /sys/kernel/security/lsm || true
+            sysctl kernel.unprivileged_userns_clone || true
+            sysctl user.max_user_namespaces || true
+            sysctl kernel.apparmor_restrict_unprivileged_userns || true
           fi
 
       # GM-342. `scripts/install.ps1` is 616 lines that, until this step, had

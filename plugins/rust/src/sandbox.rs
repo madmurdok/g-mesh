@@ -12,8 +12,10 @@
 //! [`SandboxPolicy`] says what is allowed and denied, independent of the OS;
 //! [`confine`] rewrites the server's [`SemanticConfig`] so it starts under
 //! this OS's backend and reports a [`SandboxOutcome`]. On macOS the backend
-//! is Seatbelt (`sandbox-exec`); an OS with no backend leaves the config
-//! untouched and says so.
+//! is Seatbelt (`sandbox-exec`). On Linux it is the plugin binary itself as
+//! a trampoline (`landlock_ns`): a `noexec` mount namespace plus Landlock,
+//! or whichever of the two this host supports. An OS with no backend leaves
+//! the config untouched and says so.
 
 use std::path::{Path, PathBuf};
 
@@ -42,6 +44,14 @@ pub enum SandboxOutcome {
     Confined {
         /// The backend that confines it, for log lines (`"seatbelt"`).
         backend: &'static str,
+    },
+    /// The config now starts the server under a backend that blocks less
+    /// than the policy asks: `gap` says what is not blocked and why.
+    Partial {
+        /// The backend that partly confines it, for log lines.
+        backend: &'static str,
+        /// What stays open and why, for log lines.
+        gap: String,
     },
     /// No backend on this OS; the config is untouched.
     NoBackend,
@@ -87,18 +97,28 @@ impl SandboxPolicy {
 
 /// Rewrites `config` (command and args) so the server starts under this OS's
 /// sandbox, after a preflight of the wrapped command. On any outcome but
-/// [`SandboxOutcome::Confined`] the config is left as it was.
-pub fn confine(config: &mut SemanticConfig, policy: &SandboxPolicy) -> SandboxOutcome {
+/// [`SandboxOutcome::Confined`] and [`SandboxOutcome::Partial`] the config is
+/// left as it was. `launcher` is the binary that runs the Linux trampoline
+/// (`/proc/self/exe` in the plugin); other backends ignore it.
+pub fn confine(config: &mut SemanticConfig, policy: &SandboxPolicy, launcher: &Path) -> SandboxOutcome {
     #[cfg(target_os = "macos")]
     {
+        let _ = launcher;
         seatbelt::confine(config, policy)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        let _ = (config, policy);
+        landlock_ns::confine(config, policy, launcher)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (config, policy, launcher);
         SandboxOutcome::NoBackend
     }
 }
+
+#[cfg(target_os = "linux")]
+pub use landlock_ns::trampoline;
 
 /// The macOS backend: `sandbox-exec` with a profile generated from the
 /// policy. `sandbox-exec` execs the server in place, so the spawned pid is
@@ -263,6 +283,9 @@ pub(crate) mod seatbelt {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) mod landlock_ns;
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -316,7 +339,7 @@ mod tests {
     /// `confine` of a config that starts `server`, under `policy`.
     fn confine_server(server: &Path, policy: &SandboxPolicy) -> (SandboxOutcome, SemanticConfig) {
         let mut config = SemanticConfig::new(server);
-        let outcome = confine(&mut config, policy);
+        let outcome = confine(&mut config, policy, Path::new("/proc/self/exe"));
         (outcome, config)
     }
 
