@@ -1,6 +1,6 @@
 # GM-601: run rust-analyzer under a Linux sandbox (Landlock + noexec mount namespace)
 
-Status: design (slice S1), awaiting owner decisions D1-D5.
+Status: design approved (D1-D5, section 8); design delta S6 (sections 3, 3a, 6, 7) after GM-600 merged.
 Branch: `feat/GM-601-linux-landlock-sandbox` (off `release-4.14.0`).
 Parent: GM-587 D2 ("Split per OS"); macOS counterpart: GM-600 (Seatbelt).
 The code slice starts only after GM-600 is merged into the release branch.
@@ -100,7 +100,7 @@ Never allowed: the project root, a target dir outside it,
 directory; a C linker is not needed (nothing links: build scripts and proc
 macros are off).
 
-### Mount layer (in `pre_exec`, in this order)
+### Mount layer (in the trampoline, section 3a; in this order)
 
 1. `unshare(CLONE_NEWUSER | CLONE_NEWNS)`.
 2. Write `deny` to `/proc/self/setgroups`, then `"<uid> <uid> 1"` to
@@ -190,50 +190,167 @@ runs (mount-only tier); where the mount layer cannot run, there is no
 `bwrap` configuration that closes the channel, so the outcome is D2's.
 The GM-587 pre-check stays in every tier as defense in depth.
 
-## 3. Launch abstraction shared with GM-600 (assumed interface)
+## 3. Launch: through GM-600's `confine` (design delta, slice S6)
 
-The server is spawned in exactly one place, `LspClient::start`
-(`plugins/sdk/src/lsp/client.rs:225-296`), reached from
-`LspBridge::ensure_client` (`plugins/sdk/src/lsp/bridge.rs:706`) - which
-also respawns a crashed server - and one SDK unit test. `SemanticConfig`
-derives `PartialEq, Eq`, so the sandbox is **not** a config field; it rides
-on the bridge like the existing builders (`quiescent_signal`,
-`client_watches_files`). Minimal interface:
+The interface section 3 assumed (`ServerSandbox` trait, `LspBridge::sandbox`)
+is superseded by what GM-600 merged (`2f7e8f5`):
 
-```rust
-// plugins/sdk/src/lsp/sandbox.rs (new, OS-independent)
-pub trait ServerSandbox: Send + Sync + std::fmt::Debug {
-    /// The command that starts `program args` confined. The caller adds
-    /// env, current dir and stdio. Called on every (re)spawn.
-    fn command(&self, program: &Path, args: &[String]) -> anyhow::Result<std::process::Command>;
-    /// One line for the semantic-tier log, e.g. "noexec mounts + Landlock ABI 6".
-    fn describe(&self) -> String;
-}
+- `plugins/rust/src/sandbox.rs`: `SandboxPolicy { project_root, toolchain }`
+  (`:29-36`), `SandboxPolicy::for_server` (`:74-86`),
+  `confine(&mut SemanticConfig, &SandboxPolicy) -> SandboxOutcome`
+  (`:91-101`) which dispatches to `mod seatbelt` on macOS and returns
+  `NoBackend` elsewhere; the backend rewrites `config.command/args` (argv
+  wrap) after a preflight `lsp::probe(<wrapped> --version)`.
+- `plugins/rust/src/semantic.rs`: `server_config(root)` (`:143-175`) builds
+  the policy and calls `admit(sandbox::confine(..), &policy)` (`:181-203`):
+  `Confined` and `NoBackend` are logged and admitted, `Failed` is `Err`
+  (structural tier).
+- `confine`'s only callers are `server_config` and the macOS unit test
+  helper `sandbox::tests::confine_server` (g-mesh, appendix). The server is
+  spawned only by `LspClient::start` (SDK), from `LspBridge::ensure_client`
+  and one SDK unit test; `ensure_client` reuses the same `SemanticConfig` on
+  every respawn.
 
-impl LspBridge {
-    pub fn sandbox(mut self, sandbox: Arc<dyn ServerSandbox>) -> Self;
-}
-// LspClient::start(..., sandbox: Option<&dyn ServerSandbox>)
-//   -> Command::new(program) when None, sandbox.command(program, args) otherwise.
+The Linux layers need code in the child between `fork` and `exec` (unshare
+user+mount namespaces, `mount_setattr` noexec, Landlock `restrict_self`).
+An argv rewrite cannot express a `pre_exec` closure directly, hence 3a.
+
+## 3a. Route through `confine`
+
+### Options
+
+- **(a) SDK spawn hook.** `SemanticConfig` (or `LspBridge`) gains an
+  optional pre-exec hook that `LspClient::start` installs with
+  `CommandExt::pre_exec`.
+- **(b) Self-exec trampoline.** Linux `confine` rewrites argv to
+  `/proc/self/exe __g-mesh-sandbox <layers> <policy...> -- <rust-analyzer> <args...>`.
+  The plugin's `main` recognises the hidden first argument before it calls
+  the SDK's `run`, sets the layers up in-process, and `execve`s
+  rust-analyzer in place (same pid, as `sandbox-exec` does on macOS).
+
+| | (a) SDK spawn hook | (b) trampoline |
+|---|---|---|
+| Async-signal safety | The closure runs after `fork` in the multi-threaded plugin (SDK reader threads, the core loop): raw syscalls only, no allocation or locks, every `CString`, map string and the Landlock ruleset fd prepared in the parent. The `landlock` crate's `restrict_self` cannot be trusted there; error reporting is an errno only. | The layers run in a fresh, single-threaded process at the top of `main`, before the SDK starts a thread: ordinary Rust, the `landlock` crate as-is, allocation, readable error text on stderr. `unshare(CLONE_NEWUSER)` requires a single-threaded caller, which this is by construction. |
+| Restarts (`ensure_client` reuses the config) | The hook must be re-armed per spawn: a ruleset fd consumed by one child must be rebuilt (`Fn`, not `FnOnce`, plus parent-side state). | Nothing to do: the argv is data; every respawn re-runs the same layers from scratch. |
+| Preflight | `lsp::probe(command, args, budget)` takes no hook, so it either grows a hook parameter too or the plugin writes its own probe spawn. | Unchanged GM-600 shape: `lsp::probe("/proc/self/exe", [<trampoline args>, <ra>, "--version"])` runs exactly the layers the server will run. |
+| SDK API surface | New public field or builder on `SemanticConfig`/`LspBridge` and a new `LspClient::start`/`probe` parameter. `SemanticConfig` derives `Debug, Clone, PartialEq, Eq` (`config.rs:233`), which a closure field breaks, so a hand-written wrapper type is needed. `SemanticConfig` is referenced from 14 files in 4 crates (sdk, rust, python, typescript; g-mesh appendix), all built via `from_manifest`/parse (no struct literals), so the field compiles everywhere, but it is an SDK interface change for every plugin. | None. Changes stay in `plugins/rust` (`main.rs`, `sandbox.rs`, `semantic.rs`). |
+| Testability in Docker | The hook is only reachable through a real spawn; same test shape. | The trampoline is a plain process: `g-mesh-plugin-rust __g-mesh-sandbox ... -- /bin/sh -c ...` can be driven directly from an integration test (`env!("CARGO_BIN_EXE_g-mesh-plugin-rust")`), so B4/B5 need no rust-analyzer. |
+
+### Recommendation: (b) self-exec trampoline
+
+Benefit: no SDK change, no async-signal-safety constraints, restart and
+preflight come for free from GM-600's argv-wrap shape, and the trampoline
+is directly testable. It mirrors the macOS backend: `sandbox-exec` is a
+trampoline the OS ships; on Linux the plugin is its own.
+
+Risks and their handling:
+
+- **Which binary is "self".** The command is the literal `/proc/self/exe`,
+  not `current_exe()`'s path: the kernel resolves it to the running
+  plugin's inode even after an install refreshes the file on disk
+  (`~/.local/share/g-mesh/bin` is overwritten by a release build), where a
+  path would respawn the new binary or a `(deleted)` name. A host without
+  `/proc` mounted fails the preflight -> `Failed` -> structural.
+- **Integration tests are not the plugin binary.** `/proc/self/exe` in the
+  test process is the test binary. `server_config(root)` therefore becomes
+  `server_config_with(root, launcher: &Path)` (hidden `pub`, `#[doc(hidden)]`)
+  with `server_config(root)` passing `/proc/self/exe`; the Linux test
+  passes `env!("CARGO_BIN_EXE_g-mesh-plugin-rust")`. On macOS `launcher`
+  is ignored. This is a plugin-internal function, not an SDK interface;
+  no shipped switch (unlike the rejected environment variable).
+- **A hidden argv mode.** `std::env::args()` in the SDK's `run`
+  (`run.rs:115`) panics on non-UTF-8, so `main` reads `args_os()` and
+  intercepts `__g-mesh-sandbox` first; anyone invoking it only confines a
+  process they already could run unconfined, so it grants nothing.
+- **Non-UTF-8 paths.** `SemanticConfig.args` is `Vec<String>`; a policy
+  path that is not UTF-8 is `Failed` (same rule as `seatbelt::wrapper_args`).
+- **Cost.** One extra `execve` per (re)spawn; negligible next to
+  rust-analyzer's start-up.
+
+**Owner question: none.** Route (b) changes no interface outside
+`plugins/rust`. Route (a) would change the SDK (`SemanticConfig`/
+`LspBridge`, `LspClient::start`, `lsp::probe`) and would need the owner;
+it is not recommended.
+
+### Trampoline argv and exit codes
+
+```
+/proc/self/exe __g-mesh-sandbox --layers mount,landlock|mount|landlock
+    --root <project_root> --allow <prefix> [--allow <prefix>...]
+    -- <rust-analyzer> <args...>
 ```
 
-- macOS (GM-600) returns `Command::new("/usr/bin/sandbox-exec")` with
-  `-p <profile> <program> <args...>`; Linux returns `Command::new(program)`
-  with `args` and an `unsafe pre_exec` closure. `command()` is the only
-  shape that serves both: std's `Command` cannot change its program after
-  construction, and a `pre_exec` cannot rewrite argv.
-- The plugin side: `plugins/rust/src/sandbox/{mod,linux,macos}.rs`,
-  `sandbox::for_server(root, &toolchain) -> Result<Option<Arc<dyn ServerSandbox>>>`
-  (`Err` = refuse to structural with the reason; `Ok(None)` = Windows).
-- Linux builds a fresh Landlock ruleset per `command()` call, so a respawn
-  is confined like the first start.
-- Reconcile at review: if GM-600 lands a different trait name or a config
-  field, GM-601 adopts it; what GM-601 needs is only "produce the `Command`
-  for program+args, called per spawn, may fail".
+The OS prefixes (`/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, section 1)
+are the Linux backend's own, as `OS_MAP`/`OS_EXEC` are Seatbelt's; the
+`--allow` list is `policy.toolchain`. `--layers` is mandatory and exact:
+the trampoline never drops a layer on its own, so a respawn runs exactly
+the tier the preflight proved and logged, and a host that changed under a
+running plugin fails closed (the bridge reports the start failure).
+
+Distinct exit codes (the `seatbelt::failure` pattern, matched in the
+probe's `exited exit status: N` text): **70** usage error, **71** mount
+layer failed (`unshare`/`uid_map`/`mount`/`mount_setattr`, errno and step
+on stderr), **72** Landlock layer failed (ABI missing, ruleset or
+`restrict_self`), **73** `execve` of the server failed.
+
+### Tier selection mapped onto `SandboxOutcome`
+
+Linux `confine` runs a preflight ladder, at most two probes:
+
+1. `--layers mount,landlock` -> success: **full** tier.
+2. exit 72 (Landlock missing, mount layer fine) -> retry `--layers mount`
+   -> success: **mount-only**.
+3. exit 71 (mount layer cannot run) -> retry `--layers landlock`
+   -> success: **Landlock-only** (D2).
+4. second rung fails, or the first fails with 70/73/timeout -> **Failed**.
+
+`fn next_rung(tried: Layers, exit: Option<i32>) -> Option<Layers>` is pure
+(unit-tested, `--lib`); the spawning is not.
+
+| Tier | Outcome | `admit` |
+|---|---|---|
+| full | `Confined { backend: "noexec mounts + Landlock" }` | existing line, Ok |
+| mount-only | `Confined { backend: "noexec mounts" }`; `confine` logs one line `sandbox: Landlock unavailable (<stderr reason>)` | existing line, Ok |
+| Landlock-only | **new** `Partial { backend: "Landlock", gap: String }` | new line: `rust-analyzer runs under Landlock only; shared-object loads from the project are not blocked (<gap>); the cargo config pre-check still refuses the [env] loader channel`, Ok |
+| none | `Failed(reason)` (both rungs' stderr) | existing `Err` -> structural |
+| other OS | `NoBackend` | unchanged |
+
+`SandboxOutcome` gets one new variant, `Partial { backend: &'static str, gap: String }`,
+rather than a backend string on `Confined`: `admit`'s `Confined` line
+states "nothing under <root>" may be mapped, which is false for
+Landlock-only (section "Finding"), and an exhaustive `match` makes every
+future caller decide what a partial confinement means instead of treating
+it as full. Seatbelt never returns it. The variant and `admit`'s arm stay
+inside `plugins/rust`.
+
+### Test entry
+
+GM-600's `server_config` is the right entry (D4: no `engine_with`): it
+bypasses the cargo config pre-check, which lives in `engine`, and returns
+the confined config the test hands to `LspBridge::new`, exactly as the
+macOS test does (`semantic_runs_no_project_code.rs:1024-1053`). It does
+not suffice unchanged on Linux only because of the launcher (above): the
+test calls `server_config_with(&root, Path::new(env!("CARGO_BIN_EXE_g-mesh-plugin-rust")))`
+and asserts `config.args[0] == "__g-mesh-sandbox"`. `CheckedBridge`'s
+re-check is not on this path (the test builds the bridge itself), so it
+needs no option. B3's extra allowed directory is passed by pushing an
+`--allow` into the returned `config.args` before `--` (test-side, no
+production option).
+
+### What this supersedes in section 1
+
+"Crate and async-signal safety" and "Capability probe and tier selection"
+assumed a `pre_exec` closure and an `engine`-time `/bin/true` probe. Under
+(b) the layers run in the trampoline (no async-signal constraint; the
+`landlock` crate's `restrict_self` is used as-is), the probe is the
+preflight ladder above (the real server's `--version`), and the tier table
+is the one in this section. The rule sets (exec allowlist, mount steps,
+Landlock rights) are unchanged.
 
 ## 4. Test route
 
-- **Local:** Docker Desktop 28.3.2 runs (`linux x86_64`, kernel
+- **Local:** Docker Desktop 28.3.2 runs (re-checked in S6, 2026-10-20:
+  `docker info` -> `28.3.2 linux x86_64`) (`linux x86_64`, kernel
   `6.10.14-linuxkit`); no podman/colima/lima/orbstack. Its kernel is built
   **without Landlock** (`/proc/config.gz`: `# CONFIG_SECURITY_LANDLOCK is
   not set`; `CONFIG_LSM="yama,loadpin,safesetid,integrity,bpf"`). With
@@ -267,9 +384,9 @@ producing `dylib/marker.so` whose constructor appends to
 The existing sanity step (an unsandboxed `cargo metadata` fires the marker)
 stays. New in a `#[cfg(target_os = "linux")] mod linux_sandbox`:
 
-- The engine is built through a hidden test entry,
-  `semantic::engine_with(root, EngineOptions { loader_precheck: false, sandbox: SandboxMode::... , extra_exec_allowed: Vec<PathBuf> })`
-  (D4), reaching both `engine` and `CheckedBridge::checked`.
+- The config is built through GM-600's `server_config` entry (as
+  `server_config_with(root, launcher)`, section 3a), which bypasses the
+  pre-check; the test builds the bridge itself (D4 as answered).
 - The marker writes into the project root. That is only valid while the
   sandbox does not confine writes (D4 recommendation); if writes are
   confined, the marker path moves to a write-allowed directory, and B3
@@ -280,95 +397,135 @@ stays. New in a `#[cfg(target_os = "linux")] mod linux_sandbox`:
 
 ## 6. Edit map
 
-Line numbers are 1-based, from this worktree.
+Line numbers are 1-based, against this worktree after the rebase onto
+`release-4.14.0` (GM-600 merged, `2f7e8f5`). Route (b): no SDK file changes.
 
 Change:
 
-- `plugins/sdk/src/lsp/sandbox.rs` (new): `ServerSandbox` (section 3).
-  Register in `plugins/sdk/src/lsp/mod.rs`; re-export from the SDK root.
-- `plugins/sdk/src/lsp/client.rs` `LspClient::start` (`:225-296`): new
-  `sandbox: Option<&dyn ServerSandbox>` parameter; build `command` from it
-  (line `:233`), everything after unchanged.
-- `plugins/sdk/src/lsp/bridge.rs`: `LspBridge` gains a
-  `sandbox: Option<Arc<dyn ServerSandbox>>` field and a builder beside
-  `quiescent_signal` (`:602`) / `client_watches_files` (`:623`);
-  `ensure_client` (`:706`) passes it to `LspClient::start`. The SDK test
-  `the_server_runs_with_no_current_directory_exe_lookup_whatever_the_manifest_says`
-  (`client.rs:916`) passes `None`.
-- `plugins/rust/src/sandbox/mod.rs`, `linux.rs` (new): allowlist builder,
-  probe, `select_tier` (pure), `LinuxSandbox::command` with the `pre_exec`
-  closure; `macos.rs` is GM-600's.
-- `plugins/rust/src/semantic.rs` `engine` (`:105-149`): after
-  `config.env.extend(pinned_env(&toolchain))`, call
-  `sandbox::for_server(root, &toolchain)`; `Err` -> `bail!` (structural,
-  logged); `Some` -> `.sandbox(...)` on the `LspBridge` (`:147`) and add
-  `describe()` to the existing semantic-tier log line. Split into
-  `engine_with(root, EngineOptions)` (hidden) with `engine` calling it
-  with defaults.
-- `plugins/rust/src/semantic.rs` `CheckedBridge` (`:165-170`), `new`
-  (`:173-175`), `checked` (`:179-188`): carry `loader_precheck` so the
-  test entry can disable the re-check too.
-- `plugins/rust/Cargo.toml`: Linux-only `landlock`, `libc`.
-- `.github/workflows/ci.yml` "Runner state" (`:318-330`): on Linux print
-  `uname -r`, `/sys/kernel/security/lsm`, the Landlock ABI, and the userns
-  sysctls.
-- `scripts/test-linux-sandbox-docker.sh` (new, shellcheck-clean): runs the
-  `linux_sandbox` tests in `rust:1.97.1` with `seccomp=unconfined` and a
-  cached target volume.
-- `docs/adr/`: new ADR "the semantic tier runs rust-analyzer in an OS
-  sandbox" (shared with GM-600), linked from `engine`'s doc comment.
+- `plugins/rust/src/main.rs` `main` (`:11-24`): first statement
+  `if let Some(code) = g_mesh_plugin_rust::sandbox::trampoline(std::env::args_os()) { std::process::exit(code) }`
+  (`#[cfg(target_os = "linux")]`; on success `trampoline` never returns,
+  it `execve`s). Before `run(...)`, so no SDK thread exists yet.
+- `plugins/rust/src/sandbox.rs`:
+  - `SandboxOutcome` (`:38-50`): add `Partial { backend: &'static str, gap: String }`.
+  - `confine` (`:88-101`): add the `#[cfg(target_os = "linux")]` arm
+    `landlock_ns::confine(config, policy, launcher)`; `confine` gains a
+    `launcher: &Path` parameter (ignored by `seatbelt::confine`; its one
+    other caller, `tests::confine_server` `:317-321`, passes
+    `/proc/self/exe`). Module doc (`:1-16`): name the Linux backend.
+  - new `#[cfg(target_os = "linux")] pub(crate) mod landlock_ns` after
+    `mod seatbelt` (ends `:264`), or a sibling file `sandbox/linux.rs` if
+    `sandbox.rs` becomes a directory module (code slice's call; the
+    macOS module stays where it is): `OS_EXEC` prefixes,
+    `trampoline_args(policy, layers) -> Result<Vec<String>, String>`,
+    `confine` (preflight ladder via `lsp::probe`), `next_rung` (pure),
+    `failure(detail)` (exit code -> reason, as `seatbelt::failure`).
+  - new `#[cfg(target_os = "linux")] pub fn trampoline(args: ArgsOs) -> Option<i32>`:
+    parses argv, runs `mount_layer(root, allow)` then `landlock_layer(allow)`
+    per `--layers`, then `execvp`-free `execve` of the absolute server
+    path; returns the exit code (70-73) on failure, `None` when argv is not
+    a trampoline call.
+  - new `#[cfg(all(test, target_os = "linux"))] mod linux_tests` beside
+    `mod tests` (`:266-447`): `next_rung`, `trampoline_args`, `failure`.
+- `plugins/rust/src/semantic.rs`:
+  - `server_config` (`:131-175`): body moves to hidden
+    `pub fn server_config_with(root: &Path, launcher: &Path)`;
+    `server_config(root)` calls it with `Path::new("/proc/self/exe")`.
+    The `confine` call (`:173`) passes `launcher`. Doc comment: Linux tiers.
+  - `admit` (`:177-203`): new `SandboxOutcome::Partial` arm (log, `Ok`).
+  - `engine` doc comment (ends `:111`): Linux sentence beside the macOS one.
+  - the two source-reading tests that slice `server_config`'s body by the
+    needle `"pub fn server_config("` (`:1207` and
+    `the_engine_pins_the_sysroot_and_hints_after_the_pinned_env`
+    `:1758-1772`, which also finds `sandbox::confine(&mut config, &policy)`):
+    point them at `"pub fn server_config_with("` and the new `confine`
+    call text, or they read the one-line wrapper and fail.
+- `plugins/rust/Cargo.toml`: `[target.'cfg(target_os = "linux")'.dependencies]`
+  `landlock` (exact version computed by `cargo add`, not from memory) and
+  `libc` (already in `Cargo.lock` as a transitive dependency).
+- `plugins/rust/tests/semantic_runs_no_project_code.rs` `mod cargo_env_loader_var`
+  (`:888-1258`): Linux twins of the macOS pair at `:1005-1053`, plus the
+  trampoline tests (section 7), all `#[cfg(target_os = "linux")]`.
+- `.github/workflows/ci.yml` "Runner state" (`:317-329`): Linux branch
+  prints `uname -r`, `/sys/kernel/security/lsm`, the userns sysctls
+  (`kernel.unprivileged_userns_clone`, `user.max_user_namespaces`,
+  `kernel.apparmor_restrict_unprivileged_userns`, each `|| true`).
+- `scripts/test-linux-sandbox-docker.sh` (new, shellcheck-clean):
+  `rust:1.97.1`, `--security-opt seccomp=unconfined`, named target volume,
+  runs `-p g-mesh-plugin-rust --test semantic_runs_no_project_code` filtered
+  to the Linux tests and `--lib sandbox::`.
+- `docs/adr/0039-rust-server-runs-under-an-os-sandbox.md` (66 lines):
+  Decision gains the Linux backend (trampoline, layers, tiers), Consequences
+  the Landlock-only gap (D2) and "no write confinement" (D4).
 
-Read (not changed): `Toolchain` / `Toolchain::detect` (`semantic.rs:227-243`,
-`:246-272`) for `sysroot`, `rustup`, `rust_analyzer`; `cargo_home`
-(`:688-696`); `refusal` (`:546-562`); `LazyEngine`
-(`plugins/sdk/src/semantic.rs:223-240`); the test helpers `in_its_env`
-(`:192`), `child_fixture` (`:219`), `marker_dylib` (`:337`),
-`loader_fixture_in_its_env` (`:904`).
-
-Out of scope: `probe` (`plugins/sdk/src/lsp/resolve.rs:148`) runs
-`rust-analyzer --version` unsandboxed; it starts no cargo and reads no
-project config. `Toolchain::detect` runs `rustup` in a neutral dir.
+Read for context (not changed): `sandbox::seatbelt::{confine, preflight, failure}`
+(`sandbox.rs:221-264`) as the pattern; `SandboxPolicy::for_server`
+(`:74-86`); `Toolchain` (`semantic.rs:281`) / `Toolchain::detect`
+(`:300`); `lsp::probe` (`plugins/sdk/src/lsp/resolve.rs:148`, error text
+`` `--version` exited {status} ``); `LspClient::start`
+(`plugins/sdk/src/lsp/client.rs:225-296`) and `LspBridge::ensure_client`
+(`plugins/sdk/src/lsp/bridge.rs:706-750`) for env/cwd/respawn behaviour;
+`run` (`plugins/sdk/src/run.rs:113-116`) for argv handling; test helpers
+`child_fixture` (`:219`), `in_its_env` (`:192`), `ran_marker` (`:183`),
+`build_marker_dylib` (`:346`), `loader_fixture_in_its_env` (`:904`),
+`write_live_loader_config` (`:928`), `project_extra_env::resolved_method`
+(`:725`), `index_of` (`:712`).
 
 ## 7. Behaviours to pin and controls
 
-Behaviours (the tests slice pins each):
+Where: **Docker** = `scripts/test-linux-sandbox-docker.sh` locally (no
+Landlock in Docker Desktop's kernel: mount-only tier); **CI** = the
+`x86_64-unknown-linux-gnu` row on `ubuntu-22.04` (full tier). Binaries:
+**int** = `--test semantic_runs_no_project_code`, **lib** = `--lib`.
 
-- **B1** Linux, pre-check off, sandbox on (full tier on CI, mount-only in
-  Docker): indexing the `[env] LD_PRELOAD` fixture writes no marker, and
-  `util::Thing.method()` resolves (semantic tier works).
-- **B2** Same fixture, sandbox off: the marker fires (in-test sanity arm;
-  this is the task's control AC).
-- **B3** Sandbox on, `LD_PRELOAD` pointing at a copy of the marker in an
-  `extra_exec_allowed` directory: the marker fires - proves the marker can
-  load and write from inside the sandbox, so B1's silence is the denied
-  mapping.
-- **B4** `LinuxSandbox::command` running a copy of `/bin/true` placed in
-  the project root fails (`EACCES`/126) - exec from the project is denied.
-- **B5** Landlock layer alone (mount layer disabled by a test option): an
-  `execve` of a binary outside the allowlist fails. Landlock kernels only.
-- **B6** `select_tier`: Landlock missing + mount layer works -> mount-only
-  with the logged reason; both fail -> structural `Err` naming the reason;
-  Landlock present + mount layer fails -> D2's choice.
-- **B7** On CI (`GITHUB_ACTIONS` set) the probe reports the full tier;
-  otherwise the test fails.
+Behaviours (function each lives in):
 
-Controls (7; the verify slice reverts code, never the test, in a
-throwaway worktree; C1-C3, C6, C7 build in the Docker route, C4-C5 on CI):
+- **B1** Pre-check bypassed via `server_config_with`, `[env] LD_PRELOAD`
+  fixture: no marker, and `util::Thing.method()` resolves.
+  `cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env`
+  (Linux twin), int; Docker (mount-only) and CI (full).
+- **B2** Same fixture, unconfined `cargo metadata`: the marker fires
+  (existing sanity arm in `loader_fixture_in_its_env`), int.
+- **B3** Confined, marker `.so` copied into an extra `--allow` directory:
+  the marker fires - the marker can load and write inside the sandbox, so
+  B1's silence is the denied mapping.
+  `cargo_env_loader_var::an_allowed_preload_still_loads_under_the_sandbox`, int; Docker + CI.
+- **B4** The trampoline with `--layers mount` cannot exec a copy of
+  `/bin/true` placed under `--root` (exit 126 from `sh`, `EACCES`).
+  `linux_sandbox::the_trampoline_denies_exec_under_the_root`, int; Docker + CI.
+- **B5** The trampoline with `--layers landlock` cannot exec a binary
+  outside the allowlist. `linux_sandbox::landlock_alone_denies_exec_outside_the_allowlist`,
+  int; CI only (skips with a printed reason without Landlock, except
+  under `GITHUB_ACTIONS`, where it fails).
+- **B6** `next_rung`: 72 after full -> mount-only; 71 after full ->
+  Landlock-only; 70/73/`None` -> no rung; a failure on the second rung ->
+  no rung. `sandbox::linux_tests::next_rung_*`, lib; Docker.
+- **B7** `admit(Partial{..})` is `Ok` and `admit(Failed)` is `Err` naming
+  the reason. `semantic::tests::a_partial_sandbox_is_admitted_and_logged`, lib; Docker.
+- **B8** On CI, `server_config_with` returns `--layers mount,landlock`
+  (full tier). `linux_sandbox::ci_runs_the_full_tier`, int; CI only.
 
-1. **C1** `LspClient::start` ignores `sandbox` -> B1 fails (marker).
-2. **C2** skip the mount layer's `noexec` steps (keep userns + Landlock) ->
-   B1 fails on CI: pins the claim that Landlock alone does not block the
-   preload.
-3. **C3** drop the toolchain prefixes from the allowlist -> B1's
-   "resolves" assertion fails (the semantic-tier check has teeth).
-4. **C4** Landlock ruleset handles no access right -> B5 fails (CI).
-5. **C5** the probe always reports Landlock missing -> B7 fails (CI).
-6. **C6** `select_tier` maps "mount layer fails" to mount-only -> B6 fails
-   (`--lib`).
-7. **C7** don't add `extra_exec_allowed` to the allowlist -> B3 fails.
+Controls (7; the verify slice reverts code, never the test, in a throwaway
+worktree; Docker ones grouped by binary in one script, CI ones in one
+`workflow_dispatch` on a throwaway branch the owner approves pushing):
 
-C1, C3, C7 share the integration binary; C6 is `--lib`; C2/C4/C5 go in
-one CI dispatch.
+1. **C1** Linux `confine` returns `Confined` without rewriting argv ->
+   B1 fails (marker). Docker, int.
+2. **C2** `mount_layer` skips the `mount_setattr` noexec steps (userns
+   kept) -> B1 fails on CI: pins "Landlock alone does not block the
+   preload". CI, int.
+3. **C3** drop `policy.toolchain` from `--allow` -> B1's "resolves"
+   assertion fails. Docker, int.
+4. **C4** `landlock_layer` handles no access right -> B5 fails. CI, int.
+5. **C5** `next_rung` maps 71 to mount-only -> B6 fails. Docker, lib.
+6. **C6** `admit` treats `Partial` as `Failed` -> B7 fails. Docker, lib.
+7. **C7** the trampoline ignores `--allow` arguments beyond the policy's
+   (the test's extra prefix) -> B3 fails. Docker, int.
+
+Grouping: Docker int = C1, C3, C7; Docker lib = C5, C6; CI = C2, C4
+(+ B8's acceptance run). B4 has no own control: C1-style "no layers"
+fails it too, and the verify slice may add it to C1's group at no build
+cost.
 
 ## 8. Owner decisions
 
@@ -388,6 +545,8 @@ Answered 2026-10-20 (owner's chosen labels quoted):
   `sandbox::{SandboxPolicy, SandboxOutcome, confine}`; a short design delta
   after GM-600 merges decides how the Linux backend applies `pre_exec`
   through it (an SDK spawn hook vs a self-exec trampoline).
+  Decided in section 3a (slice S6): the self-exec trampoline; no SDK
+  change, so no further owner question.
 
 ### D1 - mechanism: noexec mount namespace + Landlock, no bwrap (recommended)
 
@@ -537,3 +696,32 @@ function-call edges, which the structural tier carries.
   `plugins/sdk/src/lsp/bridge.rs`, new `plugins/sdk/src/lsp/sandbox.rs`,
   `plugins/rust/src/semantic.rs`, new `plugins/rust/src/sandbox/`,
   `plugins/rust/Cargo.toml`, `plugins/rust/tests/semantic_runs_no_project_code.rs`.
+
+### Slice S6 (design delta), after the rebase onto `release-4.14.0`
+
+`select_project /Users/Valentin_Taiurskii/Projects/ClaudeProjects/g-mesh-wt-gm601`,
+`project: "g-mesh-wt-gm601"` on each call; structural tier only
+(`provenance: semanticTier absent`), direct call edges.
+
+- `find_callers LspClient::start` (id `3e9bb2ca…`) -> `LspBridge::ensure_client`
+  (`bridge.rs:706`) and the SDK test
+  `the_server_runs_with_no_current_directory_exe_lookup_whatever_the_manifest_says`
+  (`client.rs:916`); `hasMore: false`. Route (a) would touch both.
+- `find_definition LspClient::start` -> `source.text`: one
+  `Command::new(&config.command)` with args/env/`NO_CWD_EXE_LOOKUP`/cwd,
+  no hook point today.
+- `find_references SemanticConfig` (`answer: files`, id `07a23890…`) ->
+  39 references in 14 files across `plugins/sdk`, `plugins/rust`,
+  `plugins/python`, `plugins/typescript` (src and tests). Construction is
+  via `from_manifest`/parse only (grep `SemanticConfig {` finds no struct
+  literal outside `config.rs`), so a new field compiles everywhere, but it
+  is an SDK interface every plugin sees: the blast radius of route (a).
+- `find_definition SemanticConfig` -> derives `Debug, Clone, PartialEq, Eq`
+  (`config.rs:233`): a closure field needs a hand-written wrapper.
+- `find_references sandbox::confine` (id `4d7acb2c…`, after the name was
+  ambiguous with `seatbelt::confine`) -> `semantic::server_config` and
+  `sandbox::tests::confine_server`; `hasMore: false`. Adding `launcher` to
+  `confine` touches exactly these two.
+- grep (single known files, non-call-graph): `run.rs:115` (`std::env::args()`),
+  `resolve.rs:148` (`probe` error text), the `"pub fn server_config("`
+  needles in `semantic.rs` tests, `ci.yml` "Runner state".
