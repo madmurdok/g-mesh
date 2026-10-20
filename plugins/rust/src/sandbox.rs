@@ -244,13 +244,9 @@ pub(crate) mod seatbelt {
     /// parameter bound, and the server may be exec'd and map its own
     /// libraries. `Err` is the reason the sandbox cannot be applied.
     pub(crate) fn preflight(sandbox_exec: &Path, wrapped: &[String]) -> Result<(), String> {
-        match lsp::probe(sandbox_exec, wrapped, PROBE_BUDGET) {
-            Ok(version) if version == "no version reported" => {
-                Err("the confined rust-analyzer printed no version".to_string())
-            }
-            Ok(_) => Ok(()),
-            Err(err) => Err(failure(&format!("{err:#}"))),
-        }
+        lsp::probe(sandbox_exec, wrapped, PROBE_BUDGET)
+            .map(|_| ())
+            .map_err(|err| failure(&format!("{err:#}")))
     }
 
     /// The reason for a failed preflight, from the probe's error text, which
