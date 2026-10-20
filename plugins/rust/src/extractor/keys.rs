@@ -233,7 +233,9 @@ pub(crate) trait ModuleNames {
 ///     child module. Edition 2015 wrote `use` paths this way, and a *path
 ///     call* (`helpers::run()`) is written this way in every edition.
 ///  4. A bare first segment bound by one of the asking module's own `use`
-///     items, and spelled like a module rather than a type, continues from
+///     items, and spelled like a module rather than a type - or naming a
+///     container [`ProjectContext::has_container`] knows, whatever its
+///     spelling (`use a::Keys;` for `pub mod Keys`, GM-637) - continues from
 ///     wherever that `use` pointed: `use crate::a::b;` then `b::f()`.
 ///  5. Anything else whose first segment is an identifier is taken to be an
 ///     external crate; anything else at all is unresolved.
@@ -263,14 +265,19 @@ pub(crate) fn resolve_module_path(
             } else if names.declares_module(&module.key, name) {
                 format!("{}::{}", module.key, name)
             } else if let Some((container, original)) = names.imported(&module.key, name) {
-                if looks_like_type(&original) {
+                let key = format!("{container}::{original}");
+                if looks_like_type(&original) && !project.has_container(&key) {
                     // `use crate::a::Point;` then `Point::new()` - not a
                     // module path at all. The caller's type-qualified branch
                     // handles it; saying "module" here would address a
-                    // container that will never exist.
+                    // container that will never exist. A capitalized name
+                    // the project's module registry holds (`use a::Keys;`
+                    // for `pub mod Keys { … }`) is a module all the same:
+                    // Rust's one type namespace cannot also hold a type
+                    // `Keys` there (GM-637).
                     return PathTarget::Unresolved;
                 }
-                format!("{container}::{original}")
+                key
             } else {
                 return PathTarget::ExternalCrate((*name).to_string());
             }

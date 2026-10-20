@@ -109,6 +109,26 @@ fn held_lock(dir: &Path) -> File {
         .expect("nothing else holds this fixture's lock")
 }
 
+/// Polls `probe` every 10 ms until `done` accepts its value or 5 s pass, and
+/// returns the last value seen, so a failed assertion names the state it
+/// gave up on (GM-636).
+///
+/// Use it, not an immediate probe, after `drop(lock)`. A `flock` belongs to
+/// the open file description, and a child spawned by another thread of this
+/// process inherits a copy of our lock fd until its exec closes it
+/// (`O_CLOEXEC`). Lib tests share one process under `cargo test`, so a drop
+/// that lands in that window reads as still held for a few ms.
+fn eventually<T>(mut probe: impl FnMut() -> T, done: impl Fn(&T) -> bool) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let value = probe();
+        if done(&value) || std::time::Instant::now() >= deadline {
+            return value;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// A project nobody is serving and nobody has locked: a bootstrap may go
 /// ahead, and nothing is there to evict.
 #[test]
@@ -122,11 +142,8 @@ fn an_unheld_lock_reads_as_free() {
     let lock = held_lock(dir.path());
     record_serving_owner(dir.path());
     drop(lock);
-    assert_eq!(
-        inspect_daemon_lock_in(dir.path(), false).unwrap(),
-        DaemonLock::Free,
-        "a released lock is free however recently its holder was serving"
-    );
+    let state = eventually(|| inspect_daemon_lock_in(dir.path(), false).unwrap(), |s| *s == DaemonLock::Free);
+    assert_eq!(state, DaemonLock::Free, "a released lock is free however recently its holder was serving");
 }
 
 /// A daemon between taking the lock and binding its socket. Indistinguishable
@@ -880,7 +897,8 @@ fn a_rebuild_marker_counts_only_while_its_pid_lives_and_the_daemon_lock_is_held(
     assert_eq!((rebuild.pid, rebuild.command.as_str()), (std::process::id(), "init"));
 
     drop(lock);
-    assert_eq!(rebuild_in_progress_in(dir.path()).unwrap(), None, "the lock was released");
+    let rebuild = eventually(|| rebuild_in_progress_in(dir.path()).unwrap(), |r| r.is_none());
+    assert_eq!(rebuild, None, "the lock was released");
 
     let _lock = held_lock(dir.path());
     std::fs::write(&marker, format!("{}\n0\nreindex\n", exited_pid())).unwrap();
