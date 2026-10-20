@@ -2314,4 +2314,23 @@ mod tests {
         assert!(format!("{error:#}").contains("semantic tier refused"), "{error:#}");
         assert!(admit(SandboxOutcome::NoBackend, &policy).is_ok());
     }
+
+    /// A partly confined server is admitted (its gap goes to the log); a
+    /// backend that could not confine refuses with its reason.
+    ///
+    /// Control: treat `SandboxOutcome::Partial` like `Failed` in `admit`.
+    #[test]
+    fn a_partial_sandbox_is_admitted_and_a_failed_one_refused_with_its_reason() {
+        let policy = SandboxPolicy::new(Path::new("/nonexistent/g-mesh-admit-root"), []);
+        let partial = SandboxOutcome::Partial {
+            backend: "Landlock",
+            gap: "the noexec mount namespace cannot be set up: unshare: EPERM".to_string(),
+        };
+        assert!(admit(partial, &policy).is_ok(), "a Landlock-only sandbox was refused");
+
+        let error = admit(SandboxOutcome::Failed("no layer works here".to_string()), &policy)
+            .expect_err("a server that cannot be confined was admitted");
+        let error = format!("{error:#}");
+        assert!(error.contains("semantic tier refused") && error.contains("no layer works here"), "{error}");
+    }
 }

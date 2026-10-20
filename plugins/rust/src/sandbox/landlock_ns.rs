@@ -491,3 +491,388 @@ fn drop_capabilities() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn paths(list: &[&str]) -> Vec<PathBuf> {
+        list.iter().map(PathBuf::from).collect()
+    }
+
+    /// The probe error text for a trampoline that exited `code`, as
+    /// `lsp::probe` words it.
+    fn probe_error(code: i32) -> String {
+        format!("`--version` exited exit status: {code} (g-mesh sandbox: step failed)")
+    }
+
+    #[test]
+    fn next_rung_falls_back_from_the_full_tier_by_the_failed_layer() {
+        assert_eq!(next_rung(Layers::Full, Some(EXIT_LANDLOCK)), Some(Layers::Mount));
+        assert_eq!(next_rung(Layers::Full, Some(EXIT_MOUNT)), Some(Layers::Landlock));
+    }
+
+    #[test]
+    fn next_rung_ends_the_ladder_on_any_other_failure() {
+        for exit in [Some(EXIT_USAGE), Some(EXIT_EXEC), Some(EXIT_CAPS), Some(0), Some(1), None] {
+            assert_eq!(next_rung(Layers::Full, exit), None, "full tier, exit {exit:?}");
+        }
+        for tried in [Layers::Mount, Layers::Landlock] {
+            for exit in [Some(EXIT_MOUNT), Some(EXIT_LANDLOCK), Some(EXIT_CAPS), None] {
+                assert_eq!(next_rung(tried, exit), None, "{tried:?}, exit {exit:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn exit_code_reads_the_status_from_the_probe_error() {
+        assert_eq!(exit_code(&probe_error(EXIT_CAPS)), Some(EXIT_CAPS));
+        assert_eq!(exit_code(&probe_error(EXIT_MOUNT)), Some(EXIT_MOUNT));
+        assert_eq!(exit_code("`--version` exited signal: 9 (SIGKILL)"), None);
+        assert_eq!(exit_code("`--version` did not answer within 60s"), None);
+    }
+
+    #[test]
+    fn failure_names_the_step_of_each_exit_code() {
+        for (code, step) in [
+            (EXIT_USAGE, "rejected its arguments"),
+            (EXIT_MOUNT, "noexec mount namespace"),
+            (EXIT_LANDLOCK, "Landlock cannot be applied"),
+            (EXIT_EXEC, "could not exec rust-analyzer"),
+            (EXIT_CAPS, "could not drop its capabilities"),
+        ] {
+            let reason = failure(&probe_error(code));
+            assert!(reason.contains(step) && reason.contains(&probe_error(code)), "{code}: {reason}");
+        }
+    }
+
+    #[test]
+    fn prefix_over_matches_whole_path_components_only() {
+        let allowed = paths(&["/usr", "/home/u/.rustup"]);
+        assert_eq!(prefix_over(Path::new("/usr/src/proj"), &allowed), Some(&allowed[0]));
+        assert_eq!(prefix_over(Path::new("/usr"), &allowed), Some(&allowed[0]));
+        assert_eq!(prefix_over(Path::new("/home/u/.rustup/x"), &allowed), Some(&allowed[1]));
+        assert_eq!(prefix_over(Path::new("/usrlocal/proj"), &allowed), None);
+        assert_eq!(prefix_over(Path::new("/home/u/.rustup-proj"), &allowed), None);
+        assert_eq!(prefix_over(Path::new("/home/u"), &allowed), None);
+        assert_eq!(prefix_over(Path::new("/usr/src/proj"), &[]), None);
+    }
+
+    #[test]
+    fn mount_plan_rebinds_every_prefix_exec_and_the_root_noexec_most_specific_last() {
+        let root = Path::new("/home/u/proj");
+        let allowed = paths(&["/usr", "/home/u", "/opt/toolchains/stable-x86_64"]);
+        let plan = mount_plan(root, &allowed);
+
+        assert_eq!(plan.len(), allowed.len() + 1, "{plan:?}");
+        for prefix in &allowed {
+            assert!(
+                plan.contains(&(prefix.clone(), true)),
+                "{} is not rebound exec: {plan:?}",
+                prefix.display()
+            );
+        }
+        assert!(plan.contains(&(root.to_path_buf(), false)), "the root is not made noexec: {plan:?}");
+        assert!(
+            plan.windows(2).all(|pair| pair[0].0.as_os_str().len() <= pair[1].0.as_os_str().len()),
+            "the steps are not ascending by path length: {plan:?}"
+        );
+        let at = |path: &str| plan.iter().position(|(step, _)| step == Path::new(path)).unwrap();
+        assert!(at("/home/u") < at("/home/u/proj"), "the root's noexec does not follow its prefix: {plan:?}");
+    }
+
+    #[test]
+    fn mount_plan_makes_a_root_that_is_itself_an_allowed_prefix_noexec_last() {
+        let root = Path::new("/srv/proj");
+        let plan = mount_plan(root, &paths(&["/srv/proj", "/usr"]));
+        assert_eq!(plan.last(), Some(&(root.to_path_buf(), false)), "{plan:?}");
+    }
+
+    fn policy(root: &str, toolchain: &[&str]) -> SandboxPolicy {
+        SandboxPolicy { project_root: PathBuf::from(root), toolchain: paths(toolchain) }
+    }
+
+    fn os(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn the_trampoline_argv_round_trips_paths_with_spaces_and_server_args_with_dashes() {
+        let policy = policy("/tmp/a project/--root", &["/opt/tool chain", "/home/u/-x"]);
+        let server_args = ["--log-file", "-v", "--", "--layers", "landlock"];
+        for layers in [Layers::Full, Layers::Mount, Layers::Landlock] {
+            let mut argv: Vec<OsString> =
+                trampoline_args(&policy, layers).unwrap().into_iter().map(OsString::from).collect();
+            assert_eq!(argv[0], TRAMPOLINE_ARG);
+            argv.push("/opt/tool chain/rust-analyzer".into());
+            argv.extend(os(&server_args));
+
+            let invocation = parse(argv.into_iter().skip(1)).unwrap();
+            assert_eq!(
+                invocation,
+                Invocation {
+                    layers,
+                    root: policy.project_root.clone(),
+                    allow: policy.toolchain.clone(),
+                    server: PathBuf::from("/opt/tool chain/rust-analyzer"),
+                    args: os(&server_args),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parse_refuses_an_incomplete_or_unknown_argv() {
+        let cases: [&[&str]; 8] = [
+            &["--layers", "mount", "--root", "/r", "/bin/true"],
+            &["--layers", "mount", "--root", "/r", "--"],
+            &["--layers", "mount", "--root", "/r", "--", "true"],
+            &["--layers", "mount,landlock,seccomp", "--root", "/r", "--", "/bin/true"],
+            &["--layers", "mount", "--root", "/r", "--net", "off", "--", "/bin/true"],
+            &["--root", "/r", "--", "/bin/true"],
+            &["--layers", "mount", "--", "/bin/true"],
+            &["--layers", "mount", "--root"],
+        ];
+        for case in cases {
+            assert!(parse(os(case)).is_err(), "{case:?} parsed");
+        }
+    }
+
+    #[test]
+    fn trampoline_args_refuses_a_path_that_is_not_utf8() {
+        let mut bad = policy("/r", &[]);
+        bad.toolchain.push(PathBuf::from(OsString::from_vec(b"/opt/\xff".to_vec())));
+        assert!(trampoline_args(&bad, Layers::Full).is_err());
+    }
+
+    #[test]
+    fn the_trampoline_runs_only_on_its_own_argument_and_rejects_bad_argv_before_any_layer() {
+        assert_eq!(trampoline(os(&["g-mesh-plugin-rust"])), None);
+        assert_eq!(trampoline(os(&["g-mesh-plugin-rust", "serve", TRAMPOLINE_ARG])), None);
+        let usage = trampoline(os(&[
+            "g-mesh-plugin-rust",
+            TRAMPOLINE_ARG,
+            "--layers",
+            "none",
+            "--root",
+            "/r",
+            "--",
+            "/bin/true",
+        ]));
+        assert_eq!(usage, Some(EXIT_USAGE));
+        let relative = trampoline(os(&[
+            "g-mesh-plugin-rust",
+            TRAMPOLINE_ARG,
+            "--layers",
+            "mount",
+            "--root",
+            "/r",
+            "--",
+            "true",
+        ]));
+        assert_eq!(relative, Some(EXIT_USAGE));
+    }
+
+    /// A stand-in launcher: it records each `--layers` it is asked for in
+    /// `<root>/tried` and exits with the code in `<root>/exit-<layers>`, 0
+    /// when there is none; called without the trampoline argument it exits
+    /// 0. Written once per user to a fixed path and run once before it is
+    /// returned: exec'ing a file another thread's fork still holds open for
+    /// writing fails `ETXTBSY`.
+    fn fake_launcher() -> &'static Path {
+        static LAUNCHER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        LAUNCHER.get_or_init(|| {
+            const SCRIPT: &str = "#!/bin/sh\n[ \"$1\" = __g-mesh-sandbox ] || exit 0\n\
+                 echo \"$3\" >> \"$5/tried\"\n\
+                 code=$(cat \"$5/exit-$3\" 2>/dev/null) || code=0\n\
+                 echo \"g-mesh sandbox: fake failure of $3\" >&2\n\
+                 exit \"$code\"\n";
+            let dir = std::env::temp_dir()
+                .join(format!("g-mesh-landlock-ns-fake-launcher-{}", unsafe { libc::getuid() }));
+            std::fs::create_dir_all(&dir).unwrap();
+            let launcher = dir.join("launcher");
+            if std::fs::read_to_string(&launcher).ok().as_deref() != Some(SCRIPT) {
+                let staged = dir.join(format!("launcher.{}", std::process::id()));
+                std::fs::write(&staged, SCRIPT).unwrap();
+                std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+                std::fs::rename(&staged, &launcher).unwrap();
+            }
+            for _ in 0..100 {
+                match std::process::Command::new(&launcher).status() {
+                    Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                        std::thread::sleep(std::time::Duration::from_millis(20))
+                    }
+                    result => {
+                        assert!(result.as_ref().is_ok_and(|status| status.success()), "{result:?}");
+                        return launcher;
+                    }
+                }
+            }
+            panic!("{} stayed busy", launcher.display())
+        })
+    }
+
+    /// A scratch directory that removes itself.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("g-mesh-landlock-ns-{name}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("proj")).unwrap();
+            Scratch(dir.canonicalize().unwrap())
+        }
+
+        fn root(&self) -> PathBuf {
+            self.0.join("proj")
+        }
+
+        /// Writes the exit code [`fake_launcher`] gives each tier in `exits`.
+        fn fail(&self, exits: &[(Layers, i32)]) {
+            for (layers, code) in exits {
+                std::fs::write(self.root().join(format!("exit-{}", layers.as_arg())), code.to_string())
+                    .unwrap();
+            }
+        }
+
+        fn tried(&self) -> Vec<String> {
+            std::fs::read_to_string(self.root().join("tried"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const SERVER: &str = "/opt/ra/rust-analyzer";
+
+    fn server_config() -> SemanticConfig {
+        let mut config = SemanticConfig::new(Path::new(SERVER));
+        config.args = vec!["--log-file".to_string(), "/tmp/a b".to_string()];
+        config
+    }
+
+    /// `confine` through a launcher that fails each tier in `exits`.
+    fn confine_with(
+        scratch: &Scratch,
+        toolchain: Vec<PathBuf>,
+        exits: &[(Layers, i32)],
+    ) -> (SandboxOutcome, SemanticConfig, SandboxPolicy) {
+        scratch.fail(exits);
+        let launcher = fake_launcher();
+        let policy = SandboxPolicy { project_root: scratch.root(), toolchain };
+        let mut config = server_config();
+        let outcome = confine(&mut config, &policy, launcher);
+        (outcome, config, policy)
+    }
+
+    fn assert_rewritten(config: &SemanticConfig, policy: &SandboxPolicy, layers: Layers) {
+        let mut expected = trampoline_args(policy, layers).unwrap();
+        expected.push(SERVER.to_string());
+        expected.extend(server_config().args);
+        assert_eq!(config.command, fake_launcher());
+        assert_eq!(config.args, expected);
+    }
+
+    #[test]
+    fn confine_runs_the_full_tier_when_its_preflight_passes() {
+        let scratch = Scratch::new("full");
+        let (outcome, config, policy) = confine_with(&scratch, vec![], &[]);
+        assert_eq!(outcome, SandboxOutcome::Confined { backend: "noexec mounts + Landlock" });
+        assert_rewritten(&config, &policy, Layers::Full);
+        assert_eq!(scratch.tried(), ["mount,landlock"]);
+    }
+
+    #[test]
+    fn confine_falls_back_to_the_mount_layer_without_landlock() {
+        let scratch = Scratch::new("mount-only");
+        let (outcome, config, policy) = confine_with(&scratch, vec![], &[(Layers::Full, EXIT_LANDLOCK)]);
+        assert_eq!(outcome, SandboxOutcome::Confined { backend: "noexec mounts" });
+        assert_rewritten(&config, &policy, Layers::Mount);
+        assert_eq!(scratch.tried(), ["mount,landlock", "mount"]);
+    }
+
+    #[test]
+    fn confine_falls_back_to_landlock_alone_as_partial_with_the_mount_failure_as_gap() {
+        let scratch = Scratch::new("landlock-only");
+        let (outcome, config, policy) = confine_with(&scratch, vec![], &[(Layers::Full, EXIT_MOUNT)]);
+        let SandboxOutcome::Partial { backend, gap } = outcome else {
+            panic!("the Landlock-only tier is not Partial: {outcome:?}")
+        };
+        assert_eq!(backend, "Landlock");
+        assert!(gap.contains("noexec mount namespace cannot be set up"), "{gap}");
+        assert!(!gap.contains("exec of project binaries"), "the root lies under no allowed prefix: {gap}");
+        assert_rewritten(&config, &policy, Layers::Landlock);
+        assert_eq!(scratch.tried(), ["mount,landlock", "landlock"]);
+    }
+
+    #[test]
+    fn a_landlock_only_gap_names_project_exec_when_the_root_lies_under_an_allowed_prefix() {
+        let scratch = Scratch::new("landlock-under");
+        let (outcome, _, _) = confine_with(&scratch, vec![scratch.0.clone()], &[(Layers::Full, EXIT_MOUNT)]);
+        let SandboxOutcome::Partial { gap, .. } = outcome else {
+            panic!("the Landlock-only tier is not Partial: {outcome:?}")
+        };
+        assert!(
+            gap.contains("exec of project binaries is not blocked")
+                && gap.contains(&scratch.root().display().to_string())
+                && gap.contains(&format!("allowed prefix {}", scratch.0.display())),
+            "{gap}"
+        );
+    }
+
+    #[test]
+    fn confine_fails_with_both_reasons_when_neither_layer_works() {
+        let scratch = Scratch::new("neither");
+        let (outcome, config, _) =
+            confine_with(&scratch, vec![], &[(Layers::Full, EXIT_MOUNT), (Layers::Landlock, EXIT_LANDLOCK)]);
+        let SandboxOutcome::Failed(reason) = outcome else { panic!("not Failed: {outcome:?}") };
+        assert!(
+            reason.contains("noexec mount namespace cannot be set up")
+                && reason.contains("Landlock cannot be applied"),
+            "{reason}"
+        );
+        assert_eq!(config, server_config(), "a failed confine changed the config");
+        assert_eq!(scratch.tried(), ["mount,landlock", "landlock"]);
+    }
+
+    #[test]
+    fn confine_fails_without_a_fallback_on_a_second_rung_failure() {
+        let scratch = Scratch::new("mount-fails");
+        let (outcome, config, _) =
+            confine_with(&scratch, vec![], &[(Layers::Full, EXIT_LANDLOCK), (Layers::Mount, EXIT_MOUNT)]);
+        assert!(matches!(outcome, SandboxOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(config, server_config());
+        assert_eq!(scratch.tried(), ["mount,landlock", "mount"]);
+    }
+
+    #[test]
+    fn confine_fails_at_once_on_a_usage_exec_or_capability_failure() {
+        for (code, step) in [
+            (EXIT_CAPS, "could not drop its capabilities"),
+            (EXIT_USAGE, "rejected its arguments"),
+            (EXIT_EXEC, "could not exec rust-analyzer"),
+        ] {
+            let scratch = Scratch::new("no-fallback");
+            let (outcome, config, _) = confine_with(&scratch, vec![], &[(Layers::Full, code)]);
+            let SandboxOutcome::Failed(reason) = outcome else {
+                panic!("exit {code} is not Failed: {outcome:?}")
+            };
+            assert!(reason.contains(step), "exit {code}: {reason}");
+            assert_eq!(config, server_config(), "exit {code}: a failed confine changed the config");
+            assert_eq!(scratch.tried(), ["mount,landlock"], "exit {code} tried a fallback");
+        }
+    }
+}
