@@ -115,6 +115,8 @@ the pipeline takes 40 s to open its SQLite cache; with A the test passes after
 of A: a future bug that hangs the pipeline before the weights is caught by the
 runner's timeout, not by the test's own message. Recommended: A.
 
+**Decided:** owner chose "A: без 30-с лимита (Recommended)" (2026-10-20).
+
 ## 5. Edit map (option A)
 
 - `core/src/embedding/pipeline.rs`, test
@@ -126,6 +128,10 @@ runner's timeout, not by the test's own message. Recommended: A.
   the FIFO forever). Nothing else changes; no production code.
 
 ## 6. Control
+
+Verify (GM-641/S5) found `SBThread.Suspend()` is not honored on macOS (the
+thread kept running); the working form parks the computing thread by setting
+its pc to a `jmp .` loop for 35 s, then restoring it. Same outcome as below.
 
 Hold the computing thread, not the process: in the lldb callback, take
 `frame.GetThread()`, `Suspend()` it, continue the process, and from a Python
