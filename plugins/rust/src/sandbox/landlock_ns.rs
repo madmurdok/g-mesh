@@ -15,6 +15,10 @@
 //!   prefixes, and no TCP bind or connect. Landlock does not check
 //!   `mmap(PROT_EXEC)`, so on its own it blocks execs, not library loads.
 //!
+//! In every tier the trampoline then drops all capabilities and sets
+//! `no_new_privs`, so the server cannot undo a layer (root in its user
+//! namespace could otherwise remount the root `exec`).
+//!
 //! [`confine`] proves a tier with a `--version` preflight, trying the full
 //! tier first and one fallback chosen by [`next_rung`]
 //! ([ADR 0039](../../../../docs/adr/0039-rust-server-runs-under-an-os-sandbox.md)).
@@ -42,6 +46,7 @@ pub(crate) const EXIT_USAGE: i32 = 70;
 pub(crate) const EXIT_MOUNT: i32 = 71;
 pub(crate) const EXIT_LANDLOCK: i32 = 72;
 pub(crate) const EXIT_EXEC: i32 = 73;
+pub(crate) const EXIT_CAPS: i32 = 74;
 
 /// Which layers the trampoline sets up. It sets up exactly these or fails:
 /// it never drops one on its own, so a respawn runs the tier the preflight
@@ -81,7 +86,8 @@ impl Layers {
 /// The tier to try after `tried` failed its preflight with the trampoline's
 /// `exit` code: Landlock missing after the full tier -> mount only; the
 /// mount layer failing after the full tier -> Landlock only. Anything else
-/// (a usage or exec failure, a timeout, a failed fallback) ends the ladder.
+/// (a usage, capability-drop or exec failure, a timeout, a failed fallback)
+/// ends the ladder.
 pub(crate) fn next_rung(tried: Layers, exit: Option<i32>) -> Option<Layers> {
     match (tried, exit) {
         (Layers::Full, Some(EXIT_LANDLOCK)) => Some(Layers::Mount),
@@ -127,6 +133,7 @@ pub(crate) fn failure(detail: &str) -> String {
         Some(EXIT_MOUNT) => format!("the noexec mount namespace cannot be set up: {detail}"),
         Some(EXIT_LANDLOCK) => format!("Landlock cannot be applied: {detail}"),
         Some(EXIT_EXEC) => format!("the sandbox could not exec rust-analyzer: {detail}"),
+        Some(EXIT_CAPS) => format!("the sandbox could not drop its capabilities: {detail}"),
         _ => format!("the confined rust-analyzer did not start: {detail}"),
     }
 }
@@ -163,7 +170,20 @@ pub(crate) fn confine(
                         );
                         SandboxOutcome::Confined { backend: "noexec mounts" }
                     }
-                    Layers::Landlock => SandboxOutcome::Partial { backend: "Landlock", gap: earlier },
+                    Layers::Landlock => {
+                        let root = std::fs::canonicalize(&policy.project_root)
+                            .unwrap_or_else(|_| policy.project_root.clone());
+                        let gap = match prefix_over(&root, &allowed_prefixes(&policy.toolchain)) {
+                            Some(prefix) => format!(
+                                "{earlier}; exec of project binaries is not blocked either: the project \
+                                 root {} lies under the allowed prefix {}",
+                                root.display(),
+                                prefix.display()
+                            ),
+                            None => earlier,
+                        };
+                        SandboxOutcome::Partial { backend: "Landlock", gap }
+                    }
                 };
             }
             Err(err) => {
@@ -260,6 +280,10 @@ pub fn trampoline(args: impl IntoIterator<Item = OsString>) -> Option<i32> {
             return Some(EXIT_LANDLOCK);
         }
     }
+    if let Err(reason) = drop_capabilities() {
+        g_mesh_plugin_sdk::log_line!("g-mesh sandbox: capabilities: {reason}");
+        return Some(EXIT_CAPS);
+    }
     let error = std::process::Command::new(&invocation.server).args(&invocation.args).exec();
     g_mesh_plugin_sdk::log_line!("g-mesh sandbox: exec {}: {error}", invocation.server.display());
     Some(EXIT_EXEC)
@@ -276,6 +300,13 @@ fn allowed_prefixes(extra: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
     prefixes
+}
+
+/// The allowed prefix `root` lies under, if any: Landlock grants exec
+/// beneath a prefix and has no deny inside a grant, so in the Landlock-only
+/// tier the project's own binaries are exec'able there.
+pub(crate) fn prefix_over<'a>(root: &Path, allowed: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    allowed.iter().find(|prefix| root.starts_with(prefix))
 }
 
 /// The mount layer's per-path steps, in the order they are applied:
@@ -392,6 +423,71 @@ fn landlock_layer(allowed: &[PathBuf]) -> Result<(), String> {
             other => format!("not enforced ({other:?})"),
         };
         return Err(format!("Landlock unavailable: {why}"));
+    }
+    Ok(())
+}
+
+/// `struct __user_cap_header_struct` for `capset`.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+/// `struct __user_cap_data_struct`; version 3 takes two of them.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// Leaves this process, and everything it execs, with no capabilities:
+/// the bounding set and the ambient set cleared, the effective, permitted
+/// and inheritable sets zeroed, and `no_new_privs` set so no setuid or
+/// file-capability binary grants any back. Runs after both layers (the
+/// mount layer needs the namespace's capabilities) and before the exec.
+///
+/// The bounding set can only be cleared holding `CAP_SETPCAP`; without it
+/// (Landlock-only tier, unprivileged user) a failure is accepted only when
+/// neither the real nor the effective uid is 0, because only a root exec
+/// fills the permitted set from the bounding set.
+fn drop_capabilities() -> Result<(), String> {
+    let mut bounding_error = None;
+    for cap in 0.. {
+        let held = unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap as libc::c_ulong, 0, 0, 0) };
+        if held < 0 {
+            // EINVAL: past the kernel's last capability.
+            break;
+        }
+        if held == 1
+            && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) } != 0
+            && bounding_error.is_none()
+        {
+            bounding_error = Some(errno(&format!("PR_CAPBSET_DROP {cap}")));
+        }
+    }
+    if let Some(error) = bounding_error {
+        if unsafe { libc::getuid() == 0 || libc::geteuid() == 0 } {
+            return Err(error);
+        }
+    }
+    let clear_ambient = unsafe {
+        libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong, 0, 0, 0)
+    };
+    if clear_ambient != 0 {
+        return Err(errno("PR_CAP_AMBIENT_CLEAR_ALL"));
+    }
+    let header = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+    let data = [CapData::default(); 2];
+    if unsafe { libc::syscall(libc::SYS_capset, &header as *const CapHeader, data.as_ptr()) } != 0 {
+        return Err(errno("capset"));
+    }
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) } != 0 {
+        return Err(errno("PR_SET_NO_NEW_PRIVS"));
     }
     Ok(())
 }

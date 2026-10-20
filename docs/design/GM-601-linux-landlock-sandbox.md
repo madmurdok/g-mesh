@@ -291,7 +291,16 @@ Distinct exit codes (the `seatbelt::failure` pattern, matched in the
 probe's `exited exit status: N` text): **70** usage error, **71** mount
 layer failed (`unshare`/`uid_map`/`mount`/`mount_setattr`, errno and step
 on stderr), **72** Landlock layer failed (ABI missing, ruleset or
-`restrict_self`), **73** `execve` of the server failed.
+`restrict_self`), **73** `execve` of the server failed, **74** dropping
+capabilities failed. After the layers and before the `execve` the
+trampoline clears the bounding and ambient sets, zeroes the effective,
+permitted and inheritable sets and sets `no_new_privs`, in every tier: with
+the identity uid map a uid-0 plugin (Docker, CI) is root in its user
+namespace, and with its capabilities the server could `mount -o
+remount,bind,exec` the root in the mount-only tier. A bounding-set drop
+refused for lack of `CAP_SETPCAP` (Landlock-only tier, unprivileged user)
+is accepted when neither uid is 0, since only a root exec refills the
+permitted set from it; otherwise it exits 74.
 
 ### Tier selection mapped onto `SandboxOutcome`
 
@@ -302,7 +311,7 @@ Linux `confine` runs a preflight ladder, at most two probes:
    -> success: **mount-only**.
 3. exit 71 (mount layer cannot run) -> retry `--layers landlock`
    -> success: **Landlock-only** (D2).
-4. second rung fails, or the first fails with 70/73/timeout -> **Failed**.
+4. second rung fails, or the first fails with 70/73/74/timeout -> **Failed**.
 
 `fn next_rung(tried: Layers, exit: Option<i32>) -> Option<Layers>` is pure
 (unit-tested, `--lib`); the spawning is not.

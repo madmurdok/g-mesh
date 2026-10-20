@@ -64,8 +64,12 @@ rules apply to every descendant.
   needs anyway), and every respawn re-runs the same layers from the argv.
   `/proc/self/exe`, not a path, so a respawn after an install refreshed the
   binary still runs the binary that proved the tier. The trampoline exits
-  70 (usage), 71 (mount layer), 72 (Landlock layer) or 73 (exec), and never
-  drops a layer on its own.
+  70 (usage), 71 (mount layer), 72 (Landlock layer), 73 (exec) or 74
+  (capability drop), and never drops a layer on its own. Before the exec it
+  drops every capability (bounding, ambient, effective, permitted,
+  inheritable) and sets `no_new_privs` in every tier: the identity uid map
+  leaves a uid-0 plugin root in its user namespace, and a server keeping
+  those capabilities could remount the project root `exec`.
 - **D1 A - a `noexec` mount namespace plus Landlock, no `bwrap`.**
   Landlock's `EXECUTE` right is not checked by `mmap(PROT_EXEC)`, so it
   cannot stop `LD_PRELOAD`/`dlopen` of a project shared object; a
@@ -86,7 +90,9 @@ rules apply to every descendant.
   "Landlock unavailable" logged; mount layer failing (71: userns disabled,
   AppArmor's userns restriction, kernel < 5.12, a seccomp profile) ->
   **D2 A - Landlock only**, `SandboxOutcome::Partial`, admitted with a log
-  line saying shared-object loads from the project are not blocked;
+  line saying shared-object loads from the project are not blocked, and,
+  when the project root lies under an allowed prefix, that exec of its
+  binaries is not blocked either;
   neither -> `Failed`, structural tier. `Partial` is its own variant so
   every `match` decides what partial confinement means.
 
