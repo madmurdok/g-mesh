@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Runs the Rust plugin's Linux sandbox tests (`sandbox::landlock_ns` unit
-# tests, the `linux_sandbox` and `cargo_env_loader_var` Linux tests of
-# `semantic_runs_no_project_code`) in Docker, from a macOS or Linux host.
+# tests, `semantic::tests::a_partial_sandbox_is_admitted`) and every
+# integration binary that starts the sandboxed semantic engine
+# (`semantic_runs_no_project_code`, `indexing_writes_nothing_and_stays_offline`,
+# `conformance`) in Docker, from a macOS or Linux host.
 #
 #   scripts/test-linux-sandbox-docker.sh [runs]
 #
@@ -10,6 +12,8 @@
 #   2. as uid 1000, with `seccomp=unconfined`;
 #   3. once as uid 1000 under Docker's default seccomp profile, where no
 #      user namespace can be made: the tier test then expects `Failed`.
+#      Only the sandbox tests run here, since a server needing the layers
+#      cannot start.
 # Tests needing Landlock print a skip line where the kernel lacks it (Docker
 # Desktop's does); those lines are listed at the end.
 #
@@ -30,6 +34,11 @@ registry_volume="$prefix-registry"
 
 lib_filter=(sandbox::landlock_ns semantic::tests::a_partial_sandbox_is_admitted)
 int_filter=(linux_sandbox:: cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves)
+engine_tests=(semantic_runs_no_project_code indexing_writes_nothing_and_stays_offline conformance)
+engine_args=""
+for t in "${engine_tests[@]}"; do
+	engine_args="$engine_args --test $t"
+done
 
 docker build -q -t "$tag" - >/dev/null <<EOF
 FROM $image
@@ -50,8 +59,10 @@ in_container() {
 		-v "$src:/src:ro" -w /src "$tag" bash -c "$command"
 }
 
-tests="cargo test -p g-mesh-plugin-rust --locked --lib -- ${lib_filter[*]} --show-output \
+sandbox_tests="cargo test -p g-mesh-plugin-rust --locked --lib -- ${lib_filter[*]} --show-output \
 	&& cargo test -p g-mesh-plugin-rust --locked --test semantic_runs_no_project_code -- ${int_filter[*]} --show-output"
+all_tests="cargo test -p g-mesh-plugin-rust --locked --lib -- ${lib_filter[*]} --show-output \
+	&& cargo test -p g-mesh-plugin-rust --locked$engine_args -- --show-output"
 # A uid-1000 run must be able to write what a root build left.
 open_up="chmod -R a+rwX /target /usr/local/cargo/registry"
 
@@ -59,7 +70,9 @@ log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 
 echo "build ($image)"
-in_container 0 unconfined "cargo test -p g-mesh-plugin-rust --locked --lib --test semantic_runs_no_project_code --no-run && $open_up" \
+# `conformance` drives the plugin through the `g-mesh` binary's kit.
+in_container 0 unconfined "cargo build -p g-mesh --bin g-mesh --locked \
+	&& cargo test -p g-mesh-plugin-rust --locked --lib$engine_args --no-run && $open_up" \
 	>"$log" 2>&1 || {
 	cat "$log"
 	echo "FAIL build"
@@ -67,7 +80,7 @@ in_container 0 unconfined "cargo test -p g-mesh-plugin-rust --locked --lib --tes
 }
 
 pass() {
-	local name="$1" user="$2" seccomp="$3" n="$4" i
+	local name="$1" user="$2" seccomp="$3" n="$4" tests="$5" i
 	for i in $(seq 1 "$n"); do
 		if ! in_container "$user" "$seccomp" "$tests; status=\$?; [ $user = 0 ] && $open_up; exit \$status" >"$log" 2>&1; then
 			cat "$log"
@@ -80,7 +93,7 @@ pass() {
 	echo "PASS $name x$n"
 }
 
-pass root 0 unconfined "$runs"
-pass uid1000 1000 unconfined "$runs"
-pass uid1000-default-seccomp 1000 default 1
+pass root 0 unconfined "$runs" "$all_tests"
+pass uid1000 1000 unconfined "$runs" "$all_tests"
+pass uid1000-default-seccomp 1000 default 1 "$sandbox_tests"
 echo "PASS all"

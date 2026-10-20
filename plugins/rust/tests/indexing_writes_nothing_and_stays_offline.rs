@@ -3,9 +3,9 @@
 //! (`docs/design/GM-512-plugins-no-writes-no-network.md` §3, ADR 0033).
 //!
 //! Two fixtures run in sequence through the plugin's own
-//! [`semantic::engine`], with the shipped manifest, so the toolchain pin, the
-//! pinned environment and the initialization options are the production
-//! ones:
+//! [`semantic::engine`] (via `sandboxed_engine`), with the shipped
+//! manifest, so the toolchain pin, the pinned environment and the
+//! initialization options are the production ones:
 //!
 //! - **network**: `app` depends on `itoa = "1"` and on a git crate, with no
 //!   `Cargo.lock` and an empty `CARGO_HOME`, so resolving the workspace needs
@@ -41,6 +41,13 @@ use g_mesh_plugin_rust::project::{ProjectContext, EXCLUDE_DIRS};
 use g_mesh_plugin_rust::semantic;
 use g_mesh_plugin_sdk::wire::SourceTier;
 use g_mesh_plugin_sdk::{walk_project, Extractor, RelPath, SdkIndex, MANIFEST_PATH_ENV};
+
+/// [`semantic::engine`] with the Linux sandbox trampoline run by the plugin
+/// binary, since this test binary has no trampoline entry. Other OSes
+/// ignore the launcher.
+fn sandboxed_engine(root: &Path) -> anyhow::Result<Box<dyn g_mesh_plugin_sdk::SemanticEngine>> {
+    semantic::engine_with(root, Path::new(env!("CARGO_BIN_EXE_g-mesh-plugin-rust")))
+}
 
 /// A scratch directory that removes itself.
 struct Scratch(PathBuf);
@@ -264,7 +271,7 @@ fn index_and_check(root: &Path, sink: &Sink, what: &str) {
         let graph = RustExtractor.extract(&project, &path, &source);
         index.insert(path, source, graph);
     }
-    let mut engine = semantic::engine(root).expect("the engine resolves a rust-analyzer");
+    let mut engine = crate::sandboxed_engine(root).expect("the engine resolves a rust-analyzer");
     let answer = engine.answer(&[], &index).expect("the engine answers");
     drop(engine);
 

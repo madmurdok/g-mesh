@@ -1,7 +1,8 @@
 //! The rust-analyzer tier runs no code the indexed project supplies.
 //!
 //! A hostile workspace (`docs/design/GM-513-semantic-servers-no-project-code.md`,
-//! fixture `rfx`) is indexed through the plugin's own [`semantic::engine`],
+//! fixture `rfx`) is indexed through the plugin's own [`semantic::engine`]
+//! (via `sandboxed_engine`),
 //! with the shipped manifest and its bare `rust-analyzer` command, so the
 //! toolchain detection, the candidate list and the pinned environment are
 //! the production ones. Every hook the project offers writes a marker or a
@@ -56,6 +57,13 @@ use g_mesh_plugin_rust::project::{ProjectContext, EXCLUDE_DIRS};
 use g_mesh_plugin_rust::semantic;
 use g_mesh_plugin_sdk::wire::{SourceTier, TargetKey};
 use g_mesh_plugin_sdk::{walk_project, Extractor, RelPath, SdkIndex, MANIFEST_PATH_ENV};
+
+/// [`semantic::engine`] with the Linux sandbox trampoline run by the plugin
+/// binary, since this test binary has no trampoline entry. Other OSes
+/// ignore the launcher.
+fn sandboxed_engine(root: &Path) -> anyhow::Result<Box<dyn g_mesh_plugin_sdk::SemanticEngine>> {
+    semantic::engine_with(root, Path::new(env!("CARGO_BIN_EXE_g-mesh-plugin-rust")))
+}
 
 /// What a child test reads its fixture from, as one path list: the scratch
 /// root, then the parent's rustup proxy directory, `rustc`, `cargo` and
@@ -560,7 +568,7 @@ fn rust_analyzer_runs_no_build_script_proc_macro_toolchain_or_rustc_the_project_
         index.insert(path, source, graph);
     }
 
-    let mut engine = semantic::engine(&fixture.root).expect("the engine resolves a rust-analyzer");
+    let mut engine = crate::sandboxed_engine(&fixture.root).expect("the engine resolves a rust-analyzer");
     let answer = engine.answer(&[], &index).expect("the engine answers");
     drop(engine);
 
@@ -753,7 +761,7 @@ mod project_extra_env {
     ) {
         let index = index_of(&fixture.root);
         let mut engine: Box<dyn g_mesh_plugin_sdk::SemanticEngine> = match client_extra_env {
-            None => semantic::engine(&fixture.root).expect("the engine resolves a rust-analyzer"),
+            None => crate::sandboxed_engine(&fixture.root).expect("the engine resolves a rust-analyzer"),
             Some(env) => {
                 let mut config =
                     SemanticConfig::from_manifest().unwrap().expect("the manifest has [plugin.semantic]");
@@ -968,7 +976,7 @@ mod cargo_env_loader_var {
         let Some((root, real)) = child_fixture(test) else { return };
         let (mark, config) = write_live_loader_config(&root, &real);
 
-        let refusal = match semantic::engine(&root) {
+        let refusal = match crate::sandboxed_engine(&root) {
             Err(error) => Some(format!("{error:#}")),
             Ok(mut engine) => {
                 let index = {
@@ -1172,7 +1180,7 @@ mod cargo_env_loader_var {
         let (mark, dylib) = mark_and_dylib(&root);
         let manifest = LOADER_MANIFEST;
 
-        let mut engine = semantic::engine(&root).expect("no cargo config yet: the engine starts");
+        let mut engine = crate::sandboxed_engine(&root).expect("no cargo config yet: the engine starts");
         let index = {
             let project = ProjectContext::load(&root).expect("the fixture is a loadable Rust project");
             let mut index = SdkIndex::new();
@@ -1267,7 +1275,7 @@ mod cargo_env_loader_var {
         let Some((root, real)) = child_fixture(test) else { return };
         let (mark, dylib) = mark_and_dylib(&root);
 
-        let mut engine = semantic::engine(&root).expect("no cargo config yet: the engine starts");
+        let mut engine = crate::sandboxed_engine(&root).expect("no cargo config yet: the engine starts");
         if let Err(error) = engine.answer(&[], &index_of(&root)) {
             panic!("the first pass on a clean fixture failed: {error:#}");
         }
@@ -1416,7 +1424,7 @@ mod source_freshness {
         let test =
             "source_freshness::an_edit_to_a_file_no_question_touched_reaches_the_answer_about_its_caller_in_its_env";
         let Some((root, _real)) = child_fixture(test) else { return };
-        let mut engine = semantic::engine(&root).expect("the engine starts");
+        let mut engine = crate::sandboxed_engine(&root).expect("the engine starts");
         let before = index_of(&root);
         let first = engine.answer(&[], &before).expect("the first pass answers");
         assert_eq!(
@@ -1483,7 +1491,7 @@ mod source_freshness {
         let test =
             "source_freshness::the_answer_about_an_edited_file_follows_the_indexed_text_not_a_newer_disk_in_its_env";
         let Some((root, _real)) = child_fixture(test) else { return };
-        let mut engine = semantic::engine(&root).expect("the engine starts");
+        let mut engine = crate::sandboxed_engine(&root).expect("the engine starts");
         let before = index_of(&root);
         let first = engine.answer(&[], &before).expect("the first pass answers");
         assert_eq!(

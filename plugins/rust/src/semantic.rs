@@ -113,10 +113,18 @@ const LANGUAGE: &str = "rust";
 /// (Landlock alone is logged as not blocking shared-object loads); with
 /// neither this returns `Err` the same way.
 pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
+    engine_with(root, Path::new("/proc/self/exe"))
+}
+
+/// [`engine`] with the Linux trampoline run by `launcher`, as
+/// [`server_config_with`]: a test process is not the plugin binary.
+/// Ignored on other OSes.
+#[doc(hidden)]
+pub fn engine_with(root: &Path, launcher: &Path) -> Result<Box<dyn SemanticEngine>> {
     if let Some(refusal) = cargo_env_loader_var(root).refusal() {
         anyhow::bail!("{refusal}");
     }
-    let config = server_config(root)?;
+    let config = server_config_with(root, launcher)?;
     // rust-analyzer's start-up phases can be separated by more than the
     // bridge's 2s settle under load, so its readiness is its own `quiescent`
     // status rather than a quiet period.
@@ -1049,11 +1057,11 @@ mod tests {
     /// private, so the wiring is read from this file's own `engine` body, as
     /// the TypeScript plugin pins its warm-up.
     ///
-    /// Control: drop `.quiescent_signal()` from `engine`.
+    /// Control: drop `.quiescent_signal()` from `engine_with`.
     #[test]
     fn the_engine_reads_rust_analyzers_quiescent_status() {
         let source = include_str!("semantic.rs");
-        let engine = &source[source.find("pub fn engine(").expect("this file defines `engine`")..];
+        let engine = &source[source.find("pub fn engine_with(").expect("this file defines `engine_with`")..];
         let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
         assert!(
             body.contains("LspBridge::new(LANGUAGE, root, config).quiescent_signal()"),
