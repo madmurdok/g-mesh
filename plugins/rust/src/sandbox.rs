@@ -266,3 +266,186 @@ pub(crate) mod seatbelt {
         }
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use g_mesh_plugin_sdk::lsp::SemanticConfig;
+
+    use super::seatbelt::{self, Rule};
+    use super::{confine, SandboxOutcome, SandboxPolicy};
+    use crate::semantic::Toolchain;
+
+    /// A directory that removes itself, at `base`/`name`, unique per process
+    /// and per call.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn under(base: &Path, name: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = base.join(format!("g-mesh-rs-sandbox-{name}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+
+        /// Under the temp dir, canonicalized.
+        fn new(name: &str) -> Self {
+            let scratch = Scratch::under(&std::env::temp_dir(), name);
+            let canonical = scratch.0.canonicalize().unwrap();
+            Scratch(canonical)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A stand-in server at `dir/rust-analyzer`: a `/bin/sh` script that
+    /// answers `--version`. Under Seatbelt its exec is checked against its
+    /// own path, so where it lies decides whether the preflight passes.
+    fn fake_server(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let server = dir.join("rust-analyzer");
+        std::fs::write(&server, "#!/bin/sh\necho \"rust-analyzer 0.0.0-fake\"\n").unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        server
+    }
+
+    /// `confine` of a config that starts `server`, under `policy`.
+    fn confine_server(server: &Path, policy: &SandboxPolicy) -> (SandboxOutcome, SemanticConfig) {
+        let mut config = SemanticConfig::new(server);
+        let outcome = confine(&mut config, policy);
+        (outcome, config)
+    }
+
+    fn position(rules: &[Rule], allow: bool, path: &Path) -> usize {
+        rules.iter().position(|rule| rule.allow == allow && rule.path == path).unwrap_or_else(|| {
+            panic!("no {} rule for {}: {rules:?}", if allow { "allow" } else { "deny" }, path.display())
+        })
+    }
+
+    /// The root deny is emitted after an allow of a prefix that holds the
+    /// root, and before an allow of a prefix the root holds; at equal length
+    /// the deny comes last.
+    ///
+    /// Control: emit the rules in insertion order (drop the sort in
+    /// `seatbelt::rules`).
+    #[test]
+    fn the_root_deny_follows_the_prefixes_that_hold_it_and_precedes_those_it_holds() {
+        let policy = SandboxPolicy {
+            project_root: PathBuf::from("/usr/local/src/project"),
+            toolchain: vec![PathBuf::from("/usr/local"), PathBuf::from("/usr/local/src/project/.rustup")],
+        };
+        let rules = seatbelt::rules(&policy);
+        let root = position(&rules, false, &policy.project_root);
+        assert!(position(&rules, true, Path::new("/usr/local")) < root, "{rules:?}");
+        assert!(root < position(&rules, true, Path::new("/usr/local/src/project/.rustup")), "{rules:?}");
+        assert!(
+            rules.windows(2).all(|pair| pair[0].path.as_os_str().len() <= pair[1].path.as_os_str().len()),
+            "rules are not in ascending path length: {rules:?}"
+        );
+
+        let tie = SandboxPolicy {
+            project_root: PathBuf::from("/opt/toolchain"),
+            toolchain: vec![PathBuf::from("/opt/toolchain")],
+        };
+        let rules = seatbelt::rules(&tie);
+        assert!(
+            position(&rules, true, &tie.project_root) < position(&rules, false, &tie.project_root),
+            "{rules:?}"
+        );
+    }
+
+    /// The ordering holds where it matters, in Seatbelt itself: a server
+    /// inside the root is refused even though an allowed prefix holds the
+    /// root, and a server in an allowed prefix inside the root starts (an
+    /// indexed `$HOME` holding `~/.rustup`).
+    ///
+    /// Control: emit the rules in insertion order (drop the sort in
+    /// `seatbelt::rules`).
+    #[test]
+    fn seatbelt_denies_the_root_inside_a_prefix_and_allows_a_prefix_inside_the_root() {
+        let scratch = Scratch::new("order");
+        let prefix = scratch.0.join("toolchain");
+        let root = prefix.join("project");
+
+        let inside_root = fake_server(&root);
+        let (outcome, config) = confine_server(&inside_root, &SandboxPolicy::new(&root, [prefix.clone()]));
+        assert!(matches!(outcome, SandboxOutcome::Failed(_)), "a server under the root started: {outcome:?}");
+        assert_eq!(config, SemanticConfig::new(&inside_root), "a failed confine changed the config");
+
+        let home = scratch.0.join("home");
+        let rustup = home.join(".rustup");
+        let in_prefix = fake_server(&rustup);
+        let (outcome, _) = confine_server(&in_prefix, &SandboxPolicy::new(&home, [rustup.clone()]));
+        assert_eq!(outcome, SandboxOutcome::Confined { backend: "seatbelt" });
+    }
+
+    /// The machine's real rust-analyzer starts confined under the policy
+    /// `engine` builds, and the config then starts `sandbox-exec` with the
+    /// server last; without the sysroot in the policy the same preflight
+    /// fails. Skips on a machine with no rust-analyzer.
+    ///
+    /// Control: drop the sysroot from `SandboxPolicy::for_server`.
+    #[test]
+    fn the_real_server_starts_confined_and_needs_its_sysroot() {
+        let toolchain = Toolchain::detect();
+        let Some(server) = toolchain.rust_analyzer.clone() else {
+            println!("SKIPPED: no rust-analyzer found");
+            return;
+        };
+        let scratch = Scratch::new("toolchain");
+
+        let policy = SandboxPolicy::for_server(&scratch.0, &toolchain, &server);
+        let (outcome, config) = confine_server(&server, &policy);
+        assert_eq!(outcome, SandboxOutcome::Confined { backend: "seatbelt" }, "{policy:?}");
+        assert_eq!(config.command, Path::new(seatbelt::SANDBOX_EXEC));
+        assert_eq!(config.args.last().map(String::as_str), server.to_str(), "{:?}", config.args);
+
+        let without_sysroot = Toolchain { sysroot: None, ..toolchain };
+        let policy = SandboxPolicy::for_server(&scratch.0, &without_sysroot, &server);
+        let (outcome, config) = confine_server(&server, &policy);
+        assert!(
+            matches!(outcome, SandboxOutcome::Failed(_)),
+            "sanity: the server started without its sysroot allowed, so the sysroot is not what lets it start: \
+             {outcome:?} under {policy:?}"
+        );
+        assert_eq!(config.command, server);
+    }
+
+    /// A root given through a symlink (`/tmp` is one on macOS) reaches the
+    /// profile as its canonical path, which is what Seatbelt matches, so a
+    /// server under it is refused even when named through the alias.
+    ///
+    /// Control: skip `canonicalize` on the project root in
+    /// `SandboxPolicy::new`.
+    #[test]
+    fn a_root_given_through_a_symlink_is_denied_by_its_canonical_path() {
+        let alias = Path::new("/tmp");
+        let scratch = Scratch::under(alias, "alias");
+        let canonical = scratch.0.canonicalize().unwrap();
+        assert_ne!(canonical, scratch.0, "sanity: {} is not a symlink here", alias.display());
+        let prefix = scratch.0.join("toolchain");
+        let root = prefix.join("project");
+        let server = fake_server(&root);
+
+        let policy = SandboxPolicy::new(&root, [prefix]);
+        let canonical_root = canonical.join("toolchain/project");
+        assert_eq!(policy.project_root, canonical_root);
+        let args = seatbelt::wrapper_args(&policy).unwrap();
+        assert!(args.contains(&format!("ROOT={}", canonical_root.display())), "{args:?}");
+
+        let (outcome, _) = confine_server(&server, &policy);
+        assert!(
+            matches!(outcome, SandboxOutcome::Failed(_)),
+            "a server under the root, named through {}, started: {outcome:?}",
+            alias.display()
+        );
+    }
+}

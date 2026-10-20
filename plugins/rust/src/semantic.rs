@@ -2264,4 +2264,29 @@ mod tests {
         let (file, error) = unchecked(&scratch, &root);
         assert_eq!(file, root, "the refusal names another path ({error})");
     }
+
+    /// A sandbox that cannot confine the server refuses the semantic tier
+    /// with the reason; an OS with no backend starts the server.
+    ///
+    /// Control: treat `SandboxOutcome::Failed` like `NoBackend` in `admit`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandbox_that_cannot_confine_the_server_refuses_the_semantic_tier() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("sandbox-refused");
+        let server = scratch.0.join("rust-analyzer");
+        std::fs::write(&server, "#!/bin/sh\necho \"rust-analyzer 0.0.0-fake\"\n").unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let policy = SandboxPolicy::new(&scratch.0, []);
+        let mut config = SemanticConfig::new(&server);
+
+        let outcome = sandbox::confine(&mut config, &policy);
+        assert!(
+            matches!(outcome, SandboxOutcome::Failed(_)),
+            "sanity: a server under the project root passed the preflight: {outcome:?}"
+        );
+        let error = admit(outcome, &policy).expect_err("a server that cannot be confined was admitted");
+        assert!(format!("{error:#}").contains("semantic tier refused"), "{error:#}");
+        assert!(admit(SandboxOutcome::NoBackend, &policy).is_ok());
+    }
 }

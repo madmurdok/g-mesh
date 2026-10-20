@@ -722,7 +722,7 @@ mod project_extra_env {
 
     /// Whether the answer resolved `thing.method()` across files: the server
     /// really indexed the fixture.
-    fn resolved_method(index: &SdkIndex, answer: &g_mesh_plugin_sdk::SemanticAnswer) -> bool {
+    pub(super) fn resolved_method(index: &SdkIndex, answer: &g_mesh_plugin_sdk::SemanticAnswer) -> bool {
         let main = index
             .graph(&RelPath::new("app/src/main.rs"))
             .expect("app/src/main.rs is indexed")
@@ -921,32 +921,20 @@ mod cargo_env_loader_var {
         in_its_env(child, &root, &real, None);
     }
 
-    #[test]
-    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker() {
-        loader_fixture_in_its_env(
-            "loader-env",
-            "cargo_env_loader_var::a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env",
-        );
-    }
-
-    #[test]
-    #[ignore = "run by its parent test in the fixture's environment"]
-    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env() {
-        let test =
-            "cargo_env_loader_var::a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env";
-        let Some((root, real)) = child_fixture(test) else { return };
-        let (mark, dylib) = mark_and_dylib(&root);
+    /// Writes the fixture's `.cargo/config.toml` with `[env] LOADER_VAR`
+    /// forced to the marker dylib, checks that an unpinned `cargo metadata`
+    /// in the fixture then loads it (the hostile config is live), and clears
+    /// what that run left. Returns the marker and the config file.
+    fn write_live_loader_config(root: &Path, real: &RealToolchain) -> (PathBuf, PathBuf) {
+        let (mark, dylib) = mark_and_dylib(root);
         let config = root.join(".cargo/config.toml");
         write(
             &config,
             &format!("[env]\n{LOADER_VAR} = {{ value = {:?}, force = true }}\n", dylib.to_string_lossy()),
         );
-
-        // Sanity: the hostile config is live - an unpinned `cargo metadata`
-        // in the fixture loads the dylib into the rustc it starts.
         let output = Command::new(real.proxy_dir.join("cargo"))
             .args(["metadata", "--format-version", "1"])
-            .current_dir(&root)
+            .current_dir(root)
             .output()
             .unwrap();
         assert!(
@@ -961,6 +949,24 @@ mod cargo_env_loader_var {
         );
         std::fs::remove_file(&mark).unwrap();
         let _ = std::fs::remove_file(root.join("Cargo.lock"));
+        (mark, config)
+    }
+
+    #[test]
+    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker() {
+        loader_fixture_in_its_env(
+            "loader-env",
+            "cargo_env_loader_var::a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env",
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env() {
+        let test =
+            "cargo_env_loader_var::a_cargo_config_env_loader_var_refuses_the_semantic_tier_and_fires_no_marker_in_its_env";
+        let Some((root, real)) = child_fixture(test) else { return };
+        let (mark, config) = write_live_loader_config(&root, &real);
 
         let refusal = match semantic::engine(&root) {
             Err(error) => Some(format!("{error:#}")),
@@ -992,6 +998,61 @@ mod cargo_env_loader_var {
             reason.contains(LOADER_VAR) && reason.contains(&config.display().to_string()),
             "the engine failed, but not by refusing the [env] {LOADER_VAR} in {}: {reason}",
             config.display()
+        );
+        println!("{}", ran_marker(test));
+    }
+
+    /// On macOS the server `semantic::server_config` builds runs under
+    /// Seatbelt: with the engine's cargo config pre-check bypassed, the
+    /// hostile `[env]` reaches the rustc that the server's `cargo metadata`
+    /// starts, which maps no project dylib (no marker), and the server still
+    /// resolves the workspace-local call `util::Thing.method()`.
+    ///
+    /// Controls: make `seatbelt::confine` return `Confined` without
+    /// rewriting the config; or drop `file-map-executable` from both the
+    /// profile's default deny and the project-root deny (the root deny alone
+    /// already refuses the dylib).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandboxed_server_maps_no_project_dylib_and_still_resolves() {
+        loader_fixture_in_its_env(
+            "loader-sandbox",
+            "cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env() {
+        use g_mesh_plugin_sdk::lsp::LspBridge;
+        use g_mesh_plugin_sdk::SemanticEngine;
+
+        let test =
+            "cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env";
+        let Some((root, real)) = child_fixture(test) else { return };
+        let (mark, _) = write_live_loader_config(&root, &real);
+
+        let config = semantic::server_config(&root).expect("the server config is built and confined");
+        assert_eq!(
+            config.command,
+            Path::new("/usr/bin/sandbox-exec"),
+            "the server does not start under Seatbelt: {config:?}"
+        );
+        let index = index_of(&root);
+        let mut bridge = LspBridge::new("rust", &root, config).quiescent_signal();
+        let answer = bridge.answer(&[], &index).expect("the confined server answers");
+        drop(bridge);
+
+        assert!(
+            !mark.exists(),
+            "the confined server started a rustc that loaded the project's [env] {LOADER_VAR} dylib"
+        );
+        assert!(
+            super::project_extra_env::resolved_method(&index, &answer),
+            "the confined server did not resolve `util::Thing.method()` (complete: {}, reason: {:?})",
+            answer.complete,
+            answer.reason
         );
         println!("{}", ran_marker(test));
     }
