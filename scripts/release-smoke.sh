@@ -111,7 +111,7 @@ sqlite_scalar() {
 		sqlite3 "$1" "$2"
 	else
 		"$sqlite_via" -I -c 'import sqlite3, sys
-print(sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone()[0])' "$1" "$2"
+sys.stdout.write(str(sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone()[0]))' "$1" "$2"
 	fi
 }
 
