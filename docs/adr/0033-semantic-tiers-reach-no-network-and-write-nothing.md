@@ -114,7 +114,10 @@ config (works only for a user whose npm cache already holds pyright).
   `go.work.sum` (the exception above).
 - `Cargo.lock` is not written because rust-analyzer 1.97.1 passes
   `-Zlockfile-path`; an older rust-analyzer may write one. No configuration
-  of ours prevents that; the tests pin it for the version CI installs.
+  of ours prevents that; the tests pin it for the version CI installs. On
+  macOS and Linux the OS sandbox now refuses that write too: the project
+  root is read-only to the server's process tree
+  ([ADR 0040](0040-rust-sandbox-denies-network-and-writes.md)).
 - A JavaScript project loses types only automatic type acquisition would
   have downloaded (`@types/*` for an untyped dependency); those targets are
   third-party and outside the index either way (D5).

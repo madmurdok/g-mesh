@@ -1,19 +1,24 @@
 //! The Linux backend: the plugin binary is its own trampoline.
 //!
 //! [`confine`] rewrites the server's argv to
-//! `<launcher> __g-mesh-sandbox --layers <layers> --root <root> --allow <prefix>… -- <server> <args…>`.
+//! `<launcher> __g-mesh-sandbox --layers <layers> --root <root> --allow <prefix>… --write <prefix>… -- <server> <args…>`.
 //! [`trampoline`], called first thing in the plugin's `main`, sets up the
 //! requested layers in that fresh single-threaded process and execs the
 //! server in place, so the spawned pid is the server's and every child
 //! inherits the layers:
 //!
-//! - **mount**: a user + mount namespace in which every mount is `noexec`
-//!   except the OS and toolchain prefixes, and the project root is `noexec`
-//!   again even inside an allowed prefix. This is what keeps a shared object
-//!   under the root from being mapped executable (`LD_PRELOAD`, `dlopen`).
+//! - **mount**: a user + mount + network namespace. Every mount is `noexec`
+//!   except the OS and toolchain prefixes, and read-only except the
+//!   writable prefixes (the server's temp dir, the cargo caches); the
+//!   project root is `noexec` and read-only again even inside an allowed
+//!   prefix. This is what keeps a shared object under the root from being
+//!   mapped executable (`LD_PRELOAD`, `dlopen`). The network namespace has
+//!   only a down loopback, so no TCP, UDP or abstract unix socket connects.
 //! - **landlock**: a Landlock domain allowing exec only under the same
-//!   prefixes, and no TCP bind or connect. Landlock does not check
-//!   `mmap(PROT_EXEC)`, so on its own it blocks execs, not library loads.
+//!   prefixes, writes only under the writable prefixes and `/dev`, no TCP
+//!   bind or connect, and no connect to a pathname unix socket (ABI >= 9).
+//!   Landlock does not check `mmap(PROT_EXEC)`, so on its own it blocks
+//!   execs, not library loads; it never covers UDP.
 //!
 //! In every tier the trampoline then drops all capabilities and sets
 //! `no_new_privs`, so the server cannot undo a layer (root in its user
@@ -40,6 +45,11 @@ pub(crate) const TRAMPOLINE_ARG: &str = "__g-mesh-sandbox";
 /// followed.
 pub(crate) const OS_EXEC: [&str; 8] =
     ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/nix/store"];
+
+/// OS prefixes the tree may write in the Landlock layer: device nodes
+/// (`/dev/null`, `/dev/tty`). The mount layer needs none: a device node
+/// ignores a read-only mount.
+pub(crate) const OS_WRITE: [&str; 1] = ["/dev"];
 
 /// Trampoline exit codes, each naming the step that failed.
 pub(crate) const EXIT_USAGE: i32 = 70;
@@ -114,6 +124,10 @@ pub(crate) fn trampoline_args(policy: &SandboxPolicy, layers: Layers) -> Result<
         args.push("--allow".to_string());
         args.push(utf8(prefix)?);
     }
+    for prefix in &policy.writable {
+        args.push("--write".to_string());
+        args.push(utf8(prefix)?);
+    }
     args.push("--".to_string());
     Ok(args)
 }
@@ -173,16 +187,17 @@ pub(crate) fn confine(
                     Layers::Landlock => {
                         let root = std::fs::canonicalize(&policy.project_root)
                             .unwrap_or_else(|_| policy.project_root.clone());
-                        let gap = match prefix_over(&root, &allowed_prefixes(&policy.toolchain)) {
-                            Some(prefix) => format!(
-                                "{earlier}; exec of project binaries is not blocked either: the project \
-                                 root {} lies under the allowed prefix {}",
+                        let mut gaps = vec![earlier];
+                        if let Some(prefix) = prefix_over(&root, &allowed_prefixes(&policy.toolchain)) {
+                            gaps.push(format!(
+                                "exec of project binaries is not blocked either: the project root {} lies \
+                                 under the allowed prefix {}",
                                 root.display(),
                                 prefix.display()
-                            ),
-                            None => earlier,
-                        };
-                        SandboxOutcome::Partial { backend: "Landlock", gap }
+                            ));
+                        }
+                        gaps.extend(landlock_gaps(landlock_abi(), &root, &policy.writable));
+                        SandboxOutcome::Partial { backend: "Landlock", gap: gaps.join("; ") }
                     }
                 };
             }
@@ -204,6 +219,7 @@ pub(crate) struct Invocation {
     pub(crate) layers: Layers,
     pub(crate) root: PathBuf,
     pub(crate) allow: Vec<PathBuf>,
+    pub(crate) write: Vec<PathBuf>,
     pub(crate) server: PathBuf,
     pub(crate) args: Vec<OsString>,
 }
@@ -215,6 +231,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Invocati
     let mut layers = None;
     let mut root = None;
     let mut allow = Vec::new();
+    let mut write = Vec::new();
     loop {
         let flag = args.next().ok_or("no `--` before the server")?;
         let flag = flag.to_str().ok_or("a non-UTF-8 option")?.to_string();
@@ -229,6 +246,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Invocati
             }
             "--root" => root = Some(PathBuf::from(value)),
             "--allow" => allow.push(PathBuf::from(value)),
+            "--write" => write.push(PathBuf::from(value)),
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -240,6 +258,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Invocati
         layers: layers.ok_or("no --layers")?,
         root: root.ok_or("no --root")?,
         allow,
+        write,
         server,
         args: args.collect(),
     })
@@ -269,13 +288,13 @@ pub fn trampoline(args: impl IntoIterator<Item = OsString>) -> Option<i32> {
     };
     let allowed = allowed_prefixes(&invocation.allow);
     if invocation.layers.mount() {
-        if let Err(reason) = mount_layer(&invocation.root, &allowed) {
+        if let Err(reason) = mount_layer(&invocation.root, &allowed, &invocation.write) {
             g_mesh_plugin_sdk::log_line!("g-mesh sandbox: mount layer: {reason}");
             return Some(EXIT_MOUNT);
         }
     }
     if invocation.layers.landlock() {
-        if let Err(reason) = landlock_layer(&allowed) {
+        if let Err(reason) = landlock_layer(&allowed, &invocation.write) {
             g_mesh_plugin_sdk::log_line!("g-mesh sandbox: Landlock layer: {reason}");
             return Some(EXIT_LANDLOCK);
         }
@@ -309,15 +328,90 @@ pub(crate) fn prefix_over<'a>(root: &Path, allowed: &'a [PathBuf]) -> Option<&'a
     allowed.iter().find(|prefix| root.starts_with(prefix))
 }
 
-/// The mount layer's per-path steps, in the order they are applied:
-/// `(path, exec)` for every allowed prefix (`exec`) and the root (not),
-/// ascending by path length so the most specific applies last. At equal
-/// length (the root is itself an allowed prefix) the root comes last.
-pub(crate) fn mount_plan(root: &Path, allowed: &[PathBuf]) -> Vec<(PathBuf, bool)> {
-    let mut plan: Vec<(PathBuf, bool)> = allowed.iter().map(|prefix| (prefix.clone(), true)).collect();
-    plan.push((root.to_path_buf(), false));
-    plan.sort_by_key(|(path, exec)| (path.as_os_str().len(), !exec));
-    plan
+/// What the Landlock-only tier leaves open at Landlock ABI `abi`, for a
+/// `root` and the `writable` prefixes, one clause each, for the `Partial`
+/// gap: UDP and (below ABI 9) pathname unix sockets always or by ABI, TCP
+/// below ABI 4, truncation below ABI 3, and writes under a root that lies
+/// under a writable prefix (Landlock has no deny inside a grant).
+pub(crate) fn landlock_gaps(abi: i64, root: &Path, writable: &[PathBuf]) -> Vec<String> {
+    let mut gaps = Vec::new();
+    if abi >= 9 {
+        gaps.push("UDP connects are not blocked".to_string());
+    } else {
+        gaps.push(format!(
+            "UDP and unix-socket connects are not blocked (Landlock ABI {abi} < 9 checks no pathname socket)"
+        ));
+    }
+    if abi < 4 {
+        gaps.push(format!("TCP is not blocked (Landlock ABI {abi} < 4)"));
+    }
+    if abi < 3 {
+        gaps.push(format!("truncation is not blocked (Landlock ABI {abi} < 3)"));
+    }
+    if let Some(prefix) = prefix_over(root, writable) {
+        gaps.push(format!(
+            "writes under the root are not blocked: it lies under the writable prefix {}",
+            prefix.display()
+        ));
+    }
+    gaps
+}
+
+/// The Landlock ABI version this kernel reports, 0 without Landlock.
+pub fn landlock_abi() -> i64 {
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    abi.max(0)
+}
+
+/// One step of the mount layer: bind `path` on itself, then make it (and
+/// every mount beneath it) executable when `exec` and writable when `write`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountStep {
+    pub(crate) path: PathBuf,
+    pub(crate) exec: bool,
+    pub(crate) write: bool,
+}
+
+/// The mount layer's per-path steps, in the order they are applied: one for
+/// every exec prefix, every writable prefix and the root, ascending by path
+/// length so the most specific applies last; at equal length the root comes
+/// last. A step's two flags are decided independently by the most specific
+/// rule over its path: exec from the `exec` prefixes against the root,
+/// write from the `write` prefixes against the root; the root wins a tie,
+/// and a path under neither stays `noexec` and read-only.
+pub(crate) fn mount_plan(root: &Path, exec: &[PathBuf], write: &[PathBuf]) -> Vec<MountStep> {
+    let decide = |path: &Path, grants: &[PathBuf]| {
+        let grant =
+            grants.iter().filter(|grant| path.starts_with(grant)).map(|grant| grant.as_os_str().len()).max();
+        let deny = path.starts_with(root).then_some(root.as_os_str().len());
+        match (grant, deny) {
+            (Some(grant), Some(deny)) => grant > deny,
+            (grant, _) => grant.is_some(),
+        }
+    };
+    let mut paths: Vec<&Path> = Vec::new();
+    for path in exec.iter().chain(write).map(PathBuf::as_path).chain([root]) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths.sort_by_key(|path| (path.as_os_str().len(), *path == root));
+    paths
+        .into_iter()
+        .map(|path| MountStep {
+            path: path.to_path_buf(),
+            exec: decide(path, exec),
+            write: decide(path, write),
+        })
+        .collect()
 }
 
 fn cstring(path: &Path) -> Result<CString, String> {
@@ -328,15 +422,14 @@ fn errno(step: &str) -> String {
     format!("{step}: {}", std::io::Error::last_os_error())
 }
 
-/// `mount_setattr(path, AT_RECURSIVE)` setting or clearing `noexec` on the
-/// mount at `path` and every mount beneath it.
-fn set_noexec(path: &CString, noexec: bool) -> Result<(), String> {
+/// `mount_setattr(path, AT_RECURSIVE)` setting the `set` and clearing the
+/// `clr` attributes (`MOUNT_ATTR_NOEXEC`, `MOUNT_ATTR_RDONLY`) on the mount
+/// at `path` and every mount beneath it. `Err` says which path failed and
+/// why; its `raw_os_error` is the syscall's errno.
+fn set_attrs(path: &CString, set: u64, clr: u64) -> Result<(), std::io::Error> {
     let mut attr: libc::mount_attr = unsafe { std::mem::zeroed() };
-    if noexec {
-        attr.attr_set = libc::MOUNT_ATTR_NOEXEC;
-    } else {
-        attr.attr_clr = libc::MOUNT_ATTR_NOEXEC;
-    }
+    attr.attr_set = set;
+    attr.attr_clr = clr;
     let result = unsafe {
         libc::syscall(
             libc::SYS_mount_setattr,
@@ -350,23 +443,43 @@ fn set_noexec(path: &CString, noexec: bool) -> Result<(), String> {
     if result == 0 {
         Ok(())
     } else {
-        Err(errno(&format!("mount_setattr {}", path.to_string_lossy())))
+        let error = std::io::Error::last_os_error();
+        Err(std::io::Error::new(error.kind(), format!("mount_setattr {}: {error}", path.to_string_lossy())))
     }
 }
 
-/// Enters a new user + mount namespace (uid and gid mapped to themselves)
-/// in which every mount is `noexec` except under `allowed`, and `root` is
-/// `noexec` again wherever it lies. Mounts never propagate out.
-fn mount_layer(root: &Path, allowed: &[PathBuf]) -> Result<(), String> {
-    let plan = mount_plan(root, allowed);
-    let plan: Vec<(CString, bool)> =
-        plan.iter().map(|(path, exec)| cstring(path).map(|path| (path, *exec))).collect::<Result<_, _>>()?;
+/// Sets one mount step's flags on `path` and beneath it. A mount the parent
+/// namespace locked read-only (`MNT_LOCK_READONLY`) cannot be made writable:
+/// that step then keeps it read-only, which confines more, rather than fail
+/// the whole layer.
+fn apply_step(path: &CString, exec: bool, write: bool) -> Result<(), String> {
+    let (mut set, mut clr) = (0, 0);
+    let mut flag = |on: bool, attr: u64| if on { clr |= attr } else { set |= attr };
+    flag(exec, libc::MOUNT_ATTR_NOEXEC);
+    flag(write, libc::MOUNT_ATTR_RDONLY);
+    match set_attrs(path, set, clr) {
+        Err(error) if write && error.kind() == std::io::ErrorKind::PermissionDenied => {
+            set_attrs(path, set, clr & !libc::MOUNT_ATTR_RDONLY).map_err(|error| error.to_string())
+        }
+        result => result.map_err(|error| error.to_string()),
+    }
+}
+
+/// Enters a new user + mount + network namespace (uid and gid mapped to
+/// themselves) in which every mount is `noexec` except under `allowed` and
+/// read-only except under `writable`, and `root` is `noexec` and read-only
+/// again wherever it lies. The network namespace has only a loopback that is
+/// down, so no socket reaches any address. Mounts never propagate out.
+fn mount_layer(root: &Path, allowed: &[PathBuf], writable: &[PathBuf]) -> Result<(), String> {
+    let plan = mount_plan(root, allowed, writable);
+    let plan: Vec<(CString, &MountStep)> =
+        plan.iter().map(|step| cstring(&step.path).map(|path| (path, step))).collect::<Result<_, _>>()?;
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     let cwd = std::env::current_dir().ok();
 
-    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
-        return Err(errno("unshare(CLONE_NEWUSER | CLONE_NEWNS)"));
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWNET) } != 0 {
+        return Err(errno("unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET)"));
     }
     std::fs::write("/proc/self/setgroups", "deny").map_err(|err| format!("/proc/self/setgroups: {err}"))?;
     std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))
@@ -381,15 +494,16 @@ fn mount_layer(root: &Path, allowed: &[PathBuf]) -> Result<(), String> {
     {
         return Err(errno("mount / private"));
     }
-    set_noexec(&slash, true)?;
-    for (path, exec) in &plan {
+    set_attrs(&slash, libc::MOUNT_ATTR_NOEXEC | libc::MOUNT_ATTR_RDONLY, 0)
+        .map_err(|error| error.to_string())?;
+    for (path, step) in &plan {
         let bound = unsafe {
             libc::mount(path.as_ptr(), path.as_ptr(), none, libc::MS_BIND | libc::MS_REC, std::ptr::null())
         };
         if bound != 0 {
             return Err(errno(&format!("bind {}", path.to_string_lossy())));
         }
-        set_noexec(path, !exec)?;
+        apply_step(path, step.exec, step.write)?;
     }
     // The working directory still resolves through the mounts it was
     // entered under; re-entering it resolves it through the new binds.
@@ -400,20 +514,30 @@ fn mount_layer(root: &Path, allowed: &[PathBuf]) -> Result<(), String> {
 }
 
 /// Restricts this process and its descendants with Landlock: exec only
-/// under `allowed`, no TCP bind or connect (ABI >= 4), no abstract unix
-/// socket or signal outside the domain (ABI >= 6). `Err` when the kernel
+/// under `allowed`; writes (create, remove, write, refer, truncate, device
+/// ioctl, connect to a pathname unix socket, each from the ABI that has it)
+/// only under `writable` and `/dev`; no TCP bind or connect (ABI >= 4); no
+/// abstract unix socket or signal outside the domain (ABI >= 6). Best
+/// effort: each right the kernel lacks is dropped. `Err` when the kernel
 /// enforces none of it.
-fn landlock_layer(allowed: &[PathBuf]) -> Result<(), String> {
+fn landlock_layer(allowed: &[PathBuf], writable: &[PathBuf]) -> Result<(), String> {
     use landlock::{
         path_beneath_rules, AccessFs, AccessNet, LandlockStatus, Ruleset, RulesetAttr, RulesetCreatedAttr,
-        RulesetStatus, Scope,
+        RulesetStatus, Scope, ABI,
     };
+    let write = AccessFs::from_write(ABI::V9);
+    let write_beneath: Vec<PathBuf> = writable
+        .iter()
+        .cloned()
+        .chain(OS_WRITE.iter().filter_map(|prefix| std::fs::canonicalize(prefix).ok()))
+        .collect();
     let status = Ruleset::default()
-        .handle_access(AccessFs::Execute)
+        .handle_access(write | AccessFs::Execute)
         .and_then(|ruleset| ruleset.handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp))
         .and_then(|ruleset| ruleset.scope(Scope::AbstractUnixSocket | Scope::Signal))
         .and_then(|ruleset| ruleset.create())
         .and_then(|ruleset| ruleset.add_rules(path_beneath_rules(allowed, AccessFs::Execute)))
+        .and_then(|ruleset| ruleset.add_rules(path_beneath_rules(&write_beneath, write)))
         .and_then(|ruleset| ruleset.restrict_self())
         .map_err(|err| err.to_string())?;
     if status.ruleset == RulesetStatus::NotEnforced {
@@ -565,34 +689,41 @@ mod tests {
     fn mount_plan_rebinds_every_prefix_exec_and_the_root_noexec_most_specific_last() {
         let root = Path::new("/home/u/proj");
         let allowed = paths(&["/usr", "/home/u", "/opt/toolchains/stable-x86_64"]);
-        let plan = mount_plan(root, &allowed);
+        let plan = mount_plan(root, &allowed, &[]);
 
         assert_eq!(plan.len(), allowed.len() + 1, "{plan:?}");
         for prefix in &allowed {
             assert!(
-                plan.contains(&(prefix.clone(), true)),
+                plan.contains(&MountStep { path: prefix.clone(), exec: true, write: false }),
                 "{} is not rebound exec: {plan:?}",
                 prefix.display()
             );
         }
-        assert!(plan.contains(&(root.to_path_buf(), false)), "the root is not made noexec: {plan:?}");
         assert!(
-            plan.windows(2).all(|pair| pair[0].0.as_os_str().len() <= pair[1].0.as_os_str().len()),
+            plan.contains(&MountStep { path: root.to_path_buf(), exec: false, write: false }),
+            "the root is not made noexec: {plan:?}"
+        );
+        assert!(
+            plan.windows(2).all(|pair| pair[0].path.as_os_str().len() <= pair[1].path.as_os_str().len()),
             "the steps are not ascending by path length: {plan:?}"
         );
-        let at = |path: &str| plan.iter().position(|(step, _)| step == Path::new(path)).unwrap();
+        let at = |path: &str| plan.iter().position(|step| step.path == Path::new(path)).unwrap();
         assert!(at("/home/u") < at("/home/u/proj"), "the root's noexec does not follow its prefix: {plan:?}");
     }
 
     #[test]
     fn mount_plan_makes_a_root_that_is_itself_an_allowed_prefix_noexec_last() {
         let root = Path::new("/srv/proj");
-        let plan = mount_plan(root, &paths(&["/srv/proj", "/usr"]));
-        assert_eq!(plan.last(), Some(&(root.to_path_buf(), false)), "{plan:?}");
+        let plan = mount_plan(root, &paths(&["/srv/proj", "/usr"]), &[]);
+        assert_eq!(
+            plan.last(),
+            Some(&MountStep { path: root.to_path_buf(), exec: false, write: false }),
+            "{plan:?}"
+        );
     }
 
     fn policy(root: &str, toolchain: &[&str]) -> SandboxPolicy {
-        SandboxPolicy { project_root: PathBuf::from(root), toolchain: paths(toolchain) }
+        SandboxPolicy { project_root: PathBuf::from(root), toolchain: paths(toolchain), writable: vec![] }
     }
 
     fn os(list: &[&str]) -> Vec<OsString> {
@@ -617,6 +748,7 @@ mod tests {
                     layers,
                     root: policy.project_root.clone(),
                     allow: policy.toolchain.clone(),
+                    write: policy.writable.clone(),
                     server: PathBuf::from("/opt/tool chain/rust-analyzer"),
                     args: os(&server_args),
                 }
@@ -772,7 +904,7 @@ mod tests {
     ) -> (SandboxOutcome, SemanticConfig, SandboxPolicy) {
         scratch.fail(exits);
         let launcher = fake_launcher();
-        let policy = SandboxPolicy { project_root: scratch.root(), toolchain };
+        let policy = SandboxPolicy { project_root: scratch.root(), toolchain, writable: vec![] };
         let mut config = server_config();
         let outcome = confine(&mut config, &policy, launcher);
         (outcome, config, policy)

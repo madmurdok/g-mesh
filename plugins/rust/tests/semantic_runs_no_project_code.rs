@@ -1828,7 +1828,7 @@ mod linux_sandbox {
         let mount = host_supports("mount");
         let landlock = host_supports("landlock");
         let scratch = Scratch::new("tier");
-        let policy = SandboxPolicy::new(&scratch.0, []);
+        let policy = SandboxPolicy::new(&scratch.0, [], []);
         let untouched = SemanticConfig::new(Path::new("/bin/true"));
         let mut config = untouched.clone();
 

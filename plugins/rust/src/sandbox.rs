@@ -1,13 +1,18 @@
 //! The OS sandbox rust-analyzer and every process it starts run under.
 //!
-//! The sandbox decides one thing: what the server's process tree may map as
-//! executable code and exec. The toolchain and the OS may be; nothing under
-//! the project root may be, even when the root lies inside an allowed
+//! The sandbox decides three things. What the server's process tree may map
+//! as executable code and exec: the toolchain and the OS may be; nothing
+//! under the project root may be, even when the root lies inside an allowed
 //! prefix. A cargo config `[env]` that sets a dynamic-loader variable, a
 //! project binary named as a tool, a project proc-macro dylib: each one is
 //! a map or an exec of project code, and each one fails under the sandbox
 //! however it was reached
 //! ([ADR 0039](../../../docs/adr/0039-rust-server-runs-under-an-os-sandbox.md)).
+//! What it may write: only the server's private temp dir and the cargo
+//! caches (`$CARGO_HOME/registry`, `$CARGO_HOME/git`), never anything under
+//! the project root. And the network: the tree opens no connection, so
+//! offline cargo is enforced by the OS, not only by configuration
+//! ([ADR 0040](../../../docs/adr/0040-rust-sandbox-denies-network-and-writes.md)).
 //!
 //! [`SandboxPolicy`] says what is allowed and denied, independent of the OS;
 //! [`confine`] rewrites the server's [`SemanticConfig`] so it starts under
@@ -23,18 +28,25 @@ use g_mesh_plugin_sdk::lsp::SemanticConfig;
 
 use crate::semantic::Toolchain;
 
-/// What the rust-analyzer process tree may map executable and exec,
-/// independent of the OS. Every path is canonical (symlinks resolved): a
+/// What the rust-analyzer process tree may map executable, exec and write,
+/// independent of the OS. Nothing in the tree may open a network
+/// connection. Every path is canonical (symlinks resolved): a
 /// sandbox matches the resolved path of what is mapped or exec'd, so a rule
 /// written on an alias would not match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPolicy {
-    /// Nothing under it is mapped executable or exec'd.
+    /// Nothing under it is mapped executable, exec'd or written, even inside
+    /// a toolchain or writable prefix.
     pub project_root: PathBuf,
     /// Toolchain prefixes the tree may map and exec (sysroot, rustup proxies
     /// dir, server dir, rustc/cargo dirs), deduplicated. OS prefixes are each
     /// backend's own.
     pub toolchain: Vec<PathBuf>,
+    /// Prefixes the tree may write (the server's private temp dir and the
+    /// cargo caches), deduplicated. A writable prefix inside the root stays
+    /// writable; the root inside one stays read-only. OS write prefixes
+    /// (`/dev`) are each backend's own.
+    pub writable: Vec<PathBuf>,
 }
 
 /// What [`confine`] did to the server's config.
@@ -60,28 +72,38 @@ pub enum SandboxOutcome {
 }
 
 impl SandboxPolicy {
-    /// A policy denying `project_root` and allowing `toolchain`, each path
-    /// canonicalized. A toolchain prefix that does not exist is dropped (it
-    /// holds nothing to map or exec); a root that cannot be canonicalized is
-    /// kept as given.
-    pub fn new(project_root: &Path, toolchain: impl IntoIterator<Item = PathBuf>) -> Self {
+    /// A policy denying `project_root`, allowing map and exec under
+    /// `toolchain` and writes under `writable`, each path canonicalized. A
+    /// prefix that does not exist is dropped (it holds nothing to map, exec
+    /// or keep); a root that cannot be canonicalized is kept as given.
+    pub fn new(
+        project_root: &Path,
+        toolchain: impl IntoIterator<Item = PathBuf>,
+        writable: impl IntoIterator<Item = PathBuf>,
+    ) -> Self {
         let project_root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-        let mut prefixes: Vec<PathBuf> = Vec::new();
-        for prefix in toolchain {
-            if let Ok(prefix) = std::fs::canonicalize(&prefix) {
-                if !prefixes.contains(&prefix) {
-                    prefixes.push(prefix);
-                }
-            }
+        SandboxPolicy {
+            project_root,
+            toolchain: canonical_prefixes(toolchain),
+            writable: canonical_prefixes(writable),
         }
-        SandboxPolicy { project_root, toolchain: prefixes }
     }
 
     /// The policy for `server` (the resolved rust-analyzer) running on
     /// `root` with `toolchain`: the sysroot, the rustup proxies' directory,
     /// and the directories of the server, `rustc` and `cargo`, which lie
-    /// outside the sysroot on an install that is not rustup's.
-    pub(crate) fn for_server(root: &Path, toolchain: &Toolchain, server: &Path) -> Self {
+    /// outside the sysroot on an install that is not rustup's. The tree may
+    /// write `temp` (the server's private `TMPDIR`) and `cargo_home`'s
+    /// `registry/` and `git/` (extracting an already cached dependency), never
+    /// `cargo_home` itself, whose `bin/` and config files reach the user's own
+    /// later cargo runs.
+    pub(crate) fn for_server(
+        root: &Path,
+        toolchain: &Toolchain,
+        server: &Path,
+        cargo_home: Option<&Path>,
+        temp: Option<&Path>,
+    ) -> Self {
         let server = std::fs::canonicalize(server).unwrap_or_else(|_| server.to_path_buf());
         let parent = |path: &Path| path.parent().map(Path::to_path_buf);
         let prefixes = [
@@ -91,8 +113,26 @@ impl SandboxPolicy {
             toolchain.rustc.as_deref().and_then(parent),
             toolchain.cargo.as_deref().and_then(parent),
         ];
-        SandboxPolicy::new(root, prefixes.into_iter().flatten())
+        let writable = [
+            temp.map(Path::to_path_buf),
+            cargo_home.map(|home| home.join("registry")),
+            cargo_home.map(|home| home.join("git")),
+        ];
+        SandboxPolicy::new(root, prefixes.into_iter().flatten(), writable.into_iter().flatten())
     }
+}
+
+/// `prefixes` canonicalized, the missing ones dropped, deduplicated in order.
+fn canonical_prefixes(prefixes: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut canonical: Vec<PathBuf> = Vec::new();
+    for prefix in prefixes {
+        if let Ok(prefix) = std::fs::canonicalize(&prefix) {
+            if !canonical.contains(&prefix) {
+                canonical.push(prefix);
+            }
+        }
+    }
+    canonical
 }
 
 /// Rewrites `config` (command and args) so the server starts under this OS's
@@ -118,7 +158,7 @@ pub fn confine(config: &mut SemanticConfig, policy: &SandboxPolicy, launcher: &P
 }
 
 #[cfg(target_os = "linux")]
-pub use landlock_ns::trampoline;
+pub use landlock_ns::{landlock_abi, trampoline};
 
 /// The macOS backend: `sandbox-exec` with a profile generated from the
 /// policy. `sandbox-exec` execs the server in place, so the spawned pid is
@@ -137,11 +177,14 @@ pub(crate) mod seatbelt {
     /// The backend's name in [`SandboxOutcome::Confined`].
     pub(crate) const BACKEND: &str = "seatbelt";
 
-    /// The profile's operations: mapping a file as executable code, and
-    /// exec.
+    /// The profile's operations: mapping a file as executable code, exec,
+    /// and every kind of write (create, data, unlink, rename, mode, xattr,
+    /// times).
     const MAP: &str = "file-map-executable";
     const EXEC: &str = "process-exec";
     const MAP_EXEC: &str = "file-map-executable process-exec";
+    const WRITE: &str = "file-write*";
+    const MAP_EXEC_WRITE: &str = "file-map-executable process-exec file-write*";
 
     /// OS prefixes whose libraries every process maps.
     const OS_MAP: [&str; 3] = ["/System", "/usr/lib", "/Library/Apple"];
@@ -151,6 +194,9 @@ pub(crate) mod seatbelt {
     /// (Homebrew on Apple silicon and Intel, MacPorts, nix). Allowed for
     /// both operations; one that does not exist is skipped.
     const PACKAGE_PREFIXES: [&str; 4] = ["/opt/homebrew", "/usr/local", "/opt/local", "/nix/store"];
+    /// OS prefixes every process may write: `/dev/null`, `/dev/tty`,
+    /// `/dev/dtracehelper`.
+    const OS_WRITE: [&str; 1] = ["/dev"];
 
     /// One rule of the profile: `allow` or `deny` of `ops` under `path`,
     /// which reaches the profile as the parameter `param`.
@@ -170,7 +216,10 @@ pub(crate) mod seatbelt {
     /// inside an allowed prefix, and a toolchain prefix inside the project
     /// root (indexing `$HOME`, which holds `~/.rustup`) stays allowed. At
     /// equal length (the root is itself an allowed prefix) the deny comes
-    /// last.
+    /// last. Write allows take part in the same ordering: the root deny also
+    /// denies writes, so a root inside a writable prefix stays read-only and
+    /// a writable prefix inside the root (`~/.cargo/registry` when indexing
+    /// `$HOME`) stays writable.
     pub(crate) fn rules(policy: &SandboxPolicy) -> Vec<Rule> {
         let mut allows: Vec<(&'static str, PathBuf)> = Vec::new();
         for prefix in &policy.toolchain {
@@ -183,6 +232,8 @@ pub(crate) mod seatbelt {
         }
         allows.extend(OS_MAP.iter().map(|path| (MAP, PathBuf::from(path))));
         allows.extend(OS_EXEC.iter().map(|path| (EXEC, PathBuf::from(path))));
+        allows.extend(policy.writable.iter().map(|prefix| (WRITE, prefix.clone())));
+        allows.extend(OS_WRITE.iter().map(|path| (WRITE, PathBuf::from(path))));
         let mut deduped: Vec<(&'static str, PathBuf)> = Vec::new();
         for allow in allows {
             if !deduped.contains(&allow) {
@@ -192,7 +243,7 @@ pub(crate) mod seatbelt {
 
         let mut rules: Vec<(bool, &'static str, PathBuf)> =
             deduped.into_iter().map(|(ops, path)| (true, ops, path)).collect();
-        rules.push((false, MAP_EXEC, policy.project_root.clone()));
+        rules.push((false, MAP_EXEC_WRITE, policy.project_root.clone()));
         rules.sort_by_key(|(allow, _, path)| (path.as_os_str().len(), !allow));
 
         let mut next = 0;
@@ -210,11 +261,14 @@ pub(crate) mod seatbelt {
             .collect()
     }
 
-    /// The profile text for `rules`. It names paths only through
-    /// parameters, so no path is ever spelled inside SBPL.
+    /// The profile text for `rules`: map, exec and write denied by default,
+    /// and every network operation (outbound, inbound, bind) denied. It names
+    /// paths only through parameters, so no path is ever spelled inside SBPL.
     pub(crate) fn profile(rules: &[Rule]) -> String {
-        let mut text =
-            String::from("(version 1)\n(allow default)\n(deny file-map-executable)\n(deny process-exec)\n");
+        let mut text = String::from(
+            "(version 1)\n(allow default)\n(deny file-map-executable)\n(deny process-exec)\n\
+             (deny file-write*)\n(deny network*)\n",
+        );
         for rule in rules {
             let verb = if rule.allow { "allow" } else { "deny" };
             text.push_str(&format!("({verb} {} (subpath (param \"{}\")))\n", rule.ops, rule.param));
@@ -360,6 +414,7 @@ mod tests {
         let policy = SandboxPolicy {
             project_root: PathBuf::from("/usr/local/src/project"),
             toolchain: vec![PathBuf::from("/usr/local"), PathBuf::from("/usr/local/src/project/.rustup")],
+            writable: vec![],
         };
         let rules = seatbelt::rules(&policy);
         let root = position(&rules, false, &policy.project_root);
@@ -373,6 +428,7 @@ mod tests {
         let tie = SandboxPolicy {
             project_root: PathBuf::from("/opt/toolchain"),
             toolchain: vec![PathBuf::from("/opt/toolchain")],
+            writable: vec![],
         };
         let rules = seatbelt::rules(&tie);
         assert!(
@@ -395,14 +451,15 @@ mod tests {
         let root = prefix.join("project");
 
         let inside_root = fake_server(&root);
-        let (outcome, config) = confine_server(&inside_root, &SandboxPolicy::new(&root, [prefix.clone()]));
+        let (outcome, config) =
+            confine_server(&inside_root, &SandboxPolicy::new(&root, [prefix.clone()], []));
         assert!(matches!(outcome, SandboxOutcome::Failed(_)), "a server under the root started: {outcome:?}");
         assert_eq!(config, SemanticConfig::new(&inside_root), "a failed confine changed the config");
 
         let home = scratch.0.join("home");
         let rustup = home.join(".rustup");
         let in_prefix = fake_server(&rustup);
-        let (outcome, _) = confine_server(&in_prefix, &SandboxPolicy::new(&home, [rustup.clone()]));
+        let (outcome, _) = confine_server(&in_prefix, &SandboxPolicy::new(&home, [rustup.clone()], []));
         assert_eq!(outcome, SandboxOutcome::Confined { backend: "seatbelt" });
     }
 
@@ -421,14 +478,14 @@ mod tests {
         };
         let scratch = Scratch::new("toolchain");
 
-        let policy = SandboxPolicy::for_server(&scratch.0, &toolchain, &server);
+        let policy = SandboxPolicy::for_server(&scratch.0, &toolchain, &server, None, None);
         let (outcome, config) = confine_server(&server, &policy);
         assert_eq!(outcome, SandboxOutcome::Confined { backend: "seatbelt" }, "{policy:?}");
         assert_eq!(config.command, Path::new(seatbelt::SANDBOX_EXEC));
         assert_eq!(config.args.last().map(String::as_str), server.to_str(), "{:?}", config.args);
 
         let without_sysroot = Toolchain { sysroot: None, ..toolchain };
-        let policy = SandboxPolicy::for_server(&scratch.0, &without_sysroot, &server);
+        let policy = SandboxPolicy::for_server(&scratch.0, &without_sysroot, &server, None, None);
         let (outcome, config) = confine_server(&server, &policy);
         assert!(
             matches!(outcome, SandboxOutcome::Failed(_)),
@@ -454,7 +511,7 @@ mod tests {
         let root = prefix.join("project");
         let server = fake_server(&root);
 
-        let policy = SandboxPolicy::new(&root, [prefix]);
+        let policy = SandboxPolicy::new(&root, [prefix], []);
         let canonical_root = canonical.join("toolchain/project");
         assert_eq!(policy.project_root, canonical_root);
         let args = seatbelt::wrapper_args(&policy).unwrap();
