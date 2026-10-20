@@ -9,6 +9,11 @@ use g_mesh_plugin_rust::extractor::RustExtractor;
 use g_mesh_plugin_rust::project;
 
 fn main() -> ! {
+    // The sandbox trampoline must run before anything starts a thread.
+    #[cfg(target_os = "linux")]
+    if let Some(code) = g_mesh_plugin_rust::sandbox::trampoline(std::env::args_os()) {
+        std::process::exit(code)
+    }
     run(
         RustExtractor,
         PluginSpec::new("rust", env!("CARGO_PKG_VERSION"), &[".rs"]).exclude_dirs(&project::EXCLUDE_DIRS),
