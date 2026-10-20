@@ -235,7 +235,6 @@ impl LspClient {
             .args(&config.args)
             .envs(&config.env)
             // After the manifest's own env, so no manifest can unset it.
-            .env(super::resolve::NO_CWD_EXE_LOOKUP.0, super::resolve::NO_CWD_EXE_LOOKUP.1)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

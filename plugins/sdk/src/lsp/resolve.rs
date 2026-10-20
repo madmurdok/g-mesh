@@ -149,7 +149,6 @@ pub fn probe(command: &Path, args: &[String], budget: Duration) -> Result<String
     let mut child = Command::new(command)
         .args(args)
         .arg("--version")
-        .env(NO_CWD_EXE_LOOKUP.0, NO_CWD_EXE_LOOKUP.1)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
