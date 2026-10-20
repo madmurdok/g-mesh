@@ -557,3 +557,11 @@ Project `g-mesh-wt-gm640` (this worktree); the index built on first call.
 
 grep was used for the integration test file's layout and for docs, the
 Docker script and the CI workflow (non-code or one known file).
+
+## Owner decisions (2026-10-21)
+
+- D1: "Свой каталог на движок (Recommended)" — option A, a private
+  `TMPDIR` per engine.
+- D2: "Только registry/ и git/ (Recommended)" — option A.
+- D3: "Сетевой namespace + Landlock TCP (Recommended)" — option A,
+  `CLONE_NEWNET` in the mount layer, Landlock TCP kept.
