@@ -6,6 +6,9 @@ mechanism comparison and the remaining channels:
 [`GM-587-cargo-env-loader-vars.md`](../design/GM-587-cargo-env-loader-vars.md).
 Follows [ADR 0032](0032-semantic-tiers-execute-no-project-code.md) and
 [ADR 0033](0033-semantic-tiers-reach-no-network-and-write-nothing.md).
+Superseded in part on macOS by
+[ADR 0039](0039-rust-server-runs-under-an-os-sandbox.md): the server runs
+under Seatbelt there, and this pre-check stays as a second layer.
 
 ## Context
 ADR 0032 keeps a project's `.cargo/config.toml` from naming the `rustc`,
