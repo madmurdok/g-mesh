@@ -80,6 +80,8 @@ use anyhow::{Context, Result};
 use g_mesh_plugin_sdk::lsp::{self, is_bare, Candidate, LspBridge, SemanticConfig, PROBE_BUDGET};
 use g_mesh_plugin_sdk::{RelPath, SdkIndex, SemanticAnswer, SemanticEngine};
 
+use crate::sandbox::{self, SandboxOutcome, SandboxPolicy};
+
 /// The language id this plugin speaks, for `didOpen` and for log lines.
 const LANGUAGE: &str = "rust";
 
@@ -102,7 +104,43 @@ const LANGUAGE: &str = "rust";
 /// applies that table to the `rustc` children of `cargo metadata` and
 /// `force = true` defeats any environment override: this returns `Err`
 /// naming the key and the file, and the plugin stays structural-only.
+///
+/// On macOS the server and every process it starts run under Seatbelt and
+/// may map or exec nothing under `root`; when the sandbox cannot be applied
+/// this returns `Err` with the reason instead of starting an unconfined
+/// server (see [`server_config`]).
 pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
+    if let Some(refusal) = cargo_env_loader_var(root).refusal() {
+        anyhow::bail!("{refusal}");
+    }
+    let config = server_config(root)?;
+    // rust-analyzer's start-up phases can be separated by more than the
+    // bridge's 2s settle under load, so its readiness is its own `quiescent`
+    // status rather than a quiet period.
+    // rust-analyzer's own file watcher would rerun `cargo metadata` on a
+    // manifest change before `CheckedBridge` could re-check the configs, so
+    // the server is told the client watches files: it registers its globs
+    // here and reloads only when `CheckedBridge::workspace_changed` asks.
+    // The bridge forwards the `.rs` files a pass is sent, inside
+    // `CheckedBridge::answer`, so even a created or deleted one (which makes
+    // rust-analyzer refetch the workspace) reaches it only after a re-check.
+    let bridge = LspBridge::new(LANGUAGE, root, config).quiescent_signal().client_watches_files();
+    Ok(Box::new(CheckedBridge::new(root, bridge)))
+}
+
+/// The config [`engine`] starts the server with for `root`, minus the cargo
+/// config pre-check: the manifest's server resolved to the toolchain's
+/// binary, [`pinned_env`] on top of the manifest's env, `cargo.sysroot`
+/// pinned, and the command wrapped in this OS's sandbox
+/// ([`sandbox::confine`]).
+///
+/// On macOS the server and every child run under Seatbelt, which lets them
+/// map and exec only the toolchain and the OS, never anything under `root`;
+/// when it cannot be applied this returns `Err` with the reason, and no
+/// unsandboxed server is started. On an OS with no sandbox backend the
+/// server starts unconfined
+/// ([ADR 0039](../../../docs/adr/0039-rust-server-runs-under-an-os-sandbox.md)).
+pub fn server_config(root: &Path) -> Result<SemanticConfig> {
     let mut config = SemanticConfig::from_manifest()
         .context("reading [plugin.semantic] from this plugin's manifest")?
         .ok_or_else(|| {
@@ -113,9 +151,6 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
         })?;
 
     let toolchain = Toolchain::detect();
-    if let Some(refusal) = cargo_env_loader_var(root).refusal() {
-        anyhow::bail!("{refusal}");
-    }
     let resolved = resolve(&config.command, &toolchain)?;
     g_mesh_plugin_sdk::log_line!(
         "[{LANGUAGE}] semantic tier: {} ({}, toolchain {}, cargo offline: dependencies not in the \
@@ -134,18 +169,37 @@ pub fn engine(root: &Path) -> Result<Box<dyn SemanticEngine>> {
             g_mesh_plugin_sdk::log_line!("{hint}");
         }
     }
-    // GM-550: rust-analyzer's start-up phases can be separated by more than
-    // the bridge's 2s settle under load (2.04s and 2.47s measured), so its
-    // readiness is its own `quiescent` status rather than a quiet period.
-    // rust-analyzer's own file watcher would rerun `cargo metadata` on a
-    // manifest change before `CheckedBridge` could re-check the configs, so
-    // the server is told the client watches files: it registers its globs
-    // here and reloads only when `CheckedBridge::workspace_changed` asks.
-    // The bridge forwards the `.rs` files a pass is sent, inside
-    // `CheckedBridge::answer`, so even a created or deleted one (which makes
-    // rust-analyzer refetch the workspace) reaches it only after a re-check.
-    let bridge = LspBridge::new(LANGUAGE, root, config).quiescent_signal().client_watches_files();
-    Ok(Box::new(CheckedBridge::new(root, bridge)))
+    let policy = SandboxPolicy::for_server(root, &toolchain, &config.command);
+    admit(sandbox::confine(&mut config, &policy), &policy)?;
+    Ok(config)
+}
+
+/// Whether the server may start after [`sandbox::confine`] reported
+/// `outcome`: a confined or a backend-less start is logged and admitted; a
+/// backend that could not confine is `Err`, so the project stays on the
+/// structural tier rather than run an unconfined server.
+fn admit(outcome: SandboxOutcome, policy: &SandboxPolicy) -> Result<()> {
+    match outcome {
+        SandboxOutcome::Confined { backend } => {
+            let allowed: Vec<String> = policy.toolchain.iter().map(|p| p.display().to_string()).collect();
+            g_mesh_plugin_sdk::log_line!(
+                "[{LANGUAGE}] semantic tier: rust-analyzer runs under {backend}; it may map and exec \
+                 the OS, package-manager prefixes and {}, and nothing under {}",
+                allowed.join(", "),
+                policy.project_root.display()
+            );
+            Ok(())
+        }
+        SandboxOutcome::NoBackend => {
+            g_mesh_plugin_sdk::log_line!(
+                "[{LANGUAGE}] semantic tier: no OS sandbox on this platform; rust-analyzer runs unconfined"
+            );
+            Ok(())
+        }
+        SandboxOutcome::Failed(reason) => {
+            anyhow::bail!("rust-analyzer cannot run sandboxed, semantic tier refused: {reason}")
+        }
+    }
 }
 
 /// The engine [`engine`] returns: the bridge, behind a re-check of the cargo
@@ -224,26 +278,26 @@ impl SemanticEngine for CheckedBridge {
 /// without consulting the project: every `rustup` call runs in
 /// [`neutral_dir`], so no `rust-toolchain.toml` is in scope.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Toolchain {
+pub(crate) struct Toolchain {
     /// The rustup toolchain name: the daemon's own `RUSTUP_TOOLCHAIN`, else
     /// `rustup default`. `None` without rustup or without a default.
-    pin: Option<String>,
+    pub(crate) pin: Option<String>,
     /// The `rustup` binary every proxy runs, canonicalized (symlinks
     /// resolved). `None` when rustup is not on `PATH`.
-    rustup: Option<PathBuf>,
+    pub(crate) rustup: Option<PathBuf>,
     /// The toolchain's own binaries, as absolute paths (never proxies).
-    rust_analyzer: Option<PathBuf>,
-    rustc: Option<PathBuf>,
-    cargo: Option<PathBuf>,
+    pub(crate) rust_analyzer: Option<PathBuf>,
+    pub(crate) rustc: Option<PathBuf>,
+    pub(crate) cargo: Option<PathBuf>,
     /// `rustc --print sysroot` of [`Toolchain::rustc`], run in
     /// [`neutral_dir`]. The server gets it as `cargo.sysroot` (GM-603), so it
     /// loads std from this toolchain and never runs `rustup component add
     /// rust-src` itself. `None` when there is no `rustc` or it fails.
-    sysroot: Option<PathBuf>,
+    pub(crate) sysroot: Option<PathBuf>,
 }
 
 impl Toolchain {
-    fn detect() -> Self {
+    pub(crate) fn detect() -> Self {
         let rustup_bin = on_path("rustup").map(|rustup| std::fs::canonicalize(&rustup).unwrap_or(rustup));
         if rustup_bin.is_none() {
             // Not rustup-managed: no proxy reads a toolchain file, and the
@@ -481,7 +535,8 @@ fn rust_src_hint(sysroot: &Path, pin: Option<&str>, rust_src_path: Option<&Path>
 /// variable. The config's `[env]` table reaches `rustc` by another route,
 /// which no variable here outranks (`force = true` overrides any inherited
 /// value): a dynamic-loader variable in it is refused by [`engine`] (see
-/// [`cargo_env_loader_var`]), and its other entries stay outside this map.
+/// [`cargo_env_loader_var`]) and, on macOS, the server runs under Seatbelt
+/// (see [`sandbox`]), and its other entries stay outside this map.
 /// `CARGO_NET_OFFLINE` reaches every cargo the server runs (`metadata`,
 /// `locate-project`, `config get`), so none of them downloads a dependency
 /// or refreshes a registry index.
@@ -1143,12 +1198,13 @@ mod tests {
         }
     }
 
-    /// `engine` starts the server with `pinned_env` on top of the manifest's
-    /// env, so the unit test above is the env the server really gets.
+    /// `server_config` puts `pinned_env` on top of the manifest's env, so the
+    /// unit test above is the env the server really gets.
     #[test]
     fn the_engine_starts_the_server_with_the_pinned_env() {
         let source = include_str!("semantic.rs");
-        let engine = &source[source.find("pub fn engine(").expect("this file defines `engine`")..];
+        let engine =
+            &source[source.find("pub fn server_config(").expect("this file defines `server_config`")..];
         let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
         assert!(body.contains("config.env.extend(pinned_env(&toolchain));"), "{body}");
     }
@@ -1690,17 +1746,19 @@ mod tests {
         assert_eq!(toolchain.sysroot, sysroot_of(rustc));
     }
 
-    /// `engine` pins the sysroot and logs the hint after `pinned_env`, and
-    /// before the bridge takes the config. The engine cannot be run here
-    /// without starting rust-analyzer, so this reads `engine`'s body, like
-    /// the tests above.
+    /// `server_config` pins the sysroot and logs the hint after
+    /// `pinned_env`, and before the sandbox wraps the config (which `engine`
+    /// then hands to the bridge). It cannot be run here without starting
+    /// rust-analyzer, so this reads `server_config`'s body, like the tests
+    /// above.
     ///
-    /// Controls: delete the `pin_sysroot` call in `engine`; or move it below
-    /// `LspBridge::new`; or pass `None` for `rust_src_path`.
+    /// Controls: delete the `pin_sysroot` call in `server_config`; or move it
+    /// below `sandbox::confine`; or pass `None` for `rust_src_path`.
     #[test]
     fn the_engine_pins_the_sysroot_and_hints_after_the_pinned_env() {
         let source = include_str!("semantic.rs");
-        let engine = &source[source.find("pub fn engine(").expect("this file defines `engine`")..];
+        let engine =
+            &source[source.find("pub fn server_config(").expect("this file defines `server_config`")..];
         let body = &engine[..engine.find("\n}\n").expect("`engine` ends")];
         let at =
             |needle: &str| body.find(needle).unwrap_or_else(|| panic!("`engine` lacks `{needle}`:\n{body}"));
@@ -1708,8 +1766,8 @@ mod tests {
         let pin = at("pin_sysroot(&mut config.initialization_options, sysroot);");
         let source = at("std_source(config.initialization_options.as_ref(), root, sysroot)");
         let hint = at("std_hint(&source, sysroot, toolchain.pin.as_deref(), rust_src_path.as_deref())");
-        let bridge = at("LspBridge::new(LANGUAGE, root, config)");
-        assert!(env < pin && pin < source && source < hint && hint < bridge, "{body}");
+        let confine = at("sandbox::confine(&mut config, &policy)");
+        assert!(env < pin && pin < source && source < hint && hint < confine, "{body}");
         assert!(body.contains("std::env::var(\"RUST_SRC_PATH\")"), "{body}");
     }
 
@@ -2205,5 +2263,30 @@ mod tests {
         let _locked = ModeGuard::set(&root, 0o300, 0o755);
         let (file, error) = unchecked(&scratch, &root);
         assert_eq!(file, root, "the refusal names another path ({error})");
+    }
+
+    /// A sandbox that cannot confine the server refuses the semantic tier
+    /// with the reason; an OS with no backend starts the server.
+    ///
+    /// Control: treat `SandboxOutcome::Failed` like `NoBackend` in `admit`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandbox_that_cannot_confine_the_server_refuses_the_semantic_tier() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("sandbox-refused");
+        let server = scratch.0.join("rust-analyzer");
+        std::fs::write(&server, "#!/bin/sh\necho \"rust-analyzer 0.0.0-fake\"\n").unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let policy = SandboxPolicy::new(&scratch.0, []);
+        let mut config = SemanticConfig::new(&server);
+
+        let outcome = sandbox::confine(&mut config, &policy);
+        assert!(
+            matches!(outcome, SandboxOutcome::Failed(_)),
+            "sanity: a server under the project root passed the preflight: {outcome:?}"
+        );
+        let error = admit(outcome, &policy).expect_err("a server that cannot be confined was admitted");
+        assert!(format!("{error:#}").contains("semantic tier refused"), "{error:#}");
+        assert!(admit(SandboxOutcome::NoBackend, &policy).is_ok());
     }
 }

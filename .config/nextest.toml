@@ -153,6 +153,8 @@ not (
     (binary_id(g-mesh::it) & test(=orphaned_daemon::a_daemon_whose_project_root_still_exists_is_left_alone)) |
     (binary_id(g-mesh-plugin-rust::conformance) & test(=the_linked_index_answers_the_acceptance_criteria)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=cargo_env_loader_var::a_loader_var_added_after_start_stops_the_server_before_any_reload)) |
+    (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves)) |
+    (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves_in_its_env)) |
     (binary_id(g-mesh-plugin-typescript::indexing_writes_nothing_and_stays_offline) & test(=indexing_reaches_no_network_and_writes_nothing_under_the_root)) |
     (binary_id(g-mesh-plugin-typescript::semantic_runs_no_project_code) & test(=the_shipped_settings_load_no_project_typescript_or_plugin_and_run_no_npm)) |
     (binary_id(g-mesh-plugin-rust::indexing_writes_nothing_and_stays_offline) & test(=indexing_reaches_no_network_and_writes_nothing_under_the_root)) |
