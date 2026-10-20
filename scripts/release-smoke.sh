@@ -35,12 +35,13 @@
 # `BulkIndexSummary` (core/src/daemon/bulk_index.rs) is one project-wide
 # aggregate - so this script's primary assertion (both counts non-zero) proves
 # *something* extracted *something*, not that every one of the four languages
-# individually did. Where `sqlite3` is available (confirmed present on the
-# macOS and Ubuntu runner images this targets; not confirmed on the Windows
-# one, so skipped there rather than assumed) this also queries the index
-# directly and checks each language contributed at least one node of its own -
-# see the per-language section below and scripts/release-smoke-fixture/
-# README.md for the full argument.
+# individually did. So this also queries the index directly and checks each
+# language contributed at least one node of its own - see the per-language
+# section below and scripts/release-smoke-fixture/README.md for the full
+# argument. The query runs through the `sqlite3` CLI where it is on PATH (the
+# macOS and Ubuntu runner images), and otherwise through Python's standard
+# `sqlite3` module (the Windows image has Python but no `sqlite3` CLI). Only
+# when neither is available is the check skipped, and the log says so.
 #
 # Deliberately NOT run: `g-mesh model fetch`. GM-206 measured that at ~614MiB
 # per platform per release - four downloads of the same ~614MiB per release to
@@ -59,7 +60,7 @@
 # reindex itself: with every other root replaced by the override, a language
 # whose asset holds no usable manifest is reported as "<language> has no
 # plugin installed" for its fixture file, and both legs fail on that line.
-# That holds even where the per-language sqlite3 check is skipped.
+# That holds even where the per-language check is skipped.
 #
 # Usage: scripts/release-smoke.sh <stage_dir> <target> [<asset_dir>]
 #   stage_dir  the unpacked staging directory build-targets.sh leaves on disk
@@ -85,6 +86,34 @@ log() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURE_DIR="$SCRIPT_DIR/release-smoke-fixture"
+
+# How the per-language check queries an index: the `sqlite3` CLI, else a
+# Python whose standard `sqlite3` module imports, else nothing (empty). The
+# Python candidate is run, not just looked up, because on Windows `python3`
+# can be the Store's stub that only prints an install hint.
+sqlite_via=""
+if command -v sqlite3 >/dev/null 2>&1; then
+	sqlite_via="sqlite3"
+else
+	for py in python3 python; do
+		if command -v "$py" >/dev/null 2>&1 && "$py" -I -c 'import sqlite3' >/dev/null 2>&1; then
+			sqlite_via="$py"
+			break
+		fi
+	done
+fi
+
+# Prints the result of one-value query $2 against index $1. Under Git Bash
+# the MSYS runtime turns $1's POSIX path into a Windows one for a native
+# python.exe, so no conversion is needed here.
+sqlite_scalar() {
+	if [ "$sqlite_via" = "sqlite3" ]; then
+		sqlite3 "$1" "$2"
+	else
+		"$sqlite_via" -I -c 'import sqlite3, sys
+print(sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone()[0])' "$1" "$2"
+	fi
+}
 
 if [ $# -ne 2 ] && [ $# -ne 3 ]; then
 	die "usage: release-smoke.sh <stage_dir> <target> [<asset_dir>]"
@@ -174,10 +203,10 @@ smoke_reindex() {
 	# Best-effort per-language check - see this script's header. Non-fatal to
 	# skip; fatal if it runs and finds a language with nothing to show for it.
 	db="$(find "$home_dir/projects" -maxdepth 2 -name 'index.db' -print -quit 2>/dev/null || true)"
-	if command -v sqlite3 >/dev/null 2>&1 && [ -n "$db" ]; then
-		log "per-language check: querying $db"
+	if [ -n "$sqlite_via" ] && [ -n "$db" ]; then
+		log "per-language check: querying $db (via $sqlite_via)"
 		for ext in go rs py ts; do
-			count="$(sqlite3 "$db" "SELECT COUNT(*) FROM nodes WHERE filePath LIKE '%.$ext';")"
+			count="$(sqlite_scalar "$db" "SELECT COUNT(*) FROM nodes WHERE filePath LIKE '%.$ext';")"
 			# No `.$ext:` here: actions/setup-go's problem matcher (owner "go",
 			# `^\s*(.+\.go):(?:(\d+):(\d+):)? (.*)`) reads `.go: ` as a compiler
 			# error and annotates a passing job (GM-627).
@@ -185,7 +214,7 @@ smoke_reindex() {
 			[ "$count" -gt 0 ] || die ".$ext contributed 0 nodes - that plugin ran but extracted nothing from its own fixture file (aggregate nodes=$nodes came entirely from the other languages)"
 		done
 	else
-		log "per-language check skipped (sqlite3 not on PATH, or no index.db found) - relying on the aggregate nodes/edges check above only"
+		log "per-language check skipped (neither sqlite3 nor a Python with its sqlite3 module on PATH, or no index.db found) - relying on the aggregate nodes/edges check above only"
 	fi
 	log "PASS ($leg): $target spawned its plugins, indexed the fixture, and produced a non-empty graph ($nodes nodes, $edges edges)"
 }

@@ -198,13 +198,14 @@ on:
       # sources, and the script that decides whether `tests` runs.
       - "scripts/lib/runnable.sh"
       - "scripts/ci-green-for-commit.sh"
-      # GM-333: a change to any of these three should get the same "watch all
+      # GM-333: a change to any of these should get the same "watch all
       # four jobs" PR run as a change to the build/package scripts above -
       # they are what the new smoke-test steps in the `build` job actually
       # run.
       - "scripts/release-smoke.sh"
       - "scripts/release-smoke-fixture/**"
       - "scripts/install.ps1"
+      - "scripts/mcp-smoke.py"
 
 # The floor for every job. Only the `publish` job raises it, to `contents:
 # write`, and only for itself - the jobs that compile third-party C, C++ and
@@ -466,28 +467,32 @@ jobs:
           stage_dir="$(bash scripts/build-targets.sh --stage-dir ${{ matrix.target }})"
           bash scripts/release-smoke.sh "$stage_dir" ${{ matrix.target }} dist
 
-      # GM-333. `scripts/install.ps1` is 616 lines that, until this step, had
-      # never been *executed* anywhere - ci.yml's "install.ps1 parses under
-      # PowerShell" (GM-342) proves only that it parses, and its own comment
-      # says so: "Running the thing end to end is GM-333." This is that run,
-      # against the archive this job just staged rather than a published
-      # release - there is no published release to install from during a
-      # build. A tiny local file server hands out the staged `.zip` and
-      # `.sha256` at the same `<base>/v<version>/<asset>` shape install.ps1
-      # expects from GitHub Releases; `G_MESH_DOWNLOAD_BASE` is documented and
-      # injectable for exactly this (see install.ps1's own "TESTING IT
-      # WITHOUT A RELEASE" section - this step automates precisely what that
-      # section says to run by hand). Everything this step creates - the
-      # server's files and the install itself - lives under
-      # `$env:RUNNER_TEMP`, which the runner discards on its own, and the
-      # `finally` block below tears the server and the install down besides,
-      # so nothing here can affect a later step.
+      # Runs scripts/install.ps1 end to end against the archive this job just
+      # staged (there is no published release to install from during a
+      # build). A local file server hands out the staged `.zip` and `.sha256`
+      # at the `<base>/v<version>/<asset>` shape install.ps1 expects from
+      # GitHub Releases, through the documented `G_MESH_DOWNLOAD_BASE`
+      # override (install.ps1's "TESTING IT WITHOUT A RELEASE" section). The
+      # installed g-mesh.exe must then report the version, list all four
+      # bundled plugins, index scripts/release-smoke-fixture (non-zero nodes
+      # and edges, no undiscovered or shadowed plugin) and answer one
+      # `find_callers` call over MCP through `mcp-shim` with a caller in every
+      # language (scripts/mcp-smoke.py). After that come the user-Path, -Force
+      # and opt-out checks.
       #
-      # Unverified: this has never run on a real Windows runner (this change
-      # could not be exercised by pushing - see the PR/commit that introduced
-      # it). It assumes `python` is on PATH, which GitHub's `windows-2022`
-      # image documents; if that stops being true this fails loudly ("python"
-      # not found) rather than silently skipping.
+      # Invariant: the checkout's `plugins\` is renamed for the whole step.
+      # The binary also searches a compiled-in root, `<checkout>\core\..\plugins`,
+      # which on this runner is the live checkout, so with it in place a
+      # plugin install.ps1 failed to install would still be found there and
+      # every discovery check above would pass. Hidden, discovery is what a
+      # user's machine has. `finally` renames it back and stops the daemon
+      # the MCP call started, before removing the install it runs from.
+      #
+      # Everything the step creates lives under `$env:RUNNER_TEMP`, and
+      # `finally` tears the server and the installs down besides, so nothing
+      # here can affect a later step. It needs `python` on PATH (GitHub's
+      # `windows-2022` image documents it); without it the step fails loudly
+      # ("python not found") rather than skipping.
       - name: Install from the staged archive with install.ps1 (GM-333)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
@@ -533,7 +538,19 @@ jobs:
             @($raw -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -ieq $dir.TrimEnd('\')) }).Count
           }
 
+          # Paths for the installed-binary index + MCP smoke, and the
+          # checkout plugins\ rename (see this step's comment).
+          $checkoutPlugins = Join-Path $PWD 'plugins'
+          $hiddenPluginsName = 'plugins.gm205-hidden'
+          $hiddenPlugins = Join-Path $PWD $hiddenPluginsName
+          $pluginsHidden = $false
+          $smokeProject = Join-Path $env:RUNNER_TEMP 'gm205-proj'
+          $smokeHome = Join-Path $env:RUNNER_TEMP 'gmh'
+
           try {
+            Rename-Item -LiteralPath $checkoutPlugins -NewName $hiddenPluginsName
+            $pluginsHidden = $true
+
             $ready = $false
             for ($i = 0; $i -lt 40; $i++) {
               try {
@@ -577,6 +594,53 @@ jobs:
             }
 
             Write-Host "PASS: install.ps1 installed g-mesh $version from the staged archive, and the installed binary runs with all four bundled plugins discovered"
+
+            Write-Host "==> indexing scripts/release-smoke-fixture with the installed binary"
+            Copy-Item -LiteralPath (Join-Path $PWD 'scripts/release-smoke-fixture') -Destination $smokeProject -Recurse
+            Remove-Item -LiteralPath (Join-Path $smokeProject 'README.md')
+            New-Item -ItemType Directory -Path $smokeHome -Force | Out-Null
+            # A short G_MESH_HOME: the daemon's AF_UNIX socket lives under it
+            # and its path must stay under ~108 characters.
+            $env:G_MESH_HOME = $smokeHome
+            Remove-Item Env:CLAUDE_PROJECT_DIR -ErrorAction SilentlyContinue
+            Push-Location -LiteralPath $smokeProject
+            $savedEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+              $reindexOutput = ((& $exe reindex 2>&1 | ForEach-Object { "$_" }) -join "`n")
+              $reindexStatus = $LASTEXITCODE
+            } finally {
+              $ErrorActionPreference = $savedEap
+              Pop-Location
+            }
+            Write-Host $reindexOutput
+            if ($reindexStatus -ne 0) {
+              throw "installed g-mesh.exe reindex exited $reindexStatus against the fixture - see output above"
+            }
+            if ($reindexOutput -match 'has no plugin installed') {
+              throw "installed g-mesh.exe reindex reports a language with no plugin installed - its plugin was not discovered beside the installed binary"
+            }
+            if ($reindexOutput -match 'shadows') {
+              throw "installed g-mesh.exe reindex found a plugin in more than one root - discovery is not what a user's machine has"
+            }
+            $counts = [regex]::Match($reindexOutput, '(?m)^\s*index:\s+(\d+) nodes, (\d+) edges')
+            if (-not $counts.Success) {
+              throw "installed g-mesh.exe reindex output has no 'index: N nodes, M edges' line"
+            }
+            $nodes = [int]$counts.Groups[1].Value
+            $edges = [int]$counts.Groups[2].Value
+            if ($nodes -le 0 -or $edges -le 0) {
+              throw "installed g-mesh.exe indexed $nodes node(s) and $edges edge(s) from the fixture - expected both above 0"
+            }
+            Write-Host "==> reindex reported $nodes node(s), $edges edge(s)"
+
+            Write-Host "==> one find_callers call over MCP through the installed binary's mcp-shim"
+            & python -I (Join-Path $PWD 'scripts/mcp-smoke.py') $exe $smokeProject
+            if ($LASTEXITCODE -ne 0) {
+              throw "scripts/mcp-smoke.py exited $LASTEXITCODE against the installed g-mesh.exe - see output above"
+            }
+            Remove-Item Env:G_MESH_HOME
+            Write-Host "PASS: the installed g-mesh.exe indexed the fixture and answered find_callers over MCP (go, python, rust, typescript)"
 
             $count = Get-UserPathCount $installDir
             if ($count -ne 1) {
@@ -637,6 +701,17 @@ jobs:
             }
             Write-Host "PASS: G_MESH_NO_MODIFY_PATH=1 left the user Path alone"
           } finally {
+            # The daemon runs from $installDir and holds files under it and
+            # under G_MESH_HOME; stop it before anything is removed.
+            $installedExe = Join-Path $installDir 'g-mesh.exe'
+            if ((Test-Path -LiteralPath $installedExe -PathType Leaf) -and (Test-Path -LiteralPath $smokeProject -PathType Container)) {
+              $env:G_MESH_HOME = $smokeHome
+              Push-Location -LiteralPath $smokeProject
+              try { & $installedExe stop 2>&1 | Out-Host } catch { } finally { Pop-Location }
+            }
+            Remove-Item Env:G_MESH_HOME -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $smokeProject -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $smokeHome -Recurse -Force -ErrorAction SilentlyContinue
             if ($server -and -not $server.HasExited) {
               Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
             }
@@ -652,6 +727,11 @@ jobs:
             $envKey.Close()
             Remove-Item -LiteralPath $serveRoot -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item Env:G_MESH_DOWNLOAD_BASE -ErrorAction SilentlyContinue
+            # Last, so a failed rename still fails the step without skipping
+            # the cleanup above.
+            if ($pluginsHidden) {
+              Rename-Item -LiteralPath $hiddenPlugins -NewName 'plugins'
+            }
           }
 
       # `meta/` rides along inside the same artifact rather than as a second
@@ -668,6 +748,80 @@ jobs:
             dist/*.sha256
             dist/meta/*.txt
           if-no-files-found: error
+
+  # Installs the latest *published* GitHub Release on a clean Windows runner
+  # with the README's one-liner, as a user runs it: install.ps1 from `main`
+  # on raw.githubusercontent.com piped into `iex`, the version from the
+  # releases/latest API, the archive and checksum from GitHub Releases, the
+  # default install directory and user-Path edit. Once under PowerShell 7
+  # (`pwsh`) and once under Windows PowerShell 5.1 (`powershell`, what stock
+  # Windows ships). It tests what is already published, not this commit, so
+  # it has no checkout and no build and runs on a manual dispatch only. Its
+  # token is read-only; it publishes nothing.
+  install-latest:
+    name: Install the latest published release on Windows
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      # install.ps1 sends it to the releases/latest API when set: shared
+      # runner IPs run out of the unauthenticated 60-per-hour limit.
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: README one-liner under PowerShell 7 (pwsh)
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath (Join-Path $env:USERPROFILE '.g-mesh') -Recurse -Force -ErrorAction SilentlyContinue
+          irm https://raw.githubusercontent.com/madmurdok/g-mesh/main/scripts/install.ps1 | iex
+          $exe = Join-Path $env:USERPROFILE '.g-mesh\bin\g-mesh.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "the one-liner reported success but $exe does not exist"
+          }
+          $latest = (Invoke-RestMethod -Uri 'https://api.github.com/repos/madmurdok/g-mesh/releases/latest' -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN" }).tag_name.TrimStart('v')
+          $reported = ((& $exe --version) -join "`n")
+          if ($LASTEXITCODE -ne 0 -or $reported -notmatch [regex]::Escape($latest)) {
+            throw "installed g-mesh.exe --version did not report the latest release $latest (exit $LASTEXITCODE, output: $reported)"
+          }
+          $plugins = ((& $exe plugins list) -join "`n")
+          if ($LASTEXITCODE -ne 0) {
+            throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
+          }
+          foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
+            if ($plugins -notmatch $lang) {
+              throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$plugins"
+            }
+          }
+          Write-Host "PASS: the README one-liner installed g-mesh $latest from GitHub Releases under PowerShell $($PSVersionTable.PSVersion), and it runs with all four bundled plugins"
+
+      - name: README one-liner under Windows PowerShell 5.1 (powershell)
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5) {
+            throw "expected Windows PowerShell 5.x, got $($PSVersionTable.PSVersion)"
+          }
+          Remove-Item -LiteralPath (Join-Path $env:USERPROFILE '.g-mesh') -Recurse -Force -ErrorAction SilentlyContinue
+          irm https://raw.githubusercontent.com/madmurdok/g-mesh/main/scripts/install.ps1 | iex
+          $exe = Join-Path $env:USERPROFILE '.g-mesh\bin\g-mesh.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "the one-liner reported success but $exe does not exist"
+          }
+          $latest = (Invoke-RestMethod -Uri 'https://api.github.com/repos/madmurdok/g-mesh/releases/latest' -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN" }).tag_name.TrimStart('v')
+          $reported = ((& $exe --version) -join "`n")
+          if ($LASTEXITCODE -ne 0 -or $reported -notmatch [regex]::Escape($latest)) {
+            throw "installed g-mesh.exe --version did not report the latest release $latest (exit $LASTEXITCODE, output: $reported)"
+          }
+          $plugins = ((& $exe plugins list) -join "`n")
+          if ($LASTEXITCODE -ne 0) {
+            throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
+          }
+          foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
+            if ($plugins -notmatch $lang) {
+              throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$plugins"
+            }
+          }
+          Write-Host "PASS: the README one-liner installed g-mesh $latest from GitHub Releases under PowerShell $($PSVersionTable.PSVersion), and it runs with all four bundled plugins"
 
   # The publish job's dangerous half - "are these the right files, under the
   # right names" - rehearsed on every non-tag run, so it is not first exercised
