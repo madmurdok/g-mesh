@@ -326,3 +326,14 @@ After the green run: link the run in GM-205. Remove or rewrite the
     criteria say.
 - **Recommendation:** (a). The acceptance criteria's re-assessment is still
   recorded after the run.
+
+## Owner decisions (2026-10-21)
+
+- D1: "Пушить task-ветку (Recommended)" — dispatch release.yml on
+  `ci/GM-205-windows-archive-install`.
+- D2: "Переименовать plugins\ на время шага (Recommended)" — option (a).
+- D3: "Да, в этой задаче (Recommended)" — E7 lands in GM-205.
+- D4: "Добавить в GM-205" — option (b): the one-liner / Windows PowerShell
+  5.1 / real-download install check joins this task (acceptance criteria
+  amended).
+- D5: "Понизить сейчас (Recommended)" — priority 6 -> 2, still in 4.15.0.
