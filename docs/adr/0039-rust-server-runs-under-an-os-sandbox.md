@@ -8,6 +8,10 @@ Supersedes in part, on macOS, [ADR 0037](0037-rust-tier-refuses-cargo-env-loader
 follows [ADR 0032](0032-semantic-tiers-execute-no-project-code.md).
 Linux backend: GM-601 (owner decisions D1 A, D2 A, D3 A, D4 A, D5 A;
 [`GM-601-linux-landlock-sandbox.md`](../design/GM-601-linux-landlock-sandbox.md)).
+D4 A and the "No Linux layer confines writes" consequence are superseded by
+[ADR 0040](0040-rust-sandbox-denies-network-and-writes.md) (GM-640): the
+sandbox now also denies network and writes outside a private temp dir and
+the cargo caches.
 
 ## Context
 ADR 0037 closes one channel by which a project gets its code mapped into a

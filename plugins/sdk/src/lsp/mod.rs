@@ -82,6 +82,8 @@
 mod bridge;
 mod client;
 mod config;
+#[cfg(all(test, windows))]
+mod cwd_exe_lookup_windows_tests;
 mod position;
 mod resolve;
 
