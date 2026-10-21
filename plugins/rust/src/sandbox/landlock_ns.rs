@@ -15,7 +15,8 @@
 //!   mapped executable (`LD_PRELOAD`, `dlopen`). The network namespace has
 //!   only a down loopback, so no TCP, UDP or abstract unix socket connects.
 //! - **landlock**: a Landlock domain allowing exec only under the same
-//!   prefixes, writes only under the writable prefixes and `/dev`, no TCP
+//!   prefixes, writes only under the writable prefixes and to a few `/dev` nodes
+//!   (`null`, `zero`, `full`, `tty`, `random`, `urandom`), no TCP
 //!   bind or connect, and no connect to a pathname unix socket (ABI >= 9).
 //!   Landlock does not check `mmap(PROT_EXEC)`, so on its own it blocks
 //!   execs, not library loads; it never covers UDP.

@@ -274,7 +274,7 @@ fn admit(outcome: SandboxOutcome, policy: &SandboxPolicy) -> Result<()> {
         SandboxOutcome::Partial { backend, gap } => {
             g_mesh_plugin_sdk::log_line!(
                 "[{LANGUAGE}] semantic tier: rust-analyzer runs under {backend} only; shared-object loads \
-                 from the project are not blocked ({gap}); the cargo config pre-check still refuses the \
+                 from the project and the writable dirs are not blocked ({gap}); the cargo config pre-check still refuses the \
                  [env] loader channel"
             );
             Ok(())
