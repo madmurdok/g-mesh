@@ -208,12 +208,12 @@ pub fn render(outcome: &Outcome, project_root: &Path) -> String {
         outcome.summary.linked_imports,
         outcome.summary.linked_symbols,
     );
-    if outcome.embeddings.candidates > 0 {
+    if outcome.embeddings.owed_a_vector() > 0 {
         let _ = writeln!(
             out,
             "  embeddings: {} of {} nodes got a vector - {} from the embedding cache, {} embedded",
             outcome.embeddings.cache_hits + outcome.embeddings.embedded,
-            outcome.embeddings.candidates,
+            outcome.embeddings.owed_a_vector(),
             outcome.embeddings.cache_hits,
             outcome.embeddings.embedded,
         );
@@ -302,7 +302,12 @@ mod tests {
             daemon_was_running: false,
             summary: BulkIndexSummary::default(),
             semantic_pass_ran: false,
-            embeddings: backfill::BackfillSummary { candidates: 12, embedded: 3, cache_hits: 9 },
+            embeddings: backfill::BackfillSummary {
+                candidates: 12,
+                embedded: 3,
+                cache_hits: 9,
+                ..Default::default()
+            },
         };
 
         let rendered = render(&outcome, &PathBuf::from("/tmp/project"));

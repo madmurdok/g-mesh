@@ -109,6 +109,12 @@ pub(crate) struct EmbedInput<'a> {
     pub(crate) signature: Option<&'a str>,
 }
 
+/// The generation of [`is_noise`]'s rule. An index records the generation
+/// whose vectors it last purged (`embedding::backfill`'s one-time noise
+/// purge); bump this whenever the rule changes, so every existing index
+/// purges the vectors the new rule filters once more.
+pub(crate) const NOISE_RULE_VERSION: &str = "1";
+
 /// Words [`is_noise`] does not count as identifiers of a signature, compared
 /// lowercased.
 const SIGNATURE_KEYWORDS: &[&str] = &[

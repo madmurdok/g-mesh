@@ -682,6 +682,19 @@ CREATE TABLE IF NOT EXISTS seed_origin (
     seededAt            TEXT NOT NULL,
     reconciledAt        TEXT
 );
+
+-- The generation of the embedding noise rule (`embedding::text::
+-- NOISE_RULE_VERSION`) whose vectors this index last purged
+-- (`embedding::backfill`'s one-time noise purge). No row, or another
+-- generation, means vectors stored before that rule may still be held by
+-- nodes it filters. Dropped by `wipe`, so a rebuilt index purges again (a
+-- no-op scan of what it embedded under the rule). Added by `CREATE TABLE IF
+-- NOT EXISTS`, so an existing index gains it without a schema-version bump.
+CREATE TABLE IF NOT EXISTS embedding_noise_purge (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    ruleVersion TEXT NOT NULL,
+    purgedAt    TEXT NOT NULL
+);
 "#;
 
 /// Applies the graph schema DDL to a fresh (or already up-to-date) connection.
@@ -2000,6 +2013,25 @@ pub fn set_embedding_model(conn: &Connection, model: &str) -> Result<()> {
     Ok(())
 }
 
+/// The noise-rule generation whose vectors this index last purged
+/// (`embedding_noise_purge.ruleVersion`), or `None` if it never ran one.
+pub fn noise_purge_rule(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row("SELECT ruleVersion FROM embedding_noise_purge WHERE id = 1", [], |row| row.get(0))
+        .optional()
+        .context("failed to read embedding_noise_purge")
+}
+
+/// Records that this index purged the vectors noise-rule generation `rule`
+/// filters.
+pub fn record_noise_purge(conn: &Connection, rule: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO embedding_noise_purge (id, ruleVersion, purgedAt) VALUES (1, ?1, CURRENT_TIMESTAMP)",
+        params![rule],
+    )
+    .context("failed to record the embedding noise purge")?;
+    Ok(())
+}
+
 fn wipe(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         // Children before parents: with `foreign_keys` on, dropping `nodes`
@@ -2021,7 +2053,8 @@ fn wipe(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS semantic_owed_files; DROP TABLE IF EXISTS semantic_residual; \
          DROP TABLE IF EXISTS semantic_gap_files; DROP TABLE IF EXISTS language_outcome; \
          DROP TABLE IF EXISTS language_retry; \
-         DROP TABLE IF EXISTS resolution_facts; DROP TABLE IF EXISTS seed_origin;",
+         DROP TABLE IF EXISTS resolution_facts; DROP TABLE IF EXISTS seed_origin; \
+         DROP TABLE IF EXISTS embedding_noise_purge;",
     )
     .context("failed to wipe schema")
 }

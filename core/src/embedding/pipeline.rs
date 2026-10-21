@@ -413,8 +413,9 @@ impl EmbeddingPipeline {
     /// [`ComputedEmbedding`] for each upserted node in `diff` with embeddable
     /// text ([`node_text`]), in `diff`'s order, plus the ids of the upserted
     /// nodes [`is_noise`](crate::embedding::text::is_noise) filtered out, and
-    /// adds what it did to `stats`. Empty, quickly, if there is neither a
-    /// model nor a cache to answer from.
+    /// adds what it did to `stats`. No embeddings, quickly, if there is
+    /// neither a model nor a cache to answer from; the filtered ids are
+    /// returned either way, since deleting their vectors needs no model.
     ///
     /// Texts are looked up in the embedding cache first, all of the batch's
     /// keys at once; only the misses reach the model, which is loaded on the
@@ -431,9 +432,6 @@ impl EmbeddingPipeline {
     /// inference failing is reported and skipped, never allowed to lose the
     /// rest of the diff's embeddings.
     pub fn compute(&self, diff: &Diff, stats: &mut EmbedStats) -> ComputedBatch {
-        if matches!(self.model.get(), Some(None)) {
-            return ComputedBatch::default();
-        }
         let mut dropped = Vec::new();
         let mut pending: Vec<(&str, String)> = Vec::new();
         for node in &diff.upsert_nodes {
@@ -444,14 +442,14 @@ impl EmbeddingPipeline {
                 pending.push((node.id.as_str(), text));
             }
         }
-        if pending.is_empty() {
+        if pending.is_empty() || matches!(self.model.get(), Some(None)) {
             return ComputedBatch { embeddings: Vec::new(), dropped };
         }
 
         let keys: Vec<Hash> = pending.iter().map(|(_, text)| cache::text_hash(text)).collect();
         let mut cached = self.cache_lookup(&keys, stats);
         if cached.is_none() && self.model().is_none() {
-            return ComputedBatch::default();
+            return ComputedBatch { embeddings: Vec::new(), dropped };
         }
         stats.texts += pending.len();
 
@@ -796,6 +794,14 @@ pub struct ComputedEmbedding {
 pub struct ComputedBatch {
     embeddings: Vec<ComputedEmbedding>,
     dropped: Vec<String>,
+}
+
+impl ComputedBatch {
+    /// How many of the batch's nodes [`is_noise`](crate::embedding::text::is_noise)
+    /// filtered out.
+    pub(crate) fn dropped_len(&self) -> usize {
+        self.dropped.len()
+    }
 }
 
 #[cfg(test)]

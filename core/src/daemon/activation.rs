@@ -224,11 +224,11 @@ impl ActivationCtx {
             crate::embedding::backfill::run(&self.conn, &self.embedding, &self.indexing)
         }));
         match backfill {
-            Ok(summary) if summary.candidates > 0 => crate::log_line!(
-                "g-mesh daemon: embedding backfill - {} of {} candidate nodes got a vector, {} from the embedding \
+            Ok(summary) if summary.owed_a_vector() > 0 => crate::log_line!(
+                "g-mesh daemon: embedding backfill - {} of {} nodes owed a vector got one, {} from the embedding \
                  cache, {} embedded",
                 summary.cache_hits + summary.embedded,
-                summary.candidates,
+                summary.owed_a_vector(),
                 summary.cache_hits,
                 summary.embedded
             ),
