@@ -416,9 +416,17 @@ mod tests {
         })
     }
 
+    /// The rules that take part in the length ordering: every rule but the
+    /// trailing map/exec denies of the writable prefixes.
+    fn ordered(rules: &[Rule]) -> Vec<Rule> {
+        rules.iter().filter(|rule| !rule.param.starts_with("NOEXEC_")).cloned().collect()
+    }
+
     /// The root deny is emitted after an allow of a prefix that holds the
     /// root, and before an allow of a prefix the root holds; at equal length
-    /// the deny comes last.
+    /// the deny comes last. Writable prefixes take part in the same order,
+    /// and the root deny denies writes too: a root inside a writable prefix
+    /// stays read-only, a writable prefix inside the root stays writable.
     ///
     /// Control: emit the rules in insertion order (drop the sort in
     /// `seatbelt::rules`).
@@ -427,12 +435,18 @@ mod tests {
         let policy = SandboxPolicy {
             project_root: PathBuf::from("/usr/local/src/project"),
             toolchain: vec![PathBuf::from("/usr/local"), PathBuf::from("/usr/local/src/project/.rustup")],
-            writable: vec![],
+            writable: vec![
+                PathBuf::from("/usr/local/src"),
+                PathBuf::from("/usr/local/src/project/.cargo/git"),
+            ],
         };
-        let rules = seatbelt::rules(&policy);
+        let rules = ordered(&seatbelt::rules(&policy));
         let root = position(&rules, false, &policy.project_root);
         assert!(position(&rules, true, Path::new("/usr/local")) < root, "{rules:?}");
         assert!(root < position(&rules, true, Path::new("/usr/local/src/project/.rustup")), "{rules:?}");
+        assert!(position(&rules, true, Path::new("/usr/local/src")) < root, "{rules:?}");
+        assert!(root < position(&rules, true, Path::new("/usr/local/src/project/.cargo/git")), "{rules:?}");
+        assert!(rules[root].ops.contains("file-write*"), "the root deny does not deny writes: {rules:?}");
         assert!(
             rules.windows(2).all(|pair| pair[0].path.as_os_str().len() <= pair[1].path.as_os_str().len()),
             "rules are not in ascending path length: {rules:?}"
@@ -536,5 +550,268 @@ mod tests {
             "a server under the root, named through {}, started: {outcome:?}",
             alias.display()
         );
+    }
+
+    /// Every writable prefix gets a deny of map and exec after every other
+    /// rule, so it wins over a broader allowed prefix holding it
+    /// (`/usr/local` holding a `CARGO_HOME` of `/usr/local/cargo`) and over a
+    /// longer toolchain allow inside it, while the last write rule over it is
+    /// still an allow.
+    ///
+    /// Control: drop the trailing `NOEXEC_` denies from `seatbelt::rules`.
+    #[test]
+    fn every_writable_prefix_is_denied_map_and_exec_after_every_other_rule() {
+        let registry = PathBuf::from("/usr/local/cargo/registry");
+        let policy = SandboxPolicy {
+            project_root: PathBuf::from("/src/project"),
+            toolchain: vec![PathBuf::from("/usr/local"), registry.join("src/tool")],
+            writable: vec![registry.clone(), PathBuf::from("/private/tmp/g-mesh-rust-1-0")],
+        };
+        let rules = seatbelt::rules(&policy);
+        let last_allow = rules.iter().rposition(|rule| rule.allow).unwrap();
+        for prefix in &policy.writable {
+            let deny = rules
+                .iter()
+                .rposition(|rule| !rule.allow && rule.path == *prefix)
+                .unwrap_or_else(|| panic!("no deny for the writable {}: {rules:?}", prefix.display()));
+            let ops = rules[deny].ops;
+            assert!(
+                ops.contains("file-map-executable")
+                    && ops.contains("process-exec")
+                    && !ops.contains("file-write"),
+                "{}: {ops}",
+                prefix.display()
+            );
+            assert!(deny > last_allow, "the deny of {} precedes an allow: {rules:?}", prefix.display());
+            let last_write = rules
+                .iter()
+                .rposition(|rule| rule.ops.contains("file-write") && prefix.starts_with(&rule.path))
+                .unwrap();
+            assert!(rules[last_write].allow, "{} is not writable: {rules:?}", prefix.display());
+        }
+    }
+
+    /// A stand-in server at `dir/rust-analyzer` that answers `--version`
+    /// and otherwise runs each argument as a step, printing one line per
+    /// step: `write=<file>` creates the file, `connect=<port>` opens a TCP
+    /// connection to `127.0.0.1:<port>` with `bash`'s `/dev/tcp`, `run=<prog>`
+    /// runs a program and prints its exit code.
+    fn probe_server(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        const SCRIPT: &str = "#!/bin/sh\n\
+            if [ \"$1\" = --version ]; then echo \"rust-analyzer 0.0.0-probe\"; exit 0; fi\n\
+            for step in \"$@\"; do\n\
+              case \"$step\" in\n\
+                write=*) f=\"${step#write=}\"; if (: > \"$f\") 2>/dev/null; then echo \"wrote $f\"; \
+                         else echo \"refused $f\"; fi ;;\n\
+                connect=*) if /bin/bash -c \"exec 3<>/dev/tcp/127.0.0.1/${step#connect=}\" 2>/dev/null; \
+                           then echo connected; else echo \"not connected\"; fi ;;\n\
+                run=*) \"${step#run=}\" >/dev/null 2>&1; echo \"run ${step#run=} rc=$?\" ;;\n\
+              esac\n\
+            done\n";
+        std::fs::create_dir_all(dir).unwrap();
+        let server = dir.join("rust-analyzer");
+        std::fs::write(&server, SCRIPT).unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        server
+    }
+
+    /// The probe's stdout for `steps`, run unconfined (`policy` `None`) or
+    /// confined under `policy`, which must confine it.
+    fn probe(server: &Path, policy: Option<&SandboxPolicy>, steps: &[String]) -> String {
+        let config = match policy {
+            None => SemanticConfig::new(server),
+            Some(policy) => {
+                let (outcome, config) = confine_server(server, policy);
+                assert_eq!(outcome, SandboxOutcome::Confined { backend: "seatbelt" }, "{policy:?}");
+                config
+            }
+        };
+        let output =
+            std::process::Command::new(&config.command).args(&config.args).args(steps).output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "the probe failed ({}): {stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    }
+
+    fn step(kind: &str, path: &Path) -> String {
+        format!("{kind}={}", path.display())
+    }
+
+    /// A script at `path` that exits 0.
+    fn exits_zero(path: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_path_buf()
+    }
+
+    /// Confined, the tree writes under a writable prefix and to `/dev/null`,
+    /// and nowhere else: not under the root, which lies inside the writable
+    /// prefix, and not in a directory no prefix lists.
+    ///
+    /// Controls: drop `(deny file-write*)` from `seatbelt::profile`
+    /// (`out/MARK` written); root deny back to map and exec only in
+    /// `seatbelt::rules` (`w/proj/MARK` written).
+    #[test]
+    fn seatbelt_writes_only_under_writable_prefixes_and_never_under_the_root() {
+        let scratch = Scratch::new("writes");
+        let writable = scratch.0.join("w");
+        let root = writable.join("proj");
+        let out = scratch.0.join("out");
+        for dir in [&root, &out] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let server = probe_server(&scratch.0.join("tool"));
+
+        let sanity = out.join("SANITY");
+        probe(&server, None, &[step("write", &sanity)]);
+        assert!(sanity.is_file(), "sanity: the probe writes nothing unconfined");
+
+        let policy = SandboxPolicy::new(&root, [scratch.0.join("tool")], [writable.clone()]);
+        let (ok, in_root, outside) = (writable.join("ok"), root.join("MARK"), out.join("MARK"));
+        let steps =
+            [step("write", &ok), step("write", &in_root), step("write", &outside), "write=/dev/null".into()];
+        let stdout = probe(&server, Some(&policy), &steps);
+        assert!(ok.is_file(), "the writable prefix was not writable: {stdout}");
+        assert!(!in_root.exists(), "a confined process wrote under the root: {stdout}");
+        assert!(!outside.exists(), "a confined process wrote outside every writable prefix: {stdout}");
+        assert!(stdout.contains("wrote /dev/null"), "{stdout}");
+    }
+
+    /// Confined, the tree opens no network connection, not even to a
+    /// listener on loopback that the same probe reaches unconfined.
+    ///
+    /// Control: drop `(deny network*)` from `seatbelt::profile`.
+    #[test]
+    fn seatbelt_refuses_every_network_connection() {
+        let scratch = Scratch::new("network");
+        let server = probe_server(&scratch.0.join("tool"));
+        let sink = Sink::start();
+        let connect = vec![format!("connect={}", sink.port)];
+
+        let stdout = probe(&server, None, &connect);
+        assert!(
+            stdout.contains("connected") && sink.settled() == 1,
+            "sanity: the probe does not connect: {stdout}"
+        );
+
+        let policy = SandboxPolicy::new(&scratch.0.join("proj"), [scratch.0.join("tool")], []);
+        let stdout = probe(&server, Some(&policy), &connect);
+        assert_eq!(sink.settled(), 1, "a confined process connected: {stdout}");
+        assert!(stdout.contains("not connected"), "{stdout}");
+    }
+
+    /// A writable prefix inside an allowed prefix is not executable, while
+    /// the rest of the allowed prefix is, and the writable prefix stays
+    /// writable.
+    ///
+    /// Control: drop the trailing `NOEXEC_` denies from `seatbelt::rules`.
+    #[test]
+    fn seatbelt_execs_nothing_under_a_writable_prefix_inside_an_allowed_prefix() {
+        let scratch = Scratch::new("noexec");
+        let tool = scratch.0.join("tool");
+        let cache = tool.join("cache");
+        let server = probe_server(&tool);
+        let in_tool = exits_zero(&tool.join("run.sh"));
+        let in_cache = exits_zero(&cache.join("run.sh"));
+        let runs = [step("run", &in_tool), step("run", &in_cache)];
+
+        let stdout = probe(&server, None, &runs);
+        assert_eq!(stdout.matches("rc=0").count(), 2, "sanity: the scripts do not run unconfined: {stdout}");
+
+        let policy = SandboxPolicy::new(&scratch.0.join("proj"), [tool.clone()], [cache.clone()]);
+        let written = cache.join("ok");
+        let mut steps = runs.to_vec();
+        steps.push(step("write", &written));
+        let stdout = probe(&server, Some(&policy), &steps);
+        assert!(stdout.contains(&format!("run {} rc=0", in_tool.display())), "{stdout}");
+        assert!(
+            !stdout.contains(&format!("run {} rc=0", in_cache.display())),
+            "a confined process exec'd a file under a writable prefix: {stdout}"
+        );
+        assert!(written.is_file(), "the writable prefix inside an allowed prefix is not writable: {stdout}");
+    }
+
+    /// The writable set is the temp dir and `CARGO_HOME`'s `registry/` and
+    /// `git/`, canonical, in that order; never `CARGO_HOME` itself or its
+    /// `bin/`, and a missing cache directory is dropped.
+    #[test]
+    fn for_server_allows_writes_only_to_the_temp_dir_and_cargo_caches() {
+        let scratch = Scratch::new("writable");
+        let home = scratch.0.join("cargo-home");
+        let temp = scratch.0.join("tmp");
+        for dir in [home.join("registry"), home.join("git"), home.join("bin"), temp.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root = scratch.0.join("proj");
+        let server = scratch.0.join("ra/rust-analyzer");
+        let policy = |home: &Path| {
+            SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(home), Some(&temp))
+        };
+
+        let all = policy(&home);
+        assert_eq!(all.writable, vec![temp.clone(), home.join("registry"), home.join("git")]);
+        assert!(!all.writable.contains(&home) && !all.writable.contains(&home.join("bin")), "{all:?}");
+
+        std::fs::remove_dir(home.join("git")).unwrap();
+        assert_eq!(policy(&home).writable, vec![temp.clone(), home.join("registry")]);
+    }
+
+    /// A TCP listener on loopback that counts the connections it accepts.
+    /// [`Sink::settled`] makes its own connection last, so every connection
+    /// made before the call has been counted when it returns.
+    struct Sink {
+        port: u16,
+        real: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        sentinels: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Sink {
+        fn start() -> Self {
+            use std::io::Read;
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let real = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let sentinels = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (counted, marked) = (real.clone(), sentinels.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                    let mut first = [0u8; 1];
+                    if stream.read_exact(&mut first).is_ok() && first == *b"S" {
+                        marked.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+            Sink { port, real, sentinels }
+        }
+
+        /// The connections accepted so far, the sink's own excluded. The
+        /// listener accepts in arrival order, so once the sentinel made here
+        /// is counted every earlier connection is too.
+        fn settled(&self) -> usize {
+            use std::io::Write;
+            use std::sync::atomic::Ordering;
+            let target = self.sentinels.load(Ordering::SeqCst) + 1;
+            let mut sentinel = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+            sentinel.write_all(b"S").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while self.sentinels.load(Ordering::SeqCst) < target {
+                assert!(std::time::Instant::now() < deadline, "the sink never accepted its own connection");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            self.real.load(Ordering::SeqCst)
+        }
     }
 }

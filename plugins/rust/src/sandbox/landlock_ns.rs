@@ -790,6 +790,154 @@ mod tests {
         );
     }
 
+    fn step(path: &str, exec: bool, write: bool) -> MountStep {
+        MountStep { path: PathBuf::from(path), exec, write }
+    }
+
+    /// A root inside a writable prefix is read-only and `noexec`, applied
+    /// after the prefix; a writable prefix inside the root is writable,
+    /// applied after the root; exec and write are decided independently.
+    ///
+    /// Control: sort the root first in `mount_plan` (no "most specific
+    /// last").
+    #[test]
+    fn mount_plan_keeps_a_root_inside_a_writable_prefix_read_only_and_a_writable_prefix_inside_it_writable() {
+        let plan = mount_plan(Path::new("/srv/w/proj"), &paths(&["/usr"]), &paths(&["/srv/w"]));
+        assert_eq!(
+            plan,
+            vec![step("/usr", true, false), step("/srv/w", false, true), step("/srv/w/proj", false, false)]
+        );
+
+        let plan = mount_plan(
+            Path::new("/home/u"),
+            &paths(&["/home/u/.rustup"]),
+            &paths(&["/home/u/.cargo/registry"]),
+        );
+        assert_eq!(
+            plan,
+            vec![
+                step("/home/u", false, false),
+                step("/home/u/.rustup", true, false),
+                step("/home/u/.cargo/registry", false, true),
+            ]
+        );
+    }
+
+    /// A step at or under a writable prefix is `noexec` whatever exec prefix
+    /// holds it, and an exec prefix inside a writable one is writable and
+    /// `noexec`.
+    ///
+    /// Control: drop the `!write.iter().any(..)` clause from `mount_plan`'s
+    /// exec flag.
+    #[test]
+    fn mount_plan_makes_every_step_at_or_under_a_writable_prefix_noexec() {
+        let plan = mount_plan(
+            Path::new("/home/u/proj"),
+            &paths(&["/usr", "/tmp/w/tool"]),
+            &paths(&["/usr/local/cargo/registry", "/tmp/w"]),
+        );
+        for expected in [
+            step("/usr", true, false),
+            step("/tmp/w", false, true),
+            step("/tmp/w/tool", false, true),
+            step("/usr/local/cargo/registry", false, true),
+            step("/home/u/proj", false, false),
+        ] {
+            assert!(plan.contains(&expected), "no {expected:?} in {plan:?}");
+        }
+        assert_eq!(plan.len(), 5, "{plan:?}");
+    }
+
+    fn sorted(mut list: Vec<PathBuf>) -> Vec<PathBuf> {
+        list.sort();
+        list
+    }
+
+    /// Landlock's exec grants leave every writable prefix out: an allowed
+    /// prefix holding one is replaced by its entries down to it, one at or
+    /// under one is dropped, others are kept as given.
+    ///
+    /// Control: make `exec_beneath` return `allowed` unchanged.
+    #[test]
+    fn exec_beneath_carves_every_writable_prefix_out_of_the_exec_grants() {
+        let children = |dir: &Path| -> Vec<PathBuf> {
+            match dir.to_str().unwrap() {
+                "/usr" => paths(&["/usr/bin", "/usr/local"]),
+                "/usr/local" => paths(&["/usr/local/bin", "/usr/local/cargo"]),
+                "/usr/local/cargo" => paths(&["/usr/local/cargo/bin", "/usr/local/cargo/registry"]),
+                other => panic!("listed {other}, which holds no writable prefix"),
+            }
+        };
+        let grants = exec_beneath(
+            &paths(&["/usr", "/opt/tool", "/srv/cache", "/srv/cache/inner"]),
+            &paths(&["/usr/local/cargo/registry", "/srv/cache"]),
+            &children,
+        );
+        assert_eq!(
+            sorted(grants),
+            sorted(paths(&["/usr/bin", "/usr/local/bin", "/usr/local/cargo/bin", "/opt/tool"]))
+        );
+        assert_eq!(exec_beneath(&paths(&["/usr", "/opt"]), &[], &children), paths(&["/usr", "/opt"]));
+    }
+
+    /// The entries `exec_beneath` recurses through skip symlinks (whose
+    /// target's own grant decides them), and an unreadable directory lists
+    /// none.
+    ///
+    /// Control: drop the `!kind.is_symlink()` filter in
+    /// `entries_but_symlinks`.
+    #[test]
+    fn entries_but_symlinks_lists_directories_and_files_but_no_symlink() {
+        let scratch = Scratch::new("entries");
+        let dir = scratch.0.join("dir");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("file"), "").unwrap();
+        std::os::unix::fs::symlink("/usr", dir.join("link")).unwrap();
+        assert_eq!(sorted(entries_but_symlinks(&dir)), sorted(vec![dir.join("file"), dir.join("sub")]));
+        assert!(entries_but_symlinks(&scratch.0.join("missing")).is_empty());
+    }
+
+    /// The Landlock layer's OS write grants are single device nodes, never
+    /// `/dev` or the `tmpfs` mounts beneath it.
+    #[test]
+    fn landlock_os_writes_are_device_nodes_only() {
+        assert!(OS_WRITE.contains(&"/dev/null"), "{OS_WRITE:?}");
+        for path in OS_WRITE {
+            let node = Path::new(path);
+            assert_eq!(node.parent(), Some(Path::new("/dev")), "{path} is not a node directly in /dev");
+            assert!(!["/dev/shm", "/dev/mqueue", "/dev/pts"].contains(&path), "{path}");
+        }
+    }
+
+    /// The Landlock-only gap names, per ABI, the network and write holes
+    /// that tier leaves.
+    #[test]
+    fn landlock_gaps_name_the_holes_of_each_abi() {
+        let root = Path::new("/home/u/proj");
+        let has = |gaps: &[String], text: &str| gaps.iter().any(|gap| gap.contains(text));
+        for (abi, unix, tcp, truncate) in [
+            (9, false, false, false),
+            (6, true, false, false),
+            (4, true, false, false),
+            (3, true, true, false),
+            (2, true, true, true),
+            (1, true, true, true),
+        ] {
+            let gaps = landlock_gaps(abi, root, &paths(&["/tmp/g-mesh-rust-1-0"]));
+            assert!(has(&gaps, "UDP"), "ABI {abi}: {gaps:?}");
+            assert_eq!(has(&gaps, "unix-socket"), unix, "ABI {abi}: {gaps:?}");
+            assert_eq!(has(&gaps, "TCP is not blocked"), tcp, "ABI {abi}: {gaps:?}");
+            assert_eq!(has(&gaps, "truncation"), truncate, "ABI {abi}: {gaps:?}");
+            assert!(!has(&gaps, "writes under the root"), "ABI {abi}: {gaps:?}");
+        }
+        let gaps = landlock_gaps(9, root, &paths(&["/home/u"]));
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("writes under the root are not blocked") && gap.contains("/home/u")),
+            "{gaps:?}"
+        );
+    }
+
     fn policy(root: &str, toolchain: &[&str]) -> SandboxPolicy {
         SandboxPolicy { project_root: PathBuf::from(root), toolchain: paths(toolchain), writable: vec![] }
     }
@@ -800,7 +948,8 @@ mod tests {
 
     #[test]
     fn the_trampoline_argv_round_trips_paths_with_spaces_and_server_args_with_dashes() {
-        let policy = policy("/tmp/a project/--root", &["/opt/tool chain", "/home/u/-x"]);
+        let mut policy = policy("/tmp/a project/--root", &["/opt/tool chain", "/home/u/-x"]);
+        policy.writable = paths(&["/tmp/private temp", "/home/u/--write"]);
         let server_args = ["--log-file", "-v", "--", "--layers", "landlock"];
         for layers in [Layers::Full, Layers::Mount, Layers::Landlock] {
             let mut argv: Vec<OsString> =
@@ -826,7 +975,8 @@ mod tests {
 
     #[test]
     fn parse_refuses_an_incomplete_or_unknown_argv() {
-        let cases: [&[&str]; 8] = [
+        let cases: [&[&str]; 9] = [
+            &["--layers", "mount", "--root", "/r", "--write"],
             &["--layers", "mount", "--root", "/r", "/bin/true"],
             &["--layers", "mount", "--root", "/r", "--"],
             &["--layers", "mount", "--root", "/r", "--", "true"],
