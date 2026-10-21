@@ -46,10 +46,13 @@ pub(crate) const TRAMPOLINE_ARG: &str = "__g-mesh-sandbox";
 pub(crate) const OS_EXEC: [&str; 8] =
     ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/nix/store"];
 
-/// OS prefixes the tree may write in the Landlock layer: device nodes
-/// (`/dev/null`, `/dev/tty`). The mount layer needs none: a device node
-/// ignores a read-only mount.
-pub(crate) const OS_WRITE: [&str; 1] = ["/dev"];
+/// The device nodes the tree may write in the Landlock layer (`cargo` and
+/// `rustc` send output to `/dev/null`, a terminal is `/dev/tty`); one that
+/// does not exist is skipped. Each node, never `/dev` itself, so the
+/// `tmpfs` mounts beneath it (`/dev/shm`, `/dev/mqueue`) stay read-only. The
+/// mount layer needs none: a device node ignores a read-only mount.
+pub(crate) const OS_WRITE: [&str; 6] =
+    ["/dev/null", "/dev/zero", "/dev/full", "/dev/tty", "/dev/random", "/dev/urandom"];
 
 /// Trampoline exit codes, each naming the step that failed.
 pub(crate) const EXIT_USAGE: i32 = 70;
@@ -371,6 +374,65 @@ pub fn landlock_abi() -> i64 {
     abi.max(0)
 }
 
+/// The paths Landlock grants `Execute` beneath: `allowed` with every
+/// writable prefix carved out, since Landlock has no deny inside a grant.
+/// An allowed prefix at or under a `writable` one is dropped; one that holds
+/// a writable prefix is replaced by its entries (`children`), recursing into
+/// the entry on the way to the writable prefix and leaving out the writable
+/// prefix itself. `children` lists a directory's entries that are not
+/// symlinks (a symlink resolves to a path whose own grant decides it); an
+/// unreadable directory lists none, which grants less.
+pub(crate) fn exec_beneath(
+    allowed: &[PathBuf],
+    writable: &[PathBuf],
+    children: &dyn Fn(&Path) -> Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    fn carve(
+        dir: &Path,
+        inner: &[&PathBuf],
+        children: &dyn Fn(&Path) -> Vec<PathBuf>,
+        out: &mut Vec<PathBuf>,
+    ) {
+        for child in children(dir) {
+            if inner.iter().any(|write| **write == child) {
+                continue;
+            }
+            let deeper: Vec<&PathBuf> =
+                inner.iter().copied().filter(|write| write.starts_with(&child)).collect();
+            if deeper.is_empty() {
+                out.push(child);
+            } else {
+                carve(&child, &deeper, children, out);
+            }
+        }
+    }
+    let mut grants = Vec::new();
+    for prefix in allowed {
+        if writable.iter().any(|write| prefix.starts_with(write)) {
+            continue;
+        }
+        let inner: Vec<&PathBuf> = writable.iter().filter(|write| write.starts_with(prefix)).collect();
+        if inner.is_empty() {
+            grants.push(prefix.clone());
+        } else {
+            carve(prefix, &inner, children, &mut grants);
+        }
+    }
+    grants
+}
+
+/// A directory's entries that are not symlinks, none when it is unreadable.
+fn entries_but_symlinks(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| !kind.is_symlink()))
+        .map(|entry| entry.path())
+        .collect()
+}
+
 /// One step of the mount layer: bind `path` on itself, then make it (and
 /// every mount beneath it) executable when `exec` and writable when `write`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,7 +448,9 @@ pub(crate) struct MountStep {
 /// last. A step's two flags are decided independently by the most specific
 /// rule over its path: exec from the `exec` prefixes against the root,
 /// write from the `write` prefixes against the root; the root wins a tie,
-/// and a path under neither stays `noexec` and read-only.
+/// and a path under neither stays `noexec` and read-only. A path at or under
+/// a `write` prefix is `noexec` whatever holds it (`/usr/local/cargo/registry`
+/// under an exec `/usr`): nothing the tree writes can be run or mapped.
 pub(crate) fn mount_plan(root: &Path, exec: &[PathBuf], write: &[PathBuf]) -> Vec<MountStep> {
     let decide = |path: &Path, grants: &[PathBuf]| {
         let grant =
@@ -408,7 +472,7 @@ pub(crate) fn mount_plan(root: &Path, exec: &[PathBuf], write: &[PathBuf]) -> Ve
         .into_iter()
         .map(|path| MountStep {
             path: path.to_path_buf(),
-            exec: decide(path, exec),
+            exec: decide(path, exec) && !write.iter().any(|grant| path.starts_with(grant)),
             write: decide(path, write),
         })
         .collect()
@@ -466,10 +530,10 @@ fn apply_step(path: &CString, exec: bool, write: bool) -> Result<(), String> {
 }
 
 /// Enters a new user + mount + network namespace (uid and gid mapped to
-/// themselves) in which every mount is `noexec` except under `allowed` and
-/// read-only except under `writable`, and `root` is `noexec` and read-only
-/// again wherever it lies. The network namespace has only a loopback that is
-/// down, so no socket reaches any address. Mounts never propagate out.
+/// themselves) in which every mount is `noexec` except under `allowed` (and
+/// never under `writable`) and read-only except under `writable`, and `root`
+/// is `noexec` and read-only again wherever it lies. The network namespace
+/// has only a loopback that is down, so no socket reaches any address. Mounts never propagate out.
 fn mount_layer(root: &Path, allowed: &[PathBuf], writable: &[PathBuf]) -> Result<(), String> {
     let plan = mount_plan(root, allowed, writable);
     let plan: Vec<(CString, &MountStep)> =
@@ -514,10 +578,12 @@ fn mount_layer(root: &Path, allowed: &[PathBuf], writable: &[PathBuf]) -> Result
 }
 
 /// Restricts this process and its descendants with Landlock: exec only
-/// under `allowed`; writes (create, remove, write, refer, truncate, device
-/// ioctl, connect to a pathname unix socket, each from the ABI that has it)
-/// only under `writable` and `/dev`; no TCP bind or connect (ABI >= 4); no
-/// abstract unix socket or signal outside the domain (ABI >= 6). Best
+/// under `allowed` and never under a writable prefix ([`exec_beneath`]);
+/// writes (create, remove, write, refer, truncate, device ioctl, connect to
+/// a pathname unix socket, each from the ABI that has it) only under
+/// `writable` and to the device nodes of [`OS_WRITE`]; no TCP bind or
+/// connect (ABI >= 4); no abstract unix socket or signal outside the domain
+/// (ABI >= 6). Best
 /// effort: each right the kernel lacks is dropped. `Err` when the kernel
 /// enforces none of it.
 fn landlock_layer(allowed: &[PathBuf], writable: &[PathBuf]) -> Result<(), String> {
@@ -531,12 +597,13 @@ fn landlock_layer(allowed: &[PathBuf], writable: &[PathBuf]) -> Result<(), Strin
         .cloned()
         .chain(OS_WRITE.iter().filter_map(|prefix| std::fs::canonicalize(prefix).ok()))
         .collect();
+    let exec_beneath = exec_beneath(allowed, &write_beneath, &entries_but_symlinks);
     let status = Ruleset::default()
         .handle_access(write | AccessFs::Execute)
         .and_then(|ruleset| ruleset.handle_access(AccessNet::BindTcp | AccessNet::ConnectTcp))
         .and_then(|ruleset| ruleset.scope(Scope::AbstractUnixSocket | Scope::Signal))
         .and_then(|ruleset| ruleset.create())
-        .and_then(|ruleset| ruleset.add_rules(path_beneath_rules(allowed, AccessFs::Execute)))
+        .and_then(|ruleset| ruleset.add_rules(path_beneath_rules(&exec_beneath, AccessFs::Execute)))
         .and_then(|ruleset| ruleset.add_rules(path_beneath_rules(&write_beneath, write)))
         .and_then(|ruleset| ruleset.restrict_self())
         .map_err(|err| err.to_string())?;

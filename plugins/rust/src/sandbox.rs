@@ -220,6 +220,12 @@ pub(crate) mod seatbelt {
     /// denies writes, so a root inside a writable prefix stays read-only and
     /// a writable prefix inside the root (`~/.cargo/registry` when indexing
     /// `$HOME`) stays writable.
+    ///
+    /// A writable prefix is never executable: after every length-ordered
+    /// rule, each writable prefix gets a deny of map and exec, so it wins over
+    /// a broader prefix that allows them (`/usr/local` holding a
+    /// `CARGO_HOME` of `/usr/local/cargo`) and over a longer toolchain allow
+    /// inside it. Nothing the tree writes can then be run or mapped as code.
     pub(crate) fn rules(policy: &SandboxPolicy) -> Vec<Rule> {
         let mut allows: Vec<(&'static str, PathBuf)> = Vec::new();
         for prefix in &policy.toolchain {
@@ -247,7 +253,7 @@ pub(crate) mod seatbelt {
         rules.sort_by_key(|(allow, _, path)| (path.as_os_str().len(), !allow));
 
         let mut next = 0;
-        rules
+        let mut emitted: Vec<Rule> = rules
             .into_iter()
             .map(|(allow, ops, path)| {
                 let param = if allow {
@@ -258,7 +264,14 @@ pub(crate) mod seatbelt {
                 };
                 Rule { allow, ops, path, param }
             })
-            .collect()
+            .collect();
+        emitted.extend(policy.writable.iter().enumerate().map(|(n, prefix)| Rule {
+            allow: false,
+            ops: MAP_EXEC,
+            path: prefix.clone(),
+            param: format!("NOEXEC_{n}"),
+        }));
+        emitted
     }
 
     /// The profile text for `rules`: map, exec and write denied by default,

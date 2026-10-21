@@ -190,7 +190,17 @@ pub fn server_config_with(root: &Path, launcher: &Path) -> Result<SemanticConfig
     );
     config.command = resolved.command;
     config.env.extend(pinned_env(&toolchain));
-    let temp = private_temp_dir().context("creating the rust-analyzer's private temp dir")?;
+    // A temp dir that cannot be made degrades the start rather than refuse
+    // it: the server keeps the inherited `TMPDIR`, which the sandbox leaves
+    // read-only, so rust-analyzer cannot copy the lockfile there and may
+    // resolve dependencies less.
+    let temp = private_temp_dir().unwrap_or_else(|err| {
+        g_mesh_plugin_sdk::log_line!(
+            "[{LANGUAGE}] semantic tier: no private temp dir for rust-analyzer ({err:#}); it keeps the \
+             inherited TMPDIR, which the sandbox does not let it write, so dependencies may resolve less"
+        );
+        None
+    });
     if let Some(temp) = &temp {
         config.env.insert("TMPDIR".to_string(), temp.to_string_lossy().into_owned());
     }
