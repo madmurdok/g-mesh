@@ -995,7 +995,7 @@ jobs:
           # --generate-notes`: that flag's behaviour when a body is also
           # supplied has varied between gh versions, and the runner's gh is not
           # pinned. Notes are the one part of a release worth degrading rather
-          # than failing over - a human reviews the draft before it goes out.
+          # than failing over: they can still be edited after publishing.
           if gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
               -f tag_name="$GITHUB_REF_NAME" --jq .body > generated.md; then
             { echo; echo "---"; echo; cat generated.md; } >> notes.md
@@ -1046,8 +1046,10 @@ jobs:
 
           # Only a draft is published. A Release that is already public (a
           # re-run, or one a human published) keeps its state and its
-          # latest flag.
-          if [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" = "true" ]; then
+          # latest flag. The lookup is its own assignment so that a failed
+          # `gh` call fails the step instead of skipping the undraft.
+          draft="$(gh release view "$tag" --json isDraft --jq .isDraft)"
+          if [ "$draft" = "true" ]; then
             gh release edit "$tag" --draft=false --latest
           fi
 

@@ -1202,7 +1202,7 @@ fn position(haystack: &str, needle: &str) -> usize {
     haystack.find(needle).unwrap_or_else(|| panic!("{needle:?} not found in:\n{haystack}"))
 }
 
-/// GM-643 behaviour 5: `publish` runs only on a version tag, and only when
+/// `publish` runs only on a version tag, and only when
 /// every `build` leg succeeded.
 ///
 /// Control: drop `&& startsWith(github.ref, 'refs/tags/v')` - this fails.
@@ -1219,7 +1219,7 @@ fn the_publish_job_runs_only_for_a_version_tag_once_every_build_succeeded() {
     );
 }
 
-/// GM-643 behaviour 1: a new Release is created as a draft, so it is never
+/// A new Release is created as a draft, so it is never
 /// public while its assets are still uploading.
 ///
 /// Control: remove `--draft` from `gh release create` - this fails.
@@ -1232,7 +1232,7 @@ fn the_publish_step_creates_a_new_release_as_a_draft() {
     assert!(create.contains("--draft"), "gh release create no longer passes --draft:\n{create}");
 }
 
-/// GM-643 behaviours 2 and 3: after create/upload the step undrafts the
+/// After create/upload the step undrafts the
 /// Release and marks it latest, but only after the uploaded asset count
 /// matched the upload list; a mismatch exits before the undraft.
 ///
@@ -1254,7 +1254,7 @@ fn the_publish_step_publishes_only_after_the_uploaded_count_matches_the_list() {
     assert_eq!(step.matches("gh release edit").count(), 1, "one undraft only:\n{step}");
 }
 
-/// GM-643 behaviour 4: only a draft is undrafted, so a re-run leaves a
+/// Only a draft is undrafted, so a re-run leaves a
 /// Release that is already public (and its latest flag) alone.
 ///
 /// Control: unwrap the undraft from its `isDraft` guard - this fails.
@@ -1262,12 +1262,13 @@ fn the_publish_step_publishes_only_after_the_uploaded_count_matches_the_list() {
 fn the_publish_step_undrafts_only_a_release_that_is_still_a_draft() {
     let workflow = release_workflow();
     let step = step_block(job_block(&workflow, "publish"), PUBLISH_STEP);
-    let guard = r#"if [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" = "true" ]; then"#;
-    let expected = format!("{guard}\n            {UNDRAFT}\n          fi\n");
+    let lookup = r#"draft="$(gh release view "$tag" --json isDraft --jq .isDraft)""#;
+    let guard = r#"if [ "$draft" = "true" ]; then"#;
+    let expected = format!("{lookup}\n          {guard}\n            {UNDRAFT}\n          fi\n");
     assert!(step.contains(&expected), "the undraft is not guarded by isDraft == true:\n{step}");
 }
 
-/// GM-643 behaviour 6: `cut-release.sh` no longer asks the user to publish a
+/// `cut-release.sh` no longer asks the user to publish a
 /// draft; both of its endings point at the published release of the tag.
 ///
 /// Control: restore "Review and publish the draft release" - this fails.
@@ -1285,7 +1286,7 @@ fn cut_release_points_at_the_published_release_instead_of_a_draft() {
     );
 }
 
-/// GM-643 behaviour 7: `install-latest` runs after `publish` (or on a manual
+/// `install-latest` runs after `publish` (or on a manual
 /// run), and both PowerShell legs fail when releases/latest is not the tag
 /// this run published.
 ///
