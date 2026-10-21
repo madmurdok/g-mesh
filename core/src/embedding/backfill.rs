@@ -590,7 +590,7 @@ mod tests {
     /// `count_candidates` against this test's real schema, finds the one
     /// candidate node below, and `summary.candidates` reads `1`.
     #[test]
-    fn an_unavailable_model_returns_without_running_a_query() {
+    fn an_unavailable_model_returns_before_counting_candidates() {
         let mut conn = open_conn();
         apply_diff(
             &mut conn,
@@ -612,5 +612,144 @@ mod tests {
              one node ({:?}) owed an embedding",
             summary
         );
+    }
+
+    /// An undocumented `pub mod {id}`: noise under the GM-437 rule.
+    fn noise_module(id: &str) -> NodeRecord {
+        let mut node = NodeRecord::new(id, "Module", id, format!("crate::{id}"), "src/lib.rs", "rust");
+        node.signature = Some(format!("pub mod {id}"));
+        node
+    }
+
+    /// An index holding `nodes`, each with a vector made before the filter
+    /// (at the version `v1`) when its id is in `with_vectors`.
+    fn index_with(nodes: Vec<NodeRecord>, with_vectors: &[&str]) -> IndexStore {
+        let mut conn = open_conn();
+        apply_diff(&mut conn, &Diff { upsert_nodes: nodes, ..Default::default() }).unwrap();
+        for id in with_vectors {
+            insert_vector(&conn, id);
+        }
+        IndexStore::new(conn)
+    }
+
+    fn insert_vector(conn: &Connection, id: &str) {
+        crate::storage::vectors::insert(conn, id, &[0.0; crate::embedding::EMBEDDING_DIM], "v1").unwrap();
+    }
+
+    fn vector_ids(store: &IndexStore) -> Vec<String> {
+        store.with(|conn| {
+            let mut stmt = conn.prepare("SELECT nodeId FROM vectors ORDER BY nodeId").unwrap();
+            stmt.query_map([], |row| row.get(0)).unwrap().collect::<SqlResult<_>>().unwrap()
+        })
+    }
+
+    fn marker(store: &IndexStore) -> Option<String> {
+        store.with(|conn| schema::noise_purge_rule(conn).unwrap())
+    }
+
+    /// The design note's survivors of the purge: a documented module and a
+    /// name-only fn that is no test.
+    fn kept_nodes() -> Vec<NodeRecord> {
+        let mut documented = noise_module("documented");
+        documented.doc_comment = Some("Semantic search.".to_string());
+        vec![documented, node("signed", None, Some("fn signed()"))]
+    }
+
+    /// A noise node is a backfill candidate that never reaches the model and
+    /// gets no vector; it is counted as filtered, not as owed a vector.
+    /// Control: `compute` pushing a noise node's `text_to_embed` text into
+    /// `pending` embeds it.
+    #[test]
+    fn backfill_gives_a_noise_node_no_vector() {
+        use crate::embedding::pipeline::test_support::{fake_model_dir, fake_pipeline, Counters};
+        crate::storage::vectors::register_extension();
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+        let counters = Counters::default();
+        let pipeline = fake_pipeline(&model_dir, None, &counters);
+        let store =
+            index_with(vec![noise_module("semantic"), node("read", Some("Reads a file."), None)], &[]);
+
+        let summary = run(&store, &pipeline, &IndexingStatus::structural());
+
+        assert_eq!(vector_ids(&store), vec!["read"]);
+        assert_eq!(counters.received(), vec!["Reads a file.".to_string()], "only `read` reaches the model");
+        assert_eq!((summary.candidates, summary.filtered, summary.embedded), (2, 1, 1), "{summary:?}");
+        assert_eq!(summary.owed_a_vector(), 1, "{summary:?}");
+    }
+
+    /// The one-time purge deletes a vector a noise node got before the
+    /// filter, with no model at all, keeps every other vector, and records
+    /// the rule's generation.
+    /// Control: running `purge_noise_vectors` after the `is_available`
+    /// return leaves `semantic`'s vector; deleting every row in
+    /// `purge_noise_page` (no `is_noise` check) loses the kept ones.
+    #[test]
+    fn the_purge_deletes_pre_filter_noise_vectors_without_a_model_and_keeps_the_rest() {
+        let mut nodes = kept_nodes();
+        nodes.push(noise_module("semantic"));
+        let store = index_with(nodes, &["documented", "semantic", "signed"]);
+
+        let summary = run(&store, &EmbeddingPipeline::disabled(), &IndexingStatus::structural());
+
+        assert_eq!(summary.purged, 1, "{summary:?}");
+        assert_eq!(vector_ids(&store), vec!["documented", "signed"]);
+        assert_eq!(marker(&store).as_deref(), Some(NOISE_RULE_VERSION));
+    }
+
+    /// Once the marker holds the current generation the purge does not run
+    /// again: a noise vector stored after it stays. A marker from another
+    /// generation purges again and records the current one.
+    /// Control: dropping the early return on a current marker purges on
+    /// the second run.
+    #[test]
+    fn the_purge_runs_once_per_rule_version() {
+        let store = index_with(vec![noise_module("semantic")], &["semantic"]);
+        let pipeline = EmbeddingPipeline::disabled();
+        let progress = IndexingStatus::structural();
+        assert_eq!(run(&store, &pipeline, &progress).purged, 1);
+
+        store.with(|conn| insert_vector(conn, "semantic"));
+        assert_eq!(run(&store, &pipeline, &progress).purged, 0, "a current marker skips the purge");
+        assert_eq!(vector_ids(&store), vec!["semantic"]);
+
+        store.with(|conn| schema::record_noise_purge(conn, "0").unwrap());
+        assert_eq!(run(&store, &pipeline, &progress).purged, 1, "an older generation purges again");
+        assert!(vector_ids(&store).is_empty());
+        assert_eq!(marker(&store).as_deref(), Some(NOISE_RULE_VERSION));
+    }
+
+    /// A purge that fails records no marker, so the next start runs it
+    /// again and then records it.
+    /// Control: `break` instead of `return purged` on a page error records
+    /// the marker after the failure.
+    #[test]
+    fn a_failed_purge_records_no_marker_and_runs_again_next_start() {
+        let store = index_with(vec![noise_module("semantic")], &["semantic"]);
+        store.with(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER refuse_delete BEFORE DELETE ON vectors BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap()
+        });
+
+        assert_eq!(purge_noise_vectors(&store), 0);
+        assert_eq!(marker(&store), None, "a failed purge must not record its generation");
+        assert_eq!(vector_ids(&store), vec!["semantic"]);
+
+        store.with(|conn| conn.execute_batch("DROP TRIGGER refuse_delete;").unwrap());
+        assert_eq!(purge_noise_vectors(&store), 1, "the next start purges");
+        assert_eq!(marker(&store).as_deref(), Some(NOISE_RULE_VERSION));
+    }
+
+    /// The count the start and reindex logs report leaves out filtered
+    /// candidates; a pass whose candidates are all noise owes nothing (the
+    /// daemon log stays silent on it).
+    #[test]
+    fn owed_a_vector_leaves_out_the_filtered_candidates() {
+        let all_noise = BackfillSummary { candidates: 5, filtered: 5, ..Default::default() };
+        assert_eq!(all_noise.owed_a_vector(), 0);
+        let mixed = BackfillSummary { candidates: 12, filtered: 2, embedded: 10, ..Default::default() };
+        assert_eq!(mixed.owed_a_vector(), 10);
     }
 }

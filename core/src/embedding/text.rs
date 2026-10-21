@@ -537,4 +537,165 @@ pub(crate) mod tests {
         assert_eq!(structured_doc("```\nfn main() {}\n```"), "");
         assert_eq!(structured_doc("# Examples\n\nIt runs.\n\n```\nrun();\n```"), "");
     }
+
+    /// A node as the noise rule sees it: `(kind, name, qualifiedName,
+    /// filePath, doc, signature)`.
+    type Node = (&'static str, &'static str, &'static str, &'static str, Option<&'static str>, &'static str);
+
+    fn input(node: &Node) -> EmbedInput<'static> {
+        let (kind, name, qualified_name, file_path, doc, signature) = *node;
+        EmbedInput { kind, name, qualified_name, file_path, doc, signature: Some(signature) }
+    }
+
+    /// The design note's dropped examples are noise and embed as nothing.
+    /// Control: `is_noise` returning `false` fails every case.
+    #[test]
+    fn the_notes_dropped_examples_are_noise() {
+        let dropped: &[Node] = &[
+            (
+                "Module",
+                "semantic",
+                "crate::embedding::semantic",
+                "core/src/embedding/mod.rs",
+                None,
+                "pub mod semantic",
+            ),
+            ("Module", "tests", "crate::cli::stop::tests", "core/src/cli/stop.rs", None, "mod tests"),
+            ("Module", "x", "crate::x", "core/src/lib.rs", None, "pub(crate) mod x"),
+            ("Function", "test_trim", "crate::text::test_trim", "core/src/text.rs", None, "fn test_trim()"),
+            (
+                "Function",
+                "an_escalated_shutdown_says_so",
+                "crate::cli::stop::tests::an_escalated_shutdown_says_so",
+                "core/src/cli/stop.rs",
+                None,
+                "fn an_escalated_shutdown_says_so()",
+            ),
+            (
+                "Method",
+                "test_invalid",
+                "validators.Checks.test_invalid",
+                "pkg/validators.py",
+                None,
+                "def test_invalid(self)",
+            ),
+            ("Function", "testX", "testX", "src/x.ts", None, "testX()"),
+            // A blank doc is no doc.
+            ("Module", "blank", "crate::blank", "core/src/lib.rs", Some(" \n\t"), "pub mod blank"),
+        ];
+        for node in dropped {
+            assert!(is_noise(&input(node)), "{node:?} must be noise");
+            assert_eq!(node_text(&input(node)), None, "{node:?} must embed as nothing");
+        }
+    }
+
+    /// The design note's kept examples, any documented node, and a Go test
+    /// taking `t *testing.T` (three identifiers besides `func`) keep their
+    /// `text_to_embed` text. `pid` sits in a `tests` module so only its
+    /// second identifier (`u32`; `self` is a keyword) keeps it.
+    /// Control: `signature_identifiers` returning 1 fails `pid` and `TestX`.
+    #[test]
+    fn the_notes_kept_examples_keep_their_text() {
+        let kept: &[Node] = &[
+            (
+                "Method",
+                "pid",
+                "crate::daemon::tests::Fake::pid",
+                "core/src/daemon/x.rs",
+                None,
+                "fn pid(&self) -> u32",
+            ),
+            (
+                "Method",
+                "PATCH",
+                "gin.IRoutes.PATCH",
+                "routergroup.go",
+                None,
+                "PATCH(string, ...HandlerFunc) IRoutes",
+            ),
+            ("Constant", "STRUCTURAL", "crate::STRUCTURAL", "core/src/lib.rs", None, "const STRUCTURAL: u8"),
+            ("Struct", "BulkRun", "crate::BulkRun", "core/src/lib.rs", None, "struct BulkRun"),
+            ("Function", "getDateTime", "getDateTime", "src/utils/date.ts", None, "getDateTime()"),
+            ("Function", "TestX", "x.TestX", "pkg/x_test.go", None, "func TestX(t *testing.T)"),
+            (
+                "Module",
+                "semantic",
+                "crate::semantic",
+                "core/src/lib.rs",
+                Some("Semantic search."),
+                "pub mod semantic",
+            ),
+            (
+                "Function",
+                "test_trim",
+                "crate::tests::test_trim",
+                "tests/text.rs",
+                Some("Trims."),
+                "fn test_trim()",
+            ),
+        ];
+        for node in kept {
+            let (.., doc, signature) = *node;
+            assert!(!is_noise(&input(node)), "{node:?} must not be noise");
+            assert_eq!(node_text(&input(node)), text_to_embed(doc, Some(signature)), "{node:?}");
+            assert!(node_text(&input(node)).is_some(), "{node:?} must embed");
+        }
+    }
+
+    /// An undocumented zero-arg `run` is noise in a test file and not in a
+    /// source file; the test-path patterns hold, and near misses do not.
+    /// Control: `is_test_path` returning `false` fails every test path.
+    #[test]
+    fn a_name_only_fn_is_noise_in_a_test_file_only() {
+        let run_in = |path: &'static str| -> Node { ("Function", "run", "foo::run", path, None, "fn run()") };
+        let test_paths = [
+            "tests/foo.rs",
+            "core/tests/it/foo.rs",
+            "src/test/x.rs",
+            "web/__tests__/a.tsx",
+            "pkg/testdata/a.go",
+            "pkg/server_test.go",
+            "pkg/test_server.py",
+            "src/foo_test.rs",
+            "src/foo_tests.rs",
+            "web/a.test.ts",
+            "web/a.spec.jsx",
+            "web/a.test.js",
+            "web/a.spec.tsx",
+        ];
+        for path in test_paths {
+            assert!(is_noise(&input(&run_in(path))), "{path} is a test path");
+        }
+        let source_paths = [
+            "src/foo.rs",
+            "src/latest/x.rs",
+            "src/testing/x.rs",
+            "src/contest.rs",
+            "src/tests.rs",
+            "pkg/server_test.py",
+            "pkg/test_server.rs",
+            "web/a.test.css",
+            "web/atest.ts",
+        ];
+        for path in source_paths {
+            assert!(!is_noise(&input(&run_in(path))), "{path} is not a test path");
+        }
+    }
+
+    /// A name-only fn inside an inline `tests` module (`::tests::` inside
+    /// the qualified name, or `tests::` at its start) is noise; one taking a
+    /// param is not, nor is a module merely ending in `tests`.
+    /// Control: dropping the `::tests::` clause fails `crate::m::tests::`;
+    /// dropping the `tests::` prefix clause fails `tests::checks_it`.
+    #[test]
+    fn a_name_only_fn_in_an_inline_tests_module_is_noise_unless_it_takes_a_param() {
+        let at = |qualified_name: &'static str, signature: &'static str| -> Node {
+            ("Function", "checks_it", qualified_name, "src/m.rs", None, signature)
+        };
+        assert!(is_noise(&input(&at("crate::m::tests::checks_it", "fn checks_it()"))));
+        assert!(is_noise(&input(&at("tests::checks_it", "fn checks_it()"))));
+        assert!(!is_noise(&input(&at("crate::m::tests::checks_it", "fn checks_it(x: u8)"))));
+        assert!(!is_noise(&input(&at("crate::contests::checks_it", "fn checks_it()"))));
+        assert!(!is_noise(&input(&at("attests::checks_it", "fn checks_it()"))));
+    }
 }

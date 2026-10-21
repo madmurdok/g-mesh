@@ -1759,4 +1759,86 @@ mod tests {
             assert_eq!(bits(&entry.embedding), bits(&fake_vector(&entry.text)), "{}", entry.node_id);
         }
     }
+
+    /// Seeds an undocumented `pub mod {id}` node: noise under the GM-437 rule.
+    fn insert_noise_module(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, signature, language)
+             VALUES (?1, 'Module', ?1, ?1, 'src/lib.rs', 1, 0, 1, 1, 'pub mod ' || ?1, 'rust')",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+
+    fn vector_ids(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("SELECT nodeId FROM vectors ORDER BY nodeId").unwrap();
+        stmt.query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    fn noise_module_record(id: &str) -> NodeRecord {
+        let mut node = NodeRecord::new(id, "Module", id, id, "src/lib.rs", "rust");
+        node.signature = Some(format!("pub mod {id}"));
+        node
+    }
+
+    /// Without a model, `compute` still returns the filtered ids - through
+    /// both of its no-model returns (a model known missing, and a cache miss
+    /// whose model fails to load) - and `store` deletes their vectors while
+    /// keeping a non-noise node's.
+    /// Control: either early return giving `ComputedBatch::default()` fails
+    /// its pipeline's case.
+    #[test]
+    fn without_a_model_compute_still_drops_the_noise_and_store_deletes_its_vector() {
+        crate::storage::vectors::register_extension();
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+        let failing =
+            || EmbeddingPipeline::with_loader(&model_dir, |_dir| anyhow::bail!("no weights here"), None);
+        for (label, pipeline) in [("disabled", EmbeddingPipeline::disabled()), ("failing load", failing())] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::storage::schema::ensure_current(&conn, "test").unwrap();
+            insert_noise_module(&conn, "semantic");
+            insert_node(&conn, "read", "Reads a file.", "fn read()");
+            vectors::insert(&conn, "semantic", &[1.0, 0.0, 0.0], "v1").unwrap();
+            vectors::insert(&conn, "read", &[0.0, 1.0, 0.0], "v1").unwrap();
+            let mut read = NodeRecord::new("read", "Function", "read", "read", "src/lib.rs", "rust");
+            read.doc_comment = Some("Reads a file.".to_string());
+            read.signature = Some("fn read()".to_string());
+            let diff =
+                Diff { upsert_nodes: vec![noise_module_record("semantic"), read], ..Default::default() };
+
+            let computed = pipeline.compute(&diff, &mut EmbedStats::default());
+            assert_eq!(computed.dropped_len(), 1, "{label}");
+            assert!(computed.is_empty(), "{label}: no model, no embedding");
+            pipeline.store(&conn, &computed);
+
+            assert_eq!(vector_ids(&conn), vec!["read"], "{label}: the noise vector goes, the rest stays");
+        }
+    }
+
+    /// `store`'s staleness check judges the current row by `node_text`: a
+    /// vector computed from a node's old text is not stored once the row
+    /// is noise, even though `text_to_embed` of that row equals the
+    /// computed text.
+    /// Control: `current_embeddable_text` calling `text_to_embed(doc,
+    /// signature)` instead of `node_text` stores it.
+    #[test]
+    fn store_skips_a_vector_for_a_node_that_turned_into_noise() {
+        crate::storage::vectors::register_extension();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::storage::schema::ensure_current(&conn, "test").unwrap();
+        insert_noise_module(&conn, "semantic");
+
+        let computed = ComputedBatch {
+            embeddings: vec![ComputedEmbedding {
+                node_id: "semantic".to_string(),
+                embedding: vec![1.0, 0.0, 0.0],
+                text: "pub mod semantic".to_string(),
+            }],
+            dropped: Vec::new(),
+        };
+        EmbeddingPipeline::disabled().store(&conn, &computed);
+
+        assert_eq!(vector_count(&conn), 0, "a node that is noise now must get no vector");
+    }
 }

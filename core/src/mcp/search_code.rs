@@ -1000,4 +1000,40 @@ mod tests {
             "the symbol whose docstring matches the query must rank first: {results:?}"
         );
     }
+
+    /// A noise node whose pre-filter vector the one-time purge deleted
+    /// leaves `search` but stays in the graph `find_definition` reads.
+    /// Control: the purge controls in `embedding::backfill::tests` (its
+    /// vector stays, and `search` returns it).
+    #[test]
+    fn a_purged_noise_node_leaves_search_but_not_the_graph() {
+        let conn = setup();
+        insert_node(&conn, "alpha", "pkg::alpha", "a.rs");
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, signature, language)
+             VALUES ('semantic', 'Module', 'semantic', 'crate::semantic', 'src/lib.rs', 1, 0, 1, 1, 'pub mod semantic', 'rust')",
+            [],
+        )
+        .unwrap();
+        insert(&conn, "alpha", &[1.0, 0.0, 0.0], "v1").unwrap();
+        insert(&conn, "semantic", &[0.9, 0.1, 0.0], "v1").unwrap();
+        let ids = |conn: &Connection| -> Vec<String> {
+            search(conn, &[1.0, 0.0, 0.0], 10, None)
+                .unwrap()
+                .results
+                .into_iter()
+                .map(|r| r.symbol_id)
+                .collect()
+        };
+        assert_eq!(ids(&conn), vec!["alpha", "semantic"], "before the purge both are searchable");
+
+        let store = crate::storage::index_store::IndexStore::new(conn);
+        assert_eq!(crate::embedding::backfill::purge_noise_vectors(&store), 1);
+
+        store.with(|conn| {
+            assert_eq!(ids(conn), vec!["alpha"], "search_code must not return a filtered node");
+            let found = crate::graph::queries::find_by_qualified_name(conn, "crate::semantic", None).unwrap();
+            assert_eq!(found.len(), 1, "find_definition's lookup still finds it");
+        });
+    }
 }
