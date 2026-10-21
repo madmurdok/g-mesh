@@ -1,9 +1,11 @@
 //! `scripts/cut-release.sh` refuses to tag a release while a crate-backed
-//! plugin's `plugin.toml` names a `plugin_version` other than the release's.
+//! plugin's `plugin.toml` names a `plugin_version` other than its crate's.
 //!
 //! The script is sourced (its `main` is guarded for exactly that) and only
 //! `check_crate_backed_plugin_versions` is called, against a scratch
-//! `REPO_ROOT` holding copies of the bundled manifests. Bash only, so Unix
+//! `REPO_ROOT` holding copies of the bundled manifests and a minimal
+//! `Cargo.toml` per plugin. The scratch root is not a git repository, so the
+//! change rule against the previous tag is skipped. Bash only, so Unix
 //! only: the release is cut from a Unix shell.
 #![cfg(unix)]
 
@@ -39,6 +41,11 @@ fn scratch_root(typescript_version: &str) -> tempfile::TempDir {
         let target = root.path().join(&relative);
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, text).unwrap();
+        fs::write(
+            target.with_file_name("Cargo.toml"),
+            format!("[package]\nname = \"g-mesh-plugin-{language}\"\nversion = \"{RELEASE}\"\n"),
+        )
+        .unwrap();
     }
     root
 }

@@ -391,15 +391,19 @@ Oniguruma, tree-sitter grammars) for that target.
    3.8.0 through 3.10.1 were merged locally and reached `main` without a
    single CI run, which is how v3.10.0 was tagged with nothing to publish
    (GM-391).
-2. Merge the release branch (with `core/Cargo.toml` — and, since GM-288,
-   `wire/Cargo.toml`, `plugins/sdk/Cargo.toml`, `plugins/rust/Cargo.toml` and,
-   since GM-298, `plugins/python/Cargo.toml`, which must all agree with it —
+2. Merge the release branch (with `core/Cargo.toml`, `wire/Cargo.toml`,
+   `walk/Cargo.toml` and `plugins/sdk/Cargo.toml`, which must all agree,
    already bumped to the new version) into `main` with `--no-ff` and the
-   subject `merge: release-<version> into main`.
+   subject `merge: release-<version> into main`. `plugins/rust`,
+   `plugins/python` and `plugins/typescript` carry their own version: bump a
+   plugin's `Cargo.toml` and `plugin.toml` only if it changed since the
+   previous release tag (see `docs/architecture/plugin-modularity.md`,
+   "`plugin_version`: two rules, not one").
 3. Run `scripts/cut-release.sh <version>` on `main`. It refuses unless the
    merged release commit is the tip of `origin/release-<version>` and has a
    successful `ci.yml` run — so step 1 cannot be skipped silently. It verifies the crate
-   version (every workspace member's, not only core's), working tree and
+   version (core's and every release-versioned member's, plus each
+   workspace plugin's own version rule), working tree and
    branch state, runs `cargo test --workspace`, and creates an annotated
    `v<version>` tag locally — it does not push by default, since pushing the
    tag is what starts the public four-platform build and a Release.
