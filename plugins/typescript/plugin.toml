@@ -18,9 +18,12 @@
 [plugin]
 language = "typescript"
 protocol_version = 2
-# Must equal this crate's `Cargo.toml` `version`: a plugin in the cargo
-# workspace tracks the release version (docs/architecture/plugin-modularity.md,
-# "plugin_version: two rules, not one"); scripts/cut-release.sh checks it.
+# Equals this crate's `Cargo.toml` `version` (`tests/units.rs`'s
+# `the_manifest_version_matches_the_crates` pins it) and names this
+# plugin's build, not the g-mesh release: both are bumped together only when
+# the plugin changed since the previous release tag, and
+# scripts/cut-release.sh enforces that. See
+# docs/architecture/plugin-modularity.md, "plugin_version: two rules, not one".
 plugin_version = "4.16.0"
 
 [plugin.spawn]

@@ -50,15 +50,14 @@
 # 1. Make sure `core/Cargo.toml`'s version is the version you are releasing.
 #    It, not the tag, is what the artifacts are named after; the tag is checked
 #    against it in the first step of every build job so a mismatch costs a
-#    minute instead of four 90-minute builds. Since GM-288, `wire/Cargo.toml`,
-#    `plugins/sdk/Cargo.toml` and `plugins/rust/Cargo.toml` must say the same
-#    version too, since GM-298 so must `plugins/python/Cargo.toml`, and since
-#    GM-351 `plugins/typescript/Cargo.toml` (and its plugin.toml's
-#    `plugin_version`, which the shipped manifest carries unchanged), and
-#    since GM-514 `walk/Cargo.toml` -
-#    `scripts/cut-release.sh` refuses if any of them disagree (see that
-#    script's own header), which is the easiest way to check this by hand as
-#    well.
+#    minute instead of four 90-minute builds. `wire/Cargo.toml`,
+#    `walk/Cargo.toml` and `plugins/sdk/Cargo.toml` must say the same version
+#    too. `plugins/rust`, `plugins/python` and `plugins/typescript` carry their
+#    own version (`Cargo.toml` and `plugin.toml`, which the shipped manifest
+#    carries unchanged), bumped only when the plugin changed since the
+#    previous release tag. `scripts/cut-release.sh` refuses if any of this
+#    does not hold (see that script's own header), which is the easiest way
+#    to check it by hand as well.
 # 2. Tag the commit and push the tag:  `git tag v2.7.0 && git push origin v2.7.0`
 #    The repository has no tags at all today, so this is a deliberate, manual,
 #    human act - nothing in this pipeline creates one.
