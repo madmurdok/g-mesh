@@ -198,6 +198,18 @@ fn ran_marker(test: &str) -> String {
 /// otherwise), and `scratch` and `real` in [`CHILD_ENV`]; asserts that it ran
 /// and passed.
 fn in_its_env(test: &str, scratch: &Path, real: &RealToolchain, cwd: Option<&Path>) {
+    in_its_env_with(test, scratch, real, cwd, &[]);
+}
+
+/// [`in_its_env`] with `env` set in the child's environment on top; returns
+/// the child's output.
+fn in_its_env_with(
+    test: &str,
+    scratch: &Path,
+    real: &RealToolchain,
+    cwd: Option<&Path>,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.args([test, "--exact", "--ignored", "--nocapture", "--test-threads=1"]);
     for name in cargo_and_rustup_vars() {
@@ -208,6 +220,9 @@ fn in_its_env(test: &str, scratch: &Path, real: &RealToolchain, cwd: Option<&Pat
         .env("PATH", child_path(&real.proxy_dir))
         .env(MANIFEST_PATH_ENV, concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))
         .env(CHILD_ENV, std::env::join_paths(fixture).unwrap());
+    for (name, value) in env {
+        command.env(name, value);
+    }
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -219,6 +234,7 @@ fn in_its_env(test: &str, scratch: &Path, real: &RealToolchain, cwd: Option<&Pat
         "{test} did not pass in its environment ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
         output.status
     );
+    output
 }
 
 /// The scratch root and the parent's toolchain of a child test, or `None`
@@ -1532,6 +1548,460 @@ mod source_freshness {
 /// prints why and passes, except on GitHub Actions, whose ubuntu-22.04 runner
 /// has both layers: there it fails, so a degraded runner cannot turn these
 /// tests into skips.
+/// A TCP listener on loopback that counts the connections it accepts.
+/// [`Sink::settled`] makes its own connection last, so every connection made
+/// before the call has been counted when it returns.
+#[cfg(unix)]
+struct Sink {
+    port: u16,
+    real: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    sentinels: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+impl Sink {
+    fn start() -> Self {
+        use std::io::Read;
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let real = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sentinels = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counted, marked) = (real.clone(), sentinels.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut first = [0u8; 1];
+                if stream.read_exact(&mut first).is_ok() && first == *b"S" {
+                    marked.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        Sink { port, real, sentinels }
+    }
+
+    /// The connections accepted so far, the sink's own excluded. The
+    /// listener accepts in arrival order, so once the sentinel made here is
+    /// counted every earlier connection is too.
+    fn settled(&self) -> usize {
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+        let target = self.sentinels.load(Ordering::SeqCst) + 1;
+        let mut sentinel = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        sentinel.write_all(b"S").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.sentinels.load(Ordering::SeqCst) < target {
+            assert!(std::time::Instant::now() < deadline, "the sink never accepted its own connection");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.real.load(Ordering::SeqCst)
+    }
+}
+
+/// The OS sandbox stands alone between the server's process tree and the
+/// network and every write outside its private temp dir and the cargo
+/// caches: each child test builds the production config with
+/// `semantic::server_config_with` (bypassing the cargo config pre-check),
+/// then removes test-side the configuration that keeps the tree offline and
+/// writing nothing, so only the sandbox refuses. A clean lockless fixture
+/// keeps the dependency edge only the writable temp dir makes possible.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod sandbox_writes_and_network {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    use g_mesh_plugin_sdk::lsp::{LspBridge, SemanticConfig};
+    use g_mesh_plugin_sdk::{SemanticAnswer, SemanticEngine};
+
+    const LAUNCHER: &str = env!("CARGO_BIN_EXE_g-mesh-plugin-rust");
+
+    /// Whether the sandbox can run here (on Linux, the mount layer); prints
+    /// why not, or panics on GitHub Actions.
+    fn host_runs_the_sandbox(test: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            super::linux_sandbox::host_runs_the_mount_layer(test)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = test;
+            true
+        }
+    }
+
+    /// Workspace `app` (`main` calls `util::Thing.method()`), with
+    /// `dependencies` as `app`'s `[dependencies]` body, no `Cargo.lock`.
+    fn write_workspace(root: &Path, dependencies: &str) {
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n");
+        write(
+            &root.join("app/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{dependencies}"
+            ),
+        );
+        write(&root.join("app/src/main.rs"), "mod util;\n\nfn main() {\n    util::Thing.method();\n}\n");
+        write(
+            &root.join("app/src/util.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn method(&self) {}\n}\n",
+        );
+    }
+
+    fn index_of(root: &Path) -> SdkIndex {
+        let project = ProjectContext::load(root).expect("the fixture is a loadable Rust project");
+        let mut index = SdkIndex::new();
+        for path in walk_project(root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+            let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+            let graph = RustExtractor.extract(&project, &path, &source);
+            index.insert(path, source, graph);
+        }
+        index
+    }
+
+    /// The index of `root` and the server's answer about it under `config`.
+    fn answer(root: &Path, config: SemanticConfig) -> (SdkIndex, SemanticAnswer) {
+        let index = index_of(root);
+        let mut bridge = LspBridge::new("rust", root, config).quiescent_signal();
+        let answer = bridge.answer(&[], &index).expect("the confined server answers");
+        drop(bridge);
+        (index, answer)
+    }
+
+    /// Whether the answer has a semantic edge from `main` in
+    /// `app/src/main.rs` to a function named `name`.
+    fn main_calls(index: &SdkIndex, answer: &SemanticAnswer, name: &str) -> bool {
+        let main = index
+            .graph(&RelPath::new("app/src/main.rs"))
+            .expect("app/src/main.rs is indexed")
+            .nodes
+            .iter()
+            .find(|node| node.name == "main")
+            .expect("the extractor emits `main`")
+            .id
+            .clone();
+        answer
+            .diff
+            .upsert_edges
+            .iter()
+            .filter(|edge| edge.from_id == main && edge.source == SourceTier::Semantic)
+            .any(|edge| {
+                answer.diff.upsert_nodes.iter().any(|node| node.id == edge.to_id && node.name == name)
+                    || index.node(&edge.to_id).is_some_and(|(_, node)| node.name == name)
+            })
+    }
+
+    /// Every path under `dir`, relative to it.
+    fn tree(dir: &Path) -> BTreeSet<PathBuf> {
+        let mut paths = BTreeSet::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path.clone());
+                }
+                paths.insert(path.strip_prefix(dir).unwrap().to_path_buf());
+            }
+        }
+        paths
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        for relative in tree(from) {
+            let source = from.join(&relative);
+            if source.is_file() {
+                std::fs::create_dir_all(to.join(&relative).parent().unwrap()).unwrap();
+                std::fs::copy(&source, to.join(&relative)).unwrap();
+            }
+        }
+    }
+
+    /// `cargo` (the rustup proxy) run unconfined in `dir`, its output.
+    fn cargo(real: &RealToolchain, dir: &Path, args: &[&str]) -> std::process::Output {
+        let mut command = Command::new(real.proxy_dir.join("cargo"));
+        command.args(args).current_dir(dir).env("CARGO_NET_RETRY", "0").env_remove("CARGO_NET_OFFLINE");
+        for proxy in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"] {
+            command.env_remove(proxy);
+        }
+        command.output().unwrap()
+    }
+
+    fn server_config(root: &Path) -> SemanticConfig {
+        semantic::server_config_with(root, Path::new(LAUNCHER))
+            .expect("the server config is built and confined")
+    }
+
+    /// N: with `CARGO_NET_OFFLINE` removed, a git dependency on a loopback
+    /// listener, and `CARGO_HOME/{registry,git}` writable (without a
+    /// writable `git/` cargo fails before any connect), the confined tree
+    /// opens no connection that plain `cargo metadata` opens, and the server
+    /// still resolves the workspace.
+    ///
+    /// Controls: drop `(deny network*)` from `seatbelt::profile` (macOS);
+    /// drop `CLONE_NEWNET` from `mount_layer`'s `unshare` (Docker).
+    #[test]
+    fn the_server_tree_opens_no_network_connection_with_offline_removed() {
+        let test =
+            "sandbox_writes_and_network::the_server_tree_opens_no_network_connection_with_offline_removed";
+        if !host_runs_the_sandbox(test) {
+            return;
+        }
+        let real = real_toolchain();
+        let scratch = Scratch::new("gm640-net");
+        let home = scratch.0.join("cargo-home");
+        for cache in ["git", "registry"] {
+            std::fs::create_dir_all(home.join(cache)).unwrap();
+        }
+        in_its_env_with(
+            &format!("{test}_in_its_env"),
+            &scratch.0,
+            &real,
+            None,
+            &[("CARGO_HOME", home.as_os_str())],
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn the_server_tree_opens_no_network_connection_with_offline_removed_in_its_env() {
+        let test =
+            "sandbox_writes_and_network::the_server_tree_opens_no_network_connection_with_offline_removed_in_its_env";
+        let Some((scratch, real)) = child_fixture(test) else { return };
+        let sink = Sink::start();
+        let root = scratch.join("root");
+        write_workspace(
+            &root,
+            &format!("gm640dep = {{ git = \"http://127.0.0.1:{}/gm640dep.git\" }}\n", sink.port),
+        );
+
+        let copy = scratch.join("copy");
+        copy_tree(&root, &copy);
+        let output = cargo(&real, &copy, &["metadata", "--format-version", "1"]);
+        let before = sink.settled();
+        assert!(
+            before > 0,
+            "sanity: unconfined `cargo metadata` never reached the listener, so this test would prove nothing \
+             about the network: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut config = server_config(&root);
+        assert!(
+            config.env.remove("CARGO_NET_OFFLINE").is_some(),
+            "the config no longer sets CARGO_NET_OFFLINE"
+        );
+        config.env.insert("CARGO_NET_RETRY".to_string(), "0".to_string());
+        let (index, answer) = answer(&root, config);
+
+        assert_eq!(sink.settled(), before, "the confined server tree connected to the listener");
+        assert!(
+            main_calls(&index, &answer, "method"),
+            "the confined server did not resolve `util::Thing.method()` (complete: {}, reason: {:?})",
+            answer.complete,
+            answer.reason
+        );
+        println!("{}", ran_marker(test));
+    }
+
+    /// W: with build scripts turned on, `CARGO_TARGET_DIR` outside every
+    /// writable prefix and `TMPDIR` at a directory the policy does not list
+    /// (so cargo tries `<root>/Cargo.lock`), the confined tree writes nothing
+    /// under the root, the target dir or that `TMPDIR`, and the server still
+    /// resolves the workspace.
+    ///
+    /// Controls: drop `(deny file-write*)` from `seatbelt::profile` (macOS);
+    /// drop `RDONLY` from the default `/` `set_attrs` in `mount_layer`
+    /// (Docker).
+    #[test]
+    fn the_server_tree_writes_nothing_outside_its_writable_prefixes() {
+        let test = "sandbox_writes_and_network::the_server_tree_writes_nothing_outside_its_writable_prefixes";
+        if !host_runs_the_sandbox(test) {
+            return;
+        }
+        let real = real_toolchain();
+        let scratch = Scratch::new("gm640-writes");
+        in_its_env(&format!("{test}_in_its_env"), &scratch.0, &real, None);
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn the_server_tree_writes_nothing_outside_its_writable_prefixes_in_its_env() {
+        let test =
+            "sandbox_writes_and_network::the_server_tree_writes_nothing_outside_its_writable_prefixes_in_its_env";
+        let Some((scratch, real)) = child_fixture(test) else { return };
+        let root = scratch.join("root");
+        write_workspace(&root, "");
+        write(&root.join("app/build.rs"), "fn main() {}\n");
+
+        let copy = scratch.join("copy");
+        copy_tree(&root, &copy);
+        let output = cargo(&real, &copy, &["check", "--offline"]);
+        assert!(
+            copy.join("target").is_dir(),
+            "sanity: unconfined `cargo check` wrote no target/: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let unlisted = scratch.join("unlisted-tmp");
+        std::fs::create_dir_all(&unlisted).unwrap();
+        let outside = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("gm640-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("target");
+        let before = tree(&root);
+
+        let mut config = server_config(&root);
+        let options = config.initialization_options.get_or_insert_with(|| serde_json::json!({}));
+        options["cargo"]["buildScripts"]["enable"] = serde_json::json!(true);
+        config.env.insert("CARGO_TARGET_DIR".to_string(), target.to_string_lossy().into_owned());
+        config.env.insert("TMPDIR".to_string(), unlisted.to_string_lossy().into_owned());
+        let (index, answer) = answer(&root, config);
+        let target_written = target.exists();
+        let _ = std::fs::remove_dir_all(&outside);
+
+        assert_eq!(tree(&root), before, "the confined server tree wrote under the root");
+        assert!(!target_written, "the confined server tree wrote {}", target.display());
+        assert_eq!(tree(&unlisted), BTreeSet::new(), "the confined server tree wrote in an unlisted TMPDIR");
+        assert!(
+            main_calls(&index, &answer, "method"),
+            "the confined server did not resolve `util::Thing.method()` (complete: {}, reason: {:?})",
+            answer.complete,
+            answer.reason
+        );
+        println!("{}", ran_marker(test));
+    }
+
+    /// P: the server's `TMPDIR` is its private temp dir, which the sandbox
+    /// lets it write, so a lockless workspace keeps the edge to a method of
+    /// a path dependency outside the workspace (only `cargo metadata` with
+    /// dependencies yields it), and nothing is written under the root.
+    ///
+    /// Control: `server_config_with` does not set `TMPDIR` in `config.env`.
+    #[test]
+    fn a_lockless_workspace_keeps_its_path_dependency_through_the_private_temp_dir() {
+        let test =
+            "sandbox_writes_and_network::a_lockless_workspace_keeps_its_path_dependency_through_the_private_temp_dir";
+        if !host_runs_the_sandbox(test) {
+            return;
+        }
+        let real = real_toolchain();
+        let scratch = Scratch::new("gm640-temp");
+        in_its_env(&format!("{test}_in_its_env"), &scratch.0, &real, None);
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_lockless_workspace_keeps_its_path_dependency_through_the_private_temp_dir_in_its_env() {
+        let test = "sandbox_writes_and_network::a_lockless_workspace_keeps_its_path_dependency_through_the_private_temp_dir_in_its_env";
+        let Some((scratch, _real)) = child_fixture(test) else { return };
+        let root = scratch.join("root");
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\nexclude = [\"helper\"]\nresolver = \"2\"\n",
+        );
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n\
+             helper = { path = \"../helper\" }\n",
+        );
+        write(
+            &root.join("app/src/main.rs"),
+            "fn main() {\n    let thing = helper::Thing;\n    thing.assist();\n}\n",
+        );
+        write(
+            &root.join("helper/Cargo.toml"),
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(
+            &root.join("helper/src/lib.rs"),
+            "pub struct Thing;\n\nimpl Thing {\n    pub fn assist(&self) {}\n}\n",
+        );
+        let before = tree(&root);
+
+        let config = server_config(&root);
+        let temp = PathBuf::from(config.env.get("TMPDIR").expect("the server gets its own TMPDIR"));
+        assert!(temp.is_dir(), "{}", temp.display());
+        assert_ne!(
+            temp,
+            std::env::temp_dir().canonicalize().unwrap(),
+            "the server's TMPDIR is the user's shared temp dir"
+        );
+        let listed = if cfg!(target_os = "macos") {
+            config
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("ALLOW_") && arg.ends_with(&format!("={}", temp.display())))
+        } else {
+            config.args.windows(2).any(|pair| pair[0] == "--write" && Path::new(&pair[1]) == temp)
+        };
+        assert!(
+            listed,
+            "the server's TMPDIR {} is not writable under the sandbox: {:?}",
+            temp.display(),
+            config.args
+        );
+
+        let (index, answer) = answer(&root, config);
+        assert_eq!(tree(&root), before, "the confined server tree wrote under the root");
+        assert!(
+            main_calls(&index, &answer, "assist"),
+            "the confined server did not resolve `thing.assist()` on `helper::Thing` in a lockless workspace (complete: {}, \
+             reason: {:?})",
+            answer.complete,
+            answer.reason
+        );
+        println!("{}", ran_marker(test));
+    }
+
+    /// A private temp dir that cannot be created degrades the start rather
+    /// than refusing it: the config is built and confined, without a
+    /// `TMPDIR` override, and the reason is logged.
+    ///
+    /// Control: make `server_config_with` propagate the error of
+    /// `private_temp_dir` (`?`).
+    #[test]
+    fn a_private_temp_dir_that_cannot_be_made_degrades_the_start() {
+        let test = "sandbox_writes_and_network::a_private_temp_dir_that_cannot_be_made_degrades_the_start";
+        if !host_runs_the_sandbox(test) {
+            return;
+        }
+        let real = real_toolchain();
+        let scratch = Scratch::new("gm640-notemp");
+        let missing = scratch.0.join("missing-tmp");
+        let output = in_its_env_with(
+            &format!("{test}_in_its_env"),
+            &scratch.0,
+            &real,
+            None,
+            &[("TMPDIR", missing.as_os_str())],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no private temp dir for rust-analyzer") && stderr.contains("missing-tmp"),
+            "the degraded start is not logged: {stderr}"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by its parent test in the fixture's environment"]
+    fn a_private_temp_dir_that_cannot_be_made_degrades_the_start_in_its_env() {
+        let test = "sandbox_writes_and_network::a_private_temp_dir_that_cannot_be_made_degrades_the_start_in_its_env";
+        let Some((scratch, _real)) = child_fixture(test) else { return };
+        assert!(!std::env::temp_dir().exists(), "sanity: the child's TMPDIR exists");
+        let root = scratch.join("root");
+        write_workspace(&root, "");
+
+        let config = semantic::server_config_with(&root, Path::new(LAUNCHER))
+            .expect("a temp dir that cannot be made refused the start");
+        assert!(!config.env.contains_key("TMPDIR"), "{:?}", config.env);
+        let confined = if cfg!(target_os = "macos") { "/usr/bin/sandbox-exec" } else { LAUNCHER };
+        assert_eq!(config.command, Path::new(confined), "the degraded start is not confined: {config:?}");
+        println!("{}", ran_marker(test));
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux_sandbox {
     use super::*;
@@ -1551,13 +2021,23 @@ mod linux_sandbox {
         std::env::var_os("GITHUB_ACTIONS").is_some()
     }
 
-    /// Runs `server args` under the trampoline with `layers`, `root` and an
-    /// `--allow` per entry of `allow`.
-    fn trampoline(layers: &str, root: &Path, allow: &[&Path], server: &str, args: &[&OsStr]) -> Output {
+    /// Runs `server args` under the trampoline with `layers`, `root`, an
+    /// `--allow` per entry of `allow` and a `--write` per entry of `write`.
+    fn trampoline(
+        layers: &str,
+        root: &Path,
+        allow: &[&Path],
+        write: &[&Path],
+        server: &str,
+        args: &[&OsStr],
+    ) -> Output {
         let mut command = Command::new(LAUNCHER);
         command.args(["__g-mesh-sandbox", "--layers", layers, "--root"]).arg(root);
         for prefix in allow {
             command.arg("--allow").arg(prefix);
+        }
+        for prefix in write {
+            command.arg("--write").arg(prefix);
         }
         command.arg("--").arg(server).args(args).output().unwrap()
     }
@@ -1574,7 +2054,7 @@ mod linux_sandbox {
     /// `Err` with the trampoline's reason when it cannot set up `layers` here.
     fn host_supports(layers: &str) -> Result<(), String> {
         let scratch = Scratch::new("probe");
-        let output = trampoline(layers, &scratch.0, &[], "/bin/true", &[]);
+        let output = trampoline(layers, &scratch.0, &[], &[], "/bin/true", &[]);
         if output.status.success() {
             Ok(())
         } else {
@@ -1640,10 +2120,16 @@ mod linux_sandbox {
     const RUN_EACH: &str = "codes=; for c in \"$@\"; do \"$c\"; codes=\"$codes $?\"; done; echo $codes";
 
     /// The exit codes of `programs`, each run under the trampoline.
-    fn exit_codes_under(layers: &str, root: &Path, allow: &[&Path], programs: &[&Path]) -> (String, Output) {
+    fn exit_codes_under(
+        layers: &str,
+        root: &Path,
+        allow: &[&Path],
+        write: &[&Path],
+        programs: &[&Path],
+    ) -> (String, Output) {
         let mut args: Vec<&OsStr> = vec![OsStr::new("-c"), OsStr::new(RUN_EACH), OsStr::new("sh")];
         args.extend(programs.iter().map(|program| program.as_os_str()));
-        let output = trampoline(layers, root, allow, "/bin/sh", &args);
+        let output = trampoline(layers, root, allow, write, "/bin/sh", &args);
         (String::from_utf8_lossy(&output.stdout).trim().to_string(), output)
     }
 
@@ -1661,7 +2147,7 @@ mod linux_sandbox {
         let allowed = true_in(&scratch.0.join("tool"));
 
         let (codes, output) =
-            exit_codes_under("mount", &root, &[&scratch.0.join("tool")], &[&in_root, &allowed]);
+            exit_codes_under("mount", &root, &[&scratch.0.join("tool")], &[], &[&in_root, &allowed]);
         assert_eq!(codes, format!("{DENIED} 0"), "{}", describe(&output));
     }
 
@@ -1681,14 +2167,16 @@ mod linux_sandbox {
         let in_root = true_in(&root);
         let beside = true_in(&scratch.0.join("tool"));
 
-        let (codes, output) = exit_codes_under("mount", &root, &[&scratch.0], &[&in_root, &beside]);
+        let (codes, output) = exit_codes_under("mount", &root, &[&scratch.0], &[], &[&in_root, &beside]);
         assert_eq!(codes, format!("{DENIED} 0"), "{}", describe(&output));
     }
 
     /// In the mount layer the loader cannot map a shared object under the
     /// root (`LD_PRELOAD`, set inside the sandbox by `env`), and does map
     /// the same object from an allowed prefix, whose constructor writes its
-    /// marker from inside the sandbox.
+    /// marker from inside the sandbox. Both markers go to a `--write`
+    /// directory: the root is read-only, so a marker there could not show a
+    /// load.
     #[test]
     fn the_mount_layer_maps_no_shared_object_under_the_root() {
         let test = "linux_sandbox::the_mount_layer_maps_no_shared_object_under_the_root";
@@ -1698,8 +2186,10 @@ mod linux_sandbox {
         let scratch = Scratch::new("mount-preload");
         let root = scratch.0.join("proj");
         let tool = scratch.0.join("tool");
-        let root_mark = root.join("MARK_root_object");
-        let tool_mark = root.join("MARK_allowed_object");
+        let marks = scratch.0.join("marks");
+        std::fs::create_dir_all(&marks).unwrap();
+        let root_mark = marks.join("MARK_root_object");
+        let tool_mark = marks.join("MARK_allowed_object");
         let root_object = build_marker_dylib(&root.join("dylib"), &root_mark, "LD_PRELOAD from the root");
         let tool_object = build_marker_dylib(&tool, &tool_mark, "LD_PRELOAD from an allowed prefix");
         let preload = |object: &Path| format!("LD_PRELOAD={}", object.display());
@@ -1718,6 +2208,7 @@ mod linux_sandbox {
                 "mount",
                 &root,
                 &[&tool],
+                &[&marks],
                 "/usr/bin/env",
                 &[OsStr::new(&preload), OsStr::new("/bin/true")],
             );
@@ -1754,6 +2245,7 @@ mod linux_sandbox {
             "mount",
             &root,
             &[],
+            &[],
             "/bin/sh",
             &[OsStr::new("-c"), OsStr::new(script), OsStr::new("sh"), root.as_os_str(), in_root.as_os_str()],
         );
@@ -1778,7 +2270,7 @@ mod linux_sandbox {
         let allowed = true_in(&scratch.0.join("tool"));
 
         let (codes, output) =
-            exit_codes_under("landlock", &root, &[&scratch.0.join("tool")], &[&outside, &allowed]);
+            exit_codes_under("landlock", &root, &[&scratch.0.join("tool")], &[], &[&outside, &allowed]);
         assert_eq!(codes, format!("{DENIED} 0"), "{}", describe(&output));
     }
 
@@ -1810,8 +2302,14 @@ mod linux_sandbox {
         );
 
         let scratch = Scratch::new("landlock-tcp");
-        let output =
-            trampoline("landlock", &scratch.0, &[], "/bin/bash", &[OsStr::new("-c"), OsStr::new(&script)]);
+        let output = trampoline(
+            "landlock",
+            &scratch.0,
+            &[],
+            &[],
+            "/bin/bash",
+            &[OsStr::new("-c"), OsStr::new(&script)],
+        );
         assert!(
             !String::from_utf8_lossy(&output.stdout).contains("connected") && !output.status.success(),
             "a process under Landlock connected over TCP: {}",
@@ -1828,7 +2326,7 @@ mod linux_sandbox {
         let mount = host_supports("mount");
         let landlock = host_supports("landlock");
         let scratch = Scratch::new("tier");
-        let policy = SandboxPolicy::new(&scratch.0, []);
+        let policy = SandboxPolicy::new(&scratch.0, [], []);
         let untouched = SemanticConfig::new(Path::new("/bin/true"));
         let mut config = untouched.clone();
 
@@ -1872,5 +2370,211 @@ mod linux_sandbox {
             }
             None => assert_eq!(config, untouched, "a failed confine changed the config"),
         }
+    }
+
+    /// `sh -c` that writes each argument as a file and prints `wrote <f>` or
+    /// `refused <f>` for it.
+    const WRITE_EACH: &str =
+        "for f in \"$@\"; do if (: > \"$f\") 2>/dev/null; then echo \"wrote $f\"; else echo \"refused $f\"; fi; done";
+
+    /// The output of writing `files`, each under the trampoline.
+    fn writes_under(layers: &str, root: &Path, write: &[&Path], files: &[&Path]) -> (String, Output) {
+        let mut args: Vec<&OsStr> = vec![OsStr::new("-c"), OsStr::new(WRITE_EACH), OsStr::new("sh")];
+        args.extend(files.iter().map(|file| file.as_os_str()));
+        let output = trampoline(layers, root, &[], write, "/bin/sh", &args);
+        (String::from_utf8_lossy(&output.stdout).into_owned(), output)
+    }
+
+    /// In the mount layer the tree writes under a `--write` prefix and to
+    /// `/dev/null`, and nowhere else: not under the root, which lies inside
+    /// the writable prefix, and not in a directory no prefix lists.
+    ///
+    /// Controls: drop `RDONLY` from the default `/` `set_attrs` in
+    /// `mount_layer` (`out/MARK` written); sort the root first in
+    /// `mount_plan` (`w/proj/MARK` written).
+    #[test]
+    fn the_mount_layer_writes_only_under_write_prefixes_and_never_under_the_root() {
+        let test = "linux_sandbox::the_mount_layer_writes_only_under_write_prefixes_and_never_under_the_root";
+        if !require("mount", test) {
+            return;
+        }
+        let scratch = Scratch::new("mount-writes");
+        let writable = scratch.0.join("w");
+        let root = writable.join("proj");
+        let out = scratch.0.join("out");
+        for dir in [&root, &out] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let (ok, in_root, outside) = (writable.join("ok"), root.join("MARK"), out.join("MARK"));
+        let (stdout, output) =
+            writes_under("mount", &root, &[&writable], &[&ok, &in_root, &outside, Path::new("/dev/null")]);
+        assert!(output.status.success(), "{}", describe(&output));
+        assert!(ok.is_file(), "the --write prefix was not writable: {stdout}");
+        assert!(!in_root.exists(), "a process in the mount layer wrote under the root: {stdout}");
+        assert!(
+            !outside.exists(),
+            "a process in the mount layer wrote outside every --write prefix: {stdout}"
+        );
+        assert!(stdout.contains("wrote /dev/null"), "{stdout}");
+    }
+
+    /// In the mount layer the tree reaches no network: neither a TCP
+    /// listener nor a UDP socket on loopback, which the same shell reaches
+    /// unconfined.
+    ///
+    /// Control: drop `CLONE_NEWNET` from `mount_layer`'s `unshare`.
+    #[test]
+    fn the_mount_layer_reaches_no_network() {
+        let test = "linux_sandbox::the_mount_layer_reaches_no_network";
+        if !require("mount", test) {
+            return;
+        }
+        let sink = Sink::start();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        udp.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        let (tcp_port, udp_port) = (sink.port.to_string(), udp.local_addr().unwrap().port().to_string());
+        let script = "(exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null && echo tcp; \
+                      (printf D > /dev/udp/127.0.0.1/$2) 2>/dev/null && echo udp; true";
+        let args = [
+            OsStr::new("-c"),
+            OsStr::new(script),
+            OsStr::new("bash"),
+            OsStr::new(&tcp_port),
+            OsStr::new(&udp_port),
+        ];
+        let first_datagram = || {
+            let mut buf = [0u8; 16];
+            let n = udp.recv(&mut buf).expect("no datagram arrived within 10s");
+            buf[..n].to_vec()
+        };
+
+        let unconfined = Command::new("/bin/bash").args(args).output().unwrap();
+        let stdout = String::from_utf8_lossy(&unconfined.stdout);
+        assert!(stdout.contains("tcp") && stdout.contains("udp"), "sanity: {}", describe(&unconfined));
+        assert_eq!(sink.settled(), 1, "sanity: bash did not reach the TCP listener");
+        assert_eq!(first_datagram(), b"D", "sanity: bash did not reach the UDP socket");
+
+        let scratch = Scratch::new("mount-net");
+        let output = trampoline("mount", &scratch.0, &[], &[], "/bin/bash", &args);
+        assert!(output.status.success(), "{}", describe(&output));
+        assert_eq!(
+            sink.settled(),
+            1,
+            "a process in the mount layer connected over TCP: {}",
+            describe(&output)
+        );
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().send_to(b"S", udp.local_addr().unwrap()).unwrap();
+        assert_eq!(
+            first_datagram(),
+            b"S",
+            "a process in the mount layer sent a UDP datagram: {}",
+            describe(&output)
+        );
+    }
+
+    /// In the mount layer a `--write` prefix inside an `--allow` prefix is
+    /// not executable, while the rest of the allowed prefix is.
+    ///
+    /// Control: drop the `!write.iter().any(..)` clause from `mount_plan`'s
+    /// exec flag.
+    #[test]
+    fn the_mount_layer_execs_nothing_under_a_write_prefix_inside_an_allowed_prefix() {
+        let test =
+            "linux_sandbox::the_mount_layer_execs_nothing_under_a_write_prefix_inside_an_allowed_prefix";
+        if !require("mount", test) {
+            return;
+        }
+        let scratch = Scratch::new("mount-write-noexec");
+        let tool = scratch.0.join("tool");
+        let cache = tool.join("cache");
+        let root = scratch.0.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let in_cache = true_in(&cache);
+        let in_tool = true_in(&tool);
+
+        let (codes, output) = exit_codes_under("mount", &root, &[&tool], &[&cache], &[&in_cache, &in_tool]);
+        assert_eq!(codes, format!("{DENIED} 0"), "{}", describe(&output));
+    }
+
+    /// Landlock alone allows writes only under the `--write` prefixes (and
+    /// to the OS device nodes): `w/ok` is written, `out/MARK` is not.
+    ///
+    /// Control: drop the `from_write` rules (`write_beneath`) from
+    /// `landlock_layer`'s handled access.
+    #[test]
+    fn landlock_alone_denies_writes_outside_the_write_prefixes() {
+        let test = "linux_sandbox::landlock_alone_denies_writes_outside_the_write_prefixes";
+        if !require("landlock", test) {
+            return;
+        }
+        let scratch = Scratch::new("landlock-writes");
+        let writable = scratch.0.join("w");
+        let root = scratch.0.join("proj");
+        let out = scratch.0.join("out");
+        for dir in [&writable, &root, &out] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let (ok, outside) = (writable.join("ok"), out.join("MARK"));
+        let (stdout, output) =
+            writes_under("landlock", &root, &[&writable], &[&ok, &outside, Path::new("/dev/null")]);
+        assert!(output.status.success(), "{}", describe(&output));
+        assert!(ok.is_file(), "the --write prefix was not writable: {stdout}");
+        assert!(!outside.exists(), "a process under Landlock wrote outside every --write prefix: {stdout}");
+        assert!(stdout.contains("wrote /dev/null"), "{stdout}");
+    }
+
+    /// Landlock alone lets the tree write `/dev/null` but not a file in
+    /// `/dev/shm`, which the same shell writes unconfined: the OS write
+    /// grants are device nodes, never `/dev`.
+    ///
+    /// Control: `landlock_ns::OS_WRITE` back to `["/dev"]`.
+    #[test]
+    fn landlock_alone_writes_device_nodes_but_not_dev_shm() {
+        let test = "linux_sandbox::landlock_alone_writes_device_nodes_but_not_dev_shm";
+        if !require("landlock", test) {
+            return;
+        }
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let shm = PathBuf::from(format!("/dev/shm/g-mesh-gm640-{}-{n}", std::process::id()));
+        let sanity = Command::new("/bin/sh").args(["-c", WRITE_EACH, "sh"]).arg(&shm).output().unwrap();
+        if !shm.is_file() {
+            assert!(!on_ci(), "{test}: GitHub Actions' runner cannot write /dev/shm: {}", describe(&sanity));
+            println!("{test}: skipped, /dev/shm is not writable here: {}", describe(&sanity));
+            return;
+        }
+        std::fs::remove_file(&shm).unwrap();
+
+        let scratch = Scratch::new("landlock-dev");
+        let (stdout, output) = writes_under("landlock", &scratch.0, &[], &[Path::new("/dev/null"), &shm]);
+        let written = shm.is_file();
+        let _ = std::fs::remove_file(&shm);
+        assert!(output.status.success(), "{}", describe(&output));
+        assert!(stdout.contains("wrote /dev/null"), "{stdout}");
+        assert!(!written, "a process under Landlock wrote in /dev/shm: {stdout}");
+    }
+
+    /// Landlock alone execs nothing under a `--write` prefix inside an
+    /// `--allow` prefix, while the rest of the allowed prefix runs.
+    ///
+    /// Control: make `exec_beneath` return `allowed` unchanged.
+    #[test]
+    fn landlock_alone_execs_nothing_under_a_write_prefix_inside_an_allowed_prefix() {
+        let test =
+            "linux_sandbox::landlock_alone_execs_nothing_under_a_write_prefix_inside_an_allowed_prefix";
+        if !require("landlock", test) {
+            return;
+        }
+        let scratch = Scratch::new("landlock-write-noexec");
+        let tool = scratch.0.join("tool");
+        let cache = tool.join("cache");
+        let root = scratch.0.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let in_cache = true_in(&cache);
+        let in_tool = true_in(&tool);
+
+        let (codes, output) =
+            exit_codes_under("landlock", &root, &[&tool], &[&cache], &[&in_cache, &in_tool]);
+        assert_eq!(codes, format!("{DENIED} 0"), "{}", describe(&output));
     }
 }

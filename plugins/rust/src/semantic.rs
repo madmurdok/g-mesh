@@ -146,17 +146,21 @@ pub fn engine_with(root: &Path, launcher: &Path) -> Result<Box<dyn SemanticEngin
 /// ([`sandbox::confine`]).
 ///
 /// On macOS the server and every child run under Seatbelt, which lets them
-/// map and exec only the toolchain and the OS, never anything under `root`;
-/// when it cannot be applied this returns `Err` with the reason, and no
+/// map and exec only the toolchain and the OS, never anything under `root`,
+/// write only their private `TMPDIR` (a fresh directory per engine) and the
+/// cargo caches (`$CARGO_HOME/registry`, `$CARGO_HOME/git`), and open no
+/// network connection; when it cannot be applied this returns `Err` with the reason, and no
 /// unsandboxed server is started. On Linux the plugin binary re-executes
 /// itself as a trampoline that sets up the layers and execs the server: a
-/// `noexec` mount namespace (only the toolchain and the OS executable,
-/// never `root`) plus Landlock (exec allowlist, no TCP) where both work;
-/// the mount namespace alone without Landlock; Landlock alone, logged as
-/// not blocking shared-object loads, without a usable user namespace;
-/// `Err` with neither. On an OS with no sandbox backend the server starts
-/// unconfined
-/// ([ADR 0039](../../../docs/adr/0039-rust-server-runs-under-an-os-sandbox.md)).
+/// mount namespace (only the toolchain and the OS executable, only the same
+/// temp dir and cargo caches writable, never `root`) inside a network
+/// namespace with no interface up, plus Landlock (exec and write allowlists,
+/// no TCP) where both work; the namespaces alone without Landlock; Landlock
+/// alone, logged as not blocking shared-object loads or UDP, without a
+/// usable user namespace; `Err` with neither. On an OS with no sandbox
+/// backend the server starts unconfined and no temp dir is made
+/// ([ADR 0039](../../../docs/adr/0039-rust-server-runs-under-an-os-sandbox.md),
+/// [ADR 0040](../../../docs/adr/0040-rust-sandbox-denies-network-and-writes.md)).
 pub fn server_config(root: &Path) -> Result<SemanticConfig> {
     server_config_with(root, Path::new("/proc/self/exe"))
 }
@@ -186,6 +190,20 @@ pub fn server_config_with(root: &Path, launcher: &Path) -> Result<SemanticConfig
     );
     config.command = resolved.command;
     config.env.extend(pinned_env(&toolchain));
+    // A temp dir that cannot be made degrades the start rather than refuse
+    // it: the server keeps the inherited `TMPDIR`, which the sandbox leaves
+    // read-only, so rust-analyzer cannot copy the lockfile there and may
+    // resolve dependencies less.
+    let temp = private_temp_dir().unwrap_or_else(|err| {
+        g_mesh_plugin_sdk::log_line!(
+            "[{LANGUAGE}] semantic tier: no private temp dir for rust-analyzer ({err:#}); it keeps the \
+             inherited TMPDIR, which the sandbox does not let it write, so dependencies may resolve less"
+        );
+        None
+    });
+    if let Some(temp) = &temp {
+        config.env.insert("TMPDIR".to_string(), temp.to_string_lossy().into_owned());
+    }
     if let Some(sysroot) = &toolchain.sysroot {
         pin_sysroot(&mut config.initialization_options, sysroot);
         let rust_src_path = rust_src_path(std::env::var("RUST_SRC_PATH").ok().as_deref());
@@ -194,9 +212,45 @@ pub fn server_config_with(root: &Path, launcher: &Path) -> Result<SemanticConfig
             g_mesh_plugin_sdk::log_line!("{hint}");
         }
     }
-    let policy = SandboxPolicy::for_server(root, &toolchain, &config.command);
+    let cargo_home = cargo_home();
+    let policy =
+        SandboxPolicy::for_server(root, &toolchain, &config.command, cargo_home.as_deref(), temp.as_deref());
     admit(sandbox::confine(&mut config, &policy, launcher), &policy)?;
     Ok(config)
+}
+
+/// A fresh directory for the server's `TMPDIR` on an OS with a sandbox
+/// backend, `None` elsewhere: `<temp>/g-mesh-rust-<pid>-<n>`, mode 0700,
+/// canonical, `n` counting up so every engine of this process gets its own
+/// and a leftover of an earlier process with the same pid is skipped. The
+/// sandbox lets the tree write here and not in the user's shared temp dir.
+/// rust-analyzer removes what it creates inside; the empty directory is left
+/// to the OS's temp cleaning.
+fn private_temp_dir() -> Result<Option<PathBuf>> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = std::env::temp_dir();
+        loop {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = parent.join(format!("g-mesh-rust-{}-{n}", std::process::id()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => {
+                    let dir = std::fs::canonicalize(&dir)
+                        .with_context(|| format!("resolving {}", dir.display()))?;
+                    return Ok(Some(dir));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err).with_context(|| format!("creating {}", dir.display())),
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Ok(None)
+    }
 }
 
 /// Whether the server may start after [`sandbox::confine`] reported
@@ -206,19 +260,21 @@ pub fn server_config_with(root: &Path, launcher: &Path) -> Result<SemanticConfig
 fn admit(outcome: SandboxOutcome, policy: &SandboxPolicy) -> Result<()> {
     match outcome {
         SandboxOutcome::Confined { backend } => {
-            let allowed: Vec<String> = policy.toolchain.iter().map(|p| p.display().to_string()).collect();
+            let list = |paths: &[PathBuf]| paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>();
             g_mesh_plugin_sdk::log_line!(
                 "[{LANGUAGE}] semantic tier: rust-analyzer runs under {backend}; it may map and exec \
-                 the OS, package-manager prefixes and {}, and nothing under {}",
-                allowed.join(", "),
-                policy.project_root.display()
+                 the OS, package-manager prefixes and {}, and nothing under {}; it may write only {}, \
+                 and opens no network connection",
+                list(&policy.toolchain).join(", "),
+                policy.project_root.display(),
+                list(&policy.writable).join(", ")
             );
             Ok(())
         }
         SandboxOutcome::Partial { backend, gap } => {
             g_mesh_plugin_sdk::log_line!(
                 "[{LANGUAGE}] semantic tier: rust-analyzer runs under {backend} only; shared-object loads \
-                 from the project are not blocked ({gap}); the cargo config pre-check still refuses the \
+                 from the project and the writable dirs are not blocked ({gap}); the cargo config pre-check still refuses the \
                  [env] loader channel"
             );
             Ok(())
@@ -572,7 +628,8 @@ fn rust_src_hint(sysroot: &Path, pin: Option<&str>, rust_src_path: Option<&Path>
 /// (see [`sandbox`]), and its other entries stay outside this map.
 /// `CARGO_NET_OFFLINE` reaches every cargo the server runs (`metadata`,
 /// `locate-project`, `config get`), so none of them downloads a dependency
-/// or refreshes a registry index.
+/// or refreshes a registry index; under a sandbox backend the OS also
+/// refuses every connection the tree would open (see [`sandbox`]).
 fn pinned_env(toolchain: &Toolchain) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("CARGO_NET_OFFLINE".to_string(), "true".to_string());
@@ -2310,7 +2367,7 @@ mod tests {
         let server = scratch.0.join("rust-analyzer");
         std::fs::write(&server, "#!/bin/sh\necho \"rust-analyzer 0.0.0-fake\"\n").unwrap();
         std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let policy = SandboxPolicy::new(&scratch.0, []);
+        let policy = SandboxPolicy::new(&scratch.0, [], []);
         let mut config = SemanticConfig::new(&server);
 
         let outcome = sandbox::confine(&mut config, &policy, Path::new("/proc/self/exe"));
@@ -2329,7 +2386,7 @@ mod tests {
     /// Control: treat `SandboxOutcome::Partial` like `Failed` in `admit`.
     #[test]
     fn a_partial_sandbox_is_admitted_and_a_failed_one_refused_with_its_reason() {
-        let policy = SandboxPolicy::new(Path::new("/nonexistent/g-mesh-admit-root"), []);
+        let policy = SandboxPolicy::new(Path::new("/nonexistent/g-mesh-admit-root"), [], []);
         let partial = SandboxOutcome::Partial {
             backend: "Landlock",
             gap: "the noexec mount namespace cannot be set up: unshare: EPERM".to_string(),

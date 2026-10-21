@@ -135,12 +135,17 @@ readiness = "indexed"
 # The server runs no code the project supplies: no build script and no proc
 # macro (`cargo.buildScripts`, `procMacro`), so it builds nothing and writes
 # no `target/`. Derive-generated impls and `OUT_DIR` code are not resolved.
-# See docs/adr/0032-semantic-tiers-execute-no-project-code.md.
+# See docs/adr/0032-semantic-tiers-execute-no-project-code.md. On macOS and
+# Linux the OS sandbox also refuses every write outside the server's private
+# temp dir and `$CARGO_HOME/{registry,git}`, so no `target/` is written even
+# if a setting here changed.
 #
 # It also reaches no network: the plugin starts the server with
 # `CARGO_NET_OFFLINE=true`, so dependencies not in the local cargo cache are
 # not fetched and their edges stay unresolved until `cargo fetch`. See
-# docs/adr/0033-semantic-tiers-reach-no-network-and-write-nothing.md.
+# docs/adr/0033-semantic-tiers-reach-no-network-and-write-nothing.md. On
+# macOS and Linux the OS sandbox enforces it too: the server's process tree
+# opens no network connection (docs/adr/0040-rust-sandbox-denies-network-and-writes.md).
 #
 # `cargo.sysroot` is not set here: the plugin adds it at run time, as the
 # pinned toolchain's `rustc --print sysroot` (GM-603), unless this table

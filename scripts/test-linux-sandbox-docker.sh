@@ -33,7 +33,7 @@ target_volume="$prefix-target"
 registry_volume="$prefix-registry"
 
 lib_filter=(sandbox::landlock_ns semantic::tests::a_partial_sandbox_is_admitted)
-int_filter=(linux_sandbox:: cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves)
+int_filter=(linux_sandbox:: sandbox_writes_and_network:: cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves)
 engine_tests=(semantic_runs_no_project_code indexing_writes_nothing_and_stays_offline conformance)
 engine_args=""
 for t in "${engine_tests[@]}"; do
