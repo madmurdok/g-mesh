@@ -1163,3 +1163,156 @@ fn the_release_workflow_sets_up_and_reports_no_node_runtime() {
         assert!(!workflow.contains(forbidden), "release.yml still contains {forbidden:?}");
     }
 }
+
+fn release_workflow() -> String {
+    fs::read_to_string(repo_root().join(".github/workflows/release.yml")).unwrap()
+}
+
+/// The text of job `name` in `workflow`: from its `  name:` key to the next
+/// line at the jobs' own indentation (another job, or a comment above one).
+fn job_block<'a>(workflow: &'a str, name: &str) -> &'a str {
+    let header = format!("\n  {name}:\n");
+    let start = workflow.find(&header).unwrap_or_else(|| panic!("release.yml has no job {name:?}")) + 1;
+    let body_start = start + header.len() - 1;
+    let end = workflow[body_start..]
+        .match_indices('\n')
+        .map(|(i, _)| body_start + i + 1)
+        .find(|&line| {
+            let rest = &workflow[line..];
+            rest.starts_with("  ") && !rest[2..].starts_with([' ', '\n'])
+        })
+        .unwrap_or(workflow.len());
+    &workflow[start..end]
+}
+
+/// The text of the step named `name` in `job`: from its `- name:` line to the
+/// next step or the end of the job.
+fn step_block<'a>(job: &'a str, name: &str) -> &'a str {
+    let header = format!("      - name: {name}\n");
+    let start = job.find(&header).unwrap_or_else(|| panic!("job has no step {name:?}"));
+    let body_start = start + header.len();
+    let end = job[body_start..].find("\n      - ").map_or(job.len(), |i| body_start + i + 1);
+    &job[start..end]
+}
+
+const PUBLISH_STEP: &str = "Create, verify and publish the Release";
+const UNDRAFT: &str = r#"gh release edit "$tag" --draft=false --latest"#;
+
+fn position(haystack: &str, needle: &str) -> usize {
+    haystack.find(needle).unwrap_or_else(|| panic!("{needle:?} not found in:\n{haystack}"))
+}
+
+/// GM-643 behaviour 5: `publish` runs only on a version tag, and only when
+/// every `build` leg succeeded.
+///
+/// Control: drop `&& startsWith(github.ref, 'refs/tags/v')` - this fails.
+#[test]
+fn the_publish_job_runs_only_for_a_version_tag_once_every_build_succeeded() {
+    let workflow = release_workflow();
+    let job = job_block(&workflow, "publish");
+    assert!(job.contains("\n    needs: build\n"), "publish no longer needs build:\n{job}");
+    assert!(
+        job.contains(
+            "\n    if: ${{ !cancelled() && needs.build.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}\n"
+        ),
+        "publish lost its tag/build gate:\n{job}"
+    );
+}
+
+/// GM-643 behaviour 1: a new Release is created as a draft, so it is never
+/// public while its assets are still uploading.
+///
+/// Control: remove `--draft` from `gh release create` - this fails.
+#[test]
+fn the_publish_step_creates_a_new_release_as_a_draft() {
+    let workflow = release_workflow();
+    let step = step_block(job_block(&workflow, "publish"), PUBLISH_STEP);
+    let create = &step[position(step, r#"gh release create "$tag""#)..];
+    let create = &create[..position(create, "\n          fi\n")];
+    assert!(create.contains("--draft"), "gh release create no longer passes --draft:\n{create}");
+}
+
+/// GM-643 behaviours 2 and 3: after create/upload the step undrafts the
+/// Release and marks it latest, but only after the uploaded asset count
+/// matched the upload list; a mismatch exits before the undraft.
+///
+/// Controls: drop `--latest`, or move the undraft above the count check, or
+/// compare the count to anything but `${#assets[@]}` - each fails this.
+#[test]
+fn the_publish_step_publishes_only_after_the_uploaded_count_matches_the_list() {
+    let workflow = release_workflow();
+    let step = step_block(job_block(&workflow, "publish"), PUBLISH_STEP);
+    let create = position(step, r#"gh release create "$tag""#);
+    let count = position(step, r#"uploaded="$(gh release view "$tag" --json assets --jq '.assets|length')""#);
+    let check = position(step, r#"if [ "$uploaded" != "${#assets[@]}" ]; then"#);
+    let bail = check + position(&step[check..], "exit 1");
+    let undraft = position(step, UNDRAFT);
+    assert!(
+        create < count && count < check && check < bail && bail < undraft,
+        "expected create < count < check < exit 1 < undraft, got {create} {count} {check} {bail} {undraft}:\n{step}"
+    );
+    assert_eq!(step.matches("gh release edit").count(), 1, "one undraft only:\n{step}");
+}
+
+/// GM-643 behaviour 4: only a draft is undrafted, so a re-run leaves a
+/// Release that is already public (and its latest flag) alone.
+///
+/// Control: unwrap the undraft from its `isDraft` guard - this fails.
+#[test]
+fn the_publish_step_undrafts_only_a_release_that_is_still_a_draft() {
+    let workflow = release_workflow();
+    let step = step_block(job_block(&workflow, "publish"), PUBLISH_STEP);
+    let guard = r#"if [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" = "true" ]; then"#;
+    let expected = format!("{guard}\n            {UNDRAFT}\n          fi\n");
+    assert!(step.contains(&expected), "the undraft is not guarded by isDraft == true:\n{step}");
+}
+
+/// GM-643 behaviour 6: `cut-release.sh` no longer asks the user to publish a
+/// draft; both of its endings point at the published release of the tag.
+///
+/// Control: restore "Review and publish the draft release" - this fails.
+#[test]
+fn cut_release_points_at_the_published_release_instead_of_a_draft() {
+    let script = fs::read_to_string(repo_root().join("scripts/cut-release.sh")).unwrap();
+    assert!(
+        !script.to_lowercase().contains("publish the draft"),
+        "cut-release.sh still asks to publish a draft"
+    );
+    assert_eq!(
+        script.matches("Check the published release: https://github.com/$slug/releases/tag/$tag\"").count(),
+        2,
+        "both endings of cut-release.sh must point at the published release"
+    );
+}
+
+/// GM-643 behaviour 7: `install-latest` runs after `publish` (or on a manual
+/// run), and both PowerShell legs fail when releases/latest is not the tag
+/// this run published.
+///
+/// Controls: set `needs: build`, or delete the tag assertion from one leg -
+/// each fails this.
+#[test]
+fn install_latest_runs_after_publish_and_asserts_latest_is_the_tag() {
+    let workflow = release_workflow();
+    let job = job_block(&workflow, "install-latest");
+    assert!(job.contains("\n    needs: publish\n"), "install-latest no longer needs publish:\n{job}");
+    assert!(
+        job.contains(
+            "\n    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.publish.result == 'success') }}\n"
+        ),
+        "install-latest lost its dispatch-or-publish gate:\n{job}"
+    );
+    for name in [
+        "README one-liner under PowerShell 7 (pwsh)",
+        "README one-liner under Windows PowerShell 5.1 (powershell)",
+    ] {
+        let step = step_block(job, name);
+        let read = position(step, "releases/latest");
+        let assert = position(
+            step,
+            "if ($env:GITHUB_REF_TYPE -eq 'tag' -and $latest -ne $env:GITHUB_REF_NAME.TrimStart('v')) {",
+        );
+        let throw = assert + position(&step[assert..], "throw \"releases/latest is $latest");
+        assert!(read < assert && assert < throw, "{name} does not assert latest == the tag:\n{step}");
+    }
+}
