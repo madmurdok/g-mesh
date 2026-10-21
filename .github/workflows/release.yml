@@ -2,18 +2,15 @@
 # single trigger, uploads one named archive per triple, and - on a version tag
 # - publishes them as a draft GitHub Release.
 #
-# STATUS: this file has never been executed. It was written offline; the YAML
-# parses, the runner labels and action majors were checked against GitHub's
-# current docs, and the build/package script it calls was run for real on
-# x86_64-apple-darwin. Nothing else here is proven - treat the first run as the
-# test, and expect the Windows job (the only one with no local counterpart at
-# all: MSVC toolchain, 7-Zip, Git Bash path handling) to be the likeliest to
-# need a fix. The publish job added by #67 is unproven in a different way: its
-# steps have never talked to the Releases API, but the one thing that would be
-# invisible if it were wrong - whether the asset names it uploads are the names
-# the build produces - is not a guess. Both come from `build-targets.sh
-# --asset-names`, and `scripts/prepare-release-assets.sh` fails the release if
-# the files on disk disagree with it.
+# Every matrix leg builds its archive and runs release-smoke.sh on it. The
+# Windows leg also installs the archive with install.ps1; the installed
+# g-mesh.exe then reindexes a fixture with the checkout's plugins\ hidden
+# and answers one MCP call (scripts/mcp-smoke.py). The install-latest job
+# (workflow_dispatch only) installs the latest published release with the
+# README one-liner under pwsh and Windows PowerShell 5.1. The asset names the
+# publish job uploads come from `build-targets.sh --asset-names`, and
+# `scripts/prepare-release-assets.sh` fails the release if the files on disk
+# disagree with it.
 #
 # GM-613 (written offline, proven by its own workflow_dispatch rehearsal):
 # x86_64 macOS is cross-built on the arm64 `macos-15` runner and smoke-tested
