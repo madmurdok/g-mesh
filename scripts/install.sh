@@ -110,9 +110,9 @@
 # without first knowing the version. The version therefore comes from the
 # `releases/latest` API, or from `--version`/`G_MESH_VERSION` to pin one.
 #
-# Releases are created as DRAFTS and stay invisible until a human publishes
-# them (.github/workflows/release.yml, task #67). Until that happens the API
-# has no latest release and every asset URL 404s. That is not an error worth a
+# Releases are created as DRAFTS and stay invisible until the release
+# workflow publishes them (.github/workflows/release.yml), after every asset
+# is uploaded. Until that happens the API has no latest release and every asset URL 404s. That is not an error worth a
 # bare "404" - the script says what state the repository is in and what to do
 # about it (see `no_published_release`).
 #
@@ -359,7 +359,7 @@ detect_target() {
 # ordering the causes by likelihood is the most honest thing it can do.
 #
 # That order changed once a release existed. While the repository had none,
-# "a draft is waiting for someone to press Publish" was the expected state and
+# "a draft is waiting to be published" was the expected state and
 # led. Now that v2.8.0 is out, a caller who reaches this message far more
 # likely hit the unauthenticated API's 60-requests-per-hour limit, or has no
 # route to it at all - both of which the API reports in a way this script
@@ -378,9 +378,9 @@ Most likely, in this order:
     to raise the limit, or wait an hour.
   - You have no route to api.github.com - a proxy, a firewall, or no network.
   - There genuinely is no published release. Releases here are built as
-    drafts and stay invisible, with their download URLs 404ing, until a human
-    publishes one, so this is the expected state between a build finishing
-    and someone pressing Publish.
+    drafts and stay invisible, with their download URLs 404ing, until the
+    release workflow publishes them, so a release build that is still
+    running or failed leaves nothing to install.
 
 What you can do:
   - Check https://github.com/$REPO/releases to see what is published.
