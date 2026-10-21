@@ -51,8 +51,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
-use crate::embedding::pipeline::ComputedEmbedding;
-use crate::embedding::text::text_to_embed;
+use crate::embedding::pipeline::ComputedBatch;
+use crate::embedding::text::{node_text, EmbedInput};
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::containers::CONTAINER_NATIVE_KIND;
 use crate::graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND;
@@ -371,13 +371,17 @@ fn plan_attached(
 }
 
 /// Fills `plan_text_changed` and returns the upserted nodes owed a vector:
-/// new nodes, nodes whose embedded text changed, and nodes whose live vector
-/// is missing or was made by another model. Every other node keeps its live
-/// vector, which is the vector its unchanged text would get again.
+/// new nodes, nodes whose embedded text ([`node_text`]) changed, and nodes
+/// whose live vector is missing or was made by another model. Every other
+/// node keeps its live vector, which is the vector its unchanged text would
+/// get again. A node with no text that still has a live vector (one made
+/// before it became noise) counts as changed, so the swap deletes that
+/// vector.
 fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
     let mut statement = tx
         .prepare(
-            "SELECT s.id, s.docComment, s.signature, l.id IS NOT NULL, l.docComment, l.signature,
+            "SELECT s.id, s.kind, s.name, s.qualifiedName, s.filePath, s.docComment, s.signature,
+                    l.id IS NOT NULL, l.kind, l.name, l.qualifiedName, l.filePath, l.docComment, l.signature,
                     v.embeddingVersion
              FROM plan_upsert_nodes p
              JOIN main.nodes s ON s.id = p.id
@@ -385,10 +389,40 @@ fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
              LEFT JOIN live.vectors v ON v.nodeId = s.id",
         )
         .context("failed to prepare the embedding plan")?;
-    type Row = (String, Option<String>, Option<String>, bool, Option<String>, Option<String>, Option<String>);
+    struct Side {
+        kind: Option<String>,
+        name: Option<String>,
+        qualified_name: Option<String>,
+        file_path: Option<String>,
+        doc: Option<String>,
+        signature: Option<String>,
+    }
+    impl Side {
+        fn read(row: &rusqlite::Row, at: usize) -> rusqlite::Result<Self> {
+            Ok(Side {
+                kind: row.get(at)?,
+                name: row.get(at + 1)?,
+                qualified_name: row.get(at + 2)?,
+                file_path: row.get(at + 3)?,
+                doc: row.get(at + 4)?,
+                signature: row.get(at + 5)?,
+            })
+        }
+        fn text(&self) -> Option<String> {
+            node_text(&EmbedInput {
+                kind: self.kind.as_deref().unwrap_or_default(),
+                name: self.name.as_deref().unwrap_or_default(),
+                qualified_name: self.qualified_name.as_deref().unwrap_or_default(),
+                file_path: self.file_path.as_deref().unwrap_or_default(),
+                doc: self.doc.as_deref(),
+                signature: self.signature.as_deref(),
+            })
+        }
+    }
+    type Row = (String, Side, bool, Side, Option<String>);
     let rows: Vec<Row> = statement
         .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+            Ok((row.get(0)?, Side::read(row, 1)?, row.get(7)?, Side::read(row, 8)?, row.get(14)?))
         })
         .context("failed to read the embedding plan")?
         .collect::<rusqlite::Result<_>>()
@@ -396,17 +430,25 @@ fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
     drop(statement);
 
     let mut to_embed = Diff::default();
-    for (id, doc, signature, in_live, live_doc, live_signature, live_version) in rows {
-        let staged_text = text_to_embed(doc.as_deref(), signature.as_deref());
+    for (id, staged, in_live, live, live_version) in rows {
+        let staged_text = staged.text();
         let text_changed =
-            in_live && text_to_embed(live_doc.as_deref(), live_signature.as_deref()) != staged_text;
+            in_live && (live.text() != staged_text || (staged_text.is_none() && live_version.is_some()));
         if text_changed {
             tx.execute("INSERT INTO plan_text_changed (id) VALUES (?1)", params![id])
                 .context("failed to record a node whose text changed")?;
         }
         let owed = !in_live || text_changed || live_version.as_deref() != Some(embedding_version);
         if staged_text.is_some() && owed {
-            let mut node = NodeRecord::new(id.clone(), "", id.clone(), id, "", "");
+            let Side { kind, name, qualified_name, file_path, doc, signature } = staged;
+            let mut node = NodeRecord::new(
+                id,
+                kind.unwrap_or_default(),
+                name.unwrap_or_default(),
+                qualified_name.unwrap_or_default(),
+                file_path.unwrap_or_default(),
+                "",
+            );
             node.doc_comment = doc;
             node.signature = signature;
             to_embed.upsert_nodes.push(node);
@@ -442,7 +484,7 @@ pub struct SwapBookkeeping<'a> {
 pub fn swap(
     live: &mut Connection,
     staging_path: &Path,
-    vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
+    vectors: Option<(&EmbeddingPipeline, &ComputedBatch)>,
     bookkeeping: &SwapBookkeeping<'_>,
 ) -> Result<Vec<String>> {
     let staging_path = staging_path.to_str().context("the staging index path is not valid UTF-8")?;
@@ -457,7 +499,7 @@ pub fn swap(
 
 fn swap_attached(
     live: &mut Connection,
-    vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
+    vectors: Option<(&EmbeddingPipeline, &ComputedBatch)>,
     bookkeeping: &SwapBookkeeping<'_>,
 ) -> Result<Vec<String>> {
     let tx = live.transaction().context("failed to start the swap transaction")?;

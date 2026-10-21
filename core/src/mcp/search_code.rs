@@ -235,7 +235,7 @@ pub(super) fn search(
     // things this base query owes `paginate_by_score`'s contract (a `score`
     // and an `id` column); every other column just rides along for the
     // caller. The inner join is what keeps unembedded nodes (no doc comment
-    // or signature - see `embedding::pipeline::text_to_embed`) out of the
+    // or signature, or filtered as noise - see `embedding::text::node_text`) out of the
     // results without a separate filter.
     let base_sql = "SELECT v.nodeId AS id, n.qualifiedName, n.kind, n.filePath, n.startLine, n.startCol, \
                      n.language, \
@@ -955,8 +955,14 @@ mod tests {
             &model,
             &conn,
             "reader",
-            Some("Reads a file from disk and returns its contents as a string."),
-            Some("readFileAsString(path: string): string"),
+            &crate::embedding::text::EmbedInput {
+                kind: "Function",
+                name: "readFileAsString",
+                qualified_name: "pkg::readFileAsString",
+                file_path: "a.rs",
+                doc: Some("Reads a file from disk and returns its contents as a string."),
+                signature: Some("readFileAsString(path: string): string"),
+            },
             "jina-embeddings-v2-base-code",
         )
         .unwrap();
@@ -964,8 +970,14 @@ mod tests {
             &model,
             &conn,
             "math",
-            None,
-            Some("unrelatedMathHelper(a: number, b: number): number"),
+            &crate::embedding::text::EmbedInput {
+                kind: "Function",
+                name: "unrelatedMathHelper",
+                qualified_name: "pkg::unrelatedMathHelper",
+                file_path: "b.rs",
+                doc: None,
+                signature: Some("unrelatedMathHelper(a: number, b: number): number"),
+            },
             "jina-embeddings-v2-base-code",
         )
         .unwrap();

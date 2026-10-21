@@ -29,9 +29,11 @@
 //!
 //! Keyset pagination over `nodes.id`, not "while any unembedded row
 //! remains": a node whose inference keeps failing (a pathological input, a
-//! persistent ONNX error) or whose text trims to nothing (`text_to_embed`
-//! returning `None`, so [`EmbeddingPipeline::compute`] silently skips it)
-//! would make a "does anything remain" loop spin forever. Paging strictly
+//! persistent ONNX error), whose text trims to nothing, or that
+//! `embedding::text::is_noise` filters out (`node_text` returning `None`, so
+//! [`EmbeddingPipeline::compute`] skips it) would make a "does anything
+//! remain" loop spin forever. A filtered node stays a candidate and is
+//! visited on every pass; the first visit deletes a vector it had. Paging strictly
 //! past the last id a page saw, ordered by id, guarantees every candidate at
 //! the moment this pass started is visited exactly once, however many of
 //! them end up unembedded anyway.
@@ -40,8 +42,9 @@
 //!
 //! The graph itself is unchanged by this feature, so an index built before
 //! GM-395 needs no reindex - "embeddings complete" is recorded nowhere on
-//! disk; this pass's own `COUNT(*)` query *is* the check, and it is `0`,
-//! quickly, once every embeddable node already has a row. A side effect
+//! disk; this pass's own `COUNT(*)` query *is* the check, and it settles,
+//! quickly, at the count of candidates that get no vector (filtered, or
+//! text that trims to nothing) once every embeddable node has a row. A side effect
 //! worth having: a project whose model was not available at index time (or
 //! whose weights simply had not been fetched yet) gets embedded on the next
 //! restart that finds one, with no reindex required.
@@ -158,7 +161,7 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
             if page.is_empty() {
                 break;
             }
-            after_id = Some(page.last().expect("just checked non-empty").0.clone());
+            after_id = Some(page.last().expect("just checked non-empty").id.clone());
             let page_len = page.len() as u64;
 
             let diff =
@@ -174,19 +177,29 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
     })
 }
 
-/// One candidate row: a node's id plus the two columns
+/// One candidate row: a node's id plus the columns
 /// [`EmbeddingPipeline::compute`] actually reads.
-type Candidate = (String, Option<String>, Option<String>);
+struct Candidate {
+    id: String,
+    kind: String,
+    name: String,
+    qualified_name: String,
+    file_path: String,
+    doc_comment: Option<String>,
+    signature: Option<String>,
+}
 
-/// Builds a filler [`NodeRecord`] carrying only what
-/// [`EmbeddingPipeline::compute`] actually reads (`id`, `doc_comment`,
-/// `signature`) - every other field is irrelevant here, because this
-/// `Diff` is never handed to [`crate::storage::write::apply_diff`]; it only
-/// exists as `compute`'s input shape. `EmbeddingPipeline::store` re-reads a
-/// node's *real*, current row before writing anything, so a filler kind/name/qualifiedName/filePath/language here can
-/// never leak into a stored answer.
-fn to_node_record((id, doc_comment, signature): Candidate) -> NodeRecord {
-    let mut node = NodeRecord::new(id, "", "", "", "", "");
+/// Builds a [`NodeRecord`] carrying only what
+/// [`EmbeddingPipeline::compute`] actually reads (`id`, `kind`, `name`,
+/// `qualified_name`, `file_path`, `doc_comment`, `signature`) - every other
+/// field is irrelevant here, because this `Diff` is never handed to
+/// [`crate::storage::write::apply_diff`]; it only exists as `compute`'s
+/// input shape. `EmbeddingPipeline::store` re-reads a node's *real*, current
+/// row before writing anything, so a filler language here can never leak
+/// into a stored answer.
+fn to_node_record(candidate: Candidate) -> NodeRecord {
+    let Candidate { id, kind, name, qualified_name, file_path, doc_comment, signature } = candidate;
+    let mut node = NodeRecord::new(id, kind, name, qualified_name, file_path, "");
     node.doc_comment = doc_comment;
     node.signature = signature;
     node
@@ -218,7 +231,8 @@ fn fetch_candidate_page(
     limit: i64,
 ) -> SqlResult<Vec<Candidate>> {
     let mut stmt = conn.prepare(
-        "SELECT n.id, n.docComment, n.signature FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
+        "SELECT n.id, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
+         FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
          WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?3) \
          AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) \
          AND n.id > ?1 ORDER BY n.id LIMIT ?2",
@@ -227,7 +241,15 @@ fn fetch_candidate_page(
     // of them - the same query serves both "from the very start" (`after_id`
     // is `None`) and "strictly after the last page's id" with one statement.
     let rows = stmt.query_map(rusqlite::params![after_id.unwrap_or(""), limit, version], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        Ok(Candidate {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            name: row.get(2)?,
+            qualified_name: row.get(3)?,
+            file_path: row.get(4)?,
+            doc_comment: row.get(5)?,
+            signature: row.get(6)?,
+        })
     })?;
     rows.collect()
 }
@@ -315,7 +337,7 @@ mod tests {
         assert_eq!(count, 2, "only `documented` and `signed_only` are owed an embedding");
 
         let page = fetch_candidate_page(&conn, "v1", None, 256).unwrap();
-        let mut ids: Vec<&str> = page.iter().map(|(id, _, _)| id.as_str()).collect();
+        let mut ids: Vec<&str> = page.iter().map(|c| c.id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec!["documented", "signed_only"]);
     }
@@ -355,7 +377,7 @@ mod tests {
 
         assert_eq!(count_candidates(&conn, &current).unwrap(), 2);
         let page = fetch_candidate_page(&conn, &current, None, 256).unwrap();
-        let ids: Vec<&str> = page.iter().map(|(id, _, _)| id.as_str()).collect();
+        let ids: Vec<&str> = page.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["embedded_by_fp32", "embedded_from_full_text"]);
     }
 
@@ -384,8 +406,8 @@ mod tests {
                 break;
             }
             assert!(page.len() <= 2, "a page must never exceed the requested limit");
-            after_id = Some(page.last().unwrap().0.clone());
-            seen.extend(page.into_iter().map(|(id, _, _)| id));
+            after_id = Some(page.last().unwrap().id.clone());
+            seen.extend(page.into_iter().map(|c| c.id));
         }
 
         seen.sort_unstable();

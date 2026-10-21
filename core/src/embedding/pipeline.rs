@@ -13,7 +13,9 @@
 //! is skipped entirely rather than embedding an empty string: an empty
 //! string still tokenizes to something (see `EmbeddingModel::embed`'s special
 //! tokens), and a vector for "nothing" would only ever be a false positive in
-//! a similarity search, never a true one.
+//! a similarity search, never a true one. A node whose text is only its
+//! name and that is a module declaration or a test gets none either
+//! (`embedding::text::is_noise`), and a vector it had is deleted.
 //!
 //! # Where the model lives
 //!
@@ -67,9 +69,9 @@ use crate::embedding::model::{
     TOKENIZER_FILE_NAME,
 };
 use crate::embedding::rerank::Reranker;
-use crate::embedding::text::text_to_embed;
+use crate::embedding::text::{node_text, EmbedInput};
 use crate::storage::vectors;
-use crate::storage::write::Diff;
+use crate::storage::write::{Diff, NodeRecord};
 
 /// Turns one text into one vector. [`EmbeddingModel`] in production; a
 /// deterministic fake in tests that count inference calls.
@@ -409,8 +411,10 @@ impl EmbeddingPipeline {
 
     /// The database-free half of [`apply`](Self::apply): returns one
     /// [`ComputedEmbedding`] for each upserted node in `diff` with embeddable
-    /// text, in `diff`'s order, and adds what it did to `stats`. Empty,
-    /// quickly, if there is neither a model nor a cache to answer from.
+    /// text ([`node_text`]), in `diff`'s order, plus the ids of the upserted
+    /// nodes [`is_noise`](crate::embedding::text::is_noise) filtered out, and
+    /// adds what it did to `stats`. Empty, quickly, if there is neither a
+    /// model nor a cache to answer from.
     ///
     /// Texts are looked up in the embedding cache first, all of the batch's
     /// keys at once; only the misses reach the model, which is loaded on the
@@ -426,26 +430,28 @@ impl EmbeddingPipeline {
     /// Best-effort per node, exactly as `apply` always was: one node's
     /// inference failing is reported and skipped, never allowed to lose the
     /// rest of the diff's embeddings.
-    pub fn compute(&self, diff: &Diff, stats: &mut EmbedStats) -> Vec<ComputedEmbedding> {
+    pub fn compute(&self, diff: &Diff, stats: &mut EmbedStats) -> ComputedBatch {
         if matches!(self.model.get(), Some(None)) {
-            return Vec::new();
+            return ComputedBatch::default();
         }
-        let pending: Vec<(&str, String)> = diff
-            .upsert_nodes
-            .iter()
-            .filter_map(|node| {
-                text_to_embed(node.doc_comment.as_deref(), node.signature.as_deref())
-                    .map(|text| (node.id.as_str(), text))
-            })
-            .collect();
+        let mut dropped = Vec::new();
+        let mut pending: Vec<(&str, String)> = Vec::new();
+        for node in &diff.upsert_nodes {
+            let input = EmbedInput::from(node);
+            if crate::embedding::text::is_noise(&input) {
+                dropped.push(node.id.clone());
+            } else if let Some(text) = node_text(&input) {
+                pending.push((node.id.as_str(), text));
+            }
+        }
         if pending.is_empty() {
-            return Vec::new();
+            return ComputedBatch { embeddings: Vec::new(), dropped };
         }
 
         let keys: Vec<Hash> = pending.iter().map(|(_, text)| cache::text_hash(text)).collect();
         let mut cached = self.cache_lookup(&keys, stats);
         if cached.is_none() && self.model().is_none() {
-            return Vec::new();
+            return ComputedBatch::default();
         }
         stats.texts += pending.len();
 
@@ -477,7 +483,7 @@ impl EmbeddingPipeline {
                 fresh.iter().map(|(key, at)| (*key, computed[*at].embedding.as_slice())).collect();
             self.cache_insert(&entries, stats);
         }
-        computed
+        ComputedBatch { embeddings: computed, dropped }
     }
 
     /// Reports one reindex unit's `stats` - a bulk walk, a workspace
@@ -619,9 +625,12 @@ impl EmbeddingPipeline {
         }
     }
 
-    /// The database-writing half of [`apply`](Self::apply): stores every
-    /// embedding [`compute`](Self::compute) produced, and records the active
-    /// embedding model - both no-ops when `computed` is empty, which also
+    /// The database-writing half of [`apply`](Self::apply): deletes the
+    /// vector of every node `compute` filtered out as noise whose current
+    /// row still has no [`node_text`], stores every embedding
+    /// [`compute`](Self::compute) produced, and records the active
+    /// embedding model - the last two no-ops when `computed` holds no
+    /// embedding, which also
     /// covers "no model loaded" (`compute` never returns anything in that
     /// case), so a disabled pipeline still never claims an active model,
     /// matching `apply`'s original contract.
@@ -644,7 +653,7 @@ impl EmbeddingPipeline {
     /// that no longer names anything.
     ///
     /// So before writing, this re-reads the node's *current* row and recomputes
-    /// the same `text_to_embed` it derives from - if it no longer exists, or
+    /// the same [`node_text`] it derives from - if it no longer exists, or
     /// its doc comment/signature no longer combine to the exact text this
     /// embedding was computed from, the write is skipped: only a node still
     /// present with unchanged content gets its vector stored. A skip here is
@@ -655,14 +664,27 @@ impl EmbeddingPipeline {
     /// Best-effort per node beyond that, same as `compute`'s own inference
     /// step: a single row failing to store is reported and skipped, not
     /// allowed to lose the rest of the batch.
-    pub fn store(&self, conn: &Connection, computed: &[ComputedEmbedding]) {
-        if computed.is_empty() {
+    pub fn store(&self, conn: &Connection, computed: &ComputedBatch) {
+        for node_id in &computed.dropped {
+            // A node that has text again by now belongs to whichever diff
+            // gave it that text; its vector is that diff's to write.
+            let deleted = current_embeddable_text(conn, node_id).and_then(|current| match current {
+                Some(_) => Ok(()),
+                None => vectors::delete(conn, node_id),
+            });
+            if let Err(err) = deleted {
+                crate::log_line!(
+                    "g-mesh daemon: failed to delete the vector of filtered node {node_id} ({err:#})"
+                );
+            }
+        }
+        if computed.embeddings.is_empty() {
             return;
         }
         if let Err(err) = crate::storage::schema::set_embedding_model(conn, &self.version) {
             crate::log_line!("g-mesh daemon: failed to record the active embedding model ({err:#})");
         }
-        for entry in computed {
+        for entry in &computed.embeddings {
             match current_embeddable_text(conn, &entry.node_id) {
                 Ok(Some(current_text)) if current_text == entry.text => {
                     if let Err(err) = vectors::insert(conn, &entry.node_id, &entry.embedding, &self.version) {
@@ -757,7 +779,7 @@ fn reopen(slot: &mut CacheSlot, settings: CacheSettings, fingerprint: Hash, caus
 /// written by [`EmbeddingPipeline::store`].
 ///
 /// `text` is not the node's raw doc comment/signature - it is the exact
-/// string [`text_to_embed`] built and fed to the model, kept around purely so
+/// string [`node_text`] built and fed to the model, kept around purely so
 /// `store` can compare it against the same node's *current* row before
 /// writing - see `store`'s own "GM-396" doc section for why that comparison
 /// exists.
@@ -767,33 +789,80 @@ pub struct ComputedEmbedding {
     text: String,
 }
 
+/// What one [`EmbeddingPipeline::compute`] call hands
+/// [`EmbeddingPipeline::store`]: the embeddings to write, and the ids of the
+/// upserted nodes it filtered out as noise, whose vectors `store` deletes.
+#[derive(Default)]
+pub struct ComputedBatch {
+    embeddings: Vec<ComputedEmbedding>,
+    dropped: Vec<String>,
+}
+
+#[cfg(test)]
+impl ComputedBatch {
+    /// How many embeddings the batch holds.
+    pub(crate) fn len(&self) -> usize {
+        self.embeddings.len()
+    }
+
+    /// The batch holds no embedding.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.embeddings.is_empty()
+    }
+}
+
+impl<'a> From<&'a NodeRecord> for EmbedInput<'a> {
+    fn from(node: &'a NodeRecord) -> Self {
+        EmbedInput {
+            kind: &node.kind,
+            name: &node.name,
+            qualified_name: &node.qualified_name,
+            file_path: &node.file_path,
+            doc: node.doc_comment.as_deref(),
+            signature: node.signature.as_deref(),
+        }
+    }
+}
+
 /// The text a node's *current* row would embed as, or `None` if it has none
 /// (or the node no longer exists at all) - [`EmbeddingPipeline::store`]'s own
 /// half of the GM-396 staleness check, re-deriving exactly what
-/// [`text_to_embed`] would have produced had `compute` run against this row
+/// [`node_text`] would have produced had `compute` run against this row
 /// right now instead of whenever it actually ran.
 fn current_embeddable_text(conn: &Connection, node_id: &str) -> Result<Option<String>> {
-    let row = conn
-        .query_row("SELECT docComment, signature FROM nodes WHERE id = ?1", [node_id], |row| {
-            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
-        })
+    type Row = (String, String, String, String, Option<String>, Option<String>);
+    let row: Option<Row> = conn
+        .query_row(
+            "SELECT kind, name, qualifiedName, filePath, docComment, signature FROM nodes WHERE id = ?1",
+            [node_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
         .optional()
         .context("failed to read node for its embedding staleness check")?;
-    Ok(row.and_then(|(doc_comment, signature)| text_to_embed(doc_comment.as_deref(), signature.as_deref())))
+    Ok(row.and_then(|(kind, name, qualified_name, file_path, doc, signature)| {
+        node_text(&EmbedInput {
+            kind: &kind,
+            name: &name,
+            qualified_name: &qualified_name,
+            file_path: &file_path,
+            doc: doc.as_deref(),
+            signature: signature.as_deref(),
+        })
+    }))
 }
 
-/// Embeds one node's doc comment/signature and stores the result, or does
-/// nothing if there is no embeddable text - the acceptance criterion that a
-/// node with neither must not embed an empty string.
-pub fn embed_node(
+/// Embeds one node's [`node_text`] and stores the result, or does nothing
+/// if it has none - the acceptance criterion that a node with neither doc
+/// comment nor signature must not embed an empty string.
+#[cfg(test)]
+pub(crate) fn embed_node(
     model: &EmbeddingModel,
     conn: &Connection,
     node_id: &str,
-    doc_comment: Option<&str>,
-    signature: Option<&str>,
+    input: &EmbedInput,
     embedding_version: &str,
 ) -> Result<()> {
-    let Some(text) = text_to_embed(doc_comment, signature) else { return Ok(()) };
+    let Some(text) = node_text(input) else { return Ok(()) };
     let embedding = model.embed(&text)?;
     vectors::insert(conn, node_id, &embedding, embedding_version)
 }
@@ -894,6 +963,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::text::text_to_embed;
 
     /// A model directory whose `model.onnx` is a sparse file of `onnx_size`
     /// bytes: the weight check reads a length, never the bytes.
@@ -1105,11 +1175,14 @@ mod tests {
         insert_node(&conn, "n1", "Reads a file.", "fn foo()");
 
         let pipeline = EmbeddingPipeline::disabled();
-        let computed = vec![ComputedEmbedding {
-            node_id: "n1".to_string(),
-            embedding: vec![1.0, 0.0, 0.0],
-            text: "Reads a file.\n\nfn foo()".to_string(),
-        }];
+        let computed = ComputedBatch {
+            embeddings: vec![ComputedEmbedding {
+                node_id: "n1".to_string(),
+                embedding: vec![1.0, 0.0, 0.0],
+                text: "Reads a file.\n\nfn foo()".to_string(),
+            }],
+            dropped: Vec::new(),
+        };
         pipeline.store(&conn, &computed);
 
         assert_eq!(
@@ -1145,11 +1218,14 @@ mod tests {
 
         let pipeline = EmbeddingPipeline::disabled();
         // What `compute` produced against the *old* text.
-        let computed = vec![ComputedEmbedding {
-            node_id: "n1".to_string(),
-            embedding: vec![1.0, 0.0, 0.0],
-            text: "Reads a file.\n\nfn foo()".to_string(),
-        }];
+        let computed = ComputedBatch {
+            embeddings: vec![ComputedEmbedding {
+                node_id: "n1".to_string(),
+                embedding: vec![1.0, 0.0, 0.0],
+                text: "Reads a file.\n\nfn foo()".to_string(),
+            }],
+            dropped: Vec::new(),
+        };
         pipeline.store(&conn, &computed);
 
         assert_eq!(
@@ -1173,11 +1249,14 @@ mod tests {
         // No `nodes` row for "n1" at all.
 
         let pipeline = EmbeddingPipeline::disabled();
-        let computed = vec![ComputedEmbedding {
-            node_id: "n1".to_string(),
-            embedding: vec![1.0, 0.0, 0.0],
-            text: "Reads a file.".to_string(),
-        }];
+        let computed = ComputedBatch {
+            embeddings: vec![ComputedEmbedding {
+                node_id: "n1".to_string(),
+                embedding: vec![1.0, 0.0, 0.0],
+                text: "Reads a file.".to_string(),
+            }],
+            dropped: Vec::new(),
+        };
         pipeline.store(&conn, &computed);
 
         assert_eq!(
@@ -1243,9 +1322,9 @@ mod tests {
         assert_eq!(warm.embeds(), 0, "every text is in the cache");
         assert_eq!(warm.loads(), 0, "an all-hit batch must not load the model");
         assert_eq!((warm_stats.texts, warm_stats.hits, warm_stats.embedded), (5, 5, 0));
-        let ids: Vec<&str> = second.iter().map(|entry| entry.node_id.as_str()).collect();
+        let ids: Vec<&str> = second.embeddings.iter().map(|entry| entry.node_id.as_str()).collect();
         assert_eq!(ids, ["n0", "n1", "n2", "n3", "n4"], "results keep the diff's order");
-        for (cached, fresh) in second.iter().zip(&first) {
+        for (cached, fresh) in second.embeddings.iter().zip(&first.embeddings) {
             assert_eq!(bits(&cached.embedding), bits(&fresh.embedding));
             assert_eq!(cached.text, fresh.text);
         }
@@ -1670,7 +1749,7 @@ mod tests {
             text_to_embed(changed.doc_comment.as_deref(), changed.signature.as_deref()).unwrap();
         assert_eq!(new_format.received(), [changed_text]);
         assert_eq!((stats.texts, stats.hits, stats.embedded), (5, 4, 1));
-        for entry in &computed {
+        for entry in &computed.embeddings {
             assert_eq!(bits(&entry.embedding), bits(&fake_vector(&entry.text)), "{}", entry.node_id);
         }
     }

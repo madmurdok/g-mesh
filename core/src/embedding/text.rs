@@ -46,6 +46,18 @@
 //!    characters long.
 //!
 //! Kept paragraphs are rejoined with a blank line, in their original order.
+//!
+//! # What is not embedded
+//!
+//! [`node_text`] decides whether a node gets a vector at all; the text it
+//! embeds as is always [`text_to_embed`]'s. It refuses a node
+//! [`is_noise`] calls name-only noise: no doc comment, a signature whose
+//! only identifier (keywords aside) is the node's own name, and the node is
+//! a module declaration (`pub mod x`) or a test (a test file, a `test`/`Test`
+//! name, or a Rust inline `tests` module). Such a text says nothing the name
+//! does not. A filtered node keeps every structural answer; it is absent only
+//! from `search_code`. Why this rule and not body size or all name-only
+//! nodes: `docs/design/GM-437-embedding-noise-filter.md`.
 
 /// The "short prose" cap: a paragraph after the first is kept only when its
 /// text (lines joined by `\n`, ends trimmed) is at most this many `char`s,
@@ -83,6 +95,102 @@ const DROPPED_SECTIONS: &[&str] = &[
 pub(crate) fn text_to_embed(doc_comment: Option<&str>, signature: Option<&str>) -> Option<String> {
     let trimmed = doc_comment.map(structured_doc);
     full_text(trimmed.as_deref(), signature).or_else(|| full_text(doc_comment, signature))
+}
+
+/// What [`is_noise`] and [`node_text`] read of a node.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EmbedInput<'a> {
+    pub(crate) kind: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) qualified_name: &'a str,
+    /// Project-relative, `/`-separated.
+    pub(crate) file_path: &'a str,
+    pub(crate) doc: Option<&'a str>,
+    pub(crate) signature: Option<&'a str>,
+}
+
+/// Words [`is_noise`] does not count as identifiers of a signature, compared
+/// lowercased.
+const SIGNATURE_KEYWORDS: &[&str] = &[
+    "pub", "crate", "super", "in", "fn", "mod", "const", "static", "struct", "enum", "func", "def", "async",
+    "let", "export", "self", "mut", "var", "type", "impl", "unsafe", "extern",
+];
+
+/// The text `input` embeds as, or `None` when it gets no vector: when
+/// [`text_to_embed`] has nothing, or when [`is_noise`] holds.
+pub(crate) fn node_text(input: &EmbedInput) -> Option<String> {
+    if is_noise(input) {
+        return None;
+    }
+    text_to_embed(input.doc, input.signature)
+}
+
+/// Whether `input` is name-only noise: no doc comment, a non-blank signature
+/// with at most one identifier besides [`SIGNATURE_KEYWORDS`] (the name),
+/// and either a `Module` or a test node (see [`is_test`]).
+pub(crate) fn is_noise(input: &EmbedInput) -> bool {
+    if input.doc.is_some_and(|doc| !doc.trim().is_empty()) {
+        return false;
+    }
+    let Some(signature) = input.signature.filter(|s| !s.trim().is_empty()) else { return false };
+    if signature_identifiers(signature) > 1 {
+        return false;
+    }
+    input.kind == "Module" || is_test(input)
+}
+
+/// A node in a test file, named `test*`/`Test*`, or inside a Rust inline
+/// `tests` module.
+fn is_test(input: &EmbedInput) -> bool {
+    is_test_path(input.file_path)
+        || input.name.starts_with("test")
+        || input.name.starts_with("Test")
+        || input.qualified_name.contains("::tests::")
+        || input.qualified_name.starts_with("tests::")
+}
+
+/// A test file: a `test`, `tests`, `__tests__` or `testdata` directory
+/// anywhere on the path, `*_test.go`, `test_*.py`, `*_test.rs`/`*_tests.rs`,
+/// or `*.test.*`/`*.spec.*` with a `js`/`jsx`/`ts`/`tsx` extension.
+fn is_test_path(path: &str) -> bool {
+    let (dirs, file) = path.rsplit_once('/').unwrap_or(("", path));
+    if dirs.split('/').any(|dir| matches!(dir, "test" | "tests" | "__tests__" | "testdata")) {
+        return true;
+    }
+    if file.ends_with("_test.go") || file.ends_with("_test.rs") || file.ends_with("_tests.rs") {
+        return true;
+    }
+    if file.starts_with("test_") && file.ends_with(".py") {
+        return true;
+    }
+    ["js", "jsx", "ts", "tsx"]
+        .iter()
+        .any(|ext| file.ends_with(&format!(".test.{ext}")) || file.ends_with(&format!(".spec.{ext}")))
+}
+
+/// How many ASCII identifiers (`[A-Za-z_][A-Za-z0-9_]*`, matched leftmost
+/// as a regex scan would, so `0x1F` holds `x1F`) in `signature` are not
+/// [`SIGNATURE_KEYWORDS`]. Counting stops at two.
+fn signature_identifiers(signature: &str) -> usize {
+    let bytes = signature.as_bytes();
+    let mut count = 0;
+    let mut at = 0;
+    while at < bytes.len() && count < 2 {
+        let byte = bytes[at];
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = at;
+            while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+                at += 1;
+            }
+            let word = signature[start..at].to_ascii_lowercase();
+            if !SIGNATURE_KEYWORDS.contains(&word.as_str()) {
+                count += 1;
+            }
+        } else {
+            at += 1;
+        }
+    }
+    count
 }
 
 /// The whole doc comment, a blank line, then the signature; either alone when

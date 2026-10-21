@@ -11,7 +11,9 @@
 //! - `run`: embed every node text the variant's text form produces (the
 //!   `structured` form is production's own `text_to_embed`, which is why this
 //!   lives in the crate) and every query with one
-//!   variant, rank brute force by cosine, and write `manifest.json`,
+//!   variant (leaving out the nodes production filters as noise when the
+//!   variant sets `filter = "noise"`), rank brute force by cosine, and
+//!   write `manifest.json`,
 //!   `vectors.bin`, `query_vectors.bin`, `rankings.jsonl` and `timings.json`
 //!   under `<out>/<variant>/<corpus>/`.
 //! - `report`: compute D5-D7 over run directories and apply D9.
@@ -47,9 +49,9 @@ use sha2::{Digest, Sha256};
 use crate::embedding::model::{
     cosine_similarity, EmbeddingModel, EncoderSpec, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
-use crate::embedding::text::{full_text, text_to_embed};
+use crate::embedding::text::{full_text, is_noise, text_to_embed, EmbedInput};
 
-use config::{Arm, ContextForm, CorporaFile, Role, TextForm, Variant, VariantsFile};
+use config::{Arm, ContextForm, CorporaFile, EmbedFilter, Role, TextForm, Variant, VariantsFile};
 use metrics::{Bound, Floors, Outcome, KEPT_HITS};
 use queries::{hex, Query};
 use rng::Rng;
@@ -233,7 +235,8 @@ struct SnapshotRecord {
 
 /// One node of the snapshot. `text` is `full_text`'s output; only nodes
 /// with text are ranking candidates, exactly as the `vectors` join makes them
-/// in `search_code` (`text_to_embed` is `Some` exactly when `full_text` is).
+/// in `search_code` (`text_to_embed` is `Some` exactly when `full_text` is),
+/// less the nodes a variant's [`EmbedFilter`] leaves out ([`Node::filtered`]).
 #[derive(Debug, Clone)]
 struct Node {
     id: String,
@@ -253,8 +256,24 @@ struct Node {
 }
 
 impl Node {
+    /// Whether `filter` leaves this node out of the candidate set.
+    fn filtered(&self, filter: EmbedFilter) -> bool {
+        match filter {
+            EmbedFilter::None => false,
+            EmbedFilter::Noise => is_noise(&EmbedInput {
+                kind: &self.kind,
+                name: &self.name,
+                qualified_name: &self.qualified_name,
+                file_path: &self.file_path,
+                doc: self.doc.as_deref(),
+                signature: self.signature.as_deref(),
+            }),
+        }
+    }
+
     /// The text a variant embeds for this node. Every form is `Some` exactly
-    /// when `text` is, so the candidate set does not depend on the form.
+    /// when `text` is, so the candidate set does not depend on the form
+    /// (only on the variant's [`EmbedFilter`]).
     fn text_for(&self, form: TextForm) -> Option<String> {
         match form {
             TextForm::Full => self.text.clone(),
@@ -498,11 +517,14 @@ fn fingerprint(variant: &Variant) -> String {
     hex(&Sha256::digest(fingerprint_text(variant).as_bytes()))
 }
 
-/// The variant's `Debug` form, without the `context` and `text` fields when
-/// they are the default: a default must leave the fingerprints of runs
-/// stored before the field existed valid.
+/// The variant's `Debug` form, without the `filter`, `context` and `text`
+/// fields when they are the default: a default must leave the fingerprints
+/// of runs stored before the field existed valid. Stripped last field first.
 fn fingerprint_text(variant: &Variant) -> String {
     let mut debug = format!("{variant:?}");
+    if variant.filter == EmbedFilter::None {
+        debug = debug.replacen(", filter: None }", " }", 1);
+    }
     if variant.context == ContextForm::None {
         debug = debug.replacen(", context: None }", " }", 1);
     }
@@ -518,11 +540,14 @@ fn run_dir(args: &RunArgs, variant: &str, corpus: &str) -> PathBuf {
 }
 
 /// Each expected symbol of each query as candidate indices. Collects every
-/// failure before failing, so one run lists all the drift to fix.
+/// failure before failing, so one run lists all the drift to fix. An
+/// expected node `filter` leaves out resolves to no candidate: a miss, not
+/// a failure.
 fn resolve_expected(
     queries: &[Query],
     nodes: &[Node],
     candidate_of: &HashMap<usize, usize>,
+    filter: EmbedFilter,
 ) -> Result<Vec<Vec<usize>>> {
     let mut by_key: HashMap<(&str, &str, &str), Vec<usize>> = HashMap::new();
     for (i, n) in nodes.iter().enumerate() {
@@ -542,6 +567,7 @@ fn resolve_expected(
                     for i in indices {
                         match candidate_of.get(i) {
                             Some(&c) => hits.push(c),
+                            None if nodes[*i].filtered(filter) => {}
                             None => errors.push(format!(
                                 "{}: {} {} has no embeddable text, so no model could find it",
                                 q.id, e.file_path, e.qualified_name
@@ -567,11 +593,13 @@ fn shuffle_words(text: &str, rng: &mut Rng) -> String {
     words.join(" ")
 }
 
-/// The ranking candidates (nodes with text, by index) and the text `run`
+/// The ranking candidates (nodes with text the variant's filter keeps, by
+/// index) and the text `run`
 /// embeds for each under `variant`'s text form and context, before the
 /// encoder's document prefix. `cost predict` counts exactly these.
 fn candidate_texts(nodes: &[Node], variant: &Variant, arm_seed: u64) -> (Vec<usize>, Vec<String>) {
-    let candidates: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].text.is_some()).collect();
+    let candidates: Vec<usize> =
+        (0..nodes.len()).filter(|&i| nodes[i].text.is_some() && !nodes[i].filtered(variant.filter)).collect();
     let mut all_texts = context::embed_texts(nodes, variant.text, variant.context, arm_seed);
     let texts = candidates.iter().map(|&i| all_texts[i].take().unwrap()).collect();
     (candidates, texts)
@@ -690,7 +718,7 @@ fn run_corpus(
     if let Some(q) = queries.iter().find(|q| &q.language != language) {
         bail!("query {} is {}, corpus {corpus} is {language}", q.id, q.language);
     }
-    let expected = resolve_expected(&queries, &nodes, &candidate_of)?;
+    let expected = resolve_expected(&queries, &nodes, &candidate_of, variant.filter)?;
 
     let dir = run_dir(args, &variant.name, corpus);
     std::fs::create_dir_all(&dir)?;

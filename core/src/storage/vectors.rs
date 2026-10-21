@@ -79,6 +79,12 @@ pub fn insert(conn: &Connection, node_id: &str, embedding: &[f32], embedding_ver
     Ok(())
 }
 
+/// Deletes `node_id`'s embedding, if it has one.
+pub fn delete(conn: &Connection, node_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM vectors WHERE nodeId = ?1", [node_id]).context("failed to delete vector")?;
+    Ok(())
+}
+
 /// One result row from [`search`]: a node id and its distance from the query
 /// vector (smaller is more similar).
 #[derive(Debug, Clone, PartialEq)]
