@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "g-mesh"
-version = "4.15.0"
+version = "4.16.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -755,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "g-mesh-plugin-python"
-version = "4.15.0"
+version = "4.16.0"
 dependencies = [
  "anyhow",
  "g-mesh-plugin-sdk",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "g-mesh-plugin-rust"
-version = "4.15.0"
+version = "4.16.0"
 dependencies = [
  "anyhow",
  "g-mesh-plugin-sdk",
@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "g-mesh-plugin-sdk"
-version = "4.15.0"
+version = "4.16.0"
 dependencies = [
  "anyhow",
  "g-mesh-walk",
@@ -800,7 +800,7 @@ dependencies = [
 
 [[package]]
 name = "g-mesh-plugin-typescript"
-version = "4.15.0"
+version = "4.16.0"
 dependencies = [
  "anyhow",
  "g-mesh-plugin-sdk",
@@ -815,14 +815,14 @@ dependencies = [
 
 [[package]]
 name = "g-mesh-walk"
-version = "4.15.0"
+version = "4.16.0"
 dependencies = [
  "ignore",
 ]
 
 [[package]]
 name = "g-mesh-wire"
-version = "4.15.0"
+version = "4.16.0"
 dependencies = [
  "schemars",
  "serde",
