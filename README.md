@@ -159,9 +159,10 @@ end to end on Windows — that is GM-333 (a release-workflow step that runs
 each published artifact on its own runner), a separate, narrower claim than
 "the installer downloads, verifies and unpacks it correctly."
 
-**Until a release is published, this installs nothing.** Releases are built as
-drafts and are invisible — and their download URLs 404 — until a human presses
-Publish (see "Cutting a release" below). The script says exactly that, with
+**Until a release is published, this installs nothing.** A release is created
+as a draft, invisible with 404 download URLs, and published by the release
+workflow once every asset is uploaded (see "Cutting a release" below). A build
+that is still running or failed leaves nothing to install. The script says exactly that, with
 what to do about it, instead of showing a bare 404 — until then the
 build-from-source path below is the only one that works.
 
@@ -401,10 +402,12 @@ Oniguruma, tree-sitter grammars) for that target.
    version (every workspace member's, not only core's), working tree and
    branch state, runs `cargo test --workspace`, and creates an annotated
    `v<version>` tag locally — it does not push by default, since pushing the
-   tag is what starts the public four-platform build and drafts a Release.
+   tag is what starts the public four-platform build and a Release.
    Pass `--push` to push it in the same step, or run the printed
    `git push origin v<version>` yourself when ready.
-4. Once the build finishes, approve the draft on GitHub.
+4. The tag run publishes the Release after all four legs pass. If the
+   `publish` job fails, fix the cause and re-run the job: it publishes a
+   Release that is still a draft.
 
 ## How it finds a project
 

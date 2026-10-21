@@ -131,7 +131,7 @@ $ErrorActionPreference = 'Stop'
 # knowing the version. The version comes from the releases/latest API, or
 # from -Version/$env:G_MESH_VERSION to pin one. Releases are created as
 # DRAFTS (.github/workflows/release.yml) and stay invisible - their asset
-# URLs 404 - until a human publishes them, so "no published release" gets the
+# URLs 404 - until the release workflow publishes them, so "no published release" gets the
 # same explicit message install.sh gives, not a bare 404.
 #
 # ---------------------------------------------------------------------------
@@ -270,9 +270,9 @@ Most likely, in this order:
     to raise the limit, or wait an hour.
   - You have no route to api.github.com - a proxy, a firewall, or no network.
   - There genuinely is no published release. Releases here are built as
-    drafts and stay invisible, with their download URLs 404ing, until a
-    human publishes one, so this is the expected state between a build
-    finishing and someone pressing Publish.
+    drafts and stay invisible, with their download URLs 404ing, until the
+    release workflow publishes them, so a release build that is still
+    running or failed leaves nothing to install.
 
 What you can do:
   - Check https://github.com/$Repo/releases to see what is published.

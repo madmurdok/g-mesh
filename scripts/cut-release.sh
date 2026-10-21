@@ -2,7 +2,8 @@
 #
 # One command to validate, test and tag a release, instead of the four manual
 # steps described in .github/workflows/release.yml's header (check the crate
-# version, run the workflow once by hand, tag, approve the draft). The version
+# version, run the workflow once by hand, tag; release.yml publishes the
+# release). The version
 # is typed here exactly once.
 #
 #   scripts/cut-release.sh <version>              # verify, test, tag locally
@@ -81,11 +82,11 @@
 # It tags `main`, and only after the release branch has already been merged
 # into it - the tag is meant to point at the code someone gets by cloning, not
 # at a branch tip nobody else can see. It does not create the release branch,
-# does not merge anything, does not publish the draft Release GitHub builds
-# (that stays a human decision, per #67's design), and does not touch the
-# task tracker.
+# does not merge anything, does not publish the Release GitHub builds
+# (release.yml publishes it when all four builds pass), and does not touch
+# the task tracker.
 #
-# Pushing the tag starts a public four-platform build and a draft Release, so
+# Pushing the tag starts a public four-platform build and a Release, so
 # it takes the explicit --push above; without it, the tag is created locally
 # and the exact command to push it is printed instead.
 #
@@ -714,11 +715,11 @@ main() {
 	log "remaining steps"
 	if [ "$push" -eq 1 ]; then
 		echo "  1. Watch the build: https://github.com/$slug/actions"
-		echo "  2. Review and publish the draft release: https://github.com/$slug/releases"
+		echo "  2. Check the published release: https://github.com/$slug/releases/tag/$tag"
 	else
 		echo "  1. Push the tag:    git push origin $tag"
 		echo "  2. Watch the build: https://github.com/$slug/actions"
-		echo "  3. Review and publish the draft release: https://github.com/$slug/releases"
+		echo "  3. Check the published release: https://github.com/$slug/releases/tag/$tag"
 	fi
 }
 
