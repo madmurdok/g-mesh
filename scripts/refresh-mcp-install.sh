@@ -67,6 +67,24 @@ canonical() {
 	printf '%s%s\n' "$(cd "$path" && pwd -P)" "$rest"
 }
 
+# normalize ABSOLUTE_PATH: empty and `.` components dropped, each `..`
+# removing the component before it, lexically. The install dir is used as this
+# string from then on (install.sh gets it too), so what the refusals below
+# judged is what gets replaced.
+normalize() {
+	local out="" rest="$1/" seg
+	while [[ -n "$rest" ]]; do
+		seg="${rest%%/*}"
+		rest="${rest#*/}"
+		case "$seg" in
+		'' | .) ;;
+		..) out="${out%/*}" ;;
+		*) out="$out/$seg" ;;
+		esac
+	done
+	printf '%s\n' "${out:-/}"
+}
+
 # under PATH BASE: PATH is BASE or inside it.
 under() {
 	[[ "$1" == "$2" || "$1" == "$2"/* ]]
@@ -128,18 +146,16 @@ fi
 # --- the install directory -------------------------------------------------
 
 [[ "$install_dir" == /* ]] || install_dir="$PWD/$install_dir"
-while [[ "$install_dir" == */ && "$install_dir" != / ]]; do
-	install_dir="${install_dir%/}"
-done
+install_dir="$(normalize "$install_dir")"
 install_canon="$(canonical "$install_dir")"
 home_canon="$(canonical "$HOME")"
 
-for refused in "$HOME/.g-mesh" "$home_canon/.g-mesh"; do
+for refused in "$(normalize "$HOME")/.g-mesh" "$home_canon/.g-mesh"; do
 	if under "$install_dir" "$refused" || under "$install_canon" "$refused"; then
 		die "refusing $install_dir: it is under $refused, which holds g-mesh's own state; pick a directory outside it (e.g. ~/.local/share/g-mesh/bin)"
 	fi
 done
-for refused in / "$HOME" "$home_canon"; do
+for refused in / "$(normalize "$HOME")" "$home_canon"; do
 	if [[ "$install_dir" == "$refused" || "$install_canon" == "$refused" ]]; then
 		die "refusing $install_dir: install.sh replaces the whole directory"
 	fi
@@ -202,11 +218,29 @@ exe="$install_dir/g-mesh"
 [[ -x "$exe" ]] || die "verification failed: no executable $exe after the install"
 log "installed: $("$exe" --version)"
 
-plugins_list="$("$exe" plugins list)" || die "verification failed: $exe plugins list exited non-zero"
+# Under an empty HOME, so a plugin of the user's own in ~/.g-mesh/plugins
+# cannot shadow (and so hide) a broken installed one.
+empty_home="$(mktemp -d "${TMPDIR:-/tmp}/g-mesh-refresh-home.XXXXXX")"
+plugins_list="$(HOME="$empty_home" "$exe" plugins list)" || {
+	rmdir "$empty_home"
+	die "verification failed: $exe plugins list exited non-zero"
+}
+rmdir "$empty_home"
 plugins_canon="$(canonical "$install_dir/plugins")"
-user_plugins_canon="$(canonical "$HOME/.g-mesh/plugins")"
 dir_checked=0
 failures=()
+
+# Every language this checkout bundles, plus any other the install carries.
+bundled="$(bash "$BUILD_TARGETS" --plugins)" || die "verification failed: could not read the bundled plugin languages"
+languages="$(
+	{
+		printf '%s\n' "$bundled"
+		for manifest in "$install_dir"/plugins/*/plugin.toml; do
+			if [[ -f "$manifest" ]]; then basename "$(dirname "$manifest")"; fi
+		done
+	} | awk 'NF' | sort -u
+)"
+[[ -n "$languages" ]] || die "verification failed: no plugin languages to verify"
 
 while IFS= read -r lang; do
 	[[ -n "$lang" ]] || continue
@@ -238,13 +272,14 @@ while IFS= read -r lang; do
 	if [[ "$line" == *"  dir="* ]]; then
 		dir_checked=1
 		listed_dir="$(canonical "${line##*  dir=}")"
-		if [[ "$listed_dir" == "$user_plugins_canon/$lang" ]]; then
-			log "note: $lang is served by your own override in $listed_dir, not by the plugin installed here"
-		elif [[ "$listed_dir" != "$plugins_canon/$lang" ]]; then
+		if [[ "$listed_dir" != "$plugins_canon/$lang" ]]; then
 			failures+=("$lang: $exe finds it in $listed_dir, not in $plugin_dir")
 		fi
 	fi
-done < <(bash "$BUILD_TARGETS" --plugins)
+	if [[ -f "$HOME/.g-mesh/plugins/$lang/plugin.toml" ]]; then
+		log "note: your own $lang plugin in $HOME/.g-mesh/plugins/$lang takes precedence over the one installed here"
+	fi
+done <<<"$languages"
 
 if [[ ${#failures[@]} -gt 0 ]]; then
 	printf 'refresh-mcp-install: verification failed:\n' >&2
@@ -259,15 +294,31 @@ fi
 
 # --- daemons of the replaced binary ----------------------------------------
 
+# is_installed_exe PATH: PATH is DIR/g-mesh (as given or canonical), or the
+# same binary inside the DIR.old-<pid> directory install.sh moved the previous
+# install to (Linux reports a running process's executable there, with
+# " (deleted)" once it is removed).
+is_installed_exe() {
+	local path="${1% (deleted)}" base middle
+	for base in "$install_dir" "$install_canon"; do
+		[[ "$path" == "$base/g-mesh" ]] && return 0
+		if [[ "$path" == "$base".old-*/g-mesh ]]; then
+			middle="${path#"$base".old-}"
+			middle="${middle%/g-mesh}"
+			[[ "$middle" =~ ^[0-9]+$ ]] && return 0
+		fi
+	done
+	return 1
+}
+
 # Prints "PID PGID" for every `g-mesh daemon` process whose executable is
-# exactly DIR/g-mesh (as given or canonical). Never matches by pattern.
+# the installed binary (see is_installed_exe). Never matches by pattern.
 daemons_of_install() {
 	local pid pgid path args
 	if [[ -e /proc/self/exe ]]; then
 		for proc in /proc/[0-9]*; do
 			path="$(readlink "$proc/exe" 2>/dev/null)" || continue
-			path="${path% (deleted)}"
-			[[ "$path" == "$exe" || "$path" == "$install_canon/g-mesh" ]] || continue
+			is_installed_exe "$path" || continue
 			pid="${proc#/proc/}"
 			args="$(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null)" || continue
 			[[ "$args" == *" daemon --project-root "* ]] || continue
@@ -277,7 +328,7 @@ daemons_of_install() {
 	else
 		# macOS: `comm` is the full path the process was executed from.
 		while read -r pid pgid path; do
-			[[ "$path" == "$exe" || "$path" == "$install_canon/g-mesh" ]] || continue
+			is_installed_exe "$path" || continue
 			args="$(ps -o args= -p "$pid" 2>/dev/null)" || continue
 			[[ "$args" == *" daemon --project-root "* ]] || continue
 			echo "$pid $pgid"
@@ -286,11 +337,14 @@ daemons_of_install() {
 }
 
 # alive PID PGID: the daemon, or anything left in the group it leads, runs.
+# A zombie (exited, not yet reaped) does not count.
 alive() {
 	if [[ "$2" == "$1" ]]; then
-		kill -0 -- "-$2" 2>/dev/null
+		ps -axo pgid=,stat= | awk -v g="$2" '$1 == g && $2 !~ /^Z/ { f = 1 } END { exit !f }'
 	else
-		kill -0 "$1" 2>/dev/null
+		local stat
+		stat="$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')" || return 1
+		[[ -n "$stat" && "$stat" != Z* ]]
 	fi
 }
 

@@ -541,7 +541,7 @@ function Install-GMesh {
         }
         $pluginsLines = & $exePath plugins list 2>$null
         $pluginsOutput = if ($pluginsLines) { $pluginsLines -join "`n" } else { '' }
-        if ($pluginsOutput -notmatch 'typescript') {
+        if ($pluginsOutput -notmatch '(?m)^typescript +[0-9]') {
             Die "the downloaded g-mesh does not see the plugin that shipped with it - nothing was installed"
         }
 
