@@ -224,7 +224,9 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum PluginsCommand {
-    /// List the language plugins installed under `~/.g-mesh/plugins/`.
+    /// List the language plugins g-mesh discovers, and the directory each was
+    /// found in: `~/.g-mesh/plugins/`, then `plugins/` beside this binary,
+    /// then the checkout this binary was built from.
     List,
     /// Run a plugin against a fixture project through the real index and
     /// linker, and report every conformance check it fails.

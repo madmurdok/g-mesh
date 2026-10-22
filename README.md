@@ -121,6 +121,22 @@ Uninstalling is `rm -rf ~/.g-mesh/bin`, plus deleting the
 `~/.config/fish/conf.d/g-mesh.fish`) — settings, project indexes and the
 embedding model live elsewhere under `~/.g-mesh` and survive it.
 
+**Pointing an MCP client at a fixed install directory.** g-mesh finds its
+language plugins as `plugins/<language>/plugin.toml` beside the `g-mesh`
+binary, so never copy bare binaries into that directory: a flat copy discovers
+no plugins at all. Install or refresh it with:
+
+```bash
+scripts/refresh-mcp-install.sh --install-dir ~/.local/share/g-mesh/bin                  # latest release
+scripts/refresh-mcp-install.sh --install-dir ~/.local/share/g-mesh/bin --version 2.7.0  # a pinned release
+scripts/refresh-mcp-install.sh --install-dir ~/.local/share/g-mesh/bin --local          # build this checkout
+```
+
+It installs through install.sh (never touching rc files or `~/.g-mesh`),
+checks that `g-mesh plugins list` finds every bundled plugin in that
+directory (`plugins list` prints each plugin's `dir=`), and stops the
+daemons still running the replaced binary.
+
 **Windows is not supported by this script.** That target ships a `.zip`, which
 a POSIX shell has no portable way to unpack, so the script refuses instead of
 pretending — and points at `scripts/install.ps1`, its PowerShell counterpart:

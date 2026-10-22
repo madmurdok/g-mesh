@@ -422,6 +422,26 @@ sha256_of() {
 # an existing g-mesh install is replaced silently, an empty directory is used,
 # and anything else is refused. Checked before the download rather than after
 # it: a typo should cost a second, not 25 MB.
+# normalize_path ABSOLUTE_PATH: the path with empty and `.` components
+# dropped and each `..` removing the component before it, lexically. Applied
+# to an install dir with a `.` or `..` component (any other is kept as typed,
+# so PATH lines match it); every later use of the install dir is the result,
+# so what check_install_dir judged is what gets moved aside.
+normalize_path() {
+	_np_out=""
+	_np_rest="$1/"
+	while [ -n "$_np_rest" ]; do
+		_np_seg="${_np_rest%%/*}"
+		_np_rest="${_np_rest#*/}"
+		case "$_np_seg" in
+		'' | .) ;;
+		..) _np_out="${_np_out%/*}" ;;
+		*) _np_out="$_np_out/$_np_seg" ;;
+		esac
+	done
+	printf '%s\n' "${_np_out:-/}"
+}
+
 check_install_dir() {
 	[ -e "$INSTALL_DIR" ] || return 0
 	[ -d "$INSTALL_DIR" ] || die "$INSTALL_DIR exists and is not a directory"
@@ -581,6 +601,43 @@ print_path_advice() {
 	echo "Then: g-mesh --version"
 }
 
+# canonical_dir DIR: DIR with symlinks resolved, or DIR unchanged when it
+# does not resolve.
+canonical_dir() {
+	(cd "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+}
+
+# check_staged_plugins STAGE PLUGINS_LIST: every STAGE/plugins/<lang>/plugin.toml
+# must be listed as a loaded plugin (`<lang>  <version> ...`), from a listing
+# taken with an empty HOME. A line ending in `  dir=<path>` (binaries that
+# print it) must name STAGE/plugins/<lang>. Dies naming the first language
+# that fails; notes the languages a user override in ~/.g-mesh/plugins will
+# serve instead.
+check_staged_plugins() {
+	_csp_stage_plugins="$(canonical_dir "$1/plugins")"
+	_csp_found=0
+	for _csp_manifest in "$1"/plugins/*/plugin.toml; do
+		[ -f "$_csp_manifest" ] || continue
+		_csp_found=1
+		_csp_lang="$(basename "$(dirname "$_csp_manifest")")"
+		_csp_line="$(printf '%s\n' "$2" | grep -E "^$_csp_lang +[0-9]" | head -n 1)"
+		[ -n "$_csp_line" ] ||
+			die "the downloaded g-mesh does not see the $_csp_lang plugin that shipped with it - nothing was installed"
+		case "$_csp_line" in
+		*"  dir="*)
+			_csp_dir="$(canonical_dir "${_csp_line##*  dir=}")"
+			[ "$_csp_dir" = "$_csp_stage_plugins/$_csp_lang" ] ||
+				die "the downloaded g-mesh finds its $_csp_lang plugin in $_csp_dir instead of the plugins/$_csp_lang it shipped with - nothing was installed"
+			;;
+		esac
+		if [ -f "$HOME/.g-mesh/plugins/$_csp_lang/plugin.toml" ]; then
+			log "note: your own $_csp_lang plugin in $HOME/.g-mesh/plugins/$_csp_lang takes precedence over the one installed here"
+		fi
+	done
+	[ "$_csp_found" = 1 ] ||
+		die "the downloaded g-mesh carries no plugins/<language>/plugin.toml - nothing was installed"
+}
+
 main() {
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -618,6 +675,10 @@ main() {
 	/*) ;;
 	*) INSTALL_DIR="$(pwd)/$INSTALL_DIR" ;;
 	esac
+	case "$INSTALL_DIR/" in
+	*/./* | */../*) INSTALL_DIR="$(normalize_path "$INSTALL_DIR")" ;;
+	esac
+	[ "$INSTALL_DIR" != / ] || die "refusing to install into /"
 
 	have tar || die "tar is required to unpack the release archive"
 	check_install_dir
@@ -688,9 +749,9 @@ this binary."
 	chmod +x "$_stage/g-mesh" 2>/dev/null || true
 
 	# Run it before installing it. `--version` proves the binary executes on
-	# this machine at all, and `plugins list` proves it discovers the plugin
-	# that travelled with it - the one failure mode that otherwise shows up
-	# only later, as a daemon that refuses to start.
+	# this machine at all, and `plugins list` proves it discovers every plugin
+	# that travelled with it, from the staged directory - the one failure mode
+	# that otherwise shows up only later, as a daemon that refuses to start.
 	log "verifying the downloaded binary runs"
 	_reported="$("$_stage/g-mesh" --version 2>/dev/null)" ||
 		die "the downloaded g-mesh does not run on this machine (target $TARGET) - nothing was installed"
@@ -698,11 +759,16 @@ this binary."
 	*"$VERSION"*) ;;
 	*) die "version mismatch: the archive is named $VERSION but the binary reports '$_reported' - nothing was installed" ;;
 	esac
-	"$_stage/g-mesh" plugins list 2>/dev/null | grep -q typescript ||
-		die "the downloaded g-mesh does not see the plugin that shipped with it - nothing was installed"
+	# Under an empty HOME, so a plugin of the user's own in ~/.g-mesh/plugins
+	# cannot shadow (and so hide) a broken staged one.
+	mkdir -p "$_work/empty-home"
+	_plugins="$(HOME="$_work/empty-home" "$_stage/g-mesh" plugins list 2>/dev/null)" ||
+		die "the downloaded g-mesh could not list its plugins - nothing was installed"
+	check_staged_plugins "$_stage" "$_plugins"
 
 	log "installing into $INSTALL_DIR"
 	mkdir -p "$(dirname "$INSTALL_DIR")" || die "could not create $(dirname "$INSTALL_DIR")"
+	check_install_dir
 	_new="$INSTALL_DIR.new-$$"
 	_old="$INSTALL_DIR.old-$$"
 	rm -rf "$_new" "$_old"

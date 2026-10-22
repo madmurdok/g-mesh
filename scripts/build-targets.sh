@@ -359,7 +359,9 @@ build_one() {
 		# since GM-326 the JS/TS check also requires the cargo-built plugin
 		# binary the staged manifest spawns: a manifest with no binary beside
 		# it is discovered but cannot index anything. The pattern wants a
-		# loaded manifest (`typescript  <version>  ...`), not an error line.
+		# loaded manifest (`<language>  <version>  ...`), not an error line, and
+		# anchors every language to the line start: each line also carries a
+		# `dir=` path, which may contain a language's name.
 		if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" != "1" ]; then
 			log "smoke test: the staged binary discovers the staged plugins"
 			local plugins_output ts_exe="g-mesh-plugin-typescript"
@@ -370,11 +372,11 @@ build_one() {
 			{ echo "$plugins_output" | grep -Eq "^typescript +[0-9]" &&
 				[ -f "$stage_dir/plugins/typescript/$ts_exe" ]; } ||
 				die "the staged binary does not discover the typescript plugin staged beside it, or its binary plugins/typescript/$ts_exe is missing"
-			echo "$plugins_output" | grep -q "go" ||
+			echo "$plugins_output" | grep -Eq "^go +[0-9]" ||
 				die "the staged binary does not discover the go plugin staged beside it"
-			echo "$plugins_output" | grep -q "rust" ||
+			echo "$plugins_output" | grep -Eq "^rust +[0-9]" ||
 				die "the staged binary does not discover the rust plugin staged beside it"
-			echo "$plugins_output" | grep -q "python" ||
+			echo "$plugins_output" | grep -Eq "^python +[0-9]" ||
 				die "the staged binary does not discover the python plugin staged beside it"
 		fi
 	else
