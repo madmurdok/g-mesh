@@ -715,5 +715,41 @@ pub fn defining_containers(conn: &Connection, file_path: &str) -> Result<Vec<Def
     Ok(outermost)
 }
 
+/// [`defining_containers`] for every `File` node at once, inverted: each
+/// container's node id to the paths of the files that define it, sorted.
+/// A container no file defines has no entry (see [`member_files`]).
+pub fn defining_files(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
+    let mut stmt = conn
+        .prepare("SELECT filePath FROM nodes WHERE kind = ?1 ORDER BY filePath")
+        .context("failed to prepare the file listing")?;
+    let files: Vec<String> = stmt
+        .query_map(params![FILE_KIND], |row| row.get(0))
+        .context("failed to list the indexed files")?
+        .collect::<rusqlite::Result<_>>()
+        .context("failed to read the indexed files")?;
+    let mut by_container: HashMap<String, Vec<String>> = HashMap::new();
+    for file in files {
+        for container in defining_containers(conn, &file)? {
+            by_container.entry(container.node_id).or_default().push(file.clone());
+        }
+    }
+    Ok(by_container)
+}
+
+/// The files holding a container's `DEFINES` members, sorted: the fallback
+/// for a container [`defining_files`] maps to no file.
+pub fn member_files(conn: &Connection, container_node_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT DISTINCT m.filePath FROM edges e JOIN nodes m ON m.id = e.toId \
+             WHERE e.fromId = ?1 AND e.kind = ?2 AND m.filePath <> '' ORDER BY m.filePath",
+        )
+        .context("failed to prepare the container member lookup")?;
+    let rows = stmt
+        .query_map(params![container_node_id, DEFINES_KIND], |row| row.get(0))
+        .context("failed to look up a container's member files")?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to read a container's member files")
+}
+
 #[cfg(test)]
 mod tests;

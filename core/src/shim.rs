@@ -22,6 +22,8 @@ use crate::storage::connection::{ensure_project_dir, ensure_project_dir_under};
 
 mod router;
 
+pub(crate) use router::Rebuilding;
+
 /// How long to keep retrying the first connect after bootstrapping a daemon,
 /// and how long to wait between attempts. The daemon needs a few milliseconds
 /// to bind; the bound stops a failed bootstrap from hanging the MCP client.
@@ -241,7 +243,7 @@ enum Incumbent {
 ///
 /// `origin` says where `root` came from (see [`launch_origin`] and
 /// [`selected_origin`]); it only colors the cold-start line.
-fn connect_or_bootstrap(root: &Path, origin: &str) -> Result<ipc::Stream> {
+pub(crate) fn connect_or_bootstrap(root: &Path, origin: &str) -> Result<ipc::Stream> {
     let endpoint = daemon::endpoint(root)?;
     // Checked before anything is attempted, because every step below assumes
     // the endpoint is one a daemon could listen on. An over-long AF_UNIX path
