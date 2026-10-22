@@ -1,5 +1,5 @@
 //! `g-mesh deps --json` driven as a subprocess against temp projects, with the
-//! real TypeScript, Rust and Python plugins `cargo build --workspace` builds
+//! real TypeScript, Rust, Python and Go plugins `cargo build --workspace` builds
 //! (format and exit codes: `docs/cli/deps-json.md`).
 //!
 //! The edges are checked against `get_dependencies` over a real shim for the
@@ -24,8 +24,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 /// What the shim prints when it starts a daemon: present only on a cold run.
 const COLD_START_LINE: &str = "starting a daemon";
 
-/// One TypeScript, one Rust and one Python corner of one project.
-const FILES: [(&str, &str); 11] = [
+/// One TypeScript, one Rust, one Python and one Go corner of one project.
+const FILES: [(&str, &str); 15] = [
     // TS: a file import, a package, a missing file, and `.` with no index file.
     (
         "web/a.ts",
@@ -45,6 +45,11 @@ const FILES: [(&str, &str); 11] = [
     ("ns/a.py", "import ns\nX = 1\n"),
     ("ns/b.py", "Y = 2\n"),
     ("main.py", "import ns\n"),
+    // Go: package `lib` is defined by two files in one directory.
+    ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+    ("lib/a.go", "package lib\n\nfunc A() int { return 1 }\n"),
+    ("lib/b.go", "package lib\n\nfunc B() int { return 2 }\n"),
+    ("main.go", "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/app/lib\"\n)\n\nfunc main() { fmt.Println(lib.A() + lib.B()) }\n"),
 ];
 
 struct Project {
@@ -286,7 +291,7 @@ async fn deps_on_a_cold_ts_rust_python_project_matches_get_dependencies_and_reru
     assert_eq!(doc["project_root"], project.canonical());
     let languages: Vec<&str> =
         doc["languages"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
-    for language in ["python", "rust", "typescript"] {
+    for language in ["go", "python", "rust", "typescript"] {
         assert!(languages.contains(&language), "{language} must be indexed: {doc}");
         assert_eq!(doc["coverage"][language]["status"], "indexed", "{doc}");
     }
@@ -343,12 +348,15 @@ async fn deps_on_a_cold_ts_rust_python_project_matches_get_dependencies_and_reru
         !edges.iter().any(|e| e["from"] == "ns/a.py"),
         "no edge onto the importer's own directory: {doc}"
     );
+    // Go: a package defined by several files in one directory is that directory.
+    assert!(edges.contains(&edge("main.go", "lib", "dir", "go", Some("example.com/app/lib"))), "{doc}");
+    assert_eq!(doc["coverage"]["go"]["external"], 1, "`fmt`: {doc}");
 
     // --- against get_dependencies -----------------------------------------
     let code: Vec<&str> = FILES
         .iter()
         .map(|(path, _)| *path)
-        .filter(|path| [".ts", ".rs", ".py"].iter().any(|ext| path.ends_with(ext)))
+        .filter(|path| [".ts", ".rs", ".py", ".go"].iter().any(|ext| path.ends_with(ext)))
         .collect();
     let answers = get_dependencies(project.root(), &code).await;
     let mut placeholders: BTreeMap<String, usize> = BTreeMap::new();
@@ -367,6 +375,7 @@ async fn deps_on_a_cold_ts_rust_python_project_matches_get_dependencies_and_reru
         let language = match Path::new(file).extension().and_then(|e| e.to_str()) {
             Some("ts") => "typescript",
             Some("rs") => "rust",
+            Some("go") => "go",
             _ => "python",
         };
         *placeholders.entry(language.to_string()).or_default() += placeholder_rows;
@@ -455,4 +464,30 @@ fn a_timeout_exits_5_and_leaves_the_daemon_indexing() {
     let doc = document(&unbounded);
     assert_eq!(doc, waited, "the same index, the same document");
     assert_eq!(project.live_daemon_pid(), pid, "the same daemon answered");
+}
+
+/// A short timeout on a cold project still gets the walk started: the run
+/// exits 5 only once its activation request reached the daemon.
+#[test]
+fn a_short_timeout_on_a_cold_project_exits_5_after_starting_the_walk() {
+    let project = Project::with(&[("a.ts", "export const a = 1;\n")]);
+    // The walk is held, so the index cannot be ready within any timeout.
+    std::fs::write(project.hold(), b"").unwrap();
+    assert!(project.daemon_pid().is_none(), "the project starts cold");
+
+    let output = run(
+        project.root(),
+        &["deps", "--json", "--timeout", "1"],
+        &[(g_mesh::daemon::bulk_index::WALK_HOLD_FILE_ENV, project.hold().as_os_str())],
+    );
+    assert_exit(&output, 5);
+    assert!(output.stdout.is_empty(), "no document on a timeout");
+    assert!(stderr(&output).contains("The daemon keeps indexing"), "{}", stderr(&output));
+
+    let phase = daemon::phase_path_in(&project_dir(project.root()).unwrap());
+    common::wait_for("the index phase to leave `unindexed`", common::startup_timeout(), || {
+        std::fs::read_to_string(&phase)
+            .is_ok_and(|phase| !phase.trim().is_empty() && phase.trim() != "unindexed")
+    });
+    project.live_daemon_pid();
 }
