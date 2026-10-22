@@ -7,11 +7,7 @@ package main
 // here is made there too. Design: `docs/design/GM-646-skip-generated-files.md`
 // section 3.
 
-import (
-	"strings"
-	"unicode"
-	"unicode/utf8"
-)
+import "strings"
 
 const (
 	// The header window: at most this many lines...
@@ -31,25 +27,26 @@ const (
 //     "auto generated" (all case-insensitive). `//go:` directive lines are
 //     ignored.
 //   - R2: some line has the `@generated` token (see hasGeneratedToken).
+//
+// Text inside a balanced pair of backticks or quotes on one line is not read
+// by either rule (see unquoted). Every character test is ASCII-only, which
+// keeps this byte-for-byte equal to the SDK detector.
 func isGenerated(content []byte) bool {
-	header := headerLines(content)
-	notice, word := false, false
-	for _, line := range header {
-		if strings.HasPrefix(line, "//go:") {
-			continue
+	notice, word, token := false, false, false
+	for _, raw := range headerLines(content) {
+		line := unquoted(raw)
+		if !strings.HasPrefix(raw, "//go:") {
+			notice = notice || hasDoNotEdit(line)
+			word = word || hasGeneratedWord(line)
 		}
-		notice = notice || hasDoNotEdit(line)
-		word = word || hasGeneratedWord(line)
+		token = token || hasGeneratedToken(line)
 	}
-	if notice && word {
-		return true
-	}
-	for _, line := range header {
-		if hasGeneratedToken(line) {
-			return true
-		}
-	}
-	return false
+	return (notice && word) || token
+}
+
+// isASCIISpace is Rust's u8::is_ascii_whitespace: space, \t, \n, \f, \r.
+func isASCIISpace(r rune) bool {
+	return r == ' ' || r == '\t' || r == '\n' || r == '\f' || r == '\r'
 }
 
 // headerLines returns the trimmed lines of the file's leading comment block.
@@ -57,7 +54,7 @@ func headerLines(content []byte) []string {
 	end := len(content)
 	if end > maxHeaderBytes {
 		end = maxHeaderBytes
-		for end > 0 && !utf8.RuneStart(content[end]) {
+		for end > 0 && content[end]&0xC0 == 0x80 {
 			end--
 		}
 	}
@@ -72,17 +69,24 @@ func headerLines(content []byte) []string {
 	}
 	var header []string
 	inBlock := false
+	// Open `[` of a Rust inner attribute `#![...]` that spans several lines.
+	attributeDepth := 0
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
+		trimmed := strings.TrimFunc(line, isASCIISpace)
 		if inBlock {
 			header = append(header, trimmed)
 			inBlock = opensBlock(trimmed, true)
 			continue
 		}
-		switch {
-		case trimmed == "" || strings.HasPrefix(trimmed, "#!"):
-			// Blank, a shebang or a Rust inner attribute `#![...]`.
+		if attributeDepth > 0 {
+			attributeDepth = bracketDepth(attributeDepth, trimmed)
 			continue
+		}
+		switch {
+		case strings.HasPrefix(trimmed, "#!["):
+			attributeDepth = bracketDepth(0, trimmed)
+		case trimmed == "" || strings.HasPrefix(trimmed, "#!"):
+			// Blank or a shebang.
 		case strings.HasPrefix(trimmed, "//"):
 			header = append(header, trimmed)
 		case strings.HasPrefix(trimmed, "/*"):
@@ -95,6 +99,22 @@ func headerLines(content []byte) []string {
 		}
 	}
 	return header
+}
+
+// bracketDepth is depth open brackets, updated by the `[` and `]` of line
+// (never below 0).
+func bracketDepth(depth int, line string) int {
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '[':
+			depth++
+		case ']':
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	return depth
 }
 
 // opensBlock reports whether a `/* ... */` comment is still open at the end
@@ -113,19 +133,68 @@ func opensBlock(line string, openAtStart bool) bool {
 	}
 }
 
-// normalized is line lower-cased with every whitespace run collapsed to one
-// space.
+func isASCIIAlnum(b byte) bool {
+	return b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
+}
+
+func isWordByte(b byte) bool {
+	return isASCIIAlnum(b) || b == '_'
+}
+
+// isQuoteAt reports whether line[at] is a quote: a backtick, a double quote,
+// or a single quote that is not an apostrophe between two ASCII letters or
+// digits.
+func isQuoteAt(line string, at int) bool {
+	switch line[at] {
+	case '`', '"':
+		return true
+	case '\'':
+		apostrophe := at > 0 && isASCIIAlnum(line[at-1]) && at+1 < len(line) && isASCIIAlnum(line[at+1])
+		return !apostrophe
+	}
+	return false
+}
+
+// unquoted is line with each balanced quoted span (a quote, then the next
+// quote of the same kind, and what lies between) replaced by one space. A
+// quote with no partner on the line stays as it is, so it never hides the
+// rest of the line.
+func unquoted(line string) string {
+	var out strings.Builder
+	copied := 0
+	for at := 0; at < len(line); at++ {
+		if !isQuoteAt(line, at) {
+			continue
+		}
+		for close := at + 1; close < len(line); close++ {
+			if line[close] == line[at] && isQuoteAt(line, close) {
+				out.WriteString(line[copied:at])
+				out.WriteByte(' ')
+				copied = close + 1
+				at = close
+				break
+			}
+		}
+	}
+	out.WriteString(line[copied:])
+	return out.String()
+}
+
+// normalized is line ASCII-lower-cased with every ASCII whitespace run
+// collapsed to one space.
 func normalized(line string) string {
-	return strings.ToLower(strings.Join(strings.Fields(line), " "))
+	joined := []byte(strings.Join(strings.FieldsFunc(line, isASCIISpace), " "))
+	for i, b := range joined {
+		if b >= 'A' && b <= 'Z' {
+			joined[i] = b + ('a' - 'A')
+		}
+	}
+	return string(joined)
 }
 
 func hasDoNotEdit(line string) bool {
 	line = normalized(line)
 	return strings.Contains(line, "do not edit") || strings.Contains(line, "do not modify")
-}
-
-func isWordRune(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
 }
 
 // hasGeneratedWord reports a word beginning "generated" or "autogenerated";
@@ -135,7 +204,7 @@ func hasGeneratedWord(line string) bool {
 	line = normalized(line)
 	for _, word := range []string{"generated", "autogenerated"} {
 		for at := range indexAll(line, word) {
-			if r, _ := utf8.DecodeLastRuneInString(line[:at]); at == 0 || !isWordRune(r) {
+			if at == 0 || !isWordByte(line[at-1]) {
 				return true
 			}
 		}
@@ -145,50 +214,26 @@ func hasGeneratedWord(line string) bool {
 
 // hasGeneratedToken is R2: `@generated`, preceded by line start, whitespace,
 // `*`, `/` or `#`, and followed by end of line (optionally `*/`), or by
-// whitespace and then `by` or `SignedSource`. Case-sensitive. Not a hit
-// inside backticks or quotes (an apostrophe between two letters is not a
-// quote).
+// whitespace and then `by` or `SignedSource`. Case-sensitive. line is already
+// unquoted.
 func hasGeneratedToken(line string) bool {
 	const token = "@generated"
 	for at := range indexAll(line, token) {
-		before, after := line[:at], line[at+len(token):]
-		if r, _ := utf8.DecodeLastRuneInString(before); at > 0 && !unicode.IsSpace(r) && r != '*' && r != '/' && r != '#' {
-			continue
-		}
-		rest := strings.TrimLeftFunc(after, unicode.IsSpace)
-		ends := rest == "" || rest == "*/"
-		first, _ := utf8.DecodeRuneInString(after)
-		spaced := after != "" && unicode.IsSpace(first)
-		by := false
-		if tail, ok := strings.CutPrefix(rest, "by"); ok {
-			r, _ := utf8.DecodeRuneInString(tail)
-			by = tail == "" || !isWordRune(r)
-		}
-		if (ends || (spaced && (by || strings.HasPrefix(rest, "SignedSource")))) && !insideQuotes(before) {
-			return true
-		}
-	}
-	return false
-}
-
-// insideQuotes reports whether before leaves a backtick, double quote or
-// single quote open.
-func insideQuotes(before string) bool {
-	runes := []rune(before)
-	for _, quote := range []rune{'`', '"', '\''} {
-		count := 0
-		for i, r := range runes {
-			if r != quote {
+		if at > 0 {
+			b := line[at-1]
+			if !isASCIISpace(rune(b)) && b != '*' && b != '/' && b != '#' {
 				continue
 			}
-			apostrophe := quote == '\'' && i > 0 && i+1 < len(runes) &&
-				(unicode.IsLetter(runes[i-1]) || unicode.IsDigit(runes[i-1])) &&
-				(unicode.IsLetter(runes[i+1]) || unicode.IsDigit(runes[i+1]))
-			if !apostrophe {
-				count++
-			}
 		}
-		if count%2 == 1 {
+		after := line[at+len(token):]
+		rest := strings.TrimLeftFunc(after, isASCIISpace)
+		ends := rest == "" || rest == "*/"
+		spaced := after != "" && isASCIISpace(rune(after[0]))
+		by := false
+		if tail, ok := strings.CutPrefix(rest, "by"); ok {
+			by = tail == "" || !isWordByte(tail[0])
+		}
+		if ends || (spaced && (by || strings.HasPrefix(rest, "SignedSource"))) {
 			return true
 		}
 	}

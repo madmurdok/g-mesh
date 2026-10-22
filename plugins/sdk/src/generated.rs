@@ -21,11 +21,16 @@ const MAX_HEADER_BYTES: usize = 8 * 1024;
 ///   `auto generated` (all case-insensitive). Go `//go:` directive lines are
 ///   ignored.
 /// - **R2:** some line has the `@generated` token (see [`has_generated_token`]).
+///
+/// Text inside a balanced pair of backticks or quotes on one line is not
+/// read by either rule (see [`unquoted`]). Every character test is ASCII-only,
+/// which keeps this byte-for-byte equal to the Go detector.
 pub fn is_generated(source: &str) -> bool {
-    let header = header_lines(source);
-    let notice = header.iter().any(|line| !is_go_directive(line) && has_do_not_edit(line));
-    let word = header.iter().any(|line| !is_go_directive(line) && has_generated_word(line));
-    (notice && word) || header.iter().any(|line| has_generated_token(line))
+    let header: Vec<(bool, String)> =
+        header_lines(source).into_iter().map(|line| (is_go_directive(line), unquoted(line))).collect();
+    let notice = header.iter().any(|(directive, line)| !directive && has_do_not_edit(line));
+    let word = header.iter().any(|(directive, line)| !directive && has_generated_word(line));
+    (notice && word) || header.iter().any(|(_, line)| has_generated_token(line))
 }
 
 /// The trimmed lines of the file's leading comment block.
@@ -37,15 +42,25 @@ fn header_lines(source: &str) -> Vec<&str> {
     let window = source[..end].strip_prefix('\u{feff}').unwrap_or(&source[..end]);
     let mut header = Vec::new();
     let mut in_block = false;
+    // Open `[` of a Rust inner attribute `#![...]` that spans several lines.
+    let mut attribute_depth = 0usize;
     for line in window.lines().take(MAX_HEADER_LINES) {
-        let trimmed = line.trim();
+        let trimmed = line.trim_ascii();
         if in_block {
             header.push(trimmed);
             in_block = opens_block(trimmed, true);
             continue;
         }
+        if attribute_depth > 0 {
+            attribute_depth = bracket_depth(attribute_depth, trimmed);
+            continue;
+        }
+        if trimmed.starts_with("#![") {
+            attribute_depth = bracket_depth(0, trimmed);
+            continue;
+        }
         if trimmed.is_empty() || trimmed.starts_with("#!") {
-            // Blank, a shebang or a Rust inner attribute `#![...]`.
+            // Blank or a shebang.
             continue;
         }
         if trimmed.starts_with("//") {
@@ -60,6 +75,15 @@ fn header_lines(source: &str) -> Vec<&str> {
         }
     }
     header
+}
+
+/// `depth` open brackets, updated by the `[` and `]` of `line` (never below 0).
+fn bracket_depth(depth: usize, line: &str) -> usize {
+    line.bytes().fold(depth, |depth, byte| match byte {
+        b'[' => depth + 1,
+        b']' => depth.saturating_sub(1),
+        _ => depth,
+    })
 }
 
 /// Whether a `/* ... */` comment is still open at the end of `line`, given
@@ -77,18 +101,59 @@ fn is_go_directive(line: &str) -> bool {
     line.starts_with("//go:")
 }
 
-/// `line` lower-cased with every whitespace run collapsed to one space.
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Whether the byte at `at` is a quote: a backtick, a double quote, or a
+/// single quote that is not an apostrophe between two ASCII letters or digits.
+fn is_quote_at(bytes: &[u8], at: usize) -> bool {
+    match bytes[at] {
+        b'`' | b'"' => true,
+        b'\'' => {
+            let apostrophe = at > 0
+                && bytes[at - 1].is_ascii_alphanumeric()
+                && bytes.get(at + 1).is_some_and(|next| next.is_ascii_alphanumeric());
+            !apostrophe
+        }
+        _ => false,
+    }
+}
+
+/// `line` with each balanced quoted span (a quote, then the next quote of the
+/// same kind, and what lies between) replaced by one space. A quote with no
+/// partner on the line stays as it is, so it never hides the rest of the line.
+fn unquoted(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let (mut copied, mut at) = (0, 0);
+    while at < bytes.len() {
+        if is_quote_at(bytes, at) {
+            if let Some(close) =
+                (at + 1..bytes.len()).find(|&j| bytes[j] == bytes[at] && is_quote_at(bytes, j))
+            {
+                out.push_str(&line[copied..at]);
+                out.push(' ');
+                at = close + 1;
+                copied = at;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    out.push_str(&line[copied..]);
+    out
+}
+
+/// `line` ASCII-lower-cased with every ASCII whitespace run collapsed to one
+/// space.
 fn normalized(line: &str) -> String {
-    line.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    line.split_ascii_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
 }
 
 fn has_do_not_edit(line: &str) -> bool {
     let line = normalized(line);
     line.contains("do not edit") || line.contains("do not modify")
-}
-
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
 }
 
 /// A word beginning `generated` or `autogenerated`; `auto-generated` and
@@ -98,47 +163,27 @@ fn has_generated_word(line: &str) -> bool {
     let line = normalized(line);
     ["generated", "autogenerated"].iter().any(|word| {
         line.match_indices(word)
-            .any(|(at, _)| line[..at].chars().next_back().is_none_or(|c| !is_word_char(c)))
+            .any(|(at, _)| line.as_bytes()[..at].last().is_none_or(|&byte| !is_word_byte(byte)))
     })
 }
 
 /// R2: `@generated`, preceded by line start, whitespace, `*`, `/` or `#`, and
 /// followed by end of line (optionally `*/`), or by whitespace and then `by`
-/// or `SignedSource`. Case-sensitive. Not a hit inside backticks or quotes
-/// (an apostrophe between two letters is not a quote).
+/// or `SignedSource`. Case-sensitive. `line` is already [`unquoted`].
 fn has_generated_token(line: &str) -> bool {
     const TOKEN: &str = "@generated";
     line.match_indices(TOKEN).any(|(at, _)| {
-        let before = &line[..at];
+        let before = &line.as_bytes()[..at];
         let after = &line[at + TOKEN.len()..];
-        let preceded =
-            before.chars().next_back().is_none_or(|c| c.is_whitespace() || matches!(c, '*' | '/' | '#'));
-        let followed = {
-            let rest = after.trim_start();
-            let ends = rest.is_empty() || rest == "*/";
-            let spaced = after.starts_with(char::is_whitespace);
-            let by = rest.strip_prefix("by").is_some_and(|tail| !tail.starts_with(is_word_char));
-            ends || (spaced && (by || rest.starts_with("SignedSource")))
-        };
-        preceded && followed && !inside_quotes(before)
+        let preceded = before
+            .last()
+            .is_none_or(|&byte| byte.is_ascii_whitespace() || matches!(byte, b'*' | b'/' | b'#'));
+        let rest = after.trim_ascii_start();
+        let ends = rest.is_empty() || rest == "*/";
+        let spaced = after.bytes().next().is_some_and(|byte| byte.is_ascii_whitespace());
+        let by = rest
+            .strip_prefix("by")
+            .is_some_and(|tail| tail.bytes().next().is_none_or(|byte| !is_word_byte(byte)));
+        preceded && (ends || (spaced && (by || rest.starts_with("SignedSource"))))
     })
-}
-
-/// Whether `before` leaves a backtick, double quote or single quote open.
-fn inside_quotes(before: &str) -> bool {
-    let chars: Vec<char> = before.chars().collect();
-    let count = |quote: char| {
-        chars
-            .iter()
-            .enumerate()
-            .filter(|&(i, &c)| {
-                c == quote
-                    && !(quote == '\''
-                        && i > 0
-                        && chars[i - 1].is_alphanumeric()
-                        && chars.get(i + 1).is_some_and(|next| next.is_alphanumeric()))
-            })
-            .count()
-    };
-    ['`', '"', '\''].iter().any(|&quote| count(quote) % 2 == 1)
 }
