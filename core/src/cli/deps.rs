@@ -645,3 +645,6 @@ fn parent_dir(path: &str) -> &str {
         _ => ".",
     }
 }
+
+#[cfg(test)]
+mod tests;
