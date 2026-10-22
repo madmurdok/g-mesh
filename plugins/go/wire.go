@@ -214,6 +214,10 @@ type wireNode struct {
 	// QualifiedName and ends in Name. Absent on File, import and placeholder
 	// nodes.
 	QualifiedPath []pathSegment `json:"qualifiedPath,omitempty"`
+	// The file has a generated-code header (generated.go): the node keeps its
+	// structure but core gives it no embedding. Omitted when false, so an
+	// ordinary node stays byte-identical on the wire.
+	Generated bool `json:"generated,omitempty"`
 }
 
 // wireEdge mirrors core's WireEdge. Unused by this scaffold's extractor (no

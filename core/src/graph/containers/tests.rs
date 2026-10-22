@@ -581,6 +581,7 @@ fn the_wire_conversion_carries_container_parent_through_to_the_row() {
         language: "go".to_string(),
         native_kind: None,
         has_syntax_errors: false,
+        generated: false,
         declarations: None,
         container: Some("github.com/x/app/server".to_string()),
         container_parent: Some("github.com/x/app".to_string()),
