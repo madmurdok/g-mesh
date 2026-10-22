@@ -134,6 +134,19 @@ impl ContextForm {
     }
 }
 
+/// Which nodes a model arm leaves out of the candidate set. Unlike the text
+/// form and the context, it changes the candidate set itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbedFilter {
+    /// Every node with text is a candidate.
+    #[default]
+    None,
+    /// Production's filter: a node `embedding::text::is_noise` holds for is
+    /// not a candidate.
+    Noise,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PoolingName {
@@ -182,6 +195,10 @@ pub struct Variant {
     /// the same reason.
     #[serde(default)]
     pub context: ContextForm,
+    /// Kept after `context` and dropped from the fingerprint when default,
+    /// for the same reason.
+    #[serde(default)]
+    pub filter: EmbedFilter,
 }
 
 impl VariantsFile {

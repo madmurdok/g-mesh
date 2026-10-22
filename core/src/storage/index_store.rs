@@ -36,7 +36,7 @@ use std::sync::{LockResult, Mutex, MutexGuard, PoisonError};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::embedding::pipeline::ComputedEmbedding;
+use crate::embedding::pipeline::ComputedBatch;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::symbol_links::LinkRules;
 use crate::graph::{imports, symbol_links};
@@ -305,7 +305,7 @@ impl IndexStore {
     pub fn swap_language(
         &self,
         staging_path: &std::path::Path,
-        vectors: Option<(&EmbeddingPipeline, &[ComputedEmbedding])>,
+        vectors: Option<(&EmbeddingPipeline, &ComputedBatch)>,
         bookkeeping: &SwapBookkeeping<'_>,
     ) -> Result<usize> {
         // The kept ids are recorded before the guard drops, so no diff can
@@ -430,9 +430,10 @@ impl Writer<'_> {
         })
     }
 
-    /// Stores precomputed vectors, in one step. Best-effort, like
+    /// Stores precomputed vectors and deletes the filtered nodes' ones, in
+    /// one step. Best-effort, like
     /// [`EmbeddingPipeline::store`].
-    pub fn store_vectors(&mut self, embedding: &EmbeddingPipeline, computed: &[ComputedEmbedding]) {
+    pub fn store_vectors(&mut self, embedding: &EmbeddingPipeline, computed: &ComputedBatch) {
         self.step(|conn| embedding.store(conn, computed));
     }
 

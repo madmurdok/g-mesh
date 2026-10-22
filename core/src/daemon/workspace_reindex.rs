@@ -89,6 +89,7 @@ use crate::daemon::plugin;
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
+use crate::embedding::pipeline::ComputedBatch;
 use crate::embedding::EmbedStats;
 use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
@@ -446,14 +447,14 @@ fn rebuild(
     let mut stats = EmbedStats::default();
     let computed = match kind {
         Rebuild::Reindex => embedding.compute(&plan.to_embed, &mut stats),
-        Rebuild::Retry => Vec::new(),
+        Rebuild::Retry => ComputedBatch::default(),
     };
     at(Stage::Planned);
 
     let semantic_pass_languages: HashSet<String> = registry.semantic_pass_languages().into_iter().collect();
     let fingerprint = plugin::fingerprint(manifest);
     let vectors = match kind {
-        Rebuild::Reindex => Some((embedding.as_ref(), computed.as_slice())),
+        Rebuild::Reindex => Some((embedding.as_ref(), &computed)),
         Rebuild::Retry => None,
     };
     store.swap_language(
