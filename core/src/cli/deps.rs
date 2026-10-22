@@ -77,7 +77,9 @@ pub fn run(args: &DepsArgs) -> Result<()> {
 
     let root = resolve_root(args.project.as_deref())?;
     reject_folder_of_projects(&root)?;
-    let deadline = (args.timeout != 0).then(|| Instant::now() + Duration::from_secs(args.timeout));
+    // A timeout too large to be an instant is no limit.
+    let deadline =
+        (args.timeout != 0).then(|| Instant::now().checked_add(Duration::from_secs(args.timeout))).flatten();
     wait_ready(&root, deadline)?;
 
     let state_dir = project_dir(&root).context("failed to resolve the project's state directory")?;
@@ -386,7 +388,7 @@ pub fn export(
     let outcomes: BTreeMap<String, LanguageOutcome> = schema::language_outcomes(&tx)?.into_iter().collect();
     let container_keys = container_keys(&tx)?;
     let defining = containers::defining_files(&tx)?;
-    let mut member_fallback: HashMap<String, Vec<String>> = HashMap::new();
+    let mut fallback: HashMap<String, Vec<(String, &'static str)>> = HashMap::new();
 
     let mut tallies: HashMap<String, Tally> = HashMap::new();
     // (from, to) -> (kind, language, module); the smallest module wins, so the
@@ -420,21 +422,21 @@ pub fn export(
     for row in rows {
         let row = row.context("failed to read an import edge")?;
         let tally = tallies.entry(row.language.clone()).or_default();
-        let (files, module) = if row.target_kind == FILE_KIND {
-            (vec![row.target_path.clone()], None)
+        let (targets, module) = if row.target_kind == FILE_KIND {
+            (vec![(row.target_path.clone(), "file")], None)
         } else if let Some(key) = container_keys.get(&row.target_id) {
-            let files = match defining.get(&row.target_id) {
-                Some(files) => files.clone(),
-                None => match member_fallback.get(&row.target_id) {
-                    Some(files) => files.clone(),
+            let targets = match defining.get(&row.target_id) {
+                Some(files) => targets_of(files),
+                None => match fallback.get(&row.target_id) {
+                    Some(targets) => targets.clone(),
                     None => {
-                        let files = containers::member_files(&tx, &row.target_id)?;
-                        member_fallback.insert(row.target_id.clone(), files.clone());
-                        files
+                        let targets = fallback_targets(&tx, &row.target_id, &row.language, key)?;
+                        fallback.insert(row.target_id.clone(), targets.clone());
+                        targets
                     }
                 },
             };
-            (files, Some(key.clone()))
+            (targets, Some(key.clone()))
         } else if row.native_kind.as_deref() == Some(EXTERNAL_MODULE_NATIVE_KIND) {
             if is_relative_specifier(&row.language, &row.specifier) {
                 tally.unresolved.insert((row.from, row.specifier));
@@ -447,13 +449,18 @@ pub fn export(
             continue;
         };
 
-        let targets = targets_of(&files);
         if targets.is_empty() {
             tally.unresolved.insert((row.from, row.specifier));
             continue;
         }
         for (to, kind) in targets {
-            if kind == "file" && to == row.from {
+            // An import of the importer itself, or of the package directory
+            // it sits in, says nothing about a dependency between files.
+            let onto_itself = match kind {
+                "dir" => to == parent_dir(&row.from),
+                _ => to == row.from,
+            };
+            if onto_itself {
                 continue;
             }
             let value = (kind, row.language.clone(), module.clone());
@@ -574,13 +581,59 @@ fn targets_of(files: &[String]) -> Vec<(String, &'static str)> {
     }
 }
 
+/// Where an import of a container no file defines leads: the file whose own
+/// module declaration it is; else the files holding its ordinary members;
+/// else, for a container whose only members are sub-modules (a Python package
+/// with an empty `__init__.py`, or a namespace package), the sub-modules'
+/// common directory's `__init__.py` when indexed, or that directory.
+fn fallback_targets(
+    conn: &Connection,
+    node_id: &str,
+    language: &str,
+    key: &str,
+) -> Result<Vec<(String, &'static str)>> {
+    let own = containers::own_module_files(conn, language, key)?;
+    if !own.is_empty() {
+        return Ok(targets_of(&own));
+    }
+    let members = containers::member_files(conn, node_id)?;
+    if !members.declarations.is_empty() {
+        return Ok(targets_of(&members.declarations));
+    }
+    let Some(dir) = common_dir(&members.submodules) else {
+        return Ok(Vec::new());
+    };
+    let init = if dir == "." { "__init__.py".to_string() } else { format!("{dir}/__init__.py") };
+    if containers::has_file(conn, &init)? {
+        return Ok(vec![(init, "file")]);
+    }
+    Ok(vec![(dir, "dir")])
+}
+
+/// The deepest directory holding every one of `files`; `None` for no files.
+fn common_dir(files: &[String]) -> Option<String> {
+    let mut dirs = files.iter().map(|file| parent_dir(file));
+    let first: Vec<&str> = match dirs.next()? {
+        "." => Vec::new(),
+        dir => dir.split('/').collect(),
+    };
+    let mut common = first.len();
+    for dir in dirs {
+        let segments: Vec<&str> = if dir == "." { Vec::new() } else { dir.split('/').collect() };
+        common = common.min(first.iter().zip(&segments).take_while(|(a, b)| a == b).count());
+    }
+    Some(if common == 0 { ".".to_string() } else { first[..common].join("/") })
+}
+
 /// Whether an import specifier names a path relative to the importing file
-/// (`./x`, `../x`; for Python also `.x`, `..x`). Such a specifier can never
+/// (`.`, `..`, `./x`, `../x`; for Python also `.x`, `..x`). Such a specifier can never
 /// name an external package, so an `external_module` placeholder carrying one
 /// is an import that resolved to nothing in the project: the TypeScript plugin
 /// marks an unresolvable relative import that way (docs/cli/deps-json.md).
 fn is_relative_specifier(language: &str, specifier: &str) -> bool {
-    specifier.starts_with("./")
+    specifier == "."
+        || specifier == ".."
+        || specifier.starts_with("./")
         || specifier.starts_with("../")
         || (language == "python" && specifier.starts_with('.'))
 }

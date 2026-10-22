@@ -78,7 +78,7 @@ empty index: exit 0, `languages: []`, and `coverage` naming the
     {"from": "pkg/cli.py",    "to": "pkg/config.py", "kind": "file", "language": "python",     "module": "pkg.config"},
     {"from": "server/main.go","to": "server/render", "kind": "dir",  "language": "go",         "module": "example.com/app/server/render"},
     {"from": "src/a.ts",      "to": "src/b.ts",      "kind": "file", "language": "typescript", "module": null},
-    {"from": "src/main.rs",   "to": "src/config.rs", "kind": "file", "language": "rust",       "module": "crate::config"}
+    {"from": "src/main.rs",   "to": "src/config.rs", "kind": "file", "language": "rust",       "module": "app::config"}
   ]
 }
 ```
@@ -104,7 +104,7 @@ empty index: exit 0, `languages: []`, and `coverage` naming the
 | `edges[].to` | string | The imported file, or a directory when `kind` is `dir`. |
 | `edges[].kind` | string | What `to` names: `file` or `dir`. Every row is an import in version 1. |
 | `edges[].language` | string | The importing file's language. |
-| `edges[].module` | string or null | The module/package key the import resolved to (Rust module, Python module, Go package import path); `null` for a file-to-file import (TypeScript/JavaScript). It equals the `qualifiedName` of the row `get_dependencies` returns for that import. |
+| `edges[].module` | string or null | The module/package key the import resolved to (Rust module path starting with the crate's name, e.g. `app::config` for `use crate::config` in crate `app`; Python module; Go package import path); `null` for a file-to-file import (TypeScript/JavaScript). It equals the `qualifiedName` of the row `get_dependencies` returns for that import. |
 
 `line` (the 1-based line of the import in `from`) is **not emitted** in
 version 1: the index does not store an import's position. The name is
@@ -118,10 +118,15 @@ For every import of a file:
 2. Resolved to a module or package -> the file(s) that define it. One file ->
    `kind: file`. Several files in one directory (a Go package) -> `kind: dir`,
    `to` = that directory. Files in several directories -> one `kind: file` row
-   per file. No file -> counted as unresolved.
+   per file. A module no file defines (it declares nothing of its own) leads to
+   the file whose own module declaration it is; else to the files holding its
+   members; else, when its only members are sub-modules (a Python package
+   with an empty `__init__.py`), to the sub-modules' common directory's
+   `__init__.py` when indexed, or to that directory (`kind: dir`, a namespace
+   package). No file -> counted as unresolved.
 3. An external package -> counted in `external`, no row. Exception: a
    target the plugin marked external whose specifier is relative to the
-   importing file (`./x`, `../x`; for Python also `.x`, `..x`) is counted in
+   importing file (`.`, `..`, `./x`, `../x`; for Python also `.x`, `..x`) is counted in
    `unresolved` instead, because a relative path cannot name a package.
 4. Anything else -> counted in `unresolved`, no row.
 
@@ -132,7 +137,8 @@ imports ('./missing') as external_module"; once it ships, the rule has nothing
 left to reclassify. It does not change `version`: `unresolved` and `external`
 keep the meaning documented above, and the rule makes the output match it.
 
-Rows with `from == to` are dropped. Two imports of the same target from one
+Rows with `from == to` are dropped, and so are `dir` rows whose `to` is the
+directory `from` sits in (an import of the importer's own package). Two imports of the same target from one
 file collapse into one row.
 
 ### Paths

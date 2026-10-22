@@ -105,7 +105,7 @@ module doc, `get_dependencies.rs:494` doc):
 | Target node | When | Example |
 |---|---|---|
 | `File` node | TS/JS specifier resolved to a file | `src/a.ts` -> `src/b.ts` |
-| Container node (`Module`, `nativeKind = 'container'`, `filePath = ''`, row in `containers`) | Rust module, Python module, Go package | `src/main.rs` -> `crate::config`; `a.py` -> `requests.adapters`; `x.go` -> `github.com/gin-gonic/gin/render` |
+| Container node (`Module`, `nativeKind = 'container'`, `filePath = ''`, row in `containers`) | Rust module, Python module, Go package | `src/main.rs` -> `app::config` (`use crate::config` in crate `app`); `a.py` -> `requests.adapters`; `x.go` -> `github.com/gin-gonic/gin/render` |
 | `Module` placeholder, `nativeKind = 'external_module'` | a package/builtin outside the project | `react`, `std::fs`, `os` |
 | `Module` placeholder, `nativeKind = 'resolved_module'` left unlinked, or no nativeKind | the plugin thought it was in-project but the index has no such file/container | `./missing` |
 
@@ -276,7 +276,7 @@ text, which the format doc must state.
     {"from": "pkg/cli.py",   "to": "pkg/config.py", "kind": "file", "language": "python",     "module": "pkg.config"},
     {"from": "server/main.go","to": "server/render", "kind": "dir",  "language": "go",         "module": "example.com/app/server/render"},
     {"from": "src/a.ts",     "to": "src/b.ts",      "kind": "file", "language": "typescript", "module": null},
-    {"from": "src/main.rs",  "to": "src/config.rs", "kind": "file", "language": "rust",       "module": "crate::config"}
+    {"from": "src/main.rs",  "to": "src/config.rs", "kind": "file", "language": "rust",       "module": "app::config"}
   ]
 }
 ```
@@ -424,7 +424,7 @@ plugins from the workspace (`common` helpers). Likely heavy: add to the
    `kind: file`, `module: null`; `coverage.typescript.external == 1`,
    `unresolved == 1`; top-level `unresolved.typescript == 1`.
 4. Rust fixture (`main.rs` `mod config; use crate::config::X;`, `use std::fs`):
-   edge `src/main.rs -> src/config.rs`, `module: "crate::config"`; `std` counted
+   edge `src/main.rs -> src/config.rs`, `module: "<crate>::config"`; `std` counted
    external.
 5. Python fixture (`pkg/cli.py` `from pkg import config`, `import os`): edge to
    `pkg/config.py`; a package import (`import pkg`) maps to `pkg/__init__.py`.
