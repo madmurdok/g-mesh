@@ -427,6 +427,27 @@ fn build_targets_fails_when_plugins_list_reports_the_typescript_manifest_as_an_e
     );
 }
 
+/// Behaviour 3: each language counts only as a loaded row starting with its
+/// name. A `dir=` path on another plugin's row may contain a language's name
+/// (`.../go/...`), and must not stand in for that language's own row.
+///
+/// Control: put the go pattern back to `grep -q "go"` - the build passes and
+/// this fails.
+#[test]
+fn build_targets_fails_when_go_appears_only_inside_another_plugins_dir_path() {
+    let root = build_targets_root();
+    let listed = "typescript  4.0.0  bundled  dir=/x/go/plugins/typescript\\n\
+                  rust  4.0.0  bundled  dir=/x/go/plugins/rust\\n\
+                  python  4.0.0  bundled  dir=/x/go/plugins/python\\n";
+    let output = run_build_targets(root.path(), true, listed);
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(
+        stderr_of(&output).contains("does not discover the go plugin staged beside it"),
+        "{}",
+        describe(&output)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // scripts/release-smoke.sh
 // ---------------------------------------------------------------------------

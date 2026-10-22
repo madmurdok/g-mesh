@@ -483,6 +483,93 @@ mod tests {
         assert!(plugins.is_empty());
     }
 
+    /// `plugins list` names the directory each plugin's manifest was
+    /// read from, canonical, as the last field of its line - a user-root
+    /// plugin shows `~/.g-mesh/plugins/<lang>`, a plugin beside the binary
+    /// shows `<exe dir>/plugins/<lang>`, and a broken manifest shows its
+    /// directory too. Both roots are reached through a symlink so the
+    /// canonical spelling differs from the one scanned on every unix host.
+    ///
+    /// Controls: drop `  dir={}` from `render`'s two formats (the line-end
+    /// assertions fail); show `dir.clone()` instead of the canonicalized dir in
+    /// `scan_root` (the `dir` assertions fail).
+    #[cfg(unix)]
+    #[test]
+    fn plugins_list_names_each_plugins_canonical_manifest_dir_last() {
+        let scratch = tempfile::tempdir().unwrap();
+        let real = scratch.path().join("real");
+        let home_plugins = real.join("home/.g-mesh/plugins");
+        let exe_plugins = real.join("install/bin/plugins");
+        for (root, lang, body) in [
+            (&home_plugins, "python", plugin_toml("python", "0.1.0")),
+            (&home_plugins, "broken", "this is not [ valid toml".to_string()),
+            (&exe_plugins, "typescript", BUNDLED_JS_TS_MANIFEST.to_string()),
+        ] {
+            fs::create_dir_all(root.join(lang)).unwrap();
+            fs::write(root.join(lang).join(MANIFEST_FILE_NAME), body).unwrap();
+        }
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let plugins = list_from_roots(&[
+            (link.join("home/.g-mesh/plugins"), PluginStatus::Installed),
+            (link.join("install/bin/plugins"), PluginStatus::Bundled),
+        ])
+        .unwrap();
+
+        let canonical = |root: &Path, lang: &str| fs::canonicalize(root.join(lang)).unwrap();
+        let by_language = |lang: &str| {
+            plugins
+                .iter()
+                .find(|p| p.language == lang)
+                .unwrap_or_else(|| panic!("{lang} missing: {plugins:?}"))
+        };
+        assert_eq!(plugins.len(), 3, "{plugins:?}");
+        assert_eq!(by_language("python").dir, canonical(&home_plugins, "python"));
+        assert_eq!(by_language("broken").dir, canonical(&home_plugins, "broken"));
+        assert_eq!(by_language("typescript").dir, canonical(&exe_plugins, "typescript"));
+
+        // Each entry's own rendering ends with its dir. An error message may
+        // span lines, so for an error entry that is the entry's last line,
+        // not necessarily the line its language starts.
+        for (lang, root) in
+            [("python", &home_plugins), ("broken", &home_plugins), ("typescript", &exe_plugins)]
+        {
+            let entry = render(std::slice::from_ref(by_language(lang)));
+            assert!(entry.starts_with(&format!("{lang}  ")), "{entry}");
+            let want = format!("  dir={}", canonical(root, lang).display());
+            assert!(entry.trim_end().ends_with(&want), "{lang} entry does not end with {want:?}: {entry}");
+        }
+        assert!(render(std::slice::from_ref(by_language("broken"))).contains("  error: "));
+        let loaded_line = render(std::slice::from_ref(by_language("python")));
+        assert_eq!(loaded_line.lines().count(), 1, "{loaded_line}");
+    }
+
+    /// The failure mode the `plugins/` layout exists for: a flat install (bare
+    /// `g-mesh-plugin-*` binaries beside the executable, no `plugins/`
+    /// directory) whose build checkout is gone discovers no plugin at all -
+    /// the plugin binaries alone are not a discovery root.
+    #[test]
+    fn a_flat_install_with_no_plugins_dir_and_no_checkout_lists_nothing() {
+        let scratch = tempfile::tempdir().unwrap();
+        let bin = scratch.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for file in ["g-mesh", "g-mesh-plugin-rust", "g-mesh-plugin-python", "g-mesh-plugin-typescript"] {
+            fs::write(bin.join(file), "").unwrap();
+        }
+        let (_empty_home, user_root) = fixture_root(&[]);
+
+        let plugins = list_from_roots(&[
+            (user_root, PluginStatus::Installed),
+            (bin.join("plugins"), PluginStatus::Bundled),
+            (scratch.path().join("deleted-checkout/plugins"), PluginStatus::Bundled),
+        ])
+        .unwrap();
+
+        assert!(plugins.is_empty(), "{plugins:?}");
+        assert_eq!(render(&plugins), "");
+    }
+
     /// A minimal well-formed `plugin.toml` body for a given language and
     /// version - the `list_from_roots` analog of `daemon::manifest`'s own
     /// `manifest_toml` test helper, needed here because this module's tests
