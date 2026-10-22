@@ -60,7 +60,7 @@ use crate::storage::schema;
 use crate::storage::write::{Diff, NodeRecord};
 
 const NODE_COLUMNS: &str = "id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, \
-     signature, visibility, visibilityContainer, docComment, language, nativeKind, hasSyntaxErrors, container, \
+     signature, visibility, visibilityContainer, docComment, language, nativeKind, hasSyntaxErrors, generated, container, \
      qualifiedPath";
 const DECLARATION_COLUMNS: &str = "nodeId, ordinal, startLine, startCol, endLine, endCol, signature, hasBody";
 const TARGET_COLUMNS: &str = "nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile, keyPath";
@@ -375,13 +375,14 @@ fn plan_attached(
 /// whose live vector is missing or was made by another model. Every other
 /// node keeps its live vector, which is the vector its unchanged text would
 /// get again. A node with no text that still has a live vector (one made
-/// before it became noise) counts as changed, so the swap deletes that
-/// vector.
+/// before it became noise or generated) counts as changed, so the swap
+/// deletes that vector.
 fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
     let mut statement = tx
         .prepare(
-            "SELECT s.id, s.kind, s.name, s.qualifiedName, s.filePath, s.docComment, s.signature,
+            "SELECT s.id, s.kind, s.name, s.qualifiedName, s.filePath, s.docComment, s.signature, s.generated,
                     l.id IS NOT NULL, l.kind, l.name, l.qualifiedName, l.filePath, l.docComment, l.signature,
+                    l.generated,
                     v.embeddingVersion
              FROM plan_upsert_nodes p
              JOIN main.nodes s ON s.id = p.id
@@ -396,6 +397,8 @@ fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
         file_path: Option<String>,
         doc: Option<String>,
         signature: Option<String>,
+        /// `None` on the live side of a node live does not have.
+        generated: Option<bool>,
     }
     impl Side {
         fn read(row: &rusqlite::Row, at: usize) -> rusqlite::Result<Self> {
@@ -406,6 +409,7 @@ fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
                 file_path: row.get(at + 3)?,
                 doc: row.get(at + 4)?,
                 signature: row.get(at + 5)?,
+                generated: row.get(at + 6)?,
             })
         }
         fn text(&self) -> Option<String> {
@@ -416,13 +420,14 @@ fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
                 file_path: self.file_path.as_deref().unwrap_or_default(),
                 doc: self.doc.as_deref(),
                 signature: self.signature.as_deref(),
+                generated: self.generated.unwrap_or_default(),
             })
         }
     }
     type Row = (String, Side, bool, Side, Option<String>);
     let rows: Vec<Row> = statement
         .query_map([], |row| {
-            Ok((row.get(0)?, Side::read(row, 1)?, row.get(7)?, Side::read(row, 8)?, row.get(14)?))
+            Ok((row.get(0)?, Side::read(row, 1)?, row.get(8)?, Side::read(row, 9)?, row.get(16)?))
         })
         .context("failed to read the embedding plan")?
         .collect::<rusqlite::Result<_>>()
@@ -440,7 +445,9 @@ fn plan_embeddings(tx: &Connection, embedding_version: &str) -> Result<Diff> {
         }
         let owed = !in_live || text_changed || live_version.as_deref() != Some(embedding_version);
         if staged_text.is_some() && owed {
-            let Side { kind, name, qualified_name, file_path, doc, signature } = staged;
+            // `staged_text` is `None` for a generated node, so it is never
+            // staged here.
+            let Side { kind, name, qualified_name, file_path, doc, signature, .. } = staged;
             let mut node = NodeRecord::new(
                 id,
                 kind.unwrap_or_default(),

@@ -288,6 +288,10 @@ fn purge_noise_page(
             file_path,
             doc: doc.as_deref(),
             signature: signature.as_deref(),
+            // A generated node never gets a vector (`EmbeddingPipeline::compute`
+            // drops it, schema 15 rebuilt every older index), so this purge
+            // has none to find; it stays the noise rule's alone.
+            generated: false,
         };
         if is_noise(&input) {
             vectors::delete(conn, id)?;
@@ -334,7 +338,7 @@ fn count_candidates(conn: &Connection, version: &str) -> SqlResult<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
          WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?1) \
-         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL)",
+         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0",
         [version],
         |row| row.get(0),
     )
@@ -354,7 +358,7 @@ fn fetch_candidate_page(
         "SELECT n.id, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
          FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
          WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?3) \
-         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) \
+         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0 \
          AND n.id > ?1 ORDER BY n.id LIMIT ?2",
     )?;
     // Every real node id is a non-empty string, so `id > ''` is true for all

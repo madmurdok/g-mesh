@@ -267,6 +267,7 @@ impl Node {
                 file_path: &self.file_path,
                 doc: self.doc.as_deref(),
                 signature: self.signature.as_deref(),
+                generated: false,
             }),
         }
     }

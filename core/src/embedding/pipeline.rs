@@ -436,7 +436,8 @@ impl EmbeddingPipeline {
         let mut pending: Vec<(&str, String)> = Vec::new();
         for node in &diff.upsert_nodes {
             let input = EmbedInput::from(node);
-            if crate::embedding::text::is_noise(&input) {
+            // A generated node's old vector goes the way a noise node's does.
+            if input.generated || crate::embedding::text::is_noise(&input) {
                 dropped.push(node.id.clone());
             } else if let Some(text) = node_text(&input) {
                 pending.push((node.id.as_str(), text));
@@ -826,6 +827,7 @@ impl<'a> From<&'a NodeRecord> for EmbedInput<'a> {
             file_path: &node.file_path,
             doc: node.doc_comment.as_deref(),
             signature: node.signature.as_deref(),
+            generated: node.generated,
         }
     }
 }
@@ -836,16 +838,16 @@ impl<'a> From<&'a NodeRecord> for EmbedInput<'a> {
 /// [`node_text`] would have produced had `compute` run against this row
 /// right now instead of whenever it actually ran.
 fn current_embeddable_text(conn: &Connection, node_id: &str) -> Result<Option<String>> {
-    type Row = (String, String, String, String, Option<String>, Option<String>);
+    type Row = (String, String, String, String, Option<String>, Option<String>, bool);
     let row: Option<Row> = conn
         .query_row(
-            "SELECT kind, name, qualifiedName, filePath, docComment, signature FROM nodes WHERE id = ?1",
+            "SELECT kind, name, qualifiedName, filePath, docComment, signature, generated FROM nodes WHERE id = ?1",
             [node_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         )
         .optional()
         .context("failed to read node for its embedding staleness check")?;
-    Ok(row.and_then(|(kind, name, qualified_name, file_path, doc, signature)| {
+    Ok(row.and_then(|(kind, name, qualified_name, file_path, doc, signature, generated)| {
         node_text(&EmbedInput {
             kind: &kind,
             name: &name,
@@ -853,6 +855,7 @@ fn current_embeddable_text(conn: &Connection, node_id: &str) -> Result<Option<St
             file_path: &file_path,
             doc: doc.as_deref(),
             signature: signature.as_deref(),
+            generated,
         })
     }))
 }

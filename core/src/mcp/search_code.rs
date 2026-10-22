@@ -962,6 +962,7 @@ mod tests {
                 file_path: "a.rs",
                 doc: Some("Reads a file from disk and returns its contents as a string."),
                 signature: Some("readFileAsString(path: string): string"),
+                generated: false,
             },
             "jina-embeddings-v2-base-code",
         )
@@ -977,6 +978,7 @@ mod tests {
                 file_path: "b.rs",
                 doc: None,
                 signature: Some("unrelatedMathHelper(a: number, b: number): number"),
+                generated: false,
             },
             "jina-embeddings-v2-base-code",
         )
