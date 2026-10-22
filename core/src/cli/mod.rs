@@ -33,6 +33,7 @@ pub mod agent_instructions;
 pub mod clean;
 pub mod config_wizard;
 pub mod debug_candidates;
+pub mod deps;
 pub mod embed_eval;
 pub mod init;
 pub mod model;
@@ -56,6 +57,18 @@ use crate::{daemon, shim};
 /// only in part: `g-mesh init`/`reindex` when some, not all, discovered
 /// languages failed to index (ADR 0021). The index is written and usable.
 pub const PARTIAL_FAILURE_EXIT_CODE: i32 = 2;
+
+/// `g-mesh deps`: the root is not one project (a folder of projects, or not
+/// a directory at all). Nothing was started.
+pub const NOT_A_PROJECT_EXIT_CODE: i32 = 3;
+
+/// `g-mesh deps`: the project's index cannot be read - its daemon did not
+/// start, or its walk failed.
+pub const INDEX_UNAVAILABLE_EXIT_CODE: i32 = 4;
+
+/// `g-mesh deps`: the index was not ready within `--timeout`. The daemon keeps
+/// building it.
+pub const TIMEOUT_EXIT_CODE: i32 = 5;
 
 /// A command's error that carries its own exit code, for an outcome that is
 /// neither success nor the plain failure every other error exits 1 with.
@@ -166,6 +179,13 @@ pub enum Command {
     },
     /// Wipe and rebuild the current project's index from scratch.
     Reindex,
+    /// Print every file-level import edge of the current project as one JSON
+    /// document (format: docs/cli/deps-json.md). Builds the index first when
+    /// the project has none, through the project's daemon.
+    ///
+    /// Exit codes: 0 printed, 1 unexpected error, 2 usage error, 3 not a
+    /// project, 4 index unavailable, 5 timed out.
+    Deps(DepsArgs),
     /// Inspect the installed language plugins, or check one against the
     /// plugin contract.
     ///
@@ -313,6 +333,24 @@ pub struct CleanArgs {
     pub force: bool,
 }
 
+/// `g-mesh deps`'s flags.
+#[derive(Debug, Args)]
+pub struct DepsArgs {
+    /// Print JSON. Required: it is the only output format, and requiring it
+    /// keeps a later text format from changing what scripts get.
+    #[arg(long, required = true)]
+    pub json: bool,
+    /// Seconds to wait for the daemon and the index before giving up with
+    /// exit code 5; 0 waits without limit. The daemon keeps indexing after a
+    /// timeout, so the next run is faster.
+    #[arg(long, value_name = "SECONDS", default_value_t = deps::DEFAULT_TIMEOUT_SECS)]
+    pub timeout: u64,
+    /// The project root; the current directory when omitted.
+    /// `$CLAUDE_PROJECT_DIR` is not consulted.
+    #[arg(long, value_name = "DIR")]
+    pub project: Option<PathBuf>,
+}
+
 /// Parses argv and runs the command it names.
 ///
 /// Parse failures never reach here: clap prints its own diagnostic and exits
@@ -330,6 +368,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Config { global } => config_wizard::run(global),
         Command::Status { full, json } => status::run(full, json),
         Command::Reindex => reindex::run(),
+        Command::Deps(args) => deps::run(&args),
         Command::Plugins { command } => match command {
             PluginsCommand::List => plugins::run(),
             PluginsCommand::Check(args) => plugin_check::run(&args),
@@ -578,7 +617,9 @@ mod tests {
     #[test]
     fn help_lists_every_human_facing_command_and_hides_the_daemon() {
         let help = Cli::command().render_help().to_string();
-        for name in ["init", "config", "status", "reindex", "plugins", "model", "clean", "stop", "mcp-shim"] {
+        for name in
+            ["init", "config", "status", "reindex", "deps", "plugins", "model", "clean", "stop", "mcp-shim"]
+        {
             assert!(help.contains(name), "`--help` must mention `{name}`:\n{help}");
         }
 
@@ -590,6 +631,53 @@ mod tests {
             .expect("the daemon subcommand must still exist")
             .clone();
         assert!(daemon.is_hide_set(), "the shim's private daemon entry point must stay out of --help");
+    }
+
+    #[test]
+    fn deps_parses_json_with_the_default_timeout_and_no_project() {
+        match command_of(&["deps", "--json"]) {
+            Command::Deps(args) => {
+                assert!(args.json);
+                assert_eq!(args.timeout, deps::DEFAULT_TIMEOUT_SECS);
+                assert_eq!(args.timeout, 600);
+                assert_eq!(args.project, None);
+            }
+            other => panic!("expected the deps subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deps_without_json_is_a_missing_argument_error() {
+        let err = parse(&["deps"]).expect_err("--json is required");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        assert_eq!(err.exit_code(), 2, "a usage error exits 2");
+        let err = parse(&["deps", "--timeout", "5"]).expect_err("--json is required with other flags too");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn deps_takes_a_timeout_in_seconds_and_a_project_dir() {
+        match command_of(&["deps", "--json", "--timeout", "0", "--project", "/some/dir"]) {
+            Command::Deps(args) => {
+                assert_eq!(args.timeout, 0);
+                assert_eq!(args.project, Some(PathBuf::from("/some/dir")));
+            }
+            other => panic!("expected the deps subcommand, got {other:?}"),
+        }
+        let err = parse(&["deps", "--json", "--timeout", "soon"]).expect_err("a timeout is a number");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        let err = parse(&["deps", "--json", "extra"]).expect_err("deps takes no positional argument");
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn deps_help_names_its_flags() {
+        let mut command = Cli::command();
+        let deps = command.find_subcommand_mut("deps").expect("deps must exist");
+        let help = deps.render_help().to_string();
+        for flag in ["--json", "--timeout", "--project"] {
+            assert!(help.contains(flag), "`deps --help` must mention `{flag}`:\n{help}");
+        }
     }
 
     #[test]

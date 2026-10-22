@@ -111,3 +111,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0038 | [Rust enum variants are nodes, of the kind each shape is in Rust's value namespace](0038-rust-enum-variants-are-nodes.md) | Accepted |
 | 0039 | [The rust server runs under an OS sandbox that denies mapping and exec of project code](0039-rust-server-runs-under-an-os-sandbox.md) | Accepted |
 | 0040 | [The rust server's sandbox denies network and writes outside its temp dir and the cargo caches](0040-rust-sandbox-denies-network-and-writes.md) | Accepted |
+| 0041 | [`g-mesh deps` reads the index directly after a daemon readiness wait](0041-deps-cli-reads-the-index-after-a-daemon-readiness-wait.md) | Accepted |

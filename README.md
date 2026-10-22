@@ -861,6 +861,19 @@ than deleting quietly:
   dead as you work; `clean expired` or `clean all --force` are the blunt
   instruments for what is left.
 
+### Exporting the dependency graph: `g-mesh deps`
+
+`g-mesh deps --json` prints every file-level import edge g-mesh has indexed
+for the project in the current directory (or `--project <DIR>`) as one JSON
+document on stdout: which languages it covers, per-language counts, and one
+`{from, to, kind, language, module}` row per imported file or Go package
+directory. A project with no index yet is indexed first, through its daemon,
+within `--timeout` seconds (default 600, `0` for no limit); progress goes to
+stderr. Exit codes: 0 printed, 2 usage error, 3 not a project (a folder of
+projects), 4 index unavailable, 5 timed out (the daemon keeps indexing, so run
+it again). Format, versioning and exit codes:
+[`docs/cli/deps-json.md`](docs/cli/deps-json.md).
+
 ## Writing a language plugin
 
 A plugin is a directory named after its language, holding a `plugin.toml`
