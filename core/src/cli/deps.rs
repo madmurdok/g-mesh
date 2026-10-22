@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -56,6 +57,18 @@ const REBUILD_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// Between two activating calls whose answer came back before the index was
 /// ready (the daemon's own wait cap fired).
 const NOT_READY_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How long past the deadline a run waits for its activation request to go
+/// out, so a timeout does not leave a just-bootstrapped daemon with its walk
+/// unrequested: the shim's bootstrap budget (10 s) plus the handshake.
+const ACTIVATION_GRACE: Duration = Duration::from_secs(15);
+
+/// [`readiness_loop`]'s progress, for the deadline's message: nothing reached
+/// yet, a daemon connected, the activating call sent (the daemon now builds
+/// the index whatever this process does).
+const STAGE_CONNECTING: u8 = 0;
+const STAGE_CONNECTED: u8 = 1;
+const STAGE_REQUESTED: u8 = 2;
 
 /// How many times the daemon may go away mid-wait before the index counts as
 /// unavailable.
@@ -165,16 +178,18 @@ fn unavailable(root: &Path, state_dir: &Path, reason: String) -> anyhow::Error {
 fn wait_ready(root: &Path, deadline: Option<Instant>) -> Result<()> {
     let state_dir = project_dir(root).context("failed to resolve the project's state directory")?;
     let rebuild_note: Arc<Mutex<Option<String>>> = Arc::default();
+    let stage = Arc::new(AtomicU8::new(STAGE_CONNECTING));
     let (tx, rx) = mpsc::channel();
     {
         let root = root.to_path_buf();
         let state_dir = state_dir.clone();
         let rebuild_note = Arc::clone(&rebuild_note);
+        let stage = Arc::clone(&stage);
         thread::Builder::new()
             .name("deps-readiness".to_string())
             .spawn(move || {
                 // A send fails only once the receiver gave up waiting.
-                let _ = tx.send(readiness_loop(&root, &state_dir, &rebuild_note));
+                let _ = tx.send(readiness_loop(&root, &state_dir, &rebuild_note, &stage));
             })
             .context("failed to start the readiness wait")?;
     }
@@ -193,7 +208,23 @@ fn wait_ready(root: &Path, deadline: Option<Instant>) -> Result<()> {
             Err(RecvTimeoutError::Timeout) => {
                 let note = rebuild_note.lock().map(|note| note.clone()).unwrap_or_default();
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Err(timed_out(root, &state_dir, note, started.elapsed()));
+                    // The daemon is reached (bootstrapped if need be) and
+                    // asked to build the index before the timeout is
+                    // honoured. Not while a rebuild holds the project: the
+                    // rebuild builds the index itself.
+                    let grace_end = Instant::now() + ACTIVATION_GRACE;
+                    while note.is_none()
+                        && stage.load(Ordering::SeqCst) != STAGE_REQUESTED
+                        && Instant::now() < grace_end
+                    {
+                        match rx.recv_timeout(Duration::from_millis(20)) {
+                            Ok(outcome) => return outcome,
+                            Err(RecvTimeoutError::Disconnected) => break,
+                            Err(RecvTimeoutError::Timeout) => {}
+                        }
+                    }
+                    let requested = stage.load(Ordering::SeqCst) == STAGE_REQUESTED;
+                    return Err(timed_out(root, &state_dir, note, requested, started.elapsed()));
                 }
                 let doing = note.unwrap_or_else(|| progress_detail(&state_dir));
                 eprintln!("g-mesh deps: waiting for the index of {} ({doing})", root.display());
@@ -202,10 +233,24 @@ fn wait_ready(root: &Path, deadline: Option<Instant>) -> Result<()> {
     }
 }
 
-fn timed_out(root: &Path, state_dir: &Path, rebuild_note: Option<String>, waited: Duration) -> anyhow::Error {
+/// Exit 5's error. `requested`: the activating call reached the daemon, so it
+/// keeps indexing; otherwise the walk may not have started.
+fn timed_out(
+    root: &Path,
+    state_dir: &Path,
+    rebuild_note: Option<String>,
+    requested: bool,
+    waited: Duration,
+) -> anyhow::Error {
     let waited = format!("{} s", waited.as_secs());
     let message = match rebuild_note {
         Some(note) => format!("{note}; waited {waited}. Run again once it finishes."),
+        None if !requested => format!(
+            "the daemon for {} was not reached and asked to build the index in time ({}); waited {waited}. \
+             Indexing may not have started; run again.",
+            root.display(),
+            progress_detail(state_dir)
+        ),
         None => format!(
             "the index for {} is still being built ({}); waited {waited}. The daemon keeps indexing; run again.",
             root.display(),
@@ -237,7 +282,12 @@ fn progress_detail(state_dir: &Path) -> String {
 /// Connect or bootstrap, activate, check the phase; again until the phase
 /// allows structural answers. Never returns for a rebuild that does not end:
 /// the caller's deadline ends that.
-fn readiness_loop(root: &Path, state_dir: &Path, rebuild_note: &Mutex<Option<String>>) -> Result<()> {
+fn readiness_loop(
+    root: &Path,
+    state_dir: &Path,
+    rebuild_note: &Mutex<Option<String>>,
+    stage: &AtomicU8,
+) -> Result<()> {
     let mut lost = 0u32;
     let mut lose = |reason: String| -> Result<()> {
         lost += 1;
@@ -252,6 +302,7 @@ fn readiness_loop(root: &Path, state_dir: &Path, rebuild_note: &Mutex<Option<Str
                 if let Ok(mut note) = rebuild_note.lock() {
                     *note = None;
                 }
+                stage.fetch_max(STAGE_CONNECTED, Ordering::SeqCst);
                 stream
             }
             Err(err) => {
@@ -273,7 +324,9 @@ fn readiness_loop(root: &Path, state_dir: &Path, rebuild_note: &Mutex<Option<Str
                 return Err(unavailable(root, state_dir, reason));
             }
         };
-        let answer = match client::activate_and_wait(stream, CLIENT_NAME) {
+        let answer = match client::activate_and_wait(stream, CLIENT_NAME, || {
+            stage.store(STAGE_REQUESTED, Ordering::SeqCst);
+        }) {
             Ok(answer) => answer,
             Err(err) => {
                 lose(format!("the daemon went away while building the index: {err:#}"))?;

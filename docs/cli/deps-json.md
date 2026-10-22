@@ -35,8 +35,11 @@ While waiting, a line is printed to stderr every 10 s:
 
 The `--timeout` deadline covers steps 1 and 2, including a wait for a running
 `g-mesh reindex`/`init` (retried every 500 ms). Reading and printing are not
-bounded. On a timeout the daemon is left running and keeps indexing, so the
-next run is faster.
+bounded. Before the timeout is honoured, the daemon is reached (started if
+need be) and asked to build the index, for up to 15 s past the deadline. A
+timeout after that request leaves the daemon running and indexing, so the next
+run is faster. If the daemon could not be reached and asked even then, the
+message says so: indexing may not have started, and the next run starts it.
 
 stdout carries only the JSON document: one compact line, then a newline. Every
 other message goes to stderr.
@@ -50,7 +53,7 @@ other message goes to stderr.
 | 2 | Usage error (unknown flag, missing `--json`) | empty | clap's message |
 | 3 | Not a project: a folder of projects, or not an existing directory | empty | `g-mesh: <root> is a folder of N projects; run deps inside one of them` |
 | 4 | Index unavailable: the daemon did not start or accept, the walk failed, the endpoint path is too long, or the daemon kept disappearing | empty | `g-mesh: the index for <root> is unavailable: <reason> (daemon log: <path>)` |
-| 5 | Timed out before the index was ready | empty | `g-mesh: the index for <root> is still being built (<progress>); waited <t>. The daemon keeps indexing; run again.` |
+| 5 | Timed out before the index was ready | empty | the request reached the daemon: `g-mesh: the index for <root> is still being built (<progress>); waited <t>. The daemon keeps indexing; run again.` It did not: `g-mesh: the daemon for <root> was not reached and asked to build the index in time (<progress>); waited <t>. Indexing may not have started; run again.` |
 
 Code 2 is not used for "some languages failed" here (unlike `init`/`reindex`):
 a partly indexed project still prints a usable document with exit 0.

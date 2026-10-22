@@ -33,7 +33,13 @@ pub struct CallAnswer {
 /// Runs the handshake and the activating call on `stream` and blocks until the
 /// call's answer arrives. No read timeout: a caller that needs one runs this
 /// on a thread it can abandon. `client_name` goes into `clientInfo`.
-pub fn activate_and_wait(stream: ipc::Stream, client_name: &str) -> Result<CallAnswer> {
+/// `on_requested` runs once the tool call is written: from then on the daemon
+/// builds the index even if this client goes away.
+pub fn activate_and_wait(
+    stream: ipc::Stream,
+    client_name: &str,
+    on_requested: impl FnOnce(),
+) -> Result<CallAnswer> {
     let mut writer = stream.try_clone().context("failed to clone the daemon connection")?;
     let mut reader = BufReader::new(stream);
     let mut send = |message: Value| -> Result<()> {
@@ -59,6 +65,7 @@ pub fn activate_and_wait(stream: ipc::Stream, client_name: &str) -> Result<CallA
         "method": "tools/call",
         "params": { "name": "get_file_outline", "arguments": { "file_path": "\u{0000}" } },
     }))?;
+    on_requested();
     let response = read_response(&mut reader, CALL_ID).context("the daemon did not answer the tool call")?;
     Ok(answer_of(&response))
 }
