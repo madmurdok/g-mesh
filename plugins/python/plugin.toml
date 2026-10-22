@@ -22,23 +22,13 @@
 [plugin]
 language = "python"
 protocol_version = 2
-# Must equal this crate's `Cargo.toml` `version`, and `src/semantic.rs`'s
-# `the_manifest_version_matches_the_crates` is what enforces it. It had
-# already drifted by the time GM-299 added that check: this said 0.1.0 (the
-# value GM-295 scaffolded) while the crate had been carried to 3.4.0 by the
-# workspace's own release bumps. Nothing caught it because nothing read both -
-# core reads this file for `g-mesh plugins list` and for its protocol-mismatch
-# message, the plugin announced `env!("CARGO_PKG_VERSION")` in its handshake,
-# and the two screens a person consults about one plugin named different
-# versions. This is the same drift `plugins/rust/plugin.toml`'s own header
-# records, found the same way and fixed the same way.
-# GM-303 wrote down the general rule this is one case of: a plugin that
-# joins the cargo workspace tracks the release version (transitively, via
-# its own crate's version); a plugin built by its own separate toolchain
-# (plugins/go, plugins/typescript) tracks its own manifest of record
-# instead. See docs/architecture/plugin-modularity.md, "plugin_version: two
-# rules, not one".
-plugin_version = "4.15.0"
+# Equals this crate's `Cargo.toml` `version` (`src/semantic.rs`'s
+# `the_manifest_version_matches_the_crates` pins it) and names this
+# plugin's build, not the g-mesh release: both are bumped together only when
+# the plugin changed since the previous release tag, and
+# scripts/cut-release.sh enforces that. See
+# docs/architecture/plugin-modularity.md, "plugin_version: two rules, not one".
+plugin_version = "4.16.0"
 
 [plugin.spawn]
 command = "${G_MESH_BIN_DIR}/g-mesh-plugin-python"

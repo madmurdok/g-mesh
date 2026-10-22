@@ -29,9 +29,13 @@
 //!
 //! Keyset pagination over `nodes.id`, not "while any unembedded row
 //! remains": a node whose inference keeps failing (a pathological input, a
-//! persistent ONNX error) or whose text trims to nothing (`text_to_embed`
-//! returning `None`, so [`EmbeddingPipeline::compute`] silently skips it)
-//! would make a "does anything remain" loop spin forever. Paging strictly
+//! persistent ONNX error), whose text trims to nothing, or that
+//! `embedding::text::is_noise` filters out (`node_text` returning `None`, so
+//! [`EmbeddingPipeline::compute`] skips it) would make a "does anything
+//! remain" loop spin forever. A filtered node with no vector, or one from
+//! another `embeddingVersion`, stays a candidate and is visited on every pass
+//! (counted as [`BackfillSummary::filtered`], not as owed a vector); the first
+//! visit deletes a vector it had. Paging strictly
 //! past the last id a page saw, ordered by id, guarantees every candidate at
 //! the moment this pass started is visited exactly once, however many of
 //! them end up unembedded anyway.
@@ -40,8 +44,9 @@
 //!
 //! The graph itself is unchanged by this feature, so an index built before
 //! GM-395 needs no reindex - "embeddings complete" is recorded nowhere on
-//! disk; this pass's own `COUNT(*)` query *is* the check, and it is `0`,
-//! quickly, once every embeddable node already has a row. A side effect
+//! disk; this pass's own `COUNT(*)` query *is* the check, and it settles,
+//! quickly, at the count of candidates that get no vector (filtered, or
+//! text that trims to nothing) once every embeddable node has a row. A side effect
 //! worth having: a project whose model was not available at index time (or
 //! whose weights simply had not been fetched yet) gets embedded on the next
 //! restart that finds one, with no reindex required.
@@ -55,13 +60,27 @@
 //! reaches an existing index: every old row is
 //! re-embedded by this pass on the next start, with no reindex and no schema
 //! change, and `vectors::insert` overwrites it in place.
+//!
+//! # Vectors stored before the noise rule
+//!
+//! A node `embedding::text::is_noise` filters may still hold a vector from
+//! before the rule existed, at the current `embeddingVersion` (the rule did
+//! not change the text form's tag). Such a node is no candidate above, so the
+//! page loop never reaches it. [`purge_noise_vectors`] does, once per index
+//! and per rule generation (`embedding::text::NOISE_RULE_VERSION`, recorded
+//! in the `embedding_noise_purge` table): it pages through every node that
+//! has a vector, deletes the ones the rule filters, and records the
+//! generation. It runs ahead of the model check, since deleting needs no
+//! model; an interrupted purge records nothing and runs again next start.
 
 use rusqlite::{Connection, Result as SqlResult};
 
 use crate::daemon::indexing_status::IndexingStatus;
+use crate::embedding::text::{is_noise, EmbedInput, NOISE_RULE_VERSION};
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::storage::index_store::{IndexStore, Unit};
 use crate::storage::write::{Diff, NodeRecord};
+use crate::storage::{schema, vectors};
 
 /// Keyset page size. Small enough that one page's inference plus its commit
 /// is a reasonable amount of work to redo if the daemon is killed mid-pass -
@@ -96,21 +115,36 @@ pub const PANIC_ENV: &str = "G_MESH_EMBED_PASS_PANIC";
 pub struct BackfillSummary {
     /// Candidate rows this pass owed the project when it started - not
     /// necessarily how many it ended up embedding (a node can fail inference,
-    /// or be deleted mid-pass by a concurrent edit).
+    /// or be deleted mid-pass by a concurrent edit). Includes the
+    /// [`filtered`](Self::filtered) ones.
     pub candidates: usize,
+    /// Candidates `embedding::text::is_noise` filtered out: they get no
+    /// vector by design, so they are not owed one.
+    pub filtered: usize,
     /// Vectors the model computed: the embedding cache's misses, as
     /// [`EmbedStats::embedded`] counts them.
     pub embedded: usize,
     /// Vectors the embedding cache served instead. `embedded + cache_hits`
     /// is every vector this pass handed to the store.
     pub cache_hits: usize,
+    /// Vectors [`purge_noise_vectors`] deleted before the pass.
+    pub purged: usize,
+}
+
+impl BackfillSummary {
+    /// The candidates owed a vector: [`candidates`](Self::candidates) less
+    /// the [`filtered`](Self::filtered) ones.
+    pub fn owed_a_vector(&self) -> usize {
+        self.candidates.saturating_sub(self.filtered)
+    }
 }
 
 /// Fills in every `vectors` row this project's graph is currently missing.
 ///
-/// Holds on [`HOLD_FILE_ENV`] first, unconditionally, then returns
-/// immediately - before running a single query - if
-/// [`EmbeddingPipeline::is_available`] says there is no model to run at all.
+/// Holds on [`HOLD_FILE_ENV`] first, unconditionally, then runs
+/// [`purge_noise_vectors`] (no model needed), then returns - before counting
+/// a single candidate - if [`EmbeddingPipeline::is_available`] says there is
+/// no model to run at all.
 /// The hold has to come before that check, not after: a phase-gating test
 /// needs to observe the daemon sitting in
 /// [`Phase::Embedding`](crate::daemon::indexing_status::Phase::Embedding)
@@ -122,8 +156,9 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
     hold_before_first_batch_for_tests();
     panic_before_first_batch_for_tests();
 
+    let purged = purge_noise_vectors(store);
     if !embedding.is_available() {
-        return BackfillSummary::default();
+        return BackfillSummary { purged, ..Default::default() };
     }
 
     store.unit(Unit::Backfill, |store| {
@@ -143,6 +178,7 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
         let mut stats = EmbedStats::default();
         let candidates = candidates.max(0) as usize;
         let mut after_id: Option<String> = None;
+        let mut filtered = 0;
 
         loop {
             let page = match store.step(|conn| fetch_candidate_page(conn, version, after_id.as_deref(), PAGE_SIZE)) {
@@ -158,35 +194,132 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
             if page.is_empty() {
                 break;
             }
-            after_id = Some(page.last().expect("just checked non-empty").0.clone());
+            after_id = Some(page.last().expect("just checked non-empty").id.clone());
             let page_len = page.len() as u64;
 
             let diff =
                 Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
             // Inference runs between the unit's steps.
             let computed = embedding.compute(&diff, &mut stats);
+            filtered += computed.dropped_len();
             store.store_vectors(embedding, &computed);
             progress.add_embed_done(page_len);
         }
 
         embedding.finish_unit("backfill", &stats, started.elapsed());
-        BackfillSummary { candidates, embedded: stats.embedded, cache_hits: stats.hits }
+        BackfillSummary { candidates, filtered, embedded: stats.embedded, cache_hits: stats.hits, purged }
     })
 }
 
-/// One candidate row: a node's id plus the two columns
-/// [`EmbeddingPipeline::compute`] actually reads.
-type Candidate = (String, Option<String>, Option<String>);
+/// Purge page size: rows are read and their noise deleted in one step, so a
+/// page bounds how long the store lock is held.
+const PURGE_PAGE_SIZE: i64 = 1024;
 
-/// Builds a filler [`NodeRecord`] carrying only what
-/// [`EmbeddingPipeline::compute`] actually reads (`id`, `doc_comment`,
-/// `signature`) - every other field is irrelevant here, because this
-/// `Diff` is never handed to [`crate::storage::write::apply_diff`]; it only
-/// exists as `compute`'s input shape. `EmbeddingPipeline::store` re-reads a
-/// node's *real*, current row before writing anything, so a filler kind/name/qualifiedName/filePath/language here can
-/// never leak into a stored answer.
-fn to_node_record((id, doc_comment, signature): Candidate) -> NodeRecord {
-    let mut node = NodeRecord::new(id, "", "", "", "", "");
+/// Deletes the vector of every node [`is_noise`] filters, unless this index
+/// already recorded a purge under [`NOISE_RULE_VERSION`] - see this module's
+/// "Vectors stored before the noise rule" section. Returns how many vectors
+/// it deleted. Best-effort: a failure is logged, and leaves the generation
+/// unrecorded, so the next start runs the purge again.
+pub(crate) fn purge_noise_vectors(store: &IndexStore) -> usize {
+    store.unit(Unit::Backfill, |store| {
+        match store.step(|conn| schema::noise_purge_rule(conn)) {
+            Ok(Some(rule)) if rule == NOISE_RULE_VERSION => return 0,
+            Ok(_) => {}
+            Err(err) => {
+                crate::log_line!("g-mesh daemon: failed to read the embedding noise purge marker ({err:#})");
+                return 0;
+            }
+        }
+        let mut purged = 0;
+        let mut after_id = String::new();
+        loop {
+            match store.step(|conn| purge_noise_page(conn, &after_id, PURGE_PAGE_SIZE)) {
+                Ok((_, None)) => break,
+                Ok((deleted, Some(last_id))) => {
+                    purged += deleted;
+                    after_id = last_id;
+                }
+                Err(err) => {
+                    crate::log_line!(
+                        "g-mesh daemon: failed to purge the vectors of filtered nodes, retrying next start ({err:#})"
+                    );
+                    return purged;
+                }
+            }
+        }
+        if let Err(err) = store.step(|conn| schema::record_noise_purge(conn, NOISE_RULE_VERSION)) {
+            crate::log_line!("g-mesh daemon: {err:#} - the purge runs again next start");
+        }
+        if purged > 0 {
+            crate::log_line!("g-mesh daemon: deleted {purged} vectors of name-only module and test nodes");
+        }
+        purged
+    })
+}
+
+/// One keyset page of the purge: reads the nodes with a vector strictly
+/// after `after_id`, ordered by id, and deletes the vectors of the ones
+/// [`is_noise`] filters. Returns how many it deleted and the page's last id,
+/// `None` once no node is left.
+fn purge_noise_page(
+    conn: &Connection,
+    after_id: &str,
+    limit: i64,
+) -> anyhow::Result<(usize, Option<String>)> {
+    type Row = (String, String, String, String, String, Option<String>, Option<String>);
+    let rows: Vec<Row> = {
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
+             FROM vectors v JOIN nodes n ON n.id = v.nodeId \
+             WHERE v.nodeId > ?1 ORDER BY v.nodeId LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![after_id, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+        })?;
+        rows.collect::<SqlResult<_>>()?
+    };
+    let Some(last_id) = rows.last().map(|row| row.0.clone()) else { return Ok((0, None)) };
+    let mut deleted = 0;
+    for (id, kind, name, qualified_name, file_path, doc, signature) in &rows {
+        let input = EmbedInput {
+            kind,
+            name,
+            qualified_name,
+            file_path,
+            doc: doc.as_deref(),
+            signature: signature.as_deref(),
+        };
+        if is_noise(&input) {
+            vectors::delete(conn, id)?;
+            deleted += 1;
+        }
+    }
+    Ok((deleted, Some(last_id)))
+}
+
+/// One candidate row: a node's id plus the columns
+/// [`EmbeddingPipeline::compute`] actually reads.
+struct Candidate {
+    id: String,
+    kind: String,
+    name: String,
+    qualified_name: String,
+    file_path: String,
+    doc_comment: Option<String>,
+    signature: Option<String>,
+}
+
+/// Builds a [`NodeRecord`] carrying only what
+/// [`EmbeddingPipeline::compute`] actually reads (`id`, `kind`, `name`,
+/// `qualified_name`, `file_path`, `doc_comment`, `signature`) - every other
+/// field is irrelevant here, because this `Diff` is never handed to
+/// [`crate::storage::write::apply_diff`]; it only exists as `compute`'s
+/// input shape. `EmbeddingPipeline::store` re-reads a node's *real*, current
+/// row before writing anything, so a filler language here can never leak
+/// into a stored answer.
+fn to_node_record(candidate: Candidate) -> NodeRecord {
+    let Candidate { id, kind, name, qualified_name, file_path, doc_comment, signature } = candidate;
+    let mut node = NodeRecord::new(id, kind, name, qualified_name, file_path, "");
     node.doc_comment = doc_comment;
     node.signature = signature;
     node
@@ -218,7 +351,8 @@ fn fetch_candidate_page(
     limit: i64,
 ) -> SqlResult<Vec<Candidate>> {
     let mut stmt = conn.prepare(
-        "SELECT n.id, n.docComment, n.signature FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
+        "SELECT n.id, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
+         FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
          WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?3) \
          AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) \
          AND n.id > ?1 ORDER BY n.id LIMIT ?2",
@@ -227,7 +361,15 @@ fn fetch_candidate_page(
     // of them - the same query serves both "from the very start" (`after_id`
     // is `None`) and "strictly after the last page's id" with one statement.
     let rows = stmt.query_map(rusqlite::params![after_id.unwrap_or(""), limit, version], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        Ok(Candidate {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            name: row.get(2)?,
+            qualified_name: row.get(3)?,
+            file_path: row.get(4)?,
+            doc_comment: row.get(5)?,
+            signature: row.get(6)?,
+        })
     })?;
     rows.collect()
 }
@@ -315,7 +457,7 @@ mod tests {
         assert_eq!(count, 2, "only `documented` and `signed_only` are owed an embedding");
 
         let page = fetch_candidate_page(&conn, "v1", None, 256).unwrap();
-        let mut ids: Vec<&str> = page.iter().map(|(id, _, _)| id.as_str()).collect();
+        let mut ids: Vec<&str> = page.iter().map(|c| c.id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec!["documented", "signed_only"]);
     }
@@ -355,7 +497,7 @@ mod tests {
 
         assert_eq!(count_candidates(&conn, &current).unwrap(), 2);
         let page = fetch_candidate_page(&conn, &current, None, 256).unwrap();
-        let ids: Vec<&str> = page.iter().map(|(id, _, _)| id.as_str()).collect();
+        let ids: Vec<&str> = page.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["embedded_by_fp32", "embedded_from_full_text"]);
     }
 
@@ -384,8 +526,8 @@ mod tests {
                 break;
             }
             assert!(page.len() <= 2, "a page must never exceed the requested limit");
-            after_id = Some(page.last().unwrap().0.clone());
-            seen.extend(page.into_iter().map(|(id, _, _)| id));
+            after_id = Some(page.last().unwrap().id.clone());
+            seen.extend(page.into_iter().map(|c| c.id));
         }
 
         seen.sort_unstable();
@@ -448,7 +590,7 @@ mod tests {
     /// `count_candidates` against this test's real schema, finds the one
     /// candidate node below, and `summary.candidates` reads `1`.
     #[test]
-    fn an_unavailable_model_returns_without_running_a_query() {
+    fn an_unavailable_model_returns_before_counting_candidates() {
         let mut conn = open_conn();
         apply_diff(
             &mut conn,
@@ -470,5 +612,144 @@ mod tests {
              one node ({:?}) owed an embedding",
             summary
         );
+    }
+
+    /// An undocumented `pub mod {id}`: noise under the GM-437 rule.
+    fn noise_module(id: &str) -> NodeRecord {
+        let mut node = NodeRecord::new(id, "Module", id, format!("crate::{id}"), "src/lib.rs", "rust");
+        node.signature = Some(format!("pub mod {id}"));
+        node
+    }
+
+    /// An index holding `nodes`, each with a vector made before the filter
+    /// (at the version `v1`) when its id is in `with_vectors`.
+    fn index_with(nodes: Vec<NodeRecord>, with_vectors: &[&str]) -> IndexStore {
+        let mut conn = open_conn();
+        apply_diff(&mut conn, &Diff { upsert_nodes: nodes, ..Default::default() }).unwrap();
+        for id in with_vectors {
+            insert_vector(&conn, id);
+        }
+        IndexStore::new(conn)
+    }
+
+    fn insert_vector(conn: &Connection, id: &str) {
+        crate::storage::vectors::insert(conn, id, &[0.0; crate::embedding::EMBEDDING_DIM], "v1").unwrap();
+    }
+
+    fn vector_ids(store: &IndexStore) -> Vec<String> {
+        store.with(|conn| {
+            let mut stmt = conn.prepare("SELECT nodeId FROM vectors ORDER BY nodeId").unwrap();
+            stmt.query_map([], |row| row.get(0)).unwrap().collect::<SqlResult<_>>().unwrap()
+        })
+    }
+
+    fn marker(store: &IndexStore) -> Option<String> {
+        store.with(|conn| schema::noise_purge_rule(conn).unwrap())
+    }
+
+    /// The design note's survivors of the purge: a documented module and a
+    /// name-only fn that is no test.
+    fn kept_nodes() -> Vec<NodeRecord> {
+        let mut documented = noise_module("documented");
+        documented.doc_comment = Some("Semantic search.".to_string());
+        vec![documented, node("signed", None, Some("fn signed()"))]
+    }
+
+    /// A noise node is a backfill candidate that never reaches the model and
+    /// gets no vector; it is counted as filtered, not as owed a vector.
+    /// Control: `compute` pushing a noise node's `text_to_embed` text into
+    /// `pending` embeds it.
+    #[test]
+    fn backfill_gives_a_noise_node_no_vector() {
+        use crate::embedding::pipeline::test_support::{fake_model_dir, fake_pipeline, Counters};
+        crate::storage::vectors::register_extension();
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+        let counters = Counters::default();
+        let pipeline = fake_pipeline(&model_dir, None, &counters);
+        let store =
+            index_with(vec![noise_module("semantic"), node("read", Some("Reads a file."), None)], &[]);
+
+        let summary = run(&store, &pipeline, &IndexingStatus::structural());
+
+        assert_eq!(vector_ids(&store), vec!["read"]);
+        assert_eq!(counters.received(), vec!["Reads a file.".to_string()], "only `read` reaches the model");
+        assert_eq!((summary.candidates, summary.filtered, summary.embedded), (2, 1, 1), "{summary:?}");
+        assert_eq!(summary.owed_a_vector(), 1, "{summary:?}");
+    }
+
+    /// The one-time purge deletes a vector a noise node got before the
+    /// filter, with no model at all, keeps every other vector, and records
+    /// the rule's generation.
+    /// Control: running `purge_noise_vectors` after the `is_available`
+    /// return leaves `semantic`'s vector; deleting every row in
+    /// `purge_noise_page` (no `is_noise` check) loses the kept ones.
+    #[test]
+    fn the_purge_deletes_pre_filter_noise_vectors_without_a_model_and_keeps_the_rest() {
+        let mut nodes = kept_nodes();
+        nodes.push(noise_module("semantic"));
+        let store = index_with(nodes, &["documented", "semantic", "signed"]);
+
+        let summary = run(&store, &EmbeddingPipeline::disabled(), &IndexingStatus::structural());
+
+        assert_eq!(summary.purged, 1, "{summary:?}");
+        assert_eq!(vector_ids(&store), vec!["documented", "signed"]);
+        assert_eq!(marker(&store).as_deref(), Some(NOISE_RULE_VERSION));
+    }
+
+    /// Once the marker holds the current generation the purge does not run
+    /// again: a noise vector stored after it stays. A marker from another
+    /// generation purges again and records the current one.
+    /// Control: dropping the early return on a current marker purges on
+    /// the second run.
+    #[test]
+    fn the_purge_runs_once_per_rule_version() {
+        let store = index_with(vec![noise_module("semantic")], &["semantic"]);
+        let pipeline = EmbeddingPipeline::disabled();
+        let progress = IndexingStatus::structural();
+        assert_eq!(run(&store, &pipeline, &progress).purged, 1);
+
+        store.with(|conn| insert_vector(conn, "semantic"));
+        assert_eq!(run(&store, &pipeline, &progress).purged, 0, "a current marker skips the purge");
+        assert_eq!(vector_ids(&store), vec!["semantic"]);
+
+        store.with(|conn| schema::record_noise_purge(conn, "0").unwrap());
+        assert_eq!(run(&store, &pipeline, &progress).purged, 1, "an older generation purges again");
+        assert!(vector_ids(&store).is_empty());
+        assert_eq!(marker(&store).as_deref(), Some(NOISE_RULE_VERSION));
+    }
+
+    /// A purge that fails records no marker, so the next start runs it
+    /// again and then records it.
+    /// Control: `break` instead of `return purged` on a page error records
+    /// the marker after the failure.
+    #[test]
+    fn a_failed_purge_records_no_marker_and_runs_again_next_start() {
+        let store = index_with(vec![noise_module("semantic")], &["semantic"]);
+        store.with(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER refuse_delete BEFORE DELETE ON vectors BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap()
+        });
+
+        assert_eq!(purge_noise_vectors(&store), 0);
+        assert_eq!(marker(&store), None, "a failed purge must not record its generation");
+        assert_eq!(vector_ids(&store), vec!["semantic"]);
+
+        store.with(|conn| conn.execute_batch("DROP TRIGGER refuse_delete;").unwrap());
+        assert_eq!(purge_noise_vectors(&store), 1, "the next start purges");
+        assert_eq!(marker(&store).as_deref(), Some(NOISE_RULE_VERSION));
+    }
+
+    /// The count the start and reindex logs report leaves out filtered
+    /// candidates; a pass whose candidates are all noise owes nothing (the
+    /// daemon log stays silent on it).
+    #[test]
+    fn owed_a_vector_leaves_out_the_filtered_candidates() {
+        let all_noise = BackfillSummary { candidates: 5, filtered: 5, ..Default::default() };
+        assert_eq!(all_noise.owed_a_vector(), 0);
+        let mixed = BackfillSummary { candidates: 12, filtered: 2, embedded: 10, ..Default::default() };
+        assert_eq!(mixed.owed_a_vector(), 10);
     }
 }

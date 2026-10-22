@@ -159,9 +159,10 @@ end to end on Windows — that is GM-333 (a release-workflow step that runs
 each published artifact on its own runner), a separate, narrower claim than
 "the installer downloads, verifies and unpacks it correctly."
 
-**Until a release is published, this installs nothing.** Releases are built as
-drafts and are invisible — and their download URLs 404 — until a human presses
-Publish (see "Cutting a release" below). The script says exactly that, with
+**Until a release is published, this installs nothing.** A release is created
+as a draft, invisible with 404 download URLs, and published by the release
+workflow once every asset is uploaded (see "Cutting a release" below). A build
+that is still running or failed leaves nothing to install. The script says exactly that, with
 what to do about it, instead of showing a bare 404 — until then the
 build-from-source path below is the only one that works.
 
@@ -390,21 +391,27 @@ Oniguruma, tree-sitter grammars) for that target.
    3.8.0 through 3.10.1 were merged locally and reached `main` without a
    single CI run, which is how v3.10.0 was tagged with nothing to publish
    (GM-391).
-2. Merge the release branch (with `core/Cargo.toml` — and, since GM-288,
-   `wire/Cargo.toml`, `plugins/sdk/Cargo.toml`, `plugins/rust/Cargo.toml` and,
-   since GM-298, `plugins/python/Cargo.toml`, which must all agree with it —
+2. Merge the release branch (with `core/Cargo.toml`, `wire/Cargo.toml`,
+   `walk/Cargo.toml` and `plugins/sdk/Cargo.toml`, which must all agree,
    already bumped to the new version) into `main` with `--no-ff` and the
-   subject `merge: release-<version> into main`.
+   subject `merge: release-<version> into main`. `plugins/rust`,
+   `plugins/python` and `plugins/typescript` carry their own version: bump a
+   plugin's `Cargo.toml` and `plugin.toml` only if it changed since the
+   previous release tag (see `docs/architecture/plugin-modularity.md`,
+   "`plugin_version`: two rules, not one").
 3. Run `scripts/cut-release.sh <version>` on `main`. It refuses unless the
    merged release commit is the tip of `origin/release-<version>` and has a
    successful `ci.yml` run — so step 1 cannot be skipped silently. It verifies the crate
-   version (every workspace member's, not only core's), working tree and
+   version (core's and every release-versioned member's, plus each
+   workspace plugin's own version rule), working tree and
    branch state, runs `cargo test --workspace`, and creates an annotated
    `v<version>` tag locally — it does not push by default, since pushing the
-   tag is what starts the public four-platform build and drafts a Release.
+   tag is what starts the public four-platform build and a Release.
    Pass `--push` to push it in the same step, or run the printed
    `git push origin v<version>` yourself when ready.
-4. Once the build finishes, approve the draft on GitHub.
+4. The tag run publishes the Release after all four legs pass. If the
+   `publish` job fails, fix the cause and re-run the job: it publishes a
+   Release that is still a draft.
 
 ## How it finds a project
 

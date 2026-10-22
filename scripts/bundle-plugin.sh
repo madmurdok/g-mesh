@@ -48,8 +48,8 @@
 # its `command` line rewritten to `./<exe name staged beside it>`, the same
 # one-substitution pattern the Rust and Python bundlers use, so
 # `plugin_version` and every other table are carried over unchanged:
-# `plugin_version` tracks the release (GM-303's rule for a workspace member),
-# and scripts/cut-release.sh checks it against this crate's Cargo.toml.
+# `plugin_version` equals this crate's version, and scripts/cut-release.sh
+# checks it against this crate's Cargo.toml.
 #
 # Cargo names a Windows build `<bin>.exe` on its own, so `exe_name_for` only
 # has to know the filename that will exist on disk.

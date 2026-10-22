@@ -221,6 +221,41 @@ token_type_ids = false
 text = "first-paragraph"
 context = "path-parent-shuffled"
 
+# --- GM-437: production's noise filter -------------------------------------
+# `filter = "noise"` leaves out the nodes `embedding::text::is_noise` filters
+# (undocumented name-only modules and tests), so the candidate set shrinks; a
+# gold on a filtered node scores as a miss. Each row is its base row plus the
+# filter: fp32 against the reference, int8 via `report --reference
+# jina-v2-base-code-int8`.
+
+[[variant]]
+name = "jina-v2-base-code-fp32-noise"
+arm = "model"
+role = "cost"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model.onnx"
+model_dir = "~/.g-mesh/models/jina-embeddings-v2-base-code"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+filter = "noise"
+
+[[variant]]
+name = "jina-v2-base-code-int8-noise"
+arm = "model"
+role = "cost"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model_quantized.onnx"
+model_dir = "work/models/jina-v2-base-code-int8"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+filter = "noise"
+
 # --- broken arms (D7) -------------------------------------------------------
 
 [[variant]]

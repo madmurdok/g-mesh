@@ -31,6 +31,7 @@ fn creates_all_tables_and_indexes() {
             "containers",
             "declarations",
             "edges",
+            "embedding_noise_purge",
             "indexed_files",
             "language_outcome",
             "language_retry",

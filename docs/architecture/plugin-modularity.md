@@ -274,52 +274,54 @@ see [`multi-language-plugins.md`](./multi-language-plugins.md)'s "`plugin.toml`
 additions" section for the full field list, defaults, and the rationale behind
 each one — not repeated here.
 
-**`plugin_version`: two rules, not one (GM-303).** It is what
-`g-mesh plugins list` prints and what core names in a protocol-mismatch
-message, so whichever rule applies to a given plugin, it is the number a
-person reads first when reporting a bug about it — and it must therefore
-never be free-form the way the original comment above called it. Which rule
-applies depends on how the plugin is built, and conflating the two is exactly
-the mistake to avoid:
+**`plugin_version`: two rules, not one.** It is what `g-mesh plugins list`
+prints and what core names in a protocol-mismatch message, so it is the
+number a person reads first when reporting a bug about a plugin. It names the
+plugin's build, never the g-mesh release: a plugin's number changes only when
+the plugin does. Which of two rules enforces that depends on how the plugin
+is built:
 
-- **`plugins/rust` and `plugins/python` are ordinary members of this
-  repository's own cargo workspace** (see `Cargo.toml` and the GM-288 header
-  in `scripts/cut-release.sh`). Their crate `version` is already forced to
-  equal core's own at every release cut, so `plugin_version` tracking that
-  crate version — `the_manifest_version_matches_the_crates` in each plugin's
-  `src/semantic.rs`, added by GM-290 and GM-299 after finding the two had
-  drifted — makes it, transitively, **the g-mesh release version**. A plugin
-  that joins the cargo workspace follows this rule.
-- **`plugins/go` and `plugins/typescript` are not workspace members at all** —
-  a separate Go module and a separate npm package, each with its own release
-  history, bumped by hand for the plugin's *own* capability changes and
-  nothing else (`plugins/typescript/package.json`: 2.0.0 → 2.1.0 for becoming
-  a self-contained Node SEA, → 2.2.0 for the `--run-node` entry path;
-  `plugins/go/wire.go`'s `pluginVersion` const: 0.1.0 → 0.2.0 for the
-  go/types semantic tier). Tying these to the release version would make the
-  number lie — g-mesh 3.5.0 shipped no change to the Go plugin at all — so
-  what has to hold instead is **internal agreement**: `plugin.toml`'s copy
-  against the plugin's own manifest of record (`package.json`'s `.version`,
-  or the `pluginVersion` const), which each plugin's own test already checks
-  (`every_declaration_of_the_bundled_plugins_version_agrees` in
-  `core/src/daemon/manifest.rs`; `TestPluginVersionMatchesTheManifest` in
-  `plugins/go/manifest_test.go`) and `scripts/cut-release.sh` re-checks
-  directly, so the drift is caught even under `--skip-tests` and without a Go
-  toolchain on `PATH`. A plugin built by its own separate toolchain — not
-  added to the cargo workspace — follows this rule instead.
+- **`plugins/rust`, `plugins/python` and `plugins/typescript` are members of
+  this repository's cargo workspace that carry their own version.**
+  `plugin_version` equals the crate's `[package] version`
+  (`the_manifest_version_matches_the_crates` in each plugin's tests pins it),
+  and the two are bumped together only when the plugin changed since the
+  previous release tag. `scripts/cut-release.sh`
+  (`check_crate_backed_plugin_versions`) refuses the cut when the two
+  disagree, when the version is lower than at the previous tag, or when the
+  plugin changed and its version did not move; a bump without a change is
+  accepted and logged. What counts as a change is what the plugin binary is
+  built from:
+  - the plugin's own `src/`, and `src/` of the crates it builds on:
+    `plugins/sdk`, `wire`, `walk`;
+  - the plugin's `Cargo.toml` and `plugin.toml`, and the `Cargo.toml` of sdk,
+    wire and walk, each compared without its own version line. sdk, wire and
+    walk keep the release version, so the release bump is not a change;
+  - the registry and git packages the plugin reaches in `Cargo.lock`. Path
+    packages (workspace members) are walked through but not compared, for
+    the same reason. The lock does not tell dev-dependencies apart, so a
+    dev-dependency upgrade counts too.
 
-**4.0.0:** `plugins/typescript` became a Rust crate in the cargo workspace
-and moved to the first rule: its `plugin_version` equals its crate version,
-`scripts/cut-release.sh` lists it with rust and python, and the
-`package.json` comparison (script gate and core test) is retired. Only
-`plugins/go` follows the second rule now.
+  Tests, conformance fixtures, READMEs, `package.json` and every other path
+  do not count. Core and the three shared crates keep the release version; a
+  release bump touches only their four `Cargo.toml`.
+- **`plugins/go` is not a workspace member** — a separate Go module, bumped by
+  hand for the plugin's own capability changes (`plugins/go/wire.go`'s
+  `pluginVersion` const). What has to hold is **internal agreement**:
+  `plugin.toml`'s copy against the `pluginVersion` const, which
+  `TestPluginVersionMatchesTheManifest` in `plugins/go/manifest_test.go`
+  checks and `scripts/cut-release.sh` re-checks directly, so drift is caught
+  even under `--skip-tests` and without a Go toolchain on `PATH`.
 
-A fifth plugin's author: pick the rule by which category the plugin falls
-into (joins the cargo workspace, or ships its own toolchain), add it to the
-matching list in `scripts/cut-release.sh`, and this file's example above
-still applies unchanged — only which rule the number obeys was ever in
-question, not the field's existence or its meaning to a reader of
-`g-mesh plugins list`.
+The release archive's plugin assets are named after **core's** version
+(`g-mesh-plugin-<lang>-v<core>-<target>.tar.gz`, fetched from tag
+`v<core>`): the asset name says which release it came from, the
+`plugin_version` inside it says which plugin build.
+
+A new plugin's author: pick the rule by which category the plugin falls into
+(joins the cargo workspace, or ships its own toolchain), add it to the
+matching list in `scripts/cut-release.sh` (`CRATE_BACKED_PLUGINS` for a
+workspace plugin), and this file's example above still applies unchanged.
 
 **Built-in baseline ignore, applied to every plugin regardless of
 manifest**: `.git`, `node_modules`, `__pycache__`, `.venv`, `venv`,

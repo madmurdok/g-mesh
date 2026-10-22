@@ -2,7 +2,8 @@
 #
 # One command to validate, test and tag a release, instead of the four manual
 # steps described in .github/workflows/release.yml's header (check the crate
-# version, run the workflow once by hand, tag, approve the draft). The version
+# version, run the workflow once by hand, tag; release.yml publishes the
+# release). The version
 # is typed here exactly once.
 #
 #   scripts/cut-release.sh <version>              # verify, test, tag locally
@@ -33,59 +34,59 @@
 # `build-targets.sh`, `prepare-release-assets.sh`, `release.yml`, this file,
 # and README.md's own release checklist), this script instead grows the same
 # check it already runs to cover every workspace member: `core/Cargo.toml`
-# stays the one manifest whose version *names* the release, and every other
-# member's version is checked to equal it, in `check_workspace_versions`
+# stays the one manifest whose version *names* the release, and wire's,
+# walk's and plugins/sdk's versions are checked to equal it (the three
+# language plugins carry their own, see below), in `check_workspace_versions`
 # below, before a single test runs. A member added to the workspace later
 # that forgets this gets caught here, not after a release ships with it
 # silently stale - which is the whole reason this got written down instead of
 # only fixed: this decision is what the next language plugin's manifest
 # should follow too.
 #
-# GM-303: `plugin.toml`'s own `plugin_version` - a different field from every
-# manifest `[package] version` above, and checked by a different rule, not
-# the same one repeated. `g-mesh plugins list` prints it and core names it in
-# a protocol-mismatch message, so whichever rule applies to a given plugin is
-# the number a person reads first about it - and the four bundled plugins do
-# not all follow the same one:
+# `plugin.toml`'s own `plugin_version` is a different field from every
+# manifest `[package] version` above, checked by a different rule. `g-mesh
+# plugins list` prints it and core names it in a protocol-mismatch message,
+# so it is the number a person reads first about a plugin. It names the
+# plugin build, never the release: the release archive's asset names carry
+# core's version, and a plugin's `plugin_version` changes only when the
+# plugin does.
 #
-#   - plugins/rust, plugins/python and plugins/typescript ARE cargo workspace
-#     members (their Cargo.toml is already in OTHER_WORKSPACE_MANIFESTS
-#     above), and `plugin_version` equals ITS crate's version (rust and
-#     python each have a `the_manifest_version_matches_the_crates` test for
-#     it, added by GM-290 and GM-299 after finding it had drifted -
-#     plugins/rust/plugin.toml still said 0.1.0 three releases after the crate
-#     reached 3.3.0). Chained with the check above, that makes
-#     `plugin_version` the release version for these three, transitively - so
-#     `check_crate_backed_plugin_versions` below checks it directly against
-#     `$crate_version`, the same way `check_workspace_versions` does for the
-#     Cargo manifests. TypeScript moved to this rule in 4.0.0, when it became
-#     a Rust crate; the package.json comparison that used to gate it is
-#     retired.
+#   - plugins/rust, plugins/python and plugins/typescript are cargo workspace
+#     members that carry their own version: `plugin_version` equals the
+#     crate's `[package] version` (each crate's
+#     `the_manifest_version_matches_the_crates` test pins this too), and the
+#     two are bumped together only when the plugin changed since the previous
+#     release tag. `check_crate_backed_plugin_versions` below enforces both:
+#     the agreement, and the change rule. A plugin changed when its shipped
+#     inputs differ from the tag: its own and plugins/sdk's, wire's and walk's
+#     `src/`; its own `Cargo.toml` and `plugin.toml` and sdk's, wire's and
+#     walk's `Cargo.toml`, each with its own version line ignored (so the
+#     release bump of sdk/wire/walk is not a change); and the registry/git
+#     packages its `Cargo.lock` dependency closure reaches. Tests, fixtures,
+#     READMEs and every other path do not count. A changed plugin whose
+#     version did not move, or a version lower than at the tag, stops the cut;
+#     a bump without a change is accepted and logged.
 #   - plugins/go is NOT a workspace member - a separate Go module, bumped by
-#     hand for the plugin's OWN capability changes and nothing else
-#     (plugins/go/wire.go's `pluginVersion` const: 0.1.0 -> 0.2.0 for the
-#     go/types semantic tier). Forcing it to the release version would make
-#     the number lie - g-mesh 3.5.0 shipped no change to the Go plugin at
-#     all - so what `check_self_versioned_plugin_versions` below checks
-#     instead is INTERNAL agreement: plugin.toml's copy against the
+#     hand for the plugin's own capability changes (plugins/go/wire.go's
+#     `pluginVersion` const). What `check_self_versioned_plugin_versions`
+#     below checks is internal agreement: plugin.toml's copy against the
 #     `pluginVersion` const. `TestPluginVersionMatchesTheManifest` in
-#     plugins/go/manifest_test.go tests this too - this script re-checks it
-#     directly by reading the files, so drift is still caught under
-#     --skip-tests, and without a Go toolchain on PATH (`go test` cannot run
-#     at all then).
+#     plugins/go/manifest_test.go tests this too; this script re-checks it by
+#     reading the files, so drift is still caught under --skip-tests and
+#     without a Go toolchain on PATH.
 #
 # docs/architecture/plugin-modularity.md ("plugin_version: two rules, not
-# one") is where a plugin author reads this before adding a fifth plugin;
-# this comment is the enforcement side of that same decision.
+# one") is where a plugin author reads this before adding a plugin; this
+# comment is the enforcement side of that same rule.
 #
 # It tags `main`, and only after the release branch has already been merged
 # into it - the tag is meant to point at the code someone gets by cloning, not
 # at a branch tip nobody else can see. It does not create the release branch,
-# does not merge anything, does not publish the draft Release GitHub builds
-# (that stays a human decision, per #67's design), and does not touch the
-# task tracker.
+# does not merge anything, does not publish the Release GitHub builds
+# (release.yml publishes it when all four builds pass), and does not touch
+# the task tracker.
 #
-# Pushing the tag starts a public four-platform build and a draft Release, so
+# Pushing the tag starts a public four-platform build and a Release, so
 # it takes the explicit --push above; without it, the tag is created locally
 # and the exact command to push it is printed instead.
 #
@@ -187,7 +188,9 @@
 #   - `core/Cargo.toml`'s version disagreeing with the argument
 #   - any other workspace member's version disagreeing with core's (GM-288)
 #   - plugins/rust's, plugins/python's or plugins/typescript's plugin.toml
-#     `plugin_version` disagreeing with core's version (GM-303)
+#     `plugin_version` disagreeing with its own Cargo.toml version, or that
+#     plugin having changed since the previous release tag without a version
+#     bump, or its version being lower than at that tag
 #   - plugins/go's plugin.toml `plugin_version` disagreeing with the Go
 #     plugin's own `pluginVersion` const (GM-303)
 #   - core's own normal dependency graph reaching serde_json's
@@ -238,9 +241,6 @@ OTHER_WORKSPACE_MANIFESTS=(
 	"wire/Cargo.toml"
 	"walk/Cargo.toml"
 	"plugins/sdk/Cargo.toml"
-	"plugins/rust/Cargo.toml"
-	"plugins/python/Cargo.toml"
-	"plugins/typescript/Cargo.toml"
 )
 
 # The `version` of a manifest's `[package]` section. Same restriction as
@@ -284,14 +284,23 @@ check_workspace_versions() {
 	log "workspace versions agree: $core_version (core, ${OTHER_WORKSPACE_MANIFESTS[*]})"
 }
 
-# GM-303: bundled plugins whose plugin.toml `plugin_version` must equal the
-# release version because the crate it's built from already does (see this
-# script's header comment for the full rule and why Go is not here). A new cargo-workspace plugin's manifest is a deliberate addition to
-# this list, the same fail-closed shape OTHER_WORKSPACE_MANIFESTS uses.
-CRATE_BACKED_PLUGIN_MANIFESTS=(
-	"plugins/rust/plugin.toml"
-	"plugins/python/plugin.toml"
-	"plugins/typescript/plugin.toml"
+# The cargo-workspace language plugins, by directory under plugins/. Each
+# carries its own version and is checked by `check_crate_backed_plugin_versions`
+# (see this script's header comment for the rule, and why Go is not here). A
+# new cargo-workspace plugin is a deliberate addition to this list, the same
+# fail-closed shape OTHER_WORKSPACE_MANIFESTS uses.
+CRATE_BACKED_PLUGINS=(
+	rust
+	python
+	typescript
+)
+
+# The release-versioned crates every plugin in CRATE_BACKED_PLUGINS is built
+# from. Their `src/` and `Cargo.toml` are shipped inputs of each plugin.
+PLUGIN_SHARED_CRATES=(
+	plugins/sdk
+	wire
+	walk
 )
 
 # The `plugin_version` of a plugin.toml's `[plugin]` section. Same
@@ -307,31 +316,216 @@ plugin_toml_version() {
 	' "$1"
 }
 
-# Refuses if plugins/rust's or plugins/python's plugin.toml `plugin_version`
-# disagrees with `$core_version` - the release-tracking half of GM-303's
-# rule. Collects every mismatch before dying, same reasoning as
-# `check_workspace_versions`.
-check_crate_backed_plugin_versions() {
-	local core_version="$1" manifest path mismatches=()
-	for manifest in "${CRATE_BACKED_PLUGIN_MANIFESTS[@]}"; do
-		path="$REPO_ROOT/$manifest"
-		[ -f "$path" ] || die "plugin manifest not found: $manifest (update CRATE_BACKED_PLUGIN_MANIFESTS in this script if it moved or was removed)"
-		local plugin_version
-		plugin_version="$(plugin_toml_version "$path")"
-		[ -n "$plugin_version" ] || die "could not determine plugin_version from $manifest"
-		if [ "$plugin_version" != "$core_version" ]; then
-			mismatches+=("$manifest says $plugin_version")
+# The `name` of a manifest's `[package]` section.
+package_name() {
+	awk '
+		/^\[/ { in_package = ($0 == "[package]") }
+		in_package && /^name[[:space:]]*=/ {
+			gsub(/[",]/, "", $3); print $3; exit
+		}
+	' "$1"
+}
+
+# The newest `v*` tag reachable from HEAD other than `v$1` (the tag this run
+# creates). Prints nothing when there is none, or when $REPO_ROOT is not a git
+# repository.
+previous_release_tag() {
+	local current="v$1" tag
+	while IFS= read -r tag; do
+		[ "$tag" = "$current" ] && continue
+		printf '%s\n' "$tag"
+		return 0
+	done < <(git -C "$REPO_ROOT" tag --merged HEAD -l 'v[0-9]*' --sort=-v:refname 2>/dev/null)
+}
+
+# The manifest on stdin (a Cargo.toml or a plugin.toml) without its own
+# version line, `[package] version` or `[plugin] plugin_version`. Two copies
+# that differ only by a version bump print the same; a `version` key in any
+# other section is kept.
+strip_version() {
+	awk '
+		/^\[/ { section = $0 }
+		section == "[package]" && /^version[[:space:]]*=/ { next }
+		section == "[plugin]" && /^plugin_version[[:space:]]*=/ { next }
+		{ print }
+	'
+}
+
+# `name version source` of every package the crate named $1 reaches in the
+# Cargo.lock on stdin, sorted, for packages with a `source` (registry or git)
+# only. Path packages (workspace members) have no `source`: they are walked
+# through but never printed, so a member's version bump does not show up here.
+# A dependency written without a version matches every package of that name.
+# The lock does not tell dev-dependencies apart, so they are reached too.
+# Prints nothing if the crate is not in the lock.
+lock_closure() {
+	awk -v root="$1" '
+		function flush() {
+			if (name != "") { n++; pname[n] = name; pver[n] = ver; psrc[n] = src; pdeps[n] = deps }
+			name = ""; ver = ""; src = ""; deps = ""; in_deps = 0
+		}
+		function add_deps(text,    m, k, items, item) {
+			m = split(text, items, ",")
+			for (k = 1; k <= m; k++) {
+				item = items[k]
+				gsub(/"/, "", item); gsub(/\[/, "", item); gsub(/\]/, "", item)
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", item)
+				if (item != "") deps = deps "|" item
+			}
+		}
+		/^\[\[package\]\]/ { flush(); in_pkg = 1; next }
+		/^\[/ { flush(); in_pkg = 0; next }
+		!in_pkg { next }
+		in_deps {
+			if ($0 ~ /^[[:space:]]*\]/) { in_deps = 0; next }
+			add_deps($0); next
+		}
+		/^name[[:space:]]*=/ { name = $0; sub(/^[^"]*"/, "", name); sub(/".*$/, "", name); next }
+		/^version[[:space:]]*=/ { ver = $0; sub(/^[^"]*"/, "", ver); sub(/".*$/, "", ver); next }
+		/^source[[:space:]]*=/ { src = $0; sub(/^[^"]*"/, "", src); sub(/".*$/, "", src); next }
+		/^dependencies[[:space:]]*=/ {
+			rest = $0; sub(/^[^\[]*\[/, "", rest)
+			if (rest ~ /\]/) { add_deps(rest) } else { add_deps(rest); in_deps = 1 }
+			next
+		}
+		END {
+			flush()
+			for (i = 1; i <= n; i++) if (pname[i] == root) { seen[i] = 1; queue[++tail] = i }
+			while (head < tail) {
+				i = queue[++head]
+				m = split(pdeps[i], d, "|")
+				for (k = 1; k <= m; k++) {
+					if (d[k] == "") continue
+					split(d[k], f, " ")
+					for (j = 1; j <= n; j++) {
+						if (!(j in seen) && pname[j] == f[1] && (f[2] == "" || pver[j] == f[2])) {
+							seen[j] = 1; queue[++tail] = j
+						}
+					}
+				}
+			}
+			for (j in seen) if (psrc[j] != "") print pname[j], pver[j], psrc[j]
+		}
+	' | sort
+}
+
+# Prints the shipped inputs of plugins/$1 that differ between tag $2 and the
+# working tree, one per line, and nothing when the plugin did not change. The
+# shipped inputs are: the plugin's and PLUGIN_SHARED_CRATES' `src/`; the
+# plugin's `Cargo.toml` and `plugin.toml` and PLUGIN_SHARED_CRATES'
+# `Cargo.toml`, each without its own version line (`strip_version`); and the
+# plugin's registry/git dependency closure in Cargo.lock (`lock_closure`). A
+# manifest missing on one side and present on the other counts as changed.
+# Nothing else does (tests/, conformance/, README.md, package.json, sdk's
+# fixture binaries, ...).
+plugin_changed_since() {
+	local dir="plugins/$1" tag="$2" shared manifest crate
+	local src_dirs=("$dir/src") manifests=("$dir/Cargo.toml" "$dir/plugin.toml")
+	for shared in "${PLUGIN_SHARED_CRATES[@]}"; do
+		src_dirs+=("$shared/src")
+		manifests+=("$shared/Cargo.toml")
+	done
+
+	git -C "$REPO_ROOT" diff --name-only "$tag" -- "${src_dirs[@]}" || return 1
+
+	for manifest in "${manifests[@]}"; do
+		if ! cmp -s \
+			<(git -C "$REPO_ROOT" show "$tag:$manifest" 2>/dev/null | strip_version) \
+			<(strip_version < "$REPO_ROOT/$manifest" 2>/dev/null); then
+			echo "$manifest"
 		fi
 	done
-	if [ ${#mismatches[@]} -gt 0 ]; then
+
+	crate="$(package_name "$REPO_ROOT/$dir/Cargo.toml")"
+	if ! cmp -s \
+		<(git -C "$REPO_ROOT" show "$tag:Cargo.lock" 2>/dev/null | lock_closure "$crate") \
+		<(lock_closure "$crate" < "$REPO_ROOT/Cargo.lock" 2>/dev/null); then
+		echo "Cargo.lock: $crate dependency closure"
+	fi
+}
+
+# For each plugin in CRATE_BACKED_PLUGINS, refuses if
+#   (a) its plugin.toml `plugin_version` differs from its Cargo.toml
+#       `[package] version` (checked even without a previous tag, and under
+#       --skip-tests), or, against the previous release tag
+#       (`previous_release_tag "$1"`):
+#   (b) its version is lower than at that tag, or
+#   (c) it changed since that tag (`plugin_changed_since`) and its version
+#       did not move.
+# A plugin absent at the tag is new and passes (b) and (c); a bump without a
+# change passes with a log line. With no previous tag, (b) and (c) are
+# skipped with a log line. $1 is the release version, used only to skip its
+# own tag. Collects every refusal before dying, same reasoning as
+# `check_workspace_versions`.
+check_crate_backed_plugin_versions() {
+	local release_version="$1" plugin dir cargo_toml plugin_toml
+	local crate_version toml_version prev_tag prev_version changed summary
+	local refusals=() agreed=()
+
+	prev_tag="$(previous_release_tag "$release_version")"
+	if [ -z "$prev_tag" ]; then
+		log "no earlier v* release tag reachable from HEAD: skipping the plugin change rule, checking plugin.toml/Cargo.toml agreement only"
+	fi
+
+	for plugin in "${CRATE_BACKED_PLUGINS[@]}"; do
+		dir="plugins/$plugin"
+		cargo_toml="$REPO_ROOT/$dir/Cargo.toml"
+		plugin_toml="$REPO_ROOT/$dir/plugin.toml"
+		[ -f "$cargo_toml" ] || die "plugin manifest not found: $dir/Cargo.toml (update CRATE_BACKED_PLUGINS in this script if it moved or was removed)"
+		[ -f "$plugin_toml" ] || die "plugin manifest not found: $dir/plugin.toml (update CRATE_BACKED_PLUGINS in this script if it moved or was removed)"
+		crate_version="$(package_version "$cargo_toml")"
+		[ -n "$crate_version" ] || die "could not determine version from $dir/Cargo.toml"
+		toml_version="$(plugin_toml_version "$plugin_toml")"
+		[ -n "$toml_version" ] || die "could not determine plugin_version from $dir/plugin.toml"
+
+		if [ "$toml_version" != "$crate_version" ]; then
+			refusals+=("$dir/plugin.toml says $toml_version, $dir/Cargo.toml says $crate_version - they must agree")
+			continue
+		fi
+		agreed+=("$dir/plugin.toml $crate_version")
+
+		[ -n "$prev_tag" ] || continue
+		if ! git -C "$REPO_ROOT" cat-file -e "$prev_tag:$dir/Cargo.toml" 2>/dev/null; then
+			log "$dir is new since $prev_tag, starts at $crate_version"
+			continue
+		fi
+		prev_version="$(git -C "$REPO_ROOT" show "$prev_tag:$dir/Cargo.toml" | package_version -)"
+		[ -n "$prev_version" ] || die "could not determine version from $dir/Cargo.toml at $prev_tag"
+
+		if [ "$crate_version" != "$prev_version" ] &&
+			[ "$(printf '%s\n%s\n' "$prev_version" "$crate_version" | sort -V | head -n 1)" = "$crate_version" ]; then
+			refusals+=("$dir went backwards: $crate_version now, $prev_version at $prev_tag")
+			continue
+		fi
+
+		changed="$(plugin_changed_since "$plugin" "$prev_tag")" ||
+			die "could not compare $dir with $prev_tag"
+		if [ -z "$changed" ]; then
+			if [ "$crate_version" = "$prev_version" ]; then
+				log "$dir unchanged since $prev_tag, stays $crate_version"
+			else
+				log "$dir bumped $prev_version -> $crate_version without a change since $prev_tag"
+			fi
+		elif [ "$crate_version" = "$prev_version" ]; then
+			summary="$(printf '%s\n' "$changed" | head -n 3 | paste -s -d ',' - | sed 's/,/, /g')"
+			if [ "$(printf '%s\n' "$changed" | wc -l)" -gt 3 ]; then
+				summary="$summary, ..."
+			fi
+			refusals+=("$dir changed since $prev_tag ($summary) but its version is still $crate_version - bump $dir/Cargo.toml and $dir/plugin.toml")
+		else
+			log "$dir changed since $prev_tag, bumped $prev_version -> $crate_version"
+		fi
+	done
+
+	if [ ${#refusals[@]} -gt 0 ]; then
 		local line
-		echo "cut-release: plugin_version drift - core/Cargo.toml says $core_version, but:" >&2
-		for line in "${mismatches[@]}"; do
+		echo "cut-release: workspace plugin version check failed:" >&2
+		for line in "${refusals[@]}"; do
 			echo "  - $line" >&2
 		done
-		die "fix every listed plugin.toml's plugin_version to $core_version before tagging"
+		die "fix every listed plugin's Cargo.toml and plugin.toml version before tagging"
 	fi
-	log "crate-backed plugin_version agrees: $core_version (${CRATE_BACKED_PLUGIN_MANIFESTS[*]})"
+	log "crate-backed plugin_version agrees with each crate: ${agreed[*]}"
 }
 
 # Refuses if plugins/go's plugin.toml `plugin_version` disagrees with the Go
@@ -714,11 +908,11 @@ main() {
 	log "remaining steps"
 	if [ "$push" -eq 1 ]; then
 		echo "  1. Watch the build: https://github.com/$slug/actions"
-		echo "  2. Review and publish the draft release: https://github.com/$slug/releases"
+		echo "  2. Check the published release: https://github.com/$slug/releases/tag/$tag"
 	else
 		echo "  1. Push the tag:    git push origin $tag"
 		echo "  2. Watch the build: https://github.com/$slug/actions"
-		echo "  3. Review and publish the draft release: https://github.com/$slug/releases"
+		echo "  3. Check the published release: https://github.com/$slug/releases/tag/$tag"
 	fi
 }
 

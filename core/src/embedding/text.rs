@@ -46,6 +46,18 @@
 //!    characters long.
 //!
 //! Kept paragraphs are rejoined with a blank line, in their original order.
+//!
+//! # What is not embedded
+//!
+//! [`node_text`] decides whether a node gets a vector at all; the text it
+//! embeds as is always [`text_to_embed`]'s. It refuses a node
+//! [`is_noise`] calls name-only noise: no doc comment, a signature whose
+//! only identifier (keywords aside) is the node's own name, and the node is
+//! a module declaration (`pub mod x`) or a test (a test file, a `test`/`Test`
+//! name, or a Rust inline `tests` module). Such a text says nothing the name
+//! does not. A filtered node keeps every structural answer; it is absent only
+//! from `search_code`. Why this rule and not body size or all name-only
+//! nodes: `docs/design/GM-437-embedding-noise-filter.md`.
 
 /// The "short prose" cap: a paragraph after the first is kept only when its
 /// text (lines joined by `\n`, ends trimmed) is at most this many `char`s,
@@ -83,6 +95,108 @@ const DROPPED_SECTIONS: &[&str] = &[
 pub(crate) fn text_to_embed(doc_comment: Option<&str>, signature: Option<&str>) -> Option<String> {
     let trimmed = doc_comment.map(structured_doc);
     full_text(trimmed.as_deref(), signature).or_else(|| full_text(doc_comment, signature))
+}
+
+/// What [`is_noise`] and [`node_text`] read of a node.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EmbedInput<'a> {
+    pub(crate) kind: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) qualified_name: &'a str,
+    /// Project-relative, `/`-separated.
+    pub(crate) file_path: &'a str,
+    pub(crate) doc: Option<&'a str>,
+    pub(crate) signature: Option<&'a str>,
+}
+
+/// The generation of [`is_noise`]'s rule. An index records the generation
+/// whose vectors it last purged (`embedding::backfill`'s one-time noise
+/// purge); bump this whenever the rule changes, so every existing index
+/// purges the vectors the new rule filters once more.
+pub(crate) const NOISE_RULE_VERSION: &str = "1";
+
+/// Words [`is_noise`] does not count as identifiers of a signature, compared
+/// lowercased.
+const SIGNATURE_KEYWORDS: &[&str] = &[
+    "pub", "crate", "super", "in", "fn", "mod", "const", "static", "struct", "enum", "func", "def", "async",
+    "let", "export", "self", "mut", "var", "type", "impl", "unsafe", "extern",
+];
+
+/// The text `input` embeds as, or `None` when it gets no vector: when
+/// [`text_to_embed`] has nothing, or when [`is_noise`] holds.
+pub(crate) fn node_text(input: &EmbedInput) -> Option<String> {
+    if is_noise(input) {
+        return None;
+    }
+    text_to_embed(input.doc, input.signature)
+}
+
+/// Whether `input` is name-only noise: no doc comment, a non-blank signature
+/// with at most one identifier besides [`SIGNATURE_KEYWORDS`] (the name),
+/// and either a `Module` or a test node (see [`is_test`]).
+pub(crate) fn is_noise(input: &EmbedInput) -> bool {
+    if input.doc.is_some_and(|doc| !doc.trim().is_empty()) {
+        return false;
+    }
+    let Some(signature) = input.signature.filter(|s| !s.trim().is_empty()) else { return false };
+    if signature_identifiers(signature) > 1 {
+        return false;
+    }
+    input.kind == "Module" || is_test(input)
+}
+
+/// A node in a test file, named `test*`/`Test*`, or inside a Rust inline
+/// `tests` module.
+fn is_test(input: &EmbedInput) -> bool {
+    is_test_path(input.file_path)
+        || input.name.starts_with("test")
+        || input.name.starts_with("Test")
+        || input.qualified_name.contains("::tests::")
+        || input.qualified_name.starts_with("tests::")
+}
+
+/// A test file: a `test`, `tests`, `__tests__` or `testdata` directory
+/// anywhere on the path, `*_test.go`, `test_*.py`, `*_test.rs`/`*_tests.rs`,
+/// or `*.test.*`/`*.spec.*` with a `js`/`jsx`/`ts`/`tsx` extension.
+fn is_test_path(path: &str) -> bool {
+    let (dirs, file) = path.rsplit_once('/').unwrap_or(("", path));
+    if dirs.split('/').any(|dir| matches!(dir, "test" | "tests" | "__tests__" | "testdata")) {
+        return true;
+    }
+    if file.ends_with("_test.go") || file.ends_with("_test.rs") || file.ends_with("_tests.rs") {
+        return true;
+    }
+    if file.starts_with("test_") && file.ends_with(".py") {
+        return true;
+    }
+    ["js", "jsx", "ts", "tsx"]
+        .iter()
+        .any(|ext| file.ends_with(&format!(".test.{ext}")) || file.ends_with(&format!(".spec.{ext}")))
+}
+
+/// How many ASCII identifiers (`[A-Za-z_][A-Za-z0-9_]*`, matched leftmost
+/// as a regex scan would, so `0x1F` holds `x1F`) in `signature` are not
+/// [`SIGNATURE_KEYWORDS`]. Counting stops at two.
+fn signature_identifiers(signature: &str) -> usize {
+    let bytes = signature.as_bytes();
+    let mut count = 0;
+    let mut at = 0;
+    while at < bytes.len() && count < 2 {
+        let byte = bytes[at];
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = at;
+            while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+                at += 1;
+            }
+            let word = signature[start..at].to_ascii_lowercase();
+            if !SIGNATURE_KEYWORDS.contains(&word.as_str()) {
+                count += 1;
+            }
+        } else {
+            at += 1;
+        }
+    }
+    count
 }
 
 /// The whole doc comment, a blank line, then the signature; either alone when
@@ -422,5 +536,166 @@ pub(crate) mod tests {
         assert_eq!(structured_doc("  \n\t\n"), "");
         assert_eq!(structured_doc("```\nfn main() {}\n```"), "");
         assert_eq!(structured_doc("# Examples\n\nIt runs.\n\n```\nrun();\n```"), "");
+    }
+
+    /// A node as the noise rule sees it: `(kind, name, qualifiedName,
+    /// filePath, doc, signature)`.
+    type Node = (&'static str, &'static str, &'static str, &'static str, Option<&'static str>, &'static str);
+
+    fn input(node: &Node) -> EmbedInput<'static> {
+        let (kind, name, qualified_name, file_path, doc, signature) = *node;
+        EmbedInput { kind, name, qualified_name, file_path, doc, signature: Some(signature) }
+    }
+
+    /// The design note's dropped examples are noise and embed as nothing.
+    /// Control: `is_noise` returning `false` fails every case.
+    #[test]
+    fn the_notes_dropped_examples_are_noise() {
+        let dropped: &[Node] = &[
+            (
+                "Module",
+                "semantic",
+                "crate::embedding::semantic",
+                "core/src/embedding/mod.rs",
+                None,
+                "pub mod semantic",
+            ),
+            ("Module", "tests", "crate::cli::stop::tests", "core/src/cli/stop.rs", None, "mod tests"),
+            ("Module", "x", "crate::x", "core/src/lib.rs", None, "pub(crate) mod x"),
+            ("Function", "test_trim", "crate::text::test_trim", "core/src/text.rs", None, "fn test_trim()"),
+            (
+                "Function",
+                "an_escalated_shutdown_says_so",
+                "crate::cli::stop::tests::an_escalated_shutdown_says_so",
+                "core/src/cli/stop.rs",
+                None,
+                "fn an_escalated_shutdown_says_so()",
+            ),
+            (
+                "Method",
+                "test_invalid",
+                "validators.Checks.test_invalid",
+                "pkg/validators.py",
+                None,
+                "def test_invalid(self)",
+            ),
+            ("Function", "testX", "testX", "src/x.ts", None, "testX()"),
+            // A blank doc is no doc.
+            ("Module", "blank", "crate::blank", "core/src/lib.rs", Some(" \n\t"), "pub mod blank"),
+        ];
+        for node in dropped {
+            assert!(is_noise(&input(node)), "{node:?} must be noise");
+            assert_eq!(node_text(&input(node)), None, "{node:?} must embed as nothing");
+        }
+    }
+
+    /// The design note's kept examples, any documented node, and a Go test
+    /// taking `t *testing.T` (three identifiers besides `func`) keep their
+    /// `text_to_embed` text. `pid` sits in a `tests` module so only its
+    /// second identifier (`u32`; `self` is a keyword) keeps it.
+    /// Control: `signature_identifiers` returning 1 fails `pid` and `TestX`.
+    #[test]
+    fn the_notes_kept_examples_keep_their_text() {
+        let kept: &[Node] = &[
+            (
+                "Method",
+                "pid",
+                "crate::daemon::tests::Fake::pid",
+                "core/src/daemon/x.rs",
+                None,
+                "fn pid(&self) -> u32",
+            ),
+            (
+                "Method",
+                "PATCH",
+                "gin.IRoutes.PATCH",
+                "routergroup.go",
+                None,
+                "PATCH(string, ...HandlerFunc) IRoutes",
+            ),
+            ("Constant", "STRUCTURAL", "crate::STRUCTURAL", "core/src/lib.rs", None, "const STRUCTURAL: u8"),
+            ("Struct", "BulkRun", "crate::BulkRun", "core/src/lib.rs", None, "struct BulkRun"),
+            ("Function", "getDateTime", "getDateTime", "src/utils/date.ts", None, "getDateTime()"),
+            ("Function", "TestX", "x.TestX", "pkg/x_test.go", None, "func TestX(t *testing.T)"),
+            (
+                "Module",
+                "semantic",
+                "crate::semantic",
+                "core/src/lib.rs",
+                Some("Semantic search."),
+                "pub mod semantic",
+            ),
+            (
+                "Function",
+                "test_trim",
+                "crate::tests::test_trim",
+                "tests/text.rs",
+                Some("Trims."),
+                "fn test_trim()",
+            ),
+        ];
+        for node in kept {
+            let (.., doc, signature) = *node;
+            assert!(!is_noise(&input(node)), "{node:?} must not be noise");
+            assert_eq!(node_text(&input(node)), text_to_embed(doc, Some(signature)), "{node:?}");
+            assert!(node_text(&input(node)).is_some(), "{node:?} must embed");
+        }
+    }
+
+    /// An undocumented zero-arg `run` is noise in a test file and not in a
+    /// source file; the test-path patterns hold, and near misses do not.
+    /// Control: `is_test_path` returning `false` fails every test path.
+    #[test]
+    fn a_name_only_fn_is_noise_in_a_test_file_only() {
+        let run_in = |path: &'static str| -> Node { ("Function", "run", "foo::run", path, None, "fn run()") };
+        let test_paths = [
+            "tests/foo.rs",
+            "core/tests/it/foo.rs",
+            "src/test/x.rs",
+            "web/__tests__/a.tsx",
+            "pkg/testdata/a.go",
+            "pkg/server_test.go",
+            "pkg/test_server.py",
+            "src/foo_test.rs",
+            "src/foo_tests.rs",
+            "web/a.test.ts",
+            "web/a.spec.jsx",
+            "web/a.test.js",
+            "web/a.spec.tsx",
+        ];
+        for path in test_paths {
+            assert!(is_noise(&input(&run_in(path))), "{path} is a test path");
+        }
+        let source_paths = [
+            "src/foo.rs",
+            "src/latest/x.rs",
+            "src/testing/x.rs",
+            "src/contest.rs",
+            "src/tests.rs",
+            "pkg/server_test.py",
+            "pkg/test_server.rs",
+            "web/a.test.css",
+            "web/atest.ts",
+        ];
+        for path in source_paths {
+            assert!(!is_noise(&input(&run_in(path))), "{path} is not a test path");
+        }
+    }
+
+    /// A name-only fn inside an inline `tests` module (`::tests::` inside
+    /// the qualified name, or `tests::` at its start) is noise; one taking a
+    /// param is not, nor is a module merely ending in `tests`.
+    /// Control: dropping the `::tests::` clause fails `crate::m::tests::`;
+    /// dropping the `tests::` prefix clause fails `tests::checks_it`.
+    #[test]
+    fn a_name_only_fn_in_an_inline_tests_module_is_noise_unless_it_takes_a_param() {
+        let at = |qualified_name: &'static str, signature: &'static str| -> Node {
+            ("Function", "checks_it", qualified_name, "src/m.rs", None, signature)
+        };
+        assert!(is_noise(&input(&at("crate::m::tests::checks_it", "fn checks_it()"))));
+        assert!(is_noise(&input(&at("tests::checks_it", "fn checks_it()"))));
+        assert!(!is_noise(&input(&at("crate::m::tests::checks_it", "fn checks_it(x: u8)"))));
+        assert!(!is_noise(&input(&at("crate::contests::checks_it", "fn checks_it()"))));
+        assert!(!is_noise(&input(&at("attests::checks_it", "fn checks_it()"))));
     }
 }

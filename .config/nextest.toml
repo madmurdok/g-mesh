@@ -173,6 +173,9 @@ not (
     (binary_id(g-mesh::it) & test(=cli_status::status_reports_a_dead_daemon_and_the_files_its_index_never_saw)) |
     (binary_id(g-mesh::it) & test(=cli_init::init_on_a_fresh_project_creates_state_and_a_subsequent_status_shows_it_indexed)) |
     (binary_id(g-mesh::it) & test(=state_isolation::a_spawned_g_mesh_resolves_the_same_isolated_state_root)) |
-    (binary_id(g-mesh::it) & test(=multi_project_front::reindexing_one_project_leaves_the_front_and_other_projects_alone))
+    (binary_id(g-mesh::it) & test(=multi_project_front::reindexing_one_project_leaves_the_front_and_other_projects_alone)) |
+    (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=sandbox_writes_and_network::the_server_tree_writes_nothing_outside_its_writable_prefixes)) |
+    (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=sandbox_writes_and_network::the_server_tree_opens_no_network_connection_with_offline_removed)) |
+    (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=sandbox_writes_and_network::a_lockless_workspace_keeps_its_path_dependency_through_the_private_temp_dir))
 )
 """

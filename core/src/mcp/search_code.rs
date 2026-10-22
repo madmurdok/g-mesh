@@ -235,7 +235,7 @@ pub(super) fn search(
     // things this base query owes `paginate_by_score`'s contract (a `score`
     // and an `id` column); every other column just rides along for the
     // caller. The inner join is what keeps unembedded nodes (no doc comment
-    // or signature - see `embedding::pipeline::text_to_embed`) out of the
+    // or signature, or filtered as noise - see `embedding::text::node_text`) out of the
     // results without a separate filter.
     let base_sql = "SELECT v.nodeId AS id, n.qualifiedName, n.kind, n.filePath, n.startLine, n.startCol, \
                      n.language, \
@@ -955,8 +955,14 @@ mod tests {
             &model,
             &conn,
             "reader",
-            Some("Reads a file from disk and returns its contents as a string."),
-            Some("readFileAsString(path: string): string"),
+            &crate::embedding::text::EmbedInput {
+                kind: "Function",
+                name: "readFileAsString",
+                qualified_name: "pkg::readFileAsString",
+                file_path: "a.rs",
+                doc: Some("Reads a file from disk and returns its contents as a string."),
+                signature: Some("readFileAsString(path: string): string"),
+            },
             "jina-embeddings-v2-base-code",
         )
         .unwrap();
@@ -964,8 +970,14 @@ mod tests {
             &model,
             &conn,
             "math",
-            None,
-            Some("unrelatedMathHelper(a: number, b: number): number"),
+            &crate::embedding::text::EmbedInput {
+                kind: "Function",
+                name: "unrelatedMathHelper",
+                qualified_name: "pkg::unrelatedMathHelper",
+                file_path: "b.rs",
+                doc: None,
+                signature: Some("unrelatedMathHelper(a: number, b: number): number"),
+            },
             "jina-embeddings-v2-base-code",
         )
         .unwrap();
@@ -987,5 +999,41 @@ mod tests {
             results[0]["symbolId"], "reader",
             "the symbol whose docstring matches the query must rank first: {results:?}"
         );
+    }
+
+    /// A noise node whose pre-filter vector the one-time purge deleted
+    /// leaves `search` but stays in the graph `find_definition` reads.
+    /// Control: the purge controls in `embedding::backfill::tests` (its
+    /// vector stays, and `search` returns it).
+    #[test]
+    fn a_purged_noise_node_leaves_search_but_not_the_graph() {
+        let conn = setup();
+        insert_node(&conn, "alpha", "pkg::alpha", "a.rs");
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, signature, language)
+             VALUES ('semantic', 'Module', 'semantic', 'crate::semantic', 'src/lib.rs', 1, 0, 1, 1, 'pub mod semantic', 'rust')",
+            [],
+        )
+        .unwrap();
+        insert(&conn, "alpha", &[1.0, 0.0, 0.0], "v1").unwrap();
+        insert(&conn, "semantic", &[0.9, 0.1, 0.0], "v1").unwrap();
+        let ids = |conn: &Connection| -> Vec<String> {
+            search(conn, &[1.0, 0.0, 0.0], 10, None)
+                .unwrap()
+                .results
+                .into_iter()
+                .map(|r| r.symbol_id)
+                .collect()
+        };
+        assert_eq!(ids(&conn), vec!["alpha", "semantic"], "before the purge both are searchable");
+
+        let store = crate::storage::index_store::IndexStore::new(conn);
+        assert_eq!(crate::embedding::backfill::purge_noise_vectors(&store), 1);
+
+        store.with(|conn| {
+            assert_eq!(ids(conn), vec!["alpha"], "search_code must not return a filtered node");
+            let found = crate::graph::queries::find_by_qualified_name(conn, "crate::semantic", None).unwrap();
+            assert_eq!(found.len(), 1, "find_definition's lookup still finds it");
+        });
     }
 }
