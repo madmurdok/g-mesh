@@ -120,6 +120,9 @@ pub struct PluginInfo {
     /// it did not, the directory it was found in (the best identifier left
     /// once the manifest itself cannot be trusted).
     pub language: String,
+    /// The directory the manifest was read from (canonical when it resolves),
+    /// so a reader can tell which discovery root supplied this plugin.
+    pub dir: PathBuf,
     pub outcome: PluginOutcome,
 }
 
@@ -234,11 +237,13 @@ fn scan_root(root: &Path, status: PluginStatus) -> Result<Vec<PluginInfo>> {
         }
 
         let dir_name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("?").to_string();
+        let shown_dir = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
 
         let outcome = match manifest::read_manifest(&dir) {
             Ok(manifest) => {
                 infos.push(PluginInfo {
                     language: manifest.language,
+                    dir: shown_dir,
                     outcome: PluginOutcome::Loaded {
                         version: manifest.plugin_version,
                         status,
@@ -251,7 +256,7 @@ fn scan_root(root: &Path, status: PluginStatus) -> Result<Vec<PluginInfo>> {
             }
             Err(err) => PluginOutcome::Error(format!("{err:#}")),
         };
-        infos.push(PluginInfo { language: dir_name, outcome });
+        infos.push(PluginInfo { language: dir_name, dir: shown_dir, outcome });
     }
 
     Ok(infos)
@@ -260,7 +265,9 @@ fn scan_root(root: &Path, status: PluginStatus) -> Result<Vec<PluginInfo>> {
 /// Renders the plugin list the way `plugins list` prints it: one line per
 /// plugin naming its language, then either its version, status,
 /// capabilities and non-symbol query shapes, or - for a manifest that failed to read - an error in their
-/// place.
+/// place. Every line ends with `  dir=<manifest directory>`; it is always the
+/// last field, so a parser takes everything after the last `  dir=`
+/// (`scripts/install.sh` and `scripts/refresh-mcp-install.sh` do).
 pub fn render(plugins: &[PluginInfo]) -> String {
     let mut out = String::new();
     for plugin in plugins {
@@ -274,17 +281,19 @@ pub fn render(plugins: &[PluginInfo]) -> String {
             } => {
                 let _ = writeln!(
                     out,
-                    "{}  {}  {}  {}  non_symbol_queries: {}  symbol_query_prefixes: {}",
+                    "{}  {}  {}  {}  non_symbol_queries: {}  symbol_query_prefixes: {}  dir={}",
                     plugin.language,
                     version,
                     status.label(),
                     render_capabilities(capabilities),
                     non_symbol_queries.render(),
-                    symbol_query_prefixes.render()
+                    symbol_query_prefixes.render(),
+                    plugin.dir.display()
                 );
             }
             PluginOutcome::Error(message) => {
-                let _ = writeln!(out, "{}  error: {}", plugin.language, message);
+                let _ =
+                    writeln!(out, "{}  error: {}  dir={}", plugin.language, message, plugin.dir.display());
             }
         }
     }
@@ -560,6 +569,7 @@ extensions = [".{language}"]
     fn render_reports_language_version_and_status_for_a_loaded_plugin() {
         let plugins = vec![PluginInfo {
             language: "typescript".to_string(),
+            dir: PathBuf::from("/fixture/plugins/typescript"),
             outcome: PluginOutcome::Loaded {
                 version: "2.0.0".to_string(),
                 status: PluginStatus::Bundled,
@@ -580,6 +590,7 @@ extensions = [".{language}"]
     fn render_reports_installed_status() {
         let plugins = vec![PluginInfo {
             language: "python".to_string(),
+            dir: PathBuf::from("/fixture/plugins/python"),
             outcome: PluginOutcome::Loaded {
                 version: "0.1.0".to_string(),
                 status: PluginStatus::Installed,
@@ -604,6 +615,7 @@ extensions = [".{language}"]
     fn render_shows_capabilities_for_a_loaded_plugin() {
         let plugins = vec![PluginInfo {
             language: "go".to_string(),
+            dir: PathBuf::from("/fixture/plugins/go"),
             outcome: PluginOutcome::Loaded {
                 version: "0.1.0".to_string(),
                 status: PluginStatus::Bundled,
@@ -634,6 +646,7 @@ extensions = [".{language}"]
     fn render_shows_non_symbol_queries_for_a_loaded_plugin() {
         let loaded = |non_symbol_queries, symbol_query_prefixes| PluginInfo {
             language: "go".to_string(),
+            dir: PathBuf::from("/fixture/plugins/go"),
             outcome: PluginOutcome::Loaded {
                 version: "0.1.0".to_string(),
                 status: PluginStatus::Bundled,
@@ -654,16 +667,21 @@ extensions = [".{language}"]
         let lines: Vec<&str> = rendered.lines().collect();
         assert!(
             lines[0]
-                .ends_with("non_symbol_queries: starts_with=@ contains=/,::  symbol_query_prefixes: strip=@"),
+                .ends_with("non_symbol_queries: starts_with=@ contains=/,::  symbol_query_prefixes: strip=@  dir=/fixture/plugins/go"),
             "{rendered}"
         );
-        assert!(lines[1].ends_with("non_symbol_queries: none  symbol_query_prefixes: none"), "{rendered}");
+        assert!(
+            lines[1]
+                .ends_with("non_symbol_queries: none  symbol_query_prefixes: none  dir=/fixture/plugins/go"),
+            "{rendered}"
+        );
     }
 
     #[test]
     fn render_shows_an_error_indicator_for_a_broken_manifest() {
         let plugins = vec![PluginInfo {
             language: "broken".to_string(),
+            dir: PathBuf::from("/fixture/plugins/broken"),
             outcome: PluginOutcome::Error("failed to parse plugin manifest".to_string()),
         }];
 

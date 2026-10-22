@@ -68,7 +68,7 @@ for target in x86_64-unknown-linux-gnu x86_64-apple-darwin; do
 #!/bin/sh
 case "\$1" in
 --version) echo "g-mesh $VERSION" ;;
-plugins) echo "typescript (bundled)" ;;
+plugins) echo "typescript  $VERSION  bundled  semantic_pass=no  dir=\$(cd "\$(dirname "\$0")" && pwd -P)/plugins/typescript" ;;
 esac
 EOF
 	chmod +x "$src/g-mesh"
