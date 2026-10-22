@@ -86,11 +86,52 @@ wait_quiet() {
 [ -f "$TSV" ] || printf 'phase\tround\tarm\tvariant\tcorpora\trc\tembed_ms\treal\tuser\tsys\tmaxrss\tload_before\tload_after\tattempt\tpolicy\tsettings\n' > "$TSV"
 log "start phases [$PHASES]; uptime: $(uptime); daemons: $(pgrep -fl 'g-mesh daemon' | tr '\n' ';')"
 
+# --- Probe (phase D) -----------------------------------------------------------
+# A probe that is running has its stop file in PROBE_STOP; any exit, die()
+# included, touches it so no probe outlives the script.
+PROBE_STOP=
+PROBE_WITH=
+cleanup() { if [ -n "$PROBE_STOP" ]; then touch "$PROBE_STOP"; fi; }
+trap cleanup EXIT
+# The probe runs at normal priority with default options and a clean
+# G_MESH_EMBED_* environment; only the pass beside it changes per arm.
+probe_start() { # arm, then extra probe flags
+  local arm=$1; shift
+  PROBE_STOP="$OUT/D/$arm.stop"; rm -f "$PROBE_STOP"
+  mkdir -p "$OUT/D"
+  "$BIN" debug-embed-eval probe --eval-dir "$EVAL" --variant "$FP32" --corpus "$CORPUS_BC" \
+    --burst 5 --interval-ms 2000 --until "$PROBE_STOP" --out "$OUT/D/$arm.jsonl" "$@" \
+    > "$OUT/logs/probe-$arm.out" 2> "$OUT/logs/probe-$arm.err" &
+  PROBE_PID=$!
+}
+probe_stop() {
+  touch "$PROBE_STOP"
+  local stop=$PROBE_STOP; PROBE_STOP=
+  wait "$PROBE_PID" || die "probe exited non-zero (see $OUT/logs/; stop file $stop)"
+}
+probe_alone() { # arm settings extra-flags...
+  local arm=$1 settings=$2; shift 2
+  mkdir -p "$OUT/D"; rm -f "$OUT/D/$arm.stop"
+  wait_quiet
+  log "probe $arm alone for ${PROBE_IDLE_S}s [$settings] uptime: $(uptime)"
+  # shellcheck disable=SC2086
+  env $settings "$BIN" debug-embed-eval probe --eval-dir "$EVAL" --variant "$FP32" --corpus "$CORPUS_BC" \
+    --burst 5 --interval-ms 2000 --until "$OUT/D/$arm.stop" --out "$OUT/D/$arm.jsonl" "$@" \
+    > "$OUT/logs/probe-$arm.out" 2> "$OUT/logs/probe-$arm.err" &
+  local pid=$!
+  PROBE_STOP="$OUT/D/$arm.stop"
+  sleep "$PROBE_IDLE_S"
+  touch "$PROBE_STOP"; PROBE_STOP=
+  wait "$pid" || die "probe $arm exited non-zero"
+}
 # One timed embed-only pass: phase round arm variant settings policy(normal|background) corpora...
 # Leaves timings-embed.json beside each corpus's timings.json, so a later
 # quality run in the same directory cannot overwrite the pass's timings.
 # Redone once when the load after the run exceeds 8.0 plus the run's own
-# parallelism (GM-398's owner-approved noisy-machine rule).
+# parallelism (GM-398's owner-approved noisy-machine rule). With PROBE_WITH
+# set to an arm name, a probe runs beside each attempt: started after the
+# quiet wait and stopped when the pass ends, so it samples only the pass
+# (a redo restarts it, truncating that arm's jsonl).
 timed() {
   local phase=$1 round=$2 arm=$3 variant=$4 settings=$5 policy=$6; shift 6
   local corpora=("$@") out="$OUT/$phase/r$round/$arm" cargs=() c
@@ -100,6 +141,7 @@ timed() {
   local attempt
   for attempt in 1 2; do
     wait_quiet
+    [ -n "$PROBE_WITH" ] && probe_start "$PROBE_WITH"
     local tag="$phase-r$round-$arm-a$attempt" before after rc
     before=$(load1)
     log "start $phase r$round $arm ($variant, ${corpora[*]}, $policy) [$settings] uptime: $(uptime)"
@@ -109,6 +151,7 @@ timed() {
       > "$OUT/logs/$tag.out" 2> "$OUT/logs/$tag.err"
     rc=$?
     after=$(load1)
+    [ -n "$PROBE_WITH" ] && probe_stop
     [ $rc = 0 ] || die "$tag exited $rc (see $OUT/logs/$tag.err)"
     local embed=0 real user sys rss
     for c in "${corpora[@]}"; do
@@ -194,7 +237,10 @@ fi
 
 # --- Phase B ------------------------------------------------------------------
 if has_phase B; then
-  gate=$("${SUMMARY[@]}" gate "$OUT") || die "gate failed"
+  if ! gate=$("${SUMMARY[@]}" gate "$OUT" 2>> "$LOG"); then
+    [ -n "${B_ARMS:-}" ] || die "phase B needs phase A's timings in $OUT (run phase A into this OUT, or set B_ARMS)"
+    gate="go B_ARMS given, no phase-A gate in $OUT"
+  fi
   log "phase A gate: $gate"
   if [ "${gate%% *}" = stop ] && [ "${FORCE_B:-0}" != 1 ]; then
     log "phase B skipped by the gate (FORCE_B=1 runs it)"
@@ -231,42 +277,14 @@ if has_phase C; then
 fi
 
 # --- Phase D ------------------------------------------------------------------
-# The probe runs at normal priority with default options and a clean
-# G_MESH_EMBED_* environment; only the pass beside it changes per arm.
-probe_start() { # arm, then extra probe flags
-  local arm=$1; shift
-  PROBE_STOP="$OUT/D/$arm.stop"; rm -f "$PROBE_STOP"
-  mkdir -p "$OUT/D"
-  "$BIN" debug-embed-eval probe --eval-dir "$EVAL" --variant "$FP32" --corpus "$CORPUS_BC" \
-    --burst 5 --interval-ms 2000 --until "$PROBE_STOP" --out "$OUT/D/$arm.jsonl" "$@" \
-    > "$OUT/logs/probe-$arm.out" 2> "$OUT/logs/probe-$arm.err" &
-  PROBE_PID=$!
-}
-probe_stop() {
-  touch "$PROBE_STOP"
-  wait "$PROBE_PID" || die "probe exited non-zero (see $OUT/logs/)"
-}
-probe_alone() { # arm settings extra-flags...
-  local arm=$1 settings=$2; shift 2
-  wait_quiet
-  log "probe $arm alone for ${PROBE_IDLE_S}s [$settings] uptime: $(uptime)"
-  # shellcheck disable=SC2086
-  env $settings "$BIN" debug-embed-eval probe --eval-dir "$EVAL" --variant "$FP32" --corpus "$CORPUS_BC" \
-    --burst 5 --interval-ms 2000 --until "$OUT/D/$arm.stop" --out "$OUT/D/$arm.jsonl" "$@" \
-    > "$OUT/logs/probe-$arm.out" 2> "$OUT/logs/probe-$arm.err" &
-  local pid=$!
-  sleep "$PROBE_IDLE_S"
-  touch "$OUT/D/$arm.stop"
-  wait "$pid" || die "probe $arm exited non-zero"
-}
 if has_phase D; then
   mkdir -p "$OUT/D"; rm -f "$OUT"/D/*.stop
   probe_alone P-idle ""
   for e in "P0|normal|" "P1|background|" "P2|normal|$C2_ENV"; do
     arm=${e%%|*}; rest=${e#*|}; policy=${rest%%|*}; settings=${rest#*|}
-    probe_start "$arm"
+    PROBE_WITH=$arm
     timed D 1 "$arm" "$FP32" "$settings" "$policy" "$CORPUS_BC"
-    probe_stop
+    PROBE_WITH=
   done
   # Option (i) also gives queries fewer threads: the probe alone with that rule.
   probe_alone P2q "$C2_ENV" --options-from-env

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """GM-453 helpers for gm453_measure.sh (docs/design/GM-453-onnx-tuning.md §5.3, §7).
 
-  gate <out dir>      "go <reason>" or "stop <reason>": the §10.2 phase-A gate
+  gate <out dir>      "go <reason>" or "stop <reason>": the §10.2 phase-A gate;
+                      exits non-zero when OUT holds no phase-A timing
   best <out dir>      the two fastest adoptable phase-A arms, space-separated
   summary <out dir>   summary.md: per-run rows, medians and x baseline per arm,
                       quality per arm, probe latency
@@ -18,6 +19,7 @@ BASELINE = {"A": "A0", "B": "A0", "C": "C0", "D": "P0"}
 BATCHING_ARMS = {"A9", "A10", "A11", "A12"}
 GAIN = 0.05  # §10.2: a thread or opt arm must save more than 5%
 K = 10
+QUERIES = Path(__file__).resolve().parent / "queries"
 
 
 def runs(out):
@@ -51,9 +53,12 @@ def parity(out):
         m = merged.setdefault((phase, rnd, arm), {"compared": 0, "bit": 0, "maxL2": 0.0, "minCos": 1.0, "over": 0})
         m["compared"] += d["compared"]
         m["bit"] += d["bitIdentical"]
-        m["maxL2"] = max(m["maxL2"], d["maxL2"])
-        m["minCos"] = min(m["minCos"], d["minCos"])
-        m["over"] += d["overTolerance"]
+        # A NaN distance is written as null: it counts as the worst value.
+        max_l2 = float("inf") if d["maxL2"] is None else d["maxL2"]
+        min_cos = float("-inf") if d["minCos"] is None else d["minCos"]
+        m["maxL2"] = max(m["maxL2"], max_l2)
+        m["minCos"] = min(m["minCos"], min_cos)
+        m["over"] += d["overTolerance"] + (1 if d["maxL2"] is None and not d["overTolerance"] else 0)
     return merged
 
 
@@ -76,8 +81,7 @@ def gate(out):
     med = medians(rows, "A")
     base = med.get("A0")
     if not base:
-        print("stop no A0 timing")
-        return
+        sys.exit(f"no phase-A A0 timing in {out}/timing.tsv: run phase A into this OUT first, or set B_ARMS")
     batching_ok = [a for a in sorted(BATCHING_ARMS) if a in med and arm_passes(par, "A", a)]
     gainers = [
         a for a, m in med.items()
@@ -103,23 +107,40 @@ def run_dirs(out, phase, arm):
     return sorted((Path(out) / phase / "r1" / arm).glob("*/*/"))
 
 
+def scored_queries(corpus):
+    """Ids of the corpus's authored positive queries: the set the harness's
+    `report` computes recall@k and MRR over (metrics::is_scored_positive)."""
+    path = QUERIES / f"{corpus}.jsonl"
+    ids = set()
+    for line in path.read_text().splitlines():
+        if line.strip():
+            q = json.loads(line)
+            if q.get("kind") == "positive":
+                ids.add(q["id"])
+    return ids
+
+
 def quality(run_dir):
-    """recall@10 and MRR@10 over rankings.jsonl's queries with expected symbols."""
+    """recall@10 and MRR as `report` defines them (metrics.rs): over the
+    authored positives, recall@10 = share whose first expected node ranks
+    <= 10, MRR = mean of 1/first expected rank over the kept hits. One
+    corpus is one language, so the language-pooled mean is the plain mean."""
     path = run_dir / "rankings.jsonl"
     if not path.exists():
         return None
-    recalls, rr = [], []
+    scored = scored_queries(run_dir.name)
+    hits, rr = [], []
     for line in path.read_text().splitlines():
         q = json.loads(line)
-        expected = set(q["expected"])
-        if not expected:
+        if q["id"] not in scored:
             continue
-        top = [hit[0] for hit in q["hits"][:K]]
-        recalls.append(len(expected & set(top)) / len(expected))
-        rr.append(next((1 / (i + 1) for i, node in enumerate(top) if node in expected), 0.0))
-    if not recalls:
+        expected = set(q["expected"])
+        rank = next((i + 1 for i, hit in enumerate(q["hits"]) if hit[0] in expected), None)
+        hits.append(1.0 if rank is not None and rank <= K else 0.0)
+        rr.append(1 / rank if rank is not None else 0.0)
+    if not hits:
         return None
-    return statistics.mean(recalls), statistics.mean(rr), len(recalls)
+    return statistics.mean(hits), statistics.mean(rr), len(hits)
 
 
 def probe(path):
@@ -174,8 +195,8 @@ def summary(out):
                   f"| {fmt(real.get(arm), '.1f')} | {fmt(statistics.median(ratios) if ratios else None, '.2f')} "
                   f"| {'pass' if arm_passes(par, phase, arm) else 'FAIL'} |")
 
-    print("\n## Quality (recall@10, MRR@10 from rankings.jsonl)\n")
-    print("| phase | arm | run | queries | recall@10 | MRR@10 | delta recall vs baseline |")
+    print("\n## Quality (recall@10, MRR as the harness report defines them, from rankings.jsonl)\n")
+    print("| phase | arm | run | queries | recall@10 | MRR | delta recall vs baseline |")
     print("|---|---|---|---:|---:|---:|---:|")
     for phase in ("B", "C"):
         arms = sorted({r["arm"] for r in rows if r["phase"] == phase}, key=lambda a: (len(a), a))

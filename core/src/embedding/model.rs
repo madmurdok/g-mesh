@@ -418,9 +418,12 @@ pub fn logical_cores() -> usize {
 
 /// Physical CPU cores: `hw.physicalcpu` on macOS, distinct
 /// `(physical id, core id)` pairs of `/proc/cpuinfo` on Linux, and
-/// [`logical_cores`] wherever neither answers.
+/// [`logical_cores`] wherever neither answers. Never more than
+/// [`logical_cores`]: the OS counts are the host's and ignore the affinity
+/// mask and cgroup quota `logical_cores` honours.
 pub fn physical_cores() -> usize {
-    physical_cores_from_os().filter(|&n| n >= 1).unwrap_or_else(logical_cores)
+    let logical = logical_cores();
+    physical_cores_from_os().filter(|&n| n >= 1).map_or(logical, |physical| physical.min(logical))
 }
 
 #[cfg(target_os = "macos")]
