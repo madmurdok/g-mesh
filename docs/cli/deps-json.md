@@ -119,8 +119,18 @@ For every import of a file:
    `kind: file`. Several files in one directory (a Go package) -> `kind: dir`,
    `to` = that directory. Files in several directories -> one `kind: file` row
    per file. No file -> counted as unresolved.
-3. An external package -> counted in `external`, no row.
+3. An external package -> counted in `external`, no row. Exception: a
+   target the plugin marked external whose specifier is relative to the
+   importing file (`./x`, `../x`; for Python also `.x`, `..x`) is counted in
+   `unresolved` instead, because a relative path cannot name a package.
 4. Anything else -> counted in `unresolved`, no row.
+
+The exception in step 3 is a workaround: the TypeScript plugin marks a
+relative import it cannot resolve (`./missing`) as an external package. The
+plugin fix is backlog task "TypeScript plugin marks unresolvable relative
+imports ('./missing') as external_module"; once it ships, the rule has nothing
+left to reclassify. It does not change `version`: `unresolved` and `external`
+keep the meaning documented above, and the rule makes the output match it.
 
 Rows with `from == to` are dropped. Two imports of the same target from one
 file collapse into one row.

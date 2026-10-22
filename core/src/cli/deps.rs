@@ -436,7 +436,11 @@ pub fn export(
             };
             (files, Some(key.clone()))
         } else if row.native_kind.as_deref() == Some(EXTERNAL_MODULE_NATIVE_KIND) {
-            tally.external.insert((row.from, row.specifier));
+            if is_relative_specifier(&row.language, &row.specifier) {
+                tally.unresolved.insert((row.from, row.specifier));
+            } else {
+                tally.external.insert((row.from, row.specifier));
+            }
             continue;
         } else {
             tally.unresolved.insert((row.from, row.specifier));
@@ -568,6 +572,17 @@ fn targets_of(files: &[String]) -> Vec<(String, &'static str)> {
             }
         }
     }
+}
+
+/// Whether an import specifier names a path relative to the importing file
+/// (`./x`, `../x`; for Python also `.x`, `..x`). Such a specifier can never
+/// name an external package, so an `external_module` placeholder carrying one
+/// is an import that resolved to nothing in the project: the TypeScript plugin
+/// marks an unresolvable relative import that way (docs/cli/deps-json.md).
+fn is_relative_specifier(language: &str, specifier: &str) -> bool {
+    specifier.starts_with("./")
+        || specifier.starts_with("../")
+        || (language == "python" && specifier.starts_with('.'))
 }
 
 /// A project-relative path's directory; `.` for the root.
