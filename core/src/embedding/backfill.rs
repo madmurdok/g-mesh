@@ -87,7 +87,7 @@ use crate::storage::{schema, vectors};
 /// the next start's backfill simply resumes, since nothing here is
 /// all-or-nothing the way one bulk-index batch's transaction is - and the
 /// same order of magnitude as `daemon::bulk_index::BATCH_ITEMS`.
-const PAGE_SIZE: i64 = 256;
+pub(crate) const PAGE_SIZE: i64 = 256;
 
 /// While the file this names exists, [`run`] holds *before* its first batch -
 /// independent of whether a model is actually available (see [`run`]'s own

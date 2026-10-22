@@ -70,6 +70,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
+use serde::{Deserialize, Serialize};
 use tokenizers::tokenizer::Tokenizer;
 use tokenizers::TruncationParams;
 
@@ -257,6 +258,283 @@ impl EncoderSpec {
     }
 }
 
+/// Environment variables that tune the ONNX session and the batching of
+/// [`EmbeddingModel::embed_batch`]. Absent or empty means the default; an
+/// invalid value logs one line and falls back to the default.
+pub const INTRA_THREADS_ENV: &str = "G_MESH_EMBED_INTRA_THREADS";
+pub const INTER_THREADS_ENV: &str = "G_MESH_EMBED_INTER_THREADS";
+pub const OPT_LEVEL_ENV: &str = "G_MESH_EMBED_OPT_LEVEL";
+pub const SPIN_ENV: &str = "G_MESH_EMBED_SPIN";
+pub const BATCH_ENV: &str = "G_MESH_EMBED_BATCH";
+pub const TOKEN_BUDGET_ENV: &str = "G_MESH_EMBED_TOKEN_BUDGET";
+pub const BUCKET_ENV: &str = "G_MESH_EMBED_BUCKET";
+
+/// Default cap on padded tokens (`texts x longest text`) per batched call:
+/// eight texts at [`DEFAULT_MAX_SEQUENCE_LENGTH`].
+pub const DEFAULT_TOKEN_BUDGET: usize = 8192;
+
+/// ONNX Runtime graph optimisation level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OptLevel {
+    Disable,
+    Basic,
+    Extended,
+    All,
+}
+
+impl From<OptLevel> for GraphOptimizationLevel {
+    fn from(level: OptLevel) -> Self {
+        match level {
+            OptLevel::Disable => GraphOptimizationLevel::Disable,
+            OptLevel::Basic => GraphOptimizationLevel::Level1,
+            OptLevel::Extended => GraphOptimizationLevel::Level2,
+            OptLevel::All => GraphOptimizationLevel::Level3,
+        }
+    }
+}
+
+/// How the session is built and how [`EmbeddingModel::embed_batch`] groups
+/// texts. [`InferenceOptions::default`] is the session and calling pattern
+/// [`EmbeddingModel::load`] has always used: every `None` leaves ONNX
+/// Runtime's own default in place, and `batch_size == 1` makes
+/// `embed_batch` a plain loop over [`EmbeddingModel::embed`].
+///
+/// Not part of the embedding cache key or of `embedding_version`: a setting
+/// that changes vectors beyond rounding would mix old and new vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferenceOptions {
+    /// Intra-op threads; `None` = ORT default.
+    pub intra_threads: Option<usize>,
+    /// Inter-op threads; `Some` also turns on parallel execution, without
+    /// which ORT ignores the count.
+    pub inter_threads: Option<usize>,
+    pub optimization: OptLevel,
+    /// Whether intra-op workers spin while idle; `None` = ORT default.
+    pub intra_spinning: Option<bool>,
+    /// Most texts per batched call; 1 = one `embed` call per text.
+    pub batch_size: usize,
+    /// Most padded tokens per batched call. A text longer than this still
+    /// runs, alone.
+    pub token_budget: usize,
+    /// Sort texts by token length before forming batches.
+    pub bucket_by_length: bool,
+}
+
+impl Default for InferenceOptions {
+    fn default() -> Self {
+        Self {
+            intra_threads: None,
+            inter_threads: None,
+            optimization: OptLevel::All,
+            intra_spinning: None,
+            batch_size: 1,
+            token_budget: DEFAULT_TOKEN_BUDGET,
+            bucket_by_length: false,
+        }
+    }
+}
+
+impl InferenceOptions {
+    /// Reads the `G_MESH_EMBED_*` variables of the process environment.
+    pub fn from_env() -> Self {
+        Self::from_env_with(|name| std::env::var(name).ok())
+    }
+
+    /// [`from_env`](Self::from_env) over any variable lookup. Never fails:
+    /// an unparsable value is logged and the default kept.
+    pub fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Self {
+        let mut options = Self::default();
+        let value = |name: &str| get(name).map(|v| v.trim().to_ascii_lowercase()).filter(|v| !v.is_empty());
+        let invalid = |name: &str, raw: &str| {
+            crate::log_line!("g-mesh: ignoring {name}={raw:?}: not a valid value, using the default");
+        };
+        let positive = |raw: &str| raw.parse::<usize>().ok().filter(|&n| n >= 1);
+        let flag = |raw: &str| match raw {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
+        };
+
+        if let Some(raw) = value(INTRA_THREADS_ENV) {
+            match raw.as_str() {
+                "0" => {}
+                "physical" => options.intra_threads = Some(physical_cores()),
+                "logical" => options.intra_threads = Some(logical_cores()),
+                other => match positive(other) {
+                    Some(n) => options.intra_threads = Some(n),
+                    None => invalid(INTRA_THREADS_ENV, &raw),
+                },
+            }
+        }
+        if let Some(raw) = value(INTER_THREADS_ENV) {
+            match positive(&raw) {
+                Some(n) => options.inter_threads = Some(n),
+                None => invalid(INTER_THREADS_ENV, &raw),
+            }
+        }
+        if let Some(raw) = value(OPT_LEVEL_ENV) {
+            match raw.as_str() {
+                "disable" => options.optimization = OptLevel::Disable,
+                "basic" => options.optimization = OptLevel::Basic,
+                "extended" => options.optimization = OptLevel::Extended,
+                "all" => options.optimization = OptLevel::All,
+                _ => invalid(OPT_LEVEL_ENV, &raw),
+            }
+        }
+        if let Some(raw) = value(SPIN_ENV) {
+            match flag(&raw) {
+                Some(spin) => options.intra_spinning = Some(spin),
+                None => invalid(SPIN_ENV, &raw),
+            }
+        }
+        if let Some(raw) = value(BATCH_ENV) {
+            match positive(&raw) {
+                Some(n) => options.batch_size = n,
+                None => invalid(BATCH_ENV, &raw),
+            }
+        }
+        if let Some(raw) = value(TOKEN_BUDGET_ENV) {
+            match positive(&raw) {
+                Some(n) => options.token_budget = n,
+                None => invalid(TOKEN_BUDGET_ENV, &raw),
+            }
+        }
+        if let Some(raw) = value(BUCKET_ENV) {
+            match flag(&raw) {
+                Some(bucket) => options.bucket_by_length = bucket,
+                None => invalid(BUCKET_ENV, &raw),
+            }
+        }
+        options
+    }
+}
+
+/// Logical CPUs (hardware threads) available to this process.
+pub fn logical_cores() -> usize {
+    std::thread::available_parallelism().map(std::num::NonZeroUsize::get).unwrap_or(1)
+}
+
+/// Physical CPU cores: `hw.physicalcpu` on macOS, distinct
+/// `(physical id, core id)` pairs of `/proc/cpuinfo` on Linux, and
+/// [`logical_cores`] wherever neither answers.
+pub fn physical_cores() -> usize {
+    physical_cores_from_os().filter(|&n| n >= 1).unwrap_or_else(logical_cores)
+}
+
+#[cfg(target_os = "macos")]
+fn physical_cores_from_os() -> Option<usize> {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is NUL-terminated, `value` is a c_int and `size`
+    // holds its size, as sysctlbyname requires for an integer OID.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.physicalcpu".as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0).then(|| usize::try_from(value).ok()).flatten()
+}
+
+#[cfg(target_os = "linux")]
+fn physical_cores_from_os() -> Option<usize> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    Some(physical_cores_in_cpuinfo(&cpuinfo)).filter(|&n| n >= 1)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn physical_cores_from_os() -> Option<usize> {
+    None
+}
+
+/// Distinct `(physical id, core id)` pairs in `/proc/cpuinfo` text; 0 when
+/// the file names no core ids.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn physical_cores_in_cpuinfo(cpuinfo: &str) -> usize {
+    let mut cores = std::collections::BTreeSet::new();
+    let mut package = String::new();
+    for line in cpuinfo.lines() {
+        let Some((key, value)) = line.split_once(':') else { continue };
+        match key.trim() {
+            "physical id" => package = value.trim().to_string(),
+            "core id" => {
+                cores.insert((package.clone(), value.trim().to_string()));
+            }
+            _ => {}
+        }
+    }
+    cores.len()
+}
+
+/// What [`EmbeddingModel::embed_batch_with_stats`] ran: the number of
+/// encoder calls, and for the batched path the real and padded token counts
+/// (`None` on the one-call-per-text path, which pads nothing).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchStats {
+    pub batches: usize,
+    pub real_tokens: Option<usize>,
+    pub padded_tokens: Option<usize>,
+}
+
+impl BatchStats {
+    pub fn add(&mut self, other: BatchStats) {
+        self.batches += other.batches;
+        self.real_tokens = sum_counts(self.real_tokens, other.real_tokens);
+        self.padded_tokens = sum_counts(self.padded_tokens, other.padded_tokens);
+    }
+}
+
+fn sum_counts(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    }
+}
+
+/// Groups text indices into batches for [`EmbeddingModel::embed_batch`].
+///
+/// Every index in `0..lengths.len()` appears exactly once. With `bucket`
+/// the indices are taken in order of `(length, index)`, otherwise in input
+/// order. A batch grows while it holds fewer than `batch_size` texts and
+/// `(count + 1) x longest` stays within `token_budget`; a text longer than
+/// the budget forms a batch of its own.
+pub(crate) fn plan_batches(
+    lengths: &[usize],
+    batch_size: usize,
+    token_budget: usize,
+    bucket: bool,
+) -> Vec<Vec<usize>> {
+    let batch_size = batch_size.max(1);
+    let mut order: Vec<usize> = (0..lengths.len()).collect();
+    if bucket {
+        order.sort_by_key(|&i| (lengths[i], i));
+    }
+    let mut batches = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut longest = 0usize;
+    for index in order {
+        let length = lengths[index];
+        let widened = longest.max(length);
+        if !current.is_empty()
+            && (current.len() >= batch_size || (current.len() + 1).saturating_mul(widened) > token_budget)
+        {
+            batches.push(std::mem::take(&mut current));
+            longest = 0;
+        }
+        longest = longest.max(length);
+        current.push(index);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
 /// A loaded ONNX encoder plus its tokenizer.
 ///
 /// Loading is expensive (hundreds of MiB read and graph-optimized, ~1s), so a
@@ -268,6 +546,9 @@ pub struct EmbeddingModel {
     session: Session,
     tokenizer: Tokenizer,
     spec: EncoderSpec,
+    options: InferenceOptions,
+    /// Token id written into the padded tail of a batched input; masked out.
+    pad_id: i64,
 }
 
 /// Hand-written rather than derived: the fields are a loaded ONNX graph and a
@@ -310,6 +591,18 @@ impl EmbeddingModel {
     /// [`load`](Self::load) for an encoder described by `spec` rather than
     /// the default model's [`EncoderSpec::production`].
     pub fn load_with_spec(model_dir: &Path, spec: EncoderSpec) -> Result<Self> {
+        Self::load_with_options(model_dir, spec, &InferenceOptions::default())
+    }
+
+    /// [`load_with_spec`](Self::load_with_spec) with the session built and
+    /// batches formed as `options` says. Each option reaches the session
+    /// builder only when it is set, so the default options build exactly the
+    /// session `load` always has.
+    pub fn load_with_options(
+        model_dir: &Path,
+        spec: EncoderSpec,
+        options: &InferenceOptions,
+    ) -> Result<Self> {
         let max_sequence_length = spec.max_sequence_length;
         if max_sequence_length == 0 {
             bail!("max_sequence_length must be at least 1");
@@ -345,11 +638,26 @@ impl EmbeddingModel {
         // Some exported tokenizer.json files carry a padding config; a batch
         // of one needs none, and pooling must see only the text's own tokens.
         tokenizer.with_padding(None);
+        let pad_id = tokenizer.token_to_id("<pad>").map_or(0, i64::from);
 
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .context("failed to create ONNX session builder")?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .context("failed to set ONNX graph optimization level")?
+            .with_optimization_level(options.optimization.into())
+            .context("failed to set ONNX graph optimization level")?;
+        if let Some(threads) = options.intra_threads {
+            builder = builder.with_intra_threads(threads).context("failed to set ONNX intra-op threads")?;
+        }
+        if let Some(threads) = options.inter_threads {
+            builder = builder
+                .with_parallel_execution(true)
+                .context("failed to enable ONNX parallel execution")?
+                .with_inter_threads(threads)
+                .context("failed to set ONNX inter-op threads")?;
+        }
+        if let Some(spin) = options.intra_spinning {
+            builder = builder.with_intra_op_spinning(spin).context("failed to set ONNX intra-op spinning")?;
+        }
+        let session = builder
             // Fixes the floating-point reduction order inside ONNX Runtime, so
             // two runs of the same input cannot differ in the last bits.
             .with_deterministic_compute(true)
@@ -357,7 +665,12 @@ impl EmbeddingModel {
             .commit_from_file(&onnx_path)
             .with_context(|| format!("failed to load ONNX model {}", onnx_path.display()))?;
 
-        Ok(Self { session, tokenizer, spec })
+        Ok(Self { session, tokenizer, spec, options: *options, pad_id })
+    }
+
+    /// The options this model was loaded with.
+    pub fn options(&self) -> InferenceOptions {
+        self.options
     }
 
     /// The spec this model was loaded with.
@@ -399,10 +712,7 @@ impl EmbeddingModel {
         debug_assert_eq!(ids.len(), mask.len());
 
         let sequence_length = ids.len();
-        // Batch of one. Batching several texts would mean padding them to a
-        // common length, which changes nothing about the result (the
-        // attention mask already excludes padding, both in the network and in
-        // `mean_pool`) but is not needed yet.
+        // Batch of one, unpadded; `embed_batch` is the padded path.
         let input_shape = [1usize, sequence_length];
         let input_ids = Tensor::from_array((input_shape, ids)).context("failed to build input_ids tensor")?;
         let attention_mask = Tensor::from_array((input_shape, mask.clone()))
@@ -429,6 +739,130 @@ impl EmbeddingModel {
 
         pool(self.spec.pooling, self.spec.dimension, shape, values, &mask, sequence_length)
     }
+
+    /// Embeds every text, result `i` belonging to `texts[i]`.
+    ///
+    /// With `batch_size == 1` (the default) this is exactly one
+    /// [`embed`](Self::embed) call per text, so its vectors are bit-identical
+    /// to `embed`'s.
+    pub fn embed_batch(&self, texts: &[&str]) -> Vec<Result<Vec<f32>>> {
+        self.embed_batch_with_stats(texts).0
+    }
+
+    /// [`embed_batch`](Self::embed_batch), also reporting what ran.
+    ///
+    /// With `batch_size > 1` the texts are tokenized, grouped by
+    /// [`plan_batches`], each group padded to its longest text (padding is
+    /// masked out) and run as one `[B, L]` call. Results are written back by
+    /// original index, so the grouping never reorders the output. A group
+    /// whose inference fails is retried one text at a time with `embed`, so
+    /// one bad text fails alone; a group of one is a plain `embed` call.
+    pub fn embed_batch_with_stats(&self, texts: &[&str]) -> (Vec<Result<Vec<f32>>>, BatchStats) {
+        if self.options.batch_size <= 1 {
+            let results = texts.iter().map(|text| self.embed(text)).collect();
+            return (results, BatchStats { batches: texts.len(), ..BatchStats::default() });
+        }
+
+        let mut out: Vec<Option<Result<Vec<f32>>>> = (0..texts.len()).map(|_| None).collect();
+        let mut stats = BatchStats { batches: 0, real_tokens: Some(0), padded_tokens: Some(0) };
+        // (original index, ids, mask) of every text that tokenized.
+        let mut encoded: Vec<(usize, Vec<i64>, Vec<i64>)> = Vec::with_capacity(texts.len());
+        for (index, text) in texts.iter().enumerate() {
+            match self.tokenizer.encode(*text, true) {
+                Ok(encoding) if !encoding.get_ids().is_empty() => encoded.push((
+                    index,
+                    encoding.get_ids().iter().map(|&id| i64::from(id)).collect(),
+                    encoding.get_attention_mask().iter().map(|&m| i64::from(m)).collect(),
+                )),
+                // `embed` reports the same failure for this text.
+                _ => out[index] = Some(self.embed(text)),
+            }
+        }
+
+        let lengths: Vec<usize> = encoded.iter().map(|(_, ids, _)| ids.len()).collect();
+        let plan = plan_batches(
+            &lengths,
+            self.options.batch_size,
+            self.options.token_budget,
+            self.options.bucket_by_length,
+        );
+        for batch in plan {
+            stats.batches += 1;
+            let longest = batch.iter().map(|&b| lengths[b]).max().unwrap_or(0);
+            stats.real_tokens =
+                stats.real_tokens.map(|n| n + batch.iter().map(|&b| lengths[b]).sum::<usize>());
+            stats.padded_tokens = stats.padded_tokens.map(|n| n + batch.len() * longest);
+            if let [only] = batch.as_slice() {
+                let index = encoded[*only].0;
+                out[index] = Some(self.embed(texts[index]));
+                continue;
+            }
+            let rows: Vec<(&[i64], &[i64])> =
+                batch.iter().map(|&b| (encoded[b].1.as_slice(), encoded[b].2.as_slice())).collect();
+            match self.run_padded(&rows, longest) {
+                Ok(vectors) => {
+                    for (&b, vector) in batch.iter().zip(vectors) {
+                        out[encoded[b].0] = Some(vector);
+                    }
+                }
+                Err(_) => {
+                    for &b in &batch {
+                        let index = encoded[b].0;
+                        out[index] = Some(self.embed(texts[index]));
+                    }
+                }
+            }
+        }
+
+        let results = out
+            .into_iter()
+            .map(|slot| slot.unwrap_or_else(|| Err(anyhow!("text was not embedded"))))
+            .collect();
+        (results, stats)
+    }
+
+    /// Runs `rows` (ids and mask per text) as one `[B, longest]` call, each
+    /// row padded with the pad id under mask 0, and pools each row. The outer
+    /// error is the call failing; an inner one is that row's pooling failing.
+    fn run_padded(&self, rows: &[(&[i64], &[i64])], longest: usize) -> Result<Vec<Result<Vec<f32>>>> {
+        let batch = rows.len();
+        let mut ids = Vec::with_capacity(batch * longest);
+        let mut mask = Vec::with_capacity(batch * longest);
+        for (row_ids, row_mask) in rows {
+            ids.extend_from_slice(row_ids);
+            ids.resize(ids.len() + longest - row_ids.len(), self.pad_id);
+            mask.extend_from_slice(row_mask);
+            mask.resize(mask.len() + longest - row_mask.len(), 0);
+        }
+        let input_shape = [batch, longest];
+        let input_ids = Tensor::from_array((input_shape, ids)).context("failed to build input_ids tensor")?;
+        let attention_mask = Tensor::from_array((input_shape, mask.clone()))
+            .context("failed to build attention_mask tensor")?;
+        let outputs = if self.spec.token_type_ids {
+            let token_type_ids = Tensor::from_array((input_shape, vec![0i64; batch * longest]))
+                .context("failed to build token_type_ids tensor")?;
+            self.session.run(ort::inputs![
+                INPUT_IDS => input_ids,
+                ATTENTION_MASK => attention_mask,
+                TOKEN_TYPE_IDS => token_type_ids
+            ]?)
+        } else {
+            self.session.run(ort::inputs![INPUT_IDS => input_ids, ATTENTION_MASK => attention_mask]?)
+        }
+        .context("ONNX inference failed")?;
+        let hidden_state = outputs
+            .get(LAST_HIDDEN_STATE)
+            .ok_or_else(|| anyhow!("model produced no `{LAST_HIDDEN_STATE}` output"))?;
+        let (shape, values) = hidden_state
+            .try_extract_raw_tensor::<f32>()
+            .context("failed to read `last_hidden_state` as f32")?;
+        Ok((0..batch)
+            .map(|row| {
+                let row_mask = &mask[row * longest..(row + 1) * longest];
+                pool_row(self.spec.pooling, self.spec.dimension, shape, values, row_mask, row, longest)
+            })
+            .collect())
+    }
 }
 
 /// Pools `[1, sequence_length, dimension]` hidden states into one vector
@@ -451,7 +885,47 @@ fn pool(
              The model directory is probably not a {dimension}-dimensional BERT-style encoder."
         );
     }
+    pool_checked(pooling, dimension, values, mask, sequence_length)
+}
 
+/// [`pool`] for row `row` of padded `[B, sequence_length, dimension]` hidden
+/// states, with `mask` that row's mask (padding marked 0). The same
+/// arithmetic as `pool` over that row's slice.
+pub(crate) fn pool_row(
+    pooling: Pooling,
+    dimension: usize,
+    shape: &[i64],
+    values: &[f32],
+    mask: &[i64],
+    row: usize,
+    sequence_length: usize,
+) -> Result<Vec<f32>> {
+    let rows = match shape {
+        [rows, length, width] if *length == sequence_length as i64 && *width == dimension as i64 => *rows,
+        _ => bail!(
+            "unexpected `{LAST_HIDDEN_STATE}` shape {shape:?}; expected [B, {sequence_length}, {dimension}]. \
+             The model directory is probably not a {dimension}-dimensional BERT-style encoder."
+        ),
+    };
+    if row as i64 >= rows {
+        bail!("row {row} is outside the `{LAST_HIDDEN_STATE}` batch of {rows}");
+    }
+    let width = sequence_length * dimension;
+    let Some(row_values) = values.get(row * width..(row + 1) * width) else {
+        bail!("`{LAST_HIDDEN_STATE}` holds {} values, too few for shape {shape:?}", values.len());
+    };
+    pool_checked(pooling, dimension, row_values, mask, sequence_length)
+}
+
+/// Pooling and normalisation of one text's `[sequence_length, dimension]`
+/// hidden states, already shape-checked.
+fn pool_checked(
+    pooling: Pooling,
+    dimension: usize,
+    values: &[f32],
+    mask: &[i64],
+    sequence_length: usize,
+) -> Result<Vec<f32>> {
     let mut pooled = vec![0f32; dimension];
     match pooling {
         Pooling::Mean => {

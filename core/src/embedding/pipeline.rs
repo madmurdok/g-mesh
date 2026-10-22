@@ -65,8 +65,8 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::config::EmbeddingConfig;
 use crate::embedding::cache::{self, EmbeddingCache, Hash, OpenError};
 use crate::embedding::model::{
-    check_default_weights, default_model_dir, embedding_version, EmbeddingModel, ONNX_FILE_NAME,
-    TOKENIZER_FILE_NAME,
+    check_default_weights, default_model_dir, embedding_version, EmbeddingModel, EncoderSpec,
+    InferenceOptions, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
 use crate::embedding::rerank::Reranker;
 use crate::embedding::text::{node_text, EmbedInput};
@@ -77,11 +77,21 @@ use crate::storage::write::{Diff, NodeRecord};
 /// deterministic fake in tests that count inference calls.
 pub(crate) trait Embedder: Send + Sync {
     fn embed(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Embeds every text; result `i` belongs to `texts[i]` and one text
+    /// failing never fails another.
+    fn embed_batch(&self, texts: &[&str]) -> Vec<Result<Vec<f32>>> {
+        texts.iter().map(|text| self.embed(text)).collect()
+    }
 }
 
 impl Embedder for EmbeddingModel {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         EmbeddingModel::embed(self, text)
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Vec<Result<Vec<f32>>> {
+        EmbeddingModel::embed_batch(self, texts)
     }
 }
 
@@ -237,7 +247,12 @@ impl EmbeddingPipeline {
                 if pinned_weights {
                     check_default_weights(dir)?;
                 }
-                Ok(Box::new(EmbeddingModel::load(dir)?) as Box<dyn Embedder>)
+                let model = EmbeddingModel::load_with_options(
+                    dir,
+                    EncoderSpec::production(),
+                    &InferenceOptions::from_env(),
+                )?;
+                Ok(Box::new(model) as Box<dyn Embedder>)
             }),
             model: OnceLock::new(),
             cache: Mutex::new(cache),
@@ -453,16 +468,40 @@ impl EmbeddingPipeline {
         }
         stats.texts += pending.len();
 
+        let hits: Vec<Option<Vec<f32>>> =
+            (0..pending.len()).map(|index| cached.as_mut().and_then(|hits| hits[index].take())).collect();
+        // One result slot per pending text; filled for the misses only. The
+        // model may group and reorder the misses, but its result `i` belongs
+        // to its text `i`, so each vector lands on its own node and key.
+        let mut results: Vec<Option<Result<Vec<f32>>>> = (0..pending.len()).map(|_| None).collect();
+        let misses: Vec<usize> = (0..pending.len()).filter(|&index| hits[index].is_none()).collect();
+        if !misses.is_empty() {
+            if let Some(model) = self.model() {
+                let texts: Vec<&str> = misses.iter().map(|&index| pending[index].1.as_str()).collect();
+                let embedded = model.embed_batch(&texts);
+                if embedded.len() != misses.len() {
+                    crate::log_line!(
+                        "g-mesh daemon: the model returned {} vectors for {} texts - the rest are left unembedded",
+                        embedded.len(),
+                        misses.len()
+                    );
+                }
+                for (&index, result) in misses.iter().zip(embedded) {
+                    results[index] = Some(result);
+                }
+            }
+        }
+
         let mut computed = Vec::with_capacity(pending.len());
         let mut fresh: Vec<(Hash, usize)> = Vec::new();
-        for (index, (node_id, text)) in pending.into_iter().enumerate() {
-            if let Some(embedding) = cached.as_mut().and_then(|hits| hits[index].take()) {
+        for ((index, (node_id, text)), hit) in pending.into_iter().enumerate().zip(hits) {
+            if let Some(embedding) = hit {
                 stats.hits += 1;
                 computed.push(ComputedEmbedding { node_id: node_id.to_string(), embedding, text });
                 continue;
             }
-            let Some(model) = self.model() else { continue };
-            match model.embed(&text) {
+            let Some(result) = results[index].take() else { continue };
+            match result {
                 Ok(embedding) => {
                     stats.embedded += 1;
                     fresh.push((keys[index], computed.len()));
