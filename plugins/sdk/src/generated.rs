@@ -187,3 +187,49 @@ fn has_generated_token(line: &str) -> bool {
         preceded && (ends || (spaced && (by || rest.starts_with("SignedSource"))))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_generated;
+
+    /// The cases shared with the Go detector (`plugins/go/generated_test.go`
+    /// reads the same file).
+    const CASES: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/generated_headers.json"));
+
+    fn cases() -> Vec<(String, String, bool)> {
+        let parsed: serde_json::Value = serde_json::from_str(CASES).expect("the case file is JSON");
+        parsed["cases"]
+            .as_array()
+            .expect("a `cases` array")
+            .iter()
+            .map(|case| {
+                (
+                    case["name"].as_str().expect("a case name").to_string(),
+                    case["source"].as_str().expect("a case source").to_string(),
+                    case["generated"].as_bool().expect("a case verdict"),
+                )
+            })
+            .collect()
+    }
+
+    /// Every shared case: the section 3 rules table (R1/R2 positives), the
+    /// false-hit table, the header-window cases (marker after code, past 64
+    /// lines, after a copyright block), quotes/backticks, and the review
+    /// cases. All mismatches are listed at once.
+    ///
+    /// Controls: `header_lines` not stopping at the first other line
+    /// (`break` -> `continue`) fails "marker after the first code line";
+    /// `is_generated` reading `line.to_string()` instead of `unquoted(line)`
+    /// fails "module doc quoting the markers in backticks".
+    #[test]
+    fn every_shared_case_gets_its_verdict() {
+        let cases = cases();
+        assert_eq!(cases.len(), 85, "the case file changed size; update this count with it");
+        let mismatches: Vec<String> = cases
+            .iter()
+            .filter(|(_, source, want)| is_generated(source) != *want)
+            .map(|(name, _, want)| format!("{name}: want {want}"))
+            .collect();
+        assert!(mismatches.is_empty(), "{} mismatches:\n{}", mismatches.len(), mismatches.join("\n"));
+    }
+}

@@ -713,4 +713,23 @@ pub(crate) mod tests {
         assert!(!is_noise(&input(&at("crate::contests::checks_it", "fn checks_it()"))));
         assert!(!is_noise(&input(&at("attests::checks_it", "fn checks_it()"))));
     }
+
+    /// A node of a generated file embeds as nothing, though the same node
+    /// unflagged has text (a documented, signed function: no noise).
+    /// Control: drop `input.generated ||` from `node_text`.
+    #[test]
+    fn a_generated_node_has_no_text_to_embed() {
+        let node: Node = (
+            "Function",
+            "get_name",
+            "pb::User::get_name",
+            "pb/user.pb.go",
+            Some("GetName returns the user's name."),
+            "func (x *User) GetName() string",
+        );
+        let plain = input(&node);
+        assert!(node_text(&plain).is_some(), "sanity: the unflagged node embeds");
+        let generated = EmbedInput { generated: true, ..input(&node) };
+        assert_eq!(node_text(&generated), None);
+    }
 }
