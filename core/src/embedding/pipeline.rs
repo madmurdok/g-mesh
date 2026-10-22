@@ -934,9 +934,15 @@ pub(crate) mod test_support {
         loads: Arc<AtomicUsize>,
         embeds: Arc<AtomicUsize>,
         received: Arc<Mutex<Vec<String>>>,
+        batches: Arc<Mutex<Vec<usize>>>,
     }
 
     impl Counters {
+        /// The size of every `embed_batch` call the batching fake served.
+        pub(crate) fn batches(&self) -> Vec<usize> {
+            self.batches.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        }
+
         pub(crate) fn loads(&self) -> usize {
             self.loads.load(Ordering::SeqCst)
         }
@@ -962,6 +968,57 @@ pub(crate) mod test_support {
             self.received.lock().unwrap_or_else(PoisonError::into_inner).push(text.to_string());
             Ok(fake_vector(text))
         }
+    }
+
+    /// A fake that serves `embed_batch` as a real batching model does: it
+    /// embeds the texts in its own (reversed) order and writes each result
+    /// back to its input position, then drops the last `short_by` results.
+    struct BatchingFakeEmbedder {
+        inner: FakeEmbedder,
+        batches: Arc<Mutex<Vec<usize>>>,
+        short_by: usize,
+    }
+
+    impl Embedder for BatchingFakeEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>> {
+            self.inner.embed(text)
+        }
+
+        fn embed_batch(&self, texts: &[&str]) -> Vec<Result<Vec<f32>>> {
+            self.batches.lock().unwrap_or_else(PoisonError::into_inner).push(texts.len());
+            let mut out: Vec<Option<Result<Vec<f32>>>> = (0..texts.len()).map(|_| None).collect();
+            for index in (0..texts.len()).rev() {
+                out[index] = Some(self.inner.embed(texts[index]));
+            }
+            let keep = texts.len().saturating_sub(self.short_by);
+            out.into_iter().take(keep).map(Option::unwrap).collect()
+        }
+    }
+
+    /// A pipeline over [`BatchingFakeEmbedder`] in `model_dir`, counting
+    /// into `counters`.
+    pub(crate) fn fake_batching_pipeline(
+        model_dir: &Path,
+        cache: Option<CacheSettings>,
+        counters: &Counters,
+        short_by: usize,
+    ) -> EmbeddingPipeline {
+        let counters = counters.clone();
+        EmbeddingPipeline::with_loader(
+            model_dir,
+            move |_dir| {
+                counters.loads.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(BatchingFakeEmbedder {
+                    inner: FakeEmbedder {
+                        embeds: Arc::clone(&counters.embeds),
+                        received: Arc::clone(&counters.received),
+                    },
+                    batches: Arc::clone(&counters.batches),
+                    short_by,
+                }) as Box<dyn Embedder>)
+            },
+            cache,
+        )
     }
 
     /// The fake model's vector for `text`: a function of the text alone.
@@ -1315,7 +1372,9 @@ mod tests {
     // The embedding cache seam, over the fake model in `test_support`.
     // -----------------------------------------------------------------
 
-    use super::test_support::{cache_at, fake_model_dir, fake_pipeline, fake_vector, Counters};
+    use super::test_support::{
+        cache_at, fake_batching_pipeline, fake_model_dir, fake_pipeline, fake_vector, Counters,
+    };
 
     fn documented(id: &str, doc: &str) -> crate::storage::write::NodeRecord {
         let mut node = crate::storage::write::NodeRecord::new(id, "Function", id, id, "src/lib.rs", "rust");
@@ -1879,5 +1938,103 @@ mod tests {
         EmbeddingPipeline::disabled().store(&conn, &computed);
 
         assert_eq!(vector_count(&conn), 0, "a node that is noise now must get no vector");
+    }
+
+    // -----------------------------------------------------------------
+    // Batched inference: `compute` hands the misses to `embed_batch`.
+    // -----------------------------------------------------------------
+
+    /// Asserts each computed entry carries its own node's text and the
+    /// fake's vector of that text.
+    fn assert_paired(batch: &ComputedBatch) {
+        for entry in &batch.embeddings {
+            assert!(
+                entry.text.starts_with(&format!("Does thing {}.", &entry.node_id[1..])),
+                "node {} carries text {:?}",
+                entry.node_id,
+                entry.text
+            );
+            assert_eq!(bits(&entry.embedding), bits(&fake_vector(&entry.text)), "node {}", entry.node_id);
+        }
+    }
+
+    /// B8: with cache hits mixed in, the misses go to the model in one
+    /// `embed_batch` call, and each vector stays on its own node id and is
+    /// cached under its own text's key: a later all-hit pass serves every
+    /// node the vector of its own text.
+    ///
+    /// Control: in `compute`, pair the batch results with pending positions
+    /// `0..` instead of the miss indices (`misses.iter().zip(embedded)` ->
+    /// `(0..).zip(embedded)`) and vectors land on the wrong nodes.
+    #[test]
+    fn batched_misses_keep_their_node_and_cache_key_with_hits_mixed_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&dir.path().join("model"), "weights v1");
+        let full = diff_of(6);
+        let warm_part = Diff {
+            upsert_nodes: vec![documented("n1", "Does thing 1."), documented("n4", "Does thing 4.")],
+            ..Default::default()
+        };
+        fake_pipeline(&model_dir, Some(cache_at(dir.path())), &Counters::default())
+            .compute(&warm_part, &mut EmbedStats::default());
+
+        let counters = Counters::default();
+        let mut stats = EmbedStats::default();
+        let batch = fake_batching_pipeline(&model_dir, Some(cache_at(dir.path())), &counters, 0)
+            .compute(&full, &mut stats);
+
+        assert_eq!(counters.batches(), vec![4], "the four misses go to the model in one call");
+        assert_eq!((stats.texts, stats.hits, stats.embedded, stats.inserted), (6, 2, 4, 4));
+        let ids: Vec<&str> = batch.embeddings.iter().map(|entry| entry.node_id.as_str()).collect();
+        assert_eq!(ids, ["n0", "n1", "n2", "n3", "n4", "n5"], "results keep the diff's order");
+        assert_paired(&batch);
+
+        let replay = Counters::default();
+        let cached = fake_pipeline(&model_dir, Some(cache_at(dir.path())), &replay)
+            .compute(&full, &mut EmbedStats::default());
+        assert_eq!(replay.embeds(), 0, "every text is cached now");
+        assert_eq!(cached.embeddings.len(), 6);
+        assert_paired(&cached);
+    }
+
+    /// B8: without a cache every text is a miss, and the batch still pairs
+    /// each vector with its node.
+    #[test]
+    fn batched_compute_without_a_cache_pairs_every_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&dir.path().join("model"), "weights v1");
+        let counters = Counters::default();
+        let mut stats = EmbedStats::default();
+        let batch = fake_batching_pipeline(&model_dir, None, &counters, 0).compute(&diff_of(5), &mut stats);
+
+        assert_eq!(counters.batches(), vec![5]);
+        assert_eq!((stats.texts, stats.hits, stats.embedded), (5, 0, 5));
+        assert_eq!(batch.embeddings.len(), 5);
+        assert_paired(&batch);
+    }
+
+    /// B8: a model that returns fewer results than texts leaves the
+    /// unanswered nodes unembedded; nothing panics and no other node gets a
+    /// wrong vector or cache entry.
+    #[test]
+    fn a_short_batch_result_leaves_the_rest_unembedded() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&dir.path().join("model"), "weights v1");
+        let counters = Counters::default();
+        let mut stats = EmbedStats::default();
+        let batch = fake_batching_pipeline(&model_dir, Some(cache_at(dir.path())), &counters, 2)
+            .compute(&diff_of(5), &mut stats);
+
+        let ids: Vec<&str> = batch.embeddings.iter().map(|entry| entry.node_id.as_str()).collect();
+        assert_eq!(ids, ["n0", "n1", "n2"]);
+        assert_eq!((stats.embedded, stats.inserted), (3, 3));
+        assert_paired(&batch);
+
+        let replay = Counters::default();
+        let mut replay_stats = EmbedStats::default();
+        let again = fake_pipeline(&model_dir, Some(cache_at(dir.path())), &replay)
+            .compute(&diff_of(5), &mut replay_stats);
+        assert_eq!((replay_stats.hits, replay.embeds()), (3, 2), "only the answered texts were cached");
+        assert_paired(&again);
     }
 }

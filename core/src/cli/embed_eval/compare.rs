@@ -278,3 +278,188 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
         dot / (na * nb)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DIM: usize = 8;
+
+    /// A unit vector per node, distinct per index.
+    fn unit(index: usize) -> Vec<f32> {
+        let raw: Vec<f32> = (0..DIM).map(|d| ((index * 5 + d * 3) % 11) as f32 + 1.0).collect();
+        let norm = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
+        raw.iter().map(|v| v / norm).collect()
+    }
+
+    fn ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("node-{i}")).collect()
+    }
+
+    fn vectors(n: usize) -> Vec<Vec<f32>> {
+        (0..n).map(unit).collect()
+    }
+
+    /// `vector` moved by `distance` in L2 along its first axis.
+    fn offset(vector: &[f32], distance: f32) -> Vec<f32> {
+        let mut moved = vector.to_vec();
+        moved[0] += distance;
+        moved
+    }
+
+    /// B9: identical runs pass, all nodes bit-identical.
+    #[test]
+    fn identical_runs_pass_and_are_bit_identical() {
+        let comparison = compare_vectors(&ids(5), &vectors(5), &ids(5), &vectors(5), DEFAULT_MAX_L2);
+        assert!(comparison.passes());
+        assert_eq!((comparison.compared, comparison.bit_identical, comparison.over_tolerance), (5, 5, 0));
+        assert_eq!(comparison.max_l2, 0.0);
+        assert!(comparison.offenders.is_empty());
+    }
+
+    /// B9: one node moved by L2 2e-4 fails and is named; one moved by 5e-5
+    /// passes but is no longer bit-identical.
+    ///
+    /// Control: make the tolerance check always pass (`l2.is_nan() || l2 >
+    /// max_l2` -> `false`) and the 2e-4 node passes.
+    #[test]
+    fn a_node_over_the_tolerance_fails_and_is_named() {
+        let mut candidate = vectors(5);
+        candidate[3] = offset(&candidate[3], 2e-4);
+        let comparison = compare_vectors(&ids(5), &vectors(5), &ids(5), &candidate, DEFAULT_MAX_L2);
+        assert!(!comparison.passes());
+        assert_eq!(comparison.over_tolerance, 1);
+        assert_eq!(comparison.offenders.len(), 1);
+        assert_eq!(comparison.offenders[0].0, "node-3");
+        assert!((comparison.offenders[0].1 - 2e-4).abs() < 1e-6, "{}", comparison.offenders[0].1);
+        assert_eq!(comparison.max_l2_node.as_deref(), Some("node-3"));
+        assert_eq!(comparison.bit_identical, 4);
+
+        let mut near = vectors(5);
+        near[1] = offset(&near[1], 5e-5);
+        let comparison = compare_vectors(&ids(5), &vectors(5), &ids(5), &near, DEFAULT_MAX_L2);
+        assert!(comparison.passes(), "{comparison:?}");
+        assert_eq!((comparison.bit_identical, comparison.over_tolerance), (4, 0));
+        assert_eq!(comparison.max_l2_node.as_deref(), Some("node-1"));
+    }
+
+    /// B9: a NaN vector counts as over the tolerance.
+    #[test]
+    fn a_nan_vector_counts_as_over_the_tolerance() {
+        let mut candidate = vectors(3);
+        candidate[2][0] = f32::NAN;
+        let comparison = compare_vectors(&ids(3), &vectors(3), &ids(3), &candidate, DEFAULT_MAX_L2);
+        assert_eq!(comparison.over_tolerance, 1);
+        assert_eq!(comparison.offenders[0].0, "node-2");
+    }
+
+    /// B9: nodes are matched by id, not by row, and only ids both runs hold
+    /// are compared.
+    #[test]
+    fn nodes_are_matched_by_id_over_the_intersection() {
+        let baseline_ids = ids(4);
+        let candidate_ids: Vec<String> = ["node-2", "node-0", "node-9", "node-3"].map(String::from).to_vec();
+        let candidate: Vec<Vec<f32>> = vec![unit(2), unit(0), unit(9), unit(3)];
+        let comparison =
+            compare_vectors(&baseline_ids, &vectors(4), &candidate_ids, &candidate, DEFAULT_MAX_L2);
+        assert_eq!((comparison.compared, comparison.bit_identical, comparison.over_tolerance), (3, 3, 0));
+    }
+
+    /// At most ten offenders are named, worst first.
+    #[test]
+    fn at_most_ten_offenders_are_named_worst_first() {
+        let n = 15;
+        let candidate: Vec<Vec<f32>> = (0..n).map(|i| offset(&unit(i), 1e-3 * (i + 1) as f32)).collect();
+        let comparison = compare_vectors(&ids(n), &vectors(n), &ids(n), &candidate, DEFAULT_MAX_L2);
+        assert_eq!(comparison.over_tolerance, n);
+        assert_eq!(comparison.offenders.len(), NAMED_OFFENDERS);
+        assert_eq!(comparison.offenders[0].0, "node-14");
+        assert!(comparison.offenders.windows(2).all(|w| w[0].1 >= w[1].1));
+    }
+
+    fn manifest(ids: &[String]) -> Manifest {
+        Manifest {
+            variant: "jina-v2-base-code-int8-structured".to_string(),
+            variant_fingerprint: "fp-1".to_string(),
+            corpus: "gin".to_string(),
+            revision: "rev".to_string(),
+            snapshot_sha256: "snap".to_string(),
+            node_ids_sha256: node_ids_sha256(ids.iter().map(String::as_str)),
+            node_count: ids.len(),
+            dimension: DIM,
+            query_ids: Vec::new(),
+            query_files: Vec::new(),
+            model_files: Vec::new(),
+            model_source: None,
+            token_share_over_512: None,
+            token_share_over_1024: None,
+            gmesh_version: "test".to_string(),
+        }
+    }
+
+    /// B9: runs of another variant, snapshot or node set are refused unless
+    /// `--allow-variant-mismatch`; another corpus or width never compares.
+    #[test]
+    fn mismatched_runs_are_refused_without_the_switch() {
+        let base = manifest(&ids(4));
+        assert!(check_comparable(&base, &base.clone(), false).is_ok());
+
+        let other_variant = Manifest { variant_fingerprint: "fp-2".to_string(), ..base.clone() };
+        assert!(check_comparable(&base, &other_variant, false).is_err());
+        assert!(check_comparable(&base, &other_variant, true).is_ok());
+
+        let other_nodes = manifest(&ids(3));
+        assert!(check_comparable(&base, &other_nodes, false).is_err());
+        assert!(check_comparable(&base, &other_nodes, true).is_ok());
+
+        let other_snapshot = Manifest { snapshot_sha256: "snap-2".to_string(), ..base.clone() };
+        assert!(check_comparable(&base, &other_snapshot, false).is_err());
+
+        let other_corpus = Manifest { corpus: "py-requests".to_string(), ..base.clone() };
+        assert!(check_comparable(&base, &other_corpus, true).is_err());
+        let other_width = Manifest { dimension: DIM + 1, ..base.clone() };
+        assert!(check_comparable(&base, &other_width, true).is_err());
+    }
+
+    fn write_run(dir: &Path, ids: &[String], vectors: &[Vec<f32>]) {
+        std::fs::create_dir_all(dir).unwrap();
+        write_json(&dir.join("manifest.json"), &manifest(ids)).unwrap();
+        super::super::write_vectors(&dir.join("vectors.bin"), vectors).unwrap();
+        write_node_ids(dir, ids.iter().map(String::as_str)).unwrap();
+    }
+
+    fn args(root: &Path, json: &Path) -> CompareArgs {
+        CompareArgs {
+            dir: EvalDir { eval_dir: root.join("no-eval-dir-needed") },
+            baseline: root.join("baseline"),
+            candidate: root.join("candidate"),
+            max_l2: DEFAULT_MAX_L2,
+            json: Some(json.to_path_buf()),
+            allow_variant_mismatch: false,
+        }
+    }
+
+    /// B9 end to end: `compare` over two run directories fails naming the
+    /// node over the tolerance, after writing the JSON; identical runs pass.
+    #[test]
+    fn the_compare_command_fails_naming_the_offending_node() {
+        let root = tempfile::tempdir().unwrap();
+        let json = root.path().join("out.json");
+        write_run(&root.path().join("baseline"), &ids(4), &vectors(4));
+        write_run(&root.path().join("candidate"), &ids(4), &vectors(4));
+        run(&args(root.path(), &json)).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        assert_eq!(written["bitIdentical"], 4);
+
+        let mut moved = vectors(4);
+        moved[2] = offset(&moved[2], 2e-4);
+        write_run(&root.path().join("candidate"), &ids(4), &moved);
+        let err = run(&args(root.path(), &json)).unwrap_err().to_string();
+        assert!(err.contains("node-2"), "{err}");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        assert_eq!(written["overTolerance"], 1);
+        assert_eq!(written["maxL2Node"], "node-2");
+    }
+}

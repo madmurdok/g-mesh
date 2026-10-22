@@ -111,3 +111,56 @@ fn sleep_unless_stopped(total: Duration, stop: &Path) {
         std::thread::sleep(left.min(STOP_POLL));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B11: an existing stop file ends the wait at once.
+    #[test]
+    fn an_existing_stop_file_ends_the_sleep_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("stop");
+        std::fs::write(&stop, "").unwrap();
+        let started = Instant::now();
+        sleep_unless_stopped(Duration::from_secs(60), &stop);
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    /// B11: a stop file that appears mid-sleep ends it within a poll or so,
+    /// never before it appears.
+    #[test]
+    fn a_stop_file_that_appears_mid_sleep_ends_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("stop");
+        let writer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                // Taken before the write: the file cannot exist earlier.
+                let before_write = Instant::now();
+                std::fs::write(&stop, "").unwrap();
+                before_write
+            })
+        };
+        sleep_unless_stopped(Duration::from_secs(60), &stop);
+        let returned = Instant::now();
+        let before_write = writer.join().unwrap();
+        assert!(stop.exists());
+        assert!(returned >= before_write, "returned before the stop file was written");
+        assert!(
+            returned.duration_since(before_write) < Duration::from_secs(20),
+            "{:?}",
+            returned - before_write
+        );
+    }
+
+    /// Without a stop file the sleep lasts its full length.
+    #[test]
+    fn without_a_stop_file_the_sleep_runs_its_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        sleep_unless_stopped(Duration::from_millis(250), &dir.path().join("never"));
+        assert!(started.elapsed() >= Duration::from_millis(250));
+    }
+}

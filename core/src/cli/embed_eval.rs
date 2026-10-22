@@ -1651,6 +1651,36 @@ mod tests {
         assert_eq!(top_hits(&scores), expected);
     }
 
+    /// B10: `timings.json` carries the effective options and the throughput
+    /// under the names the GM-453 summary reads.
+    #[test]
+    fn timings_record_the_options_and_the_throughput() {
+        let options =
+            InferenceOptions { batch_size: 8, bucket_by_length: true, ..InferenceOptions::default() };
+        let timings = Timings {
+            node_count: 10,
+            embed_nodes_ms: 500.0,
+            options: Some(options),
+            embeddings_per_second: Some(20.0),
+            batches: Some(2),
+            real_tokens: Some(100),
+            padded_tokens: Some(160),
+            ..Timings::default()
+        };
+        let json = serde_json::to_value(&timings).unwrap();
+        assert_eq!(json["embeddingsPerSecond"], 20.0);
+        assert_eq!(json["batches"], 2);
+        assert_eq!(json["realTokens"], 100);
+        assert_eq!(json["paddedTokens"], 160);
+        assert_eq!(json["options"]["batchSize"], 8);
+        assert_eq!(json["options"]["tokenBudget"], 8192);
+        assert_eq!(json["options"]["bucketByLength"], true);
+        assert_eq!(json["options"]["optimization"], "all");
+        assert!(json["options"]["intraThreads"].is_null());
+        let back: Timings = serde_json::from_value(json).unwrap();
+        assert_eq!(back.options, Some(options));
+    }
+
     #[test]
     fn top_hits_keep_at_most_the_kept_count() {
         let scores: Vec<f64> = (0..250).map(|i| i as f64).collect();
