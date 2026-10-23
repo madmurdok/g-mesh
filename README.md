@@ -698,6 +698,34 @@ Both are configurable via `[plugin] idleTimeoutMinutes` (per-project
 — see `g-mesh config` / `g-mesh config --global`. The values above are the
 defaults when a project or machine has never run either.
 
+### Tuning the embedding pass
+
+`G_MESH_EMBED_*` variables, read once per daemon, tune the ONNX Runtime
+session that embeds symbols. Empty or absent means the default; an invalid
+value logs one line and keeps the default. **The defaults are unchanged**:
+no setting beat them on every measure
+([`docs/results/gm-453-onnx-tuning.md`](docs/results/gm-453-onnx-tuning.md)).
+
+| Variable | Values | Default |
+|---|---|---|
+| `G_MESH_EMBED_INTRA_THREADS` | `N` (>= 1), `physical`, `logical`, `0` | `0`: ONNX Runtime's own choice |
+| `G_MESH_EMBED_INTER_THREADS` | `N` (>= 1) | unset (ONNX Runtime's own) |
+| `G_MESH_EMBED_OPT_LEVEL` | `disable`, `basic`, `extended`, `all` | `all` |
+| `G_MESH_EMBED_SPIN` | `0`, `1`: intra-op workers spin while idle | unset (ONNX Runtime's own) |
+| `G_MESH_EMBED_BATCH` | `N` (>= 1): most texts per call | `1` |
+| `G_MESH_EMBED_TOKEN_BUDGET` | `N` (>= 1): most padded tokens per batched call | `8192` |
+| `G_MESH_EMBED_BUCKET` | `0`, `1`: sort texts by length before batching | `0` |
+
+*Opt-in recipe:* `G_MESH_EMBED_INTRA_THREADS=2` when indexing beside active
+use. Query p50 stayed near idle (18.7 ms against 33 ms with the default) at
+1.05x the pass time. The cost: an unattended fp32 pass was 1.93x slower. The
+latency was measured with an fp32 query probe without the cross-encoder
+rerank, so the int8 plus rerank path is unmeasured.
+
+*Batching* (`BATCH`, `TOKEN_BUDGET`, `BUCKET`) changes the int8 vectors (L2
+distance up to 0.64 against batch 1). Do not set it on an existing index: old
+and new vectors would mix.
+
 ## Tools exposed
 
 `find_definition`, `find_references`, `find_callers`, `find_callees`,

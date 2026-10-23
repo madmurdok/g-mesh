@@ -37,7 +37,7 @@ Gate: go (thread/opt arms over 5%: A2 A3 A4 A6 A7 A8; no adoptable batching arm)
 | arm | max L2 | min cos | bit-identical | verdict |
 |---|---:|---:|---:|---|
 | A1-A4, A6-A8 | 0 | 1.0 | 100% | pass |
-| A5 opt=basic | 0.158 (14% of unit norm scale; 0.14-0.16 across docs) | 0.987 | 0% | FAIL |
+| A5 opt=basic | 0.158 (0.14-0.16 across docs) | 0.987 | 0% | FAIL |
 | A9 | 0.407 | 0.917 | 0% | FAIL |
 | A10, A12 | 0.377 | 0.929 | 0% | FAIL |
 | A11 | 0.642 | 0.794 | 0% | FAIL |
