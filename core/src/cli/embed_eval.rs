@@ -25,11 +25,13 @@
 
 mod bm25;
 mod churn;
+mod compare;
 mod config;
 mod context;
 mod cost;
 mod decision;
 mod metrics;
+mod probe;
 mod progress;
 mod queries;
 mod rng;
@@ -47,7 +49,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::embedding::model::{
-    cosine_similarity, EmbeddingModel, EncoderSpec, ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
+    cosine_similarity, BatchStats, EmbeddingModel, EncoderSpec, InferenceOptions, ONNX_FILE_NAME,
+    TOKENIZER_FILE_NAME,
 };
 use crate::embedding::text::{full_text, is_noise, text_to_embed, EmbedInput};
 
@@ -72,6 +75,10 @@ pub enum EmbedEvalCommand {
     /// a variant's pass time from it.
     #[command(subcommand)]
     Cost(cost::CostCommand),
+    /// Compare two runs' node vectors per node (L2, cosine, bit equality).
+    Compare(compare::CompareArgs),
+    /// Time query embeddings in bursts until a stop file appears.
+    Probe(probe::ProbeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -166,6 +173,8 @@ pub fn run(command: EmbedEvalCommand) -> Result<()> {
         EmbedEvalCommand::Parity(args) => parity(&args),
         EmbedEvalCommand::Churn(args) => churn::run(&args),
         EmbedEvalCommand::Cost(command) => cost::run(&command),
+        EmbedEvalCommand::Compare(args) => compare::run(&args),
+        EmbedEvalCommand::Probe(args) => probe::run(&args),
     }
 }
 
@@ -512,6 +521,18 @@ struct Timings {
     query_embed_ms: Vec<f64>,
     query_embed_ms_median: Option<f64>,
     rank_ms: f64,
+    /// The session and batching options the model ran with (model arms),
+    /// threads resolved to the count the rule produced.
+    options: Option<InferenceOptions>,
+    /// `node_count / embed_nodes_ms` in seconds, when node vectors were
+    /// computed in this run.
+    embeddings_per_second: Option<f64>,
+    /// Encoder calls for the node vectors (model arm).
+    batches: Option<usize>,
+    /// Real and padded tokens over the batched calls; absent on the
+    /// one-call-per-text path, which pads nothing.
+    real_tokens: Option<usize>,
+    padded_tokens: Option<usize>,
 }
 
 fn fingerprint(variant: &Variant) -> String {
@@ -676,7 +697,8 @@ fn run_variant(args: &RunArgs) -> Result<()> {
             let base = variants.encoder_of(&variant)?;
             let dir = base.model_dir(eval_dir)?;
             let spec = base.encoder_spec()?;
-            Some((base.clone(), dir.clone(), EmbeddingModel::load_with_spec(&dir, spec)?))
+            let options = InferenceOptions::from_env();
+            Some((base.clone(), dir.clone(), EmbeddingModel::load_with_options(&dir, spec, &options)?))
         }
         _ => None,
     };
@@ -705,14 +727,7 @@ fn run_corpus(
     let (candidates, owned_texts) = candidate_texts(&nodes, variant, variants.settings.arm_seed);
     let candidate_of: HashMap<usize, usize> = candidates.iter().enumerate().map(|(c, &i)| (i, c)).collect();
     let texts: Vec<&str> = owned_texts.iter().map(String::as_str).collect();
-    let node_ids_sha = {
-        let mut h = Sha256::new();
-        for &i in &candidates {
-            h.update(nodes[i].id.as_bytes());
-            h.update(b"\n");
-        }
-        hex(&h.finalize())
-    };
+    let node_ids_sha = compare::node_ids_sha256(candidates.iter().map(|&i| nodes[i].id.as_str()));
 
     let (queries, query_files) = queries::load(eval_dir, corpus)?;
     let language = &corpora.get(corpus)?.language;
@@ -778,7 +793,12 @@ fn run_corpus(
             .as_ref()
             .is_some_and(|p| p.query_ids == manifest.query_ids && p.query_files == manifest.query_files);
 
-    let mut timings = Timings { load_ms, node_count: candidates.len(), ..Timings::default() };
+    let mut timings = Timings {
+        load_ms,
+        node_count: candidates.len(),
+        options: encoder.map(|(_, _, model)| model.options()),
+        ..Timings::default()
+    };
     // Node and query streams are separate, so reusing cached node vectors
     // cannot shift which query vectors a seeded arm draws.
     let mut arm_rng = Rng::new(variants.settings.arm_seed);
@@ -795,15 +815,25 @@ fn run_corpus(
             Arm::Model => {
                 let (base, _, model) = encoder.unwrap();
                 let mut progress = progress::stderr(&variant.name, corpus, "embed", texts.len());
-                texts
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
-                        let v = model.embed(&format!("{}{t}", base.document_prefix));
-                        progress.tick(i + 1);
-                        v
-                    })
-                    .collect::<Result<Vec<_>>>()?
+                let mut stats = BatchStats::default();
+                let mut vectors = Vec::with_capacity(texts.len());
+                // Chunks of one backfill page, so texts are grouped as the
+                // daemon groups them.
+                for chunk in texts.chunks(crate::embedding::backfill::PAGE_SIZE as usize) {
+                    let prefixed: Vec<String> =
+                        chunk.iter().map(|t| format!("{}{t}", base.document_prefix)).collect();
+                    let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+                    let (results, chunk_stats) = model.embed_batch_with_stats(&refs);
+                    stats.add(chunk_stats);
+                    for result in results {
+                        vectors.push(result?);
+                    }
+                    progress.tick(vectors.len());
+                }
+                timings.batches = Some(stats.batches);
+                timings.real_tokens = stats.real_tokens;
+                timings.padded_tokens = stats.padded_tokens;
+                vectors
             }
             Arm::WordsShuffled => {
                 let (base, _, model) = encoder.unwrap();
@@ -831,7 +861,11 @@ fn run_corpus(
             Arm::Bm25 => unreachable!(),
         };
         timings.embed_nodes_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if timings.embed_nodes_ms > 0.0 {
+            timings.embeddings_per_second = Some(candidates.len() as f64 / (timings.embed_nodes_ms / 1000.0));
+        }
         write_vectors(&dir.join("vectors.bin"), &vectors)?;
+        compare::write_node_ids(&dir, candidates.iter().map(|&i| nodes[i].id.as_str()))?;
         vectors
     };
     write_json(&manifest_path, &manifest)?;
@@ -1616,6 +1650,36 @@ mod tests {
         expected.extend((0..600).filter(|&i| scores[i] == 1.0));
         expected.truncate(KEPT_HITS);
         assert_eq!(top_hits(&scores), expected);
+    }
+
+    /// B10: `timings.json` carries the effective options and the throughput
+    /// under the names the GM-453 summary reads.
+    #[test]
+    fn timings_record_the_options_and_the_throughput() {
+        let options =
+            InferenceOptions { batch_size: 8, bucket_by_length: true, ..InferenceOptions::default() };
+        let timings = Timings {
+            node_count: 10,
+            embed_nodes_ms: 500.0,
+            options: Some(options),
+            embeddings_per_second: Some(20.0),
+            batches: Some(2),
+            real_tokens: Some(100),
+            padded_tokens: Some(160),
+            ..Timings::default()
+        };
+        let json = serde_json::to_value(&timings).unwrap();
+        assert_eq!(json["embeddingsPerSecond"], 20.0);
+        assert_eq!(json["batches"], 2);
+        assert_eq!(json["realTokens"], 100);
+        assert_eq!(json["paddedTokens"], 160);
+        assert_eq!(json["options"]["batchSize"], 8);
+        assert_eq!(json["options"]["tokenBudget"], 8192);
+        assert_eq!(json["options"]["bucketByLength"], true);
+        assert_eq!(json["options"]["optimization"], "all");
+        assert!(json["options"]["intraThreads"].is_null());
+        let back: Timings = serde_json::from_value(json).unwrap();
+        assert_eq!(back.options, Some(options));
     }
 
     #[test]
