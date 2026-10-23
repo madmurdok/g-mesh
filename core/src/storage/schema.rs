@@ -87,7 +87,11 @@ use crate::languages::LanguageOutcome;
 /// "14" adds `edges.specifier` and the `resolution_facts` table. An existing
 /// index holds no specifiers on its linked imports and no facts, so it is
 /// rebuilt.
-pub const CURRENT_SCHEMA_VERSION: &str = "14";
+///
+/// "15" adds `nodes.generated` (GM-646). An existing index has every node of
+/// a generated file stored as hand-written, with a vector it must not have,
+/// so it is rebuilt.
+pub const CURRENT_SCHEMA_VERSION: &str = "15";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -235,6 +239,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     language             TEXT NOT NULL,
     nativeKind           TEXT,
     hasSyntaxErrors      INTEGER NOT NULL DEFAULT 0,
+    -- 1 when the node's file carries a generated-code header (GM-646): the
+    -- node keeps every structural answer and gets no vector.
+    generated            INTEGER NOT NULL DEFAULT 0,
     container            TEXT,
     -- The plugin's segments of `qualifiedName`, encoded as name0, then each
     -- later segment's separator and name, all joined by U+001F

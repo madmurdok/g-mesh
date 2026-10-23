@@ -121,6 +121,22 @@ Uninstalling is `rm -rf ~/.g-mesh/bin`, plus deleting the
 `~/.config/fish/conf.d/g-mesh.fish`) — settings, project indexes and the
 embedding model live elsewhere under `~/.g-mesh` and survive it.
 
+**Pointing an MCP client at a fixed install directory.** g-mesh finds its
+language plugins as `plugins/<language>/plugin.toml` beside the `g-mesh`
+binary, so never copy bare binaries into that directory: a flat copy discovers
+no plugins at all. Install or refresh it with:
+
+```bash
+scripts/refresh-mcp-install.sh --install-dir ~/.local/share/g-mesh/bin                  # latest release
+scripts/refresh-mcp-install.sh --install-dir ~/.local/share/g-mesh/bin --version 2.7.0  # a pinned release
+scripts/refresh-mcp-install.sh --install-dir ~/.local/share/g-mesh/bin --local          # build this checkout
+```
+
+It installs through install.sh (never touching rc files or `~/.g-mesh`),
+checks that `g-mesh plugins list` finds every bundled plugin in that
+directory (`plugins list` prints each plugin's `dir=`), and stops the
+daemons still running the replaced binary.
+
 **Windows is not supported by this script.** That target ships a `.zip`, which
 a POSIX shell has no portable way to unpack, so the script refuses instead of
 pretending — and points at `scripts/install.ps1`, its PowerShell counterpart:
@@ -698,6 +714,34 @@ Both are configurable via `[plugin] idleTimeoutMinutes` (per-project
 — see `g-mesh config` / `g-mesh config --global`. The values above are the
 defaults when a project or machine has never run either.
 
+### Tuning the embedding pass
+
+`G_MESH_EMBED_*` variables, read once per daemon, tune the ONNX Runtime
+session that embeds symbols. Empty or absent means the default; an invalid
+value logs one line and keeps the default. **The defaults are unchanged**:
+no setting beat them on every measure
+([`docs/results/gm-453-onnx-tuning.md`](docs/results/gm-453-onnx-tuning.md)).
+
+| Variable | Values | Default |
+|---|---|---|
+| `G_MESH_EMBED_INTRA_THREADS` | `N` (>= 1), `physical`, `logical`, `0` | `0`: ONNX Runtime's own choice |
+| `G_MESH_EMBED_INTER_THREADS` | `N` (>= 1) | unset (ONNX Runtime's own) |
+| `G_MESH_EMBED_OPT_LEVEL` | `disable`, `basic`, `extended`, `all` | `all` |
+| `G_MESH_EMBED_SPIN` | `0`, `1`: intra-op workers spin while idle | unset (ONNX Runtime's own) |
+| `G_MESH_EMBED_BATCH` | `N` (>= 1): most texts per call | `1` |
+| `G_MESH_EMBED_TOKEN_BUDGET` | `N` (>= 1): most padded tokens per batched call | `8192` |
+| `G_MESH_EMBED_BUCKET` | `0`, `1`: sort texts by length before batching | `0` |
+
+*Opt-in recipe:* `G_MESH_EMBED_INTRA_THREADS=2` when indexing beside active
+use. Query p50 stayed near idle (18.7 ms against 33 ms with the default) at
+1.05x the pass time. The cost: an unattended fp32 pass was 1.93x slower. The
+latency was measured with an fp32 query probe without the cross-encoder
+rerank, so the int8 plus rerank path is unmeasured.
+
+*Batching* (`BATCH`, `TOKEN_BUDGET`, `BUCKET`) changes the int8 vectors (L2
+distance up to 0.64 against batch 1). Do not set it on an existing index: old
+and new vectors would mix.
+
 ## Tools exposed
 
 `find_definition`, `find_references`, `find_callers`, `find_callees`,
@@ -844,6 +888,19 @@ than deleting quietly:
   root the next time its daemon starts, so this group shrinks to the genuinely
   dead as you work; `clean expired` or `clean all --force` are the blunt
   instruments for what is left.
+
+### Exporting the dependency graph: `g-mesh deps`
+
+`g-mesh deps --json` prints every file-level import edge g-mesh has indexed
+for the project in the current directory (or `--project <DIR>`) as one JSON
+document on stdout: which languages it covers, per-language counts, and one
+`{from, to, kind, language, module}` row per imported file or Go package
+directory. A project with no index yet is indexed first, through its daemon,
+within `--timeout` seconds (default 600, `0` for no limit); progress goes to
+stderr. Exit codes: 0 printed, 2 usage error, 3 not a project (a folder of
+projects), 4 index unavailable, 5 timed out (the daemon keeps indexing, so run
+it again). Format, versioning and exit codes:
+[`docs/cli/deps-json.md`](docs/cli/deps-json.md).
 
 ## Writing a language plugin
 

@@ -1153,6 +1153,7 @@ pub(crate) fn to_node_record(node: WireNode, warnings: &mut PathWarnings) -> Nod
         language: node.language,
         native_kind: node.native_kind,
         has_syntax_errors: node.has_syntax_errors,
+        generated: node.generated,
         // Absent means "one declaration", which is no rows in the child table
         // - the same thing an empty list means to `apply_diff`, which replaces
         // whatever was stored either way.

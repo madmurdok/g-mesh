@@ -16,6 +16,7 @@ mod absent_language_field;
 mod ambiguous_reexport_linking;
 mod cli_clean;
 mod cli_clean_sweeping;
+mod cli_deps;
 mod cli_init;
 mod cli_reindex;
 mod cli_status;

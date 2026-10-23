@@ -301,9 +301,8 @@ fn wipes_and_reindexes_on_version_mismatch() {
         conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
     // Pinned as a literal on purpose, alongside the constant: a schema change
-    // has to update this line by hand. "14" adds `edges.specifier` and the
-    // `resolution_facts` table.
-    assert_eq!(version, "14");
+    // has to update this line by hand. "15" adds `nodes.generated`.
+    assert_eq!(version, "15");
 
     let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
     assert_eq!(node_count, 0, "old data must not survive a version mismatch wipe");
@@ -1537,4 +1536,32 @@ fn recording_a_walks_outcomes_clears_the_retry_counts() {
     .unwrap();
 
     assert!(language_retries(&conn).unwrap().is_empty());
+}
+
+/// Schema "15" (GM-646): an index stamped "14" stored every node of a
+/// generated file as hand-written, with a vector, so it is reset rather
+/// than migrated; and a node row written without the new column reads 0.
+///
+/// Control: leave `CURRENT_SCHEMA_VERSION` at "14" - `ensure_current`
+/// returns false and the old node survives.
+#[test]
+fn a_schema_14_index_is_reset_and_a_node_defaults_to_hand_written() {
+    let conn = setup();
+    conn.execute(
+        "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, '14', ?1, CURRENT_TIMESTAMP)",
+        params![GENERATION],
+    )
+    .unwrap();
+    let insert = "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, language)
+                  VALUES ('n1', 'Function', 'foo', 'pb::foo', 'pb/foo.pb.go', 1, 0, 3, 1, 'go')";
+    conn.execute(insert, []).unwrap();
+
+    assert!(ensure_current(&conn, GENERATION).unwrap(), "schema 14 is not current");
+    let nodes: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
+    assert_eq!(nodes, 0, "the reset must drop the schema-14 nodes");
+
+    conn.execute(insert, []).unwrap();
+    let generated: i64 =
+        conn.query_row("SELECT generated FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
+    assert_eq!(generated, 0);
 }

@@ -182,6 +182,7 @@ func extractFile(ws *workspace, relPath string, content []byte) fileGraph {
 
 	fileNode := computeFileNode(relPath, content)
 	fileNode.HasSyntaxErrors = err != nil
+	fileNode.Generated = isGenerated(content)
 
 	if astFile == nil {
 		// Only reachable when the parser could not produce even an empty
@@ -196,6 +197,7 @@ func extractFile(ws *workspace, relPath string, content []byte) fileGraph {
 		fset:            fset,
 		fileNodeID:      fileNode.ID,
 		hasSyntaxErrors: fileNode.HasSyntaxErrors,
+		generated:       fileNode.Generated,
 		container:       containerKeyFor(ws, relPath, packageNameOf(astFile)),
 		nodeSeen:        map[string]bool{},
 		nodeKind:        map[string]string{},
@@ -227,6 +229,7 @@ type extractor struct {
 	fset            *token.FileSet
 	fileNodeID      string
 	hasSyntaxErrors bool
+	generated       bool
 	// container is this file's package as a container key: the directory's
 	// import path, or that plus "_test" for an external test package.
 	container string
@@ -320,6 +323,7 @@ func packageNameOf(file *ast.File) string {
 
 func (e *extractor) addNode(node wireNode) string {
 	node.HasSyntaxErrors = e.hasSyntaxErrors
+	node.Generated = e.generated
 	if e.nodeSeen[node.ID] {
 		return node.ID
 	}

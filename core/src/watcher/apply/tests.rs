@@ -60,6 +60,7 @@ fn canned_node(id: &str) -> WireNode {
         language: "rust".to_string(),
         native_kind: None,
         has_syntax_errors: false,
+        generated: false,
         declarations: None,
         container: None,
         container_parent: None,
@@ -3001,3 +3002,24 @@ fn a_residual_and_a_whole_project_pass_are_sent_their_timeout_as_their_budget() 
 }
 
 mod affected;
+
+/// GM-646: a wire node's `generated` flag reaches the stored row, and a
+/// re-send flips it back (the upsert overwrites the column both ways).
+/// Controls: `to_node_record` setting `generated: false`; drop
+/// `generated = excluded.generated` from `write_diff`'s upsert (the flag
+/// sticks at true).
+#[test]
+fn a_wire_nodes_generated_flag_is_stored_and_flips_back() {
+    let mut conn = setup_conn();
+    let write = |conn: &mut Connection, generated: bool| {
+        let mut node = canned_node("n1");
+        node.generated = generated;
+        let record = to_node_record(node, &mut PathWarnings::default());
+        assert_eq!(record.generated, generated);
+        apply_diff(conn, &Diff { upsert_nodes: vec![record], ..Default::default() }).unwrap();
+        crate::graph::queries::get_node(conn, "n1").unwrap().expect("the node is stored").generated
+    };
+
+    assert!(write(&mut conn, true), "the stored row says generated");
+    assert!(!write(&mut conn, false), "a re-send without the flag clears it");
+}

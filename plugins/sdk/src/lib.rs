@@ -81,6 +81,7 @@
 mod columns;
 mod diff;
 pub mod framing;
+mod generated;
 mod graph;
 mod hold;
 pub mod ids;
@@ -97,6 +98,7 @@ mod walk;
 
 pub use columns::CharColumns;
 pub use diff::{diff_file, is_empty_diff};
+pub use generated::is_generated;
 pub use graph::{
     placeholder_id, render_target, EdgeSpec, FileGraph, FileGraphBuilder, NodeSpec, OpenSite, OpenSiteKind,
     PlaceholderKind,

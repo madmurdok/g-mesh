@@ -25,6 +25,23 @@ dimension = 768
 max_tokens = 1024
 token_type_ids = false
 
+# --- GM-453: the reference's fp32 weights, fetched into work/models ----------
+# The reference row's model_dir now holds the shipped int8 weights (ADR 0011),
+# so fp32 timing needs its own copy: same repo, revision and spec, no model_dir
+# (`fetch_models.py jina-v2-base-code-fp32-r` downloads it).
+
+[[variant]]
+name = "jina-v2-base-code-fp32-r"
+arm = "model"
+role = "cost"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model.onnx"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+
 # --- candidates (D8) --------------------------------------------------------
 
 [[variant]]
