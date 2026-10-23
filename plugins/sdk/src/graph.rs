@@ -505,6 +505,7 @@ impl FileGraphBuilder {
             qualified_path: spec.qualified_path,
             alias_paths: spec.alias_paths,
             untyped_calls: Vec::new(),
+            generated: false,
         });
         id
     }

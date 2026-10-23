@@ -106,6 +106,7 @@ mod tests {
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
+            generated: false,
             declarations: None,
             container: None,
             container_parent: None,

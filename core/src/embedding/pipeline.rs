@@ -436,7 +436,8 @@ impl EmbeddingPipeline {
         let mut pending: Vec<(&str, String)> = Vec::new();
         for node in &diff.upsert_nodes {
             let input = EmbedInput::from(node);
-            if crate::embedding::text::is_noise(&input) {
+            // A generated node's old vector goes the way a noise node's does.
+            if input.generated || crate::embedding::text::is_noise(&input) {
                 dropped.push(node.id.clone());
             } else if let Some(text) = node_text(&input) {
                 pending.push((node.id.as_str(), text));
@@ -826,6 +827,7 @@ impl<'a> From<&'a NodeRecord> for EmbedInput<'a> {
             file_path: &node.file_path,
             doc: node.doc_comment.as_deref(),
             signature: node.signature.as_deref(),
+            generated: node.generated,
         }
     }
 }
@@ -836,16 +838,16 @@ impl<'a> From<&'a NodeRecord> for EmbedInput<'a> {
 /// [`node_text`] would have produced had `compute` run against this row
 /// right now instead of whenever it actually ran.
 fn current_embeddable_text(conn: &Connection, node_id: &str) -> Result<Option<String>> {
-    type Row = (String, String, String, String, Option<String>, Option<String>);
+    type Row = (String, String, String, String, Option<String>, Option<String>, bool);
     let row: Option<Row> = conn
         .query_row(
-            "SELECT kind, name, qualifiedName, filePath, docComment, signature FROM nodes WHERE id = ?1",
+            "SELECT kind, name, qualifiedName, filePath, docComment, signature, generated FROM nodes WHERE id = ?1",
             [node_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         )
         .optional()
         .context("failed to read node for its embedding staleness check")?;
-    Ok(row.and_then(|(kind, name, qualified_name, file_path, doc, signature)| {
+    Ok(row.and_then(|(kind, name, qualified_name, file_path, doc, signature, generated)| {
         node_text(&EmbedInput {
             kind: &kind,
             name: &name,
@@ -853,6 +855,7 @@ fn current_embeddable_text(conn: &Connection, node_id: &str) -> Result<Option<St
             file_path: &file_path,
             doc: doc.as_deref(),
             signature: signature.as_deref(),
+            generated,
         })
     }))
 }
@@ -1840,5 +1843,105 @@ mod tests {
         EmbeddingPipeline::disabled().store(&conn, &computed);
 
         assert_eq!(vector_count(&conn), 0, "a node that is noise now must get no vector");
+    }
+
+    /// GM-646: marks the row of `id` as a node of a generated file.
+    fn mark_generated(conn: &Connection, id: &str, generated: bool) {
+        conn.execute("UPDATE nodes SET generated = ?2 WHERE id = ?1", rusqlite::params![id, generated])
+            .unwrap();
+    }
+
+    fn generated_record(id: &str, doc: &str) -> NodeRecord {
+        let mut node = documented(id, doc);
+        node.generated = true;
+        node
+    }
+
+    /// A generated node in a batch never reaches the model and gets no
+    /// vector; its unmarked sibling in the same batch does.
+    /// Control: drop `input.generated ||` from `compute` (and from
+    /// `node_text`, which then embeds it): the generated text reaches the model.
+    #[test]
+    fn compute_gives_a_generated_node_no_vector_and_embeds_its_sibling() {
+        crate::storage::vectors::register_extension();
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+        let counters = Counters::default();
+        let pipeline = fake_pipeline(&model_dir, None, &counters);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::storage::schema::ensure_current(&conn, "test").unwrap();
+        insert_node(&conn, "stub", "Gets the stub.", "fn stub()");
+        mark_generated(&conn, "stub", true);
+        insert_node(&conn, "hand", "Written by hand.", "fn hand()");
+        let diff = Diff {
+            upsert_nodes: vec![
+                generated_record("stub", "Gets the stub."),
+                documented("hand", "Written by hand."),
+            ],
+            ..Default::default()
+        };
+
+        let computed = pipeline.compute(&diff, &mut EmbedStats::default());
+        pipeline.store(&conn, &computed);
+
+        assert_eq!(vector_ids(&conn), vec!["hand"]);
+        assert_eq!(
+            counters.received(),
+            vec!["Written by hand.\n\nfn hand()".to_string()],
+            "only `hand` is embedded"
+        );
+    }
+
+    /// The incremental path: a node with a vector that is re-sent as
+    /// generated loses the vector, and gets one again when it is re-sent
+    /// unmarked.
+    /// Control: drop `input.generated ||` from `compute`; the generated
+    /// re-send leaves the old vector in place.
+    #[test]
+    fn a_node_that_turns_generated_loses_its_vector_and_gets_one_back_when_it_stops() {
+        crate::storage::vectors::register_extension();
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+        let pipeline = fake_pipeline(&model_dir, None, &Counters::default());
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::storage::schema::ensure_current(&conn, "test").unwrap();
+        insert_node(&conn, "stub", "Gets the stub.", "fn stub()");
+        vectors::insert(&conn, "stub", &[1.0, 0.0, 0.0], "v1").unwrap();
+
+        mark_generated(&conn, "stub", true);
+        let turned =
+            Diff { upsert_nodes: vec![generated_record("stub", "Gets the stub.")], ..Default::default() };
+        pipeline.store(&conn, &pipeline.compute(&turned, &mut EmbedStats::default()));
+        assert_eq!(vector_ids(&conn), Vec::<String>::new(), "a node that turned generated keeps no vector");
+
+        mark_generated(&conn, "stub", false);
+        let stopped = Diff { upsert_nodes: vec![documented("stub", "Gets the stub.")], ..Default::default() };
+        pipeline.store(&conn, &pipeline.compute(&stopped, &mut EmbedStats::default()));
+        assert_eq!(vector_ids(&conn), vec!["stub"], "a node that stopped being generated is embedded again");
+    }
+
+    /// `store`'s staleness check: a vector computed while the node was
+    /// hand-written is not stored once its row says generated.
+    /// Control: `current_embeddable_text` passing `generated: false` to
+    /// `node_text` instead of the row's value stores it.
+    #[test]
+    fn store_skips_a_vector_for_a_node_that_turned_generated() {
+        crate::storage::vectors::register_extension();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::storage::schema::ensure_current(&conn, "test").unwrap();
+        insert_node(&conn, "stub", "Gets the stub.", "fn stub()");
+        mark_generated(&conn, "stub", true);
+
+        let computed = ComputedBatch {
+            embeddings: vec![ComputedEmbedding {
+                node_id: "stub".to_string(),
+                embedding: vec![1.0, 0.0, 0.0],
+                text: "Gets the stub.\n\nfn stub()".to_string(),
+            }],
+            dropped: Vec::new(),
+        };
+        EmbeddingPipeline::disabled().store(&conn, &computed);
+
+        assert_eq!(vector_count(&conn), 0, "a node that is generated now must get no vector");
     }
 }

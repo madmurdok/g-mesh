@@ -58,6 +58,10 @@
 //! does not. A filtered node keeps every structural answer; it is absent only
 //! from `search_code`. Why this rule and not body size or all name-only
 //! nodes: `docs/design/GM-437-embedding-noise-filter.md`.
+//!
+//! It also refuses every node of a generated file (`EmbedInput::generated`,
+//! a `Code generated ... DO NOT EDIT` or `@generated` header), kept in the
+//! graph the same way: `docs/design/GM-646-skip-generated-files.md`.
 
 /// The "short prose" cap: a paragraph after the first is kept only when its
 /// text (lines joined by `\n`, ends trimmed) is at most this many `char`s,
@@ -107,6 +111,8 @@ pub(crate) struct EmbedInput<'a> {
     pub(crate) file_path: &'a str,
     pub(crate) doc: Option<&'a str>,
     pub(crate) signature: Option<&'a str>,
+    /// The node's file is generated code (`nodes.generated`).
+    pub(crate) generated: bool,
 }
 
 /// The generation of [`is_noise`]'s rule. An index records the generation
@@ -123,9 +129,10 @@ const SIGNATURE_KEYWORDS: &[&str] = &[
 ];
 
 /// The text `input` embeds as, or `None` when it gets no vector: when
-/// [`text_to_embed`] has nothing, or when [`is_noise`] holds.
+/// [`text_to_embed`] has nothing, when the node's file is generated, or when
+/// [`is_noise`] holds.
 pub(crate) fn node_text(input: &EmbedInput) -> Option<String> {
-    if is_noise(input) {
+    if input.generated || is_noise(input) {
         return None;
     }
     text_to_embed(input.doc, input.signature)
@@ -544,7 +551,15 @@ pub(crate) mod tests {
 
     fn input(node: &Node) -> EmbedInput<'static> {
         let (kind, name, qualified_name, file_path, doc, signature) = *node;
-        EmbedInput { kind, name, qualified_name, file_path, doc, signature: Some(signature) }
+        EmbedInput {
+            kind,
+            name,
+            qualified_name,
+            file_path,
+            doc,
+            signature: Some(signature),
+            generated: false,
+        }
     }
 
     /// The design note's dropped examples are noise and embed as nothing.
@@ -697,5 +712,24 @@ pub(crate) mod tests {
         assert!(!is_noise(&input(&at("crate::m::tests::checks_it", "fn checks_it(x: u8)"))));
         assert!(!is_noise(&input(&at("crate::contests::checks_it", "fn checks_it()"))));
         assert!(!is_noise(&input(&at("attests::checks_it", "fn checks_it()"))));
+    }
+
+    /// A node of a generated file embeds as nothing, though the same node
+    /// unflagged has text (a documented, signed function: no noise).
+    /// Control: drop `input.generated ||` from `node_text`.
+    #[test]
+    fn a_generated_node_has_no_text_to_embed() {
+        let node: Node = (
+            "Function",
+            "get_name",
+            "pb::User::get_name",
+            "pb/user.pb.go",
+            Some("GetName returns the user's name."),
+            "func (x *User) GetName() string",
+        );
+        let plain = input(&node);
+        assert!(node_text(&plain).is_some(), "sanity: the unflagged node embeds");
+        let generated = EmbedInput { generated: true, ..input(&node) };
+        assert_eq!(node_text(&generated), None);
     }
 }

@@ -2047,4 +2047,37 @@ mod tests {
         assert_eq!(eight["overrides"].as_array().map(Vec::len), Some(8), "{eight}");
         assert!(eight.get("overridesTruncated").is_none(), "{eight}");
     }
+
+    /// GM-646 keeps the structure of a generated file: its node is still a
+    /// reference anchor, and a hand-written use of it is still a reference.
+    /// A guard, not a pinned fix: it passes before and after the task and
+    /// fails if a structural query starts filtering on `generated`.
+    #[test]
+    fn a_generated_node_still_answers_its_references() {
+        let mut conn = setup();
+        let mut stub = NodeRecord::new("stub", "Function", "GetName", "pb::GetName", "pb/user.pb.go", "go");
+        stub.generated = true;
+        upsert_node(&mut conn, stub).unwrap();
+        upsert_node(
+            &mut conn,
+            NodeRecord::new("user", "Function", "greet", "app::greet", "app/app.go", "go"),
+        )
+        .unwrap();
+        upsert_edge(&mut conn, EdgeRecord::new("e", "user", "stub", "CALLS", "tree-sitter", true)).unwrap();
+
+        let params = SymbolQueryParams { symbol_name: Some("GetName".to_string()), ..Default::default() };
+        let result = handle(
+            &Arc::new(IndexStore::new(conn)),
+            &EmbeddingPipeline::disabled(),
+            QueryShapes::shipped(),
+            &no_capabilities(),
+            &SessionHints::default(),
+            params,
+        )
+        .unwrap();
+        let body = json_body(&result);
+        let rows = body["results"].as_array().unwrap_or_else(|| panic!("{body}"));
+        assert_eq!(rows.len(), 1, "{body}");
+        assert_eq!(rows[0]["referencingSymbolId"], "user", "{body}");
+    }
 }

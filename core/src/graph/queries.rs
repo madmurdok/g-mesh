@@ -153,6 +153,7 @@ pub(crate) fn map_node_row(row: &Row) -> rusqlite::Result<NodeRecord> {
         language: row.get("language")?,
         native_kind: row.get("nativeKind")?,
         has_syntax_errors: row.get("hasSyntaxErrors")?,
+        generated: row.get("generated")?,
         // Deliberately not joined: almost no node has declaration rows, and
         // every reader of this function today asks about the symbol as a
         // whole, which the flat fields above already answer. See the field's
