@@ -1028,7 +1028,14 @@ fn extract_caught<E: Extractor>(
     language: &str,
 ) -> Option<FileGraph> {
     match catch_unwind(AssertUnwindSafe(|| extractor.extract(project, path, source))) {
-        Ok(graph) => Some(graph),
+        Ok(mut graph) => {
+            // Every extraction path (bulk, `file_changed`, reindex) passes
+            // through here, so the flag reaches every node of the file.
+            if crate::is_generated(source) {
+                graph.nodes.iter_mut().for_each(|node| node.generated = true);
+            }
+            Some(graph)
+        }
         Err(_) => {
             // The default hook has already printed the panic and its
             // location; this says which file provoked it, which the panic

@@ -503,7 +503,7 @@ pub fn language_retries(db_path: &Path) -> BTreeMap<String, u32> {
 /// left behind needs write access, and a missing database must never be
 /// conjured into existence by a command that only reports. Nothing here
 /// writes.
-fn open_index(db_path: &Path) -> Result<Connection> {
+pub(crate) fn open_index(db_path: &Path) -> Result<Connection> {
     Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI)
         .with_context(|| format!("failed to open the project index at {}", db_path.display()))
 }

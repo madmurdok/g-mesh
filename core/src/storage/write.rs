@@ -115,6 +115,10 @@ pub struct NodeRecord {
     pub language: String,
     pub native_kind: Option<String>,
     pub has_syntax_errors: bool,
+    /// The node's file carries a generated-code header (wire `generated`,
+    /// GM-646): it keeps every structural answer and gets no vector
+    /// (`embedding::text::node_text`). Read and written (`nodes.generated`).
+    pub generated: bool,
     /// Every declaration this symbol is written as, in source order - empty
     /// for the single-declaration symbols that are nearly all of them, since
     /// the flat fields above already describe those completely.
@@ -177,6 +181,7 @@ impl NodeRecord {
             language: language.into(),
             native_kind: None,
             has_syntax_errors: false,
+            generated: false,
             declarations: Vec::new(),
             qualified_path: None,
             alias_paths: Vec::new(),
@@ -431,8 +436,8 @@ fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
     }
     for node in &diff.upsert_nodes {
         tx.execute(
-            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, signature, visibility, visibilityContainer, docComment, language, nativeKind, hasSyntaxErrors, container, qualifiedPath)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, signature, visibility, visibilityContainer, docComment, language, nativeKind, hasSyntaxErrors, generated, container, qualifiedPath)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
              ON CONFLICT(id) DO UPDATE SET
                 kind = excluded.kind,
                 name = excluded.name,
@@ -449,6 +454,7 @@ fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
                 language = excluded.language,
                 nativeKind = excluded.nativeKind,
                 hasSyntaxErrors = excluded.hasSyntaxErrors,
+                generated = excluded.generated,
                 container = excluded.container,
                 qualifiedPath = excluded.qualifiedPath",
             // `exported` is deliberately absent from both the column list and
@@ -475,6 +481,7 @@ fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
                 node.language,
                 node.native_kind,
                 node.has_syntax_errors,
+                node.generated,
                 node.container,
                 node.qualified_path.as_ref().map(qualified_path::encode),
             ],

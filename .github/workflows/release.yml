@@ -583,7 +583,7 @@ jobs:
               throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
             }
             foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
-              if ($pluginsOutput -notmatch $lang) {
+              if ($pluginsOutput -notmatch "(?m)^$lang +[0-9]") {
                 throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$pluginsOutput"
               }
             }
@@ -789,7 +789,7 @@ jobs:
             throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
           }
           foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
-            if ($plugins -notmatch $lang) {
+            if ($plugins -notmatch "(?m)^$lang +[0-9]") {
               throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$plugins"
             }
           }
@@ -820,7 +820,7 @@ jobs:
             throw "installed g-mesh.exe plugins list exited $LASTEXITCODE"
           }
           foreach ($lang in @('typescript', 'go', 'rust', 'python')) {
-            if ($plugins -notmatch $lang) {
+            if ($plugins -notmatch "(?m)^$lang +[0-9]") {
               throw "installed g-mesh.exe does not see the $lang plugin - plugins list:`n$plugins"
             }
           }

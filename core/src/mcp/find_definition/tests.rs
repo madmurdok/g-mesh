@@ -2269,3 +2269,18 @@ fn a_whole_file_candidate_in_a_new_index_carries_its_source() {
     assert_eq!(texts["module"], VERSION_PY.trim_end(), "the whole file: {body}");
     assert_eq!(texts["variable"], "__version__ = \"2.32.3\"", "{body}");
 }
+
+/// GM-646 keeps the structure of a generated file: its declaration still
+/// resolves by name. A guard (passes before and after the task); it fails
+/// if a definition rung starts filtering on `generated`.
+#[test]
+fn a_generated_declaration_still_resolves_by_name() {
+    let mut conn = setup();
+    let mut stub = node_with_span("stub", "GetName", "pb::User::GetName", "pb/user.pb.go", (9, 0));
+    stub.generated = true;
+    upsert_node(&mut conn, stub).unwrap();
+
+    let body = json_body(&resolved_by_name(&conn, "GetName").unwrap());
+
+    assert_eq!(body["id"], "stub", "{body}");
+}

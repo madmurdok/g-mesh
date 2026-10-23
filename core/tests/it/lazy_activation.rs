@@ -429,6 +429,7 @@ async fn a_failed_walk_is_a_tool_error_and_is_retried() {
         language: "python".to_string(),
         native_kind: None,
         has_syntax_errors: false,
+        generated: false,
         declarations: None,
         container: None,
         container_parent: None,

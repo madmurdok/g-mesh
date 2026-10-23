@@ -189,7 +189,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use crate::graph::queries::NON_DECLARATION_NATIVE_KINDS;
+use crate::graph::queries::{declaration_only, NON_DECLARATION_NATIVE_KINDS};
 use crate::storage::write::{Diff, NodeRecord};
 
 /// The `nativeKind` of a core-materialized container node. Never plugin-emitted
@@ -713,6 +713,93 @@ pub fn defining_containers(conn: &Connection, file_path: &str) -> Result<Vec<Def
         }
     }
     Ok(outermost)
+}
+
+/// [`defining_containers`] for every `File` node at once, inverted: each
+/// container's node id to the paths of the files that define it, sorted.
+/// A container no file defines has no entry (see [`member_files`]).
+pub fn defining_files(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
+    let mut stmt = conn
+        .prepare("SELECT filePath FROM nodes WHERE kind = ?1 ORDER BY filePath")
+        .context("failed to prepare the file listing")?;
+    let files: Vec<String> = stmt
+        .query_map(params![FILE_KIND], |row| row.get(0))
+        .context("failed to list the indexed files")?
+        .collect::<rusqlite::Result<_>>()
+        .context("failed to read the indexed files")?;
+    let mut by_container: HashMap<String, Vec<String>> = HashMap::new();
+    for file in files {
+        for container in defining_containers(conn, &file)? {
+            by_container.entry(container.node_id).or_default().push(file.clone());
+        }
+    }
+    Ok(by_container)
+}
+
+/// A container's `DEFINES` members' files, split by what the member is.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MemberFiles {
+    /// Files holding an ordinary member (a function, a variable, ...), sorted.
+    pub declarations: Vec<String>,
+    /// Files whose own whole-file `Module` node is a member: sub-modules, not
+    /// the container itself (see [`defining_containers`]), sorted.
+    pub submodules: Vec<String>,
+}
+
+/// The files holding a container's `DEFINES` members: the fallback for a
+/// container [`defining_files`] maps to no file.
+pub fn member_files(conn: &Connection, container_node_id: &str) -> Result<MemberFiles> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT DISTINCT m.filePath, \
+                    (m.kind = ?3 AND m.startLine <= f.startLine AND m.endLine >= f.endLine) \
+             FROM edges e JOIN nodes m ON m.id = e.toId \
+             JOIN nodes f ON f.kind = ?4 AND f.filePath = m.filePath \
+             WHERE e.fromId = ?1 AND e.kind = ?2 AND m.filePath <> '' ORDER BY m.filePath",
+        )
+        .context("failed to prepare the container member lookup")?;
+    let rows = stmt
+        .query_map(params![container_node_id, DEFINES_KIND, MODULE_KIND, FILE_KIND], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })
+        .context("failed to look up a container's member files")?;
+    let mut files = MemberFiles::default();
+    for row in rows {
+        let (path, whole_file_module) = row.context("failed to read a container's member files")?;
+        let list = if whole_file_module { &mut files.submodules } else { &mut files.declarations };
+        if list.last() != Some(&path) {
+            list.push(path);
+        }
+    }
+    Ok(files)
+}
+
+/// Files whose own whole-file `Module` declaration is named `key` in
+/// `language`, sorted: the file that *is* a module that declares nothing
+/// (a Python package's `__init__.py` holding only imports or nothing at all
+/// below the package root).
+pub fn own_module_files(conn: &Connection, language: &str, key: &str) -> Result<Vec<String>> {
+    let sql = format!(
+        "SELECT DISTINCT m.filePath FROM nodes m \
+         JOIN nodes f ON f.kind = ?3 AND f.filePath = m.filePath \
+         WHERE m.kind = ?4 AND m.language = ?1 AND m.qualifiedName = ?2 AND m.filePath <> '' \
+           AND {} AND m.startLine <= f.startLine AND m.endLine >= f.endLine \
+         ORDER BY m.filePath",
+        declaration_only("m.")
+    );
+    let mut stmt = conn.prepare_cached(&sql).context("failed to prepare the module file lookup")?;
+    let rows = stmt
+        .query_map(params![language, key, FILE_KIND, MODULE_KIND], |row| row.get(0))
+        .context("failed to look up a module's own file")?;
+    rows.collect::<rusqlite::Result<_>>().context("failed to read a module's own file")
+}
+
+/// Whether the index holds a `File` node at `file_path`.
+pub fn has_file(conn: &Connection, file_path: &str) -> Result<bool> {
+    conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM nodes WHERE kind = ?1 AND filePath = ?2)")
+        .context("failed to prepare the file lookup")?
+        .query_row(params![FILE_KIND, file_path], |row| row.get(0))
+        .context("failed to look up a file")
 }
 
 #[cfg(test)]

@@ -438,6 +438,12 @@ pub struct WireNode {
     /// core's `untyped_calls` table, never printed or hashed into an id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub untyped_calls: Vec<String>,
+    /// The node's file has a generated-code header (a `DO NOT EDIT` notice or
+    /// an `@generated` token). The node keeps its structure but gets no
+    /// embedding. Sent only when `true`, so an ordinary node stays
+    /// byte-identical on the wire; absent means `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub generated: bool,
 }
 
 impl WireNode {
@@ -941,6 +947,7 @@ mod tests {
             language: "rust".to_string(),
             native_kind: None,
             has_syntax_errors: false,
+            generated: false,
             declarations: None,
             container: None,
             container_parent: None,
@@ -1042,6 +1049,7 @@ mod tests {
             language: "go".to_string(),
             native_kind: Some("pending_symbol".to_string()),
             has_syntax_errors: false,
+            generated: false,
             declarations: None,
             container: Some("github.com/x/app/server".to_string()),
             container_parent: None,
@@ -1107,6 +1115,7 @@ mod tests {
             language: "typescript".to_string(),
             native_kind: None,
             has_syntax_errors: false,
+            generated: false,
             declarations: None,
             container: None,
             container_parent: None,
@@ -1412,6 +1421,7 @@ mod tests {
                 language: "rust".to_string(),
                 native_kind: None,
                 has_syntax_errors: false,
+                generated: false,
                 declarations: None,
                 container: None,
                 container_parent: None,

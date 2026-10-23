@@ -288,6 +288,10 @@ fn purge_noise_page(
             file_path,
             doc: doc.as_deref(),
             signature: signature.as_deref(),
+            // A generated node never gets a vector (`EmbeddingPipeline::compute`
+            // drops it, schema 15 rebuilt every older index), so this purge
+            // has none to find; it stays the noise rule's alone.
+            generated: false,
         };
         if is_noise(&input) {
             vectors::delete(conn, id)?;
@@ -334,7 +338,7 @@ fn count_candidates(conn: &Connection, version: &str) -> SqlResult<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
          WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?1) \
-         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL)",
+         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0",
         [version],
         |row| row.get(0),
     )
@@ -354,7 +358,7 @@ fn fetch_candidate_page(
         "SELECT n.id, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
          FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
          WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?3) \
-         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) \
+         AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0 \
          AND n.id > ?1 ORDER BY n.id LIMIT ?2",
     )?;
     // Every real node id is a non-empty string, so `id > ''` is true for all
@@ -751,5 +755,58 @@ mod tests {
         assert_eq!(all_noise.owed_a_vector(), 0);
         let mixed = BackfillSummary { candidates: 12, filtered: 2, embedded: 10, ..Default::default() };
         assert_eq!(mixed.owed_a_vector(), 10);
+    }
+
+    /// GM-646: a documented node of a generated file.
+    fn generated(id: &str) -> NodeRecord {
+        let mut node = node(id, Some("Gets the stub."), Some("func Stub()"));
+        node.generated = true;
+        node
+    }
+
+    /// Both candidate queries leave a generated node out, so a backfill
+    /// never visits it (unlike the noise rule, it is not even counted).
+    /// Controls: drop `AND n.generated = 0` from `count_candidates` (the
+    /// count is 2), or from `fetch_candidate_page` (the page holds `stub`).
+    #[test]
+    fn the_candidate_queries_leave_out_a_generated_node() {
+        let mut conn = open_conn();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![generated("stub"), node("hand", Some("By hand."), None)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count_candidates(&conn, "v1").unwrap(), 1, "only `hand` is owed a vector");
+        let page = fetch_candidate_page(&conn, "v1", None, 256).unwrap();
+        let ids: Vec<&str> = page.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["hand"]);
+    }
+
+    /// A backfill gives a generated node no vector and never shows it to the
+    /// model, and a second start finds nothing left to visit.
+    /// Control: drop `AND n.generated = 0` from both candidate queries; the
+    /// first pass counts `stub` (and filters it), the second visits it again.
+    #[test]
+    fn backfill_never_visits_a_generated_node_and_a_second_start_visits_nothing() {
+        use crate::embedding::pipeline::test_support::{fake_model_dir, fake_pipeline, Counters};
+        crate::storage::vectors::register_extension();
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
+        let counters = Counters::default();
+        let pipeline = fake_pipeline(&model_dir, None, &counters);
+        let store = index_with(vec![generated("stub"), node("read", Some("Reads a file."), None)], &[]);
+
+        let first = run(&store, &pipeline, &IndexingStatus::structural());
+        assert_eq!(vector_ids(&store), vec!["read"]);
+        assert_eq!(counters.received(), vec!["Reads a file.".to_string()], "only `read` reaches the model");
+        assert_eq!((first.candidates, first.filtered, first.embedded), (1, 0, 1), "{first:?}");
+
+        let second = run(&store, &pipeline, &IndexingStatus::structural());
+        assert_eq!((second.candidates, second.filtered, second.embedded), (0, 0, 0), "{second:?}");
+        assert_eq!(vector_ids(&store), vec!["read"]);
     }
 }

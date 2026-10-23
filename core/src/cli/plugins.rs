@@ -120,6 +120,9 @@ pub struct PluginInfo {
     /// it did not, the directory it was found in (the best identifier left
     /// once the manifest itself cannot be trusted).
     pub language: String,
+    /// The directory the manifest was read from (canonical when it resolves),
+    /// so a reader can tell which discovery root supplied this plugin.
+    pub dir: PathBuf,
     pub outcome: PluginOutcome,
 }
 
@@ -234,11 +237,13 @@ fn scan_root(root: &Path, status: PluginStatus) -> Result<Vec<PluginInfo>> {
         }
 
         let dir_name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("?").to_string();
+        let shown_dir = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
 
         let outcome = match manifest::read_manifest(&dir) {
             Ok(manifest) => {
                 infos.push(PluginInfo {
                     language: manifest.language,
+                    dir: shown_dir,
                     outcome: PluginOutcome::Loaded {
                         version: manifest.plugin_version,
                         status,
@@ -251,7 +256,7 @@ fn scan_root(root: &Path, status: PluginStatus) -> Result<Vec<PluginInfo>> {
             }
             Err(err) => PluginOutcome::Error(format!("{err:#}")),
         };
-        infos.push(PluginInfo { language: dir_name, outcome });
+        infos.push(PluginInfo { language: dir_name, dir: shown_dir, outcome });
     }
 
     Ok(infos)
@@ -260,7 +265,9 @@ fn scan_root(root: &Path, status: PluginStatus) -> Result<Vec<PluginInfo>> {
 /// Renders the plugin list the way `plugins list` prints it: one line per
 /// plugin naming its language, then either its version, status,
 /// capabilities and non-symbol query shapes, or - for a manifest that failed to read - an error in their
-/// place.
+/// place. Every line ends with `  dir=<manifest directory>`; it is always the
+/// last field, so a parser takes everything after the last `  dir=`
+/// (`scripts/install.sh` and `scripts/refresh-mcp-install.sh` do).
 pub fn render(plugins: &[PluginInfo]) -> String {
     let mut out = String::new();
     for plugin in plugins {
@@ -274,17 +281,19 @@ pub fn render(plugins: &[PluginInfo]) -> String {
             } => {
                 let _ = writeln!(
                     out,
-                    "{}  {}  {}  {}  non_symbol_queries: {}  symbol_query_prefixes: {}",
+                    "{}  {}  {}  {}  non_symbol_queries: {}  symbol_query_prefixes: {}  dir={}",
                     plugin.language,
                     version,
                     status.label(),
                     render_capabilities(capabilities),
                     non_symbol_queries.render(),
-                    symbol_query_prefixes.render()
+                    symbol_query_prefixes.render(),
+                    plugin.dir.display()
                 );
             }
             PluginOutcome::Error(message) => {
-                let _ = writeln!(out, "{}  error: {}", plugin.language, message);
+                let _ =
+                    writeln!(out, "{}  error: {}  dir={}", plugin.language, message, plugin.dir.display());
             }
         }
     }
@@ -474,6 +483,93 @@ mod tests {
         assert!(plugins.is_empty());
     }
 
+    /// `plugins list` names the directory each plugin's manifest was
+    /// read from, canonical, as the last field of its line - a user-root
+    /// plugin shows `~/.g-mesh/plugins/<lang>`, a plugin beside the binary
+    /// shows `<exe dir>/plugins/<lang>`, and a broken manifest shows its
+    /// directory too. Both roots are reached through a symlink so the
+    /// canonical spelling differs from the one scanned on every unix host.
+    ///
+    /// Controls: drop `  dir={}` from `render`'s two formats (the line-end
+    /// assertions fail); show `dir.clone()` instead of the canonicalized dir in
+    /// `scan_root` (the `dir` assertions fail).
+    #[cfg(unix)]
+    #[test]
+    fn plugins_list_names_each_plugins_canonical_manifest_dir_last() {
+        let scratch = tempfile::tempdir().unwrap();
+        let real = scratch.path().join("real");
+        let home_plugins = real.join("home/.g-mesh/plugins");
+        let exe_plugins = real.join("install/bin/plugins");
+        for (root, lang, body) in [
+            (&home_plugins, "python", plugin_toml("python", "0.1.0")),
+            (&home_plugins, "broken", "this is not [ valid toml".to_string()),
+            (&exe_plugins, "typescript", BUNDLED_JS_TS_MANIFEST.to_string()),
+        ] {
+            fs::create_dir_all(root.join(lang)).unwrap();
+            fs::write(root.join(lang).join(MANIFEST_FILE_NAME), body).unwrap();
+        }
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let plugins = list_from_roots(&[
+            (link.join("home/.g-mesh/plugins"), PluginStatus::Installed),
+            (link.join("install/bin/plugins"), PluginStatus::Bundled),
+        ])
+        .unwrap();
+
+        let canonical = |root: &Path, lang: &str| fs::canonicalize(root.join(lang)).unwrap();
+        let by_language = |lang: &str| {
+            plugins
+                .iter()
+                .find(|p| p.language == lang)
+                .unwrap_or_else(|| panic!("{lang} missing: {plugins:?}"))
+        };
+        assert_eq!(plugins.len(), 3, "{plugins:?}");
+        assert_eq!(by_language("python").dir, canonical(&home_plugins, "python"));
+        assert_eq!(by_language("broken").dir, canonical(&home_plugins, "broken"));
+        assert_eq!(by_language("typescript").dir, canonical(&exe_plugins, "typescript"));
+
+        // Each entry's own rendering ends with its dir. An error message may
+        // span lines, so for an error entry that is the entry's last line,
+        // not necessarily the line its language starts.
+        for (lang, root) in
+            [("python", &home_plugins), ("broken", &home_plugins), ("typescript", &exe_plugins)]
+        {
+            let entry = render(std::slice::from_ref(by_language(lang)));
+            assert!(entry.starts_with(&format!("{lang}  ")), "{entry}");
+            let want = format!("  dir={}", canonical(root, lang).display());
+            assert!(entry.trim_end().ends_with(&want), "{lang} entry does not end with {want:?}: {entry}");
+        }
+        assert!(render(std::slice::from_ref(by_language("broken"))).contains("  error: "));
+        let loaded_line = render(std::slice::from_ref(by_language("python")));
+        assert_eq!(loaded_line.lines().count(), 1, "{loaded_line}");
+    }
+
+    /// The failure mode the `plugins/` layout exists for: a flat install (bare
+    /// `g-mesh-plugin-*` binaries beside the executable, no `plugins/`
+    /// directory) whose build checkout is gone discovers no plugin at all -
+    /// the plugin binaries alone are not a discovery root.
+    #[test]
+    fn a_flat_install_with_no_plugins_dir_and_no_checkout_lists_nothing() {
+        let scratch = tempfile::tempdir().unwrap();
+        let bin = scratch.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for file in ["g-mesh", "g-mesh-plugin-rust", "g-mesh-plugin-python", "g-mesh-plugin-typescript"] {
+            fs::write(bin.join(file), "").unwrap();
+        }
+        let (_empty_home, user_root) = fixture_root(&[]);
+
+        let plugins = list_from_roots(&[
+            (user_root, PluginStatus::Installed),
+            (bin.join("plugins"), PluginStatus::Bundled),
+            (scratch.path().join("deleted-checkout/plugins"), PluginStatus::Bundled),
+        ])
+        .unwrap();
+
+        assert!(plugins.is_empty(), "{plugins:?}");
+        assert_eq!(render(&plugins), "");
+    }
+
     /// A minimal well-formed `plugin.toml` body for a given language and
     /// version - the `list_from_roots` analog of `daemon::manifest`'s own
     /// `manifest_toml` test helper, needed here because this module's tests
@@ -560,6 +656,7 @@ extensions = [".{language}"]
     fn render_reports_language_version_and_status_for_a_loaded_plugin() {
         let plugins = vec![PluginInfo {
             language: "typescript".to_string(),
+            dir: PathBuf::from("/fixture/plugins/typescript"),
             outcome: PluginOutcome::Loaded {
                 version: "2.0.0".to_string(),
                 status: PluginStatus::Bundled,
@@ -580,6 +677,7 @@ extensions = [".{language}"]
     fn render_reports_installed_status() {
         let plugins = vec![PluginInfo {
             language: "python".to_string(),
+            dir: PathBuf::from("/fixture/plugins/python"),
             outcome: PluginOutcome::Loaded {
                 version: "0.1.0".to_string(),
                 status: PluginStatus::Installed,
@@ -604,6 +702,7 @@ extensions = [".{language}"]
     fn render_shows_capabilities_for_a_loaded_plugin() {
         let plugins = vec![PluginInfo {
             language: "go".to_string(),
+            dir: PathBuf::from("/fixture/plugins/go"),
             outcome: PluginOutcome::Loaded {
                 version: "0.1.0".to_string(),
                 status: PluginStatus::Bundled,
@@ -634,6 +733,7 @@ extensions = [".{language}"]
     fn render_shows_non_symbol_queries_for_a_loaded_plugin() {
         let loaded = |non_symbol_queries, symbol_query_prefixes| PluginInfo {
             language: "go".to_string(),
+            dir: PathBuf::from("/fixture/plugins/go"),
             outcome: PluginOutcome::Loaded {
                 version: "0.1.0".to_string(),
                 status: PluginStatus::Bundled,
@@ -654,16 +754,21 @@ extensions = [".{language}"]
         let lines: Vec<&str> = rendered.lines().collect();
         assert!(
             lines[0]
-                .ends_with("non_symbol_queries: starts_with=@ contains=/,::  symbol_query_prefixes: strip=@"),
+                .ends_with("non_symbol_queries: starts_with=@ contains=/,::  symbol_query_prefixes: strip=@  dir=/fixture/plugins/go"),
             "{rendered}"
         );
-        assert!(lines[1].ends_with("non_symbol_queries: none  symbol_query_prefixes: none"), "{rendered}");
+        assert!(
+            lines[1]
+                .ends_with("non_symbol_queries: none  symbol_query_prefixes: none  dir=/fixture/plugins/go"),
+            "{rendered}"
+        );
     }
 
     #[test]
     fn render_shows_an_error_indicator_for_a_broken_manifest() {
         let plugins = vec![PluginInfo {
             language: "broken".to_string(),
+            dir: PathBuf::from("/fixture/plugins/broken"),
             outcome: PluginOutcome::Error("failed to parse plugin manifest".to_string()),
         }];
 
