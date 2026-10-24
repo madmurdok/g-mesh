@@ -55,9 +55,11 @@
 //! default to the package's own name when neither gives an explicit `[lib]
 //! name`/`[[bin]] name`) - real `cargo` tells them apart by *target kind*.
 //! Container keys are one flat namespace (Decision 6: a container key is
-//! `<crate>::<module path>`), so the kind goes into the key: targets register
-//! library first, then binaries in manifest-declared order
-//! (`ProjectContext::load`'s `used_keys`), and a **binary** whose key is
+//! `<crate>::<module path>`), so the kind goes into the key: every member's
+//! library registers first, in member order, then every member's binaries,
+//! in member order and then manifest-declared order (`ProjectContext::load`'s
+//! `used_keys`) - so a binary never takes the plain key a library of the same
+//! or another member needs - and a **binary** whose key is
 //! already taken registers under [`bin_key`] (`tool[bin]`) instead. Every
 //! other collision - a library whose key is taken, or a binary whose
 //! `[bin]` key is taken too (two packages whose binaries share a name) -
@@ -233,10 +235,7 @@ impl ProjectContext {
 
         let package_dirs = collect_package_dirs(root, root_manifest.as_ref());
 
-        let mut crates = Vec::new();
-        let mut trees: Vec<module_tree::CrateTree> = Vec::new();
-        let mut taken: BTreeSet<RelPath> = BTreeSet::new();
-        let mut used_keys: BTreeSet<String> = BTreeSet::new();
+        let mut packages: Vec<(RelPath, Vec<Target>)> = Vec::new();
         let mut root_files: BTreeMap<RelPath, bool> = BTreeMap::new();
 
         for package_dir in &package_dirs {
@@ -260,31 +259,42 @@ impl ProjectContext {
                 continue;
             };
             let package_rel_dir = RelPath::relative_to(root, package_dir).unwrap_or_else(|| RelPath::new(""));
+            let targets = resolve_targets(root, package_dir, &package.name, &manifest);
+            for target in &targets {
+                *root_files.entry(target.root_file.clone()).or_insert(false) |= target.exists;
+            }
+            packages.push((package_rel_dir, targets));
+        }
 
-            for Target { key, kind, root_file, exists } in
-                resolve_targets(root, package_dir, &package.name, &manifest)
-            {
-                let seen = root_files.entry(root_file.clone()).or_insert(false);
-                *seen |= exists;
-                if !exists {
-                    continue;
+        // Every member's library registers before any binary, so a binary
+        // never takes the plain key a library of another member needs.
+        let mut crates = Vec::new();
+        let mut trees: Vec<module_tree::CrateTree> = Vec::new();
+        let mut taken: BTreeSet<RelPath> = BTreeSet::new();
+        let mut used_keys: BTreeSet<String> = BTreeSet::new();
+        for pass in [TargetKind::Lib, TargetKind::Bin] {
+            for (package_rel_dir, targets) in &packages {
+                for Target { key, kind, root_file, exists } in targets {
+                    if *kind != pass || !exists {
+                        continue;
+                    }
+                    let key = if used_keys.insert(key.clone()) {
+                        key.clone()
+                    } else if *kind == TargetKind::Bin && used_keys.insert(bin_key(key)) {
+                        bin_key(key)
+                    } else {
+                        notes.push(format!(
+                            "crate key {key:?} ({root_file}, package {package_rel_dir}) collides with an \
+                             earlier crate of the same name - keeping the first"
+                        ));
+                        continue;
+                    };
+                    let tree = module_tree::scan_crate(root, &key, root_file.clone(), &taken);
+                    taken.extend(tree.files.keys().cloned());
+                    notes.0.push(NoteSlot::Crate(trees.len()));
+                    trees.push(tree);
+                    crates.push(Crate { key, root: root_file.clone(), package_dir: package_rel_dir.clone() });
                 }
-                let key = if used_keys.insert(key.clone()) {
-                    key
-                } else if kind == TargetKind::Bin && used_keys.insert(bin_key(&key)) {
-                    bin_key(&key)
-                } else {
-                    notes.push(format!(
-                        "crate key {key:?} ({root_file}, package {package_rel_dir}) collides with an \
-                         earlier crate of the same name - keeping the first"
-                    ));
-                    continue;
-                };
-                let tree = module_tree::scan_crate(root, &key, root_file.clone(), &taken);
-                taken.extend(tree.files.keys().cloned());
-                notes.0.push(NoteSlot::Crate(trees.len()));
-                trees.push(tree);
-                crates.push(Crate { key, root: root_file, package_dir: package_rel_dir.clone() });
             }
         }
 
@@ -444,9 +454,10 @@ impl ProjectContext {
         self.rebuild();
     }
 
-    /// Every crate this project model found, in the order their `Cargo.toml`
-    /// was resolved (workspace root first when it is itself a package, then
-    /// `members` in the order `[workspace] members` names or globs them).
+    /// Every crate this project model found: every library first, then every
+    /// binary, each group in the order its `Cargo.toml` was resolved
+    /// (workspace root first when it is itself a package, then `members` in
+    /// the order `[workspace] members` names or globs them).
     pub fn crates(&self) -> &[Crate] {
         &self.crates
     }
