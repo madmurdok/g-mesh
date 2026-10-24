@@ -199,6 +199,6 @@ fn receiver_calls_are_folded_into_their_callers_untyped_calls() {
 fn a_nul_keeps_names_and_the_edges_written_after_it() {
     let graph =
         extract(PATH, "import \"./x\0y\";\nconst a = \"\0\";\nfunction f() {}\nfunction g() { f(); }\n");
-    assert_edge!(graph, EdgeKind::Imports, "<file>", "external_module:./x\0y");
+    assert_edge!(graph, EdgeKind::Imports, "<file>", "resolved_module:./x\0y");
     assert_edge!(graph, Calls, "g", "f");
 }

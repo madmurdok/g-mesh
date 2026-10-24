@@ -484,10 +484,10 @@ func (e *extractor) collectImports(file *ast.File) {
 
 		nativeKind := externalModuleNativeKind
 		var target *placeholderTarget
-		if e.ws.isProjectImportPath(importPath) {
+		if container, ok := e.importContainer(importPath); ok {
 			nativeKind = resolvedModuleNativeKind
 			target = &placeholderTarget{
-				Scope:         targetScope{Container: importPath},
+				Scope:         targetScope{Container: container},
 				Key:           targetKey{Name: reexportAllName},
 				FromContainer: e.container,
 			}
@@ -537,6 +537,34 @@ func (e *extractor) collectImports(file *ast.File) {
 // is the safe direction: the selector base is not recognized as a package,
 // so `that.F()` is treated as a receiver call and becomes an *open site*
 // rather than a wrong edge. GM-281 resolves it exactly.
+// importContainer is the container an import's placeholder addresses, and
+// whether it gets one at all: a project import path addresses itself; a
+// relative one (`./util`, `../x`, `.`, `..`) addresses a key no container
+// ever has, so its placeholder stays an unlinked `resolved_module` (an
+// unresolved import) rather than an `external_module`, since a relative
+// path never names a package outside the project; any other import has none
+// and is external.
+//
+// The relative key is the specifier as written, with a trailing `/` added to
+// a bare `.` or `..`. It always begins with `./` or `../`, which no
+// container key does (workspace.importPath yields a module path, a
+// normalized project-relative directory, or `.`), so it cannot link to an
+// unrelated package. The directory the specifier names is deliberately not
+// used: without a go.mod a directory's container key is that directory, and
+// with one a module path may equal a project-relative directory name, so it
+// could land on a package Go itself refuses to import this way.
+func (e *extractor) importContainer(importPath string) (string, bool) {
+	switch {
+	case e.ws.isProjectImportPath(importPath):
+		return importPath, true
+	case importPath == "." || importPath == "..":
+		return importPath + "/", true
+	case strings.HasPrefix(importPath, "./") || strings.HasPrefix(importPath, "../"):
+		return importPath, true
+	}
+	return "", false
+}
+
 func packageNameFromPath(importPath string) string {
 	segments := strings.Split(importPath, "/")
 	last := segments[len(segments)-1]

@@ -33,9 +33,9 @@ fn an_import_resolves_once_its_target_is_reported_present() {
     let mut project = fixture.load();
 
     let before = fixture.extract(&project, "src/a.ts");
-    assert_edge!(before, Imports, "<file>", "external_module:./b");
+    assert_edge!(before, Imports, "<file>", "resolved_module:./b");
     assert!(
-        !before.labels().iter().any(|label| label.starts_with("resolved_module:")),
+        !before.labels().iter().any(|label| label == "resolved_module:src/b.ts"),
         "{:?}",
         before.labels()
     );
@@ -356,7 +356,7 @@ fn a_shadowed_const_is_not_folded_into_a_dynamic_import() {
     let shadowed = extract(PATH, "const m = \"./m\";\nfunction g(m) { import(m); }\n");
     assert!(shadowed.pairs(Imports).is_empty(), "{:?}", shadowed.pairs(Imports));
     let visible = extract(PATH, "const m = \"./m\";\nfunction g() { import(m); }\n");
-    assert_edge!(visible, Imports, "<file>", "external_module:./m");
+    assert_edge!(visible, Imports, "<file>", "resolved_module:./m");
 }
 
 #[test]

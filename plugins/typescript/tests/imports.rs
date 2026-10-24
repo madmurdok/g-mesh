@@ -120,6 +120,30 @@ fn unresolved_import_is_an_external_module_named_by_the_specifier() {
 }
 
 #[test]
+fn relative_import_resolving_to_no_file_is_an_unlinked_resolved_module_at_the_path_it_names() {
+    let graph = extract(
+        PATH,
+        "import { m } from \"./missing\";\nimport \"../lib/x\";\nimport \".\";\nimport \"lodash\";\nm();\n",
+        &[],
+    );
+    for (specifier, path) in [("./missing", "src/missing"), ("../lib/x", "lib/x"), (".", "src")] {
+        let module = graph.placeholder("resolved_module", specifier);
+        assert_eq!(module.kind, NodeKind::Module);
+        assert_eq!(module.name, specifier);
+        assert_eq!(module.target, Some(target(path, "*")), "{specifier}");
+        assert_eq!(module.id, node_id(PATH, NodeKind::Module, specifier, Some("resolved_module")));
+    }
+    // Only the bare package is external.
+    let external: Vec<_> =
+        graph.of_kind("external_module").iter().map(|n| n.qualified_name.as_str()).collect();
+    assert_eq!(external, ["lodash"]);
+    assert_eq!(graph.imported(), [".", "../lib/x", "./missing", "lodash"]);
+    assert!(graph.imports_edges().iter().all(|edge| !edge.resolved));
+    // A name bound by an import that resolved to no file is not tracked.
+    assert!(graph.of_kind("pending_symbol").is_empty());
+}
+
+#[test]
 fn resolved_import_is_a_resolved_module_addressed_by_the_bare_path() {
     let graph = extract(PATH, "import { x } from \"./b\";\n", &[("./b", "src/b.ts")]);
     assert!(graph.of_kind("external_module").is_empty());
@@ -212,7 +236,7 @@ fn literal_require_and_dynamic_import_each_import_their_specifier() {
         &[("./n", "src/n.ts")],
     );
     assert_eq!(graph.imported(), ["./m", "./n"]);
-    graph.placeholder("external_module", "./m");
+    graph.placeholder("resolved_module", "./m");
     graph.placeholder("resolved_module", "src/n.ts");
 }
 
@@ -221,8 +245,8 @@ fn conditional_specifier_imports_each_branch_at_the_call_argument_span() {
     let graph = extract(PATH, "require(c ? \"./a\" : \"./b\");\n", &[]);
     assert_eq!(graph.imported(), ["./a", "./b"]);
     // Both span the whole conditional, not their own branch.
-    assert_eq!(graph.placeholder("external_module", "./a").range, range(0, 8, 25));
-    assert_eq!(graph.placeholder("external_module", "./b").range, range(0, 8, 25));
+    assert_eq!(graph.placeholder("resolved_module", "./a").range, range(0, 8, 25));
+    assert_eq!(graph.placeholder("resolved_module", "./b").range, range(0, 8, 25));
 }
 
 #[test]

@@ -114,6 +114,16 @@ pub fn resolve_relative(project: &TsProject, specifier: &str, from: &RelPath) ->
     first_existing(&project.existence, [base])
 }
 
+/// The project-relative path a relative specifier written in `from` names,
+/// before any extension or `index` candidate is tried (`./missing` in
+/// `src/a.ts` -> `src/missing`); `None` for a non-relative one. Pure path
+/// arithmetic: the result may name no file, the root (`.`), or a path above
+/// it (`../x`).
+pub fn relative_address(specifier: &str, from: &RelPath) -> Option<String> {
+    is_relative_specifier(specifier)
+        .then(|| paths::normalize(&paths::join(paths::dirname(from.as_str()), specifier)))
+}
+
 /// A bare specifier naming a workspace package or a subpath of one. Does not
 /// depend on the importer: a package name means the same everywhere.
 pub fn resolve_workspace(project: &TsProject, specifier: &str) -> Option<RelPath> {
