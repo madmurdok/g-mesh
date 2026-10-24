@@ -2,7 +2,8 @@
 //! What a real plugin produces is pinned end to end in
 //! `core/tests/it/cli_deps.rs`; these pin the shapes no fixture project of
 //! the bundled plugins reaches cheaply (a container defined by several files,
-//! duplicate import edges, a Python-relative `external_module`).
+//! duplicate import edges, an unlinked `resolved_module` beside an
+//! `external_module`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -165,18 +166,18 @@ fn a_self_import_is_dropped_and_duplicate_imports_collapse_to_one_edge() {
 }
 
 #[test]
-fn a_relative_external_module_is_unresolved_a_bare_one_external_each_counted_once_per_importer() {
+fn an_unlinked_resolved_module_is_unresolved_an_external_module_external_each_counted_once_per_importer() {
     let conn = index(
         vec![
             file("a.ts", "typescript"),
             placeholder("a.ts", "typescript", "react", EXTERNAL_MODULE_NATIVE_KIND),
-            placeholder("a.ts", "typescript", "./missing", EXTERNAL_MODULE_NATIVE_KIND),
-            placeholder("a.ts", "typescript", "../up", EXTERNAL_MODULE_NATIVE_KIND),
-            placeholder("a.ts", "typescript", ".", EXTERNAL_MODULE_NATIVE_KIND),
-            placeholder("a.ts", "typescript", "..", EXTERNAL_MODULE_NATIVE_KIND),
+            placeholder("a.ts", "typescript", "./missing", RESOLVED_MODULE_NATIVE_KIND),
+            placeholder("a.ts", "typescript", "../up", RESOLVED_MODULE_NATIVE_KIND),
+            placeholder("a.ts", "typescript", ".", RESOLVED_MODULE_NATIVE_KIND),
+            placeholder("a.ts", "typescript", "..", RESOLVED_MODULE_NATIVE_KIND),
             file("p.py", "python"),
             placeholder("p.py", "python", "os", EXTERNAL_MODULE_NATIVE_KIND),
-            placeholder("p.py", "python", ".sibling", EXTERNAL_MODULE_NATIVE_KIND),
+            placeholder("p.py", "python", ".sibling", RESOLVED_MODULE_NATIVE_KIND),
             placeholder("p.py", "python", "pkg.gone", RESOLVED_MODULE_NATIVE_KIND),
         ],
         vec![
@@ -268,26 +269,6 @@ fn absent_and_failed_languages_are_in_coverage_only_and_nothing_indexed_lists_no
     assert!(report["coverage"]["go"]["error"].as_str().is_some_and(|e| !e.contains('\n')), "{report}");
     assert_eq!(report["unresolved"], json!({}), "{report}");
     assert_eq!(report["edges"], json!([]), "{report}");
-}
-
-#[test]
-fn relative_specifiers_are_dot_slash_dot_dot_and_for_python_any_leading_dot() {
-    for (language, specifier, relative) in [
-        ("typescript", "./x", true),
-        ("typescript", "../x", true),
-        ("typescript", ".", true),
-        ("typescript", "..", true),
-        ("typescript", "react", false),
-        ("typescript", "@scope/pkg", false),
-        ("typescript", ".hidden", false),
-        ("python", ".", true),
-        ("python", ".sibling", true),
-        ("python", "..parent", true),
-        ("python", "os", false),
-        ("rust", "std", false),
-    ] {
-        assert_eq!(is_relative_specifier(language, specifier), relative, "{language} {specifier:?}");
-    }
 }
 
 #[test]

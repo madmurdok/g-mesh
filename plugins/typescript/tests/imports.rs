@@ -212,7 +212,7 @@ fn literal_require_and_dynamic_import_each_import_their_specifier() {
         &[("./n", "src/n.ts")],
     );
     assert_eq!(graph.imported(), ["./m", "./n"]);
-    graph.placeholder("external_module", "./m");
+    graph.placeholder("resolved_module", "./m");
     graph.placeholder("resolved_module", "src/n.ts");
 }
 
@@ -221,8 +221,8 @@ fn conditional_specifier_imports_each_branch_at_the_call_argument_span() {
     let graph = extract(PATH, "require(c ? \"./a\" : \"./b\");\n", &[]);
     assert_eq!(graph.imported(), ["./a", "./b"]);
     // Both span the whole conditional, not their own branch.
-    assert_eq!(graph.placeholder("external_module", "./a").range, range(0, 8, 25));
-    assert_eq!(graph.placeholder("external_module", "./b").range, range(0, 8, 25));
+    assert_eq!(graph.placeholder("resolved_module", "./a").range, range(0, 8, 25));
+    assert_eq!(graph.placeholder("resolved_module", "./b").range, range(0, 8, 25));
 }
 
 #[test]

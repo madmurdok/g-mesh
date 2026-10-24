@@ -127,18 +127,10 @@ For every import of a file:
    with an empty `__init__.py`), to the sub-modules' common directory's
    `__init__.py` when indexed, or to that directory (`kind: dir`, a namespace
    package). No file -> counted as unresolved.
-3. An external package -> counted in `external`, no row. Exception: a
-   target the plugin marked external whose specifier is relative to the
-   importing file (`.`, `..`, `./x`, `../x`; for Python also `.x`, `..x`) is counted in
-   `unresolved` instead, because a relative path cannot name a package.
+3. An external package -> counted in `external`, no row. A plugin marks
+   only a non-relative specifier external: a relative one (`./missing`,
+   `.x` in Python) that names no file is a target core could not link, step 4.
 4. Anything else -> counted in `unresolved`, no row.
-
-The exception in step 3 is a workaround: the TypeScript plugin marks a
-relative import it cannot resolve (`./missing`) as an external package. The
-plugin fix is backlog task "TypeScript plugin marks unresolvable relative
-imports ('./missing') as external_module"; once it ships, the rule has nothing
-left to reclassify. It does not change `version`: `unresolved` and `external`
-keep the meaning documented above, and the rule makes the output match it.
 
 Rows with `from == to` are dropped, and so are `dir` rows whose `to` is the
 directory `from` sits in (an import of the importer's own package). Two imports of the same target from one

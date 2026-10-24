@@ -10,11 +10,13 @@
 
 use g_mesh_plugin_sdk::wire::{PathSegment, PlaceholderTarget, TargetKey, TargetScope};
 
-/// `nativeKind` of a placeholder for an import specifier that names nothing
-/// in this project.
+/// `nativeKind` of a placeholder for a non-relative import specifier that
+/// names nothing in this project (a package, a builtin).
 pub const EXTERNAL_MODULE_NATIVE_KIND: &str = "external_module";
-/// `nativeKind` of a placeholder for an import specifier resolved to a file of
-/// this project; its `qualifiedName` is that file's path.
+/// `nativeKind` of a placeholder for an import specifier addressed at a path
+/// of this project. Resolved to a file, its `qualifiedName` is that file's
+/// path; a relative specifier resolved to none keeps the specifier as its
+/// `qualifiedName` and is targeted at the path it names.
 pub const RESOLVED_MODULE_NATIVE_KIND: &str = "resolved_module";
 /// `nativeKind` of a placeholder for a symbol imported from a file of this
 /// project; its `qualifiedName` is [`pending_symbol_qualified_name`].
