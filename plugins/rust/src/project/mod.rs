@@ -898,6 +898,117 @@ mod tests {
         assert!(!context.notes().iter().any(|note| note.contains("collides")), "{:?}", context.notes());
     }
 
+    /// A bin+lib package: the bin's whole module tree lives under
+    /// `<name>[bin]`, nested modules included, and the lib's keys are the
+    /// plain crate name as for a lib-only package.
+    #[test]
+    fn a_bin_sharing_its_libs_name_keeps_its_module_tree_under_the_bin_key() {
+        let tree = Tree::new("bin-tree-under-bin-key");
+        tree.write("Cargo.toml", "[package]\nname = \"tool\"\n");
+        tree.write("src/lib.rs", "pub mod util;\n");
+        tree.write("src/util.rs", "");
+        tree.write("src/main.rs", "mod config;\nfn main() {}\n");
+        tree.write("src/config.rs", "pub mod inner;\n");
+        tree.write("src/config/inner.rs", "");
+        let context = ProjectContext::load(&tree.0).unwrap();
+        assert_eq!(crate_keys(&context), vec!["tool", "tool[bin]"]);
+        assert_eq!(
+            context.container_for(&RelPath::new("src/main.rs")),
+            ContainerInfo::Member { key: "tool[bin]".to_string(), parent: None }
+        );
+        assert_eq!(
+            context.container_for(&RelPath::new("src/config.rs")),
+            ContainerInfo::Member {
+                key: "tool[bin]::config".to_string(),
+                parent: Some("tool[bin]".to_string())
+            }
+        );
+        assert_eq!(
+            context.container_for(&RelPath::new("src/config/inner.rs")),
+            ContainerInfo::Member {
+                key: "tool[bin]::config::inner".to_string(),
+                parent: Some("tool[bin]::config".to_string())
+            }
+        );
+        assert_eq!(
+            context.container_for(&RelPath::new("src/lib.rs")),
+            ContainerInfo::Member { key: "tool".to_string(), parent: None }
+        );
+        assert_eq!(
+            context.container_for(&RelPath::new("src/util.rs")),
+            ContainerInfo::Member { key: "tool::util".to_string(), parent: Some("tool".to_string()) }
+        );
+        assert!(context.notes().is_empty(), "{:?}", context.notes());
+    }
+
+    /// Three members named `x`: A (bin only), B (lib and bin), C (bin only).
+    /// Every lib registers before any bin, so B's lib holds `x`, A's bin -
+    /// the first bin in member order - holds `x[bin]`, and B's and C's bins
+    /// find both keys taken: each is noted and skipped, its files orphans,
+    /// never merged into another crate's tree.
+    #[test]
+    fn a_bin_whose_bin_key_is_taken_too_is_noted_and_skipped() {
+        let tree = Tree::new("bin-key-taken-too");
+        tree.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\n");
+        for member in ["a", "b", "c"] {
+            tree.write(&format!("{member}/Cargo.toml"), "[package]\nname = \"x\"\n");
+            tree.write(&format!("{member}/src/main.rs"), "mod m;\nfn main() {}\n");
+            tree.write(&format!("{member}/src/m.rs"), "");
+        }
+        tree.write("b/src/lib.rs", "pub mod l;\n");
+        tree.write("b/src/l.rs", "");
+        let context = ProjectContext::load(&tree.0).unwrap();
+
+        assert_eq!(crate_keys(&context), vec!["x", "x[bin]"], "{:?}", context.notes());
+        let roots: Vec<&str> = context.crates().iter().map(|c| c.root.as_str()).collect();
+        assert_eq!(roots, vec!["b/src/lib.rs", "a/src/main.rs"]);
+        assert_eq!(key_of(&context, "b/src/l.rs"), "x::l");
+        assert_eq!(key_of(&context, "a/src/m.rs"), "x[bin]::m");
+        for skipped in ["b/src/main.rs", "b/src/m.rs", "c/src/main.rs", "c/src/m.rs"] {
+            assert_eq!(key_of(&context, skipped), format!("orphan:{skipped}"));
+        }
+        for root in ["b/src/main.rs", "c/src/main.rs"] {
+            assert!(
+                context.notes().iter().any(|note| note.contains("collides") && note.contains(root)),
+                "{root}: {:?}",
+                context.notes()
+            );
+        }
+        assert_eq!(context.notes().iter().filter(|note| note.contains("collides")).count(), 2);
+    }
+
+    /// A bin named after a later member's lib: the lib holds the plain key
+    /// (its files are members, not orphans) and the bin is `tool[bin]`,
+    /// whatever the member order.
+    #[test]
+    fn a_later_members_lib_takes_the_plain_key_from_an_earlier_members_bin() {
+        let tree = Tree::new("lib-before-bin-across-members");
+        tree.write("Cargo.toml", "[workspace]\nmembers = [\"cli\", \"core\"]\n");
+        tree.write(
+            "cli/Cargo.toml",
+            "[package]\nname = \"cli\"\n\n[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n",
+        );
+        tree.write("cli/src/main.rs", "mod args;\nfn main() {}\n");
+        tree.write("cli/src/args.rs", "");
+        tree.write("core/Cargo.toml", "[package]\nname = \"tool\"\n");
+        tree.write("core/src/lib.rs", "pub mod x;\n");
+        tree.write("core/src/x.rs", "");
+        let context = ProjectContext::load(&tree.0).unwrap();
+
+        assert_eq!(crate_keys(&context), vec!["tool", "tool[bin]"], "{:?}", context.notes());
+        assert_eq!(
+            context.container_for(&RelPath::new("core/src/lib.rs")),
+            ContainerInfo::Member { key: "tool".to_string(), parent: None }
+        );
+        assert_eq!(key_of(&context, "core/src/x.rs"), "tool::x");
+        assert_eq!(
+            context.container_for(&RelPath::new("cli/src/main.rs")),
+            ContainerInfo::Member { key: "tool[bin]".to_string(), parent: None }
+        );
+        assert_eq!(key_of(&context, "cli/src/args.rs"), "tool[bin]::args");
+        assert!(!context.notes().iter().any(|note| note.contains("collides")), "{:?}", context.notes());
+    }
+
     #[test]
     fn a_missing_root_cargo_toml_yields_an_empty_model_not_an_error() {
         let tree = Tree::new("no-manifest");

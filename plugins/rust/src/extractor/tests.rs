@@ -2994,3 +2994,111 @@ fn single_segment_calls_stay_and_non_call_paths_are_asked_at_the_last_segment() 
         assert!(start as u32 <= *col && *col < (start + name.len()) as u32, "{name} at {line}:{col}");
     }
 }
+
+// --- a bin crate beside a lib of the same name -----------------------------------
+
+/// Package `krate` with a lib and a bin: the bin's modules are keyed under
+/// `krate[bin]`, the lib's under `krate`.
+fn bin_and_lib() -> Crate {
+    Crate::new(&[
+        ("src/lib.rs", "pub mod util;\n"),
+        ("src/util.rs", "pub fn u() {}\n"),
+        (
+            "src/main.rs",
+            "mod config;\nuse crate::config::Settings;\nuse crate::config::helper;\nuse krate::util::u;\n\
+             fn main() { helper(); u(); }\n",
+        ),
+        ("src/config.rs", "pub mod inner;\npub struct Settings;\npub(crate) fn helper() {}\n"),
+        ("src/config/inner.rs", "use super::Settings;\n"),
+    ])
+}
+
+/// In the bin's root, `crate::config` names the bin's own module and a bare
+/// `krate::` still names the lib, the crate a bin refers to by name.
+#[test]
+fn a_bins_crate_paths_name_its_own_modules_and_its_packages_name_names_the_lib() {
+    let krate = bin_and_lib();
+    let graph = krate.extract("src/main.rs");
+    assert_eq!(
+        graph.target_of(graph.placeholder("pending_symbol", "Settings")),
+        (container("krate[bin]::config"), TargetKey::Name("Settings".into()))
+    );
+    let helper = graph.placeholder("pending_symbol", "helper");
+    assert_eq!(graph.target_of(helper), (container("krate[bin]::config"), TargetKey::Name("helper".into())));
+    assert_eq!(
+        helper.target.as_ref().and_then(|t| t.from_container.clone()).as_deref(),
+        Some("krate[bin]"),
+        "the requester is the bin's root, inside `pub(crate)`'s reach"
+    );
+    assert_eq!(
+        graph.target_of(graph.placeholder("pending_symbol", "u")),
+        (container("krate::util"), TargetKey::Name("u".into()))
+    );
+    assert_eq!(
+        graph.targets(EdgeKind::Imports, "src/main.rs"),
+        vec![
+            "resolved_module krate::util::*".to_string(),
+            "resolved_module krate[bin]::config::*".to_string()
+        ],
+        "{:#?}",
+        graph.names()
+    );
+}
+
+/// The bin's module is declared in container `krate[bin]::config`, under
+/// parent `krate[bin]`, and its `pub(crate)` reaches the bin's root, not the
+/// lib's.
+#[test]
+fn a_bin_modules_items_are_declared_in_the_bin_keyed_container() {
+    let krate = bin_and_lib();
+    let graph = krate.extract("src/config.rs");
+    let settings = graph.node("config::Settings");
+    assert_eq!(settings.container.as_deref(), Some("krate[bin]::config"));
+    assert_eq!(settings.container_parent.as_deref(), Some("krate[bin]"));
+    assert_eq!(graph.node("config::helper").visibility, Visibility::Container("krate[bin]".into()));
+}
+
+/// `use super::Settings` in a bin's nested module imports the parent module.
+#[test]
+fn a_super_use_in_a_bin_module_imports_the_parent_module() {
+    let krate = bin_and_lib();
+    let graph = krate.extract("src/config/inner.rs");
+    assert_eq!(
+        graph.targets(EdgeKind::Imports, "src/config/inner.rs"),
+        vec!["resolved_module krate[bin]::config::*".to_string()],
+        "{:#?}",
+        graph.names()
+    );
+}
+
+/// An orphan file's top level has no parent module, so its `use super::`
+/// names nothing and emits no `IMPORTS`.
+#[test]
+fn a_super_use_in_an_orphan_file_emits_no_import() {
+    let krate = Crate::new(&[("src/lib.rs", "pub fn f() {}\n"), ("src/loose.rs", "use super::f;\n")]);
+    let graph = krate.extract("src/loose.rs");
+    assert!(graph.edges(EdgeKind::Imports).is_empty(), "{:#?}", graph.0.edges);
+}
+
+/// A bin named after another member's lib: from the bin, `use tool::x::f`
+/// names the lib's module.
+#[test]
+fn a_bin_named_after_another_members_lib_imports_that_lib_by_name() {
+    let krate = Crate::new(&[
+        ("Cargo.toml", "[workspace]\nmembers = [\"cli\", \"core\"]\n"),
+        ("cli/Cargo.toml", "[package]\nname = \"cli\"\n\n[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n"),
+        ("cli/src/main.rs", "use tool::x::f;\nfn main() { f(); }\n"),
+        ("core/Cargo.toml", "[package]\nname = \"tool\"\n"),
+        ("core/src/lib.rs", "pub mod x;\n"),
+        ("core/src/x.rs", "pub fn f() {}\n"),
+    ]);
+    let graph = krate.extract("cli/src/main.rs");
+    assert_eq!(
+        graph.target_of(graph.placeholder("pending_symbol", "f")),
+        (container("tool::x"), TargetKey::Name("f".into()))
+    );
+    assert_eq!(
+        graph.targets(EdgeKind::Imports, "cli/src/main.rs"),
+        vec!["resolved_module tool::x::*".to_string()]
+    );
+}
