@@ -53,14 +53,18 @@
 //! target ([`resolve_targets`]) becomes its own [`Crate`] with its own
 //! [`module_tree::scan_crate`] walk. Their default names can collide (both
 //! default to the package's own name when neither gives an explicit `[lib]
-//! name`/`[[bin]] name`) - real `cargo` tells them apart by *target kind*,
-//! which the wire's container key has no room for (Decision 6: a container
-//! key is `<crate>::<module path>`, one flat namespace). This model resolves
-//! the collision the same deterministic way it resolves every other one in
-//! this file: **first registered wins** (`ProjectContext::load`'s
-//! `used_keys`), library before binaries, in manifest-declared order among
-//! binaries - and the loser is recorded in [`ProjectContext::notes`], never
-//! silently merged into the winner's container.
+//! name`/`[[bin]] name`) - real `cargo` tells them apart by *target kind*.
+//! Container keys are one flat namespace (Decision 6: a container key is
+//! `<crate>::<module path>`), so the kind goes into the key: targets register
+//! library first, then binaries in manifest-declared order
+//! (`ProjectContext::load`'s `used_keys`), and a **binary** whose key is
+//! already taken registers under [`bin_key`] (`tool[bin]`) instead. Every
+//! other collision - a library whose key is taken, or a binary whose
+//! `[bin]` key is taken too (two packages whose binaries share a name) -
+//! keeps the first registered crate, and the later one is recorded in
+//! [`ProjectContext::notes`], never silently merged into the first one's
+//! container. The design is
+//! `docs/design/GM-651-bin-crate-imports.md`.
 //!
 //! # Decision 5: the orphan container's key
 //!
@@ -89,7 +93,9 @@
 //! A crate's own key is [`normalize_crate_name`] applied to its target name -
 //! `-` becomes `_`, exactly `cargo`'s own rule for turning a package name
 //! into the identifier real Rust code refers to it by (`this-crate` compiles
-//! as `extern crate this_crate`). The crate root itself - `src/lib.rs` or
+//! as `extern crate this_crate`) - or, for a binary whose name is already
+//! taken, that name with a `[bin]` suffix ("One package, several crates"
+//! above). The crate root itself - `src/lib.rs` or
 //! `src/main.rs` - is registered as a member of container key `<crate>`
 //! (bare, no `::`) with **no parent**, matching the design doc's table
 //! ("Rust... crate root has none"). That the root is *itself* always a
@@ -133,7 +139,7 @@ pub const EXCLUDE_DIRS: [&str; 1] = ["target"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Crate {
     /// The normalized container key of this crate's own root - see Decision
-    /// 6.
+    /// 6. A binary whose name a library already holds is `<name>[bin]`.
     pub key: String,
     /// This crate's root file (`src/lib.rs`, `src/main.rs`, or an explicit
     /// `[lib]`/`[[bin]] path`), project-relative.
@@ -255,7 +261,7 @@ impl ProjectContext {
             };
             let package_rel_dir = RelPath::relative_to(root, package_dir).unwrap_or_else(|| RelPath::new(""));
 
-            for Target { key, root_file, exists } in
+            for Target { key, kind, root_file, exists } in
                 resolve_targets(root, package_dir, &package.name, &manifest)
             {
                 let seen = root_files.entry(root_file.clone()).or_insert(false);
@@ -263,13 +269,17 @@ impl ProjectContext {
                 if !exists {
                     continue;
                 }
-                if !used_keys.insert(key.clone()) {
+                let key = if used_keys.insert(key.clone()) {
+                    key
+                } else if kind == TargetKind::Bin && used_keys.insert(bin_key(&key)) {
+                    bin_key(&key)
+                } else {
                     notes.push(format!(
                         "crate key {key:?} ({root_file}, package {package_rel_dir}) collides with an \
                          earlier crate of the same name - keeping the first"
                     ));
                     continue;
-                }
+                };
                 let tree = module_tree::scan_crate(root, &key, root_file.clone(), &taken);
                 taken.extend(tree.files.keys().cloned());
                 notes.0.push(NoteSlot::Crate(trees.len()));
@@ -550,10 +560,15 @@ fn resolve_targets(
     manifest: &RawCargoToml,
 ) -> Vec<Target> {
     let mut targets = Vec::new();
-    let mut push = |name: String, relative: &str| {
+    let mut push = |kind: TargetKind, name: String, relative: &str| {
         let absolute = package_dir.join(relative);
         if let Some(root_file) = RelPath::relative_to(root, &absolute) {
-            targets.push(Target { key: normalize_crate_name(&name), root_file, exists: absolute.is_file() });
+            targets.push(Target {
+                key: normalize_crate_name(&name),
+                kind,
+                root_file,
+                exists: absolute.is_file(),
+            });
         }
     };
 
@@ -561,7 +576,7 @@ fn resolve_targets(
         manifest.lib.as_ref().and_then(|lib| lib.path.clone()).unwrap_or_else(|| "src/lib.rs".into());
     let lib_name =
         manifest.lib.as_ref().and_then(|lib| lib.name.clone()).unwrap_or_else(|| package_name.into());
-    push(lib_name, &lib_path);
+    push(TargetKind::Lib, lib_name, &lib_path);
 
     let mut bins = manifest.bins.clone();
     if bins.is_empty() {
@@ -573,18 +588,27 @@ fn resolve_targets(
     }
     for bin in &bins {
         let bin_path = bin.path.clone().unwrap_or_else(|| "src/main.rs".into());
-        push(bin.name.clone().unwrap_or_else(|| package_name.into()), &bin_path);
+        push(TargetKind::Bin, bin.name.clone().unwrap_or_else(|| package_name.into()), &bin_path);
     }
 
     targets
 }
 
 /// One crate root a package's manifest names: its normalized crate key, its
-/// project-relative path, and whether that path is a file now.
+/// target kind, its project-relative path, and whether that path is a file
+/// now.
 struct Target {
     key: String,
+    kind: TargetKind,
     root_file: RelPath,
     exists: bool,
+}
+
+/// A manifest target's kind: the package's library or one of its binaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    Lib,
+    Bin,
 }
 
 /// `cargo`'s own crate-identifier rule: a package or target name's `-`
@@ -592,6 +616,16 @@ struct Target {
 /// `[[bin]] name` - see this module's doc, Decision 6.
 fn normalize_crate_name(name: &str) -> String {
     name.replace('-', "_")
+}
+
+/// The key a binary registers under when its normalized name `key` is
+/// already taken: `<key>[bin]`. It never equals a real `<crate>::<module
+/// path>` key and no bare path segment matches it, because `[` and `]` are
+/// not identifier characters; it contains no `::`, so every `::`-splitting
+/// rule (`crate_root_of`, `parent_key`, the facts' container delta) reads it
+/// as one crate root.
+fn bin_key(key: &str) -> String {
+    format!("{key}[bin]")
 }
 
 #[cfg(test)]
@@ -834,16 +868,23 @@ mod tests {
         tree.write("src/main.rs", "mod shared;\n"); // would also claim `tool::shared` if not deduped
         let context = ProjectContext::load(&tree.0).unwrap();
         let keys: Vec<&str> = context.crates().iter().map(|c| c.key.as_str()).collect();
-        assert_eq!(keys, vec!["tool"], "only the lib crate root registers under the shared key");
+        assert_eq!(keys, vec!["tool", "tool[bin]"], "the bin registers under its own `[bin]` key");
         assert_eq!(
             context.container_for(&RelPath::new("src/lib.rs")),
             ContainerInfo::Member { key: "tool".to_string(), parent: None }
         );
-        assert!(
-            matches!(context.container_for(&RelPath::new("src/main.rs")), ContainerInfo::Orphan { .. }),
-            "the losing crate root's own file is not silently absorbed into the winner's tree either"
+        assert_eq!(
+            context.container_for(&RelPath::new("src/main.rs")),
+            ContainerInfo::Member { key: "tool[bin]".to_string(), parent: None },
+            "the bin's crate root is not absorbed into the lib's container"
         );
-        assert!(context.notes().iter().any(|note| note.contains("collides")), "{:?}", context.notes());
+        assert_eq!(key_of(&context, "src/shared.rs"), "tool::shared", "the file both claim stays the lib's");
+        assert!(
+            context.notes().iter().any(|note| note.contains("already indexed under a different module")),
+            "{:?}",
+            context.notes()
+        );
+        assert!(!context.notes().iter().any(|note| note.contains("collides")), "{:?}", context.notes());
     }
 
     #[test]
@@ -1146,12 +1187,13 @@ mod tests {
         assert_equals_load(&context, &tree);
     }
 
-    /// `src/lib.rs` and `src/main.rs` share the default key and the lib
-    /// wins. Deleting `lib.rs` hands the key to `main.rs`'s crate and
-    /// re-creating it takes it back: the crate names stay the same, so each
-    /// step answers `Affected` (not `Unknown`) and equals a cold load.
+    /// `src/lib.rs` and `src/main.rs` share the default name: the lib holds
+    /// `tool` and the bin is `tool[bin]`. Deleting `lib.rs` gives the bin the
+    /// plain key back and re-creating it moves the bin to `tool[bin]` again:
+    /// the crate names change, so each step answers `Unknown` and equals a
+    /// cold load.
     #[test]
-    fn deleting_the_winning_lib_rs_promotes_the_bin_under_the_same_key() {
+    fn deleting_lib_rs_gives_the_bin_the_plain_key_back() {
         let tree = Tree::new("lib-bin-swap");
         tree.write("Cargo.toml", "[package]\nname = \"tool\"\n");
         tree.write("src/lib.rs", "pub mod shared;\n");
@@ -1159,8 +1201,9 @@ mod tests {
         tree.write("src/main.rs", "mod cli;\nfn main() {}\n");
         tree.write("src/cli.rs", "");
         let mut context = ProjectContext::load(&tree.0).unwrap();
+        assert_eq!(crate_keys(&context), vec!["tool", "tool[bin]"]);
         assert_eq!(key_of(&context, "src/shared.rs"), "tool::shared");
-        assert_eq!(key_of(&context, "src/cli.rs"), "orphan:src/cli.rs");
+        assert_eq!(key_of(&context, "src/cli.rs"), "tool[bin]::cli");
 
         let delta = delete(&mut context, &tree, "src/lib.rs");
         assert_eq!(crate_keys(&context), vec!["tool"]);
@@ -1170,16 +1213,14 @@ mod tests {
         );
         assert_eq!(key_of(&context, "src/cli.rs"), "tool::cli");
         assert_eq!(key_of(&context, "src/shared.rs"), "orphan:src/shared.rs");
-        let files = scoped(&delta);
-        for path in ["src/cli.rs", "src/shared.rs"] {
-            assert!(files.contains(&path.to_string()), "{path}: {delta:?}");
-        }
+        assert!(is_unknown(&delta), "{delta:?}");
         assert_equals_load(&context, &tree);
 
         let delta = save(&mut context, &tree, "src/lib.rs", "pub mod shared;\n");
+        assert_eq!(crate_keys(&context), vec!["tool", "tool[bin]"]);
         assert_eq!(key_of(&context, "src/shared.rs"), "tool::shared");
-        assert_eq!(key_of(&context, "src/cli.rs"), "orphan:src/cli.rs");
-        assert!(scoped(&delta).contains(&"src/cli.rs".to_string()), "{delta:?}");
+        assert_eq!(key_of(&context, "src/cli.rs"), "tool[bin]::cli");
+        assert!(is_unknown(&delta), "{delta:?}");
         assert_equals_load(&context, &tree);
     }
 
@@ -1239,20 +1280,24 @@ mod tests {
 
     /// A root present at load that lost the key collision is recorded as
     /// present: saving it is no creation, so it neither reloads nor reads
-    /// the disk (which here holds a new `mod child;` in `lib.rs`).
+    /// the disk (which here holds a new `mod child;` in the winning
+    /// `lib.rs`). Two members' libs sharing one name is such a collision.
     #[test]
     fn saving_a_root_that_lost_the_key_collision_does_not_reload() {
         let tree = Tree::new("losing-root-saved");
-        tree.write("Cargo.toml", "[package]\nname = \"tool\"\n");
-        tree.write("src/lib.rs", "");
-        tree.write("src/main.rs", "fn main() {}\n");
+        tree.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        tree.write("crates/a/Cargo.toml", "[package]\nname = \"tool\"\n");
+        tree.write("crates/a/src/lib.rs", "");
+        tree.write("crates/b/Cargo.toml", "[package]\nname = \"tool\"\n");
+        tree.write("crates/b/src/lib.rs", "");
         let mut context = ProjectContext::load(&tree.0).unwrap();
-        assert_eq!(key_of(&context, "src/main.rs"), "orphan:src/main.rs");
+        assert_eq!(crate_keys(&context), vec!["tool"]);
+        assert_eq!(key_of(&context, "crates/b/src/lib.rs"), "orphan:crates/b/src/lib.rs");
         let before = context.clone();
-        tree.write("src/lib.rs", "pub mod child;\n");
-        tree.write("src/child.rs", "");
+        tree.write("crates/a/src/lib.rs", "pub mod child;\n");
+        tree.write("crates/a/src/child.rs", "");
 
-        let delta = context.source_changed(&RelPath::new("src/main.rs"), Some("fn main() {}\n// edited\n"));
+        let delta = context.source_changed(&RelPath::new("crates/b/src/lib.rs"), Some("// edited\n"));
 
         assert_eq!(delta, None);
         assert_eq!(context, before, "the model is untouched");

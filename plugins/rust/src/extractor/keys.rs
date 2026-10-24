@@ -87,7 +87,10 @@ const ORPHAN_PREFIX: &str = "orphan:";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModuleCtx {
     /// The container key of this module - `<crate>::<module path>`, or
-    /// `orphan:<path>` for an orphan file's own top level.
+    /// `orphan:<path>` for an orphan file's own top level. `<crate>` is a
+    /// crate name, or `<name>[bin]` for a binary whose package's library
+    /// already holds `<name>`; that form is not an identifier, so no bare path
+    /// segment ever names it.
     pub(crate) key: String,
     /// The key of the module that declares this one. `None` only for a crate
     /// root (and for an orphan file's top level, which is a root of its own).
@@ -162,7 +165,8 @@ pub(crate) fn qualified_in(container: &str, tail: &str) -> String {
 }
 
 /// The crate root key a container key hangs under: its first `::`-separated
-/// segment, or the whole key for a crate root or an orphan container.
+/// segment, or the whole key for a crate root or an orphan container. A
+/// crate root key contains no `::`, the `<name>[bin]` form included.
 fn crate_root_of(key: &str) -> &str {
     key.split_once("::").map_or(key, |(root, _)| root)
 }
