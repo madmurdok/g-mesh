@@ -297,9 +297,9 @@ const LIB_RS: (&str, &str) = ("src/lib.rs", "pub mod core;\npub fn lib_fn() {}\n
 
 /// Acceptance, `src/lib.rs`: in a package of `src/main.rs` alone, creating
 /// `lib.rs` and routing only it places the lib's module without a
-/// `Cargo.toml` save; the lib takes the package's crate key, so the bin's
-/// module is orphaned. Deleting `lib.rs` restores the bin. Both states equal
-/// a cold index of the same files.
+/// `Cargo.toml` save; the lib takes the package's crate key and the bin
+/// moves to `alpha[bin]`. Deleting `lib.rs` gives the bin the plain key back.
+/// Both states equal a cold index of the same files.
 ///
 /// Control: drop the crate-root check at the top of
 /// `ProjectContext::source_changed` (`core.rs` stays an orphan).
@@ -313,7 +313,7 @@ fn creating_and_deleting_src_lib_rs_moves_the_crate_without_a_cargo_toml_save() 
     harness.route("src/lib.rs");
     assert_eq!(container_of("core_fn", &harness).as_deref(), Some("alpha::core"));
     assert_eq!(container_of("lib_fn", &harness).as_deref(), Some("alpha"));
-    assert_eq!(container_of("cli_fn", &harness).as_deref(), Some("orphan:src/cli.rs"));
+    assert_eq!(container_of("cli_fn", &harness).as_deref(), Some("alpha[bin]::cli"));
     let with_lib: Vec<(&str, &str)> = MAIN_ONLY.iter().copied().chain([LIB_RS]).collect();
     assert_equals_cold(&harness, &with_lib);
 
