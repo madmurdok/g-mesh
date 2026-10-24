@@ -115,8 +115,6 @@ path = "junit.xml"
 # (docs/adr/0031-local-test-runs.md); `test-local.sh --full` runs them and
 # reports any test whose time crossed 10s either way against this list. A test
 # joins at 10s or more and leaves only after two batch-end runs under 10s.
-# Refreshed from the 4.18.0 batch-end timings: an entry leaves only when both
-# that run and the one before measured it under 10s.
 [profile.local]
 inherits = "default"
 default-filter = """
