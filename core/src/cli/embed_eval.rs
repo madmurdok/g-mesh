@@ -2112,4 +2112,299 @@ mod tests {
             })
         );
     }
+
+    /// A gold fixture: `1` is a module the noise filter drops, `2` a
+    /// documented method, `3` a node with no text, `4` an undocumented
+    /// function no filter drops.
+    fn gold_nodes() -> Vec<Node> {
+        use context::test_node;
+        let mut nodes = vec![
+            test_node(
+                "1",
+                "Module",
+                "module",
+                "m::transport",
+                "src/transport/mod.rs",
+                "rust",
+                Some("transport"),
+            ),
+            test_node(
+                "2",
+                "Function",
+                "method",
+                "m::Session::send",
+                "src/session.rs",
+                "rust",
+                Some("fn send(&self)"),
+            ),
+            test_node("3", "Function", "function", "m::bare", "src/bare.rs", "rust", None),
+            test_node(
+                "4",
+                "Function",
+                "function",
+                "m::other",
+                "src/other.rs",
+                "rust",
+                Some("fn other(x: u32)"),
+            ),
+        ];
+        nodes[1].doc = Some("Sends a message.".into());
+        nodes[1].text = full_text(nodes[1].doc.as_deref(), nodes[1].signature.as_deref());
+        nodes
+    }
+
+    fn gold_query(id: &str, text: &str, expected: &[(&str, &str, &str)]) -> Query {
+        Query {
+            id: id.into(),
+            corpus: "c".into(),
+            language: "rust".into(),
+            kind: queries::QueryKind::Positive,
+            shape: "phrase".into(),
+            text: text.into(),
+            expected: expected
+                .iter()
+                .map(|&(file, qn, kind)| queries::ExpectedSymbol {
+                    file_path: file.into(),
+                    qualified_name: qn.into(),
+                    kind: kind.into(),
+                })
+                .collect(),
+            derivation: "fixture".into(),
+            author: "test".into(),
+            mechanical: false,
+        }
+    }
+
+    const MODULE: (&str, &str, &str) = ("src/transport/mod.rs", "m::transport", "Module");
+    const METHOD: (&str, &str, &str) = ("src/session.rs", "m::Session::send", "Function");
+    const NO_TEXT: (&str, &str, &str) = ("src/bare.rs", "m::bare", "Function");
+    const MISSING: (&str, &str, &str) = ("src/gone.rs", "m::gone", "Function");
+
+    /// Candidate indices of `nodes` under `filter`, as `run_corpus` builds them.
+    fn candidates_under(nodes: &[Node], filter: EmbedFilter) -> HashMap<usize, usize> {
+        (0..nodes.len())
+            .filter(|&i| nodes[i].text.is_some() && !nodes[i].filtered(filter))
+            .enumerate()
+            .map(|(c, i)| (i, c))
+            .collect()
+    }
+
+    /// `gold` names every embeddable expected node whatever the filter;
+    /// `hits` leaves out the nodes the filter drops, as a miss.
+    #[test]
+    fn resolved_gold_does_not_depend_on_the_filter() {
+        let nodes = gold_nodes();
+        assert!(nodes[0].filtered(EmbedFilter::Noise) && !nodes[1].filtered(EmbedFilter::Noise));
+        let queries = vec![
+            gold_query("c-001", "open the transport", &[MODULE]),
+            gold_query("c-002", "deliver", &[MODULE, METHOD]),
+        ];
+        let resolve =
+            |filter| resolve_expected(&queries, &nodes, &candidates_under(&nodes, filter), filter).unwrap();
+        let plain = resolve(EmbedFilter::None);
+        let noise = resolve(EmbedFilter::Noise);
+        assert_eq!(plain[0], Resolved { hits: vec![0], gold: vec![0] });
+        assert_eq!(plain[1], Resolved { hits: vec![0, 1], gold: vec![0, 1] });
+        assert_eq!(noise[0], Resolved { hits: vec![], gold: vec![0] });
+        // Under the noise filter node 2 is the first candidate.
+        assert_eq!(noise[1], Resolved { hits: vec![0], gold: vec![0, 1] });
+    }
+
+    /// Every gold that is not in the snapshot fails, each error naming its
+    /// query id; one call reports them all.
+    #[test]
+    fn gold_missing_from_the_snapshot_fails_naming_each_query() {
+        let nodes = gold_nodes();
+        let queries = vec![
+            gold_query("c-001", "open the transport", &[MODULE]),
+            gold_query("c-002", "gone", &[MISSING]),
+            gold_query("c-003", "deliver", &[METHOD, MISSING]),
+        ];
+        let err = format!("{:#}", check_gold(&queries, &nodes).unwrap_err());
+        assert!(err.contains("c-002: src/gone.rs m::gone (Function) is not in the snapshot"), "{err}");
+        assert!(err.contains("c-003: src/gone.rs m::gone (Function) is not in the snapshot"), "{err}");
+        assert!(!err.contains("c-001"), "{err}");
+        check_gold(&queries[..1], &nodes).unwrap();
+    }
+
+    /// A gold node with no embeddable text fails under every filter.
+    #[test]
+    fn gold_without_text_fails_under_every_filter() {
+        let nodes = gold_nodes();
+        let queries = vec![gold_query("c-004", "bare", &[NO_TEXT])];
+        for filter in [EmbedFilter::None, EmbedFilter::Noise] {
+            let err = format!(
+                "{:#}",
+                resolve_expected(&queries, &nodes, &candidates_under(&nodes, filter), filter).unwrap_err()
+            );
+            assert!(err.contains("c-004: src/bare.rs m::bare has no embeddable text"), "{filter:?}: {err}");
+        }
+        assert!(check_gold(&queries, &nodes).is_err());
+    }
+
+    const VARIANTS: &str = r#"
+        [settings]
+        reference = "r"
+        bootstrap_seed = 1
+        bootstrap_resamples = 10
+        arm_seed = 1
+
+        [[variant]]
+        name = "r"
+        arm = "model"
+        role = "reference"
+        pooling = "mean"
+        dimension = 768
+        max_tokens = 1024
+
+        [[variant]]
+        name = "bm25"
+        arm = "bm25"
+        role = "informational"
+
+        [[variant]]
+        name = "bm25-noise"
+        arm = "bm25"
+        role = "informational"
+        filter = "noise"
+    "#;
+
+    /// Writes corpus `corpus` into `eval_dir`: its corpora.toml entry is
+    /// appended by the caller; this writes the snapshot of `nodes`, its
+    /// record and the query file.
+    fn write_corpus(eval_dir: &Path, corpus: &str, nodes: &[Node], queries: &[Query]) {
+        let work = eval_dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(eval_dir.join("queries")).unwrap();
+        let db = snapshot_path(eval_dir, corpus);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (id TEXT, kind TEXT, qualifiedName TEXT, filePath TEXT, language TEXT, \
+             docComment TEXT, signature TEXT, name TEXT, nativeKind TEXT, container TEXT, \
+             startLine INTEGER, endLine INTEGER)",
+        )
+        .unwrap();
+        for n in nodes {
+            conn.execute(
+                "INSERT INTO nodes VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    n.id,
+                    n.kind,
+                    n.qualified_name,
+                    n.file_path,
+                    n.language,
+                    n.doc,
+                    n.signature,
+                    n.name,
+                    n.native_kind,
+                    n.container,
+                    n.start_line,
+                    n.end_line
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let record = SnapshotRecord {
+            corpus: corpus.into(),
+            revision: "rev".into(),
+            source: ".".into(),
+            git_ref: None,
+            sha256: sha256_file(&db).unwrap(),
+            source_db: "fixture".into(),
+            nodes: nodes.len(),
+            embeddable: nodes.iter().filter(|n| n.text.is_some()).count(),
+            indexer_version: None,
+        };
+        write_json(&snapshot_record_path(eval_dir, corpus), &record).unwrap();
+        let lines: Vec<String> = queries
+            .iter()
+            .map(|q| serde_json::to_string(&Query { corpus: corpus.into(), ..q.clone() }).unwrap())
+            .collect();
+        std::fs::write(eval_dir.join("queries").join(format!("{corpus}.jsonl")), lines.join("\n")).unwrap();
+    }
+
+    fn write_corpora(eval_dir: &Path, corpora: &[&str]) {
+        let toml: String = corpora
+            .iter()
+            .map(|c| {
+                format!("[[corpus]]\nid = \"{c}\"\nlanguage = \"rust\"\nsource = \".\"\nrevision = \"rev\"\ncheckout = \"x\"\n\n")
+            })
+            .collect();
+        std::fs::write(eval_dir.join("corpora.toml"), toml).unwrap();
+        std::fs::write(eval_dir.join("variants.toml"), VARIANTS).unwrap();
+    }
+
+    fn read_rankings(path: &Path) -> BTreeMap<String, RankingLine> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<RankingLine>(l).unwrap())
+            .map(|l| (l.id.clone(), l))
+            .collect()
+    }
+
+    /// Two arms that differ only in their node filter write the same
+    /// `targetDoc`/`pathOverlap` for every query, labelled from the full
+    /// gold: `c-001`'s only gold is filtered, `c-002` keeps one of two.
+    /// The filtered arm still counts the dropped gold as no hit.
+    #[test]
+    fn labels_are_identical_across_arms_with_different_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let eval_dir = dir.path();
+        write_corpora(eval_dir, &["c"]);
+        let queries = vec![
+            gold_query("c-001", "open the transport", &[MODULE]),
+            gold_query("c-002", "deliver a message", &[MODULE, METHOD]),
+        ];
+        write_corpus(eval_dir, "c", &gold_nodes(), &queries);
+        let run = |variant: &str| {
+            let args = RunArgs {
+                dir: EvalDir { eval_dir: eval_dir.to_path_buf() },
+                variant: variant.into(),
+                corpus: vec!["c".into()],
+                out: Some(eval_dir.join("runs")),
+                embed_only: false,
+                force: false,
+            };
+            run_variant(&args).unwrap();
+            read_rankings(&eval_dir.join("runs").join(variant).join("c").join("rankings.jsonl"))
+        };
+        let plain = run("bm25");
+        let noise = run("bm25-noise");
+        assert_eq!(plain.len(), 2);
+        for (id, line) in &plain {
+            let other = &noise[id];
+            assert_eq!((line.target_doc, line.path_overlap), (other.target_doc, other.path_overlap), "{id}");
+        }
+        assert_eq!(plain["c-001"].target_doc, Some(TargetDoc::Sig));
+        assert_eq!(plain["c-001"].path_overlap, Some(true));
+        assert_eq!(plain["c-002"].target_doc, Some(TargetDoc::Mixed));
+        assert_eq!(plain["c-001"].expected, vec!["1".to_string()]);
+        assert!(noise["c-001"].expected.is_empty());
+        assert_eq!(noise["c-002"].expected, vec!["2".to_string()]);
+    }
+
+    /// `check` passes a corpus whose gold resolves, and checks every corpus
+    /// before failing, naming each failing corpus and query id.
+    #[test]
+    fn check_reports_every_failing_corpus() {
+        let dir = tempfile::tempdir().unwrap();
+        let eval_dir = dir.path();
+        write_corpora(eval_dir, &["a", "b", "ok"]);
+        let nodes = gold_nodes();
+        write_corpus(eval_dir, "a", &nodes, &[gold_query("a-001", "gone", &[MISSING])]);
+        write_corpus(eval_dir, "b", &nodes, &[gold_query("b-001", "bare", &[NO_TEXT])]);
+        write_corpus(eval_dir, "ok", &nodes, &[gold_query("ok-001", "deliver", &[MODULE, METHOD])]);
+        let args = |corpus: &[&str]| CheckArgs {
+            dir: EvalDir { eval_dir: eval_dir.to_path_buf() },
+            corpus: corpus.iter().map(|c| c.to_string()).collect(),
+        };
+        check(&args(&["ok"])).unwrap();
+        let err = format!("{:#}", check(&args(&[])).unwrap_err());
+        assert!(err.contains("2 corpus/corpora failed"), "{err}");
+        assert!(err.contains("a: ") && err.contains("a-001: src/gone.rs m::gone"), "{err}");
+        assert!(err.contains("b: ") && err.contains("b-001: src/bare.rs m::bare"), "{err}");
+        assert!(!err.contains("ok-001"), "{err}");
+    }
 }
