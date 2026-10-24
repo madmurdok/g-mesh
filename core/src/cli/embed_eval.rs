@@ -1015,7 +1015,7 @@ fn run_corpus(
         let top = top_hits(scores);
         let expected = &resolved.hits;
         // From the full gold, not the filtered hits: a filter must not
-        // change a query's split (GM-648).
+        // change a query's split.
         let (target_doc, path_overlap) = query_labels(&q.text, &resolved.gold, &nodes, &parents);
         let line = RankingLine {
             target_doc,
