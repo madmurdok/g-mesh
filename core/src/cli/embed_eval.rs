@@ -67,6 +67,8 @@ pub enum EmbedEvalCommand {
     Run(RunArgs),
     /// Compute the metrics over run directories and apply the decision rule.
     Report(ReportArgs),
+    /// Check that every query's gold resolves against the pinned snapshot.
+    Check(CheckArgs),
     /// Compare the harness's reference ranking with production `search_code`.
     Parity(ParityArgs),
     /// Count the embedded texts synthetic edits invalidate, per variant.
@@ -120,6 +122,15 @@ pub struct RunArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct CheckArgs {
+    #[command(flatten)]
+    pub dir: EvalDir,
+    /// Corpora to check; all of corpora.toml when omitted.
+    #[arg(long)]
+    pub corpus: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct ReportArgs {
     #[command(flatten)]
     pub dir: EvalDir,
@@ -170,6 +181,7 @@ pub fn run(command: EmbedEvalCommand) -> Result<()> {
         EmbedEvalCommand::Snapshot(args) => snapshot(&args),
         EmbedEvalCommand::Run(args) => run_variant(&args),
         EmbedEvalCommand::Report(args) => report(&args),
+        EmbedEvalCommand::Check(args) => check(&args),
         EmbedEvalCommand::Parity(args) => parity(&args),
         EmbedEvalCommand::Churn(args) => churn::run(&args),
         EmbedEvalCommand::Cost(command) => cost::run(&command),
@@ -561,16 +573,27 @@ fn run_dir(args: &RunArgs, variant: &str, corpus: &str) -> PathBuf {
     base.join(variant).join(corpus)
 }
 
-/// Each expected symbol of each query as candidate indices. Collects every
-/// failure before failing, so one run lists all the drift to fix. An
-/// expected node `filter` leaves out resolves to no candidate: a miss, not
-/// a failure.
+/// One query's gold, resolved against the snapshot.
+#[derive(Debug, Default, PartialEq)]
+struct Resolved {
+    /// The expected nodes the variant ranks, as candidate indices.
+    hits: Vec<usize>,
+    /// Every embeddable snapshot node the gold names, as node indices,
+    /// whatever the variant's filter: the split labels come from these, so
+    /// arms that differ only in their filter label every query alike.
+    gold: Vec<usize>,
+}
+
+/// Each expected symbol of each query, resolved against the snapshot.
+/// Collects every failure before failing, so one run lists all the drift to
+/// fix, each line naming its query id. An expected node `filter` leaves out
+/// resolves to no candidate: a miss, not a failure.
 fn resolve_expected(
     queries: &[Query],
     nodes: &[Node],
     candidate_of: &HashMap<usize, usize>,
     filter: EmbedFilter,
-) -> Result<Vec<Vec<usize>>> {
+) -> Result<Vec<Resolved>> {
     let mut by_key: HashMap<(&str, &str, &str), Vec<usize>> = HashMap::new();
     for (i, n) in nodes.iter().enumerate() {
         by_key.entry((n.file_path.as_str(), n.qualified_name.as_str(), n.kind.as_str())).or_default().push(i);
@@ -579,6 +602,7 @@ fn resolve_expected(
     let mut resolved = Vec::with_capacity(queries.len());
     for q in queries {
         let mut hits = Vec::new();
+        let mut gold = Vec::new();
         for e in &q.expected {
             match by_key.get(&(e.file_path.as_str(), e.qualified_name.as_str(), e.kind.as_str())) {
                 None => errors.push(format!(
@@ -586,12 +610,20 @@ fn resolve_expected(
                     q.id, e.file_path, e.qualified_name, e.kind
                 )),
                 Some(indices) => {
-                    for i in indices {
-                        match candidate_of.get(i) {
-                            Some(&c) => hits.push(c),
-                            None if nodes[*i].filtered(filter) => {}
-                            None => errors.push(format!(
+                    for &i in indices {
+                        if nodes[i].text.is_none() {
+                            errors.push(format!(
                                 "{}: {} {} has no embeddable text, so no model could find it",
+                                q.id, e.file_path, e.qualified_name
+                            ));
+                            continue;
+                        }
+                        gold.push(i);
+                        match candidate_of.get(&i) {
+                            Some(&c) => hits.push(c),
+                            None if nodes[i].filtered(filter) => {}
+                            None => errors.push(format!(
+                                "{}: {} {} is embeddable but not a candidate",
                                 q.id, e.file_path, e.qualified_name
                             )),
                         }
@@ -601,12 +633,55 @@ fn resolve_expected(
         }
         hits.sort_unstable();
         hits.dedup();
-        resolved.push(hits);
+        gold.sort_unstable();
+        gold.dedup();
+        resolved.push(Resolved { hits, gold });
     }
     if !errors.is_empty() {
         bail!("{} expected symbol(s) did not resolve:\n  {}", errors.len(), errors.join("\n  "));
     }
     Ok(resolved)
+}
+
+/// `check`: every corpus's gold against its pinned snapshot, with no
+/// model and no filter, so a query file that would fail a run fails here
+/// first. Checks every corpus before failing and names each query id.
+fn check(args: &CheckArgs) -> Result<()> {
+    let eval_dir = &args.dir.eval_dir;
+    let corpora = CorporaFile::load(eval_dir)?;
+    let corpus_ids: Vec<String> = if args.corpus.is_empty() {
+        corpora.corpora.iter().map(|c| c.id.clone()).collect()
+    } else {
+        args.corpus.clone()
+    };
+    let mut failures = Vec::new();
+    for corpus in &corpus_ids {
+        match check_corpus(eval_dir, &corpora, corpus) {
+            Ok(count) => eprintln!("{corpus}: every gold of {count} queries resolves"),
+            Err(e) => failures.push(format!("{corpus}: {e:#}")),
+        }
+    }
+    if !failures.is_empty() {
+        bail!("{} corpus/corpora failed the gold check:\n{}", failures.len(), failures.join("\n"));
+    }
+    Ok(())
+}
+
+/// The number of queries of `corpus`, once every gold resolves.
+fn check_corpus(eval_dir: &Path, corpora: &CorporaFile, corpus: &str) -> Result<usize> {
+    verified_snapshot(eval_dir, corpora, corpus)?;
+    let nodes = load_nodes(&snapshot_path(eval_dir, corpus))?;
+    let (queries, _) = queries::load(eval_dir, corpus)?;
+    check_gold(&queries, &nodes)?;
+    Ok(queries.len())
+}
+
+/// [`resolve_expected`] over every embeddable node, unfiltered: fails
+/// naming each query whose gold is not in the snapshot or not embeddable.
+fn check_gold(queries: &[Query], nodes: &[Node]) -> Result<()> {
+    let candidate_of: HashMap<usize, usize> =
+        (0..nodes.len()).filter(|&i| nodes[i].text.is_some()).enumerate().map(|(c, i)| (i, c)).collect();
+    resolve_expected(queries, nodes, &candidate_of, EmbedFilter::None).map(|_| ())
 }
 
 fn shuffle_words(text: &str, rng: &mut Rng) -> String {
@@ -936,10 +1011,12 @@ fn run_corpus(
 
     let parents = context::parents(&nodes);
     let mut out = std::io::BufWriter::new(std::fs::File::create(dir.join("rankings.jsonl"))?);
-    for ((q, scores), expected) in queries.iter().zip(&scores_per_query).zip(&expected) {
+    for ((q, scores), resolved) in queries.iter().zip(&scores_per_query).zip(&expected) {
         let top = top_hits(scores);
-        let expected_nodes: Vec<usize> = expected.iter().map(|&c| candidates[c]).collect();
-        let (target_doc, path_overlap) = query_labels(&q.text, &expected_nodes, &nodes, &parents);
+        let expected = &resolved.hits;
+        // From the full gold, not the filtered hits: a filter must not
+        // change a query's split (GM-648).
+        let (target_doc, path_overlap) = query_labels(&q.text, &resolved.gold, &nodes, &parents);
         let line = RankingLine {
             target_doc,
             path_overlap,
