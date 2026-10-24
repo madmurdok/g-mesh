@@ -248,6 +248,44 @@ var _ = fmt.Sprint(server.New(), dep.F())
 	assertHasEdge(t, graph, "IMPORTS a.go -> "+serverPkg+" (unresolved)")
 }
 
+// A relative import path never names a module this project owns or a package
+// outside it, so it is an unlinked resolved_module addressed by the path as
+// written (bare `.` and `..` with a trailing `/`), never an external_module.
+func TestRelativeImportsAreUnresolvedNotExternal(t *testing.T) {
+	graph := extract(t, "sub/a.go", `package sub
+
+import (
+	"fmt"
+
+	_ "."
+	_ ".."
+	_ "../x"
+	_ "./util"
+)
+
+var _ = fmt.Sprint()
+`)
+
+	for spec, container := range map[string]string{
+		"./util": "./util",
+		"../x":   "../x",
+		".":      "./",
+		"..":     "../",
+	} {
+		node := nodeByQName(t, graph, spec)
+		if node.NativeKind != resolvedModuleNativeKind {
+			t.Fatalf("%q: nativeKind = %q, want %q", spec, node.NativeKind, resolvedModuleNativeKind)
+		}
+		if node.Target == nil || node.Target.Scope.Container != container || node.Target.Key.Name != reexportAllName {
+			t.Fatalf("%q: target = %+v, want container %q, name %q", spec, node.Target, container, reexportAllName)
+		}
+		assertHasEdge(t, graph, "IMPORTS sub/a.go -> "+spec+" (unresolved)")
+	}
+	if node := nodeByQName(t, graph, "fmt"); node.NativeKind != externalModuleNativeKind || node.Target != nil {
+		t.Fatalf("fmt = %+v, want an external_module with no target", node)
+	}
+}
+
 // An aliased import binds the alias; a blank import binds nothing and still
 // records the dependency, because a dependency is the only thing it states.
 func TestImportAliasAndBlankImport(t *testing.T) {
