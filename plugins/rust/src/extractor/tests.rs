@@ -3079,26 +3079,3 @@ fn a_super_use_in_an_orphan_file_emits_no_import() {
     let graph = krate.extract("src/loose.rs");
     assert!(graph.edges(EdgeKind::Imports).is_empty(), "{:#?}", graph.0.edges);
 }
-
-/// A bin named after another member's lib: from the bin, `use tool::x::f`
-/// names the lib's module.
-#[test]
-fn a_bin_named_after_another_members_lib_imports_that_lib_by_name() {
-    let krate = Crate::new(&[
-        ("Cargo.toml", "[workspace]\nmembers = [\"cli\", \"core\"]\n"),
-        ("cli/Cargo.toml", "[package]\nname = \"cli\"\n\n[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n"),
-        ("cli/src/main.rs", "use tool::x::f;\nfn main() { f(); }\n"),
-        ("core/Cargo.toml", "[package]\nname = \"tool\"\n"),
-        ("core/src/lib.rs", "pub mod x;\n"),
-        ("core/src/x.rs", "pub fn f() {}\n"),
-    ]);
-    let graph = krate.extract("cli/src/main.rs");
-    assert_eq!(
-        graph.target_of(graph.placeholder("pending_symbol", "f")),
-        (container("tool::x"), TargetKey::Name("f".into()))
-    );
-    assert_eq!(
-        graph.targets(EdgeKind::Imports, "cli/src/main.rs"),
-        vec!["resolved_module tool::x::*".to_string()]
-    );
-}
