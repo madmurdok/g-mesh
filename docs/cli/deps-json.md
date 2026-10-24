@@ -130,6 +130,8 @@ For every import of a file:
 3. An external package -> counted in `external`, no row. A plugin marks
    only a non-relative specifier external: a relative one (`./missing`,
    `.x` in Python) that names no file is a target core could not link, step 4.
+   A relative Go import (`./util`) is never linked, even when it names an
+   indexed directory, so it always lands in step 4.
 4. Anything else -> counted in `unresolved`, no row.
 
 Rows with `from == to` are dropped, and so are `dir` rows whose `to` is the
