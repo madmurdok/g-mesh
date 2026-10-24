@@ -151,6 +151,7 @@ not (
     (binary_id(g-mesh::scripts) & test(=release_packaging_scripts::prepare_release_assets_refuses_a_plugin_asset_whose_command_names_no_binary)) |
     (binary_id(g-mesh::it) & test(=plugin_check::a_bulk_index_that_never_finishes_fails_session_instead_of_hanging)) |
     (binary_id(g-mesh::it) & test(=orphaned_daemon::a_daemon_whose_project_root_still_exists_is_left_alone)) |
+    (binary_id(g-mesh::it) & test(=daemon_lifeline::a_daemon_whose_lifeline_is_running_or_unreadable_is_left_alone)) |
     (binary_id(g-mesh-plugin-rust::conformance) & test(=the_linked_index_answers_the_acceptance_criteria)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=cargo_env_loader_var::a_loader_var_added_after_start_stops_the_server_before_any_reload)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves)) |
