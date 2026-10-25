@@ -32,6 +32,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use g_mesh_plugin_sdk::wire::{
+    ImportMatch, ImportSelector, Matcher, PathScope, ResolutionDelta, TargetScopeKind,
+};
 use g_mesh_plugin_sdk::{walk_project, RelPath};
 
 use crate::extractor::grammar::EXTENSIONS;
@@ -69,6 +72,11 @@ pub struct TsProject {
     pub imports_by_dir: BTreeMap<String, Option<PackageImports>>,
     /// What the load skipped and why, one line each.
     pub notes: Vec<String>,
+    /// The files [`TsProject::source_changed`] has already offered to the
+    /// imports waiting on them since this model was built. Empty after a
+    /// load, so a file created while no model watched (offline, or before
+    /// this process spawned) is still offered on its first `fileChanged`.
+    pub announced: BTreeSet<RelPath>,
 }
 
 impl TsProject {
@@ -124,7 +132,7 @@ impl TsProject {
         let patterns = workspace_patterns(pnpm.as_deref(), manifests.get(""));
         let packages = workspace_packages(&patterns, &tree, &manifests);
 
-        Ok(Self { existence, packages, tsconfig_by_dir, imports_by_dir, notes })
+        Ok(Self { existence, packages, tsconfig_by_dir, imports_by_dir, notes, announced: BTreeSet::new() })
     }
 
     /// The file `specifier`, written in the file `from`, names, or `None`
@@ -142,7 +150,41 @@ impl TsProject {
             }
         } else {
             self.existence.remove(path);
+            self.announced.remove(path);
         }
+    }
+
+    /// The importers whose unlinked relative imports `path`, whose text is
+    /// now `source`, may resolve to: those whose placeholder still waits at
+    /// an address `path` is a candidate of
+    /// ([`resolve::addresses_resolving_to`]), such as `./missing` (`src/missing`)
+    /// once `src/missing.ts` or `src/missing/index.ts` exists. Core links an
+    /// address equal to a new file's path by itself; any other address only
+    /// a re-extract against the updated existence set resolves, in the
+    /// resolver's own candidate order.
+    ///
+    /// Once per path per model (`announced`), so an ordinary edit costs core
+    /// no import scan; `None` (gone) forgets the path, so a re-creation is
+    /// offered again. `None` when no address can name `path`.
+    pub fn source_changed(&mut self, path: &RelPath, source: Option<&str>) -> Option<ResolutionDelta> {
+        if source.is_none() {
+            self.announced.remove(path);
+            return None;
+        }
+        if !self.announced.insert(path.clone()) {
+            return None;
+        }
+        let imports: Vec<ImportSelector> = resolve::addresses_resolving_to(path.as_str())
+            .into_iter()
+            .map(|address| ImportSelector {
+                importers: PathScope { under: String::new(), not_under: Vec::new() },
+                by: ImportMatch::Target {
+                    scope_kind: TargetScopeKind::File,
+                    matcher: Matcher::Exact(address),
+                },
+            })
+            .collect();
+        (!imports.is_empty()).then_some(ResolutionDelta::Affected { files: Vec::new(), imports })
     }
 
     /// The effective `paths` of the config nearest the project-relative
