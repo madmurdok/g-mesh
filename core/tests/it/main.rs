@@ -26,6 +26,7 @@ mod config_reindex_go;
 mod config_reindex_python;
 mod config_reindex_rust;
 mod config_reindex_typescript;
+mod created_file_links_waiting_import;
 mod daemon_build_staleness;
 mod daemon_core;
 mod daemon_lifeline;
