@@ -17,6 +17,12 @@
 //! `an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass`, including
 //! its rewrite loop and the reason for it.
 //!
+//! The test waits for the settled state, not the first one with two bindings:
+//! a complete reparse of a file the live plugin only hydrated re-upserts the
+//! collapsed edge until the plugin's per-file pass retracts it, so the bound
+//! edges can exist while a collapsed edge is still present. Both are read from
+//! one snapshot.
+//!
 //! Requires the TypeScript plugin binary, which `cargo build --workspace`
 //! builds.
 
@@ -105,24 +111,41 @@ fn spawn_daemon(root: &Path) -> Child {
         .expect("failed to spawn the daemon")
 }
 
-/// Every `(caller name, bound ordinal)` the index holds for a `CALLS` edge that
-/// names a declaration - the whole shape this test is about.
-fn bindings(db: &Path) -> Vec<(String, i64)> {
-    let Ok(conn) = Connection::open(db) else {
-        return Vec::new();
+/// The index's settled-or-not state, read in one transaction: every
+/// `(caller name, bound ordinal)` for a `CALLS` edge that names a declaration -
+/// the whole shape this test is about - and the number of collapsed
+/// (`toDeclaration IS NULL`) `CALLS` edges to `parse`. One read transaction
+/// means both come from a single snapshot, so a write landing between two
+/// separate reads cannot make them disagree.
+fn snapshot(db: &Path) -> (Vec<(String, i64)>, i64) {
+    let Ok(mut conn) = Connection::open(db) else {
+        return (Vec::new(), 0);
     };
-    let Ok(mut stmt) = conn.prepare(
+    let Ok(tx) = conn.transaction() else {
+        return (Vec::new(), 0);
+    };
+    let Ok(mut stmt) = tx.prepare(
         "SELECT f.name, e.toDeclaration FROM edges e JOIN nodes f ON f.id = e.fromId
          WHERE e.kind = 'CALLS' AND e.toDeclaration IS NOT NULL
            AND e.source = 'semantic' AND e.resolved = 1
          ORDER BY f.name",
     ) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let Ok(rows) = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
-    rows.collect::<rusqlite::Result<Vec<_>>>().unwrap_or_default()
+    let bound = rows.collect::<rusqlite::Result<Vec<_>>>().unwrap_or_default();
+    drop(stmt);
+    let unbound = tx
+        .query_row(
+            "SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id = e.toId
+             WHERE e.kind = 'CALLS' AND e.toDeclaration IS NULL AND n.name = 'parse'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    (bound, unbound)
 }
 
 #[test]
@@ -157,14 +180,17 @@ fn each_call_of_an_overloaded_function_is_stored_against_the_overload_it_binds()
         fs::write(project.root().join("use.ts"), use_source(edits)).unwrap();
         thread::sleep(Duration::from_millis(250));
 
-        let found = bindings(&db_path);
-        if found.len() == 2 {
+        // Settled means two bindings and no collapsed edge left, from one
+        // snapshot: the collapsed edge is re-upserted by a complete reparse
+        // and only retracted by the per-file pass that follows it.
+        let (found, unbound) = snapshot(&db_path);
+        if found.len() == 2 && unbound == 0 {
             break found;
         }
         assert!(
             Instant::now() < deadline,
-            "the semantic pass did not bind the overloaded calls after {edits} edit(s); \
-             the index holds {found:?}"
+            "the semantic pass did not settle the overloaded calls after {edits} edit(s); \
+             the index holds {found:?} and {unbound} collapsed edge(s)"
         );
     };
 
@@ -205,19 +231,6 @@ fn each_call_of_an_overloaded_function_is_stored_against_the_overload_it_binds()
             .unwrap_or_else(|e| panic!("{caller} bound ordinal {ordinal}, which has no row: {e}"));
         assert!(!has_body, "{caller} must bind a call signature, never the implementation");
     }
-
-    // The collapsed edge the structural pass wrote was retracted rather than
-    // left alongside: a caller of one overload has exactly one `CALLS` edge,
-    // not one bound and one saying strictly less.
-    let unbound: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM edges e JOIN nodes n ON n.id = e.toId
-             WHERE e.kind = 'CALLS' AND e.toDeclaration IS NULL AND n.name = 'parse'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(unbound, 0, "the collapsed edge must go out with the bound ones that replace it");
 
     let _ = daemon.kill();
     let _ = daemon.wait();

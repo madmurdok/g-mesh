@@ -67,6 +67,8 @@ pub enum EmbedEvalCommand {
     Run(RunArgs),
     /// Compute the metrics over run directories and apply the decision rule.
     Report(ReportArgs),
+    /// Check that every query's gold resolves against the pinned snapshot.
+    Check(CheckArgs),
     /// Compare the harness's reference ranking with production `search_code`.
     Parity(ParityArgs),
     /// Count the embedded texts synthetic edits invalidate, per variant.
@@ -120,6 +122,15 @@ pub struct RunArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct CheckArgs {
+    #[command(flatten)]
+    pub dir: EvalDir,
+    /// Corpora to check; all of corpora.toml when omitted.
+    #[arg(long)]
+    pub corpus: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct ReportArgs {
     #[command(flatten)]
     pub dir: EvalDir,
@@ -170,6 +181,7 @@ pub fn run(command: EmbedEvalCommand) -> Result<()> {
         EmbedEvalCommand::Snapshot(args) => snapshot(&args),
         EmbedEvalCommand::Run(args) => run_variant(&args),
         EmbedEvalCommand::Report(args) => report(&args),
+        EmbedEvalCommand::Check(args) => check(&args),
         EmbedEvalCommand::Parity(args) => parity(&args),
         EmbedEvalCommand::Churn(args) => churn::run(&args),
         EmbedEvalCommand::Cost(command) => cost::run(&command),
@@ -561,16 +573,27 @@ fn run_dir(args: &RunArgs, variant: &str, corpus: &str) -> PathBuf {
     base.join(variant).join(corpus)
 }
 
-/// Each expected symbol of each query as candidate indices. Collects every
-/// failure before failing, so one run lists all the drift to fix. An
-/// expected node `filter` leaves out resolves to no candidate: a miss, not
-/// a failure.
+/// One query's gold, resolved against the snapshot.
+#[derive(Debug, Default, PartialEq)]
+struct Resolved {
+    /// The expected nodes the variant ranks, as candidate indices.
+    hits: Vec<usize>,
+    /// Every embeddable snapshot node the gold names, as node indices,
+    /// whatever the variant's filter: the split labels come from these, so
+    /// arms that differ only in their filter label every query alike.
+    gold: Vec<usize>,
+}
+
+/// Each expected symbol of each query, resolved against the snapshot.
+/// Collects every failure before failing, so one run lists all the drift to
+/// fix, each line naming its query id. An expected node `filter` leaves out
+/// resolves to no candidate: a miss, not a failure.
 fn resolve_expected(
     queries: &[Query],
     nodes: &[Node],
     candidate_of: &HashMap<usize, usize>,
     filter: EmbedFilter,
-) -> Result<Vec<Vec<usize>>> {
+) -> Result<Vec<Resolved>> {
     let mut by_key: HashMap<(&str, &str, &str), Vec<usize>> = HashMap::new();
     for (i, n) in nodes.iter().enumerate() {
         by_key.entry((n.file_path.as_str(), n.qualified_name.as_str(), n.kind.as_str())).or_default().push(i);
@@ -579,6 +602,7 @@ fn resolve_expected(
     let mut resolved = Vec::with_capacity(queries.len());
     for q in queries {
         let mut hits = Vec::new();
+        let mut gold = Vec::new();
         for e in &q.expected {
             match by_key.get(&(e.file_path.as_str(), e.qualified_name.as_str(), e.kind.as_str())) {
                 None => errors.push(format!(
@@ -586,12 +610,20 @@ fn resolve_expected(
                     q.id, e.file_path, e.qualified_name, e.kind
                 )),
                 Some(indices) => {
-                    for i in indices {
-                        match candidate_of.get(i) {
-                            Some(&c) => hits.push(c),
-                            None if nodes[*i].filtered(filter) => {}
-                            None => errors.push(format!(
+                    for &i in indices {
+                        if nodes[i].text.is_none() {
+                            errors.push(format!(
                                 "{}: {} {} has no embeddable text, so no model could find it",
+                                q.id, e.file_path, e.qualified_name
+                            ));
+                            continue;
+                        }
+                        gold.push(i);
+                        match candidate_of.get(&i) {
+                            Some(&c) => hits.push(c),
+                            None if nodes[i].filtered(filter) => {}
+                            None => errors.push(format!(
+                                "{}: {} {} is embeddable but not a candidate",
                                 q.id, e.file_path, e.qualified_name
                             )),
                         }
@@ -601,12 +633,55 @@ fn resolve_expected(
         }
         hits.sort_unstable();
         hits.dedup();
-        resolved.push(hits);
+        gold.sort_unstable();
+        gold.dedup();
+        resolved.push(Resolved { hits, gold });
     }
     if !errors.is_empty() {
         bail!("{} expected symbol(s) did not resolve:\n  {}", errors.len(), errors.join("\n  "));
     }
     Ok(resolved)
+}
+
+/// `check`: every corpus's gold against its pinned snapshot, with no
+/// model and no filter, so a query file that would fail a run fails here
+/// first. Checks every corpus before failing and names each query id.
+fn check(args: &CheckArgs) -> Result<()> {
+    let eval_dir = &args.dir.eval_dir;
+    let corpora = CorporaFile::load(eval_dir)?;
+    let corpus_ids: Vec<String> = if args.corpus.is_empty() {
+        corpora.corpora.iter().map(|c| c.id.clone()).collect()
+    } else {
+        args.corpus.clone()
+    };
+    let mut failures = Vec::new();
+    for corpus in &corpus_ids {
+        match check_corpus(eval_dir, &corpora, corpus) {
+            Ok(count) => eprintln!("{corpus}: every gold of {count} queries resolves"),
+            Err(e) => failures.push(format!("{corpus}: {e:#}")),
+        }
+    }
+    if !failures.is_empty() {
+        bail!("{} corpus/corpora failed the gold check:\n{}", failures.len(), failures.join("\n"));
+    }
+    Ok(())
+}
+
+/// The number of queries of `corpus`, once every gold resolves.
+fn check_corpus(eval_dir: &Path, corpora: &CorporaFile, corpus: &str) -> Result<usize> {
+    verified_snapshot(eval_dir, corpora, corpus)?;
+    let nodes = load_nodes(&snapshot_path(eval_dir, corpus))?;
+    let (queries, _) = queries::load(eval_dir, corpus)?;
+    check_gold(&queries, &nodes)?;
+    Ok(queries.len())
+}
+
+/// [`resolve_expected`] over every embeddable node, unfiltered: fails
+/// naming each query whose gold is not in the snapshot or not embeddable.
+fn check_gold(queries: &[Query], nodes: &[Node]) -> Result<()> {
+    let candidate_of: HashMap<usize, usize> =
+        (0..nodes.len()).filter(|&i| nodes[i].text.is_some()).enumerate().map(|(c, i)| (i, c)).collect();
+    resolve_expected(queries, nodes, &candidate_of, EmbedFilter::None).map(|_| ())
 }
 
 fn shuffle_words(text: &str, rng: &mut Rng) -> String {
@@ -936,10 +1011,12 @@ fn run_corpus(
 
     let parents = context::parents(&nodes);
     let mut out = std::io::BufWriter::new(std::fs::File::create(dir.join("rankings.jsonl"))?);
-    for ((q, scores), expected) in queries.iter().zip(&scores_per_query).zip(&expected) {
+    for ((q, scores), resolved) in queries.iter().zip(&scores_per_query).zip(&expected) {
         let top = top_hits(scores);
-        let expected_nodes: Vec<usize> = expected.iter().map(|&c| candidates[c]).collect();
-        let (target_doc, path_overlap) = query_labels(&q.text, &expected_nodes, &nodes, &parents);
+        let expected = &resolved.hits;
+        // From the full gold, not the filtered hits: a filter must not
+        // change a query's split.
+        let (target_doc, path_overlap) = query_labels(&q.text, &resolved.gold, &nodes, &parents);
         let line = RankingLine {
             target_doc,
             path_overlap,
@@ -2034,5 +2111,300 @@ mod tests {
                 "rust": {"n": 3, "point": -1.0, "lower": -1.0, "upper": -1.0},
             })
         );
+    }
+
+    /// A gold fixture: `1` is a module the noise filter drops, `2` a
+    /// documented method, `3` a node with no text, `4` an undocumented
+    /// function no filter drops.
+    fn gold_nodes() -> Vec<Node> {
+        use context::test_node;
+        let mut nodes = vec![
+            test_node(
+                "1",
+                "Module",
+                "module",
+                "m::transport",
+                "src/transport/mod.rs",
+                "rust",
+                Some("transport"),
+            ),
+            test_node(
+                "2",
+                "Function",
+                "method",
+                "m::Session::send",
+                "src/session.rs",
+                "rust",
+                Some("fn send(&self)"),
+            ),
+            test_node("3", "Function", "function", "m::bare", "src/bare.rs", "rust", None),
+            test_node(
+                "4",
+                "Function",
+                "function",
+                "m::other",
+                "src/other.rs",
+                "rust",
+                Some("fn other(x: u32)"),
+            ),
+        ];
+        nodes[1].doc = Some("Sends a message.".into());
+        nodes[1].text = full_text(nodes[1].doc.as_deref(), nodes[1].signature.as_deref());
+        nodes
+    }
+
+    fn gold_query(id: &str, text: &str, expected: &[(&str, &str, &str)]) -> Query {
+        Query {
+            id: id.into(),
+            corpus: "c".into(),
+            language: "rust".into(),
+            kind: queries::QueryKind::Positive,
+            shape: "phrase".into(),
+            text: text.into(),
+            expected: expected
+                .iter()
+                .map(|&(file, qn, kind)| queries::ExpectedSymbol {
+                    file_path: file.into(),
+                    qualified_name: qn.into(),
+                    kind: kind.into(),
+                })
+                .collect(),
+            derivation: "fixture".into(),
+            author: "test".into(),
+            mechanical: false,
+        }
+    }
+
+    const MODULE: (&str, &str, &str) = ("src/transport/mod.rs", "m::transport", "Module");
+    const METHOD: (&str, &str, &str) = ("src/session.rs", "m::Session::send", "Function");
+    const NO_TEXT: (&str, &str, &str) = ("src/bare.rs", "m::bare", "Function");
+    const MISSING: (&str, &str, &str) = ("src/gone.rs", "m::gone", "Function");
+
+    /// Candidate indices of `nodes` under `filter`, as `run_corpus` builds them.
+    fn candidates_under(nodes: &[Node], filter: EmbedFilter) -> HashMap<usize, usize> {
+        (0..nodes.len())
+            .filter(|&i| nodes[i].text.is_some() && !nodes[i].filtered(filter))
+            .enumerate()
+            .map(|(c, i)| (i, c))
+            .collect()
+    }
+
+    /// `gold` names every embeddable expected node whatever the filter;
+    /// `hits` leaves out the nodes the filter drops, as a miss.
+    #[test]
+    fn resolved_gold_does_not_depend_on_the_filter() {
+        let nodes = gold_nodes();
+        assert!(nodes[0].filtered(EmbedFilter::Noise) && !nodes[1].filtered(EmbedFilter::Noise));
+        let queries = vec![
+            gold_query("c-001", "open the transport", &[MODULE]),
+            gold_query("c-002", "deliver", &[MODULE, METHOD]),
+        ];
+        let resolve =
+            |filter| resolve_expected(&queries, &nodes, &candidates_under(&nodes, filter), filter).unwrap();
+        let plain = resolve(EmbedFilter::None);
+        let noise = resolve(EmbedFilter::Noise);
+        assert_eq!(plain[0], Resolved { hits: vec![0], gold: vec![0] });
+        assert_eq!(plain[1], Resolved { hits: vec![0, 1], gold: vec![0, 1] });
+        assert_eq!(noise[0], Resolved { hits: vec![], gold: vec![0] });
+        // Under the noise filter node 2 is the first candidate.
+        assert_eq!(noise[1], Resolved { hits: vec![0], gold: vec![0, 1] });
+    }
+
+    /// Every gold that is not in the snapshot fails, each error naming its
+    /// query id; one call reports them all.
+    #[test]
+    fn gold_missing_from_the_snapshot_fails_naming_each_query() {
+        let nodes = gold_nodes();
+        let queries = vec![
+            gold_query("c-001", "open the transport", &[MODULE]),
+            gold_query("c-002", "gone", &[MISSING]),
+            gold_query("c-003", "deliver", &[METHOD, MISSING]),
+        ];
+        let err = format!("{:#}", check_gold(&queries, &nodes).unwrap_err());
+        assert!(err.contains("c-002: src/gone.rs m::gone (Function) is not in the snapshot"), "{err}");
+        assert!(err.contains("c-003: src/gone.rs m::gone (Function) is not in the snapshot"), "{err}");
+        assert!(!err.contains("c-001"), "{err}");
+        check_gold(&queries[..1], &nodes).unwrap();
+    }
+
+    /// A gold node with no embeddable text fails under every filter.
+    #[test]
+    fn gold_without_text_fails_under_every_filter() {
+        let nodes = gold_nodes();
+        let queries = vec![gold_query("c-004", "bare", &[NO_TEXT])];
+        for filter in [EmbedFilter::None, EmbedFilter::Noise] {
+            let err = format!(
+                "{:#}",
+                resolve_expected(&queries, &nodes, &candidates_under(&nodes, filter), filter).unwrap_err()
+            );
+            assert!(err.contains("c-004: src/bare.rs m::bare has no embeddable text"), "{filter:?}: {err}");
+        }
+        assert!(check_gold(&queries, &nodes).is_err());
+    }
+
+    const VARIANTS: &str = r#"
+        [settings]
+        reference = "r"
+        bootstrap_seed = 1
+        bootstrap_resamples = 10
+        arm_seed = 1
+
+        [[variant]]
+        name = "r"
+        arm = "model"
+        role = "reference"
+        pooling = "mean"
+        dimension = 768
+        max_tokens = 1024
+
+        [[variant]]
+        name = "bm25"
+        arm = "bm25"
+        role = "informational"
+
+        [[variant]]
+        name = "bm25-noise"
+        arm = "bm25"
+        role = "informational"
+        filter = "noise"
+    "#;
+
+    /// Writes corpus `corpus` into `eval_dir`: its corpora.toml entry is
+    /// appended by the caller; this writes the snapshot of `nodes`, its
+    /// record and the query file.
+    fn write_corpus(eval_dir: &Path, corpus: &str, nodes: &[Node], queries: &[Query]) {
+        let work = eval_dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(eval_dir.join("queries")).unwrap();
+        let db = snapshot_path(eval_dir, corpus);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (id TEXT, kind TEXT, qualifiedName TEXT, filePath TEXT, language TEXT, \
+             docComment TEXT, signature TEXT, name TEXT, nativeKind TEXT, container TEXT, \
+             startLine INTEGER, endLine INTEGER)",
+        )
+        .unwrap();
+        for n in nodes {
+            conn.execute(
+                "INSERT INTO nodes VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    n.id,
+                    n.kind,
+                    n.qualified_name,
+                    n.file_path,
+                    n.language,
+                    n.doc,
+                    n.signature,
+                    n.name,
+                    n.native_kind,
+                    n.container,
+                    n.start_line,
+                    n.end_line
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let record = SnapshotRecord {
+            corpus: corpus.into(),
+            revision: "rev".into(),
+            source: ".".into(),
+            git_ref: None,
+            sha256: sha256_file(&db).unwrap(),
+            source_db: "fixture".into(),
+            nodes: nodes.len(),
+            embeddable: nodes.iter().filter(|n| n.text.is_some()).count(),
+            indexer_version: None,
+        };
+        write_json(&snapshot_record_path(eval_dir, corpus), &record).unwrap();
+        let lines: Vec<String> = queries
+            .iter()
+            .map(|q| serde_json::to_string(&Query { corpus: corpus.into(), ..q.clone() }).unwrap())
+            .collect();
+        std::fs::write(eval_dir.join("queries").join(format!("{corpus}.jsonl")), lines.join("\n")).unwrap();
+    }
+
+    fn write_corpora(eval_dir: &Path, corpora: &[&str]) {
+        let toml: String = corpora
+            .iter()
+            .map(|c| {
+                format!("[[corpus]]\nid = \"{c}\"\nlanguage = \"rust\"\nsource = \".\"\nrevision = \"rev\"\ncheckout = \"x\"\n\n")
+            })
+            .collect();
+        std::fs::write(eval_dir.join("corpora.toml"), toml).unwrap();
+        std::fs::write(eval_dir.join("variants.toml"), VARIANTS).unwrap();
+    }
+
+    fn read_rankings(path: &Path) -> BTreeMap<String, RankingLine> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<RankingLine>(l).unwrap())
+            .map(|l| (l.id.clone(), l))
+            .collect()
+    }
+
+    /// Two arms that differ only in their node filter write the same
+    /// `targetDoc`/`pathOverlap` for every query, labelled from the full
+    /// gold: `c-001`'s only gold is filtered, `c-002` keeps one of two.
+    /// The filtered arm still counts the dropped gold as no hit.
+    #[test]
+    fn labels_are_identical_across_arms_with_different_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let eval_dir = dir.path();
+        write_corpora(eval_dir, &["c"]);
+        let queries = vec![
+            gold_query("c-001", "open the transport", &[MODULE]),
+            gold_query("c-002", "deliver a message", &[MODULE, METHOD]),
+        ];
+        write_corpus(eval_dir, "c", &gold_nodes(), &queries);
+        let run = |variant: &str| {
+            let args = RunArgs {
+                dir: EvalDir { eval_dir: eval_dir.to_path_buf() },
+                variant: variant.into(),
+                corpus: vec!["c".into()],
+                out: Some(eval_dir.join("runs")),
+                embed_only: false,
+                force: false,
+            };
+            run_variant(&args).unwrap();
+            read_rankings(&eval_dir.join("runs").join(variant).join("c").join("rankings.jsonl"))
+        };
+        let plain = run("bm25");
+        let noise = run("bm25-noise");
+        assert_eq!(plain.len(), 2);
+        for (id, line) in &plain {
+            let other = &noise[id];
+            assert_eq!((line.target_doc, line.path_overlap), (other.target_doc, other.path_overlap), "{id}");
+        }
+        assert_eq!(plain["c-001"].target_doc, Some(TargetDoc::Sig));
+        assert_eq!(plain["c-001"].path_overlap, Some(true));
+        assert_eq!(plain["c-002"].target_doc, Some(TargetDoc::Mixed));
+        assert_eq!(plain["c-001"].expected, vec!["1".to_string()]);
+        assert!(noise["c-001"].expected.is_empty());
+        assert_eq!(noise["c-002"].expected, vec!["2".to_string()]);
+    }
+
+    /// `check` passes a corpus whose gold resolves, and checks every corpus
+    /// before failing, naming each failing corpus and query id.
+    #[test]
+    fn check_reports_every_failing_corpus() {
+        let dir = tempfile::tempdir().unwrap();
+        let eval_dir = dir.path();
+        write_corpora(eval_dir, &["a", "b", "ok"]);
+        let nodes = gold_nodes();
+        write_corpus(eval_dir, "a", &nodes, &[gold_query("a-001", "gone", &[MISSING])]);
+        write_corpus(eval_dir, "b", &nodes, &[gold_query("b-001", "bare", &[NO_TEXT])]);
+        write_corpus(eval_dir, "ok", &nodes, &[gold_query("ok-001", "deliver", &[MODULE, METHOD])]);
+        let args = |corpus: &[&str]| CheckArgs {
+            dir: EvalDir { eval_dir: eval_dir.to_path_buf() },
+            corpus: corpus.iter().map(|c| c.to_string()).collect(),
+        };
+        check(&args(&["ok"])).unwrap();
+        let err = format!("{:#}", check(&args(&[])).unwrap_err());
+        assert!(err.contains("2 corpus/corpora failed"), "{err}");
+        assert!(err.contains("a: ") && err.contains("a-001: src/gone.rs m::gone"), "{err}");
+        assert!(err.contains("b: ") && err.contains("b-001: src/bare.rs m::bare"), "{err}");
+        assert!(!err.contains("ok-001"), "{err}");
     }
 }

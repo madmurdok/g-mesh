@@ -25,7 +25,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const COLD_START_LINE: &str = "starting a daemon";
 
 /// One TypeScript, one Rust, one Python and one Go corner of one project.
-const FILES: [(&str, &str); 15] = [
+const FILES: [(&str, &str); 19] = [
     // TS: a file import, a package, a missing file, and `.` with no index file.
     (
         "web/a.ts",
@@ -33,10 +33,13 @@ const FILES: [(&str, &str); 15] = [
          import d from \".\";\nexport const a = b + m + d + String(React);\n",
     ),
     ("web/b.ts", "export const b = 1;\n"),
-    // Rust: crate `app`, `mod config; use crate::config::X;` and `std`.
+    // Rust: package `app` with a lib and a bin; the bin's `mod config; use
+    // crate::config::X;`, `use super::X;` in its nested module, and `std`.
     ("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    ("src/lib.rs", "pub fn lib_fn() {}\n"),
     ("src/main.rs", "mod config;\nuse crate::config::X;\nuse std::fs;\nfn main() {\n    let _ = X;\n    let _ = fs::read(\"x\");\n}\n"),
-    ("src/config.rs", "pub struct X;\n"),
+    ("src/config.rs", "pub mod inner;\npub struct X;\n"),
+    ("src/config/inner.rs", "use super::X;\n"),
     // Python: an empty `__init__.py`, a sibling module, a builtin, and a
     // namespace package `ns` imported from outside and from inside itself.
     ("pkg/__init__.py", ""),
@@ -50,6 +53,9 @@ const FILES: [(&str, &str); 15] = [
     ("lib/a.go", "package lib\n\nfunc A() int { return 1 }\n"),
     ("lib/b.go", "package lib\n\nfunc B() int { return 2 }\n"),
     ("main.go", "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/app/lib\"\n)\n\nfunc main() { fmt.Println(lib.A() + lib.B()) }\n"),
+    // Go: a relative import of an indexed directory names no module path.
+    ("rel/rel.go", "package rel\n\nimport _ \"./util\"\n"),
+    ("rel/util/u.go", "package util\n"),
 ];
 
 struct Project {
@@ -330,9 +336,20 @@ async fn deps_on_a_cold_ts_rust_python_project_matches_get_dependencies_and_reru
     assert_eq!(doc["coverage"]["typescript"]["external"], 1, "{doc}");
     assert_eq!(doc["coverage"]["typescript"]["unresolved"], 2, "{doc}");
     assert_eq!(doc["unresolved"]["typescript"], 2, "{doc}");
-    // Rust: the container `app::config` maps back to the file defining it.
+    // Rust: the bin's container `app[bin]::config` maps back to the file
+    // defining it, from the bin's root and from its nested module.
     assert!(
-        edges.contains(&edge("src/main.rs", "src/config.rs", "file", "rust", Some("app::config"))),
+        edges.contains(&edge("src/main.rs", "src/config.rs", "file", "rust", Some("app[bin]::config"))),
+        "{doc}"
+    );
+    assert!(
+        edges.contains(&edge(
+            "src/config/inner.rs",
+            "src/config.rs",
+            "file",
+            "rust",
+            Some("app[bin]::config")
+        )),
         "{doc}"
     );
     assert_eq!(doc["coverage"]["rust"]["external"], 1, "`std`: {doc}");
@@ -351,6 +368,10 @@ async fn deps_on_a_cold_ts_rust_python_project_matches_get_dependencies_and_reru
     // Go: a package defined by several files in one directory is that directory.
     assert!(edges.contains(&edge("main.go", "lib", "dir", "go", Some("example.com/app/lib"))), "{doc}");
     assert_eq!(doc["coverage"]["go"]["external"], 1, "`fmt`: {doc}");
+    // A relative import is unresolved, even onto an indexed directory.
+    assert_eq!(doc["coverage"]["go"]["unresolved"], 1, "`./util`: {doc}");
+    assert_eq!(doc["unresolved"]["go"], 1, "{doc}");
+    assert!(!edges.iter().any(|e| e["from"] == "rel/rel.go"), "{doc}");
 
     // --- against get_dependencies -----------------------------------------
     let code: Vec<&str> = FILES

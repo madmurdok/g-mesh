@@ -115,8 +115,6 @@ path = "junit.xml"
 # (docs/adr/0031-local-test-runs.md); `test-local.sh --full` runs them and
 # reports any test whose time crossed 10s either way against this list. A test
 # joins at 10s or more and leaves only after two batch-end runs under 10s.
-# GM-626: refreshed from the 4.10.0 batch-end timings; an entry stays only if
-# that run measured it at 8s or more (new entries joined at 10s or more).
 [profile.local]
 inherits = "default"
 default-filter = """
@@ -130,18 +128,11 @@ not (
     (binary_id(g-mesh) & test(=graph::symbol_links::tests::link_all_and_link_diff_agree_on_the_same_end_state)) |
     (binary_id(g-mesh) & test(=daemon::semantic::tests::an_interrupted_pass_for_one_language_is_retried_without_rerunning_the_other)) |
     (binary_id(g-mesh::it) & test(=serving_while_indexing::a_walk_that_outlasts_the_bootstrap_timeout_is_waited_out_rather_than_losing_the_client)) |
-    (binary_id(g-mesh::it) & test(=daemon_build_staleness::status_reports_a_daemon_that_an_upgrade_has_left_behind)) |
-    (binary_id(g-mesh::it) & test(=cli_clean::clean_orphaned_without_force_reports_and_deletes_nothing)) |
-    (binary_id(g-mesh::it) & test(=cli_clean::clean_and_clean_orphaned_handle_a_front_state_dir)) |
     (binary_id(g-mesh::it) & test(=plugin_memory_limit::the_generated_mcp_instructions_reflect_a_real_suspended_rust)) |
     (binary_id(g-mesh::it) & test(=plugin_memory_limit::a_real_rust_analyzer_over_its_memory_limit_is_suspended_and_structural_work_continues)) |
     (binary_id(g-mesh::it) & test(=plugin_memory_limit::with_a_memory_limit_far_above_real_usage_a_real_rust_analyzer_is_left_alone)) |
     (binary_id(g-mesh::it) & test(=cli_status::status_in_a_front_served_folder_prints_the_front_line_and_no_coverage)) |
     (binary_id(g-mesh::it) & test(=cli_status::status_reports_the_daemon_plugin_coverage_and_syntax_errors_of_a_live_project)) |
-    (binary_id(g-mesh::it) & test(=cli_status::status_on_a_project_that_was_never_indexed_reports_an_empty_state)) |
-    (binary_id(g-mesh::it) & test(=cli_status::a_failed_plugin_discovery_is_reported_by_light_status_and_fatal_to_full)) |
-    (binary_id(g-mesh::it) & test(=cli_status::status_on_an_index_that_predates_language_outcomes_says_so)) |
-    (binary_id(g-mesh::it) & test(=one_plugin_binary_missing::status_reports_each_languages_outcome_in_light_and_full_json)) |
     (binary_id(g-mesh::scripts) & test(=release_packaging_scripts::prepare_release_assets_blesses_a_complete_release_with_plugin_assets)) |
     (binary_id(g-mesh::scripts) & test(=release_packaging_scripts::prepare_release_assets_refuses_a_tampered_plugin_asset_on_windows)) |
     (binary_id(g-mesh::scripts) & test(=release_packaging_scripts::prepare_release_assets_refuses_a_plugin_asset_not_identical_to_the_main_archives_copy)) |
@@ -151,6 +142,7 @@ not (
     (binary_id(g-mesh::scripts) & test(=release_packaging_scripts::prepare_release_assets_refuses_a_plugin_asset_whose_command_names_no_binary)) |
     (binary_id(g-mesh::it) & test(=plugin_check::a_bulk_index_that_never_finishes_fails_session_instead_of_hanging)) |
     (binary_id(g-mesh::it) & test(=orphaned_daemon::a_daemon_whose_project_root_still_exists_is_left_alone)) |
+    (binary_id(g-mesh::it) & test(=daemon_lifeline::a_daemon_whose_lifeline_is_running_or_unreadable_is_left_alone)) |
     (binary_id(g-mesh-plugin-rust::conformance) & test(=the_linked_index_answers_the_acceptance_criteria)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=cargo_env_loader_var::a_loader_var_added_after_start_stops_the_server_before_any_reload)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=cargo_env_loader_var::a_sandboxed_server_maps_no_project_dylib_and_still_resolves)) |
@@ -162,20 +154,16 @@ not (
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=source_freshness::an_edit_to_a_file_no_question_touched_reaches_the_answer_about_its_caller)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=project_extra_env::a_crate_level_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker)) |
     (binary_id(g-mesh::it) & test(=worktree_seed::a_tool_call_waits_for_the_seeded_reconcile)) |
-    (binary_id(g-mesh::it) & test(=plugin_build_staleness::a_plugin_rebuilt_under_a_running_daemon_costs_the_project_a_re_walk)) |
-    (binary_id(g-mesh::it) & test(=plugin_build_staleness::a_rebuild_of_any_discovered_plugin_retires_the_daemon_not_only_typescripts)) |
     (binary_id(g-mesh::it) & test(=plugin_memory_limit::a_real_rust_analyzer_without_std_over_its_memory_limit_is_suspended_and_structural_work_continues)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=project_extra_env::a_root_rust_analyzer_toml_extra_env_fires_no_rustflags_or_host_config_marker)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=project_extra_env::the_same_extra_env_through_the_client_fires_the_markers)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=source_freshness::the_answer_about_an_edited_file_follows_the_indexed_text_not_a_newer_disk)) |
     (binary_id(g-mesh::it) & test(=ambiguous_reexport_linking::find_callers_resolves_through_an_ambiguous_export_star_barrel)) |
-    (binary_id(g-mesh::it) & test(=cli_status::status_warns_about_a_project_idle_past_the_threshold)) |
-    (binary_id(g-mesh::it) & test(=cli_status::status_reports_a_dead_daemon_and_the_files_its_index_never_saw)) |
-    (binary_id(g-mesh::it) & test(=cli_init::init_on_a_fresh_project_creates_state_and_a_subsequent_status_shows_it_indexed)) |
-    (binary_id(g-mesh::it) & test(=state_isolation::a_spawned_g_mesh_resolves_the_same_isolated_state_root)) |
     (binary_id(g-mesh::it) & test(=multi_project_front::reindexing_one_project_leaves_the_front_and_other_projects_alone)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=sandbox_writes_and_network::the_server_tree_writes_nothing_outside_its_writable_prefixes)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=sandbox_writes_and_network::the_server_tree_opens_no_network_connection_with_offline_removed)) |
-    (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=sandbox_writes_and_network::a_lockless_workspace_keeps_its_path_dependency_through_the_private_temp_dir))
+    (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=sandbox_writes_and_network::a_lockless_workspace_keeps_its_path_dependency_through_the_private_temp_dir)) |
+    (binary_id(g-mesh::it) & test(=cli_deps::deps_on_a_cold_ts_rust_python_project_matches_get_dependencies_and_reruns_byte_identically)) |
+    (binary_id(g-mesh::it) & test(=worktree_daemon_lifecycle::a_call_to_a_deleted_selection_says_it_no_longer_exists))
 )
 """

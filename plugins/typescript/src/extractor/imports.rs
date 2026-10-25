@@ -5,8 +5,12 @@
 //!   edge from the file. The [`SpecifierResolver`] decides which: a specifier
 //!   it resolves to a project file is a `resolved_module` whose
 //!   `qualifiedName` is that file's path and whose target is
-//!   `{file: path, name: "*"}`; any other is an `external_module` named by the
-//!   raw specifier, with no target.
+//!   `{file: path, name: "*"}`. A relative specifier that resolves to no file
+//!   is a `resolved_module` named by the raw specifier and targeted at the
+//!   path it names before any extension is tried (`./missing` ->
+//!   `src/missing`): core finds no file there and leaves it unlinked, an
+//!   unresolved import. Any other is an `external_module` named by the raw
+//!   specifier, with no target.
 //! - The names an import binds are kept only when its specifier resolved:
 //!   named and default imports in [`ImportBinding`]s (a use of one becomes a
 //!   `pending_symbol` placeholder, [`Declarer::imported_symbol`]), a
@@ -36,6 +40,7 @@ use crate::extractor::keys::{
 use crate::extractor::model::{ConstantInitializer, ImportBinding, NodeParams};
 use crate::extractor::scope::{is_locally_bound, Scope};
 use crate::extractor::syntax::{child_of_kind, children, named_children, string_literal_value};
+use crate::project::resolve::relative_address;
 
 /// Turns a module specifier written in the file `from` into the project file
 /// it names, or `None` when it names nothing in this project (a package, a
@@ -44,7 +49,8 @@ use crate::extractor::syntax::{child_of_kind, children, named_children, string_l
 /// lives behind this.
 pub type SpecifierResolver<'r> = dyn Fn(&str, &RelPath) -> Option<RelPath> + 'r;
 
-/// The resolver that resolves nothing: every import is an `external_module`.
+/// The resolver that resolves nothing: every relative import is an unlinked
+/// `resolved_module`, every other an `external_module`.
 pub fn no_resolution(_specifier: &str, _from: &RelPath) -> Option<RelPath> {
     None
 }
@@ -194,13 +200,20 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
     /// only core knows whether that node is indexed, and repoints the edge.
     fn record_specifier(&mut self, specifier: &str, at: Node<'t>) -> Option<RelPath> {
         let resolved = (self.resolver)(specifier, self.path);
+        // A relative specifier never names a package: when it resolves to no
+        // file it is still addressed at the path it names, so the placeholder
+        // stays an unlinked `resolved_module`, never an `external_module`.
+        let address = match &resolved {
+            Some(path) => Some(path.as_str().to_string()),
+            None => relative_address(specifier, self.path),
+        };
         let qualified_name = resolved.as_ref().map_or(specifier, RelPath::as_str);
         let mut params = NodeParams::new(NodeKind::Module, specifier, qualified_name, self.range(at));
         params.native_kind = Some(
-            if resolved.is_some() { RESOLVED_MODULE_NATIVE_KIND } else { EXTERNAL_MODULE_NATIVE_KIND }
+            if address.is_some() { RESOLVED_MODULE_NATIVE_KIND } else { EXTERNAL_MODULE_NATIVE_KIND }
                 .to_string(),
         );
-        params.target = resolved.as_ref().map(|path| file_target(path.as_str(), REEXPORT_ALL_NAME));
+        params.target = address.as_deref().map(|path| file_target(path, REEXPORT_ALL_NAME));
         let index = self.model.add_node(params);
         let file_id = self.model.file_id().to_string();
         let target_id = self.model.node(index).id.clone();
