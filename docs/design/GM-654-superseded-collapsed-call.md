@@ -289,3 +289,104 @@ Single known files were read with `sed -n`: `file_rows.rs`, `index.rs`,
 (`WireEdge`), `apply.rs`, `bridge.rs`, `pagination.rs`, `schema.rs` (grep for
 edge indexes). All g-mesh calls used `project: "g-mesh"`: the worktree's HEAD
 is the main checkout's (`912c53c`), so its index answers for this code.
+
+## 5. M1 diagnosis
+
+Status: diagnosis (S11). No production change.
+
+**Reproduced.** The it test was looped with a throwaway probe that, when
+`useString`'s two edges had different `toId`s, dumped the nodes and edges and
+copied the db (probe reverted). Run 20 of 20 failed with the same assertion
+and the same ids as S10: `bound -> bca4e8ab… (toDeclaration 0)`,
+`collapsed -> 01ea26f1… (NULL)`. Runs took real 7.7-18.6 s at user 3-6 s;
+load 71 at the start, 53 at the end (`uptime`), from other work on the
+machine. The failing run: real 12.88, user 4.80, sys 1.61.
+
+**What the two ids are.**
+
+| id | node | role |
+|---|---|---|
+| `bca4e8ab…` | `Function parse`, `lib.ts` 2:7-4:1, declarations 0/1/2 | the declaration |
+| `01ea26f1…` | `Module parse`, `nativeKind = pending_symbol`, `use.ts` 0:9-0:14, qualifiedName `lib.ts#parse`; `placeholder_targets` (file `lib.ts`, name `parse`) | the import placeholder `use.ts` sends for the structural call |
+
+The probe's dump, taken a few ms after the failing read, already showed the
+collapsed edge `0b39ce26…` on `bca4e8ab…` with `linkedFrom = 01ea26f1…`, and
+the window was still open (`(2, 2)`). So the test read the collapsed edge
+**before it was linked**, and the linker moved it right after. It is not a
+second `parse` node per overload, and the edge is not left on the placeholder.
+
+**The sequence.** `round_trip` (`core/src/watcher/apply.rs` 901) ->
+`Writer::apply_file_diff_linked` (`core/src/storage/index_store.rs` 397-415)
+-> `file_rows::widen`, then `apply_and_link` (101-104):
+
+1. `write::apply_diff` (`core/src/storage/write.rs` 309-318) opens **its own
+   transaction and commits**. The re-sent collapsed edge is stored as the
+   plugin sent it: `toId = 01ea26f1…` (the placeholder), `linkedFrom NULL`.
+   The bound edge, kept by `widen`, is already on `bca4e8ab…`.
+2. `imports::link_diff` (`core/src/graph/imports.rs` 203, transaction at 328),
+   a second commit.
+3. `symbol_links::link_diff` (`core/src/graph/symbol_links.rs` 772-811)
+   collects the placeholder (it is an upserted edge's `toId`), and `link`
+   (1295-1386) runs a **third transaction**:
+   `UPDATE edges SET toId = <decl>, resolved = 1, linkedFrom = <placeholder>`
+   per `(kind, source)` group, and commits.
+4. Only after `apply_file_diff_linked` returns does `round_trip` reach
+   `hold_compute_open_for_tests` (line 941), which opens the held window.
+
+`Writer::step` (348-353) holds the write lock across 1-3, but WAL readers see
+each commit. Between commit 1 and commit 3 the collapsed edge is on the
+placeholder. The test detects the window with `edges_onto_parse`, which joins
+`nodes.name = 'parse'`. The placeholder is also named `parse`, so
+`(2, 2)` matches at commit 1, before the hold. With a 20 ms poll the test
+usually lands after commit 3 (the hold), and once in about 10-20 runs lands
+between 1 and 3.
+
+Who sets `toId`/`linkedFrom` on a `CALLS` edge: the `repoint`/`unlink`
+statements in `symbol_links::link` (reached from `link_diff` and `link_all`)
+write `linkedFrom` (schema comment, `core/src/storage/schema.rs` 328-337).
+They run after `apply_diff`'s commit, never inside it. The chain was read
+with g-mesh `find_definition` (project `g-mesh`, code unchanged on this
+branch) on `apply_file_diff_linked`, `apply_and_link`, `link_applied`,
+`widen` and `link_diff`; the `UPDATE`/`transaction()` sites in
+`symbol_links.rs` were found with grep on that one file.
+
+**The bound edge is linked from another placeholder.** Both bound edges have
+`linkedFrom = fd039a45…`, a node no longer stored (the semantic answer's own
+placeholder, `plugins/sdk/src/lsp/bridge.rs` `answer_ids`). The collapsed
+edge's is `01ea26f1…`. So the S6/S7 reading was right that the two edges come
+from different placeholders. After linking both end on the same declaration,
+which is why M1 holds in the held window.
+
+**Production reach.**
+- The sub-window (commit 1 to commit 3) exists on every `fileChanged` of a
+  file with cross-file usages, with or without this fix and with or without
+  overloads. It lasts as long as two short link transactions (ms), not a
+  semantic pass.
+- `find_callers(parse)` and `find_references(parse)` are anchored on the
+  declaration. The collapsed edge is not on it in the sub-window, so the
+  caller is listed **once** (the bound edge). No duplicate there.
+- `find_callees(useString)` in the sub-window lists `parse` twice: the bound
+  edge (resolved) and the collapsed edge onto the placeholder (unresolved,
+  with candidates). Without overloads the same sub-window lists the one call
+  as unresolved. Both are the same thing, already present: apply and link
+  are not one commit. This is not the GM-654 window and the read-side filter
+  cannot close it, because the two rows have different callees in the store.
+- The test only fails on the raw-store assertion (line 366). Its MCP
+  assertions run later, after commit 3.
+
+**Fix options.**
+
+| Option | Edit map | Keeps "a failed pass never leaves a call with no edge" | Index use | Verdict |
+|---|---|---|---|---|
+| T. Test: detect the window only once the collapsed edges are linked | `core/tests/it/superseded_collapsed_call.rs` `edges_onto_parse` (155-170): count edges whose target is the declaration (`n.name = 'parse' AND n.kind = 'Function'`, or `n.nativeKind IS NOT 'pending_symbol'`), so a collapsed edge still on the placeholder does not count. The `(2, 0)` checks keep the same meaning. | yes (no production change) | unchanged (`+b.toId`, `idx_edges_fromId`) | **Recommended** |
+| C. Compare `COALESCE(linkedFrom, toId)` | `pagination.rs` `SUPERSEDED_CALL_FILTER` (369-372) | yes | `idx_edges_fromId` still drives the probe | **Wrong.** The bound edges' canonical id is `fd039a45…`, the collapsed edge's `01ea26f1…`. They never match, so the filter would stop hiding the collapsed edge in the held window too: the GM-654 bug comes back. |
+| N. Also hide a collapsed edge onto an unlinked placeholder whose target name equals the bound sibling's callee | `SUPERSEDED_CALL_FILTER` + a join on `nodes`/`placeholder_targets` | yes | an extra `nodes` probe per row | Rejected. It hides a different callee with the same name (two `parse` from two modules, one bound, one not yet linked). It also only matters for a ms-wide sub-window that `find_callers` does not hit. |
+| O. Apply and link in one transaction | `index_store.rs` `apply_and_link` (101-104), `write::apply_diff` (309-318), `imports::link_diff` (328), `symbol_links::link` (1303/1380): savepoints under one outer transaction | **changes it**: today a link failure keeps the applied diff. With one transaction the whole reparse rolls back | unchanged | Out of scope. It touches every diff's write path. It closes the general apply/link sub-window for every tool, not GM-654's. Worth a follow-up task if the `find_callees` blip matters. |
+
+**Recommendation: T.** M1 holds for the window approach A targets: the held
+window opens only after commit 3, and in it both edges share `toId` (shown by
+the dump). The failure was the test's window detector admitting the
+pre-link sub-window. T is an implementation detail of approach A and needs no
+owner review. The sub-window itself (apply and link are separate commits) is
+pre-existing and not caused or worsened by A. Filing it as a separate task
+(option O) is the owner's call.
