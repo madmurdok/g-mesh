@@ -90,6 +90,7 @@ mod shim_handle_inheritance;
 mod stale_index_invalidation;
 mod state_isolation;
 mod structural_does_not_wait_for_embeddings;
+mod superseded_collapsed_call;
 mod symlink_table_routing;
 mod typescript_grammar_routing;
 #[cfg(unix)] // every user of it is a `#![cfg(unix)]` file

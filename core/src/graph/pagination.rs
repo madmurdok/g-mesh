@@ -1926,4 +1926,200 @@ mod tests {
 
         assert_eq!(served, whole);
     }
+
+    /// A collapsed `CALLS` edge (no `toDeclaration`) beside a bound one from
+    /// the same caller onto the same callee: rows, counts and file tallies
+    /// all list the call once, through the bound edge.
+    mod superseded_call {
+        use super::*;
+
+        const CALLER: &str = "useString";
+        const CALLEE: &str = "parse";
+
+        fn store() -> Connection {
+            let conn = setup();
+            make_node(&conn, CALLER, "use.ts");
+            make_node(&conn, CALLEE, "lib.ts");
+            make_node(&conn, "other", "other.ts");
+            conn
+        }
+
+        fn insert(
+            conn: &Connection,
+            id: &str,
+            from: &str,
+            to: &str,
+            kind: &str,
+            to_declaration: Option<i64>,
+        ) {
+            let source = if to_declaration.is_some() { "semantic" } else { "syntactic" };
+            conn.execute(
+                "INSERT INTO edges (id, fromId, toId, kind, source, engine, resolved, toDeclaration)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'test', 1, ?6)",
+                params![id, from, to, kind, source, to_declaration],
+            )
+            .unwrap();
+        }
+
+        fn collapsed(conn: &Connection, id: &str, from: &str, to: &str) {
+            insert(conn, id, from, to, "CALLS", None);
+        }
+
+        fn bound(conn: &Connection, id: &str, from: &str, to: &str, ordinal: i64) {
+            insert(conn, id, from, to, "CALLS", Some(ordinal));
+        }
+
+        fn row_ids(conn: &Connection, anchor: &str, direction: Direction, kinds: &[&str]) -> Vec<String> {
+            let page =
+                paginate_edges(conn, anchor, direction, kinds, &[], "lib.ts", Distinctness::Edges, 50, None)
+                    .unwrap();
+            let mut ids: Vec<String> = page.results.into_iter().map(|row| row.edge.id).collect();
+            ids.sort();
+            ids
+        }
+
+        fn total(conn: &Connection, anchor: &str, direction: Direction, kinds: &[&str]) -> usize {
+            count_edges_by_resolution(conn, anchor, direction, kinds, &[]).unwrap().total
+        }
+
+        fn tally(
+            conn: &Connection,
+            anchor: &str,
+            direction: Direction,
+            kinds: &[&str],
+        ) -> Vec<(String, i64)> {
+            tally_edge_files(conn, anchor, direction, kinds, &[])
+                .unwrap()
+                .into_iter()
+                .map(|file| (file.path, file.refs))
+                .collect()
+        }
+
+        fn ids(expected: &[&str]) -> Vec<String> {
+            expected.iter().map(|id| id.to_string()).collect()
+        }
+
+        fn superseded_pair() -> Connection {
+            let conn = store();
+            collapsed(&conn, "collapsed", CALLER, CALLEE);
+            bound(&conn, "bound", CALLER, CALLEE, 0);
+            conn
+        }
+
+        #[test]
+        fn a_collapsed_call_beside_its_bound_sibling_is_one_caller_row() {
+            let conn = superseded_pair();
+            assert_eq!(row_ids(&conn, CALLEE, Direction::Incoming, &["CALLS"]), ids(&["bound"]));
+        }
+
+        #[test]
+        fn a_collapsed_call_beside_its_bound_sibling_is_one_callee_row() {
+            let conn = superseded_pair();
+            assert_eq!(row_ids(&conn, CALLER, Direction::Outgoing, &["CALLS"]), ids(&["bound"]));
+        }
+
+        #[test]
+        fn a_collapsed_call_beside_its_bound_sibling_counts_once() {
+            let conn = superseded_pair();
+            assert_eq!(total(&conn, CALLEE, Direction::Incoming, &["CALLS"]), 1);
+            assert_eq!(total(&conn, CALLER, Direction::Outgoing, &["CALLS"]), 1);
+            assert_eq!(count_edges(&conn, CALLEE, Direction::Incoming, &["CALLS"], &[]).unwrap(), 1);
+        }
+
+        #[test]
+        fn a_collapsed_call_beside_its_bound_sibling_is_tallied_once() {
+            let conn = superseded_pair();
+            assert_eq!(
+                tally(&conn, CALLEE, Direction::Incoming, &["CALLS"]),
+                vec![("use.ts".to_string(), 1)]
+            );
+            let (files, truncated) =
+                tally_edge_files_bounded(&conn, CALLEE, Direction::Incoming, &["CALLS"], &[]).unwrap();
+            assert_eq!(files.iter().map(|file| file.refs).sum::<i64>(), 1);
+            assert!(!truncated);
+        }
+
+        #[test]
+        fn two_bound_calls_from_one_caller_onto_one_callee_are_both_listed() {
+            let conn = store();
+            bound(&conn, "bound-0", CALLER, CALLEE, 0);
+            bound(&conn, "bound-1", CALLER, CALLEE, 1);
+            collapsed(&conn, "collapsed", CALLER, CALLEE);
+            assert_eq!(row_ids(&conn, CALLEE, Direction::Incoming, &["CALLS"]), ids(&["bound-0", "bound-1"]));
+            assert_eq!(total(&conn, CALLEE, Direction::Incoming, &["CALLS"]), 2);
+            assert_eq!(
+                tally(&conn, CALLEE, Direction::Incoming, &["CALLS"]),
+                vec![("use.ts".to_string(), 2)]
+            );
+        }
+
+        #[test]
+        fn a_collapsed_call_with_no_bound_sibling_is_listed() {
+            let conn = store();
+            collapsed(&conn, "collapsed", CALLER, CALLEE);
+            assert_eq!(row_ids(&conn, CALLEE, Direction::Incoming, &["CALLS"]), ids(&["collapsed"]));
+            assert_eq!(total(&conn, CALLEE, Direction::Incoming, &["CALLS"]), 1);
+            assert_eq!(
+                tally(&conn, CALLEE, Direction::Incoming, &["CALLS"]),
+                vec![("use.ts".to_string(), 1)]
+            );
+        }
+
+        #[test]
+        fn a_collapsed_call_is_listed_again_once_its_bound_sibling_is_gone() {
+            let conn = superseded_pair();
+            assert_eq!(row_ids(&conn, CALLEE, Direction::Incoming, &["CALLS"]), ids(&["bound"]));
+
+            conn.execute("DELETE FROM edges WHERE id = 'bound'", []).unwrap();
+
+            assert_eq!(row_ids(&conn, CALLEE, Direction::Incoming, &["CALLS"]), ids(&["collapsed"]));
+            assert_eq!(total(&conn, CALLEE, Direction::Incoming, &["CALLS"]), 1);
+            assert_eq!(
+                tally(&conn, CALLEE, Direction::Incoming, &["CALLS"]),
+                vec![("use.ts".to_string(), 1)]
+            );
+        }
+
+        #[test]
+        fn a_bound_call_onto_one_callee_does_not_hide_a_collapsed_call_onto_another() {
+            let conn = superseded_pair();
+            collapsed(&conn, "collapsed-other", CALLER, "other");
+            assert_eq!(
+                row_ids(&conn, CALLER, Direction::Outgoing, &["CALLS"]),
+                ids(&["bound", "collapsed-other"])
+            );
+            assert_eq!(total(&conn, CALLER, Direction::Outgoing, &["CALLS"]), 2);
+            assert_eq!(row_ids(&conn, "other", Direction::Incoming, &["CALLS"]), ids(&["collapsed-other"]));
+            assert_eq!(total(&conn, "other", Direction::Incoming, &["CALLS"]), 1);
+            assert_eq!(
+                tally(&conn, "other", Direction::Incoming, &["CALLS"]),
+                vec![("use.ts".to_string(), 1)]
+            );
+        }
+
+        #[test]
+        fn a_reference_beside_a_bound_call_is_still_listed() {
+            let conn = store();
+            bound(&conn, "bound", CALLER, CALLEE, 0);
+            insert(&conn, "reference", CALLER, CALLEE, "REFERENCES", None);
+            let kinds = ["CALLS", "REFERENCES"];
+            assert_eq!(row_ids(&conn, CALLEE, Direction::Incoming, &kinds), ids(&["bound", "reference"]));
+            assert_eq!(row_ids(&conn, CALLEE, Direction::Incoming, &["REFERENCES"]), ids(&["reference"]));
+            assert_eq!(total(&conn, CALLEE, Direction::Incoming, &kinds), 2);
+            assert_eq!(tally(&conn, CALLEE, Direction::Incoming, &kinds), vec![("use.ts".to_string(), 2)]);
+        }
+
+        #[test]
+        fn only_a_bound_call_hides_a_collapsed_call() {
+            let conn = store();
+            collapsed(&conn, "collapsed", CALLER, CALLEE);
+            insert(&conn, "bound-reference", CALLER, CALLEE, "REFERENCES", Some(0));
+            assert_eq!(row_ids(&conn, CALLEE, Direction::Incoming, &["CALLS"]), ids(&["collapsed"]));
+            assert_eq!(total(&conn, CALLEE, Direction::Incoming, &["CALLS"]), 1);
+            assert_eq!(
+                tally(&conn, CALLEE, Direction::Incoming, &["CALLS"]),
+                vec![("use.ts".to_string(), 1)]
+            );
+        }
+    }
 }
