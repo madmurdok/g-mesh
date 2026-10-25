@@ -345,6 +345,32 @@ const LOCALITY_EXPR: &str = "CASE WHEN n.filePath = ?1 THEN 0 \
      WHEN substr(n.filePath, 1, ?9) = ?8 AND instr(substr(n.filePath, ?9 + 1), '/') = 0 THEN 1 \
      ELSE 2 END";
 
+/// Leaves out a collapsed call that a bound call already answers: a `CALLS`
+/// edge `e` with no `toDeclaration` is not listed when another `CALLS` edge
+/// from the same `fromId` onto the same `toId` has one. The two describe one
+/// call site seen by two passes (the structural pass, which cannot tell
+/// overloads apart, and the semantic pass, which binds one declaration), and
+/// they serialize to identical rows, so listing both counts one caller twice.
+///
+/// Every query that lists, counts or tallies edges for an answer applies it,
+/// so `results`, `total` and `files` agree. It is a filter over the current
+/// rows, re-derived on every read, and never hides an edge with a
+/// `toDeclaration`: when the bound edge goes away the collapsed one is listed
+/// again, and the store itself keeps both rows.
+///
+/// A caller can also hold a collapsed and a bound edge onto one callee that
+/// stand for two different call sites (two structural edges onto one
+/// function, only one of them bound). The collapsed one is hidden there too:
+/// the caller is still listed, with one row fewer.
+///
+/// Expects the edge table under the alias `e`. The unary `+` on `b.toId`
+/// keeps the probe on `idx_edges_fromId`: a caller has few edges, while a
+/// callee can have thousands, and without it SQLite picks `idx_edges_toId`.
+const SUPERSEDED_CALL_FILTER: &str = "NOT (e.kind = 'CALLS' AND e.toDeclaration IS NULL AND EXISTS ( \
+     SELECT 1 FROM edges b \
+     WHERE b.fromId = e.fromId AND +b.toId = e.toId \
+       AND b.kind = 'CALLS' AND b.toDeclaration IS NOT NULL))";
+
 /// The anchor's directory as a prefix ending in `/` (empty for a file at the
 /// project root), and its length in characters, which is what SQLite's
 /// `substr` counts.
@@ -505,6 +531,7 @@ pub fn tally_edge_files_limited(
          WHERE e.{this_endpoint} = ?1 \
            AND {kind_filter} \
            AND {scope_filter} \
+           AND {SUPERSEDED_CALL_FILTER} \
          GROUP BY n.filePath \
          ORDER BY refs DESC, filePath ASC \
          LIMIT ?2"
@@ -585,7 +612,8 @@ pub fn count_edges_by_resolution(
          FROM edges e JOIN nodes n ON n.id = e.{other_endpoint} \
          WHERE e.{this_endpoint} = ?1 \
            AND {kind_filter} \
-           AND {scope_filter}"
+           AND {scope_filter} \
+           AND {SUPERSEDED_CALL_FILTER}"
     );
 
     let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&anchor_node_id];
@@ -687,6 +715,8 @@ pub enum Distinctness {
 /// need a separate sentinel.
 /// `distinct` is [`Distinctness`]' own doc: whether a second edge onto an
 /// endpoint already on the page is a second row or the same answer twice.
+/// A collapsed call beside a bound one for the same caller and callee is
+/// never a row: see `SUPERSEDED_CALL_FILTER`.
 // Nine independently-meaningful parameters, each already documented above;
 // grouping them into a struct would only move the same list one level of
 // indirection away from its three call sites without shortening it.
@@ -756,6 +786,7 @@ pub fn paginate_edges(
            AND {kind_filter} \
            AND {scope_filter} \
            AND {distinct_filter} \
+           AND {SUPERSEDED_CALL_FILTER} \
            AND ( \
              ?3 = 0 \
              OR (1 - e.resolved, locality, fileRow, n.filePath, n.startLine, e.id) \
