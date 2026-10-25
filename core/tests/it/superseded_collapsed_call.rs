@@ -150,8 +150,11 @@ fn spawn_daemon(project: &mut Project, hold_file: &Path) {
     project.daemon = Some(daemon);
 }
 
-/// `(bound, collapsed)` `CALLS` edges onto `parse`, from one read
-/// transaction so a commit between two reads cannot make them disagree.
+/// `(bound, collapsed)` `CALLS` edges onto the `parse` declaration, from one
+/// read transaction so a commit between two reads cannot make them disagree.
+/// Only edges whose target is the `Function` node count: the import
+/// placeholder named `parse` holds the collapsed edge until it is linked, and
+/// counting it would end the wait before the window is held.
 fn edges_onto_parse(db: &Path) -> (i64, i64) {
     let read = || -> rusqlite::Result<(i64, i64)> {
         let mut conn = Connection::open(db)?;
@@ -159,7 +162,7 @@ fn edges_onto_parse(db: &Path) -> (i64, i64) {
         tx.query_row(
             "SELECT COALESCE(SUM(e.toDeclaration IS NOT NULL), 0), COALESCE(SUM(e.toDeclaration IS NULL), 0)
              FROM edges e JOIN nodes n ON n.id = e.toId
-             WHERE e.kind = 'CALLS' AND n.name = 'parse'",
+             WHERE e.kind = 'CALLS' AND n.name = 'parse' AND n.kind = 'Function'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
