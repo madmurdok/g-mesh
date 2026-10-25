@@ -119,8 +119,11 @@ pub fn resolve_relative(project: &TsProject, specifier: &str, from: &RelPath) ->
 /// relative import may be waiting at ([`relative_address`]) that the new
 /// file `path` can answer. `src/missing.ts` -> `src/missing` (and
 /// `src/missing.js`, through [`TS_SUBSTITUTIONS`]); `src/missing/index.ts`
-/// -> `src/missing` too. Which existing candidate wins is still the
-/// resolver's, on re-extract; this only names who to ask.
+/// -> `src/missing` too; `src/index.ts` -> `src` (`'.'` in `src/a.ts`,
+/// `'../..'` in `src/x/y/b.ts`). Never the root `.` or a path above it:
+/// [`resolve_relative`] resolves neither, so no re-extract would link it.
+/// Which existing candidate wins is still the resolver's, on re-extract;
+/// this only names who to ask.
 pub fn addresses_resolving_to(path: &str) -> Vec<String> {
     let mut bases: BTreeSet<String> = BTreeSet::new();
     for extension in EXTENSIONS {
@@ -139,7 +142,9 @@ pub fn addresses_resolving_to(path: &str) -> Vec<String> {
         }
     }
     bases.remove(path);
-    bases.retain(|base| !base.is_empty() && candidate_paths(base).iter().any(|candidate| candidate == path));
+    bases.retain(|base| {
+        !paths::escapes(base) && candidate_paths(base).iter().any(|candidate| candidate == path)
+    });
     bases.into_iter().collect()
 }
 

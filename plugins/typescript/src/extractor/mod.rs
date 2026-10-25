@@ -50,12 +50,17 @@ pub mod scope;
 pub mod sites;
 pub mod syntax;
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+
 use g_mesh_plugin_sdk::wire::ResolutionDelta;
 use g_mesh_plugin_sdk::{CharColumns, Extractor, FileGraph, RelPath};
 
 use crate::extractor::decls::Declarer;
 use crate::extractor::model::FileModel;
 use crate::project::facts::{self, TsFacts};
+use crate::project::paths;
+use crate::project::resolve::relative_address;
 use crate::project::TsProject;
 
 /// The plugin's wire identifier: the manifest's `language`, this directory's
@@ -86,7 +91,8 @@ impl Extractor for TypeScriptExtractor {
         project.file_presence_changed(path, present);
     }
 
-    /// Names the importers a created file may resolve an unlinked relative
+    /// Records which relative imports of `path` wait unresolved, and names
+    /// the importers a newly present file may resolve an unlinked relative
     /// import of (`./missing` once `src/missing.ts` exists).
     fn source_changed(
         &self,
@@ -94,7 +100,8 @@ impl Extractor for TypeScriptExtractor {
         path: &RelPath,
         source: Option<&str>,
     ) -> Option<ResolutionDelta> {
-        project.source_changed(path, source)
+        let unresolved = source.map(|source| unresolved_relative_addresses(project, path, source));
+        project.source_changed(path, unresolved)
     }
 
     /// The packages, tsconfig `paths` and `imports` maps resolution reads.
@@ -126,4 +133,32 @@ impl Extractor for TypeScriptExtractor {
         Declarer::new(source, &columns, path, &resolve, &mut model).run(root);
         emit::flush(model, LANGUAGE, ENGINE, path, root.has_error())
     }
+}
+
+/// The addresses ([`relative_address`]) of the relative specifiers of
+/// `source` that `project` resolves to no file: where this extraction of
+/// `path` leaves an unlinked placeholder waiting. The root and paths above
+/// it are left out, since nothing created there ever resolves them. The
+/// same parse and declaration pass as [`TypeScriptExtractor::extract`], so
+/// every specifier it folds is seen.
+fn unresolved_relative_addresses(project: &TsProject, path: &RelPath, source: &str) -> BTreeSet<String> {
+    let unresolved = RefCell::new(BTreeSet::new());
+    let Some(tree) = grammar::grammar_for(path).and_then(|grammar| grammar::parse(grammar, source)) else {
+        return BTreeSet::new();
+    };
+    let columns = CharColumns::new(source);
+    let mut model = FileModel::new(path.as_str(), columns.file_range());
+    let resolve = |specifier: &str, from: &RelPath| {
+        let resolved = project.resolve(specifier, from);
+        if resolved.is_none() {
+            if let Some(address) =
+                relative_address(specifier, from).filter(|address| !paths::escapes(address))
+            {
+                unresolved.borrow_mut().insert(address);
+            }
+        }
+        resolved
+    };
+    Declarer::new(source, &columns, path, &resolve, &mut model).run(tree.root_node());
+    unresolved.into_inner()
 }

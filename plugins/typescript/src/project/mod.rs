@@ -26,10 +26,11 @@ pub mod jsonc;
 pub mod paths;
 pub mod resolve;
 pub mod tsconfig;
+pub mod waiting;
 pub mod workspace;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use g_mesh_plugin_sdk::wire::{
@@ -41,6 +42,7 @@ use crate::extractor::grammar::EXTENSIONS;
 use crate::project::exports::PackageImports;
 use crate::project::jsonc::{parse_json, Json};
 use crate::project::tsconfig::{EffectiveConfig, TsconfigReader};
+use crate::project::waiting::Waiting;
 use crate::project::workspace::{workspace_packages, workspace_patterns, DirectoryTree, WorkspacePackage};
 
 /// Directories the walk never descends into, on top of the SDK's own
@@ -72,11 +74,16 @@ pub struct TsProject {
     pub imports_by_dir: BTreeMap<String, Option<PackageImports>>,
     /// What the load skipped and why, one line each.
     pub notes: Vec<String>,
+    /// The root the model was loaded from, which [`Waiting`] reads the
+    /// files this model did not extract under.
+    pub root: PathBuf,
     /// The files [`TsProject::source_changed`] has already offered to the
     /// imports waiting on them since this model was built. Empty after a
     /// load, so a file created while no model watched (offline, or before
     /// this process spawned) is still offered on its first `fileChanged`.
     pub announced: BTreeSet<RelPath>,
+    /// The addresses unresolved relative imports may wait at.
+    pub waiting: Waiting,
 }
 
 impl TsProject {
@@ -132,7 +139,16 @@ impl TsProject {
         let patterns = workspace_patterns(pnpm.as_deref(), manifests.get(""));
         let packages = workspace_packages(&patterns, &tree, &manifests);
 
-        Ok(Self { existence, packages, tsconfig_by_dir, imports_by_dir, notes, announced: BTreeSet::new() })
+        Ok(Self {
+            existence,
+            packages,
+            tsconfig_by_dir,
+            imports_by_dir,
+            notes,
+            root: root.to_path_buf(),
+            announced: BTreeSet::new(),
+            waiting: Waiting::default(),
+        })
     }
 
     /// The file `specifier`, written in the file `from`, names, or `None`
@@ -151,30 +167,43 @@ impl TsProject {
         } else {
             self.existence.remove(path);
             self.announced.remove(path);
+            self.waiting.forget(path);
         }
     }
 
-    /// The importers whose unlinked relative imports `path`, whose text is
-    /// now `source`, may resolve to: those whose placeholder still waits at
-    /// an address `path` is a candidate of
-    /// ([`resolve::addresses_resolving_to`]), such as `./missing` (`src/missing`)
-    /// once `src/missing.ts` or `src/missing/index.ts` exists. Core links an
-    /// address equal to a new file's path by itself; any other address only
-    /// a re-extract against the updated existence set resolves, in the
-    /// resolver's own candidate order.
+    /// The importers whose unlinked relative imports `path` may now resolve:
+    /// those waiting ([`Waiting::waited`]) at an address `path` is a candidate
+    /// of ([`resolve::addresses_resolving_to`]), such as `./missing`
+    /// (`src/missing`) once `src/missing.ts` or `src/missing/index.ts`
+    /// exists. Core links an address equal to a new file's path by itself;
+    /// any other one only a re-extract against the updated existence set
+    /// resolves, in the resolver's own candidate order.
     ///
-    /// Once per path per model (`announced`), so an ordinary edit costs core
-    /// no import scan; `None` (gone) forgets the path, so a re-creation is
-    /// offered again. `None` when no address can name `path`.
-    pub fn source_changed(&mut self, path: &RelPath, source: Option<&str>) -> Option<ResolutionDelta> {
-        if source.is_none() {
+    /// `unresolved` is `path`'s own extraction for this text: the addresses
+    /// its relative imports leave unresolved, `None` when the file is gone.
+    /// Asked once per path per model (`announced`): an import that waits at
+    /// an address `path` answers was extracted before `path` existed, and
+    /// that is `path`'s first sighting by this model. `None` when nothing
+    /// may wait at any address naming `path`, so an ordinary edit costs core
+    /// no import scan.
+    pub fn source_changed(
+        &mut self,
+        path: &RelPath,
+        unresolved: Option<BTreeSet<String>>,
+    ) -> Option<ResolutionDelta> {
+        let Some(unresolved) = unresolved else {
             self.announced.remove(path);
+            self.waiting.forget(path);
             return None;
-        }
+        };
+        self.waiting.record(path, unresolved);
         if !self.announced.insert(path.clone()) {
             return None;
         }
-        let imports: Vec<ImportSelector> = resolve::addresses_resolving_to(path.as_str())
+        let addresses = resolve::addresses_resolving_to(path.as_str());
+        let imports: Vec<ImportSelector> = self
+            .waiting
+            .waited(&self.root, &self.existence, &addresses)
             .into_iter()
             .map(|address| ImportSelector {
                 importers: PathScope { under: String::new(), not_under: Vec::new() },
