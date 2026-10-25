@@ -123,8 +123,12 @@ fn seeded() -> Connection {
 }
 
 fn select(conn: &Connection, files: &[PathScope], imports: &[ImportSelector]) -> Vec<String> {
-    let (selected, indexed) = select_affected(conn, "ts", files, imports).unwrap();
-    assert_eq!(indexed, TS_FILES.len(), "the language's indexed File nodes, and only its own");
+    let selected = select_affected(conn, "ts", files, imports).unwrap();
+    assert_eq!(
+        indexed_file_count(conn, "ts").unwrap(),
+        TS_FILES.len(),
+        "the language's indexed File nodes, and only its own"
+    );
     selected.into_iter().collect()
 }
 
