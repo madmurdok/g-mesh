@@ -507,6 +507,40 @@ fn addresses_resolving_to_names_only_bases_whose_candidates_include_the_file() {
     assert!(addresses_resolving_to("README.md").is_empty());
 }
 
+/// A root index file also answers the root's own address `.` (`..` in
+/// `src/a.ts`, `.` in `main.ts`), whichever index extension it carries; a
+/// directory index never does.
+///
+/// Control: drop the `stem == "index"` insert in `addresses_resolving_to`.
+#[test]
+fn a_root_index_offers_the_root_address() {
+    assert_eq!(addresses_resolving_to("index.ts"), vec![".", "index", "index.js"]);
+    for path in ["index.tsx", "index.d.ts", "index.js", "index.mts"] {
+        assert!(addresses_resolving_to(path).contains(&".".to_string()), "{path}");
+    }
+    assert!(!addresses_resolving_to("src/index.ts").contains(&".".to_string()));
+    assert!(!addresses_resolving_to("main.ts").contains(&".".to_string()));
+}
+
+/// A created root `index.ts` offers `.`, where an unresolved `import '..'`
+/// waits, and names the root `index.tsx` it shadows there.
+///
+/// Control: the `stem == "index"` revert above (`.` is not offered).
+#[test]
+fn a_first_sighting_of_a_root_index_offers_the_root_address() {
+    let fixture = Fixture::new(&[
+        ("src/a.ts", "import { m } from \"..\";\n"),
+        ("index.tsx", "export const m = 1;\n"),
+        ("index.ts", "export const m = 2;\n"),
+    ]);
+    let mut project = fixture.load();
+    assert_eq!(
+        source_changed(&mut project, "index.ts", Some("export const m = 2;\n")),
+        Some(waiting_at(&[".", "index", "index.js", "index.tsx"]))
+    );
+    assert_eq!(candidates_shadowed_by("index.ts", &existing(&["index.ts", "index.tsx"])), vec!["index.tsx"]);
+}
+
 // -------------------------------------------------------------------------
 // source_changed: a created file offers the candidate it shadows
 // -------------------------------------------------------------------------

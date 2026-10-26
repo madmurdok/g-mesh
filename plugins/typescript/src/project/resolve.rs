@@ -43,6 +43,11 @@ pub const TS_SUBSTITUTIONS: [(&str, &[&str]); 4] = [
     (".cjs", &[".cts", ".d.cts"]),
 ];
 
+/// The address a relative specifier naming the project root itself has
+/// (`..` in `src/a.ts`, `.` or `./` in `main.ts`): [`paths::normalize`]'s
+/// spelling of the empty path.
+pub const ROOT_ADDRESS: &str = ".";
+
 /// `./x`, `../x`, `.` and `..`; everything else is bare or `#private`.
 pub fn is_relative_specifier(specifier: &str) -> bool {
     specifier == "." || specifier == ".." || specifier.starts_with("./") || specifier.starts_with("../")
@@ -61,8 +66,13 @@ pub fn extension_of(path: &str) -> String {
 /// Every path `base` could name, most specific first: TS substitutions for a
 /// JS extension (then the JS file itself), `base` alone when it already
 /// names a parsed source file, otherwise `base` plus each of [`EXTENSIONS`],
-/// then `base/index` plus each.
+/// then `base/index` plus each. The root's own address `.` names a directory
+/// whose file form would sit outside the project, so only its `index` files
+/// count (`index.ts`, `index.tsx`, ...).
 pub fn candidate_paths(base: &str) -> Vec<String> {
+    if base == ROOT_ADDRESS {
+        return EXTENSIONS.iter().map(|extension| format!("index{extension}")).collect();
+    }
     let extension = extension_of(base);
     if let Some((_, substitutions)) = TS_SUBSTITUTIONS.iter().find(|(from, _)| *from == extension) {
         let stem = &base[..base.len() - extension.len()];
@@ -102,13 +112,14 @@ fn importer_dir(from: &RelPath) -> Option<&str> {
 }
 
 /// A relative specifier written in `from`. `None` for a non-relative one, a
-/// path leaving the root or naming the root itself, or no existing candidate.
+/// path leaving the root, or no existing candidate. One naming the root
+/// itself resolves to the root's `index` file ([`candidate_paths`]).
 pub fn resolve_relative(project: &TsProject, specifier: &str, from: &RelPath) -> Option<RelPath> {
     if !is_relative_specifier(specifier) {
         return None;
     }
     let base = paths::normalize(&paths::join(importer_dir(from)?, specifier));
-    if paths::escapes(&base) {
+    if base != ROOT_ADDRESS && paths::escapes(&base) {
         return None;
     }
     first_existing(&project.existence, [base])
@@ -119,8 +130,9 @@ pub fn resolve_relative(project: &TsProject, specifier: &str, from: &RelPath) ->
 /// relative import may be waiting at ([`relative_address`]) that the new
 /// file `path` can answer. `src/missing.ts` -> `src/missing` (and
 /// `src/missing.js`, through [`TS_SUBSTITUTIONS`]); `src/missing/index.ts`
-/// -> `src/missing` too. Which existing candidate wins is still the
-/// resolver's, on re-extract; this only names who to ask.
+/// -> `src/missing` too; a root `index.ts` -> [`ROOT_ADDRESS`]. Which
+/// existing candidate wins is still the resolver's, on re-extract; this only
+/// names who to ask.
 pub fn addresses_resolving_to(path: &str) -> Vec<String> {
     let mut bases: BTreeSet<String> = BTreeSet::new();
     for extension in EXTENSIONS {
@@ -128,6 +140,8 @@ pub fn addresses_resolving_to(path: &str) -> Vec<String> {
             bases.insert(stem.to_string());
             if let Some(dir) = stem.strip_suffix("/index") {
                 bases.insert(dir.to_string());
+            } else if stem == "index" {
+                bases.insert(ROOT_ADDRESS.to_string());
             }
         }
     }

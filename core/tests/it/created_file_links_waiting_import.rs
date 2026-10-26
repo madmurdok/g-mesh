@@ -4,8 +4,10 @@
 //! `src/missing/index.ts` appears, `./m.js` re-pointed from `src/m.js` to a
 //! created `src/m.ts`, `./missing` re-pointed from `src/missing/index.ts`
 //! and `./m` from `src/m.tsx` to a created higher-priority candidate, while
-//! an import naming the lower candidate explicitly stays on it, and a split
-//! literal the extractor folds to `./missing`, after a plugin restart.
+//! an import naming the lower candidate explicitly stays on it, a split
+//! literal the extractor folds to `./missing`, after a plugin restart, and
+//! `..` naming the project root once a root `index.ts` appears (and back to
+//! `index.tsx` once it is deleted).
 //!
 //! The plugin answers the created file's first `fileChanged` with the
 //! addresses that file answers, plus the candidate each address resolved to
@@ -182,4 +184,39 @@ fn an_import_naming_the_lower_candidate_explicitly_stays_on_it() {
         assert_eq!(harness.imports("src/a.ts"), (vec![link.to_string()], Vec::new()), "{import}");
         assert_only_the_importer_re_extracted(&harness);
     }
+}
+
+/// `..` in `src/a.ts` names the project root, which only its index file
+/// answers: it waits unlinked until a root `index.ts` is created.
+#[test]
+fn creating_the_root_index_links_an_import_naming_the_root() {
+    let harness = indexed("import { created } from \"..\";\n", &[]);
+    assert!(harness.imports("src/a.ts").0.is_empty(), ".. waits unlinked");
+
+    create(&harness, "index.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["index.ts:index.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// `..` linked to the root `index.tsx` moves to a created root `index.ts`;
+/// once that is deleted, the importer's next edit falls back to
+/// `index.tsx`. Core drops an edge into a deleted file with its node and
+/// leaves the importer's link to that importer's next reparse.
+#[test]
+fn an_import_naming_the_root_moves_to_a_created_root_index_and_back_once_it_is_deleted() {
+    let harness = indexed("import { mark_v1 } from \"..\";\n", &["index.tsx"]);
+    assert_eq!(harness.imports("src/a.ts").0, vec!["index.tsx:index.tsx".to_string()], "linked to index.tsx");
+
+    create(&harness, "index.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["index.ts:index.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+
+    std::fs::remove_file(harness.root().join("index.ts")).unwrap();
+    harness.route("index.ts");
+    harness.write("src/a.ts", &source("import { mark_v1 } from \"..\";\n", "mark_v3"));
+    harness.route("src/a.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["index.tsx:index.tsx".to_string()], Vec::new()));
 }
