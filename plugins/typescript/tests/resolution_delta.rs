@@ -12,10 +12,13 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use g_mesh_plugin_sdk::wire::{EdgeKind, ImportMatch, Matcher, PathScope, ResolutionDelta};
+use g_mesh_plugin_sdk::wire::{
+    EdgeKind, ImportMatch, ImportSelector, Matcher, PathScope, ResolutionDelta, TargetScopeKind,
+};
 use g_mesh_plugin_sdk::{Extractor, RelPath};
 use g_mesh_plugin_typescript::extractor::TypeScriptExtractor;
 use g_mesh_plugin_typescript::project::facts::TsFacts;
+use g_mesh_plugin_typescript::project::resolve::addresses_resolving_to;
 use g_mesh_plugin_typescript::project::TsProject;
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -391,4 +394,114 @@ fn the_bulk_walk_ends_with_the_resolution_facts() {
             && line.get("specifier").and_then(|s| s.as_str()) == Some("@app/x")),
         "the walk's IMPORTS edge carries its specifier"
     );
+}
+
+// -------------------------------------------------------------------------
+// source_changed: a created file offers the addresses waiting on it
+// -------------------------------------------------------------------------
+
+/// The delta naming, everywhere, the importers waiting at each of `addresses`.
+fn waiting_at(addresses: &[&str]) -> ResolutionDelta {
+    ResolutionDelta::Affected {
+        files: Vec::new(),
+        imports: addresses
+            .iter()
+            .map(|address| ImportSelector {
+                importers: PathScope { under: String::new(), not_under: Vec::new() },
+                by: ImportMatch::Target {
+                    scope_kind: TargetScopeKind::File,
+                    matcher: Matcher::Exact((*address).to_string()),
+                },
+            })
+            .collect(),
+    }
+}
+
+fn source_changed(project: &mut TsProject, path: &str, source: Option<&str>) -> Option<ResolutionDelta> {
+    TypeScriptExtractor.source_changed(project, &RelPath::new(path), source)
+}
+
+/// After a fresh load (a plugin restart, the file created while nothing
+/// watched), a file's first `fileChanged` offers every address it answers,
+/// whatever the importers' text: a plain `./missing`, a split literal the
+/// extractor folds to it, or no importer at all.
+///
+/// Control: `TsProject::source_changed` returns `None` on a first sighting.
+#[test]
+fn a_first_sighting_after_a_load_offers_every_address_whatever_the_importers() {
+    for (case, importer) in [
+        ("plain", Some("import { m } from \"./missing\";\n")),
+        ("split literal", Some("export const m = import(`./${'mis'}sing`);\n")),
+        ("no importer", None),
+    ] {
+        let mut files = vec![("src/missing.ts", "export const m = 1;\n")];
+        if let Some(importer) = importer {
+            files.push(("src/a.ts", importer));
+        }
+        let fixture = Fixture::new(&files);
+        let mut project = fixture.load();
+        assert_eq!(
+            source_changed(&mut project, "src/missing.ts", Some("export const m = 1;\n")),
+            Some(waiting_at(&["src/missing", "src/missing.js"])),
+            "{case}"
+        );
+    }
+}
+
+/// Only the first `fileChanged` of a path per model offers; a later edit
+/// offers nothing. Deletion (no source, or presence gone) forgets the path,
+/// so a re-creation offers again.
+///
+/// Controls: drop the `announced.insert` early return (the second call
+/// offers); drop `announced.remove` in the `None` branch (re-creation after a
+/// delete offers nothing).
+#[test]
+fn a_path_is_offered_once_per_model_until_it_is_deleted() {
+    let fixture = Fixture::new(&[("src/a.ts", "import { m } from \"./missing\";\n")]);
+    let mut project = fixture.load();
+    let offer = Some(waiting_at(&["src/missing", "src/missing.js"]));
+    let text = Some("export const m = 1;\n");
+
+    assert_eq!(source_changed(&mut project, "src/missing.ts", text), offer, "first sighting");
+    assert_eq!(source_changed(&mut project, "src/missing.ts", text), None, "an edit offers nothing");
+
+    assert_eq!(source_changed(&mut project, "src/missing.ts", None), None, "a deletion offers nothing");
+    assert_eq!(source_changed(&mut project, "src/missing.ts", text), offer, "re-created after a delete");
+
+    TypeScriptExtractor.file_presence_changed(&mut project, &RelPath::new("src/missing.ts"), false);
+    assert_eq!(source_changed(&mut project, "src/missing.ts", text), offer, "re-created after presence gone");
+}
+
+/// `src/missing/index.ts` answers `./missing` too, and a file no address can
+/// name besides its own path offers nothing.
+///
+/// Control: drop the `strip_suffix("/index")` insert in
+/// `addresses_resolving_to` (`src/missing` is not offered).
+#[test]
+fn a_directory_index_offers_its_directory() {
+    let fixture = Fixture::new(&[("src/a.ts", "import { m } from \"./missing\";\n")]);
+    let mut project = fixture.load();
+    assert_eq!(
+        source_changed(&mut project, "src/missing/index.ts", Some("export const m = 1;\n")),
+        Some(waiting_at(&["src/missing", "src/missing/index", "src/missing/index.js"]))
+    );
+}
+
+/// The addresses a file answers are only those whose resolver candidates
+/// include it, sorted: `./m.js` names `src/m.ts` (TS's ESM rule) but never
+/// `src/m.js.ts`, though stripping `.ts` from that path yields `src/m.js`.
+///
+/// Control: drop the `candidate_paths` filter in `addresses_resolving_to`'s
+/// `retain` (`src/m.js` is offered for `src/m.js.ts`).
+#[test]
+fn addresses_resolving_to_names_only_bases_whose_candidates_include_the_file() {
+    assert_eq!(addresses_resolving_to("src/m.ts"), vec!["src/m", "src/m.js"]);
+    assert_eq!(
+        addresses_resolving_to("src/m/index.tsx"),
+        vec!["src/m", "src/m/index", "src/m/index.js", "src/m/index.jsx"]
+    );
+    assert_eq!(addresses_resolving_to("src/m.js"), vec!["src/m"]);
+    assert!(addresses_resolving_to("src/m.d.ts").contains(&"src/m".to_string()));
+    assert_eq!(addresses_resolving_to("src/m.js.ts"), vec!["src/m.js.js"]);
+    assert!(addresses_resolving_to("README.md").is_empty());
 }

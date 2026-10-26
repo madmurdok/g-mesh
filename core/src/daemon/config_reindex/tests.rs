@@ -123,8 +123,12 @@ fn seeded() -> Connection {
 }
 
 fn select(conn: &Connection, files: &[PathScope], imports: &[ImportSelector]) -> Vec<String> {
-    let (selected, indexed) = select_affected(conn, "ts", files, imports).unwrap();
-    assert_eq!(indexed, TS_FILES.len(), "the language's indexed File nodes, and only its own");
+    let selected = select_affected(conn, "ts", files, imports).unwrap();
+    assert_eq!(
+        indexed_file_count(conn, "ts").unwrap(),
+        TS_FILES.len(),
+        "the language's indexed File nodes, and only its own"
+    );
     selected.into_iter().collect()
 }
 
@@ -226,6 +230,218 @@ fn file_scopes_and_import_selectors_are_one_union() {
             &[by_specifier(exact("@lib/e")), by_target(TargetScopeKind::File, exact("lib/e.ts"))]
         ),
         paths(&["app/a.ts", "lib/e.ts", "lib/f.ts"])
+    );
+}
+
+// -------------------------------------------------------------------------
+// select_affected: keyed lookup of exact targets vs the import scan
+// -------------------------------------------------------------------------
+
+/// `(import scans, file lists)` this thread has run so far.
+fn read_counts() -> (usize, usize) {
+    (reads::IMPORT_SCANS.with(std::cell::Cell::get), reads::FILE_LISTS.with(std::cell::Cell::get))
+}
+
+/// What [`scan_imports`] alone selects for the delta: the reference every
+/// keyed answer must equal.
+fn scanned(conn: &Connection, files: &[PathScope], imports: &[ImportSelector]) -> Vec<String> {
+    let mut selected: BTreeSet<String> = indexed_files_of(conn, "ts")
+        .unwrap()
+        .into_iter()
+        .filter(|path| files.iter().any(|scope| scope.contains(path)))
+        .collect();
+    let selectors: Vec<&ImportSelector> = imports.iter().collect();
+    scan_imports(conn, "ts", &selectors, &mut selected).unwrap();
+    selected.into_iter().collect()
+}
+
+fn scoped_target(importers: PathScope, scope_kind: TargetScopeKind, key: &str) -> ImportSelector {
+    ImportSelector { importers, by: ImportMatch::Target { scope_kind, matcher: exact(key) } }
+}
+
+/// `(what the case pins, file scopes, selectors, the expected selection)`
+/// for every delta made of `Target/Exact` selectors (and file scopes).
+#[allow(clippy::type_complexity)]
+fn exact_cases() -> Vec<(&'static str, Vec<PathScope>, Vec<ImportSelector>, Vec<String>)> {
+    use TargetScopeKind::{Container, File};
+    vec![
+        (
+            "file linked (no placeholder row); py's importer of the same file left out",
+            vec![],
+            vec![by_target(File, exact("lib/e.ts"))],
+            paths(&["app/a.ts", "lib/f.ts"]),
+        ),
+        ("file placeholder", vec![], vec![by_target(File, exact("lib/f.ts"))], paths(&["pkg/h.ts"])),
+        ("a container key is not a file target", vec![], vec![by_target(File, exact("pkg.subtle"))], vec![]),
+        ("container linked", vec![], vec![by_target(Container, exact("pkg.subtle"))], paths(&["appx/d.ts"])),
+        (
+            "container placeholder",
+            vec![],
+            vec![by_target(Container, exact("pkg.sub.mod"))],
+            paths(&["pkg/g.ts"]),
+        ),
+        ("container exact is not a prefix", vec![], vec![by_target(Container, exact("pkg.sub"))], vec![]),
+        (
+            "a file path is not a container target",
+            vec![],
+            vec![by_target(Container, exact("lib/e.ts"))],
+            vec![],
+        ),
+        (
+            "importer scope on a linked file",
+            vec![],
+            vec![scoped_target(scope("", &["app"]), File, "lib/e.ts")],
+            paths(&["lib/f.ts"]),
+        ),
+        (
+            "importer scope on a container placeholder, inside",
+            vec![],
+            vec![scoped_target(scope("pkg", &[]), Container, "pkg.sub.mod")],
+            paths(&["pkg/g.ts"]),
+        ),
+        (
+            "importer scope on a container placeholder, outside",
+            vec![],
+            vec![scoped_target(scope("app", &[]), Container, "pkg.sub.mod")],
+            vec![],
+        ),
+        (
+            "several exact selectors",
+            vec![],
+            vec![
+                by_target(File, exact("lib/e.ts")),
+                by_target(File, exact("lib/f.ts")),
+                by_target(Container, exact("pkg.subtle")),
+            ],
+            paths(&["app/a.ts", "appx/d.ts", "lib/f.ts", "pkg/h.ts"]),
+        ),
+        (
+            "union with a file scope",
+            vec![scope("lib", &[])],
+            vec![by_target(File, exact("lib/e.ts"))],
+            paths(&["app/a.ts", "lib/e.ts", "lib/f.ts"]),
+        ),
+    ]
+}
+
+/// A delta of only `Target/Exact` selectors is answered by the keyed lookup:
+/// no import scan runs, and the answer is exactly the scan's.
+///
+/// Controls: in `select_affected`, send every selector to `scanned` (a scan
+/// runs); drop either UNION half of `indexed_importers`' File or Container
+/// arm, or the `selector.importers.contains` filter (a case differs from the
+/// scan).
+#[test]
+fn an_exact_target_delta_runs_no_scan_and_selects_what_the_scan_does() {
+    let conn = seeded();
+    for (case, files, imports, expected) in exact_cases() {
+        let before = read_counts();
+        let selected: Vec<String> =
+            select_affected(&conn, "ts", &files, &imports).unwrap().into_iter().collect();
+        let after = read_counts();
+        assert_eq!(after.0, before.0, "{case}: an exact-only delta ran an import scan");
+        assert_eq!(
+            selected,
+            scanned(&conn, &files, &imports),
+            "{case}: the keyed answer differs from the scan"
+        );
+        assert_eq!(selected, expected, "{case}");
+    }
+}
+
+/// Any other selector (`Specifier`, `Target` with `Under`, `StartsWith` or
+/// `NonRelative`) is answered by the scan, once per call however many there
+/// are, mixed with exact ones or not; the union is still the scan's.
+///
+/// Control: in `select_affected`, drop the `if !scanned.is_empty()` guard
+/// (the exact-only delta scans once).
+#[test]
+fn non_exact_selectors_share_one_scan_and_exact_only_runs_none() {
+    use TargetScopeKind::{Container, File};
+    let conn = seeded();
+    let mixed = vec![
+        by_specifier(exact("@lib/e")),
+        by_specifier(Matcher::StartsWith("../".to_string())),
+        by_target(Container, under("pkg.sub", ".")),
+        by_target(File, Matcher::NonRelative),
+        by_target(Container, exact("pkg.subtle")),
+        by_target(File, exact("lib/f.ts")),
+    ];
+    for (case, imports, scans) in [
+        ("one specifier selector", vec![by_specifier(exact("@lib/e"))], 1),
+        ("one container Under selector", vec![by_target(Container, under("pkg.sub", "."))], 1),
+        ("mixed exact and non-exact", mixed, 1),
+        (
+            "exact only",
+            vec![by_target(File, exact("lib/e.ts")), by_target(Container, exact("pkg.subtle"))],
+            0,
+        ),
+    ] {
+        let before = read_counts();
+        let selected: Vec<String> =
+            select_affected(&conn, "ts", &[], &imports).unwrap().into_iter().collect();
+        let after = read_counts();
+        assert_eq!(after.0 - before.0, scans, "{case}: import scans");
+        assert_eq!(selected, scanned(&conn, &[], &imports), "{case}");
+    }
+}
+
+/// The language's file list is read only for a delta with file scopes: an
+/// imports-only delta lists no files, whatever it selects.
+///
+/// Control: in `select_affected`, drop the `if !files.is_empty()` guard.
+#[test]
+fn an_imports_only_delta_never_lists_files() {
+    let conn = seeded();
+    for imports in [
+        vec![],
+        vec![by_target(TargetScopeKind::File, exact("nowhere.ts"))],
+        vec![by_target(TargetScopeKind::File, exact("lib/e.ts"))],
+        vec![by_specifier(exact("@lib/e"))],
+    ] {
+        let before = read_counts();
+        select_affected(&conn, "ts", &[], &imports).unwrap();
+        assert_eq!(read_counts().1, before.1, "{imports:?} listed the language's files");
+    }
+    let before = read_counts();
+    select_affected(&conn, "ts", &[scope("lib", &[])], &[]).unwrap();
+    assert_eq!(read_counts().1 - before.1, 1, "a file scope lists the files once");
+}
+
+/// `select` counts the language's files only once something is selected: a
+/// delta that selects nothing, or only its own trigger, reads no file list at
+/// all. The count still includes the trigger while the selection leaves it
+/// out (3 of 8 is too many; the same 3 less the trigger is 2 of 8, not 2 of 7).
+///
+/// Control: in `select`, move `indexed_file_count` above the `is_empty`
+/// return (`Nothing` reads one list).
+#[test]
+fn select_counts_the_files_only_after_a_non_empty_selection() {
+    let conn = seeded();
+    let waiting_at = |key: &str| vec![by_target(TargetScopeKind::File, exact(key))];
+
+    for (case, imports, trigger) in [
+        ("selects nothing", waiting_at("nowhere.ts"), None),
+        ("selects only its trigger", waiting_at("lib/f.ts"), Some("pkg/h.ts")),
+    ] {
+        let before = read_counts();
+        let selection = super::select(&conn, "ts", &[], &imports, trigger).unwrap();
+        assert!(matches!(selection, Selection::Nothing), "{case}: {selection:?}");
+        assert_eq!(read_counts(), before, "{case}: no scan and no file list");
+    }
+
+    let before = read_counts();
+    let selection = super::select(&conn, "ts", &[], &waiting_at("lib/f.ts"), None).unwrap();
+    assert!(matches!(&selection, Selection::Files(files) if files.iter().eq(["pkg/h.ts"])), "{selection:?}");
+    assert_eq!(read_counts(), (before.0, before.1 + 1), "one count, no scan");
+
+    let app = [scope("app", &[])];
+    let selection = super::select(&conn, "ts", &app, &[], None).unwrap();
+    assert!(matches!(selection, Selection::TooMany(_)), "3 of 8 files: {selection:?}");
+    let selection = super::select(&conn, "ts", &app, &[], Some("app/a.ts")).unwrap();
+    assert!(
+        matches!(&selection, Selection::Files(files) if files.iter().eq(["app/b.ts", "app/sub/c.ts"])),
+        "2 of 8 files: {selection:?}"
     );
 }
 
