@@ -7,6 +7,7 @@
 //! sections 3.3 and 3.6. Selection is evaluated here with the wire's own
 //! `PathScope::contains` and `Matcher::matches`, the predicates core applies.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,7 +19,7 @@ use g_mesh_plugin_sdk::wire::{
 use g_mesh_plugin_sdk::{Extractor, RelPath};
 use g_mesh_plugin_typescript::extractor::TypeScriptExtractor;
 use g_mesh_plugin_typescript::project::facts::TsFacts;
-use g_mesh_plugin_typescript::project::resolve::addresses_resolving_to;
+use g_mesh_plugin_typescript::project::resolve::{addresses_resolving_to, candidates_shadowed_by};
 use g_mesh_plugin_typescript::project::TsProject;
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -504,4 +505,125 @@ fn addresses_resolving_to_names_only_bases_whose_candidates_include_the_file() {
     assert!(addresses_resolving_to("src/m.d.ts").contains(&"src/m".to_string()));
     assert_eq!(addresses_resolving_to("src/m.js.ts"), vec!["src/m.js.js"]);
     assert!(addresses_resolving_to("README.md").is_empty());
+}
+
+// -------------------------------------------------------------------------
+// source_changed: a created file offers the candidate it shadows
+// -------------------------------------------------------------------------
+
+fn existing(paths: &[&str]) -> BTreeSet<RelPath> {
+    paths.iter().map(RelPath::new).collect()
+}
+
+/// Per address of the created file, only the candidate that answered it
+/// before: the first existing one after the file in the resolver's order.
+/// `src/m.tsx` comes before `src/m/index.ts` for `./m`, so with both present
+/// only `src/m.tsx` is named; with `src/m.tsx` absent, `src/m/index.ts` is.
+///
+/// Control: collect every existing candidate after the file (`.filter`
+/// instead of `.find` in `candidates_shadowed_by`): `src/m/index.ts` is
+/// named beside `src/m.tsx`.
+#[test]
+fn only_the_previous_winner_of_an_address_is_named() {
+    assert_eq!(
+        candidates_shadowed_by("src/m.ts", &existing(&["src/m.ts", "src/m.tsx", "src/m/index.ts"])),
+        vec!["src/m.tsx"]
+    );
+    assert_eq!(
+        candidates_shadowed_by("src/m.ts", &existing(&["src/m.ts", "src/m/index.ts"])),
+        vec!["src/m/index.ts"]
+    );
+    assert_eq!(candidates_shadowed_by("src/m.ts", &existing(&["src/m.ts", "src/m.js"])), vec!["src/m.js"]);
+    assert!(candidates_shadowed_by("src/m.ts", &existing(&["src/m.ts", "src/other.ts"])).is_empty());
+}
+
+/// The created file is in the existence set it is asked against (the
+/// plugin applies presence first) and is never named as its own previous
+/// winner, nor is a candidate before it: `src/m.tsx` still wins `./m` over a
+/// created `src/m/index.ts`, so nothing moved.
+///
+/// Controls: start the search at the file (`candidates[at..]`): `src/m.ts`
+/// names itself; search the whole list (`candidates.iter()`): `src/m.tsx`
+/// is named for `src/m/index.ts`.
+#[test]
+fn neither_the_file_itself_nor_an_earlier_candidate_is_named() {
+    assert!(candidates_shadowed_by("src/m.ts", &existing(&["src/m.ts"])).is_empty());
+    assert!(candidates_shadowed_by("src/m/index.ts", &existing(&["src/m/index.ts", "src/m.tsx"])).is_empty());
+}
+
+/// A directory index shadows the later index candidates of each of its
+/// addresses (`./m`, `./m/index`, `./m/index.js`).
+#[test]
+fn a_directory_index_names_the_index_it_shadows() {
+    assert_eq!(
+        candidates_shadowed_by("src/m/index.ts", &existing(&["src/m/index.ts", "src/m/index.tsx"])),
+        vec!["src/m/index.tsx"]
+    );
+}
+
+/// A JS-extension address is walked in its substitution order: `./m.mjs`
+/// tries `src/m.mts`, `src/m.d.mts`, `src/m.mjs`, so a created `src/m.mts`
+/// shadows `src/m.d.mts` there, a file `./m` never tries, while `./m` moves
+/// off `src/m/index.ts`. Both are named, sorted.
+///
+/// Control: skip the addresses carrying a JS extension in
+/// `candidates_shadowed_by` (only `src/m/index.ts` is named).
+#[test]
+fn a_js_extension_address_names_its_substitution_winner() {
+    assert_eq!(
+        candidates_shadowed_by("src/m.mts", &existing(&["src/m.mts", "src/m.d.mts", "src/m/index.ts"])),
+        vec!["src/m.d.mts", "src/m/index.ts"]
+    );
+}
+
+/// A created file's first `fileChanged` offers its addresses plus the path
+/// of the candidate it shadows, so core selects the importers linked there:
+/// `src/m.ts` beside `src/m/index.ts` offers `src/m/index.ts`, `src/m.ts`
+/// beside `src/m.tsx` offers `src/m.tsx`.
+///
+/// Control: drop the `keys.extend(resolve::candidates_shadowed_by(..))`
+/// line in `TsProject::source_changed` (only the addresses are offered).
+#[test]
+fn a_first_sighting_offers_the_candidate_it_shadows() {
+    for (lower, offered) in [
+        ("src/m/index.ts", ["src/m", "src/m.js", "src/m/index.ts"]),
+        ("src/m.tsx", ["src/m", "src/m.js", "src/m.tsx"]),
+    ] {
+        let fixture = Fixture::new(&[
+            (lower, "export const m = 1;\n"),
+            ("src/m.ts", "export const m = 2;\n"),
+            ("src/a.ts", "import { m } from \"./m\";\n"),
+        ]);
+        let mut project = fixture.load();
+        assert_eq!(
+            source_changed(&mut project, "src/m.ts", Some("export const m = 2;\n")),
+            Some(waiting_at(&offered)),
+            "{lower}"
+        );
+    }
+}
+
+/// Two candidates created in one batch (the existence set already holds
+/// both): the higher one names the lower new one, the lower new one names
+/// the old winner, so between them the importers linked to the old winner
+/// are selected whichever is announced first.
+///
+/// Control: the `keys.extend` revert above (neither offer names
+/// `src/m/index.ts`).
+#[test]
+fn a_batch_of_two_candidates_offers_the_old_winner() {
+    let fixture = Fixture::new(&[
+        ("src/m/index.ts", "export const m = 1;\n"),
+        ("src/m.ts", "export const m = 2;\n"),
+        ("src/m.tsx", "export const m = 3;\n"),
+    ]);
+    let mut project = fixture.load();
+    assert_eq!(
+        source_changed(&mut project, "src/m.ts", Some("export const m = 2;\n")),
+        Some(waiting_at(&["src/m", "src/m.js", "src/m.tsx"]))
+    );
+    assert_eq!(
+        source_changed(&mut project, "src/m.tsx", Some("export const m = 3;\n")),
+        Some(waiting_at(&["src/m", "src/m.js", "src/m.jsx", "src/m/index.ts"]))
+    );
 }
