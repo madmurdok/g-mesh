@@ -126,6 +126,9 @@ pub fn open(root: &Path) -> Result<Connection> {
         .with_context(|| format!("failed to open SQLite database at {}", db_path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL").context("failed to enable WAL mode")?;
     conn.pragma_update(None, "foreign_keys", "OFF").context("failed to disable foreign-key enforcement")?;
+    // A Writer step runs its units as savepoints inside one transaction; with
+    // file temp storage each step's statement journal spills to a temp file.
+    conn.pragma_update(None, "temp_store", "MEMORY").context("failed to keep temp storage in memory")?;
     Ok(conn)
 }
 
@@ -174,6 +177,17 @@ mod tests {
 
         let enforced: i64 = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0)).unwrap();
         assert_eq!(enforced, 0, "the daemon's index connection must not enforce foreign keys");
+    }
+
+    /// `temp_store = MEMORY` is 2. Asked of the connection, so a build define
+    /// that forces file temp storage would show here too.
+    #[test]
+    fn opens_database_with_temp_storage_in_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open(tmp.path()).unwrap();
+
+        let temp_store: i64 = conn.pragma_query_value(None, "temp_store", |row| row.get(0)).unwrap();
+        assert_eq!(temp_store, 2, "savepoint journals of a Writer step must not spill to temp files");
     }
 
     /// Opening an index is the moment a state directory learns which project

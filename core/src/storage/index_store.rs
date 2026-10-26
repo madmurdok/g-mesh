@@ -1078,8 +1078,8 @@ mod tests {
         store.unclaimed.lock().unwrap().insert("typescript".to_string(), HashSet::from([EXTRA.to_string()]));
     }
 
-    /// A link failure inside the step still commits the applied diff, as
-    /// three separate commits did: the new function is there and the calls
+    /// A link failure inside the step still commits the applied diff: the
+    /// new function is there and the calls
     /// stay on their placeholders. The error is returned and nothing is
     /// claimed; the connection is back in autocommit.
     ///
