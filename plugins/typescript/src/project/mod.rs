@@ -163,6 +163,12 @@ impl TsProject {
     /// a re-extract against the updated existence set resolves, in the
     /// resolver's own candidate order.
     ///
+    /// An import already linked to a lower-priority candidate of one of those
+    /// addresses is offered too, keyed by that candidate's path
+    /// ([`resolve::candidates_shadowed_by`]): core's linked lookup selects
+    /// its importer, whose re-extract moves `./m` from `src/m/index.ts` or
+    /// `src/m.tsx` onto a new `src/m.ts`.
+    ///
     /// Once per path per model (`announced`), so an ordinary edit costs core
     /// no import scan; `None` (gone) forgets the path, so a re-creation is
     /// offered again. `None` when no address can name `path`.
@@ -174,7 +180,9 @@ impl TsProject {
         if !self.announced.insert(path.clone()) {
             return None;
         }
-        let imports: Vec<ImportSelector> = resolve::addresses_resolving_to(path.as_str())
+        let mut keys: BTreeSet<String> = resolve::addresses_resolving_to(path.as_str()).into_iter().collect();
+        keys.extend(resolve::candidates_shadowed_by(path.as_str(), &self.existence));
+        let imports: Vec<ImportSelector> = keys
             .into_iter()
             .map(|address| ImportSelector {
                 importers: PathScope { under: String::new(), not_under: Vec::new() },

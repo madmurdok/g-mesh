@@ -2,12 +2,15 @@
 //! is created, by re-extracting only its importer, through the real
 //! TypeScript plugin: `./missing` once `src/missing.ts` or
 //! `src/missing/index.ts` appears, `./m.js` re-pointed from `src/m.js` to a
-//! created `src/m.ts`, and a split literal the extractor folds to
-//! `./missing`, after a plugin restart.
+//! created `src/m.ts`, `./missing` re-pointed from `src/missing/index.ts`
+//! and `./m` from `src/m.tsx` to a created higher-priority candidate, while
+//! an import naming the lower candidate explicitly stays on it, and a split
+//! literal the extractor folds to `./missing`, after a plugin restart.
 //!
 //! The plugin answers the created file's first `fileChanged` with the
-//! addresses that file answers; core looks up the importers stored as
-//! pointing at them and re-extracts those.
+//! addresses that file answers, plus the candidate each address resolved to
+//! before; core looks up the importers stored as pointing at them and
+//! re-extracts those.
 //!
 //! How a re-extract is seen: after the index is built every `.ts` file is
 //! rewritten on disk to declare `mark_v2` instead of `mark_v1`, and none of
@@ -17,7 +20,10 @@
 //!
 //! Controls: `TsProject::source_changed` returns `None` (the import stays
 //! where it was); the linked half of `indexed_importers`' File arm deleted
-//! (`./m.js` stays on `src/m.js`).
+//! (`./m.js` stays on `src/m.js`); the `candidates_shadowed_by` keys dropped
+//! from `TsProject::source_changed` (`./missing` stays on
+//! `src/missing/index.ts`, `./m` on `src/m.tsx`, and the explicit importers
+//! are not re-extracted).
 
 #![cfg(unix)]
 
@@ -127,4 +133,53 @@ fn a_split_literal_import_links_when_its_file_is_created_across_a_restart() {
 
     assert_eq!(harness.imports("src/a.ts"), (vec!["src/missing.ts:missing.ts".to_string()], Vec::new()));
     assert_only_the_importer_re_extracted(&harness);
+}
+
+/// `./missing` linked to `src/missing/index.ts` moves to a created
+/// `src/missing.ts`, which comes first among its candidates.
+#[test]
+fn an_import_linked_to_the_directory_index_moves_to_a_created_ts_file() {
+    let harness = indexed("import { mark_v1 } from \"./missing\";\n", &["src/missing/index.ts"]);
+    assert_eq!(
+        harness.imports("src/a.ts").0,
+        vec!["src/missing/index.ts:index.ts".to_string()],
+        "linked to src/missing/index.ts"
+    );
+
+    create(&harness, "src/missing.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["src/missing.ts:missing.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// `./m` linked to `src/m.tsx` moves to a created `src/m.ts`.
+#[test]
+fn an_import_linked_to_the_tsx_file_moves_to_a_created_ts_file() {
+    let harness = indexed("import { mark_v1 } from \"./m\";\n", &["src/m.tsx"]);
+    assert_eq!(harness.imports("src/a.ts").0, vec!["src/m.tsx:m.tsx".to_string()], "linked to src/m.tsx");
+
+    create(&harness, "src/m.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["src/m.ts:m.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// An import naming the lower candidate itself (`./m.tsx`, `./m/index`) is
+/// selected by that candidate's path like any importer linked there, and
+/// its re-extract keeps it where it was: `src/m.ts` is not among its
+/// candidates.
+#[test]
+fn an_import_naming_the_lower_candidate_explicitly_stays_on_it() {
+    for (import, lower, link) in [
+        ("import { mark_v1 } from \"./m.tsx\";\n", "src/m.tsx", "src/m.tsx:m.tsx"),
+        ("import { mark_v1 } from \"./m/index\";\n", "src/m/index.ts", "src/m/index.ts:index.ts"),
+    ] {
+        let harness = indexed(import, &[lower]);
+        assert_eq!(harness.imports("src/a.ts").0, vec![link.to_string()], "{import} linked to {lower}");
+
+        create(&harness, "src/m.ts");
+
+        assert_eq!(harness.imports("src/a.ts"), (vec![link.to_string()], Vec::new()), "{import}");
+        assert_only_the_importer_re_extracted(&harness);
+    }
 }

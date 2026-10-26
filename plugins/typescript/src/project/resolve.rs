@@ -143,6 +143,31 @@ pub fn addresses_resolving_to(path: &str) -> Vec<String> {
     bases.into_iter().collect()
 }
 
+/// For each address of `path` ([`addresses_resolving_to`]), the candidate
+/// that answered it before `path` existed: the first candidate after `path`
+/// in [`candidate_paths`]' order that is in `existence`, sorted and deduplicated.
+/// An import linked there, by any specifier kind, now resolves to `path`
+/// instead (`./m` on `src/m.tsx` or `src/m/index.ts` once `src/m.ts`
+/// exists). Only the previous winner is named: a candidate further down
+/// never answered that address, and `path` itself or an earlier candidate
+/// still wins over it. Which file wins stays the resolver's, on re-extract.
+pub fn candidates_shadowed_by(path: &str, existence: &BTreeSet<RelPath>) -> Vec<String> {
+    let mut shadowed: BTreeSet<String> = BTreeSet::new();
+    for address in addresses_resolving_to(path) {
+        let candidates = candidate_paths(&address);
+        let Some(at) = candidates.iter().position(|candidate| candidate == path) else {
+            continue;
+        };
+        if let Some(previous) = candidates[at + 1..]
+            .iter()
+            .find(|candidate| existence.contains(&RelPath::new(candidate.as_str())))
+        {
+            shadowed.insert(previous.clone());
+        }
+    }
+    shadowed.into_iter().collect()
+}
+
 /// The project-relative path a relative specifier written in `from` names,
 /// before any extension or `index` candidate is tried (`./missing` in
 /// `src/a.ts` -> `src/missing`); `None` for a non-relative one. Pure path
