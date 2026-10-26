@@ -234,7 +234,7 @@ fn file_scopes_and_import_selectors_are_one_union() {
 }
 
 // -------------------------------------------------------------------------
-// select_affected: keyed lookup of exact targets vs the import scan (GM-655)
+// select_affected: keyed lookup of exact targets vs the import scan
 // -------------------------------------------------------------------------
 
 /// `(import scans, file lists)` this thread has run so far.
