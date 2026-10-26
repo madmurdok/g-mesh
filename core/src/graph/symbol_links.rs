@@ -1300,7 +1300,7 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
         return Ok(summary);
     }
 
-    let tx = conn.transaction().context("failed to start the symbol-linking transaction")?;
+    let tx = conn.savepoint().context("failed to start the symbol-linking savepoint")?;
     let untargeted_reexports;
     {
         // The (kind, source) groups still on the placeholder, and those it
@@ -1377,7 +1377,7 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
         }
         untargeted_reexports = resolver.untargeted_reexports.len();
     }
-    tx.commit().context("failed to commit the symbol-linking transaction")?;
+    tx.commit().context("failed to commit the symbol-linking savepoint")?;
 
     report_untargeted(untargeted, untargeted_reexports);
     Ok(summary)
