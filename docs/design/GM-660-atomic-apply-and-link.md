@@ -355,3 +355,95 @@ sites in `write.rs`, `imports.rs`, `symbol_links.rs`; `Connection::open`
 and `connection::open` across `core/src` (to find every index connection);
 `Transaction` in `write.rs`; rusqlite 0.31 `transaction.rs` for
 `Savepoint`'s drop behaviour.
+
+## 6. Write cost diagnosis
+
+The verify measurement showed the one-commit write about 16% slower per call,
+with system time doubled even though it makes fewer commits. The cause is
+SQLite's statement sub-journal, which it writes to a temporary file.
+
+### Setup
+
+The scratch harness from verify (kept outside the repo) times 1600
+`apply_file_diff_linked` calls: 400 files x 4 saves, 15 functions per file,
+3 calls each onto pending placeholders, `FileScope::Complete`. The index is a
+file-backed WAL database with foreign keys off, the same pragmas as
+`connection::open`. Two new probes were added to the harness, not to the
+product: a VFS shim that counts `xOpen` by file kind, and
+`sqlite3_db_status`. The old arm is release-4.19.0 at `0a32898`; the new arm
+is this branch. Both are release builds. There were 3 pairs per variant, run
+in alternating order (old/new, new/old, old/new), with `/usr/bin/time -l` for
+each run. Load average ranged from 11 to 94 over the 13-minute run. The
+machine is shared, so the absolute numbers are inflated, but the alternating
+order cancels drift.
+
+Pragmas in effect (both arms): `synchronous=FULL`, `journal_mode=wal`,
+`wal_autocheckpoint=1000`, `cache_size=-2000`, `mmap_size=0`,
+`temp_store=DEFAULT` (the bundled build sets no `SQLITE_TEMP_STORE`, so
+temporary files go to disk), `cache_spill=483`.
+
+### Results
+
+| variant | arm | median ms (p1/p2/p3) | sys s | user s | sub-journal opens | pages written (`CACHE_WRITE`) |
+|---|---|---|---|---|---|---|
+| default | old | 39.7 / 30.9 / 29.7 | 13.6 / 10.6 / 10.7 | 35-45 | 0 | 310 495 |
+| default | new | 47.8 / 39.3 / 44.3 | 26.1 / 21.8 / 23.6 | 36-43 | **1600** | 264 460 |
+| `temp_store=MEMORY` | old | 32.2 / 33.0 / 31.9 | 11.3 / 11.3 / 10.9 | 35-38 | 0 | 310 495 |
+| `temp_store=MEMORY` | new | 31.1 / 34.0 / 34.2 | 9.2 / 9.8 / 9.7 | 38-40 | 0 | 264 460 |
+
+The dry-run pair agrees (old 38.3 ms and 12.8 s sys; new 55.1 ms and
+28.8 s sys). Other counters:
+- Page faults and block I/O were 0 in every run.
+- WAL size was the same in both arms (max 4.93 MB old, 4.94 MB new). The WAL
+  is never truncated, so checkpoints do not show in its size.
+- No spills from the page cache (`CACHE_SPILL` 0).
+- The new arm has about 10 000 fewer voluntary context switches (about 68k
+  against 78k). That fits one commit and one WAL sync per call instead of
+  three.
+- Peak RSS is 10-11 MB, or 15-16 MB for the new arm with `MEMORY`.
+
+### Cause
+
+Inside the outer `BEGIN`, each inner unit is now a `SAVEPOINT`. A savepoint
+nested in an open transaction makes SQLite copy every page the unit changes
+for the first time into a statement sub-journal, so that this unit alone can
+be rolled back. Before this change each unit was its own transaction, so
+rollback used the WAL and no sub-journal was written. The sub-journal is kept
+in memory until it reaches `SQLITE_STMTJRNL_SPILL` (64 KiB). Past that it
+moves to a temporary file in `$TMPDIR` that is created, unlinked, written and
+closed again for every write transaction. The counting shim shows exactly
+1600 sub-journal opens in the new arm, one per call, and none in the old arm.
+That is about 12 s of extra system time, roughly 7.5 ms per call under this
+load. The commit itself is cheaper: 15% fewer pages written and fewer
+syncs. The file churn outweighs that saving.
+
+### Recommendation: cheap fix, `PRAGMA temp_store = MEMORY` in `connection::open`
+
+The pragma keeps the sub-journal in memory. With it the new arm has no file
+opens. Its system time falls below the old arm's (9.5 s against 11.2 s on
+average), and its median per call is within noise of the old arm (+2% on the
+pair averages, 33.1 against 32.4 ms; the pairs go -1.1, +1.0 and +2.3 ms). It
+removes the whole regression. The old arm itself also gains about 0.5 s of
+system time under the pragma.
+
+The pragma does more than move the sub-journal:
+- Every temporary structure on this connection moves to RAM: sorter spills,
+  temporary indexes for `ORDER BY`/`GROUP BY`/`DISTINCT` without an index,
+  `CREATE TEMP TABLE`, and VACUUM's temporary database. The production code
+  has no VACUUM and no temporary tables (the one `CREATE TEMP TABLE` is in a
+  test). A very large sort or rebuild would now use memory instead of disk.
+- Sub-journal memory is bounded by the pages one Writer step touches. That
+  was about 5 MB of peak RSS here. A large single-file diff costs
+  proportionally more, and only for the length of that commit.
+- The pragma is per connection, so it must be set wherever a writing
+  connection is opened (`connection::open`). The staging connection already
+  keeps its rollback journal in memory.
+
+An alternative that changes nothing at run time is to rebuild the bundled
+SQLite with a larger `-DSQLITE_STMTJRNL_SPILL` (via `LIBSQLITE3_FLAGS`). That
+is a build-wide setting, harder to see, and still spills past its threshold.
+It is not recommended over the pragma.
+
+If the fix were declined: the cost without it is about +10 ms median and
++7.5 ms system time per file save at this machine's load (about +30% per
+call). It hits every caller listed in section 1 (watcher save, query-time reindex, language purge).
