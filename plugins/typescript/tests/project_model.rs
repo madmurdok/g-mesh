@@ -307,6 +307,59 @@ fn a_specifier_naming_the_root_itself_resolves_to_the_root_index() {
     assert_eq!(resolve(&project, "..", "src/deep/b.ts"), some("src/index.ts"));
 }
 
+/// The root has no file form (`.ts` beside the project), so only its index
+/// files are candidates, in TS's extension order: `index.tsx` alone answers
+/// `..`, `index.ts` wins over it, and a declaration or JS index answers
+/// when it is the only one.
+#[test]
+fn the_root_index_follows_the_ts_extension_order() {
+    let expected: Vec<String> = EXTENSIONS.iter().map(|extension| format!("index{extension}")).collect();
+    assert_eq!(candidate_paths("."), expected);
+    for (present, winner) in [
+        (&["index.tsx"][..], "index.tsx"),
+        (&["index.tsx", "index.ts"][..], "index.ts"),
+        (&["index.js", "index.d.ts"][..], "index.d.ts"),
+        (&["index.mjs"][..], "index.mjs"),
+    ] {
+        let mut files: Vec<(&str, &str)> = present.iter().map(|path| (*path, SRC)).collect();
+        files.extend([("main.ts", SRC), ("src/a.ts", SRC)]);
+        let fx = Fixture::new(&files);
+        let project = fx.load();
+        assert_eq!(resolve(&project, "..", "src/a.ts"), some(winner), "{present:?}");
+        assert_eq!(resolve(&project, ".", "main.ts"), some(winner), "{present:?}");
+    }
+}
+
+/// The root index is looked up in the live existence set: an `index.ts`
+/// created later answers a `..` that named nothing, shadows an existing
+/// `index.tsx`, and once deleted leaves `..` on `index.tsx` again.
+#[test]
+fn the_root_index_follows_presence() {
+    let fx = Fixture::new(&[("src/a.ts", SRC)]);
+    let mut project = fx.load();
+    assert_eq!(resolve(&project, "..", "src/a.ts"), None, "no root index yet");
+    project.file_presence_changed(&rel("index.tsx"), true);
+    assert_eq!(resolve(&project, "..", "src/a.ts"), some("index.tsx"));
+    project.file_presence_changed(&rel("index.ts"), true);
+    assert_eq!(resolve(&project, "..", "src/a.ts"), some("index.ts"), "index.ts shadows index.tsx");
+    project.file_presence_changed(&rel("index.ts"), false);
+    assert_eq!(resolve(&project, "..", "src/a.ts"), some("index.tsx"), "falls back once index.ts is gone");
+}
+
+/// Climbing above the root is refused by the path, not by the absence of a
+/// file there: a path above the root the model were told of is still not
+/// named by `..` from a root file.
+#[test]
+fn a_specifier_climbing_above_the_root_is_refused_whatever_exists() {
+    let fx = Fixture::new(&[("main.ts", SRC), ("src/a.ts", SRC)]);
+    let mut project = fx.load();
+    project.file_presence_changed(&rel("../index.ts"), true);
+    project.file_presence_changed(&rel("../x.ts"), true);
+    assert_eq!(resolve(&project, "..", "main.ts"), None);
+    assert_eq!(resolve(&project, "../x", "main.ts"), None);
+    assert_eq!(resolve(&project, "../..", "src/a.ts"), None);
+}
+
 #[test]
 fn an_absolute_importer_path_resolves_nothing() {
     let fx = Fixture::new(&[("abs/a.ts", SRC), ("abs/b.ts", SRC)]);
