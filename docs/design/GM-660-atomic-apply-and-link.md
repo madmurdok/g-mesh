@@ -206,6 +206,9 @@ already on `lib.ts#parse`. **Consequence:**
   disk full) does the outer `ROLLBACK` drop the applied diff too, where today
   commit 1 might already have landed; that is a failure of the write itself,
   reported as an error, after which the file's next save re-sends it.
+  The same holds if SQLite itself rolls back the whole transaction during
+  linking (`SQLITE_FULL`, `SQLITE_IOERR`, `SQLITE_NOMEM`): the applied diff
+  is lost too, nothing is written, and `claim` is not called.
 - *Panic inside the step:* the store mutex is poisoned and the daemon's
   store is never used again (`a_poisoned_store_stays_poisoned`), so an open
   outer transaction is moot; same as an inner panic today.
