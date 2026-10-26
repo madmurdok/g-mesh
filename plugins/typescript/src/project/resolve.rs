@@ -114,6 +114,35 @@ pub fn resolve_relative(project: &TsProject, specifier: &str, from: &RelPath) ->
     first_existing(&project.existence, [base])
 }
 
+/// Every address other than `path` itself whose candidates
+/// ([`candidate_paths`]) include `path`, sorted: the bases an unresolved
+/// relative import may be waiting at ([`relative_address`]) that the new
+/// file `path` can answer. `src/missing.ts` -> `src/missing` (and
+/// `src/missing.js`, through [`TS_SUBSTITUTIONS`]); `src/missing/index.ts`
+/// -> `src/missing` too. Which existing candidate wins is still the
+/// resolver's, on re-extract; this only names who to ask.
+pub fn addresses_resolving_to(path: &str) -> Vec<String> {
+    let mut bases: BTreeSet<String> = BTreeSet::new();
+    for extension in EXTENSIONS {
+        if let Some(stem) = path.strip_suffix(extension) {
+            bases.insert(stem.to_string());
+            if let Some(dir) = stem.strip_suffix("/index") {
+                bases.insert(dir.to_string());
+            }
+        }
+    }
+    for (js_extension, substitutions) in TS_SUBSTITUTIONS {
+        for substitution in substitutions {
+            if let Some(stem) = path.strip_suffix(substitution) {
+                bases.insert(format!("{stem}{js_extension}"));
+            }
+        }
+    }
+    bases.remove(path);
+    bases.retain(|base| !base.is_empty() && candidate_paths(base).iter().any(|candidate| candidate == path));
+    bases.into_iter().collect()
+}
+
 /// The project-relative path a relative specifier written in `from` names,
 /// before any extension or `index` candidate is tried (`./missing` in
 /// `src/a.ts` -> `src/missing`); `None` for a non-relative one. Pure path

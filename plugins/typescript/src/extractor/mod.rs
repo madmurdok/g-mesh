@@ -86,6 +86,17 @@ impl Extractor for TypeScriptExtractor {
         project.file_presence_changed(path, present);
     }
 
+    /// Names the importers a created file may resolve an unlinked relative
+    /// import of (`./missing` once `src/missing.ts` exists).
+    fn source_changed(
+        &self,
+        project: &mut TsProject,
+        path: &RelPath,
+        source: Option<&str>,
+    ) -> Option<ResolutionDelta> {
+        project.source_changed(path, source)
+    }
+
     /// The packages, tsconfig `paths` and `imports` maps resolution reads.
     fn resolution_facts(&self, project: &TsProject) -> Option<String> {
         Some(TsFacts::of(project).encode())

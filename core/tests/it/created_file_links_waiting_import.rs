@@ -1,0 +1,130 @@
+//! A relative TS import whose file does not exist yet links once that file
+//! is created, by re-extracting only its importer, through the real
+//! TypeScript plugin: `./missing` once `src/missing.ts` or
+//! `src/missing/index.ts` appears, `./m.js` re-pointed from `src/m.js` to a
+//! created `src/m.ts`, and a split literal the extractor folds to
+//! `./missing`, after a plugin restart.
+//!
+//! The plugin answers the created file's first `fileChanged` with the
+//! addresses that file answers; core looks up the importers stored as
+//! pointing at them and re-extracts those.
+//!
+//! How a re-extract is seen: after the index is built every `.ts` file is
+//! rewritten on disk to declare `mark_v2` instead of `mark_v1`, and none of
+//! those edits is routed. A re-extracted (or reindexed) file shows `mark_v2`.
+//! Six filler files keep the one importer under core's 30% whole-language
+//! fallback, which would link the import too.
+//!
+//! Controls: `TsProject::source_changed` returns `None` (the import stays
+//! where it was); the linked half of `indexed_importers`' File arm deleted
+//! (`./m.js` stays on `src/m.js`).
+
+#![cfg(unix)]
+
+use crate::typescript_registry::Harness;
+
+const FILLERS: [&str; 6] = ["src/n1.ts", "src/n2.ts", "src/n3.ts", "src/n4.ts", "src/n5.ts", "src/n6.ts"];
+
+fn source(import: &str, mark: &str) -> String {
+    format!("{import}export function {mark}() {{\n  return 1;\n}}\n")
+}
+
+/// The files whose indexed `Function` nodes include `mark`, sorted.
+fn marked(mark: &str, harness: &Harness) -> Vec<String> {
+    harness.conn.with(|c| {
+        let mut statement = c
+            .prepare("SELECT DISTINCT filePath FROM nodes WHERE name = ?1 AND kind = 'Function' ORDER BY 1")
+            .unwrap();
+        statement
+            .query_map([mark], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    })
+}
+
+/// Indexes the fillers, `extra` and `src/a.ts` (written with `import`), one
+/// route each, then rewrites every one of them to `mark_v2` unrouted.
+fn indexed(import: &str, extra: &[&str]) -> Harness {
+    let harness = Harness::new();
+    let mut files: Vec<(&str, &str)> = FILLERS.iter().map(|path| (*path, "")).collect();
+    files.extend(extra.iter().map(|path| (*path, "")));
+    files.push(("src/a.ts", import));
+    for (path, import) in &files {
+        harness.write(path, &source(import, "mark_v1"));
+        harness.route(path);
+    }
+    assert_eq!(marked("mark_v1", &harness).len(), files.len(), "every file indexed");
+    for (path, import) in &files {
+        harness.write(path, &source(import, "mark_v2"));
+    }
+    harness
+}
+
+/// Creates `path` and routes it, as the watcher does a created file.
+fn create(harness: &Harness, path: &str) {
+    harness.write(path, "export const created = 1;\n");
+    harness.route(path);
+}
+
+fn assert_only_the_importer_re_extracted(harness: &Harness) {
+    assert_eq!(
+        marked("mark_v2", harness),
+        vec!["src/a.ts".to_string()],
+        "only src/a.ts was re-extracted: no whole-language reindex"
+    );
+}
+
+#[test]
+fn creating_the_ts_file_of_an_extensionless_import_links_it() {
+    let harness = indexed("import { created } from \"./missing\";\n", &[]);
+    assert!(harness.imports("src/a.ts").0.is_empty(), "./missing waits unlinked");
+
+    create(&harness, "src/missing.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["src/missing.ts:missing.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+#[test]
+fn creating_the_directory_index_of_an_extensionless_import_links_it() {
+    let harness = indexed("import { created } from \"./missing\";\n", &[]);
+    assert!(harness.imports("src/a.ts").0.is_empty(), "./missing waits unlinked");
+
+    create(&harness, "src/missing/index.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["src/missing/index.ts:index.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// `./m.js` names `src/m.ts` before `src/m.js` (TS's ESM rule), so an import
+/// linked to `src/m.js` moves to `src/m.ts` once it is created.
+#[test]
+fn a_js_import_linked_to_the_js_file_moves_to_a_created_ts_file() {
+    let harness = indexed("import { mark_v1 } from \"./m.js\";\n", &["src/m.js"]);
+    assert_eq!(harness.imports("src/a.ts").0, vec!["src/m.js:m.js".to_string()], "linked to src/m.js");
+
+    create(&harness, "src/m.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["src/m.ts:m.ts".to_string()], Vec::new()));
+    // src/m.js was rewritten too and is not an importer: left alone.
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// A specifier split across a template substitution is stored folded
+/// (`./missing`), so it is found by its stored target, also when the file is
+/// created while the plugin is down and first seen by the restarted one.
+#[test]
+fn a_split_literal_import_links_when_its_file_is_created_across_a_restart() {
+    let harness = indexed("export const lazy = import(`./${'mis'}sing`);\n", &[]);
+    assert!(harness.imports("src/a.ts").0.is_empty(), "the folded ./missing waits unlinked");
+
+    harness.registry.sleep_all_now("restart");
+    harness.write("src/missing.ts", "export const created = 1;\n");
+    harness.route("src/missing.ts");
+    // A sleeping plugin queues the change; the next request wakes it to replay.
+    assert_eq!(harness.registry.replay_pending(&harness.conn), 1, "src/missing.ts replayed");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["src/missing.ts:missing.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+}
