@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection};
 
 use crate::graph::containers;
 use crate::protocol::types::QualifiedPath;
@@ -295,7 +295,9 @@ impl Diff {
 /// Applies `diff` in a single SQLite transaction: edge deletes, node
 /// deletes, node upserts, edge upserts, in that order so edge FKs are
 /// always valid mid-transaction. Any failure rolls back the whole diff -
-/// nothing partial is ever committed.
+/// nothing partial is ever committed. The unit is a savepoint: standalone it
+/// commits on its own, inside a caller's transaction it becomes visible only
+/// when that transaction commits.
 ///
 /// Logical-container membership (`graph::containers`) is maintained inside
 /// the same transaction, in two halves around those writes: `detach` before
@@ -311,9 +313,9 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
         return Ok(());
     }
 
-    let tx = conn.transaction().context("failed to start transaction")?;
+    let tx = conn.savepoint().context("failed to start the diff savepoint")?;
     write_diff(&tx, diff)?;
-    tx.commit().context("failed to commit diff transaction")?;
+    tx.commit().context("failed to commit the diff savepoint")?;
     Ok(())
 }
 
@@ -349,7 +351,7 @@ pub fn apply_semantic_diff(conn: &mut Connection, diff: &mut Diff) -> Result<()>
         return Ok(());
     }
 
-    let tx = conn.transaction().context("failed to start transaction")?;
+    let tx = conn.savepoint().context("failed to start the diff savepoint")?;
     let stored = stored_node_ids(&tx, diff)?;
     let (kept, inserted): (Vec<NodeRecord>, Vec<NodeRecord>) =
         std::mem::take(&mut diff.upsert_nodes).into_iter().partition(|node| stored.contains(&node.id));
@@ -358,11 +360,11 @@ pub fn apply_semantic_diff(conn: &mut Connection, diff: &mut Diff) -> Result<()>
         .and_then(|()| kept.iter().try_for_each(|node| replace_untyped_calls(&tx, node)));
     diff.upsert_nodes.extend(kept);
     written?;
-    tx.commit().context("failed to commit diff transaction")?;
+    tx.commit().context("failed to commit the diff savepoint")?;
     Ok(())
 }
 
-fn write_diff_unless_empty(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
+fn write_diff_unless_empty(tx: &Connection, diff: &Diff) -> Result<()> {
     if diff.is_empty() {
         return Ok(());
     }
@@ -371,7 +373,7 @@ fn write_diff_unless_empty(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
 
 /// The ids of `diff`'s upserted nodes that have a row now and that `diff`
 /// does not delete first.
-fn stored_node_ids(tx: &Transaction<'_>, diff: &Diff) -> Result<HashSet<String>> {
+fn stored_node_ids(tx: &Connection, diff: &Diff) -> Result<HashSet<String>> {
     let deleted: HashSet<&str> = diff.delete_node_ids.iter().map(String::as_str).collect();
     let mut exists = tx
         .prepare("SELECT 1 FROM nodes WHERE id = ?1")
@@ -389,7 +391,7 @@ fn stored_node_ids(tx: &Transaction<'_>, diff: &Diff) -> Result<HashSet<String>>
 }
 
 /// [`apply_diff`]'s writes, inside a transaction the caller owns and commits.
-fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
+fn write_diff(tx: &Connection, diff: &Diff) -> Result<()> {
     let membership = containers::detach(tx, diff).context("failed to detach container members")?;
 
     for id in &diff.delete_edge_ids {
@@ -619,7 +621,7 @@ fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
 }
 
 /// Replaces `node`'s `untyped_calls` rows with the ones it carries now.
-fn replace_untyped_calls(tx: &Transaction<'_>, node: &NodeRecord) -> Result<()> {
+fn replace_untyped_calls(tx: &Connection, node: &NodeRecord) -> Result<()> {
     // Untyped receiver calls are replaced wholesale too: a node re-sent
     // with an empty list (a plugin that stopped reporting, or a body that
     // no longer has such calls) loses its rows.

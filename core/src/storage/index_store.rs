@@ -97,6 +97,33 @@ const fn hold(unit: Unit) -> Hold {
     }
 }
 
+/// Runs `f` inside one transaction on `conn`, so another connection sees
+/// everything `f` wrote at once, and commits it whether or not `f` failed.
+/// The units inside (`apply_diff`, the import and symbol linkers) are
+/// savepoints that roll themselves back on failure, so committing after an
+/// inner error keeps exactly the units that succeeded before it. If the
+/// commit itself fails, the transaction is rolled back and nothing `f` wrote
+/// is kept; the error returned is `f`'s if it failed, else the commit's.
+fn in_one_commit<T>(conn: &mut Connection, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+    conn.execute_batch("BEGIN").context("failed to begin the write's transaction")?;
+    let result = f(conn);
+    if let Err(commit) = conn.execute_batch("COMMIT") {
+        // An I/O or full-disk error may already have rolled it back.
+        if !conn.is_autocommit() {
+            if let Err(rollback) = conn.execute_batch("ROLLBACK") {
+                crate::log_line!(
+                    "g-mesh: failed to roll back a write after its commit failed ({rollback:#})"
+                );
+            }
+        }
+        return match result {
+            Err(err) => Err(err),
+            Ok(_) => Err(anyhow::Error::new(commit).context("failed to commit the write's transaction")),
+        };
+    }
+    result
+}
+
 /// `apply_diff`, then the imports and symbol links it enables, in one hold.
 /// `label` names the diff in the error.
 fn apply_and_link(conn: &mut Connection, diff: &Diff, label: &str, rules: &LinkRules) -> Result<()> {
@@ -104,13 +131,45 @@ fn apply_and_link(conn: &mut Connection, diff: &Diff, label: &str, rules: &LinkR
     link_applied(conn, diff, rules)
 }
 
-/// The imports and symbol links a committed `diff` enables.
+#[cfg(test)]
+type AfterApplyHook = Box<dyn FnMut(&Connection)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_APPLY_FOR_TESTS: std::cell::RefCell<Option<AfterApplyHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs (or, with `None`, removes) this thread's callback that
+/// [`link_applied`] runs on the writer's connection after the diff is written
+/// and before it is linked.
+#[cfg(test)]
+#[expect(dead_code, reason = "no test installs the hook yet")]
+pub(crate) fn set_after_apply_for_tests(hook: Option<AfterApplyHook>) {
+    AFTER_APPLY_FOR_TESTS.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn after_apply_for_tests(conn: &Connection) {
+    AFTER_APPLY_FOR_TESTS.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(conn);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn after_apply_for_tests(_: &Connection) {}
+
+/// The imports and symbol links an applied `diff` enables.
 fn link_applied(conn: &mut Connection, diff: &Diff, rules: &LinkRules) -> Result<()> {
-    // After the commit: linking points edges at `File` nodes, and the ones
-    // this diff brought with it have to be in the index first.
+    after_apply_for_tests(conn);
+    // After the write, in the same transaction: linking points edges at
+    // `File` nodes, and the ones this diff brought with it have to be in the
+    // index first.
     imports::link_diff(conn, diff).context("failed to link the file's resolved imports")?;
     // Symbols second: a usage edge can only be repointed at an export that
-    // is already committed, including the ones this diff added.
+    // is already written, including the ones this diff added.
     symbol_links::link_diff(conn, diff, rules)
         .context("failed to link the file's cross-file symbol usages")?;
     Ok(())
@@ -366,11 +425,12 @@ impl Writer<'_> {
         }
     }
 
-    /// Commits `diff` and links its imports and symbol usages, in one step.
+    /// Commits `diff` and links its imports and symbol usages, in one step
+    /// and one commit.
     pub fn apply_diff_linked(&mut self, diff: &Diff, label: &str) -> Result<()> {
         let store = self.store;
         self.step(|conn| {
-            apply_and_link(conn, diff, label, &store.link_rules)?;
+            in_one_commit(conn, |conn| apply_and_link(conn, diff, label, &store.link_rules))?;
             store.claim(diff);
             Ok(())
         })
@@ -379,12 +439,16 @@ impl Writer<'_> {
     /// [`Self::apply_diff_linked`] for a `semanticPass` answer: commits it
     /// through [`apply_semantic_diff`], so a node already stored keeps its
     /// text and takes only its `untypedCalls`. Linking and claiming still
-    /// see every node the answer named, kept ones included. In one step.
+    /// see every node the answer named, kept ones included. In one step and
+    /// one commit.
     pub fn apply_semantic_diff_linked(&mut self, diff: &mut Diff, label: &str) -> Result<()> {
         let store = self.store;
         self.step(|conn| {
-            apply_semantic_diff(conn, diff).with_context(|| format!("failed to apply the {label} diff"))?;
-            link_applied(conn, diff, &store.link_rules)?;
+            in_one_commit(conn, |conn| {
+                apply_semantic_diff(conn, diff)
+                    .with_context(|| format!("failed to apply the {label} diff"))?;
+                link_applied(conn, diff, &store.link_rules)
+            })?;
             store.claim(diff);
             Ok(())
         })
@@ -394,7 +458,7 @@ impl Writer<'_> {
     /// is first widened by `scope` to retire the file's stored rows the
     /// plugin did not name (`storage::file_rows`). A gone file also loses its
     /// `indexed_files` row and its owed-file and never-answered semantic
-    /// rows. All in one step.
+    /// rows. All in one step and one commit.
     pub fn apply_file_diff_linked(
         &mut self,
         diff: &mut Diff,
@@ -404,12 +468,15 @@ impl Writer<'_> {
     ) -> Result<()> {
         let store = self.store;
         self.step(|conn| {
-            file_rows::widen(conn, file_path, scope, diff)?;
-            apply_and_link(conn, diff, label, &store.link_rules)?;
-            if scope == FileScope::Gone {
-                file_rows::delete_indexed_file(conn, file_path)?;
-                super::schema::clear_gone_file_semantic_rows(conn, file_path)?;
-            }
+            in_one_commit(conn, |conn| {
+                file_rows::widen(conn, file_path, scope, diff)?;
+                apply_and_link(conn, diff, label, &store.link_rules)?;
+                if scope == FileScope::Gone {
+                    file_rows::delete_indexed_file(conn, file_path)?;
+                    super::schema::clear_gone_file_semantic_rows(conn, file_path)?;
+                }
+                Ok(())
+            })?;
             store.claim(diff);
             Ok(())
         })

@@ -325,7 +325,7 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
         return Ok(summary);
     }
 
-    let tx = conn.transaction().context("failed to start the import-linking transaction")?;
+    let tx = conn.savepoint().context("failed to start the import-linking savepoint")?;
     {
         let mut find_file = tx
             .prepare("SELECT id FROM nodes WHERE kind = ?1 AND filePath = ?2")
@@ -416,7 +416,7 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
             }
         }
     }
-    tx.commit().context("failed to commit the import-linking transaction")?;
+    tx.commit().context("failed to commit the import-linking savepoint")?;
 
     Ok(summary)
 }
