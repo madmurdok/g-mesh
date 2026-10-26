@@ -12,7 +12,8 @@
 //! The plugin answers the created file's first `fileChanged` with the
 //! addresses that file answers, plus the candidate each address resolved to
 //! before; core looks up the importers stored as pointing at them and
-//! re-extracts those.
+//! re-extracts those. A deleted file's importers are re-extracted by core
+//! itself, from the imports linked to the file before its rows go.
 //!
 //! How a re-extract is seen: after the index is built every `.ts` file is
 //! rewritten on disk to declare `mark_v2` instead of `mark_v1`, and none of
@@ -200,9 +201,8 @@ fn creating_the_root_index_links_an_import_naming_the_root() {
 }
 
 /// `..` linked to the root `index.tsx` moves to a created root `index.ts`;
-/// once that is deleted, the importer's next edit falls back to
-/// `index.tsx`. Core drops an edge into a deleted file with its node and
-/// leaves the importer's link to that importer's next reparse.
+/// once that is deleted, it falls back to `index.tsx`: core re-extracts the
+/// importers of a deleted file in the delete's own round trip.
 #[test]
 fn an_import_naming_the_root_moves_to_a_created_root_index_and_back_once_it_is_deleted() {
     let harness = indexed("import { mark_v1 } from \"..\";\n", &["index.tsx"]);

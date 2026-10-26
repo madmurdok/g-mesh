@@ -82,8 +82,10 @@ pub(crate) fn ensure_project_dir_under(home: &Path, root: &Path) -> Result<PathB
 /// `placeholder_targets` and `containers` as foreign keys onto `nodes`, and
 /// every writer is built on those declarations *not* being enforced.
 /// Cross-file edges are lazy by design: when a symbol another file points at
-/// is deleted or renamed, the importer's edge is left dangling until that
-/// importer is itself reindexed (see `graph::imports::link_diff`). And the TS
+/// is deleted or renamed, an edge into it that no placeholder carried is left
+/// dangling until its file is reindexed, and an import linked to a deleted
+/// file until core re-extracts the importer (see `graph::imports::link_diff`
+/// and `storage::write::apply_diff`). And the TS
 /// plugin reports any change to a symbol as a delete plus an upsert of the
 /// same id, without re-sending the unchanged edges into it - so under
 /// enforcement the delete is refused and the whole diff rolls back.

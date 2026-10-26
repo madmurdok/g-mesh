@@ -397,6 +397,7 @@ fn write_diff(tx: &Connection, diff: &Diff) -> Result<()> {
     for id in &diff.delete_edge_ids {
         tx.execute("DELETE FROM edges WHERE id = ?1", params![id]).context("failed to delete edge")?;
     }
+    let upserted: HashSet<&str> = diff.upsert_nodes.iter().map(|node| node.id.as_str()).collect();
     for id in &diff.delete_node_ids {
         // Explicitly, rather than leaning on the child tables' ON DELETE
         // CASCADE: `storage::connection::open` switches `foreign_keys` off on
@@ -414,16 +415,31 @@ fn write_diff(tx: &Connection, diff: &Diff) -> Result<()> {
         // gets a fresh one from `EmbeddingPipeline::apply`, which embeds every
         // upserted node.
         //
-        // Edges into the node are deliberately *not* touched. One the plugin
-        // did not re-send because its id did not change (a file's `DEFINES`
-        // into a symbol whose body grew) is valid again the moment the same
-        // id is upserted below; one into a node that is really gone (another
-        // file's call to a deleted symbol) is the documented lazy dangling
-        // edge, repaired when that file is next reindexed. Both are rows a
-        // foreign key would refuse this delete over, which is why enforcement
-        // is off - see `storage::connection::open`. (`containers::detach`
-        // above does remove a member's container `DEFINES` edge, for its own
+        // Edges into the node are not deleted. One the plugin did not
+        // re-send because its id did not change (a file's `DEFINES` into a
+        // symbol whose body grew) is valid again the moment the same id is
+        // upserted below. One into a node that is really gone (not upserted
+        // by this diff) and that linking moved off a placeholder
+        // (`linkedFrom`, `graph::symbol_links`) goes back onto that
+        // placeholder, unresolved, as an unlink does: another file's call to
+        // a deleted symbol, which that file's own reparse would never revisit
+        // when it imports the symbol through a re-export. Any other edge into
+        // a gone node dangles until its file is reindexed; for an import
+        // linked to a gone file, core re-extracts the importer
+        // (`storage::file_rows::importers_of`). Both are rows a foreign key
+        // would refuse this delete over, which is why enforcement is off -
+        // see `storage::connection::open`. (`containers::detach` above does
+        // remove a member's container `DEFINES` edge, for its own
         // bookkeeping, and `attach` restores it.)
+        if !upserted.contains(id.as_str()) {
+            tx.prepare_cached(
+                "UPDATE edges SET toId = linkedFrom, resolved = 0, linkedFrom = NULL
+                 WHERE toId = ?1 AND linkedFrom IS NOT NULL",
+            )
+            .context("failed to prepare the unlink of edges into a deleted node")?
+            .execute(params![id])
+            .context("failed to unlink the edges into a deleted node")?;
+        }
         tx.execute("DELETE FROM declarations WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's declarations")?;
         tx.execute("DELETE FROM placeholder_targets WHERE nodeId = ?1", params![id])

@@ -279,7 +279,9 @@ pub fn run_with_progress(
 
 /// Removes every row `language` has in the index, through the watcher's own
 /// path for a deleted file, one file at a time. Containers (`filePath = ''`)
-/// are not files: they go with their last member.
+/// are not files: they go with their last member. The re-extracts that path
+/// records as owed to a deleted file's importers name files purged here too,
+/// so the language's owed re-extracts are cleared with its resolution facts.
 fn purge_language(conn: &IndexStore, language: &str) -> Result<()> {
     let paths: Vec<String> = conn.with(|conn| -> Result<Vec<String>> {
         let mut stmt = conn
@@ -297,7 +299,10 @@ fn purge_language(conn: &IndexStore, language: &str) -> Result<()> {
             let mut diff = Diff::default();
             store.apply_file_diff_linked(&mut diff, path, FileScope::Gone, "purge a failed language")?;
         }
-        store.step(|conn| schema::set_resolution_facts(conn, language, None))
+        store.step(|conn| {
+            schema::clear_owed_reextracts(conn, language)?;
+            schema::set_resolution_facts(conn, language, None)
+        })
     })
 }
 

@@ -192,7 +192,23 @@ pub(crate) fn select(
     imports: &[ImportSelector],
     trigger: Option<&str>,
 ) -> Result<Selection> {
+    select_with(conn, language, files, imports, trigger, &[])
+}
+
+/// [`select`] with `extra` files joined to the selection before the
+/// threshold, so one rule bounds both: the importers of a gone file
+/// (`Writer::apply_file_diff_linked`) ride along with what the plugin's own
+/// `affected` answer selected for the same delete.
+pub(crate) fn select_with(
+    conn: &Connection,
+    language: &str,
+    files: &[PathScope],
+    imports: &[ImportSelector],
+    trigger: Option<&str>,
+    extra: &[String],
+) -> Result<Selection> {
     let mut selected = select_affected(conn, language, files, imports)?;
+    selected.extend(extra.iter().cloned());
     if let Some(trigger) = trigger {
         selected.remove(trigger);
     }

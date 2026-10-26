@@ -458,26 +458,39 @@ impl Writer<'_> {
     /// plugin did not name (`storage::file_rows`). A gone file also loses its
     /// `indexed_files` row and its owed-file and never-answered semantic
     /// rows. All in one step and one commit.
+    ///
+    /// For a gone file, returns the other files whose imports are linked to
+    /// it ([`file_rows::importers_of`]), read before its rows go and recorded
+    /// in the same commit as owed a re-extract (`reextract_owed_files`, with
+    /// the gone file as trigger): their edges into it are left dangling, and
+    /// re-extracting them re-resolves each import to another candidate or an
+    /// unresolved placeholder. The caller re-extracts them, or leaves the
+    /// rows to the next start's `config_reindex::resume_owed_reextracts`.
+    /// Empty for any other scope.
     pub fn apply_file_diff_linked(
         &mut self,
         diff: &mut Diff,
         file_path: &str,
         scope: FileScope,
         label: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let store = self.store;
         self.step(|conn| {
-            in_one_commit(conn, |conn| {
+            let importers = in_one_commit(conn, |conn| {
+                let importers =
+                    if scope == FileScope::Gone { file_rows::importers_of(conn, file_path)? } else { None };
                 file_rows::widen(conn, file_path, scope, diff)?;
                 apply_and_link(conn, diff, label, &store.link_rules)?;
                 if scope == FileScope::Gone {
                     file_rows::delete_indexed_file(conn, file_path)?;
                     super::schema::clear_gone_file_semantic_rows(conn, file_path)?;
                 }
-                Ok(())
+                let Some((language, importers)) = importers else { return Ok(Vec::new()) };
+                super::schema::owe_reextracts(conn, &language, file_path, &importers)?;
+                Ok(importers)
             })?;
             store.claim(diff);
-            Ok(())
+            Ok(importers)
         })
     }
 
@@ -1002,7 +1015,9 @@ mod tests {
     fn run_step(store: &IndexStore, step: Step, diff: &mut Diff) -> Result<()> {
         store.unit(Unit::WatcherApply, |writer| match step {
             Step::Diff => writer.apply_diff_linked(diff, "test"),
-            Step::FileDiff => writer.apply_file_diff_linked(diff, "use.ts", FileScope::Partial, "test"),
+            Step::FileDiff => {
+                writer.apply_file_diff_linked(diff, "use.ts", FileScope::Partial, "test").map(|_| ())
+            }
             Step::SemanticDiff => writer.apply_semantic_diff_linked(diff, "test"),
         })
     }
