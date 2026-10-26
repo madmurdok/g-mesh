@@ -288,7 +288,7 @@ fn a_specifier_climbing_out_of_the_project_root_resolves_to_nothing() {
 }
 
 #[test]
-fn a_specifier_naming_the_root_itself_stays_unresolved() {
+fn a_specifier_naming_the_root_itself_resolves_to_the_root_index() {
     let fx = Fixture::new(&[
         ("index.ts", SRC),
         ("main.ts", SRC),
@@ -297,10 +297,12 @@ fn a_specifier_naming_the_root_itself_stays_unresolved() {
         ("src/deep/b.ts", SRC),
     ]);
     let project = fx.load();
-    assert_eq!(resolve(&project, ".", "main.ts"), None);
-    assert_eq!(resolve(&project, "./", "main.ts"), None);
-    assert_eq!(resolve(&project, "..", "src/a.ts"), None);
-    // The same forms naming a directory below the root do resolve.
+    assert_eq!(resolve(&project, ".", "main.ts"), some("index.ts"));
+    assert_eq!(resolve(&project, "./", "main.ts"), some("index.ts"));
+    assert_eq!(resolve(&project, "..", "src/a.ts"), some("index.ts"));
+    // Climbing above the root still names nothing.
+    assert_eq!(resolve(&project, "..", "main.ts"), None);
+    // The same forms naming a directory below the root resolve there.
     assert_eq!(resolve(&project, ".", "src/a.ts"), some("src/index.ts"));
     assert_eq!(resolve(&project, "..", "src/deep/b.ts"), some("src/index.ts"));
 }
