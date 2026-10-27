@@ -224,8 +224,11 @@ pub enum FileChangeOutcome {
 /// placeholder. They join the plugin's selection under the same threshold.
 ///
 /// A re-extract round trip (`reextract`) ignores its own `affected` and gone
-/// importers, so one edit never starts a second round; a gone file's
-/// importers it leaves owed are re-extracted at the next start
+/// importers, so one edit never starts a second round. Every re-extract
+/// loop skips a selected file already gone from disk and leaves it to its
+/// own deletion's change ([`reextract_affected`], `config_reindex`'s
+/// `on_disk`); only a file deleted during its round trip leaves its
+/// importers owed here, and the next start re-extracts them
 /// (`config_reindex::resume_owed_reextracts`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(

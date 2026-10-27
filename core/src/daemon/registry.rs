@@ -1550,9 +1550,9 @@ impl PluginRegistry {
     /// baseline and its semantic bookkeeping. Edges into its nodes from other
     /// files stay, as for every node delete (`storage::write::apply_diff`);
     /// the files whose imports are linked to it are recorded as owed a
-    /// re-extract in the same commit, and a start's
-    /// `config_reindex::resume_owed_reextracts` re-extracts them (this one's,
-    /// if its read comes after this commit, else the next one's).
+    /// re-extract in the same commit. The seeded start re-extracts them in
+    /// its second `config_reindex::resume_owed_reextracts`, which
+    /// `daemon::activation` runs after the gate this reconcile opens.
     fn retire_file(&self, conn: &IndexStore, file_path: &str) -> Result<()> {
         conn.unit(Unit::WatcherApply, |store| {
             store

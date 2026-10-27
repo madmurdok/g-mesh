@@ -494,7 +494,8 @@ fn wire_import(from: usize, to: usize, specifier: &str) -> WireEdge {
     }
 }
 
-/// The walk: [`FILES`] files, none of them on disk; `f1` and `f2` import
+/// The walk: [`FILES`] files, none of them on disk (until
+/// [`Fixture::put_on_disk`]); `f1` and `f2` import
 /// `f0` as `lib`, `f3` imports it as `./f0`; then the trailer, when `facts`.
 fn set_walk(project: &Path, facts: Option<&str>) {
     set_walk_of(
@@ -589,6 +590,15 @@ struct Seen {
 }
 
 impl Fixture {
+    /// Writes the walked files to disk, empty: a re-extract skips a selected
+    /// file gone from disk (GM-659).
+    fn put_on_disk(&self) {
+        std::fs::create_dir_all(self.project.path().join("src")).unwrap();
+        for i in 0..FILES {
+            std::fs::write(self.project.path().join(src(i)), "").unwrap();
+        }
+    }
+
     fn answer(&self, result: &str) {
         test_plugin::set_resolution_changed_answer(&self.dir, Some(result));
     }
@@ -752,13 +762,13 @@ fn a_gitignore_change_reindexes_a_resolution_delta_language_whole() {
 
 /// `affected` selecting 3 of 10 files (30%, not more): exactly those get a
 /// `fileChanged`, nothing is re-walked, the other files keep their rows, the
-/// facts are replaced and no reindex is left pending. The fake answers every
-/// `fileChanged` with an empty diff and the files are not on disk, so a
-/// re-extracted file loses its rows: which rows are gone is which files were
-/// re-extracted.
+/// facts are replaced and no reindex is left pending. The files are on disk
+/// (a re-extract skips one that is not), so the fake's empty answers retire
+/// nothing.
 #[test]
 fn an_affected_answer_re_extracts_exactly_the_selected_files() {
     let fixture = fixture(true, false, Some("facts-1"));
+    fixture.put_on_disk();
     fixture.answer(&affected(&[&src(9)], IMPORTS_OF_LIB, "facts-2"));
 
     let seen = fixture.save_go_mod();
@@ -769,8 +779,7 @@ fn an_affected_answer_re_extracts_exactly_the_selected_files() {
     assert_eq!(seen.requests.len(), 1 + selected.len(), "one fileChanged each: {:?}", seen.requests);
     assert!(!seen.whole_reindex);
     assert_eq!(seen.spawns, 0);
-    let kept: BTreeSet<String> = (0..FILES).map(src).filter(|path| !selected.contains(path)).collect();
-    assert_eq!(indexed_files(&fixture.conn), kept);
+    assert_eq!(indexed_files(&fixture.conn).len(), FILES, "every file is on disk and keeps its row");
     assert_eq!(fixture.facts().as_deref(), Some("facts-2"));
     assert!(fixture.pending().is_empty());
 }
@@ -842,6 +851,7 @@ fn a_whole_language_reindex_moves_an_unchanged_importers_edge() {
 #[test]
 fn an_affected_answer_sends_one_semantic_pass_after_the_re_extracts() {
     let fixture = fixture(true, true, Some("facts-1"));
+    fixture.put_on_disk();
     fixture.answer(&affected(&[], IMPORTS_OF_LIB, "facts-2"));
 
     let seen = fixture.save_go_mod();
@@ -983,6 +993,7 @@ fn owed_re_extracts_left_by_a_killed_daemon_are_finished_at_the_next_start() {
             schema::owe_reextracts(conn, "gone-language", "x.gone", &["y.gone".to_string()])
         })
         .unwrap();
+    fixture.put_on_disk();
     // The old process died with the daemon.
     fixture.supervisor.sleep_now("the daemon was killed");
     let requests = test_plugin::requests(&fixture.dir).len();
@@ -1005,7 +1016,7 @@ fn owed_re_extracts_left_by_a_killed_daemon_are_finished_at_the_next_start() {
     assert!(owed(&fixture.conn).is_empty(), "every row is settled or dropped");
     assert_eq!(
         indexed_files(&fixture.conn).len(),
-        FILES - 2,
-        "the fake's empty answers retired the two re-extracted files"
+        FILES,
+        "the re-extracted files are on disk and keep their rows"
     );
 }

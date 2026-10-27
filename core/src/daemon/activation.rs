@@ -218,6 +218,12 @@ impl ActivationCtx {
         drop(self.seed_gate.take());
         if let Some(reconciled) = self.seed_reconciled.take() {
             let _ = reconciled.recv();
+            // GM-659: the seeded reconcile retires the files this worktree
+            // does not walk, recording their importers as owed in the same
+            // commits, on the consumer thread and so concurrently with the
+            // read above; once the gate is open those rows are committed, and
+            // this second read re-extracts them.
+            crate::daemon::config_reindex::resume_owed_reextracts(&self.registry, &self.conn);
         }
         self.indexing.set_phase(Phase::Embedding);
         let backfill = panic::catch_unwind(AssertUnwindSafe(|| {

@@ -39,6 +39,7 @@
 //! after a kill.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -85,7 +86,7 @@ pub(crate) fn run(
     let embedding = registry.embedding();
     let started = std::time::Instant::now();
     let outcome = supervisor.with_awake_exclusive_access(|process| {
-        selective(process, store, embedding, &language, changed_file, semantic_pass)
+        selective(process, store, embedding, registry.project_root(), &language, changed_file, semantic_pass)
     });
     let outcome = match outcome {
         Ok(Ok(outcome)) => outcome,
@@ -122,6 +123,7 @@ fn selective(
     process: &PluginProcess,
     store: &IndexStore,
     embedding: &EmbeddingPipeline,
+    project_root: &Path,
     language: &str,
     changed_file: &str,
     semantic_pass: bool,
@@ -159,6 +161,7 @@ fn selective(
                 process,
                 store,
                 embedding,
+                project_root,
                 language,
                 changed_file,
                 &selected,
@@ -452,12 +455,14 @@ impl StoredImport {
 /// over them (plus the owed files) when `semantic_pass`, then stores `facts`
 /// and clears `pending_reindex` together. A failed re-extract stops the loop
 /// and falls back, leaving `pending_reindex` for the whole-language reindex
-/// to clear.
+/// to clear. A selected file already gone from disk (the selection is the
+/// index's) is skipped, see [`on_disk`].
 #[allow(clippy::too_many_arguments)]
 fn reextract(
     process: &PluginProcess,
     store: &IndexStore,
     embedding: &EmbeddingPipeline,
+    project_root: &Path,
     language: &str,
     changed_file: &str,
     selected: &BTreeSet<String>,
@@ -467,14 +472,14 @@ fn reextract(
     store
         .with(|conn| schema::mark_pending_reindex(conn, language, changed_file))
         .with_context(|| format!("failed to mark {language}'s reindex as pending"))?;
-    for file_path in selected {
+    let selected = on_disk(project_root, selected);
+    for file_path in &selected {
         if let Err(err) = process.reextract(store, file_path, embedding) {
             return Ok(Outcome::Fallback(format!("re-extracting {file_path} failed ({err:#})")));
         }
     }
-    if semantic_pass {
-        let scope: Vec<String> = selected.iter().cloned().collect();
-        if let Err(err) = process.scoped_semantic_pass(store, scope, embedding) {
+    if semantic_pass && !selected.is_empty() {
+        if let Err(err) = process.scoped_semantic_pass(store, selected.clone(), embedding) {
             crate::log_line!(
                 "g-mesh daemon: the semantic pass over {language}'s re-extracted files failed ({err:#}) - \
                  their edges keep whatever the structural pass resolved"
@@ -493,6 +498,19 @@ fn reextract(
     Ok(Outcome::Reextracted(selected.len()))
 }
 
+/// The files of `selected` still on disk. A selected file already gone (a
+/// branch switch deleted it before the watcher routed the deletion) is left
+/// to its deletion's own change: a re-extract round trip of it would retire
+/// it without following its importers (`watcher::apply`'s
+/// `apply_file_change_in`), and the deletion, finding no `File` node left,
+/// would not re-extract them either. Every gone indexed file has that
+/// change coming: the watcher's event, a dropped-event rescan, or a start's
+/// reconcile (`PluginRegistry::reconcile_since_index`, which routes or
+/// retires it).
+fn on_disk<'a>(project_root: &Path, selected: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    selected.into_iter().filter(|path| project_root.join(path).exists()).cloned().collect()
+}
+
 /// Re-extracts the files a source edit's re-extract loop (GM-507,
 /// `watcher::apply`) recorded as owed and did not finish: a daemon killed
 /// mid-loop leaves their rows, which hold the module placement of before
@@ -500,8 +518,11 @@ fn reextract(
 /// `workspace_reindex::resume_pending` (whose swap clears a reindexed
 /// language's rows). Per language: each file is re-extracted, one semantic
 /// pass covers them, and the rows are cleared; a failure falls back to the
-/// whole-language reindex, whose swap clears them. Rows of a language no
-/// discovered plugin serves are dropped.
+/// whole-language reindex, whose swap clears them. A file gone from disk is
+/// not re-extracted, only settled ([`on_disk`]). Rows of a language no
+/// discovered plugin serves are dropped. A seeded start calls it once more
+/// after its reconcile (`daemon::activation`), for the rows that
+/// reconcile's retired files owe their importers.
 pub(crate) fn resume_owed_reextracts(registry: &PluginRegistry, store: &IndexStore) {
     let owed = match store.with(schema::owed_reextracts) {
         Ok(owed) => owed,
@@ -535,13 +556,14 @@ pub(crate) fn resume_owed_reextracts(registry: &PluginRegistry, store: &IndexSto
             supervisor.manifest().capabilities.semantic_pass && !supervisor.is_semantic_suspended();
         let embedding = registry.embedding();
         let finished = supervisor.with_awake_exclusive_access(|process| -> Result<()> {
-            for file_path in &files {
+            let live = on_disk(registry.project_root(), &files);
+            for file_path in &live {
                 process
                     .reextract(store, file_path, embedding)
                     .with_context(|| format!("re-extracting {file_path} failed"))?;
             }
-            if semantic_pass {
-                if let Err(err) = process.scoped_semantic_pass(store, files.clone(), embedding) {
+            if semantic_pass && !live.is_empty() {
+                if let Err(err) = process.scoped_semantic_pass(store, live, embedding) {
                     crate::log_line!(
                         "g-mesh daemon: the semantic pass over {language}'s owed re-extracts failed ({err:#}) - \
                          their edges keep whatever the structural pass resolved"
