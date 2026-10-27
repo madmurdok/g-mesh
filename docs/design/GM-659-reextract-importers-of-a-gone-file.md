@@ -131,7 +131,10 @@ The plugin re-resolves each importer in its own candidate order:
   first-sighting delta finds when `src/m.ts` or `src/m/index.ts` appears.
 
 `retire_file` (seeded deletion, no plugin) gets the owed rows from the same
-commit and the next start's `resume_owed_reextracts` finishes them.
+commit; activation runs `resume_owed_reextracts` again once the seeded
+reconcile has finished, so they are re-extracted in the same start. A
+config re-extract or resume skips selected files no longer on disk, so a
+gone file's importers are owed by its own delete route, not dropped.
 
 - Benefit: one language-agnostic mechanism; no plugin change, no schema
   change, works on existing indexes for every new delete; reuses the owed /
