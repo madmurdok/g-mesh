@@ -950,6 +950,75 @@ mod tests {
         assert_eq!(count(&conn, "vectors"), 0, "a deleted node's embedding must not outlive it");
     }
 
+    /// `(toId, resolved, linkedFrom)` of edge `id`.
+    fn edge_target(conn: &Connection, id: &str) -> (String, bool, Option<String>) {
+        conn.query_row("SELECT toId, resolved, linkedFrom FROM edges WHERE id = ?1", [id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+    }
+
+    /// `a.ts`'s `g` calls `m.ts`'s `f` twice: `linked`, moved there off its
+    /// placeholder `p` by linking (`linkedFrom = p`), and `bound`, written
+    /// straight onto `f`. Foreign keys off, as on the daemon's connection.
+    fn linked_call() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![
+                    NodeRecord::new("g", "Function", "g", "g", "a.ts", "typescript"),
+                    NodeRecord::new("p", "Module", "f", "b.ts#f", "a.ts", "typescript"),
+                    NodeRecord::new("f", "Function", "f", "f", "m.ts", "typescript"),
+                ],
+                upsert_edges: vec![
+                    EdgeRecord::new("linked", "g", "f", "CALLS", "tree-sitter", true),
+                    EdgeRecord::new("bound", "g", "f", "CALLS", "semantic", true),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        conn.execute("UPDATE edges SET linkedFrom = 'p' WHERE id = 'linked'", []).unwrap();
+        conn
+    }
+
+    /// A deleted node no upsert of the same diff brings back: an edge
+    /// linking moved onto it goes back onto its placeholder, unresolved; an
+    /// edge with no placeholder to go back to is left as it was.
+    #[test]
+    fn deleting_a_node_puts_the_edges_linked_onto_it_back_on_their_placeholders() {
+        let mut conn = linked_call();
+
+        apply_diff(&mut conn, &Diff { delete_node_ids: vec!["f".to_string()], ..Default::default() })
+            .unwrap();
+
+        assert_eq!(edge_target(&conn, "linked"), ("p".to_string(), false, None));
+        assert_eq!(edge_target(&conn, "bound"), ("f".to_string(), true, None));
+    }
+
+    /// A node deleted and upserted in one diff (a changed symbol, same id)
+    /// keeps the edges linked onto it.
+    #[test]
+    fn a_node_deleted_and_upserted_in_one_diff_keeps_the_edges_linked_onto_it() {
+        let mut conn = linked_call();
+
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![NodeRecord::new("f", "Function", "f", "f", "m.ts", "typescript")],
+                delete_node_ids: vec!["f".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(edge_target(&conn, "linked"), ("f".to_string(), true, Some("p".to_string())));
+        assert_eq!(count(&conn, "nodes"), 3);
+    }
+
     fn file_scoped_target(scope: &str, key: &str) -> PlaceholderTargetRecord {
         PlaceholderTargetRecord {
             scope_kind: "file".to_string(),

@@ -445,6 +445,28 @@ fn select_counts_the_files_only_after_a_non_empty_selection() {
     );
 }
 
+/// A gone file's importers join the delta's own selection under one
+/// threshold: alone they are selected, joined with the delta's they can make
+/// it too many (a file most of the language imports reindexes the language
+/// instead of re-extracting it file by file); the trigger is never selected.
+#[test]
+fn a_gone_files_importers_join_the_selection_under_the_same_threshold() {
+    let conn = seeded();
+    let extra = paths(&["app/a.ts", "lib/f.ts", "lib/e.ts"]);
+
+    let selection = select_with(&conn, "ts", &[], &[], Some("lib/e.ts"), &extra).unwrap();
+    assert!(
+        matches!(&selection, Selection::Files(files) if files.iter().eq(["app/a.ts", "lib/f.ts"])),
+        "2 of 8 files: {selection:?}"
+    );
+
+    let selection = select_with(&conn, "ts", &[scope("pkg", &[])], &[], Some("lib/e.ts"), &extra).unwrap();
+    assert!(
+        matches!(selection, Selection::TooMany(_)),
+        "2 importers and 2 of pkg, 4 of 8 files: {selection:?}"
+    );
+}
+
 // -------------------------------------------------------------------------
 // run, end to end through the registry and the fake plugin
 // -------------------------------------------------------------------------
@@ -784,6 +806,28 @@ fn an_affected_answer_re_extracts_exactly_the_selected_files() {
     assert!(fixture.pending().is_empty());
 }
 
+/// A selected file already gone from disk is not re-extracted: its rows
+/// stay for its own deletion's change, which still finds its `File` node and
+/// re-extracts its importers. The rest of the selection is re-extracted.
+///
+/// Control: make `on_disk` return every selected path (the gone file is
+/// asked `fileChanged` and the fake's empty answer retires it).
+#[test]
+fn an_affected_answer_leaves_a_selected_file_gone_from_disk_to_its_own_deletion() {
+    let fixture = fixture(true, false, Some("facts-1"));
+    fixture.put_on_disk();
+    std::fs::remove_file(fixture.project.path().join(src(9))).unwrap();
+    fixture.answer(&affected(&[&src(9)], IMPORTS_OF_LIB, "facts-2"));
+
+    let seen = fixture.save_go_mod();
+
+    assert_eq!(re_extracted(&seen), [src(1), src(2)].into(), "{:?}", seen.requests);
+    assert!(!seen.whole_reindex);
+    assert!(indexed_files(&fixture.conn).contains(&src(9)), "the gone file keeps its rows");
+    assert_eq!(fixture.facts().as_deref(), Some("facts-2"));
+    assert!(fixture.pending().is_empty());
+}
+
 /// One more file (4 of 10, above 30%) re-walks the language instead.
 ///
 /// Control: remove the `FALLBACK_SHARE_PERCENT` check in `selective`.
@@ -1019,4 +1063,27 @@ fn owed_re_extracts_left_by_a_killed_daemon_are_finished_at_the_next_start() {
         FILES,
         "the re-extracted files are on disk and keep their rows"
     );
+}
+
+/// An owed row naming a file gone from disk is settled without a
+/// re-extract: the file keeps its rows for its own deletion's change. The
+/// language's other owed file is re-extracted.
+///
+/// Control: make `on_disk` return every selected path (the gone file is
+/// asked `fileChanged` and the fake's empty answer retires it).
+#[test]
+fn an_owed_re_extract_of_a_file_gone_from_disk_is_settled_without_a_re_extract() {
+    let fixture = fixture(true, false, Some("facts-1"));
+    fixture.conn.with(|conn| schema::owe_reextracts(conn, "alpha", &src(0), &[src(4), src(7)])).unwrap();
+    fixture.put_on_disk();
+    std::fs::remove_file(fixture.project.path().join(src(7))).unwrap();
+    fixture.supervisor.sleep_now("the daemon was killed");
+    let requests = test_plugin::requests(&fixture.dir).len();
+
+    resume_owed_reextracts(&fixture.registry, &fixture.conn);
+
+    let asked = test_plugin::requests(&fixture.dir)[requests..].to_vec();
+    assert_eq!(asked, vec![format!("fileChanged {}", src(4))], "only the file on disk is re-extracted");
+    assert!(owed(&fixture.conn).is_empty(), "both rows are settled");
+    assert!(indexed_files(&fixture.conn).contains(&src(7)), "the gone file keeps its rows");
 }

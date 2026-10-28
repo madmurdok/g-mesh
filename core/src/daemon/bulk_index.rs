@@ -1109,4 +1109,41 @@ mod tests {
             "the walk is complete for every language it could index, so bulkIndexedAt is set"
         );
     }
+
+    /// Purging a language whose files import each other leaves none of its
+    /// owed re-extracts: the delete of an imported file owes its importer one,
+    /// and that importer is purged too.
+    ///
+    /// Control: drop the `clear_owed_reextracts` call in `purge_language`
+    /// (the row `src/a.beta-src`'s delete owes `src/b.beta-src` stays).
+    #[test]
+    fn purging_a_language_leaves_none_of_its_owed_re_extracts() {
+        use crate::storage::write::{EdgeRecord, NodeRecord};
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+        let conn = IndexStore::new(conn);
+        let file = |path: &str| NodeRecord::new(format!("File:{path}"), "File", path, path, path, "beta");
+        let diff = Diff {
+            upsert_nodes: vec![file("src/a.beta-src"), file("src/b.beta-src")],
+            upsert_edges: vec![EdgeRecord::new(
+                "i:b->a",
+                "File:src/b.beta-src",
+                "File:src/a.beta-src",
+                "IMPORTS",
+                "tree-sitter",
+                true,
+            )],
+            ..Default::default()
+        };
+        conn.unit(Unit::WatcherApply, |writer| writer.apply_diff_linked(&diff, "seed")).unwrap();
+
+        purge_language(&conn, "beta").unwrap();
+
+        assert_eq!(count(&conn, "nodes"), 0);
+        assert!(
+            conn.with(schema::owed_reextracts).unwrap().is_empty(),
+            "no owed re-extract outlives the purge"
+        );
+    }
 }

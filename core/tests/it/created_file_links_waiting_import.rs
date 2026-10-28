@@ -7,7 +7,11 @@
 //! an import naming the lower candidate explicitly stays on it, a split
 //! literal the extractor folds to `./missing`, after a plugin restart, and
 //! `..` naming the project root once a root `index.ts` appears (and back to
-//! `index.tsx` once it is deleted).
+//! `index.tsx` once it is deleted). A deleted candidate's importer falls
+//! back to the remaining candidate or is left unresolved, and links again
+//! once a candidate is created; a call through a re-export of a deleted file
+//! goes back onto its placeholder; no `IMPORTS` or `CALLS` edge is left
+//! pointing at a deleted node.
 //!
 //! The plugin answers the created file's first `fileChanged` with the
 //! addresses that file answers, plus the candidate each address resolved to
@@ -213,10 +217,186 @@ fn an_import_naming_the_root_moves_to_a_created_root_index_and_back_once_it_is_d
     assert_eq!(harness.imports("src/a.ts"), (vec!["index.ts:index.ts".to_string()], Vec::new()));
     assert_only_the_importer_re_extracted(&harness);
 
-    std::fs::remove_file(harness.root().join("index.ts")).unwrap();
-    harness.route("index.ts");
+    // Unrouted: only a re-extract by the delete itself shows it.
     harness.write("src/a.ts", &source("import { mark_v1 } from \"..\";\n", "mark_v3"));
-    harness.route("src/a.ts");
+    delete(&harness, "index.ts");
 
     assert_eq!(harness.imports("src/a.ts"), (vec!["index.tsx:index.tsx".to_string()], Vec::new()));
+    assert_eq!(marked("mark_v3", &harness), vec!["src/a.ts".to_string()], "re-extracted by the delete");
+    assert_eq!(dangling(&harness), 0);
+}
+
+/// Deletes `path` from disk and routes it, as the watcher does a deleted
+/// file.
+fn delete(harness: &Harness, path: &str) {
+    std::fs::remove_file(harness.root().join(path)).unwrap();
+    harness.route(path);
+}
+
+/// `IMPORTS` and `CALLS` edges whose target node does not exist.
+fn dangling(harness: &Harness) -> i64 {
+    harness.conn.with(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM edges e LEFT JOIN nodes t ON t.id = e.toId \
+             WHERE e.kind IN ('IMPORTS', 'CALLS') AND t.id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    })
+}
+
+/// Files owed a re-extract (`reextract_owed_files`), sorted.
+fn owed(harness: &Harness) -> Vec<String> {
+    let owed = harness.conn.with(g_mesh::storage::schema::owed_reextracts).unwrap();
+    owed.into_iter().flat_map(|(_, _, files)| files).collect()
+}
+
+const IMPORT_M: &str = "import { mark_v1 } from \"./m\";\n";
+
+/// `./m` linked to `src/m.ts` falls back to the remaining candidate once
+/// `src/m.ts` is deleted, by a re-extract of only its importer.
+#[test]
+fn deleting_the_linked_candidate_falls_back_to_the_remaining_one() {
+    for (remaining, link) in [("src/m/index.ts", "src/m/index.ts:index.ts"), ("src/m.tsx", "src/m.tsx:m.tsx")]
+    {
+        let harness = indexed(IMPORT_M, &["src/m.ts", remaining]);
+        assert_eq!(harness.imports("src/a.ts").0, vec!["src/m.ts:m.ts".to_string()], "linked to src/m.ts");
+
+        delete(&harness, "src/m.ts");
+
+        assert_eq!(harness.imports("src/a.ts"), (vec![link.to_string()], Vec::new()), "{remaining}");
+        assert_only_the_importer_re_extracted(&harness);
+        assert_eq!(dangling(&harness), 0, "{remaining}");
+        assert!(owed(&harness).is_empty(), "{remaining}: {:?}", owed(&harness));
+    }
+}
+
+/// Deleting the only candidate leaves `./m` unresolved and listed, exactly
+/// as a fresh extract with `src/m.ts` absent stores it.
+#[test]
+fn deleting_the_only_candidate_leaves_the_import_unresolved_as_a_fresh_extract_does() {
+    let harness = indexed(IMPORT_M, &["src/m.ts"]);
+    assert_eq!(harness.imports("src/a.ts").0, vec!["src/m.ts:m.ts".to_string()], "linked to src/m.ts");
+
+    delete(&harness, "src/m.ts");
+
+    let (resolved, unresolved) = harness.imports("src/a.ts");
+    assert!(resolved.is_empty(), "{resolved:?}");
+    assert_eq!(unresolved.len(), 1, "./m listed as unresolved: {unresolved:?}");
+    assert_eq!((resolved, unresolved), indexed(IMPORT_M, &[]).imports("src/a.ts"), "as a fresh extract");
+    assert_only_the_importer_re_extracted(&harness);
+    assert_eq!(dangling(&harness), 0);
+    assert!(owed(&harness).is_empty(), "{:?}", owed(&harness));
+}
+
+/// Once its only candidate is deleted, `./m` links again to a re-created
+/// `src/m.ts` or a created `src/m/index.ts`, by a re-extract of the
+/// importer: no edit of it, no whole-language reindex.
+#[test]
+fn an_import_whose_file_was_deleted_links_to_a_re_created_candidate() {
+    for (created, link) in [("src/m.ts", "src/m.ts:m.ts"), ("src/m/index.ts", "src/m/index.ts:index.ts")] {
+        let harness = indexed(IMPORT_M, &["src/m.ts"]);
+        delete(&harness, "src/m.ts");
+        assert!(harness.imports("src/a.ts").0.is_empty(), "./m unresolved");
+        // Unrouted: only a re-extract by the creation shows it.
+        harness.write("src/a.ts", &source(IMPORT_M, "mark_v3"));
+
+        create(&harness, created);
+
+        assert_eq!(harness.imports("src/a.ts"), (vec![link.to_string()], Vec::new()), "{created}");
+        assert_eq!(marked("mark_v3", &harness), vec!["src/a.ts".to_string()], "{created}: re-extracted");
+        assert_eq!(marked("mark_v2", &harness), Vec::<String>::new(), "{created}: no whole-language reindex");
+        assert_eq!(dangling(&harness), 0, "{created}");
+    }
+}
+
+/// `src/m.ts` and its importer `src/a.ts` deleted in one batch, `src/b.ts`
+/// importing `src/a.ts`: routing `src/m.ts` does not re-extract the gone
+/// `src/a.ts` (its rows stay for its own delete, nothing is left owed);
+/// routing `src/a.ts` then re-extracts `src/b.ts`, whose `./a` is left
+/// unresolved.
+#[test]
+fn a_deleted_importer_is_left_to_its_own_delete() {
+    let harness = indexed(IMPORT_M, &["src/m.ts"]);
+    let import_a = "import { mark_v1 } from \"./a\";\n";
+    harness.write("src/b.ts", &source(import_a, "mark_v1"));
+    harness.route("src/b.ts");
+    harness.write("src/b.ts", &source(import_a, "mark_v2"));
+    assert_eq!(harness.imports("src/b.ts").0, vec!["src/a.ts:a.ts".to_string()], "linked to src/a.ts");
+    std::fs::remove_file(harness.root().join("src/m.ts")).unwrap();
+    std::fs::remove_file(harness.root().join("src/a.ts")).unwrap();
+
+    harness.route("src/m.ts");
+
+    assert!(marked("mark_v1", &harness).contains(&"src/a.ts".to_string()), "src/a.ts keeps its rows");
+    assert!(owed(&harness).is_empty(), "{:?}", owed(&harness));
+
+    harness.route("src/a.ts");
+
+    assert!(!marked("mark_v1", &harness).contains(&"src/a.ts".to_string()), "src/a.ts is retired");
+    assert_eq!(marked("mark_v2", &harness), vec!["src/b.ts".to_string()], "only src/b.ts re-extracted");
+    let (resolved, unresolved) = harness.imports("src/b.ts");
+    assert!(resolved.is_empty() && unresolved.len() == 1, "./a unresolved: {resolved:?} {unresolved:?}");
+    assert_eq!(dangling(&harness), 0);
+    assert!(owed(&harness).is_empty(), "{:?}", owed(&harness));
+}
+
+/// `(target file:name, resolved, linkedFrom is set)` of each `CALLS` edge
+/// out of `file`, sorted.
+fn calls_of(harness: &Harness, file: &str) -> Vec<(String, bool, bool)> {
+    harness.conn.with(|c| {
+        let mut statement = c
+            .prepare(
+                "SELECT t.filePath || ':' || t.name, e.resolved, e.linkedFrom IS NOT NULL FROM edges e \
+                 JOIN nodes f ON f.id = e.fromId JOIN nodes t ON t.id = e.toId \
+                 WHERE e.kind = 'CALLS' AND f.filePath = ?1 ORDER BY 1",
+            )
+            .unwrap();
+        statement
+            .query_map([file], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    })
+}
+
+/// `src/a.ts` calls `f` imported from `./b`, which re-exports it from
+/// `./m`. Deleting `src/m.ts` re-extracts `src/b.ts` only, and `src/a.ts`'s
+/// call, linked onto `src/m.ts`'s `f`, goes back onto its unresolved
+/// placeholder in `src/a.ts`; re-creating `src/m.ts` links it again.
+#[test]
+fn a_call_through_a_re_export_of_a_deleted_file_goes_back_onto_its_placeholder() {
+    let harness = Harness::new();
+    let mut files: Vec<(&str, &str)> =
+        FILLERS.iter().map(|path| (*path, "export const filler = 1;\n")).collect();
+    let m = "export function f() {\n  return 1;\n}\n";
+    files.extend([
+        ("src/m.ts", m),
+        ("src/b.ts", "export { f } from \"./m\";\n"),
+        ("src/a.ts", "import { f } from \"./b\";\nexport function g() {\n  return f();\n}\n"),
+    ]);
+    for (path, contents) in &files {
+        harness.write(path, contents);
+        harness.route(path);
+    }
+    let linked = vec![("src/m.ts:f".to_string(), true, true)];
+    assert_eq!(calls_of(&harness, "src/a.ts"), linked, "linked through the re-export");
+
+    delete(&harness, "src/m.ts");
+
+    let calls = calls_of(&harness, "src/a.ts");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(
+        calls[0].0.starts_with("src/a.ts:") && !calls[0].1 && !calls[0].2,
+        "on its placeholder: {calls:?}"
+    );
+    assert_eq!(dangling(&harness), 0);
+    assert!(owed(&harness).is_empty(), "{:?}", owed(&harness));
+
+    harness.write("src/m.ts", m);
+    harness.route("src/m.ts");
+
+    assert_eq!(calls_of(&harness, "src/a.ts"), linked, "linked again");
+    assert_eq!(dangling(&harness), 0);
 }

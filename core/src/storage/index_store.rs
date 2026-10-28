@@ -856,6 +856,85 @@ mod tests {
         assert_eq!(store.with(semantic_file_rows), (left.clone(), left));
     }
 
+    /// A store whose connection enforces no foreign key, as the daemon's
+    /// does: a gone file's node is deleted with other files' edges into it.
+    fn store_without_foreign_keys() -> IndexStore {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+        IndexStore::new(conn)
+    }
+
+    /// `lib.ts`'s `File` node, imported by `use.ts` and `other.ts` (linked
+    /// `IMPORTS` edges into it), and `lib.ts`'s own import of `other.ts`.
+    fn imported_lib(store: &IndexStore) {
+        let file =
+            |path: &str| NodeRecord::new(format!("File:{path}"), "File", path, path, path, "typescript");
+        let import = |from: &str, to: &str| {
+            crate::storage::write::EdgeRecord::new(
+                format!("i:{from}->{to}"),
+                format!("File:{from}"),
+                format!("File:{to}"),
+                "IMPORTS",
+                "tree-sitter",
+                true,
+            )
+        };
+        let diff = Diff {
+            upsert_nodes: vec![file("lib.ts"), file("use.ts"), file("other.ts")],
+            upsert_edges: vec![
+                import("use.ts", "lib.ts"),
+                import("other.ts", "lib.ts"),
+                import("lib.ts", "other.ts"),
+            ],
+            ..Default::default()
+        };
+        store.unit(Unit::WatcherApply, |writer| writer.apply_diff_linked(&diff, "seed")).unwrap();
+    }
+
+    /// A gone file's importers are returned and recorded as owed a
+    /// re-extract in the delete's own commit, keyed by the importer with the
+    /// gone file as trigger; its own import of another file makes nobody owed.
+    #[test]
+    fn a_gone_file_owes_its_importers_a_re_extract_in_the_same_commit() {
+        let store = store_without_foreign_keys();
+        imported_lib(&store);
+
+        let importers = store
+            .unit(Unit::WatcherApply, |writer| {
+                writer.apply_file_diff_linked(&mut Diff::default(), "lib.ts", FileScope::Gone, "test")
+            })
+            .unwrap();
+
+        assert_eq!(importers, vec!["other.ts".to_string(), "use.ts".to_string()]);
+        assert_eq!(
+            store.with(schema::owed_reextracts).unwrap(),
+            vec![(
+                "typescript".to_string(),
+                "lib.ts".to_string(),
+                vec!["other.ts".to_string(), "use.ts".to_string()]
+            )]
+        );
+    }
+
+    /// A file that is still there owes nobody a re-extract.
+    #[test]
+    fn a_partial_or_complete_file_diff_owes_no_re_extract() {
+        for scope in [FileScope::Partial, FileScope::Complete] {
+            let store = store_without_foreign_keys();
+            imported_lib(&store);
+
+            let importers = store
+                .unit(Unit::WatcherApply, |writer| {
+                    writer.apply_file_diff_linked(&mut Diff::default(), "lib.ts", scope, "test")
+                })
+                .unwrap();
+
+            assert!(importers.is_empty(), "{scope:?}");
+            assert!(store.with(schema::owed_reextracts).unwrap().is_empty(), "{scope:?}");
+        }
+    }
+
     // --- One commit per step: what another connection sees ---------------
     //
     // `lib.ts` declares `parse` and `format`; `use.ts`'s `useString` calls
