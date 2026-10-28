@@ -1548,10 +1548,16 @@ impl PluginRegistry {
     /// Removes `file_path`'s rows from the index without asking its plugin,
     /// as a deletion from disk would: its nodes, their outgoing edges, its
     /// baseline and its semantic bookkeeping. Edges into its nodes from other
-    /// files stay, as for every node delete (`storage::write::apply_diff`).
+    /// files stay, as for every node delete (`storage::write::apply_diff`);
+    /// the files whose imports are linked to it are recorded as owed a
+    /// re-extract in the same commit. The seeded start re-extracts them in
+    /// its second `config_reindex::resume_owed_reextracts`, which
+    /// `daemon::activation` runs after the gate this reconcile opens.
     fn retire_file(&self, conn: &IndexStore, file_path: &str) -> Result<()> {
         conn.unit(Unit::WatcherApply, |store| {
-            store.apply_file_diff_linked(&mut Diff::default(), file_path, FileScope::Gone, "seeded deletion")
+            store
+                .apply_file_diff_linked(&mut Diff::default(), file_path, FileScope::Gone, "seeded deletion")
+                .map(|_| ())
         })
     }
 

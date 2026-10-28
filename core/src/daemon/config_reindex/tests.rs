@@ -445,6 +445,28 @@ fn select_counts_the_files_only_after_a_non_empty_selection() {
     );
 }
 
+/// A gone file's importers join the delta's own selection under one
+/// threshold: alone they are selected, joined with the delta's they can make
+/// it too many (a file most of the language imports reindexes the language
+/// instead of re-extracting it file by file); the trigger is never selected.
+#[test]
+fn a_gone_files_importers_join_the_selection_under_the_same_threshold() {
+    let conn = seeded();
+    let extra = paths(&["app/a.ts", "lib/f.ts", "lib/e.ts"]);
+
+    let selection = select_with(&conn, "ts", &[], &[], Some("lib/e.ts"), &extra).unwrap();
+    assert!(
+        matches!(&selection, Selection::Files(files) if files.iter().eq(["app/a.ts", "lib/f.ts"])),
+        "2 of 8 files: {selection:?}"
+    );
+
+    let selection = select_with(&conn, "ts", &[scope("pkg", &[])], &[], Some("lib/e.ts"), &extra).unwrap();
+    assert!(
+        matches!(selection, Selection::TooMany(_)),
+        "2 importers and 2 of pkg, 4 of 8 files: {selection:?}"
+    );
+}
+
 // -------------------------------------------------------------------------
 // run, end to end through the registry and the fake plugin
 // -------------------------------------------------------------------------
@@ -494,7 +516,8 @@ fn wire_import(from: usize, to: usize, specifier: &str) -> WireEdge {
     }
 }
 
-/// The walk: [`FILES`] files, none of them on disk; `f1` and `f2` import
+/// The walk: [`FILES`] files, none of them on disk (until
+/// [`Fixture::put_on_disk`]); `f1` and `f2` import
 /// `f0` as `lib`, `f3` imports it as `./f0`; then the trailer, when `facts`.
 fn set_walk(project: &Path, facts: Option<&str>) {
     set_walk_of(
@@ -589,6 +612,15 @@ struct Seen {
 }
 
 impl Fixture {
+    /// Writes the walked files to disk, empty: a re-extract skips a selected
+    /// file gone from disk (GM-659).
+    fn put_on_disk(&self) {
+        std::fs::create_dir_all(self.project.path().join("src")).unwrap();
+        for i in 0..FILES {
+            std::fs::write(self.project.path().join(src(i)), "").unwrap();
+        }
+    }
+
     fn answer(&self, result: &str) {
         test_plugin::set_resolution_changed_answer(&self.dir, Some(result));
     }
@@ -752,13 +784,13 @@ fn a_gitignore_change_reindexes_a_resolution_delta_language_whole() {
 
 /// `affected` selecting 3 of 10 files (30%, not more): exactly those get a
 /// `fileChanged`, nothing is re-walked, the other files keep their rows, the
-/// facts are replaced and no reindex is left pending. The fake answers every
-/// `fileChanged` with an empty diff and the files are not on disk, so a
-/// re-extracted file loses its rows: which rows are gone is which files were
-/// re-extracted.
+/// facts are replaced and no reindex is left pending. The files are on disk
+/// (a re-extract skips one that is not), so the fake's empty answers retire
+/// nothing.
 #[test]
 fn an_affected_answer_re_extracts_exactly_the_selected_files() {
     let fixture = fixture(true, false, Some("facts-1"));
+    fixture.put_on_disk();
     fixture.answer(&affected(&[&src(9)], IMPORTS_OF_LIB, "facts-2"));
 
     let seen = fixture.save_go_mod();
@@ -769,8 +801,29 @@ fn an_affected_answer_re_extracts_exactly_the_selected_files() {
     assert_eq!(seen.requests.len(), 1 + selected.len(), "one fileChanged each: {:?}", seen.requests);
     assert!(!seen.whole_reindex);
     assert_eq!(seen.spawns, 0);
-    let kept: BTreeSet<String> = (0..FILES).map(src).filter(|path| !selected.contains(path)).collect();
-    assert_eq!(indexed_files(&fixture.conn), kept);
+    assert_eq!(indexed_files(&fixture.conn).len(), FILES, "every file is on disk and keeps its row");
+    assert_eq!(fixture.facts().as_deref(), Some("facts-2"));
+    assert!(fixture.pending().is_empty());
+}
+
+/// A selected file already gone from disk is not re-extracted: its rows
+/// stay for its own deletion's change, which still finds its `File` node and
+/// re-extracts its importers. The rest of the selection is re-extracted.
+///
+/// Control: make `on_disk` return every selected path (the gone file is
+/// asked `fileChanged` and the fake's empty answer retires it).
+#[test]
+fn an_affected_answer_leaves_a_selected_file_gone_from_disk_to_its_own_deletion() {
+    let fixture = fixture(true, false, Some("facts-1"));
+    fixture.put_on_disk();
+    std::fs::remove_file(fixture.project.path().join(src(9))).unwrap();
+    fixture.answer(&affected(&[&src(9)], IMPORTS_OF_LIB, "facts-2"));
+
+    let seen = fixture.save_go_mod();
+
+    assert_eq!(re_extracted(&seen), [src(1), src(2)].into(), "{:?}", seen.requests);
+    assert!(!seen.whole_reindex);
+    assert!(indexed_files(&fixture.conn).contains(&src(9)), "the gone file keeps its rows");
     assert_eq!(fixture.facts().as_deref(), Some("facts-2"));
     assert!(fixture.pending().is_empty());
 }
@@ -842,6 +895,7 @@ fn a_whole_language_reindex_moves_an_unchanged_importers_edge() {
 #[test]
 fn an_affected_answer_sends_one_semantic_pass_after_the_re_extracts() {
     let fixture = fixture(true, true, Some("facts-1"));
+    fixture.put_on_disk();
     fixture.answer(&affected(&[], IMPORTS_OF_LIB, "facts-2"));
 
     let seen = fixture.save_go_mod();
@@ -983,6 +1037,7 @@ fn owed_re_extracts_left_by_a_killed_daemon_are_finished_at_the_next_start() {
             schema::owe_reextracts(conn, "gone-language", "x.gone", &["y.gone".to_string()])
         })
         .unwrap();
+    fixture.put_on_disk();
     // The old process died with the daemon.
     fixture.supervisor.sleep_now("the daemon was killed");
     let requests = test_plugin::requests(&fixture.dir).len();
@@ -1005,7 +1060,30 @@ fn owed_re_extracts_left_by_a_killed_daemon_are_finished_at_the_next_start() {
     assert!(owed(&fixture.conn).is_empty(), "every row is settled or dropped");
     assert_eq!(
         indexed_files(&fixture.conn).len(),
-        FILES - 2,
-        "the fake's empty answers retired the two re-extracted files"
+        FILES,
+        "the re-extracted files are on disk and keep their rows"
     );
+}
+
+/// An owed row naming a file gone from disk is settled without a
+/// re-extract: the file keeps its rows for its own deletion's change. The
+/// language's other owed file is re-extracted.
+///
+/// Control: make `on_disk` return every selected path (the gone file is
+/// asked `fileChanged` and the fake's empty answer retires it).
+#[test]
+fn an_owed_re_extract_of_a_file_gone_from_disk_is_settled_without_a_re_extract() {
+    let fixture = fixture(true, false, Some("facts-1"));
+    fixture.conn.with(|conn| schema::owe_reextracts(conn, "alpha", &src(0), &[src(4), src(7)])).unwrap();
+    fixture.put_on_disk();
+    std::fs::remove_file(fixture.project.path().join(src(7))).unwrap();
+    fixture.supervisor.sleep_now("the daemon was killed");
+    let requests = test_plugin::requests(&fixture.dir).len();
+
+    resume_owed_reextracts(&fixture.registry, &fixture.conn);
+
+    let asked = test_plugin::requests(&fixture.dir)[requests..].to_vec();
+    assert_eq!(asked, vec![format!("fileChanged {}", src(4))], "only the file on disk is re-extracted");
+    assert!(owed(&fixture.conn).is_empty(), "both rows are settled");
+    assert!(indexed_files(&fixture.conn).contains(&src(7)), "the gone file keeps its rows");
 }

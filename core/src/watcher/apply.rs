@@ -215,9 +215,21 @@ pub enum FileChangeOutcome {
 /// what other files resolve to (a Rust `mod` line placed a module file, or
 /// stopped placing it). Those files are selected and re-extracted here,
 /// inside the caller's exclusive section, by [`reextract_affected`]; the one
-/// semantic pass that follows covers them along with `file_path`. A
-/// re-extract round trip (`reextract`) ignores its own `affected`, so one
-/// edit never starts a second round.
+/// semantic pass that follows covers them along with `file_path`.
+///
+/// A deleted file's own answer adds the files whose imports were linked to
+/// it (`Writer::apply_file_diff_linked`, which records them as owed in the
+/// delete's commit): their edges into it dangle, and re-extracting them
+/// re-resolves each import to another candidate or an unresolved
+/// placeholder. They join the plugin's selection under the same threshold.
+///
+/// A re-extract round trip (`reextract`) ignores its own `affected` and gone
+/// importers, so one edit never starts a second round. Every re-extract
+/// loop skips a selected file already gone from disk and leaves it to its
+/// own deletion's change ([`reextract_affected`], `config_reindex`'s
+/// `on_disk`); only a file deleted during its round trip leaves its
+/// importers owed here, and the next start re-extracts them
+/// (`config_reindex::resume_owed_reextracts`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     reader: &mut R,
@@ -251,15 +263,21 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     )?;
 
     // Behaviour 9: a re-extract's own answer starts nothing.
-    let affected = if reextract { None } else { structural.affected };
-    let reextracted = match affected {
-        None | Some(ResolutionDelta::Unchanged) => Vec::new(),
+    let (affected, gone_importers) =
+        if reextract { (None, Vec::new()) } else { (structural.affected, structural.gone_importers) };
+    let (files, imports) = match affected {
+        None | Some(ResolutionDelta::Unchanged) => (Vec::new(), Vec::new()),
         Some(ResolutionDelta::Unknown { reason }) => {
             return Ok(FileChangeOutcome::ReindexLanguage {
                 reason: format!("the plugin cannot tell what {file_path} changed for resolution ({reason})"),
             });
         }
-        Some(ResolutionDelta::Affected { files, imports }) => match reextract_affected(
+        Some(ResolutionDelta::Affected { files, imports }) => (files, imports),
+    };
+    let reextracted = if files.is_empty() && imports.is_empty() && gone_importers.is_empty() {
+        Vec::new()
+    } else {
+        match reextract_affected(
             reader,
             writer,
             store,
@@ -271,11 +289,12 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
             file_changed_timeout,
             &files,
             &imports,
+            &gone_importers,
             on_timeout,
         ) {
             Ok(reextracted) => reextracted,
             Err(reason) => return Ok(FileChangeOutcome::ReindexLanguage { reason }),
-        },
+        }
     };
     let outcome = FileChangeOutcome::Applied { reextracted: reextracted.len() };
 
@@ -329,9 +348,11 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
 }
 
 /// Selects the indexed files of `language` that an edit of `file_path`
-/// answered `affected` for (GM-509's [`config_reindex::select`], the
-/// importers of a moved container key included), records them as owed a
-/// re-extract, and re-extracts each one. Returns the re-extracted paths,
+/// answered `affected` for, plus `gone_importers` (GM-509's threshold over
+/// both, [`config_reindex::select_with`], the importers of a moved container
+/// key included), records them as owed a re-extract, and re-extracts each
+/// one still on disk; one gone from disk is left to its own deletion's
+/// change, and its owed row is settled. Returns the re-extracted paths,
 /// which stay owed until the caller's semantic pass is done
 /// ([`settle_reextracts`]): a daemon killed before that leaves the rows, and
 /// the next start re-extracts them (`config_reindex::resume_owed_reextracts`).
@@ -341,7 +362,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
 /// failed, or a re-extract that failed (the loop stops there; the reindex's
 /// swap clears the rows).
 ///
-/// [`config_reindex::select`]: crate::daemon::config_reindex::select
+/// [`config_reindex::select_with`]: crate::daemon::config_reindex::select_with
 #[allow(clippy::too_many_arguments)]
 fn reextract_affected<R: BufRead + Send, W: Write>(
     reader: &mut R,
@@ -355,11 +376,14 @@ fn reextract_affected<R: BufRead + Send, W: Write>(
     file_changed_timeout: Duration,
     files: &[crate::protocol::types::PathScope],
     imports: &[crate::protocol::types::ImportSelector],
+    gone_importers: &[String],
     on_timeout: &mut dyn FnMut(),
 ) -> std::result::Result<Vec<String>, String> {
-    use crate::daemon::config_reindex::{select, Selection};
+    use crate::daemon::config_reindex::{select_with, Selection};
 
-    let selected = match store.step(|conn| select(conn, language, files, imports, Some(file_path))) {
+    let selected = match store
+        .step(|conn| select_with(conn, language, files, imports, Some(file_path), gone_importers))
+    {
         Ok(Selection::Nothing) => return Ok(Vec::new()),
         Ok(Selection::Files(selected)) => selected.into_iter().collect::<Vec<_>>(),
         Ok(Selection::TooMany(why)) => return Err(format!("{file_path} changed resolution: {why}")),
@@ -368,6 +392,14 @@ fn reextract_affected<R: BufRead + Send, W: Write>(
     store
         .step(|conn| schema::owe_reextracts(conn, language, file_path, &selected))
         .map_err(|err| format!("recording what {file_path} changed failed ({err:#})"))?;
+    // A file deleted in the same batch is not re-extracted as a live one:
+    // its own change retires it and re-extracts its importers.
+    let (selected, gone): (Vec<String>, Vec<String>) =
+        selected.into_iter().partition(|path| project_root.join(path).exists());
+    settle_reextracts(store, language, &gone);
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
     let started = std::time::Instant::now();
     for (index, path) in selected.iter().enumerate() {
         if let Err(err) = apply_file_change_in(
@@ -824,6 +856,10 @@ struct RoundTrip {
     /// [`FileChangeDiff::affected`]: what a `fileChanged`'s edit changed for
     /// other files' resolution (GM-507). Read only after a `fileChanged`.
     affected: Option<ResolutionDelta>,
+    /// The files whose imports were linked to a `fileChanged`'s file that
+    /// turned out gone, already recorded as owed a re-extract
+    /// (`Writer::apply_file_diff_linked`). Empty otherwise.
+    gone_importers: Vec<String>,
 }
 
 /// The id for the semantic pass that follows a file change, derived from
@@ -929,10 +965,11 @@ fn round_trip<R: BufRead + Send, W: Write>(
     let complete = response.result.complete;
     let affected = response.result.affected.take();
     let mut diff = to_storage_diff(response.result, &mut PathWarnings::default());
+    let mut gone_importers = Vec::new();
     match (&request.message, project_root) {
         (ControlMessage::FileChanged { file_path, .. }, Some(root)) => {
             let scope = file_scope(root, file_path, &diff, complete);
-            store.apply_file_diff_linked(&mut diff, file_path, scope, method)?;
+            gone_importers = store.apply_file_diff_linked(&mut diff, file_path, scope, method)?;
         }
         (ControlMessage::SemanticPass { .. }, _) => store.apply_semantic_diff_linked(&mut diff, method)?,
         _ => store.apply_diff_linked(&diff, method)?,
@@ -965,6 +1002,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
         unfinished_files: response.unfinished_files,
         upserted_edges: diff.upsert_edges.iter().map(|edge| edge.id.clone()).collect(),
         affected,
+        gone_importers,
     })
 }
 

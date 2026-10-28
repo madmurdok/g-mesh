@@ -20,12 +20,15 @@
 //! they carry the importer's path) and the edges out of them. Container nodes
 //! have an empty `filePath` and belong to no file. Edges *into* a removed node
 //! from another file are left alone, as `storage::write::apply_diff`
-//! documents for every node delete.
+//! documents for every node delete. For a gone file, core then re-extracts
+//! the files whose imports are linked to it ([`importers_of`],
+//! `Writer::apply_file_diff_linked`), which re-sends those imports onto
+//! another candidate or an unresolved placeholder.
 
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::storage::write::Diff;
 
@@ -94,6 +97,33 @@ pub(crate) fn widen(conn: &Connection, file_path: &str, scope: FileScope, diff: 
         }
     }
     Ok(())
+}
+
+/// The language of `file_path`'s `File` node and the other files whose
+/// `IMPORTS` edges are linked to it, sorted; `None` when the file has no
+/// `File` node. Read before a gone file's rows are deleted: those edges are
+/// left pointing at the deleted node (see the module doc), and the importers
+/// are what core re-extracts so their imports fall back to another candidate
+/// or come back as unresolved placeholders. A container a file's import is
+/// linked to is not covered: one losing its last member leaves its importers
+/// dangling until they are next reindexed (`graph::containers`).
+pub(crate) fn importers_of(conn: &Connection, file_path: &str) -> Result<Option<(String, Vec<String>)>> {
+    let language: Option<String> = conn
+        .prepare_cached("SELECT language FROM nodes WHERE filePath = ?1 AND kind = 'File' LIMIT 1")
+        .and_then(|mut stmt| stmt.query_row(params![file_path], |row| row.get(0)).optional())
+        .context("failed to read the file's language")?;
+    let Some(language) = language else { return Ok(None) };
+    let importers = conn
+        .prepare_cached(
+            "SELECT DISTINCT src.filePath FROM nodes t
+             JOIN edges e ON e.toId = t.id AND e.kind = 'IMPORTS'
+             JOIN nodes src ON src.id = e.fromId
+             WHERE t.filePath = ?1 AND t.kind = 'File' AND src.filePath <> ?1 AND src.filePath <> ''
+             ORDER BY 1",
+        )
+        .and_then(|mut stmt| stmt.query_map(params![file_path], |row| row.get(0))?.collect())
+        .context("failed to read the file's importers")?;
+    Ok(Some((language, importers)))
 }
 
 /// Deletes `file_path`'s `indexed_files` baseline, for a file that is gone.

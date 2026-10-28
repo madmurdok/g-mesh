@@ -279,7 +279,9 @@ pub fn run_with_progress(
 
 /// Removes every row `language` has in the index, through the watcher's own
 /// path for a deleted file, one file at a time. Containers (`filePath = ''`)
-/// are not files: they go with their last member.
+/// are not files: they go with their last member. The re-extracts that path
+/// records as owed to a deleted file's importers name files purged here too,
+/// so the language's owed re-extracts are cleared with its resolution facts.
 fn purge_language(conn: &IndexStore, language: &str) -> Result<()> {
     let paths: Vec<String> = conn.with(|conn| -> Result<Vec<String>> {
         let mut stmt = conn
@@ -297,7 +299,10 @@ fn purge_language(conn: &IndexStore, language: &str) -> Result<()> {
             let mut diff = Diff::default();
             store.apply_file_diff_linked(&mut diff, path, FileScope::Gone, "purge a failed language")?;
         }
-        store.step(|conn| schema::set_resolution_facts(conn, language, None))
+        store.step(|conn| {
+            schema::clear_owed_reextracts(conn, language)?;
+            schema::set_resolution_facts(conn, language, None)
+        })
     })
 }
 
@@ -1102,6 +1107,43 @@ mod tests {
         assert!(
             schema::bulk_index_completed(&guard).unwrap(),
             "the walk is complete for every language it could index, so bulkIndexedAt is set"
+        );
+    }
+
+    /// Purging a language whose files import each other leaves none of its
+    /// owed re-extracts: the delete of an imported file owes its importer one,
+    /// and that importer is purged too.
+    ///
+    /// Control: drop the `clear_owed_reextracts` call in `purge_language`
+    /// (the row `src/a.beta-src`'s delete owes `src/b.beta-src` stays).
+    #[test]
+    fn purging_a_language_leaves_none_of_its_owed_re_extracts() {
+        use crate::storage::write::{EdgeRecord, NodeRecord};
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+        let conn = IndexStore::new(conn);
+        let file = |path: &str| NodeRecord::new(format!("File:{path}"), "File", path, path, path, "beta");
+        let diff = Diff {
+            upsert_nodes: vec![file("src/a.beta-src"), file("src/b.beta-src")],
+            upsert_edges: vec![EdgeRecord::new(
+                "i:b->a",
+                "File:src/b.beta-src",
+                "File:src/a.beta-src",
+                "IMPORTS",
+                "tree-sitter",
+                true,
+            )],
+            ..Default::default()
+        };
+        conn.unit(Unit::WatcherApply, |writer| writer.apply_diff_linked(&diff, "seed")).unwrap();
+
+        purge_language(&conn, "beta").unwrap();
+
+        assert_eq!(count(&conn, "nodes"), 0);
+        assert!(
+            conn.with(schema::owed_reextracts).unwrap().is_empty(),
+            "no owed re-extract outlives the purge"
         );
     }
 }
