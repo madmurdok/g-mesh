@@ -52,18 +52,19 @@ pub fn escapes(normalized: &str) -> bool {
 }
 
 /// `target` resolved against the project-relative directory `dir`, or `None`
-/// when that leaves the project, names the directory's root itself, or
-/// `target` is absolute (a POSIX root or a drive letter). Used for every
-/// target a manifest or config declares: a package's entries, an `imports`
-/// key's targets, a tsconfig `paths` target. As in tsc, `\\` in `target`
-/// is a separator on every host.
+/// when that leaves the project or `target` is empty or absolute (a POSIX
+/// root or a drive letter). A target naming the project root itself gives
+/// [`normalize`]'s `.`, whose only candidates are the root's `index` files
+/// (`resolve::candidate_paths`). Used for every target a manifest or config
+/// declares: a package's entries, an `imports` key's targets, a tsconfig
+/// `paths` target. As in tsc, `\\` in `target` is a separator on every host.
 pub fn inside(dir: &str, target: &str) -> Option<String> {
     let target = with_forward_slashes(target);
     if target.is_empty() || is_rooted(&target) {
         return None;
     }
     let joined = normalize(&join(dir, &target));
-    (!escapes(&joined)).then_some(joined)
+    (joined == "." || !escapes(&joined)).then_some(joined)
 }
 
 /// `dir` and every ancestor of it, nearest first, ending with the root `""`.
