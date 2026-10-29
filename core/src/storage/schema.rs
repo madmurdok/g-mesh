@@ -594,7 +594,9 @@ CREATE TABLE IF NOT EXISTS pending_reindex (
 -- re-extracted and removed once all of them and their semantic pass are done.
 -- A row outliving its daemon means the loop was interrupted: the next start
 -- re-extracts them again (`daemon::config_reindex::resume_owed_reextracts`).
--- `trigger` is the edited file. A workspace reindex swap removes the
+-- `trigger` is the edited file, or a deleted one whose importers are owed
+-- (`storage::index_store::Writer::apply_file_diff_linked`, in the delete's
+-- commit). A workspace reindex swap removes the
 -- language's rows. Added by `CREATE TABLE IF NOT EXISTS`, so an existing
 -- index gains it without a schema-version bump.
 CREATE TABLE IF NOT EXISTS reextract_owed_files (

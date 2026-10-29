@@ -307,6 +307,28 @@ impl Index {
         self.strings("SELECT filePath FROM nodes WHERE name = ?1 AND kind = 'Function' ORDER BY 1", [name])
     }
 
+    /// `target file` of each resolved `IMPORTS` edge out of `from`.
+    fn imports_of(&self, from: &str) -> Vec<String> {
+        self.strings(
+            "SELECT t.filePath FROM edges e JOIN nodes f ON f.id = e.fromId JOIN nodes t ON t.id = e.toId \
+             WHERE e.kind = 'IMPORTS' AND e.resolved = 1 AND f.filePath = ?1 ORDER BY 1",
+            [from],
+        )
+    }
+
+    /// `IMPORTS` and `CALLS` edges whose target node does not exist, by id.
+    fn dangling(&self) -> Vec<String> {
+        self.strings(
+            "SELECT e.id FROM edges e LEFT JOIN nodes t ON t.id = e.toId \
+             WHERE e.kind IN ('IMPORTS', 'CALLS') AND t.id IS NULL ORDER BY 1",
+            [],
+        )
+    }
+
+    fn owed_reextracts(&self) -> Vec<String> {
+        self.strings("SELECT filePath FROM reextract_owed_files ORDER BY 1", [])
+    }
+
     fn strings<P: rusqlite::Params>(&self, sql: &str, params: P) -> Vec<String> {
         let Ok(mut statement) = self.0.prepare(sql) else { return vec![format!("unreadable: {sql}")] };
         statement
@@ -477,5 +499,78 @@ async fn an_unstamped_seed_is_reconciled_again_and_a_stamped_one_starts_plain() 
         })
         .await;
     harness.await_log_line("semantic pass over 1 semantic-pending typescript file(s)").await;
+    harness.stop(&worktree, client).await;
+}
+
+/// A file the worktree does not have (`src/m.ts`, deleted there) is retired
+/// by the seeded reconcile, and its unchanged importer `src/a.ts` (not
+/// reparsed) is re-extracted in the same start, once its first tool call
+/// activates it: `./m` falls back to
+/// `src/m/index.ts`, no edge is left pointing at the retired file, nothing
+/// stays owed. The reconcile is held so the activation's first read of the
+/// owed re-extracts runs before the reconcile records any.
+///
+/// Control: drop the second `resume_owed_reextracts` call in
+/// `ActivationCtx::activate` (after `seed_reconciled.recv()`): `./m` stays
+/// on the retired `src/m.ts` and its row stays owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_the_seeded_reconcile_retires_has_its_importer_re_extracted_in_the_same_start() {
+    let mut harness = Harness::new();
+    let main = harness.main.clone();
+    for (relative, contents) in [
+        ("src/m.ts", function("mThing", 1)),
+        ("src/m/index.ts", function("mThing", 2)),
+        ("src/a.ts", format!("import {{ mThing }} from \"./m\";\n{}", function("aThing", 1))),
+    ] {
+        write(&main, relative, &contents);
+    }
+    git(&main, &["add", "src"]);
+    git(&main, &["commit", "-q", "-m", "m"]);
+    for relative in ["src/m.ts", "src/m/index.ts", "src/a.ts"] {
+        common::backdate_an_hour(&main.join(relative));
+    }
+    harness.index_main().await;
+    assert_eq!(
+        Index::open(&main).unwrap().imports_of("src/a.ts"),
+        ["src/m.ts"],
+        "main links ./m to src/m.ts"
+    );
+    harness.add_worktree();
+    let worktree = harness.worktree.clone();
+    fs::remove_file(worktree.join("src/m.ts")).unwrap();
+    let hold = harness.aux.path().join("hold-the-seeded-reconcile");
+    fs::write(&hold, "").unwrap();
+
+    let client = harness.connect(&worktree, &[(HOLD_ENV, &hold)]).await;
+    harness.await_log_line("holding the seeded reconcile").await;
+    // The first tool call activates the daemon; it waits for the reconcile.
+    let client = std::sync::Arc::new(client);
+    let call = tokio::spawn({
+        let client = std::sync::Arc::clone(&client);
+        async move { definition(&client, "aThing").await }
+    });
+    // Time for the activation's first read of the owed re-extracts, which
+    // finds none while the reconcile is held.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    fs::remove_file(&hold).unwrap();
+    call.await.unwrap();
+    harness.await_seed_settled().await;
+    harness
+        .await_index(&worktree, "the owed re-extract of src/a.ts", |index| index.owed_reextracts().is_empty())
+        .await;
+
+    let index = Index::open(&worktree).unwrap();
+    assert!(!index.files().contains(&"src/m.ts".to_string()), "src/m.ts retired");
+    assert_eq!(
+        index.imports_of("src/a.ts"),
+        ["src/m/index.ts"],
+        "./m falls back (dangling: {:?}); daemon log:\n{}",
+        index.dangling(),
+        harness.log_text()
+    );
+    assert_eq!(index.dangling(), Vec::<String>::new());
+    assert_eq!(index.owed_reextracts(), Vec::<String>::new());
+    drop(index);
+    let client = std::sync::Arc::into_inner(client).expect("the call is done with the client");
     harness.stop(&worktree, client).await;
 }

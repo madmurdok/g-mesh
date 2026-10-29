@@ -192,14 +192,15 @@ pub fn link_all(conn: &mut Connection) -> Result<LinkSummary> {
 ///    the two triggers answer the same question either way, since a
 ///    placeholder that already linked no longer has a row to match again.
 ///
-/// Not covered, deliberately: a file *deleted* from the project, or a
-/// container's *last* member leaving (`graph::containers` GCs it). Either
-/// node's outgoing... no, *incoming*: the edges pointing at it go when
-/// something deletes the node; the importers' edges then come back as fresh
-/// placeholders the next time those importers are reindexed, rather than
-/// being re-placeholdered eagerly here - `graph::containers`' own module doc
-/// documents the container half of this and confirms it is the same
-/// deliberate non-eager behaviour this module already had for a deleted file.
+/// Not covered here: a file *deleted* from the project, or a container's
+/// *last* member leaving (`graph::containers` GCs it). The importers' edges
+/// into the deleted node are left pointing at it, not re-placeholdered by
+/// this pass. For a file, core re-extracts its importers in the delete's
+/// round trip (`storage::file_rows::importers_of`,
+/// `watcher::apply::apply_file_change_in`), and each import falls back to
+/// another candidate or comes back as an unresolved placeholder. For a
+/// container, the edges dangle until those importers are next reindexed, as
+/// `graph::containers`' own module doc documents.
 pub fn link_diff(conn: &mut Connection, diff: &Diff) -> Result<LinkSummary> {
     let mut placeholders: Vec<Placeholder> = diff
         .upsert_nodes
@@ -325,7 +326,7 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
         return Ok(summary);
     }
 
-    let tx = conn.transaction().context("failed to start the import-linking transaction")?;
+    let tx = conn.savepoint().context("failed to start the import-linking savepoint")?;
     {
         let mut find_file = tx
             .prepare("SELECT id FROM nodes WHERE kind = ?1 AND filePath = ?2")
@@ -416,7 +417,7 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
             }
         }
     }
-    tx.commit().context("failed to commit the import-linking transaction")?;
+    tx.commit().context("failed to commit the import-linking savepoint")?;
 
     Ok(summary)
 }

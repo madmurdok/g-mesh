@@ -123,8 +123,12 @@ fn seeded() -> Connection {
 }
 
 fn select(conn: &Connection, files: &[PathScope], imports: &[ImportSelector]) -> Vec<String> {
-    let (selected, indexed) = select_affected(conn, "ts", files, imports).unwrap();
-    assert_eq!(indexed, TS_FILES.len(), "the language's indexed File nodes, and only its own");
+    let selected = select_affected(conn, "ts", files, imports).unwrap();
+    assert_eq!(
+        indexed_file_count(conn, "ts").unwrap(),
+        TS_FILES.len(),
+        "the language's indexed File nodes, and only its own"
+    );
     selected.into_iter().collect()
 }
 
@@ -230,6 +234,240 @@ fn file_scopes_and_import_selectors_are_one_union() {
 }
 
 // -------------------------------------------------------------------------
+// select_affected: keyed lookup of exact targets vs the import scan
+// -------------------------------------------------------------------------
+
+/// `(import scans, file lists)` this thread has run so far.
+fn read_counts() -> (usize, usize) {
+    (reads::IMPORT_SCANS.with(std::cell::Cell::get), reads::FILE_LISTS.with(std::cell::Cell::get))
+}
+
+/// What [`scan_imports`] alone selects for the delta: the reference every
+/// keyed answer must equal.
+fn scanned(conn: &Connection, files: &[PathScope], imports: &[ImportSelector]) -> Vec<String> {
+    let mut selected: BTreeSet<String> = indexed_files_of(conn, "ts")
+        .unwrap()
+        .into_iter()
+        .filter(|path| files.iter().any(|scope| scope.contains(path)))
+        .collect();
+    let selectors: Vec<&ImportSelector> = imports.iter().collect();
+    scan_imports(conn, "ts", &selectors, &mut selected).unwrap();
+    selected.into_iter().collect()
+}
+
+fn scoped_target(importers: PathScope, scope_kind: TargetScopeKind, key: &str) -> ImportSelector {
+    ImportSelector { importers, by: ImportMatch::Target { scope_kind, matcher: exact(key) } }
+}
+
+/// `(what the case pins, file scopes, selectors, the expected selection)`
+/// for every delta made of `Target/Exact` selectors (and file scopes).
+#[allow(clippy::type_complexity)]
+fn exact_cases() -> Vec<(&'static str, Vec<PathScope>, Vec<ImportSelector>, Vec<String>)> {
+    use TargetScopeKind::{Container, File};
+    vec![
+        (
+            "file linked (no placeholder row); py's importer of the same file left out",
+            vec![],
+            vec![by_target(File, exact("lib/e.ts"))],
+            paths(&["app/a.ts", "lib/f.ts"]),
+        ),
+        ("file placeholder", vec![], vec![by_target(File, exact("lib/f.ts"))], paths(&["pkg/h.ts"])),
+        ("a container key is not a file target", vec![], vec![by_target(File, exact("pkg.subtle"))], vec![]),
+        ("container linked", vec![], vec![by_target(Container, exact("pkg.subtle"))], paths(&["appx/d.ts"])),
+        (
+            "container placeholder",
+            vec![],
+            vec![by_target(Container, exact("pkg.sub.mod"))],
+            paths(&["pkg/g.ts"]),
+        ),
+        ("container exact is not a prefix", vec![], vec![by_target(Container, exact("pkg.sub"))], vec![]),
+        (
+            "a file path is not a container target",
+            vec![],
+            vec![by_target(Container, exact("lib/e.ts"))],
+            vec![],
+        ),
+        (
+            "importer scope on a linked file",
+            vec![],
+            vec![scoped_target(scope("", &["app"]), File, "lib/e.ts")],
+            paths(&["lib/f.ts"]),
+        ),
+        (
+            "importer scope on a container placeholder, inside",
+            vec![],
+            vec![scoped_target(scope("pkg", &[]), Container, "pkg.sub.mod")],
+            paths(&["pkg/g.ts"]),
+        ),
+        (
+            "importer scope on a container placeholder, outside",
+            vec![],
+            vec![scoped_target(scope("app", &[]), Container, "pkg.sub.mod")],
+            vec![],
+        ),
+        (
+            "several exact selectors",
+            vec![],
+            vec![
+                by_target(File, exact("lib/e.ts")),
+                by_target(File, exact("lib/f.ts")),
+                by_target(Container, exact("pkg.subtle")),
+            ],
+            paths(&["app/a.ts", "appx/d.ts", "lib/f.ts", "pkg/h.ts"]),
+        ),
+        (
+            "union with a file scope",
+            vec![scope("lib", &[])],
+            vec![by_target(File, exact("lib/e.ts"))],
+            paths(&["app/a.ts", "lib/e.ts", "lib/f.ts"]),
+        ),
+    ]
+}
+
+/// A delta of only `Target/Exact` selectors is answered by the keyed lookup:
+/// no import scan runs, and the answer is exactly the scan's.
+///
+/// Controls: in `select_affected`, send every selector to `scanned` (a scan
+/// runs); drop either UNION half of `indexed_importers`' File or Container
+/// arm, or the `selector.importers.contains` filter (a case differs from the
+/// scan).
+#[test]
+fn an_exact_target_delta_runs_no_scan_and_selects_what_the_scan_does() {
+    let conn = seeded();
+    for (case, files, imports, expected) in exact_cases() {
+        let before = read_counts();
+        let selected: Vec<String> =
+            select_affected(&conn, "ts", &files, &imports).unwrap().into_iter().collect();
+        let after = read_counts();
+        assert_eq!(after.0, before.0, "{case}: an exact-only delta ran an import scan");
+        assert_eq!(
+            selected,
+            scanned(&conn, &files, &imports),
+            "{case}: the keyed answer differs from the scan"
+        );
+        assert_eq!(selected, expected, "{case}");
+    }
+}
+
+/// Any other selector (`Specifier`, `Target` with `Under`, `StartsWith` or
+/// `NonRelative`) is answered by the scan, once per call however many there
+/// are, mixed with exact ones or not; the union is still the scan's.
+///
+/// Control: in `select_affected`, drop the `if !scanned.is_empty()` guard
+/// (the exact-only delta scans once).
+#[test]
+fn non_exact_selectors_share_one_scan_and_exact_only_runs_none() {
+    use TargetScopeKind::{Container, File};
+    let conn = seeded();
+    let mixed = vec![
+        by_specifier(exact("@lib/e")),
+        by_specifier(Matcher::StartsWith("../".to_string())),
+        by_target(Container, under("pkg.sub", ".")),
+        by_target(File, Matcher::NonRelative),
+        by_target(Container, exact("pkg.subtle")),
+        by_target(File, exact("lib/f.ts")),
+    ];
+    for (case, imports, scans) in [
+        ("one specifier selector", vec![by_specifier(exact("@lib/e"))], 1),
+        ("one container Under selector", vec![by_target(Container, under("pkg.sub", "."))], 1),
+        ("mixed exact and non-exact", mixed, 1),
+        (
+            "exact only",
+            vec![by_target(File, exact("lib/e.ts")), by_target(Container, exact("pkg.subtle"))],
+            0,
+        ),
+    ] {
+        let before = read_counts();
+        let selected: Vec<String> =
+            select_affected(&conn, "ts", &[], &imports).unwrap().into_iter().collect();
+        let after = read_counts();
+        assert_eq!(after.0 - before.0, scans, "{case}: import scans");
+        assert_eq!(selected, scanned(&conn, &[], &imports), "{case}");
+    }
+}
+
+/// The language's file list is read only for a delta with file scopes: an
+/// imports-only delta lists no files, whatever it selects.
+///
+/// Control: in `select_affected`, drop the `if !files.is_empty()` guard.
+#[test]
+fn an_imports_only_delta_never_lists_files() {
+    let conn = seeded();
+    for imports in [
+        vec![],
+        vec![by_target(TargetScopeKind::File, exact("nowhere.ts"))],
+        vec![by_target(TargetScopeKind::File, exact("lib/e.ts"))],
+        vec![by_specifier(exact("@lib/e"))],
+    ] {
+        let before = read_counts();
+        select_affected(&conn, "ts", &[], &imports).unwrap();
+        assert_eq!(read_counts().1, before.1, "{imports:?} listed the language's files");
+    }
+    let before = read_counts();
+    select_affected(&conn, "ts", &[scope("lib", &[])], &[]).unwrap();
+    assert_eq!(read_counts().1 - before.1, 1, "a file scope lists the files once");
+}
+
+/// `select` counts the language's files only once something is selected: a
+/// delta that selects nothing, or only its own trigger, reads no file list at
+/// all. The count still includes the trigger while the selection leaves it
+/// out (3 of 8 is too many; the same 3 less the trigger is 2 of 8, not 2 of 7).
+///
+/// Control: in `select`, move `indexed_file_count` above the `is_empty`
+/// return (`Nothing` reads one list).
+#[test]
+fn select_counts_the_files_only_after_a_non_empty_selection() {
+    let conn = seeded();
+    let waiting_at = |key: &str| vec![by_target(TargetScopeKind::File, exact(key))];
+
+    for (case, imports, trigger) in [
+        ("selects nothing", waiting_at("nowhere.ts"), None),
+        ("selects only its trigger", waiting_at("lib/f.ts"), Some("pkg/h.ts")),
+    ] {
+        let before = read_counts();
+        let selection = super::select(&conn, "ts", &[], &imports, trigger).unwrap();
+        assert!(matches!(selection, Selection::Nothing), "{case}: {selection:?}");
+        assert_eq!(read_counts(), before, "{case}: no scan and no file list");
+    }
+
+    let before = read_counts();
+    let selection = super::select(&conn, "ts", &[], &waiting_at("lib/f.ts"), None).unwrap();
+    assert!(matches!(&selection, Selection::Files(files) if files.iter().eq(["pkg/h.ts"])), "{selection:?}");
+    assert_eq!(read_counts(), (before.0, before.1 + 1), "one count, no scan");
+
+    let app = [scope("app", &[])];
+    let selection = super::select(&conn, "ts", &app, &[], None).unwrap();
+    assert!(matches!(selection, Selection::TooMany(_)), "3 of 8 files: {selection:?}");
+    let selection = super::select(&conn, "ts", &app, &[], Some("app/a.ts")).unwrap();
+    assert!(
+        matches!(&selection, Selection::Files(files) if files.iter().eq(["app/b.ts", "app/sub/c.ts"])),
+        "2 of 8 files: {selection:?}"
+    );
+}
+
+/// A gone file's importers join the delta's own selection under one
+/// threshold: alone they are selected, joined with the delta's they can make
+/// it too many (a file most of the language imports reindexes the language
+/// instead of re-extracting it file by file); the trigger is never selected.
+#[test]
+fn a_gone_files_importers_join_the_selection_under_the_same_threshold() {
+    let conn = seeded();
+    let extra = paths(&["app/a.ts", "lib/f.ts", "lib/e.ts"]);
+
+    let selection = select_with(&conn, "ts", &[], &[], Some("lib/e.ts"), &extra).unwrap();
+    assert!(
+        matches!(&selection, Selection::Files(files) if files.iter().eq(["app/a.ts", "lib/f.ts"])),
+        "2 of 8 files: {selection:?}"
+    );
+
+    let selection = select_with(&conn, "ts", &[scope("pkg", &[])], &[], Some("lib/e.ts"), &extra).unwrap();
+    assert!(
+        matches!(selection, Selection::TooMany(_)),
+        "2 importers and 2 of pkg, 4 of 8 files: {selection:?}"
+    );
+}
+
+// -------------------------------------------------------------------------
 // run, end to end through the registry and the fake plugin
 // -------------------------------------------------------------------------
 
@@ -278,7 +516,8 @@ fn wire_import(from: usize, to: usize, specifier: &str) -> WireEdge {
     }
 }
 
-/// The walk: [`FILES`] files, none of them on disk; `f1` and `f2` import
+/// The walk: [`FILES`] files, none of them on disk (until
+/// [`Fixture::put_on_disk`]); `f1` and `f2` import
 /// `f0` as `lib`, `f3` imports it as `./f0`; then the trailer, when `facts`.
 fn set_walk(project: &Path, facts: Option<&str>) {
     set_walk_of(
@@ -373,6 +612,15 @@ struct Seen {
 }
 
 impl Fixture {
+    /// Writes the walked files to disk, empty: a re-extract skips a selected
+    /// file gone from disk (GM-659).
+    fn put_on_disk(&self) {
+        std::fs::create_dir_all(self.project.path().join("src")).unwrap();
+        for i in 0..FILES {
+            std::fs::write(self.project.path().join(src(i)), "").unwrap();
+        }
+    }
+
     fn answer(&self, result: &str) {
         test_plugin::set_resolution_changed_answer(&self.dir, Some(result));
     }
@@ -536,13 +784,13 @@ fn a_gitignore_change_reindexes_a_resolution_delta_language_whole() {
 
 /// `affected` selecting 3 of 10 files (30%, not more): exactly those get a
 /// `fileChanged`, nothing is re-walked, the other files keep their rows, the
-/// facts are replaced and no reindex is left pending. The fake answers every
-/// `fileChanged` with an empty diff and the files are not on disk, so a
-/// re-extracted file loses its rows: which rows are gone is which files were
-/// re-extracted.
+/// facts are replaced and no reindex is left pending. The files are on disk
+/// (a re-extract skips one that is not), so the fake's empty answers retire
+/// nothing.
 #[test]
 fn an_affected_answer_re_extracts_exactly_the_selected_files() {
     let fixture = fixture(true, false, Some("facts-1"));
+    fixture.put_on_disk();
     fixture.answer(&affected(&[&src(9)], IMPORTS_OF_LIB, "facts-2"));
 
     let seen = fixture.save_go_mod();
@@ -553,8 +801,29 @@ fn an_affected_answer_re_extracts_exactly_the_selected_files() {
     assert_eq!(seen.requests.len(), 1 + selected.len(), "one fileChanged each: {:?}", seen.requests);
     assert!(!seen.whole_reindex);
     assert_eq!(seen.spawns, 0);
-    let kept: BTreeSet<String> = (0..FILES).map(src).filter(|path| !selected.contains(path)).collect();
-    assert_eq!(indexed_files(&fixture.conn), kept);
+    assert_eq!(indexed_files(&fixture.conn).len(), FILES, "every file is on disk and keeps its row");
+    assert_eq!(fixture.facts().as_deref(), Some("facts-2"));
+    assert!(fixture.pending().is_empty());
+}
+
+/// A selected file already gone from disk is not re-extracted: its rows
+/// stay for its own deletion's change, which still finds its `File` node and
+/// re-extracts its importers. The rest of the selection is re-extracted.
+///
+/// Control: make `on_disk` return every selected path (the gone file is
+/// asked `fileChanged` and the fake's empty answer retires it).
+#[test]
+fn an_affected_answer_leaves_a_selected_file_gone_from_disk_to_its_own_deletion() {
+    let fixture = fixture(true, false, Some("facts-1"));
+    fixture.put_on_disk();
+    std::fs::remove_file(fixture.project.path().join(src(9))).unwrap();
+    fixture.answer(&affected(&[&src(9)], IMPORTS_OF_LIB, "facts-2"));
+
+    let seen = fixture.save_go_mod();
+
+    assert_eq!(re_extracted(&seen), [src(1), src(2)].into(), "{:?}", seen.requests);
+    assert!(!seen.whole_reindex);
+    assert!(indexed_files(&fixture.conn).contains(&src(9)), "the gone file keeps its rows");
     assert_eq!(fixture.facts().as_deref(), Some("facts-2"));
     assert!(fixture.pending().is_empty());
 }
@@ -626,6 +895,7 @@ fn a_whole_language_reindex_moves_an_unchanged_importers_edge() {
 #[test]
 fn an_affected_answer_sends_one_semantic_pass_after_the_re_extracts() {
     let fixture = fixture(true, true, Some("facts-1"));
+    fixture.put_on_disk();
     fixture.answer(&affected(&[], IMPORTS_OF_LIB, "facts-2"));
 
     let seen = fixture.save_go_mod();
@@ -767,6 +1037,7 @@ fn owed_re_extracts_left_by_a_killed_daemon_are_finished_at_the_next_start() {
             schema::owe_reextracts(conn, "gone-language", "x.gone", &["y.gone".to_string()])
         })
         .unwrap();
+    fixture.put_on_disk();
     // The old process died with the daemon.
     fixture.supervisor.sleep_now("the daemon was killed");
     let requests = test_plugin::requests(&fixture.dir).len();
@@ -789,7 +1060,30 @@ fn owed_re_extracts_left_by_a_killed_daemon_are_finished_at_the_next_start() {
     assert!(owed(&fixture.conn).is_empty(), "every row is settled or dropped");
     assert_eq!(
         indexed_files(&fixture.conn).len(),
-        FILES - 2,
-        "the fake's empty answers retired the two re-extracted files"
+        FILES,
+        "the re-extracted files are on disk and keep their rows"
     );
+}
+
+/// An owed row naming a file gone from disk is settled without a
+/// re-extract: the file keeps its rows for its own deletion's change. The
+/// language's other owed file is re-extracted.
+///
+/// Control: make `on_disk` return every selected path (the gone file is
+/// asked `fileChanged` and the fake's empty answer retires it).
+#[test]
+fn an_owed_re_extract_of_a_file_gone_from_disk_is_settled_without_a_re_extract() {
+    let fixture = fixture(true, false, Some("facts-1"));
+    fixture.conn.with(|conn| schema::owe_reextracts(conn, "alpha", &src(0), &[src(4), src(7)])).unwrap();
+    fixture.put_on_disk();
+    std::fs::remove_file(fixture.project.path().join(src(7))).unwrap();
+    fixture.supervisor.sleep_now("the daemon was killed");
+    let requests = test_plugin::requests(&fixture.dir).len();
+
+    resume_owed_reextracts(&fixture.registry, &fixture.conn);
+
+    let asked = test_plugin::requests(&fixture.dir)[requests..].to_vec();
+    assert_eq!(asked, vec![format!("fileChanged {}", src(4))], "only the file on disk is re-extracted");
+    assert!(owed(&fixture.conn).is_empty(), "both rows are settled");
+    assert!(indexed_files(&fixture.conn).contains(&src(7)), "the gone file keeps its rows");
 }

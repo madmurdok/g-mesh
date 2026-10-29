@@ -758,12 +758,12 @@ pub fn link_all(conn: &mut Connection, rules: &LinkRules) -> Result<LinkSummary>
 /// later provider through a star import) moves it to the new answer or
 /// unlinks it back onto its placeholder, as [`link`] describes (GM-491).
 ///
-/// Not covered, deliberately, and for the same reason `graph::imports` does
-/// not cover it: anything that seeds no trigger, so wakes no placeholder.
-/// Two known cases: a symbol *deleted* from the project (edges into a deleted
-/// node go when something deletes it, and the importers' edges come back as
-/// fresh placeholders the next time those importers are reindexed), and a
-/// visibility narrowing, which publishes no scope. Those are the only sense
+/// Not covered here: anything that seeds no trigger, so wakes no
+/// placeholder. Two known cases: a symbol *deleted* from the project, and a
+/// visibility narrowing, which publishes no scope. A linked edge into a
+/// deleted symbol goes back onto the placeholder in its `linkedFrom` when the
+/// node is deleted (`storage::write::apply_diff`), unresolved, and links again
+/// once a change wakes that placeholder. Those are the only sense
 /// in which this and [`link_all`] can disagree: whenever every change in a
 /// sequence of diffs seeds a trigger, the two produce the same edges
 /// (asserted by `link_all_and_link_diff_agree_on_the_same_end_state`).
@@ -1300,7 +1300,7 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
         return Ok(summary);
     }
 
-    let tx = conn.transaction().context("failed to start the symbol-linking transaction")?;
+    let tx = conn.savepoint().context("failed to start the symbol-linking savepoint")?;
     let untargeted_reexports;
     {
         // The (kind, source) groups still on the placeholder, and those it
@@ -1377,7 +1377,7 @@ fn link(conn: &mut Connection, pending: Pending, rules: &LinkRules) -> Result<Li
         }
         untargeted_reexports = resolver.untargeted_reexports.len();
     }
-    tx.commit().context("failed to commit the symbol-linking transaction")?;
+    tx.commit().context("failed to commit the symbol-linking savepoint")?;
 
     report_untargeted(untargeted, untargeted_reexports);
     Ok(summary)

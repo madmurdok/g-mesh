@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection};
 
 use crate::graph::containers;
 use crate::protocol::types::QualifiedPath;
@@ -295,7 +295,9 @@ impl Diff {
 /// Applies `diff` in a single SQLite transaction: edge deletes, node
 /// deletes, node upserts, edge upserts, in that order so edge FKs are
 /// always valid mid-transaction. Any failure rolls back the whole diff -
-/// nothing partial is ever committed.
+/// nothing partial is ever committed. The unit is a savepoint: standalone it
+/// commits on its own, inside a caller's transaction it becomes visible only
+/// when that transaction commits.
 ///
 /// Logical-container membership (`graph::containers`) is maintained inside
 /// the same transaction, in two halves around those writes: `detach` before
@@ -311,9 +313,9 @@ pub fn apply_diff(conn: &mut Connection, diff: &Diff) -> Result<()> {
         return Ok(());
     }
 
-    let tx = conn.transaction().context("failed to start transaction")?;
+    let tx = conn.savepoint().context("failed to start the diff savepoint")?;
     write_diff(&tx, diff)?;
-    tx.commit().context("failed to commit diff transaction")?;
+    tx.commit().context("failed to commit the diff savepoint")?;
     Ok(())
 }
 
@@ -349,7 +351,7 @@ pub fn apply_semantic_diff(conn: &mut Connection, diff: &mut Diff) -> Result<()>
         return Ok(());
     }
 
-    let tx = conn.transaction().context("failed to start transaction")?;
+    let tx = conn.savepoint().context("failed to start the diff savepoint")?;
     let stored = stored_node_ids(&tx, diff)?;
     let (kept, inserted): (Vec<NodeRecord>, Vec<NodeRecord>) =
         std::mem::take(&mut diff.upsert_nodes).into_iter().partition(|node| stored.contains(&node.id));
@@ -358,11 +360,11 @@ pub fn apply_semantic_diff(conn: &mut Connection, diff: &mut Diff) -> Result<()>
         .and_then(|()| kept.iter().try_for_each(|node| replace_untyped_calls(&tx, node)));
     diff.upsert_nodes.extend(kept);
     written?;
-    tx.commit().context("failed to commit diff transaction")?;
+    tx.commit().context("failed to commit the diff savepoint")?;
     Ok(())
 }
 
-fn write_diff_unless_empty(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
+fn write_diff_unless_empty(tx: &Connection, diff: &Diff) -> Result<()> {
     if diff.is_empty() {
         return Ok(());
     }
@@ -371,7 +373,7 @@ fn write_diff_unless_empty(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
 
 /// The ids of `diff`'s upserted nodes that have a row now and that `diff`
 /// does not delete first.
-fn stored_node_ids(tx: &Transaction<'_>, diff: &Diff) -> Result<HashSet<String>> {
+fn stored_node_ids(tx: &Connection, diff: &Diff) -> Result<HashSet<String>> {
     let deleted: HashSet<&str> = diff.delete_node_ids.iter().map(String::as_str).collect();
     let mut exists = tx
         .prepare("SELECT 1 FROM nodes WHERE id = ?1")
@@ -389,12 +391,13 @@ fn stored_node_ids(tx: &Transaction<'_>, diff: &Diff) -> Result<HashSet<String>>
 }
 
 /// [`apply_diff`]'s writes, inside a transaction the caller owns and commits.
-fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
+fn write_diff(tx: &Connection, diff: &Diff) -> Result<()> {
     let membership = containers::detach(tx, diff).context("failed to detach container members")?;
 
     for id in &diff.delete_edge_ids {
         tx.execute("DELETE FROM edges WHERE id = ?1", params![id]).context("failed to delete edge")?;
     }
+    let upserted: HashSet<&str> = diff.upsert_nodes.iter().map(|node| node.id.as_str()).collect();
     for id in &diff.delete_node_ids {
         // Explicitly, rather than leaning on the child tables' ON DELETE
         // CASCADE: `storage::connection::open` switches `foreign_keys` off on
@@ -412,16 +415,31 @@ fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
         // gets a fresh one from `EmbeddingPipeline::apply`, which embeds every
         // upserted node.
         //
-        // Edges into the node are deliberately *not* touched. One the plugin
-        // did not re-send because its id did not change (a file's `DEFINES`
-        // into a symbol whose body grew) is valid again the moment the same
-        // id is upserted below; one into a node that is really gone (another
-        // file's call to a deleted symbol) is the documented lazy dangling
-        // edge, repaired when that file is next reindexed. Both are rows a
-        // foreign key would refuse this delete over, which is why enforcement
-        // is off - see `storage::connection::open`. (`containers::detach`
-        // above does remove a member's container `DEFINES` edge, for its own
+        // Edges into the node are not deleted. One the plugin did not
+        // re-send because its id did not change (a file's `DEFINES` into a
+        // symbol whose body grew) is valid again the moment the same id is
+        // upserted below. One into a node that is really gone (not upserted
+        // by this diff) and that linking moved off a placeholder
+        // (`linkedFrom`, `graph::symbol_links`) goes back onto that
+        // placeholder, unresolved, as an unlink does: another file's call to
+        // a deleted symbol, which that file's own reparse would never revisit
+        // when it imports the symbol through a re-export. Any other edge into
+        // a gone node dangles until its file is reindexed; for an import
+        // linked to a gone file, core re-extracts the importer
+        // (`storage::file_rows::importers_of`). Both are rows a foreign key
+        // would refuse this delete over, which is why enforcement is off -
+        // see `storage::connection::open`. (`containers::detach` above does
+        // remove a member's container `DEFINES` edge, for its own
         // bookkeeping, and `attach` restores it.)
+        if !upserted.contains(id.as_str()) {
+            tx.prepare_cached(
+                "UPDATE edges SET toId = linkedFrom, resolved = 0, linkedFrom = NULL
+                 WHERE toId = ?1 AND linkedFrom IS NOT NULL",
+            )
+            .context("failed to prepare the unlink of edges into a deleted node")?
+            .execute(params![id])
+            .context("failed to unlink the edges into a deleted node")?;
+        }
         tx.execute("DELETE FROM declarations WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's declarations")?;
         tx.execute("DELETE FROM placeholder_targets WHERE nodeId = ?1", params![id])
@@ -619,7 +637,7 @@ fn write_diff(tx: &Transaction<'_>, diff: &Diff) -> Result<()> {
 }
 
 /// Replaces `node`'s `untyped_calls` rows with the ones it carries now.
-fn replace_untyped_calls(tx: &Transaction<'_>, node: &NodeRecord) -> Result<()> {
+fn replace_untyped_calls(tx: &Connection, node: &NodeRecord) -> Result<()> {
     // Untyped receiver calls are replaced wholesale too: a node re-sent
     // with an empty list (a plugin that stopped reporting, or a body that
     // no longer has such calls) loses its rows.
@@ -930,6 +948,75 @@ mod tests {
 
         assert_eq!(count(&conn, "nodes"), 0);
         assert_eq!(count(&conn, "vectors"), 0, "a deleted node's embedding must not outlive it");
+    }
+
+    /// `(toId, resolved, linkedFrom)` of edge `id`.
+    fn edge_target(conn: &Connection, id: &str) -> (String, bool, Option<String>) {
+        conn.query_row("SELECT toId, resolved, linkedFrom FROM edges WHERE id = ?1", [id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+    }
+
+    /// `a.ts`'s `g` calls `m.ts`'s `f` twice: `linked`, moved there off its
+    /// placeholder `p` by linking (`linkedFrom = p`), and `bound`, written
+    /// straight onto `f`. Foreign keys off, as on the daemon's connection.
+    fn linked_call() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![
+                    NodeRecord::new("g", "Function", "g", "g", "a.ts", "typescript"),
+                    NodeRecord::new("p", "Module", "f", "b.ts#f", "a.ts", "typescript"),
+                    NodeRecord::new("f", "Function", "f", "f", "m.ts", "typescript"),
+                ],
+                upsert_edges: vec![
+                    EdgeRecord::new("linked", "g", "f", "CALLS", "tree-sitter", true),
+                    EdgeRecord::new("bound", "g", "f", "CALLS", "semantic", true),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        conn.execute("UPDATE edges SET linkedFrom = 'p' WHERE id = 'linked'", []).unwrap();
+        conn
+    }
+
+    /// A deleted node no upsert of the same diff brings back: an edge
+    /// linking moved onto it goes back onto its placeholder, unresolved; an
+    /// edge with no placeholder to go back to is left as it was.
+    #[test]
+    fn deleting_a_node_puts_the_edges_linked_onto_it_back_on_their_placeholders() {
+        let mut conn = linked_call();
+
+        apply_diff(&mut conn, &Diff { delete_node_ids: vec!["f".to_string()], ..Default::default() })
+            .unwrap();
+
+        assert_eq!(edge_target(&conn, "linked"), ("p".to_string(), false, None));
+        assert_eq!(edge_target(&conn, "bound"), ("f".to_string(), true, None));
+    }
+
+    /// A node deleted and upserted in one diff (a changed symbol, same id)
+    /// keeps the edges linked onto it.
+    #[test]
+    fn a_node_deleted_and_upserted_in_one_diff_keeps_the_edges_linked_onto_it() {
+        let mut conn = linked_call();
+
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![NodeRecord::new("f", "Function", "f", "f", "m.ts", "typescript")],
+                delete_node_ids: vec!["f".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(edge_target(&conn, "linked"), ("f".to_string(), true, Some("p".to_string())));
+        assert_eq!(count(&conn, "nodes"), 3);
     }
 
     fn file_scoped_target(scope: &str, key: &str) -> PlaceholderTargetRecord {
