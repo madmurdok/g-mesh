@@ -29,7 +29,7 @@
 //! correct under tokio.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::{LockResult, Mutex, MutexGuard, PoisonError};
 
@@ -464,8 +464,11 @@ impl Writer<'_> {
     /// in the same commit as owed a re-extract (`reextract_owed_files`, with
     /// the gone file as trigger): their edges into it are left dangling, and
     /// re-extracting them re-resolves each import to another candidate or an
-    /// unresolved placeholder. The caller re-extracts them, or leaves the
-    /// rows to the next start's `config_reindex::resume_owed_reextracts`.
+    /// unresolved placeholder. Each importer is owed under its own language,
+    /// but only those of the gone file's language are returned: the calling
+    /// plugin re-extracts them, or leaves the rows to the next start's
+    /// `config_reindex::resume_owed_reextracts`, which is the only one to
+    /// re-extract an importer of another language (with its own plugin).
     /// Empty for any other scope.
     pub fn apply_file_diff_linked(
         &mut self,
@@ -486,8 +489,14 @@ impl Writer<'_> {
                     super::schema::clear_gone_file_semantic_rows(conn, file_path)?;
                 }
                 let Some((language, importers)) = importers else { return Ok(Vec::new()) };
-                super::schema::owe_reextracts(conn, &language, file_path, &importers)?;
-                Ok(importers)
+                let mut by_language: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for (importer_language, path) in importers {
+                    by_language.entry(importer_language).or_default().push(path);
+                }
+                for (importer_language, paths) in &by_language {
+                    super::schema::owe_reextracts(conn, importer_language, file_path, paths)?;
+                }
+                Ok(by_language.remove(&language).unwrap_or_default())
             })?;
             store.claim(diff);
             Ok(importers)
