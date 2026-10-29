@@ -858,7 +858,8 @@ struct RoundTrip {
     affected: Option<ResolutionDelta>,
     /// The files whose imports were linked to a `fileChanged`'s file that
     /// turned out gone, already recorded as owed a re-extract
-    /// (`Writer::apply_file_diff_linked`). Empty otherwise.
+    /// (`Writer::apply_file_diff_linked`): only those of the plugin's own
+    /// language. Empty otherwise.
     gone_importers: Vec<String>,
 }
 
