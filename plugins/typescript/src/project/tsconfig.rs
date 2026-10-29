@@ -121,6 +121,37 @@ pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec
     candidates
 }
 
+/// The specifiers whose expansion under `config` ([`expand_paths_candidates`])
+/// may include `address`, in declaration order without repeats: a wildcard
+/// entry's pattern with the capture its target pattern takes from `address`
+/// (`@/*` -> `src/*`, `src/x` -> `@/x`), an exact entry's own pattern when
+/// one of its targets is `address`. A wildcard entry whose target has no `*`
+/// names that one path for every capture, so it gives no specifier.
+pub fn specifiers_targeting(config: &EffectiveConfig, address: &str) -> Vec<String> {
+    let mut specifiers: Vec<String> = Vec::new();
+    for entry in &config.paths {
+        for target in &entry.targets {
+            let Some(pattern) = paths::inside(&config.resolve_dir, target) else {
+                continue;
+            };
+            let specifier = if entry.pattern.contains('*') {
+                match match_wildcard(&pattern, address) {
+                    Some(capture) => entry.pattern.replacen('*', capture, 1),
+                    None => continue,
+                }
+            } else if pattern == address {
+                entry.pattern.clone()
+            } else {
+                continue;
+            };
+            if !specifiers.contains(&specifier) {
+                specifiers.push(specifier);
+            }
+        }
+    }
+    specifiers
+}
+
 /// The config files an `extends` entry written in `config` could name,
 /// project-relative, in the order tsc tries them. An entry may name the
 /// file, drop its `.json`, or name a directory holding a `tsconfig.json`.

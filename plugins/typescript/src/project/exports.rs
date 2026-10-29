@@ -107,6 +107,58 @@ pub fn imports_targets(config: &PackageImports, specifier: &str) -> Vec<String> 
     resolved
 }
 
+/// The `#` specifiers whose [`imports_targets`] under `config` may include
+/// `address`, in declaration order without repeats ([`keys_targeting`]).
+pub fn imports_specifiers_targeting(config: &PackageImports, address: &str) -> Vec<String> {
+    keys_targeting(&config.imports, &config.dir, address)
+}
+
+/// The subpaths whose [`exports_targets`] may include `address`, a path
+/// under the project-relative package directory `dir`, in declaration order
+/// without repeats ([`keys_targeting`]). Only a subpath map has keys to
+/// invert; a string, array or condition map only declares the root `.`,
+/// which the caller asks about anyway.
+pub fn exports_subpaths_targeting(exports: Option<&Json>, dir: &str, address: &str) -> Vec<String> {
+    match exports {
+        Some(Json::Object(entries)) if entries.iter().any(|(key, _)| key == "." || key.starts_with("./")) => {
+            keys_targeting(entries, dir, address)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The inverse of substituting a key's targets: for each key of `entries`
+/// (an `exports` subpath map or an `imports` map) and each target pattern
+/// of its value ([`key_targets`] without a capture, conditions flattened)
+/// resolved against `dir`, a wildcard key with the capture the pattern takes
+/// from `address` (`./*` -> `./src/*.ts`, `src/u.ts` -> `./u`), or an exact
+/// key whose target is `address`. A wildcard key whose target has no `*`
+/// gives none.
+fn keys_targeting(entries: &[(String, Json)], dir: &str, address: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for (key, value) in entries {
+        for target in key_targets(value, None) {
+            let Some(pattern) = paths::inside(dir, &target) else {
+                continue;
+            };
+            let found = if key.contains('*') {
+                match match_wildcard(&pattern, address) {
+                    Some(capture) => key.replacen('*', capture, 1),
+                    None => continue,
+                }
+            } else if pattern == address {
+                key.clone()
+            } else {
+                continue;
+            };
+            if !keys.contains(&found) {
+                keys.push(found);
+            }
+        }
+    }
+    keys
+}
+
 /// One key's value (a string, an array, or a condition object) as ranked
 /// target strings, with the wildcard capture substituted for every `*`.
 /// `exports` subpath keys and `imports` keys share this shape.

@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::project::exports::exports_targets;
+use crate::project::exports::{exports_subpaths_targeting, exports_targets};
 use crate::project::jsonc::Json;
 use crate::project::paths;
 
@@ -158,6 +158,36 @@ pub fn package_entry_targets(package: &WorkspacePackage, subpath: &str) -> Vec<S
         }
     }
     resolved
+}
+
+/// The subpaths of `package` whose [`package_entry_targets`] may include the
+/// project-relative `address`, without repeats: always the root `.`, every
+/// `exports` key that can name it ([`exports_subpaths_targeting`]), and for
+/// an address under the package directory its own subpath (`pkg/u` ->
+/// `./u`) and, under `src/`, the subpath the `src/` convention maps to it
+/// (`pkg/src/u` -> `./u`).
+pub fn subpaths_targeting(package: &WorkspacePackage, address: &str) -> Vec<String> {
+    let mut subpaths: Vec<String> = vec![".".to_string()];
+    let mut add = |subpath: String| {
+        if !subpaths.contains(&subpath) {
+            subpaths.push(subpath);
+        }
+    };
+    for subpath in exports_subpaths_targeting(package.manifest.get("exports"), &package.dir, address) {
+        add(subpath);
+    }
+    let relative = if package.dir.is_empty() {
+        Some(address)
+    } else {
+        address.strip_prefix(&format!("{}/", package.dir))
+    };
+    if let Some(relative) = relative.filter(|relative| !relative.is_empty() && *relative != ".") {
+        add(format!("./{relative}"));
+        if let Some(under_src) = relative.strip_prefix("src/") {
+            add(format!("./{under_src}"));
+        }
+    }
+    subpaths
 }
 
 /// The workspace globs: `pnpm-workspace.yaml`'s first, then the root
