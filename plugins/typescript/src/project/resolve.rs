@@ -24,10 +24,12 @@ use std::collections::BTreeSet;
 use g_mesh_plugin_sdk::RelPath;
 
 use crate::extractor::grammar::grammar_for;
-use crate::project::exports::imports_targets;
+use crate::project::exports::{imports_specifiers_targeting, imports_targets};
 use crate::project::paths;
-use crate::project::tsconfig::expand_paths_candidates;
-use crate::project::workspace::{package_entry_targets, parse_bare_specifier};
+use crate::project::tsconfig::{expand_paths_candidates, specifiers_targeting, EffectiveConfig};
+use crate::project::workspace::{
+    package_entry_targets, package_may_name, parse_bare_specifier, subpaths_targeting,
+};
 use crate::project::TsProject;
 
 /// Extensions tried after a specifier that has none, in TypeScript's order
@@ -100,6 +102,22 @@ where
         .flat_map(|base| candidate_paths(&base))
         .map(RelPath::new)
         .find(|candidate| existence.contains(candidate))
+}
+
+/// The candidate of `bases` that answered before `path` existed, if `path`
+/// now wins over it: the first candidate after `path`'s first place in the
+/// list [`first_existing`] walks that is in `existence`. `None` when `path`
+/// is not a candidate of `bases` or nothing after it exists. An existing
+/// candidate before `path` is not consulted: in a batch create it may be
+/// another new file, and the file it shadowed must still be named by
+/// `path`'s own event. The list is walked lazily, base by base.
+fn displaced_by<I>(path: &str, existence: &BTreeSet<RelPath>, bases: I) -> Option<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut candidates = bases.into_iter().flat_map(|base| candidate_paths(&base));
+    candidates.by_ref().find(|candidate| candidate == path)?;
+    candidates.find(|candidate| candidate != path && existence.contains(&RelPath::new(candidate.as_str())))
 }
 
 /// The importer's directory, or `None` when `from` climbs out of the root.
@@ -179,6 +197,79 @@ pub fn candidates_shadowed_by(path: &str, existence: &BTreeSet<RelPath>) -> Vec<
             shadowed.insert(previous.clone());
         }
     }
+    shadowed.into_iter().collect()
+}
+
+/// The files that answered an alias, workspace package or `#` specifier
+/// before `path` existed and that `path` now wins over, sorted and
+/// deduplicated: the multi-base counterpart of [`candidates_shadowed_by`].
+/// `paths` targets `["src/*", "generated/*"]` and a new `src/x.ts` name
+/// `generated/x.ts`, the file `@/x` was linked to.
+///
+/// The specifiers asked about come from inverting each target pattern
+/// against `path` and its addresses ([`addresses_resolving_to`]):
+/// [`specifiers_targeting`] for every tsconfig, [`subpaths_targeting`] for
+/// every workspace package, [`imports_specifiers_targeting`] for every
+/// `imports` map. Every config is asked, not only the one nearest some
+/// importer, so this may name a file no importer reaches through it; it
+/// never misses one the inversion finds. The order and the previous winner
+/// come from the resolver's own list functions ([`displaced_by`]). A
+/// workspace specifier's list is the package's entries followed by each
+/// config's expansion of the same bare specifier, the order [`resolve`]
+/// tries them in, so a new package file displaces an alias answer too. A
+/// package whose entries cannot name `path` is skipped
+/// ([`package_may_name`]).
+pub fn fallbacks_shadowed_by(project: &TsProject, path: &str) -> Vec<String> {
+    let mut addresses = addresses_resolving_to(path);
+    addresses.push(path.to_string());
+    let existence = &project.existence;
+    let mut shadowed: BTreeSet<String> = BTreeSet::new();
+
+    let mut configs: Vec<&EffectiveConfig> = Vec::new();
+    for config in project.tsconfig_by_dir.values().flatten() {
+        if !configs.iter().any(|seen| std::ptr::eq(*seen, config.as_ref())) {
+            configs.push(config.as_ref());
+        }
+    }
+    for config in &configs {
+        let specifiers: BTreeSet<String> =
+            addresses.iter().flat_map(|address| specifiers_targeting(config, address)).collect();
+        for specifier in specifiers {
+            shadowed.extend(displaced_by(path, existence, expand_paths_candidates(config, &specifier)));
+        }
+    }
+
+    for (name, package) in &project.packages {
+        if !package_may_name(package, path) {
+            continue;
+        }
+        let subpaths: BTreeSet<String> =
+            addresses.iter().flat_map(|address| subpaths_targeting(package, address)).collect();
+        for subpath in subpaths {
+            let specifier = match subpath.strip_prefix('.') {
+                Some(rest) if !rest.is_empty() => format!("{name}{rest}"),
+                _ => name.clone(),
+            };
+            let entries = package_entry_targets(package, &subpath);
+            if configs.is_empty() {
+                shadowed.extend(displaced_by(path, existence, entries));
+                continue;
+            }
+            for config in &configs {
+                let aliased = expand_paths_candidates(config, &specifier);
+                shadowed.extend(displaced_by(path, existence, entries.iter().cloned().chain(aliased)));
+            }
+        }
+    }
+
+    for config in project.imports_by_dir.values().flatten() {
+        let specifiers: BTreeSet<String> =
+            addresses.iter().flat_map(|address| imports_specifiers_targeting(config, address)).collect();
+        for specifier in specifiers {
+            shadowed.extend(displaced_by(path, existence, imports_targets(config, &specifier)));
+        }
+    }
+
     shadowed.into_iter().collect()
 }
 

@@ -167,7 +167,11 @@ impl TsProject {
     /// addresses is offered too, keyed by that candidate's path
     /// ([`resolve::candidates_shadowed_by`]): core's linked lookup selects
     /// its importer, whose re-extract moves `./m` from `src/m/index.ts` or
-    /// `src/m.tsx` onto a new `src/m.ts`.
+    /// `src/m.tsx` onto a new `src/m.ts`. The same holds across the bases of
+    /// a tsconfig alias, a workspace package entry or an `imports` key
+    /// ([`resolve::fallbacks_shadowed_by`]): `@/x` linked to
+    /// `generated/x.ts` moves onto a new `src/x.ts` when the alias lists
+    /// `src/*` first.
     ///
     /// Once per path per model (`announced`), so an ordinary edit costs core
     /// no import scan; `None` (gone) forgets the path, so a re-creation is
@@ -182,6 +186,7 @@ impl TsProject {
         }
         let mut keys: BTreeSet<String> = resolve::addresses_resolving_to(path.as_str()).into_iter().collect();
         keys.extend(resolve::candidates_shadowed_by(path.as_str(), &self.existence));
+        keys.extend(resolve::fallbacks_shadowed_by(self, path.as_str()));
         let imports: Vec<ImportSelector> = keys
             .into_iter()
             .map(|address| ImportSelector {
