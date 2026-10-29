@@ -190,6 +190,36 @@ pub fn subpaths_targeting(package: &WorkspacePackage, address: &str) -> Vec<Stri
     subpaths
 }
 
+/// Whether any of `package`'s entry targets can be the project-relative
+/// `path`: `path` is under the package directory, or the manifest declares
+/// an entry (`exports`, `source`, `main`, `module`, `types`, `typings`)
+/// with a `..` segment that can leave it. Allocates nothing.
+pub fn package_may_name(package: &WorkspacePackage, path: &str) -> bool {
+    let dir = package.dir.as_str();
+    if dir.is_empty() || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/')) {
+        return true;
+    }
+    let climbs = |target: &str| target.split(['/', '\\']).any(|segment| segment == "..");
+    if ["source", "main", "module", "types", "typings"]
+        .iter()
+        .any(|field| package.manifest.get(field).and_then(Json::as_str).is_some_and(climbs))
+    {
+        return true;
+    }
+    package.manifest.get("exports").is_some_and(|exports| any_string(exports, &climbs))
+}
+
+/// Whether any string leaf of `value` satisfies `test`; object keys are not
+/// targets and are not visited.
+fn any_string(value: &Json, test: &impl Fn(&str) -> bool) -> bool {
+    match value {
+        Json::String(text) => test(text),
+        Json::Array(items) => items.iter().any(|item| any_string(item, test)),
+        Json::Object(entries) => entries.iter().any(|(_, nested)| any_string(nested, test)),
+        _ => false,
+    }
+}
+
 /// The workspace globs: `pnpm-workspace.yaml`'s first, then the root
 /// package.json's `workspaces` (an array, or yarn's object with `packages`).
 /// A repo carrying both gets the union.
