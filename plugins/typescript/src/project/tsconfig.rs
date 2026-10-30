@@ -166,7 +166,8 @@ pub fn specifiers_targeting(config: &EffectiveConfig, address: &str) -> Vec<Stri
 /// A relative entry (`./`, `../`) resolves against the config's directory
 /// and names a file: the path as written, then with `.json` appended unless
 /// it already ends in `.json`. It never names a directory, so `../base`
-/// does not reach `../base/tsconfig.json`, and `../` or `./..` names nothing.
+/// does not reach `../base/tsconfig.json`, and `../` or `./..` names only
+/// the parent's sibling `<parent>.json`.
 /// An entry of exactly `.` or `..` is a module name for the config's own or
 /// parent directory and names that directory's `tsconfig.json`; it may be
 /// the project root's. A package-named entry (`@tsconfig/node18`) resolves
