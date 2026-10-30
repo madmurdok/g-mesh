@@ -80,8 +80,9 @@ pub fn exports_targets(exports: Option<&Json>, subpath: &str) -> Vec<String> {
 
 /// Every project-relative path the `#` specifier could name under `config`,
 /// in declaration order. Targets leaving the project are dropped, and so is
-/// one naming the project root unless it is spelled as a module name (`.`,
-/// `..`), the only form tsc resolves to the root's `index` file.
+/// one naming the project root unless it is spelled as a module name
+/// ([`imports_target_inside`]), the only form tsc resolves to the root's
+/// `index` file.
 pub fn imports_targets(config: &PackageImports, specifier: &str) -> Vec<String> {
     let mut targets = Vec::new();
     for (key, value) in &config.imports {
@@ -109,10 +110,12 @@ pub fn imports_targets(config: &PackageImports, specifier: &str) -> Vec<String> 
     resolved
 }
 
-/// One `imports` target resolved against the package directory `dir`
-/// ([`imports_targets`]' rule for the root).
+/// One `imports` target resolved against the package directory `dir`. As in
+/// tsc, a target is a module name when its own spelling, before `\\` is
+/// read as a separator, starts with neither `./` nor `../` (`.`, `..`, `.\\`,
+/// `..\\..`); only a module name may name the project root.
 fn imports_target_inside(dir: &str, target: &str) -> Option<String> {
-    if matches!(paths::with_forward_slashes(target).as_str(), "." | "..") {
+    if !target.starts_with("./") && !target.starts_with("../") {
         paths::inside_or_root(dir, target)
     } else {
         paths::inside(dir, target)
