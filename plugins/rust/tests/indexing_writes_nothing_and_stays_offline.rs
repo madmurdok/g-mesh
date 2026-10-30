@@ -24,8 +24,9 @@
 //! and the sink must have seen no connection.
 //!
 //! The test process's environment is scrubbed of what cargo and rustup set
-//! for it, as in `semantic_runs_no_project_code.rs`. One test in this binary,
-//! because it rewrites the process environment.
+//! for it, as in `semantic_runs_no_project_code.rs`. That test is the only
+//! one here that rewrites the process environment; the proxy test beside it
+//! runs its check in a child process.
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -159,11 +160,13 @@ fn rustup(args: &[&str]) -> String {
 /// A directory of rustup proxies made in `dir`, after checking the default
 /// toolchain has a working rust-analyzer.
 ///
-/// `cargo`, `rustc` and `rust-analyzer` are linked to the `rustup` on `PATH`,
-/// which runs as the proxy its program name says - all an installed proxy
-/// is. Not the directory `rustup` sits in: whether that one holds the proxies
-/// is the installer's choice (rustup-init's `~/.cargo/bin` does, Homebrew's
-/// `bin` does not, GM-574).
+/// `cargo`, `rustc` and `rust-analyzer` are linked to the install's own proxy
+/// of that name beside the `rustup` on `PATH`, or to that `rustup` when there
+/// is none. rustup runs as the proxy its `argv[0]` names, and a wrapper
+/// script (Homebrew's keg `bin`) replaces `argv[0]` when it execs the real
+/// binary, so a link to such a `rustup` would run as rustup whatever its
+/// name. rustup-init's `~/.cargo/bin` and Homebrew's keg `bin` hold the
+/// proxies; an install whose `rustup` stands alone gets links to that binary.
 fn proxy_dir(dir: &Path) -> PathBuf {
     let default = rustup(&["default"]);
     let pin = default.split_whitespace().next().expect("`rustup default` names a toolchain").to_string();
@@ -179,15 +182,116 @@ fn proxy_dir(dir: &Path) -> PathBuf {
         .expect("rustup is on PATH");
     std::fs::create_dir_all(dir).unwrap();
     for name in ["cargo", "rustc", "rust-analyzer"] {
-        let proxy = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+        let proxy = dir.join(&file);
+        let sibling = rustup.with_file_name(&file);
+        let target = if sibling.is_file() { sibling } else { rustup.clone() };
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&rustup, &proxy).unwrap();
+        std::os::unix::fs::symlink(&target, &proxy).unwrap();
         #[cfg(not(unix))]
-        if std::fs::hard_link(&rustup, &proxy).is_err() {
-            std::fs::copy(&rustup, &proxy).unwrap();
+        if std::fs::hard_link(&target, &proxy).is_err() {
+            std::fs::copy(&target, &proxy).unwrap();
         }
     }
     dir.to_path_buf()
+}
+
+/// Set, to the fake install's directory, only in the child process of
+/// [`proxies_beside_a_wrapper_script_rustup_run_as_their_tool`].
+#[cfg(unix)]
+const KEG_CHILD_ENV: &str = "G_MESH_RS_WRAPPER_KEG_CHILD";
+
+/// A Homebrew-shaped rustup install in `keg`: `rustup`, `cargo`, `rustc` and
+/// `rust-analyzer` are bash scripts that `exec` the same file beside the
+/// `rustup` on `PATH`, so `argv[0]` reaches the real binary as its own path,
+/// whatever name the script was started under. `false`, with the reason
+/// printed, where bash or such an install of rustup is missing.
+#[cfg(unix)]
+fn wrapper_keg(test: &str, keg: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if !Command::new("bash").args(["-c", "true"]).output().is_ok_and(|o| o.status.success()) {
+        println!("{test}: skipped, no bash to run wrapper scripts");
+        return false;
+    }
+    let Some(host) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("rustup"))
+        .find(|candidate| candidate.is_file())
+    else {
+        println!("{test}: skipped, no rustup on PATH");
+        return false;
+    };
+    std::fs::create_dir_all(keg).unwrap();
+    for name in ["rustup", "cargo", "rustc", "rust-analyzer"] {
+        let real = host.with_file_name(name);
+        if !real.is_file() {
+            println!("{test}: skipped, {} has no {name} beside it", host.display());
+            return false;
+        }
+        let script = keg.join(name);
+        std::fs::write(&script, format!("#!/bin/bash\nexec \"{}\" \"$@\"\n", real.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    true
+}
+
+/// With a `rustup` that is a wrapper script first on `PATH`, each proxy
+/// [`proxy_dir`] makes runs as the tool it is named after. A link to the
+/// script itself would run as rustup: the script's `exec` hands rustup its
+/// own path as `argv[0]`. `proxy_dir` reads this process's `PATH`, so the
+/// check runs in a child process of this test binary with the fake install
+/// first on its `PATH`, leaving this process's environment alone.
+#[cfg(unix)]
+#[test]
+fn proxies_beside_a_wrapper_script_rustup_run_as_their_tool() {
+    let test = "proxies_beside_a_wrapper_script_rustup_run_as_their_tool";
+    let Some(keg) = std::env::var_os(KEG_CHILD_ENV) else {
+        let scratch = std::env::temp_dir().join(format!("g-mesh-rust-wrapper-keg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let keg = scratch.join("keg");
+        if !wrapper_keg(test, &keg) {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return;
+        }
+        let path = std::env::join_paths(
+            std::iter::once(keg.clone())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--nocapture"])
+            .env("PATH", path)
+            .env(KEG_CHILD_ENV, &keg)
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&scratch);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(&format!("{test}: proxies checked")),
+            "the child did not pass ({}):\n--- stdout\n{stdout}\n--- stderr\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let scratch = Scratch::new();
+    let proxies = proxy_dir(&scratch.0.join("rustup-proxies"));
+    for name in ["cargo", "rustc", "rust-analyzer"] {
+        let output = Command::new(proxies.join(name))
+            .arg("--version")
+            .current_dir(std::env::temp_dir())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.starts_with(&format!("{name} ")),
+            "with {} first on PATH, the {name} proxy did not run as {name} ({}):\n--- stdout\n{stdout}\n--- stderr\n{}",
+            Path::new(&keg).display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    println!("{test}: proxies checked");
 }
 
 /// Clears what cargo and rustup set for this test process, puts rustup's

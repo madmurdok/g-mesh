@@ -145,20 +145,99 @@ fn real_toolchain() -> RealToolchain {
     }
 }
 
-/// Links `cargo`, `rustc` and `rust-analyzer` in `dir` to `rustup`: rustup
-/// runs as the proxy its program name says, which is all an installed proxy
-/// is. Not the directory `rustup` sits in: whether that one holds the proxies
-/// is the installer's choice (rustup-init's `~/.cargo/bin` does, Homebrew's
-/// `bin` does not), and a missing one is a spawn error, not a finding.
+/// Links `cargo`, `rustc` and `rust-analyzer` in `dir` to the install's own
+/// proxy of that name beside `rustup`, or to `rustup` itself when there is
+/// none. rustup runs as the proxy its `argv[0]` names, and a wrapper script
+/// (Homebrew's keg `bin`) replaces `argv[0]` when it execs the real binary,
+/// so a link to such a `rustup` would run as rustup whatever its name.
+/// rustup-init's `~/.cargo/bin` and Homebrew's keg `bin` hold the proxies; an
+/// install whose `rustup` stands alone gets links to that binary.
 fn link_rustup_proxies(dir: &Path, rustup: &Path) {
     for name in ["cargo", "rustc", "rust-analyzer"] {
-        let proxy = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+        let proxy = dir.join(&file);
+        let sibling = rustup.with_file_name(&file);
+        let target = if sibling.is_file() { sibling } else { rustup.to_path_buf() };
         #[cfg(unix)]
-        std::os::unix::fs::symlink(rustup, &proxy).unwrap();
+        std::os::unix::fs::symlink(&target, &proxy).unwrap();
         #[cfg(not(unix))]
-        if std::fs::hard_link(rustup, &proxy).is_err() {
-            std::fs::copy(rustup, &proxy).unwrap();
+        if std::fs::hard_link(&target, &proxy).is_err() {
+            std::fs::copy(&target, &proxy).unwrap();
         }
+    }
+}
+
+/// A Homebrew-shaped rustup install in `keg`: `rustup`, `cargo`, `rustc` and
+/// `rust-analyzer` are bash scripts that `exec` the same file beside the
+/// `rustup` on `PATH`, so `argv[0]` reaches the real binary as its own path,
+/// whatever name the script was started under. `None`, with the reason
+/// printed, where bash or such an install of rustup is missing.
+#[cfg(unix)]
+fn wrapper_keg(test: &str, keg: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    if !Command::new("bash").args(["-c", "true"]).output().is_ok_and(|o| o.status.success()) {
+        println!("{test}: skipped, no bash to run wrapper scripts");
+        return None;
+    }
+    let Some(host) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("rustup"))
+        .find(|candidate| candidate.is_file())
+    else {
+        println!("{test}: skipped, no rustup on PATH");
+        return None;
+    };
+    for name in ["rustup", "cargo", "rustc", "rust-analyzer"] {
+        let real = host.with_file_name(name);
+        if !real.is_file() {
+            println!("{test}: skipped, {} has no {name} beside it", host.display());
+            return None;
+        }
+        let script = keg.join(name);
+        std::fs::write(&script, format!("#!/bin/bash\nexec \"{}\" \"$@\"\n", real.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    Some(keg.join("rustup"))
+}
+
+/// Each proxy linked beside a `rustup` that is a wrapper script runs as the
+/// tool it is named after. A link to the script itself would run as rustup:
+/// the script's `exec` hands rustup its own path as `argv[0]`.
+#[cfg(unix)]
+#[test]
+fn proxies_beside_a_wrapper_script_rustup_run_as_their_tool() {
+    let test = "proxies_beside_a_wrapper_script_rustup_run_as_their_tool";
+    let keg = Scratch::new("wrapper-keg");
+    let Some(rustup) = wrapper_keg(test, &keg.0) else { return };
+    let proxies = Scratch::new("wrapper-proxies");
+    link_rustup_proxies(&proxies.0, &rustup);
+    for name in ["cargo", "rustc", "rust-analyzer"] {
+        let output = Command::new(proxies.0.join(name))
+            .arg("--version")
+            .current_dir(std::env::temp_dir())
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.starts_with(&format!("{name} ")),
+            "the {name} proxy did not run as {name} ({}):\n--- stdout\n{stdout}\n--- stderr\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// A `rustup` with no proxy beside it gets its proxies linked to itself.
+#[cfg(unix)]
+#[test]
+fn proxies_of_a_rustup_that_stands_alone_link_to_it() {
+    let alone = Scratch::new("lone-rustup");
+    let rustup = alone.0.join("rustup");
+    write(&rustup, "#!/bin/sh\n");
+    let proxies = Scratch::new("lone-proxies");
+    link_rustup_proxies(&proxies.0, &rustup);
+    for name in ["cargo", "rustc", "rust-analyzer"] {
+        assert_eq!(std::fs::read_link(proxies.0.join(name)).unwrap(), rustup, "the {name} proxy");
     }
 }
 
