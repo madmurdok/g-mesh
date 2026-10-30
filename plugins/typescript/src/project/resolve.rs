@@ -48,7 +48,7 @@ pub const TS_SUBSTITUTIONS: [(&str, &[&str]); 4] = [
 /// The address a relative specifier naming the project root itself has
 /// (`..` in `src/a.ts`, `.` or `./` in `main.ts`): [`paths::normalize`]'s
 /// spelling of the empty path.
-pub const ROOT_ADDRESS: &str = ".";
+pub const ROOT_ADDRESS: &str = paths::ROOT;
 
 /// `./x`, `../x`, `.` and `..`; everything else is bare or `#private`.
 pub fn is_relative_specifier(specifier: &str) -> bool {

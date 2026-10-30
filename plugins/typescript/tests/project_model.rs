@@ -642,7 +642,7 @@ fn paths_inside_refuses_absolute_drive_lettered_and_escaping_targets() {
     assert_eq!(inside("pkg", "C:/a.ts"), None);
     assert_eq!(inside("pkg", "z:a.ts"), None);
     assert_eq!(inside("pkg", ""), None);
-    assert_eq!(inside("", "."), some("."));
+    assert_eq!(inside("", "."), None);
     assert_eq!(inside("", "./a.ts"), some("a.ts"));
 }
 

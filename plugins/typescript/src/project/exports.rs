@@ -79,7 +79,9 @@ pub fn exports_targets(exports: Option<&Json>, subpath: &str) -> Vec<String> {
 }
 
 /// Every project-relative path the `#` specifier could name under `config`,
-/// in declaration order. Targets leaving the project are dropped.
+/// in declaration order. Targets leaving the project are dropped, and so is
+/// one naming the project root unless it is spelled as a module name (`.`,
+/// `..`), the only form tsc resolves to the root's `index` file.
 pub fn imports_targets(config: &PackageImports, specifier: &str) -> Vec<String> {
     let mut targets = Vec::new();
     for (key, value) in &config.imports {
@@ -98,7 +100,7 @@ pub fn imports_targets(config: &PackageImports, specifier: &str) -> Vec<String> 
 
     let mut resolved: Vec<String> = Vec::new();
     for target in targets {
-        if let Some(inside) = paths::inside(&config.dir, &target) {
+        if let Some(inside) = imports_target_inside(&config.dir, &target) {
             if !resolved.contains(&inside) {
                 resolved.push(inside);
             }
@@ -107,10 +109,20 @@ pub fn imports_targets(config: &PackageImports, specifier: &str) -> Vec<String> 
     resolved
 }
 
+/// One `imports` target resolved against the package directory `dir`
+/// ([`imports_targets`]' rule for the root).
+fn imports_target_inside(dir: &str, target: &str) -> Option<String> {
+    if matches!(paths::with_forward_slashes(target).as_str(), "." | "..") {
+        paths::inside_or_root(dir, target)
+    } else {
+        paths::inside(dir, target)
+    }
+}
+
 /// The `#` specifiers whose [`imports_targets`] under `config` may include
 /// `address`, in declaration order without repeats ([`keys_targeting`]).
 pub fn imports_specifiers_targeting(config: &PackageImports, address: &str) -> Vec<String> {
-    keys_targeting(&config.imports, &config.dir, address)
+    keys_targeting(&config.imports, &config.dir, address, imports_target_inside)
 }
 
 /// The subpaths whose [`exports_targets`] may include `address`, a path
@@ -121,7 +133,7 @@ pub fn imports_specifiers_targeting(config: &PackageImports, address: &str) -> V
 pub fn exports_subpaths_targeting(exports: Option<&Json>, dir: &str, address: &str) -> Vec<String> {
     match exports {
         Some(Json::Object(entries)) if entries.iter().any(|(key, _)| key == "." || key.starts_with("./")) => {
-            keys_targeting(entries, dir, address)
+            keys_targeting(entries, dir, address, paths::inside)
         }
         _ => Vec::new(),
     }
@@ -133,12 +145,17 @@ pub fn exports_subpaths_targeting(exports: Option<&Json>, dir: &str, address: &s
 /// resolved against `dir`, a wildcard key with the capture the pattern takes
 /// from `address` (`./*` -> `./src/*.ts`, `src/u.ts` -> `./u`), or an exact
 /// key whose target is `address`. A wildcard key whose target has no `*`
-/// gives none.
-fn keys_targeting(entries: &[(String, Json)], dir: &str, address: &str) -> Vec<String> {
+/// gives none. `inside` resolves a target the way the forward lookup does.
+fn keys_targeting(
+    entries: &[(String, Json)],
+    dir: &str,
+    address: &str,
+    inside: fn(&str, &str) -> Option<String>,
+) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     for (key, value) in entries {
         for target in key_targets(value, None) {
-            let Some(pattern) = paths::inside(dir, &target) else {
+            let Some(pattern) = inside(dir, &target) else {
                 continue;
             };
             let found = if key.contains('*') {
