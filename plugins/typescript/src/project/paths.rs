@@ -67,7 +67,8 @@ pub fn inside(dir: &str, target: &str) -> Option<String> {
 /// [`inside`], except that a target naming the project root itself gives
 /// [`ROOT`]. Only for the targets tsc resolves to the root's `index` file:
 /// a tsconfig `paths` target, a package's `main`-style field, an `imports`
-/// target spelled as a module name (`.`).
+/// target spelled as a module name (`.`), and a tsconfig `extends` of `.`
+/// or `..`, which names that directory's `tsconfig.json`.
 pub fn inside_or_root(dir: &str, target: &str) -> Option<String> {
     let target = with_forward_slashes(target);
     if target.is_empty() || is_rooted(&target) {
