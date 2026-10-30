@@ -161,32 +161,51 @@ pub fn specifiers_targeting(config: &EffectiveConfig, address: &str) -> Vec<Stri
 }
 
 /// The config files an `extends` entry written in `config` could name,
-/// project-relative, in the order tsc tries them. An entry may name the
-/// file, drop its `.json`, or name a directory holding a `tsconfig.json`.
+/// project-relative, in the order tsc tries them.
 ///
-/// A relative entry (`./`, `../`) resolves against the config's directory.
-/// A package-named one (`@tsconfig/node18/tsconfig.json`) resolves under
-/// `node_modules` of the config's directory and each ancestor up to the
-/// root. Candidates outside the project, and absolute entries (a POSIX root
-/// or a drive letter), are dropped. As in tsc, `\\` is a separator on every
-/// host.
+/// A relative entry (`./`, `../`) resolves against the config's directory
+/// and names a file: the path as written, then with `.json` appended unless
+/// it already ends in `.json`. It never names a directory, so `../base`
+/// does not reach `../base/tsconfig.json`, and `../` or `./..` names nothing.
+/// An entry of exactly `.` or `..` is a module name for the config's own or
+/// parent directory and names that directory's `tsconfig.json`; it may be
+/// the project root's. A package-named entry (`@tsconfig/node18`) resolves
+/// under `node_modules` of the config's directory and each ancestor up to
+/// the root: the file itself when it ends in `.json`, else `<name>.json`
+/// or a directory holding a `tsconfig.json`. Candidates outside the
+/// project, and absolute entries (a POSIX root or a drive letter), are
+/// dropped. As in tsc, `\\` is a separator on every host.
 pub fn extends_candidates(config: &str, entry: &str) -> Vec<String> {
     let config_dir = paths::dirname(config);
     let entry = paths::with_forward_slashes(entry);
     let entry = entry.as_str();
-    let bases: Vec<String> = if entry.starts_with("./") || entry.starts_with("../") {
-        vec![paths::join(config_dir, entry)]
-    } else if entry.is_empty() || paths::is_rooted(entry) || entry.starts_with('.') {
-        Vec::new()
-    } else {
-        paths::ancestors(config_dir)
-            .map(|dir| paths::join(&paths::join(dir, "node_modules"), entry))
-            .collect()
-    };
+    if entry == "." || entry == ".." {
+        return paths::inside_or_root(config_dir, entry)
+            .map(|dir| {
+                let dir = if dir == paths::ROOT { "" } else { dir.as_str() };
+                vec![paths::join(dir, "tsconfig.json")]
+            })
+            .unwrap_or_default();
+    }
+    if entry.starts_with("./") || entry.starts_with("../") {
+        let base = paths::normalize(&paths::join(config_dir, entry));
+        if paths::escapes(&base) {
+            return Vec::new();
+        }
+        return if base.ends_with(".json") {
+            vec![base]
+        } else {
+            let with_json = format!("{base}.json");
+            vec![base, with_json]
+        };
+    }
+    if entry.is_empty() || paths::is_rooted(entry) || entry.starts_with('.') {
+        return Vec::new();
+    }
 
     let mut candidates = Vec::new();
-    for base in bases {
-        let base = paths::normalize(&base);
+    for dir in paths::ancestors(config_dir) {
+        let base = paths::normalize(&paths::join(&paths::join(dir, "node_modules"), entry));
         if paths::escapes(&base) {
             continue;
         }

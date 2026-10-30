@@ -673,10 +673,7 @@ fn config_targets_without_backslashes_or_drive_letters_read_as_before() {
     assert_eq!(inside("pkg", "../shared/a.ts"), some("shared/a.ts"));
     assert_eq!(inside("pkg", "../../etc/x.ts"), None);
     assert_eq!(inside("pkg", "/abs/x.ts"), None);
-    assert_eq!(
-        extends_candidates("pkg/tsconfig.json", "./base"),
-        strings(&["pkg/base.json", "pkg/base/tsconfig.json"])
-    );
+    assert_eq!(extends_candidates("pkg/tsconfig.json", "./base"), strings(&["pkg/base", "pkg/base.json"]));
     assert_eq!(extends_candidates("a/b/tsconfig.json", "../../base.json"), strings(&["base.json"]));
     assert_eq!(
         extends_candidates("pkg/tsconfig.json", "@tsconfig/node18/tsconfig.json"),
@@ -1586,7 +1583,7 @@ fn a_config_with_no_paths_of_its_own_inherits_the_ones_it_extends() {
 }
 
 #[test]
-fn an_extends_entry_without_json_or_naming_a_directory_is_found() {
+fn an_extends_entry_without_json_is_found_but_a_relative_directory_is_not() {
     let fx = Fixture::new(&[
         ("configs/base.json", r#"{"compilerOptions":{"paths":{"@a/*":["../a/*"]}}}"#),
         ("shared/tsconfig.json", r#"{"compilerOptions":{"paths":{"@b/*":["../b/*"]}}}"#),
@@ -1599,7 +1596,7 @@ fn an_extends_entry_without_json_or_naming_a_directory_is_found() {
     ]);
     let project = fx.load();
     assert_eq!(resolve(&project, "@a/m", "one/x.ts"), some("a/m.ts"));
-    assert_eq!(resolve(&project, "@b/m", "two/x.ts"), some("b/m.ts"));
+    assert_eq!(resolve(&project, "@b/m", "two/x.ts"), None);
 }
 
 #[test]
@@ -1720,7 +1717,7 @@ fn a_missing_extends_target_is_a_note_and_the_configs_own_paths_still_apply() {
 fn extends_candidates_follow_tscs_lookup() {
     assert_eq!(
         extends_candidates("apps/web/tsconfig.json", "./base"),
-        strings(&["apps/web/base.json", "apps/web/base/tsconfig.json"])
+        strings(&["apps/web/base", "apps/web/base.json"])
     );
     assert_eq!(
         extends_candidates("apps/web/tsconfig.json", "../../configs/base.json"),
@@ -1747,10 +1744,7 @@ fn extends_candidates_follow_tscs_lookup() {
 /// relative, so `.\base` is relative and `@tsconfig\node18` is a package path.
 #[test]
 fn extends_candidates_read_backslashes_as_separators() {
-    assert_eq!(
-        extends_candidates("pkg/tsconfig.json", ".\\base"),
-        strings(&["pkg/base.json", "pkg/base/tsconfig.json"])
-    );
+    assert_eq!(extends_candidates("pkg/tsconfig.json", ".\\base"), strings(&["pkg/base", "pkg/base.json"]));
     assert_eq!(extends_candidates("a/b/tsconfig.json", "..\\..\\base.json"), strings(&["base.json"]));
     assert_eq!(extends_candidates("tsconfig.json", "..\\outside.json"), Vec::<String>::new());
     assert_eq!(
