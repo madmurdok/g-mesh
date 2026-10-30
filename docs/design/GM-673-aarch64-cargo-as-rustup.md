@@ -56,9 +56,13 @@ child test fails at a sanity step that runs `real.proxy_dir.join(...)`:
   succeeds and reads no toolchain file.
 - `:964`, `:1253`, `:1337` (`cargo_env_loader_var::*`), `:1783`, `:1841`
   (`sandbox_writes_and_network::*`): `<proxy_dir>/cargo metadata|check` in
-  the fixture failed. Their stderr is printed empty, unlike the indexing
-  test's clap error; not explained, but every one goes through the same
-  proxy, and the tests that use only absolute toolchain binaries
+  the fixture failed. Their stderr is printed empty because rustup 1.29
+  writes its clap usage error to **stdout** (checked locally:
+  `<keg>/rustup metadata --format-version 1 >o 2>e` leaves `e` empty, `o`
+  holds "error: unexpected argument '--format-version'"), and these
+  assertions print only stderr; the indexing test's `plain_cargo` prints
+  both. `cargo check` in rustup mode is `rustup check` (update check, exit
+  100, stdout only). The tests that use only absolute toolchain binaries
   (`source_freshness::*`, `project_extra_env::*`) passed on the same image.
 
 Why 4.19.0 was green: the previous image installed rustup with rustup-init

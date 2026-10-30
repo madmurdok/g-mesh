@@ -159,11 +159,13 @@ fn rustup(args: &[&str]) -> String {
 /// A directory of rustup proxies made in `dir`, after checking the default
 /// toolchain has a working rust-analyzer.
 ///
-/// `cargo`, `rustc` and `rust-analyzer` are linked to the `rustup` on `PATH`,
-/// which runs as the proxy its program name says - all an installed proxy
-/// is. Not the directory `rustup` sits in: whether that one holds the proxies
-/// is the installer's choice (rustup-init's `~/.cargo/bin` does, Homebrew's
-/// `bin` does not, GM-574).
+/// `cargo`, `rustc` and `rust-analyzer` are linked to the install's own proxy
+/// of that name beside the `rustup` on `PATH`, or to that `rustup` when there
+/// is none. rustup runs as the proxy its `argv[0]` names, and a wrapper
+/// script (Homebrew's keg `bin`) replaces `argv[0]` when it execs the real
+/// binary, so a link to such a `rustup` would run as rustup whatever its
+/// name. rustup-init's `~/.cargo/bin` and Homebrew's keg `bin` hold the
+/// proxies; an install whose `rustup` stands alone gets links to that binary.
 fn proxy_dir(dir: &Path) -> PathBuf {
     let default = rustup(&["default"]);
     let pin = default.split_whitespace().next().expect("`rustup default` names a toolchain").to_string();
@@ -179,12 +181,15 @@ fn proxy_dir(dir: &Path) -> PathBuf {
         .expect("rustup is on PATH");
     std::fs::create_dir_all(dir).unwrap();
     for name in ["cargo", "rustc", "rust-analyzer"] {
-        let proxy = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+        let proxy = dir.join(&file);
+        let sibling = rustup.with_file_name(&file);
+        let target = if sibling.is_file() { sibling } else { rustup.clone() };
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&rustup, &proxy).unwrap();
+        std::os::unix::fs::symlink(&target, &proxy).unwrap();
         #[cfg(not(unix))]
-        if std::fs::hard_link(&rustup, &proxy).is_err() {
-            std::fs::copy(&rustup, &proxy).unwrap();
+        if std::fs::hard_link(&target, &proxy).is_err() {
+            std::fs::copy(&target, &proxy).unwrap();
         }
     }
     dir.to_path_buf()
