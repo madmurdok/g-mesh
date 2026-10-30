@@ -115,8 +115,6 @@ path = "junit.xml"
 # (docs/adr/0031-local-test-runs.md); `test-local.sh --full` runs them and
 # reports any test whose time crossed 10s either way against this list. A test
 # joins at 10s or more and leaves only after two batch-end runs under 10s.
-# 4.19.0 batch-end run: 19 tests joined; `cli_deps::deps_on_a_cold_ts_rust_python_project_...`
-# measured 7.5s (first run under 10s), so it stays until a second run confirms.
 [profile.local]
 inherits = "default"
 default-filter = """
@@ -165,7 +163,6 @@ not (
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=sandbox_writes_and_network::the_server_tree_writes_nothing_outside_its_writable_prefixes)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=sandbox_writes_and_network::the_server_tree_opens_no_network_connection_with_offline_removed)) |
     (binary_id(g-mesh-plugin-rust::semantic_runs_no_project_code) & test(=sandbox_writes_and_network::a_lockless_workspace_keeps_its_path_dependency_through_the_private_temp_dir)) |
-    (binary_id(g-mesh::it) & test(=cli_deps::deps_on_a_cold_ts_rust_python_project_matches_get_dependencies_and_reruns_byte_identically)) |
     (binary_id(g-mesh::it) & test(=worktree_daemon_lifecycle::a_call_to_a_deleted_selection_says_it_no_longer_exists)) |
     (binary_id(g-mesh::scripts) & test(=prune_stale_objects_script::real_crate::a_rebuild_leaves_the_old_objects_and_the_prune_removes_only_them)) |
     (binary_id(g-mesh::it) & test(=cli_clean::clean_and_clean_orphaned_handle_a_front_state_dir)) |
@@ -185,6 +182,10 @@ not (
     (binary_id(g-mesh::it) & test(=daemon_build_staleness::a_daemon_started_from_an_older_build_is_replaced_before_it_answers_again)) |
     (binary_id(g-mesh::it) & test(=daemon_build_staleness::shims_racing_to_replace_one_outdated_daemon_produce_exactly_one_replacement)) |
     (binary_id(g-mesh::it) & test(=go_plugin_fingerprint::the_go_plugin_fingerprint_ignores_the_checkouts_git_state)) |
-    (binary_id(g-mesh::it) & test(=plugins_die_with_daemon::long_lived_typescript_plugin_dies_with_a_killed_daemon))
+    (binary_id(g-mesh::it) & test(=plugins_die_with_daemon::long_lived_typescript_plugin_dies_with_a_killed_daemon)) |
+    (binary_id(g-mesh::it) & test(=one_plugin_binary_missing::status_reports_each_languages_outcome_in_light_and_full_json)) |
+    (binary_id(g-mesh::it) & test(=overload_call_resolution::an_overloaded_function_resolves_correctly_through_the_real_mcp_tools)) |
+    (binary_id(g-mesh::it) & test(=plugin_bridge::an_ambiguous_reexport_is_resolved_by_the_plugin_semantic_pass)) |
+    (binary_id(g-mesh::it) & test(=cli_clean::clean_orphaned_without_force_reports_and_deletes_nothing))
 )
 """
