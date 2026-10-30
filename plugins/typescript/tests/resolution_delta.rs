@@ -952,3 +952,116 @@ fn a_created_file_of_an_earlier_imports_target_names_the_later_one() {
     let (_fixture, project) = created_over(&files, "#x", "gen/x.ts", &["src/x.ts"], "src/x.ts");
     assert_eq!(fallbacks_shadowed_by(&project, "src/x.ts"), vec!["gen/x.ts"]);
 }
+
+/// `files` plus `importer` importing `specifier`, which names `before`; a
+/// root `index.ts` is then created and `specifier` names `after`. Returns
+/// that model, so a test asks it what the creation shadows.
+fn root_index_created_over(
+    files: &[(&str, &str)],
+    importer: &str,
+    specifier: &str,
+    before: &str,
+    after: &str,
+) -> (Fixture, TsProject) {
+    let resolves = |project: &TsProject| {
+        resolve(project, specifier, &RelPath::new(importer)).map(|path| path.as_str().to_string())
+    };
+    let source = format!("import {{ v }} from \"{specifier}\";\n");
+    let mut all: Vec<(&str, &str)> = files.to_vec();
+    all.push((importer, &source));
+    let fixture = Fixture::new(&all);
+    assert_eq!(resolves(&fixture.load()).as_deref(), Some(before), "{specifier} before");
+    fixture.write("index.ts", b"export const v = 2;\n");
+    let project = fixture.load();
+    assert_eq!(resolves(&project).as_deref(), Some(after), "{specifier} after");
+    (fixture, project)
+}
+
+/// A tsconfig `paths` target `.` listed before a fallback, and a package
+/// whose `main` is `../..` before its `index` convention: the import linked
+/// to the fallback moves to a created root `index.ts`, which names it.
+///
+/// Controls: `expand_paths_candidates` or `package_entry_targets`' legacy
+/// fields resolve with `paths::inside` (the import stays on the fallback);
+/// `specifiers_targeting` inverts with `paths::inside` (nothing is named).
+#[test]
+fn a_created_root_index_names_the_fallback_of_a_paths_or_main_target_naming_the_root() {
+    let tsconfig = alias_tsconfig(r#"{"~":[".","fallback/p"]}"#);
+    let files = [("tsconfig.json", tsconfig.as_str()), ("fallback/p.ts", "export const v = 1;\n")];
+    let (_fixture, project) = root_index_created_over(&files, MAIN, "~", "fallback/p.ts", "index.ts");
+    assert_eq!(fallbacks_shadowed_by(&project, "index.ts"), vec!["fallback/p.ts"]);
+
+    let files = [
+        WORKSPACE_ROOT,
+        ("packages/c/package.json", r#"{"name":"@s/c","main":"../.."}"#),
+        ("packages/c/index.ts", "export const v = 1;\n"),
+    ];
+    let (_fixture, project) =
+        root_index_created_over(&files, MAIN, "@s/c", "packages/c/index.ts", "index.ts");
+    assert_eq!(fallbacks_shadowed_by(&project, "index.ts"), vec!["packages/c/index.ts"]);
+}
+
+/// An `imports` target spelled as a module name and naming the root (`.`
+/// from the root package, `..\` from `sub`, `..\..` from `a/b`) listed
+/// before a fallback: the import moves to a created root `index.ts`, which
+/// names the fallback.
+///
+/// Controls: `imports_targets` resolves with `paths::inside`, or tests the
+/// slash-normalised target (the import stays on the fallback);
+/// `imports_specifiers_targeting` inverts with `paths::inside` (nothing is
+/// named).
+#[test]
+fn a_created_root_index_names_the_fallback_of_an_imports_module_name_target() {
+    for (manifest, json, importer, fallback) in [
+        (
+            "package.json",
+            r##"{"name":"root","imports":{"#r":[".","./fallback/i.ts"]}}"##,
+            MAIN,
+            "fallback/i.ts",
+        ),
+        (
+            "sub/package.json",
+            r##"{"name":"sub","imports":{"#r":["..\\","./fc.ts"]}}"##,
+            "sub/main.ts",
+            "sub/fc.ts",
+        ),
+        (
+            "a/b/package.json",
+            r##"{"name":"ab","imports":{"#r":["..\\..","./ff.ts"]}}"##,
+            "a/b/main.ts",
+            "a/b/ff.ts",
+        ),
+    ] {
+        let files = [(manifest, json), (fallback, "export const v = 1;\n")];
+        let (_fixture, project) = root_index_created_over(&files, importer, "#r", fallback, "index.ts");
+        assert_eq!(fallbacks_shadowed_by(&project, "index.ts"), vec![fallback], "{manifest}");
+    }
+}
+
+/// An `imports` target spelled relatively and naming the root (`./` from
+/// the root package, `../` from `sub`) names nothing, so the import stays on
+/// its fallback when a root `index.ts` is created, and that is not named.
+///
+/// Controls: `paths::inside` keeps the root (`./` moves); the module-name
+/// test ignores a leading `../` (`../` moves).
+#[test]
+fn a_created_root_index_leaves_a_relative_imports_target_naming_the_root_alone() {
+    for (manifest, json, importer, fallback) in [
+        (
+            "package.json",
+            r##"{"name":"root","imports":{"#r":["./","./fallback/s.ts"]}}"##,
+            MAIN,
+            "fallback/s.ts",
+        ),
+        (
+            "sub/package.json",
+            r##"{"name":"sub","imports":{"#r":["../","./fd.ts"]}}"##,
+            "sub/main.ts",
+            "sub/fd.ts",
+        ),
+    ] {
+        let files = [(manifest, json), (fallback, "export const v = 1;\n")];
+        let (_fixture, project) = root_index_created_over(&files, importer, "#r", fallback, fallback);
+        assert!(!fallbacks_shadowed_by(&project, "index.ts").contains(&fallback.to_string()), "{manifest}");
+    }
+}
