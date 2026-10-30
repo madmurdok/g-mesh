@@ -1713,6 +1713,128 @@ fn a_missing_extends_target_is_a_note_and_the_configs_own_paths_still_apply() {
     assert_eq!(resolve(&project, "@/a", "app.ts"), some("src/a.ts"));
 }
 
+/// `extends: ".."` names the parent directory's `tsconfig.json`, the
+/// project root's included, so a nested config inherits the root's `paths`.
+#[test]
+fn an_extends_of_dotdot_inherits_the_parent_directorys_tsconfig() {
+    let fx = Fixture::new(&[
+        ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#),
+        ("sub/tsconfig.json", r#"{"extends":".."}"#),
+        ("sub/page.ts", SRC),
+        ("src/x.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@/x", "sub/page.ts"), some("src/x.ts"));
+    assert!(!has_note(&project, &["sub/tsconfig.json", "not found"]), "{:?}", project.notes);
+}
+
+/// For `..` tsc loads the directory, never a same-named file next to it:
+/// with both `a.json` and `a/tsconfig.json` present, `a/b`'s `..` is the latter.
+#[test]
+fn an_extends_of_dotdot_prefers_the_directory_over_a_same_named_json_file() {
+    let fx = Fixture::new(&[
+        ("a.json", r#"{"compilerOptions":{"paths":{"@/*":["./wrong/*"]}}}"#),
+        ("a/tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["./right/*"]}}}"#),
+        ("a/b/tsconfig.json", r#"{"extends":".."}"#),
+        ("a/b/page.ts", SRC),
+        ("a/right/x.ts", SRC),
+        ("wrong/x.ts", SRC),
+    ]);
+    assert_eq!(resolve(&fx.load(), "@/x", "a/b/page.ts"), some("a/right/x.ts"));
+}
+
+/// `extends: "."` names the config's own directory's `tsconfig.json`, so a
+/// sibling config reaches it, and a config extending it inherits through it.
+#[test]
+fn an_extends_of_dot_names_the_configs_own_directorys_tsconfig() {
+    let fx = Fixture::new(&[
+        ("sub/tsconfig.json", r#"{"compilerOptions":{"paths":{"@s/*":["./s/*"]}}}"#),
+        ("sub/app.json", r#"{"extends":"."}"#),
+        ("sub/inner/tsconfig.json", r#"{"extends":"../app.json"}"#),
+        ("sub/inner/page.ts", SRC),
+        ("sub/s/x.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@s/x", "sub/inner/page.ts"), some("sub/s/x.ts"));
+    assert!(!has_note(&project, &["sub/app.json", "not found"]), "{:?}", project.notes);
+}
+
+/// Only exactly `.` or `..` names a directory. `../`, `./..` and `../base`
+/// (a directory holding a `tsconfig.json`) are file paths that tsc does not
+/// find, so the child inherits nothing.
+#[test]
+fn a_relative_extends_spelling_a_directory_otherwise_inherits_nothing() {
+    let fx = Fixture::new(&[
+        ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#),
+        ("base/tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["../src/*"]}}}"#),
+        ("slash/tsconfig.json", r#"{"extends":"../"}"#),
+        ("slash/page.ts", SRC),
+        ("dotslash/tsconfig.json", r#"{"extends":"./.."}"#),
+        ("dotslash/page.ts", SRC),
+        ("named/tsconfig.json", r#"{"extends":"../base"}"#),
+        ("named/page.ts", SRC),
+        ("src/x.ts", SRC),
+    ]);
+    let project = fx.load();
+    for dir in ["slash", "dotslash", "named"] {
+        let config = format!("{dir}/tsconfig.json");
+        assert_eq!(resolve(&project, "@/x", &format!("{dir}/page.ts")), None, "{dir}");
+        assert!(has_note(&project, &[config.as_str(), "not found"]), "{dir}: {:?}", project.notes);
+    }
+}
+
+/// `..` in the project root's own config would climb out of the project:
+/// refused even when the directory above holds a `tsconfig.json`.
+#[test]
+fn an_extends_of_dotdot_from_the_root_config_never_leaves_the_project() {
+    let fx = Fixture::new(&[
+        ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@out/*":["./proj/src/*"]}}}"#),
+        ("proj/tsconfig.json", r#"{"extends":"..","compilerOptions":{"paths":{"@own/*":["./src/*"]}}}"#),
+        ("proj/app.ts", SRC),
+        ("proj/src/x.ts", SRC),
+    ]);
+    let project = TsProject::load(&fx.root.join("proj")).expect("load never fails on a project tree");
+    assert_eq!(resolve(&project, "@out/x", "app.ts"), None);
+    assert_eq!(resolve(&project, "@own/x", "app.ts"), some("src/x.ts"));
+    assert!(has_note(&project, &["tsconfig.json", "not found"]), "{:?}", project.notes);
+}
+
+/// A relative entry names a file: the path as written first, then with
+/// `.json`. A directory of that name is not a candidate, so the `.json`
+/// file beside it is taken.
+#[test]
+fn a_relative_extends_loads_the_exact_file_then_the_json_one() {
+    let fx = Fixture::new(&[
+        ("configs/base", r#"{"compilerOptions":{"paths":{"@/*":["../exact/*"]}}}"#),
+        ("configs/base.json", r#"{"compilerOptions":{"paths":{"@/*":["../json/*"]}}}"#),
+        ("configs/dual/tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["../../dir/*"]}}}"#),
+        ("configs/dual.json", r#"{"compilerOptions":{"paths":{"@/*":["../json/*"]}}}"#),
+        ("one/tsconfig.json", r#"{"extends":"../configs/base"}"#),
+        ("one/page.ts", SRC),
+        ("two/tsconfig.json", r#"{"extends":"../configs/dual"}"#),
+        ("two/page.ts", SRC),
+        ("exact/x.ts", SRC),
+        ("json/x.ts", SRC),
+        ("dir/x.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@/x", "one/page.ts"), some("exact/x.ts"));
+    assert_eq!(resolve(&project, "@/x", "two/page.ts"), some("json/x.ts"));
+}
+
+#[test]
+fn extends_candidates_read_dot_and_dotdot_as_directories_only_when_exact() {
+    assert_eq!(extends_candidates("sub/tsconfig.json", ".."), strings(&["tsconfig.json"]));
+    assert_eq!(extends_candidates("a/b/tsconfig.json", ".."), strings(&["a/tsconfig.json"]));
+    assert_eq!(extends_candidates("sub/app.json", "."), strings(&["sub/tsconfig.json"]));
+    assert_eq!(extends_candidates("app.json", "."), strings(&["tsconfig.json"]));
+    assert_eq!(extends_candidates("sub/tsconfig.json", "../base"), strings(&["base", "base.json"]));
+    for entry in ["../", "./..", "..\\", "../.."] {
+        assert_eq!(extends_candidates("sub/tsconfig.json", entry), Vec::<String>::new(), "{entry:?}");
+    }
+    assert_eq!(extends_candidates("tsconfig.json", ".."), Vec::<String>::new());
+}
+
 #[test]
 fn extends_candidates_follow_tscs_lookup() {
     assert_eq!(
