@@ -92,7 +92,10 @@ pub fn paths_entries(value: &Json) -> Option<Vec<PathsEntry>> {
 /// Every project-relative path `specifier` could name under `config`, in
 /// declaration order, without repeats. Every matching key contributes; the
 /// existence set picks. A key without `*` is an exact alias. Targets leaving
-/// the project are dropped.
+/// the project are dropped. A target naming the project root is kept (its
+/// `index` files are the candidates) unless an empty `*` capture produced
+/// it: tsc substitutes no empty capture, so `@/` under `"@/*": ["./*"]`
+/// names no root.
 pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     for entry in &config.paths {
@@ -111,7 +114,12 @@ pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec
                 Some(capture) => target.replace('*', capture),
                 None => target.clone(),
             };
-            if let Some(inside) = paths::inside(&config.resolve_dir, &substituted) {
+            let resolved = if capture == Some("") {
+                paths::inside(&config.resolve_dir, &substituted)
+            } else {
+                paths::inside_or_root(&config.resolve_dir, &substituted)
+            };
+            if let Some(inside) = resolved {
                 if !candidates.contains(&inside) {
                     candidates.push(inside);
                 }
@@ -131,7 +139,7 @@ pub fn specifiers_targeting(config: &EffectiveConfig, address: &str) -> Vec<Stri
     let mut specifiers: Vec<String> = Vec::new();
     for entry in &config.paths {
         for target in &entry.targets {
-            let Some(pattern) = paths::inside(&config.resolve_dir, target) else {
+            let Some(pattern) = paths::inside_or_root(&config.resolve_dir, target) else {
                 continue;
             };
             let specifier = if entry.pattern.contains('*') {

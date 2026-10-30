@@ -499,6 +499,23 @@ fn a_hash_import_linked_to_a_later_target_moves_to_a_created_earlier_one() {
     assert_only_the_importer_re_extracted(&harness);
 }
 
+/// An `imports` target `.` (a module name) names the project root: `#r`
+/// listing `.` before `./gen/r.ts` and linked to `gen/r.ts` moves to a
+/// created root `index.ts`, by a re-extract of only its importer.
+#[test]
+fn a_hash_import_naming_the_root_moves_to_a_created_root_index() {
+    let harness = indexed_with_configs(
+        &[("package.json", r##"{"name":"root","imports":{"#r":[".","./gen/r.ts"]}}"##)],
+        &[("gen/r.ts", ""), ("src/a.ts", "import { mark_v1 } from \"#r\";\n")],
+    );
+    assert_eq!(harness.imports("src/a.ts").0, vec!["gen/r.ts:r.ts".to_string()], "linked to gen/r.ts");
+
+    create(&harness, "index.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["index.ts:index.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+}
+
 /// The importer of another alias (`@/y`, linked to `generated/y.ts`) is not
 /// selected by the creation of `src/x.ts`: it is not re-extracted and keeps
 /// its link, while `@/x` moves.

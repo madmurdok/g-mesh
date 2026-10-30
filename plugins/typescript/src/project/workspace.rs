@@ -133,25 +133,35 @@ fn has_url_scheme(specifier: &str) -> bool {
 /// output (`dist/`) that an unbuilt checkout lacks and a built one ignores,
 /// so it is never in the existence set and cannot shadow the source.
 pub fn package_entry_targets(package: &WorkspacePackage, subpath: &str) -> Vec<String> {
-    let mut targets = exports_targets(package.manifest.get("exports"), subpath);
+    // Whether a target naming the project root keeps it: only a `main`-style
+    // field does, as in tsc; an `exports` target naming it names nothing.
+    let mut targets: Vec<(String, bool)> = exports_targets(package.manifest.get("exports"), subpath)
+        .into_iter()
+        .map(|target| (target, false))
+        .collect();
 
     if subpath == "." {
         for field in ["source", "main", "module", "types", "typings"] {
             if let Some(entry) = package.manifest.get(field).and_then(Json::as_str) {
-                targets.push(entry.to_string());
+                targets.push((entry.to_string(), true));
             }
         }
-        targets.push("src/index".to_string());
-        targets.push("index".to_string());
+        targets.push(("src/index".to_string(), false));
+        targets.push(("index".to_string(), false));
     } else {
         let relative = &subpath[2..];
-        targets.push(relative.to_string());
-        targets.push(format!("src/{relative}"));
+        targets.push((relative.to_string(), false));
+        targets.push((format!("src/{relative}"), false));
     }
 
     let mut resolved: Vec<String> = Vec::new();
-    for target in targets {
-        if let Some(inside) = paths::inside(&package.dir, &target) {
+    for (target, root_allowed) in targets {
+        let inside = if root_allowed {
+            paths::inside_or_root(&package.dir, &target)
+        } else {
+            paths::inside(&package.dir, &target)
+        };
+        if let Some(inside) = inside {
             if !resolved.contains(&inside) {
                 resolved.push(inside);
             }
