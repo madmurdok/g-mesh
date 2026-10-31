@@ -14,13 +14,16 @@ from the rest without downloading the log. GM-539 also needs units it can
 select by changed paths.
 
 ## Decision
-We split the suite into 11 named sections, each a nextest filterset over the
-whole workspace, held in `scripts/test-sections.sh`: `core-it`, `core-mcp`,
-`core-daemon`, `core-cli`, `core-graph`, `core-rest`, `sdk`,
-`plugin-typescript`, `plugin-rust`, `plugin-python`, `wire`.
-(Since GM-623, `core-it` is two binaries, `g-mesh::it` and
-`g-mesh::scripts`, rather than one per file; it still selects them by
-`kind(test)`.)
+We split the suite into 12 named sections, each a nextest filterset over the
+whole workspace, held in `scripts/test-sections.sh`: `core-it`,
+`core-scripts`, `core-mcp`, `core-daemon`, `core-cli`, `core-graph`,
+`core-rest`, `sdk`, `plugin-typescript`, `plugin-rust`, `plugin-python`,
+`wire`. Core's integration tests are two binaries: `core-scripts` is
+`binary_id(g-mesh::scripts)` (tests whose subject is a file under
+`scripts/`), and `core-it` is the rest of core's `kind(test)`, so a new test
+binary lands in `core-it` rather than in no section (GM-671: split out so a
+core change that cannot reach the scripts tests skips them locally). Every
+section has one CI step.
 
 - **Filtersets in a script, not nextest profiles.** CI needs the `ci`
   profile's JUnit output per section, and a nextest profile cannot inherit
@@ -32,8 +35,9 @@ whole workspace, held in `scripts/test-sections.sh`: `core-it`, `core-mcp`,
 - **`--workspace` plus `package()`, never `-p`.** Every section uses the one
   build and the one feature unification, and the plugin and SDK binaries core
   tests spawn always exist. A `-p` per section would rebuild with different
-  features. The release gate's `cargo test -p g-mesh` run stays, because it
-  exists to test that other configuration.
+  features. CI's Linux row runs `cargo test -p g-mesh` on full runs (GM-675; before,
+  the release gate ran it locally), because it exists to test that other
+  configuration.
 - **`core-rest` is a complement.** It holds every core lib test outside
   `mcp`, `daemon`, `cli` and `graph`, so a new top-level module needs no edit.
   Small modules share it rather than each adding a near-empty step.
@@ -41,17 +45,17 @@ whole workspace, held in `scripts/test-sections.sh`: `core-it`, `core-mcp`,
   each section once (ignored tests included) and
   `scripts/test-sections-check.py` fails on a test in no section, in two
   sections, or matched by a section but absent from the suite. CI's linux row
-  and the release gate run it.
+  and `cut-release.sh` run it.
 - **CI: steps in one job, not a matrix.** One build step, then one step per
   section with its own timeout and JUnit file. A matrix over sections would
   be 44 jobs, each with its own cold build.
 - **`!cancelled()` between sections in CI.** A failing section does not skip
   the ones after it, the same rule as `fail-fast = false` inside a section.
-  Locally and in the release gate, `run` stops at the first failing section
+  Locally, `run` stops at the first failing section
   unless given `--keep-going`.
-- **The release gate runs `check` and `run all`** instead of
-  `cargo test --workspace`, so it uses the same runner and per-test timeout
-  as CI.
+- **The release gate runs `check` and waits for CI** (GM-675). It used to run
+  `run all` locally instead of `cargo test --workspace`; now the suite runs
+  only in CI, with the same runner and per-test timeout as any CI run.
 
 ## Consequences
 - Each section's duration is a step duration on the CI run page, and each
@@ -83,7 +87,7 @@ Accepted 2026-10-09 (owner decisions Q1 and Q2 in the design note, section 10).
 - **The release gate requires a full run, read from a job, not a summary.**
   ci.yml's `full-suite` job ("Full test suite ran") succeeds only when the
   `select` job said `full`, the platform matrix was not narrowed, and every
-  test row passed. `cut-release.sh` looks for that job on a green ci.yml run
+  test row passed. `cut-release.sh` waits for that job on a ci.yml run
   of the release-branch tip and otherwise refuses, naming
   `gh workflow run ci.yml --ref release-<version>`. Job outputs and step
   summaries are not in the REST API; a job's name and conclusion are.

@@ -161,8 +161,10 @@ fn rustup(args: &[&str]) -> String {
 /// toolchain has a working rust-analyzer.
 ///
 /// `cargo`, `rustc` and `rust-analyzer` are linked to the install's own proxy
-/// of that name beside the `rustup` on `PATH`, or to that `rustup` when there
-/// is none. rustup runs as the proxy its `argv[0]` names, and a wrapper
+/// of that name beside the `rustup` on `PATH`, canonicalized first, or to
+/// that `rustup` when there is none. The `rustup` on `PATH` may be a symlink
+/// in a directory with no proxies beside it (`/opt/homebrew/bin`); the
+/// install's proxies are beside the file it resolves to. rustup runs as the proxy its `argv[0]` names, and a wrapper
 /// script (Homebrew's keg `bin`) replaces `argv[0]` when it execs the real
 /// binary, so a link to such a `rustup` would run as rustup whatever its
 /// name. rustup-init's `~/.cargo/bin` and Homebrew's keg `bin` hold the
@@ -180,6 +182,7 @@ fn proxy_dir(dir: &Path) -> PathBuf {
         .map(|dir| dir.join(format!("rustup{}", std::env::consts::EXE_SUFFIX)))
         .find(|candidate| candidate.is_file())
         .expect("rustup is on PATH");
+    let rustup = std::fs::canonicalize(&rustup).unwrap_or(rustup);
     std::fs::create_dir_all(dir).unwrap();
     for name in ["cargo", "rustc", "rust-analyzer"] {
         let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
@@ -289,6 +292,68 @@ fn proxies_beside_a_wrapper_script_rustup_run_as_their_tool() {
             Path::new(&keg).display(),
             output.status,
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    println!("{test}: proxies checked");
+}
+
+/// Set, to the fake install's directory, only in the child process of
+/// [`proxies_of_a_symlinked_rustup_link_to_the_proxies_beside_its_target`].
+#[cfg(unix)]
+const SYMLINK_CHILD_ENV: &str = "G_MESH_RS_SYMLINKED_RUSTUP_CHILD";
+
+/// With a `rustup` first on `PATH` that is a symlink, in a directory with no
+/// proxies beside it (`/opt/homebrew/bin`), to a wrapper keg's script,
+/// [`proxy_dir`] links each proxy to the one beside the keg's `rustup`. The
+/// check runs in a child process with that `PATH`, as for the wrapper test.
+///
+/// Control: drop the canonicalization of `rustup` in `proxy_dir` (the proxies
+/// link to the symlink, which runs as rustup).
+#[cfg(unix)]
+#[test]
+fn proxies_of_a_symlinked_rustup_link_to_the_proxies_beside_its_target() {
+    let test = "proxies_of_a_symlinked_rustup_link_to_the_proxies_beside_its_target";
+    let Some(keg) = std::env::var_os(SYMLINK_CHILD_ENV) else {
+        let scratch = std::env::temp_dir().join(format!("g-mesh-rust-symlinked-keg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let scratch = scratch.canonicalize().unwrap();
+        let keg = scratch.join("keg");
+        if !wrapper_keg(test, &keg) {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return;
+        }
+        let bin = scratch.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(keg.join("rustup"), bin.join("rustup")).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--nocapture"])
+            .env("PATH", path)
+            .env(SYMLINK_CHILD_ENV, &keg)
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&scratch);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(&format!("{test}: proxies checked")),
+            "the child did not pass ({}):\n--- stdout\n{stdout}\n--- stderr\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let scratch = Scratch::new();
+    let proxies = proxy_dir(&scratch.0.join("rustup-proxies"));
+    for name in ["cargo", "rustc", "rust-analyzer"] {
+        assert_eq!(
+            std::fs::read_link(proxies.join(name)).unwrap(),
+            Path::new(&keg).join(name),
+            "the {name} proxy is not the one beside the real rustup"
         );
     }
     println!("{test}: proxies checked");

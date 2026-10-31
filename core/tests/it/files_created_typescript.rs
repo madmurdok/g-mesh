@@ -30,7 +30,7 @@ fn an_importer_created_with_its_target_and_routed_first_resolves_the_import() {
     harness.write("b.ts", "export function target(): number {\n  return 1;\n}\n");
     harness.write("a.ts", "import { target } from \"./b\";\n\nexport const value = target();\n");
     let created = ["a.ts".to_string(), "b.ts".to_string()];
-    harness.registry.announce_created(&created);
+    harness.registry.announce_created(&harness.conn, &created);
     for file_path in &created {
         harness.route(file_path);
     }

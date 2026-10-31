@@ -2,6 +2,7 @@
 //! script for real, or checks what it reads. Separate from `it` so that a
 //! release or tooling task that edits only these recompiles this small crate
 //! and not the product's tests (GM-623).
+//! These tests run as section `core-scripts`; `core/tests/it` runs as `core-it`.
 //!
 //! Placement rule (GM-623): a core integration test whose subject is a file
 //! under `scripts/` (it runs that script, or parses its output) goes to
@@ -15,6 +16,7 @@
 
 mod ci_junit_summary_script;
 mod cut_release_plugin_versions;
+mod new_task_worktree_script;
 mod prune_stale_objects_script;
 mod release_packaging_scripts;
 mod test_local_script;

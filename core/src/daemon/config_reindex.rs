@@ -45,6 +45,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 use crate::daemon::lifecycle::PluginSupervisor;
+use crate::daemon::path_case;
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::workspace_reindex;
@@ -140,9 +141,11 @@ fn selective(
         Err(err) => return Ok(Outcome::Fallback(format!("resolutionChanged failed ({err:#})"))),
     };
     let facts = answer.facts;
+    let watch_paths = path_case::keys(project_root, &answer.watch_paths);
     match answer.delta {
         ResolutionDelta::Unchanged => {
-            store.with(|conn| schema::set_resolution_facts(conn, language, facts.as_deref()))?;
+            store
+                .with(|conn| schema::set_resolution_facts(conn, language, facts.as_deref(), &watch_paths))?;
             Ok(Outcome::Unchanged)
         }
         ResolutionDelta::Unknown { reason } => {
@@ -151,7 +154,9 @@ fn selective(
         ResolutionDelta::Affected { files, imports } => {
             let selected = match store.with(|conn| select(conn, language, &files, &imports, None))? {
                 Selection::Nothing => {
-                    store.with(|conn| schema::set_resolution_facts(conn, language, facts.as_deref()))?;
+                    store.with(|conn| {
+                        schema::set_resolution_facts(conn, language, facts.as_deref(), &watch_paths)
+                    })?;
                     return Ok(Outcome::Unchanged);
                 }
                 Selection::TooMany(why) => return Ok(Outcome::Fallback(why)),
@@ -166,6 +171,7 @@ fn selective(
                 changed_file,
                 &selected,
                 facts.as_deref(),
+                &watch_paths,
                 semantic_pass,
             )
         }
@@ -195,13 +201,14 @@ pub(crate) fn select(
     imports: &[ImportSelector],
     trigger: Option<&str>,
 ) -> Result<Selection> {
-    select_with(conn, language, files, imports, trigger, &[])
+    select_with(conn, language, files, imports, trigger, &[], &[])
 }
 
 /// [`select`] with `extra` files joined to the selection before the
 /// threshold, so one rule bounds both: the importers of a gone file
 /// (`Writer::apply_file_diff_linked`) ride along with what the plugin's own
-/// `affected` answer selected for the same delete.
+/// `affected` answer selected for the same delete. `own_waiting` is what an
+/// exact `File` key equal to `trigger` selects ([`select_affected`]).
 pub(crate) fn select_with(
     conn: &Connection,
     language: &str,
@@ -209,8 +216,9 @@ pub(crate) fn select_with(
     imports: &[ImportSelector],
     trigger: Option<&str>,
     extra: &[String],
+    own_waiting: &[String],
 ) -> Result<Selection> {
-    let mut selected = select_affected(conn, language, files, imports)?;
+    let mut selected = select_affected(conn, language, files, imports, trigger.map(|t| (t, own_waiting)))?;
     selected.extend(extra.iter().cloned());
     if let Some(trigger) = trigger {
         selected.remove(trigger);
@@ -240,11 +248,18 @@ pub(crate) fn select_with(
 /// A selector on one exact target is answered by [`indexed_importers`], whose
 /// cost follows the edges pointing there; only the other selectors read every
 /// import of the language, in one [`scan_imports`].
+///
+/// `own` is the edited file's path and the importers whose imports waited
+/// unresolved at it until the edit's commit linked them. An exact `File` key
+/// equal to that path selects only those importers (within the selector's
+/// `importers` scope), not [`indexed_importers`]: every other import linked
+/// to the file was linked before the edit and is unaffected by it.
 pub(crate) fn select_affected(
     conn: &Connection,
     language: &str,
     files: &[PathScope],
     imports: &[ImportSelector],
+    own: Option<(&str, &[String])>,
 ) -> Result<BTreeSet<String>> {
     let mut selected = BTreeSet::new();
     if !files.is_empty() {
@@ -258,6 +273,12 @@ pub(crate) fn select_affected(
     let mut scanned = Vec::new();
     for selector in imports {
         match &selector.by {
+            ImportMatch::Target { scope_kind: TargetScopeKind::File, matcher: Matcher::Exact(key) }
+                if own.is_some_and(|(trigger, _)| trigger == key) =>
+            {
+                let waiting = own.map(|(_, waiting)| waiting).unwrap_or_default();
+                selected.extend(waiting.iter().filter(|path| selector.importers.contains(path)).cloned());
+            }
             ImportMatch::Target { scope_kind, matcher: Matcher::Exact(key) } => {
                 for importer in indexed_importers(conn, language, *scope_kind, key)? {
                     if selector.importers.contains(&importer) {
@@ -453,6 +474,7 @@ impl StoredImport {
 
 /// Re-extracts `selected` under `pending_reindex`, sends one semantic pass
 /// over them (plus the owed files) when `semantic_pass`, then stores `facts`
+/// with `watch_paths` (already case-folded keys)
 /// and clears `pending_reindex` together. A failed re-extract stops the loop
 /// and falls back, leaving `pending_reindex` for the whole-language reindex
 /// to clear. A selected file already gone from disk (the selection is the
@@ -467,6 +489,7 @@ fn reextract(
     changed_file: &str,
     selected: &BTreeSet<String>,
     facts: Option<&str>,
+    watch_paths: &[String],
     semantic_pass: bool,
 ) -> Result<Outcome> {
     store
@@ -489,7 +512,7 @@ fn reextract(
     store
         .with(|conn| -> Result<()> {
             let tx = conn.unchecked_transaction().context("failed to start the facts transaction")?;
-            schema::set_resolution_facts(&tx, language, facts)?;
+            schema::set_resolution_facts(&tx, language, facts, watch_paths)?;
             tx.execute("DELETE FROM pending_reindex WHERE language = ?1", params![language])
                 .with_context(|| format!("failed to clear {language}'s pending reindex"))?;
             tx.commit().context("failed to commit the facts transaction")

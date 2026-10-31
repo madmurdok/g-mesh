@@ -18,8 +18,9 @@ use std::process::{Command, Output};
 
 use serde_json::{json, Map, Value};
 
-const SECTIONS: [&str; 11] = [
+const SECTIONS: [&str; 12] = [
     "core-it",
+    "core-scripts",
     "core-mcp",
     "core-daemon",
     "core-cli",
@@ -237,7 +238,7 @@ fn sections_script(path_env: &str, args: &[&str]) -> Output {
 }
 
 #[test]
-fn list_prints_the_eleven_sections_in_run_order() {
+fn list_prints_the_twelve_sections_in_run_order() {
     let dir = tempfile::tempdir().unwrap();
     let output = sections_script(&recording_cargo(dir.path()), &["list"]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
@@ -283,10 +284,299 @@ fn run_refuses_an_unknown_or_missing_section_before_calling_cargo() {
     );
 }
 
+/// `sections_script` on a host whose `uname -s` is `uname`, with an empty
+/// target dir so the real script's object pruning has nothing to touch.
+fn sections_on(uname: &str, dir: &Path, path_env: &str, args: &[&str]) -> Output {
+    Command::new("bash")
+        .arg(repo_root().join("scripts/test-sections.sh"))
+        .args(args)
+        .env("PATH", path_env)
+        .env("TEST_SECTIONS_UNAME", uname)
+        .env("CARGO_TARGET_DIR", dir.join("empty-target"))
+        .env_remove("GITHUB_STEP_SUMMARY")
+        .output()
+        .expect("failed to run bash")
+}
+
+fn cargo_calls(dir: &Path) -> String {
+    fs::read_to_string(dir.join("cargo-called")).unwrap_or_default()
+}
+
+const WINDOWS_UNAMES: [&str; 3] = ["MINGW64_NT-10.0-20348", "MSYS_NT-10.0", "CYGWIN_NT-10.0"];
+
+#[test]
+fn on_windows_run_core_scripts_skips_with_a_skip_line_and_never_runs_cargo_tests() {
+    for uname in WINDOWS_UNAMES {
+        let dir = tempfile::tempdir().unwrap();
+        let path_env = recording_cargo(dir.path());
+
+        let output = sections_on(uname, dir.path(), &path_env, &["run", "core-scripts"]);
+        assert_eq!(output.status.code(), Some(0), "{uname}: {}", describe(&output));
+        assert!(
+            stdout_lines(&output).iter().any(|l| l.starts_with("== core-scripts: SKIP")),
+            "{uname}: {}",
+            describe(&output)
+        );
+        // The `nextest --version` probe is allowed; running tests is not.
+        let calls = cargo_calls(dir.path());
+        assert!(!calls.contains("nextest run"), "{uname}: cargo ran tests: {calls}");
+    }
+}
+
+#[test]
+fn on_windows_a_section_with_tests_still_runs_with_no_tests_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+
+    let output = sections_on(WINDOWS_UNAMES[0], dir.path(), &path_env, &["run", "core-it"]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("SKIP"), "{}", describe(&output));
+    let calls = cargo_calls(dir.path());
+    assert!(calls.contains("nextest run"), "{calls}");
+    assert!(calls.contains("--no-tests=fail"), "{calls}");
+}
+
+#[test]
+fn on_windows_run_all_skips_only_core_scripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+
+    let output = sections_on(WINDOWS_UNAMES[0], dir.path(), &path_env, &["run", "all"]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let skipped: Vec<String> = stdout_lines(&output).into_iter().filter(|l| l.contains("SKIP")).collect();
+    assert_eq!(skipped.len(), 1, "{}", describe(&output));
+    assert!(skipped[0].starts_with("== core-scripts: SKIP"), "{}", describe(&output));
+    let runs = cargo_calls(dir.path()).lines().filter(|l| l.contains("nextest run")).count();
+    assert_eq!(runs, SECTIONS.len() - 1, "{}", cargo_calls(dir.path()));
+}
+
+#[test]
+fn on_unix_run_core_scripts_calls_cargo_with_no_tests_fail() {
+    for uname in ["Linux", "Darwin"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path_env = recording_cargo(dir.path());
+
+        let output = sections_on(uname, dir.path(), &path_env, &["run", "core-scripts"]);
+        assert_eq!(output.status.code(), Some(0), "{uname}: {}", describe(&output));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("SKIP"), "{uname}: {}", describe(&output));
+        let calls = cargo_calls(dir.path());
+        assert!(calls.contains("binary_id(g-mesh::scripts)"), "{uname}: {calls}");
+        assert!(calls.contains("--no-tests=fail"), "{uname}: {calls}");
+    }
+}
+
+/// A `cargo` that answers `nextest list` for a two-test suite (one scripts
+/// test, one `mcp::` lib test) by evaluating just the section filters it is
+/// given, so `check` can run without building anything.
+fn listing_cargo(dir: &Path) -> String {
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    let script = r#"#!/bin/sh
+case "$*" in
+*--version*) exit 0 ;;
+esac
+filter=""
+while [ $# -gt 0 ]; do
+	[ "$1" != -E ] || filter="$2"
+	shift
+done
+scripts='"g-mesh::scripts":{"binary-id":"g-mesh::scripts","testcases":{"t":{"ignored":false,"filter-match":{"status":"matches"}}}}'
+mcp='"g-mesh":{"binary-id":"g-mesh","testcases":{"mcp::t":{"ignored":false,"filter-match":{"status":"matches"}}}}'
+case "$filter" in
+"") suites="$scripts,$mcp" ;;
+*'!binary_id(g-mesh::scripts)'*) suites="" ;;
+*'binary_id(g-mesh::scripts)'*) suites="$scripts" ;;
+*'test(/^mcp::/)'*) suites="$mcp" ;;
+*) suites="" ;;
+esac
+printf '{"rust-build-meta":{},"test-count":0,"rust-suites":{%s}}\n' "$suites"
+"#;
+    fs::write(&cargo, script).unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+}
+
+#[test]
+fn check_on_windows_still_counts_core_scripts_tests() {
+    for uname in [WINDOWS_UNAMES[0], "Linux"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path_env = listing_cargo(dir.path());
+
+        let output = sections_on(uname, dir.path(), &path_env, &["check"]);
+        assert_eq!(output.status.code(), Some(0), "{uname}: {}", describe(&output));
+        let lines = stdout_lines(&output);
+        assert!(lines.contains(&"core-scripts: 1".to_owned()), "{uname}: {}", describe(&output));
+        assert!(lines.contains(&"core-mcp: 1".to_owned()), "{uname}: {}", describe(&output));
+        assert!(
+            lines.contains(&"OK: every test is in exactly one section".to_owned()),
+            "{uname}: {}",
+            describe(&output)
+        );
+    }
+}
+
+/// `core-it` holds core's `kind(test)` binaries but `g-mesh::scripts`, which
+/// `core-scripts` holds alone.
+#[test]
+fn core_scripts_is_the_scripts_binary_and_core_it_is_every_other_core_test_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+    let filter_of = |name: &str| {
+        let output = sections_script(&path_env, &["filter", name]);
+        assert_eq!(output.status.code(), Some(0), "{name}\n{}", describe(&output));
+        String::from_utf8_lossy(&output.stdout).trim_end().to_owned()
+    };
+    assert_eq!(filter_of("core-scripts"), "package(g-mesh) & binary_id(g-mesh::scripts)");
+    assert_eq!(filter_of("core-it"), "package(g-mesh) & kind(test) & !binary_id(g-mesh::scripts)");
+}
+
+/// A section nobody runs in CI drops its tests silently: each listed section
+/// has exactly one `tests: <section>` step, whose `if:` selects it by name.
+#[test]
+fn every_listed_section_has_exactly_one_ci_step_that_runs_it_when_selected() {
+    let dir = tempfile::tempdir().unwrap();
+    let listed = stdout_lines(&sections_script(&recording_cargo(dir.path()), &["list"]));
+    assert_eq!(listed.len(), SECTIONS.len(), "{listed:?}");
+    let ci = fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    let mut steps: Vec<Vec<&str>> = Vec::new();
+    for line in ci.lines() {
+        if line.trim_start().starts_with("- name:") {
+            steps.push(Vec::new());
+        }
+        if let Some(step) = steps.last_mut() {
+            step.push(line);
+        }
+    }
+    for name in &listed {
+        let run_line = format!("run: scripts/test-sections.sh run --profile ci {name}");
+        let running: Vec<&Vec<&str>> =
+            steps.iter().filter(|s| s.iter().any(|l| l.trim() == run_line)).collect();
+        assert_eq!(
+            running.len(),
+            1,
+            "section {name}: {} ci.yml steps run it, want exactly one",
+            running.len()
+        );
+        let step = running[0];
+        assert!(step[0].contains(&format!("\"tests: {name}\"")), "section {name}: step is `{}`", step[0]);
+        let condition = step.iter().find(|l| l.trim_start().starts_with("if:")).copied().unwrap_or("");
+        assert!(
+            condition.contains(&format!("' {name} '")),
+            "section {name}: its step's `if:` is `{condition}`"
+        );
+    }
+}
+
+/// A scratch checkout: the real `scripts/test-sections.sh` and `map`, when
+/// given, as `scripts/test-plugin-spawns.txt`.
+fn sections_root(map: Option<&str>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("scripts/test-sections.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    for name in ["test-sections.sh", "prune-stale-objects.sh"] {
+        fs::copy(repo_root().join("scripts").join(name), dir.path().join("scripts").join(name)).unwrap();
+    }
+    if let Some(map) = map {
+        fs::write(dir.path().join("scripts/test-plugin-spawns.txt"), map).unwrap();
+    }
+    dir
+}
+
+fn sections_in(root: &Path, path_env: &str, args: &[&str]) -> Output {
+    Command::new("bash")
+        .arg(root.join("scripts/test-sections.sh"))
+        .args(args)
+        .env("PATH", path_env)
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env_remove("GITHUB_STEP_SUMMARY")
+        .output()
+        .expect("failed to run bash")
+}
+
+const SPAWN_MAP: &str = "# comment\n\
+    it:alpha typescript rust\n\
+    it:beta   typescript   # trailing comment\n\
+    it:gamma none\n\
+    lib:m::tests typescript go\n\
+    scripts:s rust\n";
+
+fn spawns_filter(root: &Path, plugin: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let output =
+        sections_in(root, &recording_cargo(dir.path()), &["filter", &format!("core-spawns-{plugin}")]);
+    assert_eq!(output.status.code(), Some(0), "{plugin}\n{}", describe(&output));
+    String::from_utf8_lossy(&output.stdout).trim_end().to_owned()
+}
+
+/// The filter names exactly the modules whose row lists the plugin, per
+/// binary; a plugin no row lists selects nothing.
+#[test]
+fn a_core_spawns_filter_names_the_modules_whose_map_rows_list_that_plugin() {
+    let root = sections_root(Some(SPAWN_MAP));
+    let it = |mods: &str| format!("(binary_id(g-mesh::it) & test(/^({mods})::/))");
+    assert_eq!(
+        spawns_filter(root.path(), "typescript"),
+        format!("package(g-mesh) & ({} | (kind(lib) & test(/^(m::tests)::/)))", it("alpha|beta"))
+    );
+    assert_eq!(
+        spawns_filter(root.path(), "rust"),
+        format!("package(g-mesh) & ({} | (binary_id(g-mesh::scripts) & test(/^(s)::/)))", it("alpha"))
+    );
+    assert_eq!(spawns_filter(root.path(), "go"), "package(g-mesh) & ((kind(lib) & test(/^(m::tests)::/)))");
+    assert_eq!(spawns_filter(root.path(), "python"), "package(g-mesh) & (none())");
+}
+
+#[test]
+fn a_core_spawns_filter_refuses_a_missing_map_or_a_row_of_another_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+
+    let root = sections_root(None);
+    let output = sections_in(root.path(), &path_env, &["filter", "core-spawns-typescript"]);
+    assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read"), "{}", describe(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "", "a filter was printed");
+
+    let root = sections_root(Some("it:alpha typescript\nbogus:x typescript\n"));
+    let output = sections_in(root.path(), &path_env, &["filter", "core-spawns-typescript"]);
+    assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("bad row"), "{}", describe(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "", "a filter was printed");
+}
+
+/// The selectors overlap sections, so they are not listed (the partition check
+/// would see two owners); `run` takes them, and the refusal of an unknown name
+/// says they exist.
+#[test]
+fn core_spawns_selectors_are_runnable_but_not_listed_sections() {
+    let root = sections_root(Some(SPAWN_MAP));
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+
+    let listed = stdout_lines(&sections_in(root.path(), &path_env, &["list"]));
+    assert_eq!(listed, SECTIONS.map(str::to_owned).to_vec());
+
+    let output = sections_in(root.path(), &path_env, &["run", "core-spawns-typescript"]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let calls = fs::read_to_string(dir.path().join("cargo-called")).unwrap();
+    let runs: Vec<&str> = calls.lines().filter(|l| l.starts_with("nextest run")).collect();
+    assert_eq!(runs.len(), 1, "{calls}");
+    assert!(runs[0].contains("alpha|beta"), "{calls}");
+
+    let output = sections_in(root.path(), &path_env, &["filter", "core-nope"]);
+    assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("core-spawns-<plugin>"),
+        "{}",
+        describe(&output)
+    );
+}
+
 /// The real tree: lists the whole workspace suite once plus once per section,
 /// on the current build. Ignored because that is twelve full listings; CI
 /// runs the same `scripts/test-sections.sh check` as its own step on the
-/// linux row, and the release gate runs it before the sections. Run it with
+/// linux row, and cut-release runs it before waiting for CI. Run it with
 /// `cargo nextest run -p g-mesh --test scripts -E 'test(/^test_sections_scripts::/)' --run-ignored only`.
 #[test]
 #[ignore = "lists the whole suite 12 times; CI's coverage-check step runs the same check"]

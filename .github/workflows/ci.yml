@@ -199,8 +199,9 @@ jobs:
           fi
 
   # Present and green only when every test section ran on every platform and
-  # passed. `scripts/cut-release.sh` looks for this job by name on the release
-  # branch tip's run, so its name is part of that contract.
+  # passed (on the Linux row also the workspace doctests and `cargo test -p
+  # g-mesh`, GM-675). `scripts/cut-release.sh` waits for this job by name on the
+  # release branch tip's run, so its name is part of that contract.
   full-suite:
     name: Full test suite ran
     needs: [matrix, select, test]
@@ -781,6 +782,12 @@ jobs:
         shell: bash
         run: scripts/test-sections.sh run --profile ci core-it
 
+      - name: "tests: core-scripts"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && (needs.select.outputs.mode == 'full' || contains(format(' {0} ', needs.select.outputs.sections), ' core-scripts ')) }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci core-scripts
+
       - name: "tests: core-mcp"
         if: ${{ !cancelled() && steps.build.outcome == 'success' && (needs.select.outputs.mode == 'full' || contains(format(' {0} ', needs.select.outputs.sections), ' core-mcp ')) }}
         timeout-minutes: 10
@@ -840,6 +847,25 @@ jobs:
         timeout-minutes: 10
         shell: bash
         run: scripts/test-sections.sh run --profile ci wire
+
+      # GM-675: what the old local release run covered that nextest does not
+      # (doctests; core in the package scope that ships, GM-302). Linux row,
+      # full runs only, so "Full test suite ran" (needs: test) succeeds only
+      # when they pass. Not named `tests: ` - those are sections.
+      - name: doctests (workspace)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.target == 'x86_64-unknown-linux-gnu' && needs.select.outputs.mode == 'full' }}
+        timeout-minutes: 25
+        shell: bash
+        run: cargo test --doc --workspace
+
+      - name: "shipped scope: cargo test -p g-mesh"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.target == 'x86_64-unknown-linux-gnu' && needs.select.outputs.mode == 'full' }}
+        timeout-minutes: 25
+        shell: bash
+        run: |
+          cargo test -p g-mesh --lib --bins
+          cargo test -p g-mesh --doc
+          cargo test -p g-mesh --test it --test scripts -- --test-threads=2
 
       # `always()` because the interesting case is the failing one, and a
       # section step has already failed the job by the time this runs.

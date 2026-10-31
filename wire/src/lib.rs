@@ -686,6 +686,18 @@ pub struct ResolutionChangedResult {
     /// none, and the next edit falls back to a whole-language reindex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<String>,
+    /// Files, beyond the manifest's static `watch_files`, whose save changes
+    /// the reloaded model (e.g. the targets of a config's `extends` chain,
+    /// found or not). Each path is project-relative with forward slashes,
+    /// normalized and inside the project, not under the plugin's
+    /// `exclude_dirs`, and never a file of one of the plugin's own
+    /// `[plugin.languages] extensions`. Core replaces the language's whole
+    /// set with each delivery and keeps it only beside stored `facts`.
+    /// Absent: empty. The same field rides the bulk walk's
+    /// `{"resolutionFacts": ...}` trailer. A plugin that declares paths needs
+    /// a core that knows this field: an older core rejects the trailer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_paths: Vec<String>,
 }
 
 /// What a watch-file edit changed for resolution.
@@ -1759,13 +1771,18 @@ mod tests {
         let cases: Vec<(&str, ResolutionChangedResult)> = vec![
             (
                 r#"{"delta":{"kind":"unchanged"},"facts":"f2"}"#,
-                ResolutionChangedResult { delta: ResolutionDelta::Unchanged, facts: Some("f2".to_string()) },
+                ResolutionChangedResult {
+                    delta: ResolutionDelta::Unchanged,
+                    facts: Some("f2".to_string()),
+                    watch_paths: Vec::new(),
+                },
             ),
             (
                 r#"{"delta":{"kind":"unknown","reason":"no model"}}"#,
                 ResolutionChangedResult {
                     delta: ResolutionDelta::Unknown { reason: "no model".to_string() },
                     facts: None,
+                    watch_paths: Vec::new(),
                 },
             ),
             (
@@ -1802,6 +1819,7 @@ mod tests {
                         ],
                     },
                     facts: Some("f3".to_string()),
+                    watch_paths: Vec::new(),
                 },
             ),
         ];
@@ -1818,6 +1836,23 @@ mod tests {
         assert_eq!(terse, ResolutionDelta::Affected { files: vec![], imports: vec![] });
     }
 
+    /// `watchPaths` round-trips in order; empty is neither written nor
+    /// required.
+    #[test]
+    fn watch_paths_round_trip_and_an_empty_set_is_left_out() {
+        let json = r#"{"delta":{"kind":"unchanged"},"facts":"f","watchPaths":["cfg/b.json","a.json"]}"#;
+        let read: ResolutionChangedResult = serde_json::from_str(json).unwrap();
+        assert_eq!(read.watch_paths, vec!["cfg/b.json".to_string(), "a.json".to_string()]);
+        assert_eq!(serde_json::to_string(&read).unwrap(), json);
+
+        let without: ResolutionChangedResult =
+            serde_json::from_str(r#"{"delta":{"kind":"unchanged"},"facts":"f"}"#).unwrap();
+        assert!(without.watch_paths.is_empty());
+        let written =
+            serde_json::to_string(&ResolutionChangedResult { watch_paths: Vec::new(), ..read }).unwrap();
+        assert!(!written.contains("watchPaths"), "{written}");
+    }
+
     /// The full response frame reads with its id.
     #[test]
     fn a_resolution_changed_response_reads_with_its_id() {
@@ -1826,7 +1861,11 @@ mod tests {
         assert_eq!(response.id, RequestId::Number(9));
         assert_eq!(
             response.result,
-            ResolutionChangedResult { delta: ResolutionDelta::Unchanged, facts: None }
+            ResolutionChangedResult {
+                delta: ResolutionDelta::Unchanged,
+                facts: None,
+                watch_paths: Vec::new()
+            }
         );
     }
 

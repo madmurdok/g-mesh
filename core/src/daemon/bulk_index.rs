@@ -19,7 +19,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
-use crate::daemon::plugin;
+use crate::daemon::{path_case, plugin};
 use crate::languages::{self, LanguageOutcome};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::file_rows::FileScope;
@@ -301,7 +301,7 @@ fn purge_language(conn: &IndexStore, language: &str) -> Result<()> {
         }
         store.step(|conn| {
             schema::clear_owed_reextracts(conn, language)?;
-            schema::set_resolution_facts(conn, language, None)
+            schema::set_resolution_facts(conn, language, None, &[])
         })
     })
 }
@@ -411,10 +411,14 @@ fn walk_one_language_in(
             )
         })
         .with_context(|| format!("failed to record that {} was bulk-indexed", manifest.language))?;
-    // The facts describe the rows this walk wrote; a walk without a trailer
-    // leaves none, so no stale facts outlive it.
+    // The facts and their watch paths describe the rows this walk wrote; a
+    // walk without a trailer leaves none, so no stale facts outlive it.
+    let (facts, watch_paths) = match facts {
+        Some((facts, watch_paths)) => (Some(facts), path_case::keys(project_root, &watch_paths)),
+        None => (None, Vec::new()),
+    };
     store
-        .step(|conn| schema::set_resolution_facts(conn, &manifest.language, facts.as_deref()))
+        .step(|conn| schema::set_resolution_facts(conn, &manifest.language, facts.as_deref(), &watch_paths))
         .with_context(|| format!("failed to store {}'s resolution facts", manifest.language))?;
 
     Ok(())
@@ -463,12 +467,13 @@ pub(crate) fn ingest<R: BufRead>(reader: R, ctx: &mut WalkContext<'_>) -> Result
     store.unit(Unit::BulkWalk, |store| ingest_in(reader, store, ctx).map(|_facts| ()))
 }
 
-/// Returns the stream's `resolutionFacts`, the last one when it has several.
+/// Returns the stream's `resolutionFacts` with its `watchPaths`, the last
+/// trailer when it has several.
 fn ingest_in<R: BufRead>(
     reader: R,
     store: &mut Writer<'_>,
     ctx: &mut WalkContext<'_>,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, Vec<String>)>> {
     let mut batch = Diff::default();
     let mut batched = 0usize;
     let mut path_warnings = PathWarnings::default();
@@ -493,8 +498,8 @@ fn ingest_in<R: BufRead>(
                 batch.upsert_edges.push(to_edge_record(edge));
                 ctx.summary.edges += 1;
             }
-            Ok(BulkItem::ResolutionFacts(line)) => {
-                facts = Some(line);
+            Ok(BulkItem::ResolutionFacts { facts: line, watch_paths }) => {
+                facts = Some((line, watch_paths));
                 continue;
             }
             Err(err) => {

@@ -35,6 +35,7 @@
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use g_mesh::daemon;
@@ -504,4 +505,54 @@ pub fn typescript_manifest() -> daemon::manifest::PluginManifest {
     let manifest = daemon::manifest::read_manifest(&dir)
         .unwrap_or_else(|err| panic!("plugins/typescript/plugin.toml: {err:#}"));
     daemon::manifest::PluginManifest { capabilities: Default::default(), ..manifest }
+}
+
+/// A `G_MESH_HOME` belonging to one test and nothing else. Without it a test
+/// resolves the ambient home every test binary and worktree shares, where
+/// foreign processes (any `g-mesh status` scans every project's `index.db`)
+/// create and remove files in the very state directory the test is deleting,
+/// and a sweeping delete would take out someone else's fixtures.
+///
+/// Set it on the `Command` ([`g_mesh::paths::HOME_ENV`]), not on this process:
+/// no `set_var`, so no race with the test threads cargo runs in parallel.
+pub struct IsolatedHome {
+    pub dir: PathBuf,
+}
+
+impl IsolatedHome {
+    pub fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        // On Unix: deliberately short, and deliberately not
+        // `tempfile::tempdir()`. A daemon binds
+        // `<home>/projects/<hash>/daemon.sock`, and an AF_UNIX address holds
+        // 104 bytes of path on macOS; the system temp directory there is
+        // `/var/folders/<..>/<..>/T/`, some 50 bytes before anything of ours,
+        // which would leave the socket path riding the limit. An over-long
+        // path is at least a clear refusal naming the limit rather than a
+        // bind failure - but the point is not to produce one.
+        //
+        // That budget is Unix's alone, and so is `/tmp`. On Windows the
+        // transport is a named pipe, so there is no path length to protect -
+        // and `/tmp/...` is not even an absolute path there but a *drive-
+        // relative* one, resolved against whatever drive each process happens
+        // to be on. This binary runs from the checkout's drive and the daemon
+        // it spawns need not, which is how the two came to disagree about
+        // where the state root was and every sweep here timed out waiting for
+        // a pid file that was being written somewhere else.
+        let base = if cfg!(windows) { std::env::temp_dir() } else { PathBuf::from("/tmp") };
+        let dir =
+            base.join(format!("gm-home-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("failed to create {}: {e}", dir.display()));
+        Self { dir }
+    }
+
+    pub fn projects_root(&self) -> PathBuf {
+        self.dir.join("projects")
+    }
+}
+
+impl Drop for IsolatedHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }

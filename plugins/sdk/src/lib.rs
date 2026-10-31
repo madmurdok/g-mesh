@@ -241,6 +241,27 @@ pub trait Extractor: Send + Sync {
         None
     }
 
+    /// Files, beyond the manifest's static `watch_files`, whose save changes
+    /// `project` (e.g. every file an `extends` chain names, found or not).
+    /// Core routes a save of one of them like a `watch_files` save.
+    ///
+    /// The default is empty. Contract:
+    /// - sent only beside [`resolution_facts`](Extractor::resolution_facts)
+    ///   `Some`: on the bulk walk's last line and with a `resolutionChanged`
+    ///   answer whose delta is not `Unknown`. Core replaces the language's
+    ///   whole set with each delivery;
+    /// - each path is project-relative with forward slashes, normalized and
+    ///   inside the project, not under the manifest's `exclude_dirs`, and
+    ///   never a file with one of the language's own extensions;
+    /// - must not read the disk: it is a projection of `project`;
+    /// - a panic is caught and costs the list (empty).
+    ///
+    /// A plugin returning paths needs a core that knows the `watchPaths`
+    /// field: an older core rejects the bulk walk's last line.
+    fn watch_paths(&self, _project: &Self::Project) -> Vec<String> {
+        Vec::new()
+    }
+
     /// What a watch-file save changed for resolution: `previous` is the blob
     /// [`resolution_facts`](Extractor::resolution_facts) returned for the
     /// model the index was built from, and `project` the reloaded model.

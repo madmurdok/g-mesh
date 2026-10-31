@@ -275,15 +275,15 @@ fn a_none_selection_reports_no_sections_and_never_calls_cargo() {
     assert!(calls.is_empty(), "cargo was called: {:?}", calls.iter().map(|c| &c.args).collect::<Vec<_>>());
 }
 
-/// The local run passes `--narrow`: a cli-only change selects `core-cli` and
+/// The local run passes `--narrow`: an mcp-only change selects `core-mcp` and
 /// `core-it`, not every core section as CI's call does.
 #[test]
-fn a_cli_change_selects_only_the_cli_section_and_the_integration_tests() {
-    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+fn an_mcp_change_selects_only_the_mcp_section_and_the_integration_tests() {
+    let (_dir, file) = paths_file(&["core/src/mcp/mod.rs"]);
     let (output, _) = run_local(&["--paths-from", &file], &[]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert!(
-        stdout_of(&output).lines().any(|l| l == "== selected: core-it core-cli"),
+        stdout_of(&output).lines().any(|l| l == "== selected: core-it core-mcp"),
         "{}",
         describe(&output)
     );
@@ -291,7 +291,7 @@ fn a_cli_change_selects_only_the_cli_section_and_the_integration_tests() {
 
 #[test]
 fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest() {
-    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let (_dir, file) = paths_file(&["core/src/mcp/mod.rs"]);
     let (output, calls) = run_local(&["--paths-from", &file], &[]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
 
@@ -306,13 +306,13 @@ fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest()
     assert_eq!(tests[0].args, ["test", "-p", "g-mesh", "--lib", "--", "--exact", "cli::a", "cli::b"]);
     assert_eq!(tests[0].seeds.as_deref(), Some("2"));
 
-    // The lib filter is the core-cli section's lib tests; nextest runs the
+    // The lib filter is the core-mcp section's lib tests; nextest runs the
     // union of the selected sections minus exactly that filter.
     assert!(
-        lib_filter.starts_with(&format!("kind(lib) & (({})) & not (", section_filter("core-cli"))),
+        lib_filter.starts_with(&format!("kind(lib) & (({})) & not (", section_filter("core-mcp"))),
         "{lib_filter}"
     );
-    let union = format!("({}) | ({})", section_filter("core-it"), section_filter("core-cli"));
+    let union = format!("({}) | ({})", section_filter("core-it"), section_filter("core-mcp"));
     let runs = test_runs(&calls);
     assert_eq!(runs.len(), 1, "{:?}", calls.iter().map(|c| &c.args).collect::<Vec<_>>());
     assert_eq!(runs[0].value_of("--profile"), "local");
@@ -332,7 +332,7 @@ fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest()
 /// `cargo test -p`, with only that crate's names.
 #[test]
 fn each_crate_runs_its_own_names_in_its_own_process() {
-    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let (_dir, file) = paths_file(&["core/src/mcp/mod.rs"]);
     let (output, calls) = run_local(&["--paths-from", &file], &[("FAKE_LIST_SDK", "1")]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     let tests: Vec<_> = calls_of(&calls, &["test"]).into_iter().map(|c| c.args.clone()).collect();
@@ -347,7 +347,7 @@ fn each_crate_runs_its_own_names_in_its_own_process() {
 
 #[test]
 fn per_process_makes_no_cargo_test_call_and_runs_every_selected_test_under_nextest() {
-    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let (_dir, file) = paths_file(&["core/src/mcp/mod.rs"]);
     let (output, calls) = run_local(&["--per-process", "--paths-from", &file], &[]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert!(
@@ -360,13 +360,13 @@ fn per_process_makes_no_cargo_test_call_and_runs_every_selected_test_under_nexte
     assert_eq!(runs[0].value_of("--profile"), "local");
     assert_eq!(
         runs[0].value_of("-E"),
-        format!("({}) | ({})", section_filter("core-it"), section_filter("core-cli"))
+        format!("({}) | ({})", section_filter("core-it"), section_filter("core-mcp"))
     );
 }
 
 #[test]
 fn a_failing_lib_part_fails_the_run_and_skips_nextest_unless_keep_going() {
-    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let (_dir, file) = paths_file(&["core/src/mcp/mod.rs"]);
     let failing = [("FAKE_CARGO_TEST_EXIT", "101")];
 
     let (output, calls) = run_local(&["--paths-from", &file], &failing);
@@ -561,7 +561,9 @@ fn a_missing_go_toolchain_is_fine_when_the_diff_has_no_go_path() {
 
 #[test]
 fn an_earlier_failure_skips_the_go_step_unless_keep_going() {
-    let (_dir, file) = paths_file(&["plugins/go/main.go"]);
+    // A core path beside the go one: a go-only diff selects `core-spawns-go`,
+    // which has no lib part for the failing `cargo test` to fail.
+    let (_dir, file) = paths_file(&["core/src/config/mod.rs", "plugins/go/main.go"]);
     let failing = [("FAKE_CARGO_TEST_EXIT", "101")];
 
     let (output, _, go) = run_local_go(&["--paths-from", &file], &failing, true);
@@ -796,18 +798,27 @@ fn a_dry_run_without_the_plugin_node_modules_still_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
-// The same PATH for cut-release.sh's test step (GM-628)
+// cut-release.sh runs no suite (GM-675): `check`, then the CI gate, then the tag
 
 /// Runs `cut-release.sh`'s `main` from a copy of `scripts/` in `root`, with a
 /// working directory that is not the repo root, and every command it would
-/// run for real (git, cargo, the pre-tag checks) replaced by a shell function
-/// that succeeds. `scripts/test-sections.sh` is a stub that appends its
-/// arguments and `PATH` to the record file, and exits `sections_status`
-/// for `run`. Returns the output and the record's lines.
-fn run_cut_release(root: &Path, args: &[&str], sections_status: i32) -> (Output, Vec<String>) {
-    let stub = format!(
-        "#!/bin/sh\necho \"test-sections $*|$PATH\" >> \"$GM628_RECORD\"\n[ \"$1\" = run ] && exit {sections_status}\nexit 0\n"
-    );
+/// run for real (git, cargo, the pre-tag checks, the CI gate) replaced by a
+/// shell function that succeeds. `scripts/test-sections.sh` is a stub that
+/// appends its arguments to the record file. The CI gate stub records `gate`
+/// and fails when `gate_status` is not 0. Returns the output and the record.
+fn run_cut_release(root: &Path, args: &[&str], gate_status: i32) -> (Output, Vec<String>) {
+    run_cut_release_with(root, args, gate_status, &[])
+}
+
+/// `run_cut_release` with extra environment: `SECTIONS_STATUS` is the exit
+/// status of `test-sections.sh`, `VERSION_DRIFT=1` makes the version check die.
+fn run_cut_release_with(
+    root: &Path,
+    args: &[&str],
+    gate_status: i32,
+    env: &[(&str, &str)],
+) -> (Output, Vec<String>) {
+    let stub = "#!/bin/sh\necho \"test-sections $*\" >> \"$GM628_RECORD\"\nexit ${SECTIONS_STATUS:-0}\n";
     let sections = root.join("scripts/test-sections.sh");
     fs::write(&sections, stub).unwrap();
     fs::set_permissions(&sections, fs::Permissions::from_mode(0o755)).unwrap();
@@ -825,11 +836,12 @@ fn run_cut_release(root: &Path, args: &[&str], sections_status: i32) -> (Output,
             esac
         }
         bash() { echo "9.9.9"; }
-        cargo() { echo "cargo $*|$PATH" >> "$GM628_RECORD"; }
+        cargo() { echo "cargo $*" >> "$GM628_RECORD"; }
         origin_slug() { echo o/r; }
         check_no_untagged_prior_releases() { :; }
-        check_release_branch_ci_passed() { :; }
-        check_workspace_versions() { :; }
+        check_release_merge_shape() { :; }
+        wait_for_green_full_ci() { echo "gate $*" >> "$GM628_RECORD"; [ "$GATE_STATUS" = 0 ] || die "gate failed"; }
+        check_workspace_versions() { [ "${VERSION_DRIFT:-0}" = 0 ] || die "version drift"; }
         check_crate_backed_plugin_versions() { :; }
         check_self_versioned_plugin_versions() { :; }
         check_core_feature_isolation() { :; }
@@ -843,72 +855,72 @@ fn run_cut_release(root: &Path, args: &[&str], sections_status: i32) -> (Output,
         .args(args)
         .current_dir(other_cwd.path())
         .env("GM628_RECORD", &record)
+        .env("GATE_STATUS", gate_status.to_string())
+        .envs(env.iter().copied())
         .output()
         .expect("failed to run bash");
     let lines = fs::read_to_string(&record).unwrap_or_default().lines().map(String::from).collect();
     (output, lines)
 }
 
-/// With both plugins' `node_modules/.bin` present, the test step of a cut
-/// (the sections, the doctests, `cargo test -p g-mesh`) sees them first on
-/// `PATH`, taken from the repo root and not from the working directory.
+/// The cut runs `test-sections.sh check` and no section and no `cargo test`;
+/// the CI gate runs after `check` and before the tag, with the timeout.
 #[test]
-fn the_cut_release_test_step_has_the_plugin_bin_dirs_first_on_the_path() {
-    let root = fake_root(true);
-    let (output, record) = run_cut_release(root.path(), &["9.9.9"], 0);
+fn a_cut_release_runs_check_then_the_ci_gate_then_tags_and_runs_no_suite() {
+    let root = fake_root(false);
+    let (output, record) = run_cut_release(root.path(), &["9.9.9", "--ci-timeout", "7"], 0);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
-    let calls: Vec<&String> = record.iter().filter(|l| !l.starts_with("git ")).collect();
-    assert_eq!(calls.len(), 6, "check, run all, doctest, then cargo test -p g-mesh's three runs: {record:?}");
-    // GM-623: core's integration tests are two binaries of daemon-spawning
-    // tests, so the gate runs them at nextest's `daemon-spawning` width, and
-    // the unit tests and doctests in runs of their own at full width.
-    let commands: Vec<&str> = calls.iter().map(|l| l.split_once('|').unwrap().0).collect();
-    for expected in [
-        "cargo test -p g-mesh --lib --bins",
-        "cargo test -p g-mesh --doc",
-        "cargo test -p g-mesh --test it --test scripts -- --test-threads=2",
-    ] {
-        assert!(commands.contains(&expected), "no `{expected}` in {commands:?}");
-    }
-    let rootp = fs::canonicalize(root.path()).unwrap().display().to_string();
-    let expected =
-        format!("{0}/plugins/typescript/node_modules/.bin:{0}/plugins/python/node_modules/.bin:", rootp);
-    for line in calls {
-        let path = line.split_once('|').unwrap().1.replace(&root.path().display().to_string(), &rootp);
-        assert!(path.starts_with(&expected), "PATH {path} does not start with {expected}");
-    }
+    assert!(
+        !record.iter().any(|l| l.starts_with("cargo") || l.starts_with("test-sections run")),
+        "{record:?}"
+    );
+    let pos = |needle: &str| {
+        record.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle}: {record:?}"))
+    };
+    assert!(pos("test-sections check") < pos("gate 9.9.9 main 7"), "{record:?}");
+    assert!(pos("gate ") < pos(" tag -a "), "{record:?}");
 }
 
-/// Without a plugin's `node_modules/.bin` the cut fails with the helper's
-/// message, naming `scripts/test-deps.sh`, before any test runs and before
-/// the tag exists.
+/// `--skip-tests` is gone: it dies with the GM-675 message and nothing runs.
 #[test]
-fn a_cut_release_without_the_plugin_node_modules_fails_before_running_tests() {
+fn a_cut_release_with_skip_tests_dies() {
     let root = fake_root(false);
-    let (output, record) = run_cut_release(root.path(), &["9.9.9"], 0);
+    let (output, record) = run_cut_release(root.path(), &["9.9.9", "--skip-tests"], 0);
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("cut-release: plugins/typescript/node_modules/.bin is missing"),
+        String::from_utf8_lossy(&output.stderr).contains("--skip-tests is gone (GM-675)"),
         "{}",
         describe(&output)
     );
-    assert!(stderr.contains("scripts/test-deps.sh"), "{}", describe(&output));
-    assert!(
-        !record
-            .iter()
-            .any(|l| l.starts_with("test-sections") || l.starts_with("cargo") || l.contains(" tag -a ")),
-        "something ran after the failed check: {record:?}"
-    );
+    assert!(record.is_empty(), "{record:?}");
 }
 
-/// `--skip-tests` runs no test, so it needs no plugin dependency: the cut
-/// goes on to the tag without `node_modules`, and no test command runs.
+/// A failing CI gate leaves no tag.
 #[test]
-fn a_cut_release_with_skip_tests_does_not_need_the_plugin_node_modules() {
+fn a_failing_ci_gate_leaves_no_tag() {
     let root = fake_root(false);
-    let (output, record) = run_cut_release(root.path(), &["9.9.9", "--skip-tests"], 0);
-    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
-    assert!(record.iter().any(|l| l.contains(" tag -a ")), "no tag: {record:?}");
-    assert!(!record.iter().any(|l| l.starts_with("test-sections") || l.starts_with("cargo")), "{record:?}");
+    let (output, record) = run_cut_release(root.path(), &["9.9.9"], 1);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(!record.iter().any(|l| l.contains(" tag -a ")), "{record:?}");
+}
+
+/// A failing `test-sections.sh check` dies before the CI gate and the tag.
+#[test]
+fn a_failing_sections_check_dies_before_the_ci_gate() {
+    let root = fake_root(false);
+    let (output, record) = run_cut_release_with(root.path(), &["9.9.9"], 0, &[("SECTIONS_STATUS", "1")]);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(record.iter().any(|l| l.contains("test-sections check")), "{record:?}");
+    assert!(!record.iter().any(|l| l.starts_with("gate ") || l.contains(" tag -a ")), "{record:?}");
+}
+
+/// Every cheap check runs before the CI gate: a version drift dies without
+/// the gate (which would query GitHub) being called.
+#[test]
+fn a_version_drift_dies_before_the_ci_gate_is_called() {
+    let root = fake_root(false);
+    let (output, record) = run_cut_release_with(root.path(), &["9.9.9"], 0, &[("VERSION_DRIFT", "1")]);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("version drift"), "{}", describe(&output));
+    assert!(!record.iter().any(|l| l.starts_with("gate ")), "{record:?}");
 }

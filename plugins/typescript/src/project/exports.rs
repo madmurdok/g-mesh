@@ -7,6 +7,7 @@
 
 use crate::project::jsonc::Json;
 use crate::project::paths;
+use crate::project::resolve::names_file;
 
 /// Conditions in the order their targets are tried: source and ESM before
 /// CJS, `types` last. Unlisted conditions rank after all of these, in
@@ -79,10 +80,7 @@ pub fn exports_targets(exports: Option<&Json>, subpath: &str) -> Vec<String> {
 }
 
 /// Every project-relative path the `#` specifier could name under `config`,
-/// in declaration order. Targets leaving the project are dropped, and so is
-/// one naming the project root unless it is spelled as a module name
-/// ([`imports_target_inside`]), the only form tsc resolves to the root's
-/// `index` file.
+/// in declaration order ([`imports_base`] per target).
 pub fn imports_targets(config: &PackageImports, specifier: &str) -> Vec<String> {
     let mut targets = Vec::new();
     for (key, value) in &config.imports {
@@ -101,7 +99,7 @@ pub fn imports_targets(config: &PackageImports, specifier: &str) -> Vec<String> 
 
     let mut resolved: Vec<String> = Vec::new();
     for target in targets {
-        if let Some(inside) = imports_target_inside(&config.dir, &target) {
+        if let Some(inside) = imports_base(&config.dir, &target) {
             if !resolved.contains(&inside) {
                 resolved.push(inside);
             }
@@ -114,12 +112,24 @@ pub fn imports_targets(config: &PackageImports, specifier: &str) -> Vec<String> 
 /// tsc, a target is a module name when its own spelling, before `\\` is
 /// read as a separator, starts with neither `./` nor `../` (`.`, `..`, `.\\`,
 /// `..\\..`); only a module name may name the project root.
-fn imports_target_inside(dir: &str, target: &str) -> Option<String> {
+pub fn imports_target_inside(dir: &str, target: &str) -> Option<String> {
     if !target.starts_with("./") && !target.starts_with("../") {
         paths::inside_or_root(dir, target)
     } else {
         paths::inside(dir, target)
     }
+}
+
+/// One substituted `imports` target as a base the forward lookup probes.
+/// Targets leaving the project are dropped, and so is one naming the project
+/// root unless it is spelled as a module name ([`imports_target_inside`]),
+/// the only form tsc resolves to the root's `index` file. A relative target
+/// (`./`, `../`) must name a file as written ([`names_file`]): tsc tries no
+/// extension or `index` file for it, so `./lib` and `./src/` name nothing.
+pub fn imports_base(dir: &str, target: &str) -> Option<String> {
+    let inside = imports_target_inside(dir, target)?;
+    let relative = target.starts_with("./") || target.starts_with("../");
+    (!relative || names_file(&inside)).then_some(inside)
 }
 
 /// The `#` specifiers whose [`imports_targets`] under `config` may include

@@ -645,7 +645,7 @@ fn three_kinds(root: &Path, conn: &IndexStore, created: usize) -> (Vec<String>, 
 /// order they are then routed; every path still gets exactly one
 /// `fileChanged`. Fed modified -> created -> deleted.
 ///
-/// Control: remove the `registry.announce_created(&order.created)` call in
+/// Control: remove the `registry.announce_created(conn, &order.created)` call in
 /// `watch_and_route_once` (no `filesCreated`), or move it before the deleted
 /// loop (the plugin is not running yet, so nothing is sent; with it running,
 /// the frame lands first).
@@ -812,21 +812,47 @@ fn workspace_excluded_and_failed_language_files_are_not_announced() {
     let barrier = || supervisor.file_changed(&conn, "barrier.python-src".to_string());
     let paths = |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
 
-    registry.announce_created(&paths(&[
-        "a.python-src",
-        "setup.python-src",
-        "vendor/c.python-src",
-        "notes.txt",
-        "b.python-src",
-    ]));
+    registry.announce_created(
+        &conn,
+        &paths(&["a.python-src", "setup.python-src", "vendor/c.python-src", "notes.txt", "b.python-src"]),
+    );
     barrier();
-    registry.announce_created(&paths(&["a.python-src", "setup.python-src", "vendor/c.python-src"]));
+    registry.announce_created(&conn, &paths(&["a.python-src", "setup.python-src", "vendor/c.python-src"]));
     barrier();
     registry.set_failed_languages(["python".to_string()]);
-    registry.announce_created(&paths(&["a.python-src", "b.python-src"]));
+    registry.announce_created(&conn, &paths(&["a.python-src", "b.python-src"]));
     barrier();
 
     assert_eq!(files_created_notifications(plugin_dir), vec!["filesCreated a.python-src,b.python-src"]);
+}
+
+/// 5b: a created file another language declared as a watch path is routed
+/// as that language's workspace file, so it is left out of the claiming
+/// language's `filesCreated`.
+#[test]
+fn a_created_declared_watch_path_is_not_announced() {
+    let (project, _plugins, dirs, registry) = declaring_registry(&["python", "rust"]);
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    fs::write(root.join("barrier.rust-src"), "").unwrap();
+    conn.with(|conn| {
+        crate::storage::schema::set_resolution_facts(
+            conn,
+            "python",
+            Some("facts"),
+            &["r1.rust-src".to_string()],
+        )
+    })
+    .unwrap();
+    let supervisor = registry.get_or_spawn("rust").unwrap();
+
+    registry.announce_created(
+        &conn,
+        &["r1.rust-src".to_string(), "r2.rust-src".to_string(), "r3.rust-src".to_string()],
+    );
+    supervisor.file_changed(&conn, "barrier.rust-src".to_string());
+
+    assert_eq!(files_created_notifications(&dirs[1]), vec!["filesCreated r2.rust-src,r3.rust-src"]);
 }
 
 /// 6: created files of two languages are announced per language, each with

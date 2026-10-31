@@ -43,6 +43,7 @@ fn creates_all_tables_and_indexes() {
             "qualified_suffixes",
             "reextract_owed_files",
             "resolution_facts",
+            "resolution_watch_paths",
             "seed_origin",
             "semantic_gap_files",
             "semantic_owed_files",
@@ -72,6 +73,7 @@ fn creates_all_tables_and_indexes() {
         "idx_targets_scope",
         "idx_qualified_suffixes_nodeId",
         "idx_untyped_calls_nodeId",
+        "idx_resolution_watch_paths_language",
     ] {
         assert!(indexes.contains(&expected.to_string()), "missing index {expected}");
     }
@@ -301,8 +303,8 @@ fn wipes_and_reindexes_on_version_mismatch() {
         conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
     // Pinned as a literal on purpose, alongside the constant: a schema change
-    // has to update this line by hand. "15" adds `nodes.generated`.
-    assert_eq!(version, "15");
+    // has to update this line by hand. "16" adds `resolution_watch_paths`.
+    assert_eq!(version, "16");
 
     let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
     assert_eq!(node_count, 0, "old data must not survive a version mismatch wipe");
@@ -1369,12 +1371,12 @@ fn resolution_facts_are_stored_replaced_and_deleted_per_language() {
     let conn = setup();
     assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None);
 
-    set_resolution_facts(&conn, "typescript", Some("f1")).unwrap();
-    set_resolution_facts(&conn, "rust", Some("r1")).unwrap();
-    set_resolution_facts(&conn, "typescript", Some("f2")).unwrap();
+    set_resolution_facts(&conn, "typescript", Some("f1"), &[]).unwrap();
+    set_resolution_facts(&conn, "rust", Some("r1"), &[]).unwrap();
+    set_resolution_facts(&conn, "typescript", Some("f2"), &[]).unwrap();
     assert_eq!(resolution_facts(&conn, "typescript").unwrap().as_deref(), Some("f2"));
 
-    set_resolution_facts(&conn, "typescript", None).unwrap();
+    set_resolution_facts(&conn, "typescript", None, &[]).unwrap();
     assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None);
     assert_eq!(resolution_facts(&conn, "rust").unwrap().as_deref(), Some("r1"));
 }
@@ -1395,7 +1397,7 @@ fn a_schema_13_index_is_reset_and_gains_the_specifier_column() {
         params![GENERATION],
     )
     .unwrap();
-    set_resolution_facts(&conn, "typescript", Some("stale")).unwrap();
+    set_resolution_facts(&conn, "typescript", Some("stale"), &[]).unwrap();
 
     assert!(ensure_current(&conn, GENERATION).unwrap(), "schema 13 is not current");
 
@@ -1564,4 +1566,75 @@ fn a_schema_14_index_is_reset_and_a_node_defaults_to_hand_written() {
     let generated: i64 =
         conn.query_row("SELECT generated FROM nodes WHERE id = 'n1'", [], |row| row.get(0)).unwrap();
     assert_eq!(generated, 0);
+}
+
+fn paths(list: &[&str]) -> Vec<String> {
+    list.iter().map(|path| path.to_string()).collect()
+}
+
+/// Watch paths are replaced as a whole by each delivery, deleted with the
+/// facts by `None` (whatever paths come with it), kept per language, and a
+/// lookup by path names every language that declared it.
+///
+/// Control: make `write_resolution_facts` skip its `DELETE FROM
+/// resolution_watch_paths` - the replaced set keeps `old.json`.
+#[test]
+fn watch_paths_are_replaced_per_delivery_and_cleared_with_the_facts() {
+    let conn = setup();
+    set_resolution_facts(&conn, "typescript", Some("f1"), &paths(&["old.json", "shared.json"])).unwrap();
+    set_resolution_facts(&conn, "rust", Some("r1"), &paths(&["shared.json"])).unwrap();
+    assert_eq!(watch_paths(&conn, "typescript").unwrap(), paths(&["old.json", "shared.json"]));
+    assert_eq!(watch_path_languages(&conn, "shared.json").unwrap(), paths(&["rust", "typescript"]));
+    assert_eq!(watch_path_languages(&conn, "old.json").unwrap(), paths(&["typescript"]));
+    assert!(watch_path_languages(&conn, "other.json").unwrap().is_empty());
+
+    set_resolution_facts(&conn, "typescript", Some("f2"), &paths(&["new.json", "new.json"])).unwrap();
+    assert_eq!(watch_paths(&conn, "typescript").unwrap(), paths(&["new.json"]), "the set was replaced");
+    assert!(watch_path_languages(&conn, "old.json").unwrap().is_empty());
+    assert_eq!(watch_paths(&conn, "rust").unwrap(), paths(&["shared.json"]), "another language is untouched");
+
+    set_resolution_facts(&conn, "typescript", Some("f3"), &[]).unwrap();
+    assert!(watch_paths(&conn, "typescript").unwrap().is_empty(), "an empty delivery empties the set");
+
+    set_resolution_facts(&conn, "typescript", Some("f4"), &paths(&["a.json"])).unwrap();
+    set_resolution_facts(&conn, "typescript", None, &paths(&["ignored.json"])).unwrap();
+    assert!(watch_paths(&conn, "typescript").unwrap().is_empty(), "no facts, no paths");
+    assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None);
+    assert_eq!(watch_paths(&conn, "rust").unwrap(), paths(&["shared.json"]));
+}
+
+/// The facts and the paths are written all or nothing, and inside a caller's
+/// transaction the write rolls back with it.
+#[test]
+fn storing_facts_and_paths_works_inside_a_transaction_and_rolls_back_with_it() {
+    let conn = setup();
+    set_resolution_facts(&conn, "typescript", Some("kept"), &paths(&["kept.json"])).unwrap();
+
+    conn.execute_batch("BEGIN").unwrap();
+    set_resolution_facts(&conn, "typescript", Some("lost"), &paths(&["lost.json"])).unwrap();
+    assert_eq!(watch_paths(&conn, "typescript").unwrap(), paths(&["lost.json"]));
+    conn.execute_batch("ROLLBACK").unwrap();
+
+    assert_eq!(resolution_facts(&conn, "typescript").unwrap().as_deref(), Some("kept"));
+    assert_eq!(watch_paths(&conn, "typescript").unwrap(), paths(&["kept.json"]));
+}
+
+/// Schema "16": an index stamped "15" has no watch-path table, so it is reset
+/// and the table then exists and starts empty; a reset drops the stored
+/// paths with everything else.
+#[test]
+fn a_schema_15_index_is_reset_and_its_watch_paths_are_dropped() {
+    let conn = setup();
+    conn.execute(
+        "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, '15', ?1, CURRENT_TIMESTAMP)",
+        params![GENERATION],
+    )
+    .unwrap();
+    set_resolution_facts(&conn, "typescript", Some("stale"), &paths(&["stale.json"])).unwrap();
+
+    assert!(ensure_current(&conn, GENERATION).unwrap(), "schema 15 is not current");
+
+    assert!(watch_paths(&conn, "typescript").unwrap().is_empty(), "the reset drops the watch paths");
+    assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None);
+    assert!(!ensure_current(&conn, GENERATION).unwrap(), "a schema 16 index is current");
 }

@@ -12,15 +12,22 @@ use crate::protocol::types::{WireEdge, WireNode};
 pub enum BulkItem {
     Node(Box<WireNode>),
     Edge(WireEdge),
-    /// `{"resolutionFacts": "<opaque>"}`: the resolution facts the walk was
-    /// built from, written last by a `resolution_delta` plugin.
-    ResolutionFacts(String),
+    /// `{"resolutionFacts": "<opaque>", "watchPaths": [...]}`: the
+    /// resolution facts the walk was built from, written last by a
+    /// `resolution_delta` plugin, with the files whose save changes that
+    /// model (`watchPaths` is optional; absent means empty).
+    ResolutionFacts {
+        facts: String,
+        watch_paths: Vec<String>,
+    },
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ResolutionFactsLine {
     resolution_facts: String,
+    #[serde(default)]
+    watch_paths: Vec<String>,
 }
 
 impl BulkItem {
@@ -34,7 +41,10 @@ impl BulkItem {
         match serde_json::from_str::<WireEdge>(line) {
             Ok(edge) => Ok(BulkItem::Edge(edge)),
             Err(err) => match serde_json::from_str::<ResolutionFactsLine>(line) {
-                Ok(facts) => Ok(BulkItem::ResolutionFacts(facts.resolution_facts)),
+                Ok(line) => Ok(BulkItem::ResolutionFacts {
+                    facts: line.resolution_facts,
+                    watch_paths: line.watch_paths,
+                }),
                 Err(_) => Err(err).with_context(|| {
                     format!("malformed NDJSON line (neither a valid node nor edge): {line:?}")
                 }),
@@ -201,7 +211,26 @@ mod tests {
         let items: Vec<_> = NdjsonReader::new(Cursor::new(stream.into_bytes())).collect();
         assert_eq!(items.len(), 3);
         assert!(matches!(&items[0], Ok(BulkItem::Node(n)) if n.id == "n1"));
-        assert!(matches!(&items[1], Ok(BulkItem::ResolutionFacts(facts)) if facts == "opaque"));
+        assert!(
+            matches!(&items[1], Ok(BulkItem::ResolutionFacts { facts, watch_paths }) if facts == "opaque" && watch_paths.is_empty())
+        );
         assert!(items[2].is_err(), "an unknown key is not a trailer");
+    }
+
+    /// A trailer's `watchPaths` ride beside the facts, in order; absent they
+    /// are empty, and a wrong type is a malformed line.
+    #[test]
+    fn a_resolution_facts_trailer_carries_its_watch_paths() {
+        let stream = "{\"resolutionFacts\":\"f\",\"watchPaths\":[\"cfg/b.json\",\"a.json\"]}\n\
+                      {\"resolutionFacts\":\"g\",\"watchPaths\":[]}\n\
+                      {\"resolutionFacts\":\"h\",\"watchPaths\":\"x\"}\n";
+        let items: Vec<_> = NdjsonReader::new(Cursor::new(stream.as_bytes().to_vec())).collect();
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[0], Ok(BulkItem::ResolutionFacts { facts, watch_paths })
+                if facts == "f" && watch_paths == &["cfg/b.json", "a.json"]));
+        assert!(
+            matches!(&items[1], Ok(BulkItem::ResolutionFacts { facts, watch_paths }) if facts == "g" && watch_paths.is_empty())
+        );
+        assert!(items[2].is_err(), "watchPaths must be a list of strings");
     }
 }

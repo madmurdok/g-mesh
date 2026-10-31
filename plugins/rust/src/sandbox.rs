@@ -39,8 +39,8 @@ pub struct SandboxPolicy {
     /// a toolchain or writable prefix.
     pub project_root: PathBuf,
     /// Toolchain prefixes the tree may map and exec (sysroot, rustup proxies
-    /// dir, server dir, rustc/cargo dirs), deduplicated. OS prefixes are each
-    /// backend's own.
+    /// dir, the proxy dir rust-analyzer execs from `CARGO_HOME`, server dir,
+    /// rustc/cargo dirs), deduplicated. OS prefixes are each backend's own.
     pub toolchain: Vec<PathBuf>,
     /// Prefixes the tree may write (the server's private temp dir and the
     /// cargo caches), deduplicated. A writable prefix inside the root stays
@@ -91,12 +91,13 @@ impl SandboxPolicy {
 
     /// The policy for `server` (the resolved rust-analyzer) running on
     /// `root` with `toolchain`: the sysroot, the rustup proxies' directory,
-    /// and the directories of the server, `rustc` and `cargo`, which lie
-    /// outside the sysroot on an install that is not rustup's. The tree may
-    /// write `temp` (the server's private `TMPDIR`) and `cargo_home`'s
-    /// `registry/` and `git/` (extracting an already cached dependency), never
-    /// `cargo_home` itself, whose `bin/` and config files reach the user's own
-    /// later cargo runs.
+    /// the directory of the rustup proxy rust-analyzer runs from
+    /// `cargo_home`'s `bin/` (see [`cargo_proxy`]), and the directories of the
+    /// server, `rustc` and `cargo`, which lie outside the sysroot on an
+    /// install that is not rustup's. The tree may write `temp` (the server's
+    /// private `TMPDIR`) and `cargo_home`'s `registry/` and `git/`
+    /// (extracting an already cached dependency), never `cargo_home` itself,
+    /// whose `bin/` and config files reach the user's own later cargo runs.
     pub(crate) fn for_server(
         root: &Path,
         toolchain: &Toolchain,
@@ -109,6 +110,7 @@ impl SandboxPolicy {
         let prefixes = [
             toolchain.sysroot.clone(),
             toolchain.rustup.as_deref().and_then(parent),
+            cargo_home.and_then(cargo_proxy).as_deref().and_then(parent),
             parent(&server),
             toolchain.rustc.as_deref().and_then(parent),
             toolchain.cargo.as_deref().and_then(parent),
@@ -120,6 +122,16 @@ impl SandboxPolicy {
         ];
         SandboxPolicy::new(root, prefixes.into_iter().flatten(), writable.into_iter().flatten())
     }
+}
+
+/// The rustup proxy rust-analyzer execs for cargo, canonicalized:
+/// `cargo_home/bin/cargo` when that file exists. With a sysroot set,
+/// rust-analyzer prefers this proxy over `CARGO` and `PATH`, so its directory
+/// must be exec-able whichever `rustup` comes first on `PATH`. A symlink
+/// resolves to the `rustup` it names, the file a sandbox sees exec'd.
+pub(crate) fn cargo_proxy(cargo_home: &Path) -> Option<PathBuf> {
+    let proxy = cargo_home.join("bin").join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+    std::fs::canonicalize(proxy).ok().filter(|proxy| proxy.is_file())
 }
 
 /// `prefixes` canonicalized, the missing ones dropped, deduplicated in order.
@@ -762,6 +774,136 @@ mod tests {
 
         std::fs::remove_dir(home.join("git")).unwrap();
         assert_eq!(policy(&home).writable, vec![temp.clone(), home.join("registry")]);
+    }
+
+    /// A `CARGO_HOME` at `base`/`cargo-home` whose `bin/cargo` is a symlink
+    /// to the file `rustup`, `base`/`rup/rustup`, as rustup-init makes it;
+    /// returns the home and the directory `rustup` lies in.
+    fn home_with_a_symlinked_proxy(base: &Path, rustup: &Path) -> (PathBuf, PathBuf) {
+        let home = base.join("cargo-home");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::os::unix::fs::symlink(rustup, home.join("bin/cargo")).unwrap();
+        (home, rustup.parent().unwrap().to_path_buf())
+    }
+
+    /// The directory of the rustup proxy rust-analyzer runs from
+    /// `CARGO_HOME`'s `bin/` is a toolchain prefix, as the canonical
+    /// directory of the file `bin/cargo` resolves to: a symlink to a
+    /// `rustup` elsewhere names that directory, not `bin/`.
+    ///
+    /// Controls: drop the `cargo_proxy` entry from the prefixes in
+    /// `for_server` (empty); use `cargo_home/bin` instead of the canonical
+    /// target's parent (`rup/` missing).
+    #[test]
+    fn for_server_allows_the_directory_of_the_proxy_cargo_home_execs() {
+        let scratch = Scratch::new("proxy-dir");
+        let rustup = exits_zero(&scratch.0.join("rup/rustup"));
+        let (home, rup) = home_with_a_symlinked_proxy(&scratch.0, &rustup);
+        let root = scratch.0.join("proj");
+        let server = scratch.0.join("ra/rust-analyzer");
+
+        let policy = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None);
+        assert_eq!(policy.toolchain, vec![rup], "{policy:?}");
+        assert!(policy.writable.is_empty(), "the proxy directory is not writable: {policy:?}");
+    }
+
+    /// Without a `bin/cargo` under `CARGO_HOME` nothing is added for it:
+    /// not `bin/` (which holds other installed tools), not `CARGO_HOME`,
+    /// and a `cargo` that names nothing adds nothing either.
+    ///
+    /// Control: add `cargo_home/bin` to the prefixes in `for_server`
+    /// whether or not `bin/cargo` exists.
+    #[test]
+    fn for_server_adds_nothing_when_cargo_home_has_no_proxy() {
+        let scratch = Scratch::new("no-proxy");
+        let home = scratch.0.join("cargo-home");
+        exits_zero(&home.join("bin/cargo-nextest"));
+        let root = scratch.0.join("proj");
+        let server = scratch.0.join("ra/rust-analyzer");
+        let policy =
+            |home: &Path| SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(home), None);
+
+        let none = policy(&home);
+        assert!(none.toolchain.is_empty(), "a prefix for a proxy that is not there: {none:?}");
+        assert!(none.writable.is_empty(), "{none:?}");
+
+        std::os::unix::fs::symlink(scratch.0.join("gone"), home.join("bin/cargo")).unwrap();
+        let dangling = policy(&home);
+        assert!(dangling.toolchain.is_empty(), "a prefix for a dangling proxy: {dangling:?}");
+
+        let absent = policy(&scratch.0.join("no-such-home"));
+        assert!(absent.toolchain.is_empty(), "{absent:?}");
+    }
+
+    /// The root deny keeps its place when `CARGO_HOME` lies inside the
+    /// root: the proxy directory, a longer prefix than the root, is allowed
+    /// after the root's deny, which stays.
+    ///
+    /// Control: the one that drops the proxy prefix (no allow rule to find).
+    #[test]
+    fn a_cargo_home_inside_the_root_keeps_its_proxy_directory_allowed_and_the_root_denied() {
+        let scratch = Scratch::new("home-in-root");
+        let root = scratch.0.join("proj");
+        let home = root.join(".cargo");
+        let proxy = exits_zero(&home.join("bin/cargo"));
+        let server = scratch.0.join("ra/rust-analyzer");
+
+        let policy = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None);
+        assert_eq!(policy.toolchain, vec![proxy.parent().unwrap().to_path_buf()], "{policy:?}");
+        let rules = ordered(&seatbelt::rules(&policy));
+        let deny = position(&rules, false, &policy.project_root);
+        let allow = position(&rules, true, &policy.toolchain[0]);
+        assert!(deny < allow, "the root deny does not precede the proxy directory's allow: {rules:?}");
+    }
+
+    /// A proxy that is a script allows its own directory and nothing its
+    /// `exec` names.
+    ///
+    /// Control: none of its own (a policy that followed the script's target
+    /// would need new code); the check is that the one prefix is the proxy's
+    /// directory.
+    #[test]
+    fn a_script_proxy_allows_its_own_directory_and_not_its_target() {
+        let scratch = Scratch::new("script-proxy");
+        let target = exits_zero(&scratch.0.join("target-dir/real-cargo"));
+        let home = scratch.0.join("cargo-home");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::write(home.join("bin/cargo"), format!("#!/bin/sh\nexec {} \"$@\"\n", target.display()))
+            .unwrap();
+        let root = scratch.0.join("proj");
+        let server = scratch.0.join("ra/rust-analyzer");
+
+        let policy = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None);
+        assert_eq!(policy.toolchain, vec![home.join("bin")], "{policy:?}");
+    }
+
+    /// Confined, the tree execs `CARGO_HOME`'s `bin/cargo` although the
+    /// `rustup` it names lies outside the sysroot, the rustup directory and
+    /// every package prefix (the temp dir), and the same exec is refused
+    /// under a policy built without that `CARGO_HOME`.
+    ///
+    /// Control: the one that drops the proxy prefix from `for_server`
+    /// (the confined exec is refused).
+    #[test]
+    fn seatbelt_execs_the_proxy_cargo_home_names() {
+        let scratch = Scratch::new("exec-proxy");
+        let rustup = exits_zero(&scratch.0.join("rup/rustup"));
+        let (home, _) = home_with_a_symlinked_proxy(&scratch.0, &rustup);
+        let server = probe_server(&scratch.0.join("ra"));
+        let root = scratch.0.join("proj");
+        let proxy = home.join("bin/cargo");
+        let run = [step("run", &proxy)];
+        let ran = format!("run {} rc=0", proxy.display());
+
+        assert!(probe(&server, None, &run).contains(&ran), "sanity: the proxy does not run unconfined");
+
+        let without = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, None, None);
+        let stdout = probe(&server, Some(&without), &run);
+        assert!(!stdout.contains(&ran), "sanity: the proxy runs without its directory allowed: {stdout}");
+
+        let with = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None);
+        let stdout = probe(&server, Some(&with), &run);
+        assert!(stdout.contains(&ran), "the confined tree could not exec the proxy ({with:?}): {stdout}");
     }
 
     /// A TCP listener on loopback that counts the connections it accepts.

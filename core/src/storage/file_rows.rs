@@ -138,6 +138,25 @@ pub(crate) fn importers_of(
     Ok(Some((language, importers)))
 }
 
+/// The other files whose `IMPORTS` edges point at an unlinked placeholder
+/// naming `file_path` as its file scope, as `(language, path)` sorted by
+/// path, with each importer's language read as in [`importers_of`]. Read
+/// before a diff upserting `file_path`'s `File` node is linked: the link
+/// repoints exactly these edges onto that node, so afterwards they are
+/// indistinguishable from imports that were linked all along.
+pub(crate) fn waiting_importers(conn: &Connection, file_path: &str) -> Result<Vec<LanguagePath>> {
+    conn.prepare_cached(
+        "SELECT DISTINCT COALESCE(f.language, src.language), src.filePath FROM placeholder_targets pt
+         JOIN edges e ON e.toId = pt.nodeId AND e.kind = 'IMPORTS'
+         JOIN nodes src ON src.id = e.fromId
+         LEFT JOIN nodes f ON f.filePath = src.filePath AND f.kind = 'File'
+         WHERE pt.scopeKind = 'file' AND pt.scope = ?1 AND src.filePath <> ?1 AND src.filePath <> ''
+         ORDER BY 2, 1",
+    )
+    .and_then(|mut stmt| stmt.query_map(params![file_path], |row| Ok((row.get(0)?, row.get(1)?)))?.collect())
+    .context("failed to read the importers waiting at the file")
+}
+
 /// Deletes `file_path`'s `indexed_files` baseline, for a file that is gone.
 pub(crate) fn delete_indexed_file(conn: &Connection, file_path: &str) -> Result<()> {
     conn.execute("DELETE FROM indexed_files WHERE filePath = ?1", params![file_path])

@@ -639,8 +639,8 @@ fn swap_attached(
     // never-answered rows) described the index this swap replaces; the
     // whole-project pass that follows re-asks every file anyway.
     schema::clear_semantic_leftovers(&tx, language)?;
-    // The stored resolution facts describe the rows: they are replaced with
-    // the walk's own, or dropped when the walk reported none.
+    // The stored resolution facts and watch paths describe the rows: they are
+    // replaced with the walk's own, or dropped when the walk reported none.
     tx.execute("DELETE FROM resolution_facts WHERE language = ?1", params![language])
         .with_context(|| format!("failed to drop {language}'s resolution facts"))?;
     tx.execute(
@@ -649,6 +649,14 @@ fn swap_attached(
         params![language],
     )
     .with_context(|| format!("failed to swap in {language}'s resolution facts"))?;
+    tx.execute("DELETE FROM resolution_watch_paths WHERE language = ?1", params![language])
+        .with_context(|| format!("failed to drop {language}'s watch paths"))?;
+    tx.execute(
+        "INSERT INTO resolution_watch_paths (path, language)
+         SELECT path, language FROM staging.resolution_watch_paths WHERE language = ?1",
+        params![language],
+    )
+    .with_context(|| format!("failed to swap in {language}'s watch paths"))?;
     schema::record_bulk_index(&tx).context("failed to reconcile the bulk-index roll-up")?;
     schema::reconcile_semantic_pass_rollup(&tx, semantic_pass_languages)
         .context("failed to reconcile the semantic-pass roll-up")?;
@@ -1191,6 +1199,16 @@ mod tests {
     /// `super::a`, and
     /// `staged_facts`. Swaps and returns live.
     fn swap_imports_and_facts(staged_facts: Option<&str>) -> (tempfile::TempDir, Connection) {
+        swap_imports_facts_and_paths(staged_facts, &["staged.json"])
+    }
+
+    /// [`swap_imports_and_facts`] with `staged_paths` as staging's watch
+    /// paths for `rust`; live holds `live.json` for `rust` and `go.json`
+    /// for `go`.
+    fn swap_imports_facts_and_paths(
+        staged_facts: Option<&str>,
+        staged_paths: &[&str],
+    ) -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let live_path = dir.path().join("index.db");
         let staging_path = dir.path().join("staging-rust.db");
@@ -1215,8 +1233,8 @@ mod tests {
             },
         )
         .unwrap();
-        schema::set_resolution_facts(&live, "rust", Some("live facts")).unwrap();
-        schema::set_resolution_facts(&live, "go", Some("go facts")).unwrap();
+        schema::set_resolution_facts(&live, "rust", Some("live facts"), &["live.json".to_string()]).unwrap();
+        schema::set_resolution_facts(&live, "go", Some("go facts"), &["go.json".to_string()]).unwrap();
 
         let mut staging = open_staging(&staging_path).unwrap();
         // `b.rs` changed, so the swap takes its new edge.
@@ -1234,7 +1252,8 @@ mod tests {
             },
         )
         .unwrap();
-        schema::set_resolution_facts(&staging, "rust", staged_facts).unwrap();
+        let staged_paths: Vec<String> = staged_paths.iter().map(|path| path.to_string()).collect();
+        schema::set_resolution_facts(&staging, "rust", staged_facts, &staged_paths).unwrap();
         plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
         drop(staging);
         swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();
@@ -1274,6 +1293,24 @@ mod tests {
         let (_dir, live) = swap_imports_and_facts(None);
         assert_eq!(schema::resolution_facts(&live, "rust").unwrap(), None);
         assert_eq!(schema::resolution_facts(&live, "go").unwrap().as_deref(), Some("go facts"));
+    }
+
+    /// The swap replaces the language's watch paths with staging's, leaves
+    /// another language's alone, and a walk with no facts leaves the language
+    /// with none.
+    ///
+    /// Control: drop the `INSERT INTO resolution_watch_paths` in
+    /// `swap_attached` (the swapped language loses its paths) or its `DELETE`
+    /// (`live.json` survives).
+    #[test]
+    fn a_swap_replaces_the_languages_watch_paths() {
+        let (_dir, live) = swap_imports_facts_and_paths(Some("staged facts"), &["staged.json", "also.json"]);
+        assert_eq!(schema::watch_paths(&live, "rust").unwrap(), vec!["also.json", "staged.json"]);
+        assert_eq!(schema::watch_paths(&live, "go").unwrap(), vec!["go.json"]);
+
+        let (_dir, live) = swap_imports_facts_and_paths(None, &["ignored.json"]);
+        assert!(schema::watch_paths(&live, "rust").unwrap().is_empty(), "no staged facts, no paths");
+        assert_eq!(schema::watch_paths(&live, "go").unwrap(), vec!["go.json"]);
     }
 
     /// GM-546: live holds `a.rs -> app.rs`; staging re-walks `rust` with the
