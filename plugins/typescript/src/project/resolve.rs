@@ -24,11 +24,13 @@ use std::collections::BTreeSet;
 use g_mesh_plugin_sdk::RelPath;
 
 use crate::extractor::grammar::grammar_for;
-use crate::project::exports::{imports_specifiers_targeting, imports_targets};
+use crate::project::exports::{
+    imports_specifiers_targeting, imports_targets, match_wildcard, PackageImports,
+};
 use crate::project::paths;
 use crate::project::tsconfig::{expand_paths_candidates, specifiers_targeting, EffectiveConfig};
 use crate::project::workspace::{
-    package_entry_targets, package_may_name, parse_bare_specifier, subpaths_targeting,
+    package_entry_targets, package_may_name, parse_bare_specifier, subpaths_targeting, WorkspacePackage,
 };
 use crate::project::TsProject;
 
@@ -220,10 +222,93 @@ pub fn candidates_shadowed_by(path: &str, existence: &BTreeSet<RelPath>) -> Vec<
 /// package whose entries cannot name `path` is skipped
 /// ([`package_may_name`]).
 pub fn fallbacks_shadowed_by(project: &TsProject, path: &str) -> Vec<String> {
+    let existence = &project.existence;
+    let Derivation { configs, specifiers } = derive_specifiers(project, path);
+    let mut shadowed: BTreeSet<String> = BTreeSet::new();
+    for derived in specifiers {
+        match derived {
+            Derived::Paths(config, specifier) => {
+                shadowed.extend(displaced_by(path, existence, expand_paths_candidates(config, &specifier)));
+            }
+            Derived::Package(package, subpath, specifier) => {
+                let entries = package_entry_targets(package, &subpath);
+                if configs.is_empty() {
+                    shadowed.extend(displaced_by(path, existence, entries));
+                    continue;
+                }
+                for config in &configs {
+                    let aliased = expand_paths_candidates(config, &specifier);
+                    shadowed.extend(displaced_by(path, existence, entries.iter().cloned().chain(aliased)));
+                }
+            }
+            Derived::Imports(config, specifier) => {
+                shadowed.extend(displaced_by(path, existence, imports_targets(config, &specifier)));
+            }
+        }
+    }
+    shadowed.into_iter().collect()
+}
+
+/// The addresses an unresolved alias, workspace package or `#` import that
+/// `path` can answer is waiting at, sorted and deduplicated: for every
+/// specifier [`fallbacks_shadowed_by`]'s inversion derives from `path`, its
+/// [`waiting_address`] under the config that derived it. A tsconfig's
+/// `["src/*", "generated/*"]` and a new `generated/x.ts` give `src/x`, the
+/// address an unresolved `@/x` was recorded at ([`miss_address`]). Both sides
+/// compute the address with [`waiting_address`]; every config is asked, so
+/// the one nearest the importer is among them.
+pub fn waiting_addresses_for(project: &TsProject, path: &str) -> Vec<String> {
+    let Derivation { configs, specifiers } = derive_specifiers(project, path);
+    let mut addresses: BTreeSet<String> = BTreeSet::new();
+    for derived in &specifiers {
+        match derived {
+            Derived::Paths(config, specifier) => {
+                addresses.extend(waiting_address(project, specifier, Some(config), None));
+            }
+            Derived::Package(_, _, specifier) => {
+                if configs.is_empty() {
+                    addresses.extend(waiting_address(project, specifier, None, None));
+                }
+                for config in &configs {
+                    addresses.extend(waiting_address(project, specifier, Some(config), None));
+                }
+            }
+            Derived::Imports(config, specifier) => {
+                addresses.extend(waiting_address(project, specifier, None, Some(config)));
+            }
+        }
+    }
+    addresses.into_iter().collect()
+}
+
+/// A specifier the inversion of a target pattern derives from a path, with
+/// what derived it.
+enum Derived<'p> {
+    /// From a tsconfig's `paths`.
+    Paths(&'p EffectiveConfig, String),
+    /// From a workspace package's entries: the subpath (`"."` or `./x`) and
+    /// the bare specifier naming it.
+    Package(&'p WorkspacePackage, String, String),
+    /// From a package.json `imports` map.
+    Imports(&'p PackageImports, String),
+}
+
+/// Every distinct tsconfig of the project, and the specifiers derived from
+/// a path by inverting each target pattern against it and its addresses.
+struct Derivation<'p> {
+    configs: Vec<&'p EffectiveConfig>,
+    specifiers: Vec<Derived<'p>>,
+}
+
+/// The specifiers that may resolve to `path`: [`specifiers_targeting`] for
+/// every tsconfig, [`subpaths_targeting`] for every workspace package that
+/// may name `path` ([`package_may_name`]), [`imports_specifiers_targeting`]
+/// for every `imports` map, each over `path` and its addresses
+/// ([`addresses_resolving_to`]).
+fn derive_specifiers<'p>(project: &'p TsProject, path: &str) -> Derivation<'p> {
     let mut addresses = addresses_resolving_to(path);
     addresses.push(path.to_string());
-    let existence = &project.existence;
-    let mut shadowed: BTreeSet<String> = BTreeSet::new();
+    let mut specifiers: Vec<Derived<'p>> = Vec::new();
 
     let mut configs: Vec<&EffectiveConfig> = Vec::new();
     for config in project.tsconfig_by_dir.values().flatten() {
@@ -232,11 +317,9 @@ pub fn fallbacks_shadowed_by(project: &TsProject, path: &str) -> Vec<String> {
         }
     }
     for config in &configs {
-        let specifiers: BTreeSet<String> =
+        let derived: BTreeSet<String> =
             addresses.iter().flat_map(|address| specifiers_targeting(config, address)).collect();
-        for specifier in specifiers {
-            shadowed.extend(displaced_by(path, existence, expand_paths_candidates(config, &specifier)));
-        }
+        specifiers.extend(derived.into_iter().map(|specifier| Derived::Paths(config, specifier)));
     }
 
     for (name, package) in &project.packages {
@@ -250,27 +333,17 @@ pub fn fallbacks_shadowed_by(project: &TsProject, path: &str) -> Vec<String> {
                 Some(rest) if !rest.is_empty() => format!("{name}{rest}"),
                 _ => name.clone(),
             };
-            let entries = package_entry_targets(package, &subpath);
-            if configs.is_empty() {
-                shadowed.extend(displaced_by(path, existence, entries));
-                continue;
-            }
-            for config in &configs {
-                let aliased = expand_paths_candidates(config, &specifier);
-                shadowed.extend(displaced_by(path, existence, entries.iter().cloned().chain(aliased)));
-            }
+            specifiers.push(Derived::Package(package, subpath, specifier));
         }
     }
 
     for config in project.imports_by_dir.values().flatten() {
-        let specifiers: BTreeSet<String> =
+        let derived: BTreeSet<String> =
             addresses.iter().flat_map(|address| imports_specifiers_targeting(config, address)).collect();
-        for specifier in specifiers {
-            shadowed.extend(displaced_by(path, existence, imports_targets(config, &specifier)));
-        }
+        specifiers.extend(derived.into_iter().map(|specifier| Derived::Imports(config, specifier)));
     }
 
-    shadowed.into_iter().collect()
+    Derivation { configs, specifiers }
 }
 
 /// The project-relative path a relative specifier written in `from` names,
@@ -312,6 +385,63 @@ pub fn resolve_package_imports(project: &TsProject, specifier: &str, from: &RelP
     }
     let config = project.imports_for(importer_dir(from)?)?;
     first_existing(&project.existence, imports_targets(config, specifier))
+}
+
+/// The address an unresolved non-relative `specifier` is recorded at: the
+/// first base of the list [`resolve`] walks for it, so the create of any of
+/// its candidates can name it ([`waiting_addresses_for`]). A `#` specifier
+/// takes the first target of `imports`; a bare one naming a workspace
+/// package the package's first entry, else the first `paths` expansion
+/// under `config`. `None` for a relative specifier, one no family matches
+/// (an npm package, a builtin), or one only the catch-all `"*"` entry
+/// matches: that entry is a lookup before `node_modules`, so a package
+/// import it matches stays external.
+pub fn waiting_address(
+    project: &TsProject,
+    specifier: &str,
+    config: Option<&EffectiveConfig>,
+    imports: Option<&PackageImports>,
+) -> Option<String> {
+    if is_relative_specifier(specifier) {
+        return None;
+    }
+    if specifier.starts_with('#') {
+        return imports_targets(imports?, specifier).into_iter().next();
+    }
+    let workspace = parse_bare_specifier(specifier)
+        .and_then(|(name, subpath)| Some(package_entry_targets(project.packages.get(&name)?, &subpath)))
+        .and_then(|entries| entries.into_iter().next());
+    workspace.or_else(|| {
+        let config = config.filter(|config| matched_beyond_catch_all(config, specifier))?;
+        expand_paths_candidates(config, specifier).into_iter().next()
+    })
+}
+
+/// The `paths` pattern that matches every bare specifier.
+const CATCH_ALL_PATTERN: &str = "*";
+
+/// Whether an entry of `config` other than the catch-all `"*"` matches
+/// `specifier`.
+fn matched_beyond_catch_all(config: &EffectiveConfig, specifier: &str) -> bool {
+    config.paths.iter().any(|entry| {
+        entry.pattern != CATCH_ALL_PATTERN
+            && if entry.pattern.contains('*') {
+                match_wildcard(&entry.pattern, specifier).is_some()
+            } else {
+                entry.pattern == specifier
+            }
+    })
+}
+
+/// [`waiting_address`] for `specifier` written in `from`, under the tsconfig
+/// and `imports` map nearest `from`. `None` for a relative specifier (its
+/// address is [`relative_address`]) or an importer outside the root.
+pub fn miss_address(project: &TsProject, specifier: &str, from: &RelPath) -> Option<String> {
+    if is_relative_specifier(specifier) {
+        return None;
+    }
+    let dir = importer_dir(from)?;
+    waiting_address(project, specifier, project.tsconfig_for(dir), project.imports_for(dir))
 }
 
 /// The file `specifier`, written in `from`, names: relative first, then

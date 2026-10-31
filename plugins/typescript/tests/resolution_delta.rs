@@ -807,7 +807,8 @@ fn a_created_file_of_an_exact_alias_names_its_later_target() {
 }
 
 /// A created file's first `fileChanged` offers the alias target it shadows
-/// beside its own addresses.
+/// beside its own addresses, and `src/x.ts`, where an unresolved `@/x.ts`
+/// waits.
 ///
 /// Control: drop the `keys.extend(resolve::fallbacks_shadowed_by(..))` line
 /// in `TsProject::source_changed`.
@@ -818,7 +819,7 @@ fn a_first_sighting_offers_the_alias_target_it_shadows() {
     let (_fixture, mut project) = created_over(&files, "@/x", "generated/x.ts", &["src/x.ts"], "src/x.ts");
     assert_eq!(
         source_changed(&mut project, "src/x.ts", Some("export const v = 2;\n")),
-        Some(waiting_at(&["generated/x.ts", "src/x", "src/x.js"]))
+        Some(waiting_at(&["generated/x.ts", "src/x", "src/x.js", "src/x.ts"]))
     );
 }
 
