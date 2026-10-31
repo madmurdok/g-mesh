@@ -22,6 +22,11 @@
 # - Every section runs with `--workspace` and selects by `package()`, never
 #   `-p`: all sections share one build and one feature unification, and the
 #   plugin and SDK binaries that core tests spawn always exist.
+# - A section named in UNIX_ONLY_SECTIONS has only `cfg(unix)` tests, so on
+#   Windows its binary is empty and `--no-tests=fail` would fail it. `run`
+#   skips it there and says so; `--no-tests=fail` stays on for every other
+#   section. `check` still lists it, so the partition does not depend on the
+#   platform.
 # - `core-spawns-<plugin>` selectors are not sections: they overlap core
 #   sections, are not in `list`, and `check` does not see them.
 #
@@ -45,6 +50,9 @@ SECTIONS=(
 	plugin-python
 	wire
 )
+
+# Sections whose every test is `cfg(unix)`: `run` skips them on Windows.
+UNIX_ONLY_SECTIONS=(core-scripts)
 
 SPAWN_MAP=scripts/test-plugin-spawns.txt
 
@@ -131,6 +139,20 @@ python_cmd() {
 	}
 }
 
+# Succeeds when section $1 has tests on this host. `TEST_SECTIONS_UNAME`
+# stands in for `uname -s` so the Windows answer can be tested on Unix.
+section_runs_here() {
+	local s
+	case "${TEST_SECTIONS_UNAME:-$(uname -s)}" in
+	MINGW* | MSYS* | CYGWIN*)
+		for s in "${UNIX_ONLY_SECTIONS[@]}"; do
+			[ "$s" != "$1" ] || return 1
+		done
+		;;
+	esac
+	return 0
+}
+
 require_nextest() {
 	if ! cargo nextest --version >/dev/null 2>&1; then
 		echo "test-sections: cargo-nextest is not installed (cargo install --locked cargo-nextest)" >&2
@@ -213,6 +235,13 @@ cmd_run() {
 	for name in "${names[@]}"; do
 		local filter start status=0 secs result counts
 		filter="$(section_filter "$name")"
+		if ! section_runs_here "$name"; then
+			echo "== $name: SKIP (unix-only section, no tests on this platform)"
+			if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+				printf '| %s | SKIP | - | - | - |\n' "$name" >>"$GITHUB_STEP_SUMMARY"
+			fi
+			continue
+		fi
 		echo "== $name: $filter"
 		# A stale JUnit file from an earlier invocation must not be taken for
 		# this section's.

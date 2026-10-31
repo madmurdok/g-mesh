@@ -284,6 +284,138 @@ fn run_refuses_an_unknown_or_missing_section_before_calling_cargo() {
     );
 }
 
+/// `sections_script` on a host whose `uname -s` is `uname`, with an empty
+/// target dir so the real script's object pruning has nothing to touch.
+fn sections_on(uname: &str, dir: &Path, path_env: &str, args: &[&str]) -> Output {
+    Command::new("bash")
+        .arg(repo_root().join("scripts/test-sections.sh"))
+        .args(args)
+        .env("PATH", path_env)
+        .env("TEST_SECTIONS_UNAME", uname)
+        .env("CARGO_TARGET_DIR", dir.join("empty-target"))
+        .env_remove("GITHUB_STEP_SUMMARY")
+        .output()
+        .expect("failed to run bash")
+}
+
+fn cargo_calls(dir: &Path) -> String {
+    fs::read_to_string(dir.join("cargo-called")).unwrap_or_default()
+}
+
+const WINDOWS_UNAMES: [&str; 3] = ["MINGW64_NT-10.0-20348", "MSYS_NT-10.0", "CYGWIN_NT-10.0"];
+
+#[test]
+fn on_windows_run_core_scripts_skips_with_a_skip_line_and_never_runs_cargo_tests() {
+    for uname in WINDOWS_UNAMES {
+        let dir = tempfile::tempdir().unwrap();
+        let path_env = recording_cargo(dir.path());
+
+        let output = sections_on(uname, dir.path(), &path_env, &["run", "core-scripts"]);
+        assert_eq!(output.status.code(), Some(0), "{uname}: {}", describe(&output));
+        assert!(
+            stdout_lines(&output).iter().any(|l| l.starts_with("== core-scripts: SKIP")),
+            "{uname}: {}",
+            describe(&output)
+        );
+        // The `nextest --version` probe is allowed; running tests is not.
+        let calls = cargo_calls(dir.path());
+        assert!(!calls.contains("nextest run"), "{uname}: cargo ran tests: {calls}");
+    }
+}
+
+#[test]
+fn on_windows_a_section_with_tests_still_runs_with_no_tests_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+
+    let output = sections_on(WINDOWS_UNAMES[0], dir.path(), &path_env, &["run", "core-it"]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("SKIP"), "{}", describe(&output));
+    let calls = cargo_calls(dir.path());
+    assert!(calls.contains("nextest run"), "{calls}");
+    assert!(calls.contains("--no-tests=fail"), "{calls}");
+}
+
+#[test]
+fn on_windows_run_all_skips_only_core_scripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+
+    let output = sections_on(WINDOWS_UNAMES[0], dir.path(), &path_env, &["run", "all"]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let skipped: Vec<String> = stdout_lines(&output).into_iter().filter(|l| l.contains("SKIP")).collect();
+    assert_eq!(skipped.len(), 1, "{}", describe(&output));
+    assert!(skipped[0].starts_with("== core-scripts: SKIP"), "{}", describe(&output));
+    let runs = cargo_calls(dir.path()).lines().filter(|l| l.contains("nextest run")).count();
+    assert_eq!(runs, SECTIONS.len() - 1, "{}", cargo_calls(dir.path()));
+}
+
+#[test]
+fn on_unix_run_core_scripts_calls_cargo_with_no_tests_fail() {
+    for uname in ["Linux", "Darwin"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path_env = recording_cargo(dir.path());
+
+        let output = sections_on(uname, dir.path(), &path_env, &["run", "core-scripts"]);
+        assert_eq!(output.status.code(), Some(0), "{uname}: {}", describe(&output));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("SKIP"), "{uname}: {}", describe(&output));
+        let calls = cargo_calls(dir.path());
+        assert!(calls.contains("binary_id(g-mesh::scripts)"), "{uname}: {calls}");
+        assert!(calls.contains("--no-tests=fail"), "{uname}: {calls}");
+    }
+}
+
+/// A `cargo` that answers `nextest list` for a two-test suite (one scripts
+/// test, one `mcp::` lib test) by evaluating just the section filters it is
+/// given, so `check` can run without building anything.
+fn listing_cargo(dir: &Path) -> String {
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    let script = r#"#!/bin/sh
+case "$*" in
+*--version*) exit 0 ;;
+esac
+filter=""
+while [ $# -gt 0 ]; do
+	[ "$1" != -E ] || filter="$2"
+	shift
+done
+scripts='"g-mesh::scripts":{"binary-id":"g-mesh::scripts","testcases":{"t":{"ignored":false,"filter-match":{"status":"matches"}}}}'
+mcp='"g-mesh":{"binary-id":"g-mesh","testcases":{"mcp::t":{"ignored":false,"filter-match":{"status":"matches"}}}}'
+case "$filter" in
+"") suites="$scripts,$mcp" ;;
+*'!binary_id(g-mesh::scripts)'*) suites="" ;;
+*'binary_id(g-mesh::scripts)'*) suites="$scripts" ;;
+*'test(/^mcp::/)'*) suites="$mcp" ;;
+*) suites="" ;;
+esac
+printf '{"rust-build-meta":{},"test-count":0,"rust-suites":{%s}}\n' "$suites"
+"#;
+    fs::write(&cargo, script).unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+}
+
+#[test]
+fn check_on_windows_still_counts_core_scripts_tests() {
+    for uname in [WINDOWS_UNAMES[0], "Linux"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path_env = listing_cargo(dir.path());
+
+        let output = sections_on(uname, dir.path(), &path_env, &["check"]);
+        assert_eq!(output.status.code(), Some(0), "{uname}: {}", describe(&output));
+        let lines = stdout_lines(&output);
+        assert!(lines.contains(&"core-scripts: 1".to_owned()), "{uname}: {}", describe(&output));
+        assert!(lines.contains(&"core-mcp: 1".to_owned()), "{uname}: {}", describe(&output));
+        assert!(
+            lines.contains(&"OK: every test is in exactly one section".to_owned()),
+            "{uname}: {}",
+            describe(&output)
+        );
+    }
+}
+
 /// `core-it` holds core's `kind(test)` binaries but `g-mesh::scripts`, which
 /// `core-scripts` holds alone.
 #[test]
