@@ -1,36 +1,34 @@
 //! `g-mesh clean` driven as a real subprocess, against a real project state
-//! directory under the projects root the run resolves.
+//! directory.
 //!
-//! Only forms that delete nothing outside this test's own project are driven
-//! here. `clean expired`, `clean orphaned --force` and `clean all` are scoped
-//! to *every* project under the root, and the root is shared: before task 217
-//! it was the developer's real `~/.g-mesh`, and since then it is one
-//! `G_MESH_HOME` that every test binary in this directory writes into
-//! concurrently. Either way a sweeping delete from here would take out
-//! fixtures that belong to someone else.
+//! Each test runs against a `G_MESH_HOME` of its own (`common::IsolatedHome`).
+//! The ambient home is shared by every test binary and worktree, and any
+//! process there that scans the projects root (`g-mesh status`, `clean
+//! orphaned`) opens every project's `index.db`, creating files inside the
+//! very state directory a test is deleting. That failed `clean` with
+//! "Directory not empty".
 //!
-//! Those forms now live in `cli_clean_sweeping.rs`, which gives each test a
-//! `G_MESH_HOME` of its own so a sweep inside it is safe by construction. The
-//! unit tests in `cli::clean` still cover the classification with an injected
-//! root; what they cannot show, and that file can, is that the word on the
-//! command line reaches that code at all.
-//!
-//! What is still worth driving as a subprocess is the wiring: that the word
-//! reaches the right code path and reports rather than deletes.
+//! Only the forms scoped to this test's own project are driven here;
+//! `clean expired`, `clean orphaned --force` and `clean all` live in
+//! `cli_clean_sweeping.rs`. What is worth driving as a subprocess is the
+//! wiring: that the word reaches the right code path and reports rather than
+//! deletes.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use g_mesh::daemon;
-use g_mesh::storage::connection::project_dir;
+use g_mesh::daemon::identity::project_hash;
+use g_mesh::paths::HOME_ENV;
 
 use crate::common;
 
-use crate::common::Lifeline;
+use crate::common::{IsolatedHome, Lifeline};
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
 struct Project {
+    home: IsolatedHome,
     dir: tempfile::TempDir,
 }
 
@@ -39,23 +37,25 @@ impl Project {
         let dir = tempfile::tempdir().expect("failed to create a temp project root");
         std::fs::write(dir.path().join("a.ts"), b"export const a = 1;\n")
             .expect("failed to seed the project with a source file");
-        Self { dir }
+        Self { home: IsolatedHome::new(), dir }
     }
 
     fn root(&self) -> &Path {
         self.dir.path()
     }
 
+    /// Derived from the home rather than asked of `storage::connection`,
+    /// which would answer for the *ambient* root this process inherited.
     fn state_dir(&self) -> PathBuf {
-        project_dir(self.root()).expect("failed to resolve the project state directory")
+        self.home.projects_root().join(project_hash(self.root()).expect("failed to hash the project root"))
     }
 
     fn pid_file(&self) -> PathBuf {
-        daemon::pid_path(self.root()).expect("failed to resolve the pid file path")
+        daemon::pid_path_in(&self.state_dir())
     }
 
     fn plugin_pid_file(&self) -> PathBuf {
-        daemon::plugin_pid_path(self.root()).expect("failed to resolve the plugin pid file path")
+        daemon::plugin_pid_path_in(&self.state_dir())
     }
 
     /// Bootstraps a detached daemon through the shim, so the state directory
@@ -65,6 +65,7 @@ impl Project {
             .lifeline()
             .arg("mcp-shim")
             .current_dir(self.root())
+            .env(HOME_ENV, &self.home.dir)
             .env_remove(g_mesh::shim::PROJECT_DIR_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -74,12 +75,17 @@ impl Project {
         wait_for("the daemon to start listening", || self.pid_file().exists());
         let _ = shim.kill();
         let _ = shim.wait();
+        assert!(
+            self.pid_file().starts_with(&self.home.dir) && self.state_dir().starts_with(&self.home.dir),
+            "the pid file and state directory must live under this test's own home"
+        );
     }
 
     fn command(&self, args: &[&str]) -> Output {
         Command::new(BIN)
             .args(args)
             .current_dir(self.root())
+            .env(HOME_ENV, &self.home.dir)
             .output()
             .unwrap_or_else(|e| panic!("failed to run `g-mesh {}`: {e}", args.join(" ")))
     }
@@ -104,6 +110,20 @@ fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Names what is left in a directory a `clean` failed to remove, so a
+/// recurrence identifies the writer.
+fn leftovers_of(dir: &Path) -> String {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut names: Vec<String> =
+                entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            format!("{names:?}")
+        }
+        Err(e) => format!("unreadable: {e}"),
+    }
+}
+
 fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
@@ -122,7 +142,13 @@ fn clean_deletes_the_cwds_project_state_directory() {
 
     let cleaned = project.command(&["clean"]);
 
-    assert!(cleaned.status.success(), "clean failed: {}", stderr_of(&cleaned));
+    assert!(
+        cleaned.status.success(),
+        "clean failed: {} (left in {}: {})",
+        stderr_of(&cleaned),
+        state_dir.display(),
+        leftovers_of(&state_dir)
+    );
     assert!(stdout_of(&cleaned).contains("deleted project"), "unexpected output: {}", stdout_of(&cleaned));
     assert!(!state_dir.exists(), "the project's state directory must be gone");
 }
@@ -145,7 +171,13 @@ fn clean_refuses_while_a_daemon_is_still_serving_the_project() {
     let stopped = project.command(&["stop"]);
     assert!(stopped.status.success(), "stop failed: {}", stderr_of(&stopped));
     let cleaned_again = project.command(&["clean"]);
-    assert!(cleaned_again.status.success(), "clean failed: {}", stderr_of(&cleaned_again));
+    assert!(
+        cleaned_again.status.success(),
+        "clean failed: {} (left in {}: {})",
+        stderr_of(&cleaned_again),
+        project.state_dir().display(),
+        leftovers_of(&project.state_dir())
+    );
     assert!(!project.state_dir().exists());
 }
 
@@ -196,6 +228,12 @@ fn clean_and_clean_orphaned_handle_a_front_state_dir() {
     let stopped = project.command(&["stop"]);
     assert!(stopped.status.success(), "stop failed: {}", stderr_of(&stopped));
     let cleaned = project.command(&["clean"]);
-    assert!(cleaned.status.success(), "clean failed: {}", stderr_of(&cleaned));
+    assert!(
+        cleaned.status.success(),
+        "clean failed: {} (left in {}: {})",
+        stderr_of(&cleaned),
+        state_dir.display(),
+        leftovers_of(&state_dir)
+    );
     assert!(!state_dir.exists(), "the front's state directory must be gone");
 }
