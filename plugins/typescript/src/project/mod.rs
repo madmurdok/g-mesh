@@ -177,7 +177,9 @@ impl TsProject {
     /// its resolution walks ([`resolve::miss_address`]); `path` offers every
     /// such address its derived specifiers have
     /// ([`resolve::waiting_addresses_for`]), so a new `generated/x.ts` names
-    /// `src/x`, where `@/x` under `["src/*", "generated/*"]` waits.
+    /// `src/x`, where `@/x` under `["src/*", "generated/*"]` waits. A key
+    /// equal to `path` itself selects only the importers that were waiting
+    /// at `path` before core linked them, not every importer of `path`.
     ///
     /// Once per path per model (`announced`), so an ordinary edit costs core
     /// no import scan; `None` (gone) forgets the path, so a re-creation is

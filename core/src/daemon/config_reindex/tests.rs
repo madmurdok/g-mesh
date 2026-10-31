@@ -123,7 +123,7 @@ fn seeded() -> Connection {
 }
 
 fn select(conn: &Connection, files: &[PathScope], imports: &[ImportSelector]) -> Vec<String> {
-    let selected = select_affected(conn, "ts", files, imports).unwrap();
+    let selected = select_affected(conn, "ts", files, imports, None).unwrap();
     assert_eq!(
         indexed_file_count(conn, "ts").unwrap(),
         TS_FILES.len(),
@@ -337,7 +337,7 @@ fn an_exact_target_delta_runs_no_scan_and_selects_what_the_scan_does() {
     for (case, files, imports, expected) in exact_cases() {
         let before = read_counts();
         let selected: Vec<String> =
-            select_affected(&conn, "ts", &files, &imports).unwrap().into_iter().collect();
+            select_affected(&conn, "ts", &files, &imports, None).unwrap().into_iter().collect();
         let after = read_counts();
         assert_eq!(after.0, before.0, "{case}: an exact-only delta ran an import scan");
         assert_eq!(
@@ -379,7 +379,7 @@ fn non_exact_selectors_share_one_scan_and_exact_only_runs_none() {
     ] {
         let before = read_counts();
         let selected: Vec<String> =
-            select_affected(&conn, "ts", &[], &imports).unwrap().into_iter().collect();
+            select_affected(&conn, "ts", &[], &imports, None).unwrap().into_iter().collect();
         let after = read_counts();
         assert_eq!(after.0 - before.0, scans, "{case}: import scans");
         assert_eq!(selected, scanned(&conn, &[], &imports), "{case}");
@@ -400,11 +400,11 @@ fn an_imports_only_delta_never_lists_files() {
         vec![by_specifier(exact("@lib/e"))],
     ] {
         let before = read_counts();
-        select_affected(&conn, "ts", &[], &imports).unwrap();
+        select_affected(&conn, "ts", &[], &imports, None).unwrap();
         assert_eq!(read_counts().1, before.1, "{imports:?} listed the language's files");
     }
     let before = read_counts();
-    select_affected(&conn, "ts", &[scope("lib", &[])], &[]).unwrap();
+    select_affected(&conn, "ts", &[scope("lib", &[])], &[], None).unwrap();
     assert_eq!(read_counts().1 - before.1, 1, "a file scope lists the files once");
 }
 
@@ -454,13 +454,14 @@ fn a_gone_files_importers_join_the_selection_under_the_same_threshold() {
     let conn = seeded();
     let extra = paths(&["app/a.ts", "lib/f.ts", "lib/e.ts"]);
 
-    let selection = select_with(&conn, "ts", &[], &[], Some("lib/e.ts"), &extra).unwrap();
+    let selection = select_with(&conn, "ts", &[], &[], Some("lib/e.ts"), &extra, &[]).unwrap();
     assert!(
         matches!(&selection, Selection::Files(files) if files.iter().eq(["app/a.ts", "lib/f.ts"])),
         "2 of 8 files: {selection:?}"
     );
 
-    let selection = select_with(&conn, "ts", &[scope("pkg", &[])], &[], Some("lib/e.ts"), &extra).unwrap();
+    let selection =
+        select_with(&conn, "ts", &[scope("pkg", &[])], &[], Some("lib/e.ts"), &extra, &[]).unwrap();
     assert!(
         matches!(selection, Selection::TooMany(_)),
         "2 importers and 2 of pkg, 4 of 8 files: {selection:?}"

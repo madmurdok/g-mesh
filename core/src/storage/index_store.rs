@@ -393,6 +393,19 @@ impl IndexStore {
     }
 }
 
+/// What [`Writer::apply_file_diff_linked`] read about other files in the
+/// commit that applied one file's diff.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkedFileDiff {
+    /// For a gone file, its importers of the same language, each owed a
+    /// re-extract in that commit; empty for any other scope.
+    pub gone_importers: Vec<String>,
+    /// For any other scope, `(language, path)` of every file whose import
+    /// waited unresolved at the file's path just before the link; empty
+    /// for a gone file.
+    pub waiting_importers: Vec<(String, String)>,
+}
+
 /// A multi-step write in progress. Under `PerStep` each operation locks and
 /// releases; under `WholeUnit` it holds the guard taken when the unit opened.
 pub struct Writer<'a> {
@@ -469,26 +482,37 @@ impl Writer<'_> {
     /// plugin re-extracts them, or leaves the rows to the next start's
     /// `config_reindex::resume_owed_reextracts`, which is the only one to
     /// re-extract an importer of another language (with its own plugin).
-    /// Empty for any other scope.
+    /// These are [`LinkedFileDiff::gone_importers`], empty for any other
+    /// scope.
+    ///
+    /// For any other scope, [`LinkedFileDiff::waiting_importers`] holds the
+    /// files whose imports waited unresolved at `file_path`
+    /// ([`file_rows::waiting_importers`]), read in the same commit before the
+    /// link repoints them onto the file. Nothing is owed for them here.
     pub fn apply_file_diff_linked(
         &mut self,
         diff: &mut Diff,
         file_path: &str,
         scope: FileScope,
         label: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<LinkedFileDiff> {
         let store = self.store;
         self.step(|conn| {
-            let importers = in_one_commit(conn, |conn| {
-                let importers =
-                    if scope == FileScope::Gone { file_rows::importers_of(conn, file_path)? } else { None };
+            let linked = in_one_commit(conn, |conn| {
+                let (importers, waiting_importers) = if scope == FileScope::Gone {
+                    (file_rows::importers_of(conn, file_path)?, Vec::new())
+                } else {
+                    (None, file_rows::waiting_importers(conn, file_path)?)
+                };
                 file_rows::widen(conn, file_path, scope, diff)?;
                 apply_and_link(conn, diff, label, &store.link_rules)?;
                 if scope == FileScope::Gone {
                     file_rows::delete_indexed_file(conn, file_path)?;
                     super::schema::clear_gone_file_semantic_rows(conn, file_path)?;
                 }
-                let Some((language, importers)) = importers else { return Ok(Vec::new()) };
+                let Some((language, importers)) = importers else {
+                    return Ok(LinkedFileDiff { gone_importers: Vec::new(), waiting_importers });
+                };
                 let mut by_language: BTreeMap<String, Vec<String>> = BTreeMap::new();
                 for (importer_language, path) in importers {
                     by_language.entry(importer_language).or_default().push(path);
@@ -496,10 +520,11 @@ impl Writer<'_> {
                 for (importer_language, paths) in &by_language {
                     super::schema::owe_reextracts(conn, importer_language, file_path, paths)?;
                 }
-                Ok(by_language.remove(&language).unwrap_or_default())
+                let gone_importers = by_language.remove(&language).unwrap_or_default();
+                Ok(LinkedFileDiff { gone_importers, waiting_importers })
             })?;
             store.claim(diff);
-            Ok(importers)
+            Ok(linked)
         })
     }
 
@@ -915,7 +940,7 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(importers, vec!["other.ts".to_string(), "use.ts".to_string()]);
+        assert_eq!(importers.gone_importers, vec!["other.ts".to_string(), "use.ts".to_string()]);
         assert_eq!(
             store.with(schema::owed_reextracts).unwrap(),
             vec![(
@@ -939,7 +964,7 @@ mod tests {
                 })
                 .unwrap();
 
-            assert!(importers.is_empty(), "{scope:?}");
+            assert!(importers.gone_importers.is_empty(), "{scope:?}");
             assert!(store.with(schema::owed_reextracts).unwrap().is_empty(), "{scope:?}");
         }
     }
@@ -976,6 +1001,7 @@ mod tests {
                 writer.apply_file_diff_linked(&mut Diff::default(), "lib.ts", FileScope::Gone, "test")
             })
             .unwrap()
+            .gone_importers
     }
 
     /// An importer of another language is owed under its own language, and

@@ -114,7 +114,7 @@ pub fn imports_targets(config: &PackageImports, specifier: &str) -> Vec<String> 
 /// tsc, a target is a module name when its own spelling, before `\\` is
 /// read as a separator, starts with neither `./` nor `../` (`.`, `..`, `.\\`,
 /// `..\\..`); only a module name may name the project root.
-fn imports_target_inside(dir: &str, target: &str) -> Option<String> {
+pub fn imports_target_inside(dir: &str, target: &str) -> Option<String> {
     if !target.starts_with("./") && !target.starts_with("../") {
         paths::inside_or_root(dir, target)
     } else {

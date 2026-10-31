@@ -25,7 +25,8 @@ use g_mesh_plugin_sdk::RelPath;
 
 use crate::extractor::grammar::grammar_for;
 use crate::project::exports::{
-    imports_specifiers_targeting, imports_targets, match_wildcard, PackageImports,
+    imports_specifiers_targeting, imports_target_inside, imports_targets, key_targets, match_wildcard,
+    PackageImports,
 };
 use crate::project::paths;
 use crate::project::tsconfig::{expand_paths_candidates, specifiers_targeting, EffectiveConfig};
@@ -256,7 +257,14 @@ pub fn fallbacks_shadowed_by(project: &TsProject, path: &str) -> Vec<String> {
 /// `["src/*", "generated/*"]` and a new `generated/x.ts` give `src/x`, the
 /// address an unresolved `@/x` was recorded at ([`miss_address`]). Both sides
 /// compute the address with [`waiting_address`]; every config is asked, so
-/// the one nearest the importer is among them.
+/// the one nearest the importer is among them. A wildcard entry whose target
+/// has no `*` derives no specifier, so its target is offered directly when it
+/// names `path` ([`static_targets_naming`]).
+///
+/// An address other than `path` that exists is dropped: no import waits
+/// unresolved at a base whose first candidate exists, and core would answer
+/// such a key with every importer linked to that file. `path` itself is
+/// always kept; core selects only the importers waiting at it.
 pub fn waiting_addresses_for(project: &TsProject, path: &str) -> Vec<String> {
     let Derivation { configs, specifiers } = derive_specifiers(project, path);
     let mut addresses: BTreeSet<String> = BTreeSet::new();
@@ -278,7 +286,45 @@ pub fn waiting_addresses_for(project: &TsProject, path: &str) -> Vec<String> {
             }
         }
     }
-    addresses.into_iter().collect()
+    addresses.extend(static_targets_naming(project, &configs, path));
+    addresses
+        .into_iter()
+        .filter(|address| address == path || !project.existence.contains(&RelPath::new(address.as_str())))
+        .collect()
+}
+
+/// The static targets (no `*`) of wildcard `paths` entries of `configs`
+/// (the catch-all `"*"` excluded, as in [`waiting_address`]) and of wildcard
+/// `imports` keys that equal `path` or one of its addresses
+/// ([`addresses_resolving_to`]), resolved the way the forward lookup
+/// resolves them. Such an entry names that one path for every capture, so a
+/// specifier it matches waits there.
+fn static_targets_naming(project: &TsProject, configs: &[&EffectiveConfig], path: &str) -> Vec<String> {
+    let mut addresses = addresses_resolving_to(path);
+    addresses.push(path.to_string());
+    let mut targets: Vec<String> = Vec::new();
+    for config in configs {
+        for entry in &config.paths {
+            if !entry.pattern.contains('*') || entry.pattern == CATCH_ALL_PATTERN {
+                continue;
+            }
+            for target in entry.targets.iter().filter(|target| !target.contains('*')) {
+                targets.extend(paths::inside_or_root(&config.resolve_dir, target));
+            }
+        }
+    }
+    for config in project.imports_by_dir.values().flatten() {
+        for (key, value) in &config.imports {
+            if !key.contains('*') {
+                continue;
+            }
+            for target in key_targets(value, None).into_iter().filter(|target| !target.contains('*')) {
+                targets.extend(imports_target_inside(&config.dir, &target));
+            }
+        }
+    }
+    targets.retain(|target| addresses.contains(target));
+    targets
 }
 
 /// A specifier the inversion of a target pattern derives from a path, with
