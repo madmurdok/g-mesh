@@ -231,28 +231,39 @@ exact keys cannot be complete.
 ### Change (recommended, owner decision D2)
 
 Offer a **prefix** key instead of specifiers. New
-`resolve::climbing_target_prefixes(project, path) -> Vec<String>`. For each
-distinct config, each wildcard entry `E` (pattern `Qe*Re`), and each target
-`t1 = P1*S1` whose `S1` begins with `k >= 1` `..` segments after the star's
-segment (`.` segments ignored), it computes from `path` and each of its
-addresses `A`:
+`resolve::climbing_target_prefixes(project, path) -> ClimbingKeys`
+(`prefixes` plus `exact` keys). For each distinct config, each wildcard
+entry `E` (pattern `Qe*Re`), and each target `t1 = P1*S1` whose `S1`
+begins with `k >= 1` `..` segments after the star's segment (`.` segments
+ignored), let `D = normalize(resolve_dir/dir(P1))` (the root for none) and
+`H = D/` + the text before the `*` in its segment. It computes from `path`
+and each of its addresses `A`:
 
 1. `A` must end with `/R`, where `R` is `S1` after those `..` (or `R` is
-   empty). Strip it to get `A'`.
-2. `c_head = match_wildcard(normalize(resolve_dir/P1) + "*", A')`. When `A'`
-   equals the prefix itself, `c_head` is empty.
+   empty). Strip it to get `A'` (the root when `A == R`).
+2. If `A'` is `D` or an ancestor of `D` at most `k - 1` levels up (the
+   root included), the climb consumes the whole capture: `c_head` is
+   empty. This covers a partial head (`./src/p*/..`, capture `x` ->
+   `src`) and a capture with fewer segments than `k`
+   (`./src/a/*/../..`, capture `x` -> `src`). Otherwise
+   `c_head = A'` without the prefix `H`, or no family when `A'` does not
+   start with `H`.
 3. The family's fixed specifier prefix is `F = Qe + c_head + "/"` (or `Qe`
    when `c_head` is empty).
-4. For every other wildcard target `t2 = P2*S2` (no climb) of every entry
-   `E2 = Q2*R2` of the same config:
-   - if `F` starts with `Q2`, emit
-     `normalize(resolve_dir/(P2 + F[Q2.len..]))`, with a trailing `/` when
-     that text ended in `/`;
-   - if `Q2` starts with `F`, emit `normalize(resolve_dir/P2)` (an
-     over-approximation);
-   - otherwise `E2` cannot match the family.
-   An exact entry (no `*`) whose pattern starts with `F` adds its targets
-   as ordinary exact keys.
+4. For every wildcard target `t2 = P2*S2` of every entry `E2 = Q2*R2` of
+   the same config, take `rest = F[Q2.len..]` if `F` starts with `Q2`, or
+   `rest = ""` if `Q2` starts with `F` (an over-approximation); otherwise
+   `E2` cannot match the family. With `k2` the climb of `t2` (0 for none),
+   substitute `rest + y` for every open capture tail `y` of `1..=k2 + 1`
+   segments and normalize `resolve_dir/(P2 + rest + y + S2)`:
+   - where a segment of `y` survives, emit the text in front of it as a
+     prefix (`./gen/*` -> `gen/lib/`);
+   - where the climb consumes all of `y`, the result is one address
+     (`./*/../../x` -> `x`): emit it and every file it may name
+     (`candidate_paths`) as exact keys.
+   An exact entry (no `*`) whose pattern starts with `F` adds each target
+   address and every file it may name as exact keys: an importer linked
+   to `special.ts` is caught, not only one waiting at `special`.
 
 `source_changed` (mod.rs 187-210) turns each prefix into an
 `ImportSelector { by: Target { File, Matcher::StartsWith(prefix) } }`

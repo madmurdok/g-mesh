@@ -354,7 +354,9 @@ pub struct ClimbingKeys {
     /// Target prefixes: every import whose target (placeholder address or
     /// linked file) starts with one may now resolve to `path`. Never empty.
     pub prefixes: Vec<String>,
-    /// Exact addresses, from exact entries the climbing family matches.
+    /// Exact keys: addresses the family's specifiers may substitute to
+    /// (exact entries, captures a climb consumes) and every file each one
+    /// may name.
     pub exact: Vec<String>,
 }
 
@@ -364,11 +366,13 @@ pub struct ClimbingKeys {
 /// `@m/lib/<y>` reaches `lib` for every `<y>`. No finite list of exact keys
 /// names that family, so for `path` and each of its addresses
 /// ([`addresses_resolving_to`]) the family's fixed specifier prefix `F` is
-/// worked out (`@m/lib/`), and every other wildcard target of the same
-/// config gives the target prefix its expansion of `F` starts with
-/// (`./gen/*` -> `gen/lib/`). An entry whose pattern is more specific than
-/// `F` gives its whole target prefix (an over-approximation); an exact
-/// entry whose pattern starts with `F` gives its targets as exact keys.
+/// worked out (`@m/lib/`), and every wildcard target of the same config
+/// gives the target prefix its expansion of `F` starts with (`./gen/*` ->
+/// `gen/lib/`), plus, for a target that climbs too, the addresses of the
+/// captures its climb consumes as exact keys. An entry whose pattern is
+/// more specific than `F` gives its whole target prefix (an
+/// over-approximation); an exact entry whose pattern starts with `F` gives
+/// its targets as exact keys.
 ///
 /// Empty for a config without such a target, so an ordinary create adds no
 /// prefix selector. A prefix naming the project root itself (which would
@@ -403,7 +407,7 @@ pub fn climbing_target_prefixes(project: &TsProject, path: &str) -> ClimbingKeys
     keys
 }
 
-/// The keys every non-climbing target of `config` offers for the
+/// The keys every wildcard and exact entry of `config` offers for the
 /// specifiers starting with `fixed` ([`climbing_target_prefixes`]).
 fn offer_family(config: &EffectiveConfig, fixed: &str, keys: &mut ClimbingKeys) {
     for entry in &config.paths {
@@ -411,7 +415,7 @@ fn offer_family(config: &EffectiveConfig, fixed: &str, keys: &mut ClimbingKeys) 
             if entry.pattern.starts_with(fixed) {
                 for target in &entry.targets {
                     if let Some(exact) = paths::inside_or_root(&config.resolve_dir, target) {
-                        push_new(&mut keys.exact, exact);
+                        offer_address(&exact, keys);
                     }
                 }
             }
@@ -425,23 +429,50 @@ fn offer_family(config: &EffectiveConfig, fixed: &str, keys: &mut ClimbingKeys) 
             continue;
         };
         for target in &entry.targets {
-            if Climb::of(&config.resolve_dir, target).is_some() {
-                continue;
-            }
-            let Some((target_head, _)) = target.split_once('*') else {
-                continue;
-            };
-            let text = paths::with_forward_slashes(&format!("{target_head}{rest}"));
-            if paths::is_rooted(&text) {
-                continue;
-            }
-            let normalized = paths::normalize(&paths::join(&config.resolve_dir, &text));
-            if normalized == paths::ROOT || paths::escapes(&normalized) {
-                continue;
-            }
-            let prefix = if text.ends_with('/') { format!("{normalized}/") } else { normalized };
-            push_new(&mut keys.prefixes, prefix);
+            offer_target(config, target, rest, keys);
         }
+    }
+}
+
+/// Stands for one capture segment the family leaves open; never part of a
+/// real path.
+const OPEN_SEGMENT: &str = "\u{1}";
+
+/// The keys wildcard `target` offers for captures `rest` + `y`, over every
+/// `y` of one or more segments: a `y` that survives the target's climb
+/// gives the target prefix in front of it; a `y` the climb consumes (at
+/// most `k` segments for `k` climbs) gives one address, offered exactly.
+fn offer_target(config: &EffectiveConfig, target: &str, rest: &str, keys: &mut ClimbingKeys) {
+    let target = paths::with_forward_slashes(target);
+    let Some((target_head, target_tail)) = target.split_once('*') else {
+        return;
+    };
+    let climbs = Climb::of(&config.resolve_dir, &target).map_or(0, |climb| climb.climbs);
+    for open in 1..=climbs + 1 {
+        let open = vec![OPEN_SEGMENT; open].join("/");
+        let text = format!("{target_head}{rest}{open}{target_tail}");
+        if paths::is_rooted(&text) {
+            continue;
+        }
+        let normalized = paths::normalize(&paths::join(&config.resolve_dir, &text));
+        if normalized != paths::ROOT && paths::escapes(&normalized) {
+            continue;
+        }
+        match normalized.find(OPEN_SEGMENT) {
+            Some(0) => {}
+            Some(at) => push_new(&mut keys.prefixes, normalized[..at].to_string()),
+            None => offer_address(&normalized, keys),
+        }
+    }
+}
+
+/// `address` and every file it may name, as exact keys: an import linked
+/// to one of those files, or waiting at `address`, may move onto the new
+/// path.
+fn offer_address(address: &str, keys: &mut ClimbingKeys) {
+    push_new(&mut keys.exact, address.to_string());
+    for candidate in candidate_paths(address) {
+        push_new(&mut keys.exact, candidate);
     }
 }
 
@@ -459,6 +490,10 @@ struct Climb {
     /// path: the normalized directory (with its `/`, or empty for the root)
     /// and the text before the `*` in its segment.
     head: String,
+    /// The normalized directory of `head`; [`paths::ROOT`] for the root.
+    dir: String,
+    /// `k`, the number of leading `..` segments.
+    climbs: usize,
     /// The normalized remainder after the `..` segments; empty for none.
     rest: String,
 }
@@ -484,13 +519,15 @@ impl Climb {
         } else {
             format!("{dir}/{partial}")
         };
-        Some(Climb { head, rest: segments.join("/") })
+        Some(Climb { head, dir, climbs, rest: segments.join("/") })
     }
 
     /// The capture segments that survive the climb, for a specifier whose
     /// substitution normalizes to `address`: `address` without the
     /// remainder, matched against the head. Empty when the climb consumes
-    /// the whole capture; `None` when no capture reaches `address` that way.
+    /// the whole capture, which lands on the head's directory or one of
+    /// its ancestors at most `k - 1` levels up; `None` when no capture
+    /// reaches `address` that way.
     fn capture_head<'a>(&self, address: &'a str) -> Option<&'a str> {
         let kept = if self.rest.is_empty() {
             address
@@ -499,14 +536,29 @@ impl Climb {
         } else {
             address.strip_suffix(self.rest.as_str())?.strip_suffix('/')?
         };
-        let head_dir = self.head.strip_suffix('/');
-        if kept == paths::ROOT {
-            return self.head.is_empty().then_some("");
-        }
-        if head_dir == Some(kept) {
+        if self.consumes_capture_at(kept) {
             return Some("");
         }
+        if kept == paths::ROOT {
+            return None;
+        }
         kept.strip_prefix(self.head.as_str())
+    }
+
+    /// Whether `kept` is the head's directory or an ancestor of it at most
+    /// `k - 1` levels up.
+    fn consumes_capture_at(&self, kept: &str) -> bool {
+        let mut dir = self.dir.as_str();
+        for _ in 0..self.climbs {
+            if dir == kept {
+                return true;
+            }
+            if dir == paths::ROOT {
+                return false;
+            }
+            dir = dir.rsplit_once('/').map_or(paths::ROOT, |(parent, _)| parent);
+        }
+        false
     }
 }
 
