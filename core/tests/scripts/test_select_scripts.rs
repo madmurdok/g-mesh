@@ -525,15 +525,18 @@ fn git_out(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+/// Gives every git the command runs an explicit identity, so a commit or tag
+/// does not depend on a global git config (CI runners have none).
+fn with_git_identity(command: &mut Command) -> &mut Command {
+    command
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@example.com")
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@example.com")
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = with_git_identity(Command::new("git").arg("-C").arg(dir).args(args))
         .output()
         .expect("failed to run git");
     assert!(output.status.success(), "git {args:?}\n{}", describe(&output));
@@ -880,11 +883,9 @@ exec jq -r "$4" "{fixtures}/$file"
     /// The gate as `main()` calls it, then the tag: `die` exits, so a tag
     /// exists afterwards only when the gate returned.
     fn check_within(&self, timeout_min: u32) -> Output {
-        Command::new("bash")
-            .arg("-c")
-            .arg(
+        with_git_identity(Command::new("bash").arg("-c").arg(
                 r#"source "$1" && REPO_ROOT="$2" && check_release_merge_shape "$3" && wait_for_green_full_ci "$3" main "$4"; git -C "$2" tag -a "v$3" -m release"#,
-            )
+            ))
             .arg("cut-release-test")
             .arg(repo_root().join("scripts/cut-release.sh"))
             .arg(self.dir.path().join("repo"))
