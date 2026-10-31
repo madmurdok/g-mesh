@@ -6,9 +6,9 @@
 # release). The version
 # is typed here exactly once.
 #
-#   scripts/cut-release.sh <version>              # verify, test, tag locally
+#   scripts/cut-release.sh <version>              # verify, wait for green CI, tag locally
 #   scripts/cut-release.sh <version> --push       # ...and push the tag
-#   scripts/cut-release.sh <version> --skip-tests # skip the test runs (all test sections, doctests, and cargo test -p g-mesh)
+#   scripts/cut-release.sh <version> --ci-timeout 120 # wait up to 120 min for a running ci.yml run (default 90, 0 = no wait)
 #
 # This script does NOT bump the version - that already happened as the
 # release branch's first commit. What it does instead is VERIFY that
@@ -72,7 +72,7 @@
 #     below checks is internal agreement: plugin.toml's copy against the
 #     `pluginVersion` const. `TestPluginVersionMatchesTheManifest` in
 #     plugins/go/manifest_test.go tests this too; this script re-checks it by
-#     reading the files, so drift is still caught under --skip-tests and
+#     reading the files, so drift is still caught without a build and
 #     without a Go toolchain on PATH.
 #
 # docs/architecture/plugin-modularity.md ("plugin_version: two rules, not
@@ -90,11 +90,16 @@
 # it takes the explicit --push above; without it, the tag is created locally
 # and the exact command to push it is printed instead.
 #
-# The workspace test sections take 10+ minutes on this machine. Skipping the announcement of
-# that fact makes the wait look like a hang, so this script says what it is
-# doing before it goes quiet. --skip-tests exists for re-running this script
-# after a preflight check fails post-test (e.g. to fix --push without paying
-# for the suite twice) - use it deliberately, not as a default habit.
+# GM-675: this script runs no test suite. The release gate is GitHub CI: a
+# full ci.yml run (every section, doctests and `cargo test -p g-mesh` on the
+# Linux row) that passed on the release branch tip `main` merged, with the
+# merge's tree equal to that tip's tree, so the tested code is the tagged code.
+# A run still in progress is waited for (poll every 60 s, up to --ci-timeout
+# minutes), so the wait is the last step before `git tag` and every cheap check
+# fails first. The batch-end step dispatches that run
+# (`gh workflow run ci.yml --ref release-<v>`); this script only reads it.
+# The gh calls go through $GH (default `gh`, as scripts/ci-green-for-commit.sh) so tests can inject a
+# fake; CUT_RELEASE_CI_POLL_SECS overrides the 60 s poll interval.
 #
 # GM-302: the workspace-wide test run is GM-288's deliberate choice, but a
 # workspace is not the configuration that ships. `build-targets.sh` builds
@@ -138,7 +143,8 @@
 # diverge from what the workspace-wide test run exercises; `check_core_feature_
 # isolation` below is the standing check that this stays true, since nothing
 # about resolver v2's host/target separation is guaranteed by this script,
-# only observed. `cargo test -p g-mesh` further down is the general backstop
+# only observed. `cargo test -p g-mesh` in ci.yml's Linux row (full runs, which
+# this script's CI gate requires) is the general backstop
 # underneath that specific check: it actually builds and runs core's own
 # suite in the exact scope that ships, so a divergence of any kind - this
 # one, or one a future dependency introduces that this narrow check does not
@@ -196,18 +202,17 @@
 #   - core's own normal dependency graph reaching serde_json's
 #     `preserve_order` feature (GM-302) - see that comment above for why this
 #     is checked directly instead of trusted to stay absent
-#   - the test sections' coverage check or any test section failing
-#     (`scripts/test-sections.sh`), OR `cargo test -p g-mesh` failing
-#     (GM-302 added the second one; GM-288's comment on the first explains why
-#     both run rather than either replacing the other)
+#   - the test sections' coverage check failing (`scripts/test-sections.sh check`)
+#   - `main` not being a `merge: release-<v> into main` merge whose tree equals
+#     its release-side parent's tree, or origin/release-<v> not being that parent
+#   - no green full ci.yml run on that parent (GM-675): none at all, only
+#     partial runs, only failed/cancelled ones, or one still running when
+#     --ci-timeout expires
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-# shellcheck source=scripts/lib/plugin-bins.sh
-. "$REPO_ROOT/scripts/lib/plugin-bins.sh"
 
 die() {
 	echo "cut-release: $*" >&2
@@ -220,11 +225,12 @@ log() {
 
 usage() {
 	cat <<'EOF'
-usage: scripts/cut-release.sh <version> [--push] [--skip-tests]
+usage: scripts/cut-release.sh <version> [--push] [--ci-timeout <minutes>]
 
   <version>      the release version, X.Y.Z, matching core/Cargo.toml
   --push         also push the tag (starts the build/publish workflow)
-  --skip-tests   skip the test runs (all test sections, doctests, and cargo test -p g-mesh) before tagging
+  --ci-timeout   minutes to wait for a running ci.yml run on the release tip
+                 (default 90; 0 = do not wait)
 EOF
 }
 
@@ -447,7 +453,7 @@ plugin_changed_since() {
 # For each plugin in CRATE_BACKED_PLUGINS, refuses if
 #   (a) its plugin.toml `plugin_version` differs from its Cargo.toml
 #       `[package] version` (checked even without a previous tag, and under
-#       --skip-tests), or, against the previous release tag
+#       an offline check), or, against the previous release tag
 #       (`previous_release_tag "$1"`):
 #   (b) its version is lower than at that tag, or
 #   (c) it changed since that tag (`plugin_changed_since`) and its version
@@ -654,23 +660,15 @@ origin_slug() {
 	printf '%s\n' "$url"
 }
 
-# GM-391: the release-side parent of `merge: release-<version> into main` must
-# be the tip of `origin/release-<version>` and must have a successful ci.yml
-# run for that exact commit. `ci.yml` has triggered on `release-*` pushes since
-# d508f09, but release-3.8.0 through 3.10.1 were never pushed, so that trigger
-# never saw them - and 3.5.0/3.6.0 were pushed, went red, and shipped anyway.
-# Any successful full run on the SHA counts (a push run, or a workflow_dispatch
-# re-run of the same commit); a red run followed by a green one on the same
-# SHA is a flake someone re-ran, not an untested commit.
+# GM-391 / GM-675: the release-side parent of `merge: release-<version> into
+# main` (T = M^2) must be the tip of `origin/release-<version>`, and M's tree
+# must equal T's tree (main has nothing the release branch lacks), so a green
+# CI run on T tested exactly the code the tag will carry. Cheap, no network but
+# one ls-remote; split from the wait so every cheap check can fail first.
 #
 # `merge_rev` defaults to `main`; it is a parameter so this can be checked
 # against an earlier release's merge commit by sourcing this file.
-#
-# The name of ci.yml's `full-suite` job. Must stay equal to ci.yml's job name
-# and to CI_FULL_SUITE_JOB in scripts/ci-green-for-commit.sh (GM-613), which
-# asks release.yml's question with the same query.
-CI_FULL_SUITE_JOB="Full test suite ran"
-check_release_branch_ci_passed() {
+check_release_merge_shape() {
 	local version="$1" merge_rev="${2:-main}"
 	local branch="release-$version"
 
@@ -690,49 +688,146 @@ check_release_branch_ci_passed() {
 	remote_tip="$(git -C "$REPO_ROOT" ls-remote origin "refs/heads/$branch" | cut -f1)" ||
 		die "could not list $branch on origin - check network/remote access and try again"
 	[ -n "$remote_tip" ] ||
-		die "$branch was never pushed, so ci.yml never ran on it - push it ('git push origin $branch'), wait for a green run (https://github.com/$slug/actions?query=branch%3A$branch), then re-run this"
+		die "$branch was never pushed, so ci.yml never ran on it - push it ('git push origin $branch'), run 'gh workflow run ci.yml --ref $branch', wait for a green run (https://github.com/$slug/actions?query=branch%3A$branch), then re-run this"
 	[ "$remote_tip" = "$tip" ] ||
 		die "origin/$branch is at ${remote_tip:0:7}, but main merged ${tip:0:7} - main does not contain what was pushed and tested; reconcile the two before tagging"
 
-	command -v gh >/dev/null 2>&1 ||
-		die "gh (GitHub CLI) not found - it is needed to confirm ci.yml passed on $branch at ${tip:0:7}"
+	local merge_tree tip_tree
+	merge_tree="$(git -C "$REPO_ROOT" rev-parse "$merge_rev^{tree}")"
+	tip_tree="$(git -C "$REPO_ROOT" rev-parse "$tip^{tree}")"
+	[ "$merge_tree" = "$tip_tree" ] ||
+		die "main has commits that are not on $branch (the tree of $merge_rev differs from the tree of ${tip:0:7}) - merge main into $branch, push, let CI pass, merge again"
+}
 
-	local green
-	green="$(gh api "repos/$slug/actions/workflows/ci.yml/runs?head_sha=$tip&per_page=100" \
-		--jq '[.workflow_runs[] | select(.conclusion == "success") | .id] | join(" ")')" ||
-		die "could not query ci.yml runs for ${tip:0:7} (is 'gh auth status' logged in?)"
-	[ -n "$green" ] ||
-		die "no successful ci.yml run for $branch at ${tip:0:7} - fix it on $branch and push, or re-run a flaky job (https://github.com/$slug/actions?query=branch%3A$branch); main has not been verified by CI"
+# The name of ci.yml's `full-suite` job. Must stay equal to ci.yml's job name
+# and to CI_FULL_SUITE_JOB in scripts/ci-green-for-commit.sh (GM-613), which
+# asks release.yml's question with the same query.
+CI_FULL_SUITE_JOB="Full test suite ran"
 
-	# A push to release-* runs only the test sections its paths select, so a
-	# green run is not enough: one of them must be full. ci.yml's job named
-	# "$CI_FULL_SUITE_JOB" succeeds only on a run where every section ran on
-	# every platform and passed.
-	local run_id full_run="" full
-	for run_id in $green; do
-		full="$(gh api "repos/$slug/actions/runs/$run_id/jobs?per_page=100" \
-			--jq "[.jobs[] | select(.name == \"$CI_FULL_SUITE_JOB\" and .conclusion == \"success\")] | length")" ||
-			die "could not query the jobs of ci.yml run $run_id (is 'gh auth status' logged in?)"
-		if [ "$full" -gt 0 ]; then
-			full_run="$run_id"
-			break
+# GM-675: the single place cut-release calls GitHub. $GH replaces
+# the `gh` binary (tests point it at a fake; a fake `gh` on PATH works too).
+cut_release_gh() {
+	"${GH:-gh}" "$@"
+}
+
+# One query of ci.yml's runs for T, with a retry: prints one line per run,
+# "<id> <status> <conclusion|none> <attempt>", filtered by head_sha. Three
+# consecutive failures die; an error never counts as green.
+ci_runs_for_sha() {
+	local slug="$1" sha="$2" out="" try
+	for try in 1 2 3; do
+		if out="$(cut_release_gh api "repos/$slug/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=100" \
+			--jq ".workflow_runs[] | select(.head_sha == \"$sha\") | \"\(.id) \(.status) \(.conclusion // \"none\") \(.run_attempt)\"")"; then
+			printf '%s\n' "$out"
+			return 0
 		fi
+		[ "$try" -eq 3 ] || sleep "${CUT_RELEASE_CI_POLL_SECS:-60}"
 	done
-	[ -n "$full_run" ] ||
-		die "ci.yml passed on $branch at ${tip:0:7}, but only as a partial run (test sections selected by changed paths) - run every section: 'gh workflow run ci.yml --ref $branch', wait for it to pass (https://github.com/$slug/actions/workflows/ci.yml?query=branch%3A$branch), then re-run this"
+	die "could not query ci.yml runs for ${sha:0:7} after 3 attempts (is 'gh auth status' logged in?)"
+}
 
-	log "$branch at ${tip:0:7} is on origin and passed a full ci.yml run ($full_run)"
+# 1 if run $2's latest attempt has a successful "$CI_FULL_SUITE_JOB" job.
+ci_run_has_full_suite() {
+	local slug="$1" run_id="$2" n="" try
+	for try in 1 2 3; do
+		if n="$(cut_release_gh api "repos/$slug/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
+			--jq "[.jobs[] | select(.name == \"$CI_FULL_SUITE_JOB\" and .conclusion == \"success\")] | length")"; then
+			[ "$n" -gt 0 ] && echo 1 || echo 0
+			return 0
+		fi
+		[ "$try" -eq 3 ] || sleep "${CUT_RELEASE_CI_POLL_SECS:-60}"
+	done
+	die "could not query the jobs of ci.yml run $run_id after 3 attempts (is 'gh auth status' logged in?)"
+}
+
+# GM-675: wait for a green full ci.yml run on T = merge_rev^2, then return.
+# States, in this order: green (a completed/success run whose full-suite job
+# succeeded: return), running (any run not completed: poll again), partial
+# (green runs without the full-suite job: die, dispatch hint), failed (only
+# completed non-success runs: die naming them), missing (no run: die).
+# A green full run wins over any other run on the same SHA (a red run followed
+# by a green one is a flake someone re-ran).
+wait_for_green_full_ci() {
+	local version="$1" merge_rev="${2:-main}" timeout_min="${3:-90}"
+	local branch="release-$version" poll="${CUT_RELEASE_CI_POLL_SECS:-60}"
+
+	command -v "${GH:-gh}" >/dev/null 2>&1 ||
+		die "gh (GitHub CLI) not found - it is needed to confirm ci.yml passed on $branch"
+
+	local tip slug
+	tip="$(git -C "$REPO_ROOT" rev-parse "$merge_rev^2")"
+	slug="$(origin_slug)" || die "could not read the origin remote's GitHub owner/repo"
+
+	local start now elapsed_min
+	start="$(date +%s)"
+	while :; do
+		local runs id status conclusion attempt
+		runs="$(ci_runs_for_sha "$slug" "$tip")" || exit 1
+
+		local running_id="" running_desc="" partial=0 failed_desc="" any=0 cancelled=0
+		while read -r id status conclusion attempt; do
+			[ -n "$id" ] || continue
+			any=1
+			if [ "$status" != "completed" ]; then
+				[ -n "$running_id" ] || {
+					running_id="$id"
+					running_desc="$status, attempt $attempt"
+				}
+			elif [ "$conclusion" = "success" ]; then
+				local full
+				full="$(ci_run_has_full_suite "$slug" "$id")" || exit 1
+				if [ "$full" = "1" ]; then
+					log "$branch at ${tip:0:7} is on origin and passed a full ci.yml run ($id)"
+					return 0
+				fi
+				partial=1
+			else
+				[ "$conclusion" != "cancelled" ] || cancelled=1
+				failed_desc="$failed_desc
+  run $id: $conclusion (attempt $attempt) https://github.com/$slug/actions/runs/$id"
+			fi
+		done <<<"$runs"
+
+		now="$(date +%s)"
+		elapsed_min=$(((now - start) / 60))
+		if [ -n "$running_id" ]; then
+			if [ "$elapsed_min" -ge "$timeout_min" ]; then
+				die "ci.yml run $running_id for $branch at ${tip:0:7} is still running after ${timeout_min}m (https://github.com/$slug/actions/runs/$running_id) - nothing was tagged; re-run this to keep waiting (--ci-timeout)"
+			fi
+			log "waiting for ci.yml run $running_id ($running_desc), ${elapsed_min}m of ${timeout_min}m"
+			sleep "$poll"
+			continue
+		fi
+		if [ "$partial" -eq 1 ]; then
+			die "ci.yml passed on $branch at ${tip:0:7}, but only as a partial run (test sections selected by changed paths) - run every section: 'gh workflow run ci.yml --ref $branch', wait for it to pass (https://github.com/$slug/actions/workflows/ci.yml?query=branch%3A$branch), then re-run this"
+		fi
+		if [ -n "$failed_desc" ]; then
+			local note=""
+			[ "$cancelled" -eq 0 ] || note="
+a newer push to $branch cancels a running run (ci.yml concurrency)"
+			die "no green full ci.yml run for $branch at ${tip:0:7}; failed runs:$failed_desc$note
+fix it on $branch and push, or re-run the failed run, then re-run this"
+		fi
+		[ "$any" -eq 1 ] ||
+			die "no ci.yml run for $branch at ${tip:0:7} - push it ('git push origin $branch'), run 'gh workflow run ci.yml --ref $branch', wait for a green run (https://github.com/$slug/actions?query=branch%3A$branch), then re-run this; main has not been verified by CI"
+	done
 }
 
 main() {
-	local version="" push=0 skip_tests=0
+	local version="" push=0 ci_timeout=90
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--push)
 			push=1
 			;;
 		--skip-tests)
-			skip_tests=1
+			die "--skip-tests is gone (GM-675): cut-release runs no test suite; CI on release-<v> is the gate"
+			;;
+		--ci-timeout)
+			[ $# -ge 2 ] || die "--ci-timeout needs a number of minutes"
+			ci_timeout="$2"
+			[[ "$ci_timeout" =~ ^[0-9]+$ ]] || die "--ci-timeout takes whole minutes, got '$ci_timeout'"
+			shift
 			;;
 		-h | --help)
 			usage
@@ -795,9 +890,10 @@ main() {
 	# tagging it - see the GM-374 header comment and the function itself.
 	check_no_untagged_prior_releases
 
-	# GM-391: the release branch must have been pushed and passed CI before
-	# it was merged - see the function's own comment.
-	check_release_branch_ci_passed "$version"
+	# GM-391/GM-675: the release branch must have been pushed, and main's merge
+	# must carry exactly its tree - see the function's own comment. The wait for
+	# CI itself is the last step before tagging.
+	check_release_merge_shape "$version"
 
 	# The exact check .github/workflows/release.yml's "Check the tag matches
 	# the crate version" step runs, so a mismatch is caught here instead of
@@ -823,68 +919,15 @@ main() {
 	# the function's own for the full investigation.
 	check_core_feature_isolation
 
-	if [ "$skip_tests" -eq 1 ]; then
-		log "skipping the test runs (--skip-tests)"
-	else
-		# Every workspace member's tests run, not core's alone: every one of
-		# them ships inside the release archive. The sections partition the
-		# suite (`check`), so `run all` is the whole suite; it stops at the
-		# first failing section (docs/adr/0030-test-sections.md).
-		# GM-628: the plugins' vtsls/pyright from their node_modules, as CI
-		# and scripts/test-local.sh have them, not whatever is global.
-		plugin_bins_on_path "$REPO_ROOT" 1
-		log "checking that the test sections cover the whole suite"
-		"$REPO_ROOT/scripts/test-sections.sh" check ||
-			die "scripts/test-sections.sh check failed - a test is in no section or in two; fix the filtersets before cutting a release"
-		log "running every test section - this takes 10+ minutes on this machine, not hung, just slow"
-		local test_start test_end
-		test_start="$(date +%s)"
-		"$REPO_ROOT/scripts/test-sections.sh" run all ||
-			die "a test section failed - fix the failure before cutting a release"
-		test_end="$(date +%s)"
-		log "every test section passed in $((test_end - test_start))s"
+	# The sections partition the suite (`check`): a test in no section or in two
+	# would be a hole in what CI runs. It builds the test binaries (a few
+	# minutes), needs no plugin node_modules.
+	log "checking that the test sections cover the whole suite"
+	"$REPO_ROOT/scripts/test-sections.sh" check ||
+		die "scripts/test-sections.sh check failed - a test is in no section or in two; fix the filtersets before cutting a release"
 
-		# nextest does not run doctests, so the sections above never compile
-		# them; this is the run that does.
-		log "running the workspace doctests"
-		(cd "$REPO_ROOT" && cargo test --doc --workspace) ||
-			die "cargo test --doc --workspace failed - fix the doctest before cutting a release"
-
-		# GM-302: the workspace-wide sections above are deliberate (the comment
-		# on them, just above, explains why) and stay - this is IN ADDITION, not a
-		# replacement. `check_core_feature_isolation` already confirmed core's
-		# own linked serde_json is the same in both configurations today, but
-		# that confirmation is a property of this repository's CURRENT
-		# dependency graph, not a standing guarantee the way a type system
-		# would give - a future dependency change could shift it without that
-		# narrow check anticipating the new shape. This run is the general
-		# backstop underneath it: it actually builds and tests core in the
-		# exact package scope `build-targets.sh` ships (`cd core && cargo
-		# build`, no `-p`, which is what `-p g-mesh` from the workspace root
-		# resolves the same way - both exclude plugins/rust and
-		# plugins/python from the graph entirely), so ANY divergence between
-		# what ships and what the sections above just tested - this one, or
-		# a different one neither check above was written for - has to fail
-		# a real test to reach a release.
-		#
-		# Three runs, the same `-p g-mesh` scope. Core's integration tests
-		# are two binaries (`it`, `scripts`, GM-623), and most of their tests
-		# spawn a real detached daemon and a Node plugin; at libtest's default
-		# width (num-cpus threads in one process) they can fail from
-		# contention, as nextest's first unconfigured run did
-		# (.config/nextest.toml). So they run two at a time, the width of
-		# nextest's `daemon-spawning` group; the cheap unit tests and the
-		# doctests keep the full width.
-		log "running cargo test -p g-mesh - the exact package scope build-targets.sh ships (GM-302)"
-		test_start="$(date +%s)"
-		(cd "$REPO_ROOT" &&
-			cargo test -p g-mesh --lib --bins &&
-			cargo test -p g-mesh --doc &&
-			cargo test -p g-mesh --test it --test scripts -- --test-threads=2) ||
-			die "cargo test -p g-mesh failed - the shipped configuration itself is broken, even though the workspace test sections passed; fix it before cutting a release (see GM-302)"
-		test_end="$(date +%s)"
-		log "cargo test -p g-mesh passed in $((test_end - test_start))s"
-	fi
+	# GM-675: the suite itself ran on GitHub CI (see the header comment).
+	wait_for_green_full_ci "$version" main "$ci_timeout"
 
 	log "tagging $tag on $(git -C "$REPO_ROOT" rev-parse --short main)"
 	git -C "$REPO_ROOT" tag -a "$tag" -m "g-mesh $tag" ||

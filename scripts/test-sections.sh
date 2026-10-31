@@ -14,7 +14,7 @@
 #
 # Invariants:
 # - The sections partition the suite: every test, ignored ones included, is in
-#   exactly one section. `check` proves it; CI and the release gate run it.
+#   exactly one section. `check` proves it; CI and `cut-release.sh` run it.
 # - `core-rest` is the complement of the other core lib sections, so a new
 #   top-level core module lands in it without an edit here.
 # - `core-it` is the complement of `core-scripts` within core's `kind(test)`,

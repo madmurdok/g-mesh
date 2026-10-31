@@ -24,7 +24,8 @@ CI must keep running everything exactly as before.
 ## Decision
 - **One local entry point, `scripts/test-local.sh`.** A verify slice runs
   `scripts/test-local.sh --base <release-branch>`; the batch-end slice runs
-  `scripts/test-local.sh --full`. CI does not call it.
+  `scripts/test-local.sh --full` (GM-675: no longer, see the amendment below).
+  CI does not call it.
 - **The Go plugin's suite is a separate step** (`go test ./...` in
   `plugins/go`, CI's Go job's test command; its `go vet` and `gofmt`
   checks are not run locally; GM-573). It is not a nextest section,
@@ -51,7 +52,7 @@ CI must keep running everything exactly as before.
   spawn-timing test.
 - **Heavy tests are skipped by a `local` nextest profile only** (Q4). Its
   `default-filter` excludes one exact `(binary_id, name)` term per heavy test.
-  `default` and `ci` are untouched, so CI, the release gate and
+  `default` and `ci` are untouched, so CI (the batch-end and release-gate runs), and
   `test-sections.sh check` run and count them as before. The list is static
   and reviewable in git. `--full` runs the same two parts over every section
   under `ci` with `--keep-going` (GM-556; before, `test-sections.sh run
@@ -113,7 +114,24 @@ that forgets it runs anyway); a nextest in-process mode (nextest has none);
 needs a second copy of the heavy list); a heavy list generated from the last
 run's JUnit (not reviewable, depends on another run's file).
 
+### Amendment (GM-675, 2026-10-31)
+
+The batch-end slice no longer runs `test-local.sh --full`. It pushes
+`release-<v>` and dispatches ci.yml on it (`gh workflow run ci.yml --ref
+release-<v>`), and `scripts/cut-release.sh` runs no suite: it waits for a
+green full ci.yml run on the release tip `main` merged (same tree) and tags.
+Why: for 4.20.0 the local release run took 5719 s (`run all`) plus 994 s
+(doctests, `-p g-mesh`), against 27-35 min on CI runners that are not the
+loaded developer machine. What the old local run covered and CI did not, the
+workspace doctests and `cargo test -p g-mesh`, now runs in CI's Linux row on
+full runs. The heavy-list report reads the aarch64-apple-darwin JUnit of that
+run; `test-local.sh --full` remains for a manual run.
+
 ## Consequences
+- The heavy list is now grown from CI timings, which are shorter than local
+  ones under load, so fewer tests will be added. A test that fails only on the
+  loaded local machine is no longer caught at batch end; it surfaces in some
+  later per-task verify, or not at all (GM-675).
 - A local run skips the heavy tests and 6 of 8 (sequence) and 2 of 4 (batch)
   containers seeds. A defect only they catch shows up at batch end, not in
   verify.
@@ -128,5 +146,5 @@ run's JUnit (not reviewable, depends on another run's file).
   quiet machine understates times that are 2-5x longer under the usual load,
   so a single light run is not enough to send a test back to every verify.
 - A `cli`/`mcp` change that breaks another module's lib tests is not caught
-  by the local verify run; CI (which does not narrow), `--full` at batch end
-  and the release gate's full run catch it.
+  by the local verify run; CI (which does not narrow) catches it: the
+  batch-end full run and the release gate's.

@@ -70,22 +70,32 @@ The suite runs as named sections (`scripts/test-sections.sh`,
   scripts/test-local.sh --base <release-branch>
   ```
 
-- **Batch end:** every section, heavy tests included, per process, plus a
-  report of tests whose time crossed 10s against the heavy list. Its failures
-  and report lines become tasks in the batch.
+- **Batch end:** push the release branch and run the full CI on its tip
+  (GM-675); its failures become tasks in the batch.
 
   ```
-  scripts/test-local.sh --full
+  git push origin release-<v>
+  gh workflow run ci.yml --ref release-<v>   # a push after the first is partial; a dispatch is full
+  gh run watch <run id> --exit-status        # one background wait, no polling
   ```
 
-- **CI** is unchanged: `scripts/test-sections.sh run` per section under
-  `--profile ci`.
+  Every section on four platforms, heavy tests included, plus the workspace
+  doctests and `cargo test -p g-mesh` on Linux. The heavy-list report reads
+  that run's JUnit: `gh run download <run id> -n junit-aarch64-apple-darwin
+  -D <dir>`, then `scripts/test-heavy-report.py .config/nextest.toml
+  <dir>/*.xml`. `scripts/test-local.sh --full` stays available to run by hand.
+
+- **Release gate:** `scripts/cut-release.sh` runs no suite. It tags only when
+  ci.yml passed a full run on the release branch tip that `main` merged (same
+  tree), waiting for a run still in progress (`--ci-timeout`, default 90 min).
+
+- **CI** runs `scripts/test-sections.sh run` per section under `--profile ci`.
 
 `test-select.sh` prints `full`, `none` or section names (with `--narrow`,
 also `core-spawns-<plugin>`: the core tests that start that plugin, from
 `scripts/test-plugin-spawns.txt`), and counts uncommitted and untracked
 files too. Any path it has no rule for selects
-`full`. The release gate (`scripts/cut-release.sh`) always runs every section.
+`full`. A full CI run (batch end, release gate) always runs every section.
 
 Core's integration tests are two binaries (GM-623): `core/tests/scripts/`
 for a test whose subject is a file under `scripts/`, `core/tests/it/` for

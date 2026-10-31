@@ -60,7 +60,7 @@ slow-timeout = { period = "30s", terminate-after = 7 }
 # plugin, and the first unconfigured run failed 23 tests that passed under
 # `cargo test` (then one binary per file, run one at a time) - contention
 # reported as failure. `cargo test` now runs all of core's `it` binary in one
-# process, so `scripts/cut-release.sh` and README.md cap it at the same width
+# process, so ci.yml's `cargo test -p g-mesh` step and README.md cap it at the same width
 # (`--test-threads=2`). `kind(test)` is exactly the core and plugin integration-test
 # binaries (core's are `g-mesh::it` and `g-mesh::scripts`), as against
 # `kind(lib)`'s 621 cheap unit tests, which keep the full width.

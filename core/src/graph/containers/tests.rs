@@ -633,7 +633,7 @@ impl Rng {
 const SEED_ENV: &str = "G_MESH_CONTAINERS_SEED";
 /// Runs only the first `n` built-in seeds: `G_MESH_CONTAINERS_SEEDS=2`.
 /// `scripts/test-local.sh` sets it; unset means every seed, which is what CI
-/// and the release gate run (docs/adr/0031-local-test-runs.md).
+/// runs (docs/adr/0031-local-test-runs.md).
 const SEEDS_ENV: &str = "G_MESH_CONTAINERS_SEEDS";
 
 fn seeds(default: &[u64]) -> Vec<u64> {
