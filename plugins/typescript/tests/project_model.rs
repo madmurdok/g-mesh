@@ -729,10 +729,7 @@ fn config_targets_without_backslashes_or_drive_letters_read_as_before() {
     assert_eq!(extends_candidates("a/b/tsconfig.json", "../../base.json"), strings(&["base.json"]));
     assert_eq!(
         extends_candidates("pkg/tsconfig.json", "@tsconfig/node18/tsconfig.json"),
-        strings(&[
-            "pkg/node_modules/@tsconfig/node18/tsconfig.json",
-            "node_modules/@tsconfig/node18/tsconfig.json"
-        ])
+        Vec::<String>::new()
     );
     assert_eq!(extends_candidates("pkg/tsconfig.json", "/abs/base.json"), Vec::<String>::new());
 }
@@ -1972,19 +1969,7 @@ fn extends_candidates_follow_tscs_lookup() {
         extends_candidates("apps/web/tsconfig.json", "../../configs/base.json"),
         strings(&["configs/base.json"])
     );
-    assert_eq!(
-        extends_candidates("apps/web/tsconfig.json", "@tsconfig/node18/tsconfig.json"),
-        strings(&[
-            "apps/web/node_modules/@tsconfig/node18/tsconfig.json",
-            "apps/node_modules/@tsconfig/node18/tsconfig.json",
-            "node_modules/@tsconfig/node18/tsconfig.json",
-        ])
-    );
-    assert_eq!(
-        extends_candidates("tsconfig.json", "@tsconfig/strictest"),
-        strings(&["node_modules/@tsconfig/strictest.json", "node_modules/@tsconfig/strictest/tsconfig.json"])
-    );
-    for entry in ["/etc/base.json", "../outside.json", "", ".hidden"] {
+    for entry in ["/etc/base.json", "../outside.json", "", ".hidden", "@tsconfig/strictest"] {
         assert_eq!(extends_candidates("tsconfig.json", entry), Vec::<String>::new(), "{entry:?}");
     }
 }
@@ -1998,10 +1983,7 @@ fn extends_candidates_read_backslashes_as_separators() {
     assert_eq!(extends_candidates("tsconfig.json", "..\\outside.json"), Vec::<String>::new());
     assert_eq!(
         extends_candidates("pkg/tsconfig.json", "@tsconfig\\node18\\tsconfig.json"),
-        strings(&[
-            "pkg/node_modules/@tsconfig/node18/tsconfig.json",
-            "node_modules/@tsconfig/node18/tsconfig.json"
-        ])
+        Vec::<String>::new()
     );
 }
 

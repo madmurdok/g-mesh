@@ -7,13 +7,14 @@
 //! config to its directory. [`super::TsProject::load`] reads every such
 //! config once and records its effective rules per directory.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use crate::extractor::grammar::EXTENSIONS as SOURCE_EXTENSIONS;
 use crate::project::exports::match_wildcard;
-use crate::project::jsonc::{parse_jsonc, Json};
-use crate::project::paths;
+use crate::project::jsonc::{parse_json, parse_jsonc, Json};
+use crate::project::{paths, EXCLUDE_DIRS};
 
 /// Config file names a directory is searched for, in priority order.
 pub const CONFIG_FILE_NAMES: [&str; 2] = ["tsconfig.json", "jsconfig.json"];
@@ -157,8 +158,8 @@ pub fn specifiers_targeting(config: &EffectiveConfig, address: &str) -> Vec<Stri
     specifiers
 }
 
-/// The config files an `extends` entry written in `config` could name,
-/// project-relative, in the order tsc tries them.
+/// The config files a relative `extends` entry written in `config` could
+/// name, project-relative, in the order tsc tries them.
 ///
 /// A relative entry (`./`, `../`) resolves against the config's directory
 /// and names a file: the path as written, then with `.json` appended unless
@@ -167,12 +168,10 @@ pub fn specifiers_targeting(config: &EffectiveConfig, address: &str) -> Vec<Stri
 /// the parent's sibling `<parent>.json`.
 /// An entry of exactly `.` or `..` is a module name for the config's own or
 /// parent directory and names that directory's `tsconfig.json`; it may be
-/// the project root's. A package-named entry (`@tsconfig/node18`) resolves
-/// under `node_modules` of the config's directory and each ancestor up to
-/// the root: the file itself when it ends in `.json`, else `<name>.json`
-/// or a directory holding a `tsconfig.json`. Candidates outside the
-/// project, and absolute entries (a POSIX root or a drive letter), are
-/// dropped. As in tsc, `\\` is a separator on every host.
+/// the project root's. Candidates outside the project are dropped, and so
+/// is every other entry (a package name, an absolute path, an empty one):
+/// [`TsconfigReader`] resolves those itself. As in tsc, `\\` is a separator
+/// on every host.
 pub fn extends_candidates(config: &str, entry: &str) -> Vec<String> {
     let config_dir = paths::dirname(config);
     let entry = paths::with_forward_slashes(entry);
@@ -185,36 +184,29 @@ pub fn extends_candidates(config: &str, entry: &str) -> Vec<String> {
             })
             .unwrap_or_default();
     }
-    if entry.starts_with("./") || entry.starts_with("../") {
-        let base = paths::normalize(&paths::join(config_dir, entry));
-        if paths::escapes(&base) {
-            return Vec::new();
-        }
-        return if base.ends_with(".json") {
-            vec![base]
-        } else {
-            let with_json = format!("{base}.json");
-            vec![base, with_json]
-        };
-    }
-    if entry.is_empty() || paths::is_rooted(entry) || entry.starts_with('.') {
+    if !is_relative_extends(entry) {
         return Vec::new();
     }
-
-    let mut candidates = Vec::new();
-    for dir in paths::ancestors(config_dir) {
-        let base = paths::normalize(&paths::join(&paths::join(dir, "node_modules"), entry));
-        if paths::escapes(&base) {
-            continue;
-        }
-        if base.ends_with(".json") {
-            candidates.push(base);
-        } else {
-            candidates.push(format!("{base}.json"));
-            candidates.push(format!("{base}/tsconfig.json"));
-        }
+    let base = paths::normalize(&paths::join(config_dir, entry));
+    if paths::escapes(&base) {
+        return Vec::new();
     }
-    candidates
+    file_candidates(&base)
+}
+
+/// Whether a slash-normalized `extends` entry is `./x` or `../x`.
+fn is_relative_extends(entry: &str) -> bool {
+    entry.starts_with("./") || entry.starts_with("../")
+}
+
+/// The files an `extends` path names, in tsc's order: `base` as written,
+/// then `base.json` unless it already ends in `.json`.
+fn file_candidates(base: &str) -> Vec<String> {
+    if base.ends_with(".json") {
+        vec![base.to_string()]
+    } else {
+        vec![base.to_string(), format!("{base}.json")]
+    }
 }
 
 /// The directory a config's own `paths` resolve against: `baseUrl` when it
@@ -255,17 +247,56 @@ fn with_roots_drive(path: &Path, root: &Path) -> PathBuf {
 
 /// Reads configs under one root, each file at most once, and resolves their
 /// `extends` chains. Only [`super::TsProject::load`] uses it.
+///
+/// It also collects the watch paths of those chains
+/// ([`TsconfigReader::into_watch_paths`]): every file an `extends`
+/// resolution looked at, found or not, so that creating, editing or deleting
+/// one reloads the model. Paths under [`EXCLUDE_DIRS`] (a package under
+/// `node_modules`) are left out, so a change there is not seen until the
+/// next reload.
 pub struct TsconfigReader<'a> {
     root: &'a Path,
+    /// `root` with symlinks resolved; `None` when it cannot be.
+    canonical_root: Option<PathBuf>,
     raw: HashMap<String, Option<RawTsconfig>>,
     effective: HashMap<String, Option<Arc<EffectiveConfig>>>,
+    /// package.json files read for `extends`, parsed (`None`: missing or not
+    /// a JSON object).
+    manifests: HashMap<String, Option<Json>>,
+    watch_paths: BTreeSet<String>,
     notes: &'a mut Vec<String>,
 }
+
+/// Why an `extends` entry names no config.
+enum ExtendsMiss {
+    NotFound,
+    OutsideProject,
+}
+
+/// The conditions tsc matches in a package's `exports` when it resolves an
+/// `extends` entry; any other key is skipped.
+const EXTENDS_CONDITIONS: [&str; 4] = ["node", "require", "types", "default"];
 
 impl<'a> TsconfigReader<'a> {
     /// A reader for configs under `root`, appending what it skips to `notes`.
     pub fn new(root: &'a Path, notes: &'a mut Vec<String>) -> Self {
-        Self { root, raw: HashMap::new(), effective: HashMap::new(), notes }
+        Self {
+            root,
+            canonical_root: root.canonicalize().ok(),
+            raw: HashMap::new(),
+            effective: HashMap::new(),
+            manifests: HashMap::new(),
+            watch_paths: BTreeSet::new(),
+            notes,
+        }
+    }
+
+    /// The files the `extends` chains resolved so far depend on,
+    /// project-relative: each path a resolution probed (found or not), and
+    /// the in-project real path of a found target reached through a symlink.
+    /// Never a path under [`EXCLUDE_DIRS`] or a file with a source extension.
+    pub fn into_watch_paths(self) -> BTreeSet<String> {
+        self.watch_paths
     }
 
     /// The config `dir` holds itself (`tsconfig.json` before
@@ -311,13 +342,20 @@ impl<'a> TsconfigReader<'a> {
         in_progress.push(config.to_string());
         let mut inherited = None;
         for entry in &raw.extends {
-            let target = extends_candidates(config, entry)
-                .into_iter()
-                .find(|candidate| config_is_file(self.root, candidate));
-            let Some(target) = target else {
-                self.notes.push(format!("{config}: `extends` target {entry:?} not found, skipped"));
-                continue;
+            let target = match self.resolve_extends(config, entry) {
+                Ok(target) => target,
+                Err(ExtendsMiss::NotFound) => {
+                    self.notes.push(format!("{config}: `extends` target {entry:?} not found, skipped"));
+                    continue;
+                }
+                Err(ExtendsMiss::OutsideProject) => {
+                    self.notes.push(format!(
+                        "{config}: `extends` target {entry:?} is outside the project, skipped"
+                    ));
+                    continue;
+                }
             };
+            self.record_real_path(&target);
             if let Some(contributed) = self.resolve_effective(&target, in_progress) {
                 inherited = Some(contributed);
             }
@@ -361,6 +399,264 @@ impl<'a> TsconfigReader<'a> {
         };
         self.raw.insert(config.to_string(), raw.clone());
         raw
+    }
+}
+
+impl TsconfigReader<'_> {
+    /// The config file `entry`, written in `config`, names, as tsc 5.9
+    /// resolves it:
+    /// - `.`, `..`, `./x`, `../x`: [`extends_candidates`];
+    /// - an absolute path (a POSIX root or a drive letter; a drive-less root
+    ///   takes `root`'s drive): `p`, then `p.json`, when inside the project;
+    /// - anything else is a package name (`.hidden/x` included): the
+    ///   config's own package by name ([`Self::self_name_target`]), then
+    ///   `node_modules` of the config's directory and each ancestor up to the
+    ///   root, nearest first ([`Self::node_modules_target`]).
+    ///
+    /// Every path it probes is recorded as a watch path.
+    fn resolve_extends(&mut self, config: &str, entry: &str) -> Result<String, ExtendsMiss> {
+        let entry = paths::with_forward_slashes(entry);
+        if entry == "." || entry == ".." || is_relative_extends(&entry) {
+            return self.first_file(extends_candidates(config, &entry)).ok_or(ExtendsMiss::NotFound);
+        }
+        if entry.is_empty() {
+            return Err(ExtendsMiss::NotFound);
+        }
+        if paths::is_rooted(&entry) {
+            let base = self.rooted_inside(&entry).ok_or(ExtendsMiss::OutsideProject)?;
+            return self.first_file(file_candidates(&base)).ok_or(ExtendsMiss::NotFound);
+        }
+        self.resolve_package_extends(config, &entry).ok_or(ExtendsMiss::NotFound)
+    }
+
+    /// The absolute `entry` as a project-relative path, or `None` when it
+    /// lies outside the project. `entry` may be spelled against `root` as
+    /// given or against its real path.
+    fn rooted_inside(&self, entry: &str) -> Option<String> {
+        let absolute = with_roots_drive(Path::new(entry), self.root);
+        let relative = absolute
+            .strip_prefix(self.root)
+            .ok()
+            .or_else(|| absolute.strip_prefix(self.canonical_root.as_ref()?).ok())?;
+        let joined = paths::normalize(&relative.to_string_lossy().replace('\\', "/"));
+        (!paths::escapes(&joined)).then_some(joined)
+    }
+
+    /// A package-named `entry` (`@scope/name/rest`, `name/rest`, `name`).
+    fn resolve_package_extends(&mut self, config: &str, entry: &str) -> Option<String> {
+        let (name, rest) = split_package_entry(entry)?;
+        let ancestors: Vec<String> = paths::ancestors(paths::dirname(config)).map(str::to_string).collect();
+        if let Some(found) = self.self_name_target(&ancestors, name, rest) {
+            return Some(found);
+        }
+        ancestors.iter().find_map(|dir| self.node_modules_target(dir, name, rest))
+    }
+
+    /// `rest` of the config's own package when the nearest package.json at
+    /// or above the config (`ancestors`, nearest first) is named `name` and
+    /// declares `exports`. Only that nearest package.json counts.
+    fn self_name_target(&mut self, ancestors: &[String], name: &str, rest: &str) -> Option<String> {
+        for dir in ancestors {
+            let manifest_path = paths::join(dir, "package.json");
+            if !self.probe(&manifest_path) {
+                continue;
+            }
+            let manifest = self.manifest(&manifest_path)?;
+            if manifest.get("name").and_then(Json::as_str) != Some(name) {
+                return None;
+            }
+            let exports = manifest.get("exports").filter(|exports| **exports != Json::Null)?;
+            return self.config_exports_target(dir, exports, &exports_subpath(rest));
+        }
+        None
+    }
+
+    /// `name`/`rest` under `dir/node_modules`. A package.json with `exports`
+    /// decides alone. Otherwise the bare name is `<name>.json`, then the
+    /// package directory ([`Self::package_dir_target`]); a subpath is
+    /// `rest.json` (or `rest` when it ends in `.json`), then the directory
+    /// `rest`.
+    fn node_modules_target(&mut self, dir: &str, name: &str, rest: &str) -> Option<String> {
+        let modules = paths::join(dir, "node_modules");
+        let package = paths::normalize(&paths::join(&modules, name));
+        if paths::escapes(&package) {
+            return None;
+        }
+        let manifest = self.manifest(&paths::join(&package, "package.json"));
+        if let Some(exports) = manifest.as_ref().and_then(|m| m.get("exports")).filter(|e| **e != Json::Null)
+        {
+            return self.config_exports_target(&package, exports, &exports_subpath(rest));
+        }
+        if rest.is_empty() {
+            let file = format!("{package}.json");
+            return if self.probe(&file) { Some(file) } else { self.package_dir_target(&package) };
+        }
+        let sub = paths::normalize(&paths::join(&package, rest));
+        if paths::escapes(&sub) {
+            return None;
+        }
+        let file = if sub.ends_with(".json") { sub.clone() } else { format!("{sub}.json") };
+        if self.probe(&file) {
+            return Some(file);
+        }
+        self.package_dir_target(&sub)
+    }
+
+    /// The config a package directory names: its package.json `tsconfig`
+    /// field `f` (the file `f`, then `f.json`, then `f/tsconfig.json`), else,
+    /// also when that names nothing, the directory's `tsconfig.json`.
+    fn package_dir_target(&mut self, dir: &str) -> Option<String> {
+        let manifest = self.manifest(&paths::join(dir, "package.json"));
+        let field = manifest.as_ref().and_then(|m| m.get("tsconfig")).and_then(Json::as_str);
+        if let Some(base) = field.and_then(|field| paths::inside(dir, field)) {
+            let mut candidates = file_candidates(&base);
+            candidates.push(paths::join(&base, "tsconfig.json"));
+            if let Some(found) = self.first_file(candidates) {
+                return Some(found);
+            }
+        }
+        let fallback = paths::join(dir, "tsconfig.json");
+        self.probe(&fallback).then_some(fallback)
+    }
+
+    /// The file a package's `exports` maps `subpath` (`.` or `./rest`) to:
+    /// the exact key, else the wildcard key with the longest prefix before
+    /// its `*`. A subpath it does not export names nothing; there is no
+    /// fallback inside that package.
+    fn config_exports_target(&mut self, package: &str, exports: &Json, subpath: &str) -> Option<String> {
+        let entries = match exports {
+            Json::Object(entries) if entries.iter().any(|(key, _)| key == "." || key.starts_with("./")) => {
+                entries
+            }
+            _ if subpath == "." => return self.exports_value_target(package, exports, None),
+            _ => return None,
+        };
+        if let Some(exact) = exports.get(subpath) {
+            return self.exports_value_target(package, exact, None);
+        }
+        let mut best: Option<(usize, &Json, &str)> = None;
+        for (key, value) in entries {
+            let Some(capture) = match_wildcard(key, subpath) else { continue };
+            let prefix = key.find('*').unwrap_or(0);
+            if best.is_none_or(|(longest, _, _)| prefix > longest) {
+                best = Some((prefix, value, capture));
+            }
+        }
+        let (_, value, capture) = best?;
+        self.exports_value_target(package, value, Some(capture))
+    }
+
+    /// One `exports` value: a `./` string is the exact file (with `*` taken
+    /// by `capture`) when it exists; an array is its first element that
+    /// resolves; an object is its first key among [`EXTENDS_CONDITIONS`], in
+    /// declaration order.
+    fn exports_value_target(&mut self, package: &str, value: &Json, capture: Option<&str>) -> Option<String> {
+        match value {
+            Json::String(target) => {
+                let target = paths::with_forward_slashes(target);
+                if !target.starts_with("./") {
+                    return None;
+                }
+                let target = match capture {
+                    Some(capture) => target.replace('*', capture),
+                    None => target,
+                };
+                let path = paths::inside(package, &target)?;
+                self.probe(&path).then_some(path)
+            }
+            Json::Array(items) => {
+                items.iter().find_map(|item| self.exports_value_target(package, item, capture))
+            }
+            Json::Object(entries) => {
+                let (_, chosen) =
+                    entries.iter().find(|(key, _)| EXTENDS_CONDITIONS.contains(&key.as_str()))?;
+                self.exports_value_target(package, chosen, capture)
+            }
+            _ => None,
+        }
+    }
+
+    /// The first of `candidates` that is a file, probing each in order.
+    fn first_file(&mut self, candidates: Vec<String>) -> Option<String> {
+        candidates.into_iter().find(|candidate| self.probe(candidate))
+    }
+
+    /// Whether `path` is a file; records it as a watch path either way.
+    fn probe(&mut self, path: &str) -> bool {
+        self.record(path);
+        config_is_file(self.root, path)
+    }
+
+    /// The package.json at `path`, read once and recorded as a watch path.
+    fn manifest(&mut self, path: &str) -> Option<Json> {
+        if let Some(cached) = self.manifests.get(path) {
+            return cached.clone();
+        }
+        self.record(path);
+        let manifest = std::fs::read_to_string(self.root.join(path))
+            .ok()
+            .and_then(|text| parse_json(&text))
+            .filter(|manifest| manifest.as_object().is_some());
+        self.manifests.insert(path.to_string(), manifest.clone());
+        manifest
+    }
+
+    /// Records the in-project real path of `target` when a symlink makes it
+    /// differ, so a save through the real path is seen too.
+    fn record_real_path(&mut self, target: &str) {
+        let Some(canonical_root) = &self.canonical_root else { return };
+        let Ok(real) = self.root.join(target).canonicalize() else { return };
+        let Ok(relative) = real.strip_prefix(canonical_root) else { return };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative != target {
+            self.record(&relative);
+        }
+    }
+
+    /// Adds `path` to the watch paths unless the core contract forbids it:
+    /// outside the project, under [`EXCLUDE_DIRS`], or a source file.
+    fn record(&mut self, path: &str) {
+        let normalized = paths::normalize(path);
+        if paths::escapes(&normalized) || normalized != path {
+            return;
+        }
+        let excluded = path.split('/').rev().skip(1).any(|segment| EXCLUDE_DIRS.contains(&segment));
+        let source = paths::basename(path).rsplit_once('.').is_some_and(|(_, ext)| {
+            SOURCE_EXTENSIONS.iter().any(|known| known.strip_prefix('.') == Some(ext))
+        });
+        if !excluded && !source {
+            self.watch_paths.insert(path.to_string());
+        }
+    }
+}
+
+/// `name`/`rest` of a package-named `extends` entry (`@scope/name` takes two
+/// segments), or `None` with an empty segment.
+fn split_package_entry(entry: &str) -> Option<(&str, &str)> {
+    let name_segments = if entry.starts_with('@') { 2 } else { 1 };
+    let mut split = entry.len();
+    let mut seen = 0;
+    for (index, char) in entry.char_indices() {
+        if char == '/' {
+            seen += 1;
+            if seen == name_segments {
+                split = index;
+                break;
+            }
+        }
+    }
+    let (name, rest) = (&entry[..split], entry[split..].strip_prefix('/').unwrap_or(""));
+    let segments_ok = |text: &str| text.split('/').all(|segment| !segment.is_empty());
+    (segments_ok(name) && name.split('/').count() == name_segments && (rest.is_empty() || segments_ok(rest)))
+        .then_some((name, rest))
+}
+
+/// The `exports` key a package subpath is looked up under.
+fn exports_subpath(rest: &str) -> String {
+    if rest.is_empty() {
+        ".".to_string()
+    } else {
+        format!("./{rest}")
     }
 }
 
