@@ -315,3 +315,254 @@ One control per behaviour, run by the verify slice in a throwaway worktree.
   the layout and gets a test) vs `~/.claude/hooks/` (no repo churn, untested).
 - D4 Core sub-areas (`core-it` split to cut the scripts binary, ~15% of a core
   diff): a follow-up task (recommended) vs inside GM-671 (a CI partition change).
+
+## 11. Addendum (S6): core sub-areas
+
+Owner decisions on this addendum: D4 "Внутри GM-671"; D5 "Настоящее разделение
+секции core-it"; D6 "Да, в GM-671 (Recommended)"; D7 "Чиним здесь (Recommended)".
+This section supersedes 2.4 and D4's recommendation.
+
+### 11.1 The split: `core-it` becomes `core-it` + `core-scripts`
+
+Today `core-it` = `package(g-mesh) & kind(test)` = two binaries, `g-mesh::it`
+(306 tests run locally) and `g-mesh::scripts` (131 run locally, ~242 summed s
+in S1). All `kind(test)` tests share the `daemon-spawning` group,
+`max-threads = 2` (.config/nextest.toml:67-71), so the scripts binary costs
+~242 / 2 = ~120 s wall in every run that selects `core-it`.
+
+New partition sections (12 instead of 11), run order
+`core-it core-scripts core-mcp core-daemon core-cli core-graph core-rest sdk
+plugin-typescript plugin-rust plugin-python wire`:
+
+| section | filterset | tests (local) |
+|---|---|---:|
+| `core-scripts` | `package(g-mesh) & binary_id(g-mesh::scripts)` | 131 (+ ignored) |
+| `core-it` | `package(g-mesh) & kind(test) & !binary_id(g-mesh::scripts)` | 306 (+ ignored, heavy) |
+
+- The name `core-it` is kept for the `it` binary: CI step names, JUnit file
+  `junit-core-it.xml`, ADR text and the narrow rows keep meaning "the product's
+  integration tests", and the `it_timeout` matrix key stays valid.
+- `core-it` is the **complement** of `core-scripts` inside `kind(test)`, like
+  `core-rest` for the lib: a future third core test binary lands in `core-it`
+  instead of in no section (layout.rs forbids one anyway).
+- Both names start with `core-`, so test-select's `CORE` array (:124-127) and
+  `test-local.sh` pick up `core-scripts` without an edit; it is not in
+  `LIB_SECTIONS` (:49), so it runs in the nextest part.
+- The `daemon-spawning` override (`kind(test)`) is unchanged: both sections
+  stay in the group. Moving `core-scripts` out (it spawns bash, not daemons)
+  would let it run at full width; not in this task (see 11.9, GM-675).
+
+**What the scripts binary reaches in core.** Its only core uses
+(grep over core/tests/scripts, confirmed by g-mesh):
+`daemon::manifest::read_manifest` (release_packaging_scripts.rs:19, :215-216) and
+`languages::CATALOGUE` (:739). No scripts test runs the `g-mesh` binary (no
+`CARGO_BIN_EXE_g-mesh` under core/tests/scripts; release-smoke stages a shell
+stand-in). The one real `cargo` call (`listed_under`, test_sections_scripts.rs:336)
+is in an `#[ignore]` test, not in the 131.
+
+g-mesh calls behind the closure:
+- `find_callees daemon::manifest::read_manifest` -> `current_bin_dir`,
+  `validate_non_symbol_queries`, `validate_symbol_query_prefixes`,
+  `resolve_command`, `resolve_arg`, all in core/src/daemon/manifest.rs;
+  `find_callees resolve_command` -> `resolve_path_entry`, `resolve_exe_suffix`
+  (same file); `find_callees validate_symbol_query_prefixes` -> none.
+- `find_references languages::CATALOGUE` -> core/src/languages.rs (5),
+  core/src/mcp/instructions/tests.rs (2), release_packaging_scripts.rs (1).
+  `CATALOGUE` is a `const` table (languages.rs:119): no call reaches further.
+- `get_dependencies Outgoing core/src/daemon/manifest.rs` (depth 3) ->
+  `graph::symbol_links` (`LinkRules`, deserialized inside `RawManifest`),
+  `protocol::types::*` (`CURRENT_PROTOCOL_VERSION`, checked by `read_manifest`),
+  plus externals. The walk stopped at depth 1 (module nodes have no file), and
+  `get_dependencies Outgoing g_mesh::daemon::manifest` / `g_mesh::languages`
+  returned **empty**: g-mesh cannot walk transitive module imports here, so the
+  types' own dependencies were judged by reading the `use` lines, not by a walk.
+
+Closure kept wide (hand-listed, conservative): `core/src/daemon/manifest.rs`,
+`core/src/daemon/manifest/*`, `core/src/languages.rs`,
+`core/src/graph/symbol_links.rs`, `core/src/graph/symbol_links/*`,
+`core/src/protocol/*`, `core/src/log.rs` (`log_line!` used in manifest.rs:702),
+`core/src/lib.rs`. With `--narrow`, only these core/src paths select
+`core-scripts`. `core/Cargo.toml`, `core/build.rs`, fixtures and anything else under `core/` outside `src/` and `tests/{it,scripts}` stay on the `core/*`
+row. Compile breaks need no closure: `test-local.sh` and CI build every test binary
+(`cargo nextest run --workspace --no-run`) before any section runs.
+
+
+### 11.2 More cuts: what is safe and pays
+
+- **core/src -> it-module map: rejected, not reliable.** 63 `it` modules run the
+  `g-mesh` binary (`env!("CARGO_BIN_EXE_g-mesh")`, 109 `Command::new(BIN)`),
+  which links all of core and reaches config, storage, graph, watcher, … at run
+  time through CLI -> daemon. The import graph cannot see that:
+  `get_dependencies Incoming g_mesh::config` (depth 1) names 3 it files
+  (plugin_memory_limit, cli_status, embedding_peak_memory), yet every daemon a
+  test starts loads config (`daemon/lifecycle.rs` imports it, same call). The
+  spawn-map machinery of section 4 works for plugins because the coupling is
+  one process boundary with an observable launch; core code has no such seam.
+  A core diff keeps the whole `it` binary (`core-it`).
+- **Test-only core diffs: safe, pays.** `core/tests/it/*` builds only into the
+  `it` binary; no lib test and no scripts test reads it (grep over core/src for
+  `tests/it` finds comments and one string literal in embedding/text.rs:668).
+  Such a diff needs `core-it`, not the 2064 lib tests or `core-scripts`.
+  `core/tests/scripts/*` builds only into `scripts`, but `it/layout.rs` reads
+  `core/tests/scripts/main.rs`, so it selects `core-scripts` and `core-it`, lib off.
+  `core/tests/fixtures/*` stays wide: lib tests read fixtures (daemon/registry,
+  cli/deps, cli/plugin_check, …).
+- **Further lib narrowing (leaf modules beyond cli/mcp): not here.** The whole
+  core lib part is 84 s; each new leaf row needs its own importer analysis for a
+  share of that. A follow-up at most.
+- **Found gap (fix in this task):** `core/tests/log_line/shared.rs` is
+  `include!`d by `plugins/sdk/tests/log_line_atomic.rs:9`, but `core/*` selects
+  no `sdk` section, in CI too. New row before `core/*`:
+  `core/tests/log_line/*) add sdk "${CORE[@]}"` (both modes; a widening).
+
+### 11.3 Rules (classify, first match wins, replacing :149-151 and :161)
+
+All core = the 7 `core-*` sections. Lib = `core-mcp core-daemon core-cli
+core-graph core-rest`.
+
+| path | `--narrow` | without (CI) |
+|---|---|---|
+| `core/tests/log_line/*` | `sdk` + all core | same (new: `sdk` added, D7) |
+| `core/src/cli/*` | `core-it core-cli` (unchanged text, now without scripts) | all core |
+| `core/src/mcp/*` | `core-it core-mcp` (same) | all core |
+| closure paths (11.1) | all core | all core |
+| other `core/src/*` | `core-it` + lib (no `core-scripts`) | all core |
+| `core/tests/it/*` | `core-it` (D6) | all core |
+| `core/tests/scripts/*` | `core-it core-scripts` | all core |
+| other `core/*` | all core | all core |
+| `scripts/*` (:161) | `core-it core-scripts core-cli` | same |
+
+`scripts/*` must add `core-scripts`, in both modes: today's `core-it` there
+exists *for* the scripts binary (release_packaging, cut_release, test_select
+… read scripts/), and `core-it` stays because `it` runs repo scripts too
+(go_plugin_fingerprint.rs:122 runs `scripts/bundle-go-plugin.sh`). Without this
+edit a `scripts/` change would silently stop running the tests of `scripts/`
+in CI: the one dangerous site of the rename.
+
+CI stays wide for core paths (ADR 0031's "Только локально, CI как был"); see D8.
+Output loop: sections in `SECTIONS` order (no selectors needed for the core
+cut). The 4.3 `core-spawns-<p>` dedupe: drop it when `core-it` and all five lib
+sections are selected.
+
+### 11.4 Expected after-numbers (S1 method, compare by tests and user+sys)
+
+| diff | selected (narrow) | tests | real at S1 load |
+|---|---|---:|---|
+| B: comment in `core/src/config/mod.rs` | `core-it` + 5 lib | 2370 (lib 2064, nextest 306) | ~540 s (664 - ~120); ~-18% |
+| C: comment in `core/tests/it/cli_status.rs` | `core-it` | 306 | ~460 s (no lib part; nextest ~440, build ~20); ~-31%, tests -88% |
+| D: `core/src/daemon/manifest.rs` | all 7 core | 2501 | ~664 s, unchanged |
+| E: `scripts/install.sh` | `core-it core-scripts core-cli` | same as today | unchanged |
+
+Locally `test-local.sh` unions the sections into one nextest run, so the split
+adds no process. In CI a full run gains one step (one more `nextest run`
+startup, ~5-15 s per row); `core-it`'s step loses ~2 min (more on x86 macOS,
+GM-612: sum/2 scaling). The ~120 s is 242 summed s at width 2; tail effects
+may give less.
+
+### 11.5 Edit map
+
+| file | where | change |
+|---|---|---|
+| `scripts/test-sections.sh` | `SECTIONS` (:26-38); `section_filter` (:43); header invariants (:11-20) | add `core-scripts` after `core-it`; the two filtersets of 11.1; invariant "`core-it` is the complement of `core-scripts` within core's `kind(test)`" |
+| `scripts/test-select.sh` | header invariants (:22-30); classify (:147-151, :161) | rows of 11.3; invariant text names `core-scripts` |
+| `.github/workflows/ci.yml` | after the `tests: core-it` step (:778-782) | new step `tests: core-scripts`, same `if:` shape with `' core-scripts '`, `timeout-minutes: 10`, `run: scripts/test-sections.sh run --profile ci core-scripts`; `select` job (:173) reads `list`, no edit |
+| `scripts/cut-release.sh` | :832-842 | no code change: `check` and `run all` read `SECTIONS`; comment unchanged. Confirm by the release-gate dry path (M8) |
+| `core/tests/it/layout.rs` | none | still two binaries; the partition is `check`'s job |
+| `core/tests/scripts/main.rs` | header (:1-14) | one line: these tests run as section `core-scripts` |
+| `core/tests/scripts/test_sections_scripts.rs` | `SECTIONS` const (:21, 11 -> 12); `list_prints_the_eleven_sections_in_run_order` (:240) | add the name, rename to `…twelve…`; new K5 guard test |
+| `core/tests/scripts/test_select_scripts.rs` | `CORE` const (:20, 6 -> 7); :135-158; :193, :237, :243 | `core_plus` gains `core-scripts`; narrow cli/mcp keep `core-it core-cli`; `scripts/*` expectations become `core-it core-scripts core-cli`; the :148 loop keeps only closure paths, lib.rs, Cargo.toml; new K2/K3/K4 tests |
+| `core/tests/scripts/test_local_script.rs` | :279-363 | none expected (filters computed via `section_filter`); confirm it passes |
+| `docs/adr/0030-test-sections.md` | Decision (:17-23) | 12 sections, the list, `core-it`/`core-scripts` by binary (replaces the GM-623 parenthesis) |
+| `docs/adr/0031-local-test-runs.md` | :19; narrowing paragraph (:70-76) | `core-it` is the `it` binary; the 11.3 rows (closure, test-only, `scripts/`) |
+| `CLAUDE.md` | Testing, "Core's integration tests are two binaries" paragraph | one sentence: they run as sections `core-it` and `core-scripts` |
+| older design/results docs | none | historical |
+
+Sequencing: the plugin implement slice edits the same functions of
+test-select.sh/test-sections.sh (4.2-4.3). Run this edit after it, or in the
+same slice; never in parallel in one worktree.
+
+### 11.6 Behaviours
+
+- B6 The suite is partitioned into 12 sections; `core-scripts` holds exactly
+  `g-mesh::scripts`, `core-it` the rest of core's `kind(test)`.
+- B7 Every listed section has one CI step that runs it when selected.
+- B8 A narrowed core diff outside the closure skips `core-scripts`; a closure
+  diff selects all core; a `core/tests/it/*`-only diff selects only `core-it`.
+- B9 A `scripts/` change selects `core-scripts` (both modes).
+- B10 Without `--narrow`, every core path selects all 7 core sections;
+  `core/tests/log_line/*` adds `sdk`.
+- B11 Every direct core use in `core/tests/scripts` is in the closure (guard).
+
+### 11.7 Controls (verify slice, throwaway worktree)
+
+- **K1, missed-test control for the core rule (acceptance).** Break
+  `validate_symbol_query_prefixes` (manifest.rs:509) so it rejects the repo's
+  TypeScript manifest; `read_manifest` then errs and
+  `release_packaging_scripts::the_staged_typescript_manifest_is_the_repo_manifest_with_only_the_command_rewritten`
+  panics at its `expect` (:215). (A `resolve_command` break is not enough: it
+  hits the staged and the repo manifest alike.) (1) `test-select.sh --narrow`
+  on that diff includes `core-scripts`; running it fails naming that test.
+  (2) Revert the closure row (code, not test): the selection lacks
+  `core-scripts` and the test does not run: the visible miss.
+- **K2, selection rules.** The 11.3 table as assertions, narrow and not.
+  Control: revert the classify rows -> the first new test fails.
+- **K3, `scripts/` keeps its tests.** `scripts/install.sh` -> `core-it
+  core-scripts core-cli`. Control: restore today's `add core-it core-cli` -> fails.
+- **K4, closure guard.** File-reading test: every `g_mesh::<a>::<b>` path in
+  core/tests/scripts/*.rs maps to a file (`core/src/<a>/<b>.rs`,
+  `core/src/<a>/<b>/`, `core/src/<a>.rs`) named by test-select's closure row.
+  Control: add `use g_mesh::config::Config;` to a scripts file -> fails naming
+  `config`. Direct uses only; transitive reach is 11.1's hand list.
+- **K5, every section has a CI step.** File-reading test: for each name of
+  `test-sections.sh list`, ci.yml holds exactly one
+  `run: scripts/test-sections.sh run --profile ci <name>` whose step `if:`
+  contains `' <name> '`. Control: delete the `core-scripts` step -> fails
+  naming it. (Without it, a forgotten step silently drops 131 tests from CI.)
+- **K6, log_line -> sdk.** Control: drop the row.
+- **K7, partition.** `test-sections.sh check` passes with 12 sections, and
+  `core-scripts`' count equals today's `core-it` count minus the new
+  `core-it`'s. Control: make `core-it` = `kind(test)` again -> `check` fails
+  "in two sections" naming scripts tests.
+
+### 11.8 Must-confirm
+
+- M5 `nextest list` per section: `core-scripts` = all `g-mesh::scripts` tests
+  (ignored included, `--run-ignored all`), `core-it` = all `g-mesh::it`; sum =
+  today's `core-it`.
+- M6 Before relying on K1: the break fails the named scripts test; if not, pick
+  another closure break (2 tries, then report).
+- M7 After-numbers B and C measured like S1 (`uptime`, `/usr/bin/time -p`).
+- M8 Release gate: `cut-release.sh`'s `check` + `run all` see 12 sections (its
+  test-mode or a dry run, no real release).
+- M9 CI on the branch: one `workflow_dispatch` full run; the run summary table
+  shows 12 rows, `core-scripts` PASS with the expected count, `core-it`'s step
+  shorter. This is the only CI-side proof; ask the owner before dispatching.
+
+### 11.9 Risks to CI and interaction with GM-675
+
+- A forgotten CI step or `scripts/*` row edit drops tests silently; K5 and K3
+  pin both.
+- `check` must pass on the linux row before merge: a filterset typo puts
+  scripts tests in no or two sections (K7).
+- Per-section JUnit/summary: `ci-junit-summary.py` and the step summary are
+  per section and generic; a new row appears, nothing breaks.
+- A transitive dependency of `read_manifest`/`CATALOGUE` outside the hand list
+  makes a narrowed local run skip a failing scripts test; CI (no `--narrow`)
+  still runs `core-scripts`, so the cost is a CI round trip.
+- **GM-675 (parallel sections in cut-release).** The split gives it a smaller
+  critical path: `core-it` is the longest section, and moving ~120 s out of it
+  shortens the longest parallel unit. Test groups are **per nextest process**:
+  two sections run as two processes give `daemon-spawning` 2 + 2 slots. Running
+  `core-scripts` beside `core-it` is safe (scripts tests spawn no daemon); GM-675
+  must not run two daemon-spawning *it* processes at once, and must read the
+  section list from `test-sections.sh list`, not hard-code 11 names. Land
+  GM-671 first; GM-675 then designs against 12 sections. Taking `core-scripts`
+  out of the group (full width, ~242 s / cores) is GM-675's call, not this task's.
+
+### 11.10 Owner decisions
+
+- D5-D7 decided (top of section 11).
+- D8 Narrow `core-scripts` in CI too, for non-closure core paths: no
+  (recommended: keeps ADR 0031's "CI как был"; a closure miss is caught by CI)
+  vs yes (~2 min less per core PR per row; a miss then surfaces only on main's
+  full run or the release gate).
