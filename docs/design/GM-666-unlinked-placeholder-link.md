@@ -421,3 +421,263 @@ binaries: group per binary in one build.
 | who uses `SpecifierResolver` | `extractor/decls.rs` only | `find_references(SpecifierResolver, answer=files)` |
 | who calls `TsProject::resolve` | `extract`, `tests/project_model.rs::resolve` | `find_callers(TsProject::resolve)` |
 | selector cost (scan vs keyed) | read in one known file: `select_affected`, `indexed_importers`, `scan_imports` | `find_definition(select_with)` + `sed` on config_reindex.rs |
+
+## 10. Addendum (S6): own-path keys in core
+
+Owner decision (review finding F2): "Правка в ядре (Recommended)". This
+section supersedes §6's "No wire, SDK, core or schema change": core
+changes, the wire and schema do not.
+
+### Today, with an example
+
+`tsconfig.json`: `"paths": {"@/*": ["src/*"]}`. `src/hub.ts` exists and
+40 of 100 TS files import it as `@/hub`. The plugin restarts, so
+`announced` is empty. The user saves `src/hub.ts`:
+
+1. `TsProject::source_changed` offers `Target{File, Exact(k)}` for
+   k in {`src/hub`, `src/hub.js`, `src/hub.ts`}. `src/hub.ts` comes from
+   `waiting_addresses_for` (derived `@/hub`, whose waiting address is
+   `src/hub.ts`), and it equals the edited file's own path.
+2. `round_trip` commits the diff and links it
+   (`Writer::apply_file_diff_linked` -> `apply_and_link` ->
+   `link_applied` -> `imports::link_diff`). Nothing is repointed.
+3. `apply_file_change_in` -> `reextract_affected` -> `select_with` ->
+   `select_affected` -> `indexed_importers(File, "src/hub.ts")`. Its half
+   (b) (linked edges into the `File` node at that path) returns all 40
+   importers. 40 > 30% of 100, so `Selection::TooMany`, and the whole TS
+   language is reindexed. This happens once per hub file per restart.
+
+Before a062632 no TS key was ever the trigger's own path:
+`addresses_resolving_to`, `candidates_shadowed_by` and
+`fallbacks_shadowed_by` only name other paths.
+
+### The change
+
+When `select_affected` meets a `Target{File, Exact(key)}` selector whose
+`key` is the trigger's own path, it skips `indexed_importers`. It selects
+the trigger's **waiting importers** instead: the importers whose
+`IMPORTS` edges pointed at a file-scoped placeholder with scope == trigger
+path **just before this change's link pass**, read inside the same
+commit. Each one is still filtered by `selector.importers`. Any other key
+keeps both halves, unchanged.
+
+Why this set: `link` repoints exactly the edges into placeholders whose
+scope equals a `File` node the diff upserted
+(`link_diff`'s `added_files` lookup, then `find_file` + `repoint`). So the
+pre-link half (a) of the trigger's path = (post-link half (a)) ∪ (edges
+repointed by this pass). This is the owner's rule, computed with one
+indexed read (`idx_targets_scope`, the same index `link_diff` already hits
+per added file) and no change to `graph::imports`. The read follows the
+gone-file precedent: `file_rows::importers_of` is also read inside
+`apply_file_diff_linked`'s commit, before the write.
+
+Rejected alternative: return the repointed importers from
+`imports::link`. This needs a new `LinkSummary` field (12 `assert_eq!`
+literals in `graph/imports.rs` tests), and `link_applied`/`apply_and_link`
+would have to return it through `apply_diff_linked` and
+`apply_semantic_diff_linked`, which do not use it. It gives the same
+answer.
+
+### How core identifies an own-path key
+
+Core identifies it by plain string equality `key == trigger`. The
+trigger is `apply_file_change_in`'s `file_path`, which `select_with`
+already receives as `trigger: Option<&str>` and removes from the
+selection. The key must also have `scope_kind == File` and
+`Matcher::Exact`. The config-reload path (`selective` -> `select`) passes
+`trigger: None` (`config_reindex.rs` 152), so it never takes the new
+branch. Container keys never take it either.
+
+### F2 after the change
+
+Same example. The waiting read at `src/hub.ts` is empty, because every
+`@/hub` import was linked when its importer was extracted. The own-path
+branch therefore selects nothing. `src/hub` and `src/hub.js` have neither
+a placeholder nor a `File` node. Result: `Selection::Nothing`, and the
+edit is `Applied { reextracted: 0 }`.
+
+### M4 still works (walk-through)
+
+`package.json` `"imports": {"#internal/*": "./src/internal/*.ts"}`.
+`src/app.ts` has `import {f} from "#internal/a"` while
+`src/internal/a.ts` is missing. The record side stores a
+`resolved_module` placeholder with target `File` scope
+`src/internal/a.ts`: the first candidate equals the path (§9 M4).
+
+1. Create `src/internal/a.ts`. The plugin answers with the diff and the
+   keys {`src/internal/a`, `src/internal/a.js`, `src/internal/a.ts`}.
+   The last key is the own path, derived from `#internal/a`.
+2. `apply_file_diff_linked` (scope `Complete`) reads the waiting importers
+   at `src/internal/a.ts`: [(`typescript`, `src/app.ts`)]. `apply_and_link`
+   then runs `link_diff`, whose file trigger repoints `src/app.ts`'s edge
+   onto the new `File` node and drops the placeholder. Both happen in one
+   commit.
+3. `round_trip` returns `waiting_importers = [src/app.ts]` (same
+   language). `reextract_affected` passes it to `select_with`.
+4. `select_affected`: the own key selects `src/app.ts`. The other two keys
+   find neither a placeholder nor a `File` node. Selection
+   {`src/app.ts`}, which is under the threshold. `src/app.ts` is
+   re-extracted, and its bindings for `f` are recorded (behaviour 13).
+
+F3 (`"@env/*": ["src/env.ts"]`) takes the same route once the plugin
+offers `src/env.ts` (fix below).
+
+Crash window: a daemon killed between the commit (link done) and
+`owe_reextracts` in `reextract_affected` loses the re-extract. This window
+already exists for every `affected` selection. Before this change, the
+next edit after a restart happened to cover it through half (b). Now it
+does not (must-confirm M7).
+
+### Effect on other plugins
+
+| plugin | `Target` selectors sent | own-path File key? |
+|---|---|---|
+| python (`project/facts.rs` 152, 223) | `Target{Container, Exact(parent/key)}` | no |
+| rust (`project/facts.rs` 135, 206) | `Target{Container, Exact(parent/key)}` | no |
+| sdk `container_delta` (`resolution.rs` 48) | `Target{Container, Exact(key)}` | no |
+| go (`facts.go` 246-250) | `specifierUnder` only | no |
+| typescript (`project/mod.rs` 201) | `Target{File, Exact(address)}` | yes, only `waiting_addresses_for` (since a062632) and F3's static targets |
+
+No other plugin is affected. Within TS, only the keys a062632 added change
+behaviour.
+
+### Edit map
+
+Core:
+
+- `core/src/storage/index_store.rs` `Writer::apply_file_diff_linked`
+  (473-506). Return a struct `LinkedFileDiff { gone_importers:
+  Vec<String>, waiting_importers: Vec<(String, String)> }` instead of
+  `Vec<String>`. When `scope != Gone`, read the waiting importers before
+  `widen`/`apply_and_link` with a new `file_rows::waiting_importers(conn,
+  file_path)`. Update the callers: `watcher::apply::round_trip` (973),
+  `daemon::registry::PluginRegistry::retire_file` (1556-1560),
+  `daemon::bulk_index::purge_language` (300), and the
+  `index_store::tests` sites (781, 914, 938, 976, 1240).
+- `core/src/storage/file_rows.rs`: new `waiting_importers` next to
+  `importers_of` (116-139). It returns `(language, path)` pairs, `SELECT
+  DISTINCT src.language, src.filePath FROM placeholder_targets pt JOIN
+  edges e ON e.toId = pt.nodeId AND e.kind = 'IMPORTS' JOIN nodes src ON
+  src.id = e.fromId WHERE pt.scopeKind = 'file' AND pt.scope = ?1 AND
+  src.filePath <> ?1`.
+- `core/src/watcher/apply.rs`:
+  - `RoundTrip` (847-864): field `waiting_importers: Vec<String>`
+    (plugin language only, like `gone_importers`).
+  - `round_trip` (938-1011): fill it from `LinkedFileDiff`.
+  - `apply_file_change_in` (234-348): for a re-extract round trip, pass
+    an empty list, like `gone_importers` (behaviour 9). Otherwise pass
+    `structural.waiting_importers` to `reextract_affected`. The "nothing to
+    do" test (277) is unchanged: the list only matters through an
+    own-path key.
+  - `reextract_affected` (367-429): new parameter `own_waiting:
+    &[String]`, passed to `select_with`. Doc paragraph.
+- `core/src/daemon/config_reindex.rs`:
+  - `select` (191-199): passes `&[]`.
+  - `select_with` (205-229): new parameter `own_waiting: &[String]`.
+    It passes `trigger.map(|t| (t, own_waiting))` to `select_affected`.
+  - `select_affected` (243-275): new parameter `own: Option<(&str,
+    &[String])>`. In the `Target{scope_kind: File, Exact(key)}` arm,
+    `Some((t, w))` with `key == t` inserts `w` filtered by
+    `selector.importers` and does not call `indexed_importers`. Doc
+    paragraph.
+  - `indexed_importers` (306-346): unchanged.
+  - `config_reindex/tests.rs`: callers `select` (124), 334, 358, 393 pass
+    `None`. `select_with`'s test at 452 passes `&[]`.
+
+Plugin (F1, F3, from gm666-s3.md):
+
+- `plugins/typescript/src/project/resolve.rs` `waiting_addresses_for`
+  (260-282):
+  - **F1**: drop every address `a` with `a != path &&
+    project.existence.contains(a)`. Never drop `path` itself, which the
+    core rule now makes cheap.
+  - **F3**: also offer the resolved static target of every wildcard
+    `paths` entry whose target has no `*`, and of every `imports` key with
+    a static target, when that target is `path` or one of
+    `addresses_resolving_to(path)`. Put this in a private helper next to
+    `derive_specifiers` (308). Enumerate the entries as
+    `tsconfig::specifiers_targeting` (138-160) and
+    `exports::keys_targeting` (152) do. Those functions stay unchanged:
+    they serve `fallbacks_shadowed_by` too.
+- `plugins/typescript/src/project/mod.rs` `source_changed` doc (156-178):
+  one sentence saying that an own-path key selects only the importers
+  that were waiting at it (core).
+
+### Behaviours tests must pin
+
+Numbering continues §7.
+
+17. (core unit, `config_reindex/tests.rs`) A `Target{File, Exact(t)}` key equal to the trigger `t`, with linked importers of `t` and an empty `own_waiting`, selects nothing.
+18. (core unit) The same key with `own_waiting = [x]` selects exactly `x`, still filtered by the selector's `importers` scope.
+19. (core unit) A `File` key that is not the trigger still selects linked importers through half (b) (existing `an_exact_target_delta_runs_no_scan_and_selects_what_the_scan_does` keeps passing).
+20. (core unit, `index_store` tests) `apply_file_diff_linked` reports the importers waiting at the file's path as read before the link, and none for `Gone`.
+21. (F2, core integration) After a plugin restart, the first edit of an `@/`-imported hub file (more than 30% of files import it) is `Applied { reextracted: 0 }`, not `ReindexLanguage`.
+22. (M4, core integration) Behaviour 13 unchanged: a waiting `#x` with a `.ts` target, then create: linked, importer re-extracted, bindings recorded.
+23. (F3, core integration) A waiting `@env/a` under `"@env/*": ["src/env.ts"]`, then create `src/env.ts`: linked, importer re-extracted, bindings recorded.
+24. (F1, plugin `resolution_delta.rs`) Creating `packages/p/src/other.ts` in a package whose entry `src/index.ts` exists offers no key `packages/p/src/index.ts`.
+25. (F1, plugin) Under `@/*: ["src/*","generated/*"]` with an existing `src/x.ts`, creating `generated/x.ts` offers no key `src/x.ts`.
+26. (F1, plugin) The filter keeps `path` itself, and an address created in the same batch is still offered by its own event.
+27. (F3, plugin) Under `"@env/*": ["src/env.ts"]` (and an `imports` key with a static target), creating `src/env.ts` offers `src/env.ts`.
+
+### Controls (whole task: 8)
+
+§8 had 7. This addendum keeps C1, C2, C4, C5 and drops C3, C6, C7.
+Those three pin single-branch details (first vs last base, catch-all, root
+config only) that behaviours 1, 3 and 8 still pin without a control.
+
+| # | revert (code only) | must fail |
+|---|---|---|
+| C1 | `record_specifier` ignores `miss_address` | 1, 4, 5, 10-13 |
+| C2 | drop the `waiting_addresses_for` extend in `source_changed` | 6-8, 11, 12, 22, 23 |
+| C4 | `waiting_address` skips the workspace branch | 4, 12 |
+| C5 | `waiting_address` returns `None` for `#` specifiers | 5, 13, 22 |
+| C8 (replaces C3) | own-path arm removed: an own key goes to `indexed_importers` again | 17, 21 |
+| C9 (replaces C6) | `round_trip` passes empty `waiting_importers` | 18, 20, 22, 23 |
+| C10 (replaces C7) | F1 existence filter removed | 24, 25 |
+| C11 (extra slot, total 8) | F3 static-target offer removed | 23, 27 |
+
+C8 and C9 tell the two halves of the core rule apart. C8 restores the
+F2 cost, so 22 still passes. C9 breaks M4, so 21 still passes. C1, C2 and
+C9 land in both the plugin and the core `it` binary: group the reverts per
+binary in one build.
+
+### Must confirm
+
+- **M6.** The waiting set is read before the link inside
+  `apply_file_diff_linked`. Rejected alternative: plumb the repointed set
+  out of `imports::link`. Both give the same selection; the first touches
+  neither `graph::imports` nor `LinkSummary`.
+- **M7.** Accept the crash window above (link committed, re-extract not
+  yet owed) as the same window every `affected` selection already has. The
+  alternative is to owe the waiting importers in the same commit, which
+  needs the own-path decision before the commit (`affected` is in hand
+  there, the threshold is not).
+- **M8.** Own-path detection is string equality with the trigger. A
+  plugin that sends a differently spelled path for the same file
+  (`./src/x.ts`) would bypass it and fall back to the old, wider
+  selection. That is safe, only slower. TS sends normalized `RelPath`
+  strings.
+- **M9.** F3's offer may add an extensionless address of `path` that
+  never exists as a file. It is harmless: neither half matches it, and F1
+  never drops it.
+
+Cross-file answers for this section (g-mesh, project `g-mesh-wt-gm666`):
+`find_callers(indexed_importers)` gives `select_affected` only.
+`find_callers(select_with)` gives `select`, `reextract_affected` and one
+test. `find_callers(select_affected)` gives `select_with` and 4 tests.
+`find_callers(select)` gives `selective` (trigger `None`).
+`find_callers(reextract_affected)` gives `apply_file_change_in` only.
+`find_callers(graph::imports::link_diff by id)` gives
+`index_store::link_applied` and 3 tests. `find_callers(link_applied)`
+gives `apply_and_link` and `apply_semantic_diff_linked`.
+`find_callers(Writer::apply_file_diff_linked)` gives `round_trip`,
+`retire_file`, `purge_language` and 5 tests.
+`find_references(LinkSummary)` finds `graph/imports.rs` only.
+`find_references(ImportMatch, answer=files)` finds `wire` and
+`config_reindex`, plus unlinked usages in the python, rust and TS
+`facts.rs` files, sdk `resolution.rs`, TS `project/mod.rs` and
+`resolution_delta.rs`. Those were read with `grep -n`; go has no
+`ImportMatch` and was checked by grep in `facts.go`.
+Ordering: read in `apply_file_change_in`. The link runs inside
+`round_trip`'s commit, and `reextract_affected`'s selection comes after
+it.
