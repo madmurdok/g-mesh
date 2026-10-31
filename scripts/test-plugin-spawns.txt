@@ -46,7 +46,7 @@ it:incremental_embed_outside_lock                        typescript rust python 
 it:incremental_matches_full_reindex                      typescript rust go
 it:index_wait_progress                                   typescript rust python go
 it:last_used                                             typescript rust python go
-it:layout                                                none
+it:layout                                                rust
 it:lazy_activation                                       typescript rust python go
 it:log_line_atomic                                       rust
 it:mcp_e2e                                               typescript rust python go
@@ -68,6 +68,7 @@ it:plugin_check                                          typescript rust python 
 it:plugin_crash_recovery                                 typescript
 it:plugin_install                                        rust
 it:plugin_memory_limit                                   typescript rust python go
+it:plugin_spawn_map                                      rust
 it:plugins_die_with_daemon                               typescript rust python go
 it:protocol_conformance                                  typescript
 it:python_later_binding                                  python
@@ -105,3 +106,5 @@ lib:languages::tests                                     none
 lib:cli::status::tests                                   none
 lib:cli::agent_instructions                              none
 lib:storage::index_store                                 none
+lib:cli::plugins                                         none
+lib:daemon::workspace_reindex                            none

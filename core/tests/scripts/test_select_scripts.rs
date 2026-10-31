@@ -17,7 +17,11 @@ use std::process::{Command, Output};
 
 use serde_json::json;
 
-const CORE: [&str; 6] = ["core-it", "core-mcp", "core-daemon", "core-cli", "core-graph", "core-rest"];
+const CORE: [&str; 7] =
+    ["core-it", "core-scripts", "core-mcp", "core-daemon", "core-cli", "core-graph", "core-rest"];
+
+/// Every core section but `core-it` and `core-scripts`: the lib sections.
+const CORE_LIB: [&str; 5] = ["core-mcp", "core-daemon", "core-cli", "core-graph", "core-rest"];
 
 fn repo_root() -> PathBuf {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")).to_path_buf()
@@ -82,7 +86,17 @@ fn select(paths: &[&str]) -> String {
     select_raw(&paths.iter().map(|p| format!("{p}\n")).collect::<String>())
 }
 
-/// The six core sections followed by `extra`, space-separated.
+/// What `--narrow` selects for `paths`.
+fn narrowed(paths: &[&str]) -> String {
+    select_raw_with(&["--narrow"], &paths.iter().map(|p| format!("{p}\n")).collect::<String>())
+}
+
+/// `core-it` and the five lib sections, space-separated, then `extra`.
+fn core_it_and_lib(extra: &[&str]) -> String {
+    ["core-it"].iter().chain(CORE_LIB.iter()).chain(extra).copied().collect::<Vec<_>>().join(" ")
+}
+
+/// The seven core sections followed by `extra`, space-separated.
 fn core_plus(extra: &[&str]) -> String {
     CORE.iter().chain(extra).copied().collect::<Vec<_>>().join(" ")
 }
@@ -130,31 +144,31 @@ fn a_core_change_runs_the_core_sections_only() {
 }
 
 /// CI's call (no `--narrow`) keeps every core section for a leaf-module
-/// change; only `scripts/test-local.sh`'s `--narrow` call narrows it.
+/// change; only `scripts/test-local.sh`'s `--narrow` call narrows it. A cli
+/// path adds `core-rest` because a storage test calls `cli::status::index_status`.
 #[test]
 fn a_cli_or_mcp_change_runs_every_core_section_unless_narrowed() {
     let leaves =
         ["core/src/cli/status.rs", "core/src/cli/x/y.rs", "core/src/mcp/mod.rs", "core/src/mcp/x.rs"];
     assert_each(&leaves, &core_plus(&[]));
 
-    let narrow = |paths: &[&str]| {
-        select_raw_with(&["--narrow"], &paths.iter().map(|p| format!("{p}\n")).collect::<String>())
-    };
-    assert_eq!(narrow(&["core/src/cli/status.rs"]), "core-it core-cli");
-    assert_eq!(narrow(&["core/src/cli/x/y.rs"]), "core-it core-cli");
-    assert_eq!(narrow(&["core/src/mcp/mod.rs"]), "core-it core-mcp");
-    assert_eq!(narrow(&["core/src/cli/a.rs", "core/src/mcp/b.rs"]), "core-it core-mcp core-cli");
-    // Any other core path still selects every core section, narrowed or not.
-    for other in ["core/src/graph/x.rs", "core/src/lib.rs", "core/tests/foo.rs", "core/Cargo.toml"] {
-        assert_eq!(narrow(&[other]), core_plus(&[]), "path {other}");
-        assert_eq!(narrow(&["core/src/cli/a.rs", other]), core_plus(&[]), "path {other} with a cli path");
+    assert_eq!(narrowed(&["core/src/cli/status.rs"]), "core-it core-cli core-rest");
+    assert_eq!(narrowed(&["core/src/cli/x/y.rs"]), "core-it core-cli core-rest");
+    assert_eq!(narrowed(&["core/src/mcp/mod.rs"]), "core-it core-mcp");
+    assert_eq!(narrowed(&["core/src/cli/a.rs", "core/src/mcp/b.rs"]), "core-it core-mcp core-cli core-rest");
+    // Any other core path selects more, narrowed or not.
+    assert_eq!(narrowed(&["core/src/graph/x.rs"]), core_it_and_lib(&[]));
+    assert_eq!(narrowed(&["core/src/cli/a.rs", "core/src/graph/x.rs"]), core_it_and_lib(&[]));
+    for other in ["core/src/lib.rs", "core/tests/foo.rs", "core/Cargo.toml"] {
+        assert_eq!(narrowed(&[other]), core_plus(&[]), "path {other}");
+        assert_eq!(narrowed(&["core/src/cli/a.rs", other]), core_plus(&[]), "path {other} with a cli path");
     }
     // The flag's position does not matter.
     let dir = tempfile::tempdir().unwrap();
     let list = dir.path().join("paths.txt");
     fs::write(&list, "core/src/cli/a.rs\n").unwrap();
     let output = select_script(&repo_root(), &["--paths-from", list.to_str().unwrap(), "--narrow"]);
-    assert_eq!(stdout_of(&output), "core-it core-cli\n", "{}", describe(&output));
+    assert_eq!(stdout_of(&output), "core-it core-cli core-rest\n", "{}", describe(&output));
 }
 
 #[test]
@@ -190,7 +204,7 @@ fn a_go_plugin_change_runs_the_core_sections_without_a_plugin_section() {
 #[test]
 fn readme_scripts_and_eval_changes_run_their_core_sections() {
     assert_eq!(select(&["README.md"]), "core-cli");
-    assert_each(&["scripts/install.sh", "scripts/cut-release.sh"], "core-it core-cli");
+    assert_each(&["scripts/install.sh", "scripts/cut-release.sh"], "core-it core-scripts core-cli");
     assert_eq!(select(&["eval/run.py"]), "core-cli");
 }
 
@@ -234,14 +248,250 @@ fn a_mixed_change_runs_the_union_in_list_order_without_duplicates() {
         select(&["plugins/rust/src/a.rs", "eval/x.py", "docs/a.md", "scripts/install.sh"]),
         core_plus(&["plugin-rust"])
     );
-    assert_eq!(select(&["README.md", "scripts/install.sh"]), "core-it core-cli");
+    assert_eq!(select(&["README.md", "scripts/install.sh"]), "core-it core-scripts core-cli");
     assert_eq!(select(&["core/src/lib.rs", "wire/src/lib.rs"]), "full");
 }
 
 #[test]
 fn crlf_lines_and_blank_lines_are_tolerated() {
-    assert_eq!(select_raw("\r\nREADME.md\r\n\r\n\nscripts/install.sh\r\n"), "core-it core-cli");
+    assert_eq!(select_raw("\r\nREADME.md\r\n\r\n\nscripts/install.sh\r\n"), "core-it core-scripts core-cli");
     assert_eq!(select_raw("docs/a.md\r\n"), "none");
+}
+
+/// A scratch checkout holding the real selector and section scripts and
+/// `map` as `scripts/test-plugin-spawns.txt`.
+fn scratch_root_with_map(map: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for script in ["scripts/test-select.sh", "scripts/test-sections.sh"] {
+        write_executable(&dir.path().join(script), &fs::read_to_string(repo_root().join(script)).unwrap());
+    }
+    write_file(dir.path(), "scripts/test-plugin-spawns.txt", map);
+    dir
+}
+
+/// `--narrow --paths-from` run from `root`'s copy of the scripts.
+fn narrowed_in(root: &Path, paths: &[&str]) -> String {
+    let list = root.join("paths.txt");
+    fs::write(&list, paths.iter().map(|p| format!("{p}\n")).collect::<String>()).unwrap();
+    let output = select_script(root, &["--narrow", "--paths-from", list.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", describe(&output));
+    stdout_of(&output).trim_end().to_owned()
+}
+
+fn go_query_narrowed(paths: &[&str]) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let list = dir.path().join("paths.txt");
+    fs::write(&list, paths.iter().map(|p| format!("{p}\n")).collect::<String>()).unwrap();
+    let output = select_script(&repo_root(), &["--narrow", "--go", "--paths-from", list.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", describe(&output));
+    stdout_of(&output).trim_end().to_owned()
+}
+
+/// A narrowed plugin source change runs the plugin's own section and only the
+/// core tests that start it (`core-spawns-<plugin>`), not every core section.
+#[test]
+fn a_narrowed_plugin_source_change_runs_that_plugin_and_the_core_tests_that_start_it() {
+    for plugin in ["typescript", "rust", "python"] {
+        let expected = format!("plugin-{plugin} core-spawns-{plugin}");
+        for path in [format!("plugins/{plugin}/src/x.rs"), format!("plugins/{plugin}/README.md")] {
+            assert_eq!(narrowed(&[&path]), expected, "path {path}");
+        }
+    }
+    assert_eq!(narrowed(&["plugins/typescript/package.json"]), "plugin-typescript core-spawns-typescript");
+    // Go has no plugin section: its own tests run through `--go`.
+    assert_eq!(narrowed(&["plugins/go/main.go"]), "core-spawns-go");
+    assert_eq!(go_query_narrowed(&["plugins/go/main.go"]), "1");
+}
+
+/// The manifest and `Cargo.toml` are read by core tests that do not start the
+/// plugin, and CI never narrows: those keep today's answer.
+#[test]
+fn a_narrowed_manifest_change_and_every_unnarrowed_plugin_change_stay_wide() {
+    for plugin in ["typescript", "rust", "python"] {
+        let expected = core_plus(&[&format!("plugin-{plugin}")]);
+        for file in ["plugin.toml", "Cargo.toml", "src/x.rs"] {
+            let path = format!("plugins/{plugin}/{file}");
+            assert_eq!(select(&[&path]), expected, "path {path}");
+            if file != "src/x.rs" {
+                assert_eq!(narrowed(&[&path]), expected, "path {path} --narrow");
+            }
+        }
+    }
+    assert_eq!(narrowed(&["plugins/go/plugin.toml"]), core_plus(&[]));
+    assert_eq!(select(&["plugins/go/main.go"]), core_plus(&[]));
+    assert_eq!(go_query_narrowed(&["plugins/go/plugin.toml"]), "1");
+}
+
+#[test]
+fn the_spawn_map_is_part_of_the_selection_machinery() {
+    assert_eq!(select(&["scripts/test-plugin-spawns.txt"]), "full");
+    assert_eq!(narrowed(&["scripts/test-plugin-spawns.txt"]), "full");
+}
+
+/// The `core-spawns-*` selectors come after the sections, in plugin order, and
+/// only while some core section that holds a mapped binary is missing.
+#[test]
+fn core_spawns_selectors_follow_the_sections_and_are_dropped_when_core_it_and_the_lib_sections_run() {
+    assert_eq!(
+        narrowed(&["plugins/typescript/src/x.rs", "core/tests/it/x.rs"]),
+        "core-it plugin-typescript core-spawns-typescript"
+    );
+    assert_eq!(
+        narrowed(&["plugins/python/src/a.rs", "plugins/typescript/src/b.rs", "plugins/rust/src/c.rs"]),
+        "plugin-typescript plugin-rust plugin-python core-spawns-typescript core-spawns-rust core-spawns-python"
+    );
+    assert_eq!(
+        narrowed(&["plugins/go/main.go", "plugins/typescript/src/b.rs"]),
+        "plugin-typescript core-spawns-typescript core-spawns-go"
+    );
+    // `core-it` and the five lib sections already hold every mapped test.
+    assert_eq!(
+        narrowed(&["plugins/typescript/src/x.rs", "core/src/config/mod.rs"]),
+        core_it_and_lib(&["plugin-typescript"])
+    );
+    // Without `--narrow` the selectors are never printed.
+    assert_eq!(select(&["plugins/typescript/src/x.rs"]), core_plus(&["plugin-typescript"]));
+}
+
+/// With a map row for the `scripts` binary, `core-scripts` also holds mapped
+/// tests, so the selectors stay until it runs too.
+#[test]
+fn a_scripts_row_in_the_map_keeps_the_selectors_until_core_scripts_runs() {
+    let root = scratch_root_with_map("scripts:probe typescript\n");
+    assert_eq!(
+        narrowed_in(root.path(), &["plugins/typescript/src/x.rs", "core/src/config/mod.rs"]),
+        core_it_and_lib(&["plugin-typescript", "core-spawns-typescript"])
+    );
+    assert_eq!(
+        narrowed_in(
+            root.path(),
+            &["plugins/typescript/src/x.rs", "core/src/config/mod.rs", "core/tests/scripts/x.rs"]
+        ),
+        core_plus(&["plugin-typescript"])
+    );
+}
+
+const SCRIPTS_CLOSURE_PATHS: [&str; 10] = [
+    "core/src/lib.rs",
+    "core/src/log.rs",
+    "core/src/languages.rs",
+    "core/src/languages/tests.rs",
+    "core/src/daemon/manifest.rs",
+    "core/src/daemon/manifest/tests.rs",
+    "core/src/graph/symbol_links.rs",
+    "core/src/graph/symbol_links/x.rs",
+    "core/src/protocol/types.rs",
+    "core/src/protocol/mod.rs",
+];
+
+#[test]
+fn a_narrowed_core_source_change_outside_the_scripts_closure_skips_core_scripts() {
+    for path in ["core/src/config/mod.rs", "core/src/graph/x.rs", "core/src/storage/index_store.rs"] {
+        assert_eq!(narrowed(&[path]), core_it_and_lib(&[]), "path {path}");
+    }
+    for path in SCRIPTS_CLOSURE_PATHS {
+        assert_eq!(narrowed(&[path]), core_plus(&[]), "closure path {path}");
+    }
+}
+
+#[test]
+fn a_narrowed_core_test_change_runs_only_the_binary_it_belongs_to() {
+    assert_eq!(narrowed(&["core/tests/it/x.rs"]), "core-it");
+    assert_eq!(narrowed(&["core/tests/scripts/x.rs"]), "core-it core-scripts");
+    assert_eq!(narrowed(&["core/tests/scripts/main.rs"]), "core-it core-scripts");
+    for path in ["core/Cargo.toml", "core/build.rs", "core/tests/fixtures/valid.ndjson", "core/tests/foo.rs"]
+    {
+        assert_eq!(narrowed(&[path]), core_plus(&[]), "path {path}");
+    }
+}
+
+#[test]
+fn without_narrow_every_core_path_runs_every_core_section() {
+    for path in SCRIPTS_CLOSURE_PATHS.iter().chain(&[
+        "core/src/config/mod.rs",
+        "core/tests/it/x.rs",
+        "core/tests/scripts/x.rs",
+        "core/build.rs",
+    ]) {
+        assert_eq!(select(&[path]), core_plus(&[]), "path {path}");
+    }
+}
+
+#[test]
+fn a_log_line_test_change_adds_the_sdk_section_narrowed_or_not() {
+    let expected = core_plus(&["sdk"]);
+    assert_eq!(select(&["core/tests/log_line/x.rs"]), expected);
+    assert_eq!(narrowed(&["core/tests/log_line/x.rs"]), expected);
+    assert_eq!(narrowed(&["core/tests/log_line/x.rs", "core/tests/it/y.rs"]), expected);
+}
+
+/// The scripts tests read `scripts/`, so a change there keeps them running.
+#[test]
+fn a_scripts_change_runs_core_scripts_narrowed_or_not() {
+    for path in ["scripts/install.sh", "scripts/new-task-worktree.sh", "scripts/test-plugin-spawns.sh"] {
+        assert_eq!(select(&[path]), "core-it core-scripts core-cli", "path {path}");
+        assert_eq!(narrowed(&[path]), "core-it core-scripts core-cli", "path {path} --narrow");
+    }
+}
+
+/// Every core module the scripts tests use directly is a path the selector
+/// maps to `core-scripts`, so changing it cannot skip the tests that use it.
+/// Only direct uses are read; what those modules call is the selector's own
+/// hand-kept closure.
+#[test]
+fn every_core_module_the_scripts_tests_use_selects_core_scripts() {
+    let src = repo_root().join("core/src");
+    let mut uses: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(repo_root().join("core/tests/scripts")).unwrap() {
+        let path = entry.unwrap().path();
+        // This file names the pattern it searches for.
+        if path.extension().is_none_or(|e| e != "rs") || path.ends_with("test_select_scripts.rs") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        for (at, _) in text.match_indices("g_mesh::") {
+            let boundary = text[..at].chars().next_back().is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+            if !boundary {
+                continue;
+            }
+            let rest = &text[at + "g_mesh::".len()..];
+            assert!(
+                !rest.starts_with('{'),
+                "{file}: `g_mesh::{{..}}` groups are not read by this guard; write each path in full"
+            );
+            let mut segments = rest
+                .split("::")
+                .map(|s| s.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>());
+            let a = segments.next().unwrap();
+            if a.is_empty() {
+                continue;
+            }
+            let b = segments.next().unwrap_or_default();
+            let candidates = [
+                (!b.is_empty()).then(|| format!("core/src/{a}/{b}.rs")),
+                (!b.is_empty()).then(|| format!("core/src/{a}/{b}/mod.rs")),
+                Some(format!("core/src/{a}.rs")),
+                Some(format!("core/src/{a}/mod.rs")),
+            ];
+            let found =
+                candidates.into_iter().flatten().find(|c| repo_root().join(c).is_file()).unwrap_or_else(
+                    || panic!("{file}: g_mesh::{a}::{b} is not a file under {}", src.display()),
+                );
+            uses.entry(found).or_insert(file.clone());
+        }
+    }
+    assert!(!uses.is_empty(), "no `g_mesh::` use found in core/tests/scripts; the guard reads nothing");
+    let missed: Vec<String> = uses
+        .iter()
+        .filter(|(path, _)| !narrowed(&[path.as_str()]).split(' ').any(|s| s == "core-scripts"))
+        .map(|(path, file)| format!("{path} (used by core/tests/scripts/{file})"))
+        .collect();
+    assert!(
+        missed.is_empty(),
+        "a narrowed change to these selects no `core-scripts`; add them to SCRIPTS_CLOSURE in \
+         scripts/test-select.sh: {missed:?}"
+    );
 }
 
 #[test]
@@ -467,7 +717,7 @@ fn run_full_runs_the_same_sections_as_run_all() {
     assert!(full.status.success(), "{}", describe(&full));
     let (all, all_calls) = recording_run(&["all"]);
     assert!(all.status.success(), "{}", describe(&all));
-    assert_eq!(run_calls(&full_calls).len(), 11, "{full_calls}");
+    assert_eq!(run_calls(&full_calls).len(), 12, "{full_calls}");
     assert_eq!(run_calls(&full_calls), run_calls(&all_calls));
 }
 
