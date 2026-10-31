@@ -202,12 +202,12 @@ by hand, then `npm ci` in `plugins/typescript` and `plugins/python`, then a cold
 `cargo build --workspace` (S1: ~279 s total, 265 s of it the build, at load ~157).
 The only `cp -c -R` seeding in use is for control worktrees (slice-task skill).
 
-Proposal: `scripts/new-task-worktree.sh <dir-suffix> <branch> [--base <ref>] [--no-seed]`:
+Proposal: `scripts/new-task-worktree.sh <dir-suffix> <branch> [--base <ref>] [--seed]` (owner, after M3: seeding only with `--seed`, "Только по флагу --seed (Recommended)"):
 
 1. `git worktree add ../g-mesh-wt-<suffix> -b <branch> <base>`; refuse an
    existing directory (names collide: wt-340 vs wt-gm340).
 2. `npm ci` in `plugins/typescript` and `plugins/python` of the new worktree.
-3. Seed, unless `--no-seed`: if `pgrep -fl -- "--out-dir <main>/target"` prints
+3. Seed, only with `--seed`: if `pgrep -fl -- "--out-dir <main>/target"` prints
    anything, skip seeding with a message (never wait, never kill). Else
    `cp -c -R <main>/target/debug <wt>/target/debug` (only `debug`: the main
    target is 76 GB with `release`, `nextest`, `flycheck0`, `test-local`; not

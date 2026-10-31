@@ -16,8 +16,8 @@ things CI does not feel as much:
   207s CPU).
 - **A few slow tests.** 56 tests took 10s or more in both of two full-suite
   logs (GM-509/S24 and GM-523). They are 26-37% of the summed suite time and
-  about half of `core-it`'s wall time, since `core-it` runs at most 2 tests at
-  a time.
+  about half of `core-it`'s wall time (then both integration-test binaries),
+  since `core-it` runs at most 2 tests at a time.
 
 CI must keep running everything exactly as before.
 
@@ -70,9 +70,22 @@ CI must keep running everything exactly as before.
 - **Leaf core modules select narrower sections, locally only** (Q1). With
   `scripts/test-select.sh --narrow`, which only `test-local.sh` passes, a path
   under `core/src/cli/` selects `core-cli` and `core-it`, one under
-  `core/src/mcp/` selects `core-mcp` and `core-it`; every other `core/` path
-  still selects all core sections. Without the flag (CI's `select` job) the
-  `core/**` row of ADR 0030 is unchanged (owner: "Только локально, CI как был").
+  `core/src/mcp/` selects `core-mcp` and `core-it`. `core-it` here is the
+  `g-mesh::it` binary only; the `g-mesh::scripts` binary is `core-scripts`
+  (GM-671). Its tests reach core only through `daemon::manifest::read_manifest`
+  and `languages::CATALOGUE`, so a hand-listed closure (manifest, languages,
+  `graph::symbol_links`, `protocol`, `log.rs`, `lib.rs`) selects every core
+  section, and any other `core/src/` path selects every core section but
+  `core-scripts`. A test-only change narrows further: `core/tests/it/` selects
+  `core-it`, `core/tests/scripts/` selects `core-scripts` and `core-it` (whose
+  `layout.rs` reads that `main.rs`). Other `core/` paths (fixtures, Cargo.toml,
+  build.rs) still select all core sections. A `core/src` -> `it`-module map was
+  rejected: 63 `it` modules run the `g-mesh` binary, which reaches all of core
+  at run time without an import the graph can see. Without the flag (CI's
+  `select` job) every `core/**` path selects all core sections (owner: "Только
+  локально, CI как был"); a closure miss is then caught by CI. In both modes
+  `scripts/` selects `core-scripts`, and `core/tests/log_line/` adds `sdk`
+  (the SDK's `log_line_atomic` test includes its `shared.rs`).
 - **A plugin-only change selects that plugin and the core tests that start
   it, locally only** (GM-671). With `--narrow`, a path under `plugins/<p>/`
   other than its `plugin.toml` or `Cargo.toml` (core tests read both) selects

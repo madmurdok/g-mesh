@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Creates a task worktree next to the main checkout, ready to build: installs
-# the TypeScript and Python plugins' npm dependencies and seeds its
-# target/debug with an APFS clone of the main checkout's, so the first
-# `cargo build --workspace` starts warm. Builds nothing.
+# the TypeScript and Python plugins' npm dependencies. With `--seed` it also
+# seeds its target/debug with an APFS clone of the main checkout's, so the
+# first `cargo build --workspace` reuses the third-party artifacts (workspace
+# crates rebuild anyway; on a loaded machine the clone can cost more than it
+# saves). Builds nothing.
 #
-#   scripts/new-task-worktree.sh <dir-suffix> <branch> [--base <ref>] [--no-seed]
+#   scripts/new-task-worktree.sh <dir-suffix> <branch> [--base <ref>] [--seed]
 #
 # The worktree is <main checkout's parent>/<main checkout's name>-wt-<dir-suffix>
 # on a new branch <branch> from <ref> (default: HEAD of the checkout this
@@ -21,7 +23,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/new-task-worktree.sh <dir-suffix> <branch> [--base <ref>] [--no-seed]" >&2
+	echo "usage: scripts/new-task-worktree.sh <dir-suffix> <branch> [--base <ref>] [--seed]" >&2
 }
 
 die() {
@@ -32,7 +34,7 @@ die() {
 suffix=""
 branch=""
 base=HEAD
-seed=1
+seed=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--base)
@@ -43,8 +45,8 @@ while [ $# -gt 0 ]; do
 		base="$2"
 		shift 2
 		;;
-	--no-seed)
-		seed=0
+	--seed)
+		seed=1
 		shift
 		;;
 	-*)
@@ -117,7 +119,7 @@ seed_target() {
 if [ "$seed" -eq 1 ]; then
 	seed_target
 else
-	echo "== not seeded (--no-seed)"
+	echo "== not seeded (pass --seed to clone the main checkout's target/debug)"
 fi
 
 echo "== ready: $wt"

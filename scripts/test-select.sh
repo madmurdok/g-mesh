@@ -23,16 +23,26 @@
 # - A path no rule names selects `full`: an unknown path is never skipped.
 # - A change to anything every crate builds on (wire, the SDK, cargo and
 #   nextest config, CI and this selection machinery) selects `full`.
-# - A change under `core/` selects every core section. With `--narrow` only,
-#   one under `core/src/cli/` or `core/src/mcp/` selects that module's lib
-#   section and `core-it`.
+# - A change under `core/` selects every core section; one under
+#   `core/tests/log_line/` (which the SDK's tests include) adds `sdk`. With
+#   `--narrow` only: `core/src/cli/` or `core/src/mcp/` selects that module's
+#   lib section and `core-it`; `core/tests/it/` selects `core-it`;
+#   `core/tests/scripts/` selects `core-it` and `core-scripts`; any other
+#   `core/src/` path outside SCRIPTS_CLOSURE selects every core section but
+#   `core-scripts`.
+# - SCRIPTS_CLOSURE holds every core source file the `g-mesh::scripts` tests
+#   reach (they use only `daemon::manifest::read_manifest` and
+#   `languages::CATALOGUE`); a new core use in core/tests/scripts extends it.
+# - A change under `scripts/` selects `core-scripts`, in both modes: those
+#   tests read scripts/.
 # - A plugin change selects that plugin's section and every core section, never
 #   another plugin's section. With `--narrow` only, a change under
 #   plugins/<p>/ other than its plugin.toml or Cargo.toml (which core tests
 #   read) selects `plugin-<p>` and `core-spawns-<p>` instead of every core
 #   section: the core tests scripts/test-plugin-spawns.txt says start <p>.
-# - A `core-spawns-<p>` selector is printed only while some core section is
-#   missing from the selection; it is a subset of the core sections.
+# - A `core-spawns-<p>` selector is printed only while some core section that
+#   holds a test binary of scripts/test-plugin-spawns.txt is missing from the
+#   selection; it is a subset of the core sections.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -127,8 +137,10 @@ changed_paths() {
 SECTIONS=($(scripts/test-sections.sh list))
 [ ${#SECTIONS[@]} -gt 0 ] || die "scripts/test-sections.sh list printed nothing"
 CORE=()
+CORE_LIB=()
 for s in "${SECTIONS[@]}"; do
 	case "$s" in core-*) CORE+=("$s") ;; esac
+	case "$s" in core-it | core-scripts) ;; core-*) CORE_LIB+=("$s") ;; esac
 done
 
 full=0
@@ -150,10 +162,20 @@ classify() {
 	scripts/test-plugin-spawns.txt) full=1 ;;
 	scripts/test-local.sh | scripts/test-heavy-report.py) full=1 ;;
 	.gitattributes) full=1 ;;
+	core/tests/log_line/*) add sdk "${CORE[@]}" ;;
 	# Leaf modules, local runs only: their lib tests and the integration tests,
 	# not the rest of the lib (docs/adr/0031-local-test-runs.md).
 	core/src/cli/*) if [ -n "$narrow" ]; then add core-cli core-it; else add "${CORE[@]}"; fi ;;
 	core/src/mcp/*) if [ -n "$narrow" ]; then add core-mcp core-it; else add "${CORE[@]}"; fi ;;
+	# SCRIPTS_CLOSURE
+	core/src/lib.rs | core/src/log.rs | core/src/languages.rs | core/src/languages/* | \
+		core/src/daemon/manifest.rs | core/src/daemon/manifest/* | \
+		core/src/graph/symbol_links.rs | core/src/graph/symbol_links/* | core/src/protocol/*)
+		add "${CORE[@]}"
+		;;
+	core/src/*) if [ -n "$narrow" ]; then add core-it "${CORE_LIB[@]}"; else add "${CORE[@]}"; fi ;;
+	core/tests/it/*) if [ -n "$narrow" ]; then add core-it; else add "${CORE[@]}"; fi ;;
+	core/tests/scripts/*) if [ -n "$narrow" ]; then add core-it core-scripts; else add "${CORE[@]}"; fi ;;
 	core/*) add "${CORE[@]}" ;;
 	plugins/python/* | plugins/rust/* | plugins/typescript/*)
 		local plugin="${1#plugins/}"
@@ -171,7 +193,7 @@ classify() {
 		esac
 		;;
 	README.md) add core-cli ;;
-	scripts/*) add core-it core-cli ;;
+	scripts/*) add core-it core-scripts core-cli ;;
 	eval/*) add core-cli ;;
 	docs/* | *.md | LICENSE* | .gitignore | .git-blame-ignore-revs | clippy.toml | rustfmt.toml) ;;
 	*) full=1 ;;
@@ -202,11 +224,14 @@ else
 	for s in "${SECTIONS[@]}"; do
 		case "$selected" in *" $s "*) out+=("$s") ;; esac
 	done
-	all_core=1
+	map_has_scripts=0
+	if grep -q '^scripts:' scripts/test-plugin-spawns.txt 2>/dev/null; then map_has_scripts=1; fi
+	spawns_covered=1
 	for s in "${CORE[@]}"; do
-		case "$selected" in *" $s "*) ;; *) all_core=0 ;; esac
+		[ "$s" != core-scripts ] || [ "$map_has_scripts" -eq 1 ] || continue
+		case "$selected" in *" $s "*) ;; *) spawns_covered=0 ;; esac
 	done
-	if [ "$all_core" -eq 0 ]; then
+	if [ "$spawns_covered" -eq 0 ]; then
 		for s in core-spawns-typescript core-spawns-rust core-spawns-python core-spawns-go; do
 			case "$selected" in *" $s "*) out+=("$s") ;; esac
 		done

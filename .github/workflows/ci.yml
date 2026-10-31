@@ -781,6 +781,12 @@ jobs:
         shell: bash
         run: scripts/test-sections.sh run --profile ci core-it
 
+      - name: "tests: core-scripts"
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && (needs.select.outputs.mode == 'full' || contains(format(' {0} ', needs.select.outputs.sections), ' core-scripts ')) }}
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test-sections.sh run --profile ci core-scripts
+
       - name: "tests: core-mcp"
         if: ${{ !cancelled() && steps.build.outcome == 'success' && (needs.select.outputs.mode == 'full' || contains(format(' {0} ', needs.select.outputs.sections), ' core-mcp ')) }}
         timeout-minutes: 10

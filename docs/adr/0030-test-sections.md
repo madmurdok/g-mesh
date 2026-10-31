@@ -14,13 +14,16 @@ from the rest without downloading the log. GM-539 also needs units it can
 select by changed paths.
 
 ## Decision
-We split the suite into 11 named sections, each a nextest filterset over the
-whole workspace, held in `scripts/test-sections.sh`: `core-it`, `core-mcp`,
-`core-daemon`, `core-cli`, `core-graph`, `core-rest`, `sdk`,
-`plugin-typescript`, `plugin-rust`, `plugin-python`, `wire`.
-(Since GM-623, `core-it` is two binaries, `g-mesh::it` and
-`g-mesh::scripts`, rather than one per file; it still selects them by
-`kind(test)`.)
+We split the suite into 12 named sections, each a nextest filterset over the
+whole workspace, held in `scripts/test-sections.sh`: `core-it`,
+`core-scripts`, `core-mcp`, `core-daemon`, `core-cli`, `core-graph`,
+`core-rest`, `sdk`, `plugin-typescript`, `plugin-rust`, `plugin-python`,
+`wire`. Core's integration tests are two binaries: `core-scripts` is
+`binary_id(g-mesh::scripts)` (tests whose subject is a file under
+`scripts/`), and `core-it` is the rest of core's `kind(test)`, so a new test
+binary lands in `core-it` rather than in no section (GM-671: split out so a
+core change that cannot reach the scripts tests skips them locally). Every
+section has one CI step.
 
 - **Filtersets in a script, not nextest profiles.** CI needs the `ci`
   profile's JUnit output per section, and a nextest profile cannot inherit

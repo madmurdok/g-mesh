@@ -89,8 +89,8 @@ files too. Any path it has no rule for selects
 
 Core's integration tests are two binaries (GM-623): `core/tests/scripts/`
 for a test whose subject is a file under `scripts/`, `core/tests/it/` for
-every other one. A new file there needs a `mod <file>;` line in that
-directory's `main.rs`; `core/tests/it/layout.rs` fails on a missing one and
+every other one. They run as sections `core-scripts` and `core-it`. A new
+file there needs a `mod <file>;` line in that directory's `main.rs`; `core/tests/it/layout.rs` fails on a missing one and
 on any new top-level `core/tests/*.rs`. Run one file's tests with
 `cargo nextest run -p g-mesh --test it -E 'test(/^<file>::/)'` (`--test
 scripts` for a script test); nextest names them `<file>::<test>`.

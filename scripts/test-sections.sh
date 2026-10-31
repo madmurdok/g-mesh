@@ -17,6 +17,8 @@
 #   exactly one section. `check` proves it; CI and the release gate run it.
 # - `core-rest` is the complement of the other core lib sections, so a new
 #   top-level core module lands in it without an edit here.
+# - `core-it` is the complement of `core-scripts` within core's `kind(test)`,
+#   so a new core test binary lands in `core-it`, never in no section.
 # - Every section runs with `--workspace` and selects by `package()`, never
 #   `-p`: all sections share one build and one feature unification, and the
 #   plugin and SDK binaries that core tests spawn always exist.
@@ -31,6 +33,7 @@ cd "$(dirname "$0")/.."
 
 SECTIONS=(
 	core-it
+	core-scripts
 	core-mcp
 	core-daemon
 	core-cli
@@ -89,7 +92,8 @@ section_filter() {
 	core-spawns-typescript | core-spawns-rust | core-spawns-python | core-spawns-go)
 		spawns_filter "${1#core-spawns-}"
 		;;
-	core-it) echo 'package(g-mesh) & kind(test)' ;;
+	core-it) echo 'package(g-mesh) & kind(test) & !binary_id(g-mesh::scripts)' ;;
+	core-scripts) echo 'package(g-mesh) & binary_id(g-mesh::scripts)' ;;
 	core-mcp) echo 'package(g-mesh) & kind(lib) & test(/^mcp::/)' ;;
 	core-daemon) echo 'package(g-mesh) & kind(lib) & test(/^daemon::/)' ;;
 	core-cli) echo 'package(g-mesh) & kind(lib) & test(/^cli::/)' ;;
