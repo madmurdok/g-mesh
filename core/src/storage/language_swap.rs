@@ -639,8 +639,8 @@ fn swap_attached(
     // never-answered rows) described the index this swap replaces; the
     // whole-project pass that follows re-asks every file anyway.
     schema::clear_semantic_leftovers(&tx, language)?;
-    // The stored resolution facts describe the rows: they are replaced with
-    // the walk's own, or dropped when the walk reported none.
+    // The stored resolution facts and watch paths describe the rows: they are
+    // replaced with the walk's own, or dropped when the walk reported none.
     tx.execute("DELETE FROM resolution_facts WHERE language = ?1", params![language])
         .with_context(|| format!("failed to drop {language}'s resolution facts"))?;
     tx.execute(
@@ -649,6 +649,14 @@ fn swap_attached(
         params![language],
     )
     .with_context(|| format!("failed to swap in {language}'s resolution facts"))?;
+    tx.execute("DELETE FROM resolution_watch_paths WHERE language = ?1", params![language])
+        .with_context(|| format!("failed to drop {language}'s watch paths"))?;
+    tx.execute(
+        "INSERT INTO resolution_watch_paths (path, language)
+         SELECT path, language FROM staging.resolution_watch_paths WHERE language = ?1",
+        params![language],
+    )
+    .with_context(|| format!("failed to swap in {language}'s watch paths"))?;
     schema::record_bulk_index(&tx).context("failed to reconcile the bulk-index roll-up")?;
     schema::reconcile_semantic_pass_rollup(&tx, semantic_pass_languages)
         .context("failed to reconcile the semantic-pass roll-up")?;
@@ -1215,8 +1223,8 @@ mod tests {
             },
         )
         .unwrap();
-        schema::set_resolution_facts(&live, "rust", Some("live facts")).unwrap();
-        schema::set_resolution_facts(&live, "go", Some("go facts")).unwrap();
+        schema::set_resolution_facts(&live, "rust", Some("live facts"), &[]).unwrap();
+        schema::set_resolution_facts(&live, "go", Some("go facts"), &[]).unwrap();
 
         let mut staging = open_staging(&staging_path).unwrap();
         // `b.rs` changed, so the swap takes its new edge.
@@ -1234,7 +1242,7 @@ mod tests {
             },
         )
         .unwrap();
-        schema::set_resolution_facts(&staging, "rust", staged_facts).unwrap();
+        schema::set_resolution_facts(&staging, "rust", staged_facts, &[]).unwrap();
         plan(&mut staging, live_path.to_str().unwrap(), "rust", "model", true).unwrap();
         drop(staging);
         swap(&mut live, &staging_path, None, &bookkeeping(&HashSet::new())).unwrap();

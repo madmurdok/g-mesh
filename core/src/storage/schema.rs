@@ -91,7 +91,10 @@ use crate::languages::LanguageOutcome;
 /// "15" adds `nodes.generated` (GM-646). An existing index has every node of
 /// a generated file stored as hand-written, with a vector it must not have,
 /// so it is rebuilt.
-pub const CURRENT_SCHEMA_VERSION: &str = "15";
+///
+/// "16" adds the `resolution_watch_paths` table. An existing index holds
+/// facts without the files whose save changes them, so it is rebuilt.
+pub const CURRENT_SCHEMA_VERSION: &str = "16";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -653,6 +656,21 @@ CREATE TABLE IF NOT EXISTS resolution_facts (
     facts    TEXT NOT NULL
 );
 
+-- The files beyond the manifest's static `watch_files` whose save changes
+-- the model `resolution_facts` describes (a plugin's `watchPaths`), one row
+-- per (path, language). The rows live and die with the language's facts row:
+-- every write of the facts replaces them, a deletion of the facts deletes
+-- them, and the language swap copies them with the facts. `path` is
+-- project-relative, lowercased when the project's volume is case-insensitive
+-- (`daemon::path_case`).
+CREATE TABLE IF NOT EXISTS resolution_watch_paths (
+    path     TEXT NOT NULL,
+    language TEXT NOT NULL,
+    PRIMARY KEY (path, language)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_resolution_watch_paths_language
+    ON resolution_watch_paths(language);
+
 -- One row per language whose last whole-project semantic pass was incomplete
 -- and named the files it did not finish (GM-521): those files are its
 -- `semantic_owed_files` rows, and the next start asks only them instead of
@@ -1194,17 +1212,81 @@ pub fn resolution_facts(conn: &Connection, language: &str) -> Result<Option<Stri
     .with_context(|| format!("failed to read {language}'s resolution facts"))
 }
 
-/// Replaces `language`'s resolution facts; `None` deletes them.
-pub fn set_resolution_facts(conn: &Connection, language: &str, facts: Option<&str>) -> Result<()> {
-    match facts {
-        Some(facts) => conn.execute(
-            "INSERT OR REPLACE INTO resolution_facts (language, facts) VALUES (?1, ?2)",
-            params![language, facts],
-        ),
-        None => conn.execute("DELETE FROM resolution_facts WHERE language = ?1", params![language]),
-    }
+/// Replaces `language`'s resolution facts and its watch paths together;
+/// `None` deletes both, and `watch_paths` is then ignored. The paths are
+/// stored as given: a caller on a case-insensitive volume passes them
+/// through `daemon::path_case` first. All or nothing, inside or outside a
+/// caller's transaction (a savepoint).
+pub fn set_resolution_facts(
+    conn: &Connection,
+    language: &str,
+    facts: Option<&str>,
+    watch_paths: &[String],
+) -> Result<()> {
+    conn.execute_batch("SAVEPOINT set_resolution_facts")
+        .with_context(|| format!("failed to start storing {language}'s resolution facts"))?;
+    let written = write_resolution_facts(conn, language, facts, watch_paths);
+    let ended = if written.is_ok() {
+        conn.execute_batch("RELEASE set_resolution_facts")
+    } else {
+        conn.execute_batch("ROLLBACK TO set_resolution_facts; RELEASE set_resolution_facts")
+    };
+    written?;
+    ended.with_context(|| format!("failed to finish storing {language}'s resolution facts"))
+}
+
+fn write_resolution_facts(
+    conn: &Connection,
+    language: &str,
+    facts: Option<&str>,
+    watch_paths: &[String],
+) -> Result<()> {
+    conn.execute("DELETE FROM resolution_watch_paths WHERE language = ?1", params![language])
+        .with_context(|| format!("failed to drop {language}'s watch paths"))?;
+    let Some(facts) = facts else {
+        conn.execute("DELETE FROM resolution_facts WHERE language = ?1", params![language])
+            .with_context(|| format!("failed to drop {language}'s resolution facts"))?;
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT OR REPLACE INTO resolution_facts (language, facts) VALUES (?1, ?2)",
+        params![language, facts],
+    )
     .with_context(|| format!("failed to store {language}'s resolution facts"))?;
+    let mut insert = conn
+        .prepare_cached("INSERT OR IGNORE INTO resolution_watch_paths (path, language) VALUES (?1, ?2)")
+        .context("failed to prepare the watch-path insert")?;
+    for path in watch_paths {
+        insert
+            .execute(params![path, language])
+            .with_context(|| format!("failed to store {language}'s watch path {path}"))?;
+    }
     Ok(())
+}
+
+/// The languages whose stored watch paths hold exactly `path` (already
+/// case-folded by the caller where the volume needs it), sorted.
+pub fn watch_path_languages(conn: &Connection, path: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare_cached("SELECT language FROM resolution_watch_paths WHERE path = ?1 ORDER BY language")
+        .context("failed to prepare the watch-path lookup")?;
+    let languages = stmt
+        .query_map(params![path], |row| row.get(0))
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())
+        .with_context(|| format!("failed to look up the watch path {path}"))?;
+    Ok(languages)
+}
+
+/// `language`'s stored watch paths, sorted.
+pub fn watch_paths(conn: &Connection, language: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare_cached("SELECT path FROM resolution_watch_paths WHERE language = ?1 ORDER BY path")
+        .context("failed to prepare the watch-path listing")?;
+    let paths = stmt
+        .query_map(params![language], |row| row.get(0))
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())
+        .with_context(|| format!("failed to read {language}'s watch paths"))?;
+    Ok(paths)
 }
 
 /// Every `(language, trigger)` whose workspace reindex was started and never
@@ -2062,7 +2144,8 @@ fn wipe(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS semantic_owed_files; DROP TABLE IF EXISTS semantic_residual; \
          DROP TABLE IF EXISTS semantic_gap_files; DROP TABLE IF EXISTS language_outcome; \
          DROP TABLE IF EXISTS language_retry; \
-         DROP TABLE IF EXISTS resolution_facts; DROP TABLE IF EXISTS seed_origin; \
+         DROP TABLE IF EXISTS resolution_facts; DROP TABLE IF EXISTS resolution_watch_paths; \
+         DROP TABLE IF EXISTS seed_origin; \
          DROP TABLE IF EXISTS embedding_noise_purge;",
     )
     .context("failed to wipe schema")

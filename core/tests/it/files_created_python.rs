@@ -110,7 +110,7 @@ fn an_importer_created_with_its_module_and_routed_first_resolves_the_import() {
     harness.write("pkg/new.py", "def new():\n    return 1\n");
     harness.write("main.py", "import pkg.new\n");
     let created = ["main.py".to_string(), "pkg/new.py".to_string()];
-    harness.registry.announce_created(&created);
+    harness.registry.announce_created(&harness.conn, &created);
     for file_path in &created {
         harness.route(file_path);
     }

@@ -268,7 +268,7 @@ pub fn check(
     // only for a declaring plugin once bulk run 1 completed - a
     // non-declaring plugin is never sent `resolutionChanged`.
     let facts = bulk1.lines.iter().rev().find_map(|line| match &line.item {
-        Ok(BulkItem::ResolutionFacts(facts)) => Some(facts.clone()),
+        Ok(BulkItem::ResolutionFacts { facts, .. }) => Some(facts.clone()),
         _ => None,
     });
     let version_bump = (manifest.capabilities.resolution_delta && bulk1.complete())

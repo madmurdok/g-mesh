@@ -686,6 +686,18 @@ pub struct ResolutionChangedResult {
     /// none, and the next edit falls back to a whole-language reindex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<String>,
+    /// Files, beyond the manifest's static `watch_files`, whose save changes
+    /// the reloaded model (e.g. the targets of a config's `extends` chain,
+    /// found or not). Each path is project-relative with forward slashes,
+    /// normalized and inside the project, not under the plugin's
+    /// `exclude_dirs`, and never a file of one of the plugin's own
+    /// `[plugin.languages] extensions`. Core replaces the language's whole
+    /// set with each delivery and keeps it only beside stored `facts`.
+    /// Absent: empty. The same field rides the bulk walk's
+    /// `{"resolutionFacts": ...}` trailer. A plugin that declares paths needs
+    /// a core that knows this field: an older core rejects the trailer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_paths: Vec<String>,
 }
 
 /// What a watch-file edit changed for resolution.
@@ -1759,13 +1771,18 @@ mod tests {
         let cases: Vec<(&str, ResolutionChangedResult)> = vec![
             (
                 r#"{"delta":{"kind":"unchanged"},"facts":"f2"}"#,
-                ResolutionChangedResult { delta: ResolutionDelta::Unchanged, facts: Some("f2".to_string()) },
+                ResolutionChangedResult {
+                    delta: ResolutionDelta::Unchanged,
+                    facts: Some("f2".to_string()),
+                    watch_paths: Vec::new(),
+                },
             ),
             (
                 r#"{"delta":{"kind":"unknown","reason":"no model"}}"#,
                 ResolutionChangedResult {
                     delta: ResolutionDelta::Unknown { reason: "no model".to_string() },
                     facts: None,
+                    watch_paths: Vec::new(),
                 },
             ),
             (
@@ -1802,6 +1819,7 @@ mod tests {
                         ],
                     },
                     facts: Some("f3".to_string()),
+                    watch_paths: Vec::new(),
                 },
             ),
         ];
@@ -1826,7 +1844,11 @@ mod tests {
         assert_eq!(response.id, RequestId::Number(9));
         assert_eq!(
             response.result,
-            ResolutionChangedResult { delta: ResolutionDelta::Unchanged, facts: None }
+            ResolutionChangedResult {
+                delta: ResolutionDelta::Unchanged,
+                facts: None,
+                watch_paths: Vec::new()
+            }
         );
     }
 

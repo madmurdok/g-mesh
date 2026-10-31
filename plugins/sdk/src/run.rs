@@ -640,6 +640,7 @@ impl<E: Extractor> Session<'_, E> {
                         reason: format!("the project model failed to load: {err:#}"),
                     },
                     facts: None,
+                    watch_paths: Vec::new(),
                 }
             }
             Ok(project) => {
@@ -649,7 +650,7 @@ impl<E: Extractor> Session<'_, E> {
                 };
                 let facts = facts_caught(self.extractor, &project, &self.spec.language);
                 self.project = Some(project);
-                ResolutionChangedResult { delta, facts }
+                ResolutionChangedResult { delta, facts, watch_paths: Vec::new() }
             }
         };
         if matches!(result.delta, ResolutionDelta::Unknown { .. }) {

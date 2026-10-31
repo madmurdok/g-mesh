@@ -645,7 +645,7 @@ fn three_kinds(root: &Path, conn: &IndexStore, created: usize) -> (Vec<String>, 
 /// order they are then routed; every path still gets exactly one
 /// `fileChanged`. Fed modified -> created -> deleted.
 ///
-/// Control: remove the `registry.announce_created(&order.created)` call in
+/// Control: remove the `registry.announce_created(conn, &order.created)` call in
 /// `watch_and_route_once` (no `filesCreated`), or move it before the deleted
 /// loop (the plugin is not running yet, so nothing is sent; with it running,
 /// the frame lands first).
@@ -812,18 +812,15 @@ fn workspace_excluded_and_failed_language_files_are_not_announced() {
     let barrier = || supervisor.file_changed(&conn, "barrier.python-src".to_string());
     let paths = |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
 
-    registry.announce_created(&paths(&[
-        "a.python-src",
-        "setup.python-src",
-        "vendor/c.python-src",
-        "notes.txt",
-        "b.python-src",
-    ]));
+    registry.announce_created(
+        &conn,
+        &paths(&["a.python-src", "setup.python-src", "vendor/c.python-src", "notes.txt", "b.python-src"]),
+    );
     barrier();
-    registry.announce_created(&paths(&["a.python-src", "setup.python-src", "vendor/c.python-src"]));
+    registry.announce_created(&conn, &paths(&["a.python-src", "setup.python-src", "vendor/c.python-src"]));
     barrier();
     registry.set_failed_languages(["python".to_string()]);
-    registry.announce_created(&paths(&["a.python-src", "b.python-src"]));
+    registry.announce_created(&conn, &paths(&["a.python-src", "b.python-src"]));
     barrier();
 
     assert_eq!(files_created_notifications(plugin_dir), vec!["filesCreated a.python-src,b.python-src"]);

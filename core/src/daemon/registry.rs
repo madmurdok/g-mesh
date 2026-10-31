@@ -99,7 +99,7 @@ use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
 use crate::daemon::manifest::{self, extension_of, under_excluded_dir, DiscoveredPlugins};
-use crate::daemon::plugin;
+use crate::daemon::{path_case, plugin};
 use crate::embedding::EmbeddingPipeline;
 use crate::languages::LanguageOutcome;
 use crate::storage::file_rows::FileScope;
@@ -838,6 +838,42 @@ impl PluginRegistry {
         languages
     }
 
+    /// The languages a save of `file_path` reloads the resolution model of:
+    /// [`workspace_language_matches`](Self::workspace_language_matches) (the
+    /// manifests' static `watch_files`) plus the languages whose stored
+    /// `watchPaths` hold the path ([`schema::watch_path_languages`], keyed by
+    /// [`path_case::key`]). A stored row counts only for a discovered
+    /// manifest, when the path is not under that manifest's `exclude_dirs`,
+    /// is not a file of one of its own extensions, and the language has not
+    /// failed. Sorted and deduplicated. A failed lookup is reported and
+    /// leaves the static answer.
+    pub fn watch_languages(&self, conn: &IndexStore, file_path: &str) -> Vec<String> {
+        let mut languages = self.workspace_language_matches(file_path);
+        let key = path_case::key(&self.project_root, file_path);
+        let stored = match conn.with(|conn| schema::watch_path_languages(conn, &key)) {
+            Ok(stored) => stored,
+            Err(err) => {
+                crate::log_line!(
+                    "g-mesh daemon: could not look up {file_path} among the plugins' watch paths: {err:#}"
+                );
+                Vec::new()
+            }
+        };
+        for language in stored {
+            let Some(manifest) = self.discovered.manifests.get(&language) else { continue };
+            if under_excluded_dir(file_path, &manifest.workspace.exclude_dirs)
+                || self.discovered.language_for(file_path) == Some(language.as_str())
+                || self.is_failed_language(&language)
+            {
+                continue;
+            }
+            languages.push(language);
+        }
+        languages.sort();
+        languages.dedup();
+        languages
+    }
+
     /// Whether a plugin was discovered for `language` at all - the same
     /// question [`get_or_spawn`](Self::get_or_spawn) answers with an `Err`
     /// when it fails, exposed here so a caller that wants "nothing to do" to
@@ -1053,13 +1089,15 @@ impl PluginRegistry {
     /// extension routing for the same settled path rather than running
     /// alongside it.
     ///
-    /// Every matching language is reindexed (see [`workspace_language_matches`](Self::workspace_language_matches)
+    /// The match is [`watch_languages`](Self::watch_languages): the static
+    /// `watch_files` plus the plugins' stored watch paths. Every matching
+    /// language is reindexed (see [`workspace_language_matches`](Self::workspace_language_matches)
     /// on why that can be more than one), each independently - one
     /// language's reindex failing must not skip another's, the same
     /// "failures are reported and dropped, never propagated" contract every
     /// other watcher-thread entry point in this module already has.
     pub fn route_settled_path(&self, conn: &IndexStore, file_path: String) {
-        let workspace_languages = self.workspace_language_matches(&file_path);
+        let workspace_languages = self.watch_languages(conn, &file_path);
         if workspace_languages.is_empty() {
             self.file_changed(conn, file_path);
             return;
@@ -1076,7 +1114,8 @@ impl PluginRegistry {
     /// is routed ([`route_settled_path`](Self::route_settled_path) still routes
     /// every one of them afterwards). A path counts for the language that would
     /// receive its `fileChanged`, under the same filters
-    /// [`file_changed`](Self::file_changed) applies: not a workspace file, claimed,
+    /// [`file_changed`](Self::file_changed) applies: not a watch file
+    /// ([`watch_languages`](Self::watch_languages)), claimed,
     /// not under that language's `exclude_dirs`, not a failed language.
     ///
     /// Only a language with at least two such paths is told: one created file
@@ -1086,10 +1125,10 @@ impl PluginRegistry {
     /// plugin understands the message is its manifest's `files_created`,
     /// checked where the message is sent. A failed send is reported and
     /// dropped: the per-file routing that follows meets the same process.
-    pub fn announce_created(&self, created: &[String]) {
+    pub fn announce_created(&self, conn: &IndexStore, created: &[String]) {
         let mut by_language: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for file_path in created {
-            if !self.workspace_language_matches(file_path).is_empty() {
+            if !self.watch_languages(conn, file_path).is_empty() {
                 continue;
             }
             let real = self.real_relative(file_path);
@@ -1491,7 +1530,7 @@ impl PluginRegistry {
                 );
             }
         }
-        self.announce_created(&created);
+        self.announce_created(conn, &created);
         let semantic_languages: HashSet<String> =
             if seeded { self.semantic_pass_languages().into_iter().collect() } else { HashSet::new() };
         let mut reindexed = 0usize;
@@ -1563,7 +1602,7 @@ impl PluginRegistry {
 
     /// A seeded start's watch-file reconcile, after
     /// [`reconcile_since_index`](Self::reconcile_since_index): every
-    /// `[plugin.workspace] watch_files` file of this worktree is compared,
+    /// watch file of this worktree is compared,
     /// byte for byte, with the file at the same relative path in the working
     /// tree the seed was copied from (`seed_origin.sourceRoot`; the index
     /// records no watch-file content of its own). A file on one side only
@@ -1574,7 +1613,9 @@ impl PluginRegistry {
     /// asked against the seed's stored facts first). Both sides are walked as
     /// the bulk walk walks (`.gitignore` honoured, the directories every
     /// language excludes pruned) and filtered by
-    /// [`workspace_language_matches`](Self::workspace_language_matches). The
+    /// [`watch_languages`](Self::watch_languages), whose stored watch paths
+    /// are the seed's (copied with its index), so a chain file differing
+    /// from the source's triggers like a static watch file does. The
     /// source's watch files are read as they are now, not as its index read
     /// them: an edit there that its own daemon has not indexed is missed, as
     /// the source's own next start would miss it. A failed language is
@@ -1595,7 +1636,7 @@ impl PluginRegistry {
         let watch_files_under = |root: &Path| -> HashSet<String> {
             crate::project_walk::project_files(root, &pruned)
                 .map(|file| file.relative)
-                .filter(|relative| !self.workspace_language_matches(relative).is_empty())
+                .filter(|relative| !self.watch_languages(conn, relative).is_empty())
                 .collect()
         };
         let mine = watch_files_under(&self.project_root);
@@ -1620,7 +1661,7 @@ impl PluginRegistry {
         differing.sort();
         let mut triggers: BTreeMap<String, String> = BTreeMap::new();
         for relative in differing {
-            for language in self.workspace_language_matches(relative) {
+            for language in self.watch_languages(conn, relative) {
                 triggers.entry(language).or_insert_with(|| relative.clone());
             }
         }

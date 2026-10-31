@@ -43,6 +43,7 @@ fn creates_all_tables_and_indexes() {
             "qualified_suffixes",
             "reextract_owed_files",
             "resolution_facts",
+            "resolution_watch_paths",
             "seed_origin",
             "semantic_gap_files",
             "semantic_owed_files",
@@ -72,6 +73,7 @@ fn creates_all_tables_and_indexes() {
         "idx_targets_scope",
         "idx_qualified_suffixes_nodeId",
         "idx_untyped_calls_nodeId",
+        "idx_resolution_watch_paths_language",
     ] {
         assert!(indexes.contains(&expected.to_string()), "missing index {expected}");
     }
@@ -301,8 +303,8 @@ fn wipes_and_reindexes_on_version_mismatch() {
         conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
     // Pinned as a literal on purpose, alongside the constant: a schema change
-    // has to update this line by hand. "15" adds `nodes.generated`.
-    assert_eq!(version, "15");
+    // has to update this line by hand. "16" adds `resolution_watch_paths`.
+    assert_eq!(version, "16");
 
     let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
     assert_eq!(node_count, 0, "old data must not survive a version mismatch wipe");
@@ -1369,12 +1371,12 @@ fn resolution_facts_are_stored_replaced_and_deleted_per_language() {
     let conn = setup();
     assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None);
 
-    set_resolution_facts(&conn, "typescript", Some("f1")).unwrap();
-    set_resolution_facts(&conn, "rust", Some("r1")).unwrap();
-    set_resolution_facts(&conn, "typescript", Some("f2")).unwrap();
+    set_resolution_facts(&conn, "typescript", Some("f1"), &[]).unwrap();
+    set_resolution_facts(&conn, "rust", Some("r1"), &[]).unwrap();
+    set_resolution_facts(&conn, "typescript", Some("f2"), &[]).unwrap();
     assert_eq!(resolution_facts(&conn, "typescript").unwrap().as_deref(), Some("f2"));
 
-    set_resolution_facts(&conn, "typescript", None).unwrap();
+    set_resolution_facts(&conn, "typescript", None, &[]).unwrap();
     assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None);
     assert_eq!(resolution_facts(&conn, "rust").unwrap().as_deref(), Some("r1"));
 }
@@ -1395,7 +1397,7 @@ fn a_schema_13_index_is_reset_and_gains_the_specifier_column() {
         params![GENERATION],
     )
     .unwrap();
-    set_resolution_facts(&conn, "typescript", Some("stale")).unwrap();
+    set_resolution_facts(&conn, "typescript", Some("stale"), &[]).unwrap();
 
     assert!(ensure_current(&conn, GENERATION).unwrap(), "schema 13 is not current");
 

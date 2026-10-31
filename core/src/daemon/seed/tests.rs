@@ -117,7 +117,7 @@ fn source_index(home: &Path, main: &Path, version: &str, walked: bool) -> PathBu
     fs::create_dir_all(&dir).unwrap();
     let db = dir.join("index.db");
     let conn = create_index(&db, version, walked);
-    schema::set_resolution_facts(&conn, "typescript", Some("source facts")).unwrap();
+    schema::set_resolution_facts(&conn, "typescript", Some("source facts"), &[]).unwrap();
     drop(conn);
     db
 }
@@ -265,7 +265,7 @@ fn a_seed_holds_commits_still_only_in_the_sources_wal() {
     first.pragma_update(None, "wal_checkpoint", "TRUNCATE").unwrap();
     let writer = Connection::open(&source).unwrap();
     writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-    schema::set_resolution_facts(&writer, "typescript", Some("wal only")).unwrap();
+    schema::set_resolution_facts(&writer, "typescript", Some("wal only"), &[]).unwrap();
 
     let main_file_only = source_dir.path().join("main-file-only.db");
     fs::copy(&source, &main_file_only).unwrap();

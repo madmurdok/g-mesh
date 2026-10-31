@@ -23,7 +23,11 @@
 //!   `nativeKind` carries a `target`. A v1-shaped line (GM-263's `exported`,
 //!   a bare `source` with no `engine`) fails to deserialize at all as of
 //!   GM-275 - `protocol::ndjson`'s parse error is what this check reports for
-//!   it, the same as any other malformed line.
+//!   it, the same as any other malformed line. Every `watchPaths` entry, on
+//!   the bulk trailer or on the resolution-delta session's answer, is a
+//!   normalized, relative path inside the workspace with forward slashes,
+//!   not under the manifest's `exclude_dirs` and without one of its
+//!   `[plugin.languages]` extensions ([`watch_path_violation`]).
 //! - **`stream-order`** - in the structural stream (bulk, `fileChanged`
 //!   diffs), an edge's `fromId` and `toId` are nodes of the edge's own file,
 //!   emitted before the edge. This is "edges never leave their file": a bulk
@@ -140,7 +144,7 @@ use crate::cli::plugin_check::session::{
     BulkLine, BulkRun, EditTarget, Exchange, FilesCreatedRun, Method, ResolutionDeltaRun, Session,
     StoredRange, VersionBump,
 };
-use crate::daemon::manifest::PluginManifest;
+use crate::daemon::manifest::{extension_of, under_excluded_dir, PluginManifest};
 use crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND;
 use crate::protocol::conformance::{
     placeholder_target_violation, plugin_emitted_container_violation, qualified_path_violation,
@@ -376,7 +380,21 @@ fn shape(run: &RunData, answered: &[(String, &FileChangeDiff)]) -> CheckResult {
                         findings.push(format!("bulk run 1, NDJSON line {}: {message}", line.line_no));
                     }
                 }
-                Ok(BulkItem::Edge(_) | BulkItem::ResolutionFacts(_)) => {}
+                Ok(BulkItem::ResolutionFacts { watch_paths, .. }) => {
+                    for path in watch_paths {
+                        if let Some(message) = watch_path_violation(run.manifest, path) {
+                            findings.push(format!("bulk run 1, NDJSON line {}: {message}", line.line_no));
+                        }
+                    }
+                }
+                Ok(BulkItem::Edge(_)) => {}
+            }
+        }
+    }
+    if let ResolutionDeltaEvidence::Ran { run: delta_run, .. } = &run.resolution_delta {
+        for path in delta_run.result.iter().flat_map(|answer| &answer.watch_paths) {
+            if let Some(message) = watch_path_violation(run.manifest, path) {
+                findings.push(format!("resolution-delta session's resolutionChanged answer: {message}"));
             }
         }
     }
@@ -405,6 +423,30 @@ fn shape(run: &RunData, answered: &[(String, &FileChangeDiff)]) -> CheckResult {
     }
 
     result("shape", verdict(findings))
+}
+
+/// Why `path`, a `watchPaths` entry, breaks the wire contract, `None` when it
+/// keeps it: project-relative with forward slashes, normalized (no empty,
+/// `.` or `..` segment) and so inside the workspace, not under `manifest`'s
+/// `exclude_dirs`, and not a file of one of its own extensions (core routes
+/// those as sources, never as watch files).
+pub(crate) fn watch_path_violation(manifest: &PluginManifest, path: &str) -> Option<String> {
+    let reason = if path.contains('\\') {
+        "uses a backslash; watch paths use forward slashes"
+    } else if path.starts_with('/') || path.as_bytes().get(1) == Some(&b':') {
+        "is not project-relative"
+    } else if path.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..") {
+        "is not a normalized path inside the workspace"
+    } else if under_excluded_dir(path, &manifest.workspace.exclude_dirs) {
+        "is under one of the manifest's exclude_dirs"
+    } else if extension_of(path)
+        .is_some_and(|extension| manifest.extensions.iter().any(|own| own.eq_ignore_ascii_case(&extension)))
+    {
+        "has one of the manifest's own [plugin.languages] extensions"
+    } else {
+        return None;
+    };
+    Some(format!("watchPaths entry {path:?} {reason}"))
 }
 
 // --- bulk-stream rules ------------------------------------------------------
@@ -539,7 +581,7 @@ fn bulk_ids(lines: &[BulkLine]) -> (BTreeSet<&str>, BTreeSet<&str>) {
             Ok(BulkItem::Edge(edge)) => {
                 edges.insert(edge.id.as_str());
             }
-            Ok(BulkItem::ResolutionFacts(_)) | Err(_) => {}
+            Ok(BulkItem::ResolutionFacts { .. }) | Err(_) => {}
         }
     }
     (nodes, edges)

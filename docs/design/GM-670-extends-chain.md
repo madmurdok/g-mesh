@@ -419,8 +419,11 @@ build per group.
 - **Coverage limits:** `node_modules` targets are not watched (decision 2).
   An edit made while no daemon runs is not compared at a plain start; this
   is already true for static watch files (`reconcile_since_index` compares
-  indexed files only). A chain file in a gitignored directory routes only if
-  the watcher delivers gitignored paths (must-confirm 3).
+  indexed files only). A gitignored chain file is not watched: the watcher
+  drops every event for a path a `.gitignore` ignores before routing
+  (`ProjectWatcher::next_change` and `retain_unignored`, both through
+  `IgnoreLayers::is_ignored`), and a seeded start's comparison walks with
+  `.gitignore` honoured too (must-confirm 3).
 - **Case-insensitive file systems:** a missing candidate is declared as
   spelled in `extends`. On macOS, a later file created with a different
   case does not match the stored key (must-confirm 4). Found targets are
