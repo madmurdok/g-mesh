@@ -19,7 +19,9 @@ use g_mesh_plugin_sdk::wire::{
 use g_mesh_plugin_sdk::{Extractor, RelPath};
 use g_mesh_plugin_typescript::extractor::TypeScriptExtractor;
 use g_mesh_plugin_typescript::project::facts::TsFacts;
-use g_mesh_plugin_typescript::project::resolve::{addresses_resolving_to, candidates_shadowed_by};
+use g_mesh_plugin_typescript::project::resolve::{
+    addresses_resolving_to, candidates_shadowed_by, fallbacks_shadowed_by, resolve,
+};
 use g_mesh_plugin_typescript::project::TsProject;
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -660,4 +662,406 @@ fn a_batch_of_two_candidates_offers_the_old_winner() {
         source_changed(&mut project, "src/m.tsx", Some("export const m = 3;\n")),
         Some(waiting_at(&["src/m", "src/m.js", "src/m.jsx", "src/m/index.ts"]))
     );
+}
+
+// -------------------------------------------------------------------------
+// source_changed: a created file offers the alias, package or `#` fallback
+// it shadows
+// -------------------------------------------------------------------------
+
+/// The importer every fallback fixture adds, and the file it resolves from.
+const MAIN: &str = "src/main.ts";
+
+/// A root tsconfig whose `paths` are `paths` (a JSON object), with `baseUrl`
+/// at the root.
+fn alias_tsconfig(paths: &str) -> String {
+    format!(r#"{{"compilerOptions":{{"baseUrl":".","paths":{paths}}}}}"#)
+}
+
+/// The file `specifier`, written in [`MAIN`], names in `project`.
+fn resolves_to(project: &TsProject, specifier: &str) -> Option<String> {
+    resolve(project, specifier, &RelPath::new(MAIN)).map(|path| path.as_str().to_string())
+}
+
+/// `files` plus [`MAIN`] importing `specifier`: loaded without `created`,
+/// `specifier` names `before`; with every path of `created` written (one
+/// batch: the model holds them all), it names `after`. Returns that model,
+/// so a test asks it what the creation shadows.
+fn created_over(
+    files: &[(&str, &str)],
+    specifier: &str,
+    before: &str,
+    created: &[&str],
+    after: &str,
+) -> (Fixture, TsProject) {
+    let importer = format!("import {{ v }} from \"{specifier}\";\n");
+    let mut all: Vec<(&str, &str)> = files.to_vec();
+    all.push((MAIN, &importer));
+    let fixture = Fixture::new(&all);
+    assert_eq!(resolves_to(&fixture.load(), specifier).as_deref(), Some(before), "{specifier} before");
+    for path in created {
+        fixture.write(path, b"export const v = 2;\n");
+    }
+    let project = fixture.load();
+    assert_eq!(resolves_to(&project, specifier).as_deref(), Some(after), "{specifier} after");
+    (fixture, project)
+}
+
+/// The exact targets `delta` offers, sorted.
+fn offered(delta: Option<ResolutionDelta>) -> BTreeSet<String> {
+    let Some(ResolutionDelta::Affected { imports, .. }) = delta else {
+        return BTreeSet::new();
+    };
+    imports
+        .into_iter()
+        .filter_map(|selector| match selector.by {
+            ImportMatch::Target { matcher: Matcher::Exact(target), .. } => Some(target),
+            _ => None,
+        })
+        .collect()
+}
+
+const SRC_THEN_GENERATED: &str = r#"{"@/*":["src/*","generated/*"]}"#;
+
+/// `@/*` tries `src/*` before `generated/*`: `@/x` linked to
+/// `generated/x.ts` moves to a created `src/x.ts`, which names
+/// `generated/x.ts`; a created directory index `src/x/index.ts` (address
+/// `src/x`) does the same.
+///
+/// Control: skip the tsconfig loop of `fallbacks_shadowed_by`.
+#[test]
+fn a_created_file_of_an_earlier_alias_target_names_the_later_one() {
+    let tsconfig = alias_tsconfig(SRC_THEN_GENERATED);
+    for created in ["src/x.ts", "src/x/index.ts"] {
+        let files = [("tsconfig.json", tsconfig.as_str()), ("generated/x.ts", "export const v = 1;\n")];
+        let (_fixture, project) = created_over(&files, "@/x", "generated/x.ts", &[created], created);
+        assert_eq!(fallbacks_shadowed_by(&project, created), vec!["generated/x.ts"], "{created}");
+    }
+}
+
+/// The reverse: a created `generated/x.ts` comes after the existing
+/// `src/x.ts`, which keeps `@/x`; nothing is named.
+///
+/// Control: search the whole candidate list in `displaced_by`, not only
+/// after the file (`src/x.ts` is named).
+#[test]
+fn a_created_file_of_a_later_alias_target_names_nothing() {
+    let tsconfig = alias_tsconfig(SRC_THEN_GENERATED);
+    let files = [("tsconfig.json", tsconfig.as_str()), ("src/x.ts", "export const v = 1;\n")];
+    let (_fixture, project) = created_over(&files, "@/x", "src/x.ts", &["generated/x.ts"], "src/x.ts");
+    assert!(fallbacks_shadowed_by(&project, "generated/x.ts").is_empty());
+}
+
+const THREE_BASES: &str = r#"{"@/*":["a/*","b/*","c/*"]}"#;
+
+/// With `b/x.ts` and `c/x.ts` existing, `@/x` was on `b/x.ts`; a created
+/// `a/x.ts` names only that one, not `c/x.ts`, which no importer reached
+/// through `@/x`.
+///
+/// Control: name the last existing candidate after the file in
+/// `displaced_by` (`c/x.ts` is named).
+#[test]
+fn only_the_previous_winner_among_alias_targets_is_named() {
+    let tsconfig = alias_tsconfig(THREE_BASES);
+    let files = [
+        ("tsconfig.json", tsconfig.as_str()),
+        ("b/x.ts", "export const v = 1;\n"),
+        ("c/x.ts", "export const v = 1;\n"),
+    ];
+    let (_fixture, project) = created_over(&files, "@/x", "b/x.ts", &["a/x.ts"], "a/x.ts");
+    assert_eq!(fallbacks_shadowed_by(&project, "a/x.ts"), vec!["b/x.ts"]);
+}
+
+/// `a/x.ts` and `b/x.ts` created in one batch over an existing `c/x.ts`:
+/// the model holds both before either is announced, and whichever is
+/// announced first, the offers of the two together name `c/x.ts`, where
+/// `@/x` was linked.
+///
+/// Control: let `displaced_by` answer `None` when an existing candidate
+/// other than the file comes before it (`b/x.ts`'s event sees the new
+/// `a/x.ts` and names nothing).
+#[test]
+fn a_batch_of_alias_targets_names_the_old_winner_in_either_order() {
+    let tsconfig = alias_tsconfig(THREE_BASES);
+    for order in [["a/x.ts", "b/x.ts"], ["b/x.ts", "a/x.ts"]] {
+        let files = [("tsconfig.json", tsconfig.as_str()), ("c/x.ts", "export const v = 1;\n")];
+        let (_fixture, mut project) = created_over(&files, "@/x", "c/x.ts", &["a/x.ts", "b/x.ts"], "a/x.ts");
+        let mut keys = BTreeSet::new();
+        for path in order {
+            keys.extend(offered(source_changed(&mut project, path, Some("export const v = 2;\n"))));
+        }
+        assert!(keys.contains("c/x.ts"), "{order:?}: {keys:?}");
+    }
+}
+
+/// An exact alias `"cfg": ["src/cfg", "gen/cfg"]`: a created `src/cfg.ts`
+/// names `gen/cfg.ts`.
+///
+/// Control: the tsconfig-loop revert above.
+#[test]
+fn a_created_file_of_an_exact_alias_names_its_later_target() {
+    let tsconfig = alias_tsconfig(r#"{"cfg":["src/cfg","gen/cfg"]}"#);
+    let files = [("tsconfig.json", tsconfig.as_str()), ("gen/cfg.ts", "export const v = 1;\n")];
+    let (_fixture, project) = created_over(&files, "cfg", "gen/cfg.ts", &["src/cfg.ts"], "src/cfg.ts");
+    assert_eq!(fallbacks_shadowed_by(&project, "src/cfg.ts"), vec!["gen/cfg.ts"]);
+}
+
+/// A created file's first `fileChanged` offers the alias target it shadows
+/// beside its own addresses.
+///
+/// Control: drop the `keys.extend(resolve::fallbacks_shadowed_by(..))` line
+/// in `TsProject::source_changed`.
+#[test]
+fn a_first_sighting_offers_the_alias_target_it_shadows() {
+    let tsconfig = alias_tsconfig(SRC_THEN_GENERATED);
+    let files = [("tsconfig.json", tsconfig.as_str()), ("generated/x.ts", "export const v = 1;\n")];
+    let (_fixture, mut project) = created_over(&files, "@/x", "generated/x.ts", &["src/x.ts"], "src/x.ts");
+    assert_eq!(
+        source_changed(&mut project, "src/x.ts", Some("export const v = 2;\n")),
+        Some(waiting_at(&["generated/x.ts", "src/x", "src/x.js"]))
+    );
+}
+
+const WORKSPACE_ROOT: (&str, &str) = ("package.json", r#"{"name":"root","workspaces":["packages/*"]}"#);
+
+/// A package without entry fields tries `src/index` before `index` for its
+/// root: `@s/p` linked to `packages/p/index.ts` moves to a created
+/// `packages/p/src/index.ts`, which names it.
+///
+/// Control: skip the workspace loop of `fallbacks_shadowed_by`.
+#[test]
+fn a_created_package_source_index_names_the_root_index() {
+    let files = [
+        WORKSPACE_ROOT,
+        ("packages/p/package.json", r#"{"name":"@s/p"}"#),
+        ("packages/p/index.ts", "export const v = 1;\n"),
+    ];
+    let (_fixture, project) = created_over(
+        &files,
+        "@s/p",
+        "packages/p/index.ts",
+        &["packages/p/src/index.ts"],
+        "packages/p/src/index.ts",
+    );
+    assert_eq!(fallbacks_shadowed_by(&project, "packages/p/src/index.ts"), vec!["packages/p/index.ts"]);
+}
+
+/// A package subpath tries the path under the package before the one under
+/// `src/`: `@s/p/u` linked to `packages/p/src/u.ts` moves to a created
+/// `packages/p/u.ts`, which names it.
+///
+/// Control: the workspace-loop revert above.
+#[test]
+fn a_created_package_subpath_file_names_the_src_one() {
+    let files = [
+        WORKSPACE_ROOT,
+        ("packages/p/package.json", r#"{"name":"@s/p"}"#),
+        ("packages/p/src/u.ts", "export const v = 1;\n"),
+    ];
+    let (_fixture, project) =
+        created_over(&files, "@s/p/u", "packages/p/src/u.ts", &["packages/p/u.ts"], "packages/p/u.ts");
+    assert_eq!(fallbacks_shadowed_by(&project, "packages/p/u.ts"), vec!["packages/p/src/u.ts"]);
+}
+
+/// An `exports` wildcard listing `./gen/*.ts` before `./lib/*.ts`, as an
+/// array or as a condition object (`source` ranks before `default`):
+/// `@s/p/u` linked to `packages/p/lib/u.ts` moves to a created
+/// `packages/p/gen/u.ts`, which names it. Only the file's own path matches
+/// the `.ts` pattern; no address of it or source convention yields `./u`.
+///
+/// Controls: the workspace-loop revert above; leave the file's own path out
+/// of the address set in `fallbacks_shadowed_by` (nothing is named).
+#[test]
+fn a_created_file_of_an_earlier_exports_target_names_the_later_one() {
+    for exports in [r#"["./gen/*.ts","./lib/*.ts"]"#, r#"{"source":"./gen/*.ts","default":"./lib/*.ts"}"#] {
+        let manifest = format!(r#"{{"name":"@s/p","exports":{{"./*":{exports}}}}}"#);
+        let files = [
+            WORKSPACE_ROOT,
+            ("packages/p/package.json", manifest.as_str()),
+            ("packages/p/lib/u.ts", "export const v = 1;\n"),
+        ];
+        let (_fixture, project) = created_over(
+            &files,
+            "@s/p/u",
+            "packages/p/lib/u.ts",
+            &["packages/p/gen/u.ts"],
+            "packages/p/gen/u.ts",
+        );
+        assert_eq!(
+            fallbacks_shadowed_by(&project, "packages/p/gen/u.ts"),
+            vec!["packages/p/lib/u.ts"],
+            "{exports}"
+        );
+    }
+}
+
+/// A workspace package is tried before tsconfig `paths`: `@s/p`, whose
+/// package has no existing entry, was answered by the alias `@s/*` ->
+/// `gen/*`; a created `packages/p/index.ts` takes it and names `gen/p.ts`.
+///
+/// Control: drop the alias chain from the workspace loop of
+/// `fallbacks_shadowed_by` (only the package entries are walked).
+#[test]
+fn a_created_package_entry_names_the_alias_target_it_takes_over() {
+    let tsconfig = alias_tsconfig(r#"{"@s/*":["gen/*"]}"#);
+    let files = [
+        WORKSPACE_ROOT,
+        ("tsconfig.json", tsconfig.as_str()),
+        ("packages/p/package.json", r#"{"name":"@s/p"}"#),
+        // The model reads a package.json only in a directory holding a file.
+        ("packages/p/other.ts", "export const o = 1;\n"),
+        ("gen/p.ts", "export const v = 1;\n"),
+    ];
+    let (_fixture, project) =
+        created_over(&files, "@s/p", "gen/p.ts", &["packages/p/index.ts"], "packages/p/index.ts");
+    assert_eq!(fallbacks_shadowed_by(&project, "packages/p/index.ts"), vec!["gen/p.ts"]);
+}
+
+/// A package entry may leave the package directory: `"main":
+/// "../../shared/x.ts"` comes before the `index` convention, so a created
+/// `shared/x.ts` takes `@s/p` from `packages/p/index.ts` and names it,
+/// though it is outside the package. Another package, which cannot name it,
+/// adds nothing.
+///
+/// Control: let `package_may_name` ignore `..` entries (the package is
+/// skipped and nothing is named).
+#[test]
+fn a_created_file_named_by_an_entry_outside_its_package_names_the_old_entry() {
+    let files = [
+        WORKSPACE_ROOT,
+        ("packages/p/package.json", r#"{"name":"@s/p","main":"../../shared/x.ts"}"#),
+        ("packages/p/index.ts", "export const v = 1;\n"),
+        ("packages/q/package.json", r#"{"name":"@s/q"}"#),
+        ("packages/q/index.ts", "export const v = 1;\n"),
+    ];
+    let (_fixture, project) =
+        created_over(&files, "@s/p", "packages/p/index.ts", &["shared/x.ts"], "shared/x.ts");
+    assert_eq!(fallbacks_shadowed_by(&project, "shared/x.ts"), vec!["packages/p/index.ts"]);
+}
+
+/// An `imports` key listing `./src/x.ts` before `./gen/x.ts`: `#x` linked to
+/// `gen/x.ts` moves to a created `src/x.ts`, which names it.
+///
+/// Control: skip the `imports` loop of `fallbacks_shadowed_by`.
+#[test]
+fn a_created_file_of_an_earlier_imports_target_names_the_later_one() {
+    let files = [
+        ("package.json", r##"{"name":"root","imports":{"#x":["./src/x.ts","./gen/x.ts"]}}"##),
+        ("gen/x.ts", "export const v = 1;\n"),
+    ];
+    let (_fixture, project) = created_over(&files, "#x", "gen/x.ts", &["src/x.ts"], "src/x.ts");
+    assert_eq!(fallbacks_shadowed_by(&project, "src/x.ts"), vec!["gen/x.ts"]);
+}
+
+/// `files` plus `importer` importing `specifier`, which names `before`; a
+/// root `index.ts` is then created and `specifier` names `after`. Returns
+/// that model, so a test asks it what the creation shadows.
+fn root_index_created_over(
+    files: &[(&str, &str)],
+    importer: &str,
+    specifier: &str,
+    before: &str,
+    after: &str,
+) -> (Fixture, TsProject) {
+    let resolves = |project: &TsProject| {
+        resolve(project, specifier, &RelPath::new(importer)).map(|path| path.as_str().to_string())
+    };
+    let source = format!("import {{ v }} from \"{specifier}\";\n");
+    let mut all: Vec<(&str, &str)> = files.to_vec();
+    all.push((importer, &source));
+    let fixture = Fixture::new(&all);
+    assert_eq!(resolves(&fixture.load()).as_deref(), Some(before), "{specifier} before");
+    fixture.write("index.ts", b"export const v = 2;\n");
+    let project = fixture.load();
+    assert_eq!(resolves(&project).as_deref(), Some(after), "{specifier} after");
+    (fixture, project)
+}
+
+/// A tsconfig `paths` target `.` listed before a fallback, and a package
+/// whose `main` is `../..` before its `index` convention: the import linked
+/// to the fallback moves to a created root `index.ts`, which names it.
+///
+/// Controls: `expand_paths_candidates` or `package_entry_targets`' legacy
+/// fields resolve with `paths::inside` (the import stays on the fallback);
+/// `specifiers_targeting` inverts with `paths::inside` (nothing is named).
+#[test]
+fn a_created_root_index_names_the_fallback_of_a_paths_or_main_target_naming_the_root() {
+    let tsconfig = alias_tsconfig(r#"{"~":[".","fallback/p"]}"#);
+    let files = [("tsconfig.json", tsconfig.as_str()), ("fallback/p.ts", "export const v = 1;\n")];
+    let (_fixture, project) = root_index_created_over(&files, MAIN, "~", "fallback/p.ts", "index.ts");
+    assert_eq!(fallbacks_shadowed_by(&project, "index.ts"), vec!["fallback/p.ts"]);
+
+    let files = [
+        WORKSPACE_ROOT,
+        ("packages/c/package.json", r#"{"name":"@s/c","main":"../.."}"#),
+        ("packages/c/index.ts", "export const v = 1;\n"),
+    ];
+    let (_fixture, project) =
+        root_index_created_over(&files, MAIN, "@s/c", "packages/c/index.ts", "index.ts");
+    assert_eq!(fallbacks_shadowed_by(&project, "index.ts"), vec!["packages/c/index.ts"]);
+}
+
+/// An `imports` target spelled as a module name and naming the root (`.`
+/// from the root package, `..\` from `sub`, `..\..` from `a/b`) listed
+/// before a fallback: the import moves to a created root `index.ts`, which
+/// names the fallback.
+///
+/// Controls: `imports_targets` resolves with `paths::inside`, or tests the
+/// slash-normalised target (the import stays on the fallback);
+/// `imports_specifiers_targeting` inverts with `paths::inside` (nothing is
+/// named).
+#[test]
+fn a_created_root_index_names_the_fallback_of_an_imports_module_name_target() {
+    for (manifest, json, importer, fallback) in [
+        (
+            "package.json",
+            r##"{"name":"root","imports":{"#r":[".","./fallback/i.ts"]}}"##,
+            MAIN,
+            "fallback/i.ts",
+        ),
+        (
+            "sub/package.json",
+            r##"{"name":"sub","imports":{"#r":["..\\","./fc.ts"]}}"##,
+            "sub/main.ts",
+            "sub/fc.ts",
+        ),
+        (
+            "a/b/package.json",
+            r##"{"name":"ab","imports":{"#r":["..\\..","./ff.ts"]}}"##,
+            "a/b/main.ts",
+            "a/b/ff.ts",
+        ),
+    ] {
+        let files = [(manifest, json), (fallback, "export const v = 1;\n")];
+        let (_fixture, project) = root_index_created_over(&files, importer, "#r", fallback, "index.ts");
+        assert_eq!(fallbacks_shadowed_by(&project, "index.ts"), vec![fallback], "{manifest}");
+    }
+}
+
+/// An `imports` target spelled relatively and naming the root (`./` from
+/// the root package, `../` from `sub`) names nothing, so the import stays on
+/// its fallback when a root `index.ts` is created, and that is not named.
+///
+/// Controls: `paths::inside` keeps the root (`./` moves); the module-name
+/// test ignores a leading `../` (`../` moves).
+#[test]
+fn a_created_root_index_leaves_a_relative_imports_target_naming_the_root_alone() {
+    for (manifest, json, importer, fallback) in [
+        (
+            "package.json",
+            r##"{"name":"root","imports":{"#r":["./","./fallback/s.ts"]}}"##,
+            MAIN,
+            "fallback/s.ts",
+        ),
+        (
+            "sub/package.json",
+            r##"{"name":"sub","imports":{"#r":["../","./fd.ts"]}}"##,
+            "sub/main.ts",
+            "sub/fd.ts",
+        ),
+    ] {
+        let files = [(manifest, json), (fallback, "export const v = 1;\n")];
+        let (_fixture, project) = root_index_created_over(&files, importer, "#r", fallback, fallback);
+        assert!(!fallbacks_shadowed_by(&project, "index.ts").contains(&fallback.to_string()), "{manifest}");
+    }
 }

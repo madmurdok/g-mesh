@@ -673,10 +673,7 @@ fn config_targets_without_backslashes_or_drive_letters_read_as_before() {
     assert_eq!(inside("pkg", "../shared/a.ts"), some("shared/a.ts"));
     assert_eq!(inside("pkg", "../../etc/x.ts"), None);
     assert_eq!(inside("pkg", "/abs/x.ts"), None);
-    assert_eq!(
-        extends_candidates("pkg/tsconfig.json", "./base"),
-        strings(&["pkg/base.json", "pkg/base/tsconfig.json"])
-    );
+    assert_eq!(extends_candidates("pkg/tsconfig.json", "./base"), strings(&["pkg/base", "pkg/base.json"]));
     assert_eq!(extends_candidates("a/b/tsconfig.json", "../../base.json"), strings(&["base.json"]));
     assert_eq!(
         extends_candidates("pkg/tsconfig.json", "@tsconfig/node18/tsconfig.json"),
@@ -1433,6 +1430,143 @@ fn an_alias_target_climbing_out_of_the_project_is_not_offered() {
     assert_eq!(resolve(&project, "evil", "app.ts"), None);
 }
 
+// --- targets naming the project root ------------------------------------------------
+//
+// A config or manifest target that names the project root resolves to the
+// root's `index` file exactly where tsc does, and names nothing elsewhere.
+
+/// A tsconfig `paths` target naming the root (`.`, `./`, `./a/..`, `.\`)
+/// resolves to the root index in TS's extension order. `..` climbs out of
+/// the project, and an empty `*` capture (`@/` under `"@/*": ["./*"]`)
+/// names nothing, as tsc substitutes no empty capture.
+#[test]
+fn a_paths_target_naming_the_root_resolves_to_the_root_index() {
+    let tsconfig = r#"{"compilerOptions":{"baseUrl":".","paths":{
+        "dot":["."],"slash":["./"],"folded":["./a/.."],"backslash":[".\\"],"up":[".."],"@/*":["./*"]}}}"#;
+    for (present, winner) in [(&["index.ts", "index.tsx"][..], "index.ts"), (&["index.tsx"][..], "index.tsx")]
+    {
+        let mut files: Vec<(&str, &str)> = present.iter().map(|path| (*path, SRC)).collect();
+        files.extend([("tsconfig.json", tsconfig), ("app.ts", SRC)]);
+        let fx = Fixture::new(&files);
+        let project = fx.load();
+        for specifier in ["dot", "slash", "folded", "backslash"] {
+            assert_eq!(resolve(&project, specifier, "app.ts"), some(winner), "{specifier} {present:?}");
+        }
+        assert_eq!(resolve(&project, "up", "app.ts"), None, "{present:?}");
+        assert_eq!(resolve(&project, "@/", "app.ts"), None, "{present:?}");
+        assert_eq!(resolve(&project, "@/app", "app.ts"), some("app.ts"), "the wildcard key itself works");
+    }
+}
+
+/// `..` names the root from a `baseUrl` below it and from a config below it.
+#[test]
+fn a_paths_target_climbing_to_the_root_from_below_resolves_to_the_root_index() {
+    for config in [
+        ("tsconfig.json", r#"{"compilerOptions":{"baseUrl":"src","paths":{"r":[".."]}}}"#),
+        ("sub/tsconfig.json", r#"{"compilerOptions":{"paths":{"r":[".."]}}}"#),
+    ] {
+        let fx = Fixture::new(&[config, ("index.ts", SRC), ("src/a.ts", SRC), ("sub/a.ts", SRC)]);
+        let project = fx.load();
+        let importer = if config.0 == "tsconfig.json" { "src/a.ts" } else { "sub/a.ts" };
+        assert_eq!(resolve(&project, "r", importer), some("index.ts"), "{config:?}");
+    }
+}
+
+/// A `main`-style field (`source`, `main`, `module`, `types`, `typings`)
+/// naming the root is offered as the root itself, before the conventions;
+/// an `exports` target naming the root is not offered at all, as tsc loads
+/// it as a file.
+#[test]
+fn a_main_style_field_naming_the_root_offers_it_and_an_exports_target_does_not() {
+    for field in ["source", "main", "module", "types", "typings"] {
+        for (dir, entry) in [("", "."), ("", "./"), ("packages/a", "../.."), ("packages/a", "../../")] {
+            let manifest = format!(r#"{{"{field}":"{entry}"}}"#);
+            let mut expected = strings(&["."]);
+            expected.extend(package_entry_targets(&package(dir, "{}"), "."));
+            assert_eq!(package_entry_targets(&package(dir, &manifest), "."), expected, "{dir:?} {manifest}");
+        }
+    }
+    for (dir, exports) in [
+        ("", r#""./""#),
+        ("", r#"{".":"."}"#),
+        ("", r#"["./"]"#),
+        ("packages/a", r#""../..""#),
+        ("packages/a", r#""./../..""#),
+        ("packages/a", r#"{".":["../.."]}"#),
+    ] {
+        let manifest = format!(r#"{{"exports":{exports}}}"#);
+        let conventions = package_entry_targets(&package(dir, "{}"), ".");
+        assert_eq!(package_entry_targets(&package(dir, &manifest), "."), conventions, "{dir:?} {manifest}");
+    }
+}
+
+/// The same through a loaded workspace: `@s/a`, whose `main` is `../..`,
+/// resolves to the root index; `@s/b`, whose `exports` is `../..`, has no
+/// other entry and stays unresolved.
+#[test]
+fn a_package_whose_main_names_the_root_resolves_to_the_root_index() {
+    let fx = Fixture::new(&[
+        ("package.json", r#"{"name":"root","workspaces":["packages/*"]}"#),
+        ("index.ts", SRC),
+        ("app.ts", SRC),
+        ("packages/a/package.json", r#"{"name":"@s/a","main":"../.."}"#),
+        ("packages/a/keep.ts", SRC),
+        ("packages/b/package.json", r#"{"name":"@s/b","exports":"../.."}"#),
+        ("packages/b/keep.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@s/a", "app.ts"), some("index.ts"));
+    assert_eq!(resolve(&project, "@s/b", "app.ts"), None);
+}
+
+/// An `imports` target spelled as a module name (neither `./` nor `../` in
+/// its own spelling, `\` included) may name the root: `.` and `.\` from the
+/// root package, `..` and `..\` from `sub`, `..\..` from `a/b`. A relative
+/// spelling naming the root names nothing, and `..` from the root climbs
+/// out. An empty `*` capture names nothing either.
+#[test]
+fn an_imports_target_spelled_as_a_module_name_may_name_the_root() {
+    for (dir, target, names_root) in [
+        ("", ".", true),
+        ("", ".\\", true),
+        ("", "./", false),
+        ("", "..", false),
+        ("", "./..", false),
+        ("sub", "..", true),
+        ("sub", "..\\", true),
+        ("sub", "../", false),
+        ("sub", "../.", false),
+        ("sub", "./..", false),
+        ("a/b", "..\\..", true),
+        ("a/b", "../..", false),
+        ("a/b", "../../", false),
+    ] {
+        let map = format!(r##"{{"#r":"{}"}}"##, target.replace('\\', "\\\\"));
+        let expected = if names_root { strings(&["."]) } else { Vec::new() };
+        assert_eq!(imports_targets(&imports(dir, &map), "#r"), expected, "{dir:?} {target:?}");
+    }
+    let wildcard = imports("", r##"{"#r/*":"./*"}"##);
+    assert_eq!(imports_targets(&wildcard, "#r/"), Vec::<String>::new());
+    assert_eq!(imports_targets(&wildcard, "#r/x"), strings(&["x"]));
+}
+
+/// The same through a loaded model, from the importer's nearest package.
+#[test]
+fn a_hash_specifier_whose_target_is_a_module_name_resolves_to_the_root_index() {
+    let fx = Fixture::new(&[
+        ("package.json", r##"{"name":"root","imports":{"#dot":".","#slash":"./"}}"##),
+        ("sub/package.json", r##"{"name":"sub","imports":{"#up":"..\\","#rel":"../"}}"##),
+        ("index.ts", SRC),
+        ("src/a.ts", SRC),
+        ("sub/a.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "#dot", "src/a.ts"), some("index.ts"));
+    assert_eq!(resolve(&project, "#slash", "src/a.ts"), None);
+    assert_eq!(resolve(&project, "#up", "sub/a.ts"), some("index.ts"));
+    assert_eq!(resolve(&project, "#rel", "sub/a.ts"), None);
+}
+
 // --- tsconfig: extends ------------------------------------------------------------
 
 #[test]
@@ -1449,7 +1583,7 @@ fn a_config_with_no_paths_of_its_own_inherits_the_ones_it_extends() {
 }
 
 #[test]
-fn an_extends_entry_without_json_or_naming_a_directory_is_found() {
+fn an_extends_entry_without_json_is_found_but_a_relative_directory_is_not() {
     let fx = Fixture::new(&[
         ("configs/base.json", r#"{"compilerOptions":{"paths":{"@a/*":["../a/*"]}}}"#),
         ("shared/tsconfig.json", r#"{"compilerOptions":{"paths":{"@b/*":["../b/*"]}}}"#),
@@ -1462,7 +1596,7 @@ fn an_extends_entry_without_json_or_naming_a_directory_is_found() {
     ]);
     let project = fx.load();
     assert_eq!(resolve(&project, "@a/m", "one/x.ts"), some("a/m.ts"));
-    assert_eq!(resolve(&project, "@b/m", "two/x.ts"), some("b/m.ts"));
+    assert_eq!(resolve(&project, "@b/m", "two/x.ts"), None);
 }
 
 #[test]
@@ -1579,11 +1713,133 @@ fn a_missing_extends_target_is_a_note_and_the_configs_own_paths_still_apply() {
     assert_eq!(resolve(&project, "@/a", "app.ts"), some("src/a.ts"));
 }
 
+/// `extends: ".."` names the parent directory's `tsconfig.json`, the
+/// project root's included, so a nested config inherits the root's `paths`.
+#[test]
+fn an_extends_of_dotdot_inherits_the_parent_directorys_tsconfig() {
+    let fx = Fixture::new(&[
+        ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#),
+        ("sub/tsconfig.json", r#"{"extends":".."}"#),
+        ("sub/page.ts", SRC),
+        ("src/x.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@/x", "sub/page.ts"), some("src/x.ts"));
+    assert!(!has_note(&project, &["sub/tsconfig.json", "not found"]), "{:?}", project.notes);
+}
+
+/// For `..` tsc loads the directory, never a same-named file next to it:
+/// with both `a.json` and `a/tsconfig.json` present, `a/b`'s `..` is the latter.
+#[test]
+fn an_extends_of_dotdot_prefers_the_directory_over_a_same_named_json_file() {
+    let fx = Fixture::new(&[
+        ("a.json", r#"{"compilerOptions":{"paths":{"@/*":["./wrong/*"]}}}"#),
+        ("a/tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["./right/*"]}}}"#),
+        ("a/b/tsconfig.json", r#"{"extends":".."}"#),
+        ("a/b/page.ts", SRC),
+        ("a/right/x.ts", SRC),
+        ("wrong/x.ts", SRC),
+    ]);
+    assert_eq!(resolve(&fx.load(), "@/x", "a/b/page.ts"), some("a/right/x.ts"));
+}
+
+/// `extends: "."` names the config's own directory's `tsconfig.json`, so a
+/// sibling config reaches it, and a config extending it inherits through it.
+#[test]
+fn an_extends_of_dot_names_the_configs_own_directorys_tsconfig() {
+    let fx = Fixture::new(&[
+        ("sub/tsconfig.json", r#"{"compilerOptions":{"paths":{"@s/*":["./s/*"]}}}"#),
+        ("sub/app.json", r#"{"extends":"."}"#),
+        ("sub/inner/tsconfig.json", r#"{"extends":"../app.json"}"#),
+        ("sub/inner/page.ts", SRC),
+        ("sub/s/x.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@s/x", "sub/inner/page.ts"), some("sub/s/x.ts"));
+    assert!(!has_note(&project, &["sub/app.json", "not found"]), "{:?}", project.notes);
+}
+
+/// Only exactly `.` or `..` names a directory. `../`, `./..` and `../base`
+/// (a directory holding a `tsconfig.json`) are file paths that tsc does not
+/// find, so the child inherits nothing.
+#[test]
+fn a_relative_extends_spelling_a_directory_otherwise_inherits_nothing() {
+    let fx = Fixture::new(&[
+        ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#),
+        ("base/tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["../src/*"]}}}"#),
+        ("slash/tsconfig.json", r#"{"extends":"../"}"#),
+        ("slash/page.ts", SRC),
+        ("dotslash/tsconfig.json", r#"{"extends":"./.."}"#),
+        ("dotslash/page.ts", SRC),
+        ("named/tsconfig.json", r#"{"extends":"../base"}"#),
+        ("named/page.ts", SRC),
+        ("src/x.ts", SRC),
+    ]);
+    let project = fx.load();
+    for dir in ["slash", "dotslash", "named"] {
+        let config = format!("{dir}/tsconfig.json");
+        assert_eq!(resolve(&project, "@/x", &format!("{dir}/page.ts")), None, "{dir}");
+        assert!(has_note(&project, &[config.as_str(), "not found"]), "{dir}: {:?}", project.notes);
+    }
+}
+
+/// `..` in the project root's own config would climb out of the project:
+/// refused even when the directory above holds a `tsconfig.json`.
+#[test]
+fn an_extends_of_dotdot_from_the_root_config_never_leaves_the_project() {
+    let fx = Fixture::new(&[
+        ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@out/*":["./proj/src/*"]}}}"#),
+        ("proj/tsconfig.json", r#"{"extends":"..","compilerOptions":{"paths":{"@own/*":["./src/*"]}}}"#),
+        ("proj/app.ts", SRC),
+        ("proj/src/x.ts", SRC),
+    ]);
+    let project = TsProject::load(&fx.root.join("proj")).expect("load never fails on a project tree");
+    assert_eq!(resolve(&project, "@out/x", "app.ts"), None);
+    assert_eq!(resolve(&project, "@own/x", "app.ts"), some("src/x.ts"));
+    assert!(has_note(&project, &["tsconfig.json", "not found"]), "{:?}", project.notes);
+}
+
+/// A relative entry names a file: the path as written first, then with
+/// `.json`. A directory of that name is not a candidate, so the `.json`
+/// file beside it is taken.
+#[test]
+fn a_relative_extends_loads_the_exact_file_then_the_json_one() {
+    let fx = Fixture::new(&[
+        ("configs/base", r#"{"compilerOptions":{"paths":{"@/*":["../exact/*"]}}}"#),
+        ("configs/base.json", r#"{"compilerOptions":{"paths":{"@/*":["../json/*"]}}}"#),
+        ("configs/dual/tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["../../dir/*"]}}}"#),
+        ("configs/dual.json", r#"{"compilerOptions":{"paths":{"@/*":["../json/*"]}}}"#),
+        ("one/tsconfig.json", r#"{"extends":"../configs/base"}"#),
+        ("one/page.ts", SRC),
+        ("two/tsconfig.json", r#"{"extends":"../configs/dual"}"#),
+        ("two/page.ts", SRC),
+        ("exact/x.ts", SRC),
+        ("json/x.ts", SRC),
+        ("dir/x.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@/x", "one/page.ts"), some("exact/x.ts"));
+    assert_eq!(resolve(&project, "@/x", "two/page.ts"), some("json/x.ts"));
+}
+
+#[test]
+fn extends_candidates_read_dot_and_dotdot_as_directories_only_when_exact() {
+    assert_eq!(extends_candidates("sub/tsconfig.json", ".."), strings(&["tsconfig.json"]));
+    assert_eq!(extends_candidates("a/b/tsconfig.json", ".."), strings(&["a/tsconfig.json"]));
+    assert_eq!(extends_candidates("sub/app.json", "."), strings(&["sub/tsconfig.json"]));
+    assert_eq!(extends_candidates("app.json", "."), strings(&["tsconfig.json"]));
+    assert_eq!(extends_candidates("sub/tsconfig.json", "../base"), strings(&["base", "base.json"]));
+    for entry in ["../", "./..", "..\\", "../.."] {
+        assert_eq!(extends_candidates("sub/tsconfig.json", entry), Vec::<String>::new(), "{entry:?}");
+    }
+    assert_eq!(extends_candidates("tsconfig.json", ".."), Vec::<String>::new());
+}
+
 #[test]
 fn extends_candidates_follow_tscs_lookup() {
     assert_eq!(
         extends_candidates("apps/web/tsconfig.json", "./base"),
-        strings(&["apps/web/base.json", "apps/web/base/tsconfig.json"])
+        strings(&["apps/web/base", "apps/web/base.json"])
     );
     assert_eq!(
         extends_candidates("apps/web/tsconfig.json", "../../configs/base.json"),
@@ -1610,10 +1866,7 @@ fn extends_candidates_follow_tscs_lookup() {
 /// relative, so `.\base` is relative and `@tsconfig\node18` is a package path.
 #[test]
 fn extends_candidates_read_backslashes_as_separators() {
-    assert_eq!(
-        extends_candidates("pkg/tsconfig.json", ".\\base"),
-        strings(&["pkg/base.json", "pkg/base/tsconfig.json"])
-    );
+    assert_eq!(extends_candidates("pkg/tsconfig.json", ".\\base"), strings(&["pkg/base", "pkg/base.json"]));
     assert_eq!(extends_candidates("a/b/tsconfig.json", "..\\..\\base.json"), strings(&["base.json"]));
     assert_eq!(extends_candidates("tsconfig.json", "..\\outside.json"), Vec::<String>::new());
     assert_eq!(

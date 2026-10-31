@@ -29,7 +29,7 @@
 //! correct under tokio.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::{LockResult, Mutex, MutexGuard, PoisonError};
 
@@ -464,8 +464,11 @@ impl Writer<'_> {
     /// in the same commit as owed a re-extract (`reextract_owed_files`, with
     /// the gone file as trigger): their edges into it are left dangling, and
     /// re-extracting them re-resolves each import to another candidate or an
-    /// unresolved placeholder. The caller re-extracts them, or leaves the
-    /// rows to the next start's `config_reindex::resume_owed_reextracts`.
+    /// unresolved placeholder. Each importer is owed under its own language,
+    /// but only those of the gone file's language are returned: the calling
+    /// plugin re-extracts them, or leaves the rows to the next start's
+    /// `config_reindex::resume_owed_reextracts`, which is the only one to
+    /// re-extract an importer of another language (with its own plugin).
     /// Empty for any other scope.
     pub fn apply_file_diff_linked(
         &mut self,
@@ -486,8 +489,14 @@ impl Writer<'_> {
                     super::schema::clear_gone_file_semantic_rows(conn, file_path)?;
                 }
                 let Some((language, importers)) = importers else { return Ok(Vec::new()) };
-                super::schema::owe_reextracts(conn, &language, file_path, &importers)?;
-                Ok(importers)
+                let mut by_language: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for (importer_language, path) in importers {
+                    by_language.entry(importer_language).or_default().push(path);
+                }
+                for (importer_language, paths) in &by_language {
+                    super::schema::owe_reextracts(conn, importer_language, file_path, paths)?;
+                }
+                Ok(by_language.remove(&language).unwrap_or_default())
             })?;
             store.claim(diff);
             Ok(importers)
@@ -933,6 +942,139 @@ mod tests {
             assert!(importers.is_empty(), "{scope:?}");
             assert!(store.with(schema::owed_reextracts).unwrap().is_empty(), "{scope:?}");
         }
+    }
+
+    /// Seeds `nodes` as `(id, kind, filePath, language)` and a linked
+    /// `IMPORTS` edge for each `(fromId, toId)` in `imports`.
+    fn seed(store: &IndexStore, nodes: &[(&str, &str, &str, &str)], imports: &[(&str, &str)]) {
+        let diff = Diff {
+            upsert_nodes: nodes
+                .iter()
+                .map(|&(id, kind, path, language)| NodeRecord::new(id, kind, id, id, path, language))
+                .collect(),
+            upsert_edges: imports
+                .iter()
+                .map(|&(from, to)| {
+                    crate::storage::write::EdgeRecord::new(
+                        format!("i:{from}->{to}"),
+                        from,
+                        to,
+                        "IMPORTS",
+                        "tree-sitter",
+                        true,
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        store.unit(Unit::WatcherApply, |writer| writer.apply_diff_linked(&diff, "seed")).unwrap();
+    }
+
+    fn delete_lib(store: &IndexStore) -> Vec<String> {
+        store
+            .unit(Unit::WatcherApply, |writer| {
+                writer.apply_file_diff_linked(&mut Diff::default(), "lib.ts", FileScope::Gone, "test")
+            })
+            .unwrap()
+    }
+
+    /// An importer of another language is owed under its own language, and
+    /// only the gone file's language's importers are returned for the live
+    /// re-extract.
+    #[test]
+    fn a_gone_file_owes_an_importer_of_another_language_under_that_language() {
+        let store = store_without_foreign_keys();
+        imported_lib(&store);
+        seed(&store, &[("File:tool.py", "File", "tool.py", "python")], &[("File:tool.py", "File:lib.ts")]);
+
+        let importers = delete_lib(&store);
+
+        assert_eq!(importers, vec!["other.ts".to_string(), "use.ts".to_string()]);
+        assert_eq!(
+            store.with(schema::owed_reextracts).unwrap(),
+            vec![
+                ("python".to_string(), "lib.ts".to_string(), vec!["tool.py".to_string()]),
+                (
+                    "typescript".to_string(),
+                    "lib.ts".to_string(),
+                    vec!["other.ts".to_string(), "use.ts".to_string()]
+                ),
+            ]
+        );
+    }
+
+    /// A gone file imported only from another language returns nobody to
+    /// re-extract live, and its importers are still owed under their language.
+    #[test]
+    fn a_gone_file_imported_only_from_another_language_returns_no_importer() {
+        let store = store_without_foreign_keys();
+        seed(
+            &store,
+            &[
+                ("File:lib.ts", "File", "lib.ts", "typescript"),
+                ("File:tool.py", "File", "tool.py", "python"),
+                ("File:run.py", "File", "run.py", "python"),
+            ],
+            &[("File:tool.py", "File:lib.ts"), ("File:run.py", "File:lib.ts")],
+        );
+
+        let importers = delete_lib(&store);
+
+        assert!(importers.is_empty(), "{importers:?}");
+        assert_eq!(
+            store.with(schema::owed_reextracts).unwrap(),
+            vec![(
+                "python".to_string(),
+                "lib.ts".to_string(),
+                vec!["run.py".to_string(), "tool.py".to_string()]
+            )]
+        );
+    }
+
+    /// Clearing one language's owed re-extracts leaves another language's
+    /// importer owed.
+    #[test]
+    fn clearing_the_gone_files_language_leaves_another_languages_importer_owed() {
+        let store = store_without_foreign_keys();
+        imported_lib(&store);
+        seed(&store, &[("File:tool.py", "File", "tool.py", "python")], &[("File:tool.py", "File:lib.ts")]);
+        delete_lib(&store);
+
+        store.with(|conn| schema::clear_owed_reextracts(conn, "typescript")).unwrap();
+
+        assert_eq!(
+            store.with(schema::owed_reextracts).unwrap(),
+            vec![("python".to_string(), "lib.ts".to_string(), vec!["tool.py".to_string()])]
+        );
+    }
+
+    /// An importer's language is its own `File` node's, not the importing
+    /// node's; a file without a `File` node falls back to the importing
+    /// node's language.
+    #[test]
+    fn an_importers_language_is_its_file_nodes_and_falls_back_to_the_importing_node() {
+        let store = store_without_foreign_keys();
+        seed(
+            &store,
+            &[
+                ("File:lib.ts", "File", "lib.ts", "typescript"),
+                ("File:page.vue", "File", "page.vue", "vue"),
+                ("Module:page.vue:script", "Module", "page.vue", "typescript"),
+                ("Module:loose.js:main", "Module", "loose.js", "javascript"),
+            ],
+            &[("Module:page.vue:script", "File:lib.ts"), ("Module:loose.js:main", "File:lib.ts")],
+        );
+
+        let importers = delete_lib(&store);
+
+        assert!(importers.is_empty(), "{importers:?}");
+        assert_eq!(
+            store.with(schema::owed_reextracts).unwrap(),
+            vec![
+                ("javascript".to_string(), "lib.ts".to_string(), vec!["loose.js".to_string()]),
+                ("vue".to_string(), "lib.ts".to_string(), vec!["page.vue".to_string()]),
+            ]
+        );
     }
 
     // --- One commit per step: what another connection sees ---------------

@@ -11,7 +11,10 @@
 //! back to the remaining candidate or is left unresolved, and links again
 //! once a candidate is created; a call through a re-export of a deleted file
 //! goes back onto its placeholder; no `IMPORTS` or `CALLS` edge is left
-//! pointing at a deleted node.
+//! pointing at a deleted node. The same holds across the targets of a
+//! tsconfig alias (`@/x` from `generated/x.ts` to a created `src/x.ts`), the
+//! entries of a workspace package and an `imports` key, while an importer of
+//! another alias is left alone.
 //!
 //! The plugin answers the created file's first `fileChanged` with the
 //! addresses that file answers, plus the candidate each address resolved to
@@ -30,7 +33,9 @@
 //! (`./m.js` stays on `src/m.js`); the `candidates_shadowed_by` keys dropped
 //! from `TsProject::source_changed` (`./missing` stays on
 //! `src/missing/index.ts`, `./m` on `src/m.tsx`, and the explicit importers
-//! are not re-extracted).
+//! are not re-extracted); the `fallbacks_shadowed_by` keys dropped from
+//! `TsProject::source_changed` (`@/x`, `@scope/p` and `#x` stay where they
+//! were).
 
 #![cfg(unix)]
 
@@ -65,6 +70,31 @@ fn indexed(import: &str, extra: &[&str]) -> Harness {
     files.push(("src/a.ts", import));
     for (path, import) in &files {
         harness.write(path, &source(import, "mark_v1"));
+        harness.route(path);
+    }
+    assert_eq!(marked("mark_v1", &harness).len(), files.len(), "every file indexed");
+    for (path, import) in &files {
+        harness.write(path, &source(import, "mark_v2"));
+    }
+    harness
+}
+
+/// Like [`indexed`] over the fillers and `files` (`(path, import)`), with
+/// real `configs` (tsconfig.json, package.json text) that are never routed.
+/// Configs and files are all written before the first route, so the model
+/// the plugin loads then holds the configs and the directories they sit in
+/// (a package.json is read only in a directory holding a file).
+fn indexed_with_configs(configs: &[(&str, &str)], files: &[(&str, &str)]) -> Harness {
+    let harness = Harness::new();
+    for (path, contents) in configs {
+        harness.write(path, contents);
+    }
+    let files: Vec<(&str, &str)> =
+        FILLERS.iter().map(|path| (*path, "")).chain(files.iter().copied()).collect();
+    for (path, import) in &files {
+        harness.write(path, &source(import, "mark_v1"));
+    }
+    for (path, _) in &files {
         harness.route(path);
     }
     assert_eq!(marked("mark_v1", &harness).len(), files.len(), "every file indexed");
@@ -399,4 +429,113 @@ fn a_call_through_a_re_export_of_a_deleted_file_goes_back_onto_its_placeholder()
 
     assert_eq!(calls_of(&harness, "src/a.ts"), linked, "linked again");
     assert_eq!(dangling(&harness), 0);
+}
+
+const ALIAS_TSCONFIG: (&str, &str) =
+    ("tsconfig.json", r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*","generated/*"]}}}"#);
+
+/// `@/*` tries `src/*` before `generated/*`: `@/x` linked to
+/// `generated/x.ts` moves to a created `src/x.ts`, by a re-extract of only
+/// its importer.
+#[test]
+fn an_alias_import_linked_to_a_later_target_moves_to_a_created_earlier_one() {
+    let harness = indexed_with_configs(
+        &[ALIAS_TSCONFIG],
+        &[("generated/x.ts", ""), ("src/a.ts", "import { mark_v1 } from \"@/x\";\n")],
+    );
+    assert_eq!(
+        harness.imports("src/a.ts").0,
+        vec!["generated/x.ts:x.ts".to_string()],
+        "linked to generated/x.ts"
+    );
+
+    create(&harness, "src/x.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["src/x.ts:x.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// A package without entry fields tries `src/index` before `index`:
+/// `@scope/p` linked to `packages/p/index.ts` moves to a created
+/// `packages/p/src/index.ts`, by a re-extract of only its importer.
+#[test]
+fn a_package_import_linked_to_its_root_index_moves_to_a_created_source_index() {
+    let harness = indexed_with_configs(
+        &[
+            ("package.json", r#"{"name":"root","workspaces":["packages/*"]}"#),
+            ("packages/p/package.json", r#"{"name":"@scope/p"}"#),
+        ],
+        &[("packages/p/index.ts", ""), ("src/a.ts", "import { mark_v1 } from \"@scope/p\";\n")],
+    );
+    assert_eq!(
+        harness.imports("src/a.ts").0,
+        vec!["packages/p/index.ts:index.ts".to_string()],
+        "linked to packages/p/index.ts"
+    );
+
+    create(&harness, "packages/p/src/index.ts");
+
+    assert_eq!(
+        harness.imports("src/a.ts"),
+        (vec!["packages/p/src/index.ts:index.ts".to_string()], Vec::new())
+    );
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// An `imports` key listing `./src/x.ts` before `./gen/x.ts`: `#x` linked to
+/// `gen/x.ts` moves to a created `src/x.ts`, by a re-extract of only its
+/// importer.
+#[test]
+fn a_hash_import_linked_to_a_later_target_moves_to_a_created_earlier_one() {
+    let harness = indexed_with_configs(
+        &[("package.json", r##"{"name":"root","imports":{"#x":["./src/x.ts","./gen/x.ts"]}}"##)],
+        &[("gen/x.ts", ""), ("src/a.ts", "import { mark_v1 } from \"#x\";\n")],
+    );
+    assert_eq!(harness.imports("src/a.ts").0, vec!["gen/x.ts:x.ts".to_string()], "linked to gen/x.ts");
+
+    create(&harness, "src/x.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["src/x.ts:x.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// An `imports` target `.` (a module name) names the project root: `#r`
+/// listing `.` before `./gen/r.ts` and linked to `gen/r.ts` moves to a
+/// created root `index.ts`, by a re-extract of only its importer.
+#[test]
+fn a_hash_import_naming_the_root_moves_to_a_created_root_index() {
+    let harness = indexed_with_configs(
+        &[("package.json", r##"{"name":"root","imports":{"#r":[".","./gen/r.ts"]}}"##)],
+        &[("gen/r.ts", ""), ("src/a.ts", "import { mark_v1 } from \"#r\";\n")],
+    );
+    assert_eq!(harness.imports("src/a.ts").0, vec!["gen/r.ts:r.ts".to_string()], "linked to gen/r.ts");
+
+    create(&harness, "index.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["index.ts:index.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// The importer of another alias (`@/y`, linked to `generated/y.ts`) is not
+/// selected by the creation of `src/x.ts`: it is not re-extracted and keeps
+/// its link, while `@/x` moves.
+#[test]
+fn an_import_of_another_alias_is_left_alone_by_the_create() {
+    let harness = indexed_with_configs(
+        &[ALIAS_TSCONFIG],
+        &[
+            ("generated/x.ts", ""),
+            ("generated/y.ts", ""),
+            ("src/b.ts", "import { mark_v1 } from \"@/y\";\n"),
+            ("src/a.ts", "import { mark_v1 } from \"@/x\";\n"),
+        ],
+    );
+    let other = vec!["generated/y.ts:y.ts".to_string()];
+    assert_eq!(harness.imports("src/b.ts").0, other, "linked to generated/y.ts");
+
+    create(&harness, "src/x.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["src/x.ts:x.ts".to_string()], Vec::new()));
+    assert_eq!(harness.imports("src/b.ts"), (other, Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
 }

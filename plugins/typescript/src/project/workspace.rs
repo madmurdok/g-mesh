@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::project::exports::exports_targets;
+use crate::project::exports::{exports_subpaths_targeting, exports_targets};
 use crate::project::jsonc::Json;
 use crate::project::paths;
 
@@ -133,31 +133,101 @@ fn has_url_scheme(specifier: &str) -> bool {
 /// output (`dist/`) that an unbuilt checkout lacks and a built one ignores,
 /// so it is never in the existence set and cannot shadow the source.
 pub fn package_entry_targets(package: &WorkspacePackage, subpath: &str) -> Vec<String> {
-    let mut targets = exports_targets(package.manifest.get("exports"), subpath);
+    // Whether a target naming the project root keeps it: only a `main`-style
+    // field does, as in tsc; an `exports` target naming it names nothing.
+    let mut targets: Vec<(String, bool)> = exports_targets(package.manifest.get("exports"), subpath)
+        .into_iter()
+        .map(|target| (target, false))
+        .collect();
 
     if subpath == "." {
         for field in ["source", "main", "module", "types", "typings"] {
             if let Some(entry) = package.manifest.get(field).and_then(Json::as_str) {
-                targets.push(entry.to_string());
+                targets.push((entry.to_string(), true));
             }
         }
-        targets.push("src/index".to_string());
-        targets.push("index".to_string());
+        targets.push(("src/index".to_string(), false));
+        targets.push(("index".to_string(), false));
     } else {
         let relative = &subpath[2..];
-        targets.push(relative.to_string());
-        targets.push(format!("src/{relative}"));
+        targets.push((relative.to_string(), false));
+        targets.push((format!("src/{relative}"), false));
     }
 
     let mut resolved: Vec<String> = Vec::new();
-    for target in targets {
-        if let Some(inside) = paths::inside(&package.dir, &target) {
+    for (target, root_allowed) in targets {
+        let inside = if root_allowed {
+            paths::inside_or_root(&package.dir, &target)
+        } else {
+            paths::inside(&package.dir, &target)
+        };
+        if let Some(inside) = inside {
             if !resolved.contains(&inside) {
                 resolved.push(inside);
             }
         }
     }
     resolved
+}
+
+/// The subpaths of `package` whose [`package_entry_targets`] may include the
+/// project-relative `address`, without repeats: always the root `.`, every
+/// `exports` key that can name it ([`exports_subpaths_targeting`]), and for
+/// an address under the package directory its own subpath (`pkg/u` ->
+/// `./u`) and, under `src/`, the subpath the `src/` convention maps to it
+/// (`pkg/src/u` -> `./u`).
+pub fn subpaths_targeting(package: &WorkspacePackage, address: &str) -> Vec<String> {
+    let mut subpaths: Vec<String> = vec![".".to_string()];
+    let mut add = |subpath: String| {
+        if !subpaths.contains(&subpath) {
+            subpaths.push(subpath);
+        }
+    };
+    for subpath in exports_subpaths_targeting(package.manifest.get("exports"), &package.dir, address) {
+        add(subpath);
+    }
+    let relative = if package.dir.is_empty() {
+        Some(address)
+    } else {
+        address.strip_prefix(&format!("{}/", package.dir))
+    };
+    if let Some(relative) = relative.filter(|relative| !relative.is_empty() && *relative != ".") {
+        add(format!("./{relative}"));
+        if let Some(under_src) = relative.strip_prefix("src/") {
+            add(format!("./{under_src}"));
+        }
+    }
+    subpaths
+}
+
+/// Whether any of `package`'s entry targets can be the project-relative
+/// `path`: `path` is under the package directory, or the manifest declares
+/// an entry (`exports`, `source`, `main`, `module`, `types`, `typings`)
+/// with a `..` segment that can leave it. Allocates nothing.
+pub fn package_may_name(package: &WorkspacePackage, path: &str) -> bool {
+    let dir = package.dir.as_str();
+    if dir.is_empty() || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/')) {
+        return true;
+    }
+    let climbs = |target: &str| target.split(['/', '\\']).any(|segment| segment == "..");
+    if ["source", "main", "module", "types", "typings"]
+        .iter()
+        .any(|field| package.manifest.get(field).and_then(Json::as_str).is_some_and(climbs))
+    {
+        return true;
+    }
+    package.manifest.get("exports").is_some_and(|exports| any_string(exports, &climbs))
+}
+
+/// Whether any string leaf of `value` satisfies `test`; object keys are not
+/// targets and are not visited.
+fn any_string(value: &Json, test: &impl Fn(&str) -> bool) -> bool {
+    match value {
+        Json::String(text) => test(text),
+        Json::Array(items) => items.iter().any(|item| any_string(item, test)),
+        Json::Object(entries) => entries.iter().any(|(_, nested)| any_string(nested, test)),
+        _ => false,
+    }
 }
 
 /// The workspace globs: `pnpm-workspace.yaml`'s first, then the root

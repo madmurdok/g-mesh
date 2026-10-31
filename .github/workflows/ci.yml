@@ -700,7 +700,9 @@ jobs:
             Windows) slug=windows-tar ;;
             *) echo "unrecognised runner OS: ${{ runner.os }}"; exit 1 ;;
           esac
-          curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/${slug}" | tar -xz -C "${HOME}/.cargo/bin"
+          # Next to the cargo on PATH: the runner images do not all keep it
+          # in ~/.cargo/bin.
+          curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/${slug}" | tar -xz -C "$(dirname "$(command -v cargo)")"
           cargo nextest --version
 
       # State goes to G_MESH_HOME, which `<repo>/.cargo/config.toml` already
@@ -946,7 +948,7 @@ jobs:
             RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER= \
             CARGO_RESOLVER_LOCKFILE_PATH="$lk/Cargo.lock" RUSTUP_AUTO_INSTALL=0 \
             __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly \
-            "$HOME/.cargo/bin/cargo" metadata --format-version 1 --manifest-path "$lib/Cargo.toml" \
+            "$(command -v cargo)" metadata --format-version 1 --manifest-path "$lib/Cargo.toml" \
               --filter-platform "$(rustc -vV | sed -n 's/^host: //p')" -Zlockfile-path -Zunstable-options > /dev/null)
           echo "sysroot cargo metadata exit: $?"
 

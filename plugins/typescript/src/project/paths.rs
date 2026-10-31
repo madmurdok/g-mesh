@@ -1,6 +1,9 @@
 //! Project-relative POSIX path arithmetic, the spelling every lookup in the
 //! project model uses. The root directory is `""`.
 
+/// [`normalize`]'s spelling of a path naming the project root itself.
+pub const ROOT: &str = ".";
+
 /// `path` with `.` segments, empty segments and trailing slashes removed and
 /// each `..` folded into its parent. A path that climbs above its start keeps
 /// its leading `..` segments; an empty result is `"."`.
@@ -52,18 +55,27 @@ pub fn escapes(normalized: &str) -> bool {
 }
 
 /// `target` resolved against the project-relative directory `dir`, or `None`
-/// when that leaves the project, names the directory's root itself, or
-/// `target` is absolute (a POSIX root or a drive letter). Used for every
+/// when that leaves the project, names the project root itself, or `target`
+/// is empty or absolute (a POSIX root or a drive letter). Used for every
 /// target a manifest or config declares: a package's entries, an `imports`
-/// key's targets, a tsconfig `paths` target. As in tsc, `\\` in `target`
-/// is a separator on every host.
+/// key's targets, a tsconfig `paths` target. As in tsc, `\\` in `target` is
+/// a separator on every host.
 pub fn inside(dir: &str, target: &str) -> Option<String> {
+    inside_or_root(dir, target).filter(|joined| joined != ROOT)
+}
+
+/// [`inside`], except that a target naming the project root itself gives
+/// [`ROOT`]. Only for the targets tsc resolves to the root's `index` file:
+/// a tsconfig `paths` target, a package's `main`-style field, an `imports`
+/// target spelled as a module name (`.`), and a tsconfig `extends` of `.`
+/// or `..`, which names that directory's `tsconfig.json`.
+pub fn inside_or_root(dir: &str, target: &str) -> Option<String> {
     let target = with_forward_slashes(target);
     if target.is_empty() || is_rooted(&target) {
         return None;
     }
     let joined = normalize(&join(dir, &target));
-    (!escapes(&joined)).then_some(joined)
+    (joined == ROOT || !escapes(&joined)).then_some(joined)
 }
 
 /// `dir` and every ancestor of it, nearest first, ending with the root `""`.

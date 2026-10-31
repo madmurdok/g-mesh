@@ -92,7 +92,10 @@ pub fn paths_entries(value: &Json) -> Option<Vec<PathsEntry>> {
 /// Every project-relative path `specifier` could name under `config`, in
 /// declaration order, without repeats. Every matching key contributes; the
 /// existence set picks. A key without `*` is an exact alias. Targets leaving
-/// the project are dropped.
+/// the project are dropped. A target naming the project root is kept (its
+/// `index` files are the candidates) unless an empty `*` capture produced
+/// it: tsc substitutes no empty capture, so `@/` under `"@/*": ["./*"]`
+/// names no root.
 pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     for entry in &config.paths {
@@ -111,7 +114,12 @@ pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec
                 Some(capture) => target.replace('*', capture),
                 None => target.clone(),
             };
-            if let Some(inside) = paths::inside(&config.resolve_dir, &substituted) {
+            let resolved = if capture == Some("") {
+                paths::inside(&config.resolve_dir, &substituted)
+            } else {
+                paths::inside_or_root(&config.resolve_dir, &substituted)
+            };
+            if let Some(inside) = resolved {
                 if !candidates.contains(&inside) {
                     candidates.push(inside);
                 }
@@ -121,33 +129,84 @@ pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec
     candidates
 }
 
+/// The specifiers whose expansion under `config` ([`expand_paths_candidates`])
+/// may include `address`, in declaration order without repeats: a wildcard
+/// entry's pattern with the capture its target pattern takes from `address`
+/// (`@/*` -> `src/*`, `src/x` -> `@/x`), an exact entry's own pattern when
+/// one of its targets is `address`. A wildcard entry whose target has no `*`
+/// names that one path for every capture, so it gives no specifier.
+pub fn specifiers_targeting(config: &EffectiveConfig, address: &str) -> Vec<String> {
+    let mut specifiers: Vec<String> = Vec::new();
+    for entry in &config.paths {
+        for target in &entry.targets {
+            let Some(pattern) = paths::inside_or_root(&config.resolve_dir, target) else {
+                continue;
+            };
+            let specifier = if entry.pattern.contains('*') {
+                match match_wildcard(&pattern, address) {
+                    Some(capture) => entry.pattern.replacen('*', capture, 1),
+                    None => continue,
+                }
+            } else if pattern == address {
+                entry.pattern.clone()
+            } else {
+                continue;
+            };
+            if !specifiers.contains(&specifier) {
+                specifiers.push(specifier);
+            }
+        }
+    }
+    specifiers
+}
+
 /// The config files an `extends` entry written in `config` could name,
-/// project-relative, in the order tsc tries them. An entry may name the
-/// file, drop its `.json`, or name a directory holding a `tsconfig.json`.
+/// project-relative, in the order tsc tries them.
 ///
-/// A relative entry (`./`, `../`) resolves against the config's directory.
-/// A package-named one (`@tsconfig/node18/tsconfig.json`) resolves under
-/// `node_modules` of the config's directory and each ancestor up to the
-/// root. Candidates outside the project, and absolute entries (a POSIX root
-/// or a drive letter), are dropped. As in tsc, `\\` is a separator on every
-/// host.
+/// A relative entry (`./`, `../`) resolves against the config's directory
+/// and names a file: the path as written, then with `.json` appended unless
+/// it already ends in `.json`. It never names a directory, so `../base`
+/// does not reach `../base/tsconfig.json`, and `../` or `./..` names only
+/// the parent's sibling `<parent>.json`.
+/// An entry of exactly `.` or `..` is a module name for the config's own or
+/// parent directory and names that directory's `tsconfig.json`; it may be
+/// the project root's. A package-named entry (`@tsconfig/node18`) resolves
+/// under `node_modules` of the config's directory and each ancestor up to
+/// the root: the file itself when it ends in `.json`, else `<name>.json`
+/// or a directory holding a `tsconfig.json`. Candidates outside the
+/// project, and absolute entries (a POSIX root or a drive letter), are
+/// dropped. As in tsc, `\\` is a separator on every host.
 pub fn extends_candidates(config: &str, entry: &str) -> Vec<String> {
     let config_dir = paths::dirname(config);
     let entry = paths::with_forward_slashes(entry);
     let entry = entry.as_str();
-    let bases: Vec<String> = if entry.starts_with("./") || entry.starts_with("../") {
-        vec![paths::join(config_dir, entry)]
-    } else if entry.is_empty() || paths::is_rooted(entry) || entry.starts_with('.') {
-        Vec::new()
-    } else {
-        paths::ancestors(config_dir)
-            .map(|dir| paths::join(&paths::join(dir, "node_modules"), entry))
-            .collect()
-    };
+    if entry == "." || entry == ".." {
+        return paths::inside_or_root(config_dir, entry)
+            .map(|dir| {
+                let dir = if dir == paths::ROOT { "" } else { dir.as_str() };
+                vec![paths::join(dir, "tsconfig.json")]
+            })
+            .unwrap_or_default();
+    }
+    if entry.starts_with("./") || entry.starts_with("../") {
+        let base = paths::normalize(&paths::join(config_dir, entry));
+        if paths::escapes(&base) {
+            return Vec::new();
+        }
+        return if base.ends_with(".json") {
+            vec![base]
+        } else {
+            let with_json = format!("{base}.json");
+            vec![base, with_json]
+        };
+    }
+    if entry.is_empty() || paths::is_rooted(entry) || entry.starts_with('.') {
+        return Vec::new();
+    }
 
     let mut candidates = Vec::new();
-    for base in bases {
-        let base = paths::normalize(&base);
+    for dir in paths::ancestors(config_dir) {
+        let base = paths::normalize(&paths::join(&paths::join(dir, "node_modules"), entry));
         if paths::escapes(&base) {
             continue;
         }

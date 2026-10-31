@@ -23,7 +23,8 @@
 //! documents for every node delete. For a gone file, core then re-extracts
 //! the files whose imports are linked to it ([`importers_of`],
 //! `Writer::apply_file_diff_linked`), which re-sends those imports onto
-//! another candidate or an unresolved placeholder.
+//! another candidate or an unresolved placeholder. Each importer is owed that
+//! re-extract under its own language.
 
 use std::collections::HashSet;
 
@@ -99,15 +100,23 @@ pub(crate) fn widen(conn: &Connection, file_path: &str, scope: FileScope, diff: 
     Ok(())
 }
 
+/// An importer of a gone file: `(language, path)`.
+pub(crate) type LanguagePath = (String, String);
+
 /// The language of `file_path`'s `File` node and the other files whose
-/// `IMPORTS` edges are linked to it, sorted; `None` when the file has no
-/// `File` node. Read before a gone file's rows are deleted: those edges are
+/// `IMPORTS` edges are linked to it, as `(language, path)` sorted by path;
+/// `None` when the file has no `File` node. An importer's language is its own
+/// `File` node's, falling back to the importing node's language for a file
+/// without one. Read before a gone file's rows are deleted: those edges are
 /// left pointing at the deleted node (see the module doc), and the importers
 /// are what core re-extracts so their imports fall back to another candidate
 /// or come back as unresolved placeholders. A container a file's import is
 /// linked to is not covered: one losing its last member leaves its importers
 /// dangling until they are next reindexed (`graph::containers`).
-pub(crate) fn importers_of(conn: &Connection, file_path: &str) -> Result<Option<(String, Vec<String>)>> {
+pub(crate) fn importers_of(
+    conn: &Connection,
+    file_path: &str,
+) -> Result<Option<(String, Vec<LanguagePath>)>> {
     let language: Option<String> = conn
         .prepare_cached("SELECT language FROM nodes WHERE filePath = ?1 AND kind = 'File' LIMIT 1")
         .and_then(|mut stmt| stmt.query_row(params![file_path], |row| row.get(0)).optional())
@@ -115,13 +124,16 @@ pub(crate) fn importers_of(conn: &Connection, file_path: &str) -> Result<Option<
     let Some(language) = language else { return Ok(None) };
     let importers = conn
         .prepare_cached(
-            "SELECT DISTINCT src.filePath FROM nodes t
+            "SELECT DISTINCT COALESCE(f.language, src.language), src.filePath FROM nodes t
              JOIN edges e ON e.toId = t.id AND e.kind = 'IMPORTS'
              JOIN nodes src ON src.id = e.fromId
+             LEFT JOIN nodes f ON f.filePath = src.filePath AND f.kind = 'File'
              WHERE t.filePath = ?1 AND t.kind = 'File' AND src.filePath <> ?1 AND src.filePath <> ''
-             ORDER BY 1",
+             ORDER BY 2, 1",
         )
-        .and_then(|mut stmt| stmt.query_map(params![file_path], |row| row.get(0))?.collect())
+        .and_then(|mut stmt| {
+            stmt.query_map(params![file_path], |row| Ok((row.get(0)?, row.get(1)?)))?.collect()
+        })
         .context("failed to read the file's importers")?;
     Ok(Some((language, importers)))
 }
