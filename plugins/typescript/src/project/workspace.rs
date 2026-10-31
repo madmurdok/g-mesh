@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::project::exports::{exports_subpaths_targeting, exports_targets};
 use crate::project::jsonc::Json;
 use crate::project::paths;
+use crate::project::resolve::names_file;
 
 /// How deep a `**` glob segment descends below where it starts.
 const MAX_GLOB_DEPTH: usize = 6;
@@ -125,41 +126,44 @@ fn has_url_scheme(specifier: &str) -> bool {
 }
 
 /// Every project-relative path `subpath` of `package` could name, most
-/// specific first: the `exports` map, then (for the root) `source`, `main`,
-/// `module`, `types`, `typings`, then the source conventions `src/index` and
-/// `index` (for a subpath: the subpath itself, then under `src/`).
+/// specific first: the `exports` map, then (for the root) `source`,
+/// `typings`, `types`, `main`, `module`, then the source conventions
+/// `src/index` and `index` (for a subpath: the subpath itself, then under
+/// `src/`). The declared fields follow tsc's order (`typings` before `types`
+/// before `main`; tsc never reads `module`), with `source` first.
+///
+/// An `exports` target must name a file as written ([`names_file`]): tsc
+/// tries no extension or `index` file for it.
 ///
 /// The conventions matter most: a declared entry usually points into build
 /// output (`dist/`) that an unbuilt checkout lacks and a built one ignores,
 /// so it is never in the existence set and cannot shadow the source.
 pub fn package_entry_targets(package: &WorkspacePackage, subpath: &str) -> Vec<String> {
-    // Whether a target naming the project root keeps it: only a `main`-style
-    // field does, as in tsc; an `exports` target naming it names nothing.
-    let mut targets: Vec<(String, bool)> = exports_targets(package.manifest.get("exports"), subpath)
+    let mut targets: Vec<(String, Origin)> = exports_targets(package.manifest.get("exports"), subpath)
         .into_iter()
-        .map(|target| (target, false))
+        .map(|target| (target, Origin::Exports))
         .collect();
 
     if subpath == "." {
-        for field in ["source", "main", "module", "types", "typings"] {
+        for field in ["source", "typings", "types", "main", "module"] {
             if let Some(entry) = package.manifest.get(field).and_then(Json::as_str) {
-                targets.push((entry.to_string(), true));
+                targets.push((entry.to_string(), Origin::Field));
             }
         }
-        targets.push(("src/index".to_string(), false));
-        targets.push(("index".to_string(), false));
+        targets.push(("src/index".to_string(), Origin::Convention));
+        targets.push(("index".to_string(), Origin::Convention));
     } else {
         let relative = &subpath[2..];
-        targets.push((relative.to_string(), false));
-        targets.push((format!("src/{relative}"), false));
+        targets.push((relative.to_string(), Origin::Convention));
+        targets.push((format!("src/{relative}"), Origin::Convention));
     }
 
     let mut resolved: Vec<String> = Vec::new();
-    for (target, root_allowed) in targets {
-        let inside = if root_allowed {
-            paths::inside_or_root(&package.dir, &target)
-        } else {
-            paths::inside(&package.dir, &target)
+    for (target, origin) in targets {
+        let inside = match origin {
+            Origin::Field => paths::inside_or_root(&package.dir, &target),
+            Origin::Exports => paths::inside(&package.dir, &target).filter(|inside| names_file(inside)),
+            Origin::Convention => paths::inside(&package.dir, &target),
         };
         if let Some(inside) = inside {
             if !resolved.contains(&inside) {
@@ -168,6 +172,16 @@ pub fn package_entry_targets(package: &WorkspacePackage, subpath: &str) -> Vec<S
         }
     }
     resolved
+}
+
+/// Where a [`package_entry_targets`] target comes from. Only a `main`-style
+/// field may name the project root, as in tsc; an `exports` target or a
+/// convention naming it names nothing.
+#[derive(Clone, Copy)]
+enum Origin {
+    Exports,
+    Field,
+    Convention,
 }
 
 /// The subpaths of `package` whose [`package_entry_targets`] may include the

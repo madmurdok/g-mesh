@@ -181,6 +181,13 @@ impl TsProject {
     /// equal to `path` itself selects only the importers that were waiting
     /// at `path` before core linked them, not every importer of `path`.
     ///
+    /// A `paths` target climbing out of its capture (`"@m/*": ["./*/..",
+    /// "./gen/*"]`) names one address for a whole family of specifiers, so
+    /// its other targets are offered as target prefixes
+    /// ([`resolve::climbing_target_prefixes`]): `gen/lib/` selects `@m/lib/x`
+    /// both linked to `gen/lib/x.ts` and waiting at `gen/lib/x` once `lib.ts`
+    /// exists.
+    ///
     /// Once per path per model (`announced`), so an ordinary edit costs core
     /// no import scan; `None` (gone) forgets the path, so a re-creation is
     /// offered again. `None` when no address can name `path`.
@@ -196,14 +203,15 @@ impl TsProject {
         keys.extend(resolve::candidates_shadowed_by(path.as_str(), &self.existence));
         keys.extend(resolve::fallbacks_shadowed_by(self, path.as_str()));
         keys.extend(resolve::waiting_addresses_for(self, path.as_str()));
+        let climbing = resolve::climbing_target_prefixes(self, path.as_str());
+        keys.extend(climbing.exact);
         let imports: Vec<ImportSelector> = keys
             .into_iter()
-            .map(|address| ImportSelector {
+            .map(Matcher::Exact)
+            .chain(climbing.prefixes.into_iter().map(Matcher::StartsWith))
+            .map(|matcher| ImportSelector {
                 importers: PathScope { under: String::new(), not_under: Vec::new() },
-                by: ImportMatch::Target {
-                    scope_kind: TargetScopeKind::File,
-                    matcher: Matcher::Exact(address),
-                },
+                by: ImportMatch::Target { scope_kind: TargetScopeKind::File, matcher },
             })
             .collect();
         (!imports.is_empty()).then_some(ResolutionDelta::Affected { files: Vec::new(), imports })

@@ -18,7 +18,9 @@ use g_mesh_plugin_typescript::project::exports::{
 };
 use g_mesh_plugin_typescript::project::jsonc::{parse_json, parse_jsonc, strip_jsonc, Json};
 use g_mesh_plugin_typescript::project::paths::inside;
-use g_mesh_plugin_typescript::project::resolve::{candidate_paths, resolve_relative, EXTENSIONS};
+use g_mesh_plugin_typescript::project::resolve::{
+    candidate_paths, miss_address, resolve_relative, EXTENSIONS,
+};
 use g_mesh_plugin_typescript::project::tsconfig::{
     expand_paths_candidates, extends_candidates, own_resolve_dir, EffectiveConfig, PathsEntry,
 };
@@ -588,14 +590,64 @@ fn the_declared_entry_fields_are_offered_in_a_fixed_order_after_exports() {
         strings(&[
             "packages/p/e.js",
             "packages/p/s.ts",
+            "packages/p/ty.d.ts",
+            "packages/p/t.d.ts",
             "packages/p/m.js",
             "packages/p/mod.js",
-            "packages/p/t.d.ts",
-            "packages/p/ty.d.ts",
             "packages/p/src/index",
             "packages/p/index",
         ])
     );
+}
+
+/// A workspace package entry behaves as tsc reads the manifest: `typings`
+/// before `types` before `main`, and `module` after `main`, so with every
+/// file present `types` beats `main`, `typings` beats `types`, and `main`
+/// beats `module`.
+#[test]
+fn a_workspace_package_resolves_typings_then_types_then_main_then_module() {
+    let fx = Fixture::new(&[
+        ("package.json", r#"{"name":"root","workspaces":["packages/*"]}"#),
+        ("app.ts", SRC),
+        ("packages/a/package.json", r#"{"name":"@s/a","main":"m.js","types":"t.d.ts"}"#),
+        ("packages/a/m.ts", SRC),
+        ("packages/a/t.d.ts", SRC),
+        ("packages/b/package.json", r#"{"name":"@s/b","main":"m.js","types":"t.d.ts","typings":"ty.d.ts"}"#),
+        ("packages/b/m.ts", SRC),
+        ("packages/b/t.d.ts", SRC),
+        ("packages/b/ty.d.ts", SRC),
+        ("packages/c/package.json", r#"{"name":"@s/c","module":"mod.js","main":"m.js"}"#),
+        ("packages/c/m.ts", SRC),
+        ("packages/c/mod.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@s/a", "app.ts"), some("packages/a/t.d.ts"));
+    assert_eq!(resolve(&project, "@s/b", "app.ts"), some("packages/b/ty.d.ts"));
+    assert_eq!(resolve(&project, "@s/c", "app.ts"), some("packages/c/m.ts"));
+}
+
+/// tsc loads an `exports` target as a file: `"./a": "./lib"` names neither
+/// `lib.ts` nor `lib/index.ts`, so `p/a` is not answered through `exports`,
+/// while `"./b": "./b.js"` resolves to `b.ts`. The target stays out of the
+/// entry list; the conventions follow.
+#[test]
+fn an_extensionless_exports_target_names_nothing() {
+    let manifest = r#"{"name":"p","exports":{"./a":"./lib","./b":"./b.js"}}"#;
+    let conventions = package_entry_targets(&package("packages/p", r#"{"name":"p"}"#), "./a");
+    assert_eq!(package_entry_targets(&package("packages/p", manifest), "./a"), conventions);
+    assert_eq!(package_entry_targets(&package("packages/p", manifest), "./b")[0], "packages/p/b.js");
+
+    let fx = Fixture::new(&[
+        ("package.json", r#"{"name":"root","workspaces":["packages/*"]}"#),
+        ("app.ts", SRC),
+        ("packages/p/package.json", manifest),
+        ("packages/p/lib.ts", SRC),
+        ("packages/p/lib/index.ts", SRC),
+        ("packages/p/b.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "p/a", "app.ts"), None);
+    assert_eq!(resolve(&project, "p/b", "app.ts"), some("packages/p/b.ts"));
 }
 
 #[test]
@@ -1458,6 +1510,42 @@ fn a_paths_target_naming_the_root_resolves_to_the_root_index() {
     }
 }
 
+/// tsc substitutes only a non-empty capture: an empty one leaves the literal
+/// `*` in the target, which names no file, so `@/` under `./src/*` is
+/// unresolved and waits nowhere (`miss_address` is `None`). A target without
+/// a `*` is used as written whatever the capture: `@x/` under
+/// `./src/index.ts` resolves.
+#[test]
+fn an_empty_capture_leaves_a_wildcard_target_unresolved_but_not_a_static_one() {
+    let fx = Fixture::new(&[
+        ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["./src/*"],"@x/*":["./src/index.ts"]}}}"#),
+        ("src/index.ts", SRC),
+        ("src/a.ts", SRC),
+        ("app.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@/", "app.ts"), None);
+    assert_eq!(miss_address(&project, "@/", &rel("app.ts")), None);
+    assert_eq!(resolve(&project, "@/a", "app.ts"), some("src/a.ts"), "a non-empty capture still substitutes");
+    assert_eq!(resolve(&project, "@x/", "app.ts"), some("src/index.ts"));
+}
+
+/// An empty capture under a target that is the root (`./`) or a directory
+/// (`./src`) with no `*` resolves it as written: the root index, or
+/// `src/index.ts`.
+#[test]
+fn an_empty_capture_under_a_directory_target_resolves_its_index() {
+    let fx = Fixture::new(&[
+        ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@r/*":["./"],"@s/*":["./src"]}}}"#),
+        ("index.ts", SRC),
+        ("src/index.ts", SRC),
+        ("app.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@r/", "app.ts"), some("index.ts"));
+    assert_eq!(resolve(&project, "@s/", "app.ts"), some("src/index.ts"));
+}
+
 /// `..` names the root from a `baseUrl` below it and from a config below it.
 #[test]
 fn a_paths_target_climbing_to_the_root_from_below_resolves_to_the_root_index() {
@@ -1523,7 +1611,8 @@ fn a_package_whose_main_names_the_root_resolves_to_the_root_index() {
 /// its own spelling, `\` included) may name the root: `.` and `.\` from the
 /// root package, `..` and `..\` from `sub`, `..\..` from `a/b`. A relative
 /// spelling naming the root names nothing, and `..` from the root climbs
-/// out. An empty `*` capture names nothing either.
+/// out. An empty `*` capture names nothing either, nor does an extensionless
+/// relative target (`#r/x` under `./*`).
 #[test]
 fn an_imports_target_spelled_as_a_module_name_may_name_the_root() {
     for (dir, target, names_root) in [
@@ -1547,7 +1636,45 @@ fn an_imports_target_spelled_as_a_module_name_may_name_the_root() {
     }
     let wildcard = imports("", r##"{"#r/*":"./*"}"##);
     assert_eq!(imports_targets(&wildcard, "#r/"), Vec::<String>::new());
-    assert_eq!(imports_targets(&wildcard, "#r/x"), strings(&["x"]));
+    assert_eq!(imports_targets(&wildcard, "#r/x"), Vec::<String>::new());
+}
+
+/// tsc gives a relative `imports` target neither an extension nor a
+/// directory index: `#e: "./lib"` names nothing though `lib.ts` and
+/// `lib/index.ts` exist, nor does `#f: "./lib2"`, and an empty `*` capture
+/// under `./src/*` (`./src/`) is no file, nor is `#r/index` (`./src/index`).
+#[test]
+fn a_relative_imports_target_without_an_extension_names_nothing() {
+    let fx = Fixture::new(&[
+        ("package.json", r##"{"name":"root","imports":{"#e":"./lib","#f":"./lib2","#r/*":"./src/*"}}"##),
+        ("lib.ts", SRC),
+        ("lib/index.ts", SRC),
+        ("lib2.ts", SRC),
+        ("src/index.ts", SRC),
+        ("app.ts", SRC),
+    ]);
+    let project = fx.load();
+    for specifier in ["#e", "#f", "#r/", "#r/index"] {
+        assert_eq!(resolve(&project, specifier, "app.ts"), None, "{specifier}");
+    }
+}
+
+/// A target that names its file still resolves: the TS source of a JS
+/// extension (`#r/x.js` under `./src/*` -> `src/x.ts`, `#t/` under
+/// `./lib2.js` -> `lib2.ts`), and the module-name form `.` the root index.
+#[test]
+fn a_relative_imports_target_naming_a_file_still_resolves() {
+    let fx = Fixture::new(&[
+        ("package.json", r##"{"name":"root","imports":{"#r/*":"./src/*","#t/*":"./lib2.js","#x":"."}}"##),
+        ("src/x.ts", SRC),
+        ("lib2.ts", SRC),
+        ("index.ts", SRC),
+        ("app.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "#r/x.js", "app.ts"), some("src/x.ts"));
+    assert_eq!(resolve(&project, "#t/", "app.ts"), some("lib2.ts"));
+    assert_eq!(resolve(&project, "#x", "app.ts"), some("index.ts"));
 }
 
 /// The same through a loaded model, from the importer's nearest package.

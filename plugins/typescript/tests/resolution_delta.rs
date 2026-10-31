@@ -20,7 +20,7 @@ use g_mesh_plugin_sdk::{Extractor, RelPath};
 use g_mesh_plugin_typescript::extractor::TypeScriptExtractor;
 use g_mesh_plugin_typescript::project::facts::TsFacts;
 use g_mesh_plugin_typescript::project::resolve::{
-    addresses_resolving_to, candidates_shadowed_by, fallbacks_shadowed_by, resolve,
+    addresses_resolving_to, candidates_shadowed_by, climbing_target_prefixes, fallbacks_shadowed_by, resolve,
 };
 use g_mesh_plugin_typescript::project::TsProject;
 
@@ -1353,4 +1353,209 @@ fn a_created_static_alias_target_offers_its_own_path() {
     let imports = [("package.json", r##"{"name":"root","imports":{"#env/*":"./src/env.ts"}}"##)];
     let offer = first_offer(&imports, "src/env.ts");
     assert!(offer.contains("src/env.ts"), "imports: {offer:?}");
+}
+
+// -------------------------------------------------------------------------
+// source_changed: a `paths` target that climbs out of its capture
+// -------------------------------------------------------------------------
+
+/// The selectors of `delta` that are target prefixes (`StartsWith`).
+fn prefixes(delta: &Option<ResolutionDelta>) -> Vec<String> {
+    let Some(ResolutionDelta::Affected { imports, .. }) = delta else { return Vec::new() };
+    imports
+        .iter()
+        .filter_map(|selector| match &selector.by {
+            ImportMatch::Target { matcher: Matcher::StartsWith(prefix), .. } => Some(prefix.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `delta` selects an import stored as targeting `target` (a linked
+/// file or the address a waiting import sits at).
+fn selects_target(delta: &Option<ResolutionDelta>, target: &str) -> bool {
+    let Some(ResolutionDelta::Affected { imports, .. }) = delta else { return false };
+    imports.iter().any(|selector| {
+        matches!(&selector.by, ImportMatch::Target { scope_kind: TargetScopeKind::File, matcher } if matcher.matches(target))
+    })
+}
+
+/// `files` (a tsconfig whose `paths` are `paths`, plus [`MAIN`] importing
+/// `specifier`): the importer targets `stored` before `created` is
+/// written, what `specifier` names afterwards, and the delta the plugin
+/// answers for the create.
+///
+/// An importer already linked stores its file; a waiting one stores the
+/// address it waits at.
+fn climbing_create(
+    paths: &str,
+    extra: &[(&str, &str)],
+    specifier: &str,
+    stored: (&str, &str),
+    created: &str,
+    after: &str,
+) -> Option<ResolutionDelta> {
+    let tsconfig = alias_tsconfig(paths);
+    let importer = format!("import {{ v }} from \"{specifier}\";\n");
+    let mut files: Vec<(&str, &str)> = vec![("tsconfig.json", tsconfig.as_str()), (MAIN, importer.as_str())];
+    files.extend_from_slice(extra);
+    let fixture = Fixture::new(&files);
+    let project = fixture.load();
+    let (kind, target) = stored;
+    if kind == "linked" {
+        assert_eq!(resolves_to(&project, specifier).as_deref(), Some(target), "{specifier} before");
+    } else {
+        assert_eq!(resolves_to(&project, specifier), None, "{specifier} before");
+        assert_eq!(waits_at(&files, specifier), resolved(target), "{specifier} waits");
+    }
+    fixture.write(created, b"export const v = 2;\n");
+    let mut project = fixture.load();
+    assert_eq!(resolves_to(&project, specifier).as_deref(), Some(after), "{specifier} after");
+    source_changed(&mut project, created, Some("export const v = 2;\n"))
+}
+
+/// `["./*/..", "./gen/*"]`: `@m/lib/x` linked to `gen/lib/x.ts` moves to a
+/// created `lib.ts` (`./lib/x/..`), a target no specifier derived from
+/// `lib.ts` names. The delta selects it by the prefix `gen/lib/` of the
+/// other target, and `source_changed` offers that prefix.
+///
+/// Control: `climbing_target_prefixes` returns no keys.
+#[test]
+fn a_created_file_a_climbing_target_reaches_selects_the_importers_linked_by_another_target() {
+    let delta = climbing_create(
+        r#"{"@m/*":["./*/..","./gen/*"]}"#,
+        &[("gen/lib/x.ts", "export const v = 1;\n")],
+        "@m/lib/x",
+        ("linked", "gen/lib/x.ts"),
+        "lib.ts",
+        "lib.ts",
+    );
+    assert!(prefixes(&delta).iter().any(|prefix| prefix == "gen/lib/"), "{delta:?}");
+    assert!(selects_target(&delta, "gen/lib/x.ts"), "{delta:?}");
+}
+
+/// `["./gen/*", "./*/.."]`: `@m/lib/x` waits at `gen/lib/x` (its first
+/// base) and links to a created `lib.ts`, which no finite list of exact
+/// keys names: the prefix selector does.
+///
+/// Control: `climbing_target_prefixes` returns no keys.
+#[test]
+fn a_created_file_a_climbing_target_reaches_selects_the_importers_waiting_at_another_target() {
+    let delta = climbing_create(
+        r#"{"@m/*":["./gen/*","./*/.."]}"#,
+        &[],
+        "@m/lib/x",
+        ("waiting", "gen/lib/x"),
+        "lib.ts",
+        "lib.ts",
+    );
+    assert!(selects_target(&delta, "gen/lib/x"), "{delta:?}");
+}
+
+/// A partial head (`./src/p*/..`, capture `x` -> `src`) and a root one
+/// (`./p*/..`, capture `x` -> the root) climb out of the whole capture:
+/// the created `src/index.ts` (or root `index.ts`) takes `@m/x` over from
+/// `gen/x.ts`.
+///
+/// Control: `Climb::consumes_capture_at` answers false.
+#[test]
+fn a_climb_that_consumes_a_partial_head_capture_selects_the_importers_of_the_other_target() {
+    for (paths, created) in [
+        (r#"{"@m/*":["./src/p*/..","./gen/*"]}"#, "src/index.ts"),
+        (r#"{"@m/*":["./p*/..","./gen/*"]}"#, "index.ts"),
+    ] {
+        let delta = climbing_create(
+            paths,
+            &[("gen/x.ts", "export const v = 1;\n")],
+            "@m/x",
+            ("linked", "gen/x.ts"),
+            created,
+            created,
+        );
+        assert!(selects_target(&delta, "gen/x.ts"), "{paths} {created}: {delta:?}");
+    }
+}
+
+/// A climb deeper than the capture (`./src/a/*/../..`, capture `x` ->
+/// `src`) reaches an ancestor of the head's directory: `src/index.ts` takes
+/// `@m/x` over from `gen/x.ts`.
+///
+/// Control: `Climb::consumes_capture_at` answers false.
+#[test]
+fn a_climb_deeper_than_its_capture_selects_the_importers_of_the_other_target() {
+    let delta = climbing_create(
+        r#"{"@m/*":["./src/a/*/../..","./gen/*"]}"#,
+        &[("gen/x.ts", "export const v = 1;\n")],
+        "@m/x",
+        ("linked", "gen/x.ts"),
+        "src/index.ts",
+        "src/index.ts",
+    );
+    assert!(selects_target(&delta, "gen/x.ts"), "{delta:?}");
+}
+
+/// An exact entry next to the climbing wildcard: `@m/lib/special` linked to
+/// `special.ts` through `./special` moves to a created `lib.ts` (the
+/// wildcard's `./lib/special/..` comes first). The exact entry's own target
+/// is offered, not only an importer waiting at it.
+///
+/// Control: `offer_family` skips the exact entries.
+#[test]
+fn an_exact_entry_next_to_a_climbing_target_selects_the_importers_linked_to_its_file() {
+    let delta = climbing_create(
+        r#"{"@m/*":["./*/.."],"@m/lib/special":["./special"]}"#,
+        &[("special.ts", "export const v = 1;\n")],
+        "@m/lib/special",
+        ("linked", "special.ts"),
+        "lib.ts",
+        "lib.ts",
+    );
+    assert!(selects_target(&delta, "special.ts"), "{delta:?}");
+}
+
+/// A second target that climbs too (`./*/../../x`, capture `lib/y` -> `x`):
+/// `@m/lib/y` linked to `x.ts` moves to a created `lib.ts`.
+///
+/// Control: `offer_target` treats every target as non-climbing.
+#[test]
+fn another_climbing_target_selects_the_importers_it_names_through_its_own_climb() {
+    let delta = climbing_create(
+        r#"{"@m/*":["./*/..","./*/../../x"]}"#,
+        &[("x.ts", "export const v = 1;\n")],
+        "@m/lib/y",
+        ("linked", "x.ts"),
+        "lib.ts",
+        "lib.ts",
+    );
+    assert!(selects_target(&delta, "x.ts"), "{delta:?}");
+}
+
+/// A config without a `*`-then-`..` target (also one with `..` elsewhere)
+/// adds no prefix selector, and a root index under a climbing config never
+/// emits the empty prefix, which would select every import.
+///
+/// Control: `climbing_target_prefixes` emits a prefix for every config.
+#[test]
+fn an_ordinary_config_adds_no_prefix_selector_and_none_is_ever_empty() {
+    for paths in [
+        r#"{"@/*":["./src/*","./gen/*"]}"#,
+        r#"{"@/*":["../lib/*"],"x":["./a/../b"]}"#,
+        r#"{"@m/*":["./*/..","./*"]}"#,
+        r#"{"@m/*":["./*/..","./"]}"#,
+    ] {
+        let tsconfig = alias_tsconfig(paths);
+        let fixture =
+            Fixture::new(&[("tsconfig.json", tsconfig.as_str()), ("index.ts", ""), ("src/a.ts", "")]);
+        let mut project = fixture.load();
+        for path in ["index.ts", "src/a.ts", "src/index.ts"] {
+            let keys = climbing_target_prefixes(&project, path);
+            assert!(keys.prefixes.iter().all(|prefix| !prefix.is_empty()), "{paths} {path}: {keys:?}");
+            let delta = source_changed(&mut project, path, Some(""));
+            assert!(prefixes(&delta).iter().all(|prefix| !prefix.is_empty()), "{paths} {path}: {delta:?}");
+            if paths.starts_with(r#"{"@/*":["#) {
+                assert_eq!(keys, Default::default(), "{paths} {path}");
+                assert!(prefixes(&delta).is_empty(), "{paths} {path}: {delta:?}");
+            }
+        }
+    }
 }
