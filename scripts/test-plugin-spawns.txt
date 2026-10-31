@@ -4,7 +4,8 @@
 #
 # <binary>:<module>   <plugins it spawns, or none>
 # binary: it (core/tests/it, one row per module), scripts (core/tests/scripts),
-# lib (core lib test modules; only those that spawn a plugin).
+# lib (core lib test modules that spawn a plugin or read plugins/; `none`
+# marks one that only reads plugin.toml).
 # `observe --write` adds what it sees and never drops a listed plugin.
 it:absent_language_field                                 rust python
 it:ambiguous_reexport_linking                            typescript rust python go
@@ -93,7 +94,14 @@ it:walk_follows_symlinks                                 typescript rust python 
 it:wedged_daemon                                         typescript
 it:worktree_daemon_lifecycle                             typescript rust python go
 it:worktree_seed                                         typescript
+lib:daemon::registry::tests                              typescript rust python go
 lib:daemon::manifest::tests                              typescript
 lib:daemon::plugin::tests                                typescript
 lib:mcp::member_name_collision_tests                     typescript rust python go
 lib:mcp::unlinked::tests                                 rust
+lib:mcp::instructions::tests                             none
+lib:graph::symbol_links::tests                           none
+lib:languages::tests                                     none
+lib:cli::status::tests                                   none
+lib:cli::agent_instructions                              none
+lib:storage::index_store                                 none

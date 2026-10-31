@@ -26,7 +26,8 @@
 # - A change under `core/` selects every core section; one under
 #   `core/tests/log_line/` (which the SDK's tests include) adds `sdk`. With
 #   `--narrow` only: `core/src/cli/` or `core/src/mcp/` selects that module's
-#   lib section and `core-it`; `core/tests/it/` selects `core-it`;
+#   lib section and `core-it` (`cli/` also `core-rest`: a storage test calls
+#   `cli::status::index_status`); `core/tests/it/` selects `core-it`;
 #   `core/tests/scripts/` selects `core-it` and `core-scripts`; any other
 #   `core/src/` path outside SCRIPTS_CLOSURE selects every core section but
 #   `core-scripts`.
@@ -165,7 +166,7 @@ classify() {
 	core/tests/log_line/*) add sdk "${CORE[@]}" ;;
 	# Leaf modules, local runs only: their lib tests and the integration tests,
 	# not the rest of the lib (docs/adr/0031-local-test-runs.md).
-	core/src/cli/*) if [ -n "$narrow" ]; then add core-cli core-it; else add "${CORE[@]}"; fi ;;
+	core/src/cli/*) if [ -n "$narrow" ]; then add core-cli core-rest core-it; else add "${CORE[@]}"; fi ;;
 	core/src/mcp/*) if [ -n "$narrow" ]; then add core-mcp core-it; else add "${CORE[@]}"; fi ;;
 	# SCRIPTS_CLOSURE
 	core/src/lib.rs | core/src/log.rs | core/src/languages.rs | core/src/languages/* | \

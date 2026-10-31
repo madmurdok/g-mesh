@@ -82,6 +82,16 @@ wt="$(dirname "$main")/$(basename "$main")-wt-$suffix"
 echo "== git worktree add $wt -b $branch $base"
 git -C "$repo" worktree add "$wt" -b "$branch" "$base"
 
+# A later failure leaves the worktree and branch in place; say how to remove them.
+on_exit() {
+	local rc=$?
+	if [ "$rc" -ne 0 ]; then
+		echo "new-task-worktree: failed after creating $wt (branch $branch); remove it with:" >&2
+		echo "  cd $(dirname "$wt") && ~/.claude/hooks/wt-cleanup.sh $(basename "$wt")" >&2
+	fi
+}
+trap on_exit EXIT
+
 for dir in plugins/typescript plugins/python; do
 	if [ -f "$wt/$dir/package-lock.json" ]; then
 		echo "== npm ci in $dir"
