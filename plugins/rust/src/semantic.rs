@@ -216,7 +216,7 @@ pub fn server_config_with(root: &Path, launcher: &Path) -> Result<SemanticConfig
     if let Some(proxy) = cargo_home.as_deref().and_then(script_proxy) {
         g_mesh_plugin_sdk::log_line!(
             "[{LANGUAGE}] semantic tier: rust-analyzer will run {}, a script whose target the sandbox \
-             does not allow; the workspace may not load",
+             may not allow; the workspace may not load",
             proxy.display()
         );
     }
