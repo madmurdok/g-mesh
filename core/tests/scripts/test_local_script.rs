@@ -807,7 +807,18 @@ fn a_dry_run_without_the_plugin_node_modules_still_succeeds() {
 /// appends its arguments to the record file. The CI gate stub records `gate`
 /// and fails when `gate_status` is not 0. Returns the output and the record.
 fn run_cut_release(root: &Path, args: &[&str], gate_status: i32) -> (Output, Vec<String>) {
-    let stub = "#!/bin/sh\necho \"test-sections $*\" >> \"$GM628_RECORD\"\nexit 0\n";
+    run_cut_release_with(root, args, gate_status, &[])
+}
+
+/// `run_cut_release` with extra environment: `SECTIONS_STATUS` is the exit
+/// status of `test-sections.sh`, `VERSION_DRIFT=1` makes the version check die.
+fn run_cut_release_with(
+    root: &Path,
+    args: &[&str],
+    gate_status: i32,
+    env: &[(&str, &str)],
+) -> (Output, Vec<String>) {
+    let stub = "#!/bin/sh\necho \"test-sections $*\" >> \"$GM628_RECORD\"\nexit ${SECTIONS_STATUS:-0}\n";
     let sections = root.join("scripts/test-sections.sh");
     fs::write(&sections, stub).unwrap();
     fs::set_permissions(&sections, fs::Permissions::from_mode(0o755)).unwrap();
@@ -830,7 +841,7 @@ fn run_cut_release(root: &Path, args: &[&str], gate_status: i32) -> (Output, Vec
         check_no_untagged_prior_releases() { :; }
         check_release_merge_shape() { :; }
         wait_for_green_full_ci() { echo "gate $*" >> "$GM628_RECORD"; [ "$GATE_STATUS" = 0 ] || die "gate failed"; }
-        check_workspace_versions() { :; }
+        check_workspace_versions() { [ "${VERSION_DRIFT:-0}" = 0 ] || die "version drift"; }
         check_crate_backed_plugin_versions() { :; }
         check_self_versioned_plugin_versions() { :; }
         check_core_feature_isolation() { :; }
@@ -845,6 +856,7 @@ fn run_cut_release(root: &Path, args: &[&str], gate_status: i32) -> (Output, Vec
         .current_dir(other_cwd.path())
         .env("GM628_RECORD", &record)
         .env("GATE_STATUS", gate_status.to_string())
+        .envs(env.iter().copied())
         .output()
         .expect("failed to run bash");
     let lines = fs::read_to_string(&record).unwrap_or_default().lines().map(String::from).collect();
@@ -858,8 +870,13 @@ fn a_cut_release_runs_check_then_the_ci_gate_then_tags_and_runs_no_suite() {
     let root = fake_root(false);
     let (output, record) = run_cut_release(root.path(), &["9.9.9", "--ci-timeout", "7"], 0);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
-    assert!(!record.iter().any(|l| l.starts_with("cargo") || l.starts_with("test-sections run")), "{record:?}");
-    let pos = |needle: &str| record.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle}: {record:?}"));
+    assert!(
+        !record.iter().any(|l| l.starts_with("cargo") || l.starts_with("test-sections run")),
+        "{record:?}"
+    );
+    let pos = |needle: &str| {
+        record.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle}: {record:?}"))
+    };
     assert!(pos("test-sections check") < pos("gate 9.9.9 main 7"), "{record:?}");
     assert!(pos("gate ") < pos(" tag -a "), "{record:?}");
 }
@@ -870,7 +887,11 @@ fn a_cut_release_with_skip_tests_dies() {
     let root = fake_root(false);
     let (output, record) = run_cut_release(root.path(), &["9.9.9", "--skip-tests"], 0);
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--skip-tests is gone (GM-675)"), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--skip-tests is gone (GM-675)"),
+        "{}",
+        describe(&output)
+    );
     assert!(record.is_empty(), "{record:?}");
 }
 
@@ -881,4 +902,25 @@ fn a_failing_ci_gate_leaves_no_tag() {
     let (output, record) = run_cut_release(root.path(), &["9.9.9"], 1);
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     assert!(!record.iter().any(|l| l.contains(" tag -a ")), "{record:?}");
+}
+
+/// A failing `test-sections.sh check` dies before the CI gate and the tag.
+#[test]
+fn a_failing_sections_check_dies_before_the_ci_gate() {
+    let root = fake_root(false);
+    let (output, record) = run_cut_release_with(root.path(), &["9.9.9"], 0, &[("SECTIONS_STATUS", "1")]);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(record.iter().any(|l| l.contains("test-sections check")), "{record:?}");
+    assert!(!record.iter().any(|l| l.starts_with("gate ") || l.contains(" tag -a ")), "{record:?}");
+}
+
+/// Every cheap check runs before the CI gate: a version drift dies without
+/// the gate (which would query GitHub) being called.
+#[test]
+fn a_version_drift_dies_before_the_ci_gate_is_called() {
+    let root = fake_root(false);
+    let (output, record) = run_cut_release_with(root.path(), &["9.9.9"], 0, &[("VERSION_DRIFT", "1")]);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("version drift"), "{}", describe(&output));
+    assert!(!record.iter().any(|l| l.starts_with("gate ")), "{record:?}");
 }

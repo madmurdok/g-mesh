@@ -735,13 +735,26 @@ const VERSION: &str = "9.9.9";
 /// A scratch release: `release-9.9.9` pushed to a bare `origin` and merged
 /// into `main` with the subject the gate expects, plus a stand-in `gh` that
 /// answers `gh api <endpoint> --jq <filter>` by running the real `jq` on
-/// `<fixtures>/runs.json` or `<fixtures>/jobs-<run id>.json`.
+/// `<fixtures>/runs-<n>.json` (the n-th runs query; the last file repeats) or
+/// `<fixtures>/jobs-<run id>.json`. Every call is appended to
+/// `<fixtures>/calls`; `<fixtures>/failures` holds how many runs queries
+/// still fail with exit 1.
 struct Release {
     dir: tempfile::TempDir,
 }
 
 impl Release {
     fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// `main` holds a commit the release branch lacks, so the merge's tree
+    /// differs from the tested tip's.
+    fn with_main_work() -> Self {
+        Self::build(true)
+    }
+
+    fn build(main_work: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
         let origin = dir.path().join("origin.git");
@@ -758,6 +771,11 @@ impl Release {
         git(&root, &["remote", "add", "origin", origin.to_str().unwrap()]);
         git(&root, &["push", "-q", "origin", &format!("release-{VERSION}")]);
         git(&root, &["checkout", "-q", "main"]);
+        if main_work {
+            write_file(&root, "c.txt", "c\n");
+            git(&root, &["add", "c.txt"]);
+            git(&root, &["commit", "-q", "-m", "main work"]);
+        }
         git(
             &root,
             &[
@@ -775,8 +793,15 @@ impl Release {
                 r#"#!/bin/sh
 # gh api <endpoint> --jq <filter>
 [ "$1" = api ] && [ "$3" = --jq ] || {{ echo "fake gh: unexpected call: $*" >&2; exit 99; }}
+f="{fixtures}"
+echo "$2" >> "$f/calls"
 case "$2" in
-*/workflows/ci.yml/runs*) file=runs.json ;;
+*/workflows/ci.yml/runs*)
+  left=$(cat "$f/failures" 2>/dev/null || echo 0)
+  if [ "$left" -gt 0 ]; then echo $((left - 1)) > "$f/failures"; echo "fake gh: HTTP 502" >&2; exit 1; fi
+  n=$(( $(cat "$f/runs.count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$f/runs.count"
+  while [ ! -f "$f/runs-$n.json" ] && [ "$n" -gt 1 ]; do n=$((n - 1)); done
+  file="runs-$n.json" ;;
 */actions/runs/*/jobs*) id="${{2#*/actions/runs/}}"; file="jobs-${{id%%/*}}.json" ;;
 *) echo "fake gh: unexpected endpoint $2" >&2; exit 99 ;;
 esac
@@ -790,18 +815,52 @@ exec jq -r "$4" "{fixtures}/$file"
         Release { dir }
     }
 
-    /// ci.yml runs on the tip, as (run id, conclusion). GM-675: each run
-    /// carries the tip's `head_sha`, `completed` and attempt 1.
-    fn runs(&self, runs: &[(u64, &str)]) {
-        let tip = git_out(&self.dir.path().join("repo"), &["rev-parse", "main^2"]);
+    fn tip(&self) -> String {
+        git_out(&self.dir.path().join("repo"), &["rev-parse", "main^2"])
+    }
+
+    /// The answer of the `n`-th runs query: runs of `head_sha` as
+    /// (run id, status, conclusion, attempt); conclusion "none" is null.
+    fn runs_of(&self, n: usize, head_sha: &str, runs: &[(u64, &str, &str, u32)]) {
         let runs: Vec<_> = runs
             .iter()
-            .map(|(id, c)| {
-                json!({ "id": id, "conclusion": c, "status": "completed", "head_sha": tip, "run_attempt": 1 })
+            .map(|(id, status, c, attempt)| {
+                let conclusion = if *c == "none" { json!(null) } else { json!(c) };
+                json!({ "id": id, "status": status, "conclusion": conclusion, "head_sha": head_sha, "run_attempt": attempt })
             })
             .collect();
-        fs::write(self.dir.path().join("fixtures/runs.json"), json!({ "workflow_runs": runs }).to_string())
-            .unwrap();
+        fs::write(
+            self.dir.path().join(format!("fixtures/runs-{n}.json")),
+            json!({ "workflow_runs": runs }).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// The `n`-th runs query answers with these runs of the tip.
+    fn runs_at(&self, n: usize, runs: &[(u64, &str, &str, u32)]) {
+        self.runs_of(n, &self.tip(), runs);
+    }
+
+    /// Every runs query answers with these completed runs of the tip, attempt 1.
+    fn runs(&self, runs: &[(u64, &str)]) {
+        let rows: Vec<_> = runs.iter().map(|(id, c)| (*id, "completed", *c, 1)).collect();
+        self.runs_at(1, &rows);
+    }
+
+    fn fail_runs_queries(&self, times: u32) {
+        fs::write(self.dir.path().join("fixtures/failures"), times.to_string()).unwrap();
+    }
+
+    fn calls(&self) -> String {
+        fs::read_to_string(self.dir.path().join("fixtures/calls")).unwrap_or_default()
+    }
+
+    fn runs_queries(&self) -> usize {
+        self.calls().lines().filter(|l| l.contains("/workflows/ci.yml/runs")).count()
+    }
+
+    fn tags(&self) -> String {
+        git_out(&self.dir.path().join("repo"), &["tag", "-l"])
     }
 
     /// The jobs of run `id`, as (name, conclusion).
@@ -815,13 +874,23 @@ exec jq -r "$4" "{fixtures}/$file"
     }
 
     fn check(&self) -> Output {
+        self.check_within(90)
+    }
+
+    /// The gate as `main()` calls it, then the tag: `die` exits, so a tag
+    /// exists afterwards only when the gate returned.
+    fn check_within(&self, timeout_min: u32) -> Output {
         Command::new("bash")
             .arg("-c")
-            .arg(r#"source "$1" && REPO_ROOT="$2" && check_release_merge_shape "$3" && wait_for_green_full_ci "$3""#)
+            .arg(
+                r#"source "$1" && REPO_ROOT="$2" && check_release_merge_shape "$3" && wait_for_green_full_ci "$3" main "$4"; git -C "$2" tag -a "v$3" -m release"#,
+            )
             .arg("cut-release-test")
             .arg(repo_root().join("scripts/cut-release.sh"))
             .arg(self.dir.path().join("repo"))
             .arg(VERSION)
+            .arg(timeout_min.to_string())
+            .env("CUT_RELEASE_CI_POLL_SECS", "0")
             .env(
                 "PATH",
                 format!(
@@ -913,4 +982,205 @@ fn the_gates_job_name_is_the_full_suite_jobs_name_in_ci_yml() {
         .expect("full-suite job has a name");
     assert_eq!(in_script, name.trim().trim_matches('"').trim_matches('\''));
     assert_eq!(in_script, FULL_JOB);
+}
+
+fn assert_died_untagged(release: &Release, output: &Output, message: &str) {
+    assert!(!output.status.success(), "the gate let the tag through\n{}", describe(output));
+    assert!(stderr_of(output).contains(message), "{}", describe(output));
+    assert_eq!(release.tags(), "", "a tag exists after the gate died");
+}
+
+fn full_jobs(release: &Release, id: u64) {
+    release.jobs(id, &[("tests", "success"), (FULL_JOB, "success")]);
+}
+
+#[test]
+fn a_green_full_run_on_the_tip_lets_the_tag_through() {
+    let release = Release::new();
+    release.runs(&[(61, "success")]);
+    full_jobs(&release, 61);
+    let output = release.check();
+    assert!(output.status.success(), "{}", describe(&output));
+    assert_eq!(release.tags(), format!("v{VERSION}"));
+}
+
+#[test]
+fn a_running_run_is_waited_for_and_the_tag_follows_its_green() {
+    let release = Release::new();
+    release.runs_at(1, &[(71, "queued", "none", 1)]);
+    release.runs_at(2, &[(71, "in_progress", "none", 1)]);
+    release.runs_at(3, &[(71, "completed", "success", 1)]);
+    full_jobs(&release, 71);
+    let output = release.check();
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(stdout_of(&output).contains("waiting for ci.yml run 71"), "{}", describe(&output));
+    assert_eq!(release.runs_queries(), 3);
+    assert_eq!(release.tags(), format!("v{VERSION}"));
+}
+
+#[test]
+fn a_failed_run_is_refused_naming_its_id_attempt_and_url() {
+    let release = Release::new();
+    release.runs_at(1, &[(81, "completed", "failure", 2)]);
+    let output = release.check();
+    assert_died_untagged(&release, &output, "no green full ci.yml run");
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("run 81: failure (attempt 2)"), "{}", describe(&output));
+    assert!(stderr.contains("/actions/runs/81"), "{}", describe(&output));
+    assert!(!stderr.contains("ci.yml concurrency"), "{}", describe(&output));
+}
+
+#[test]
+fn a_cancelled_run_alone_is_refused_with_the_concurrency_note() {
+    let release = Release::new();
+    release.runs_at(1, &[(91, "completed", "cancelled", 1)]);
+    let output = release.check();
+    assert_died_untagged(&release, &output, "run 91: cancelled");
+    assert!(stderr_of(&output).contains("ci.yml concurrency"), "{}", describe(&output));
+}
+
+#[test]
+fn a_timed_out_or_never_started_run_is_refused() {
+    for conclusion in ["timed_out", "startup_failure"] {
+        let release = Release::new();
+        release.runs_at(1, &[(101, "completed", conclusion, 1)]);
+        let output = release.check();
+        assert_died_untagged(&release, &output, &format!("run 101: {conclusion}"));
+    }
+}
+
+#[test]
+fn a_tip_without_any_run_is_refused_with_the_push_and_dispatch_hint() {
+    let release = Release::new();
+    release.runs_at(1, &[]);
+    let output = release.check();
+    assert_died_untagged(&release, &output, "no ci.yml run for");
+    assert!(
+        stderr_of(&output).contains(&format!("gh workflow run ci.yml --ref release-{VERSION}")),
+        "{}",
+        describe(&output)
+    );
+}
+
+#[test]
+fn a_release_branch_that_moved_on_origin_is_refused_before_any_query() {
+    let release = Release::new();
+    let repo = release.dir.path().join("repo");
+    git(&repo, &["checkout", "-q", &format!("release-{VERSION}")]);
+    write_file(&repo, "late.txt", "late\n");
+    git(&repo, &["add", "late.txt"]);
+    git(&repo, &["commit", "-q", "-m", "pushed after the merge"]);
+    git(&repo, &["push", "-q", "origin", &format!("release-{VERSION}")]);
+    git(&repo, &["checkout", "-q", "main"]);
+    release.runs(&[(111, "success")]);
+    full_jobs(&release, 111);
+    let output = release.check();
+    assert_died_untagged(&release, &output, &format!("origin/release-{VERSION} is at"));
+    assert_eq!(release.calls(), "");
+}
+
+#[test]
+fn a_green_run_of_another_commit_does_not_count() {
+    let release = Release::new();
+    release.runs_of(1, &"0".repeat(40), &[(121, "completed", "success", 1)]);
+    full_jobs(&release, 121);
+    let output = release.check();
+    assert_died_untagged(&release, &output, "no ci.yml run for");
+    assert!(!release.calls().contains("/jobs"), "{}", release.calls());
+}
+
+#[test]
+fn a_main_with_commits_the_release_branch_lacks_is_refused_before_any_query() {
+    let release = Release::with_main_work();
+    release.runs(&[(131, "success")]);
+    full_jobs(&release, 131);
+    let output = release.check();
+    assert_died_untagged(&release, &output, "main has commits that are not on");
+    assert_eq!(release.calls(), "");
+}
+
+#[test]
+fn a_run_still_running_at_the_timeout_is_refused_naming_it() {
+    let release = Release::new();
+    release.runs_at(1, &[(141, "in_progress", "none", 1)]);
+    let output = release.check_within(0);
+    assert_died_untagged(&release, &output, "run 141");
+    assert!(stderr_of(&output).contains("still running after 0m"), "{}", describe(&output));
+    assert_eq!(release.runs_queries(), 1);
+}
+
+#[test]
+fn a_re_run_failed_run_is_waited_for_and_read_from_its_latest_attempt() {
+    let release = Release::new();
+    release.runs_at(1, &[(151, "in_progress", "none", 2)]);
+    release.runs_at(2, &[(151, "completed", "success", 2)]);
+    full_jobs(&release, 151);
+    let output = release.check();
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(stdout_of(&output).contains("attempt 2"), "{}", describe(&output));
+    assert!(release.calls().contains("/actions/runs/151/jobs?filter=latest"), "{}", release.calls());
+    assert_eq!(release.tags(), format!("v{VERSION}"));
+}
+
+#[test]
+fn a_green_full_run_wins_over_failed_cancelled_and_running_runs_of_the_tip() {
+    let release = Release::new();
+    release.runs_at(
+        1,
+        &[
+            (161, "completed", "failure", 1),
+            (162, "completed", "cancelled", 1),
+            (163, "in_progress", "none", 1),
+            (164, "completed", "success", 1),
+        ],
+    );
+    full_jobs(&release, 164);
+    let output = release.check();
+    assert!(output.status.success(), "{}", describe(&output));
+    assert_eq!(release.runs_queries(), 1, "the gate waited although a green full run existed");
+    assert_eq!(release.tags(), format!("v{VERSION}"));
+}
+
+#[test]
+fn three_failed_queries_in_a_row_are_refused_and_one_is_retried() {
+    let release = Release::new();
+    release.runs(&[(171, "success")]);
+    full_jobs(&release, 171);
+    release.fail_runs_queries(3);
+    let output = release.check();
+    assert_died_untagged(&release, &output, "after 3 attempts");
+    assert_eq!(release.runs_queries(), 3);
+
+    let release = Release::new();
+    release.runs(&[(172, "success")]);
+    full_jobs(&release, 172);
+    release.fail_runs_queries(1);
+    let output = release.check();
+    assert!(output.status.success(), "{}", describe(&output));
+    assert_eq!(release.runs_queries(), 2);
+    assert_eq!(release.tags(), format!("v{VERSION}"));
+}
+
+/// The steps that carry what the old local run covered run on the Linux row of
+/// a full run only, and are not named like a section (`tests: `).
+#[test]
+fn ci_yml_runs_the_doctests_and_shipped_scope_on_the_linux_row_of_full_runs_only() {
+    let ci = fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    let test_job: String = ci
+        .lines()
+        .skip_while(|l| *l != "  test:")
+        .take_while(|l| *l == "  test:" || l.starts_with("    ") || l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let steps: Vec<&str> = test_job.split("\n      - name: ").skip(1).collect();
+    for name in ["doctests (workspace)", "\"shipped scope: cargo test -p g-mesh\""] {
+        let step = steps
+            .iter()
+            .find(|s| s.starts_with(name))
+            .unwrap_or_else(|| panic!("the test job has no step {name}"));
+        let condition = step.lines().find(|l| l.trim_start().starts_with("if:")).unwrap_or_default();
+        assert!(condition.contains("matrix.target == 'x86_64-unknown-linux-gnu'"), "{name}: {condition}");
+        assert!(condition.contains("needs.select.outputs.mode == 'full'"), "{name}: {condition}");
+        assert!(!name.trim_matches('"').starts_with("tests: "), "{name} reads as a section");
+    }
 }
