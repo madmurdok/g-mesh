@@ -969,6 +969,74 @@ mod tests {
         }
     }
 
+    /// `use.ts`'s import of `lib.ts`, unresolved: a `File`-scoped placeholder
+    /// at `lib.ts` in `use.ts`, with the `IMPORTS` edge onto it.
+    fn use_waiting_on_lib(store: &IndexStore) {
+        let mut placeholder =
+            NodeRecord::new("ph:use.ts:lib.ts", "Module", "lib.ts", "lib.ts", "use.ts", "typescript");
+        placeholder.native_kind = Some("resolved_module".to_string());
+        placeholder.target = Some(crate::storage::write::PlaceholderTargetRecord {
+            scope_kind: "file".to_string(),
+            scope: "lib.ts".to_string(),
+            key_kind: "name".to_string(),
+            key: "*".to_string(),
+            from_container: None,
+            key_path: None,
+        });
+        let diff = Diff {
+            upsert_nodes: vec![
+                NodeRecord::new("File:use.ts", "File", "use.ts", "use.ts", "use.ts", "typescript"),
+                placeholder,
+            ],
+            upsert_edges: vec![crate::storage::write::EdgeRecord::new(
+                "i:use.ts->lib.ts",
+                "File:use.ts",
+                "ph:use.ts:lib.ts",
+                "IMPORTS",
+                "tree-sitter",
+                false,
+            )],
+            ..Default::default()
+        };
+        store.unit(Unit::WatcherApply, |writer| writer.apply_diff_linked(&diff, "seed")).unwrap();
+    }
+
+    /// A file diff reports the importers waiting unresolved at the file's
+    /// path as they were before its link pass, with their language; a gone
+    /// file reports none.
+    ///
+    /// Control: in `Writer::apply_file_diff_linked`, return an empty
+    /// `waiting_importers` for every scope (the first assertion fails).
+    #[test]
+    fn a_file_diff_reports_the_importers_waiting_at_its_path_before_the_link() {
+        for scope in [FileScope::Partial, FileScope::Complete] {
+            let store = store_without_foreign_keys();
+            use_waiting_on_lib(&store);
+
+            let linked = store
+                .unit(Unit::WatcherApply, |writer| {
+                    writer.apply_file_diff_linked(&mut Diff::default(), "lib.ts", scope, "test")
+                })
+                .unwrap();
+
+            assert_eq!(
+                linked.waiting_importers,
+                vec![("typescript".to_string(), "use.ts".to_string())],
+                "{scope:?}"
+            );
+            assert!(linked.gone_importers.is_empty(), "{scope:?}");
+        }
+
+        let store = store_without_foreign_keys();
+        use_waiting_on_lib(&store);
+        let gone = store
+            .unit(Unit::WatcherApply, |writer| {
+                writer.apply_file_diff_linked(&mut Diff::default(), "lib.ts", FileScope::Gone, "test")
+            })
+            .unwrap();
+        assert!(gone.waiting_importers.is_empty(), "{gone:?}");
+    }
+
     /// Seeds `nodes` as `(id, kind, filePath, language)` and a linked
     /// `IMPORTS` edge for each `(fromId, toId)` in `imports`.
     fn seed(store: &IndexStore, nodes: &[(&str, &str, &str, &str)], imports: &[(&str, &str)]) {

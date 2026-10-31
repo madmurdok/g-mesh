@@ -1066,3 +1066,291 @@ fn a_created_root_index_leaves_a_relative_imports_target_naming_the_root_alone()
         assert!(!fallbacks_shadowed_by(&project, "index.ts").contains(&fallback.to_string()), "{manifest}");
     }
 }
+
+// -------------------------------------------------------------------------
+// GM-666: an alias, workspace or `#` import that resolves to nothing waits at
+// an address; a created file names the addresses waiting on it
+// -------------------------------------------------------------------------
+
+/// What `importer` (written in `fixture`) stores for its import of
+/// `specifier` when it resolves to nothing: `(native kind, file the
+/// placeholder targets)`, plus the native kinds of every node of the graph.
+fn stored_placeholder(
+    fixture: &Fixture,
+    importer: &str,
+    specifier: &str,
+) -> (String, Option<String>, Vec<String>) {
+    let source = fs::read_to_string(fixture.root.join(importer)).unwrap();
+    let graph = TypeScriptExtractor.extract(&fixture.load(), &RelPath::new(importer), &source);
+    let kinds: Vec<String> = graph.nodes.iter().filter_map(|node| node.native_kind.clone()).collect();
+    let node = graph
+        .nodes
+        .iter()
+        .find(|node| node.name == specifier && node.native_kind.is_some())
+        .unwrap_or_else(|| panic!("no placeholder for {specifier}: {:?}", graph.nodes));
+    let target = node.target.as_ref().map(|target| match &target.scope {
+        g_mesh_plugin_sdk::wire::TargetScope::File(file) => file.clone(),
+        other => panic!("not a file scope: {other:?}"),
+    });
+    (node.native_kind.clone().unwrap(), target, kinds)
+}
+
+/// `files` plus [`MAIN`] importing `specifier`; what [`stored_placeholder`]
+/// answers for it.
+fn waits(files: &[(&str, &str)], specifier: &str) -> (String, Option<String>, Vec<String>) {
+    let importer = format!("import {{ v }} from \"{specifier}\";\n");
+    let mut all: Vec<(&str, &str)> = files.to_vec();
+    all.push((MAIN, &importer));
+    stored_placeholder(&Fixture::new(&all), MAIN, specifier)
+}
+
+fn waits_at(files: &[(&str, &str)], specifier: &str) -> (String, Option<String>) {
+    let (kind, target, kinds) = waits(files, specifier);
+    assert!(
+        !kinds.iter().any(|kind| kind == "pending_symbol"),
+        "an unresolved import binds nothing: {kinds:?}"
+    );
+    (kind, target)
+}
+
+fn resolved(target: &str) -> (String, Option<String>) {
+    ("resolved_module".to_string(), Some(target.to_string()))
+}
+
+fn external() -> (String, Option<String>) {
+    ("external_module".to_string(), None)
+}
+
+/// An alias import that resolves to nothing is an unlinked `resolved_module`
+/// targeted at the first base of the entry's list, with no bindings; a
+/// specifier no alias, package or `#` key can name stays an
+/// `external_module` with no target, also next to an unrelated alias.
+///
+/// Control: `record_specifier` ignores `miss_address`.
+#[test]
+fn an_unresolved_alias_import_waits_at_its_first_base() {
+    let tsconfig = alias_tsconfig(SRC_THEN_GENERATED);
+    let files = [("tsconfig.json", tsconfig.as_str())];
+    assert_eq!(waits_at(&files, "@/x"), resolved("src/x"));
+    assert_eq!(waits_at(&files, "react"), external());
+    assert_eq!(waits_at(&files, "@other/x"), external());
+    assert_eq!(waits_at(&[], "react"), external());
+}
+
+/// A bare specifier that only the catch-all `"*"` entry matches stays an
+/// `external_module`: it names an npm package, not a project module.
+///
+/// Control: do not exclude the catch-all pattern in `waiting_address`.
+#[test]
+fn a_catch_all_paths_entry_leaves_a_bare_import_external() {
+    let tsconfig = alias_tsconfig(r#"{"*":["src/types/*"]}"#);
+    assert_eq!(waits_at(&[("tsconfig.json", tsconfig.as_str())], "react"), external());
+}
+
+/// An unresolved workspace package import waits at the first base its
+/// package lists, a subpath at the first base of that subpath, and a package
+/// wins over an alias of the same name.
+///
+/// Control: `waiting_address` skips the workspace branch.
+#[test]
+fn an_unresolved_workspace_package_import_waits_at_its_first_entry() {
+    let manifest = r#"{"name":"@s/p","main":"lib/entry.ts"}"#;
+    let files = [WORKSPACE_ROOT, ("packages/p/package.json", manifest), ("packages/p/other.ts", SRC_X)];
+    assert_eq!(waits_at(&files, "@s/p"), resolved("packages/p/lib/entry.ts"));
+
+    let tsconfig = alias_tsconfig(r#"{"@s/*":["gen/*"]}"#);
+    let with_alias = [files[0], files[1], files[2], ("tsconfig.json", tsconfig.as_str())];
+    assert_eq!(waits_at(&with_alias, "@s/p"), resolved("packages/p/lib/entry.ts"), "the package first");
+    assert_eq!(waits_at(&with_alias, "@s/q"), resolved("gen/q"), "another name falls to the alias");
+}
+
+const SRC_X: &str = "export const o = 1;\n";
+
+/// An unresolved `#` import waits at the first target of its `imports` key.
+///
+/// Control: `waiting_address` returns `None` for `#` specifiers.
+#[test]
+fn an_unresolved_hash_import_waits_at_its_first_target() {
+    let single = [("package.json", r##"{"name":"root","imports":{"#x":"./src/x.ts"}}"##)];
+    assert_eq!(waits_at(&single, "#x"), resolved("src/x.ts"));
+    let list = [("package.json", r##"{"name":"root","imports":{"#x":["./src/x.ts","./gen/x.ts"]}}"##)];
+    assert_eq!(waits_at(&list, "#x"), resolved("src/x.ts"));
+    assert_eq!(waits_at(&list, "#nope"), external());
+}
+
+/// The offer `source_changed` makes for the first sighting of `created`
+/// (written beside `files`), as the exact targets it names.
+fn first_offer(files: &[(&str, &str)], created: &str) -> BTreeSet<String> {
+    let mut all: Vec<(&str, &str)> = files.to_vec();
+    all.push((created, "export const v = 2;\n"));
+    let fixture = Fixture::new(&all);
+    let mut project = fixture.load();
+    offered(source_changed(&mut project, created, Some("export const v = 2;\n")))
+}
+
+/// A created file of a later alias base offers the address `@/x` waits at,
+/// the first base, though `src/x.ts` is not the file created.
+///
+/// Control: drop the `waiting_addresses_for` extend in `source_changed`.
+#[test]
+fn a_created_later_alias_base_offers_the_address_waiting_at_the_first_base() {
+    let tsconfig = alias_tsconfig(SRC_THEN_GENERATED);
+    let offer = first_offer(&[("tsconfig.json", tsconfig.as_str())], "generated/x.ts");
+    assert!(offer.contains("src/x"), "{offer:?}");
+}
+
+/// A created workspace package entry offers the address its waiting
+/// importers are stored at.
+///
+/// Control: the `waiting_addresses_for` revert above.
+#[test]
+fn a_created_package_entry_offers_the_address_waiting_at_it() {
+    let files = [WORKSPACE_ROOT, ("packages/p/package.json", r#"{"name":"@s/p","main":"lib/entry.ts"}"#)];
+    let offer = first_offer(&files, "packages/p/lib/entry.ts");
+    assert!(offer.contains("packages/p/lib/entry.ts"), "{offer:?}");
+
+    // Without entry fields the waiting address is the first convention base,
+    // not the created path.
+    let bare = [
+        WORKSPACE_ROOT,
+        ("packages/q/package.json", r#"{"name":"@s/q"}"#),
+        // The model reads a package.json only in a directory holding a file.
+        ("packages/q/other.ts", SRC_X),
+    ];
+    let mut all = bare.to_vec();
+    all.push(("packages/q/src/index.ts", SRC_X));
+    let fixture = Fixture::new(&all);
+    let project = fixture.load();
+    let waiting = resolve_miss(&fixture, &project, "@s/q");
+    let offer = first_offer(&bare, "packages/q/src/index.ts");
+    assert!(offer.contains(&waiting), "{waiting} not in {offer:?}");
+}
+
+/// The address an importer of `specifier` waited at before the file was
+/// created: stored by a model without any file of the package's entries.
+fn resolve_miss(fixture: &Fixture, _project: &TsProject, specifier: &str) -> String {
+    fixture.remove("packages/q/src/index.ts");
+    let importer = format!("import {{ v }} from \"{specifier}\";\n");
+    fixture.write(MAIN, importer.as_bytes());
+    let (_, target, _) = stored_placeholder(fixture, MAIN, specifier);
+    fixture.write("packages/q/src/index.ts", SRC_X.as_bytes());
+    target.expect("an address")
+}
+
+/// With a nested config and a root one both mapping `@/*`, a file under the
+/// nested config's base offers the nested address `apps/web/src/x`, which an
+/// importer under `apps/web` waits at.
+///
+/// Control: ask only the root config in `derive_specifiers`.
+#[test]
+fn a_created_file_offers_the_address_of_a_nested_config() {
+    let root = alias_tsconfig(r#"{"@/*":["src/*"]}"#);
+    let nested = r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*"]}}}"#;
+    let files = [
+        ("tsconfig.json", root.as_str()),
+        ("apps/web/tsconfig.json", nested),
+        ("apps/web/other.ts", SRC_X),
+        ("src/other.ts", SRC_X),
+    ];
+    let offer = first_offer(&files, "apps/web/src/x.ts");
+    assert!(offer.contains("apps/web/src/x"), "{offer:?}");
+}
+
+/// Every selector `source_changed` returns is an exact `File` target, which
+/// core answers by keyed lookup: never a specifier or prefix selector, which
+/// would make it scan every import.
+#[test]
+fn every_selector_a_create_returns_is_an_exact_file_target() {
+    let tsconfig = alias_tsconfig(SRC_THEN_GENERATED);
+    let files = [
+        ("tsconfig.json", tsconfig.as_str()),
+        WORKSPACE_ROOT,
+        ("packages/p/package.json", r#"{"name":"@s/p"}"#),
+        ("package.json", r##"{"name":"root","workspaces":["packages/*"],"imports":{"#x":"./src/x.ts"}}"##),
+    ];
+    for created in ["generated/x.ts", "src/x.ts", "packages/p/src/index.ts"] {
+        let mut all: Vec<(&str, &str)> = files[..1].to_vec();
+        all.extend_from_slice(&files[2..]);
+        all.push((created, "export const v = 2;\n"));
+        let fixture = Fixture::new(&all);
+        let mut project = fixture.load();
+        let delta = source_changed(&mut project, created, Some("export const v = 2;\n"));
+        let Some(ResolutionDelta::Affected { files, imports }) = delta else {
+            panic!("{created}: {delta:?}");
+        };
+        assert!(files.is_empty(), "{created}");
+        assert!(!imports.is_empty(), "{created}");
+        for selector in &imports {
+            assert!(
+                matches!(
+                    &selector.by,
+                    ImportMatch::Target { scope_kind: TargetScopeKind::File, matcher: Matcher::Exact(_) }
+                ),
+                "{created}: {selector:?}"
+            );
+        }
+    }
+}
+
+/// A package whose entry exists does not offer that entry when another file
+/// of the package is created: no import can wait at a file that exists, and
+/// the key would select every importer of the package.
+///
+/// Control: remove the existence filter in `waiting_addresses_for`.
+#[test]
+fn a_created_package_file_does_not_offer_the_existing_entry() {
+    let files = [
+        WORKSPACE_ROOT,
+        ("packages/p/package.json", r#"{"name":"@s/p","exports":"./src/index.ts"}"#),
+        ("packages/p/src/index.ts", "export const v = 1;\n"),
+    ];
+    let offer = first_offer(&files, "packages/p/src/other.ts");
+    assert!(!offer.contains("packages/p/src/index.ts"), "{offer:?}");
+}
+
+/// Under `@/*: ["src/*", "generated/*"]` with `src/x.ts` existing, a created
+/// `generated/x.ts` does not offer `src/x.ts`.
+///
+/// Control: the existence-filter revert above.
+#[test]
+fn a_created_later_alias_base_does_not_offer_an_existing_first_base() {
+    let tsconfig = alias_tsconfig(SRC_THEN_GENERATED);
+    let files = [("tsconfig.json", tsconfig.as_str()), ("src/x.ts", "export const v = 1;\n")];
+    let offer = first_offer(&files, "generated/x.ts");
+    assert!(!offer.contains("src/x.ts"), "{offer:?}");
+}
+
+/// The existence filter keeps the file's own path, and an address created in
+/// the same batch is still offered by its own event: `src/x.ts` and
+/// `generated/x.ts` both exist in the model, the event of the later base
+/// does not name `src/x.ts` while the event of `src/x.ts` offers itself.
+///
+/// Control: the existence-filter revert above, without its `a != path`
+/// guard (`src/x.ts` is no longer offered).
+#[test]
+fn the_existence_filter_keeps_the_created_path_itself() {
+    let tsconfig = alias_tsconfig(r#"{"@/*":["src/*"]}"#);
+    let offer = first_offer(&[("tsconfig.json", tsconfig.as_str())], "src/x.ts");
+    assert!(offer.contains("src/x.ts"), "{offer:?}");
+
+    let both = alias_tsconfig(SRC_THEN_GENERATED);
+    let files = [("tsconfig.json", both.as_str()), ("generated/x.ts", "export const v = 1;\n")];
+    let offer = first_offer(&files, "src/x.ts");
+    assert!(offer.contains("src/x.ts"), "{offer:?}");
+}
+
+/// A wildcard `paths` entry with a static target, and an `imports` key with
+/// one, offer that target when it is the created file: an import of
+/// `@env/a` waits at `src/env.ts`, an address equal to the path.
+///
+/// Control: remove the static-target offer (`static_targets_naming`).
+#[test]
+fn a_created_static_alias_target_offers_its_own_path() {
+    let tsconfig = alias_tsconfig(r#"{"@env/*":["src/env.ts"]}"#);
+    let offer = first_offer(&[("tsconfig.json", tsconfig.as_str())], "src/env.ts");
+    assert!(offer.contains("src/env.ts"), "paths: {offer:?}");
+
+    let imports = [("package.json", r##"{"name":"root","imports":{"#env/*":"./src/env.ts"}}"##)];
+    let offer = first_offer(&imports, "src/env.ts");
+    assert!(offer.contains("src/env.ts"), "imports: {offer:?}");
+}

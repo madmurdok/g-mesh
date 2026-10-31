@@ -349,6 +349,77 @@ fn an_exact_target_delta_runs_no_scan_and_selects_what_the_scan_does() {
     }
 }
 
+/// A `File` key equal to the trigger selects the importers that were waiting
+/// at it before the link, not the importers linked to it: with none waiting
+/// it selects nothing, though two files import it, and the same key under
+/// another trigger (or none) still reads both halves.
+///
+/// Control: in `select_affected`, remove the own-path arm (the key goes to
+/// `indexed_importers`: the linked importers come back).
+#[test]
+fn an_own_path_file_key_with_nobody_waiting_selects_nothing() {
+    use TargetScopeKind::File;
+    let conn = seeded();
+    let imports = [by_target(File, exact("lib/e.ts"))];
+    let own: &[String] = &[];
+
+    let selected = select_affected(&conn, "ts", &[], &imports, Some(("lib/e.ts", own))).unwrap();
+    assert!(selected.is_empty(), "{selected:?}");
+
+    for other in [Some(("lib/f.ts", own)), None] {
+        let selected: Vec<String> =
+            select_affected(&conn, "ts", &[], &imports, other).unwrap().into_iter().collect();
+        assert_eq!(selected, paths(&["app/a.ts", "lib/f.ts"]), "{other:?}");
+    }
+}
+
+/// With importers waiting at the trigger the own-path key selects exactly
+/// them, narrowed by the selector's importer scope, and reads nothing else.
+///
+/// Control: in `select_affected`, insert `own_waiting` without the
+/// `selector.importers.contains` filter (the out-of-scope importer comes
+/// back).
+#[test]
+fn an_own_path_file_key_selects_exactly_the_waiting_importers_in_scope() {
+    use TargetScopeKind::File;
+    let conn = seeded();
+    let waiting = vec!["pkg/h.ts".to_string(), "app/b.ts".to_string()];
+    let own = Some(("lib/e.ts", waiting.as_slice()));
+
+    let everyone = [by_target(File, exact("lib/e.ts"))];
+    let selected: Vec<String> =
+        select_affected(&conn, "ts", &[], &everyone, own).unwrap().into_iter().collect();
+    assert_eq!(selected, paths(&["app/b.ts", "pkg/h.ts"]));
+
+    let scoped = [scoped_target(scope("pkg", &[]), File, "lib/e.ts")];
+    let selected: Vec<String> =
+        select_affected(&conn, "ts", &[], &scoped, own).unwrap().into_iter().collect();
+    assert_eq!(selected, paths(&["pkg/h.ts"]));
+}
+
+/// A key that is not the trigger keeps both halves, whatever the waiting
+/// list: `lib/f.ts`'s placeholder importer comes back under trigger
+/// `lib/e.ts`, and a `Container` key never takes the own-path arm.
+///
+/// Control: in `select_affected`, take the own-path arm for any `File` key
+/// when a trigger is present (`pkg/h.ts` is lost).
+#[test]
+fn a_file_key_that_is_not_the_trigger_still_reads_the_index() {
+    use TargetScopeKind::{Container, File};
+    let conn = seeded();
+    let waiting = vec!["app/b.ts".to_string()];
+    let own = Some(("lib/e.ts", waiting.as_slice()));
+
+    let by_file = [by_target(File, exact("lib/f.ts"))];
+    let selected: Vec<String> =
+        select_affected(&conn, "ts", &[], &by_file, own).unwrap().into_iter().collect();
+    assert_eq!(selected, paths(&["pkg/h.ts"]));
+
+    let by_container = [by_target(Container, exact("lib/e.ts"))];
+    let selected = select_affected(&conn, "ts", &[], &by_container, own).unwrap();
+    assert!(selected.is_empty(), "{selected:?}");
+}
+
 /// Any other selector (`Specifier`, `Target` with `Under`, `StartsWith` or
 /// `NonRelative`) is answered by the scan, once per call however many there
 /// are, mixed with exact ones or not; the union is still the scan's.
