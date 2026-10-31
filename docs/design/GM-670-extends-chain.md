@@ -451,10 +451,12 @@ build per group.
   and suffix overlap in the subpath (`./a*a` for `./a`) matches in tsc,
   not here. `exports` given as the number `0` counts as present here.
   `typesVersions` in a package.json is not read for `extends`.
-- **Case-insensitive file systems:** a missing candidate is declared as
-  spelled in `extends`. On macOS, a later file created with a different
-  case does not match the stored key (must-confirm 4). Found targets are
-  declared by realpath, so this affects only targets created after the load.
+- **Case-insensitive file systems:** owner decision "Нижний регистр ключей
+  на таких томах". Core probes each project root once (a case-swapped
+  spelling of a root entry compared by dev+ino, `daemon/path_case.rs`); on a
+  case-insensitive volume it stores and looks up `resolution_watch_paths`
+  keys lowercased, so a missing candidate later created in a different case
+  still matches. On a case-sensitive volume keys stay exact.
 
 ## 8. Must-confirm
 
@@ -465,5 +467,6 @@ build per group.
    not, document that gitignored chain files are not watched.
 4. Case-insensitive FS: accept that a missing candidate created later in a
    different case is missed, or lowercase the stored keys on
-   case-insensitive volumes (more core code).
+   case-insensitive volumes (more core code). Decided: lowercase the keys
+   on such volumes (section 7).
 5. Slice C waits for GM-669's merge (file-level overlap in `tsconfig.rs`).
