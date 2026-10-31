@@ -23,7 +23,11 @@
 //!   `nativeKind` carries a `target`. A v1-shaped line (GM-263's `exported`,
 //!   a bare `source` with no `engine`) fails to deserialize at all as of
 //!   GM-275 - `protocol::ndjson`'s parse error is what this check reports for
-//!   it, the same as any other malformed line.
+//!   it, the same as any other malformed line. Every `watchPaths` entry, on
+//!   the bulk trailer or on the resolution-delta session's answer, is a
+//!   normalized, relative path inside the workspace with forward slashes,
+//!   not under the manifest's `exclude_dirs` and without one of its
+//!   `[plugin.languages]` extensions ([`watch_path_violation`]).
 //! - **`stream-order`** - in the structural stream (bulk, `fileChanged`
 //!   diffs), an edge's `fromId` and `toId` are nodes of the edge's own file,
 //!   emitted before the edge. This is "edges never leave their file": a bulk
@@ -140,7 +144,7 @@ use crate::cli::plugin_check::session::{
     BulkLine, BulkRun, EditTarget, Exchange, FilesCreatedRun, Method, ResolutionDeltaRun, Session,
     StoredRange, VersionBump,
 };
-use crate::daemon::manifest::PluginManifest;
+use crate::daemon::manifest::{extension_of, under_excluded_dir, PluginManifest};
 use crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND;
 use crate::protocol::conformance::{
     placeholder_target_violation, plugin_emitted_container_violation, qualified_path_violation,
@@ -376,7 +380,21 @@ fn shape(run: &RunData, answered: &[(String, &FileChangeDiff)]) -> CheckResult {
                         findings.push(format!("bulk run 1, NDJSON line {}: {message}", line.line_no));
                     }
                 }
-                Ok(BulkItem::Edge(_) | BulkItem::ResolutionFacts(_)) => {}
+                Ok(BulkItem::ResolutionFacts { watch_paths, .. }) => {
+                    for path in watch_paths {
+                        if let Some(message) = watch_path_violation(run.manifest, path) {
+                            findings.push(format!("bulk run 1, NDJSON line {}: {message}", line.line_no));
+                        }
+                    }
+                }
+                Ok(BulkItem::Edge(_)) => {}
+            }
+        }
+    }
+    if let ResolutionDeltaEvidence::Ran { run: delta_run, .. } = &run.resolution_delta {
+        for path in delta_run.result.iter().flat_map(|answer| &answer.watch_paths) {
+            if let Some(message) = watch_path_violation(run.manifest, path) {
+                findings.push(format!("resolution-delta session's resolutionChanged answer: {message}"));
             }
         }
     }
@@ -405,6 +423,30 @@ fn shape(run: &RunData, answered: &[(String, &FileChangeDiff)]) -> CheckResult {
     }
 
     result("shape", verdict(findings))
+}
+
+/// Why `path`, a `watchPaths` entry, breaks the wire contract, `None` when it
+/// keeps it: project-relative with forward slashes, normalized (no empty,
+/// `.` or `..` segment) and so inside the workspace, not under `manifest`'s
+/// `exclude_dirs`, and not a file of one of its own extensions (core routes
+/// those as sources, never as watch files).
+pub(crate) fn watch_path_violation(manifest: &PluginManifest, path: &str) -> Option<String> {
+    let reason = if path.contains('\\') {
+        "uses a backslash; watch paths use forward slashes"
+    } else if path.starts_with('/') || path.as_bytes().get(1) == Some(&b':') {
+        "is not project-relative"
+    } else if path.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..") {
+        "is not a normalized path inside the workspace"
+    } else if under_excluded_dir(path, &manifest.workspace.exclude_dirs) {
+        "is under one of the manifest's exclude_dirs"
+    } else if extension_of(path)
+        .is_some_and(|extension| manifest.extensions.iter().any(|own| own.eq_ignore_ascii_case(&extension)))
+    {
+        "has one of the manifest's own [plugin.languages] extensions"
+    } else {
+        return None;
+    };
+    Some(format!("watchPaths entry {path:?} {reason}"))
 }
 
 // --- bulk-stream rules ------------------------------------------------------
@@ -539,7 +581,7 @@ fn bulk_ids(lines: &[BulkLine]) -> (BTreeSet<&str>, BTreeSet<&str>) {
             Ok(BulkItem::Edge(edge)) => {
                 edges.insert(edge.id.as_str());
             }
-            Ok(BulkItem::ResolutionFacts(_)) | Err(_) => {}
+            Ok(BulkItem::ResolutionFacts { .. }) | Err(_) => {}
         }
     }
     (nodes, edges)
@@ -1309,6 +1351,53 @@ mod tests {
         let Outcome::Fail(findings) = &shape.outcome else { panic!("shape must fail: {shape:?}") };
         assert_eq!(findings.len(), 3, "{findings:?}");
         assert!(shape.warnings.is_empty(), "{:?}", shape.warnings);
+    }
+
+    /// `watchPaths` entries break the contract when they are not forward-slash,
+    /// project-relative, normalized, outside `exclude_dirs` and free of the
+    /// manifest's own extensions; each finding names the entry.
+    #[test]
+    fn a_watch_path_that_breaks_the_contract_is_named() {
+        let mut manifest = manifest(false);
+        manifest.workspace.exclude_dirs = vec!["node_modules".to_string()];
+        for path in ["cfg/base.json", "base", "a/b.d.json", ".hidden/base.json"] {
+            assert_eq!(watch_path_violation(&manifest, path), None, "{path}");
+        }
+        for (path, why) in [
+            ("../x.json", "normalized"),
+            ("a/../x.json", "normalized"),
+            ("a//b.json", "normalized"),
+            ("./x.json", "normalized"),
+            ("", "normalized"),
+            ("/abs.json", "project-relative"),
+            ("C:/abs.json", "project-relative"),
+            ("a\\b.json", "backslash"),
+            ("node_modules/x.json", "exclude_dirs"),
+            ("pkg/node_modules/x.json", "exclude_dirs"),
+            ("src/x.fk", "extensions"),
+            ("src/X.FK", "extensions"),
+        ] {
+            let message = watch_path_violation(&manifest, path).unwrap_or_else(|| panic!("{path:?} passed"));
+            assert!(message.contains(&format!("{path:?}")) && message.contains(why), "{path:?}: {message}");
+        }
+    }
+
+    /// The `shape` check fails a bulk trailer's bad `watchPaths` entry, naming
+    /// it, and passes a good one.
+    #[test]
+    fn shape_judges_the_bulk_trailers_watch_paths() {
+        let shape_of = |trailer: &str| {
+            let mut lines = conformant_lines();
+            lines.push(trailer.to_string());
+            outcome_of(&evaluate_bulk(lines), "shape")
+        };
+        assert_eq!(shape_of(r#"{"resolutionFacts":"f","watchPaths":["cfg/base.json"]}"#), Outcome::Pass);
+        let Outcome::Fail(findings) = shape_of(r#"{"resolutionFacts":"f","watchPaths":["../x.json"]}"#)
+        else {
+            panic!("a path outside the workspace must fail shape")
+        };
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("../x.json") && findings[0].contains("bulk run 1"), "{findings:?}");
     }
 
     /// `id-stability.declaration-edit-applies` over hand-built snapshots: the

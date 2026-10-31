@@ -103,6 +103,11 @@ impl Extractor for TypeScriptExtractor {
         Some(TsFacts::of(project).encode())
     }
 
+    /// The tsconfig `extends` chain files the model was built from.
+    fn watch_paths(&self, project: &TsProject) -> Vec<String> {
+        project.watch_paths.iter().cloned().collect()
+    }
+
     /// Which importers the reloaded model may resolve differently.
     fn resolution_delta(&self, previous: &str, project: &TsProject) -> ResolutionDelta {
         facts::resolution_delta(previous, project)

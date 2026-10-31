@@ -297,6 +297,11 @@ importers: an over-selection, never a miss.
 A new module, core/src/daemon/config_reindex.rs. It is reached from
 `workspace_file_changed` when the language's manifest has `resolution_delta`.
 
+Besides the manifest's `watch_files` names, routing also matches the paths a
+plugin declares in `watchPaths` on its bulk trailer and `resolutionChanged`
+answer (table `resolution_watch_paths`), such as every file of a tsconfig
+`extends` chain; see docs/design/GM-670-extends-chain.md.
+
 1. Get or spawn the supervisor. Inside `with_exclusive_access`, read
    `resolution_facts(language)`. Send `resolutionChanged { filePath, previousFacts }`.
    The timeout is the `fileChanged` timeout.

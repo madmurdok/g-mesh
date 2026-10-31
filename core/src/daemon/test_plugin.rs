@@ -452,7 +452,8 @@ pub(crate) fn declare_resolution_delta(plugin_dir: &Path) {
 }
 
 /// Makes every later `resolutionChanged` to the plugin in `plugin_dir` answer
-/// with `result` (a `ResolutionChangedResult` as JSON), or, with `None`, with
+/// with `result` (a `ResolutionChangedResult` as JSON, `watchPaths`
+/// included when the test wants core to store some), or, with `None`, with
 /// an `unknown` delta again. Read per request, so it takes effect without a
 /// respawn.
 pub(crate) fn set_resolution_changed_answer(plugin_dir: &Path, result: Option<&str>) {
@@ -584,6 +585,17 @@ pub(crate) fn set_bulk_stream(project: &Path, language: &str, lines: &[String], 
         .expect("failed to write the bulk stream");
     fs::write(project.join(format!(".{language}-bulk.exit")), exit_code.to_string())
         .expect("failed to write the bulk exit status");
+}
+
+/// The bulk-walk trailer line a `resolution_delta` plugin ends its stream
+/// with, for [`set_bulk_stream`]'s `lines`: `facts`, plus `watchPaths` when
+/// `watch_paths` is non-empty (absent otherwise, as the SDK writes it).
+pub(crate) fn resolution_facts_line(facts: &str, watch_paths: &[&str]) -> String {
+    let mut line = serde_json::json!({ "resolutionFacts": facts });
+    if !watch_paths.is_empty() {
+        line["watchPaths"] = serde_json::json!(watch_paths);
+    }
+    line.to_string()
 }
 
 /// A fresh in-memory index for the (empty) diffs a fake plugin's round trips

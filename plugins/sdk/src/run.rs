@@ -207,9 +207,16 @@ fn bulk_index<E: Extractor>(extractor: &E, spec: &ResolvedSpec, root: &Path) -> 
     }
 
     // The facts the walk was built from, last: core stores them with the
-    // walk's rows, and a stream cut short never delivers them.
+    // walk's rows, and a stream cut short never delivers them. `watchPaths`
+    // is written only when non-empty, so a plugin declaring none keeps
+    // working with an older core, which rejects the field.
     if let Some(facts) = facts_caught(extractor, &project, &spec.language) {
-        let line = serde_json::json!({ "resolutionFacts": facts });
+        let watch_paths = watch_paths_caught(extractor, &project, &spec.language);
+        let line = if watch_paths.is_empty() {
+            serde_json::json!({ "resolutionFacts": facts })
+        } else {
+            serde_json::json!({ "resolutionFacts": facts, "watchPaths": watch_paths })
+        };
         if let Err(err) = writeln!(out, "{line}") {
             crate::log_line!("[{}] failed to write the bulk stream: {err}", spec.language);
             return 1;
@@ -618,6 +625,8 @@ impl<E: Extractor> Session<'_, E> {
     /// - a model that fails to load answers `Unknown` and the old model stays
     ///   in use, as on `workspaceChanged`;
     /// - no `previous`, or a delta that panics, answers `Unknown`;
+    /// - `watch_paths` come from the reloaded model, and are empty on
+    ///   `Unknown` or without facts (core stores them only beside facts);
     /// - only `Unknown` clears the cached extractions: core follows it with a
     ///   whole-language reindex. Otherwise every cached extraction outside the
     ///   delta is still what the new model would produce, and core re-extracts
@@ -640,6 +649,7 @@ impl<E: Extractor> Session<'_, E> {
                         reason: format!("the project model failed to load: {err:#}"),
                     },
                     facts: None,
+                    watch_paths: Vec::new(),
                 }
             }
             Ok(project) => {
@@ -648,8 +658,13 @@ impl<E: Extractor> Session<'_, E> {
                     Some(previous) => delta_caught(self.extractor, previous, &project, &self.spec.language),
                 };
                 let facts = facts_caught(self.extractor, &project, &self.spec.language);
+                let watch_paths = if facts.is_none() || matches!(delta, ResolutionDelta::Unknown { .. }) {
+                    Vec::new()
+                } else {
+                    watch_paths_caught(self.extractor, &project, &self.spec.language)
+                };
                 self.project = Some(project);
-                ResolutionChangedResult { delta, facts }
+                ResolutionChangedResult { delta, facts, watch_paths }
             }
         };
         if matches!(result.delta, ResolutionDelta::Unknown { .. }) {
@@ -996,6 +1011,14 @@ fn facts_caught<E: Extractor>(extractor: &E, project: &E::Project, language: &st
     catch_unwind(AssertUnwindSafe(|| extractor.resolution_facts(project))).unwrap_or_else(|_| {
         crate::log_line!("[{language}] the extractor panicked computing its resolution facts");
         None
+    })
+}
+
+/// [`Extractor::watch_paths`], with a panic costing the list.
+fn watch_paths_caught<E: Extractor>(extractor: &E, project: &E::Project, language: &str) -> Vec<String> {
+    catch_unwind(AssertUnwindSafe(|| extractor.watch_paths(project))).unwrap_or_else(|_| {
+        crate::log_line!("[{language}] the extractor panicked computing its watch paths");
+        Vec::new()
     })
 }
 

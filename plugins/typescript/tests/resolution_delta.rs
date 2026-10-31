@@ -399,6 +399,45 @@ fn the_bulk_walk_ends_with_the_resolution_facts() {
     );
 }
 
+fn bulk_trailer(fixture: &Fixture) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_g-mesh-plugin-typescript"))
+        .arg("--bulk-index")
+        .arg(&fixture.root)
+        .output()
+        .expect("the plugin binary runs");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let last = stdout.lines().last().expect("the walk wrote lines");
+    serde_json::from_str(last).expect("every line is JSON")
+}
+
+/// The bulk trailer carries the extends chain's files, found or not, beside
+/// the facts; a project with no `extends` writes no `watchPaths` key, and the
+/// extractor's declaration is the model's own set.
+#[test]
+fn the_bulk_trailer_declares_the_extends_chain_and_only_that() {
+    let fixture = Fixture::new(&[
+        ("tsconfig.json", r#"{"extends":"./base.json"}"#),
+        ("base.json", r#"{"extends":"./missing"}"#),
+        ("src/a.ts", "export const a = 1;\n"),
+    ]);
+    let trailer = bulk_trailer(&fixture);
+    assert!(trailer["resolutionFacts"].is_string(), "{trailer}");
+    assert_eq!(
+        trailer["watchPaths"],
+        serde_json::json!(["base.json", "missing", "missing.json"]),
+        "{trailer}"
+    );
+    let project = fixture.load();
+    assert_eq!(
+        TypeScriptExtractor.watch_paths(&project),
+        project.watch_paths.iter().cloned().collect::<Vec<_>>()
+    );
+
+    let plain = paths_fixture();
+    assert!(bulk_trailer(&plain).get("watchPaths").is_none(), "no chain, no key");
+}
+
 // -------------------------------------------------------------------------
 // source_changed: a created file offers the addresses waiting on it
 // -------------------------------------------------------------------------

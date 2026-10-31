@@ -45,6 +45,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 use crate::daemon::lifecycle::PluginSupervisor;
+use crate::daemon::path_case;
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::workspace_reindex;
@@ -140,9 +141,11 @@ fn selective(
         Err(err) => return Ok(Outcome::Fallback(format!("resolutionChanged failed ({err:#})"))),
     };
     let facts = answer.facts;
+    let watch_paths = path_case::keys(project_root, &answer.watch_paths);
     match answer.delta {
         ResolutionDelta::Unchanged => {
-            store.with(|conn| schema::set_resolution_facts(conn, language, facts.as_deref()))?;
+            store
+                .with(|conn| schema::set_resolution_facts(conn, language, facts.as_deref(), &watch_paths))?;
             Ok(Outcome::Unchanged)
         }
         ResolutionDelta::Unknown { reason } => {
@@ -151,7 +154,9 @@ fn selective(
         ResolutionDelta::Affected { files, imports } => {
             let selected = match store.with(|conn| select(conn, language, &files, &imports, None))? {
                 Selection::Nothing => {
-                    store.with(|conn| schema::set_resolution_facts(conn, language, facts.as_deref()))?;
+                    store.with(|conn| {
+                        schema::set_resolution_facts(conn, language, facts.as_deref(), &watch_paths)
+                    })?;
                     return Ok(Outcome::Unchanged);
                 }
                 Selection::TooMany(why) => return Ok(Outcome::Fallback(why)),
@@ -166,6 +171,7 @@ fn selective(
                 changed_file,
                 &selected,
                 facts.as_deref(),
+                &watch_paths,
                 semantic_pass,
             )
         }
@@ -468,6 +474,7 @@ impl StoredImport {
 
 /// Re-extracts `selected` under `pending_reindex`, sends one semantic pass
 /// over them (plus the owed files) when `semantic_pass`, then stores `facts`
+/// with `watch_paths` (already case-folded keys)
 /// and clears `pending_reindex` together. A failed re-extract stops the loop
 /// and falls back, leaving `pending_reindex` for the whole-language reindex
 /// to clear. A selected file already gone from disk (the selection is the
@@ -482,6 +489,7 @@ fn reextract(
     changed_file: &str,
     selected: &BTreeSet<String>,
     facts: Option<&str>,
+    watch_paths: &[String],
     semantic_pass: bool,
 ) -> Result<Outcome> {
     store
@@ -504,7 +512,7 @@ fn reextract(
     store
         .with(|conn| -> Result<()> {
             let tx = conn.unchecked_transaction().context("failed to start the facts transaction")?;
-            schema::set_resolution_facts(&tx, language, facts)?;
+            schema::set_resolution_facts(&tx, language, facts, watch_paths)?;
             tx.execute("DELETE FROM pending_reindex WHERE language = ?1", params![language])
                 .with_context(|| format!("failed to clear {language}'s pending reindex"))?;
             tx.commit().context("failed to commit the facts transaction")

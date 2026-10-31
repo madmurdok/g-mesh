@@ -28,6 +28,7 @@ struct Model(String);
 struct Versioned {
     presence: Mutex<Vec<(String, bool)>>,
     panic_in_delta: bool,
+    panic_in_paths: bool,
 }
 
 fn load(root: &Path) -> anyhow::Result<Model> {
@@ -64,6 +65,11 @@ impl crate::Extractor for Versioned {
 
     fn resolution_facts(&self, project: &Model) -> Option<String> {
         Some(project.0.clone())
+    }
+
+    fn watch_paths(&self, project: &Model) -> Vec<String> {
+        assert!(!self.panic_in_paths, "deliberate panic for the test");
+        vec![format!("{}.json", project.0)]
     }
 
     fn resolution_delta(&self, previous: &str, project: &Model) -> ResolutionDelta {
@@ -279,6 +285,79 @@ fn a_missing_blob_a_panicking_delta_or_a_failed_load_answers_unknown() {
         vec!["built_against_1"],
         "the old model stays in use after a failed load"
     );
+}
+
+/// A `resolutionChanged` answer carries the reloaded model's watch paths,
+/// not the previous model's, whether the delta is `Unchanged` or `Affected`;
+/// a later answer replaces them again.
+///
+/// Control: leave `watch_paths` empty in `Session::resolution_changed`
+/// (every answer below has none).
+#[test]
+fn a_resolution_change_answers_the_reloaded_models_watch_paths() {
+    let scratch = Scratch::new("watch-paths", "1");
+    let (spec, extractor, started) = (spec(), Versioned::default(), Arc::new(AtomicBool::new(false)));
+    let mut session = session(&extractor, &spec, &scratch.0, &started);
+
+    let same = resolution_changed(&mut session, 1, Some("1"));
+    assert_eq!(same.delta, ResolutionDelta::Unchanged);
+    assert_eq!(same.watch_paths, vec!["1.json".to_string()]);
+
+    scratch.set_model("2");
+    let moved = resolution_changed(&mut session, 2, Some("1"));
+    assert!(matches!(moved.delta, ResolutionDelta::Affected { .. }), "{moved:?}");
+    assert_eq!(moved.watch_paths, vec!["2.json".to_string()], "the new model's, not the old one's");
+}
+
+/// The answer has no watch paths when it is `Unknown` (no previous facts, a
+/// panicking delta, a failed load) or when the extractor has no facts, and
+/// the field is then absent from the JSON; a panicking `watch_paths` costs
+/// only the list.
+#[test]
+fn a_resolution_answer_carries_no_watch_paths_without_a_usable_delta_and_facts() {
+    let scratch = Scratch::new("watch-paths-none", "1");
+    let spec = spec();
+    let started = Arc::new(AtomicBool::new(false));
+
+    let extractor = Versioned::default();
+    let mut plain = session(&extractor, &spec, &scratch.0, &started);
+    let result = resolution_changed(&mut plain, 1, None);
+    assert!(unknown(&result) && result.watch_paths.is_empty(), "no previousFacts: {result:?}");
+
+    let panicking = Versioned { panic_in_delta: true, ..Versioned::default() };
+    let mut session_d = session(&panicking, &spec, &scratch.0, &started);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = resolution_changed(&mut session_d, 2, Some("0"));
+    let paths_panic = Versioned { panic_in_paths: true, ..Versioned::default() };
+    let mut session_p = session(&paths_panic, &spec, &scratch.0, &started);
+    let kept = resolution_changed(&mut session_p, 3, Some("0"));
+    std::panic::set_hook(previous);
+    assert!(unknown(&result) && result.watch_paths.is_empty(), "a panicking delta: {result:?}");
+    assert!(matches!(kept.delta, ResolutionDelta::Affected { .. }), "the delta survives: {kept:?}");
+    assert_eq!(kept.facts.as_deref(), Some("1"), "the facts survive");
+    assert!(kept.watch_paths.is_empty(), "a panicking watch_paths costs the list: {kept:?}");
+
+    let defaults = Defaults;
+    let mut session_n = session(&defaults, &spec, &scratch.0, &started);
+    let raw = send(
+        &mut session_n,
+        4,
+        "resolutionChanged",
+        serde_json::json!({ "filePath": MODEL, "previousFacts": "1" }),
+    )
+    .expect("answered");
+    assert!(raw["result"].get("watchPaths").is_none(), "an empty list is not written: {raw}");
+
+    scratch.set_model("broken");
+    let result = resolution_changed(&mut plain, 5, Some("1"));
+    assert!(unknown(&result) && result.watch_paths.is_empty(), "a failed load: {result:?}");
+}
+
+/// The trait default declares no watch paths.
+#[test]
+fn the_default_extractor_declares_no_watch_paths() {
+    assert!(crate::Extractor::watch_paths(&Defaults, &Model("1".to_string())).is_empty());
 }
 
 /// `reextract` extracts unchanged text against the

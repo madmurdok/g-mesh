@@ -12,6 +12,7 @@ pub mod indexing_status;
 pub mod lifecycle;
 pub mod manifest;
 pub mod memory;
+pub(crate) mod path_case;
 pub mod plugin;
 pub mod registry;
 pub mod seed;
@@ -784,12 +785,13 @@ fn watch_and_route_once(
         batch.push((classify_settled(conn, &settled, &file_path), file_path));
     }
     let order = order_for_routing(batch);
-    // A workspace file (`[plugin.workspace] watch_files`) triggers that
-    // language's reindex; anything else is applied or queued by its supervisor.
+    // A watch file (`[plugin.workspace] watch_files`, or a stored watch path)
+    // triggers that language's reindex; anything else is applied or queued by
+    // its supervisor.
     for file_path in order.deleted {
         registry.route_settled_path(conn, file_path);
     }
-    registry.announce_created(&order.created);
+    registry.announce_created(conn, &order.created);
     for file_path in order.created.into_iter().chain(order.modified) {
         registry.route_settled_path(conn, file_path);
     }

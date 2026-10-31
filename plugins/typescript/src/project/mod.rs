@@ -13,8 +13,9 @@
 //!   when it is in the set.
 //! - **Configs are read once.** Workspace packages, tsconfig `paths` per
 //!   directory and package.json `imports` per directory change only through
-//!   a reload: their files are [`WATCH_FILES`], and a save of one reloads
-//!   the model; [`facts`] says which importers that can move.
+//!   a reload: their files are [`WATCH_FILES`] plus
+//!   [`TsProject::watch_paths`], and a save of one reloads the model;
+//!   [`facts`] says which importers that can move.
 //! - **Lookups walk up** the importer's directories against per-directory
 //!   maps, so a directory created after the load needs no model update.
 //! - **A bad config is a note, never an error.** An unreadable or malformed
@@ -26,6 +27,7 @@ pub mod jsonc;
 pub mod paths;
 pub mod resolve;
 pub mod tsconfig;
+mod version_range;
 pub mod workspace;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,6 +79,10 @@ pub struct TsProject {
     /// load, so a file created while no model watched (offline, or before
     /// this process spawned) is still offered on its first `fileChanged`.
     pub announced: BTreeSet<RelPath>,
+    /// Files outside [`WATCH_FILES`] whose save changes this model: every
+    /// file the tsconfig `extends` chains probed, found or not, outside
+    /// [`EXCLUDE_DIRS`]. A config under `node_modules` is not among them.
+    pub watch_paths: BTreeSet<String>,
 }
 
 impl TsProject {
@@ -96,14 +102,15 @@ impl TsProject {
         let mut manifests: BTreeMap<String, Json> = BTreeMap::new();
         let mut imports_by_dir = BTreeMap::new();
         let mut tsconfig_by_dir = BTreeMap::new();
-        {
+        let watch_paths = {
             let mut configs = TsconfigReader::new(root, &mut notes);
             for dir in &tree.dirs {
                 if let Some(config) = configs.own_config(dir) {
                     tsconfig_by_dir.insert(dir.clone(), configs.effective(&config));
                 }
             }
-        }
+            configs.into_watch_paths()
+        };
 
         for dir in &tree.dirs {
             let manifest_path = paths::join(dir, "package.json");
@@ -132,7 +139,15 @@ impl TsProject {
         let patterns = workspace_patterns(pnpm.as_deref(), manifests.get(""));
         let packages = workspace_packages(&patterns, &tree, &manifests);
 
-        Ok(Self { existence, packages, tsconfig_by_dir, imports_by_dir, notes, announced: BTreeSet::new() })
+        Ok(Self {
+            existence,
+            packages,
+            tsconfig_by_dir,
+            imports_by_dir,
+            notes,
+            announced: BTreeSet::new(),
+            watch_paths,
+        })
     }
 
     /// The file `specifier`, written in the file `from`, names, or `None`

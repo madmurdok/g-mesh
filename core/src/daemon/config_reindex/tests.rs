@@ -618,7 +618,7 @@ fn set_walk_of(project: &Path, facts: Option<&str>, imports: [WireEdge; 3]) {
         lines.push(serde_json::to_string(&edge).unwrap());
     }
     if let Some(facts) = facts {
-        lines.push(serde_json::json!({ "resolutionFacts": facts }).to_string());
+        lines.push(test_plugin::resolution_facts_line(facts, &[]));
     }
     test_plugin::set_bulk_stream(project, "alpha", &lines, 0);
 }
