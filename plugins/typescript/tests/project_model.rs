@@ -588,10 +588,10 @@ fn the_declared_entry_fields_are_offered_in_a_fixed_order_after_exports() {
         strings(&[
             "packages/p/e.js",
             "packages/p/s.ts",
+            "packages/p/ty.d.ts",
+            "packages/p/t.d.ts",
             "packages/p/m.js",
             "packages/p/mod.js",
-            "packages/p/t.d.ts",
-            "packages/p/ty.d.ts",
             "packages/p/src/index",
             "packages/p/index",
         ])
@@ -1523,7 +1523,8 @@ fn a_package_whose_main_names_the_root_resolves_to_the_root_index() {
 /// its own spelling, `\` included) may name the root: `.` and `.\` from the
 /// root package, `..` and `..\` from `sub`, `..\..` from `a/b`. A relative
 /// spelling naming the root names nothing, and `..` from the root climbs
-/// out. An empty `*` capture names nothing either.
+/// out. An empty `*` capture names nothing either, nor does an extensionless
+/// relative target (`#r/x` under `./*`).
 #[test]
 fn an_imports_target_spelled_as_a_module_name_may_name_the_root() {
     for (dir, target, names_root) in [
@@ -1547,7 +1548,7 @@ fn an_imports_target_spelled_as_a_module_name_may_name_the_root() {
     }
     let wildcard = imports("", r##"{"#r/*":"./*"}"##);
     assert_eq!(imports_targets(&wildcard, "#r/"), Vec::<String>::new());
-    assert_eq!(imports_targets(&wildcard, "#r/x"), strings(&["x"]));
+    assert_eq!(imports_targets(&wildcard, "#r/x"), Vec::<String>::new());
 }
 
 /// The same through a loaded model, from the importer's nearest package.
