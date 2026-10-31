@@ -32,7 +32,8 @@ rules apply to every descendant.
   `file-map-executable` and `process-exec` denied, then allowed under the
   OS (`/System`, `/usr/lib`, `/Library/Apple` to map; `/bin`, `/usr/bin`,
   `/usr/libexec`, `/System` to exec) and the toolchain (sysroot, rustup
-  proxies dir, the server's, `rustc`'s and `cargo`'s dirs), and denied
+  proxies dir, the dir of the `CARGO_HOME/bin/cargo` proxy rust-analyzer
+  execs, the server's, `rustc`'s and `cargo`'s dirs), and denied
   under the canonical project root. Paths reach the profile only as `-D`
   parameters, all canonical (Seatbelt matches resolved paths). Seatbelt
   applies the last matching rule, so rules are emitted in ascending path
@@ -119,6 +120,7 @@ rules apply to every descendant.
   cannot deny exec under a project root that lies inside an allowed prefix.
 - No Linux layer confines writes (D4 A); "write nothing" stays enforced by
   configuration, as on macOS.
-- A Linux toolchain outside the OS prefixes, sysroot, rustup proxies and
-  the server's/`rustc`'s/`cargo`'s directories fails the preflight; the
+- A Linux toolchain outside the OS prefixes, sysroot, rustup proxies, the
+  `CARGO_HOME/bin` proxy dir and the server's/`rustc`'s/`cargo`'s
+  directories fails the preflight; the
   logged reason carries the trampoline's message.
