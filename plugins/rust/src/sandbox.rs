@@ -40,7 +40,10 @@ pub struct SandboxPolicy {
     pub project_root: PathBuf,
     /// Toolchain prefixes the tree may map and exec (sysroot, rustup proxies
     /// dir, the proxy dir rust-analyzer execs from `CARGO_HOME`, server dir,
-    /// rustc/cargo dirs), deduplicated. OS prefixes are each backend's own.
+    /// rustc/cargo dirs), deduplicated. From [`SandboxPolicy::for_server`]
+    /// never the filesystem root, a top-level directory, a volume or mount
+    /// root, or the user's home or one above it (see [`too_broad`]). OS
+    /// prefixes are each backend's own.
     pub toolchain: Vec<PathBuf>,
     /// Prefixes the tree may write (the server's private temp dir and the
     /// cargo caches), deduplicated. A writable prefix inside the root stays
@@ -94,33 +97,205 @@ impl SandboxPolicy {
     /// the directory of the rustup proxy rust-analyzer runs from
     /// `cargo_home`'s `bin/` (see [`cargo_proxy`]), and the directories of the
     /// server, `rustc` and `cargo`, which lie outside the sysroot on an
-    /// install that is not rustup's. The tree may write `temp` (the server's
-    /// private `TMPDIR`) and `cargo_home`'s `registry/` and `git/`
-    /// (extracting an already cached dependency), never `cargo_home` itself,
-    /// whose `bin/` and config files reach the user's own later cargo runs.
+    /// install that is not rustup's. A prefix that is too broad (see
+    /// [`too_broad`], judged on its canonical path with `home` as the user's
+    /// home) is dropped and logged once; the rest of the policy stands. The
+    /// tree may write `temp` (the server's private `TMPDIR`) and
+    /// `cargo_home`'s `registry/` and `git/` (extracting an already cached
+    /// dependency), never `cargo_home` itself, whose `bin/` and config files
+    /// reach the user's own later cargo runs.
     pub(crate) fn for_server(
         root: &Path,
         toolchain: &Toolchain,
         server: &Path,
         cargo_home: Option<&Path>,
         temp: Option<&Path>,
+        home: Option<&Path>,
     ) -> Self {
-        let server = std::fs::canonicalize(server).unwrap_or_else(|_| server.to_path_buf());
-        let parent = |path: &Path| path.parent().map(Path::to_path_buf);
-        let prefixes = [
-            toolchain.sysroot.clone(),
-            toolchain.rustup.as_deref().and_then(parent),
-            cargo_home.and_then(cargo_proxy).as_deref().and_then(parent),
-            parent(&server),
-            toolchain.rustc.as_deref().and_then(parent),
-            toolchain.cargo.as_deref().and_then(parent),
-        ];
+        let (prefixes, refusals) = toolchain_prefixes(toolchain, server, cargo_home, home);
+        for refusal in &refusals {
+            g_mesh_plugin_sdk::log_line!("{}", refusal.message());
+        }
         let writable = [
             temp.map(Path::to_path_buf),
             cargo_home.map(|home| home.join("registry")),
             cargo_home.map(|home| home.join("git")),
         ];
-        SandboxPolicy::new(root, prefixes.into_iter().flatten(), writable.into_iter().flatten())
+        SandboxPolicy::new(root, prefixes, writable.into_iter().flatten())
+    }
+}
+
+/// The toolchain prefixes [`SandboxPolicy::for_server`] allows, canonical,
+/// missing ones dropped, deduplicated in order, and the ones it refuses as
+/// too broad ([`too_broad`]), one [`Refusal`] per distinct prefix naming the
+/// first source that yielded it. `home` is canonicalized before the check
+/// (kept as given when that fails).
+pub(crate) fn toolchain_prefixes(
+    toolchain: &Toolchain,
+    server: &Path,
+    cargo_home: Option<&Path>,
+    home: Option<&Path>,
+) -> (Vec<PathBuf>, Vec<Refusal>) {
+    let server = std::fs::canonicalize(server).unwrap_or_else(|_| server.to_path_buf());
+    let home = home.map(|home| std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()));
+    let parent = |path: &Path| path.parent().map(Path::to_path_buf);
+    let proxy = cargo_home.and_then(cargo_proxy);
+    let sources = [
+        (toolchain.sysroot.clone(), PrefixSource::Sysroot),
+        (
+            toolchain.rustup.as_deref().and_then(parent),
+            PrefixSource::Rustup(toolchain.rustup.clone().unwrap_or_default()),
+        ),
+        (proxy.as_deref().and_then(parent), PrefixSource::CargoProxy(proxy.clone().unwrap_or_default())),
+        (parent(&server), PrefixSource::Server(server.clone())),
+        (
+            toolchain.rustc.as_deref().and_then(parent),
+            PrefixSource::Rustc(toolchain.rustc.clone().unwrap_or_default()),
+        ),
+        (
+            toolchain.cargo.as_deref().and_then(parent),
+            PrefixSource::Cargo(toolchain.cargo.clone().unwrap_or_default()),
+        ),
+    ];
+    let mut kept: Vec<PathBuf> = Vec::new();
+    let mut refused: Vec<Refusal> = Vec::new();
+    for (prefix, source) in sources {
+        let Some(prefix) = prefix.and_then(|prefix| std::fs::canonicalize(prefix).ok()) else {
+            continue;
+        };
+        if kept.contains(&prefix) || refused.iter().any(|refusal| refusal.prefix == prefix) {
+            continue;
+        }
+        match too_broad(&prefix, home.as_deref()) {
+            Some(reason) => refused.push(Refusal { prefix, source, reason }),
+            None => kept.push(prefix),
+        }
+    }
+    (kept, refused)
+}
+
+/// Why a toolchain prefix is too broad to allow exec under (rules R1-R5 of
+/// the GM-681 design note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BreadthReason {
+    /// R1: no normal component (`/`, `C:\`, `\\server\share\`).
+    Root,
+    /// R2: exactly one normal component (`/usr`, `/Users`, `C:\Users`).
+    TopLevel,
+    /// R3: `/private/<x>`, what macOS's `/var`, `/tmp`, `/etc` resolve to.
+    SystemAlias,
+    /// R4: a volume or mount root (`/Volumes/<x>`, `/System/Volumes/<x>`,
+    /// `/mnt/<x>`, `/media/<x>`, `/media/<u>/<x>`, `/run/media/<u>/<x>`).
+    VolumeRoot,
+    /// R5: the user's home or an ancestor of it.
+    Home,
+}
+
+impl std::fmt::Display for BreadthReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BreadthReason::Root => "the filesystem root",
+            BreadthReason::TopLevel => "a top-level directory",
+            BreadthReason::SystemAlias => "a system alias directory",
+            BreadthReason::VolumeRoot => "a volume or mount root",
+            BreadthReason::Home => "your home directory or one above it",
+        })
+    }
+}
+
+/// Which of [`SandboxPolicy::for_server`]'s sources yielded a prefix, with
+/// the binary whose directory it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrefixSource {
+    /// `rustc --print sysroot`.
+    Sysroot,
+    /// The directory of the first `rustup` on `PATH`.
+    Rustup(PathBuf),
+    /// The directory of the canonical `CARGO_HOME/bin/cargo` proxy.
+    CargoProxy(PathBuf),
+    /// The directory of the canonical rust-analyzer.
+    Server(PathBuf),
+    /// The directory of `rustc`.
+    Rustc(PathBuf),
+    /// The directory of `cargo`.
+    Cargo(PathBuf),
+}
+
+impl std::fmt::Display for PrefixSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (what, path) = match self {
+            PrefixSource::Sysroot => return f.write_str("sysroot"),
+            PrefixSource::Rustup(path) => ("rustup", path),
+            PrefixSource::CargoProxy(path) => ("the cargo proxy", path),
+            PrefixSource::Server(path) => ("rust-analyzer", path),
+            PrefixSource::Rustc(path) => ("rustc", path),
+            PrefixSource::Cargo(path) => ("cargo", path),
+        };
+        write!(f, "directory of {what} {}", path.display())
+    }
+}
+
+/// A toolchain prefix [`SandboxPolicy::for_server`] dropped as too broad.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    /// The canonical prefix that was dropped.
+    pub prefix: PathBuf,
+    /// The first source that yielded it.
+    pub source: PrefixSource,
+    /// Which rule it broke.
+    pub reason: BreadthReason,
+}
+
+impl Refusal {
+    /// The log line for this refusal.
+    pub(crate) fn message(&self) -> String {
+        format!(
+            "[rust] semantic tier: sandbox: not allowing exec under {}, the {} ({}); rust-analyzer \
+             cannot run anything that lives only there",
+            self.prefix.display(),
+            self.source,
+            self.reason
+        )
+    }
+}
+
+/// Why `prefix` (canonical) is too broad to allow exec under, or `None`:
+/// the filesystem root (R1), a top-level directory (R2), a macOS
+/// `/private/<x>` alias (R3), a volume or mount root (R4), or `home` or an
+/// ancestor of it (R5, skipped when `home` is `None`). Judged on path
+/// components, so Windows drive and UNC roots are R1 and `C:\Users` is R2.
+pub(crate) fn too_broad(prefix: &Path, home: Option<&Path>) -> Option<BreadthReason> {
+    use std::path::Component;
+    let mut has_prefix = false;
+    let mut normal: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in prefix.components() {
+        match component {
+            Component::Prefix(_) => has_prefix = true,
+            Component::Normal(name) => normal.push(name),
+            Component::RootDir | Component::CurDir | Component::ParentDir => {}
+        }
+    }
+    match normal.len() {
+        0 => return Some(BreadthReason::Root),
+        1 => return Some(BreadthReason::TopLevel),
+        _ => {}
+    }
+    if !has_prefix {
+        let names: Vec<&str> = normal.iter().map(|name| name.to_str().unwrap_or("")).collect();
+        match names.as_slice() {
+            ["private", _] => return Some(BreadthReason::SystemAlias),
+            ["Volumes", _]
+            | ["System", "Volumes", _]
+            | ["mnt", _]
+            | ["media", _]
+            | ["media", _, _]
+            | ["run", "media", _, _] => return Some(BreadthReason::VolumeRoot),
+            _ => {}
+        }
+    }
+    match home {
+        Some(home) if home.starts_with(prefix) => Some(BreadthReason::Home),
+        _ => None,
     }
 }
 
@@ -517,14 +692,14 @@ mod tests {
         };
         let scratch = Scratch::new("toolchain");
 
-        let policy = SandboxPolicy::for_server(&scratch.0, &toolchain, &server, None, None);
+        let policy = SandboxPolicy::for_server(&scratch.0, &toolchain, &server, None, None, None);
         let (outcome, config) = confine_server(&server, &policy);
         assert_eq!(outcome, SandboxOutcome::Confined { backend: "seatbelt" }, "{policy:?}");
         assert_eq!(config.command, Path::new(seatbelt::SANDBOX_EXEC));
         assert_eq!(config.args.last().map(String::as_str), server.to_str(), "{:?}", config.args);
 
         let without_sysroot = Toolchain { sysroot: None, ..toolchain };
-        let policy = SandboxPolicy::for_server(&scratch.0, &without_sysroot, &server, None, None);
+        let policy = SandboxPolicy::for_server(&scratch.0, &without_sysroot, &server, None, None, None);
         let (outcome, config) = confine_server(&server, &policy);
         assert!(
             matches!(outcome, SandboxOutcome::Failed(_)),
@@ -765,7 +940,7 @@ mod tests {
         let root = scratch.0.join("proj");
         let server = scratch.0.join("ra/rust-analyzer");
         let policy = |home: &Path| {
-            SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(home), Some(&temp))
+            SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(home), Some(&temp), None)
         };
 
         let all = policy(&home);
@@ -802,7 +977,8 @@ mod tests {
         let root = scratch.0.join("proj");
         let server = scratch.0.join("ra/rust-analyzer");
 
-        let policy = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None);
+        let policy =
+            SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None, None);
         assert_eq!(policy.toolchain, vec![rup], "{policy:?}");
         assert!(policy.writable.is_empty(), "the proxy directory is not writable: {policy:?}");
     }
@@ -820,8 +996,9 @@ mod tests {
         exits_zero(&home.join("bin/cargo-nextest"));
         let root = scratch.0.join("proj");
         let server = scratch.0.join("ra/rust-analyzer");
-        let policy =
-            |home: &Path| SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(home), None);
+        let policy = |home: &Path| {
+            SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(home), None, None)
+        };
 
         let none = policy(&home);
         assert!(none.toolchain.is_empty(), "a prefix for a proxy that is not there: {none:?}");
@@ -848,7 +1025,8 @@ mod tests {
         let proxy = exits_zero(&home.join("bin/cargo"));
         let server = scratch.0.join("ra/rust-analyzer");
 
-        let policy = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None);
+        let policy =
+            SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None, None);
         assert_eq!(policy.toolchain, vec![proxy.parent().unwrap().to_path_buf()], "{policy:?}");
         let rules = ordered(&seatbelt::rules(&policy));
         let deny = position(&rules, false, &policy.project_root);
@@ -873,7 +1051,8 @@ mod tests {
         let root = scratch.0.join("proj");
         let server = scratch.0.join("ra/rust-analyzer");
 
-        let policy = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None);
+        let policy =
+            SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None, None);
         assert_eq!(policy.toolchain, vec![home.join("bin")], "{policy:?}");
     }
 
@@ -897,11 +1076,11 @@ mod tests {
 
         assert!(probe(&server, None, &run).contains(&ran), "sanity: the proxy does not run unconfined");
 
-        let without = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, None, None);
+        let without = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, None, None, None);
         let stdout = probe(&server, Some(&without), &run);
         assert!(!stdout.contains(&ran), "sanity: the proxy runs without its directory allowed: {stdout}");
 
-        let with = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None);
+        let with = SandboxPolicy::for_server(&root, &Toolchain::default(), &server, Some(&home), None, None);
         let stdout = probe(&server, Some(&with), &run);
         assert!(stdout.contains(&ran), "the confined tree could not exec the proxy ({with:?}): {stdout}");
     }

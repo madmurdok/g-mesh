@@ -33,7 +33,10 @@ rules apply to every descendant.
   OS (`/System`, `/usr/lib`, `/Library/Apple` to map; `/bin`, `/usr/bin`,
   `/usr/libexec`, `/System` to exec) and the toolchain (sysroot, rustup
   proxies dir, the dir of the `CARGO_HOME/bin/cargo` proxy rust-analyzer
-  execs, the server's, `rustc`'s and `cargo`'s dirs), and denied
+  execs, the server's, `rustc`'s and `cargo`'s dirs; never the filesystem
+  root, a top-level directory, a `/private/<x>` alias, a volume or mount
+  root, or the user's home or one above it: such a prefix is dropped and
+  logged, GM-681), and denied
   under the canonical project root. Paths reach the profile only as `-D`
   parameters, all canonical (Seatbelt matches resolved paths). Seatbelt
   applies the last matching rule, so rules are emitted in ascending path
@@ -123,4 +126,7 @@ rules apply to every descendant.
 - A Linux toolchain outside the OS prefixes, sysroot, rustup proxies, the
   `CARGO_HOME/bin` proxy dir and the server's/`rustc`'s/`cargo`'s
   directories fails the preflight; the
-  logged reason carries the trampoline's message.
+  logged reason carries the trampoline's message. A toolchain prefix that
+  is the filesystem root, a top-level directory, a volume or mount root,
+  or the user's home or one above it is dropped and logged (GM-681): a
+  Landlock grant there could not deny exec under the project root.
