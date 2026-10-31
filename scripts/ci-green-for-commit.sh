@@ -6,7 +6,7 @@
 #
 # release.yml's `ci-gate` job asks this before deciding whether to call ci.yml
 # again. A tag is cut by scripts/cut-release.sh only after GM-391 proved the
-# release-side parent passed a full ci.yml run, and the tag commit's tree is
+# release-side parent passed a full ci.yml run (GM-391, GM-675), and the tag commit's tree is
 # that parent's tree byte for byte, so re-running ~41-60 minutes of tests on
 # it repeats a result already in hand.
 #
@@ -20,12 +20,13 @@
 # either way; 2 only for a usage error.
 #
 # What counts (the same query as cut-release.sh's
-# check_release_branch_ci_passed, GM-391):
+# wait_for_green_full_ci, GM-675):
 #   * a ci.yml run whose head_sha is the candidate and whose conclusion is
 #     `success`, AND
 #   * whose jobs include "$CI_FULL_SUITE_JOB" with conclusion `success` - a
 #     partial run (test sections selected by changed paths, a single-platform
-#     dispatch) does not count.
+#     dispatch) does not count. A full run includes the doctests and
+#     `cargo test -p g-mesh` (Linux row).
 # Candidates: the commit itself, then each parent whose *tree* equals the
 # commit's tree (owner decision D2: same code, not same SHA). A parent with a
 # different tree is never borrowed from.

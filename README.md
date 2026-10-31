@@ -416,11 +416,15 @@ Oniguruma, tree-sitter grammars) for that target.
    previous release tag (see `docs/architecture/plugin-modularity.md`,
    "`plugin_version`: two rules, not one").
 3. Run `scripts/cut-release.sh <version>` on `main`. It refuses unless the
-   merged release commit is the tip of `origin/release-<version>` and has a
-   successful `ci.yml` run — so step 1 cannot be skipped silently. It verifies the crate
+   merged release commit is the tip of `origin/release-<version>`, its tree equals
+   that tip's tree, and ci.yml passed a full run on it — so step 1 cannot be skipped
+   silently. It verifies the crate
    version (core's and every release-versioned member's, plus each
    workspace plugin's own version rule), working tree and
-   branch state, runs `cargo test --workspace`, and creates an annotated
+   branch state, runs `scripts/test-sections.sh check`, waits for (or
+   requires) a green full `ci.yml` run on the release tip (dispatch it with
+   `gh workflow run ci.yml --ref release-<version>`; `--ci-timeout <min>`,
+   default 90), runs no test suite itself, and creates an annotated
    `v<version>` tag locally — it does not push by default, since pushing the
    tag is what starts the public four-platform build and a Release.
    Pass `--push` to push it in the same step, or run the printed
@@ -1133,7 +1137,7 @@ Core's integration tests are two binaries, `it` and `scripts`, and most of
 their tests start a real daemon and a Node plugin. Run them two at a time
 (`--test-threads=2`, the width of nextest's `daemon-spawning` group in
 `.config/nextest.toml`): at libtest's default width they can fail from
-contention, not from a bug. `scripts/cut-release.sh` runs core this way.
+contention, not from a bug. ci.yml's Linux row runs core this way (`cargo test -p g-mesh`, full runs).
 
 `scripts/test-deps.sh` installs what the suite drives for real and cargo
 cannot fetch: rust-analyzer (`plugins/rust`'s semantic tier) and pyright

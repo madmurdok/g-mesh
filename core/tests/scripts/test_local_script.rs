@@ -798,18 +798,16 @@ fn a_dry_run_without_the_plugin_node_modules_still_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
-// The same PATH for cut-release.sh's test step (GM-628)
+// cut-release.sh runs no suite (GM-675): `check`, then the CI gate, then the tag
 
 /// Runs `cut-release.sh`'s `main` from a copy of `scripts/` in `root`, with a
 /// working directory that is not the repo root, and every command it would
-/// run for real (git, cargo, the pre-tag checks) replaced by a shell function
-/// that succeeds. `scripts/test-sections.sh` is a stub that appends its
-/// arguments and `PATH` to the record file, and exits `sections_status`
-/// for `run`. Returns the output and the record's lines.
-fn run_cut_release(root: &Path, args: &[&str], sections_status: i32) -> (Output, Vec<String>) {
-    let stub = format!(
-        "#!/bin/sh\necho \"test-sections $*|$PATH\" >> \"$GM628_RECORD\"\n[ \"$1\" = run ] && exit {sections_status}\nexit 0\n"
-    );
+/// run for real (git, cargo, the pre-tag checks, the CI gate) replaced by a
+/// shell function that succeeds. `scripts/test-sections.sh` is a stub that
+/// appends its arguments to the record file. The CI gate stub records `gate`
+/// and fails when `gate_status` is not 0. Returns the output and the record.
+fn run_cut_release(root: &Path, args: &[&str], gate_status: i32) -> (Output, Vec<String>) {
+    let stub = "#!/bin/sh\necho \"test-sections $*\" >> \"$GM628_RECORD\"\nexit 0\n";
     let sections = root.join("scripts/test-sections.sh");
     fs::write(&sections, stub).unwrap();
     fs::set_permissions(&sections, fs::Permissions::from_mode(0o755)).unwrap();
@@ -827,10 +825,11 @@ fn run_cut_release(root: &Path, args: &[&str], sections_status: i32) -> (Output,
             esac
         }
         bash() { echo "9.9.9"; }
-        cargo() { echo "cargo $*|$PATH" >> "$GM628_RECORD"; }
+        cargo() { echo "cargo $*" >> "$GM628_RECORD"; }
         origin_slug() { echo o/r; }
         check_no_untagged_prior_releases() { :; }
-        check_release_branch_ci_passed() { :; }
+        check_release_merge_shape() { :; }
+        wait_for_green_full_ci() { echo "gate $*" >> "$GM628_RECORD"; [ "$GATE_STATUS" = 0 ] || die "gate failed"; }
         check_workspace_versions() { :; }
         check_crate_backed_plugin_versions() { :; }
         check_self_versioned_plugin_versions() { :; }
@@ -845,72 +844,41 @@ fn run_cut_release(root: &Path, args: &[&str], sections_status: i32) -> (Output,
         .args(args)
         .current_dir(other_cwd.path())
         .env("GM628_RECORD", &record)
+        .env("GATE_STATUS", gate_status.to_string())
         .output()
         .expect("failed to run bash");
     let lines = fs::read_to_string(&record).unwrap_or_default().lines().map(String::from).collect();
     (output, lines)
 }
 
-/// With both plugins' `node_modules/.bin` present, the test step of a cut
-/// (the sections, the doctests, `cargo test -p g-mesh`) sees them first on
-/// `PATH`, taken from the repo root and not from the working directory.
+/// The cut runs `test-sections.sh check` and no section and no `cargo test`;
+/// the CI gate runs after `check` and before the tag, with the timeout.
 #[test]
-fn the_cut_release_test_step_has_the_plugin_bin_dirs_first_on_the_path() {
-    let root = fake_root(true);
-    let (output, record) = run_cut_release(root.path(), &["9.9.9"], 0);
-    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
-    let calls: Vec<&String> = record.iter().filter(|l| !l.starts_with("git ")).collect();
-    assert_eq!(calls.len(), 6, "check, run all, doctest, then cargo test -p g-mesh's three runs: {record:?}");
-    // GM-623: core's integration tests are two binaries of daemon-spawning
-    // tests, so the gate runs them at nextest's `daemon-spawning` width, and
-    // the unit tests and doctests in runs of their own at full width.
-    let commands: Vec<&str> = calls.iter().map(|l| l.split_once('|').unwrap().0).collect();
-    for expected in [
-        "cargo test -p g-mesh --lib --bins",
-        "cargo test -p g-mesh --doc",
-        "cargo test -p g-mesh --test it --test scripts -- --test-threads=2",
-    ] {
-        assert!(commands.contains(&expected), "no `{expected}` in {commands:?}");
-    }
-    let rootp = fs::canonicalize(root.path()).unwrap().display().to_string();
-    let expected =
-        format!("{0}/plugins/typescript/node_modules/.bin:{0}/plugins/python/node_modules/.bin:", rootp);
-    for line in calls {
-        let path = line.split_once('|').unwrap().1.replace(&root.path().display().to_string(), &rootp);
-        assert!(path.starts_with(&expected), "PATH {path} does not start with {expected}");
-    }
-}
-
-/// Without a plugin's `node_modules/.bin` the cut fails with the helper's
-/// message, naming `scripts/test-deps.sh`, before any test runs and before
-/// the tag exists.
-#[test]
-fn a_cut_release_without_the_plugin_node_modules_fails_before_running_tests() {
+fn a_cut_release_runs_check_then_the_ci_gate_then_tags_and_runs_no_suite() {
     let root = fake_root(false);
-    let (output, record) = run_cut_release(root.path(), &["9.9.9"], 0);
-    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("cut-release: plugins/typescript/node_modules/.bin is missing"),
-        "{}",
-        describe(&output)
-    );
-    assert!(stderr.contains("scripts/test-deps.sh"), "{}", describe(&output));
-    assert!(
-        !record
-            .iter()
-            .any(|l| l.starts_with("test-sections") || l.starts_with("cargo") || l.contains(" tag -a ")),
-        "something ran after the failed check: {record:?}"
-    );
+    let (output, record) = run_cut_release(root.path(), &["9.9.9", "--ci-timeout", "7"], 0);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert!(!record.iter().any(|l| l.starts_with("cargo") || l.starts_with("test-sections run")), "{record:?}");
+    let pos = |needle: &str| record.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle}: {record:?}"));
+    assert!(pos("test-sections check") < pos("gate 9.9.9 main 7"), "{record:?}");
+    assert!(pos("gate ") < pos(" tag -a "), "{record:?}");
 }
 
-/// `--skip-tests` runs no test, so it needs no plugin dependency: the cut
-/// goes on to the tag without `node_modules`, and no test command runs.
+/// `--skip-tests` is gone: it dies with the GM-675 message and nothing runs.
 #[test]
-fn a_cut_release_with_skip_tests_does_not_need_the_plugin_node_modules() {
+fn a_cut_release_with_skip_tests_dies() {
     let root = fake_root(false);
     let (output, record) = run_cut_release(root.path(), &["9.9.9", "--skip-tests"], 0);
-    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
-    assert!(record.iter().any(|l| l.contains(" tag -a ")), "no tag: {record:?}");
-    assert!(!record.iter().any(|l| l.starts_with("test-sections") || l.starts_with("cargo")), "{record:?}");
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--skip-tests is gone (GM-675)"), "{}", describe(&output));
+    assert!(record.is_empty(), "{record:?}");
+}
+
+/// A failing CI gate leaves no tag.
+#[test]
+fn a_failing_ci_gate_leaves_no_tag() {
+    let root = fake_root(false);
+    let (output, record) = run_cut_release(root.path(), &["9.9.9"], 1);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(!record.iter().any(|l| l.contains(" tag -a ")), "{record:?}");
 }

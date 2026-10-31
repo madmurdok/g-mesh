@@ -3,8 +3,9 @@
 # GM-628: the plugins' test dependencies (vtsls, pyright) are found on PATH
 # only (ADR 0032 D7); CI puts each plugin's node_modules/.bin there in its
 # "Install vtsls" step, so the local runs do too. Sourced by
-# scripts/test-local.sh (GM-598) and scripts/cut-release.sh, whose test run
-# used to rely on a global vtsls and failed core-it without one (4.10.0).
+# scripts/test-local.sh (GM-598). cut-release.sh used it for its own test run
+# (a global vtsls failed core-it without it, 4.10.0) until GM-675 moved that
+# run to CI.
 #
 # The sourcing script defines `die` (its own prefix and exit code), so a
 # missing directory reads as that script's error.

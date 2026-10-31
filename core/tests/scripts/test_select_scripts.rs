@@ -1,6 +1,6 @@
 //! A change runs only the test sections it can affect (`scripts/test-select.sh`,
 //! GM-539), and a release is cut only from a commit that passed the whole
-//! suite (`scripts/cut-release.sh`'s `check_release_branch_ci_passed`).
+//! suite (`scripts/cut-release.sh`'s `wait_for_green_full_ci`).
 //!
 //! The selector runs for real on path lists (`--paths-from`) and on a scratch
 //! git repository (`--base`) holding copies of the two section scripts. The
@@ -519,6 +519,12 @@ fn bad_arguments_exit_2_without_a_selection() {
 // ---------------------------------------------------------------------------
 // scripts/test-select.sh with git
 
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git").args(args).current_dir(dir).output().expect("git");
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -722,7 +728,7 @@ fn run_full_runs_the_same_sections_as_run_all() {
 }
 
 // ---------------------------------------------------------------------------
-// scripts/cut-release.sh check_release_branch_ci_passed
+// scripts/cut-release.sh check_release_merge_shape + wait_for_green_full_ci
 
 const VERSION: &str = "9.9.9";
 
@@ -784,9 +790,16 @@ exec jq -r "$4" "{fixtures}/$file"
         Release { dir }
     }
 
-    /// ci.yml runs on the tip, as (run id, conclusion).
+    /// ci.yml runs on the tip, as (run id, conclusion). GM-675: each run
+    /// carries the tip's `head_sha`, `completed` and attempt 1.
     fn runs(&self, runs: &[(u64, &str)]) {
-        let runs: Vec<_> = runs.iter().map(|(id, c)| json!({ "id": id, "conclusion": c })).collect();
+        let tip = git_out(&self.dir.path().join("repo"), &["rev-parse", "main^2"]);
+        let runs: Vec<_> = runs
+            .iter()
+            .map(|(id, c)| {
+                json!({ "id": id, "conclusion": c, "status": "completed", "head_sha": tip, "run_attempt": 1 })
+            })
+            .collect();
         fs::write(self.dir.path().join("fixtures/runs.json"), json!({ "workflow_runs": runs }).to_string())
             .unwrap();
     }
@@ -804,7 +817,7 @@ exec jq -r "$4" "{fixtures}/$file"
     fn check(&self) -> Output {
         Command::new("bash")
             .arg("-c")
-            .arg(r#"source "$1" && REPO_ROOT="$2" && check_release_branch_ci_passed "$3""#)
+            .arg(r#"source "$1" && REPO_ROOT="$2" && check_release_merge_shape "$3" && wait_for_green_full_ci "$3""#)
             .arg("cut-release-test")
             .arg(repo_root().join("scripts/cut-release.sh"))
             .arg(self.dir.path().join("repo"))
@@ -878,7 +891,7 @@ fn a_tip_without_a_green_run_is_refused_before_any_job_is_read() {
     release.runs(&[(51, "failure")]);
     let output = release.check();
     assert!(!output.status.success(), "{}", describe(&output));
-    assert!(stderr_of(&output).contains("no successful ci.yml run"), "{}", describe(&output));
+    assert!(stderr_of(&output).contains("no green full ci.yml run"), "{}", describe(&output));
 }
 
 /// The gate looks for the `full-suite` job by its display name; renaming the
