@@ -9,8 +9,12 @@
 //!   is a `resolved_module` named by the raw specifier and targeted at the
 //!   path it names before any extension is tried (`./missing` ->
 //!   `src/missing`): core finds no file there and leaves it unlinked, an
-//!   unresolved import. Any other is an `external_module` named by the raw
-//!   specifier, with no target.
+//!   unresolved import. A non-relative one that resolves to no file is
+//!   addressed the same way when it is an alias, workspace package or `#`
+//!   key: a `resolved_module` targeted at the first base its resolution
+//!   walks ([`MissAddress`]), so the create of any candidate can name it.
+//!   Any other is an `external_module` named by the raw specifier, with no
+//!   target.
 //! - The names an import binds are kept only when its specifier resolved:
 //!   named and default imports in [`ImportBinding`]s (a use of one becomes a
 //!   `pending_symbol` placeholder, [`Declarer::imported_symbol`]), a
@@ -48,6 +52,11 @@ use crate::project::resolve::relative_address;
 /// The walk stays a function of (path, text); the filesystem-dependent policy
 /// lives behind this.
 pub type SpecifierResolver<'r> = dyn Fn(&str, &RelPath) -> Option<RelPath> + 'r;
+
+/// The address an unresolved non-relative specifier written in `from` is
+/// recorded at, or `None` when it names no project path (a package, a
+/// builtin): it then stays an `external_module`.
+pub type MissAddress<'r> = dyn Fn(&str, &RelPath) -> Option<String> + 'r;
 
 /// The resolver that resolves nothing: every relative import is an unlinked
 /// `resolved_module`, every other an `external_module`.
@@ -205,7 +214,8 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         // stays an unlinked `resolved_module`, never an `external_module`.
         let address = match &resolved {
             Some(path) => Some(path.as_str().to_string()),
-            None => relative_address(specifier, self.path),
+            None => relative_address(specifier, self.path)
+                .or_else(|| self.miss_address.and_then(|address| address(specifier, self.path))),
         };
         let qualified_name = resolved.as_ref().map_or(specifier, RelPath::as_str);
         let mut params = NodeParams::new(NodeKind::Module, specifier, qualified_name, self.range(at));

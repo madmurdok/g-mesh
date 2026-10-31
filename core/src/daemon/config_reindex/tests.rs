@@ -123,7 +123,7 @@ fn seeded() -> Connection {
 }
 
 fn select(conn: &Connection, files: &[PathScope], imports: &[ImportSelector]) -> Vec<String> {
-    let selected = select_affected(conn, "ts", files, imports).unwrap();
+    let selected = select_affected(conn, "ts", files, imports, None).unwrap();
     assert_eq!(
         indexed_file_count(conn, "ts").unwrap(),
         TS_FILES.len(),
@@ -337,7 +337,7 @@ fn an_exact_target_delta_runs_no_scan_and_selects_what_the_scan_does() {
     for (case, files, imports, expected) in exact_cases() {
         let before = read_counts();
         let selected: Vec<String> =
-            select_affected(&conn, "ts", &files, &imports).unwrap().into_iter().collect();
+            select_affected(&conn, "ts", &files, &imports, None).unwrap().into_iter().collect();
         let after = read_counts();
         assert_eq!(after.0, before.0, "{case}: an exact-only delta ran an import scan");
         assert_eq!(
@@ -347,6 +347,77 @@ fn an_exact_target_delta_runs_no_scan_and_selects_what_the_scan_does() {
         );
         assert_eq!(selected, expected, "{case}");
     }
+}
+
+/// A `File` key equal to the trigger selects the importers that were waiting
+/// at it before the link, not the importers linked to it: with none waiting
+/// it selects nothing, though two files import it, and the same key under
+/// another trigger (or none) still reads both halves.
+///
+/// Control: in `select_affected`, remove the own-path arm (the key goes to
+/// `indexed_importers`: the linked importers come back).
+#[test]
+fn an_own_path_file_key_with_nobody_waiting_selects_nothing() {
+    use TargetScopeKind::File;
+    let conn = seeded();
+    let imports = [by_target(File, exact("lib/e.ts"))];
+    let own: &[String] = &[];
+
+    let selected = select_affected(&conn, "ts", &[], &imports, Some(("lib/e.ts", own))).unwrap();
+    assert!(selected.is_empty(), "{selected:?}");
+
+    for other in [Some(("lib/f.ts", own)), None] {
+        let selected: Vec<String> =
+            select_affected(&conn, "ts", &[], &imports, other).unwrap().into_iter().collect();
+        assert_eq!(selected, paths(&["app/a.ts", "lib/f.ts"]), "{other:?}");
+    }
+}
+
+/// With importers waiting at the trigger the own-path key selects exactly
+/// them, narrowed by the selector's importer scope, and reads nothing else.
+///
+/// Control: in `select_affected`, insert `own_waiting` without the
+/// `selector.importers.contains` filter (the out-of-scope importer comes
+/// back).
+#[test]
+fn an_own_path_file_key_selects_exactly_the_waiting_importers_in_scope() {
+    use TargetScopeKind::File;
+    let conn = seeded();
+    let waiting = vec!["pkg/h.ts".to_string(), "app/b.ts".to_string()];
+    let own = Some(("lib/e.ts", waiting.as_slice()));
+
+    let everyone = [by_target(File, exact("lib/e.ts"))];
+    let selected: Vec<String> =
+        select_affected(&conn, "ts", &[], &everyone, own).unwrap().into_iter().collect();
+    assert_eq!(selected, paths(&["app/b.ts", "pkg/h.ts"]));
+
+    let scoped = [scoped_target(scope("pkg", &[]), File, "lib/e.ts")];
+    let selected: Vec<String> =
+        select_affected(&conn, "ts", &[], &scoped, own).unwrap().into_iter().collect();
+    assert_eq!(selected, paths(&["pkg/h.ts"]));
+}
+
+/// A key that is not the trigger keeps both halves, whatever the waiting
+/// list: `lib/f.ts`'s placeholder importer comes back under trigger
+/// `lib/e.ts`, and a `Container` key never takes the own-path arm.
+///
+/// Control: in `select_affected`, take the own-path arm for any `File` key
+/// when a trigger is present (`pkg/h.ts` is lost).
+#[test]
+fn a_file_key_that_is_not_the_trigger_still_reads_the_index() {
+    use TargetScopeKind::{Container, File};
+    let conn = seeded();
+    let waiting = vec!["app/b.ts".to_string()];
+    let own = Some(("lib/e.ts", waiting.as_slice()));
+
+    let by_file = [by_target(File, exact("lib/f.ts"))];
+    let selected: Vec<String> =
+        select_affected(&conn, "ts", &[], &by_file, own).unwrap().into_iter().collect();
+    assert_eq!(selected, paths(&["pkg/h.ts"]));
+
+    let by_container = [by_target(Container, exact("lib/e.ts"))];
+    let selected = select_affected(&conn, "ts", &[], &by_container, own).unwrap();
+    assert!(selected.is_empty(), "{selected:?}");
 }
 
 /// Any other selector (`Specifier`, `Target` with `Under`, `StartsWith` or
@@ -379,7 +450,7 @@ fn non_exact_selectors_share_one_scan_and_exact_only_runs_none() {
     ] {
         let before = read_counts();
         let selected: Vec<String> =
-            select_affected(&conn, "ts", &[], &imports).unwrap().into_iter().collect();
+            select_affected(&conn, "ts", &[], &imports, None).unwrap().into_iter().collect();
         let after = read_counts();
         assert_eq!(after.0 - before.0, scans, "{case}: import scans");
         assert_eq!(selected, scanned(&conn, &[], &imports), "{case}");
@@ -400,11 +471,11 @@ fn an_imports_only_delta_never_lists_files() {
         vec![by_specifier(exact("@lib/e"))],
     ] {
         let before = read_counts();
-        select_affected(&conn, "ts", &[], &imports).unwrap();
+        select_affected(&conn, "ts", &[], &imports, None).unwrap();
         assert_eq!(read_counts().1, before.1, "{imports:?} listed the language's files");
     }
     let before = read_counts();
-    select_affected(&conn, "ts", &[scope("lib", &[])], &[]).unwrap();
+    select_affected(&conn, "ts", &[scope("lib", &[])], &[], None).unwrap();
     assert_eq!(read_counts().1 - before.1, 1, "a file scope lists the files once");
 }
 
@@ -454,13 +525,14 @@ fn a_gone_files_importers_join_the_selection_under_the_same_threshold() {
     let conn = seeded();
     let extra = paths(&["app/a.ts", "lib/f.ts", "lib/e.ts"]);
 
-    let selection = select_with(&conn, "ts", &[], &[], Some("lib/e.ts"), &extra).unwrap();
+    let selection = select_with(&conn, "ts", &[], &[], Some("lib/e.ts"), &extra, &[]).unwrap();
     assert!(
         matches!(&selection, Selection::Files(files) if files.iter().eq(["app/a.ts", "lib/f.ts"])),
         "2 of 8 files: {selection:?}"
     );
 
-    let selection = select_with(&conn, "ts", &[scope("pkg", &[])], &[], Some("lib/e.ts"), &extra).unwrap();
+    let selection =
+        select_with(&conn, "ts", &[scope("pkg", &[])], &[], Some("lib/e.ts"), &extra, &[]).unwrap();
     assert!(
         matches!(selection, Selection::TooMany(_)),
         "2 importers and 2 of pkg, 4 of 8 files: {selection:?}"

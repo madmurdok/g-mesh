@@ -30,7 +30,7 @@ use g_mesh_plugin_sdk::{CharColumns, RelPath};
 use tree_sitter::Node;
 
 use crate::extractor::bodies::UseState;
-use crate::extractor::imports::{is_whole_module_reexport, ImportState, SpecifierResolver};
+use crate::extractor::imports::{is_whole_module_reexport, ImportState, MissAddress, SpecifierResolver};
 use crate::extractor::keys::{qualified_in, MemberSeparator, Qualified, REEXPORT_ALL_NAME};
 use crate::extractor::model::{FileModel, NodeParams, PendingSupertype};
 use crate::extractor::scope::{block_scope, type_parameter_scope, Scope};
@@ -56,6 +56,9 @@ pub struct Declarer<'a, 's, 't> {
     /// The file being walked, as the resolver is asked from.
     pub(super) path: &'a RelPath,
     pub(super) resolver: &'a SpecifierResolver<'a>,
+    /// Where an unresolved non-relative specifier is addressed; `None`
+    /// leaves every such specifier an `external_module`.
+    pub(super) miss_address: Option<&'a MissAddress<'a>>,
     /// Names an export statement publishes without declaring them there;
     /// settled against the file's declarations once the walk is over.
     pending_exports: Vec<String>,
@@ -79,10 +82,18 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
             model,
             path,
             resolver,
+            miss_address: None,
             pending_exports: Vec::new(),
             imports: ImportState::default(),
             uses: UseState::default(),
         }
+    }
+
+    /// Addresses an unresolved non-relative specifier with `miss_address`
+    /// instead of leaving it an `external_module`.
+    pub fn with_miss_address(mut self, miss_address: &'a MissAddress<'a>) -> Self {
+        self.miss_address = Some(miss_address);
+        self
     }
 
     /// Declares everything in the tree under `root`, then imports the

@@ -36,6 +36,20 @@
 //! are not re-extracted); the `fallbacks_shadowed_by` keys dropped from
 //! `TsProject::source_changed` (`@/x`, `@scope/p` and `#x` stay where they
 //! were).
+//!
+//! An import of an alias, a workspace package or a `#` key that resolves to
+//! nothing waits at the first base of its entry and links once any file it
+//! can name is created, re-extracting only its importer and recording its
+//! bindings; creating a file that hundreds of linked importers name through
+//! the same alias, or editing such a hub after a plugin restart, reindexes
+//! nothing. Controls (GM-666): `record_specifier` ignores `miss_address`
+//! (no waiting import links); the `waiting_addresses_for` keys dropped from
+//! `TsProject::source_changed` (`generated/x.ts`, the package entry, `#x`
+//! and `@env/a` stay unlinked); `waiting_address` skips the workspace branch
+//! or answers `None` for `#` specifiers; core's own-path arm in
+//! `select_affected` removed (the hub edit reindexes the language) or
+//! `round_trip` passing no waiting importers (the `#x` and `@env/a` importers
+//! link but keep no bindings).
 
 #![cfg(unix)]
 
@@ -538,4 +552,202 @@ fn an_import_of_another_alias_is_left_alone_by_the_create() {
     assert_eq!(harness.imports("src/a.ts"), (vec!["src/x.ts:x.ts".to_string()], Vec::new()));
     assert_eq!(harness.imports("src/b.ts"), (other, Vec::new()));
     assert_only_the_importer_re_extracted(&harness);
+}
+
+// -------------------------------------------------------------------------
+// GM-666: an alias, package or `#` import that waits at its first base
+// -------------------------------------------------------------------------
+
+const IMPORT_CREATED: &str = "import { created } from ";
+
+/// `src/a.ts` waits on `specifier`; its source on disk calls the import, so
+/// only a re-extract after the create records the call's binding.
+fn waiting_importer(configs: &[(&str, &str)], extra: &[(&str, &str)], specifier: &str) -> Harness {
+    let import = format!("{IMPORT_CREATED}\"{specifier}\";\n");
+    let mut files: Vec<(&str, &str)> = extra.to_vec();
+    files.push(("src/a.ts", &import));
+    let harness = indexed_with_configs(configs, &files);
+    assert!(harness.imports("src/a.ts").0.is_empty(), "{specifier} waits unlinked");
+    harness.write("src/a.ts", &format!("{import}export function mark_v2() {{\n  return created();\n}}\n"));
+    harness
+}
+
+/// Creates `path` exporting the function `created`, as the watcher does.
+fn create_function(harness: &Harness, path: &str) {
+    harness.write(path, "export function created() {\n  return 1;\n}\n");
+    harness.route(path);
+}
+
+/// `src/a.ts` links to `target`, only it was re-extracted, and its call of
+/// the imported function is bound to `target`'s `created`.
+fn assert_linked_with_bindings(harness: &Harness, target: &str) {
+    assert_eq!(harness.imports("src/a.ts"), (vec![format!("{target}:{}", file_name(target))], Vec::new()));
+    assert_only_the_importer_re_extracted(harness);
+    let calls = calls_of(harness, "src/a.ts");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].0, format!("{target}:created"), "{calls:?}");
+    assert!(calls[0].1, "the call is resolved: {calls:?}");
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap()
+}
+
+const SRC_ALIAS: (&str, &str) =
+    ("tsconfig.json", r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*","generated/*"]}}}"#);
+
+/// `@/x` waits (neither base exists); creating the first base links it.
+#[test]
+fn creating_the_first_alias_base_links_a_waiting_import() {
+    let harness = waiting_importer(&[SRC_ALIAS], &[], "@/x");
+
+    create_function(&harness, "src/x.ts");
+
+    assert_linked_with_bindings(&harness, "src/x.ts");
+}
+
+/// Creating the later base, which is not the address the import waits at,
+/// links it just the same.
+#[test]
+fn creating_a_later_alias_base_links_a_waiting_import() {
+    let harness = waiting_importer(&[SRC_ALIAS], &[], "@/x");
+
+    create_function(&harness, "generated/x.ts");
+
+    assert_linked_with_bindings(&harness, "generated/x.ts");
+}
+
+/// A workspace package import waits before its entry exists.
+#[test]
+fn creating_the_entry_of_a_workspace_package_links_a_waiting_import() {
+    let harness = waiting_importer(
+        &[
+            ("package.json", r#"{"name":"root","workspaces":["packages/*"]}"#),
+            ("packages/p/package.json", r#"{"name":"@scope/p"}"#),
+        ],
+        &[("packages/p/other.ts", "")],
+        "@scope/p",
+    );
+
+    create_function(&harness, "packages/p/src/index.ts");
+
+    assert_linked_with_bindings(&harness, "packages/p/src/index.ts");
+}
+
+/// A `#` key whose target is the created file: the address equals the path,
+/// which core links by itself, so the importer is re-extracted for its
+/// bindings by the waiting set read before the link.
+#[test]
+fn creating_the_target_of_a_waiting_hash_import_links_it_with_its_bindings() {
+    let harness = waiting_importer(
+        &[("package.json", r##"{"name":"root","imports":{"#x":"./src/x.ts"}}"##)],
+        &[],
+        "#x",
+    );
+
+    create_function(&harness, "src/x.ts");
+
+    assert_linked_with_bindings(&harness, "src/x.ts");
+}
+
+/// A wildcard alias with a static target, `@env/*` -> `src/env.ts`, is the
+/// same case through the paths branch.
+#[test]
+fn creating_the_static_target_of_a_wildcard_alias_links_a_waiting_import_with_its_bindings() {
+    let harness = waiting_importer(
+        &[("tsconfig.json", r#"{"compilerOptions":{"baseUrl":".","paths":{"@env/*":["src/env.ts"]}}}"#)],
+        &[],
+        "@env/a",
+    );
+
+    create_function(&harness, "src/env.ts");
+
+    assert_linked_with_bindings(&harness, "src/env.ts");
+}
+
+/// `@/x` and `~/x` both map to `src/*`: one create links both importers.
+#[test]
+fn one_create_links_the_waiting_imports_of_two_aliases_of_one_directory() {
+    let harness = indexed_with_configs(
+        &[(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*"],"~/*":["src/*"]}}}"#,
+        )],
+        &[
+            ("src/a.ts", "import { created } from \"@/x\";\n"),
+            ("src/b.ts", "import { created } from \"~/x\";\n"),
+        ],
+    );
+    assert!(harness.imports("src/a.ts").0.is_empty() && harness.imports("src/b.ts").0.is_empty());
+
+    create(&harness, "src/x.ts");
+
+    for importer in ["src/a.ts", "src/b.ts"] {
+        assert_eq!(harness.imports(importer).0, vec!["src/x.ts:x.ts".to_string()], "{importer}");
+    }
+    assert_eq!(marked("mark_v2", &harness), vec!["src/a.ts".to_string(), "src/b.ts".to_string()]);
+}
+
+/// A waiting `@/y` is not re-extracted by the create of `src/x.ts`.
+#[test]
+fn a_waiting_import_of_another_name_is_left_alone_by_the_create() {
+    let harness = indexed_with_configs(
+        &[SRC_ALIAS],
+        &[
+            ("src/b.ts", "import { created } from \"@/y\";\n"),
+            ("src/a.ts", "import { created } from \"@/x\";\n"),
+        ],
+    );
+
+    create(&harness, "src/x.ts");
+
+    assert_eq!(harness.imports("src/a.ts").0, vec!["src/x.ts:x.ts".to_string()]);
+    assert!(harness.imports("src/b.ts").0.is_empty(), "@/y still waits");
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// Forty importers of `@/shared` are linked; creating the file one more
+/// importer waits for re-extracts that importer, and does not reindex the
+/// language (a prefix or specifier selection would select forty).
+#[test]
+fn a_create_in_a_widely_aliased_project_re_extracts_only_the_waiting_importer() {
+    let importers: Vec<String> = (0..40).map(|i| format!("src/user{i}.ts")).collect();
+    let mut files: Vec<(&str, &str)> = vec![("src/shared.ts", "")];
+    files.extend(importers.iter().map(|path| (path.as_str(), "import { created } from \"@/shared\";\n")));
+    files.push(("src/a.ts", "import { created } from \"@/new\";\n"));
+    let harness = indexed_with_configs(&[SRC_ALIAS], &files);
+    assert!(harness.imports("src/a.ts").0.is_empty(), "@/new waits unlinked");
+
+    create(&harness, "src/new.ts");
+
+    assert_eq!(harness.imports("src/a.ts").0, vec!["src/new.ts:new.ts".to_string()]);
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// After a plugin restart the first edit of a hub that more than 30% of the
+/// files import through an alias re-extracts the hub only: nobody waited at
+/// it, so the own-path key selects nothing and the language is not reindexed.
+#[test]
+fn the_first_edit_of_a_hub_after_a_plugin_restart_reindexes_nothing() {
+    let importers: Vec<String> = (0..5).map(|i| format!("src/user{i}.ts")).collect();
+    let mut files: Vec<(&str, &str)> = vec![("src/hub.ts", "")];
+    files.extend(importers.iter().map(|path| (path.as_str(), "import { mark_v1 } from \"@/hub\";\n")));
+    let harness = indexed_with_configs(&[SRC_ALIAS], &files);
+    for importer in &importers {
+        assert_eq!(harness.imports(importer).0, vec!["src/hub.ts:hub.ts".to_string()], "{importer}");
+    }
+
+    harness.registry.sleep_all_now("restart");
+    harness.write("src/hub.ts", &source("", "mark_v2"));
+    harness.route("src/hub.ts");
+    assert_eq!(harness.registry.replay_pending(&harness.conn), 1, "src/hub.ts replayed");
+
+    assert_eq!(marked("mark_v2", &harness), vec!["src/hub.ts".to_string()], "no importer re-extracted");
+    for importer in &importers {
+        assert_eq!(
+            harness.imports(importer).0,
+            vec!["src/hub.ts:hub.ts".to_string()],
+            "{importer} kept its link"
+        );
+    }
 }
