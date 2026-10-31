@@ -1,0 +1,110 @@
+# Core test modules and the real plugin processes they start.
+# Read by `scripts/test-sections.sh filter core-spawns-<plugin>`; written
+# and checked by `scripts/test-plugin-spawns.sh observe`.
+#
+# <binary>:<module>   <plugins it spawns, or none>
+# binary: it (core/tests/it, one row per module), scripts (core/tests/scripts),
+# lib (core lib test modules that spawn a plugin or read plugins/; `none`
+# marks one that only reads plugin.toml).
+# `observe --write` adds what it sees and never drops a listed plugin.
+it:absent_language_field                                 rust python
+it:ambiguous_reexport_linking                            typescript rust python go
+it:cli_clean                                             typescript
+it:cli_clean_sweeping                                    typescript
+it:cli_deps                                              typescript rust python go
+it:cli_init                                              typescript rust python go
+it:cli_reindex                                           typescript rust python go
+it:cli_status                                            typescript rust python go
+it:cli_stop                                              typescript rust python go
+it:config_reindex_go                                     go
+it:config_reindex_python                                 python
+it:config_reindex_rust                                   rust
+it:config_reindex_typescript                             typescript
+it:created_file_links_waiting_import                     typescript
+it:daemon_build_staleness                                typescript rust python go
+it:daemon_core                                           typescript rust python go
+it:daemon_lifeline                                       typescript rust python go
+it:daemon_log_lines                                      typescript
+it:daemon_missing_plugin_binary                          none
+it:daemon_plugin_bin_dir                                 rust
+it:daemon_plugin_discovery_failure                       none
+it:daemon_sigterm                                        typescript rust python go
+it:default_export_linking                                typescript rust python go
+it:dynamic_import_resolution                             typescript rust python go
+it:embedding_generation_pipeline                         typescript
+it:embedding_peak_memory                                 none
+it:files_created_python                                  python
+it:files_created_typescript                              typescript
+it:first_query_after_walk                                typescript rust python go
+it:generic_reference_resolution                          typescript rust python go
+it:gitignore_reevaluation                                typescript
+it:go_plugin_fingerprint                                 rust go
+it:handshake_independent_of_indexing                     typescript rust python go
+it:idle_lifecycle                                        typescript rust python go
+it:import_resolution                                     typescript rust python go
+it:incremental_embed_outside_lock                        typescript rust python go
+it:incremental_matches_full_reindex                      typescript rust go
+it:index_wait_progress                                   typescript rust python go
+it:last_used                                             typescript rust python go
+it:layout                                                rust
+it:lazy_activation                                       typescript rust python go
+it:log_line_atomic                                       rust
+it:mcp_e2e                                               typescript rust python go
+it:module_tree_refresh_rust                              rust
+it:multi_project_front                                   typescript rust python go
+it:named_glob_shadowing                                  rust
+it:namespace_import_after_init                           typescript rust python go
+it:namespace_import_resolution                           typescript rust python go
+it:nextest_wait_budgets                                  none
+it:offline_changes_reconcile                             typescript rust
+it:one_plugin_binary_missing                             rust python go
+it:orphaned_daemon                                       typescript rust python go
+it:overload_call_binding                                 typescript rust python go
+it:overload_call_resolution                              typescript rust python go
+it:overload_declaration_storage                          typescript
+it:plugin_bridge                                         typescript rust python go
+it:plugin_build_staleness                                typescript
+it:plugin_check                                          typescript rust python go
+it:plugin_crash_recovery                                 typescript
+it:plugin_install                                        rust
+it:plugin_memory_limit                                   typescript rust python go
+it:plugin_spawn_map                                      rust
+it:plugins_die_with_daemon                               typescript rust python go
+it:protocol_conformance                                  typescript
+it:python_later_binding                                  python
+it:reexport_linking                                      typescript rust python go
+it:reexport_member_linking                               rust python
+it:repeated_edits_through_a_warm_plugin                  typescript rust python go
+it:replay_progress                                       typescript rust python go
+it:rust_enum_variants                                    rust
+it:rust_glob_trait_overrides                             rust
+it:rust_python_qualified_paths                           rust python
+it:semantic_pass_trigger                                 typescript
+it:serving_while_indexing                                typescript rust python go
+it:shim_bootstrap                                        none
+it:shim_handle_inheritance                               typescript
+it:stale_index_invalidation                              typescript rust python go
+it:state_isolation                                       none
+it:structural_does_not_wait_for_embeddings               typescript rust python go
+it:superseded_collapsed_call                             typescript rust python go
+it:symlink_table_routing                                 none
+it:typescript_grammar_routing                            typescript
+it:typescript_registry                                   none
+it:typescript_workspace_reindex                          typescript
+it:walk_follows_symlinks                                 typescript rust python go
+it:wedged_daemon                                         typescript
+it:worktree_daemon_lifecycle                             typescript rust python go
+it:worktree_seed                                         typescript
+lib:daemon::registry::tests                              typescript rust python go
+lib:daemon::manifest::tests                              typescript
+lib:daemon::plugin::tests                                typescript
+lib:mcp::member_name_collision_tests                     typescript rust python go
+lib:mcp::unlinked::tests                                 rust
+lib:mcp::instructions::tests                             none
+lib:graph::symbol_links::tests                           none
+lib:languages::tests                                     none
+lib:cli::status::tests                                   none
+lib:cli::agent_instructions                              none
+lib:storage::index_store                                 none
+lib:cli::plugins                                         none
+lib:daemon::workspace_reindex                            none

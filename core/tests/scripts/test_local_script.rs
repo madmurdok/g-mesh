@@ -275,15 +275,15 @@ fn a_none_selection_reports_no_sections_and_never_calls_cargo() {
     assert!(calls.is_empty(), "cargo was called: {:?}", calls.iter().map(|c| &c.args).collect::<Vec<_>>());
 }
 
-/// The local run passes `--narrow`: a cli-only change selects `core-cli` and
+/// The local run passes `--narrow`: an mcp-only change selects `core-mcp` and
 /// `core-it`, not every core section as CI's call does.
 #[test]
-fn a_cli_change_selects_only_the_cli_section_and_the_integration_tests() {
-    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+fn an_mcp_change_selects_only_the_mcp_section_and_the_integration_tests() {
+    let (_dir, file) = paths_file(&["core/src/mcp/mod.rs"]);
     let (output, _) = run_local(&["--paths-from", &file], &[]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert!(
-        stdout_of(&output).lines().any(|l| l == "== selected: core-it core-cli"),
+        stdout_of(&output).lines().any(|l| l == "== selected: core-it core-mcp"),
         "{}",
         describe(&output)
     );
@@ -291,7 +291,7 @@ fn a_cli_change_selects_only_the_cli_section_and_the_integration_tests() {
 
 #[test]
 fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest() {
-    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let (_dir, file) = paths_file(&["core/src/mcp/mod.rs"]);
     let (output, calls) = run_local(&["--paths-from", &file], &[]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
 
@@ -306,13 +306,13 @@ fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest()
     assert_eq!(tests[0].args, ["test", "-p", "g-mesh", "--lib", "--", "--exact", "cli::a", "cli::b"]);
     assert_eq!(tests[0].seeds.as_deref(), Some("2"));
 
-    // The lib filter is the core-cli section's lib tests; nextest runs the
+    // The lib filter is the core-mcp section's lib tests; nextest runs the
     // union of the selected sections minus exactly that filter.
     assert!(
-        lib_filter.starts_with(&format!("kind(lib) & (({})) & not (", section_filter("core-cli"))),
+        lib_filter.starts_with(&format!("kind(lib) & (({})) & not (", section_filter("core-mcp"))),
         "{lib_filter}"
     );
-    let union = format!("({}) | ({})", section_filter("core-it"), section_filter("core-cli"));
+    let union = format!("({}) | ({})", section_filter("core-it"), section_filter("core-mcp"));
     let runs = test_runs(&calls);
     assert_eq!(runs.len(), 1, "{:?}", calls.iter().map(|c| &c.args).collect::<Vec<_>>());
     assert_eq!(runs[0].value_of("--profile"), "local");
@@ -332,7 +332,7 @@ fn the_lib_part_runs_the_listed_names_in_one_process_and_nextest_runs_the_rest()
 /// `cargo test -p`, with only that crate's names.
 #[test]
 fn each_crate_runs_its_own_names_in_its_own_process() {
-    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let (_dir, file) = paths_file(&["core/src/mcp/mod.rs"]);
     let (output, calls) = run_local(&["--paths-from", &file], &[("FAKE_LIST_SDK", "1")]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     let tests: Vec<_> = calls_of(&calls, &["test"]).into_iter().map(|c| c.args.clone()).collect();
@@ -347,7 +347,7 @@ fn each_crate_runs_its_own_names_in_its_own_process() {
 
 #[test]
 fn per_process_makes_no_cargo_test_call_and_runs_every_selected_test_under_nextest() {
-    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let (_dir, file) = paths_file(&["core/src/mcp/mod.rs"]);
     let (output, calls) = run_local(&["--per-process", "--paths-from", &file], &[]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert!(
@@ -360,13 +360,13 @@ fn per_process_makes_no_cargo_test_call_and_runs_every_selected_test_under_nexte
     assert_eq!(runs[0].value_of("--profile"), "local");
     assert_eq!(
         runs[0].value_of("-E"),
-        format!("({}) | ({})", section_filter("core-it"), section_filter("core-cli"))
+        format!("({}) | ({})", section_filter("core-it"), section_filter("core-mcp"))
     );
 }
 
 #[test]
 fn a_failing_lib_part_fails_the_run_and_skips_nextest_unless_keep_going() {
-    let (_dir, file) = paths_file(&["core/src/cli/status.rs"]);
+    let (_dir, file) = paths_file(&["core/src/mcp/mod.rs"]);
     let failing = [("FAKE_CARGO_TEST_EXIT", "101")];
 
     let (output, calls) = run_local(&["--paths-from", &file], &failing);
@@ -561,7 +561,9 @@ fn a_missing_go_toolchain_is_fine_when_the_diff_has_no_go_path() {
 
 #[test]
 fn an_earlier_failure_skips_the_go_step_unless_keep_going() {
-    let (_dir, file) = paths_file(&["plugins/go/main.go"]);
+    // A core path beside the go one: a go-only diff selects `core-spawns-go`,
+    // which has no lib part for the failing `cargo test` to fail.
+    let (_dir, file) = paths_file(&["core/src/config/mod.rs", "plugins/go/main.go"]);
     let failing = [("FAKE_CARGO_TEST_EXIT", "101")];
 
     let (output, _, go) = run_local_go(&["--paths-from", &file], &failing, true);

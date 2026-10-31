@@ -74,6 +74,7 @@ mod plugin_check;
 mod plugin_crash_recovery;
 mod plugin_install;
 mod plugin_memory_limit;
+mod plugin_spawn_map;
 mod plugins_die_with_daemon;
 mod protocol_conformance;
 mod python_later_binding;

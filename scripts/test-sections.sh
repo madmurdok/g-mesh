@@ -8,14 +8,22 @@
 #   scripts/test-sections.sh run [--profile P] [--keep-going] <section>...|all|full|none
 #   scripts/test-sections.sh check                   the sections partition the suite
 #
+# `filter` and `run` also take the selectors `core-spawns-<plugin>` (plugin:
+# typescript, rust, python, go): the core tests that start that plugin's real
+# process, by module, as scripts/test-plugin-spawns.txt lists them.
+#
 # Invariants:
 # - The sections partition the suite: every test, ignored ones included, is in
 #   exactly one section. `check` proves it; CI and the release gate run it.
 # - `core-rest` is the complement of the other core lib sections, so a new
 #   top-level core module lands in it without an edit here.
+# - `core-it` is the complement of `core-scripts` within core's `kind(test)`,
+#   so a new core test binary lands in `core-it`, never in no section.
 # - Every section runs with `--workspace` and selects by `package()`, never
 #   `-p`: all sections share one build and one feature unification, and the
 #   plugin and SDK binaries that core tests spawn always exist.
+# - `core-spawns-<plugin>` selectors are not sections: they overlap core
+#   sections, are not in `list`, and `check` does not see them.
 #
 # A section can be run by hand without this script:
 #   cargo nextest run --workspace -E "$(scripts/test-sections.sh filter core-mcp)"
@@ -25,6 +33,7 @@ cd "$(dirname "$0")/.."
 
 SECTIONS=(
 	core-it
+	core-scripts
 	core-mcp
 	core-daemon
 	core-cli
@@ -37,10 +46,54 @@ SECTIONS=(
 	wire
 )
 
-# Prints the filterset of section $1; returns 1 for an unknown name.
+SPAWN_MAP=scripts/test-plugin-spawns.txt
+
+# Prints the modules of binary $2 (`it`, `scripts` or `lib`) whose row in
+# SPAWN_MAP names plugin $1, joined with `|`. A row of another binary fails.
+spawn_modules() {
+	[ -r "$SPAWN_MAP" ] || {
+		echo "test-sections: cannot read $SPAWN_MAP" >&2
+		exit 2
+	}
+	awk -v p="$1" -v b="$2" -v map="$SPAWN_MAP" '
+		{ sub(/\r$/, ""); sub(/#.*/, "") }
+		NF == 0 { next }
+		{
+			i = index($1, ":")
+			bin = substr($1, 1, i - 1)
+			if (i == 0 || (bin != "it" && bin != "scripts" && bin != "lib")) {
+				printf "test-sections: %s:%d: bad row \"%s\"\n", map, NR, $1 > "/dev/stderr"
+				bad = 1
+				exit 2
+			}
+			if (bin != b) next
+			for (f = 2; f <= NF; f++) if ($f == p) { out = out (out == "" ? "" : "|") substr($1, i + 1); break }
+		}
+		END { if (!bad) print out }
+	' "$SPAWN_MAP"
+}
+
+# Prints the filterset of the core tests that SPAWN_MAP says spawn plugin $1.
+spawns_filter() {
+	local mods clauses=""
+	mods="$(spawn_modules "$1" it)" || exit 2
+	[ -z "$mods" ] || clauses="(binary_id(g-mesh::it) & test(/^($mods)::/))"
+	mods="$(spawn_modules "$1" scripts)" || exit 2
+	[ -z "$mods" ] || clauses="${clauses:+$clauses | }(binary_id(g-mesh::scripts) & test(/^($mods)::/))"
+	mods="$(spawn_modules "$1" lib)" || exit 2
+	[ -z "$mods" ] || clauses="${clauses:+$clauses | }(kind(lib) & test(/^($mods)::/))"
+	echo "package(g-mesh) & (${clauses:-none()})"
+}
+
+# Prints the filterset of section (or `core-spawns-<plugin>` selector) $1;
+# returns 1 for an unknown name.
 section_filter() {
 	case "$1" in
-	core-it) echo 'package(g-mesh) & kind(test)' ;;
+	core-spawns-typescript | core-spawns-rust | core-spawns-python | core-spawns-go)
+		spawns_filter "${1#core-spawns-}"
+		;;
+	core-it) echo 'package(g-mesh) & kind(test) & !binary_id(g-mesh::scripts)' ;;
+	core-scripts) echo 'package(g-mesh) & binary_id(g-mesh::scripts)' ;;
 	core-mcp) echo 'package(g-mesh) & kind(lib) & test(/^mcp::/)' ;;
 	core-daemon) echo 'package(g-mesh) & kind(lib) & test(/^daemon::/)' ;;
 	core-cli) echo 'package(g-mesh) & kind(lib) & test(/^cli::/)' ;;
@@ -61,11 +114,12 @@ usage: scripts/test-sections.sh list
        scripts/test-sections.sh filter <section>
        scripts/test-sections.sh run [--profile P] [--keep-going] <section>...|all|full|none
        scripts/test-sections.sh check
+<section> may also be core-spawns-<plugin> (typescript, rust, python, go).
 EOF
 }
 
 die_unknown() {
-	echo "test-sections: unknown section '$1' (known: ${SECTIONS[*]})" >&2
+	echo "test-sections: unknown section '$1' (known: ${SECTIONS[*]}, core-spawns-<plugin>)" >&2
 	exit 2
 }
 
