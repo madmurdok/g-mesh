@@ -263,8 +263,17 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     )?;
 
     // Behaviour 9: a re-extract's own answer starts nothing.
-    let (affected, gone_importers) =
-        if reextract { (None, Vec::new()) } else { (structural.affected, structural.gone_importers) };
+    let (affected, gone_importers, own_waiting) = if reextract {
+        (None, Vec::new(), Vec::new())
+    } else {
+        let own_waiting: Vec<String> = structural
+            .waiting_importers
+            .into_iter()
+            .filter(|(importer_language, _)| importer_language == language)
+            .map(|(_, path)| path)
+            .collect();
+        (structural.affected, structural.gone_importers, own_waiting)
+    };
     let (files, imports) = match affected {
         None | Some(ResolutionDelta::Unchanged) => (Vec::new(), Vec::new()),
         Some(ResolutionDelta::Unknown { reason }) => {
@@ -290,6 +299,7 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
             &files,
             &imports,
             &gone_importers,
+            &own_waiting,
             on_timeout,
         ) {
             Ok(reextracted) => reextracted,
@@ -357,6 +367,12 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
 /// ([`settle_reextracts`]): a daemon killed before that leaves the rows, and
 /// the next start re-extracts them (`config_reindex::resume_owed_reextracts`).
 ///
+/// `own_waiting` holds the files of `language` whose imports waited
+/// unresolved at `file_path` until this edit's round trip linked them
+/// ([`RoundTrip::waiting_importers`]). A selector whose exact `File` key is
+/// `file_path` itself selects only these, not every importer of
+/// `file_path` (`config_reindex::select_affected`).
+///
 /// `Err` is the reason the whole-language reindex is owed instead: a
 /// selection above `FALLBACK_SHARE_PERCENT`, a selection or a record that
 /// failed, or a re-extract that failed (the loop stops there; the reindex's
@@ -377,13 +393,14 @@ fn reextract_affected<R: BufRead + Send, W: Write>(
     files: &[crate::protocol::types::PathScope],
     imports: &[crate::protocol::types::ImportSelector],
     gone_importers: &[String],
+    own_waiting: &[String],
     on_timeout: &mut dyn FnMut(),
 ) -> std::result::Result<Vec<String>, String> {
     use crate::daemon::config_reindex::{select_with, Selection};
 
-    let selected = match store
-        .step(|conn| select_with(conn, language, files, imports, Some(file_path), gone_importers))
-    {
+    let selected = match store.step(|conn| {
+        select_with(conn, language, files, imports, Some(file_path), gone_importers, own_waiting)
+    }) {
         Ok(Selection::Nothing) => return Ok(Vec::new()),
         Ok(Selection::Files(selected)) => selected.into_iter().collect::<Vec<_>>(),
         Ok(Selection::TooMany(why)) => return Err(format!("{file_path} changed resolution: {why}")),
@@ -861,6 +878,11 @@ struct RoundTrip {
     /// (`Writer::apply_file_diff_linked`): only those of the plugin's own
     /// language. Empty otherwise.
     gone_importers: Vec<String>,
+    /// `(language, path)` of the files whose imports waited unresolved at a
+    /// `fileChanged`'s file until this round trip's commit linked them
+    /// (`Writer::apply_file_diff_linked`). Empty for a gone file and for
+    /// any other message.
+    waiting_importers: Vec<(String, String)>,
 }
 
 /// The id for the semantic pass that follows a file change, derived from
@@ -967,10 +989,13 @@ fn round_trip<R: BufRead + Send, W: Write>(
     let affected = response.result.affected.take();
     let mut diff = to_storage_diff(response.result, &mut PathWarnings::default());
     let mut gone_importers = Vec::new();
+    let mut waiting_importers = Vec::new();
     match (&request.message, project_root) {
         (ControlMessage::FileChanged { file_path, .. }, Some(root)) => {
             let scope = file_scope(root, file_path, &diff, complete);
-            gone_importers = store.apply_file_diff_linked(&mut diff, file_path, scope, method)?;
+            let linked = store.apply_file_diff_linked(&mut diff, file_path, scope, method)?;
+            gone_importers = linked.gone_importers;
+            waiting_importers = linked.waiting_importers;
         }
         (ControlMessage::SemanticPass { .. }, _) => store.apply_semantic_diff_linked(&mut diff, method)?,
         _ => store.apply_diff_linked(&diff, method)?,
@@ -1004,6 +1029,7 @@ fn round_trip<R: BufRead + Send, W: Write>(
         upserted_edges: diff.upsert_edges.iter().map(|edge| edge.id.clone()).collect(),
         affected,
         gone_importers,
+        waiting_importers,
     })
 }
 

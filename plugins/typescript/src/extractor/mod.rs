@@ -56,6 +56,7 @@ use g_mesh_plugin_sdk::{CharColumns, Extractor, FileGraph, RelPath};
 use crate::extractor::decls::Declarer;
 use crate::extractor::model::FileModel;
 use crate::project::facts::{self, TsFacts};
+use crate::project::resolve::miss_address;
 use crate::project::TsProject;
 
 /// The plugin's wire identifier: the manifest's `language`, this directory's
@@ -123,7 +124,8 @@ impl Extractor for TypeScriptExtractor {
         // the content does, as on the unparsed path above (GM-527).
         let mut model = FileModel::new(path.as_str(), columns.file_range());
         let resolve = |specifier: &str, from: &RelPath| project.resolve(specifier, from);
-        Declarer::new(source, &columns, path, &resolve, &mut model).run(root);
+        let miss = |specifier: &str, from: &RelPath| miss_address(project, specifier, from);
+        Declarer::new(source, &columns, path, &resolve, &mut model).with_miss_address(&miss).run(root);
         emit::flush(model, LANGUAGE, ENGINE, path, root.has_error())
     }
 }

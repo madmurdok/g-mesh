@@ -18,8 +18,9 @@ use std::process::{Command, Output};
 
 use serde_json::{json, Map, Value};
 
-const SECTIONS: [&str; 11] = [
+const SECTIONS: [&str; 12] = [
     "core-it",
+    "core-scripts",
     "core-mcp",
     "core-daemon",
     "core-cli",
@@ -237,7 +238,7 @@ fn sections_script(path_env: &str, args: &[&str]) -> Output {
 }
 
 #[test]
-fn list_prints_the_eleven_sections_in_run_order() {
+fn list_prints_the_twelve_sections_in_run_order() {
     let dir = tempfile::tempdir().unwrap();
     let output = sections_script(&recording_cargo(dir.path()), &["list"]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
@@ -280,6 +281,163 @@ fn run_refuses_an_unknown_or_missing_section_before_calling_cargo() {
         !dir.path().join("cargo-called").exists(),
         "cargo ran: {}",
         fs::read_to_string(dir.path().join("cargo-called")).unwrap_or_default()
+    );
+}
+
+/// `core-it` holds core's `kind(test)` binaries but `g-mesh::scripts`, which
+/// `core-scripts` holds alone.
+#[test]
+fn core_scripts_is_the_scripts_binary_and_core_it_is_every_other_core_test_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+    let filter_of = |name: &str| {
+        let output = sections_script(&path_env, &["filter", name]);
+        assert_eq!(output.status.code(), Some(0), "{name}\n{}", describe(&output));
+        String::from_utf8_lossy(&output.stdout).trim_end().to_owned()
+    };
+    assert_eq!(filter_of("core-scripts"), "package(g-mesh) & binary_id(g-mesh::scripts)");
+    assert_eq!(filter_of("core-it"), "package(g-mesh) & kind(test) & !binary_id(g-mesh::scripts)");
+}
+
+/// A section nobody runs in CI drops its tests silently: each listed section
+/// has exactly one `tests: <section>` step, whose `if:` selects it by name.
+#[test]
+fn every_listed_section_has_exactly_one_ci_step_that_runs_it_when_selected() {
+    let dir = tempfile::tempdir().unwrap();
+    let listed = stdout_lines(&sections_script(&recording_cargo(dir.path()), &["list"]));
+    assert_eq!(listed.len(), SECTIONS.len(), "{listed:?}");
+    let ci = fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    let mut steps: Vec<Vec<&str>> = Vec::new();
+    for line in ci.lines() {
+        if line.trim_start().starts_with("- name:") {
+            steps.push(Vec::new());
+        }
+        if let Some(step) = steps.last_mut() {
+            step.push(line);
+        }
+    }
+    for name in &listed {
+        let run_line = format!("run: scripts/test-sections.sh run --profile ci {name}");
+        let running: Vec<&Vec<&str>> =
+            steps.iter().filter(|s| s.iter().any(|l| l.trim() == run_line)).collect();
+        assert_eq!(
+            running.len(),
+            1,
+            "section {name}: {} ci.yml steps run it, want exactly one",
+            running.len()
+        );
+        let step = running[0];
+        assert!(step[0].contains(&format!("\"tests: {name}\"")), "section {name}: step is `{}`", step[0]);
+        let condition = step.iter().find(|l| l.trim_start().starts_with("if:")).copied().unwrap_or("");
+        assert!(
+            condition.contains(&format!("' {name} '")),
+            "section {name}: its step's `if:` is `{condition}`"
+        );
+    }
+}
+
+/// A scratch checkout: the real `scripts/test-sections.sh` and `map`, when
+/// given, as `scripts/test-plugin-spawns.txt`.
+fn sections_root(map: Option<&str>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("scripts/test-sections.sh");
+    fs::create_dir_all(script.parent().unwrap()).unwrap();
+    for name in ["test-sections.sh", "prune-stale-objects.sh"] {
+        fs::copy(repo_root().join("scripts").join(name), dir.path().join("scripts").join(name)).unwrap();
+    }
+    if let Some(map) = map {
+        fs::write(dir.path().join("scripts/test-plugin-spawns.txt"), map).unwrap();
+    }
+    dir
+}
+
+fn sections_in(root: &Path, path_env: &str, args: &[&str]) -> Output {
+    Command::new("bash")
+        .arg(root.join("scripts/test-sections.sh"))
+        .args(args)
+        .env("PATH", path_env)
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env_remove("GITHUB_STEP_SUMMARY")
+        .output()
+        .expect("failed to run bash")
+}
+
+const SPAWN_MAP: &str = "# comment\n\
+    it:alpha typescript rust\n\
+    it:beta   typescript   # trailing comment\n\
+    it:gamma none\n\
+    lib:m::tests typescript go\n\
+    scripts:s rust\n";
+
+fn spawns_filter(root: &Path, plugin: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let output =
+        sections_in(root, &recording_cargo(dir.path()), &["filter", &format!("core-spawns-{plugin}")]);
+    assert_eq!(output.status.code(), Some(0), "{plugin}\n{}", describe(&output));
+    String::from_utf8_lossy(&output.stdout).trim_end().to_owned()
+}
+
+/// The filter names exactly the modules whose row lists the plugin, per
+/// binary; a plugin no row lists selects nothing.
+#[test]
+fn a_core_spawns_filter_names_the_modules_whose_map_rows_list_that_plugin() {
+    let root = sections_root(Some(SPAWN_MAP));
+    let it = |mods: &str| format!("(binary_id(g-mesh::it) & test(/^({mods})::/))");
+    assert_eq!(
+        spawns_filter(root.path(), "typescript"),
+        format!("package(g-mesh) & ({} | (kind(lib) & test(/^(m::tests)::/)))", it("alpha|beta"))
+    );
+    assert_eq!(
+        spawns_filter(root.path(), "rust"),
+        format!("package(g-mesh) & ({} | (binary_id(g-mesh::scripts) & test(/^(s)::/)))", it("alpha"))
+    );
+    assert_eq!(spawns_filter(root.path(), "go"), "package(g-mesh) & ((kind(lib) & test(/^(m::tests)::/)))");
+    assert_eq!(spawns_filter(root.path(), "python"), "package(g-mesh) & (none())");
+}
+
+#[test]
+fn a_core_spawns_filter_refuses_a_missing_map_or_a_row_of_another_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+
+    let root = sections_root(None);
+    let output = sections_in(root.path(), &path_env, &["filter", "core-spawns-typescript"]);
+    assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read"), "{}", describe(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "", "a filter was printed");
+
+    let root = sections_root(Some("it:alpha typescript\nbogus:x typescript\n"));
+    let output = sections_in(root.path(), &path_env, &["filter", "core-spawns-typescript"]);
+    assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("bad row"), "{}", describe(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "", "a filter was printed");
+}
+
+/// The selectors overlap sections, so they are not listed (the partition check
+/// would see two owners); `run` takes them, and the refusal of an unknown name
+/// says they exist.
+#[test]
+fn core_spawns_selectors_are_runnable_but_not_listed_sections() {
+    let root = sections_root(Some(SPAWN_MAP));
+    let dir = tempfile::tempdir().unwrap();
+    let path_env = recording_cargo(dir.path());
+
+    let listed = stdout_lines(&sections_in(root.path(), &path_env, &["list"]));
+    assert_eq!(listed, SECTIONS.map(str::to_owned).to_vec());
+
+    let output = sections_in(root.path(), &path_env, &["run", "core-spawns-typescript"]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let calls = fs::read_to_string(dir.path().join("cargo-called")).unwrap();
+    let runs: Vec<&str> = calls.lines().filter(|l| l.starts_with("nextest run")).collect();
+    assert_eq!(runs.len(), 1, "{calls}");
+    assert!(runs[0].contains("alpha|beta"), "{calls}");
+
+    let output = sections_in(root.path(), &path_env, &["filter", "core-nope"]);
+    assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("core-spawns-<plugin>"),
+        "{}",
+        describe(&output)
     );
 }
 
