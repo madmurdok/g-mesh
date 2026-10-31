@@ -161,8 +161,10 @@ fn rustup(args: &[&str]) -> String {
 /// toolchain has a working rust-analyzer.
 ///
 /// `cargo`, `rustc` and `rust-analyzer` are linked to the install's own proxy
-/// of that name beside the `rustup` on `PATH`, or to that `rustup` when there
-/// is none. rustup runs as the proxy its `argv[0]` names, and a wrapper
+/// of that name beside the `rustup` on `PATH`, canonicalized first, or to
+/// that `rustup` when there is none. The `rustup` on `PATH` may be a symlink
+/// in a directory with no proxies beside it (`/opt/homebrew/bin`); the
+/// install's proxies are beside the file it resolves to. rustup runs as the proxy its `argv[0]` names, and a wrapper
 /// script (Homebrew's keg `bin`) replaces `argv[0]` when it execs the real
 /// binary, so a link to such a `rustup` would run as rustup whatever its
 /// name. rustup-init's `~/.cargo/bin` and Homebrew's keg `bin` hold the
@@ -180,6 +182,7 @@ fn proxy_dir(dir: &Path) -> PathBuf {
         .map(|dir| dir.join(format!("rustup{}", std::env::consts::EXE_SUFFIX)))
         .find(|candidate| candidate.is_file())
         .expect("rustup is on PATH");
+    let rustup = std::fs::canonicalize(&rustup).unwrap_or(rustup);
     std::fs::create_dir_all(dir).unwrap();
     for name in ["cargo", "rustc", "rust-analyzer"] {
         let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);

@@ -39,8 +39,8 @@ pub struct SandboxPolicy {
     /// a toolchain or writable prefix.
     pub project_root: PathBuf,
     /// Toolchain prefixes the tree may map and exec (sysroot, rustup proxies
-    /// dir, server dir, rustc/cargo dirs), deduplicated. OS prefixes are each
-    /// backend's own.
+    /// dir, the proxy dir rust-analyzer execs from `CARGO_HOME`, server dir,
+    /// rustc/cargo dirs), deduplicated. OS prefixes are each backend's own.
     pub toolchain: Vec<PathBuf>,
     /// Prefixes the tree may write (the server's private temp dir and the
     /// cargo caches), deduplicated. A writable prefix inside the root stays
@@ -91,12 +91,13 @@ impl SandboxPolicy {
 
     /// The policy for `server` (the resolved rust-analyzer) running on
     /// `root` with `toolchain`: the sysroot, the rustup proxies' directory,
-    /// and the directories of the server, `rustc` and `cargo`, which lie
-    /// outside the sysroot on an install that is not rustup's. The tree may
-    /// write `temp` (the server's private `TMPDIR`) and `cargo_home`'s
-    /// `registry/` and `git/` (extracting an already cached dependency), never
-    /// `cargo_home` itself, whose `bin/` and config files reach the user's own
-    /// later cargo runs.
+    /// the directory of the rustup proxy rust-analyzer runs from
+    /// `cargo_home`'s `bin/` (see [`cargo_proxy`]), and the directories of the
+    /// server, `rustc` and `cargo`, which lie outside the sysroot on an
+    /// install that is not rustup's. The tree may write `temp` (the server's
+    /// private `TMPDIR`) and `cargo_home`'s `registry/` and `git/`
+    /// (extracting an already cached dependency), never `cargo_home` itself,
+    /// whose `bin/` and config files reach the user's own later cargo runs.
     pub(crate) fn for_server(
         root: &Path,
         toolchain: &Toolchain,
@@ -109,6 +110,7 @@ impl SandboxPolicy {
         let prefixes = [
             toolchain.sysroot.clone(),
             toolchain.rustup.as_deref().and_then(parent),
+            cargo_home.and_then(cargo_proxy).as_deref().and_then(parent),
             parent(&server),
             toolchain.rustc.as_deref().and_then(parent),
             toolchain.cargo.as_deref().and_then(parent),
@@ -120,6 +122,16 @@ impl SandboxPolicy {
         ];
         SandboxPolicy::new(root, prefixes.into_iter().flatten(), writable.into_iter().flatten())
     }
+}
+
+/// The rustup proxy rust-analyzer execs for cargo, canonicalized:
+/// `cargo_home/bin/cargo` when that file exists. With a sysroot set,
+/// rust-analyzer prefers this proxy over `CARGO` and `PATH`, so its directory
+/// must be exec-able whichever `rustup` comes first on `PATH`. A symlink
+/// resolves to the `rustup` it names, the file a sandbox sees exec'd.
+pub(crate) fn cargo_proxy(cargo_home: &Path) -> Option<PathBuf> {
+    let proxy = cargo_home.join("bin").join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+    std::fs::canonicalize(proxy).ok().filter(|proxy| proxy.is_file())
 }
 
 /// `prefixes` canonicalized, the missing ones dropped, deduplicated in order.

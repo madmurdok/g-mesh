@@ -213,6 +213,13 @@ pub fn server_config_with(root: &Path, launcher: &Path) -> Result<SemanticConfig
         }
     }
     let cargo_home = cargo_home();
+    if let Some(proxy) = cargo_home.as_deref().and_then(script_proxy) {
+        g_mesh_plugin_sdk::log_line!(
+            "[{LANGUAGE}] semantic tier: rust-analyzer will run {}, a script whose target the sandbox \
+             does not allow; the workspace may not load",
+            proxy.display()
+        );
+    }
     let policy =
         SandboxPolicy::for_server(root, &toolchain, &config.command, cargo_home.as_deref(), temp.as_deref());
     admit(sandbox::confine(&mut config, &policy, launcher), &policy)?;
@@ -838,6 +845,17 @@ fn cargo_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .filter(|home| !home.is_empty())?;
     Some(PathBuf::from(home).join(".cargo"))
+}
+
+/// The cargo proxy rust-analyzer will exec from `cargo_home` (see
+/// [`sandbox::cargo_proxy`]) when it is a script (`#!`): the sandbox allows
+/// the script's directory, not whatever the script execs.
+fn script_proxy(cargo_home: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let proxy = sandbox::cargo_proxy(cargo_home)?;
+    let mut head = [0u8; 2];
+    std::fs::File::open(&proxy).ok()?.read_exact(&mut head).ok()?;
+    (&head == b"#!").then_some(proxy)
 }
 
 /// The server to run, and the version string it answered with.

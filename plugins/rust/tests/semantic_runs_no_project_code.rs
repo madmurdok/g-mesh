@@ -146,18 +146,21 @@ fn real_toolchain() -> RealToolchain {
 }
 
 /// Links `cargo`, `rustc` and `rust-analyzer` in `dir` to the install's own
-/// proxy of that name beside `rustup`, or to `rustup` itself when there is
-/// none. rustup runs as the proxy its `argv[0]` names, and a wrapper script
+/// proxy of that name beside `rustup`, canonicalized first, or to that
+/// `rustup` itself when there is none. A `rustup` found on `PATH` may be a
+/// symlink in a directory with no proxies beside it (`/opt/homebrew/bin`);
+/// the install's proxies are beside the file it resolves to. rustup runs as the proxy its `argv[0]` names, and a wrapper script
 /// (Homebrew's keg `bin`) replaces `argv[0]` when it execs the real binary,
 /// so a link to such a `rustup` would run as rustup whatever its name.
 /// rustup-init's `~/.cargo/bin` and Homebrew's keg `bin` hold the proxies; an
 /// install whose `rustup` stands alone gets links to that binary.
 fn link_rustup_proxies(dir: &Path, rustup: &Path) {
+    let rustup = std::fs::canonicalize(rustup).unwrap_or_else(|_| rustup.to_path_buf());
     for name in ["cargo", "rustc", "rust-analyzer"] {
         let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
         let proxy = dir.join(&file);
         let sibling = rustup.with_file_name(&file);
-        let target = if sibling.is_file() { sibling } else { rustup.to_path_buf() };
+        let target = if sibling.is_file() { sibling } else { rustup.clone() };
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &proxy).unwrap();
         #[cfg(not(unix))]
