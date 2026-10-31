@@ -29,7 +29,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,80 +37,34 @@ use g_mesh::paths::HOME_ENV;
 
 use crate::common;
 
-use crate::common::Lifeline;
+use crate::common::{IsolatedHome, Lifeline};
 
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 
-/// A `G_MESH_HOME` belonging to one test and nothing else, so a sweep inside
-/// it is safe by construction rather than by every test remembering to scope
-/// itself.
-struct Home {
-    dir: PathBuf,
+/// Writes the global config `clean expired` reads its threshold from.
+/// Key spelling is the file's, not Rust's - see `config::CleanupConfig`.
+fn set_idle_threshold_days(home: &IsolatedHome, days: u64) {
+    fs::write(
+        home.dir.join("config.toml"),
+        format!("[cleanup]\nenabled = true\nidleThresholdDays = {days}\n"),
+    )
+    .expect("failed to write the global config");
 }
 
-impl Home {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        // On Unix: deliberately short, and deliberately not
-        // `tempfile::tempdir()`. A daemon binds
-        // `<home>/projects/<hash>/daemon.sock`, and an AF_UNIX address holds
-        // 104 bytes of path on macOS; the system temp directory there is
-        // `/var/folders/<..>/<..>/T/`, some 50 bytes before anything of ours,
-        // which would leave the socket path riding the limit. Since GM-220 an
-        // over-long path is at least a clear refusal naming the limit rather
-        // than a bind failure - but the point is not to produce one.
-        //
-        // That budget is Unix's alone, and so is `/tmp`. On Windows the
-        // transport is a named pipe, so there is no path length to protect -
-        // and `/tmp/...` is not even an absolute path there but a *drive-
-        // relative* one, resolved against whatever drive each process happens
-        // to be on. This binary runs from the checkout's drive and the daemon
-        // it spawns need not, which is how the two came to disagree about
-        // where the state root was and every sweep here timed out waiting for
-        // a pid file that was being written somewhere else (GM-252). The
-        // identical mistake, in `.cargo/config.toml`, is what GM-246 was.
-        let base = if cfg!(windows) { std::env::temp_dir() } else { PathBuf::from("/tmp") };
-        let dir =
-            base.join(format!("gm-sweep-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("failed to create {}: {e}", dir.display()));
-        Self { dir }
-    }
-
-    fn projects_root(&self) -> PathBuf {
-        self.dir.join("projects")
-    }
-
-    /// Writes the global config `clean expired` reads its threshold from.
-    /// Key spelling is the file's, not Rust's - see `config::CleanupConfig`.
-    fn set_idle_threshold_days(&self, days: u64) {
-        fs::write(
-            self.dir.join("config.toml"),
-            format!("[cleanup]\nenabled = true\nidleThresholdDays = {days}\n"),
-        )
-        .expect("failed to write the global config");
-    }
-
-    /// How many project state directories the root currently holds - the
-    /// quantity every assertion here is really about.
-    fn project_count(&self) -> usize {
-        fs::read_dir(self.projects_root()).map(|entries| entries.flatten().count()).unwrap_or(0)
-    }
+/// How many project state directories the root currently holds - the
+/// quantity every assertion here is really about.
+fn project_count(home: &IsolatedHome) -> usize {
+    fs::read_dir(home.projects_root()).map(|entries| entries.flatten().count()).unwrap_or(0)
 }
 
-impl Drop for Home {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// A project whose state lives in one particular [`Home`].
+/// A project whose state lives in one particular [`IsolatedHome`].
 struct Project<'a> {
-    home: &'a Home,
+    home: &'a IsolatedHome,
     dir: tempfile::TempDir,
 }
 
 impl<'a> Project<'a> {
-    fn new(home: &'a Home) -> Self {
+    fn new(home: &'a IsolatedHome) -> Self {
         let dir = tempfile::tempdir().expect("failed to create a temp project root");
         fs::write(dir.path().join("a.ts"), b"export const a = 1;\n")
             .expect("failed to seed the project with a source file");
@@ -228,7 +181,7 @@ fn stderr_of(output: &Output) -> String {
 /// suite-wide override.
 #[test]
 fn a_sweep_runs_against_a_root_of_its_own_not_the_shared_one() {
-    let home = Home::new();
+    let home = IsolatedHome::new();
     let project = Project::new(&home);
 
     let shared =
@@ -261,16 +214,16 @@ fn a_sweep_runs_against_a_root_of_its_own_not_the_shared_one() {
 /// under one value and deleted under another with nothing else changed.
 #[test]
 fn clean_expired_honours_the_configured_threshold() {
-    let home = Home::new();
+    let home = IsolatedHome::new();
     let project = Project::new(&home);
     let state_dir = project.ready_to_be_swept();
 
-    home.set_idle_threshold_days(90);
+    set_idle_threshold_days(&home, 90);
     let spared = project.command(&["clean", "expired"]);
     assert!(spared.status.success(), "clean expired failed: {}", stderr_of(&spared));
     assert!(state_dir.is_dir(), "a project idle for seconds must survive a 90-day threshold");
 
-    home.set_idle_threshold_days(0);
+    set_idle_threshold_days(&home, 0);
     let swept = project.command(&["clean", "expired"]);
 
     assert!(swept.status.success(), "clean expired failed: {}", stderr_of(&swept));
@@ -283,7 +236,7 @@ fn clean_expired_honours_the_configured_threshold() {
 /// was deleted" just as well.
 #[test]
 fn clean_orphaned_force_deletes_only_the_state_whose_project_is_gone() {
-    let home = Home::new();
+    let home = IsolatedHome::new();
     let live = Project::new(&home);
     let live_state = live.ready_to_be_swept();
 
@@ -304,7 +257,7 @@ fn clean_orphaned_force_deletes_only_the_state_whose_project_is_gone() {
         orphan_state.is_dir(),
         "deleting the project directory must not remove its state - that is what makes it an orphan"
     );
-    assert_eq!(home.project_count(), 2, "both projects must have state before the sweep");
+    assert_eq!(project_count(&home), 2, "both projects must have state before the sweep");
 
     let swept = live.command(&["clean", "orphaned", "--force"]);
 
@@ -326,7 +279,7 @@ fn clean_orphaned_force_deletes_only_the_state_whose_project_is_gone() {
 /// this suite writes could produce it by accident.
 #[test]
 fn a_state_directory_whose_pid_file_cannot_be_read_is_never_swept() {
-    let home = Home::new();
+    let home = IsolatedHome::new();
     let project = Project::new(&home);
     let state = project.ready_to_be_swept();
 
@@ -354,20 +307,20 @@ fn a_state_directory_whose_pid_file_cannot_be_read_is_never_swept() {
 /// project it is indistinguishable from `clean`.
 #[test]
 fn clean_all_force_deletes_every_project_in_the_root() {
-    let home = Home::new();
+    let home = IsolatedHome::new();
     let first = Project::new(&home);
     let second = Project::new(&home);
     let first_state = first.ready_to_be_swept();
     let second_state = second.ready_to_be_swept();
     assert_ne!(first_state, second_state, "the two fixtures must be distinct projects");
-    assert_eq!(home.project_count(), 2);
+    assert_eq!(project_count(&home), 2);
 
     let swept = first.command(&["clean", "all", "--force"]);
 
     assert!(swept.status.success(), "clean all --force failed: {}", stderr_of(&swept));
     assert!(!first_state.exists(), "{}", stdout_of(&swept));
     assert!(!second_state.exists(), "{}", stdout_of(&swept));
-    assert_eq!(home.project_count(), 0, "the root must be empty: {}", stdout_of(&swept));
+    assert_eq!(project_count(&home), 0, "the root must be empty: {}", stdout_of(&swept));
 }
 
 /// `--force` is what separates a report from a deletion, so its absence has to
@@ -376,7 +329,7 @@ fn clean_all_force_deletes_every_project_in_the_root() {
 /// honestly means having projects in the root to count.
 #[test]
 fn clean_all_without_force_counts_without_deleting() {
-    let home = Home::new();
+    let home = IsolatedHome::new();
     let first = Project::new(&home);
     let second = Project::new(&home);
     let first_state = first.ready_to_be_swept();
@@ -387,5 +340,5 @@ fn clean_all_without_force_counts_without_deleting() {
     assert!(previewed.status.success(), "clean all failed: {}", stderr_of(&previewed));
     assert!(first_state.is_dir(), "clean all without --force must delete nothing");
     assert!(second_state.is_dir(), "clean all without --force must delete nothing");
-    assert_eq!(home.project_count(), 2, "clean all without --force must delete nothing");
+    assert_eq!(project_count(&home), 2, "clean all without --force must delete nothing");
 }
