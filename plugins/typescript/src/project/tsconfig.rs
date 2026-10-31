@@ -93,9 +93,10 @@ pub fn paths_entries(value: &Json) -> Option<Vec<PathsEntry>> {
 /// declaration order, without repeats. Every matching key contributes; the
 /// existence set picks. A key without `*` is an exact alias. Targets leaving
 /// the project are dropped. A target naming the project root is kept (its
-/// `index` files are the candidates) unless an empty `*` capture produced
-/// it: tsc substitutes no empty capture, so `@/` under `"@/*": ["./*"]`
-/// names no root.
+/// `index` files are the candidates). tsc substitutes no empty capture: a
+/// target with a `*` names nothing for it (`@/` under `"@/*": ["./src/*"]`),
+/// a target without one is used as written (`@r/` under `["./"]` names the
+/// root).
 pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     for entry in &config.paths {
@@ -111,15 +112,11 @@ pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec
         };
         for target in &entry.targets {
             let substituted = match capture {
+                Some("") if target.contains('*') => continue,
                 Some(capture) => target.replace('*', capture),
                 None => target.clone(),
             };
-            let resolved = if capture == Some("") {
-                paths::inside(&config.resolve_dir, &substituted)
-            } else {
-                paths::inside_or_root(&config.resolve_dir, &substituted)
-            };
-            if let Some(inside) = resolved {
+            if let Some(inside) = paths::inside_or_root(&config.resolve_dir, &substituted) {
                 if !candidates.contains(&inside) {
                     candidates.push(inside);
                 }

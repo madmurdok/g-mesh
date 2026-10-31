@@ -25,8 +25,7 @@ use g_mesh_plugin_sdk::RelPath;
 
 use crate::extractor::grammar::grammar_for;
 use crate::project::exports::{
-    imports_specifiers_targeting, imports_target_inside, imports_targets, key_targets, match_wildcard,
-    PackageImports,
+    imports_base, imports_specifiers_targeting, imports_targets, key_targets, match_wildcard, PackageImports,
 };
 use crate::project::paths;
 use crate::project::tsconfig::{expand_paths_candidates, specifiers_targeting, EffectiveConfig};
@@ -66,6 +65,14 @@ pub fn extension_of(path: &str) -> String {
         Some(at) if at > 0 => name[at..].to_lowercase(),
         _ => String::new(),
     }
+}
+
+/// Whether `base` names a file as written, so [`candidate_paths`] tries no
+/// extension or `index` file for it: it has a JS extension with TS
+/// substitutions, or one this plugin parses.
+pub fn names_file(base: &str) -> bool {
+    let extension = extension_of(base);
+    TS_SUBSTITUTIONS.iter().any(|(from, _)| *from == extension) || grammar_for(&RelPath::new(base)).is_some()
 }
 
 /// Every path `base` could name, most specific first: TS substitutions for a
@@ -319,12 +326,240 @@ fn static_targets_naming(project: &TsProject, configs: &[&EffectiveConfig], path
                 continue;
             }
             for target in key_targets(value, None).into_iter().filter(|target| !target.contains('*')) {
-                targets.extend(imports_target_inside(&config.dir, &target));
+                targets.extend(imports_base(&config.dir, &target));
             }
         }
     }
     targets.retain(|target| addresses.contains(target));
     targets
+}
+
+/// Every distinct tsconfig of the project (configs shared by several
+/// directories counted once).
+fn distinct_configs(project: &TsProject) -> Vec<&EffectiveConfig> {
+    let mut configs: Vec<&EffectiveConfig> = Vec::new();
+    for config in project.tsconfig_by_dir.values().flatten() {
+        if !configs.iter().any(|seen| std::ptr::eq(*seen, config.as_ref())) {
+            configs.push(config.as_ref());
+        }
+    }
+    configs
+}
+
+/// What a new `path` offers through `paths` targets that climb out of their
+/// capture (`"@m/*": ["./*/..", "./gen/*"]`): the importers such a target
+/// may move onto `path`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ClimbingKeys {
+    /// Target prefixes: every import whose target (placeholder address or
+    /// linked file) starts with one may now resolve to `path`. Never empty.
+    pub prefixes: Vec<String>,
+    /// Exact keys: addresses the family's specifiers may substitute to
+    /// (exact entries, captures a climb consumes) and every file each one
+    /// may name.
+    pub exact: Vec<String>,
+}
+
+/// The keys of [`ClimbingKeys`] for `path`. A wildcard target `P1*S1` whose
+/// `S1` climbs `k >= 1` segments after the `*`'s own (`./*/..`,
+/// `./src/*/../x`) names one address for a whole family of specifiers:
+/// `@m/lib/<y>` reaches `lib` for every `<y>`. No finite list of exact keys
+/// names that family, so for `path` and each of its addresses
+/// ([`addresses_resolving_to`]) the family's fixed specifier prefix `F` is
+/// worked out (`@m/lib/`), and every wildcard target of the same config
+/// gives the target prefix its expansion of `F` starts with (`./gen/*` ->
+/// `gen/lib/`), plus, for a target that climbs too, the addresses of the
+/// captures its climb consumes as exact keys. An entry whose pattern is
+/// more specific than `F` gives its whole target prefix (an
+/// over-approximation); an exact entry whose pattern starts with `F` gives
+/// its targets as exact keys.
+///
+/// Empty for a config without such a target, so an ordinary create adds no
+/// prefix selector. A prefix naming the project root itself (which would
+/// select every import) is never offered.
+pub fn climbing_target_prefixes(project: &TsProject, path: &str) -> ClimbingKeys {
+    let mut addresses = addresses_resolving_to(path);
+    addresses.push(path.to_string());
+    let mut keys = ClimbingKeys::default();
+    for config in distinct_configs(project) {
+        for entry in &config.paths {
+            let Some((family_head, _)) = entry.pattern.split_once('*') else {
+                continue;
+            };
+            for target in &entry.targets {
+                let Some(climb) = Climb::of(&config.resolve_dir, target) else {
+                    continue;
+                };
+                for address in &addresses {
+                    let Some(capture_head) = climb.capture_head(address) else {
+                        continue;
+                    };
+                    let fixed = if capture_head.is_empty() {
+                        family_head.to_string()
+                    } else {
+                        format!("{family_head}{capture_head}/")
+                    };
+                    offer_family(config, &fixed, &mut keys);
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// The keys every wildcard and exact entry of `config` offers for the
+/// specifiers starting with `fixed` ([`climbing_target_prefixes`]).
+fn offer_family(config: &EffectiveConfig, fixed: &str, keys: &mut ClimbingKeys) {
+    for entry in &config.paths {
+        let Some((head, _)) = entry.pattern.split_once('*') else {
+            if entry.pattern.starts_with(fixed) {
+                for target in &entry.targets {
+                    if let Some(exact) = paths::inside_or_root(&config.resolve_dir, target) {
+                        offer_address(&exact, keys);
+                    }
+                }
+            }
+            continue;
+        };
+        let rest = if let Some(rest) = fixed.strip_prefix(head) {
+            rest
+        } else if head.starts_with(fixed) {
+            ""
+        } else {
+            continue;
+        };
+        for target in &entry.targets {
+            offer_target(config, target, rest, keys);
+        }
+    }
+}
+
+/// Stands for one capture segment the family leaves open; never part of a
+/// real path.
+const OPEN_SEGMENT: &str = "\u{1}";
+
+/// The keys wildcard `target` offers for captures `rest` + `y`, over every
+/// `y` of one or more segments: a `y` that survives the target's climb
+/// gives the target prefix in front of it; a `y` the climb consumes (at
+/// most `k` segments for `k` climbs) gives one address, offered exactly.
+fn offer_target(config: &EffectiveConfig, target: &str, rest: &str, keys: &mut ClimbingKeys) {
+    let target = paths::with_forward_slashes(target);
+    let Some((target_head, target_tail)) = target.split_once('*') else {
+        return;
+    };
+    let climbs = Climb::of(&config.resolve_dir, &target).map_or(0, |climb| climb.climbs);
+    for open in 1..=climbs + 1 {
+        let open = vec![OPEN_SEGMENT; open].join("/");
+        let text = format!("{target_head}{rest}{open}{target_tail}");
+        if paths::is_rooted(&text) {
+            continue;
+        }
+        let normalized = paths::normalize(&paths::join(&config.resolve_dir, &text));
+        if normalized != paths::ROOT && paths::escapes(&normalized) {
+            continue;
+        }
+        match normalized.find(OPEN_SEGMENT) {
+            Some(0) => {}
+            Some(at) => push_new(&mut keys.prefixes, normalized[..at].to_string()),
+            None => offer_address(&normalized, keys),
+        }
+    }
+}
+
+/// `address` and every file it may name, as exact keys: an import linked
+/// to one of those files, or waiting at `address`, may move onto the new
+/// path.
+fn offer_address(address: &str, keys: &mut ClimbingKeys) {
+    push_new(&mut keys.exact, address.to_string());
+    for candidate in candidate_paths(address) {
+        push_new(&mut keys.exact, candidate);
+    }
+}
+
+fn push_new(list: &mut Vec<String>, value: String) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
+}
+
+/// A `paths` target `P1*S1` whose `S1` climbs out of the capture: after
+/// the `*`'s own segment, `S1` normalizes to `k >= 1` leading `..`
+/// segments and a remainder.
+struct Climb {
+    /// `resolve_dir/P1` spelled so that `head + capture` is the substituted
+    /// path: the normalized directory (with its `/`, or empty for the root)
+    /// and the text before the `*` in its segment.
+    head: String,
+    /// The normalized directory of `head`; [`paths::ROOT`] for the root.
+    dir: String,
+    /// `k`, the number of leading `..` segments.
+    climbs: usize,
+    /// The normalized remainder after the `..` segments; empty for none.
+    rest: String,
+}
+
+impl Climb {
+    fn of(resolve_dir: &str, target: &str) -> Option<Climb> {
+        let target = paths::with_forward_slashes(target);
+        let (before, after) = target.split_once('*')?;
+        let (_, after_segment) = after.split_once('/')?;
+        let tail = paths::normalize(after_segment);
+        let mut segments: Vec<&str> = tail.split('/').collect();
+        let climbs = segments.iter().take_while(|segment| **segment == "..").count();
+        if climbs == 0 {
+            return None;
+        }
+        segments.drain(..climbs);
+        let (dir, partial) = before.rsplit_once('/').unwrap_or(("", before));
+        let dir = paths::normalize(&paths::join(resolve_dir, dir));
+        let head = if dir == paths::ROOT {
+            partial.to_string()
+        } else if paths::escapes(&dir) {
+            return None;
+        } else {
+            format!("{dir}/{partial}")
+        };
+        Some(Climb { head, dir, climbs, rest: segments.join("/") })
+    }
+
+    /// The capture segments that survive the climb, for a specifier whose
+    /// substitution normalizes to `address`: `address` without the
+    /// remainder, matched against the head. Empty when the climb consumes
+    /// the whole capture, which lands on the head's directory or one of
+    /// its ancestors at most `k - 1` levels up; `None` when no capture
+    /// reaches `address` that way.
+    fn capture_head<'a>(&self, address: &'a str) -> Option<&'a str> {
+        let kept = if self.rest.is_empty() {
+            address
+        } else if address == self.rest {
+            paths::ROOT
+        } else {
+            address.strip_suffix(self.rest.as_str())?.strip_suffix('/')?
+        };
+        if self.consumes_capture_at(kept) {
+            return Some("");
+        }
+        if kept == paths::ROOT {
+            return None;
+        }
+        kept.strip_prefix(self.head.as_str())
+    }
+
+    /// Whether `kept` is the head's directory or an ancestor of it at most
+    /// `k - 1` levels up.
+    fn consumes_capture_at(&self, kept: &str) -> bool {
+        let mut dir = self.dir.as_str();
+        for _ in 0..self.climbs {
+            if dir == kept {
+                return true;
+            }
+            if dir == paths::ROOT {
+                return false;
+            }
+            dir = dir.rsplit_once('/').map_or(paths::ROOT, |(parent, _)| parent);
+        }
+        false
+    }
 }
 
 /// A specifier the inversion of a target pattern derives from a path, with
@@ -356,12 +591,7 @@ fn derive_specifiers<'p>(project: &'p TsProject, path: &str) -> Derivation<'p> {
     addresses.push(path.to_string());
     let mut specifiers: Vec<Derived<'p>> = Vec::new();
 
-    let mut configs: Vec<&EffectiveConfig> = Vec::new();
-    for config in project.tsconfig_by_dir.values().flatten() {
-        if !configs.iter().any(|seen| std::ptr::eq(*seen, config.as_ref())) {
-            configs.push(config.as_ref());
-        }
-    }
+    let configs = distinct_configs(project);
     for config in &configs {
         let derived: BTreeSet<String> =
             addresses.iter().flat_map(|address| specifiers_targeting(config, address)).collect();

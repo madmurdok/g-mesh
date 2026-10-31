@@ -50,6 +50,11 @@
 //! `select_affected` removed (the hub edit reindexes the language) or
 //! `round_trip` passing no waiting importers (the `#x` and `@env/a` importers
 //! link but keep no bindings).
+//!
+//! A `paths` target that climbs out of its capture (`"@m/*": ["./*/..",
+//! "./gen/*"]`) names one file for every `@m/lib/<y>`: a created `lib.ts`
+//! re-points an importer linked to `gen/lib/x.ts` and links one waiting at
+//! `gen/lib/x`. Control: `climbing_target_prefixes` returns no keys.
 
 #![cfg(unix)]
 
@@ -750,4 +755,42 @@ fn the_first_edit_of_a_hub_after_a_plugin_restart_reindexes_nothing() {
             "{importer} kept its link"
         );
     }
+}
+
+const CLIMBING_PREFIX_FIRST: (&str, &str) =
+    ("tsconfig.json", r#"{"compilerOptions":{"baseUrl":".","paths":{"@m/*":["./*/..","./gen/*"]}}}"#);
+
+/// `@m/lib/x` linked to `gen/lib/x.ts` moves to a created `lib.ts`, which
+/// `./*/..` names for it, re-extracting only that importer.
+#[test]
+fn an_import_linked_through_a_target_moves_to_a_file_a_climbing_target_reaches() {
+    let harness = indexed_with_configs(
+        &[CLIMBING_PREFIX_FIRST],
+        &[("gen/lib/x.ts", ""), ("src/a.ts", "import { mark_v1 } from \"@m/lib/x\";\n")],
+    );
+    assert_eq!(
+        harness.imports("src/a.ts").0,
+        vec!["gen/lib/x.ts:x.ts".to_string()],
+        "linked to gen/lib/x.ts"
+    );
+
+    create(&harness, "lib.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["lib.ts:lib.ts".to_string()], Vec::new()));
+    assert_only_the_importer_re_extracted(&harness);
+}
+
+/// `@m/lib/x` waits at `gen/lib/x` under `["./gen/*", "./*/.."]` and links
+/// to a created `lib.ts`, with its bindings.
+#[test]
+fn creating_a_file_a_climbing_target_reaches_links_a_waiting_import() {
+    let harness = waiting_importer(
+        &[("tsconfig.json", r#"{"compilerOptions":{"baseUrl":".","paths":{"@m/*":["./gen/*","./*/.."]}}}"#)],
+        &[],
+        "@m/lib/x",
+    );
+
+    create_function(&harness, "lib.ts");
+
+    assert_linked_with_bindings(&harness, "lib.ts");
 }
