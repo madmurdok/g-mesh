@@ -27,6 +27,7 @@ pub mod jsonc;
 pub mod paths;
 pub mod resolve;
 pub mod tsconfig;
+mod version_range;
 pub mod workspace;
 
 use std::collections::{BTreeMap, BTreeSet};

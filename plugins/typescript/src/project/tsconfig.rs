@@ -7,6 +7,7 @@
 //! config to its directory. [`super::TsProject::load`] reads every such
 //! config once and records its effective rules per directory.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use crate::extractor::grammar::EXTENSIONS as SOURCE_EXTENSIONS;
 use crate::project::exports::match_wildcard;
 use crate::project::jsonc::{parse_json, parse_jsonc, Json};
-use crate::project::{paths, EXCLUDE_DIRS};
+use crate::project::{paths, version_range, EXCLUDE_DIRS};
 
 /// Config file names a directory is searched for, in priority order.
 pub const CONFIG_FILE_NAMES: [&str; 2] = ["tsconfig.json", "jsconfig.json"];
@@ -274,8 +275,22 @@ enum ExtendsMiss {
 }
 
 /// The conditions tsc matches in a package's `exports` when it resolves an
-/// `extends` entry; any other key is skipped.
+/// `extends` entry, besides a `types@<range>` key whose range tsc 5.9.3
+/// satisfies; any other key is skipped.
 const EXTENDS_CONDITIONS: [&str; 4] = ["node", "require", "types", "default"];
+
+/// How an `exports` key matched the subpath looked up.
+#[derive(Clone, Copy)]
+enum ExportMatch<'s> {
+    /// The key is the subpath itself.
+    Exact,
+    /// A key with one `*`, which stands for this text; every `*` of the
+    /// target takes it.
+    Pattern(&'s str),
+    /// A key ending in `/` that the subpath starts with; the target, which
+    /// must then end in `/`, takes the rest of the subpath.
+    Folder(&'s str),
+}
 
 impl<'a> TsconfigReader<'a> {
     /// A reader for configs under `root`, appending what it skips to `notes`.
@@ -454,7 +469,9 @@ impl TsconfigReader<'_> {
 
     /// `rest` of the config's own package when the nearest package.json at
     /// or above the config (`ancestors`, nearest first) is named `name` and
-    /// declares `exports`. Only that nearest package.json counts.
+    /// declares `exports`. Only that nearest package.json counts. As in tsc,
+    /// `exports` is looked up twice: first without `.json` targets (only a
+    /// `.ts`, `.d.ts` or `.js` target, read as `.json`), then with them.
     fn self_name_target(&mut self, ancestors: &[String], name: &str, rest: &str) -> Option<String> {
         for dir in ancestors {
             let manifest_path = paths::join(dir, "package.json");
@@ -462,20 +479,22 @@ impl TsconfigReader<'_> {
                 continue;
             }
             let manifest = self.manifest(&manifest_path)?;
+            let exports = manifest.get("exports").filter(|exports| truthy(exports))?;
             if manifest.get("name").and_then(Json::as_str) != Some(name) {
                 return None;
             }
-            let exports = manifest.get("exports").filter(|exports| **exports != Json::Null)?;
-            return self.config_exports_target(dir, exports, &exports_subpath(rest));
+            let subpath = exports_subpath(rest);
+            return self
+                .config_exports_target(dir, exports, &subpath, false)
+                .or_else(|| self.config_exports_target(dir, exports, &subpath, true));
         }
         None
     }
 
     /// `name`/`rest` under `dir/node_modules`. A package.json with `exports`
-    /// decides alone. Otherwise the bare name is `<name>.json`, then the
-    /// package directory ([`Self::package_dir_target`]); a subpath is
-    /// `rest.json` (or `rest` when it ends in `.json`), then the directory
-    /// `rest`.
+    /// decides alone. Otherwise the bare name, or the subpath `rest`, is
+    /// tried as a file ([`module_file_candidates`]), then as a directory
+    /// ([`Self::package_dir_target`]).
     fn node_modules_target(&mut self, dir: &str, name: &str, rest: &str) -> Option<String> {
         let modules = paths::join(dir, "node_modules");
         let package = paths::normalize(&paths::join(&modules, name));
@@ -483,95 +502,103 @@ impl TsconfigReader<'_> {
             return None;
         }
         let manifest = self.manifest(&paths::join(&package, "package.json"));
-        if let Some(exports) = manifest.as_ref().and_then(|m| m.get("exports")).filter(|e| **e != Json::Null)
-        {
-            return self.config_exports_target(&package, exports, &exports_subpath(rest));
+        if let Some(exports) = manifest.as_ref().and_then(|m| m.get("exports")).filter(|e| truthy(e)) {
+            return self.config_exports_target(&package, exports, &exports_subpath(rest), true);
         }
-        if rest.is_empty() {
-            let file = format!("{package}.json");
-            return if self.probe(&file) { Some(file) } else { self.package_dir_target(&package) };
-        }
-        let sub = paths::normalize(&paths::join(&package, rest));
-        if paths::escapes(&sub) {
+        let target = if rest.is_empty() { package } else { paths::normalize(&paths::join(&package, rest)) };
+        if paths::escapes(&target) {
             return None;
         }
-        let file = if sub.ends_with(".json") { sub.clone() } else { format!("{sub}.json") };
-        if self.probe(&file) {
-            return Some(file);
+        if let Some(found) = self.first_file(module_file_candidates(&target)) {
+            return Some(found);
         }
-        self.package_dir_target(&sub)
+        self.package_dir_target(&target)
     }
 
     /// The config a package directory names: its package.json `tsconfig`
-    /// field `f` (the file `f`, then `f.json`, then `f/tsconfig.json`), else,
-    /// also when that names nothing, the directory's `tsconfig.json`.
+    /// field ([`tsconfig_field_candidates`]), else, also when that names
+    /// nothing, the directory's `tsconfig.json`.
     fn package_dir_target(&mut self, dir: &str) -> Option<String> {
         let manifest = self.manifest(&paths::join(dir, "package.json"));
         let field = manifest.as_ref().and_then(|m| m.get("tsconfig")).and_then(Json::as_str);
-        if let Some(base) = field.and_then(|field| paths::inside(dir, field)) {
-            let mut candidates = file_candidates(&base);
-            candidates.push(paths::join(&base, "tsconfig.json"));
-            if let Some(found) = self.first_file(candidates) {
-                return Some(found);
-            }
+        if let Some(found) = field.and_then(|field| self.first_file(tsconfig_field_candidates(dir, field))) {
+            return Some(found);
         }
         let fallback = paths::join(dir, "tsconfig.json");
         self.probe(&fallback).then_some(fallback)
     }
 
-    /// The file a package's `exports` maps `subpath` (`.` or `./rest`) to:
-    /// the exact key, else the wildcard key with the longest prefix before
-    /// its `*`. A subpath it does not export names nothing; there is no
-    /// fallback inside that package.
-    fn config_exports_target(&mut self, package: &str, exports: &Json, subpath: &str) -> Option<String> {
-        let entries = match exports {
-            Json::Object(entries) if entries.iter().any(|(key, _)| key == "." || key.starts_with("./")) => {
-                entries
-            }
-            _ if subpath == "." => return self.exports_value_target(package, exports, None),
-            _ => return None,
-        };
-        if let Some(exact) = exports.get(subpath) {
-            return self.exports_value_target(package, exact, None);
+    /// The file a package's `exports` maps `subpath` (`.` or `./rest`) to,
+    /// as tsc's `loadModuleFromExports` does:
+    /// - `.`: the whole `exports` when no key starts with `.`, else its `.`
+    ///   key;
+    /// - `./rest`, only when every key starts with `.`: the exact key, else
+    ///   the first matching key with one `*` or a trailing `/`, in
+    ///   [`compare_pattern_keys`] order.
+    ///
+    /// A subpath it does not map names nothing, and neither does a matched
+    /// key whose value resolves to nothing: there is no fallback inside that
+    /// package. `json_targets`: see [`exports_target_file`].
+    fn config_exports_target(
+        &mut self,
+        package: &str,
+        exports: &Json,
+        subpath: &str,
+        json_targets: bool,
+    ) -> Option<String> {
+        if subpath == "." {
+            let main = match exports {
+                Json::Object(entries) if entries.iter().any(|(key, _)| key.starts_with('.')) => {
+                    exports.get(".")?
+                }
+                _ => exports,
+            };
+            return self.exports_value_target(package, main, ExportMatch::Exact, json_targets);
         }
-        let mut best: Option<(usize, &Json, &str)> = None;
-        for (key, value) in entries {
-            let Some(capture) = match_wildcard(key, subpath) else { continue };
-            let prefix = key.find('*').unwrap_or(0);
-            if best.is_none_or(|(longest, _, _)| prefix > longest) {
-                best = Some((prefix, value, capture));
+        let Json::Object(entries) = exports else { return None };
+        if !entries.iter().all(|(key, _)| key.starts_with('.')) {
+            return None;
+        }
+        if !subpath.contains('*') && !subpath.ends_with('/') {
+            if let Some(exact) = exports.get(subpath) {
+                return self.exports_value_target(package, exact, ExportMatch::Exact, json_targets);
             }
         }
-        let (_, value, capture) = best?;
-        self.exports_value_target(package, value, Some(capture))
+        let mut expanding: Vec<&(String, Json)> =
+            entries.iter().filter(|(key, _)| key.matches('*').count() == 1 || key.ends_with('/')).collect();
+        expanding.sort_by(|(a, _), (b, _)| compare_pattern_keys(a, b));
+        let (value, matched) = expanding
+            .into_iter()
+            .find_map(|(key, value)| export_key_match(key, subpath).map(|m| (value, m)))?;
+        self.exports_value_target(package, value, matched, json_targets)
     }
 
-    /// One `exports` value: a `./` string is the exact file (with `*` taken
-    /// by `capture`) when it exists; an array is its first element that
-    /// resolves; an object is its first key among [`EXTENDS_CONDITIONS`], in
-    /// declaration order.
-    fn exports_value_target(&mut self, package: &str, value: &Json, capture: Option<&str>) -> Option<String> {
+    /// One `exports` value, as tsc's `loadModuleFromTargetExportOrImport`
+    /// resolves it: a string is one file ([`exports_target_path`],
+    /// [`exports_target_file`]); an array is its first element that
+    /// resolves; an object is its first key that is a condition tsc matches
+    /// ([`EXTENDS_CONDITIONS`], an applicable `types@<range>`) and resolves,
+    /// in declaration order. Every in-project file tried is probed.
+    fn exports_value_target(
+        &mut self,
+        package: &str,
+        value: &Json,
+        matched: ExportMatch<'_>,
+        json_targets: bool,
+    ) -> Option<String> {
         match value {
             Json::String(target) => {
-                let target = paths::with_forward_slashes(target);
-                if !target.starts_with("./") {
-                    return None;
-                }
-                let target = match capture {
-                    Some(capture) => target.replace('*', capture),
-                    None => target,
-                };
-                let path = paths::inside(package, &target)?;
-                self.probe(&path).then_some(path)
+                let path = exports_target_path(package, target, matched)?;
+                let file = exports_target_file(&path, json_targets)?;
+                self.probe(&file).then_some(file)
             }
             Json::Array(items) => {
-                items.iter().find_map(|item| self.exports_value_target(package, item, capture))
+                items.iter().find_map(|item| self.exports_value_target(package, item, matched, json_targets))
             }
-            Json::Object(entries) => {
-                let (_, chosen) =
-                    entries.iter().find(|(key, _)| EXTENDS_CONDITIONS.contains(&key.as_str()))?;
-                self.exports_value_target(package, chosen, capture)
-            }
+            Json::Object(entries) => entries
+                .iter()
+                .filter(|(key, _)| condition_applies(key))
+                .find_map(|(_, sub)| self.exports_value_target(package, sub, matched, json_targets)),
             _ => None,
         }
     }
@@ -581,10 +608,30 @@ impl TsconfigReader<'_> {
         candidates.into_iter().find(|candidate| self.probe(candidate))
     }
 
-    /// Whether `path` is a file; records it as a watch path either way.
+    /// Whether `path` is a file; records it as a watch path either way
+    /// ([`Self::record_probed`]).
     fn probe(&mut self, path: &str) -> bool {
-        self.record(path);
+        self.record_probed(path);
         config_is_file(self.root, path)
+    }
+
+    /// Records a probed `path`, and also its spelling through its parent
+    /// directory's real path when a symlink makes that differ and it lies
+    /// inside the project, so a file created or saved through the real path
+    /// is seen too.
+    fn record_probed(&mut self, path: &str) {
+        self.record(path);
+        let parent = paths::dirname(path);
+        if parent.is_empty() {
+            return;
+        }
+        let Some(canonical_root) = &self.canonical_root else { return };
+        let Ok(real_parent) = self.root.join(parent).canonicalize() else { return };
+        let Ok(relative) = real_parent.strip_prefix(canonical_root) else { return };
+        let real = paths::join(&relative.to_string_lossy().replace('\\', "/"), paths::basename(path));
+        if real != path {
+            self.record(&real);
+        }
     }
 
     /// The package.json at `path`, read once and recorded as a watch path.
@@ -592,7 +639,7 @@ impl TsconfigReader<'_> {
         if let Some(cached) = self.manifests.get(path) {
             return cached.clone();
         }
-        self.record(path);
+        self.record_probed(path);
         let manifest = std::fs::read_to_string(self.root.join(path))
             .ok()
             .and_then(|text| parse_json(&text))
@@ -649,6 +696,133 @@ fn split_package_entry(entry: &str) -> Option<(&str, &str)> {
     let segments_ok = |text: &str| text.split('/').all(|segment| !segment.is_empty());
     (segments_ok(name) && name.split('/').count() == name_segments && (rest.is_empty() || segments_ok(rest)))
         .then_some((name, rest))
+}
+
+/// The files tsc's `loadModuleFromFile` tries for `path` when it loads a
+/// config by module name: [`extension_replaced`], then `path.json`.
+fn module_file_candidates(path: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = extension_replaced(path).into_iter().collect();
+    candidates.push(format!("{path}.json"));
+    candidates
+}
+
+/// The `.json` file tsc tries in place of `path`'s extension when it loads a
+/// config by module name: `x.json` for `x.json`, `x.ts`, `x.d.ts` and
+/// `x.js`. `None` for a basename without a dot or with any other extension.
+fn extension_replaced(path: &str) -> Option<String> {
+    if !paths::basename(path).contains('.') {
+        return None;
+    }
+    [".d.ts", ".json", ".ts", ".js"]
+        .into_iter()
+        .find_map(|extension| path.strip_suffix(extension))
+        .map(|stem| format!("{stem}.json"))
+}
+
+/// The files a package.json `tsconfig` field `field` in `dir` names, in
+/// tsc's order: the field itself only when it ends in `.json`, then
+/// [`extension_replaced`], `field.json` and `field/tsconfig.json`; only the
+/// last when it ends in `/`. Empty when it leaves the project.
+fn tsconfig_field_candidates(dir: &str, field: &str) -> Vec<String> {
+    let Some(base) = paths::inside(dir, field) else { return Vec::new() };
+    let directory = paths::join(&base, "tsconfig.json");
+    if paths::with_forward_slashes(field).ends_with('/') {
+        return vec![directory];
+    }
+    let mut candidates = Vec::new();
+    if base.ends_with(".json") {
+        candidates.push(base.clone());
+    }
+    for candidate in module_file_candidates(&base).into_iter().chain([directory]) {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+/// The in-project path an `exports` string `target` names for `matched`,
+/// or `None` when tsc rejects it: a target not starting with `./`; a `.`,
+/// `..` or `node_modules` segment after its first, or in the text a `*` or
+/// a trailing-`/` key captured; a non-`/` target for a trailing-`/` key; a
+/// result ending in `/`.
+fn exports_target_path(package: &str, target: &str, matched: ExportMatch<'_>) -> Option<String> {
+    let target = paths::with_forward_slashes(target);
+    let (pattern, subpath) = match matched {
+        ExportMatch::Exact => (false, ""),
+        ExportMatch::Pattern(capture) => (true, capture),
+        ExportMatch::Folder(rest) => (false, rest),
+    };
+    if !pattern && !subpath.is_empty() && !target.ends_with('/') {
+        return None;
+    }
+    let after_first = target.strip_prefix("./")?;
+    if has_invalid_target_segment(after_first) || has_invalid_target_segment(subpath) {
+        return None;
+    }
+    let joined = if pattern { target.replace('*', subpath) } else { format!("{target}{subpath}") };
+    if joined.ends_with('/') {
+        return None;
+    }
+    paths::inside(package, &joined)
+}
+
+/// Whether a `/`-separated text has a `.`, `..` or `node_modules` segment.
+fn has_invalid_target_segment(text: &str) -> bool {
+    let text = text.strip_suffix('/').unwrap_or(text);
+    text.split('/').any(|segment| matches!(segment, "." | ".." | "node_modules"))
+}
+
+/// The file tsc reads for an `exports` target `path`: [`extension_replaced`],
+/// except that a `.json` path names nothing unless `json_targets` (tsc's
+/// self-name lookup first tries without `.json` targets).
+fn exports_target_file(path: &str, json_targets: bool) -> Option<String> {
+    if !json_targets && path.ends_with(".json") {
+        return None;
+    }
+    extension_replaced(path)
+}
+
+/// Whether tsc matches the `exports` condition `key` for an `extends` entry.
+fn condition_applies(key: &str) -> bool {
+    EXTENDS_CONDITIONS.contains(&key)
+        || key.strip_prefix("types@").is_some_and(version_range::includes_tsc_version)
+}
+
+/// tsc's `comparePatternKeys`: the longer text up to and including the `*`
+/// (the whole key without one) first; on a tie a key with a `*` before one
+/// without, then the longer key.
+fn compare_pattern_keys(a: &str, b: &str) -> Ordering {
+    let base = |key: &str| key.find('*').map_or(key.len(), |star| star + 1);
+    base(b).cmp(&base(a)).then_with(|| match (a.contains('*'), b.contains('*')) {
+        (true, true) => b.len().cmp(&a.len()),
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => Ordering::Equal,
+    })
+}
+
+/// How the expanding `exports` key `key` (one `*`, or a trailing `/`)
+/// matches `subpath`, tested in tsc's order: a `*` with text after it, a
+/// trailing `*`, then `key` as a plain prefix.
+fn export_key_match<'s>(key: &str, subpath: &'s str) -> Option<ExportMatch<'s>> {
+    if !key.ends_with('*') {
+        if let Some(capture) = match_wildcard(key, subpath) {
+            return Some(ExportMatch::Pattern(capture));
+        }
+    }
+    if let Some(prefix) = key.strip_suffix('*') {
+        if let Some(rest) = subpath.strip_prefix(prefix) {
+            return Some(ExportMatch::Pattern(rest));
+        }
+    }
+    subpath.strip_prefix(key).map(ExportMatch::Folder)
+}
+
+/// Whether tsc treats an `exports` value as present: anything but `null`,
+/// `false` and `""`. (A number counts as present; its value is not kept.)
+fn truthy(value: &Json) -> bool {
+    !matches!(value, Json::Null | Json::Bool(false)) && value.as_str() != Some("")
 }
 
 /// The `exports` key a package subpath is looked up under.

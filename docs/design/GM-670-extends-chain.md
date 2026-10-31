@@ -76,6 +76,7 @@ What `extends_candidates` does today:
 |---|---|---|
 | c1 | `pkg/package.json` `tsconfig: ./cfg/base.json`; `pkg/tsconfig.json` too | `cfg/base.json` |
 | c12 / a8 | field `./base` / field `./sub` (dir) | `base.json` / `sub/tsconfig.json` |
+| S12 g4, g4b, g4c | field `./base` (files `base`, `base.json`) / `./base.ts` / `./base.json` missing | `base.json` (never the exact non-`.json` file) / `base.json` before `base.ts.json` / `base.json.json` |
 | c13 | field names a missing file | `pkg/tsconfig.json` |
 | c2, a4 | `node_modules/pkg.json` beside `pkg/` (tsconfig.json / field) | `pkg.json` (file before directory) |
 | c4 | `exports {"./node": "./cfg/node.json"}`, `pkg/node.json` too | `cfg/node.json` |
@@ -84,9 +85,13 @@ What `extends_candidates` does today:
 | b1 | `exports "."` vs sibling `pkg.json` | `exports` |
 | b3, d4 | exports target `./e` (no ext) / missing | TS6053 (exact, no fallback) |
 | d3 | exports array `[missing, ./tsconfig.json]` | second element |
-| a1, a2, c11, d1, d2 | condition objects | first key in declaration order among `node`, `require`, `types`, `default` (`import`, `browser`, `source` never) |
-| d5, c17 | wildcard keys | longest prefix |
+| a1, a2, c11, d1, d2 | condition objects | first key in declaration order among `node`, `require`, `types`, `default` and an applicable `types@<range>` (`import`, `browser`, `source` never) that resolves; a key whose target is missing or `null` falls through to the next (S12 g1, g8, n1) |
+| d5, c17 | wildcard keys | longest prefix up to and including `*`, then the longer key (S12 g6); legacy `"./dir/": "./x/"` keys too (h4) |
+| S12 g2-g2d, b3 | exports string target | `.json` exact; `.ts`/`.d.ts`/`.js` read as `.json`; no dot or another extension: nothing |
+| S12 g9 | self-name `{"require":"./b.json","default":"./c.ts"}`, `b.json` and `c.json` | `c.json` (a first pass ignores `.json` targets) |
+| S12 h1-h3 | target or `*` capture with a `.`, `..` or `node_modules` segment | TS6053 |
 | c3 | `pkg/sub`: `sub.json` and `sub/tsconfig.json` | `sub.json` |
+| S12 g5, g5b, g5c | `pkg/base.ts` / `pkg/base.json` missing / package `chart.js` | `base.json` first / `base.json.json` / `node_modules/chart.json` first |
 | c16 | `pkg/sub/package.json` `tsconfig` field | field target |
 | a5 | `pkg/x` exact file, no `.json` | TS6053 |
 | c14, e1-e3 | nearest `node_modules` fails | next ancestor's |
@@ -224,7 +229,10 @@ this.
 found or not, minus paths under `EXCLUDE_DIRS` and paths with a TS source
 extension. It also holds the canonical project-relative path of each found
 target whose realpath differs and lies inside the root (a10: the save lands
-on `packages/cfg/base.json`). It covers:
+on `packages/cfg/base.json`), and of each probed path whose parent
+directory's realpath differs and lies inside the root (a missing
+`./configs/base.json` behind `configs -> shared/configs` is also declared as
+`shared/configs/base.json`). It covers:
 
 - relative entries: both candidates (`x`, `x.json`), including an exact
   non-`.json` file (owner item 4: routed by its exact path);
@@ -248,20 +256,24 @@ resolve_extends(config, entry):
   ""                           -> None
   else (package name, incl. ".hidden/x"):
     self_name(config_dir, name, rest)              // nearest package.json only (f3)
-      -> if its `name` == name and it has `exports`: config_exports_target; on a miss, go on (f5)
+      -> if its `name` == name and it has `exports`: config_exports_target without
+         `.json` targets, then with them (g9); on a miss, go on (f5)
     for dir in ancestors(config_dir):              // nearest first, inside root
       pkg = dir/node_modules/name
-      found = pkg/package.json has non-null `exports`
+      found = pkg/package.json has `exports` (not null, false or "")
                 ? config_exports_target(pkg, exports, "." | "./rest")
-                : rest == "" ? file(dir/node_modules/name.json) or directory(pkg)
-                             : file(rest ends .json ? pkg/rest : pkg/rest.json) or directory(pkg/rest)
+                : file(t) or directory(t), t = rest == "" ? pkg : pkg/rest
+                  // file(t): t with .ts/.d.ts/.js/.json replaced by .json, then t.json
       if found: return found                       // else next ancestor (e1-e3)
-directory(d): d/package.json `tsconfig` field -> f (exact, else f.json) or f/tsconfig.json;
-              missing -> d/tsconfig.json (c13)
-config_exports_target: exact key, else the wildcard key with the longest prefix
-  (exports::match_wildcard, read-only); string -> exact "./" target that exists;
-  array -> first element that resolves; object -> first key in declaration order
-  among node/require/types/default, recursive; else None (no fallback in this package).
+directory(d): d/package.json `tsconfig` field -> f only if it ends .json, file(f),
+              f/tsconfig.json (only the last for a trailing /); missing -> d/tsconfig.json (c13)
+config_exports_target: "." -> exports itself, or its "." key when a key starts with ".";
+  subpath (all keys start with ".") -> exact key, else the first of the keys with one
+  `*` or a trailing `/` that matches, sorted as tsc's comparePatternKeys;
+  string -> "./" target (tsc's segment checks), `.json` exact, `.ts`/`.d.ts`/`.js`
+  read as `.json`; array -> first element that resolves; object -> each key among
+  node/require/types/default/applicable types@<range>, in declaration order, until
+  one resolves; else None (no fallback in this package).
 ```
 
 Every result stays inside the project (`paths::escapes`). A target outside
@@ -424,6 +436,21 @@ build per group.
   (`ProjectWatcher::next_change` and `retain_unignored`, both through
   `IgnoreLayers::is_ignored`), and a seeded start's comparison walks with
   `.gitignore` honoured too (must-confirm 3).
+- **Resolved but not watched:** an `extends` naming a file with a TS
+  source extension (`"./base.ts"`, which tsc reads too) resolves, but
+  `record` drops it by the watch-path contract, so editing it does not
+  reload the model.
+- **Lookup stops at the project root:** `node_modules` is searched from the
+  config's directory up to the project root, never above it (design 3.2,
+  "inside root"); tsc keeps climbing, so a sub-project root relying on a
+  hoisted `node_modules` above it inherits nothing here, with a note.
+- **Residual tsc divergences:** a `types@<range>` key is tested with a
+  port of tsc 5.9's range parser against 5.9.3; a range tsc's `Version`
+  would throw on (an empty or zero-padded prerelease part) counts as not
+  matching, and a number past `u64::MAX` saturates. A `*` key whose prefix
+  and suffix overlap in the subpath (`./a*a` for `./a`) matches in tsc,
+  not here. `exports` given as the number `0` counts as present here.
+  `typesVersions` in a package.json is not read for `extends`.
 - **Case-insensitive file systems:** a missing candidate is declared as
   spelled in `extends`. On macOS, a later file created with a different
   case does not match the stored key (must-confirm 4). Found targets are
