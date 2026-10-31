@@ -826,6 +826,35 @@ fn workspace_excluded_and_failed_language_files_are_not_announced() {
     assert_eq!(files_created_notifications(plugin_dir), vec!["filesCreated a.python-src,b.python-src"]);
 }
 
+/// 5b: a created file another language declared as a watch path is routed
+/// as that language's workspace file, so it is left out of the claiming
+/// language's `filesCreated`.
+#[test]
+fn a_created_declared_watch_path_is_not_announced() {
+    let (project, _plugins, dirs, registry) = declaring_registry(&["python", "rust"]);
+    let conn = test_plugin::empty_index();
+    let root = project.path().canonicalize().unwrap();
+    fs::write(root.join("barrier.rust-src"), "").unwrap();
+    conn.with(|conn| {
+        crate::storage::schema::set_resolution_facts(
+            conn,
+            "python",
+            Some("facts"),
+            &["r1.rust-src".to_string()],
+        )
+    })
+    .unwrap();
+    let supervisor = registry.get_or_spawn("rust").unwrap();
+
+    registry.announce_created(
+        &conn,
+        &["r1.rust-src".to_string(), "r2.rust-src".to_string(), "r3.rust-src".to_string()],
+    );
+    supervisor.file_changed(&conn, "barrier.rust-src".to_string());
+
+    assert_eq!(files_created_notifications(&dirs[1]), vec!["filesCreated r2.rust-src,r3.rust-src"]);
+}
+
 /// 6: created files of two languages are announced per language, each with
 /// only its own paths, and each plugin receives its announcement before the
 /// `fileChanged` of its own creations. The order *across* the two plugins is

@@ -2013,6 +2013,642 @@ fn a_backslashed_extends_entry_is_followed_when_loading() {
     assert_eq!(resolve(&project, "@/a", "app.ts"), some("src/a.ts"));
 }
 
+// --- tsconfig: the `extends` lookup against tsc 5.9.3 --------------------------------
+//
+// Each case lays out candidate configs that carry distinct `paths` markers
+// (`m:<name>` in a file list becomes a config whose only alias is
+// `@<name>/*`), and asks which marker the root config inherited: the case's
+// name in tsc's own `--showConfig`, or none where tsc reports TS6053.
+
+/// A config whose only effect is one `paths` entry named after `name`.
+fn marker_config(name: &str) -> String {
+    format!(r#"{{"compilerOptions":{{"paths":{{"@{name}/*":["./x/*"]}}}}}}"#)
+}
+
+fn extends_config(entry: &str) -> String {
+    format!(r#"{{"extends":{}}}"#, serde_json::to_string(entry).unwrap())
+}
+
+/// A fixture over `files`, where a content `m:<name>` is [`marker_config`].
+fn marker_fixture(files: &[(&str, &str)]) -> Fixture {
+    let expanded: Vec<(String, String)> = files
+        .iter()
+        .map(|(path, contents)| {
+            let contents = contents.strip_prefix("m:").map_or_else(|| contents.to_string(), marker_config);
+            (path.to_string(), contents)
+        })
+        .collect();
+    let refs: Vec<(&str, &str)> = expanded.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+    Fixture::new(&refs)
+}
+
+/// The marker `dir`'s nearest config inherited.
+fn inherited(project: &TsProject, dir: &str) -> Option<String> {
+    let entry = project.tsconfig_for(dir)?.paths.first()?;
+    Some(entry.pattern.trim_start_matches('@').trim_end_matches("/*").to_string())
+}
+
+/// The marker the root `tsconfig.json` inherits when it extends `entry`
+/// over `files`.
+fn chain(entry: &str, files: &[(&str, &str)]) -> Option<String> {
+    chain_at("tsconfig.json", entry, files)
+}
+
+fn chain_at(config: &str, entry: &str, files: &[(&str, &str)]) -> Option<String> {
+    let fx = marker_fixture(files);
+    fx.write(config, &extends_config(entry));
+    let dir = config.rsplit_once('/').map_or("", |(dir, _)| dir);
+    // A directory joins the model only when it holds a source file.
+    let source = format!("{dir}/source.ts");
+    fx.write(source.trim_start_matches('/'), SRC);
+    inherited(&fx.load(), dir)
+}
+
+/// [`chain`] over a package at `node_modules/pkg` whose `package.json` is
+/// `manifest` and whose other files are `files` (paths relative to it).
+fn chain_pkg(entry: &str, manifest: &str, files: &[(&str, &str)]) -> Option<String> {
+    let mut all: Vec<(String, &str)> =
+        files.iter().map(|(p, c)| (format!("node_modules/pkg/{p}"), *c)).collect();
+    all.push(("node_modules/pkg/package.json".to_string(), manifest));
+    let refs: Vec<(&str, &str)> = all.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+    chain(entry, &refs)
+}
+
+fn expect(case: &str, got: Option<String>, want: Option<&str>) {
+    assert_eq!(got.as_deref(), want, "{case}");
+}
+
+/// The package's `tsconfig` field: a relative path, `.json` appended, a
+/// directory's `tsconfig.json`, and the package's own `tsconfig.json` when
+/// the field names nothing.
+///
+/// Control: do not read the `tsconfig` field in `package_dir_target` (the
+/// first two cases inherit the package's own config, or nothing).
+#[test]
+fn a_packages_tsconfig_field_names_the_config_it_extends() {
+    let own = ("tsconfig.json", "m:dflt");
+    let field = |text: &str| format!(r#"{{"tsconfig":"{text}"}}"#);
+    expect(
+        "c1",
+        chain_pkg("pkg", &field("./cfg/base.json"), &[("cfg/base.json", "m:field"), own]),
+        Some("field"),
+    );
+    expect(
+        "c8",
+        chain_pkg("pkg", &field("cfg/base.json"), &[("cfg/base.json", "m:field"), own]),
+        Some("field"),
+    );
+    expect("c12", chain_pkg("pkg", &field("./base"), &[("base.json", "m:base"), own]), Some("base"));
+    expect("a8", chain_pkg("pkg", &field("./sub"), &[("sub/tsconfig.json", "m:sub"), own]), Some("sub"));
+    expect("c13", chain_pkg("pkg", &field("./nope.json"), &[own]), Some("dflt"));
+    expect(
+        "a12",
+        chain(
+            "pkg",
+            &[
+                ("node_modules/pkg/package.json", r#"{"tsconfig":"../other.json"}"#),
+                ("node_modules/other.json", "m:other"),
+            ],
+        ),
+        Some("other"),
+    );
+}
+
+/// `<name>.json` beside the package directory wins over the directory, with
+/// or without a `tsconfig` field inside it.
+#[test]
+fn a_package_json_file_wins_over_the_package_directory() {
+    let files = [("node_modules/pkg.json", "m:file"), ("node_modules/pkg/tsconfig.json", "m:dir")];
+    expect("c2", chain("pkg", &files), Some("file"));
+    let with_field = [
+        ("node_modules/pkg.json", "m:file"),
+        ("node_modules/pkg/package.json", r#"{"tsconfig":"./f.json"}"#),
+        ("node_modules/pkg/f.json", "m:field"),
+    ];
+    expect("a4", chain("pkg", &with_field), Some("file"));
+}
+
+/// `exports` decides alone when present: a subpath key, over the field and
+/// over a plain file; an unexported subpath or `.`, a target without an
+/// extension (no fallback) or a missing one inherits nothing; an array takes
+/// its first element that resolves.
+///
+/// Control: ignore `exports` in `node_modules_target` - c4 and c6 inherit
+/// the direct file or the field, the TS6053 cases inherit a file.
+#[test]
+fn a_packages_exports_decide_before_files_and_the_field() {
+    let own = ("tsconfig.json", "m:dflt");
+    expect(
+        "c4",
+        chain_pkg(
+            "pkg/node",
+            r#"{"exports":{"./node":"./cfg/node.json"}}"#,
+            &[("cfg/node.json", "m:export"), ("node.json", "m:direct")],
+        ),
+        Some("export"),
+    );
+    expect(
+        "c6",
+        chain_pkg(
+            "pkg",
+            r#"{"exports":{".":"./e.json"},"tsconfig":"./f.json"}"#,
+            &[("e.json", "m:e"), ("f.json", "m:f")],
+        ),
+        Some("e"),
+    );
+    expect(
+        "e4",
+        chain_pkg(
+            "pkg",
+            r#"{"exports":{"./x":"./x.json"},"tsconfig":"./f.json"}"#,
+            &[("f.json", "m:f"), own],
+        ),
+        None,
+    );
+    expect(
+        "c5",
+        chain_pkg("pkg/node", r#"{"exports":{"./other":"./o.json"}}"#, &[("node.json", "m:direct")]),
+        None,
+    );
+    expect(
+        "b3",
+        chain_pkg("pkg", r#"{"exports":{".":"./e"}}"#, &[("e", "m:exact"), ("e.json", "m:json")]),
+        None,
+    );
+    expect("d4", chain_pkg("pkg", r#"{"exports":{".":"./missing.json"}}"#, &[own]), None);
+    expect(
+        "d3",
+        chain_pkg(
+            "pkg",
+            r#"{"exports":{".":["./missing.json","./tsconfig.json"]}}"#,
+            &[("tsconfig.json", "m:second")],
+        ),
+        Some("second"),
+    );
+}
+
+/// Condition objects: the first of `node`, `require`, `types`, `default`
+/// in declaration order that resolves; `import`, `browser` and `source`
+/// never count.
+#[test]
+fn exports_conditions_are_taken_in_declaration_order_and_import_never_counts() {
+    let files = [("i.json", "m:i"), ("n.json", "m:n"), ("d.json", "m:d")];
+    let exports = |text: &str| format!(r#"{{"exports":{text}}}"#);
+    expect("a1", chain_pkg("pkg", &exports(r#"{"node":"./n.json","import":"./i.json"}"#), &files), Some("n"));
+    expect(
+        "a2",
+        chain_pkg("pkg", &exports(r#"{"import":"./i.json","default":"./d.json"}"#), &files),
+        Some("d"),
+    );
+    expect(
+        "d1",
+        chain_pkg("pkg", &exports(r#"{"default":"./d.json","node":"./n.json"}"#), &files),
+        Some("d"),
+    );
+    expect(
+        "d2",
+        chain_pkg(
+            "pkg",
+            &exports(r#"{"import":"./i.json","browser":"./i.json","source":"./i.json"}"#),
+            &files,
+        ),
+        None,
+    );
+}
+
+/// A key whose target is missing, `null` or invalid falls through to the
+/// next one; each candidate tried is declared as a watch path.
+///
+/// Control: stop at the first matching key in `exports_value_target`.
+#[test]
+fn an_unresolvable_condition_falls_through_to_the_next_and_is_still_watched() {
+    let exports = |text: &str| format!(r#"{{"exports":{text}}}"#);
+    expect(
+        "g1",
+        chain_pkg("pkg", &exports(r#"{"node":"./missing.json","default":"./d.json"}"#), &[("d.json", "m:d")]),
+        Some("d"),
+    );
+    expect(
+        "n1",
+        chain_pkg("pkg", &exports(r#"{"node":null,"default":"./b.json"}"#), &[("b.json", "m:b")]),
+        Some("b"),
+    );
+    expect(
+        "n2",
+        chain_pkg(
+            "pkg",
+            &exports(r#"{".":[{"node":"./m1.json"},"./m2.json",{"default":"./d.json"}]}"#),
+            &[("d.json", "m:d")],
+        ),
+        Some("d"),
+    );
+    expect(
+        "n3",
+        chain_pkg(
+            "pkg",
+            &exports(r#"{"node":{"import":"./i.json"},"types":"./t.json"}"#),
+            &[("i.json", "m:i"), ("t.json", "m:t")],
+        ),
+        Some("t"),
+    );
+
+    let fx = marker_fixture(&[
+        (
+            "package.json",
+            r#"{"name":"me","exports":{"./b":{"require":"./missing.json","default":"./b.json"}}}"#,
+        ),
+        ("b.json", "m:b"),
+        ("tsconfig.json", r#"{"extends":"me/b"}"#),
+    ]);
+    let project = fx.load();
+    assert_eq!(inherited(&project, "").as_deref(), Some("b"), "g8");
+    for path in ["missing.json", "b.json"] {
+        assert!(project.watch_paths.contains(path), "g8: {path} in {:?}", project.watch_paths);
+    }
+}
+
+/// An `exports` string target: `.json` exact, `.ts`/`.d.ts`/`.js` read as
+/// `.json`, no extension or another one nothing.
+#[test]
+fn an_exports_string_target_is_read_as_json_only_through_the_source_extensions() {
+    let case = |target: &str, files: &[(&str, &str)]| {
+        chain_pkg("pkg", &format!(r#"{{"exports":"{target}"}}"#), files)
+    };
+    expect("g2", case("./base.js", &[("base.json", "m:j")]), Some("j"));
+    expect("g2b", case("./base.d.ts", &[("base.json", "m:j")]), Some("j"));
+    expect("g3", case("./e", &[("e", "m:exact"), ("e.json", "m:json")]), None);
+    expect("g2c", case("./base.yaml", &[("base.yaml", "m:y"), ("base.yaml.json", "m:yj")]), None);
+    expect("g2d", case("./base.mjs", &[("base.json", "m:j")]), None);
+}
+
+/// The longest matching wildcard key wins whatever its position, the key
+/// with `*` before a plain-prefix key of the same length, and a legacy
+/// trailing-slash key resolves; the first matching key decides even when it
+/// resolves to nothing.
+#[test]
+fn the_longest_exports_pattern_key_wins() {
+    let exports = |text: &str| format!(r#"{{"exports":{text}}}"#);
+    expect(
+        "d5",
+        chain_pkg(
+            "pkg/a/x.json",
+            &exports(r#"{"./*":"./short/*","./a/*":"./long/*"}"#),
+            &[("short/a/x.json", "m:short"), ("long/x.json", "m:long")],
+        ),
+        Some("long"),
+    );
+    let two = [("one/x.json", "m:one"), ("two/x.json", "m:two")];
+    expect(
+        "g6",
+        chain_pkg("pkg/a/x.json", &exports(r#"{"./a/*":"./one/*","./a/*.json":"./two/*.json"}"#), &two),
+        Some("two"),
+    );
+    expect(
+        "g6b",
+        chain_pkg("pkg/a/x.json", &exports(r#"{"./a/":"./one/","./a/*":"./two/*"}"#), &two),
+        Some("two"),
+    );
+    expect(
+        "g6c",
+        chain_pkg("pkg/a/x.json", &exports(r#"{"./a/*":"./missing/*","./a/x*":"./two/x*"}"#), &two),
+        Some("two"),
+    );
+    expect(
+        "h4",
+        chain_pkg("pkg/dir/a.json", &exports(r#"{"./dir/":"./x/"}"#), &[("x/a.json", "m:x")]),
+        Some("x"),
+    );
+}
+
+/// `exports` target checks: a target must start `./`, with no `.`, `..` or
+/// `node_modules` segment after it or in a capture; a legacy folder target
+/// must end `/`; a `.`-prefixed key beside a condition blocks it; empty,
+/// `false` and `null` exports count as absent.
+#[test]
+fn exports_targets_with_dot_segments_or_a_bad_shape_inherit_nothing() {
+    let exports = |text: &str| format!(r#"{{"exports":{text}}}"#);
+    let files = [("d.json", "m:d"), ("cfg/y.json", "m:y")];
+    expect("h1", chain_pkg("pkg", &exports(r#""./a/../d.json""#), &files), None);
+    expect(
+        "h2",
+        chain_pkg("pkg", &exports(r#""./node_modules/d.json""#), &[("node_modules/d.json", "m:d")]),
+        None,
+    );
+    expect("h3", chain_pkg("pkg/x/../y.json", &exports(r#"{"./x/*":"./cfg/*"}"#), &files), None);
+    expect("h5", chain_pkg("pkg/dir/a.json", &exports(r#"{"./dir/":"./x"}"#), &[("x/a.json", "m:x")]), None);
+    expect("h6", chain_pkg("pkg", &exports(r#""./.""#), &files), None);
+    expect("m1", chain_pkg("pkg", &exports(r#"{".foo":"./d.json","node":"./d.json"}"#), &files), None);
+    expect(
+        "m2",
+        chain_pkg("pkg", r#"{"exports":"","tsconfig":"./f.json"}"#, &[("f.json", "m:f")]),
+        Some("f"),
+    );
+    expect("m3", chain_pkg("pkg", r#"{"exports":false}"#, &[("tsconfig.json", "m:dflt")]), Some("dflt"));
+}
+
+/// `rest.json` before `rest/`, a nested package's own `tsconfig` field, a
+/// `.ts` or `.yaml` subpath read through `<rest>.json`, and an exact file
+/// without an extension that inherits nothing; the package `chart.js` finds
+/// `chart.json` before its directory.
+#[test]
+fn a_subpath_takes_rest_json_before_the_directory_and_never_the_exact_file() {
+    expect(
+        "c3",
+        chain(
+            "pkg/sub",
+            &[("node_modules/pkg/sub.json", "m:file"), ("node_modules/pkg/sub/tsconfig.json", "m:dir")],
+        ),
+        Some("file"),
+    );
+    expect(
+        "c16",
+        chain(
+            "pkg/sub",
+            &[
+                ("node_modules/pkg/sub/package.json", r#"{"tsconfig":"./cfg.json"}"#),
+                ("node_modules/pkg/sub/cfg.json", "m:field"),
+                ("node_modules/pkg/sub/tsconfig.json", "m:dflt"),
+            ],
+        ),
+        Some("field"),
+    );
+    expect("a5", chain("pkg/x", &[("node_modules/pkg/x", "m:exact")]), None);
+    expect(
+        "g5",
+        chain(
+            "pkg/base.ts",
+            &[("node_modules/pkg/base.json", "m:j"), ("node_modules/pkg/base.ts.json", "m:tj")],
+        ),
+        Some("j"),
+    );
+    expect("g5b", chain("pkg/base.json", &[("node_modules/pkg/base.json.json", "m:jj")]), Some("jj"));
+    expect("g5d", chain("pkg/base.yaml", &[("node_modules/pkg/base.yaml.json", "m:y")]), Some("y"));
+    expect(
+        "g5c",
+        chain(
+            "chart.js",
+            &[("node_modules/chart.json", "m:file"), ("node_modules/chart.js/tsconfig.json", "m:dir")],
+        ),
+        Some("file"),
+    );
+}
+
+/// The `tsconfig` field: exact only with a `.json` name, then `.json`
+/// appended or extension-replaced, then a directory; a trailing `/` means
+/// only the directory's `tsconfig.json`.
+#[test]
+fn the_tsconfig_field_follows_tscs_file_then_directory_order() {
+    let field = |text: &str| format!(r#"{{"tsconfig":"{text}"}}"#);
+    expect("g4", chain_pkg("pkg", &field("./base"), &[("base", "m:exact"), ("base.json", "m:j")]), Some("j"));
+    expect(
+        "g4b",
+        chain_pkg("pkg", &field("./base.ts"), &[("base.json", "m:j"), ("base.ts.json", "m:tj")]),
+        Some("j"),
+    );
+    expect("g4c", chain_pkg("pkg", &field("./base.json"), &[("base.json.json", "m:jj")]), Some("jj"));
+    expect("g4d", chain_pkg("pkg", &field("./base.yaml"), &[("base.yaml.json", "m:y")]), Some("y"));
+    expect(
+        "g4e",
+        chain_pkg("pkg", &field("./sub/"), &[("sub.json", "m:file"), ("sub/tsconfig.json", "m:dir")]),
+        Some("dir"),
+    );
+}
+
+/// A `types@<range>` condition is matched against 5.9.3 with tsc's own
+/// range grammar: each row is whether the range key beat `default`.
+#[test]
+fn a_types_range_key_is_tested_against_tsc_5_9_3() {
+    let rows: [(&str, bool); 25] = [
+        (">=4.0", true),
+        ("<4", false),
+        ("^5.9.4", false),
+        ("5.9.x", true),
+        ("", true),
+        ("4 - 6", true),
+        ("~5.8", false),
+        (">5.9.3-beta", true),
+        ("=5.9.3", true),
+        ("*", true),
+        (" >=5 <6", true),
+        ("1 || 5.9.3", true),
+        ("abc", false),
+        (">=5.10", false),
+        ("5", true),
+        ("<=5.9", true),
+        (">5.8", true),
+        ("5.9.3 - 5.9.3", true),
+        ("x - 5.8", false),
+        ("<5.9.3-0", false),
+        ("1 ||  || 5", false),
+        ("^0.0.1", false),
+        ("~5", true),
+        ("5.9.3+build", true),
+        (">=5.9.3-rc.1", true),
+    ];
+    let files = [("v.json", "m:v"), ("d.json", "m:d")];
+    for (range, picks) in rows {
+        let manifest =
+            format!(r#"{{"exports":{{".":{{"types@{range}":"./v.json","default":"./d.json"}}}}}}"#);
+        expect(
+            &format!("types@{range:?}"),
+            chain_pkg("pkg", &manifest, &files),
+            Some(if picks { "v" } else { "d" }),
+        );
+    }
+}
+
+/// `node_modules` is searched nearest first from the config's directory up,
+/// and a nearest directory that holds no config falls through to the next
+/// ancestor's.
+#[test]
+fn node_modules_is_searched_nearest_first_and_falls_through_a_miss() {
+    let near = ("a/b/node_modules/cfg/tsconfig.json", "m:near");
+    let mid = ("a/node_modules/cfg/tsconfig.json", "m:mid");
+    let top = ("node_modules/cfg/tsconfig.json", "m:top");
+    expect("c14 nearest", chain_at("a/b/c/tsconfig.json", "cfg", &[near, mid, top]), Some("near"));
+    expect("nearest missing", chain_at("a/b/c/tsconfig.json", "cfg", &[mid, top]), Some("mid"));
+    let empty_near = ("a/b/node_modules/cfg/readme.md", "x");
+    expect(
+        "e1 empty directory",
+        chain_at("a/b/c/tsconfig.json", "cfg", &[empty_near, mid, top]),
+        Some("mid"),
+    );
+    expect("e3 two levels", chain_at("a/b/c/tsconfig.json", "cfg", &[empty_near, top]), Some("top"));
+}
+
+/// `.hidden/x` is a package name: only `node_modules/.hidden/x.json`, never
+/// the local file.
+#[test]
+fn a_dot_leading_entry_is_a_package_name_not_a_local_path() {
+    expect(
+        "c7",
+        chain(".hidden/x", &[(".hidden/x.json", "m:local"), ("node_modules/.hidden/x.json", "m:nm")]),
+        Some("nm"),
+    );
+    expect("d6", chain(".hidden/x", &[(".hidden/x.json", "m:local")]), None);
+}
+
+/// `main`, `types` and `@types/<name>` never name a config.
+#[test]
+fn main_types_and_the_types_scope_are_ignored() {
+    expect(
+        "c9 a13",
+        chain_pkg(
+            "pkg",
+            r#"{"main":"./m.json","types":"./t.json"}"#,
+            &[("m.json", "m:main"), ("t.json", "m:types")],
+        ),
+        None,
+    );
+    expect("a14", chain("pkg", &[("node_modules/@types/pkg/tsconfig.json", "m:types")]), None);
+}
+
+/// A package's own name resolves through its `exports` (from any
+/// subdirectory), needs `exports`, is blocked by a nearer `package.json` of
+/// another name, wins over `node_modules/<name>`, and falls through to it on
+/// a miss.
+///
+/// Control: skip `self_name_target` - the self-name cases inherit nothing.
+#[test]
+fn a_packages_own_name_resolves_through_its_exports_only() {
+    let own = ("package.json", r#"{"name":"me","exports":{"./b":"./cfg/b.json"}}"#);
+    let target = ("cfg/b.json", "m:b");
+    expect("a11/f2", chain_at("sub/tsconfig.json", "me/b", &[own, target]), Some("b"));
+    expect("a11 root", chain("me/b", &[own, target]), Some("b"));
+    expect(
+        "f1",
+        chain("me", &[("package.json", r#"{"name":"me","tsconfig":"./b.json"}"#), ("b.json", "m:b")]),
+        None,
+    );
+    expect(
+        "f3",
+        chain_at("sub/tsconfig.json", "me/b", &[own, target, ("sub/package.json", r#"{"name":"other"}"#)]),
+        None,
+    );
+    let hoisted = ("node_modules/me/b.json", "m:nm");
+    expect("f4", chain("me/b", &[own, target, hoisted]), Some("b"));
+    expect(
+        "f5",
+        chain("me/b", &[("package.json", r#"{"name":"me","exports":{"./c":"./c.json"}}"#), target, hoisted]),
+        Some("nm"),
+    );
+}
+
+/// Self-name runs `exports` in two passes: a first pass ignoring `.json`
+/// targets, so a `.ts` default beats an earlier `.json` condition.
+#[test]
+fn a_self_name_export_prefers_a_source_extension_target_over_a_json_one() {
+    let manifest =
+        ("package.json", r#"{"name":"me","exports":{".":{"require":"./b.json","default":"./c.ts"}}}"#);
+    expect("g9", chain("me", &[manifest, ("b.json", "m:b"), ("c.json", "m:c")]), Some("c"));
+    let fx = marker_fixture(&[manifest, ("b.json", "m:b"), ("tsconfig.json", r#"{"extends":"me"}"#)]);
+    let project = fx.load();
+    assert_eq!(inherited(&project, "").as_deref(), Some("b"), "g9b");
+    for path in ["c.json", "b.json"] {
+        assert!(project.watch_paths.contains(path), "g9b: {path} in {:?}", project.watch_paths);
+    }
+}
+
+/// An absolute entry inside the project is read exact first, then with
+/// `.json`; one outside inherits nothing and is a note.
+///
+/// Control: drop absolute entries in `resolve_extends` - both inside cases
+/// inherit nothing.
+#[test]
+fn an_absolute_extends_inside_the_project_is_followed_and_one_outside_is_a_note() {
+    let root = |fx: &Fixture| fx.root.to_string_lossy().replace('\\', "/");
+    let fx = marker_fixture(&[("base", "m:exact"), ("base.json", "m:json")]);
+    fx.write("tsconfig.json", &extends_config(&format!("{}/base", root(&fx))));
+    expect("a15", inherited(&fx.load(), ""), Some("exact"));
+
+    let fx = marker_fixture(&[("base.json", "m:json")]);
+    fx.write("tsconfig.json", &extends_config(&format!("{}/base", root(&fx))));
+    expect("f7", inherited(&fx.load(), ""), Some("json"));
+
+    let fx = marker_fixture(&[("base.json", "m:json")]);
+    fx.write("tsconfig.json", &extends_config("/gm670-nowhere/base.json"));
+    let project = fx.load();
+    expect("A2", inherited(&project, ""), None);
+    assert!(has_note(&project, &["tsconfig.json", "outside the project"]), "{:?}", project.notes);
+}
+
+/// `"../"` from `a/sub` names `a.json` before `a/tsconfig.json`, the
+/// `<parent>.json` form, even when the directory's own config exists.
+#[test]
+fn a_trailing_slash_extends_names_the_sibling_json_before_the_directory() {
+    let files = [("a.json", "m:sibling"), ("a/tsconfig.json", "m:dir")];
+    expect("c18", chain_at("a/sub/tsconfig.json", "../", &files), Some("sibling"));
+    expect("c18 dotdot", chain_at("a/sub/tsconfig.json", "..", &files), Some("dir"));
+}
+
+/// `@tsconfig\node18\tsconfig.json` resolves like its `/` form.
+#[test]
+fn a_backslashed_package_entry_resolves_like_the_slash_form() {
+    let files = [("node_modules/@tsconfig/node18/tsconfig.json", "m:n18")];
+    expect("backslash", chain("@tsconfig\\node18\\tsconfig.json", &files), Some("n18"));
+    expect("slash", chain("@tsconfig/node18/tsconfig.json", &files), Some("n18"));
+}
+
+/// The watch paths a load declares: every probed candidate, found or not;
+/// only the exact file once it exists; the `.json` form of a source-extension
+/// entry and nothing with a source extension; nothing under `node_modules` or
+/// an excluded directory.
+///
+/// Control: record only the candidate that was found in `probe` - the
+/// missing-candidate case has no `base` or `base.json`.
+#[test]
+fn the_declared_watch_paths_hold_the_probed_candidates_and_nothing_excluded() {
+    let paths = |files: &[(&str, &str)], entry: &str| {
+        let fx = marker_fixture(files);
+        fx.write("tsconfig.json", &extends_config(entry));
+        fx.load().watch_paths.into_iter().collect::<Vec<_>>()
+    };
+    assert_eq!(paths(&[], "./base"), strings(&["base", "base.json"]), "both missing candidates");
+    let found = paths(&[("base", "m:exact"), ("base.json", "m:json")], "./base");
+    assert_eq!(found, strings(&["base"]), "the exact file is found first, so base.json is not probed");
+    let source = paths(&[], "./x.ts");
+    assert_eq!(source, strings(&["x.ts.json"]), "no path with a source extension");
+    let under = paths(&[("node_modules/pkg/tsconfig.json", "m:p")], "pkg");
+    assert!(
+        under.iter().all(|path| !path.starts_with("node_modules/")),
+        "nothing under node_modules: {under:?}"
+    );
+    let excluded = paths(&[], "./dist/base.json");
+    assert!(excluded.is_empty(), "nothing under an excluded directory: {excluded:?}");
+    assert_eq!(paths(&[("cfg/base.json", "m:b")], "./cfg/base.json"), strings(&["cfg/base.json"]));
+}
+
+/// A target found through a symlink is also declared by its real path (the
+/// save lands there), and a missing candidate behind a symlinked directory
+/// by both spellings.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_target_is_declared_by_its_real_path_too() {
+    let fx = marker_fixture(&[
+        ("packages/cfg/base.json", "m:base"),
+        ("packages/cfg/package.json", r#"{"exports":{"./base":["./missing.json","./base.json"]}}"#),
+        ("shared/configs/keep", "x"),
+        ("tsconfig.json", r#"{"extends":"cfg/base"}"#),
+    ]);
+    fs::create_dir_all(fx.root.join("node_modules")).unwrap();
+    std::os::unix::fs::symlink("../packages/cfg", fx.root.join("node_modules/cfg")).unwrap();
+    let project = fx.load();
+    assert_eq!(inherited(&project, "").as_deref(), Some("base"), "a10 / s2");
+    for path in ["packages/cfg/missing.json", "packages/cfg/base.json", "packages/cfg/package.json"] {
+        assert!(project.watch_paths.contains(path), "{path} in {:?}", project.watch_paths);
+    }
+
+    let fx = marker_fixture(&[
+        ("shared/configs/keep", "x"),
+        ("tsconfig.json", r#"{"extends":"./configs/base.json"}"#),
+    ]);
+    std::os::unix::fs::symlink("shared/configs", fx.root.join("configs")).unwrap();
+    let project = fx.load();
+    for path in ["configs/base.json", "shared/configs/base.json"] {
+        assert!(project.watch_paths.contains(path), "s1: {path} in {:?}", project.watch_paths);
+    }
+}
+
 /// The expansion itself, before `RelPath` (which also turns `\\` into `/`)
 /// could hide a target that was never normalised.
 #[test]

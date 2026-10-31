@@ -18,19 +18,25 @@ use std::sync::{Mutex, OnceLock};
 /// `path`'s key under `project_root`: lowercased when the project's volume
 /// is case-insensitive, unchanged otherwise.
 pub(crate) fn key(project_root: &Path, path: &str) -> String {
-    if folds_case(project_root) {
+    fold_key(folds_case(project_root), path)
+}
+
+/// [`key`] of each of `paths`, sorted and deduplicated (two spellings of one
+/// file on a case-insensitive volume are one key).
+pub(crate) fn keys(project_root: &Path, paths: &[String]) -> Vec<String> {
+    fold_keys(folds_case(project_root), paths)
+}
+
+fn fold_key(fold: bool, path: &str) -> String {
+    if fold {
         path.to_lowercase()
     } else {
         path.to_string()
     }
 }
 
-/// [`key`] of each of `paths`, sorted and deduplicated (two spellings of one
-/// file on a case-insensitive volume are one key).
-pub(crate) fn keys(project_root: &Path, paths: &[String]) -> Vec<String> {
-    let fold = folds_case(project_root);
-    let mut keys: Vec<String> =
-        paths.iter().map(|path| if fold { path.to_lowercase() } else { path.clone() }).collect();
+fn fold_keys(fold: bool, paths: &[String]) -> Vec<String> {
+    let mut keys: Vec<String> = paths.iter().map(|path| fold_key(fold, path)).collect();
     keys.sort();
     keys.dedup();
     keys
@@ -99,3 +105,6 @@ fn same_file(a: &Path, b: &Path) -> bool {
 fn same_file(a: &Path, b: &Path) -> bool {
     fs::symlink_metadata(a).is_ok() && fs::symlink_metadata(b).is_ok()
 }
+
+#[cfg(test)]
+mod tests;

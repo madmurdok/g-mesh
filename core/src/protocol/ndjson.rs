@@ -216,4 +216,21 @@ mod tests {
         );
         assert!(items[2].is_err(), "an unknown key is not a trailer");
     }
+
+    /// A trailer's `watchPaths` ride beside the facts, in order; absent they
+    /// are empty, and a wrong type is a malformed line.
+    #[test]
+    fn a_resolution_facts_trailer_carries_its_watch_paths() {
+        let stream = "{\"resolutionFacts\":\"f\",\"watchPaths\":[\"cfg/b.json\",\"a.json\"]}\n\
+                      {\"resolutionFacts\":\"g\",\"watchPaths\":[]}\n\
+                      {\"resolutionFacts\":\"h\",\"watchPaths\":\"x\"}\n";
+        let items: Vec<_> = NdjsonReader::new(Cursor::new(stream.as_bytes().to_vec())).collect();
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[0], Ok(BulkItem::ResolutionFacts { facts, watch_paths })
+                if facts == "f" && watch_paths == &["cfg/b.json", "a.json"]));
+        assert!(
+            matches!(&items[1], Ok(BulkItem::ResolutionFacts { facts, watch_paths }) if facts == "g" && watch_paths.is_empty())
+        );
+        assert!(items[2].is_err(), "watchPaths must be a list of strings");
+    }
 }

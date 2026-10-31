@@ -11,6 +11,15 @@
 //! the second one. The manifest is the shipped one with `semantic_pass`
 //! off, so no language server is involved.
 //!
+//! A save of a file in a config's `extends` chain reloads the model too
+//! (GM-670): the plugin declares the chain's files with its facts, core
+//! stores them and routes their saves. Controls: `route_settled_path` asks
+//! only the static matcher (W1 and the rest drop the chain file); the SDK's
+//! `resolution_changed` answers no `watch_paths` (W2: a chain changed by an
+//! edit goes unwatched); `set_resolution_facts` appends instead of replacing
+//! (W4: `a.json` stays stored); the TS reader records only found candidates
+//! (W3: the missing `base.json` is not stored).
+//!
 //! Controls: `resolution_delta = false` in the manifest (each save
 //! reindexes: every file shows `mark_v2`); drop the trailer write in the
 //! SDK's `bulk_index` (no facts are stored: every save reindexes).
@@ -169,4 +178,208 @@ fn a_whole_language_paths_reindex_moves_an_unchanged_importers_edge() {
         vec![(false, moved.clone()), (true, moved)],
         "the unchanged importer resolves through the edited alias"
     );
+}
+
+// --- GM-670: the files of an `extends` chain ------------------------------------
+
+fn alias_to(dir: &str) -> String {
+    format!(r#"{{"compilerOptions":{{"baseUrl":".","paths":{{"@app/*":["src/{dir}/*"]}}}}}}"#)
+}
+
+fn extends(entry: &str) -> String {
+    format!(r#"{{"extends":"{entry}"}}"#)
+}
+
+fn stored_watch_paths(harness: &Harness) -> Vec<String> {
+    harness.conn.with(|c| g_mesh::storage::schema::watch_paths(c, "typescript")).unwrap()
+}
+
+/// Writes `configs` and `extra` beside the usual files, saves the root
+/// `tsconfig.json` once so the index is built with its facts and watch paths,
+/// then rewrites every `.ts` file to `mark_v2` (unrouted).
+fn chained(harness: Harness, configs: &[(&str, &str)], extra: &[(&str, &str)]) -> Harness {
+    harness.write("package.json", PACKAGE_JSON);
+    harness.write("deep/tsconfig.json", r#"{"compilerOptions":{"baseUrl":".","paths":{"@deep/*":["x/*"]}}}"#);
+    for (path, contents) in configs {
+        harness.write(path, contents);
+    }
+    let files: Vec<(&str, &str)> = FILES.iter().chain(extra).copied().collect();
+    for (path, import) in &files {
+        harness.write(path, &source(import, "mark_v1"));
+    }
+    harness.route("tsconfig.json");
+    assert_eq!(marked("mark_v1", &harness).len(), files.len(), "the first save indexed every file");
+    for (path, import) in &files {
+        harness.write(path, &source(import, "mark_v2"));
+    }
+    harness
+}
+
+fn only_a_re_extracted(harness: &Harness) {
+    assert_eq!(marked("mark_v2", harness), vec!["src/a.ts".to_string()], "only src/a.ts was re-extracted");
+}
+
+const APP_X: &str = "src/app/x.ts:x.ts";
+const APP2_X: &str = "src/app2/x.ts:x.ts";
+
+/// W1: the child extends `./base.json`; an edit of the base's `paths`
+/// re-points the alias importer and re-extracts only it.
+///
+/// Control (C1): `route_settled_path` uses the static matcher only - the
+/// save of `base.json` is dropped and nothing moves.
+#[test]
+fn a_base_config_edit_re_points_the_alias_importer() {
+    let harness = chained(
+        harness(),
+        &[("tsconfig.json", &extends("./base.json")), ("base.json", &alias_to("app"))],
+        &[],
+    );
+    assert_eq!(harness.imports("src/a.ts").0, vec![APP_X.to_string()]);
+    assert!(stored_watch_paths(&harness).contains(&"base.json".to_string()));
+
+    harness.write("base.json", &alias_to("app2"));
+    harness.route("base.json");
+
+    only_a_re_extracted(&harness);
+    assert_eq!(harness.imports("src/a.ts"), (vec![APP2_X.to_string()], Vec::new()));
+}
+
+/// W2: the chain child -> `a.json` -> `b.json` is built by an edit (the bulk
+/// walk stored child -> `a.json` only), then `b.json` is edited. The first
+/// edit changes nothing resolvable; the second must still reach the model.
+///
+/// Control (C4): the SDK's `resolution_changed` answers no `watch_paths` -
+/// `b.json` is never stored and its edit is dropped.
+#[test]
+fn a_chain_grown_by_an_edit_is_watched_to_its_end() {
+    let harness = chained(
+        harness(),
+        &[
+            ("tsconfig.json", &extends("./a.json")),
+            ("a.json", &alias_to("app")),
+            ("b.json", &alias_to("app")),
+        ],
+        &[],
+    );
+    harness.write("a.json", &extends("./b.json"));
+    harness.route("a.json");
+    assert_eq!(marked("mark_v2", &harness), Vec::<String>::new(), "the effective paths did not move");
+    assert!(
+        stored_watch_paths(&harness).contains(&"b.json".to_string()),
+        "{:?}",
+        stored_watch_paths(&harness)
+    );
+
+    harness.write("b.json", &alias_to("app2"));
+    harness.route("b.json");
+
+    only_a_re_extracted(&harness);
+    assert_eq!(harness.imports("src/a.ts"), (vec![APP2_X.to_string()], Vec::new()));
+}
+
+/// W3: `./base.json` is missing when the model loads, then created: the
+/// child inherits it.
+///
+/// Control (C5): the TS reader records only found candidates - `base.json`
+/// is not stored and its creation is dropped.
+#[test]
+fn a_missing_base_config_that_is_created_later_is_inherited() {
+    let harness = chained(harness(), &[("tsconfig.json", &extends("./base.json"))], &[]);
+    assert!(
+        stored_watch_paths(&harness).contains(&"base.json".to_string()),
+        "the missing target is declared"
+    );
+    assert!(harness.imports("src/a.ts").0.is_empty(), "no alias yet");
+
+    harness.write("base.json", &alias_to("app"));
+    harness.route("base.json");
+
+    only_a_re_extracted(&harness);
+    assert_eq!(harness.imports("src/a.ts"), (vec![APP_X.to_string()], Vec::new()));
+}
+
+/// W4: the child switches its `extends` from `./a.json` to `./b.json`: it
+/// inherits `b.json` at once, and `a.json` is no longer a stored watch path.
+///
+/// Control (C2): `set_resolution_facts` appends instead of replacing -
+/// `a.json` stays stored.
+#[test]
+fn a_chain_file_that_left_the_chain_is_no_longer_stored() {
+    let harness = chained(
+        harness(),
+        &[
+            ("tsconfig.json", &extends("./a.json")),
+            ("a.json", &alias_to("app")),
+            ("b.json", &alias_to("app2")),
+        ],
+        &[],
+    );
+    assert_eq!(stored_watch_paths(&harness), vec!["a.json".to_string()]);
+
+    harness.write("tsconfig.json", &extends("./b.json"));
+    harness.route("tsconfig.json");
+    only_a_re_extracted(&harness);
+    assert_eq!(harness.imports("src/a.ts"), (vec![APP2_X.to_string()], Vec::new()));
+    assert_eq!(stored_watch_paths(&harness), vec!["b.json".to_string()], "a.json left the chain");
+
+    harness.write("a.json", &alias_to("n1"));
+    harness.route("a.json");
+    assert_eq!(stored_watch_paths(&harness), vec!["b.json".to_string()]);
+}
+
+/// W5: `extends: "./base"` names an exact file with no `.json`; editing it
+/// re-points.
+#[test]
+fn an_exact_non_json_base_is_watched_by_its_exact_path() {
+    let harness =
+        chained(harness(), &[("tsconfig.json", &extends("./base")), ("base", &alias_to("app"))], &[]);
+    assert_eq!(harness.imports("src/a.ts").0, vec![APP_X.to_string()]);
+
+    harness.write("base", &alias_to("app2"));
+    harness.route("base");
+
+    only_a_re_extracted(&harness);
+    assert_eq!(harness.imports("src/a.ts"), (vec![APP2_X.to_string()], Vec::new()));
+}
+
+/// W6: an absolute `extends` inside the project root; editing its target
+/// re-points.
+///
+/// Control (C9): absolute entries are dropped - the alias never resolves.
+#[test]
+fn an_absolute_extends_inside_the_root_is_followed_and_watched() {
+    let harness = harness();
+    let absolute = format!("{}/cfg/base.json", harness.root().display());
+    let base = |dir: &str| {
+        format!(r#"{{"compilerOptions":{{"baseUrl":"..","paths":{{"@app/*":["src/{dir}/*"]}}}}}}"#)
+    };
+    let harness =
+        chained(harness, &[("tsconfig.json", &extends(&absolute)), ("cfg/base.json", &base("app"))], &[]);
+    assert_eq!(harness.imports("src/a.ts").0, vec![APP_X.to_string()]);
+
+    harness.write("cfg/base.json", &base("app2"));
+    harness.route("cfg/base.json");
+
+    only_a_re_extracted(&harness);
+    assert_eq!(harness.imports("src/a.ts"), (vec![APP2_X.to_string()], Vec::new()));
+}
+
+/// W7: `@/x` waits (its alias points at a directory with no `x`); a base
+/// edit maps `@/*` to `lib/*`, where `lib/x.ts` exists, and the import links.
+#[test]
+fn a_base_edit_links_a_waiting_alias_import() {
+    let alias =
+        |dir: &str| format!(r#"{{"compilerOptions":{{"baseUrl":".","paths":{{"@/*":["{dir}/*"]}}}}}}"#);
+    let harness = chained(
+        harness(),
+        &[("tsconfig.json", &extends("./base.json")), ("base.json", &alias("missing"))],
+        &[("lib/x.ts", ""), ("src/w.ts", "import { thing } from \"@/x\";\n")],
+    );
+    assert!(harness.imports("src/w.ts").0.is_empty(), "@/x waits");
+
+    harness.write("base.json", &alias("lib"));
+    harness.route("base.json");
+
+    assert_eq!(marked("mark_v2", &harness), vec!["src/w.ts".to_string()], "only the waiting importer");
+    assert_eq!(harness.imports("src/w.ts"), (vec!["lib/x.ts:x.ts".to_string()], Vec::new()));
 }

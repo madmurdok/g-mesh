@@ -935,6 +935,154 @@ fn file_changed_does_not_route_a_path_under_its_own_languages_exclude_dirs() {
 }
 
 // ---------------------------------------------------------------------
+// Watch paths a plugin declared with its resolution facts
+// ---------------------------------------------------------------------
+
+fn store_watch_paths(conn: &crate::storage::index_store::IndexStore, language: &str, paths: &[&str]) {
+    let paths: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
+    conn.with(|conn| schema::set_resolution_facts(conn, language, Some("facts"), &paths))
+        .expect("failed to store the watch paths");
+}
+
+/// A stored chain file routes its save to the declaring language's
+/// workspace reindex; a `.json` file nobody declared reaches no plugin.
+///
+/// Control: `route_settled_path` asks `workspace_language_matches` instead
+/// of `watch_languages` - the stored path spawns nothing.
+#[test]
+fn a_stored_watch_path_routes_its_save_to_the_declaring_language() {
+    let (_project, _plugins, dir, registry) =
+        registry_over_workspace("alpha", ".alpha-src", &["go.mod"], &[]);
+    let conn = test_plugin::empty_index();
+    store_watch_paths(&conn, "alpha", &["cfg/base.json"]);
+
+    registry.route_settled_path(&conn, "cfg/other.json".to_string());
+    assert!(test_plugin::spawns(&dir).is_empty(), "an undeclared .json file is dropped");
+
+    registry.route_settled_path(&conn, "cfg/base.json".to_string());
+    assert_eq!(test_plugin::spawns(&dir).len(), 1, "the declared chain file reaches the plugin");
+}
+
+/// `watch_languages` is the static matches plus the stored rows, minus a
+/// stored row under the language's `exclude_dirs`, with its own extension,
+/// of a failed language, or of a language no manifest was discovered for;
+/// sorted, each language once.
+#[test]
+fn watch_languages_adds_stored_rows_through_the_same_filters_as_static_matches() {
+    let (_project, _plugins, _dir, registry) =
+        registry_over_workspace("alpha", ".alpha-src", &["go.mod"], &["vendor"]);
+    let conn = test_plugin::empty_index();
+    store_watch_paths(&conn, "alpha", &["cfg/base.json", "go.mod", "vendor/base.json", "src/own.alpha-src"]);
+    store_watch_paths(&conn, "ghost", &["cfg/base.json", "ghost.json"]);
+
+    assert_eq!(registry.watch_languages(&conn, "cfg/base.json"), vec!["alpha".to_string()]);
+    assert_eq!(
+        registry.watch_languages(&conn, "go.mod"),
+        vec!["alpha".to_string()],
+        "static and stored: once"
+    );
+    assert!(registry.watch_languages(&conn, "vendor/base.json").is_empty(), "under exclude_dirs");
+    assert!(registry.watch_languages(&conn, "src/own.alpha-src").is_empty(), "the language's own extension");
+    assert!(registry.watch_languages(&conn, "ghost.json").is_empty(), "no manifest for the language");
+    assert!(registry.watch_languages(&conn, "cfg/unknown.json").is_empty());
+
+    registry.set_failed_languages(["alpha".to_string()]);
+    assert!(registry.watch_languages(&conn, "cfg/base.json").is_empty(), "a failed language");
+}
+
+/// Two languages declaring one path are both returned, sorted.
+#[test]
+fn watch_languages_returns_every_language_that_declared_the_path() {
+    let project = tempfile::tempdir().unwrap();
+    let plugins = tempfile::tempdir().unwrap();
+    for language in ["beta", "alpha"] {
+        let extension = format!(".{language}-src");
+        test_plugin::install_with_workspace(plugins.path(), language, &[extension.as_str()], &[], &[]);
+    }
+    let discovered = discover(&[plugins.path().to_path_buf()]).unwrap();
+    let state_dir = crate::storage::connection::project_dir(project.path()).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let registry = PluginRegistry::new(
+        project.path(),
+        state_dir,
+        discovered,
+        None,
+        None,
+        Arc::new(EmbeddingPipeline::disabled()),
+    );
+    let conn = test_plugin::empty_index();
+    store_watch_paths(&conn, "beta", &["cfg/base.json"]);
+    store_watch_paths(&conn, "alpha", &["cfg/base.json"]);
+
+    assert_eq!(
+        registry.watch_languages(&conn, "cfg/base.json"),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+}
+
+/// A path stored under its key matches the save spelled the same way on
+/// either kind of volume, and a save spelled in another case matches only
+/// where the volume folds case.
+#[test]
+fn a_stored_watch_path_matches_a_save_by_the_volumes_case_rules() {
+    let (project, _plugins, _dir, registry) =
+        registry_over_workspace("alpha", ".alpha-src", &["go.mod"], &[]);
+    let conn = test_plugin::empty_index();
+    let stored = crate::daemon::path_case::key(project.path(), "Cfg/Base.json");
+    store_watch_paths(&conn, "alpha", &[&stored]);
+
+    assert_eq!(registry.watch_languages(&conn, "Cfg/Base.json"), vec!["alpha".to_string()]);
+    let folds = crate::daemon::path_case::folds_case(project.path());
+    assert_eq!(
+        registry.watch_languages(&conn, "cfg/base.json"),
+        if folds { vec!["alpha".to_string()] } else { Vec::new() },
+        "a different case matches only on a case-insensitive volume (folds: {folds})"
+    );
+}
+
+/// A seeded start compares a declared chain file with the seed source's
+/// copy like a static watch file: identical bytes trigger nothing, a
+/// differing one reindexes the declaring language; a file nobody declared
+/// is not compared at all.
+///
+/// Control: the closure of `reconcile_watch_files_with_seed` filters by
+/// `workspace_language_matches` instead of `watch_languages` - the
+/// differing chain file spawns nothing.
+#[test]
+fn a_seeded_start_compares_a_declared_chain_file_with_the_sources() {
+    let (project, _plugins, dir, registry) = registry_over_workspace("alpha", ".alpha-src", &["go.mod"], &[]);
+    let source = tempfile::tempdir().unwrap();
+    let conn = test_plugin::empty_index();
+    store_watch_paths(&conn, "alpha", &["cfg/base.json"]);
+    let source_root = source.path().to_str().unwrap().to_string();
+    conn.with(|conn| {
+        conn.execute(
+            "INSERT INTO meta (id, schema_version, indexer_version, lastUsed, bulkIndexedAt) \
+             VALUES (1, 'x', 'x', 'x', CURRENT_TIMESTAMP)",
+            [],
+        )?;
+        schema::record_seed_origin(conn, &source_root)
+    })
+    .unwrap();
+    for root in [project.path(), source.path()] {
+        std::fs::create_dir_all(root.join("cfg")).unwrap();
+        std::fs::write(root.join("cfg/base.json"), "{\"same\":1}").unwrap();
+        std::fs::write(root.join("cfg/other.json"), "{}").unwrap();
+    }
+    std::fs::write(project.path().join("cfg/other.json"), "{\"differs\":1}").unwrap();
+
+    registry.reconcile_watch_files_with_seed(&conn);
+    assert!(
+        test_plugin::spawns(&dir).is_empty(),
+        "identical chain file, and an undeclared one is not compared"
+    );
+
+    std::fs::write(project.path().join("cfg/base.json"), "{\"edited\":1}").unwrap();
+    registry.reconcile_watch_files_with_seed(&conn);
+    assert_eq!(test_plugin::spawns(&dir).len(), 1, "the differing chain file reindexes its language");
+}
+
+// ---------------------------------------------------------------------
 // A language the bulk walk failed is not routed (ADR 0021, section 2)
 // ---------------------------------------------------------------------
 

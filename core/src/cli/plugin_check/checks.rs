@@ -1353,6 +1353,53 @@ mod tests {
         assert!(shape.warnings.is_empty(), "{:?}", shape.warnings);
     }
 
+    /// `watchPaths` entries break the contract when they are not forward-slash,
+    /// project-relative, normalized, outside `exclude_dirs` and free of the
+    /// manifest's own extensions; each finding names the entry.
+    #[test]
+    fn a_watch_path_that_breaks_the_contract_is_named() {
+        let mut manifest = manifest(false);
+        manifest.workspace.exclude_dirs = vec!["node_modules".to_string()];
+        for path in ["cfg/base.json", "base", "a/b.d.json", ".hidden/base.json"] {
+            assert_eq!(watch_path_violation(&manifest, path), None, "{path}");
+        }
+        for (path, why) in [
+            ("../x.json", "normalized"),
+            ("a/../x.json", "normalized"),
+            ("a//b.json", "normalized"),
+            ("./x.json", "normalized"),
+            ("", "normalized"),
+            ("/abs.json", "project-relative"),
+            ("C:/abs.json", "project-relative"),
+            ("a\\b.json", "backslash"),
+            ("node_modules/x.json", "exclude_dirs"),
+            ("pkg/node_modules/x.json", "exclude_dirs"),
+            ("src/x.fk", "extensions"),
+            ("src/X.FK", "extensions"),
+        ] {
+            let message = watch_path_violation(&manifest, path).unwrap_or_else(|| panic!("{path:?} passed"));
+            assert!(message.contains(&format!("{path:?}")) && message.contains(why), "{path:?}: {message}");
+        }
+    }
+
+    /// The `shape` check fails a bulk trailer's bad `watchPaths` entry, naming
+    /// it, and passes a good one.
+    #[test]
+    fn shape_judges_the_bulk_trailers_watch_paths() {
+        let shape_of = |trailer: &str| {
+            let mut lines = conformant_lines();
+            lines.push(trailer.to_string());
+            outcome_of(&evaluate_bulk(lines), "shape")
+        };
+        assert_eq!(shape_of(r#"{"resolutionFacts":"f","watchPaths":["cfg/base.json"]}"#), Outcome::Pass);
+        let Outcome::Fail(findings) = shape_of(r#"{"resolutionFacts":"f","watchPaths":["../x.json"]}"#)
+        else {
+            panic!("a path outside the workspace must fail shape")
+        };
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("../x.json") && findings[0].contains("bulk run 1"), "{findings:?}");
+    }
+
     /// `id-stability.declaration-edit-applies` over hand-built snapshots: the
     /// index after the edit against bulk run 3's, for the nodes the control
     /// path delivered (`a` and `f` here). A stale range and a delivered node

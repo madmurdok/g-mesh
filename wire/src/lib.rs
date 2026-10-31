@@ -1836,6 +1836,23 @@ mod tests {
         assert_eq!(terse, ResolutionDelta::Affected { files: vec![], imports: vec![] });
     }
 
+    /// `watchPaths` round-trips in order; empty is neither written nor
+    /// required.
+    #[test]
+    fn watch_paths_round_trip_and_an_empty_set_is_left_out() {
+        let json = r#"{"delta":{"kind":"unchanged"},"facts":"f","watchPaths":["cfg/b.json","a.json"]}"#;
+        let read: ResolutionChangedResult = serde_json::from_str(json).unwrap();
+        assert_eq!(read.watch_paths, vec!["cfg/b.json".to_string(), "a.json".to_string()]);
+        assert_eq!(serde_json::to_string(&read).unwrap(), json);
+
+        let without: ResolutionChangedResult =
+            serde_json::from_str(r#"{"delta":{"kind":"unchanged"},"facts":"f"}"#).unwrap();
+        assert!(without.watch_paths.is_empty());
+        let written =
+            serde_json::to_string(&ResolutionChangedResult { watch_paths: Vec::new(), ..read }).unwrap();
+        assert!(!written.contains("watchPaths"), "{written}");
+    }
+
     /// The full response frame reads with its id.
     #[test]
     fn a_resolution_changed_response_reads_with_its_id() {
