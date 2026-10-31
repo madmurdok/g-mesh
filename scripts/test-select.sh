@@ -7,12 +7,12 @@
 #   scripts/test-select.sh [--narrow] --paths-from <file>  paths listed in <file>, one per line
 #
 # `--narrow` (scripts/test-local.sh only, never CI) narrows the leaf-module
-# rows below; CI calls without it and keeps every core section for any core
-# change.
+# and plugin rows below; CI calls without it and keeps every core section for
+# any core or plugin change.
 #
 # Prints exactly one line: `full`, `none`, or section names in run order,
-# space-separated. The output is valid arguments for
-# `scripts/test-sections.sh run`. With `--go` it prints `1` if the diff needs
+# space-separated, then any `core-spawns-<plugin>` selectors. The output is
+# valid arguments for `scripts/test-sections.sh run`. With `--go` it prints `1` if the diff needs
 # the Go plugin's own tests (plugins/go/), `0` otherwise.
 #
 # With git, the changed paths are `git diff <base>...HEAD` plus uncommitted and
@@ -27,7 +27,12 @@
 #   one under `core/src/cli/` or `core/src/mcp/` selects that module's lib
 #   section and `core-it`.
 # - A plugin change selects that plugin's section and every core section, never
-#   another plugin's section.
+#   another plugin's section. With `--narrow` only, a change under
+#   plugins/<p>/ other than its plugin.toml or Cargo.toml (which core tests
+#   read) selects `plugin-<p>` and `core-spawns-<p>` instead of every core
+#   section: the core tests scripts/test-plugin-spawns.txt says start <p>.
+# - A `core-spawns-<p>` selector is printed only while some core section is
+#   missing from the selection; it is a subset of the core sections.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -142,6 +147,7 @@ classify() {
 	wire/* | plugins/sdk/*) full=1 ;;
 	Cargo.toml | Cargo.lock | .cargo/* | .config/nextest.toml | rust-toolchain*) full=1 ;;
 	.github/workflows/* | scripts/test-sections.sh | scripts/test-sections-check.py | scripts/test-select.sh) full=1 ;;
+	scripts/test-plugin-spawns.txt) full=1 ;;
 	scripts/test-local.sh | scripts/test-heavy-report.py) full=1 ;;
 	.gitattributes) full=1 ;;
 	# Leaf modules, local runs only: their lib tests and the integration tests,
@@ -151,11 +157,18 @@ classify() {
 	core/*) add "${CORE[@]}" ;;
 	plugins/python/* | plugins/rust/* | plugins/typescript/*)
 		local plugin="${1#plugins/}"
-		add "plugin-${plugin%%/*}" "${CORE[@]}"
+		plugin="${plugin%%/*}"
+		case "$narrow:$1" in
+		1:plugins/*/plugin.toml | 1:plugins/*/Cargo.toml | :*) add "plugin-$plugin" "${CORE[@]}" ;;
+		*) add "plugin-$plugin" "core-spawns-$plugin" ;;
+		esac
 		;;
 	plugins/go/*)
 		go=1
-		add "${CORE[@]}"
+		case "$narrow:$1" in
+		1:plugins/go/plugin.toml | :*) add "${CORE[@]}" ;;
+		*) add core-spawns-go ;;
+		esac
 		;;
 	README.md) add core-cli ;;
 	scripts/*) add core-it core-cli ;;
@@ -189,5 +202,14 @@ else
 	for s in "${SECTIONS[@]}"; do
 		case "$selected" in *" $s "*) out+=("$s") ;; esac
 	done
+	all_core=1
+	for s in "${CORE[@]}"; do
+		case "$selected" in *" $s "*) ;; *) all_core=0 ;; esac
+	done
+	if [ "$all_core" -eq 0 ]; then
+		for s in core-spawns-typescript core-spawns-rust core-spawns-python core-spawns-go; do
+			case "$selected" in *" $s "*) out+=("$s") ;; esac
+		done
+	fi
 	echo "${out[*]}"
 fi

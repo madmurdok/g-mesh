@@ -81,8 +81,10 @@ The suite runs as named sections (`scripts/test-sections.sh`,
 - **CI** is unchanged: `scripts/test-sections.sh run` per section under
   `--profile ci`.
 
-`test-select.sh` prints `full`, `none` or section names, and counts
-uncommitted and untracked files too. Any path it has no rule for selects
+`test-select.sh` prints `full`, `none` or section names (with `--narrow`,
+also `core-spawns-<plugin>`: the core tests that start that plugin, from
+`scripts/test-plugin-spawns.txt`), and counts uncommitted and untracked
+files too. Any path it has no rule for selects
 `full`. The release gate (`scripts/cut-release.sh`) always runs every section.
 
 Core's integration tests are two binaries (GM-623): `core/tests/scripts/`
