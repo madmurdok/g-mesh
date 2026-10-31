@@ -1001,6 +1001,54 @@ mod tests {
     use super::*;
     use g_mesh_plugin_sdk::lsp::ServerReadiness;
 
+    /// `script_proxy` names the cargo proxy under `CARGO_HOME`'s `bin/` only
+    /// when it is a script (`#!`), by its canonical path; a binary, a missing
+    /// file and a missing `bin/` name nothing.
+    ///
+    /// Control: drop the `#!` test in `script_proxy` (the binary proxy is
+    /// named).
+    #[cfg(unix)]
+    #[test]
+    fn a_cargo_proxy_is_named_only_when_it_is_a_script() {
+        let base = std::env::temp_dir().join(format!("g-mesh-rs-gm674-script-proxy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let base = {
+            std::fs::create_dir_all(&base).unwrap();
+            base.canonicalize().unwrap()
+        };
+        let home = |name: &str| {
+            let bin = base.join(name).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            bin
+        };
+
+        let script = home("script");
+        std::fs::write(script.join("cargo"), "#!/bin/sh\nexec /elsewhere/cargo \"$@\"\n").unwrap();
+        assert_eq!(script_proxy(script.parent().unwrap()), Some(script.join("cargo")));
+
+        let linked = home("linked");
+        std::fs::write(base.join("wrapper"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(base.join("wrapper"), linked.join("cargo")).unwrap();
+        assert_eq!(
+            script_proxy(linked.parent().unwrap()),
+            Some(base.join("wrapper")),
+            "a symlink to a script is named by the file it resolves to"
+        );
+
+        let binary = home("binary");
+        std::fs::write(binary.join("cargo"), b"\x7fELF\x02\x01").unwrap();
+        assert_eq!(script_proxy(binary.parent().unwrap()), None, "a binary proxy is not a script");
+
+        let empty = home("empty");
+        std::fs::write(empty.join("cargo"), b"").unwrap();
+        assert_eq!(script_proxy(empty.parent().unwrap()), None, "an empty file is not a script");
+
+        let missing = home("missing");
+        assert_eq!(script_proxy(missing.parent().unwrap()), None, "no cargo proxy, nothing to name");
+        assert_eq!(script_proxy(&base.join("no-such-home")), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A path names one binary and is never searched around - see
     /// [`resolve`]'s doc.
     #[test]

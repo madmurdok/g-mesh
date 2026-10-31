@@ -244,6 +244,134 @@ fn proxies_of_a_rustup_that_stands_alone_link_to_it() {
     }
 }
 
+/// A `rustup` found on `PATH` through a symlink, in a directory with no
+/// proxies beside it (`/opt/homebrew/bin`), gets its proxies linked to the
+/// ones beside the file it resolves to.
+///
+/// Control: drop the canonicalization of `rustup` in `link_rustup_proxies`
+/// (the proxies link to the symlink itself).
+#[cfg(unix)]
+#[test]
+fn proxies_of_a_symlinked_rustup_link_to_the_proxies_beside_its_target() {
+    let keg = Scratch::new("symlinked-keg");
+    for name in ["rustup", "cargo", "rustc", "rust-analyzer"] {
+        write(&keg.0.join(name), "#!/bin/sh\n");
+    }
+    let bin = Scratch::new("symlinked-bin");
+    let rustup = bin.0.join("rustup");
+    std::os::unix::fs::symlink(keg.0.join("rustup"), &rustup).unwrap();
+    let proxies = Scratch::new("symlinked-proxies");
+    link_rustup_proxies(&proxies.0, &rustup);
+    for name in ["cargo", "rustc", "rust-analyzer"] {
+        assert_eq!(
+            std::fs::read_link(proxies.0.join(name)).unwrap(),
+            keg.0.join(name),
+            "the {name} proxy is not the one beside the real rustup"
+        );
+    }
+}
+
+/// The `bin/` of the rustup-init install this process runs under (`CARGO_HOME`
+/// or `~/.cargo`) when it holds `rustup` and the three proxies the engine
+/// needs as files; `None`, with the reason printed, otherwise.
+#[cfg(target_os = "macos")]
+fn rustup_init_bin(test: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("CARGO_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))?;
+    let bin = home.join("bin");
+    for name in ["rustup", "cargo", "rustc", "rust-analyzer"] {
+        if !bin.join(name).is_file() {
+            println!("{test}: skipped, {} has no {name}: not a rustup-init CARGO_HOME", bin.display());
+            return None;
+        }
+    }
+    Some(bin)
+}
+
+/// With a Homebrew-shaped wrapper keg first on `PATH` whose scripts `exec`
+/// the rustup-init `~/.cargo/bin` (the keg is outside every directory the
+/// sandbox allows by itself), the sandboxed engine still resolves a receiver
+/// call: rust-analyzer runs `$CARGO_HOME/bin/cargo` and the policy allows
+/// that directory. Skips where this process has no rustup-init `CARGO_HOME`.
+///
+/// Control: drop the `cargo_proxy` prefix in `SandboxPolicy::for_server`
+/// (the server's `cargo metadata` is refused, so nothing resolves).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_wrapper_keg_over_a_rustup_init_cargo_home_still_resolves_a_call() {
+    let test = "a_wrapper_keg_over_a_rustup_init_cargo_home_still_resolves_a_call";
+    let Some(cargo_bin) = rustup_init_bin(test) else { return };
+    let real = real_toolchain();
+    let keg = Scratch::new("keg-over-cargo-home");
+    for name in ["rustup", "cargo", "rustc", "rust-analyzer"] {
+        use std::os::unix::fs::PermissionsExt;
+        let script = keg.0.join(name);
+        write(&script, &format!("#!/bin/bash\nexec \"{}\" \"$@\"\n", cargo_bin.join(name).display()));
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let with_keg = RealToolchain {
+        proxy_dir: keg.0.clone(),
+        _proxies: None,
+        rustc: real.rustc.clone(),
+        cargo: real.cargo.clone(),
+        rust_analyzer: real.rust_analyzer.clone(),
+    };
+    let scratch = Scratch::new("keg-project");
+    write_fixture(&scratch.0, &real);
+    in_its_env(
+        "a_wrapper_keg_over_a_rustup_init_cargo_home_still_resolves_a_call_in_its_env",
+        &scratch.0,
+        &with_keg,
+        Some(&scratch.0),
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "run by its parent test in the fixture's environment"]
+fn a_wrapper_keg_over_a_rustup_init_cargo_home_still_resolves_a_call_in_its_env() {
+    let test = "a_wrapper_keg_over_a_rustup_init_cargo_home_still_resolves_a_call_in_its_env";
+    let Some((root, _real)) = child_fixture(test) else { return };
+    let project = ProjectContext::load(&root).expect("the fixture is a loadable Rust project");
+    let mut index = SdkIndex::new();
+    for path in walk_project(&root, &[".rs".to_string()], &EXCLUDE_DIRS.map(String::from)) {
+        let source = std::fs::read_to_string(root.join(path.as_str())).unwrap();
+        let graph = RustExtractor.extract(&project, &path, &source);
+        index.insert(path, source, graph);
+    }
+    let mut engine = crate::sandboxed_engine(&root).expect("the engine resolves a rust-analyzer");
+    let answer = engine.answer(&[], &index).expect("the engine answers");
+    drop(engine);
+
+    let main = index
+        .graph(&RelPath::new("app/src/main.rs"))
+        .expect("app/src/main.rs is indexed")
+        .nodes
+        .iter()
+        .find(|node| node.name == "main")
+        .expect("the extractor emits `main`")
+        .id
+        .clone();
+    let resolved: Vec<&str> = answer
+        .diff
+        .upsert_edges
+        .iter()
+        .filter(|edge| edge.from_id == main && edge.source == SourceTier::Semantic)
+        .filter_map(|edge| answer.diff.upsert_nodes.iter().find(|node| node.id == edge.to_id))
+        .map(|node| node.name.as_str())
+        .collect();
+    assert!(
+        resolved.contains(&"method"),
+        "rust-analyzer did not resolve `thing.method()` (complete: {}, reason: {:?}): {:#?}",
+        answer.complete,
+        answer.reason,
+        answer.diff
+    );
+    println!("{}", ran_marker(test));
+}
+
 /// What cargo and rustup set for this test process, which a child must not
 /// inherit.
 fn cargo_and_rustup_vars() -> Vec<std::ffi::OsString> {
