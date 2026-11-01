@@ -9,9 +9,15 @@
 //! - **What extraction reads from the model** is a file's own container key
 //!   ([`ProjectContext::container_for`]), whether a key exists
 //!   ([`ProjectContext::has_container`]) and which bare first segments name a
-//!   crate of this project ([`ProjectContext::crates`]). Dependencies,
-//!   versions, features and every other manifest table reach none of them, so
-//!   an edit of those answers `Unchanged`.
+//!   crate of this project ([`ProjectContext::crates`]), and each package's
+//!   Cargo dependency names ([`ProjectContext::is_dependency`]), which tell a
+//!   glob-reached module path from another crate's (GM-682). Versions,
+//!   features and every other manifest table reach none of them, so an edit
+//!   of those answers `Unchanged`.
+//! - **A package whose dependency names changed has all its files
+//!   selected.** Whether `name::f()` in a glob-importing module is an open
+//!   site depends on `name` not being a dependency, and such a path carries
+//!   no `IMPORTS` edge a selector could name.
 //! - **A changed set of crate names answers `Unknown`.** A path such as
 //!   `some_crate::f()` needs no `use`, so the files whose calls resolve
 //!   differently once `some_crate` is (or stops being) one of ours carry no
@@ -21,7 +27,7 @@
 //!   importer's own key says, and an importer whose key moved is selected as
 //!   a file anyway.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use g_mesh_plugin_sdk::wire::{
     ImportMatch, ImportSelector, Matcher, PathScope, ResolutionDelta, TargetScopeKind,
@@ -35,7 +41,8 @@ use super::ProjectContext;
 /// `Unknown`.
 ///
 /// 2: `container_keys` also lists inline modules (GM-637).
-const FORMAT: u32 = 2;
+/// 3: `dependencies`, each package's Cargo dependency names (GM-682).
+const FORMAT: u32 = 3;
 
 /// A Rust container key's separator, `crate::a::b`.
 const SEPARATOR: &str = "::";
@@ -48,6 +55,9 @@ pub struct RustFacts {
     crates: BTreeSet<String>,
     /// Each module-tree file's container key, and every key that exists.
     containers: ContainerFacts,
+    /// Each package directory's Cargo dependency names, as
+    /// [`ProjectContext::is_dependency`] reads them.
+    dependencies: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl RustFacts {
@@ -60,6 +70,11 @@ impl RustFacts {
                 files: project.files.iter().map(|(path, (key, _))| (path.to_string(), key.clone())).collect(),
                 keys: project.container_keys.clone(),
             },
+            dependencies: project
+                .dependencies
+                .iter()
+                .map(|(dir, names)| (dir.to_string(), names.clone()))
+                .collect(),
         }
     }
 
@@ -81,7 +96,8 @@ impl RustFacts {
 /// - another set of crate names: `Unknown` (see this module's doc);
 /// - otherwise [`container_delta`]'s answer: every file whose key moved,
 ///   importers of every added or removed key, and specifiers under every
-///   added key, plus [`with_parent_targets`].
+///   added key, plus [`with_parent_targets`], plus
+///   [`with_dependency_changes`].
 ///
 /// `Unknown` also when `previous` is unreadable.
 pub fn resolution_delta(previous: &str, project: &ProjectContext) -> ResolutionDelta {
@@ -105,11 +121,56 @@ pub fn delta(old: &RustFacts, new: &RustFacts) -> ResolutionDelta {
             ),
         };
     }
-    with_parent_targets(
-        container_delta(&old.containers, &new.containers, SEPARATOR),
-        &old.containers,
-        &new.containers,
+    with_dependency_changes(
+        with_parent_targets(
+            container_delta(&old.containers, &new.containers, SEPARATOR),
+            &old.containers,
+            &new.containers,
+        ),
+        &old.dependencies,
+        &new.dependencies,
     )
+}
+
+/// Adds every file of each package whose dependency names changed (one
+/// added, removed or renamed, or the package itself added or removed), less
+/// the packages nested under it: see this module's doc.
+fn with_dependency_changes(
+    delta: ResolutionDelta,
+    old: &BTreeMap<String, BTreeSet<String>>,
+    new: &BTreeMap<String, BTreeSet<String>>,
+) -> ResolutionDelta {
+    let changed: Vec<&String> = old
+        .keys()
+        .chain(new.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|dir| old.get(*dir) != new.get(*dir))
+        .collect();
+    if changed.is_empty() {
+        return delta;
+    }
+    let (mut files, imports) = match delta {
+        ResolutionDelta::Unchanged => (Vec::new(), Vec::new()),
+        ResolutionDelta::Affected { files, imports } => (files, imports),
+        unknown @ ResolutionDelta::Unknown { .. } => return unknown,
+    };
+    let packages: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+    for dir in changed {
+        let not_under = packages
+            .iter()
+            .filter(|other| *other != &dir && is_under(other, dir))
+            .map(|other| other.to_string())
+            .collect();
+        files.push(PathScope { under: dir.clone(), not_under });
+    }
+    ResolutionDelta::Affected { files, imports }
+}
+
+/// Whether the project-relative path `path` is `dir` or under it, on a `/`
+/// boundary; `""` is the whole project.
+fn is_under(path: &str, dir: &str) -> bool {
+    dir.is_empty() || path == dir || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Adds, for every added key `p::c`, the importers whose stored target is
@@ -226,19 +287,19 @@ mod tests {
         resolution_delta(&RustFacts::of(before).encode(), &tree.load())
     }
 
-    /// A version bump, a new dependency and a feature table read nothing
-    /// extraction reads.
+    /// A version bump and a feature table read nothing extraction reads. (A
+    /// dependency edit selects its package's files: GM-682.)
     ///
     /// Control: make [`delta`] return `container_delta` of empty old facts
     /// (or drop the `crates`/`containers` comparison): this answers
     /// `Affected`.
     #[test]
-    fn a_dependency_and_version_edit_answers_unchanged() {
+    fn a_version_and_feature_edit_answers_unchanged() {
         let tree = workspace();
         let before = tree.load();
         tree.write(
             "alpha/Cargo.toml",
-            "[package]\nname = \"alpha\"\nversion = \"0.2.0\"\n\n[dependencies]\nserde = \"1\"\n\n[features]\nx = []\n",
+            "[package]\nname = \"alpha\"\nversion = \"0.2.0\"\n\n[features]\nx = []\n",
         );
         tree.write(
             "Cargo.toml",
@@ -361,5 +422,93 @@ mod tests {
             );
         }
         assert_eq!(RustFacts::decode(&RustFacts::of(&project).encode()), Some(RustFacts::of(&project)));
+    }
+
+    /// The files of the package at `dir`, less the packages `not_under`.
+    fn package(dir: &str, not_under: &[&str]) -> ResolutionDelta {
+        ResolutionDelta::Affected {
+            files: vec![PathScope {
+                under: dir.to_string(),
+                not_under: not_under.iter().map(|dir| dir.to_string()).collect(),
+            }],
+            imports: Vec::new(),
+        }
+    }
+
+    /// A dependency added to, removed from or renamed in any of a package's
+    /// dependency tables selects that package's files, and only them; a
+    /// version or feature edit of an existing dependency selects nothing.
+    ///
+    /// Control: make `delta` skip `with_dependency_changes` (return its
+    /// first argument) - every edit answers `Unchanged`.
+    #[test]
+    fn a_dependency_added_removed_or_renamed_selects_its_package() {
+        let with = |tables: &str| format!("{ALPHA}\n{tables}");
+        for (label, from, to) in [
+            ("added", "", "[dependencies]\nserde = \"1\"\n"),
+            ("removed", "[dependencies]\nserde = \"1\"\n", ""),
+            ("renamed", "[dependencies]\nserde = \"1\"\n", "[dependencies]\nserde_json = \"1\"\n"),
+            ("dev", "", "[dev-dependencies]\ntempfile = \"3\"\n"),
+            ("build", "", "[build-dependencies]\ncc = \"1\"\n"),
+            ("target", "", "[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n"),
+            (
+                "package rename by key",
+                "[dependencies]\nalias = { package = \"real\", version = \"1\" }\n",
+                "[dependencies]\nother = { package = \"real\", version = \"1\" }\n",
+            ),
+        ] {
+            let tree = workspace();
+            tree.write("alpha/Cargo.toml", &with(from));
+            let before = tree.load();
+            tree.write("alpha/Cargo.toml", &with(to));
+            assert_eq!(saved(&before, &tree), package("alpha", &[]), "{label}");
+        }
+
+        let tree = workspace();
+        tree.write("alpha/Cargo.toml", &with("[dependencies]\nserde = { version = \"1\" }\n"));
+        let before = tree.load();
+        tree.write(
+            "alpha/Cargo.toml",
+            &with("[dependencies]\nserde = { version = \"2\", features = [\"derive\"] }\n"),
+        );
+        assert_eq!(saved(&before, &tree), ResolutionDelta::Unchanged, "a version and feature edit");
+    }
+
+    /// A dependency edit of a package with packages nested under its
+    /// directory leaves the nested ones out of the scope.
+    ///
+    /// Control: make `with_dependency_changes` push `not_under: Vec::new()` -
+    /// the scope also covers `alpha` and `beta`.
+    #[test]
+    fn a_dependency_edit_of_a_root_package_leaves_the_nested_packages_out() {
+        let root = |tables: &str| {
+            format!(
+                "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = [\"alpha\", \"beta\"]\n{tables}"
+            )
+        };
+        let tree = workspace();
+        tree.write("Cargo.toml", &root("")).write("src/lib.rs", "");
+        let before = tree.load();
+        tree.write("Cargo.toml", &root("\n[dependencies]\nserde = \"1\"\n"));
+        assert_eq!(saved(&before, &tree), package("", &["alpha", "beta"]));
+    }
+
+    /// The dependency names are part of the facts' format: a blob of format
+    /// 2, which had none, answers `Unknown` rather than a delta that would
+    /// read every package as having lost its dependencies.
+    ///
+    /// Control: set [`FORMAT`] back to 2 - the blob is read and answers
+    /// `Unchanged`.
+    #[test]
+    fn a_format_2_blob_answers_unknown() {
+        let tree = workspace();
+        let project = tree.load();
+        let current = RustFacts::of(&project).encode();
+        let format_2 = current.replacen(&format!("\"format\":{FORMAT}"), "\"format\":2", 1);
+        assert_ne!(format_2, current, "the blob spells its format as expected");
+        assert!(
+            matches!(resolution_delta(&format_2, &project), ResolutionDelta::Unknown { .. }),
+            "a format-2 blob was read as facts"
+        );
     }
 }

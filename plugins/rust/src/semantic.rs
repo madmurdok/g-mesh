@@ -220,8 +220,14 @@ pub fn server_config_with(root: &Path, launcher: &Path) -> Result<SemanticConfig
             proxy.display()
         );
     }
-    let policy =
-        SandboxPolicy::for_server(root, &toolchain, &config.command, cargo_home.as_deref(), temp.as_deref());
+    let policy = SandboxPolicy::for_server(
+        root,
+        &toolchain,
+        &config.command,
+        cargo_home.as_deref(),
+        temp.as_deref(),
+        user_home().as_deref(),
+    );
     admit(sandbox::confine(&mut config, &policy, launcher), &policy)?;
     Ok(config)
 }
@@ -841,10 +847,16 @@ fn cargo_home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("CARGO_HOME").filter(|home| !home.is_empty()) {
         return Some(PathBuf::from(home));
     }
-    let home = std::env::var_os("HOME")
+    Some(user_home()?.join(".cargo"))
+}
+
+/// The user's home directory: `$HOME`, else `$USERPROFILE`, when non-empty.
+/// [`SandboxPolicy::for_server`] canonicalizes it before judging prefixes.
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|home| !home.is_empty())?;
-    Some(PathBuf::from(home).join(".cargo"))
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The cargo proxy rust-analyzer will exec from `cargo_home` (see

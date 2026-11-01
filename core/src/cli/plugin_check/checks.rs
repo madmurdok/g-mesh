@@ -147,8 +147,8 @@ use crate::cli::plugin_check::session::{
 use crate::daemon::manifest::{extension_of, under_excluded_dir, PluginManifest};
 use crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND;
 use crate::protocol::conformance::{
-    placeholder_target_violation, plugin_emitted_container_violation, qualified_path_violation,
-    untyped_calls_violation, PLACEHOLDER_NATIVE_KINDS,
+    also_scopes_violation, placeholder_target_violation, plugin_emitted_container_violation,
+    qualified_path_violation, untyped_calls_violation, PLACEHOLDER_NATIVE_KINDS,
 };
 use crate::protocol::ndjson::BulkItem;
 use crate::protocol::types::{EdgeKind, FileChangeDiff, NodeKind, ResolutionDelta, WireEdge, WireNode};
@@ -376,6 +376,7 @@ fn shape(run: &RunData, answered: &[(String, &FileChangeDiff)]) -> CheckResult {
                         .into_iter()
                         .chain(qualified_path_violation(node))
                         .chain(untyped_calls_violation(node))
+                        .chain(also_scopes_violation(node))
                     {
                         findings.push(format!("bulk run 1, NDJSON line {}: {message}", line.line_no));
                     }
@@ -416,6 +417,7 @@ fn shape(run: &RunData, answered: &[(String, &FileChangeDiff)]) -> CheckResult {
                 .into_iter()
                 .chain(qualified_path_violation(node))
                 .chain(untyped_calls_violation(node))
+                .chain(also_scopes_violation(node))
             {
                 findings.push(format!("{step}: {message}"));
             }

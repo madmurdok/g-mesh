@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::extractor::grammar::EXTENSIONS as SOURCE_EXTENSIONS;
-use crate::project::exports::match_wildcard;
+use crate::project::exports::{match_wildcard, target_accepted, TargetMap};
 use crate::project::jsonc::{parse_json, parse_jsonc, Json};
 use crate::project::{paths, version_range, EXCLUDE_DIRS};
 
@@ -98,7 +98,9 @@ pub fn paths_entries(value: &Json) -> Option<Vec<PathsEntry>> {
 /// `index` files are the candidates). tsc substitutes no empty capture: a
 /// target with a `*` names nothing for it (`@/` under `"@/*": ["./src/*"]`),
 /// a target without one is used as written (`@r/` under `["./"]` names the
-/// root).
+/// root). As in tsc, only a target's first `*` takes the capture; a second
+/// one (tsc error TS5062) stays literal (`./src/*-*` for `q` names
+/// `src/q-*`).
 pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     for entry in &config.paths {
@@ -115,7 +117,7 @@ pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec
         for target in &entry.targets {
             let substituted = match capture {
                 Some("") if target.contains('*') => continue,
-                Some(capture) => target.replace('*', capture),
+                Some(capture) => target.replacen('*', capture, 1),
                 None => target.clone(),
             };
             if let Some(inside) = paths::inside_or_root(&config.resolve_dir, &substituted) {
@@ -742,12 +744,11 @@ fn tsconfig_field_candidates(dir: &str, field: &str) -> Vec<String> {
 }
 
 /// The in-project path an `exports` string `target` names for `matched`,
-/// or `None` when tsc rejects it: a target not starting with `./`; a `.`,
-/// `..` or `node_modules` segment after its first, or in the text a `*` or
-/// a trailing-`/` key captured; a non-`/` target for a trailing-`/` key; a
-/// result ending in `/`.
+/// or `None` when tsc rejects it: a target or text captured by a `*` or a
+/// trailing-`/` key that [`target_accepted`] rejects (the same rule module
+/// resolution applies, so a `.\` prefix is no `./`); a non-`/` target
+/// for a trailing-`/` key; a result ending in `/`.
 fn exports_target_path(package: &str, target: &str, matched: ExportMatch<'_>) -> Option<String> {
-    let target = paths::with_forward_slashes(target);
     let (pattern, subpath) = match matched {
         ExportMatch::Exact => (false, ""),
         ExportMatch::Pattern(capture) => (true, capture),
@@ -756,21 +757,15 @@ fn exports_target_path(package: &str, target: &str, matched: ExportMatch<'_>) ->
     if !pattern && !subpath.is_empty() && !target.ends_with('/') {
         return None;
     }
-    let after_first = target.strip_prefix("./")?;
-    if has_invalid_target_segment(after_first) || has_invalid_target_segment(subpath) {
+    if !target_accepted(TargetMap::Exports, target, Some(subpath)) {
         return None;
     }
+    let target = paths::with_forward_slashes(target);
     let joined = if pattern { target.replace('*', subpath) } else { format!("{target}{subpath}") };
     if joined.ends_with('/') {
         return None;
     }
     paths::inside(package, &joined)
-}
-
-/// Whether a `/`-separated text has a `.`, `..` or `node_modules` segment.
-fn has_invalid_target_segment(text: &str) -> bool {
-    let text = text.strip_suffix('/').unwrap_or(text);
-    text.split('/').any(|segment| matches!(segment, "." | ".." | "node_modules"))
 }
 
 /// The file tsc reads for an `exports` target `path`: [`extension_replaced`],

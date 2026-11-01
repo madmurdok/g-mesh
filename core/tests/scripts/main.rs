@@ -13,6 +13,12 @@
 //!
 //! Run one file's tests:
 //! `cargo nextest run -p g-mesh --test scripts -E 'test(/^<file>::/)'`.
+//!
+//! Unix only, for the whole binary (GM-683): every script here is bash or
+//! python3, and `test-sections.sh` skips `core-scripts` on Windows, so a test
+//! meant to run there would be skipped silently. On Windows this crate
+//! compiles to no tests at all.
+#![cfg(unix)]
 
 mod ci_junit_summary_script;
 mod cut_release_plugin_versions;

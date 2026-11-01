@@ -139,3 +139,23 @@ fn core_tests_have_exactly_the_two_binaries() {
 
     assert!(problems.is_empty(), "core/tests/ layout: {problems:#?}\nThe rule: {RULE}.");
 }
+
+/// `core/tests/scripts` is unix-only as a whole (GM-683): every script there
+/// is bash or python3 and `test-sections.sh` skips it on Windows. The guard
+/// is one crate-level `#![cfg(unix)]` in `main.rs`, before the first `mod`;
+/// without it a non-unix test added there would compile on Windows and be
+/// skipped silently.
+#[test]
+fn scripts_binary_is_unix_only_at_crate_level() {
+    let main_rs = tests_dir().join("scripts").join("main.rs");
+    let text = fs::read_to_string(&main_rs).unwrap_or_else(|e| panic!("{}: {e}", main_rs.display()));
+    let code: Vec<&str> =
+        text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("//")).collect();
+    let first_mod = code.iter().position(|l| l.starts_with("mod ")).unwrap_or(code.len());
+    assert!(
+        code[..first_mod].contains(&"#![cfg(unix)]"),
+        "core/tests/scripts/main.rs lacks a crate-level `#![cfg(unix)]` before its first `mod` \
+         line: every script under test is bash or python3, so the binary must compile to nothing \
+         on Windows (GM-683)"
+    );
+}

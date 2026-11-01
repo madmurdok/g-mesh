@@ -724,6 +724,12 @@ fn unix_now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64)
 }
 
+/// A path as a timing line names it (GM-435): project-relative when it is
+/// inside `root`, as given otherwise.
+fn timing_path(root: &Path, path: &Path) -> String {
+    relative_wire_path(root, path).unwrap_or_else(|| path.display().to_string())
+}
+
 /// One iteration of the watcher loop: waits up to [`DEBOUNCE_WINDOW`] for a
 /// raw change, records it, then routes every settled path to `registry` in
 /// [`order_for_routing`]'s order (deletions, creations, modifications; ADR 0023).
@@ -751,7 +757,10 @@ fn watch_and_route_once(
     registry: &PluginRegistry,
 ) {
     match watcher.next_change(DEBOUNCE_WINDOW) {
-        Some(Change::Path(path)) => debouncer.record(path),
+        Some(Change::Path(path)) => {
+            crate::log_timing!("fs_event path={}", timing_path(root, &path));
+            debouncer.record(path)
+        }
         // `next_change` widens a Rescan outside the root to the root; `""`
         // is the root here as well.
         Some(Change::Rescan(path)) => {
@@ -760,6 +769,10 @@ fn watch_and_route_once(
         None => {}
     }
     let mut settled_paths = debouncer.drain_ready();
+    if !settled_paths.is_empty() && crate::log::timing_enabled() {
+        let names: Vec<String> = settled_paths.iter().map(|path| timing_path(root, path)).collect();
+        crate::log_timing!("settled paths={} names={}", names.len(), names.join(","));
+    }
     let mut links = Vec::new();
     if let Some(changed_links) = watcher.reload_ignores_if_changed(&settled_paths) {
         links = changed_links;

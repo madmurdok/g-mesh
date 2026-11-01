@@ -244,6 +244,7 @@ fn to_node_record_derives_visibility_container_and_target_from_the_wire_v2_shape
         key: TargetKey::QualifiedName("Server.Close".to_string()),
         from_container: Some("github.com/x/app/client".to_string()),
         key_path: None,
+        also_scopes: Vec::new(),
     });
 
     let record = to_node_record(node, &mut PathWarnings::default());
@@ -258,6 +259,33 @@ fn to_node_record_derives_visibility_container_and_target_from_the_wire_v2_shape
     assert_eq!(target.key_kind, "qualifiedName");
     assert_eq!(target.key, "Server.Close");
     assert_eq!(target.from_container.as_deref(), Some("github.com/x/app/client"));
+}
+
+/// GM-676: a `File`-scoped target's extra waiting scopes reach the record;
+/// under a `Container` scope (non-conformant) they are dropped, never stored
+/// as file paths. Controls: always `Vec::new()` in
+/// `to_placeholder_target_record` (the file case loses them), or always
+/// copy them (the container case keeps them).
+#[test]
+fn to_node_record_keeps_also_scopes_only_on_a_file_scoped_target() {
+    for (scope, kept) in [
+        (TargetScope::File("generated/a".to_string()), vec!["src/env.ts".to_string()]),
+        (TargetScope::Container("pkg".to_string()), Vec::new()),
+    ] {
+        let mut node = canned_node("n1");
+        node.native_kind = Some("resolved_module".to_string());
+        node.target = Some(PlaceholderTarget {
+            scope: scope.clone(),
+            key: TargetKey::Name("*".to_string()),
+            from_container: None,
+            key_path: None,
+            also_scopes: vec!["src/env.ts".to_string()],
+        });
+
+        let record = to_node_record(node, &mut PathWarnings::default());
+
+        assert_eq!(record.target.expect("the target is kept").also_scopes, kept, "{scope:?}");
+    }
 }
 
 /// The ordinary case: `Visibility::Public` maps to `"public"`/`exported`,
@@ -1205,6 +1233,7 @@ fn a_bad_key_path_is_dropped_and_the_target_kept() {
         key: TargetKey::QualifiedName("a::T.f".to_string()),
         from_container: None,
         key_path: Some(key_path),
+        also_scopes: Vec::new(),
     };
     let good =
         WireNode { target: Some(target(path_of("a", &[("::", "T"), (".", "f")]))), ..canned_node("p1") };
@@ -1542,6 +1571,7 @@ fn rich_caller() -> WireNode {
             key: TargetKey::QualifiedName("mod::foo".to_string()),
             from_container: Some("mod".to_string()),
             key_path: None,
+            also_scopes: Vec::new(),
         }),
         untyped_calls: vec!["frob".to_string(), "len".to_string()],
         ..pathed_node("caller", "Alias")
@@ -1783,6 +1813,7 @@ fn pending(id: &str, file_path: &str, language: &str, scope: TargetScope, name: 
             key: TargetKey::Name(name.to_string()),
             from_container: Some("mycrate".to_string()),
             key_path: None,
+            also_scopes: Vec::new(),
         }),
         ..node_in(id, file_path)
     }
@@ -1803,6 +1834,7 @@ fn lib_rs_reparse() -> FileChangeDiff {
             key: TargetKey::Name(crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string()),
             from_container: Some("mycrate".to_string()),
             key_path: None,
+            also_scopes: Vec::new(),
         }),
         ..node_in("glob", "src/lib.rs")
     };

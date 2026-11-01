@@ -42,10 +42,12 @@ use crate::common::Lifeline;
 const BIN: &str = env!("CARGO_BIN_EXE_g-mesh");
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// The plugin's shortened idle timeout. Not as short as it could be: the test
-/// also has to *catch* the plugin awake after the wake that replays the queue,
-/// and a timeout of a few hundred milliseconds would race its own assertions
-/// by putting it straight back to sleep.
+/// The plugin's shortened idle timeout. The test never has to catch the plugin
+/// awake: a plugin's pid is taken from its pid file when the test gets there
+/// first, and otherwise from the line the daemon logs when it puts that plugin
+/// to sleep ([`Daemon::slept_plugin_pids`]). A pid file names a plugin only
+/// while it is awake, and a test thread starved for longer than this timeout
+/// finds it already removed by the next sleep.
 const PLUGIN_IDLE: Duration = Duration::from_millis(1_500);
 /// The core's, in the test that asserts it exits. Deliberately several times
 /// the plugin's, so the two-tier claim is tested with the same *ordering*
@@ -193,6 +195,19 @@ impl Daemon {
         let (_, paths) = line.split_once(MARKER).expect("the marker was just matched");
         paths.split(", ").map(str::to_string).collect()
     }
+
+    /// The pids of the plugins the daemon has put to sleep, in order. The
+    /// daemon logs that line after it has shut the process down and removed
+    /// its pid file (`lifecycle::SupervisedPlugin::put_to_sleep`), so a pid
+    /// listed here belonged to a plugin that ran and is gone.
+    fn slept_plugin_pids(&self) -> Vec<u32> {
+        const MARKER: &str = "plugin (pid ";
+        self.log()
+            .lines()
+            .filter(|line| line.contains(") put to sleep"))
+            .filter_map(|line| line.split_once(MARKER)?.1.split_once(')')?.0.parse().ok())
+            .collect()
+    }
 }
 
 impl Drop for Daemon {
@@ -214,6 +229,19 @@ fn wait_for(what: &str, ready: impl FnMut() -> bool) {
 
 fn recorded_pid(path: &Path) -> u32 {
     daemon::read_pid_file(path).unwrap_or_else(|| panic!("no pid recorded in {}", path.display()))
+}
+
+/// The pid of the first plugin the daemon starts: from its pid file while it
+/// is awake, or from its sleep line once it has idled to sleep, whichever the
+/// test sees first.
+fn first_plugin_pid(daemon_process: &Daemon, plugin_pid_file: &Path) -> u32 {
+    let mut pid = None;
+    wait_for("the plugin to start", || {
+        pid = daemon::read_pid_file(plugin_pid_file)
+            .or_else(|| daemon_process.slept_plugin_pids().first().copied());
+        pid.is_some()
+    });
+    pid.expect("just waited for it")
 }
 
 /// Runs one MCP conversation over a fresh connection and returns the
@@ -310,15 +338,15 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
     // own), so it is entitled to fall asleep while that walk is still going.
     // GM-395 slice 2: the daemon walks - and so spawns its plugin - only once a tool call asks.
     common::trigger_activation(project.root());
-    wait_for("the plugin to start", || plugin_pid_file.exists());
-    let first_plugin_pid = recorded_pid(&plugin_pid_file);
-    assert!(daemon::is_process_alive(first_plugin_pid), "the plugin must be up before it can sleep");
+    let first_plugin_pid = first_plugin_pid(&daemon_process, &plugin_pid_file);
     wait_until_indexed(project.root());
 
     // --- the plugin falls asleep on its own -----------------------------
-    // Waited on through the pid file, which is cleared *after* the process is
-    // reaped, so this cannot observe a half-finished sleep.
-    wait_for("the plugin to exit on its idle timeout", || !plugin_pid_file.exists());
+    // Waited on through its sleep line, logged after the process is reaped
+    // and its pid file removed, so this cannot observe a half-finished sleep.
+    wait_for("the plugin to exit on its idle timeout", || {
+        daemon_process.slept_plugin_pids().contains(&first_plugin_pid) && !plugin_pid_file.exists()
+    });
     assert!(
         !daemon::is_process_alive(first_plugin_pid),
         "the plugin process must actually be gone, not merely unrecorded"
@@ -384,9 +412,15 @@ fn the_plugin_sleeps_alone_and_a_request_replays_only_what_it_missed() {
         thread::sleep(Duration::from_millis(100));
     }
 
-    let second_plugin_pid = recorded_pid(&plugin_pid_file);
+    // Nothing asks the plugin anything from here on, so the woken plugin idles
+    // back to sleep and its sleep line is the last one; it is waited on rather
+    // than raced through a pid file that goes away with that sleep.
+    wait_for("the woken plugin to idle back to sleep", || {
+        daemon_process.slept_plugin_pids().len() >= 2 && !plugin_pid_file.exists()
+    });
+    let second_plugin_pid =
+        *daemon_process.slept_plugin_pids().last().expect("just waited for two sleep lines");
     assert_ne!(second_plugin_pid, first_plugin_pid, "waking must start a new plugin process");
-    assert!(daemon::is_process_alive(second_plugin_pid), "the woken plugin must be running");
 
     // --- and it replayed the queue, not the project ----------------------
     let replayed = daemon_process.replayed_paths();

@@ -72,6 +72,7 @@ fn placeholder(importer: &str, scope_kind: &str, scope: &str) -> NodeRecord {
         key: "*".to_string(),
         from_container: None,
         key_path: None,
+        also_scopes: Vec::new(),
     });
     node
 }
@@ -1158,4 +1159,35 @@ fn an_owed_re_extract_of_a_file_gone_from_disk_is_settled_without_a_re_extract()
     assert_eq!(asked, vec![format!("fileChanged {}", src(4))], "only the file on disk is re-extracted");
     assert!(owed(&fixture.conn).is_empty(), "both rows are settled");
     assert!(indexed_files(&fixture.conn).contains(&src(7)), "the gone file keeps its rows");
+}
+
+/// GM-676 (7b): an unlinked import whose placeholder waits at `gen/a` and
+/// also at `src/env` is selected by an exact `File` key `src/env` (a static
+/// paths target written without extension, which never equals the created
+/// file's own path), through the keyed lookup and `select_affected`; a key
+/// naming no extra scope selects nothing.
+///
+/// Control: drop the `placeholder_also_scopes` UNION from
+/// `indexed_importers`' File arm (the key selects nothing).
+#[test]
+fn a_file_key_selects_an_import_waiting_there_through_an_also_scope() {
+    let mut conn = seeded();
+    let mut waiting = placeholder("app/b.ts", "file", "gen/a");
+    waiting.target.as_mut().unwrap().also_scopes = vec!["src/env".to_string()];
+    let edge = import("app/b.ts", &waiting.id, "@env/a");
+    apply_diff(
+        &mut conn,
+        &Diff { upsert_nodes: vec![waiting], upsert_edges: vec![edge], ..Default::default() },
+    )
+    .unwrap();
+
+    use TargetScopeKind::File;
+    assert_eq!(indexed_importers(&conn, "ts", File, "src/env").unwrap(), paths(&["app/b.ts"]));
+    assert!(indexed_importers(&conn, "ts", File, "src/other").unwrap().is_empty());
+    assert!(indexed_importers(&conn, "ts", TargetScopeKind::Container, "src/env").unwrap().is_empty());
+    let selected: Vec<String> = select_affected(&conn, "ts", &[], &[by_target(File, exact("src/env"))], None)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(selected, paths(&["app/b.ts"]));
 }

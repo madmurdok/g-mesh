@@ -187,6 +187,17 @@ impl<'s> Emitter<'s> {
         id
     }
 
+    /// Whether a declaration with `spec`'s id was already emitted in this
+    /// file - which [`Self::declare`] would answer by adding nothing.
+    pub(crate) fn is_declared(&self, spec: &NodeSpec) -> bool {
+        self.nodes.contains(&node_id(
+            self.path.as_str(),
+            spec.kind,
+            &spec.qualified_name,
+            spec.native_kind.as_deref(),
+        ))
+    }
+
     /// Adds (or finds) the placeholder waiting on `target`, and returns its
     /// id.
     pub(crate) fn placeholder(
@@ -333,6 +344,7 @@ pub(crate) fn container_target(container: &str, key: TargetKey, from_container: 
         key,
         from_container: Some(from_container.to_string()),
         key_path: None,
+        also_scopes: Vec::new(),
     }
 }
 

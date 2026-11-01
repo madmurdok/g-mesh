@@ -8,7 +8,6 @@
 //! small shell stand-ins. No release build is paid for: what is under test is
 //! the scripts' staging and checking, not the binaries they stage. Bash only,
 //! so Unix only: the release is packaged from a Unix shell.
-#![cfg(unix)]
 
 use std::collections::BTreeSet;
 use std::fs;

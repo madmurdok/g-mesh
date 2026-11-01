@@ -15,7 +15,6 @@
 //! `scripts/lib/` beside it), so a control revert can be run against this
 //! test binary without editing the checkout. Bash only, so Unix only: the
 //! release is cut from a Unix shell.
-#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

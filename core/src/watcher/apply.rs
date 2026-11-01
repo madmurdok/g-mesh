@@ -286,7 +286,14 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     let reextracted = if files.is_empty() && imports.is_empty() && gone_importers.is_empty() {
         Vec::new()
     } else {
-        match reextract_affected(
+        crate::log_timing!(
+            "reextract_start id={} file={file_path} files={} imports={} gone_importers={}",
+            timing_id(&request_id),
+            files.len(),
+            imports.len(),
+            gone_importers.len()
+        );
+        let reextracted = reextract_affected(
             reader,
             writer,
             store,
@@ -301,7 +308,14 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
             &gone_importers,
             &own_waiting,
             on_timeout,
-        ) {
+        );
+        crate::log_timing!(
+            "reextract_done id={} n={} ok={}",
+            timing_id(&request_id),
+            reextracted.as_ref().map_or(0, Vec::len),
+            reextracted.is_ok()
+        );
+        match reextracted {
             Ok(reextracted) => reextracted,
             Err(reason) => return Ok(FileChangeOutcome::ReindexLanguage { reason }),
         }
@@ -336,18 +350,27 @@ pub(crate) fn apply_file_change_in<R: BufRead + Send, W: Write>(
     let mut requested = Vec::with_capacity(reextracted.len() + 1);
     requested.push(file_path.clone());
     requested.extend(reextracted.iter().cloned());
-    if let Err(err) = apply_semantic_pass_in(
+    let semantic_id = semantic_pass_id(&request_id);
+    crate::log_timing!(
+        "semantic_start id={} file={file_path} requested={} owed={}",
+        timing_id(&semantic_id),
+        requested.len(),
+        owed.len()
+    );
+    let semantic = apply_semantic_pass_in(
         reader,
         writer,
         store,
         language,
         None,
         Scope::Files { requested, owed },
-        semantic_pass_id(&request_id),
+        semantic_id.clone(),
         embedding,
         semantic_pass_timeout.saturating_mul(scale),
         on_timeout,
-    ) {
+    );
+    crate::log_timing!("semantic_done id={} ok={}", timing_id(&semantic_id), semantic.is_ok());
+    if let Err(err) = semantic {
         crate::log_line!(
             "g-mesh: the semantic pass over {file_path} failed after its reparse ({err:#}) - \
              its edges keep whatever the structural pass resolved"
@@ -908,6 +931,15 @@ fn semantic_pass_id(base: &RequestId) -> RequestId {
     })
 }
 
+/// A request id as a timing line names it (GM-435): the number, or the
+/// string as is.
+fn timing_id(id: &RequestId) -> String {
+    match id {
+        RequestId::Number(n) => n.to_string(),
+        RequestId::String(s) => s.clone(),
+    }
+}
+
 /// The id of the `index`th re-extract an edit's `affected` answer started,
 /// derived from that edit's own id like [`semantic_pass_id`].
 fn reextract_id(base: &RequestId, index: usize) -> RequestId {
@@ -972,6 +1004,15 @@ fn round_trip<R: BufRead + Send, W: Write>(
     let request =
         ControlEnvelope { jsonrpc: JSONRPC_VERSION.to_string(), id: Some(request_id.clone()), message };
     write_message(writer, &request).with_context(|| format!("failed to write {method} request to plugin"))?;
+    crate::log_timing!(
+        "rt_sent id={} method={method} {}",
+        timing_id(&request_id),
+        match &request.message {
+            ControlMessage::FileChanged { file_path, .. } => format!("file={file_path}"),
+            ControlMessage::SemanticPass { file_paths, .. } => format!("files={}", file_paths.len()),
+            _ => String::new(),
+        }
+    );
 
     let mut response: FileChangeResponse = read_message_with_timeout(reader, timeout, on_timeout)
         .with_context(|| format!("failed to read plugin's {method} response"))?
@@ -987,6 +1028,16 @@ fn round_trip<R: BufRead + Send, W: Write>(
 
     let complete = response.result.complete;
     let affected = response.result.affected.take();
+    crate::log_timing!(
+        "rt_answered id={} affected={}",
+        timing_id(&request_id),
+        match &affected {
+            None => "none".to_string(),
+            Some(ResolutionDelta::Unchanged) => "unchanged".to_string(),
+            Some(ResolutionDelta::Unknown { .. }) => "unknown".to_string(),
+            Some(ResolutionDelta::Affected { files, imports }) => (files.len() + imports.len()).to_string(),
+        }
+    );
     let mut diff = to_storage_diff(response.result, &mut PathWarnings::default());
     let mut gone_importers = Vec::new();
     let mut waiting_importers = Vec::new();
@@ -1000,6 +1051,14 @@ fn round_trip<R: BufRead + Send, W: Write>(
         (ControlMessage::SemanticPass { .. }, _) => store.apply_semantic_diff_linked(&mut diff, method)?,
         _ => store.apply_diff_linked(&diff, method)?,
     }
+    crate::log_timing!(
+        "rt_committed id={} method={method} nodes={} edges={} deleted_nodes={} deleted_edges={}",
+        timing_id(&request_id),
+        diff.upsert_nodes.len(),
+        diff.upsert_edges.len(),
+        diff.delete_node_ids.len(),
+        diff.delete_edge_ids.len()
+    );
 
     hold_compute_open_for_tests();
 
@@ -1018,10 +1077,18 @@ fn round_trip<R: BufRead + Send, W: Write>(
     let mut stats = EmbedStats::default();
     let computed = embedding.compute(&diff, &mut stats);
     embedding.finish_file_change(method, &stats, started.elapsed());
+    crate::log_timing!(
+        "rt_embedded id={} texts={} hits={} embedded={}",
+        timing_id(&request_id),
+        stats.texts,
+        stats.hits,
+        stats.embedded
+    );
 
     // Best-effort, like a failed semantic pass: a diff that is already
     // committed and linked is not undone by an optional layer on top of it.
     store.store_vectors(embedding, &computed);
+    crate::log_timing!("rt_vectors id={}", timing_id(&request_id));
     Ok(RoundTrip {
         incomplete: response.incomplete,
         incomplete_reason: response.incomplete_reason,
@@ -1282,6 +1349,13 @@ fn to_placeholder_target_record(
         key,
         from_container: target.from_container.clone(),
         key_path,
+        // Extra waiting scopes are file paths: kept only on a file-scoped
+        // target (the conformance rule), never read as container keys.
+        also_scopes: if matches!(target.scope, TargetScope::File(_)) {
+            target.also_scopes.clone()
+        } else {
+            Vec::new()
+        },
     }
 }
 

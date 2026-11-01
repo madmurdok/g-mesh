@@ -772,6 +772,7 @@ mod tests {
                 key: TargetKey::Name("helper".into()),
                 from_container: None,
                 key_path: None,
+                also_scopes: Vec::new(),
             },
             range(1, 1),
         );
@@ -783,6 +784,7 @@ mod tests {
                 key: TargetKey::Name("helper".into()),
                 from_container: None,
                 key_path: None,
+                also_scopes: Vec::new(),
             },
             range(2, 2),
         );
@@ -794,6 +796,7 @@ mod tests {
                 key: TargetKey::Name("helper".into()),
                 from_container: None,
                 key_path: None,
+                also_scopes: Vec::new(),
             },
             range(3, 3),
         );
@@ -806,6 +809,7 @@ mod tests {
                 key: TargetKey::Name("helper".into()),
                 from_container: None,
                 key_path: None,
+                also_scopes: Vec::new(),
             },
             range(4, 4),
         );
@@ -833,6 +837,7 @@ mod tests {
             key,
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         };
         let file = || TargetScope::File("src/x.ts".into());
         let container = || TargetScope::Container("crate::m".into());
@@ -881,6 +886,7 @@ mod tests {
             key: TargetKey::Name("helper".into()),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         };
         for kind in
             [PlaceholderKind::PendingSymbol, PlaceholderKind::Reexport, PlaceholderKind::ResolvedModule]
@@ -916,6 +922,7 @@ mod tests {
                     key: TargetKey::Name("x".into()),
                     from_container: None,
                     key_path: None,
+                    also_scopes: Vec::new(),
                 },
                 range(1, 1),
             );

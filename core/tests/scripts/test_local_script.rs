@@ -11,7 +11,6 @@
 //! (`scripts/test-sections.sh filter`) are the real ones. The heavy-list
 //! report runs for real on fixture files. Bash and python3 only, so Unix
 //! only, like `test_sections_scripts.rs`.
-#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
