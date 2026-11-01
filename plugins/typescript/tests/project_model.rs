@@ -2580,6 +2580,12 @@ fn exports_targets_tsc_rejects_for_extends_inherit_nothing() {
     expect("e10 star backslash prefix", star("pkg/cfg/base", r#"".\\configs\\*.json""#), None);
     expect("e11 star capture node_modules", star("pkg/cfg/node_modules/x", r#""./configs/*.json""#), None);
     expect("e12 star target dotdot", star("pkg/cfg/base", r#""./x/../configs/*.json""#), None);
+    // A trailing-`/` key needs a target ending in `/` before any backslash
+    // is read as one (control: normalize before that check).
+    let folder =
+        |target: &str| chain_pkg("pkg/cfg/base.json", &exports(&format!(r#"{{"./cfg/":{target}}}"#)), &files);
+    expect("e13 folder key", folder(r#""./a/""#), Some("a"));
+    expect("e14 folder key backslash end", folder(r#""./a\\""#), None);
 }
 
 /// `rest.json` before `rest/`, a nested package's own `tsconfig` field, a
