@@ -1735,6 +1735,9 @@ fn an_unresolved_hash_import_also_waits_at_the_static_target_of_its_key() {
 ///
 /// Control: `expand_paths_candidates` replaces every `*` (the record side
 /// waits at `generated/a-a`, which no create offers).
+/// Unix only (GM-684): the fixture writes a file named with `*`, which
+/// Windows forbids in a file name, so the shape cannot occur there.
+#[cfg(unix)]
 #[test]
 fn a_two_star_paths_target_waits_at_the_key_its_create_offers() {
     let tsconfig = alias_tsconfig(r#"{"@env/*":["generated/*-*","src/env.ts"]}"#);
