@@ -3,7 +3,6 @@
 //! writing there. It runs for real against a scratch repository; `uname`,
 //! `cp` and `pgrep` are stand-ins on `PATH`, so the clone path runs on any
 //! Unix and a busy or quiet machine is a switch. Git only, so Unix only.
-#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

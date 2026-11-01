@@ -9,7 +9,6 @@
 //! the real tree; it lists the whole suite twelve times, so it is ignored here
 //! and CI runs the same `check` as its own step. Bash and python3 only, so Unix
 //! only, like `release_packaging_scripts.rs`.
-#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

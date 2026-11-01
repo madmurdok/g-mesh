@@ -8,7 +8,6 @@
 //! stand-in `gh` that answers from fixture JSON through the real `jq`, so the
 //! script's own `--jq` filters decide. Bash, git and jq only, so Unix only,
 //! like `test_sections_scripts.rs`.
-#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
