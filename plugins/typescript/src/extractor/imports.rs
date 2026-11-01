@@ -12,7 +12,9 @@
 //!   unresolved import. A non-relative one that resolves to no file is
 //!   addressed the same way when it is an alias, workspace package or `#`
 //!   key: a `resolved_module` targeted at the first base its resolution
-//!   walks ([`MissAddress`]), so the create of any candidate can name it.
+//!   walks ([`MissAddress`]), so the create of any candidate can name it,
+//!   and also waiting at every static target (no `*`) of the wildcard
+//!   entries matching it, whose create derives no specifier.
 //!   Any other is an `external_module` named by the raw specifier, with no
 //!   target.
 //! - The names an import binds are kept only when its specifier resolved:
@@ -38,13 +40,13 @@ use tree_sitter::Node;
 
 use crate::extractor::decls::Declarer;
 use crate::extractor::keys::{
-    file_target, pending_symbol_qualified_name, EXTERNAL_MODULE_NATIVE_KIND, PENDING_SYMBOL_NATIVE_KIND,
-    REEXPORT_ALL_NAME, REEXPORT_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND,
+    file_target, file_target_also, pending_symbol_qualified_name, EXTERNAL_MODULE_NATIVE_KIND,
+    PENDING_SYMBOL_NATIVE_KIND, REEXPORT_ALL_NAME, REEXPORT_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND,
 };
 use crate::extractor::model::{ConstantInitializer, ImportBinding, NodeParams};
 use crate::extractor::scope::{is_locally_bound, Scope};
 use crate::extractor::syntax::{child_of_kind, children, named_children, string_literal_value};
-use crate::project::resolve::relative_address;
+use crate::project::resolve::{relative_address, MissAddresses};
 
 /// Turns a module specifier written in the file `from` into the project file
 /// it names, or `None` when it names nothing in this project (a package, a
@@ -53,10 +55,11 @@ use crate::project::resolve::relative_address;
 /// lives behind this.
 pub type SpecifierResolver<'r> = dyn Fn(&str, &RelPath) -> Option<RelPath> + 'r;
 
-/// The address an unresolved non-relative specifier written in `from` is
-/// recorded at, or `None` when it names no project path (a package, a
-/// builtin): it then stays an `external_module`.
-pub type MissAddress<'r> = dyn Fn(&str, &RelPath) -> Option<String> + 'r;
+/// The addresses an unresolved non-relative specifier written in `from` is
+/// recorded at (its scope and the extra file scopes it also waits at), or
+/// `None` when it names no project path (a package, a builtin): it then
+/// stays an `external_module`.
+pub type MissAddress<'r> = dyn Fn(&str, &RelPath) -> Option<MissAddresses> + 'r;
 
 /// The resolver that resolves nothing: every relative import is an unlinked
 /// `resolved_module`, every other an `external_module`.
@@ -213,8 +216,9 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
         // file it is still addressed at the path it names, so the placeholder
         // stays an unlinked `resolved_module`, never an `external_module`.
         let address = match &resolved {
-            Some(path) => Some(path.as_str().to_string()),
+            Some(path) => Some(MissAddresses { primary: path.as_str().to_string(), also: Vec::new() }),
             None => relative_address(specifier, self.path)
+                .map(|primary| MissAddresses { primary, also: Vec::new() })
                 .or_else(|| self.miss_address.and_then(|address| address(specifier, self.path))),
         };
         let qualified_name = resolved.as_ref().map_or(specifier, RelPath::as_str);
@@ -223,7 +227,8 @@ impl<'a, 's, 't> Declarer<'a, 's, 't> {
             if address.is_some() { RESOLVED_MODULE_NATIVE_KIND } else { EXTERNAL_MODULE_NATIVE_KIND }
                 .to_string(),
         );
-        params.target = address.as_deref().map(|path| file_target(path, REEXPORT_ALL_NAME));
+        params.target = address
+            .map(|MissAddresses { primary, also }| file_target_also(&primary, REEXPORT_ALL_NAME, also));
         let index = self.model.add_node(params);
         let file_id = self.model.file_id().to_string();
         let target_id = self.model.node(index).id.clone();

@@ -1272,13 +1272,14 @@ mod tests {
             .unwrap()
     }
 
-    const GRAPH_TABLES: [&str; 8] = [
+    const GRAPH_TABLES: [&str; 9] = [
         "SELECT * FROM nodes ORDER BY id",
         "SELECT * FROM edges ORDER BY id",
         "SELECT nodeId, hex(embedding), embeddingVersion FROM vectors ORDER BY nodeId",
         "SELECT * FROM containers ORDER BY nodeId",
         "SELECT * FROM declarations ORDER BY nodeId, ordinal",
         "SELECT * FROM placeholder_targets ORDER BY nodeId",
+        "SELECT * FROM placeholder_also_scopes ORDER BY nodeId, scope",
         "SELECT * FROM qualified_suffixes ORDER BY nodeId, suffix",
         "SELECT * FROM untyped_calls ORDER BY nodeId, name",
     ];
@@ -1364,6 +1365,7 @@ mod tests {
                 key: TargetKey::Name("thing".to_string()),
                 from_container: None,
                 key_path: None,
+                also_scopes: Vec::new(),
             }),
             ..wire_node("alpha-p2", "src/b.alpha-src")
         };
@@ -1423,6 +1425,7 @@ mod tests {
         for table in [
             "declarations",
             "placeholder_targets",
+            "placeholder_also_scopes",
             "vectors",
             "containers",
             "qualified_suffixes",
@@ -2113,6 +2116,7 @@ mod tests {
                 key: TargetKey::QualifiedName("elsewhere::gone".to_string()),
                 from_container: None,
                 key_path: None,
+                also_scopes: Vec::new(),
             }),
             ..wire_node(id, "src/a.alpha-src")
         }

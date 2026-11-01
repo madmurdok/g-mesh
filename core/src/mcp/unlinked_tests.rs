@@ -509,6 +509,7 @@ fn call_onto_placeholder(conn: &mut Connection, id: &str, file: &str, key: &[&st
         key: key.join("::"),
         from_container: None,
         key_path: (key.len() > 1).then(|| path(key)),
+        also_scopes: Vec::new(),
     });
     upsert_node(conn, node).unwrap();
     upsert_edge(conn, EdgeRecord::new(format!("{id}_e"), &caller, id, "CALLS", "tree-sitter", resolved))

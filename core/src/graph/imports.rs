@@ -363,6 +363,7 @@ fn link(conn: &mut Connection, placeholders: Vec<Placeholder>) -> Result<LinkSum
         // (GM-292) - the cascade this module's comments assumed never ran.
         let mut drop_placeholder_dependents = [
             "DELETE FROM placeholder_targets WHERE nodeId = ?1",
+            "DELETE FROM placeholder_also_scopes WHERE nodeId = ?1",
             "DELETE FROM declarations WHERE nodeId = ?1",
             "DELETE FROM qualified_suffixes WHERE nodeId = ?1",
             "DELETE FROM untyped_calls WHERE nodeId = ?1",
@@ -456,6 +457,7 @@ mod tests {
             key: crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string(),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         }
     }
 
@@ -469,6 +471,7 @@ mod tests {
             key: crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string(),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         }
     }
 

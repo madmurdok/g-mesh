@@ -139,6 +139,7 @@ impl Extractor for ToyExtractor {
                         key: TargetKey::Name(name.to_string()),
                         from_container: None,
                         key_path: None,
+                        also_scopes: Vec::new(),
                     },
                     range,
                 );
@@ -206,6 +207,7 @@ impl SemanticEngine for ToyEngine {
                         key: TargetKey::Name(site.name.clone()),
                         from_container: site.from_container.clone(),
                         key_path: None,
+                        also_scopes: Vec::new(),
                     },
                     Range { start: site.position, end: site.position },
                 );

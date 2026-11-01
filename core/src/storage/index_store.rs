@@ -982,6 +982,7 @@ mod tests {
             key: "*".to_string(),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         });
         let diff = Diff {
             upsert_nodes: vec![
@@ -1217,6 +1218,7 @@ mod tests {
             key: name.to_string(),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         });
         node
     }

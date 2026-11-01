@@ -2008,6 +2008,7 @@ fn address_of(node: &WireNode, from_container: Option<String>) -> PlaceholderTar
         key: TargetKey::QualifiedName(node.qualified_name.clone()),
         from_container,
         key_path: node.qualified_path.clone(),
+        also_scopes: Vec::new(),
     }
 }
 
@@ -3471,6 +3472,7 @@ mod tests {
                 key: TargetKey::Name("x".into()),
                 from_container: None,
                 key_path: None,
+                also_scopes: Vec::new(),
             },
             range,
         );
@@ -3793,6 +3795,7 @@ mod tests {
             key: TargetKey::QualifiedName("m::caller".to_string()),
             from_container: Some("m".to_string()),
             key_path: None,
+            also_scopes: Vec::new(),
         });
         index.insert(
             b,
@@ -4678,6 +4681,7 @@ mod tests {
             key: TargetKey::Name(name.to_string()),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         }
     }
 
@@ -4771,12 +4775,14 @@ mod tests {
             key: TargetKey::QualifiedName("n".to_string()),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         };
         let container = PlaceholderTarget {
             scope: TargetScope::Container("m".to_string()),
             key: TargetKey::Name("n".to_string()),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         };
         let cases = [
             (
@@ -4988,6 +4994,7 @@ mod tests {
             key: TargetKey::QualifiedName("T.n".to_string()),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         };
         using_file(
             &mut index,

@@ -181,6 +181,14 @@ pub struct PlaceholderTarget {
     /// opaque string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_path: Option<QualifiedPath>,
+    /// More file paths this placeholder waits at besides its `File` scope:
+    /// the creation of any of them may resolve the import, so core selects
+    /// the importer for re-extraction on each. Core links only at `scope`;
+    /// the re-extract links at whichever file then resolves. Only on a
+    /// `resolved_module` placeholder with a `File` scope; absent reads as
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_scopes: Vec<String>,
 }
 
 /// One segment of a [`QualifiedPath`]: the separator text that joins it to
@@ -1070,6 +1078,7 @@ mod tests {
                 key: TargetKey::QualifiedName("Server.Close".to_string()),
                 from_container: Some("github.com/x/app/client".to_string()),
                 key_path: None,
+                also_scopes: Vec::new(),
             }),
             alias_paths: Vec::new(),
             untyped_calls: Vec::new(),

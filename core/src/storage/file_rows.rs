@@ -139,18 +139,22 @@ pub(crate) fn importers_of(
 }
 
 /// The other files whose `IMPORTS` edges point at an unlinked placeholder
-/// naming `file_path` as its file scope, as `(language, path)` sorted by
-/// path, with each importer's language read as in [`importers_of`]. Read
+/// naming `file_path` as its file scope or as one of its extra waiting scopes
+/// (`placeholder_also_scopes`), as `(language, path)` sorted by path, with
+/// each importer's language read as in [`importers_of`]. Read
 /// before a diff upserting `file_path`'s `File` node is linked: the link
 /// repoints exactly these edges onto that node, so afterwards they are
 /// indistinguishable from imports that were linked all along.
 pub(crate) fn waiting_importers(conn: &Connection, file_path: &str) -> Result<Vec<LanguagePath>> {
     conn.prepare_cached(
-        "SELECT DISTINCT COALESCE(f.language, src.language), src.filePath FROM placeholder_targets pt
-         JOIN edges e ON e.toId = pt.nodeId AND e.kind = 'IMPORTS'
+        "SELECT DISTINCT COALESCE(f.language, src.language), src.filePath FROM (
+             SELECT nodeId FROM placeholder_targets WHERE scopeKind = 'file' AND scope = ?1
+             UNION SELECT nodeId FROM placeholder_also_scopes WHERE scope = ?1
+         ) waiting
+         JOIN edges e ON e.toId = waiting.nodeId AND e.kind = 'IMPORTS'
          JOIN nodes src ON src.id = e.fromId
          LEFT JOIN nodes f ON f.filePath = src.filePath AND f.kind = 'File'
-         WHERE pt.scopeKind = 'file' AND pt.scope = ?1 AND src.filePath <> ?1 AND src.filePath <> ''
+         WHERE src.filePath <> ?1 AND src.filePath <> ''
          ORDER BY 2, 1",
     )
     .and_then(|mut stmt| stmt.query_map(params![file_path], |row| Ok((row.get(0)?, row.get(1)?)))?.collect())

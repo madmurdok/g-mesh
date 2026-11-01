@@ -244,6 +244,7 @@ fn to_node_record_derives_visibility_container_and_target_from_the_wire_v2_shape
         key: TargetKey::QualifiedName("Server.Close".to_string()),
         from_container: Some("github.com/x/app/client".to_string()),
         key_path: None,
+        also_scopes: Vec::new(),
     });
 
     let record = to_node_record(node, &mut PathWarnings::default());
@@ -1205,6 +1206,7 @@ fn a_bad_key_path_is_dropped_and_the_target_kept() {
         key: TargetKey::QualifiedName("a::T.f".to_string()),
         from_container: None,
         key_path: Some(key_path),
+        also_scopes: Vec::new(),
     };
     let good =
         WireNode { target: Some(target(path_of("a", &[("::", "T"), (".", "f")]))), ..canned_node("p1") };
@@ -1542,6 +1544,7 @@ fn rich_caller() -> WireNode {
             key: TargetKey::QualifiedName("mod::foo".to_string()),
             from_container: Some("mod".to_string()),
             key_path: None,
+            also_scopes: Vec::new(),
         }),
         untyped_calls: vec!["frob".to_string(), "len".to_string()],
         ..pathed_node("caller", "Alias")
@@ -1783,6 +1786,7 @@ fn pending(id: &str, file_path: &str, language: &str, scope: TargetScope, name: 
             key: TargetKey::Name(name.to_string()),
             from_container: Some("mycrate".to_string()),
             key_path: None,
+            also_scopes: Vec::new(),
         }),
         ..node_in(id, file_path)
     }
@@ -1803,6 +1807,7 @@ fn lib_rs_reparse() -> FileChangeDiff {
             key: TargetKey::Name(crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string()),
             from_container: Some("mycrate".to_string()),
             key_path: None,
+            also_scopes: Vec::new(),
         }),
         ..node_in("glob", "src/lib.rs")
     };

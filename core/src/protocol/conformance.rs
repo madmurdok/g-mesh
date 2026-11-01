@@ -9,7 +9,7 @@ use crate::graph::imports::RESOLVED_MODULE_NATIVE_KIND;
 use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::protocol::jsonrpc::read_message;
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
-use crate::protocol::types::{ControlEnvelope, NodeKind, WireNode};
+use crate::protocol::types::{ControlEnvelope, NodeKind, TargetScope, WireNode};
 
 /// The `nativeKind`s a `WireNode` stands in for something outside its own
 /// file rather than declaring anything (mirrors the plugin's own
@@ -57,6 +57,8 @@ impl ConformanceReport {
 ///    its rules ([`qualified_path_violation`]).
 ///  - `untypedCalls`, when sent, sits on a `File` or `Function` node and
 ///    names no empty string ([`untyped_calls_violation`]).
+///  - a target's `alsoScopes`, when sent, sits on a `resolved_module`
+///    placeholder with a `File` scope ([`also_scopes_violation`]).
 pub fn check_bulk_output(ndjson: &[u8]) -> ConformanceReport {
     let reader = NdjsonReader::new(BufReader::new(Cursor::new(ndjson.to_vec())));
     let mut violations = Vec::new();
@@ -77,6 +79,7 @@ fn node_shape_violations(context: &str, node: &WireNode) -> Vec<Violation> {
         .chain(plugin_emitted_container_violation(node))
         .chain(qualified_path_violation(node))
         .chain(untyped_calls_violation(node))
+        .chain(also_scopes_violation(node))
         .map(|message| Violation { context: context.to_string(), message })
         .collect()
 }
@@ -94,6 +97,22 @@ pub(crate) fn placeholder_target_violation(node: &WireNode) -> Option<String> {
         format!(
             "placeholder node {:?} (nativeKind {native_kind:?}) has no `target` (qualifiedName: {:?})",
             node.id, node.qualified_name
+        )
+    })
+}
+
+/// The `alsoScopes` rule: extra waiting scopes are file paths an unresolved
+/// import also waits at, so only a `resolved_module` placeholder whose own
+/// scope is a `File` may carry them. Absent is conformant.
+pub(crate) fn also_scopes_violation(node: &WireNode) -> Option<String> {
+    let target = node.target.as_ref().filter(|target| !target.also_scopes.is_empty())?;
+    let resolved_module = node.native_kind.as_deref() == Some(RESOLVED_MODULE_NATIVE_KIND);
+    let file_scoped = matches!(target.scope, TargetScope::File(_));
+    (!resolved_module || !file_scoped).then(|| {
+        format!(
+            "node {:?} (nativeKind {:?}) carries `alsoScopes`; only a resolved_module placeholder \
+             with a file scope may",
+            node.id, node.native_kind
         )
     })
 }

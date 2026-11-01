@@ -64,6 +64,7 @@ const NODE_COLUMNS: &str = "id, kind, name, qualifiedName, filePath, startLine, 
      qualifiedPath";
 const DECLARATION_COLUMNS: &str = "nodeId, ordinal, startLine, startCol, endLine, endCol, signature, hasBody";
 const TARGET_COLUMNS: &str = "nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile, keyPath";
+const ALSO_SCOPE_COLUMNS: &str = "nodeId, scope";
 const SUFFIX_COLUMNS: &str = "suffix, nodeId";
 const UNTYPED_COLUMNS: &str = "name, nodeId";
 const EDGE_COLUMNS: &str =
@@ -224,6 +225,7 @@ fn plan_attached(
     for (table, columns) in [
         ("declarations", DECLARATION_COLUMNS),
         ("placeholder_targets", TARGET_COLUMNS),
+        ("placeholder_also_scopes", ALSO_SCOPE_COLUMNS),
         ("qualified_suffixes", SUFFIX_COLUMNS),
         ("untyped_calls", UNTYPED_COLUMNS),
     ] {
@@ -521,7 +523,13 @@ fn swap_attached(
             OR nodeId IN (SELECT id FROM staging.plan_text_changed)",
         "the stale vectors",
     )?;
-    for table in ["declarations", "placeholder_targets", "qualified_suffixes", "untyped_calls"] {
+    for table in [
+        "declarations",
+        "placeholder_targets",
+        "placeholder_also_scopes",
+        "qualified_suffixes",
+        "untyped_calls",
+    ] {
         run(
             &format!(
                 "DELETE FROM {table} WHERE nodeId IN (SELECT id FROM staging.plan_delete_nodes)
@@ -566,6 +574,14 @@ fn swap_attached(
              WHERE nodeId IN (SELECT id FROM staging.plan_upsert_nodes)"
         ),
         "the placeholder targets",
+    )?;
+    run(
+        &format!(
+            "INSERT INTO placeholder_also_scopes ({ALSO_SCOPE_COLUMNS})
+             SELECT {ALSO_SCOPE_COLUMNS} FROM staging.placeholder_also_scopes
+             WHERE nodeId IN (SELECT id FROM staging.plan_upsert_nodes)"
+        ),
+        "the placeholder also-scopes",
     )?;
     run(
         &format!(
@@ -702,6 +718,7 @@ pub(crate) fn delete_placeholders(conn: &mut Connection, language: &str, ids: &[
             "DELETE FROM vectors WHERE nodeId = ?1",
             "DELETE FROM declarations WHERE nodeId = ?1",
             "DELETE FROM placeholder_targets WHERE nodeId = ?1",
+            "DELETE FROM placeholder_also_scopes WHERE nodeId = ?1",
             "DELETE FROM qualified_suffixes WHERE nodeId = ?1",
             "DELETE FROM untyped_calls WHERE nodeId = ?1",
             "DELETE FROM containers WHERE nodeId = ?1",
@@ -1103,6 +1120,7 @@ mod tests {
             } else {
                 qpath("a", &[("::", "T.f")])
             }),
+            also_scopes: Vec::new(),
         });
         node
     }

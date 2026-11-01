@@ -49,6 +49,9 @@ pub struct PlaceholderTargetRecord {
     /// The segments of a `qualifiedName` key; `None` for a `name` key or a
     /// plugin that sends no paths.
     pub key_path: Option<QualifiedPath>,
+    /// Further file paths the placeholder waits at besides `scope`, stored
+    /// as `placeholder_also_scopes` rows; empty for most placeholders.
+    pub also_scopes: Vec<String>,
 }
 
 pub struct NodeRecord {
@@ -444,6 +447,8 @@ fn write_diff(tx: &Connection, diff: &Diff) -> Result<()> {
             .context("failed to delete a node's declarations")?;
         tx.execute("DELETE FROM placeholder_targets WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's placeholder target")?;
+        tx.execute("DELETE FROM placeholder_also_scopes WHERE nodeId = ?1", params![id])
+            .context("failed to delete a node's placeholder also-scopes")?;
         tx.execute("DELETE FROM qualified_suffixes WHERE nodeId = ?1", params![id])
             .context("failed to delete a node's qualified suffixes")?;
         tx.execute("DELETE FROM untyped_calls WHERE nodeId = ?1", params![id])
@@ -571,7 +576,20 @@ fn write_diff(tx: &Connection, diff: &Diff) -> Result<()> {
             .context("failed to prepare the placeholder target replacement")?
             .execute(params![node.id])
             .context("failed to clear a node's placeholder target")?;
+        // Its extra waiting scopes live and die with the target row.
+        tx.prepare_cached("DELETE FROM placeholder_also_scopes WHERE nodeId = ?1")
+            .context("failed to prepare the placeholder also-scope replacement")?
+            .execute(params![node.id])
+            .context("failed to clear a node's placeholder also-scopes")?;
         if let Some(target) = &node.target {
+            for scope in &target.also_scopes {
+                tx.prepare_cached(
+                    "INSERT OR IGNORE INTO placeholder_also_scopes (nodeId, scope) VALUES (?1, ?2)",
+                )
+                .context("failed to prepare the placeholder also-scope insert")?
+                .execute(params![node.id, scope])
+                .context("failed to insert a placeholder also-scope")?;
+            }
             tx.prepare_cached(
                 "INSERT INTO placeholder_targets
                     (nodeId, scopeKind, scope, keyKind, key, fromContainer, fromFile, keyPath)
@@ -1027,6 +1045,7 @@ mod tests {
             key: key.to_string(),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         }
     }
 

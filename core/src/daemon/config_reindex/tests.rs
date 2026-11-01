@@ -72,6 +72,7 @@ fn placeholder(importer: &str, scope_kind: &str, scope: &str) -> NodeRecord {
         key: "*".to_string(),
         from_container: None,
         key_path: None,
+        also_scopes: Vec::new(),
     });
     node
 }

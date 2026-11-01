@@ -39,6 +39,7 @@ fn creates_all_tables_and_indexes() {
             "meta",
             "nodes",
             "pending_reindex",
+            "placeholder_also_scopes",
             "placeholder_targets",
             "qualified_suffixes",
             "reextract_owed_files",
@@ -71,6 +72,7 @@ fn creates_all_tables_and_indexes() {
         "idx_edges_toId",
         "idx_edges_linkedFrom",
         "idx_targets_scope",
+        "idx_also_scopes_scope",
         "idx_qualified_suffixes_nodeId",
         "idx_untyped_calls_nodeId",
         "idx_resolution_watch_paths_language",
@@ -303,8 +305,8 @@ fn wipes_and_reindexes_on_version_mismatch() {
         conn.query_row("SELECT schema_version FROM meta WHERE id = 1", [], |row| row.get(0)).unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
     // Pinned as a literal on purpose, alongside the constant: a schema change
-    // has to update this line by hand. "16" adds `resolution_watch_paths`.
-    assert_eq!(version, "16");
+    // has to update this line by hand. "17" adds `placeholder_also_scopes`.
+    assert_eq!(version, "17");
 
     let node_count: i64 = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0)).unwrap();
     assert_eq!(node_count, 0, "old data must not survive a version mismatch wipe");
@@ -1636,5 +1638,5 @@ fn a_schema_15_index_is_reset_and_its_watch_paths_are_dropped() {
 
     assert!(watch_paths(&conn, "typescript").unwrap().is_empty(), "the reset drops the watch paths");
     assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None);
-    assert!(!ensure_current(&conn, GENERATION).unwrap(), "a schema 16 index is current");
+    assert!(!ensure_current(&conn, GENERATION).unwrap(), "the reset index is current");
 }
