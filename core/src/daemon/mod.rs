@@ -724,6 +724,12 @@ fn unix_now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64)
 }
 
+/// A path as a timing line names it (GM-435): project-relative when it is
+/// inside `root`, as given otherwise.
+fn timing_path(root: &Path, path: &Path) -> String {
+    relative_wire_path(root, path).unwrap_or_else(|| path.display().to_string())
+}
+
 /// One iteration of the watcher loop: waits up to [`DEBOUNCE_WINDOW`] for a
 /// raw change, records it, then routes every settled path to `registry` in
 /// [`order_for_routing`]'s order (deletions, creations, modifications; ADR 0023).
@@ -742,12 +748,6 @@ fn unix_now_secs() -> i64 {
 /// `rescans`' scheduler, and after the batch, when the scheduler says a run is
 /// due, [`PluginRegistry::rescan_subtrees`] reconciles the pending subtrees
 /// with the disk.
-/// A path as a timing line names it (GM-435): project-relative when it is
-/// inside `root`, as given otherwise.
-fn timing_path(root: &Path, path: &Path) -> String {
-    relative_wire_path(root, path).unwrap_or_else(|| path.display().to_string())
-}
-
 fn watch_and_route_once(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
