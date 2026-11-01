@@ -2546,6 +2546,42 @@ fn exports_targets_with_dot_segments_or_a_bad_shape_inherit_nothing() {
     expect("m3", chain_pkg("pkg", r#"{"exports":false}"#, &[("tsconfig.json", "m:dflt")]), Some("dflt"));
 }
 
+/// An `exports` target that tsc 5.9 rejects (TS6053) inherits nothing: one
+/// not starting `./` (a `.\` prefix included), or one with a `.`, `..` or
+/// `node_modules` segment after its first, a backslash read as a separator
+/// for that check; the same for a `*` capture. Each rejected case has an
+/// accepted twin naming a file that exists.
+///
+/// Control: normalize backslashes before `target_accepted` in
+/// `exports_target_path` (`.\base.json` and `.\configs\*.json` resolve).
+#[test]
+fn exports_targets_tsc_rejects_for_extends_inherit_nothing() {
+    let exports = |text: &str| format!(r#"{{"exports":{text}}}"#);
+    let files = [
+        ("base.json", "m:root"),
+        ("a/base.json", "m:a"),
+        ("node_modules/x/base.json", "m:nm"),
+        ("x/keep.json", "m:keep"),
+        ("configs/base.json", "m:configs"),
+        ("configs/node_modules/x.json", "m:cnm"),
+    ];
+    let exact = |target: &str| chain_pkg("pkg/cfg", &exports(&format!(r#"{{"./cfg":{target}}}"#)), &files);
+    let star =
+        |entry: &str, target: &str| chain_pkg(entry, &exports(&format!(r#"{{"./cfg/*":{target}}}"#)), &files);
+    expect("e1 dot slash", exact(r#""./base.json""#), Some("root"));
+    expect("e2 backslash prefix", exact(r#"".\\base.json""#), None);
+    expect("e3 no dot slash", exact(r#""base.json""#), None);
+    expect("e4 node_modules segment", exact(r#""./node_modules/x/base.json""#), None);
+    expect("e5 dotdot segment", exact(r#""./a/../base.json""#), None);
+    expect("e6 dot segment", exact(r#""./a/./base.json""#), None);
+    expect("e7 inner backslash", exact(r#""./a\\base.json""#), Some("a"));
+    expect("e8 inner backslash dotdot", exact(r#""./a\\..\\base.json""#), None);
+    expect("e9 star", star("pkg/cfg/base", r#""./configs/*.json""#), Some("configs"));
+    expect("e10 star backslash prefix", star("pkg/cfg/base", r#"".\\configs\\*.json""#), None);
+    expect("e11 star capture node_modules", star("pkg/cfg/node_modules/x", r#""./configs/*.json""#), None);
+    expect("e12 star target dotdot", star("pkg/cfg/base", r#""./x/../configs/*.json""#), None);
+}
+
 /// `rest.json` before `rest/`, a nested package's own `tsconfig` field, a
 /// `.ts` or `.yaml` subpath read through `<rest>.json`, and an exact file
 /// without an extension that inherits nothing; the package `chart.js` finds
