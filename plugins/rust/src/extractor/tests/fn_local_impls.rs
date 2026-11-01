@@ -2,7 +2,10 @@
 //! node (Decision 8) inside a fn body is qualified by the fns it is inside,
 //! as rustc's def paths are, so two fns of one module that each declare a
 //! local `Nothing` with its own impl keep two nodes; a block whose name is
-//! still taken in the file is suffixed `#2`, `#3`, ... in source order.
+//! still taken by another scope of the file is suffixed `#2`, `#3`, ... in
+//! source order. Blocks of one name in one scope (such as `#[cfg]`
+//! alternatives, which are siblings) are one block, merged as every other
+//! item is.
 //!
 //! Its own module, so these tests stay apart from the parent file's; the
 //! helpers are the parent's.

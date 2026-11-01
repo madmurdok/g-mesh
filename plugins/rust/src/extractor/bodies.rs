@@ -86,6 +86,8 @@
 //! site budget with questions whose answers are not in the index anyway. A
 //! type this project declares is reachable through a `use`, which resolves.
 
+use std::collections::HashMap;
+
 use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PlaceholderTarget, QualifiedPath, TargetKey, Visibility};
 use g_mesh_plugin_sdk::{NodeSpec, OpenSite, OpenSiteKind, PlaceholderKind};
 use tree_sitter::Node;
@@ -159,6 +161,10 @@ pub(crate) struct Bodies<'a, 's> {
     /// path within its own parent (`f`, `T::m`, `<T as Tr>::m`). Empty at
     /// module level.
     pub(crate) enclosing_fns: Vec<QualifiedPath>,
+    /// The name [`Self::declare_impl_block`] gave each impl block, keyed by
+    /// the block's unsuffixed qualified name and the start byte of the node
+    /// holding it (its scope), so siblings of one scope resolve to one name.
+    pub(crate) impl_block_names: HashMap<(String, usize), String>,
 }
 
 impl Bodies<'_, '_> {
@@ -1648,13 +1654,19 @@ impl Bodies<'_, '_> {
     /// module may each declare a local `Nothing` with its own impl, and one
     /// shared name would make the two one node.
     ///
-    /// A block whose name is already taken in this file - two
-    /// `const _: () = { struct K; impl Tr for K {} };` in one module, or two
-    /// `{ struct K; impl Tr for K {} }` blocks in one fn, which rustc tells
-    /// apart (`{const#0}`, `{const#1}`) and this scheme cannot - is named
-    /// with a `#2`, `#3`, ... suffix in source order (`m::<K as Tr>#2`), so
-    /// it is a node of its own rather than dropped by [`Emitter::declare`]'s
-    /// first-wins rule. A non-colliding block keeps its plain name.
+    /// The `#2`, `#3`, ... ordinal names an anonymous scope, as rustc's
+    /// `{const#0}`, `{const#1}` do: a block whose name is already taken by
+    /// another scope of this file - two `const _: () = { struct K; impl Tr
+    /// for K {} };` in one module, or two `{ struct K; impl Tr for K {} }`
+    /// blocks in one fn - is named with the next ordinal in source order
+    /// (`m::<K as Tr>#2`), so it is a node of its own rather than dropped by
+    /// [`Emitter::declare`]'s first-wins rule. A non-colliding block keeps
+    /// its plain name.
+    ///
+    /// Blocks with one name in one scope (the node holding them, such as a
+    /// `{ }` block or a module body) are one block, as with every other
+    /// item: `#[cfg(a)]` and `#[cfg(not(a))]` alternatives are siblings and
+    /// resolve to the name the first of them was given.
     ///
     /// `public`, because a trait impl's reach is the trait's and the type's,
     /// never narrower - the same reasoning [`impl_block`] already applies to
@@ -1677,12 +1689,22 @@ impl Bodies<'_, '_> {
             .visibility(Visibility::Public)
             .in_container(module.key.clone(), module.parent.clone())
         };
-        let mut spec = spec_named(self, prefix.clone());
-        let mut ordinal = 2;
-        while self.emitter.is_declared(&spec) {
-            spec = spec_named(self, format!("{prefix}#{ordinal}"));
-            ordinal += 1;
-        }
+        let base = spec_named(self, prefix.clone());
+        let scope = item.parent().map_or(0, |parent| parent.start_byte());
+        let key = (base.qualified_name.clone(), scope);
+        let mut spec = match self.impl_block_names.get(&key) {
+            Some(name) => spec_named(self, name.clone()),
+            None => {
+                let mut spec = base;
+                let mut ordinal = 2;
+                while self.emitter.is_declared(&spec) {
+                    spec = spec_named(self, format!("{prefix}#{ordinal}"));
+                    ordinal += 1;
+                }
+                self.impl_block_names.insert(key, spec.name.clone());
+                spec
+            }
+        };
         spec.signature = signature(item, self.source);
         spec.doc_comment = outer_doc_comment(item, self.source);
         Some(self.emitter.declare(spec, true))
