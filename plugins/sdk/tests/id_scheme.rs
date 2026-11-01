@@ -109,6 +109,7 @@ fn a_name_keyed_placeholder_keeps_its_recorded_id() {
         key,
         from_container: None,
         key_path: None,
+        also_scopes: Vec::new(),
     };
     let at = RelPath::new("src/a.ts");
     let by_name =

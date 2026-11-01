@@ -457,6 +457,7 @@ pub(crate) fn container_target(container: &str, key: TargetKey, from_container: 
         key,
         from_container: Some(from_container.to_string()),
         key_path: None,
+        also_scopes: Vec::new(),
     }
 }
 

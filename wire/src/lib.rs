@@ -181,6 +181,14 @@ pub struct PlaceholderTarget {
     /// opaque string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_path: Option<QualifiedPath>,
+    /// More file paths this placeholder waits at besides its `File` scope:
+    /// the creation of any of them may resolve the import, so core selects
+    /// the importer for re-extraction on each. Core links only at `scope`;
+    /// the re-extract links at whichever file then resolves. Only on a
+    /// `resolved_module` placeholder with a `File` scope; absent reads as
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_scopes: Vec<String>,
 }
 
 /// One segment of a [`QualifiedPath`]: the separator text that joins it to
@@ -1070,6 +1078,7 @@ mod tests {
                 key: TargetKey::QualifiedName("Server.Close".to_string()),
                 from_container: Some("github.com/x/app/client".to_string()),
                 key_path: None,
+                also_scopes: Vec::new(),
             }),
             alias_paths: Vec::new(),
             untyped_calls: Vec::new(),
@@ -1928,5 +1937,25 @@ mod tests {
         let trailing = PathScope { under: "a/".to_string(), not_under: vec![] };
         assert!(trailing.contains("a/x.ts"));
         assert!(!trailing.contains("ab/x.ts"));
+    }
+
+    /// GM-676: `alsoScopes` reads as empty when absent (every pre-4.22
+    /// plugin), is not written when empty, and survives a round trip when
+    /// set. Control: drop `serde(default)` from `also_scopes` (the absent
+    /// line no longer parses).
+    #[test]
+    fn placeholder_target_also_scopes_default_empty_and_round_trip() {
+        let absent = r#"{"scope":{"file":"generated/a"},"key":{"name":"*"}}"#;
+        let target: PlaceholderTarget = serde_json::from_str(absent).unwrap();
+        assert!(target.also_scopes.is_empty());
+        assert_eq!(serde_json::to_string(&target).unwrap(), absent, "an empty list is not written");
+
+        let set = PlaceholderTarget {
+            also_scopes: vec!["src/env.ts".to_string(), "lib/env".to_string()],
+            ..target
+        };
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(json.contains(r#""alsoScopes":["src/env.ts","lib/env"]"#), "{json}");
+        assert_eq!(serde_json::from_str::<PlaceholderTarget>(&json).unwrap(), set);
     }
 }

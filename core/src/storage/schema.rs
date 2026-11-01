@@ -94,7 +94,11 @@ use crate::languages::LanguageOutcome;
 ///
 /// "16" adds the `resolution_watch_paths` table. An existing index holds
 /// facts without the files whose save changes them, so it is rebuilt.
-pub const CURRENT_SCHEMA_VERSION: &str = "16";
+///
+/// "17" adds the `placeholder_also_scopes` table. An existing index holds no
+/// extra waiting scopes, so an import waiting at a static fallback would stay
+/// unlinked when that file is created; it is rebuilt.
+pub const CURRENT_SCHEMA_VERSION: &str = "17";
 
 /// The generation of the extractor+linker whose output an index holds.
 ///
@@ -416,6 +420,25 @@ CREATE TABLE IF NOT EXISTS placeholder_targets (
 -- reads `key`, only `(scopeKind, scope)` - its own "new file"/"new container
 -- member" triggers - so it uses this index's leading columns.
 CREATE INDEX IF NOT EXISTS idx_targets_scope ON placeholder_targets(scopeKind, scope, key);
+
+-- The further file paths a `file`-scoped placeholder waits at besides its
+-- `placeholder_targets.scope` (the wire's `PlaceholderTarget::also_scopes`):
+-- the "who waits at this path" reads (`file_rows::waiting_importers`,
+-- `config_reindex::indexed_importers`) select its importer for each, while
+-- linking stays keyed by the primary scope alone. A placeholder with none has
+-- no rows.
+--
+-- Written only by `storage::write::apply_diff`, which replaces a node's set
+-- together with its `placeholder_targets` row. Foreign keys are off on the
+-- daemon's connection, so every site that deletes or replaces a
+-- `placeholder_targets` row does the same here, or a later node with the same
+-- id inherits the orphan rows.
+CREATE TABLE IF NOT EXISTS placeholder_also_scopes (
+    nodeId TEXT NOT NULL,
+    scope  TEXT NOT NULL,
+    PRIMARY KEY (nodeId, scope)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_also_scopes_scope ON placeholder_also_scopes(scope);
 
 -- Every spelling by which a partial path finds a declaration: each suffix of
 -- its `qualifiedPath` that starts at segment 1 or later and keeps at least
@@ -2137,6 +2160,7 @@ fn wipe(conn: &Connection) -> Result<()> {
         // just the project-wide roll-up).
         "DROP TABLE IF EXISTS declarations; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS vectors; \
          DROP TABLE IF EXISTS containers; DROP TABLE IF EXISTS placeholder_targets; \
+         DROP TABLE IF EXISTS placeholder_also_scopes; \
          DROP TABLE IF EXISTS qualified_suffixes; DROP TABLE IF EXISTS untyped_calls; \
          DROP TABLE IF EXISTS nodes; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS indexed_files; \
          DROP TABLE IF EXISTS language_state; DROP TABLE IF EXISTS pending_reindex; \

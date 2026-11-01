@@ -1272,13 +1272,14 @@ mod tests {
             .unwrap()
     }
 
-    const GRAPH_TABLES: [&str; 8] = [
+    const GRAPH_TABLES: [&str; 9] = [
         "SELECT * FROM nodes ORDER BY id",
         "SELECT * FROM edges ORDER BY id",
         "SELECT nodeId, hex(embedding), embeddingVersion FROM vectors ORDER BY nodeId",
         "SELECT * FROM containers ORDER BY nodeId",
         "SELECT * FROM declarations ORDER BY nodeId, ordinal",
         "SELECT * FROM placeholder_targets ORDER BY nodeId",
+        "SELECT * FROM placeholder_also_scopes ORDER BY nodeId, scope",
         "SELECT * FROM qualified_suffixes ORDER BY nodeId, suffix",
         "SELECT * FROM untyped_calls ORDER BY nodeId, name",
     ];
@@ -1329,7 +1330,7 @@ mod tests {
 
     /// Test 2: a symbol the new walk no longer emits is gone after the swap,
     /// with every row keyed by it: its edges, declarations, placeholder
-    /// target, vector and emptied container.
+    /// target and extra waiting scopes, vector and emptied container.
     ///
     /// Control: skip the plan's `plan_delete_nodes` insert in
     /// `language_swap::plan_attached` -> `alpha-n2` survives.
@@ -1358,12 +1359,13 @@ mod tests {
         };
         let placeholder = WireNode {
             kind: NodeKind::Module,
-            native_kind: Some("pending_symbol".to_string()),
+            native_kind: Some("resolved_module".to_string()),
             target: Some(PlaceholderTarget {
                 scope: TargetScope::File("src/elsewhere.alpha-src".to_string()),
                 key: TargetKey::Name("thing".to_string()),
                 from_container: None,
                 key_path: None,
+                also_scopes: vec!["src/fallback.alpha-src".to_string()],
             }),
             ..wire_node("alpha-p2", "src/b.alpha-src")
         };
@@ -1385,6 +1387,7 @@ mod tests {
                 ("nodes", "id"),
                 ("declarations", "nodeId"),
                 ("placeholder_targets", "nodeId"),
+                ("placeholder_also_scopes", "nodeId"),
                 ("vectors", "nodeId"),
                 ("qualified_suffixes", "nodeId"),
                 ("untyped_calls", "nodeId"),
@@ -1423,6 +1426,7 @@ mod tests {
         for table in [
             "declarations",
             "placeholder_targets",
+            "placeholder_also_scopes",
             "vectors",
             "containers",
             "qualified_suffixes",
@@ -2113,6 +2117,7 @@ mod tests {
                 key: TargetKey::QualifiedName("elsewhere::gone".to_string()),
                 from_container: None,
                 key_path: None,
+                also_scopes: Vec::new(),
             }),
             ..wire_node(id, "src/a.alpha-src")
         }

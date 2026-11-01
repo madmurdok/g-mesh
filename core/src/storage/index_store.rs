@@ -982,6 +982,7 @@ mod tests {
             key: "*".to_string(),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         });
         let diff = Diff {
             upsert_nodes: vec![
@@ -1217,6 +1218,7 @@ mod tests {
             key: name.to_string(),
             from_container: None,
             key_path: None,
+            also_scopes: Vec::new(),
         });
         node
     }
@@ -1561,5 +1563,67 @@ mod tests {
             assert!(conn.is_autocommit());
         }
         assert_eq!(use_ts_edges(&reader), linked_state(), "the linker committed");
+    }
+
+    /// `importer`'s import, unresolved: a `File`-scoped placeholder at
+    /// `generated/a` that also waits at `also`.
+    fn waiting_with_also(store: &IndexStore, importer: &str, also: &str) {
+        let id = format!("ph:{importer}:@env/a");
+        let mut placeholder =
+            NodeRecord::new(id.clone(), "Module", "@env/a", "@env/a", importer, "typescript");
+        placeholder.native_kind = Some("resolved_module".to_string());
+        placeholder.target = Some(crate::storage::write::PlaceholderTargetRecord {
+            scope_kind: "file".to_string(),
+            scope: "generated/a".to_string(),
+            key_kind: "name".to_string(),
+            key: "*".to_string(),
+            from_container: None,
+            key_path: None,
+            also_scopes: vec![also.to_string()],
+        });
+        let diff = Diff {
+            upsert_nodes: vec![
+                NodeRecord::new(
+                    format!("File:{importer}"),
+                    "File",
+                    importer,
+                    importer,
+                    importer,
+                    "typescript",
+                ),
+                placeholder,
+            ],
+            upsert_edges: vec![crate::storage::write::EdgeRecord::new(
+                format!("i:{importer}->@env/a"),
+                format!("File:{importer}"),
+                id,
+                "IMPORTS",
+                "tree-sitter",
+                false,
+            )],
+            ..Default::default()
+        };
+        store.unit(Unit::WatcherApply, |writer| writer.apply_diff_linked(&diff, "seed")).unwrap();
+    }
+
+    /// GM-676 (7a): an importer waiting at a path only through an extra
+    /// scope of its placeholder is reported for that path's diff, and an
+    /// importer whose extra scope is another path is not.
+    ///
+    /// Control: drop the `placeholder_also_scopes` UNION from
+    /// `file_rows::waiting_importers` (nothing is reported).
+    #[test]
+    fn a_file_diff_reports_an_importer_waiting_at_its_path_through_an_also_scope() {
+        let store = store_without_foreign_keys();
+        waiting_with_also(&store, "use.ts", "src/env.ts");
+        waiting_with_also(&store, "other.ts", "src/other.ts");
+
+        let linked = store
+            .unit(Unit::WatcherApply, |writer| {
+                writer.apply_file_diff_linked(&mut Diff::default(), "src/env.ts", FileScope::Partial, "test")
+            })
+            .unwrap();
+
+        assert_eq!(linked.waiting_importers, vec![("typescript".to_string(), "use.ts".to_string())]);
     }
 }

@@ -9,7 +9,7 @@ use crate::graph::imports::RESOLVED_MODULE_NATIVE_KIND;
 use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::protocol::jsonrpc::read_message;
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
-use crate::protocol::types::{ControlEnvelope, NodeKind, WireNode};
+use crate::protocol::types::{ControlEnvelope, NodeKind, TargetScope, WireNode};
 
 /// The `nativeKind`s a `WireNode` stands in for something outside its own
 /// file rather than declaring anything (mirrors the plugin's own
@@ -57,6 +57,8 @@ impl ConformanceReport {
 ///    its rules ([`qualified_path_violation`]).
 ///  - `untypedCalls`, when sent, sits on a `File` or `Function` node and
 ///    names no empty string ([`untyped_calls_violation`]).
+///  - a target's `alsoScopes`, when sent, sits on a `resolved_module`
+///    placeholder with a `File` scope ([`also_scopes_violation`]).
 pub fn check_bulk_output(ndjson: &[u8]) -> ConformanceReport {
     let reader = NdjsonReader::new(BufReader::new(Cursor::new(ndjson.to_vec())));
     let mut violations = Vec::new();
@@ -77,6 +79,7 @@ fn node_shape_violations(context: &str, node: &WireNode) -> Vec<Violation> {
         .chain(plugin_emitted_container_violation(node))
         .chain(qualified_path_violation(node))
         .chain(untyped_calls_violation(node))
+        .chain(also_scopes_violation(node))
         .map(|message| Violation { context: context.to_string(), message })
         .collect()
 }
@@ -94,6 +97,22 @@ pub(crate) fn placeholder_target_violation(node: &WireNode) -> Option<String> {
         format!(
             "placeholder node {:?} (nativeKind {native_kind:?}) has no `target` (qualifiedName: {:?})",
             node.id, node.qualified_name
+        )
+    })
+}
+
+/// The `alsoScopes` rule: extra waiting scopes are file paths an unresolved
+/// import also waits at, so only a `resolved_module` placeholder whose own
+/// scope is a `File` may carry them. Absent is conformant.
+pub(crate) fn also_scopes_violation(node: &WireNode) -> Option<String> {
+    let target = node.target.as_ref().filter(|target| !target.also_scopes.is_empty())?;
+    let resolved_module = node.native_kind.as_deref() == Some(RESOLVED_MODULE_NATIVE_KIND);
+    let file_scoped = matches!(target.scope, TargetScope::File(_));
+    (!resolved_module || !file_scoped).then(|| {
+        format!(
+            "node {:?} (nativeKind {:?}) carries `alsoScopes`; only a resolved_module placeholder \
+             with a file scope may",
+            node.id, node.native_kind
         )
     })
 }
@@ -285,6 +304,32 @@ mod tests {
         let report = check_bulk_output(empty_name.as_bytes());
         assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
         assert!(report.violations[0].message.contains("empty name"), "{:?}", report.violations);
+    }
+
+    const ALSO_SCOPED_IMPORT: &str = "{\"id\":\"n1\",\"kind\":\"Module\",\"name\":\"@env/a\",\"qualifiedName\":\"@env/a\",\"filePath\":\"a.ts\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"visibility\":\"file\",\"language\":\"typescript\",\"nativeKind\":\"resolved_module\",\"target\":{\"scope\":{\"file\":\"generated/a\"},\"key\":{\"name\":\"*\"},\"alsoScopes\":[\"src/env.ts\"]}}\n";
+
+    /// GM-676 (M3): `alsoScopes` on a `resolved_module` placeholder with a
+    /// `File` scope is conformant, as is an empty list anywhere; on another
+    /// placeholder kind, or under a `Container` scope, it is a violation
+    /// naming the node. Controls: return `None` from `also_scopes_violation`,
+    /// or drop its chain from `node_shape_violations` (no violation).
+    #[test]
+    fn also_scopes_belong_on_a_file_scoped_resolved_module() {
+        let report = check_bulk_output(ALSO_SCOPED_IMPORT.as_bytes());
+        assert!(report.is_conformant(), "{:?}", report.violations);
+        let empty = ALSO_SCOPED_IMPORT.replace("[\"src/env.ts\"]", "[]");
+        let empty_pending = empty.replace("resolved_module", "pending_symbol");
+        assert!(check_bulk_output(empty_pending.as_bytes()).is_conformant(), "an empty list is absent");
+
+        for bad in [
+            ALSO_SCOPED_IMPORT.replace("resolved_module", "pending_symbol"),
+            ALSO_SCOPED_IMPORT.replace("{\"file\":\"generated/a\"}", "{\"container\":\"pkg\"}"),
+        ] {
+            let report = check_bulk_output(bad.as_bytes());
+            assert_eq!(report.violations.len(), 1, "{bad}: {:?}", report.violations);
+            assert!(report.violations[0].message.contains("alsoScopes"), "{:?}", report.violations);
+            assert!(report.violations[0].message.contains("n1"), "{:?}", report.violations);
+        }
     }
 
     #[test]

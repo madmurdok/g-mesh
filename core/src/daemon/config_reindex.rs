@@ -317,8 +317,10 @@ fn indexed_file_count(conn: &Connection, language: &str) -> Result<usize> {
 /// The importers in `language` of every `IMPORTS` edge whose target of
 /// `scope_kind` is exactly `key`, by the same rule as [`StoredImport::target`]:
 /// an unlinked edge through its placeholder's scope, a linked one through the
-/// `File` path or container key of the node it points at. Each half starts at
-/// an index on the key (`idx_targets_scope`, `idx_nodes_filePath`, the
+/// `File` path or container key of the node it points at; for a `File` key,
+/// also an unlinked edge whose placeholder lists `key` among its extra
+/// waiting scopes. Each part starts at an index on the key
+/// (`idx_targets_scope`, `idx_also_scopes_scope`, `idx_nodes_filePath`, the
 /// containers' `(language, key)`), then follows `idx_edges_toId`.
 ///
 /// A linked container is looked up in the importer's language: the linker
@@ -337,6 +339,11 @@ fn indexed_importers(
              JOIN edges e ON e.toId = t.id
              JOIN nodes src ON src.id = e.fromId
              WHERE pt.scopeKind = 'file' AND pt.scope = ?2 AND e.kind = 'IMPORTS' AND src.language = ?1
+             UNION
+             SELECT src.filePath FROM placeholder_also_scopes a
+             JOIN edges e ON e.toId = a.nodeId
+             JOIN nodes src ON src.id = e.fromId
+             WHERE a.scope = ?2 AND e.kind = 'IMPORTS' AND src.language = ?1
              UNION
              SELECT src.filePath FROM nodes t
              JOIN edges e ON e.toId = t.id

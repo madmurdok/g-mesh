@@ -123,5 +123,12 @@ pub fn file_target(target_file: &str, name: &str) -> PlaceholderTarget {
         key: TargetKey::Name(name.to_string()),
         from_container: None,
         key_path: None,
+        also_scopes: Vec::new(),
     }
+}
+
+/// [`file_target`] that also waits at the files `also_scopes` (an
+/// unresolved import's static fallbacks).
+pub fn file_target_also(target_file: &str, name: &str, also_scopes: Vec<String>) -> PlaceholderTarget {
+    PlaceholderTarget { also_scopes, ..file_target(target_file, name) }
 }

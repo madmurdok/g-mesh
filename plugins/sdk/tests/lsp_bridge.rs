@@ -254,6 +254,7 @@ fn fixture_with_structural_edge(scratch: &Scratch, structural: bool) -> (SdkInde
                 key: TargetKey::QualifiedName("Receiver::add".to_string()),
                 from_container: Some("pkg".to_string()),
                 key_path: None,
+                also_scopes: Vec::new(),
             },
             range(1, SITE_CHAR_COL, 1, SITE_CHAR_COL + 3),
         );
@@ -2275,6 +2276,7 @@ fn typed_site_fixture(
                     key: TargetKey::QualifiedName(d_add.qualified_name.clone()),
                     from_container: Some("pkg".to_string()),
                     key_path: d_add.qualified_path.clone(),
+                    also_scopes: Vec::new(),
                 },
                 range(AGREE, 4, AGREE, 7),
             );
@@ -2289,6 +2291,7 @@ fn typed_site_fixture(
                     key: TargetKey::QualifiedName("reexp::add".to_string()),
                     from_container: Some("pkg".to_string()),
                     key_path: d_add.qualified_path.clone(),
+                    also_scopes: Vec::new(),
                 },
                 range(AGREE, 4, AGREE, 7),
             );
@@ -3130,6 +3133,7 @@ fn overload_fixture(scratch: &Scratch, sites: &[OSite]) -> Overloads {
                 key,
                 from_container: Some("pkg".to_string()),
                 key_path,
+                also_scopes: Vec::new(),
             },
             range(line, 2, line, 3),
         );

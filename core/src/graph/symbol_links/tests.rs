@@ -184,6 +184,7 @@ fn target(
         key: key.to_string(),
         from_container: from.map(str::to_string),
         key_path: None,
+        also_scopes: Vec::new(),
     }
 }
 

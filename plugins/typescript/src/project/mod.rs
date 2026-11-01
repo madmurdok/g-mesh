@@ -194,7 +194,10 @@ impl TsProject {
     /// ([`resolve::waiting_addresses_for`]), so a new `generated/x.ts` names
     /// `src/x`, where `@/x` under `["src/*", "generated/*"]` waits. A key
     /// equal to `path` itself selects only the importers that were waiting
-    /// at `path` before core linked them, not every importer of `path`.
+    /// at `path` before core linked them, not every importer of `path`. Such
+    /// an import also waits at every static target of the wildcard entries
+    /// matching it (`src/env.ts` under `["generated/*", "src/env.ts"]`), so
+    /// creating that target selects it through the same key.
     ///
     /// A `paths` target climbing out of its capture (`"@m/*": ["./*/..",
     /// "./gen/*"]`) names one address for a whole family of specifiers, so

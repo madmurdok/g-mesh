@@ -52,6 +52,7 @@ fn target(file: &str, name: &str) -> PlaceholderTarget {
         key: TargetKey::Name(name.to_string()),
         from_container: None,
         key_path: None,
+        also_scopes: Vec::new(),
     }
 }
 

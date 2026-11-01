@@ -27,8 +27,9 @@ use crate::extractor::grammar::grammar_for;
 use crate::project::exports::{
     imports_base, imports_specifiers_targeting, imports_targets, key_targets, match_wildcard, PackageImports,
 };
+use crate::project::jsonc::Json;
 use crate::project::paths;
-use crate::project::tsconfig::{expand_paths_candidates, specifiers_targeting, EffectiveConfig};
+use crate::project::tsconfig::{expand_paths_candidates, specifiers_targeting, EffectiveConfig, PathsEntry};
 use crate::project::workspace::{
     package_entry_targets, package_may_name, parse_bare_specifier, subpaths_targeting, WorkspacePackage,
 };
@@ -311,27 +312,86 @@ fn static_targets_naming(project: &TsProject, configs: &[&EffectiveConfig], path
     addresses.push(path.to_string());
     let mut targets: Vec<String> = Vec::new();
     for config in configs {
-        for entry in &config.paths {
-            if !entry.pattern.contains('*') || entry.pattern == CATCH_ALL_PATTERN {
-                continue;
-            }
-            for target in entry.targets.iter().filter(|target| !target.contains('*')) {
-                targets.extend(paths::inside_or_root(&config.resolve_dir, target));
-            }
+        for entry in config.paths.iter().filter(|entry| is_wildcard_entry(entry)) {
+            targets.extend(paths_static_targets(config, entry));
         }
     }
     for config in project.imports_by_dir.values().flatten() {
-        for (key, value) in &config.imports {
-            if !key.contains('*') {
-                continue;
-            }
-            for target in key_targets(value, None).into_iter().filter(|target| !target.contains('*')) {
-                targets.extend(imports_base(&config.dir, &target));
-            }
+        for (_, value) in config.imports.iter().filter(|(key, _)| key.contains('*')) {
+            targets.extend(imports_static_targets(config, value));
         }
     }
     targets.retain(|target| addresses.contains(target));
     targets
+}
+
+/// Whether a `paths` entry is a wildcard one other than the catch-all `"*"`:
+/// the entries whose static targets a specifier waits at.
+fn is_wildcard_entry(entry: &PathsEntry) -> bool {
+    entry.pattern.contains('*') && entry.pattern != CATCH_ALL_PATTERN
+}
+
+/// The targets without `*` of one `paths` entry of `config`, resolved the way
+/// the forward lookup resolves them. [`static_targets_naming`] and
+/// [`static_fallbacks`] both go through it, so the create side offers
+/// exactly the strings the record side waits at.
+fn paths_static_targets<'c>(
+    config: &'c EffectiveConfig,
+    entry: &'c PathsEntry,
+) -> impl Iterator<Item = String> + 'c {
+    entry
+        .targets
+        .iter()
+        .filter(|target| !target.contains('*'))
+        .filter_map(|target| paths::inside_or_root(&config.resolve_dir, target))
+}
+
+/// The targets without `*` of one `imports` key's `value` under `config`, as
+/// bases the forward lookup probes ([`imports_base`]).
+fn imports_static_targets(config: &PackageImports, value: &Json) -> Vec<String> {
+    key_targets(value, None)
+        .into_iter()
+        .filter(|target| !target.contains('*'))
+        .filter_map(|target| imports_base(&config.dir, &target))
+        .collect()
+}
+
+/// The static targets an unresolved `specifier` also waits at, besides its
+/// [`waiting_address`]: the targets without `*` of the wildcard `paths`
+/// entries of `config` that match it (the catch-all `"*"` excluded) and, for
+/// a `#` specifier, of the wildcard `imports` keys that match it, in
+/// declaration order, deduplicated. Such a target names one file for every
+/// capture, so no specifier can be derived from it when it is created; the
+/// placeholder lists it so that create selects the importer.
+fn static_fallbacks(
+    specifier: &str,
+    config: Option<&EffectiveConfig>,
+    imports: Option<&PackageImports>,
+) -> Vec<String> {
+    let mut fallbacks: Vec<String> = Vec::new();
+    let mut push = |target: String| {
+        if !fallbacks.contains(&target) {
+            fallbacks.push(target);
+        }
+    };
+    if specifier.starts_with('#') {
+        if let Some(config) = imports {
+            for (key, value) in &config.imports {
+                if key.contains('*') && match_wildcard(key, specifier).is_some() {
+                    imports_static_targets(config, value).into_iter().for_each(&mut push);
+                }
+            }
+        }
+        return fallbacks;
+    }
+    if let Some(config) = config {
+        for entry in &config.paths {
+            if is_wildcard_entry(entry) && match_wildcard(&entry.pattern, specifier).is_some() {
+                paths_static_targets(config, entry).for_each(&mut push);
+            }
+        }
+    }
+    fallbacks
 }
 
 /// Every distinct tsconfig of the project (configs shared by several
@@ -709,15 +769,30 @@ fn matched_beyond_catch_all(config: &EffectiveConfig, specifier: &str) -> bool {
     })
 }
 
+/// Where an unresolved non-relative import waits: its primary address and
+/// the further file paths whose create may resolve it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissAddresses {
+    /// The [`waiting_address`]: the placeholder's scope.
+    pub primary: String,
+    /// The [`static_fallbacks`] other than `primary`, in declaration order.
+    pub also: Vec<String>,
+}
+
 /// [`waiting_address`] for `specifier` written in `from`, under the tsconfig
-/// and `imports` map nearest `from`. `None` for a relative specifier (its
-/// address is [`relative_address`]) or an importer outside the root.
-pub fn miss_address(project: &TsProject, specifier: &str, from: &RelPath) -> Option<String> {
+/// and `imports` map nearest `from`, with its [`static_fallbacks`] under the
+/// same two. `None` for a relative specifier (its address is
+/// [`relative_address`]) or an importer outside the root.
+pub fn miss_address(project: &TsProject, specifier: &str, from: &RelPath) -> Option<MissAddresses> {
     if is_relative_specifier(specifier) {
         return None;
     }
     let dir = importer_dir(from)?;
-    waiting_address(project, specifier, project.tsconfig_for(dir), project.imports_for(dir))
+    let (config, imports) = (project.tsconfig_for(dir), project.imports_for(dir));
+    let primary = waiting_address(project, specifier, config, imports)?;
+    let mut also = static_fallbacks(specifier, config, imports);
+    also.retain(|target| *target != primary);
+    Some(MissAddresses { primary, also })
 }
 
 /// The file `specifier`, written in `from`, names: relative first, then

@@ -1282,6 +1282,13 @@ fn to_placeholder_target_record(
         key,
         from_container: target.from_container.clone(),
         key_path,
+        // Extra waiting scopes are file paths: kept only on a file-scoped
+        // target (the conformance rule), never read as container keys.
+        also_scopes: if matches!(target.scope, TargetScope::File(_)) {
+            target.also_scopes.clone()
+        } else {
+            Vec::new()
+        },
     }
 }
 

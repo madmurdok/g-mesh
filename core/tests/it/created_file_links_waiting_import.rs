@@ -794,3 +794,171 @@ fn creating_a_file_a_climbing_target_reaches_links_a_waiting_import() {
 
     assert_linked_with_bindings(&harness, "lib.ts");
 }
+
+// -------------------------------------------------------------------------
+// GM-676: an import also waits at the static targets of its wildcard entry
+// -------------------------------------------------------------------------
+
+const ENV_FALLBACK: (&str, &str) = (
+    "tsconfig.json",
+    r#"{"compilerOptions":{"baseUrl":".","paths":{"@env/*":["generated/*","src/env.ts"]}}}"#,
+);
+
+/// `placeholder_also_scopes` rows as `(importer, scope)`, sorted.
+fn also_scopes(harness: &Harness) -> Vec<(String, String)> {
+    harness.conn.with(|c| {
+        let mut statement = c
+            .prepare(
+                "SELECT n.filePath, a.scope FROM placeholder_also_scopes a \
+                 JOIN nodes n ON n.id = a.nodeId ORDER BY 1, 2",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    })
+}
+
+/// `placeholder_also_scopes` rows whose node is gone.
+fn orphan_also_scopes(harness: &Harness) -> i64 {
+    harness.conn.with(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM placeholder_also_scopes WHERE nodeId NOT IN (SELECT id FROM nodes)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    })
+}
+
+fn pair(importer: &str, scope: &str) -> (String, String) {
+    (importer.to_string(), scope.to_string())
+}
+
+/// The GM-676 acceptance: `@env/a` under `["generated/*", "src/env.ts"]`
+/// waits at `generated/a` and also at `src/env.ts`; creating `src/env.ts`
+/// re-extracts only its importer (no whole-language reindex), which links
+/// it there with its binding, and the dropped placeholder leaves no
+/// extra-scope row behind.
+///
+/// Controls: `miss_address` returns no `also`; the also-scope UNION dropped
+/// from `file_rows::waiting_importers` (the import stays unlinked).
+#[test]
+fn creating_the_static_fallback_of_a_wildcard_alias_links_a_waiting_import() {
+    let harness = waiting_importer(&[ENV_FALLBACK], &[], "@env/a");
+    assert_eq!(also_scopes(&harness), vec![pair("src/a.ts", "src/env.ts")], "stored with its extra scope");
+
+    create_function(&harness, "src/env.ts");
+
+    assert_linked_with_bindings(&harness, "src/env.ts");
+    assert!(also_scopes(&harness).is_empty(), "{:?}", also_scopes(&harness));
+    assert_eq!(orphan_also_scopes(&harness), 0);
+}
+
+/// A later static target of the same entry (`lib/env.ts`) links the waiting
+/// import just the same.
+#[test]
+fn creating_a_second_static_fallback_links_a_waiting_import() {
+    let harness = waiting_importer(
+        &[(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@env/*":["generated/*","src/env.ts","lib/env.ts"]}}}"#,
+        )],
+        &[],
+        "@env/a",
+    );
+    assert_eq!(also_scopes(&harness), vec![pair("src/a.ts", "lib/env.ts"), pair("src/a.ts", "src/env.ts")]);
+
+    create_function(&harness, "lib/env.ts");
+
+    assert_linked_with_bindings(&harness, "lib/env.ts");
+}
+
+/// A static target written without extension, `src/env`, never equals the
+/// created path: the key `src/env` goes through `indexed_importers`, which
+/// finds the import by its extra scope.
+///
+/// Control: the also-scope UNION dropped from `indexed_importers`.
+#[test]
+fn creating_the_file_of_an_extensionless_static_fallback_links_a_waiting_import() {
+    let harness = waiting_importer(
+        &[(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@env/*":["generated/*","src/env"]}}}"#,
+        )],
+        &[],
+        "@env/a",
+    );
+    assert_eq!(also_scopes(&harness), vec![pair("src/a.ts", "src/env")]);
+
+    create_function(&harness, "src/env.ts");
+
+    assert_linked_with_bindings(&harness, "src/env.ts");
+}
+
+/// A package.json `imports` key with a static target in its list: `#env/a.ts`
+/// waits there too and links once it is created.
+///
+/// Control: drop the `#` arm of `static_fallbacks`.
+#[test]
+fn creating_the_static_fallback_of_a_wildcard_imports_key_links_a_waiting_import() {
+    let harness = waiting_importer(
+        &[("package.json", r##"{"name":"root","imports":{"#env/*":["./generated/*","./src/env.ts"]}}"##)],
+        &[],
+        "#env/a.ts",
+    );
+    assert_eq!(also_scopes(&harness), vec![pair("src/a.ts", "src/env.ts")]);
+
+    create_function(&harness, "src/env.ts");
+
+    assert_linked_with_bindings(&harness, "src/env.ts");
+}
+
+/// The extra scope does not widen the wildcard target's create: under the
+/// same config, creating `generated/a.ts` re-extracts only the importer of
+/// `@env/a`, not the one of `@env/b`, though both also wait at `src/env.ts`.
+#[test]
+fn creating_the_wildcard_target_still_selects_only_its_own_importer() {
+    let harness = indexed_with_configs(
+        &[ENV_FALLBACK],
+        &[
+            ("src/b.ts", "import { created } from \"@env/b\";\n"),
+            ("src/a.ts", "import { created } from \"@env/a\";\n"),
+        ],
+    );
+    assert_eq!(also_scopes(&harness), vec![pair("src/a.ts", "src/env.ts"), pair("src/b.ts", "src/env.ts")]);
+
+    create(&harness, "generated/a.ts");
+
+    assert_eq!(harness.imports("src/a.ts"), (vec!["generated/a.ts:a.ts".to_string()], Vec::new()));
+    assert!(harness.imports("src/b.ts").0.is_empty(), "@env/b still waits");
+    assert_only_the_importer_re_extracted(&harness);
+    assert_eq!(also_scopes(&harness), vec![pair("src/b.ts", "src/env.ts")]);
+}
+
+/// Deleting the linked static fallback puts the import back to waiting, with
+/// its extra scope stored once more and no orphan row, and re-creating it
+/// links it again; deleting the importer then takes its rows with it.
+#[test]
+fn a_deleted_static_fallback_leaves_the_import_waiting_there_again() {
+    let harness = waiting_importer(&[ENV_FALLBACK], &[], "@env/a");
+    create_function(&harness, "src/env.ts");
+    assert_eq!(harness.imports("src/a.ts").0, vec!["src/env.ts:env.ts".to_string()]);
+
+    delete(&harness, "src/env.ts");
+
+    assert!(harness.imports("src/a.ts").0.is_empty(), "@env/a waits again");
+    assert_eq!(also_scopes(&harness), vec![pair("src/a.ts", "src/env.ts")]);
+    assert_eq!((orphan_also_scopes(&harness), dangling(&harness)), (0, 0));
+
+    create_function(&harness, "src/env.ts");
+    assert_eq!(harness.imports("src/a.ts").0, vec!["src/env.ts:env.ts".to_string()]);
+    assert!(also_scopes(&harness).is_empty());
+
+    delete(&harness, "src/env.ts");
+    delete(&harness, "src/a.ts");
+    assert!(also_scopes(&harness).is_empty(), "{:?}", also_scopes(&harness));
+    assert_eq!((orphan_also_scopes(&harness), dangling(&harness)), (0, 0));
+}
