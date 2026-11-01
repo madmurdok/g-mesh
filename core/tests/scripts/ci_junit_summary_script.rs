@@ -4,7 +4,6 @@
 //! one per module, the former test file, so a failure stays attributable to
 //! the file it came from. Run for real against hand-written JUnit; python3
 //! only, so Unix only, like the other script tests.
-#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

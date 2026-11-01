@@ -11,7 +11,6 @@
 //! binary and against a backtrace; it needs the macOS toolchain, so it is
 //! macOS-only. Every test points `CARGO_TARGET_DIR` at a temp dir: the script
 //! must never see this checkout's own `target`.
-#![cfg(unix)]
 
 use std::collections::BTreeSet;
 use std::fs;
