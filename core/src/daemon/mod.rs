@@ -742,6 +742,12 @@ fn unix_now_secs() -> i64 {
 /// `rescans`' scheduler, and after the batch, when the scheduler says a run is
 /// due, [`PluginRegistry::rescan_subtrees`] reconciles the pending subtrees
 /// with the disk.
+/// A path as a timing line names it (GM-435): project-relative when it is
+/// inside `root`, as given otherwise.
+fn timing_path(root: &Path, path: &Path) -> String {
+    relative_wire_path(root, path).unwrap_or_else(|| path.display().to_string())
+}
+
 fn watch_and_route_once(
     watcher: &ProjectWatcher,
     debouncer: &mut Debouncer,
@@ -751,7 +757,10 @@ fn watch_and_route_once(
     registry: &PluginRegistry,
 ) {
     match watcher.next_change(DEBOUNCE_WINDOW) {
-        Some(Change::Path(path)) => debouncer.record(path),
+        Some(Change::Path(path)) => {
+            crate::log_timing!("fs_event path={}", timing_path(root, &path));
+            debouncer.record(path)
+        }
         // `next_change` widens a Rescan outside the root to the root; `""`
         // is the root here as well.
         Some(Change::Rescan(path)) => {
@@ -760,6 +769,10 @@ fn watch_and_route_once(
         None => {}
     }
     let mut settled_paths = debouncer.drain_ready();
+    if !settled_paths.is_empty() && crate::log::timing_enabled() {
+        let names: Vec<String> = settled_paths.iter().map(|path| timing_path(root, path)).collect();
+        crate::log_timing!("settled paths={} names={}", names.len(), names.join(","));
+    }
     let mut links = Vec::new();
     if let Some(changed_links) = watcher.reload_ignores_if_changed(&settled_paths) {
         links = changed_links;
