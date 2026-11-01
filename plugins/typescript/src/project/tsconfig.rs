@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::extractor::grammar::EXTENSIONS as SOURCE_EXTENSIONS;
-use crate::project::exports::{has_invalid_target_segment, match_wildcard};
+use crate::project::exports::{match_wildcard, target_accepted, TargetMap};
 use crate::project::jsonc::{parse_json, parse_jsonc, Json};
 use crate::project::{paths, version_range, EXCLUDE_DIRS};
 
@@ -744,12 +744,11 @@ fn tsconfig_field_candidates(dir: &str, field: &str) -> Vec<String> {
 }
 
 /// The in-project path an `exports` string `target` names for `matched`,
-/// or `None` when tsc rejects it: a target not starting with `./`; a `.`,
-/// `..` or `node_modules` segment after its first, or in the text a `*` or
-/// a trailing-`/` key captured; a non-`/` target for a trailing-`/` key; a
-/// result ending in `/`.
+/// or `None` when tsc rejects it: a target or text captured by a `*` or a
+/// trailing-`/` key that [`target_accepted`] rejects (the same rule module
+/// resolution applies, so a `.\` prefix is no `./`); a non-`/` target
+/// for a trailing-`/` key; a result ending in `/`.
 fn exports_target_path(package: &str, target: &str, matched: ExportMatch<'_>) -> Option<String> {
-    let target = paths::with_forward_slashes(target);
     let (pattern, subpath) = match matched {
         ExportMatch::Exact => (false, ""),
         ExportMatch::Pattern(capture) => (true, capture),
@@ -758,10 +757,10 @@ fn exports_target_path(package: &str, target: &str, matched: ExportMatch<'_>) ->
     if !pattern && !subpath.is_empty() && !target.ends_with('/') {
         return None;
     }
-    let after_first = target.strip_prefix("./")?;
-    if has_invalid_target_segment(after_first) || has_invalid_target_segment(subpath) {
+    if !target_accepted(TargetMap::Exports, target, Some(subpath)) {
         return None;
     }
+    let target = paths::with_forward_slashes(target);
     let joined = if pattern { target.replace('*', subpath) } else { format!("{target}{subpath}") };
     if joined.ends_with('/') {
         return None;
