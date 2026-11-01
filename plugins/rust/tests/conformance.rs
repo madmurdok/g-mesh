@@ -132,7 +132,9 @@ const EXPECT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/conformance/expect.to
 // 33 with `[[implementations]] sirens::Wail` (semantic).
 // 38 with GM-630's five `shapes::Tone` variant entries (structural).
 // 40 with GM-637's two `capitals::Keys` module-path caller entries (structural).
-const EXPECTATIONS: usize = 40;
+// 42 with the glob-reached `store::schema::set_facts` callers (semantic) and the
+// fn-local `locals::Extractor` implementations (structural).
+const EXPECTATIONS: usize = 42;
 // 6 since GM-386: `[[references]] shapes::Shape` joined the five receiver/
 // implementation entries, not because its rows need rust-analyzer - they do
 // not - but because the `files` tally it now asserts counts edges, and two of
@@ -152,7 +154,9 @@ const EXPECTATIONS: usize = 40;
 // 4 once `[[references]] shapes::Shape` lost its tag (GM-596): the semantic
 // tier no longer records an implementor a structural `SUPERTYPE_OF` already
 // states, so its `files` tally is the same in both arms.
-const SEMANTIC_EXPECTATIONS: usize = 4;
+// 5 with `[[callers]] store::schema::set_facts`: two of its callers reach it
+// through a glob import, which only rust-analyzer resolves.
+const SEMANTIC_EXPECTATIONS: usize = 5;
 
 /// GM-380: the tripwire above only works if tripping it says what to do.
 ///

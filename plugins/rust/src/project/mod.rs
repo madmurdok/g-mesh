@@ -191,6 +191,9 @@ pub struct ProjectContext {
     /// whether it was a file at load. A root whose existence flips is what
     /// [`ProjectContext::source_changed`] answers with a reload.
     root_files: BTreeMap<RelPath, bool>,
+    /// Each package's Cargo dependency names, by package directory - see
+    /// [`ProjectContext::is_dependency`].
+    dependencies: BTreeMap<RelPath, BTreeSet<String>>,
     /// Everything this load could not honestly resolve - a manifest that
     /// would not parse, a crate-key collision, a `mod` naming nothing on
     /// disk, two `mod` items claiming one file. Never fatal (see `load`'s own
@@ -237,6 +240,7 @@ impl ProjectContext {
 
         let mut packages: Vec<(RelPath, Vec<Target>)> = Vec::new();
         let mut root_files: BTreeMap<RelPath, bool> = BTreeMap::new();
+        let mut dependencies: BTreeMap<RelPath, BTreeSet<String>> = BTreeMap::new();
 
         for package_dir in &package_dirs {
             let manifest = if package_dir == root {
@@ -260,6 +264,7 @@ impl ProjectContext {
             };
             let package_rel_dir = RelPath::relative_to(root, package_dir).unwrap_or_else(|| RelPath::new(""));
             let targets = resolve_targets(root, package_dir, &package.name, &manifest);
+            dependencies.insert(package_rel_dir.clone(), manifest.dependency_names());
             for target in &targets {
                 *root_files.entry(target.root_file.clone()).or_insert(false) |= target.exists;
             }
@@ -304,6 +309,7 @@ impl ProjectContext {
             trees,
             note_layout: notes.0,
             root_files,
+            dependencies,
             ..Self::default()
         };
         project.rebuild();
@@ -496,6 +502,18 @@ impl ProjectContext {
     /// trade-off `FileModel::lookup_name` documents for an ambiguous name.
     pub fn has_container(&self, key: &str) -> bool {
         self.container_keys.contains(key)
+    }
+
+    /// Whether `name` is a Cargo dependency of the package the crate
+    /// `crate_key` belongs to, under the name its source writes it with
+    /// (`-` read as `_`, a `package =` rename by its key). `false` for a key
+    /// no crate of this model has, an orphan's included.
+    pub fn is_dependency(&self, crate_key: &str, name: &str) -> bool {
+        self.crates
+            .iter()
+            .find(|krate| krate.key == crate_key)
+            .and_then(|krate| self.dependencies.get(&krate.package_dir))
+            .is_some_and(|names| names.contains(name))
     }
 
     /// Everything this load could not honestly resolve - see this struct's

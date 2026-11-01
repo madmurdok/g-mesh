@@ -31,9 +31,12 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// The handful of `Cargo.toml` fields this plugin's project model needs.
-/// Every other table (`[dependencies]`, `[features]`, `[profile.*]`, ...) is
-/// parsed into nothing, by the absence of a field for it - see this module's
-/// doc.
+/// Every other table (`[features]`, `[profile.*]`, ...) is parsed into
+/// nothing, by the absence of a field for it - see this module's doc.
+///
+/// The dependency tables are read as untyped values, and only their keys are
+/// used ([`RawCargoToml::dependency_names`]): a dependency entry of a shape
+/// this plugin does not expect must not stop the crate from being modelled.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawCargoToml {
     pub package: Option<RawPackage>,
@@ -41,6 +44,44 @@ pub(crate) struct RawCargoToml {
     #[serde(default, rename = "bin")]
     pub bins: Vec<RawTarget>,
     pub workspace: Option<RawWorkspace>,
+    pub dependencies: Option<toml::Value>,
+    #[serde(rename = "dev-dependencies")]
+    pub dev_dependencies: Option<toml::Value>,
+    #[serde(rename = "build-dependencies")]
+    pub build_dependencies: Option<toml::Value>,
+    /// `[target.'cfg(..)'.dependencies]` and its dev/build siblings.
+    pub target: Option<toml::Value>,
+}
+
+impl RawCargoToml {
+    /// The name each dependency of this package has in its source: the key
+    /// of every entry of `[dependencies]`, `[dev-dependencies]`,
+    /// `[build-dependencies]` and their `[target.*.…]` forms, with `-` read
+    /// as `_`. A renamed dependency (`alias = { package = "real" }`) is
+    /// written `alias::…`, so the key, not `package`, is its name. A
+    /// dependency whose library target overrides its name (`[lib] name` in
+    /// the dependency's own manifest) is not seen here.
+    pub(crate) fn dependency_names(&self) -> BTreeSet<String> {
+        let mut tables: Vec<&toml::Value> =
+            [&self.dependencies, &self.dev_dependencies, &self.build_dependencies]
+                .into_iter()
+                .flatten()
+                .collect();
+        if let Some(toml::Value::Table(targets)) = &self.target {
+            for platform in targets.values() {
+                let toml::Value::Table(platform) = platform else { continue };
+                for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                    tables.extend(platform.get(key));
+                }
+            }
+        }
+        tables
+            .into_iter()
+            .filter_map(toml::Value::as_table)
+            .flat_map(|table| table.keys())
+            .map(|name| name.replace('-', "_"))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

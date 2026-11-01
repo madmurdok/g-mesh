@@ -40,7 +40,7 @@ pub(crate) enum Ctx {
 }
 
 /// Why the extractor emitted neither an edge nor an open site for a name -
-/// except the two `Open*` variants, which are what it *does* emit today and
+/// except the `Open*` variants, which are what it *does* emit today and
 /// are counted so the census can be checked against the real open-site total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Reason {
@@ -67,6 +67,10 @@ pub(crate) enum Reason {
     OpenUnresolvedCall,
     /// Already an open site: an unresolved multi-segment path.
     OpenUnresolvedPath,
+    /// An open site: a multi-segment path whose first segment names no
+    /// crate, `mod`, named import or dependency, in a module with a glob
+    /// `use` that may have brought it in.
+    OpenGlobPath,
 }
 
 /// What a typed receiver is (GM-488): a local (`x.m()`), a field
