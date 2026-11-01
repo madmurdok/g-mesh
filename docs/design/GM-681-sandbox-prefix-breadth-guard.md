@@ -64,7 +64,7 @@ Each rule is checked against the **canonical** prefix (after
 | R1 root | a path with no normal component | `/`; Windows `C:\`, `\\?\C:\`, `\\server\share\` |
 | R2 top level | exactly one normal component | `/usr`, `/opt`, `/etc`, `/var`, `/home`, `/Users`, `/Library`, `/System`, `/Applications`, `/nix`, `/private`; Windows `C:\Users`, `C:\Program Files` |
 | R3 macOS aliases | `/private/<x>` | `/private/var`, `/private/tmp`, `/private/etc` (what `/var`, `/tmp`, `/etc` canonicalize to) |
-| R4 volume and mount roots | `/Volumes/<x>`, `/System/Volumes/<x>`, `/mnt/<x>`, `/media/<x>`, `/media/<u>/<x>`, `/run/media/<u>/<x>` | `/Volumes/External`, `/System/Volumes/Data`, `/media/alice/usb` |
+| R4 volume and mount roots | `/Volumes/<x>`, `/System/Volumes/<x>`, `/mnt/<x>`, `/media/<x>`, `/media/<u>/<x>`, `/run/media`, `/run/media/<u>`, `/run/media/<u>/<x>` | `/Volumes/External`, `/System/Volumes/Data`, `/media/alice/usb`, `/run/media/alice` |
 | R5 home | the canonical user home, or any ancestor of it | `/Users/alice`, `/home/alice`, `/home/users` for `HOME=/home/users/alice` |
 
 Not refused, on purpose: `/usr/bin`, `/usr/lib`, `/usr/local`,
@@ -75,8 +75,12 @@ themselves (macOS `OS_EXEC`/`PACKAGE_PREFIXES`, Linux `OS_EXEC` holds all of
 subdirectory of `$HOME` is where rustup itself lives.
 
 R5's home is the same one `semantic::cargo_home` uses: `HOME`, else
-`USERPROFILE`, non-empty, canonicalized; no home known means R5 is skipped
-(R1-R4 still apply).
+`USERPROFILE`, non-empty, canonicalized; a home that does not exist
+canonicalizes its nearest existing ancestor and appends the remaining
+components (`HOME=/var/nohome/u` on macOS -> `/private/var/nohome/u`), so it
+still compares against canonical prefixes; no home known means R5 is skipped
+(R1-R4 still apply). R4 also covers `/run/media` and `/run/media/<u>`, the
+parents of udisks2 mount roots, as `/media/<u>` covers those under `/media`.
 
 ## 3. Decisions
 

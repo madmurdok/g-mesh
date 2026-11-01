@@ -129,7 +129,7 @@ impl SandboxPolicy {
 /// missing ones dropped, deduplicated in order, and the ones it refuses as
 /// too broad ([`too_broad`]), one [`Refusal`] per distinct prefix naming the
 /// first source that yielded it. `home` is canonicalized before the check
-/// (kept as given when that fails).
+/// ([`canonical_home`]).
 pub(crate) fn toolchain_prefixes(
     toolchain: &Toolchain,
     server: &Path,
@@ -137,7 +137,7 @@ pub(crate) fn toolchain_prefixes(
     home: Option<&Path>,
 ) -> (Vec<PathBuf>, Vec<Refusal>) {
     let server = std::fs::canonicalize(server).unwrap_or_else(|_| server.to_path_buf());
-    let home = home.map(|home| std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()));
+    let home = home.map(canonical_home);
     let parent = |path: &Path| path.parent().map(Path::to_path_buf);
     let proxy = cargo_home.and_then(cargo_proxy);
     let sources = [
@@ -174,6 +174,22 @@ pub(crate) fn toolchain_prefixes(
     (kept, refused)
 }
 
+/// `home` canonicalized for R5. A missing home canonicalizes its nearest
+/// existing ancestor and appends the remaining components, so it still
+/// compares against canonical prefixes (`/var/nohome/u` on macOS becomes
+/// `/private/var/nohome/u`); kept as given when no ancestor resolves.
+fn canonical_home(home: &Path) -> PathBuf {
+    for ancestor in home.ancestors() {
+        if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+            return match home.strip_prefix(ancestor) {
+                Ok(rest) if !rest.as_os_str().is_empty() => canonical.join(rest),
+                _ => canonical,
+            };
+        }
+    }
+    home.to_path_buf()
+}
+
 /// Why a toolchain prefix is too broad to allow exec under (rules R1-R5 of
 /// the GM-681 design note).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +201,8 @@ pub(crate) enum BreadthReason {
     /// R3: `/private/<x>`, what macOS's `/var`, `/tmp`, `/etc` resolve to.
     SystemAlias,
     /// R4: a volume or mount root (`/Volumes/<x>`, `/System/Volumes/<x>`,
-    /// `/mnt/<x>`, `/media/<x>`, `/media/<u>/<x>`, `/run/media/<u>/<x>`).
+    /// `/mnt/<x>`, `/media/<x>`, `/media/<u>/<x>`, `/run/media`,
+    /// `/run/media/<u>`, `/run/media/<u>/<x>`).
     VolumeRoot,
     /// R5: the user's home or an ancestor of it.
     Home,
@@ -289,6 +306,8 @@ pub(crate) fn too_broad(prefix: &Path, home: Option<&Path>) -> Option<BreadthRea
             | ["mnt", _]
             | ["media", _]
             | ["media", _, _]
+            | ["run", "media"]
+            | ["run", "media", _]
             | ["run", "media", _, _] => return Some(BreadthReason::VolumeRoot),
             _ => {}
         }
