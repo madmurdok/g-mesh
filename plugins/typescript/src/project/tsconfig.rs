@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::extractor::grammar::EXTENSIONS as SOURCE_EXTENSIONS;
-use crate::project::exports::match_wildcard;
+use crate::project::exports::{has_invalid_target_segment, match_wildcard};
 use crate::project::jsonc::{parse_json, parse_jsonc, Json};
 use crate::project::{paths, version_range, EXCLUDE_DIRS};
 
@@ -98,7 +98,9 @@ pub fn paths_entries(value: &Json) -> Option<Vec<PathsEntry>> {
 /// `index` files are the candidates). tsc substitutes no empty capture: a
 /// target with a `*` names nothing for it (`@/` under `"@/*": ["./src/*"]`),
 /// a target without one is used as written (`@r/` under `["./"]` names the
-/// root).
+/// root). As in tsc, only a target's first `*` takes the capture; a second
+/// one (tsc error TS5062) stays literal (`./src/*-*` for `q` names
+/// `src/q-*`).
 pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     for entry in &config.paths {
@@ -115,7 +117,7 @@ pub fn expand_paths_candidates(config: &EffectiveConfig, specifier: &str) -> Vec
         for target in &entry.targets {
             let substituted = match capture {
                 Some("") if target.contains('*') => continue,
-                Some(capture) => target.replace('*', capture),
+                Some(capture) => target.replacen('*', capture, 1),
                 None => target.clone(),
             };
             if let Some(inside) = paths::inside_or_root(&config.resolve_dir, &substituted) {
@@ -765,12 +767,6 @@ fn exports_target_path(package: &str, target: &str, matched: ExportMatch<'_>) ->
         return None;
     }
     paths::inside(package, &joined)
-}
-
-/// Whether a `/`-separated text has a `.`, `..` or `node_modules` segment.
-fn has_invalid_target_segment(text: &str) -> bool {
-    let text = text.strip_suffix('/').unwrap_or(text);
-    text.split('/').any(|segment| matches!(segment, "." | ".." | "node_modules"))
 }
 
 /// The file tsc reads for an `exports` target `path`: [`extension_replaced`],

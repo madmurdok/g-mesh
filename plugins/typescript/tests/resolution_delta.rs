@@ -1726,3 +1726,23 @@ fn an_unresolved_hash_import_also_waits_at_the_static_target_of_its_key() {
         [("package.json", r##"{"name":"root","imports":{"#env/*":["./src/env.ts","./generated/*"]}}"##)];
     assert_eq!(waiting_scopes(&first, "#env/a.ts"), scopes("src/env.ts", &[]));
 }
+
+/// A two-`*` paths target substitutes only its first `*` (tsc TS5062), on
+/// both sides of a waiting key: `@env/a` under `["generated/*-*",
+/// "src/env.ts"]` waits at `generated/a-*` (record), and the create of a
+/// literal `generated/a-*.ts` offers exactly that key (create); the static
+/// target stays a waiting scope its own create offers.
+///
+/// Control: `expand_paths_candidates` replaces every `*` (the record side
+/// waits at `generated/a-a`, which no create offers).
+#[test]
+fn a_two_star_paths_target_waits_at_the_key_its_create_offers() {
+    let tsconfig = alias_tsconfig(r#"{"@env/*":["generated/*-*","src/env.ts"]}"#);
+    let files = [("tsconfig.json", tsconfig.as_str())];
+    assert_eq!(waiting_scopes(&files, "@env/a"), scopes("generated/a-*", &["src/env.ts"]));
+
+    let offer = first_offer(&files, "generated/a-*.ts");
+    assert!(offer.contains("generated/a-*"), "{offer:?}");
+    let offer = first_offer(&files, "src/env.ts");
+    assert!(offer.contains("src/env.ts"), "{offer:?}");
+}
