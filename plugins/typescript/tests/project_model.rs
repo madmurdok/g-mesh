@@ -13,8 +13,9 @@ use g_mesh_plugin_sdk::{walk_project, Extractor, RelPath};
 use g_mesh_plugin_typescript::extractor::grammar::EXTENSIONS as GRAMMAR_EXTENSIONS;
 use g_mesh_plugin_typescript::extractor::TypeScriptExtractor;
 use g_mesh_plugin_typescript::project::exports::{
-    collect_condition_targets, condition_rank, exports_targets, imports_targets, key_targets, match_wildcard,
-    PackageImports,
+    collect_condition_targets, condition_rank, exports_subpaths_targeting, exports_targets,
+    imports_specifiers_targeting, imports_targets, key_targets, match_wildcard, target_accepted,
+    PackageImports, TargetMap,
 };
 use g_mesh_plugin_typescript::project::jsonc::{parse_json, parse_jsonc, strip_jsonc, Json};
 use g_mesh_plugin_typescript::project::paths::inside;
@@ -22,11 +23,12 @@ use g_mesh_plugin_typescript::project::resolve::{
     candidate_paths, miss_address, resolve_relative, EXTENSIONS,
 };
 use g_mesh_plugin_typescript::project::tsconfig::{
-    expand_paths_candidates, extends_candidates, own_resolve_dir, EffectiveConfig, PathsEntry,
+    expand_paths_candidates, extends_candidates, own_resolve_dir, specifiers_targeting, EffectiveConfig,
+    PathsEntry,
 };
 use g_mesh_plugin_typescript::project::workspace::{
-    expand_pattern, package_entry_targets, parse_bare_specifier, pnpm_workspace_patterns, scalar_value,
-    workspace_packages, workspace_patterns, DirectoryTree, WorkspacePackage,
+    expand_pattern, package_entry_targets, package_may_name, parse_bare_specifier, pnpm_workspace_patterns,
+    scalar_value, workspace_packages, workspace_patterns, DirectoryTree, WorkspacePackage,
 };
 use g_mesh_plugin_typescript::project::{TsProject, EXCLUDE_DIRS};
 
@@ -734,8 +736,13 @@ fn config_targets_without_backslashes_or_drive_letters_read_as_before() {
     assert_eq!(extends_candidates("pkg/tsconfig.json", "/abs/base.json"), Vec::<String>::new());
 }
 
+/// tsc tests an `exports` target's raw spelling for a leading `./` before
+/// it reads `\\` as a separator, on every host: `.\\src\\main.ts` is an
+/// invalid target (tsc 5.9 --traceResolution), so the package falls back to
+/// its conventions. An `imports` target spelled `.\\src\\utils.ts` is a
+/// module name instead, which tsc looks up and finds.
 #[test]
-fn backslashed_exports_and_imports_targets_resolve_like_their_slash_forms() {
+fn backslashed_exports_targets_are_rejected_and_a_backslashed_imports_target_resolves() {
     let fx = Fixture::new(&[
         ("package.json", r#"{"workspaces":["packages/*"]}"#),
         ("app.ts", SRC),
@@ -751,8 +758,8 @@ fn backslashed_exports_and_imports_targets_resolve_like_their_slash_forms() {
         ("packages/p/src/a.ts", SRC),
     ]);
     let project = fx.load();
-    assert_eq!(resolve(&project, "p", "app.ts"), some("packages/p/src/main.ts"));
-    assert_eq!(resolve(&project, "p/feature", "app.ts"), some("packages/p/src/feat/impl.ts"));
+    assert_eq!(resolve(&project, "p", "app.ts"), some("packages/p/src/index.ts"));
+    assert_eq!(resolve(&project, "p/feature", "app.ts"), some("packages/p/src/feature.ts"));
     assert_eq!(resolve(&project, "#utils", "packages/p/src/a.ts"), some("packages/p/src/utils.ts"));
 }
 
@@ -942,6 +949,165 @@ fn an_imports_target_escaping_the_project_is_refused() {
     let config = imports("packages/math", r##"{"#leak":"../../../etc/passwd","#abs":"/etc/passwd"}"##);
     assert_eq!(imports_targets(&config, "#leak"), Vec::<String>::new());
     assert_eq!(imports_targets(&config, "#abs"), Vec::<String>::new());
+}
+
+/// tsc 5.9 rejects an `exports` target ("invalid type for target") that does
+/// not start `./` (bare, `../`, `.\\`) or has a `.`, `..` or `node_modules`
+/// segment after it, in the target or in the wildcard capture; `\\` after
+/// the leading `./` reads as a separator (`./src\\a.js` is accepted). An
+/// accepted target of the same value still contributes.
+#[test]
+fn an_exports_target_tsc_finds_invalid_contributes_nothing() {
+    let none = Vec::<String>::new();
+    for (exports, subpath) in [
+        (r#"{"./a":"./x/../a.js"}"#, "./a"),
+        (r#"{"./a":"./src/./a.js"}"#, "./a"),
+        (r#"{"./a":"./node_modules/x/a.js"}"#, "./a"),
+        (r#"{"./a":"src/a.js"}"#, "./a"),
+        (r#"{"./a":"../p/a.js"}"#, "./a"),
+        (r#"{"./a":".\\src\\a.js"}"#, "./a"),
+        (r#"{"./a":"./src\\x\\..\\a.js"}"#, "./a"),
+        (r#"{"./*":"./src/*.js"}"#, "./x/../a"),
+        (r#"{"./*":"./src/*.js"}"#, "./x/./a"),
+        (r#"{"./*":"./src/*.js"}"#, "./node_modules/a"),
+        (r#"{"./*":"./src/*.js"}"#, "./x\\..\\a"),
+    ] {
+        assert_eq!(exports_targets(Some(&json(exports)), subpath), none, "{exports} {subpath}");
+    }
+    assert_eq!(exports_targets(Some(&json(r#"{"./a":"./src\\a.js"}"#)), "./a"), strings(&["./src\\a.js"]));
+    assert_eq!(exports_targets(Some(&json(r#"{"./*":"./src/*.js"}"#)), "./x/a"), strings(&["./src/x/a.js"]));
+    assert_eq!(
+        exports_targets(Some(&json(r#"{"./a":["../bad.js","./good.js"]}"#)), "./a"),
+        strings(&["./good.js"])
+    );
+    assert_eq!(exports_targets(Some(&json(r#""./x/../main.js""#)), "."), none, "a root string value");
+}
+
+/// The same rule for `imports`, except that a target spelled as a module
+/// name (neither `./`, `../` nor rooted) is looked up as tsc does, its
+/// segments and capture unchecked; a `../` target is rejected rather than
+/// climbing out of the package.
+#[test]
+fn an_imports_target_tsc_finds_invalid_contributes_nothing_but_a_module_name_does() {
+    let config = imports(
+        "packages/p",
+        r##"{"#dd":"./src/a/../u.ts","#dot":"./src/./u.ts","#nm":"./node_modules/u.ts","#up":"../q/u.ts",
+            "#bs":"./src\\a\\..\\u.ts","#c/*":"./src/*","#m":"src/u.ts","#mb":".\\src\\u.ts","#w/*":"src/*"}"##,
+    );
+    for specifier in ["#dd", "#dot", "#nm", "#up", "#bs", "#c/a/../u.ts", "#c/./u.ts", "#c/node_modules/u.ts"]
+    {
+        assert_eq!(imports_targets(&config, specifier), Vec::<String>::new(), "{specifier}");
+    }
+    assert_eq!(imports_targets(&config, "#c/u.ts"), strings(&["packages/p/src/u.ts"]));
+    assert_eq!(imports_targets(&config, "#m"), strings(&["packages/p/src/u.ts"]));
+    assert_eq!(imports_targets(&config, "#mb"), strings(&["packages/p/src/u.ts"]));
+    assert_eq!(
+        imports_targets(&config, "#w/node_modules/u.ts"),
+        strings(&["packages/p/src/node_modules/u.ts"])
+    );
+}
+
+/// [`target_accepted`] case by case: the shapes tsc 5.9 rejects for both
+/// maps, and the module-name spellings only `imports` keeps.
+#[test]
+fn target_accepted_follows_tsc_for_exports_and_imports() {
+    for (target, capture, exports, imports) in [
+        ("./src/a.js", None, true, true),
+        ("./src/*.js", Some("x/a"), true, true),
+        ("./src\\a.js", None, true, true),
+        ("./", None, true, true),
+        ("./x/../a.js", None, false, false),
+        ("./x/./a.js", None, false, false),
+        ("./node_modules/a.js", None, false, false),
+        ("./src/*.js", Some("x/../a"), false, false),
+        ("./src/*.js", Some("node_modules"), false, false),
+        ("../a.js", None, false, false),
+        ("/abs/a.js", None, false, false),
+        ("C:/a.js", None, false, false),
+        ("src/a.js", None, false, true),
+        (".\\src\\a.js", None, false, true),
+        ("src/*", Some("x/../a"), false, true),
+    ] {
+        assert_eq!(
+            target_accepted(TargetMap::Exports, target, capture),
+            exports,
+            "exports {target} {capture:?}"
+        );
+        assert_eq!(
+            target_accepted(TargetMap::Imports, target, capture),
+            imports,
+            "imports {target} {capture:?}"
+        );
+    }
+}
+
+/// The inverse lookups derive no key from a target tsc rejects, nor from a
+/// capture it rejects (`node_modules`: the only invalid segment a normalised
+/// address can hold); the accepted forms still invert.
+#[test]
+fn the_inverse_lookups_skip_targets_and_captures_tsc_rejects() {
+    let exports = json(r#"{"./*":"./src/*.js","./a":"./x/../lib/a.js","./b":"lib/b.js","./c":"./lib/c.js"}"#);
+    let dir = "packages/p";
+    let none = Vec::<String>::new();
+    assert_eq!(exports_subpaths_targeting(Some(&exports), dir, "packages/p/src/k.js"), strings(&["./k"]));
+    assert_eq!(exports_subpaths_targeting(Some(&exports), dir, "packages/p/src/node_modules/k.js"), none);
+    assert_eq!(exports_subpaths_targeting(Some(&exports), dir, "packages/p/lib/a.js"), none);
+    assert_eq!(exports_subpaths_targeting(Some(&exports), dir, "packages/p/lib/b.js"), none);
+    assert_eq!(exports_subpaths_targeting(Some(&exports), dir, "packages/p/lib/c.js"), strings(&["./c"]));
+
+    let config =
+        imports(dir, r##"{"#c/*":"./src/*","#up":"../q/u.ts","#dd":"./x/../u.ts","#m":"src/m.ts"}"##);
+    assert_eq!(imports_specifiers_targeting(&config, "packages/p/src/k.ts"), strings(&["#c/k.ts"]));
+    assert_eq!(
+        imports_specifiers_targeting(&config, "packages/p/src/node_modules/k.ts"),
+        Vec::<String>::new()
+    );
+    assert_eq!(imports_specifiers_targeting(&config, "packages/q/u.ts"), Vec::<String>::new());
+    assert_eq!(imports_specifiers_targeting(&config, "packages/p/u.ts"), Vec::<String>::new());
+    assert_eq!(imports_specifiers_targeting(&config, "packages/p/src/m.ts"), strings(&["#c/m.ts", "#m"]));
+}
+
+/// A rejected `exports` or `imports` target names nothing end to end: the
+/// package falls back to its conventions and the `#` import stays
+/// unresolved, though each target names a real file.
+#[test]
+fn a_target_tsc_rejects_resolves_nothing_end_to_end() {
+    let fx = Fixture::new(&[
+        ("package.json", r#"{"workspaces":["packages/*"]}"#),
+        ("app.ts", SRC),
+        (
+            "packages/p/package.json",
+            r##"{"name":"p","exports":{".":"./lib/../src/main.ts","./*":"./src/*.ts"},
+                "imports":{"#up":"../q/u.ts","#dd":"./lib/../src/main.ts","#c/*":"./src/*"}}"##,
+        ),
+        ("packages/p/src/index.ts", SRC),
+        ("packages/p/src/main.ts", SRC),
+        ("packages/p/src/node_modules/x.ts", SRC),
+        ("packages/q/u.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "p", "app.ts"), some("packages/p/src/index.ts"));
+    assert_eq!(resolve(&project, "p/main", "app.ts"), some("packages/p/src/main.ts"));
+    let from = "packages/p/src/main.ts";
+    assert_eq!(resolve(&project, "#up", from), None);
+    assert_eq!(resolve(&project, "#dd", from), None);
+    assert_eq!(resolve(&project, "#c/node_modules/x.ts", from), None);
+    assert_eq!(resolve(&project, "#c/main.ts", from), some("packages/p/src/main.ts"));
+}
+
+/// Only a `main`-style field can take a package's entry outside its
+/// directory: an `exports` target with `..` is rejected by tsc, so it no
+/// longer admits an outside path.
+#[test]
+fn package_may_name_admits_an_outside_path_only_through_a_main_style_field() {
+    let outside = "packages/shared/x.js";
+    assert!(!package_may_name(&package("packages/p", r#"{"exports":"../shared/x.js"}"#), outside));
+    assert!(!package_may_name(
+        &package("packages/p", r#"{"exports":{"./x":["./a/../../shared/x.js"]}}"#),
+        outside
+    ));
+    assert!(package_may_name(&package("packages/p", r#"{"main":"../shared/x.js"}"#), outside));
+    assert!(package_may_name(&package("packages/p", r#"{"exports":"../shared/x.js"}"#), "packages/p/x.js"));
 }
 
 #[test]
@@ -1393,6 +1559,40 @@ fn expand_paths_candidates_unions_matching_keys_without_repeats() {
         strings(&["apps/web/src/x", "apps/web/gen/x", "apps/web/special/x.ts"])
     );
     assert_eq!(expand_paths_candidates(&config, "other"), Vec::<String>::new());
+}
+
+/// tsc substitutes only a paths target's first `*` (the second is error
+/// TS5062 and stays literal): `./src/*-*` for `@/q` names `src/q-*`, never
+/// `src/q-q`. The inverse splits at the same first `*`, so the address it
+/// takes `@/q` from is one the expansion offers.
+#[test]
+fn only_the_first_star_of_a_paths_target_takes_the_capture() {
+    let config = EffectiveConfig {
+        resolve_dir: String::new(),
+        paths: vec![PathsEntry { pattern: "@/*".to_string(), targets: strings(&["./src/*-*"]) }],
+    };
+    assert_eq!(expand_paths_candidates(&config, "@/q"), strings(&["src/q-*"]));
+    assert_eq!(specifiers_targeting(&config, "src/q-*"), strings(&["@/q"]));
+    assert_eq!(specifiers_targeting(&config, "src/q-q"), Vec::<String>::new());
+    for specifier in specifiers_targeting(&config, "src/q-*") {
+        assert!(expand_paths_candidates(&config, &specifier).contains(&"src/q-*".to_string()), "{specifier}");
+    }
+}
+
+/// End to end: with both `src/q-q.ts` and a literal `src/q-*.ts` on disk,
+/// `@/q` resolves to the literal one, as tsc does.
+#[test]
+fn a_two_star_paths_target_resolves_to_the_literal_second_star() {
+    let fx = Fixture::new(&[
+        ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["./src/*-*"]}}}"#),
+        ("app.ts", SRC),
+        ("src/q-q.ts", SRC),
+        ("src/q-*.ts", SRC),
+        ("src/r-r.ts", SRC),
+    ]);
+    let project = fx.load();
+    assert_eq!(resolve(&project, "@/q", "app.ts"), some("src/q-*.ts"));
+    assert_eq!(resolve(&project, "@/r", "app.ts"), None);
 }
 
 #[test]
