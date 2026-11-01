@@ -306,6 +306,32 @@ mod tests {
         assert!(report.violations[0].message.contains("empty name"), "{:?}", report.violations);
     }
 
+    const ALSO_SCOPED_IMPORT: &str = "{\"id\":\"n1\",\"kind\":\"Module\",\"name\":\"@env/a\",\"qualifiedName\":\"@env/a\",\"filePath\":\"a.ts\",\"range\":{\"start\":{\"line\":0,\"col\":0},\"end\":{\"line\":0,\"col\":1}},\"visibility\":\"file\",\"language\":\"typescript\",\"nativeKind\":\"resolved_module\",\"target\":{\"scope\":{\"file\":\"generated/a\"},\"key\":{\"name\":\"*\"},\"alsoScopes\":[\"src/env.ts\"]}}\n";
+
+    /// GM-676 (M3): `alsoScopes` on a `resolved_module` placeholder with a
+    /// `File` scope is conformant, as is an empty list anywhere; on another
+    /// placeholder kind, or under a `Container` scope, it is a violation
+    /// naming the node. Controls: return `None` from `also_scopes_violation`,
+    /// or drop its chain from `node_shape_violations` (no violation).
+    #[test]
+    fn also_scopes_belong_on_a_file_scoped_resolved_module() {
+        let report = check_bulk_output(ALSO_SCOPED_IMPORT.as_bytes());
+        assert!(report.is_conformant(), "{:?}", report.violations);
+        let empty = ALSO_SCOPED_IMPORT.replace("[\"src/env.ts\"]", "[]");
+        let empty_pending = empty.replace("resolved_module", "pending_symbol");
+        assert!(check_bulk_output(empty_pending.as_bytes()).is_conformant(), "an empty list is absent");
+
+        for bad in [
+            ALSO_SCOPED_IMPORT.replace("resolved_module", "pending_symbol"),
+            ALSO_SCOPED_IMPORT.replace("{\"file\":\"generated/a\"}", "{\"container\":\"pkg\"}"),
+        ] {
+            let report = check_bulk_output(bad.as_bytes());
+            assert_eq!(report.violations.len(), 1, "{bad}: {:?}", report.violations);
+            assert!(report.violations[0].message.contains("alsoScopes"), "{:?}", report.violations);
+            assert!(report.violations[0].message.contains("n1"), "{:?}", report.violations);
+        }
+    }
+
     #[test]
     fn well_formed_control_frame_is_conformant() {
         let frame = b"Content-Length: 72\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"reindex\",\"params\":{\"filePath\":\"a.ts\"}}";

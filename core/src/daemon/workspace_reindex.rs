@@ -1330,7 +1330,7 @@ mod tests {
 
     /// Test 2: a symbol the new walk no longer emits is gone after the swap,
     /// with every row keyed by it: its edges, declarations, placeholder
-    /// target, vector and emptied container.
+    /// target and extra waiting scopes, vector and emptied container.
     ///
     /// Control: skip the plan's `plan_delete_nodes` insert in
     /// `language_swap::plan_attached` -> `alpha-n2` survives.
@@ -1359,13 +1359,13 @@ mod tests {
         };
         let placeholder = WireNode {
             kind: NodeKind::Module,
-            native_kind: Some("pending_symbol".to_string()),
+            native_kind: Some("resolved_module".to_string()),
             target: Some(PlaceholderTarget {
                 scope: TargetScope::File("src/elsewhere.alpha-src".to_string()),
                 key: TargetKey::Name("thing".to_string()),
                 from_container: None,
                 key_path: None,
-                also_scopes: Vec::new(),
+                also_scopes: vec!["src/fallback.alpha-src".to_string()],
             }),
             ..wire_node("alpha-p2", "src/b.alpha-src")
         };
@@ -1387,6 +1387,7 @@ mod tests {
                 ("nodes", "id"),
                 ("declarations", "nodeId"),
                 ("placeholder_targets", "nodeId"),
+                ("placeholder_also_scopes", "nodeId"),
                 ("vectors", "nodeId"),
                 ("qualified_suffixes", "nodeId"),
                 ("untyped_calls", "nodeId"),

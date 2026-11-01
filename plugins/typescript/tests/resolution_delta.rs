@@ -1598,3 +1598,131 @@ fn an_ordinary_config_adds_no_prefix_selector_and_none_is_ever_empty() {
         }
     }
 }
+
+// -------------------------------------------------------------------------
+// GM-676: an unresolved import also waits at the static targets of the
+// wildcard entries matching it
+// -------------------------------------------------------------------------
+
+const ENV_FALLBACK: &str = r#"{"@env/*":["generated/*","src/env.ts"]}"#;
+
+/// The `resolved_module` placeholder [`MAIN`] stores for its import of
+/// `specifier` (written beside `files`): its file scope and its extra
+/// waiting scopes. `None` when the import is an `external_module`.
+fn waiting_scopes(files: &[(&str, &str)], specifier: &str) -> Option<(String, Vec<String>)> {
+    let importer = format!("import {{ v }} from \"{specifier}\";\n");
+    let mut all: Vec<(&str, &str)> = files.to_vec();
+    all.push((MAIN, &importer));
+    let fixture = Fixture::new(&all);
+    let graph = TypeScriptExtractor.extract(&fixture.load(), &RelPath::new(MAIN), &importer);
+    let node = graph.nodes.iter().find(|node| node.native_kind.as_deref() == Some("resolved_module"))?;
+    let target = node.target.as_ref().expect("a resolved_module carries a target");
+    let scope = match &target.scope {
+        g_mesh_plugin_sdk::wire::TargetScope::File(file) => file.clone(),
+        other => panic!("not a file scope: {other:?}"),
+    };
+    Some((scope, target.also_scopes.clone()))
+}
+
+fn scopes(primary: &str, also: &[&str]) -> Option<(String, Vec<String>)> {
+    Some((primary.to_string(), also.iter().map(|scope| scope.to_string()).collect()))
+}
+
+/// `@env/a` under `["generated/*", "src/env.ts"]` waits at `generated/a`
+/// (its first base) and also at `src/env.ts`, whose create derives no
+/// specifier.
+///
+/// Control: `miss_address` returns no `also`.
+#[test]
+fn an_unresolved_alias_import_also_waits_at_the_static_target_of_its_entry() {
+    let tsconfig = alias_tsconfig(ENV_FALLBACK);
+    assert_eq!(
+        waiting_scopes(&[("tsconfig.json", tsconfig.as_str())], "@env/a"),
+        scopes("generated/a", &["src/env.ts"])
+    );
+}
+
+/// No extra scope when the entry has no static target, when the only static
+/// target is the primary, when only the catch-all `"*"` lists one, when the
+/// import resolves, or for a relative miss.
+///
+/// Controls: drop `is_wildcard_entry`'s catch-all exclusion from
+/// `static_fallbacks` (the catch-all case gains `src/env.ts`); drop the
+/// `also.retain(!= primary)` in `miss_address` (the static-first case lists
+/// its primary).
+#[test]
+fn an_import_without_a_further_static_target_waits_nowhere_else() {
+    let cases = [
+        (r#"{"@env/*":["generated/*"]}"#, "generated/a"),
+        (r#"{"@env/*":["src/env.ts","generated/*"]}"#, "src/env.ts"),
+        (r#"{"@env/*":["generated/*"],"*":["gen/*","src/env.ts"]}"#, "generated/a"),
+    ];
+    for (paths, primary) in cases {
+        let tsconfig = alias_tsconfig(paths);
+        assert_eq!(
+            waiting_scopes(&[("tsconfig.json", tsconfig.as_str())], "@env/a"),
+            scopes(primary, &[]),
+            "{paths}"
+        );
+    }
+
+    let tsconfig = alias_tsconfig(ENV_FALLBACK);
+    let resolving = [("tsconfig.json", tsconfig.as_str()), ("generated/a.ts", SRC_X)];
+    assert_eq!(waiting_scopes(&resolving, "@env/a"), scopes("generated/a.ts", &[]), "it resolves");
+
+    let relative =
+        waiting_scopes(&[("tsconfig.json", tsconfig.as_str())], "./missing").expect("a resolved_module");
+    assert!(relative.1.is_empty(), "a relative miss: {relative:?}");
+}
+
+/// Several static targets are all listed, in declaration order and once
+/// each; one written without extension (`src/env`) is kept as written, and
+/// it is exactly the key the create of `src/env.ts` offers, as `lib/env.ts`
+/// is for its own create.
+///
+/// Controls: `miss_address` returns no `also`; the static-target offer
+/// (`static_targets_naming`) removed (the offers lose both keys).
+#[test]
+fn every_static_target_is_a_waiting_scope_the_create_of_its_file_offers() {
+    let tsconfig = alias_tsconfig(r#"{"@env/*":["generated/*","src/env","lib/env.ts","src/env"]}"#);
+    let files = [("tsconfig.json", tsconfig.as_str())];
+    let (primary, also) = waiting_scopes(&files, "@env/a").expect("a resolved_module");
+    assert_eq!(primary, "generated/a");
+    assert_eq!(also, vec!["src/env".to_string(), "lib/env.ts".to_string()]);
+
+    let offer = first_offer(&files, "src/env.ts");
+    assert!(offer.contains(&also[0]), "{offer:?}");
+    let offer = first_offer(&files, "lib/env.ts");
+    assert!(offer.contains(&also[1]), "{offer:?}");
+}
+
+/// Two wildcard entries matching one specifier that list the same static
+/// target give it once.
+///
+/// Control: push without the `contains` check in `static_fallbacks`.
+#[test]
+fn a_static_target_of_two_matching_entries_is_listed_once() {
+    let tsconfig = alias_tsconfig(r#"{"@env/*":["generated/*","src/env.ts"],"@*":["other/*","src/env.ts"]}"#);
+    let (_, also) =
+        waiting_scopes(&[("tsconfig.json", tsconfig.as_str())], "@env/a").expect("a resolved_module");
+    assert_eq!(also, vec!["src/env.ts".to_string()]);
+}
+
+/// A `#` specifier (`#env/a.ts`: an `imports` target is used as written,
+/// with no extension probing) under a wildcard `imports` key whose list
+/// holds a static target also waits there (package.json `imports`, like `paths`); a key
+/// whose static target comes first waits only there.
+///
+/// Control: drop the `#` arm of `static_fallbacks` (return empty).
+#[test]
+fn an_unresolved_hash_import_also_waits_at_the_static_target_of_its_key() {
+    let later =
+        [("package.json", r##"{"name":"root","imports":{"#env/*":["./generated/*","./src/env.ts"]}}"##)];
+    let (primary, also) = waiting_scopes(&later, "#env/a.ts").expect("a resolved_module");
+    assert_eq!(also, vec!["src/env.ts".to_string()], "primary {primary}");
+    assert_ne!(primary, "src/env.ts");
+
+    let first =
+        [("package.json", r##"{"name":"root","imports":{"#env/*":["./src/env.ts","./generated/*"]}}"##)];
+    assert_eq!(waiting_scopes(&first, "#env/a.ts"), scopes("src/env.ts", &[]));
+}

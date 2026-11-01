@@ -1509,4 +1509,74 @@ mod tests {
         apply_diff(&mut conn, &import_with(Some("@app/b"))).unwrap();
         assert_eq!(stored_specifier(&conn, "imp").as_deref(), Some("@app/b"), "replaced by a new one");
     }
+
+    /// `p1` waiting at `generated/a` and also at `also`.
+    fn placeholder_also(also: &[&str]) -> NodeRecord {
+        let target = PlaceholderTargetRecord {
+            also_scopes: also.iter().map(|scope| scope.to_string()).collect(),
+            ..file_scoped_target("generated/a", "*")
+        };
+        placeholder("p1", "src/a.ts", target)
+    }
+
+    fn also_scopes_of(conn: &Connection, node_id: &str) -> Vec<String> {
+        conn.prepare("SELECT scope FROM placeholder_also_scopes WHERE nodeId = ?1 ORDER BY scope")
+            .unwrap()
+            .query_map(params![node_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn upsert(conn: &mut Connection, node: NodeRecord) {
+        apply_diff(conn, &Diff { upsert_nodes: vec![node], ..Default::default() }).unwrap();
+    }
+
+    /// GM-676: a placeholder's extra waiting scopes are stored one row each,
+    /// and a re-upsert replaces the set: no stale scope survives it, an
+    /// empty list clears it. Run with foreign keys off, as the daemon's
+    /// connection is. Control: drop the `DELETE FROM placeholder_also_scopes`
+    /// before the re-insert in `write_diff` (`src/env.ts` survives).
+    #[test]
+    fn re_upserting_a_placeholder_replaces_its_also_scopes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+
+        upsert(&mut conn, placeholder_also(&["src/env.ts", "lib/env"]));
+        assert_eq!(also_scopes_of(&conn, "p1"), vec!["lib/env", "src/env.ts"]);
+
+        upsert(&mut conn, placeholder_also(&["lib/env"]));
+        assert_eq!(also_scopes_of(&conn, "p1"), vec!["lib/env"], "the dropped scope must go");
+
+        upsert(&mut conn, placeholder_also(&[]));
+        assert!(also_scopes_of(&conn, "p1").is_empty(), "an empty list clears the set");
+
+        upsert(&mut conn, placeholder_also(&["src/env.ts"]));
+        let mut plain = placeholder_also(&[]);
+        plain.target = None;
+        upsert(&mut conn, plain);
+        assert!(also_scopes_of(&conn, "p1").is_empty(), "a node that lost its target keeps no scopes");
+    }
+
+    /// Deleting the placeholder takes its extra scopes with it, foreign keys
+    /// off. Control: drop the `placeholder_also_scopes` delete from the
+    /// `delete_node_ids` loop.
+    #[test]
+    fn deleting_a_placeholder_takes_its_also_scopes_with_it_without_foreign_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+        upsert(&mut conn, placeholder_also(&["src/env.ts"]));
+        assert_eq!(count(&conn, "placeholder_also_scopes"), 1);
+
+        apply_diff(&mut conn, &Diff { delete_node_ids: vec!["p1".to_string()], ..Default::default() })
+            .unwrap();
+
+        assert_eq!(
+            count(&conn, "placeholder_also_scopes"),
+            0,
+            "a later node with this id would inherit them"
+        );
+    }
 }

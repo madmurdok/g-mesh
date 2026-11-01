@@ -261,6 +261,33 @@ fn to_node_record_derives_visibility_container_and_target_from_the_wire_v2_shape
     assert_eq!(target.from_container.as_deref(), Some("github.com/x/app/client"));
 }
 
+/// GM-676: a `File`-scoped target's extra waiting scopes reach the record;
+/// under a `Container` scope (non-conformant) they are dropped, never stored
+/// as file paths. Controls: always `Vec::new()` in
+/// `to_placeholder_target_record` (the file case loses them), or always
+/// copy them (the container case keeps them).
+#[test]
+fn to_node_record_keeps_also_scopes_only_on_a_file_scoped_target() {
+    for (scope, kept) in [
+        (TargetScope::File("generated/a".to_string()), vec!["src/env.ts".to_string()]),
+        (TargetScope::Container("pkg".to_string()), Vec::new()),
+    ] {
+        let mut node = canned_node("n1");
+        node.native_kind = Some("resolved_module".to_string());
+        node.target = Some(PlaceholderTarget {
+            scope: scope.clone(),
+            key: TargetKey::Name("*".to_string()),
+            from_container: None,
+            key_path: None,
+            also_scopes: vec!["src/env.ts".to_string()],
+        });
+
+        let record = to_node_record(node, &mut PathWarnings::default());
+
+        assert_eq!(record.target.expect("the target is kept").also_scopes, kept, "{scope:?}");
+    }
+}
+
 /// The ordinary case: `Visibility::Public` maps to `"public"`/`exported`,
 /// and an ordinary (non-placeholder) node carries no target at all.
 #[test]

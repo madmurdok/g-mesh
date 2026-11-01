@@ -1104,4 +1104,53 @@ mod tests {
             .unwrap();
         assert_eq!(specifier.as_deref(), Some("@app/math"));
     }
+
+    /// GM-676 (M4): an import waiting at `generated/a.ts` and also at
+    /// `src/env.ts` is never linked by core at the extra scope - the
+    /// plugin's re-extract links it there - and linked at its own scope its
+    /// placeholder goes with every extra-scope row, foreign keys off.
+    /// Control: drop the `placeholder_also_scopes` delete from `link`'s
+    /// `drop_placeholder_dependents` (the row survives the drop).
+    #[test]
+    fn an_also_scope_never_links_and_a_dropped_placeholder_takes_its_also_scopes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        schema::apply(&conn).unwrap();
+        let target = PlaceholderTargetRecord {
+            also_scopes: vec!["src/env.ts".to_string()],
+            ..file_target("generated/a.ts")
+        };
+        let placeholder =
+            placeholder_node("a.ts", "@env/a", RESOLVED_MODULE_NATIVE_KIND, Some(target), "typescript");
+        let edge = import_edge("a.ts", &placeholder);
+        let (edge_id, placeholder_id) = (edge.id.clone(), placeholder.id.clone());
+        apply_diff(
+            &mut conn,
+            &Diff {
+                upsert_nodes: vec![file_node("a.ts"), placeholder],
+                upsert_edges: vec![edge],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "placeholder_also_scopes"), 1);
+
+        let env = Diff { upsert_nodes: vec![file_node("src/env.ts")], ..Default::default() };
+        apply_diff(&mut conn, &env).unwrap();
+        assert_eq!(link_diff(&mut conn, &env).unwrap(), LinkSummary::default(), "core links by scope only");
+        assert_eq!(edge_target(&conn, &edge_id), (placeholder_id, false));
+
+        let primary = Diff { upsert_nodes: vec![file_node("generated/a.ts")], ..Default::default() };
+        apply_diff(&mut conn, &primary).unwrap();
+        assert_eq!(
+            link_diff(&mut conn, &primary).unwrap(),
+            LinkSummary { linked_edges: 1, dropped_placeholders: 1 }
+        );
+        assert_eq!(edge_target(&conn, &edge_id), ("file:generated/a.ts".to_string(), true));
+        assert_eq!(
+            count(&conn, "placeholder_also_scopes"),
+            0,
+            "a dropped placeholder's also-scopes must go with it"
+        );
+    }
 }

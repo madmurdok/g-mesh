@@ -1640,3 +1640,25 @@ fn a_schema_15_index_is_reset_and_its_watch_paths_are_dropped() {
     assert_eq!(resolution_facts(&conn, "typescript").unwrap(), None);
     assert!(!ensure_current(&conn, GENERATION).unwrap(), "the reset index is current");
 }
+
+/// Schema "17": an index stamped "16" holds no extra waiting scopes, so it is
+/// reset; the `placeholder_also_scopes` table then exists, empty, and the
+/// reset index is current.
+#[test]
+fn a_schema_16_index_is_reset_and_has_the_also_scopes_table() {
+    let conn = setup();
+    conn.execute(
+        "INSERT INTO meta (id, schema_version, indexer_version, lastUsed) VALUES (1, '16', ?1, CURRENT_TIMESTAMP)",
+        params![GENERATION],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO placeholder_also_scopes (nodeId, scope) VALUES ('p1', 'src/env.ts')", [])
+        .unwrap();
+
+    assert!(ensure_current(&conn, GENERATION).unwrap(), "schema 16 is not current");
+
+    let rows: i64 =
+        conn.query_row("SELECT COUNT(*) FROM placeholder_also_scopes", [], |row| row.get(0)).unwrap();
+    assert_eq!(rows, 0, "the reset drops the old rows and recreates the table");
+    assert!(!ensure_current(&conn, GENERATION).unwrap(), "the reset index is current");
+}

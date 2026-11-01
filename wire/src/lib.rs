@@ -1938,4 +1938,24 @@ mod tests {
         assert!(trailing.contains("a/x.ts"));
         assert!(!trailing.contains("ab/x.ts"));
     }
+
+    /// GM-676: `alsoScopes` reads as empty when absent (every pre-4.22
+    /// plugin), is not written when empty, and survives a round trip when
+    /// set. Control: drop `serde(default)` from `also_scopes` (the absent
+    /// line no longer parses).
+    #[test]
+    fn placeholder_target_also_scopes_default_empty_and_round_trip() {
+        let absent = r#"{"scope":{"file":"generated/a"},"key":{"name":"*"}}"#;
+        let target: PlaceholderTarget = serde_json::from_str(absent).unwrap();
+        assert!(target.also_scopes.is_empty());
+        assert_eq!(serde_json::to_string(&target).unwrap(), absent, "an empty list is not written");
+
+        let set = PlaceholderTarget {
+            also_scopes: vec!["src/env.ts".to_string(), "lib/env".to_string()],
+            ..target
+        };
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(json.contains(r#""alsoScopes":["src/env.ts","lib/env"]"#), "{json}");
+        assert_eq!(serde_json::from_str::<PlaceholderTarget>(&json).unwrap(), set);
+    }
 }

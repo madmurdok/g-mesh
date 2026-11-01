@@ -1155,6 +1155,68 @@ mod tests {
         assert!(column(&conn, "SELECT suffix FROM qualified_suffixes").is_empty());
     }
 
+    /// `p1`, an unresolved import waiting at `generated/a` and also at
+    /// `also`.
+    fn also_placeholder(also: &[&str]) -> NodeRecord {
+        let mut node = NodeRecord::new("p1", "Module", "@env/a", "@env/a", "src/b.rs", "rust");
+        node.native_kind = Some("resolved_module".to_string());
+        node.target = Some(crate::storage::write::PlaceholderTargetRecord {
+            scope_kind: "file".to_string(),
+            scope: "generated/a".to_string(),
+            key_kind: "name".to_string(),
+            key: "*".to_string(),
+            from_container: None,
+            key_path: None,
+            also_scopes: also.iter().map(|scope| scope.to_string()).collect(),
+        });
+        node
+    }
+
+    /// GM-676: a placeholder whose only change is its extra waiting scopes
+    /// is re-swapped, and live ends with exactly staging's rows, the loss of
+    /// every scope included. Controls: drop `placeholder_also_scopes` from
+    /// `plan_attached`'s child-table loop (upsert count 0, live keeps
+    /// `src/env.ts`); from `swap_attached`'s delete loop (the stale row
+    /// stays); or its insert (live has no rows).
+    #[test]
+    fn a_swap_carries_an_also_scopes_only_change() {
+        let (_dir, live, counts) =
+            swap_one(also_placeholder(&["src/env.ts"]), also_placeholder(&["lib/env.ts", "src/env"]));
+
+        assert_eq!(counts.upsert_nodes, 1, "the also-scope change alone marks the placeholder upserted");
+        assert_eq!(
+            column(&live, "SELECT scope FROM placeholder_also_scopes WHERE nodeId = 'p1' ORDER BY scope"),
+            vec!["lib/env.ts", "src/env"]
+        );
+
+        let (_dir, live, counts) = swap_one(also_placeholder(&["src/env.ts"]), also_placeholder(&[]));
+        assert_eq!(counts.upsert_nodes, 1, "losing every scope is a change");
+        assert!(column(&live, "SELECT scope FROM placeholder_also_scopes").is_empty());
+
+        let (_dir, live, counts) =
+            swap_one(also_placeholder(&["src/env.ts"]), also_placeholder(&["src/env.ts"]));
+        assert_eq!(counts, PlanCounts::default(), "unchanged");
+        assert_eq!(column(&live, "SELECT scope FROM placeholder_also_scopes"), vec!["src/env.ts"]);
+    }
+
+    /// A swept placeholder takes any extra-scope rows under its id with it
+    /// (only a `pending_symbol` is swept, so the row is seeded by hand, as
+    /// for the suffix rows). Control: drop the `placeholder_also_scopes`
+    /// delete from `delete_placeholders` (the row remains).
+    #[test]
+    fn deleting_a_kept_placeholder_takes_its_also_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_staging(&dir.path().join("index.db")).unwrap();
+        let mut placeholder = NodeRecord::new("p1", "Module", "f", "a.rs#f", "src/b.rs", "rust");
+        placeholder.native_kind = Some(PENDING_SYMBOL_NATIVE_KIND.to_string());
+        apply_diff(&mut conn, &Diff { upsert_nodes: vec![placeholder], ..Default::default() }).unwrap();
+        conn.execute("INSERT INTO placeholder_also_scopes (nodeId, scope) VALUES ('p1', 'src/env.ts')", [])
+            .unwrap();
+
+        assert_eq!(delete_placeholders(&mut conn, "rust", &["p1".to_string()]).unwrap(), 1);
+        assert!(column(&conn, "SELECT scope FROM placeholder_also_scopes").is_empty());
+    }
+
     /// `run`, calling `names` through untyped receivers.
     fn untyped_caller(names: &[&str]) -> NodeRecord {
         let mut node = NodeRecord::new("run", "Function", "run", "m::run", "src/a.rs", "rust");
