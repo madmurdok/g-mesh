@@ -31,6 +31,7 @@ it:daemon_plugin_discovery_failure                       none
 it:daemon_sigterm                                        typescript rust python go
 it:default_export_linking                                typescript rust python go
 it:dynamic_import_resolution                             typescript rust python go
+it:edit_timing_lines                                     typescript
 it:embedding_generation_pipeline                         typescript
 it:embedding_peak_memory                                 none
 it:files_created_python                                  python

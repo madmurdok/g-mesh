@@ -37,6 +37,7 @@ mod daemon_plugin_discovery_failure;
 mod daemon_sigterm;
 mod default_export_linking;
 mod dynamic_import_resolution;
+mod edit_timing_lines;
 mod embedding_generation_pipeline;
 mod embedding_peak_memory;
 mod files_created_python;

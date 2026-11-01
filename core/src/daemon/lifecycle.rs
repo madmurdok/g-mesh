@@ -320,7 +320,9 @@ impl PluginSupervisor {
     /// awake, or queue it for the next wake. Failures are logged and dropped, so
     /// one bad file never takes the watcher thread down.
     pub fn file_changed(&self, conn: &IndexStore, file_path: String) {
+        crate::log_timing!("route file={file_path} language={}", self.manifest.language);
         let mut inner = self.inner();
+        crate::log_timing!("plugin_taken file={file_path} queued={}", inner.process.is_none());
         let Some(process) = inner.process.as_ref() else {
             inner.dirty.push(file_path);
             self.pending.store(true, Ordering::SeqCst);

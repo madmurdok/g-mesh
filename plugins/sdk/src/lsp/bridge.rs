@@ -2464,6 +2464,8 @@ fn run_pass(
     // Never shorter than `request`: a warm-up is a longer budget or none.
     let warm_up = budgets.warm_up.map(|warm_up| warm_up.max(budgets.request));
     let mut warm_up_logged = false;
+    // GM-435's `lsp_answered` line: measured only when it is written.
+    let mut timing = crate::log::timing_enabled().then(PassTiming::default);
 
     loop {
         // A deferred question goes back on the queue only once the server has
@@ -2505,6 +2507,9 @@ fn run_pass(
             });
             match client.request(question.method(), params) {
                 Ok(id) => {
+                    if let Some(timing) = timing.as_mut() {
+                        timing.questions += 1;
+                    }
                     in_flight.insert(id, (question, Instant::now()));
                 }
                 Err(err) => {
@@ -2576,7 +2581,11 @@ fn run_pass(
 
         match client.poll(wait) {
             Poll::Answered { id, result } => {
-                let Some((question, _)) = in_flight.remove(&id) else { continue };
+                let Some((question, sent)) = in_flight.remove(&id) else { continue };
+                if let Some(timing) = timing.as_mut() {
+                    timing.answers += 1;
+                    timing.latencies.push(sent.elapsed());
+                }
                 // Any answer, empty or not, is a server that is answering.
                 client.mark_warmed_up();
                 // An empty answer while the server is indexing is not an
@@ -2596,7 +2605,12 @@ fn run_pass(
                 queue.extend(again);
             }
             Poll::Failed { id, code, message } => {
-                let Some((question, _)) = in_flight.remove(&id) else { continue };
+                let Some((question, sent)) = in_flight.remove(&id) else { continue };
+                if let Some(timing) = timing.as_mut() {
+                    timing.failed += 1;
+                    timing.content_modified += usize::from(code == Some(CONTENT_MODIFIED));
+                    timing.latencies.push(sent.elapsed());
+                }
                 client.mark_warmed_up();
                 // `ContentModified` is not a refusal: the server's state moved
                 // under the question (rust-analyzer switching crate graphs,
@@ -2678,8 +2692,38 @@ fn run_pass(
         }
     }
 
+    if let Some(mut timing) = timing {
+        timing.latencies.sort_unstable();
+        let ms = |at: Option<&Duration>| at.map_or(0, Duration::as_millis);
+        crate::log_timing!(
+            "lsp_answered language={language} questions={} answers={} failed={} content_modified={} \
+             max_request_ms={} p50_request_ms={}",
+            timing.questions,
+            timing.answers,
+            timing.failed,
+            timing.content_modified,
+            ms(timing.latencies.last()),
+            ms(timing.latencies.get(timing.latencies.len() / 2))
+        );
+    }
     let covered = touched_files.difference(&failed_files).cloned().collect();
     (answers, covered, failure)
+}
+
+/// What [`run_pass`] counts for its GM-435 timing line, only while
+/// `G_MESH_EDIT_TIMING` is set.
+#[derive(Default)]
+struct PassTiming {
+    /// Requests sent, re-asks included.
+    questions: usize,
+    /// Requests answered with a result, empty ones included.
+    answers: usize,
+    /// Requests answered with an error, `ContentModified` included.
+    failed: usize,
+    /// Errors that were `ContentModified`.
+    content_modified: usize,
+    /// Send-to-reply time of every answered or failed request.
+    latencies: Vec<Duration>,
 }
 
 /// Turns one server answer into whatever it is evidence for, and into
@@ -3207,7 +3251,15 @@ impl SemanticEngine for LspBridge {
                         Self::forward_watched(client, &mut unforwarded, &mut opened, &root, index);
                     synced.extend(asked_about.iter().cloned());
                     Self::sync_documents(client, &mut opened, &root, index, &synced, &language, language_ids);
-                    match Self::wait_ready(client, &budgets, deadline, &language) {
+                    crate::log_timing!("lsp_synced language={language} files={}", synced.len());
+                    let ready_started = Instant::now();
+                    let ready = Self::wait_ready(client, &budgets, deadline, &language);
+                    crate::log_timing!(
+                        "lsp_ready language={language} waited_ms={} ready={}",
+                        ready_started.elapsed().as_millis(),
+                        ready.is_ok()
+                    );
+                    match ready {
                         Ok(()) => Ok(run_pass(
                             client,
                             &language,
@@ -3280,6 +3332,15 @@ impl SemanticEngine for LspBridge {
             }
         }
 
+        crate::log_timing!(
+            "lsp_done language={} files={} nodes={} edges={} retracted={} incomplete={}",
+            self.language,
+            scope.len(),
+            diff.upsert_nodes.len(),
+            diff.upsert_edges.len(),
+            diff.delete_edge_ids.len(),
+            failure.is_some() || plan.truncated
+        );
         crate::log_line!(
             "[{}] semantic pass: {} file(s), {} node(s)/{} edge(s) upserted, {} edge(s) retracted, \
              in {:?}{}",
