@@ -42,7 +42,8 @@ pub struct PackageImports {
 /// A string or an array is the package root's entry. An object is a subpath
 /// map when any key is `.` or starts with `./`, and a condition map for the
 /// root otherwise. An exact subpath key wins outright; without one every
-/// wildcard key that matches contributes.
+/// wildcard key that matches contributes. Every form keeps only the targets
+/// tsc accepts ([`target_accepted`]), the root sugar forms included.
 pub fn exports_targets(exports: Option<&Json>, subpath: &str) -> Vec<String> {
     let mut targets = Vec::new();
     let Some(exports) = exports else {
@@ -51,7 +52,7 @@ pub fn exports_targets(exports: Option<&Json>, subpath: &str) -> Vec<String> {
     let entries = match exports {
         Json::String(_) | Json::Array(_) => {
             if subpath == "." {
-                collect_condition_targets(exports, &mut targets);
+                targets = accepted_key_targets(TargetMap::Exports, exports, None);
             }
             return targets;
         }
@@ -61,7 +62,7 @@ pub fn exports_targets(exports: Option<&Json>, subpath: &str) -> Vec<String> {
 
     if !entries.iter().any(|(key, _)| key == "." || key.starts_with("./")) {
         if subpath == "." {
-            collect_condition_targets(exports, &mut targets);
+            targets = accepted_key_targets(TargetMap::Exports, exports, None);
         }
         return targets;
     }
