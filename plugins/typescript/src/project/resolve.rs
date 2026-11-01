@@ -25,7 +25,8 @@ use g_mesh_plugin_sdk::RelPath;
 
 use crate::extractor::grammar::grammar_for;
 use crate::project::exports::{
-    imports_base, imports_specifiers_targeting, imports_targets, key_targets, match_wildcard, PackageImports,
+    accepted_key_targets, imports_base, imports_specifiers_targeting, imports_targets, match_wildcard,
+    PackageImports, TargetMap,
 };
 use crate::project::jsonc::Json;
 use crate::project::paths;
@@ -349,7 +350,7 @@ fn paths_static_targets<'c>(
 /// The targets without `*` of one `imports` key's `value` under `config`, as
 /// bases the forward lookup probes ([`imports_base`]).
 fn imports_static_targets(config: &PackageImports, value: &Json) -> Vec<String> {
-    key_targets(value, None)
+    accepted_key_targets(TargetMap::Imports, value, None)
         .into_iter()
         .filter(|target| !target.contains('*'))
         .filter_map(|target| imports_base(&config.dir, &target))

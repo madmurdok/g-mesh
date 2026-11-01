@@ -133,7 +133,9 @@ fn has_url_scheme(specifier: &str) -> bool {
 /// before `main`; tsc never reads `module`), with `source` first.
 ///
 /// An `exports` target must name a file as written ([`names_file`]): tsc
-/// tries no extension or `index` file for it.
+/// tries no extension or `index` file for it. [`exports_targets`] has
+/// already dropped the targets tsc rejects (not `./`, or a `.`, `..` or
+/// `node_modules` segment).
 ///
 /// The conventions matter most: a declared entry usually points into build
 /// output (`dist/`) that an unbuilt checkout lacks and a built one ignores,
@@ -216,32 +218,20 @@ pub fn subpaths_targeting(package: &WorkspacePackage, address: &str) -> Vec<Stri
 
 /// Whether any of `package`'s entry targets can be the project-relative
 /// `path`: `path` is under the package directory, or the manifest declares
-/// an entry (`exports`, `source`, `main`, `module`, `types`, `typings`)
-/// with a `..` segment that can leave it. Allocates nothing.
+/// a `main`-style field (`source`, `main`, `module`, `types`, `typings`)
+/// with a `..` segment that can leave it. An `exports` target never leaves
+/// it: tsc rejects one with a `..` segment
+/// ([`target_accepted`](crate::project::exports::target_accepted)).
+/// Allocates nothing.
 pub fn package_may_name(package: &WorkspacePackage, path: &str) -> bool {
     let dir = package.dir.as_str();
     if dir.is_empty() || path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/')) {
         return true;
     }
     let climbs = |target: &str| target.split(['/', '\\']).any(|segment| segment == "..");
-    if ["source", "main", "module", "types", "typings"]
+    ["source", "main", "module", "types", "typings"]
         .iter()
         .any(|field| package.manifest.get(field).and_then(Json::as_str).is_some_and(climbs))
-    {
-        return true;
-    }
-    package.manifest.get("exports").is_some_and(|exports| any_string(exports, &climbs))
-}
-
-/// Whether any string leaf of `value` satisfies `test`; object keys are not
-/// targets and are not visited.
-fn any_string(value: &Json, test: &impl Fn(&str) -> bool) -> bool {
-    match value {
-        Json::String(text) => test(text),
-        Json::Array(items) => items.iter().any(|item| any_string(item, test)),
-        Json::Object(entries) => entries.iter().any(|(_, nested)| any_string(nested, test)),
-        _ => false,
-    }
 }
 
 /// The workspace globs: `pnpm-workspace.yaml`'s first, then the root
