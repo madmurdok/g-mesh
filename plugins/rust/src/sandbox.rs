@@ -1155,3 +1155,411 @@ mod tests {
         }
     }
 }
+
+/// The breadth guard's rules R1-R5 on string paths (GM-681). Pure: no
+/// filesystem, so they run on every OS.
+#[cfg(test)]
+mod breadth_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{too_broad, BreadthReason, PrefixSource, Refusal};
+
+    fn reason(prefix: &str) -> Option<BreadthReason> {
+        too_broad(Path::new(prefix), None)
+    }
+
+    /// R1: the filesystem root is refused, with or without a home.
+    ///
+    /// Control: drop R1 from `too_broad`.
+    #[test]
+    fn the_filesystem_root_is_too_broad() {
+        assert_eq!(reason("/"), Some(BreadthReason::Root));
+        assert_eq!(too_broad(Path::new("/"), Some(Path::new("/h/u"))), Some(BreadthReason::Root));
+    }
+
+    /// R2: a path with exactly one normal component is refused.
+    ///
+    /// Control: drop R2 from `too_broad`.
+    #[test]
+    fn a_top_level_directory_is_too_broad() {
+        for prefix in ["/usr", "/opt", "/Users", "/home", "/etc", "/var", "/nix", "/private", "/run"] {
+            assert_eq!(reason(prefix), Some(BreadthReason::TopLevel), "{prefix}");
+        }
+    }
+
+    /// R3: macOS's `/private/<x>` aliases are refused; a directory below
+    /// one (the per-user temp dir) is not.
+    ///
+    /// Control: drop R3 from `too_broad`.
+    #[test]
+    fn a_macos_system_alias_is_too_broad_and_a_directory_below_it_is_not() {
+        for prefix in ["/private/var", "/private/tmp", "/private/etc"] {
+            assert_eq!(reason(prefix), Some(BreadthReason::SystemAlias), "{prefix}");
+        }
+        assert_eq!(reason("/private/var/folders/x/y/T/scratch"), None);
+    }
+
+    /// R4: volume and mount roots, and the `/run/media` parents of udisks2
+    /// mount roots, are refused; a directory inside a volume is not.
+    ///
+    /// Controls: drop R4 from `too_broad`; drop the `["run", "media"]` and
+    /// `["run", "media", _]` shapes (the `/run/media` parents).
+    #[test]
+    fn a_volume_or_mount_root_is_too_broad_and_a_directory_inside_one_is_not() {
+        for prefix in
+            ["/Volumes/X", "/System/Volumes/Data", "/mnt/x", "/media/x", "/media/u/x", "/run/media/u/x"]
+        {
+            assert_eq!(reason(prefix), Some(BreadthReason::VolumeRoot), "{prefix}");
+        }
+        assert_eq!(reason("/Volumes/X/rust/bin"), None);
+    }
+
+    /// R4 also covers `/run/media` and `/run/media/<u>`, as `/media/<u>`
+    /// covers the mount roots under `/media`.
+    ///
+    /// Control: drop the `["run", "media"]` and `["run", "media", _]` shapes.
+    #[test]
+    fn the_run_media_parents_of_mount_roots_are_too_broad() {
+        assert_eq!(reason("/run/media"), Some(BreadthReason::VolumeRoot));
+        assert_eq!(reason("/run/media/alice"), Some(BreadthReason::VolumeRoot));
+    }
+
+    /// R5: the home and every ancestor of it are refused, a directory below
+    /// the home is not; R1-R4 win over R5 (`/h` is a top-level directory).
+    ///
+    /// Control: drop R5 from `too_broad` (ignore `home`).
+    #[test]
+    fn the_home_and_its_ancestors_are_too_broad_and_a_directory_below_it_is_not() {
+        let home = Some(Path::new("/h/u"));
+        assert_eq!(too_broad(Path::new("/h/u"), home), Some(BreadthReason::Home));
+        assert_eq!(too_broad(Path::new("/h"), home), Some(BreadthReason::TopLevel));
+        assert_eq!(too_broad(Path::new("/h/u/.cargo/bin"), home), None);
+        let deep = Some(Path::new("/home/users/alice"));
+        assert_eq!(too_broad(Path::new("/home/users"), deep), Some(BreadthReason::Home));
+        assert_eq!(too_broad(Path::new("/home/users/alice"), deep), Some(BreadthReason::Home));
+        assert_eq!(too_broad(Path::new("/home/users/bob"), deep), None);
+    }
+
+    /// Without a known home R5 is skipped; R1-R4 still apply.
+    ///
+    /// Control: none of its own (the R1 control fails the `/` assertion).
+    #[test]
+    fn without_a_home_only_r5_is_skipped() {
+        assert_eq!(too_broad(Path::new("/h/u"), None), None);
+        assert_eq!(too_broad(Path::new("/"), None), Some(BreadthReason::Root));
+        assert_eq!(too_broad(Path::new("/usr"), None), Some(BreadthReason::TopLevel));
+        assert_eq!(too_broad(Path::new("/private/tmp"), None), Some(BreadthReason::SystemAlias));
+        assert_eq!(too_broad(Path::new("/Volumes/X"), None), Some(BreadthReason::VolumeRoot));
+    }
+
+    /// The depth-2 OS and package directories next to the refused shapes are
+    /// allowed.
+    ///
+    /// Control: none of its own; it fails if a rule is widened to depth 2.
+    #[test]
+    fn os_and_package_directories_below_the_top_level_are_allowed() {
+        for prefix in ["/usr/bin", "/usr/lib", "/usr/local", "/opt/homebrew", "/nix/store/abc-rust/bin"] {
+            assert_eq!(too_broad(Path::new(prefix), Some(Path::new("/h/u"))), None, "{prefix}");
+        }
+    }
+
+    /// Windows drive and UNC roots are R1, `C:\Users` is R2, the unix-only
+    /// R3/R4 shapes do not apply under a drive, and a cargo bin below the
+    /// home is allowed.
+    #[cfg(windows)]
+    #[test]
+    fn windows_roots_and_top_level_directories_are_too_broad() {
+        for prefix in [r"C:\", r"\\?\C:\", r"\\server\share\"] {
+            assert_eq!(reason(prefix), Some(BreadthReason::Root), "{prefix}");
+        }
+        assert_eq!(reason(r"C:\Users"), Some(BreadthReason::TopLevel));
+        assert_eq!(reason(r"C:\Program Files"), Some(BreadthReason::TopLevel));
+        assert_eq!(reason(r"C:\mnt\x"), None);
+        assert_eq!(reason(r"C:\private\var"), None);
+        let home = Some(Path::new(r"C:\Users\u"));
+        assert_eq!(too_broad(Path::new(r"C:\Users\u"), home), Some(BreadthReason::Home));
+        assert_eq!(too_broad(Path::new(r"C:\Users\u\.cargo\bin"), home), None);
+    }
+
+    /// The log line names the prefix, the source with its binary, and the
+    /// reason, in the documented wording.
+    ///
+    /// Control: none of its own (a wording change fails it).
+    #[test]
+    fn a_refusal_message_names_the_prefix_the_source_and_the_reason() {
+        let root = Refusal {
+            prefix: PathBuf::from("/"),
+            source: PrefixSource::Sysroot,
+            reason: BreadthReason::Root,
+        };
+        assert_eq!(
+            root.message(),
+            "[rust] semantic tier: sandbox: not allowing exec under /, the sysroot (the filesystem root); \
+             rust-analyzer cannot run anything that lives only there"
+        );
+        let home = Refusal {
+            prefix: PathBuf::from("/h/u"),
+            source: PrefixSource::CargoProxy(PathBuf::from("/h/u/rustup")),
+            reason: BreadthReason::Home,
+        };
+        assert_eq!(
+            home.message(),
+            "[rust] semantic tier: sandbox: not allowing exec under /h/u, the directory of the cargo proxy \
+             /h/u/rustup (your home directory or one above it); rust-analyzer cannot run anything that lives \
+             only there"
+        );
+        let sources = [
+            (PrefixSource::Rustup(PathBuf::from("/a/rustup")), "directory of rustup /a/rustup"),
+            (PrefixSource::Server(PathBuf::from("/a/ra")), "directory of rust-analyzer /a/ra"),
+            (PrefixSource::Rustc(PathBuf::from("/a/rustc")), "directory of rustc /a/rustc"),
+            (PrefixSource::Cargo(PathBuf::from("/a/cargo")), "directory of cargo /a/cargo"),
+        ];
+        for (source, text) in sources {
+            assert_eq!(source.to_string(), text);
+        }
+        let reasons = [
+            (BreadthReason::TopLevel, "a top-level directory"),
+            (BreadthReason::SystemAlias, "a system alias directory"),
+            (BreadthReason::VolumeRoot, "a volume or mount root"),
+        ];
+        for (reason, text) in reasons {
+            assert_eq!(reason.to_string(), text);
+        }
+    }
+}
+
+/// The breadth guard wired into `toolchain_prefixes` and `for_server`, on
+/// real temp dirs and symlinks (GM-681).
+#[cfg(all(test, unix))]
+mod breadth_wiring_tests {
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+
+    use super::{toolchain_prefixes, BreadthReason, PrefixSource, Refusal, SandboxPolicy};
+    use crate::semantic::Toolchain;
+
+    /// A canonical temp directory that removes itself, unique per process
+    /// and per call.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("g-mesh-rs-breadth-{name}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir.canonicalize().unwrap())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An empty file at `path`, its parent created.
+    fn file(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "").unwrap();
+        path.to_path_buf()
+    }
+
+    /// A cargo proxy symlinked to a `rustup` that lies directly in the home
+    /// resolves to the home: that prefix is dropped with one refusal naming
+    /// the cargo proxy and R5, and the server's directory stays (the tier is
+    /// not refused).
+    ///
+    /// Controls: drop R5 from `too_broad`; keep refused prefixes in
+    /// `policy.toolchain`.
+    #[test]
+    fn a_proxy_resolving_into_the_home_is_dropped_and_the_rest_kept() {
+        let scratch = Scratch::new("proxy-home");
+        let home = scratch.0.join("home");
+        let rustup = file(&home.join("rustup"));
+        let cargo_home = home.join(".cargo");
+        std::fs::create_dir_all(cargo_home.join("bin")).unwrap();
+        symlink(&rustup, cargo_home.join("bin/cargo")).unwrap();
+        let server = file(&scratch.0.join("ra/rust-analyzer"));
+        let root = scratch.0.join("proj");
+
+        let (kept, refused) =
+            toolchain_prefixes(&Toolchain::default(), &server, Some(&cargo_home), Some(&home));
+        assert_eq!(
+            refused,
+            vec![Refusal {
+                prefix: home.clone(),
+                source: PrefixSource::CargoProxy(rustup),
+                reason: BreadthReason::Home
+            }]
+        );
+        assert_eq!(kept, vec![scratch.0.join("ra")]);
+
+        let policy = SandboxPolicy::for_server(
+            &root,
+            &Toolchain::default(),
+            &server,
+            Some(&cargo_home),
+            None,
+            Some(&home),
+        );
+        assert_eq!(policy.toolchain, vec![scratch.0.join("ra")], "{policy:?}");
+        assert_eq!(policy.project_root, root, "{policy:?}");
+    }
+
+    /// A prefix is judged by its canonical path: `rustc` in a symlinked
+    /// directory that resolves to the home is dropped, though the link's
+    /// own path is not the home or above it.
+    ///
+    /// Control: run `too_broad` on the prefix before canonicalizing it.
+    #[test]
+    fn a_symlinked_prefix_is_judged_by_its_target() {
+        let scratch = Scratch::new("symlink-target");
+        let home = scratch.0.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let tools = scratch.0.join("tools");
+        symlink(&home, &tools).unwrap();
+        let rustc = file(&tools.join("rustc"));
+        let toolchain = Toolchain { rustc: Some(rustc.clone()), ..Toolchain::default() };
+        let server = scratch.0.join("ra/rust-analyzer");
+
+        let (kept, refused) = toolchain_prefixes(&toolchain, &server, None, Some(&home));
+        assert_eq!(
+            refused,
+            vec![Refusal { prefix: home, source: PrefixSource::Rustc(rustc), reason: BreadthReason::Home }]
+        );
+        assert!(kept.is_empty(), "{kept:?}");
+    }
+
+    /// R5 applies through `for_server`'s `home`: `rustup` directly in the
+    /// home drops its directory; without a home the same toolchain keeps it;
+    /// a `~/.cargo/bin`-shaped prefix below the home is kept either way.
+    ///
+    /// Controls: drop R5 from `too_broad`; keep refused prefixes in
+    /// `policy.toolchain`.
+    #[test]
+    fn rustup_in_the_home_is_dropped_only_when_the_home_is_known() {
+        let scratch = Scratch::new("rustup-home");
+        let home = scratch.0.join("home");
+        let rustup = file(&home.join("rustup"));
+        let cargo = file(&home.join(".cargo/bin/cargo"));
+        let toolchain =
+            Toolchain { rustup: Some(rustup.clone()), cargo: Some(cargo), ..Toolchain::default() };
+        let server = scratch.0.join("ra/rust-analyzer");
+        let root = scratch.0.join("proj");
+        let bin = home.join(".cargo/bin");
+
+        let with = SandboxPolicy::for_server(&root, &toolchain, &server, None, None, Some(&home));
+        assert_eq!(with.toolchain, vec![bin.clone()], "{with:?}");
+        let (_, refused) = toolchain_prefixes(&toolchain, &server, None, Some(&home));
+        assert_eq!(
+            refused,
+            vec![Refusal {
+                prefix: home.clone(),
+                source: PrefixSource::Rustup(rustup),
+                reason: BreadthReason::Home
+            }]
+        );
+
+        let without = SandboxPolicy::for_server(&root, &toolchain, &server, None, None, None);
+        assert_eq!(without.toolchain, vec![home, bin], "{without:?}");
+        let (_, refused) = toolchain_prefixes(&toolchain, &server, None, None);
+        assert!(refused.is_empty(), "{refused:?}");
+    }
+
+    /// The home is canonicalized before R5: given through a symlink, it
+    /// still refuses its canonical self.
+    ///
+    /// Control: compare against `home` as given (skip `canonical_home`).
+    #[test]
+    fn a_home_given_through_a_symlink_is_judged_by_its_target() {
+        let scratch = Scratch::new("home-link");
+        let home = scratch.0.join("home");
+        let rustup = file(&home.join("rustup"));
+        let link = scratch.0.join("home-link");
+        symlink(&home, &link).unwrap();
+        let toolchain = Toolchain { rustup: Some(rustup), ..Toolchain::default() };
+
+        let (kept, refused) =
+            toolchain_prefixes(&toolchain, &scratch.0.join("ra/rust-analyzer"), None, Some(&link));
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!((refused[0].prefix.clone(), refused[0].reason), (home, BreadthReason::Home));
+    }
+
+    /// A home that does not exist resolves through its nearest existing
+    /// ancestor: behind a symlinked ancestor, the canonical directories
+    /// above it are still refused.
+    ///
+    /// Control: keep a home that cannot be canonicalized as given in
+    /// `canonical_home` (no ancestor walk).
+    #[test]
+    fn a_missing_home_behind_a_symlink_still_refuses_its_canonical_ancestors() {
+        let real = Scratch::new("missing-home-real");
+        let links = Scratch::new("missing-home-links");
+        let link = links.0.join("link");
+        symlink(&real.0, &link).unwrap();
+        let home = link.join("nohome/u");
+        let rustc = file(&real.0.join("rustc"));
+        let toolchain = Toolchain { rustc: Some(rustc.clone()), ..Toolchain::default() };
+        let server = links.0.join("ra/rust-analyzer");
+
+        let (kept, refused) = toolchain_prefixes(&toolchain, &server, None, Some(&home));
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(
+            refused,
+            vec![Refusal {
+                prefix: real.0.clone(),
+                source: PrefixSource::Rustc(rustc),
+                reason: BreadthReason::Home
+            }]
+        );
+    }
+
+    /// One broad prefix from two sources yields one refusal, naming the
+    /// first source in order (rustup before rustc), so one log line; a kept
+    /// prefix from two sources appears once.
+    ///
+    /// Control: drop the dedup check in `toolchain_prefixes`.
+    #[test]
+    fn a_prefix_from_two_sources_is_refused_or_kept_once() {
+        let scratch = Scratch::new("dedup");
+        let home = scratch.0.join("home");
+        let rustup = file(&home.join("rustup"));
+        let rustc = file(&home.join("rustc"));
+        let cargo = file(&home.join(".cargo/bin/cargo"));
+        let server = file(&home.join(".cargo/bin/rust-analyzer"));
+        let toolchain = Toolchain {
+            rustup: Some(rustup.clone()),
+            rustc: Some(rustc),
+            cargo: Some(cargo),
+            ..Toolchain::default()
+        };
+
+        let (kept, refused) = toolchain_prefixes(&toolchain, &server, None, Some(&home));
+        assert_eq!(
+            refused,
+            vec![Refusal {
+                prefix: home.clone(),
+                source: PrefixSource::Rustup(rustup),
+                reason: BreadthReason::Home
+            }]
+        );
+        assert_eq!(kept, vec![home.join(".cargo/bin")]);
+    }
+
+    /// A prefix that does not exist is skipped without a refusal.
+    ///
+    /// Control: none of its own (behaviour unchanged by GM-681).
+    #[test]
+    fn a_missing_prefix_is_skipped_without_a_refusal() {
+        let scratch = Scratch::new("missing-prefix");
+        let toolchain = Toolchain { rustc: Some(scratch.0.join("gone/rustc")), ..Toolchain::default() };
+        let (kept, refused) =
+            toolchain_prefixes(&toolchain, &scratch.0.join("ra/rust-analyzer"), None, Some(&scratch.0));
+        assert!(kept.is_empty(), "{kept:?}");
+        assert!(refused.is_empty(), "{refused:?}");
+    }
+}
