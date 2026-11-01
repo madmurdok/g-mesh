@@ -1581,6 +1581,9 @@ fn only_the_first_star_of_a_paths_target_takes_the_capture() {
 
 /// End to end: with both `src/q-q.ts` and a literal `src/q-*.ts` on disk,
 /// `@/q` resolves to the literal one, as tsc does.
+/// Unix only (GM-684): the fixture writes a file named with `*`, which
+/// Windows forbids in a file name, so the shape cannot occur there.
+#[cfg(unix)]
 #[test]
 fn a_two_star_paths_target_resolves_to_the_literal_second_star() {
     let fx = Fixture::new(&[
