@@ -63,6 +63,14 @@
 //!    declared here nor imported (it came through a glob import, or the
 //!    prelude), an associated function on a generic parameter (`T::new()`),
 //!    `Self::` outside any impl.
+//!  - **A path rooted at a name a glob `use` may have brought in**: in a
+//!    module with a glob `use`, `a::f` or `a::T::f` whose `a` is no
+//!    workspace crate, declared `mod` or named import of the module
+//!    (`use super::*;` then `schema::f()`, the parent having imported
+//!    `schema`). Without the glob, `a` is another crate and the path is not
+//!    asked; with it, `a` is asked unless it is `std`, `core`, `alloc`,
+//!    `proc_macro`, a primitive type or a Cargo dependency of the crate
+//!    ([`Bodies::glob_may_bind`]).
 //!  - **`impl Trait for T` where `T` is declared in another file.** The
 //!    `SUPERTYPE_OF` edge has to start at `T`'s node, and an edge may not
 //!    leave its file - but a *semantic* answer may (the conformance kit
@@ -83,7 +91,7 @@ use g_mesh_plugin_sdk::{NodeSpec, OpenSite, OpenSiteKind, PlaceholderKind};
 use tree_sitter::Node;
 
 use crate::extractor::decls::{
-    field_tail, field_tail_path, impl_block, member_tail, trait_block, BlockCtx, Family,
+    field_tail, field_tail_path, impl_block, member_tail, member_tail_path, trait_block, BlockCtx, Family,
 };
 use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::{
@@ -98,6 +106,32 @@ use crate::extractor::syntax::{
 };
 use crate::extractor::typing::{binding_name, LocalType, Origin, Wrapper, WrittenType, MAX_HOPS};
 use crate::project::ProjectContext;
+
+/// Path roots no glob `use` of this project can make name a project item:
+/// the sysroot crates and the primitive types.
+const NEVER_A_PROJECT_ITEM: &[&str] = &[
+    "std",
+    "core",
+    "alloc",
+    "proc_macro",
+    "bool",
+    "char",
+    "str",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "u128",
+    "usize",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "isize",
+    "f32",
+    "f64",
+];
 
 /// What a use site turned out to name.
 #[derive(Debug, Clone)]
@@ -121,6 +155,10 @@ pub(crate) struct Bodies<'a, 's> {
     pub(crate) model: &'a FileModel,
     pub(crate) emitter: &'a mut Emitter<'s>,
     pub(crate) scopes: Scopes,
+    /// The fns whose bodies the walk is inside, outermost first, each as its
+    /// path within its own parent (`f`, `T::m`, `<T as Tr>::m`). Empty at
+    /// module level.
+    pub(crate) enclosing_fns: Vec<QualifiedPath>,
 }
 
 impl Bodies<'_, '_> {
@@ -419,9 +457,22 @@ impl Bodies<'_, '_> {
             self.scopes.bind_parameters(parameters, self.source);
             self.type_parameters(parameters, module, block, Origin::Parameter);
         }
+        let name = item.child_by_field_name("name").map(|name| text(name, self.source));
+        let member = item
+            .parent()
+            .filter(|list| list.kind() == "declaration_list")
+            .and_then(|list| list.parent())
+            .is_some_and(|owner| matches!(owner.kind(), "impl_item" | "trait_item"));
+        if let Some(name) = name {
+            let block = if member { block } else { None };
+            self.enclosing_fns.push(member_tail_path(block, name));
+        }
         // The name is an `identifier`, and walking it would ask what `f`
         // means at a point where `f` is the thing being declared.
         self.visit_children_except(item, &[item.child_by_field_name("name")], module, block, &id);
+        if name.is_some() {
+            self.enclosing_fns.pop();
+        }
         self.scopes.pop();
     }
 
@@ -1214,6 +1265,11 @@ impl Bodies<'_, '_> {
                     name: tail.to_string(),
                 }
             }
+            PathTarget::ExternalCrate(first) if self.glob_may_bind(&first, module) => {
+                #[cfg(test)]
+                crate::census::record(crate::census::Reason::OpenGlobPath, tail, &module.key);
+                Bound::Open
+            }
             PathTarget::ExternalCrate(_) => {
                 #[cfg(test)]
                 crate::census::record(crate::census::Reason::DottedExternal, tail, &module.key);
@@ -1225,6 +1281,22 @@ impl Bodies<'_, '_> {
                 Bound::Open
             }
         }
+    }
+
+    /// Whether `first`, the first segment of a path that names no workspace
+    /// crate, declared `mod` or named import of `module`, may name something
+    /// a glob `use` of `module` brought in (`use super::*;` then
+    /// `schema::f()` for a parent's `use crate::storage::schema;`) - so only
+    /// the semantic tier can say what the path names. Not when `module` has
+    /// no glob, nor for a name that is never a project item: `std`, `core`,
+    /// `alloc`, `proc_macro`, a primitive type (`u32::MAX`), a name a `use`
+    /// of this module binds to another crate, or a Cargo dependency of this
+    /// crate's package ([`ProjectContext::is_dependency`]).
+    fn glob_may_bind(&self, first: &str, module: &ModuleCtx) -> bool {
+        self.model.has_glob(&module.key)
+            && !NEVER_A_PROJECT_ITEM.contains(&first)
+            && self.model.lookup_import(&module.key, first).is_none()
+            && !self.project.is_dependency(&module.crate_root, first)
     }
 
     /// Whether `path`'s last segment, the qualifier of a `path::member`, is a
@@ -1246,10 +1318,12 @@ impl Bodies<'_, '_> {
     /// told from a type of the same spelling by this alone (GM-637).
     ///
     /// A capitalized module reached only through a glob `use` (`use a::*;
-    /// Keys::f()`) has no import record, so its path does not resolve here
-    /// and it is still read as a type; so is one a `macro_rules!` body
-    /// declares, which the module-tree scan does not see. Both are a missing
-    /// edge, never a wrong one.
+    /// Keys::f()`) as the path's first segment has no import record, so its
+    /// path does not resolve here and it is still read as a type; so is one
+    /// a `macro_rules!` body declares, which the module-tree scan does not
+    /// see. Both are a missing edge, never a wrong one. A lowercase module
+    /// reached the same way (`schema::f()`) is an open site instead - see
+    /// the module doc, Decision 7.
     fn names_module(&self, path: &[Seg<'_>], module: &ModuleCtx) -> bool {
         let PathTarget::Container(key) = resolve_module_path(path, module, self.model, self.project) else {
             return false;
@@ -1309,6 +1383,11 @@ impl Bodies<'_, '_> {
         } else {
             match resolve_module_path(prefix, module, self.model, self.project) {
                 PathTarget::Container(container) => (container, type_name.to_string()),
+                PathTarget::ExternalCrate(first) if self.glob_may_bind(&first, module) => {
+                    #[cfg(test)]
+                    crate::census::record(crate::census::Reason::OpenGlobPath, member, &module.key);
+                    return Bound::Open;
+                }
                 PathTarget::ExternalCrate(_) => {
                     #[cfg(test)]
                     crate::census::record(crate::census::Reason::DottedExternal, member, &module.key);
@@ -1564,6 +1643,11 @@ impl Bodies<'_, '_> {
     /// the kind the SDK bridge accepts as an implementor; `nativeKind` is
     /// `impl`, which is what tells it apart from a `struct`.
     ///
+    /// A block inside a fn body is qualified by the fns it is inside, as
+    /// rustc's def paths are (`m::first::<Nothing as Tr>`): two fns of one
+    /// module may each declare a local `Nothing` with its own impl, and one
+    /// shared name would make the two one node.
+    ///
     /// `public`, because a trait impl's reach is the trait's and the type's,
     /// never narrower - the same reasoning [`impl_block`] already applies to
     /// the block's members (Rust forbids a visibility modifier on either).
@@ -1577,7 +1661,7 @@ impl Bodies<'_, '_> {
         let mut spec = NodeSpec::with_path(
             NodeKind::Type,
             name.clone(),
-            module.qualified_path(&QualifiedPath::root(name.clone())),
+            module.qualified_path(&self.fn_local_path(&name)),
             self.emitter.positions().range(item),
         )
         .native_kind("impl")
@@ -1586,6 +1670,21 @@ impl Bodies<'_, '_> {
         spec.signature = signature(item, self.source);
         spec.doc_comment = outer_doc_comment(item, self.source);
         Some(self.emitter.declare(spec, true))
+    }
+
+    /// `name` as a path inside the fns the walk is in - see
+    /// [`Self::enclosing_fns`] - or alone at module level.
+    fn fn_local_path(&self, name: &str) -> QualifiedPath {
+        let mut segments = self.enclosing_fns.iter().flat_map(|path| {
+            path.segments().iter().enumerate().map(|(index, segment)| {
+                let sep = if index == 0 { "::".to_string() } else { segment.sep.clone().unwrap_or_default() };
+                (sep, segment.name.clone())
+            })
+        });
+        let Some((_, first)) = segments.next() else { return QualifiedPath::root(name) };
+        segments
+            .fold(QualifiedPath::root(first), |path, (sep, segment)| path.child(sep, segment))
+            .child("::", name)
     }
 
     fn supertype_to(&mut self, subtype: &str, supertype: Node, module: &ModuleCtx, block: Option<&BlockCtx>) {

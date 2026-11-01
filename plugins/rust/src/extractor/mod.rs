@@ -207,8 +207,14 @@ impl Extractor for RustExtractor {
         }
         {
             let file = emitter.file_id().to_string();
-            let mut bodies =
-                Bodies { project, source, model: &model, emitter: &mut emitter, scopes: Scopes::new() };
+            let mut bodies = Bodies {
+                project,
+                source,
+                model: &model,
+                emitter: &mut emitter,
+                scopes: Scopes::new(),
+                enclosing_fns: Vec::new(),
+            };
             bodies.visit_children(root, &module, None, &file);
         }
 
