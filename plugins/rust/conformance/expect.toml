@@ -57,6 +57,9 @@
 #   - references, a qualifiedName two crates carry (GM-360's `shapes::Gauge`).
 #   - callers, through a module spelled like a type (`capitals::Keys::f` and
 #     `capitals::Keys::Key::Major`), from another crate.
+#   - callers through a module path a glob `use` brought in
+#     (`store::schema::set_facts`, semantic), and implementations by two
+#     same-named fn-local impls of one module (`locals::Extractor`).
 #
 # Every `expect` is a SET of `"filePath:qualifiedName"` strings - order never
 # matters, and an entry missing from the set is as much of a failure as an
@@ -821,3 +824,30 @@ symbol = "capitals::Keys::Key::Major"
 # segment continues to the module's own container, where the tuple variant's
 # `qualifiedName` `Keys::Key::Major` is declared.
 expect = ["crates/beta/src/capital_calls.rs:capital_calls::variant"]
+
+# --- callers through a glob-reached module path; same-named fn-local impls ---
+
+[[callers]]
+symbol = "store::schema::set_facts"
+tier = "semantic"
+# `seed` imports `schema` by name, so `direct`'s call is a structural edge.
+# `seed::inline` and the file-backed `seed::tests` reach `schema` only
+# through `use super::*;`: their `schema::set_facts` calls are open sites,
+# and only rust-analyzer's answer makes them callers. Structural: `{direct}`.
+expect = [
+    "crates/alpha/src/seed.rs:seed::direct",
+    "crates/alpha/src/seed.rs:seed::inline::via_glob_inline",
+    "crates/alpha/src/seed/tests.rs:seed::tests::via_glob_file",
+]
+# Two rows in seed.rs, so the response tallies them.
+files = ["crates/alpha/src/seed.rs:2", "crates/alpha/src/seed/tests.rs:1"]
+
+[[implementations]]
+symbol = "locals::Extractor"
+# `first` and `second` each declare a local `Nothing` with its own impl: two
+# impl-block nodes qualified by their fns, each with its own `SUPERTYPE_OF`
+# edge, rather than one node both blocks collapse into.
+expect = [
+    "crates/alpha/src/locals.rs:locals::first::<Nothing as Extractor>",
+    "crates/alpha/src/locals.rs:locals::second::<Nothing as Extractor>",
+]

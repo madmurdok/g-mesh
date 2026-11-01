@@ -8,7 +8,8 @@
 //! `pub(crate)` item whose visibility is checked from a sibling module and
 //! from the other crate, `prelude` is the `pub use` chain, and `gaps` is
 //! where the documented structural gaps are written down beside code that
-//! has them.
+//! has them. `seed` reaches `store::schema` through glob imports, and
+//! `locals` declares two same-named fn-local impls.
 
 mod nested;
 
@@ -25,9 +26,12 @@ pub mod blanket;
 pub mod capitals;
 pub mod gaps;
 pub mod internals;
+pub mod locals;
 pub mod prelude;
+pub mod seed;
 pub mod shapes;
 pub mod sirens;
+pub mod store;
 
 pub fn run() -> &'static str {
     let _ = inline_mod::helper();

@@ -423,4 +423,92 @@ mod tests {
         }
         assert_eq!(RustFacts::decode(&RustFacts::of(&project).encode()), Some(RustFacts::of(&project)));
     }
+
+    /// The files of the package at `dir`, less the packages `not_under`.
+    fn package(dir: &str, not_under: &[&str]) -> ResolutionDelta {
+        ResolutionDelta::Affected {
+            files: vec![PathScope {
+                under: dir.to_string(),
+                not_under: not_under.iter().map(|dir| dir.to_string()).collect(),
+            }],
+            imports: Vec::new(),
+        }
+    }
+
+    /// A dependency added to, removed from or renamed in any of a package's
+    /// dependency tables selects that package's files, and only them; a
+    /// version or feature edit of an existing dependency selects nothing.
+    ///
+    /// Control: make `delta` skip `with_dependency_changes` (return its
+    /// first argument) - every edit answers `Unchanged`.
+    #[test]
+    fn a_dependency_added_removed_or_renamed_selects_its_package() {
+        let with = |tables: &str| format!("{ALPHA}\n{tables}");
+        for (label, from, to) in [
+            ("added", "", "[dependencies]\nserde = \"1\"\n"),
+            ("removed", "[dependencies]\nserde = \"1\"\n", ""),
+            ("renamed", "[dependencies]\nserde = \"1\"\n", "[dependencies]\nserde_json = \"1\"\n"),
+            ("dev", "", "[dev-dependencies]\ntempfile = \"3\"\n"),
+            ("build", "", "[build-dependencies]\ncc = \"1\"\n"),
+            ("target", "", "[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n"),
+            (
+                "package rename by key",
+                "[dependencies]\nalias = { package = \"real\", version = \"1\" }\n",
+                "[dependencies]\nother = { package = \"real\", version = \"1\" }\n",
+            ),
+        ] {
+            let tree = workspace();
+            tree.write("alpha/Cargo.toml", &with(from));
+            let before = tree.load();
+            tree.write("alpha/Cargo.toml", &with(to));
+            assert_eq!(saved(&before, &tree), package("alpha", &[]), "{label}");
+        }
+
+        let tree = workspace();
+        tree.write("alpha/Cargo.toml", &with("[dependencies]\nserde = { version = \"1\" }\n"));
+        let before = tree.load();
+        tree.write(
+            "alpha/Cargo.toml",
+            &with("[dependencies]\nserde = { version = \"2\", features = [\"derive\"] }\n"),
+        );
+        assert_eq!(saved(&before, &tree), ResolutionDelta::Unchanged, "a version and feature edit");
+    }
+
+    /// A dependency edit of a package with packages nested under its
+    /// directory leaves the nested ones out of the scope.
+    ///
+    /// Control: make `with_dependency_changes` push `not_under: Vec::new()` -
+    /// the scope also covers `alpha` and `beta`.
+    #[test]
+    fn a_dependency_edit_of_a_root_package_leaves_the_nested_packages_out() {
+        let root = |tables: &str| {
+            format!(
+                "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = [\"alpha\", \"beta\"]\n{tables}"
+            )
+        };
+        let tree = workspace();
+        tree.write("Cargo.toml", &root("")).write("src/lib.rs", "");
+        let before = tree.load();
+        tree.write("Cargo.toml", &root("\n[dependencies]\nserde = \"1\"\n"));
+        assert_eq!(saved(&before, &tree), package("", &["alpha", "beta"]));
+    }
+
+    /// The dependency names are part of the facts' format: a blob of format
+    /// 2, which had none, answers `Unknown` rather than a delta that would
+    /// read every package as having lost its dependencies.
+    ///
+    /// Control: set [`FORMAT`] back to 2 - the blob is read and answers
+    /// `Unchanged`.
+    #[test]
+    fn a_format_2_blob_answers_unknown() {
+        let tree = workspace();
+        let project = tree.load();
+        let current = RustFacts::of(&project).encode();
+        let format_2 = current.replacen(&format!("\"format\":{FORMAT}"), "\"format\":2", 1);
+        assert_ne!(format_2, current, "the blob spells its format as expected");
+        assert!(
+            matches!(resolution_delta(&format_2, &project), ResolutionDelta::Unknown { .. }),
+            "a format-2 blob was read as facts"
+        );
+    }
 }
