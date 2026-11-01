@@ -124,13 +124,16 @@ pub const DEFAULT_INDEX_WAIT_CAP: Duration = Duration::from_secs(25 * 60);
 
 /// The longest `search_code` waits, after the structural wait, for the
 /// embedding pass to finish, in milliseconds; past it the call answers from
-/// the vectors already stored and says so. `0` does not wait. Unset or
-/// unparsable means [`SEARCH_EMBEDDING_WAIT`].
+/// the vectors already stored and says so. The bound is per pass, not per
+/// call: once one call has waited it out, later calls during the same pass
+/// answer at once. `0` does not wait. Unset or unparsable means
+/// [`SEARCH_EMBEDDING_WAIT`].
 pub const SEARCH_EMBEDDING_WAIT_ENV: &str = "G_MESH_SEARCH_EMBEDDING_WAIT_MS";
 
 /// Under Claude Code's 120 s move-to-background threshold; long enough for a
 /// small project's whole backfill or one file-change batch
-/// (`docs/architecture/gm-432-search-code-hang.md`).
+/// (`docs/architecture/gm-432-search-code-hang.md`). Spent once per pass,
+/// not per call (see [`SEARCH_EMBEDDING_WAIT_ENV`]).
 pub const SEARCH_EMBEDDING_WAIT: Duration = Duration::from_secs(20);
 
 /// Upper bound on the serialized `tools/list` result in bytes, measured on a
@@ -579,7 +582,10 @@ impl GMeshMcpServer {
 
     /// `search_code`'s bounded wait for [`Phase::Ready`], after `prepare` has
     /// satisfied [`Need::Structural`]: at most [`SEARCH_EMBEDDING_WAIT_ENV`],
-    /// with the same progress and cancellation as the structural wait.
+    /// with the same progress and cancellation as the structural wait. Once a
+    /// call has waited a non-zero bound out, later calls in the same pass do
+    /// not wait ([`IndexingStatus::embedding_wait_spent`]); a phase that is
+    /// already `Ready` still reads as complete.
     /// `Ok(Ok(None))`: every embeddable node is embedded. `Ok(Ok(Some))`: the
     /// pass is still owed, and the answer is ranked from the stored vectors
     /// alone. `Ok(Err)`: a finished tool result (a failed walk).
@@ -588,9 +594,13 @@ impl GMeshMcpServer {
         ctx: &RequestContext<RoleServer>,
     ) -> Result<Result<Option<search_code::Coverage>, CallToolResult>, ErrorData> {
         let started = Instant::now();
-        let bound = self
-            .search_embedding_wait
-            .unwrap_or_else(|| env_millis(SEARCH_EMBEDDING_WAIT_ENV, SEARCH_EMBEDDING_WAIT));
+        let spent = self.indexing.embedding_wait_spent();
+        let bound = if spent {
+            Duration::ZERO
+        } else {
+            self.search_embedding_wait
+                .unwrap_or_else(|| env_millis(SEARCH_EMBEDDING_WAIT_ENV, SEARCH_EMBEDDING_WAIT))
+        };
         let deadline = started.checked_add(bound);
         let outcome =
             self.wait_until(ctx, "search_code:embeddings", Need::Embeddings, started, deadline).await?;
@@ -600,13 +610,16 @@ impl GMeshMcpServer {
             // The phase is read after the progress so that a pass finishing
             // in between reads as complete rather than as partial.
             WaitOutcome::TimedOut => {
+                if !bound.is_zero() {
+                    self.indexing.mark_embedding_wait_spent();
+                }
                 let (embedded, total) = self.indexing.embed_progress();
                 let phase = self.indexing.phase();
                 search_code::Coverage::partial(
                     &phase,
                     embedded,
                     total,
-                    started.elapsed(),
+                    (!spent).then(|| started.elapsed()),
                     self.registry.project_root(),
                 )
                 .map_or(Ok(None), |coverage| Ok(Some(coverage)))

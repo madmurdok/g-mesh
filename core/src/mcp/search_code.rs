@@ -143,7 +143,9 @@ pub(super) struct Coverage {
     state: PassState,
     embedded: u64,
     total: u64,
-    waited: Duration,
+    /// How long this call waited; `None` when it did not wait because an
+    /// earlier call had already waited the bound out for this pass.
+    waited: Option<Duration>,
     root: PathBuf,
 }
 
@@ -154,7 +156,7 @@ impl Coverage {
         phase: &Phase,
         embedded: u64,
         total: u64,
-        waited: Duration,
+        waited: Option<Duration>,
         root: &Path,
     ) -> Option<Self> {
         let state = match phase {
@@ -170,19 +172,22 @@ impl Coverage {
     /// `stored`, the number of vectors the page was ranked from.
     fn note(&self, stored: u64) -> String {
         let root = self.root.display();
-        let waited = human_duration(self.waited);
+        let waited = match self.waited {
+            Some(waited) => format!("this call waited {}", human_duration(waited)),
+            None => "this call did not wait: an earlier call already waited for this pass".to_string(),
+        };
         let head = match self.state {
             PassState::Running => format!(
-                "g-mesh: the embedding pass for {root} is still running (embeddings {} of {} computed, this \
-                 call waited {waited}). Only symbols embedded so far were ranked",
+                "g-mesh: the embedding pass for {root} is still running (embeddings {} of {} computed, \
+                 {waited}). Only symbols embedded so far were ranked",
                 self.embedded, self.total
             ),
             PassState::Counting => format!(
                 "g-mesh: the embedding pass for {root} has started but has not yet counted what needs \
-                 embedding (this call waited {waited}); {stored} symbols from an earlier pass were ranked"
+                 embedding ({waited}); {stored} symbols from an earlier pass were ranked"
             ),
             PassState::NotStarted => format!(
-                "g-mesh: the embedding pass for {root} has not started yet (this call waited {waited}); \
+                "g-mesh: the embedding pass for {root} has not started yet ({waited}); \
                  {stored} symbols from an earlier pass were ranked"
             ),
         };
