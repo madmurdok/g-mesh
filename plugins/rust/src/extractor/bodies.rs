@@ -1648,6 +1648,14 @@ impl Bodies<'_, '_> {
     /// module may each declare a local `Nothing` with its own impl, and one
     /// shared name would make the two one node.
     ///
+    /// A block whose name is already taken in this file - two
+    /// `const _: () = { struct K; impl Tr for K {} };` in one module, or two
+    /// `{ struct K; impl Tr for K {} }` blocks in one fn, which rustc tells
+    /// apart (`{const#0}`, `{const#1}`) and this scheme cannot - is named
+    /// with a `#2`, `#3`, ... suffix in source order (`m::<K as Tr>#2`), so
+    /// it is a node of its own rather than dropped by [`Emitter::declare`]'s
+    /// first-wins rule. A non-colliding block keeps its plain name.
+    ///
     /// `public`, because a trait impl's reach is the trait's and the type's,
     /// never narrower - the same reasoning [`impl_block`] already applies to
     /// the block's members (Rust forbids a visibility modifier on either).
@@ -1657,16 +1665,24 @@ impl Bodies<'_, '_> {
         module: &ModuleCtx,
         block: Option<&BlockCtx>,
     ) -> Option<String> {
-        let name = block.map(|block| block.prefix.clone())?;
-        let mut spec = NodeSpec::with_path(
-            NodeKind::Type,
-            name.clone(),
-            module.qualified_path(&self.fn_local_path(&name)),
-            self.emitter.positions().range(item),
-        )
-        .native_kind("impl")
-        .visibility(Visibility::Public)
-        .in_container(module.key.clone(), module.parent.clone());
+        let prefix = block.map(|block| block.prefix.clone())?;
+        let spec_named = |this: &Self, name: String| {
+            NodeSpec::with_path(
+                NodeKind::Type,
+                name.clone(),
+                module.qualified_path(&this.fn_local_path(&name)),
+                this.emitter.positions().range(item),
+            )
+            .native_kind("impl")
+            .visibility(Visibility::Public)
+            .in_container(module.key.clone(), module.parent.clone())
+        };
+        let mut spec = spec_named(self, prefix.clone());
+        let mut ordinal = 2;
+        while self.emitter.is_declared(&spec) {
+            spec = spec_named(self, format!("{prefix}#{ordinal}"));
+            ordinal += 1;
+        }
         spec.signature = signature(item, self.source);
         spec.doc_comment = outer_doc_comment(item, self.source);
         Some(self.emitter.declare(spec, true))

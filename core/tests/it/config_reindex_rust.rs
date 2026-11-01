@@ -124,18 +124,12 @@ fn a_lib_path_move_re_extracts_the_re_keyed_files_and_the_parents_importers() {
     );
 }
 
-/// A version bump, a new dependency and a feature table re-extract nothing
-/// and reindex nothing.
+/// A version bump and a feature table re-extract nothing and reindex
+/// nothing. (A dependency edit re-extracts its package: GM-682.)
 #[test]
-fn a_cargo_toml_version_and_dependency_edit_re_extracts_nothing() {
+fn a_cargo_toml_version_and_feature_edit_re_extracts_nothing() {
     let harness = indexed();
-    harness.write(
-        "alpha/Cargo.toml",
-        &format!(
-            "{}\n[dependencies]\nserde = \"1\"\n\n[features]\nx = []\n",
-            ALPHA.replace("0.1.0", "0.2.0")
-        ),
-    );
+    harness.write("alpha/Cargo.toml", &format!("{}\n[features]\nx = []\n", ALPHA.replace("0.1.0", "0.2.0")));
     harness.route("alpha/Cargo.toml");
 
     assert_eq!(marked("mark_v2", &harness), Vec::<String>::new(), "no file was re-extracted");

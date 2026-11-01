@@ -339,3 +339,27 @@ enclosing-fn prefix must fail test 6.
   changes so existing indexes rebuild.
 - **Owner choices:** Decision A (A2 recommended; A3 optional on top) and
   Decision B (B1 recommended, or B3 for the same-fn residual).
+
+## 8. Review fixes (GM-682/S6)
+
+- **F1: a Cargo dependency edit re-extracts its package.** A2 made each
+  package's dependency names an input of extraction (`name::f()` in a
+  glob-importing module is an open site only while `name` is no
+  dependency), but `RustFacts` did not carry them, so adding, removing or
+  renaming a dependency answered `Unchanged` and kept stale open sites (or
+  their absence) until the `.rs` file was edited. `RustFacts` now holds
+  `dependencies` (package dir -> names, as `ProjectContext::is_dependency`
+  reads them); `facts::delta` adds, through `with_dependency_changes`, a
+  `files` scope for every package whose set changed (packages nested under
+  it excluded). Facts `FORMAT` is 3, so stored format-2 facts answer
+  `Unknown` once and refresh. The tests that pinned "a dependency edit
+  re-extracts nothing" now edit only the version and features.
+- **F2: colliding Decision-8 impl blocks get an ordinal.** Two
+  `const _: () = { struct K; impl Tr for K {} };` in one module (or two
+  `{}` blocks in one fn) qualified to the same `m::<K as Tr>`, and the
+  second was dropped by the emitter's first-wins rule. `declare_impl_block`
+  now checks `Emitter::is_declared` and retries with `#2`, `#3`, ... on the
+  name and qualified name (`m::<K as Tr>#2`), in source order. A
+  non-colliding block keeps its B1 name. Residual: the second block's
+  methods still share the first's prefix (`<K as Tr>::f`), and two `cfg`
+  alternatives of one such block are now two nodes rather than one.
