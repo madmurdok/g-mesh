@@ -1,0 +1,217 @@
+{
+ "bin": "/Users/Valentin_Taiurskii/Projects/ClaudeProjects/g-mesh-wt-gm441/../g-mesh-wt-gm441-base/target/release/g-mesh",
+ "project": "/tmp/gm441/src-r5-A0",
+ "timeline": [
+  {
+   "t": 0.81,
+   "phase": "unindexed",
+   "done": 0,
+   "total": 0
+  },
+  {
+   "t": 1.81,
+   "phase": "walking",
+   "done": 0,
+   "total": 0
+  },
+  {
+   "t": 11.88,
+   "phase": "structural",
+   "done": 0,
+   "total": 0
+  },
+  {
+   "t": 293.02,
+   "phase": "embedding",
+   "done": 0,
+   "total": 5411
+  },
+  {
+   "t": 305.1,
+   "phase": "embedding",
+   "done": 256,
+   "total": 5411
+  },
+  {
+   "t": 315.19,
+   "phase": "embedding",
+   "done": 512,
+   "total": 5411
+  },
+  {
+   "t": 325.25,
+   "phase": "embedding",
+   "done": 768,
+   "total": 5411
+  },
+  {
+   "t": 335.33,
+   "phase": "embedding",
+   "done": 1024,
+   "total": 5411
+  },
+  {
+   "t": 345.4,
+   "phase": "embedding",
+   "done": 1280,
+   "total": 5411
+  },
+  {
+   "t": 356.5,
+   "phase": "embedding",
+   "done": 1536,
+   "total": 5411
+  },
+  {
+   "t": 366.58,
+   "phase": "embedding",
+   "done": 1792,
+   "total": 5411
+  },
+  {
+   "t": 376.65,
+   "phase": "embedding",
+   "done": 2048,
+   "total": 5411
+  },
+  {
+   "t": 386.73,
+   "phase": "embedding",
+   "done": 2304,
+   "total": 5411
+  },
+  {
+   "t": 396.81,
+   "phase": "embedding",
+   "done": 2560,
+   "total": 5411
+  },
+  {
+   "t": 404.88,
+   "phase": "embedding",
+   "done": 2816,
+   "total": 5411
+  },
+  {
+   "t": 413.94,
+   "phase": "embedding",
+   "done": 3072,
+   "total": 5411
+  },
+  {
+   "t": 426.04,
+   "phase": "embedding",
+   "done": 3328,
+   "total": 5411
+  },
+  {
+   "t": 436.13,
+   "phase": "embedding",
+   "done": 3584,
+   "total": 5411
+  },
+  {
+   "t": 447.22,
+   "phase": "embedding",
+   "done": 3840,
+   "total": 5411
+  },
+  {
+   "t": 455.29,
+   "phase": "embedding",
+   "done": 4096,
+   "total": 5411
+  },
+  {
+   "t": 464.34,
+   "phase": "embedding",
+   "done": 4352,
+   "total": 5411
+  },
+  {
+   "t": 475.42,
+   "phase": "embedding",
+   "done": 4608,
+   "total": 5411
+  },
+  {
+   "t": 486.49,
+   "phase": "embedding",
+   "done": 4864,
+   "total": 5411
+  },
+  {
+   "t": 496.57,
+   "phase": "embedding",
+   "done": 5120,
+   "total": 5411
+  },
+  {
+   "t": 504.63,
+   "phase": "embedding",
+   "done": 5376,
+   "total": 5411
+  },
+  {
+   "t": 506.64,
+   "phase": "ready",
+   "done": 5411,
+   "total": 5411
+  }
+ ],
+ "searches": [
+  {
+   "query": "parse a configuration file",
+   "took_s": 1.45,
+   "partial": false,
+   "rows": 30,
+   "score_monotone": false,
+   "at": "ready",
+   "t": 508.1
+  },
+  {
+   "query": "compute the embedding of a node text",
+   "took_s": 0.808,
+   "partial": false,
+   "rows": 30,
+   "score_monotone": false,
+   "at": "ready",
+   "t": 508.9
+  },
+  {
+   "query": "find the nodes that still need a vector",
+   "took_s": 0.545,
+   "partial": false,
+   "rows": 30,
+   "score_monotone": false,
+   "at": "ready",
+   "t": 509.45
+  },
+  {
+   "query": "report indexing progress to the status command",
+   "took_s": 0.419,
+   "partial": false,
+   "rows": 30,
+   "score_monotone": false,
+   "at": "ready",
+   "t": 509.87
+  },
+  {
+   "query": "load the language plugin process",
+   "took_s": 0.824,
+   "partial": false,
+   "rows": 30,
+   "score_monotone": false,
+   "at": "ready",
+   "t": 510.69
+  }
+ ],
+ "tiers": [],
+ "daemonPid": 66003,
+ "initialize": true,
+ "ready_t": 506.64,
+ "embedding_start_t": 293.02,
+ "pass_s": 213.62,
+ "daemonCpuTime": "27:55.27",
+ "daemonKilled": false
+}
