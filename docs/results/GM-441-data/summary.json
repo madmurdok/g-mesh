@@ -1,0 +1,1308 @@
+{
+ "corpora": [
+  "excalidraw",
+  "g-mesh",
+  "gin",
+  "py-requests",
+  "ripgrep",
+  "task-tracker-mcp"
+ ],
+ "arms": {
+  "id": {
+   "excalidraw": {
+    "nodes": 2726,
+    "goldTotal": 54,
+    "passS": 94.53133565380786,
+    "measuredPassS": 94.819959144,
+    "recall10": 0.62,
+    "mrr": 0.4222372952855846,
+    "recall10Reranked": 0.62,
+    "mrrReranked": 0.48626559066170616,
+    "tFullGold": 93.87170619929151,
+    "t90": 85.08179320594803,
+    "t100": 89.82942264504638,
+    "goldShare": {
+     "20": 0.16666666666666666,
+     "60": 0.6481481481481481,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 94.5125949514678,
+      "frac": 0.9998017514276041,
+      "nodes": 1357
+     },
+     "public": {
+      "t": 94.53133565380786,
+      "frac": 1.0,
+      "nodes": 1186
+     },
+     "test": {
+      "t": 93.87170619929151,
+      "frac": 0.9930221079607714,
+      "nodes": 183
+     }
+    },
+    "aucRecall": 0.3372256829889588,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.9930221079607714,
+    "t90Frac": 0.9000379886467923,
+    "t100Frac": 0.950260800016824
+   },
+   "g-mesh": {
+    "nodes": 5608,
+    "goldTotal": 56,
+    "passS": 333.0606803692472,
+    "measuredPassS": 353.792,
+    "recall10": 0.38,
+    "mrr": 0.24047502413278468,
+    "recall10Reranked": 0.42,
+    "mrrReranked": 0.29935332027067163,
+    "tFullGold": 332.8972338953916,
+    "t90": 299.77506978661387,
+    "t100": 332.8972338953916,
+    "goldShare": {
+     "20": 0.08928571428571429,
+     "60": 0.19642857142857142,
+     "120": 0.48214285714285715
+    },
+    "tierEnds": {
+     "private": {
+      "t": 332.8972338953916,
+      "frac": 0.9995092591726097,
+      "nodes": 2077
+     },
+     "public": {
+      "t": 332.98343917766357,
+      "frac": 0.9997680867297274,
+      "nodes": 1046
+     },
+     "test": {
+      "t": 333.0606803692472,
+      "frac": 1.0,
+      "nodes": 2485
+     }
+    },
+    "aucRecall": 0.2664443640428321,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.9995092591726096,
+    "t90Frac": 0.9000614226040393,
+    "t100Frac": 0.9995092591726096
+   },
+   "gin": {
+    "nodes": 1478,
+    "goldTotal": 134,
+    "passS": 36.01068187489978,
+    "measuredPassS": 36.665788018,
+    "recall10": 0.76,
+    "mrr": 0.44590121033244867,
+    "recall10Reranked": 0.81,
+    "mrrReranked": 0.5033629313146325,
+    "tFullGold": 35.98650266178825,
+    "t90": 32.409992311917705,
+    "t100": 35.98650266178825,
+    "goldShare": {
+     "20": 0.5373134328358209,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 35.76394862332511,
+      "frac": 0.9931483315858387,
+      "nodes": 165
+     },
+     "public": {
+      "t": 36.01068187489978,
+      "frac": 1.0,
+      "nodes": 520
+     },
+     "test": {
+      "t": 35.98650266178825,
+      "frac": 0.9993285544218372,
+      "nodes": 793
+     }
+    },
+    "aucRecall": 0.43550751642225116,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.9993285544218371,
+    "t90Frac": 0.9000105142276733,
+    "t100Frac": 0.9993285544218371
+   },
+   "py-requests": {
+    "nodes": 830,
+    "goldTotal": 107,
+    "passS": 33.32517456336029,
+    "measuredPassS": 35.545835598,
+    "recall10": 0.72,
+    "mrr": 0.5033219010315836,
+    "recall10Reranked": 0.74,
+    "mrrReranked": 0.526870320749121,
+    "tFullGold": 33.31034076868492,
+    "t90": 31.71510668394032,
+    "t100": 33.31034076868492,
+    "goldShare": {
+     "20": 0.5420560747663551,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 32.02396254196764,
+      "frac": 0.9609540823584077,
+      "nodes": 15
+     },
+     "public": {
+      "t": 33.32517456336029,
+      "frac": 1.0,
+      "nodes": 448
+     },
+     "test": {
+      "t": 33.31034076868492,
+      "frac": 0.9995548772101052,
+      "nodes": 367
+     }
+    },
+    "aucRecall": 0.35728489058108875,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.9995548772101052,
+    "t90Frac": 0.9516861381668447,
+    "t100Frac": 0.9995548772101052
+   },
+   "ripgrep": {
+    "nodes": 2850,
+    "goldTotal": 68,
+    "passS": 119.5563055860028,
+    "measuredPassS": 126.66251082900001,
+    "recall10": 0.36,
+    "mrr": 0.21605419293727565,
+    "recall10Reranked": 0.44,
+    "mrrReranked": 0.24137901626209904,
+    "tFullGold": 113.58496508573418,
+    "t90": 95.64745295403708,
+    "t100": 95.64745295403708,
+    "goldShare": {
+     "20": 0.058823529411764705,
+     "60": 0.4264705882352941,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 119.5563055860028,
+      "frac": 1.0,
+      "nodes": 1087
+     },
+     "public": {
+      "t": 119.53045083151954,
+      "frac": 0.9997837441165773,
+      "nodes": 1583
+     },
+     "test": {
+      "t": 119.08117361139992,
+      "frac": 0.9960258727277159,
+      "nodes": 180
+     }
+    },
+    "aucRecall": 0.19181788361072302,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.9500541567339321,
+    "t90Frac": 0.8000201451962156,
+    "t100Frac": 0.8000201451962156
+   },
+   "task-tracker-mcp": {
+    "nodes": 149,
+    "goldTotal": 56,
+    "passS": 6.892278152257212,
+    "measuredPassS": 6.944549784,
+    "recall10": 0.9,
+    "mrr": 0.7136300350549577,
+    "recall10Reranked": 0.92,
+    "mrrReranked": 0.7702828207787374,
+    "tFullGold": 6.832158911173878,
+    "t90": 5.519241321076106,
+    "t100": 6.832158911173878,
+    "goldShare": {
+     "20": 1.0,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 6.832158911173878,
+      "frac": 0.9912773048685442,
+      "nodes": 57
+     },
+     "public": {
+      "t": 6.892278152257212,
+      "frac": 1.0,
+      "nodes": 82
+     },
+     "test": {
+      "t": 5.6810237813939235,
+      "frac": 0.8242592152978323,
+      "nodes": 10
+     }
+    },
+    "aucRecall": 0.5114520275335663,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.991277304868544,
+    "t90Frac": 0.8007862130852281,
+    "t100Frac": 0.991277304868544
+   }
+  },
+  "tier": {
+   "excalidraw": {
+    "nodes": 2726,
+    "goldTotal": 54,
+    "passS": 94.53133565380772,
+    "measuredPassS": 94.819959144,
+    "recall10": 0.62,
+    "mrr": 0.4222372952855846,
+    "recall10Reranked": 0.62,
+    "mrrReranked": 0.48626559066170616,
+    "tFullGold": 85.08976352658235,
+    "t90": 61.49373465752513,
+    "t100": 85.08976352658235,
+    "goldShare": {
+     "20": 0.18518518518518517,
+     "60": 0.7777777777777778,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 88.52304247051171,
+      "frac": 0.936441253667466,
+      "nodes": 1357
+     },
+     "public": {
+      "t": 44.67337322434175,
+      "frac": 0.47257740425824946,
+      "nodes": 1186
+     },
+     "test": {
+      "t": 94.53133565380772,
+      "frac": 1.0,
+      "nodes": 183
+     }
+    },
+    "aucRecall": 0.40473092542654754,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.9001223027060333,
+    "t90Frac": 0.6505116449716446,
+    "t100Frac": 0.9001223027060333
+   },
+   "g-mesh": {
+    "nodes": 5608,
+    "goldTotal": 56,
+    "passS": 333.0606803692467,
+    "measuredPassS": 353.792,
+    "recall10": 0.38,
+    "mrr": 0.24047502413278468,
+    "recall10Reranked": 0.42,
+    "mrrReranked": 0.29935332027067163,
+    "tFullGold": 183.19654280027692,
+    "t90": 116.60372272393988,
+    "t100": 116.60372272393988,
+    "goldShare": {
+     "20": 0.16071428571428573,
+     "60": 0.30357142857142855,
+     "120": 0.75
+    },
+    "tierEnds": {
+     "private": {
+      "t": 183.77936802934573,
+      "frac": 0.5517894451713703,
+      "nodes": 2077
+     },
+     "public": {
+      "t": 60.944396383220855,
+      "frac": 0.18298286160844637,
+      "nodes": 1046
+     },
+     "test": {
+      "t": 333.0606803692467,
+      "frac": 1.0,
+      "nodes": 2485
+     }
+    },
+    "aucRecall": 0.34581548914574517,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.5500395381321405,
+    "t90Frac": 0.3500975335625554,
+    "t100Frac": 0.3500975335625554
+   },
+   "gin": {
+    "nodes": 1478,
+    "goldTotal": 134,
+    "passS": 36.010681874899696,
+    "measuredPassS": 36.665788018,
+    "recall10": 0.76,
+    "mrr": 0.44590121033244867,
+    "recall10Reranked": 0.81,
+    "mrrReranked": 0.5033629313146325,
+    "tFullGold": 21.264757584594893,
+    "t90": 19.823286994904674,
+    "t100": 21.264757584594893,
+    "goldShare": {
+     "20": 0.8880597014925373,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 21.264757584594893,
+      "frac": 0.590512494555593,
+      "nodes": 165
+     },
+     "public": {
+      "t": 17.766324858869048,
+      "frac": 0.49336263391481633,
+      "nodes": 520
+     },
+     "test": {
+      "t": 36.010681874899696,
+      "frac": 1.0,
+      "nodes": 793
+     }
+    },
+    "aucRecall": 0.5537428470661784,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.5905124945555928,
+    "t90Frac": 0.5504835221885087,
+    "t100Frac": 0.5905124945555928
+   },
+   "py-requests": {
+    "nodes": 830,
+    "goldTotal": 107,
+    "passS": 33.325174563360285,
+    "measuredPassS": 35.545835598,
+    "recall10": 0.72,
+    "mrr": 0.5033219010315836,
+    "recall10Reranked": 0.74,
+    "mrrReranked": 0.526870320749121,
+    "tFullGold": 15.693341055394722,
+    "t90": 13.397330383024881,
+    "t100": 15.064622702949228,
+    "goldShare": {
+     "20": 1.0,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 15.693341055394722,
+      "frac": 0.4709154943977077,
+      "nodes": 15
+     },
+     "public": {
+      "t": 15.516804203058033,
+      "frac": 0.46561809221903216,
+      "nodes": 448
+     },
+     "test": {
+      "t": 33.325174563360285,
+      "frac": 1.0,
+      "nodes": 367
+     }
+    },
+    "aucRecall": 0.5866016128655344,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.4709154943977077,
+    "t90Frac": 0.4020183107384145,
+    "t100Frac": 0.4520493260825162
+   },
+   "ripgrep": {
+    "nodes": 2850,
+    "goldTotal": 68,
+    "passS": 119.55630558600332,
+    "measuredPassS": 126.66251082900001,
+    "recall10": 0.36,
+    "mrr": 0.21605419293727565,
+    "recall10Reranked": 0.44,
+    "mrrReranked": 0.24137901626209904,
+    "tFullGold": 111.53555658646388,
+    "t90": 101.64394336935825,
+    "t100": 101.64394336935825,
+    "goldShare": {
+     "20": 0.10294117647058823,
+     "60": 0.4264705882352941,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 111.53555658646388,
+      "frac": 0.932912371620837,
+      "nodes": 1087
+     },
+     "public": {
+      "t": 63.56172907088634,
+      "frac": 0.5316468149407891,
+      "nodes": 1583
+     },
+     "test": {
+      "t": 119.55630558600332,
+      "frac": 1.0,
+      "nodes": 180
+     }
+    },
+    "aucRecall": 0.19636726093722254,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.9329123716208371,
+    "t90Frac": 0.8501763488855907,
+    "t100Frac": 0.8501763488855907
+   },
+   "task-tracker-mcp": {
+    "nodes": 149,
+    "goldTotal": 56,
+    "passS": 6.892278152257212,
+    "measuredPassS": 6.944549784,
+    "recall10": 0.9,
+    "mrr": 0.7136300350549577,
+    "recall10Reranked": 0.92,
+    "mrrReranked": 0.7702828207787374,
+    "tFullGold": 6.689284146374442,
+    "t90": 6.216476264411259,
+    "t100": 6.689284146374442,
+    "goldShare": {
+     "20": 1.0,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 6.689284146374442,
+      "frac": 0.970547618450905,
+      "nodes": 57
+     },
+     "public": {
+      "t": 4.7366045681883335,
+      "frac": 0.6872335189544114,
+      "nodes": 82
+     },
+     "test": {
+      "t": 6.892278152257212,
+      "frac": 1.0,
+      "nodes": 10
+     }
+    },
+    "aucRecall": 0.47407767055222666,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.9705476184509051,
+    "t90Frac": 0.9019479665624597,
+    "t100Frac": 0.9705476184509051
+   }
+  },
+  "oracle": {
+   "excalidraw": {
+    "nodes": 2726,
+    "goldTotal": 54,
+    "passS": 94.53133565380786,
+    "measuredPassS": 94.819959144,
+    "recall10": 0.62,
+    "mrr": 0.4222372952855846,
+    "recall10Reranked": 0.62,
+    "mrrReranked": 0.48626559066170616,
+    "tFullGold": 4.7442139077453,
+    "t90": 4.7442139077453,
+    "t100": 4.7442139077453,
+    "goldShare": {
+     "20": 1.0,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 94.5125949514678,
+      "frac": 0.9998017514276041,
+      "nodes": 1357
+     },
+     "public": {
+      "t": 94.53133565380786,
+      "frac": 1.0,
+      "nodes": 1186
+     },
+     "test": {
+      "t": 93.87170619929151,
+      "frac": 0.9930221079607714,
+      "nodes": 183
+     }
+    },
+    "aucRecall": 0.6834221371372009,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.05018668016201034,
+    "t90Frac": 0.05018668016201034,
+    "t100Frac": 0.05018668016201034
+   },
+   "g-mesh": {
+    "nodes": 5608,
+    "goldTotal": 56,
+    "passS": 333.0606803692473,
+    "measuredPassS": 353.792,
+    "recall10": 0.38,
+    "mrr": 0.24047502413278468,
+    "recall10Reranked": 0.42,
+    "mrrReranked": 0.29935332027067163,
+    "tFullGold": 16.697055256224445,
+    "t90": 16.697055256224445,
+    "t100": 16.697055256224445,
+    "goldShare": {
+     "20": 1.0,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 332.8972338953917,
+      "frac": 0.9995092591726097,
+      "nodes": 2077
+     },
+     "public": {
+      "t": 332.98343917766357,
+      "frac": 0.9997680867297274,
+      "nodes": 1046
+     },
+     "test": {
+      "t": 333.0606803692473,
+      "frac": 1.0,
+      "nodes": 2485
+     }
+    },
+    "aucRecall": 0.5114907935047994,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.05013217182440532,
+    "t90Frac": 0.05013217182440532,
+    "t100Frac": 0.05013217182440532
+   },
+   "gin": {
+    "nodes": 1478,
+    "goldTotal": 134,
+    "passS": 36.01068187489978,
+    "measuredPassS": 36.665788018,
+    "recall10": 0.76,
+    "mrr": 0.44590121033244867,
+    "recall10Reranked": 0.81,
+    "mrrReranked": 0.5033629313146325,
+    "tFullGold": 5.411271388792405,
+    "t90": 3.6309396770332696,
+    "t100": 3.6309396770332696,
+    "goldShare": {
+     "20": 1.0,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 35.79838619030037,
+      "frac": 0.9941046469117991,
+      "nodes": 165
+     },
+     "public": {
+      "t": 36.01068187489978,
+      "frac": 1.0,
+      "nodes": 520
+     },
+     "test": {
+      "t": 35.98650266178825,
+      "frac": 0.9993285544218372,
+      "nodes": 793
+     }
+    },
+    "aucRecall": 0.7830637742646036,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.1502685066500831,
+    "t90Frac": 0.10082951746504175,
+    "t100Frac": 0.10082951746504175
+   },
+   "py-requests": {
+    "nodes": 830,
+    "goldTotal": 107,
+    "passS": 33.32517456336028,
+    "measuredPassS": 35.545835598,
+    "recall10": 0.72,
+    "mrr": 0.5033219010315836,
+    "recall10Reranked": 0.74,
+    "mrrReranked": 0.526870320749121,
+    "tFullGold": 5.013283514531254,
+    "t90": 5.013283514531254,
+    "t100": 5.013283514531254,
+    "goldShare": {
+     "20": 1.0,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 31.013540427878006,
+      "frac": 0.9306339976978298,
+      "nodes": 15
+     },
+     "public": {
+      "t": 33.32517456336028,
+      "frac": 1.0,
+      "nodes": 448
+     },
+     "test": {
+      "t": 33.3103407686849,
+      "frac": 0.9995548772101052,
+      "nodes": 367
+     }
+    },
+    "aucRecall": 0.7495450465523934,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.1504353264526681,
+    "t90Frac": 0.1504353264526681,
+    "t100Frac": 0.1504353264526681
+   },
+   "ripgrep": {
+    "nodes": 2850,
+    "goldTotal": 68,
+    "passS": 119.55630558600276,
+    "measuredPassS": 126.66251082900001,
+    "recall10": 0.36,
+    "mrr": 0.21605419293727565,
+    "recall10Reranked": 0.44,
+    "mrrReranked": 0.24137901626209904,
+    "tFullGold": 6.015027906438665,
+    "t90": 6.015027906438665,
+    "t100": 6.015027906438665,
+    "goldShare": {
+     "20": 1.0,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 119.55630558600276,
+      "frac": 1.0,
+      "nodes": 1087
+     },
+     "public": {
+      "t": 119.5304508315195,
+      "frac": 0.9997837441165773,
+      "nodes": 1583
+     },
+     "test": {
+      "t": 119.08117361139989,
+      "frac": 0.9960258727277159,
+      "nodes": 180
+     }
+    },
+    "aucRecall": 0.4869700876385356,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.050311256081025005,
+    "t90Frac": 0.050311256081025005,
+    "t100Frac": 0.050311256081025005
+   },
+   "task-tracker-mcp": {
+    "nodes": 149,
+    "goldTotal": 56,
+    "passS": 6.892278152257217,
+    "measuredPassS": 6.944549784,
+    "recall10": 0.9,
+    "mrr": 0.7136300350549577,
+    "recall10Reranked": 0.92,
+    "mrrReranked": 0.7702828207787374,
+    "tFullGold": 2.4605186325124913,
+    "t90": 2.0734417372791243,
+    "t100": 2.4605186325124913,
+    "goldShare": {
+     "20": 1.0,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 6.832158911173884,
+      "frac": 0.9912773048685442,
+      "nodes": 57
+     },
+     "public": {
+      "t": 6.892278152257217,
+      "frac": 1.0,
+      "nodes": 82
+     },
+     "test": {
+      "t": 6.262626939407668,
+      "frac": 0.9086439637315946,
+      "nodes": 10
+     }
+    },
+    "aucRecall": 0.7852457101768218,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.35699642094489076,
+    "t90Frac": 0.30083546999624117,
+    "t100Frac": 0.35699642094489076
+   }
+  },
+  "tier-reversed": {
+   "excalidraw": {
+    "nodes": 2726,
+    "goldTotal": 54,
+    "passS": 94.53133565380817,
+    "measuredPassS": 94.819959144,
+    "recall10": 0.62,
+    "mrr": 0.4222372952855846,
+    "recall10Reranked": 0.62,
+    "mrrReranked": 0.48626559066170616,
+    "tFullGold": 94.53133565380817,
+    "t90": 80.36044628085506,
+    "t100": 94.53133565380817,
+    "goldShare": {
+     "20": 0.14814814814814814,
+     "60": 0.42592592592592593,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 49.857962429466205,
+      "frac": 0.5274225957417507,
+      "nodes": 1357
+     },
+     "public": {
+      "t": 94.53133565380817,
+      "frac": 1.0,
+      "nodes": 1186
+     },
+     "test": {
+      "t": 6.00829318329605,
+      "frac": 0.0635587463325343,
+      "nodes": 183
+     }
+    },
+    "aucRecall": 0.2639293004289187,
+    "checkpoints": 22,
+    "tFullGoldFrac": 1.0,
+    "t90Frac": 0.8500932069250601,
+    "t100Frac": 1.0
+   },
+   "g-mesh": {
+    "nodes": 5608,
+    "goldTotal": 56,
+    "passS": 333.0606803692468,
+    "measuredPassS": 353.792,
+    "recall10": 0.38,
+    "mrr": 0.24047502413278468,
+    "recall10Reranked": 0.42,
+    "mrrReranked": 0.29935332027067163,
+    "tFullGold": 333.0606803692468,
+    "t90": 283.1025486439267,
+    "t100": 333.0606803692468,
+    "goldShare": {
+     "20": 0.0,
+     "60": 0.0,
+     "120": 0.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 272.1162839860265,
+      "frac": 0.8170171383915552,
+      "nodes": 2077
+     },
+     "public": {
+      "t": 333.0606803692468,
+      "frac": 1.0,
+      "nodes": 1046
+     },
+     "test": {
+      "t": 149.28131233990248,
+      "frac": 0.44821055482863414,
+      "nodes": 2485
+     }
+    },
+    "aucRecall": 0.13029118680793778,
+    "checkpoints": 22,
+    "tFullGoldFrac": 1.0,
+    "t90Frac": 0.8500029133732202,
+    "t100Frac": 1.0
+   },
+   "gin": {
+    "nodes": 1478,
+    "goldTotal": 134,
+    "passS": 36.01068187489981,
+    "measuredPassS": 36.665788018,
+    "recall10": 0.76,
+    "mrr": 0.44590121033244867,
+    "recall10Reranked": 0.81,
+    "mrrReranked": 0.5033629313146325,
+    "tFullGold": 36.01068187489981,
+    "t90": 32.41092380733857,
+    "t100": 36.01068187489981,
+    "goldShare": {
+     "20": 0.30597014925373134,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 18.244357016030527,
+      "frac": 0.5066373660851788,
+      "nodes": 165
+     },
+     "public": {
+      "t": 36.01068187489981,
+      "frac": 1.0,
+      "nodes": 520
+     },
+     "test": {
+      "t": 14.74592429030471,
+      "frac": 0.4094875054444033,
+      "nodes": 793
+     }
+    },
+    "aucRecall": 0.273343700218537,
+    "checkpoints": 22,
+    "tFullGoldFrac": 1.0,
+    "t90Frac": 0.9000363814251919,
+    "t100Frac": 1.0
+   },
+   "py-requests": {
+    "nodes": 830,
+    "goldTotal": 107,
+    "passS": 33.325174563360314,
+    "measuredPassS": 35.545835598,
+    "recall10": 0.72,
+    "mrr": 0.5033219010315836,
+    "recall10Reranked": 0.74,
+    "mrrReranked": 0.526870320749121,
+    "tFullGold": 33.325174563360314,
+    "t90": 33.325174563360314,
+    "t100": 33.325174563360314,
+    "goldShare": {
+     "20": 0.028037383177570093,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 17.808370360302273,
+      "frac": 0.5343819077809681,
+      "nodes": 15
+     },
+     "public": {
+      "t": 33.325174563360314,
+      "frac": 1.0,
+      "nodes": 448
+     },
+     "test": {
+      "t": 17.631833507965588,
+      "frac": 0.5290845056022926,
+      "nodes": 367
+     }
+    },
+    "aucRecall": 0.15644589521872693,
+    "checkpoints": 22,
+    "tFullGoldFrac": 1.0,
+    "t90Frac": 1.0,
+    "t100Frac": 1.0
+   },
+   "ripgrep": {
+    "nodes": 2850,
+    "goldTotal": 68,
+    "passS": 119.55630558600282,
+    "measuredPassS": 126.66251082900001,
+    "recall10": 0.36,
+    "mrr": 0.21605419293727565,
+    "recall10Reranked": 0.44,
+    "mrrReranked": 0.24137901626209904,
+    "tFullGold": 113.64908712090835,
+    "t90": 89.69148681430593,
+    "t100": 101.64443784083967,
+    "goldShare": {
+     "20": 0.014705882352941176,
+     "60": 0.5735294117647058,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 55.9945765151171,
+      "frac": 0.468353185059214,
+      "nodes": 1087
+     },
+     "public": {
+      "t": 119.55630558600282,
+      "frac": 1.0,
+      "nodes": 1583
+     },
+     "test": {
+      "t": 8.020748999539506,
+      "frac": 0.06708762837916385,
+      "nodes": 180
+     }
+    },
+    "aucRecall": 0.22958050855435183,
+    "checkpoints": 22,
+    "tFullGoldFrac": 0.950590490094685,
+    "t90Frac": 0.7502028970758583,
+    "t100Frac": 0.8501804847735258
+   },
+   "task-tracker-mcp": {
+    "nodes": 149,
+    "goldTotal": 56,
+    "passS": 6.892278152257212,
+    "measuredPassS": 6.944549784,
+    "recall10": 0.9,
+    "mrr": 0.7136300350549577,
+    "recall10Reranked": 0.92,
+    "mrrReranked": 0.7702828207787374,
+    "tFullGold": 6.892278152257212,
+    "t90": 5.553643916980799,
+    "t100": 6.652141597624935,
+    "goldShare": {
+     "20": 1.0,
+     "60": 1.0,
+     "120": 1.0
+    },
+    "tierEnds": {
+     "private": {
+      "t": 2.1556735840688814,
+      "frac": 0.31276648104558885,
+      "nodes": 57
+     },
+     "public": {
+      "t": 6.892278152257212,
+      "frac": 1.0,
+      "nodes": 82
+     },
+     "test": {
+      "t": 0.20299400588277106,
+      "frac": 0.029452381549095023,
+      "nodes": 10
+     }
+    },
+    "aucRecall": 0.5352031278039817,
+    "checkpoints": 22,
+    "tFullGoldFrac": 1.0,
+    "t90Frac": 0.8057776825449199,
+    "t100Frac": 0.965158609486236
+   }
+  }
+ },
+ "pooled": {
+  "id": {
+   "passSSum": 623.3764561995752,
+   "tFullGoldSumS": 616.4829075220644,
+   "t90SumS": 550.1486562635332,
+   "t100SumS": 594.503111836122,
+   "tFullGoldSecShare": 0.988941596030852,
+   "t90SecShare": 0.8825303727662792,
+   "t100SecShare": 0.9536823309954952,
+   "tFullGoldMacroFrac": 0.9887910433946332,
+   "t90MacroFrac": 0.8754337369877989,
+   "t100MacroFrac": 0.9566584901476892,
+   "aucMacro": 0.34995539419657007,
+   "recall10Macro": 0.6233333333333333,
+   "recall10RerankedMacro": 0.6583333333333333,
+   "mrrMacro": 0.42360327646243917,
+   "mrrRerankedMacro": 0.4712523333394946
+  },
+  "tier": {
+   "passSSum": 623.3764561995749,
+   "tFullGoldSumS": 423.4692456996873,
+   "t90SumS": 319.17849439316404,
+   "t100SumS": 346.3560940537991,
+   "tFullGoldSecShare": 0.6793154304886243,
+   "t90SecShare": 0.5120156387346437,
+   "t100SecShare": 0.555613049882193,
+   "tFullGoldMacroFrac": 0.7358416366438695,
+   "t90MacroFrac": 0.6175392211515289,
+   "t100MacroFrac": 0.685584270707199,
+   "aucMacro": 0.42688930099890904,
+   "recall10Macro": 0.6233333333333333,
+   "recall10RerankedMacro": 0.6583333333333333,
+   "mrrMacro": 0.42360327646243917,
+   "mrrRerankedMacro": 0.4712523333394946
+  },
+  "oracle": {
+   "passSSum": 623.3764561995752,
+   "tFullGoldSumS": 40.34137060624456,
+   "t90SumS": 38.17396199925206,
+   "t100SumS": 38.56103889448542,
+   "tFullGoldSecShare": 0.06471429936925496,
+   "t90SecShare": 0.06123741379644051,
+   "t100SecShare": 0.061858349815733224,
+   "tFullGoldMacroFrac": 0.13472172701918042,
+   "t90MacroFrac": 0.11712173699689861,
+   "t100MacroFrac": 0.1264818954883402,
+   "aucMacro": 0.666622924879059,
+   "recall10Macro": 0.6233333333333333,
+   "recall10RerankedMacro": 0.6583333333333333,
+   "mrrMacro": 0.42360327646243917,
+   "mrrRerankedMacro": 0.4712523333394946
+  },
+  "tier-reversed": {
+   "passSSum": 623.3764561995752,
+   "tFullGoldSumS": 617.4692377344807,
+   "t90SumS": 524.4442240267674,
+   "t100SumS": 605.2244518997798,
+   "tFullGoldSecShare": 0.990523834504261,
+   "t90SecShare": 0.8412961683282848,
+   "t100SecShare": 0.9708811519599899,
+   "tFullGoldMacroFrac": 0.9917650816824475,
+   "t90MacroFrac": 0.8593521802240418,
+   "t100MacroFrac": 0.9692231823766271,
+   "aucMacro": 0.26479895317207564,
+   "recall10Macro": 0.6233333333333333,
+   "recall10RerankedMacro": 0.6583333333333333,
+   "mrrMacro": 0.42360327646243917,
+   "mrrRerankedMacro": 0.4712523333394946
+  }
+ },
+ "bootstrapA1vsA0": [
+  {
+   "target": 0.25,
+   "diff": 0.11333333333333334,
+   "ci95": [
+    0.06833333333333333,
+    0.15833333333333335
+   ]
+  },
+  {
+   "target": 0.5,
+   "diff": 0.135,
+   "ci95": [
+    0.07833333333333332,
+    0.19170833333333273
+   ]
+  },
+  {
+   "target": 0.75,
+   "diff": 0.05833333333333332,
+   "ci95": [
+    0.020000000000000004,
+    0.09666666666666668
+   ]
+  }
+ ],
+ "controls": {
+  "tierReversedT90LaterThanA0": {
+   "excalidraw": false,
+   "g-mesh": false,
+   "gin": true,
+   "py-requests": true,
+   "ripgrep": false,
+   "task-tracker-mcp": true
+  },
+  "tierReversedT90PooledSecShare": [
+   0.8412961683282848,
+   0.8825303727662792
+  ],
+  "tierReversedAucBelowA0": {
+   "excalidraw": true,
+   "g-mesh": true,
+   "gin": true,
+   "py-requests": true,
+   "ripgrep": false,
+   "task-tracker-mcp": false
+  },
+  "rerankedRankingsIdenticalAcrossArms": {
+   "excalidraw": true,
+   "g-mesh": true,
+   "gin": true,
+   "py-requests": true,
+   "ripgrep": true,
+   "task-tracker-mcp": true
+  },
+  "maskOffEqualsStoredRankings": {
+   "excalidraw": {
+    "sameOrder": true,
+    "maxScoreDiff": 0.0,
+    "queries": 362
+   },
+   "g-mesh": {
+    "sameOrder": true,
+    "maxScoreDiff": 0.0,
+    "queries": 363
+   },
+   "gin": {
+    "sameOrder": true,
+    "maxScoreDiff": 0.0,
+    "queries": 425
+   },
+   "py-requests": {
+    "sameOrder": true,
+    "maxScoreDiff": 0.0,
+    "queries": 425
+   },
+   "ripgrep": {
+    "sameOrder": true,
+    "maxScoreDiff": 0.0,
+    "queries": 362
+   },
+   "task-tracker-mcp": {
+    "sameOrder": true,
+    "maxScoreDiff": 0.0,
+    "queries": 342
+   }
+  }
+ },
+ "confirm": {
+  "A0": {
+   "readyT": 725.74,
+   "passS": 257.02,
+   "embeddingStartT": 468.72,
+   "tiers": [],
+   "daemonPid": 68307,
+   "daemonCpuTime": "34:43.53",
+   "searches": [
+    {
+     "query": "parse a configuration file",
+     "took_s": 1.405,
+     "partial": false,
+     "rows": 30,
+     "score_monotone": false,
+     "at": "ready",
+     "t": 727.14
+    },
+    {
+     "query": "compute the embedding of a node text",
+     "took_s": 0.681,
+     "partial": false,
+     "rows": 30,
+     "score_monotone": false,
+     "at": "ready",
+     "t": 727.82
+    },
+    {
+     "query": "find the nodes that still need a vector",
+     "took_s": 0.451,
+     "partial": false,
+     "rows": 30,
+     "score_monotone": false,
+     "at": "ready",
+     "t": 728.27
+    },
+    {
+     "query": "report indexing progress to the status command",
+     "took_s": 0.472,
+     "partial": false,
+     "rows": 30,
+     "score_monotone": false,
+     "at": "ready",
+     "t": 728.75
+    },
+    {
+     "query": "load the language plugin process",
+     "took_s": 0.882,
+     "partial": false,
+     "rows": 30,
+     "score_monotone": false,
+     "at": "ready",
+     "t": 729.63
+    }
+   ],
+   "embedTotal": 0,
+   "timelinePoints": 27
+  },
+  "A1": {
+   "readyT": 794.36,
+   "passS": 294.45,
+   "embeddingStartT": 499.91,
+   "tiers": [
+    {
+     "tier": "public",
+     "candidates": 1376,
+     "s": 95.8,
+     "seen_t": 596.32
+    },
+    {
+     "tier": "private",
+     "candidates": 1994,
+     "s": 107.0,
+     "seen_t": 702.81
+    },
+    {
+     "tier": "test",
+     "candidates": 2041,
+     "s": 91.1,
+     "seen_t": 794.36
+    }
+   ],
+   "daemonPid": 75906,
+   "daemonCpuTime": "36:38.90",
+   "searches": [
+    {
+     "query": "parse a configuration file",
+     "took_s": 0.098,
+     "partial": true,
+     "rows": 30,
+     "score_monotone": true,
+     "at": "tier-public",
+     "t": 596.32
+    },
+    {
+     "query": "compute the embedding of a node text",
+     "took_s": 0.156,
+     "partial": true,
+     "rows": 30,
+     "score_monotone": true,
+     "at": "tier-private",
+     "t": 702.81
+    },
+    {
+     "query": "parse a configuration file",
+     "took_s": 0.993,
+     "partial": false,
+     "rows": 30,
+     "score_monotone": false,
+     "at": "ready",
+     "t": 795.36
+    },
+    {
+     "query": "compute the embedding of a node text",
+     "took_s": 0.859,
+     "partial": false,
+     "rows": 30,
+     "score_monotone": false,
+     "at": "ready",
+     "t": 796.22
+    },
+    {
+     "query": "find the nodes that still need a vector",
+     "took_s": 0.548,
+     "partial": false,
+     "rows": 30,
+     "score_monotone": false,
+     "at": "ready",
+     "t": 796.76
+    },
+    {
+     "query": "report indexing progress to the status command",
+     "took_s": 0.452,
+     "partial": false,
+     "rows": 30,
+     "score_monotone": false,
+     "at": "ready",
+     "t": 797.22
+    },
+    {
+     "query": "load the language plugin process",
+     "took_s": 0.898,
+     "partial": false,
+     "rows": 30,
+     "score_monotone": false,
+     "at": "ready",
+     "t": 798.11
+    }
+   ],
+   "embedTotal": 0,
+   "timelinePoints": 51
+  }
+ },
+ "confirmTierShares": {
+  "public": {
+   "measuredFrac": 0.3259612112963593,
+   "predictedFrac": 0.18298286160844637,
+   "diffPct": 14.297834968791292
+  },
+  "private": {
+   "measuredFrac": 0.6900306226607691,
+   "predictedFrac": 0.5517894451713703,
+   "diffPct": 13.82411774893988
+  },
+  "test": {
+   "measuredFrac": 1.0,
+   "predictedFrac": 1.0,
+   "diffPct": 0.0
+  }
+ }
+}

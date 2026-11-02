@@ -1,0 +1,28 @@
+18:06  up 12 days,  6:08, 8 users, load averages: 98.64 69.48 47.16
+[g-mesh-go] bulk index complete: 0 file(s), 0 node(s), 0 edge(s)
+[python] bulk index complete: 0 file(s), 0 node(s), 0 edge(s)
+[rust] bulk index complete: 0 file(s), 0 node(s), 0 edge(s)
+[typescript] bulk index complete: 48 file(s), 843 node(s), 1259 edge(s)
+g-mesh: typescript's whole-project semantic pass carries 371 linked edge(s)
+[typescript] semantic tier: vtsls (0.3.0, found on PATH)
+[typescript] the server has not answered yet - its first question may take up to 120s (warm-up), the rest 10s
+[typescript] semantic pass: 48 file(s), 84 node(s)/366 edge(s) upserted, 0 edge(s) retracted, in 5.86122275s
+g-mesh daemon: embeddings [semanticPass]: 67 texts, 0 cache hits, 67 embedded, 0 cache errors, 7.6s
+[typescript] core closed the control stream - exiting (semantic engine started: true)
+g-mesh: typescript semantic pass over the rebuilt index complete
+g-mesh daemon: embedding backfill finished the public tier: 57 candidates in 5.6s
+g-mesh daemon: embedding backfill finished the private tier: 17 candidates in 1.5s
+g-mesh daemon: embedding backfill finished the test tier: 16 candidates in 0.4s
+g-mesh daemon: embeddings [backfill]: 82 texts, 0 cache hits, 82 embedded, 0 cache errors, 7.5s
+g-mesh: reindexed /private/tmp/gm441/ttm-src
+  index:   843 nodes, 1259 edges (183 imports linked, 371 symbols linked)
+  embeddings: 82 of 82 nodes got a vector - 0 from the embedding cache, 82 embedded
+  semantic: pass complete over what the walk could not resolve
+real 25.24
+user 51.37
+sys 1.68
+index: /tmp/gm441/home-ttm/projects/c384704626904451/index.db
+parity on task-tracker-mcp: 20 queries, production vectors 149, harness candidates 157
+  ttm-003: top-10 differs (same order: false, max score diff 7.68e-4)
+  production embedded 149 nodes, the harness ranks 157: text selection differs
+g-mesh: parity: FAILED (2 findings)
