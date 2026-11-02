@@ -665,6 +665,199 @@ mod tests {
         assert!(err.contains("not the pinned"), "{err}");
     }
 
+    // --- how a daemon resolved its rerank ----------------------------------
+
+    /// A scorer that is never asked to score: these tests only resolve.
+    struct Unused;
+
+    impl Scorer for Unused {
+        fn score(&self, _query: &str, _texts: &[String]) -> Result<Vec<f32>> {
+            unreachable!("the outcome tests never score")
+        }
+    }
+
+    /// A rerank under `enabled` and `model_dir` whose loader answers with
+    /// `loads`, counting its calls in the returned counter.
+    fn reranker(
+        enabled: bool,
+        model_dir: Option<PathBuf>,
+        loads: bool,
+    ) -> (Reranker, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&calls);
+        let reranker = Reranker::with_parts(
+            move || RerankSettings {
+                enabled,
+                model_dir: model_dir.clone().ok_or_else(|| anyhow!("no home directory")),
+            },
+            move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                if loads {
+                    Ok(Box::new(Unused) as Box<dyn Scorer>)
+                } else {
+                    bail!("the loader refused")
+                }
+            },
+            |_| {},
+        );
+        (reranker, calls)
+    }
+
+    /// A directory holding both model files, with any bytes.
+    fn dir_with_both_files() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ONNX_FILE_NAME), "weights").unwrap();
+        std::fs::write(dir.path().join(TOKENIZER_FILE_NAME), "{}").unwrap();
+        dir
+    }
+
+    /// The four outcomes, each from the settings and loader result that
+    /// define it; only `Loaded` hands out a scorer.
+    ///
+    /// *Control:* classify every loader error as `Absent` (drop the
+    /// file-existence check in `Reranker::outcome`) -> the files-present case
+    /// reads `Absent`.
+    #[test]
+    fn each_outcome_comes_from_its_settings_and_loader_result() {
+        let (off, off_loads) = reranker(false, Some("/stub".into()), true);
+        assert_eq!(off.take_unavailable_hint(), None);
+        assert!(off.scorer().is_none());
+        assert_eq!(off_loads.load(Ordering::SeqCst), 0, "a switched-off rerank never loads");
+
+        let (loaded, _) = reranker(true, Some("/stub".into()), true);
+        assert!(loaded.scorer().is_some());
+        assert_eq!(loaded.take_unavailable_hint(), None);
+
+        let empty = tempfile::tempdir().unwrap();
+        let (absent, _) = reranker(true, Some(empty.path().to_path_buf()), false);
+        assert!(absent.scorer().is_none());
+        assert_eq!(absent.take_unavailable_hint(), Some(RerankOutcome::Absent));
+
+        let only_onnx = tempfile::tempdir().unwrap();
+        std::fs::write(only_onnx.path().join(ONNX_FILE_NAME), "weights").unwrap();
+        let (one_missing, _) = reranker(true, Some(only_onnx.path().to_path_buf()), false);
+        assert_eq!(one_missing.take_unavailable_hint(), Some(RerankOutcome::Absent));
+
+        let both = dir_with_both_files();
+        let (failed, _) = reranker(true, Some(both.path().to_path_buf()), false);
+        assert!(failed.scorer().is_none());
+        assert_eq!(failed.take_unavailable_hint(), Some(RerankOutcome::Failed));
+
+        let (no_dir, no_dir_loads) = reranker(true, None, true);
+        assert_eq!(no_dir.take_unavailable_hint(), Some(RerankOutcome::Failed));
+        assert_eq!(no_dir_loads.load(Ordering::SeqCst), 0, "no directory, nothing to load");
+    }
+
+    /// The hint goes out once per rerank (per daemon), however many callers
+    /// ask, and never from `Reranker::off`.
+    ///
+    /// *Control:* `load` instead of `swap` on `missing_hint_sent` -> every
+    /// call returns the outcome.
+    #[test]
+    fn the_unavailable_hint_is_handed_out_exactly_once() {
+        let empty = tempfile::tempdir().unwrap();
+        let (absent, loads) = reranker(true, Some(empty.path().to_path_buf()), false);
+        assert_eq!(absent.take_unavailable_hint(), Some(RerankOutcome::Absent));
+        assert_eq!(absent.take_unavailable_hint(), None);
+        assert_eq!(absent.take_unavailable_hint(), None);
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "resolved once");
+
+        assert_eq!(Reranker::off().take_unavailable_hint(), None);
+    }
+
+    /// Callers on several threads: exactly one gets the hint.
+    #[test]
+    fn concurrent_callers_get_the_hint_exactly_once() {
+        let both = dir_with_both_files();
+        let (failed, _) = reranker(true, Some(both.path().to_path_buf()), false);
+        let handed = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| failed.take_unavailable_hint())).collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert_eq!(handed.iter().filter(|hint| hint.is_some()).count(), 1, "{handed:?}");
+        assert!(handed.iter().flatten().all(|hint| *hint == RerankOutcome::Failed), "{handed:?}");
+    }
+
+    /// The resolved outcome is written once, with this process's pid and the
+    /// directory, where `record_outcome_to` pointed; nothing is written
+    /// without it.
+    ///
+    /// *Control:* drop the write from `Reranker::outcome` -> no record.
+    #[test]
+    fn the_outcome_is_recorded_once_where_it_was_pointed() {
+        let state = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let path = state.path().join("rerank.outcome");
+        let (absent, _) = reranker(true, Some(empty.path().to_path_buf()), false);
+        absent.record_outcome_to(path.clone());
+        assert!(!path.exists(), "nothing is written before the outcome is resolved");
+        assert!(absent.scorer().is_none());
+        assert_eq!(
+            OutcomeRecord::read(&path),
+            Some(OutcomeRecord {
+                pid: std::process::id(),
+                outcome: RerankOutcome::Absent,
+                dir: Some(empty.path().to_path_buf())
+            })
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(absent.take_unavailable_hint(), Some(RerankOutcome::Absent));
+        assert!(!path.exists(), "written once, on resolution");
+
+        let (loaded, _) = reranker(true, None, true);
+        let loaded_path = state.path().join("loaded.outcome");
+        loaded.record_outcome_to(loaded_path.clone());
+        let _ = loaded.scorer();
+        let record = OutcomeRecord::read(&loaded_path).unwrap();
+        assert_eq!((record.outcome, record.dir), (RerankOutcome::Failed, None));
+
+        let (unset, _) = reranker(true, Some(empty.path().to_path_buf()), false);
+        let _ = unset.scorer();
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 1, "only loaded.outcome");
+    }
+
+    #[test]
+    fn the_outcome_record_uses_lowercase_words_and_ignores_garbage() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("rerank.outcome");
+        std::fs::write(&path, r#"{"pid":7,"outcome":"failed","dir":"/m"}"#).unwrap();
+        assert_eq!(
+            OutcomeRecord::read(&path),
+            Some(OutcomeRecord { pid: 7, outcome: RerankOutcome::Failed, dir: Some("/m".into()) })
+        );
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(OutcomeRecord::read(&path), None);
+        assert_eq!(OutcomeRecord::read(&state.path().join("absent")), None);
+    }
+
+    /// The on-disk check `g-mesh status` falls back to: by size only, and
+    /// `Disabled` whatever is on disk.
+    ///
+    /// *Control:* drop the `enabled` check from `RerankModelState::of` ->
+    /// the switched-off case with files reads `Present`.
+    #[test]
+    fn the_on_disk_state_is_judged_by_the_switch_and_the_pinned_sizes() {
+        let settings = |enabled: bool, dir: Option<&Path>| RerankSettings {
+            enabled,
+            model_dir: dir.map(Path::to_path_buf).ok_or_else(|| anyhow!("no home directory")),
+        };
+        let pinned = tempfile::tempdir().unwrap();
+        File::create(pinned.path().join(ONNX_FILE_NAME)).unwrap().set_len(RERANK_ONNX_SIZE).unwrap();
+        File::create(pinned.path().join(TOKENIZER_FILE_NAME))
+            .unwrap()
+            .set_len(RERANK_TOKENIZER_SIZE)
+            .unwrap();
+        let wrong_size = dir_with_both_files();
+        let empty = tempfile::tempdir().unwrap();
+
+        assert_eq!(RerankModelState::of(settings(true, Some(pinned.path()))), RerankModelState::Present);
+        assert_eq!(RerankModelState::of(settings(false, Some(pinned.path()))), RerankModelState::Disabled);
+        assert_eq!(RerankModelState::of(settings(true, Some(wrong_size.path()))), RerankModelState::Missing);
+        assert_eq!(RerankModelState::of(settings(true, Some(empty.path()))), RerankModelState::Missing);
+        assert_eq!(RerankModelState::of(settings(true, None)), RerankModelState::Missing);
+        assert_eq!(RerankModelState::of(settings(false, None)), RerankModelState::Disabled);
+    }
+
     // -----------------------------------------------------------------------
     // Tests that need the real cross-encoder (~87 MiB, not in the repo):
     //

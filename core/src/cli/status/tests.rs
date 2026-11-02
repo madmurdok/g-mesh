@@ -1734,3 +1734,169 @@ fn language_retries_reads_the_counts_and_none_from_an_index_without_the_table() 
     drop(conn);
     assert!(language_retries(&older).is_empty());
 }
+
+// --- the rerank model line ------------------------------------------------
+
+fn rerank_report(rerank_model: RerankStatus) -> Report {
+    let mut report = report_with(IndexStatus {
+        bulk_indexed: true,
+        semantic_pass_completed: true,
+        semantic_pass_owed: Vec::new(),
+        semantic_pass_failures: Vec::new(),
+        pending_reindex: Vec::new(),
+        semantic_pending: Vec::new(),
+        semantic_stale: Vec::new(),
+        semantic_leftovers: Vec::new(),
+        coverage: None,
+        syntax_error_files: Vec::new(),
+    });
+    report.rerank_model = rerank_model;
+    report
+}
+
+fn daemon_said(outcome: RerankOutcome, dir: Option<&str>) -> RerankStatus {
+    RerankStatus::Daemon(OutcomeRecord { pid: 4242, outcome, dir: dir.map(PathBuf::from) })
+}
+
+/// The rendered `rerank model:` line's text.
+fn rerank_line(status: RerankStatus) -> String {
+    let rendered = render(&rerank_report(status));
+    rendered
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("rerank model:"))
+        .unwrap_or_else(|| panic!("no rerank model line:\n{rendered}"))
+        .trim()
+        .to_string()
+}
+
+fn write_outcome(state_dir: &Path, pid: u32, outcome: &str) {
+    std::fs::write(
+        daemon::rerank_outcome_path_in(state_dir),
+        format!(r#"{{"pid":{pid},"outcome":"{outcome}","dir":"/models/rerank"}}"#),
+    )
+    .unwrap();
+}
+
+/// The live daemon's record is reported as its own, whichever live state
+/// the core is in.
+///
+/// *Control:* drop the pid filter in `rerank_status` -> the stale-pid case
+/// below reports the leftover as the daemon's.
+#[test]
+fn the_live_daemons_own_outcome_is_reported() {
+    let state = tempfile::tempdir().unwrap();
+    write_outcome(state.path(), 4242, "absent");
+    let expected = OutcomeRecord {
+        pid: 4242,
+        outcome: RerankOutcome::Absent,
+        dir: Some(PathBuf::from("/models/rerank")),
+    };
+    for core in [
+        CoreState::Running { pid: 4242 },
+        CoreState::NotAccepting { pid: 4242 },
+        CoreState::Wedged { pid: 4242 },
+    ] {
+        assert_eq!(rerank_status(core, state.path()), RerankStatus::Daemon(expected.clone()), "{core:?}");
+    }
+}
+
+/// A record left by another pid, or with no daemon running, falls back to
+/// the on-disk check and says whether a daemon is alive; so does a live
+/// daemon that has not resolved its rerank yet.
+#[test]
+fn a_leftover_record_falls_back_to_the_on_disk_check() {
+    let state = tempfile::tempdir().unwrap();
+    let alive = |status: RerankStatus| match status {
+        RerankStatus::OnDisk { daemon_alive, .. } => daemon_alive,
+        other => panic!("expected the on-disk fallback, got {other:?}"),
+    };
+    assert!(alive(rerank_status(CoreState::Running { pid: 7 }, state.path())), "no record yet");
+    write_outcome(state.path(), 4242, "loaded");
+    assert!(alive(rerank_status(CoreState::Running { pid: 7 }, state.path())), "another pid's record");
+    assert!(!alive(rerank_status(CoreState::NotRunning, state.path())), "no daemon");
+    std::fs::write(daemon::rerank_outcome_path_in(state.path()), "garbage").unwrap();
+    assert!(alive(rerank_status(CoreState::Running { pid: 4242 }, state.path())), "an unreadable record");
+}
+
+/// Each daemon outcome's wording: absent and failed are told apart, both
+/// name `g-mesh model fetch`, and a failed load never reads as present.
+///
+/// *Control:* render `RerankOutcome::Failed` with the `Absent` text ->
+/// the failed line has no "failed to load" and no directory.
+#[test]
+fn each_daemon_outcome_has_its_own_wording() {
+    assert_eq!(rerank_line(daemon_said(RerankOutcome::Loaded, Some("/m"))), "loaded");
+    assert!(rerank_line(daemon_said(RerankOutcome::Off, None)).starts_with("disabled ("));
+
+    let absent = rerank_line(daemon_said(RerankOutcome::Absent, Some("/m")));
+    assert!(absent.starts_with("missing - "), "{absent}");
+    assert!(absent.contains("`g-mesh model fetch`"), "{absent}");
+    assert!(absent.contains("`g-mesh stop`"), "{absent}");
+    assert!(!absent.contains("failed"), "{absent}");
+
+    let failed = rerank_line(daemon_said(RerankOutcome::Failed, Some("/models/rerank")));
+    assert!(failed.starts_with("failed to load (see the daemon log)"), "{failed}");
+    assert!(failed.contains("delete /models/rerank"), "{failed}");
+    assert!(failed.contains("`g-mesh model fetch`"), "{failed}");
+    assert!(!failed.contains("present"), "{failed}");
+    assert!(!failed.starts_with("missing"), "{failed}");
+
+    let no_dir = rerank_line(daemon_said(RerankOutcome::Failed, None));
+    assert!(no_dir.starts_with("failed to load (see the daemon log)"), "{no_dir}");
+    assert!(!no_dir.contains("present"), "{no_dir}");
+}
+
+/// The on-disk fallback is labelled as such, with whether a daemon runs.
+#[test]
+fn the_on_disk_fallback_is_labelled() {
+    let on_disk = |daemon_alive, state| rerank_line(RerankStatus::OnDisk { daemon_alive, state });
+    assert_eq!(
+        on_disk(false, RerankModelState::Missing),
+        "no daemon running; on disk: missing - run `g-mesh model fetch`"
+    );
+    assert!(
+        on_disk(true, RerankModelState::Present).starts_with("not loaded yet; on disk: present ("),
+        "{}",
+        on_disk(true, RerankModelState::Present)
+    );
+    assert!(on_disk(false, RerankModelState::Disabled).starts_with("no daemon running; on disk: disabled ("));
+}
+
+/// A front returns before the index lines; the rerank line is still there.
+#[test]
+fn a_front_still_reports_the_rerank_model() {
+    let mut report = rerank_report(daemon_said(RerankOutcome::Absent, None));
+    report.front = Some(FrontSummary { projects: 2, truncated: false });
+    let rendered = render(&report);
+    assert!(rendered.contains("rerank model:    missing - "), "{rendered}");
+}
+
+/// `rerankModel` in the JSON: the daemon's outcome word or the on-disk
+/// word, the other one null.
+///
+/// *Control:* emit the on-disk word for a `Daemon` status too -> the
+/// daemon arm's `onDisk` is not null.
+#[test]
+fn the_json_names_the_daemon_outcome_or_the_on_disk_state() {
+    let json = |status| json::to_json(&rerank_report(status))["rerankModel"].clone();
+    for (outcome, word) in [
+        (RerankOutcome::Off, "off"),
+        (RerankOutcome::Absent, "absent"),
+        (RerankOutcome::Failed, "failed"),
+        (RerankOutcome::Loaded, "loaded"),
+    ] {
+        assert_eq!(json(daemon_said(outcome, None)), serde_json::json!({ "daemon": word, "onDisk": null }));
+    }
+    for (state, word) in [
+        (RerankModelState::Present, "present"),
+        (RerankModelState::Missing, "missing"),
+        (RerankModelState::Disabled, "disabled"),
+    ] {
+        for daemon_alive in [false, true] {
+            assert_eq!(
+                json(RerankStatus::OnDisk { daemon_alive, state }),
+                serde_json::json!({ "daemon": null, "onDisk": word })
+            );
+        }
+    }
+}
