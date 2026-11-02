@@ -454,3 +454,129 @@ fn a_failed_plugin_discovery_is_reported_by_light_status_and_fatal_to_full() {
     assert!(!full.status.success(), "the full walk needs the plugins");
     assert_contains(&String::from_utf8_lossy(&full.stderr), "failed to discover language plugins");
 }
+
+// --- the rerank model line ------------------------------------------------
+
+/// `g-mesh status --json`'s `rerankModel`, under `envs`.
+fn rerank_json(root: &Path, envs: &[(&str, &Path)]) -> serde_json::Value {
+    let output = status_output(root, &["--json"], envs);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is one JSON object");
+    report["rerankModel"].clone()
+}
+
+/// `g-mesh status`'s text under `envs`.
+fn status_text(root: &Path, envs: &[(&str, &Path)]) -> String {
+    let output = status_output(root, &[], envs);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).expect("status output is not valid UTF-8")
+}
+
+/// With no daemon, an absent model reads as missing on disk, and either
+/// switch (the environment, the global config) reads as disabled.
+///
+/// *Control:* drop the `enabled` check from `RerankModelState::of` -> the
+/// two disabled arms read `missing`.
+#[test]
+fn status_without_a_daemon_reports_the_rerank_model_on_disk() {
+    let project = Project::new();
+    let models = tempfile::tempdir().expect("failed to create a model root");
+    let missing = models.path().join("no-rerank-model-here");
+    let dir_env = [(g_mesh::embedding::rerank::RERANK_MODEL_DIR_ENV, missing.as_path())];
+
+    assert_contains(
+        &status_text(project.root(), &dir_env),
+        "rerank model:    no daemon running; on disk: missing - run `g-mesh model fetch`",
+    );
+    assert_eq!(
+        rerank_json(project.root(), &dir_env),
+        serde_json::json!({ "daemon": null, "onDisk": "missing" })
+    );
+
+    let off = [dir_env[0], (g_mesh::embedding::rerank::RERANK_ENV, Path::new("off"))];
+    assert_contains(
+        &status_text(project.root(), &off),
+        "rerank model:    no daemon running; on disk: disabled (",
+    );
+    assert_eq!(
+        rerank_json(project.root(), &off),
+        serde_json::json!({ "daemon": null, "onDisk": "disabled" })
+    );
+
+    let home = tempfile::tempdir().expect("failed to create a g-mesh home");
+    std::fs::write(home.path().join("config.toml"), "[rerank]\nenabled = false\n")
+        .expect("failed to write the global config");
+    let configured = [dir_env[0], (g_mesh::paths::HOME_ENV, home.path())];
+    assert_contains(
+        &status_text(project.root(), &configured),
+        "rerank model:    no daemon running; on disk: disabled (",
+    );
+    assert_eq!(
+        rerank_json(project.root(), &configured),
+        serde_json::json!({ "daemon": null, "onDisk": "disabled" })
+    );
+}
+
+/// A dead daemon's leftover outcome is not reported as a daemon's.
+///
+/// *Control:* drop the pid filter in `rerank_status` -> the leftover's
+/// `absent` is reported as the daemon's.
+#[test]
+fn status_ignores_a_dead_daemons_leftover_rerank_outcome() {
+    let project = Project::new();
+    let state_dir = project.state_dir();
+    std::fs::create_dir_all(&state_dir).expect("failed to create the state directory");
+    let mut exited = Command::new(BIN).arg("--version").spawn().expect("failed to run a short-lived process");
+    let dead_pid = exited.id();
+    exited.wait().expect("failed to wait for the short-lived process");
+    daemon::write_pid_file(&project.pid_file(), dead_pid);
+    std::fs::write(
+        daemon::rerank_outcome_path_in(&state_dir),
+        format!(r#"{{"pid":{dead_pid},"outcome":"absent","dir":"/models/rerank"}}"#),
+    )
+    .expect("failed to write rerank.outcome");
+
+    let status = status_text(project.root(), &[]);
+    assert_contains(&status, "rerank model:    no daemon running; on disk: ");
+    assert!(!status.contains("search_code ranks by embedding similarity only"), "{status}");
+    assert!(rerank_json(project.root(), &[])["daemon"].is_null());
+}
+
+/// A daemon clears a leftover outcome when it starts; while it runs,
+/// `status` reports the outcome its pid wrote.
+///
+/// *Control:* drop the `remove_file(rerank_outcome_path_in(..))` from
+/// `daemon::run` -> the planted leftover is never cleared and the wait
+/// times out.
+#[test]
+fn status_reports_the_live_daemons_rerank_outcome_and_the_daemon_clears_it() {
+    let project = Project::new();
+    let state_dir = project.state_dir();
+    std::fs::create_dir_all(&state_dir).expect("failed to create the state directory");
+    let outcome_file = daemon::rerank_outcome_path_in(&state_dir);
+    std::fs::write(&outcome_file, r#"{"pid":1,"outcome":"loaded","dir":null}"#)
+        .expect("failed to plant a leftover rerank.outcome");
+
+    let mut daemon_process = spawn_daemon(project.root());
+    wait_for("the daemon's pid file", || project.pid_file().exists());
+    wait_for("the daemon to clear the leftover rerank.outcome", || !outcome_file.exists());
+    let core_pid = project.recorded_pid(&project.pid_file());
+    assert_eq!(core_pid, daemon_process.id(), "the pid file must name the daemon we started");
+
+    std::fs::write(
+        &outcome_file,
+        format!(r#"{{"pid":{core_pid},"outcome":"absent","dir":"/models/rerank"}}"#),
+    )
+    .expect("failed to write rerank.outcome");
+    wait_for("the daemon to accept connections", || {
+        status_text(project.root(), &[]).contains(&format!("daemon core:     running (pid {core_pid})"))
+    });
+    assert_contains(
+        &status_text(project.root(), &[]),
+        "rerank model:    missing - search_code ranks by embedding similarity only",
+    );
+    assert_eq!(rerank_json(project.root(), &[]), serde_json::json!({ "daemon": "absent", "onDisk": null }));
+
+    assert!(daemon_process.try_wait().unwrap().is_none(), "the daemon must still be running");
+}

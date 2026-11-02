@@ -15,11 +15,13 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokenizers::tokenizer::Tokenizer;
 use tokenizers::TruncationParams;
@@ -259,7 +261,7 @@ pub(crate) struct RerankSettings {
 impl RerankSettings {
     /// The global config's `[rerank] enabled`, overridden by
     /// [`RERANK_ENV`]`=off`, and [`default_rerank_model_dir`].
-    fn from_environment() -> Self {
+    pub(crate) fn from_environment() -> Self {
         let enabled = !env_disables_rerank(std::env::var_os(RERANK_ENV).as_deref())
             && crate::config::read_global_config().map(|config| config.rerank.enabled).unwrap_or_else(|err| {
                 crate::log_line!("g-mesh: failed to read the global config ({err:#}) - the rerank keeps its default (on)");
@@ -277,13 +279,110 @@ type SettingsSource = Box<dyn Fn() -> RerankSettings + Send + Sync>;
 type ScorerLoader = Box<dyn Fn(&Path) -> Result<Box<dyn Scorer>> + Send + Sync>;
 type Log = Box<dyn Fn(&str) + Send + Sync>;
 
+/// What the rerank model is on disk, as `g-mesh status` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankModelState {
+    /// Both files present at their pinned sizes, and the rerank switched on.
+    Present,
+    /// Switched on, but a file is absent or the wrong size.
+    Missing,
+    /// Switched off by `[rerank] enabled = false` or [`RERANK_ENV`]`=off`,
+    /// whatever is on disk.
+    Disabled,
+}
+
+impl RerankModelState {
+    /// The state under the global config, the environment and the default
+    /// model directory.
+    pub fn from_environment() -> Self {
+        Self::of(RerankSettings::from_environment())
+    }
+
+    /// Checks presence and size only, as `g-mesh model status` does: no
+    /// sha256 over the 91 MB weights. A same-size file with other bytes
+    /// reads `Present` here while the daemon refuses it.
+    pub(crate) fn of(settings: RerankSettings) -> Self {
+        if !settings.enabled {
+            return Self::Disabled;
+        }
+        let complete = settings.model_dir.is_ok_and(|dir| {
+            [(ONNX_FILE_NAME, RERANK_ONNX_SIZE), (TOKENIZER_FILE_NAME, RERANK_TOKENIZER_SIZE)]
+                .iter()
+                .all(|(name, size)| std::fs::metadata(dir.join(name)).is_ok_and(|meta| meta.len() == *size))
+        });
+        if complete {
+            Self::Present
+        } else {
+            Self::Missing
+        }
+    }
+}
+
+/// How a daemon resolved its rerank, as `search_code`'s hint and `g-mesh
+/// status` name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RerankOutcome {
+    /// Switched off: `search_code` keeps the embedding order by choice.
+    Off,
+    /// Switched on, but a model file is not in its directory.
+    Absent,
+    /// Switched on, the files are there, and loading them failed (a sha256
+    /// mismatch, a corrupt file, an ORT error), or the directory could not
+    /// be resolved.
+    Failed,
+    Loaded,
+}
+
+/// What a daemon writes to its state directory once it resolves the rerank:
+/// read by `g-mesh status` only while the daemon with `pid` is the live one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeRecord {
+    pub pid: u32,
+    pub outcome: RerankOutcome,
+    /// The model directory the daemon resolved; `None` when it could not.
+    pub dir: Option<PathBuf>,
+}
+
+impl OutcomeRecord {
+    /// The record at `path`; `None` for a missing or unparseable file.
+    pub fn read(path: &Path) -> Option<Self> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    }
+}
+
+/// How the first call that asked resolved the rerank.
+enum Outcome {
+    Off,
+    Absent,
+    Failed,
+    Loaded(Box<dyn Scorer>),
+}
+
+impl Outcome {
+    fn kind(&self) -> RerankOutcome {
+        match self {
+            Self::Off => RerankOutcome::Off,
+            Self::Absent => RerankOutcome::Absent,
+            Self::Failed => RerankOutcome::Failed,
+            Self::Loaded(_) => RerankOutcome::Loaded,
+        }
+    }
+}
+
 /// The rerank as `search_code` sees it: switched off, unavailable, or a
 /// loaded scorer. Resolved on the first call that asks and held for the
 /// daemon's lifetime, so a config change takes effect on restart.
 pub struct Reranker {
     settings: SettingsSource,
     loader: ScorerLoader,
-    scorer: OnceLock<Option<Box<dyn Scorer>>>,
+    outcome: OnceLock<Outcome>,
+    /// Set once the unavailable-model hint has been handed out: it goes on
+    /// at most one `search_code` page per daemon.
+    missing_hint_sent: AtomicBool,
+    /// Where the outcome is recorded once resolved ([`OutcomeRecord`]); unset
+    /// outside a daemon.
+    outcome_file: OnceLock<PathBuf>,
     log: Log,
 }
 
@@ -294,7 +393,9 @@ impl Reranker {
         Self {
             settings: Box::new(RerankSettings::from_environment),
             loader: Box::new(|dir| Ok(Box::new(CrossEncoder::load(dir)?) as Box<dyn Scorer>)),
-            scorer: OnceLock::new(),
+            outcome: OnceLock::new(),
+            missing_hint_sent: AtomicBool::new(false),
+            outcome_file: OnceLock::new(),
             log: Box::new(|line| crate::log_line!("{line}")),
         }
     }
@@ -304,7 +405,9 @@ impl Reranker {
         Self {
             settings: Box::new(|| RerankSettings { enabled: false, model_dir: Err(anyhow!("off")) }),
             loader: Box::new(|_| bail!("off")),
-            scorer: OnceLock::from(None),
+            outcome: OnceLock::from(Outcome::Off),
+            missing_hint_sent: AtomicBool::new(false),
+            outcome_file: OnceLock::new(),
             log: Box::new(|_| {}),
         }
     }
@@ -319,7 +422,9 @@ impl Reranker {
         Self {
             settings: Box::new(settings),
             loader: Box::new(loader),
-            scorer: OnceLock::new(),
+            outcome: OnceLock::new(),
+            missing_hint_sent: AtomicBool::new(false),
+            outcome_file: OnceLock::new(),
             log: Box::new(log),
         }
     }
@@ -339,24 +444,68 @@ impl Reranker {
     /// switched off, or when the model cannot be loaded: that is logged once,
     /// and every later call answers from the same outcome.
     pub(crate) fn scorer(&self) -> Option<&dyn Scorer> {
-        self.scorer
-            .get_or_init(|| {
-                let settings = (self.settings)();
-                if !settings.enabled {
-                    return None;
-                }
+        match self.outcome() {
+            Outcome::Loaded(scorer) => Some(scorer.as_ref()),
+            Outcome::Off | Outcome::Absent | Outcome::Failed => None,
+        }
+    }
+
+    /// Records the outcome as an [`OutcomeRecord`] at `path` once it is
+    /// resolved. Set before the first `search_code` call; a later call is
+    /// ignored.
+    pub(crate) fn record_outcome_to(&self, path: PathBuf) {
+        let _ = self.outcome_file.set(path);
+    }
+
+    /// `Absent` or `Failed` on the first call that finds the model so, `None`
+    /// on every call after it and whenever the model is loaded or switched
+    /// off. Resolves the rerank like [`Self::scorer`].
+    pub(crate) fn take_unavailable_hint(&self) -> Option<RerankOutcome> {
+        let kind = self.outcome().kind();
+        (matches!(kind, RerankOutcome::Absent | RerankOutcome::Failed)
+            && !self.missing_hint_sent.swap(true, Ordering::Relaxed))
+        .then_some(kind)
+    }
+
+    fn outcome(&self) -> &Outcome {
+        self.outcome.get_or_init(|| {
+            let settings = (self.settings)();
+            let dir = settings.model_dir.as_ref().ok().cloned();
+            let outcome = if !settings.enabled {
+                Outcome::Off
+            } else {
                 match settings.model_dir.and_then(|dir| (self.loader)(&dir)) {
-                    Ok(scorer) => Some(scorer),
+                    Ok(scorer) => Outcome::Loaded(scorer),
                     Err(err) => {
                         (self.log)(&format!(
                             "g-mesh daemon: rerank model {RERANK_MODEL_NAME} is not available ({err:#}) - \
                              search_code keeps the embedding order. Run g-mesh model fetch to enable it."
                         ));
-                        None
+                        let absent = dir.as_ref().is_some_and(|dir| {
+                            [ONNX_FILE_NAME, TOKENIZER_FILE_NAME].iter().any(|name| !dir.join(name).exists())
+                        });
+                        if absent {
+                            Outcome::Absent
+                        } else {
+                            Outcome::Failed
+                        }
                     }
                 }
-            })
-            .as_deref()
+            };
+            if let Some(path) = self.outcome_file.get() {
+                let record = OutcomeRecord { pid: std::process::id(), outcome: outcome.kind(), dir };
+                let written = serde_json::to_string(&record)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|json| std::fs::write(path, json).map_err(anyhow::Error::from));
+                if let Err(err) = written {
+                    (self.log)(&format!(
+                        "g-mesh daemon: failed to record the rerank outcome at {} ({err:#})",
+                        path.display()
+                    ));
+                }
+            }
+            outcome
+        })
     }
 
     /// The window's reranked order ([`blended_order`]) under `scorer`, or
@@ -514,6 +663,199 @@ mod tests {
         std::fs::write(dir.path().join(TOKENIZER_FILE_NAME), "{}").unwrap();
         let err = check_rerank_files(dir.path()).unwrap_err().to_string();
         assert!(err.contains("not the pinned"), "{err}");
+    }
+
+    // --- how a daemon resolved its rerank ----------------------------------
+
+    /// A scorer that is never asked to score: these tests only resolve.
+    struct Unused;
+
+    impl Scorer for Unused {
+        fn score(&self, _query: &str, _texts: &[String]) -> Result<Vec<f32>> {
+            unreachable!("the outcome tests never score")
+        }
+    }
+
+    /// A rerank under `enabled` and `model_dir` whose loader answers with
+    /// `loads`, counting its calls in the returned counter.
+    fn reranker(
+        enabled: bool,
+        model_dir: Option<PathBuf>,
+        loads: bool,
+    ) -> (Reranker, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&calls);
+        let reranker = Reranker::with_parts(
+            move || RerankSettings {
+                enabled,
+                model_dir: model_dir.clone().ok_or_else(|| anyhow!("no home directory")),
+            },
+            move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                if loads {
+                    Ok(Box::new(Unused) as Box<dyn Scorer>)
+                } else {
+                    bail!("the loader refused")
+                }
+            },
+            |_| {},
+        );
+        (reranker, calls)
+    }
+
+    /// A directory holding both model files, with any bytes.
+    fn dir_with_both_files() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ONNX_FILE_NAME), "weights").unwrap();
+        std::fs::write(dir.path().join(TOKENIZER_FILE_NAME), "{}").unwrap();
+        dir
+    }
+
+    /// The four outcomes, each from the settings and loader result that
+    /// define it; only `Loaded` hands out a scorer.
+    ///
+    /// *Control:* classify every loader error as `Absent` (drop the
+    /// file-existence check in `Reranker::outcome`) -> the files-present case
+    /// reads `Absent`.
+    #[test]
+    fn each_outcome_comes_from_its_settings_and_loader_result() {
+        let (off, off_loads) = reranker(false, Some("/stub".into()), true);
+        assert_eq!(off.take_unavailable_hint(), None);
+        assert!(off.scorer().is_none());
+        assert_eq!(off_loads.load(Ordering::SeqCst), 0, "a switched-off rerank never loads");
+
+        let (loaded, _) = reranker(true, Some("/stub".into()), true);
+        assert!(loaded.scorer().is_some());
+        assert_eq!(loaded.take_unavailable_hint(), None);
+
+        let empty = tempfile::tempdir().unwrap();
+        let (absent, _) = reranker(true, Some(empty.path().to_path_buf()), false);
+        assert!(absent.scorer().is_none());
+        assert_eq!(absent.take_unavailable_hint(), Some(RerankOutcome::Absent));
+
+        let only_onnx = tempfile::tempdir().unwrap();
+        std::fs::write(only_onnx.path().join(ONNX_FILE_NAME), "weights").unwrap();
+        let (one_missing, _) = reranker(true, Some(only_onnx.path().to_path_buf()), false);
+        assert_eq!(one_missing.take_unavailable_hint(), Some(RerankOutcome::Absent));
+
+        let both = dir_with_both_files();
+        let (failed, _) = reranker(true, Some(both.path().to_path_buf()), false);
+        assert!(failed.scorer().is_none());
+        assert_eq!(failed.take_unavailable_hint(), Some(RerankOutcome::Failed));
+
+        let (no_dir, no_dir_loads) = reranker(true, None, true);
+        assert_eq!(no_dir.take_unavailable_hint(), Some(RerankOutcome::Failed));
+        assert_eq!(no_dir_loads.load(Ordering::SeqCst), 0, "no directory, nothing to load");
+    }
+
+    /// The hint goes out once per rerank (per daemon), however many callers
+    /// ask, and never from `Reranker::off`.
+    ///
+    /// *Control:* `load` instead of `swap` on `missing_hint_sent` -> every
+    /// call returns the outcome.
+    #[test]
+    fn the_unavailable_hint_is_handed_out_exactly_once() {
+        let empty = tempfile::tempdir().unwrap();
+        let (absent, loads) = reranker(true, Some(empty.path().to_path_buf()), false);
+        assert_eq!(absent.take_unavailable_hint(), Some(RerankOutcome::Absent));
+        assert_eq!(absent.take_unavailable_hint(), None);
+        assert_eq!(absent.take_unavailable_hint(), None);
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "resolved once");
+
+        assert_eq!(Reranker::off().take_unavailable_hint(), None);
+    }
+
+    /// Callers on several threads: exactly one gets the hint.
+    #[test]
+    fn concurrent_callers_get_the_hint_exactly_once() {
+        let both = dir_with_both_files();
+        let (failed, _) = reranker(true, Some(both.path().to_path_buf()), false);
+        let handed = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| failed.take_unavailable_hint())).collect();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert_eq!(handed.iter().filter(|hint| hint.is_some()).count(), 1, "{handed:?}");
+        assert!(handed.iter().flatten().all(|hint| *hint == RerankOutcome::Failed), "{handed:?}");
+    }
+
+    /// The resolved outcome is written once, with this process's pid and the
+    /// directory, where `record_outcome_to` pointed; nothing is written
+    /// without it.
+    ///
+    /// *Control:* drop the write from `Reranker::outcome` -> no record.
+    #[test]
+    fn the_outcome_is_recorded_once_where_it_was_pointed() {
+        let state = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let path = state.path().join("rerank.outcome");
+        let (absent, _) = reranker(true, Some(empty.path().to_path_buf()), false);
+        absent.record_outcome_to(path.clone());
+        assert!(!path.exists(), "nothing is written before the outcome is resolved");
+        assert!(absent.scorer().is_none());
+        assert_eq!(
+            OutcomeRecord::read(&path),
+            Some(OutcomeRecord {
+                pid: std::process::id(),
+                outcome: RerankOutcome::Absent,
+                dir: Some(empty.path().to_path_buf())
+            })
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(absent.take_unavailable_hint(), Some(RerankOutcome::Absent));
+        assert!(!path.exists(), "written once, on resolution");
+
+        let (loaded, _) = reranker(true, None, true);
+        let loaded_path = state.path().join("loaded.outcome");
+        loaded.record_outcome_to(loaded_path.clone());
+        let _ = loaded.scorer();
+        let record = OutcomeRecord::read(&loaded_path).unwrap();
+        assert_eq!((record.outcome, record.dir), (RerankOutcome::Failed, None));
+
+        let (unset, _) = reranker(true, Some(empty.path().to_path_buf()), false);
+        let _ = unset.scorer();
+        assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 1, "only loaded.outcome");
+    }
+
+    #[test]
+    fn the_outcome_record_uses_lowercase_words_and_ignores_garbage() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("rerank.outcome");
+        std::fs::write(&path, r#"{"pid":7,"outcome":"failed","dir":"/m"}"#).unwrap();
+        assert_eq!(
+            OutcomeRecord::read(&path),
+            Some(OutcomeRecord { pid: 7, outcome: RerankOutcome::Failed, dir: Some("/m".into()) })
+        );
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(OutcomeRecord::read(&path), None);
+        assert_eq!(OutcomeRecord::read(&state.path().join("absent")), None);
+    }
+
+    /// The on-disk check `g-mesh status` falls back to: by size only, and
+    /// `Disabled` whatever is on disk.
+    ///
+    /// *Control:* drop the `enabled` check from `RerankModelState::of` ->
+    /// the switched-off case with files reads `Present`.
+    #[test]
+    fn the_on_disk_state_is_judged_by_the_switch_and_the_pinned_sizes() {
+        let settings = |enabled: bool, dir: Option<&Path>| RerankSettings {
+            enabled,
+            model_dir: dir.map(Path::to_path_buf).ok_or_else(|| anyhow!("no home directory")),
+        };
+        let pinned = tempfile::tempdir().unwrap();
+        File::create(pinned.path().join(ONNX_FILE_NAME)).unwrap().set_len(RERANK_ONNX_SIZE).unwrap();
+        File::create(pinned.path().join(TOKENIZER_FILE_NAME))
+            .unwrap()
+            .set_len(RERANK_TOKENIZER_SIZE)
+            .unwrap();
+        let wrong_size = dir_with_both_files();
+        let empty = tempfile::tempdir().unwrap();
+
+        assert_eq!(RerankModelState::of(settings(true, Some(pinned.path()))), RerankModelState::Present);
+        assert_eq!(RerankModelState::of(settings(false, Some(pinned.path()))), RerankModelState::Disabled);
+        assert_eq!(RerankModelState::of(settings(true, Some(wrong_size.path()))), RerankModelState::Missing);
+        assert_eq!(RerankModelState::of(settings(true, Some(empty.path()))), RerankModelState::Missing);
+        assert_eq!(RerankModelState::of(settings(true, None)), RerankModelState::Missing);
+        assert_eq!(RerankModelState::of(settings(false, None)), RerankModelState::Disabled);
     }
 
     // -----------------------------------------------------------------------

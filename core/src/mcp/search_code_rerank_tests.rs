@@ -342,7 +342,11 @@ fn a_missing_model_keeps_todays_output_and_logs_once() {
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
     let missing = dir.path().join("no-rerank-model-here");
-    assert_matches_golden(&fake(dir.path()).with_reranker(Reranker::real_at(&missing, lines.sink())));
+    let embedding = fake(dir.path()).with_reranker(Reranker::real_at(&missing, lines.sink()));
+    // The once-per-daemon missing-model hint is the only output change; spent
+    // here so the golden pins the ranking alone.
+    assert!(embedding.reranker().take_unavailable_hint().is_some());
+    assert_matches_golden(&embedding);
     let logged = lines.0.lock().unwrap().clone();
     assert_eq!(logged.len(), 1, "{logged:?}");
     assert!(logged[0].contains("rerank model ms-marco-MiniLM-L6-v2 is not available"), "{logged:?}");
@@ -699,4 +703,210 @@ fn search_code_embeds_a_prefixed_query_as_typed() {
     assert_eq!(embedded, vec!["@Component".to_string()]);
     assert_eq!(embedded, embedded_base);
     assert_eq!(with_strip, without_strip);
+}
+
+// --- the unavailable-model hint ------------------------------------------
+
+/// The page's `hint`, or "" when it has none.
+fn hint_of(page: &serde_json::Value) -> String {
+    page["hint"].as_str().unwrap_or_default().to_string()
+}
+
+fn mentions_the_rerank_model(page: &serde_json::Value) -> bool {
+    let hint = hint_of(page);
+    hint.contains(super::session_hints::RERANK_MODEL_MISSING)
+        || hint.contains(super::session_hints::RERANK_MODEL_FAILED)
+}
+
+/// A rerank switched on whose loader fails, with `model_dir` as given.
+fn failing_reranker(model_dir: Option<std::path::PathBuf>) -> Reranker {
+    Reranker::with_parts(
+        move || RerankSettings {
+            enabled: true,
+            model_dir: model_dir.clone().ok_or_else(|| anyhow::anyhow!("no home directory")),
+        },
+        |_| anyhow::bail!("the loader refused"),
+        |_| {},
+    )
+}
+
+/// A first complete page under `embedding`, as a fresh session asks it.
+fn first_page(embedding: &EmbeddingPipeline) -> serde_json::Value {
+    let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
+    body(&call(&store, embedding, "parseConfig", Some(5), None))
+}
+
+/// An absent model: the first full page names `g-mesh model fetch` after
+/// the search hint; no later first page does, from a new session either
+/// (`call` builds a fresh `SessionHints` each time).
+///
+/// *Control:* return `None` from `rerank_model_hint` -> no hint.
+#[test]
+fn an_absent_model_is_named_once_on_the_first_full_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-rerank-model-here");
+    let embedding = fake(dir.path()).with_reranker(Reranker::real_at(&missing, |_| {}));
+
+    let page = first_page(&embedding);
+    let hint = hint_of(&page);
+    assert!(hint.contains(super::session_hints::RERANK_MODEL_MISSING), "{page}");
+    assert!(hint.contains("`g-mesh model fetch`"), "{page}");
+    assert!(!hint.contains(super::session_hints::RERANK_MODEL_FAILED), "{page}");
+    assert!(
+        hint.find(super::session_hints::SEARCH_HITS) < hint.find(super::session_hints::RERANK_MODEL_MISSING),
+        "joined after the search hint: {page}"
+    );
+
+    for _ in 0..3 {
+        let later = first_page(&embedding);
+        assert!(!mentions_the_rerank_model(&later), "{later}");
+        assert!(hint_of(&later).contains(super::session_hints::SEARCH_HITS), "{later}");
+    }
+}
+
+/// Files present that fail to load get the other sentence, which says to
+/// delete the directory first; so does a directory that cannot be resolved.
+///
+/// *Control:* map every unavailable outcome to `RERANK_MODEL_MISSING` in
+/// `rerank_model_hint` -> the failed arm names the wrong sentence.
+#[test]
+fn a_model_that_fails_to_load_gets_the_failed_wording() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    std::fs::write(model.path().join("model.onnx"), "weights").unwrap();
+    std::fs::write(model.path().join("tokenizer.json"), "{}").unwrap();
+    for reranker in [failing_reranker(Some(model.path().to_path_buf())), failing_reranker(None)] {
+        let page = first_page(&fake(dir.path()).with_reranker(reranker));
+        let hint = hint_of(&page);
+        assert!(hint.contains(super::session_hints::RERANK_MODEL_FAILED), "{page}");
+        assert!(!hint.contains(super::session_hints::RERANK_MODEL_MISSING), "{page}");
+    }
+}
+
+/// A switched-off rerank and a loaded one never get the hint.
+///
+/// *Control:* have `take_unavailable_hint` return the outcome for `Off`
+/// too -> the switched-off arm gets a hint.
+#[test]
+fn a_switched_off_or_loaded_rerank_gets_no_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = Lines::default();
+    for embedding in [
+        fake(dir.path()),
+        fake(dir.path()).with_reranker(stub_reranker(false, reversing, &lines)),
+        fake(dir.path()).with_reranker(stub_reranker(true, reversing, &lines)),
+    ] {
+        for _ in 0..2 {
+            let page = first_page(&embedding);
+            assert!(!mentions_the_rerank_model(&page), "{page}");
+        }
+    }
+}
+
+/// A first page of 0 or 1 rows gets no hint and leaves it for the next
+/// full one.
+///
+/// *Control:* drop the `rows < 2` check from `rerank_model_hint` -> the
+/// one-row page takes the hint.
+#[test]
+fn a_page_of_fewer_than_two_rows_does_not_spend_the_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let embedding = fake(dir.path()).with_reranker(failing_reranker(None));
+    let empty = store_for("parseConfig", &[]);
+    let page = body(&call(&empty, &embedding, "parseConfig", Some(5), None));
+    assert!(!mentions_the_rerank_model(&page), "{page}");
+    let one = store_for("parseConfig", &descending(1, 0.9, 0.01));
+    let page = body(&call(&one, &embedding, "parseConfig", Some(5), None));
+    assert_eq!(page["results"].as_array().map(Vec::len), Some(1), "{page}");
+    assert!(!mentions_the_rerank_model(&page), "{page}");
+
+    let page = first_page(&embedding);
+    assert!(mentions_the_rerank_model(&page), "the hint is still owed: {page}");
+}
+
+/// A continuation page gets no hint and leaves it for the next first page.
+///
+/// *Control:* drop the `cursor.is_some()` check from `rerank_model_hint`
+/// -> the continuation page takes the hint.
+#[test]
+fn a_continuation_page_does_not_spend_the_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
+    let plain = fake(dir.path());
+    let cursor = body(&call(&store, &plain, "parseConfig", Some(5), None))["nextCursor"]
+        .as_str()
+        .map(str::to_string)
+        .expect("a 64-row store has a second page");
+
+    let embedding = fake(dir.path()).with_reranker(failing_reranker(None));
+    let next = body(&call(&store, &embedding, "parseConfig", Some(5), Some(cursor)));
+    assert!(next["results"].as_array().is_some_and(|rows| rows.len() >= 2), "{next}");
+    assert!(!mentions_the_rerank_model(&next), "{next}");
+
+    let page = first_page(&embedding);
+    assert!(mentions_the_rerank_model(&page), "the hint is still owed: {page}");
+}
+
+/// A partial page (the embedding pass still running) gets no hint and
+/// leaves it for the next complete page.
+///
+/// *Control:* in `handle`, join `rerank_model_hint` for a partial page too
+/// -> the partial page takes the hint.
+#[test]
+fn a_partial_page_does_not_spend_the_hint() {
+    use crate::daemon::indexing_status::Phase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let embedding = fake(dir.path()).with_reranker(failing_reranker(None));
+    let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
+    let coverage = super::search_code::Coverage::partial(
+        &Phase::Embedding,
+        40,
+        64,
+        Some(std::time::Duration::ZERO),
+        dir.path(),
+    );
+    assert!(coverage.is_some(), "the fixture must be a partial page");
+    let params = SearchCodeParams { query: "parseConfig".to_string(), cursor: None, limit: Some(5) };
+    let result = handle(
+        &store,
+        &embedding,
+        QueryShapes::shipped(),
+        &SessionHints::default(),
+        params,
+        coverage.as_ref(),
+    )
+    .unwrap();
+    // A partial result may lead with a plain-text note; the page is the JSON block.
+    let partial = result
+        .content
+        .iter()
+        .find_map(|block| match block {
+            rmcp::model::ContentBlock::Text(text) => {
+                serde_json::from_str::<serde_json::Value>(&text.text).ok()
+            }
+            _ => None,
+        })
+        .expect("a JSON page");
+    assert!(partial["results"].as_array().is_some_and(|rows| rows.len() >= 2), "{partial}");
+    assert!(!mentions_the_rerank_model(&partial), "{partial}");
+
+    let page = first_page(&embedding);
+    assert!(mentions_the_rerank_model(&page), "the hint is still owed: {page}");
+}
+
+/// The hint is the only difference an unavailable model makes: the rows and
+/// the cursor equal the switched-off rerank's.
+#[test]
+fn an_unavailable_model_changes_nothing_but_the_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-rerank-model-here");
+    let absent = fake(dir.path()).with_reranker(Reranker::real_at(&missing, |_| {}));
+    let plain = fake(dir.path());
+    let mut with_hint = first_page(&absent);
+    assert!(mentions_the_rerank_model(&with_hint), "{with_hint}");
+    let mut without = first_page(&plain);
+    with_hint.as_object_mut().unwrap().remove("hint");
+    without.as_object_mut().unwrap().remove("hint");
+    assert_eq!(with_hint, without);
 }

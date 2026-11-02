@@ -156,6 +156,18 @@ pub(crate) const SEARCH_HITS: &str =
     "These hits are ranked by relevance, not resolved: once one plausibly matches, do one \
      confirming read and stop, without rewording the query or grepping the repo.";
 
+/// Sent once per daemon, not per session (`Reranker::take_unavailable_hint`),
+/// when a rerank model file is absent.
+pub(crate) const RERANK_MODEL_MISSING: &str =
+    "The rerank model is not installed, so these hits are in embedding order only: ask the user to run \
+     `g-mesh model fetch` and restart the daemon.";
+
+/// [`RERANK_MODEL_MISSING`] for files that are present but failed to load:
+/// `model fetch` keeps a file at its pinned size, so it must be deleted first.
+pub(crate) const RERANK_MODEL_FAILED: &str =
+    "The rerank model failed to load, so these hits are in embedding order only: ask the user to delete \
+     its directory (see `g-mesh model status`), run `g-mesh model fetch`, and restart the daemon.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +255,8 @@ mod tests {
             WALK_COMPLETE,
             WALK_COMPLETE_IMPORT_TYPE,
             SEARCH_HITS,
+            RERANK_MODEL_MISSING,
+            RERANK_MODEL_FAILED,
         ];
         all.extend(causes.iter().map(|cause| truncated_by(cause).unwrap()));
         for sentence in all {

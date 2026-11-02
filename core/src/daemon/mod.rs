@@ -77,6 +77,11 @@ const PHASE_FILE: &str = "index.phase";
 /// reader must check its `pid` against the live daemon before trusting it.
 const PROGRESS_FILE: &str = "index.progress";
 
+/// How the daemon resolved its rerank (`embedding::rerank::OutcomeRecord`),
+/// written once, on the first `search_code` call that asks. A killed daemon
+/// leaves it behind, so a reader checks its `pid` against the live daemon.
+const RERANK_FILE: &str = "rerank.outcome";
+
 /// The watcher's debounce window and its loop's poll bound: a path is reparsed
 /// once quiet this long, and a settled burst is drained only when the loop
 /// wakes, so this must stay short. Unrelated to the idle timeouts.
@@ -134,6 +139,11 @@ pub fn plugin_pid_path_in(state_dir: &Path) -> PathBuf {
 /// Where [`PHASE_FILE`] lives for a given state directory.
 pub fn phase_path_in(state_dir: &Path) -> PathBuf {
     state_dir.join(PHASE_FILE)
+}
+
+/// Where [`RERANK_FILE`] lives for a given state directory.
+pub fn rerank_outcome_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join(RERANK_FILE)
 }
 
 /// Where [`PROGRESS_FILE`] lives for a given state directory.
@@ -461,6 +471,8 @@ pub fn run(root: &Path) -> Result<()> {
     // restart budgets): the first `apply` pays for it on its own thread. A
     // missing model does not stop the daemon, which never fetches one.
     let embedding = Arc::new(crate::embedding::EmbeddingPipeline::load(&project_config.embedding));
+    let _ = fs::remove_file(rerank_outcome_path_in(&dir));
+    embedding.reranker().record_outcome_to(rerank_outcome_path_in(&dir));
 
     // The bulk walk spawns one-shot processes from the manifests, not the
     // registry's supervisors, so it takes its own copy before `discovered` moves.

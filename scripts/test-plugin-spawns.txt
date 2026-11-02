@@ -13,6 +13,7 @@ it:cli_clean                                             typescript
 it:cli_clean_sweeping                                    typescript
 it:cli_deps                                              typescript rust python go
 it:cli_init                                              typescript rust python go
+it:cli_model_fetch                                       rust
 it:cli_reindex                                           typescript rust python go
 it:cli_status                                            typescript rust python go
 it:cli_stop                                              typescript rust python go

@@ -49,6 +49,7 @@ use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
 use crate::daemon::indexing_status::{group_thousands, ProgressSnapshot};
 use crate::daemon::manifest::{self, DiscoveredPlugins};
+use crate::embedding::rerank::{OutcomeRecord, RerankModelState, RerankOutcome};
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
 use crate::languages::LanguageOutcome;
@@ -331,6 +332,36 @@ pub struct Report {
     /// the live daemon's (see [`live_progress`]).
     pub progress: Option<ProgressSnapshot>,
     pub languages: LanguagesReport,
+    pub rerank_model: RerankStatus,
+}
+
+/// The rerank as `g-mesh status` reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RerankStatus {
+    /// The live daemon's own outcome, read from its state directory: it holds
+    /// under the daemon's environment, which may differ from this shell's.
+    Daemon(OutcomeRecord),
+    /// No outcome from a live daemon (none running, or no `search_code` call
+    /// has resolved it yet): the model on disk under this shell's environment.
+    OnDisk { daemon_alive: bool, state: RerankModelState },
+}
+
+/// The live daemon's [`OutcomeRecord`] in `state_dir`, else the on-disk check.
+/// A record whose `pid` is not the live daemon's is a leftover and ignored.
+fn rerank_status(core: CoreState, state_dir: &Path) -> RerankStatus {
+    let live_pid = match core {
+        CoreState::Running { pid } | CoreState::NotAccepting { pid } | CoreState::Wedged { pid } => Some(pid),
+        CoreState::NotRunning => None,
+    };
+    match OutcomeRecord::read(&daemon::rerank_outcome_path_in(state_dir))
+        .filter(|record| Some(record.pid) == live_pid)
+    {
+        Some(record) => RerankStatus::Daemon(record),
+        None => RerankStatus::OnDisk {
+            daemon_alive: live_pid.is_some(),
+            state: RerankModelState::from_environment(),
+        },
+    }
 }
 
 /// What `g-mesh status` says about a front: how many projects, and whether
@@ -436,6 +467,7 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
         front,
         progress: daemon::read_progress_in(&state_dir),
         languages: LanguagesReport { section, installed, retries },
+        rerank_model: rerank_status(core, &state_dir),
         project_root: project_root.to_path_buf(),
         state_dir,
     })
@@ -900,6 +932,7 @@ pub fn render(report: &Report) -> String {
         }
     }
     let _ = writeln!(out, "  last used:       {}", describe_last_used(report.last_used.as_ref()));
+    let _ = writeln!(out, "  rerank model:    {}", describe_rerank(&report.rerank_model));
 
     let index = &report.index;
     // A phase word or progress file whose daemon is not running was left
@@ -1227,6 +1260,41 @@ fn percent(done: u64, total: u64) -> f64 {
         return 0.0;
     }
     done as f64 * 100.0 / total as f64
+}
+
+fn describe_rerank(status: &RerankStatus) -> String {
+    const DISABLED: &str = "disabled ([rerank] enabled = false or G_MESH_RERANK=off)";
+    match status {
+        RerankStatus::Daemon(record) => match record.outcome {
+            RerankOutcome::Loaded => "loaded".to_string(),
+            RerankOutcome::Off => DISABLED.to_string(),
+            RerankOutcome::Absent => {
+                "missing - search_code ranks by embedding similarity only; run `g-mesh model \
+                                      fetch`, then restart the daemon (`g-mesh stop`)"
+                    .to_string()
+            }
+            RerankOutcome::Failed => match &record.dir {
+                Some(dir) => format!(
+                    "failed to load (see the daemon log) - search_code ranks by embedding similarity only; \
+                     delete {}, run `g-mesh model fetch`, then restart the daemon (`g-mesh stop`)",
+                    dir.display()
+                ),
+                None => {
+                    "failed to load (see the daemon log) - search_code ranks by embedding similarity only"
+                        .to_string()
+                }
+            },
+        },
+        RerankStatus::OnDisk { daemon_alive, state } => {
+            let lead = if *daemon_alive { "not loaded yet" } else { "no daemon running" };
+            let on_disk = match state {
+                RerankModelState::Present => "present (file sizes only; the daemon checks sha256)",
+                RerankModelState::Missing => "missing - run `g-mesh model fetch`",
+                RerankModelState::Disabled => DISABLED,
+            };
+            format!("{lead}; on disk: {on_disk}")
+        }
+    }
 }
 
 fn describe_core(core: CoreState) -> String {

@@ -8,7 +8,11 @@
 
 use serde_json::{json, Value};
 
-use super::{live_progress, BuildState, CoreState, LanguageRow, LanguageSection, Mode, PluginState, Report};
+use super::{
+    live_progress, BuildState, CoreState, LanguageRow, LanguageSection, Mode, PluginState, Report,
+    RerankStatus,
+};
+use crate::embedding::rerank::RerankModelState;
 use crate::languages::LanguageOutcome;
 
 /// The `formatVersion` this build writes.
@@ -47,7 +51,25 @@ pub fn to_json(report: &Report) -> Value {
             "truncated": front.truncated,
         })),
         "languages": languages(report),
+        "rerankModel": rerank_model(&report.rerank_model),
     })
+}
+
+/// `daemon` is the live daemon's outcome (`off`, `absent`, `failed`,
+/// `loaded`), `onDisk` this shell's check (`present`, `missing`,
+/// `disabled`); exactly one is non-null.
+fn rerank_model(status: &RerankStatus) -> Value {
+    match status {
+        RerankStatus::Daemon(record) => json!({ "daemon": record.outcome, "onDisk": null }),
+        RerankStatus::OnDisk { state, .. } => json!({
+            "daemon": null,
+            "onDisk": match state {
+                RerankModelState::Present => "present",
+                RerankModelState::Missing => "missing",
+                RerankModelState::Disabled => "disabled",
+            },
+        }),
+    }
 }
 
 fn daemon(core: CoreState, build: BuildState) -> Value {

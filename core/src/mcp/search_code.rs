@@ -21,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::daemon::indexing_status::Phase;
-use crate::embedding::rerank::{self, Scorer};
+use crate::embedding::rerank::{self, RerankOutcome, Scorer};
 use crate::embedding::text::text_to_embed;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
@@ -110,9 +110,12 @@ struct SearchPage {
     #[serde(skip_serializing_if = "Option::is_none")]
     low_similarity: Option<&'static str>,
     /// `session_hints::SEARCH_HITS`, once per session, on a page with hits
-    /// and neither `noMatch` nor `lowSimilarity`.
+    /// and neither `noMatch` nor `lowSimilarity`; then
+    /// `session_hints::RERANK_MODEL_MISSING` or `RERANK_MODEL_FAILED`, once
+    /// per daemon, on a first, complete page ranked without the unavailable
+    /// rerank model.
     #[serde(skip_serializing_if = "Option::is_none")]
-    hint: Option<&'static str>,
+    hint: Option<String>,
     /// Present only when the embedding pass was still owed: the rows were
     /// ranked from the vectors stored so far.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -376,7 +379,10 @@ pub(super) fn handle(
         Some(_) => page.next_cursor.map(|next| partial_cursor(stored, &next)),
     };
     let hint = match coverage {
-        None => search_hint(&page.results, no_match.is_some() || low_similarity.is_some(), hints),
+        None => session_hints::join([
+            search_hint(&page.results, no_match.is_some() || low_similarity.is_some(), hints),
+            rerank_model_hint(cursor, page.results.len(), embedding),
+        ]),
         Some(_) => None,
     };
     let body = SearchPage {
@@ -601,6 +607,24 @@ fn rows_by_id(conn: &Connection, query_vector: &[f32], ids: &[String]) -> anyhow
 /// hint's "once one plausibly matches ... stop" must not sit beside either.
 fn search_hint(results: &[SearchResult], judged: bool, hints: &SessionHints) -> Option<&'static str> {
     hints.once(!results.is_empty() && !judged, HintKey::SearchHits, session_hints::SEARCH_HITS)
+}
+
+/// `RERANK_MODEL_MISSING` or `RERANK_MODEL_FAILED` on a first page (`cursor`
+/// is `None`) of at least 2 rows, the fewest a rerank reorders, when the
+/// rerank model is unavailable: at most once per daemon. The caller asks only
+/// for a complete page; a switched-off rerank never gets it.
+fn rerank_model_hint(
+    cursor: Option<&str>,
+    rows: usize,
+    embedding: &EmbeddingPipeline,
+) -> Option<&'static str> {
+    if cursor.is_some() || rows < 2 {
+        return None;
+    }
+    match embedding.reranker().take_unavailable_hint()? {
+        RerankOutcome::Absent => Some(session_hints::RERANK_MODEL_MISSING),
+        _ => Some(session_hints::RERANK_MODEL_FAILED),
+    }
 }
 
 #[cfg(test)]
