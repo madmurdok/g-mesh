@@ -190,6 +190,12 @@ Today `search_code` waits for `Phase::Ready` for up to 25 min.
   waits at most **`SEARCH_EMBEDDING_WAIT` = 20 s** (`G_MESH_SEARCH_EMBEDDING_WAIT_MS`,
   where `0` means don't wait) for `Phase::Ready`, and then answers from the
   vectors already stored.
+- **The wait is per pass, not per call (GM-686).** Once one call has waited the
+  whole bound and timed out, later calls during the same pass return the
+  partial page at once, and the note says an earlier call already waited. The
+  latch clears when the phase reaches `Ready` or a new activation restarts at
+  `Walking`. A zero bound never sets it. Without it, every call in a long
+  backfill cost the full 20 s (see `docs/design/GM-686-go-search-code-latency.md`).
 - **Why 20 s.** It is well under Claude Code's 120 s move-to-background
   threshold and its 1815 s idle abort. It is long enough for a small project's
   whole backfill, or a file-change batch (the log shows 0.0 to 13.2 s per
