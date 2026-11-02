@@ -255,6 +255,19 @@ def index_ready(E, root):
         return False
 
 
+def load_gate(a, raw, sess, rep):
+    """GM-692/S2: at load1 700-760 (8 cpus) a restarted daemon's watcher saw the canary but no fs_event for the
+    edit or its restore within minutes; at load1 6-60 the same session saw every edit in <0.3 s. Wait, up to
+    --load-wait seconds, for load1 <= --max-load before an edit; record the wait either way."""
+    t0 = time.time()
+    while os.getloadavg()[0] > a.max_load and time.time() - t0 < a.load_wait:
+        time.sleep(10)
+    ok = os.getloadavg()[0] <= a.max_load
+    raw({"kind": "load_gate", "session": sess, "rep": rep, "ok": ok, "waited_s": round(time.time() - t0, 1),
+         "load": [round(x, 2) for x in os.getloadavg()]})
+    return ok
+
+
 def session(E, a, raw, sess, plan, ref, PG):
     root = os.path.join(a.work, "P")
     spec = m.ARMS["rust"]
@@ -343,6 +356,8 @@ def session(E, a, raw, sess, plan, ref, PG):
             path = os.path.join(root, cfg["file"])
             if m.sha(path) != orig_sha[arm]:
                 raise RuntimeError("sha mismatch before %s rep %d" % (arm, rep))
+            if not load_gate(a, raw, sess, rep):
+                status = "load above %s for %ss before %s rep %d" % (a.max_load, a.load_wait, arm, rep); break
             idle = m.idle_gate(proc.pid, 60)
             ms = m.machine_state(proc.pid)
             rep_t0 = time.time(); cpu0 = tree_cpu(proc.pid)
@@ -401,7 +416,8 @@ def session(E, a, raw, sess, plan, ref, PG):
             PG.done += 1
             PG.tick("s%d %s rep %d miss=%s" % (sess, arm, rep, miss))
             if [k for k in missing if k != "b_tool"]:
-                status = "tier not reached: %s (%s rep %d)" % (missing, arm, rep); break
+                why = "tier not reached" if "fs_event" in P else "no fs_event for the edit (watcher delivery)"
+                status = "%s: %s (%s rep %d)" % (why, missing, arm, rep); break
             if m.sha(path) != orig_sha[arm]:
                 status = "sha mismatch after restore"; break
     except Exception as e:
@@ -428,6 +444,9 @@ def main():
     ap.add_argument("--rerank-dir", dest="rerank_dir", help="G_MESH_RERANK_MODEL_DIR (the cross-encoder)")
     ap.add_argument("--only-reps", type=int, default=0, dest="only_reps", help="dry run: stop after this many reps of session 1")
     ap.add_argument("--restarts", type=int, default=4, help="restart sessions after session 1 (each: first-query rep + 1)")
+    ap.add_argument("--max-load", type=float, default=4.0 * (os.cpu_count() or 8), dest="max_load",
+                    help="load1 ceiling before each edit (GM-692/S2: default 4 x ncpu)")
+    ap.add_argument("--load-wait", type=int, default=1800, dest="load_wait", help="seconds to wait for --max-load")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rawf = open(os.path.join(a.out, "raw.jsonl"), "a", buffering=1)
