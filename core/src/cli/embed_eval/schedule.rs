@@ -458,3 +458,224 @@ fn rank_checkpoint(replay: &Replay, embedded: &[usize], path: &Path) -> Result<V
     }
     Ok(outcomes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{queries::ExpectedSymbol, queries::QueryKind, top_hits};
+    use super::*;
+
+    use EmbedTier::{Private, Public, Test};
+
+    /// Interleaved tiers: index `i` is test, public, private by `i % 3`.
+    fn interleaved(n: usize) -> Vec<EmbedTier> {
+        (0..n).map(|i| [Test, Public, Private][i % 3]).collect()
+    }
+
+    fn is_permutation(order: &[usize], n: usize) -> bool {
+        let mut sorted = order.to_vec();
+        sorted.sort_unstable();
+        sorted == (0..n).collect::<Vec<_>>()
+    }
+
+    /// Harness behaviours 1-4: id order whatever the tiers; tier and
+    /// reversed-tier orders group by tier with ascending index inside a
+    /// group even when indices interleave; the oracle puts gold first; each
+    /// order is a permutation.
+    /// Control: make `order` leave `ScheduleArm::Tier` in id order.
+    #[test]
+    fn each_arm_orders_the_candidates_by_its_rule_and_keeps_ascending_index_within_a_group() {
+        let tiers = interleaved(9);
+        let gold = [false, false, true, false, true, false, false, false, true];
+        assert_eq!(order(ScheduleArm::Id, &tiers, &gold), (0..9).collect::<Vec<_>>());
+        assert_eq!(order(ScheduleArm::Tier, &tiers, &gold), vec![1, 4, 7, 2, 5, 8, 0, 3, 6]);
+        assert_eq!(order(ScheduleArm::TierReversed, &tiers, &gold), vec![0, 3, 6, 2, 5, 8, 1, 4, 7]);
+        assert_eq!(order(ScheduleArm::Oracle, &tiers, &gold), vec![2, 4, 8, 0, 1, 3, 5, 6, 7]);
+        for arm in ScheduleArm::ALL {
+            assert!(is_permutation(&order(arm, &tiers, &gold), 9), "{arm:?}");
+        }
+    }
+
+    /// Harness behaviour 5: a checkpoint at the first prefix whose cost
+    /// reaches each 5% of the total, so a costly first node moves the
+    /// points; every extra length is kept; ascending, no duplicate, no 0,
+    /// ends at `n`.
+    /// Control: space the checkpoints by count (`n * step / 20`) instead of
+    /// by cost; the skewed case then reads `[2, 4, ...]`.
+    #[test]
+    fn checkpoints_fall_at_each_5_percent_of_the_cost_plus_the_tier_ends() {
+        let cumulative = |costs: &[f64]| {
+            let mut c = vec![0.0];
+            for cost in costs {
+                c.push(c.last().unwrap() + cost);
+            }
+            c
+        };
+        let uniform = cumulative(&[1.0; 40]);
+        assert_eq!(checkpoint_lengths(&uniform, &[]), (1..=20).map(|s| 2 * s).collect::<Vec<_>>());
+
+        let mut skewed_costs = vec![1.0; 41];
+        skewed_costs[0] = 40.0;
+        let skewed = cumulative(&skewed_costs);
+        let mut want = vec![1];
+        want.extend((11..=20).map(|s| 4 * s - 39));
+        assert_eq!(checkpoint_lengths(&skewed, &[]), want);
+
+        let with_extra = checkpoint_lengths(&uniform, &[7, 0, 40, 7]);
+        assert!(with_extra.contains(&7));
+        assert!(with_extra.windows(2).all(|w| w[0] < w[1]), "{with_extra:?}");
+        assert_eq!(with_extra.first(), Some(&2));
+        assert_eq!(with_extra.last(), Some(&40));
+    }
+
+    /// Scores with many ties, so the tie-break decides most ranks.
+    fn tied_scores(n: usize, salt: usize) -> Vec<f64> {
+        (0..n).map(|i| ((i * 7 + salt * 3) % 5) as f64 / 5.0).collect()
+    }
+
+    /// Harness behaviour 6 (design note item 9): over every candidate the
+    /// replay ranks exactly as a full pass (`top_hits`), ties by ascending
+    /// index whatever order the embedded set comes in; over a prefix it
+    /// returns only embedded candidates, at most `KEPT_HITS`.
+    /// Control: drop `.then(a.cmp(b))` from `top_embedded`'s comparator.
+    #[test]
+    fn top_embedded_over_every_candidate_ranks_as_a_full_pass() {
+        let scores = tied_scores(250, 1);
+        let all_reversed: Vec<usize> = (0..250).rev().collect();
+        assert_eq!(top_embedded(&scores, &all_reversed), top_hits(&scores));
+
+        let prefix: Vec<usize> = (0..250).filter(|i| i % 4 != 0).rev().collect();
+        let top = top_embedded(&scores, &prefix);
+        assert_eq!(top.len(), KEPT_HITS);
+        assert!(top.iter().all(|m| m % 4 != 0), "only embedded candidates rank");
+        let few = top_embedded(&scores, &[9, 3, 5]);
+        assert_eq!(few.len(), 3);
+        assert!(few
+            .windows(2)
+            .all(|w| scores[w[0]] > scores[w[1]] || (scores[w[0]] == scores[w[1]] && w[0] < w[1])));
+    }
+
+    fn query(id: &str) -> Query {
+        Query {
+            id: id.into(),
+            corpus: "c".into(),
+            language: "rust".into(),
+            kind: QueryKind::Positive,
+            shape: "phrase".into(),
+            text: id.into(),
+            expected: vec![ExpectedSymbol {
+                file_path: "f".into(),
+                qualified_name: "q".into(),
+                kind: "Function".into(),
+            }],
+            derivation: "fixture".into(),
+            author: "test".into(),
+            mechanical: false,
+        }
+    }
+
+    /// 12 interleaved candidates, three scored queries with tied scores.
+    fn replay() -> Replay {
+        let n = 12;
+        let cost_ms: Vec<f64> = (0..n).map(|m| 1.0 + (m % 4) as f64).collect();
+        Replay {
+            queries: vec![query("q0"), query("q1"), query("q2")],
+            ids: (0..n).map(|m| format!("n{m:02}")).collect(),
+            tiers: interleaved(n),
+            scores: (0..3).map(|q| tied_scores(n, q)).collect(),
+            expected: vec![vec![0], vec![4, 5], vec![11]],
+            run_nodes: n,
+            predicted_run_ms: cost_ms.iter().sum(),
+            cost_ms,
+            measured_s: 10.0,
+        }
+    }
+
+    fn args(out: &Path) -> ScheduleArgs {
+        ScheduleArgs {
+            dir: EvalDir { eval_dir: std::path::PathBuf::new() },
+            run_root: std::path::PathBuf::new(),
+            variant: "v".into(),
+            filter: ScheduleFilter::None,
+            curve: std::path::PathBuf::new(),
+            arm: Vec::new(),
+            corpus: Vec::new(),
+            out: out.to_path_buf(),
+            final_rankings_only: false,
+        }
+    }
+
+    fn rankings(path: &Path) -> Vec<RankingLine> {
+        std::fs::read_to_string(path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    /// Harness behaviours 7-9 (design note items 9 and 11): per arm, only
+    /// the 100% checkpoint is `reranked`; `frac` and `t` never fall and `t`
+    /// ends at `passS`; the tier arm's tier ends are the cumulative tier
+    /// counts and are checkpoints; at 100% every arm writes the same
+    /// rankings, and those are the stored run's (`top_hits` over all
+    /// candidates, the run's expected ids).
+    /// Controls: write `reranked: true` at every checkpoint; make `order`
+    /// leave `ScheduleArm::Tier` in id order (the tier ends read 11/12/10).
+    #[test]
+    fn every_arm_ends_in_the_stored_runs_rankings_and_reranks_only_at_100_percent() {
+        let out = tempfile::tempdir().unwrap();
+        let args = args(out.path());
+        let replay = replay();
+        let mut finals = Vec::new();
+        for arm in ScheduleArm::ALL {
+            replay_arm(&args, "v", "c", &replay, arm).unwrap();
+            let dir = out.path().join(arm.name()).join("c");
+            let schedule: serde_json::Value = read_json(&dir.join("schedule.json")).unwrap();
+            let checkpoints = schedule["checkpoints"].as_array().unwrap();
+            let reranked: Vec<u64> = checkpoints
+                .iter()
+                .filter(|c| c["reranked"].as_bool().unwrap())
+                .map(|c| c["embedded"].as_u64().unwrap())
+                .collect();
+            assert_eq!(reranked, vec![12], "{arm:?}: reranked only at 100%");
+            let (t, frac): (Vec<f64>, Vec<f64>) =
+                checkpoints.iter().map(|c| (c["t"].as_f64().unwrap(), c["frac"].as_f64().unwrap())).unzip();
+            assert!(t.windows(2).all(|w| w[0] <= w[1]) && frac.windows(2).all(|w| w[0] <= w[1]), "{arm:?}");
+            assert_eq!(t.last(), schedule["passS"].as_f64().as_ref(), "{arm:?}");
+            assert_eq!(frac.last(), Some(&1.0), "{arm:?}");
+            if arm == ScheduleArm::Tier {
+                let ends = &schedule["tierEnds"];
+                let embedded: Vec<u64> = ["public", "private", "test"]
+                    .iter()
+                    .map(|t| ends[t]["embedded"].as_u64().unwrap())
+                    .collect();
+                assert_eq!(embedded, vec![4, 8, 12]);
+                let lengths: Vec<u64> = checkpoints.iter().map(|c| c["embedded"].as_u64().unwrap()).collect();
+                assert!(embedded.iter().all(|e| lengths.contains(e)), "{lengths:?}");
+            }
+            finals.push(std::fs::read_to_string(dir.join("rankings.jsonl")).unwrap());
+        }
+        assert!(finals.iter().all(|f| *f == finals[0]), "100% rankings differ between arms");
+
+        let lines = rankings(&out.path().join("id").join("c").join("rankings.jsonl"));
+        for (q, line) in lines.iter().enumerate() {
+            let stored: Vec<(String, f64)> = top_hits(&replay.scores[q])
+                .into_iter()
+                .map(|m| (replay.ids[m].clone(), replay.scores[q][m]))
+                .collect();
+            assert_eq!(line.hits, stored, "{}: the stored run's ranking", line.id);
+            let expected: Vec<String> = replay.expected[q].iter().map(|&m| replay.ids[m].clone()).collect();
+            assert_eq!(line.expected, expected);
+        }
+    }
+
+    /// Harness behaviour 10: before its answer is embedded a query has no
+    /// expected rank, and a prefix ranks only embedded candidates.
+    /// Control: rank `top_hits(scores)` in `rank_checkpoint` (all
+    /// candidates): `q0` finds `n00` at once.
+    #[test]
+    fn a_query_whose_answer_is_not_embedded_has_no_rank() {
+        let replay = replay();
+        let embedded: Vec<usize> = (1..12).collect();
+        let outcomes = rank_checkpoint(&replay, &embedded, Path::new("")).unwrap();
+        assert_eq!(outcomes[0].first_expected_rank, None, "n00 is not embedded");
+        let all: Vec<usize> = (0..12).collect();
+        let outcomes = rank_checkpoint(&replay, &all, Path::new("")).unwrap();
+        assert!(outcomes[0].first_expected_rank.is_some());
+    }
+}

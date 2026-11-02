@@ -769,4 +769,54 @@ pub(crate) mod tests {
         let generated = EmbedInput { generated: true, ..input(&node) };
         assert_eq!(node_text(&generated), None);
     }
+
+    /// A non-test node is public or private by its visibility, and
+    /// a test node is a test whatever its visibility; the tiers embed in the
+    /// order public, private, test.
+    /// Controls: drop `embed_tier`'s `is_test` branch (a public test node
+    /// reads Public); compare `visibility != "private"` instead of
+    /// `== "public"` (a `file` node reads Public).
+    #[test]
+    fn embed_tier_classifies_public_private_and_test_and_test_wins() {
+        let lib: Node =
+            ("Function", "read", "crate::io::read", "core/src/io.rs", Some("Reads."), "pub fn read()");
+        assert_eq!(embed_tier(&input(&lib), "public"), EmbedTier::Public);
+        for visibility in ["file", "container", "private", ""] {
+            assert_eq!(embed_tier(&input(&lib), visibility), EmbedTier::Private, "{visibility:?}");
+        }
+        let tests: &[Node] = &[
+            (
+                "Function",
+                "reads_it",
+                "crate::reads_it",
+                "core/tests/it/io.rs",
+                Some("Checks it."),
+                "fn reads_it()",
+            ),
+            (
+                "Function",
+                "test_read",
+                "crate::io::test_read",
+                "core/src/io.rs",
+                Some("Checks it."),
+                "fn test_read()",
+            ),
+            ("Class", "TestRead", "TestRead", "src/io.ts", Some("Checks it."), "class TestRead"),
+            (
+                "Function",
+                "reads_it",
+                "crate::io::tests::reads_it",
+                "core/src/io.rs",
+                Some("Checks it."),
+                "fn reads_it()",
+            ),
+        ];
+        for node in tests {
+            for visibility in ["public", "file", "container"] {
+                assert_eq!(embed_tier(&input(node), visibility), EmbedTier::Test, "{node:?} {visibility:?}");
+            }
+        }
+        assert_eq!(EmbedTier::ALL, [EmbedTier::Public, EmbedTier::Private, EmbedTier::Test]);
+        assert!(EmbedTier::Public < EmbedTier::Private && EmbedTier::Private < EmbedTier::Test);
+    }
 }
