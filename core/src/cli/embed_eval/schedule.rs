@@ -203,6 +203,11 @@ struct Replay {
     measured_s: f64,
 }
 
+/// Cold-pass milliseconds used instead of a run's `timings.json`: g-mesh's is
+/// the A0 median of `docs/results/gm-453-onnx-tuning.md`, the pass time
+/// `docs/design/GM-441-prioritised-embedding.md` builds its seconds on.
+const PASS_MS_OVERRIDE: &[(&str, f64)] = &[("g-mesh", 353_792.0)];
+
 pub fn run(args: &ScheduleArgs) -> Result<()> {
     let eval_dir = &args.dir.eval_dir;
     let corpora = CorporaFile::load(eval_dir)?;
@@ -249,9 +254,13 @@ pub fn run(args: &ScheduleArgs) -> Result<()> {
                 Ok(predicted_ms(&[n], max_tokens, &curve.fit))
             })
             .collect::<Result<_>>()?;
-        let timings: serde_json::Value = read_json(&dir.join("timings.json"))?;
-        let measured_s =
-            timings["embedNodesMs"].as_f64().context("timings.json has no embedNodesMs")? / 1000.0;
+        let measured_s = match PASS_MS_OVERRIDE.iter().find(|(c, _)| c == corpus) {
+            Some(&(_, ms)) => ms / 1000.0,
+            None => {
+                let timings: serde_json::Value = read_json(&dir.join("timings.json"))?;
+                timings["embedNodesMs"].as_f64().context("timings.json has no embedNodesMs")? / 1000.0
+            }
+        };
 
         let (queries, query_files) = queries::load(eval_dir, corpus)?;
         if manifest.query_ids != queries.iter().map(|q| q.id.clone()).collect::<Vec<_>>()

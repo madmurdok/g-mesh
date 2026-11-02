@@ -5,8 +5,10 @@ F4 is the shipped rerank: the top K=30 of the 100 kept hits, reordered by
 `ce-minilm logit + BETA * cosine` (stable), the rest unchanged. It reuses
 gm464_ce_structured.py's structured-text port and logit cache, and
 rerank_eval.py's reranking, so the numbers come from the same scorer as
-the ADR 0016 ones. It never scores a pair: when the cache lacks pairs of the
-top-K windows it prints how many and stops.
+the ADR 0016 ones. Pairs of the top-K windows that the cache lacks are scored
+with the same cross-encoder (gm464's score_missing), counted once across arms,
+and saved to the same cache; when more than --max-score would be scored it
+prints the count and stops instead.
 
 For every <schedule-root>/<arm>/<corpus>/ it writes rankings.reranked.jsonl
 and adds `recall10Reranked` / `mrrReranked` to the last checkpoint of
@@ -14,7 +16,7 @@ schedule.json (the checkpoint with `reranked: true`). It then checks that the
 reranked rankings of all arms are identical per corpus.
 
 usage: gm441_rerank.py --work <eval/embedding/work> --schedule-root <dir>
-       [--arm A ...] [--corpus C ...]
+       [--arm A ...] [--corpus C ...] [--max-score N]
 """
 import argparse
 import json
@@ -33,6 +35,7 @@ from gm423_token_lengths import form_text  # noqa: E402
 K = 30
 BETA = 80.0
 ARM = "schedule"
+G.PROGRESS = Path.home() / ".claude/progress/GM-441-rerank.txt"
 
 
 def add_structured_text(c):
@@ -73,25 +76,43 @@ def main():
     ap.add_argument("--schedule-root", required=True, type=Path)
     ap.add_argument("--arm", action="append")
     ap.add_argument("--corpus", action="append")
+    ap.add_argument("--max-score", type=int, default=1000,
+                    help="stop instead of scoring when more missing pairs than this")
     a = ap.parse_args()
     arms = a.arm or sorted(p.name for p in a.schedule_root.iterdir() if p.is_dir())
     corpora = a.corpus or sorted(p.name for p in (a.schedule_root / arms[0]).iterdir() if p.is_dir())
     model_sha = R.sha256_file(a.work / "models" / R.CE_DIR[G.NAME] / "model.onnx")
 
-    plans, missing = [], 0
+    plans, needs = [], []
     for corpus in corpora:
         c = R.Corpus(a.work, HERE, corpus, 0)
         add_structured_text(c)
         cache = G.Cache(a.work, [c], model_sha)
+        # (corpus, qid) -> {text sha: text}, the format score_missing takes; keyed by
+        # text, so a pair shared by several arms is scored once.
+        need = {}
         for arm in arms:
             d = a.schedule_root / arm / corpus
             lines = read_lines(d / "rankings.jsonl")
             for line in lines:
-                have = cache.d[c.name].get(line["id"], {})
-                missing += sum(1 for h in line["hits"][:K] if G.tsha(c.stext[h[0]]) not in have)
+                have = cache.d[c.name].setdefault(line["id"], {})
+                for h in line["hits"][:K]:
+                    t = c.stext[h[0]]
+                    if G.tsha(t) not in have:
+                        need.setdefault((c.name, line["id"]), {})[G.tsha(t)] = t
             plans.append((arm, corpus, c, cache, d, lines))
+        needs.append((c, cache, need))
+    counts = {c.name: sum(len(m) for m in need.values()) for c, _, need in needs}
+    missing = sum(counts.values())
+    print(f"missing (query, node) pairs of the top-{K} windows, unique across arms: {counts}")
+    if missing > a.max_score:
+        sys.exit(f"STOP: {missing} pairs to score exceeds --max-score {a.max_score}")
     if missing:
-        sys.exit(f"STOP: the logit cache lacks {missing} (query, node) pairs of the top-{K} windows; not scoring them")
+        ce = R.CrossEncoder(a.work, G.NAME)
+        assert ce.files["model.onnx"] == model_sha
+        for c, cache, need in needs:
+            if need:
+                G.score_missing([c], cache, need, ce)
 
     rerankings = {}
     for arm, corpus, c, cache, d, lines in plans:

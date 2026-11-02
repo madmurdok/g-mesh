@@ -46,10 +46,13 @@
 //! non-public non-test nodes, then test nodes (`embedding::text::embed_tier`;
 //! a test node is in the test tier whatever its visibility). It runs one
 //! keyset scan per tier over the same candidate set, and each scan hands
-//! `compute` only the rows of its own tier, so:
+//! `compute` only the rows of its own tier that no earlier scan handed it, so:
 //!
 //! - a candidate whose tier does not change mid-pass is processed exactly
 //!   once, and `embed_done` ends at `embed_total`;
+//! - no candidate is processed twice in a pass, even one that gets no vector
+//!   (noise, empty text) and whose tier moves to a later one mid-pass, so
+//!   `embed_done` never exceeds the candidates counted into `embed_total`;
 //! - a node embedded by the watcher during the pass is no longer a
 //!   candidate, so later scans do not reach it;
 //! - a node whose tier changes mid-pass can be missed by every scan; it
@@ -91,6 +94,8 @@
 //! has a vector, deletes the ones the rule filters, and records the
 //! generation. It runs ahead of the model check, since deleting needs no
 //! model; an interrupted purge records nothing and runs again next start.
+
+use std::collections::HashSet;
 
 use rusqlite::{Connection, Result as SqlResult};
 
@@ -197,6 +202,9 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
         let mut stats = EmbedStats::default();
         let candidates = candidates.max(0) as usize;
         let mut filtered = 0;
+        // Ids handed to compute in this pass; one that got no vector is still
+        // a candidate in later scans and must not be handed again.
+        let mut handed: HashSet<String> = HashSet::new();
 
         'tiers: for tier in EmbedTier::ALL {
             let tier_started = std::time::Instant::now();
@@ -220,12 +228,11 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
                 after_id = Some(page.last().expect("just checked non-empty").id.clone());
 
                 // Every scan reads all candidates; a row is handed to compute
-                // and counted as done only in its own tier's scan, so each
-                // candidate is processed once and `embed_done` ends at
-                // `embed_total`.
+                // and counted as done only in its own tier's scan and only
+                // once per pass, so `embed_done` never exceeds `embed_total`.
                 let nodes: Vec<NodeRecord> = page
                     .into_iter()
-                    .filter(|candidate| candidate_tier(candidate) == tier)
+                    .filter(|candidate| candidate_tier(candidate) == tier && handed.insert(candidate.id.clone()))
                     .map(to_node_record)
                     .collect();
                 if nodes.is_empty() {
