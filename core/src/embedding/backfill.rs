@@ -37,8 +37,27 @@
 //! (counted as [`BackfillSummary::filtered`], not as owed a vector); the first
 //! visit deletes a vector it had. Paging strictly
 //! past the last id a page saw, ordered by id, guarantees every candidate at
-//! the moment this pass started is visited exactly once, however many of
-//! them end up unembedded anyway.
+//! the moment this pass started is visited exactly once per scan, however
+//! many of them end up unembedded anyway.
+//!
+//! # Embedding order
+//!
+//! The pass embeds by [`EmbedTier`]: public non-test nodes first, then
+//! non-public non-test nodes, then test nodes (`embedding::text::embed_tier`;
+//! a test node is in the test tier whatever its visibility). It runs one
+//! keyset scan per tier over the same candidate set, and each scan hands
+//! `compute` only the rows of its own tier, so:
+//!
+//! - a candidate whose tier does not change mid-pass is processed exactly
+//!   once, and `embed_done` ends at `embed_total`;
+//! - a node embedded by the watcher during the pass is no longer a
+//!   candidate, so later scans do not reach it;
+//! - a node whose tier changes mid-pass can be missed by every scan; it
+//!   stays a candidate and the next start embeds it.
+//!
+//! The order changes nothing once the pass completes: the same set of nodes
+//! gets the same vectors. `Phase::Ready` still comes only at the end of the
+//! whole pass.
 //!
 //! # No schema or indexer-version bump
 //!
@@ -76,7 +95,7 @@
 use rusqlite::{Connection, Result as SqlResult};
 
 use crate::daemon::indexing_status::IndexingStatus;
-use crate::embedding::text::{is_noise, EmbedInput, NOISE_RULE_VERSION};
+use crate::embedding::text::{embed_tier, is_noise, EmbedInput, EmbedTier, NOISE_RULE_VERSION};
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::storage::index_store::{IndexStore, Unit};
 use crate::storage::write::{Diff, NodeRecord};
@@ -177,33 +196,56 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
         let started = std::time::Instant::now();
         let mut stats = EmbedStats::default();
         let candidates = candidates.max(0) as usize;
-        let mut after_id: Option<String> = None;
         let mut filtered = 0;
 
-        loop {
-            let page = match store.step(|conn| fetch_candidate_page(conn, version, after_id.as_deref(), PAGE_SIZE)) {
-                Ok(page) => page,
-                Err(err) => {
-                    crate::log_line!(
-                        "g-mesh daemon: failed to read a page of nodes owed an embedding, stopping the \
-                         backfill pass early ({err:#})"
-                    );
+        'tiers: for tier in EmbedTier::ALL {
+            let tier_started = std::time::Instant::now();
+            let mut tier_len = 0usize;
+            let mut after_id: Option<String> = None;
+            loop {
+                let page =
+                    match store.step(|conn| fetch_candidate_page(conn, version, after_id.as_deref(), PAGE_SIZE)) {
+                        Ok(page) => page,
+                        Err(err) => {
+                            crate::log_line!(
+                                "g-mesh daemon: failed to read a page of nodes owed an embedding, stopping the \
+                                 backfill pass early ({err:#})"
+                            );
+                            break 'tiers;
+                        }
+                    };
+                if page.is_empty() {
                     break;
                 }
-            };
-            if page.is_empty() {
-                break;
-            }
-            after_id = Some(page.last().expect("just checked non-empty").id.clone());
-            let page_len = page.len() as u64;
+                after_id = Some(page.last().expect("just checked non-empty").id.clone());
 
-            let diff =
-                Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
-            // Inference runs between the unit's steps.
-            let computed = embedding.compute(&diff, &mut stats);
-            filtered += computed.dropped_len();
-            store.store_vectors(embedding, &computed);
-            progress.add_embed_done(page_len);
+                // Every scan reads all candidates; a row is handed to compute
+                // and counted as done only in its own tier's scan, so each
+                // candidate is processed once and `embed_done` ends at
+                // `embed_total`.
+                let nodes: Vec<NodeRecord> = page
+                    .into_iter()
+                    .filter(|candidate| candidate_tier(candidate) == tier)
+                    .map(to_node_record)
+                    .collect();
+                if nodes.is_empty() {
+                    continue;
+                }
+                let nodes_len = nodes.len();
+                tier_len += nodes_len;
+
+                let diff = Diff { upsert_nodes: nodes, ..Default::default() };
+                // Inference runs between the unit's steps.
+                let computed = embedding.compute(&diff, &mut stats);
+                filtered += computed.dropped_len();
+                store.store_vectors(embedding, &computed);
+                progress.add_embed_done(nodes_len as u64);
+            }
+            crate::log_line!(
+                "g-mesh daemon: embedding backfill finished the {} tier: {tier_len} candidates in {:.1}s",
+                tier.as_str(),
+                tier_started.elapsed().as_secs_f64()
+            );
         }
 
         embedding.finish_unit("backfill", &stats, started.elapsed());
@@ -302,9 +344,11 @@ fn purge_noise_page(
 }
 
 /// One candidate row: a node's id plus the columns
-/// [`EmbeddingPipeline::compute`] actually reads.
+/// [`EmbeddingPipeline::compute`] actually reads, and the `visibility`
+/// [`candidate_tier`] reads.
 struct Candidate {
     id: String,
+    visibility: String,
     kind: String,
     name: String,
     qualified_name: String,
@@ -322,11 +366,26 @@ struct Candidate {
 /// row before writing anything, so a filler language here can never leak
 /// into a stored answer.
 fn to_node_record(candidate: Candidate) -> NodeRecord {
-    let Candidate { id, kind, name, qualified_name, file_path, doc_comment, signature } = candidate;
+    let Candidate { id, visibility: _, kind, name, qualified_name, file_path, doc_comment, signature } =
+        candidate;
     let mut node = NodeRecord::new(id, kind, name, qualified_name, file_path, "");
     node.doc_comment = doc_comment;
     node.signature = signature;
     node
+}
+
+/// The embedding tier `candidate` belongs to.
+fn candidate_tier(candidate: &Candidate) -> EmbedTier {
+    let input = EmbedInput {
+        kind: &candidate.kind,
+        name: &candidate.name,
+        qualified_name: &candidate.qualified_name,
+        file_path: &candidate.file_path,
+        doc: candidate.doc_comment.as_deref(),
+        signature: candidate.signature.as_deref(),
+        generated: false,
+    };
+    embed_tier(&input, &candidate.visibility)
 }
 
 /// Total rows this pass owes the project right now: every node with
@@ -355,7 +414,7 @@ fn fetch_candidate_page(
     limit: i64,
 ) -> SqlResult<Vec<Candidate>> {
     let mut stmt = conn.prepare(
-        "SELECT n.id, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
+        "SELECT n.id, n.visibility, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
          FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
          WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?3) \
          AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0 \
@@ -367,12 +426,13 @@ fn fetch_candidate_page(
     let rows = stmt.query_map(rusqlite::params![after_id.unwrap_or(""), limit, version], |row| {
         Ok(Candidate {
             id: row.get(0)?,
-            kind: row.get(1)?,
-            name: row.get(2)?,
-            qualified_name: row.get(3)?,
-            file_path: row.get(4)?,
-            doc_comment: row.get(5)?,
-            signature: row.get(6)?,
+            visibility: row.get(1)?,
+            kind: row.get(2)?,
+            name: row.get(3)?,
+            qualified_name: row.get(4)?,
+            file_path: row.get(5)?,
+            doc_comment: row.get(6)?,
+            signature: row.get(7)?,
         })
     })?;
     rows.collect()

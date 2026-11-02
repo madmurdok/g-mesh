@@ -152,9 +152,46 @@ pub(crate) fn is_noise(input: &EmbedInput) -> bool {
     input.kind == "Module" || is_test(input)
 }
 
+/// The backfill's embedding order: every candidate of one tier is embedded
+/// before any of the next, in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum EmbedTier {
+    /// Not a test, `visibility = 'public'`.
+    Public,
+    /// Not a test, any other visibility.
+    Private,
+    /// A test node (see [`is_test`]), whatever its visibility.
+    Test,
+}
+
+impl EmbedTier {
+    /// Every tier, in embedding order.
+    pub(crate) const ALL: [EmbedTier; 3] = [EmbedTier::Public, EmbedTier::Private, EmbedTier::Test];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            EmbedTier::Public => "public",
+            EmbedTier::Private => "private",
+            EmbedTier::Test => "test",
+        }
+    }
+}
+
+/// The tier of a node with this `visibility` (`nodes.visibility`). A test
+/// node is [`EmbedTier::Test`] whatever its visibility.
+pub(crate) fn embed_tier(input: &EmbedInput, visibility: &str) -> EmbedTier {
+    if is_test(input) {
+        EmbedTier::Test
+    } else if visibility == "public" {
+        EmbedTier::Public
+    } else {
+        EmbedTier::Private
+    }
+}
+
 /// A node in a test file, named `test*`/`Test*`, or inside a Rust inline
 /// `tests` module.
-fn is_test(input: &EmbedInput) -> bool {
+pub(crate) fn is_test(input: &EmbedInput) -> bool {
     is_test_path(input.file_path)
         || input.name.starts_with("test")
         || input.name.starts_with("Test")
