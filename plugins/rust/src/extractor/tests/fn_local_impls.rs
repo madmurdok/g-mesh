@@ -277,3 +277,59 @@ fn same_named_impls_in_one_scope_are_one_block() {
     );
     assert_paths_are_well_formed(&graph);
 }
+
+/// Two `{ }` scopes of one fn, each with its own `K`, an `impl Tr for K`
+/// and, inside its method, a block of its own: the second scope's block is
+/// `<K as Tr>#2`, and the block nested in its method is qualified by that
+/// assigned name, so each nested block is one node with no ordinal.
+///
+/// Control: in `Bodies::function`, always push `member_tail_path(block,
+/// name)` - the second nested block reads `f::<K as Tr>::x::<M as U>#2`.
+#[test]
+fn a_block_nested_in_a_member_of_an_ordinal_block_takes_its_assigned_name() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Tr { fn x(&self); }\n\
+         pub trait U { fn y(&self); }\n\
+         pub fn f() {\n    \
+         { struct K; impl Tr for K { fn x(&self) { struct M; impl U for M { fn y(&self) {} } } } }\n    \
+         { struct K; impl Tr for K { fn x(&self) { struct M; impl U for M { fn y(&self) {} } } } }\n\
+         }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(
+        impl_blocks(&graph),
+        vec!["f::<K as Tr>", "f::<K as Tr>#2", "f::<K as Tr>#2::x::<M as U>", "f::<K as Tr>::x::<M as U>"],
+        "{:#?}",
+        graph.names()
+    );
+    assert_block(&graph, "f::<K as Tr>", "<K as Tr>", "Tr");
+    assert_block(&graph, "f::<K as Tr>#2", "<K as Tr>#2", "Tr");
+    assert_block(&graph, "f::<K as Tr>::x::<M as U>", "<M as U>", "U");
+    assert_block(&graph, "f::<K as Tr>#2::x::<M as U>", "<M as U>", "U");
+    assert_eq!(graph.node("f::<K as Tr>::x::<M as U>").range.start.line, 3, "the first scope's block");
+    assert_eq!(graph.node("f::<K as Tr>#2::x::<M as U>").range.start.line, 4, "the second scope's block");
+    assert_paths_are_well_formed(&graph);
+}
+
+/// A module-level type with two inherent impl blocks and two trait impls:
+/// every method is qualified by its own block, and nothing is suffixed.
+#[test]
+fn methods_of_each_module_level_impl_block_are_qualified_by_their_block() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Tr { fn x(&self); }\n\
+         pub trait U { fn y(&self); }\n\
+         pub struct S;\n\
+         impl S { pub fn a() {} }\n\
+         impl S { pub fn b() {} }\n\
+         impl Tr for S { fn x(&self) {} }\n\
+         impl U for S { fn y(&self) {} }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for method in ["S::a", "S::b", "<S as Tr>::x", "<S as U>::y"] {
+        assert_eq!(nodes_named(&graph, method).len(), 1, "{method}: {:#?}", graph.names());
+    }
+    assert!(graph.0.nodes.iter().all(|node| !node.qualified_name.contains('#')), "{:#?}", graph.names());
+    assert_paths_are_well_formed(&graph);
+}
