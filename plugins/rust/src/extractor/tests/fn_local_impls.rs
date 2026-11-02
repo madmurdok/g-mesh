@@ -5,7 +5,8 @@
 //! still taken by another scope of the file is suffixed `#2`, `#3`, ... in
 //! source order. Blocks of one name in one scope (such as `#[cfg]`
 //! alternatives, which are siblings) are one block, merged as every other
-//! item is.
+//! item is; so are blocks nested in the bodies of such alternatives, because
+//! a scope is a block's position within its named owner, not a byte offset.
 //!
 //! Its own module, so these tests stay apart from the parent file's; the
 //! helpers are the parent's.
