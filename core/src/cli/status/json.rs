@@ -9,6 +9,7 @@
 use serde_json::{json, Value};
 
 use super::{live_progress, BuildState, CoreState, LanguageRow, LanguageSection, Mode, PluginState, Report};
+use crate::embedding::rerank::RerankModelState;
 use crate::languages::LanguageOutcome;
 
 /// The `formatVersion` this build writes.
@@ -47,6 +48,11 @@ pub fn to_json(report: &Report) -> Value {
             "truncated": front.truncated,
         })),
         "languages": languages(report),
+        "rerankModel": match report.rerank_model {
+            RerankModelState::Present => "present",
+            RerankModelState::Missing => "missing",
+            RerankModelState::Disabled => "disabled",
+        },
     })
 }
 

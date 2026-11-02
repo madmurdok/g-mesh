@@ -342,7 +342,11 @@ fn a_missing_model_keeps_todays_output_and_logs_once() {
     let dir = tempfile::tempdir().unwrap();
     let lines = Lines::default();
     let missing = dir.path().join("no-rerank-model-here");
-    assert_matches_golden(&fake(dir.path()).with_reranker(Reranker::real_at(&missing, lines.sink())));
+    let embedding = fake(dir.path()).with_reranker(Reranker::real_at(&missing, lines.sink()));
+    // The once-per-daemon missing-model hint is the only output change; spent
+    // here so the golden pins the ranking alone.
+    assert!(embedding.reranker().take_missing_model_hint());
+    assert_matches_golden(&embedding);
     let logged = lines.0.lock().unwrap().clone();
     assert_eq!(logged.len(), 1, "{logged:?}");
     assert!(logged[0].contains("rerank model ms-marco-MiniLM-L6-v2 is not available"), "{logged:?}");

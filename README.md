@@ -245,7 +245,12 @@ g-mesh model status   # where the weights are expected, and whether they're ther
 embedding model, and again by the daemon when it loads it. `--no-rerank` skips
 it; `G_MESH_RERANK_MODEL_DIR` puts it elsewhere (`G_MESH_MODEL_DIR` names the
 embedding model's own directory, so it cannot also hold this one). Without it
-`search_code` keeps the embedding order and says so once in the daemon log.
+`search_code` keeps the embedding order, says so once in the daemon log, and
+adds a `hint` to one first page per daemon; `g-mesh status` shows it as
+`rerank model: missing`. **If you fetched models before 3.18.0, run `g-mesh
+model fetch` again after upgrading** (then restart the daemon with `g-mesh
+stop`): releases before it did not download the rerank model, and an upgrade
+does not fetch it for you.
 
 **If you are comparing two indexes, point `G_MESH_MODEL_DIR` at an empty
 directory in both arms.** Embedding generation, not indexing, dominates a

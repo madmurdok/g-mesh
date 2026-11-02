@@ -49,6 +49,7 @@ use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
 use crate::daemon::indexing_status::{group_thousands, ProgressSnapshot};
 use crate::daemon::manifest::{self, DiscoveredPlugins};
+use crate::embedding::rerank::RerankModelState;
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
 use crate::languages::LanguageOutcome;
@@ -331,6 +332,8 @@ pub struct Report {
     /// the live daemon's (see [`live_progress`]).
     pub progress: Option<ProgressSnapshot>,
     pub languages: LanguagesReport,
+    /// The rerank model on this machine, not per project.
+    pub rerank_model: RerankModelState,
 }
 
 /// What `g-mesh status` says about a front: how many projects, and whether
@@ -436,6 +439,7 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
         front,
         progress: daemon::read_progress_in(&state_dir),
         languages: LanguagesReport { section, installed, retries },
+        rerank_model: RerankModelState::from_environment(),
         project_root: project_root.to_path_buf(),
         state_dir,
     })
@@ -900,6 +904,7 @@ pub fn render(report: &Report) -> String {
         }
     }
     let _ = writeln!(out, "  last used:       {}", describe_last_used(report.last_used.as_ref()));
+    let _ = writeln!(out, "  rerank model:    {}", describe_rerank_model(report.rerank_model));
 
     let index = &report.index;
     // A phase word or progress file whose daemon is not running was left
@@ -1227,6 +1232,17 @@ fn percent(done: u64, total: u64) -> f64 {
         return 0.0;
     }
     done as f64 * 100.0 / total as f64
+}
+
+fn describe_rerank_model(state: RerankModelState) -> &'static str {
+    match state {
+        RerankModelState::Present => "present",
+        RerankModelState::Missing => {
+            "missing - search_code ranks by embedding similarity only; run `g-mesh model fetch`, then restart \
+             the daemon (`g-mesh stop`)"
+        }
+        RerankModelState::Disabled => "disabled ([rerank] enabled = false or G_MESH_RERANK=off)",
+    }
 }
 
 fn describe_core(core: CoreState) -> String {

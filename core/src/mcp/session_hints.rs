@@ -156,6 +156,11 @@ pub(crate) const SEARCH_HITS: &str =
     "These hits are ranked by relevance, not resolved: once one plausibly matches, do one \
      confirming read and stop, without rewording the query or grepping the repo.";
 
+/// Sent once per daemon, not per session (`Reranker::take_missing_model_hint`).
+pub(crate) const RERANK_MODEL_MISSING: &str =
+    "The rerank model is not installed, so these hits are in embedding order only: ask the user to run \
+     `g-mesh model fetch` and restart the daemon.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +248,7 @@ mod tests {
             WALK_COMPLETE,
             WALK_COMPLETE_IMPORT_TYPE,
             SEARCH_HITS,
+            RERANK_MODEL_MISSING,
         ];
         all.extend(causes.iter().map(|cause| truncated_by(cause).unwrap()));
         for sentence in all {

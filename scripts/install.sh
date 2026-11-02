@@ -842,6 +842,8 @@ this binary."
 	echo
 	echo "The seven structural tools work as-is. \`search_code\` additionally needs"
 	echo "the embedding model: g-mesh model fetch"
+	echo "Upgrading from a release before 3.18? Run g-mesh model fetch again: it adds"
+	echo "the rerank model search_code ranks with (g-mesh status shows whether it is there)."
 	echo
 	case "$PATH_RESULT" in
 	added | present | stale)

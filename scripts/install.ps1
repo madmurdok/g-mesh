@@ -643,6 +643,8 @@ function Install-GMesh {
         Write-Host ""
         Write-Host "The seven structural tools work as-is. ``search_code`` additionally needs"
         Write-Host "the embedding model: g-mesh model fetch"
+        Write-Host "Upgrading from a release before 3.18? Run g-mesh model fetch again: it adds"
+        Write-Host "the rerank model search_code ranks with (g-mesh status shows whether it is there)."
         Write-Host ""
         if ($pathResult -eq 'added' -or $pathResult -eq 'present') {
             Write-Host "To uninstall: Remove-Item -Recurse -Force $InstallDir, and remove"

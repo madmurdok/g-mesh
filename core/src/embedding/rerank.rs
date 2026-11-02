@@ -15,6 +15,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -259,7 +260,7 @@ pub(crate) struct RerankSettings {
 impl RerankSettings {
     /// The global config's `[rerank] enabled`, overridden by
     /// [`RERANK_ENV`]`=off`, and [`default_rerank_model_dir`].
-    fn from_environment() -> Self {
+    pub(crate) fn from_environment() -> Self {
         let enabled = !env_disables_rerank(std::env::var_os(RERANK_ENV).as_deref())
             && crate::config::read_global_config().map(|config| config.rerank.enabled).unwrap_or_else(|err| {
                 crate::log_line!("g-mesh: failed to read the global config ({err:#}) - the rerank keeps its default (on)");
@@ -277,13 +278,65 @@ type SettingsSource = Box<dyn Fn() -> RerankSettings + Send + Sync>;
 type ScorerLoader = Box<dyn Fn(&Path) -> Result<Box<dyn Scorer>> + Send + Sync>;
 type Log = Box<dyn Fn(&str) + Send + Sync>;
 
+/// What the rerank model is on disk, as `g-mesh status` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankModelState {
+    /// Both files present at their pinned sizes, and the rerank switched on.
+    Present,
+    /// Switched on, but a file is absent or the wrong size.
+    Missing,
+    /// Switched off by `[rerank] enabled = false` or [`RERANK_ENV`]`=off`,
+    /// whatever is on disk.
+    Disabled,
+}
+
+impl RerankModelState {
+    /// The state under the global config, the environment and the default
+    /// model directory.
+    pub fn from_environment() -> Self {
+        Self::of(RerankSettings::from_environment())
+    }
+
+    /// Checks presence and size only, as `g-mesh model status` does: no
+    /// sha256 over the 91 MB weights. A same-size file with other bytes
+    /// reads `Present` here while the daemon refuses it.
+    pub(crate) fn of(settings: RerankSettings) -> Self {
+        if !settings.enabled {
+            return Self::Disabled;
+        }
+        let complete = settings.model_dir.is_ok_and(|dir| {
+            [(ONNX_FILE_NAME, RERANK_ONNX_SIZE), (TOKENIZER_FILE_NAME, RERANK_TOKENIZER_SIZE)]
+                .iter()
+                .all(|(name, size)| std::fs::metadata(dir.join(name)).is_ok_and(|meta| meta.len() == *size))
+        });
+        if complete {
+            Self::Present
+        } else {
+            Self::Missing
+        }
+    }
+}
+
+/// How the first call that asked resolved the rerank.
+enum Outcome {
+    /// Switched off: `search_code` keeps the embedding order by choice.
+    Off,
+    /// Switched on, but the model could not be loaded (files missing, a
+    /// sha256 mismatch, a load error).
+    Unavailable,
+    Loaded(Box<dyn Scorer>),
+}
+
 /// The rerank as `search_code` sees it: switched off, unavailable, or a
 /// loaded scorer. Resolved on the first call that asks and held for the
 /// daemon's lifetime, so a config change takes effect on restart.
 pub struct Reranker {
     settings: SettingsSource,
     loader: ScorerLoader,
-    scorer: OnceLock<Option<Box<dyn Scorer>>>,
+    outcome: OnceLock<Outcome>,
+    /// Set once the missing-model hint has been handed out: it goes on at
+    /// most one `search_code` page per daemon.
+    missing_hint_sent: AtomicBool,
     log: Log,
 }
 
@@ -294,7 +347,8 @@ impl Reranker {
         Self {
             settings: Box::new(RerankSettings::from_environment),
             loader: Box::new(|dir| Ok(Box::new(CrossEncoder::load(dir)?) as Box<dyn Scorer>)),
-            scorer: OnceLock::new(),
+            outcome: OnceLock::new(),
+            missing_hint_sent: AtomicBool::new(false),
             log: Box::new(|line| crate::log_line!("{line}")),
         }
     }
@@ -304,7 +358,8 @@ impl Reranker {
         Self {
             settings: Box::new(|| RerankSettings { enabled: false, model_dir: Err(anyhow!("off")) }),
             loader: Box::new(|_| bail!("off")),
-            scorer: OnceLock::from(None),
+            outcome: OnceLock::from(Outcome::Off),
+            missing_hint_sent: AtomicBool::new(false),
             log: Box::new(|_| {}),
         }
     }
@@ -319,7 +374,8 @@ impl Reranker {
         Self {
             settings: Box::new(settings),
             loader: Box::new(loader),
-            scorer: OnceLock::new(),
+            outcome: OnceLock::new(),
+            missing_hint_sent: AtomicBool::new(false),
             log: Box::new(log),
         }
     }
@@ -339,24 +395,37 @@ impl Reranker {
     /// switched off, or when the model cannot be loaded: that is logged once,
     /// and every later call answers from the same outcome.
     pub(crate) fn scorer(&self) -> Option<&dyn Scorer> {
-        self.scorer
-            .get_or_init(|| {
-                let settings = (self.settings)();
-                if !settings.enabled {
-                    return None;
+        match self.outcome() {
+            Outcome::Loaded(scorer) => Some(scorer.as_ref()),
+            Outcome::Off | Outcome::Unavailable => None,
+        }
+    }
+
+    /// True on the first call that finds the model unavailable (not switched
+    /// off), false on every call after it and whenever the model is loaded
+    /// or switched off. Resolves the rerank like [`Self::scorer`].
+    pub(crate) fn take_missing_model_hint(&self) -> bool {
+        matches!(self.outcome(), Outcome::Unavailable)
+            && !self.missing_hint_sent.swap(true, Ordering::Relaxed)
+    }
+
+    fn outcome(&self) -> &Outcome {
+        self.outcome.get_or_init(|| {
+            let settings = (self.settings)();
+            if !settings.enabled {
+                return Outcome::Off;
+            }
+            match settings.model_dir.and_then(|dir| (self.loader)(&dir)) {
+                Ok(scorer) => Outcome::Loaded(scorer),
+                Err(err) => {
+                    (self.log)(&format!(
+                        "g-mesh daemon: rerank model {RERANK_MODEL_NAME} is not available ({err:#}) - \
+                         search_code keeps the embedding order. Run g-mesh model fetch to enable it."
+                    ));
+                    Outcome::Unavailable
                 }
-                match settings.model_dir.and_then(|dir| (self.loader)(&dir)) {
-                    Ok(scorer) => Some(scorer),
-                    Err(err) => {
-                        (self.log)(&format!(
-                            "g-mesh daemon: rerank model {RERANK_MODEL_NAME} is not available ({err:#}) - \
-                             search_code keeps the embedding order. Run g-mesh model fetch to enable it."
-                        ));
-                        None
-                    }
-                }
-            })
-            .as_deref()
+            }
+        })
     }
 
     /// The window's reranked order ([`blended_order`]) under `scorer`, or
