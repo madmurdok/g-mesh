@@ -287,7 +287,7 @@ fn a_report_renders_every_field_it_was_asked_for() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankModelState::Present,
+        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
     };
 
     let rendered = render(&report);
@@ -333,7 +333,7 @@ fn an_interrupted_workspace_reindex_is_named() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankModelState::Present,
+        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
     };
 
     let rendered = render(&report);
@@ -373,7 +373,7 @@ fn a_walked_index_with_no_completed_semantic_pass_is_called_out() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankModelState::Present,
+        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
     };
 
     let rendered = render(&report);
@@ -419,7 +419,7 @@ fn a_recorded_semantic_pass_failure_is_shown_with_its_reason_instead_of_the_gene
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankModelState::Present,
+        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
     });
 
     assert!(
@@ -625,7 +625,7 @@ fn a_daemon_mid_cold_start_walk_reports_the_walk_in_progress_not_a_cold_start_ow
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankModelState::Present,
+        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
     };
 
     let rendered = render(&report);
@@ -672,7 +672,7 @@ fn phase_fixture(bulk_indexed: bool, phase: Option<&str>) -> Report {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankModelState::Present,
+        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
     }
 }
 
@@ -888,7 +888,7 @@ fn a_dead_project_renders_as_such_without_pretending_to_know_pids() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankModelState::Present,
+        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
     };
 
     let rendered = render(&report);
@@ -983,7 +983,7 @@ fn a_report_with_no_plugin_pid_files_renders_a_summary_line() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankModelState::Present,
+        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
     };
 
     let rendered = render(&report);
@@ -1199,7 +1199,7 @@ fn a_project_with_no_suspension_marker_reports_none() {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankModelState::Present,
+        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
     };
     let rendered = render(&report);
     assert!(!rendered.contains("semantic ("), "{rendered}");
@@ -1231,7 +1231,7 @@ fn report_with(index: IndexStatus) -> Report {
         front: None,
         progress: None,
         languages: no_languages(),
-        rerank_model: RerankModelState::Present,
+        rerank_model: RerankStatus::OnDisk { daemon_alive: false, state: RerankModelState::Present },
     }
 }
 

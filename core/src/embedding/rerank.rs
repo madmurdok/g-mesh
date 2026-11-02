@@ -21,6 +21,7 @@ use std::sync::OnceLock;
 use anyhow::{anyhow, bail, Context, Result};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokenizers::tokenizer::Tokenizer;
 use tokenizers::TruncationParams;
@@ -317,14 +318,56 @@ impl RerankModelState {
     }
 }
 
-/// How the first call that asked resolved the rerank.
-enum Outcome {
+/// How a daemon resolved its rerank, as `search_code`'s hint and `g-mesh
+/// status` name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RerankOutcome {
     /// Switched off: `search_code` keeps the embedding order by choice.
     Off,
-    /// Switched on, but the model could not be loaded (files missing, a
-    /// sha256 mismatch, a load error).
-    Unavailable,
+    /// Switched on, but a model file is not in its directory.
+    Absent,
+    /// Switched on, the files are there, and loading them failed (a sha256
+    /// mismatch, a corrupt file, an ORT error), or the directory could not
+    /// be resolved.
+    Failed,
+    Loaded,
+}
+
+/// What a daemon writes to its state directory once it resolves the rerank:
+/// read by `g-mesh status` only while the daemon with `pid` is the live one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeRecord {
+    pub pid: u32,
+    pub outcome: RerankOutcome,
+    /// The model directory the daemon resolved; `None` when it could not.
+    pub dir: Option<PathBuf>,
+}
+
+impl OutcomeRecord {
+    /// The record at `path`; `None` for a missing or unparseable file.
+    pub fn read(path: &Path) -> Option<Self> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    }
+}
+
+/// How the first call that asked resolved the rerank.
+enum Outcome {
+    Off,
+    Absent,
+    Failed,
     Loaded(Box<dyn Scorer>),
+}
+
+impl Outcome {
+    fn kind(&self) -> RerankOutcome {
+        match self {
+            Self::Off => RerankOutcome::Off,
+            Self::Absent => RerankOutcome::Absent,
+            Self::Failed => RerankOutcome::Failed,
+            Self::Loaded(_) => RerankOutcome::Loaded,
+        }
+    }
 }
 
 /// The rerank as `search_code` sees it: switched off, unavailable, or a
@@ -334,9 +377,12 @@ pub struct Reranker {
     settings: SettingsSource,
     loader: ScorerLoader,
     outcome: OnceLock<Outcome>,
-    /// Set once the missing-model hint has been handed out: it goes on at
-    /// most one `search_code` page per daemon.
+    /// Set once the unavailable-model hint has been handed out: it goes on
+    /// at most one `search_code` page per daemon.
     missing_hint_sent: AtomicBool,
+    /// Where the outcome is recorded once resolved ([`OutcomeRecord`]); unset
+    /// outside a daemon.
+    outcome_file: OnceLock<PathBuf>,
     log: Log,
 }
 
@@ -349,6 +395,7 @@ impl Reranker {
             loader: Box::new(|dir| Ok(Box::new(CrossEncoder::load(dir)?) as Box<dyn Scorer>)),
             outcome: OnceLock::new(),
             missing_hint_sent: AtomicBool::new(false),
+            outcome_file: OnceLock::new(),
             log: Box::new(|line| crate::log_line!("{line}")),
         }
     }
@@ -360,6 +407,7 @@ impl Reranker {
             loader: Box::new(|_| bail!("off")),
             outcome: OnceLock::from(Outcome::Off),
             missing_hint_sent: AtomicBool::new(false),
+            outcome_file: OnceLock::new(),
             log: Box::new(|_| {}),
         }
     }
@@ -376,6 +424,7 @@ impl Reranker {
             loader: Box::new(loader),
             outcome: OnceLock::new(),
             missing_hint_sent: AtomicBool::new(false),
+            outcome_file: OnceLock::new(),
             log: Box::new(log),
         }
     }
@@ -397,34 +446,65 @@ impl Reranker {
     pub(crate) fn scorer(&self) -> Option<&dyn Scorer> {
         match self.outcome() {
             Outcome::Loaded(scorer) => Some(scorer.as_ref()),
-            Outcome::Off | Outcome::Unavailable => None,
+            Outcome::Off | Outcome::Absent | Outcome::Failed => None,
         }
     }
 
-    /// True on the first call that finds the model unavailable (not switched
-    /// off), false on every call after it and whenever the model is loaded
-    /// or switched off. Resolves the rerank like [`Self::scorer`].
-    pub(crate) fn take_missing_model_hint(&self) -> bool {
-        matches!(self.outcome(), Outcome::Unavailable)
-            && !self.missing_hint_sent.swap(true, Ordering::Relaxed)
+    /// Records the outcome as an [`OutcomeRecord`] at `path` once it is
+    /// resolved. Set before the first `search_code` call; a later call is
+    /// ignored.
+    pub(crate) fn record_outcome_to(&self, path: PathBuf) {
+        let _ = self.outcome_file.set(path);
+    }
+
+    /// `Absent` or `Failed` on the first call that finds the model so, `None`
+    /// on every call after it and whenever the model is loaded or switched
+    /// off. Resolves the rerank like [`Self::scorer`].
+    pub(crate) fn take_unavailable_hint(&self) -> Option<RerankOutcome> {
+        let kind = self.outcome().kind();
+        (matches!(kind, RerankOutcome::Absent | RerankOutcome::Failed)
+            && !self.missing_hint_sent.swap(true, Ordering::Relaxed))
+        .then_some(kind)
     }
 
     fn outcome(&self) -> &Outcome {
         self.outcome.get_or_init(|| {
             let settings = (self.settings)();
-            if !settings.enabled {
-                return Outcome::Off;
-            }
-            match settings.model_dir.and_then(|dir| (self.loader)(&dir)) {
-                Ok(scorer) => Outcome::Loaded(scorer),
-                Err(err) => {
+            let dir = settings.model_dir.as_ref().ok().cloned();
+            let outcome = if !settings.enabled {
+                Outcome::Off
+            } else {
+                match settings.model_dir.and_then(|dir| (self.loader)(&dir)) {
+                    Ok(scorer) => Outcome::Loaded(scorer),
+                    Err(err) => {
+                        (self.log)(&format!(
+                            "g-mesh daemon: rerank model {RERANK_MODEL_NAME} is not available ({err:#}) - \
+                             search_code keeps the embedding order. Run g-mesh model fetch to enable it."
+                        ));
+                        let absent = dir.as_ref().is_some_and(|dir| {
+                            [ONNX_FILE_NAME, TOKENIZER_FILE_NAME].iter().any(|name| !dir.join(name).exists())
+                        });
+                        if absent {
+                            Outcome::Absent
+                        } else {
+                            Outcome::Failed
+                        }
+                    }
+                }
+            };
+            if let Some(path) = self.outcome_file.get() {
+                let record = OutcomeRecord { pid: std::process::id(), outcome: outcome.kind(), dir };
+                let written = serde_json::to_string(&record)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|json| std::fs::write(path, json).map_err(anyhow::Error::from));
+                if let Err(err) = written {
                     (self.log)(&format!(
-                        "g-mesh daemon: rerank model {RERANK_MODEL_NAME} is not available ({err:#}) - \
-                         search_code keeps the embedding order. Run g-mesh model fetch to enable it."
+                        "g-mesh daemon: failed to record the rerank outcome at {} ({err:#})",
+                        path.display()
                     ));
-                    Outcome::Unavailable
                 }
             }
+            outcome
         })
     }
 

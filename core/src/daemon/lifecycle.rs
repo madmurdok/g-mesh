@@ -1053,6 +1053,7 @@ fn release_state_files(state_dir: &Path) {
     // `docs/architecture/lazy-indexing.md`).
     let _ = fs::remove_file(super::phase_path_in(state_dir));
     let _ = fs::remove_file(super::progress_path_in(state_dir));
+    let _ = fs::remove_file(super::rerank_outcome_path_in(state_dir));
     let _ = fs::remove_file(super::pid_path_in(state_dir));
     // Derived through the parent module so what a daemon binds and what it
     // releases are the same endpoint by construction. No-op on Windows.

@@ -345,7 +345,7 @@ fn a_missing_model_keeps_todays_output_and_logs_once() {
     let embedding = fake(dir.path()).with_reranker(Reranker::real_at(&missing, lines.sink()));
     // The once-per-daemon missing-model hint is the only output change; spent
     // here so the golden pins the ranking alone.
-    assert!(embedding.reranker().take_missing_model_hint());
+    assert!(embedding.reranker().take_unavailable_hint().is_some());
     assert_matches_golden(&embedding);
     let logged = lines.0.lock().unwrap().clone();
     assert_eq!(logged.len(), 1, "{logged:?}");
