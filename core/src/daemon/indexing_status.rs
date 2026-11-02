@@ -14,7 +14,7 @@
 //! `docs/architecture/g-mesh-v1.md`, "Ideas surfaced while comparing kungfu").
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -157,6 +157,12 @@ struct Inner {
     semantic_done: std::sync::atomic::AtomicU32,
     semantic_total: std::sync::atomic::AtomicU32,
     current_semantic_language: Mutex<Option<String>>,
+    /// Set once a `search_code` call has waited its whole bound for
+    /// [`Phase::Ready`] and timed out; cleared by
+    /// [`set_phase`](IndexingStatus::set_phase) on [`Phase::Ready`] and
+    /// [`Phase::Walking`]. While set, later calls do not wait again for the
+    /// same pass.
+    embedding_wait_spent: AtomicBool,
     /// Where the counters are published for outside readers, and when they last
     /// were. Unset until [`IndexingStatus::attach_progress_file`].
     progress_file: Mutex<ProgressFile>,
@@ -262,6 +268,7 @@ impl IndexingStatus {
             semantic_done: std::sync::atomic::AtomicU32::new(0),
             semantic_total: std::sync::atomic::AtomicU32::new(0),
             current_semantic_language: Mutex::new(None),
+            embedding_wait_spent: AtomicBool::new(false),
             progress_file: Mutex::new(ProgressFile::default()),
             activation: Mutex::new(Activation::default()),
             phase_file: Mutex::new(None),
@@ -327,6 +334,11 @@ impl IndexingStatus {
                 FAILED
             }
         };
+        // Cleared before the phase is published, so a reader that sees the
+        // new phase never sees the previous pass's latch.
+        if matches!(phase, Phase::Ready | Phase::Walking) {
+            self.0.embedding_wait_spent.store(false, Ordering::SeqCst);
+        }
         self.0.phase.store(discriminant, Ordering::Release);
         *self.0.phase_since.lock().unwrap() = Instant::now();
         self.0.notify.notify_waiters();
@@ -574,6 +586,19 @@ impl IndexingStatus {
 
     pub fn embed_progress(&self) -> (u64, u64) {
         (self.0.embed_done.load(Ordering::Relaxed), self.0.embed_total.load(Ordering::Relaxed))
+    }
+
+    /// Whether a `search_code` call has already waited its whole bound for
+    /// this pass's [`Phase::Ready`] and timed out.
+    pub fn embedding_wait_spent(&self) -> bool {
+        self.0.embedding_wait_spent.load(Ordering::SeqCst)
+    }
+
+    /// Records that a `search_code` call waited its whole bound for this
+    /// pass and timed out; holds until the phase reaches [`Phase::Ready`] or
+    /// restarts at [`Phase::Walking`].
+    pub fn mark_embedding_wait_spent(&self) {
+        self.0.embedding_wait_spent.store(true, Ordering::SeqCst);
     }
 
     /// Starts a whole-project semantic pass over `languages_total` languages.

@@ -2,12 +2,15 @@
 //! node (Decision 8) inside a fn body is qualified by the fns it is inside,
 //! as rustc's def paths are, so two fns of one module that each declare a
 //! local `Nothing` with its own impl keep two nodes; a block whose name is
-//! still taken in the file is suffixed `#2`, `#3`, ... in source order.
+//! still taken by another scope of the file is suffixed `#2`, `#3`, ... in
+//! source order. Blocks of one name in one scope (such as `#[cfg]`
+//! alternatives, which are siblings) are one block, merged as every other
+//! item is.
 //!
 //! Its own module, so these tests stay apart from the parent file's; the
 //! helpers are the parent's.
 
-use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind};
+use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, WireNode};
 
 use super::{assert_paths_are_well_formed, segments, Crate, Graph};
 
@@ -149,5 +152,184 @@ fn a_colliding_impl_block_is_suffixed_and_keeps_its_edge() {
     ] {
         assert_block(&graph, block, name, "Tr");
     }
+    assert_paths_are_well_formed(&graph);
+}
+
+/// The nodes named `qualified_name`, however many there are.
+fn nodes_named<'g>(graph: &'g Graph, qualified_name: &str) -> Vec<&'g WireNode> {
+    graph.0.nodes.iter().filter(|node| node.qualified_name == qualified_name).collect()
+}
+
+/// `#[cfg(a)]` and `#[cfg(not(a))]` alternatives of one fn-local impl block
+/// are siblings in one scope, so they are one node, at the first
+/// alternative, with one `SUPERTYPE_OF` edge.
+///
+/// Control: in `Bodies::declare_impl_block`, skip the per-scope lookup and
+/// always run the ordinal loop - `g::<L as Tr>#2` appears.
+#[test]
+fn cfg_alternatives_of_a_fn_local_impl_block_are_one_node() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Tr { fn x(&self); }\n\
+         pub fn helper() {}\n\
+         pub fn g() {\n    \
+         #[cfg(a)] fn inner() {}\n    \
+         #[cfg(not(a))] fn inner() {}\n    \
+         struct L;\n    \
+         #[cfg(a)] impl Tr for L { fn x(&self) { helper(); } }\n    \
+         #[cfg(not(a))] impl Tr for L { fn x(&self) { helper(); } }\n\
+         }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(impl_blocks(&graph), vec!["g::<L as Tr>"], "{:#?}", graph.names());
+    assert!(graph.0.nodes.iter().all(|node| !node.qualified_name.contains('#')), "{:#?}", graph.names());
+    assert_block(&graph, "g::<L as Tr>", "<L as Tr>", "Tr");
+    assert_eq!(graph.node("g::<L as Tr>").range.start.line, 6, "the first alternative's line");
+    assert_paths_are_well_formed(&graph);
+}
+
+/// A module-level Decision-8 block (a trait impl on a tuple) follows the
+/// same rule: its cfg alternatives are one block node, agreeing with its
+/// method, which is one node too.
+///
+/// Control: as for the fn-local case - `<(u8, u8) as Tr>#2` appears.
+#[test]
+fn cfg_alternatives_of_a_module_level_impl_block_are_one_node_like_its_method() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Tr { fn x(&self); }\n\
+         #[cfg(a)] pub fn f() {}\n\
+         #[cfg(not(a))] pub fn f() {}\n\
+         #[cfg(a)] pub struct S;\n\
+         #[cfg(not(a))] pub struct S;\n\
+         #[cfg(a)] impl S { pub fn m() {} }\n\
+         #[cfg(not(a))] impl S { pub fn m() {} }\n\
+         #[cfg(a)] impl Tr for S { fn x(&self) {} }\n\
+         #[cfg(not(a))] impl Tr for S { fn x(&self) {} }\n\
+         #[cfg(a)] impl Tr for (u8, u8) { fn x(&self) {} }\n\
+         #[cfg(not(a))] impl Tr for (u8, u8) { fn x(&self) {} }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(impl_blocks(&graph), vec!["<(u8, u8) as Tr>"], "{:#?}", graph.names());
+    assert_block(&graph, "<(u8, u8) as Tr>", "<(u8, u8) as Tr>", "Tr");
+    assert_eq!(graph.node("<(u8, u8) as Tr>").range.start.line, 9, "the first alternative's line");
+    let methods = nodes_named(&graph, "<(u8, u8) as Tr>::x");
+    assert_eq!(methods.len(), 1, "{:#?}", graph.names());
+    assert_eq!(methods[0].native_kind.as_deref(), Some("trait_impl_method"));
+    assert_paths_are_well_formed(&graph);
+}
+
+/// Two `{ }` blocks of one fn, each with its own `K` and two cfg
+/// alternatives of `impl Tr for K`: the alternatives of each block merge,
+/// and the second block still takes the next ordinal.
+///
+/// Control: in `Bodies::declare_impl_block`, key the remembered names by
+/// the unsuffixed name alone (no scope) - the second block merges into the
+/// first and `f::<K as Tr>#2` is missing.
+#[test]
+fn cfg_alternatives_merge_within_each_scope_and_scopes_keep_their_ordinals() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Tr {}\n\
+         pub fn f() {\n    \
+         {\n        struct K;\n        \
+         #[cfg(a)] impl Tr for K {}\n        \
+         #[cfg(not(a))] impl Tr for K {}\n    }\n    \
+         {\n        struct K;\n        \
+         #[cfg(a)] impl Tr for K {}\n        \
+         #[cfg(not(a))] impl Tr for K {}\n    }\n\
+         }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(impl_blocks(&graph), vec!["f::<K as Tr>", "f::<K as Tr>#2"], "{:#?}", graph.names());
+    assert_block(&graph, "f::<K as Tr>", "<K as Tr>", "Tr");
+    assert_block(&graph, "f::<K as Tr>#2", "<K as Tr>#2", "Tr");
+    assert_eq!(graph.node("f::<K as Tr>").range.start.line, 4, "the first scope's first alternative");
+    assert_eq!(graph.node("f::<K as Tr>#2").range.start.line, 9, "the second scope's first alternative");
+    assert_paths_are_well_formed(&graph);
+}
+
+/// Two real impls in one scope whose names match, because a block's name
+/// drops the trait's generic arguments (`Tr<u8>`, `Tr<u16>`), are one
+/// block, as their methods already are at module level.
+///
+/// Control: as for the cfg alternatives - `h::<L as Tr>#2` appears.
+#[test]
+fn same_named_impls_in_one_scope_are_one_block() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Tr<T> { fn x(&self); }\n\
+         pub fn h() {\n    \
+         struct L;\n    \
+         impl Tr<u8> for L { fn x(&self) {} }\n    \
+         impl Tr<u16> for L { fn x(&self) {} }\n\
+         }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(impl_blocks(&graph), vec!["h::<L as Tr>"], "{:#?}", graph.names());
+    let block = graph.node("h::<L as Tr>");
+    assert_eq!(block.name, "<L as Tr>", "{block:#?}");
+    assert_eq!(block.range.start.line, 3, "the first impl's line");
+    assert!(
+        graph.targets(EdgeKind::SupertypeOf, "h::<L as Tr>").iter().all(|target| target == "Tr"),
+        "{:#?}",
+        graph.edges(EdgeKind::SupertypeOf)
+    );
+    assert_paths_are_well_formed(&graph);
+}
+
+/// Two `{ }` scopes of one fn, each with its own `K`, an `impl Tr for K`
+/// and, inside its method, a block of its own: the second scope's block is
+/// `<K as Tr>#2`, and the block nested in its method is qualified by that
+/// assigned name, so each nested block is one node with no ordinal.
+///
+/// Control: in `Bodies::function`, always push `member_tail_path(block,
+/// name)` - the second nested block reads `f::<K as Tr>::x::<M as U>#2`.
+#[test]
+fn a_block_nested_in_a_member_of_an_ordinal_block_takes_its_assigned_name() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Tr { fn x(&self); }\n\
+         pub trait U { fn y(&self); }\n\
+         pub fn f() {\n    \
+         { struct K; impl Tr for K { fn x(&self) { struct M; impl U for M { fn y(&self) {} } } } }\n    \
+         { struct K; impl Tr for K { fn x(&self) { struct M; impl U for M { fn y(&self) {} } } } }\n\
+         }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    assert_eq!(
+        impl_blocks(&graph),
+        vec!["f::<K as Tr>", "f::<K as Tr>#2", "f::<K as Tr>#2::x::<M as U>", "f::<K as Tr>::x::<M as U>"],
+        "{:#?}",
+        graph.names()
+    );
+    assert_block(&graph, "f::<K as Tr>", "<K as Tr>", "Tr");
+    assert_block(&graph, "f::<K as Tr>#2", "<K as Tr>#2", "Tr");
+    assert_block(&graph, "f::<K as Tr>::x::<M as U>", "<M as U>", "U");
+    assert_block(&graph, "f::<K as Tr>#2::x::<M as U>", "<M as U>", "U");
+    assert_eq!(graph.node("f::<K as Tr>::x::<M as U>").range.start.line, 3, "the first scope's block");
+    assert_eq!(graph.node("f::<K as Tr>#2::x::<M as U>").range.start.line, 4, "the second scope's block");
+    assert_paths_are_well_formed(&graph);
+}
+
+/// A module-level type with two inherent impl blocks and two trait impls:
+/// every method is qualified by its own block, and nothing is suffixed.
+#[test]
+fn methods_of_each_module_level_impl_block_are_qualified_by_their_block() {
+    let krate = Crate::new(&[(
+        "src/lib.rs",
+        "pub trait Tr { fn x(&self); }\n\
+         pub trait U { fn y(&self); }\n\
+         pub struct S;\n\
+         impl S { pub fn a() {} }\n\
+         impl S { pub fn b() {} }\n\
+         impl Tr for S { fn x(&self) {} }\n\
+         impl U for S { fn y(&self) {} }\n",
+    )]);
+    let graph = krate.extract("src/lib.rs");
+    for method in ["S::a", "S::b", "<S as Tr>::x", "<S as U>::y"] {
+        assert_eq!(nodes_named(&graph, method).len(), 1, "{method}: {:#?}", graph.names());
+    }
+    assert!(graph.0.nodes.iter().all(|node| !node.qualified_name.contains('#')), "{:#?}", graph.names());
     assert_paths_are_well_formed(&graph);
 }

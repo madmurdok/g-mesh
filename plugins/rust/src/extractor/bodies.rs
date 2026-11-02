@@ -86,6 +86,8 @@
 //! site budget with questions whose answers are not in the index anyway. A
 //! type this project declares is reachable through a `use`, which resolves.
 
+use std::collections::HashMap;
+
 use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PlaceholderTarget, QualifiedPath, TargetKey, Visibility};
 use g_mesh_plugin_sdk::{NodeSpec, OpenSite, OpenSiteKind, PlaceholderKind};
 use tree_sitter::Node;
@@ -159,6 +161,10 @@ pub(crate) struct Bodies<'a, 's> {
     /// path within its own parent (`f`, `T::m`, `<T as Tr>::m`). Empty at
     /// module level.
     pub(crate) enclosing_fns: Vec<QualifiedPath>,
+    /// The name [`Self::declare_impl_block`] gave each impl block, keyed by
+    /// the block's unsuffixed qualified name and the start byte of the node
+    /// holding it (its scope), so siblings of one scope resolve to one name.
+    pub(crate) impl_block_names: HashMap<(String, usize), String>,
 }
 
 impl Bodies<'_, '_> {
@@ -465,7 +471,11 @@ impl Bodies<'_, '_> {
             .is_some_and(|owner| matches!(owner.kind(), "impl_item" | "trait_item"));
         if let Some(name) = name {
             let block = if member { block } else { None };
-            self.enclosing_fns.push(member_tail_path(block, name));
+            let path = match block.and_then(|block| self.assigned_impl_block_name(item, module, block)) {
+                Some(assigned) => QualifiedPath::root(assigned).child("::", name),
+                None => member_tail_path(block, name),
+            };
+            self.enclosing_fns.push(path);
         }
         // The name is an `identifier`, and walking it would ask what `f`
         // means at a point where `f` is the thing being declared.
@@ -1648,13 +1658,19 @@ impl Bodies<'_, '_> {
     /// module may each declare a local `Nothing` with its own impl, and one
     /// shared name would make the two one node.
     ///
-    /// A block whose name is already taken in this file - two
-    /// `const _: () = { struct K; impl Tr for K {} };` in one module, or two
-    /// `{ struct K; impl Tr for K {} }` blocks in one fn, which rustc tells
-    /// apart (`{const#0}`, `{const#1}`) and this scheme cannot - is named
-    /// with a `#2`, `#3`, ... suffix in source order (`m::<K as Tr>#2`), so
-    /// it is a node of its own rather than dropped by [`Emitter::declare`]'s
-    /// first-wins rule. A non-colliding block keeps its plain name.
+    /// The `#2`, `#3`, ... ordinal names an anonymous scope, as rustc's
+    /// `{const#0}`, `{const#1}` do: a block whose name is already taken by
+    /// another scope of this file - two `const _: () = { struct K; impl Tr
+    /// for K {} };` in one module, or two `{ struct K; impl Tr for K {} }`
+    /// blocks in one fn - is named with the next ordinal in source order
+    /// (`m::<K as Tr>#2`), so it is a node of its own rather than dropped by
+    /// [`Emitter::declare`]'s first-wins rule. A non-colliding block keeps
+    /// its plain name.
+    ///
+    /// Blocks with one name in one scope (the node holding them, such as a
+    /// `{ }` block or a module body) are one block, as with every other
+    /// item: `#[cfg(a)]` and `#[cfg(not(a))]` alternatives are siblings and
+    /// resolve to the name the first of them was given.
     ///
     /// `public`, because a trait impl's reach is the trait's and the type's,
     /// never narrower - the same reasoning [`impl_block`] already applies to
@@ -1666,26 +1682,52 @@ impl Bodies<'_, '_> {
         block: Option<&BlockCtx>,
     ) -> Option<String> {
         let prefix = block.map(|block| block.prefix.clone())?;
-        let spec_named = |this: &Self, name: String| {
-            NodeSpec::with_path(
-                NodeKind::Type,
-                name.clone(),
-                module.qualified_path(&this.fn_local_path(&name)),
-                this.emitter.positions().range(item),
-            )
-            .native_kind("impl")
-            .visibility(Visibility::Public)
-            .in_container(module.key.clone(), module.parent.clone())
+        let base = self.impl_block_spec(item, module, prefix.clone());
+        let key = (base.qualified_name.clone(), impl_block_scope(item));
+        let mut spec = match self.impl_block_names.get(&key) {
+            Some(name) => self.impl_block_spec(item, module, name.clone()),
+            None => {
+                let mut spec = base;
+                let mut ordinal = 2;
+                while self.emitter.is_declared(&spec) {
+                    spec = self.impl_block_spec(item, module, format!("{prefix}#{ordinal}"));
+                    ordinal += 1;
+                }
+                self.impl_block_names.insert(key, spec.name.clone());
+                spec
+            }
         };
-        let mut spec = spec_named(self, prefix.clone());
-        let mut ordinal = 2;
-        while self.emitter.is_declared(&spec) {
-            spec = spec_named(self, format!("{prefix}#{ordinal}"));
-            ordinal += 1;
-        }
         spec.signature = signature(item, self.source);
         spec.doc_comment = outer_doc_comment(item, self.source);
         Some(self.emitter.declare(spec, true))
+    }
+
+    /// The node [`Self::declare_impl_block`] declares for `item` under `name`.
+    fn impl_block_spec(&self, item: Node, module: &ModuleCtx, name: String) -> NodeSpec {
+        NodeSpec::with_path(
+            NodeKind::Type,
+            name.clone(),
+            module.qualified_path(&self.fn_local_path(&name)),
+            self.emitter.positions().range(item),
+        )
+        .native_kind("impl")
+        .visibility(Visibility::Public)
+        .in_container(module.key.clone(), module.parent.clone())
+    }
+
+    /// The name [`Self::declare_impl_block`] gave the impl block holding the
+    /// member fn `member`, or `None` when the block is not a node of its own.
+    /// It is the prefix the member's body is qualified by, so a block nested
+    /// in a member of `<K as Tr>#2` reads `<K as Tr>#2::x::<M as U>` and not
+    /// the first scope's `<K as Tr>::x::<M as U>`. Must be read with
+    /// [`Self::enclosing_fns`] as it was when the block was declared.
+    fn assigned_impl_block_name(&self, member: Node, module: &ModuleCtx, block: &BlockCtx) -> Option<String> {
+        let item = member.parent()?.parent().filter(|owner| owner.kind() == "impl_item")?;
+        if self.impl_block_names.is_empty() {
+            return None;
+        }
+        let base = self.impl_block_spec(item, module, block.prefix.clone());
+        self.impl_block_names.get(&(base.qualified_name, impl_block_scope(item))).cloned()
     }
 
     /// `name` as a path inside the fns the walk is in - see
@@ -1797,6 +1839,12 @@ impl Bodies<'_, '_> {
             self.edge(bound, EdgeKind::SupertypeOf, &id, name_node);
         }
     }
+}
+
+/// The scope an impl block sits in, as [`Bodies::impl_block_names`] keys it:
+/// the start byte of the node holding it.
+fn impl_block_scope(item: Node) -> usize {
+    item.parent().map_or(0, |parent| parent.start_byte())
 }
 
 /// What a typed receiver is, for the census: a local, a field, or a call,

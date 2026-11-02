@@ -214,6 +214,7 @@ impl Extractor for RustExtractor {
                 emitter: &mut emitter,
                 scopes: Scopes::new(),
                 enclosing_fns: Vec::new(),
+                impl_block_names: Default::default(),
             };
             bodies.visit_children(root, &module, None, &file);
         }

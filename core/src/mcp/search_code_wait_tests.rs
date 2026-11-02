@@ -3,7 +3,7 @@
 //! wait, the embedding wait and the partial answer, as a caller sees them.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::service::RunningService;
@@ -36,7 +36,37 @@ struct Fixture {
     _dir: tempfile::TempDir,
     store: Arc<IndexStore>,
     indexing: IndexingStatus,
+    registry: Arc<PluginRegistry>,
+    embedding: Arc<EmbeddingPipeline>,
     client: RunningService<RoleClient, ()>,
+}
+
+impl Fixture {
+    /// Another server over this fixture's store and [`IndexingStatus`], with
+    /// its own embedding wait, and a client connected to it.
+    async fn connect(&self, wait: Duration) -> RunningService<RoleClient, ()> {
+        serve(
+            GMeshMcpServer::new(
+                Arc::clone(&self.store),
+                Arc::clone(&self.registry),
+                CoreActivity::new(),
+                self.indexing.clone(),
+                Arc::clone(&self.embedding),
+            )
+            .with_search_embedding_wait(wait),
+        )
+        .await
+    }
+}
+
+async fn serve(server: GMeshMcpServer) -> RunningService<RoleClient, ()> {
+    let (server_io, client_io) = tokio::io::duplex(1 << 20);
+    tokio::spawn(async move {
+        if let Ok(service) = server.serve(server_io).await {
+            let _ = service.waiting().await;
+        }
+    });
+    ().serve(client_io).await.expect("the client must initialize against the server")
 }
 
 /// A vector with every component negative. The fake model's query vectors
@@ -88,18 +118,18 @@ async fn fixture(vectors: usize, embedded: u64, total: u64) -> Fixture {
         Arc::new(EmbeddingPipeline::disabled()),
     ));
     let embedding = Arc::new(fake_pipeline(&dir.path().join("model"), None, &Counters::default()));
-    let server =
-        GMeshMcpServer::new(Arc::clone(&store), registry, CoreActivity::new(), indexing.clone(), embedding)
-            .with_search_embedding_wait(WAIT);
-
-    let (server_io, client_io) = tokio::io::duplex(1 << 20);
-    tokio::spawn(async move {
-        if let Ok(service) = server.serve(server_io).await {
-            let _ = service.waiting().await;
-        }
-    });
-    let client = ().serve(client_io).await.expect("the client must initialize against the server");
-    Fixture { _dir: dir, store, indexing, client }
+    let client = serve(
+        GMeshMcpServer::new(
+            Arc::clone(&store),
+            Arc::clone(&registry),
+            CoreActivity::new(),
+            indexing.clone(),
+            Arc::clone(&embedding),
+        )
+        .with_search_embedding_wait(WAIT),
+    )
+    .await;
+    Fixture { _dir: dir, store, indexing, registry, embedding, client }
 }
 
 async fn search(client: &RunningService<RoleClient, ()>, arguments: Value) -> CallToolResult {
@@ -111,6 +141,15 @@ async fn search(client: &RunningService<RoleClient, ()>, arguments: Value) -> Ca
         .await
         .expect("search_code must answer within its bound while the embedding pass runs")
         .expect("tools/call must return a result, not a protocol failure")
+}
+
+async fn timed_search(
+    client: &RunningService<RoleClient, ()>,
+    arguments: Value,
+) -> (Duration, CallToolResult) {
+    let started = Instant::now();
+    let result = search(client, arguments).await;
+    (started.elapsed(), result)
 }
 
 fn texts(result: &CallToolResult) -> Vec<String> {
@@ -251,4 +290,126 @@ async fn a_partial_pages_cursor_is_refused_once_the_stored_vectors_change() {
             && message.contains("Call search_code again without `cursor`."),
         "{message}"
     );
+}
+
+/// The embedding wait of the servers that test the per-pass latch: long
+/// enough that "waited the bound" and "answered at once" (under half of it)
+/// cannot be confused, and under `CALL_BOUND`.
+const LATCH_WAIT: Duration = Duration::from_secs(2);
+
+/// A call on `client` that waits the whole `LATCH_WAIT` and answers partially.
+async fn waits_the_bound(client: &RunningService<RoleClient, ()>) -> CallToolResult {
+    let (took, result) = timed_search(client, json!({ "query": "readFile" })).await;
+    assert!(took >= LATCH_WAIT, "the call waits its whole bound: took {took:?}");
+    assert!(page(&result).get("partial").is_some(), "{:?}", texts(&result));
+    result
+}
+
+/// A call on `client` that answers partially without waiting.
+async fn answers_at_once(client: &RunningService<RoleClient, ()>) -> CallToolResult {
+    let (took, result) = timed_search(client, json!({ "query": "readFile" })).await;
+    assert!(took < LATCH_WAIT / 2, "the call does not wait again: took {took:?}");
+    result
+}
+
+/// The pass never finishes: the first call waits the bound out, the second
+/// answers at once with the same partial page.
+///
+/// Control: drop the `embedding_wait_spent` check in
+/// `GMeshMcpServer::wait_for_embeddings` - the second call waits the bound
+/// again.
+#[tokio::test]
+async fn a_second_call_during_the_same_pass_does_not_wait() {
+    let fixture = fixture(3, 3, 10).await;
+    let client = fixture.connect(LATCH_WAIT).await;
+
+    let first = page(&waits_the_bound(&client).await);
+    let second = page(&answers_at_once(&client).await);
+
+    assert_eq!(first["partial"], json!({ "embedded": 3, "total": 10 }), "{first}");
+    assert_eq!(second["partial"], first["partial"], "{second}");
+    assert_eq!(second["results"], first["results"], "{second}");
+}
+
+/// The first call's note says how long it waited; the second's says it did
+/// not wait because an earlier call had.
+///
+/// Control: drop the `embedding_wait_spent` check in
+/// `GMeshMcpServer::wait_for_embeddings` - the second note says "this call
+/// waited".
+#[tokio::test]
+async fn a_call_that_did_not_wait_says_an_earlier_call_did() {
+    let fixture = fixture(3, 3, 10).await;
+    let client = fixture.connect(LATCH_WAIT).await;
+
+    let first = texts(&waits_the_bound(&client).await);
+    let second = texts(&answers_at_once(&client).await);
+
+    assert!(
+        first[0].contains("is still running (embeddings 3 of 10 computed, this call waited"),
+        "{}",
+        first[0]
+    );
+    assert!(
+        second[0].contains(
+            "is still running (embeddings 3 of 10 computed, this call did not wait: an earlier call \
+             already waited for this pass)"
+        ) && second[0].contains("Call again later for complete results."),
+        "{}",
+        second[0]
+    );
+}
+
+/// Reaching `Ready` clears the latch: the next call is complete, and a later
+/// embedding pass that does not restart at `Walking` is waited for again.
+///
+/// Control: do not clear the latch on `Phase::Ready` in
+/// `IndexingStatus::set_phase` - the call in the later pass answers at once.
+#[tokio::test]
+async fn reaching_ready_clears_the_spent_wait() {
+    let fixture = fixture(3, 3, 10).await;
+    let client = fixture.connect(LATCH_WAIT).await;
+    waits_the_bound(&client).await;
+
+    fixture.indexing.set_phase(Phase::Ready);
+    let complete = search(&client, json!({ "query": "readFile" })).await;
+    assert_eq!(texts(&complete).len(), 1, "a complete page has no note: {:?}", texts(&complete));
+    assert!(page(&complete).get("partial").is_none(), "{:?}", texts(&complete));
+
+    fixture.indexing.set_phase(Phase::Embedding);
+    waits_the_bound(&client).await;
+}
+
+/// A new activation, restarting at `Walking`, is waited for again.
+///
+/// Control: do not clear the latch on `Phase::Walking` in
+/// `IndexingStatus::set_phase` - the call after the restart answers at once.
+#[tokio::test]
+async fn a_pass_restarting_at_walking_is_waited_for_again() {
+    let fixture = fixture(3, 3, 10).await;
+    let client = fixture.connect(LATCH_WAIT).await;
+    waits_the_bound(&client).await;
+
+    fixture.indexing.set_phase(Phase::Walking);
+    fixture.indexing.set_phase(Phase::Structural);
+    fixture.indexing.set_phase(Phase::Embedding);
+    waits_the_bound(&client).await;
+}
+
+/// A call with a zero bound does not spend the pass's wait: a later call
+/// with a non-zero bound, on the same pass, still waits.
+///
+/// Control: mark the wait spent on a zero bound too in
+/// `GMeshMcpServer::wait_for_embeddings` - the later call answers at once.
+#[tokio::test]
+async fn a_zero_bound_call_does_not_spend_the_wait() {
+    let fixture = fixture(3, 3, 10).await;
+    let no_wait = fixture.connect(Duration::ZERO).await;
+    let waiting = fixture.connect(LATCH_WAIT).await;
+
+    let (took, result) = timed_search(&no_wait, json!({ "query": "readFile" })).await;
+    assert!(took < LATCH_WAIT / 2, "a zero bound does not wait: took {took:?}");
+    assert!(page(&result).get("partial").is_some(), "{:?}", texts(&result));
+
+    waits_the_bound(&waiting).await;
 }

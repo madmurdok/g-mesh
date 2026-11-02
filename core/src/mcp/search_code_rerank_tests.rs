@@ -532,7 +532,7 @@ fn a_partial_page_is_not_reranked() {
         &Phase::Embedding,
         40,
         64,
-        std::time::Duration::ZERO,
+        Some(std::time::Duration::ZERO),
         dir.path(),
     );
     let partial = |embedding: &EmbeddingPipeline| {
