@@ -13,7 +13,8 @@ cost is about 0.3% of the pass.**
 - Within one arm, passes vary by up to 32 s (14%). That variation follows the
   load and the machine's thermal speed limit, not the arm.
 - All of the tier code (the three keyset scans, `handed`, the extra
-  `compute`/`store` calls, the tier boundaries) adds about 0.66 s per pass.
+  `compute`/`store` calls, the tier boundaries) adds about 0.4-0.7 s per pass (0.66 s pooled over all 7 runs, 0.40 s in the
+  balanced block).
 - Every other second of the pass is ONNX inference on the same 5,411
   candidates (4,237 embedded) in both arms.
 - The order of the texts does not make inference slower. In an offline A/B
@@ -65,12 +66,14 @@ in `traced-A0-A1-A1N.txt` and `traced-balanced-A1-A0-A0-A1.txt`. The driver's
 user/sys (8-11 s / 29-38 s) excludes the daemon. Daemon CPU comes from the
 trace and from `ps`.
 
-- **Arm means:** A0 230.8 s (218.2-250.0). A1 235.7 s (223.5-245.6, A1N
-  included).
+- **Arm means:** A0 230.8 s (218.2-250.0). A1 235.7 s without A1N
+  (223.5-245.6), 235.9 s with A1N (223.5-245.6).
 - **Balanced block s1-s4:** A1 234.6 s, A0 234.1 s, a difference of +0.2%.
   The spread within each arm (A0: 31.8 s) is about 60 times that difference.
 - **Non-inference time (fetch + store + other):** A0 averages 1.98 s, A1
-  2.64 s. The tiering's own cost is therefore about +0.66 s (0.3%).
+  2.64 s over all 7 runs (A1N counted as A1): +0.66 s. In the balanced block
+  s1-s4 alone it is A0 2.15 s, A1 2.55 s: +0.40 s. The tiering's own cost is
+  therefore about 0.4-0.7 s (0.2-0.3% of the pass).
   - It comes from 51 keyset pages instead of 23: the public scan reads every
     candidate, the private scan reads the rest, and the test scan reads only
     test rows.
@@ -97,7 +100,7 @@ nothing". Both arms received the same patch:
 - fetch time: 0.14-0.29 s against 0.50-1.37 s;
 - the tier log lines appear only in A1.
 
-That difference sits in the overhead columns, and it is 0.66 s.
+That difference sits in the overhead columns, and it is 0.4-0.7 s (0.66 s pooled, 0.40 s balanced).
 
 ### Offline order bench (inference only, same process, same texts)
 
@@ -149,7 +152,7 @@ following:
 
 The thermal explanation is likely but not proven, because confirm3 did not
 record pmset. The claim that does not depend on it is this: the tier code
-adds about 0.66 s, and the rest of each pass is inference whose length
+adds about 0.4-0.7 s, and the rest of each pass is inference whose length
 varies by 14% between runs of the same arm.
 
 ## Answers to the brief's code questions (g-mesh, project `g-mesh-wt-gm695`)
@@ -166,7 +169,7 @@ varies by 14% between runs of the same arm.
 
 | option | what | benefit | risk |
 |---|---|---|---|
-| **F0 (recommended)** | No production change. The measurement gets fixed: `gm441_confirm3.sh` runs a balanced order (A1 A0 A0 A1 per block) and records `pmset -g therm` and load during the pass. GM-441's results note gets a correction: "+7-10%" is replaced by "+0.2% balanced; tier overhead ≈ 0.66 s". | Keeps GM-441's earlier answers with no new code. It removes a false regression from the record and stops future A/Bs from repeating the order bias. | Rests on one balanced block plus the overhead decomposition. A real effect of 1-2% could hide in the 14% noise, but the trace bounds the tier code itself at 0.66 s. |
+| **F0 (recommended)** | No production change. The measurement gets fixed: `gm441_confirm3.sh` runs a balanced order (A1 A0 A0 A1 per block) and records `pmset -g therm` and load during the pass. GM-441's results note gets a correction: "+7-10%" is replaced by "+0.2% balanced; tier overhead ≈ 0.4-0.7 s". | Keeps GM-441's earlier answers with no new code. It removes a false regression from the record and stops future A/Bs from repeating the order bias. | Rests on one balanced block plus the overhead decomposition. A real effect of 1-2% could hide in the 14% noise, but the trace bounds the tier code itself at 0.7 s. |
 | F1 | Single scan: one keyset pass collects the ids of each tier, then each tier embeds its own ids in pages. | Saves about 0.4-0.6 s per pass on this corpus: 23 pages instead of 51, and `compute` batches of 256 again. | Holds every candidate id in memory (about 19k ids on the live index, under 2 MB). The design must be reworked: a node that changes mid-pass, and `handed` against an id-list snapshot. Every GM-441 backfill test must be re-pinned. That is a lot of risk for 0.3%. |
 | F2 | Filter `visibility` in SQL for the public and private scans; the test rule stays in Rust. | Fewer rows cross into Rust in the public and private scans. | Splits the tier rule between SQL and `text::embed_tier`, which GM-441's design rejected. The gain is at most the fetch time (≤ 1.4 s). |
 

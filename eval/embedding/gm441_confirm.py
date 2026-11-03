@@ -93,6 +93,7 @@ def main():
     ap.add_argument("--home", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--timeout", type=float, default=1500)
+    ap.add_argument("--no-tier-search", action="store_true")
     a = ap.parse_args()
 
     home = Path(a.home)
@@ -112,6 +113,40 @@ def main():
     # Indexing is lazy: the first tool call starts the walk and the passes.
     threading.Thread(target=lambda: shim.call("tools/call", {"name": "search_code", "arguments": {
         "query": "start indexing", "limit": 5}}, timeout=a.timeout), daemon=True).start()
+    out["samples"] = []
+    stop = threading.Event()
+    def cpu_s(txt):
+        txt = txt.strip()
+        if not txt:
+            return 0.0
+        d = 0
+        if "-" in txt:
+            dd, txt = txt.split("-", 1); d = int(dd)
+        parts = [float(x) for x in txt.split(":")]
+        return d * 86400 + sum(v * 60 ** k for k, v in enumerate(reversed(parts)))
+    def sampler():
+        while not stop.is_set():
+            pid = out["daemonPid"]
+            load = subprocess.run(["sysctl", "-n", "vm.loadavg"], capture_output=True, text=True).stdout.split()[1]
+            row = {"t": round(time.monotonic() - t0, 2), "load1": float(load)}
+            if pid:
+                ps = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,cputime="], capture_output=True, text=True).stdout
+                kids, cpu = {}, {}
+                for line in ps.splitlines():
+                    f = line.split()
+                    if len(f) < 3:
+                        continue
+                    kids.setdefault(int(f[1]), []).append(int(f[0])); cpu[int(f[0])] = cpu_s(f[2])
+                desc, todo = 0.0, list(kids.get(pid, []))
+                while todo:
+                    c = todo.pop(); desc += cpu.get(c, 0.0); todo.extend(kids.get(c, []))
+                row.update(daemon_cpu=cpu.get(pid), desc_cpu=round(desc, 2))
+            if last_phase[0]:
+                row["phase"] = last_phase[0]
+            out["samples"].append(row)
+            stop.wait(2)
+    last_phase = [None]
+    threading.Thread(target=sampler, daemon=True).start()
     seen_tiers = 0
     last = None
     ready_t = None
@@ -135,6 +170,8 @@ def main():
             except (OSError, ValueError, KeyError):
                 row = None
         t = round(time.monotonic() - t0, 2)
+        if row:
+            last_phase[0] = row[0]
         if row and row != last:
             out["timeline"].append({"t": t, "phase": row[0], "done": row[1], "total": row[2]})
             last = row
@@ -143,7 +180,7 @@ def main():
             for tier, n, secs in tiers[seen_tiers:]:
                 out["tiers"].append({"tier": tier, "candidates": int(n), "s": float(secs), "seen_t": t})
             seen_tiers = len(tiers)
-            if not (row and row[0] == "ready"):
+            if not (row and row[0] == "ready") and not a.no_tier_search:
                 s = search(shim, QUERIES[len(out["searches"]) % len(QUERIES)])
                 s.update(at="tier-" + tiers[-1][0], t=t)
                 out["searches"].append(s)
@@ -163,6 +200,7 @@ def main():
     out["embedding_start_t"] = emb[0]["t"] if emb else None
     out["pass_s"] = round(ready_t - emb[0]["t"], 2) if emb and ready_t else None
 
+    stop.set()
     pid = out["daemonPid"]
     if pid:
         r = subprocess.run(["ps", "-o", "cputime=", "-p", str(pid)], capture_output=True, text=True)
