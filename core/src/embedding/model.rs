@@ -1298,9 +1298,6 @@ mod tests {
         assert_eq!(first, second, "embeddings must be bit-identical across runs");
     }
 
-    /// Determinism has to survive a fresh `Session`, not just a repeated call
-    /// on a warm one - an index written today is compared against vectors
-    /// computed by a process started tomorrow.
     /// `load_with_options` is the CPU target: both build a session that
     /// embeds bit-identically. Control: making `load_with_options` pass
     /// `ExecutionTarget::CoreMl` fails it in a default build.
@@ -1320,6 +1317,9 @@ mod tests {
         assert_eq!(bits(&plain), bits(&cpu));
     }
 
+    /// Determinism has to survive a fresh `Session`, not just a repeated call
+    /// on a warm one - an index written today is compared against vectors
+    /// computed by a process started tomorrow.
     #[test]
     #[ignore = "needs the real model weights; see the comment above"]
     fn embedding_is_identical_across_separately_loaded_models() {
