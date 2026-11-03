@@ -230,3 +230,80 @@ The authors' own "unsure" notes, unresolved:
    sides and the cross-side overlap list are unchanged.
 6. **Not fixed (S18 minor note):** task-tracker-mcp's absent shapes break the
    phrase/sentence alternation by one (12 phrases / 11 sentences overall).
+
+## Measure (GM-460/S19)
+
+Binary `g-mesh 4.25.0` built from this branch (`cargo build --release --bin g-mesh`, tip d7a5b94 plus the script edits below). Arms seeded by `eval/embedding/v2/setup_work.sh` from the stored work dir, then `debug-embed-eval run --eval-dir eval/embedding/v2` per arm (no `--force`). The orchestration script, checks and raw outputs are in the session scratchpad, not committed; the numbers below are copied from its `summary.txt`.
+
+Tool changes needed to run on v2: `gm464_ce_structured.py --eval-dir` (v2 queries; C3 needs old int8 lists and is skipped on v2); `shipped_floor_rates.py --eval-dir`, `--floors shipped-structured` (parsed from `similarity.rs::floor`) and `--custom`; new `gm460_subset.py`, `v2/setup_work.sh` (also seeds `gte-small`, which `rerank_eval.Corpus` loads).
+
+### Machine state
+
+Final run: start 03:26, `uptime` load 3.70 6.97 10.59, `pmset -g therm`: no thermal or performance warning, CPU_Speed_Limit 100. End 03:43, load 6.34 7.14 8.01, same thermal state. Arms (`/usr/bin/time -p`, real / user / sys seconds): fp32 93.1 / 302.8 / 3.3, int8 53.2 / 168.6 / 1.4, int8-structured 54.9 / 175.0 / 1.4, random 9.5 / 9.1 / 0.3, shuffled 8.1 / 7.8 / 0.2, gte-small 21.8 / 65.0 / 0.8. F4 step: 34,918 new CE pairs over 1,152 queries, real 686 / user 2,626 / sys 17. Load was 4-5 at the arm starts (other agents on the machine); user is about 3.2x real, so the runs were CPU-bound, not waiting. These are quality runs; the timings are state, not a cost measurement.
+
+### Deviations found while running (each stopped the run once)
+
+1. **fp32 arm model.** `variants.toml` gives the fp32 row `model_dir = ~/.g-mesh/models/jina-embeddings-v2-base-code`, which now holds the shipped int8 weights (sha `ed45870...`). The first run embedded fp32 queries with int8 weights against fp32 node vectors, and C1 failed on all 18 files. The fp32 arm is now run with `HOME` pointing at a directory whose `.g-mesh/models/jina-embeddings-v2-base-code` links to `work/models/jina-v2-base-code-fp32-r` (sha `63363fc...`, the stored run's); the manifest's onnx sha was checked to equal it. No file under the real home was touched.
+2. **C1 "byte-identical" is exact on all stored keys, not on bytes.** 4.25 rows add `pathOverlap` and `targetDoc`. C1 compares each row as parsed JSON limited to the stored row's keys: ids, expected sets, hit ids and scores (exact float equality) are equal.
+3. **C4 excludes `random`.** The random arm's rows are not reproduced across query sets (its rankings differ from the stored run from the first row on), and `validity.floorParity.shipped` is read from the binary's source, where the floors changed after GM-465. C4 compares fp32, int8, int8-structured and shuffled in full, plus the validity's shuffled control, fitted floors and error list.
+4. **C4's "shipped floors" label.** The spec's figures FA 12.1% (8/66), CW pos 53.0% (114/215) are the `shipped-int8` floors 0.57/0.57/0.55/0.53 (GM-465's `gm434-...-structured.txt`). At the current `similarity.rs` floors 0.57/0.59/0.57/0.53 the same GM-398 rows give FA 12.1% (8/66), CW pos 49.8% (107/215). C4 equals the stored file exactly with `shipped-int8`.
+
+### Controls (all self-tested: each comparison was shown to fail on a planted mismatch before use)
+
+| # | what | result |
+|---|---|---|
+| C0 | `vectors.bin` sha256, 6 arms x 6 corpora | 36/36 equal to the stored run |
+| C1 | GM-398-id rows, fp32 / int8 / int8-structured (stored keys, exact floats) | 18/18 files equal |
+| C1b | subset `queryIds` = stored `queryIds` (FIT rows = GM-398 FIT rows + mechanical) | 18/18 |
+| C2 | `q5_floor_sensitivity.py` step 0 on the GM-398 subset | CONTROL OK (floors, held-out FA, Q5 table). v2's refit floors differ from GM-398's in go, python and typescript, so C2 can catch a FIT leak and the row-count check is not needed (C1b is run anyway) |
+| C2b | `recall_at_k.py` control, fp32 and int8 | MATCH: fp32 0.335 / 0.542 / 0.633 / 0.427, int8 0.328 / 0.532 / 0.637 / 0.424, per-language r@10 all cells |
+| C3 | `int8_confirm_report.py` on the confirm-id subset | all published cells match: Q1 +0.6 [-0.6], Q2 +0.005 [-0.004], Q4 +1.5 [upper +2.9] n=814, Q5 -2.0 [upper +1.2] n=161, go +2.1 [-4.2, +8.3] 48, python -8.8 [-17.6, -2.9] 34, rust +4.2 [0.0, +12.5] 24, ts -5.5 [-10.9, -1.8] 55 |
+| C4 | `report` on the GM-398 subset vs the stored GM-465 report, plus GM-434 columns | equal (see deviation 3); GM-434 file identical |
+| C5 | F4 K=30 beta=80 on the GM-398 subset | MATCH: r@10 +3.7 [+1.8], MRR +0.047 [+0.021], Q4 -3.0 [-0.2], Q5 +0.0 |
+
+The F4 script's own C1, C2 and C4 pass on v2 as well (C3 skipped, as above).
+
+### v2 numbers
+
+Held-out NL (positives / absent): go 184 / 41, python 155 / 40, rust 161 / 45, typescript 181 / 38.
+
+Recall (held-out NL, from the F4 script; 95% bootstrap): fp32 r@10 0.616 [0.586, 0.646], MRR 0.381 [0.358, 0.406]; int8 0.621 [0.591, 0.651], 0.384; int8-structured 0.612 [0.582, 0.642], 0.384 [0.360, 0.409]. Pooled all-query r@10 from `report`: fp32 0.608 [0.586, 0.629], int8 0.613, int8-structured 0.608. Per-language r@10 (all authored queries): go 0.679 / 0.679 / 0.679, python 0.639 / 0.645 / 0.658, rust 0.415 / 0.439 / 0.415, typescript 0.697 / 0.688 / 0.682 (fp32 / int8 / structured).
+
+**F4 rerank (K=30, beta=80, FIT-tuned, CE on structured text) vs int8-structured at the shipped floors:** r@10 0.649 [0.620, 0.678], MRR 0.427 [0.401, 0.454]; Q1 +3.7 [+2.3], Q2 +0.043 [+0.030], Q4 -2.8 [upper -1.4], Q5 +0.0 [+0.0]; passes all gates. Same sign and size as C5 on the old subset (+3.7, +0.047, -3.0, +0.0). CE on full text: Q1 +4.9 [+3.4], Q2 +0.050, Q4 -2.8, Q5 +0.0.
+
+**D7 validity.** Random: gap 59.8 points, ratio 0.016, bounds separate, recall@10 0.0098 vs chance 0.0123: pass. Shuffled: gap 59.6, ratio 0.019, bounds separate: pass. The `report` verdict line reads `FAILED` only because of the floor-parity error below, not D7.
+
+### Floors: shipped vs D6 refit on v2 FIT
+
+| arm | v2 refit go / py / rs / ts | GM-398 fit | shipped (`similarity.rs`) |
+|---|---|---|---|
+| fp32 | 0.53 / 0.46 / 0.56 / 0.46 | 0.56 / 0.58 / 0.56 / 0.55 | |
+| int8 | 0.51 / 0.46 / 0.55 / 0.47 | 0.57 / 0.57 / 0.55 / 0.53 | |
+| int8-structured | 0.51 / 0.47 / 0.57 / 0.46 | 0.57 / 0.59 / 0.57 / 0.53 | 0.57 / 0.59 / 0.57 / 0.53 |
+
+`report` flags floor parity: go 0.51 and python 0.47 are not within 0.03 of shipped (go 0.57, python 0.59), and typescript 0.46 vs 0.53 (not gated, would also fail). GM-434 columns for int8-structured, held-out NL, at each floor set:
+
+| floors | go FA | python FA | rust FA | ts FA | all FA | CW positives | CW absent |
+|---|---|---|---|---|---|---|---|
+| shipped 0.57 / 0.59 / 0.57 / 0.53 | 34.7% (17/49) | 23.9% (11/46) | 8.7% (2/23) | 15.2% (10/66) | 21.7% (40/184) | 49.6% (338/681) | 22.6% (37/164) |
+| v2 refit 0.51 / 0.47 / 0.57 / 0.46 | 4.1% (2/49) | 0.0% (0/46) | 8.7% (2/23) | 6.1% (4/66) | 4.3% (8/184) | 63.7% (434/681) | 51.8% (85/164) |
+
+On GM-398 alone the shipped floors gave 12.1% (8/66) false alarms. On the 2.8x larger v2 held-out set they give 21.7%, against the 3% per-language NL false-alarm bar GM-434 aimed for; fp32 at its own refit is 9.2% overall, so the refit cannot reach 3% either without more confident-wrong answers.
+
+**Shipped floors fall short; backlog task (not acted on, nothing in the product changed).** Draft: "Re-fit the similarity floors on the GM-460 v2 set. On v2's 681 held-out positives the shipped int8-structured floors (go 0.57, python 0.59, rust 0.57, typescript 0.53) give a 21.7% false-alarm rate (go 34.7%, python 23.9%), where the GM-398 fit saw 12.1%. The D6 refit on v2 FIT gives 0.51 / 0.47 / 0.57 / 0.46: false alarms fall to 4.3% but confident-wrong on absent queries rises from 22.6% to 51.8% and on positives from 49.6% to 63.7%. Decide the trade-off (floor per language, or a different refusal signal such as the F4 rerank score), refit on the v2 FIT half, verify on the held-out half, and update `similarity.rs::floor` and ADR 0012's table."
+
+### Achieved precision vs planning
+
+Pair rate r (Q5 pairs / held-out positives, int8 vs fp32), observed vs planning: go 0.228 vs 0.210, python 0.265 vs 0.235, rust 0.143 vs 0.131, typescript 0.365 vs 0.327. All above planning (+9 to +13%), as the arms barely move rank-1.
+
+Observed SDs (per-query delta, held-out, each arm at its own refit floors) are far below the planning 0.55 (Q4) and 0.45 (Q5) because int8 and structured barely move the ranking. Per-language 95% half-widths in points, 1.96 SD / sqrt(n) (bootstrap half-width in brackets):
+
+| pair | metric | go | python | rust | typescript |
+|---|---|---|---|---|---|
+| int8 vs fp32 | Q4 (n 225 / 195 / 206 / 219) | 3.6 (3.1) | 2.8 (2.3) | 3.1 (2.7) | 3.2 (2.7) |
+| int8 vs fp32 | Q5 (n 42 / 41 / 23 / 66) | 11.4 (9.5), SD .377 | 0.0, SD 0 | 8.5 (6.5), SD .209 | 5.2 (4.5), SD .214 |
+| structured vs int8 | Q4 | 0.0 | 2.7 (2.1) | 4.3 (3.6) | 2.3 (2.1) |
+| structured vs int8 | Q5 (n 49 / 43 / 21 / 66) | 0.0 | 0.0 | 0.0 | 4.2 (3.8) |
+| structured vs fp32 | Q4 | 3.6 (3.1) | 3.3 (2.6) | 4.0 (3.4) | 3.3 (2.7) |
+
+The Q4 target is 7.5 points: met in every language and pair at the observed SDs (all <= 4.3). With the planning SD 0.55 at the achieved n the half-widths are go 7.2, python 7.7, rust 7.5, typescript 7.3: python misses the target by 0.2 points and the others meet it, so the sizing is right for an arm that moves the top row like a model change; no more authoring is proposed. Q5 per-language has no target; its half-widths are 0-11.4 points at the observed SDs (planning-SD values 10.9-19.2), the go int8-vs-fp32 pair being the widest.

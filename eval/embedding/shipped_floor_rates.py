@@ -24,6 +24,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -44,6 +45,13 @@ def held_out(qid: str, mechanical: bool) -> bool:
     return not mechanical and hashlib.sha256(qid.encode()).digest()[0] % 2 == 1
 
 
+def structured_floors():
+    """core/src/mcp/similarity.rs::floor as checked out (the structured-text floors, ADR 0012), parsed."""
+    src = (Path(__file__).resolve().parents[2] / "core/src/mcp/similarity.rs").read_text()
+    body = src[src.index("pub(crate) fn floor("):]
+    return {m[0]: float(m[1]) for m in re.findall(r'"(go|python|rust|typescript)" => ([0-9.]+),', body[:body.index("\n}\n")])}
+
+
 def load_queries(corpus: str):
     out = {}
     for rel, mech in ((f"queries/{corpus}.jsonl", False), (f"queries/mechanical/{corpus}.jsonl", True)):
@@ -61,13 +69,24 @@ def load_queries(corpus: str):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
-    ap.add_argument("--floors", choices=["shipped", "fitted", "shipped-int8"], default="shipped")
+    ap.add_argument("--floors", choices=["shipped", "fitted", "shipped-int8", "shipped-structured"], default="shipped")
+    ap.add_argument("--custom", help="per-language floors, e.g. go=0.57,python=0.59,rust=0.57,typescript=0.53 (replaces --floors)")
+    ap.add_argument("--eval-dir", help="query files and their hashes; default: this script's directory (GM-460: eval/embedding/v2)")
     ap.add_argument("--json")
     ap.add_argument("--options", action="store_true", help="GM-434/S2: evaluate the below-floor options")
     ap.add_argument("--after", action="store_true", help="GM-434/S7: score similarity.rs's shipped verdict rule")
     a = ap.parse_args()
-    floors = {"shipped": SHIPPED, "fitted": FITTED, "shipped-int8": SHIPPED_INT8}[a.floors]
-    default_floor = SHIPPED_INT8_DEFAULT if a.floors == "shipped-int8" else DEFAULT_FLOOR
+    global EVAL
+    if a.eval_dir:
+        EVAL = Path(a.eval_dir).resolve()
+    structured = structured_floors()
+    floors = {"shipped": SHIPPED, "fitted": FITTED, "shipped-int8": SHIPPED_INT8,
+              "shipped-structured": structured}[a.floors]
+    if a.custom:
+        floors = {k: float(v) for k, v in (kv.split("=") for kv in a.custom.split(","))}
+    default_floor = (SHIPPED_INT8_DEFAULT if a.floors == "shipped-int8"
+                     else min(structured.values()) if a.floors == "shipped-structured"
+                     else min(floors.values()) if a.custom else DEFAULT_FLOOR)
 
     rows = []
     for d in sorted(Path(a.run).iterdir()):
@@ -122,7 +141,7 @@ def main():
     result = {}
     def pct(t):
         return f"{100*t[0]/t[1]:.1f}% ({t[0]}/{t[1]})" if t[1] else "-"
-    print(f"floors={a.floors} {floors}")
+    print(f"floors={'custom' if a.custom else a.floors} {floors}")
     print("| set | language | floor | false alarm | confident wrong (positives) | confident wrong (absent) | n pos / n absent |")
     print("|---|---|---|---|---|---|---|")
     for name, f in sets.items():
