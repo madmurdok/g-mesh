@@ -1,0 +1,46 @@
+95a96
+>     ap.add_argument("--no-tier-search", action="store_true")
+114a116,149
+>     out["samples"] = []
+>     stop = threading.Event()
+>     def cpu_s(txt):
+>         txt = txt.strip()
+>         if not txt:
+>             return 0.0
+>         d = 0
+>         if "-" in txt:
+>             dd, txt = txt.split("-", 1); d = int(dd)
+>         parts = [float(x) for x in txt.split(":")]
+>         return d * 86400 + sum(v * 60 ** k for k, v in enumerate(reversed(parts)))
+>     def sampler():
+>         while not stop.is_set():
+>             pid = out["daemonPid"]
+>             load = subprocess.run(["sysctl", "-n", "vm.loadavg"], capture_output=True, text=True).stdout.split()[1]
+>             row = {"t": round(time.monotonic() - t0, 2), "load1": float(load)}
+>             if pid:
+>                 ps = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,cputime="], capture_output=True, text=True).stdout
+>                 kids, cpu = {}, {}
+>                 for line in ps.splitlines():
+>                     f = line.split()
+>                     if len(f) < 3:
+>                         continue
+>                     kids.setdefault(int(f[1]), []).append(int(f[0])); cpu[int(f[0])] = cpu_s(f[2])
+>                 desc, todo = 0.0, list(kids.get(pid, []))
+>                 while todo:
+>                     c = todo.pop(); desc += cpu.get(c, 0.0); todo.extend(kids.get(c, []))
+>                 row.update(daemon_cpu=cpu.get(pid), desc_cpu=round(desc, 2))
+>             if last_phase[0]:
+>                 row["phase"] = last_phase[0]
+>             out["samples"].append(row)
+>             stop.wait(2)
+>     last_phase = [None]
+>     threading.Thread(target=sampler, daemon=True).start()
+137a173,174
+>         if row:
+>             last_phase[0] = row[0]
+146c183
+<             if not (row and row[0] == "ready"):
+---
+>             if not (row and row[0] == "ready") and not a.no_tier_search:
+165a203
+>     stop.set()

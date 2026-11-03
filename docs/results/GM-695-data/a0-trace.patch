@@ -1,0 +1,169 @@
+diff --git a/core/src/embedding/backfill.rs b/core/src/embedding/backfill.rs
+index 3e0049f..3dfe23e 100644
+--- a/core/src/embedding/backfill.rs
++++ b/core/src/embedding/backfill.rs
+@@ -179,9 +179,10 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
+         let candidates = candidates.max(0) as usize;
+         let mut after_id: Option<String> = None;
+         let mut filtered = 0;
++        let mut gm = gm695::Acc::start();
+ 
+         loop {
+-            let page = match store.step(|conn| fetch_candidate_page(conn, version, after_id.as_deref(), PAGE_SIZE)) {
++            let page = match { let gm_f = std::time::Instant::now(); let r = store.step(|conn| fetch_candidate_page(conn, version, after_id.as_deref(), PAGE_SIZE)); gm.fetch(gm_f); r } {
+                 Ok(page) => page,
+                 Err(err) => {
+                     crate::log_line!(
+@@ -200,12 +201,17 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
+             let diff =
+                 Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
+             // Inference runs between the unit's steps.
++            let gm_c = gm.before(&diff.upsert_nodes);
+             let computed = embedding.compute(&diff, &mut stats);
+             filtered += computed.dropped_len();
++            let gm_s = std::time::Instant::now();
+             store.store_vectors(embedding, &computed);
++            gm.after(gm_c, gm_s, "all");
+             progress.add_embed_done(page_len);
+         }
+ 
++        gm.finish();
++
+         embedding.finish_unit("backfill", &stats, started.elapsed());
+         BackfillSummary { candidates, filtered, embedded: stats.embedded, cache_hits: stats.hits, purged }
+     })
+@@ -810,3 +816,134 @@ mod tests {
+         assert_eq!(vector_ids(&store), vec!["read"]);
+     }
+ }
++
++/// GM-695 throwaway trace (not production).
++#[allow(dead_code)]
++mod gm695 {
++    use std::time::Instant;
++
++    fn tcpu() -> f64 {
++        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
++        ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
++    }
++
++    fn ru() -> (f64, i64, i64) {
++        let mut r: libc::rusage = unsafe { std::mem::zeroed() };
++        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) };
++        let t = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 * 1e-6;
++        (t(r.ru_utime) + t(r.ru_stime), r.ru_nvcsw as i64, r.ru_nivcsw as i64)
++    }
++
++    pub struct Acc {
++        t0: Instant,
++        ru0: (f64, i64, i64),
++        tc0: f64,
++        fetch: f64,
++        fetch_since: f64,
++        pages: usize,
++        compute: f64,
++        compute_cpu: f64,
++        store: f64,
++        calls: usize,
++        n: usize,
++        chars: usize,
++    }
++
++    pub struct Before {
++        t: Instant,
++        ru: (f64, i64, i64),
++        tc: f64,
++        n: usize,
++        chars: usize,
++    }
++
++    impl Acc {
++        pub fn start() -> Self {
++            Acc {
++                t0: Instant::now(),
++                ru0: ru(),
++                tc0: tcpu(),
++                fetch: 0.0,
++                fetch_since: 0.0,
++                pages: 0,
++                compute: 0.0,
++                compute_cpu: 0.0,
++                store: 0.0,
++                calls: 0,
++                n: 0,
++                chars: 0,
++            }
++        }
++
++        pub fn fetch(&mut self, t: Instant) {
++            let d = t.elapsed().as_secs_f64();
++            self.fetch += d;
++            self.fetch_since += d;
++            self.pages += 1;
++        }
++
++        pub fn before(&self, nodes: &[crate::storage::write::NodeRecord]) -> Before {
++            let chars = nodes
++                .iter()
++                .map(|n| {
++                    n.qualified_name.len()
++                        + n.doc_comment.as_ref().map_or(0, |d| d.len())
++                        + n.signature.as_ref().map_or(0, |s| s.len())
++                })
++                .sum();
++            Before { t: Instant::now(), ru: ru(), tc: tcpu(), n: nodes.len(), chars }
++        }
++
++        pub fn after(&mut self, b: Before, s: Instant, tier: &str) {
++            let ru_c = ru();
++            let tc_c = tcpu();
++            let compute = (s - b.t).as_secs_f64();
++            let store = s.elapsed().as_secs_f64();
++            let cpu = ru_c.0 - b.ru.0;
++            crate::log_line!(
++                "GM695 call t={:.3} tier={} n={} chars={} fetch_ms={:.1} compute_ms={:.1} cpu_ms={:.1} tcpu_ms={:.1} nivcsw={} nvcsw={} store_ms={:.1}",
++                self.t0.elapsed().as_secs_f64(),
++                tier,
++                b.n,
++                b.chars,
++                self.fetch_since * 1e3,
++                compute * 1e3,
++                cpu * 1e3,
++                (tc_c - b.tc) * 1e3,
++                ru_c.2 - b.ru.2,
++                ru_c.1 - b.ru.1,
++                store * 1e3
++            );
++            self.fetch_since = 0.0;
++            self.compute += compute;
++            self.compute_cpu += cpu;
++            self.store += store;
++            self.calls += 1;
++            self.n += b.n;
++            self.chars += b.chars;
++        }
++
++        pub fn finish(&self) {
++            let wall = self.t0.elapsed().as_secs_f64();
++            let r = ru();
++            crate::log_line!(
++                "GM695 pass wall={:.3} fetch={:.3} compute={:.3} store={:.3} other={:.3} pages={} calls={} n={} chars={} proc_cpu={:.2} compute_cpu={:.2} thread_cpu={:.2} nvcsw={} nivcsw={}",
++                wall,
++                self.fetch,
++                self.compute,
++                self.store,
++                wall - self.fetch - self.compute - self.store,
++                self.pages,
++                self.calls,
++                self.n,
++                self.chars,
++                r.0 - self.ru0.0,
++                self.compute_cpu,
++                tcpu() - self.tc0,
++                r.1 - self.ru0.1,
++                r.2 - self.ru0.2
++            );
++        }
++    }
++}
