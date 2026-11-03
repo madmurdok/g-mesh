@@ -1,0 +1,32 @@
+r1-A0 load_before=4.01 load_after=103.77 pid=53031
+  20:55  up 12 days,  8:57, 8 users, load averages: 103.77 163.10 96.29
+  real 858.64 user 0.48 sys 0.48 
+r2-A1 load_before=4.02 load_after=21.85 pid=24998
+  22:57  up 12 days, 10:59, 8 users, load averages: 21.85 17.33 14.12
+  real 670.69 user 0.46 sys 0.44 
+r3-A0 load_before=4.03 load_after=17.80 pid=46486
+  23:26  up 12 days, 11:29, 8 users, load averages: 17.80 15.81 12.17
+  real 574.91 user 0.33 sys 0.31 
+r4-A1 load_before=3.88 load_after=11.18 pid=55333
+  23:43  up 12 days, 11:46, 8 users, load averages: 11.18 11.69 10.52
+  real 573.71 user 0.31 sys 0.30 
+r5-A0 load_before=3.68 load_after=8.06 pid=66003
+  23:58  up 12 days, 12:01, 8 users, load averages: 8.06 8.81 8.84
+  real 512.66 user 0.29 sys 0.28 
+r6-A1 load_before=3.78 load_after=12.30 pid=69546
+   0:09  up 12 days, 12:12, 8 users, load averages: 12.30 11.69 10.30
+  real 548.79 user 0.31 sys 0.29 
+== per run
+r1-A0: embed 468.7s tiers {} real 858.64 user 0.48 sys 0.48 daemonCPU 2539s (driver time excludes the daemon)
+r2-A1: embed 278.6s tiers {'public': 81.6, 'private': 119.5, 'test': 76.9} real 670.69 user 0.46 sys 0.44 daemonCPU 2068s (driver time excludes the daemon)
+r3-A0: embed 233.75s tiers {} real 574.91 user 0.33 sys 0.31 daemonCPU 1825s (driver time excludes the daemon)
+r4-A1: embed 250.2s tiers {'public': 70.9, 'private': 114.5, 'test': 64.3} real 573.71 user 0.31 sys 0.30 daemonCPU 1834s (driver time excludes the daemon)
+r5-A0: embed 213.62s tiers {} real 512.66 user 0.29 sys 0.28 daemonCPU 1675s (driver time excludes the daemon)
+r6-A1: embed 234.23s tiers {'public': 62.2, 'private': 98.7, 'test': 72.2} real 548.79 user 0.31 sys 0.29 daemonCPU 1784s (driver time excludes the daemon)
+== per arm (median [min-max])
+A0: embed 233.8 [213.6-468.7]  real 574.9 [512.7-858.6]  user 0.3 [0.3-0.5]  sys 0.3 [0.3-0.5]  daemonCPU 1825.5 [1675.3-2539.4]
+A1: embed 250.2 [234.2-278.6]  real 573.7 [548.8-670.7]  user 0.3 [0.3-0.5]  sys 0.3 [0.3-0.4]  daemonCPU 1834.2 [1783.7-2067.7]
+   public: 70.9 [62.2-81.6]
+   private: 114.5 [98.7-119.5]
+   test: 72.2 [64.3-76.9]
+ALL DONE

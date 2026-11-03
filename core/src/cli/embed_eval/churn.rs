@@ -234,6 +234,7 @@ pub fn apply(nodes: &[Node], edit: Edit, target: &Target) -> Vec<Node> {
                 file_path: t.file_path.clone(),
                 language: t.language.clone(),
                 native_kind: Some("method".into()),
+                visibility: t.visibility.clone(),
                 container: t.container.clone(),
                 start_line: t.end_line + 1,
                 end_line: t.end_line + 1,
