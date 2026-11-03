@@ -1,0 +1,31 @@
+21:52:16 s1-A1 start load1=3.84 speed_limit=58 waited=1080s 21:52  up 13 days,  9:54, 9 users, load averages: 3.62 8.50 45.00
+22:02:53 s1-A1 end rc=0 load1=10.22 speed_limit=58 22:02  up 13 days, 10:05, 9 users, load averages: 10.22 13.57 29.06 | real 636.44 user 10.66 sys 38.22 
+g-mesh daemon: embeddings [semanticPass]: 2786 texts, 0 cache hits, 2786 embedded, 0 cache errors, 257.2s
+g-mesh daemon: embeddings [semanticPass]: 194 texts, 0 cache hits, 194 embedded, 0 cache errors, 12.1s
+g-mesh daemon: embedding backfill finished the public tier: 1376 candidates in 80.8s
+g-mesh daemon: embedding backfill finished the private tier: 1994 candidates in 104.9s
+g-mesh daemon: embedding backfill finished the test tier: 2041 candidates in 60.0s
+GM695 pass wall=245.630 fetch=0.654 compute=243.100 store=1.801 other=0.075 pages=51 calls=48 n=5411 chars=1485055 proc_cpu=931.09 compute_cpu=928.75 thread_cpu=232.15 nvcsw=6155 nivcsw=741648
+g-mesh daemon: embeddings [backfill]: 4237 texts, 0 cache hits, 4237 embedded, 0 cache errors, 245.6s
+22:08:33 s2-A0 start load1=3.67 speed_limit=92 waited=330s 22:08  up 13 days, 10:11, 9 users, load averages: 3.67 7.67 21.21
+22:18:57 s2-A0 end rc=0 load1=44.35 speed_limit=53 22:18  up 13 days, 10:21, 9 users, load averages: 44.35 20.28 19.29 | real 623.26 user 10.15 sys 36.11 
+g-mesh daemon: embeddings [semanticPass]: 2786 texts, 0 cache hits, 2786 embedded, 0 cache errors, 241.2s
+g-mesh daemon: embeddings [semanticPass]: 194 texts, 0 cache hits, 194 embedded, 0 cache errors, 17.3s
+GM695 pass wall=250.037 fetch=0.267 compute=248.110 store=1.627 other=0.032 pages=23 calls=22 n=5411 chars=1485055 proc_cpu=924.97 compute_cpu=924.20 thread_cpu=230.47 nvcsw=5276 nivcsw=897856
+g-mesh daemon: embeddings [backfill]: 4237 texts, 0 cache hits, 4237 embedded, 0 cache errors, 250.0s
+22:23:07 s3-A0 start load1=4.04 speed_limit=100 waited=240s 22:23  up 13 days, 10:25, 9 users, load averages: 4.04 10.74 15.26
+22:31:51 s3-A0 end rc=0 load1=8.45 speed_limit=63 22:31  up 13 days, 10:34, 9 users, load averages: 8.45 11.03 13.53 | real 523.79 user 8.19 sys 29.35 
+g-mesh daemon: embeddings [semanticPass]: 2786 texts, 0 cache hits, 2786 embedded, 0 cache errors, 217.8s
+g-mesh daemon: embeddings [semanticPass]: 194 texts, 0 cache hits, 194 embedded, 0 cache errors, 9.5s
+GM695 pass wall=218.163 fetch=0.292 compute=215.796 store=2.050 other=0.026 pages=23 calls=22 n=5411 chars=1485055 proc_cpu=830.98 compute_cpu=830.34 thread_cpu=207.29 nvcsw=5188 nivcsw=938595
+g-mesh daemon: embeddings [backfill]: 4237 texts, 0 cache hits, 4237 embedded, 0 cache errors, 218.2s
+22:33:59 s4-A1 start load1=3.23 speed_limit=100 waited=120s 22:33  up 13 days, 10:36, 9 users, load averages: 3.23 8.11 12.00
+22:43:34 s4-A1 end rc=0 load1=14.28 speed_limit=53 22:43  up 13 days, 10:46, 9 users, load averages: 14.28 15.26 14.52 | real 574.79 user 9.12 sys 32.68 
+g-mesh daemon: embeddings [semanticPass]: 2786 texts, 0 cache hits, 2786 embedded, 0 cache errors, 253.7s
+g-mesh daemon: embeddings [semanticPass]: 194 texts, 0 cache hits, 194 embedded, 0 cache errors, 12.6s
+g-mesh daemon: embedding backfill finished the public tier: 1376 candidates in 62.0s
+g-mesh daemon: embedding backfill finished the private tier: 1994 candidates in 94.6s
+g-mesh daemon: embedding backfill finished the test tier: 2041 candidates in 66.9s
+GM695 pass wall=223.531 fetch=0.610 compute=220.965 store=1.886 other=0.070 pages=51 calls=48 n=5411 chars=1485055 proc_cpu=846.33 compute_cpu=843.99 thread_cpu=210.72 nvcsw=6119 nivcsw=904842
+g-mesh daemon: embeddings [backfill]: 4237 texts, 0 cache hits, 4237 embedded, 0 cache errors, 223.5s
+22:43:39 ALL DONE
