@@ -421,3 +421,11 @@ Product files a later port would touch (informational, out of scope):
 | The `nodes` columns (no body or source text stored) | grep on core/src/storage/schema.rs (one known file) |
 | The eval snapshot DBs lack `qualifiedPath`; startLine is 0-based; the corpus checkouts are at their snapshot revisions, clean | sqlite3 and git on `<main>/eval/embedding/work` |
 | The gm464 cache key is `a0168968689691f2`; coverage is 68,370 / 68,370 | computed by a scratch script that reuses gm464's key formula |
+
+## Owner decisions (2026-11-03)
+
+1. Setup: "A: отгружаемый F4 K=30 (Recommended)". `--setup gm443-k50` is
+   left as a stub that raises NotImplementedError.
+2. Ablation scope: "Всё вкл + 4 leave-one-out (Recommended)".
+3. Body budget: "96 + строка с 48 при эффекте (Recommended)".
+4. On "helps": "Задача на перенос (Recommended)".
