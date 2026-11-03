@@ -23,7 +23,10 @@ Controls (any failure is a STOP):
   C1  build(all off) == gm464's structured text, every window node;
   C2  the gm464 cache holds every (query, window node) off pair;
   C3  200 off pairs rescored through score_texts agree with the cache (<= 1e-5);
-  C4  the off row reproduces the published F4 row (rendered lines compared);
+  C4  the off row reproduces the published F4 row (rendered lines compared):
+      on the current set GM-464 S1's row; on another eval dir (v2) GM-460's
+      F4 K=30 row, and the off arm restricted to the GM-398 query ids
+      reproduces GM-464 S1's row;
   C5  rerank disabled == int8-structured on every outcome and cell;
   C6  the all arm's text differs from base on every window node, and its row
       differs from the off row.
@@ -65,6 +68,8 @@ C3_PAIRS, C3_MAX_DIFF = 200, 1e-5
 C4_DOC = HERE.parents[1] / "docs/results/gm-443-recall-rerank.md"
 C4_SECTION = "## GM-464 S1: F4 K=30 on the structured text"
 C4_LABEL = "F4s K=30 beta=80 (FIT-tuned), CE on structured text"
+V2_C4_DOC = HERE.parents[1] / "docs/results/gm-460-enlarged-eval.md"
+V2_C4_LABEL = re.compile(r"^\| (F4s K=30 beta=80(?: \(FIT-tuned\))?, CE on structured text) \|")
 LOGIT_LOW = -8.0
 ARMS = {  # name -> (switches, body budget or None for --body-budget, authored NL only)
     "off": (frozenset(), None, False),
@@ -76,6 +81,7 @@ ARMS = {  # name -> (switches, body budget or None for --body-budget, authored N
     "all-b48": (frozenset("EIPB"), 48, True),
 }
 DEFAULT_ARMS = "off,all,-E,-I,-P,-B"
+LOO_ARMS = ("-E", "-I", "-P", "-B")
 NODE_COLS = ("id", "kind", "nativeKind", "name", "qualifiedName", "filePath", "startLine", "endLine",
              "signature", "docComment", "language")
 
@@ -350,9 +356,12 @@ def c3_rescore(cs, cache, ce, k):
     for c, q, nid in sample:
         byq.setdefault((c, q), []).append(c.atext["off"][nid])
     diffs, t0 = [], time.time()
+    p = Progress("C3 rescoring", len(sample))
     for (c, q), ts in byq.items():
         got = score_texts(ce, c.queries[q]["text"], ts)
         diffs += [abs(float(g) - cache.get(c, q, t)) for g, t in zip(got, ts)]
+        p.tick(len(diffs))
+    p.write(len(diffs))
     ms = 1000.0 * (time.time() - t0) / len(diffs)
     import onnxruntime
     import tokenizers
@@ -374,11 +383,31 @@ def c6_texts_differ(cs):
 
 
 def c4_target(doc, section, label):
-    """The published lines of `label` inside `section` of `doc`, in order."""
+    """(label, the published lines of that label in order) from `doc`, inside
+    `section` when one is given. `label` is a string or a compiled pattern
+    whose group 1 is the label; a pattern must match one label only."""
+    if not doc.exists():
+        sys.exit(f"STOP: C4 target {doc} does not exist")
     text = doc.read_text()
-    i = text.index(section + "\n")
-    j = text.find("\n## ", i + len(section))
-    return [l for l in text[i:j if j >= 0 else None].splitlines() if l.startswith(f"| {label} |")]
+    if section:
+        if section + "\n" not in text:
+            sys.exit(f"STOP: C4 section '{section}' not in {doc}")
+        i = text.index(section + "\n")
+        j = text.find("\n## ", i + len(section))
+        text = text[i:j if j >= 0 else None]
+    lines = text.splitlines()
+    if isinstance(label, str):
+        return label, [l for l in lines if l.startswith(f"| {label} |")]
+    found = {m.group(1) for m in map(label.match, lines) if m}
+    if len(found) != 1:
+        sys.exit(f"STOP: C4 wants one row matching {label.pattern} in {doc}, found {sorted(found) or 'none'}")
+    lab = found.pop()
+    return lab, [l for l in lines if l.startswith(f"| {lab} |")]
+
+
+def gm398_ids(cs):
+    """Query ids of the current (GM-398) eval set, authored and mechanical."""
+    return {q for c in cs for q in R.load_queries(HERE, c.name)[0]}
 
 
 # ---- metrics -------------------------------------------------------------------
@@ -441,7 +470,8 @@ def window_logits(cs, arm, beta, k, score_of):
 
 def bucket_table(cs, outs_off, outs_all, lg_off, lg_all):
     L = ["", "Buckets of held-out NL positives by the expected symbols' doc comments (off and all at their tuned betas)",
-         "", "| bucket | scope | n | off r@10 / MRR | all r@10 / MRR | Δr@10 [lo, hi] | ΔMRR [lo, hi] | "
+         "r@10 and MRR are pooled over languages (the mean of per-language means), as the Δ columns are", "",
+         "| bucket | scope | n | off r@10 / MRR | all r@10 / MRR | Δr@10 [lo, hi] | ΔMRR [lo, hi] | "
              "median logit off / all | expected nodes logit < -8 off / all |",
          "|---|---|---|---|---|---|---|---|---|"]
     lab = {(c.name, q): bucket_of(c, q) for c in cs for q in c.qids}
@@ -454,7 +484,7 @@ def bucket_table(cs, outs_off, outs_all, lg_off, lg_all):
             if not sel:
                 L.append(f"| {b} | {scope} | 0 | - | - | - | - | - | - |")
                 continue
-            m = lambda xs, f: sum(f(o) for o in xs) / len(xs)
+            m = lambda xs, f: R.pooled(xs, f, lambda o: True)[0]
             sa = [by_all[o["id"]] for o in sel]
             d10, dmrr = paired(outs_off, outs_all, keep)
             lo = [lg_off[o["id"]] for o in sel if o["id"] in lg_off]
@@ -490,12 +520,14 @@ def parse_args(argv=None):
     ap.add_argument("--setup", choices=("shipped", "gm443-k50"), default="shipped")
     ap.add_argument("--arms", default=DEFAULT_ARMS)
     ap.add_argument("--body-budget", type=int, default=T.BODY_BUDGET)
-    ap.add_argument("--dry-run", metavar="CORPUS")
+    ap.add_argument("--dry-run", metavar="CORPUS",
+                    help="controls and the pair count on every corpus, then time new pairs of CORPUS and stop")
     ap.add_argument("--dry-run-pairs", type=int, default=200,
                     help="new pairs the dry run scores to time the arms' text (0: none)")
-    ap.add_argument("--c4-doc", type=Path, default=C4_DOC)
-    ap.add_argument("--c4-section", default=C4_SECTION)
-    ap.add_argument("--c4-label", default=C4_LABEL)
+    ap.add_argument("--c4-doc", type=Path, help="C4 target doc (default: GM-464 S1's on the current set, "
+                                                "GM-460's results on another eval dir)")
+    ap.add_argument("--c4-section")
+    ap.add_argument("--c4-label")
     ap.add_argument("--table", type=Path)
     ap.add_argument("--summary", type=Path)
     a = ap.parse_args(argv)
@@ -527,8 +559,8 @@ def main(argv=None):
     c1_fixture()
 
     corpora = [p.name for p in sorted((work / "runs" / R.REF).iterdir()) if (p / "rankings.jsonl").exists()]
-    if a.dry_run:
-        corpora = [a.dry_run]
+    if a.dry_run and a.dry_run not in corpora:
+        sys.exit(f"STOP: --dry-run {a.dry_run} is not one of {corpora}")
     cs = [R.Corpus(work, a.eval_dir, c, 0) for c in corpora]
     ce = R.CrossEncoder(work, NAME)
     from tokenizers import Tokenizer
@@ -563,13 +595,15 @@ def main(argv=None):
     print(f"pairs to score, all arms: {total}; threads {ce.threads}; load {os.getloadavg()}")
 
     if a.dry_run:
-        ms = ms_base
-        if total and a.dry_run_pairs:
-            arm = next(x for x in a.arms if needs[x])
-            n, sec, _ = score_missing(cs, cache, needs[arm], ce, f"dry run {arm}", a.dry_run_pairs)
-            ms = 1000.0 * sec / n
-            print(f"dry run: {n} new {arm} pairs scored, {ms:.2f} ms/pair")
-        print(f"dry run ETA for {a.dry_run}: {total} pairs x {ms:.2f} ms = {total * ms / 1000:.0f}s")
+        ms, src = ms_base, "C3, base text"
+        arm = next((x for x in a.arms if any(cn == a.dry_run for cn, _ in needs[x])), None)
+        if arm and a.dry_run_pairs:
+            own = {key: v for key, v in needs[arm].items() if key[0] == a.dry_run}
+            n, sec, _ = score_missing(cs, cache, own, ce, f"dry run {arm}", a.dry_run_pairs)
+            ms, src = 1000.0 * sec / n, f"{n} new {arm} pairs of {a.dry_run}"
+            print(f"dry run: {n} new {arm} pairs of {a.dry_run} scored, {ms:.2f} ms/pair")
+        print(f"dry run ETA, every corpus: {total} pairs x {ms:.2f} ms ({src}) = {total * ms / 1000:.0f}s; "
+              f"load {os.getloadavg()}")
         PROGRESS.write_text("GM-462 dry run done\n")
         print("dry run OK")
         return
@@ -628,19 +662,39 @@ def main(argv=None):
     rowby = {r["label"]: r for r in rows}
 
     # ---- C4: the off row at beta 80 reproduces the published F4 row ----
-    want = c4_target(a.c4_doc, a.c4_section, a.c4_label)
     off80 = outs[("off", SHIPPED_BETA)]
-    c4row = dict(mkrow(a.c4_label, off80))
-    got = [l for l in render([c4row]) + flips([(a.c4_label, off80)], by8, shipped) if l.startswith(f"| {a.c4_label} |")]
-    ok = got == want and tuned["off"] == SHIPPED_BETA
-    print(f"C4 off row reproduces '{a.c4_label}' ({a.c4_doc.name}): {'MATCH' if ok else 'MISMATCH'}; "
-          f"off FIT-tuned beta {tuned['off']:g}")
-    if not ok:
-        for g_, w_ in zip(got + [""] * len(want), want + [""] * len(got)):
-            if g_ != w_:
-                print(f"   got  {g_}\n   want {w_}")
-        sys.exit("STOP: C4 failed")
-    S.append("C4 pass")
+
+    def c4(tag, target, ids=None):
+        """Renders the off row at beta 80 (restricted to `ids` when given) under the
+        target's label and compares it with the published lines. A "(FIT-tuned)"
+        label also requires the off arm's FIT-tuned beta, on the same queries, to be 80."""
+        label, want = target
+        sel = (lambda xs: xs) if ids is None else (lambda xs: [o_ for o_ in xs if o_["id"] in ids])
+        b32, b8, o80 = sel(base[R.REF]), sel(base[ST]), sel(off80)
+        r = row(label, o80, shipped, b32, R.fit_floors(b32), b8, shipped)
+        b8by = {o_["id"]: o_ for o_ in b8}
+        got = [l for l in render([r]) + flips([(label, o80)], b8by, shipped) if l.startswith(f"| {label} |")]
+        beta = tuned["off"]
+        if ids is not None:
+            keys = [(c, q) for c, q in fit_keys if q in ids]
+            beta = max(R.BETAS, key=lambda b: fit_obj(keys, K, score_of["off"], b) + (-b,))
+        ok = bool(want) and got == want and ("(FIT-tuned)" not in label or beta == SHIPPED_BETA)
+        print(f"C4{tag} off row reproduces '{label}': {'MATCH' if ok else 'MISMATCH'} "
+              f"({len(want)} published lines); off FIT-tuned beta {beta:g}")
+        if not ok:
+            for g_, w_ in zip(got + [""] * len(want), want + [""] * len(got)):
+                if g_ != w_:
+                    print(f"   got  {g_}\n   want {w_}")
+            sys.exit(f"STOP: C4{tag} failed")
+        S.append(f"C4{tag} pass ('{label}')")
+
+    if current_set or a.c4_doc:
+        c4("", c4_target(a.c4_doc or C4_DOC, a.c4_section if a.c4_doc else C4_SECTION,
+                         a.c4_label or (C4_LABEL if not a.c4_doc else V2_C4_LABEL)))
+    else:
+        c4("a", c4_target(V2_C4_DOC, a.c4_section, V2_C4_LABEL))
+    if not current_set:
+        c4("b (GM-398 ids)", c4_target(C4_DOC, C4_SECTION, C4_LABEL), gm398_ids(cs))
 
     L = render(rows)
     L += flips(variants, by8, shipped)
@@ -672,7 +726,7 @@ def main(argv=None):
                 continue
             x10, xmrr = paired(all_t, outs[(arm, tuned[arm])], R.ho)
             L.append(f"| all | {arm} | {fmt_d(x10)} | {fmt_d(xmrr, True)} |")
-            if x10[1] <= 0 <= x10[2] and xmrr[1] <= 0 <= xmrr[2]:
+            if arm in LOO_ARMS and x10[1] <= 0 <= x10[2] and xmrr[1] <= 0 <= xmrr[2]:
                 loo.append(arm)
         if not current_set:
             s10, smrr = paired(off_t, all_t, strict_ho(cs))

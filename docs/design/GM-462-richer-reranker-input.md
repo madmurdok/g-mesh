@@ -74,7 +74,7 @@ lowercased and joined by one space. For example `HTTPServer` gives
 | `E` | **enclosing** | `split_words(nativeKind or kind)`, then `split_words` of the qualified-name prefix: `qualifiedName` minus its trailing `name`, or the whole `qualifiedName` when it does not end in `name` | `nativeKind`, `kind`, `qualifiedName`, `name` |
 | `I` | **identifiers** | `split_words(name)`, then `split_words` of each distinct identifier in the signature. Identifiers are matched by `[A-Za-z_][A-Za-z0-9_]*`, in source order, minus `SIGNATURE_KEYWORDS` (text.rs) and minus `name` itself. Cut at 48 tokens on a word boundary. | `name`, `signature` |
 | `P` | **path** | `split_words(filePath)` | `filePath` |
-| `B` | **body** | Only for `kind` Function or Type. Source lines `startLine+1 ..= endLine` (0-based, so the declaration's own first line is skipped). A leading Python docstring is skipped. Lines holding only `{}()[];,` and whitespace are dropped. Whitespace is collapsed and each line is cut at 200 characters. Whole lines are added while the field stays within **96 tokens**, stopping at the first line that does not fit. | `startLine`, `endLine`, `language` + `work/corpora/<corpus>/<filePath>` |
+| `B` | **body** | Only for `kind` Function or Type. Source lines after the signature, up to `endLine` (0-based). The signature ends at the first line, from `startLine`, that ends in `:` at bracket depth 0 (Python; this skips decorators, which the eval DB's `startLine` includes, and a multi-line header) or holds a `{`, `;` or `=>` at bracket depth 0 (other languages; a multi-line parameter list is skipped). Without such a line the body starts at `startLine+1`. A leading Python docstring is skipped. Lines holding only `{}()[];,` and whitespace are dropped. Whitespace is collapsed and each line is cut at 200 characters. Whole lines are added while the field stays within **96 tokens**, stopping at the first line that does not fit. | `startLine`, `endLine`, `language` + `work/corpora/<corpus>/<filePath>` |
 
 Examples of the enclosing field: `Context.Next` gives `method context`;
 `walk::Worker::send_quit` gives `method walk worker`;
@@ -297,6 +297,25 @@ What changes on v2:
 
 The builder, fields, budget and verdict rule do not change between the two
 sets. The script takes the set as arguments only.
+
+How the script implements v2 (GM-462/S10; these depart from the table
+above where noted):
+
+- C4(a) reads GM-460's F4 K=30 row from `docs/results/gm-460-enlarged-eval.md`
+  (the row labelled `F4s K=30 beta=80[ (FIT-tuned)], CE on structured text`,
+  as `gm464_ce_structured.py` renders it). The script stops if that file or
+  row is absent, so GM-462's measure on v2 waits for GM-460's step 4.
+- C4(b) filters the v2 outcomes to the GM-398 query ids (the ids in
+  `eval/embedding/queries/` and `queries/mechanical/`) in the script itself,
+  instead of through `gm460_subset.py`, and compares the off row at beta 80
+  with GM-464 S1's row. On that subset the off arm's FIT-tuned beta must be
+  80, as GM-464 published.
+- C4 requires the off arm's FIT-tuned beta to be 80 only when the target row
+  says "(FIT-tuned)". Every arm's beta is fitted on v2's FIT half; the beta
+  80 rows stay in the tables.
+- The strict held-out view is computed from the queries (held-out queries
+  sharing an expected symbol with a FIT query dropped), not read from
+  `build.py --check`'s list.
 
 ## 8. Progress output for the CE pass
 

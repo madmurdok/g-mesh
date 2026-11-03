@@ -11,7 +11,7 @@ structured text that Rust `text_to_embed` produces):
   I  identifiers: split words of the name, then of each distinct signature
      identifier (keywords and the name itself dropped), cut at 48 tokens;
   P  path: split words of the file path;
-  B  body: source lines after the declaration's first line (Function and
+  B  body: source lines after the signature (Function and
      Type only), within a token budget (96 by default).
 
 An empty field is left out together with its newline, so with every switch
@@ -107,12 +107,54 @@ def _skip_docstring(lines):
     return i + 1
 
 
+def signature_end(lines, start, end, language):
+    """Index of the signature's last line, scanning from `start` (0-based):
+    for Python the first line that ends in `:` at bracket depth 0, which
+    skips decorators and a multi-line header; for the other languages the
+    first line holding a `{`, `;` or `=>` at bracket depth 0 (the arrow ends
+    an expression-bodied arrow function's signature). `start` when no such
+    line exists up to `end`. String contents and line comments are ignored;
+    outside Python only double quotes and backticks open a string, since a
+    single quote is a Rust lifetime."""
+    py = language == "python"
+    quotes = "\"'" if py else "\"`"
+    depth, q = 0, None
+    for i in range(start, min(end, len(lines) - 1) + 1):
+        line, tail = lines[i], ""
+        j = 0
+        while j < len(line):
+            ch = line[j]
+            if q:
+                if ch == "\\":
+                    j += 1
+                elif ch == q:
+                    q = None
+            elif ch in quotes:
+                q = ch
+            elif (py and ch == "#") or (not py and line.startswith("//", j)):
+                break
+            elif ch in "([":
+                depth += 1
+            elif ch in ")]":
+                depth = max(0, depth - 1)
+            elif depth == 0 and not py and (ch in "{;" or line.startswith("=>", j)):
+                return i
+            if not q and not ch.isspace():
+                tail = ch
+            j += 1
+        if py and q in ("'", '"'):
+            q = None
+        if py and depth == 0 and tail == ":":
+            return i
+    return start
+
+
 def body_lines(lines, start, end, language):
-    """Source lines `start+1 ..= end` (0-based, the declaration's first line
-    skipped), a leading Python docstring skipped, lines holding only
-    `{}()[];,` and whitespace dropped, whitespace collapsed, each line cut at
-    LINE_CHARS characters."""
-    ls = lines[start + 1:end + 1]
+    """Source lines after the signature (`signature_end`) up to `end`
+    (0-based, inclusive), a leading Python docstring skipped, lines holding
+    only `{}()[];,` and whitespace dropped, whitespace collapsed, each line
+    cut at LINE_CHARS characters."""
+    ls = lines[signature_end(lines, start, end, language) + 1:end + 1]
     if language == "python":
         ls = ls[_skip_docstring(ls):]
     return [" ".join(l.split())[:LINE_CHARS] for l in ls if not _PUNCT_ONLY.match(l)]
