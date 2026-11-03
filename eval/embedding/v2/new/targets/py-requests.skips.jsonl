@@ -1,0 +1,10 @@
+{"n": 40, "qualifiedName": "builtin_str", "reason": "identity rebind builtin_str = str (compat.py:108)"}
+{"n": 63, "qualifiedName": "target", "reason": "module-level loop helper holding chardet module name in packages.py:17, not a standalone search target"}
+{"n": 64, "qualifiedName": "_T_co", "reason": "generic covariant TypeVar"}
+{"n": 68, "qualifiedName": "__cake__", "reason": "dunder package metadata (emoji string)"}
+{"n": 69, "qualifiedName": "str", "reason": "identity rebind str = str (compat.py:109)"}
+{"n": 70, "qualifiedName": "__author_email__", "reason": "dunder package metadata"}
+{"n": 73, "qualifiedName": "_CookieJarT", "reason": "generic TypeVar bound to CookieJar"}
+{"n": 75, "qualifiedName": "bytes", "reason": "identity rebind bytes = bytes (compat.py:110)"}
+{"n": 76, "qualifiedName": "requests.utils", "reason": "module node listed as expected twin of target #30 (utils.py file)"}
+{"n": 86, "qualifiedName": "requests.status_codes", "reason": "module node listed as expected twin of target #84 (status_codes.py file)"}

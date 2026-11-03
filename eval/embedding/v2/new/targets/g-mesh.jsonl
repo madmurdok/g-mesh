@@ -1,0 +1,53 @@
+{"meta": {"corpus": "g-mesh", "seed": 460, "frameSource": "/Users/Valentin_Taiurskii/Projects/ClaudeProjects/g-mesh/eval/embedding/work/g-mesh.sqlite", "frameSha256": "1fd9a1563cd55afa2eb9be061735dc56394027ad061bfac64e2ac0c65d03fd02", "frameSizes": {"fn": 1457, "type": 366, "other": 516}, "dropped": {"not_embeddable": 5754, "test_or_fixture": 3404, "not_at_pin": 0, "duplicate": 0, "excluded": 167}, "exclude": [{"study": "eval/embedding", "consumedPrefix": 59, "consumedTargets": 59, "expectedSymbols": 56, "keys": 65}, {"study": "eval/embedding/confirm", "consumedPrefix": 98, "consumedTargets": 98, "expectedSymbols": 80, "keys": 103}], "excludeKeys": 168}}
+{"n": 1, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "daemon::lifecycle::PluginSupervisor::has_pending", "filePath": "core/src/daemon/lifecycle.rs", "lineAtPin": 259}
+{"n": 2, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "extractor::decls::Declarer::collect", "filePath": "plugins/rust/src/extractor/decls.rs", "lineAtPin": 256}
+{"n": 3, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "TargetScope", "filePath": "wire/src/lib.rs", "lineAtPin": 138}
+{"n": 4, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "daemon::registry::PluginRegistry::pid_file_for", "filePath": "core/src/daemon/registry.rs", "lineAtPin": 982}
+{"n": 5, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "extractor::emit::Positions::new", "filePath": "plugins/python/src/extractor/emit.rs", "lineAtPin": 71}
+{"n": 6, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "mcp::get_dependencies::EntryPoint", "filePath": "core/src/mcp/get_dependencies.rs", "lineAtPin": 589}
+{"n": 7, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "storage::index_store::<StoreGuard as DerefMut>::deref_mut", "filePath": "core/src/storage/index_store.rs", "lineAtPin": 340}
+{"n": 8, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "graph::symbol_links::Candidate", "filePath": "core/src/graph/symbol_links.rs", "lineAtPin": 1063}
+{"n": 9, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "daemon::semantic::run_with_registry", "filePath": "core/src/daemon/semantic.rs", "lineAtPin": 300}
+{"n": 10, "stratum": "other", "kind": "File", "nativeKind": null, "qualifiedName": "core/src/main.rs", "filePath": "core/src/main.rs", "lineAtPin": 1}
+{"n": 11, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "daemon::memory::ProcessTreeSample::contains", "filePath": "core/src/daemon/memory.rs", "lineAtPin": 133}
+{"n": 12, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "cli::plugin_check::session::parse_bulk_lines", "filePath": "core/src/cli/plugin_check/session.rs", "lineAtPin": 486}
+{"n": 13, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "daemon::plugin::RoundTripTimeouts", "filePath": "core/src/daemon/plugin.rs", "lineAtPin": 175}
+{"n": 14, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "graph::symbol_links::Resolver::visible", "filePath": "core/src/graph/symbol_links.rs", "lineAtPin": 1287}
+{"n": 15, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "daemon::read_phase_in", "filePath": "core/src/daemon/mod.rs", "lineAtPin": 144}
+{"n": 16, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "daemon::semantic::SemanticPassRun", "filePath": "core/src/daemon/semantic.rs", "lineAtPin": 216}
+{"n": 17, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "cli::plugin_check::report::Report::results", "filePath": "core/src/cli/plugin_check/report.rs", "lineAtPin": 93}
+{"n": 18, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "daemon::lifecycle::DirtyQueue", "filePath": "core/src/daemon/lifecycle.rs", "lineAtPin": 128}
+{"n": 19, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "extractor::emit::Emitter::file_id", "filePath": "plugins/rust/src/extractor/emit.rs", "lineAtPin": 174}
+{"n": 20, "stratum": "other", "kind": "Variable", "nativeKind": "const", "qualifiedName": "embedding::model::EMBEDDING_DIM", "filePath": "core/src/embedding/model.rs", "lineAtPin": 93}
+{"n": 21, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "extractor::emit::Emitter::finish", "filePath": "plugins/rust/src/extractor/emit.rs", "lineAtPin": 299}
+{"n": 22, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "project::ProjectContext::load", "filePath": "plugins/python/src/project/mod.rs", "lineAtPin": 416}
+{"n": 23, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "cli::plugin_check::session::Response", "filePath": "core/src/cli/plugin_check/session.rs", "lineAtPin": 772}
+{"n": 24, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "census::pop_ctx", "filePath": "plugins/rust/src/census.rs", "lineAtPin": 107}
+{"n": 25, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "shim::wait_until_listening", "filePath": "core/src/shim.rs", "lineAtPin": 439}
+{"n": 26, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "cli::plugin_check::session::Session", "filePath": "core/src/cli/plugin_check/session.rs", "lineAtPin": 788}
+{"n": 27, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "daemon::serving_owner_path_in", "filePath": "core/src/daemon/mod.rs", "lineAtPin": 172}
+{"n": 28, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "mcp::find_implementations::ImplementationSite", "filePath": "core/src/mcp/find_implementations.rs", "lineAtPin": 59}
+{"n": 29, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "storage::index_store::IndexStore::lock", "filePath": "core/src/storage/index_store.rs", "lineAtPin": 162}
+{"n": 30, "stratum": "other", "kind": "Variable", "nativeKind": "const", "qualifiedName": "mcp::get_dependencies::IMPORT_EDGE", "filePath": "core/src/mcp/get_dependencies.rs", "lineAtPin": 31}
+{"n": 31, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "graph::traversal::frontier_nodes", "filePath": "core/src/graph/traversal.rs", "lineAtPin": 392}
+{"n": 32, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "embedding::cache::EmbeddingCache::file_sha256", "filePath": "core/src/embedding/cache.rs", "lineAtPin": 239}
+{"n": 33, "stratum": "type", "kind": "Type", "nativeKind": "enum", "qualifiedName": "daemon::candidates::Mode", "filePath": "core/src/daemon/candidates.rs", "lineAtPin": 93}
+{"n": 34, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "lsp::bridge::LspBridge::with_budgets", "filePath": "plugins/sdk/src/lsp/bridge.rs", "lineAtPin": 409}
+{"n": 35, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "paths::g_mesh_home", "filePath": "core/src/paths.rs", "lineAtPin": 35}
+{"n": 36, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "config::EmbeddingCacheConfig", "filePath": "core/src/config/mod.rs", "lineAtPin": 159}
+{"n": 37, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "daemon::plugin_pid_path", "filePath": "core/src/daemon/mod.rs", "lineAtPin": 110}
+{"n": 38, "stratum": "type", "kind": "Type", "nativeKind": "trait_impl_type", "qualifiedName": "storage::index_store::<StoreGuard as Deref>::Target", "filePath": "core/src/storage/index_store.rs", "lineAtPin": 333}
+{"n": 39, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "lsp::position::without_verbatim_prefix", "filePath": "plugins/sdk/src/lsp/position.rs", "lineAtPin": 172}
+{"n": 40, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "census::run", "filePath": "plugins/rust/src/census.rs", "lineAtPin": 184}
+{"n": 41, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "run::Session::respond_to_pass", "filePath": "plugins/sdk/src/run.rs", "lineAtPin": 556}
+{"n": 42, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "graph::symbol_links::Scope::of_node", "filePath": "core/src/graph/symbol_links.rs", "lineAtPin": 392}
+{"n": 43, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "daemon::bulk_index::WalkContext", "filePath": "core/src/daemon/bulk_index.rs", "lineAtPin": 86}
+{"n": 44, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "cli::status::excluded_by_every_language", "filePath": "core/src/cli/status.rs", "lineAtPin": 557}
+{"n": 45, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "daemon::candidates::markers_of", "filePath": "core/src/daemon/candidates.rs", "lineAtPin": 219}
+{"n": 46, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "ipc::windows::AsyncListener", "filePath": "core/src/ipc/windows.rs", "lineAtPin": 369}
+{"n": 47, "stratum": "fn", "kind": "Function", "nativeKind": "trait_impl_method", "qualifiedName": "lsp::client::<LspClient as Drop>::drop", "filePath": "plugins/sdk/src/lsp/client.rs", "lineAtPin": 601}
+{"n": 48, "stratum": "type", "kind": "Type", "nativeKind": "struct", "qualifiedName": "storage::write::EdgeRecord", "filePath": "core/src/storage/write.rs", "lineAtPin": 164}
+{"n": 49, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "graph::symbol_links::seeds", "filePath": "core/src/graph/symbol_links.rs", "lineAtPin": 642}
+{"n": 50, "stratum": "other", "kind": "Module", "nativeKind": "module", "qualifiedName": "shim", "filePath": "core/src/lib.rs", "lineAtPin": 12}
+{"n": 51, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "testing::PluginCheck::entry_points", "filePath": "plugins/sdk/src/testing.rs", "lineAtPin": 166}
+{"n": 52, "stratum": "fn", "kind": "Function", "nativeKind": "method", "qualifiedName": "shim::router::Shared::lock", "filePath": "core/src/shim/router.rs", "lineAtPin": 210}

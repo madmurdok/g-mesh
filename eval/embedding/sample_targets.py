@@ -15,12 +15,14 @@ every stratum has rows left.
 The frame is structural data only; no model output is read.
 
 `--exclude <eval dir of an earlier study>` makes the list disjoint from that
-study (GM-422 confirmatory protocol, section 3 step 3): before ordering, the
+study (GM-422 confirmatory protocol, section 3 step 3); it may be repeated,
+and the frame then drops the union over all named studies. Before ordering, the
 frame drops (a) every target the study consumed, rows 1..k of its
 `targets/<corpus>.jsonl` where k is the highest target number used by a
 query derivation or recorded in `targets/<corpus>.skips.jsonl`, and (b) every
 symbol in the `expected` set of any of its authored queries. Both match on
-filePath plus qualifiedName. The dropped counts go into `meta`.
+filePath plus qualifiedName. The dropped counts go into `meta`: `exclude` is
+one study's summary when a single study is named, a list of them otherwise.
 
 `--expect-sha256` stops unless the frame database has exactly that sha256
 (the confirmatory study samples over the D4 snapshot GM-398 embedded).
@@ -119,7 +121,12 @@ def main():
     ap.add_argument("--seed", type=int, default=398)
     ap.add_argument("--count", type=int, required=True, help="targets to emit (authoring oversamples)")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--exclude", help="eval dir of an earlier study whose targets and expected symbols are dropped")
+    ap.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="eval dir of an earlier study whose targets and expected symbols are dropped (repeatable)",
+    )
     ap.add_argument("--expect-sha256", help="stop unless the frame database has this sha256")
     args = ap.parse_args()
 
@@ -127,7 +134,11 @@ def main():
         db_sha = hashlib.sha256(f.read()).hexdigest()
     if args.expect_sha256 and db_sha != args.expect_sha256:
         sys.exit(f"STOP: {args.index_db} has sha256 {db_sha}, expected {args.expect_sha256}")
-    excluded, exclude_meta = exclusion(args.exclude, args.corpus) if args.exclude else (set(), None)
+    excluded, summaries = set(), []
+    for study in args.exclude:
+        keys, summary = exclusion(study, args.corpus)
+        excluded |= keys
+        summaries.append(summary)
 
     conn = sqlite3.connect(args.index_db)
     conn.row_factory = sqlite3.Row
@@ -199,8 +210,11 @@ def main():
         "frameSizes": {s: len(frame[s]) for s in frame},
         "dropped": dropped,
     }
-    if exclude_meta:
-        meta["exclude"] = exclude_meta
+    if len(summaries) == 1:
+        meta["exclude"] = summaries[0]
+    elif summaries:
+        meta["exclude"] = summaries
+        meta["excludeKeys"] = len(excluded)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         f.write(json.dumps({"meta": meta}) + "\n")

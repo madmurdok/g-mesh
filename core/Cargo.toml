@@ -12,6 +12,12 @@ path = "src/lib.rs"
 name = "g-mesh"
 path = "src/main.rs"
 
+[features]
+# Links ONNX Runtime's CoreML execution provider (and CoreML.framework) so
+# `debug-embed-eval run --ep coreml` can time it. Off by default: release and
+# CI builds stay CPU-only and the daemon never reads the switch.
+ep-coreml = ["ort/coreml", "dep:tracing-subscriber"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
@@ -98,8 +104,9 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 #   `EmbeddingModel` can hand out `&self` inference to a multi-threaded daemon
 #   without a mutex. rc.13 changed `run` to `&mut self`.
 #
-# No execution-provider feature is enabled on purpose: CPU-only, per
-# REQUIREMENTS.md ("работает на CPU без GPU").
+# No execution-provider feature is enabled by default: the shipped binary is
+# CPU-only, per REQUIREMENTS.md ("работает на CPU без GPU"). The opt-in
+# `ep-coreml` feature below exists only for `debug-embed-eval` measurements.
 ort = "=2.0.0-rc.9"
 # Not used directly - pinned only to hold `ort`'s own `ort-sys` dependency down.
 # `ort` rc.9 asks for `ort-sys = "2.0.0-rc.9"`, and because that is a caret
@@ -108,6 +115,9 @@ ort = "=2.0.0-rc.9"
 # has no Intel macOS entry. Without this pin the build breaks the first time
 # anyone runs `cargo update`.
 ort-sys = "=2.0.0-rc.9"
+# Prints ONNX Runtime's own log (which nodes an execution provider took) on
+# stderr; only an `ep-coreml` build has a non-CPU provider to report on.
+tracing-subscriber = { version = "0.3.23", optional = true, default-features = false, features = ["fmt", "std"] }
 rmcp = { version = "2.2.0", features = ["server", "macros"] }
 rusqlite = { version = "0.31", features = ["backup", "bundled", "hooks"] }
 schemars = "1"
@@ -188,4 +198,7 @@ windows-sys = { version = "0.61", features = [
 dirs = "5"
 rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }
 tempfile = "3"
+# The `ep-coreml` ONNX Runtime log test asks the installed subscriber which
+# targets and levels it lets through.
+tracing = "0.1"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }

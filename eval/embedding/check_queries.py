@@ -16,7 +16,7 @@ Usage: check_queries.py <corpus> [--checkout DIR] [--positives N] [--absent N]
 study uses eval/embedding/confirm); --seed is the sampling seed each
 positive's derivation must name (398 for GM-398, 4222 for GM-422);
 --disjoint-from fails any query whose text, lower-cased and stripped, equals
-an authored query text of the eval dir DIR (any corpus).
+an authored query text of the eval dir DIR (any corpus); it may be repeated.
 """
 
 import argparse
@@ -78,16 +78,16 @@ def main():
     ap.add_argument("--absent", type=int)
     ap.add_argument("--eval-dir", default=HERE)
     ap.add_argument("--seed", type=int, default=398)
-    ap.add_argument("--disjoint-from")
+    ap.add_argument("--disjoint-from", action="append", default=[])
     args = ap.parse_args()
-    earlier = set()
-    if args.disjoint_from:
-        qdir = os.path.join(args.disjoint_from, "queries")
+    earlier = {}
+    for study in args.disjoint_from:
+        qdir = os.path.join(study, "queries")
         for name in sorted(os.listdir(qdir)):
             if name.endswith(".jsonl"):
                 for line in open(os.path.join(qdir, name)):
                     if line.strip():
-                        earlier.add(json.loads(line)["text"].strip().lower())
+                        earlier.setdefault(json.loads(line)["text"].strip().lower(), study)
 
     corpus = args.corpus
     checkout = args.checkout or os.path.join(HERE, "work", "corpora", corpus)
@@ -112,8 +112,9 @@ def main():
             errors.append(f"{where}: id must start with {PREFIX[corpus]}-")
         if q.get("corpus") != corpus or q.get("language") != LANGUAGE[corpus]:
             errors.append(f"{where}: corpus/language mismatch")
-        if q.get("text", "").strip().lower() in earlier:
-            errors.append(f"{where}: text repeats a query of {args.disjoint_from}")
+        text_key = q.get("text", "").strip().lower()
+        if text_key in earlier:
+            errors.append(f"{where}: text repeats a query of {earlier[text_key]}")
         words = len(q.get("text", "").split())
         if q.get("shape") == "phrase":
             phrases += 1

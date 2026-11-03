@@ -1,0 +1,11 @@
+20:13:15 build start load={ 5.65 7.81 9.82 }
+20:19:04 build done 
+20:25:35 bench start waited=390s 20:25  up 13 days,  8:28, 9 users, load averages: 3.80 24.09 28.09
+GM695 round 0 A0 wall=701.5s before=[{ 3.99 23.46 27.82 } CPU_Speed_Limit = 51] after=[{ 53.82 53.24 45.43 } CPU_Speed_Limit = 43]
+GM695 round 1 A1 wall=631.4s before=[{ 53.82 53.24 45.43 } CPU_Speed_Limit = 43] after=[{ 105.03 57.19 47.82 } CPU_Speed_Limit = 51]
+GM695 round 2 A1 wall=580.2s before=[{ 105.03 57.19 47.82 } CPU_Speed_Limit = 51] after=[{ 54.96 48.59 49.69 } CPU_Speed_Limit = 56]
+GM695 round 3 A0 wall=686.9s before=[{ 54.96 48.59 49.69 } CPU_Speed_Limit = 56] after=[{ 166.02 117.80 79.28 } CPU_Speed_Limit = 46]
+GM695 round 4 A0 wall=749.2s before=[{ 166.02 117.80 79.28 } CPU_Speed_Limit = 46] after=[{ 117.68 187.75 155.01 } CPU_Speed_Limit = 53]
+GM695 round 5 A1 wall=697.9s before=[{ 117.68 187.75 155.01 } CPU_Speed_Limit = 53] after=[{ 72.23 130.11 148.16 } CPU_Speed_Limit = 51]
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2154 filtered out; finished in 4059.52s
+21:33:17 bench done 21:33  up 13 days,  9:35, 9 users, load averages: 72.23 130.11 148.16 | 
