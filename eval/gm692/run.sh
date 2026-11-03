@@ -23,19 +23,21 @@ log "run.sh $MODE start"; uptime >> "$OUT/run.log"
 # 1. target seed + release build (once)
 if [ ! -x "$WT/target/release/g-mesh" ]; then
   if [ ! -d "$WT/target" ]; then
-    test -z "$(pgrep -fl -- '[-]-out-dir '$MAIN'/target' || true)" || { log "main target busy"; exit 1; }
+    test -z "$(pgrep -fl -- '[-]-out-dir '"$MAIN"'/target' || true)" || { log "main target busy"; exit 1; }
     cp -c -R "$MAIN/target" "$WT/target"
   fi
-  test -z "$(pgrep -fl -- '[-]-out-dir '$WT'/target' || true)" || { log "wt target busy"; exit 1; }
+  test -z "$(pgrep -fl -- '[-]-out-dir '"$WT"'/target' || true)" || { log "wt target busy"; exit 1; }
   ( cd "$WT" && /usr/bin/time -p cargo build --release --workspace ) >> "$OUT/build.log" 2>&1
   grep -E '^(real|user|sys)' "$OUT/build.log" >> "$OUT/run.log"
 fi
 BIN=$WT/target/release/g-mesh
-"$BIN" --version >> "$OUT/run.log" 2>&1
-git -C "$WT" rev-parse HEAD >> "$OUT/run.log"
-# 2. LSP plugin deps
-(cd "$WT/plugins/typescript" && npm ci --no-audit --no-fund) >> "$OUT/run.log" 2>&1
-(cd "$WT/plugins/python" && if [ -f package.json ]; then npm ci --no-audit --no-fund; fi) >> "$OUT/run.log" 2>&1
+{
+  "$BIN" --version 2>&1
+  git -C "$WT" rev-parse HEAD
+  # 2. LSP plugin deps
+  (cd "$WT/plugins/typescript" && npm ci --no-audit --no-fund) 2>&1
+  (cd "$WT/plugins/python" && if [ -f package.json ]; then npm ci --no-audit --no-fund; fi) 2>&1
+} >> "$OUT/run.log"
 # 3. project P: detached worktree of db1074a (GM-690's project), clean
 P=$SCR/P
 if [ ! -d "$P" ]; then git -C "$WT" worktree add --detach "$P" db1074a >> "$OUT/run.log" 2>&1; fi
@@ -57,10 +59,12 @@ shasum -a 256 "$RERANK/model.onnx" "$RERANK/tokenizer.json" >> "$OUT/run.log"
 mkdir -p "$H/old-logs"; for f in "$H"/daemon-*.log; do [ -e "$f" ] && mv "$f" "$H/old-logs/$(date +%s)-$(basename "$f")"; done || true
 ARGS=()
 if [ "$MODE" = dry ]; then ARGS=(--only-reps 1); fi
-uptime >> "$OUT/run.log"
-/usr/bin/time -p python3 "$HERE/repro.py" --bin "$BIN" --home "$H" --work "$SCR" --out "$OUT" \
-  --progress "$PROG" --rerank-dir "$RERANK" ${ARGS[@]+"${ARGS[@]}"} >> "$OUT/run.log" 2>&1
-uptime >> "$OUT/run.log"
+{
+  uptime
+  /usr/bin/time -p python3 "$HERE/repro.py" --bin "$BIN" --home "$H" --work "$SCR" --out "$OUT" \
+    --progress "$PROG" --rerank-dir "$RERANK" ${ARGS[@]+"${ARGS[@]}"} 2>&1
+  uptime
+} >> "$OUT/run.log"
 python3 "$HERE/summarize.py" "$OUT/raw.jsonl" "$H"/daemon-*.log > "$OUT/summary.md"
 while read -r pid; do if kill -0 "$pid" 2>/dev/null; then echo "LEFT daemon $pid" >> "$OUT/summary.md"; fi; done < "$OUT/pids.txt"
 log "run.sh $MODE end"
