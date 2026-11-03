@@ -152,9 +152,46 @@ pub(crate) fn is_noise(input: &EmbedInput) -> bool {
     input.kind == "Module" || is_test(input)
 }
 
+/// The backfill's embedding order: every candidate of one tier is embedded
+/// before any of the next, in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum EmbedTier {
+    /// Not a test, `visibility = 'public'`.
+    Public,
+    /// Not a test, any other visibility.
+    Private,
+    /// A test node (see [`is_test`]), whatever its visibility.
+    Test,
+}
+
+impl EmbedTier {
+    /// Every tier, in embedding order.
+    pub(crate) const ALL: [EmbedTier; 3] = [EmbedTier::Public, EmbedTier::Private, EmbedTier::Test];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            EmbedTier::Public => "public",
+            EmbedTier::Private => "private",
+            EmbedTier::Test => "test",
+        }
+    }
+}
+
+/// The tier of a node with this `visibility` (`nodes.visibility`). A test
+/// node is [`EmbedTier::Test`] whatever its visibility.
+pub(crate) fn embed_tier(input: &EmbedInput, visibility: &str) -> EmbedTier {
+    if is_test(input) {
+        EmbedTier::Test
+    } else if visibility == "public" {
+        EmbedTier::Public
+    } else {
+        EmbedTier::Private
+    }
+}
+
 /// A node in a test file, named `test*`/`Test*`, or inside a Rust inline
 /// `tests` module.
-fn is_test(input: &EmbedInput) -> bool {
+pub(crate) fn is_test(input: &EmbedInput) -> bool {
     is_test_path(input.file_path)
         || input.name.starts_with("test")
         || input.name.starts_with("Test")
@@ -731,5 +768,55 @@ pub(crate) mod tests {
         assert!(node_text(&plain).is_some(), "sanity: the unflagged node embeds");
         let generated = EmbedInput { generated: true, ..input(&node) };
         assert_eq!(node_text(&generated), None);
+    }
+
+    /// A non-test node is public or private by its visibility, and
+    /// a test node is a test whatever its visibility; the tiers embed in the
+    /// order public, private, test.
+    /// Controls: drop `embed_tier`'s `is_test` branch (a public test node
+    /// reads Public); compare `visibility != "private"` instead of
+    /// `== "public"` (a `file` node reads Public).
+    #[test]
+    fn embed_tier_classifies_public_private_and_test_and_test_wins() {
+        let lib: Node =
+            ("Function", "read", "crate::io::read", "core/src/io.rs", Some("Reads."), "pub fn read()");
+        assert_eq!(embed_tier(&input(&lib), "public"), EmbedTier::Public);
+        for visibility in ["file", "container", "private", ""] {
+            assert_eq!(embed_tier(&input(&lib), visibility), EmbedTier::Private, "{visibility:?}");
+        }
+        let tests: &[Node] = &[
+            (
+                "Function",
+                "reads_it",
+                "crate::reads_it",
+                "core/tests/it/io.rs",
+                Some("Checks it."),
+                "fn reads_it()",
+            ),
+            (
+                "Function",
+                "test_read",
+                "crate::io::test_read",
+                "core/src/io.rs",
+                Some("Checks it."),
+                "fn test_read()",
+            ),
+            ("Class", "TestRead", "TestRead", "src/io.ts", Some("Checks it."), "class TestRead"),
+            (
+                "Function",
+                "reads_it",
+                "crate::io::tests::reads_it",
+                "core/src/io.rs",
+                Some("Checks it."),
+                "fn reads_it()",
+            ),
+        ];
+        for node in tests {
+            for visibility in ["public", "file", "container"] {
+                assert_eq!(embed_tier(&input(node), visibility), EmbedTier::Test, "{node:?} {visibility:?}");
+            }
+        }
+        assert_eq!(EmbedTier::ALL, [EmbedTier::Public, EmbedTier::Private, EmbedTier::Test]);
+        assert!(EmbedTier::Public < EmbedTier::Private && EmbedTier::Private < EmbedTier::Test);
     }
 }

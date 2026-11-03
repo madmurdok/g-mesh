@@ -377,12 +377,17 @@ fn model_dir(explicit: Option<&Path>, model: &ResolvedModel) -> Result<PathBuf> 
 ///
 /// `rerank_dir` is where the rerank model goes (`$G_MESH_RERANK_MODEL_DIR`,
 /// else `~/.g-mesh/models/ms-marco-MiniLM-L6-v2`), or `None` to skip it
-/// (`--no-rerank`).
+/// (`--no-rerank`). The rerank model does not depend on the embedding model,
+/// so a refused embedding fetch still fetches it, then fails with the refusal.
 fn fetch(explicit: Option<&Path>, rerank_dir: Option<&Path>, out: &mut impl Write) -> Result<()> {
     let model = resolved_model();
-    // Before the directory is created, so a refused fetch leaves nothing
-    // behind - the same posture the rest of this command already takes.
+    // Before the embedding directory is created, so a refused fetch leaves
+    // nothing behind there.
     if let Some(refusal) = fetch_refusal(explicit, &model, &model_dir(None, &model)?) {
+        if let Some(rerank_dir) = rerank_dir {
+            fetch_rerank(&http_agent(), rerank_dir, &sources(), out)?;
+            writeln!(out)?;
+        }
         bail!("{refusal}");
     }
 
@@ -395,12 +400,23 @@ fn fetch(explicit: Option<&Path>, rerank_dir: Option<&Path>, out: &mut impl Writ
     writeln!(out, "\nmodel ready in {}", dir.display())?;
 
     if let Some(rerank_dir) = rerank_dir {
-        fs::create_dir_all(rerank_dir)
-            .with_context(|| format!("failed to create model directory {}", rerank_dir.display()))?;
-        writeln!(out, "\nrerank model directory: {}", rerank_dir.display())?;
-        fetch_files(&agent, rerank_dir, &RERANK_FILES, &sources, out)?;
-        writeln!(out, "\nrerank model ready in {}", rerank_dir.display())?;
+        writeln!(out)?;
+        fetch_rerank(&agent, rerank_dir, &sources, out)?;
     }
+    Ok(())
+}
+
+fn fetch_rerank(
+    agent: &ureq::Agent,
+    rerank_dir: &Path,
+    sources: &[Source],
+    out: &mut impl Write,
+) -> Result<()> {
+    fs::create_dir_all(rerank_dir)
+        .with_context(|| format!("failed to create model directory {}", rerank_dir.display()))?;
+    writeln!(out, "rerank model directory: {}", rerank_dir.display())?;
+    fetch_files(agent, rerank_dir, &RERANK_FILES, sources, out)?;
+    writeln!(out, "\nrerank model ready in {}", rerank_dir.display())?;
     Ok(())
 }
 

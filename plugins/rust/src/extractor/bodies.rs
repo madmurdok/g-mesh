@@ -162,9 +162,9 @@ pub(crate) struct Bodies<'a, 's> {
     /// module level.
     pub(crate) enclosing_fns: Vec<QualifiedPath>,
     /// The name [`Self::declare_impl_block`] gave each impl block, keyed by
-    /// the block's unsuffixed qualified name and the start byte of the node
-    /// holding it (its scope), so siblings of one scope resolve to one name.
-    pub(crate) impl_block_names: HashMap<(String, usize), String>,
+    /// the block's unsuffixed qualified name and its scope (see
+    /// [`impl_block_scope`]), so siblings of one scope resolve to one name.
+    pub(crate) impl_block_names: HashMap<(String, Vec<u32>), String>,
 }
 
 impl Bodies<'_, '_> {
@@ -1667,10 +1667,12 @@ impl Bodies<'_, '_> {
     /// [`Emitter::declare`]'s first-wins rule. A non-colliding block keeps
     /// its plain name.
     ///
-    /// Blocks with one name in one scope (the node holding them, such as a
-    /// `{ }` block or a module body) are one block, as with every other
-    /// item: `#[cfg(a)]` and `#[cfg(not(a))]` alternatives are siblings and
-    /// resolve to the name the first of them was given.
+    /// Blocks with one name in one scope (see [`impl_block_scope`]: the
+    /// anonymous `{ }` blocks within a named owner, such as a fn or a module
+    /// body) are one block, as with every other item: `#[cfg(a)]` and
+    /// `#[cfg(not(a))]` alternatives are siblings, and the blocks nested in
+    /// their bodies are one scope, so they resolve to the name the first of
+    /// them was given.
     ///
     /// `public`, because a trait impl's reach is the trait's and the type's,
     /// never narrower - the same reasoning [`impl_block`] already applies to
@@ -1842,9 +1844,62 @@ impl Bodies<'_, '_> {
 }
 
 /// The scope an impl block sits in, as [`Bodies::impl_block_names`] keys it:
-/// the start byte of the node holding it.
-fn impl_block_scope(item: Node) -> usize {
-    item.parent().map_or(0, |parent| parent.start_byte())
+/// for each `{ }` block around it, innermost first, that block's ordinal
+/// among the blocks of its owner (the enclosing fn, module or file), counted
+/// in source order without descending into nested owners. The key does not
+/// depend on byte offsets, so the bodies of `#[cfg]` alternatives that merge
+/// into one node are one scope, while distinct blocks of one owner stay
+/// distinct.
+fn impl_block_scope(item: Node) -> Vec<u32> {
+    let mut key = Vec::new();
+    let mut node = item.parent();
+    while let Some(current) = node {
+        if current.kind() == "block" {
+            key.push(block_ordinal(current));
+        }
+        node = current.parent();
+    }
+    key
+}
+
+fn is_scope_owner(node: Node) -> bool {
+    matches!(node.kind(), "function_item" | "source_file" | "mod_item")
+}
+
+fn block_ordinal(block: Node) -> u32 {
+    let mut owner = block.parent();
+    while let Some(o) = owner {
+        if is_scope_owner(o) {
+            break;
+        }
+        owner = o.parent();
+    }
+    let Some(owner) = owner else { return 0 };
+    let mut count = 0;
+    count_blocks_before(owner, block, &mut count);
+    count
+}
+
+fn count_blocks_before(node: Node, target: Node, count: &mut u32) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.id() == target.id() {
+            return true;
+        }
+        if child.start_byte() > target.start_byte() {
+            return true;
+        }
+        if is_scope_owner(child) {
+            continue;
+        }
+        if child.kind() == "block" {
+            *count += 1;
+        }
+        if count_blocks_before(child, target, count) {
+            return true;
+        }
+    }
+    false
 }
 
 /// What a typed receiver is, for the census: a local, a field, or a call,

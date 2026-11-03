@@ -37,8 +37,30 @@
 //! (counted as [`BackfillSummary::filtered`], not as owed a vector); the first
 //! visit deletes a vector it had. Paging strictly
 //! past the last id a page saw, ordered by id, guarantees every candidate at
-//! the moment this pass started is visited exactly once, however many of
-//! them end up unembedded anyway.
+//! the moment this pass started is visited exactly once per scan, however
+//! many of them end up unembedded anyway.
+//!
+//! # Embedding order
+//!
+//! The pass embeds by [`EmbedTier`]: public non-test nodes first, then
+//! non-public non-test nodes, then test nodes (`embedding::text::embed_tier`;
+//! a test node is in the test tier whatever its visibility). It runs one
+//! keyset scan per tier over the same candidate set, and each scan hands
+//! `compute` only the rows of its own tier that no earlier scan handed it, so:
+//!
+//! - a candidate whose tier does not change mid-pass is processed exactly
+//!   once, and `embed_done` ends at `embed_total`;
+//! - no candidate is processed twice in a pass, even one that gets no vector
+//!   (noise, empty text) and whose tier moves to a later one mid-pass, so
+//!   `embed_done` never exceeds the candidates counted into `embed_total`;
+//! - a node embedded by the watcher during the pass is no longer a
+//!   candidate, so later scans do not reach it;
+//! - a node whose tier changes mid-pass can be missed by every scan; it
+//!   stays a candidate and the next start embeds it.
+//!
+//! The order changes nothing once the pass completes: the same set of nodes
+//! gets the same vectors. `Phase::Ready` still comes only at the end of the
+//! whole pass.
 //!
 //! # No schema or indexer-version bump
 //!
@@ -73,10 +95,12 @@
 //! generation. It runs ahead of the model check, since deleting needs no
 //! model; an interrupted purge records nothing and runs again next start.
 
+use std::collections::HashSet;
+
 use rusqlite::{Connection, Result as SqlResult};
 
 use crate::daemon::indexing_status::IndexingStatus;
-use crate::embedding::text::{is_noise, EmbedInput, NOISE_RULE_VERSION};
+use crate::embedding::text::{embed_tier, is_noise, EmbedInput, EmbedTier, NOISE_RULE_VERSION};
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
 use crate::storage::index_store::{IndexStore, Unit};
 use crate::storage::write::{Diff, NodeRecord};
@@ -177,33 +201,58 @@ pub fn run(store: &IndexStore, embedding: &EmbeddingPipeline, progress: &Indexin
         let started = std::time::Instant::now();
         let mut stats = EmbedStats::default();
         let candidates = candidates.max(0) as usize;
-        let mut after_id: Option<String> = None;
         let mut filtered = 0;
+        // Ids handed to compute in this pass; one that got no vector is still
+        // a candidate in later scans and must not be handed again.
+        let mut handed: HashSet<String> = HashSet::new();
 
-        loop {
-            let page = match store.step(|conn| fetch_candidate_page(conn, version, after_id.as_deref(), PAGE_SIZE)) {
-                Ok(page) => page,
-                Err(err) => {
-                    crate::log_line!(
-                        "g-mesh daemon: failed to read a page of nodes owed an embedding, stopping the \
-                         backfill pass early ({err:#})"
-                    );
+        'tiers: for tier in EmbedTier::ALL {
+            let tier_started = std::time::Instant::now();
+            let mut tier_len = 0usize;
+            let mut after_id: Option<String> = None;
+            loop {
+                let page =
+                    match store.step(|conn| fetch_candidate_page(conn, version, after_id.as_deref(), PAGE_SIZE)) {
+                        Ok(page) => page,
+                        Err(err) => {
+                            crate::log_line!(
+                                "g-mesh daemon: failed to read a page of nodes owed an embedding, stopping the \
+                                 backfill pass early ({err:#})"
+                            );
+                            break 'tiers;
+                        }
+                    };
+                if page.is_empty() {
                     break;
                 }
-            };
-            if page.is_empty() {
-                break;
-            }
-            after_id = Some(page.last().expect("just checked non-empty").id.clone());
-            let page_len = page.len() as u64;
+                after_id = Some(page.last().expect("just checked non-empty").id.clone());
 
-            let diff =
-                Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
-            // Inference runs between the unit's steps.
-            let computed = embedding.compute(&diff, &mut stats);
-            filtered += computed.dropped_len();
-            store.store_vectors(embedding, &computed);
-            progress.add_embed_done(page_len);
+                // Every scan reads all candidates; a row is handed to compute
+                // and counted as done only in its own tier's scan and only
+                // once per pass, so `embed_done` never exceeds `embed_total`.
+                let nodes: Vec<NodeRecord> = page
+                    .into_iter()
+                    .filter(|candidate| candidate_tier(candidate) == tier && handed.insert(candidate.id.clone()))
+                    .map(to_node_record)
+                    .collect();
+                if nodes.is_empty() {
+                    continue;
+                }
+                let nodes_len = nodes.len();
+                tier_len += nodes_len;
+
+                let diff = Diff { upsert_nodes: nodes, ..Default::default() };
+                // Inference runs between the unit's steps.
+                let computed = embedding.compute(&diff, &mut stats);
+                filtered += computed.dropped_len();
+                store.store_vectors(embedding, &computed);
+                progress.add_embed_done(nodes_len as u64);
+            }
+            crate::log_line!(
+                "g-mesh daemon: embedding backfill finished the {} tier: {tier_len} candidates in {:.1}s",
+                tier.as_str(),
+                tier_started.elapsed().as_secs_f64()
+            );
         }
 
         embedding.finish_unit("backfill", &stats, started.elapsed());
@@ -302,9 +351,11 @@ fn purge_noise_page(
 }
 
 /// One candidate row: a node's id plus the columns
-/// [`EmbeddingPipeline::compute`] actually reads.
+/// [`EmbeddingPipeline::compute`] actually reads, and the `visibility`
+/// [`candidate_tier`] reads.
 struct Candidate {
     id: String,
+    visibility: String,
     kind: String,
     name: String,
     qualified_name: String,
@@ -322,11 +373,26 @@ struct Candidate {
 /// row before writing anything, so a filler language here can never leak
 /// into a stored answer.
 fn to_node_record(candidate: Candidate) -> NodeRecord {
-    let Candidate { id, kind, name, qualified_name, file_path, doc_comment, signature } = candidate;
+    let Candidate { id, visibility: _, kind, name, qualified_name, file_path, doc_comment, signature } =
+        candidate;
     let mut node = NodeRecord::new(id, kind, name, qualified_name, file_path, "");
     node.doc_comment = doc_comment;
     node.signature = signature;
     node
+}
+
+/// The embedding tier `candidate` belongs to.
+fn candidate_tier(candidate: &Candidate) -> EmbedTier {
+    let input = EmbedInput {
+        kind: &candidate.kind,
+        name: &candidate.name,
+        qualified_name: &candidate.qualified_name,
+        file_path: &candidate.file_path,
+        doc: candidate.doc_comment.as_deref(),
+        signature: candidate.signature.as_deref(),
+        generated: false,
+    };
+    embed_tier(&input, &candidate.visibility)
 }
 
 /// Total rows this pass owes the project right now: every node with
@@ -355,7 +421,7 @@ fn fetch_candidate_page(
     limit: i64,
 ) -> SqlResult<Vec<Candidate>> {
     let mut stmt = conn.prepare(
-        "SELECT n.id, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
+        "SELECT n.id, n.visibility, n.kind, n.name, n.qualifiedName, n.filePath, n.docComment, n.signature \
          FROM nodes n LEFT JOIN vectors v ON v.nodeId = n.id \
          WHERE (v.nodeId IS NULL OR v.embeddingVersion != ?3) \
          AND (n.docComment IS NOT NULL OR n.signature IS NOT NULL) AND n.generated = 0 \
@@ -367,12 +433,13 @@ fn fetch_candidate_page(
     let rows = stmt.query_map(rusqlite::params![after_id.unwrap_or(""), limit, version], |row| {
         Ok(Candidate {
             id: row.get(0)?,
-            kind: row.get(1)?,
-            name: row.get(2)?,
-            qualified_name: row.get(3)?,
-            file_path: row.get(4)?,
-            doc_comment: row.get(5)?,
-            signature: row.get(6)?,
+            visibility: row.get(1)?,
+            kind: row.get(2)?,
+            name: row.get(3)?,
+            qualified_name: row.get(4)?,
+            file_path: row.get(5)?,
+            doc_comment: row.get(6)?,
+            signature: row.get(7)?,
         })
     })?;
     rows.collect()
@@ -409,6 +476,9 @@ fn panic_before_first_batch_for_tests() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::storage::schema;
     use crate::storage::write::apply_diff;
@@ -808,5 +878,235 @@ mod tests {
         let second = run(&store, &pipeline, &IndexingStatus::structural());
         assert_eq!((second.candidates, second.filtered, second.embedded), (0, 0, 0), "{second:?}");
         assert_eq!(vector_ids(&store), vec!["read"]);
+    }
+
+    // The tiered pass. Every test below names its control.
+
+    /// A documented node of `tier` whose text is `doc {id}`: a test node
+    /// lives under `core/tests/` and is `public` when `public` is set (a test
+    /// whatever its visibility); any other node is `public` or `file` by
+    /// its tier.
+    fn tiered(id: &str, tier: EmbedTier, public: bool) -> NodeRecord {
+        let path = if tier == EmbedTier::Test { "core/tests/it/x.rs" } else { "core/src/x.rs" };
+        let mut node = NodeRecord::new(id, "Function", id, format!("crate::{id}"), path, "rust");
+        node.doc_comment = Some(format!("doc {id}"));
+        let public = match tier {
+            EmbedTier::Public => true,
+            EmbedTier::Private => false,
+            EmbedTier::Test => public,
+        };
+        node.visibility = if public { "public" } else { "file" }.to_string();
+        node
+    }
+
+    /// A model that records each text and runs `hook` on it before
+    /// answering: the hook stands in for a watcher writing between scans.
+    struct HookedEmbedder {
+        received: Arc<Mutex<Vec<String>>>,
+        hook: Arc<dyn Fn(&str) + Send + Sync>,
+    }
+
+    impl crate::embedding::pipeline::Embedder for HookedEmbedder {
+        fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.received.lock().unwrap().push(text.to_string());
+            (self.hook)(text);
+            Ok(crate::embedding::pipeline::test_support::fake_vector(text))
+        }
+    }
+
+    /// A pipeline over [`HookedEmbedder`], and the texts it receives.
+    fn hooked_pipeline(
+        model_dir: &std::path::Path,
+        hook: impl Fn(&str) + Send + Sync + 'static,
+    ) -> (EmbeddingPipeline, Arc<Mutex<Vec<String>>>) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let hook: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(hook);
+        let shared = Arc::clone(&received);
+        let pipeline = EmbeddingPipeline::with_loader(
+            model_dir,
+            move |_dir| {
+                Ok(Box::new(HookedEmbedder { received: Arc::clone(&shared), hook: Arc::clone(&hook) })
+                    as Box<dyn crate::embedding::pipeline::Embedder>)
+            },
+            None,
+        );
+        (pipeline, received)
+    }
+
+    fn model_dir(scratch: &tempfile::TempDir) -> std::path::PathBuf {
+        crate::storage::vectors::register_extension();
+        crate::embedding::pipeline::test_support::fake_model_dir(&scratch.path().join("model"), "weights v1")
+    }
+
+    /// Every `vectors` row: `(nodeId, embedding, embeddingVersion)`.
+    fn vector_rows(store: &IndexStore) -> Vec<(String, Vec<u8>, String)> {
+        store.with(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT nodeId, embedding, embeddingVersion FROM vectors ORDER BY nodeId")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<SqlResult<_>>()
+                .unwrap()
+        })
+    }
+
+    /// Behaviours 2, 3, 5 and 8: with tiers interleaved by id over several
+    /// pages, every public node reaches the model before any private one and
+    /// every private one before any test one; each candidate reaches it
+    /// once; the pass returns only after the test tier, with
+    /// `embed_done == embed_total`.
+    /// Controls: drop `candidate_tier(candidate) == tier &&` from `run`'s
+    /// filter (id order: the tiers interleave); iterate only the first two
+    /// tiers (the test nodes get no vector, `embed_done` stops at 600).
+    #[test]
+    fn the_pass_embeds_public_then_private_then_test_nodes_once_each_when_ids_interleave() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (pipeline, received) = hooked_pipeline(&model_dir(&scratch), |_| {});
+        let tiers = [EmbedTier::Test, EmbedTier::Public, EmbedTier::Private];
+        let nodes: Vec<NodeRecord> =
+            (0..900).map(|i| tiered(&format!("n{i:04}"), tiers[i % 3], i % 2 == 0)).collect();
+        assert!(nodes.len() as i64 > 3 * PAGE_SIZE, "sanity: each scan reads several pages");
+        let tier_of: HashMap<String, EmbedTier> =
+            (0..900).map(|i| (format!("n{i:04}"), tiers[i % 3])).collect();
+        let store = index_with(nodes, &[]);
+        let progress = IndexingStatus::structural();
+
+        let summary = run(&store, &pipeline, &progress);
+
+        let received = received.lock().unwrap().clone();
+        let ids: Vec<&str> =
+            received.iter().map(|t| t.strip_prefix("doc ").expect("a fixture text")).collect();
+        let order: Vec<EmbedTier> = ids.iter().map(|id| tier_of[*id]).collect();
+        if let Some(at) = order.windows(2).position(|w| w[0] > w[1]) {
+            panic!(
+                "{} ({:?}) reached the model before {} ({:?})",
+                ids[at + 1],
+                order[at + 1],
+                ids[at],
+                order[at]
+            );
+        }
+        let unique: HashSet<&str> = ids.iter().copied().collect();
+        assert_eq!((ids.len(), unique.len()), (900, 900), "each candidate reaches the model exactly once");
+        assert_eq!(vector_ids(&store).len(), 900);
+        assert_eq!(progress.embed_progress(), (900, 900), "(embed_done, embed_total)");
+        assert_eq!((summary.candidates, summary.filtered, summary.embedded), (900, 0, 900), "{summary:?}");
+    }
+
+    /// Behaviours 4, 5 and 6: the tiered pass stores the same vectors as one
+    /// id-order pass over the same candidates (one page, one `compute`);
+    /// noise of every tier is counted as filtered once and gets no vector, a
+    /// generated node is not even a candidate.
+    /// Controls: iterate only the first two tiers (the test nodes' vectors
+    /// are missing); drop `AND n.generated = 0` from `fetch_candidate_page`
+    /// (`g_gen` is counted as filtered: 3, not 2).
+    #[test]
+    fn the_tiered_pass_stores_the_vectors_of_an_id_order_pass() {
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = model_dir(&scratch);
+        let nodes = || {
+            let tiers = [EmbedTier::Private, EmbedTier::Test, EmbedTier::Public];
+            let mut nodes: Vec<NodeRecord> =
+                (0..30).map(|i| tiered(&format!("n{i:02}"), tiers[i % 3], i % 2 == 1)).collect();
+            let mut public_noise = noise_module("m_public");
+            public_noise.visibility = "public".to_string();
+            nodes.push(public_noise);
+            nodes.push(node("test_noise", None, Some("fn test_noise()")));
+            nodes.push(generated("g_gen"));
+            nodes
+        };
+
+        let (pipeline, _) = hooked_pipeline(&model_dir, |_| {});
+        let tiered_store = index_with(nodes(), &[]);
+        let progress = IndexingStatus::structural();
+        let summary = run(&tiered_store, &pipeline, &progress);
+
+        let (reference_pipeline, _) = hooked_pipeline(&model_dir, |_| {});
+        let id_order = index_with(nodes(), &[]);
+        let version = reference_pipeline.embedding_version().to_string();
+        let page = id_order.with(|conn| fetch_candidate_page(conn, &version, None, i64::MAX)).unwrap();
+        let diff =
+            Diff { upsert_nodes: page.into_iter().map(to_node_record).collect(), ..Default::default() };
+        let computed = reference_pipeline.compute(&diff, &mut EmbedStats::default());
+        id_order.unit(Unit::Backfill, |store| store.store_vectors(&reference_pipeline, &computed));
+
+        let rows = vector_rows(&tiered_store);
+        assert_eq!(rows.len(), 30, "{:?}", rows.iter().map(|r| &r.0).collect::<Vec<_>>());
+        assert_eq!(rows, vector_rows(&id_order), "the tiered pass stores the id-order pass's vectors");
+        assert_eq!((summary.candidates, summary.filtered, summary.embedded), (32, 2, 30), "{summary:?}");
+        assert_eq!(progress.embed_progress(), (32, 32), "(embed_done, embed_total)");
+    }
+
+    /// A candidate that gets no vector (noise) stays a candidate
+    /// after its scan; when the watcher moves it to a later tier mid-pass,
+    /// the later scan does not hand it to `compute` again, so it is filtered
+    /// once and `embed_done` never passes `embed_total`.
+    /// Control: drop `&& handed.insert(candidate.id.clone())` from `run`
+    /// (filtered 2, `embed_done` 3 of 2).
+    #[test]
+    fn a_no_vector_node_moved_to_a_later_tier_mid_pass_is_handed_to_compute_once() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut noise = noise_module("a_noise");
+        noise.visibility = "public".to_string();
+        let store = Arc::new(index_with(vec![noise, tiered("b_pub", EmbedTier::Public, true)], &[]));
+        let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (watcher, flag) = (Arc::clone(&store), Arc::clone(&moved));
+        // `a_noise` and `b_pub` share the public scan's one page, and the
+        // page is filtered before `compute` runs: `a_noise` was handed.
+        let (pipeline, _) = hooked_pipeline(&model_dir(&scratch), move |text| {
+            if text == "doc b_pub" {
+                watcher.with(|conn| {
+                    conn.execute("UPDATE nodes SET visibility = 'file' WHERE id = 'a_noise'", []).unwrap()
+                });
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let progress = IndexingStatus::structural();
+
+        let summary = run(&store, &pipeline, &progress);
+
+        assert!(moved.load(std::sync::atomic::Ordering::SeqCst), "sanity: the watcher stand-in ran");
+        assert_eq!((summary.candidates, summary.filtered, summary.embedded), (2, 1, 1), "{summary:?}");
+        assert_eq!(progress.embed_progress(), (2, 2), "(embed_done, embed_total)");
+        assert_eq!(vector_ids(&store), vec!["b_pub"]);
+    }
+
+    /// Behaviour 7: a candidate the watcher embeds at the current version
+    /// while an earlier tier runs is no candidate by its own scan, so it does
+    /// not reach the model again.
+    /// Control: drop `(v.nodeId IS NULL OR v.embeddingVersion != ?3) AND`
+    /// from `fetch_candidate_page` (`b_priv` reaches the model).
+    #[test]
+    fn a_node_the_watcher_embeds_mid_pass_is_not_embedded_again() {
+        let scratch = tempfile::tempdir().unwrap();
+        let store = Arc::new(index_with(
+            vec![
+                tiered("a_pub", EmbedTier::Public, true),
+                tiered("b_priv", EmbedTier::Private, false),
+                tiered("c_test", EmbedTier::Test, true),
+            ],
+            &[],
+        ));
+        let version = Arc::new(std::sync::OnceLock::<String>::new());
+        let (watcher, current) = (Arc::clone(&store), Arc::clone(&version));
+        let (pipeline, received) = hooked_pipeline(&model_dir(&scratch), move |text| {
+            if text == "doc a_pub" {
+                let vector = crate::embedding::pipeline::test_support::fake_vector("doc b_priv");
+                let version = current.get().expect("set before the pass");
+                watcher
+                    .with(|conn| crate::storage::vectors::insert(conn, "b_priv", &vector, version).unwrap());
+            }
+        });
+        version.set(pipeline.embedding_version().to_string()).unwrap();
+        let progress = IndexingStatus::structural();
+
+        let summary = run(&store, &pipeline, &progress);
+
+        assert_eq!(*received.lock().unwrap(), vec!["doc a_pub".to_string(), "doc c_test".to_string()]);
+        assert_eq!(vector_ids(&store), vec!["a_pub", "b_priv", "c_test"]);
+        assert_eq!(summary.candidates, 3, "{summary:?}");
+        let (done, total) = progress.embed_progress();
+        assert!(done <= total, "embed_done {done} > embed_total {total}");
     }
 }

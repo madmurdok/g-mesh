@@ -18,6 +18,7 @@ mod cli_clean;
 mod cli_clean_sweeping;
 mod cli_deps;
 mod cli_init;
+mod cli_model_fetch;
 mod cli_reindex;
 mod cli_status;
 mod cli_stop;

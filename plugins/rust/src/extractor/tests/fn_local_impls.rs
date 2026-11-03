@@ -5,7 +5,8 @@
 //! still taken by another scope of the file is suffixed `#2`, `#3`, ... in
 //! source order. Blocks of one name in one scope (such as `#[cfg]`
 //! alternatives, which are siblings) are one block, merged as every other
-//! item is.
+//! item is; so are blocks nested in the bodies of such alternatives, because
+//! a scope is a block's position within its named owner, not a byte offset.
 //!
 //! Its own module, so these tests stay apart from the parent file's; the
 //! helpers are the parent's.
@@ -332,4 +333,217 @@ fn methods_of_each_module_level_impl_block_are_qualified_by_their_block() {
     }
     assert!(graph.0.nodes.iter().all(|node| !node.qualified_name.contains('#')), "{:#?}", graph.names());
     assert_paths_are_well_formed(&graph);
+}
+
+/// The traits every GM-691 fixture below implements.
+const GM691_TRAITS: &str = "pub trait Tr { fn x(&self); }\npub trait U {}\n";
+
+/// Extracts `GM691_TRAITS` followed by `body` as `src/lib.rs`.
+fn extract_gm691(body: &str) -> Graph {
+    Crate::new(&[("src/lib.rs", &format!("{GM691_TRAITS}{body}"))]).extract("src/lib.rs")
+}
+
+/// A block nested in a method of merged `#[cfg]` alternatives of a
+/// fn-local impl is one node, at the first alternative; three levels deep
+/// (a block in a method of a block in a method of the merged alternatives)
+/// no `#` appears anywhere.
+///
+/// Control: restore `impl_block_scope` to `vec![parent.start_byte()]` (the
+/// byte offset of the enclosing block) - `g::<L as Tr>::x::<M as U>#2` and
+/// `f::<K as Tr>::x::<M as Tr>#2` appear.
+#[test]
+fn a_block_nested_in_a_method_of_merged_cfg_alternatives_is_one_node() {
+    let graph = extract_gm691(
+        "pub fn g() {\n struct L;\n \
+         #[cfg(a)] impl Tr for L { fn x(&self) { struct M; impl U for M {} } }\n \
+         #[cfg(not(a))] impl Tr for L { fn x(&self) { struct M; impl U for M {} } }\n}\n",
+    );
+    assert_eq!(
+        impl_blocks(&graph),
+        vec!["g::<L as Tr>", "g::<L as Tr>::x::<M as U>"],
+        "{:#?}",
+        graph.names()
+    );
+    assert_block(&graph, "g::<L as Tr>::x::<M as U>", "<M as U>", "U");
+    assert_eq!(graph.node("g::<L as Tr>::x::<M as U>").range.start.line, 4, "the first alternative's block");
+    assert_paths_are_well_formed(&graph);
+
+    let graph = extract_gm691(
+        "pub fn f() {\n struct K;\n \
+         #[cfg(a)] impl Tr for K { fn x(&self) { struct M; impl Tr for M { fn x(&self) { struct N; impl U for N {} } } } }\n \
+         #[cfg(not(a))] impl Tr for K { fn x(&self) { struct M; impl Tr for M { fn x(&self) { struct N; impl U for N {} } } } }\n}\n",
+    );
+    assert_eq!(
+        impl_blocks(&graph),
+        vec!["f::<K as Tr>", "f::<K as Tr>::x::<M as Tr>", "f::<K as Tr>::x::<M as Tr>::x::<N as U>"],
+        "{:#?}",
+        graph.names()
+    );
+    assert!(graph.0.nodes.iter().all(|node| !node.qualified_name.contains('#')), "{:#?}", graph.names());
+    assert_block(&graph, "f::<K as Tr>::x::<M as Tr>::x::<N as U>", "<N as U>", "U");
+    assert_paths_are_well_formed(&graph);
+}
+
+/// A block in the body of top-level `#[cfg]` alternatives of a fn (or of
+/// fn-local ones) is one node, at the first alternative, also when the
+/// alternatives differ before it: an extra statement or an extra `{ }`
+/// block in one alternative only.
+///
+/// Control: as above (`impl_block_scope` keyed by the enclosing block's
+/// byte offset) - every case gains a `#2`.
+#[test]
+fn a_block_in_the_body_of_merged_cfg_alternatives_of_a_fn_is_one_node() {
+    for (case, body, wanted) in [
+        (
+            "P2 top-level alternatives",
+            "#[cfg(a)] pub fn f() { struct M; impl U for M {} }\n\
+             #[cfg(not(a))] pub fn f() { struct M; impl U for M {} }\n",
+            "f::<M as U>",
+        ),
+        (
+            "P3 fn-local alternatives",
+            "pub fn g() {\n #[cfg(a)] fn h() { struct M; impl U for M {} }\n \
+             #[cfg(not(a))] fn h() { struct M; impl U for M {} }\n}\n",
+            "g::h::<M as U>",
+        ),
+        (
+            "P8 a statement in one alternative only",
+            "#[cfg(a)] pub fn f() { let _a = 1; struct M; impl U for M {} }\n\
+             #[cfg(not(a))] pub fn f() { struct M; impl U for M {} }\n",
+            "f::<M as U>",
+        ),
+        (
+            "P12 a block in one alternative only",
+            "#[cfg(a)] pub fn f() { { let _ = 1; } struct M; impl U for M {} }\n\
+             #[cfg(not(a))] pub fn f() { struct M; impl U for M {} }\n",
+            "f::<M as U>",
+        ),
+    ] {
+        let graph = extract_gm691(body);
+        assert_eq!(impl_blocks(&graph), vec![wanted], "{case}: {:#?}", graph.names());
+        assert_block(&graph, wanted, "<M as U>", "U");
+        assert_paths_are_well_formed(&graph);
+    }
+    let graph = extract_gm691(
+        "#[cfg(a)] pub fn f() { struct M; impl U for M {} }\n\
+         #[cfg(not(a))] pub fn f() { struct M; impl U for M {} }\n",
+    );
+    assert_eq!(graph.node("f::<M as U>").range.start.line, 2, "the first alternative's block");
+}
+
+/// A block in a nested `{ }` or a closure of merged `#[cfg]` alternatives
+/// is one node per position: each alternative with two `{ }` blocks gives
+/// exactly two nodes (one per block, not one per block per alternative),
+/// and a block in a closure, or in one nested block, gives one.
+///
+/// Control: as above (`impl_block_scope` keyed by the enclosing block's
+/// byte offset) - P7 gives `#3`/`#4`, P4 and P9 give `#2`.
+#[test]
+fn blocks_in_nested_scopes_of_merged_cfg_alternatives_are_one_node_per_position() {
+    let graph = extract_gm691(
+        "#[cfg(a)] pub fn f() { { struct M; impl U for M {} } { struct M; impl U for M {} } }\n\
+         #[cfg(not(a))] pub fn f() { { struct M; impl U for M {} } { struct M; impl U for M {} } }\n",
+    );
+    assert_eq!(impl_blocks(&graph), vec!["f::<M as U>", "f::<M as U>#2"], "P7: {:#?}", graph.names());
+    assert_block(&graph, "f::<M as U>", "<M as U>", "U");
+    assert_block(&graph, "f::<M as U>#2", "<M as U>#2", "U");
+    assert_paths_are_well_formed(&graph);
+
+    for (case, body) in [
+        (
+            "P4 one nested block",
+            "#[cfg(a)] pub fn f() { { struct M; impl U for M {} } }\n\
+             #[cfg(not(a))] pub fn f() { { struct M; impl U for M {} } }\n",
+        ),
+        (
+            "P9 a closure",
+            "#[cfg(a)] pub fn f() { let _c = || { struct M; impl U for M {} }; }\n\
+             #[cfg(not(a))] pub fn f() { let _c = || { struct M; impl U for M {} }; }\n",
+        ),
+    ] {
+        let graph = extract_gm691(body);
+        assert_eq!(impl_blocks(&graph), vec!["f::<M as U>"], "{case}: {:#?}", graph.names());
+        assert_block(&graph, "f::<M as U>", "<M as U>", "U");
+        assert_paths_are_well_formed(&graph);
+    }
+}
+
+/// Blocks in genuinely different anonymous scopes of one owner keep their
+/// ordinals: same-named fns in two `{ }` blocks of one fn, fns in two
+/// `const _` initializers, two sibling `{ }` blocks, the branches of an
+/// `if`/`else`, and the initializers of two named consts (whose names the
+/// qualified name does not carry).
+///
+/// Control: make `block_ordinal` return 0 - every pair merges and its `#2`
+/// is missing.
+#[test]
+fn blocks_in_different_anonymous_scopes_of_one_owner_keep_their_ordinals() {
+    for (case, body, first, second) in [
+        (
+            "P5 same-named fns in two blocks",
+            "pub fn g() {\n { fn h() { struct M; impl U for M {} } }\n \
+             { fn h() { struct M; impl U for M {} } }\n}\n",
+            "g::h::<M as U>",
+            "g::h::<M as U>#2",
+        ),
+        (
+            "P6 fns in two const _",
+            "const _: () = { fn h() { struct M; impl U for M {} } };\n\
+             const _: () = { fn h() { struct M; impl U for M {} } };\n",
+            "h::<M as U>",
+            "h::<M as U>#2",
+        ),
+        (
+            "P11 sibling blocks",
+            "pub fn f() {\n { struct M; impl U for M {} }\n { struct M; impl U for M {} }\n}\n",
+            "f::<M as U>",
+            "f::<M as U>#2",
+        ),
+        (
+            "P13 if/else branches",
+            "pub fn f(c: bool) {\n if c { struct M; impl U for M {} } else { struct M; impl U for M {} }\n}\n",
+            "f::<M as U>",
+            "f::<M as U>#2",
+        ),
+        (
+            "P15 two named consts",
+            "const C: () = { struct M; impl U for M {} };\n\
+             const D: () = { struct M; impl U for M {} };\n",
+            "<M as U>",
+            "<M as U>#2",
+        ),
+    ] {
+        let graph = extract_gm691(body);
+        assert_eq!(impl_blocks(&graph), vec![first, second], "{case}: {:#?}", graph.names());
+        assert_block(&graph, first, "<M as U>", "U");
+        assert_block(&graph, second, "<M as U>#2", "U");
+        assert_paths_are_well_formed(&graph);
+    }
+}
+
+/// Documented residuals (GM-691 design note, section 5): `#[cfg]`
+/// alternatives of a named const are module-level blocks, not owners, so
+/// their initializers are two scopes; and alternatives whose block
+/// structure differs before a nested-block impl shift its ordinal. Both
+/// stay split into `#2`.
+#[test]
+fn cfg_alternatives_of_a_named_const_or_of_differing_block_structure_stay_split_as_documented() {
+    for (case, body, wanted) in [
+        (
+            "P14 named const alternatives",
+            "#[cfg(a)] const C: () = { struct M; impl U for M {} };\n\
+             #[cfg(not(a))] const C: () = { struct M; impl U for M {} };\n",
+            ["<M as U>", "<M as U>#2"],
+        ),
+        (
+            "P16 an extra block before a nested-block impl",
+            "#[cfg(a)] pub fn f() { { let _ = 1; } { struct M; impl U for M {} } }\n\
+             #[cfg(not(a))] pub fn f() { { struct M; impl U for M {} } }\n",
+            ["f::<M as U>", "f::<M as U>#2"],
+        ),
+    ] {
+        let graph = extract_gm691(body);
+        assert_eq!(impl_blocks(&graph), wanted, "{case}: {:#?}", graph.names());
+        assert_paths_are_well_formed(&graph);
+    }
 }

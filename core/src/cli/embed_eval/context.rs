@@ -246,6 +246,7 @@ pub(super) fn test_node(
         file_path: file.into(),
         language: language.into(),
         native_kind: Some(native.into()),
+        visibility: "public".into(),
         container: None,
         start_line: 1,
         end_line: 1,

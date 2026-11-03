@@ -1,0 +1,3 @@
+harness candidates 157 production vectors 149 production ids missing from harness 0
+shared 149 min cosine 1.000000000 max |delta| 0.000e+00
+harness-only: [('tests/releases.test.ts', 'setup()'), ('tests/create-tasks.test.ts', 'setup()'), ('tests/dependencies.test.ts', 'setup()'), ('tests/board.test.ts', 'setup()'), ('tests/status.test.ts', 'setup()'), ('tests/split.test.ts', 'setup()'), ('tests/ownership.test.ts', 'setup()'), ('tests/epics.test.ts', 'setup()')]

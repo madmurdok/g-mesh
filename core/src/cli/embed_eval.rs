@@ -35,6 +35,7 @@ mod probe;
 mod progress;
 mod queries;
 mod rng;
+mod schedule;
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
@@ -81,6 +82,9 @@ pub enum EmbedEvalCommand {
     Compare(compare::CompareArgs),
     /// Time query embeddings in bursts until a stop file appears.
     Probe(probe::ProbeArgs),
+    /// Replay the backfill orders over a stored run: rankings and recall
+    /// at checkpoints of the embedding pass.
+    Schedule(schedule::ScheduleArgs),
 }
 
 #[derive(Debug, Args)]
@@ -187,6 +191,7 @@ pub fn run(command: EmbedEvalCommand) -> Result<()> {
         EmbedEvalCommand::Cost(command) => cost::run(&command),
         EmbedEvalCommand::Compare(args) => compare::run(&args),
         EmbedEvalCommand::Probe(args) => probe::run(&args),
+        EmbedEvalCommand::Schedule(args) => schedule::run(&args),
     }
 }
 
@@ -267,6 +272,8 @@ struct Node {
     file_path: String,
     language: String,
     native_kind: Option<String>,
+    /// `nodes.visibility`; the embedding tier depends on it.
+    visibility: String,
     /// The module path (empty for TypeScript).
     container: Option<String>,
     start_line: i64,
@@ -329,7 +336,7 @@ fn load_nodes(db: &Path) -> Result<Vec<Node>> {
             .with_context(|| format!("failed to open {}", db.display()))?;
     let mut stmt = conn.prepare(
         "SELECT id, kind, qualifiedName, filePath, language, docComment, signature, name, nativeKind, \
-         container, startLine, endLine FROM nodes ORDER BY id",
+         container, startLine, endLine, COALESCE(visibility, 'file') FROM nodes ORDER BY id",
     )?;
     let nodes = stmt
         .query_map([], |row| {
@@ -346,6 +353,7 @@ fn load_nodes(db: &Path) -> Result<Vec<Node>> {
                 container: row.get(9)?,
                 start_line: row.get(10)?,
                 end_line: row.get(11)?,
+                visibility: row.get(12)?,
                 text: full_text(doc.as_deref(), signature.as_deref()),
                 doc,
                 signature,
@@ -1794,6 +1802,7 @@ mod tests {
             file_path: "f.rs".into(),
             language: "rust".into(),
             native_kind: Some("function".into()),
+            visibility: "public".into(),
             container: None,
             start_line: 1,
             end_line: 1,
@@ -1814,6 +1823,7 @@ mod tests {
             file_path: "f.rs".into(),
             language: "rust".into(),
             native_kind: Some("function".into()),
+            visibility: "public".into(),
             container: None,
             start_line: 1,
             end_line: 1,
@@ -2281,12 +2291,13 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE nodes (id TEXT, kind TEXT, qualifiedName TEXT, filePath TEXT, language TEXT, \
              docComment TEXT, signature TEXT, name TEXT, nativeKind TEXT, container TEXT, \
-             startLine INTEGER, endLine INTEGER)",
+             startLine INTEGER, endLine INTEGER, visibility TEXT)",
         )
         .unwrap();
         for n in nodes {
             conn.execute(
-                "INSERT INTO nodes VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO nodes (id, kind, qualifiedName, filePath, language, docComment, signature, name, \
+                 nativeKind, container, startLine, endLine) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     n.id,
                     n.kind,

@@ -245,7 +245,16 @@ g-mesh model status   # where the weights are expected, and whether they're ther
 embedding model, and again by the daemon when it loads it. `--no-rerank` skips
 it; `G_MESH_RERANK_MODEL_DIR` puts it elsewhere (`G_MESH_MODEL_DIR` names the
 embedding model's own directory, so it cannot also hold this one). Without it
-`search_code` keeps the embedding order and says so once in the daemon log.
+`search_code` keeps the embedding order, says so once in the daemon log, and
+adds a `hint` to one first page per daemon; `g-mesh status` shows it as
+`rerank model: missing`. A model whose files are there but fail to load (a
+sha256 mismatch) shows as `failed to load`: `model fetch` keeps a file of the
+pinned size, so delete the rerank directory first, then fetch. `model fetch`
+fetches the rerank model even when it refuses to fetch a non-default
+embedding model. **If you fetched models before 3.18.0, run `g-mesh
+model fetch` again after upgrading** (then restart the daemon with `g-mesh
+stop`): releases before it did not download the rerank model, and an upgrade
+does not fetch it for you.
 
 **If you are comparing two indexes, point `G_MESH_MODEL_DIR` at an empty
 directory in both arms.** Embedding generation, not indexing, dominates a
@@ -795,7 +804,9 @@ embedding pass cost what they did before.
 `~/.g-mesh/config.toml`, or `G_MESH_RERANK=off` in the daemon's environment;
 either takes effect when the daemon restarts, and `search_code` then answers
 exactly as it did before the rerank existed. Not fetching the model (`model
-fetch --no-rerank`) has the same effect.
+fetch --no-rerank`) keeps the embedding order too, but `search_code` (once per
+daemon) and `g-mesh status` then report the model as missing; to opt out
+silently, use `[rerank] enabled = false`.
 
 What gets embedded is each symbol's doc comment trimmed to its prose — the
 summary, headings and short paragraphs; code examples, parameter and return

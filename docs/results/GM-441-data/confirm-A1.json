@@ -1,0 +1,404 @@
+{
+ "bin": "/Users/Valentin_Taiurskii/Projects/ClaudeProjects/g-mesh-wt-gm441/target/release/g-mesh",
+ "project": "/tmp/gm441/src-A1",
+ "timeline": [
+  {
+   "t": 0.9,
+   "phase": "walking",
+   "done": 0,
+   "total": 0
+  },
+  {
+   "t": 14.96,
+   "phase": "structural",
+   "done": 0,
+   "total": 0
+  },
+  {
+   "t": 499.91,
+   "phase": "embedding",
+   "done": 0,
+   "total": 0
+  },
+  {
+   "t": 500.92,
+   "phase": "embedding",
+   "done": 0,
+   "total": 5411
+  },
+  {
+   "t": 504.95,
+   "phase": "embedding",
+   "done": 60,
+   "total": 5411
+  },
+  {
+   "t": 508.97,
+   "phase": "embedding",
+   "done": 113,
+   "total": 5411
+  },
+  {
+   "t": 513.98,
+   "phase": "embedding",
+   "done": 170,
+   "total": 5411
+  },
+  {
+   "t": 518.99,
+   "phase": "embedding",
+   "done": 240,
+   "total": 5411
+  },
+  {
+   "t": 523.01,
+   "phase": "embedding",
+   "done": 308,
+   "total": 5411
+  },
+  {
+   "t": 529.03,
+   "phase": "embedding",
+   "done": 376,
+   "total": 5411
+  },
+  {
+   "t": 536.07,
+   "phase": "embedding",
+   "done": 442,
+   "total": 5411
+  },
+  {
+   "t": 541.1,
+   "phase": "embedding",
+   "done": 508,
+   "total": 5411
+  },
+  {
+   "t": 547.12,
+   "phase": "embedding",
+   "done": 575,
+   "total": 5411
+  },
+  {
+   "t": 551.14,
+   "phase": "embedding",
+   "done": 632,
+   "total": 5411
+  },
+  {
+   "t": 558.17,
+   "phase": "embedding",
+   "done": 714,
+   "total": 5411
+  },
+  {
+   "t": 562.18,
+   "phase": "embedding",
+   "done": 778,
+   "total": 5411
+  },
+  {
+   "t": 565.19,
+   "phase": "embedding",
+   "done": 835,
+   "total": 5411
+  },
+  {
+   "t": 570.22,
+   "phase": "embedding",
+   "done": 907,
+   "total": 5411
+  },
+  {
+   "t": 573.23,
+   "phase": "embedding",
+   "done": 967,
+   "total": 5411
+  },
+  {
+   "t": 576.24,
+   "phase": "embedding",
+   "done": 1021,
+   "total": 5411
+  },
+  {
+   "t": 580.26,
+   "phase": "embedding",
+   "done": 1099,
+   "total": 5411
+  },
+  {
+   "t": 584.28,
+   "phase": "embedding",
+   "done": 1159,
+   "total": 5411
+  },
+  {
+   "t": 589.3,
+   "phase": "embedding",
+   "done": 1234,
+   "total": 5411
+  },
+  {
+   "t": 593.31,
+   "phase": "embedding",
+   "done": 1297,
+   "total": 5411
+  },
+  {
+   "t": 595.32,
+   "phase": "embedding",
+   "done": 1361,
+   "total": 5411
+  },
+  {
+   "t": 596.32,
+   "phase": "embedding",
+   "done": 1376,
+   "total": 5411
+  },
+  {
+   "t": 603.44,
+   "phase": "embedding",
+   "done": 1510,
+   "total": 5411
+  },
+  {
+   "t": 608.46,
+   "phase": "embedding",
+   "done": 1620,
+   "total": 5411
+  },
+  {
+   "t": 614.48,
+   "phase": "embedding",
+   "done": 1739,
+   "total": 5411
+  },
+  {
+   "t": 621.51,
+   "phase": "embedding",
+   "done": 1869,
+   "total": 5411
+  },
+  {
+   "t": 628.53,
+   "phase": "embedding",
+   "done": 1991,
+   "total": 5411
+  },
+  {
+   "t": 635.55,
+   "phase": "embedding",
+   "done": 2115,
+   "total": 5411
+  },
+  {
+   "t": 642.58,
+   "phase": "embedding",
+   "done": 2249,
+   "total": 5411
+  },
+  {
+   "t": 648.6,
+   "phase": "embedding",
+   "done": 2365,
+   "total": 5411
+  },
+  {
+   "t": 653.62,
+   "phase": "embedding",
+   "done": 2483,
+   "total": 5411
+  },
+  {
+   "t": 659.64,
+   "phase": "embedding",
+   "done": 2613,
+   "total": 5411
+  },
+  {
+   "t": 665.67,
+   "phase": "embedding",
+   "done": 2742,
+   "total": 5411
+  },
+  {
+   "t": 673.7,
+   "phase": "embedding",
+   "done": 2876,
+   "total": 5411
+  },
+  {
+   "t": 680.72,
+   "phase": "embedding",
+   "done": 2995,
+   "total": 5411
+  },
+  {
+   "t": 688.75,
+   "phase": "embedding",
+   "done": 3119,
+   "total": 5411
+  },
+  {
+   "t": 696.78,
+   "phase": "embedding",
+   "done": 3239,
+   "total": 5411
+  },
+  {
+   "t": 702.81,
+   "phase": "embedding",
+   "done": 3370,
+   "total": 5411
+  },
+  {
+   "t": 712.0,
+   "phase": "embedding",
+   "done": 3607,
+   "total": 5411
+  },
+  {
+   "t": 728.08,
+   "phase": "embedding",
+   "done": 3848,
+   "total": 5411
+  },
+  {
+   "t": 740.13,
+   "phase": "embedding",
+   "done": 4091,
+   "total": 5411
+  },
+  {
+   "t": 750.16,
+   "phase": "embedding",
+   "done": 4335,
+   "total": 5411
+  },
+  {
+   "t": 761.22,
+   "phase": "embedding",
+   "done": 4572,
+   "total": 5411
+  },
+  {
+   "t": 773.28,
+   "phase": "embedding",
+   "done": 4808,
+   "total": 5411
+  },
+  {
+   "t": 782.31,
+   "phase": "embedding",
+   "done": 5053,
+   "total": 5411
+  },
+  {
+   "t": 790.34,
+   "phase": "embedding",
+   "done": 5286,
+   "total": 5411
+  },
+  {
+   "t": 794.36,
+   "phase": "ready",
+   "done": 5411,
+   "total": 5411
+  }
+ ],
+ "searches": [
+  {
+   "query": "parse a configuration file",
+   "took_s": 0.098,
+   "partial": true,
+   "rows": 30,
+   "score_monotone": true,
+   "at": "tier-public",
+   "t": 596.32
+  },
+  {
+   "query": "compute the embedding of a node text",
+   "took_s": 0.156,
+   "partial": true,
+   "rows": 30,
+   "score_monotone": true,
+   "at": "tier-private",
+   "t": 702.81
+  },
+  {
+   "query": "parse a configuration file",
+   "took_s": 0.993,
+   "partial": false,
+   "rows": 30,
+   "score_monotone": false,
+   "at": "ready",
+   "t": 795.36
+  },
+  {
+   "query": "compute the embedding of a node text",
+   "took_s": 0.859,
+   "partial": false,
+   "rows": 30,
+   "score_monotone": false,
+   "at": "ready",
+   "t": 796.22
+  },
+  {
+   "query": "find the nodes that still need a vector",
+   "took_s": 0.548,
+   "partial": false,
+   "rows": 30,
+   "score_monotone": false,
+   "at": "ready",
+   "t": 796.76
+  },
+  {
+   "query": "report indexing progress to the status command",
+   "took_s": 0.452,
+   "partial": false,
+   "rows": 30,
+   "score_monotone": false,
+   "at": "ready",
+   "t": 797.22
+  },
+  {
+   "query": "load the language plugin process",
+   "took_s": 0.898,
+   "partial": false,
+   "rows": 30,
+   "score_monotone": false,
+   "at": "ready",
+   "t": 798.11
+  }
+ ],
+ "tiers": [
+  {
+   "tier": "public",
+   "candidates": 1376,
+   "s": 95.8,
+   "seen_t": 596.32
+  },
+  {
+   "tier": "private",
+   "candidates": 1994,
+   "s": 107.0,
+   "seen_t": 702.81
+  },
+  {
+   "tier": "test",
+   "candidates": 2041,
+   "s": 91.1,
+   "seen_t": 794.36
+  }
+ ],
+ "daemonPid": 75906,
+ "initialize": true,
+ "ready_t": 794.36,
+ "embedding_start_t": 499.91,
+ "pass_s": 294.45,
+ "daemonCpuTime": "36:38.90",
+ "daemonKilled": false
+}
