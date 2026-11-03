@@ -68,7 +68,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
+use ort::session::Session;
 use ort::value::Tensor;
 use serde::{Deserialize, Serialize};
 use tokenizers::tokenizer::Tokenizer;
@@ -332,6 +333,65 @@ impl Default for InferenceOptions {
             batch_size: 1,
             token_budget: DEFAULT_TOKEN_BUDGET,
             bucket_by_length: false,
+        }
+    }
+}
+
+/// Which ONNX Runtime execution provider runs the session. Kept out of
+/// [`InferenceOptions`] on purpose: those are read from the environment by the
+/// daemon, and the daemon must stay on the CPU provider. Only
+/// `debug-embed-eval run --ep` picks a non-CPU target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ExecutionTarget {
+    /// ONNX Runtime's CPU provider, the one production uses.
+    #[default]
+    #[value(name = "cpu")]
+    Cpu,
+    /// CoreML (GPU/Neural Engine where present, its own CPU path otherwise),
+    /// with unsupported nodes left on the CPU provider.
+    #[value(name = "coreml")]
+    CoreMl,
+    /// CoreML restricted to its CPU compute unit.
+    #[value(name = "coreml-cpu-only")]
+    CoreMlCpuOnly,
+}
+
+impl ExecutionTarget {
+    /// The name written to run records; equal to the `--ep` value.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::CoreMl => "coreml",
+            Self::CoreMlCpuOnly => "coreml-cpu-only",
+        }
+    }
+
+    /// Registers this target's provider on `builder`. A provider that fails
+    /// to register is an error, never a silent fall back to the CPU provider.
+    #[cfg(feature = "ep-coreml")]
+    fn register(self, builder: SessionBuilder) -> Result<SessionBuilder> {
+        use ort::execution_providers::CoreMLExecutionProvider;
+        let provider = match self {
+            Self::Cpu => return Ok(builder),
+            Self::CoreMl => CoreMLExecutionProvider::default(),
+            Self::CoreMlCpuOnly => CoreMLExecutionProvider::default().with_cpu_only(),
+        };
+        builder
+            .with_execution_providers([provider.build().error_on_failure()])
+            .with_context(|| format!("failed to register the {} execution provider", self.name()))
+    }
+
+    /// A build without the `ep-coreml` feature has no CoreML provider; asking
+    /// for one fails instead of running on the CPU provider unnoticed.
+    #[cfg(not(feature = "ep-coreml"))]
+    fn register(self, builder: SessionBuilder) -> Result<SessionBuilder> {
+        match self {
+            Self::Cpu => Ok(builder),
+            Self::CoreMl | Self::CoreMlCpuOnly => bail!(
+                "execution provider {} needs a build with the `ep-coreml` cargo feature \
+                 (cargo build --release -p g-mesh --features ep-coreml)",
+                self.name()
+            ),
         }
     }
 }
@@ -606,6 +666,18 @@ impl EmbeddingModel {
         spec: EncoderSpec,
         options: &InferenceOptions,
     ) -> Result<Self> {
+        Self::load_with_target(model_dir, spec, options, ExecutionTarget::Cpu)
+    }
+
+    /// [`load_with_options`](Self::load_with_options) with the session run by
+    /// `target`'s execution provider. [`ExecutionTarget::Cpu`] registers
+    /// nothing, so it builds the same session `load_with_options` does.
+    pub fn load_with_target(
+        model_dir: &Path,
+        spec: EncoderSpec,
+        options: &InferenceOptions,
+        target: ExecutionTarget,
+    ) -> Result<Self> {
         let max_sequence_length = spec.max_sequence_length;
         if max_sequence_length == 0 {
             bail!("max_sequence_length must be at least 1");
@@ -660,6 +732,7 @@ impl EmbeddingModel {
         if let Some(spin) = options.intra_spinning {
             builder = builder.with_intra_op_spinning(spin).context("failed to set ONNX intra-op spinning")?;
         }
+        builder = target.register(builder)?;
         let session = builder
             // Fixes the floating-point reduction order inside ONNX Runtime, so
             // two runs of the same input cannot differ in the last bits.

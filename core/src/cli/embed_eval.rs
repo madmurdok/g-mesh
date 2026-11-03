@@ -50,8 +50,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::embedding::model::{
-    cosine_similarity, BatchStats, EmbeddingModel, EncoderSpec, InferenceOptions, ONNX_FILE_NAME,
-    TOKENIZER_FILE_NAME,
+    cosine_similarity, BatchStats, EmbeddingModel, EncoderSpec, ExecutionTarget, InferenceOptions,
+    ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
 use crate::embedding::text::{full_text, is_noise, text_to_embed, EmbedInput};
 
@@ -123,6 +123,11 @@ pub struct RunArgs {
     /// Recompute vectors even when a matching earlier run could be reused.
     #[arg(long)]
     pub force: bool,
+    /// ONNX Runtime execution provider for the encoder. Anything but `cpu`
+    /// needs a build with the `ep-coreml` feature and prints ONNX Runtime's
+    /// node placement on stderr.
+    #[arg(long, value_enum, default_value_t = ExecutionTarget::Cpu)]
+    pub ep: ExecutionTarget,
 }
 
 #[derive(Debug, Args)]
@@ -473,6 +478,14 @@ struct Manifest {
     token_share_over_512: Option<f64>,
     token_share_over_1024: Option<f64>,
     gmesh_version: String,
+    /// `--ep` of the run that wrote vectors.bin; manifests without it were
+    /// written by CPU-only builds.
+    #[serde(default = "cpu_execution_provider")]
+    execution_provider: String,
+}
+
+fn cpu_execution_provider() -> String {
+    ExecutionTarget::Cpu.name().to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -553,6 +566,9 @@ struct Timings {
     /// one-call-per-text path, which pads nothing.
     real_tokens: Option<usize>,
     padded_tokens: Option<usize>,
+    /// `--ep` of this run, the provider behind `embed_nodes_ms`.
+    #[serde(default = "cpu_execution_provider")]
+    execution_provider: String,
 }
 
 fn fingerprint(variant: &Variant) -> String {
@@ -773,6 +789,10 @@ fn run_variant(args: &RunArgs) -> Result<()> {
         args.corpus.clone()
     };
 
+    if args.ep != ExecutionTarget::Cpu {
+        log_onnx_runtime_to_stderr();
+    }
+
     // One model load for every corpus; its time is recorded per corpus run.
     let load_started = Instant::now();
     let encoder = match variant.arm {
@@ -781,7 +801,11 @@ fn run_variant(args: &RunArgs) -> Result<()> {
             let dir = base.model_dir(eval_dir)?;
             let spec = base.encoder_spec()?;
             let options = InferenceOptions::from_env();
-            Some((base.clone(), dir.clone(), EmbeddingModel::load_with_options(&dir, spec, &options)?))
+            Some((
+                base.clone(),
+                dir.clone(),
+                EmbeddingModel::load_with_target(&dir, spec, &options, args.ep)?,
+            ))
         }
         _ => None,
     };
@@ -793,6 +817,28 @@ fn run_variant(args: &RunArgs) -> Result<()> {
     }
     Ok(())
 }
+
+/// Sends ONNX Runtime's log (forwarded by `ort` as `tracing` events) to
+/// stderr at info level. Its `GetCapability` line says how many nodes the
+/// execution provider took; a provider that takes none fails no call, so this
+/// line is the only evidence the run did not stay on the CPU provider.
+#[cfg(feature = "ep-coreml")]
+fn log_onnx_runtime_to_stderr() {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    let filter = Targets::new().with_target("ort", LevelFilter::INFO);
+    // A second call (or a subscriber set elsewhere) keeps the first one.
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(filter))
+        .try_init();
+}
+
+/// Without `ep-coreml` a non-CPU target fails at model load, before any
+/// provider could log.
+#[cfg(not(feature = "ep-coreml"))]
+fn log_onnx_runtime_to_stderr() {}
 
 #[allow(clippy::too_many_arguments)]
 fn run_corpus(
@@ -862,6 +908,7 @@ fn run_corpus(
         token_share_over_512,
         token_share_over_1024,
         gmesh_version: env!("CARGO_PKG_VERSION").to_string(),
+        execution_provider: args.ep.name().to_string(),
     };
 
     let previous: Option<Manifest> = if args.force { None } else { read_json(&manifest_path).ok() };
@@ -870,6 +917,7 @@ fn run_corpus(
             && p.snapshot_sha256 == manifest.snapshot_sha256
             && p.node_ids_sha256 == manifest.node_ids_sha256
             && p.dimension == manifest.dimension
+            && p.execution_provider == manifest.execution_provider
     });
     let same_queries = same_nodes
         && previous
@@ -880,6 +928,7 @@ fn run_corpus(
         load_ms,
         node_count: candidates.len(),
         options: encoder.map(|(_, _, model)| model.options()),
+        execution_provider: args.ep.name().to_string(),
         ..Timings::default()
     };
     // Node and query streams are separate, so reusing cached node vectors
@@ -2377,6 +2426,7 @@ mod tests {
                 out: Some(eval_dir.join("runs")),
                 embed_only: false,
                 force: false,
+                ep: ExecutionTarget::Cpu,
             };
             run_variant(&args).unwrap();
             read_rankings(&eval_dir.join("runs").join(variant).join("c").join("rankings.jsonl"))
