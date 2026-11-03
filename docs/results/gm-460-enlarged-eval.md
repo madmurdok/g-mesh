@@ -15,8 +15,8 @@ corpus was written by its own fresh blind agent (GM-460/S11-S16).
 |---|---|---|---|---|---|---|
 | gin | go | 30 | 8 | 27 / 30 | #1-#31 | `8f30231a453b9e8c8dc1052f4ec2461311ba662d08e7f453ed6c31172ab96547` |
 | py-requests | python | 80 | 20 | 80 / 80 | #1-#90 | `dc1a2cfe9009a97fc73421661585be968e4bb60d941c01b7df0f4815e16744c9` |
-| ripgrep | rust | 40 | 10 | 38 / 40 | #1-#43 | `ed28f7fe5100ae72440538ea482c9d98706ec2d0c527a381e5b5a059121a83a3` |
-| g-mesh | rust | 40 | 10 | 39 / 40 | #1-#44 | `9bec0378efeb45f26f51c3257fbebcad2c392b2999d2684a829eea249854109b` |
+| ripgrep | rust | 40 | 10 | 38 / 40 | #1-#43 | `ab3e0019a75a5ffc7743d445c4bdadd63ea954c7e70e5aaa07260e468a706a8a` |
+| g-mesh | rust | 40 | 10 | 39 / 40 | #1-#44 | `feb653245ab856f6b5726c486416e7f3d8d08656191eef3608185f32a3e41d6a` |
 | excalidraw | typescript | 65 | 12 | 64 / 65 | #1-#69 | `4d939369998278e51e6f613eee12dfe9f5e93c6a51847664a6855d893e231e7d` |
 | task-tracker-mcp | typescript | 15 | 8 | 15 / 15 | #1-#15 | `c3460a45aab0c5d7c1c87445b7602136f9ae19cdcb45062f7786c6d51584eadf` |
 
@@ -33,8 +33,8 @@ ends in a newline.
 |---|---|---|---|
 | `eval/embedding/v2/queries/gin.jsonl` | 125 / 250 / 38 | 413 | `71fa5b134a68242b6f45862d6b19a407cf1642310e30036624ac4bf5e7da8306` |
 | `eval/embedding/v2/queries/py-requests.jsonl` | 125 / 188 / 100 | 413 | `ce3a068fca2a3f5a87af76756440a7498bcd8a1dde8add5697bbbfdc352e599a` |
-| `eval/embedding/v2/queries/ripgrep.jsonl` | 62 / 94 / 50 | 206 | `44951dc2a86918183517e86279e8713920b974a7240d5f7918c240f131e2cfe8` |
-| `eval/embedding/v2/queries/g-mesh.jsonl` | 63 / 94 / 50 | 207 | `4c5b01f5e41edbde5cf898b907150b11100411865bd17023a260a00129703fbc` |
+| `eval/embedding/v2/queries/ripgrep.jsonl` | 62 / 94 / 50 | 206 | `b498fd50fe91e0fbd59fc4de96d48e800c37da5cdb246e91aaf4f7481a5b228c` |
+| `eval/embedding/v2/queries/g-mesh.jsonl` | 63 / 94 / 50 | 207 | `e551b3461e3375080d8e6f91f6eb3efd0911a384acbaad3846e46dbb06f106a7` |
 | `eval/embedding/v2/queries/excalidraw.jsonl` | 62 / 109 / 77 | 248 | `f545e5553c566835a781721d9a6daea5c5244262b7d3141dfe8bfd3cfed89f78` |
 | `eval/embedding/v2/queries/task-tracker-mcp.jsonl` | 63 / 79 / 23 | 165 | `570ec16dfcbe85b12605cd3fd2c65139ab45c0b9210cc02bd807443044e4463b` |
 
@@ -131,7 +131,7 @@ set minus the target row named by `#N` in the derivation).
 | req-e080 | #90 `requests._types` (Module) | `src/requests/_types.py` (File) |
 | rg-e002 | #2 `standard::Standard::has_written` | `summary::Summary::has_written`, `json::JSON::has_written` |
 | rg-e007 | #8 `flags::defs::TypeList` | `flags::defs::<TypeList as Flag>::update` |
-| rg-e011 | #12 `flags::defs::<NoUnicode as Flag>::update` | `flags::defs::NoUnicode` |
+| rg-e011 | #12 `flags::defs::<NoUnicode as Flag>::update` | `flags::defs::NoUnicode`, `flags::defs::<NoPcre2Unicode as Flag>::update` |
 | rg-e015 | #16 `flags::parse::Parser` | `flags::parse::Parser::new` |
 | rg-e017 | #18 `flags::defs::NoMessages` | `flags::defs::<NoMessages as Flag>::update` |
 | rg-e020 | #21 `standard::StandardSink::binary_byte_offset` | `summary::SummarySink::binary_byte_offset`, `json::JSONSink::binary_byte_offset` |
@@ -141,6 +141,7 @@ set minus the target row named by `#N` in the derivation).
 | rg-e036 | #38 `flags::defs::Sort` | `flags::defs::<Sort as Flag>::update` |
 | rg-e038 | #40 `human` | `human::parse_human_readable_size` |
 | gm-e001 | #1 `daemon::lifecycle::PluginSupervisor::has_pending` | `daemon::registry::PluginRegistry::has_pending` |
+| gm-e021 | #24 `census::pop_ctx` (Rust plugin) | `census::pop_ctx` (Python plugin, `plugins/python/src/census.rs`) |
 | gm-e004 | #4 `daemon::registry::PluginRegistry::pid_file_for` | `daemon::registry::plugin_pid_file_name` |
 | gm-e005 | #5 `extractor::emit::Positions::new` (Python plugin) | `extractor::emit::Positions::new` (Rust plugin, `plugins/rust/src/extractor/emit.rs`) |
 | gm-e008 | #9 `daemon::semantic::run_with_registry` | `daemon::semantic::run_with_registry_and_progress` (earlier-study expected symbol) |
@@ -215,3 +216,17 @@ The authors' own "unsure" notes, unresolved:
 4. **New cross-side pair** `req-c025` ~ `req-e032` through an additional
    acceptable answer; the split is not changed (section 6), the strict
    held-out view drops `req-c025`.
+5. **Post-freeze fix of 2 expected sets before any arm ran, per S18.** The
+   verify slice (GM-460/S18) passed the first freeze commit `1db4a79` with two
+   expected-set findings; each corpus's blind author added an identical twin,
+   no text, shape or other row changed: `gm-e021` gained `census::pop_ctx`
+   (`plugins/python/src/census.rs:96`), `rg-e011` gained
+   `flags::defs::<NoPcre2Unicode as Flag>::update` (`defs.rs:4810`). The
+   hashes above are the re-frozen ones (previous: g-mesh new
+   `9bec0378...`, ripgrep new `ed28f7fe...`, v2 g-mesh `4c5b01f5...`, v2
+   ripgrep `44951dc2...`). Both new symbols exist as Function nodes in the
+   pinned frames (`work/g-mesh.sqlite`, `work/ripgrep.sqlite`); the resolve
+   step (dry `run`, embeddability) is left to the measure slice. Counts,
+   sides and the cross-side overlap list are unchanged.
+6. **Not fixed (S18 minor note):** task-tracker-mcp's absent shapes break the
+   phrase/sentence alternation by one (12 phrases / 11 sentences overall).
