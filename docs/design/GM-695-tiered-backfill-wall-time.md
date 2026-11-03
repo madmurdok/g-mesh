@@ -84,7 +84,7 @@ trace and from `ps`.
     236.6 s, against 237.9 s with them (A1). The searches cost nothing
     measurable.
 - **CPU against waiting:**
-  - During `compute`, CPU/wall is 3.8-3.97 in both arms. ORT's 4 intra-op
+  - During `compute`, CPU/wall is 3.72-3.92 in both arms. ORT's 4 intra-op
     threads spin, so CPU follows wall in either arm.
   - S25's "equal daemon CPU" was a whole-daemon figure. The structural
     phase (about 900 s of CPU) dominates it. It did not show that A1 was
