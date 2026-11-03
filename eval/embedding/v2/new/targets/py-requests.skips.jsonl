@@ -1,0 +1,5 @@
+{"n": 64, "qualifiedName": "_T_co", "reason": "generic covariant TypeVar (_types.py:22) with no doc; indistinguishable from _KT_co/_VT_co, no behaviour to describe"}
+{"n": 68, "qualifiedName": "__cake__", "reason": "decorative emoji string in __version__.py:14; no behaviour or meaning to query"}
+{"n": 69, "qualifiedName": "str", "reason": "identity rebinding str = str in compat.py:109; no doc and nothing to describe beyond the builtin"}
+{"n": 75, "qualifiedName": "bytes", "reason": "identity rebinding bytes = bytes in compat.py:110; no doc and nothing to describe beyond the builtin"}
+{"n": 76, "qualifiedName": "requests.utils", "reason": "same module as target #30 (File node src/requests/utils.py); listed in #30's expected set instead of a second query"}

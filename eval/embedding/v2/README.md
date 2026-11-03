@@ -29,6 +29,7 @@ python3 eval/embedding/check_queries.py <corpus> --checkout <work dir>/corpora/<
     --disjoint-from eval/embedding --disjoint-from eval/embedding/confirm
 python3 eval/embedding/v2/build.py              # write queries/*.jsonl
 python3 eval/embedding/v2/build.py --check      # verify; prints counts and cross-side overlap
+python3 eval/embedding/v2/neardup.py [prefix..] # section 6 review: new texts at token Jaccard >= 0.5
 ```
 
 ## Seed-460 frames (stage 2)
@@ -38,6 +39,22 @@ studies (fn / type / other): gin 290 / 0 / 6, py-requests 47 / 0 / 97,
 ripgrep 2019 / 322 / 108, g-mesh 1457 / 366 / 516, excalidraw 2318 / 22 / 29,
 task-tracker-mcp 18 / 0 / 0. task-tracker-mcp has 18 targets, not 20, for its
 15 positives.
+
+## Stage-2 authoring (GM-460/S7)
+
+| corpus | positives | absent | targets used | skipped |
+|---|---|---|---|---|
+| gin | 30 | 8 | #1-#30 | none |
+| py-requests | 80 | 20 | #1-#85 | #64, #68, #69, #75, #76 |
+| ripgrep | 40 | 10 | #1-#40 | none |
+| g-mesh | 40 | 10 | #1-#40 | none |
+| excalidraw | 65 | 12 | #1-#65 | none |
+| task-tracker-mcp | 15 | 8 | #1-#15 | none |
+
+Each language ends at 330 positives and 83 absent in `queries/`. Skip
+reasons are in the `.skips.jsonl` files; the freeze record
+(`docs/results/gm-460-enlarged-eval.md`) lists the hashes, the per-side
+counts, the near-duplicate pairs resolved and the added acceptable answers.
 
 ## Freeze
 
