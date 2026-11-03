@@ -394,6 +394,7 @@ mod tests {
             token_share_over_512: None,
             token_share_over_1024: None,
             gmesh_version: "test".to_string(),
+            execution_provider: "cpu".to_string(),
         }
     }
 
