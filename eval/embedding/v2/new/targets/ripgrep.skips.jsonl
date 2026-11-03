@@ -1,0 +1,3 @@
+{"n": 3, "qualifiedName": "color::<SpecType as FromStr>::Err", "reason": "associated type alias to ColorError; the error type itself is the sensible answer (already an earlier query's expected symbol)"}
+{"n": 33, "qualifiedName": "sink::<&'a mut S as Sink>::Error", "reason": "identity rebind: forwarding impl's associated type equals S::Error"}
+{"n": 42, "qualifiedName": "matcher::RegexCaptures::new", "reason": "identity rebind: crate-private constructor that only wraps AutomataCaptures in a newtype"}

@@ -1,0 +1,19 @@
+{"meta": {"corpus": "task-tracker-mcp", "seed": 460, "frameSource": "/Users/Valentin_Taiurskii/Projects/ClaudeProjects/g-mesh/eval/embedding/work/task-tracker-mcp.sqlite", "frameSha256": "6e2381ba9123712a3114c5a6127fe4f29e0a27e372147ac392c8ad2ce74041ff", "frameSizes": {"fn": 18, "type": 0, "other": 0}, "dropped": {"not_embeddable": 503, "test_or_fixture": 18, "not_at_pin": 0, "duplicate": 0, "excluded": 121}, "exclude": [{"study": "eval/embedding", "consumedPrefix": 53, "consumedTargets": 53, "expectedSymbols": 56, "keys": 59}, {"study": "eval/embedding/confirm", "consumedPrefix": 62, "consumedTargets": 62, "expectedSymbols": 61, "keys": 63}], "excludeKeys": 121}}
+{"n": 1, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "displayStatus", "filePath": "src/domain/status.ts", "lineAtPin": 106}
+{"n": 2, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "createRelease", "filePath": "src/domain/releases.ts", "lineAtPin": 50}
+{"n": 3, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "widenReleaseStatusCheck", "filePath": "src/db/schema.ts", "lineAtPin": 241}
+{"n": 4, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "laneKey", "filePath": "src/dashboard/public/board.js", "lineAtPin": 160}
+{"n": 5, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "getProject", "filePath": "src/domain/projects.ts", "lineAtPin": 89}
+{"n": 6, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "tickConnectionLabel", "filePath": "src/dashboard/public/board.js", "lineAtPin": 339}
+{"n": 7, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "wireReleaseNotesDialog", "filePath": "src/dashboard/public/board.js", "lineAtPin": 423}
+{"n": 8, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "addDependency", "filePath": "src/domain/dependencies.ts", "lineAtPin": 28}
+{"n": 9, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "listHandoffNotes", "filePath": "src/domain/handoffNotes.ts", "lineAtPin": 41}
+{"n": 10, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "getNextTask", "filePath": "src/domain/status.ts", "lineAtPin": 124}
+{"n": 11, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "listEpicsWithStatus", "filePath": "src/domain/status.ts", "lineAtPin": 268}
+{"n": 12, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "isOverBudget", "filePath": "src/domain/budget.ts", "lineAtPin": 29}
+{"n": 13, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "getTaskDetail", "filePath": "src/domain/status.ts", "lineAtPin": 48}
+{"n": 14, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "conflictResult", "filePath": "src/mcp/toolResult.ts", "lineAtPin": 11}
+{"n": 15, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "isReachable", "filePath": "src/domain/dependencies.ts", "lineAtPin": 3}
+{"n": 16, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "browserOpenCommand", "filePath": "src/dashboard/openBrowser.ts", "lineAtPin": 13}
+{"n": 17, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "aggregateStatus", "filePath": "src/domain/status.ts", "lineAtPin": 219}
+{"n": 18, "stratum": "fn", "kind": "Function", "nativeKind": "function", "qualifiedName": "releaseIt", "filePath": "src/domain/lifecycle.ts", "lineAtPin": 278}

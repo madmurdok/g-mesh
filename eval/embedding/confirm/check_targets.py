@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Control for the GM-422 confirmatory target lists (section 3 of
-docs/architecture/embedding-eval-int8-confirm.md).
+"""Control for a study's target lists (GM-422 confirmatory protocol, section 3
+of docs/architecture/embedding-eval-int8-confirm.md; GM-460 v2 top-up,
+docs/design/GM-460-enlarged-nl-eval.md section 5).
 
 Independently of sample_targets.py, checks for every corpus that
-confirm/targets/<corpus>.jsonl
-- shares no (filePath, qualifiedName) with any GM-398 target row (the whole
-  list, not only the consumed prefix) nor with any expected symbol of a
-  GM-398 authored query (eval/embedding/queries);
-- has seed 4222, the protocol's snapshot sha256, and consecutive numbers;
+<targets dir>/<corpus>.jsonl
+- shares no (filePath, qualifiedName) with any consumed target row (rows
+  1..k, k the highest target number a query derivation or skip names) nor
+  with any expected symbol of an authored query of each earlier study;
+- has the expected seed, the protocol's snapshot sha256, and consecutive
+  numbers;
 - keeps the 6/3/1 strata pattern until a stratum runs out;
 - has no duplicate target.
-Also reports how many targets overlap GM-398's *unconsumed* rows (allowed).
+Also reports how many targets overlap an earlier study's *unconsumed* rows
+(allowed).
 
-usage: check_targets.py [targets dir]   exit 1 on any failure
+usage: check_targets.py [targets dir] [--seed N] [--against EVAL_DIR ...]
+  defaults: confirm/targets, seed 4222, against eval/embedding (GM-398).
+  v2 top-up: check_targets.py eval/embedding/v2/new/targets --seed 460
+             --against eval/embedding --against eval/embedding/confirm
+exit 1 on any failure
 """
+import argparse
 import json
 import os
 import re
@@ -30,6 +38,7 @@ SHA = {
     "task-tracker-mcp": "6e2381ba9123712a3114c5a6127fe4f29e0a27e372147ac392c8ad2ce74041ff",
 }
 PATTERN = ["fn", "fn", "type", "fn", "fn", "type", "fn", "type", "fn", "other"]
+DERIVED_TARGET = re.compile(r"Target sampled \(seed \d+, #(\d+)\)")
 
 
 def jsonl(path):
@@ -37,43 +46,55 @@ def jsonl(path):
         return [json.loads(l) for l in f if l.strip()]
 
 
+def earlier_study(study, corpus):
+    """(consumed prefix k, consumed keys, unconsumed keys, expected keys) of one study."""
+    rows = [r for r in jsonl(os.path.join(study, "targets", f"{corpus}.jsonl")) if "meta" not in r]
+    queries = jsonl(os.path.join(study, "queries", f"{corpus}.jsonl"))
+    used = {int(m.group(1)) for q in queries if (m := DERIVED_TARGET.search(q["derivation"]))}
+    skips_path = os.path.join(study, "targets", f"{corpus}.skips.jsonl")
+    skips = {s["n"] for s in jsonl(skips_path)} if os.path.exists(skips_path) else set()
+    k = max(used | skips | {0})
+    consumed = {(r["filePath"], r["qualifiedName"]) for r in rows if r["n"] <= k}
+    unconsumed = {(r["filePath"], r["qualifiedName"]) for r in rows if r["n"] > k}
+    expected = {(e["filePath"], e["qualifiedName"]) for q in queries for e in q["expected"]}
+    return k, consumed, unconsumed, expected
+
+
 def main():
-    tdir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "targets")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("targets_dir", nargs="?", default=os.path.join(HERE, "targets"))
+    ap.add_argument("--seed", type=int, default=4222)
+    ap.add_argument("--against", action="append", help="eval dir of an earlier study (repeatable)")
+    args = ap.parse_args()
+    studies = args.against or [EVAL]
     failures = 0
     for corpus, sha in SHA.items():
-        rows = jsonl(os.path.join(tdir, f"{corpus}.jsonl"))
+        rows = jsonl(os.path.join(args.targets_dir, f"{corpus}.jsonl"))
         meta, targets = rows[0]["meta"], rows[1:]
-        old_rows = [r for r in jsonl(os.path.join(EVAL, "targets", f"{corpus}.jsonl")) if "meta" not in r]
-        used = set()
-        for q in jsonl(os.path.join(EVAL, "queries", f"{corpus}.jsonl")):
-            m = re.search(r"Target sampled \(seed 398, #(\d+)\)", q["derivation"])
-            if m:
-                used.add(int(m.group(1)))
-        skips = {s["n"] for s in jsonl(os.path.join(EVAL, "targets", f"{corpus}.skips.jsonl"))}
-        k = max(used | skips)
-        consumed = {(r["filePath"], r["qualifiedName"]) for r in old_rows if r["n"] <= k}
-        unconsumed = {(r["filePath"], r["qualifiedName"]) for r in old_rows if r["n"] > k}
-        expected = {
-            (e["filePath"], e["qualifiedName"])
-            for q in jsonl(os.path.join(EVAL, "queries", f"{corpus}.jsonl"))
-            for e in q["expected"]
-        }
         keys = [(t["filePath"], t["qualifiedName"]) for t in targets]
         errs = []
-        if meta["seed"] != 4222:
-            errs.append(f"seed {meta['seed']}")
+        if meta["seed"] != args.seed:
+            errs.append(f"seed {meta['seed']}, want {args.seed}")
         if meta["frameSha256"] != sha:
             errs.append("frame sha256 differs from the protocol's snapshot")
         if [t["n"] for t in targets] != list(range(1, len(targets) + 1)):
             errs.append("numbers not consecutive")
         if len(set(keys)) != len(keys):
             errs.append("duplicate targets")
-        hit_c = [k_ for k_ in keys if k_ in consumed]
-        hit_e = [k_ for k_ in keys if k_ in expected]
-        if hit_c:
-            errs.append(f"{len(hit_c)} GM-398 consumed targets: {hit_c[:3]}")
-        if hit_e:
-            errs.append(f"{len(hit_e)} GM-398 expected symbols: {hit_e[:3]}")
+        against = []
+        for study in studies:
+            k, consumed, unconsumed, expected = earlier_study(study, corpus)
+            hit_c = [k_ for k_ in keys if k_ in consumed]
+            hit_e = [k_ for k_ in keys if k_ in expected]
+            if hit_c:
+                errs.append(f"{len(hit_c)} consumed targets of {study}: {hit_c[:3]}")
+            if hit_e:
+                errs.append(f"{len(hit_e)} expected symbols of {study}: {hit_e[:3]}")
+            against.append({
+                "study": study, "consumedPrefix": k, "overlapConsumed": len(hit_c),
+                "overlapExpected": len(hit_e),
+                "overlapUnconsumedRows": sum(1 for k_ in keys if k_ in unconsumed),
+            })
         # strata: slot i wants PATTERN[i % 10] unless that stratum is exhausted
         sizes, taken = meta["frameSizes"], {"fn": 0, "type": 0, "other": 0}
         for i, t in enumerate(targets):
@@ -85,9 +106,7 @@ def main():
         strata = {s: sum(1 for t in targets if t["stratum"] == s) for s in taken}
         print(json.dumps({
             "corpus": corpus, "targets": len(targets), "strata": strata, "frameSizes": sizes,
-            "gm398ConsumedPrefix": k, "overlapConsumed": len(hit_c), "overlapExpected": len(hit_e),
-            "overlapUnconsumedGm398Rows": sum(1 for k_ in keys if k_ in unconsumed),
-            "errors": errs,
+            "against": against, "errors": errs,
         }))
         failures += bool(errs)
     sys.exit(1 if failures else 0)

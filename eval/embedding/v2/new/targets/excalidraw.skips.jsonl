@@ -1,0 +1,4 @@
+{"n": 12, "qualifiedName": "AppEventBus#constructor", "reason": "empty constructor that only stores a behaviour parameter; no standalone behaviour to search for"}
+{"n": 24, "qualifiedName": "Scene#constructor", "reason": "constructor that only delegates to replaceAllElements; a query would be answered by the Scene class or that method"}
+{"n": 33, "qualifiedName": "LocalCoord", "reason": "object-form twin of LocalPoint (target #48, used) and local counterpart of GlobalCoord already queried in an earlier study; any text would be a near-paraphrase"}
+{"n": 63, "qualifiedName": "LibraryItems_v1", "reason": "private list alias of LibraryItem_v1, whose query already exists in an earlier study"}
