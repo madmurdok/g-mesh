@@ -19,6 +19,7 @@ The engine is the hidden `g-mesh debug-embed-eval` command
 | `fetch_models.py` | downloads candidate models at their pinned revisions |
 | `measure_costs.sh` | one script: candidate quality runs, query latency, D11 timed passes, report (GM-398 S14) |
 | `measure_summary.py` | writes `costs.toml` and the summary tables for `measure_costs.sh` |
+| `v2/` | the enlarged query set (GM-460): GM-398 + confirm + 270 new positives, 330 positives + 83 absent per language; see `v2/README.md` |
 | `work/` | git-ignored: checkouts, snapshots, models, runs |
 
 ## Target sampling frame
