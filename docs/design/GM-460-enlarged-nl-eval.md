@@ -471,3 +471,15 @@ was not called.
   0.53, ADR 0012).
 - Stored-run manifests carry `queryIds` and `queryFiles` (sha256), checked
   by `q5_floor_sensitivity.py::load_arm`.
+
+## Owner decisions
+
+2026-11-03, on the four questions of "Decisions for the owner":
+
+1. Merge the confirm set: "Влить confirm (Recommended)".
+2. Target: "330+83 на язык (Recommended)".
+3. Shipped-ranking arm: "Да, и F4 rerank (Recommended)".
+4. Floors: "Отдельная задача на переподбор". The measure slice reports the
+   shipped floors beside the D6-refit floors on v2. If the refit shows the
+   shipped floors fall short, a separate backlog task for re-fitting them is
+   proposed. Nothing in the product changes in GM-460.
