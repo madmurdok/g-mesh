@@ -25,7 +25,7 @@ export G_MESH_RERANK_MODEL_DIR=$MAIN/work/models/ms-marco-MiniLM-L6-v2
 n=0
 for arm in $ORDER; do
   n=$((n+1))
-  if [ $arm = A0 ]; then bin=$BIN_A0; else bin=$BIN_A1; fi
+  if [ "$arm" = A0 ]; then bin=$BIN_A0; else bin=$BIN_A1; fi
   waited=0
   while awk -v l="$(load1)" -v m="$LOAD_MAX" 'BEGIN{exit !(l>m)}'; do
     if [ $waited -ge "$LOAD_WAIT_S" ]; then echo "load1 never reached $LOAD_MAX" >> "$SUM"; exit 2; fi
