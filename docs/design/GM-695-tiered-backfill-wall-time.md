@@ -229,3 +229,10 @@ a different task: batching or thread options (GM-453/GM-439).
    the harness and GM-441 results get corrected. Or ask for F1 anyway.
 2. Choose whether GM-695 closes on this evidence (one balanced block plus
    the trace) or needs the second balanced block from "Must confirm" first.
+
+## Owner decisions
+
+2026-11-03:
+
+1. Fix option F0: "F0: без фикса, поправить замер (Recommended)"
+2. Closing: "Закрывать на этих данных (Recommended)"

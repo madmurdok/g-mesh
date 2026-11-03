@@ -1,8 +1,13 @@
 #!/bin/bash
-# GM-441 S25: daemon confirm, 3 runs per arm interleaved (A0 A1 A0 A1 A0 A1), fail-fast.
+# Daemon confirm of the tiered backfill (A1) against its base (A0), fail-fast.
+# Runs are order-balanced: blocks of `A1 A0 A0 A1` repeated until each arm has RUNS runs
+# (RUNS even), so neither arm systematically follows a longer cool-down.
 # Each run: wait for load1 <= LOAD_MAX, fresh corpus copy + home, gm441_confirm.py under
-# /usr/bin/time -p, daemon killed by its recorded PID. Compact result: $OUT/summary.txt.
-# Env: OUT, BIN_A0, BIN_A1, LOAD_MAX (4), LOAD_WAIT_S (7200), TIMEOUT_S (1500), ORDER, DRY=1
+# /usr/bin/time -p, daemon killed by its recorded PID. Each summary line records load1 and
+# the `pmset -g therm` CPU_Speed_Limit (100 = unthrottled, n/a = not reported) at the start
+# and end of the run. Compact result: $OUT/summary.txt.
+# Env: OUT, BIN_A0, BIN_A1, LOAD_MAX (4), LOAD_WAIT_S (7200), TIMEOUT_S (1500), RUNS (4),
+# ORDER (explicit arm sequence, overrides RUNS), DRY=1 (prints order and fields, runs nothing)
 set -eu
 set -o pipefail
 WT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -13,13 +18,20 @@ BIN_A0=${BIN_A0:-$WT/../g-mesh-wt-gm441-base/target/release/g-mesh}
 LOAD_MAX=${LOAD_MAX:-4}
 LOAD_WAIT_S=${LOAD_WAIT_S:-7200}
 TIMEOUT_S=${TIMEOUT_S:-1500}
-ORDER=${ORDER:-"A0 A1 A0 A1 A0 A1"}
+RUNS=${RUNS:-4}
+if [ -z "${ORDER:-}" ]; then
+  ORDER=
+  b=0
+  while [ $b -lt $((RUNS / 2)) ]; do ORDER="${ORDER:+$ORDER }A1 A0 A0 A1"; b=$((b+1)); done
+fi
 EV=$WT/eval/embedding
 mkdir -p "$OUT"
 SUM=$OUT/summary.txt
 : > "$SUM"
 sumln() { echo "$*" >> "$SUM"; }
 load1() { sysctl -n vm.loadavg | awk '{print $2}'; }
+therm() { pmset -g therm 2>/dev/null | awk -F= '/CPU_Speed_Limit/ {gsub(/ /,"",$2); v=$2} END {print (v == "" ? "n/a" : v)}'; }
+sumln "order: $ORDER"
 export G_MESH_RERANK_MODEL_DIR=$MAIN/work/models/ms-marco-MiniLM-L6-v2
 
 n=0
@@ -35,20 +47,27 @@ for arm in $ORDER; do
   src=/tmp/gm441/src-$run
   home=/tmp/gm441/h-$run
   rm -rf "$src" "$home"
-  cp -c -R "$MAIN/work/corpora/g-mesh" "$src"
   load_before=$(load1)
-  if [ "${DRY:-0}" = 1 ]; then echo '{"ready_t":1,"pass_s":1,"tiers":[],"daemonPid":null}' > "$OUT/$run.out"; continue; fi
+  therm_before=$(therm)
+  if [ "${DRY:-0}" = 1 ]; then
+    sumln "$run load_before=$load_before therm_before=$therm_before (dry)"
+    continue
+  fi
+  cp -c -R "$MAIN/work/corpora/g-mesh" "$src"
   { /usr/bin/time -p python3 "$EV/gm441_confirm.py" --bin "$bin" --project "$src" --home "$home" \
       --out "$OUT/$run.json" --timeout "$TIMEOUT_S" > "$OUT/$run.out" ; } 2> "$OUT/$run.time"
   load_after=$(load1)
+  therm_after=$(therm)
   pid=$(python3 -c "import json;print(json.load(open('$OUT/$run.json'))['daemonPid'])")
   # kill by recorded PID if still alive
   if [ "$pid" != None ] && kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" || true; sumln "  $run: daemon $pid had to be killed"; fi
-  sumln "$run load_before=$load_before load_after=$load_after pid=$pid"
+  sumln "$run load_before=$load_before load_after=$load_after therm_before=$therm_before therm_after=$therm_after pid=$pid"
   sumln "  $(uptime)"
   sumln "  $(tr '\n' ' ' < "$OUT/$run.time")"
   rm -rf "$src"
 done
+
+if [ "${DRY:-0}" = 1 ]; then cat "$SUM"; exit 0; fi
 
 python3 - "$OUT" "$ORDER" >> "$SUM" <<'PY'
 import json, re, statistics, sys
