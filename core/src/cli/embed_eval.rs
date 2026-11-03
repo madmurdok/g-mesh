@@ -790,6 +790,11 @@ fn run_variant(args: &RunArgs) -> Result<()> {
     };
 
     if args.ep != ExecutionTarget::Cpu {
+        // These arms run no encoder, so a provider would be recorded without
+        // having produced anything.
+        if matches!(variant.arm, Arm::Random | Arm::Bm25) {
+            bail!("--ep {} does not apply to {}: it runs no encoder", args.ep.name(), variant.name);
+        }
         log_onnx_runtime_to_stderr();
     }
 
@@ -819,16 +824,21 @@ fn run_variant(args: &RunArgs) -> Result<()> {
 }
 
 /// Sends ONNX Runtime's log (forwarded by `ort` as `tracing` events) to
-/// stderr at info level. Its `GetCapability` line says how many nodes the
-/// execution provider took; a provider that takes none fails no call, so this
-/// line is the only evidence the run did not stay on the CPU provider.
+/// stderr. Its `GetCapability` line says how many nodes the execution
+/// provider took; a provider that takes none fails no call, so this line is
+/// the only evidence the run did not stay on the CPU provider. ONNX Runtime
+/// logs that line at warning level only for more than one partition and at
+/// info level otherwise, and `ort` forwards ONNX Runtime's info as `debug`,
+/// so its forwarding target is let through at `debug`.
 #[cfg(feature = "ep-coreml")]
 fn log_onnx_runtime_to_stderr() {
     use tracing_subscriber::filter::{LevelFilter, Targets};
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::Layer;
-    let filter = Targets::new().with_target("ort", LevelFilter::INFO);
+    let filter = Targets::new()
+        .with_target("ort", LevelFilter::INFO)
+        .with_target("ort::environment", LevelFilter::DEBUG);
     // A second call (or a subscriber set elsewhere) keeps the first one.
     let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(filter))
@@ -1098,7 +1108,8 @@ fn run_corpus(
 }
 
 /// The reference model's run directory for a shuffled arm, checked to be
-/// over the same nodes and queries.
+/// over the same nodes and queries and run on the same execution provider,
+/// whose vectors the shuffled arm then carries.
 fn reference_run(args: &RunArgs, variant: &Variant, corpus: &str, manifest: &Manifest) -> Result<PathBuf> {
     let reference = variant.reference.as_deref().unwrap();
     let dir = run_dir(args, reference, corpus);
@@ -1106,6 +1117,14 @@ fn reference_run(args: &RunArgs, variant: &Variant, corpus: &str, manifest: &Man
         .with_context(|| format!("run the reference {reference} on {corpus} first"))?;
     if theirs.node_ids_sha256 != manifest.node_ids_sha256 || theirs.query_ids != manifest.query_ids {
         bail!("the reference run in {} is over different nodes or queries; re-run it", dir.display());
+    }
+    if theirs.execution_provider != manifest.execution_provider {
+        bail!(
+            "the reference run in {} ran on --ep {}, this run asks for --ep {}; re-run one of them",
+            dir.display(),
+            theirs.execution_provider,
+            manifest.execution_provider
+        );
     }
     Ok(dir)
 }
@@ -1301,6 +1320,11 @@ fn load_arm(eval_dir: &Path, variants: &VariantsFile, run: &Path) -> Result<ArmR
     if outcomes.is_empty() {
         bail!("{} holds no rankings", run.display());
     }
+    // An arm is one provider; arms on different providers may be compared,
+    // and each arm's summary names its provider.
+    if manifests.windows(2).any(|w| w[0].execution_provider != w[1].execution_provider) {
+        bail!("{} mixes corpora run on different --ep values; re-run them on one", run.display());
+    }
     Ok(ArmRun { name, variant, outcomes, manifests, chance_inputs, labels })
 }
 
@@ -1386,6 +1410,7 @@ fn summary(arm: &ArmRun, settings: &config::Settings) -> serde_json::Value {
         "recall@10OverlapFalse": metrics::pooled_mean(&recall_groups(o, 10, |x| !x.overlap)),
         "tokenShareOver512": share_512,
         "tokenShareOver1024": share_1024,
+        "executionProvider": arm.manifests.first().map(|m| m.execution_provider.as_str()),
     })
 }
 

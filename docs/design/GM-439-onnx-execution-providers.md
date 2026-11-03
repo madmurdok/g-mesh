@@ -122,7 +122,9 @@ Fail loudly, never silently: `error_on_failure()` for a registration error,
 and an explicit error when a CoreML target is asked for in a build without
 the feature. The zero-node / partial-placement case cannot be caught through
 `ort` rc.9's API, so the harness records the placement instead: initialise a
-`tracing` subscriber for `ort=info` on stderr when `--ep` is not `cpu` (if
+`tracing` subscriber for `ort=info` (and `ort::environment=debug`, where
+`ort` forwards ONNX Runtime's info level, at which the `GetCapability` line
+of a single-partition placement is logged) on stderr when `--ep` is not `cpu` (if
 the binary has none for that target), and the measure slice greps the
 `GetCapability` line from each run's stderr and reports partitions/nodes.
 A run whose log lacks that line, or says "will not be used", is invalid.
@@ -135,6 +137,11 @@ A run whose log lacks that line, or says "will not be used", is invalid.
   reuse CPU `vectors.bin` and time nothing.
 - `Timings` gains `execution_provider` as well, so `timings.json` says which
   EP produced `embedNodesMs`.
+- `--ep` other than `cpu` is refused for the `random` and `bm25` arms (no
+  encoder runs). A `shuffled` arm requires its reference run to be on the
+  same EP. `report` refuses an arm whose corpora mix EPs and names each
+  arm's EP (`executionProvider`) in its summary; arms on different EPs may
+  still be compared (the quality check needs exactly that).
 
 ## Edit map (1-based lines, branch `feat/GM-439-onnx-execution-providers`)
 
