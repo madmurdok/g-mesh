@@ -749,6 +749,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "toml",
+ "tracing",
  "tracing-subscriber",
  "ureq",
  "windows-sys 0.61.2",

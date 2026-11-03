@@ -198,4 +198,7 @@ windows-sys = { version = "0.61", features = [
 dirs = "5"
 rmcp = { version = "2.2.0", features = ["client", "transport-child-process"] }
 tempfile = "3"
+# The `ep-coreml` ONNX Runtime log test asks the installed subscriber which
+# targets and levels it lets through.
+tracing = "0.1"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }

@@ -1152,6 +1152,21 @@ mod tests {
         assert_eq!(resolve_model_dir(None, "some-model").unwrap(), default_model_dir("some-model").unwrap());
     }
 
+    /// A build without `ep-coreml` refuses a CoreML target with an error
+    /// naming the feature, and the CPU target registers nothing. Control:
+    /// making the non-feature `register` return `Ok(builder)` for CoreML
+    /// (a silent CPU fall-through) fails this.
+    #[cfg(not(feature = "ep-coreml"))]
+    #[test]
+    fn a_coreml_target_without_the_feature_fails_naming_it() {
+        for target in [ExecutionTarget::CoreMl, ExecutionTarget::CoreMlCpuOnly] {
+            let builder = Session::builder().unwrap();
+            let err = format!("{:#}", target.register(builder).err().expect("CoreML must not register"));
+            assert!(err.contains("`ep-coreml`") && err.contains(target.name()), "{err}");
+        }
+        assert!(ExecutionTarget::Cpu.register(Session::builder().unwrap()).is_ok());
+    }
+
     #[test]
     fn mean_pooling_ignores_masked_out_positions() {
         // Two positions, second one padding: the pooled vector must be the
@@ -1286,6 +1301,25 @@ mod tests {
     /// Determinism has to survive a fresh `Session`, not just a repeated call
     /// on a warm one - an index written today is compared against vectors
     /// computed by a process started tomorrow.
+    /// `load_with_options` is the CPU target: both build a session that
+    /// embeds bit-identically. Control: making `load_with_options` pass
+    /// `ExecutionTarget::CoreMl` fails it in a default build.
+    #[test]
+    #[ignore = "needs the real model weights; see the comment above"]
+    fn load_with_options_is_the_cpu_target() {
+        let dir = test_model_dir();
+        let spec = EncoderSpec::production();
+        let options = InferenceOptions::default();
+        let text = "fn read(path: &Path) -> io::Result<String>";
+        let plain = EmbeddingModel::load_with_options(&dir, spec, &options).unwrap().embed(text).unwrap();
+        let cpu = EmbeddingModel::load_with_target(&dir, spec, &options, ExecutionTarget::Cpu)
+            .unwrap()
+            .embed(text)
+            .unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&plain), bits(&cpu));
+    }
+
     #[test]
     #[ignore = "needs the real model weights; see the comment above"]
     fn embedding_is_identical_across_separately_loaded_models() {
