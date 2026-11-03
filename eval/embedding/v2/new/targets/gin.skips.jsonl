@@ -1,0 +1,1 @@
+{"n": 9, "qualifiedName": "SecureJSON.WriteContentType", "reason": "identical twin of 4 other WriteContentType methods in render/json.go (writeContentType(w, jsonContentType) at lines 63,68,90,113,193): expected set would exceed 3"}
