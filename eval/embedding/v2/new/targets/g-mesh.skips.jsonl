@@ -1,0 +1,4 @@
+{"n": 7, "qualifiedName": "storage::index_store::<StoreGuard as DerefMut>::deref_mut", "reason": "trait boilerplate: DerefMut on the store guard returning the inner connection; no behaviour a user would search for"}
+{"n": 19, "qualifiedName": "extractor::emit::Emitter::file_id", "reason": "trivial field getter returning the emitter's file node id (identical in the Python plugin); not a standalone search target"}
+{"n": 21, "qualifiedName": "extractor::emit::Emitter::finish", "reason": "one-line delegation to FileGraphBuilder::finish, with an identical Python twin; better covered by the builder itself"}
+{"n": 38, "qualifiedName": "storage::index_store::<StoreGuard as Deref>::Target", "reason": "associated type `type Target = Connection` of a Deref impl; not a sensible standalone search target"}

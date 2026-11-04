@@ -50,8 +50,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::embedding::model::{
-    cosine_similarity, BatchStats, EmbeddingModel, EncoderSpec, InferenceOptions, ONNX_FILE_NAME,
-    TOKENIZER_FILE_NAME,
+    cosine_similarity, BatchStats, EmbeddingModel, EncoderSpec, ExecutionTarget, InferenceOptions,
+    ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
 };
 use crate::embedding::text::{full_text, is_noise, text_to_embed, EmbedInput};
 
@@ -123,6 +123,11 @@ pub struct RunArgs {
     /// Recompute vectors even when a matching earlier run could be reused.
     #[arg(long)]
     pub force: bool,
+    /// ONNX Runtime execution provider for the encoder. Anything but `cpu`
+    /// needs a build with the `ep-coreml` feature and prints ONNX Runtime's
+    /// node placement on stderr.
+    #[arg(long, value_enum, default_value_t = ExecutionTarget::Cpu)]
+    pub ep: ExecutionTarget,
 }
 
 #[derive(Debug, Args)]
@@ -473,6 +478,14 @@ struct Manifest {
     token_share_over_512: Option<f64>,
     token_share_over_1024: Option<f64>,
     gmesh_version: String,
+    /// `--ep` of the run that wrote vectors.bin; manifests without it were
+    /// written by CPU-only builds.
+    #[serde(default = "cpu_execution_provider")]
+    execution_provider: String,
+}
+
+fn cpu_execution_provider() -> String {
+    ExecutionTarget::Cpu.name().to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -553,6 +566,9 @@ struct Timings {
     /// one-call-per-text path, which pads nothing.
     real_tokens: Option<usize>,
     padded_tokens: Option<usize>,
+    /// `--ep` of this run, the provider behind `embed_nodes_ms`.
+    #[serde(default = "cpu_execution_provider")]
+    execution_provider: String,
 }
 
 fn fingerprint(variant: &Variant) -> String {
@@ -773,6 +789,15 @@ fn run_variant(args: &RunArgs) -> Result<()> {
         args.corpus.clone()
     };
 
+    if args.ep != ExecutionTarget::Cpu {
+        // These arms run no encoder, so a provider would be recorded without
+        // having produced anything.
+        if matches!(variant.arm, Arm::Random | Arm::Bm25) {
+            bail!("--ep {} does not apply to {}: it runs no encoder", args.ep.name(), variant.name);
+        }
+        log_onnx_runtime_to_stderr();
+    }
+
     // One model load for every corpus; its time is recorded per corpus run.
     let load_started = Instant::now();
     let encoder = match variant.arm {
@@ -781,7 +806,11 @@ fn run_variant(args: &RunArgs) -> Result<()> {
             let dir = base.model_dir(eval_dir)?;
             let spec = base.encoder_spec()?;
             let options = InferenceOptions::from_env();
-            Some((base.clone(), dir.clone(), EmbeddingModel::load_with_options(&dir, spec, &options)?))
+            Some((
+                base.clone(),
+                dir.clone(),
+                EmbeddingModel::load_with_target(&dir, spec, &options, args.ep)?,
+            ))
         }
         _ => None,
     };
@@ -793,6 +822,33 @@ fn run_variant(args: &RunArgs) -> Result<()> {
     }
     Ok(())
 }
+
+/// Sends ONNX Runtime's log (forwarded by `ort` as `tracing` events) to
+/// stderr. Its `GetCapability` line says how many nodes the execution
+/// provider took; a provider that takes none fails no call, so this line is
+/// the only evidence the run did not stay on the CPU provider. ONNX Runtime
+/// logs that line at warning level only for more than one partition and at
+/// info level otherwise, and `ort` forwards ONNX Runtime's info as `debug`,
+/// so its forwarding target is let through at `debug`.
+#[cfg(feature = "ep-coreml")]
+fn log_onnx_runtime_to_stderr() {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    let filter = Targets::new()
+        .with_target("ort", LevelFilter::INFO)
+        .with_target("ort::environment", LevelFilter::DEBUG);
+    // A second call (or a subscriber set elsewhere) keeps the first one.
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(filter))
+        .try_init();
+}
+
+/// Without `ep-coreml` a non-CPU target fails at model load, before any
+/// provider could log.
+#[cfg(not(feature = "ep-coreml"))]
+fn log_onnx_runtime_to_stderr() {}
 
 #[allow(clippy::too_many_arguments)]
 fn run_corpus(
@@ -862,6 +918,7 @@ fn run_corpus(
         token_share_over_512,
         token_share_over_1024,
         gmesh_version: env!("CARGO_PKG_VERSION").to_string(),
+        execution_provider: args.ep.name().to_string(),
     };
 
     let previous: Option<Manifest> = if args.force { None } else { read_json(&manifest_path).ok() };
@@ -870,6 +927,7 @@ fn run_corpus(
             && p.snapshot_sha256 == manifest.snapshot_sha256
             && p.node_ids_sha256 == manifest.node_ids_sha256
             && p.dimension == manifest.dimension
+            && p.execution_provider == manifest.execution_provider
     });
     let same_queries = same_nodes
         && previous
@@ -880,6 +938,7 @@ fn run_corpus(
         load_ms,
         node_count: candidates.len(),
         options: encoder.map(|(_, _, model)| model.options()),
+        execution_provider: args.ep.name().to_string(),
         ..Timings::default()
     };
     // Node and query streams are separate, so reusing cached node vectors
@@ -1049,7 +1108,8 @@ fn run_corpus(
 }
 
 /// The reference model's run directory for a shuffled arm, checked to be
-/// over the same nodes and queries.
+/// over the same nodes and queries and run on the same execution provider,
+/// whose vectors the shuffled arm then carries.
 fn reference_run(args: &RunArgs, variant: &Variant, corpus: &str, manifest: &Manifest) -> Result<PathBuf> {
     let reference = variant.reference.as_deref().unwrap();
     let dir = run_dir(args, reference, corpus);
@@ -1057,6 +1117,14 @@ fn reference_run(args: &RunArgs, variant: &Variant, corpus: &str, manifest: &Man
         .with_context(|| format!("run the reference {reference} on {corpus} first"))?;
     if theirs.node_ids_sha256 != manifest.node_ids_sha256 || theirs.query_ids != manifest.query_ids {
         bail!("the reference run in {} is over different nodes or queries; re-run it", dir.display());
+    }
+    if theirs.execution_provider != manifest.execution_provider {
+        bail!(
+            "the reference run in {} ran on --ep {}, this run asks for --ep {}; re-run one of them",
+            dir.display(),
+            theirs.execution_provider,
+            manifest.execution_provider
+        );
     }
     Ok(dir)
 }
@@ -1252,6 +1320,11 @@ fn load_arm(eval_dir: &Path, variants: &VariantsFile, run: &Path) -> Result<ArmR
     if outcomes.is_empty() {
         bail!("{} holds no rankings", run.display());
     }
+    // An arm is one provider; arms on different providers may be compared,
+    // and each arm's summary names its provider.
+    if manifests.windows(2).any(|w| w[0].execution_provider != w[1].execution_provider) {
+        bail!("{} mixes corpora run on different --ep values; re-run them on one", run.display());
+    }
     Ok(ArmRun { name, variant, outcomes, manifests, chance_inputs, labels })
 }
 
@@ -1337,6 +1410,7 @@ fn summary(arm: &ArmRun, settings: &config::Settings) -> serde_json::Value {
         "recall@10OverlapFalse": metrics::pooled_mean(&recall_groups(o, 10, |x| !x.overlap)),
         "tokenShareOver512": share_512,
         "tokenShareOver1024": share_1024,
+        "executionProvider": arm.manifests.first().map(|m| m.execution_provider.as_str()),
     })
 }
 
@@ -2277,6 +2351,18 @@ mod tests {
         arm = "bm25"
         role = "informational"
         filter = "noise"
+
+        [[variant]]
+        name = "rand"
+        arm = "random"
+        role = "informational"
+        dimension = 4
+
+        [[variant]]
+        name = "shuf"
+        arm = "shuffled"
+        role = "informational"
+        reference = "r"
     "#;
 
     /// Writes corpus `corpus` into `eval_dir`: its corpora.toml entry is
@@ -2377,6 +2463,7 @@ mod tests {
                 out: Some(eval_dir.join("runs")),
                 embed_only: false,
                 force: false,
+                ep: ExecutionTarget::Cpu,
             };
             run_variant(&args).unwrap();
             read_rankings(&eval_dir.join("runs").join(variant).join("c").join("rankings.jsonl"))
@@ -2417,5 +2504,198 @@ mod tests {
         assert!(err.contains("a: ") && err.contains("a-001: src/gone.rs m::gone"), "{err}");
         assert!(err.contains("b: ") && err.contains("b-001: src/bare.rs m::bare"), "{err}");
         assert!(!err.contains("ok-001"), "{err}");
+    }
+
+    // --- GM-439: execution provider in run records ------------------------
+
+    fn run_args(eval_dir: &Path, variant: &str, corpus: &[&str], ep: ExecutionTarget) -> RunArgs {
+        RunArgs {
+            dir: EvalDir { eval_dir: eval_dir.to_path_buf() },
+            variant: variant.into(),
+            corpus: corpus.iter().map(|c| c.to_string()).collect(),
+            out: Some(eval_dir.join("runs")),
+            embed_only: false,
+            force: false,
+            ep,
+        }
+    }
+
+    /// An eval dir with corpora `corpora`, each the gold nodes and one query.
+    fn eval_dir_with(corpora: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write_corpora(dir.path(), corpora);
+        for c in corpora {
+            write_corpus(
+                dir.path(),
+                c,
+                &gold_nodes(),
+                &[gold_query(&format!("{c}-001"), "deliver", &[MODULE])],
+            );
+        }
+        dir
+    }
+
+    fn set_manifest_ep(path: &Path, ep: &str) {
+        let mut m: Manifest = read_json(path).unwrap();
+        m.execution_provider = ep.to_string();
+        write_json(path, &m).unwrap();
+    }
+
+    /// `--ep` takes the three documented names and defaults to `cpu`.
+    /// Control: `default_value_t = ExecutionTarget::CoreMl` fails the default.
+    #[test]
+    fn ep_flag_parses_its_three_values_and_defaults_to_cpu() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            run: RunArgs,
+        }
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["t", "--variant", "v"];
+            argv.extend_from_slice(extra);
+            <Cli as clap::Parser>::try_parse_from(argv).map(|c| c.run.ep)
+        };
+        assert_eq!(parse(&[]).unwrap(), ExecutionTarget::Cpu);
+        assert_eq!(parse(&["--ep", "cpu"]).unwrap(), ExecutionTarget::Cpu);
+        assert_eq!(parse(&["--ep", "coreml"]).unwrap(), ExecutionTarget::CoreMl);
+        assert_eq!(parse(&["--ep", "coreml-cpu-only"]).unwrap(), ExecutionTarget::CoreMlCpuOnly);
+        assert!(parse(&["--ep", "cuda"]).is_err());
+        for t in [ExecutionTarget::Cpu, ExecutionTarget::CoreMl, ExecutionTarget::CoreMlCpuOnly] {
+            assert_eq!(parse(&["--ep", t.name()]).unwrap(), t, "name() is the flag value");
+        }
+    }
+
+    /// Manifests and timings written before the field existed read as
+    /// `cpu`. Control: dropping `#[serde(default = ...)]` on
+    /// `Manifest::execution_provider` fails the manifest read.
+    #[test]
+    fn records_without_an_execution_provider_read_as_cpu() {
+        let dir = eval_dir_with(&["c"]);
+        run_variant(&run_args(dir.path(), "rand", &["c"], ExecutionTarget::Cpu)).unwrap();
+        let run = dir.path().join("runs").join("rand").join("c");
+        for file in ["manifest.json", "timings.json"] {
+            let mut value: serde_json::Value = read_json(&run.join(file)).unwrap();
+            assert!(value.as_object_mut().unwrap().remove("executionProvider").is_some(), "{file}");
+            write_json(&run.join(file), &value).unwrap();
+        }
+        let manifest: Manifest = read_json(&run.join("manifest.json")).unwrap();
+        assert_eq!(manifest.execution_provider, "cpu");
+        let timings: Timings = read_json(&run.join("timings.json")).unwrap();
+        assert_eq!(timings.execution_provider, "cpu");
+    }
+
+    /// A run writes its `--ep` into both the manifest and the timings.
+    /// Control: dropping `execution_provider: args.ep.name()...` from the
+    /// `Timings` literal in `run_corpus` leaves it empty.
+    #[test]
+    fn a_run_records_its_execution_provider() {
+        let dir = eval_dir_with(&["c"]);
+        run_variant(&run_args(dir.path(), "rand", &["c"], ExecutionTarget::Cpu)).unwrap();
+        let run = dir.path().join("runs").join("rand").join("c");
+        let manifest: serde_json::Value = read_json(&run.join("manifest.json")).unwrap();
+        assert_eq!(manifest["executionProvider"], "cpu");
+        let timings: serde_json::Value = read_json(&run.join("timings.json")).unwrap();
+        assert_eq!(timings["executionProvider"], "cpu");
+    }
+
+    /// Cached node vectors are reused only from a run on the same provider.
+    /// The cached vectors.bin is emptied, so a reuse fails to read it and a
+    /// recompute rewrites it. Control: dropping the `execution_provider`
+    /// term from `same_nodes` makes the last run reuse (and fail).
+    #[test]
+    fn vectors_from_another_execution_provider_are_not_reused() {
+        let dir = eval_dir_with(&["c"]);
+        let args = run_args(dir.path(), "rand", &["c"], ExecutionTarget::Cpu);
+        run_variant(&args).unwrap();
+        let run = dir.path().join("runs").join("rand").join("c");
+        let vectors = run.join("vectors.bin");
+        let size = std::fs::metadata(&vectors).unwrap().len();
+        assert!(size > 0);
+
+        // Same provider: reused, so the emptied file is read and rejected.
+        std::fs::write(&vectors, b"").unwrap();
+        let err = format!("{:#}", run_variant(&args).unwrap_err());
+        assert!(err.contains("vectors.bin"), "{err}");
+
+        // The cached run was on another provider: recomputed.
+        set_manifest_ep(&run.join("manifest.json"), "coreml");
+        run_variant(&args).unwrap();
+        assert_eq!(std::fs::metadata(&vectors).unwrap().len(), size);
+        let manifest: Manifest = read_json(&run.join("manifest.json")).unwrap();
+        assert_eq!(manifest.execution_provider, "cpu");
+    }
+
+    /// Arms without an encoder refuse a non-CPU `--ep` and write nothing.
+    /// Control: removing the `Arm::Random | Arm::Bm25` bail in
+    /// `run_variant` lets both run.
+    #[test]
+    fn a_non_cpu_ep_on_an_arm_without_encoder_fails() {
+        let dir = eval_dir_with(&["c"]);
+        for variant in ["rand", "bm25"] {
+            for ep in [ExecutionTarget::CoreMl, ExecutionTarget::CoreMlCpuOnly] {
+                let err =
+                    format!("{:#}", run_variant(&run_args(dir.path(), variant, &["c"], ep)).unwrap_err());
+                assert!(err.contains(&format!("--ep {}", ep.name())) && err.contains(variant), "{err}");
+                assert!(err.contains("runs no encoder"), "{err}");
+            }
+            assert!(!dir.path().join("runs").join(variant).exists(), "{variant}");
+        }
+    }
+
+    /// A shuffled arm carries its reference's vectors, so the reference
+    /// must have run on the same provider. Control: removing the
+    /// `execution_provider` check in `reference_run` returns the directory.
+    #[test]
+    fn a_shuffled_arm_refuses_a_reference_on_another_provider() {
+        let dir = eval_dir_with(&["c"]);
+        run_variant(&run_args(dir.path(), "rand", &["c"], ExecutionTarget::Cpu)).unwrap();
+        let ours: Manifest = read_json(&dir.path().join("runs/rand/c/manifest.json")).unwrap();
+        let reference = dir.path().join("runs").join("r").join("c");
+        std::fs::create_dir_all(&reference).unwrap();
+        write_json(&reference.join("manifest.json"), &ours).unwrap();
+
+        let variants = VariantsFile::parse(VARIANTS).unwrap();
+        let shuf = variants.get("shuf").unwrap();
+        let args = run_args(dir.path(), "shuf", &["c"], ExecutionTarget::Cpu);
+        assert_eq!(reference_run(&args, shuf, "c", &ours).unwrap(), reference);
+
+        set_manifest_ep(&reference.join("manifest.json"), "coreml");
+        let err = format!("{:#}", reference_run(&args, shuf, "c", &ours).unwrap_err());
+        assert!(err.contains("--ep coreml") && err.contains("--ep cpu"), "{err}");
+    }
+
+    /// An arm is read only when all its corpora ran on one provider, and
+    /// its summary names that provider. Control: removing the
+    /// `manifests.windows(2)` check in `load_arm` loads the mixed arm;
+    /// removing `executionProvider` from `summary` fails the last assert.
+    #[test]
+    fn an_arm_is_one_execution_provider_and_its_summary_names_it() {
+        let dir = eval_dir_with(&["a", "b"]);
+        run_variant(&run_args(dir.path(), "rand", &["a", "b"], ExecutionTarget::Cpu)).unwrap();
+        let run = dir.path().join("runs").join("rand");
+        let variants = VariantsFile::parse(VARIANTS).unwrap();
+
+        set_manifest_ep(&run.join("b").join("manifest.json"), "coreml");
+        let err = format!("{:#}", load_arm(dir.path(), &variants, &run).err().unwrap());
+        assert!(err.contains("mixes corpora run on different --ep values"), "{err}");
+
+        set_manifest_ep(&run.join("a").join("manifest.json"), "coreml");
+        let arm = load_arm(dir.path(), &variants, &run).unwrap();
+        assert_eq!(arm.manifests.len(), 2);
+        assert_eq!(summary(&arm, &variants.settings)["executionProvider"], "coreml");
+    }
+
+    /// A non-CPU run lets ONNX Runtime's log through to stderr, including
+    /// its info level (forwarded by `ort` as `debug` on `ort::environment`),
+    /// where a 0- or 1-partition `GetCapability` line is logged. Control:
+    /// lowering the `ort::environment` target to `LevelFilter::INFO` in
+    /// `log_onnx_runtime_to_stderr` fails the debug assert.
+    #[cfg(feature = "ep-coreml")]
+    #[test]
+    fn a_non_cpu_run_lets_onnx_runtime_info_through() {
+        log_onnx_runtime_to_stderr();
+        assert!(tracing::enabled!(target: "ort::environment", tracing::Level::DEBUG));
+        assert!(tracing::enabled!(target: "ort::environment", tracing::Level::WARN));
+        assert!(tracing::enabled!(target: "ort", tracing::Level::INFO));
     }
 }

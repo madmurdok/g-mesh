@@ -402,6 +402,43 @@ pair. So **the D9 rule is unchanged**: the pass-time term is measured as
 above. The predicted ratios may be reported beside it as context, never as
 the gate value.
 
+## Entry 2026-11-03: v2, an enlarged query set (GM-460)
+
+Design: `docs/design/GM-460-enlarged-nl-eval.md`. Freeze record:
+`docs/results/gm-460-enlarged-eval.md`. Files: `eval/embedding/v2/`.
+
+- **A new instrument version, not an extension of D2.** v2 is GM-398's 400
+  positives plus GM-422's confirm set plus 270 new positives and 68 new
+  absent queries. D2's decision set, and the int8-vs-fp32 verdict taken on
+  it, stay as recorded. **No int8-vs-fp32 decision is taken on v2**: the
+  confirm queries were "all held-out" for that verdict only, and in v2 they
+  follow the D6 split like every other query, so v2 numbers are not
+  comparable to that verdict's. The old query files are never edited;
+  `v2/build.py` pins their sha256 and `v2/queries/<corpus>.jsonl` is those
+  bytes followed by the new ones.
+- **D6 split unchanged.** Side is `sha256(id)` parity (`is_held_out_id`) on
+  the id alone, so every GM-398 and confirm query keeps its side. New
+  queries get ids `<prefix>-eNNN` and follow the same rule. Nothing is
+  hand-labelled.
+- **Strict held-out view.** Every v2 report adds a view that drops each
+  held-out query sharing an expected symbol with a FIT query; a learned
+  layer is judged on both views. Current pairs (freeze record, "Cross-side
+  overlap"): `rg-042` ~ `rg-c047` (old vs old) and `req-c025` ~ `req-e032`
+  (new: `req-e032` lists `HTTPDigestAuth.__eq__` as an additional acceptable
+  answer), so 2 held-out queries are dropped. The split is not changed to
+  avoid them.
+- **Target n per language: 330 positives + 83 absent** (1,320 and 332 in
+  all; held-out about half). It buys a per-language Q4 95% half-width of at
+  most 7.5 points, and for Q5 12-15 points in go, python and typescript
+  (enough to show a +26 excess with its lower bound above +10, not a +5
+  one); rust gets about 19 points and is read as direction only, its rank-1
+  rate being 0.13-0.15. These are planning values (design section 3). The
+  **achieved** widths come from the GM-460 measure's observed SDs and are
+  reported in `docs/results/gm-460-enlarged-eval.md`, not here.
+- **Authoring.** The stage-2 queries were written blind, one fresh author per
+  corpus; a first attempt (one agent, a brief that exposed the split rule)
+  was reverted. See the freeze record's "Deviations".
+
 ## Code facts this relies on (from g-mesh, 2026-09-26)
 
 - `text_to_embed` is defined at `core/src/embedding/pipeline.rs:719`,

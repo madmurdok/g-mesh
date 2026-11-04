@@ -19,6 +19,7 @@
 # eval/embedding/corpora.toml and variants.toml.
 /eval/embedding/work/
 /eval/embedding/confirm/work/
+/eval/embedding/v2/work/
 
 # BlueprintAI output (model.json, report.html, cache/, work/).
 /.blueprint/

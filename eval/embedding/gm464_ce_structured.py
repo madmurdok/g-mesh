@@ -30,6 +30,7 @@ Controls (any failure is a STOP):
 
 usage: gm464_ce_structured.py --work <eval/embedding/work> [--k 30] [--table out.md]
        [--dry-run CORPUS]  (one corpus, no controls that need all corpora)
+       [--eval-dir eval/embedding/v2]  (GM-460: v2 queries; C3 needs the old lists and is skipped)
 """
 import argparse
 import hashlib
@@ -200,6 +201,7 @@ def main():
     ap.add_argument("--k", type=int, default=30)
     ap.add_argument("--table", type=Path)
     ap.add_argument("--dry-run", metavar="CORPUS")
+    ap.add_argument("--eval-dir", type=Path, default=HERE, help="query files; a v2 eval dir skips C3 (old int8 lists only)")
     a = ap.parse_args()
     toml = (HERE / "variants.toml").read_text()
     for key in ("bootstrap_seed", "bootstrap_resamples"):
@@ -209,7 +211,7 @@ def main():
     corpora = [p.name for p in sorted((a.work / "runs" / R.REF).iterdir()) if (p / "rankings.jsonl").exists()]
     if a.dry_run:
         corpora = [a.dry_run]
-    cs = [R.Corpus(a.work, HERE, c, 3 if a.dry_run else 0) for c in corpora]
+    cs = [R.Corpus(a.work, a.eval_dir, c, 3 if a.dry_run else 0) for c in corpora]
     for c in cs:
         add_structured(c, a.work)
     n_changed = sum(sum(c.stext[n] != c.text[n] for n in c.stext) for c in cs)
@@ -280,12 +282,14 @@ def main():
                 f"{g32['mrr'][0]:+.3f}", f"{g32['mrr'][1]:+.3f}")
 
     # ---- C3: GM-443 S14's F4 K=30 beta=80 through this path (old int8, old cache, old floors) ----
-    old = f4(R.INT8, 30, 80.0)
-    got = cells(row("C3", old, OLD_FLOORS, B[R.INT8], OLD_FLOORS))
-    want = (0.691, 0.465, "+4.6", "+2.1", "+0.046", "+0.021", "+5.8", "+2.4", "+0.042", "+0.014")
-    print(f"C3 GM-443 S14 F4 K=30 beta=80 reproduced: {got}\n   {'MATCH' if got == want else 'MISMATCH, want ' + str(want)}")
-    if got != want:
-        sys.exit("STOP: C3 failed")
+    old = None
+    if a.eval_dir == HERE:
+        old = f4(R.INT8, 30, 80.0)
+        got = cells(row("C3", old, OLD_FLOORS, B[R.INT8], OLD_FLOORS))
+        want = (0.691, 0.465, "+4.6", "+2.1", "+0.046", "+0.021", "+5.8", "+2.4", "+0.042", "+0.014")
+        print(f"C3 GM-443 S14 F4 K=30 beta=80 reproduced: {got}\n   {'MATCH' if got == want else 'MISMATCH, want ' + str(want)}")
+        if got != want:
+            sys.exit("STOP: C3 failed")
 
     # ---- C4: rerank disabled == int8-structured ----
     r8s = row("int8-structured (no rerank, shipped floors)", B[ST], shipped, B[ST], shipped)
@@ -344,8 +348,9 @@ def main():
     o = f4(ST, K, 80.0, ftx)
     rows.append(row(lab, o, shipped, B[ST], shipped))
     variants.append((lab, o))
-    lab = "GM-443 F4 K=30 beta=80 (full-text int8 + full-text CE, old floors; C3)"
-    rows.append(row(lab, old, OLD_FLOORS, B[ST], shipped))
+    if old is not None:
+        lab = "GM-443 F4 K=30 beta=80 (full-text int8 + full-text CE, old floors; C3)"
+        rows.append(row(lab, old, OLD_FLOORS, B[ST], shipped))
 
     by8 = {o_["id"]: o_ for o_ in B[ST]}
     vf = all(R.clears(o_, shipped) == R.clears(by8[o_["id"]], shipped) for _, v in variants for o_ in v)
