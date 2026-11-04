@@ -688,11 +688,11 @@ def main(argv=None):
             sys.exit(f"STOP: C4{tag} failed")
         S.append(f"C4{tag} pass ('{label}')")
 
-    if current_set or a.c4_doc:
+    if current_set:
         c4("", c4_target(a.c4_doc or C4_DOC, a.c4_section if a.c4_doc else C4_SECTION,
                          a.c4_label or (C4_LABEL if not a.c4_doc else V2_C4_LABEL)))
     else:
-        c4("a", c4_target(V2_C4_DOC, a.c4_section, V2_C4_LABEL))
+        c4("a", c4_target(a.c4_doc or V2_C4_DOC, a.c4_section, V2_C4_LABEL))
     if not current_set:
         c4("b (GM-398 ids)", c4_target(C4_DOC, C4_SECTION, C4_LABEL), gm398_ids(cs))
 
