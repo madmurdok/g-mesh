@@ -5,7 +5,9 @@ Setup A (shipped F4, K=30), eval set v2 (`eval/embedding/v2`, work dir GM-460's,
 
 ## Verdict
 
-**no effect, by the pre-fixed rule, but only because of its D9 clause.** all minus off at the tuned betas (all beta 40, off beta 80), held-out NL: dr@10 +2.5 [+1.0, +4.0], dMRR +0.030 [+0.017, +0.043]. Both lower bounds are above 0, so the metric clauses of "helps" hold. D9 vs int8-structured passes for every row. D9 vs fp32 fails Q5 for every row, including int8-structured with no rerank and off (F4 today): that is the floor-parity finding of GM-460 (shipped floors fall short on v2), not an effect of the richer text. The rule as written needs D9 vs fp32 to pass, so the driver prints "no effect". The owner should decide whether to read the D9 clause against fp32 as "no worse than off" (then: helps). The body-48 row was not run: the owner's decision conditions it on an effect under the rule. It is ~15k pairs, ~7 min if wanted.
+**helps.** all minus off at the tuned betas (all beta 40, off beta 80), held-out NL: dr@10 +2.5 [+1.0, +4.0], dMRR +0.030 [+0.017, +0.043]. Both lower bounds are above 0, so the metric clauses of "helps" hold. D9 vs int8-structured passes for every row.
+
+**The pre-fixed rule was amended after measuring.** As written (design note section 6) it required D9 to pass vs fp32 as well. That clause fails Q5 for every row, including int8-structured with no rerank and off (F4 as shipped): the floor-parity finding of GM-460 (shipped floors fall short on v2), not an effect of the richer text. Because it fails for the shipped baseline too, it does not discriminate between arms. The driver therefore printed "no effect" on the rule as written; the owner decided to drop the clause. Owner decisions, quoted verbatim: "Да, helps; fp32 из правила убрать (Recommended)" and "Да, прогнать (Recommended)" (run the all-b48 row). The verdict is decided by all-minus-off plus D9 vs int8-structured.
 
 Strict held-out view (queries sharing an expected symbol with a FIT query dropped) gives numbers identical to the plain held-out view for off vs all.
 
@@ -36,12 +38,14 @@ Driver fix (small, in this commit): C4a read GM-460's results doc for a table ro
 | -I, beta 40 | 0.680 | 0.470 | |
 | -P, beta 40 | 0.673 | 0.448 | |
 | -B, beta 40 | 0.661 | 0.441 | |
+| all-b48, beta 20 (FIT-tuned; name queries in off order) | 0.676 [0.647, 0.705] | 0.450 [0.425, 0.477] | 0.973 / 0.917 |
+| all-b48, beta 80 | 0.667 [0.637, 0.696] | 0.442 [0.416, 0.468] | 0.970 / 0.880 |
 
 D9 vs int8-structured at shipped floors: off Q1 +3.7, Q2 +0.043, Q4 -2.8, Q5 +0.0; all (beta 40) Q1 +6.2 [+4.4], Q2 +0.073 [+0.055], Q4 -4.0 [-2.3], Q5 +0.0 [+0.0]; pass. Q3 worst language: all python +3.2 (beta 80), typescript +2.2 (beta 40). vs fp32: all Q1 +5.8, Q2 +0.075, Q4 -22.0, Q5 +9.6 [+13.8]; Q5 fails, as for every row incl. off (+9.9) and int8-structured (+11.1).
 
 GM-434 (NL misled / CW pos / CW absent; name misled / CW pos / CW absent): int8-structured 22% (40/184) / 50% (338/681) / 23% (37/164); 2% (9/594) / 30% (263/879) / 20% (184/900). off 24% (52/220) / 46% (314/681) / 23% (37/164); 3% (22/714) / 18% (156/879) / 20% (184/900). all beta 40 25% (60/238) / 45% (304/681) / 23% (37/164); 3% (22/715) / 18% (155/879) / 20% (184/900). Flips (right to wrong / wrong to right), NL held-out: off 14 / 38, all 21 / 55 (n=482); name: off 1 / 108, all 3 / 111 (n=848).
 
-Mean tokens per window node: off 38.4, all 110.2, -E 106.4, -I 101.2, -P 102.8, -B 58.5.
+Mean tokens per window node: off 38.4, all 110.2, all-b48 85.9, -E 106.4, -I 101.2, -P 102.8, -B 58.5.
 
 Beta: all arm peaks at 40 on FIT (held-out r@10 0.674 at 40, 0.679 at 20, 0.670 at 80), so the richer text wants a smaller beta than 80. Full sweep in the tables file.
 
@@ -74,9 +78,21 @@ Dry run (gin): 19.64 ms/pair on 200 new pairs, ETA 5733 s; actual full scoring 2
 
 Not done in this slice: M4 (enclosing-prefix counts per language); the verify slice owns the builder's field rules.
 
-## Port task draft (not created; the verdict above awaits the owner's reading of the D9 clause)
+## Body-48 row (all-b48, run after the owner's decision)
 
-"Port the enriched reranker text to the product: build the CE text with the E (enclosing), P (path/name words) and B (96-token body) fields, and the I field only if re-measured, on top of the structured header; re-tune the rerank beta (measured optimum 40 on v2, not 80). B carries the gain per the leave-one-out (-B: dMRR -0.016 [-0.026, -0.007]), then P; E and I are within noise or negative. Gate: median added latency per query at K=30 against the 2.7x token growth (110 vs 38 tokens per node; ~26 ms/pair here vs 9.6 ms), and D9 vs int8-structured on v2 at the shipped floors."
+Same arms and floors; body budget 48 instead of 96, authored NL only, tuned beta 20 (all: 40).
+
+- all-b48 minus all (paired, held-out NL, tuned betas): dr@10 +0.2 [-1.0, +1.4], dMRR -0.007 [-0.016, +0.002]. Within noise, so 48 tokens keeps the gain.
+- all-b48 minus off: point estimates only (the driver prints no CI for this pair): dr@10 +2.7 (0.676 vs 0.649), dMRR +0.023 (0.450 vs 0.427). Compare all minus off +2.5 / +0.030.
+- D9 vs int8-structured at the shipped floors (beta 20): Q1 +6.4 [+4.4], Q2 +0.067 [+0.047], Q3 worst typescript +3.3, Q4 -4.0 [-2.1], Q5 +0.0 [+0.0]; pass. (vs fp32: Q5 fails as for every row.)
+- Cost: 85.9 mean tokens per node (all: 110.2, off: 38.4); 52.21 ms/pair on this run (28157 pairs, 1470 s) under load, not comparable with the earlier ms/pair and not a latency result.
+- Machine: start 16:11 load 7.24 5.73 10.84, end 16:36 load 14.51 26.61 31.36 (another load on the machine; CPU_Speed_Limit 100 at start, 63 at end); `/usr/bin/time -p`: real 1533.41, user 4710.40, sys 74.13 (user/real ~3.1). The off and all arms were cached.
+- Name queries use the off order in this arm; the all-b48 name MRR 0.917 at beta 20 is the off-order name path with a different beta, not a body effect. Only the NL numbers carry the claim.
+- LOO arms were not rerun in this pass; the tables below are from the earlier run, plus the new rows in `tables.md` of this run.
+
+## Port task draft (verdict: helps; no longer awaiting the owner)
+
+"Port the enriched reranker text to the product: build the CE text with the E (enclosing), P (path/name words) and B (**48-token** body) fields, and the I field only if re-measured, on top of the structured header; re-tune the rerank beta (measured optimum 20 for b48, 40 for b96 on v2, not 80). B carries the gain per the leave-one-out (-B: dMRR -0.016 [-0.026, -0.007]), then P; E and I are within noise or negative. The 48-token body keeps the gain (all-b48 minus all: dr@10 +0.2 [-1.0, +1.4], dMRR -0.007 [-0.016, +0.002]) at 86 instead of 110 tokens per node (off: 38). Gate: median added latency per query at K=30 against the token growth (86 vs 38 tokens per node), and D9 vs int8-structured on v2 at the shipped floors."
 
 ## Tables
 

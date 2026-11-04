@@ -260,6 +260,8 @@ whether fixing that mechanism matters.
 - **hurts**: either upper bound < 0;
 - otherwise **no effect**.
 
+*Amendment (2026-11-04, after measuring): the owner dropped the D9-vs-fp32 clause (it fails Q5 for the shipped F4 and int8-structured rows too, so it does not discriminate); the verdict is decided by all-minus-off plus D9 vs int8-structured. Rule text above unchanged. See the results doc.*
+
 The signature-only bucket is reported but cannot carry the verdict alone:
 on the current set its held-out n is small. If "helps" holds, the results
 doc names the cheapest LOO arm (fewest tokens) whose paired Δ against all
