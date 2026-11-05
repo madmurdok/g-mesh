@@ -1414,6 +1414,40 @@ fn summary(arm: &ArmRun, settings: &config::Settings) -> serde_json::Value {
     })
 }
 
+/// Languages whose shipped similarity floor the parity gate enforces.
+/// TypeScript is reported but exempt from the gate.
+const GATED_FLOOR_LANGUAGES: [&str; 3] = ["go", "python", "rust"];
+
+/// The reference's floors re-derived on mechanical name queries, compared with
+/// the shipped ones. Returns the per-language report entries and the validity
+/// errors. A gated language with no name-query floor in the reference is an
+/// error and has no entry.
+fn floor_parity(reference: &[metrics::Outcome]) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
+    let name_floors = metrics::fit_name_floors(reference);
+    let mut entries = serde_json::Map::new();
+    let mut errors = Vec::new();
+    for (language, fitted) in &name_floors {
+        let shipped = crate::mcp::shipped_similarity_floor(language);
+        let gated = language != "typescript";
+        let ok = (fitted - shipped).abs() <= 0.03 + 1e-9;
+        if gated && !ok {
+            errors.push(format!(
+                "reference floor for {language} {fitted:.2} is not within 0.03 of shipped {shipped:.2}"
+            ));
+        }
+        entries.insert(
+            language.clone(),
+            json!({"fitted": fitted, "shipped": shipped, "gated": gated, "passes": ok}),
+        );
+    }
+    for language in GATED_FLOOR_LANGUAGES {
+        if !name_floors.contains_key(language) {
+            errors.push(format!("floor parity: no name queries for {language}"));
+        }
+    }
+    (entries, errors)
+}
+
 fn floors_and_rates(arm: &ArmRun) -> (Floors, BTreeMap<String, Option<f64>>, serde_json::Value) {
     let floors = metrics::fit_floors(&arm.outcomes);
     let languages: Vec<String> = {
@@ -1479,7 +1513,6 @@ fn report(args: &ReportArgs) -> Result<()> {
 
     let r10_bound = |arm: &ArmRun| bound_of(&recall_groups(&arm.outcomes, 10, |_| true), settings);
     let reference_r10 = r10_bound(reference).context("the reference scored no positives")?;
-    let reference_name_floors = metrics::fit_name_floors(&reference.outcomes);
 
     // --- D7: controls ---------------------------------------------------------
     let mut validity_errors = Vec::new();
@@ -1517,21 +1550,8 @@ fn report(args: &ReportArgs) -> Result<()> {
     }
     // Harness parity #2: the reference's floors re-derived on name queries
     // against the shipped ones, which are fitted on that query shape.
-    let mut floor_parity = serde_json::Map::new();
-    for (language, fitted) in &reference_name_floors {
-        let shipped = crate::mcp::shipped_similarity_floor(language);
-        let gated = language != "typescript";
-        let ok = (fitted - shipped).abs() <= 0.03 + 1e-9;
-        if gated && !ok {
-            validity_errors.push(format!(
-                "reference floor for {language} {fitted:.2} is not within 0.03 of shipped {shipped:.2}"
-            ));
-        }
-        floor_parity.insert(
-            language.clone(),
-            json!({"fitted": fitted, "shipped": shipped, "gated": gated, "passes": ok}),
-        );
-    }
+    let (floor_parity, parity_errors) = floor_parity(&reference.outcomes);
+    validity_errors.extend(parity_errors);
     let reference_valid: Result<(), String> =
         if validity_errors.is_empty() { Ok(()) } else { Err(validity_errors.join("; ")) };
 
