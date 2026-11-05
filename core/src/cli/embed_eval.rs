@@ -1428,7 +1428,7 @@ fn floor_parity(reference: &[metrics::Outcome]) -> (serde_json::Map<String, serd
     let mut errors = Vec::new();
     for (language, fitted) in &name_floors {
         let shipped = crate::mcp::shipped_similarity_floor(language);
-        let gated = language != "typescript";
+        let gated = GATED_FLOOR_LANGUAGES.contains(&language.as_str());
         let ok = (fitted - shipped).abs() <= 0.03 + 1e-9;
         if gated && !ok {
             errors.push(format!(
@@ -2777,6 +2777,17 @@ mod tests {
             entries["typescript"],
             json!({"fitted": 0.9, "shipped": 0.53, "gated": false, "passes": false})
         );
+    }
+
+    /// Only the gate list is gated: a language outside it (no calibrated
+    /// floor) is reported, never an error.
+    #[test]
+    fn floor_parity_does_not_gate_a_language_outside_the_gate_list() {
+        let pool = names(&[("go", 0.57), ("python", 0.59), ("rust", 0.57), ("java", 0.90)]);
+        let (entries, errors) = floor_parity(&pool);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(entries["java"]["gated"], json!(false));
+        assert_eq!(entries["java"]["passes"], json!(false));
     }
 
     /// A difference of exactly 0.03 passes on both sides of every gated
