@@ -827,6 +827,82 @@ fn an_unreadable_file_or_span_gives_a_text_and_no_root_gives_no_body() {
     }
 }
 
+/// The `search_code` tool, called through the served `GMeshMcpServer`,
+/// reads each node's file under the registry's project root: the texts it
+/// scores, in window (cosine) order, carry the bodies, which the handler
+/// adds only from a root.
+///
+/// *Control:* pass `None` for the project root in
+/// `GMeshMcpServer::search_code`.
+#[tokio::test]
+async fn the_tool_reads_the_body_under_the_project_root() {
+    use super::search_code_worker_tests::{call, connect};
+    use super::GMeshMcpServer;
+    use crate::daemon::indexing_status::{IndexingStatus, Phase};
+    use crate::daemon::lifecycle::CoreActivity;
+    use crate::daemon::manifest::DiscoveredPlugins;
+    use crate::daemon::registry::PluginRegistry;
+
+    let query = "parseConfig";
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(root.join("src/config.rs"), "fn n00() {\n    read_the_file();\n}\n").unwrap();
+    std::fs::write(root.join("src/other.rs"), "fn n01() {\n    parse_it();\n}\n").unwrap();
+
+    register_extension();
+    let conn = Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    for (i, (id, file_path)) in [("n00", "src/config.rs"), ("n01", "src/other.rs")].into_iter().enumerate() {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, \
+             language, signature)
+             VALUES (?1, 'Function', ?1, ?2, ?3, 0, 0, 2, 0, 'rust', ?4)",
+            rusqlite::params![id, format!("pkg::{id}"), file_path, format!("fn {id}()")],
+        )
+        .unwrap();
+        insert(&conn, id, &vector_at(query, 0.9 - 0.1 * i as f64), "v1").unwrap();
+    }
+    let store = Arc::new(IndexStore::new(conn));
+
+    let capture = Capture::default();
+    let scorer = capture.clone();
+    let lines = Lines::default();
+    let reranker = Reranker::with_parts(
+        || RerankSettings { enabled: true, model_dir: Ok("/stub".into()) },
+        move |_| Ok(Box::new(scorer.clone()) as Box<dyn Scorer>),
+        lines.sink(),
+    );
+    let embedding = Arc::new(fake(&dir.path().join("model")).with_reranker(reranker));
+    let indexing = IndexingStatus::structural();
+    indexing.set_phase(Phase::Ready);
+    let registry = Arc::new(PluginRegistry::new(
+        &root,
+        state,
+        DiscoveredPlugins::default(),
+        None,
+        None,
+        Arc::new(EmbeddingPipeline::disabled()),
+    ));
+    let server = GMeshMcpServer::new(store, registry, CoreActivity::new(), indexing, embedding);
+
+    let client = connect(server).await;
+    let result = call(&client, "search_code", serde_json::json!({ "query": query })).await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_eq!(lines.count(), 0, "the rerank fell back: {:?}", lines.0.lock().unwrap());
+    let calls = capture.0.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "one scoring call");
+    assert_eq!(
+        calls[0].1,
+        [
+            "function pkg\nsrc config rs\nfn n00()\nread_the_file();",
+            "function pkg\nsrc other rs\nfn n01()\nparse_it();"
+        ]
+    );
+}
+
 /// `search_code` never applies a strip prefix (GM-482, decision D4): an
 /// `@`-query is embedded and answered as typed, exactly as with no
 /// `[plugin.symbol_query_prefixes]` declared anywhere.
