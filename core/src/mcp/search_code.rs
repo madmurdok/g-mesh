@@ -9,6 +9,7 @@
 //! to resolve before searching and no `still_indexing`-style staleness check
 //! beyond the shared one `prepare` already runs.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,8 +22,8 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::daemon::indexing_status::Phase;
+use crate::embedding::ce_text::{ce_text, source_lines, CeNode};
 use crate::embedding::rerank::{self, RerankOutcome, Scorer};
-use crate::embedding::text::text_to_embed;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
 use crate::storage::index_store::IndexStore;
@@ -296,9 +297,10 @@ pub(super) async fn handle_off_worker(
     hints: SessionHints,
     params: SearchCodeParams,
     coverage: Option<Coverage>,
+    project_root: Option<PathBuf>,
 ) -> Result<CallToolResult, ErrorData> {
     tokio::task::spawn_blocking(move || {
-        handle(&store, &embedding, &shapes, &hints, params, coverage.as_ref())
+        handle(&store, &embedding, &shapes, &hints, params, coverage.as_ref(), project_root.as_deref())
     })
     .await
     .map_err(|e| internal_error("search_code task failed", e.into()))?
@@ -312,7 +314,8 @@ pub(super) async fn handle_off_worker(
 ///
 /// Only a first, complete page is reranked (`embedding::rerank`), and its
 /// verdict is judged on the embedding order's page, so the verdict never
-/// depends on the rerank.
+/// depends on the rerank. The reranker's texts read their body lines from
+/// the files under `project_root`; with `None` they have no body.
 pub(super) fn handle(
     store: &Arc<IndexStore>,
     embedding: &EmbeddingPipeline,
@@ -320,6 +323,7 @@ pub(super) fn handle(
     hints: &SessionHints,
     params: SearchCodeParams,
     coverage: Option<&Coverage>,
+    project_root: Option<&Path>,
 ) -> Result<CallToolResult, ErrorData> {
     let Some(query_vector) = embedding.embed_query(&params.query) else {
         return error(
@@ -356,9 +360,15 @@ pub(super) fn handle(
         _ => None,
     };
     let ranked = match (scorer, cursor.and_then(split_rerank_cursor)) {
-        (Some(scorer), _) => {
-            first_page_reranked(&conn, embedding, scorer, &params.query, &query_vector, page_size)
-        }
+        (Some(scorer), _) => first_page_reranked(
+            &conn,
+            embedding,
+            scorer,
+            &params.query,
+            &query_vector,
+            page_size,
+            project_root,
+        ),
         (None, Some(rerank_cursor)) => continue_rerank(&conn, &query_vector, page_size, rerank_cursor),
         (None, None) => search(&conn, &query_vector, page_size, cursor).map(Ranked::plain),
     }
@@ -485,13 +495,15 @@ fn first_page_reranked(
     query: &str,
     query_vector: &[f32],
     page_size: usize,
+    project_root: Option<&Path>,
 ) -> anyhow::Result<Ranked> {
     let mut window = search(conn, query_vector, page_size.max(rerank::WINDOW), None)?;
     let reranked = window.results.len().min(rerank::WINDOW);
     if reranked < 2 {
         return search(conn, query_vector, page_size, None).map(Ranked::plain);
     }
-    let texts = window_texts(conn, &window.results[..reranked])?;
+    let texts =
+        window_texts(conn, &window.results[..reranked], project_root, &|text| scorer.count_tokens(text))?;
     let cosines: Vec<f64> = window.results[..reranked].iter().map(|row| row.score).collect();
     let Some(order) = embedding.reranker().order(scorer, query, &texts, &cosines) else {
         return search(conn, query_vector, page_size, None).map(Ranked::plain);
@@ -516,20 +528,82 @@ fn first_page_reranked(
     Ok(Ranked { page, judged: Some(judged) })
 }
 
-/// The text each row was embedded from, which is also what the
-/// cross-encoder reads: `text_to_embed` of the node's current doc comment
-/// and signature.
-fn window_texts(conn: &Connection, rows: &[SearchResult]) -> anyhow::Result<Vec<String>> {
-    let mut statement = conn.prepare_cached("SELECT docComment, signature FROM nodes WHERE id = ?1")?;
+/// The cross-encoder's text of each row ([`ce_text`]), from the node's
+/// current columns and its file under `project_root` (no body without a
+/// root, or for a file that cannot be read). Each distinct file is read
+/// once per call. A row whose node is gone gets an empty text.
+fn window_texts(
+    conn: &Connection,
+    rows: &[SearchResult],
+    project_root: Option<&Path>,
+    tok: &dyn Fn(&str) -> usize,
+) -> anyhow::Result<Vec<String>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT docComment, signature, kind, nativeKind, name, qualifiedName, filePath, startLine, endLine, \
+         language FROM nodes WHERE id = ?1",
+    )?;
+    let mut files: HashMap<String, Option<Vec<String>>> = HashMap::new();
     rows.iter()
         .map(|row| {
-            let (doc_comment, signature): (Option<String>, Option<String>) = statement
-                .query_row([&row.symbol_id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?
-                .unwrap_or_default();
-            Ok(text_to_embed(doc_comment.as_deref(), signature.as_deref()).unwrap_or_default())
+            let Some(columns) = statement.query_row([&row.symbol_id], NodeColumns::read).optional()? else {
+                return Ok(String::new());
+            };
+            let lines = match (project_root, columns.file_path.as_deref()) {
+                (Some(root), Some(file_path)) => files
+                    .entry(file_path.to_string())
+                    .or_insert_with(|| source_lines(&root.join(file_path)))
+                    .as_deref(),
+                _ => None,
+            };
+            Ok(ce_text(&columns.node(), lines, tok))
         })
         .collect()
+}
+
+/// The `nodes` columns [`ce_text`] reads.
+struct NodeColumns {
+    doc_comment: Option<String>,
+    signature: Option<String>,
+    kind: Option<String>,
+    native_kind: Option<String>,
+    name: Option<String>,
+    qualified_name: Option<String>,
+    file_path: Option<String>,
+    start_line: i64,
+    end_line: i64,
+    language: Option<String>,
+}
+
+impl NodeColumns {
+    fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            doc_comment: r.get(0)?,
+            signature: r.get(1)?,
+            kind: r.get(2)?,
+            native_kind: r.get(3)?,
+            name: r.get(4)?,
+            qualified_name: r.get(5)?,
+            file_path: r.get(6)?,
+            start_line: r.get(7)?,
+            end_line: r.get(8)?,
+            language: r.get(9)?,
+        })
+    }
+
+    fn node(&self) -> CeNode<'_> {
+        CeNode {
+            kind: self.kind.as_deref(),
+            native_kind: self.native_kind.as_deref(),
+            name: self.name.as_deref(),
+            qualified_name: self.qualified_name.as_deref(),
+            file_path: self.file_path.as_deref(),
+            start_line: usize::try_from(self.start_line).unwrap_or(0),
+            end_line: usize::try_from(self.end_line).unwrap_or(0),
+            language: self.language.as_deref(),
+            signature: self.signature.as_deref(),
+            doc_comment: self.doc_comment.as_deref(),
+        }
+    }
 }
 
 /// A page after a reranked first page: the window rows the cursor still
@@ -752,7 +826,7 @@ mod tests {
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
         let result =
-            handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None)
+            handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None)
                 .unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
     }
@@ -773,7 +847,7 @@ mod tests {
 
         let params = SearchCodeParams { query: "reads a file".to_string(), ..Default::default() };
         let result =
-            handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None)
+            handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None)
                 .unwrap();
         assert!(error_text(&result).contains("g-mesh model fetch"));
     }
@@ -1020,7 +1094,7 @@ mod tests {
             ..Default::default()
         };
         let body = json_body(
-            &handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None)
+            &handle(&conn, &embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None)
                 .unwrap(),
         );
 

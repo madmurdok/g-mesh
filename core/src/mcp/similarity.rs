@@ -137,7 +137,11 @@
 //! fitted floors, go / python / rust / typescript **0.57 / 0.59 / 0.57 /
 //! 0.53** (`docs/adr/0012-embedded-text-structured.md`, fit in
 //! `docs/results/gm-465-structured-trim.md`); [`floor`] holds them. The
-//! argument above for one floor per language holds for both.
+//! argument above for one floor per language holds for both. On the v2 eval
+//! set they were re-fitted on name queries alone and hold there
+//! (`docs/results/gm-697-floor-refit.md`), so they are name-query floors: an
+//! authored prose query whose right answer scores below one is told *low*,
+//! a soft verdict, not a miss.
 //!
 //! Averaging these into one number would cost TypeScript a false "nothing
 //! matched" on one search in twelve - which is precisely the "a guarantee
@@ -284,9 +288,8 @@ const DEFAULT_FLOOR: f64 = 0.53;
 /// `provenance::Provenance::language` gives: an agent cross-referencing the
 /// two must never meet two spellings of one language.
 pub(crate) fn floor(language: &str) -> f64 {
-    // The int8 model's fitted floors on the structured text (ADR 0012).
-    // Held-out false alarm on authored queries at each, go / python / rust /
-    // typescript: 29.4 / 0.0 / 20.0 / 8.0%.
+    // The int8 model's floors on the structured text, fitted on name
+    // queries (ADR 0012).
     match language {
         "go" => 0.57,
         "python" => 0.59,

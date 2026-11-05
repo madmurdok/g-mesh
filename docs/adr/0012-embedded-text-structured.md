@@ -65,6 +65,20 @@ go / python / rust / typescript **0.57 / 0.59 / 0.57 / 0.53**, default 0.53
 authored-query false-alarm rate is 12.1% and confident-wrong on positives
 49.8%, against 14.3% and 51.6% for the full text at its floors.
 
+Update (GM-697, 2026-11-05): on the GM-460 v2 eval set the floors were
+re-fitted on name queries alone, the query shape they were set on, and the
+values are unchanged (`docs/results/gm-697-floor-refit.md`). The name
+fit-half floors are go / python / rust / typescript 0.67 / 0.62 / 0.57 /
+0.55, each at or above the shipped value, and held-out name queries whose
+right answer ranks first fall below the shipped floor in 1/45, 1/52, 2/69
+and 0/107 cases (2.2% / 1.9% / 2.9% / 0.0%, Wilson upper 11.6 / 10.1 /
+10.0 / 3.5%). The 12.1% above is an authored-prose rate: on v2, 40/184
+(21.7%) held-out authored queries with a right first answer score below
+their floor, which the verdict reports as low similarity, not as no match.
+The fp32 reference arm's name fit (all mechanical queries, rank 1) is
+0.59 / 0.59 / 0.57 / 0.61, so `debug-embed-eval report` now judges floor
+parity on name queries (within 0.03 of shipped for go, python and rust).
+
 Owner, 2026-10-01: "хорошо, берем structured".
 
 ## Consequences

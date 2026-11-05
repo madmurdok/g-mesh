@@ -94,7 +94,7 @@ pub(super) fn call(
     cursor: Option<String>,
 ) -> CallToolResult {
     let params = SearchCodeParams { query: query.to_string(), cursor, limit };
-    handle(store, embedding, QueryShapes::shipped(), &SessionHints::default(), params, None).unwrap()
+    handle(store, embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None).unwrap()
 }
 
 /// The JSON body of a one-block result.
@@ -265,6 +265,10 @@ struct Stub(Arc<dyn Fn(usize) -> f32 + Send + Sync>);
 impl Scorer for Stub {
     fn score(&self, _query: &str, texts: &[String]) -> anyhow::Result<Vec<f32>> {
         Ok(texts.iter().map(|text| (self.0)(row_number(text))).collect())
+    }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        text.split_whitespace().count()
     }
 }
 
@@ -549,6 +553,7 @@ fn a_partial_page_is_not_reranked() {
                 &SessionHints::default(),
                 params,
                 coverage.as_ref(),
+                None,
             )
             .unwrap(),
         )
@@ -563,7 +568,8 @@ fn a_partial_page_is_not_reranked() {
 }
 
 /// One case of `embedding/testdata/rerank_parity.json`: the Python
-/// reference's query and window, each row with the text it scored.
+/// reference's query and window, each row with its node columns, source
+/// span and text.
 #[derive(serde::Deserialize)]
 struct ParityCase {
     #[serde(rename = "queryId")]
@@ -576,9 +582,21 @@ struct ParityCase {
 #[serde(rename_all = "camelCase")]
 struct ParityRow {
     id: String,
+    kind: Option<String>,
+    native_kind: Option<String>,
+    name: Option<String>,
+    qualified_name: Option<String>,
+    file_path: Option<String>,
+    start_line: i64,
+    end_line: i64,
+    language: Option<String>,
     doc_comment: Option<String>,
     signature: Option<String>,
-    text: String,
+    /// The node's source span from `start_line` (cut after the last line
+    /// its text reads); `None` when the reference had no source file.
+    src_lines: Option<Vec<String>>,
+    /// The reference's text, its body counted in whitespace words.
+    words_text: String,
     cosine: f64,
 }
 
@@ -600,36 +618,71 @@ impl Scorer for Capture {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).push((query.to_string(), texts.to_vec()));
         Ok(vec![0.0; texts.len()])
     }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        text.split_whitespace().count()
+    }
 }
 
-/// A store holding one parity case's window: each row's own doc comment
-/// and signature, its vector at the reference's cosine.
-fn store_for_parity(case: &ParityCase) -> Arc<IndexStore> {
+/// A store holding one parity case's window: each row's own node columns,
+/// its vector at the reference's cosine; and under `root` one file per
+/// `filePath`, every row's source span written at its `startLine` (lines no
+/// span covers are empty).
+fn store_for_parity(case: &ParityCase, root: &Path) -> Arc<IndexStore> {
     register_extension();
     let conn = Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
+    let mut files: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
     for row in &case.rows {
         conn.execute(
-            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, \
-             language, docComment, signature)
-             VALUES (?1, 'Function', ?1, ?1, 'a.src', 1, 0, 3, 1, 'typescript', ?2, ?3)",
-            rusqlite::params![row.id, row.doc_comment, row.signature],
+            "INSERT INTO nodes (id, kind, nativeKind, name, qualifiedName, filePath, startLine, startCol, \
+             endLine, endCol, language, docComment, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, 0, ?9, ?10, ?11)",
+            rusqlite::params![
+                row.id,
+                row.kind,
+                row.native_kind,
+                row.name,
+                row.qualified_name,
+                row.file_path,
+                row.start_line,
+                row.end_line,
+                row.language,
+                row.doc_comment,
+                row.signature
+            ],
         )
         .unwrap();
         insert(&conn, &row.id, &vector_at(&case.query, row.cosine), "v1").unwrap();
+        if let (Some(path), Some(span)) = (&row.file_path, &row.src_lines) {
+            let lines = files.entry(path.as_str()).or_default();
+            let start = usize::try_from(row.start_line).unwrap();
+            if lines.len() < start + span.len() {
+                lines.resize(start + span.len(), "");
+            }
+            for (i, line) in span.iter().enumerate() {
+                lines[start + i] = line;
+            }
+        }
+    }
+    for (path, lines) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, lines.join("\n")).unwrap();
     }
     Arc::new(IndexStore::new(conn))
 }
 
-/// The product path feeds the cross-encoder exactly the (query, text)
-/// pairs the Python reference scored: for every parity case, the handler's
-/// own window texts, matched to rows through the page it returns, equal
-/// the fixture's stored `text`. This ties `window_texts` to the fixture
-/// that `the_real_model_reproduces_the_reference_logits_and_order` checks
-/// the model against (that test builds its texts itself).
+/// The product path feeds the cross-encoder the Python reference's texts:
+/// for every parity case, the handler's own window texts, read from the
+/// store and the files under the project root and matched to rows through
+/// the page it returns, equal the reference's text built with the same
+/// (whitespace-word) counter as the stub's. This ties `window_texts` to the
+/// fixture that `the_real_model_reproduces_the_reference_logits_and_order`
+/// checks the model against (that test builds its texts itself).
 ///
-/// *Control:* have `window_texts` call `full_text` instead of
-/// `text_to_embed` (49 of the fixture's 540 rows then differ).
+/// *Control:* have `window_texts` return `text_to_embed` of the doc
+/// comment and signature alone.
 #[test]
 fn the_handler_scores_the_texts_the_reference_scored() {
     let parity: Parity =
@@ -645,9 +698,21 @@ fn the_handler_scores_the_texts_the_reference_scored() {
             lines.sink(),
         );
         let embedding = fake(dir.path()).with_reranker(reranker);
-        let store = store_for_parity(case);
+        let root = tempfile::tempdir().unwrap();
+        let store = store_for_parity(case, root.path());
         let window = case.rows.len() as u32;
-        let page = body(&call(&store, &embedding, &case.query, Some(window), None));
+        let params = SearchCodeParams { query: case.query.clone(), cursor: None, limit: Some(window) };
+        let result = handle(
+            &store,
+            &embedding,
+            QueryShapes::shipped(),
+            &SessionHints::default(),
+            params,
+            None,
+            Some(root.path()),
+        )
+        .unwrap();
+        let page = body(&result);
 
         let calls = capture.0.lock().unwrap().clone();
         assert_eq!(calls.len(), 1, "{}: one scoring call", case.query_id);
@@ -659,13 +724,183 @@ fn the_handler_scores_the_texts_the_reference_scored() {
         for (id, text) in ids.iter().zip(texts) {
             let row = case.rows.iter().find(|row| row.id == *id).unwrap();
             assert_eq!(
-                text, &row.text,
+                text, &row.words_text,
                 "{} {id}: the text scored differs from the reference's",
                 case.query_id
             );
         }
         assert_eq!(lines.count(), 0, "{}", case.query_id);
     }
+}
+
+/// The texts the handler hands a [`Capture`] scorer for one first page of
+/// `store`, by row id, with `project_root`; panics if the call fails.
+fn scored_texts(store: &Arc<IndexStore>, query: &str, project_root: Option<&Path>) -> Vec<(String, String)> {
+    let capture = Capture::default();
+    let scorer = capture.clone();
+    let lines = Lines::default();
+    let reranker = Reranker::with_parts(
+        || RerankSettings { enabled: true, model_dir: Ok("/stub".into()) },
+        move |_| Ok(Box::new(scorer.clone()) as Box<dyn Scorer>),
+        lines.sink(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let embedding = fake(dir.path()).with_reranker(reranker);
+    let params = SearchCodeParams { query: query.to_string(), cursor: None, limit: Some(10) };
+    let result = handle(
+        store,
+        &embedding,
+        QueryShapes::shipped(),
+        &SessionHints::default(),
+        params,
+        None,
+        project_root,
+    )
+    .unwrap_or_else(|err| panic!("the call failed: {err:?}"));
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_eq!(lines.count(), 0, "the rerank fell back: {:?}", lines.0.lock().unwrap());
+    let page = body(&result);
+    let ids = page["results"].as_array().unwrap().iter().map(|r| r["symbolId"].as_str().unwrap().to_string());
+    let calls = capture.0.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "one scoring call");
+    ids.zip(calls[0].1.clone()).collect()
+}
+
+/// A source file the handler cannot read as the node's span says gives a
+/// text, never a failed call: a missing file and a directory give no body,
+/// a span past the end of its file is clipped, invalid UTF-8 is read lossily
+/// and a `\r\n` as a newline. With no project root no file is read, even
+/// one at an absolute `filePath`. Expected texts are
+/// `gm462_ce_text.build(row, read_text(errors="replace").split("\n"),
+/// "EPB", whitespace words)`.
+///
+/// *Control:* `source_lines` with `read_to_string` and `?` in
+/// `window_texts` (the call fails); or, with no root, read `filePath` as
+/// given.
+#[test]
+fn an_unreadable_file_or_span_gives_a_text_and_no_root_gives_no_body() {
+    let query = "parseConfig";
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("short.rs"), "fn n01() {\n    first();\n    second();").unwrap();
+    std::fs::write(root.path().join("bad.rs"), b"fn n02() {\n    a(\"\xff\xfe\");\r\n}\n").unwrap();
+    std::fs::create_dir(root.path().join("dir.rs")).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let absolute = elsewhere.path().join("four.rs");
+    std::fs::write(&absolute, "fn n04() {\n    fourth();\n}").unwrap();
+    let absolute = absolute.to_str().unwrap();
+
+    register_extension();
+    let conn = Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    let nodes = [
+        ("n00", "gone.rs", 3),
+        ("n01", "short.rs", 40),
+        ("n02", "bad.rs", 2),
+        ("n03", "dir.rs", 3),
+        ("n04", absolute, 2),
+    ];
+    for (i, (id, file_path, end_line)) in nodes.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, \
+             language, signature)
+             VALUES (?1, 'Function', ?1, ?2, ?3, 0, 0, ?4, 0, 'rust', ?5)",
+            rusqlite::params![id, format!("pkg::{id}"), file_path, end_line, format!("fn {id}()")],
+        )
+        .unwrap();
+        insert(&conn, id, &vector_at(query, 0.9 - 0.01 * i as f64), "v1").unwrap();
+    }
+    let store = Arc::new(IndexStore::new(conn));
+
+    let with_root = scored_texts(&store, query, Some(root.path()));
+    let by_id = |texts: &[(String, String)], id: &str| texts.iter().find(|(i, _)| i == id).unwrap().1.clone();
+    assert_eq!(with_root.len(), nodes.len(), "{with_root:?}");
+    assert_eq!(by_id(&with_root, "n00"), "function pkg\ngone rs\nfn n00()");
+    assert_eq!(by_id(&with_root, "n01"), "function pkg\nshort rs\nfn n01()\nfirst();\nsecond();");
+    assert_eq!(by_id(&with_root, "n02"), "function pkg\nbad rs\nfn n02()\na(\"\u{fffd}\u{fffd}\");");
+    assert_eq!(by_id(&with_root, "n03"), "function pkg\ndir rs\nfn n03()");
+    assert!(by_id(&with_root, "n04").ends_with("\nfn n04()\nfourth();"), "{with_root:?}");
+
+    let without_root = scored_texts(&store, query, None);
+    assert_eq!(without_root.len(), nodes.len(), "{without_root:?}");
+    for (id, text) in &without_root {
+        assert!(text.ends_with(&format!("\nfn {id}()")), "{id} has a body without a root: {text:?}");
+    }
+}
+
+/// The `search_code` tool, called through the served `GMeshMcpServer`,
+/// reads each node's file under the registry's project root: the texts it
+/// scores, in window (cosine) order, carry the bodies, which the handler
+/// adds only from a root.
+///
+/// *Control:* pass `None` for the project root in
+/// `GMeshMcpServer::search_code`.
+#[tokio::test]
+async fn the_tool_reads_the_body_under_the_project_root() {
+    use super::search_code_worker_tests::{call, connect};
+    use super::GMeshMcpServer;
+    use crate::daemon::indexing_status::{IndexingStatus, Phase};
+    use crate::daemon::lifecycle::CoreActivity;
+    use crate::daemon::manifest::DiscoveredPlugins;
+    use crate::daemon::registry::PluginRegistry;
+
+    let query = "parseConfig";
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(root.join("src/config.rs"), "fn n00() {\n    read_the_file();\n}\n").unwrap();
+    std::fs::write(root.join("src/other.rs"), "fn n01() {\n    parse_it();\n}\n").unwrap();
+
+    register_extension();
+    let conn = Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    for (i, (id, file_path)) in [("n00", "src/config.rs"), ("n01", "src/other.rs")].into_iter().enumerate() {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, \
+             language, signature)
+             VALUES (?1, 'Function', ?1, ?2, ?3, 0, 0, 2, 0, 'rust', ?4)",
+            rusqlite::params![id, format!("pkg::{id}"), file_path, format!("fn {id}()")],
+        )
+        .unwrap();
+        insert(&conn, id, &vector_at(query, 0.9 - 0.1 * i as f64), "v1").unwrap();
+    }
+    let store = Arc::new(IndexStore::new(conn));
+
+    let capture = Capture::default();
+    let scorer = capture.clone();
+    let lines = Lines::default();
+    let reranker = Reranker::with_parts(
+        || RerankSettings { enabled: true, model_dir: Ok("/stub".into()) },
+        move |_| Ok(Box::new(scorer.clone()) as Box<dyn Scorer>),
+        lines.sink(),
+    );
+    let embedding = Arc::new(fake(&dir.path().join("model")).with_reranker(reranker));
+    let indexing = IndexingStatus::structural();
+    indexing.set_phase(Phase::Ready);
+    let registry = Arc::new(PluginRegistry::new(
+        &root,
+        state,
+        DiscoveredPlugins::default(),
+        None,
+        None,
+        Arc::new(EmbeddingPipeline::disabled()),
+    ));
+    let server = GMeshMcpServer::new(store, registry, CoreActivity::new(), indexing, embedding);
+
+    let client = connect(server).await;
+    let result = call(&client, "search_code", serde_json::json!({ "query": query })).await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_eq!(lines.count(), 0, "the rerank fell back: {:?}", lines.0.lock().unwrap());
+    let calls = capture.0.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "one scoring call");
+    assert_eq!(
+        calls[0].1,
+        [
+            "function pkg\nsrc config rs\nfn n00()\nread_the_file();",
+            "function pkg\nsrc other rs\nfn n01()\nparse_it();"
+        ]
+    );
 }
 
 /// `search_code` never applies a strip prefix (GM-482, decision D4): an
@@ -694,7 +929,8 @@ fn search_code_embeds_a_prefixed_query_as_typed() {
         let counters = Counters::default();
         let embedding = fake_pipeline(&fake_model_dir(dir.path(), "weights"), None, &counters);
         let params = SearchCodeParams { query: "@Component".to_string(), cursor: None, limit: None };
-        let result = handle(&store, &embedding, shapes, &SessionHints::default(), params, None).unwrap();
+        let result =
+            handle(&store, &embedding, shapes, &SessionHints::default(), params, None, None).unwrap();
         (body(&result), counters.received())
     };
     let (with_strip, embedded) = run(stripping);
@@ -875,6 +1111,7 @@ fn a_partial_page_does_not_spend_the_hint() {
         &SessionHints::default(),
         params,
         coverage.as_ref(),
+        None,
     )
     .unwrap();
     // A partial result may lead with a plain-text note; the page is the JSON block.

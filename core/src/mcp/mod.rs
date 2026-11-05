@@ -945,6 +945,7 @@ impl GMeshMcpServer {
             self.hints.clone(),
             params.0,
             coverage,
+            Some(self.registry.project_root().to_path_buf()),
         )
         .await
     }
