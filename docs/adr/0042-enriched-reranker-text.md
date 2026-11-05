@@ -7,7 +7,7 @@ from disk at query time; `Scorer::count_tokens` with no default;
 Design note: [`GM-698-enriched-reranker-text.md`](../design/GM-698-enriched-reranker-text.md).
 Amends [ADR 0016](0016-cross-encoder-rerank.md): "the cross-encoder reading
 the same structured text the embedding model embeds" no longer holds, and the
-blend weight `80` is re-fitted for the new text.
+blend weight is re-fitted for the new text (`80` becomes `40`).
 
 ## Context
 ADR 0016's cross-encoder reads only the structured text (`text_to_embed` of
@@ -53,5 +53,5 @@ and a body cut at 48 tokens carried the gain
   limit.
 - File reads on the first page's hot path, at most one per distinct file of
   the 30-row window.
-- The blend weight is re-fitted for this text; until that measurement lands
-  the shipped `BETA` stays 80.
+- The blend weight is re-fitted for this text: the shipped `BETA` is 40, the
+  FIT optimum of the ship arm on the v2 corpora (`docs/results/gm-698-ship-arm.md`).

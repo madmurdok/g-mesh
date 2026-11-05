@@ -21,7 +21,7 @@ with the real tokenizer, scores them with the real model and compares logits
 and order.
 
 The fixture must tell its controls apart, so this script refuses to write it
-unless the order differs from F4 under beta = 40 and under the structured
+unless the order differs from F4 under beta = 80 and under the structured
 text alone (the text before GM-698) on at least one query each.
 
 usage: gm464_rerank_fixture.py --work <eval/embedding/work> [--corpora dir] [--out path]
@@ -42,7 +42,7 @@ import gm698_ce_text_fixture as F  # noqa: E402
 from gm464_ce_structured import ST, add_structured  # noqa: E402
 
 K = 30
-BETA = 80.0
+BETA = 40.0
 NL_PER_CORPUS = 2
 NAME_PER_CORPUS = 1
 
@@ -112,7 +112,7 @@ def main():
             logits = [float(x) for x in ce.score(query, [r["text"] for r in rows])]
             base_logits = [float(x) for x in ce.score(query, [c.stext[n] for n in ids])]
             order = f4_order(logits, cosines, BETA)
-            differs_beta += order != f4_order(logits, cosines, 40.0)
+            differs_beta += order != f4_order(logits, cosines, 80.0)
             differs_base += order != f4_order(base_logits, cosines, BETA)
             for r, lg in zip(rows, logits):
                 r["logit"] = lg
@@ -126,7 +126,7 @@ def main():
             })
             print(f"{name} {q}: {len(ids)} rows, moved {sum(i != j for i, j in enumerate(order))}", flush=True)
 
-    print(f"{len(cases)} queries; order differs under beta 40 on {differs_beta}, "
+    print(f"{len(cases)} queries; order differs under beta 80 on {differs_beta}, "
           f"under the structured text on {differs_base}")
     if not differs_beta or not differs_base:
         sys.exit("STOP: the fixture cannot tell a control apart")

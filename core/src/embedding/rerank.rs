@@ -54,7 +54,7 @@ pub const RERANK_ENV: &str = "G_MESH_RERANK";
 pub const WINDOW: usize = 30;
 
 /// The cosine's weight in the blend `logit + BETA * cosine`.
-pub const BETA: f64 = 80.0;
+pub const BETA: f64 = 40.0;
 
 /// Each (query, text) pair is truncated to this many tokens, longest side
 /// first.
@@ -642,8 +642,8 @@ mod tests {
 
     #[test]
     fn ties_keep_the_embedding_order() {
-        // 0 + 80 * 0.5 == 20 + 80 * 0.25 == 40 exactly.
-        let order = blended_order(&[0.0, 20.0, 0.0, 20.0, -1.0], &[0.5, 0.25, 0.5, 0.25, 0.75]).unwrap();
+        // 0 + 40 * 0.5 == 10 + 40 * 0.25 == 20 exactly.
+        let order = blended_order(&[0.0, 10.0, 0.0, 10.0, -1.0], &[0.5, 0.25, 0.5, 0.25, 0.75]).unwrap();
         assert_eq!(order, vec![4, 0, 1, 2, 3]);
     }
 
@@ -658,7 +658,7 @@ mod tests {
     /// any sort gives it.
     #[test]
     fn ties_across_a_full_window_keep_the_embedding_order() {
-        // Three exact blend levels: 40, 50, 60 (logit 10k + 80 * 0.5).
+        // Three exact blend levels: 20, 30, 40 (logit 10k + 40 * 0.5).
         let logits: Vec<f32> = (0..WINDOW).map(|i| (i % 3) as f32 * 10.0).collect();
         let cosines = vec![0.5; WINDOW];
         let order = blended_order(&logits, &cosines).unwrap();

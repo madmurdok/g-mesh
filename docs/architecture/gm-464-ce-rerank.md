@@ -4,10 +4,11 @@ Status: approved by the owner on 2026-10-02 (D1-D6 as recommended);
 implemented in GM-464/S3, recorded as [ADR 0016](../adr/0016-cross-encoder-rerank.md).
 
 Decided by the owner, not reopened here: ship F4. Take int8's top 30 and order
-them by `ce + 80 * cosine`, where `ce` is the raw logit of
+them by `ce + 40 * cosine`, where `ce` is the raw logit of
 `cross-encoder/ms-marco-MiniLM-L6-v2`. Rows after the 30th keep int8 order.
-The CE reads `text_to_embed(docComment, signature)`, the same structured text
-int8 embeds. The noMatch/lowSimilarity verdict stays exactly as today
+The CE reads the enriched text (enclosing scope, file path words and a
+48-token body, built by `core/src/embedding/ce_text.rs`, ADR 0042), not the
+structured text int8 embeds. The noMatch/lowSimilarity verdict stays exactly as today
 (`similarity.rs`). Evidence: `docs/results/gm-443-recall-rerank.md` S11, S12,
 S14 and "GM-464 S1" (held-out NL r@10 +3.7 [+1.8], MRR +0.047 [+0.021] vs
 int8-structured; every D9 gate passes).
@@ -32,12 +33,12 @@ rung) and `top_k_for_eval` (the embed-eval harness parity check).
    and ordering.
 2. `int8_page = window[..page_size]`. The verdict is computed on it with
    today's `similarity::verdict` / `low_similarity` (see "Verdict" below).
-3. The query and the 30 node texts are read back from `nodes`, with the same
-   `text_to_embed` that `current_embeddable_text` uses. Each pair is scored
+3. The query and the 30 node texts are read back from `nodes`; each text is
+   the enriched one `ce_text.rs` builds (body read from disk). Each pair is scored
    in length-sorted chunks of 16, with a pad mask and `token_type_ids`, and
    pair truncation at 512 tokens (LongestFirst). This is what
    `rerank_eval.py::CrossEncoder.score` does.
-4. `s_i = logit_i + 80 * cos_i` (f64). The window is stably sorted by
+4. `s_i = logit_i + 40 * cos_i` (f64). The window is stably sorted by
    `s` descending (`total_cmp`), so ties keep int8 order, which is the
    Python `lexsort` tiebreak. Rows after the 30th are appended in int8 order.
 5. The rows shown are the first `page_size`. For pagination, see Q6.
