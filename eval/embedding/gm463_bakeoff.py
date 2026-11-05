@@ -77,6 +77,10 @@ NOT_SHIPPABLE = {"ce-jina-v2": "CC-BY-NC-4.0, reference only"}
 SCOPE_DEFAULT = {"ce-bge-m3": "nl"}
 PASSES_DEFAULT = {"ce-bge-m3": 1}
 BETA_MAX, BETA_MIN = 2560.0, 0.125
+# Section 3.5's latency order L6 L12 turbo gte jv2 bge; the arms run it, then mirrored.
+LAT_ORDER = ["ce-minilm", "ce-minilm-l12", "ce-jina-turbo", "ce-gte-mb", "ce-jina-v2", "ce-bge-m3"]
+L6_PAIR_TOKENS = 101.9  # gm-698-latency.md: enr mean pair tokens, same 30 queries, K=30, one decimal
+assert sorted(MODELS) == sorted(LAT_ORDER), (MODELS, LAT_ORDER)
 C3_PAIRS = 200
 C3_TOL = {REF: 1e-5}
 C3_TOL_DEFAULT = 1e-4
@@ -298,41 +302,76 @@ def c8_input_format(ce, name):
     return ok
 
 
+C7_BATCH_TOL = 1e-4
+
+
+def c7_batch_agreement(ce, name, pairs):
+    """Each pair scored alone (no padding) vs every query's pairs as one batch
+    (unequal lengths: padded and masked). Fails if no batch was padded."""
+    single = [float(E.score_texts(ce, q, [d])[0]) for q, d in pairs]
+    byq = {}
+    for i, (q, d) in enumerate(pairs):
+        byq.setdefault(q, []).append(i)
+    batch, padded = [0.0] * len(pairs), 0
+    for q, idx in byq.items():
+        docs = [pairs[i][1] for i in idx]
+        lens = {len(e.ids) for e in ce.tok.encode_batch([(q, d) for d in docs])}
+        padded += len(idx) if len(lens) > 1 else 0
+        for i, s in zip(idx, E.score_texts(ce, q, docs)):
+            batch[i] = float(s)
+    diff = max(abs(s - b) for s, b in zip(single, batch))
+    ok = padded > 0 and diff <= C7_BATCH_TOL
+    print(f"C7 {name} batch: {len(pairs)} pairs alone vs one batch per query ({padded} in padded batches): "
+          f"max|diff| {diff:.3e} (tol {C7_BATCH_TOL}): {'pass' if ok else 'FAIL'}", flush=True)
+    return ok, single, diff
+
+
 def c7_known_answer(ce, name):
+    # The shipped model has no card scores; its batch check uses jina-turbo's card pairs (English, 10 unequal docs).
+    pairs = C7_CARDS[name if name in C7_CARDS else "ce-jina-turbo"][0]
+    okb, got, db = c7_batch_agreement(ce, name, pairs)
+    bs = f"batch max|diff| {db:.1e}"
     if name not in C7_CARDS:
         print(f"C7 {name}: n/a (no card scores; C0 covers the shipped model)", flush=True)
-        return True, "n/a"
+        return okb, f"n/a; {bs}"
     pairs, want, tol, first = C7_CARDS[name]
-    got = [float(E.score_texts(ce, q, [d])[0]) for q, d in pairs]
     if want is not None:
         diff = max(abs(g - w) for g, w in zip(got, want))
         ok = diff <= tol
         print(f"C7 {name}: got {[round(x, 5) for x in got]} card {want} max|diff| {diff:.4g} (tol {tol}): "
               f"{'pass' if ok else 'FAIL'}", flush=True)
-        return ok, f"max|diff| {diff:.4g} <= {tol}"
+        return ok and okb, f"max|diff| {diff:.4g} <= {tol}; {bs}"
     order = sorted(range(len(got)), key=lambda i: -got[i])
     ok = set(order[:len(first)]) == first
     print(f"C7 {name} (weaker: rank only): ranking {order}, logits {[round(x, 3) for x in got]}; "
           f"docs {sorted(first)} on top: {'pass' if ok else 'FAIL'}", flush=True)
-    return ok, f"rank only, docs {sorted(first)} on top"
+    return ok and okb, f"rank only, docs {sorted(first)} on top; {bs}"
 
 
 def c3p_rescore(cs, cache, ce, name, k, scope):
     """C3': C3_PAIRS seeded ship pairs; any the cache lacks are scored first, each
-    query's sample as one batch. Then every query's sample is rescored in two halves
-    (other chunk composition and padding) and compared with the cached logit."""
+    query's missing pairs in one batch padded out with up to 15 other texts of the
+    query's window, longest first (so it differs from every rescoring batch). Then
+    every query's sample is rescored in two halves (other chunk composition and
+    padding) and compared with the cached logit. A fresh pair whose query window
+    has no other text is scored in the same batch twice and counted as untested."""
     pool = [(c, q, nid) for c in cs for q in c.qids if in_model_scope(scope, c, q) for nid, _ in c.lists[ST][q][:k]]
     sample = random.Random(463).sample(pool, min(C3_PAIRS, len(pool)))
     byq = {}
     for c, q, nid in sample:
         byq.setdefault((c, q), []).append(c.atext_by[name]["ship"][nid])
-    fresh = 0
+    fresh = untested = 0
     for (c, q), ts in byq.items():
         miss = [t for t in dict.fromkeys(ts) if not cache.has(c, q, E.tsha(t))]
         if miss:
-            cache.put(c.name, q, [E.tsha(t) for t in miss], E.score_texts(ce, c.queries[q]["text"], miss))
+            qtext = c.queries[q]["text"]
+            win = [t for t in dict.fromkeys(c.atext_by[name]["ship"][nid] for nid, _ in c.lists[ST][q][:k]) if t not in miss]
+            ntok = [len(e.ids) for e in ce.tok.encode_batch([(qtext, t) for t in win])]
+            fill = [t for _, t in sorted(zip(ntok, win), key=lambda x: -x[0])][:max(0, 16 - len(miss))]
+            cache.put(c.name, q, [E.tsha(t) for t in miss], E.score_texts(ce, qtext, miss + fill)[:len(miss)])
             cache.save(c)
             fresh += len(miss)
+            untested += len(miss) if not fill else 0
     diffs, t0 = [], time.time()
     for (c, q), ts in byq.items():
         h = (len(ts) + 1) // 2
@@ -342,9 +381,10 @@ def c3p_rescore(cs, cache, ce, name, k, scope):
                 diffs += [abs(float(g) - cache.get(c, q, t)) for g, t in zip(got, part)]
     ms = 1000.0 * (time.time() - t0) / len(diffs)
     m, tol = max(diffs), C3_TOL.get(name, C3_TOL_DEFAULT)
-    print(f"C3' {name}: {len(diffs)} ship pairs ({fresh} scored for the control) rescored in halves: "
+    print(f"C3' {name}: {len(diffs)} ship pairs ({fresh} scored for the control in padded window batches, "
+          f"{untested} of them untested: no other window text) rescored in halves: "
           f"max|diff| {m:.3e} (tol {tol}); {ms:.2f} ms/pair", flush=True)
-    return m <= tol, m, ms
+    return m <= tol and untested < len(diffs), m, ms
 
 
 # ---- report helpers ------------------------------------------------------------
@@ -577,7 +617,7 @@ def quality(a):
         L += ["", f"Mean pair tokens (query + text + specials, model's tokenizer, truncated at {R.MAX_TOKENS}), K={k_} window", "",
               "| model | scope | tokens |", "|---|---|---|"] + tok_lines
         if k_ == 30 and REF in a.models:
-            S += c0_check(rows, bref)
+            S += c0_check(rows, bref, nref)
     p.write(step)
     if failed:
         L += ["", "Models that did not load:"] + [f"- {m}: {e}" for m, e in failed.items()]
@@ -588,14 +628,16 @@ C0_WANT = {"beta": 40.0, "r10": "0.670 [0.641, 0.700]", "mrr": "0.465 [0.439, 0.
            "off": "0.649 / 0.427"}  # gm-698-ship-arm.md
 
 
-def c0_check(rows, bref):
+def c0_check(rows, bref, nref):
+    """Also requires that the reference scored 0 pairs (every pair came from the GM-698 cache)."""
     by = {r["label"]: r for r in rows}
     sh = by[f"ship-L6 K=30 beta={bref:g} (FIT-tuned)"]
     off = by[f"off (L6) K=30 beta={OFF_BETA:g}"]
     got = {"beta": bref, "r10": ci3(sh["r10"]), "mrr": ci3(sh["mrr"]), "name": f"{sh['name'][0]:.3f} / {sh['name'][1]:.3f}",
            "off": f"{off['r10'][0]:.3f} / {off['mrr'][0]:.3f}"}
-    ok = got == C0_WANT
-    line = f"C0 ship-L6 reproduces GM-698: {'pass' if ok else 'MISMATCH'}; got {got}; want {C0_WANT}"
+    ok = got == C0_WANT and nref == {"off": 0, "ship": 0}
+    line = (f"C0 ship-L6 reproduces GM-698: {'pass' if ok else 'MISMATCH'}; got {got}; want {C0_WANT}; "
+            f"pairs scored {nref} (want 0)")
     print(line, flush=True)
     if not ok:
         sys.exit("STOP: " + line)
@@ -692,7 +734,8 @@ def speed_limit():
 
 
 def wait_speed_limit(cap_s):
-    """Waits until pmset reports CPU_Speed_Limit == 100 (no limit printed counts as 100)."""
+    """Waits until pmset reports CPU_Speed_Limit == 100 (no limit printed counts as 100),
+    at most cap_s: the caller passes what is left of the run's shared gate budget."""
     t0 = time.time()
     while True:
         v = speed_limit()
@@ -711,13 +754,20 @@ def latency(a):
     LAT.GATE_CAP = a.gate_cap
     if LAT.WAITED_FILE.exists():
         LAT.WAITED_FILE.unlink()
-    arms = a.models + a.models[::-1]
+    order = [m for m in LAT_ORDER if m in a.models]
+    if a.models != order:
+        sys.exit(f"STOP: --models {a.models} is not in section 3.5's order {order}")
+    arms = order + order[::-1]
+    if order != LAT_ORDER:
+        print(f"latency: subset of section 3.5's arms, missing {[m for m in LAT_ORDER if m not in order]}", flush=True)
     recs = []
     for i, m in enumerate(arms):
         label = f"{m}#{i + 1}"
         LAT.progress(f"arm {label} gate", i, len(arms))
         g = LAT.gate()
-        th, th_wait = wait_speed_limit(a.gate_cap)
+        waited = float(LAT.WAITED_FILE.read_text()) if LAT.WAITED_FILE.exists() else 0.0
+        th, th_wait = wait_speed_limit(max(0.0, a.gate_cap - waited))
+        LAT.WAITED_FILE.write_text(f"{waited + th_wait:.0f}")
         LAT.progress(f"arm {label} run", i, len(arms))
         passes = a.passes if a.passes is not None else PASSES_DEFAULT.get(m, 3)
         cmd = ["/usr/bin/time", "-p", sys.executable, __file__, "latency-arm", "--work", str(a.work),
@@ -767,7 +817,19 @@ def write_latency_summary(out, recs, ks):
     rows += ["", "uptime per arm (start -> end):"]
     rows += [f"- {r['label']}: " + (f"{r['uptime_start']} -> {r['uptime_end']}" if "error" not in r else f"error {r['error'][-300:]!r}")
              for r in recs]
+    rows += ["", l6_tokens_control(recs)]
+    print(rows[-1], flush=True)
     (out / "summary.md").write_text("\n".join(rows) + "\n")
+
+
+def l6_tokens_control(recs):
+    """Each ce-minilm arm's mean pair tokens at K=30 must equal gm-698-latency.md's value (one decimal)."""
+    got = [(r["label"], r["mean_pair_tokens_k"], r["mean_pair_tokens"]) for r in recs if r["model"] == REF and "error" not in r]
+    if not got:
+        return "Control L6 mean pair tokens: not checked (no ce-minilm arm)"
+    bad = [g for g in got if g[1] != 30 or abs(g[2] - L6_PAIR_TOKENS) > 0.05]
+    return (f"Control L6 mean pair tokens at K=30 = {L6_PAIR_TOKENS} (gm-698-latency.md): "
+            f"{'pass' if not bad else 'FAIL ' + str(bad)}; arms {got}")
 
 
 # ---- cli -----------------------------------------------------------------------
