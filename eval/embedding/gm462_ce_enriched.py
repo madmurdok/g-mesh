@@ -63,7 +63,7 @@ from rerank_q5_diag import fixed_floors_gates  # noqa: E402
 NAME = "ce-minilm"
 ST = "jina-v2-base-code-int8-structured"
 SHIPPED_BETA = 80.0
-PROGRESS = Path.home() / ".claude/progress/GM-462-measure.txt"
+PROGRESS = Path(os.environ.get("GM_PROGRESS", Path.home() / ".claude/progress/GM-462-measure.txt"))
 C3_PAIRS, C3_MAX_DIFF = 200, 1e-5
 C4_DOC = HERE.parents[1] / "docs/results/gm-443-recall-rerank.md"
 C4_SECTION = "## GM-464 S1: F4 K=30 on the structured text"
@@ -79,6 +79,7 @@ ARMS = {  # name -> (switches, body budget or None for --body-budget, authored N
     "-P": (frozenset("EIB"), None, True),
     "-B": (frozenset("EIP"), None, True),
     "all-b48": (frozenset("EIPB"), 48, True),
+    "ship": (frozenset("EPB"), 48, False),  # GM-698: E+P+B48 on all queries (NL and name)
 }
 DEFAULT_ARMS = "off,all,-E,-I,-P,-B"
 LOO_ARMS = ("-E", "-I", "-P", "-B")
@@ -373,12 +374,12 @@ def c3_rescore(cs, cache, ce, k):
     return m, ms
 
 
-def c6_texts_differ(cs):
+def c6_texts_differ(cs, arm="all"):
     nodes = [(c, nid) for c in cs for nid in c.rows]
-    n = sum(c.atext["all"][nid] != c.atext["off"][nid] for c, nid in nodes)
-    print(f"C6 all-arm text != base: {n}/{len(nodes)} window nodes")
+    n = sum(c.atext[arm][nid] != c.atext["off"][nid] for c, nid in nodes)
+    print(f"C6 {arm}-arm text != base: {n}/{len(nodes)} window nodes")
     if n != len(nodes):
-        sys.exit("STOP: C6 failed (the all arm leaves some base text unchanged)")
+        sys.exit("STOP: C6 failed (the " + arm + " arm leaves some base text unchanged)")
     return n, len(nodes)
 
 
@@ -528,6 +529,8 @@ def parse_args(argv=None):
                                                 "GM-460's results on another eval dir)")
     ap.add_argument("--c4-section")
     ap.add_argument("--c4-label")
+    ap.add_argument("--c4-gm462-numbers", action="store_true",
+                    help="C4a against GM-462's published off row numbers (GM-460's table row is not in its doc)")
     ap.add_argument("--table", type=Path)
     ap.add_argument("--summary", type=Path)
     a = ap.parse_args(argv)
@@ -692,7 +695,17 @@ def main(argv=None):
         c4("", c4_target(a.c4_doc or C4_DOC, a.c4_section if a.c4_doc else C4_SECTION,
                          a.c4_label or (C4_LABEL if not a.c4_doc else V2_C4_LABEL)))
     else:
-        c4("a", c4_target(a.c4_doc or V2_C4_DOC, a.c4_section, V2_C4_LABEL))
+        if a.c4_gm462_numbers:
+            o_ = rowby[f"off K={K} beta={SHIPPED_BETA:g} (FIT-tuned)"]
+            got = (f"{o_['r10'][0]:.3f} [{o_['r10'][1]:.3f}, {o_['r10'][2]:.3f}]",
+                   f"{o_['mrr'][0]:.3f} [{o_['mrr'][1]:.3f}, {o_['mrr'][2]:.3f}]", f"{o_['name'][0]:.3f} / {o_['name'][1]:.3f}")
+            want = ("0.649 [0.620, 0.678]", "0.427 [0.401, 0.454]", "0.970 / 0.880")  # gm-462-richer-reranker-input.md Tables, off row
+            print(f"C4a off row vs GM-462 published off row: got {got} want {want}")
+            if got != want or tuned["off"] != SHIPPED_BETA:
+                sys.exit("STOP: C4a failed")
+            S.append(f"C4a pass (GM-462 published off row numbers: {' | '.join(want)}; off tuned beta 80)")
+        else:
+            c4("a", c4_target(a.c4_doc or V2_C4_DOC, a.c4_section, V2_C4_LABEL))
     if not current_set:
         c4("b (GM-398 ids)", c4_target(C4_DOC, C4_SECTION, C4_LABEL), gm398_ids(cs))
 
@@ -741,6 +754,44 @@ def main(argv=None):
         S += [vline, f"LOO within noise of all: {loo or 'none'}; cheapest {cheap or '-'}"]
         assert (d10, dmrr) == (g["r10"], g["mrr"]), "paired() disagrees with R.gates"
     p.write(len(a.arms))
+
+    if "ship" in a.arms:
+        # GM-698 D5: ship arm vs off, per beta on FIT, chosen beta, held-out, name guard, D9.
+        S.append("C6 ship texts differ on {}/{} window nodes".format(*c6_texts_differ(cs, "ship")))
+        sh_t, off_s = outs[("ship", tuned["ship"])], outs[("off", SHIPPED_BETA)]
+        sh_row = rowby[f"ship K={K} beta={tuned['ship']:g} (FIT-tuned)"]
+        off_row = rowby[f"off K={K} beta={SHIPPED_BETA:g}" + (" (FIT-tuned)" if tuned["off"] == SHIPPED_BETA else "")]
+        differs = sig(sh_row) != sig(off_row)
+        print(f"C6 ship row differs from the off row: {differs}")
+        if not differs:
+            sys.exit("STOP: C6 failed (the ship row equals the off row)")
+        S.append("C6 rows differ")
+        L += ["", f"GM-698 beta grid, K={K}: FIT NL objective and held-out point estimates (off | ship)", "",
+              "| beta | off FIT r@10 | off FIT MRR | ship FIT r@10 | ship FIT MRR | ship ho r@10 | ship ho MRR | ship name r@10 / MRR |",
+              "|---|---|---|---|---|---|---|---|"]
+        for b in R.BETAS:
+            ko = fit_obj(fit_keys, K, score_of["off"], b)
+            ks = fit_obj(fit_keys, K, score_of["ship"], b)
+            sm = R.summarize(f4(cs, K, b, score_of["ship"]))
+            L.append(f"| {b:g} | {ko[0]:.3f} | {ko[1]:.3f} | {ks[0]:.3f} | {ks[1]:.3f} | {sm['nl_heldout']['r10']:.3f} | "
+                     f"{sm['nl_heldout']['mrr']:.3f} | {sm['name']['r10']:.3f} / {sm['name']['mrr']:.3f} |")
+        d10, dmrr = paired(off_s, sh_t, R.ho)
+        n10, nmrr = paired(off_s, sh_t, R.name_q)
+        L += ["", "Paired ship (FIT-tuned beta) minus off (beta 80), b minus a", "",
+              "| subset | Δr@10 [lo, hi] | ΔMRR [lo, hi] |", "|---|---|---|",
+              f"| held-out NL | {fmt_d(d10)} | {fmt_d(dmrr, True)} |",
+              f"| name queries | {fmt_d(n10)} | {fmt_d(nmrr, True)} |"]
+        if not current_set:
+            s10, smrr = paired(off_s, sh_t, strict_ho(cs))
+            L.append(f"| strict held-out NL | {fmt_d(s10)} | {fmt_d(smrr, True)} |")
+        bars = [("held-out NL r@10 >= 0.647", sh_row["r10"][0] >= 0.647),
+                ("held-out NL MRR >= 0.425", sh_row["mrr"][0] >= 0.425),
+                ("D9 vs int8-structured at shipped floors", all(sh_row["vs"]["int8"]["pass"][q] for q in ("Q1", "Q2", "Q3", "Q4", "Q5"))),
+                ("name-query MRR paired vs off lower bound >= -0.010", nmrr[1] >= -0.010)]
+        L += ["", f"SHIP beta {tuned['ship']:g}: held-out NL r@10 {sh_row['r10'][0]:.3f} [{sh_row['r10'][1]:.3f}, {sh_row['r10'][2]:.3f}], "
+                  f"MRR {sh_row['mrr'][0]:.3f} [{sh_row['mrr'][1]:.3f}, {sh_row['mrr'][2]:.3f}]"]
+        L += [f"BAR {'PASS' if ok_ else 'FAIL'}: {name_}" for name_, ok_ in bars]
+        S += L[-5:]
 
     print("\n" + "\n".join(L))
     if a.table:
