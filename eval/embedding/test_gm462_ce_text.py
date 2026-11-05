@@ -8,6 +8,7 @@ model; numpy must import (user site).
 Run: python3 eval/embedding/test_gm462_ce_text.py
 """
 
+import base64
 import json
 import re
 import sys
@@ -21,6 +22,10 @@ sys.path.insert(0, str(HERE))
 
 import gm462_ce_text as T  # noqa: E402
 import gm462_ce_enriched as E  # noqa: E402
+import gm698_ce_text_fixture as F  # noqa: E402
+
+TEXT_RS = HERE.parents[1] / "core/src/embedding/text.rs"
+CE_TEXT_JSON = HERE.parents[1] / "core/src/embedding/testdata/ce_text.json"
 
 
 def tok(s):
@@ -225,6 +230,34 @@ class Build(unittest.TestCase):
     def test_unknown_switch_rejected(self):
         with self.assertRaises(ValueError):
             T.build(ROW, SRC, frozenset("EX"), tok)
+
+
+class SignatureKeywords(unittest.TestCase):
+    def test_python_copy_equals_the_rust_const(self):
+        src = TEXT_RS.read_text()
+        m = re.search(r"const SIGNATURE_KEYWORDS: &\[&str\] = &\[(.*?)\];", src, re.S)
+        self.assertIsNotNone(m, f"SIGNATURE_KEYWORDS not found in {TEXT_RS}")
+        rust = re.findall(r'"([^"]*)"', m.group(1))
+        self.assertTrue(rust)
+        self.assertEqual(len(rust), len(set(rust)), "duplicate keyword in the Rust const")
+        self.assertEqual(T.SIGNATURE_KEYWORDS, frozenset(rust))
+
+
+class CeTextFixture(unittest.TestCase):
+    """core/src/embedding/testdata/ce_text.json is what gm462_ce_text.build
+    gives today: a change to the builder without regenerating the fixture
+    (gm698_ce_text_fixture.py) fails here, not only in the Rust test."""
+
+    def test_words_texts_equal_the_builder(self):
+        doc = json.loads(CE_TEXT_JSON.read_text())
+        self.assertEqual(doc["bodyBudget"], F.BODY_BUDGET)
+        self.assertGreaterEqual(len(doc["cases"]), 100)
+        for case in doc["cases"]:
+            with self.subTest(case["label"]):
+                src = case["srcLines"]
+                if "srcBytes" in case:
+                    self.assertEqual(F.lines_of_bytes(base64.b64decode(case["srcBytes"])), src)
+                self.assertEqual(F.build(case["node"], src, tok), case["words"])
 
 
 class Verdict(unittest.TestCase):

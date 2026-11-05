@@ -54,7 +54,7 @@ pub const RERANK_ENV: &str = "G_MESH_RERANK";
 pub const WINDOW: usize = 30;
 
 /// The cosine's weight in the blend `logit + BETA * cosine`.
-pub const BETA: f64 = 80.0;
+pub const BETA: f64 = 40.0;
 
 /// Each (query, text) pair is truncated to this many tokens, longest side
 /// first.
@@ -76,6 +76,10 @@ const LOGITS: &str = "logits";
 /// relevant. [`CrossEncoder`] in production; a stub in tests.
 pub(crate) trait Scorer: Send + Sync {
     fn score(&self, query: &str, texts: &[String]) -> Result<Vec<f32>>;
+
+    /// Tokens `text` takes on its own, special tokens excluded: the unit
+    /// of the cross-encoder text's body budget.
+    fn count_tokens(&self, text: &str) -> usize;
 }
 
 /// The cross-encoder's directory: `$G_MESH_RERANK_MODEL_DIR`, else
@@ -248,6 +252,11 @@ impl Scorer for CrossEncoder {
             }
         }
         Ok(logits)
+    }
+
+    /// A text the tokenizer refuses counts as over any budget.
+    fn count_tokens(&self, text: &str) -> usize {
+        self.tokenizer.encode(text, false).map_or(usize::MAX, |encoding| encoding.get_ids().len())
     }
 }
 
@@ -565,15 +574,45 @@ mod tests {
     #[serde(rename_all = "camelCase")]
     struct FixtureRow {
         id: String,
+        kind: Option<String>,
+        native_kind: Option<String>,
+        name: Option<String>,
+        qualified_name: Option<String>,
+        file_path: Option<String>,
+        start_line: usize,
+        end_line: usize,
+        language: Option<String>,
         doc_comment: Option<String>,
         signature: Option<String>,
+        /// The node's source span from `start_line`, cut after the last
+        /// line its text reads.
+        src_lines: Option<Vec<String>>,
         text: String,
         cosine: f64,
         logit: f64,
     }
 
+    impl FixtureRow {
+        /// This crate's text for the row, its body counted by `tok`.
+        fn ce_text(&self, tok: &dyn Fn(&str) -> usize) -> String {
+            let node = crate::embedding::ce_text::CeNode {
+                kind: self.kind.as_deref(),
+                native_kind: self.native_kind.as_deref(),
+                name: self.name.as_deref(),
+                qualified_name: self.qualified_name.as_deref(),
+                file_path: self.file_path.as_deref(),
+                start_line: 0,
+                end_line: self.end_line.saturating_sub(self.start_line),
+                language: self.language.as_deref(),
+                signature: self.signature.as_deref(),
+                doc_comment: self.doc_comment.as_deref(),
+            };
+            crate::embedding::ce_text::ce_text(&node, self.src_lines.as_deref(), tok)
+        }
+    }
+
     /// `eval/embedding/gm464_rerank_fixture.py`'s output: the Python
-    /// reference's logits and F4 order for int8-structured's top 30.
+    /// reference's texts, logits and F4 order for int8-structured's top 30.
     fn fixture() -> Fixture {
         serde_json::from_str(include_str!("testdata/rerank_parity.json")).unwrap()
     }
@@ -603,8 +642,8 @@ mod tests {
 
     #[test]
     fn ties_keep_the_embedding_order() {
-        // 0 + 80 * 0.5 == 20 + 80 * 0.25 == 40 exactly.
-        let order = blended_order(&[0.0, 20.0, 0.0, 20.0, -1.0], &[0.5, 0.25, 0.5, 0.25, 0.75]).unwrap();
+        // 0 + 40 * 0.5 == 10 + 40 * 0.25 == 20 exactly.
+        let order = blended_order(&[0.0, 10.0, 0.0, 10.0, -1.0], &[0.5, 0.25, 0.5, 0.25, 0.75]).unwrap();
         assert_eq!(order, vec![4, 0, 1, 2, 3]);
     }
 
@@ -619,7 +658,7 @@ mod tests {
     /// any sort gives it.
     #[test]
     fn ties_across_a_full_window_keep_the_embedding_order() {
-        // Three exact blend levels: 40, 50, 60 (logit 10k + 80 * 0.5).
+        // Three exact blend levels: 20, 30, 40 (logit 10k + 40 * 0.5).
         let logits: Vec<f32> = (0..WINDOW).map(|i| (i % 3) as f32 * 10.0).collect();
         let cosines = vec![0.5; WINDOW];
         let order = blended_order(&logits, &cosines).unwrap();
@@ -673,6 +712,10 @@ mod tests {
     impl Scorer for Unused {
         fn score(&self, _query: &str, _texts: &[String]) -> Result<Vec<f32>> {
             unreachable!("the outcome tests never score")
+        }
+
+        fn count_tokens(&self, _text: &str) -> usize {
+            unreachable!("the outcome tests never build a text")
         }
     }
 
@@ -882,17 +925,8 @@ mod tests {
     fn the_real_model_reproduces_the_reference_logits_and_order() {
         let model = load_real();
         for case in fixture().cases {
-            let texts: Vec<String> = case
-                .rows
-                .iter()
-                .map(|row| {
-                    crate::embedding::text::text_to_embed(
-                        row.doc_comment.as_deref(),
-                        row.signature.as_deref(),
-                    )
-                    .unwrap_or_default()
-                })
-                .collect();
+            let texts: Vec<String> =
+                case.rows.iter().map(|row| row.ce_text(&|text| model.count_tokens(text))).collect();
             let logits = model.score(&case.query, &texts).unwrap();
             for ((row, &logit), text) in case.rows.iter().zip(&logits).zip(&texts) {
                 let delta = (f64::from(logit) - row.logit).abs();

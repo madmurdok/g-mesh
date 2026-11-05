@@ -1,0 +1,2938 @@
+{
+ "about": "GM-698 CE text fixture, written by eval/embedding/gm698_ce_text_fixture.py",
+ "bodyBudget": 48,
+ "cases": [
+  {
+   "label": "words of HTTPServer::serve",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "x",
+    "qualifiedName": "HTTPServer::serve",
+    "filePath": "HTTPServer/serve",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function http server serve\nhttp server serve",
+   "minilm": "function http server serve\nhttp server serve"
+  },
+  {
+   "label": "words of safeInt8::run",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "x",
+    "qualifiedName": "safeInt8::run",
+    "filePath": "safeInt8/run",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function safe int 8 run\nsafe int 8 run",
+   "minilm": "function safe int 8 run\nsafe int 8 run"
+  },
+  {
+   "label": "words of send_quit::go",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "x",
+    "qualifiedName": "send_quit::go",
+    "filePath": "send_quit/go",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function send quit go\nsend quit go",
+   "minilm": "function send quit go\nsend quit go"
+  },
+  {
+   "label": "words of parseURL2Fast::x",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "x",
+    "qualifiedName": "parseURL2Fast::x",
+    "filePath": "parseURL2Fast/x",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function parse url 2 fast\nparse url 2 fast x",
+   "minilm": "function parse url 2 fast\nparse url 2 fast x"
+  },
+  {
+   "label": "words of ABC::x",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "x",
+    "qualifiedName": "ABC::x",
+    "filePath": "ABC/x",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function abc\nabc x",
+   "minilm": "function abc\nabc x"
+  },
+  {
+   "label": "words of aB::x",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "x",
+    "qualifiedName": "aB::x",
+    "filePath": "aB/x",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function a b\na b x",
+   "minilm": "function a b\na b x"
+  },
+  {
+   "label": "words of Ünïcode_naïve::x",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "x",
+    "qualifiedName": "Ünïcode_naïve::x",
+    "filePath": "Ünïcode_naïve/x",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function n code na ve\nn code na ve x",
+   "minilm": "function n code na ve\nn code na ve x"
+  },
+  {
+   "label": "words of x9Y::x",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "x",
+    "qualifiedName": "x9Y::x",
+    "filePath": "x9Y/x",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function x 9 y\nx 9 y x",
+   "minilm": "function x 9 y\nx 9 y x"
+  },
+  {
+   "label": "words of a__b--c::x",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "x",
+    "qualifiedName": "a__b--c::x",
+    "filePath": "a__b--c/x",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function a b c\na b c x",
+   "minilm": "function a b c\na b c x"
+  },
+  {
+   "label": "go method",
+   "node": {
+    "kind": "Method",
+    "nativeKind": "method",
+    "name": "Next",
+    "qualifiedName": "Context.Next",
+    "filePath": "context.go",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "go",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "method context\ncontext go",
+   "minilm": "method context\ncontext go"
+  },
+  {
+   "label": "rust trait impl method",
+   "node": {
+    "kind": "Method",
+    "nativeKind": "method",
+    "name": "send_quit",
+    "qualifiedName": "walk::Worker::send_quit",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "method walk worker\nsrc a rs",
+   "minilm": "method walk worker\nsrc a rs"
+  },
+  {
+   "label": "python method, no native kind",
+   "node": {
+    "kind": "Method",
+    "nativeKind": null,
+    "name": "send",
+    "qualifiedName": "requests.sessions.Session.send",
+    "filePath": "requests/sessions.py",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "method requests sessions session\nrequests sessions py",
+   "minilm": "method requests sessions session\nrequests sessions py"
+  },
+  {
+   "label": "ts constructor",
+   "node": {
+    "kind": "Method",
+    "nativeKind": "constructor",
+    "name": "constructor",
+    "qualifiedName": "TaskConflictError#constructor",
+    "filePath": "src/errors.ts",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "typescript",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "constructor task conflict error\nsrc errors ts",
+   "minilm": "constructor task conflict error\nsrc errors ts"
+  },
+  {
+   "label": "top-level function is kind only",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "requireTask",
+    "qualifiedName": "requireTask",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function\nsrc a rs",
+   "minilm": "function\nsrc a rs"
+  },
+  {
+   "label": "qualified name not ending in name",
+   "node": {
+    "kind": "Type",
+    "nativeKind": "struct",
+    "name": "Other",
+    "qualifiedName": "pkg::Thing",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "struct pkg thing\nsrc a rs",
+   "minilm": "struct pkg thing\nsrc a rs"
+  },
+  {
+   "label": "empty native kind falls back to kind",
+   "node": {
+    "kind": "Type",
+    "nativeKind": "",
+    "name": "T",
+    "qualifiedName": "m::T",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "type m\nsrc a rs",
+   "minilm": "type m\nsrc a rs"
+  },
+  {
+   "label": "empty name keeps the whole qualified name",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "",
+    "qualifiedName": "m::f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function m f\nsrc a rs",
+   "minilm": "function m f\nsrc a rs"
+  },
+  {
+   "label": "no name, no qualified name, no path",
+   "node": {
+    "kind": "Function",
+    "nativeKind": null,
+    "name": null,
+    "qualifiedName": null,
+    "filePath": null,
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function",
+   "minilm": "function"
+  },
+  {
+   "label": "qualified name equal to name",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "function\nsrc a rs",
+   "minilm": "function\nsrc a rs"
+  },
+  {
+   "label": "python one-line docstring",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.py",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "def f():",
+    "    \"\"\"Doc.\"\"\"",
+    "    return 1"
+   ],
+   "words": "function\na py\nreturn 1",
+   "minilm": "function\na py\nreturn 1"
+  },
+  {
+   "label": "python multi-line docstring",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.py",
+    "startLine": 0,
+    "endLine": 6,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "def f():",
+    "    \"\"\"Doc",
+    "",
+    "    more.",
+    "    \"\"\"",
+    "    x = 1",
+    "    return x"
+   ],
+   "words": "function\na py\nx = 1\nreturn x",
+   "minilm": "function\na py\nx = 1\nreturn x"
+  },
+  {
+   "label": "python raw docstring",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.py",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "def f():",
+    "    r\"\"\"Doc \\d",
+    "    \"\"\"",
+    "    return 1"
+   ],
+   "words": "function\na py\nreturn 1",
+   "minilm": "function\na py\nreturn 1"
+  },
+  {
+   "label": "python unclosed docstring",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.py",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "def f():",
+    "    \"\"\"Doc",
+    "    more",
+    "    return 1"
+   ],
+   "words": "function\na py",
+   "minilm": "function\na py"
+  },
+  {
+   "label": "python three-letter prefix is no docstring",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.py",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "def f():",
+    "    rbu\"\"\"x\"\"\"",
+    "    return 1"
+   ],
+   "words": "function\na py\nrbu\"\"\"x\"\"\"\nreturn 1",
+   "minilm": "function\na py\nrbu\"\"\"x\"\"\"\nreturn 1"
+  },
+  {
+   "label": "no docstring keeps first line",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.py",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "def f():",
+    "    x = '''not a docstring'''",
+    "    return x"
+   ],
+   "words": "function\na py\nx = '''not a docstring'''\nreturn x",
+   "minilm": "function\na py\nx = '''not a docstring'''\nreturn x"
+  },
+  {
+   "label": "punctuation dropped, whitespace collapsed, 200-char cut",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 5,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    let   a  =  1;",
+    "    });",
+    "",
+    "    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "}"
+   ],
+   "words": "function\nsrc a rs\nlet a = 1;\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "minilm": "function\nsrc a rs\nlet a = 1;\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  },
+  {
+   "label": "200-char cut counts code points",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+    "}"
+   ],
+   "words": "function\nsrc a rs\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+   "minilm": "function\nsrc a rs\néééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+  },
+  {
+   "label": "only lines up to end",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    a();",
+    "    b();",
+    "}",
+    "fn g() {",
+    "    c();",
+    "}"
+   ],
+   "words": "function\nsrc a rs\na();\nb();",
+   "minilm": "function\nsrc a rs\na();\nb();"
+  },
+  {
+   "label": "python decorators and multi-line header",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.py",
+    "startLine": 0,
+    "endLine": 5,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "@decorator",
+    "@other(x=1)",
+    "def f(a,",
+    "      b) -> int:",
+    "    \"\"\"Doc.\"\"\"",
+    "    return a"
+   ],
+   "words": "function\na py\nreturn a",
+   "minilm": "function\na py\nreturn a"
+  },
+  {
+   "label": "python colon in a comment or string",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.py",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "def f(a='x:'):  # note:",
+    "    return a",
+    "",
+    ""
+   ],
+   "words": "function\na py\nreturn a",
+   "minilm": "function\na py\nreturn a"
+  },
+  {
+   "label": "rust multi-line parameters",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 4,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "pub fn f(",
+    "    a: u8,",
+    ") -> u8 {",
+    "    a + 1",
+    "}"
+   ],
+   "words": "function\nsrc a rs\na + 1",
+   "minilm": "function\nsrc a rs\na + 1"
+  },
+  {
+   "label": "rust lifetime is not a string",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f<'a>(x: &'a str) -> &'a str {",
+    "    x",
+    "}"
+   ],
+   "words": "function\nsrc a rs\nx",
+   "minilm": "function\nsrc a rs\nx"
+  },
+  {
+   "label": "ts arrow ends the signature",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.ts",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "typescript",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "export const f = (a: number,",
+    "  b: number) =>",
+    "  a + b;"
+   ],
+   "words": "function\na ts\na + b;",
+   "minilm": "function\na ts\na + b;"
+  },
+  {
+   "label": "go brace inside parameters",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.go",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "go",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "func f(opts struct{ A int }, s string) {",
+    "    return",
+    "}"
+   ],
+   "words": "function\na go\nreturn",
+   "minilm": "function\na go\nreturn"
+  },
+  {
+   "label": "rust brace inside a string",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f(s: &str = \"{\", t: u8,",
+    "  u: u8) {",
+    "  g()",
+    "}"
+   ],
+   "words": "function\nsrc a rs\ng()",
+   "minilm": "function\nsrc a rs\ng()"
+  },
+  {
+   "label": "escaped quote inside a string",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f(s = \"a\\\"{\") {",
+    "  g()",
+    "}"
+   ],
+   "words": "function\nsrc a rs\ng()",
+   "minilm": "function\nsrc a rs\ng()"
+  },
+  {
+   "label": "line comment hides a brace",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() // {",
+    "{ g()",
+    "  h()"
+   ],
+   "words": "function\nsrc a rs\nh()",
+   "minilm": "function\nsrc a rs\nh()"
+  },
+  {
+   "label": "backtick string spans lines",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.ts",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "typescript",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "const f = `a",
+    "{ b`;",
+    "  c()",
+    "  d()"
+   ],
+   "words": "function\na ts\nc()\nd()",
+   "minilm": "function\na ts\nc()\nd()"
+  },
+  {
+   "label": "no signature line starts after start",
+   "node": {
+    "kind": "Type",
+    "nativeKind": "type",
+    "name": "X",
+    "qualifiedName": "X",
+    "filePath": "a.ts",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "typescript",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "type X =",
+    "  | A",
+    "  | B"
+   ],
+   "words": "type\na ts\n| A\n| B",
+   "minilm": "type\na ts\n| A\n| B"
+  },
+  {
+   "label": "start is honoured",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "a.py",
+    "startLine": 2,
+    "endLine": 3,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "import x",
+    "",
+    "def f():",
+    "    return 1"
+   ],
+   "words": "function\na py\nreturn 1",
+   "minilm": "function\na py\nreturn 1"
+  },
+  {
+   "label": "stops at the first line that does not fit",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 11,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    w0_0 w0_1 w0_2 w0_3 w0_4 w0_5 w0_6",
+    "    w1_0 w1_1 w1_2 w1_3 w1_4 w1_5 w1_6",
+    "    w2_0 w2_1 w2_2 w2_3 w2_4 w2_5 w2_6",
+    "    w3_0 w3_1 w3_2 w3_3 w3_4 w3_5 w3_6",
+    "    w4_0 w4_1 w4_2 w4_3 w4_4 w4_5 w4_6",
+    "    w5_0 w5_1 w5_2 w5_3 w5_4 w5_5 w5_6",
+    "    w6_0 w6_1 w6_2 w6_3 w6_4 w6_5 w6_6",
+    "    w7_0 w7_1 w7_2 w7_3 w7_4 w7_5 w7_6",
+    "    w8_0 w8_1 w8_2 w8_3 w8_4 w8_5 w8_6",
+    "    w9_0 w9_1 w9_2 w9_3 w9_4 w9_5 w9_6",
+    "}"
+   ],
+   "words": "function\nsrc a rs\nw0_0 w0_1 w0_2 w0_3 w0_4 w0_5 w0_6\nw1_0 w1_1 w1_2 w1_3 w1_4 w1_5 w1_6\nw2_0 w2_1 w2_2 w2_3 w2_4 w2_5 w2_6\nw3_0 w3_1 w3_2 w3_3 w3_4 w3_5 w3_6\nw4_0 w4_1 w4_2 w4_3 w4_4 w4_5 w4_6\nw5_0 w5_1 w5_2 w5_3 w5_4 w5_5 w5_6",
+   "minilm": "function\nsrc a rs\nw0_0 w0_1 w0_2 w0_3 w0_4 w0_5 w0_6"
+  },
+  {
+   "label": "exact budget fits",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 8,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    w w w w w w w w",
+    "    w w w w w w w w",
+    "    w w w w w w w w",
+    "    w w w w w w w w",
+    "    w w w w w w w w",
+    "    w w w w w w w w",
+    "    tail",
+    "}"
+   ],
+   "words": "function\nsrc a rs\nw w w w w w w w\nw w w w w w w w\nw w w w w w w w\nw w w w w w w w\nw w w w w w w w\nw w w w w w w w",
+   "minilm": "function\nsrc a rs\nw w w w w w w w\nw w w w w w w w\nw w w w w w w w\nw w w w w w w w\nw w w w w w w w\nw w w w w w w w"
+  },
+  {
+   "label": "a long first line gives no body",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w",
+    "}"
+   ],
+   "words": "function\nsrc a rs",
+   "minilm": "function\nsrc a rs"
+  },
+  {
+   "label": "no body for File",
+   "node": {
+    "kind": "File",
+    "nativeKind": "file",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    a();",
+    "}"
+   ],
+   "words": "file\nsrc a rs",
+   "minilm": "file\nsrc a rs"
+  },
+  {
+   "label": "no body for Module",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "module",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    a();",
+    "}"
+   ],
+   "words": "module\nsrc a rs",
+   "minilm": "module\nsrc a rs"
+  },
+  {
+   "label": "no body for Variable",
+   "node": {
+    "kind": "Variable",
+    "nativeKind": "variable",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    a();",
+    "}"
+   ],
+   "words": "variable\nsrc a rs",
+   "minilm": "variable\nsrc a rs"
+  },
+  {
+   "label": "no body for Method",
+   "node": {
+    "kind": "Method",
+    "nativeKind": "method",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    a();",
+    "}"
+   ],
+   "words": "method\nsrc a rs",
+   "minilm": "method\nsrc a rs"
+  },
+  {
+   "label": "no body for Field",
+   "node": {
+    "kind": "Field",
+    "nativeKind": "field",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    a();",
+    "}"
+   ],
+   "words": "field\nsrc a rs",
+   "minilm": "field\nsrc a rs"
+  },
+  {
+   "label": "type body",
+   "node": {
+    "kind": "Type",
+    "nativeKind": "struct",
+    "name": "S",
+    "qualifiedName": "m::S",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "struct S {",
+    "    a: u8,",
+    "    b: u8,",
+    "}"
+   ],
+   "words": "struct m\nsrc a rs\na: u8,\nb: u8,",
+   "minilm": "struct m\nsrc a rs\na: u8,\nb: u8,"
+  },
+  {
+   "label": "no source",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "rust",
+    "signature": "fn f()",
+    "docComment": "Does f."
+   },
+   "srcLines": null,
+   "words": "function\nsrc a rs\nDoes f.\n\nfn f()",
+   "minilm": "function\nsrc a rs\nDoes f.\n\nfn f()"
+  },
+  {
+   "label": "empty source",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [],
+   "words": "function\nsrc a rs",
+   "minilm": "function\nsrc a rs"
+  },
+  {
+   "label": "span past EOF",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 1,
+    "endLine": 40,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "// x",
+    "fn f() {",
+    "    a();"
+   ],
+   "words": "function\nsrc a rs\na();",
+   "minilm": "function\nsrc a rs\na();"
+  },
+  {
+   "label": "start past EOF",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 9,
+    "endLine": 12,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    a();",
+    "}"
+   ],
+   "words": "function\nsrc a rs",
+   "minilm": "function\nsrc a rs"
+  },
+  {
+   "label": "start after end",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 2,
+    "endLine": 1,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    a();",
+    "}"
+   ],
+   "words": "function\nsrc a rs",
+   "minilm": "function\nsrc a rs"
+  },
+  {
+   "label": "nbsp and unit separator in a line",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    a b\u001fc\u001c d",
+    "}"
+   ],
+   "words": "function\nsrc a rs\na b c d",
+   "minilm": "function\nsrc a rs\na b c d"
+  },
+  {
+   "label": "unit separator only line is dropped",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "\u001f\u001e",
+    "    a();",
+    "}"
+   ],
+   "words": "function\nsrc a rs\na();",
+   "minilm": "function\nsrc a rs\na();"
+  },
+  {
+   "label": "unicode line separator inside a line",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "fn f() {",
+    "    a b　c",
+    "}"
+   ],
+   "words": "function\nsrc a rs\na b c",
+   "minilm": "function\nsrc a rs\na b c"
+  },
+  {
+   "label": "doc and signature",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 1,
+    "language": "rust",
+    "signature": "pub fn f(x: u8)",
+    "docComment": "Does it.\n\nMore."
+   },
+   "srcLines": [
+    "pub fn f(x: u8) {",
+    "}"
+   ],
+   "words": "function\nsrc a rs\nDoes it.\n\nMore.\n\npub fn f(x: u8)",
+   "minilm": "function\nsrc a rs\nDoes it.\n\nMore.\n\npub fn f(x: u8)"
+  },
+  {
+   "label": "doc only",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": "Does it."
+   },
+   "srcLines": [
+    "fn f() {}"
+   ],
+   "words": "function\nsrc a rs\nDoes it.",
+   "minilm": "function\nsrc a rs\nDoes it."
+  },
+  {
+   "label": "crlf",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcBytes": "Zm4gZigpIHsNCiAgICBhKCk7DQogICAgYigpOw0KfQ0K",
+   "srcLines": [
+    "fn f() {",
+    "    a();",
+    "    b();",
+    "}",
+    ""
+   ],
+   "words": "function\nsrc a rs\na();\nb();",
+   "minilm": "function\nsrc a rs\na();\nb();"
+  },
+  {
+   "label": "lone cr",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcBytes": "Zm4gZigpIHsNICAgIGEoKTsNICAgIGIoKTsNfQ==",
+   "srcLines": [
+    "fn f() {",
+    "    a();",
+    "    b();",
+    "}"
+   ],
+   "words": "function\nsrc a rs\na();\nb();",
+   "minilm": "function\nsrc a rs\na();\nb();"
+  },
+  {
+   "label": "mixed newlines",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcBytes": "Zm4gZigpIHsNCiAgICBhKCk7DSAgICBiKCk7Cn0=",
+   "srcLines": [
+    "fn f() {",
+    "    a();",
+    "    b();",
+    "}"
+   ],
+   "words": "function\nsrc a rs\na();\nb();",
+   "minilm": "function\nsrc a rs\na();\nb();"
+  },
+  {
+   "label": "invalid utf-8",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcBytes": "Zm4gZigpIHsKICAgIGEoIv/+Iik7CiAgICBiKCLigiIpOwp9Cg==",
+   "srcLines": [
+    "fn f() {",
+    "    a(\"��\");",
+    "    b(\"�\");",
+    "}",
+    ""
+   ],
+   "words": "function\nsrc a rs\na(\"��\");\nb(\"�\");",
+   "minilm": "function\nsrc a rs\na(\"��\");\nb(\"�\");"
+  },
+  {
+   "label": "bom and surrogate bytes",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "f",
+    "qualifiedName": "f",
+    "filePath": "src/a.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcBytes": "77u/Zm4gZigpIHsKICAgIGEoIu2ggCIpOwp9",
+   "srcLines": [
+    "﻿fn f() {",
+    "    a(\"���\");",
+    "}"
+   ],
+   "words": "function\nsrc a rs\na(\"���\");",
+   "minilm": "function\nsrc a rs\na(\"���\");"
+  },
+  {
+   "label": "gin Function formMultipartBinding.Bind",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "method",
+    "name": "Bind",
+    "qualifiedName": "formMultipartBinding.Bind",
+    "filePath": "binding/form.go",
+    "startLine": 0,
+    "endLine": 9,
+    "language": "go",
+    "signature": "func (formMultipartBinding) Bind(req *http.Request, obj any) error",
+    "docComment": null
+   },
+   "srcLines": [
+    "func (formMultipartBinding) Bind(req *http.Request, obj any) error {",
+    "\tif err := req.ParseMultipartForm(defaultMemory); err != nil {",
+    "\t\treturn err",
+    "\t}",
+    "\tif err := mappingByPtr(obj, (*multipartRequest)(req), \"form\"); err != nil {",
+    "\t\treturn err",
+    "\t}",
+    "",
+    "\treturn validate(obj)",
+    "}"
+   ],
+   "words": "method form multipart binding\nbinding form go\nfunc (formMultipartBinding) Bind(req *http.Request, obj any) error\nif err := req.ParseMultipartForm(defaultMemory); err != nil {\nreturn err\nif err := mappingByPtr(obj, (*multipartRequest)(req), \"form\"); err != nil {\nreturn err\nreturn validate(obj)",
+   "minilm": "method form multipart binding\nbinding form go\nfunc (formMultipartBinding) Bind(req *http.Request, obj any) error\nif err := req.ParseMultipartForm(defaultMemory); err != nil {\nreturn err"
+  },
+  {
+   "label": "gin Type FooStructForStructPointerType",
+   "node": {
+    "kind": "Type",
+    "nativeKind": "struct",
+    "name": "FooStructForStructPointerType",
+    "qualifiedName": "FooStructForStructPointerType",
+    "filePath": "binding/binding_test.go",
+    "startLine": 0,
+    "endLine": 4,
+    "language": "go",
+    "signature": "type FooStructForStructPointerType struct",
+    "docComment": null
+   },
+   "srcLines": [
+    "type FooStructForStructPointerType struct {",
+    "\tStructPointerFoo *struct {",
+    "\t\tName string `form:\"name\"`",
+    "\t}",
+    "}"
+   ],
+   "words": "struct\nbinding binding test go\ntype FooStructForStructPointerType struct\nStructPointerFoo *struct {\nName string `form:\"name\"`",
+   "minilm": "struct\nbinding binding test go\ntype FooStructForStructPointerType struct\nStructPointerFoo *struct {\nName string `form:\"name\"`"
+  },
+  {
+   "label": "gin Function TestContextBindWithYAML",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "TestContextBindWithYAML",
+    "qualifiedName": "TestContextBindWithYAML",
+    "filePath": "context_test.go",
+    "startLine": 0,
+    "endLine": 15,
+    "language": "go",
+    "signature": "func TestContextBindWithYAML(t *testing.T)",
+    "docComment": null
+   },
+   "srcLines": [
+    "func TestContextBindWithYAML(t *testing.T) {",
+    "\tw := httptest.NewRecorder()",
+    "\tc, _ := CreateTestContext(w)",
+    "",
+    "\tc.Request, _ = http.NewRequest(http.MethodPost, \"/\", strings.NewReader(\"foo: bar\\nbar: foo\"))",
+    "\tc.Request.Header.Add(\"Content-Type\", MIMEXML) // set fake content-type",
+    "",
+    "\tvar obj struct {",
+    "\t\tFoo string `yaml:\"foo\"`",
+    "\t\tBar string `yaml:\"bar\"`",
+    "\t}",
+    "\trequire.NoError(t, c.BindYAML(&obj))",
+    "\tassert.Equal(t, \"foo\", obj.Bar)",
+    "\tassert.Equal(t, \"bar\", obj.Foo)",
+    "\tassert.Equal(t, 0, w.Body.Len())",
+    "}"
+   ],
+   "words": "function\ncontext test go\nfunc TestContextBindWithYAML(t *testing.T)\nw := httptest.NewRecorder()\nc, _ := CreateTestContext(w)\nc.Request, _ = http.NewRequest(http.MethodPost, \"/\", strings.NewReader(\"foo: bar\\nbar: foo\"))\nc.Request.Header.Add(\"Content-Type\", MIMEXML) // set fake content-type\nvar obj struct {\nFoo string `yaml:\"foo\"`\nBar string `yaml:\"bar\"`\nrequire.NoError(t, c.BindYAML(&obj))\nassert.Equal(t, \"foo\", obj.Bar)\nassert.Equal(t, \"bar\", obj.Foo)\nassert.Equal(t, 0, w.Body.Len())",
+   "minilm": "function\ncontext test go\nfunc TestContextBindWithYAML(t *testing.T)\nw := httptest.NewRecorder()\nc, _ := CreateTestContext(w)"
+  },
+  {
+   "label": "gin Function testBodyBindingSlice",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "testBodyBindingSlice",
+    "qualifiedName": "testBodyBindingSlice",
+    "filePath": "binding/binding_test.go",
+    "startLine": 0,
+    "endLine": 12,
+    "language": "go",
+    "signature": "func testBodyBindingSlice(t *testing.T, b Binding, name, path, badPath, body, badBody string)",
+    "docComment": null
+   },
+   "srcLines": [
+    "func testBodyBindingSlice(t *testing.T, b Binding, name, path, badPath, body, badBody string) {",
+    "\tassert.Equal(t, name, b.Name())",
+    "",
+    "\tvar obj1 []FooStruct",
+    "\treq := requestWithBody(http.MethodPost, path, body)",
+    "\terr := b.Bind(req, &obj1)",
+    "\trequire.NoError(t, err)",
+    "",
+    "\tvar obj2 []FooStruct",
+    "\treq = requestWithBody(http.MethodPost, badPath, badBody)",
+    "\terr = JSON.Bind(req, &obj2)",
+    "\trequire.Error(t, err)",
+    "}"
+   ],
+   "words": "function\nbinding binding test go\nfunc testBodyBindingSlice(t *testing.T, b Binding, name, path, badPath, body, badBody string)\nassert.Equal(t, name, b.Name())\nvar obj1 []FooStruct\nreq := requestWithBody(http.MethodPost, path, body)\nerr := b.Bind(req, &obj1)\nrequire.NoError(t, err)\nvar obj2 []FooStruct\nreq = requestWithBody(http.MethodPost, badPath, badBody)\nerr = JSON.Bind(req, &obj2)\nrequire.Error(t, err)",
+   "minilm": "function\nbinding binding test go\nfunc testBodyBindingSlice(t *testing.T, b Binding, name, path, badPath, body, badBody string)\nassert.Equal(t, name, b.Name())\nvar obj1 []FooStruct\nreq := requestWithBody(http.MethodPost, path, body)"
+  },
+  {
+   "label": "gin Function testFormBindingInvalidName",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "testFormBindingInvalidName",
+    "qualifiedName": "testFormBindingInvalidName",
+    "filePath": "binding/binding_test.go",
+    "startLine": 0,
+    "endLine": 17,
+    "language": "go",
+    "signature": "func testFormBindingInvalidName(t *testing.T, method, path, badPath, body, badBody string)",
+    "docComment": null
+   },
+   "srcLines": [
+    "func testFormBindingInvalidName(t *testing.T, method, path, badPath, body, badBody string) {",
+    "\tb := Form",
+    "\tassert.Equal(t, \"form\", b.Name())",
+    "",
+    "\tobj := InvalidNameType{}",
+    "\treq := requestWithBody(method, path, body)",
+    "\tif method == http.MethodPost {",
+    "\t\treq.Header.Add(\"Content-Type\", MIMEPOSTForm)",
+    "\t}",
+    "\terr := b.Bind(req, &obj)",
+    "\trequire.NoError(t, err)",
+    "\tassert.Empty(t, obj.TestName)",
+    "",
+    "\tobj = InvalidNameType{}",
+    "\treq = requestWithBody(method, badPath, badBody)",
+    "\terr = JSON.Bind(req, &obj)",
+    "\trequire.Error(t, err)",
+    "}"
+   ],
+   "words": "function\nbinding binding test go\nfunc testFormBindingInvalidName(t *testing.T, method, path, badPath, body, badBody string)\nb := Form\nassert.Equal(t, \"form\", b.Name())\nobj := InvalidNameType{}\nreq := requestWithBody(method, path, body)\nif method == http.MethodPost {\nreq.Header.Add(\"Content-Type\", MIMEPOSTForm)\nerr := b.Bind(req, &obj)\nrequire.NoError(t, err)\nassert.Empty(t, obj.TestName)\nobj = InvalidNameType{}\nreq = requestWithBody(method, badPath, badBody)\nerr = JSON.Bind(req, &obj)\nrequire.Error(t, err)",
+   "minilm": "function\nbinding binding test go\nfunc testFormBindingInvalidName(t *testing.T, method, path, badPath, body, badBody string)\nb := Form\nassert.Equal(t, \"form\", b.Name())\nobj := InvalidNameType{}\nreq := requestWithBody(method, path, body)"
+  },
+  {
+   "label": "gin Function TestMappingCustomStructTypeUnmarshalTextUri",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "TestMappingCustomStructTypeUnmarshalTextUri",
+    "qualifiedName": "TestMappingCustomStructTypeUnmarshalTextUri",
+    "filePath": "binding/form_mapping_test.go",
+    "startLine": 0,
+    "endLine": 10,
+    "language": "go",
+    "signature": "func TestMappingCustomStructTypeUnmarshalTextUri(t *testing.T)",
+    "docComment": null
+   },
+   "srcLines": [
+    "func TestMappingCustomStructTypeUnmarshalTextUri(t *testing.T) {",
+    "\tvar s struct {",
+    "\t\tFileData customUnmarshalTextType `uri:\"data,parser=encoding.TextUnmarshaler\"`",
+    "\t}",
+    "\terr := mappingByPtr(&s, formSource{\"data\": {`file:/foo:happiness`}}, \"uri\")",
+    "\trequire.NoError(t, err)",
+    "",
+    "\tassert.Equal(t, \"file\", s.FileData.Protocol)",
+    "\tassert.Equal(t, \"/foo\", s.FileData.Path)",
+    "\tassert.Equal(t, \"happiness\", s.FileData.Name)",
+    "}"
+   ],
+   "words": "function\nbinding form mapping test go\nfunc TestMappingCustomStructTypeUnmarshalTextUri(t *testing.T)\nvar s struct {\nFileData customUnmarshalTextType `uri:\"data,parser=encoding.TextUnmarshaler\"`\nerr := mappingByPtr(&s, formSource{\"data\": {`file:/foo:happiness`}}, \"uri\")\nrequire.NoError(t, err)\nassert.Equal(t, \"file\", s.FileData.Protocol)\nassert.Equal(t, \"/foo\", s.FileData.Path)\nassert.Equal(t, \"happiness\", s.FileData.Name)",
+   "minilm": "function\nbinding form mapping test go\nfunc TestMappingCustomStructTypeUnmarshalTextUri(t *testing.T)\nvar s struct {\nFileData customUnmarshalTextType `uri:\"data,parser=encoding.TextUnmarshaler\"`"
+  },
+  {
+   "label": "gin Type xmlBinding",
+   "node": {
+    "kind": "Type",
+    "nativeKind": "struct",
+    "name": "xmlBinding",
+    "qualifiedName": "xmlBinding",
+    "filePath": "binding/xml.go",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "go",
+    "signature": "type xmlBinding struct",
+    "docComment": null
+   },
+   "srcLines": [
+    "type xmlBinding struct{}"
+   ],
+   "words": "struct\nbinding xml go\ntype xmlBinding struct",
+   "minilm": "struct\nbinding xml go\ntype xmlBinding struct"
+  },
+  {
+   "label": "gin Function TestBasicAuthForProxySucceed",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "TestBasicAuthForProxySucceed",
+    "qualifiedName": "TestBasicAuthForProxySucceed",
+    "filePath": "auth_test.go",
+    "startLine": 0,
+    "endLine": 15,
+    "language": "go",
+    "signature": "func TestBasicAuthForProxySucceed(t *testing.T)",
+    "docComment": null
+   },
+   "srcLines": [
+    "func TestBasicAuthForProxySucceed(t *testing.T) {",
+    "\taccounts := Accounts{\"admin\": \"password\"}",
+    "\trouter := New()",
+    "\trouter.Use(BasicAuthForProxy(accounts, \"\"))",
+    "\trouter.Any(\"/*proxyPath\", func(c *Context) {",
+    "\t\tc.String(http.StatusOK, c.MustGet(AuthProxyUserKey).(string))",
+    "\t})",
+    "",
+    "\tw := httptest.NewRecorder()",
+    "\treq, _ := http.NewRequest(http.MethodGet, \"/test\", nil)",
+    "\treq.Header.Set(\"Proxy-Authorization\", authorizationHeader(\"admin\", \"password\"))",
+    "\trouter.ServeHTTP(w, req)",
+    "",
+    "\tassert.Equal(t, http.StatusOK, w.Code)",
+    "\tassert.Equal(t, \"admin\", w.Body.String())",
+    "}"
+   ],
+   "words": "function\nauth test go\nfunc TestBasicAuthForProxySucceed(t *testing.T)\naccounts := Accounts{\"admin\": \"password\"}\nrouter := New()\nrouter.Use(BasicAuthForProxy(accounts, \"\"))\nrouter.Any(\"/*proxyPath\", func(c *Context) {\nc.String(http.StatusOK, c.MustGet(AuthProxyUserKey).(string))\nw := httptest.NewRecorder()\nreq, _ := http.NewRequest(http.MethodGet, \"/test\", nil)\nreq.Header.Set(\"Proxy-Authorization\", authorizationHeader(\"admin\", \"password\"))\nrouter.ServeHTTP(w, req)\nassert.Equal(t, http.StatusOK, w.Code)\nassert.Equal(t, \"admin\", w.Body.String())",
+   "minilm": "function\nauth test go\nfunc TestBasicAuthForProxySucceed(t *testing.T)\naccounts := Accounts{\"admin\": \"password\"}\nrouter := New()\nrouter.Use(BasicAuthForProxy(accounts, \"\"))"
+  },
+  {
+   "label": "gin Function authPairs.searchCredential",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "method",
+    "name": "searchCredential",
+    "qualifiedName": "authPairs.searchCredential",
+    "filePath": "auth.go",
+    "startLine": 0,
+    "endLine": 10,
+    "language": "go",
+    "signature": "func (a authPairs) searchCredential(authValue string) (string, bool)",
+    "docComment": null
+   },
+   "srcLines": [
+    "func (a authPairs) searchCredential(authValue string) (string, bool) {",
+    "\tif authValue == \"\" {",
+    "\t\treturn \"\", false",
+    "\t}",
+    "\tfor _, pair := range a {",
+    "\t\tif subtle.ConstantTimeCompare(bytesconv.StringToBytes(pair.value), bytesconv.StringToBytes(authValue)) == 1 {",
+    "\t\t\treturn pair.user, true",
+    "\t\t}",
+    "\t}",
+    "\treturn \"\", false",
+    "}"
+   ],
+   "words": "method auth pairs\nauth go\nfunc (a authPairs) searchCredential(authValue string) (string, bool)\nif authValue == \"\" {\nreturn \"\", false\nfor _, pair := range a {\nif subtle.ConstantTimeCompare(bytesconv.StringToBytes(pair.value), bytesconv.StringToBytes(authValue)) == 1 {\nreturn pair.user, true\nreturn \"\", false",
+   "minilm": "method auth pairs\nauth go\nfunc (a authPairs) searchCredential(authValue string) (string, bool)\nif authValue == \"\" {\nreturn \"\", false\nfor _, pair := range a {"
+  },
+  {
+   "label": "gin Function jsonBinding.Bind",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "method",
+    "name": "Bind",
+    "qualifiedName": "jsonBinding.Bind",
+    "filePath": "binding/json.go",
+    "startLine": 0,
+    "endLine": 5,
+    "language": "go",
+    "signature": "func (jsonBinding) Bind(req *http.Request, obj any) error",
+    "docComment": null
+   },
+   "srcLines": [
+    "func (jsonBinding) Bind(req *http.Request, obj any) error {",
+    "\tif req == nil || req.Body == nil {",
+    "\t\treturn errors.New(\"invalid request\")",
+    "\t}",
+    "\treturn decodeJSON(req.Body, obj)",
+    "}"
+   ],
+   "words": "method json binding\nbinding json go\nfunc (jsonBinding) Bind(req *http.Request, obj any) error\nif req == nil || req.Body == nil {\nreturn errors.New(\"invalid request\")\nreturn decodeJSON(req.Body, obj)",
+   "minilm": "method json binding\nbinding json go\nfunc (jsonBinding) Bind(req *http.Request, obj any) error\nif req == nil || req.Body == nil {\nreturn errors.New(\"invalid request\")\nreturn decodeJSON(req.Body, obj)"
+  },
+  {
+   "label": "gin Module net/url.Values",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "Values",
+    "qualifiedName": "net/url.Values",
+    "filePath": "context.go",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "go",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "\tqueryCache url.Values"
+   ],
+   "words": "pending symbol net url\ncontext go",
+   "minilm": "pending symbol net url\ncontext go"
+  },
+  {
+   "label": "gin Module github.com/gin-gonic/gin.DefaultWriter",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "DefaultWriter",
+    "qualifiedName": "github.com/gin-gonic/gin.DefaultWriter",
+    "filePath": "githubapi_test.go",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "go",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "\tDefaultWriter = os.Stdout"
+   ],
+   "words": "pending symbol github com gin gonic gin\ngithubapi test go",
+   "minilm": "pending symbol github com gin gonic gin\ngithubapi test go"
+  },
+  {
+   "label": "gin Module encoding/json",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "external_module",
+    "name": "json",
+    "qualifiedName": "encoding/json",
+    "filePath": "codec/json/json.go",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "go",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "\t\"encoding/json\""
+   ],
+   "words": "external module encoding\ncodec json json go",
+   "minilm": "external module encoding\ncodec json json go"
+  },
+  {
+   "label": "gin Module encoding/json.Number",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "Number",
+    "qualifiedName": "encoding/json.Number",
+    "filePath": "binding/binding_test.go",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "go",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "\tv, e := obj.Foo.(json.Number).Int64()"
+   ],
+   "words": "pending symbol encoding json\nbinding binding test go",
+   "minilm": "pending symbol encoding json\nbinding binding test go"
+  },
+  {
+   "label": "gin Module html/template",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "external_module",
+    "name": "template",
+    "qualifiedName": "html/template",
+    "filePath": "gin_test.go",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "go",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "\t\"html/template\""
+   ],
+   "words": "external module html\ngin test go",
+   "minilm": "external module html\ngin test go"
+  },
+  {
+   "label": "py-requests Function TestRequests.test_params_are_merged_case_sensitive",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "method",
+    "name": "test_params_are_merged_case_sensitive",
+    "qualifiedName": "TestRequests.test_params_are_merged_case_sensitive",
+    "filePath": "tests/test_requests.py",
+    "startLine": 0,
+    "endLine": 4,
+    "language": "python",
+    "signature": "def test_params_are_merged_case_sensitive(self, httpbin)",
+    "docComment": null
+   },
+   "srcLines": [
+    "    def test_params_are_merged_case_sensitive(self, httpbin):",
+    "        s = requests.Session()",
+    "        s.params[\"foo\"] = \"bar\"",
+    "        r = s.get(httpbin(\"get\"), params={\"FOO\": \"bar\"})",
+    "        assert r.json()[\"args\"] == {\"foo\": \"bar\", \"FOO\": \"bar\"}"
+   ],
+   "words": "method test requests\ntests test requests py\ndef test_params_are_merged_case_sensitive(self, httpbin)\ns = requests.Session()\ns.params[\"foo\"] = \"bar\"\nr = s.get(httpbin(\"get\"), params={\"FOO\": \"bar\"})\nassert r.json()[\"args\"] == {\"foo\": \"bar\", \"FOO\": \"bar\"}",
+   "minilm": "method test requests\ntests test requests py\ndef test_params_are_merged_case_sensitive(self, httpbin)\ns = requests.Session()\ns.params[\"foo\"] = \"bar\"\nr = s.get(httpbin(\"get\"), params={\"FOO\": \"bar\"})"
+  },
+  {
+   "label": "py-requests Function unquote_header_value",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "unquote_header_value",
+    "qualifiedName": "unquote_header_value",
+    "filePath": "src/requests/utils.py",
+    "startLine": 0,
+    "endLine": 22,
+    "language": "python",
+    "signature": "def unquote_header_value(value: str, is_filename: bool = False) -> str",
+    "docComment": "Unquotes a header value.  (Reversal of :func:`quote_header_value`).\nThis does not use the real unquoting but what browsers are actually\nusing for quoting.\n\n:param value: the header value to unquote.\n:rtype: str"
+   },
+   "srcLines": [
+    "def unquote_header_value(value: str, is_filename: bool = False) -> str:",
+    "    r\"\"\"Unquotes a header value.  (Reversal of :func:`quote_header_value`).",
+    "    This does not use the real unquoting but what browsers are actually",
+    "    using for quoting.",
+    "",
+    "    :param value: the header value to unquote.",
+    "    :rtype: str",
+    "    \"\"\"",
+    "    if value and value[0] == value[-1] == '\"':",
+    "        # this is not the real unquoting, but fixing this so that the",
+    "        # RFC is met will result in bugs with internet explorer and",
+    "        # probably some other browsers as well.  IE for example is",
+    "        # uploading files with \"C:\\foo\\bar.txt\" as filename"
+   ],
+   "words": "function\nsrc requests utils py\nUnquotes a header value.  (Reversal of :func:`quote_header_value`).\nThis does not use the real unquoting but what browsers are actually\nusing for quoting.\n\ndef unquote_header_value(value: str, is_filename: bool = False) -> str\nif value and value[0] == value[-1] == '\"':\n# this is not the real unquoting, but fixing this so that the\n# RFC is met will result in bugs with internet explorer and\n# probably some other browsers as well. IE for example is",
+   "minilm": "function\nsrc requests utils py\nUnquotes a header value.  (Reversal of :func:`quote_header_value`).\nThis does not use the real unquoting but what browsers are actually\nusing for quoting.\n\ndef unquote_header_value(value: str, is_filename: bool = False) -> str\nif value and value[0] == value[-1] == '\"':\n# this is not the real unquoting, but fixing this so that the\n# RFC is met will result in bugs with internet explorer and"
+  },
+  {
+   "label": "py-requests Function TestRequests.test_session_hooks_are_overridden_by_request_hooks.hook2",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "hook2",
+    "qualifiedName": "TestRequests.test_session_hooks_are_overridden_by_request_hooks.hook2",
+    "filePath": "tests/test_requests.py",
+    "startLine": 0,
+    "endLine": 1,
+    "language": "python",
+    "signature": "def hook2(*args, **kwargs)",
+    "docComment": null
+   },
+   "srcLines": [
+    "        def hook2(*args, **kwargs):",
+    "            pass"
+   ],
+   "words": "function test requests test session hooks are overridden by request hooks\ntests test requests py\ndef hook2(*args, **kwargs)\npass",
+   "minilm": "function test requests test session hooks are overridden by request hooks\ntests test requests py\ndef hook2(*args, **kwargs)\npass"
+  },
+  {
+   "label": "py-requests Type InvalidURL",
+   "node": {
+    "kind": "Type",
+    "nativeKind": "class",
+    "name": "InvalidURL",
+    "qualifiedName": "InvalidURL",
+    "filePath": "src/requests/exceptions.py",
+    "startLine": 0,
+    "endLine": 1,
+    "language": "python",
+    "signature": "class InvalidURL(RequestException, ValueError)",
+    "docComment": "The URL provided was somehow invalid."
+   },
+   "srcLines": [
+    "class InvalidURL(RequestException, ValueError):"
+   ],
+   "words": "class\nsrc requests exceptions py\nThe URL provided was somehow invalid.\n\nclass InvalidURL(RequestException, ValueError)",
+   "minilm": "class\nsrc requests exceptions py\nThe URL provided was somehow invalid.\n\nclass InvalidURL(RequestException, ValueError)"
+  },
+  {
+   "label": "py-requests Function test_digestauth_401_count_reset_on_redirect",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "test_digestauth_401_count_reset_on_redirect",
+    "qualifiedName": "test_digestauth_401_count_reset_on_redirect",
+    "filePath": "tests/test_lowlevel.py",
+    "startLine": 0,
+    "endLine": 62,
+    "language": "python",
+    "signature": "def test_digestauth_401_count_reset_on_redirect()",
+    "docComment": "Ensure we correctly reset num_401_calls after a successful digest auth,\nfollowed by a 302 redirect to another digest auth prompt.\n\nSee https://github.com/psf/requests/issues/1979."
+   },
+   "srcLines": [
+    "def test_digestauth_401_count_reset_on_redirect():",
+    "    \"\"\"Ensure we correctly reset num_401_calls after a successful digest auth,",
+    "    followed by a 302 redirect to another digest auth prompt.",
+    "",
+    "    See https://github.com/psf/requests/issues/1979.",
+    "    \"\"\"",
+    "    text_401 = (b'HTTP/1.1 401 UNAUTHORIZED\\r\\n'",
+    "                b'Content-Length: 0\\r\\n'",
+    "                b'WWW-Authenticate: Digest nonce=\"6bf5d6e4da1ce66918800195d6b9130d\"'",
+    "                b', opaque=\"372825293d1c26955496c80ed6426e9e\", '",
+    "                b'realm=\"me@kennethreitz.com\", qop=auth\\r\\n\\r\\n')",
+    "",
+    "    text_302 = (b'HTTP/1.1 302 FOUND\\r\\n'",
+    "                b'Content-Length: 0\\r\\n'",
+    "                b'Location: /\\r\\n\\r\\n')",
+    "",
+    "    text_200 = (b'HTTP/1.1 200 OK\\r\\n'",
+    "                b'Content-Length: 0\\r\\n\\r\\n')",
+    "",
+    "    expected_digest = (b'Authorization: Digest username=\"user\", '",
+    "                       b'realm=\"me@kennethreitz.com\", '",
+    "                       b'nonce=\"6bf5d6e4da1ce66918800195d6b9130d\", uri=\"/\"')",
+    "",
+    "    auth = requests.auth.HTTPDigestAuth('user', 'pass')",
+    "",
+    "    def digest_response_handler(sock):",
+    "        # Respond to initial GET with a challenge."
+   ],
+   "words": "function\ntests test lowlevel py\nEnsure we correctly reset num_401_calls after a successful digest auth,\nfollowed by a 302 redirect to another digest auth prompt.\n\ndef test_digestauth_401_count_reset_on_redirect()\ntext_401 = (b'HTTP/1.1 401 UNAUTHORIZED\\r\\n'\nb'Content-Length: 0\\r\\n'\nb'WWW-Authenticate: Digest nonce=\"6bf5d6e4da1ce66918800195d6b9130d\"'\nb', opaque=\"372825293d1c26955496c80ed6426e9e\", '\nb'realm=\"me@kennethreitz.com\", qop=auth\\r\\n\\r\\n')\ntext_302 = (b'HTTP/1.1 302 FOUND\\r\\n'\nb'Content-Length: 0\\r\\n'\nb'Location: /\\r\\n\\r\\n')\ntext_200 = (b'HTTP/1.1 200 OK\\r\\n'\nb'Content-Length: 0\\r\\n\\r\\n')\nexpected_digest = (b'Authorization: Digest username=\"user\", '\nb'realm=\"me@kennethreitz.com\", '\nb'nonce=\"6bf5d6e4da1ce66918800195d6b9130d\", uri=\"/\"')\nauth = requests.auth.HTTPDigestAuth('user', 'pass')\ndef digest_response_handler(sock):",
+   "minilm": "function\ntests test lowlevel py\nEnsure we correctly reset num_401_calls after a successful digest auth,\nfollowed by a 302 redirect to another digest auth prompt.\n\ndef test_digestauth_401_count_reset_on_redirect()\ntext_401 = (b'HTTP/1.1 401 UNAUTHORIZED\\r\\n'\nb'Content-Length: 0\\r\\n'"
+  },
+  {
+   "label": "py-requests Function test_default_hooks",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "test_default_hooks",
+    "qualifiedName": "test_default_hooks",
+    "filePath": "tests/test_hooks.py",
+    "startLine": 0,
+    "endLine": 1,
+    "language": "python",
+    "signature": "def test_default_hooks()",
+    "docComment": null
+   },
+   "srcLines": [
+    "def test_default_hooks():",
+    "    assert hooks.default_hooks() == {\"response\": []}"
+   ],
+   "words": "function\ntests test hooks py\ndef test_default_hooks()\nassert hooks.default_hooks() == {\"response\": []}",
+   "minilm": "function\ntests test hooks py\ndef test_default_hooks()\nassert hooks.default_hooks() == {\"response\": []}"
+  },
+  {
+   "label": "py-requests Function TestTestServer.test_server_finishes_on_error",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "method",
+    "name": "test_server_finishes_on_error",
+    "qualifiedName": "TestTestServer.test_server_finishes_on_error",
+    "filePath": "tests/test_testserver.py",
+    "startLine": 0,
+    "endLine": 10,
+    "language": "python",
+    "signature": "def test_server_finishes_on_error(self)",
+    "docComment": "the server thread exits even if an exception exits the context manager"
+   },
+   "srcLines": [
+    "    def test_server_finishes_on_error(self):",
+    "        \"\"\"the server thread exits even if an exception exits the context manager\"\"\"",
+    "        server = Server.basic_response_server()",
+    "        with pytest.raises(Exception):",
+    "            with server:",
+    "                raise Exception()",
+    "",
+    "        assert len(server.handler_results) == 0",
+    "",
+    "        # if the server thread fails to finish, the test suite will hang",
+    "        # and get killed by the jenkins timeout."
+   ],
+   "words": "method test test server\ntests test testserver py\nthe server thread exits even if an exception exits the context manager\n\ndef test_server_finishes_on_error(self)\nserver = Server.basic_response_server()\nwith pytest.raises(Exception):\nwith server:\nraise Exception()\nassert len(server.handler_results) == 0\n# if the server thread fails to finish, the test suite will hang\n# and get killed by the jenkins timeout.",
+   "minilm": "method test test server\ntests test testserver py\nthe server thread exits even if an exception exits the context manager\n\ndef test_server_finishes_on_error(self)\nserver = Server.basic_response_server()\nwith pytest.raises(Exception):\nwith server:\nraise Exception()\nassert len(server.handler_results) == 0"
+  },
+  {
+   "label": "py-requests Function is_ipv4_address",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "is_ipv4_address",
+    "qualifiedName": "is_ipv4_address",
+    "filePath": "src/requests/utils.py",
+    "startLine": 0,
+    "endLine": 8,
+    "language": "python",
+    "signature": "def is_ipv4_address(string_ip: str) -> bool",
+    "docComment": ":rtype: bool"
+   },
+   "srcLines": [
+    "def is_ipv4_address(string_ip: str) -> bool:",
+    "    \"\"\"",
+    "    :rtype: bool",
+    "    \"\"\"",
+    "    try:",
+    "        socket.inet_aton(string_ip)",
+    "    except OSError:",
+    "        return False",
+    "    return True"
+   ],
+   "words": "function\nsrc requests utils py\ndef is_ipv4_address(string_ip: str) -> bool\ntry:\nsocket.inet_aton(string_ip)\nexcept OSError:\nreturn False\nreturn True",
+   "minilm": "function\nsrc requests utils py\ndef is_ipv4_address(string_ip: str) -> bool\ntry:\nsocket.inet_aton(string_ip)\nexcept OSError:\nreturn False\nreturn True"
+  },
+  {
+   "label": "py-requests Function TestSuperLen.test_super_len_correctly_calculates_len_of_partially_read_file",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "method",
+    "name": "test_super_len_correctly_calculates_len_of_partially_read_file",
+    "qualifiedName": "TestSuperLen.test_super_len_correctly_calculates_len_of_partially_read_file",
+    "filePath": "tests/test_utils.py",
+    "startLine": 0,
+    "endLine": 4,
+    "language": "python",
+    "signature": "def test_super_len_correctly_calculates_len_of_partially_read_file(self)",
+    "docComment": "Ensure that we handle partially consumed file like objects."
+   },
+   "srcLines": [
+    "    def test_super_len_correctly_calculates_len_of_partially_read_file(self):",
+    "        \"\"\"Ensure that we handle partially consumed file like objects.\"\"\"",
+    "        s = StringIO.StringIO()",
+    "        s.write(\"foobarbogus\")",
+    "        assert super_len(s) == 0"
+   ],
+   "words": "method test super len\ntests test utils py\nEnsure that we handle partially consumed file like objects.\n\ndef test_super_len_correctly_calculates_len_of_partially_read_file(self)\ns = StringIO.StringIO()\ns.write(\"foobarbogus\")\nassert super_len(s) == 0",
+   "minilm": "method test super len\ntests test utils py\nEnsure that we handle partially consumed file like objects.\n\ndef test_super_len_correctly_calculates_len_of_partially_read_file(self)\ns = StringIO.StringIO()\ns.write(\"foobarbogus\")\nassert super_len(s) == 0"
+  },
+  {
+   "label": "py-requests Function LookupDict.__getattr__",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "method",
+    "name": "__getattr__",
+    "qualifiedName": "LookupDict.__getattr__",
+    "filePath": "src/requests/structures.py",
+    "startLine": 0,
+    "endLine": 8,
+    "language": "python",
+    "signature": "def __getattr__(self, key: str) -> _VT | None: # We need this for type checkers to infer typing # on attribute access with status_codes.py",
+    "docComment": null
+   },
+   "srcLines": [
+    "    def __getattr__(self, key: str) -> _VT | None:",
+    "        # We need this for type checkers to infer typing",
+    "        # on attribute access with status_codes.py",
+    "        if key in self.__dict__:",
+    "            return self.__dict__[key]",
+    "        else:",
+    "            raise AttributeError(",
+    "                f\"'{type(self).__name__}' object has no attribute '{key}'\"",
+    "            )"
+   ],
+   "words": "method lookup dict\nsrc requests structures py\ndef __getattr__(self, key: str) -> _VT | None: # We need this for type checkers to infer typing # on attribute access with status_codes.py\n# We need this for type checkers to infer typing\n# on attribute access with status_codes.py\nif key in self.__dict__:\nreturn self.__dict__[key]\nelse:\nraise AttributeError(\nf\"'{type(self).__name__}' object has no attribute '{key}'\"",
+   "minilm": "method lookup dict\nsrc requests structures py\ndef __getattr__(self, key: str) -> _VT | None: # We need this for type checkers to infer typing # on attribute access with status_codes.py\n# We need this for type checkers to infer typing\n# on attribute access with status_codes.py\nif key in self.__dict__:\nreturn self.__dict__[key]"
+  },
+  {
+   "label": "py-requests Module requests._internal_utils::to_native_string",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "to_native_string",
+    "qualifiedName": "requests._internal_utils::to_native_string",
+    "filePath": "src/requests/sessions.py",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "from ._internal_utils import to_native_string"
+   ],
+   "words": "pending symbol requests internal utils\nsrc requests sessions py",
+   "minilm": "pending symbol requests internal utils\nsrc requests sessions py"
+  },
+  {
+   "label": "py-requests Module requests.compat::JSONDecodeError",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "JSONDecodeError",
+    "qualifiedName": "requests.compat::JSONDecodeError",
+    "filePath": "src/requests/exceptions.py",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "from .compat import JSONDecodeError as CompatJSONDecodeError"
+   ],
+   "words": "pending symbol requests compat\nsrc requests exceptions py",
+   "minilm": "pending symbol requests compat\nsrc requests exceptions py"
+  },
+  {
+   "label": "py-requests Module datetime",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "external_module",
+    "name": "datetime",
+    "qualifiedName": "datetime",
+    "filePath": "src/requests/sessions.py",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "from datetime import timedelta"
+   ],
+   "words": "external module\nsrc requests sessions py",
+   "minilm": "external module\nsrc requests sessions py"
+  },
+  {
+   "label": "py-requests Module requests.exceptions::RetryError",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "RetryError",
+    "qualifiedName": "requests.exceptions::RetryError",
+    "filePath": "src/requests/adapters.py",
+    "startLine": 0,
+    "endLine": 11,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "from .exceptions import ("
+   ],
+   "words": "pending symbol requests exceptions\nsrc requests adapters py",
+   "minilm": "pending symbol requests exceptions\nsrc requests adapters py"
+  },
+  {
+   "label": "py-requests Module requests.utils::to_key_val_list",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "to_key_val_list",
+    "qualifiedName": "requests.utils::to_key_val_list",
+    "filePath": "src/requests/models.py",
+    "startLine": 0,
+    "endLine": 11,
+    "language": "python",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "from .utils import ("
+   ],
+   "words": "pending symbol requests utils\nsrc requests models py",
+   "minilm": "pending symbol requests utils\nsrc requests models py"
+  },
+  {
+   "label": "g-mesh Function lsp::config::tests::settings_that_are_not_a_table_of_sections_are_reported",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "settings_that_are_not_a_table_of_sections_are_reported",
+    "qualifiedName": "lsp::config::tests::settings_that_are_not_a_table_of_sections_are_reported",
+    "filePath": "plugins/sdk/src/lsp/config.rs",
+    "startLine": 0,
+    "endLine": 3,
+    "language": "rust",
+    "signature": "fn settings_that_are_not_a_table_of_sections_are_reported()",
+    "docComment": "`settings` that is not a table of sections is a manifest this reader\ncannot act on - reported, never shipped as \"the server runs on\ndefaults\"."
+   },
+   "srcLines": [
+    "    fn settings_that_are_not_a_table_of_sections_are_reported() {",
+    "        let manifest = \"[plugin.semantic]\\ncommand = \\\"toy-server\\\"\\nsettings = \\\"python\\\"\\n\";",
+    "        assert!(read(\"scalar-settings\", Some(manifest)).is_err());",
+    "    }"
+   ],
+   "words": "function lsp config tests\nplugins sdk src lsp config rs\n`settings` that is not a table of sections is a manifest this reader\ncannot act on - reported, never shipped as \"the server runs on\ndefaults\".\n\nfn settings_that_are_not_a_table_of_sections_are_reported()\nlet manifest = \"[plugin.semantic]\\ncommand = \\\"toy-server\\\"\\nsettings = \\\"python\\\"\\n\";\nassert!(read(\"scalar-settings\", Some(manifest)).is_err());",
+   "minilm": "function lsp config tests\nplugins sdk src lsp config rs\n`settings` that is not a table of sections is a manifest this reader\ncannot act on - reported, never shipped as \"the server runs on\ndefaults\".\n\nfn settings_that_are_not_a_table_of_sections_are_reported()\nlet manifest = \"[plugin.semantic]\\ncommand = \\\"toy-server\\\"\\nsettings = \\\"python\\\"\\n\";"
+  },
+  {
+   "label": "ripgrep Function matcher::<RegexMatcher as Matcher>::capture_count",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "trait_impl_method",
+    "name": "capture_count",
+    "qualifiedName": "matcher::<RegexMatcher as Matcher>::capture_count",
+    "filePath": "crates/regex/src/matcher.rs",
+    "startLine": 0,
+    "endLine": 2,
+    "language": "rust",
+    "signature": "fn capture_count(&self) -> usize",
+    "docComment": null
+   },
+   "srcLines": [
+    "    fn capture_count(&self) -> usize {",
+    "        self.regex.captures_len()",
+    "    }"
+   ],
+   "words": "trait impl method matcher regex matcher as matcher\ncrates regex src matcher rs\nfn capture_count(&self) -> usize\nself.regex.captures_len()",
+   "minilm": "trait impl method matcher regex matcher as matcher\ncrates regex src matcher rs\nfn capture_count(&self) -> usize\nself.regex.captures_len()"
+  },
+  {
+   "label": "ripgrep Function standard::PreludeWriter::start",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "method",
+    "name": "start",
+    "qualifiedName": "standard::PreludeWriter::start",
+    "filePath": "crates/printer/src/standard.rs",
+    "startLine": 0,
+    "endLine": 13,
+    "language": "rust",
+    "signature": "fn start( &mut self, line_number: Option<u64>, column: Option<u64>, ) -> io::Result<()>",
+    "docComment": "Starts the prelude with a hyperlink when applicable.\n\nIf a heading was written, and the hyperlink format is invariant on\nthe line number, then this doesn't hyperlink each line prelude, as it\nwouldn't point to the line anyway. The hyperlink on the heading should\nbe sufficient and less confusing."
+   },
+   "srcLines": [
+    "    fn start(",
+    "        &mut self,",
+    "        line_number: Option<u64>,",
+    "        column: Option<u64>,",
+    "    ) -> io::Result<()> {",
+    "        let Some(path) = self.std.path() else { return Ok(()) };",
+    "        if self.config().hyperlink.format().is_line_dependent()",
+    "            || !self.config().heading",
+    "        {",
+    "            self.interp_status =",
+    "                self.std.start_hyperlink(path, line_number, column)?;",
+    "        }",
+    "        Ok(())",
+    "    }"
+   ],
+   "words": "method standard prelude writer\ncrates printer src standard rs\nStarts the prelude with a hyperlink when applicable.\n\nfn start( &mut self, line_number: Option<u64>, column: Option<u64>, ) -> io::Result<()>\nlet Some(path) = self.std.path() else { return Ok(()) };\nif self.config().hyperlink.format().is_line_dependent()\n|| !self.config().heading\nself.interp_status =\nself.std.start_hyperlink(path, line_number, column)?;\nOk(())",
+   "minilm": "method standard prelude writer\ncrates printer src standard rs\nStarts the prelude with a hyperlink when applicable.\n\nfn start( &mut self, line_number: Option<u64>, column: Option<u64>, ) -> io::Result<()>\nlet Some(path) = self.std.path() else { return Ok(()) };\nif self.config().hyperlink.format().is_line_dependent()"
+  },
+  {
+   "label": "g-mesh Type watcher::staleness::ReindexFailed",
+   "node": {
+    "kind": "Type",
+    "nativeKind": "struct",
+    "name": "ReindexFailed",
+    "qualifiedName": "watcher::staleness::ReindexFailed",
+    "filePath": "core/src/watcher/staleness.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": "pub struct ReindexFailed",
+    "docComment": "The context [`ensure_fresh`] attaches when the reindex itself - the plugin\nround trip and its commit - failed, as opposed to anything around it (a\nfile that could not be stat'ed or hashed, a baseline that could not be\nwritten).\n\nA type rather than only a message so that a caller can ask\n`err.downcast_ref::<ReindexFailed>()` instead of matching text:\n`daemon::plugin::PluginProcess::ensure_fresh` relaunches its plugin on\nthis failure and on nothing else around it,\nbecause only this one can leave the plugin's cached copy of the file ahead\nof the index. A timeout wears this context too - it is a failed round\ntrip - so that caller also rules out `protocol::jsonrpc::is_timeout`,\nwhich already has its own relaunch path."
+   },
+   "srcLines": [
+    "pub struct ReindexFailed;"
+   ],
+   "words": "struct watcher staleness\ncore src watcher staleness rs\nThe context [`ensure_fresh`] attaches when the reindex itself - the plugin\nround trip and its commit - failed, as opposed to anything around it (a\nfile that could not be stat'ed or hashed, a baseline that could not be\nwritten).\n\npub struct ReindexFailed",
+   "minilm": "struct watcher staleness\ncore src watcher staleness rs\nThe context [`ensure_fresh`] attaches when the reindex itself - the plugin\nround trip and its commit - failed, as opposed to anything around it (a\nfile that could not be stat'ed or hashed, a baseline that could not be\nwritten).\n\npub struct ReindexFailed"
+  },
+  {
+   "label": "ripgrep Function summary::SummaryBuilder::hyperlink",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "method",
+    "name": "hyperlink",
+    "qualifiedName": "summary::SummaryBuilder::hyperlink",
+    "filePath": "crates/printer/src/summary.rs",
+    "startLine": 0,
+    "endLine": 6,
+    "language": "rust",
+    "signature": "pub fn hyperlink( &mut self, config: HyperlinkConfig, ) -> &mut SummaryBuilder",
+    "docComment": "Set the configuration to use for hyperlinks output by this printer.\n\nRegardless of the hyperlink format provided here, whether hyperlinks\nare actually used or not is determined by the implementation of\n`WriteColor` provided to `build`. For example, if `termcolor::NoColor`\nis provided to `build`, then no hyperlinks will ever be printed\nregardless of the format provided here.\n\nThis completely overrides any previous hyperlink format.\n\nThe default configuration results in not emitting any hyperlinks."
+   },
+   "srcLines": [
+    "    pub fn hyperlink(",
+    "        &mut self,",
+    "        config: HyperlinkConfig,",
+    "    ) -> &mut SummaryBuilder {",
+    "        self.config.hyperlink = config;",
+    "        self",
+    "    }"
+   ],
+   "words": "method summary summary builder\ncrates printer src summary rs\nSet the configuration to use for hyperlinks output by this printer.\n\nThis completely overrides any previous hyperlink format.\n\nThe default configuration results in not emitting any hyperlinks.\n\npub fn hyperlink( &mut self, config: HyperlinkConfig, ) -> &mut SummaryBuilder\nself.config.hyperlink = config;\nself",
+   "minilm": "method summary summary builder\ncrates printer src summary rs\nSet the configuration to use for hyperlinks output by this printer.\n\nThis completely overrides any previous hyperlink format.\n\nThe default configuration results in not emitting any hyperlinks.\n\npub fn hyperlink( &mut self, config: HyperlinkConfig, ) -> &mut SummaryBuilder\nself.config.hyperlink = config;\nself"
+  },
+  {
+   "label": "g-mesh Function daemon::lifecycle::tests::an_unresolvable_executable_is_never_treated_as_a_missing_one",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "an_unresolvable_executable_is_never_treated_as_a_missing_one",
+    "qualifiedName": "daemon::lifecycle::tests::an_unresolvable_executable_is_never_treated_as_a_missing_one",
+    "filePath": "core/src/daemon/lifecycle/tests.rs",
+    "startLine": 0,
+    "endLine": 5,
+    "language": "rust",
+    "signature": "fn an_unresolvable_executable_is_never_treated_as_a_missing_one()",
+    "docComment": "A `current_exe()` that failed is not evidence that anything is missing,\nand this decision ends a process - so \"cannot tell\" must read exactly\nlike \"nothing is wrong\". The intact project root is what makes this\ntest about the executable branch alone."
+   },
+   "srcLines": [
+    "fn an_unresolvable_executable_is_never_treated_as_a_missing_one() {",
+    "    let project = tempfile::tempdir().expect(\"failed to create a project root\");",
+    "",
+    "    let unresolvable = Err(io::Error::new(io::ErrorKind::PermissionDenied, \"cannot read /proc/self/exe\"));",
+    "    assert_eq!(orphan_check(project.path(), unresolvable), None);",
+    "}"
+   ],
+   "words": "function daemon lifecycle tests\ncore src daemon lifecycle tests rs\nA `current_exe()` that failed is not evidence that anything is missing,\nand this decision ends a process - so \"cannot tell\" must read exactly\nlike \"nothing is wrong\". The intact project root is what makes this\ntest about the executable branch alone.\n\nfn an_unresolvable_executable_is_never_treated_as_a_missing_one()\nlet project = tempfile::tempdir().expect(\"failed to create a project root\");\nlet unresolvable = Err(io::Error::new(io::ErrorKind::PermissionDenied, \"cannot read /proc/self/exe\"));\nassert_eq!(orphan_check(project.path(), unresolvable), None);",
+   "minilm": "function daemon lifecycle tests\ncore src daemon lifecycle tests rs\nA `current_exe()` that failed is not evidence that anything is missing,\nand this decision ends a process - so \"cannot tell\" must read exactly\nlike \"nothing is wrong\". The intact project root is what makes this\ntest about the executable branch alone.\n\nfn an_unresolvable_executable_is_never_treated_as_a_missing_one()\nlet project = tempfile::tempdir().expect(\"failed to create a project root\");"
+  },
+  {
+   "label": "ripgrep Function dir::tests::custom_ignore_precedence",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "custom_ignore_precedence",
+    "qualifiedName": "dir::tests::custom_ignore_precedence",
+    "filePath": "crates/ignore/src/dir.rs",
+    "startLine": 0,
+    "endLine": 14,
+    "language": "rust",
+    "signature": "fn custom_ignore_precedence()",
+    "docComment": null
+   },
+   "srcLines": [
+    "    fn custom_ignore_precedence() {",
+    "        let td = tmpdir();",
+    "        let custom_ignore1 = \".customignore1\";",
+    "        let custom_ignore2 = \".customignore2\";",
+    "        wfile(td.path().join(custom_ignore1), \"foo\");",
+    "        wfile(td.path().join(custom_ignore2), \"!foo\");",
+    "",
+    "        let (ig, err) = IgnoreBuilder::new()",
+    "            .add_custom_ignore_filename(custom_ignore1)",
+    "            .add_custom_ignore_filename(custom_ignore2)",
+    "            .build()",
+    "            .add_child(td.path());",
+    "        assert!(err.is_none());",
+    "        assert!(ig.matched(\"foo\", false).is_whitelist());",
+    "    }"
+   ],
+   "words": "function dir tests\ncrates ignore src dir rs\nfn custom_ignore_precedence()\nlet td = tmpdir();\nlet custom_ignore1 = \".customignore1\";\nlet custom_ignore2 = \".customignore2\";\nwfile(td.path().join(custom_ignore1), \"foo\");\nwfile(td.path().join(custom_ignore2), \"!foo\");\nlet (ig, err) = IgnoreBuilder::new()\n.add_custom_ignore_filename(custom_ignore1)\n.add_custom_ignore_filename(custom_ignore2)\n.build()\n.add_child(td.path());\nassert!(err.is_none());\nassert!(ig.matched(\"foo\", false).is_whitelist());",
+   "minilm": "function dir tests\ncrates ignore src dir rs\nfn custom_ignore_precedence()\nlet td = tmpdir();\nlet custom_ignore1 = \".customignore1\";\nlet custom_ignore2 = \".customignore2\";"
+  },
+  {
+   "label": "ripgrep Function search",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "search",
+    "qualifiedName": "search",
+    "filePath": "crates/core/main.rs",
+    "startLine": 0,
+    "endLine": 44,
+    "language": "rust",
+    "signature": "fn search(args: &HiArgs, mode: SearchMode) -> anyhow::Result<bool>",
+    "docComment": "The top-level entry point for single-threaded search.\n\nThis recursively steps through the file list (current directory by default)\nand searches each file sequentially."
+   },
+   "srcLines": [
+    "fn search(args: &HiArgs, mode: SearchMode) -> anyhow::Result<bool> {",
+    "    let started_at = std::time::Instant::now();",
+    "    let haystack_builder = args.haystack_builder();",
+    "    let unsorted = args",
+    "        .walk_builder()?",
+    "        .build()",
+    "        .filter_map(|result| haystack_builder.build_from_result(result));",
+    "    let haystacks = args.sort(unsorted);",
+    "",
+    "    let mut matched = false;",
+    "    let mut searched = false;",
+    "    let mut stats = args.stats();",
+    "    let mut searcher = args.search_worker(",
+    "        args.matcher()?,",
+    "        args.searcher()?,",
+    "        args.printer(mode, args.stdout()),",
+    "    )?;",
+    "    for haystack in haystacks {"
+   ],
+   "words": "function\ncrates core main rs\nThe top-level entry point for single-threaded search.\n\nThis recursively steps through the file list (current directory by default)\nand searches each file sequentially.\n\nfn search(args: &HiArgs, mode: SearchMode) -> anyhow::Result<bool>\nlet started_at = std::time::Instant::now();\nlet haystack_builder = args.haystack_builder();\nlet unsorted = args\n.walk_builder()?\n.build()\n.filter_map(|result| haystack_builder.build_from_result(result));\nlet haystacks = args.sort(unsorted);\nlet mut matched = false;\nlet mut searched = false;\nlet mut stats = args.stats();\nlet mut searcher = args.search_worker(\nargs.matcher()?,\nargs.searcher()?,\nargs.printer(mode, args.stdout()),\n)?;",
+   "minilm": "function\ncrates core main rs\nThe top-level entry point for single-threaded search.\n\nThis recursively steps through the file list (current directory by default)\nand searches each file sequentially.\n\nfn search(args: &HiArgs, mode: SearchMode) -> anyhow::Result<bool>\nlet started_at = std::time::Instant::now();\nlet haystack_builder = args.haystack_builder();\nlet unsorted = args"
+  },
+  {
+   "label": "ripgrep Type overrides::Glob",
+   "node": {
+    "kind": "Type",
+    "nativeKind": "struct",
+    "name": "Glob",
+    "qualifiedName": "overrides::Glob",
+    "filePath": "crates/ignore/src/overrides.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": "pub struct Glob<'a>",
+    "docComment": "Glob represents a single glob in an override matcher.\n\nThis is used to report information about the highest precedent glob\nthat matched.\n\nNote that not all matches necessarily correspond to a specific glob. For\nexample, if there are one or more whitelist globs and a file path doesn't\nmatch any glob in the set, then the file path is considered to be ignored.\n\nThe lifetime `'a` refers to the lifetime of the matcher that produced\nthis glob."
+   },
+   "srcLines": [
+    "pub struct Glob<'a>(GlobInner<'a>);"
+   ],
+   "words": "struct overrides\ncrates ignore src overrides rs\nGlob represents a single glob in an override matcher.\n\nThis is used to report information about the highest precedent glob\nthat matched.\n\nThe lifetime `'a` refers to the lifetime of the matcher that produced\nthis glob.\n\npub struct Glob<'a>",
+   "minilm": "struct overrides\ncrates ignore src overrides rs\nGlob represents a single glob in an override matcher.\n\nThis is used to report information about the highest precedent glob\nthat matched.\n\nThe lifetime `'a` refers to the lifetime of the matcher that produced\nthis glob.\n\npub struct Glob<'a>"
+  },
+  {
+   "label": "g-mesh Function watcher::apply::tests::setup_conn",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "setup_conn",
+    "qualifiedName": "watcher::apply::tests::setup_conn",
+    "filePath": "core/src/watcher/apply/tests.rs",
+    "startLine": 0,
+    "endLine": 5,
+    "language": "rust",
+    "signature": "fn setup_conn() -> Connection",
+    "docComment": null
+   },
+   "srcLines": [
+    "fn setup_conn() -> Connection {",
+    "    let conn = Connection::open_in_memory().unwrap();",
+    "    conn.pragma_update(None, \"foreign_keys\", \"ON\").unwrap();",
+    "    schema::apply(&conn).unwrap();",
+    "    conn",
+    "}"
+   ],
+   "words": "function watcher apply tests\ncore src watcher apply tests rs\nfn setup_conn() -> Connection\nlet conn = Connection::open_in_memory().unwrap();\nconn.pragma_update(None, \"foreign_keys\", \"ON\").unwrap();\nschema::apply(&conn).unwrap();\nconn",
+   "minilm": "function watcher apply tests\ncore src watcher apply tests rs\nfn setup_conn() -> Connection\nlet conn = Connection::open_in_memory().unwrap();"
+  },
+  {
+   "label": "g-mesh Module orphan:core/tests/orphaned_daemon.rs::common::*",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "resolved_module",
+    "name": "common",
+    "qualifiedName": "orphan:core/tests/orphaned_daemon.rs::common::*",
+    "filePath": "core/tests/orphaned_daemon.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "use common::wait_until_indexed;"
+   ],
+   "words": "resolved module orphan core tests orphaned daemon rs common\ncore tests orphaned daemon rs",
+   "minilm": "resolved module orphan core tests orphaned daemon rs common\ncore tests orphaned daemon rs"
+  },
+  {
+   "label": "g-mesh Module g_mesh_plugin_sdk::lsp::position::tests::lsp::position::tests::PositionEncoding::Utf32",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "Utf32",
+    "qualifiedName": "g_mesh_plugin_sdk::lsp::position::tests::lsp::position::tests::PositionEncoding::Utf32",
+    "filePath": "plugins/sdk/src/lsp/position.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "        for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16, PositionEncoding::Utf32] {"
+   ],
+   "words": "pending symbol g mesh plugin sdk lsp position tests lsp position tests position encoding\nplugins sdk src lsp position rs",
+   "minilm": "pending symbol g mesh plugin sdk lsp position tests lsp position tests position encoding\nplugins sdk src lsp position rs"
+  },
+  {
+   "label": "g-mesh Module g_mesh::protocol::handshake",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "container",
+    "name": "g_mesh::protocol::handshake",
+    "qualifiedName": "g_mesh::protocol::handshake",
+    "filePath": "",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": null,
+   "words": "container",
+   "minilm": "container"
+  },
+  {
+   "label": "g-mesh File core/tests/overload_declaration_storage.rs",
+   "node": {
+    "kind": "File",
+    "nativeKind": null,
+    "name": "overload_declaration_storage.rs",
+    "qualifiedName": "core/tests/overload_declaration_storage.rs",
+    "filePath": "core/tests/overload_declaration_storage.rs",
+    "startLine": 0,
+    "endLine": 222,
+    "language": "rust",
+    "signature": null,
+    "docComment": "The overload storage model, end to end: a fixture with two overload\nsignatures beside their implementation, extracted by the real plugin, sent\nover the real NDJSON wire, and committed by the real write path - and the\nrows that come out the far side.\n\nEverything below the plugin process is genuine (`daemon::bulk_index::run`\nspawns it, `protocol::ndjson` parses its stream, `storage::write::apply_diff`\ncommits it). A daemon and a socket are deliberately *not*: the question\nhere is what a walk stores, not who asked for it, and the cold-start walk is\nreachable on its own - the same entry point `g-mesh init` and\n`g-mesh reindex` use.\n\nThe negative half matters as much as the positive one. The design's central\npromise is that a symbol with one declaration costs nothing at all, so this\nsuite asserts that an ordinary function in the very same file - walked by\nthe same plugin, through the same wire, into the same transaction - leaves\nno declaration row behind, and that a plugin line for such a node never\nmentions the field."
+   },
+   "srcLines": [
+    "//! The overload storage model, end to end: a fixture with two overload"
+   ],
+   "words": "file core tests\ncore tests overload declaration storage rs\nThe overload storage model, end to end: a fixture with two overload\nsignatures beside their implementation, extracted by the real plugin, sent\nover the real NDJSON wire, and committed by the real write path - and the\nrows that come out the far side.",
+   "minilm": "file core tests\ncore tests overload declaration storage rs\nThe overload storage model, end to end: a fixture with two overload\nsignatures beside their implementation, extracted by the real plugin, sent\nover the real NDJSON wire, and committed by the real write path - and the\nrows that come out the far side."
+  },
+  {
+   "label": "g-mesh Module g_mesh::cli::status::tests::cli::status::tests::Connection::open",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "open",
+    "qualifiedName": "g_mesh::cli::status::tests::cli::status::tests::Connection::open",
+    "filePath": "core/src/cli/status/tests.rs",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "rust",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "        let conn = Connection::open(self.db_path()).unwrap();"
+   ],
+   "words": "pending symbol g mesh cli status tests cli status tests connection\ncore src cli status tests rs",
+   "minilm": "pending symbol g mesh cli status tests cli status tests connection\ncore src cli status tests rs"
+  },
+  {
+   "label": "excalidraw Function CustomMatchers#toBeNonNaNNumber",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "method",
+    "name": "toBeNonNaNNumber",
+    "qualifiedName": "CustomMatchers#toBeNonNaNNumber",
+    "filePath": "packages/excalidraw/global.d.ts",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "typescript",
+    "signature": "toBeNonNaNNumber(): void",
+    "docComment": null
+   },
+   "srcLines": [
+    "  toBeNonNaNNumber(): void;"
+   ],
+   "words": "method custom matchers\npackages excalidraw global d ts\ntoBeNonNaNNumber(): void",
+   "minilm": "method custom matchers\npackages excalidraw global d ts\ntoBeNonNaNNumber(): void"
+  },
+  {
+   "label": "excalidraw Function getNormalizedPoints",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "arrow_function",
+    "name": "getNormalizedPoints",
+    "qualifiedName": "getNormalizedPoints",
+    "filePath": "packages/element/src/linearElementEditor.ts",
+    "startLine": 0,
+    "endLine": 19,
+    "language": "typescript",
+    "signature": "getNormalizedPoints({ points, }: { points: ExcalidrawLinearElement[\"points\"]; }): { points: LocalPoint[]; offsetX: number; offsetY: number; }",
+    "docComment": "Normalizes line points so that the start point is at [0,0]. This is\nexpected in various parts of the codebase.\n\nAlso returns the offsets - [0,0] if no normalization needed.\n\n@private"
+   },
+   "srcLines": [
+    "const getNormalizedPoints = ({",
+    "  points,",
+    "}: {",
+    "  points: ExcalidrawLinearElement[\"points\"];",
+    "}): {",
+    "  points: LocalPoint[];",
+    "  offsetX: number;",
+    "  offsetY: number;",
+    "} => {",
+    "  const offsetX = points[0][0];",
+    "  const offsetY = points[0][1];",
+    "",
+    "  return {",
+    "    points: points.map((p) => {",
+    "      return pointFrom(p[0] - offsetX, p[1] - offsetY);",
+    "    }),",
+    "    offsetX,",
+    "    offsetY,",
+    "  };",
+    "};"
+   ],
+   "words": "arrow function\npackages element src linear element editor ts\nNormalizes line points so that the start point is at [0,0]. This is\nexpected in various parts of the codebase.\n\nAlso returns the offsets - [0,0] if no normalization needed.\n\ngetNormalizedPoints({ points, }: { points: ExcalidrawLinearElement[\"points\"]; }): { points: LocalPoint[]; offsetX: number; offsetY: number; }\npoints: LocalPoint[];\noffsetX: number;\noffsetY: number;\n} => {\nconst offsetX = points[0][0];\nconst offsetY = points[0][1];\nreturn {\npoints: points.map((p) => {\nreturn pointFrom(p[0] - offsetX, p[1] - offsetY);\noffsetX,\noffsetY,",
+   "minilm": "arrow function\npackages element src linear element editor ts\nNormalizes line points so that the start point is at [0,0]. This is\nexpected in various parts of the codebase.\n\nAlso returns the offsets - [0,0] if no normalization needed.\n\ngetNormalizedPoints({ points, }: { points: ExcalidrawLinearElement[\"points\"]; }): { points: LocalPoint[]; offsetX: number; offsetY: number; }\npoints: LocalPoint[];\noffsetX: number;\noffsetY: number;\n} => {\nconst offsetX = points[0][0];\nconst offsetY = points[0][1];"
+  },
+  {
+   "label": "excalidraw Function useTextGeneration",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "arrow_function",
+    "name": "useTextGeneration",
+    "qualifiedName": "useTextGeneration",
+    "filePath": "packages/excalidraw/components/TTDDialog/hooks/useTextGeneration.ts",
+    "startLine": 0,
+    "endLine": 199,
+    "language": "typescript",
+    "signature": "useTextGeneration({ onTextSubmit, }: { onTextSubmit: ( props: TTTDDialog.OnTextSubmitProps, ) => Promise<TTTDDialog.OnTextSubmitRetValue>; })",
+    "docComment": null
+   },
+   "srcLines": [
+    "export const useTextGeneration = ({",
+    "  onTextSubmit,",
+    "}: {",
+    "  onTextSubmit: (",
+    "    props: TTTDDialog.OnTextSubmitProps,",
+    "  ) => Promise<TTTDDialog.OnTextSubmitRetValue>;",
+    "}) => {",
+    "  const [, setError] = useAtom(errorAtom);",
+    "  const [rateLimits, setRateLimits] = useAtom(rateLimitsAtom);",
+    "  const [chatHistory, setChatHistory] = useAtom(chatHistoryAtom);",
+    "",
+    "  const { addUserMessage, addAssistantMessage, setAssistantError } =",
+    "    useChatAgent();",
+    "",
+    "  const streamingAbortControllerRef = useRef<AbortController | null>(null);",
+    "",
+    "  const validatePrompt = (prompt: string): boolean => {",
+    "    if (",
+    "      prompt.length > MAX_PROMPT_LENGTH ||",
+    "      prompt.length < MIN_PROMPT_LENGTH ||",
+    "      rateLimits?.rateLimitRemaining === 0"
+   ],
+   "words": "arrow function\npackages excalidraw components ttd dialog hooks use text generation ts\nuseTextGeneration({ onTextSubmit, }: { onTextSubmit: ( props: TTTDDialog.OnTextSubmitProps, ) => Promise<TTTDDialog.OnTextSubmitRetValue>; })\nconst [, setError] = useAtom(errorAtom);\nconst [rateLimits, setRateLimits] = useAtom(rateLimitsAtom);\nconst [chatHistory, setChatHistory] = useAtom(chatHistoryAtom);\nconst { addUserMessage, addAssistantMessage, setAssistantError } =\nuseChatAgent();\nconst streamingAbortControllerRef = useRef<AbortController | null>(null);\nconst validatePrompt = (prompt: string): boolean => {\nif (\nprompt.length > MAX_PROMPT_LENGTH ||\nprompt.length < MIN_PROMPT_LENGTH ||",
+   "minilm": "arrow function\npackages excalidraw components ttd dialog hooks use text generation ts\nuseTextGeneration({ onTextSubmit, }: { onTextSubmit: ( props: TTTDDialog.OnTextSubmitProps, ) => Promise<TTTDDialog.OnTextSubmitRetValue>; })\nconst [, setError] = useAtom(errorAtom);\nconst [rateLimits, setRateLimits] = useAtom(rateLimitsAtom);"
+  },
+  {
+   "label": "excalidraw Function shouldAllowVerticalAlign",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "arrow_function",
+    "name": "shouldAllowVerticalAlign",
+    "qualifiedName": "shouldAllowVerticalAlign",
+    "filePath": "packages/element/src/textElement.ts",
+    "startLine": 0,
+    "endLine": 14,
+    "language": "typescript",
+    "signature": "shouldAllowVerticalAlign( selectedElements: readonly ExcalidrawElement[], elementsMap: ElementsMap, )",
+    "docComment": null
+   },
+   "srcLines": [
+    "export const shouldAllowVerticalAlign = (",
+    "  selectedElements: readonly ExcalidrawElement[],",
+    "  elementsMap: ElementsMap,",
+    ") => {",
+    "  return selectedElements.some((element) => {",
+    "    if (isBoundToContainer(element)) {",
+    "      const container = getContainerElement(element, elementsMap);",
+    "      if (isArrowElement(container)) {",
+    "        return false;",
+    "      }",
+    "      return true;",
+    "    }",
+    "    return false;",
+    "  });",
+    "};"
+   ],
+   "words": "arrow function\npackages element src text element ts\nshouldAllowVerticalAlign( selectedElements: readonly ExcalidrawElement[], elementsMap: ElementsMap, )\nreturn selectedElements.some((element) => {\nif (isBoundToContainer(element)) {\nconst container = getContainerElement(element, elementsMap);\nif (isArrowElement(container)) {\nreturn false;\nreturn true;\nreturn false;",
+   "minilm": "arrow function\npackages element src text element ts\nshouldAllowVerticalAlign( selectedElements: readonly ExcalidrawElement[], elementsMap: ElementsMap, )\nreturn selectedElements.some((element) => {\nif (isBoundToContainer(element)) {\nconst container = getContainerElement(element, elementsMap);"
+  },
+  {
+   "label": "excalidraw Function diagramFactory",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "arrow_function",
+    "name": "diagramFactory",
+    "qualifiedName": "diagramFactory",
+    "filePath": "packages/excalidraw/tests/fixtures/diagramFixture.ts",
+    "startLine": 0,
+    "endLine": 23,
+    "language": "typescript",
+    "signature": "diagramFactory({ overrides = {}, elementOverrides = {} as Partial<ExcalidrawElement>, } = {})",
+    "docComment": null
+   },
+   "srcLines": [
+    "export const diagramFactory = ({",
+    "  overrides = {},",
+    "  elementOverrides = {} as Partial<ExcalidrawElement>,",
+    "} = {}) => ({",
+    "  ...diagramFixture,",
+    "  elements: [",
+    "    {",
+    "      ...diamondFixture,",
+    "      ...elementOverrides,",
+    "      isDeleted: elementOverrides.isDeleted ?? false,",
+    "    } as NonDeletedExcalidrawElement,",
+    "    {",
+    "      ...ellipseFixture,",
+    "      ...elementOverrides,",
+    "      isDeleted: elementOverrides.isDeleted ?? false,",
+    "    } as NonDeletedExcalidrawElement,",
+    "    {",
+    "      ...rectangleFixture,",
+    "      ...elementOverrides,",
+    "      isDeleted: elementOverrides.isDeleted ?? false,",
+    "    } as NonDeletedExcalidrawElement,",
+    "  ],",
+    "  ...overrides,",
+    "});"
+   ],
+   "words": "arrow function\npackages excalidraw tests fixtures diagram fixture ts\ndiagramFactory({ overrides = {}, elementOverrides = {} as Partial<ExcalidrawElement>, } = {})\n...diagramFixture,\nelements: [\n...diamondFixture,\n...elementOverrides,\nisDeleted: elementOverrides.isDeleted ?? false,\n} as NonDeletedExcalidrawElement,\n...ellipseFixture,\n...elementOverrides,\nisDeleted: elementOverrides.isDeleted ?? false,\n} as NonDeletedExcalidrawElement,\n...rectangleFixture,\n...elementOverrides,\nisDeleted: elementOverrides.isDeleted ?? false,\n} as NonDeletedExcalidrawElement,\n...overrides,",
+   "minilm": "arrow function\npackages excalidraw tests fixtures diagram fixture ts\ndiagramFactory({ overrides = {}, elementOverrides = {} as Partial<ExcalidrawElement>, } = {})\n...diagramFixture,\nelements: [\n...diamondFixture,\n...elementOverrides,\nisDeleted: elementOverrides.isDeleted ?? false,"
+  },
+  {
+   "label": "excalidraw Function getResizedUpdates",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "arrow_function",
+    "name": "getResizedUpdates",
+    "qualifiedName": "getResizedUpdates",
+    "filePath": "packages/excalidraw/components/Stats/MultiDimension.tsx",
+    "startLine": 0,
+    "endLine": 23,
+    "language": "typescript",
+    "signature": "getResizedUpdates( anchorX: number, anchorY: number, scale: number, origElement: NonDeletedExcalidrawElement, )",
+    "docComment": null
+   },
+   "srcLines": [
+    "const getResizedUpdates = (",
+    "  anchorX: number,",
+    "  anchorY: number,",
+    "  scale: number,",
+    "  origElement: NonDeletedExcalidrawElement,",
+    ") => {",
+    "  const offsetX = origElement.x - anchorX;",
+    "  const offsetY = origElement.y - anchorY;",
+    "  const nextWidth = origElement.width * scale;",
+    "  const nextHeight = origElement.height * scale;",
+    "  const x = anchorX + offsetX * scale;",
+    "  const y = anchorY + offsetY * scale;",
+    "",
+    "  return {",
+    "    width: nextWidth,",
+    "    height: nextHeight,",
+    "    x,",
+    "    y,",
+    "    ...rescalePointsInElement(origElement, nextWidth, nextHeight, false),"
+   ],
+   "words": "arrow function\npackages excalidraw components stats multi dimension tsx\ngetResizedUpdates( anchorX: number, anchorY: number, scale: number, origElement: NonDeletedExcalidrawElement, )\nconst offsetX = origElement.x - anchorX;\nconst offsetY = origElement.y - anchorY;\nconst nextWidth = origElement.width * scale;\nconst nextHeight = origElement.height * scale;\nconst x = anchorX + offsetX * scale;\nconst y = anchorY + offsetY * scale;\nreturn {\nwidth: nextWidth,\nheight: nextHeight,\nx,\ny,",
+   "minilm": "arrow function\npackages excalidraw components stats multi dimension tsx\ngetResizedUpdates( anchorX: number, anchorY: number, scale: number, origElement: NonDeletedExcalidrawElement, )\nconst offsetX = origElement.x - anchorX;\nconst offsetY = origElement.y - anchorY;\nconst nextWidth = origElement.width * scale;"
+  },
+  {
+   "label": "excalidraw Type Props",
+   "node": {
+    "kind": "Type",
+    "nativeKind": "interface",
+    "name": "Props",
+    "qualifiedName": "Props",
+    "filePath": "packages/excalidraw/components/ConfirmDialog.tsx",
+    "startLine": 0,
+    "endLine": 5,
+    "language": "typescript",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "interface Props extends Omit<DialogProps, \"onCloseRequest\"> {",
+    "  onConfirm: () => void;",
+    "  onCancel: () => void;",
+    "  confirmText?: string;",
+    "  cancelText?: string;",
+    "}"
+   ],
+   "words": "interface\npackages excalidraw components confirm dialog tsx\nonConfirm: () => void;\nonCancel: () => void;\nconfirmText?: string;\ncancelText?: string;",
+   "minilm": "interface\npackages excalidraw components confirm dialog tsx\nonConfirm: () => void;\nonCancel: () => void;\nconfirmText?: string;\ncancelText?: string;"
+  },
+  {
+   "label": "task-tracker-mcp Function hashDesignDoc",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "function",
+    "name": "hashDesignDoc",
+    "qualifiedName": "hashDesignDoc",
+    "filePath": "src/domain/projects.ts",
+    "startLine": 0,
+    "endLine": 7,
+    "language": "typescript",
+    "signature": "hashDesignDoc(rootPath: string, designDocPath: string): string | null",
+    "docComment": "Hashes the design doc's current content so a later check_doc_sync call can\ndetect whether it changed since the task graph was generated from it (see\n\"Auto re-sync when the design doc changes\" in the doc's Non-goals - v2).\nReturns null if the file can't be read (e.g. a typo'd path) rather than\nthrowing, so a bad path doesn't block creating the project - it just means\nnothing is being tracked yet."
+   },
+   "srcLines": [
+    "export function hashDesignDoc(rootPath: string, designDocPath: string): string | null {",
+    "  try {",
+    "    const content = fs.readFileSync(path.resolve(rootPath, designDocPath), \"utf8\");",
+    "    return createHash(\"sha256\").update(content).digest(\"hex\");",
+    "  } catch {",
+    "    return null;",
+    "  }",
+    "}"
+   ],
+   "words": "function\nsrc domain projects ts\nHashes the design doc's current content so a later check_doc_sync call can\ndetect whether it changed since the task graph was generated from it (see\n\"Auto re-sync when the design doc changes\" in the doc's Non-goals - v2).\nReturns null if the file can't be read (e.g. a typo'd path) rather than\nthrowing, so a bad path doesn't block creating the project - it just means\nnothing is being tracked yet.\n\nhashDesignDoc(rootPath: string, designDocPath: string): string | null\ntry {\nconst content = fs.readFileSync(path.resolve(rootPath, designDocPath), \"utf8\");\nreturn createHash(\"sha256\").update(content).digest(\"hex\");\n} catch {\nreturn null;",
+   "minilm": "function\nsrc domain projects ts\nHashes the design doc's current content so a later check_doc_sync call can\ndetect whether it changed since the task graph was generated from it (see\n\"Auto re-sync when the design doc changes\" in the doc's Non-goals - v2).\nReturns null if the file can't be read (e.g. a typo'd path) rather than\nthrowing, so a bad path doesn't block creating the project - it just means\nnothing is being tracked yet.\n\nhashDesignDoc(rootPath: string, designDocPath: string): string | null\ntry {\nconst content = fs.readFileSync(path.resolve(rootPath, designDocPath), \"utf8\");"
+  },
+  {
+   "label": "excalidraw Function AppArrowText#getAnchorAtPosition",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "method",
+    "name": "getAnchorAtPosition",
+    "qualifiedName": "AppArrowText#getAnchorAtPosition",
+    "filePath": "packages/excalidraw/components/App.arrowText.ts",
+    "startLine": 0,
+    "endLine": 37,
+    "language": "typescript",
+    "signature": "getAnchorAtPosition( x: number, y: number, ): AppState[\"hoveredArrowTextAnchor\"]",
+    "docComment": "Mirrors what `handleTextOnPointerDown` would do at this position, so the\nhighlight can't promise something the click won't deliver."
+   },
+   "srcLines": [
+    "  private getAnchorAtPosition(",
+    "    x: number,",
+    "    y: number,",
+    "  ): AppState[\"hoveredArrowTextAnchor\"] {",
+    "    const endpoint = this.getBindableEndpointAtPosition(x, y);",
+    "",
+    "    if (endpoint) {",
+    "      return { elementId: endpoint.arrow.id, anchor: endpoint.startOrEnd };",
+    "    }",
+    "",
+    "    const container = this.app.getTextBindableContainerAtPosition(x, y);",
+    "",
+    "    // Only arrows get a midpoint label anchor worth pointing at; other",
+    "    // containers center the text in themselves, which needs no affordance.",
+    "    // An arrow that already has a label is edited in place, not re-anchored."
+   ],
+   "words": "method app arrow text\npackages excalidraw components app arrow text ts\nMirrors what `handleTextOnPointerDown` would do at this position, so the\nhighlight can't promise something the click won't deliver.\n\ngetAnchorAtPosition( x: number, y: number, ): AppState[\"hoveredArrowTextAnchor\"]\nconst endpoint = this.getBindableEndpointAtPosition(x, y);\nif (endpoint) {\nreturn { elementId: endpoint.arrow.id, anchor: endpoint.startOrEnd };\nconst container = this.app.getTextBindableContainerAtPosition(x, y);\n// Only arrows get a midpoint label anchor worth pointing at; other\n// containers center the text in themselves, which needs no affordance.",
+   "minilm": "method app arrow text\npackages excalidraw components app arrow text ts\nMirrors what `handleTextOnPointerDown` would do at this position, so the\nhighlight can't promise something the click won't deliver.\n\ngetAnchorAtPosition( x: number, y: number, ): AppState[\"hoveredArrowTextAnchor\"]\nconst endpoint = this.getBindableEndpointAtPosition(x, y);\nif (endpoint) {\nreturn { elementId: endpoint.arrow.id, anchor: endpoint.startOrEnd };"
+  },
+  {
+   "label": "excalidraw Function subsetToBinary",
+   "node": {
+    "kind": "Function",
+    "nativeKind": "arrow_function",
+    "name": "subsetToBinary",
+    "qualifiedName": "subsetToBinary",
+    "filePath": "packages/excalidraw/subset/subset-shared.chunk.ts",
+    "startLine": 0,
+    "endLine": 14,
+    "language": "typescript",
+    "signature": "async subsetToBinary( arrayBuffer: ArrayBuffer, codePoints: Array<number>, ): Promise<ArrayBuffer>",
+    "docComment": "Used by browser (worker thread) and as part of `subsetToBase64`, to subset the font based on the passed codepoints.\n\n@eturns woff2 font as an ArrayBuffer, to avoid copying large strings between worker threads and the main thread."
+   },
+   "srcLines": [
+    "export const subsetToBinary = async (",
+    "  arrayBuffer: ArrayBuffer,",
+    "  codePoints: Array<number>,",
+    "): Promise<ArrayBuffer> => {",
+    "  // lazy loaded wasm modules to avoid multiple initializations in case of concurrent triggers",
+    "  // IMPORTANT: could be expensive, as each new worker instance lazy loads these to their own memory ~ keep the # of workes small!",
+    "  const { compress, decompress } = await loadWoff2();",
+    "  const { subset } = await loadHbSubset();"
+   ],
+   "words": "arrow function\npackages excalidraw subset subset shared chunk ts\nUsed by browser (worker thread) and as part of `subsetToBase64`, to subset the font based on the passed codepoints.\n\nasync subsetToBinary( arrayBuffer: ArrayBuffer, codePoints: Array<number>, ): Promise<ArrayBuffer>\n// lazy loaded wasm modules to avoid multiple initializations in case of concurrent triggers\n// IMPORTANT: could be expensive, as each new worker instance lazy loads these to their own memory ~ keep the # of workes small!\nconst { compress, decompress } = await loadWoff2();",
+   "minilm": "arrow function\npackages excalidraw subset subset shared chunk ts\nUsed by browser (worker thread) and as part of `subsetToBase64`, to subset the font based on the passed codepoints.\n\nasync subsetToBinary( arrayBuffer: ArrayBuffer, codePoints: Array<number>, ): Promise<ArrayBuffer>\n// lazy loaded wasm modules to avoid multiple initializations in case of concurrent triggers\n// IMPORTANT: could be expensive, as each new worker instance lazy loads these to their own memory ~ keep the # of workes small!"
+  },
+  {
+   "label": "excalidraw Module packages/excalidraw/types.ts#AppState",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "AppState",
+    "qualifiedName": "packages/excalidraw/types.ts#AppState",
+    "filePath": "packages/element/tests/zindex.test.tsx",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "typescript",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "import type { AppState } from \"@excalidraw/excalidraw/types\";"
+   ],
+   "words": "pending symbol packages excalidraw types ts\npackages element tests zindex test tsx",
+   "minilm": "pending symbol packages excalidraw types ts\npackages element tests zindex test tsx"
+  },
+  {
+   "label": "excalidraw Module packages/element/src/index.ts#createPlaceholderEmbeddableLabel",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "createPlaceholderEmbeddableLabel",
+    "qualifiedName": "packages/element/src/index.ts#createPlaceholderEmbeddableLabel",
+    "filePath": "packages/excalidraw/renderer/staticScene.ts",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "typescript",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "import { createPlaceholderEmbeddableLabel } from \"@excalidraw/element\";"
+   ],
+   "words": "pending symbol packages element src index ts\npackages excalidraw renderer static scene ts",
+   "minilm": "pending symbol packages element src index ts\npackages excalidraw renderer static scene ts"
+  },
+  {
+   "label": "excalidraw Module packages/element/src/types.ts#NonDeletedExcalidrawElement",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "NonDeletedExcalidrawElement",
+    "qualifiedName": "packages/element/src/types.ts#NonDeletedExcalidrawElement",
+    "filePath": "packages/excalidraw/components/hyperlink/Hyperlink.tsx",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "typescript",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "  NonDeletedExcalidrawElement,"
+   ],
+   "words": "pending symbol packages element src types ts\npackages excalidraw components hyperlink hyperlink tsx",
+   "minilm": "pending symbol packages element src types ts\npackages excalidraw components hyperlink hyperlink tsx"
+  },
+  {
+   "label": "excalidraw Module packages/excalidraw/renderer/interactiveScene.ts#renderInteractiveScene",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "renderInteractiveScene",
+    "qualifiedName": "packages/excalidraw/renderer/interactiveScene.ts#renderInteractiveScene",
+    "filePath": "packages/excalidraw/components/canvases/InteractiveCanvas.tsx",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "typescript",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "import { renderInteractiveScene } from \"../../renderer/interactiveScene\";"
+   ],
+   "words": "pending symbol packages excalidraw renderer interactive scene ts\npackages excalidraw components canvases interactive canvas tsx",
+   "minilm": "pending symbol packages excalidraw renderer interactive scene ts\npackages excalidraw components canvases interactive canvas tsx"
+  },
+  {
+   "label": "task-tracker-mcp Module src/domain/tasks.ts#createTask",
+   "node": {
+    "kind": "Module",
+    "nativeKind": "pending_symbol",
+    "name": "createTask",
+    "qualifiedName": "src/domain/tasks.ts#createTask",
+    "filePath": "tests/dashboard-server.test.ts",
+    "startLine": 0,
+    "endLine": 0,
+    "language": "typescript",
+    "signature": null,
+    "docComment": null
+   },
+   "srcLines": [
+    "import { createTask } from \"../src/domain/tasks.js\";"
+   ],
+   "words": "pending symbol src domain tasks ts\ntests dashboard server test ts",
+   "minilm": "pending symbol src domain tasks ts\ntests dashboard server test ts"
+  }
+ ]
+}

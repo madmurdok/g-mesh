@@ -25,6 +25,8 @@ Modes:
                             each under /usr/bin/time -p, then the summary table
   gm464_latency.py arm NAME one arm (internal; prints a JSON line)
 
+GM-698/S16 arms: base, enr (BIN_BASE, BIN_ENR); `off` then uses BIN_T4.
+
 Env: OUT (results dir), H (isolated G_MESH_HOME; short path - the daemon
 socket lives under it), BIN_T4, BIN_T1 (dirs holding g-mesh + plugins),
 NQ (queries, default 30), PASSES (default 3), GATE=0 (dry run: no wait),
@@ -48,6 +50,9 @@ BINS = {
     "off": Path(os.environ.get("BIN_T4", "/private/tmp/claude-502/gm464s8/t4")),
     "t4": Path(os.environ.get("BIN_T4", "/private/tmp/claude-502/gm464s8/t4")),
     "t1": Path(os.environ.get("BIN_T1", "/private/tmp/claude-502/gm464s8/t1")),
+    # GM-698/S16: base = release-4.26.0 binary, enr = the enriched-text branch binary (both rerank on)
+    "base": Path(os.environ.get("BIN_BASE", "/private/tmp/claude-502/gm698s16/base")),
+    "enr": Path(os.environ.get("BIN_ENR", "/private/tmp/claude-502/gm698s16/enr")),
 }
 RERANK_DIR = os.environ.get(
     "G_MESH_RERANK_MODEL_DIR",
