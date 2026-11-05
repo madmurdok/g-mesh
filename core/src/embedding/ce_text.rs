@@ -281,6 +281,8 @@ mod tests {
         src_bytes: Option<String>,
         src_lines: Option<Vec<String>>,
         words: String,
+        /// The text with the body counted by the cross-encoder's tokenizer.
+        minilm: String,
     }
 
     #[derive(serde::Deserialize)]
@@ -345,6 +347,42 @@ mod tests {
                 mismatches.push(format!("{}:\n  ours   {text:?}\n  python {:?}", case.label, case.words));
             }
         }
+        assert!(
+            mismatches.is_empty(),
+            "{} of {} cases differ:\n{}",
+            mismatches.len(),
+            fixture.cases.len(),
+            mismatches.join("\n")
+        );
+    }
+
+    /// Every fixture case, built with the cross-encoder's own token count,
+    /// equals the Python builder's text under the same tokenizer (the
+    /// `minilm` field, which differs from `words` where the body stops).
+    /// Needs the real model: `G_MESH_RERANK_MODEL_DIR=<dir> cargo test rerank
+    /// -- --ignored`.
+    #[test]
+    #[ignore = "needs the real cross-encoder; see rerank.rs's tests"]
+    fn every_fixture_case_equals_the_python_text_under_the_rerank_tokenizer() {
+        use crate::embedding::rerank::{default_rerank_model_dir, CrossEncoder, Scorer};
+
+        let dir = default_rerank_model_dir().unwrap();
+        let model = CrossEncoder::load(&dir)
+            .unwrap_or_else(|err| panic!("could not load the cross-encoder: {err:#}"));
+        let fixture: Fixture = serde_json::from_str(include_str!("testdata/ce_text.json")).unwrap();
+        let differ_from_words = fixture.cases.iter().filter(|case| case.minilm != case.words).count();
+        assert!(differ_from_words > 0, "no case tells the tokenizer from a word count");
+        let mismatches: Vec<String> = fixture
+            .cases
+            .iter()
+            .filter_map(|case| {
+                let text = ce_text(&case.node.as_node(), case.src_lines.as_deref(), &|text| {
+                    model.count_tokens(text)
+                });
+                (text != case.minilm)
+                    .then(|| format!("{}:\n  ours   {text:?}\n  python {:?}", case.label, case.minilm))
+            })
+            .collect();
         assert!(
             mismatches.is_empty(),
             "{} of {} cases differ:\n{}",

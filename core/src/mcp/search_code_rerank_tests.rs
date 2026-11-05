@@ -733,6 +733,100 @@ fn the_handler_scores_the_texts_the_reference_scored() {
     }
 }
 
+/// The texts the handler hands a [`Capture`] scorer for one first page of
+/// `store`, by row id, with `project_root`; panics if the call fails.
+fn scored_texts(store: &Arc<IndexStore>, query: &str, project_root: Option<&Path>) -> Vec<(String, String)> {
+    let capture = Capture::default();
+    let scorer = capture.clone();
+    let lines = Lines::default();
+    let reranker = Reranker::with_parts(
+        || RerankSettings { enabled: true, model_dir: Ok("/stub".into()) },
+        move |_| Ok(Box::new(scorer.clone()) as Box<dyn Scorer>),
+        lines.sink(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let embedding = fake(dir.path()).with_reranker(reranker);
+    let params = SearchCodeParams { query: query.to_string(), cursor: None, limit: Some(10) };
+    let result = handle(
+        store,
+        &embedding,
+        QueryShapes::shipped(),
+        &SessionHints::default(),
+        params,
+        None,
+        project_root,
+    )
+    .unwrap_or_else(|err| panic!("the call failed: {err:?}"));
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_eq!(lines.count(), 0, "the rerank fell back: {:?}", lines.0.lock().unwrap());
+    let page = body(&result);
+    let ids = page["results"].as_array().unwrap().iter().map(|r| r["symbolId"].as_str().unwrap().to_string());
+    let calls = capture.0.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "one scoring call");
+    ids.zip(calls[0].1.clone()).collect()
+}
+
+/// A source file the handler cannot read as the node's span says gives a
+/// text, never a failed call: a missing file and a directory give no body,
+/// a span past the end of its file is clipped, invalid UTF-8 is read lossily
+/// and a `\r\n` as a newline. With no project root no file is read, even
+/// one at an absolute `filePath`. Expected texts are
+/// `gm462_ce_text.build(row, read_text(errors="replace").split("\n"),
+/// "EPB", whitespace words)`.
+///
+/// *Control:* `source_lines` with `read_to_string` and `?` in
+/// `window_texts` (the call fails); or, with no root, read `filePath` as
+/// given.
+#[test]
+fn an_unreadable_file_or_span_gives_a_text_and_no_root_gives_no_body() {
+    let query = "parseConfig";
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("short.rs"), "fn n01() {\n    first();\n    second();").unwrap();
+    std::fs::write(root.path().join("bad.rs"), b"fn n02() {\n    a(\"\xff\xfe\");\r\n}\n").unwrap();
+    std::fs::create_dir(root.path().join("dir.rs")).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let absolute = elsewhere.path().join("four.rs");
+    std::fs::write(&absolute, "fn n04() {\n    fourth();\n}").unwrap();
+    let absolute = absolute.to_str().unwrap();
+
+    register_extension();
+    let conn = Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    let nodes = [
+        ("n00", "gone.rs", 3),
+        ("n01", "short.rs", 40),
+        ("n02", "bad.rs", 2),
+        ("n03", "dir.rs", 3),
+        ("n04", absolute, 2),
+    ];
+    for (i, (id, file_path, end_line)) in nodes.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, \
+             language, signature)
+             VALUES (?1, 'Function', ?1, ?2, ?3, 0, 0, ?4, 0, 'rust', ?5)",
+            rusqlite::params![id, format!("pkg::{id}"), file_path, end_line, format!("fn {id}()")],
+        )
+        .unwrap();
+        insert(&conn, id, &vector_at(query, 0.9 - 0.01 * i as f64), "v1").unwrap();
+    }
+    let store = Arc::new(IndexStore::new(conn));
+
+    let with_root = scored_texts(&store, query, Some(root.path()));
+    let by_id = |texts: &[(String, String)], id: &str| texts.iter().find(|(i, _)| i == id).unwrap().1.clone();
+    assert_eq!(with_root.len(), nodes.len(), "{with_root:?}");
+    assert_eq!(by_id(&with_root, "n00"), "function pkg\ngone rs\nfn n00()");
+    assert_eq!(by_id(&with_root, "n01"), "function pkg\nshort rs\nfn n01()\nfirst();\nsecond();");
+    assert_eq!(by_id(&with_root, "n02"), "function pkg\nbad rs\nfn n02()\na(\"\u{fffd}\u{fffd}\");");
+    assert_eq!(by_id(&with_root, "n03"), "function pkg\ndir rs\nfn n03()");
+    assert!(by_id(&with_root, "n04").ends_with("\nfn n04()\nfourth();"), "{with_root:?}");
+
+    let without_root = scored_texts(&store, query, None);
+    assert_eq!(without_root.len(), nodes.len(), "{without_root:?}");
+    for (id, text) in &without_root {
+        assert!(text.ends_with(&format!("\nfn {id}()")), "{id} has a body without a root: {text:?}");
+    }
+}
+
 /// `search_code` never applies a strip prefix (GM-482, decision D4): an
 /// `@`-query is embedded and answered as typed, exactly as with no
 /// `[plugin.symbol_query_prefixes]` declared anywhere.
