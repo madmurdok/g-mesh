@@ -94,7 +94,7 @@ pub(super) fn call(
     cursor: Option<String>,
 ) -> CallToolResult {
     let params = SearchCodeParams { query: query.to_string(), cursor, limit };
-    handle(store, embedding, QueryShapes::shipped(), &SessionHints::default(), params, None).unwrap()
+    handle(store, embedding, QueryShapes::shipped(), &SessionHints::default(), params, None, None).unwrap()
 }
 
 /// The JSON body of a one-block result.
@@ -265,6 +265,10 @@ struct Stub(Arc<dyn Fn(usize) -> f32 + Send + Sync>);
 impl Scorer for Stub {
     fn score(&self, _query: &str, texts: &[String]) -> anyhow::Result<Vec<f32>> {
         Ok(texts.iter().map(|text| (self.0)(row_number(text))).collect())
+    }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        text.split_whitespace().count()
     }
 }
 
@@ -549,6 +553,7 @@ fn a_partial_page_is_not_reranked() {
                 &SessionHints::default(),
                 params,
                 coverage.as_ref(),
+                None,
             )
             .unwrap(),
         )
@@ -563,7 +568,8 @@ fn a_partial_page_is_not_reranked() {
 }
 
 /// One case of `embedding/testdata/rerank_parity.json`: the Python
-/// reference's query and window, each row with the text it scored.
+/// reference's query and window, each row with its node columns, source
+/// span and text.
 #[derive(serde::Deserialize)]
 struct ParityCase {
     #[serde(rename = "queryId")]
@@ -576,9 +582,21 @@ struct ParityCase {
 #[serde(rename_all = "camelCase")]
 struct ParityRow {
     id: String,
+    kind: Option<String>,
+    native_kind: Option<String>,
+    name: Option<String>,
+    qualified_name: Option<String>,
+    file_path: Option<String>,
+    start_line: i64,
+    end_line: i64,
+    language: Option<String>,
     doc_comment: Option<String>,
     signature: Option<String>,
-    text: String,
+    /// The node's source span from `start_line` (cut after the last line
+    /// its text reads); `None` when the reference had no source file.
+    src_lines: Option<Vec<String>>,
+    /// The reference's text, its body counted in whitespace words.
+    words_text: String,
     cosine: f64,
 }
 
@@ -600,36 +618,71 @@ impl Scorer for Capture {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).push((query.to_string(), texts.to_vec()));
         Ok(vec![0.0; texts.len()])
     }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        text.split_whitespace().count()
+    }
 }
 
-/// A store holding one parity case's window: each row's own doc comment
-/// and signature, its vector at the reference's cosine.
-fn store_for_parity(case: &ParityCase) -> Arc<IndexStore> {
+/// A store holding one parity case's window: each row's own node columns,
+/// its vector at the reference's cosine; and under `root` one file per
+/// `filePath`, every row's source span written at its `startLine` (lines no
+/// span covers are empty).
+fn store_for_parity(case: &ParityCase, root: &Path) -> Arc<IndexStore> {
     register_extension();
     let conn = Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
+    let mut files: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
     for row in &case.rows {
         conn.execute(
-            "INSERT INTO nodes (id, kind, name, qualifiedName, filePath, startLine, startCol, endLine, endCol, \
-             language, docComment, signature)
-             VALUES (?1, 'Function', ?1, ?1, 'a.src', 1, 0, 3, 1, 'typescript', ?2, ?3)",
-            rusqlite::params![row.id, row.doc_comment, row.signature],
+            "INSERT INTO nodes (id, kind, nativeKind, name, qualifiedName, filePath, startLine, startCol, \
+             endLine, endCol, language, docComment, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, 0, ?9, ?10, ?11)",
+            rusqlite::params![
+                row.id,
+                row.kind,
+                row.native_kind,
+                row.name,
+                row.qualified_name,
+                row.file_path,
+                row.start_line,
+                row.end_line,
+                row.language,
+                row.doc_comment,
+                row.signature
+            ],
         )
         .unwrap();
         insert(&conn, &row.id, &vector_at(&case.query, row.cosine), "v1").unwrap();
+        if let (Some(path), Some(span)) = (&row.file_path, &row.src_lines) {
+            let lines = files.entry(path.as_str()).or_default();
+            let start = usize::try_from(row.start_line).unwrap();
+            if lines.len() < start + span.len() {
+                lines.resize(start + span.len(), "");
+            }
+            for (i, line) in span.iter().enumerate() {
+                lines[start + i] = line;
+            }
+        }
+    }
+    for (path, lines) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, lines.join("\n")).unwrap();
     }
     Arc::new(IndexStore::new(conn))
 }
 
-/// The product path feeds the cross-encoder exactly the (query, text)
-/// pairs the Python reference scored: for every parity case, the handler's
-/// own window texts, matched to rows through the page it returns, equal
-/// the fixture's stored `text`. This ties `window_texts` to the fixture
-/// that `the_real_model_reproduces_the_reference_logits_and_order` checks
-/// the model against (that test builds its texts itself).
+/// The product path feeds the cross-encoder the Python reference's texts:
+/// for every parity case, the handler's own window texts, read from the
+/// store and the files under the project root and matched to rows through
+/// the page it returns, equal the reference's text built with the same
+/// (whitespace-word) counter as the stub's. This ties `window_texts` to the
+/// fixture that `the_real_model_reproduces_the_reference_logits_and_order`
+/// checks the model against (that test builds its texts itself).
 ///
-/// *Control:* have `window_texts` call `full_text` instead of
-/// `text_to_embed` (49 of the fixture's 540 rows then differ).
+/// *Control:* have `window_texts` return `text_to_embed` of the doc
+/// comment and signature alone.
 #[test]
 fn the_handler_scores_the_texts_the_reference_scored() {
     let parity: Parity =
@@ -645,9 +698,21 @@ fn the_handler_scores_the_texts_the_reference_scored() {
             lines.sink(),
         );
         let embedding = fake(dir.path()).with_reranker(reranker);
-        let store = store_for_parity(case);
+        let root = tempfile::tempdir().unwrap();
+        let store = store_for_parity(case, root.path());
         let window = case.rows.len() as u32;
-        let page = body(&call(&store, &embedding, &case.query, Some(window), None));
+        let params = SearchCodeParams { query: case.query.clone(), cursor: None, limit: Some(window) };
+        let result = handle(
+            &store,
+            &embedding,
+            QueryShapes::shipped(),
+            &SessionHints::default(),
+            params,
+            None,
+            Some(root.path()),
+        )
+        .unwrap();
+        let page = body(&result);
 
         let calls = capture.0.lock().unwrap().clone();
         assert_eq!(calls.len(), 1, "{}: one scoring call", case.query_id);
@@ -659,7 +724,7 @@ fn the_handler_scores_the_texts_the_reference_scored() {
         for (id, text) in ids.iter().zip(texts) {
             let row = case.rows.iter().find(|row| row.id == *id).unwrap();
             assert_eq!(
-                text, &row.text,
+                text, &row.words_text,
                 "{} {id}: the text scored differs from the reference's",
                 case.query_id
             );
@@ -694,7 +759,8 @@ fn search_code_embeds_a_prefixed_query_as_typed() {
         let counters = Counters::default();
         let embedding = fake_pipeline(&fake_model_dir(dir.path(), "weights"), None, &counters);
         let params = SearchCodeParams { query: "@Component".to_string(), cursor: None, limit: None };
-        let result = handle(&store, &embedding, shapes, &SessionHints::default(), params, None).unwrap();
+        let result =
+            handle(&store, &embedding, shapes, &SessionHints::default(), params, None, None).unwrap();
         (body(&result), counters.received())
     };
     let (with_strip, embedded) = run(stripping);
@@ -875,6 +941,7 @@ fn a_partial_page_does_not_spend_the_hint() {
         &SessionHints::default(),
         params,
         coverage.as_ref(),
+        None,
     )
     .unwrap();
     // A partial result may lead with a plain-text note; the page is the JSON block.

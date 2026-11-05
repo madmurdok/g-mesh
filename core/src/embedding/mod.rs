@@ -18,6 +18,7 @@
 
 pub mod backfill;
 pub mod cache;
+pub(crate) mod ce_text;
 pub mod model;
 pub mod pipeline;
 pub mod rerank;
