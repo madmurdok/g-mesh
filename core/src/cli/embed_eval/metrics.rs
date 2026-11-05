@@ -130,10 +130,20 @@ fn round_down_2(x: f64) -> f64 {
 /// positives plus every mechanical positive - over the queries whose top
 /// hit is expected.
 pub fn fit_floors(outcomes: &[Outcome]) -> Floors {
+    fit_floors_on(outcomes, |o| o.mechanical || !o.held_out)
+}
+
+/// Per language, the floor fitted on the mechanical name queries alone
+/// (authored queries are ignored), over the queries whose top hit is
+/// expected: the query shape the shipped floors are fitted on.
+pub fn fit_name_floors(outcomes: &[Outcome]) -> Floors {
+    fit_floors_on(outcomes, |o| o.mechanical)
+}
+
+fn fit_floors_on(outcomes: &[Outcome], in_fit: impl Fn(&Outcome) -> bool) -> Floors {
     let mut scores: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for o in outcomes {
-        let in_fit = o.mechanical || !o.held_out;
-        if o.positive && in_fit && o.top_is_expected() {
+        if o.positive && in_fit(o) && o.top_is_expected() {
             if let Some(score) = o.top_score {
                 scores.entry(o.language.clone()).or_default().push(score);
             }

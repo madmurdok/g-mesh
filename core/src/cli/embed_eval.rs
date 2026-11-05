@@ -1479,7 +1479,7 @@ fn report(args: &ReportArgs) -> Result<()> {
 
     let r10_bound = |arm: &ArmRun| bound_of(&recall_groups(&arm.outcomes, 10, |_| true), settings);
     let reference_r10 = r10_bound(reference).context("the reference scored no positives")?;
-    let (reference_floors, _, _) = floors_and_rates(reference);
+    let reference_name_floors = metrics::fit_name_floors(&reference.outcomes);
 
     // --- D7: controls ---------------------------------------------------------
     let mut validity_errors = Vec::new();
@@ -1515,9 +1515,10 @@ fn report(args: &ReportArgs) -> Result<()> {
     if control_bounds.is_empty() {
         validity_errors.push("no control arm among the runs".to_string());
     }
-    // Harness parity #2: the reference's re-derived floors against the shipped ones.
+    // Harness parity #2: the reference's floors re-derived on name queries
+    // against the shipped ones, which are fitted on that query shape.
     let mut floor_parity = serde_json::Map::new();
-    for (language, fitted) in &reference_floors {
+    for (language, fitted) in &reference_name_floors {
         let shipped = crate::mcp::shipped_similarity_floor(language);
         let gated = language != "typescript";
         let ok = (fitted - shipped).abs() <= 0.03 + 1e-9;
