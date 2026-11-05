@@ -130,10 +130,20 @@ fn round_down_2(x: f64) -> f64 {
 /// positives plus every mechanical positive - over the queries whose top
 /// hit is expected.
 pub fn fit_floors(outcomes: &[Outcome]) -> Floors {
+    fit_floors_on(outcomes, |o| o.mechanical || !o.held_out)
+}
+
+/// Per language, the floor fitted on the mechanical name queries alone
+/// (authored queries are ignored), over the queries whose top hit is
+/// expected: the query shape the shipped floors are fitted on.
+pub fn fit_name_floors(outcomes: &[Outcome]) -> Floors {
+    fit_floors_on(outcomes, |o| o.mechanical)
+}
+
+fn fit_floors_on(outcomes: &[Outcome], in_fit: impl Fn(&Outcome) -> bool) -> Floors {
     let mut scores: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for o in outcomes {
-        let in_fit = o.mechanical || !o.held_out;
-        if o.positive && in_fit && o.top_is_expected() {
+        if o.positive && in_fit(o) && o.top_is_expected() {
             if let Some(score) = o.top_score {
                 scores.entry(o.language.clone()).or_default().push(score);
             }
@@ -463,6 +473,64 @@ mod tests {
         mech.held_out = true; // mechanical rows are fit whatever their hash says
         let floors = fit_floors(&[fit, held, second, mech]);
         assert_eq!(floors.get("go"), Some(&0.80));
+    }
+
+    fn name_query(id: &str, language: &str, top: f64, held_out: bool) -> Outcome {
+        let mut o = outcome(id, language, Some(1), Some(top));
+        o.mechanical = true;
+        o.held_out = held_out;
+        o
+    }
+
+    fn authored(id: &str, language: &str, top: f64, held_out: bool) -> Outcome {
+        let mut o = outcome(id, language, Some(1), Some(top));
+        o.held_out = held_out;
+        o
+    }
+
+    /// Authored queries, fit half or held out, never move the name floor;
+    /// `fit_floors` on the same pool still takes the fit-half ones. Control:
+    /// giving `fit_name_floors` the `o.mechanical || !o.held_out` predicate
+    /// moves go to 0.10 and adds python.
+    #[test]
+    fn name_floors_ignore_authored_queries() {
+        let pool = vec![
+            name_query("m", "go", 0.80, false),
+            authored("a", "go", 0.10, false),
+            authored("h", "go", 0.05, true),
+            authored("p", "python", 0.40, false),
+        ];
+        let names = fit_name_floors(&pool);
+        assert_eq!(names.get("go"), Some(&0.80));
+        assert_eq!(names.get("python"), None);
+
+        let pooled = fit_floors(&pool);
+        assert_eq!(pooled.get("go"), Some(&0.10));
+        assert_eq!(pooled.get("python"), Some(&0.40));
+    }
+
+    /// Per language, the name floor is `fit_floor` at 3% over the name
+    /// queries ranked first, held-out ones included. Go has 40: 3% of 40 is
+    /// 1.2, so one may fall below and the floor is the second smallest,
+    /// 0.457 rounded down. Both low scores are held out. Control: fitting
+    /// on `o.mechanical && !o.held_out` moves go to 0.90.
+    #[test]
+    fn name_floors_follow_the_fit_rule_per_language_with_held_out_names() {
+        let mut pool = vec![name_query("g0", "go", 0.301, true), name_query("g1", "go", 0.457, true)];
+        pool.extend((0..38).map(|i| name_query(&format!("g{}", i + 2), "go", 0.9, i % 2 == 0)));
+        let mut second = name_query("g-second", "go", 0.01, false);
+        second.first_expected_rank = Some(2);
+        pool.push(second);
+        pool.extend([
+            name_query("p0", "python", 0.7, false),
+            name_query("p1", "python", 0.629, true),
+            name_query("p2", "python", 0.8, false),
+        ]);
+
+        let floors = fit_name_floors(&pool);
+        assert_eq!(floors.get("go"), Some(&0.45));
+        assert_eq!(floors.get("python"), Some(&0.62));
+        assert_eq!(floors.len(), 2);
     }
 
     /// Control: counting rows whose top hit is wrong in the denominator, or

@@ -1414,6 +1414,40 @@ fn summary(arm: &ArmRun, settings: &config::Settings) -> serde_json::Value {
     })
 }
 
+/// Languages whose shipped similarity floor the parity gate enforces.
+/// TypeScript is reported but exempt from the gate.
+const GATED_FLOOR_LANGUAGES: [&str; 3] = ["go", "python", "rust"];
+
+/// The reference's floors re-derived on mechanical name queries, compared with
+/// the shipped ones. Returns the per-language report entries and the validity
+/// errors. A gated language with no name-query floor in the reference is an
+/// error and has no entry.
+fn floor_parity(reference: &[metrics::Outcome]) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
+    let name_floors = metrics::fit_name_floors(reference);
+    let mut entries = serde_json::Map::new();
+    let mut errors = Vec::new();
+    for (language, fitted) in &name_floors {
+        let shipped = crate::mcp::shipped_similarity_floor(language);
+        let gated = GATED_FLOOR_LANGUAGES.contains(&language.as_str());
+        let ok = (fitted - shipped).abs() <= 0.03 + 1e-9;
+        if gated && !ok {
+            errors.push(format!(
+                "reference floor for {language} {fitted:.2} is not within 0.03 of shipped {shipped:.2}"
+            ));
+        }
+        entries.insert(
+            language.clone(),
+            json!({"fitted": fitted, "shipped": shipped, "gated": gated, "passes": ok}),
+        );
+    }
+    for language in GATED_FLOOR_LANGUAGES {
+        if !name_floors.contains_key(language) {
+            errors.push(format!("floor parity: no name queries for {language}"));
+        }
+    }
+    (entries, errors)
+}
+
 fn floors_and_rates(arm: &ArmRun) -> (Floors, BTreeMap<String, Option<f64>>, serde_json::Value) {
     let floors = metrics::fit_floors(&arm.outcomes);
     let languages: Vec<String> = {
@@ -1479,7 +1513,6 @@ fn report(args: &ReportArgs) -> Result<()> {
 
     let r10_bound = |arm: &ArmRun| bound_of(&recall_groups(&arm.outcomes, 10, |_| true), settings);
     let reference_r10 = r10_bound(reference).context("the reference scored no positives")?;
-    let (reference_floors, _, _) = floors_and_rates(reference);
 
     // --- D7: controls ---------------------------------------------------------
     let mut validity_errors = Vec::new();
@@ -1515,22 +1548,10 @@ fn report(args: &ReportArgs) -> Result<()> {
     if control_bounds.is_empty() {
         validity_errors.push("no control arm among the runs".to_string());
     }
-    // Harness parity #2: the reference's re-derived floors against the shipped ones.
-    let mut floor_parity = serde_json::Map::new();
-    for (language, fitted) in &reference_floors {
-        let shipped = crate::mcp::shipped_similarity_floor(language);
-        let gated = language != "typescript";
-        let ok = (fitted - shipped).abs() <= 0.03 + 1e-9;
-        if gated && !ok {
-            validity_errors.push(format!(
-                "reference floor for {language} {fitted:.2} is not within 0.03 of shipped {shipped:.2}"
-            ));
-        }
-        floor_parity.insert(
-            language.clone(),
-            json!({"fitted": fitted, "shipped": shipped, "gated": gated, "passes": ok}),
-        );
-    }
+    // Harness parity #2: the reference's floors re-derived on name queries
+    // against the shipped ones, which are fitted on that query shape.
+    let (floor_parity, parity_errors) = floor_parity(&reference.outcomes);
+    validity_errors.extend(parity_errors);
     let reference_valid: Result<(), String> =
         if validity_errors.is_empty() { Ok(()) } else { Err(validity_errors.join("; ")) };
 
@@ -2697,5 +2718,131 @@ mod tests {
         assert!(tracing::enabled!(target: "ort::environment", tracing::Level::DEBUG));
         assert!(tracing::enabled!(target: "ort::environment", tracing::Level::WARN));
         assert!(tracing::enabled!(target: "ort", tracing::Level::INFO));
+    }
+
+    fn reference_outcome(id: &str, language: &str, top: f64, mechanical: bool) -> Outcome {
+        Outcome {
+            query_id: id.to_string(),
+            corpus: "c".to_string(),
+            language: language.to_string(),
+            positive: true,
+            mechanical,
+            overlap: false,
+            held_out: false,
+            first_expected_rank: Some(1),
+            top_score: Some(top),
+            top_language: Some(language.to_string()),
+        }
+    }
+
+    fn names(scores: &[(&str, f64)]) -> Vec<Outcome> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(i, (language, top))| reference_outcome(&format!("n{i}"), language, *top, true))
+            .collect()
+    }
+
+    /// The gate judges the name-query fit: go and rust names sit within 0.03
+    /// of shipped and pass although authored queries pull the pooled fit far
+    /// below; python names sit 0.04 above and fail. Control: calling
+    /// `metrics::fit_floors` in `floor_parity` adds go and rust errors.
+    #[test]
+    fn floor_parity_judges_the_name_query_fit() {
+        let mut pool = names(&[("go", 0.58), ("go", 0.62), ("python", 0.63), ("rust", 0.55)]);
+        for (i, language) in ["go", "python", "rust"].iter().enumerate() {
+            pool.push(reference_outcome(&format!("a{i}"), language, 0.20, false));
+        }
+        let (entries, errors) = floor_parity(&pool);
+        assert_eq!(
+            errors,
+            vec!["reference floor for python 0.63 is not within 0.03 of shipped 0.59".to_string()]
+        );
+        assert_eq!(entries["go"], json!({"fitted": 0.58, "shipped": 0.57, "gated": true, "passes": true}));
+        assert_eq!(entries["rust"], json!({"fitted": 0.55, "shipped": 0.57, "gated": true, "passes": true}));
+        assert_eq!(
+            entries["python"],
+            json!({"fitted": 0.63, "shipped": 0.59, "gated": true, "passes": false})
+        );
+    }
+
+    /// TypeScript is reported but never gated, however far off. Control:
+    /// `gated = true` for every language adds a typescript error.
+    #[test]
+    fn floor_parity_reports_typescript_without_gating_it() {
+        let pool = names(&[("go", 0.57), ("python", 0.59), ("rust", 0.57), ("typescript", 0.90)]);
+        let (entries, errors) = floor_parity(&pool);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            entries["typescript"],
+            json!({"fitted": 0.9, "shipped": 0.53, "gated": false, "passes": false})
+        );
+    }
+
+    /// Only the gate list is gated: a language outside it (no calibrated
+    /// floor) is reported, never an error.
+    #[test]
+    fn floor_parity_does_not_gate_a_language_outside_the_gate_list() {
+        let pool = names(&[("go", 0.57), ("python", 0.59), ("rust", 0.57), ("java", 0.90)]);
+        let (entries, errors) = floor_parity(&pool);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(entries["java"]["gated"], json!(false));
+        assert_eq!(entries["java"]["passes"], json!(false));
+    }
+
+    /// A difference of exactly 0.03 passes on both sides of every gated
+    /// floor and 0.04 fails, although the float difference of two 2dp values
+    /// lands just above or just below 0.03. Control: dropping the `1e-9`
+    /// from the tolerance fails the 0.03-above cases.
+    #[test]
+    fn floor_parity_tolerance_is_inclusive_at_three_hundredths() {
+        let cases = [("go", 0.57), ("python", 0.59), ("rust", 0.57)];
+        for (language, shipped) in cases {
+            for (offset, passes) in [(0.03, true), (-0.03, true), (0.04, false), (-0.04, false)] {
+                let fitted = ((shipped + offset) * 100.0_f64).round() / 100.0;
+                let mut pool = names(&[("go", 0.57), ("python", 0.59), ("rust", 0.57)]);
+                pool.retain(|o| o.language != language);
+                pool.push(reference_outcome("t", language, fitted, true));
+                let (entries, errors) = floor_parity(&pool);
+                assert_eq!(entries[language]["passes"], json!(passes), "{language} {fitted}");
+                assert_eq!(errors.len(), usize::from(!passes), "{language} {fitted}: {errors:?}");
+            }
+        }
+    }
+
+    /// A gated language without a name floor is an error and has no entry,
+    /// whether it has only authored queries (python) or none (rust).
+    /// Control: removing the `GATED_FLOOR_LANGUAGES` loop leaves no error.
+    #[test]
+    fn floor_parity_flags_a_gated_language_without_name_queries() {
+        let mut pool = names(&[("go", 0.57)]);
+        pool.push(reference_outcome("a", "python", 0.59, false));
+        let (entries, errors) = floor_parity(&pool);
+        assert_eq!(
+            errors,
+            vec![
+                "floor parity: no name queries for python".to_string(),
+                "floor parity: no name queries for rust".to_string(),
+            ]
+        );
+        assert!(!entries.contains_key("python"));
+        assert!(!entries.contains_key("rust"));
+    }
+
+    /// The gate list is exactly the catalogued languages whose shipped floor
+    /// sits above the default an uncalibrated language gets, so a floor added
+    /// for a language without adding it to the gate list fails here. Control:
+    /// dropping "rust" from `GATED_FLOOR_LANGUAGES` fails.
+    #[test]
+    fn the_gate_list_is_the_languages_with_a_calibrated_floor() {
+        let default = crate::mcp::shipped_similarity_floor("an-uncatalogued-language");
+        let calibrated: Vec<&str> = crate::languages::CATALOGUE
+            .iter()
+            .map(|e| e.language)
+            .filter(|l| crate::mcp::shipped_similarity_floor(l) > default)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(calibrated, GATED_FLOOR_LANGUAGES.to_vec());
     }
 }
