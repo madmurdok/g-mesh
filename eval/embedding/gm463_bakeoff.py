@@ -78,11 +78,11 @@ SCOPE_DEFAULT = {"ce-bge-m3": "nl"}
 PASSES_DEFAULT = {"ce-bge-m3": 1}
 BETA_MAX, BETA_MIN = 2560.0, 0.125
 # Section 3.5's latency order L6 L12 turbo gte jv2 bge; the arms run it, then mirrored.
-LAT_ORDER = ["ce-minilm", "ce-minilm-l12", "ce-jina-turbo", "ce-gte-mb", "ce-jina-v2", "ce-bge-m3"]
+LAT_ORDER = ["ce-minilm", "ce-minilm-int8", "ce-minilm-quint8", "ce-minilm-l12", "ce-jina-turbo", "ce-gte-mb", "ce-jina-v2", "ce-bge-m3"]
 L6_PAIR_TOKENS = 101.9  # gm-698-latency.md: enr mean pair tokens, same 30 queries, K=30, one decimal
 assert sorted(MODELS) == sorted(LAT_ORDER), (MODELS, LAT_ORDER)
 C3_PAIRS = 200
-C3_TOL = {REF: 1e-5}
+C3_TOL = {REF: 1e-5, "ce-minilm-int8": 1e-5, "ce-minilm-quint8": 1e-5}  # int8 at chunk 1: exact
 C3_TOL_DEFAULT = 1e-4
 BERT_PAIR = "[CLS] A [SEP] B [SEP]"
 ROBERTA_PAIR = "<s> A </s> </s> B </s>"
@@ -91,6 +91,8 @@ MASK_INPUTS = {"input_ids", "attention_mask"}
 C8_SPEC = {  # name -> (ONNX input names, special-token layout of an encoded pair)
     "ce-minilm": (BERT_INPUTS, BERT_PAIR),
     "ce-minilm-l12": (BERT_INPUTS, BERT_PAIR),
+    "ce-minilm-int8": (BERT_INPUTS, BERT_PAIR),
+    "ce-minilm-quint8": (BERT_INPUTS, BERT_PAIR),
     "ce-jina-turbo": (MASK_INPUTS, ROBERTA_PAIR),
     "ce-jina-v2": (MASK_INPUTS, ROBERTA_PAIR),
     "ce-gte-mb": (MASK_INPUTS, BERT_PAIR),
@@ -387,6 +389,173 @@ def c3p_rescore(cs, cache, ce, name, k, scope):
     return m <= tol and untested < len(diffs), m, ms
 
 
+def c16_control(cs, cache, ce, name, k, scope):
+    """GM-700 batching control: the C3' sample rescored at chunk 16 (the query's sample
+    plus up to 16 longest window texts) must DISAGREE with the cached chunk-1 logits
+    (> 1e-3), or the chunk-1 default tests nothing. Returns (max|diff|, pairs)."""
+    pool = [(c, q, nid) for c in cs for q in c.qids if in_model_scope(scope, c, q) for nid, _ in c.lists[ST][q][:k]]
+    sample = random.Random(463).sample(pool, min(C3_PAIRS, len(pool)))
+    byq = {}
+    for c, q, nid in sample:
+        byq.setdefault((c, q), []).append(c.atext_by[name]["ship"][nid])
+    diffs = []
+    for (c, q), ts in byq.items():
+        qtext = c.queries[q]["text"]
+        ts = list(dict.fromkeys(ts))
+        win = [t for t in dict.fromkeys(c.atext_by[name]["ship"][nid] for nid, _ in c.lists[ST][q][:k]) if t not in ts]
+        got = ce.score(qtext, ts + win[:max(0, 16 - len(ts))], chunk=16)
+        diffs += [abs(float(g) - cache.get(c, q, t)) for g, t in zip(got, ts)]
+    m = max(diffs)
+    print(f"C3'-16 {name}: {len(diffs)} sample pairs rescored at chunk 16 vs cached chunk 1: max|diff| {m:.3e} "
+          f"(must exceed 1e-3): {'pass' if m > 1e-3 else 'FAIL'}", flush=True)
+    return m, len(diffs)
+
+
+def top10_ids(cs, k, beta, sc):
+    out = {}
+    for c in cs:
+        for q in c.qids:
+            lst = c.lists[ST][q]
+            n = min(k, len(lst))
+            s_ = np.array([sc(c, q, nid) for nid, _ in lst[:n]]) + beta * np.array([x for _, x in lst[:n]])
+            out[(c.name, q)] = tuple(h[0] for h in R.reranked(c, q, k, s_, ST)[0][:10])
+    return out
+
+
+def n_top10_diff(cs, a, b, keep):
+    return sum(1 for c in cs for q in c.qids if keep(c, q) and a[(c.name, q)] != b[(c.name, q)])
+
+
+def ho_nl_q(c, q):
+    return nl_only(c, q) and bool(c.queries[q]["held_out"])
+
+
+SKIP_GRID = [0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.125, 0.15, 0.20, 0.25, 0.30]
+SKIP_FIT_LOSS = 0.005  # design GM-700 2.2: FIT MRR loss <= 0.005
+_QN_SEP = re.compile(r"::|[./#\\]")
+
+
+def q2_rule(cs, k, m, scope, ref40, o40, r40, off, off_row, sc, sc_ref):
+    """GM-700 Q2/Q5 ship rule for model m at beta 40 (lines of a markdown table) and the
+    control that the int8 and fp32 reranked top-10 differ for some query."""
+    d10, dmrr = E.paired(ref40, o40, R.ho)
+    dn = E.paired(ref40, o40, R.name_q)[1]
+    bars = {"held-out NL r@10 >= 0.647": r40["r10"][0] >= 0.647, "held-out NL MRR >= 0.425": r40["mrr"][0] >= 0.425,
+            "D9 Q1-Q5 vs int8-structured": all(r40["vs"]["int8"]["pass"][q] for q in ("Q1", "Q2", "Q3", "Q4", "Q5")),
+            f"name MRR {r40['name'][1]:.3f} >= GM-463 off {off_row['name'][1]:.3f}": r40["name"][1] >= off_row["name"][1],
+            f"dMRR CI lo {dmrr[1]:+.4f} >= -0.015": dmrr[1] >= -0.015,
+            f"dr@10 CI lo {100 * d10[1]:+.2f} pt >= -1.5": d10[1] >= -0.015}
+    t_a, t_b = top10_ids(cs, k, SHIP_BETA, sc_ref), top10_ids(cs, k, SHIP_BETA, sc)
+    n_ho, n_all = n_top10_diff(cs, t_a, t_b, ho_nl_q), n_top10_diff(cs, t_a, t_b, lambda c, q: True)
+    allq = sum(len(c.qids) for c in cs)
+    ctl = n_all > 0
+    out = [f"{m} @ beta {SHIP_BETA:g}: r@10 {ci3(r40['r10'])}, MRR {ci3(r40['mrr'])}, name r@10 {r40['name'][0]:.3f} / MRR "
+           f"{r40['name'][1]:.3f}; paired vs fp32: dr@10 {E.fmt_d(d10)}, dMRR {E.fmt_d(dmrr, True)}, name dMRR "
+           f"{dn[0]:+.3f} [{dn[1]:+.3f}, {dn[2]:+.3f}]", "", "| check | result |", "|---|---|"]
+    out += [f"| {k_} | {'pass' if v else 'FAIL'} |" for k_, v in bars.items()]
+    out += [f"| **all** | **{'SHIP RULE PASSES' if all(bars.values()) else 'SHIP RULE FAILS'}** |", "",
+            f"Control: queries whose reranked top-10 differs fp32 vs {m} at beta {SHIP_BETA:g}, K={k}: "
+            f"{n_all}/{allq} (held-out NL {n_ho}); must be > 0: {'pass' if ctl else 'FAIL'}"]
+    print(out[0], flush=True)
+    return out
+
+
+def skip_flags(cs, name_rule, m):
+    """query -> skip? Rule (a): split_words(query) == split_words(top-1's last qualified-name
+    segment). Rule (b): cos(top-1) - cos(top-2) >= m (m None: off)."""
+    flags = {}
+    for c in cs:
+        for q in c.qids:
+            lst, f = c.lists[ST][q], False
+            if lst:
+                if name_rule:
+                    last = _QN_SEP.split(c.rows[lst[0][0]]["qualifiedName"] or "")[-1]
+                    w = T.split_words(last)
+                    f = bool(w) and T.split_words(c.queries[q]["text"]) == w
+                if not f and m is not None and len(lst) > 1 and lst[0][1] - lst[1][1] >= m:
+                    f = True
+            flags[(c.name, q)] = f
+    return flags
+
+
+def f4_skip(cs, k, beta, sc, flags, keys=None):
+    """E.f4 with the skipped queries left in int8-structured's order."""
+    outs = []
+    for c in cs:
+        for q in c.qids:
+            if keys is not None and (c, q) not in keys:
+                continue
+            lst = c.lists[ST][q]
+            n = min(k, len(lst))
+            if flags[(c.name, q)]:
+                s_ = -np.arange(n, dtype=np.float64)
+            else:
+                s_ = np.array([sc(c, q, nid) for nid, _ in lst[:n]]) + beta * np.array([x for _, x in lst[:n]])
+            hits, _ = R.reranked(c, q, k, s_, ST)
+            o = R.outcome(c, q, hits, lst[0][1] if lst else None)
+            o["top_language"] = c.node_lang.get(lst[0][0]) if lst else None
+            outs.append(o)
+    return outs
+
+
+def fit_rr(outs):
+    g10, gm = {}, {}
+    for o in outs:
+        g10.setdefault(o["language"], []).append(R.hit10(o))
+        gm.setdefault(o["language"], []).append(R.rr(o))
+    return R.pooled_mean(g10), R.pooled_mean(gm)
+
+
+def skip_sim(cs, K, beta, sc, fit_keys, mkrow, base_st, r8s, label):
+    """GM-700 4.3: skip -> int8-structured order, else blend. m picked on FIT NL, reported held-out."""
+    L, S = [f"## Confident-skip simulation, {label}, K={K}, beta {beta:g}", ""], []
+    fk = set(fit_keys)
+    nofl = skip_flags(cs, False, None)
+    fit0 = fit_rr(f4_skip(cs, K, beta, sc, nofl, fk))
+    L += [f"FIT NL queries {len(fit_keys)}; no-skip FIT r@10 {fit0[0]:.4f}, MRR {fit0[1]:.4f}", "",
+          "| m | FIT skip share | FIT r@10 | FIT MRR | loss | ok |", "|---|---|---|---|---|---|"]
+    best = None
+    for m in SKIP_GRID:
+        fl = skip_flags(cs, False, m)
+        share = sum(fl[(c.name, q)] for c, q in fit_keys) / len(fit_keys)
+        r10, mrr = fit_rr(f4_skip(cs, K, beta, sc, fl, fk))
+        ok = fit0[1] - mrr <= SKIP_FIT_LOSS and share > 0
+        L.append(f"| {m:g} | {share:.3f} | {r10:.4f} | {mrr:.4f} | {fit0[1] - mrr:+.4f} | {'yes' if ok else 'no'} |")
+        if ok and (best is None or share > best[1]):
+            best = (m, share)
+    m_star = best[0] if best else None
+    L += ["", f"FIT-picked m = {m_star} (largest FIT skip share with MRR loss <= {SKIP_FIT_LOSS}); "
+          f"grid {SKIP_GRID}", ""]
+    S.append(f"skip-sim {label} K={K}: FIT-picked m {m_star}")
+    arms = [("no skip (blend)", nofl), ("(a) exact-name only", skip_flags(cs, True, None)),
+            (f"(b) margin m={m_star} only", skip_flags(cs, False, m_star) if m_star is not None else nofl),
+            ("(a)+(b)", skip_flags(cs, True, m_star)),
+            ("skip all (= int8-structured)", {k_: True for k_ in nofl})]
+    outs = {n: f4_skip(cs, K, beta, sc, fl) for n, fl in arms}
+    rows = [mkrow(n, outs[n]) for n, _ in arms]
+    # controls: no rule fired == no skip; every query skipped == int8-structured (C5's twin)
+    ctl1 = E.sig(mkrow("c", f4_skip(cs, K, beta, sc, skip_flags(cs, False, float("inf"))))) == E.sig(rows[0])
+    ctl2 = outs[arms[-1][0]] == base_st and E.sig(rows[-1]) == E.sig(r8s)
+    L += [f"Control m=+inf, name rule off == no-skip on every cell: {'pass' if ctl1 else 'FAIL'}",
+          f"Control every query skipped == int8-structured on every outcome and cell: {'pass' if ctl2 else 'FAIL'}", ""]
+    S.append(f"skip-sim controls: {ctl1} {ctl2}")
+    if not (ctl1 and ctl2):
+        print("\n".join(L))
+        sys.exit("STOP: skip simulation controls failed")
+    L += render(rows)
+    L += ["", "| arm | skip share held-out NL | skip share name queries | skip share all queries | "
+          "dr@10 vs no-skip, held-out NL | dMRR | name dMRR |", "|---|---|---|---|---|---|---|"]
+    for n, fl in arms:
+        def share(keep):
+            v = [fl[(c.name, q)] for c in cs for q in c.qids if keep(c, q)]
+            return f"{sum(v) / len(v):.3f} ({sum(v)}/{len(v)})"
+        d10, dmrr = E.paired(outs[arms[0][0]], outs[n], R.ho)
+        dn = E.paired(outs[arms[0][0]], outs[n], R.name_q)[1]
+        L.append(f"| {n} | {share(ho_nl_q)} | {share(lambda c, q: not nl_only(c, q))} | {share(lambda c, q: True)} | "
+                 f"{E.fmt_d(d10)} | {E.fmt_d(dmrr, True)} | {dn[0]:+.3f} [{dn[1]:+.3f}, {dn[2]:+.3f}] |")
+    return L, S
+
+
 # ---- report helpers ------------------------------------------------------------
 def window_ceiling(cs, ks=(20, 30, 50)):
     """Share of held-out NL positives with an expected node in int8-structured's top K, pooled by language."""
@@ -533,6 +702,10 @@ def quality(a):
             sys.exit(f"STOP: C3' failed for {m}: max|diff| {d3:.3e}")
         S.append(f"{m}: C3' max|diff| {d3:.3e}, {ms3:.2f} ms/pair")
         ctl[m] = ms3
+        if m in R.INT8_MODELS:
+            d16, n16 = c16_control(cs, caches[m], ce, m, K, scope)
+            S.append(f"{m}: C3'-16 chunk 16 vs chunk 1 on {n16} pairs: max|diff| {d16:.3e} "
+                     f"({'differs, control ok' if d16 > 1e-3 else 'DOES NOT DIFFER, control FAILED'})")
 
     shipped = R.shipped_floors(HERE.parents[1])
     base = {arm: [R.outcome(c, q, c.lists[arm][q], c.lists[arm][q][0][1] if c.lists[arm][q] else None)
@@ -574,6 +747,9 @@ def quality(a):
         p.write(step)
         tok_lines = [f"| ce-minilm (ship-L6) | all | {mean_pair_tokens(cs, ces[REF], REF, k_, 'all'):.1f} |"] if REF in ces else []
         paired_lines, rule_lines, split_arms = [], [], [("ship-L6", ship), ("off", off)]
+        ship_rule_lines = []
+        off_row = rows[1]
+        ship40 = ship if bref == SHIP_BETA else f4s(cs, k_, SHIP_BETA, sc_ref["ship"])
         for m in ces:
             if m == REF:
                 step += 1
@@ -588,7 +764,13 @@ def quality(a):
             rows.append(rm)
             variants.append((f"{m} K={k_} beta={bm:g}", om))
             if bm != SHIP_BETA:
-                rows.append(mkrow(f"{m} K={k_} beta={SHIP_BETA:g}{tag}", f4s(cs, k_, SHIP_BETA, sc, scope)))
+                o40 = f4s(cs, k_, SHIP_BETA, sc, scope)
+                r40 = mkrow(f"{m} K={k_} beta={SHIP_BETA:g}{tag}", o40)
+                rows.append(r40)
+            else:
+                o40, r40 = om, rm
+            if m != REF:
+                ship_rule_lines.append(q2_rule(cs, k_, m, scope, ship40, o40, r40, off, off_row, sc, sc_ref["ship"]))
             S.append(f"K={k_}: {m} FIT-tuned beta {bm:g} (FIT r@10 {fm[0]:.3f}, MRR {fm[1]:.3f})"
                      + (f"; grid extended by {xm}" + (" (optimum still at the edge)" if bm in (0.0, BETA_MAX) else "") if xm else ""))
             subsets = [("held-out NL", R.ho), ("strict held-out NL", strict)] + ([("name queries", R.name_q)] if scope == "all" else [])
@@ -610,6 +792,9 @@ def quality(a):
         L += ["", f"## K={k_}", ""] + render(rows) + flips(variants, by8, shipped)
         L += ["", f"Paired b minus a, K={k_}, each candidate at its FIT-tuned beta (ship-L6 at beta {bref:g}, off at {OFF_BETA:g})", "",
               "| b | a | subset | Δr@10 [lo, hi] | ΔMRR [lo, hi] |", "|---|---|---|---|---|"] + paired_lines
+        if ship_rule_lines:
+            L += ["", f"GM-700 Q2 ship rule at beta {SHIP_BETA:g}, K={k_}; paired against fp32 ship-L6 at beta {SHIP_BETA:g}; "
+                  f"name floor = GM-463 off (L6, structured text, beta {OFF_BETA:g}) at this K", ""] + [x for t in ship_rule_lines for x in t]
         L += ["", f"Rules 1-4 of section 3.6 at K={k_} (rule 5 is the latency run's)", "",
               "| model | 1 ΔMRR lo > 0 | 2 Δr@10 lo >= -1.0 pt | 3 D9 vs int8-structured | 4 name ΔMRR lo >= -0.010 |",
               "|---|---|---|---|---|"] + rule_lines
@@ -619,6 +804,11 @@ def quality(a):
         if k_ == 30 and REF in a.models:
             S += c0_check(rows, bref, nref)
     p.write(step)
+    if a.skip_sim:
+        m_ = a.skip_sim
+        sl, ss = skip_sim(cs, K, SHIP_BETA, score_of_for(caches[m_], m_, "ship"), fit_keys, mkrow, base[ST], r8s, m_)
+        L += [""] + sl
+        S += ss
     if failed:
         L += ["", "Models that did not load:"] + [f"- {m}: {e}" for m, e in failed.items()]
     finish(a, S, L)
@@ -701,12 +891,13 @@ def latency_arm(a):
         return time.perf_counter() - t0, len(hits)
 
     t0 = time.perf_counter()
-    ce = R.CrossEncoder(a.work, a.model, threads, rust_like=True)
+    ce = R.CrossEncoder(a.work, a.model, threads, rust_like=True, chunk=a.chunk)
     rec["init_s"] = round(time.perf_counter() - t0, 3)
     first, _ = f4(ce, qids[0], 30 if 30 in ks else ks[-1])
     rec["first_call_ms"] = round(1000 * (time.perf_counter() - t0), 1)
     rec["first_inference_ms"] = round(1000 * first, 1)
     rec["threads"] = ce.threads
+    rec["chunk"] = ce.chunk
     for q in qids:
         f4(ce, q, ks[-1])
     rec["per_k"] = {}
@@ -775,6 +966,8 @@ def latency(a):
                "--ks", ",".join(map(str, a.ks)), "--passes", str(passes)]
         if a.corpora:
             cmd += ["--corpora", str(a.corpora)]
+        if a.chunk:
+            cmd += ["--chunk", str(a.chunk)]
         p = subprocess.run(cmd, capture_output=True, text=True)
         tp = dict(re.findall(r"^(real|user|sys)\s+([0-9.]+)", p.stderr, re.M))
         lines = [l for l in p.stdout.splitlines() if l.startswith("{")]
@@ -814,6 +1007,8 @@ def write_latency_summary(out, recs, ks):
     for (m, K), v in pooled.items():
         x = f"{statistics.mean(v) / l6[K]:.2f}" if K in l6 else "-"
         rows.append(f"| {m} | {K} | {statistics.mean(v):.1f} | {x} |")
+    rows += ["", "| arm | chunk | model.onnx sha256 |", "|---|---|---|"]
+    rows += [f"| {r['label']} | {r.get('chunk')} | {r.get('files', {}).get('model.onnx', '?')} |" for r in recs if "error" not in r]
     rows += ["", "uptime per arm (start -> end):"]
     rows += [f"- {r['label']}: " + (f"{r['uptime_start']} -> {r['uptime_end']}" if "error" not in r else f"error {r['error'][-300:]!r}")
              for r in recs]
@@ -865,6 +1060,7 @@ def parse_args(argv=None):
     q.add_argument("--cache-dir", type=Path, help="score caches (default <work>/rerank_cache)")
     q.add_argument("--dry-run-pairs", type=int, help="controls, then N new ship pairs per model with ms/pair and ETA; stop")
     q.add_argument("--controls-only", action="store_true", help="C1 C5 C8 C7 C3' per model; stop")
+    q.add_argument("--skip-sim", choices=MODELS, help="GM-700: confident-skip simulation on this model's scores at beta 40")
     q.add_argument("--table", type=Path)
     q.add_argument("--summary", type=Path)
 
@@ -873,6 +1069,7 @@ def parse_args(argv=None):
     lat.add_argument("--models", type=csv_models, required=True)
     lat.add_argument("--ks", type=csv_ints, default=[20, 30, 50])
     lat.add_argument("--passes", type=int, help=f"timed passes per K (default 3; {PASSES_DEFAULT})")
+    lat.add_argument("--chunk", type=int, help="pairs per ORT run for every arm (default: the model's own, 1 for int8, else 16)")
     lat.add_argument("--gate-cap", type=int, default=1800, help="seconds the load/therm gates may wait in total")
     lat.add_argument("--out", type=Path)
 
@@ -882,6 +1079,7 @@ def parse_args(argv=None):
     arm.add_argument("--label", default="")
     arm.add_argument("--ks", type=csv_ints, default=[20, 30, 50])
     arm.add_argument("--passes", type=int, default=3)
+    arm.add_argument("--chunk", type=int, help="pairs per ORT run (default: the model's own)")
 
     a = ap.parse_args(argv)
     if a.mode == "quality":
