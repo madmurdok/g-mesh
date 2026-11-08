@@ -8,6 +8,10 @@ The g-mesh crate itself never downloads anything outside `g-mesh model
 fetch`, so this lives here as a script.
 
 Usage: fetch_models.py [variant ...]   (all model variants when omitted)
+       fetch_models.py --ce [name ...] [--work DIR]
+           cross-encoders of rerank_eval.CE_BAKEOFF (all when no name is given)
+           into DIR/models/<CE_DIR[name]>/ (default DIR eval/embedding/v2/work);
+           stops on a pinned sha256 mismatch
 """
 
 import hashlib
@@ -46,7 +50,47 @@ def fetch(url, dest):
     os.replace(tmp, dest)
 
 
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def fetch_ce(argv):
+    sys.path.insert(0, HERE)
+    import rerank_eval as R
+    work = os.path.join(HERE, "v2", "work")
+    if "--work" in argv:
+        i = argv.index("--work")
+        work = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    names = argv or list(R.CE_BAKEOFF)
+    unknown = [n for n in names if n not in R.CE_BAKEOFF]
+    if unknown:
+        sys.exit(f"unknown --ce names {unknown}; known: {list(R.CE_BAKEOFF)}")
+    for name in names:
+        repo, rev = R.CE_BAKEOFF[name]
+        files, pinned = R.CE_FILES[name]
+        out = os.path.join(work, "models", R.CE_DIR[name])
+        os.makedirs(out, exist_ok=True)
+        for remote, local in files.items():
+            dest = os.path.join(out, local)
+            if not os.path.exists(dest):
+                fetch(f"https://huggingface.co/{repo}/resolve/{rev}/{remote}", dest)
+            digest = sha256(dest)
+            want = pinned.get(local)
+            mark = "" if want is None else (" (pinned, ok)" if digest == want else f" MISMATCH, pinned {want}")
+            print(f"{name}: {local} {os.path.getsize(dest)} bytes sha256 {digest}{mark}", flush=True)
+            if want is not None and digest != want:
+                sys.exit(f"STOP: {name} {local} sha256 differs from the pin")
+
+
 def main():
+    if sys.argv[1:2] == ["--ce"]:
+        fetch_ce(sys.argv[2:])
+        return
     wanted = set(sys.argv[1:])
     for v in variants():
         if v.get("arm") != "model" or (wanted and v["name"] not in wanted):
