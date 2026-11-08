@@ -78,11 +78,11 @@ SCOPE_DEFAULT = {"ce-bge-m3": "nl"}
 PASSES_DEFAULT = {"ce-bge-m3": 1}
 BETA_MAX, BETA_MIN = 2560.0, 0.125
 # Section 3.5's latency order L6 L12 turbo gte jv2 bge; the arms run it, then mirrored.
-LAT_ORDER = ["ce-minilm", "ce-minilm-int8", "ce-minilm-quint8", "ce-minilm-l12", "ce-jina-turbo", "ce-gte-mb", "ce-jina-v2", "ce-bge-m3"]
+LAT_ORDER = ["ce-minilm", "ce-minilm-int8", "ce-minilm-quint8", "ce-minilm-l12", "ce-jina-turbo", "ce-gte-mb", "ce-gte-mb-int8", "ce-jina-v2", "ce-bge-m3"]
 L6_PAIR_TOKENS = 101.9  # gm-698-latency.md: enr mean pair tokens, same 30 queries, K=30, one decimal
 assert sorted(MODELS) == sorted(LAT_ORDER), (MODELS, LAT_ORDER)
 C3_PAIRS = 200
-C3_TOL = {REF: 1e-5, "ce-minilm-int8": 1e-5, "ce-minilm-quint8": 1e-5}  # int8 at chunk 1: exact
+C3_TOL = {REF: 1e-5, "ce-minilm-int8": 1e-5, "ce-minilm-quint8": 1e-5, "ce-gte-mb-int8": 1e-5}  # int8 at chunk 1: exact
 C3_TOL_DEFAULT = 1e-4
 BERT_PAIR = "[CLS] A [SEP] B [SEP]"
 ROBERTA_PAIR = "<s> A </s> </s> B </s>"
@@ -96,6 +96,7 @@ C8_SPEC = {  # name -> (ONNX input names, special-token layout of an encoded pai
     "ce-jina-turbo": (MASK_INPUTS, ROBERTA_PAIR),
     "ce-jina-v2": (MASK_INPUTS, ROBERTA_PAIR),
     "ce-gte-mb": (MASK_INPUTS, BERT_PAIR),
+    "ce-gte-mb-int8": (MASK_INPUTS, BERT_PAIR),
     "ce-bge-m3": (MASK_INPUTS, ROBERTA_PAIR),
 }
 _SKIN_Q = "Organic skincare products for sensitive skin"
@@ -111,6 +112,11 @@ C7_CARDS = {
                    ("how to implement quick sort in python?", "Introduction of quick sort"),
                    ("how to implement quick sort in python?", "The weather is nice today")],
                   [2.1387, 2.4609, -1.6729], 0.05, None),
+    # int8: the card logits' 0.05 tolerance is fp32's, so rank only (the card's best document is index 1)
+    "ce-gte-mb-int8": ([("what is the capital of China?", "Beijing"),
+                        ("how to implement quick sort in python?", "Introduction of quick sort"),
+                        ("how to implement quick sort in python?", "The weather is nice today")],
+                       None, None, {0, 1}),
     "ce-bge-m3": ([("what is panda?", "hi"),
                    ("what is panda?", "The giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or "
                                       "simply panda, is a bear species endemic to China."),

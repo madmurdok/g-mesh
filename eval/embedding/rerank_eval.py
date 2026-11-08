@@ -76,14 +76,17 @@ CE_BAKEOFF = {  # GM-463 candidates, kept out of CES: latency_only and main loop
     # GM-700: the official dynamic-int8 exports of the shipped L6 revision (same tokenizer), scored one pair per run
     "ce-minilm-int8": ("cross-encoder/ms-marco-MiniLM-L6-v2", "233902d25c440f23af6f7d6e94d2946bac0bee0a"),
     "ce-minilm-quint8": ("cross-encoder/ms-marco-MiniLM-L6-v2", "233902d25c440f23af6f7d6e94d2946bac0bee0a"),
+    # GM-700 S9: the official int8 export of the GM-463 gte revision
+    "ce-gte-mb-int8": ("Alibaba-NLP/gte-reranker-modernbert-base", "f7481e6055501a30fb19d090657df9ec1f79ab2c"),
 }
-INT8_MODELS = {"ce-minilm-int8", "ce-minilm-quint8"}  # dynamic int8: a pair's logit depends on its batch, so chunk 1
+INT8_MODELS = {"ce-minilm-int8", "ce-minilm-quint8", "ce-gte-mb-int8"}  # dynamic int8: a pair's logit depends on its batch, so chunk 1
 DEFAULT_CHUNK = 16
 CE_DIR = {"ce-minilm": "ms-marco-MiniLM-L6-v2", "ce-jina-tiny": "jina-reranker-v1-tiny-en",
           "ce-minilm-l12": "ms-marco-MiniLM-L12-v2", "ce-jina-turbo": "jina-reranker-v1-turbo-en",
           "ce-jina-v2": "jina-reranker-v2-base-multilingual", "ce-gte-mb": "gte-reranker-modernbert-base",
           "ce-bge-m3": "bge-reranker-v2-m3",
-          "ce-minilm-int8": "ms-marco-MiniLM-L6-v2-qint8", "ce-minilm-quint8": "ms-marco-MiniLM-L6-v2-quint8"}
+          "ce-minilm-int8": "ms-marco-MiniLM-L6-v2-qint8", "ce-minilm-quint8": "ms-marco-MiniLM-L6-v2-quint8",
+          "ce-gte-mb-int8": "gte-reranker-modernbert-base-int8"}
 _ONNX = {"onnx/model.onnx": "model.onnx", "tokenizer.json": "tokenizer.json", "config.json": "config.json"}
 # name -> ({remote path: local name}, {local name: pinned sha256 (Hugging Face LFS oid)}).
 # model.onnx_data keeps its name: ORT resolves the external weights by the name in the graph.
@@ -103,6 +106,7 @@ _INT8_PIN = {"ce-minilm-int8": ("onnx/model_qint8_avx512_vnni.onnx",
                                 "3573b6b9593cb2f75987a31815d409ca3dd8808629118fd20451bb1a5d90cec7"),
              "ce-minilm-quint8": ("onnx/model_quint8_avx2.onnx",
                                   "c80a8b34256ea453093d612e3ac48d3d965a0c0a48c7906709af8b8e28461bf9")}
+_INT8_PIN["ce-gte-mb-int8"] = ("onnx/model_int8.onnx", "ecc6a0ae67cee3d898167802383112d9185ca9250e07bd5d1fa65019b050179d")
 for _n, (_remote, _sha) in _INT8_PIN.items():
     CE_FILES[_n] = ({_remote: "model.onnx", "tokenizer.json": "tokenizer.json", "config.json": "config.json"},
                     {"model.onnx": _sha})
