@@ -106,7 +106,11 @@ What gte-mb would need for rule 5: p50 at K=30 must fall from 9.50x to <= 2.0x L
 
 ## Owner decision
 
-> PLACEHOLDER: to be filled by the orchestrator with the owner's answer, quoted verbatim (option label plus any typed text). Not decided in this slice.
+2026-11-08, answer typed by the owner (no option label):
+
+> "gte int8 - проверить в gm-700, так же давай попробуем дистиллировать gte а gm-436"
+
+So both A and B: GM-700 adds the int8 gte-mb probe against the 4.75x bar; GM-436 distils gte-mb into an L6-size cross-encoder regardless of the probe's outcome. MiniLM-L6 stays the shipped reranker until one of them passes rules 1-5.
 
 ## Method and controls
 
