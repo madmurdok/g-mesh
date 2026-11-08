@@ -487,3 +487,13 @@ Options:
 - **B. The product's rerank-off (int8-structured).**
   - Benefit: the name skip almost surely passes.
   - Risk: allows a name-MRR drop of up to ~0.1 vs today.
+
+## 8. Owner decisions (2026-11-08)
+
+Quoted verbatim from the owner's answers:
+
+- **Q1:** "То же имя, заменить при fetch (Recommended)". This is option A: the same local name, replaced on fetch, and the old fp32 file refused until `g-mesh model fetch` runs.
+- **Q2:** "Пороги + не хуже fp32 (Recommended)". This is option A, the S3 ship rule: the AC bars, plus a dMRR CI lower bound >= -0.015 and a dr@10 lower bound >= -1.5 pt against fp32 L6, with BETA 40. If the rule fails at BETA 40, S3 reports the FIT-tuned beta and asks the owner.
+- **Q3:** "K=30, скорость за счёт int8 (Recommended)". K stays 30. The K=20 rows are reported for information only.
+- **Q4:** "Один файл, qint8 (Recommended)". One file, the signed qint8 export, unless S3 shows quint8 is better on quality.
+- **Q5:** "off из GM-463, строже (Recommended)". The name-query floor is GM-463's off: L6 on the structured text at beta 80. S3 measures it at K=30.
