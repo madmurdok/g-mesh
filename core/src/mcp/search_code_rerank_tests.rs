@@ -12,7 +12,7 @@ use super::search_code::handle;
 use super::session_hints::SessionHints;
 use super::SearchCodeParams;
 use crate::embedding::pipeline::test_support::{fake_model_dir, fake_pipeline, fake_vector, Counters};
-use crate::embedding::rerank::{RerankSettings, Reranker, Scorer};
+use crate::embedding::rerank::{self, RerankSettings, Reranker, Scorer};
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -679,7 +679,9 @@ fn store_for_parity(case: &ParityCase, root: &Path) -> Arc<IndexStore> {
 /// the page it returns, equal the reference's text built with the same
 /// (whitespace-word) counter as the stub's. This ties `window_texts` to the
 /// fixture that `the_real_model_reproduces_the_reference_logits_and_order`
-/// checks the model against (that test builds its texts itself).
+/// checks the model against (that test builds its texts itself). A case
+/// whose first row's name is the query is not scored at all
+/// (`rerank::confident`).
 ///
 /// *Control:* have `window_texts` return `text_to_embed` of the doc
 /// comment and signature alone.
@@ -715,6 +717,11 @@ fn the_handler_scores_the_texts_the_reference_scored() {
         let page = body(&result);
 
         let calls = capture.0.lock().unwrap().clone();
+        let top_name = case.rows[0].qualified_name.as_deref().unwrap_or_default();
+        if rerank::confident(&case.query, top_name) {
+            assert!(calls.is_empty(), "{}: an exact-name window is not scored", case.query_id);
+            continue;
+        }
         assert_eq!(calls.len(), 1, "{}: one scoring call", case.query_id);
         let (query, texts) = &calls[0];
         assert_eq!(query, &case.query, "{}", case.query_id);

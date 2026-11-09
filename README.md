@@ -240,8 +240,9 @@ g-mesh model status   # where the weights are expected, and whether they're ther
 
 `model fetch` also downloads the cross-encoder `search_code` reranks with
 (see "Tools exposed"): `cross-encoder/ms-marco-MiniLM-L6-v2` at revision
-`233902d25c440f23af6f7d6e94d2946bac0bee0a`, its fp32 export
-(`onnx/model.onnx`, 91 MB), checked against a pinned SHA-256 like the
+`233902d25c440f23af6f7d6e94d2946bac0bee0a`, its dynamic-int8 export
+(`onnx/model_qint8_avx512_vnni.onnx`, 23 MB, saved as `model.onnx`; an
+older fp32 `model.onnx` is replaced), checked against a pinned SHA-256 like the
 embedding model, and again by the daemon when it loads it. `--no-rerank` skips
 it; `G_MESH_RERANK_MODEL_DIR` puts it elsewhere (`G_MESH_MODEL_DIR` names the
 embedding model's own directory, so it cannot also hold this one). Without it
@@ -782,11 +783,13 @@ embedding cosine (so within the top 30 it need not fall monotonically), and
 `noMatch` / `lowSimilarity` are judged on the embedding order's own page, so
 the rerank never changes a verdict. Only a first page is reranked, and only
 once the embedding pass has finished; a page during the pass, and every
-continuation, is ranked as before. With `limit` under 30 the cursor carries
+continuation, is ranked as before; so is a first page whose top row's name
+is the query (`isMobileOrTablet` finding `isMobileOrTablet`). With `limit` under 30 the cursor carries
 the rest of the reranked top 30, so paging neither repeats nor skips a row.
-Design and trade-offs: [ADR 0016](docs/adr/0016-cross-encoder-rerank.md).
+Design and trade-offs: [ADR 0016](docs/adr/0016-cross-encoder-rerank.md),
+[ADR 0043](docs/adr/0043-int8-rerank-one-pair-per-run.md).
 
-*Cost:* the cross-encoder (91 MB on disk, ~87 MiB) loads on the first search
+*Cost:* the cross-encoder (23 MB on disk) loads on the first search
 that reranks and scores 30 pairs per first page on up to 4 CPU threads.
 Measured end to end through the daemon on g-mesh's own index, on a 4-core
 laptop ([`docs/results/gm-464-rerank-latency.md`](docs/results/gm-464-rerank-latency.md)):

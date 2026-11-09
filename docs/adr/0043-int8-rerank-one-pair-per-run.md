@@ -1,0 +1,56 @@
+# 0043. The rerank runs the int8 cross-encoder one pair per run, and skips an exact-name window
+
+## Status
+Accepted (GM-700, owner decisions: the same local name `model.onnx`,
+replaced on `g-mesh model fetch`; quality no worse than fp32 at BETA 40; K
+stays 30; one file, the signed qint8 export; the name-query floor is
+GM-463's "off").
+Design note: [`GM-700-rerank-speedup.md`](../design/GM-700-rerank-speedup.md).
+Results: [`gm-700-offline.md`](../results/gm-700-offline.md).
+Amends [ADR 0016](0016-cross-encoder-rerank.md) (the weights, the batching)
+and keeps [ADR 0042](0042-enriched-reranker-text.md)'s text and blend weight.
+
+## Context
+The rerank (`embedding::rerank`) scored the 30-row window with the fp32
+export of `cross-encoder/ms-marco-MiniLM-L6-v2` in length-sorted chunks of
+16 pairs; it was most of a reranked `search_code` call's time. The pinned
+revision `233902d2` also carries official dynamic-int8 exports with the same
+inputs, output and tokenizer. Dynamic quantization scales each run's
+activations by that run's own range, so a pair's logit moves with the other
+pairs in its batch (probe deltas up to 0.8 at 16 pairs per run).
+
+## Decision
+- **Weights.** `onnx/model_qint8_avx512_vnni.onnx` (signed int8; byte-identical
+  to the arm64 and avx512 files), 23,200,716 bytes, sha256
+  `3573b6b9593cb2f75987a31815d409ca3dd8808629118fd20451bb1a5d90cec7`, stored
+  under the same local name `model.onnx`. `g-mesh model fetch` replaces an
+  older fp32 file (its size differs); until then the daemon refuses it by
+  sha256 with a message naming `g-mesh model fetch`, and `search_code` keeps
+  the embedding order.
+- **One pair per run** (`CHUNK = 1`), so a pair's logit does not depend on
+  the other pairs. The length sort and padding stay in the code and do
+  nothing at one pair.
+- **BETA 40, WINDOW 30**, unchanged.
+- **Exact-name skip.** When the words (`ce_text::split_words`) of the query
+  equal the words of the embedding ranking's first row's last
+  qualified-name segment (segments split on `::`, `.`, `/`, `#`, `\`), and
+  are not empty, the window is not scored: the page is the plain page,
+  exactly as with the rerank off. The rule is the eval's simulation
+  (`eval/embedding/gm463_bakeoff.py::skip_flags`, rule (a)) byte for byte.
+- **No margin skip.** A cosine-margin rule (top-1 minus top-2 >= m) is not
+  used.
+
+## Consequences
+- On the v2 eval set qint8 at one pair per run matches fp32 within the
+  non-inferiority bounds (held-out NL dMRR -0.001 [-0.004, +0.003], dr@10
+  -0.1 pt [-0.6, +0.3]; name MRR 0.889), and the rerank alone runs at about
+  0.26x of fp32's p50 at K=30. The download drops from 91 MB to 23 MB.
+- The exact-name skip changes no held-out NL cell and name MRR by +0.001;
+  it skips 34% of name queries and none of the NL ones in that set.
+- The margin rule at its FIT-picked m = 0.08 lost held-out NL MRR (CI
+  [-0.012, -0.003]) and took name MRR below GM-463's off floor, so it is
+  rejected.
+- The quint8 (`avx2`) export was not better on quality; AVX2-only x86 CPUs
+  may run the s8 kernels slower, which this decision accepts unmeasured.
+- The order-parity fixture (`core/src/embedding/testdata/rerank_parity.json`)
+  holds the int8 model's logits at one pair per run.

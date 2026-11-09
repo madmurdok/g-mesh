@@ -5,8 +5,9 @@ Writes core/src/embedding/testdata/rerank_parity.json: for a few NL and name
 queries per eval corpus, int8-structured's top-30 (the node's columns,
 cosine), the text search_code's rerank reads for each node
 (gm462_ce_text.build(row, src, "EPB", ce-minilm tokenizer, 48), GM-698), the
-ce-minilm logits rerank_eval.CrossEncoder.score gives each (query, text)
-pair, and the F4 order (ce + BETA * cosine, ties in int8 order).
+logits rerank_eval.CrossEncoder.score gives each (query, text) pair under the
+shipped weights (ce-minilm-int8, the official qint8 export, one pair per run,
+GM-700), and the F4 order (ce + BETA * cosine, ties in int8 order).
 
 Each row also carries `srcLines`, its source span from startLine, cut after
 the last line the body field reads (gm698_ce_text_fixture.span_for), and
@@ -24,7 +25,7 @@ The fixture must tell its controls apart, so this script refuses to write it
 unless the order differs from F4 under beta = 80 and under the structured
 text alone (the text before GM-698) on at least one query each.
 
-usage: gm464_rerank_fixture.py --work <eval/embedding/work> [--corpora dir] [--out path]
+usage: gm464_rerank_fixture.py --work <eval/embedding/v2/work> [--corpora dir] [--out path]
 """
 
 import argparse
@@ -43,6 +44,7 @@ from gm464_ce_structured import ST, add_structured  # noqa: E402
 
 K = 30
 BETA = 40.0
+CE = "ce-minilm-int8"  # rerank_eval scores it one pair per run (core's CHUNK = 1)
 NL_PER_CORPUS = 2
 NAME_PER_CORPUS = 1
 
@@ -75,7 +77,8 @@ def main():
 
     corpora = [p.name for p in sorted((a.work / "runs" / R.REF).iterdir()) if (p / "rankings.jsonl").exists()]
     corpora_dir = a.corpora or a.work / "corpora"
-    ce = R.CrossEncoder(a.work, "ce-minilm")
+    ce = R.CrossEncoder(a.work, CE)
+    assert ce.chunk == 1, ce.chunk
     minilm = F.minilm_counter(a.work)
     toks = (F.words, minilm)
     cases, differs_beta, differs_base = [], 0, 0

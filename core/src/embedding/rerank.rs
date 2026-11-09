@@ -3,8 +3,12 @@
 //! `search_code` takes the embedding ranking's first [`WINDOW`] rows, scores
 //! each (query, symbol text) pair with `cross-encoder/ms-marco-MiniLM-L6-v2`,
 //! and orders the window by `logit + BETA * cosine`. Rows after the window
-//! keep the embedding order, and the score shown stays the cosine. Design:
-//! ADR 0016 (`docs/adr/0016-cross-encoder-rerank.md`).
+//! keep the embedding order, and the score shown stays the cosine. A window
+//! whose first row's name is the query ([`confident`]) is not scored and
+//! keeps the embedding order. Design: ADR 0016
+//! (`docs/adr/0016-cross-encoder-rerank.md`); the int8 weights, one pair per
+//! run and the exact-name skip: ADR 0043
+//! (`docs/adr/0043-int8-rerank-one-pair-per-run.md`).
 //!
 //! Like the embedding model, the cross-encoder is fetched by `g-mesh model
 //! fetch` and loaded lazily, on the first call that reranks. A missing or
@@ -26,6 +30,7 @@ use sha2::{Digest, Sha256};
 use tokenizers::tokenizer::Tokenizer;
 use tokenizers::TruncationParams;
 
+use crate::embedding::ce_text::split_words;
 use crate::embedding::model::{ONNX_FILE_NAME, TOKENIZER_FILE_NAME};
 
 /// The directory name under `~/.g-mesh/models/`, and the name the log uses.
@@ -34,11 +39,12 @@ pub(crate) const RERANK_MODEL_REPO: &str = "cross-encoder/ms-marco-MiniLM-L6-v2"
 /// The revision the blend's `BETA` was fitted against; the weights and
 /// tokenizer below are its files.
 pub(crate) const RERANK_MODEL_REVISION: &str = "233902d25c440f23af6f7d6e94d2946bac0bee0a";
-/// The fp32 export, written to [`ONNX_FILE_NAME`] in the model directory.
-pub(crate) const RERANK_ONNX_REMOTE_PATH: &str = "onnx/model.onnx";
-pub(crate) const RERANK_ONNX_SIZE: u64 = 91_011_230;
+/// The official dynamic-int8 (signed, `qint8`) export, written to
+/// [`ONNX_FILE_NAME`] in the model directory (ADR 0043).
+pub(crate) const RERANK_ONNX_REMOTE_PATH: &str = "onnx/model_qint8_avx512_vnni.onnx";
+pub(crate) const RERANK_ONNX_SIZE: u64 = 23_200_716;
 pub(crate) const RERANK_ONNX_SHA256: &str =
-    "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a";
+    "3573b6b9593cb2f75987a31815d409ca3dd8808629118fd20451bb1a5d90cec7";
 pub(crate) const RERANK_TOKENIZER_SIZE: u64 = 711_396;
 pub(crate) const RERANK_TOKENIZER_SHA256: &str =
     "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66";
@@ -60,9 +66,11 @@ pub const BETA: f64 = 40.0;
 /// first.
 pub const MAX_PAIR_TOKENS: usize = 512;
 
-/// Pairs per inference batch, taken in token-length order so one long text
-/// does not pad the whole window.
-const CHUNK: usize = 16;
+/// Pairs per inference run. A pair's logit must not depend on the other
+/// pairs it runs with; the dynamic-int8 weights quantize each run's
+/// activations with that run's own scales, so only one pair per run keeps
+/// that true (ADR 0043).
+const CHUNK: usize = 1;
 
 /// The most intra-op threads one rerank uses.
 const MAX_THREADS: usize = 4;
@@ -103,6 +111,14 @@ pub(crate) fn check_rerank_files(dir: &Path) -> Result<()> {
         }
         let actual = file_sha256(&path)?;
         if actual != sha {
+            if name == ONNX_FILE_NAME {
+                bail!(
+                    "{} has sha256 {actual}, not the pinned {sha} (g-mesh switched the rerank to the \
+                     int8 model; this is likely the fp32 file it replaced).\n\
+                     Replace it: g-mesh model fetch",
+                    path.display()
+                );
+            }
             bail!("{} has sha256 {actual}, not the pinned {sha}", path.display());
         }
     }
@@ -142,6 +158,35 @@ pub fn blended_order(logits: &[f32], cosines: &[f64]) -> Option<Vec<usize>> {
         blended[b].partial_cmp(&blended[a]).expect("every blend is finite").then(a.cmp(&b))
     });
     Some(order)
+}
+
+/// Whether the embedding ranking's first row already answers `query`, so
+/// the window keeps the embedding order without scoring: the query's words
+/// ([`split_words`]) equal those of the row's last qualified-name segment,
+/// and are not empty. Segments are split on `::`, `.`, `/`, `#` and `\`
+/// (ADR 0043).
+pub(crate) fn confident(query: &str, top_qualified_name: &str) -> bool {
+    let words = split_words(last_segment(top_qualified_name));
+    !words.is_empty() && split_words(query) == words
+}
+
+/// What follows the last segment separator of a qualified name, the
+/// separators matched left to right as the regex `::|[./#\\]` splits.
+fn last_segment(qualified_name: &str) -> &str {
+    let bytes = qualified_name.as_bytes();
+    let (mut start, mut i) = (0, 0);
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"::") {
+            i += 2;
+            start = i;
+        } else if matches!(bytes[i], b'.' | b'/' | b'#' | b'\\') {
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    &qualified_name[start..]
 }
 
 /// `cross-encoder/ms-marco-MiniLM-L6-v2` on onnxruntime.
@@ -194,7 +239,8 @@ fn intra_threads() -> usize {
 impl Scorer for CrossEncoder {
     /// Pairs are tokenized together (`[CLS] query [SEP] text [SEP]`, with
     /// segment ids), then run in chunks of [`CHUNK`] in token-length order,
-    /// each chunk padded to its longest pair and masked.
+    /// each chunk padded to its longest pair and masked. At one pair per
+    /// chunk the order and the padding change nothing.
     fn score(&self, query: &str, texts: &[String]) -> Result<Vec<f32>> {
         let encodings = texts
             .iter()
@@ -308,7 +354,7 @@ impl RerankModelState {
     }
 
     /// Checks presence and size only, as `g-mesh model status` does: no
-    /// sha256 over the 91 MB weights. A same-size file with other bytes
+    /// sha256 over the 23 MB weights. A same-size file with other bytes
     /// reads `Present` here while the daemon refuses it.
     pub(crate) fn of(settings: RerankSettings) -> Self {
         if !settings.enabled {
