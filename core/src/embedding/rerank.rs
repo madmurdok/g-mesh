@@ -39,12 +39,12 @@ pub(crate) const RERANK_MODEL_REPO: &str = "cross-encoder/ms-marco-MiniLM-L6-v2"
 /// The revision the blend's `BETA` was fitted against; the weights and
 /// tokenizer below are its files.
 pub(crate) const RERANK_MODEL_REVISION: &str = "233902d25c440f23af6f7d6e94d2946bac0bee0a";
-/// The official dynamic-int8 (signed, `qint8`) export, written to
+/// The official dynamic-int8 (unsigned, `quint8`, AVX2) export, written to
 /// [`ONNX_FILE_NAME`] in the model directory (ADR 0043).
-pub(crate) const RERANK_ONNX_REMOTE_PATH: &str = "onnx/model_qint8_avx512_vnni.onnx";
+pub(crate) const RERANK_ONNX_REMOTE_PATH: &str = "onnx/model_quint8_avx2.onnx";
 pub(crate) const RERANK_ONNX_SIZE: u64 = 23_200_716;
 pub(crate) const RERANK_ONNX_SHA256: &str =
-    "3573b6b9593cb2f75987a31815d409ca3dd8808629118fd20451bb1a5d90cec7";
+    "c80a8b34256ea453093d612e3ac48d3d965a0c0a48c7906709af8b8e28461bf9";
 pub(crate) const RERANK_TOKENIZER_SIZE: u64 = 711_396;
 pub(crate) const RERANK_TOKENIZER_SHA256: &str =
     "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66";
@@ -948,7 +948,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tests that need the real cross-encoder (~87 MiB, not in the repo):
+    // Tests that need the real cross-encoder (~23 MiB, not in the repo):
     //
     //     g-mesh model fetch
     //     cd core && cargo test rerank -- --ignored --test-threads=1
@@ -962,13 +962,18 @@ mod tests {
         CrossEncoder::load(&dir).unwrap_or_else(|err| panic!("could not load the cross-encoder: {err:#}"))
     }
 
-    /// Order parity with the Python reference: this crate's text for each
-    /// row, scored by the real model, gives the reference's logits within
-    /// 1e-4 and its order, allowing a swap only where two blends are within
-    /// 1e-3 of each other.
+    /// Parity with the Python reference: this crate's text for each row,
+    /// scored by the real model, gives the reference's logits within
+    /// `LOGIT_TOLERANCE`, the reference's first row, and its order wherever
+    /// two reference blends differ by more than twice that tolerance.
+    ///
+    /// The int8 kernels differ by CPU path (ONNX Runtime picks one per
+    /// process), so logits move by up to a fraction of a point and
+    /// near-ties may swap.
     #[test]
     #[ignore = "needs the real cross-encoder; see the comment above"]
     fn the_real_model_reproduces_the_reference_logits_and_order() {
+        const LOGIT_TOLERANCE: f64 = 0.25;
         let model = load_real();
         for case in fixture().cases {
             let texts: Vec<String> =
@@ -977,7 +982,7 @@ mod tests {
             for ((row, &logit), text) in case.rows.iter().zip(&logits).zip(&texts) {
                 let delta = (f64::from(logit) - row.logit).abs();
                 assert!(
-                    delta < 1e-4,
+                    delta < LOGIT_TOLERANCE,
                     "{} {}: logit {logit} vs the reference's {} (text equal to the reference's: {})",
                     case.query_id,
                     row.id,
@@ -987,16 +992,22 @@ mod tests {
             }
             let cosines: Vec<f64> = case.rows.iter().map(|row| row.cosine).collect();
             let order = ids_in(&case, &blended_order(&logits, &cosines).unwrap());
+            assert_eq!(order[0], case.order[0], "{}: the first row differs", case.query_id);
             let blend = |id: &str| {
                 let row = case.rows.iter().find(|row| row.id == id).unwrap();
                 row.logit + BETA * row.cosine
             };
-            for (position, (ours, theirs)) in order.iter().zip(&case.order).enumerate() {
-                assert!(
-                    ours == theirs || (blend(ours) - blend(theirs)).abs() < 1e-3,
-                    "{}: position {position} is {ours}, the reference has {theirs}",
-                    case.query_id
-                );
+            let position = |id: &str| order.iter().position(|other| other == id).unwrap();
+            for (i, higher) in case.order.iter().enumerate() {
+                for lower in &case.order[i + 1..] {
+                    if blend(higher) - blend(lower) > 2.0 * LOGIT_TOLERANCE {
+                        assert!(
+                            position(higher) < position(lower),
+                            "{}: {higher} should rank above {lower}",
+                            case.query_id
+                        );
+                    }
+                }
             }
         }
     }

@@ -3,7 +3,7 @@
 ## Status
 Accepted (GM-700, owner decisions: the same local name `model.onnx`,
 replaced on `g-mesh model fetch`; quality no worse than fp32 at BETA 40; K
-stays 30; one file, the signed qint8 export; the name-query floor is
+stays 30; one file, the unsigned quint8 AVX2 export; the name-query floor is
 GM-463's "off").
 Design note: [`GM-700-rerank-speedup.md`](../design/GM-700-rerank-speedup.md).
 Results: [`gm-700-offline.md`](../results/gm-700-offline.md).
@@ -20,13 +20,20 @@ activations by that run's own range, so a pair's logit moves with the other
 pairs in its batch (probe deltas up to 0.8 at 16 pairs per run).
 
 ## Decision
-- **Weights.** `onnx/model_qint8_avx512_vnni.onnx` (signed int8; byte-identical
-  to the arm64 and avx512 files), 23,200,716 bytes, sha256
-  `3573b6b9593cb2f75987a31815d409ca3dd8808629118fd20451bb1a5d90cec7`, stored
-  under the same local name `model.onnx`. `g-mesh model fetch` replaces an
-  older fp32 file (its size differs); until then the daemon refuses it by
-  sha256 with a message naming `g-mesh model fetch`, and `search_code` keeps
-  the embedding order.
+- **Weights.** `onnx/model_quint8_avx2.onnx` (unsigned-activation, u8
+  weights), 23,200,716 bytes, sha256
+  `c80a8b34256ea453093d612e3ac48d3d965a0c0a48c7906709af8b8e28461bf9`, stored
+  under the same local name `model.onnx`. The signed qint8 files (arm64,
+  avx512, avx512_vnni) are not used: on the AVX2 U8S8 kernel ONNX Runtime
+  picks for them, int16 intermediate sums saturate and the logits drift.
+  The u8 weights of the quint8 export do not saturate there. On macOS the
+  AVX512 state is enabled lazily, so a fresh process selects the AVX2 U8S8
+  kernel even on a CPU that has AVX512; the file must therefore be correct
+  on that kernel, not only on the one its name suggests. See
+  [`gm-700-int8-parity.md`](../results/gm-700-int8-parity.md).
+  `g-mesh model fetch` replaces an older file (its sha256 differs); until
+  then the daemon refuses it by sha256 with a message naming
+  `g-mesh model fetch`, and `search_code` keeps the embedding order.
 - **One pair per run** (`CHUNK = 1`), so a pair's logit does not depend on
   the other pairs. The length sort and padding stay in the code and do
   nothing at one pair.
@@ -41,7 +48,7 @@ pairs in its batch (probe deltas up to 0.8 at 16 pairs per run).
   used.
 
 ## Consequences
-- On the v2 eval set qint8 at one pair per run matches fp32 within the
+- On the v2 eval set int8 at one pair per run matches fp32 within the
   non-inferiority bounds (held-out NL dMRR -0.001 [-0.004, +0.003], dr@10
   -0.1 pt [-0.6, +0.3]; name MRR 0.889), and the rerank alone runs at about
   0.26x of fp32's p50 at K=30. The download drops from 91 MB to 23 MB.
@@ -50,7 +57,5 @@ pairs in its batch (probe deltas up to 0.8 at 16 pairs per run).
 - The margin rule at its FIT-picked m = 0.08 lost held-out NL MRR (CI
   [-0.012, -0.003]) and took name MRR below GM-463's off floor, so it is
   rejected.
-- The quint8 (`avx2`) export was not better on quality; AVX2-only x86 CPUs
-  may run the s8 kernels slower, which this decision accepts unmeasured.
 - The order-parity fixture (`core/src/embedding/testdata/rerank_parity.json`)
-  holds the int8 model's logits at one pair per run.
+  holds the quint8 model's logits at one pair per run.

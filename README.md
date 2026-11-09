@@ -241,7 +241,7 @@ g-mesh model status   # where the weights are expected, and whether they're ther
 `model fetch` also downloads the cross-encoder `search_code` reranks with
 (see "Tools exposed"): `cross-encoder/ms-marco-MiniLM-L6-v2` at revision
 `233902d25c440f23af6f7d6e94d2946bac0bee0a`, its dynamic-int8 export
-(`onnx/model_qint8_avx512_vnni.onnx`, 23 MB, saved as `model.onnx`; an
+(`onnx/model_quint8_avx2.onnx`, 23 MB, saved as `model.onnx`; an
 older fp32 `model.onnx` is replaced), checked against a pinned SHA-256 like the
 embedding model, and again by the daemon when it loads it. `--no-rerank` skips
 it; `G_MESH_RERANK_MODEL_DIR` puts it elsewhere (`G_MESH_MODEL_DIR` names the
