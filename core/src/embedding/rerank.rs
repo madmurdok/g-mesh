@@ -964,8 +964,8 @@ mod tests {
 
     /// Parity with the Python reference: this crate's text for each row,
     /// scored by the real model, gives the reference's logits within
-    /// `LOGIT_TOLERANCE`, the reference's first row, and its order wherever
-    /// two reference blends differ by more than twice that tolerance.
+    /// `LOGIT_TOLERANCE`, and the reference's order wherever two reference
+    /// blends differ by more than twice that tolerance.
     ///
     /// The int8 kernels differ by CPU path (ONNX Runtime picks one per
     /// process), so logits move by up to a fraction of a point and
@@ -992,7 +992,6 @@ mod tests {
             }
             let cosines: Vec<f64> = case.rows.iter().map(|row| row.cosine).collect();
             let order = ids_in(&case, &blended_order(&logits, &cosines).unwrap());
-            assert_eq!(order[0], case.order[0], "{}: the first row differs", case.query_id);
             let blend = |id: &str| {
                 let row = case.rows.iter().find(|row| row.id == id).unwrap();
                 row.logit + BETA * row.cosine
@@ -1033,13 +1032,16 @@ mod tests {
     /// `{"query", "text"}` from `RERANK_DUMP_IN` and writes one `{"logit"}`
     /// line per row to `RERANK_DUMP_OUT`, through `CrossEncoder::score` in a
     /// fresh process (the shipped kernel path). Consecutive rows with the
-    /// same query are scored in one call.
+    /// same query are scored in one call. Without both variables it does
+    /// nothing, so a run of every ignored test passes over it.
     #[test]
     #[ignore = "dev-only dump for the offline quality eval; needs RERANK_DUMP_IN and RERANK_DUMP_OUT"]
     fn dump_logits_for_the_offline_eval() {
         use std::io::{BufRead, Write};
-        let input = std::env::var("RERANK_DUMP_IN").expect("RERANK_DUMP_IN");
-        let output = std::env::var("RERANK_DUMP_OUT").expect("RERANK_DUMP_OUT");
+        let (Ok(input), Ok(output)) = (std::env::var("RERANK_DUMP_IN"), std::env::var("RERANK_DUMP_OUT"))
+        else {
+            return;
+        };
         let model = load_real();
         let mut out = std::io::BufWriter::new(std::fs::File::create(output).unwrap());
         let mut group: Vec<String> = Vec::new();

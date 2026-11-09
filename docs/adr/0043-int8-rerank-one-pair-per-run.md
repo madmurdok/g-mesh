@@ -6,7 +6,9 @@ replaced on `g-mesh model fetch`; quality no worse than fp32 at BETA 40; K
 stays 30; one file, the unsigned quint8 AVX2 export; the name-query floor is
 GM-463's "off").
 Design note: [`GM-700-rerank-speedup.md`](../design/GM-700-rerank-speedup.md).
-Results: [`gm-700-offline.md`](../results/gm-700-offline.md).
+Results: [`gm-700-offline.md`](../results/gm-700-offline.md),
+[`gm-700-int8-parity.md`](../results/gm-700-int8-parity.md),
+[`gm-700-rust-quality.md`](../results/gm-700-rust-quality.md).
 Amends [ADR 0016](0016-cross-encoder-rerank.md) (the weights, the batching)
 and keeps [ADR 0042](0042-enriched-reranker-text.md)'s text and blend weight.
 
@@ -48,12 +50,13 @@ pairs in its batch (probe deltas up to 0.8 at 16 pairs per run).
   used.
 
 ## Consequences
-- On the v2 eval set int8 at one pair per run matches fp32 within the
-  non-inferiority bounds (held-out NL dMRR -0.001 [-0.004, +0.003], dr@10
-  -0.1 pt [-0.6, +0.3]; name MRR 0.889), and the rerank alone runs at about
-  0.26x of fp32's p50 at K=30. The download drops from 91 MB to 23 MB.
+- On the v2 eval set the shipped quint8 file, scored by this crate's
+  scorer, matches fp32 within the non-inferiority bounds (held-out NL dMRR
+  -0.002 [-0.005, +0.001], dr@10 +0.5 pt [-0.0, +1.0]; name MRR 0.891), and
+  int8 at one pair per run takes about 0.26x of fp32's rerank p50 at K=30
+  offline. The download drops from 91 MB to 23 MB.
 - The exact-name skip changes no held-out NL cell and name MRR by +0.001;
-  it skips 34% of name queries and none of the NL ones in that set.
+  it skips 608 of 1779 name queries and none of the NL ones in that set.
 - The margin rule at its FIT-picked m = 0.08 lost held-out NL MRR (CI
   [-0.012, -0.003]) and took name MRR below GM-463's off floor, so it is
   rejected.
