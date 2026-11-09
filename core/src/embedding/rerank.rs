@@ -1028,4 +1028,41 @@ mod tests {
             assert!((alone[0] - together[i]).abs() < 1e-4, "{i}: {} vs {}", alone[0], together[i]);
         }
     }
+
+    /// Dev-only dump for the offline quality eval: reads JSONL rows
+    /// `{"query", "text"}` from `RERANK_DUMP_IN` and writes one `{"logit"}`
+    /// line per row to `RERANK_DUMP_OUT`, through `CrossEncoder::score` in a
+    /// fresh process (the shipped kernel path). Consecutive rows with the
+    /// same query are scored in one call.
+    #[test]
+    #[ignore = "dev-only dump for the offline quality eval; needs RERANK_DUMP_IN and RERANK_DUMP_OUT"]
+    fn dump_logits_for_the_offline_eval() {
+        use std::io::{BufRead, Write};
+        let input = std::env::var("RERANK_DUMP_IN").expect("RERANK_DUMP_IN");
+        let output = std::env::var("RERANK_DUMP_OUT").expect("RERANK_DUMP_OUT");
+        let model = load_real();
+        let mut out = std::io::BufWriter::new(std::fs::File::create(output).unwrap());
+        let mut group: Vec<String> = Vec::new();
+        let mut group_query = String::new();
+        let flush = |query: &str, texts: &mut Vec<String>, out: &mut dyn Write| {
+            if texts.is_empty() {
+                return;
+            }
+            for logit in model.score(query, texts).unwrap() {
+                writeln!(out, "{}", serde_json::json!({ "logit": logit })).unwrap();
+            }
+            texts.clear();
+        };
+        for line in std::io::BufReader::new(std::fs::File::open(input).unwrap()).lines() {
+            let row: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let query = row["query"].as_str().unwrap();
+            if query != group_query {
+                flush(&group_query, &mut group, &mut out);
+                group_query = query.to_string();
+            }
+            group.push(row["text"].as_str().unwrap().to_string());
+        }
+        flush(&group_query, &mut group, &mut out);
+        out.flush().unwrap();
+    }
 }

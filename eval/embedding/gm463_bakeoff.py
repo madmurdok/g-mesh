@@ -73,12 +73,13 @@ REF = "ce-minilm"
 SHIP_BETA = 40.0  # GM-698's FIT-tuned beta of the shipped arm
 OFF_BETA = E.SHIPPED_BETA
 MODELS = [REF] + list(R.CE_BAKEOFF)
+RUST_SCORED = {"ce-minilm-quint8-rust"}  # logits come from the Rust dump (gm700_rust_pairs.py), never from ORT here
 NOT_SHIPPABLE = {"ce-jina-v2": "CC-BY-NC-4.0, reference only"}
 SCOPE_DEFAULT = {"ce-bge-m3": "nl"}
 PASSES_DEFAULT = {"ce-bge-m3": 1}
 BETA_MAX, BETA_MIN = 2560.0, 0.125
 # Section 3.5's latency order L6 L12 turbo gte jv2 bge; the arms run it, then mirrored.
-LAT_ORDER = ["ce-minilm", "ce-minilm-int8", "ce-minilm-quint8", "ce-minilm-l12", "ce-jina-turbo", "ce-gte-mb", "ce-gte-mb-int8", "ce-jina-v2", "ce-bge-m3"]
+LAT_ORDER = ["ce-minilm", "ce-minilm-int8", "ce-minilm-quint8", "ce-minilm-quint8-rust", "ce-minilm-l12", "ce-jina-turbo", "ce-gte-mb", "ce-gte-mb-int8", "ce-jina-v2", "ce-bge-m3"]
 L6_PAIR_TOKENS = 101.9  # gm-698-latency.md: enr mean pair tokens, same 30 queries, K=30, one decimal
 assert sorted(MODELS) == sorted(LAT_ORDER), (MODELS, LAT_ORDER)
 C3_PAIRS = 200
@@ -93,6 +94,7 @@ C8_SPEC = {  # name -> (ONNX input names, special-token layout of an encoded pai
     "ce-minilm-l12": (BERT_INPUTS, BERT_PAIR),
     "ce-minilm-int8": (BERT_INPUTS, BERT_PAIR),
     "ce-minilm-quint8": (BERT_INPUTS, BERT_PAIR),
+    "ce-minilm-quint8-rust": (BERT_INPUTS, BERT_PAIR),
     "ce-jina-turbo": (MASK_INPUTS, ROBERTA_PAIR),
     "ce-jina-v2": (MASK_INPUTS, ROBERTA_PAIR),
     "ce-gte-mb": (MASK_INPUTS, BERT_PAIR),
@@ -697,6 +699,11 @@ def quality(a):
                 line = f"DRY {m}: 0 pairs to score"
             print(line, flush=True)
             S.append(line)
+            continue
+        if m in RUST_SCORED:
+            if total:
+                sys.exit(f"STOP: {m} cache lacks {total} pairs; run gm700_rust_pairs.py import")
+            S.append(f"{m}: cache complete (Rust-scored); C3'/C3'-16 not applicable (rescoring would be Python)")
             continue
         if total and not a.controls_only:
             n, sec, eta = E.score_missing(cs, caches[m], need, ce, f"CE scoring {m}")

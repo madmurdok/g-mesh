@@ -110,6 +110,11 @@ _INT8_PIN["ce-gte-mb-int8"] = ("onnx/model_int8.onnx", "ecc6a0ae67cee3d898167802
 for _n, (_remote, _sha) in _INT8_PIN.items():
     CE_FILES[_n] = ({_remote: "model.onnx", "tokenizer.json": "tokenizer.json", "config.json": "config.json"},
                     {"model.onnx": _sha})
+# GM-700 S22: the quint8 file scored by the Rust CrossEncoder; same files, its own score cache.
+CE_BAKEOFF["ce-minilm-quint8-rust"] = CE_BAKEOFF["ce-minilm-quint8"]
+CE_DIR["ce-minilm-quint8-rust"] = CE_DIR["ce-minilm-quint8"]
+CE_FILES["ce-minilm-quint8-rust"] = CE_FILES["ce-minilm-quint8"]
+INT8_MODELS.add("ce-minilm-quint8-rust")
 MAX_TOKENS = 512
 BETAS = [0.0, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0]
 GRID_A = [-0.01, -0.005, 0.0, 0.005, 0.01, 0.02]
