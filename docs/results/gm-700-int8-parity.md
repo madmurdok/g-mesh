@@ -81,3 +81,7 @@ path) and `PROBE_AVX512` (run `vpxord zmm0, zmm0, zmm0` first); it tokenizes
 each fixture row's `text` like `CrossEncoder::score`, runs it at `[1, n]` and
 writes ids, type ids, mask and logit per pair. A Python script fed those exact
 inputs to onnxruntime sessions of each variant.
+
+## Owner decision (2026-11-09)
+
+"Перейти на quint8_avx2 (Recommended)". The product ships `onnx/model_quint8_avx2.onnx`, which has u8 weights and so does not saturate on the AVX2 kernel. This replaces the Q4 choice of qint8.

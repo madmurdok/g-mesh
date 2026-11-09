@@ -497,3 +497,4 @@ Quoted verbatim from the owner's answers:
 - **Q3:** "K=30, скорость за счёт int8 (Recommended)". K stays 30. The K=20 rows are reported for information only.
 - **Q4:** "Один файл, qint8 (Recommended)". One file, the signed qint8 export, unless S3 shows quint8 is better on quality.
 - **Q5:** "off из GM-463, строже (Recommended)". The name-query floor is GM-463's off: L6 on the structured text at beta 80. S3 measures it at K=30.
+- **Q4 revised (2026-11-09), after the int8 parity diagnosis (`docs/results/gm-700-int8-parity.md`):** "Перейти на quint8_avx2 (Recommended)". The product ships `model_quint8_avx2.onnx`.
