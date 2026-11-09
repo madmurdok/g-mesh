@@ -750,6 +750,71 @@ mod tests {
         assert!(err.contains("not the pinned"), "{err}");
     }
 
+    /// The refusal of a file that is not the pinned int8 weights tells the
+    /// user what to run.
+    ///
+    /// *Control:* remove the `Replace it: g-mesh model fetch` line from
+    /// `check_rerank_files` -> the message no longer names the command.
+    #[test]
+    fn a_refused_weights_file_names_the_fetch_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ONNX_FILE_NAME), "the fp32 weights, say").unwrap();
+        std::fs::write(dir.path().join(TOKENIZER_FILE_NAME), "{}").unwrap();
+        let err = check_rerank_files(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("g-mesh model fetch"), "{err}");
+        let load = CrossEncoder::load(dir.path()).err().unwrap().to_string();
+        assert!(load.contains("g-mesh model fetch"), "{load}");
+    }
+
+    /// (query, qualified name, whether the first row answers the query),
+    /// the expected values computed by `skip_flags` rule (a) in
+    /// `eval/embedding/gm463_bakeoff.py` (`split_words` of the query equal
+    /// to those of the last `::|[./#\\]` segment, both non-empty).
+    const CONFIDENT_TABLE: [(&str, &str, bool); 27] = [
+        ("parse config", "a::b::ParseConfig", true),
+        ("parse config", "a.parse_config", true),
+        ("parse config", "a/parseConfig", true),
+        ("parse config", "a#parseConfig", true),
+        ("parse config", "a\\ParseConfig", true),
+        ("parse config", "a.b.parse_config", true),
+        ("parse config", "a/b/parseConfig", true),
+        ("parse config", "a.b#parseConfig", true),
+        ("parse config", "a\\b\\ParseConfig", true),
+        ("PARSE CONFIG", "x::parse_config", true),
+        ("parse_config", "x::parseConfig", true),
+        ("gc outcome", "GcOutcome", true),
+        ("list_epics_with_status", "listEpicsWithStatus", true),
+        ("gc outcome", "mod::GcOutcome", true),
+        ("http server", "HTTPServer", true),
+        ("safe int 8", "safeInt8", true),
+        ("new", "Vec<T>::new", true),
+        ("foo", "a.b#Foo", true),
+        ("vec new", "Vec<T>::new", false),
+        ("parse", "a::b::parse_config", false),
+        ("parse config", "ParseConfigs", false),
+        ("parse config", "a#b.c", false),
+        ("a b", "a.b#Foo", false),
+        ("", "a::b", false),
+        ("anything", "a::", false),
+        ("anything", "a.b/", false),
+        ("anything", "", false),
+    ];
+
+    /// `confident` agrees with the eval's rule on every separator, on
+    /// casing, snake against camel case, an empty query or segment, and
+    /// generics.
+    ///
+    /// *Controls:* `confident` returns `false` -> the `true` rows fail;
+    /// drop `#` from `last_segment` -> `a#parseConfig` reads `a parse
+    /// config`; compare the words case-sensitively (skip `split_words`'
+    /// lowercase) -> `PARSE CONFIG` fails.
+    #[test]
+    fn confident_agrees_with_the_eval_rule() {
+        for (query, name, expected) in CONFIDENT_TABLE {
+            assert_eq!(confident(query, name), expected, "query {query:?}, name {name:?}");
+        }
+    }
+
     // --- how a daemon resolved its rerank ----------------------------------
 
     /// A scorer that is never asked to score: these tests only resolve.
@@ -923,7 +988,9 @@ mod tests {
     /// `Disabled` whatever is on disk.
     ///
     /// *Control:* drop the `enabled` check from `RerankModelState::of` ->
-    /// the switched-off case with files reads `Present`.
+    /// the switched-off case with files reads `Present`. Set
+    /// `RERANK_ONNX_SIZE` back to the fp32 file's size -> the fp32-size
+    /// directory reads `Present`.
     #[test]
     fn the_on_disk_state_is_judged_by_the_switch_and_the_pinned_sizes() {
         let settings = |enabled: bool, dir: Option<&Path>| RerankSettings {
@@ -938,12 +1005,20 @@ mod tests {
             .unwrap();
         let wrong_size = dir_with_both_files();
         let empty = tempfile::tempdir().unwrap();
+        // The size of the fp32 file the int8 model replaced (4.27.0's
+        // `RERANK_ONNX_SIZE`).
+        const FP32_ONNX_SIZE: u64 = 91_011_230;
+        assert_ne!(RERANK_ONNX_SIZE, FP32_ONNX_SIZE);
+        let fp32 = tempfile::tempdir().unwrap();
+        File::create(fp32.path().join(ONNX_FILE_NAME)).unwrap().set_len(FP32_ONNX_SIZE).unwrap();
+        File::create(fp32.path().join(TOKENIZER_FILE_NAME)).unwrap().set_len(RERANK_TOKENIZER_SIZE).unwrap();
 
         assert_eq!(RerankModelState::of(settings(true, Some(pinned.path()))), RerankModelState::Present);
         assert_eq!(RerankModelState::of(settings(false, Some(pinned.path()))), RerankModelState::Disabled);
         assert_eq!(RerankModelState::of(settings(true, Some(wrong_size.path()))), RerankModelState::Missing);
         assert_eq!(RerankModelState::of(settings(true, Some(empty.path()))), RerankModelState::Missing);
         assert_eq!(RerankModelState::of(settings(true, None)), RerankModelState::Missing);
+        assert_eq!(RerankModelState::of(settings(true, Some(fp32.path()))), RerankModelState::Missing);
         assert_eq!(RerankModelState::of(settings(false, None)), RerankModelState::Disabled);
     }
 
@@ -1011,6 +1086,11 @@ mod tests {
         }
     }
 
+    /// Exact equality: the int8 kernels give a row other logits in a batch
+    /// than alone, and `CHUNK` of 1 is what rules that out.
+    ///
+    /// *Control:* `CHUNK = 16` -> the single-row scores differ from the
+    /// batched ones.
     #[test]
     #[ignore = "needs the real cross-encoder; see the comment above"]
     fn scoring_is_deterministic_and_independent_of_the_batch() {
@@ -1024,7 +1104,7 @@ mod tests {
         assert_eq!(together, model.score("parse the config file", &texts).unwrap());
         for (i, text) in texts.iter().enumerate() {
             let alone = model.score("parse the config file", std::slice::from_ref(text)).unwrap();
-            assert!((alone[0] - together[i]).abs() < 1e-4, "{i}: {} vs {}", alone[0], together[i]);
+            assert_eq!(alone[0], together[i], "{i}");
         }
     }
 

@@ -1111,6 +1111,29 @@ mod tests {
         assert!(!output.contains("downloading"), "{output}");
     }
 
+    /// The fp32 file the int8 model replaced is not the pinned one, and
+    /// `fetch` downloads over it.
+    ///
+    /// *Controls:* `RERANK_ONNX_SIZE` back to the fp32 size -> `on_disk`
+    /// reads it `Pinned`; make `fetch_files` skip any file that exists ->
+    /// the stale bytes stay.
+    #[test]
+    fn a_stale_fp32_rerank_file_is_replaced_by_fetch() {
+        const FP32_ONNX_SIZE: u64 = 91_011_230;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join(RERANK_FILES[0].local_name);
+        File::create(&dest).unwrap().set_len(FP32_ONNX_SIZE).unwrap();
+        assert_eq!(on_disk(&dest, &RERANK_FILES[0]), OnDisk::Other(FP32_ONNX_SIZE));
+
+        let file = RemoteFile { local_name: RERANK_FILES[0].local_name, ..test_file() };
+        let agent = ureq::AgentBuilder::new().build();
+        let mut out = Vec::new();
+        fetch_files(&agent, dir.path(), &[file], &[Source::Flat(serve_once(TEST_BODY))], &mut out).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("replacing"), "{said}");
+        assert_eq!(fs::read(&dest).unwrap(), TEST_BODY);
+    }
+
     #[test]
     fn status_reports_a_missing_rerank_model_and_how_to_get_it() {
         let dir = tempfile::tempdir().unwrap();
