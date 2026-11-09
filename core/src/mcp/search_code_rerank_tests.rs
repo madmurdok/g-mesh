@@ -1239,5 +1239,5 @@ fn a_directory_with_the_old_fp32_file_fails_once_and_keeps_the_embedding_order()
     }
     let logged = lines.0.lock().unwrap().clone();
     assert_eq!(logged.len(), 1, "{logged:?}");
-    assert!(logged[0].contains("g-mesh model fetch"), "{logged:?}");
+    assert!(logged[0].contains("Replace it: g-mesh model fetch"), "{logged:?}");
 }
