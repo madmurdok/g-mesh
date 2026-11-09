@@ -43,3 +43,7 @@ Pooled K=30 p50 (mean of the two arm p50s): L6 fp32 585.5, L6 qint8 180.8, gte i
 ## Verdict
 
 Fail: gte int8 costs 8.68x the shipped qint8 L6 at K=30 (about 1.5 s p50 against 0.18 s). Per design 3.2 step 5 no quality re-score was run. GM-436 (distilling gte) proceeds as already decided. Adding gte int8 would also mean a 151 MB download.
+
+## Owner decision (2026-11-09)
+
+"gte int8 не берём, путь к ней через GM-436 (Recommended)". gte int8 does not ship. The route to gte-level quality is the GM-436 distillation.
