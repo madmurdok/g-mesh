@@ -51,6 +51,7 @@ BINS = {
     "t4": Path(os.environ.get("BIN_T4", "/private/tmp/claude-502/gm464s8/t4")),
     "t1": Path(os.environ.get("BIN_T1", "/private/tmp/claude-502/gm464s8/t1")),
     # GM-698/S16: base = release-4.26.0 binary, enr = the enriched-text branch binary (both rerank on)
+    "new": Path(os.environ.get("BIN_NEW", "/private/tmp/claude-502/gm464s8/t4")),  # GM-700/S26: branch tip
     "base": Path(os.environ.get("BIN_BASE", "/private/tmp/claude-502/gm698s16/base")),
     "enr": Path(os.environ.get("BIN_ENR", "/private/tmp/claude-502/gm698s16/enr")),
 }
@@ -188,10 +189,11 @@ def cpu_seconds(pid):
 def env_for(arm):
     env = dict(os.environ)
     env["G_MESH_HOME"] = str(H)
-    env["G_MESH_RERANK_MODEL_DIR"] = RERANK_DIR
+    # GM-700/S26: a model dir per arm (RDIR_BASE / RDIR_NEW), falling back to RERANK_DIR
+    env["G_MESH_RERANK_MODEL_DIR"] = os.environ.get("RDIR_" + arm.upper(), RERANK_DIR)
     env["G_MESH_PLUGIN_ROOTS_OVERRIDE"] = str(ROOT / "plugins")
     env.pop("G_MESH_RERANK", None)
-    if arm == "off":
+    if arm == "off":  # off runs the BIN_T4 binary (the caller points it at the new build)
         env["G_MESH_RERANK"] = "off"
     return env
 
@@ -293,9 +295,15 @@ def run_arm(arm, label):
         ms, res = timed(shim, qs[0])
         rec["first_ms"] = round(ms, 1)
         reordered = 0
+        top1 = []
         for i, q in enumerate(qs):  # warm-up pass, untimed
             _, res = timed(shim, q)
+            m_ = re.search(r'qualifiedName\\?"\s*:\s*\\?"([^"\\]*)', json.dumps(res))
+            top1.append(m_.group(1) if m_ else None)
             progress(f"{label} warmup", i + 1, len(qs))
+        rec["top1_qn"] = top1
+        rec["outcome_file"] = [(d / "rerank.outcome").read_text().strip()
+                               for d in state_dirs() if (d / "rerank.outcome").exists()]
         cpu0, w0 = cpu_seconds(dpid), time.time()
         samples = []
         total = PASSES * len(qs)
@@ -348,8 +356,9 @@ def main_run():
     for n, arm in enumerate(arms):
         label = f"{arm}#{n + 1}"
         progress(f"arm {label} start", n, len(arms))
+        aenv = dict(env, H=str(H) + ("-base" if arm == "base" else "-new"))  # GM-700/S26: one home per binary
         p = subprocess.run(["/usr/bin/time", "-p", sys.executable, __file__, "arm", arm, label],
-                           env=env, capture_output=True, text=True)
+                           env=aenv, capture_output=True, text=True)
         tp = dict(re.findall(r"^(real|user|sys)\s+([0-9.]+)", p.stderr, re.M))
         lines = [l for l in p.stdout.splitlines() if l.startswith("{")]
         if p.returncode != 0 or not lines:

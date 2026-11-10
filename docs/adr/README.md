@@ -5,7 +5,7 @@ This directory is the index and home for g-mesh's architecture decisions.
 ## Template
 
 New decisions get their own file: `docs/adr/NNNN-<slug>.md` (four-digit,
-zero-padded, incrementing — the next free number is `0043`). Use this
+zero-padded, incrementing — the next free number is `0044`). Use this
 template:
 
 ```markdown
@@ -113,3 +113,4 @@ Each decision made from here on gets its own file, added as a row here.
 | 0040 | [The rust server's sandbox denies network and writes outside its temp dir and the cargo caches](0040-rust-sandbox-denies-network-and-writes.md) | Accepted |
 | 0041 | [`g-mesh deps` reads the index directly after a daemon readiness wait](0041-deps-cli-reads-the-index-after-a-daemon-readiness-wait.md) | Accepted |
 | 0042 | [The cross-encoder reads an enriched text: enclosing, path words and a 48-token body](0042-enriched-reranker-text.md) | Accepted |
+| 0043 | [The rerank runs the int8 cross-encoder one pair per run, and skips an exact-name window](0043-int8-rerank-one-pair-per-run.md) | Accepted |

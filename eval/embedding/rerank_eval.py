@@ -66,7 +66,55 @@ CES = {  # name -> (Hugging Face id, pinned revision); files under <work>/models
     "ce-minilm": ("cross-encoder/ms-marco-MiniLM-L6-v2", "233902d25c440f23af6f7d6e94d2946bac0bee0a"),
     "ce-jina-tiny": ("jinaai/jina-reranker-v1-tiny-en", "aca45de6945b5dc6399abcd2a9c55ded5dc9111f"),
 }
-CE_DIR = {"ce-minilm": "ms-marco-MiniLM-L6-v2", "ce-jina-tiny": "jina-reranker-v1-tiny-en"}
+CE_BAKEOFF = {  # GM-463 candidates, kept out of CES: latency_only and main loop over every CES key
+    "ce-minilm-l12": ("cross-encoder/ms-marco-MiniLM-L12-v2", "7b0235231ca2674cb8ca8f022859a6eba2b1c968"),
+    "ce-jina-turbo": ("jinaai/jina-reranker-v1-turbo-en", "b8c14f4e723d9e0aab4732a7b7b93741eeeb77c2"),
+    "ce-jina-v2": ("jinaai/jina-reranker-v2-base-multilingual", "9cfeff2df7d40d1b78e75e5e9cebec92a99813c9"),
+    "ce-gte-mb": ("Alibaba-NLP/gte-reranker-modernbert-base", "f7481e6055501a30fb19d090657df9ec1f79ab2c"),
+    # the BAAI weights (953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e) exported to ONNX by onnx-community
+    "ce-bge-m3": ("onnx-community/bge-reranker-v2-m3-ONNX", "6f5ff65298512715a1e669753bc754d2bc8f367b"),
+    # GM-700: the official dynamic-int8 exports of the shipped L6 revision (same tokenizer), scored one pair per run
+    "ce-minilm-int8": ("cross-encoder/ms-marco-MiniLM-L6-v2", "233902d25c440f23af6f7d6e94d2946bac0bee0a"),
+    "ce-minilm-quint8": ("cross-encoder/ms-marco-MiniLM-L6-v2", "233902d25c440f23af6f7d6e94d2946bac0bee0a"),
+    # GM-700 S9: the official int8 export of the GM-463 gte revision
+    "ce-gte-mb-int8": ("Alibaba-NLP/gte-reranker-modernbert-base", "f7481e6055501a30fb19d090657df9ec1f79ab2c"),
+}
+INT8_MODELS = {"ce-minilm-int8", "ce-minilm-quint8", "ce-gte-mb-int8"}  # dynamic int8: a pair's logit depends on its batch, so chunk 1
+DEFAULT_CHUNK = 16
+CE_DIR = {"ce-minilm": "ms-marco-MiniLM-L6-v2", "ce-jina-tiny": "jina-reranker-v1-tiny-en",
+          "ce-minilm-l12": "ms-marco-MiniLM-L12-v2", "ce-jina-turbo": "jina-reranker-v1-turbo-en",
+          "ce-jina-v2": "jina-reranker-v2-base-multilingual", "ce-gte-mb": "gte-reranker-modernbert-base",
+          "ce-bge-m3": "bge-reranker-v2-m3",
+          "ce-minilm-int8": "ms-marco-MiniLM-L6-v2-qint8", "ce-minilm-quint8": "ms-marco-MiniLM-L6-v2-quint8",
+          "ce-gte-mb-int8": "gte-reranker-modernbert-base-int8"}
+_ONNX = {"onnx/model.onnx": "model.onnx", "tokenizer.json": "tokenizer.json", "config.json": "config.json"}
+# name -> ({remote path: local name}, {local name: pinned sha256 (Hugging Face LFS oid)}).
+# model.onnx_data keeps its name: ORT resolves the external weights by the name in the graph.
+CE_FILES = {
+    "ce-minilm-l12": (_ONNX, {"model.onnx": "2ac389ab6abe08dcbddf2c41a69b6a18853e0dca440adbc2abc1adfcee46483f"}),
+    "ce-jina-turbo": (_ONNX, {"model.onnx": "c1296c66c119de645fa9cdee536d8637740efe85224cfa270281e50f213aa565"}),
+    "ce-jina-v2": (_ONNX, {"model.onnx": "0ef3f7978f7bc52360864d74edc1a0e03d159af770a7767c4d5943496e616012",
+                           "tokenizer.json": "3a56def25aa40facc030ea8b0b87f3688e4b3c39eb8b45d5702b3a1300fe2a20"}),
+    "ce-gte-mb": (_ONNX, {"model.onnx": "c6d3226502addbcd4d2cf273802957ebf8a2a6bf94037dcb9b1d95bfc01e5d93"}),
+    "ce-bge-m3": (dict(_ONNX, **{"onnx/model.onnx_data": "model.onnx_data"}),
+                  {"model.onnx": "faae32b124a9d54afb7e89b5e9896e03c18a9552d56d1d6b273a709a83012486",
+                   "model.onnx_data": "f009aa6c6cf21986fd7e0021fa66b20ccce27abc6900a57c7109c8496811bcbe",
+                   "tokenizer.json": "8bf8afbfd11306bd872018c53bfdf2e160a56f8edbcf49933324404791c148d3"}),
+}
+# design GM-700 section 2.1 (sha256 recomputed after download by fetch_models.py --ce)
+_INT8_PIN = {"ce-minilm-int8": ("onnx/model_qint8_avx512_vnni.onnx",
+                                "3573b6b9593cb2f75987a31815d409ca3dd8808629118fd20451bb1a5d90cec7"),
+             "ce-minilm-quint8": ("onnx/model_quint8_avx2.onnx",
+                                  "c80a8b34256ea453093d612e3ac48d3d965a0c0a48c7906709af8b8e28461bf9")}
+_INT8_PIN["ce-gte-mb-int8"] = ("onnx/model_int8.onnx", "ecc6a0ae67cee3d898167802383112d9185ca9250e07bd5d1fa65019b050179d")
+for _n, (_remote, _sha) in _INT8_PIN.items():
+    CE_FILES[_n] = ({_remote: "model.onnx", "tokenizer.json": "tokenizer.json", "config.json": "config.json"},
+                    {"model.onnx": _sha})
+# GM-700 S22: the quint8 file scored by the Rust CrossEncoder; same files, its own score cache.
+CE_BAKEOFF["ce-minilm-quint8-rust"] = CE_BAKEOFF["ce-minilm-quint8"]
+CE_DIR["ce-minilm-quint8-rust"] = CE_DIR["ce-minilm-quint8"]
+CE_FILES["ce-minilm-quint8-rust"] = CE_FILES["ce-minilm-quint8"]
+INT8_MODELS.add("ce-minilm-quint8-rust")
 MAX_TOKENS = 512
 BETAS = [0.0, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0]
 GRID_A = [-0.01, -0.005, 0.0, 0.005, 0.01, 0.02]
@@ -371,24 +419,36 @@ def shipped_floors(repo):
 
 # --- rerankers ----------------------------------------------------------------
 class CrossEncoder:
-    def __init__(self, work, name, threads=0):
+    def __init__(self, work, name, threads=0, rust_like=False, chunk=None):
+        """rust_like: the session options of core/src/embedding/rerank.rs (level-3
+        graph optimisation, deterministic compute); off keeps ORT's defaults."""
         import onnxruntime as ort
         from tokenizers import Tokenizer
         d = work / "models" / CE_DIR[name]
         self.files = {f: sha256_file(d / f) for f in ("model.onnx", "tokenizer.json", "config.json")}
+        if (d / "model.onnx_data").exists():
+            self.files["model.onnx_data"] = sha256_file(d / "model.onnx_data")
+        self.chunk = chunk or (1 if name in INT8_MODELS else DEFAULT_CHUNK)
         self.tok = Tokenizer.from_file(str(d / "tokenizer.json"))
         self.tok.enable_truncation(MAX_TOKENS)
+        # score() pads each chunk itself and masks the pad; a tokenizer.json that
+        # enables padding would put pad ids under attention 1.
+        self.tok.no_padding()
         self.pad_id = next(i for i in (self.tok.token_to_id(t) for t in ("[PAD]", "<pad>")) if i is not None)
         assert self.pad_id is not None
         so = ort.SessionOptions()
         so.intra_op_num_threads = threads
+        if rust_like:
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            so.use_deterministic_compute = True
         self.sess = ort.InferenceSession(str(d / "model.onnx"), so, providers=["CPUExecutionProvider"])
         self.names = {i.name for i in self.sess.get_inputs()}
         self.threads = so.intra_op_num_threads
 
-    def score(self, query, texts, chunk=16):
+    def score(self, query, texts, chunk=None):
         """Logits for (query, text) pairs, run in length-sorted chunks so one long doc
         comment does not pad the whole batch to 512 tokens (padding is masked)."""
+        chunk = chunk or self.chunk
         enc = self.tok.encode_batch([(query, t) for t in texts])
         order = sorted(range(len(enc)), key=lambda i: len(enc[i].ids))
         out = np.zeros(len(enc))
