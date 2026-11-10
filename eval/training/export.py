@@ -7,9 +7,15 @@ From `<version>/queries.judged.jsonl`:
   2. refuses a texts folder rendered by other code (`render.texts_for`);
   3. sets each row's `split` from corpora.toml, by repo, and refuses a repo
      on both sides (`split_rows`);
-  4. writes `queries.jsonl`, `sample.md` (SAMPLE rows, seeded) and `card.md`;
-  5. runs `leak_guard.py --check` last; a hit fails the export;
-  6. writes `manifest.json`: pins, seeds, models, efforts, prompt sha256s, API
+  4. removes the previous export (queries.jsonl, sample.md, card.md,
+     manifest.json, guard.json, leaks.jsonl), writes the rows to
+     `queries.export.jsonl` and runs `leak_guard.py --check --dataset` on it;
+     a hit or a guard STOP fails the export, leaving only the staging file,
+     guard.json and leaks.jsonl (when the guard got that far);
+  5. on a clean guard whose guard.json names this staging file's sha256,
+     renames it to `queries.jsonl` and writes `sample.md` (SAMPLE rows,
+     seeded), `card.md` and
+  6. `manifest.json`: pins, seeds, models, efforts, prompt sha256s, API
      version, renderIds, the guard result, per-language counts and the sha256
      of every file of the version.
 `--repo-copy` also copies card.md, manifest.json and sample.md into
@@ -139,7 +145,13 @@ def main():
     for repo in names:
         for n in C.load_nodes(vdir, repo):
             nodes[n["key"]] = n
-    C.write_jsonl(vdir / "queries.jsonl", rows)
+    # Nothing of a previous export may survive a failed guard, and the card
+    # may only quote this run's guard.json.
+    for name in ("queries.jsonl", "sample.md", "card.md", "manifest.json", "guard.json", "leaks.jsonl"):
+        (vdir / name).unlink(missing_ok=True)
+    staging = vdir / "queries.export.jsonl"
+    C.write_jsonl(staging, rows)
+    staging_sha = C.sha256_file(staging)
 
     by_lang = defaultdict(list)
     for r in rows:
@@ -157,13 +169,24 @@ def main():
         "positivesPerQuery": C.quantiles([len(r["positives"]) for r in rows]),
     }
     stub = any((r["gen"] or {}).get("stub") for r in rows) or any((c["judge"] or {}).get("stub") for c in negs)
-    (vdir / "sample.md").write_text(sample_md(rows, nodes, args.version))
 
-    cmd = [sys.executable, str(C.HERE / "leak_guard.py"), "--version", args.version, "--check"]
+    cmd = [sys.executable, str(C.HERE / "leak_guard.py"), "--version", args.version, "--check",
+           "--dataset", str(staging)]
     if args.eval_work:
         cmd += ["--eval-work", args.eval_work]
     guard_rc = subprocess.run(cmd).returncode
-    guard = json.load(open(vdir / "guard.json"))
+    if guard_rc != 0:
+        sys.exit(f"STOP: the leak guard exited {guard_rc}; nothing exported. See its output, guard.json and "
+                 f"leaks.jsonl (if written); the rows are in {staging.name}")
+    guard_path = vdir / "guard.json"
+    guard = json.load(open(guard_path)) if guard_path.exists() else None
+    if not guard or guard.get("result") != "clean" or guard.get("datasetSha256") != staging_sha:
+        sys.exit(f"STOP: guard.json is missing, not clean or not this run's (datasetSha256 "
+                 f"{(guard or {}).get('datasetSha256')}, staging {staging_sha}); nothing exported")
+    staging.rename(vdir / "queries.jsonl")
+    guard["dataset"] = str(vdir / "queries.jsonl")
+    C.write_json(guard_path, guard)
+    (vdir / "sample.md").write_text(sample_md(rows, nodes, args.version))
     (vdir / "card.md").write_text(card_md(args.version, rows, repos, counts, guard, stub))
 
     targets_meta = json.load(open(vdir / "targets.meta.json"))
@@ -185,8 +208,6 @@ def main():
     }
     C.write_json(vdir / "manifest.json", manifest)
     print("export:", json.dumps({"rows": len(rows), "guard": guard["result"], **counts}))
-    if guard_rc != 0:
-        sys.exit("STOP: the leak guard found hits; see guard.json and leaks.jsonl")
     if args.repo_copy:
         for src, dst in (("card.md", f"card/{args.version}.md"), ("manifest.json", f"manifest/{args.version}.json"),
                          ("sample.md", f"sample/{args.version}.md")):

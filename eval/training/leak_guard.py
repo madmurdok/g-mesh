@@ -9,19 +9,25 @@ studies' authored files and `v2/queries/mechanical/<c>.jsonl` the GM-398
 mechanical file:
   - query texts, positive and absent, mechanical included;
   - symbol keys per study and corpus, `sample_targets.exclusion` (consumed
-    targets plus every expected symbol), with their code read from the eval
-    snapshots and checkouts under `--eval-work`.
+    targets plus every expected symbol of the authored queries) plus every
+    expected symbol of the mechanical queries, with their code read from the
+    eval snapshots (each sqlite checked against SQLITE_PINS and its
+    snapshot.json) and checkouts under `--eval-work`.
 
 Checks, each naming the rows it fires on:
   1 repo-identity   a training repo's normalised URL or root commit equals an
                     eval corpus's (catches forks);
   2 exact-code      a positive or negative whose whitespace-normalised span
                     sha256 equals an eval key's (catches vendored copies);
-  3 code-neardup    shingle Jaccard >= CODE_JACCARD (SHINGLE-grams of
+  3 code-neardup    shingle Jaccard or containment of the eval span in the
+                    training span >= CODE_JACCARD (SHINGLE-grams of
                     `bm25::terms` tokens, spans of >= MIN_TOKENS tokens);
+                    containment catches an eval function copied inside a
+                    larger Type/Module/File node;
   4 query-jaccard   word Jaccard >= QUERY_JACCARD with any eval query text
                     (`v2/neardup.py` tokens); also run on the generator
-                    prompt's few-shot texts;
+                    prompt's few-shot texts (a prompt with no ```fewshot
+                    block is an error);
   5 query-embed     jina int8 cosine >= COSINE with any eval query text
                     (Python onnxruntime, mean pooling, L2; vectors cached by
                     text sha256 under work/qvec-cache).
@@ -31,7 +37,8 @@ Checks, each naming the rows it fires on:
              positive; the single negative of a negative-code hit) and
              leaks.jsonl;
   --pooling-check RUN_DIR   compare Python query vectors with a Rust run's
-             query_vectors.bin on its first N queries.
+             query_vectors.bin on its first N queries; exit 1 below
+             POOLING_BAR.
 
 Every run writes guard.json beside the dataset: per-check hit counts and the
 nearest-eval cosine and Jaccard distributions.
@@ -59,6 +66,21 @@ STUDIES = ("", "confirm", "v2/new")
 EVAL_CORPORA = ("gin", "py-requests", "ripgrep", "g-mesh", "excalidraw", "task-tracker-mcp")
 MODEL_DIR = "models/jina-v2-base-code-int8"
 MAX_TOKENS = 1024
+# Python vs Rust query-vector cosine floor (GM-456/S9 L1): vectors agree to
+# cos 1.000000 up to 15 tokens and drift from 16 (min 0.99478 over 2279
+# queries; likely the int8 GEMM kernels of the two ORT builds); 0 verdict
+# flips at COSINE over 2.6M pairs.
+POOLING_BAR = 0.994
+
+# sha256 of each eval snapshot sqlite, equal to its <c>.snapshot.json record.
+SQLITE_PINS = {
+    "excalidraw": "3c7bcb4601c64f93bf8b6b043f8140f8b0f9781a6e292e0b236fdfd2102dca4d",
+    "g-mesh": "1fd9a1563cd55afa2eb9be061735dc56394027ad061bfac64e2ac0c65d03fd02",
+    "gin": "1e013b7630a1f154dbe946ca243ee881d5dfe0bea9861816a100c74b4e068c62",
+    "py-requests": "d24c70266c36a27af0d923c8fc6ab65d37cdad3c0a71d8c7c7c38de3e8afe7fd",
+    "ripgrep": "d00f8a256d17c0cda5fe81c1a0c744a697d8c2cce9d5a6075e11f9ff3954aca0",
+    "task-tracker-mcp": "6e2381ba9123712a3114c5a6127fe4f29e0a27e372147ac392c8ad2ce74041ff",
+}
 
 # sha256 of every eval file the guard reads, relative to eval/embedding.
 # GM-398 and GM-422 authored files agree with v2/build.py's PINNED.
@@ -200,7 +222,8 @@ def eval_queries(eval_root):
 
 
 def eval_keys(eval_root):
-    """{corpus: {(filePath, qualifiedName)}} over the three studies."""
+    """{corpus: {(filePath, qualifiedName)}} over the three studies: the
+    `exclusion` keys plus the expected symbols of the mechanical queries."""
     root = Path(eval_root)
     keys = defaultdict(set)
     for study in STUDIES:
@@ -209,6 +232,10 @@ def eval_keys(eval_root):
             if (d / "targets" / f"{c}.jsonl").exists():
                 k, _ = exclusion(str(d), c)
                 keys[c] |= k
+            mech = d / "queries" / "mechanical" / f"{c}.jsonl"
+            if mech.exists():
+                keys[c] |= {(e["filePath"], e["qualifiedName"]) for q in C.read_jsonl(mech)
+                            for e in q.get("expected", [])}
     return keys
 
 
@@ -228,6 +255,10 @@ def eval_spans(eval_work, keys):
         head = git(checkout, "rev-parse", "HEAD")
         if head != record["revision"]:
             sys.exit(f"STOP: eval checkout {checkout} is at {head}, its snapshot at {record['revision']}")
+        db_sha = C.sha256_file(work / f"{c}.sqlite")
+        if c not in SQLITE_PINS or db_sha != SQLITE_PINS[c] or db_sha != record["sha256"]:
+            sys.exit(f"STOP: eval snapshot {work / f'{c}.sqlite'} sha256 {db_sha}, "
+                     f"pinned {SQLITE_PINS.get(c)}, snapshot.json {record['sha256']}")
         conn = sqlite3.connect(f"file:{work / f'{c}.sqlite'}?mode=ro", uri=True)
         rows = conn.execute("SELECT filePath, qualifiedName, startLine, endLine FROM nodes").fetchall()
         conn.close()
@@ -401,7 +432,10 @@ def code_hits(dataset_keys, nodes, ev_spans):
         for s in sh:
             for j in index.get(s, ()):
                 shared[j] += 1
-        best = max(((n / (len(sh) + len(ev_sh[j][1]) - n), j) for j, n in shared.items()), default=(0.0, None))
+        # max of Jaccard and containment |A & B| / |B_eval| (an eval span
+        # copied inside a larger training node)
+        best = max(((max(n / (len(sh) + len(ev_sh[j][1]) - n), n / len(ev_sh[j][1])), j)
+                    for j, n in shared.items()), default=(0.0, None))
         if best[0] >= CODE_JACCARD:
             hits.append((k, "code-neardup", ev_sh[best[1]][0], round(best[0], 4)))
     return hits
@@ -470,6 +504,8 @@ def run_guard(rows, nodes, train_repos, eval_root, eval_work, prompt_path, cache
         if j >= QUERY_JACCARD:
             hits.append({"check": "query-jaccard", "rows": [r["id"]], "eval": eid, "score": round(j, 4)})
     fewshot = fewshot_texts(Path(prompt_path).read_text())
+    if not fewshot:
+        sys.exit(f"STOP: {prompt_path} has no ```fewshot block (or it is empty)")
     for t, (j, eid) in zip(fewshot, nearest_jaccard(fewshot, ev_texts)):
         if j >= QUERY_JACCARD:
             hits.append({"check": "query-jaccard", "rows": [], "prompt": t, "eval": eid, "score": round(j, 4)})
@@ -494,7 +530,8 @@ def run_guard(rows, nodes, train_repos, eval_root, eval_work, prompt_path, cache
         "evalQueries": len(ev_texts),
         "evalKeySpans": len(ev_spans),
         "fewshotTexts": len(fewshot),
-        "thresholds": {"codeJaccard": CODE_JACCARD, "queryJaccard": QUERY_JACCARD, "cosine": COSINE,
+        "thresholds": {"codeJaccard": CODE_JACCARD, "codeMeasure": "max(jaccard, containment)",
+                       "queryJaccard": QUERY_JACCARD, "cosine": COSINE,
                        "shingle": SHINGLE, "minTokens": MIN_TOKENS},
         "nearestEvalCosine": {"quantiles": C.quantiles([c for c, _ in cos]),
                               "histogram": C.histogram([c for c, _ in cos],
@@ -561,7 +598,7 @@ def main():
     if args.pooling_check:
         res = pooling_check(args.pooling_check, args.eval_root, eval_work, cache, args.count, args.threads)
         print(json.dumps(res, indent=2))
-        sys.exit(0 if res["minCosine"] >= 0.999 else 1)
+        sys.exit(0 if res["minCosine"] >= POOLING_BAR else 1)
 
     if not args.version and not args.dataset:
         ap.error("--version or --dataset")

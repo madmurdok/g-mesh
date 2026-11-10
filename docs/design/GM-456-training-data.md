@@ -259,11 +259,14 @@ manifest matches. It is cached under the data dir.
   (read at S2 time from the files and the freeze records) and checked before
   use.
 - Eval symbol keys per study and corpus: the consumed targets plus every
-  expected symbol. This is exactly `sample_targets.exclusion(study_dir,
-  corpus)` (`sample_targets.py:94`), applied to `eval/embedding`,
-  `eval/embedding/confirm` and `eval/embedding/v2/new`. Their code comes from
-  the eval snapshots (`--eval-work`, default the main checkout's
-  `eval/embedding/work`).
+  expected symbol of the authored and the mechanical queries. That is
+  `sample_targets.exclusion(study_dir, corpus)` (`sample_targets.py:94`,
+  authored queries only) applied to `eval/embedding`,
+  `eval/embedding/confirm` and `eval/embedding/v2/new`, plus the `expected`
+  keys of each study's `queries/mechanical/<c>.jsonl` (GM-456/S9 M1). Their
+  code comes from the eval snapshots (`--eval-work`, default the main
+  checkout's `eval/embedding/work`); each snapshot sqlite's sha256 is pinned
+  in the script and must equal its `snapshot.json` record.
 - The dataset (`queries`, `positives`, `negatives`) and
   `prompts/generate.md`.
 
@@ -274,11 +277,14 @@ manifest matches. It is cached under the data dir.
    This catches forks.
 2. **Exact code.** No positive or negative has a whitespace-normalised span
    sha256 equal to an eval key's. This catches vendored copies.
-3. **Code near-duplicate.** Shingle Jaccard (5-grams of `bm25::terms`-style
+3. **Code near-duplicate.** Shingle Jaccard, or containment of the eval
+   span's shingles in the training span (an eval function copied inside a
+   larger node, GM-456/S9 L2), (5-grams of `bm25::terms`-style
    tokens, spans of at least 20 tokens) >= 0.7 against any eval key.
 4. **Query word Jaccard.** Jaccard >= 0.4 against any eval query text, with
    the tokens of `v2/neardup.py:7` (`[A-Za-z0-9]+`, lowercased). The same
-   check runs on the prompt's few-shot texts.
+   check runs on the prompt's few-shot texts; a prompt with no few-shot
+   block is an error.
 5. **Query embedding near-duplicate.** Cosine >= 0.90 with jina int8 (Python
    onnxruntime, mean pooling, the local `work/models/jina-v2-base-code-int8`)
    between any training query and any eval query. Vectors are cached by the
@@ -289,7 +295,10 @@ distribution on the pilot. If more than 2% of rows would drop, the owner
 picks the threshold at S6.
 
 `--filter` writes the dataset minus the hits and a `leaks.jsonl`. `--check`
-exits non-zero on any hit. The exporter runs `--check` last.
+exits non-zero on any hit. The exporter runs `--check` last, on a staging
+file: it first deletes the previous export and `guard.json`, and writes
+`queries.jsonl`, `sample.md`, `card.md` and `manifest.json` only on a clean
+guard whose `guard.json` names the staging file's sha256.
 
 **D3 decision: code near-duplicates by shingles, not embeddings.**
 
@@ -438,8 +447,14 @@ S2 makes no API calls.
     code says it is optional (`queries.rs:78`).
   - `onnxruntime` 1.19.2 and `tokenizers` 0.22.2 are present (both checked
     today). The jina int8 model is in `work/models`.
-  - Python mean pooling is sane: on 20 eval queries, cosine >= 0.999 to
-    the Rust `query_vectors.bin`.
+  - Python mean pooling is sane: on 20 eval queries, cosine >= 0.994 to
+    the Rust `query_vectors.bin` (`POOLING_BAR`; bar lowered from 0.999 at
+    GM-456/S9 L1, accepted). Measured over 2279 queries of the six GM-465
+    int8-structured runs: vectors exact (cos 1.000000) up to 15 tokens,
+    drift from 16 tokens (min 0.99478), likely the int8 GEMM kernels of the
+    two ONNX Runtime builds (Rust ort-sys 2.0.0-rc.9 vs Python 1.19.2); the
+    guard compares Python with Python, and 0 verdicts flip at 0.90 over
+    2.6M pairs.
 - **S6 step 0:**
   - The frame of every repo, and the quotas; replace a repo that is too
     small.
