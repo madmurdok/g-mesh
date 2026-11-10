@@ -29,7 +29,7 @@ Two pieces of work came after the task text, and the note covers both:
 
 | # | decision | recommendation |
 |---|---|---|
-| D1 | Repo set and per-language counts (section 1) | 23 repos. 4,000 targets: Rust 1,600, Go 800, Python 800, TS 800 |
+| D1 | Repo set and per-language counts (section 1) | 24 repos. 4,000 targets: Rust 1,600, Go 800, Python 800, TS 800 |
 | D2 | Generator: API batch or Claude Code agents (section 2) | **API Message Batches**, Opus 5.5 generates, Sonnet 5.5 judges. About $48 for the full run (about $62 with margin), about $1.5 for the pilot |
 | D3 | Code near-duplicates: shingle Jaccard instead of embeddings (section 4) | Shingles for code; embeddings and word Jaccard for queries |
 | D4 | Teacher scores (section 6) | **Defer to GM-436.** Store the candidate lists and mining scores here |
@@ -100,7 +100,7 @@ quotas.
 
 | option | benefit | risk |
 |---|---|---|
-| **a. 23 repos, 4,000 targets, Rust 40% (recommended)** | Many repos per language, so the model learns no single repo's style. The dev split is by repo | 23 clones and indexes. A few repos (rich, bat) are large |
+| **a. 24 repos, 4,000 targets, Rust 40% (recommended)** | Many repos per language, so the model learns no single repo's style. The dev split is by repo | 24 clones and indexes. A few repos (rich, bat) are large |
 | b. 2 repos per language, 2,000 targets | Half the cost and setup | The model can memorise repo idiom, and the dev split has one repo per language |
 
 ## 2. Generator
