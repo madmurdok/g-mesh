@@ -82,7 +82,7 @@ The 49.6% / 22.6% figures in GM-697 (design D5, table S2: "NL CW pos 338/681", "
 
 ### What a threshold buys (operating points)
 
-Method: for each signal, the threshold is the score that keeps a given share of right reranked top rows on FIT (the 10th percentile of the right rows' scores for 90%). "Caught" is the share of wrong-or-absent tops below it. The same threshold is then applied unchanged to held-out. Rows are those of S1's `collect` (FIT 215 right / 592 wrong+absent; held-out 247 / 598). The helper script was a scratch file and is not committed. It ran in 7.7 s real / 5.6 s user (`load 2.49 8.93 17.98`). If refusals were random, keeping 90% of right tops would catch 10% of bad ones.
+Method: for each signal, the threshold is the score that keeps a given share of right reranked top rows on FIT (the 10th percentile of the right rows' scores for 90%). "Caught" is the share of wrong-or-absent tops below it. The same threshold is then applied unchanged to held-out. Rows are those of S1's `collect` (FIT 215 right / 592 wrong+absent; held-out 247 / 598). Reproduce with `python3 eval/embedding/gm699_operating_point.py --work ../g-mesh-wt-gm463/eval/embedding/v2/work`. It prints JSON with every number below and ran in 12.8 s real / 10.3 s user (`load 2.29 6.74 15.92`). If refusals were random, keeping 90% of right tops would catch 10% of bad ones.
 
 | keep right (FIT) | threshold | cosine caught FIT / HO | blend caught FIT / HO | logit caught FIT / HO |
 |---|---|---|---|---|
