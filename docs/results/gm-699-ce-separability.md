@@ -75,3 +75,41 @@ The 49.6% / 22.6% figures in GM-697 (design D5, table S2: "NL CW pos 338/681", "
 - Logits: Rust `CrossEncoder::score` cache `v2/work/rerank_cache_gm700_rust` (key `82d82801c3afcafb`, variant `ce-minilm-quint8-rust`), from GM-700's S22 dump. It holds all 102,917 K=30 pairs of all 3431 queries; every FIT and held-out pair was found (a missing one raises KeyError), so nothing was dumped or rebuilt. Logits exist for every window including skipped ones; no FIT query was skipped.
 - Cosine/windows: `v2/work/runs/jina-v2-base-code-int8-structured`; queries `eval/embedding/v2/queries` (via the harness loader). Floors parsed from `core/src/mcp/similarity.rs`.
 - Run: 162 s real / 158 s user on a quiet machine (`load 3.8 11.4 19.8` at the end), Python 3 with numpy, no ORT run.
+
+## Verdict
+
+**Conditional yes.** A blend-score threshold is worth designing as an *additional* soft signal on the rerank-on path, not as a replacement for the GM-697 cosine floors. It must first beat the shipped floor on the same page (condition below). It is not worth turning reranking on for.
+
+### What a threshold buys (operating points)
+
+Method: for each signal, the threshold is the score that keeps a given share of right reranked top rows on FIT (the 10th percentile of the right rows' scores for 90%). "Caught" is the share of wrong-or-absent tops below it. The same threshold is then applied unchanged to held-out. Rows are those of S1's `collect` (FIT 215 right / 592 wrong+absent; held-out 247 / 598). The helper script was a scratch file and is not committed. It ran in 7.7 s real / 5.6 s user (`load 2.49 8.93 17.98`). If refusals were random, keeping 90% of right tops would catch 10% of bad ones.
+
+| keep right (FIT) | threshold | cosine caught FIT / HO | blend caught FIT / HO | logit caught FIT / HO |
+|---|---|---|---|---|
+| 90% | one pooled | 18.9% / 18.2% | 25.7% / 24.7% | 25.3% / 23.7% |
+| 90% | per language | 19.4% (115/592) / 17.4% (104/598) | 32.3% (191/592) / 30.4% (182/598) | 28.4% / 29.8% |
+| 80% | one pooled | 35.6% / 32.1% | 49.3% / 43.1% | 40.0% / 39.0% |
+| 80% | per language | 36.3% (215/592) / 33.8% (202/598) | 50.5% (299/592) / 46.8% (280/598) | 49.8% / 48.2% |
+
+The held-out shares of right tops kept, at the per-language 90% points, are cosine 92.3% (228/247) and blend 93.5% (231/247). At the 80% points they are 81.8% and 86.2%.
+
+Paired bootstrap on FIT (2000 resamples, seed 699, threshold refitted in every resample), blend caught minus cosine caught, 95% CI:
+- keep 90%, one pooled threshold: [-2.4, +16.9] points. Not separated.
+- keep 90%, per language: [+2.8, +22.8] points.
+- keep 80%, one pooled threshold: [0.0, +23.4] points.
+- keep 80%, per language: [+3.1, +24.5] points.
+
+Per language at 90% (FIT, blend vs cosine): rust 44.8% vs 22.4%, python 31.4% vs 18.9%, go 28.0% vs 16.7%, typescript 22.1% vs 19.1%. Rust gains most and typescript barely moves. The per-language thresholds rest on 42-59 right rows each. Held-out mostly keeps them, but rust held-out keeps only 85.1% at the 90% point.
+
+### Reading
+
+- **Effect size.** At about 90% of right tops kept, the blend flags about 30% of wrong/absent tops against about 18% for cosine on the same reranked row. That is roughly +12 points, or 1.7x, and it replicates on held-out. Still, about 70% of wrong tops pass unflagged. Refused pages are about 88-92% wrong at that point, against a 73% base rate. This is a better warning, not a no-answer detector.
+- **Against what ships today.** The shipped floors judge the *cosine-order* page (`judged` in `handle`). On held-out NL they give the soft note at about 78% kept (144/184 right tops unflagged) and catch 43.3% (286/661 = 159 wrong positives + 127 absent; Control 2 / GM-697 table S2). The blend at a matched ~80% FIT keep catches 46.8% held-out, keeping 86.2%. That is a different page with a different right rate (247 vs 184 of 845 right), so the two are not paired. The blend's margin over today's verdict is therefore unproven and may be small. Most of the visible gain in right rows comes from the rerank itself, not from the refusal signal.
+- **Where it could act.** All of these are prose (authored) queries, and the product gives prose pages only the soft `lowSimilarity` sentence, never `noMatch`. A blend signal would therefore tune a soft note. Name queries, the hard-verdict population, already meet the 3% misled budget at the shipped floors (GM-697 exit verdict) and were not measured here.
+- **Cost.** The logits exist only when reranking runs, which costs about +285 ms at p50 at K=30 (`gm-700-latency.md`, new vs off). On that path the signal costs nothing extra, because the logit and blend are already computed in `blended_order`. Off that path it does not exist, so the cosine floors stay the only verdict for rerank-off users and for the name path. The ~12-point gain does not justify enabling reranking for it.
+
+### Condition and follow-up scope (if taken)
+
+Condition: on held-out NL, the combined rule "shipped floor on the cosine page, **or** blend below a per-language threshold on the reranked page" must catch more wrong/absent pages than the floor alone, at a matched kept-right share. That needs a paired bootstrap CI that excludes 0, and a check that name-query misled stays at or below 3%.
+
+Follow-up task: (1) fit per-language blend thresholds on FIT for the rerank-on path and measure the combined rule against the floor alone on held-out, paired, NL and names. (2) If the condition holds, design the soft-note wiring: `handle` needs the reranked top-1 blend next to `judged`, and the ADR 0012 addendum documents the constants. If it fails, close with a "floors only" note.
