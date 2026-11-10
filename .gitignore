@@ -20,6 +20,7 @@
 /eval/embedding/work/
 /eval/embedding/confirm/work/
 /eval/embedding/v2/work/
+/eval/training/work
 
 # BlueprintAI output (model.json, report.html, cache/, work/).
 /.blueprint/
