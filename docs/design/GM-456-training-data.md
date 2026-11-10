@@ -30,7 +30,7 @@ Two pieces of work came after the task text, and the note covers both:
 | # | decision | recommendation |
 |---|---|---|
 | D1 | Repo set and per-language counts (section 1) | 24 repos. 4,000 targets: Rust 1,600, Go 800, Python 800, TS 800 |
-| D2 | Generator: API batch or Claude Code agents (section 2) | **API Message Batches**, Opus 5.5 generates, Sonnet 5.5 judges. About $48 for the full run (about $62 with margin), about $1.5 for the pilot |
+| D2 | Generator: API batch or Claude Code agents (sections 2, 2b) | **Changed by the owner to "Агенты Claude Code"**: headless `claude -p` per pack on the subscription, no tools, Opus 5.5 generates, Sonnet 5.5 judges (section 2b). Cost is measured by `/usage` around the 100-target pilot. The API route (section 2) is superseded |
 | D3 | Code near-duplicates: shingle Jaccard instead of embeddings (section 4) | Shingles for code; embeddings and word Jaccard for queries |
 | D4 | Teacher scores (section 6) | **Defer to GM-436.** Store the candidate lists and mining scores here |
 | D5 | Data location (section 5) | Outside git, at `~/Projects/ClaudeProjects/g-mesh-data/gm456/<version>/`. Commit the card, the manifest and a sample |
@@ -104,6 +104,8 @@ quotas.
 | b. 2 repos per language, 2,000 targets | Half the cost and setup | The model can memorise repo idiom, and the dev split has one repo per language |
 
 ## 2. Generator
+
+> **Superseded in part.** The API route below (Message Batches, batch ids, API cost model, option table) is replaced by section 2b. The per-target content, the prompt rules and the `overlap`/`docEcho` checks still hold.
 
 **Per target.** The model reads the full code span (capped at 150 lines),
 the untrimmed doc, the file path and the parent. It never sees a trimmed
@@ -200,6 +202,145 @@ eval queries" becomes a brief rule instead of a structural fact.
 | **a. API Message Batches, Opus 5.5 generates, Sonnet 5.5 judges (recommended)** | Exact recorded cost. Prompt and responses stored byte for byte. The generator structurally cannot read eval files. No agent re-read overhead | Needs an API key and about $60 of spend. The batch can take up to 24 h |
 | b. Claude Code agents on the subscription | No API dollars | About 100M tokens of limit (to be measured). Not blind to eval files by construction. Agent output is less uniform |
 | c. API, Haiku 5.5 for both | About $2 | Lower query quality and a likely higher false-negative rate. S7 would measure it, but after the money and time are spent |
+
+## 2b. Generation and judging on Claude Code (replaces D2's API route)
+
+The owner chose "Агенты Claude Code": generation and judging run on the
+Claude Code subscription, with no API key. Flags below come from
+`claude --help` of Claude Code 2.1.319 (`claude --version`, 2026-11-10). One
+probe was run (a schema-constrained "ok=true" on Sonnet, no tools, in an
+empty scratch dir): exit 0, 4.8 s real, and the result JSON shape quoted in
+2b.4.
+
+**Recommendations:** a Python driver that runs one headless `claude -p` per
+pack with **no tools at all**; generation packs of 10 targets on Opus 5.5,
+judging packs of 5 targets on Sonnet 5.5, both `--effort low`; 3 calls at
+once; the CLI's `structured_output` is wrapped into a message dict that the
+existing `parse_message` functions read unchanged.
+
+### 2b.1 Driver
+
+| option | benefit | risk |
+|---|---|---|
+| **a. Script: one `claude -p` per pack (recommended)** | Runs in `run_pipeline.sh` in the background with no orchestrator. The prompt is the whole input, so no tools are needed and the call is one model turn plus the structured-output turn (the probe reported `num_turns: 2`). Per-pack JSON with usage. Resumable per file | Each call pays CLI start-up (about 2 s) and a small fixed context. Subscription rate limits can stop a run midway (handled by 2b.4) |
+| b. Packs dispatched as subagents by the orchestrating session | No new driver code | About 1,200 dispatches (400 + 800) or 300+ with large packs: every result lands in the orchestrator's context and is re-read on each later turn. Subagents run in a checkout containing `eval/embedding` and have tools, so blindness is a brief rule only. Output shape is not schema-enforced |
+
+### 2b.2 Pack size and models
+
+| step | pack | calls (4,000 targets) | model | effort | why |
+|---|---|---|---|---|---|
+| generate | 10 targets (`PER_REQUEST`, unchanged) | 400 | `claude-opus-5-5` (`--model`) | `--effort low` | `build_requests` already groups 10; about 10k input and 3-4k output per call; a bad pack costs 10 targets |
+| judge | 5 targets (today 1) | 800 | `claude-sonnet-5-5` | `--effort low` | 1 target per call would be 4,000 calls whose fixed context is a large share of 3.8k input. The schema gains `t` (target index) per verdict |
+
+Thinking stays the CLI default (adaptive); only effort is set. `--fallback-model`
+is **not** used: a silent model switch would mix generators. An option for
+the owner: judging on Opus too (higher quality, more limit), decided after
+the pilot from the S7 false-negative check.
+
+### 2b.3 Eval blindness
+
+Structural, not a brief rule. Each call runs with:
+
+- `--tools ""`: no built-in tools, so nothing on disk is readable;
+- `--strict-mcp-config` and no `--mcp-config`: no MCP servers (the g-mesh
+  MCP would otherwise expose indexed code);
+- `--setting-sources ""`, `--disable-slash-commands`: no user/project
+  settings, hooks or skills;
+- `--system-prompt <prompts/generate.md text>`: replaces the default system
+  prompt;
+- cwd = a fresh empty dir under `$TMPDIR/gm456-<version>/<pack>/`, outside any
+  git repo, so no project `CLAUDE.md` is discovered;
+- `--no-session-persistence`, `--permission-prompts none`, and the input
+  piped on stdin.
+
+`--bare` would also drop auto-memory and the user `CLAUDE.md`, but it needs
+`ANTHROPIC_API_KEY`, so it is not usable here.
+
+Check, once per run, recorded in the manifest: a probe call with
+`--output-format stream-json --verbose` and the same flags. Its `init`
+event must list `tools: []` and `mcp_servers: []`. If not, the run stops.
+Per pack: `permission_denials == []` and `num_turns <= 2`. **To confirm in
+the code slice:** whether the user `~/.claude/CLAUDE.md` and auto-memory still
+reach the context (the probe's 3.4k input tokens suggest not). They contain no
+eval text, but they cost tokens per call. The leak guard (section 4) still
+runs on every output.
+
+### 2b.4 Output contract, failures, concurrency
+
+Call: `claude -p --model M --effort low --output-format json --json-schema
+<SCHEMA as JSON> --system-prompt <prompt> <flags of 2b.3>`, user message
+(today's `params.messages[0].content`) on stdin. The CLI returns one JSON
+object. The fields used are `subtype`, `is_error`, `api_error_status`,
+`terminal_reason`, `structured_output`, `usage`, `modelUsage` (keyed by model
+id), `total_cost_usd`, `num_turns`, `session_id` and `duration_ms`. The driver
+turns it into the dict `parse_message` already reads:
+
+```
+{"model": <only key of modelUsage>, "stop_reason": "end_turn" | "refusal",
+ "content": [{"type": "text", "text": json.dumps(structured_output)}],
+ "usage": <usage>}
+```
+
+So `generate.parse_message` (:162) and `judge.parse_message` (:130) stay as
+they are. The judge's version maps `t` to the pack's target.
+
+| outcome | detected by | action |
+|---|---|---|
+| success | `subtype == "success"`, `structured_output` present | write `responses/gen/<custom_id>.json` (tmp file + rename), parse |
+| refusal | `stop_reason`/`terminal_reason` says refusal | record in `*-skipped.jsonl`, never retried |
+| malformed / missing `structured_output`, wrong counts | parse problems | recorded; packs are retried only by an explicit `--retry <custom_id>...` after a person reads the reason |
+| rate or usage limit (`api_error_status` 429, limit text) | `is_error` | **stop the whole run** (no sleep loop); resume later |
+| transient (5xx, overloaded, CLI crash) | non-zero exit or 5xx | one retry, logged with the reason; a second failure is recorded and the run continues |
+
+Resumability: a pack whose `responses/<step>/<custom_id>.json` exists is
+never rerun; failures go to `<custom_id>.err.json` and do not block a resume.
+Concurrency: 3 calls at once (`--jobs 3`, a thread pool of subprocesses),
+each under `taskpolicy -b`. The limit is the subscription, not the CPU, so
+low priority mainly means few calls at a time and stopping at the first
+limit error.
+
+### 2b.5 Cost measurement
+
+- Pilot (100 targets: 10 gen calls, about 20 judge calls): the owner reads
+  `/usage` before and after. Full-run estimate = delta x 40, plus 30%
+  margin. If the delta shows the run would not fit in the owner's window,
+  the owner splits the run over several days (resume handles that).
+- Per pack, `responses/<step>-usage.jsonl` logs `custom_id`, `usage`
+  (input, cache creation, cache read, output, `thinking_tokens`),
+  `num_turns`, `duration_ms` and `total_cost_usd`. The probe shows
+  `costBasis: "list"`: it is a list-price equivalent, not money spent, and
+  it gives a second extrapolation to check the `/usage` one against.
+- The summary prints totals per step, so the pilot gives tokens per target to
+  compare with section 2's estimates (+-2x).
+
+### 2b.6 Reproducibility record
+
+The manifest's `generation`/`judging` blocks lose `apiVersion` and batch ids
+and store: `driver: "claude-cli"`, `claudeVersion` (`claude --version`), the
+model id from `modelUsage`, effort, prompt sha256, schema sha256, the exact
+argv template, pack size, the blindness probe's `init` tools/MCP lists, and
+the sha256 of every `responses/<step>/<custom_id>.json` (the raw CLI output
+with `session_id` is the artefact of record). The output is not reproducible;
+the stored outputs are.
+
+### 2b.7 Edit map for the code slice
+
+| where | change |
+|---|---|
+| new `eval/training/claude_cli.py` | `run_pack(request, schema, prompt, cwd_root, model, effort)` builds argv (2b.3), runs `claude -p`, returns the CLI JSON; `to_message(cli_json)` (2b.4); `classify(cli_json, rc)`; `run_packs(requests, step_dir, jobs)` with skip-if-done, the retry rule and stop-on-limit; `probe_blindness()` |
+| `generate.py` docstring (:1-28), `API_VERSION` (:43), `client` (:207) | Replace `--submit/--collect` with `--run [--jobs N] [--retry ID...]`. Drop `API_VERSION` and `client`. `build_requests` (:90) is unchanged |
+| `generate.py main` (:215, submit/collect branch :246-281) | `--run`: `claude_cli.run_packs`, then the existing parse loop over the stored files via `to_message` |
+| `judge.py` `SCHEMA` (:41), `build_requests` (:76) | Group 5 targets per request (`targets`, per-target `queries`/`candidates`), add `t` to the verdict items |
+| `judge.py parse_message` (:130), `main` (:147, :183-214), import (:32) | Index by `t`; `--run` as in generate; import `custom_id` only |
+| `export.py` manifest (:193-207) | Fields of 2b.6 in place of `apiVersion` (:203) |
+| `run_pipeline.sh` (:9-14, :75-90) | A `--live` mode that runs `generate.py --run` and `judge.py --run` in-line (no hand-off stop); `--stub` unchanged |
+| tests | `to_message`/`classify` on recorded CLI JSON fixtures (success, refusal, 429, missing output); a pack already done is not rerun; argv contains `--tools ""` and `--strict-mcp-config` |
+
+**Code-slice end to end:** `run_pipeline.sh --version v0.1-cli --live --count
+5 mini-redis`. That is 1 generate call on Opus (5 targets) and 1-2 judge calls
+on Sonnet through real `claude -p`, plus the blindness probe, then export and
+`leak_guard --check`. The run is re-launched once to show that no pack reruns.
+Cost: a few cents of limit; `total_cost_usd` is logged.
 
 ## 3. Hard negatives
 
