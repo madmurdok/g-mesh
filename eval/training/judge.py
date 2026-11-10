@@ -165,7 +165,10 @@ def parse_message(request, message, prompt_sha):
             continue
         seen.add((v["t"], v["c"]))
         if len(v["verdicts"]) != len(t["queries"]):
-            problems.append(f"t{v['t']} c{v['c']}: {len(v['verdicts'])} verdicts for {len(t['queries'])} queries")
+            # Alignment to q1..qn is unknown: no pair of this entry is judged, so export stops on them.
+            problems.append(f"t{v['t']} c{v['c']}: {len(v['verdicts'])} verdicts for {len(t['queries'])} queries;"
+                            " entry dropped")
+            continue
         for q, verdict in zip(t["queries"], v["verdicts"]):
             out[(q, t["candidates"][v["c"] - 1])] = {
                 "verdict": verdict, "model": message.get("model", MODEL), "promptSha256": prompt_sha,
@@ -219,12 +222,11 @@ def main():
     verdicts, skipped = {}, []
     for req in requests:
         cid = req["custom_id"]
-        out, err = resp / "judge" / f"{cid}.json", resp / "judge" / f"{cid}.err.json"
-        if not out.exists():
-            e = json.load(open(err)) if err.exists() else {"outcome": "not run", "reason": None}
-            skipped.append({"customId": cid, "reason": f"{e['outcome']}: {e['reason']}"})
+        cli, why = claude_cli.stored(req, resp / "judge")
+        if cli is None:
+            skipped.append({"customId": cid, "reason": why})
             continue
-        got, problems = parse_message(req, claude_cli.to_message(json.load(open(out))), prompt_sha)
+        got, problems = parse_message(req, claude_cli.to_message(cli), prompt_sha)
         if got is None:
             skipped.append({"customId": cid, "reason": problems})
             continue

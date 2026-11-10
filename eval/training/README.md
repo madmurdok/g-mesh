@@ -66,7 +66,8 @@ writes `<version>/summary.txt`. With `--live` the generate and judge stages
 run `generate.py --run` / `judge.py --run`: one headless `claude -p` per pack
 with no tools, MCP servers or settings sources (`claude_cli.py`, design
 section 2b). A usage limit stops the run; relaunching the same command reruns
-no stored pack. With neither `--stub` nor `--live` it stops after each
+no pack stored for the same request (a pack whose request changed is set aside
+under `responses/<step>/stale/` and rerun). With neither `--stub` nor `--live` it stops after each
 `--dry-run`; resume with `--from mine` or `--from export`.
 
 ```

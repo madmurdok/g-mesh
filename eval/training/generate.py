@@ -14,7 +14,9 @@ Modes (one per run):
               one headless `claude -p` per request (`claude_cli`, section 2b),
               raw CLI results stored as `responses/gen/<custom_id>.json` (the
               artefact of record), failures as `<custom_id>.err.json`; a pack
-              with either is not rerun unless `--retry` names it. Then every
+              with either for the same request is not rerun unless `--retry`
+              names it; files for a changed request are moved to
+              `responses/gen/stale/` and the pack reruns. Then every
               stored response is parsed; parse problems go to
               `responses/gen-skipped.jsonl`. Exits 3 on a usage limit.
 
@@ -194,6 +196,9 @@ def parse_message(request, message, nodes, targets_by_key, prompt_sha):
             query_row(t, node, "s1p", "sentence", pp[0], gen, paraphrase_of=f"{base}-s1", answers_also=also),
             query_row(t, node, "s2p", "sentence", pp[1], gen, paraphrase_of=f"{base}-s2", answers_also=also),
         ]
+    missing = sorted(set(by_n) - {e["n"] for e in data["targets"]})
+    if missing:
+        problems.append(f"no entry for targets n {missing}")
     return rows, problems
 
 
@@ -243,12 +248,11 @@ def main():
     rows, skipped = [], []
     for req in requests:
         cid = req["custom_id"]
-        out, err = resp / "gen" / f"{cid}.json", resp / "gen" / f"{cid}.err.json"
-        if not out.exists():
-            e = json.load(open(err)) if err.exists() else {"outcome": "not run", "reason": None}
-            skipped.append({"customId": cid, "reason": f"{e['outcome']}: {e['reason']}"})
+        cli, why = claude_cli.stored(req, resp / "gen")
+        if cli is None:
+            skipped.append({"customId": cid, "reason": why})
             continue
-        got, problems = parse_message(req, claude_cli.to_message(json.load(open(out))), nodes, targets_by_key,
+        got, problems = parse_message(req, claude_cli.to_message(cli), nodes, targets_by_key,
                                       prompt_sha)
         if got is None:
             skipped.append({"customId": cid, "reason": problems})

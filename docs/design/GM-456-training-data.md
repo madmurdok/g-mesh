@@ -259,7 +259,9 @@ Structural, not a brief rule. Each call runs with:
 Check, once per run, recorded in the manifest: a probe call with
 `--output-format stream-json --verbose` and the same flags. Its `init`
 event must list `tools: []` and `mcp_servers: []`. If not, the run stops.
-Per pack: `permission_denials == []` and `num_turns <= 2`. The leak guard
+Per pack: `permission_denials == []`. More than 2 turns is not a breach: the
+CLI re-prompts when the structured output fails the schema, and StructuredOutput
+is the only tool. The leak guard
 (section 4) still runs on every output.
 
 **Confirmed (S23):** the user `~/.claude/CLAUDE.md` and auto-memory do not
@@ -300,12 +302,19 @@ they are. The judge's version maps `t` to the pack's target.
 |---|---|---|
 | success | `subtype == "success"`, `structured_output` present | write `responses/gen/<custom_id>.json` (tmp file + rename), parse |
 | refusal | `stop_reason`/`terminal_reason` says refusal | record in `*-skipped.jsonl`, never retried |
-| malformed / missing `structured_output`, wrong counts | parse problems | recorded; packs are retried only by an explicit `--retry <custom_id>...` after a person reads the reason |
-| rate or usage limit (`api_error_status` 429, limit text) | `is_error` | **stop the whole run** (no sleep loop); resume later |
-| transient (5xx, overloaded, CLI crash) | non-zero exit or 5xx | one retry, logged with the reason; a second failure is recorded and the run continues |
+| malformed / missing `structured_output`, wrong counts | parse problems | recorded; packs are retried only by an explicit `--retry <custom_id>...` after a person reads the reason. A judge entry whose verdict list length differs from its query count is dropped whole (its pairs stay unjudged, so export stops); a gen target missing from the response is reported |
+| rate or usage limit (`api_error_status` 429 as int or string, `429` or limit text in the result or stderr) | `is_error` or no JSON | **stop the whole run** (no sleep loop); resume later |
+| transient (5xx, overloaded, CLI crash) | non-zero exit or 5xx | one retry, logged with the reason; a second failure is recorded and the run continues. A transient whose retry a stop prevented is not recorded, so the resume runs it |
 
-Resumability: a pack whose `responses/<step>/<custom_id>.json` exists is
-never rerun; failures go to `<custom_id>.err.json` and do not block a resume.
+Resumability: every stored response carries the sha256 of the request it
+answers (model, effort, system prompt, schema, user message) in
+`<custom_id>.req-sha256`, and every `<custom_id>.err.json` its
+`requestSha256`. A pack with a response or failure for the same request is
+never rerun (failures only by `--retry`); one whose request changed (a
+regenerated target regrouping judge packs, `--count` growing a gen pack) or
+whose `custom_id` left the request set is stale: `--run` moves its files to
+`responses/<step>/stale/<time>/` and reruns the pack, and the parse step never
+reads a stale file. Stops exit 3.
 Concurrency: 3 calls at once (`--jobs 3`, a thread pool of subprocesses),
 each under `taskpolicy -b`. The limit is the subscription, not the CPU, so
 low priority mainly means few calls at a time and stopping at the first
@@ -331,8 +340,10 @@ The manifest's `generation`/`judging` blocks lose `apiVersion` and batch ids
 and store: `driver: "claude-cli"`, `claudeVersion` (`claude --version`), the
 model id from `modelUsage`, effort, prompt sha256, schema sha256, the exact
 argv template, pack size, the blindness probe's `init` tools/MCP lists, and
-the sha256 of every `responses/<step>/<custom_id>.json` (the raw CLI output
-with `session_id` is the artefact of record). The output is not reproducible;
+the sha256 of every current `responses/<step>/<custom_id>.json` (the raw CLI
+output with `session_id` is the artefact of record), and `sessions`: one entry
+per `--run` that ran packs (time, `claudeVersion`, probe, packs pending), so
+responses from an earlier CLI version stay distinguishable. The output is not reproducible;
 the stored outputs are.
 
 ### 2b.7 Edit map for the code slice
