@@ -7,20 +7,23 @@
 # output to <version>/logs/<stage>.log.
 #
 # usage: eval/training/run_pipeline.sh --version v0.0-stub [--stub] [--count N]
-#          [--skip-setup] [--threads 2] [--bin target/release/g-mesh] <repo>...
-#   --stub   stub queries and stub judge verdicts, no API call (the S2 run).
-#   Without --stub the generate and judge stages stop at --dry-run: the
-#   batches are submitted and collected by hand (generate.py/judge.py
-#   --submit/--collect), then the run is resumed with --from mine / export.
+#          [--live [--jobs 3]] [--skip-setup] [--threads 2] [--bin target/release/g-mesh] <repo>...
+#   --stub   stub queries and stub judge verdicts, no model call (the S2 run).
+#   --live   generate.py --run and judge.py --run in-line: headless `claude -p`
+#            per pack (section 2b). A usage limit stops the run; relaunching
+#            the same command skips every pack already stored.
+#   With neither, the generate and judge stages stop at --dry-run.
 # Run from the repository root.
 set -euo pipefail
 
-version=""; stub=0; count=""; skip_setup=0; threads=2; bin="target/release/g-mesh"; from="setup"
+version=""; stub=0; live=0; jobs=3; count=""; skip_setup=0; threads=2; bin="target/release/g-mesh"; from="setup"
 repos=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) version="$2"; shift 2 ;;
     --stub) stub=1; shift ;;
+    --live) live=1; shift ;;
+    --jobs) jobs="$2"; shift 2 ;;
     --count) count="$2"; shift 2 ;;
     --skip-setup) skip_setup=1; shift ;;
     --threads) threads="$2"; shift 2 ;;
@@ -30,6 +33,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$version" ] || { echo "--version is required" >&2; exit 2; }
+[ $stub -eq 1 ] && [ $live -eq 1 ] && { echo "--stub and --live exclude each other" >&2; exit 2; }
 
 data="${GM456_DATA:-$HOME/Projects/ClaudeProjects/g-mesh-data/gm456}"
 vdir="$data/$version"
@@ -52,7 +56,7 @@ stage() {  # stage <name> <command...>: timed, logged, fail-fast
     exit 1
   fi
   grep -E '^(real|user|sys) ' "$vdir/logs/$name.log" | tr '\n' ' ' >> "$summary"; echo >> "$summary"
-  grep -E '^(nodes |sample:|render |generate|mine:|judge|leak_guard:|  nearest-eval|export:|collect:)' \
+  grep -E '^(nodes |sample:|render |generate|mine:|judge|leak_guard:|  nearest-eval|export:|collect:|run |STOP)' \
     "$vdir/logs/$name.log" | cut -c1-2000 >> "$summary" || true
 }
 
@@ -76,17 +80,22 @@ for s in $order; do
       if [ $stub -eq 1 ]; then
         stage generate-dry $py "$tdir/generate.py" --version "$version" --dry-run
         stage generate $py "$tdir/generate.py" --version "$version" --stub
+      elif [ $live -eq 1 ]; then
+        stage generate-dry $py "$tdir/generate.py" --version "$version" --dry-run
+        stage generate $py "$tdir/generate.py" --version "$version" --run --jobs "$jobs"
       else
         stage generate-dry $py "$tdir/generate.py" --version "$version" --dry-run
-        note "generate: submit with generate.py --submit, collect, then resume with --from mine"; exit 0
+        note "generate: run generate.py --run (or relaunch with --live), then resume with --from mine"; exit 0
       fi ;;
     mine) stage mine $py "$tdir/mine.py" --version "$version" --bin "$bin" --threads "$threads" ;;
     judge)
       if [ $stub -eq 1 ]; then
         stage judge $py "$tdir/judge.py" --version "$version" --dry-run --stub-verdict
+      elif [ $live -eq 1 ]; then
+        stage judge $py "$tdir/judge.py" --version "$version" --run --jobs "$jobs"
       else
         stage judge-dry $py "$tdir/judge.py" --version "$version" --dry-run
-        note "judge: submit with judge.py --submit, collect, then resume with --from export"; exit 0
+        note "judge: run judge.py --run (or relaunch with --live), then resume with --from export"; exit 0
       fi ;;
     export) stage export $py "$tdir/export.py" --version "$version" ;;
   esac

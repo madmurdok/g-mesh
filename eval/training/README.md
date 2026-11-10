@@ -51,7 +51,7 @@ bash eval/training/setup_work.sh mini-redis
 python3 eval/training/nodes.py    --version v0.0-stub --repo mini-redis
 python3 eval/training/sample.py   --version v0.0-stub --count 50
 python3 eval/training/render.py   --version v0.0-stub
-python3 eval/training/generate.py --version v0.0-stub --stub        # or --dry-run / --submit / --collect
+python3 eval/training/generate.py --version v0.0-stub --stub        # or --dry-run / --run [--jobs 3]
 python3 eval/training/mine.py     --version v0.0-stub --threads 2
 python3 eval/training/judge.py    --version v0.0-stub --dry-run --stub-verdict
 python3 eval/training/export.py   --version v0.0-stub              # runs leak_guard --check last
@@ -62,6 +62,13 @@ python3 eval/training/leak_guard.py --pooling-check <eval work>/runs-gm465/jina-
 ```
 
 `run_pipeline.sh` runs every stage under `taskpolicy -b`, fails fast, and
-writes `<version>/summary.txt`. Without `--stub` it stops after each
-`--dry-run` so the batches can be submitted and collected by hand; resume with
-`--from mine` or `--from export`.
+writes `<version>/summary.txt`. With `--live` the generate and judge stages
+run `generate.py --run` / `judge.py --run`: one headless `claude -p` per pack
+with no tools, MCP servers or settings sources (`claude_cli.py`, design
+section 2b). A usage limit stops the run; relaunching the same command reruns
+no stored pack. With neither `--stub` nor `--live` it stops after each
+`--dry-run`; resume with `--from mine` or `--from export`.
+
+```
+bash eval/training/run_pipeline.sh --version v0.1-cli --live --count 5 --skip-setup mini-redis
+```

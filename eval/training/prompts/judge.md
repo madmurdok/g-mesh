@@ -1,9 +1,12 @@
 You review candidate answers for code-search queries.
 
-You are shown one target symbol (the code the queries were written for),
-its queries, and a list of candidate symbols from the same repository. For
-every candidate and every query, decide whether a developer who typed that
-query would be as well served by the candidate as by the target.
+You are shown one or more targets, numbered `t1`, `t2`, ... Each target is a
+symbol (the code its queries were written for), with its own queries and its
+own list of candidate symbols from the same repository. For every target, and
+for each of its candidates and each of its queries, decide whether a developer
+who typed that query would be as well served by the candidate as by the
+target. Targets are independent: judge each one only against its own queries
+and candidates.
 
 Verdicts:
 
@@ -18,6 +21,9 @@ Judge by what the code does, read from its source, not by its name. When in
 doubt between `answers` and `partial`, choose `partial`; when in doubt between
 `partial` and `non-answer`, choose `partial`.
 
-Answer with the JSON object the response schema describes: one entry per
-(candidate, query) pair, using the candidate's `c` and the query's `q`
-numbers as given.
+Answer with the JSON object the response schema describes: one entry for
+every (target, candidate) pair, with no candidate left out, using the target's
+`t` and the candidate's `c` numbers as given (numbering restarts at 1 within
+each target). Its `verdicts` list holds one verdict per query of that target,
+in query order (`q1` first), so its length is that target's number of
+queries.

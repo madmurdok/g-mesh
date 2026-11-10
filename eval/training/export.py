@@ -15,8 +15,10 @@ From `<version>/queries.judged.jsonl`:
   5. on a clean guard whose guard.json names this staging file's sha256,
      renames it to `queries.jsonl` and writes `sample.md` (SAMPLE rows,
      seeded), `card.md` and
-  6. `manifest.json`: pins, seeds, models, efforts, prompt sha256s, API
-     version, renderIds, the guard result, per-language counts and the sha256
+  6. `manifest.json`: pins, seeds, the generation and judging records
+     (`claude_cli.run_record`: driver, Claude Code version, models, effort,
+     prompt and schema sha256s, argv template, pack size, blindness probe,
+     sha256 of every stored CLI response), renderIds, the guard result, per-language counts and the sha256
      of every file of the version.
 `--repo-copy` also copies card.md, manifest.json and sample.md into
 eval/training/ (`card/<version>.md`, `manifest/<version>.json`,
@@ -34,6 +36,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import claude_cli
 import common as C
 import generate
 import judge
@@ -121,6 +124,16 @@ def file_hashes(vdir, skip=("manifest.json",)):
     return out
 
 
+def step_record(vdir, step, prompt, pack_size, stub):
+    """The manifest block of a step: its CLI run record, or, for a step that
+    never ran on the CLI, the prompt sha256 and pack size with driver `stub`
+    (stub data) or `none`."""
+    rec = claude_cli.run_record(Path(vdir) / "responses", step)
+    if rec is not None:
+        return rec
+    return {"driver": "stub" if stub else "none", "promptSha256": C.sha256_file(prompt), "packSize": pack_size}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", required=True)
@@ -197,10 +210,8 @@ def main():
         "licenceFiles": {r: (C.work_dir() / "licences" / f"{r}.tsv").read_text().splitlines()
                          for r in names if (C.work_dir() / "licences" / f"{r}.tsv").exists()},
         "seeds": {"sample": targets_meta["seed"]},
-        "generation": {"model": generate.MODEL, "effort": generate.EFFORT,
-                       "promptSha256": C.sha256_file(generate.PROMPT), "perRequest": generate.PER_REQUEST},
-        "judging": {"model": judge.MODEL, "effort": judge.EFFORT, "promptSha256": C.sha256_file(judge.PROMPT)},
-        "apiVersion": generate.API_VERSION,
+        "generation": step_record(vdir, "gen", generate.PROMPT, generate.PER_REQUEST, stub),
+        "judging": step_record(vdir, "judge", judge.PROMPT, judge.PER_REQUEST, stub),
         "renderIds": render_ids,
         "guard": {k: guard[k] for k in ("result", "hitsPerCheck", "rowsFlaggedShare", "thresholds", "pinsVerified")},
         "counts": counts,

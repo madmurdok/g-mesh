@@ -3,19 +3,22 @@
 (docs/design/GM-456-training-data.md, section 2).
 
 Modes (one per run):
-  --dry-run   build the Message Batches requests (`responses/gen-requests.jsonl`)
+  --dry-run   build the requests (`responses/gen-requests.jsonl`)
               and print their size; no API call.
   --stub      write clearly-labelled stub queries (`gen.model = "stub"`): the
               doc's first sentence as the sentence and its first 7 words as
               the phrase; without a doc, "placeholder stub ..." texts around
               the name's words (bare name words would match the eval's
               mechanical name queries). For pipeline tests only.
-  --submit    build the requests and submit one batch (needs the `anthropic`
-              SDK and a credential); records the batch id.
-  --collect   fetch a submitted batch's results into `responses/gen-results.jsonl`
-              (the stored responses are the artefact of record) and parse them.
+  --run [--jobs N] [--retry ID...]
+              one headless `claude -p` per request (`claude_cli`, section 2b),
+              raw CLI results stored as `responses/gen/<custom_id>.json` (the
+              artefact of record), failures as `<custom_id>.err.json`; a pack
+              with either is not rerun unless `--retry` names it. Then every
+              stored response is parsed; parse problems go to
+              `responses/gen-skipped.jsonl`. Exits 3 on a usage limit.
 
-Each request carries up to PER_REQUEST targets after the cached system prompt.
+Each request carries up to PER_REQUEST targets after the system prompt.
 The model sees the span (capped at SPAN_CAP lines), the untrimmed doc, the
 file path and the parent; never a trimmed form. A refusal
 (`stop_reason == "refusal"`) is logged and its targets skipped.
@@ -31,16 +34,15 @@ import argparse
 import json
 import re
 import sys
-import time
 from pathlib import Path
 
+import claude_cli
 import common as C
 from check_queries import overlap
 from gm423_token_lengths import first_paragraph
 
 MODEL = "claude-opus-5-5"
 EFFORT = "low"
-API_VERSION = "2026-10-21"
 PER_REQUEST = 10
 SPAN_CAP = 150
 MAX_TOKENS = 16000
@@ -160,7 +162,7 @@ def stub_queries(t, node):
 
 
 def parse_message(request, message, nodes, targets_by_key, prompt_sha):
-    """Query rows from one succeeded batch result's message (a dict), or
+    """Query rows from one stored response's message (`claude_cli.to_message`), or
     (None, reason) when it cannot be used."""
     if message.get("stop_reason") == "refusal":
         return None, f"refusal {message.get('stop_details')}"
@@ -204,24 +206,16 @@ def load_targets(vdir):
     return targets, nodes
 
 
-def client():
-    try:
-        import anthropic
-    except ImportError:
-        sys.exit("STOP: the `anthropic` SDK is not installed for this Python")
-    return anthropic.Anthropic()
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", required=True)
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--stub", action="store_true")
-    mode.add_argument("--submit", action="store_true")
-    mode.add_argument("--collect", action="store_true")
+    mode.add_argument("--run", action="store_true")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--effort", default=EFFORT)
+    claude_cli.add_run_args(ap)
     args = ap.parse_args()
     vdir = C.version_dir(args.version)
     targets, nodes = load_targets(vdir)
@@ -243,39 +237,27 @@ def main():
     if args.dry_run:
         return
 
-    if args.submit:
-        batch = client().messages.batches.create(
-            requests=[{"custom_id": r["custom_id"], "params": r["params"]} for r in requests])
-        C.write_json(resp / "gen-batch.json", {"batchId": batch.id, "apiVersion": API_VERSION,
-                                               "submitted": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                                               "requests": len(requests), "promptSha256": prompt_sha})
-        print(f"submitted batch {batch.id}")
-        return
-
-    batch_id = json.load(open(resp / "gen-batch.json"))["batchId"]
-    c = client()
-    status = c.messages.batches.retrieve(batch_id).processing_status
-    if status != "ended":
-        sys.exit(f"batch {batch_id} is {status}; collect again later")
-    results = [r.to_dict() if hasattr(r, "to_dict") else r.model_dump() for r in c.messages.batches.results(batch_id)]
-    C.write_jsonl(resp / "gen-results.jsonl", results)
-    by_id = {r["custom_id"]: r for r in requests}
+    claude_cli.run_step("gen", requests, resp, args, SCHEMA, prompt, prompt_sha, args.model, args.effort,
+                        PER_REQUEST, args.version)
     targets_by_key = {t["key"]: t for t in targets}
     rows, skipped = [], []
-    for res in results:
-        req = by_id[res["custom_id"]]
-        if res["result"]["type"] != "succeeded":
-            skipped.append({"customId": res["custom_id"], "reason": res["result"]["type"]})
+    for req in requests:
+        cid = req["custom_id"]
+        out, err = resp / "gen" / f"{cid}.json", resp / "gen" / f"{cid}.err.json"
+        if not out.exists():
+            e = json.load(open(err)) if err.exists() else {"outcome": "not run", "reason": None}
+            skipped.append({"customId": cid, "reason": f"{e['outcome']}: {e['reason']}"})
             continue
-        got, problems = parse_message(req, res["result"]["message"], nodes, targets_by_key, prompt_sha)
+        got, problems = parse_message(req, claude_cli.to_message(json.load(open(out))), nodes, targets_by_key,
+                                      prompt_sha)
         if got is None:
-            skipped.append({"customId": res["custom_id"], "reason": problems})
+            skipped.append({"customId": cid, "reason": problems})
             continue
         rows += got
-        skipped += [{"customId": res["custom_id"], "reason": p} for p in problems]
+        skipped += [{"customId": cid, "reason": p} for p in problems]
     C.write_jsonl(Path(vdir) / "queries.gen.jsonl", rows)
     C.write_jsonl(resp / "gen-skipped.jsonl", skipped)
-    print(f"collect: {len(rows)} queries, {len(skipped)} skipped")
+    print(f"generate --run: {len(rows)} queries, {len(skipped)} skipped")
 
 
 if __name__ == "__main__":

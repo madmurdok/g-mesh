@@ -230,7 +230,7 @@ existing `parse_message` functions read unchanged.
 | step | pack | calls (4,000 targets) | model | effort | why |
 |---|---|---|---|---|---|
 | generate | 10 targets (`PER_REQUEST`, unchanged) | 400 | `claude-opus-5-5` (`--model`) | `--effort low` | `build_requests` already groups 10; about 10k input and 3-4k output per call; a bad pack costs 10 targets |
-| judge | 5 targets (today 1) | 800 | `claude-sonnet-5-5` | `--effort low` | 1 target per call would be 4,000 calls whose fixed context is a large share of 3.8k input. The schema gains `t` (target index) per verdict |
+| judge | 5 targets (today 1) | 800 | `claude-sonnet-5-5` | `--effort low` | 1 target per call would be 4,000 calls whose fixed context is a large share of 3.8k input. One schema item per (target `t`, candidate `c`) with a verdict list in query order (S23: flat `t`/`c`/`q` items left 308 of 360 pairs out on the first 5-target pack; the list form gave 360 of 360) |
 
 Thinking stays the CLI default (adaptive); only effort is set. `--fallback-model`
 is **not** used: a silent model switch would mix generators. An option for
@@ -259,11 +259,23 @@ Structural, not a brief rule. Each call runs with:
 Check, once per run, recorded in the manifest: a probe call with
 `--output-format stream-json --verbose` and the same flags. Its `init`
 event must list `tools: []` and `mcp_servers: []`. If not, the run stops.
-Per pack: `permission_denials == []` and `num_turns <= 2`. **To confirm in
-the code slice:** whether the user `~/.claude/CLAUDE.md` and auto-memory still
-reach the context (the probe's 3.4k input tokens suggest not). They contain no
-eval text, but they cost tokens per call. The leak guard (section 4) still
-runs on every output.
+Per pack: `permission_denials == []` and `num_turns <= 2`. The leak guard
+(section 4) still runs on every output.
+
+**Confirmed (S23):** the user `~/.claude/CLAUDE.md` and auto-memory do not
+reach the context under these flags; no extra flag is needed. Probe: Sonnet,
+the flags above, a sandbox cwd, asked to quote verbatim every instruction
+about reply language, memory, CLAUDE.md or the user. With `--setting-sources
+""` it quoted only the account e-mail line Claude Code attaches to every
+session, said it had no language instruction, and used 724 context tokens.
+The control, the same call without `--setting-sources ""`, answered in Russian
+quoting the user CLAUDE.md and used 5,986. `--safe-mode` on top changed
+nothing (the e-mail line stays; it is not an instruction about outputs). So the
+user CLAUDE.md is the `user` setting source. The schema-constrained call's
+`init` lists `tools: ["StructuredOutput"]` (the structured-output tool), not
+`[]`, so the check allows exactly that tool. `claude_cli.probe_blindness`
+also stops the run when the probe's context exceeds 3,000 tokens (the
+CLAUDE.md control is 6.0k, the blind probe 1.1k with its schema).
 
 ### 2b.4 Output contract, failures, concurrency
 

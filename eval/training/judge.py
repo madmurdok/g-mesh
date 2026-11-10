@@ -2,9 +2,11 @@
 """Judging of mined candidates (docs/design/GM-456-training-data.md, section 3
 "The judge").
 
-One request per target: the target's code, its queries and its candidates'
-code heads (HEAD_LINES lines). The judge returns a verdict per (candidate,
-query) pair, applied by `apply_verdicts`:
+One request per PER_REQUEST targets of one repo: per target (`t`), its code,
+its queries and its candidates' code heads (HEAD_LINES lines). The judge
+returns, per (target `t`, candidate `c`), one verdict per query in query
+order; `parse_message` records every left-out or extra entry as a problem.
+Verdicts are applied by `apply_verdicts`:
   answers     the candidate moves to that query's `positives`;
   partial     dropped as ambiguous;
   non-answer  kept as a hard negative, with its verdict recorded.
@@ -14,7 +16,8 @@ Modes:
   --dry-run   build `judge/judge-requests.jsonl` and print its size. With
               --stub-verdict, every pair also gets the verdict `non-answer`
               from model "stub" (`judge.stub = true`), for pipeline tests only.
-  --submit / --collect   as generate.py.
+  --run [--jobs N] [--retry ID...]   as generate.py; responses in
+              `responses/judge/`, parse problems in `judge/judge-skipped.jsonl`.
 
 Output: `<version>/queries.judged.jsonl`.
 
@@ -24,20 +27,23 @@ usage: judge.py --version v0.0-stub --dry-run --stub-verdict
 import argparse
 import json
 import sys
-import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import claude_cli
 import common as C
-from generate import API_VERSION, client, custom_id
+from generate import custom_id
 
 MODEL = "claude-sonnet-5-5"
 EFFORT = "low"
 HEAD_LINES = 40
+PER_REQUEST = 5
 MAX_TOKENS = 16000
 PROMPT = C.HERE / "prompts" / "judge.md"
 VERDICTS = ("answers", "partial", "non-answer")
 
+# One item per (target, candidate): `verdicts[k]` is the verdict for query
+# q = k + 1, so a left-out pair is a short list, never a silent omission.
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -46,11 +52,11 @@ SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
+                    "t": {"type": "integer"},
                     "c": {"type": "integer"},
-                    "q": {"type": "integer"},
-                    "verdict": {"type": "string", "enum": list(VERDICTS)},
+                    "verdicts": {"type": "array", "items": {"type": "string", "enum": list(VERDICTS)}},
                 },
-                "required": ["c", "q", "verdict"],
+                "required": ["t", "c", "verdicts"],
                 "additionalProperties": False,
             },
         }
@@ -73,33 +79,44 @@ def by_target(rows):
     return out
 
 
-def build_requests(rows, nodes, prompt, model=MODEL, effort=EFFORT):
-    out = []
+def target_block(i, tkey, qs, cands, nodes):
+    t = nodes[tkey]
+    qtext = "\n".join(f"q{k}: {q['text']}" for k, q in enumerate(qs, 1))
+    ctext = "\n\n".join(f"c{k}: {nodes[c['key']]['filePath']} {nodes[c['key']]['qualifiedName']}\n"
+                        f"{code_head(nodes[c['key']])}" for k, c in enumerate(cands, 1))
+    return (f"t{i}: Target: {t['filePath']} {t['qualifiedName']}\n{code_head(t, 150)}\n\n"
+            f"Queries of t{i} ({len(qs)}):\n{qtext}\n\nCandidates of t{i} ({len(cands)}):\n\n{ctext}")
+
+
+def build_requests(rows, nodes, prompt, model=MODEL, effort=EFFORT, per_request=PER_REQUEST):
+    """Requests of up to `per_request` targets of one repo each, in row order;
+    targets without candidates are left out. `targets[i]` is the pack's
+    target `t = i + 1`."""
+    by_repo = defaultdict(list)
     for tkey, qs in by_target(rows).items():
-        cands = qs[0]["negatives"]
-        if not cands:
-            continue
-        t = nodes[tkey]
-        qtext = "\n".join(f"q{i}: {q['text']}" for i, q in enumerate(qs, 1))
-        ctext = "\n\n".join(f"c{i}: {nodes[c['key']]['filePath']} {nodes[c['key']]['qualifiedName']}\n"
-                            f"{code_head(nodes[c['key']])}" for i, c in enumerate(cands, 1))
-        n = int(qs[0]["id"].split("-")[-2])
-        out.append({
-            "custom_id": custom_id("judge", qs[0]["repo"], n),
-            "target": tkey,
-            "queries": [q["id"] for q in qs],
-            "candidates": [c["key"] for c in cands],
-            "params": {
-                "model": model,
-                "max_tokens": MAX_TOKENS,
-                "system": [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
-                "messages": [{"role": "user", "content":
-                              f"Target: {t['filePath']} {t['qualifiedName']}\n{code_head(t, 150)}\n\n"
-                              f"Queries:\n{qtext}\n\nCandidates:\n\n{ctext}"}],
-                "thinking": {"type": "adaptive"},
-                "output_config": {"effort": effort, "format": {"type": "json_schema", "schema": SCHEMA}},
-            },
-        })
+        if qs[0]["negatives"]:
+            by_repo[qs[0]["repo"]].append((tkey, qs))
+    out = []
+    for repo, ts in by_repo.items():
+        for i in range(0, len(ts), per_request):
+            group = ts[i:i + per_request]
+            packs = [{"target": tkey, "queries": [q["id"] for q in qs],
+                      "candidates": [c["key"] for c in qs[0]["negatives"]]} for tkey, qs in group]
+            body = "\n\n---\n\n".join(target_block(k, tkey, qs, qs[0]["negatives"], nodes)
+                                       for k, (tkey, qs) in enumerate(group, 1))
+            n = int(group[0][1][0]["id"].split("-")[-2])
+            out.append({
+                "custom_id": custom_id("judge", repo, n),
+                "targets": packs,
+                "params": {
+                    "model": model,
+                    "max_tokens": MAX_TOKENS,
+                    "system": [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
+                    "messages": [{"role": "user", "content": f"Targets ({len(group)}):\n\n{body}"}],
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": effort, "format": {"type": "json_schema", "schema": SCHEMA}},
+                },
+            })
     return out
 
 
@@ -134,13 +151,29 @@ def parse_message(request, message, prompt_sha):
     if text is None:
         return None, f"no text block (stop_reason {message.get('stop_reason')})"
     out, problems = {}, []
+    seen = set()
     for v in json.loads(text)["verdicts"]:
-        if not (1 <= v["c"] <= len(request["candidates"]) and 1 <= v["q"] <= len(request["queries"])):
-            problems.append(f"pair out of range {v}")
+        if not 1 <= v["t"] <= len(request["targets"]):
+            problems.append(f"target out of range t{v['t']} c{v['c']}")
             continue
-        out[(request["queries"][v["q"] - 1], request["candidates"][v["c"] - 1])] = {
-            "verdict": v["verdict"], "model": message.get("model", MODEL), "promptSha256": prompt_sha,
-            "customId": request["custom_id"]}
+        t = request["targets"][v["t"] - 1]
+        if not 1 <= v["c"] <= len(t["candidates"]):
+            problems.append(f"candidate out of range t{v['t']} c{v['c']}")
+            continue
+        if (v["t"], v["c"]) in seen:
+            problems.append(f"duplicate t{v['t']} c{v['c']}")
+            continue
+        seen.add((v["t"], v["c"]))
+        if len(v["verdicts"]) != len(t["queries"]):
+            problems.append(f"t{v['t']} c{v['c']}: {len(v['verdicts'])} verdicts for {len(t['queries'])} queries")
+        for q, verdict in zip(t["queries"], v["verdicts"]):
+            out[(q, t["candidates"][v["c"] - 1])] = {
+                "verdict": verdict, "model": message.get("model", MODEL), "promptSha256": prompt_sha,
+                "customId": request["custom_id"]}
+    for ti, t in enumerate(request["targets"], 1):
+        missing = [ci for ci in range(1, len(t["candidates"]) + 1) if (ti, ci) not in seen]
+        if missing:
+            problems.append(f"t{ti}: no entry for candidates {missing}")
     return out, problems
 
 
@@ -149,9 +182,9 @@ def main():
     ap.add_argument("--version", required=True)
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
-    mode.add_argument("--submit", action="store_true")
-    mode.add_argument("--collect", action="store_true")
+    mode.add_argument("--run", action="store_true")
     ap.add_argument("--stub-verdict", action="store_true")
+    claude_cli.add_run_args(ap)
     args = ap.parse_args()
     if args.stub_verdict and not args.dry_run:
         sys.exit("--stub-verdict goes with --dry-run")
@@ -166,52 +199,41 @@ def main():
     requests = build_requests(rows, nodes, prompt)
     C.write_jsonl(vdir / "judge" / "judge-requests.jsonl", requests)
     chars = sum(len(json.dumps(r["params"])) for r in requests)
-    pairs = sum(len(r["queries"]) * len(r["candidates"]) for r in requests)
+    pairs = sum(len(t["queries"]) * len(t["candidates"]) for r in requests for t in r["targets"])
     print(f"judge: {len(requests)} requests, {pairs} (query, candidate) pairs, {chars} request chars "
           f"(~{chars // 4} input tokens before caching), prompt sha256 {prompt_sha}")
 
     if args.dry_run:
         if args.stub_verdict:
             stub = {"verdict": "non-answer", "model": "stub", "promptSha256": None, "customId": None, "stub": True}
-            verdicts = {(q, c): stub for r in requests for q in r["queries"] for c in r["candidates"]}
+            verdicts = {(q, c): stub for r in requests for t in r["targets"]
+                        for q in t["queries"] for c in t["candidates"]}
             judged = apply_verdicts(rows, verdicts)
             C.write_jsonl(vdir / "queries.judged.jsonl", judged)
             print(f"judge --stub-verdict: {len(verdicts)} stub verdicts (non-answer)")
         return
 
-    resp = vdir / "judge"
-    if args.submit:
-        batch = client().messages.batches.create(
-            requests=[{"custom_id": r["custom_id"], "params": r["params"]} for r in requests])
-        C.write_json(resp / "judge-batch.json", {"batchId": batch.id, "apiVersion": API_VERSION,
-                                                 "submitted": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                                                 "requests": len(requests), "promptSha256": prompt_sha})
-        print(f"submitted batch {batch.id}")
-        return
-
-    batch_id = json.load(open(resp / "judge-batch.json"))["batchId"]
-    c = client()
-    status = c.messages.batches.retrieve(batch_id).processing_status
-    if status != "ended":
-        sys.exit(f"batch {batch_id} is {status}; collect again later")
-    results = [r.to_dict() if hasattr(r, "to_dict") else r.model_dump() for r in c.messages.batches.results(batch_id)]
-    C.write_jsonl(resp / "judge-results.jsonl", results)
-    by_id = {r["custom_id"]: r for r in requests}
+    resp = vdir / "responses"
+    claude_cli.run_step("judge", requests, resp, args, SCHEMA, prompt, prompt_sha, MODEL, EFFORT, PER_REQUEST,
+                        args.version)
     verdicts, skipped = {}, []
-    for res in results:
-        if res["result"]["type"] != "succeeded":
-            skipped.append({"customId": res["custom_id"], "reason": res["result"]["type"]})
+    for req in requests:
+        cid = req["custom_id"]
+        out, err = resp / "judge" / f"{cid}.json", resp / "judge" / f"{cid}.err.json"
+        if not out.exists():
+            e = json.load(open(err)) if err.exists() else {"outcome": "not run", "reason": None}
+            skipped.append({"customId": cid, "reason": f"{e['outcome']}: {e['reason']}"})
             continue
-        got, problems = parse_message(by_id[res["custom_id"]], res["result"]["message"], prompt_sha)
+        got, problems = parse_message(req, claude_cli.to_message(json.load(open(out))), prompt_sha)
         if got is None:
-            skipped.append({"customId": res["custom_id"], "reason": problems})
+            skipped.append({"customId": cid, "reason": problems})
             continue
         verdicts.update(got)
-        skipped += [{"customId": res["custom_id"], "reason": p} for p in problems]
+        skipped += [{"customId": cid, "reason": p} for p in problems]
     judged = apply_verdicts(rows, verdicts)
     C.write_jsonl(vdir / "queries.judged.jsonl", judged)
-    C.write_jsonl(resp / "judge-skipped.jsonl", skipped)
-    print(f"collect: {len(verdicts)} verdicts {dict(Counter(v['verdict'] for v in verdicts.values()))}, "
+    C.write_jsonl(vdir / "judge" / "judge-skipped.jsonl", skipped)
+    print(f"judge --run: {len(verdicts)} verdicts {dict(Counter(v['verdict'] for v in verdicts.values()))}, "
           f"{len(skipped)} skipped")
 
 
