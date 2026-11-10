@@ -81,9 +81,10 @@ def c1_fixture():
         sys.exit(f"STOP: C1 failed on {bad}")
 
 
-def add_structured(c, work):
-    """int8-structured lists and the structured text of every node."""
-    d = work / "runs-gm465" / ST / c.name
+def add_structured(c, work, st_dir=None):
+    """int8-structured lists and the structured text of every node; st_dir is
+    the structured runs root (default <work>/runs-gm465/<ST>)."""
+    d = (st_dir or work / "runs-gm465" / ST) / c.name
     man = json.loads((d / "manifest.json").read_text())
     for key, want in (("snapshotSha256", c.snapshot_sha), ("nodeIdsSha256", c.node_ids_sha), ("queryIds", c.all_qids)):
         if man[key] != want:

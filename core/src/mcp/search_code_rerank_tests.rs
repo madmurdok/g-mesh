@@ -12,7 +12,7 @@ use super::search_code::handle;
 use super::session_hints::SessionHints;
 use super::SearchCodeParams;
 use crate::embedding::pipeline::test_support::{fake_model_dir, fake_pipeline, fake_vector, Counters};
-use crate::embedding::rerank::{RerankSettings, Reranker, Scorer};
+use crate::embedding::rerank::{self, RerankSettings, Reranker, Scorer};
 use crate::embedding::EmbeddingPipeline;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -679,7 +679,9 @@ fn store_for_parity(case: &ParityCase, root: &Path) -> Arc<IndexStore> {
 /// the page it returns, equal the reference's text built with the same
 /// (whitespace-word) counter as the stub's. This ties `window_texts` to the
 /// fixture that `the_real_model_reproduces_the_reference_logits_and_order`
-/// checks the model against (that test builds its texts itself).
+/// checks the model against (that test builds its texts itself). A case
+/// whose first row's name is the query is not scored at all
+/// (`rerank::confident`).
 ///
 /// *Control:* have `window_texts` return `text_to_embed` of the doc
 /// comment and signature alone.
@@ -715,6 +717,11 @@ fn the_handler_scores_the_texts_the_reference_scored() {
         let page = body(&result);
 
         let calls = capture.0.lock().unwrap().clone();
+        let top_name = case.rows[0].qualified_name.as_deref().unwrap_or_default();
+        if rerank::confident(&case.query, top_name) {
+            assert!(calls.is_empty(), "{}: an exact-name window is not scored", case.query_id);
+            continue;
+        }
         assert_eq!(calls.len(), 1, "{}: one scoring call", case.query_id);
         let (query, texts) = &calls[0];
         assert_eq!(query, &case.query, "{}", case.query_id);
@@ -1146,4 +1153,91 @@ fn an_unavailable_model_changes_nothing_but_the_hint() {
     with_hint.as_object_mut().unwrap().remove("hint");
     without.as_object_mut().unwrap().remove("hint");
     assert_eq!(with_hint, without);
+}
+
+// --- the confident skip and the old weights ------------------------------
+
+/// Scores the window in reverse and counts its calls.
+struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Scorer for Counting {
+    fn score(&self, _query: &str, texts: &[String]) -> anyhow::Result<Vec<f32>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok((0..texts.len()).map(|i| i as f32 * 100.0).collect())
+    }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        text.split_whitespace().count()
+    }
+}
+
+/// A window whose first row is named `parseConfig`.
+fn window_named_parse_config() -> Vec<Row> {
+    let mut rows = descending(64, 0.9, 0.01);
+    rows[0].id = "parseConfig".to_string();
+    rows
+}
+
+/// An exact-name first row gives the page the rerank-off handler gives,
+/// byte for byte, and the scorer is never called; a query that is not that
+/// name reranks the same window.
+///
+/// *Controls:* `confident` always `false` -> the scorer is called on the
+/// exact-name query; `confident` always `true` -> the other query is not
+/// scored.
+#[test]
+fn an_exact_name_first_row_skips_the_scorer_and_gives_the_plain_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = fake(dir.path());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let reranker = Reranker::with_parts(
+        || RerankSettings { enabled: true, model_dir: Ok("/stub".into()) },
+        move |_| Ok(Box::new(Counting(Arc::clone(&counted))) as Box<dyn Scorer>),
+        |_| {},
+    );
+    let reranking = fake(dir.path()).with_reranker(reranker);
+
+    let exact = store_for("parseConfig", &window_named_parse_config());
+    let skipped = call(&exact, &reranking, "parseConfig", Some(5), None);
+    let off = call(&exact, &plain, "parseConfig", Some(5), None);
+    assert_eq!(serde_json::to_string(&skipped).unwrap(), serde_json::to_string(&off).unwrap());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let other = store_for("loadConfig", &window_named_parse_config());
+    let reranked = body(&call(&other, &reranking, "loadConfig", Some(5), None));
+    let unranked = body(&call(&other, &plain, "loadConfig", Some(5), None));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_ne!(reranked["results"], unranked["results"]);
+}
+
+/// A model directory holding the old fp32 file (its size, other bytes)
+/// fails to load once, names `g-mesh model fetch` in the log, and every
+/// page keeps the embedding order.
+///
+/// *Controls:* remove the `Replace it: g-mesh model fetch` line from
+/// `check_rerank_files` -> the log line lacks the command; classify a
+/// present-but-unloadable model as absent in `Reranker::outcome` -> the
+/// hint is the missing wording.
+#[test]
+fn a_directory_with_the_old_fp32_file_fails_once_and_keeps_the_embedding_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    std::fs::File::create(model.path().join("model.onnx")).unwrap().set_len(91_011_230).unwrap();
+    std::fs::write(model.path().join("tokenizer.json"), "{}").unwrap();
+    let lines = Lines::default();
+    let embedding = fake(dir.path()).with_reranker(Reranker::real_at(model.path(), lines.sink()));
+    let plain = fake(dir.path());
+
+    let first = first_page(&embedding);
+    assert!(hint_of(&first).contains(super::session_hints::RERANK_MODEL_FAILED), "{first}");
+    let store = store_for("parseConfig", &descending(64, 0.9, 0.01));
+    for _ in 0..2 {
+        let page = body(&call(&store, &embedding, "parseConfig", Some(5), None));
+        let expected = body(&call(&store, &plain, "parseConfig", Some(5), None));
+        assert_eq!(page["results"], expected["results"]);
+    }
+    let logged = lines.0.lock().unwrap().clone();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert!(logged[0].contains("Replace it: g-mesh model fetch"), "{logged:?}");
 }

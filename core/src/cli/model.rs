@@ -211,8 +211,9 @@ const FILES: [RemoteFile; 2] = [
     },
 ];
 
-/// The rerank model's two files (`embedding::rerank`), the fp32 export at
-/// its pinned revision, in the same download order as [`FILES`].
+/// The rerank model's two files (`embedding::rerank`), the official
+/// dynamic-int8 export at its pinned revision, in the same download order as
+/// [`FILES`].
 const RERANK_FILES: [RemoteFile; 2] = [
     RemoteFile {
         repo: RERANK_MODEL_REPO,
@@ -1110,6 +1111,29 @@ mod tests {
         assert!(!output.contains("downloading"), "{output}");
     }
 
+    /// The fp32 file the int8 model replaced is not the pinned one, and
+    /// `fetch` downloads over it.
+    ///
+    /// *Controls:* `RERANK_ONNX_SIZE` back to the fp32 size -> `on_disk`
+    /// reads it `Pinned`; make `fetch_files` skip any file that exists ->
+    /// the stale bytes stay.
+    #[test]
+    fn a_stale_fp32_rerank_file_is_replaced_by_fetch() {
+        const FP32_ONNX_SIZE: u64 = 91_011_230;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join(RERANK_FILES[0].local_name);
+        File::create(&dest).unwrap().set_len(FP32_ONNX_SIZE).unwrap();
+        assert_eq!(on_disk(&dest, &RERANK_FILES[0]), OnDisk::Other(FP32_ONNX_SIZE));
+
+        let file = RemoteFile { local_name: RERANK_FILES[0].local_name, ..test_file() };
+        let agent = ureq::AgentBuilder::new().build();
+        let mut out = Vec::new();
+        fetch_files(&agent, dir.path(), &[file], &[Source::Flat(serve_once(TEST_BODY))], &mut out).unwrap();
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.contains("replacing"), "{said}");
+        assert_eq!(fs::read(&dest).unwrap(), TEST_BODY);
+    }
+
     #[test]
     fn status_reports_a_missing_rerank_model_and_how_to_get_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -1123,11 +1147,11 @@ mod tests {
         assert!(output.contains("search_code keeps the embedding order"), "{output}");
     }
 
-    /// The rerank model is the fp32 export at the revision S1 scored, with
-    /// the sizes and digests of those files, and a flat mirror keeps it apart
-    /// from the embedding model's same-named files.
+    /// The rerank model is the quint8 export at the revision the blend was
+    /// fitted against, with the sizes and digests of those files, and a flat
+    /// mirror keeps it apart from the embedding model's same-named files.
     #[test]
-    fn the_pinned_rerank_model_is_the_fp32_export() {
+    fn the_pinned_rerank_model_is_the_quint8_export() {
         let [onnx, tokenizer] = &RERANK_FILES;
         assert_eq!(
             (onnx.repo, onnx.revision),
@@ -1135,9 +1159,9 @@ mod tests {
         );
         assert_eq!(
             (onnx.remote_path, onnx.local_name, onnx.size),
-            ("onnx/model.onnx", ONNX_FILE_NAME, 91_011_230)
+            ("onnx/model_quint8_avx2.onnx", ONNX_FILE_NAME, 23_200_716)
         );
-        assert_eq!(onnx.sha256, "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a");
+        assert_eq!(onnx.sha256, "c80a8b34256ea453093d612e3ac48d3d965a0c0a48c7906709af8b8e28461bf9");
         assert_eq!((tokenizer.local_name, tokenizer.size), (TOKENIZER_FILE_NAME, 711_396));
         assert_eq!(tokenizer.sha256, "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66");
         assert_eq!(onnx.flat_prefix, format!("{}/", crate::embedding::rerank::RERANK_MODEL_NAME));
@@ -1147,7 +1171,7 @@ mod tests {
         );
         assert_eq!(
             Source::Upstream.url(onnx),
-            "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2/resolve/233902d25c440f23af6f7d6e94d2946bac0bee0a/onnx/model.onnx"
+            "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L6-v2/resolve/233902d25c440f23af6f7d6e94d2946bac0bee0a/onnx/model_quint8_avx2.onnx"
         );
     }
 

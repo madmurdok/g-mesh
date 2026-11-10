@@ -3,8 +3,12 @@
 //! `search_code` takes the embedding ranking's first [`WINDOW`] rows, scores
 //! each (query, symbol text) pair with `cross-encoder/ms-marco-MiniLM-L6-v2`,
 //! and orders the window by `logit + BETA * cosine`. Rows after the window
-//! keep the embedding order, and the score shown stays the cosine. Design:
-//! ADR 0016 (`docs/adr/0016-cross-encoder-rerank.md`).
+//! keep the embedding order, and the score shown stays the cosine. A window
+//! whose first row's name is the query ([`confident`]) is not scored and
+//! keeps the embedding order. Design: ADR 0016
+//! (`docs/adr/0016-cross-encoder-rerank.md`); the int8 weights, one pair per
+//! run and the exact-name skip: ADR 0043
+//! (`docs/adr/0043-int8-rerank-one-pair-per-run.md`).
 //!
 //! Like the embedding model, the cross-encoder is fetched by `g-mesh model
 //! fetch` and loaded lazily, on the first call that reranks. A missing or
@@ -26,6 +30,7 @@ use sha2::{Digest, Sha256};
 use tokenizers::tokenizer::Tokenizer;
 use tokenizers::TruncationParams;
 
+use crate::embedding::ce_text::split_words;
 use crate::embedding::model::{ONNX_FILE_NAME, TOKENIZER_FILE_NAME};
 
 /// The directory name under `~/.g-mesh/models/`, and the name the log uses.
@@ -34,11 +39,12 @@ pub(crate) const RERANK_MODEL_REPO: &str = "cross-encoder/ms-marco-MiniLM-L6-v2"
 /// The revision the blend's `BETA` was fitted against; the weights and
 /// tokenizer below are its files.
 pub(crate) const RERANK_MODEL_REVISION: &str = "233902d25c440f23af6f7d6e94d2946bac0bee0a";
-/// The fp32 export, written to [`ONNX_FILE_NAME`] in the model directory.
-pub(crate) const RERANK_ONNX_REMOTE_PATH: &str = "onnx/model.onnx";
-pub(crate) const RERANK_ONNX_SIZE: u64 = 91_011_230;
+/// The official dynamic-int8 (unsigned, `quint8`, AVX2) export, written to
+/// [`ONNX_FILE_NAME`] in the model directory (ADR 0043).
+pub(crate) const RERANK_ONNX_REMOTE_PATH: &str = "onnx/model_quint8_avx2.onnx";
+pub(crate) const RERANK_ONNX_SIZE: u64 = 23_200_716;
 pub(crate) const RERANK_ONNX_SHA256: &str =
-    "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a";
+    "c80a8b34256ea453093d612e3ac48d3d965a0c0a48c7906709af8b8e28461bf9";
 pub(crate) const RERANK_TOKENIZER_SIZE: u64 = 711_396;
 pub(crate) const RERANK_TOKENIZER_SHA256: &str =
     "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66";
@@ -60,9 +66,11 @@ pub const BETA: f64 = 40.0;
 /// first.
 pub const MAX_PAIR_TOKENS: usize = 512;
 
-/// Pairs per inference batch, taken in token-length order so one long text
-/// does not pad the whole window.
-const CHUNK: usize = 16;
+/// Pairs per inference run. A pair's logit must not depend on the other
+/// pairs it runs with; the dynamic-int8 weights quantize each run's
+/// activations with that run's own scales, so only one pair per run keeps
+/// that true (ADR 0043).
+const CHUNK: usize = 1;
 
 /// The most intra-op threads one rerank uses.
 const MAX_THREADS: usize = 4;
@@ -103,6 +111,14 @@ pub(crate) fn check_rerank_files(dir: &Path) -> Result<()> {
         }
         let actual = file_sha256(&path)?;
         if actual != sha {
+            if name == ONNX_FILE_NAME {
+                bail!(
+                    "{} has sha256 {actual}, not the pinned {sha} (g-mesh switched the rerank to the \
+                     int8 model; this is likely the fp32 file it replaced).\n\
+                     Replace it: g-mesh model fetch",
+                    path.display()
+                );
+            }
             bail!("{} has sha256 {actual}, not the pinned {sha}", path.display());
         }
     }
@@ -142,6 +158,35 @@ pub fn blended_order(logits: &[f32], cosines: &[f64]) -> Option<Vec<usize>> {
         blended[b].partial_cmp(&blended[a]).expect("every blend is finite").then(a.cmp(&b))
     });
     Some(order)
+}
+
+/// Whether the embedding ranking's first row already answers `query`, so
+/// the window keeps the embedding order without scoring: the query's words
+/// ([`split_words`]) equal those of the row's last qualified-name segment,
+/// and are not empty. Segments are split on `::`, `.`, `/`, `#` and `\`
+/// (ADR 0043).
+pub(crate) fn confident(query: &str, top_qualified_name: &str) -> bool {
+    let words = split_words(last_segment(top_qualified_name));
+    !words.is_empty() && split_words(query) == words
+}
+
+/// What follows the last segment separator of a qualified name, the
+/// separators matched left to right as the regex `::|[./#\\]` splits.
+fn last_segment(qualified_name: &str) -> &str {
+    let bytes = qualified_name.as_bytes();
+    let (mut start, mut i) = (0, 0);
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"::") {
+            i += 2;
+            start = i;
+        } else if matches!(bytes[i], b'.' | b'/' | b'#' | b'\\') {
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    &qualified_name[start..]
 }
 
 /// `cross-encoder/ms-marco-MiniLM-L6-v2` on onnxruntime.
@@ -194,7 +239,8 @@ fn intra_threads() -> usize {
 impl Scorer for CrossEncoder {
     /// Pairs are tokenized together (`[CLS] query [SEP] text [SEP]`, with
     /// segment ids), then run in chunks of [`CHUNK`] in token-length order,
-    /// each chunk padded to its longest pair and masked.
+    /// each chunk padded to its longest pair and masked. At one pair per
+    /// chunk the order and the padding change nothing.
     fn score(&self, query: &str, texts: &[String]) -> Result<Vec<f32>> {
         let encodings = texts
             .iter()
@@ -308,7 +354,7 @@ impl RerankModelState {
     }
 
     /// Checks presence and size only, as `g-mesh model status` does: no
-    /// sha256 over the 91 MB weights. A same-size file with other bytes
+    /// sha256 over the 23 MB weights. A same-size file with other bytes
     /// reads `Present` here while the daemon refuses it.
     pub(crate) fn of(settings: RerankSettings) -> Self {
         if !settings.enabled {
@@ -704,6 +750,71 @@ mod tests {
         assert!(err.contains("not the pinned"), "{err}");
     }
 
+    /// The refusal of a file that is not the pinned int8 weights tells the
+    /// user what to run.
+    ///
+    /// *Control:* remove the `Replace it: g-mesh model fetch` line from
+    /// `check_rerank_files` -> the message no longer names the command.
+    #[test]
+    fn a_refused_weights_file_names_the_fetch_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ONNX_FILE_NAME), "the fp32 weights, say").unwrap();
+        std::fs::write(dir.path().join(TOKENIZER_FILE_NAME), "{}").unwrap();
+        let err = check_rerank_files(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("g-mesh model fetch"), "{err}");
+        let load = CrossEncoder::load(dir.path()).err().unwrap().to_string();
+        assert!(load.contains("g-mesh model fetch"), "{load}");
+    }
+
+    /// (query, qualified name, whether the first row answers the query),
+    /// the expected values computed by `skip_flags` rule (a) in
+    /// `eval/embedding/gm463_bakeoff.py` (`split_words` of the query equal
+    /// to those of the last `::|[./#\\]` segment, both non-empty).
+    const CONFIDENT_TABLE: [(&str, &str, bool); 27] = [
+        ("parse config", "a::b::ParseConfig", true),
+        ("parse config", "a.parse_config", true),
+        ("parse config", "a/parseConfig", true),
+        ("parse config", "a#parseConfig", true),
+        ("parse config", "a\\ParseConfig", true),
+        ("parse config", "a.b.parse_config", true),
+        ("parse config", "a/b/parseConfig", true),
+        ("parse config", "a.b#parseConfig", true),
+        ("parse config", "a\\b\\ParseConfig", true),
+        ("PARSE CONFIG", "x::parse_config", true),
+        ("parse_config", "x::parseConfig", true),
+        ("gc outcome", "GcOutcome", true),
+        ("list_epics_with_status", "listEpicsWithStatus", true),
+        ("gc outcome", "mod::GcOutcome", true),
+        ("http server", "HTTPServer", true),
+        ("safe int 8", "safeInt8", true),
+        ("new", "Vec<T>::new", true),
+        ("foo", "a.b#Foo", true),
+        ("vec new", "Vec<T>::new", false),
+        ("parse", "a::b::parse_config", false),
+        ("parse config", "ParseConfigs", false),
+        ("parse config", "a#b.c", false),
+        ("a b", "a.b#Foo", false),
+        ("", "a::b", false),
+        ("anything", "a::", false),
+        ("anything", "a.b/", false),
+        ("anything", "", false),
+    ];
+
+    /// `confident` agrees with the eval's rule on every separator, on
+    /// casing, snake against camel case, an empty query or segment, and
+    /// generics.
+    ///
+    /// *Controls:* `confident` returns `false` -> the `true` rows fail;
+    /// drop `#` from `last_segment` -> `a#parseConfig` reads `a parse
+    /// config`; compare the words case-sensitively (skip `split_words`'
+    /// lowercase) -> `PARSE CONFIG` fails.
+    #[test]
+    fn confident_agrees_with_the_eval_rule() {
+        for (query, name, expected) in CONFIDENT_TABLE {
+            assert_eq!(confident(query, name), expected, "query {query:?}, name {name:?}");
+        }
+    }
+
     // --- how a daemon resolved its rerank ----------------------------------
 
     /// A scorer that is never asked to score: these tests only resolve.
@@ -877,7 +988,9 @@ mod tests {
     /// `Disabled` whatever is on disk.
     ///
     /// *Control:* drop the `enabled` check from `RerankModelState::of` ->
-    /// the switched-off case with files reads `Present`.
+    /// the switched-off case with files reads `Present`. Set
+    /// `RERANK_ONNX_SIZE` back to the fp32 file's size -> the fp32-size
+    /// directory reads `Present`.
     #[test]
     fn the_on_disk_state_is_judged_by_the_switch_and_the_pinned_sizes() {
         let settings = |enabled: bool, dir: Option<&Path>| RerankSettings {
@@ -892,17 +1005,25 @@ mod tests {
             .unwrap();
         let wrong_size = dir_with_both_files();
         let empty = tempfile::tempdir().unwrap();
+        // The size of the fp32 file the int8 model replaced (4.27.0's
+        // `RERANK_ONNX_SIZE`).
+        const FP32_ONNX_SIZE: u64 = 91_011_230;
+        assert_ne!(RERANK_ONNX_SIZE, FP32_ONNX_SIZE);
+        let fp32 = tempfile::tempdir().unwrap();
+        File::create(fp32.path().join(ONNX_FILE_NAME)).unwrap().set_len(FP32_ONNX_SIZE).unwrap();
+        File::create(fp32.path().join(TOKENIZER_FILE_NAME)).unwrap().set_len(RERANK_TOKENIZER_SIZE).unwrap();
 
         assert_eq!(RerankModelState::of(settings(true, Some(pinned.path()))), RerankModelState::Present);
         assert_eq!(RerankModelState::of(settings(false, Some(pinned.path()))), RerankModelState::Disabled);
         assert_eq!(RerankModelState::of(settings(true, Some(wrong_size.path()))), RerankModelState::Missing);
         assert_eq!(RerankModelState::of(settings(true, Some(empty.path()))), RerankModelState::Missing);
         assert_eq!(RerankModelState::of(settings(true, None)), RerankModelState::Missing);
+        assert_eq!(RerankModelState::of(settings(true, Some(fp32.path()))), RerankModelState::Missing);
         assert_eq!(RerankModelState::of(settings(false, None)), RerankModelState::Disabled);
     }
 
     // -----------------------------------------------------------------------
-    // Tests that need the real cross-encoder (~87 MiB, not in the repo):
+    // Tests that need the real cross-encoder (~23 MiB, not in the repo):
     //
     //     g-mesh model fetch
     //     cd core && cargo test rerank -- --ignored --test-threads=1
@@ -916,13 +1037,18 @@ mod tests {
         CrossEncoder::load(&dir).unwrap_or_else(|err| panic!("could not load the cross-encoder: {err:#}"))
     }
 
-    /// Order parity with the Python reference: this crate's text for each
-    /// row, scored by the real model, gives the reference's logits within
-    /// 1e-4 and its order, allowing a swap only where two blends are within
-    /// 1e-3 of each other.
+    /// Parity with the Python reference: this crate's text for each row,
+    /// scored by the real model, gives the reference's logits within
+    /// `LOGIT_TOLERANCE`, and the reference's order wherever two reference
+    /// blends differ by more than twice that tolerance.
+    ///
+    /// The int8 kernels differ by CPU path (ONNX Runtime picks one per
+    /// process), so logits move by up to a fraction of a point and
+    /// near-ties may swap.
     #[test]
     #[ignore = "needs the real cross-encoder; see the comment above"]
     fn the_real_model_reproduces_the_reference_logits_and_order() {
+        const LOGIT_TOLERANCE: f64 = 0.25;
         let model = load_real();
         for case in fixture().cases {
             let texts: Vec<String> =
@@ -931,7 +1057,7 @@ mod tests {
             for ((row, &logit), text) in case.rows.iter().zip(&logits).zip(&texts) {
                 let delta = (f64::from(logit) - row.logit).abs();
                 assert!(
-                    delta < 1e-4,
+                    delta < LOGIT_TOLERANCE,
                     "{} {}: logit {logit} vs the reference's {} (text equal to the reference's: {})",
                     case.query_id,
                     row.id,
@@ -945,16 +1071,26 @@ mod tests {
                 let row = case.rows.iter().find(|row| row.id == id).unwrap();
                 row.logit + BETA * row.cosine
             };
-            for (position, (ours, theirs)) in order.iter().zip(&case.order).enumerate() {
-                assert!(
-                    ours == theirs || (blend(ours) - blend(theirs)).abs() < 1e-3,
-                    "{}: position {position} is {ours}, the reference has {theirs}",
-                    case.query_id
-                );
+            let position = |id: &str| order.iter().position(|other| other == id).unwrap();
+            for (i, higher) in case.order.iter().enumerate() {
+                for lower in &case.order[i + 1..] {
+                    if blend(higher) - blend(lower) > 2.0 * LOGIT_TOLERANCE {
+                        assert!(
+                            position(higher) < position(lower),
+                            "{}: {higher} should rank above {lower}",
+                            case.query_id
+                        );
+                    }
+                }
             }
         }
     }
 
+    /// Exact equality: the int8 kernels give a row other logits in a batch
+    /// than alone, and `CHUNK` of 1 is what rules that out.
+    ///
+    /// *Control:* `CHUNK = 16` -> the single-row scores differ from the
+    /// batched ones.
     #[test]
     #[ignore = "needs the real cross-encoder; see the comment above"]
     fn scoring_is_deterministic_and_independent_of_the_batch() {
@@ -968,7 +1104,47 @@ mod tests {
         assert_eq!(together, model.score("parse the config file", &texts).unwrap());
         for (i, text) in texts.iter().enumerate() {
             let alone = model.score("parse the config file", std::slice::from_ref(text)).unwrap();
-            assert!((alone[0] - together[i]).abs() < 1e-4, "{i}: {} vs {}", alone[0], together[i]);
+            assert_eq!(alone[0], together[i], "{i}");
         }
+    }
+
+    /// Dev-only dump for the offline quality eval: reads JSONL rows
+    /// `{"query", "text"}` from `RERANK_DUMP_IN` and writes one `{"logit"}`
+    /// line per row to `RERANK_DUMP_OUT`, through `CrossEncoder::score` in a
+    /// fresh process (the shipped kernel path). Consecutive rows with the
+    /// same query are scored in one call. Without both variables it does
+    /// nothing, so a run of every ignored test passes over it.
+    #[test]
+    #[ignore = "dev-only dump for the offline quality eval; needs RERANK_DUMP_IN and RERANK_DUMP_OUT"]
+    fn dump_logits_for_the_offline_eval() {
+        use std::io::{BufRead, Write};
+        let (Ok(input), Ok(output)) = (std::env::var("RERANK_DUMP_IN"), std::env::var("RERANK_DUMP_OUT"))
+        else {
+            return;
+        };
+        let model = load_real();
+        let mut out = std::io::BufWriter::new(std::fs::File::create(output).unwrap());
+        let mut group: Vec<String> = Vec::new();
+        let mut group_query = String::new();
+        let flush = |query: &str, texts: &mut Vec<String>, out: &mut dyn Write| {
+            if texts.is_empty() {
+                return;
+            }
+            for logit in model.score(query, texts).unwrap() {
+                writeln!(out, "{}", serde_json::json!({ "logit": logit })).unwrap();
+            }
+            texts.clear();
+        };
+        for line in std::io::BufReader::new(std::fs::File::open(input).unwrap()).lines() {
+            let row: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let query = row["query"].as_str().unwrap();
+            if query != group_query {
+                flush(&group_query, &mut group, &mut out);
+                group_query = query.to_string();
+            }
+            group.push(row["text"].as_str().unwrap().to_string());
+        }
+        flush(&group_query, &mut group, &mut out);
+        out.flush().unwrap();
     }
 }

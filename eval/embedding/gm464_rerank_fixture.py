@@ -5,8 +5,9 @@ Writes core/src/embedding/testdata/rerank_parity.json: for a few NL and name
 queries per eval corpus, int8-structured's top-30 (the node's columns,
 cosine), the text search_code's rerank reads for each node
 (gm462_ce_text.build(row, src, "EPB", ce-minilm tokenizer, 48), GM-698), the
-ce-minilm logits rerank_eval.CrossEncoder.score gives each (query, text)
-pair, and the F4 order (ce + BETA * cosine, ties in int8 order).
+logits rerank_eval.CrossEncoder.score gives each (query, text) pair under the
+shipped weights (ce-minilm-quint8, the official quint8 AVX2 export, one pair per run,
+GM-700), and the F4 order (ce + BETA * cosine, ties in int8 order).
 
 Each row also carries `srcLines`, its source span from startLine, cut after
 the last line the body field reads (gm698_ce_text_fixture.span_for), and
@@ -24,7 +25,8 @@ The fixture must tell its controls apart, so this script refuses to write it
 unless the order differs from F4 under beta = 80 and under the structured
 text alone (the text before GM-698) on at least one query each.
 
-usage: gm464_rerank_fixture.py --work <eval/embedding/work> [--corpora dir] [--out path]
+usage: gm464_rerank_fixture.py --work <eval/embedding/v2/work> [--corpora dir] [--eval-dir dir]
+                               [--st-runs dir] [--out path]
 """
 
 import argparse
@@ -43,6 +45,7 @@ from gm464_ce_structured import ST, add_structured  # noqa: E402
 
 K = 30
 BETA = 40.0
+CE = "ce-minilm-quint8"  # rerank_eval scores it one pair per run (core's CHUNK = 1)
 NL_PER_CORPUS = 2
 NAME_PER_CORPUS = 1
 
@@ -70,18 +73,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True, type=Path)
     ap.add_argument("--corpora", type=Path, help="corpus checkouts (default <work>/corpora)")
+    ap.add_argument("--eval-dir", type=Path, default=HERE / "v2", help="holds queries/ (default eval/embedding/v2)")
+    ap.add_argument("--st-runs", type=Path, help="int8-structured runs root (default <work>/runs-gm465/<ST>)")
     ap.add_argument("--out", type=Path, default=HERE.parents[1] / "core/src/embedding/testdata/rerank_parity.json")
     a = ap.parse_args()
 
     corpora = [p.name for p in sorted((a.work / "runs" / R.REF).iterdir()) if (p / "rankings.jsonl").exists()]
     corpora_dir = a.corpora or a.work / "corpora"
-    ce = R.CrossEncoder(a.work, "ce-minilm")
+    ce = R.CrossEncoder(a.work, CE)
+    assert ce.chunk == 1, ce.chunk
     minilm = F.minilm_counter(a.work)
     toks = (F.words, minilm)
     cases, differs_beta, differs_base = [], 0, 0
     for name in corpora:
-        c = R.Corpus(a.work, HERE, name, 0)
-        add_structured(c, a.work)
+        c = R.Corpus(a.work, a.eval_dir, name, 0)
+        add_structured(c, a.work, a.st_runs)
         con = sqlite3.connect(f"file:{c.db}?mode=ro", uri=True)
         con_rows = {r[0]: dict(zip(F.NODE_COLS, r[1:]))
                     for r in con.execute(f"SELECT id, {', '.join(F.NODE_COLS)} FROM nodes")}

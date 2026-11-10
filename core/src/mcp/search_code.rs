@@ -487,7 +487,8 @@ pub(super) fn cursor_parts(cursor: &str) -> anyhow::Result<CursorParts> {
 /// embedding ranking's first `max(page_size, WINDOW)` rows, the first
 /// `WINDOW` of them reordered. A `page_size` under the window shows the
 /// first `page_size` reranked rows and hands out a `rerank:` cursor for the
-/// rest. When this call's scoring fails, the page is the plain one.
+/// rest. When this call's scoring fails, or the first row already answers
+/// the query ([`rerank::confident`]), the page is the plain one.
 fn first_page_reranked(
     conn: &Connection,
     embedding: &EmbeddingPipeline,
@@ -499,7 +500,7 @@ fn first_page_reranked(
 ) -> anyhow::Result<Ranked> {
     let mut window = search(conn, query_vector, page_size.max(rerank::WINDOW), None)?;
     let reranked = window.results.len().min(rerank::WINDOW);
-    if reranked < 2 {
+    if reranked < 2 || rerank::confident(query, &window.results[0].qualified_name) {
         return search(conn, query_vector, page_size, None).map(Ranked::plain);
     }
     let texts =
