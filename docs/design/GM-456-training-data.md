@@ -74,7 +74,7 @@ Otherwise the pin is HEAD on 2026-11-10.
 | python | Textualize/rich | v15.0.0 | 6ac483cbea39cab124dfd3483bba70ffafb71050 | MIT | train |
 | python | psf/black | 26.10.1 | 258e7dbf348bc23cb70b8cdf693481c04634ebcc | MIT | train |
 | python | more-itertools/more-itertools | v11.2.1 | 4aeb4338ae1407d8da9723e86da99efeb446f719 | MIT | **dev** |
-| ts | colinhacks/zod | v4.6.7 | b500a2ee95134f81d74da7911d7378dd2853d042 | MIT | train |
+| ts | open-circle/valibot | v1.5.0 | 5016198907beb383f5a6d8bbcb4c7f1586d7c6a3 | MIT | train |
 | ts | immerjs/immer | v11.2.9 | 75a290e44ba14bd723c8ef8546b6559c8ef3ae88 | MIT | train |
 | ts | honojs/hono | v4.13.17 | 61f7c59e50244ab4d2dd83c151928cf7ea448510 | MIT | train |
 | ts | pmndrs/zustand | v5.1.0 | 9fed2eb2f3af672da9f7bf694b996df3831fc207 | MIT | train |
@@ -82,6 +82,8 @@ Otherwise the pin is HEAD on 2026-11-10.
 
 "Dual MIT" is my reading of the repos' licence files: GitHub reports only one
 SPDX id. S2 records the licence file path and its sha256 at the pin.
+
+colinhacks/zod was replaced by open-circle/valibot (S22): indexing zod hung 16.5 h in the TypeScript LSP semantic pass.
 
 **Counts.** Targets come first and are stratified 6 fn / 3 type / 1 other,
 using `sample_targets.STRATA_PATTERN` (`eval/embedding/sample_targets.py:41`)
