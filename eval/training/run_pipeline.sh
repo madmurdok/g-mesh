@@ -39,6 +39,7 @@ done
 [ -n "$version" ] || { echo "--version is required" >&2; exit 2; }
 [ $stub -eq 1 ] && [ $live -eq 1 ] && { echo "--stub and --live exclude each other" >&2; exit 2; }
 order="setup nodes sample render generate mine judge filter export"
+case "$from" in ""|*[[:space:]]*) echo "--from: one of $order" >&2; exit 2 ;; esac
 case " $order " in *" $from "*) ;; *) echo "--from: one of $order" >&2; exit 2 ;; esac
 
 data="${GM456_DATA:-$HOME/Projects/ClaudeProjects/g-mesh-data/gm456}"

@@ -268,6 +268,15 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(self.summary(), "earlier summary\n")
         self.assertEqual(self.calls(), [])
 
+    def test_from_naming_more_than_one_stage_or_none_exits_2(self):
+        for value in ("judge filter", "", " export"):
+            with self.subTest(value=value):
+                p = self.run_pipeline("--from", value)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("--from: one of", p.stderr)
+                self.assertFalse((self.vdir / "summary.txt").exists())
+                self.assertEqual(self.calls(), [])
+
     def test_step_exit_3_makes_the_pipeline_exit_3_with_a_stop_line(self):
         p = self.run_pipeline("--from", "filter", leak_guard=3)
         self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
