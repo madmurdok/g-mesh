@@ -1,7 +1,8 @@
 # Source repos of the GM-456 training data (docs/design/GM-456-training-data.md,
 # section 1). Pins are the peeled commit of a release tag, or HEAD on
 # 2026-11-10 where `ref = "HEAD"`. `checkout` is relative to this directory
-# (eval/training/work is a symlink into the data dir). `licence`, `split` and
+# (eval/training/work is a symlink into the data dir). `licence`,
+# `licence_file` (a licence not at the repo root), `split` and
 # `url` are extra keys `debug-embed-eval` ignores; `split` is the by-repo
 # train/dev split.
 
@@ -25,6 +26,7 @@ ref = "axum-v0.8.9"
 revision = "c59208c86fded335cd85e388030ad59347b0e5ae"
 checkout = "work/corpora/axum"
 licence = "MIT"
+licence_file = "axum/LICENSE"
 split = "train"
 
 [[corpus]]

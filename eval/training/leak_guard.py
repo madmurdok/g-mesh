@@ -34,14 +34,16 @@ Checks, each naming the rows it fires on:
 
   --check    exit 1 on any hit (export runs this last);
   --filter   write the dataset minus the hits (rows of a hit query, repo or
-             positive; the single negative of a negative-code hit) and
-             leaks.jsonl;
+             positive; the single negative of a negative-code hit) as
+             <stem>.filtered.jsonl, the hits as filter.leaks.jsonl and the
+             report, with kept/dropped counts and the output's sha256, as
+             filter.guard.json (export deletes guard.json and leaks.jsonl);
   --pooling-check RUN_DIR   compare Python query vectors with a Rust run's
              query_vectors.bin on its first N queries; exit 1 below
              POOLING_BAR.
 
-Every run writes guard.json beside the dataset: per-check hit counts and the
-nearest-eval cosine and Jaccard distributions.
+Every --check run writes guard.json and leaks.jsonl beside the dataset:
+per-check hit counts and the nearest-eval cosine and Jaccard distributions.
 
 usage: leak_guard.py --version v0.0-stub --check [--dataset queries.jsonl]
 """
@@ -613,8 +615,12 @@ def main():
                              cache, args.threads)
     report["dataset"] = str(dataset)
     report["datasetSha256"] = C.sha256_file(dataset)
-    C.write_json(dataset.parent / "guard.json", report)
-    C.write_jsonl(dataset.parent / "leaks.jsonl", hits)
+    # --filter records under filter.* so that export, which deletes and
+    # rewrites guard.json and leaks.jsonl, keeps what the filter dropped.
+    prefix = "filter." if args.filter else ""
+    if not args.filter:
+        C.write_json(dataset.parent / "guard.json", report)
+    C.write_jsonl(dataset.parent / f"{prefix}leaks.jsonl", hits)
     print("leak_guard:", json.dumps({k: report[k] for k in ("result", "rows", "hitsPerCheck", "rowsFlaggedShare")}))
     print("  nearest-eval cosine:", json.dumps(report["nearestEvalCosine"]))
     print("  nearest-eval Jaccard:", json.dumps(report["nearestEvalJaccard"]))
@@ -624,7 +630,17 @@ def main():
         kept = filter_rows(rows, hits)
         out = dataset.with_name(dataset.stem + ".filtered.jsonl")
         C.write_jsonl(out, kept)
-        print(f"filter: kept {len(kept)} of {len(rows)} rows -> {out}")
+        # Negatives removed from kept rows (a negative-code hit); a dropped
+        # row's negatives go with it and are not counted here.
+        kept_ids = {r["id"] for r in kept}
+        negs_before = sum(len(r["negatives"]) for r in rows if r["id"] in kept_ids)
+        negs_after = sum(len(r["negatives"]) for r in kept)
+        report["filter"] = {"output": str(out), "outputSha256": C.sha256_file(out), "rowsIn": len(rows),
+                            "rowsKept": len(kept), "rowsDropped": len(rows) - len(kept),
+                            "negativesDropped": negs_before - negs_after, "hits": len(hits)}
+        C.write_json(dataset.parent / "filter.guard.json", report)
+        print(f"filter: kept {len(kept)} of {len(rows)} rows, dropped {len(rows) - len(kept)} rows and "
+              f"{negs_before - negs_after} negatives of kept rows, {len(hits)} hits -> {out}")
         return
     sys.exit(1 if hits else 0)
 

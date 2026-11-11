@@ -5,7 +5,8 @@
 # - work/models is a symlink to the stored eval work dir's models
 #   (jina int8, MiniLM tokenizer);
 # - each named repo is cloned at its pin (blobless), HEAD is checked against
-#   `revision`, its licence files' sha256 go to work/licences/<repo>.tsv, and
+#   `revision`, its licence files' sha256 (root LICENSE*/COPYING*, or the
+#   corpus's `licence_file`) go to work/licences/<repo>.tsv, and
 #   it is indexed with the model off and snapshotted by
 #   eval/embedding/make_snapshot.sh (EVAL_DIR=eval/training).
 #
@@ -69,11 +70,19 @@ for repo in "${repos[@]}"; do
 
   lic="$data/work/licences/$repo.tsv"
   : > "$lic"
-  for f in "$dir"/LICEN[CS]E* "$dir"/COPYING* "$dir"/licen[cs]e* ; do
-    [ -f "$f" ] || continue
-    printf '%s\t%s\n' "$(basename "$f")" "$(shasum -a 256 "$f" | cut -d' ' -f1)" >> "$lic"
-  done
-  [ -s "$lic" ] || { echo "$repo: no licence file at $rev" >&2; exit 1; }
+  # `licence_file` (a path from the repo root) names a licence that is not at
+  # the root (axum's is axum/LICENSE); without it, the root is searched.
+  licfile="$(field "$repo" licence_file)"
+  if [ -n "$licfile" ]; then
+    [ -f "$dir/$licfile" ] || { echo "$repo: licence_file $licfile not found at $rev" >&2; exit 1; }
+    printf '%s\t%s\n' "$licfile" "$(shasum -a 256 "$dir/$licfile" | cut -d' ' -f1)" >> "$lic"
+  else
+    for f in "$dir"/LICEN[CS]E* "$dir"/COPYING* "$dir"/licen[cs]e* ; do
+      [ -f "$f" ] || continue
+      printf '%s\t%s\n' "$(basename "$f")" "$(shasum -a 256 "$f" | cut -d' ' -f1)" >> "$lic"
+    done
+  fi
+  [ -s "$lic" ] || { echo "$repo: no licence file at $rev (set licence_file in corpora.toml)" >&2; exit 1; }
 
   EVAL_DIR="$here" eval/embedding/make_snapshot.sh "$repo" "$bin"
   embeddable="$(sed -n 's/^ *"embeddable": *\([0-9]*\).*/\1/p' "$data/work/$repo.snapshot.json")"

@@ -2,7 +2,10 @@
 """Export of a GM-456 training-data version
 (docs/design/GM-456-training-data.md, section 5).
 
-From `<version>/queries.judged.jsonl`:
+From `<version>/queries.judged.jsonl`, or with `--filtered` from the
+`leak_guard.py --filter` output `queries.judged.filtered.jsonl` (refused
+unless `filter.guard.json` names this judged file's and this filtered file's
+sha256; its drop counts go to the card and manifest):
   1. refuses any unjudged negative (`unjudged`);
   2. refuses a texts folder rendered by other code (`render.texts_for`);
   3. sets each row's `split` from corpora.toml, by repo, and refuses a repo
@@ -24,7 +27,7 @@ From `<version>/queries.judged.jsonl`:
 eval/training/ (`card/<version>.md`, `manifest/<version>.json`,
 `sample/<version>.md`) for committing.
 
-usage: export.py --version v0.0-stub
+usage: export.py --version v0.0-stub [--filtered]
 """
 
 import argparse
@@ -88,7 +91,24 @@ def sample_md(rows, nodes, version, k=SAMPLE, seed=sample.SEED):
     return "\n".join(out)
 
 
-def card_md(version, rows, repos, counts, guard, stub):
+def filter_record(vdir):
+    """The `filter` block of filter.guard.json, checked to be the filter run
+    of this queries.judged.jsonl that wrote this queries.judged.filtered.jsonl;
+    exits otherwise."""
+    judged, filtered = vdir / "queries.judged.jsonl", vdir / "queries.judged.filtered.jsonl"
+    path = vdir / "filter.guard.json"
+    rep = json.load(open(path)) if path.exists() else None
+    if not rep or not filtered.exists() or "filter" not in rep:
+        sys.exit(f"STOP: --filtered needs {filtered.name} and {path.name} (run leak_guard.py --filter --dataset "
+                 f"{judged})")
+    if rep.get("datasetSha256") != C.sha256_file(judged) or rep["filter"].get("outputSha256") != C.sha256_file(
+            filtered):
+        sys.exit(f"STOP: {path.name} is not the filter run of this {judged.name} and {filtered.name}; "
+                 f"rerun the filter stage")
+    return dict(rep["filter"], hitsPerCheck=rep["hitsPerCheck"])
+
+
+def card_md(version, rows, repos, counts, guard, stub, filt=None):
     langs = counts["queriesPerLanguage"]
     lines = [f"# GM-456 training data {version}", ""]
     if stub:
@@ -100,6 +120,9 @@ def card_md(version, rows, repos, counts, guard, stub):
         f"Language mix: {json.dumps(langs)}.",
         f"Split (by repo): {json.dumps(counts['queriesPerSplit'])}.",
         f"Leak guard: {guard['result']} ({json.dumps(guard['hitsPerCheck'])}).",
+        (f"Leak filter: dropped {filt['rowsDropped']} of {filt['rowsIn']} rows and {filt['negativesDropped']} "
+         f"negatives of kept rows ({json.dumps(filt['hitsPerCheck'])}; filter.leaks.jsonl)." if filt else
+         "Leak filter: not run."),
         "",
         "Known biases: queries are LLM-written (cleaner than agent queries; see `docEcho` and the",
         "`overlap = false` share); hard negatives are what BM25 and the shipped jina int8 rank high,",
@@ -139,9 +162,12 @@ def main():
     ap.add_argument("--version", required=True)
     ap.add_argument("--repo-copy", action="store_true")
     ap.add_argument("--eval-work", default=None)
+    ap.add_argument("--filtered", action="store_true",
+                    help="export queries.judged.filtered.jsonl (the pipeline's filter stage)")
     args = ap.parse_args()
     vdir = Path(C.version_dir(args.version))
-    rows = C.read_jsonl(vdir / "queries.judged.jsonl")
+    filt = filter_record(vdir) if args.filtered else None
+    rows = C.read_jsonl(vdir / ("queries.judged.filtered.jsonl" if args.filtered else "queries.judged.jsonl"))
     missing = unjudged(rows)
     if missing:
         sys.exit(f"STOP: {len(missing)} unjudged negatives, e.g. {missing[:5]}")
@@ -200,7 +226,7 @@ def main():
     guard["dataset"] = str(vdir / "queries.jsonl")
     C.write_json(guard_path, guard)
     (vdir / "sample.md").write_text(sample_md(rows, nodes, args.version))
-    (vdir / "card.md").write_text(card_md(args.version, rows, repos, counts, guard, stub))
+    (vdir / "card.md").write_text(card_md(args.version, rows, repos, counts, guard, stub, filt))
 
     targets_meta = json.load(open(vdir / "targets.meta.json"))
     manifest = {
@@ -214,11 +240,13 @@ def main():
         "judging": step_record(vdir, "judge", judge.PROMPT, judge.PER_REQUEST, stub),
         "renderIds": render_ids,
         "guard": {k: guard[k] for k in ("result", "hitsPerCheck", "rowsFlaggedShare", "thresholds", "pinsVerified")},
+        "filter": filt,
         "counts": counts,
         "files": file_hashes(vdir),
     }
     C.write_json(vdir / "manifest.json", manifest)
-    print("export:", json.dumps({"rows": len(rows), "guard": guard["result"], **counts}))
+    print("export:", json.dumps({"rows": len(rows), "guard": guard["result"],
+                                 "filterDropped": filt and filt["rowsDropped"], **counts}))
     if args.repo_copy:
         for src, dst in (("card.md", f"card/{args.version}.md"), ("manifest.json", f"manifest/{args.version}.json"),
                          ("sample.md", f"sample/{args.version}.md")):

@@ -13,6 +13,10 @@
 #            per pack (section 2b). A usage limit stops the run; relaunching
 #            the same command skips every pack already stored.
 #   With neither, the generate and judge stages stop at --dry-run.
+#   --from <stage>  start at setup|nodes|sample|render|generate|mine|judge|filter|export.
+# filter runs leak_guard.py --filter on queries.judged.jsonl; export reads the
+# filtered rows and still runs leak_guard.py --check last.
+# Exit 0 done (or stopped at a dry run), 1 failed, 2 usage, 3 resumable stop.
 # Run from the repository root.
 set -euo pipefail
 
@@ -34,6 +38,8 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$version" ] || { echo "--version is required" >&2; exit 2; }
 [ $stub -eq 1 ] && [ $live -eq 1 ] && { echo "--stub and --live exclude each other" >&2; exit 2; }
+order="setup nodes sample render generate mine judge filter export"
+case " $order " in *" $from "*) ;; *) echo "--from: one of $order" >&2; exit 2 ;; esac
 
 data="${GM456_DATA:-$HOME/Projects/ClaudeProjects/g-mesh-data/gm456}"
 vdir="$data/$version"
@@ -48,19 +54,27 @@ for r in ${repos[@]+"${repos[@]}"}; do repo_args+=(--repo "$r"); done
 note() { echo "$*" | tee -a "$summary"; }
 
 stage() {  # stage <name> <command...>: timed, logged, fail-fast
+  # A step's exit 3 (claude_cli.STOP_EXIT: usage limit, failed probe) is a
+  # resumable stop: the run exits 3 with a STOP line; relaunching the same
+  # command resumes it. Any other non-zero exit is a failure (exit 1).
   local name="$1"; shift
+  local rc=0
   note "== $name  ($(uptime | sed 's/.*load averages*: /load /'))"
-  if ! /usr/bin/time -p taskpolicy -b "$@" > "$vdir/logs/$name.log" 2>&1; then
-    note "FAILED: $name (log $vdir/logs/$name.log)"
+  /usr/bin/time -p taskpolicy -b "$@" > "$vdir/logs/$name.log" 2>&1 || rc=$?
+  if [ $rc -eq 3 ]; then
+    note "STOP: $name stopped, resumable (exit 3; log $vdir/logs/$name.log); relaunch the same command to resume"
+    tail -25 "$vdir/logs/$name.log" >> "$summary"
+    exit 3
+  elif [ $rc -ne 0 ]; then
+    note "FAILED: $name (exit $rc; log $vdir/logs/$name.log)"
     tail -25 "$vdir/logs/$name.log" >> "$summary"
     exit 1
   fi
   grep -E '^(real|user|sys) ' "$vdir/logs/$name.log" | tr '\n' ' ' >> "$summary"; echo >> "$summary"
-  grep -E '^(nodes |sample:|render |generate|mine:|judge|leak_guard:|  nearest-eval|export:|collect:|run |STOP)' \
+  grep -E '^(nodes |sample:|render |generate|mine:|judge|leak_guard:|  nearest-eval|filter:|export:|collect:|run |STOP)' \
     "$vdir/logs/$name.log" | cut -c1-2000 >> "$summary" || true
 }
 
-order="setup nodes sample render generate mine judge export"
 skip=1
 for s in $order; do
   [ "$s" = "$from" ] && skip=0
@@ -95,9 +109,15 @@ for s in $order; do
         stage judge $py "$tdir/judge.py" --version "$version" --run --jobs "$jobs"
       else
         stage judge-dry $py "$tdir/judge.py" --version "$version" --dry-run
-        note "judge: run judge.py --run (or relaunch with --live), then resume with --from export"; exit 0
+        note "judge: run judge.py --run (or relaunch with --live), then resume with --from filter"; exit 0
       fi ;;
-    export) stage export $py "$tdir/export.py" --version "$version" ;;
+    filter)
+      # The judged rows minus every leak-guard hit: queries.judged.filtered.jsonl,
+      # with the dropped hits in filter.leaks.jsonl and the report in
+      # filter.guard.json (names export does not delete).
+      stage filter $py "$tdir/leak_guard.py" --version "$version" --filter \
+        --dataset "$vdir/queries.judged.jsonl" ;;
+    export) stage export $py "$tdir/export.py" --version "$version" --filtered ;;
   esac
 done
 note "OK $version"

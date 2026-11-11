@@ -30,8 +30,10 @@ Data lives outside git, in `$GM456_DATA` (default
 A version folder holds `nodes/<repo>.jsonl` (raw fields), `targets.jsonl`,
 `texts/<renderId>/`, `queries.gen.jsonl`, `mine/`, `queries.mined.jsonl`,
 `responses/` and `judge/` (batch requests and raw results),
-`queries.judged.jsonl`, and the export: `queries.jsonl`, `guard.json`,
-`leaks.jsonl`, `sample.md`, `card.md`, `manifest.json`, `summary.txt`.
+`queries.judged.jsonl`, the leak filter's `queries.judged.filtered.jsonl`,
+`filter.leaks.jsonl` (dropped hits) and `filter.guard.json`, and the export:
+`queries.jsonl`, `guard.json`, `leaks.jsonl`, `sample.md`, `card.md`,
+`manifest.json`, `summary.txt`.
 
 Major versions change targets or generation; minor versions change mining,
 judging, rendering or the guard.
@@ -65,10 +67,13 @@ python3 eval/training/leak_guard.py --pooling-check <eval work>/runs-gm465/jina-
 writes `<version>/summary.txt`. With `--live` the generate and judge stages
 run `generate.py --run` / `judge.py --run`: one headless `claude -p` per pack
 with no tools, MCP servers or settings sources (`claude_cli.py`, design
-section 2b). A usage limit stops the run; relaunching the same command reruns
+section 2b). A usage limit stops the run with exit 3 and a `STOP` line in the
+summary (other failures exit 1); relaunching the same command reruns
 no pack stored for the same request (a pack whose request changed is set aside
 under `responses/<step>/stale/` and rerun). With neither `--stub` nor `--live` it stops after each
-`--dry-run`; resume with `--from mine` or `--from export`.
+`--dry-run`; resume with `--from mine` or `--from filter`. The `filter` stage
+drops every leak-guard hit from the judged rows (`leak_guard.py --filter`);
+`export.py --filtered` exports the rest and still runs `--check` last.
 
 ```
 bash eval/training/run_pipeline.sh --version v0.1-cli --live --count 5 --skip-setup mini-redis

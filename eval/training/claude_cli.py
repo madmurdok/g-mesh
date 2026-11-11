@@ -45,6 +45,11 @@ PROBE_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "re
 LIMIT_TEXT = ("rate limit", "rate_limit", "usage limit", "limit reached", "hit your limit", "limit will reset",
               "out of extra usage", "quota")
 LIMIT_STATUS = re.compile(r"\b429\b")
+# Exit code of a resumable stop (usage limit, unblind or failed probe):
+# relaunching the same command later resumes it. Config STOPs (sandbox root
+# under .git/CLAUDE.md, no free sandbox dir, unknown --retry ids, stored
+# responses of another prompt/schema/effort/model, invalid custom_id) exit 1:
+# the same command fails the same way until someone changes an input.
 STOP_EXIT = 3
 OUTCOMES = ("success", "refusal", "malformed", "limit", "transient", "unblind")
 
