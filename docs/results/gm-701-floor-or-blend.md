@@ -36,6 +36,8 @@ Deltas are in points of caught/kept share; the kept CI is paired on the resample
 
 ## Verdict: null (do not ship)
 
+Owner decision, 2026-11-11: "Закрыть как null (Recommended)". The shipped GM-697 floors stay as the only signal; no soft note, no ADR 0012 addendum.
+
 Rule: ship only if the paired gain CI excludes 0 and right tops kept >= 90%.
 - NL: the gain CI excludes 0 (B +5.9 pts), but the floor alone already keeps only 75.3% of right tops on the reranked page, so no OR rule can reach 90% (B 74.9%, B2 75.3%). Fails the kept condition. The variant that holds kept (B2) gains only +1.7 pts.
 - NAME: gains are large (+21 pts), but kept drops from 97.1% to 89.97% (B: 305/339, just below 90) or 90.9% (B2). Each lost right top is a hard noMatch on a right answer; the floor meets the GM-697 3% misled budget (2.9%), B/B2 give about 9-10%, breaching the GM-699 follow-up condition (name-query misled at or below 3%). B2 meets the letter of 90% but not that budget.
