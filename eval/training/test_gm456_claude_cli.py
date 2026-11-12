@@ -568,22 +568,24 @@ class JudgeRun(E2EBase):
         self.assertEqual(X.unjudged(self.judged()), [])
         self.assertEqual(self.skipped(), [])
 
-    def test_wrong_length_verdict_list_drops_the_entry_and_export_sees_it_unjudged(self):
+    def test_wrong_length_verdict_list_drops_the_entry_and_its_queries(self):
         out = self.verdicts((1, ["non-answer", "non-answer"]), (2, ["non-answer"]))
         self.set_fake([{"match": "", "steps": [{"stdout": cli_ok(out)}]}])
         self.main(J)
-        self.assertEqual(X.unjudged(self.judged()), [("r-0001-p1", "r:c2"), ("r-0001-p2", "r:c2")])
+        self.assertEqual(self.judged(), [])
         self.assertEqual([s["reason"] for s in self.skipped()],
                          ["t1 c2: 1 verdicts for 2 queries; entry dropped"])
-        # the dropped entry must not leak a partial judgement onto the first query either
-        rows = {r["id"]: r for r in self.judged()}
-        self.assertIsNone(rows["r-0001-p1"]["negatives"][1]["judge"])
-        self.assertEqual(rows["r-0001-p1"]["negatives"][0]["judge"]["verdict"], "non-answer")
+        # the dropped entry leaves one unjudged pair per query, not a partial judgement
+        dropped = C.read_jsonl(self.vdir / "judge" / "judge-dropped.jsonl")
+        self.assertEqual([(d["id"], d["unjudgedPairs"]) for d in dropped], [("r-0001-p1", 1), ("r-0001-p2", 1)])
 
     def test_export_refuses_the_judge_output_with_an_unjudged_pair(self):
-        out = self.verdicts((1, ["non-answer", "non-answer"]), (2, ["non-answer"]))
+        out = self.verdicts((1, ["non-answer", "non-answer"]), (2, ["non-answer", "non-answer"]))
         self.set_fake([{"match": "", "steps": [{"stdout": cli_ok(out)}]}])
         self.main(J)
+        rows = self.judged()  # a hand-made unjudged pair on each query
+        C.write_jsonl(self.vdir / "queries.judged.jsonl",
+                      [dict(r, negatives=[dict(r["negatives"][0], judge=None)] + r["negatives"][1:]) for r in rows])
         with mock.patch.object(sys, "argv", ["export.py", "--version", self.version]):
             with self.assertRaises(SystemExit) as cm:
                 X.main()

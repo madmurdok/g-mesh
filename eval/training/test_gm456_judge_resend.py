@@ -64,8 +64,9 @@ class ResendBase(T.E2EBase):
     def judged(self):
         return C.read_jsonl(self.vdir / "queries.judged.jsonl")
 
-    def unjudged(self):
-        return len(X.unjudged(self.judged()))
+    def unjudged(self):  # pairs left unjudged: in queries.judged.jsonl plus in the queries the judge dropped
+        dropped = C.read_jsonl(self.jdir / "judge-dropped.jsonl") if (self.jdir / "judge-dropped.jsonl").exists() else []
+        return len(X.unjudged(self.judged())) + sum(d["unjudgedPairs"] for d in dropped)
 
     def resent(self):
         return C.read_jsonl(self.jdir / "judge-resent.jsonl")
@@ -102,10 +103,7 @@ class Resend(ResendBase):
                          ["t1 c2: 1 verdicts for 2 queries; entry dropped"])
         row = self.resent()[0]
         self.assertEqual((row["unjudgedBefore"], row["unjudgedAfter"]), (2, 2))
-        with mock.patch.object(sys, "argv", ["export.py", "--version", self.version]):
-            with self.assertRaises(SystemExit) as cm:
-                X.main()
-        self.assertIn("2 unjudged negatives", str(cm.exception.code))
+        self.assertEqual(self.judged(), [])
 
     def test_missing_candidate_entry_is_resent(self):  # behaviour 3
         self.steps(self.no_c2(), self.good())

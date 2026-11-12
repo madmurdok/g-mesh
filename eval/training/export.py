@@ -5,7 +5,8 @@
 From `<version>/queries.judged.jsonl`, or with `--filtered` from the
 `leak_guard.py --filter` output `queries.judged.filtered.jsonl` (refused
 unless `filter.guard.json` names this judged file's and this filtered file's
-sha256; its drop counts go to the card and manifest):
+sha256; its drop counts go to the card and manifest; so do the counts of
+`judge/judge-drop.json`, refused unless it names this judged file's sha256):
   1. refuses any unjudged negative (`unjudged`);
   2. refuses a texts folder rendered by other code (`render.texts_for`);
   3. sets each row's `split` from corpora.toml, by repo, and refuses a repo
@@ -108,7 +109,21 @@ def filter_record(vdir):
     return dict(rep["filter"], hitsPerCheck=rep["hitsPerCheck"])
 
 
-def card_md(version, rows, repos, counts, guard, stub, filt=None):
+def judge_drop_record(vdir):
+    """judge.py --run's record of the queries it removed for unjudged
+    negatives, checked to be about this queries.judged.jsonl; None when the
+    judged file comes from a run that writes no record (the stub verdicts)."""
+    path = vdir / "judge" / judge.DROP_RECORD
+    if not path.exists():
+        return None
+    rec = json.load(open(path))
+    if rec.get("judgedSha256") != C.sha256_file(vdir / "queries.judged.jsonl"):
+        sys.exit(f"STOP: {path} is not the record of this queries.judged.jsonl; rerun the judge stage or move "
+                 f"the record aside")
+    return rec
+
+
+def card_md(version, rows, repos, counts, guard, stub, filt=None, drop=None):
     langs = counts["queriesPerLanguage"]
     lines = [f"# GM-456 training data {version}", ""]
     if stub:
@@ -120,6 +135,8 @@ def card_md(version, rows, repos, counts, guard, stub, filt=None):
         f"Language mix: {json.dumps(langs)}.",
         f"Split (by repo): {json.dumps(counts['queriesPerSplit'])}.",
         f"Leak guard: {guard['result']} ({json.dumps(guard['hitsPerCheck'])}).",
+        (f"Judge drop: dropped {drop['queriesDropped']} of {drop['queriesIn']} queries with unjudged negatives "
+         f"({drop['pairsUnjudged']} pairs; judge/judge-dropped.jsonl)." if drop else "Judge drop: not recorded."),
         (f"Leak filter: dropped {filt['rowsDropped']} of {filt['rowsIn']} rows and {filt['negativesDropped']} "
          f"negatives of kept rows ({json.dumps(filt['hitsPerCheck'])}; filter.leaks.jsonl)." if filt else
          "Leak filter: not run."),
@@ -171,6 +188,7 @@ def main():
     missing = unjudged(rows)
     if missing:
         sys.exit(f"STOP: {len(missing)} unjudged negatives, e.g. {missing[:5]}")
+    drop = judge_drop_record(vdir)
     repos = C.corpora()
     rows = split_rows(rows, repos)
     names = sorted({r["repo"] for r in rows})
@@ -226,7 +244,7 @@ def main():
     guard["dataset"] = str(vdir / "queries.jsonl")
     C.write_json(guard_path, guard)
     (vdir / "sample.md").write_text(sample_md(rows, nodes, args.version))
-    (vdir / "card.md").write_text(card_md(args.version, rows, repos, counts, guard, stub, filt))
+    (vdir / "card.md").write_text(card_md(args.version, rows, repos, counts, guard, stub, filt, drop))
 
     targets_meta = json.load(open(vdir / "targets.meta.json"))
     manifest = {
@@ -240,12 +258,14 @@ def main():
         "judging": step_record(vdir, "judge", judge.PROMPT, judge.PER_REQUEST, stub),
         "renderIds": render_ids,
         "guard": {k: guard[k] for k in ("result", "hitsPerCheck", "rowsFlaggedShare", "thresholds", "pinsVerified")},
+        "judgeDrop": drop,
         "filter": filt,
         "counts": counts,
         "files": file_hashes(vdir),
     }
     C.write_json(vdir / "manifest.json", manifest)
     print("export:", json.dumps({"rows": len(rows), "guard": guard["result"],
+                                 "judgeDropped": drop and drop["queriesDropped"],
                                  "filterDropped": filt and filt["rowsDropped"], **counts}))
     if args.repo_copy:
         for src, dst in (("card.md", f"card/{args.version}.md"), ("manifest.json", f"manifest/{args.version}.json"),
