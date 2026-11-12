@@ -1,0 +1,272 @@
+# Source repos of the GM-456 training data (docs/design/GM-456-training-data.md,
+# section 1). Pins are the peeled commit of a release tag, or HEAD on
+# 2026-11-10 where `ref = "HEAD"`. `checkout` is relative to this directory
+# (eval/training/work is a symlink into the data dir). `licence`,
+# `licence_file` (a licence not at the repo root), `split` and
+# `url` are extra keys `debug-embed-eval` ignores; `split` is the by-repo
+# train/dev split.
+
+[[corpus]]
+id = "serde-json"
+language = "rust"
+source = "https://github.com/serde-rs/json.git"
+url = "https://github.com/serde-rs/json.git"
+ref = "v1.0.154"
+revision = "20572a6d066958542d79cdd6cf1a7cd9f0c8e1f8"
+checkout = "work/corpora/serde-json"
+licence = "Apache-2.0 (dual MIT)"
+split = "train"
+
+[[corpus]]
+id = "axum"
+language = "rust"
+source = "https://github.com/tokio-rs/axum.git"
+url = "https://github.com/tokio-rs/axum.git"
+ref = "axum-v0.8.9"
+revision = "c59208c86fded335cd85e388030ad59347b0e5ae"
+checkout = "work/corpora/axum"
+licence = "MIT"
+licence_file = "axum/LICENSE"
+split = "train"
+
+[[corpus]]
+id = "rayon"
+language = "rust"
+source = "https://github.com/rayon-rs/rayon.git"
+url = "https://github.com/rayon-rs/rayon.git"
+ref = "v1.12.0"
+revision = "c9ced185ae3508246a9eb70c8407a1199bb1b77f"
+checkout = "work/corpora/rayon"
+licence = "Apache-2.0 (dual MIT)"
+split = "train"
+
+[[corpus]]
+id = "bat"
+language = "rust"
+source = "https://github.com/sharkdp/bat.git"
+url = "https://github.com/sharkdp/bat.git"
+ref = "v0.26.1"
+revision = "979ba22628bc9d8171f2cffca2bd5c90c9fc0a9e"
+checkout = "work/corpora/bat"
+licence = "Apache-2.0 (dual MIT)"
+split = "train"
+
+[[corpus]]
+id = "tracing"
+language = "rust"
+source = "https://github.com/tokio-rs/tracing.git"
+url = "https://github.com/tokio-rs/tracing.git"
+ref = "tracing-0.1.44"
+revision = "2d55f6faf9be83e7e4634129fb96813241aac2b8"
+checkout = "work/corpora/tracing"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "bytes"
+language = "rust"
+source = "https://github.com/tokio-rs/bytes.git"
+url = "https://github.com/tokio-rs/bytes.git"
+ref = "v1.12.1"
+revision = "76c0fbb54ed4336caf9d2311658a2f4a5627c21d"
+checkout = "work/corpora/bytes"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "http"
+language = "rust"
+source = "https://github.com/hyperium/http.git"
+url = "https://github.com/hyperium/http.git"
+ref = "v1.5.0"
+revision = "16fc9a7b840c2181e7f8b37397c107b0ffcd050d"
+checkout = "work/corpora/http"
+licence = "Apache-2.0 (dual MIT)"
+split = "dev"
+
+[[corpus]]
+id = "mini-redis"
+language = "rust"
+source = "https://github.com/tokio-rs/mini-redis.git"
+url = "https://github.com/tokio-rs/mini-redis.git"
+ref = "HEAD"
+revision = "3d93b42bc363220f85af4fc9e1bebd35b588a4a3"
+checkout = "work/corpora/mini-redis"
+licence = "MIT"
+split = "dev"
+
+[[corpus]]
+id = "cobra"
+language = "go"
+source = "https://github.com/spf13/cobra.git"
+url = "https://github.com/spf13/cobra.git"
+ref = "v1.10.2"
+revision = "88b30ab89da2d0d0abb153818746c5a2d30eccec"
+checkout = "work/corpora/cobra"
+licence = "Apache-2.0"
+split = "train"
+
+[[corpus]]
+id = "urfave-cli"
+language = "go"
+source = "https://github.com/urfave/cli.git"
+url = "https://github.com/urfave/cli.git"
+ref = "v3.14.0"
+revision = "2f64589904992914a49b1c1869eba269e580bc5d"
+checkout = "work/corpora/urfave-cli"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "viper"
+language = "go"
+source = "https://github.com/spf13/viper.git"
+url = "https://github.com/spf13/viper.git"
+ref = "v1.21.0"
+revision = "394040caccbdf5821fa6839386a35f0fb1b1ee9e"
+checkout = "work/corpora/viper"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "logrus"
+language = "go"
+source = "https://github.com/sirupsen/logrus.git"
+url = "https://github.com/sirupsen/logrus.git"
+ref = "v1.10.2"
+revision = "6d6a132bc03324d4ceb78e1b927f995d014cda20"
+checkout = "work/corpora/logrus"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "burntsushi-toml"
+language = "go"
+source = "https://github.com/BurntSushi/toml.git"
+url = "https://github.com/BurntSushi/toml.git"
+ref = "v1.6.0"
+revision = "52534926c55b4cd85b05aee90569dd0668b8cf30"
+checkout = "work/corpora/burntsushi-toml"
+licence = "MIT"
+split = "dev"
+
+[[corpus]]
+id = "groupcache"
+language = "go"
+source = "https://github.com/golang/groupcache.git"
+url = "https://github.com/golang/groupcache.git"
+ref = "HEAD"
+revision = "2c02b8208cf8c02a3e358cb1d9b60950647543fc"
+checkout = "work/corpora/groupcache"
+licence = "Apache-2.0"
+split = "dev"
+
+[[corpus]]
+id = "click"
+language = "python"
+source = "https://github.com/pallets/click.git"
+url = "https://github.com/pallets/click.git"
+ref = "8.5.1"
+revision = "cf19179e8e2fd54c601378cec9e0d21bb12b6fb1"
+checkout = "work/corpora/click"
+licence = "BSD-3-Clause"
+split = "train"
+
+[[corpus]]
+id = "attrs"
+language = "python"
+source = "https://github.com/python-attrs/attrs.git"
+url = "https://github.com/python-attrs/attrs.git"
+ref = "26.1.0"
+revision = "7bfc49e9b22d5ba25b6e429524c3d49fee27cb36"
+checkout = "work/corpora/attrs"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "rich"
+language = "python"
+source = "https://github.com/Textualize/rich.git"
+url = "https://github.com/Textualize/rich.git"
+ref = "v15.0.0"
+revision = "6ac483cbea39cab124dfd3483bba70ffafb71050"
+checkout = "work/corpora/rich"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "black"
+language = "python"
+source = "https://github.com/psf/black.git"
+url = "https://github.com/psf/black.git"
+ref = "26.10.1"
+revision = "258e7dbf348bc23cb70b8cdf693481c04634ebcc"
+checkout = "work/corpora/black"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "more-itertools"
+language = "python"
+source = "https://github.com/more-itertools/more-itertools.git"
+url = "https://github.com/more-itertools/more-itertools.git"
+ref = "v11.2.1"
+revision = "4aeb4338ae1407d8da9723e86da99efeb446f719"
+checkout = "work/corpora/more-itertools"
+licence = "MIT"
+split = "dev"
+
+[[corpus]]
+id = "valibot"
+language = "typescript"
+source = "https://github.com/open-circle/valibot.git"
+url = "https://github.com/open-circle/valibot.git"
+ref = "v1.5.0"
+revision = "5016198907beb383f5a6d8bbcb4c7f1586d7c6a3"
+checkout = "work/corpora/valibot"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "immer"
+language = "typescript"
+source = "https://github.com/immerjs/immer.git"
+url = "https://github.com/immerjs/immer.git"
+ref = "v11.2.9"
+revision = "75a290e44ba14bd723c8ef8546b6559c8ef3ae88"
+checkout = "work/corpora/immer"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "hono"
+language = "typescript"
+source = "https://github.com/honojs/hono.git"
+url = "https://github.com/honojs/hono.git"
+ref = "v4.13.17"
+revision = "61f7c59e50244ab4d2dd83c151928cf7ea448510"
+checkout = "work/corpora/hono"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "zustand"
+language = "typescript"
+source = "https://github.com/pmndrs/zustand.git"
+url = "https://github.com/pmndrs/zustand.git"
+ref = "v5.1.0"
+revision = "9fed2eb2f3af672da9f7bf694b996df3831fc207"
+checkout = "work/corpora/zustand"
+licence = "MIT"
+split = "train"
+
+[[corpus]]
+id = "ky"
+language = "typescript"
+source = "https://github.com/sindresorhus/ky.git"
+url = "https://github.com/sindresorhus/ky.git"
+ref = "v2.2.0"
+revision = "3541888878c4d303a8bc2ad61815f4e048f55a5d"
+checkout = "work/corpora/ky"
+licence = "MIT"
+split = "dev"

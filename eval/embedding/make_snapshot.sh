@@ -7,13 +7,14 @@
 # its sha256.
 #
 # Usage: eval/embedding/make_snapshot.sh <corpus> [g-mesh binary]
-# Run from the repository root. MODEL=on keeps the model (for the parity
+# Run from the repository root. EVAL_DIR picks another eval dir (default
+# eval/embedding). MODEL=on keeps the model (for the parity
 # corpus, whose production vectors `debug-embed-eval parity` compares with).
 set -euo pipefail
 
 corpus="$1"
 bin="${2:-target/release/g-mesh}"
-eval_dir="eval/embedding"
+eval_dir="${EVAL_DIR:-eval/embedding}"
 checkout="$eval_dir/work/corpora/$corpus"
 home="$(cd "$eval_dir" && pwd)/work/home/$corpus"
 
