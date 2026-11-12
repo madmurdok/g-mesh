@@ -180,6 +180,37 @@ def parse_message(request, message, prompt_sha):
     return out, problems
 
 
+def unjudged_pairs(request, got):
+    """(query, candidate) pairs of `request` that `got` gives no verdict."""
+    return sum(1 for t in request["targets"] for q in t["queries"] for c in t["candidates"]
+               if (q, c) not in (got or {}))
+
+
+def collect(requests, step_dir, prompt_sha):
+    """Parses every stored response. Returns (verdicts, skipped rows,
+    {custom_id: unjudged pair count} of the packs with unjudged pairs,
+    custom_ids of the packs with no stored response)."""
+    verdicts, skipped, short, absent = {}, [], {}, set()
+    for req in requests:
+        cid = req["custom_id"]
+        cli, why = claude_cli.stored(req, step_dir)
+        if cli is None:
+            skipped.append({"customId": cid, "reason": why})
+            short[cid] = unjudged_pairs(req, None)
+            absent.add(cid)
+            continue
+        got, problems = parse_message(req, claude_cli.to_message(cli), prompt_sha)
+        n = unjudged_pairs(req, got)
+        if n:
+            short[cid] = n
+        if got is None:
+            skipped.append({"customId": cid, "reason": problems})
+            continue
+        verdicts.update(got)
+        skipped += [{"customId": cid, "reason": p} for p in problems]
+    return verdicts, skipped, short, absent
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", required=True)
@@ -219,19 +250,21 @@ def main():
     resp = vdir / "responses"
     claude_cli.run_step("judge", requests, resp, args, SCHEMA, prompt, prompt_sha, MODEL, EFFORT, PER_REQUEST,
                         args.version)
-    verdicts, skipped = {}, []
-    for req in requests:
-        cid = req["custom_id"]
-        cli, why = claude_cli.stored(req, resp / "judge")
-        if cli is None:
-            skipped.append({"customId": cid, "reason": why})
-            continue
-        got, problems = parse_message(req, claude_cli.to_message(cli), prompt_sha)
-        if got is None:
-            skipped.append({"customId": cid, "reason": problems})
-            continue
-        verdicts.update(got)
-        skipped += [{"customId": cid, "reason": p} for p in problems]
+    verdicts, skipped, unjudged, absent = collect(requests, resp / "judge", prompt_sha)
+    # A stored response that leaves pairs unjudged is re-sent once per invocation; a recorded
+    # failure is not (--retry re-sends it).
+    short = {cid: n for cid, n in unjudged.items() if cid not in absent}
+    resent = []
+    if short:
+        print(f"judge --run: re-sending {len(short)} packs with unjudged pairs once: {sorted(short)}", flush=True)
+        claude_cli.run_step("judge", requests, resp, argparse.Namespace(**dict(vars(args), retry=sorted(short))),
+                            SCHEMA, prompt, prompt_sha, MODEL, EFFORT, PER_REQUEST, args.version)
+        verdicts, skipped, after, _ = collect(requests, resp / "judge", prompt_sha)
+        resent = [{"customId": cid, "unjudgedBefore": short[cid], "unjudgedAfter": after.get(cid, 0)}
+                  for cid in sorted(short)]
+        print(f"judge --run: re-sent {len(resent)} packs, {sum(1 for r in resent if r['unjudgedAfter'])} "
+              f"still with unjudged pairs", flush=True)
+    C.write_jsonl(vdir / "judge" / "judge-resent.jsonl", resent)
     judged = apply_verdicts(rows, verdicts)
     C.write_jsonl(vdir / "queries.judged.jsonl", judged)
     C.write_jsonl(vdir / "judge" / "judge-skipped.jsonl", skipped)
