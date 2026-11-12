@@ -94,6 +94,8 @@ with seed 456.
 - Per repo: the quota is proportional to the repo's frame (embeddable,
   non-test nodes), capped at 30% of its language.
 - Dev repos hold about 15-20% of each language.
+- `nodes.py` drops every node of a file whose longest line exceeds 2,000 chars
+  (minified or bundled code, counted as `minified_file`); a line of exactly 2,000 is kept.
 
 The frames are not yet measured. S6 step 0 indexes every repo with the model
 off, which is cheap, and fixes the quotas. If Rust's frame is below about
@@ -571,7 +573,7 @@ New directory `eval/training/` (an eval-dir layout):
 | `corpora.toml` | The 23 pins of section 1, plus `licence`, `split`, `url` keys | `CorporaFile` (`embed_eval/config.rs:11`) has no `deny_unknown_fields`, so S2 confirms the extra keys parse |
 | `variants.toml` | `[settings]` plus two rows: a copy of `jina-v2-base-code-int8-structured` (`eval/embedding/variants.toml:145`) and `name="bm25", arm="bm25", role="informational"` | the existing variant parser |
 | `setup_work.sh` | Clone each repo at its pin, check `HEAD == revision`, record the licence file sha256, index with the model off, snapshot | `eval/embedding/make_snapshot.sh`. Parametrise its hard-coded `eval_dir="eval/embedding"` with `EVAL_DIR` (a one-line edit) |
-| `nodes.py` | Snapshot plus checkout to `nodes/<repo>.jsonl` (raw fields, `srcLines`), dropping test and fixture paths | `sample_targets.embeddable` (:59), `TEST_PATH`/`TEST_QNAME` (:43, :48), `line_at_pin` (:63) |
+| `nodes.py` | Snapshot plus checkout to `nodes/<repo>.jsonl` (raw fields, `srcLines`), dropping test and fixture paths and files with a line over 2,000 chars | `sample_targets.embeddable` (:59), `TEST_PATH`/`TEST_QNAME` (:43, :48), `line_at_pin` (:63) |
 | `sample.py` | Seed-456 stratified target order with per-repo quotas | `sample_targets.stratum` (:51), `STRATA_PATTERN` (:41) |
 | `render.py` | `texts/<renderId>/` for both forms | `gm423_token_lengths.text_to_embed` (:181), `gm698_ce_text_fixture.build` (:54), `minilm_counter` (:58) |
 | `generate.py` | Build the batch request JSONL (`--dry-run` in S2), submit, collect responses, parse to queries. `--stub` writes clearly-labelled stub queries (the doc's first sentence, else the name words) for pipeline tests only | `check_queries.overlap` (:68) |

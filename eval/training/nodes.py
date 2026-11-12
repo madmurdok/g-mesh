@@ -11,6 +11,9 @@ from the checkout the way the eval reads a source file
 (`gm698_ce_text_fixture.read_lines`), rebased to line 0; `spanSha256` is the
 whitespace-normalised span's sha256 (leak-guard check 2).
 
+A file with a line longer than `MAX_LINE_CHARS` (minified or bundled code) is
+dropped whole: its nodes are counted under `dropped["minified_file"]`.
+
 usage: nodes.py --version v0.0-stub [--repo mini-redis ...]
 """
 
@@ -23,6 +26,8 @@ from pathlib import Path
 
 import common as C
 from sample_targets import TEST_PATH, TEST_QNAME, embeddable
+
+MAX_LINE_CHARS = 2000  # a file with a longer line contributes no nodes
 
 COLS = ("id", "kind", "nativeKind", "name", "qualifiedName", "filePath", "startLine", "endLine",
         "signature", "docComment", "language")
@@ -109,6 +114,9 @@ def frame(repo, meta, rows, checkout):
         lines = files[r["filePath"]]
         if lines is None:
             dropped["no_source_file"] += 1
+            continue
+        if max(map(len, lines), default=0) > MAX_LINE_CHARS:
+            dropped["minified_file"] += 1
             continue
         seen.add(key)
         span = lines[r["startLine"]: r["endLine"] + 1]
