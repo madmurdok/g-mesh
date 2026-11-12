@@ -26,6 +26,7 @@ usage: judge.py --version v0.0-stub --dry-run --stub-verdict
 
 import argparse
 import json
+import shutil
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -211,6 +212,48 @@ def collect(requests, step_dir, prompt_sha):
     return verdicts, skipped, short, absent
 
 
+def save_previous(step_dir, cids):
+    """Copies each pack's stored response and request-sha256 sidecar to
+    `<step_dir>/resend-prev/` (replacing an earlier copy). Returns that dir."""
+    prev = Path(step_dir) / "resend-prev"
+    prev.mkdir(parents=True, exist_ok=True)
+    for cid in cids:
+        for f in claude_cli.pack_files(step_dir, cid)[:2]:
+            shutil.copy2(f, prev / f.name)
+    return prev
+
+
+def keep_better(request, step_dir, prev, before, prompt_sha):
+    """After a re-send: keeps the new response when it is stored and leaves no
+    more pairs unjudged than `before`; otherwise restores the copy in `prev`
+    and moves the re-send's response or failure there as `<cid>.resend.*`.
+    Returns the judge-resent.jsonl row."""
+    cid = request["custom_id"]
+    out, sha, errf = claude_cli.pack_files(step_dir, cid)
+    if not errf.exists() and out.exists() and out.read_bytes() == (prev / out.name).read_bytes():
+        return {"customId": cid, "unjudgedBefore": before, "unjudgedAfter": before, "kept": "previous",
+                "resend": "not run"}
+    cli, why = claude_cli.stored(request, step_dir)
+    if cli is not None:
+        got, _ = parse_message(request, claude_cli.to_message(cli), prompt_sha)
+        n = unjudged_pairs(request, got)
+        if n <= before:
+            return {"customId": cid, "unjudgedBefore": before, "unjudgedAfter": n, "kept": "resent",
+                    "resend": "success"}
+        outcome = f"success with {n} unjudged pairs"
+    else:
+        outcome = why
+    if errf.exists():
+        errf.rename(prev / f"{cid}.resend.err.json")
+    if out.exists() and (prev / out.name).read_bytes() != out.read_bytes():
+        out.rename(prev / f"{cid}.resend.json")
+    sha.unlink(missing_ok=True)
+    shutil.copy2(prev / out.name, out)
+    shutil.copy2(prev / sha.name, sha)
+    return {"customId": cid, "unjudgedBefore": before, "unjudgedAfter": before, "kept": "previous",
+            "resend": outcome}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", required=True)
@@ -251,19 +294,26 @@ def main():
     claude_cli.run_step("judge", requests, resp, args, SCHEMA, prompt, prompt_sha, MODEL, EFFORT, PER_REQUEST,
                         args.version)
     verdicts, skipped, unjudged, absent = collect(requests, resp / "judge", prompt_sha)
-    # A stored response that leaves pairs unjudged is re-sent once per invocation; a recorded
-    # failure is not (--retry re-sends it).
-    short = {cid: n for cid, n in unjudged.items() if cid not in absent}
+    # A stored response that leaves pairs unjudged is re-sent once per invocation. Not re-sent: a
+    # recorded failure (--retry re-sends it) and a pack this invocation's --retry already sent.
+    short = {cid: n for cid, n in unjudged.items() if cid not in absent and cid not in (args.retry or ())}
     resent = []
     if short:
         print(f"judge --run: re-sending {len(short)} packs with unjudged pairs once: {sorted(short)}", flush=True)
-        claude_cli.run_step("judge", requests, resp, argparse.Namespace(**dict(vars(args), retry=sorted(short))),
-                            SCHEMA, prompt, prompt_sha, MODEL, EFFORT, PER_REQUEST, args.version)
-        verdicts, skipped, after, _ = collect(requests, resp / "judge", prompt_sha)
-        resent = [{"customId": cid, "unjudgedBefore": short[cid], "unjudgedAfter": after.get(cid, 0)}
-                  for cid in sorted(short)]
-        print(f"judge --run: re-sent {len(resent)} packs, {sum(1 for r in resent if r['unjudgedAfter'])} "
-              f"still with unjudged pairs", flush=True)
+        by_id = {r["custom_id"]: r for r in requests}
+        prev = save_previous(resp / "judge", short)
+        try:
+            claude_cli.run_step("judge", requests, resp,
+                                argparse.Namespace(**dict(vars(args), retry=sorted(short))),
+                                SCHEMA, prompt, prompt_sha, MODEL, EFFORT, PER_REQUEST, args.version)
+        finally:
+            # Runs on a stop (exit 3) too, so a stored response is never left worse than before the re-send.
+            resent = [keep_better(by_id[cid], resp / "judge", prev, short[cid], prompt_sha) for cid in sorted(short)]
+        verdicts, skipped, _, _ = collect(requests, resp / "judge", prompt_sha)
+        print(f"judge --run: re-sent {len(resent)} packs, "
+              f"{sum(1 for r in resent if r['kept'] == 'resent')} replaced, "
+              f"{sum(1 for r in resent if r['kept'] == 'previous')} kept the previous response, "
+              f"{sum(1 for r in resent if r['unjudgedAfter'])} still with unjudged pairs", flush=True)
     C.write_jsonl(vdir / "judge" / "judge-resent.jsonl", resent)
     judged = apply_verdicts(rows, verdicts)
     C.write_jsonl(vdir / "queries.judged.jsonl", judged)
