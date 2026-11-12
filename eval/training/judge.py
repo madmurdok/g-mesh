@@ -12,7 +12,9 @@ Verdicts are applied by `apply_verdicts`:
   non-answer  kept as a hard negative, with its verdict recorded.
 A pair the judge left out stays unjudged; `--run` then removes every query
 with an unjudged negative (`judge/judge-dropped.jsonl`, counts in
-`judge/judge-drop.json`), and export still refuses any unjudged negative.
+`judge/judge-drop.json`), except the queries of a pack with a recorded
+failure: those stay, and `--run` exits 1 naming the packs to `--retry`.
+Export still refuses any unjudged negative.
 
 Modes:
   --dry-run   build `judge/judge-requests.jsonl` and print its size. With
@@ -257,10 +259,11 @@ def keep_better(request, step_dir, prev, before, prompt_sha):
             "resend": outcome}
 
 
-def drop_unjudged(judged, requests, skipped):
+def drop_unjudged(judged, requests, skipped, failed=()):
     """Removes every query that has a negative with no verdict: the whole
-    query, since the alignment of its pairs is unknown. Returns (kept rows,
-    one judge-dropped.jsonl row per removed query)."""
+    query, since the alignment of its pairs is unknown. Queries of the packs
+    in `failed` (no stored response) are kept. Returns (kept rows, one
+    judge-dropped.jsonl row per removed query)."""
     pack = {q: r["custom_id"] for r in requests for t in r["targets"] for q in t["queries"]}
     reasons = defaultdict(list)
     for s in skipped:
@@ -268,10 +271,10 @@ def drop_unjudged(judged, requests, skipped):
     kept, dropped = [], []
     for r in judged:
         n = sum(1 for c in r["negatives"] if c["judge"] is None)
-        if not n:
+        cid = pack.get(r["id"])
+        if not n or cid in failed:
             kept.append(r)
             continue
-        cid = pack.get(r["id"])
         dropped.append({"id": r["id"], "customId": cid, "unjudgedPairs": n,
                         "reason": "; ".join(reasons.get(cid) or ["no verdict"])})
     return kept, dropped
@@ -310,6 +313,9 @@ def main():
                         for q in t["queries"] for c in t["candidates"]}
             judged = apply_verdicts(rows, verdicts)
             C.write_jsonl(vdir / "queries.judged.jsonl", judged)
+            # The drop record describes a --run's judged file; this one has none.
+            for name in ("judge-dropped.jsonl", DROP_RECORD):
+                (vdir / "judge" / name).unlink(missing_ok=True)
             print(f"judge --stub-verdict: {len(verdicts)} stub verdicts (non-answer)")
         return
 
@@ -332,13 +338,13 @@ def main():
         finally:
             # Runs on a stop (exit 3) too, so a stored response is never left worse than before the re-send.
             resent = [keep_better(by_id[cid], resp / "judge", prev, short[cid], prompt_sha) for cid in sorted(short)]
-        verdicts, skipped, _, _ = collect(requests, resp / "judge", prompt_sha)
+        verdicts, skipped, _, absent = collect(requests, resp / "judge", prompt_sha)
         print(f"judge --run: re-sent {len(resent)} packs, "
               f"{sum(1 for r in resent if r['kept'] == 'resent')} replaced, "
               f"{sum(1 for r in resent if r['kept'] == 'previous')} kept the previous response, "
               f"{sum(1 for r in resent if r['unjudgedAfter'])} still with unjudged pairs", flush=True)
     C.write_jsonl(vdir / "judge" / "judge-resent.jsonl", resent)
-    judged, dropped = drop_unjudged(apply_verdicts(rows, verdicts), requests, skipped)
+    judged, dropped = drop_unjudged(apply_verdicts(rows, verdicts), requests, skipped, absent)
     C.write_jsonl(vdir / "queries.judged.jsonl", judged)
     C.write_jsonl(vdir / "judge" / "judge-skipped.jsonl", skipped)
     C.write_jsonl(vdir / "judge" / "judge-dropped.jsonl", dropped)
@@ -349,6 +355,11 @@ def main():
           f"({sum(d['unjudgedPairs'] for d in dropped)} pairs; judge/judge-dropped.jsonl)", flush=True)
     print(f"judge --run: {len(verdicts)} verdicts {dict(Counter(v['verdict'] for v in verdicts.values()))}, "
           f"{len(skipped)} skipped")
+    if absent:
+        # Exit 1, not claude_cli.STOP_EXIT: a plain resume does not re-send a recorded failure.
+        sys.exit(f"STOP judge: {len(absent)} packs have a recorded failure and no stored response; their queries "
+                 f"stay unjudged. Re-send them: judge.py --version {args.version} --run --retry "
+                 f"{' '.join(sorted(absent))}")
 
 
 if __name__ == "__main__":

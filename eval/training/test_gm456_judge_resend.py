@@ -147,7 +147,9 @@ class Resend(ResendBase):
 
     def test_pack_with_a_recorded_failure_is_not_resent(self):  # behaviour 8
         self.steps(T.cli_err(None, "boom"), self.good())  # malformed: one call, .err.json
-        self.main(J)
+        with self.assertRaises(SystemExit) as cm:  # a recorded failure stops judge for a --retry
+            self.main(J)
+        self.assertIn("--retry", str(cm.exception.code))
         self.assertEqual(self.packs(), 1)
         self.assertTrue(CC.pack_files(self.resp, self.cid)[2].exists())
         self.assertEqual(self.resent(), [])
