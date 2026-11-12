@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import test_gm456_claude_cli as T
+import test_gm456_render_export as RE
 
 C, CC, J, X = T.C, T.CC, T.J, T.X
 NA = "non-answer"
@@ -235,6 +236,187 @@ class ResendKeepsEarlier(ResendBase):
         self.assertEqual(self.packs(), n + 2)
         self.assertEqual(self.unjudged(), 0)
         self.assertEqual(self.resent()[0]["unjudgedAfter"], 0)
+
+
+class DropBase(ResendBase):
+    def dropped(self):
+        return C.read_jsonl(self.jdir / "judge-dropped.jsonl")
+
+    def drop_record(self):
+        return json.load(open(self.jdir / "judge-drop.json"))
+
+    def run_capture(self, *extra):
+        """judge --run with stdout captured: returns the printed lines."""
+        argv = ["judge.py", "--version", self.version, "--run", "--cwd-root", str(self.cwd_root), "--jobs", "1", *extra]
+        with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print") as p:
+            J.main()
+        return [" ".join(str(a) for a in c.args) for c in p.call_args_list]
+
+    def multi(self, n):
+        """n targets r:t1..r:tn with one query each (text qtext-i) and the candidate r:c1; 5 targets to a pack."""
+        self.write_nodes([f"r:t{i}" for i in range(1, n + 1)] + ["r:c1"])
+        negs = [{"key": "r:c1", "sources": ["embed"], "sameFile": False}]
+        C.write_jsonl(self.vdir / "queries.mined.jsonl", [
+            {"id": f"r-{i:04d}-p1", "repo": "r", "target": f"r:t{i}", "text": f"qtext-{i}", "positives": [f"r:t{i}"],
+             "negatives": negs} for i in range(1, n + 1)])
+
+    @staticmethod
+    def entries(ts, bad=()):
+        """Verdict entries for targets `ts` (one query, one candidate each); a target in `bad` gets 2 verdicts."""
+        return {"verdicts": [{"t": t, "c": 1, "verdicts": [NA, NA] if t in bad else [NA]} for t in ts]}
+
+
+class Drop(DropBase):
+    def test_query_left_unjudged_after_the_resend_is_removed_and_recorded(self):  # S56-1, S56-3
+        self.steps(self.short())
+        self.main(J)
+        self.assertEqual(self.judged(), [])
+        rows = self.dropped()
+        self.assertEqual([(d["id"], d["customId"], d["unjudgedPairs"]) for d in rows],
+                         [("r-0001-p1", self.cid, 1), ("r-0001-p2", self.cid, 1)])
+        self.assertEqual({d["reason"] for d in rows}, {"t1 c2: 1 verdicts for 2 queries; entry dropped"})
+        rec = self.drop_record()
+        self.assertEqual((rec["queriesIn"], rec["queriesDropped"], rec["pairsUnjudged"]), (2, 2, 2))
+        self.assertEqual(rec["judgedSha256"], C.sha256_file(self.vdir / "queries.judged.jsonl"))
+
+    def test_only_the_query_with_an_unjudged_negative_is_removed(self):  # S56-2
+        self.multi(2)  # one pack, targets t1 and t2; t1's only entry has the wrong length
+        self.steps(T.cli_ok(self.entries([1, 2], bad=[1])))
+        self.main(J)
+        self.assertEqual(self.packs(), 2)
+        self.assertEqual([r["id"] for r in self.judged()], ["r-0002-p1"])
+        self.assertEqual([d["id"] for d in self.dropped()], ["r-0001-p1"])
+        self.assertEqual(self.drop_record()["queriesIn"], 2)
+        self.assertEqual(self.drop_record()["queriesDropped"], 1)
+
+    def test_one_stdout_line_reports_the_drop(self):  # S56 stdout line
+        self.steps(self.short())
+        lines = self.run_capture()
+        self.assertEqual(sum(1 for line in lines if "dropped 2 of 2 queries with unjudged negatives" in line), 1)
+        self.assertEqual(sum(1 for line in lines if "judge-dropped.jsonl" in line), 1)
+
+    def test_a_clean_run_writes_empty_drop_files(self):
+        self.steps(self.good())
+        self.main(J)
+        self.assertEqual(self.dropped(), [])
+        self.assertEqual(self.drop_record()["queriesDropped"], 0)
+        self.assertEqual(len(self.judged()), 2)
+
+    def test_limit_during_the_first_send_drops_nothing(self):  # S56-8
+        self.steps(T.LIMIT)
+        self.exit3()
+        for name in ("judge-dropped.jsonl", "judge-drop.json"):
+            self.assertFalse((self.jdir / name).exists(), name)
+        self.assertFalse((self.vdir / "queries.judged.jsonl").exists())
+
+    def test_limit_during_the_resend_leaves_earlier_outputs_untouched(self):  # S56-8
+        self.jdir.mkdir(parents=True, exist_ok=True)
+        sentinel = {self.jdir / "judge-dropped.jsonl": b"old dropped\n", self.jdir / "judge-drop.json": b"{}\n",
+                    self.vdir / "queries.judged.jsonl": b"old judged\n"}
+        for path, data in sentinel.items():
+            path.write_bytes(data)
+        self.steps(self.short(), T.LIMIT)  # first send is short, the re-send hits the limit
+        self.exit3()
+        for path, data in sentinel.items():
+            self.assertEqual(path.read_bytes(), data, path.name)
+
+    def test_recorded_failure_keeps_its_queries_and_exits_1_naming_the_retry(self):  # S62-1, S62-2
+        self.steps(T.cli_err(None, "boom"))  # malformed -> .err.json
+        with self.assertRaises(SystemExit) as cm:
+            self.main(J)
+        self.assertIsInstance(cm.exception.code, str)  # exit status 1, not the resumable 3
+        self.assertIn(f"--retry {self.cid}", cm.exception.code)
+        self.assertEqual(self.packs(), 1)
+        self.assertEqual(len(self.judged()), 2)  # kept, negatives unjudged
+        self.assertTrue(all(n["judge"] is None for r in self.judged() for n in r["negatives"]))
+        self.assertEqual(self.dropped(), [])
+        self.assertEqual(self.drop_record()["queriesDropped"], 0)
+        with mock.patch.object(sys, "argv", ["export.py", "--version", self.version]):  # S62-5
+            with self.assertRaises(SystemExit) as ex:
+                X.main()
+        self.assertIn("4 unjudged negatives", str(ex.exception.code))
+
+    def test_failed_pack_is_kept_while_a_short_pack_is_dropped(self):  # S62-3
+        self.multi(6)  # pack 1: t1-t5, pack 2: t6
+        self.set_fake([{"match": "qtext-6", "steps": [{"stdout": T.cli_err(None, "boom")}]},
+                       {"match": "qtext-1", "steps": [{"stdout": T.cli_ok(self.entries([1, 2, 3, 4, 5], bad=[1]))}]}])
+        with self.assertRaises(SystemExit) as cm:
+            self.main(J)
+        self.assertIsInstance(cm.exception.code, str)
+        self.assertIn("--retry judge-r-0006", cm.exception.code)
+        self.assertNotIn("judge-r-0001", cm.exception.code)
+        self.assertEqual(self.packs(), 3)  # pack 1 twice (first send, one re-send), pack 2 once
+        self.assertEqual([d["id"] for d in self.dropped()], ["r-0001-p1"])
+        self.assertEqual([r["id"] for r in self.judged()], [f"r-{i:04d}-p1" for i in range(2, 7)])
+        self.assertIsNone(next(r for r in self.judged() if r["id"] == "r-0006-p1")["negatives"][0]["judge"])
+
+    def test_failed_resend_is_not_a_recorded_failure_and_the_short_queries_are_dropped(self):  # S62-4
+        self.steps(self.short(), T.TRANSIENT)
+        self.main(J)  # exit 0
+        self.assertEqual(self.judged(), [])
+        self.assertEqual(len(self.dropped()), 2)
+        self.assertEqual(self.resent()[0]["kept"], "previous")
+
+    def test_stub_verdict_removes_the_drop_record_and_plain_dry_run_keeps_it(self):  # S62-6, S56-9
+        self.steps(self.short())
+        self.main(J)
+        before = self.packs()
+        names = ("judge-dropped.jsonl", "judge-drop.json")
+        argv = ["judge.py", "--version", self.version, "--dry-run"]
+        with mock.patch.object(sys, "argv", argv), mock.patch("builtins.print"):
+            J.main()
+        self.assertTrue(all((self.jdir / n).exists() for n in names))
+        self.assertEqual(self.judged(), [])
+        with mock.patch.object(sys, "argv", argv + ["--stub-verdict"]), mock.patch("builtins.print"):
+            J.main()
+        self.assertFalse(any((self.jdir / n).exists() for n in names))
+        self.assertEqual(len(self.judged()), 2)
+        self.assertEqual(self.packs(), before)
+
+
+class DropExport(RE.ExportBase):
+    def setUp(self):
+        super().setUp()
+        self.write_judged(self.rows)
+
+    def record(self, **over):
+        rec = {"judgedSha256": C.sha256_file(self.vdir / "queries.judged.jsonl"), "queriesIn": 9,
+               "queriesDropped": 7, "pairsUnjudged": 4}
+        rec.update(over)
+        C.write_json(self.vdir / "judge" / "judge-drop.json", rec)
+        return rec
+
+    def run_export(self):
+        self.export(self.fake_guard(0, lambda d: self.guard_report("clean", C.sha256_file(d))))
+
+    def test_record_is_read_not_recomputed_into_manifest_and_card(self):  # S56-4
+        rec = self.record()
+        self.run_export()
+        self.assertEqual(json.load(open(self.vdir / "manifest.json"))["judgeDrop"], rec)
+        self.assertIn("Judge drop: dropped 7 of 9 queries with unjudged negatives (4 pairs;",
+                      (self.vdir / "card.md").read_text())
+
+    def test_no_record_says_not_recorded(self):  # S56-6
+        self.run_export()
+        self.assertIsNone(json.load(open(self.vdir / "manifest.json"))["judgeDrop"])
+        self.assertIn("Judge drop: not recorded.", (self.vdir / "card.md").read_text())
+
+    def test_record_of_another_judged_file_stops_the_export(self):  # S56-5
+        self.record(judgedSha256="0" * 64)
+        with self.assertRaises(SystemExit) as cm:
+            self.run_export()
+        self.assertIn("judge-drop.json", str(cm.exception.code))
+        self.assertEqual(self.guard_calls, [])
+        self.assert_nothing_exported()
+
+    def test_unjudged_gate_runs_before_the_record_check(self):  # S56-7
+        self.record()
+        self.rows[1] = RE.row(2, "mini-redis", judged=False)
+        self.write_judged(self.rows)  # the record's sha no longer matches either
+        with self.assertRaises(SystemExit) as cm:
+            self.run_export()
+        self.assertIn("1 unjudged negatives", str(cm.exception.code))
+        self.assert_nothing_exported()
 
 
 if __name__ == "__main__":
