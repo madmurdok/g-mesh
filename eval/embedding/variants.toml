@@ -297,3 +297,37 @@ reference = "jina-v2-base-code-fp32"
 name = "bm25"
 arm = "bm25"
 role = "informational"
+
+# --- GM-436: base arms of the query adapters (docs/design/GM-436-laptop-training.md, section 5.1)
+# gte-small on the shipped structured text (pins of the gte-small row), and a
+# words-shuffled twin for each adapter base. A words-shuffled row takes its
+# text form from its own row, so each one sets `text = "structured"`. Adapter
+# rows (`arm = "adapter"`) are appended below by eval/training/gm436/export_adapter.py.
+
+[[variant]]
+name = "gte-small-structured"
+arm = "model"
+role = "cost"
+hf_repo = "thenlper/gte-small"
+revision = "17e1f347d17fe144873b1201da91788898c639cd"
+onnx_file = "onnx/model.onnx"
+model_dir = "work/models/gte-small"
+pooling = "mean"
+dimension = 384
+max_tokens = 512
+token_type_ids = true
+text = "structured"
+
+[[variant]]
+name = "gte-small-structured-words-shuffled"
+arm = "words-shuffled"
+role = "informational"
+reference = "gte-small-structured"
+text = "structured"
+
+[[variant]]
+name = "jina-v2-base-code-int8-structured-words-shuffled"
+arm = "words-shuffled"
+role = "informational"
+reference = "jina-v2-base-code-int8-structured"
+text = "structured"
