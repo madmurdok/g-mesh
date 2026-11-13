@@ -1,0 +1,31 @@
+# Mining arms of the GM-456 training data (docs/design/GM-456-training-data.md,
+# sections 3 and 7). `jina-v2-base-code-int8-structured` is the shipped
+# encoder and text, copied from eval/embedding/variants.toml with only `role`
+# changed: the parser requires `settings.reference` to name a model arm with
+# role "reference". `bm25` ranks the same structured texts.
+
+[settings]
+reference = "jina-v2-base-code-int8-structured"
+bootstrap_seed = 456
+bootstrap_resamples = 1000
+arm_seed = 456
+
+[[variant]]
+name = "jina-v2-base-code-int8-structured"
+arm = "model"
+role = "reference"
+hf_repo = "jinaai/jina-embeddings-v2-base-code"
+revision = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+onnx_file = "onnx/model_quantized.onnx"
+model_dir = "work/models/jina-v2-base-code-int8"
+pooling = "mean"
+dimension = 768
+max_tokens = 1024
+token_type_ids = false
+text = "structured"
+
+[[variant]]
+name = "bm25"
+arm = "bm25"
+role = "informational"
+text = "structured"
