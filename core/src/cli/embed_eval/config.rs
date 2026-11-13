@@ -69,6 +69,9 @@ pub enum Arm {
     WordsShuffled,
     /// Lexical ranking over the same texts (D7).
     Bm25,
+    /// The reference's node vectors, and its query vectors mapped through
+    /// a `QueryAdapter` (q' = W q). Runs no encoder.
+    Adapter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -184,7 +187,7 @@ pub struct Variant {
     pub query_prefix: String,
     #[serde(default)]
     pub document_prefix: String,
-    /// The model variant a shuffled or words-shuffled arm is derived from.
+    /// The variant a shuffled, words-shuffled or adapter arm is derived from.
     #[serde(default)]
     pub reference: Option<String>,
     /// Kept last: `embed_eval::fingerprint` drops it when it is the default,
@@ -199,6 +202,15 @@ pub struct Variant {
     /// for the same reason.
     #[serde(default)]
     pub filter: EmbedFilter,
+    /// An adapter arm's matrix file (`QueryAdapter` format); `~/` expands to
+    /// the home directory, a relative path is relative to the eval dir. Kept
+    /// after `filter` with `adapter_sha256`: `embed_eval::fingerprint` drops
+    /// both when both are `None`.
+    #[serde(default)]
+    pub adapter: Option<String>,
+    /// The sha256 the adapter file must have.
+    #[serde(default)]
+    pub adapter_sha256: Option<String>,
 }
 
 impl VariantsFile {
@@ -242,6 +254,18 @@ impl VariantsFile {
                         bail!("random variant {} needs `dimension`", v.name);
                     }
                 }
+                Arm::Adapter => {
+                    let base = v
+                        .reference
+                        .as_deref()
+                        .with_context(|| format!("variant {} needs `reference`", v.name))?;
+                    if !matches!(self.get(base)?.arm, Arm::Model | Arm::WordsShuffled) {
+                        bail!("variant {}'s reference {base} is not a model or words-shuffled arm", v.name);
+                    }
+                    if v.adapter.is_none() || v.adapter_sha256.is_none() {
+                        bail!("adapter variant {} needs `adapter` and `adapter_sha256`", v.name);
+                    }
+                }
                 Arm::Bm25 => {}
             }
         }
@@ -261,7 +285,7 @@ impl VariantsFile {
         match variant.arm {
             Arm::Model => Ok(variant),
             Arm::WordsShuffled | Arm::Shuffled => self.get(variant.reference.as_deref().unwrap_or_default()),
-            Arm::Random | Arm::Bm25 => bail!("variant {} runs no encoder", variant.name),
+            Arm::Random | Arm::Bm25 | Arm::Adapter => bail!("variant {} runs no encoder", variant.name),
         }
     }
 }
@@ -280,13 +304,27 @@ impl Variant {
 
     pub fn model_dir(&self, eval_dir: &Path) -> Result<PathBuf> {
         match self.model_dir.as_deref() {
-            Some(dir) if dir.starts_with("~/") => {
-                Ok(dirs::home_dir().context("could not resolve home directory")?.join(&dir[2..]))
-            }
-            Some(dir) if Path::new(dir).is_absolute() => Ok(PathBuf::from(dir)),
-            Some(dir) => Ok(eval_dir.join(dir)),
+            Some(dir) => resolve(eval_dir, dir),
             None => Ok(eval_dir.join("work").join("models").join(&self.name)),
         }
+    }
+
+    pub fn adapter_path(&self, eval_dir: &Path) -> Result<PathBuf> {
+        resolve(
+            eval_dir,
+            self.adapter.as_deref().with_context(|| format!("variant {} has no `adapter`", self.name))?,
+        )
+    }
+}
+
+/// `~/` expands to the home directory; a relative path is relative to `eval_dir`.
+fn resolve(eval_dir: &Path, path: &str) -> Result<PathBuf> {
+    if let Some(rest) = path.strip_prefix("~/") {
+        Ok(dirs::home_dir().context("could not resolve home directory")?.join(rest))
+    } else if Path::new(path).is_absolute() {
+        Ok(PathBuf::from(path))
+    } else {
+        Ok(eval_dir.join(path))
     }
 }
 

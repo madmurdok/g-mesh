@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::embedding::adapter::QueryAdapter;
 use crate::embedding::model::{
     cosine_similarity, BatchStats, EmbeddingModel, EncoderSpec, ExecutionTarget, InferenceOptions,
     ONNX_FILE_NAME, TOKENIZER_FILE_NAME,
@@ -222,6 +223,9 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 }
 
 fn write_vectors(path: &Path, vectors: &[Vec<f32>]) -> Result<()> {
+    // An adapter arm's `vectors.bin` is a symlink to its reference's; writing
+    // through it would overwrite the reference run.
+    remove_symlink(path)?;
     let mut bytes = Vec::with_capacity(vectors.iter().map(|v| v.len() * 4).sum());
     for v in vectors {
         for x in v {
@@ -229,6 +233,30 @@ fn write_vectors(path: &Path, vectors: &[Vec<f32>]) -> Result<()> {
         }
     }
     std::fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn remove_symlink(path: &Path) -> Result<()> {
+    if path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+        std::fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Makes `link` a symlink to `source` (made absolute), replacing whatever
+/// `link` was.
+fn link_vectors(source: &Path, link: &Path) -> Result<()> {
+    let source =
+        std::fs::canonicalize(source).with_context(|| format!("failed to resolve {}", source.display()))?;
+    if link.symlink_metadata().is_ok() {
+        std::fs::remove_file(link).with_context(|| format!("failed to remove {}", link.display()))?;
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&source, link)
+        .with_context(|| format!("failed to link {} to {}", link.display(), source.display()))?;
+    #[cfg(not(unix))]
+    std::fs::copy(&source, link)
+        .with_context(|| format!("failed to copy {} to {}", source.display(), link.display()))?;
+    Ok(())
 }
 
 fn read_vectors(path: &Path, count: usize, dimension: usize) -> Result<Vec<Vec<f32>>> {
@@ -575,11 +603,15 @@ fn fingerprint(variant: &Variant) -> String {
     hex(&Sha256::digest(fingerprint_text(variant).as_bytes()))
 }
 
-/// The variant's `Debug` form, without the `filter`, `context` and `text`
+/// The variant's `Debug` form, without the `adapter` and `adapter_sha256`
+/// fields when both are `None` and without the `filter`, `context` and `text`
 /// fields when they are the default: a default must leave the fingerprints
 /// of runs stored before the field existed valid. Stripped last field first.
 fn fingerprint_text(variant: &Variant) -> String {
     let mut debug = format!("{variant:?}");
+    if variant.adapter.is_none() && variant.adapter_sha256.is_none() {
+        debug = debug.replacen(", adapter: None, adapter_sha256: None }", " }", 1);
+    }
     if variant.filter == EmbedFilter::None {
         debug = debug.replacen(", filter: None }", " }", 1);
     }
@@ -792,7 +824,7 @@ fn run_variant(args: &RunArgs) -> Result<()> {
     if args.ep != ExecutionTarget::Cpu {
         // These arms run no encoder, so a provider would be recorded without
         // having produced anything.
-        if matches!(variant.arm, Arm::Random | Arm::Bm25) {
+        if matches!(variant.arm, Arm::Random | Arm::Bm25 | Arm::Adapter) {
             bail!("--ep {} does not apply to {}: it runs no encoder", args.ep.name(), variant.name);
         }
         log_onnx_runtime_to_stderr();
@@ -814,10 +846,17 @@ fn run_variant(args: &RunArgs) -> Result<()> {
         }
         _ => None,
     };
+    let adapter = match variant.arm {
+        Arm::Adapter => Some(QueryAdapter::load(
+            &variant.adapter_path(eval_dir)?,
+            variant.adapter_sha256.as_deref().unwrap_or_default(),
+        )?),
+        _ => None,
+    };
     let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
 
     for corpus in &corpus_ids {
-        run_corpus(args, &corpora, &variants, &variant, encoder.as_ref(), load_ms, corpus)
+        run_corpus(args, &corpora, &variants, &variant, encoder.as_ref(), adapter.as_ref(), load_ms, corpus)
             .with_context(|| format!("variant {} on {corpus}", variant.name))?;
     }
     Ok(())
@@ -857,6 +896,7 @@ fn run_corpus(
     variants: &VariantsFile,
     variant: &Variant,
     encoder: Option<&(Variant, PathBuf, EmbeddingModel)>,
+    adapter: Option<&QueryAdapter>,
     load_ms: f64,
     corpus: &str,
 ) -> Result<()> {
@@ -884,6 +924,24 @@ fn run_corpus(
         Arm::Random => variant.dimension.unwrap(),
         Arm::Shuffled => variants.get(variant.reference.as_deref().unwrap())?.dimension.unwrap_or(0),
         Arm::Bm25 => 0,
+        Arm::Adapter => {
+            let reference = variants.get(variant.reference.as_deref().unwrap())?;
+            let dimension = variants
+                .encoder_of(reference)?
+                .dimension
+                .with_context(|| format!("variant {} needs `dimension`", reference.name))?;
+            let adapter = adapter.unwrap();
+            if adapter.dim != dimension {
+                bail!(
+                    "adapter {} is {}x{}, the reference {} has dimension {dimension}",
+                    variant.adapter.as_deref().unwrap_or_default(),
+                    adapter.dim,
+                    adapter.dim,
+                    reference.name
+                );
+            }
+            dimension
+        }
     };
     let (model_files, token_share_over_512, token_share_over_1024) = match (variant.arm, encoder) {
         (Arm::Model, Some((base, model_dir, _))) => {
@@ -953,6 +1011,7 @@ fn run_corpus(
         read_vectors(&dir.join("vectors.bin"), candidates.len(), dimension)?
     } else {
         let started = Instant::now();
+        let mut linked = None;
         let vectors = match variant.arm {
             Arm::Model => {
                 let (base, _, model) = encoder.unwrap();
@@ -1000,13 +1059,22 @@ fn run_corpus(
                 let source = read_vectors(&reference.join("vectors.bin"), candidates.len(), dimension)?;
                 arm_rng.derangement(candidates.len()).into_iter().map(|j| source[j].clone()).collect()
             }
+            Arm::Adapter => {
+                let source = reference_run(args, variant, corpus, &manifest)?.join("vectors.bin");
+                let vectors = read_vectors(&source, candidates.len(), dimension)?;
+                linked = Some(source);
+                vectors
+            }
             Arm::Bm25 => unreachable!(),
         };
         timings.embed_nodes_ms = started.elapsed().as_secs_f64() * 1000.0;
         if timings.embed_nodes_ms > 0.0 {
             timings.embeddings_per_second = Some(candidates.len() as f64 / (timings.embed_nodes_ms / 1000.0));
         }
-        write_vectors(&dir.join("vectors.bin"), &vectors)?;
+        match linked {
+            Some(source) => link_vectors(&source, &dir.join("vectors.bin"))?,
+            None => write_vectors(&dir.join("vectors.bin"), &vectors)?,
+        }
         compare::write_node_ids(&dir, candidates.iter().map(|&i| nodes[i].id.as_str()))?;
         vectors
     };
@@ -1059,6 +1127,14 @@ fn run_corpus(
                     let reference = reference_run(args, variant, corpus, &manifest)?;
                     read_vectors(&reference.join("query_vectors.bin"), queries.len(), dimension)?
                 }
+                Arm::Adapter => {
+                    let reference = reference_run(args, variant, corpus, &manifest)?;
+                    let adapter = adapter.unwrap();
+                    read_vectors(&reference.join("query_vectors.bin"), queries.len(), dimension)?
+                        .iter()
+                        .map(|q| adapter.apply(q))
+                        .collect()
+                }
                 Arm::Bm25 => unreachable!(),
             };
             write_vectors(&dir.join("query_vectors.bin"), &vectors)?;
@@ -1107,9 +1183,9 @@ fn run_corpus(
     Ok(())
 }
 
-/// The reference model's run directory for a shuffled arm, checked to be
-/// over the same nodes and queries and run on the same execution provider,
-/// whose vectors the shuffled arm then carries.
+/// The reference's run directory for a shuffled or adapter arm, checked to
+/// be over the same nodes and queries and run on the same execution
+/// provider, whose vectors the arm then carries.
 fn reference_run(args: &RunArgs, variant: &Variant, corpus: &str, manifest: &Manifest) -> Result<PathBuf> {
     let reference = variant.reference.as_deref().unwrap();
     let dir = run_dir(args, reference, corpus);
