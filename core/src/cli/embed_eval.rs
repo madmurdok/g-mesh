@@ -2939,4 +2939,349 @@ mod tests {
             .collect();
         assert_eq!(calibrated, GATED_FLOOR_LANGUAGES.to_vec());
     }
+
+    // --- adapter arm (docs/design/GM-436-laptop-training.md, section 8) ---
+
+    const IDENTITY_2: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    /// W = [[0, 1], [-1, 0]] row-major: q' = W q maps (x, y) to (y, -x).
+    /// Not symmetric: Wᵀ maps (1, 0) to (0, 1), W to (0, -1).
+    const ROTATION: [f32; 4] = [0.0, 1.0, -1.0, 0.0];
+
+    fn adapter_variants(ad_row: &str) -> String {
+        format!(
+            "[settings]\nreference = \"m\"\nbootstrap_seed = 1\nbootstrap_resamples = 10\narm_seed = 1\n\n\
+             [[variant]]\nname = \"m\"\narm = \"model\"\nrole = \"reference\"\npooling = \"mean\"\n\
+             dimension = 2\nmax_tokens = 16\n\n\
+             [[variant]]\nname = \"ws\"\narm = \"words-shuffled\"\nrole = \"control\"\nreference = \"m\"\n\n\
+             [[variant]]\nname = \"rand\"\narm = \"random\"\nrole = \"informational\"\ndimension = 2\n\n\
+             [[variant]]\nname = \"shuf\"\narm = \"shuffled\"\nrole = \"control\"\nreference = \"m\"\n\n\
+             [[variant]]\nname = \"bm25\"\narm = \"bm25\"\nrole = \"informational\"\n\n\
+             [[variant]]\nname = \"ad\"\n{ad_row}\n"
+        )
+    }
+
+    fn adapter_row(reference: &str, file: &str, sha: &str) -> String {
+        format!(
+            "arm = \"adapter\"\nrole = \"informational\"\nreference = \"{reference}\"\n\
+             adapter = \"{file}\"\nadapter_sha256 = \"{sha}\""
+        )
+    }
+
+    /// Writes `w` (row-major f32) as `<eval_dir>/w.f32` and points `ad` at it.
+    fn set_adapter(eval_dir: &Path, w: &[f32]) {
+        let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(eval_dir.join("w.f32"), bytes).unwrap();
+        let sha = sha256_file(&eval_dir.join("w.f32")).unwrap();
+        std::fs::write(eval_dir.join("variants.toml"), adapter_variants(&adapter_row("m", "w.f32", &sha)))
+            .unwrap();
+    }
+
+    /// An eval dir with corpus `c` (the gold nodes: candidates `1`, `2`, `4`)
+    /// and three queries, the adapter `w` for arm `ad`, and a stand-in for the
+    /// model reference `m`'s run: the random arm's run copied to `runs/m/c`.
+    /// No model files exist, so any encoder load would fail.
+    fn adapter_eval_dir(w: &[f32]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write_corpora(dir.path(), &["c"]);
+        write_corpus(
+            dir.path(),
+            "c",
+            &gold_nodes(),
+            &[
+                gold_query("c-001", "deliver", &[MODULE]),
+                gold_query("c-002", "send a message", &[METHOD]),
+                gold_query("c-003", "other", &[MODULE, METHOD]),
+            ],
+        );
+        set_adapter(dir.path(), w);
+        run_variant(&run_args(dir.path(), "rand", &["c"], ExecutionTarget::Cpu)).unwrap();
+        let from = dir.path().join("runs/rand/c");
+        let to = reference_dir(dir.path());
+        std::fs::create_dir_all(&to).unwrap();
+        for entry in std::fs::read_dir(&from).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+        let mut m: Manifest = read_json(&to.join("manifest.json")).unwrap();
+        m.variant = "m".into();
+        write_json(&to.join("manifest.json"), &m).unwrap();
+        dir
+    }
+
+    fn reference_dir(eval_dir: &Path) -> PathBuf {
+        eval_dir.join("runs").join("m").join("c")
+    }
+
+    fn ad_args(eval_dir: &Path) -> RunArgs {
+        run_args(eval_dir, "ad", &["c"], ExecutionTarget::Cpu)
+    }
+
+    /// Replaces the reference run's node and query vectors and gives its
+    /// manifest another fingerprint, as a re-run of the reference would.
+    fn rerun_reference(eval_dir: &Path, nodes: &[[f32; 2]], queries: &[[f32; 2]], tag: &str) {
+        let dir = reference_dir(eval_dir);
+        let rows = |v: &[[f32; 2]]| v.iter().map(|r| r.to_vec()).collect::<Vec<_>>();
+        write_vectors(&dir.join("vectors.bin"), &rows(nodes)).unwrap();
+        write_vectors(&dir.join("query_vectors.bin"), &rows(queries)).unwrap();
+        let mut m: Manifest = read_json(&dir.join("manifest.json")).unwrap();
+        m.variant_fingerprint = format!("{}-{tag}", m.variant_fingerprint);
+        write_json(&dir.join("manifest.json"), &m).unwrap();
+    }
+
+    fn sorted_rows(mut rows: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+        rows.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        rows
+    }
+
+    /// Behaviour 1 (C0): an identity adapter's rankings equal its
+    /// reference's byte for byte. Control: applying anything but W in the
+    /// adapter's query branch, or reading other node vectors, changes them.
+    #[test]
+    fn an_identity_adapter_ranks_byte_for_byte_as_its_reference() {
+        let dir = adapter_eval_dir(&IDENTITY_2);
+        run_variant(&ad_args(dir.path())).unwrap();
+        let ours = std::fs::read_to_string(dir.path().join("runs/ad/c/rankings.jsonl")).unwrap();
+        let theirs = std::fs::read_to_string(reference_dir(dir.path()).join("rankings.jsonl")).unwrap();
+        assert_eq!(ours.lines().count(), 3);
+        assert_eq!(ours, theirs);
+    }
+
+    /// Behaviour 2: the arm ranks by cos(W q, c) with W row-major. q = (1, 0)
+    /// over nodes 1 = (1, 0), 2 = (0, 1), 4 = (0, -1): W q = (0, -1) ranks
+    /// `4` first; Wᵀ q would rank `2`, no multiply `1`. Control: skipping
+    /// `adapter.apply` in `run_corpus`, or a transposed `apply`, fails.
+    #[test]
+    fn an_adapter_ranks_by_w_times_q_row_major() {
+        let dir = adapter_eval_dir(&ROTATION);
+        rerun_reference(dir.path(), &[[1.0, 0.0], [0.0, 1.0], [0.0, -1.0]], &[[1.0, 0.0]; 3], "rot");
+        run_variant(&ad_args(dir.path())).unwrap();
+        let run = dir.path().join("runs/ad/c");
+        let ids = std::fs::read_to_string(run.join("node_ids.txt")).unwrap();
+        assert_eq!(ids.split_whitespace().collect::<Vec<_>>(), ["1", "2", "4"]);
+        let rankings = read_rankings(&run.join("rankings.jsonl"));
+        assert_eq!(rankings.len(), 3);
+        for line in rankings.values() {
+            assert_eq!(line.hits[0].0, "4", "{}: {:?}", line.id, line.hits);
+            assert!((line.hits[0].1 - 1.0).abs() < 1e-6, "{:?}", line.hits);
+        }
+    }
+
+    /// Behaviour 3: a wrong `adapter_sha256`, a file that is not a square f32
+    /// matrix, or a matrix of another size than the reference's dimension
+    /// fails the run naming the file, and writes no rankings.
+    #[test]
+    fn an_adapter_with_a_wrong_sha256_or_size_fails_naming_the_file() {
+        let dir = adapter_eval_dir(&IDENTITY_2);
+        let variants = dir.path().join("variants.toml");
+        let rankings = dir.path().join("runs/ad/c/rankings.jsonl");
+
+        std::fs::write(&variants, adapter_variants(&adapter_row("m", "w.f32", &"0".repeat(64)))).unwrap();
+        let err = format!("{:#}", run_variant(&ad_args(dir.path())).unwrap_err());
+        assert!(err.contains("w.f32") && err.contains("sha256"), "{err}");
+
+        set_adapter(dir.path(), &[1.0, 0.0, 0.0]);
+        let err = format!("{:#}", run_variant(&ad_args(dir.path())).unwrap_err());
+        assert!(err.contains("w.f32") && err.contains("not a square"), "{err}");
+
+        set_adapter(dir.path(), &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        let err = format!("{:#}", run_variant(&ad_args(dir.path())).unwrap_err());
+        assert!(err.contains("w.f32") && err.contains("3x3") && err.contains("dimension 2"), "{err}");
+        assert!(!rankings.exists());
+    }
+
+    /// Behaviour 4: unset adapter fields leave the fingerprint text as it was
+    /// before they existed (`stored_runs_keep_their_fingerprints` pins the
+    /// stored values); set, either field changes the fingerprint. Control:
+    /// stripping the fields whatever their value makes the set case equal.
+    #[test]
+    fn the_adapter_fields_enter_the_fingerprint_only_when_set() {
+        let file =
+            VariantsFile::parse(&adapter_variants(&adapter_row("m", "w.f32", &"a".repeat(64)))).unwrap();
+        let ad = file.get("ad").unwrap().clone();
+        let mut bare = ad.clone();
+        bare.adapter = None;
+        bare.adapter_sha256 = None;
+        assert!(!fingerprint_text(&bare).contains("adapter"), "{}", fingerprint_text(&bare));
+        assert_ne!(fingerprint(&ad), fingerprint(&bare));
+        let mut resha = ad.clone();
+        resha.adapter_sha256 = Some("b".repeat(64));
+        assert_ne!(fingerprint(&resha), fingerprint(&ad));
+        let mut moved = ad.clone();
+        moved.adapter = Some("v.f32".into());
+        assert_ne!(fingerprint(&moved), fingerprint(&ad));
+        for name in ["m", "ws", "rand", "shuf", "bm25"] {
+            let text = fingerprint_text(file.get(name).unwrap());
+            assert!(!text.contains("adapter"), "{name}: {text}");
+        }
+    }
+
+    /// Behaviour 5a: the reference must be a model or words-shuffled arm, and
+    /// `reference`, `adapter` and `adapter_sha256` are required.
+    #[test]
+    fn an_adapter_arm_needs_a_model_or_words_shuffled_reference_and_a_pinned_file() {
+        let sha = "a".repeat(64);
+        for reference in ["m", "ws"] {
+            assert!(VariantsFile::parse(&adapter_variants(&adapter_row(reference, "w.f32", &sha))).is_ok());
+        }
+        for reference in ["rand", "shuf", "bm25"] {
+            let err = format!(
+                "{:#}",
+                VariantsFile::parse(&adapter_variants(&adapter_row(reference, "w.f32", &sha))).unwrap_err()
+            );
+            assert!(err.contains("not a model or words-shuffled arm"), "{reference}: {err}");
+        }
+        let full = adapter_row("m", "w.f32", &sha);
+        for (field, message) in [
+            ("reference = ", "needs `reference`"),
+            ("adapter = ", "needs `adapter` and `adapter_sha256`"),
+            ("adapter_sha256 = ", "needs `adapter` and `adapter_sha256`"),
+        ] {
+            let row: Vec<&str> = full.lines().filter(|l| !l.starts_with(field)).collect();
+            let err = format!("{:#}", VariantsFile::parse(&adapter_variants(&row.join("\n"))).unwrap_err());
+            assert!(err.contains(message), "without {field}: {err}");
+        }
+    }
+
+    /// Behaviour 5b: the reference run must be over the same nodes and
+    /// queries and on the same provider. Control: removing either check in
+    /// `reference_run` lets the run through.
+    #[test]
+    fn an_adapter_arm_refuses_a_reference_run_over_other_nodes_queries_or_provider() {
+        type Tamper = fn(&mut Manifest);
+        let cases: [(&str, Tamper, &str); 3] = [
+            ("nodes", |m| m.node_ids_sha256 = "0".repeat(64), "different nodes or queries"),
+            ("queries", |m| m.query_ids.push("c-999".into()), "different nodes or queries"),
+            ("provider", |m| m.execution_provider = "coreml".into(), "--ep coreml"),
+        ];
+        for (what, tamper, message) in cases {
+            let dir = adapter_eval_dir(&IDENTITY_2);
+            let path = reference_dir(dir.path()).join("manifest.json");
+            let mut m: Manifest = read_json(&path).unwrap();
+            tamper(&mut m);
+            write_json(&path, &m).unwrap();
+            let err = format!("{:#}", run_variant(&ad_args(dir.path())).unwrap_err());
+            assert!(err.contains(message), "{what}: {err}");
+            assert!(!dir.path().join("runs/ad/c/rankings.jsonl").exists(), "{what}");
+        }
+    }
+
+    /// Behaviour 5c: an adapter arm runs no encoder, so `--ep` other than
+    /// cpu is refused before anything is written.
+    #[test]
+    fn an_adapter_arm_refuses_a_non_cpu_ep() {
+        let dir = adapter_eval_dir(&IDENTITY_2);
+        for ep in [ExecutionTarget::CoreMl, ExecutionTarget::CoreMlCpuOnly] {
+            let err = format!("{:#}", run_variant(&run_args(dir.path(), "ad", &["c"], ep)).unwrap_err());
+            assert!(err.contains("runs no encoder") && err.contains("ad"), "{err}");
+        }
+        assert!(!dir.path().join("runs/ad").exists());
+    }
+
+    /// Behaviour 6: the arm loads no model (none exists here) and carries the
+    /// reference's node vectors: `vectors.bin` is a link to the reference's.
+    #[test]
+    fn an_adapter_arm_loads_no_model_and_links_the_reference_vectors() {
+        let dir = adapter_eval_dir(&ROTATION);
+        assert!(!dir.path().join("work/models/m").exists());
+        run_variant(&ad_args(dir.path())).unwrap();
+        let ours = dir.path().join("runs/ad/c/vectors.bin");
+        let theirs = reference_dir(dir.path()).join("vectors.bin");
+        assert_eq!(std::fs::read(&ours).unwrap(), std::fs::read(&theirs).unwrap());
+        #[cfg(unix)]
+        {
+            assert!(std::fs::symlink_metadata(&ours).unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read_link(&ours).unwrap(), std::fs::canonicalize(&theirs).unwrap());
+        }
+    }
+
+    /// Re-running an adapter's run dir as an arm that writes its own vectors
+    /// replaces the link; it never writes through it into the reference.
+    /// Control: removing `remove_symlink` from `write_vectors` overwrites the
+    /// reference's `vectors.bin`.
+    #[test]
+    fn rerunning_an_adapter_dir_as_another_arm_leaves_the_reference_vectors() {
+        let dir = adapter_eval_dir(&IDENTITY_2);
+        rerun_reference(dir.path(), &[[1.0, 0.0], [0.0, 1.0], [0.6, 0.8]], &[[1.0, 0.0]; 3], "own");
+        run_variant(&ad_args(dir.path())).unwrap();
+        let theirs = reference_dir(dir.path()).join("vectors.bin");
+        let before = std::fs::read(&theirs).unwrap();
+        std::fs::write(
+            dir.path().join("variants.toml"),
+            adapter_variants("arm = \"random\"\nrole = \"informational\"\ndimension = 2"),
+        )
+        .unwrap();
+        run_variant(&ad_args(dir.path())).unwrap();
+        assert_eq!(std::fs::read(&theirs).unwrap(), before);
+        let ours = dir.path().join("runs/ad/c/vectors.bin");
+        assert!(!std::fs::symlink_metadata(&ours).unwrap().file_type().is_symlink());
+        assert_ne!(std::fs::read(&ours).unwrap(), before);
+    }
+
+    /// An adapter's cached query vectors are reused while the
+    /// reference run is unchanged, and recomputed as W q_new once it is
+    /// re-run. Control: dropping the `reference_manifest_sha256` term from
+    /// `same_nodes` reuses the emptied file and fails the second run.
+    #[test]
+    fn an_adapter_recomputes_its_query_vectors_when_the_reference_run_changes() {
+        let dir = adapter_eval_dir(&ROTATION);
+        let nodes = [[1.0, 0.0], [0.0, 1.0], [0.6, 0.8]];
+        rerun_reference(dir.path(), &nodes, &[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], "a");
+        run_variant(&ad_args(dir.path())).unwrap();
+        let qv = dir.path().join("runs/ad/c/query_vectors.bin");
+        assert_eq!(read_vectors(&qv, 3, 2).unwrap(), vec![vec![0.0, -1.0], vec![1.0, 0.0], vec![1.0, -1.0]]);
+
+        // Unchanged reference: reused, so the emptied file is read and refused.
+        std::fs::write(&qv, b"").unwrap();
+        let err = format!("{:#}", run_variant(&ad_args(dir.path())).unwrap_err());
+        assert!(err.contains("query_vectors.bin"), "{err}");
+
+        // Re-run reference: recomputed from its new query vectors.
+        rerun_reference(dir.path(), &nodes, &[[0.0, 1.0], [1.0, 0.0], [2.0, 0.0]], "b");
+        run_variant(&ad_args(dir.path())).unwrap();
+        assert_eq!(read_vectors(&qv, 3, 2).unwrap(), vec![vec![1.0, 0.0], vec![0.0, -1.0], vec![0.0, -2.0]]);
+    }
+
+    /// A shuffled arm's node vectors are a derangement of the
+    /// reference's, rebuilt when the reference is re-run. Control: as above.
+    #[test]
+    fn a_shuffled_arm_recomputes_its_vectors_when_the_reference_run_changes() {
+        let dir = adapter_eval_dir(&IDENTITY_2);
+        let shuf = run_args(dir.path(), "shuf", &["c"], ExecutionTarget::Cpu);
+        let vectors = dir.path().join("runs/shuf/c/vectors.bin");
+        let first = [[1.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
+        rerun_reference(dir.path(), &first, &[[1.0, 0.0]; 3], "a");
+        run_variant(&shuf).unwrap();
+        let want = |v: &[[f32; 2]]| sorted_rows(v.iter().map(|r| r.to_vec()).collect());
+        assert_eq!(sorted_rows(read_vectors(&vectors, 3, 2).unwrap()), want(&first));
+
+        let second = [[0.6, 0.8], [-0.8, 0.6], [1.0, 1.0]];
+        rerun_reference(dir.path(), &second, &[[1.0, 0.0]; 3], "b");
+        run_variant(&shuf).unwrap();
+        assert_eq!(sorted_rows(read_vectors(&vectors, 3, 2).unwrap()), want(&second));
+    }
+
+    /// An adapter manifest written before the field
+    /// existed is recomputed once, then reused; arms that carry no
+    /// reference's vectors never write the field.
+    #[test]
+    fn a_stored_adapter_manifest_without_the_reference_hash_is_recomputed_once() {
+        let dir = adapter_eval_dir(&ROTATION);
+        run_variant(&ad_args(dir.path())).unwrap();
+        let run = dir.path().join("runs/ad/c");
+        let path = run.join("manifest.json");
+        let mut value: serde_json::Value = read_json(&path).unwrap();
+        assert!(value.as_object_mut().unwrap().remove("referenceManifestSha256").is_some());
+        write_json(&path, &value).unwrap();
+        std::fs::write(run.join("query_vectors.bin"), b"").unwrap();
+        run_variant(&ad_args(dir.path())).unwrap();
+        assert_eq!(std::fs::metadata(run.join("query_vectors.bin")).unwrap().len(), 3 * 2 * 4);
+        let value: serde_json::Value = read_json(&path).unwrap();
+        assert!(value.get("referenceManifestSha256").is_some_and(|v| v.is_string()));
+
+        std::fs::write(run.join("query_vectors.bin"), b"").unwrap();
+        assert!(run_variant(&ad_args(dir.path())).is_err(), "reused once the field is stored");
+
+        let rand: serde_json::Value = read_json(&dir.path().join("runs/rand/c/manifest.json")).unwrap();
+        assert!(rand.get("referenceManifestSha256").is_none(), "{rand}");
+    }
 }
