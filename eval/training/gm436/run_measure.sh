@@ -244,7 +244,7 @@ if stage 8 finals; then
         train "$OUT/final/$v/c5" --base "$v" $args
         [ "$(w_sha "$OUT/final/$v/c5")" = "$(w_sha "$OUT/grid/$v/$best")" ] || { summary "C5: $v retrain W sha256 differs"; false; }
         "$PY" "$HERE/dev_metric.py" curve --r25 "$OUT/final/$v/curve-0.25" --r50 "$OUT/final/$v/curve-0.5" \
-            --r100 "$OUT/grid/$v/$best" --json "$OUT/final/$v/curve.json" >> "$OUT/summary.curve.txt"
+            --r100 "$OUT/final/$v/c5" --json "$OUT/final/$v/curve.json" >> "$OUT/summary.curve.txt"
         log "finals $v done"
     done
     best=$(get "r1.$GTE.bestTrainable")

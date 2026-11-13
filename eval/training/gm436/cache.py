@@ -22,6 +22,9 @@ Encoder passes are Rust `debug-embed-eval run`s over the GM-456 mine dir
 - Query textSha256 = sha256(prefix + text), text from the mine dir's query file
   (the text the harness embedded).
 - Lookup is by (key, textSha256): an edited query or node misses.
+- A repo's rows come from one source run: importing a new run of the repo
+  (another manifest sha256) replaces its rows. The key join refuses a
+  `<repo>.sqlite` other than the run manifest's snapshotSha256.
 - Resumable: every chunk goes to *.tmp, is fsynced and renamed; manifest and
   index are rewritten atomically after each chunk; a listed chunk whose sha256
   matches is skipped on restart.
@@ -30,11 +33,14 @@ Teacher scores (R2, owner D2: jina int8):
 
     $GM436_DATA/cache/teacher/<teacherModelKey>/<renderId>/<candSetId>/
         chunk-NNNNN.npz  qids int32 [n], cand int32 [n, K] (-1 pad), score float32 [n, K] (NaN pad)
-        manifest.json    {queryIds, nodeTable, rule, k, chunks}
+        manifest.json    {queryIds, nodeTable, nodeTableIdentity, queryTableIdentity, rule, k, chunks}
 
 candSetId = sha256(rule|K|GM-456 version)[:12]; rule = GM-456 positives +
 negatives + answersAlso, union teacher top-K over the query's repo nodes;
-`cand` indexes the teacher node table's rows.
+`cand` indexes the teacher node table's rows, so the scores are rebuilt when
+either table's identity (row order and chunk contents) changes, and loading
+them refuses a node table that changed since. A query whose teacher vector is
+not of its current text gets no scores.
 """
 
 import argparse
@@ -175,11 +181,32 @@ class VecTable:
         _fsync_replace(tmp, self.dir / "index.jsonl")
         _write_json_atomic(self.dir / "manifest.json", self.manifest)
 
+    def identity(self):
+        """sha256 of the row order and the chunk contents: positions into the table hold while it is unchanged."""
+        body = json.dumps({"chunks": self.manifest["chunks"], "index": self.index}, sort_keys=True)
+        return sha256_text(body)
+
     def has_source(self, manifest_sha):
         return any(s["manifestSha256"] == manifest_sha and s.get("complete") for s in self.manifest["sourceRuns"])
 
+    def _drop_repo_sources(self, repo, keep_sha):
+        """Remove every row, chunk and source entry of `repo` that another source run wrote."""
+        stale = [s for s in self.manifest["sourceRuns"] if s["repo"] == repo and s["manifestSha256"] != keep_sha]
+        if not stale:
+            return
+        prefixes = tuple(f"chunk-{s['manifestSha256'][:12]}-" for s in stale)
+        gone = [c["file"] for c in self.manifest["chunks"] if c["file"].startswith(prefixes)]
+        self.manifest["sourceRuns"] = [s for s in self.manifest["sourceRuns"] if s not in stale]
+        self.manifest["chunks"] = [c for c in self.manifest["chunks"] if c["file"] not in gone]
+        self.index = [r for r in self.index if r["chunk"] not in gone]
+        self._save()
+        for name in gone:
+            (self.dir / name).unlink(missing_ok=True)
+
     def add(self, source, manifest_sha, repo, keys, shas, vectors):
-        """Append one source run's rows, chunk by chunk, resumably."""
+        """Write one source run's rows, chunk by chunk, resumably. A repo holds
+        the rows of one source run: a new run of the repo replaces the old one."""
+        self._drop_repo_sources(repo, manifest_sha)
         if self.has_source(manifest_sha):
             return 0
         vectors = np.asarray(vectors, dtype="<f4")
@@ -245,10 +272,13 @@ def frame_spans(vdir, repo):
     return {n["key"]: n["spanSha256"] for n in C.load_nodes(vdir, repo)}
 
 
-def snapshot_keys(repo):
-    """Snapshot node id -> GM-456 key (mine.py::snapshot_maps, without the edges)."""
+def snapshot_keys(repo, snapshot_sha=None):
+    """Snapshot node id -> GM-456 key (mine.py::snapshot_maps, without the edges).
+    With `snapshot_sha`, refuses a snapshot other than the one a run embedded."""
     import sqlite3
     db = C.work_dir() / f"{repo}.sqlite"
+    if snapshot_sha is not None and C.sha256_file(db) != snapshot_sha:
+        raise SystemExit(f"{db} is not the snapshot the run embedded (manifest snapshotSha256 {snapshot_sha[:12]}); re-run it")
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     key = {i: C.key_of(repo, f, q, s) for i, f, q, s in
            conn.execute("SELECT id, filePath, qualifiedName, startLine FROM nodes")}
@@ -263,7 +293,7 @@ def import_run(mine_dir, vdir, variant, repo, runs_dir=None):
     row = variant_row(mine_dir, variant)
     mkey = run.model_key()
     # Node side.
-    id_to_key = snapshot_keys(repo)
+    id_to_key = snapshot_keys(repo, run.manifest["snapshotSha256"])
     missing = [i for i in run.node_ids if i not in id_to_key]
     if missing:
         raise SystemExit(f"{run.dir}: {len(missing)} node ids not in the {repo} snapshot (first {missing[0]})")
@@ -308,12 +338,14 @@ def normalise(m):
     return m / n
 
 
-def build_teacher(node_table, query_table, queries, version, out_root=None, k=TEACHER_K):
-    """Teacher cosine scores over each query's candidate set; resumable by chunk."""
+def build_teacher(node_table, query_table, queries, version, prefix, out_root=None, k=TEACHER_K):
+    """Teacher cosine scores over each query's candidate set; resumable by chunk.
+    A query whose teacher vector is not of its current text (prefix + text) gets no scores."""
     nrows, nmat = node_table.load()
     qrows, qmat = query_table.load()
     key_row = {r["key"]: i for i, r in enumerate(nrows)}
     q_row = {r["key"]: i for i, r in enumerate(qrows)}
+    q_sha = {r["key"]: r["textSha256"] for r in qrows}
     by_repo = {}
     for i, r in enumerate(nrows):
         by_repo.setdefault(r["repo"], []).append(i)
@@ -323,12 +355,14 @@ def build_teacher(node_table, query_table, queries, version, out_root=None, k=TE
     out = Path(out_root or gm436_root() / "cache" / "teacher") / node_table.manifest["modelKey"] / side / cand_set_id(version, k)
     out.mkdir(parents=True, exist_ok=True)
     mpath = out / "manifest.json"
-    qs = [q for q in queries if q["id"] in q_row]
-    man = json.loads(mpath.read_text()) if mpath.exists() else {
-        "queryIds": [q["id"] for q in qs], "nodeTable": str(node_table.dir), "queryTable": str(query_table.dir),
-        "rule": TEACHER_RULE, "k": k, "version": version, "chunks": []}
-    if man["queryIds"] != [q["id"] for q in qs]:
-        raise SystemExit(f"{out}: query list differs from the stored manifest; remove it to rebuild")
+    qs = [q for q in queries if q["id"] in q_row and q_sha[q["id"]] == query_text_sha(prefix, q["text"])]
+    fresh = {"queryIds": [q["id"] for q in qs], "nodeTable": str(node_table.dir), "queryTable": str(query_table.dir),
+             "nodeTableIdentity": node_table.identity(), "queryTableIdentity": query_table.identity(),
+             "rule": TEACHER_RULE, "k": k, "version": version, "chunks": []}
+    man = json.loads(mpath.read_text()) if mpath.exists() else fresh
+    if any(man.get(f) != fresh[f] for f in ("queryIds", "nodeTable", "nodeTableIdentity", "queryTableIdentity")):
+        print(f"{out}: queries or tables changed since the stored scores; rebuilding", file=sys.stderr)
+        man = fresh
     for c0 in range(0, len(qs), TEACHER_CHUNK):
         name = f"chunk-{c0 // TEACHER_CHUNK:05d}.npz"
         listed = next((c for c in man["chunks"] if c["file"] == name), None)
@@ -362,7 +396,10 @@ def load_teacher(tdir):
     """{query id: (candidate node-table rows, teacher scores)} and the node table's keys."""
     tdir = Path(tdir)
     man = json.loads((tdir / "manifest.json").read_text())
-    nkeys = [r["key"] for r in VecTable(man["nodeTable"]).index]
+    nt = VecTable(man["nodeTable"])
+    if man.get("nodeTableIdentity") != nt.identity():
+        raise SystemExit(f"{tdir}: the node table changed since these scores were built; re-run cache.py teacher")
+    nkeys = [r["key"] for r in nt.index]
     out = {}
     for c in sorted(man["chunks"], key=lambda c: c["file"]):
         if C.sha256_file(tdir / c["file"]) != c["sha256"]:
@@ -399,7 +436,8 @@ def main():
     else:
         nt, qt = tables_for(mine, a.variant, repos[0])
         qs = [q for q in D.load_queries(vdir) if q["repo"] in set(repos)]
-        print(build_teacher(nt, qt, qs, a.version, out_root=a.out_root, k=a.k))
+        prefix = variant_row(mine, a.variant).get("query_prefix", "")
+        print(build_teacher(nt, qt, qs, a.version, prefix, out_root=a.out_root, k=a.k))
 
 
 if __name__ == "__main__":

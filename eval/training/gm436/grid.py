@@ -18,6 +18,8 @@ TAUS = [0.02, 0.05]
 LAMS = [0.0, 1e-3, 1e-2]
 RANKS = [32, 128]
 ALPHAS = [0.0, 0.5]
+# Note section 4 R2: the KL term's temperatures are fixed, whatever --tau the R1 form carries.
+R2_TAUS = ["--tau-s", "0.05", "--tau-t", "0.05"]
 
 
 def r1_grid():
@@ -28,7 +30,7 @@ def r1_grid():
 
 
 def r2_grid(form_args):
-    return [(f"r2-alpha{a}", ["--route", "r2", "--alpha", str(a)] + form_args) for a in ALPHAS]
+    return [(f"r2-alpha{a}", ["--route", "r2", "--alpha", str(a)] + R2_TAUS + form_args) for a in ALPHAS]
 
 
 def args_of(name, grid):
@@ -72,7 +74,7 @@ def select(grid_root, r2_root=None, r2_base=None):
         alpha = json.loads((Path(b["run"]) / "result.json").read_text())["config"]["alpha"]
         form = final["r1"][r2_base]["bestTrainable"]
         final["r2"] = dict(b, base=r2_base, form=form, alpha=alpha,
-                           args=["--route", "r2", "--alpha", str(alpha)] + grid[form])
+                           args=["--route", "r2", "--alpha", str(alpha)] + R2_TAUS + grid[form])
     return final
 
 

@@ -510,6 +510,11 @@ struct Manifest {
     /// written by CPU-only builds.
     #[serde(default = "cpu_execution_provider")]
     execution_provider: String,
+    /// sha256 of the reference run's manifest.json, for arms that carry the
+    /// reference's vectors (shuffled, adapter): their cached vectors are
+    /// reused only while the reference run is the one they were built from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference_manifest_sha256: Option<String>,
 }
 
 fn cpu_execution_provider() -> String {
@@ -953,6 +958,17 @@ fn run_corpus(
         }
         _ => (Vec::new(), None, None),
     };
+    let reference_manifest_sha256 = match variant.arm {
+        Arm::Shuffled | Arm::Adapter => {
+            let reference = variant.reference.as_deref().unwrap();
+            let path = run_dir(args, reference, corpus).join("manifest.json");
+            Some(
+                sha256_file(&path)
+                    .with_context(|| format!("run the reference {reference} on {corpus} first"))?,
+            )
+        }
+        _ => None,
+    };
     let manifest = Manifest {
         variant: variant.name.clone(),
         variant_fingerprint: fingerprint(variant),
@@ -977,6 +993,7 @@ fn run_corpus(
         token_share_over_1024,
         gmesh_version: env!("CARGO_PKG_VERSION").to_string(),
         execution_provider: args.ep.name().to_string(),
+        reference_manifest_sha256,
     };
 
     let previous: Option<Manifest> = if args.force { None } else { read_json(&manifest_path).ok() };
@@ -986,6 +1003,7 @@ fn run_corpus(
             && p.node_ids_sha256 == manifest.node_ids_sha256
             && p.dimension == manifest.dimension
             && p.execution_provider == manifest.execution_provider
+            && p.reference_manifest_sha256 == manifest.reference_manifest_sha256
     });
     let same_queries = same_nodes
         && previous

@@ -6,7 +6,8 @@ R1, gold labels: InfoNCE over [the query's positives; its GM-456 hard
 negatives; every other in-batch query's positives and hard negatives], minus
 the query's `answersAlso` (data.batch_columns), multi-positive log-sum-exp.
 R2, distillation: KL(p_teacher || p_student) over the teacher cache's
-candidate list + alpha * the R1 loss.
+candidate list at tau_s = tau_t = 0.05 (--tau-s, --tau-t; independent of
+--tau, which is the R1 term's) + alpha * the R1 loss.
 
 Forms: full W (init I, lambda ||W - I||_F^2), low-rank W = I + U V^T (U = 0,
 V ~ N(0, 0.01)), orthogonal Procrustes (closed form). Every form ends as a
@@ -59,7 +60,7 @@ def progress(msg):
 
 def config_of(a):
     cfg = {k: getattr(a, k) for k in ("version", "base", "route", "form", "tau", "lam", "rank", "lr", "epochs",
-                                       "patience", "batch", "fraction", "control", "alpha", "tau_t", "teacher_dir",
+                                       "patience", "batch", "fraction", "control", "alpha", "tau_s", "tau_t", "teacher_dir",
                                        "exclude_language", "train_repos", "dev_repos", "seed")}
     return cfg, hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()
 
@@ -285,7 +286,7 @@ def train(a):
             loss = r1_loss(qa, cn, pos, valid, a.tau)
             if a.route == "r2":
                 cand, p_t, mask = kd_tensors(base, batch, teacher, a.tau_t)
-                loss = kd_loss(qa, cand, p_t, mask, a.tau) + a.alpha * loss
+                loss = kd_loss(qa, cand, p_t, mask, a.tau_s) + a.alpha * loss
             if a.form == "full" and a.lam:
                 loss = loss + a.lam * ((W - model.eye) ** 2).sum()
             opt.zero_grad()
@@ -350,7 +351,8 @@ def parse(argv=None):
     ap.add_argument("--fraction", type=float, choices=[0.25, 0.5, 1.0], default=1.0)
     ap.add_argument("--control", choices=["none", "c1", "c2"], default="none")
     ap.add_argument("--alpha", type=float, default=0.0, help="R2: weight of the gold InfoNCE term")
-    ap.add_argument("--tau-t", dest="tau_t", type=float, default=0.05)
+    ap.add_argument("--tau-s", dest="tau_s", type=float, default=0.05, help="R2: student temperature of the KL term")
+    ap.add_argument("--tau-t", dest="tau_t", type=float, default=0.05, help="R2: teacher temperature")
     ap.add_argument("--teacher-dir")
     ap.add_argument("--exclude-language", nargs="*", default=[])
     ap.add_argument("--train-repos", nargs="*")
