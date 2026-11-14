@@ -281,14 +281,14 @@ if stage 9 export; then
         done
         best=$(get "r1.$v.bestTrainable")
         for f in 0.25 0.5; do exp "$short-structured-adapter-curve$f" "$v" informational "$OUT/final/$v/curve-$f"; done
-        exp "$short-structured-adapter-c1" "$v" control "$OUT/final/$v/c1"
-        exp "$short-structured-identity" "$v" control --identity "$dim"
+        exp "$short-structured-adapter-c1" "$v" informational "$OUT/final/$v/c1"
+        exp "$short-structured-identity" "$v" informational --identity "$dim"
         exp "$short-structured-ws-adapter-${best%%-*}" "$v-words-shuffled" informational "$OUT/grid/$v/$best"
-        exp "$short-structured-ws-identity" "$v-words-shuffled" control --identity "$dim"
+        exp "$short-structured-ws-identity" "$v-words-shuffled" informational --identity "$dim"
     done
     exp "gte-structured-adapter-c4-no-go" "$GTE" informational "$OUT/final/$GTE/c4-no-go"
     for f in 0.25 0.5 1.0; do exp "gte-structured-distill-f$f" "$GTE" cost "$OUT/final/r2/f$f"; done
-    exp "gte-structured-distill-c2" "$GTE" control "$OUT/final/r2/c2"
+    exp "gte-structured-distill-c2" "$GTE" informational "$OUT/final/r2/c2"
     summary "export: $(wc -l < "$ARMS_FILE" | tr -d ' ') adapter rows in v2/variants.toml"
 fi
 
