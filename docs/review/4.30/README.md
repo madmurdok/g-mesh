@@ -545,3 +545,42 @@ area D both models cost about the same in tokens.
    (C-opus and C-fable both noted it; 30 files use it per C-fable). Fix in the map's method if it is reused.
 7. **CLI-run walks log as the daemon** (confirmed, R-31): `daemon/bulk_index.rs:512` reached from
    `cli/init.rs:254`, `cli/reindex.rs:120`.
+
+## 9. Backlog tasks
+
+Owner decisions (2026-11-14): findings "Все 35, по 10 группам (Recommended)"; side discoveries
+"Отдельные fix-задачи (Recommended)". All tasks are in the backlog (no release).
+
+| Group (section 6) | Task | Findings | Depends on |
+|---|---|---|---|
+| 1. Leaf moves that break the SCC | GM-705 | R-1, R-2, R-3, R-4 (step 1), R-6, R-8, R-10, R-30 | - |
+| 2. Control plane | GM-706 | R-5, R-4 (step 2) | GM-705 |
+| 3. Watcher and daemon startup | GM-707 | R-15, R-25 | GM-706 |
+| 4. Data layer | GM-708 | R-12, R-16, R-18, R-22, R-23, R-32 | GM-706 |
+| 5. MCP seam | GM-709 | R-11, R-17, R-19, R-27 | GM-706 |
+| 6. Configuration | GM-710 | R-9, R-20, R-31 | - |
+| 7. Plugin contracts | GM-711 | R-14, R-21, R-24, R-26 | - |
+| 8. Scripts and CI | GM-712 | R-7, R-13 | - |
+| 9. SDK structure | GM-713 | R-28, R-29 | - |
+| 10. Large and optional | GM-714 | R-33, R-34, R-35 | GM-707, GM-708, GM-709 |
+
+Follow-up not covered by the reviews: crate-level decomposition of core (design) is GM-718, after GM-705 and GM-706.
+
+Side discoveries (section 8):
+
+| Side discovery | Task |
+|---|---|
+| 8.1 `get_dependencies` Incoming misses closure `use` and inline `crate::` paths | GM-715 |
+| 8.2 Go and SDK id schemes differ (open decision: migrate Go to NUL vs correct the docs) | GM-716 |
+| 8.3 Go plugin's excluded dirs lack `.claude` (R-1 then makes drift impossible) | GM-717 |
+| 8.4 Plugin version mismatch (resolved, no task) | - |
+| 8.5 Stale documentation | folded into GM-706 (gc), GM-710 (config), GM-711 (python emit, go.mod) |
+| 8.6 Module-map `log` fan-in undercount | no task (method note) |
+| 8.7 CLI-run walks log as the daemon | GM-710 (R-31) |
+
+Per finding: R-1 GM-705, R-2 GM-705, R-3 GM-705, R-4 GM-705 (step 1) / GM-706 (step 2),
+R-5 GM-706, R-6 GM-705, R-7 GM-712, R-8 GM-705, R-9 GM-710, R-10 GM-705, R-11 GM-709,
+R-12 GM-708, R-13 GM-712, R-14 GM-711, R-15 GM-707, R-16 GM-708, R-17 GM-709, R-18 GM-708,
+R-19 GM-709, R-20 GM-710, R-21 GM-711, R-22 GM-708, R-23 GM-708, R-24 GM-711, R-25 GM-707,
+R-26 GM-711, R-27 GM-709, R-28 GM-713, R-29 GM-713, R-30 GM-705, R-31 GM-710, R-32 GM-708,
+R-33 GM-714, R-34 GM-714, R-35 GM-714. X-1..X-3 rejected: no tasks.
