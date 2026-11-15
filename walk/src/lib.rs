@@ -593,3 +593,6 @@ fn innermost(err: &ignore::Error) -> (Option<&Path>, Option<&ignore::Error>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

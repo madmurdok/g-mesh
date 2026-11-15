@@ -282,4 +282,31 @@ mod tests {
         std::fs::write(state.path().join(DEVICE_FILE), "not a number").unwrap();
         assert_eq!(read_root_device(state.path()), None);
     }
+
+    /// The hash names every project's state directory: a changed value
+    /// orphans every existing index. The literal is
+    /// `sha256(b"/srv/project").digest()[:8].hex()`.
+    #[test]
+    fn a_project_hash_never_changes() {
+        assert_eq!(hash_of_canonical(Path::new("/srv/project")), "4f3f91f6b0b47e3b");
+
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(project_hash(tmp.path()).unwrap(), hash_of_canonical(&tmp.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn an_atomic_state_write_replaces_the_file_whole_and_leaves_no_temp_file() {
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("daemon.phase");
+        std::fs::write(&path, "an older and longer previous content").unwrap();
+
+        write_state_file_atomic(&path, "ready", "phase file");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ready");
+        let names: Vec<String> = std::fs::read_dir(state.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["daemon.phase"], "the temp file must be renamed into place, not left beside it");
+    }
 }

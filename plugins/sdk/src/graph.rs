@@ -1103,4 +1103,13 @@ mod tests {
         assert!(!edge.resolved);
         assert_eq!(edge.specifier.as_deref(), Some("./b"));
     }
+
+    #[test]
+    fn each_placeholder_kind_is_the_wire_constant_core_stores() {
+        use g_mesh_wire::native_kind::*;
+        assert_eq!(PlaceholderKind::PendingSymbol.native_kind(), PENDING_SYMBOL_NATIVE_KIND);
+        assert_eq!(PlaceholderKind::Reexport.native_kind(), REEXPORT_NATIVE_KIND);
+        assert_eq!(PlaceholderKind::ResolvedModule.native_kind(), RESOLVED_MODULE_NATIVE_KIND);
+        assert_eq!(PlaceholderKind::ExternalModule.native_kind(), EXTERNAL_MODULE_NATIVE_KIND);
+    }
 }
