@@ -280,8 +280,8 @@ fn registry_with(
 
     let dirs = install(plugins.path());
 
-    let discovered =
-        manifest::discover(&[plugins.path().to_path_buf()]).expect("the fixtures must discover cleanly");
+    let discovered = crate::plugin_manifest::discover(&[plugins.path().to_path_buf()])
+        .expect("the fixtures must discover cleanly");
     let root = project.path().canonicalize().expect("failed to canonicalize the fixture project root");
     let state_dir =
         project_dir(project.path()).expect("failed to resolve the fixture project's state directory");

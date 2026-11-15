@@ -23,6 +23,7 @@
 mod ci_junit_summary_script;
 mod cut_release_plugin_versions;
 mod install_script_text;
+mod module_cycles_script;
 mod new_task_worktree_script;
 mod prune_stale_objects_script;
 mod release_packaging_scripts;

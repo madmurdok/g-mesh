@@ -23,14 +23,14 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::daemon::indexing_status::{IndexingStatus, Need, Phase, WaitOutcome};
 use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::manifest::Capabilities;
 use crate::daemon::registry::{PathCoverage, PluginRegistry};
 use crate::embedding::EmbeddingPipeline;
 use crate::gc::last_used;
 use crate::graph::pagination::Direction;
+use crate::indexing_status::{IndexingStatus, Need, Phase, WaitOutcome};
 use crate::ipc::AsyncStream;
+use crate::plugin_manifest::Capabilities;
 use crate::protocol::types::Position;
 use crate::storage::index_store::IndexStore;
 
@@ -362,7 +362,7 @@ impl GMeshMcpServer {
     /// Every discovered plugin's declared `[plugin.capabilities]`, which the
     /// four edge-walking tools hand to `provenance::resolve`. Read fresh per
     /// call: it never changes while the daemon runs
-    /// (`daemon::manifest::discover`), so a cache would save nothing.
+    /// (`plugin_manifest::discover`), so a cache would save nothing.
     fn capabilities(&self) -> HashMap<String, Capabilities> {
         self.registry.receiver_call_capabilities()
     }

@@ -20,10 +20,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use crate::daemon::candidates::Detection;
-use crate::daemon::indexing_status::ColdCause;
-use crate::daemon::manifest::{Capabilities, MemberOverrides, ReceiverCallResolution};
-use crate::languages::LanguageOutcome;
+use crate::indexing_status::ColdCause;
+use crate::plugin_manifest::{Capabilities, MemberOverrides, ReceiverCallResolution};
+use crate::project_detect::Detection;
+use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::MAX_LANGUAGE_RETRIES;
 
 /// Working byte ceiling; one constant because [`build`]'s trim ladder and the
@@ -267,7 +267,7 @@ const ERROR_BYTES: usize = 100;
 /// What a failed language's item shows of its stored error: the innermost
 /// cause, with filesystem paths shortened to their file name, at most
 /// [`ERROR_BYTES`] bytes. The store keeps the whole anyhow chain one cause
-/// per line, outermost first (`languages::failed_error`), so the innermost
+/// per line, outermost first (`storage::language_outcome::failed_error`), so the innermost
 /// cause is the last non-empty line, whole even when its own text contains
 /// ": ". The outer contexts name the step and the inner cause names what went
 /// wrong; with 100 bytes, the cause is the part worth keeping.

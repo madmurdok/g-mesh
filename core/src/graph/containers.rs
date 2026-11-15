@@ -192,9 +192,7 @@ use sha2::{Digest, Sha256};
 use crate::graph::queries::{declaration_only, NON_DECLARATION_NATIVE_KINDS};
 use crate::storage::write::{Diff, NodeRecord};
 
-/// The `nativeKind` of a core-materialized container node. Never plugin-emitted
-/// - `protocol::conformance` reports one on the wire as a violation.
-pub const CONTAINER_NATIVE_KIND: &str = "container";
+pub use g_mesh_wire::native_kind::CONTAINER_NATIVE_KIND;
 
 const MODULE_KIND: &str = "Module";
 const DEFINES_KIND: &str = "DEFINES";
@@ -228,7 +226,7 @@ type Key = (String, String);
 ///  - NUL, not a space, between language and key, because a key is free text
 ///    and may contain spaces (a C++ namespace never does, but nothing here
 ///    should rely on which languages exist). `language` is a plugin directory
-///    name (`daemon::manifest` requires the two to match) and no filesystem
+///    name (`plugin_manifest` requires the two to match) and no filesystem
 ///    allows NUL in one, so the split is unambiguous.
 ///
 /// A plugin that ever needs to address a container node directly computes the

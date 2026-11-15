@@ -99,9 +99,9 @@ use std::collections::HashSet;
 
 use rusqlite::{Connection, Result as SqlResult};
 
-use crate::daemon::indexing_status::IndexingStatus;
 use crate::embedding::text::{embed_tier, is_noise, EmbedInput, EmbedTier, NOISE_RULE_VERSION};
 use crate::embedding::{EmbedStats, EmbeddingPipeline};
+use crate::indexing_status::IndexingStatus;
 use crate::storage::index_store::{IndexStore, Unit};
 use crate::storage::write::{Diff, NodeRecord};
 use crate::storage::{schema, vectors};
@@ -124,7 +124,7 @@ pub const HOLD_FILE_ENV: &str = "G_MESH_EMBED_PASS_HOLD_FILE";
 /// While this env var is set to a non-empty value, [`run`] panics before its
 /// first batch - test-only, for GM-395 slice 2b's guard that a panic in this
 /// pass must not turn the whole activation into
-/// [`Phase::Failed`](crate::daemon::indexing_status::Phase::Failed):
+/// [`Phase::Failed`](crate::indexing_status::Phase::Failed):
 /// `daemon::activation::ActivationCtx::activate` wraps this call in
 /// `catch_unwind` precisely so that structural tools keep answering even if
 /// this pass blows up, and this knob is what lets a test make it blow up
@@ -171,7 +171,7 @@ impl BackfillSummary {
 /// no model to run at all.
 /// The hold has to come before that check, not after: a phase-gating test
 /// needs to observe the daemon sitting in
-/// [`Phase::Embedding`](crate::daemon::indexing_status::Phase::Embedding)
+/// [`Phase::Embedding`](crate::indexing_status::Phase::Embedding)
 /// regardless of whether the machine running it has ever fetched real
 /// weights, and an early return for "no model" would make the hold
 /// unreachable on exactly the machines (CI, a fresh checkout) that need it

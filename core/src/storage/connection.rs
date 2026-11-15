@@ -1,75 +1,11 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::daemon::identity::{self, project_hash};
-use crate::paths;
 use crate::storage::vectors;
 
-/// `~/.g-mesh/projects/` (or `$G_MESH_HOME/projects/`), the one directory
-/// every project's state lives under. Public because `cli::clean` enumerates
-/// it rather than deriving a single project's path from a root the way
-/// everything else here does.
-pub fn projects_root() -> Result<PathBuf> {
-    Ok(projects_root_under(&paths::g_mesh_home()?))
-}
-
-/// [`projects_root`] under the g-mesh home `home`.
-pub(crate) fn projects_root_under(home: &Path) -> PathBuf {
-    home.join("projects")
-}
-
-/// `~/.g-mesh/projects/<hash>/` for the given (canonicalized) project root.
-/// Uses the same hash as the daemon's own socket/pid file location
-/// (`daemon::identity::project_hash`) so the two can never disagree.
-pub fn project_dir(root: &Path) -> Result<PathBuf> {
-    project_dir_under(&paths::g_mesh_home()?, root)
-}
-
-/// [`project_dir`] under the g-mesh home `home` rather than the one the
-/// environment names, so a test can point it at a temp dir without writing
-/// `G_MESH_HOME`, which every other thread in the process reads.
-pub(crate) fn project_dir_under(home: &Path, root: &Path) -> Result<PathBuf> {
-    Ok(projects_root_under(home).join(project_hash(root)?))
-}
-
-/// The project's state directory, created if absent and recording which
-/// project root it belongs to.
-///
-/// The one place a state directory comes into existence, so that no path can
-/// create one without also leaving `project.root` in it - which is what
-/// `cli::clean orphaned` reads to tell state whose project was deleted from
-/// state whose project is merely idle. `identity::record_project_root` is
-/// idempotent, so an existing directory acquires the file the next time
-/// anything opens it.
-///
-/// That claim was false until GM-255. `daemon::run` and
-/// `shim::acquire_bootstrap_lock` both created the directory with a bare
-/// `fs::create_dir_all` and no root file, and the shim is the *earliest* of
-/// the three - so a project whose first contact was a shim got a state
-/// directory with no identity. Nothing recovers it later: `project_hash` is
-/// one-way, so `clean orphaned` can only class such a directory `Legacy` and
-/// leave it alone. Measured on this machine's own test home, 707 of 775
-/// directories were unsweepable for that reason.
-///
-/// So if a fourth call site ever needs a project directory, it goes through
-/// here. A bare `create_dir_all` on this path is not a shortcut, it is a
-/// directory that can never be cleaned up.
-pub fn ensure_project_dir(root: &Path) -> Result<PathBuf> {
-    ensure_project_dir_under(&paths::g_mesh_home()?, root)
-}
-
-/// [`ensure_project_dir`] under the g-mesh home `home` (see
-/// [`project_dir_under`]).
-pub(crate) fn ensure_project_dir_under(home: &Path, root: &Path) -> Result<PathBuf> {
-    let dir = project_dir_under(home, root)?;
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create project directory {}", dir.display()))?;
-    identity::record_project_root(&dir, root)?;
-    Ok(dir)
-}
+pub use crate::paths::state_dir::{ensure_project_dir, project_dir, projects_root};
 
 /// Opens (creating if absent) the project's SQLite index in WAL mode, with
 /// the sqlite-vec extension available on the returned connection (see
@@ -203,7 +139,7 @@ mod tests {
 
         let state_dir = project_dir(tmp.path()).unwrap();
 
-        let recorded = crate::daemon::identity::read_project_root(&state_dir);
+        let recorded = crate::paths::state_dir::read_project_root(&state_dir);
         assert_eq!(recorded, Some(tmp.path().canonicalize().unwrap()));
     }
 }

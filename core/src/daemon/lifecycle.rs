@@ -34,9 +34,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::config::ProjectConfig;
-use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
+use crate::plugin_manifest::PluginManifest;
 use crate::protocol::jsonrpc::is_timeout;
 use crate::storage::index_store::{self, IndexStore};
 use crate::watcher::apply::{FileChangeOutcome, SemanticPassOutcome};
@@ -875,13 +875,13 @@ impl Drop for ConnectionGuard {
 /// daemon has none.
 ///
 /// [`sleep_now`]: PluginSupervisor::sleep_now
-/// [`IndexingStatus::detach_state_files`]: crate::daemon::indexing_status::IndexingStatus::detach_state_files
+/// [`IndexingStatus::detach_state_files`]: crate::indexing_status::IndexingStatus::detach_state_files
 pub fn supervise(
     project_root: &Path,
     state_dir: &Path,
     registry: &crate::daemon::registry::PluginRegistry,
     core: &CoreActivity,
-    indexing: Option<&crate::daemon::indexing_status::IndexingStatus>,
+    indexing: Option<&crate::indexing_status::IndexingStatus>,
     timeouts: IdleTimeouts,
     accept_loop: Receiver<Result<()>>,
 ) -> Result<Exit> {

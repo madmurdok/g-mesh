@@ -351,7 +351,7 @@ impl IndexingStatus {
     fn publish_phase_file(&self, word: &str) {
         let guard = self.0.phase_file.lock().unwrap();
         if let Some(path) = guard.as_ref() {
-            super::write_state_file_atomic(path, word, "phase file");
+            crate::paths::state_dir::write_state_file_atomic(path, word, "phase file");
         }
     }
 
@@ -489,7 +489,7 @@ impl IndexingStatus {
             return;
         }
         match serde_json::to_string(&self.progress_snapshot()) {
-            Ok(json) => super::write_state_file_atomic(&path, &json, "progress file"),
+            Ok(json) => crate::paths::state_dir::write_state_file_atomic(&path, &json, "progress file"),
             Err(err) => crate::log_line!("g-mesh daemon: failed to serialize indexing progress: {err}"),
         }
         file.last_write = Some(now);

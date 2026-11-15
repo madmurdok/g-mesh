@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::graph::containers::CONTAINER_NATIVE_KIND;
-use crate::graph::imports::{EXTERNAL_MODULE_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND};
-use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::storage::write::{self, Diff, EdgeRecord, NodeRecord};
+use g_mesh_wire::native_kind::CONTAINER_NATIVE_KIND;
+use g_mesh_wire::native_kind::{EXTERNAL_MODULE_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND};
+use g_mesh_wire::native_kind::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 
 // Every "which symbol is this?" lookup below - by name, by qualifiedName, by
 // position, or by the stem of the file it sits in ([`find_in_file_named`]) -
@@ -382,10 +382,10 @@ pub fn find_in_file_named(conn: &Connection, name: &str, limit: usize) -> Result
 ///
 /// `entry_points` is the caller's job to assemble, concretely the union of
 /// every discovered plugin's `[plugin.workspace] entry_points`
-/// (`daemon::manifest::WorkspaceConfig`,
+/// (`plugin_manifest::WorkspaceConfig`,
 /// `daemon::registry::PluginRegistry::entry_points`), passed in rather than
 /// looked up here so this module, which is a thin SQL layer under
-/// `storage`/`graph`, never has to depend on `daemon::manifest` to answer a
+/// `storage`/`graph`, never has to depend on `plugin_manifest` to answer a
 /// query. A caller with no manifest available at all (this module's own
 /// tests below; a hypothetical CLI path that never starts a daemon) passes an
 /// empty slice, which this function turns into an always-false expression:
@@ -1140,7 +1140,7 @@ mod tests {
 
     /// GM-273's acceptance case: a fake manifest declaring `entry_points =
     /// ["mod.rs"]` (Rust's own convention, not yet backed by a real plugin -
-    /// see `daemon::manifest::WorkspaceConfig::entry_points`'s doc comment)
+    /// see `plugin_manifest::WorkspaceConfig::entry_points`'s doc comment)
     /// must rank `mod.rs` first in a directory lookup, exactly the way
     /// `"index"` already does for TypeScript. `pkg/a.rs` is deliberately the
     /// *shorter* path, so this only passes if the entry-point rank - not

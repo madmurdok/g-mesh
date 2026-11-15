@@ -47,9 +47,10 @@ use anyhow::{bail, Context, Result};
 
 use crate::cli::CleanArgs;
 use crate::config;
-use crate::daemon::{self, identity::project_hash};
+use crate::daemon;
 use crate::gc::last_used;
-use crate::storage::connection::projects_root;
+use crate::paths::state_dir::project_hash;
+use crate::paths::state_dir::projects_root;
 
 /// Converts a day count from `cleanup.idleThresholdDays` into the [`Duration`]
 /// [`Candidate::is_expired`] compares against.
@@ -77,7 +78,7 @@ impl Target {
     /// Reads the single positional argument `clean` takes.
     ///
     /// `expired`, `orphaned` and `all` can never be mistaken for a project
-    /// id: ids are the 16 hex characters `daemon::identity::project_hash`
+    /// id: ids are the 16 hex characters `crate::paths::state_dir::project_hash`
     /// produces, which none of those words is.
     pub fn parse(argument: Option<&str>) -> Self {
         match argument {
@@ -273,7 +274,7 @@ pub(crate) enum RootState {
 }
 
 /// Judges a recorded root against the disk; see [`RootState`] for the rules.
-/// `device` is the recorded `project.dev` ([`daemon::identity::read_root_device`]).
+/// `device` is the recorded `project.dev` ([`crate::paths::state_dir::read_root_device`]).
 pub(crate) fn root_state(root: Option<&Path>, device: Option<u64>) -> RootState {
     let Some(root) = root else {
         return RootState::Legacy;
@@ -405,8 +406,8 @@ pub(crate) fn purge_orphaned_state_dir(state_dir: &Path, wait: LockWait) -> Resu
     // `UpTo`, since a sweeper's probe holds it for an instant.
     let judge = || -> Option<Purge> {
         loop {
-            let root = daemon::identity::read_project_root(state_dir);
-            let device = daemon::identity::read_root_device(state_dir);
+            let root = crate::paths::state_dir::read_project_root(state_dir);
+            let device = crate::paths::state_dir::read_root_device(state_dir);
             if root_state(root.as_deref(), device) != RootState::Orphaned {
                 return Some(Purge::Kept("its project root exists, is unreachable, or is not recorded"));
             }
@@ -482,8 +483,8 @@ fn delete_root_record_last(state_dir: &Path) -> Result<()> {
     let entries =
         fs::read_dir(state_dir).with_context(|| format!("failed to read {}", state_dir.display()))?;
     for entry in entries.flatten() {
-        if entry.file_name() == daemon::identity::ROOT_FILE
-            || entry.file_name() == daemon::identity::DEVICE_FILE
+        if entry.file_name() == crate::paths::state_dir::ROOT_FILE
+            || entry.file_name() == crate::paths::state_dir::DEVICE_FILE
         {
             continue;
         }
@@ -499,7 +500,7 @@ fn delete_root_record_last(state_dir: &Path) -> Result<()> {
             Err(err) => return Err(err).with_context(|| format!("failed to delete {}", path.display())),
         }
     }
-    for name in [daemon::identity::ROOT_FILE, daemon::identity::DEVICE_FILE] {
+    for name in [crate::paths::state_dir::ROOT_FILE, crate::paths::state_dir::DEVICE_FILE] {
         match fs::remove_file(state_dir.join(name)) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -614,7 +615,7 @@ pub(crate) fn sweep_orphaned_if_due(home: &Path, interval: Duration) -> Result<S
         .set_len(0)
         .and_then(|()| stamp.write_all(b"swept\n"))
         .with_context(|| format!("failed to stamp {}", marker_path.display()))?;
-    Ok(Sweep::Swept(sweep_orphaned(&crate::storage::connection::projects_root_under(home))?))
+    Ok(Sweep::Swept(sweep_orphaned(&crate::paths::state_dir::projects_root_under(home))?))
 }
 
 /// Rejects anything that is not a bare directory name.
@@ -645,7 +646,7 @@ struct Candidate {
     /// - see [`RootState::Legacy`].
     root: Option<PathBuf>,
     /// The device id recorded beside the root, if any - see
-    /// [`daemon::identity::DEVICE_FILE`].
+    /// [`crate::paths::state_dir::DEVICE_FILE`].
     device: Option<u64>,
 }
 
@@ -683,8 +684,8 @@ fn candidates(projects_root: &Path) -> Result<Vec<Candidate>> {
             // project - it just has no idle time, so only `all` will take it.
             idle: last_used::read_from_project_dir(&path).unwrap_or(None).map(|record| record.idle),
             daemon_running: daemon_is_running(&path),
-            root: daemon::identity::read_project_root(&path),
-            device: daemon::identity::read_root_device(&path),
+            root: crate::paths::state_dir::read_project_root(&path),
+            device: crate::paths::state_dir::read_root_device(&path),
             id,
             path,
         });
@@ -887,7 +888,7 @@ mod tests {
         /// Records `root` as the project directory `id`'s state belongs to,
         /// exactly as `connection::ensure_project_dir` does for a real one.
         fn record_root(&self, id: &str, root: &Path) {
-            crate::daemon::identity::record_project_root(&self.root().join(id), root).unwrap();
+            crate::paths::state_dir::record_project_root(&self.root().join(id), root).unwrap();
         }
 
         /// Marks a project as served by a live daemon, using this test
@@ -1441,11 +1442,11 @@ mod tests {
         }
 
         fn add_orphan(&self, id: &str) -> PathBuf {
-            let state = crate::storage::connection::projects_root_under(self.home.path()).join(id);
+            let state = crate::paths::state_dir::projects_root_under(self.home.path()).join(id);
             fs::create_dir_all(&state).unwrap();
             let root = self.parent.path().join(id);
             fs::create_dir(&root).unwrap();
-            crate::daemon::identity::record_project_root(&state, &root).unwrap();
+            crate::paths::state_dir::record_project_root(&state, &root).unwrap();
             fs::remove_dir(&root).unwrap();
             state
         }
@@ -1541,9 +1542,9 @@ mod tests {
         let root = parent.join("root");
         fs::create_dir_all(&root).unwrap();
         let state = tempfile::tempdir().unwrap();
-        daemon::identity::record_project_root(state.path(), &root).unwrap();
-        let recorded = daemon::identity::read_project_root(state.path()).unwrap();
-        let device = daemon::identity::read_root_device(state.path());
+        crate::paths::state_dir::record_project_root(state.path(), &root).unwrap();
+        let recorded = crate::paths::state_dir::read_project_root(state.path()).unwrap();
+        let device = crate::paths::state_dir::read_root_device(state.path());
 
         let Some(_restore) = make_unsearchable(&parent, &recorded) else {
             return;
@@ -1564,7 +1565,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         projects.add("aaaa1111", 1);
         projects.record_root("aaaa1111", &root);
-        let recorded = daemon::identity::read_project_root(&projects.root().join("aaaa1111")).unwrap();
+        let recorded = crate::paths::state_dir::read_project_root(&projects.root().join("aaaa1111")).unwrap();
 
         let Some(_restore) = make_unsearchable(&parent, &recorded) else {
             return;
@@ -1593,7 +1594,8 @@ mod tests {
         projects.record_root(id, root);
         fs::remove_dir(root).unwrap();
         let other = device_of(root.parent().unwrap()).wrapping_add(1);
-        fs::write(projects.root().join(id).join(daemon::identity::DEVICE_FILE), other.to_string()).unwrap();
+        fs::write(projects.root().join(id).join(crate::paths::state_dir::DEVICE_FILE), other.to_string())
+            .unwrap();
     }
 
     /// Test 3: a missing root whose parent is on another device than the one
@@ -1649,10 +1651,10 @@ mod tests {
         projects.record_root("aaaa1111", &root);
         fs::remove_dir(&root).unwrap();
         let state = projects.root().join("aaaa1111");
-        fs::remove_file(state.join(daemon::identity::DEVICE_FILE)).unwrap();
+        fs::remove_file(state.join(crate::paths::state_dir::DEVICE_FILE)).unwrap();
 
-        let recorded = daemon::identity::read_project_root(&state).unwrap();
-        assert_eq!(daemon::identity::read_root_device(&state), None);
+        let recorded = crate::paths::state_dir::read_project_root(&state).unwrap();
+        assert_eq!(crate::paths::state_dir::read_root_device(&state), None);
         assert_eq!(root_state(Some(&recorded), None), RootState::Unreachable);
         assert!(matches!(purge_orphaned_state_dir(&state, LockWait::Try).unwrap(), Purge::Kept(_)));
         assert!(projects.exists("aaaa1111"));
@@ -1673,14 +1675,14 @@ mod tests {
         fs::remove_dir(&root).unwrap();
         let state = projects.root().join("aaaa1111");
 
-        let recorded = daemon::identity::read_project_root(&state);
-        let device = daemon::identity::read_root_device(&state);
+        let recorded = crate::paths::state_dir::read_project_root(&state);
+        let device = crate::paths::state_dir::read_root_device(&state);
         assert_eq!(root_state(recorded.as_deref(), device), RootState::Orphaned);
 
         let only_device = projects.add_empty("bbbb2222");
-        fs::write(only_device.join(daemon::identity::DEVICE_FILE), "1").unwrap();
+        fs::write(only_device.join(crate::paths::state_dir::DEVICE_FILE), "1").unwrap();
         assert_eq!(
-            root_state(daemon::identity::read_project_root(&only_device).as_deref(), Some(1)),
+            root_state(crate::paths::state_dir::read_project_root(&only_device).as_deref(), Some(1)),
             RootState::Legacy
         );
 
@@ -1731,7 +1733,7 @@ mod tests {
         projects.add("aaaa1111", 1);
         projects.record_root("aaaa1111", &root);
         assert_ne!(
-            daemon::identity::read_root_device(&projects.root().join("aaaa1111")),
+            crate::paths::state_dir::read_root_device(&projects.root().join("aaaa1111")),
             Some(device_of(tmp.path())),
             "the image did not mount on its own device"
         );

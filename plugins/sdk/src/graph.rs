@@ -228,17 +228,14 @@ pub enum PlaceholderKind {
 }
 
 impl PlaceholderKind {
-    /// The wire string, which must match core's own constants
-    /// (`graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND` and its two
-    /// siblings). They are spelled out here rather than imported because this
-    /// crate deliberately does not depend on core; the conformance kit is
-    /// what catches a divergence, under `shape`.
+    /// The wire string: the constant `g_mesh_wire::native_kind` defines, the
+    /// one core stores and compares.
     pub fn native_kind(self) -> &'static str {
         match self {
-            PlaceholderKind::PendingSymbol => "pending_symbol",
-            PlaceholderKind::Reexport => "reexport",
-            PlaceholderKind::ResolvedModule => "resolved_module",
-            PlaceholderKind::ExternalModule => "external_module",
+            PlaceholderKind::PendingSymbol => g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND,
+            PlaceholderKind::Reexport => g_mesh_wire::native_kind::REEXPORT_NATIVE_KIND,
+            PlaceholderKind::ResolvedModule => g_mesh_wire::native_kind::RESOLVED_MODULE_NATIVE_KIND,
+            PlaceholderKind::ExternalModule => g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND,
         }
     }
 }
@@ -1105,5 +1102,14 @@ mod tests {
         assert_eq!(edge.kind, EdgeKind::Imports);
         assert!(!edge.resolved);
         assert_eq!(edge.specifier.as_deref(), Some("./b"));
+    }
+
+    #[test]
+    fn each_placeholder_kind_is_the_wire_constant_core_stores() {
+        use g_mesh_wire::native_kind::*;
+        assert_eq!(PlaceholderKind::PendingSymbol.native_kind(), PENDING_SYMBOL_NATIVE_KIND);
+        assert_eq!(PlaceholderKind::Reexport.native_kind(), REEXPORT_NATIVE_KIND);
+        assert_eq!(PlaceholderKind::ResolvedModule.native_kind(), RESOLVED_MODULE_NATIVE_KIND);
+        assert_eq!(PlaceholderKind::ExternalModule.native_kind(), EXTERNAL_MODULE_NATIVE_KIND);
     }
 }

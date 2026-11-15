@@ -10,7 +10,7 @@
 //! tested against a single plugin, however real.
 //!
 //! So this module writes a plugin directory that is real in every way
-//! `daemon::manifest`, `daemon::plugin` and `daemon::lifecycle` care about -
+//! `plugin_manifest`, `daemon::plugin` and `daemon::lifecycle` care about -
 //! a `plugin.toml` that `read_manifest`/`discover` parse like any other, and
 //! a process that speaks the actual wire protocol (`Content-Length` framed
 //! JSON-RPC: a handshake first, then one `FileChangeResponse` per request).
@@ -142,7 +142,7 @@ const SEMANTIC_PASS_GATE_OPEN: &str = "semantic-pass.allow";
 /// claiming `extensions`, and returns the directory it created.
 ///
 /// Laid out exactly as a real one is (`<root>/<language>/plugin.toml`), so
-/// `daemon::manifest::discover(&[root])` picks it up with no test-only path
+/// `plugin_manifest::discover(&[root])` picks it up with no test-only path
 /// through discovery.
 ///
 /// No `[plugin.capabilities]` table at all - the same "says nothing" shape a
@@ -162,7 +162,7 @@ pub(crate) fn install(root: &Path, language: &str, extensions: &[&str]) -> PathB
 /// the ordinary extension routing every other `install*` fixture here
 /// exercises. Each entry in `watch_files` is written into the manifest
 /// exactly as given - an exact name (`"go.mod"`) or a genuine glob
-/// (`"*.csproj"`) both compile the same way through `daemon::manifest::
+/// (`"*.csproj"`) both compile the same way through `plugin_manifest::
 /// read_manifest`'s `Glob::new`, so this fixture needs no separate "glob"
 /// variant to test glob matching specifically.
 pub(crate) fn install_with_workspace(
@@ -625,7 +625,7 @@ fn manifest(
 ) -> String {
     let extensions = extensions.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
     let capabilities = if semantic_pass { "\n[plugin.capabilities]\nsemantic_pass = true\n" } else { "" };
-    // Omitted entirely when both are empty, matching `daemon::manifest`'s own
+    // Omitted entirely when both are empty, matching `plugin_manifest`'s own
     // "an absent [plugin.workspace] table defaults to all three fields empty"
     // convention - the ordinary fixture (every `install*` call before
     // GM-272) still parses to exactly the conservative default it always
@@ -676,7 +676,7 @@ pub(crate) fn point_at_a_missing_binary(plugin_dir: &Path) -> PathBuf {
     let missing = format!("{FAKE_PLUGIN_BIN}-never-built");
     fs::write(&path, manifest.replace(&command, &format!("command = \"${{G_MESH_BIN_DIR}}/{missing}\"")))
         .expect("failed to write the fake plugin's manifest");
-    crate::daemon::manifest::current_bin_dir().expect("the test binary's directory is unknown").join(missing)
+    crate::plugin_manifest::current_bin_dir().expect("the test binary's directory is unknown").join(missing)
 }
 
 /// The file whose bytes stand for the plugin's build in its directory's
@@ -704,7 +704,7 @@ struct Options<'a> {
 /// Writes `options` where the fake plugin in `dir` reads them, failing with
 /// the build command when the binary itself has not been built.
 fn write_options(dir: &Path, options: &Options<'_>) {
-    let bin_dir = crate::daemon::manifest::current_bin_dir().expect("the test binary's directory is unknown");
+    let bin_dir = crate::plugin_manifest::current_bin_dir().expect("the test binary's directory is unknown");
     let binary = bin_dir.join(format!("{FAKE_PLUGIN_BIN}{}", std::env::consts::EXE_SUFFIX));
     assert!(
         binary.is_file(),

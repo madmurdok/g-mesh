@@ -7,10 +7,10 @@ use rusqlite::Connection;
 
 use super::*;
 use crate::graph::queries;
-use crate::graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND;
 use crate::protocol::types::{PathSegment, QualifiedPath};
 use crate::storage::schema;
 use crate::storage::write::{apply_diff, Diff, EdgeRecord};
+use g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND;
 
 fn setup() -> Connection {
     let conn = Connection::open_in_memory().unwrap();

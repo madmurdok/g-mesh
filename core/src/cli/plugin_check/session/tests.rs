@@ -1,5 +1,5 @@
 use super::*;
-use crate::daemon::manifest::{Capabilities, WorkspaceConfig};
+use crate::plugin_manifest::{Capabilities, WorkspaceConfig};
 
 // -----------------------------------------------------------------
 // GM-375: a fresh worktree's unbuilt cargo-workspace plugin binary

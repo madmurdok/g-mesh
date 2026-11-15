@@ -231,7 +231,7 @@ impl IndexStore {
     }
 
     /// This store, linking under `rules` - the discovered manifests' own
-    /// (`daemon::manifest::link_rules`).
+    /// (`plugin_manifest::link_rules`).
     pub fn with_link_rules(mut self, rules: LinkRules) -> Self {
         self.link_rules = rules;
         self
@@ -827,7 +827,7 @@ mod tests {
         .unwrap();
         let store = IndexStore::new(conn);
         let plugins =
-            crate::daemon::manifest::discover(&[
+            crate::plugin_manifest::discover(&[
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins")
             ])
             .unwrap();
@@ -1210,7 +1210,7 @@ mod tests {
             "use.ts",
             "typescript",
         );
-        node.native_kind = Some(symbol_links::PENDING_SYMBOL_NATIVE_KIND.to_string());
+        node.native_kind = Some(g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND.to_string());
         node.target = Some(crate::storage::write::PlaceholderTargetRecord {
             scope_kind: "file".to_string(),
             scope: "lib.ts".to_string(),
@@ -1294,7 +1294,7 @@ mod tests {
     fn edges_on_placeholders(conn: &Connection) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id = e.toId WHERE t.nativeKind = ?1",
-            [symbol_links::PENDING_SYMBOL_NATIVE_KIND],
+            [g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND],
             |row| row.get(0),
         )
         .unwrap()

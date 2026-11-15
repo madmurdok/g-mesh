@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::graph::imports::{EXTERNAL_MODULE_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND};
-use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::storage::schema;
 use crate::storage::write::{apply_diff, EdgeRecord};
+use g_mesh_wire::native_kind::{EXTERNAL_MODULE_NATIVE_KIND, RESOLVED_MODULE_NATIVE_KIND};
+use g_mesh_wire::native_kind::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 
 /// Both connection shapes this module has to be right on: `foreign_keys`
 /// on, which is how every other storage test runs and which turns a

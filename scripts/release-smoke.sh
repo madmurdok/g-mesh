@@ -154,7 +154,7 @@ done
 # checkout, plus a scratch G_MESH_HOME (the documented override -
 # core/src/paths.rs's HOME_ENV), so this run's project state lands somewhere
 # this script can find it afterward without reimplementing g-mesh's own
-# project-path hashing (core/src/storage/connection.rs's `project_dir`), and
+# project-path hashing (core/src/paths/state_dir.rs's `project_dir`), and
 # never touches a real developer's or runner's actual ~/.g-mesh.
 work="$(mktemp -d "${TMPDIR:-/tmp}/g-mesh-release-smoke.XXXXXX")"
 trap 'rm -rf "$work"' EXIT

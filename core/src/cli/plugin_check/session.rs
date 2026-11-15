@@ -71,10 +71,10 @@ use rusqlite::Connection;
 use super::checks::is_placeholder;
 use super::expectations::FilesCreatedPair;
 use crate::daemon::bulk_index::{self, WalkContext, BULK_INDEX_FLAG};
-use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
 use crate::paths;
+use crate::plugin_manifest::PluginManifest;
 use crate::protocol::handshake;
 use crate::protocol::jsonrpc::{read_frame, read_message_with_timeout, write_message};
 use crate::protocol::ndjson::BulkItem;
@@ -377,9 +377,9 @@ pub(crate) fn run_bulk(manifest: &PluginManifest, scratch: &Scratch, timeout: Du
         .arg(scratch.workspace())
         // The manifest being checked, so an SDK plugin reads the same file the
         // kit is judging it against rather than one beside its own binary -
-        // see `daemon::manifest::MANIFEST_PATH_ENV`. Checking a plugin against
+        // see `plugin_manifest::MANIFEST_PATH_ENV`. Checking a plugin against
         // a manifest it cannot see is checking something else.
-        .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
+        .env(crate::plugin_manifest::MANIFEST_PATH_ENV, manifest.path())
         // The daemon's lifeline, exactly as `walk_one_language` sets it up:
         // a stdin pipe kept inside `child` and never written, plus
         // the variable that arms the plugin's watcher on it. Checking a
@@ -547,7 +547,7 @@ pub(crate) fn open_index(manifest: &PluginManifest) -> Result<Arc<IndexStore>> {
     let conn = Connection::open_in_memory().context("failed to open an in-memory index")?;
     conn.pragma_update(None, "foreign_keys", "OFF").context("failed to disable foreign-key enforcement")?;
     schema::apply(&conn)?;
-    let rules = crate::daemon::manifest::link_rules([manifest]);
+    let rules = crate::plugin_manifest::link_rules([manifest]);
     Ok(Arc::new(IndexStore::new(conn).with_link_rules(rules)))
 }
 
@@ -1634,8 +1634,8 @@ impl<'a> Driver<'a> {
         command
             .args(&manifest.args)
             .arg(scratch.workspace())
-            // As in `run_bulk` above - see `daemon::manifest::MANIFEST_PATH_ENV`.
-            .env(crate::daemon::manifest::MANIFEST_PATH_ENV, manifest.path())
+            // As in `run_bulk` above - see `plugin_manifest::MANIFEST_PATH_ENV`.
+            .env(crate::plugin_manifest::MANIFEST_PATH_ENV, manifest.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // As in `run_bulk` above - see [`StderrCapture`].

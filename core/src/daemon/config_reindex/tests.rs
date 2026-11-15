@@ -9,8 +9,8 @@ use std::sync::Arc;
 use rusqlite::Connection;
 
 use super::*;
-use crate::daemon::manifest::discover;
 use crate::daemon::test_plugin;
+use crate::plugin_manifest::discover;
 use crate::protocol::types::{
     EdgeKind, Matcher, NodeKind, Position, Range, SourceTier, Visibility, WireEdge, WireNode,
 };
@@ -654,7 +654,7 @@ fn fixture(capability: bool, semantic: bool, facts: Option<&str>) -> Fixture {
         test_plugin::declare_resolution_delta(&dir);
     }
     let discovered = discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover");
-    let state_dir = crate::storage::connection::project_dir(project.path()).unwrap();
+    let state_dir = crate::paths::state_dir::project_dir(project.path()).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
     let registry = PluginRegistry::new(
         project.path(),

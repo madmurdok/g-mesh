@@ -51,7 +51,7 @@ use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::storage::connection::project_dir;
+use crate::paths::state_dir::project_dir;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 
@@ -248,7 +248,7 @@ pub fn read_project_config(root: &Path) -> Result<ProjectConfig> {
 /// never indexed still records which root it belongs to - otherwise it would
 /// be the one kind of state directory `clean orphaned` could never judge.
 pub fn write_project_config(root: &Path, config: &ProjectConfig) -> Result<()> {
-    crate::storage::connection::ensure_project_dir(root)?;
+    crate::paths::state_dir::ensure_project_dir(root)?;
     write_toml(&project_config_path(root)?, config)
 }
 

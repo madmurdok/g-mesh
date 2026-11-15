@@ -305,7 +305,7 @@ build_one() {
 		"$REPO_ROOT/README.md" "$stage_dir/"
 
 	# `plugins/` beside the binary is not a convention this script invents - it
-	# is where `daemon::manifest::bundled_roots` looks in an installed layout,
+	# is where `plugin_manifest::bundled_roots` looks in an installed layout,
 	# which is what makes the unpacked archive work from any directory.
 	if [ "${G_MESH_SKIP_PLUGIN_BUNDLE:-}" = "1" ]; then
 		echo "build-targets: WARNING: G_MESH_SKIP_PLUGIN_BUNDLE=1 - packaging $target with no plugins. The resulting archive CANNOT index anything and must not be published." >&2

@@ -3,14 +3,14 @@
 mod activation;
 pub mod build_stamp;
 pub mod bulk_index;
-pub mod candidates;
+pub use crate::project_detect as candidates;
 pub mod client;
 pub(crate) mod config_reindex;
 pub mod front;
 pub mod identity;
-pub mod indexing_status;
+pub use crate::indexing_status;
 pub mod lifecycle;
-pub mod manifest;
+pub use crate::plugin_manifest as manifest;
 pub mod memory;
 pub(crate) mod path_case;
 pub mod plugin;
@@ -31,13 +31,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
-use crate::daemon::indexing_status::{ColdCause, IndexingStatus};
 use crate::daemon::lifecycle::{CoreActivity, IdleTimeouts};
 use crate::daemon::registry::PluginRegistry;
 use crate::gc::last_used;
+use crate::indexing_status::{ColdCause, IndexingStatus};
 use crate::ipc;
 use crate::mcp;
-use crate::storage::connection::{self, ensure_project_dir, project_dir};
+use crate::paths::state_dir::{ensure_project_dir, project_dir};
+use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::watcher::batch::{classify_settled, order_for_routing};
@@ -187,9 +188,9 @@ pub(crate) fn bootstrap_lock_path_in(state_dir: &Path) -> PathBuf {
 }
 
 /// [`lock_path`] under the g-mesh home `home` rather than the one the
-/// environment names (see `storage::connection::project_dir_under`).
+/// environment names (see `paths::state_dir::project_dir_under`).
 pub(crate) fn lock_path_under(home: &Path, root: &Path) -> Result<PathBuf> {
-    Ok(crate::storage::connection::project_dir_under(home, root)?.join(BOOTSTRAP_LOCK_FILE))
+    Ok(crate::paths::state_dir::project_dir_under(home, root)?.join(BOOTSTRAP_LOCK_FILE))
 }
 
 /// The singleton lock a running daemon holds for its whole lifetime.
@@ -272,20 +273,7 @@ pub fn read_pid_file_result(path: &Path) -> std::io::Result<Option<u32>> {
 /// reader never sees a truncated file, which reads as "no daemon". Best-effort:
 /// every reader handles "nothing recorded".
 pub fn write_pid_file(path: &Path, pid: u32) {
-    write_state_file_atomic(path, &format!("{pid}\n"), "pid file");
-}
-
-/// The temp-then-rename write behind [`write_pid_file`], also used for the phase file.
-pub(crate) fn write_state_file_atomic(path: &Path, contents: &str, what: &str) {
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    if let Err(err) = fs::write(&temporary, contents) {
-        crate::log_line!("g-mesh daemon: failed to write {what} {}: {err}", temporary.display());
-        return;
-    }
-    if let Err(err) = fs::rename(&temporary, path) {
-        crate::log_line!("g-mesh daemon: failed to put {what} {} in place: {err}", path.display());
-        let _ = fs::remove_file(&temporary);
-    }
+    crate::paths::state_dir::write_state_file_atomic(path, &format!("{pid}\n"), "pid file");
 }
 
 /// Whether a process with this pid exists: a snapshot, and pids are reused, so
@@ -342,8 +330,8 @@ pub fn run(root: &Path) -> Result<()> {
     // Discovery comes before the index (the generation check below needs it)
     // and before the bind, so a malformed manifest or two plugins claiming one
     // extension fail startup before a socket or pid file is published.
-    let discovered =
-        manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
+    let discovered = crate::plugin_manifest::discover(&crate::plugin_manifest::default_roots())
+        .context("failed to discover language plugins")?;
 
     // Before the index is opened and before any reindex can run: a staging
     // file left here belongs to a reindex that died.
@@ -416,8 +404,10 @@ pub fn run(root: &Path) -> Result<()> {
             "g-mesh daemon: the index is a seed - reconciling it with this worktree before tool calls answer"
         );
     }
-    let conn =
-        Arc::new(IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())));
+    let conn = Arc::new(
+        IndexStore::new(conn)
+            .with_link_rules(crate::plugin_manifest::link_rules(discovered.manifests.values())),
+    );
 
     // Canonicalized like `ProjectWatcher`'s paths, so `relative_wire_path` can strip it.
     let canonical_root = root

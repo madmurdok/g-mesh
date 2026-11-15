@@ -39,7 +39,7 @@
 #
 # Core cannot index a TypeScript project without the JS/TS plugin, and it
 # finds both plugins by looking for `plugins/` *next to the executable that is
-# running* (`daemon::manifest::installed_bundled_root`, which is
+# running* (`plugin_manifest::installed_bundled_root`, which is
 # `std::env::current_exe()` + `/plugins`). So every part of the install has to
 # land in one directory, and that directory - not a copy of the binary - is
 # what goes on `PATH`.

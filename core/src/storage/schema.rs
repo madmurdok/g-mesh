@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::languages::LanguageOutcome;
+use super::language_outcome::LanguageOutcome;
 
 /// Bumped whenever the DDL below changes in a way that isn't backward
 /// compatible. No migration framework in v1 - a mismatch means a full
@@ -1988,7 +1988,7 @@ pub fn semantic_pass_failures(conn: &Connection) -> Result<Vec<(String, String)>
 ///
 /// `semantic_pass_languages` is the caller's set of languages whose manifest
 /// declares `capabilities.semantic_pass = true` - this module reads no
-/// capability itself and has no `daemon::manifest` dependency, matching its
+/// capability itself and has no `plugin_manifest` dependency, matching its
 /// existing "pure storage, callers bring the facts" boundary; the caller
 /// (`daemon::semantic`, which already holds the discovered manifests or a
 /// `PluginRegistry` to ask) is what can answer "capable of what".
@@ -2052,7 +2052,7 @@ pub fn owed_semantic_pass_languages(
     // "Sequential, not concurrent") - a fixed, sorted order is what makes
     // which language runs first (and therefore which one a shared machine's
     // memory pressure hits first) reproducible from run to run, matching
-    // `daemon::manifest::semantic_pass_capable_languages`'s own sort for the
+    // `plugin_manifest::semantic_pass_capable_languages`'s own sort for the
     // same reason.
     owed.sort();
     Ok(owed)

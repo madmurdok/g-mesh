@@ -2,7 +2,7 @@
 //! that language is actually touched.
 //!
 //! This is the piece that turns "the daemon has a plugin" into "the daemon
-//! has plugins": it owns discovery's results (see `daemon::manifest`) and
+//! has plugins": it owns discovery's results (see `plugin_manifest`) and
 //! answers the only two questions the rest of the daemon has about them -
 //! *which* plugin claims this file, and *is it running yet* - while
 //! `PluginSupervisor` and `PluginProcess` keep doing exactly what they
@@ -98,12 +98,13 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::daemon::lifecycle::PluginSupervisor;
-use crate::daemon::manifest::{self, extension_of, under_excluded_dir, DiscoveredPlugins};
 use crate::daemon::{path_case, plugin};
 use crate::embedding::EmbeddingPipeline;
-use crate::languages::LanguageOutcome;
+use crate::plugin_manifest::{self, DiscoveredPlugins};
+use crate::project_walk::{extension_of, under_excluded_dir};
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{self, IndexStore, Unit};
+use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{self, CURRENT_INDEXER_VERSION};
 use crate::storage::write::Diff;
 use crate::watcher::staleness::{self, StalenessOutcome};
@@ -608,7 +609,7 @@ pub struct PluginRegistry {
     /// (which read `dir`, not this type) would never find them.
     state_dir: PathBuf,
     /// Discovery's output, taken as a finished value rather than produced
-    /// here: scanning roots and validating manifests is `daemon::manifest`'s
+    /// here: scanning roots and validating manifests is `plugin_manifest`'s
     /// job and happens once at startup, before this registry (or the schema
     /// staleness check that also consumes it) exists. Never re-read while the
     /// daemon runs - a plugin install takes effect on the next start, per the
@@ -783,7 +784,7 @@ impl PluginRegistry {
     /// TypeScript file on a case-insensitive filesystem, and nothing upstream
     /// normalizes what the watcher reports), while the routing table's keys
     /// are already lowercase-with-leading-dot by the manifest convention
-    /// `daemon::manifest` documents.
+    /// `plugin_manifest` documents.
     pub fn language_for(&self, file_path: &str) -> Option<&str> {
         self.discovered.language_for(file_path)
     }
@@ -795,12 +796,12 @@ impl PluginRegistry {
     /// `workspaceChanged` -> per-language reindex".
     ///
     /// A language is in the result when **both** hold:
-    ///  - its `[plugin.workspace] watch_files` (`daemon::manifest::
+    ///  - its `[plugin.workspace] watch_files` (`plugin_manifest::
     ///    WorkspaceConfig::watch_files`, already-compiled globs) matches
     ///    `file_path`'s **file name alone** - "exact file names (any
     ///    directory)" per the architecture doc's `plugin.toml additions`
     ///    section, which is exactly what an exact name is as a `Glob`
-    ///    (`daemon::manifest`'s own doc comment: an exact name needs no
+    ///    (`plugin_manifest`'s own doc comment: an exact name needs no
     ///    separate code path from a genuine glob like `*.csproj`, since both
     ///    compile through the same `Glob::compile_matcher`);
     ///  - `file_path` is not [`under_excluded_dir`] of *that same manifest's*
@@ -887,7 +888,7 @@ impl PluginRegistry {
     }
 
     /// The union of every discovered plugin's own `[plugin.workspace]
-    /// entry_points` (`daemon::manifest::WorkspaceConfig::entry_points`),
+    /// entry_points` (`plugin_manifest::WorkspaceConfig::entry_points`),
     /// deduplicated - what `mcp::get_dependencies` feeds
     /// `graph::queries::find_files_under`/`find_files_ending_in_dir` (via
     /// `entry_point_rank_expr`) so a miss-path directory lookup ranks each
@@ -927,7 +928,7 @@ impl PluginRegistry {
     }
 
     /// Every discovered manifest's `[plugin.capabilities]`
-    /// (`daemon::manifest::Capabilities`), keyed by language - what
+    /// (`plugin_manifest::Capabilities`), keyed by language - what
     /// `mcp::instructions` (GM-262) reads to decide, per language present in
     /// the index, whether its receiver-call gap
     /// (`Capabilities::receiver_calls`/`receiver_calls_structural`) is still
@@ -944,7 +945,7 @@ impl PluginRegistry {
     /// same reason: this registry has no per-project presence to consult, and
     /// the caller (`mcp::instructions::build`) already filters by what the
     /// index reports present before this map is ever indexed into.
-    pub fn receiver_call_capabilities(&self) -> HashMap<String, manifest::Capabilities> {
+    pub fn receiver_call_capabilities(&self) -> HashMap<String, plugin_manifest::Capabilities> {
         self.discovered.manifests.iter().map(|(language, m)| (language.clone(), m.capabilities)).collect()
     }
 
@@ -978,12 +979,12 @@ impl PluginRegistry {
     /// language's whole-project semantic pass, generalized (GM-270) from the
     /// single hardcoded `plugin::BUNDLED_LANGUAGE` question it replaces.
     ///
-    /// A thin wrapper over `daemon::manifest::semantic_pass_capable_languages`,
+    /// A thin wrapper over `plugin_manifest::semantic_pass_capable_languages`,
     /// which owns the filter and the sort order (see that function's own doc
     /// comment) - both shared with `daemon::semantic::run_once`, which has a
     /// bare `&DiscoveredPlugins` and no registry to ask this of.
     pub fn semantic_pass_languages(&self) -> Vec<String> {
-        manifest::semantic_pass_capable_languages(&self.discovered.manifests)
+        plugin_manifest::semantic_pass_capable_languages(&self.discovered.manifests)
     }
 
     /// The supervisor for `language`, spawning its plugin if this is the
