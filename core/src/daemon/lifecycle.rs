@@ -988,7 +988,7 @@ const PURGE_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// directory (GM-524 D1): the index and every lock and log file of a project
 /// that no longer exists. Called by `daemon::run` and `front::run` after the
 /// singleton lock is dropped, so the directory is judged by exactly the rules
-/// `clean orphaned --force` uses (`cli::clean::purge_orphaned_state_dir`): the
+/// `clean orphaned --force` uses (`control::purge::purge_orphaned_state_dir`): the
 /// root must read as deleted by `root_state` (`NotFound`, parent present on
 /// the recorded device), nothing may be running for it, and the
 /// root is re-checked under the bootstrap lock in case it came back.
@@ -1012,14 +1012,14 @@ pub fn purge_state_dir(state_dir: &Path, exit: &Exit) {
     if cfg!(windows) {
         return;
     }
-    let wait = crate::cli::clean::LockWait::UpTo(PURGE_LOCK_WAIT);
-    match crate::cli::clean::purge_orphaned_state_dir(state_dir, wait) {
-        Ok(crate::cli::clean::Purge::Deleted) => crate::log_line!(
+    let wait = crate::control::purge::LockWait::UpTo(PURGE_LOCK_WAIT);
+    match crate::control::purge::purge_orphaned_state_dir(state_dir, wait) {
+        Ok(crate::control::purge::Purge::Deleted) => crate::log_line!(
             "g-mesh daemon: deleted the state of {} ({}) - its project root no longer exists",
             root.display(),
             state_dir.display()
         ),
-        Ok(crate::cli::clean::Purge::Kept(reason)) => crate::log_line!(
+        Ok(crate::control::purge::Purge::Kept(reason)) => crate::log_line!(
             "g-mesh daemon: kept the state of {} ({}): {reason}",
             root.display(),
             state_dir.display()

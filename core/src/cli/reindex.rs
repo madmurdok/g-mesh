@@ -48,7 +48,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
-use crate::cli::stop;
+use crate::control::stop;
 use crate::daemon;
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::{registry, semantic};

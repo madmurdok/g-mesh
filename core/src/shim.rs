@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use crate::cli::stop;
+use crate::control::stop;
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
 use crate::ipc;
@@ -138,8 +138,8 @@ pub fn run() -> Result<()> {
 }
 
 /// Starts the sweep of orphaned state directories (GM-524 D1, option (c)) on
-/// a background thread: `cli::clean::sweep_orphaned_if_due`, at most once per
-/// `cli::clean::ORPHAN_SWEEP_INTERVAL` across every shim on the machine. It
+/// a background thread: `control::sweep::sweep_orphaned_if_due`, at most once per
+/// `control::sweep::ORPHAN_SWEEP_INTERVAL` across every shim on the machine. It
 /// cleans up after the daemons that could not purge their own state - one
 /// killed with `-9`, or any on Windows. The process may exit mid-sweep; the
 /// sweep deletes each directory's root record last so a cut-short delete is
@@ -149,7 +149,7 @@ fn spawn_orphan_sweep() {
         return;
     };
     let _ = thread::Builder::new().name("orphan-sweep".into()).spawn(move || {
-        use crate::cli::clean::{sweep_orphaned_if_due, Sweep, ORPHAN_SWEEP_INTERVAL};
+        use crate::control::sweep::{sweep_orphaned_if_due, Sweep, ORPHAN_SWEEP_INTERVAL};
         match sweep_orphaned_if_due(&home, ORPHAN_SWEEP_INTERVAL) {
             Ok(Sweep::Swept(deleted)) if deleted > 0 => eprintln!(
                 "g-mesh mcp-shim: deleted the index and state of {deleted} project(s) whose directory no \
@@ -359,7 +359,7 @@ fn incumbent(root: &Path, endpoint: &ipc::Endpoint) -> Result<Incumbent> {
 /// Stops a daemon this build supersedes, so the bootstrap below can put a
 /// current one in its place. Reports whether it is safe to bootstrap over.
 ///
-/// `cli::stop::stop` rather than a shutdown path of this module's own: it
+/// `control::stop::stop` rather than a shutdown path of this module's own: it
 /// already escalates `SIGTERM` to `SIGKILL`, already waits for the plugin the
 /// daemon leaves behind, and already promises not to return until everything
 /// it stopped is genuinely gone - which is exactly the guarantee bootstrapping
