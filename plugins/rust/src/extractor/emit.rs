@@ -54,6 +54,8 @@ use g_mesh_plugin_sdk::{
 };
 use tree_sitter::Node;
 
+use crate::extractor::keys::PathTarget;
+
 /// Byte columns in, character columns out.
 pub(crate) struct Positions<'s> {
     source: &'s str,
@@ -315,6 +317,24 @@ impl<'s> Emitter<'s> {
             self.graph.import_edge(from, to, specifier);
         }
         id
+    }
+
+    /// The `IMPORTS` edge from this file onto whatever a module path names
+    /// (`target`), carrying `specifier`, the path as written. Nothing for an
+    /// unresolved path.
+    pub(crate) fn module_import(&mut self, target: PathTarget, specifier: &str, range: Range) {
+        let to = match target {
+            PathTarget::Container(container) => self.placeholder(
+                PlaceholderKind::ResolvedModule,
+                container.rsplit("::").next().unwrap_or(&container),
+                container_target(&container, TargetKey::Name("*".to_string()), &container),
+                range,
+            ),
+            PathTarget::ExternalCrate(krate) => self.external_module(&krate, range),
+            PathTarget::Unresolved => return,
+        };
+        let file = self.file_id().to_string();
+        self.import_edge(&file, &to, specifier);
     }
 
     /// Records a use site the structural tier could not settle - see

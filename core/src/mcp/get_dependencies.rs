@@ -150,14 +150,15 @@ struct DependencyWalk {
 }
 
 /// `session_hints::WALK_COMPLETE` (with the `import type` clause for a
-/// language that has type-only imports) once per session on a walk that is
+/// language that has type-only imports, and Rust's uncovered paths for Rust)
+/// once per session on a walk that is
 /// not truncated; `session_hints::truncated_by` on every truncated one.
 /// `language` is the walk's first node's: the anchor on a fresh walk.
 fn walk_hint(walk: &DependencyWalk, language: Option<&str>, hints: &SessionHints) -> Option<String> {
-    let complete = if language == Some(session_hints::IMPORT_TYPE_LANGUAGE) {
-        session_hints::WALK_COMPLETE_IMPORT_TYPE
-    } else {
-        session_hints::WALK_COMPLETE
+    let complete = match language {
+        Some(session_hints::IMPORT_TYPE_LANGUAGE) => session_hints::WALK_COMPLETE_IMPORT_TYPE,
+        Some(session_hints::RUST_LANGUAGE) => session_hints::WALK_COMPLETE_RUST,
+        _ => session_hints::WALK_COMPLETE,
     };
     session_hints::join([
         hints.once(!walk.truncated, HintKey::WalkComplete, complete),
