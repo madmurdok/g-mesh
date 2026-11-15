@@ -127,10 +127,11 @@ pub(crate) const WALK_COMPLETE_IMPORT_TYPE: &str =
      importer or import, `import type` included), so don't re-derive it with a `from '...'` grep.";
 
 /// `WALK_COMPLETE` for Rust: the module paths its plugin does not turn into
-/// import edges.
+/// import edges. An inline path rooted at another crate (`std::mem::drop`)
+/// draws none, which only an `Outgoing` walk can miss.
 pub(crate) const WALK_COMPLETE_RUST: &str =
-    "`truncated: false`: complete for the depth asked, except a module reached through a glob `use`, \
-     or used in a `macro_rules!` body or a fn-local `mod`; don't grep for the rest.";
+    "`truncated: false`: complete, except a module reached via a glob `use`, in a `macro_rules!` body or \
+     fn-local `mod`, or an external crate named only inline; don't grep for the rest.";
 
 /// The language whose `WALK_COMPLETE` is [`WALK_COMPLETE_RUST`].
 pub(crate) const RUST_LANGUAGE: &str = "rust";
