@@ -26,7 +26,7 @@ dirs = "5"
 flate2 = "1"
 # Already resolved into this tree as a transitive dependency of `ignore`
 # (which uses it internally for `.gitignore`-style overrides), so promoting
-# it to a direct dependency for `daemon::manifest`'s `[plugin.workspace]
+# it to a direct dependency for `plugin_manifest`'s `[plugin.workspace]
 # watch_files` glob validation (`*.csproj`, per the multi-language-plugins
 # architecture doc's paper stress test) adds no new subtree to compile -
 # `cargo tree` already has one copy. Chosen over hand-rolling glob matching

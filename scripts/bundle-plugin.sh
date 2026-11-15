@@ -66,7 +66,7 @@
 #                                      SDK, wire and tree-sitter grammar crates
 #
 # `typescript` as the directory name is required, not cosmetic:
-# `core/src/daemon/manifest.rs` enforces that a manifest's `language` equals
+# `core/src/plugin_manifest.rs` enforces that a manifest's `language` equals
 # its containing directory's name.
 
 set -euo pipefail

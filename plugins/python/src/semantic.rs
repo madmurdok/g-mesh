@@ -112,8 +112,8 @@
 //! extension list is a parameter, not a fact [`lsp::script_spellings`] reads
 //! for itself - [`lsp::HOST_SCRIPT_EXTENSIONS`] is the one place that picks
 //! [`lsp::WINDOWS_SCRIPT_EXTENSIONS`] under `#[cfg(windows)]`, the same shape
-//! `daemon::manifest::resolve_exe_suffix` uses around
-//! `daemon::manifest::exe_suffixed` and its `EXE_SUFFIX` - so the Windows arm
+//! `plugin_manifest::resolve_exe_suffix` uses around
+//! `plugin_manifest::exe_suffixed` and its `EXE_SUFFIX` - so the Windows arm
 //! is exercised by this module's own tests from this macOS host, rather than
 //! sitting behind a `#[cfg(windows)]` nobody here can run. GM-335 is what a
 //! test that never runs costs.
