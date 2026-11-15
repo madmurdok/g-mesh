@@ -24,10 +24,10 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::graph::pagination::{self, FileTally};
-use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::protocol::types::PathSegment;
 use crate::storage::qualified_path;
 use crate::storage::write::NodeRecord;
+use g_mesh_wire::native_kind::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 
 /// Ceiling on how many files the tally names, at ~40 bytes an entry.
 const MAX_UNLINKED_FILE_TALLY: usize = 20;

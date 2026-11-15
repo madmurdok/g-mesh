@@ -4,12 +4,12 @@ use std::io::{BufReader, Cursor};
 // (`graph::containers`) - a container has members in many files, so no single
 // file's diff can own it - so a plugin ever emitting one is always a
 // conformance violation, never a legitimate message.
-use crate::graph::containers::CONTAINER_NATIVE_KIND;
-use crate::graph::imports::RESOLVED_MODULE_NATIVE_KIND;
-use crate::graph::symbol_links::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 use crate::protocol::jsonrpc::read_message;
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::protocol::types::{ControlEnvelope, NodeKind, TargetScope, WireNode};
+use g_mesh_wire::native_kind::CONTAINER_NATIVE_KIND;
+use g_mesh_wire::native_kind::RESOLVED_MODULE_NATIVE_KIND;
+use g_mesh_wire::native_kind::{PENDING_SYMBOL_NATIVE_KIND, REEXPORT_NATIVE_KIND};
 
 /// The `nativeKind`s a `WireNode` stands in for something outside its own
 /// file rather than declaring anything (mirrors the plugin's own

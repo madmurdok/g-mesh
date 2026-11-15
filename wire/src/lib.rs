@@ -32,6 +32,8 @@
 //! The wire format itself is specified in
 //! `docs/architecture/multi-language-plugins.md` ("Interfaces > Wire v2").
 
+pub mod native_kind;
+
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any breaking change to this wire contract. A mismatch between

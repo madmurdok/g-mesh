@@ -1210,7 +1210,7 @@ mod tests {
             "use.ts",
             "typescript",
         );
-        node.native_kind = Some(symbol_links::PENDING_SYMBOL_NATIVE_KIND.to_string());
+        node.native_kind = Some(g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND.to_string());
         node.target = Some(crate::storage::write::PlaceholderTargetRecord {
             scope_kind: "file".to_string(),
             scope: "lib.ts".to_string(),
@@ -1294,7 +1294,7 @@ mod tests {
     fn edges_on_placeholders(conn: &Connection) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM edges e JOIN nodes t ON t.id = e.toId WHERE t.nativeKind = ?1",
-            [symbol_links::PENDING_SYMBOL_NATIVE_KIND],
+            [g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND],
             |row| row.get(0),
         )
         .unwrap()

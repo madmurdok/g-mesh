@@ -37,7 +37,7 @@ fn the_tools_list_fits_its_ceiling() {
 fn without_project(mut tool: Tool) -> Tool {
     let mut schema = (*tool.input_schema).clone();
     if let Some(properties) = schema.get_mut("properties").and_then(|value| value.as_object_mut()) {
-        properties.remove(front::PROJECT_ARG);
+        properties.remove(crate::protocol::front::PROJECT_ARG);
     }
     tool.input_schema = std::sync::Arc::new(schema);
     tool

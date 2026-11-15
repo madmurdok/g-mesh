@@ -1807,7 +1807,7 @@ fn pending(id: &str, file_path: &str, language: &str, scope: TargetScope, name: 
         name: name.to_string(),
         qualified_name: id.to_string(),
         language: language.to_string(),
-        native_kind: Some(crate::graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND.to_string()),
+        native_kind: Some(g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND.to_string()),
         target: Some(PlaceholderTarget {
             scope,
             key: TargetKey::Name(name.to_string()),
@@ -1825,13 +1825,13 @@ fn pending(id: &str, file_path: &str, language: &str, scope: TargetScope, name: 
 fn lib_rs_reparse() -> FileChangeDiff {
     let glob = WireNode {
         kind: NodeKind::Module,
-        name: crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string(),
+        name: g_mesh_wire::native_kind::REEXPORT_ALL_NAME.to_string(),
         qualified_name: "reexport:othercrate::*".to_string(),
         container: Some("mycrate".to_string()),
-        native_kind: Some(crate::graph::symbol_links::REEXPORT_NATIVE_KIND.to_string()),
+        native_kind: Some(g_mesh_wire::native_kind::REEXPORT_NATIVE_KIND.to_string()),
         target: Some(PlaceholderTarget {
             scope: TargetScope::Container("othercrate".to_string()),
-            key: TargetKey::Name(crate::graph::symbol_links::REEXPORT_ALL_NAME.to_string()),
+            key: TargetKey::Name(g_mesh_wire::native_kind::REEXPORT_ALL_NAME.to_string()),
             from_container: Some("mycrate".to_string()),
             key_path: None,
             also_scopes: Vec::new(),

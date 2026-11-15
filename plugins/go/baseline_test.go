@@ -32,7 +32,7 @@ func rustBaseline(t *testing.T, path string) []string {
 
 // Control: drop ".claude" from baselineExcludedDirs -> both subtests fail.
 func TestBaselineExcludedDirsEqualRustBaseline(t *testing.T) {
-	for _, path := range []string{"../../core/src/watcher/mod.rs", "../sdk/src/walk.rs"} {
+	for _, path := range []string{"../../walk/src/lib.rs"} {
 		t.Run(strings.ReplaceAll(path, "/", "_"), func(t *testing.T) {
 			want := rustBaseline(t, path)
 			if !slices.Equal(baselineExcludedDirs, want) {

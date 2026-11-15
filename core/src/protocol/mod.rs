@@ -1,4 +1,5 @@
 pub mod conformance;
+pub mod front;
 pub mod handshake;
 pub mod jsonrpc;
 pub mod ndjson;

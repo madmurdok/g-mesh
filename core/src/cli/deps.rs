@@ -33,12 +33,12 @@ use crate::daemon::candidates::{self, Limits, Mode};
 use crate::daemon::indexing_status::group_thousands;
 use crate::daemon::{self, client, manifest};
 use crate::graph::containers;
-use crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND;
 use crate::languages::LanguageOutcome;
 use crate::process;
 use crate::shim;
 use crate::storage::connection::project_dir;
 use crate::storage::schema;
+use g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND;
 
 /// The JSON format's version. Removing or renaming a key, or changing a
 /// field's meaning or type, bumps it; adding a key or a new `kind`/`status`

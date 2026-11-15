@@ -24,14 +24,7 @@ use ignore_layers::{IgnoreLayers, GITIGNORE_FILE_NAME};
 /// couldn't get a real watch, not the whole project.
 const POLL_FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Directory names excluded whatever `.gitignore` says, in every language:
-/// git's object store and Claude Code's session directory (`.claude/worktrees/`
-/// holds whole copies of the project), neither of which is ever source. The
-/// same pair as `BASELINE_EXCLUDED_DIRS` in plugins/sdk/src/walk.rs, which the
-/// SDK-built plugins' bulk walks apply; everything language-specific
-/// (`node_modules`, `target`, `vendor`) is the plugin's own `[plugin.workspace]
-/// exclude_dirs`. Shared with `cli::status`'s coverage walk.
-pub const BASELINE_EXCLUDED_DIRS: [&str; 2] = [".git", ".claude"];
+pub use g_mesh_walk::BASELINE_EXCLUDED_DIRS;
 
 /// Watches a project root for filesystem changes, filtering out anything
 /// a `.gitignore` at any level ignores (plus `.git` and `.claude`, which

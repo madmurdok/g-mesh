@@ -192,9 +192,7 @@ use sha2::{Digest, Sha256};
 use crate::graph::queries::{declaration_only, NON_DECLARATION_NATIVE_KINDS};
 use crate::storage::write::{Diff, NodeRecord};
 
-/// The `nativeKind` of a core-materialized container node. Never plugin-emitted
-/// - `protocol::conformance` reports one on the wire as a violation.
-pub const CONTAINER_NATIVE_KIND: &str = "container";
+pub use g_mesh_wire::native_kind::CONTAINER_NATIVE_KIND;
 
 const MODULE_KIND: &str = "Module";
 const DEFINES_KIND: &str = "DEFINES";

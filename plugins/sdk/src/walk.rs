@@ -37,17 +37,7 @@ use crate::path::RelPath;
 
 pub use g_mesh_walk::LinkRefusal;
 
-/// Directory names no walk ever descends into, whatever the manifest says.
-///
-/// Only the two that are never source in any language: git's own object store
-/// (walking it is pure cost, and it is never in `.gitignore` because git does
-/// not need to ignore itself) and Claude Code's session directory, which
-/// holds whole copies of the project made for parallel agent sessions - real
-/// source is never there, and a project's `.gitignore` has no reason to list
-/// it. This is the same pair core's own baseline excludes, and the same split
-/// the architecture doc's Go example makes: `vendor`/`testdata` are the
-/// plugin's to declare, `.git` is not.
-pub const BASELINE_EXCLUDED_DIRS: [&str; 2] = [".git", ".claude"];
+pub use g_mesh_walk::BASELINE_EXCLUDED_DIRS;
 
 /// Every file under `root` that this plugin claims, in sorted order.
 ///

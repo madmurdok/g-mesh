@@ -133,7 +133,7 @@ fn an_import_record_no_longer_makes_a_name_ambiguous() {
     let mut conn = setup();
     let mut import_record = symbol("target.ts", "mutate", MODULE_KIND, true);
     import_record.id = "external:target.ts:mutate".to_string();
-    import_record.native_kind = Some(crate::graph::imports::EXTERNAL_MODULE_NATIVE_KIND.to_string());
+    import_record.native_kind = Some(g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND.to_string());
     apply_diff(
         &mut conn,
         &Diff {

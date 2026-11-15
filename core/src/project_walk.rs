@@ -25,10 +25,8 @@
 
 use std::path::{Path, PathBuf};
 
-use g_mesh_walk::{Link, LinkOutcome, LinkRefusal, WalkedEntry};
+use g_mesh_walk::{Link, LinkOutcome, LinkRefusal, WalkedEntry, BASELINE_EXCLUDED_DIRS};
 use ignore::WalkBuilder;
-
-use crate::watcher::BASELINE_EXCLUDED_DIRS;
 
 /// One regular file the walk found.
 pub struct WalkedFile {

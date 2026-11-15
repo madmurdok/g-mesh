@@ -228,17 +228,14 @@ pub enum PlaceholderKind {
 }
 
 impl PlaceholderKind {
-    /// The wire string, which must match core's own constants
-    /// (`graph::symbol_links::PENDING_SYMBOL_NATIVE_KIND` and its two
-    /// siblings). They are spelled out here rather than imported because this
-    /// crate deliberately does not depend on core; the conformance kit is
-    /// what catches a divergence, under `shape`.
+    /// The wire string: the constant `g_mesh_wire::native_kind` defines, the
+    /// one core stores and compares.
     pub fn native_kind(self) -> &'static str {
         match self {
-            PlaceholderKind::PendingSymbol => "pending_symbol",
-            PlaceholderKind::Reexport => "reexport",
-            PlaceholderKind::ResolvedModule => "resolved_module",
-            PlaceholderKind::ExternalModule => "external_module",
+            PlaceholderKind::PendingSymbol => g_mesh_wire::native_kind::PENDING_SYMBOL_NATIVE_KIND,
+            PlaceholderKind::Reexport => g_mesh_wire::native_kind::REEXPORT_NATIVE_KIND,
+            PlaceholderKind::ResolvedModule => g_mesh_wire::native_kind::RESOLVED_MODULE_NATIVE_KIND,
+            PlaceholderKind::ExternalModule => g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND,
         }
     }
 }
