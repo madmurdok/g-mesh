@@ -1349,6 +1349,30 @@ fn the_import_type_clause_is_only_for_a_typescript_anchor() {
     assert!(!rust_hint.contains("import type"));
 }
 
+/// A Rust anchor's complete-walk hint names what the plugin still does not
+/// turn into import edges, and a non-Rust anchor's does not.
+///
+/// Control: make `walk_hint` use `WALK_COMPLETE` for every language - the
+/// Rust anchor's hint loses the named forms.
+#[test]
+fn a_rust_walk_hint_names_the_uncovered_forms_and_another_language_does_not_get_it() {
+    let rust = Arc::new(IndexStore::new(import_chain()));
+    let hint = walk_hint_on(&rust, anchored_at("c.rs", Direction::Incoming), &SessionHints::default());
+    for named in ["glob `use`", "`macro_rules!`", "`mod`", "external crate"] {
+        assert!(hint.contains(named), "the Rust hint must name {named}: {hint}");
+    }
+
+    let mut conn = setup();
+    for path in ["a.py", "b.py"] {
+        upsert_node(&mut conn, NodeRecord::new(path, "File", path, path, path, "python")).unwrap();
+    }
+    imports(&mut conn, "a.py", "b.py");
+    let python = Arc::new(IndexStore::new(conn));
+    let other = walk_hint_on(&python, anchored_at("b.py", Direction::Incoming), &SessionHints::default());
+    assert_eq!(other, session_hints::WALK_COMPLETE);
+    assert!(!other.contains("macro_rules!"), "{other}");
+}
+
 // -----------------------------------------------------------------
 // a file path whose language is not indexed at all
 // -----------------------------------------------------------------

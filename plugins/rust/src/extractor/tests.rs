@@ -136,6 +136,7 @@ fn container(key: &str) -> TargetScope {
     TargetScope::Container(key.to_string())
 }
 
+mod block_imports;
 mod fn_local_impls;
 mod glob_paths;
 mod module_paths;
