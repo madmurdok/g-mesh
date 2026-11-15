@@ -1001,8 +1001,8 @@ fn a_memory_suspension_still_wins_over_a_hold() {
 /// start and the directory holds nothing - not while the writer is still
 /// running, and not after one more phase change on this thread.
 fn supervise_exit_leaves_no_state_file_behind(orphan: bool) {
-    use crate::daemon::indexing_status::{IndexingStatus, Phase};
     use crate::daemon::registry::PluginRegistry;
+    use crate::indexing_status::{IndexingStatus, Phase};
     use crate::plugin_manifest::DiscoveredPlugins;
 
     let project = tempfile::tempdir().expect("failed to create a project root");

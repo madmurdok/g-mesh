@@ -51,9 +51,9 @@ use anyhow::{bail, Context, Result};
 use crate::cli::stop;
 use crate::daemon;
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::{registry, semantic};
 use crate::embedding::{backfill, EmbeddingPipeline};
+use crate::indexing_status::IndexingStatus;
 use crate::plugin_manifest;
 use crate::storage::index_store::IndexStore;
 use crate::storage::{connection, schema};
@@ -123,8 +123,8 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
         .context("failed to rebuild the project's index")?;
     conn.with(schema::record_bulk_index).context("failed to record that the project was fully reindexed")?;
 
-    let state_dir =
-        connection::project_dir(project_root).context("failed to resolve the project's state directory")?;
+    let state_dir = crate::paths::state_dir::project_dir(project_root)
+        .context("failed to resolve the project's state directory")?;
     // Per language now: `run_once` asks every currently-owed
     // language and records `language_state.semanticPassAt` (and the
     // project-wide roll-up) itself - see that function's own doc comment. A
@@ -177,8 +177,8 @@ impl Drop for MarkerFile {
 /// daemon can be bootstrapped between the stop and the rebuild.
 pub(crate) fn stop_for_rebuild(project_root: &Path, command: &str) -> Result<(stop::Outcome, RebuildHold)> {
     let bootstrap = crate::shim::acquire_bootstrap_lock(project_root)?;
-    let state_dir =
-        connection::project_dir(project_root).context("failed to resolve the project's state directory")?;
+    let state_dir = crate::paths::state_dir::project_dir(project_root)
+        .context("failed to resolve the project's state directory")?;
     let marker_path = daemon::rebuild_marker_path_in(&state_dir);
     daemon::write_rebuild_marker(&marker_path, command)?;
     let marker = MarkerFile(marker_path);
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn a_held_project_reads_as_rebuilding_until_the_hold_drops() {
         let project = tempfile::tempdir().unwrap();
-        let state = State(connection::project_dir(project.path()).unwrap());
+        let state = State(crate::paths::state_dir::project_dir(project.path()).unwrap());
         let (stopped, hold) = stop_for_rebuild(project.path(), "reindex").unwrap();
         assert!(stopped.core.is_none(), "no daemon was running");
 
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn a_rebuild_refuses_a_project_whose_daemon_lock_is_held() {
         let project = tempfile::tempdir().unwrap();
-        let state = State(connection::ensure_project_dir(project.path()).unwrap());
+        let state = State(crate::paths::state_dir::ensure_project_dir(project.path()).unwrap());
         let _other = daemon::acquire_singleton_lock(&state.0).unwrap().expect("the fixture's lock is free");
 
         let refused = stop_for_rebuild(project.path(), "init").err().expect("the rebuild must refuse");

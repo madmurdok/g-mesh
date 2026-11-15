@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::storage::connection::project_dir;
+use crate::paths::state_dir::project_dir;
 use crate::storage::schema;
 
 /// What marks a directory as a project. Each is probed with one

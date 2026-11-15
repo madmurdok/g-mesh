@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 
 use crate::config;
 use crate::gc::last_used;
-use crate::storage::connection::projects_root;
+use crate::paths::state_dir::projects_root;
 
 /// One project past the idle threshold, as far as this warning cares: just
 /// enough to name it in the printed list.

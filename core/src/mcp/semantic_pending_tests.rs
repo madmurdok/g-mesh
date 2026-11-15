@@ -667,9 +667,9 @@ fn a_page_at_the_budget_edge_keeps_room_for_the_provenance_sentence() {
 /// A server over `store` (no plugins discovered, index ready), so each call
 /// below goes through `GMeshMcpServer`'s tool handler over a real session.
 fn hint_server(dir: &std::path::Path, store: Arc<IndexStore>) -> super::GMeshMcpServer {
-    use crate::daemon::indexing_status::{IndexingStatus, Phase};
     use crate::daemon::lifecycle::CoreActivity;
     use crate::daemon::registry::PluginRegistry;
+    use crate::indexing_status::{IndexingStatus, Phase};
     use crate::plugin_manifest::DiscoveredPlugins;
     let root = dir.join("project");
     let state = dir.join("state");

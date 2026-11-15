@@ -151,11 +151,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::lifecycle::AwakeHold;
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::{plugin_pid_file_name, PluginRegistry};
 use crate::embedding::EmbeddingPipeline;
+use crate::indexing_status::IndexingStatus;
 use crate::plugin_manifest::{self, DiscoveredPlugins};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -746,7 +746,7 @@ mod tests {
 
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifests must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
 

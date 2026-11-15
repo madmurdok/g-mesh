@@ -875,13 +875,13 @@ impl Drop for ConnectionGuard {
 /// daemon has none.
 ///
 /// [`sleep_now`]: PluginSupervisor::sleep_now
-/// [`IndexingStatus::detach_state_files`]: crate::daemon::indexing_status::IndexingStatus::detach_state_files
+/// [`IndexingStatus::detach_state_files`]: crate::indexing_status::IndexingStatus::detach_state_files
 pub fn supervise(
     project_root: &Path,
     state_dir: &Path,
     registry: &crate::daemon::registry::PluginRegistry,
     core: &CoreActivity,
-    indexing: Option<&crate::daemon::indexing_status::IndexingStatus>,
+    indexing: Option<&crate::indexing_status::IndexingStatus>,
     timeouts: IdleTimeouts,
     accept_loop: Receiver<Result<()>>,
 ) -> Result<Exit> {

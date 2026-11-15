@@ -21,11 +21,11 @@ use rmcp::ErrorData;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
-use crate::daemon::indexing_status::Phase;
 use crate::embedding::ce_text::{ce_text, source_lines, CeNode};
 use crate::embedding::rerank::{self, RerankOutcome, Scorer};
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination;
+use crate::indexing_status::Phase;
 use crate::storage::index_store::IndexStore;
 use crate::storage::vectors::pack;
 

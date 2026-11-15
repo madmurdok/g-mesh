@@ -15,10 +15,10 @@ use anyhow::{bail, Context, Result};
 use crate::cli::stop;
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
-use crate::daemon::candidates;
 use crate::ipc;
+use crate::paths::state_dir::{ensure_project_dir, ensure_project_dir_under};
 use crate::process;
-use crate::storage::connection::{ensure_project_dir, ensure_project_dir_under};
+use crate::project_detect as candidates;
 
 mod router;
 
@@ -664,8 +664,8 @@ fn link(stream: ipc::Stream) -> Result<router::Link> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::identity::read_project_root;
-    use crate::storage::connection::{project_dir, project_dir_under};
+    use crate::paths::state_dir::read_project_root;
+    use crate::paths::state_dir::{project_dir, project_dir_under};
 
     /// A log past its limit moves aside to `.1`, replacing the previous one;
     /// one at or under it is left to be appended to.

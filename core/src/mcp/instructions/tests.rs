@@ -408,7 +408,7 @@ fn cold_start_falls_back_to_the_no_path_line_once_the_root_is_too_long() {
 }
 
 fn front_detection(names: &[String], truncated: bool) -> Detection {
-    use crate::daemon::candidates::{Candidate, Mode};
+    use crate::project_detect::{Candidate, Mode};
     Detection {
         mode: Mode::Multi,
         candidates: names
@@ -589,11 +589,11 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
-use crate::daemon::indexing_status::{IndexingStatus, Phase};
 use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::registry::PluginRegistry;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::queries::upsert_node;
+use crate::indexing_status::{IndexingStatus, Phase};
 use crate::languages::{self, CATALOGUE};
 use crate::mcp::GMeshMcpServer;
 use crate::plugin_manifest::{discover, DiscoveredPlugins};

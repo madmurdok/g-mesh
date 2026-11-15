@@ -20,9 +20,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use crate::daemon::candidates::Detection;
-use crate::daemon::indexing_status::ColdCause;
+use crate::indexing_status::ColdCause;
 use crate::plugin_manifest::{Capabilities, MemberOverrides, ReceiverCallResolution};
+use crate::project_detect::Detection;
 use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::MAX_LANGUAGE_RETRIES;
 

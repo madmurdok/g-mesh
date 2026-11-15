@@ -546,7 +546,7 @@ mod tests {
 
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifests must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -729,7 +729,7 @@ mod tests {
         );
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -777,7 +777,7 @@ mod tests {
         );
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -827,7 +827,7 @@ mod tests {
         adjust(&alpha_dir);
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -923,7 +923,7 @@ mod tests {
         test_plugin::answer_first_semantic_pass_incomplete(&alpha_dir, "alpha", Some(REASON));
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -975,7 +975,7 @@ mod tests {
         );
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let registry = PluginRegistry::new(
@@ -1060,7 +1060,7 @@ mod tests {
         test_plugin::install_with_workspace(plugins.path(), "alpha", &[".alpha-src"], &["go.mod"], &[]);
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");
@@ -1247,7 +1247,7 @@ mod tests {
         }
         let discovered =
             discover(&[plugins.path().to_path_buf()]).expect("the fixture manifest must discover cleanly");
-        let state_dir = crate::storage::connection::project_dir(project.path())
+        let state_dir = crate::paths::state_dir::project_dir(project.path())
             .expect("failed to resolve the fixture project's state directory");
         std::fs::create_dir_all(&state_dir).expect("failed to create the fixture state directory");
         let model_dir = fake_model_dir(&scratch.path().join("model"), "weights v1");

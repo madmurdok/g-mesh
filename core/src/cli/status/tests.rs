@@ -1,5 +1,5 @@
 use super::*;
-use crate::daemon::indexing_status::{EmbedProgress, SemanticProgress, WalkProgress};
+use crate::indexing_status::{EmbedProgress, SemanticProgress, WalkProgress};
 use crate::storage::schema;
 
 /// The plugins this checkout ships - their real `plugin.toml`s, read from
@@ -805,9 +805,9 @@ fn the_repair_advice_is_shown_only_when_no_live_daemon_is_working() {
 #[test]
 fn embedding_progress_shows_the_daemons_own_done_and_total_as_a_percentage() {
     let dir = tempfile::tempdir().unwrap();
-    let indexing = crate::daemon::indexing_status::IndexingStatus::structural();
+    let indexing = crate::indexing_status::IndexingStatus::structural();
     indexing.attach_progress_file_every(daemon::progress_path_in(dir.path()), Duration::ZERO);
-    indexing.set_phase(crate::daemon::indexing_status::Phase::Embedding);
+    indexing.set_phase(crate::indexing_status::Phase::Embedding);
     indexing.set_embed_total(1_200);
     indexing.add_embed_done(300);
 

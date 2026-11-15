@@ -23,8 +23,8 @@ use anyhow::{bail, Context, Result};
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{Connection, OpenFlags};
 
-use crate::daemon::indexing_status::{IndexingStatus, Phase};
-use crate::storage::{connection, schema, vectors};
+use crate::indexing_status::{IndexingStatus, Phase};
+use crate::storage::{schema, vectors};
 
 /// The temp file a seed is copied into before its rename to `index.db`.
 const SEED_TMP: &str = "index.db.seed-tmp";
@@ -235,7 +235,7 @@ fn seed_if_eligible_under(
         return None;
     }
     let source_root = main_checkout(root)?;
-    let source_db = match connection::project_dir_under(home, &source_root) {
+    let source_db = match crate::paths::state_dir::project_dir_under(home, &source_root) {
         Ok(dir) => dir.join("index.db"),
         Err(err) => {
             crate::log_line!(

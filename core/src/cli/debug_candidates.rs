@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::daemon::candidates::{self, Limits, Mode, SingleReason, Walk};
+use crate::project_detect::{self as candidates, Limits, Mode, SingleReason, Walk};
 
 pub fn run(dir: Option<PathBuf>, as_json: bool) -> Result<()> {
     let dir = match dir {

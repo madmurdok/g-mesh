@@ -29,9 +29,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::{instructions, GMeshMcpServer};
-use crate::daemon::candidates::{self, relative_to_root, segments, Candidate, Detection, Limits};
 use crate::daemon::lifecycle::CoreActivity;
 use crate::ipc::AsyncStream;
+use crate::project_detect::{self as candidates, relative_to_root, segments, Candidate, Detection, Limits};
 
 pub use crate::protocol::front::{PROJECT_ARG, SELECT_PROJECT, SWITCH_PROJECT_META};
 

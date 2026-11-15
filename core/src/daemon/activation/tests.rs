@@ -414,7 +414,7 @@ fn a_seeded_activation_waits_for_the_seeded_reconcile_before_embedding() {
     let fixture = Fixture::new();
     fixture.full_walk();
     let Start { mut ctx, .. } = fixture.prepare(false);
-    let indexing = IndexingStatus::walking_because(crate::daemon::indexing_status::ColdCause::Seeded);
+    let indexing = IndexingStatus::walking_because(crate::indexing_status::ColdCause::Seeded);
     ctx.indexing = indexing.clone();
     let (reconciled, wait) = std::sync::mpsc::channel();
     ctx.seed_reconciled = Some(wait);

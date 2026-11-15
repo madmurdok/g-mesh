@@ -25,16 +25,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::candidates::Detection;
 use super::lifecycle::{self, CoreActivity, IdleTimeouts};
 use super::registry::PluginRegistry;
-use super::{
-    endpoint_in, phase_path_in, record_serving_owner, write_pid_file, write_state_file_atomic, PID_FILE,
-};
+use super::{endpoint_in, phase_path_in, record_serving_owner, write_pid_file, PID_FILE};
 use crate::embedding::EmbeddingPipeline;
 use crate::ipc;
 use crate::mcp;
+use crate::paths::state_dir::write_state_file_atomic;
 use crate::plugin_manifest::DiscoveredPlugins;
+use crate::project_detect::Detection;
 
 /// What a front writes to `index.phase`.
 pub const FRONT_PHASE: &str = "front";

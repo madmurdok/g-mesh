@@ -15,12 +15,12 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use super::GMeshMcpServer;
-use crate::daemon::indexing_status::{IndexingStatus, Phase};
 use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::registry::PluginRegistry;
 use crate::embedding::model::EMBEDDING_DIM;
 use crate::embedding::pipeline::Embedder;
 use crate::embedding::EmbeddingPipeline;
+use crate::indexing_status::{IndexingStatus, Phase};
 use crate::plugin_manifest::DiscoveredPlugins;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;

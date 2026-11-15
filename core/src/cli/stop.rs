@@ -53,8 +53,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::daemon;
+use crate::paths::state_dir::project_dir;
 use crate::process;
-use crate::storage::connection::project_dir;
 
 /// How long a process that has been asked to stop is given before the next,
 /// harder attempt - generous, because overshooting costs a moment on a command

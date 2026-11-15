@@ -190,10 +190,10 @@ mod tests {
     /// clone it per request: clones must share one set, new servers must not.
     #[test]
     fn each_server_starts_its_own_session_and_its_clones_share_it() {
-        use crate::daemon::indexing_status::IndexingStatus;
         use crate::daemon::lifecycle::CoreActivity;
         use crate::daemon::registry::PluginRegistry;
         use crate::embedding::EmbeddingPipeline;
+        use crate::indexing_status::IndexingStatus;
         use crate::plugin_manifest::DiscoveredPlugins;
         use crate::storage::index_store::IndexStore;
 

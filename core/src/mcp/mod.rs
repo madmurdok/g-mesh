@@ -23,12 +23,12 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::daemon::indexing_status::{IndexingStatus, Need, Phase, WaitOutcome};
 use crate::daemon::lifecycle::CoreActivity;
 use crate::daemon::registry::{PathCoverage, PluginRegistry};
 use crate::embedding::EmbeddingPipeline;
 use crate::gc::last_used;
 use crate::graph::pagination::Direction;
+use crate::indexing_status::{IndexingStatus, Need, Phase, WaitOutcome};
 use crate::ipc::AsyncStream;
 use crate::plugin_manifest::Capabilities;
 use crate::protocol::types::Position;

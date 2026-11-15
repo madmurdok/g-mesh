@@ -17,8 +17,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::{path_case, plugin};
+use crate::indexing_status::IndexingStatus;
 use crate::languages;
 use crate::plugin_manifest::{DiscoveredPlugins, PluginManifest};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};

@@ -47,13 +47,13 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
-use crate::daemon::indexing_status::{group_thousands, ProgressSnapshot};
 use crate::embedding::rerank::{OutcomeRecord, RerankModelState, RerankOutcome};
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
+use crate::indexing_status::{group_thousands, ProgressSnapshot};
+use crate::paths::state_dir::project_dir;
 use crate::plugin_manifest::{self, DiscoveredPlugins};
 use crate::project_walk;
-use crate::storage::connection::project_dir;
 use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{SemanticLeftover, MAX_LANGUAGE_RETRIES};
 use crate::watcher::staleness::mtime_millis;
@@ -404,7 +404,7 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
     let core = core_state(project_root)?;
     let phase = daemon::read_phase_in(&state_dir);
     let front = (phase.as_deref() == Some(daemon::front::FRONT_PHASE)).then(|| {
-        let walk = daemon::candidates::walk(project_root, daemon::candidates::Limits::default());
+        let walk = crate::project_detect::walk(project_root, crate::project_detect::Limits::default());
         FrontSummary { projects: walk.candidates.len(), truncated: walk.truncated }
     });
     // The same discovery the daemon runs at startup, so the files counted

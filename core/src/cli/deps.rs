@@ -29,14 +29,14 @@ use crate::cli::{
     language_outcome_lines, status, DepsArgs, ExitStatus, INDEX_UNAVAILABLE_EXIT_CODE,
     NOT_A_PROJECT_EXIT_CODE, TIMEOUT_EXIT_CODE,
 };
-use crate::daemon::candidates::{self, Limits, Mode};
-use crate::daemon::indexing_status::group_thousands;
 use crate::daemon::{self, client};
 use crate::graph::containers;
+use crate::indexing_status::group_thousands;
+use crate::paths::state_dir::project_dir;
 use crate::plugin_manifest;
 use crate::process;
+use crate::project_detect::{self as candidates, Limits, Mode};
 use crate::shim;
-use crate::storage::connection::project_dir;
 use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema;
 use g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND;

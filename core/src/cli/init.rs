@@ -103,9 +103,9 @@ use crate::cli::agent_instructions::{self, AgentsMdWrite};
 use crate::cli::{reindex, AgentTarget};
 use crate::config::{self, ProjectConfig};
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
-use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::{registry, semantic};
 use crate::embedding::{backfill, EmbeddingPipeline};
+use crate::indexing_status::IndexingStatus;
 use crate::plugin_manifest;
 use crate::storage::index_store::IndexStore;
 use crate::storage::{connection, schema};
@@ -161,8 +161,8 @@ pub fn run(agents: &[AgentTarget]) -> Result<()> {
 pub fn init(project_root: &Path, agents: &[AgentTarget]) -> Result<Outcome> {
     let (stop_outcome, _hold) = reindex::stop_for_rebuild(project_root, "init")?;
 
-    let state_dir =
-        connection::project_dir(project_root).context("failed to resolve the project's state directory")?;
+    let state_dir = crate::paths::state_dir::project_dir(project_root)
+        .context("failed to resolve the project's state directory")?;
     let project_id =
         state_dir.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
 
