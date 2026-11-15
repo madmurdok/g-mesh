@@ -893,7 +893,7 @@ extensions = [".py"]
 /// where the repo happens to keep the file.
 #[test]
 fn the_bundled_js_ts_plugin_manifest_parses_once_directory_named_correctly() {
-    const BUNDLED_JS_TS_MANIFEST: &str = include_str!("../../../../plugins/typescript/plugin.toml");
+    const BUNDLED_JS_TS_MANIFEST: &str = include_str!("../../../plugins/typescript/plugin.toml");
 
     let (_root, dir) = plugin_dir("typescript", BUNDLED_JS_TS_MANIFEST);
 

@@ -50,10 +50,10 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 
-use crate::daemon::manifest::{plain_spelling, read_manifest, PluginManifest};
 use crate::daemon::plugin::RoundTripTimeouts;
 use crate::embedding::EmbeddingPipeline;
 use crate::mcp::query_shapes::QueryShapes;
+use crate::plugin_manifest::{plain_spelling, read_manifest, PluginManifest};
 use crate::protocol::ndjson::BulkItem;
 use crate::storage::index_store::IndexStore;
 pub use report::{CheckResult, Outcome, Report, Section};
@@ -124,7 +124,7 @@ pub fn check(
     // the directory every manifest-relative `command`/`args` entry is joined
     // onto: under that prefix Windows resolves nothing, so the plugin's own
     // entry point arrives at it spelled `...\typescript\dist/src/index.js`.
-    // `manifest::plain_win32_path` carries the evidence for what that costs.
+    // `plugin_manifest::plain_win32_path` carries the evidence for what that costs.
     // The report prints both paths too, and the extended-length spelling of a
     // path is nobody's idea of where their plugin is.
     let plugin_dir = plain_spelling(

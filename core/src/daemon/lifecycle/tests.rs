@@ -1,7 +1,7 @@
 use super::*;
 
-use crate::daemon::manifest::read_manifest;
 use crate::daemon::test_plugin;
+use crate::plugin_manifest::read_manifest;
 
 /// The reason [`PluginSupervisor::manifest`] is a field and not an
 /// argument: a supervisor spawns *its own* plugin at every one of its
@@ -1002,8 +1002,8 @@ fn a_memory_suspension_still_wins_over_a_hold() {
 /// running, and not after one more phase change on this thread.
 fn supervise_exit_leaves_no_state_file_behind(orphan: bool) {
     use crate::daemon::indexing_status::{IndexingStatus, Phase};
-    use crate::daemon::manifest::DiscoveredPlugins;
     use crate::daemon::registry::PluginRegistry;
+    use crate::plugin_manifest::DiscoveredPlugins;
 
     let project = tempfile::tempdir().expect("failed to create a project root");
     let state = tempfile::tempdir().expect("failed to create a state dir");

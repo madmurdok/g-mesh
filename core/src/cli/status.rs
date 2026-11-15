@@ -48,13 +48,13 @@ use rusqlite::{Connection, OpenFlags};
 use crate::daemon;
 use crate::daemon::build_stamp::{self, Vintage};
 use crate::daemon::indexing_status::{group_thousands, ProgressSnapshot};
-use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::embedding::rerank::{OutcomeRecord, RerankModelState, RerankOutcome};
 use crate::gc::last_used::{self, LastUsed};
 use crate::gc::warning;
-use crate::languages::LanguageOutcome;
+use crate::plugin_manifest::{self, DiscoveredPlugins};
 use crate::project_walk;
 use crate::storage::connection::project_dir;
+use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema::{SemanticLeftover, MAX_LANGUAGE_RETRIES};
 use crate::watcher::staleness::mtime_millis;
 
@@ -241,7 +241,7 @@ pub enum LanguageSection {
 }
 
 /// The languages part of the report: the index's outcomes and the plugins
-/// installed now (`manifest::discover`).
+/// installed now (`plugin_manifest::discover`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LanguagesReport {
     pub section: LanguageSection,
@@ -411,7 +411,7 @@ pub fn collect(project_root: &Path, mode: Mode) -> Result<Report> {
     // here are the files the discovered plugins index, in every language.
     // A failure is reported rather than fatal, except where the walk needs
     // the plugins to know which files count.
-    let discovered = manifest::discover(&manifest::default_roots());
+    let discovered = plugin_manifest::discover(&plugin_manifest::default_roots());
     if mode == Mode::Full && front.is_none() {
         if let Err(err) = &discovered {
             anyhow::bail!("failed to discover language plugins: {err:#}");
@@ -658,7 +658,7 @@ pub fn index_status(
     };
 
     let capable: HashSet<String> =
-        manifest::semantic_pass_capable_languages(&plugins.manifests).into_iter().collect();
+        plugin_manifest::semantic_pass_capable_languages(&plugins.manifests).into_iter().collect();
     let (semantic_pass_owed, semantic_pass_failures) = semantic_pass_state(&conn, &capable)?;
     Ok(IndexStatus {
         bulk_indexed: crate::storage::schema::bulk_index_completed(&conn)
@@ -1129,7 +1129,7 @@ fn describe_language_row(row: &LanguageRow<'_>, discovery_failed: bool) -> Strin
             format!(
                 "failed{} - not in the index: {}{retry}",
                 version(),
-                crate::languages::error_on_one_line(error)
+                crate::storage::language_outcome::error_on_one_line(error)
             )
         }
         Some(LanguageOutcome::PluginAbsent { files }) => {

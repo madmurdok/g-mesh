@@ -44,15 +44,15 @@ use anyhow::{Context, Result};
 use crate::daemon::bulk_index;
 use crate::daemon::indexing_status::{IndexingStatus, Phase};
 use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::manifest::DiscoveredPlugins;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::seed::SeedGate;
 use crate::daemon::semantic;
 use crate::daemon::workspace_reindex;
 use crate::daemon::ConsumerStart;
 use crate::embedding::EmbeddingPipeline;
-use crate::languages::LanguageOutcome;
+use crate::plugin_manifest::DiscoveredPlugins;
 use crate::storage::index_store::IndexStore;
+use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema;
 use crate::watcher::ProjectWatcher;
 
@@ -285,7 +285,7 @@ impl ActivationCtx {
                 Ok(Err(err)) => err,
                 Err(_) => anyhow::anyhow!("the retry of {language} panicked"),
             };
-            let error = crate::languages::failed_error(&err);
+            let error = crate::storage::language_outcome::failed_error(&err);
             if let Err(record) =
                 self.conn.with(|conn| schema::record_language_retry_failed(conn, &language, &error))
             {
@@ -340,7 +340,7 @@ impl ActivationCtx {
                     "g-mesh daemon: {language} failed to index and is left out of the index - the next \
                      {} daemon starts retry it, or run `g-mesh reindex`: {}",
                     schema::MAX_LANGUAGE_RETRIES,
-                    crate::languages::error_on_one_line(error)
+                    crate::storage::language_outcome::error_on_one_line(error)
                 ),
                 LanguageOutcome::PluginAbsent { files } => crate::log_line!(
                     "g-mesh daemon: {language} has no plugin installed - {} not indexed",

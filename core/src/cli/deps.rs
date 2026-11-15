@@ -31,12 +31,13 @@ use crate::cli::{
 };
 use crate::daemon::candidates::{self, Limits, Mode};
 use crate::daemon::indexing_status::group_thousands;
-use crate::daemon::{self, client, manifest};
+use crate::daemon::{self, client};
 use crate::graph::containers;
-use crate::languages::LanguageOutcome;
+use crate::plugin_manifest;
 use crate::process;
 use crate::shim;
 use crate::storage::connection::project_dir;
+use crate::storage::language_outcome::LanguageOutcome;
 use crate::storage::schema;
 use g_mesh_wire::native_kind::EXTERNAL_MODULE_NATIVE_KIND;
 
@@ -362,7 +363,7 @@ fn open_read_only(db_path: &Path) -> Result<Connection> {
 /// Each discovered plugin's extensions, sorted. Empty when discovery fails:
 /// they only annotate `coverage`.
 fn plugin_extensions() -> HashMap<String, Vec<String>> {
-    let Ok(discovered) = manifest::discover(&manifest::default_roots()) else {
+    let Ok(discovered) = plugin_manifest::discover(&plugin_manifest::default_roots()) else {
         return HashMap::new();
     };
     discovered
@@ -569,7 +570,7 @@ pub fn export(
                 unresolved: None,
                 external: None,
                 extensions: None,
-                error: Some(crate::languages::error_on_one_line(error)),
+                error: Some(crate::storage::language_outcome::error_on_one_line(error)),
             },
         };
         coverage.insert(language.clone(), entry);

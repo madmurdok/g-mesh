@@ -27,7 +27,6 @@ use anyhow::{Context, Result};
 
 use super::candidates::Detection;
 use super::lifecycle::{self, CoreActivity, IdleTimeouts};
-use super::manifest::DiscoveredPlugins;
 use super::registry::PluginRegistry;
 use super::{
     endpoint_in, phase_path_in, record_serving_owner, write_pid_file, write_state_file_atomic, PID_FILE,
@@ -35,6 +34,7 @@ use super::{
 use crate::embedding::EmbeddingPipeline;
 use crate::ipc;
 use crate::mcp;
+use crate::plugin_manifest::DiscoveredPlugins;
 
 /// What a front writes to `index.phase`.
 pub const FRONT_PHASE: &str = "front";

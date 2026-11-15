@@ -22,8 +22,8 @@ use std::collections::{HashSet, VecDeque};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
-use crate::daemon::manifest::MemberOverrides;
 use crate::graph::queries::{declaration_only, map_node_row};
+use crate::plugin_manifest::MemberOverrides;
 use crate::storage::write::NodeRecord;
 
 /// Rows sent at most; `overridesTruncated` says when more were found.

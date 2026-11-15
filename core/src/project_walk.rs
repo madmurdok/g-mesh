@@ -89,6 +89,26 @@ pub(crate) fn under_any(relative: &str, subtrees: &[String]) -> bool {
     })
 }
 
+/// `src/App.TSX` -> `".tsx"`: the lowercase, leading-dot form the routing
+/// table is keyed by. `None` for a path with no (UTF-8) extension.
+pub(crate) fn extension_of(file_path: &str) -> Option<String> {
+    let extension = Path::new(file_path).extension()?.to_str()?;
+    Some(format!(".{}", extension.to_lowercase()))
+}
+
+/// Whether `file_path` sits under a directory named one of `exclude_dirs`,
+/// checked against every path segment except the file name, at any depth.
+/// Whole-segment match only: `exclude_dirs = ["vendor"]` excludes
+/// `pkg/vendor/x` but not `vendored-tools/x`.
+pub(crate) fn under_excluded_dir(file_path: &str, exclude_dirs: &[String]) -> bool {
+    if exclude_dirs.is_empty() {
+        return false;
+    }
+    let mut segments = file_path.split('/');
+    segments.next_back(); // the file name itself names no directory
+    segments.any(|segment| exclude_dirs.iter().any(|excluded| excluded == segment))
+}
+
 /// The pruned walk behind [`project_files_under`], following no link; `None`
 /// as soon as it meets a symlink in reach (inside a subtree, or one of a
 /// subtree's ancestors), whose resolution needs the whole tree.

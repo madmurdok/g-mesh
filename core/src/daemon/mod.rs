@@ -10,7 +10,7 @@ pub mod front;
 pub mod identity;
 pub mod indexing_status;
 pub mod lifecycle;
-pub mod manifest;
+pub use crate::plugin_manifest as manifest;
 pub mod memory;
 pub(crate) mod path_case;
 pub mod plugin;
@@ -342,8 +342,8 @@ pub fn run(root: &Path) -> Result<()> {
     // Discovery comes before the index (the generation check below needs it)
     // and before the bind, so a malformed manifest or two plugins claiming one
     // extension fail startup before a socket or pid file is published.
-    let discovered =
-        manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
+    let discovered = crate::plugin_manifest::discover(&crate::plugin_manifest::default_roots())
+        .context("failed to discover language plugins")?;
 
     // Before the index is opened and before any reindex can run: a staging
     // file left here belongs to a reindex that died.
@@ -416,8 +416,10 @@ pub fn run(root: &Path) -> Result<()> {
             "g-mesh daemon: the index is a seed - reconciling it with this worktree before tool calls answer"
         );
     }
-    let conn =
-        Arc::new(IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())));
+    let conn = Arc::new(
+        IndexStore::new(conn)
+            .with_link_rules(crate::plugin_manifest::link_rules(discovered.manifests.values())),
+    );
 
     // Canonicalized like `ProjectWatcher`'s paths, so `relative_wire_path` can strip it.
     let canonical_root = root

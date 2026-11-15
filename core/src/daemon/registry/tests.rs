@@ -1,8 +1,8 @@
 use super::*;
 use rusqlite::Connection;
 
-use crate::daemon::manifest::discover;
 use crate::daemon::test_plugin;
+use crate::plugin_manifest::discover;
 use crate::storage::schema;
 
 /// A registry over `languages`, each installed as a fake plugin claiming
@@ -306,7 +306,7 @@ fn routing_resolves_an_extension_to_its_language_and_ignores_case() {
 /// end of it), at the layer that actually owns discovery's results.
 #[test]
 fn entry_points_unions_every_discovered_manifests_own_list_deduplicated() {
-    use crate::daemon::manifest::{Capabilities, PluginManifest, WorkspaceConfig};
+    use crate::plugin_manifest::{Capabilities, PluginManifest, WorkspaceConfig};
 
     let manifest = |language: &str, entry_points: &[&str]| PluginManifest {
         language: language.to_string(),

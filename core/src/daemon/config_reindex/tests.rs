@@ -9,8 +9,8 @@ use std::sync::Arc;
 use rusqlite::Connection;
 
 use super::*;
-use crate::daemon::manifest::discover;
 use crate::daemon::test_plugin;
+use crate::plugin_manifest::discover;
 use crate::protocol::types::{
     EdgeKind, Matcher, NodeKind, Position, Range, SourceTier, Visibility, WireEdge, WireNode,
 };

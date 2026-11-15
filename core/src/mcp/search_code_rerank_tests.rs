@@ -847,8 +847,8 @@ async fn the_tool_reads_the_body_under_the_project_root() {
     use super::GMeshMcpServer;
     use crate::daemon::indexing_status::{IndexingStatus, Phase};
     use crate::daemon::lifecycle::CoreActivity;
-    use crate::daemon::manifest::DiscoveredPlugins;
     use crate::daemon::registry::PluginRegistry;
+    use crate::plugin_manifest::DiscoveredPlugins;
 
     let query = "parseConfig";
     let dir = tempfile::tempdir().unwrap();

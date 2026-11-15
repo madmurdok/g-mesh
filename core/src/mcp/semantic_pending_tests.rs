@@ -11,9 +11,9 @@ use rusqlite::Connection;
 use super::session_hints::SessionHints;
 use super::{find_callers_callees, find_implementations, find_references};
 use super::{FindImplementationsParams, SymbolQueryParams};
-use crate::daemon::manifest::{Capabilities, ReceiverCallResolution};
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::pagination::MAX_RESPONSE_BYTES;
+use crate::plugin_manifest::{Capabilities, ReceiverCallResolution};
 use crate::storage::connection::open_staging;
 use crate::storage::index_store::IndexStore;
 use crate::storage::language_swap::{self, SwapBookkeeping};
@@ -31,7 +31,7 @@ fn rust_with_a_semantic_tier() -> HashMap<String, Capabilities> {
             resolution_delta: false,
             receiver_calls: ReceiverCallResolution::Resolved,
             receiver_calls_structural: ReceiverCallResolution::Unresolved,
-            member_overrides: crate::daemon::manifest::MemberOverrides::None,
+            member_overrides: crate::plugin_manifest::MemberOverrides::None,
         },
     )])
 }
@@ -669,8 +669,8 @@ fn a_page_at_the_budget_edge_keeps_room_for_the_provenance_sentence() {
 fn hint_server(dir: &std::path::Path, store: Arc<IndexStore>) -> super::GMeshMcpServer {
     use crate::daemon::indexing_status::{IndexingStatus, Phase};
     use crate::daemon::lifecycle::CoreActivity;
-    use crate::daemon::manifest::DiscoveredPlugins;
     use crate::daemon::registry::PluginRegistry;
+    use crate::plugin_manifest::DiscoveredPlugins;
     let root = dir.join("project");
     let state = dir.join("state");
     std::fs::create_dir_all(&root).unwrap();

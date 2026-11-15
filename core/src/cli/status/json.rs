@@ -13,7 +13,7 @@ use super::{
     RerankStatus,
 };
 use crate::embedding::rerank::RerankModelState;
-use crate::languages::LanguageOutcome;
+use crate::storage::language_outcome::LanguageOutcome;
 
 /// The `formatVersion` this build writes.
 pub const FORMAT_VERSION: u32 = 1;
@@ -195,7 +195,7 @@ fn outcome(row: &LanguageRow<'_>) -> Value {
         }
         Some(LanguageOutcome::Failed { error }) => {
             value["outcome"] = json!("failed");
-            value["error"] = json!(crate::languages::error_on_one_line(error));
+            value["error"] = json!(crate::storage::language_outcome::error_on_one_line(error));
             value["causes"] =
                 json!(error.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>());
             if row.plugin_version.is_some() {

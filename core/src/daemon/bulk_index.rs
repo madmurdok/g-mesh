@@ -18,12 +18,13 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::daemon::indexing_status::IndexingStatus;
-use crate::daemon::manifest::{DiscoveredPlugins, PluginManifest};
 use crate::daemon::{path_case, plugin};
-use crate::languages::{self, LanguageOutcome};
+use crate::languages;
+use crate::plugin_manifest::{DiscoveredPlugins, PluginManifest};
 use crate::protocol::ndjson::{BulkItem, NdjsonReader};
 use crate::storage::file_rows::FileScope;
 use crate::storage::index_store::{IndexStore, Unit, Writer};
+use crate::storage::language_outcome::{self, LanguageOutcome};
 use crate::storage::schema;
 use crate::storage::write::Diff;
 use crate::watcher::apply::{to_edge_record, to_node_record, PathWarnings};
@@ -178,7 +179,7 @@ pub fn run_with_progress(
                 })?;
                 (ctx.summary.nodes, ctx.summary.edges, ctx.summary.skipped_lines) = counts_before;
                 ctx.walked_files = walked_before;
-                failed.insert(manifest.language.clone(), languages::failed_error(&err));
+                failed.insert(manifest.language.clone(), language_outcome::failed_error(&err));
             }
             if let Some(progress) = progress {
                 progress.mark_language_done();
@@ -232,7 +233,7 @@ pub fn run_with_progress(
         let mut message = String::from("every discovered language failed to index:");
         for (language, outcome) in &summary.outcomes {
             if let LanguageOutcome::Failed { error } = outcome {
-                message.push_str(&format!("\n  {language}: {}", languages::error_on_one_line(error)));
+                message.push_str(&format!("\n  {language}: {}", language_outcome::error_on_one_line(error)));
             }
         }
         bail!(message);
@@ -715,7 +716,7 @@ mod tests {
         let plugins = tempfile::tempdir().unwrap();
         crate::daemon::test_plugin::install(plugins.path(), "alpha", &[".alpha-src"]);
         crate::daemon::test_plugin::install(plugins.path(), "beta", &[".beta-src"]);
-        let discovered = crate::daemon::manifest::discover(&[plugins.path().to_path_buf()])
+        let discovered = crate::plugin_manifest::discover(&[plugins.path().to_path_buf()])
             .expect("the fixture plugins must discover cleanly");
         assert_eq!(discovered.manifests.len(), 2, "both fixture languages must have been discovered");
 
@@ -738,7 +739,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let plugins = tempfile::tempdir().unwrap();
         crate::daemon::test_plugin::install(plugins.path(), "solo", &[".solo-src"]);
-        let discovered = crate::daemon::manifest::discover(&[plugins.path().to_path_buf()])
+        let discovered = crate::plugin_manifest::discover(&[plugins.path().to_path_buf()])
             .expect("the fixture plugin must discover cleanly");
 
         let conn = setup_conn();
@@ -772,7 +773,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::daemon::test_plugin;
-    use crate::languages::LanguageOutcome;
+    use crate::storage::language_outcome::LanguageOutcome;
 
     /// One NDJSON node line in the fake plugins' wire shape.
     fn node_of(id: &str, kind: &str, file_path: &str, language: &str) -> String {
@@ -837,8 +838,7 @@ mod tests {
     }
 
     fn discover_root(plugins: &Path) -> DiscoveredPlugins {
-        crate::daemon::manifest::discover(&[plugins.to_path_buf()])
-            .expect("the fixture plugins must discover")
+        crate::plugin_manifest::discover(&[plugins.to_path_buf()]).expect("the fixture plugins must discover")
     }
 
     /// The acceptance criterion's core: with one of two plugins' binaries

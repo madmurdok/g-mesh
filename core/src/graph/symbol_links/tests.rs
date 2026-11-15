@@ -12,7 +12,7 @@ fn bundled_rules() -> LinkRules {
     static RULES: std::sync::OnceLock<LinkRules> = std::sync::OnceLock::new();
     RULES
         .get_or_init(|| {
-            use crate::daemon::manifest::{link_rules, read_manifest};
+            use crate::plugin_manifest::{link_rules, read_manifest};
             let plugins = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
             let manifests: Vec<_> = ["rust", "typescript", "python", "go"]
                 .iter()

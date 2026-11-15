@@ -18,6 +18,7 @@ use globset::Glob;
 use serde::Deserialize;
 
 use crate::graph::symbol_links::LinkRules;
+use crate::project_walk::{extension_of, under_excluded_dir};
 use crate::protocol::types::CURRENT_PROTOCOL_VERSION;
 
 const MANIFEST_FILE_NAME: &str = "plugin.toml";
@@ -639,24 +640,14 @@ impl DiscoveredPlugins {
     }
 }
 
-/// `src/App.TSX` -> `".tsx"`: the lowercase, leading-dot form the routing
-/// table is keyed by. `None` for a path with no (UTF-8) extension.
-pub(crate) fn extension_of(file_path: &str) -> Option<String> {
-    let extension = Path::new(file_path).extension()?.to_str()?;
-    Some(format!(".{}", extension.to_lowercase()))
-}
-
-/// Whether `file_path` sits under a directory named one of `exclude_dirs`,
-/// checked against every path segment except the file name, at any depth.
-/// Whole-segment match only: `exclude_dirs = ["vendor"]` excludes
-/// `pkg/vendor/x` but not `vendored-tools/x`.
-pub(crate) fn under_excluded_dir(file_path: &str, exclude_dirs: &[String]) -> bool {
-    if exclude_dirs.is_empty() {
-        return false;
+impl crate::languages::DiscoveredLanguages for DiscoveredPlugins {
+    fn has_plugin(&self, language: &str) -> bool {
+        self.manifests.contains_key(language)
     }
-    let mut segments = file_path.split('/');
-    segments.next_back(); // the file name itself names no directory
-    segments.any(|segment| exclude_dirs.iter().any(|excluded| excluded == segment))
+
+    fn routed_language(&self, file_path: &str) -> Option<&str> {
+        self.language_for(file_path)
+    }
 }
 
 /// Every language among `manifests` whose `capabilities.semantic_pass` is

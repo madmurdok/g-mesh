@@ -84,13 +84,13 @@ use anyhow::{Context, Result};
 
 use crate::daemon::bulk_index::{self, WalkContext};
 use crate::daemon::lifecycle::PluginSupervisor;
-use crate::daemon::manifest::{self, PluginManifest};
 use crate::daemon::plugin;
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::PluginRegistry;
 use crate::daemon::semantic;
 use crate::embedding::pipeline::ComputedBatch;
 use crate::embedding::EmbedStats;
+use crate::plugin_manifest::{self, PluginManifest};
 use crate::storage::connection;
 use crate::storage::index_store::IndexStore;
 use crate::storage::language_swap::{self, SwapBookkeeping};
@@ -145,7 +145,8 @@ pub(crate) fn remove_stale_semantic_pending(
     conn: &rusqlite::Connection,
     manifests: &std::collections::HashMap<String, PluginManifest>,
 ) {
-    let capable: HashSet<String> = manifest::semantic_pass_capable_languages(manifests).into_iter().collect();
+    let capable: HashSet<String> =
+        plugin_manifest::semantic_pass_capable_languages(manifests).into_iter().collect();
     match schema::clear_stale_semantic_pending(conn, &capable) {
         Ok(0) => {}
         Ok(cleared) => {
@@ -494,9 +495,9 @@ mod tests {
     use rusqlite::OptionalExtension;
 
     use super::*;
-    use crate::daemon::manifest::discover;
     use crate::daemon::test_plugin;
     use crate::embedding::EmbeddingPipeline;
+    use crate::plugin_manifest::discover;
     use crate::storage::write::{apply_diff, Diff, NodeRecord};
 
     /// A file-backed index in `project`'s state directory, where the daemon
@@ -2429,14 +2430,16 @@ mod tests {
     fn alpha_failed_and_counted(registry: &PluginRegistry, conn: &IndexStore) {
         let outcomes = std::collections::BTreeMap::from([(
             "alpha".to_string(),
-            crate::languages::LanguageOutcome::Failed { error: "the walk failed".to_string() },
+            crate::storage::language_outcome::LanguageOutcome::Failed {
+                error: "the walk failed".to_string(),
+            },
         )]);
         conn.with(|conn| schema::record_language_outcomes(conn, &outcomes)).unwrap();
         conn.with(|conn| schema::begin_language_retry(conn, "alpha")).unwrap();
         registry.set_failed_languages(["alpha".to_string()]);
     }
 
-    fn alpha_outcome(conn: &IndexStore) -> crate::languages::LanguageOutcome {
+    fn alpha_outcome(conn: &IndexStore) -> crate::storage::language_outcome::LanguageOutcome {
         conn.with(schema::language_outcomes).unwrap().into_iter().find(|(l, _)| l == "alpha").unwrap().1
     }
 
@@ -2469,7 +2472,10 @@ mod tests {
         let failed = retry_failed(&registry, &supervisor, &conn, std::time::SystemTime::now());
 
         assert!(failed.is_err(), "a walk that exits non-zero fails the retry");
-        assert!(matches!(alpha_outcome(&conn), crate::languages::LanguageOutcome::Failed { .. }));
+        assert!(matches!(
+            alpha_outcome(&conn),
+            crate::storage::language_outcome::LanguageOutcome::Failed { .. }
+        ));
         assert_eq!(conn.with(schema::language_retries).unwrap().get("alpha"), Some(&1));
         assert!(registry.is_failed_language("alpha"), "a failed retry leaves the language unrouted");
         assert_eq!(count(&conn.lock().unwrap(), "SELECT COUNT(*) FROM nodes WHERE language = 'alpha'"), 0);
@@ -2479,7 +2485,10 @@ mod tests {
         retry_failed(&registry, &supervisor, &conn, std::time::SystemTime::now())
             .expect("the retry succeeds");
 
-        assert!(matches!(alpha_outcome(&conn), crate::languages::LanguageOutcome::Indexed { files: _ }));
+        assert!(matches!(
+            alpha_outcome(&conn),
+            crate::storage::language_outcome::LanguageOutcome::Indexed { files: _ }
+        ));
         assert!(conn.with(schema::language_retries).unwrap().is_empty(), "the swap drops the count");
         assert!(!registry.is_failed_language("alpha"), "the swapped-in language is routed");
         assert_eq!(count(&conn.lock().unwrap(), "SELECT COUNT(*) FROM nodes WHERE language = 'alpha'"), 2);

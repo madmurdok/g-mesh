@@ -38,10 +38,10 @@
 //! Before this task, [`run_with_registry`]/[`run_once`] asked exactly one
 //! plugin - `plugin::BUNDLED_LANGUAGE` - because that was the only plugin
 //! there ever was. GM-269 gave every manifest its own
-//! `capabilities.semantic_pass` bit (`daemon::manifest::Capabilities`); this
+//! `capabilities.semantic_pass` bit (`plugin_manifest::Capabilities`); this
 //! task is what makes the scheduler actually branch on it: both functions
 //! below now iterate every language whose manifest declares the capability
-//! (`daemon::manifest::semantic_pass_capable_languages`), ask each one for
+//! (`plugin_manifest::semantic_pass_capable_languages`), ask each one for
 //! its own pass, and record `language_state.semanticPassAt`
 //! (`storage::schema::record_language_semantic_pass`) per language rather
 //! than one project-wide flag written off a single plugin's answer. A
@@ -153,10 +153,10 @@ use std::time::Duration;
 
 use crate::daemon::indexing_status::IndexingStatus;
 use crate::daemon::lifecycle::AwakeHold;
-use crate::daemon::manifest::{self, DiscoveredPlugins};
 use crate::daemon::plugin::PluginProcess;
 use crate::daemon::registry::{plugin_pid_file_name, PluginRegistry};
 use crate::embedding::EmbeddingPipeline;
+use crate::plugin_manifest::{self, DiscoveredPlugins};
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
 use crate::watcher::apply::SemanticPassOutcome;
@@ -512,7 +512,7 @@ pub fn run_once(
     embedding: &EmbeddingPipeline,
 ) -> SemanticPassRun {
     let capable: HashSet<String> =
-        manifest::semantic_pass_capable_languages(&discovered.manifests).into_iter().collect();
+        plugin_manifest::semantic_pass_capable_languages(&discovered.manifests).into_iter().collect();
     let owed = match conn.with(|conn| schema::owed_semantic_pass_languages(conn, &capable)) {
         Ok(owed) => owed,
         Err(err) => {
@@ -623,8 +623,8 @@ mod tests {
     use rusqlite::{params, OptionalExtension};
 
     use super::*;
-    use crate::daemon::manifest::discover;
     use crate::daemon::test_plugin;
+    use crate::plugin_manifest::discover;
 
     /// A `File` node for `language` at `file_path`, so `storage::schema::
     /// present_languages` (and therefore "owed") considers it present - the

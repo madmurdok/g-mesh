@@ -192,9 +192,9 @@ mod tests {
     fn each_server_starts_its_own_session_and_its_clones_share_it() {
         use crate::daemon::indexing_status::IndexingStatus;
         use crate::daemon::lifecycle::CoreActivity;
-        use crate::daemon::manifest::DiscoveredPlugins;
         use crate::daemon::registry::PluginRegistry;
         use crate::embedding::EmbeddingPipeline;
+        use crate::plugin_manifest::DiscoveredPlugins;
         use crate::storage::index_store::IndexStore;
 
         let dir = tempfile::tempdir().unwrap();

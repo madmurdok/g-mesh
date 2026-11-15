@@ -144,7 +144,8 @@ use crate::cli::plugin_check::session::{
     BulkLine, BulkRun, EditTarget, Exchange, FilesCreatedRun, Method, ResolutionDeltaRun, Session,
     StoredRange, VersionBump,
 };
-use crate::daemon::manifest::{extension_of, under_excluded_dir, PluginManifest};
+use crate::plugin_manifest::PluginManifest;
+use crate::project_walk::{extension_of, under_excluded_dir};
 use crate::protocol::conformance::{
     also_scopes_violation, placeholder_target_violation, plugin_emitted_container_violation,
     qualified_path_violation, untyped_calls_violation, PLACEHOLDER_NATIVE_KINDS,
@@ -1156,7 +1157,7 @@ mod tests {
 
     use super::*;
     use crate::cli::plugin_check::session::{parse_bulk_lines, ImportRow, Response};
-    use crate::daemon::manifest::{Capabilities, WorkspaceConfig};
+    use crate::plugin_manifest::{Capabilities, WorkspaceConfig};
 
     fn manifest(semantic_pass: bool) -> PluginManifest {
         PluginManifest {

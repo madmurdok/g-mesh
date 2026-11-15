@@ -951,8 +951,8 @@ fn unloaded_pipeline() -> EmbeddingPipeline {
     )
 }
 
-fn shapes(starts_with: &[&str], contains: &[&str]) -> crate::daemon::manifest::NonSymbolShapes {
-    crate::daemon::manifest::NonSymbolShapes {
+fn shapes(starts_with: &[&str], contains: &[&str]) -> crate::plugin_manifest::NonSymbolShapes {
+    crate::plugin_manifest::NonSymbolShapes {
         starts_with: starts_with.iter().map(|s| s.to_string()).collect(),
         contains: contains.iter().map(|s| s.to_string()).collect(),
     }

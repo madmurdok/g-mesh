@@ -19,12 +19,12 @@ use super::search_code_worker_tests::{call, connect, Gate, GatedEmbedder};
 use super::{find_definition, FindDefinitionParams, GMeshMcpServer};
 use crate::daemon::indexing_status::{IndexingStatus, Phase};
 use crate::daemon::lifecycle::CoreActivity;
-use crate::daemon::manifest::{DiscoveredPlugins, NonSymbolShapes, PluginManifest};
 use crate::daemon::registry::PluginRegistry;
 use crate::embedding::model::EMBEDDING_DIM;
 use crate::embedding::pipeline::Embedder;
 use crate::embedding::EmbeddingPipeline;
 use crate::graph::queries::upsert_node;
+use crate::plugin_manifest::{DiscoveredPlugins, NonSymbolShapes, PluginManifest};
 use crate::protocol::types::QualifiedPath;
 use crate::storage::index_store::IndexStore;
 use crate::storage::schema;
@@ -304,7 +304,7 @@ async fn the_server_applies_the_discovered_plugins_shapes() {
     let embedding = pipeline(dir.path(), move || Box::new(CountingEmbedder(Arc::clone(&counter))));
     let rust = PluginManifest {
         non_symbol_queries: NonSymbolShapes { starts_with: vec!["@".into()], contains: vec!["/".into()] },
-        ..crate::daemon::manifest::bare_manifest("rust")
+        ..crate::plugin_manifest::bare_manifest("rust")
     };
     let discovered = DiscoveredPlugins {
         manifests: [("rust".to_string(), rust)].into_iter().collect(),

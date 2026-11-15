@@ -52,8 +52,9 @@ use crate::cli::stop;
 use crate::daemon;
 use crate::daemon::bulk_index::{self, BulkIndexSummary};
 use crate::daemon::indexing_status::IndexingStatus;
-use crate::daemon::{manifest, registry, semantic};
+use crate::daemon::{registry, semantic};
 use crate::embedding::{backfill, EmbeddingPipeline};
+use crate::plugin_manifest;
 use crate::storage::index_store::IndexStore;
 use crate::storage::{connection, schema};
 
@@ -97,8 +98,8 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     // this index is re-stamped with is derived from it
     // (`daemon::registry::indexer_version`): stamping anything else here would
     // have the next daemon start wipe the index this command just rebuilt.
-    let discovered =
-        manifest::discover(&manifest::default_roots()).context("failed to discover language plugins")?;
+    let discovered = plugin_manifest::discover(&plugin_manifest::default_roots())
+        .context("failed to discover language plugins")?;
 
     let conn = connection::open(project_root).context("failed to open the project's SQLite index")?;
     schema::reset(&conn, &registry::indexer_version(&discovered))
@@ -107,8 +108,9 @@ pub fn reindex(project_root: &Path) -> Result<Outcome> {
     let canonical_root = project_root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize project root {}", project_root.display()))?;
-    let conn =
-        Arc::new(IndexStore::new(conn).with_link_rules(manifest::link_rules(discovered.manifests.values())));
+    let conn = Arc::new(
+        IndexStore::new(conn).with_link_rules(plugin_manifest::link_rules(discovered.manifests.values())),
+    );
     // Loaded fresh for this one-shot walk, exactly as `daemon::run` loads it
     // for a cold start - a reindex is that same walk, run early.
     let project_config = crate::config::read_project_config(project_root)

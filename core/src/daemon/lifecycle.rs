@@ -34,9 +34,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::config::ProjectConfig;
-use crate::daemon::manifest::PluginManifest;
 use crate::daemon::plugin::PluginProcess;
 use crate::embedding::EmbeddingPipeline;
+use crate::plugin_manifest::PluginManifest;
 use crate::protocol::jsonrpc::is_timeout;
 use crate::storage::index_store::{self, IndexStore};
 use crate::watcher::apply::{FileChangeOutcome, SemanticPassOutcome};

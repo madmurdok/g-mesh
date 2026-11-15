@@ -781,7 +781,7 @@ fn continued(conn: &Connection, token: &str, hints: &SessionHints) -> Result<Cal
 /// and `graph::queries::entry_point_rank_expr` for where it comes from and
 /// how it is used. The caller (`mcp::GMeshMcpServer::get_dependencies`) reads
 /// it off its own `PluginRegistry` once per call, since discovery never
-/// changes while a daemon runs (see `daemon::manifest::discover`'s own
+/// changes while a daemon runs (see `plugin_manifest::discover`'s own
 /// contract) - there is nothing this function would gain by asking twice.
 pub(crate) fn handle(
     store: &Arc<IndexStore>,

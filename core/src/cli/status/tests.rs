@@ -3,13 +3,13 @@ use crate::daemon::indexing_status::{EmbedProgress, SemanticProgress, WalkProgre
 use crate::storage::schema;
 
 /// The plugins this checkout ships - their real `plugin.toml`s, read from
-/// `plugins/` beside `core/` exactly as `manifest::bundled_roots` finds them in
+/// `plugins/` beside `core/` exactly as `plugin_manifest::bundled_roots` finds them in
 /// a checkout. Discovery only parses the manifests, so no plugin needs to be
 /// built. Deliberately not `default_roots`, which would also read whatever
 /// the machine running the tests has under `~/.g-mesh/plugins/`.
 fn bundled_plugins() -> DiscoveredPlugins {
     let checkout_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins");
-    manifest::discover(&[checkout_root]).unwrap()
+    plugin_manifest::discover(&[checkout_root]).unwrap()
 }
 
 /// A project directory with the given files, and an index database
@@ -1112,9 +1112,9 @@ fn idle_durations_read_the_way_a_human_would_say_them() {
 #[test]
 fn a_daemon_suspended_language_is_reported_by_a_separate_status_read() {
     use crate::daemon::lifecycle::PluginSupervisor;
-    use crate::daemon::manifest::read_manifest;
     use crate::daemon::test_plugin;
     use crate::embedding::EmbeddingPipeline;
+    use crate::plugin_manifest::read_manifest;
     use std::sync::Arc;
 
     let project = tempfile::tempdir().unwrap();

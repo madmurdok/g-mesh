@@ -50,7 +50,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::languages::LanguageOutcome;
+use crate::storage::language_outcome::LanguageOutcome;
 use crate::{daemon, shim};
 
 /// The exit code of a command that did its work and printed its result, but
@@ -102,7 +102,7 @@ pub fn language_outcome_lines(outcomes: &BTreeMap<String, LanguageOutcome>) -> V
             LanguageOutcome::Indexed { .. } => None,
             LanguageOutcome::Failed { error } => Some(format!(
                 "g-mesh: {language} failed to index and is not in the index: {}",
-                crate::languages::error_on_one_line(error)
+                crate::storage::language_outcome::error_on_one_line(error)
             )),
             LanguageOutcome::PluginAbsent { files } => {
                 let what = match files {
@@ -735,7 +735,7 @@ mod tests {
         );
     }
 
-    /// A `Failed` language's stored chain (`languages::failed_error`, one
+    /// A `Failed` language's stored chain (`storage::language_outcome::failed_error`, one
     /// cause per line) is printed on ONE stderr line, every cause joined by
     /// ": ", outermost first (GM-330, ADR 0021 section 2).
     ///
@@ -751,7 +751,7 @@ mod tests {
             "invalid type: map, expected a string\nat line 3",
         ));
         let err = inner.context("reading the manifest").context("loading the rust plugin").unwrap_err();
-        let stored = crate::languages::failed_error(&err);
+        let stored = crate::storage::language_outcome::failed_error(&err);
         assert_eq!(stored.lines().count(), 3, "the fixture must be a multi-line chain: {stored}");
 
         let lines = language_outcome_lines(&outcomes(&[("rust", LanguageOutcome::Failed { error: stored })]));

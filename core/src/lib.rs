@@ -9,6 +9,7 @@ pub mod languages;
 pub mod log;
 pub mod mcp;
 pub mod paths;
+pub mod plugin_manifest;
 pub mod process;
 pub mod project_walk;
 pub mod protocol;

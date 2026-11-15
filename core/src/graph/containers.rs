@@ -226,7 +226,7 @@ type Key = (String, String);
 ///  - NUL, not a space, between language and key, because a key is free text
 ///    and may contain spaces (a C++ namespace never does, but nothing here
 ///    should rely on which languages exist). `language` is a plugin directory
-///    name (`daemon::manifest` requires the two to match) and no filesystem
+///    name (`plugin_manifest` requires the two to match) and no filesystem
 ///    allows NUL in one, so the split is unambiguous.
 ///
 /// A plugin that ever needs to address a container node directly computes the

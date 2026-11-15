@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 
 use super::*;
-use crate::daemon::manifest::discover;
 use crate::daemon::test_plugin;
+use crate::plugin_manifest::discover;
 use crate::storage::connection;
 
 const GENERATION: &str = "test-generation";

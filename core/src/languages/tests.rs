@@ -1,6 +1,6 @@
 use super::*;
-use crate::daemon::manifest::discover;
-use crate::daemon::manifest::tests::{discovery_root, manifest_toml};
+use crate::plugin_manifest::tests::{discovery_root, manifest_toml};
+use crate::plugin_manifest::{discover, DiscoveredPlugins};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 

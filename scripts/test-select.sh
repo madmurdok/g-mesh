@@ -32,7 +32,7 @@
 #   `core/src/` path outside SCRIPTS_CLOSURE selects every core section but
 #   `core-scripts`.
 # - SCRIPTS_CLOSURE holds every core source file the `g-mesh::scripts` tests
-#   reach (they use only `daemon::manifest::read_manifest` and
+#   reach (they use only `plugin_manifest::read_manifest` and
 #   `languages::CATALOGUE`); a new core use in core/tests/scripts extends it.
 # - A change under `scripts/` selects `core-scripts`, in both modes: those
 #   tests read scripts/.
@@ -170,7 +170,8 @@ classify() {
 	core/src/mcp/*) if [ -n "$narrow" ]; then add core-mcp core-it; else add "${CORE[@]}"; fi ;;
 	# SCRIPTS_CLOSURE
 	core/src/lib.rs | core/src/log.rs | core/src/languages.rs | core/src/languages/* | \
-		core/src/daemon/manifest.rs | core/src/daemon/manifest/* | \
+		core/src/plugin_manifest.rs | core/src/plugin_manifest/* | core/src/project_walk.rs | \
+		core/src/storage/language_outcome.rs | \
 		core/src/graph/symbol_links.rs | core/src/graph/symbol_links/* | core/src/protocol/*)
 		add "${CORE[@]}"
 		;;
