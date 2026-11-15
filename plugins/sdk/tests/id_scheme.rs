@@ -1,37 +1,27 @@
 //! The id scheme is a cross-plugin contract, and this is where it is held to
 //! one.
 //!
-//! `ids`' module doc specifies the scheme in bytes. That specification is
-//! worth nothing unless the two implementations that exist agree on it, so
-//! every case below pins this crate's answer against the id
-//! the original Node TS plugin's own `nodeIdFor`/`edgeIdFor`
-//! produced for the same tuple, on
-//! 2026-09-16, by calling those functions directly on the built plugin:
+//! `ids`' module doc specifies the scheme in bytes. Every case below pins this
+//! crate's answer against a literal id, the lowercase hex SHA-256 (first 32
+//! characters) of the NUL-joined byte string the specification describes, for
+//! example:
 //!
 //! ```text
-//! node -e 'const e = require("./plugins/typescript/dist/src/extract.js");
-//!          console.log(e.nodeIdFor("src/overloads.ts", "Function", "parse", "function"))'
+//! printf 'node\0src/overloads.ts\0Function\0parse\0function' | shasum -a 256 | cut -c1-32
 //! ```
 //!
-//! The values are *recorded*, not recomputed by this test. Recomputing would
-//! make the test pass whenever both implementations change together, which is
-//! exactly the failure it exists to catch - and would make the Rust test
-//! suite depend on a Node toolchain and a built TS plugin.
+//! The values are recorded, not recomputed by this test: recomputing would
+//! pass whenever the implementation and the test changed together. The first
+//! case is also the id in `wire`'s own `OVERLOADED_NODE_LINE` constant.
 //!
-//! The first case is independently corroborated: it is the very id in
-//! `wire`'s own `OVERLOADED_NODE_LINE` constant, a line copied out of the TS
-//! plugin's real `--bulk-index` output long before this crate existed.
-//!
-//! **`plugins/go` must produce these same ids.** The Go plugin is being built
-//! in parallel and is not on this branch; when it lands, this table is the
-//! one it has to reproduce - `crypto/sha256` over the same NUL-joined fields,
-//! hex, first 32 characters.
+//! `plugins/go` reproduces these ids with `crypto/sha256` over the same
+//! NUL-joined fields (see `plugins/go/ids_test.go`).
 
 use g_mesh_plugin_sdk::ids::{edge_id, node_id};
 use g_mesh_plugin_sdk::wire::{EdgeKind, NodeKind, PlaceholderTarget, TargetKey, TargetScope};
 use g_mesh_plugin_sdk::{placeholder_id, PlaceholderKind, RelPath};
 
-/// `(filePath, kind, qualifiedName, nativeKind) -> id`, as the TS plugin
+/// `(filePath, kind, qualifiedName, nativeKind) -> id`, as the SDK scheme
 /// computes it.
 const NODE_CASES: &[(&str, NodeKind, &str, Option<&str>, &str)] = &[
     // An overloaded function - the case `wire`'s own OVERLOADED_NODE_LINE
@@ -97,7 +87,7 @@ fn edge_ids_match_the_typescript_plugins() {
     }
 }
 
-/// **GM-596.** A placeholder keyed by *name* still gets the id the TS plugin
+/// A placeholder keyed by *name* still gets the id
 /// recorded for its label (`src/b.ts#helper`, the `pending_symbol` row of
 /// `NODE_CASES`): putting the key kind into the label changed only the
 /// qualified-name rendering. The qualified-name key with the same string gets

@@ -240,10 +240,10 @@ pub fn container_id(language: &str, key: &str) -> String {
 }
 
 /// The id of the `DEFINES` edge from `container_node_id` to `member_id`,
-/// computed exactly as `edgeIdFor(from, "DEFINES", to)` in extract.ts would.
-/// Reusing the plugin's own edge scheme is safe because the `from` half is a
-/// container id no plugin node can have (see [`container_id`]), and it means
-/// the edge is the one any tier would name for that triple.
+/// the space-joined hash of `edge <from> DEFINES <to>`. This is core's own
+/// scheme, not the NUL-joined one in `plugins/sdk/src/ids.rs`; it cannot
+/// collide with a plugin edge id because the `from` half is a container id no
+/// plugin node can have (see [`container_id`]).
 fn defines_edge_id(container_node_id: &str, member_id: &str) -> String {
     let digest = Sha256::digest(format!("edge {container_node_id} {DEFINES_KIND} {member_id}").as_bytes());
     digest.iter().take(16).map(|b| format!("{b:02x}")).collect()

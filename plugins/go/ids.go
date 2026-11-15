@@ -3,50 +3,48 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
+	"strconv"
 )
 
-// hashID mirrors `node_id`/`edge_id` in plugins/sdk/src/ids.rs: sha256 of the
-// UTF-8 input, hex-encoded, truncated to the first 32 hex characters (the
-// first 16 bytes of the 32-byte digest). See ids_test.go for expected
-// values computed by actually running that TS code (`node -e '...'`, using
-// the real Node crypto module) against a handful of tuples, not recalled
-// from memory - this task's own report has the transcript.
-func hashID(input string) string {
-	sum := sha256.Sum256([]byte(input))
-	return hex.EncodeToString(sum[:])[:32]
-}
+// idFieldSeparator is the byte between hashed fields, as in
+// plugins/sdk/src/ids.rs: a NUL, which no path or name can contain.
+const idFieldSeparator = "\x00"
 
-// nodeIDFor mirrors extract.ts's nodeIdFor field-for-field: the same
-// four-part space-joined string, in the same order. Ids are
-// content-position-independent (path, kind, qualifiedName, nativeKind
-// only, never a source range) so they survive an edit elsewhere in the
-// file - the property this plugin's own id stability (control.go's
-// handleFileChanged) and the conformance kit's id-stability.* checks both
-// depend on. `nativeKind` participates even when empty, the same way
-// extract.ts's `nativeKind ?? ""` does, so an absent nativeKind is a real
-// empty-string field in the hashed string, not an omitted one - callers
-// pass "" for it today (this scaffold's only node kind, File, has no
-// nativeKind), and GM-280 will pass the real thing once nodes have one.
-func nodeIDFor(filePath, kind, qualifiedName, nativeKind string) string {
-	return hashID(fmt.Sprintf("node %s %s %s %s", filePath, kind, qualifiedName, nativeKind))
-}
-
-// edgeIDFor mirrors extract.ts's edgeIdFor: identity is the (from, kind,
-// to) triple, plus - only when set - the declaration ordinal a semantic
-// pass bound the edge to. Go has no overload sets, so nothing this plugin
-// emits ever binds one and every caller here passes nil; the parameter
-// exists because the id scheme is shared with the TS plugin and must stay
-// field-for-field identical to it. Unlike nodeIDFor's nativeKind, an absent
-// toDeclaration contributes *nothing* to the hashed string, not an empty
-// field - see extract.ts's own doc comment on edgeIdFor for why: every edge
-// a structural pass emits (which never binds a declaration ordinal) must
-// keep exactly the id it would have without this parameter existing at all.
-
-func edgeIDFor(fromID, kind, toID string, toDeclaration *int) string {
-	binding := ""
-	if toDeclaration != nil {
-		binding = fmt.Sprintf(" %d", *toDeclaration)
+// hashID is the digest half of the id scheme in plugins/sdk/src/ids.rs:
+// sha256 over the tag and the fields, each field preceded by a NUL byte,
+// hex-encoded and truncated to the first 32 hex characters (the first 16
+// bytes of the digest).
+func hashID(tag string, fields ...string) string {
+	h := sha256.New()
+	h.Write([]byte(tag))
+	for _, field := range fields {
+		h.Write([]byte(idFieldSeparator))
+		h.Write([]byte(field))
 	}
-	return hashID(fmt.Sprintf("edge %s %s %s%s", fromID, kind, toID, binding))
+	return hex.EncodeToString(h.Sum(nil))[:32]
+}
+
+// nodeIDFor mirrors `node_id` in plugins/sdk/src/ids.rs field for field:
+// tag "node", then path, kind, qualifiedName and nativeKind. Ids are
+// independent of source position (path, kind, qualifiedName, nativeKind
+// only, never a range), so they survive an edit elsewhere in the file - the
+// property control.go's handleFileChanged and the conformance kit's
+// id-stability.* checks depend on. nativeKind participates even when empty:
+// an absent nativeKind is an empty field, not an omitted one. Callers pass
+// "" for it today.
+func nodeIDFor(filePath, kind, qualifiedName, nativeKind string) string {
+	return hashID("node", filePath, kind, qualifiedName, nativeKind)
+}
+
+// edgeIDFor mirrors `edge_id` in plugins/sdk/src/ids.rs: identity is the
+// (from, kind, to) triple, plus - only when set - the declaration ordinal a
+// semantic pass bound the edge to. Go has no overload sets, so every caller
+// here passes nil. Unlike nodeIDFor's nativeKind, an absent toDeclaration
+// contributes no field and no separator, so an edge a structural pass emits
+// keeps the id it would have without the parameter.
+func edgeIDFor(fromID, kind, toID string, toDeclaration *int) string {
+	if toDeclaration == nil {
+		return hashID("edge", fromID, kind, toID)
+	}
+	return hashID("edge", fromID, kind, toID, strconv.Itoa(*toDeclaration))
 }
