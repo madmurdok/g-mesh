@@ -78,6 +78,7 @@ it:reexport_linking                                      typescript rust python 
 it:reexport_member_linking                               rust python
 it:repeated_edits_through_a_warm_plugin                  typescript rust python go
 it:replay_progress                                       typescript rust python go
+it:rust_block_use_imports                                rust
 it:rust_enum_variants                                    rust
 it:rust_glob_trait_overrides                             rust
 it:rust_python_qualified_paths                           rust python
