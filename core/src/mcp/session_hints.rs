@@ -126,6 +126,15 @@ pub(crate) const WALK_COMPLETE_IMPORT_TYPE: &str =
     "`truncated: false`: this walk is complete for the depth asked (at `max_depth: 1`, every direct \
      importer or import, `import type` included), so don't re-derive it with a `from '...'` grep.";
 
+/// `WALK_COMPLETE` for Rust: the module paths its plugin does not turn into
+/// import edges.
+pub(crate) const WALK_COMPLETE_RUST: &str =
+    "`truncated: false`: complete for the depth asked, except a module reached through a glob `use`, \
+     or used in a `macro_rules!` body or a fn-local `mod`; don't grep for the rest.";
+
+/// The language whose `WALK_COMPLETE` is [`WALK_COMPLETE_RUST`].
+pub(crate) const RUST_LANGUAGE: &str = "rust";
+
 /// The language whose import edges are file-to-file and include type-only
 /// imports - JavaScript files are indexed under it too.
 pub(crate) const IMPORT_TYPE_LANGUAGE: &str = "typescript";
@@ -254,6 +263,7 @@ mod tests {
             FILES_TALLY,
             WALK_COMPLETE,
             WALK_COMPLETE_IMPORT_TYPE,
+            WALK_COMPLETE_RUST,
             SEARCH_HITS,
             RERANK_MODEL_MISSING,
             RERANK_MODEL_FAILED,

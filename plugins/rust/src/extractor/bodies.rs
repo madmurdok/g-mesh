@@ -93,7 +93,8 @@ use g_mesh_plugin_sdk::{NodeSpec, OpenSite, OpenSiteKind, PlaceholderKind};
 use tree_sitter::Node;
 
 use crate::extractor::decls::{
-    field_tail, field_tail_path, impl_block, member_tail, member_tail_path, trait_block, BlockCtx, Family,
+    block_use_imports, field_tail, field_tail_path, impl_block, member_tail, member_tail_path, spell,
+    trait_block, BlockCtx, Family,
 };
 use crate::extractor::emit::{container_target, Emitter};
 use crate::extractor::keys::{
@@ -173,8 +174,15 @@ impl Bodies<'_, '_> {
     /// an edge found here would start at.
     pub(crate) fn visit(&mut self, node: Node, module: &ModuleCtx, block: Option<&BlockCtx>, from: &str) {
         match node.kind() {
+            // A module-level `use` is the declaration pass's; one inside a
+            // block is only seen here.
+            "use_declaration" => {
+                if node.parent().is_some_and(|parent| parent.kind() == "block") {
+                    block_use_imports(node, module, self.source, self.model, self.project, self.emitter);
+                }
+            }
             // Handled by the declaration pass, or deliberately not read.
-            "use_declaration" | "extern_crate_declaration" | "line_comment" | "block_comment" => {}
+            "extern_crate_declaration" | "line_comment" | "block_comment" => {}
             "attribute_item" | "inner_attribute_item" => {
                 // Production: nothing. The census (GM-314) resolves the names
                 // written here without emitting anything, to measure the
@@ -1136,6 +1144,58 @@ impl Bodies<'_, '_> {
             }
             _ => {}
         }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "token_tree" {
+                self.token_tree_imports(child, module);
+            }
+        }
+    }
+
+    /// The `IMPORTS` edges of the module paths written in a macro's
+    /// arguments (`log!("{}", crate::a::f())`), read off the token sequence
+    /// `seg (:: seg)+`, since a token tree has no path nodes. Only the
+    /// import: what such a path names stays unasked.
+    fn token_tree_imports(&mut self, tree: Node, module: &ModuleCtx) {
+        let mut path: Vec<Seg<'_>> = Vec::new();
+        let mut start = tree;
+        let mut after_separator = false;
+        let mut cursor = tree.walk();
+        let children: Vec<Node> = tree.children(&mut cursor).collect();
+        for child in children {
+            let seg = match child.kind() {
+                "identifier" => Some(Seg::Name(text(child, self.source))),
+                "crate" => Some(Seg::Crate),
+                "self" => Some(Seg::SelfMod),
+                "super" => Some(Seg::Super),
+                _ => None,
+            };
+            match seg {
+                Some(seg) if path.is_empty() || after_separator => {
+                    if path.is_empty() {
+                        start = child;
+                    }
+                    path.push(seg);
+                    after_separator = false;
+                    continue;
+                }
+                None if child.kind() == "::" && !path.is_empty() && !after_separator => {
+                    after_separator = true;
+                    continue;
+                }
+                _ => {}
+            }
+            self.path_import(&path, module, start);
+            path.clear();
+            after_separator = false;
+            if let Some(seg) = seg {
+                start = child;
+                path.push(seg);
+            } else if child.kind() == "token_tree" {
+                self.token_tree_imports(child, module);
+            }
+        }
+        self.path_import(&path, module, start);
     }
 
     // --- name resolution ------------------------------------------------------
@@ -1239,8 +1299,33 @@ impl Bodies<'_, '_> {
         let Some(segments) = flatten_path(node, self.source) else {
             return;
         };
+        self.path_import(&segments, module, node);
         let bound = self.resolve_path(&segments, module, block, want);
         self.emit(bound, kind, from, node, module, OpenSiteKind::Reference);
+    }
+
+    /// The `IMPORTS` edge a module-qualified path draws onto the module it
+    /// goes through (`crate::a::b::f()`, `crate::a::b::T::new()`, `b::f()`
+    /// for a child module `b`): a dependency on `crate::a::b` as real as a
+    /// `use crate::a::b::f;` would record. Only a container the project's
+    /// module registry holds, and never the path's own module.
+    fn path_import(&mut self, segments: &[Seg<'_>], module: &ModuleCtx, at: Node) {
+        let Some(qualifier) = segments.len().checked_sub(1).filter(|&end| end > 0) else { return };
+        let end =
+            if self.is_type_qualifier(&segments[..qualifier], module) { qualifier - 1 } else { qualifier };
+        if end == 0 {
+            return;
+        }
+        let prefix = &segments[..end];
+        let PathTarget::Container(container) = resolve_module_path(prefix, module, self.model, self.project)
+        else {
+            return;
+        };
+        if container == module.key || !self.project.has_container(&container) {
+            return;
+        }
+        let range = self.emitter.positions().range(at);
+        self.emitter.module_import(PathTarget::Container(container), &spell(prefix), range);
     }
 
     fn resolve_path(

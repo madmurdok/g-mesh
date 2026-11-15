@@ -1320,15 +1320,15 @@ fn a_complete_walk_hint_is_sent_once_per_session() {
     let cut = || GetDependenciesParams { max_depth: Some(1), ..anchored_at("a.rs", Direction::Outgoing) };
     let session = SessionHints::default();
 
-    assert!(!walk_hint_on(&conn, cut(), &session).contains(session_hints::WALK_COMPLETE));
-    assert_eq!(walk_hint_on(&conn, complete(), &session), session_hints::WALK_COMPLETE);
+    assert!(!walk_hint_on(&conn, cut(), &session).contains(session_hints::WALK_COMPLETE_RUST));
+    assert_eq!(walk_hint_on(&conn, complete(), &session), session_hints::WALK_COMPLETE_RUST);
     assert_eq!(walk_hint_on(&conn, complete(), &session), "", "once per session");
     assert_eq!(
         walk_hint_on(&conn, cut(), &session),
         session_hints::truncated_by("maxDepth").unwrap(),
         "a truncated walk's sentence is every time"
     );
-    assert_eq!(walk_hint_on(&conn, complete(), &SessionHints::default()), session_hints::WALK_COMPLETE);
+    assert_eq!(walk_hint_on(&conn, complete(), &SessionHints::default()), session_hints::WALK_COMPLETE_RUST);
 }
 
 #[test]
@@ -1345,7 +1345,7 @@ fn the_import_type_clause_is_only_for_a_typescript_anchor() {
         walk_hint_on(&typescript, anchored_at("b.ts", Direction::Incoming), &SessionHints::default());
     let rust_hint = walk_hint_on(&rust, anchored_at("c.rs", Direction::Incoming), &SessionHints::default());
     assert_eq!(ts_hint, session_hints::WALK_COMPLETE_IMPORT_TYPE);
-    assert_eq!(rust_hint, session_hints::WALK_COMPLETE);
+    assert_eq!(rust_hint, session_hints::WALK_COMPLETE_RUST);
     assert!(!rust_hint.contains("import type"));
 }
 
